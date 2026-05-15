@@ -332,56 +332,57 @@ export interface AskQuestion {
  * the first question only and a text-only listing for the rest (an
  * acceptable limitation — these are rare in practice and we can lift
  * it once the UX is validated). */
+/** Final-state info for an AskUserQuestion panel. Mutually-exclusive
+ * branches inside: either the user picked one of the SDK-provided
+ * options (`optionIdx`), or they typed a free-form answer
+ * (`customText`). When both are absent the panel is still pending. */
+export interface AskAnswered {
+  optionIdx?: number
+  customText?: string
+  user?: string
+}
+
 export function askUserQuestionElement(
   i: number,
   toolUseId: string,
   questions: AskQuestion[],
   status: '🤔' | '✅' | '❌' = '🤔',
-  /** When set, only this option is rendered as "picked" — every other
-   * option turns into plain text (no click target). Used after the
-   * user has answered so the panel freezes in a sensible terminal
-   * state instead of inviting another click. */
-  pickedOptionIdx?: number,
-  resolvedNote?: string,
+  answered?: AskAnswered,
 ): object {
   const primary = questions[0]
+  const isAnswered = !!answered && (answered.optionIdx !== undefined || !!answered.customText)
   const headerTag = primary?.header ? ` · ${primary.header}` : ''
-  const headerText = `${status} 🤔 AskUserQuestion${headerTag}`
+  let headerText: string
+  if (isAnswered) {
+    // Surface the picked answer in the header so a collapsed panel
+    // still tells the reader what was chosen.
+    const picked = answered!.customText
+      ?? (answered!.optionIdx !== undefined ? primary?.options[answered!.optionIdx]?.label : undefined)
+      ?? '?'
+    headerText = `${status} 已回答${headerTag}：${picked}`
+  } else {
+    headerText = `${status} 🤔 AskUserQuestion${headerTag}`
+  }
   const bodyElements: any[] = []
   if (primary) {
     bodyElements.push({ tag: 'markdown', content: `**${primary.question}**` })
-    // One row per option, each a full-width interactive_container so
-    // the entire row (label + description) is the click target. Looks
-    // cleaner than a row of squat buttons and matches the way IM
-    // quick-replies usually present themselves. After the user picks,
-    // we still render the same row layout (no JSON dump) but strip
-    // the callbacks — selected option marked ✅, others dimmed.
+    // One row per option. While pending, each row is a full-width
+    // interactive_container so the entire row is the click target.
+    // Once answered, rows degrade to plain markdown (Feishu has no
+    // generic non-interactive container — `div` doesn't exist, it
+    // rejects the PUT with code 300121).
     for (let optIdx = 0; optIdx < primary.options.length; optIdx++) {
       const opt = primary.options[optIdx]
-      const isPicked = pickedOptionIdx === optIdx
-      const isAnswered = pickedOptionIdx !== undefined
-      const labelLine = isPicked
-        ? `**✅ ${opt.label}**`
-        : isAnswered
-          ? `~~${opt.label}~~`
-          : `**${opt.label}**`
-      const descLine = opt.description ? `\n${opt.description}` : ''
-      const rowContent = { tag: 'markdown', content: `${labelLine}${descLine}` }
-      if (isAnswered) {
-        // Frozen — no behaviors, plain container so it stops looking
-        // clickable.
-        bodyElements.push({
-          tag: 'div',
-          elements: [rowContent],
-        })
-      } else {
+      const isPicked = answered?.optionIdx === optIdx
+      const desc = opt.description ? `  ·  ${opt.description}` : ''
+      if (!isAnswered) {
         bodyElements.push({
           tag: 'interactive_container',
           background_style: 'default',
           has_border: true,
           corner_radius: '6px',
           padding: '8px 12px',
-          margin: '4px 0',
+          margin: '4px 0px 4px 0px',
           behaviors: [{
             type: 'callback',
             value: {
@@ -391,13 +392,70 @@ export function askUserQuestionElement(
               option_idx: optIdx,
             },
           }],
-          elements: [rowContent],
+          elements: [{ tag: 'markdown', content: `**${opt.label}**${desc}` }],
+        })
+      } else if (isPicked) {
+        bodyElements.push({
+          tag: 'markdown',
+          content: `✅ **${opt.label}**${desc}`,
+        })
+      } else {
+        bodyElements.push({
+          tag: 'markdown',
+          content: `~~◯ ${opt.label}${desc}~~`,
         })
       }
     }
+    // Custom-answer input (pending state only). Feishu form submit
+    // packages the input value under `form_value` in the callback
+    // payload; daemon.handleCardAction reads it as
+    // `value.form_value.custom_answer`.
+    if (!isAnswered) {
+      bodyElements.push({ tag: 'markdown', content: '_或自己输入：_' })
+      bodyElements.push({
+        tag: 'form',
+        name: `ask_form_${toolUseId.slice(-12)}`,
+        elements: [{
+          tag: 'column_set',
+          columns: [
+            {
+              tag: 'column', width: 'weighted', weight: 3, vertical_align: 'center',
+              elements: [{
+                tag: 'input',
+                name: 'custom_answer',
+                placeholder: { tag: 'plain_text', content: '自定义回答…' },
+                required: false,
+              }],
+            },
+            {
+              tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
+              elements: [{
+                tag: 'button',
+                text: { tag: 'plain_text', content: '发送' },
+                type: 'primary',
+                form_action_type: 'submit',
+                behaviors: [{
+                  type: 'callback',
+                  value: {
+                    kind: 'ask',
+                    tool_use_id: toolUseId,
+                    question_idx: 0,
+                    custom: true,
+                  },
+                }],
+              }],
+            },
+          ],
+        }],
+      })
+    } else if (answered?.customText) {
+      bodyElements.push({
+        tag: 'markdown',
+        content: `✏️ **自定义回答**：${answered.customText}`,
+      })
+    }
   }
-  // Secondary questions get text-only treatment (TODO: multi-question
-  // panels when actually requested by a real prompt).
+  // Secondary questions (rare): text-only listing. TODO when needed.
   for (let qi = 1; qi < questions.length; qi++) {
     const q = questions[qi]
     const opts = q.options.map(o => `  - ${o.label}${o.description ? ` — ${o.description}` : ''}`).join('\n')
@@ -406,12 +464,19 @@ export function askUserQuestionElement(
       content: `\n---\n**(其他问题 #${qi + 1}, 暂未支持回答)** ${q.question}\n${opts}`,
     })
   }
-  if (resolvedNote) bodyElements.push({ tag: 'markdown', content: resolvedNote })
+  if (isAnswered && answered?.user) {
+    bodyElements.push({
+      tag: 'markdown',
+      content: `\n*— 由 ${answered.user} 回答*`,
+    })
+  }
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),
     header: { title: { tag: 'plain_text', content: headerText } },
-    expanded: true,
+    // Collapse once answered: header carries the picked answer, body
+    // is just history at that point.
+    expanded: !isAnswered,
     elements: bodyElements,
   }
 }

@@ -79,8 +79,9 @@ export class Session {
   /** Open AskUserQuestion tool calls — keyed by tool_use_id. The SDK
    * routes AskUserQuestion through the can_use_tool flow even under
    * bypass; we have to thread the permission `requestId` through here
-   * so onAskAnswer can answer it with `updatedInput.answers` populated.
-   * `deferredAnswer` covers the race where the user clicks a button
+   * so the answer (option click OR custom text submit) can resolve
+   * the permission with `updatedInput.answers` populated.
+   * `deferredAnswer` covers the race where the user clicks/submits
    * BEFORE can_use_tool arrives (addTool fires on the assistant
    * message; can_use_tool is a separate control_request that lands
    * slightly later). */
@@ -88,7 +89,12 @@ export class Session {
     questions: cards.AskQuestion[]
     i: number
     requestId?: string
-    deferredAnswer?: { questionIdx: number; optionIdx: number; user: string }
+    deferredAnswer?: {
+      questionIdx: number
+      optionIdx?: number
+      customText?: string
+      user: string
+    }
   }>()
   private turnCounter = 0
   // Last seen sessionId — preserved across `kill`/`stop` so a later
@@ -326,43 +332,72 @@ export class Session {
     }
   }
 
-  /** Click handler for an AskUserQuestion option button. The actual
-   * "send answer to Claude" plumbing lives in `resolveAsk` — this
-   * wrapper just chooses between answering immediately (the common
-   * case: can_use_tool has already arrived and parked a requestId on
-   * the pendingAsk record) versus deferring (the rare race where the
-   * user clicks before can_use_tool lands). */
+  /** Click handler for an AskUserQuestion option button. Dispatches
+   * to `resolveAsk` if can_use_tool has already arrived, otherwise
+   * parks the click on the pendingAsk record for renderPermission
+   * to drain. */
   async onAskAnswer(toolUseId: string, questionIdx: number, optionIdx: number, user: string): Promise<void> {
     const pending = this.pendingAsks.get(toolUseId)
     if (!pending) { log(`session "${this.sessionName}": stray ask answer for ${toolUseId}`); return }
     if (pending.requestId) {
-      this.resolveAsk(toolUseId, pending.requestId, questionIdx, optionIdx, user)
+      this.resolveAsk(toolUseId, pending.requestId, { questionIdx, optionIdx, user })
     } else {
-      // can_use_tool hasn't landed yet — park the click. renderPermission
-      // will drain it the moment the request arrives.
       pending.deferredAnswer = { questionIdx, optionIdx, user }
       log(`session "${this.sessionName}": ask answer deferred for ${toolUseId} (no requestId yet)`)
     }
   }
 
+  /** Form-submit handler for the custom-answer input on an
+   * AskUserQuestion panel. Same dispatch pattern as `onAskAnswer`,
+   * just routes a free-form string into `resolveAsk` instead of an
+   * option index. Empty/whitespace input is ignored (no answer
+   * sent, panel stays pending). */
+  async onAskCustomAnswer(toolUseId: string, questionIdx: number, customText: string, user: string): Promise<void> {
+    const pending = this.pendingAsks.get(toolUseId)
+    if (!pending) { log(`session "${this.sessionName}": stray ask custom for ${toolUseId}`); return }
+    const trimmed = (customText ?? '').trim()
+    if (!trimmed) { log(`session "${this.sessionName}": empty custom answer, ignoring`); return }
+    if (pending.requestId) {
+      this.resolveAsk(toolUseId, pending.requestId, { questionIdx, customText: trimmed, user })
+    } else {
+      pending.deferredAnswer = { questionIdx, customText: trimmed, user }
+      log(`session "${this.sessionName}": ask custom deferred for ${toolUseId} (no requestId yet)`)
+    }
+  }
+
   /** Settle an AskUserQuestion: emit the permission allow with the
-   * picked option folded into `updatedInput.answers` (this is the
-   * shape the SDK reads to synthesise the tool_result string), repaint
-   * the panel ✅, drop bookkeeping. Single source of truth — both the
-   * normal click path and the deferred-answer drain go through here. */
+   * picked option OR custom text folded into `updatedInput.answers`
+   * (this is the shape the SDK reads to synthesise the tool_result
+   * string), repaint the panel ✅, drop bookkeeping. Single source
+   * of truth — option-click, custom-submit, and the deferred drain
+   * all go through here. */
   private resolveAsk(
     toolUseId: string,
     requestId: string,
-    questionIdx: number,
-    optionIdx: number,
-    user: string,
+    answer: { questionIdx: number; optionIdx?: number; customText?: string; user: string },
   ): void {
     const pending = this.pendingAsks.get(toolUseId)
     if (!pending) return
-    const q = pending.questions[questionIdx]
-    const opt = q?.options?.[optionIdx]
-    if (!q || !opt) {
-      log(`session "${this.sessionName}": ask answer out of range q=${questionIdx} o=${optionIdx}`)
+    const q = pending.questions[answer.questionIdx]
+    if (!q) {
+      log(`session "${this.sessionName}": ask answer out of range q=${answer.questionIdx}`)
+      return
+    }
+    // Determine the literal string that will become the SDK's
+    // `answers` value for this question — custom wins if both are
+    // somehow set (shouldn't happen, but defensive).
+    let answerValue: string
+    if (answer.customText) {
+      answerValue = answer.customText
+    } else if (answer.optionIdx !== undefined) {
+      const opt = q.options?.[answer.optionIdx]
+      if (!opt) {
+        log(`session "${this.sessionName}": ask option out of range o=${answer.optionIdx}`)
+        return
+      }
+      answerValue = opt.label
+    } else {
+      log(`session "${this.sessionName}": resolveAsk called with neither optionIdx nor customText`)
       return
     }
     const turn = this.currentTurn
@@ -370,9 +405,8 @@ export class Session {
     const originalInput = meta?.input ?? {}
     // SDK keys the answer record by the question's text — confirmed
     // by the v0.1.2 jsonl trace (empty record formatted to "User has
-    // answered your questions: ."). Populate the key matching this
-    // question with the chosen option's label.
-    const answers: Record<string, string> = { [q.question]: opt.label }
+    // answered your questions: .").
+    const answers: Record<string, string> = { [q.question]: answerValue }
     this.proc?.sendPermissionResponse(requestId, 'allow', {
       updatedInput: { ...originalInput, answers },
     })
@@ -382,8 +416,11 @@ export class Session {
     if (turn && meta) {
       meta.output = JSON.stringify({ answers })
       meta.isError = false
-      const resolvedNote = `\n\n*已由 ${user || '匿名'} 回答*`
-      const el = cards.askUserQuestionElement(meta.i, toolUseId, pending.questions, '✅', optionIdx, resolvedNote)
+      const el = cards.askUserQuestionElement(meta.i, toolUseId, pending.questions, '✅', {
+        optionIdx: answer.optionIdx,
+        customText: answer.customText,
+        user: answer.user || '匿名',
+      })
       void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
     }
 
@@ -747,9 +784,14 @@ export class Session {
       ask.requestId = req.request_id
       this.pendingPermissions.set(req.request_id, { toolUseId })
       if (ask.deferredAnswer) {
-        const { questionIdx, optionIdx, user } = ask.deferredAnswer
+        const d = ask.deferredAnswer
         ask.deferredAnswer = undefined
-        this.resolveAsk(toolUseId, req.request_id, questionIdx, optionIdx, user)
+        this.resolveAsk(toolUseId, req.request_id, {
+          questionIdx: d.questionIdx,
+          optionIdx: d.optionIdx,
+          customText: d.customText,
+          user: d.user,
+        })
       }
       return
     }

@@ -140,9 +140,20 @@ async function handleCardAction(data: any): Promise<any> {
     case 'menu':
       await session.onUserMessage(`(menu choice ${value.choice + 1})`)
       return { toast: { type: 'success', content: 'OK' } }
-    case 'ask':
+    case 'ask': {
+      // Custom-text branch: form submit packages the input under
+      // `form_value`. Try a couple of plausible keys since the exact
+      // shape can drift between Feishu schema versions; fall back to
+      // empty (onAskCustomAnswer ignores blank).
+      if (value.custom) {
+        const fv = action?.form_value ?? action?.input ?? {}
+        const customText: string = fv?.custom_answer ?? action?.input_value ?? ''
+        await session.onAskCustomAnswer(value.tool_use_id, value.question_idx ?? 0, customText, userId)
+        return { toast: { type: customText.trim() ? 'success' : 'error', content: customText.trim() ? '已回答' : '请输入答案' } }
+      }
       await session.onAskAnswer(value.tool_use_id, value.question_idx ?? 0, value.option_idx, userId)
       return { toast: { type: 'success', content: '已回答' } }
+    }
   }
   return { toast: { type: 'info', content: 'unknown action' } }
 }
