@@ -152,6 +152,19 @@ export class Session {
     }
   }
 
+  /** Patch the card-level summary (the text Feishu uses for chat-list
+   * preview AND lock-screen push), then return when the API call has
+   * landed. Used right before urgent_app so the push notification's
+   * derived preview describes the *action that needs attention* (an
+   * unanswered question, a pending permission ask) rather than the
+   * stale assistant-text tail that patchSummaryThrottled was streaming.
+   * cancelSummary kills any in-flight throttled write so our explicit
+   * patch isn't immediately clobbered. */
+  private async setUrgentSummary(cardId: string, content: string): Promise<void> {
+    cardkit.cancelSummary(cardId)
+    await cardkit.patchSettings(cardId, { config: { summary: { content } } })
+  }
+
   /** Minimal cross-chat snapshot for the `hi` peer-list section.
    * `startedAt` stays private so this is the documented read path. */
   peerSnapshot(): { name: string; status: Status; uptimeMs?: number } {
@@ -745,9 +758,21 @@ export class Session {
         targetElementId: cards.ELEMENTS.footer,
       })
       // Phone push — user has to come back and answer before Claude can
-      // continue. urgentApp no-ops when userOpenId is empty.
+      // continue. Set summary to the question text so the lock-screen
+      // notification preview shows what the user needs to answer.
       if (this.currentTurn.userOpenId && this.currentTurn.messageId) {
-        void feishu.urgentApp(this.currentTurn.messageId, [this.currentTurn.userOpenId])
+        const turn = this.currentTurn
+        const q0 = questions[0]?.question?.trim() ?? ''
+        const truncated = q0.length > 40 ? q0.slice(0, 40) + '…' : q0
+        const summary = questions.length > 1
+          ? `❓ 待回答 ${questions.length} 题${truncated ? `: ${truncated}` : ''}`
+          : truncated
+            ? `❓ ${truncated}`
+            : '❓ 等你回答问题'
+        void (async () => {
+          await this.setUrgentSummary(turn.cardId, summary)
+          await feishu.urgentApp(turn.messageId, [turn.userOpenId])
+        })()
       }
       return
     }
@@ -925,8 +950,20 @@ export class Session {
     const el = cards.toolCallPermissionElement(meta.i, meta.name, meta.input, req.request_id)
     void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
     // Phone push — Claude is blocked until the user approves/denies.
+    // Set summary to "🔐 等审批: <tool>(<input summary>)" so the lock-
+    // screen notification shows which tool needs approval.
     if (turn.userOpenId && turn.messageId) {
-      void feishu.urgentApp(turn.messageId, [turn.userOpenId])
+      const inputSummary = cards.summarizeToolInput(meta.name, meta.input)
+      const tail = inputSummary && inputSummary.length > 30
+        ? inputSummary.slice(0, 30) + '…'
+        : inputSummary
+      const summary = tail
+        ? `🔐 等审批: ${meta.name} · ${tail}`
+        : `🔐 等审批: ${meta.name}`
+      void (async () => {
+        await this.setUrgentSummary(turn.cardId, summary)
+        await feishu.urgentApp(turn.messageId, [turn.userOpenId])
+      })()
     }
   }
 
