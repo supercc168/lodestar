@@ -39,6 +39,11 @@ export class Session {
   private currentTurn: TurnState | null = null
   private pendingPermissions = new Map<string, { messageId: string; toolName: string }>()
   private turnCounter = 0
+  // Last seen sessionId — preserved across `kill`/`stop` so a later
+  // `restart` can resume the same Claude conversation even after the
+  // child process is gone.
+  private lastSessionId: string | null = null
+  private startedAt: number = 0
   status: Status = 'stopped'
 
   constructor(
@@ -78,11 +83,17 @@ export class Session {
 
     await feishu.sendText(this.chatId, `✅ Lodestar session "${this.sessionName}" 已就绪，发消息开始对话。`)
     this.status = 'idle'
+    this.startedAt = Date.now()
     return true
   }
 
   async stop(reason = '已终止'): Promise<void> {
-    if (!this.proc) { this.status = 'stopped'; return }
+    if (!this.proc) {
+      this.status = 'stopped'
+      await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
+      return
+    }
+    this.lastSessionId = this.proc.sessionId ?? this.lastSessionId
     await this.proc.kill()
     this.proc = null
     this.currentTurn = null
@@ -91,8 +102,9 @@ export class Session {
   }
 
   async restart(resume = false): Promise<void> {
-    const prevSessionId = this.proc?.sessionId ?? null
+    const prevSessionId = this.proc?.sessionId ?? this.lastSessionId
     if (this.proc) {
+      this.lastSessionId = this.proc.sessionId ?? this.lastSessionId
       await this.proc.kill()
       this.proc = null
     }
@@ -108,10 +120,49 @@ export class Session {
       this.wireProc(this.proc)
       this.proc.sendInitialize({})
       this.status = 'idle'
+      this.startedAt = Date.now()
       await feishu.sendText(this.chatId, `🔁 已重启并恢复 session=${prevSessionId.slice(0, 8)}…`)
     } else {
       await this.start()
     }
+  }
+
+  /** Run a user-typed control command. Returns true if the command was
+   * consumed (don't forward to Claude). Matched exactly, case-insensitive. */
+  async runCommand(cmd: string): Promise<boolean> {
+    switch (cmd.toLowerCase()) {
+      case 'hi':
+        if (!this.isRunning()) {
+          const ok = await this.start()
+          if (!ok) return true
+        }
+        await this.showConsole()
+        return true
+      case 'kill':
+        await this.stop()
+        return true
+      case 'restart':
+        await this.restart(true)
+        return true
+      case 'clear':
+        await this.restart(false)
+        return true
+    }
+    return false
+  }
+
+  async showConsole(): Promise<void> {
+    const uptime = this.startedAt
+      ? `${Math.round((Date.now() - this.startedAt) / 1000)}s`
+      : undefined
+    const card = cards.consoleCard({
+      sessionName: this.sessionName,
+      status: this.status,
+      effort: 'max',
+      uptime,
+      hasSession: this.isRunning(),
+    })
+    await feishu.sendCard(this.chatId, card)
   }
 
   interrupt(): void {

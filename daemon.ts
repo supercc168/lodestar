@@ -99,6 +99,13 @@ async function handleMessage(data: any): Promise<void> {
   const msgType = message.message_type as string
   let text = (msgType === 'text' ? contentObj.text ?? '' : '').trim()
 
+  // Text-only control commands — intercept before any work that would
+  // forward to Claude (download / spawn / interrupt). Exact match,
+  // case-insensitive, only on plain text messages.
+  if (msgType === 'text' && text) {
+    if (await session.runCommand(text)) return
+  }
+
   let filePath: string | undefined
   if (msgType === 'image' && contentObj.image_key) {
     filePath = await feishu.downloadAttachment(message.message_id, contentObj.image_key, 'image')
