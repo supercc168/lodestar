@@ -136,14 +136,17 @@ export class Session {
     }
   }
 
-  /** Run a slash-prefixed control command (`/hi`, `/kill`, `/restart`,
-   * `/clear`).  Returns true if the command was consumed (don't forward
-   * to Claude).  Bare keywords are intentionally NOT consumed so a user
-   * can still say "hi" to Claude in a normal greeting without hijacking. */
+  /** Run a bare-text control command (`hi`, `kill`, `restart`, `clear`).
+   * Returns true if the command was consumed (don't forward to Claude).
+   * Exact match, case-insensitive, ignores trailing whitespace.
+   *
+   * Trade-off (user-confirmed 2026-05-15): the four words are reserved
+   * globally — typing "hi" as a literal greeting will show the console
+   * card instead of reaching Claude. The ergonomic win (no slash, no
+   * shift key, one-handed phone use) outweighs the collision in this
+   * product's private-bot use case. */
   async runCommand(raw: string): Promise<boolean> {
-    const t = raw.trim().toLowerCase()
-    if (!t.startsWith('/')) return false
-    switch (t.slice(1)) {
+    switch (raw.trim().toLowerCase()) {
       case 'hi':
         if (!this.isRunning()) {
           const ok = await this.start()

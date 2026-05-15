@@ -10,8 +10,8 @@
  * along.
  *
  * Coverage:
- *   1.  /kill on a stopped session           — should report "未运行"
- *   2.  /hi                                  — start + console card
+ *   1.  kill on a stopped session            — should report "未运行"
+ *   2.  hi                                   — start + console card
  *   3.  basic stream + thinking + tool call  — bypassPermissions
  *   4.  outbound [[send: /path]] marker      — Claude generates a file,
  *                                              daemon strips the marker
@@ -25,8 +25,8 @@
  *                                              progress
  *   6.  inbound image                        — synthetic PNG handed off
  *                                              as a [file: ...] hint
- *   7.  /restart (resume)                    — keeps the prior session id
- *   8.  /clear (fresh)                       — kills + starts new
+ *   7.  restart (resume)                     — keeps the prior session id
+ *   8.  clear (fresh)                        — kills + starts new
  *
  * Permission-card flow needs a live WS to click buttons; this script
  * uses bypassPermissions, so the permission card itself is exercised
@@ -91,15 +91,15 @@ await announce('[全面测试 START] Lodestar 2.0 — 控制指令 + 流式 + �
 await sleep(1500)
 
 // ──────────────────────────────────────────────────────────────────────
-// 1) /kill on stopped session
-await announce('[1/8] runCommand("/kill") @ stopped — 期待 ⚪ 未运行')
+// 1) kill on stopped session
+await announce('[1/8] runCommand("kill") @ stopped — 期待 ⚪ 未运行')
 const session = new Session(sessionName, chatId, { permissionMode: 'bypassPermissions' })
-await session.runCommand('/kill')
+await session.runCommand('kill')
 await sleep(2500)
 
-// 2) /hi → start + console card
-await announce('[2/8] runCommand("/hi") @ stopped — 期待 ✅ 启动 + 控制台卡片（含按钮）')
-await session.runCommand('/hi')
+// 2) hi → start + console card
+await announce('[2/8] runCommand("hi") @ stopped — 期待 ✅ 启动 + 控制台卡片（含按钮）')
+await session.runCommand('hi')
 await sleep(4000)
 
 // 3) basic stream + thinking + tool call
@@ -141,14 +141,14 @@ await session.onUserMessage('帮我描述一下这张图的颜色和尺寸。', 
 await waitIdle(session, 120_000, 'phase6')
 await sleep(2000)
 
-// 7) /restart (resume)
-await announce('[7/8] runCommand("/restart") — 期待 🔁 resume 同 session-id')
-await session.runCommand('/restart')
+// 7) restart (resume)
+await announce('[7/8] runCommand("restart") — 期待 🔁 resume 同 session-id')
+await session.runCommand('restart')
 await sleep(5000)
 
-// 8) /clear (fresh)
-await announce('[8/8] runCommand("/clear") — 期待 ⚪ kill + 🚀 启动新 session')
-await session.runCommand('/clear')
+// 8) clear (fresh)
+await announce('[8/8] runCommand("clear") — 期待 ⚪ kill + 🚀 启动新 session')
+await session.runCommand('clear')
 await sleep(5000)
 
 await session.stop('测试结束')
