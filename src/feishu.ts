@@ -204,6 +204,50 @@ export async function addReaction(messageId: string, emojiType: string): Promise
   } catch (e) { log(`feishu: addReaction ${emojiType} on ${messageId} failed: ${e}`) }
 }
 
+// ── Urgent push ───────────────────────────────────────────────────────
+/** Fire Feishu's "加急 — 应用内" push for an already-sent message.
+ * Bypasses chat-level mute and pops a full-screen prompt on the
+ * recipient's phone. Bot must be the original sender of the message
+ * AND must still be a member of the chat.
+ *
+ * Endpoint:
+ *   PATCH /open-apis/im/v1/messages/{message_id}/urgent_app
+ *   ?user_id_type=open_id
+ *   body: { user_id_list: ["ou_..."] }
+ *
+ * Required app scope (either one):
+ *   - `im:message.urgent`            (「发送应用内加急消息」)
+ *   - `im:message.urgent:app_send`   (「…（历史版本）」)
+ *
+ * Limits: 50 QPS app-wide; per-recipient cap is 200 unread urgent
+ * messages (230023). No daily quota.
+ *
+ * Common error codes:
+ *   230012 — message not sent by this bot
+ *   230023 — recipient has 200 unread urgent already
+ *   230052 — missing scope / chat restricts urgent */
+export async function urgentApp(messageId: string, openIds: string[]): Promise<void> {
+  if (!messageId) { log(`feishu: urgentApp skip — missing messageId`); return }
+  if (openIds.length === 0) { log(`feishu: urgentApp skip — empty openIds (msg=${messageId})`); return }
+  const token = await getTenantToken()
+  const url = `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/urgent_app?user_id_type=open_id`
+  try {
+    const res = await fetch(url, {
+      method: 'PATCH',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ user_id_list: openIds }),
+    })
+    const json = await res.json() as any
+    if (json?.code !== 0) {
+      log(`feishu: urgentApp ${messageId} code=${json?.code} msg=${json?.msg}`)
+      return
+    }
+    const invalid = json.data?.invalid_user_id_list ?? []
+    const delivered = openIds.length - invalid.length
+    log(`feishu: urgentApp ${messageId} ok — delivered=${delivered}${invalid.length ? ` invalid=${invalid.length}` : ''}`)
+  } catch (e) { log(`feishu: urgentApp ${messageId} failed: ${e}`) }
+}
+
 // ── Attachment download (image/file) ───────────────────────────────────
 export async function downloadAttachment(
   messageId: string, key: string, type: 'image' | 'file', name?: string,

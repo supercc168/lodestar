@@ -17,6 +17,11 @@ export const ELEMENTS = {
    * and the next assistant chunk opens a new one, so element order in the
    * card matches Claude's emission order. */
   assistant: (i: number) => `assistant_${i}`,
+  /** Console (hi) card — the subscription-usage row is rendered as its
+   * own element so we can replace it after the initial card lands,
+   * decoupling the slow ccusage fetch from the rest of the panel's
+   * synchronous data. */
+  consoleUsage: 'console_usage',
 } as const
 
 /** Minimal projection of an SDK task — used by Session's local mirror,
@@ -514,6 +519,20 @@ interface ConsoleOpts {
   effort?: string
   /** ms since this ClaudeProcess spawned — formatted to "1h 23m" inside. */
   uptimeMs?: number
+  /** All sessions currently running Claude across every Feishu group
+   * this daemon owns. Each entry is a sibling project. Empty/undefined
+   * → omit the section. The session matching this card's chat is
+   * flagged `isCurrent` so the row can be marked. */
+  peers?: Array<{
+    name: string
+    isCurrent: boolean
+    status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
+    uptimeMs?: number
+  }>
+  /** Subscription usage snapshot from ccusage. When `installed: false`
+   * the row renders an install hint; otherwise we surface the current
+   * 5h billing block + this week's aggregate. Undefined → omit row. */
+  usage?: import('./usage').UsageSnapshot
   /** Current context-window occupancy estimate (input + cache tokens of
    * the last assistant message). 0 if no turn has completed yet. */
   contextTokens?: number
@@ -557,9 +576,72 @@ function fmtUptime(ms: number): string {
   return `${d}d ${h % 24}h`
 }
 
+/** Human-readable "time until" — null/past dates collapse to '已重置'. */
+function fmtResetIn(date: Date | null): string {
+  if (!date) return '?'
+  const ms = date.getTime() - Date.now()
+  if (ms <= 0) return '已重置'
+  if (ms < 60 * 60 * 1000) return `${Math.max(1, Math.round(ms / 60_000))}m`
+  if (ms < 24 * 60 * 60 * 1000) return `${Math.round(ms / (60 * 60 * 1000))}h`
+  return `${Math.round(ms / (24 * 60 * 60 * 1000))}d`
+}
+
+const PEER_STATUS_EMOJI: Record<string, string> = {
+  idle: '🟢', working: '⚙️', awaiting_permission: '🔐',
+  starting: '🚀', stopped: '⚪',
+}
+
+/** Render the subscription-usage section of the console card. Pulled out
+ * of `consoleCard` so the caller can patch it in after the initial card
+ * is on screen (ccusage's first cold call is ~5s; we'd rather not block
+ * the whole panel on it). Layout intentionally splits 5h and 7d onto
+ * their own indented lines for readability on phone.
+ *
+ * `usage === undefined` → loading placeholder (initial paint).
+ * `usage === null`      → permanent "no data" (treat like installed but
+ *                          empty; rare path).
+ * `usage.installed=false` → install hint.
+ */
+export function consoleUsageContent(
+  usage: import('./usage').UsageSnapshot | null | undefined,
+): string {
+  if (usage === undefined) return '**📊 订阅额度**　_加载中…_'
+  if (usage === null) return '**📊 订阅额度**　_无数据_'
+  if (!usage.installed) return '**📊 订阅额度**　未装 `ccusage` — `bun i -g ccusage`'
+  // Format follows user spec: `5h X% $Y 剩Zh` / `7d X% $Y 剩Zd`.
+  // Both % values are vs. the user's own historical peak (peak block
+  // for 5h, peak week for 7d) since ccusage has no view into the
+  // actual subscription tier cap. Omit chips that the data layer
+  // couldn't supply rather than fabricate (no_fallbacks).
+  const lines: string[] = ['**📊 订阅额度**']
+  if (usage.fiveHour) {
+    const parts: string[] = []
+    if (usage.fiveHour.percentUsed != null) {
+      parts.push(`${Math.round(usage.fiveHour.percentUsed)}%`)
+    }
+    parts.push(`$${Math.round(usage.fiveHour.costUsd)}`)
+    if (usage.fiveHour.remainingMinutes != null) {
+      parts.push(`剩${(usage.fiveHour.remainingMinutes / 60).toFixed(1)}h`)
+    }
+    lines.push(`　· 5h　${parts.join(' ')}`)
+  }
+  if (usage.weekly) {
+    const parts: string[] = []
+    if (usage.weekly.percentUsed != null) {
+      parts.push(`${Math.round(usage.weekly.percentUsed)}%`)
+    }
+    parts.push(`$${Math.round(usage.weekly.costUsd)}`)
+    if (usage.weekly.remainingDays != null) {
+      parts.push(`剩${usage.weekly.remainingDays.toFixed(1)}d`)
+    }
+    lines.push(`　· 7d　${parts.join(' ')}`)
+  }
+  return lines.length === 1 ? '**📊 订阅额度**　_无数据_' : lines.join('\n')
+}
+
 export function consoleCard(opts: ConsoleOpts): object {
   const {
-    sessionName, status, model, effort, uptimeMs,
+    sessionName, status, model, effort, uptimeMs, peers, usage,
     contextTokens, contextLimit, cumStats, lastTurn, sessionId, hasSession,
   } = opts
   const statusEmoji = {
@@ -575,14 +657,23 @@ export function consoleCard(opts: ConsoleOpts): object {
   // the small Feishu card area without competing with the button row.
   const lines: string[] = [headerLine]
 
+  if (peers && peers.length > 0) {
+    lines.push(`**🗂 活跃项目** (${peers.length})`)
+    for (const p of peers) {
+      const dot = PEER_STATUS_EMOJI[p.status] ?? '·'
+      const up = p.uptimeMs != null && p.uptimeMs > 0 ? ` · ${fmtUptime(p.uptimeMs)}` : ''
+      const mark = p.isCurrent ? ' ← 当前' : ''
+      lines.push(`　· ${dot} \`${p.name}\`${up}${mark}`)
+    }
+  }
   if (contextTokens != null) {
     const limit = contextLimit ?? 1_000_000
     const pct = limit > 0 ? Math.round((contextTokens / limit) * 100) : 0
     lines.push(`**📦 上下文**　${fmtTokens(contextTokens)} / ${fmtTokens(limit)}　(${pct}%)`)
   }
-  if (uptimeMs != null && uptimeMs > 0) {
-    lines.push(`**⏱ 已运行**　${fmtUptime(uptimeMs)}`)
-  }
+  void uptimeMs // session-level uptime is already shown per-project in
+  // the 活跃项目 list above (peers[].uptimeMs); the dedicated row would
+  // duplicate it for the current session.
   if (cumStats && (cumStats.tokens > 0 || cumStats.costUsd > 0 || cumStats.turns > 0)) {
     lines.push(`**💬 累计**　${fmtTokens(cumStats.tokens)} tokens · ${fmtCost(cumStats.costUsd)} · ${cumStats.turns} turn${cumStats.turns === 1 ? '' : 's'}`)
   }
@@ -613,7 +704,15 @@ export function consoleCard(opts: ConsoleOpts): object {
     },
     body: {
       elements: [
-        { tag: 'markdown', content: lines.join('\n\n') },
+        { tag: 'markdown', content: lines.join('\n') },
+        // Separate element so showConsole() can replace it after the
+        // ccusage fetch completes — initial paint goes out immediately
+        // with `_加载中…_`, then this row swaps to real data.
+        {
+          tag: 'markdown',
+          element_id: ELEMENTS.consoleUsage,
+          content: consoleUsageContent(usage),
+        },
       ],
     },
   }
@@ -648,6 +747,21 @@ export function menuCard(opts: MenuOpts): object {
   }
 }
 
-export const STREAMING_OFF_SETTINGS = {
-  config: { streaming_mode: false, summary: { content: '✅ Lodestar 完成' } },
+/** Settings patch applied when a turn finishes — flips streaming off
+ * and updates the chat-list preview with `⏱ duration · NK tokens`
+ * (or just the suffix if interrupted before a result event). */
+export function streamingOffSettings(opts: {
+  durationSec: string
+  tokens?: number
+  suffix?: string
+}): object {
+  const parts: string[] = []
+  parts.push(opts.suffix ?? '✅')
+  parts.push(`⏱ ${opts.durationSec}s`)
+  if (opts.tokens != null && opts.tokens > 0) {
+    parts.push(`${fmtTokens(opts.tokens)} tokens`)
+  }
+  return {
+    config: { streaming_mode: false, summary: { content: parts.join(' · ') } },
+  }
 }

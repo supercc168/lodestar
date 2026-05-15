@@ -91,12 +91,20 @@ async function reviveAliveSessions(): Promise<void> {
 }
 
 // ── Inbound message handler ─────────────────────────────────────────────
-const STALE_THRESHOLD_MS = 10_000
+const STALE_THRESHOLD_MS = 5_000
 const seenMessageIds = new Set<string>()
 
 async function handleMessage(data: any): Promise<void> {
   const message = data?.message
   if (!message) return
+
+  // Feishu's im.message.receive_v1 event puts `sender` at the event
+  // root, sibling of `message` — NOT inside `message` (we had this
+  // wrong before, which silently emptied userOpenId and skipped every
+  // urgent_app push). Try root first, fall back to nested in case the
+  // SDK wraps the payload differently.
+  const senderId = data?.sender?.sender_id ?? data?.event?.sender?.sender_id ?? message?.sender?.sender_id
+  const userOpenId: string = senderId?.open_id ?? ''
 
   const msgId = message.message_id as string | undefined
   if (msgId && seenMessageIds.has(msgId)) return
@@ -116,7 +124,6 @@ async function handleMessage(data: any): Promise<void> {
     if (msgId) void feishu.addReaction(msgId, 'CrossMark')
     return
   }
-  if (msgId) void feishu.addReaction(msgId, 'OK')
 
   const chatId = message.chat_id as string
   let groupName = feishu.chatNameCache.get(chatId)
@@ -154,8 +161,8 @@ async function handleMessage(data: any): Promise<void> {
   // to text-only messages (an image attachment opens a new turn as
   // usual). Bare-word commands have already been intercepted above.
   if (msgType === 'text' && text && session.hasPendingAsk()) {
-    const userId = message.sender?.sender_id?.open_id ?? ''
-    await session.onAskMessageAnswer(text, userId)
+    if (msgId) void feishu.addReaction(msgId, 'CheckMark')
+    await session.onAskMessageAnswer(text, userOpenId)
     return
   }
 
@@ -168,7 +175,7 @@ async function handleMessage(data: any): Promise<void> {
   }
 
   if (!text && !filePath) return
-  await session.onUserMessage(text || '(empty)', filePath ? [filePath] : [])
+  await session.onUserMessage(text || '(empty)', filePath ? [filePath] : [], userOpenId)
 }
 
 // ── Card action handler ────────────────────────────────────────────────

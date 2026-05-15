@@ -16,9 +16,18 @@ import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
 import { INBOX_DIR } from './paths'
+import { readUsage } from './usage'
 
 interface TurnState {
   cardId: string
+  /** Feishu message_id of the card — needed for urgent_app push on clean
+   * turn close. Kept separate from cardId because cardkit's stream APIs
+   * operate on card_id but the urgent_app endpoint takes message_id. */
+  messageId: string
+  /** open_id of the user who started this turn. Used to scope the
+   * urgent_app push so only the initiator gets pinged (in case there
+   * are other members in the group). Empty string → skip the ping. */
+  userOpenId: string
   userText: string
   thinkingText: string
   toolCount: number
@@ -73,6 +82,14 @@ interface CumStats {
 }
 
 export class Session {
+  /** Process-wide registry of every Session ever constructed in this daemon.
+   * Used by the `hi` console panel to enumerate sibling sessions across
+   * Feishu groups. Sessions are never removed (matches the daemon's
+   * `sessions` map lifecycle — one Session per chat for the daemon's
+   * lifetime). Callers should filter on `isRunning()` when they only
+   * want currently-alive Claude processes. */
+  static readonly all: Set<Session> = new Set()
+
   private proc: ClaudeProcess | null = null
   private currentTurn: TurnState | null = null
   private pendingPermissions = new Map<string, { toolUseId: string }>()
@@ -125,12 +142,23 @@ export class Session {
     public readonly chatId: string,
     private opts: SessionOpts = {},
   ) {
+    Session.all.add(this)
     // Restore last-known claude session_id from disk so a daemon restart
     // (systemctl, crash, watchdog) doesn't strand the user with a fresh
     // conversation when they next type `restart`.
     this.lastSessionId = feishu.getSessionResume(sessionName)
     if (this.lastSessionId) {
       log(`session "${sessionName}": restored lastSessionId=${this.lastSessionId.slice(0, 8)}…`)
+    }
+  }
+
+  /** Minimal cross-chat snapshot for the `hi` peer-list section.
+   * `startedAt` stays private so this is the documented read path. */
+  peerSnapshot(): { name: string; status: Status; uptimeMs?: number } {
+    return {
+      name: this.sessionName,
+      status: this.status,
+      uptimeMs: this.startedAt ? (Date.now() - this.startedAt) : undefined,
     }
   }
 
@@ -175,12 +203,21 @@ export class Session {
       await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
       return
     }
-    this.lastSessionId = this.proc.sessionId ?? this.lastSessionId
-    await this.proc.kill()
+    // Flip lifecycle state SYNCHRONOUSLY before awaiting kill — daemon's
+    // SIGTERM cleanup snapshots `isRunning()` and if we're still mid-
+    // `proc.kill()` await it'll see proc!=null and write us into the
+    // alive marker, which makes the next boot auto-revive a session
+    // the user explicitly killed. Reordering the null-out fixes that
+    // race (bug observed 2026-05-15: `kill` immediately followed by
+    // `systemctl restart` revived the killed session on boot).
+    log(`session "${this.sessionName}": stop (${reason})`)
+    const proc = this.proc
+    this.lastSessionId = proc.sessionId ?? this.lastSessionId
     this.proc = null
     this.currentTurn = null
     this.pendingPermissions.clear()
     this.status = 'stopped'
+    await proc.kill()
     await feishu.sendText(this.chatId, `🔴 ${reason} (session: ${this.sessionName})`)
   }
 
@@ -264,6 +301,14 @@ export class Session {
       model,
       effort: 'max',
       uptimeMs,
+      peers: [...Session.all]
+        .filter(s => s.isRunning())
+        .map(s => ({ ...s.peerSnapshot(), isCurrent: s === this })),
+      // Initial paint without usage → cards.ts renders the
+      // `_加载中…_` placeholder in the consoleUsage element. We patch
+      // it in below once readUsage() resolves (ccusage cold-call is
+      // ~5s; not worth blocking the panel on it).
+      usage: undefined,
       contextTokens: this.currentContextTokens(),
       cumStats: this.cumStats,
       lastTurn: this.lastTurnDelta
@@ -276,7 +321,22 @@ export class Session {
       sessionId: this.proc?.sessionId ?? this.lastSessionId,
       hasSession: this.isRunning(),
     })
-    await feishu.sendCard(this.chatId, card)
+    const messageId = await feishu.sendCard(this.chatId, card)
+    if (!messageId) return
+    // Patch the usage element asynchronously so the rest of the panel
+    // stays responsive. We don't await; failures are logged and the
+    // placeholder stays visible (no fallback fabrication).
+    void (async () => {
+      try {
+        const cardId = await cardkit.convertMessageToCard(messageId)
+        const usage = await readUsage()
+        await cardkit.replaceElement(cardId, cards.ELEMENTS.consoleUsage, {
+          tag: 'markdown',
+          element_id: cards.ELEMENTS.consoleUsage,
+          content: cards.consoleUsageContent(usage),
+        })
+      } catch (e) { log(`session "${this.sessionName}": consoleUsage patch failed: ${e}`) }
+    })()
   }
 
   interrupt(): void {
@@ -286,7 +346,7 @@ export class Session {
   }
 
   // ── Inbound from Feishu ────────────────────────────────────────────
-  async onUserMessage(text: string, files: string[] = []): Promise<void> {
+  async onUserMessage(text: string, files: string[] = [], userOpenId = ''): Promise<void> {
     if (!this.isRunning()) {
       const ok = await this.start()
       if (!ok) return
@@ -296,7 +356,7 @@ export class Session {
       this.proc!.sendInterrupt()
       await this.closeTurnCard('🛑 用户打断')
     }
-    await this.openTurnCard(text)
+    await this.openTurnCard(text, userOpenId)
     this.proc!.sendUserText(text, files)
     this.status = 'working'
   }
@@ -569,7 +629,7 @@ export class Session {
     return this.lastTurnDelta?.inputTokens ?? 0
   }
 
-  private async openTurnCard(userText: string): Promise<void> {
+  private async openTurnCard(userText: string, userOpenId: string): Promise<void> {
     const turn = ++this.turnCounter
     const card = cards.mainConversationCard({
       sessionName: this.sessionName,
@@ -584,6 +644,8 @@ export class Session {
     catch (e) { log(`session "${this.sessionName}": id_convert failed: ${e}`); return }
     this.currentTurn = {
       cardId,
+      messageId,
+      userOpenId,
       userText,
       thinkingText: '',
       toolCount: 0,
@@ -620,6 +682,11 @@ export class Session {
       segId,
       this.currentTurn.currentAssistantText,
     )
+    // Chat-list preview: tail of the latest assistant text. Feishu
+    // truncates anyway; ~60 chars is what shows on a typical phone
+    // preview line. patchSummaryThrottled is rate-limited on its own.
+    const tail = this.currentTurn.currentAssistantText.slice(-60)
+    cardkit.patchSummaryThrottled(this.currentTurn.cardId, tail)
   }
 
   private appendThinking(delta: string): void {
@@ -677,6 +744,11 @@ export class Session {
         type: 'insert_before',
         targetElementId: cards.ELEMENTS.footer,
       })
+      // Phone push — user has to come back and answer before Claude can
+      // continue. urgentApp no-ops when userOpenId is empty.
+      if (this.currentTurn.userOpenId && this.currentTurn.messageId) {
+        void feishu.urgentApp(this.currentTurn.messageId, [this.currentTurn.userOpenId])
+      }
       return
     }
     // Pending Task* panels still show the *pre-op* todo mirror so users
@@ -852,6 +924,10 @@ export class Session {
     this.pendingPermissions.set(req.request_id, { toolUseId })
     const el = cards.toolCallPermissionElement(meta.i, meta.name, meta.input, req.request_id)
     void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
+    // Phone push — Claude is blocked until the user approves/denies.
+    if (turn.userOpenId && turn.messageId) {
+      void feishu.urgentApp(turn.messageId, [turn.userOpenId])
+    }
   }
 
   private async closeTurnCard(suffix?: string): Promise<void> {
@@ -896,8 +972,25 @@ export class Session {
     const sendNote = sendPaths.length ? ` · 📎 ${sendPaths.length}` : ''
     const footer = `⏱ ${elapsed}s${suffix ? ' · ' + suffix : ''}${sendNote} · ✅ done`
     await cardkit.streamText(cardId, cards.ELEMENTS.footer, footer)
-    await cardkit.patchSettings(cardId, cards.STREAMING_OFF_SETTINGS)
+    // Final chat-list preview: clean finish shows "⏱ Xs · NK tokens";
+    // interrupted shows the suffix instead (no usage event landed).
+    // cancelSummary kills any in-flight throttled write so a stale
+    // mid-stream tail can't clobber this terminal summary.
+    cardkit.cancelSummary(cardId)
+    await cardkit.patchSettings(cardId, cards.streamingOffSettings({
+      durationSec: elapsed,
+      tokens: suffix ? undefined : this.lastTurnDelta?.tokens,
+      suffix,
+    }))
     await cardkit.dispose(cardId)
+
+    // Phone push on clean turn close so the user knows Claude is done
+    // even with the chat backgrounded. Skip on interrupts (no real
+    // completion) and when we don't know who to ping. Fire-and-forget;
+    // urgent_app failures are non-fatal and already logged in feishu.ts.
+    if (!suffix && turn.userOpenId && turn.messageId) {
+      void feishu.urgentApp(turn.messageId, [turn.userOpenId])
+    }
 
     // Fire uploads sequentially AFTER the card is sealed so each file
     // posts as its own Feishu message below the conversation card.

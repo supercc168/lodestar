@@ -35,6 +35,14 @@ interface CardState {
 
 const cards = new Map<string, CardState>()
 
+interface SummaryState {
+  latest: string
+  lastSent: string
+  timer: ReturnType<typeof setTimeout> | null
+}
+const summaryStates = new Map<string, SummaryState>()
+const SUMMARY_FLUSH_MS = 1500
+
 function state(cardId: string): CardState {
   let s = cards.get(cardId)
   if (!s) {
@@ -190,6 +198,43 @@ export function deleteElement(cardId: string, elementId: string): Promise<void> 
   return s.queue
 }
 
+/** Throttled card-summary update. The summary text is what Feishu shows
+ * in the chat list as the message preview. We coalesce writes on a
+ * SUMMARY_FLUSH_MS window so streaming assistant deltas don't blow up
+ * the settings-PATCH endpoint. Whitespace is collapsed and the input
+ * is trimmed; empty content is ignored. */
+export function patchSummaryThrottled(cardId: string, content: string): void {
+  const trimmed = (content ?? '').replace(/\s+/g, ' ').trim()
+  if (!trimmed) return
+  let s = summaryStates.get(cardId)
+  if (!s) {
+    s = { latest: trimmed, lastSent: '', timer: null }
+    summaryStates.set(cardId, s)
+  } else {
+    s.latest = trimmed
+  }
+  if (s.timer) return
+  s.timer = setTimeout(() => {
+    const st = summaryStates.get(cardId)
+    if (!st) return
+    st.timer = null
+    if (st.latest === st.lastSent) return
+    const toSend = st.latest
+    st.lastSent = toSend
+    void patchSettings(cardId, { config: { summary: { content: toSend } } })
+  }, SUMMARY_FLUSH_MS)
+}
+
+/** Cancel any pending throttled summary write. Call before emitting
+ * a terminal summary (e.g. "✅ ⏱ 12.3s · 4.2K tokens") so a stale
+ * mid-stream tail can't fire after and clobber the final preview. */
+export function cancelSummary(cardId: string): void {
+  const s = summaryStates.get(cardId)
+  if (!s) return
+  if (s.timer) { clearTimeout(s.timer); s.timer = null }
+  summaryStates.delete(cardId)
+}
+
 /** Patch settings — used to flip streaming_mode off when a turn finishes. */
 export function patchSettings(cardId: string, settings: object): Promise<void> {
   const s = state(cardId)
@@ -212,4 +257,5 @@ export async function dispose(cardId: string): Promise<void> {
   await flush(cardId)
   await s.queue
   cards.delete(cardId)
+  cancelSummary(cardId)
 }
