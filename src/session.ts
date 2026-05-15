@@ -76,11 +76,20 @@ export class Session {
   private proc: ClaudeProcess | null = null
   private currentTurn: TurnState | null = null
   private pendingPermissions = new Map<string, { toolUseId: string }>()
-  /** Open AskUserQuestion tool calls — keyed by tool_use_id, valued
-   * with the questions array so we can construct the `answers` reply
-   * once a button is clicked. Cleared when the answer is sent or the
-   * turn ends. */
-  private pendingAsks = new Map<string, { questions: cards.AskQuestion[]; i: number }>()
+  /** Open AskUserQuestion tool calls — keyed by tool_use_id. The SDK
+   * routes AskUserQuestion through the can_use_tool flow even under
+   * bypass; we have to thread the permission `requestId` through here
+   * so onAskAnswer can answer it with `updatedInput.answers` populated.
+   * `deferredAnswer` covers the race where the user clicks a button
+   * BEFORE can_use_tool arrives (addTool fires on the assistant
+   * message; can_use_tool is a separate control_request that lands
+   * slightly later). */
+  private pendingAsks = new Map<string, {
+    questions: cards.AskQuestion[]
+    i: number
+    requestId?: string
+    deferredAnswer?: { questionIdx: number; optionIdx: number; user: string }
+  }>()
   private turnCounter = 0
   // Last seen sessionId — preserved across `kill`/`stop` so a later
   // `restart` can resume the same Claude conversation even after the
@@ -317,39 +326,69 @@ export class Session {
     }
   }
 
-  /** Handle a click on an AskUserQuestion option button. We construct
-   * the SDK-shaped `answers` map (question text → picked option label),
-   * send it back as a `tool_result`, and freeze the panel showing the
-   * picked option. The permission half of the flow was already auto-
-   * allowed in `renderPermission`, so no second action needed there. */
+  /** Click handler for an AskUserQuestion option button. The actual
+   * "send answer to Claude" plumbing lives in `resolveAsk` — this
+   * wrapper just chooses between answering immediately (the common
+   * case: can_use_tool has already arrived and parked a requestId on
+   * the pendingAsk record) versus deferring (the rare race where the
+   * user clicks before can_use_tool lands). */
   async onAskAnswer(toolUseId: string, questionIdx: number, optionIdx: number, user: string): Promise<void> {
     const pending = this.pendingAsks.get(toolUseId)
     if (!pending) { log(`session "${this.sessionName}": stray ask answer for ${toolUseId}`); return }
+    if (pending.requestId) {
+      this.resolveAsk(toolUseId, pending.requestId, questionIdx, optionIdx, user)
+    } else {
+      // can_use_tool hasn't landed yet — park the click. renderPermission
+      // will drain it the moment the request arrives.
+      pending.deferredAnswer = { questionIdx, optionIdx, user }
+      log(`session "${this.sessionName}": ask answer deferred for ${toolUseId} (no requestId yet)`)
+    }
+  }
+
+  /** Settle an AskUserQuestion: emit the permission allow with the
+   * picked option folded into `updatedInput.answers` (this is the
+   * shape the SDK reads to synthesise the tool_result string), repaint
+   * the panel ✅, drop bookkeeping. Single source of truth — both the
+   * normal click path and the deferred-answer drain go through here. */
+  private resolveAsk(
+    toolUseId: string,
+    requestId: string,
+    questionIdx: number,
+    optionIdx: number,
+    user: string,
+  ): void {
+    const pending = this.pendingAsks.get(toolUseId)
+    if (!pending) return
     const q = pending.questions[questionIdx]
     const opt = q?.options?.[optionIdx]
     if (!q || !opt) {
       log(`session "${this.sessionName}": ask answer out of range q=${questionIdx} o=${optionIdx}`)
       return
     }
-    // Build the answers map. SDK keys answers by the question text
-    // (matches what the AskUserQuestion contract expects). For
-    // unanswered secondary questions we don't include them — the SDK
-    // tolerates a partial map; Claude will see whichever it got.
-    const answers: Record<string, string> = { [q.question]: opt.label }
-    const content = JSON.stringify({ answers })
-    this.proc?.sendToolResult(toolUseId, content)
-    this.pendingAsks.delete(toolUseId)
-
-    // Repaint the panel to reflect the final choice — same element_id,
-    // status flips to ✅, body shows what was picked.
     const turn = this.currentTurn
     const meta = turn?.toolByUseId.get(toolUseId)
+    const originalInput = meta?.input ?? {}
+    // SDK keys the answer record by the question's text — confirmed
+    // by the v0.1.2 jsonl trace (empty record formatted to "User has
+    // answered your questions: ."). Populate the key matching this
+    // question with the chosen option's label.
+    const answers: Record<string, string> = { [q.question]: opt.label }
+    this.proc?.sendPermissionResponse(requestId, 'allow', {
+      updatedInput: { ...originalInput, answers },
+    })
+    this.pendingPermissions.delete(requestId)
+    this.pendingAsks.delete(toolUseId)
+
     if (turn && meta) {
-      meta.output = content
+      meta.output = JSON.stringify({ answers })
       meta.isError = false
       const resolvedNote = `\n\n✅ **已回答** by ${user || '匿名'}: ${opt.label}`
       const el = cards.askUserQuestionElement(meta.i, toolUseId, pending.questions, '✅', resolvedNote)
       void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
+    }
+
+    if (this.pendingPermissions.size === 0 && this.status === 'awaiting_permission') {
+      this.status = 'working'
     }
   }
 
@@ -680,17 +719,32 @@ export class Session {
       this.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'unknown tool_use_id' })
       return
     }
-    // AskUserQuestion: daemon already rendered the choice UI in addTool
-    // and is collecting the user's answer asynchronously. The SDK
-    // wraps it in the standard permission flow anyway (even under
-    // bypassPermissions), so we auto-allow the request — otherwise
-    // Claude would block on can_use_tool forever, AND our permission
-    // renderer would overwrite the ask UI with the wrong 3-button
-    // panel. Keeping it allow-by-default also matches the user's
-    // mental model: they expect to choose an option, not "approve"
-    // the question itself.
+    // AskUserQuestion: SDK routes it through can_use_tool even under
+    // bypass. The PAYLOAD of "user has answered" is the permission
+    // response itself — specifically `updatedInput.answers`. So we
+    // CANNOT auto-allow here (that's the v0.1.2 bug: SDK got an empty
+    // answers map and immediately synthesised a "User has answered
+    // your questions: ." tool_result). Park the requestId on the
+    // pendingAsk record and wait for the user to click an option;
+    // onAskAnswer will then send allow + updatedInput.answers in one
+    // shot. If the user already clicked between addTool and now —
+    // the deferredAnswer slot — settle immediately.
     if (meta.name === 'AskUserQuestion') {
-      this.proc?.sendPermissionResponse(req.request_id, 'allow')
+      const ask = this.pendingAsks.get(toolUseId)
+      if (!ask) {
+        // Defensive: addTool should have populated pendingAsks. If it
+        // didn't, fall back to a denial so Claude doesn't hang.
+        log(`session "${this.sessionName}": AskUserQuestion ${toolUseId} missing pendingAsk — deny`)
+        this.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'no pending ask' })
+        return
+      }
+      ask.requestId = req.request_id
+      this.pendingPermissions.set(req.request_id, { toolUseId })
+      if (ask.deferredAnswer) {
+        const { questionIdx, optionIdx, user } = ask.deferredAnswer
+        ask.deferredAnswer = undefined
+        this.resolveAsk(toolUseId, req.request_id, questionIdx, optionIdx, user)
+      }
       return
     }
     this.status = 'awaiting_permission'
