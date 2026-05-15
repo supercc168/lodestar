@@ -89,12 +89,19 @@ export class Session {
     questions: cards.AskQuestion[]
     i: number
     requestId?: string
-    deferredAnswer?: {
-      questionIdx: number
-      optionIdx?: number
-      customText?: string
-      user: string
-    }
+    /** 累计答案 — key 是 question 原文 (SDK 把这条 record 格式
+     * 化进 tool_result), value 是用户选的 option label 或自定
+     * 义文字。全部 question 都答完时一并塞进 updatedInput.answers
+     * 发回 SDK。 */
+    answers: Record<string, string>
+    /** 已答详情 (按 question idx 索引)，用来给历史面板和 terminal
+     * 状态画选中态。answers 同步累计，但这里多保留 customText /
+     * optionIdx 字段以便 UI 区分两种回答路径。 */
+    answered: Map<number, cards.AskAnswered>
+    /** 当前展示的 question idx。undefined 表示全部答完 (terminal)
+     * —— 这时若 requestId 已就位则 finalize；否则等 renderPermission
+     * 一来立即 finalize。 */
+    currentIdx?: number
   }>()
   private turnCounter = 0
   // Last seen sessionId — preserved across `kill`/`stop` so a later
@@ -340,11 +347,11 @@ export class Session {
     return this.pendingAsks.size > 0
   }
 
-  /** Funnel an arbitrary chat message into the oldest pending ask as
-   * a `customText` answer. Falls back to a normal turn if for some
-   * reason there's nothing pending (defensive — handleMessage's gate
-   * should prevent that). Picks the first entry by Map insertion
-   * order, which is the earliest unanswered ask. */
+  /** Funnel an arbitrary chat message into the *current* question
+   * of the oldest pending ask as a `customText` answer. Multi-
+   * question semantics: from the user's perspective, the chat
+   * input always answers whatever question is on screen right now
+   * (`pending.currentIdx`), and a new question slides in after. */
   async onAskMessageAnswer(text: string, user: string): Promise<void> {
     const firstEntry = this.pendingAsks.entries().next()
     if (firstEntry.done) {
@@ -352,102 +359,121 @@ export class Session {
       await this.onUserMessage(text)
       return
     }
-    const [toolUseId, _pending] = firstEntry.value
-    await this.onAskCustomAnswer(toolUseId, 0, text, user)
+    const [toolUseId, pending] = firstEntry.value
+    if (pending.currentIdx === undefined) {
+      log(`session "${this.sessionName}": pending ask ${toolUseId} already terminal — ignoring message`)
+      return
+    }
+    await this.onAskCustomAnswer(toolUseId, pending.currentIdx, text, user)
   }
 
-  /** Click handler for an AskUserQuestion option button. Dispatches
-   * to `resolveAsk` if can_use_tool has already arrived, otherwise
-   * parks the click on the pendingAsk record for renderPermission
-   * to drain. */
+  /** Click handler for an option button. The click must target the
+   * question currently on screen (`pending.currentIdx`); a stale
+   * click (e.g. user clicked an older render before it swapped in
+   * the next question) is logged and dropped — better than double-
+   * answering. */
   async onAskAnswer(toolUseId: string, questionIdx: number, optionIdx: number, user: string): Promise<void> {
     const pending = this.pendingAsks.get(toolUseId)
     if (!pending) { log(`session "${this.sessionName}": stray ask answer for ${toolUseId}`); return }
-    if (pending.requestId) {
-      this.resolveAsk(toolUseId, pending.requestId, { questionIdx, optionIdx, user })
-    } else {
-      pending.deferredAnswer = { questionIdx, optionIdx, user }
-      log(`session "${this.sessionName}": ask answer deferred for ${toolUseId} (no requestId yet)`)
+    if (questionIdx !== pending.currentIdx) {
+      log(`session "${this.sessionName}": stale ask click q=${questionIdx} current=${pending.currentIdx}`)
+      return
     }
+    this.advanceAsk(toolUseId, { optionIdx, user })
   }
 
-  /** Form-submit handler for the custom-answer input on an
-   * AskUserQuestion panel. Same dispatch pattern as `onAskAnswer`,
-   * just routes a free-form string into `resolveAsk` instead of an
-   * option index. Empty/whitespace input is ignored (no answer
-   * sent, panel stays pending). */
+  /** Custom-text branch. Same staleness rule as onAskAnswer; empty
+   * input is silently ignored (panel stays pending). */
   async onAskCustomAnswer(toolUseId: string, questionIdx: number, customText: string, user: string): Promise<void> {
     const pending = this.pendingAsks.get(toolUseId)
     if (!pending) { log(`session "${this.sessionName}": stray ask custom for ${toolUseId}`); return }
     const trimmed = (customText ?? '').trim()
     if (!trimmed) { log(`session "${this.sessionName}": empty custom answer, ignoring`); return }
-    if (pending.requestId) {
-      this.resolveAsk(toolUseId, pending.requestId, { questionIdx, customText: trimmed, user })
-    } else {
-      pending.deferredAnswer = { questionIdx, customText: trimmed, user }
-      log(`session "${this.sessionName}": ask custom deferred for ${toolUseId} (no requestId yet)`)
+    if (questionIdx !== pending.currentIdx) {
+      log(`session "${this.sessionName}": stale ask custom q=${questionIdx} current=${pending.currentIdx}`)
+      return
     }
+    this.advanceAsk(toolUseId, { customText: trimmed, user })
   }
 
-  /** Settle an AskUserQuestion: emit the permission allow with the
-   * picked option OR custom text folded into `updatedInput.answers`
-   * (this is the shape the SDK reads to synthesise the tool_result
-   * string), repaint the panel ✅, drop bookkeeping. Single source
-   * of truth — option-click, custom-submit, and the deferred drain
-   * all go through here. */
-  private resolveAsk(
+  /** Record an answer for the current question, advance the state
+   * machine, repaint. If every question is now answered, finalize
+   * (or defer the finalize until can_use_tool lands — the race is
+   * handled by renderPermission). */
+  private advanceAsk(
     toolUseId: string,
-    requestId: string,
-    answer: { questionIdx: number; optionIdx?: number; customText?: string; user: string },
+    answer: { optionIdx?: number; customText?: string; user: string },
   ): void {
     const pending = this.pendingAsks.get(toolUseId)
-    if (!pending) return
-    const q = pending.questions[answer.questionIdx]
-    if (!q) {
-      log(`session "${this.sessionName}": ask answer out of range q=${answer.questionIdx}`)
-      return
-    }
-    // Determine the literal string that will become the SDK's
-    // `answers` value for this question — custom wins if both are
-    // somehow set (shouldn't happen, but defensive).
-    let answerValue: string
-    if (answer.customText) {
-      answerValue = answer.customText
+    if (!pending || pending.currentIdx === undefined) return
+    const cur = pending.currentIdx
+    const q = pending.questions[cur]
+    if (!q) { log(`session "${this.sessionName}": advanceAsk currentIdx=${cur} out of range`); return }
+    // Resolve the literal answer value — custom text wins if both set.
+    let value: string
+    if (answer.customText !== undefined) {
+      value = answer.customText
     } else if (answer.optionIdx !== undefined) {
       const opt = q.options?.[answer.optionIdx]
-      if (!opt) {
-        log(`session "${this.sessionName}": ask option out of range o=${answer.optionIdx}`)
-        return
-      }
-      answerValue = opt.label
+      if (!opt) { log(`session "${this.sessionName}": advanceAsk option ${answer.optionIdx} out of range`); return }
+      value = opt.label
     } else {
-      log(`session "${this.sessionName}": resolveAsk called with neither optionIdx nor customText`)
+      log(`session "${this.sessionName}": advanceAsk with neither customText nor optionIdx`)
       return
     }
+    pending.answers[q.question] = value
+    pending.answered.set(cur, {
+      optionIdx: answer.optionIdx,
+      customText: answer.customText,
+      user: answer.user,
+    })
+    // Next unanswered idx — linear from cur+1. Implementation
+    // always moves forward; we don't currently let users revisit a
+    // previous question (would need richer UI affordance for that).
+    const total = pending.questions.length
+    let nextIdx: number | undefined = undefined
+    for (let i = cur + 1; i < total; i++) {
+      if (!pending.answered.has(i)) { nextIdx = i; break }
+    }
+    pending.currentIdx = nextIdx
+
     const turn = this.currentTurn
     const meta = turn?.toolByUseId.get(toolUseId)
-    const originalInput = meta?.input ?? {}
-    // SDK keys the answer record by the question's text — confirmed
-    // by the v0.1.2 jsonl trace (empty record formatted to "User has
-    // answered your questions: .").
-    const answers: Record<string, string> = { [q.question]: answerValue }
-    this.proc?.sendPermissionResponse(requestId, 'allow', {
-      updatedInput: { ...originalInput, answers },
-    })
-    this.pendingPermissions.delete(requestId)
-    this.pendingAsks.delete(toolUseId)
-
     if (turn && meta) {
-      meta.output = JSON.stringify({ answers })
-      meta.isError = false
-      const el = cards.askUserQuestionElement(meta.i, toolUseId, pending.questions, '✅', {
-        optionIdx: answer.optionIdx,
-        customText: answer.customText,
-        user: answer.user || '匿名',
-      })
+      const el = cards.askUserQuestionElement(
+        meta.i, toolUseId, pending.questions,
+        nextIdx === undefined ? '✅' : '🤔',
+        { currentIdx: nextIdx, answered: pending.answered },
+      )
       void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
     }
 
+    if (nextIdx === undefined) {
+      // All done. Finalize iff we have the permission request id;
+      // otherwise renderPermission will pick it up when it arrives.
+      if (pending.requestId) this.finalizeAsk(toolUseId)
+      else log(`session "${this.sessionName}": ask ${toolUseId} all answered, waiting for can_use_tool`)
+    }
+  }
+
+  /** Settle a fully-answered AskUserQuestion: emit the SDK allow
+   * with the full `answers` record folded into `updatedInput`,
+   * drop bookkeeping, restore status. The terminal panel paint was
+   * already done by the final advanceAsk; this is just protocol. */
+  private finalizeAsk(toolUseId: string): void {
+    const pending = this.pendingAsks.get(toolUseId)
+    if (!pending || !pending.requestId) return
+    const meta = this.currentTurn?.toolByUseId.get(toolUseId)
+    const originalInput = meta?.input ?? {}
+    this.proc?.sendPermissionResponse(pending.requestId, 'allow', {
+      updatedInput: { ...originalInput, answers: pending.answers },
+    })
+    this.pendingPermissions.delete(pending.requestId)
+    if (meta) {
+      meta.output = JSON.stringify({ answers: pending.answers })
+      meta.isError = false
+    }
+    this.pendingAsks.delete(toolUseId)
     if (this.pendingPermissions.size === 0 && this.status === 'awaiting_permission') {
       this.status = 'working'
     }
@@ -634,8 +660,19 @@ export class Session {
     // don't match the actual N options).
     if (name === 'AskUserQuestion') {
       const questions = Array.isArray(input?.questions) ? input.questions as cards.AskQuestion[] : []
-      this.pendingAsks.set(toolUseId, { questions, i })
-      const el = cards.askUserQuestionElement(i, toolUseId, questions, '🤔')
+      const startIdx = questions.length > 0 ? 0 : undefined
+      const answered = new Map<number, cards.AskAnswered>()
+      this.pendingAsks.set(toolUseId, {
+        questions,
+        i,
+        answers: {},
+        answered,
+        currentIdx: startIdx,
+      })
+      const el = cards.askUserQuestionElement(i, toolUseId, questions, '🤔', {
+        currentIdx: startIdx,
+        answered,
+      })
       void cardkit.addElement(this.currentTurn.cardId, el, {
         type: 'insert_before',
         targetElementId: cards.ELEMENTS.footer,
@@ -799,24 +836,16 @@ export class Session {
     if (meta.name === 'AskUserQuestion') {
       const ask = this.pendingAsks.get(toolUseId)
       if (!ask) {
-        // Defensive: addTool should have populated pendingAsks. If it
-        // didn't, fall back to a denial so Claude doesn't hang.
         log(`session "${this.sessionName}": AskUserQuestion ${toolUseId} missing pendingAsk — deny`)
         this.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'no pending ask' })
         return
       }
       ask.requestId = req.request_id
       this.pendingPermissions.set(req.request_id, { toolUseId })
-      if (ask.deferredAnswer) {
-        const d = ask.deferredAnswer
-        ask.deferredAnswer = undefined
-        this.resolveAsk(toolUseId, req.request_id, {
-          questionIdx: d.questionIdx,
-          optionIdx: d.optionIdx,
-          customText: d.customText,
-          user: d.user,
-        })
-      }
+      // Fast-clicker race: the user may have answered every question
+      // while we were still waiting for can_use_tool to arrive. If so,
+      // advanceAsk parked the all-done state and we drain it now.
+      if (ask.currentIdx === undefined) this.finalizeAsk(toolUseId)
       return
     }
     this.status = 'awaiting_permission'

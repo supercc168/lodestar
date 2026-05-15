@@ -332,14 +332,97 @@ export interface AskQuestion {
  * the first question only and a text-only listing for the rest (an
  * acceptable limitation — these are rare in practice and we can lift
  * it once the UX is validated). */
-/** Final-state info for an AskUserQuestion panel. Mutually-exclusive
- * branches inside: either the user picked one of the SDK-provided
- * options (`optionIdx`), or they typed a free-form answer
- * (`customText`). When both are absent the panel is still pending. */
+/** Per-question final-state. Mutually-exclusive branches: option pick
+ * vs. free-form custom text. */
 export interface AskAnswered {
   optionIdx?: number
   customText?: string
   user?: string
+}
+
+/** State the panel renders against. `currentIdx` undefined → terminal
+ * (every question answered). Otherwise it's the question currently on
+ * screen; everything in `answered` is history. */
+export interface AskState {
+  currentIdx?: number
+  answered: Map<number, AskAnswered>
+}
+
+/** Render one question's body — either as clickable interactive_container
+ * rows (when picked === undefined) or as plain markdown summary
+ * (already-answered, shown in history-panel context). */
+function renderAskQuestionBody(
+  q: AskQuestion,
+  toolUseId: string,
+  questionIdx: number,
+  picked?: AskAnswered,
+): any[] {
+  const els: any[] = []
+  els.push({ tag: 'markdown', content: `**${q.question}**` })
+  for (let oi = 0; oi < q.options.length; oi++) {
+    const opt = q.options[oi]
+    const desc = opt.description ? `  ·  ${opt.description}` : ''
+    if (picked) {
+      const isPicked = picked.optionIdx === oi
+      els.push({
+        tag: 'markdown',
+        content: isPicked
+          ? `✅ **${opt.label}**${desc}`
+          : `~~◯ ${opt.label}${desc}~~`,
+      })
+    } else {
+      els.push({
+        tag: 'interactive_container',
+        background_style: 'default',
+        has_border: true,
+        corner_radius: '6px',
+        padding: '8px 12px',
+        margin: '4px 0px 4px 0px',
+        behaviors: [{
+          type: 'callback',
+          value: {
+            kind: 'ask',
+            tool_use_id: toolUseId,
+            question_idx: questionIdx,
+            option_idx: oi,
+          },
+        }],
+        elements: [{ tag: 'markdown', content: `**${opt.label}**${desc}` }],
+      })
+    }
+  }
+  if (picked?.customText) {
+    els.push({ tag: 'markdown', content: `✏️ **自定义回答**：${picked.customText}` })
+  }
+  return els
+}
+
+/** Folded "📜 已答 N 题" panel — option C from the multi-question
+ * design discussion. Returns null when there's no history to show. */
+function renderAskHistoryPanel(
+  questions: AskQuestion[],
+  answered: Map<number, AskAnswered>,
+): any | null {
+  if (answered.size === 0) return null
+  const lines: string[] = []
+  const sortedIdx = [...answered.keys()].sort((a, b) => a - b)
+  for (const idx of sortedIdx) {
+    const q = questions[idx]
+    const a = answered.get(idx)!
+    const tag = q?.header ?? `Q${idx + 1}`
+    const value = a.customText
+      ?? (a.optionIdx !== undefined ? q?.options[a.optionIdx]?.label : undefined)
+      ?? '?'
+    lines.push(`- ✅ **${tag}**：${value}`)
+  }
+  return {
+    tag: 'collapsible_panel',
+    header: {
+      title: { tag: 'plain_text', content: `📜 已答 ${answered.size} 题（点击展开）` },
+    },
+    expanded: false,
+    elements: [{ tag: 'markdown', content: lines.join('\n') }],
+  }
 }
 
 export function askUserQuestionElement(
@@ -347,106 +430,79 @@ export function askUserQuestionElement(
   toolUseId: string,
   questions: AskQuestion[],
   status: '🤔' | '✅' | '❌' = '🤔',
-  answered?: AskAnswered,
+  state?: AskState,
 ): object {
-  const primary = questions[0]
-  const isAnswered = !!answered && (answered.optionIdx !== undefined || !!answered.customText)
-  const headerTag = primary?.header ? ` · ${primary.header}` : ''
-  let headerText: string
-  if (isAnswered) {
-    // Surface the picked answer in the header so a collapsed panel
-    // still tells the reader what was chosen.
-    const picked = answered!.customText
-      ?? (answered!.optionIdx !== undefined ? primary?.options[answered!.optionIdx]?.label : undefined)
-      ?? '?'
-    headerText = `${status} 已回答${headerTag}：${picked}`
-  } else {
-    headerText = `${status} 🤔 AskUserQuestion${headerTag}`
-  }
+  const total = questions.length
+  const answered = state?.answered ?? new Map<number, AskAnswered>()
+  const currentIdx = state?.currentIdx
+  const isTerminal = currentIdx === undefined && answered.size > 0
   const bodyElements: any[] = []
-  if (primary) {
-    bodyElements.push({ tag: 'markdown', content: `**${primary.question}**` })
-    // One row per option. While pending, each row is a full-width
-    // interactive_container so the entire row is the click target.
-    // Once answered, rows degrade to plain markdown (Feishu has no
-    // generic non-interactive container — `div` doesn't exist, it
-    // rejects the PUT with code 300121).
-    for (let optIdx = 0; optIdx < primary.options.length; optIdx++) {
-      const opt = primary.options[optIdx]
-      const isPicked = answered?.optionIdx === optIdx
-      const desc = opt.description ? `  ·  ${opt.description}` : ''
-      if (!isAnswered) {
-        bodyElements.push({
-          tag: 'interactive_container',
-          background_style: 'default',
-          has_border: true,
-          corner_radius: '6px',
-          padding: '8px 12px',
-          margin: '4px 0px 4px 0px',
-          behaviors: [{
-            type: 'callback',
-            value: {
-              kind: 'ask',
-              tool_use_id: toolUseId,
-              question_idx: 0,
-              option_idx: optIdx,
-            },
-          }],
-          elements: [{ tag: 'markdown', content: `**${opt.label}**${desc}` }],
-        })
-      } else if (isPicked) {
-        bodyElements.push({
-          tag: 'markdown',
-          content: `✅ **${opt.label}**${desc}`,
-        })
-      } else {
-        bodyElements.push({
-          tag: 'markdown',
-          content: `~~◯ ${opt.label}${desc}~~`,
-        })
-      }
+  let headerText: string
+
+  if (isTerminal) {
+    // All questions resolved — collapse and roll up answers in header
+    // + body. Single-question case keeps the old "已回答：xxx" header
+    // style; multi-question gets a "已回答 · N 题" count and a flat
+    // listing of Q→A pairs in the body.
+    if (total === 1) {
+      const q0 = questions[0]
+      const a0 = answered.get(0)
+      const value = a0?.customText
+        ?? (a0?.optionIdx !== undefined ? q0?.options[a0.optionIdx]?.label : undefined)
+        ?? '?'
+      const headerTag = q0?.header ? ` · ${q0.header}` : ''
+      headerText = `${status} 已回答${headerTag}：${value}`
+    } else {
+      headerText = `${status} 已回答 · ${total} 题`
     }
-    // Custom-answer hint (pending state only). Feishu schema 2.0
-    // doesn't actually have `form` / `input` elements — `tag: form`
-    // gets rejected with code 300315. Instead we route custom
-    // answers through a plain chat message: daemon.handleMessage
-    // detects a pending ask and forwards the next inbound text as
-    // the answer, no new turn opened. This is also more Feishu-
-    // native: the chat input is right there, no extra widget.
-    if (!isAnswered) {
+    const sortedIdx = [...answered.keys()].sort((a, b) => a - b)
+    for (const idx of sortedIdx) {
+      const q = questions[idx]
+      const a = answered.get(idx)!
+      const tag = q?.header ?? `Q${idx + 1}`
+      const value = a.customText
+        ?? (a.optionIdx !== undefined ? q?.options[a.optionIdx]?.label : undefined)
+        ?? '?'
       bodyElements.push({
         tag: 'markdown',
-        content: '_💬 也可以直接在群里回复你的答案（裸词命令 `hi`/`kill`/`restart`/`clear` 仍然优先）_',
-      })
-    } else if (answered?.customText) {
-      bodyElements.push({
-        tag: 'markdown',
-        content: `✏️ **自定义回答**：${answered.customText}`,
+        content: `**${tag}**：${value}`,
       })
     }
-  }
-  // Secondary questions (rare): text-only listing. TODO when needed.
-  for (let qi = 1; qi < questions.length; qi++) {
-    const q = questions[qi]
-    const opts = q.options.map(o => `  - ${o.label}${o.description ? ` — ${o.description}` : ''}`).join('\n')
+    const lastUser = [...answered.values()].reverse().find(a => a.user)?.user
+    if (lastUser) {
+      bodyElements.push({
+        tag: 'markdown',
+        content: `\n*— 由 ${lastUser} 回答*`,
+      })
+    }
+  } else if (currentIdx !== undefined && questions[currentIdx]) {
+    // In-progress: render current question + folded history above.
+    // Progress tag in header lets the user see how many are left,
+    // even with the history panel folded.
+    const q = questions[currentIdx]
+    const headerTag = q.header ? ` · ${q.header}` : ''
+    const progress = total > 1 ? ` (${currentIdx + 1}/${total})` : ''
+    headerText = `${status} 🤔 AskUserQuestion${headerTag}${progress}`
+    const history = renderAskHistoryPanel(questions, answered)
+    if (history) bodyElements.push(history)
+    bodyElements.push(...renderAskQuestionBody(q, toolUseId, currentIdx))
     bodyElements.push({
       tag: 'markdown',
-      content: `\n---\n**(其他问题 #${qi + 1}, 暂未支持回答)** ${q.question}\n${opts}`,
+      content: '_💬 也可以直接在群里回复你的答案（裸词命令 `hi`/`kill`/`restart`/`clear` 仍然优先）_',
     })
+  } else {
+    // Defensive fallback — neither answered nor a valid currentIdx.
+    headerText = `${status} 🤔 AskUserQuestion`
+    if (questions[0]) {
+      bodyElements.push({ tag: 'markdown', content: `**${questions[0].question}**` })
+    }
   }
-  if (isAnswered && answered?.user) {
-    bodyElements.push({
-      tag: 'markdown',
-      content: `\n*— 由 ${answered.user} 回答*`,
-    })
-  }
+
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),
     header: { title: { tag: 'plain_text', content: headerText } },
-    // Collapse once answered: header carries the picked answer, body
-    // is just history at that point.
-    expanded: !isAnswered,
+    expanded: !isTerminal,
     elements: bodyElements,
   }
 }
