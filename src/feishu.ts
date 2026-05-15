@@ -8,11 +8,11 @@
 
 import * as lark from '@larksuiteoapi/node-sdk'
 import { execSync } from 'node:child_process'
-import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
 import { config } from './config'
-import { DATA_DIR, INBOX_DIR, SESSION_CHAT_MAP_FILE, SESSION_RESUME_MAP_FILE } from './paths'
+import { ALIVE_MARKER_FILE, DATA_DIR, INBOX_DIR, SESSION_CHAT_MAP_FILE, SESSION_RESUME_MAP_FILE } from './paths'
 import { log } from './log'
 
 const APP_ID = config.feishu.app_id
@@ -104,6 +104,36 @@ export function bindSessionResume(sessionName: string, sessionId: string): void 
 
 export function getSessionResume(sessionName: string): string | null {
   return lastSessionIdByName.get(sessionName) ?? null
+}
+
+// ── Alive-on-shutdown marker ──────────────────────────────────────────
+// Persists the list of session names that were still running when the
+// daemon went down. Next boot reads + unlinks the file and auto-spawns
+// (via session.restart(true)) only those — sessions that were already
+// `stop`ped before shutdown are deliberately NOT in this list, so they
+// stay stopped after restart.
+
+export function writeAliveMarker(sessionNames: string[]): void {
+  try {
+    writeFileSync(ALIVE_MARKER_FILE, JSON.stringify(sessionNames, null, 2))
+  } catch (e) { log(`feishu: write alive marker failed: ${e}`) }
+}
+
+/** Read + unlink in one shot — marker is single-use: revival should
+ * happen exactly once per boot, not re-run on every subsequent crash
+ * loop where systemd might keep re-launching us. */
+export function readAndConsumeAliveMarker(): string[] {
+  if (!existsSync(ALIVE_MARKER_FILE)) return []
+  try {
+    const raw = readFileSync(ALIVE_MARKER_FILE, 'utf8')
+    try { unlinkSync(ALIVE_MARKER_FILE) } catch {}
+    const data = JSON.parse(raw)
+    return Array.isArray(data) ? data.filter((x: unknown): x is string => typeof x === 'string') : []
+  } catch (e) {
+    log(`feishu: read alive marker failed: ${e}`)
+    try { unlinkSync(ALIVE_MARKER_FILE) } catch {}
+    return []
+  }
 }
 
 export function chatIdForSession(sessionName: string): string | null {

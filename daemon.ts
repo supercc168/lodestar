@@ -32,7 +32,19 @@ try {
 mkdirSync(dirname(PID_FILE), { recursive: true })
 writeFileSync(PID_FILE, String(process.pid))
 
-const cleanup = () => { try { unlinkSync(PID_FILE) } catch {} }
+const cleanup = () => {
+  // Snapshot which sessions are still alive so the next boot can
+  // revive them — only the ones still running at shutdown, NOT
+  // anything the user already `kill`-ed (those are absent from the
+  // sessions Map filter below and stay stopped after restart).
+  try {
+    const alive: string[] = []
+    for (const s of sessions.values()) if (s.isRunning()) alive.push(s.sessionName)
+    feishu.writeAliveMarker(alive)
+    if (alive.length > 0) log(`alive marker: [${alive.join(', ')}]`)
+  } catch (e) { log(`alive marker write failed: ${e}`) }
+  try { unlinkSync(PID_FILE) } catch {}
+}
 process.on('exit', cleanup)
 process.on('SIGTERM', () => { log('SIGTERM'); cleanup(); process.exit(0) })
 process.on('SIGINT',  () => { log('SIGINT');  cleanup(); process.exit(0) })
@@ -49,6 +61,33 @@ function sessionFor(chatId: string, sessionName: string): Session {
     sessions.set(chatId, s)
   }
   return s
+}
+
+/** Auto-restart any session that was alive when the previous daemon
+ * went down. Driven by the marker file written in `cleanup` — that
+ * file ONLY lists sessions that were running, so anything the user
+ * had explicitly `kill`-ed before shutdown is intentionally absent
+ * and stays stopped. Each revived session is `restart(true)`-ed so
+ * the SDK gets `--resume <claudeSessionId>` and the in-flight
+ * conversation continues without the user typing anything. */
+async function reviveAliveSessions(): Promise<void> {
+  const names = feishu.readAndConsumeAliveMarker()
+  if (names.length === 0) return
+  log(`revive: ${names.length} session(s) marked alive on shutdown: ${names.join(', ')}`)
+  for (const sessionName of names) {
+    const chatId = feishu.chatIdForSession(sessionName)
+    if (!chatId) {
+      log(`revive: no chatId binding for "${sessionName}", skip`)
+      continue
+    }
+    const session = sessionFor(chatId, sessionName)
+    try {
+      await session.restart(true)
+      log(`revive: spawned "${sessionName}" (chat ${chatId.slice(0, 8)}…)`)
+    } catch (e) {
+      log(`revive: restart "${sessionName}" failed: ${e}`)
+    }
+  }
 }
 
 // ── Inbound message handler ─────────────────────────────────────────────
@@ -225,6 +264,11 @@ async function boot(): Promise<void> {
   })
   ws.start({ eventDispatcher: dispatcher })
   log(`lodestar-daemon: WS started, watching ${feishu.chatNameCache.size} groups`)
+
+  // Auto-revive sessions that were running when we last went down.
+  // Runs AFTER the WS is up so any 🔁 revive message lands in the
+  // right chat instead of disappearing into the void.
+  await reviveAliveSessions()
 }
 
 boot().catch(e => { log(`boot fatal: ${e}`); process.exit(1) })

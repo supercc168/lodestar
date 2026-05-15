@@ -40,4 +40,10 @@ export const PID_FILE = join(DATA_DIR, 'daemon.pid')
 export const LOG_FILE = join(DATA_DIR, 'daemon.log')
 export const SESSION_CHAT_MAP_FILE = join(DATA_DIR, 'session-chat-map.json')
 export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
+/** Marker file written at shutdown listing the session names that
+ * were still alive. The next daemon boot reads it (and unlinks it)
+ * to auto-revive those sessions via `restart(true)` — bridges the
+ * gap between systemctl-restart killing every child Claude and
+ * Lodestar's "you have to send a message to re-spawn it" default. */
+export const ALIVE_MARKER_FILE = join(DATA_DIR, 'alive-on-shutdown.json')
 export const INBOX_DIR = join(DATA_DIR, 'inbox')
