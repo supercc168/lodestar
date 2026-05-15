@@ -100,8 +100,9 @@ async function handleMessage(data: any): Promise<void> {
   let text = (msgType === 'text' ? contentObj.text ?? '' : '').trim()
 
   // Text-only control commands — intercept before any work that would
-  // forward to Claude (download / spawn / interrupt). Exact match,
-  // case-insensitive, only on plain text messages.
+  // forward to Claude (download / spawn / interrupt). Slash-prefixed,
+  // case-insensitive (`/hi`, `/kill`, `/restart`, `/clear`). Bare
+  // greetings ("hi") are NOT consumed and flow through to Claude.
   if (msgType === 'text' && text) {
     if (await session.runCommand(text)) return
   }

@@ -15,6 +15,7 @@ import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
+import { INBOX_DIR } from './paths'
 
 interface TurnState {
   cardId: string
@@ -29,7 +30,6 @@ interface TurnState {
   // [[send: /path]] markers and replace each segment with a cleaned
   // version, then post the files as separate Feishu messages.
   segmentTexts: Map<string, string>
-  pendingSends: string[]
   startedAt: number
 }
 
@@ -104,6 +104,7 @@ export class Session {
     await this.proc.kill()
     this.proc = null
     this.currentTurn = null
+    this.pendingPermissions.clear()
     this.status = 'stopped'
     await feishu.sendText(this.chatId, `🔴 ${reason} (session: ${this.sessionName})`)
   }
@@ -116,6 +117,7 @@ export class Session {
       this.proc = null
     }
     this.currentTurn = null
+    this.pendingPermissions.clear()
     if (resume && prevSessionId) {
       this.proc = new ClaudeProcess({
         workDir: this.workDir,
@@ -134,10 +136,14 @@ export class Session {
     }
   }
 
-  /** Run a user-typed control command. Returns true if the command was
-   * consumed (don't forward to Claude). Matched exactly, case-insensitive. */
-  async runCommand(cmd: string): Promise<boolean> {
-    switch (cmd.toLowerCase()) {
+  /** Run a slash-prefixed control command (`/hi`, `/kill`, `/restart`,
+   * `/clear`).  Returns true if the command was consumed (don't forward
+   * to Claude).  Bare keywords are intentionally NOT consumed so a user
+   * can still say "hi" to Claude in a normal greeting without hijacking. */
+  async runCommand(raw: string): Promise<boolean> {
+    const t = raw.trim().toLowerCase()
+    if (!t.startsWith('/')) return false
+    switch (t.slice(1)) {
       case 'hi':
         if (!this.isRunning()) {
           const ok = await this.start()
@@ -289,7 +295,6 @@ export class Session {
       currentAssistantSegmentId: null,
       currentAssistantText: '',
       segmentTexts: new Map(),
-      pendingSends: [],
       startedAt: Date.now(),
     }
   }
@@ -381,12 +386,19 @@ export class Session {
   }
 
   private async closeTurnCard(suffix?: string): Promise<void> {
-    if (!this.currentTurn) return
-    const elapsed = ((Date.now() - this.currentTurn.startedAt) / 1000).toFixed(1)
-    const cardId = this.currentTurn.cardId
-    const thinkingText = this.currentTurn.thinkingText
-    const segmentTexts = this.currentTurn.segmentTexts
+    // CRITICAL: capture-and-null in a single synchronous block at entry
+    // so a parallel `closeTurnCard` (e.g. result event firing while
+    // onUserMessage is awaiting an interrupt) can't double-process the
+    // same turn — second caller observes null and bails. The promised
+    // sync-handler invariant only protects callers that take the turn
+    // off the table BEFORE their first await.
+    const turn = this.currentTurn
+    if (!turn) return
     this.currentTurn = null
+    const elapsed = ((Date.now() - turn.startedAt) / 1000).toFixed(1)
+    const cardId = turn.cardId
+    const thinkingText = turn.thinkingText
+    const segmentTexts = turn.segmentTexts
     await cardkit.flush(cardId)
 
     // [[send: /abs/path]] markers — strip them from each assistant
@@ -420,8 +432,13 @@ export class Session {
 
     // Fire uploads sequentially AFTER the card is sealed so each file
     // posts as its own Feishu message below the conversation card.
+    // Path gate: workDir (Claude's project sandbox), the inbox where
+    // user-uploaded attachments land, and the /tmp/lodestar- namespace
+    // for ad-hoc artifacts.  Anything outside is refused — see
+    // feishu.isPathAllowed.
+    const allowedRoots = [this.workDir, INBOX_DIR, '/tmp/lodestar-']
     for (const p of sendPaths) {
-      await feishu.uploadAndSend(this.chatId, p)
+      await feishu.uploadAndSend(this.chatId, p, allowedRoots)
     }
   }
 }

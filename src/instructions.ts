@@ -18,6 +18,7 @@ export const CHANNEL_INSTRUCTIONS = [
   '',
   'To send a local file or image back to the user in this Feishu group, emit the marker `[[send: /abs/path]]` anywhere in your reply (preferably on its own line at the end). The daemon will strip every such marker from the visible card AFTER the turn finishes and upload+post the file as a separate Feishu message in the same chat. Rules:',
   '- The path MUST be absolute. Relative paths are ignored.',
+  '- The path MUST resolve inside one of these trusted roots, or it will be REFUSED: the session\'s working directory (~/{session_name}), the Lodestar attachment inbox, or the /tmp/lodestar-* namespace. Anywhere else (/etc, ~/.ssh, ~/.config, ~/.claude*, etc.) is blocked even via symlink.',
   '- Use image extensions (.png .jpg .jpeg .gif .bmp .webp) and the file is sent as an image message; everything else is sent as a generic file attachment.',
   '- Max 30 MB per file. Larger files are rejected and the user is told.',
   '- Only emit the marker when the user actually asked for a file/image, or when delivering a generated artifact (screenshot, diagram, exported doc). Do not echo arbitrary paths.',

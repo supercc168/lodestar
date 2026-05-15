@@ -8,9 +8,9 @@
 
 import * as lark from '@larksuiteoapi/node-sdk'
 import { execSync } from 'node:child_process'
-import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, join } from 'node:path'
+import { basename, extname, join } from 'node:path'
 import { config } from './config'
 import { DATA_DIR, INBOX_DIR, SESSION_CHAT_MAP_FILE } from './paths'
 import { log } from './log'
@@ -187,11 +187,35 @@ export async function downloadAttachment(
 // We refuse anything above 30 MB up front rather than chasing per-tenant
 // limits and surfacing opaque API errors mid-upload.
 const MAX_UPLOAD_BYTES = 30 * 1024 * 1024
-const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'])
+const IMAGE_EXTS = new Set(['.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp'])
 
 function looksLikeImage(filePath: string): boolean {
-  const ext = filePath.toLowerCase().split('.').pop() ?? ''
-  return IMAGE_EXTS.has(ext)
+  return IMAGE_EXTS.has(extname(filePath).toLowerCase())
+}
+
+/** Defense against prompt-injection-driven exfiltration via the
+ * [[send: /path]] marker.  The resolved (symlink-followed) real path
+ * must sit inside one of the explicitly-trusted roots.  Anything
+ * outside — `/etc/*`, `~/.ssh`, `~/.config/lodestar/config.toml`,
+ * `~/.claude.json`, the user's home dotfiles — is rejected, even if a
+ * symlink in an allowed root points to it.
+ *
+ * Returns [realPath, ''] on accept, [null, reason] on reject. */
+function gateOutboundPath(rawPath: string, allowedRoots: string[]): [string | null, string] {
+  let real: string
+  try { real = realpathSync(rawPath) }
+  catch (e) { return [null, `realpath failed: ${e instanceof Error ? e.message : e}`] }
+  for (const root of allowedRoots) {
+    if (!root) continue
+    if (real === root) return [real, '']
+    const prefix = root.endsWith('/') ? root : root + '/'
+    if (real.startsWith(prefix)) return [real, '']
+    // Special-case the `/tmp/lodestar-` namespace: caller can pass
+    // the bare prefix without a trailing slash to mean "any tmp file
+    // whose basename starts with lodestar-".
+    if (root.endsWith('-') && real.startsWith(root)) return [real, '']
+  }
+  return [null, `not inside any allowed root (real=${real})`]
 }
 
 async function uploadImageMultipart(filePath: string): Promise<string | null> {
@@ -263,40 +287,49 @@ export async function sendFile(chatId: string, fileKey: string): Promise<string 
 }
 
 /** Upload a local file and post it as an image or file message in the
- * chat.  Type is inferred from extension.  Returns true on success.  All
- * failures (missing file, oversize, upload reject, send reject) log and
- * surface an inline error message in the chat so the user knows. */
-export async function uploadAndSend(chatId: string, filePath: string): Promise<boolean> {
+ * chat.  Type is inferred from extension.  The path MUST resolve inside
+ * one of `allowedRoots` (defense against prompt-injection-driven
+ * exfiltration via the `[[send: /path]]` marker — see isPathAllowed).
+ * Returns true on success.  All failures (missing file, oversize,
+ * outside allowed roots, upload reject, send reject) log and surface
+ * an inline error message in the chat so the user knows. */
+export async function uploadAndSend(chatId: string, filePath: string, allowedRoots: string[]): Promise<boolean> {
+  const [realPath, reason] = gateOutboundPath(filePath, allowedRoots)
+  if (!realPath) {
+    log(`feishu: uploadAndSend REJECTED ${filePath}: ${reason}`)
+    await sendText(chatId, `❌ 出站文件被拒绝（路径不在允许范围）: ${filePath}`)
+    return false
+  }
   try {
-    const stats = statSync(filePath)
+    const stats = statSync(realPath)
     if (!stats.isFile()) {
       await sendText(chatId, `❌ 出站文件: 路径不是文件 — ${filePath}`)
       return false
     }
     if (stats.size > MAX_UPLOAD_BYTES) {
-      await sendText(chatId, `❌ 出站文件: ${basename(filePath)} 超过 30 MB (${Math.round(stats.size / 1024 / 1024)} MB)`)
+      await sendText(chatId, `❌ 出站文件: ${basename(realPath)} 超过 30 MB (${(stats.size / 1024 / 1024).toFixed(1)} MB)`)
       return false
     }
   } catch (e) {
     await sendText(chatId, `❌ 出站文件: 无法读取 ${filePath} (${e})`)
     return false
   }
-  const isImage = looksLikeImage(filePath)
+  const isImage = looksLikeImage(realPath)
   try {
     if (isImage) {
-      const key = await uploadImageMultipart(filePath)
-      if (!key) { await sendText(chatId, `❌ 出站图片上传失败: ${basename(filePath)}`); return false }
+      const key = await uploadImageMultipart(realPath)
+      if (!key) { await sendText(chatId, `❌ 出站图片上传失败: ${basename(realPath)}`); return false }
       const msgId = await sendImage(chatId, key)
       return msgId != null
     } else {
-      const key = await uploadFileMultipart(filePath)
-      if (!key) { await sendText(chatId, `❌ 出站文件上传失败: ${basename(filePath)}`); return false }
+      const key = await uploadFileMultipart(realPath)
+      if (!key) { await sendText(chatId, `❌ 出站文件上传失败: ${basename(realPath)}`); return false }
       const msgId = await sendFile(chatId, key)
       return msgId != null
     }
   } catch (e) {
     log(`feishu: uploadAndSend ${filePath} failed: ${e}`)
-    await sendText(chatId, `❌ 出站文件异常: ${basename(filePath)} — ${e}`)
+    await sendText(chatId, `❌ 出站文件异常: ${basename(realPath)} — ${e}`)
     return false
   }
 }
