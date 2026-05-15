@@ -19,6 +19,44 @@ export const ELEMENTS = {
   assistant: (i: number) => `assistant_${i}`,
 } as const
 
+/** Minimal projection of an SDK task — used by Session's local mirror,
+ * built incrementally from observed TaskCreate / TaskUpdate input+output
+ * pairs. Not authoritative (the SDK is the source of truth), but enough
+ * to render the "全部任务清单" footer on every Task* panel. */
+export interface Todo {
+  id: number
+  subject?: string
+  description?: string
+  status: 'pending' | 'in_progress' | 'completed' | string
+  owner?: string
+  activeForm?: string
+}
+
+function todoStatusIcon(s: string): string {
+  switch (s) {
+    case 'pending':     return '☐'
+    case 'in_progress': return '🔄'
+    case 'completed':   return '✅'
+    default:            return '·'
+  }
+}
+
+/** Render the session's full todo mirror as a markdown list. Empty list
+ * yields '' so callers can unconditionally concat. Sorted by numeric id
+ * so the order matches creation order regardless of Map iteration. */
+function renderTodoList(todos: Todo[]): string {
+  if (!todos || todos.length === 0) return ''
+  const sorted = [...todos].sort((a, b) => a.id - b.id)
+  const lines = ['', '---', `**📋 当前任务清单（${sorted.length} 项）**`, '']
+  for (const t of sorted) {
+    const icon = todoStatusIcon(t.status)
+    const subject = t.subject ?? '(无 subject)'
+    const ownerTag = t.owner ? `  · ${t.owner}` : ''
+    lines.push(`- ${icon} **#${t.id}** ${subject}${ownerTag}`)
+  }
+  return lines.join('\n')
+}
+
 /** Single-line summary used as a collapsible-panel header for a tool call. */
 export function summarizeToolInput(name: string, input: any): string {
   if (!input || typeof input !== 'object') return ''
@@ -81,8 +119,10 @@ function summarizeTaskWorkflow(name: string, input: any): string {
 /** Markdown body for Task* workflow tools — replaces the generic JSON
  * dump with a human-readable description of the operation plus, once the
  * tool result is in, the SDK's text reply (which already contains "Task
- * #N created" / "Updated task #X" / a rendered list for TaskList). */
-function renderTaskWorkflowBody(name: string, input: any, output: string | null): string {
+ * #N created" / "Updated task #X" / a rendered list for TaskList). When
+ * `todos` is non-empty, the full mirror is appended as a "📋 当前任务
+ * 清单" footer so every Task* panel doubles as a current-state readout. */
+function renderTaskWorkflowBody(name: string, input: any, output: string | null, todos?: Todo[]): string {
   const lines: string[] = []
   switch (name) {
     case 'TaskCreate':
@@ -118,7 +158,7 @@ function renderTaskWorkflowBody(name: string, input: any, output: string | null)
     lines.push('**结果**')
     lines.push(output.slice(0, 3000))
   }
-  return lines.join('\n')
+  return lines.join('\n') + renderTodoList(todos ?? [])
 }
 
 interface MainCardOpts {
@@ -191,6 +231,10 @@ export function toolCallElement(
   output: string | null,
   status: '⏳' | '✅' | '❌' = '⏳',
   resolvedNote?: string,
+  /** Session's full todo mirror — only rendered when the tool is a Task*
+   * workflow op. Other tools ignore it. Passed in by Session so every
+   * Task* panel shows the *current* state, not just this op's diff. */
+  todos?: Todo[],
 ): object {
   const summary = summarizeToolInput(name, input)
   const headerText = summary
@@ -198,11 +242,12 @@ export function toolCallElement(
     : `${status} 🔧 ${name}`
   const isTaskWorkflow = name.startsWith('Task') && name !== 'Task'
   const noteBlock = resolvedNote ? `\n\n${resolvedNote}` : ''
-  // Task* gets a narrative body (operation + result), the rest keeps the
-  // JSON-input + raw-output split — generic dump is better for unfamiliar
-  // tools where users can't predict what fields matter.
+  // Task* gets a narrative body (operation + result + current todo list),
+  // the rest keeps the JSON-input + raw-output split — generic dump is
+  // better for unfamiliar tools where users can't predict what fields
+  // matter.
   const body = isTaskWorkflow
-    ? renderTaskWorkflowBody(name, input, output) + noteBlock
+    ? renderTaskWorkflowBody(name, input, output, todos) + noteBlock
     : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
       + noteBlock
       + (output != null ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```' : '')
