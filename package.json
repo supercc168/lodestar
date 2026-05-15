@@ -1,6 +1,9 @@
 {
-  "name": "lodestar",
+  "name": "@leviyuan/lodestar",
   "version": "0.1.0",
+  "publishConfig": {
+    "access": "public"
+  },
   "description": "Lodestar (夜航星) — IM-native frontend for Claude Code via Feishu Card Kit streaming",
   "type": "module",
   "license": "MIT",
