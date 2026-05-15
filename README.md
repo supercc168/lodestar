@@ -20,7 +20,7 @@ AI 不是帮手,是倍率。它放大的不是体力,是你——你的直觉、
 - 🧠 **思考过程透明** — `thinking` 流式渲染,turn 结束后自动收起为可展开面板。每次工具调用也是一格折叠面板:折起是概述,展开看完整 input/output。
 - 🔐 **权限审批就地完成** — 需要授权的工具调用,**原地**升级为 🔐 等审批状态,三颗按钮 `允许 / 始终允许 / 拒绝` 直接嵌在面板里。不弹独立卡片,不破坏时序。点完按钮,后续 output 接在同一条线上继续往下走。
 - ❓ **结构化追问** — Claude 的 `AskUserQuestion` 在群里呈现为可点击选项行;不满意?直接在群里**打字回答**,daemon 会把自由文本当作 custom answer 发回去。多题串行,有进度计数和"已答 N 题"折叠历史。
-- 📦 **状态面板一键唤出** — 发 `hi` 弹一张控制台:model、上下文占用 %、累计 tokens/cost、上一轮 delta、session id、订阅额度(5h / 7d 双窗,通过 [ccusage](https://github.com/ryoppippi/ccusage) 拉取)、本机所有活跃项目并列展示。
+- 📦 **状态面板一键唤出** — 发 `hi` 弹一张控制台:model、上下文占用 %、累计 tokens/cost、上一轮 delta、session id、订阅额度(5h / 7d 真实 utilization,直读 Anthropic 官方 OAuth Usage API,凭据走 `~/.claude/.credentials.json`,token 过期自动 refresh)、本机所有活跃项目并列展示。
 - 📎 **图片 / 文件双向互传** — 用户在群里发图/文件,Claude 通过消息里的 `[file: /abs/path]` 提示就能读;Claude 在回复里写 `[[send: /abs/path]]`,标记被剥离,文件以独立消息发回群里。出站路径走 realpath + 白名单校验,只允许工作目录、`/tmp/lodestar-*`、inbox 三块,`/etc`、`~/.ssh`、`~/.config` 即使被符号链接绕也拒绝。
 - 📲 **加急锁屏推送** — 需要你回答问题、需要你批准操作、一轮跑完了——三种关键时刻自动触发飞书"应用内加急",直接打穿勿扰、亮屏推送。卡片摘要会同步改写成具体待办("🔐 等审批: Bash · rm -rf …"、"❓ 待回答 3 题: …"),锁屏一瞥就知道发生了什么。
 - 🗂 **多项目并发** — 一个 daemon 同时持有 N 个飞书群 ↔ N 个 Claude session。状态面板能跨群看到所有活跃项目和它们的 uptime,在群 A 里就能查群 B 在干嘛。
@@ -61,8 +61,6 @@ AI 不是帮手,是倍率。它放大的不是体力,是你——你的直觉、
   - `cardkit:card:read` `cardkit:card:write`
     `cardkit:card.element:read` `cardkit:card.element:write`
     `cardkit:card.settings:read` `cardkit:card.settings:write`
-
-可选: `bun i -g ccusage`——状态卡片里那行订阅额度就靠它。没装也能跑,只是那一行会显示「未装」提示。
 
 ### 2. 配置
 

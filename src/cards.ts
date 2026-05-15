@@ -593,48 +593,41 @@ const PEER_STATUS_EMOJI: Record<string, string> = {
 
 /** Render the subscription-usage section of the console card. Pulled out
  * of `consoleCard` so the caller can patch it in after the initial card
- * is on screen (ccusage's first cold call is ~5s; we'd rather not block
- * the whole panel on it). Layout intentionally splits 5h and 7d onto
- * their own indented lines for readability on phone.
+ * is on screen (网络往返可能慢于第一次 paint;先占位、回包后替换)。
  *
- * `usage === undefined` → loading placeholder (initial paint).
- * `usage === null`      → permanent "no data" (treat like installed but
- *                          empty; rare path).
- * `usage.installed=false` → install hint.
+ * 数据源是 Anthropic 官方 OAuth Usage API (见 src/usage.ts)。
+ * 百分比是真实 utilization,失败态按 state 区分显示具体原因。
+ *
+ * `usage === undefined` → 初始 loading 占位。
  */
 export function consoleUsageContent(
-  usage: import('./usage').UsageSnapshot | null | undefined,
+  usage: import('./usage').UsageSnapshot | undefined,
 ): string {
   if (usage === undefined) return '**📊 订阅额度**　_加载中…_'
-  if (usage === null) return '**📊 订阅额度**　_无数据_'
-  if (!usage.installed) return '**📊 订阅额度**　未装 `ccusage` — `bun i -g ccusage`'
-  // Format follows user spec: `5h X% $Y 剩Zh` / `7d X% $Y 剩Zd`.
-  // Both % values are vs. the user's own historical peak (peak block
-  // for 5h, peak week for 7d) since ccusage has no view into the
-  // actual subscription tier cap. Omit chips that the data layer
-  // couldn't supply rather than fabricate (no_fallbacks).
-  const lines: string[] = ['**📊 订阅额度**']
+  switch (usage.state) {
+    case 'no_credentials':
+      return '**📊 订阅额度**　未找到 OAuth 凭据 (`~/.claude/.credentials.json`)'
+    case 'auth_failed':
+      return '**📊 订阅额度**　Token 已过期且刷新失败 — 重新 `claude auth login`'
+    case 'rate_limited':
+      return '**📊 订阅额度**　API 429 限流,稍后重试'
+    case 'network':
+      return `**📊 订阅额度**　拉取失败${usage.reason ? ' — `' + usage.reason + '`' : ''}`
+  }
+  // state === 'ok'
+  const head = usage.subscriptionType
+    ? `**📊 订阅额度** · ${usage.subscriptionType}`
+    : '**📊 订阅额度**'
+  const lines: string[] = [head]
   if (usage.fiveHour) {
-    const parts: string[] = []
-    if (usage.fiveHour.percentUsed != null) {
-      parts.push(`${Math.round(usage.fiveHour.percentUsed)}%`)
-    }
-    parts.push(`$${Math.round(usage.fiveHour.costUsd)}`)
-    if (usage.fiveHour.remainingMinutes != null) {
-      parts.push(`剩${(usage.fiveHour.remainingMinutes / 60).toFixed(1)}h`)
-    }
-    lines.push(`　· 5h　${parts.join(' ')}`)
+    const parts = [`${Math.round(usage.fiveHour.percent)}%`]
+    if (usage.fiveHour.resetsAt) parts.push(`重置 ${fmtResetIn(usage.fiveHour.resetsAt)}`)
+    lines.push(`　· 5h　${parts.join(' · ')}`)
   }
   if (usage.weekly) {
-    const parts: string[] = []
-    if (usage.weekly.percentUsed != null) {
-      parts.push(`${Math.round(usage.weekly.percentUsed)}%`)
-    }
-    parts.push(`$${Math.round(usage.weekly.costUsd)}`)
-    if (usage.weekly.remainingDays != null) {
-      parts.push(`剩${usage.weekly.remainingDays.toFixed(1)}d`)
-    }
-    lines.push(`　· 7d　${parts.join(' ')}`)
+    const parts = [`${Math.round(usage.weekly.percent)}%`]
+    if (usage.weekly.resetsAt) parts.push(`重置 ${fmtResetIn(usage.weekly.resetsAt)}`)
+    lines.push(`　· 7d　${parts.join(' · ')}`)
   }
   return lines.length === 1 ? '**📊 订阅额度**　_无数据_' : lines.join('\n')
 }
