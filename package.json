@@ -1,0 +1,49 @@
+{
+  "name": "lodestar",
+  "version": "0.1.0",
+  "description": "Lodestar (夜航星) — IM-native frontend for Claude Code via Feishu Card Kit streaming",
+  "type": "module",
+  "license": "MIT",
+  "author": "leviyuan",
+  "homepage": "https://github.com/leviyuan/lodestar#readme",
+  "bugs": "https://github.com/leviyuan/lodestar/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/leviyuan/lodestar.git"
+  },
+  "keywords": [
+    "feishu",
+    "lark",
+    "claude-code",
+    "claude",
+    "ai",
+    "agent",
+    "im",
+    "chat",
+    "card-kit",
+    "streaming",
+    "lodestar"
+  ],
+  "scripts": {
+    "start": "bun daemon.ts"
+  },
+  "bin": {
+    "lodestar-daemon": "./daemon.ts"
+  },
+  "files": [
+    "daemon.ts",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "engines": {
+    "bun": ">=1.0.0"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.44.0"
+  },
+  "devDependencies": {
+    "@types/bun": "latest",
+    "typescript": "^5.5.0"
+  }
+}

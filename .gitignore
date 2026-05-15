@@ -1,0 +1,17 @@
+node_modules/
+
+# OS / editor
+.DS_Store
+*.swp
+*~
+
+# Local OMC / Claude / IDE state
+.omc/
+.claude/
+
+# Local override config (if dropped in repo for testing)
+config.toml
+
+# Stray runtime artifacts
+*.pid
+*.log
