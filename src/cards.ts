@@ -406,47 +406,17 @@ export function askUserQuestionElement(
         })
       }
     }
-    // Custom-answer input (pending state only). Feishu form submit
-    // packages the input value under `form_value` in the callback
-    // payload; daemon.handleCardAction reads it as
-    // `value.form_value.custom_answer`.
+    // Custom-answer hint (pending state only). Feishu schema 2.0
+    // doesn't actually have `form` / `input` elements — `tag: form`
+    // gets rejected with code 300315. Instead we route custom
+    // answers through a plain chat message: daemon.handleMessage
+    // detects a pending ask and forwards the next inbound text as
+    // the answer, no new turn opened. This is also more Feishu-
+    // native: the chat input is right there, no extra widget.
     if (!isAnswered) {
-      bodyElements.push({ tag: 'markdown', content: '_或自己输入：_' })
       bodyElements.push({
-        tag: 'form',
-        name: `ask_form_${toolUseId.slice(-12)}`,
-        elements: [{
-          tag: 'column_set',
-          columns: [
-            {
-              tag: 'column', width: 'weighted', weight: 3, vertical_align: 'center',
-              elements: [{
-                tag: 'input',
-                name: 'custom_answer',
-                placeholder: { tag: 'plain_text', content: '自定义回答…' },
-                required: false,
-              }],
-            },
-            {
-              tag: 'column', width: 'weighted', weight: 1, vertical_align: 'center',
-              elements: [{
-                tag: 'button',
-                text: { tag: 'plain_text', content: '发送' },
-                type: 'primary',
-                form_action_type: 'submit',
-                behaviors: [{
-                  type: 'callback',
-                  value: {
-                    kind: 'ask',
-                    tool_use_id: toolUseId,
-                    question_idx: 0,
-                    custom: true,
-                  },
-                }],
-              }],
-            },
-          ],
-        }],
+        tag: 'markdown',
+        content: '_💬 也可以直接在群里回复你的答案（裸词命令 `hi`/`kill`/`restart`/`clear` 仍然优先）_',
       })
     } else if (answered?.customText) {
       bodyElements.push({

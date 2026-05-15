@@ -332,6 +332,30 @@ export class Session {
     }
   }
 
+  /** True iff there's at least one open AskUserQuestion awaiting an
+   * answer in this session. `daemon.handleMessage` uses this to
+   * decide whether an inbound chat message should be a custom answer
+   * (routed to onAskMessageAnswer) instead of opening a new turn. */
+  hasPendingAsk(): boolean {
+    return this.pendingAsks.size > 0
+  }
+
+  /** Funnel an arbitrary chat message into the oldest pending ask as
+   * a `customText` answer. Falls back to a normal turn if for some
+   * reason there's nothing pending (defensive — handleMessage's gate
+   * should prevent that). Picks the first entry by Map insertion
+   * order, which is the earliest unanswered ask. */
+  async onAskMessageAnswer(text: string, user: string): Promise<void> {
+    const firstEntry = this.pendingAsks.entries().next()
+    if (firstEntry.done) {
+      log(`session "${this.sessionName}": onAskMessageAnswer with no pending — falling back to onUserMessage`)
+      await this.onUserMessage(text)
+      return
+    }
+    const [toolUseId, _pending] = firstEntry.value
+    await this.onAskCustomAnswer(toolUseId, 0, text, user)
+  }
+
   /** Click handler for an AskUserQuestion option button. Dispatches
    * to `resolveAsk` if can_use_tool has already arrived, otherwise
    * parks the click on the pendingAsk record for renderPermission

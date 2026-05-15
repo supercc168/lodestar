@@ -108,6 +108,18 @@ async function handleMessage(data: any): Promise<void> {
     if (await session.runCommand(text)) return
   }
 
+  // Pending AskUserQuestion: route the message as a custom answer
+  // instead of opening a new turn. This is how custom-text answers
+  // work in this version — Feishu schema 2.0 doesn't support form/
+  // input elements, so the chat box itself is the input. Only applies
+  // to text-only messages (an image attachment opens a new turn as
+  // usual). Bare-word commands have already been intercepted above.
+  if (msgType === 'text' && text && session.hasPendingAsk()) {
+    const userId = message.sender?.sender_id?.open_id ?? ''
+    await session.onAskMessageAnswer(text, userId)
+    return
+  }
+
   let filePath: string | undefined
   if (msgType === 'image' && contentObj.image_key) {
     filePath = await feishu.downloadAttachment(message.message_id, contentObj.image_key, 'image')
