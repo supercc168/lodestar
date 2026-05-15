@@ -12,7 +12,7 @@ import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { join } from 'node:path'
 import { config } from './config'
-import { INBOX_DIR, SESSION_CHAT_MAP_FILE } from './paths'
+import { DATA_DIR, INBOX_DIR, SESSION_CHAT_MAP_FILE } from './paths'
 import { log } from './log'
 
 const APP_ID = config.feishu.app_id
@@ -57,7 +57,7 @@ function saveSessionChatMap(): void {
   try {
     const obj: Record<string, string> = {}
     for (const [k, v] of preferredChatForSession) obj[k] = v
-    mkdirSync(STATE_DIR, { recursive: true })
+    mkdirSync(DATA_DIR, { recursive: true })
     writeFileSync(SESSION_CHAT_MAP_FILE, JSON.stringify(obj, null, 2))
   } catch (e) { log(`feishu: save session-chat-map failed: ${e}`) }
 }
