@@ -382,8 +382,8 @@ export class Session {
     if (turn && meta) {
       meta.output = JSON.stringify({ answers })
       meta.isError = false
-      const resolvedNote = `\n\n✅ **已回答** by ${user || '匿名'}: ${opt.label}`
-      const el = cards.askUserQuestionElement(meta.i, toolUseId, pending.questions, '✅', resolvedNote)
+      const resolvedNote = `\n\n*已由 ${user || '匿名'} 回答*`
+      const el = cards.askUserQuestionElement(meta.i, toolUseId, pending.questions, '✅', optionIdx, resolvedNote)
       void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
     }
 
@@ -606,6 +606,12 @@ export class Session {
     // can't discard the output after the first paint.
     meta.output = output
     meta.isError = isError
+    // AskUserQuestion already had its final panel painted by resolveAsk
+    // (✅ + the chosen option marked, others dimmed). The tool_result
+    // arriving here is just the SDK's synthesised echo — re-rendering
+    // via toolCallElement would clobber the nice option-row layout
+    // with a generic JSON dump. Bail out; the panel is done.
+    if (meta.name === 'AskUserQuestion') return
     // Update the local todo mirror BEFORE rendering so the just-
     // completed panel shows the new state too (e.g. a TaskCreate panel
     // already lists the task it just created).

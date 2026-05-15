@@ -337,6 +337,11 @@ export function askUserQuestionElement(
   toolUseId: string,
   questions: AskQuestion[],
   status: '🤔' | '✅' | '❌' = '🤔',
+  /** When set, only this option is rendered as "picked" — every other
+   * option turns into plain text (no click target). Used after the
+   * user has answered so the panel freezes in a sensible terminal
+   * state instead of inviting another click. */
+  pickedOptionIdx?: number,
   resolvedNote?: string,
 ): object {
   const primary = questions[0]
@@ -345,18 +350,38 @@ export function askUserQuestionElement(
   const bodyElements: any[] = []
   if (primary) {
     bodyElements.push({ tag: 'markdown', content: `**${primary.question}**` })
-    // Stack option buttons in a column_set — one button per option.
-    // Each carries `kind:'ask'` + the toolUseId + question/option idx
-    // so the daemon's card action handler can map a click back to
-    // exactly one (question, choice) pair.
-    bodyElements.push({
-      tag: 'column_set',
-      columns: primary.options.map((opt, optIdx) => ({
-        tag: 'column', width: 'weighted', weight: 1,
-        elements: [{
-          tag: 'button',
-          text: { tag: 'plain_text', content: opt.label },
-          type: 'default',
+    // One row per option, each a full-width interactive_container so
+    // the entire row (label + description) is the click target. Looks
+    // cleaner than a row of squat buttons and matches the way IM
+    // quick-replies usually present themselves. After the user picks,
+    // we still render the same row layout (no JSON dump) but strip
+    // the callbacks — selected option marked ✅, others dimmed.
+    for (let optIdx = 0; optIdx < primary.options.length; optIdx++) {
+      const opt = primary.options[optIdx]
+      const isPicked = pickedOptionIdx === optIdx
+      const isAnswered = pickedOptionIdx !== undefined
+      const labelLine = isPicked
+        ? `**✅ ${opt.label}**`
+        : isAnswered
+          ? `~~${opt.label}~~`
+          : `**${opt.label}**`
+      const descLine = opt.description ? `\n${opt.description}` : ''
+      const rowContent = { tag: 'markdown', content: `${labelLine}${descLine}` }
+      if (isAnswered) {
+        // Frozen — no behaviors, plain container so it stops looking
+        // clickable.
+        bodyElements.push({
+          tag: 'div',
+          elements: [rowContent],
+        })
+      } else {
+        bodyElements.push({
+          tag: 'interactive_container',
+          background_style: 'default',
+          has_border: true,
+          corner_radius: '6px',
+          padding: '8px 12px',
+          margin: '4px 0',
           behaviors: [{
             type: 'callback',
             value: {
@@ -366,15 +391,10 @@ export function askUserQuestionElement(
               option_idx: optIdx,
             },
           }],
-        }],
-      })),
-    })
-    // Inline option descriptions below the buttons so the user can
-    // read context without hovering.
-    const descLines = primary.options
-      .map((o, idx) => o.description ? `- **${o.label}** — ${o.description}` : `- **${o.label}**`)
-      .join('\n')
-    if (descLines) bodyElements.push({ tag: 'markdown', content: descLines })
+          elements: [rowContent],
+        })
+      }
+    }
   }
   // Secondary questions get text-only treatment (TODO: multi-question
   // panels when actually requested by a real prompt).
