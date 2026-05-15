@@ -8,9 +8,9 @@
 
 import * as lark from '@larksuiteoapi/node-sdk'
 import { execSync } from 'node:child_process'
-import { mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { basename, join } from 'node:path'
 import { config } from './config'
 import { DATA_DIR, INBOX_DIR, SESSION_CHAT_MAP_FILE } from './paths'
 import { log } from './log'
@@ -179,6 +179,125 @@ export async function downloadAttachment(
   } catch (e) {
     log(`feishu: download ${type} failed: ${e instanceof Error ? e.message : e}`)
     return undefined
+  }
+}
+
+// ── Outbound: upload + send file/image ────────────────────────────────
+// Lark caps message images at ~30 MB; files vary by tenant (default 30 MB).
+// We refuse anything above 30 MB up front rather than chasing per-tenant
+// limits and surfacing opaque API errors mid-upload.
+const MAX_UPLOAD_BYTES = 30 * 1024 * 1024
+const IMAGE_EXTS = new Set(['png', 'jpg', 'jpeg', 'gif', 'bmp', 'webp'])
+
+function looksLikeImage(filePath: string): boolean {
+  const ext = filePath.toLowerCase().split('.').pop() ?? ''
+  return IMAGE_EXTS.has(ext)
+}
+
+async function uploadImageMultipart(filePath: string): Promise<string | null> {
+  const token = await getTenantToken()
+  const file = Bun.file(filePath)
+  const form = new FormData()
+  form.append('image_type', 'message')
+  form.append('image', file, basename(filePath))
+  const res = await fetch('https://open.feishu.cn/open-apis/im/v1/images', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  })
+  const data = await res.json() as any
+  if (data?.code !== 0) {
+    log(`feishu: uploadImage ${filePath} code=${data.code} msg=${data.msg}`)
+    return null
+  }
+  return data.data?.image_key ?? null
+}
+
+async function uploadFileMultipart(filePath: string): Promise<string | null> {
+  const token = await getTenantToken()
+  const file = Bun.file(filePath)
+  const form = new FormData()
+  // 'stream' is the catch-all type and works for arbitrary binaries.
+  form.append('file_type', 'stream')
+  form.append('file_name', basename(filePath))
+  form.append('file', file, basename(filePath))
+  const res = await fetch('https://open.feishu.cn/open-apis/im/v1/files', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}` },
+    body: form,
+  })
+  const data = await res.json() as any
+  if (data?.code !== 0) {
+    log(`feishu: uploadFile ${filePath} code=${data.code} msg=${data.msg}`)
+    return null
+  }
+  return data.data?.file_key ?? null
+}
+
+export async function sendImage(chatId: string, imageKey: string): Promise<string | null> {
+  try {
+    const res: any = await client.im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: { receive_id: chatId, msg_type: 'image', content: JSON.stringify({ image_key: imageKey }) },
+    })
+    if (res?.code && res.code !== 0) {
+      log(`feishu: sendImage rejected chat=${chatId} code=${res.code} msg=${res.msg}`)
+      return null
+    }
+    return res?.data?.message_id ?? null
+  } catch (e) { log(`feishu: sendImage failed chat=${chatId}: ${e}`); return null }
+}
+
+export async function sendFile(chatId: string, fileKey: string): Promise<string | null> {
+  try {
+    const res: any = await client.im.message.create({
+      params: { receive_id_type: 'chat_id' },
+      data: { receive_id: chatId, msg_type: 'file', content: JSON.stringify({ file_key: fileKey }) },
+    })
+    if (res?.code && res.code !== 0) {
+      log(`feishu: sendFile rejected chat=${chatId} code=${res.code} msg=${res.msg}`)
+      return null
+    }
+    return res?.data?.message_id ?? null
+  } catch (e) { log(`feishu: sendFile failed chat=${chatId}: ${e}`); return null }
+}
+
+/** Upload a local file and post it as an image or file message in the
+ * chat.  Type is inferred from extension.  Returns true on success.  All
+ * failures (missing file, oversize, upload reject, send reject) log and
+ * surface an inline error message in the chat so the user knows. */
+export async function uploadAndSend(chatId: string, filePath: string): Promise<boolean> {
+  try {
+    const stats = statSync(filePath)
+    if (!stats.isFile()) {
+      await sendText(chatId, `❌ 出站文件: 路径不是文件 — ${filePath}`)
+      return false
+    }
+    if (stats.size > MAX_UPLOAD_BYTES) {
+      await sendText(chatId, `❌ 出站文件: ${basename(filePath)} 超过 30 MB (${Math.round(stats.size / 1024 / 1024)} MB)`)
+      return false
+    }
+  } catch (e) {
+    await sendText(chatId, `❌ 出站文件: 无法读取 ${filePath} (${e})`)
+    return false
+  }
+  const isImage = looksLikeImage(filePath)
+  try {
+    if (isImage) {
+      const key = await uploadImageMultipart(filePath)
+      if (!key) { await sendText(chatId, `❌ 出站图片上传失败: ${basename(filePath)}`); return false }
+      const msgId = await sendImage(chatId, key)
+      return msgId != null
+    } else {
+      const key = await uploadFileMultipart(filePath)
+      if (!key) { await sendText(chatId, `❌ 出站文件上传失败: ${basename(filePath)}`); return false }
+      const msgId = await sendFile(chatId, key)
+      return msgId != null
+    }
+  } catch (e) {
+    log(`feishu: uploadAndSend ${filePath} failed: ${e}`)
+    await sendText(chatId, `❌ 出站文件异常: ${basename(filePath)} — ${e}`)
+    return false
   }
 }
 

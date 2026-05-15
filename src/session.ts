@@ -25,8 +25,15 @@ interface TurnState {
   assistantSegmentCount: number
   currentAssistantSegmentId: string | null
   currentAssistantText: string
+  // Per-assistant-segment cumulative text — used at turn close to strip
+  // [[send: /path]] markers and replace each segment with a cleaned
+  // version, then post the files as separate Feishu messages.
+  segmentTexts: Map<string, string>
+  pendingSends: string[]
   startedAt: number
 }
+
+const SEND_MARKER_RE = /\[\[send:\s*([^\]\n]+?)\s*\]\]/g
 
 type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
 
@@ -281,6 +288,8 @@ export class Session {
       assistantSegmentCount: 0,
       currentAssistantSegmentId: null,
       currentAssistantText: '',
+      segmentTexts: new Map(),
+      pendingSends: [],
       startedAt: Date.now(),
     }
   }
@@ -302,9 +311,11 @@ export class Session {
       })
     }
     this.currentTurn.currentAssistantText += delta
+    const segId = this.currentTurn.currentAssistantSegmentId
+    this.currentTurn.segmentTexts.set(segId, this.currentTurn.currentAssistantText)
     cardkit.streamTextThrottled(
       this.currentTurn.cardId,
-      this.currentTurn.currentAssistantSegmentId,
+      segId,
       this.currentTurn.currentAssistantText,
     )
   }
@@ -372,16 +383,45 @@ export class Session {
   private async closeTurnCard(suffix?: string): Promise<void> {
     if (!this.currentTurn) return
     const elapsed = ((Date.now() - this.currentTurn.startedAt) / 1000).toFixed(1)
-    const footer = `⏱ ${elapsed}s${suffix ? ' · ' + suffix : ''} · ✅ done`
     const cardId = this.currentTurn.cardId
     const thinkingText = this.currentTurn.thinkingText
+    const segmentTexts = this.currentTurn.segmentTexts
     this.currentTurn = null
     await cardkit.flush(cardId)
+
+    // [[send: /abs/path]] markers — strip them from each assistant
+    // segment and collect paths to upload after the card finalizes.
+    const sendPaths: string[] = []
+    for (const [segId, fullText] of segmentTexts) {
+      let changed = false
+      const cleaned = fullText.replace(SEND_MARKER_RE, (_m, p1) => {
+        changed = true
+        const p = String(p1).trim()
+        if (p.startsWith('/')) sendPaths.push(p)
+        else log(`session "${this.sessionName}": ignore non-absolute send path: ${p}`)
+        return ''
+      })
+      if (changed) {
+        const finalText = cleaned.trim() || ' '
+        await cardkit.replaceElement(cardId, segId, {
+          tag: 'markdown', element_id: segId, content: finalText,
+        })
+      }
+    }
+
     if (thinkingText.trim()) {
       await cardkit.replaceElement(cardId, cards.ELEMENTS.thinking, cards.thinkingCollapsedPanel(thinkingText))
     }
+    const sendNote = sendPaths.length ? ` · 📎 ${sendPaths.length}` : ''
+    const footer = `⏱ ${elapsed}s${suffix ? ' · ' + suffix : ''}${sendNote} · ✅ done`
     await cardkit.streamText(cardId, cards.ELEMENTS.footer, footer)
     await cardkit.patchSettings(cardId, cards.STREAMING_OFF_SETTINGS)
     await cardkit.dispose(cardId)
+
+    // Fire uploads sequentially AFTER the card is sealed so each file
+    // posts as its own Feishu message below the conversation card.
+    for (const p of sendPaths) {
+      await feishu.uploadAndSend(this.chatId, p)
+    }
   }
 }
