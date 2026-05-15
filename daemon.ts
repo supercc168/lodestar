@@ -140,6 +140,9 @@ async function handleCardAction(data: any): Promise<any> {
     case 'menu':
       await session.onUserMessage(`(menu choice ${value.choice + 1})`)
       return { toast: { type: 'success', content: 'OK' } }
+    case 'ask':
+      await session.onAskAnswer(value.tool_use_id, value.question_idx ?? 0, value.option_idx, userId)
+      return { toast: { type: 'success', content: '已回答' } }
   }
   return { toast: { type: 'info', content: 'unknown action' } }
 }

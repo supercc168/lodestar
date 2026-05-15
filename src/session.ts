@@ -76,6 +76,11 @@ export class Session {
   private proc: ClaudeProcess | null = null
   private currentTurn: TurnState | null = null
   private pendingPermissions = new Map<string, { toolUseId: string }>()
+  /** Open AskUserQuestion tool calls — keyed by tool_use_id, valued
+   * with the questions array so we can construct the `answers` reply
+   * once a button is clicked. Cleared when the answer is sent or the
+   * turn ends. */
+  private pendingAsks = new Map<string, { questions: cards.AskQuestion[]; i: number }>()
   private turnCounter = 0
   // Last seen sessionId — preserved across `kill`/`stop` so a later
   // `restart` can resume the same Claude conversation even after the
@@ -312,6 +317,42 @@ export class Session {
     }
   }
 
+  /** Handle a click on an AskUserQuestion option button. We construct
+   * the SDK-shaped `answers` map (question text → picked option label),
+   * send it back as a `tool_result`, and freeze the panel showing the
+   * picked option. The permission half of the flow was already auto-
+   * allowed in `renderPermission`, so no second action needed there. */
+  async onAskAnswer(toolUseId: string, questionIdx: number, optionIdx: number, user: string): Promise<void> {
+    const pending = this.pendingAsks.get(toolUseId)
+    if (!pending) { log(`session "${this.sessionName}": stray ask answer for ${toolUseId}`); return }
+    const q = pending.questions[questionIdx]
+    const opt = q?.options?.[optionIdx]
+    if (!q || !opt) {
+      log(`session "${this.sessionName}": ask answer out of range q=${questionIdx} o=${optionIdx}`)
+      return
+    }
+    // Build the answers map. SDK keys answers by the question text
+    // (matches what the AskUserQuestion contract expects). For
+    // unanswered secondary questions we don't include them — the SDK
+    // tolerates a partial map; Claude will see whichever it got.
+    const answers: Record<string, string> = { [q.question]: opt.label }
+    const content = JSON.stringify({ answers })
+    this.proc?.sendToolResult(toolUseId, content)
+    this.pendingAsks.delete(toolUseId)
+
+    // Repaint the panel to reflect the final choice — same element_id,
+    // status flips to ✅, body shows what was picked.
+    const turn = this.currentTurn
+    const meta = turn?.toolByUseId.get(toolUseId)
+    if (turn && meta) {
+      meta.output = content
+      meta.isError = false
+      const resolvedNote = `\n\n✅ **已回答** by ${user || '匿名'}: ${opt.label}`
+      const el = cards.askUserQuestionElement(meta.i, toolUseId, pending.questions, '✅', resolvedNote)
+      void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
+    }
+  }
+
   async onConsoleAction(action: string): Promise<void> {
     log(`session "${this.sessionName}": console action=${action}`)
     switch (action) {
@@ -485,6 +526,22 @@ export class Session {
     }
     const i = this.currentTurn.toolCount++
     this.currentTurn.toolByUseId.set(toolUseId, { i, name, input })
+    // AskUserQuestion is a client-side tool — daemon renders the choice
+    // UI in-line and supplies the tool_result itself once the user
+    // clicks. Branch BEFORE the generic toolCallElement so we never
+    // fall through to a JSON dump or, worse, get clobbered by the
+    // permission flow (which would render 🔐 three-button buttons that
+    // don't match the actual N options).
+    if (name === 'AskUserQuestion') {
+      const questions = Array.isArray(input?.questions) ? input.questions as cards.AskQuestion[] : []
+      this.pendingAsks.set(toolUseId, { questions, i })
+      const el = cards.askUserQuestionElement(i, toolUseId, questions, '🤔')
+      void cardkit.addElement(this.currentTurn.cardId, el, {
+        type: 'insert_before',
+        targetElementId: cards.ELEMENTS.footer,
+      })
+      return
+    }
     // Pending Task* panels still show the *pre-op* todo mirror so users
     // can read the current state immediately, without waiting for the
     // tool to return.
@@ -621,6 +678,19 @@ export class Session {
     if (!meta) {
       log(`session "${this.sessionName}": can_use_tool for unknown tool_use_id=${toolUseId} — auto-deny req=${req.request_id}`)
       this.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'unknown tool_use_id' })
+      return
+    }
+    // AskUserQuestion: daemon already rendered the choice UI in addTool
+    // and is collecting the user's answer asynchronously. The SDK
+    // wraps it in the standard permission flow anyway (even under
+    // bypassPermissions), so we auto-allow the request — otherwise
+    // Claude would block on can_use_tool forever, AND our permission
+    // renderer would overwrite the ask UI with the wrong 3-button
+    // panel. Keeping it allow-by-default also matches the user's
+    // mental model: they expect to choose an option, not "approve"
+    // the question itself.
+    if (meta.name === 'AskUserQuestion') {
+      this.proc?.sendPermissionResponse(req.request_id, 'allow')
       return
     }
     this.status = 'awaiting_permission'

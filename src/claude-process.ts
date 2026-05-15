@@ -312,6 +312,31 @@ export class ClaudeProcess extends EventEmitter {
     })
   }
 
+  /** Feed a `tool_result` back to Claude as if a tool finished — used
+   * by the daemon when WE (the client) own the tool's execution side,
+   * e.g. AskUserQuestion: the SDK emits `tool_use` and waits for the
+   * client to render UI, collect a choice, and supply the result here.
+   * `content` is whatever the tool's contract says — for
+   * AskUserQuestion this is a JSON string `{"answers": {...}}`.
+   *
+   * NOTE: this is the same `{type:'user'}` envelope as `sendUserText`,
+   * just with a `tool_result` content block instead of plain text. The
+   * SDK demultiplexes by `tool_use_id`. */
+  sendToolResult(toolUseId: string, content: string, isError = false): void {
+    this.write({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: toolUseId,
+          content,
+          ...(isError ? { is_error: true } : {}),
+        }],
+      },
+    })
+  }
+
   sendHookResponse(requestId: string, output: object = {}): void {
     this.write({
       type: 'control_response',

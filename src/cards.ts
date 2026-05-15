@@ -310,6 +310,92 @@ function permissionButtonColumn(label: string, type: string, requestId: string, 
   }
 }
 
+/** Schema of an AskUserQuestion question, projected to just the fields
+ * the panel needs. Mirrors the SDK tool's input — kept loose since the
+ * runtime guarantees it matches. */
+export interface AskQuestion {
+  question: string
+  header?: string
+  multiSelect?: boolean
+  options: { label: string; description?: string }[]
+}
+
+/** Tool-panel renderer for `AskUserQuestion` — the SDK's structured
+ * multiple-choice question. Daemon takes over the client-side role:
+ * instead of letting the request fall through to the generic JSON
+ * dump (or worse, the permission flow that misappropriates it), we
+ * render each question with one button per option, callbacks tagged
+ * `kind:'ask'` so the Lark handler can route the answer back as a
+ * `tool_result`.
+ *
+ * Single-question is the common case; multi-question gets buttons on
+ * the first question only and a text-only listing for the rest (an
+ * acceptable limitation — these are rare in practice and we can lift
+ * it once the UX is validated). */
+export function askUserQuestionElement(
+  i: number,
+  toolUseId: string,
+  questions: AskQuestion[],
+  status: '🤔' | '✅' | '❌' = '🤔',
+  resolvedNote?: string,
+): object {
+  const primary = questions[0]
+  const headerTag = primary?.header ? ` · ${primary.header}` : ''
+  const headerText = `${status} 🤔 AskUserQuestion${headerTag}`
+  const bodyElements: any[] = []
+  if (primary) {
+    bodyElements.push({ tag: 'markdown', content: `**${primary.question}**` })
+    // Stack option buttons in a column_set — one button per option.
+    // Each carries `kind:'ask'` + the toolUseId + question/option idx
+    // so the daemon's card action handler can map a click back to
+    // exactly one (question, choice) pair.
+    bodyElements.push({
+      tag: 'column_set',
+      columns: primary.options.map((opt, optIdx) => ({
+        tag: 'column', width: 'weighted', weight: 1,
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: opt.label },
+          type: 'default',
+          behaviors: [{
+            type: 'callback',
+            value: {
+              kind: 'ask',
+              tool_use_id: toolUseId,
+              question_idx: 0,
+              option_idx: optIdx,
+            },
+          }],
+        }],
+      })),
+    })
+    // Inline option descriptions below the buttons so the user can
+    // read context without hovering.
+    const descLines = primary.options
+      .map((o, idx) => o.description ? `- **${o.label}** — ${o.description}` : `- **${o.label}**`)
+      .join('\n')
+    if (descLines) bodyElements.push({ tag: 'markdown', content: descLines })
+  }
+  // Secondary questions get text-only treatment (TODO: multi-question
+  // panels when actually requested by a real prompt).
+  for (let qi = 1; qi < questions.length; qi++) {
+    const q = questions[qi]
+    const opts = q.options.map(o => `  - ${o.label}${o.description ? ` — ${o.description}` : ''}`).join('\n')
+    bodyElements.push({
+      tag: 'markdown',
+      content: `\n---\n**(其他问题 #${qi + 1}, 暂未支持回答)** ${q.question}\n${opts}`,
+    })
+  }
+  if (resolvedNote) bodyElements.push({ tag: 'markdown', content: resolvedNote })
+  return {
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.tool(i),
+    header: { title: { tag: 'plain_text', content: headerText } },
+    expanded: true,
+    elements: bodyElements,
+  }
+}
+
 interface ConsoleOpts {
   sessionName: string
   status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
