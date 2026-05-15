@@ -44,6 +44,23 @@ export interface CanUseToolRequest {
   tool_use_id?: string
 }
 
+/** Subset of the SDK's `usage` object — only the fields the console
+ * panel actually shows. Anthropic adds new ones (server_tool_use,
+ * service_tier, iterations, …) without breaking existing readers. */
+export interface ClaudeUsage {
+  input_tokens?: number
+  output_tokens?: number
+  cache_creation_input_tokens?: number
+  cache_read_input_tokens?: number
+}
+
+export interface ClaudeResultMeta {
+  cost_usd: number | null
+  duration_ms: number | null
+  num_turns: number | null
+  usage: ClaudeUsage | null
+}
+
 export interface HookCallbackRequest {
   request_id: string
   callback_id: string
@@ -60,6 +77,22 @@ export class ClaudeProcess extends EventEmitter {
   private expectedExit = false
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
+  /** Model id (`claude-opus-4-7`, …) from the most recent assistant
+   * message — surfaced in the console panel so the user sees what's
+   * actually running, not whatever default we'd assume. */
+  lastModel: string | null = null
+  /** Usage from the most recent `assistant` message — input_tokens +
+   * cache_* on the *latest* message is the best proxy for current
+   * context-window occupancy, since each assistant turn replays the
+   * accumulated conversation. */
+  lastUsage: ClaudeUsage | null = null
+  /** Result-level metadata from the most recent `result` message —
+   * per-turn cost / wallclock / num_turns. Cleared to null only on
+   * spawn; persists across turns so the console panel can show "last
+   * turn" stats even while idle. */
+  lastResult: ClaudeResultMeta = {
+    cost_usd: null, duration_ms: null, num_turns: null, usage: null,
+  }
 
   constructor(opts: SpawnOpts) {
     super()
@@ -184,6 +217,8 @@ export class ClaudeProcess extends EventEmitter {
           this.emit('thinking', { uuid: msg.uuid, text: block.thinking })
         }
       }
+      if (msg.message?.usage) this.lastUsage = msg.message.usage as ClaudeUsage
+      if (typeof msg.message?.model === 'string') this.lastModel = msg.message.model
       if (msg.uuid) this.lastAssistantUuid = msg.uuid
       return
     }
@@ -201,6 +236,12 @@ export class ClaudeProcess extends EventEmitter {
       return
     }
     if (type === 'result') {
+      this.lastResult = {
+        cost_usd: typeof msg.total_cost_usd === 'number' ? msg.total_cost_usd : null,
+        duration_ms: typeof msg.duration_ms === 'number' ? msg.duration_ms : null,
+        num_turns: typeof msg.num_turns === 'number' ? msg.num_turns : null,
+        usage: msg.usage ?? null,
+      }
       this.emit('result', msg)
       return
     }
@@ -245,19 +286,28 @@ export class ClaudeProcess extends EventEmitter {
     })
   }
 
-  sendPermissionResponse(requestId: string, decision: 'allow' | 'deny', updatedInput?: any): void {
+  /** Response schema for `can_use_tool` control_request (NOT the
+   * PreToolUse-hook output shape that lives elsewhere in the SDK).
+   *   allow → { behavior: 'allow', updatedInput: <record> }
+   *   deny  → { behavior: 'deny',  message: <string> }
+   * Sending the wrong shape gets Zod-rejected on the Claude side and
+   * the decision never lands — the card visually flips to "resolved"
+   * but Claude immediately re-fires the same can_use_tool, looking to
+   * the user like a "flash back to original" bug. */
+  sendPermissionResponse(
+    requestId: string,
+    decision: 'allow' | 'deny',
+    payload?: { updatedInput?: Record<string, unknown>; denyMessage?: string },
+  ): void {
+    const response = decision === 'allow'
+      ? { behavior: 'allow' as const, updatedInput: payload?.updatedInput ?? {} }
+      : { behavior: 'deny' as const, message: payload?.denyMessage ?? 'denied by user' }
     this.write({
       type: 'control_response',
       response: {
         subtype: 'success',
         request_id: requestId,
-        response: {
-          hookSpecificOutput: {
-            hookEventName: 'PreToolUse',
-            permissionDecision: decision,
-            ...(updatedInput ? { permissionDecisionInput: updatedInput } : {}),
-          },
-        },
+        response,
       },
     })
   }

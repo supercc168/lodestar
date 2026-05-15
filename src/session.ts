@@ -9,7 +9,7 @@
 
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
-import { ClaudeProcess, type CanUseToolRequest, type HookCallbackRequest } from './claude-process'
+import { ClaudeProcess, type CanUseToolRequest, type HookCallbackRequest, type ClaudeUsage } from './claude-process'
 import { CHANNEL_INSTRUCTIONS } from './instructions'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
@@ -22,7 +22,7 @@ interface TurnState {
   userText: string
   thinkingText: string
   toolCount: number
-  toolByUseId: Map<string, { i: number; name: string; input: any }>
+  toolByUseId: Map<string, { i: number; name: string; input: any; resolvedNote?: string }>
   assistantSegmentCount: number
   currentAssistantSegmentId: string | null
   currentAssistantText: string
@@ -41,23 +41,53 @@ export interface SessionOpts {
   permissionMode?: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'
 }
 
+/** Per-turn delta extracted from the SDK `result` message — feeds the
+ * "上一轮" line in the console panel. */
+interface LastTurnDelta {
+  tokens: number      // input + cache_* + output for that turn
+  costUsd: number
+  durationMs: number
+  inputTokens: number // input + cache_* (excludes output) — context-window estimate
+}
+
+/** Cumulative session counters. Reset on full restart (`clear`), preserved
+ * across resume — but resumed conversations start counting from the
+ * resume point, not the original turn 0; the SDK doesn't replay historical
+ * usage. The session_id continuity is preserved separately by the resume
+ * map; cumStats represents "since the current ClaudeProcess was spawned". */
+interface CumStats {
+  tokens: number
+  costUsd: number
+  turns: number
+}
+
 export class Session {
   private proc: ClaudeProcess | null = null
   private currentTurn: TurnState | null = null
-  private pendingPermissions = new Map<string, { messageId: string; toolName: string }>()
+  private pendingPermissions = new Map<string, { toolUseId: string }>()
   private turnCounter = 0
   // Last seen sessionId — preserved across `kill`/`stop` so a later
   // `restart` can resume the same Claude conversation even after the
   // child process is gone.
   private lastSessionId: string | null = null
   private startedAt: number = 0
+  private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
+  private lastTurnDelta: LastTurnDelta | null = null
   status: Status = 'stopped'
 
   constructor(
     public readonly sessionName: string,
     public readonly chatId: string,
     private opts: SessionOpts = {},
-  ) {}
+  ) {
+    // Restore last-known claude session_id from disk so a daemon restart
+    // (systemctl, crash, watchdog) doesn't strand the user with a fresh
+    // conversation when they next type `restart`.
+    this.lastSessionId = feishu.getSessionResume(sessionName)
+    if (this.lastSessionId) {
+      log(`session "${sessionName}": restored lastSessionId=${this.lastSessionId.slice(0, 8)}…`)
+    }
+  }
 
   get workDir(): string { return join(feishu.PROJECTS_ROOT, this.sessionName) }
   isRunning(): boolean { return !!this.proc && this.proc.isAlive() }
@@ -82,7 +112,7 @@ export class Session {
     this.proc = new ClaudeProcess({
       workDir: this.workDir,
       effort: 'max',
-      permissionMode: this.opts.permissionMode ?? 'default',
+      permissionMode: this.opts.permissionMode ?? 'bypassPermissions',
       appendSystemPrompt: CHANNEL_INSTRUCTIONS,
     })
     this.wireProc(this.proc)
@@ -122,7 +152,7 @@ export class Session {
       this.proc = new ClaudeProcess({
         workDir: this.workDir,
         effort: 'max',
-        permissionMode: 'default',
+        permissionMode: this.opts.permissionMode ?? 'bypassPermissions',
         resumeSessionId: prevSessionId,
         appendSystemPrompt: CHANNEL_INSTRUCTIONS,
       })
@@ -132,6 +162,16 @@ export class Session {
       this.startedAt = Date.now()
       await feishu.sendText(this.chatId, `🔁 已重启并恢复 session=${prevSessionId.slice(0, 8)}…`)
     } else {
+      // Resume requested but no prior session_id on file — surface it
+      // explicitly rather than silently fresh-starting (the old behavior
+      // hid the daemon-restart sessionId-loss bug for months).
+      if (resume) {
+        await feishu.sendText(this.chatId, '⚠️ 没有可恢复的上一会话，将以新会话启动')
+      }
+      // Fresh conversation — drop cumulative stats so the next `hi` shows
+      // zeroed counters instead of bleeding numbers from the prior chat.
+      this.cumStats = { tokens: 0, costUsd: 0, turns: 0 }
+      this.lastTurnDelta = null
       await this.start()
     }
   }
@@ -168,14 +208,27 @@ export class Session {
   }
 
   async showConsole(): Promise<void> {
-    const uptime = this.startedAt
-      ? `${Math.round((Date.now() - this.startedAt) / 1000)}s`
-      : undefined
+    const uptimeMs = this.startedAt ? (Date.now() - this.startedAt) : undefined
+    // Strip the `claude-` prefix so the panel stays compact: `opus-4-7`
+    // reads better than `claude-opus-4-7` in the small status header.
+    const rawModel = this.proc?.lastModel ?? null
+    const model = rawModel ? rawModel.replace(/^claude-/, '') : undefined
     const card = cards.consoleCard({
       sessionName: this.sessionName,
       status: this.status,
+      model,
       effort: 'max',
-      uptime,
+      uptimeMs,
+      contextTokens: this.currentContextTokens(),
+      cumStats: this.cumStats,
+      lastTurn: this.lastTurnDelta
+        ? {
+            tokens: this.lastTurnDelta.tokens,
+            costUsd: this.lastTurnDelta.costUsd,
+            durationMs: this.lastTurnDelta.durationMs,
+          }
+        : undefined,
+      sessionId: this.proc?.sessionId ?? this.lastSessionId,
       hasSession: this.isRunning(),
     })
     await feishu.sendCard(this.chatId, card)
@@ -212,8 +265,21 @@ export class Session {
     if (!pending) { log(`session "${this.sessionName}": stray permission ${requestId}`); return }
     this.pendingPermissions.delete(requestId)
 
-    const resolved = cards.permissionResolvedCard(pending.toolName, decision, user)
-    await feishu.patchCardMessage(pending.messageId, resolved)
+    // Update the tool element in the main turn card in place — the
+    // permission decision lives on the same row as the tool call.
+    const turn = this.currentTurn
+    const meta = turn?.toolByUseId.get(pending.toolUseId)
+    if (turn && meta) {
+      if (decision === 'deny') {
+        const el = cards.toolCallElement(meta.i, meta.name, meta.input, `🚫 已拒绝 by ${user || '匿名'}`, '❌')
+        void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
+      } else {
+        const label = decision === 'allow_always' ? '始终允许' : '已允许'
+        meta.resolvedNote = `✅ **${label}** by ${user || '匿名'}`
+        const el = cards.toolCallElement(meta.i, meta.name, meta.input, null, '⏳', meta.resolvedNote)
+        void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
+      }
+    }
 
     const claudeDecision = decision === 'deny' ? 'deny' : 'allow'
     this.proc?.sendPermissionResponse(requestId, claudeDecision)
@@ -235,12 +301,22 @@ export class Session {
       case 'stop':      await this.stop(); break
       case 'start':     await this.start(); break
       case 'resume':    await this.restart(true); break
+      case 'refresh':   await this.showConsole(); break
       case 'ls':        await feishu.sendText(this.chatId, `📁 ${this.workDir}`); break
     }
   }
 
   // ── Wiring Claude → Feishu ─────────────────────────────────────────
   private wireProc(p: ClaudeProcess): void {
+    p.on('init', () => {
+      // Persist the freshly assigned session_id so a later daemon
+      // restart can resume this conversation. Skip if unchanged to
+      // avoid hammering the file on every init for resumed sessions.
+      if (p.sessionId && p.sessionId !== this.lastSessionId) {
+        this.lastSessionId = p.sessionId
+        feishu.bindSessionResume(this.sessionName, p.sessionId)
+      }
+    })
     p.on('assistant_text', ({ text }: { text: string }) => {
       this.appendAssistant(text)
     })
@@ -254,13 +330,14 @@ export class Session {
       this.completeTool(tool_use_id, content, is_error)
     })
     p.on('can_use_tool', (req: CanUseToolRequest) => {
-      void this.renderPermission(req)
+      this.renderPermission(req)
     })
     p.on('hook_callback', (req: HookCallbackRequest) => {
       // No hooks registered → fail-safe ack.
       this.proc?.sendHookResponse(req.request_id, {})
     })
     p.on('result', () => {
+      this.accumulateResultStats()
       void this.closeTurnCard()
       this.status = 'idle'
     })
@@ -273,6 +350,37 @@ export class Session {
         void feishu.sendText(this.chatId, `⚠️ Claude 异常退出 (code=${code}, signal=${signal})。回复任意消息将重新启动。`)
       }
     })
+  }
+
+  /** Pull per-turn numbers off `proc.lastResult` (set by ClaudeProcess when
+   * the `result` message landed) and roll them into cumStats + the
+   * "上一轮" delta. Called exactly once per result event, right before
+   * closeTurnCard. */
+  private accumulateResultStats(): void {
+    const r = this.proc?.lastResult
+    if (!r) return
+    const u = r.usage ?? {}
+    const inputTokens = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0)
+    const outputTokens = u.output_tokens ?? 0
+    const tokens = inputTokens + outputTokens
+    const costUsd = r.cost_usd ?? 0
+    const durationMs = r.duration_ms ?? 0
+    this.cumStats.tokens += tokens
+    this.cumStats.costUsd += costUsd
+    this.cumStats.turns += r.num_turns ?? 1
+    this.lastTurnDelta = { tokens, costUsd, durationMs, inputTokens }
+  }
+
+  /** Current context-window occupancy estimate — uses the most recent
+   * assistant `usage` (input + caches), since each assistant reply replays
+   * the full conversation. Falls back to the last-turn delta when no
+   * assistant message has streamed yet this process. */
+  private currentContextTokens(): number {
+    const u = this.proc?.lastUsage as ClaudeUsage | null | undefined
+    if (u) {
+      return (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0)
+    }
+    return this.lastTurnDelta?.inputTokens ?? 0
   }
 
   private async openTurnCard(userText: string): Promise<void> {
@@ -366,26 +474,47 @@ export class Session {
       : Array.isArray(content)
         ? content.map((c: any) => c?.text ?? JSON.stringify(c)).join('\n')
         : JSON.stringify(content)
-    const el = cards.toolCallElement(meta.i, meta.name, meta.input, output, isError ? '❌' : '✅')
+    const el = cards.toolCallElement(meta.i, meta.name, meta.input, output, isError ? '❌' : '✅', meta.resolvedNote)
     void cardkit.replaceElement(this.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
   }
 
-  private async renderPermission(req: CanUseToolRequest): Promise<void> {
-    this.status = 'awaiting_permission'
-    const card = cards.permissionCard({
-      sessionName: this.sessionName,
-      toolName: req.tool_name,
-      description: `工具 \`${req.tool_name}\` 想在 ~/${this.sessionName} 执行操作`,
-      inputPreview: JSON.stringify(req.input ?? {}),
-      requestId: req.request_id,
-    })
-    const messageId = await feishu.sendCard(this.chatId, card)
-    if (!messageId) {
-      log(`session "${this.sessionName}": permission card send failed; auto-deny`)
-      this.proc?.sendPermissionResponse(req.request_id, 'deny')
+  /** Merge the permission ask into the existing tool element in the
+   * current turn card. The user sees one continuous timeline: ⏳ pending
+   * → 🔐 awaiting approval (with buttons) → ⏳ allowed / ❌ denied → ✅
+   * with output. No floating orange card.
+   *
+   * `tool_use` is emitted as part of the assistant message and lands on
+   * our `addTool` handler BEFORE the SDK's `can_use_tool` control_request
+   * arrives — so by the time we get here, `toolByUseId` already has the
+   * entry we need to replace.
+   *
+   * Edge cases (no current turn / missing tool_use_id / unknown id) are
+   * surfaced loudly and auto-denied. We don't fall back to a standalone
+   * card — per the project's no-fallbacks rule, hidden anomalies are
+   * worse than visible deny errors. */
+  private renderPermission(req: CanUseToolRequest): void {
+    const turn = this.currentTurn
+    if (!turn) {
+      log(`session "${this.sessionName}": can_use_tool with no current turn — auto-deny req=${req.request_id}`)
+      this.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'no active turn' })
       return
     }
-    this.pendingPermissions.set(req.request_id, { messageId, toolName: req.tool_name })
+    const toolUseId = req.tool_use_id
+    if (!toolUseId) {
+      log(`session "${this.sessionName}": can_use_tool without tool_use_id — auto-deny req=${req.request_id}`)
+      this.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'no tool_use_id' })
+      return
+    }
+    const meta = turn.toolByUseId.get(toolUseId)
+    if (!meta) {
+      log(`session "${this.sessionName}": can_use_tool for unknown tool_use_id=${toolUseId} — auto-deny req=${req.request_id}`)
+      this.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'unknown tool_use_id' })
+      return
+    }
+    this.status = 'awaiting_permission'
+    this.pendingPermissions.set(req.request_id, { toolUseId })
+    const el = cards.toolCallPermissionElement(meta.i, meta.name, meta.input, req.request_id)
+    void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
   }
 
   private async closeTurnCard(suffix?: string): Promise<void> {

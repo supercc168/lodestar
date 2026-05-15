@@ -8,6 +8,7 @@
  *   daemon.pid              — single-instance lock          (in DATA_DIR)
  *   daemon.log              — append-only run log           (in DATA_DIR)
  *   session-chat-map.json   — duplicate-name routing        (in DATA_DIR)
+ *   session-resume-map.json — last-known claude session_id  (in DATA_DIR)
  *   inbox/                  — downloaded attachments        (in DATA_DIR)
  */
 
@@ -38,4 +39,5 @@ export const CONFIG_FILE = process.env.LODESTAR_CONFIG ?? join(CONFIG_DIR, 'conf
 export const PID_FILE = join(DATA_DIR, 'daemon.pid')
 export const LOG_FILE = join(DATA_DIR, 'daemon.log')
 export const SESSION_CHAT_MAP_FILE = join(DATA_DIR, 'session-chat-map.json')
+export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
 export const INBOX_DIR = join(DATA_DIR, 'inbox')

@@ -85,9 +85,13 @@ There is currently no test suite. The smoke test is:
 2. Send `hi` (or any text) in a bound Feishu group → expect a streaming
    card with the standard four elements (user_input panel, thinking,
    assistant, footer).
-3. Have Claude attempt a tool that needs permission → expect an orange
-   permission card with three buttons; clicking one PATCHes the card and
-   forwards the decision via `control_response`.
+3. Have Claude attempt a tool that needs permission (rare under the
+   default `bypassPermissions` mode — try `permissionMode: 'default'`
+   to force it). Expect the existing tool panel in the turn card to
+   morph into a 🔐 awaiting-approval state with three inline buttons.
+   Clicking one `replaceElement`-updates the same panel and forwards
+   the decision via the `can_use_tool` control_response (schema:
+   `{behavior:'allow', updatedInput:{}}` or `{behavior:'deny', message}`).
 
 ## Reference
 

@@ -12,7 +12,7 @@ import { mkdirSync, readFileSync, realpathSync, statSync, writeFileSync } from '
 import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
 import { config } from './config'
-import { DATA_DIR, INBOX_DIR, SESSION_CHAT_MAP_FILE } from './paths'
+import { DATA_DIR, INBOX_DIR, SESSION_CHAT_MAP_FILE, SESSION_RESUME_MAP_FILE } from './paths'
 import { log } from './log'
 
 const APP_ID = config.feishu.app_id
@@ -70,6 +70,42 @@ export function bindSessionToChat(sessionName: string, chatId: string): void {
   log(`feishu: bound session "${sessionName}" → ${chatId}${prev ? ` (was ${prev})` : ''}`)
 }
 
+// ── Session resume map ────────────────────────────────────────────────
+// `sessionName → last-known claude session_id`. Persisted so a daemon
+// restart (systemctl, crash, watchdog) doesn't strand the user with a
+// fresh conversation when they next type `restart`. Updated on every
+// `system/init` from a claude subprocess.
+const lastSessionIdByName = new Map<string, string>()
+
+export function loadSessionResumeMap(): void {
+  try {
+    const obj = JSON.parse(readFileSync(SESSION_RESUME_MAP_FILE, 'utf8'))
+    for (const [name, id] of Object.entries(obj)) {
+      if (typeof id === 'string') lastSessionIdByName.set(name, id)
+    }
+    log(`feishu: loaded ${lastSessionIdByName.size} session→resume bindings`)
+  } catch {}
+}
+
+function saveSessionResumeMap(): void {
+  try {
+    const obj: Record<string, string> = {}
+    for (const [k, v] of lastSessionIdByName) obj[k] = v
+    mkdirSync(DATA_DIR, { recursive: true })
+    writeFileSync(SESSION_RESUME_MAP_FILE, JSON.stringify(obj, null, 2))
+  } catch (e) { log(`feishu: save session-resume-map failed: ${e}`) }
+}
+
+export function bindSessionResume(sessionName: string, sessionId: string): void {
+  if (lastSessionIdByName.get(sessionName) === sessionId) return
+  lastSessionIdByName.set(sessionName, sessionId)
+  saveSessionResumeMap()
+}
+
+export function getSessionResume(sessionName: string): string | null {
+  return lastSessionIdByName.get(sessionName) ?? null
+}
+
 export function chatIdForSession(sessionName: string): string | null {
   const preferred = preferredChatForSession.get(sessionName)
   if (preferred && chatNameCache.get(preferred) === sessionName) return preferred
@@ -125,23 +161,6 @@ export async function sendCard(chatId: string, card: object): Promise<string | n
     }
     return res?.data?.message_id ?? null
   } catch (e) { log(`feishu: sendCard failed chat=${chatId}: ${e}`); return null }
-}
-
-// PATCH a regular interactive message (i.e. a card NOT promoted to a
-// cardkit entity). Used for permission cards that flip allow/deny once.
-export async function patchCardMessage(messageId: string, card: object): Promise<void> {
-  try {
-    const token = await getTenantToken()
-    const res = await fetch(`https://open.feishu.cn/open-apis/im/v1/messages/${messageId}`, {
-      method: 'PATCH',
-      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({ content: JSON.stringify(card) }),
-    })
-    const data = await res.json() as any
-    if (data?.code && data.code !== 0) {
-      log(`feishu: patchCardMessage ${messageId} code=${data.code} msg=${data.msg}`)
-    }
-  } catch (e) { log(`feishu: patchCardMessage ${messageId} failed: ${e}`) }
 }
 
 // ── Reactions ──────────────────────────────────────────────────────────

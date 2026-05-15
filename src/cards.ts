@@ -23,6 +23,13 @@ export const ELEMENTS = {
 export function summarizeToolInput(name: string, input: any): string {
   if (!input || typeof input !== 'object') return ''
   const truncate = (s: string, n: number) => s.length > n ? s.slice(0, n) + '…' : s
+  // Task workflow tools (TaskCreate / TaskUpdate / TaskList / ...) carry
+  // structured fields that summarize much better as natural language than
+  // as truncated JSON. Routed first so they don't fall through to the
+  // generic Agent/Task case below.
+  if (name.startsWith('Task') && name !== 'Task') {
+    return truncate(summarizeTaskWorkflow(name, input), 80)
+  }
   switch (name) {
     case 'Bash':       return truncate(String(input.command ?? ''), 80)
     case 'Read':
@@ -42,6 +49,76 @@ export function summarizeToolInput(name: string, input: any): string {
     if (typeof v === 'string' && v) return truncate(v, 80)
   }
   return ''
+}
+
+/** Header summary for Task* workflow tools — `Task` (singular) is the
+ * separate subagent-spawn tool and is handled above; everything else
+ * (TaskCreate / TaskUpdate / TaskList / TaskGet / TaskStop / TaskOutput /
+ * TaskDelete) summarises through here. */
+function summarizeTaskWorkflow(name: string, input: any): string {
+  switch (name) {
+    case 'TaskCreate':
+      return `📝 创建: ${input.subject ?? '(无 subject)'}`
+    case 'TaskUpdate': {
+      const parts: string[] = []
+      if (input.status) parts.push(`→ ${input.status}`)
+      if (input.owner) parts.push(`owner=${input.owner}`)
+      if (input.subject) parts.push(`subject="${input.subject}"`)
+      if (input.addBlocks) parts.push(`blocks=[${(input.addBlocks ?? []).join(',')}]`)
+      if (input.addBlockedBy) parts.push(`blockedBy=[${(input.addBlockedBy ?? []).join(',')}]`)
+      const tail = parts.length ? ' ' + parts.join(', ') : ''
+      return `✏️ #${input.taskId ?? '?'}${tail}`
+    }
+    case 'TaskList':   return '📋 查询任务列表'
+    case 'TaskGet':    return `🔍 查询 #${input.taskId ?? '?'}`
+    case 'TaskStop':   return `⏹ 停止 #${input.taskId ?? '?'}`
+    case 'TaskOutput': return `📤 取输出 #${input.taskId ?? '?'}`
+    case 'TaskDelete': return `🗑 删除 #${input.taskId ?? '?'}`
+  }
+  return name
+}
+
+/** Markdown body for Task* workflow tools — replaces the generic JSON
+ * dump with a human-readable description of the operation plus, once the
+ * tool result is in, the SDK's text reply (which already contains "Task
+ * #N created" / "Updated task #X" / a rendered list for TaskList). */
+function renderTaskWorkflowBody(name: string, input: any, output: string | null): string {
+  const lines: string[] = []
+  switch (name) {
+    case 'TaskCreate':
+      lines.push(`**📝 创建任务**`)
+      if (input.subject)    lines.push(`- subject: ${input.subject}`)
+      if (input.description) lines.push(`- 描述: ${input.description}`)
+      if (input.activeForm) lines.push(`- 进行时: ${input.activeForm}`)
+      break
+    case 'TaskUpdate': {
+      lines.push(`**✏️ 更新 #${input.taskId ?? '?'}**`)
+      if (input.status)       lines.push(`- status → \`${input.status}\``)
+      if (input.subject)      lines.push(`- subject: ${input.subject}`)
+      if (input.description)  lines.push(`- description: ${input.description}`)
+      if (input.owner)        lines.push(`- owner: ${input.owner}`)
+      if (input.activeForm)   lines.push(`- 进行时: ${input.activeForm}`)
+      if (input.addBlocks)    lines.push(`- blocks → ${(input.addBlocks).join(', ')}`)
+      if (input.addBlockedBy) lines.push(`- blockedBy → ${(input.addBlockedBy).join(', ')}`)
+      if (input.metadata)     lines.push(`- metadata: \`${JSON.stringify(input.metadata)}\``)
+      break
+    }
+    case 'TaskList':   lines.push('**📋 查询当前任务清单**'); break
+    case 'TaskGet':    lines.push(`**🔍 查询 #${input.taskId ?? '?'}**`); break
+    case 'TaskStop':   lines.push(`**⏹ 停止 #${input.taskId ?? '?'}**`); break
+    case 'TaskOutput': lines.push(`**📤 取 #${input.taskId ?? '?'} 输出**`); break
+    case 'TaskDelete': lines.push(`**🗑 删除 #${input.taskId ?? '?'}**`); break
+    default:
+      lines.push(`**${name}**`)
+      lines.push('```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 1000) + '\n```')
+  }
+  if (output != null) {
+    lines.push('')
+    lines.push('---')
+    lines.push('**结果**')
+    lines.push(output.slice(0, 3000))
+  }
+  return lines.join('\n')
 }
 
 interface MainCardOpts {
@@ -100,70 +177,79 @@ export function thinkingCollapsedPanel(fullText: string): object {
   }
 }
 
-/** Element to insert for each tool call. expandable for big results.
+/** Element to insert for each tool call. Expandable for big results.
  *
  * Header is a one-line summary: status + name + summarized input.
- * Body holds the full input + (after completion) the full output. */
+ * Body holds the full input + (after completion) the full output.
+ * `resolvedNote` is an optional one-liner appended below the input —
+ * used to surface "✅ 允许 by Alice" inline after a permission decision
+ * lands but before the actual tool execution completes. */
 export function toolCallElement(
   i: number,
   name: string,
   input: any,
   output: string | null,
   status: '⏳' | '✅' | '❌' = '⏳',
+  resolvedNote?: string,
 ): object {
   const summary = summarizeToolInput(name, input)
   const headerText = summary
     ? `${status} 🔧 ${name}: ${summary}`
     : `${status} 🔧 ${name}`
-  const inputBlock = '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
-  const outputBlock = output != null
-    ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```'
-    : ''
+  const isTaskWorkflow = name.startsWith('Task') && name !== 'Task'
+  const noteBlock = resolvedNote ? `\n\n${resolvedNote}` : ''
+  // Task* gets a narrative body (operation + result), the rest keeps the
+  // JSON-input + raw-output split — generic dump is better for unfamiliar
+  // tools where users can't predict what fields matter.
+  const body = isTaskWorkflow
+    ? renderTaskWorkflowBody(name, input, output) + noteBlock
+    : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
+      + noteBlock
+      + (output != null ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```' : '')
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),
     header: { title: { tag: 'plain_text', content: headerText } },
     expanded: false,
     elements: [
-      { tag: 'markdown', content: inputBlock + outputBlock },
+      { tag: 'markdown', content: body },
     ],
   }
 }
 
-interface PermissionOpts {
-  sessionName: string
-  toolName: string
-  description: string
-  inputPreview: string
-  requestId: string
-}
-
-export function permissionCard(opts: PermissionOpts): object {
-  const { sessionName, toolName, description, inputPreview, requestId } = opts
-  let pretty = inputPreview
-  try { pretty = JSON.stringify(JSON.parse(inputPreview), null, 2) } catch {}
+/** Same tool panel as `toolCallElement`, but with the 🔐 status and
+ * three inline action buttons (allow / allow_always / deny). Expanded
+ * by default so the user can read the request without clicking through.
+ * This is the "merge into tool panel" UX — the permission decision
+ * lives on the same row as the tool call instead of as a separate
+ * floating card. */
+export function toolCallPermissionElement(
+  i: number,
+  name: string,
+  input: any,
+  requestId: string,
+): object {
+  const summary = summarizeToolInput(name, input)
+  const headerText = summary
+    ? `🔐 等审批 · ${name}: ${summary}`
+    : `🔐 等审批 · ${name}`
+  const inputBlock = '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
   return {
-    schema: '2.0',
-    config: { update_multi: true },
-    header: {
-      title: { tag: 'plain_text', content: `🔐 权限请求 · ${toolName}` },
-      subtitle: { tag: 'plain_text', content: sessionName },
-      template: 'orange',
-    },
-    body: {
-      elements: [
-        { tag: 'markdown', content: description },
-        { tag: 'markdown', content: '```\n' + pretty.slice(0, 2000) + '\n```' },
-        {
-          tag: 'column_set',
-          columns: [
-            permissionButtonColumn('✅ 允许', 'primary', requestId, 'allow'),
-            permissionButtonColumn('♾️ 始终允许', 'default', requestId, 'allow_always'),
-            permissionButtonColumn('❌ 拒绝', 'danger', requestId, 'deny'),
-          ],
-        },
-      ],
-    },
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.tool(i),
+    header: { title: { tag: 'plain_text', content: headerText } },
+    expanded: true,
+    elements: [
+      { tag: 'markdown', content: inputBlock },
+      {
+        tag: 'column_set',
+        columns: [
+          permissionButtonColumn('✅ 允许', 'primary', requestId, 'allow'),
+          permissionButtonColumn('♾️ 始终允许', 'default', requestId, 'allow_always'),
+          permissionButtonColumn('❌ 拒绝', 'danger', requestId, 'deny'),
+        ],
+      },
+    ],
   }
 }
 
@@ -179,64 +265,97 @@ function permissionButtonColumn(label: string, type: string, requestId: string, 
   }
 }
 
-export function permissionResolvedCard(
-  toolName: string,
-  decision: 'allow' | 'allow_always' | 'deny',
-  user: string,
-): object {
-  const ok = decision !== 'deny'
-  const label = decision === 'allow_always' ? '始终允许' : decision === 'allow' ? '已允许' : '已拒绝'
-  return {
-    schema: '2.0',
-    config: { update_multi: true },
-    header: {
-      title: { tag: 'plain_text', content: `🔐 权限请求 · ${toolName}` },
-      template: ok ? 'green' : 'red',
-    },
-    body: {
-      elements: [{
-        tag: 'markdown',
-        content: `${ok ? '✅' : '❌'} **${label}** by ${user || '匿名'} · ${new Date().toLocaleTimeString('zh-CN', { hour12: false })}`,
-      }],
-    },
-  }
-}
-
 interface ConsoleOpts {
   sessionName: string
   status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
   model?: string
   effort?: string
-  uptime?: string
-  lastActivity?: string
+  /** ms since this ClaudeProcess spawned — formatted to "1h 23m" inside. */
+  uptimeMs?: number
+  /** Current context-window occupancy estimate (input + cache tokens of
+   * the last assistant message). 0 if no turn has completed yet. */
+  contextTokens?: number
+  /** Window upper bound. Defaults to 1M (claude-opus-4-7[1m]). */
+  contextLimit?: number
+  cumStats?: { tokens: number; costUsd: number; turns: number }
+  lastTurn?: { tokens: number; costUsd: number; durationMs: number }
+  sessionId?: string | null
   hasSession: boolean
 }
 
+/** Format token counts as a compact human-readable string: 1,234 → 1.2K. */
+function fmtTokens(n: number): string {
+  if (!n) return '0'
+  if (n < 1000) return String(n)
+  if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0).replace(/\.0$/, '') + 'K'
+  return (n / 1_000_000).toFixed(2).replace(/\.?0+$/, '') + 'M'
+}
+
+function fmtCost(c: number): string {
+  if (c < 0.01) return `$${c.toFixed(4)}`
+  return `$${c.toFixed(2)}`
+}
+
+function fmtDurationMs(ms: number): string {
+  if (ms < 1000) return `${ms}ms`
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)}s`
+  const m = Math.floor(ms / 60_000)
+  const s = Math.round((ms % 60_000) / 1000)
+  return `${m}m ${s}s`
+}
+
+function fmtUptime(ms: number): string {
+  if (ms < 60_000) return `${Math.round(ms / 1000)}s`
+  const totalMin = Math.floor(ms / 60_000)
+  if (totalMin < 60) return `${totalMin}m`
+  const h = Math.floor(totalMin / 60)
+  const m = totalMin % 60
+  if (h < 24) return `${h}h ${m}m`
+  const d = Math.floor(h / 24)
+  return `${d}d ${h % 24}h`
+}
+
 export function consoleCard(opts: ConsoleOpts): object {
-  const { sessionName, status, model, effort, uptime, lastActivity, hasSession } = opts
+  const {
+    sessionName, status, model, effort, uptimeMs,
+    contextTokens, contextLimit, cumStats, lastTurn, sessionId, hasSession,
+  } = opts
   const statusEmoji = {
     idle: '🟢 闲', working: '⚙️ 工作中', awaiting_permission: '🔐 等审批',
     starting: '🚀 启动中', stopped: '⚪ 未运行',
   }[status]
-  const meta = [
-    `状态: ${statusEmoji}`,
-    model ? `模型: ${model}${effort ? `/${effort}` : ''}` : null,
-    uptime ? `运行: ${uptime}` : null,
-    lastActivity ? `最近: ${lastActivity}` : null,
-  ].filter(Boolean).join(' · ')
 
-  const buttons: [string, string, string][] = hasSession
-    ? [
-        ['⏸ 中断', 'interrupt', 'default'],
-        ['🧹 /clear', 'clear', 'default'],
-        ['⏹ 终止', 'stop', 'danger'],
-        ['📁 ls', 'ls', 'default'],
-      ]
-    : [
-        ['🚀 启动', 'start', 'primary'],
-        ['🔁 续聊', 'resume', 'default'],
-        ['📁 ls', 'ls', 'default'],
-      ]
+  const modelLine = model ? `${model}${effort ? `/${effort}` : ''}` : null
+  const headerLine = [statusEmoji, modelLine].filter(Boolean).join(' · ')
+
+  // Build the metric lines that make this panel useful. Each is "label
+  // <tab> value" rendered as plain markdown — keeps it readable inside
+  // the small Feishu card area without competing with the button row.
+  const lines: string[] = [headerLine]
+
+  if (contextTokens != null) {
+    const limit = contextLimit ?? 1_000_000
+    const pct = limit > 0 ? Math.round((contextTokens / limit) * 100) : 0
+    lines.push(`**📦 上下文**　${fmtTokens(contextTokens)} / ${fmtTokens(limit)}　(${pct}%)`)
+  }
+  if (uptimeMs != null && uptimeMs > 0) {
+    lines.push(`**⏱ 已运行**　${fmtUptime(uptimeMs)}`)
+  }
+  if (cumStats && (cumStats.tokens > 0 || cumStats.costUsd > 0 || cumStats.turns > 0)) {
+    lines.push(`**💬 累计**　${fmtTokens(cumStats.tokens)} tokens · ${fmtCost(cumStats.costUsd)} · ${cumStats.turns} turn${cumStats.turns === 1 ? '' : 's'}`)
+  }
+  if (lastTurn) {
+    lines.push(`**🔄 上一轮**　+${fmtTokens(lastTurn.tokens)} · ${fmtCost(lastTurn.costUsd)} · ${fmtDurationMs(lastTurn.durationMs)}`)
+  }
+  if (sessionId) {
+    lines.push(`**🆔 session**　\`${sessionId.slice(0, 8)}…\``)
+  }
+
+  void hasSession // accept the field for caller compat; lifecycle is now
+  // driven by bare-word commands (`hi` / `kill` / `restart` / `clear`),
+  // not buttons — keeps the panel pure-readout and one-handed mobile-
+  // friendly. The 'refresh' / 'ls' actions stay in onConsoleAction for
+  // backward compat with any still-floating older cards in chat history.
 
   const template = status === 'working' ? 'blue'
     : status === 'awaiting_permission' ? 'orange'
@@ -252,19 +371,7 @@ export function consoleCard(opts: ConsoleOpts): object {
     },
     body: {
       elements: [
-        { tag: 'markdown', content: meta || '_(no state)_' },
-        {
-          tag: 'column_set',
-          columns: buttons.map(([label, action, kind]) => ({
-            tag: 'column', width: 'weighted', weight: 1,
-            elements: [{
-              tag: 'button',
-              text: { tag: 'plain_text', content: label },
-              type: kind,
-              behaviors: [{ type: 'callback', value: { kind: 'console', action } }],
-            }],
-          })),
-        },
+        { tag: 'markdown', content: lines.join('\n\n') },
       ],
     },
   }
