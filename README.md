@@ -50,9 +50,9 @@ AI 不是帮手,是倍率。它放大的不是体力,是你——你的直觉、
 | --- | --- |
 | `hi` | 未运行时启动;运行中弹一张**状态卡片** |
 | `stop` | 软打断当前 turn + 清空 type-ahead 排队;子进程保活,刚排队中的消息会被打 `CrossMark` 反应表示取消 |
-| `kill` | 优雅关闭 Claude 进程;记住 `sessionId`,下次 `restart` 还能 resume |
-| `restart` | 用上一次的 `sessionId` 重启会话(保留上下文) |
-| `clear` | 杀掉进程并启动一个全新 session(等价于 Claude Code 的 `/clear`) |
+| `kill` | 优雅关闭 Claude 进程;`sessionId` 仍记在磁盘,下次 `restart` 还能 resume |
+| `restart` | 用上一次的 `sessionId` 重启会话(保留上下文);无进程时也能用,等于"恢复上一会话" |
+| `clear` | 杀掉当前进程并启动一个全新 session(等价于 Claude Code 的 `/clear`);**无进程时无效** |
 
 > 这五个词被全局保留:在群里发 "hi" 当问候也会触发控制台卡片,不会到 Claude 那边。换来的是手机上单手打字的便利。
 

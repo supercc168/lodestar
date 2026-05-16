@@ -550,7 +550,6 @@ interface ConsoleOpts {
   cumStats?: { tokens: number; costUsd: number; turns: number }
   lastTurn?: { tokens: number; costUsd: number; durationMs: number }
   sessionId?: string | null
-  hasSession: boolean
 }
 
 /** Format token counts as a compact human-readable string: 1,234 → 1.2K. */
@@ -656,7 +655,7 @@ export function consoleUsageContent(
 export function consoleCard(opts: ConsoleOpts): object {
   const {
     sessionName, status, model, effort, uptimeMs, peers, usage,
-    contextTokens, contextLimit, cumStats, lastTurn, sessionId, hasSession,
+    contextTokens, contextLimit, cumStats, lastTurn, sessionId,
   } = opts
   const statusEmoji = {
     idle: '🟢 闲', working: '⚙️ 工作中', awaiting_permission: '🔐 等审批',
@@ -697,12 +696,6 @@ export function consoleCard(opts: ConsoleOpts): object {
   if (sessionId) {
     lines.push(`**🆔 session**　\`${sessionId.slice(0, 8)}…\``)
   }
-
-  void hasSession // accept the field for caller compat; lifecycle is now
-  // driven by bare-word commands (`hi` / `kill` / `restart` / `clear`),
-  // not buttons — keeps the panel pure-readout and one-handed mobile-
-  // friendly. The 'refresh' / 'ls' actions stay in onConsoleAction for
-  // backward compat with any still-floating older cards in chat history.
 
   const template = status === 'working' ? 'blue'
     : status === 'awaiting_permission' ? 'orange'

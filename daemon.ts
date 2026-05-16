@@ -192,9 +192,6 @@ async function handleCardAction(data: any): Promise<any> {
     case 'permission':
       await session.onPermissionDecision(value.request_id, value.decision, userId)
       return { toast: { type: value.decision === 'deny' ? 'error' : 'success', content: '已处理' } }
-    case 'console':
-      await session.onConsoleAction(value.action)
-      return { toast: { type: 'info', content: value.action } }
     case 'menu':
       await session.onUserMessage(`(menu choice ${value.choice + 1})`)
       return { toast: { type: 'success', content: 'OK' } }

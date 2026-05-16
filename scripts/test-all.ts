@@ -146,7 +146,7 @@ await announce('[7/8] runCommand("restart") — 期待 🔁 resume 同 session-i
 await session.runCommand('restart')
 await sleep(5000)
 
-// 8) clear (fresh)
+// 8) clear (fresh — kills + starts new)
 await announce('[8/8] runCommand("clear") — 期待 ⚪ kill + 🚀 启动新 session')
 await session.runCommand('clear')
 await sleep(5000)

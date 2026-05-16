@@ -398,9 +398,23 @@ export class Session {
         await this.stop()
         return true
       case 'restart':
+        // resume the prior conversation — kills the current proc (if
+        // any) and spawns a new one with `--resume <lastSessionId>`.
+        // If no process is running, this is how the user gets back the
+        // previous conversation after a `kill` or a daemon crash.
         await this.restart(true)
         return true
       case 'clear':
+        // "throw away current conversation, start a new one". By design
+        // this only makes sense when there IS a current conversation:
+        // calling clear from stopped state is a no-op (user-confirmed
+        // 2026-05-16) — we don't want a stray `clear` to silently spawn
+        // a fresh session the user didn't ask for. To start from cold,
+        // use `hi`.
+        if (!this.isRunning()) {
+          await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行,clear 无效;用 \`hi\` 启动或 \`restart\` 恢复上一会话`)
+          return true
+        }
         await this.restart(false)
         return true
     }
@@ -438,7 +452,6 @@ export class Session {
           }
         : undefined,
       sessionId: this.proc?.sessionId ?? this.lastSessionId,
-      hasSession: this.isRunning(),
     })
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) return
@@ -774,19 +787,6 @@ export class Session {
     this.pendingAsks.delete(toolUseId)
     if (this.pendingPermissions.size === 0 && this.status === 'awaiting_permission') {
       this.status = 'working'
-    }
-  }
-
-  async onConsoleAction(action: string): Promise<void> {
-    log(`session "${this.sessionName}": console action=${action}`)
-    switch (action) {
-      case 'interrupt': this.interrupt(); break
-      case 'clear':     await this.restart(false); break
-      case 'stop':      await this.stop(); break
-      case 'start':     await this.start(); break
-      case 'resume':    await this.restart(true); break
-      case 'refresh':   await this.showConsole(); break
-      case 'ls':        await feishu.sendText(this.chatId, `📁 ${this.workDir}`); break
     }
   }
 
