@@ -884,13 +884,13 @@ export class Session {
   }
 
   /** Context-window capacity for the model the subprocess is currently
-   * running. Read off the model id Anthropic embeds in each assistant
-   * message — the `[1m]` suffix marks the extended-context variant.
-   * Defaults to 200K for stock Opus / Sonnet / Haiku. */
+   * running — sourced authoritatively from `result.modelUsage[model]
+   * .contextWindow` captured by ClaudeProcess on each turn close, so
+   * the daemon doesn't have to enumerate model ids itself (was the
+   * source of a "560K/200K" display bug — model id didn't include
+   * `[1m]` so the hardcoded fallback won). */
   private contextWindowMax(): number {
-    const m = this.proc?.lastModel ?? ''
-    if (m.includes('[1m]')) return 1_000_000
-    return 200_000
+    return this.proc?.lastContextWindow ?? 200_000
   }
 
   private async openTurnCard(userText: string, userOpenId: string, trigger: 'user_message' | 'scheduled'): Promise<void> {
@@ -960,12 +960,13 @@ export class Session {
       if (this.openingTurn) this.rotationBuffer.push({ kind: 'assistant', delta })
       return
     }
-    if (this.wantsRotation) {
-      this.wantsRotation = false
-      this.rotationBuffer.push({ kind: 'assistant', delta })
-      void this.rotateCard()
-      return
-    }
+    // Note: assistant text DOES NOT trigger rotation, even if a mid-turn
+    // user message landed and set `wantsRotation`. Rotating mid-segment
+    // would chop the model's in-progress reply (often a response to the
+    // ORIGINAL prompt that started this card) onto a fresh card,
+    // visually associating it with the queued msg — which is the bug
+    // the user surfaced 2026-05-16. The rotation defers to the next
+    // tool_use, which is a clean section boundary.
     if (!this.currentTurn.currentAssistantSegmentId) {
       const i = this.currentTurn.assistantSegmentCount++
       const segId = cards.ELEMENTS.assistant(i)
@@ -995,12 +996,8 @@ export class Session {
       if (this.openingTurn) this.rotationBuffer.push({ kind: 'thinking', delta })
       return
     }
-    if (this.wantsRotation) {
-      this.wantsRotation = false
-      this.rotationBuffer.push({ kind: 'thinking', delta })
-      void this.rotateCard()
-      return
-    }
+    // Thinking, like assistant text, doesn't trigger rotation — it's
+    // preamble to the same response, not a section break.
     this.currentTurn.thinkingText += delta
     cardkit.streamTextThrottled(
       this.currentTurn.cardId,
@@ -1313,27 +1310,28 @@ export class Session {
       await cardkit.replaceElement(cardId, cards.ELEMENTS.thinking, cards.thinkingCollapsedPanel(thinkingText))
     }
     const sendNote = sendPaths.length ? ` · 📎 ${sendPaths.length}` : ''
-    // Suffix REPLACES the trailing `✅ done` — it represents a terminal
-    // state distinct from natural completion (e.g. `📨 转交新卡` for a
-    // mid-turn rotation). When absent, the turn ended cleanly.
-    const stateMark = suffix ? ` · ${suffix}` : ' · ✅ done'
-    // Per-turn metrics: context-window occupancy and dollar cost. Only
-    // meaningful on a clean close — a suffix-tagged turn (rotation /
-    // interrupt) didn't fire the `result` event that populates
-    // `lastTurnDelta`, so these numbers would be stale and misleading.
+    // State marker leads the footer (✅ for natural completion, or the
+    // suffix verbatim for non-natural states like `📨 转交新卡`). The
+    // trailing "done" word is gone — the ✅ already carries that
+    // meaning. User-confirmed footer order 2026-05-16.
+    const stateMark = suffix ? suffix : '✅'
+    // Per-turn metrics: context-window occupancy (as a real percentage,
+    // not a token count) and dollar cost. Only meaningful on a clean
+    // close — suffix-tagged turns (rotation / interrupt) didn't fire
+    // the `result` event that populates `lastTurnDelta`, so these
+    // numbers would be stale and misleading.
     let metrics = ''
     if (!suffix) {
       const ctxTokens = this.currentContextTokens()
       const ctxMax = this.contextWindowMax()
-      if (ctxTokens > 0) {
-        const ctxK = Math.round(ctxTokens / 1000)
-        const maxFmt = ctxMax >= 1_000_000 ? `${ctxMax / 1_000_000}M` : `${ctxMax / 1000}K`
-        metrics += ` · 📊 ${ctxK}K/${maxFmt}`
+      if (ctxTokens > 0 && ctxMax > 0) {
+        const pct = Math.round((ctxTokens / ctxMax) * 100)
+        metrics += ` · 📊 ${pct}%`
       }
       const cost = this.lastTurnDelta?.costUsd ?? 0
       if (cost > 0) metrics += ` · 💰 $${cost.toFixed(3)}`
     }
-    const footer = `⏱ ${elapsed}s${metrics}${sendNote}${stateMark}`
+    const footer = `${stateMark} ⏱ ${elapsed}s${metrics}${sendNote}`
     await cardkit.streamText(cardId, cards.ELEMENTS.footer, footer)
     // Final chat-list preview: clean finish shows "⏱ Xs · NK tokens";
     // interrupted shows the suffix instead (no usage event landed).

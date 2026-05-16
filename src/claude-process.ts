@@ -93,6 +93,12 @@ export class ClaudeProcess extends EventEmitter {
   lastResult: ClaudeResultMeta = {
     cost_usd: null, duration_ms: null, num_turns: null, usage: null,
   }
+  /** Context-window capacity of the model that ran the latest turn —
+   * lifted from `result.modelUsage[model].contextWindow` so we don't
+   * have to hardcode `[1m]` vs stock variants. 200K is the safe
+   * default if no result has landed yet (e.g. between spawn and the
+   * first turn close). */
+  lastContextWindow: number = 200_000
 
   constructor(opts: SpawnOpts) {
     super()
@@ -241,6 +247,19 @@ export class ClaudeProcess extends EventEmitter {
         duration_ms: typeof msg.duration_ms === 'number' ? msg.duration_ms : null,
         num_turns: typeof msg.num_turns === 'number' ? msg.num_turns : null,
         usage: msg.usage ?? null,
+      }
+      // modelUsage maps "<model id>" → { contextWindow, maxOutputTokens, … }.
+      // For mixed-model runs the SDK reports one entry per model used in
+      // the turn; we take the one matching `lastModel` (the assistant's
+      // latest model id) and fall back to any single entry if it's the
+      // only one — covers the common single-model case.
+      const mu = msg.modelUsage
+      if (mu && typeof mu === 'object') {
+        const entry = (this.lastModel && mu[this.lastModel])
+          || (Object.keys(mu).length === 1 ? mu[Object.keys(mu)[0]!] : null)
+        if (entry && typeof entry.contextWindow === 'number' && entry.contextWindow > 0) {
+          this.lastContextWindow = entry.contextWindow
+        }
       }
       this.emit('result', msg)
       return
