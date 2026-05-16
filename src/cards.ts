@@ -171,7 +171,6 @@ interface MainCardOpts {
   turn: number
   model?: string
   effort?: string
-  userText: string
   /** What started this turn. `'scheduled'` adds a top-of-card banner so
    * the user can tell a cron-fired wakeup apart from one of their own
    * messages — the user's message bubble is otherwise the only visual
@@ -200,7 +199,8 @@ export function mainConversationCard(opts: MainCardOpts): object {
       // panels are inserted between them in real time as Claude streams.
       // Note: empty-string content is rejected by CardKit PUT so the
       // thinking element starts with a single space placeholder; the first
-      // real append overwrites it.
+      // real append overwrites it. No echo of the user's message inside
+      // the card — the chat bubble above already shows it.
       elements: [
         ...banner,
         { tag: 'markdown', element_id: ELEMENTS.thinking, content: ' ' },
