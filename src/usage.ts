@@ -26,6 +26,18 @@
  * 调用共享同一份快照,不打 API。in-flight 去重保证并发的多个
  * 群同时唤出控制台时只触发一次后台请求。
  *
+ * Stale fallback (照 omchud HUD 规则): 单独记最后一次成功拉到的
+ * `state:'ok'` 快照,本次拉取失败 (network/rate_limited/auth_failed)
+ * 且距上次成功 <= MAX_STALE_MS (15 分钟) 时,返回上次的 ok 快照并打
+ * `stale:true` 标签,卡片层加 "缓存 Xm 前" 提示。这是 no_fallbacks
+ * 规则的显式例外 —— 用户明确要求订阅额度面板用缓存兜底,因为短暂
+ * 网络抖动里把面板上的数字抹成红色"拉取失败"信息密度反而更低。
+ *
+ * 429 指数退避: 收到 rate_limited 时增加 rateLimitedCount,下次允许
+ * 实拉的时间设为 now + CACHE_TTL_MS * 2^(count-1),封顶 5 分钟。
+ * 退避窗口内的 readUsage 直接走 stale fallback,不打 API。任何非 429
+ * 的响应 (ok / network / auth_failed) 都会重置计数器。
+ *
  * 参考实现: oh-my-claudecode HUD `src/hud/usage-api.ts`。这里只保留
  * Lodestar 用得到的最小子集 —— 不处理 keychain、不处理第三方网关
  * (z.ai / MiniMax)、不处理 enterprise 货币换算、不做多文件 cache 与
@@ -42,6 +54,11 @@ const TOKEN_REFRESH_URL = 'https://platform.claude.com/v1/oauth/token'
 const OAUTH_CLIENT_ID = '9d1c250a-e61b-44d9-88ed-5944d1962f5e'
 const API_TIMEOUT_MS = 10_000
 const CACHE_TTL_MS = 60_000
+/** 失败时回退到上次成功快照的最大年龄。超过此值就不再用缓存兜底,
+ * 显示真实失败状态 —— 跟 omchud HUD 的 MAX_STALE_DATA_MS 对齐。 */
+const MAX_STALE_MS = 15 * 60 * 1000
+/** 429 退避封顶,跟 omchud HUD 的 MAX_RATE_LIMITED_BACKOFF_MS 对齐。 */
+const RATE_LIMITED_MAX_BACKOFF_MS = 5 * 60 * 1000
 
 function credentialsPath(): string {
   return join(homedir(), '.claude', '.credentials.json')
@@ -73,10 +90,29 @@ export type UsageSnapshot =
       fiveHour: UsageWindow | null
       weekly: UsageWindow | null
       fetchedAt: number
+      /** true 时本快照不是这次实拉的,而是 lastOk 兜底回来的旧数据。
+       * 卡片层据此显示 "缓存" 标记 + 重置时间加 `~` 前缀。 */
+      stale?: boolean
     }
 
+type UsageSnapshotOk = Extract<UsageSnapshot, { state: 'ok' }>
+
 let cache: { data: UsageSnapshot; at: number } | null = null
+/** 最近一次 state:'ok' 的快照,用于失败时兜底。和 cache 分开存:
+ * cache 是短时去重 (60s),lastOk 是长尾兜底 (15min)。 */
+let lastOk: { snapshot: UsageSnapshotOk; at: number } | null = null
 let inFlight: Promise<UsageSnapshot> | null = null
+/** 连续 429 计数,用于指数退避;遇到任何非 429 响应就重置为 0。 */
+let rateLimitedCount = 0
+/** 在这个时间戳之前不打 API,直接走 stale fallback。 */
+let rateLimitedUntil = 0
+
+function rateLimitedBackoffMs(count: number): number {
+  return Math.min(
+    CACHE_TTL_MS * Math.pow(2, Math.max(0, count - 1)),
+    RATE_LIMITED_MAX_BACKOFF_MS,
+  )
+}
 
 function readCredentials(): OAuthCredentials | null {
   const path = credentialsPath()
@@ -246,18 +282,46 @@ async function fetchUsage(): Promise<UsageSnapshot> {
   }
 }
 
+/** 失败快照 → 如果 MAX_STALE_MS 内还有 lastOk,就返回 lastOk 的副本
+ * (打 stale 标);否则透传失败快照。state:'ok' 走 fast path 原样返回。 */
+function withStaleFallback(snapshot: UsageSnapshot): UsageSnapshot {
+  if (snapshot.state === 'ok') return snapshot
+  if (lastOk && Date.now() - lastOk.at < MAX_STALE_MS) {
+    return { ...lastOk.snapshot, stale: true }
+  }
+  return snapshot
+}
+
 /** 返回订阅额度快照。CACHE_TTL_MS 内的重复调用读缓存;并发请求去重为
- * 单次后台 fetch。永不抛出 —— 失败状态由 `state` 字段表达,卡片层
- * 按 state 分支渲染。 */
+ * 单次后台 fetch。拉取失败但 lastOk 仍在 MAX_STALE_MS 内时,回退到
+ * lastOk 并打 stale 标。连续 429 走指数退避,退避窗口内不打 API。
+ * 永不抛出 —— 失败状态由 `state` 字段表达,卡片层按 state 分支渲染。 */
 export async function readUsage(): Promise<UsageSnapshot> {
-  if (cache && Date.now() - cache.at < CACHE_TTL_MS) return cache.data
+  // 429 退避窗口内不打 API。cache 里可能存的就是 rate_limited 失败态,
+  // withStaleFallback 会自动用 lastOk 顶上(15min 内)。
+  if (Date.now() < rateLimitedUntil) {
+    return withStaleFallback(cache?.data ?? { state: 'rate_limited' })
+  }
+  if (cache && Date.now() - cache.at < CACHE_TTL_MS) return withStaleFallback(cache.data)
   if (inFlight) return inFlight
   inFlight = fetchUsage()
-    .then(d => { cache = { data: d, at: Date.now() }; inFlight = null; return d })
+    .then(d => {
+      cache = { data: d, at: Date.now() }
+      if (d.state === 'ok') lastOk = { snapshot: d, at: Date.now() }
+      if (d.state === 'rate_limited') {
+        rateLimitedCount += 1
+        rateLimitedUntil = Date.now() + rateLimitedBackoffMs(rateLimitedCount)
+      } else {
+        rateLimitedCount = 0
+        rateLimitedUntil = 0
+      }
+      inFlight = null
+      return withStaleFallback(d)
+    })
     .catch(e => {
       log(`usage: fetchUsage threw: ${e}`)
       inFlight = null
-      return cache?.data ?? { state: 'network', reason: String(e) }
+      return withStaleFallback({ state: 'network', reason: String(e) })
     })
   return inFlight
 }

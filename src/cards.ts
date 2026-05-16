@@ -595,6 +595,15 @@ function fmtResetIn(date: Date | null): string {
   return `${Math.round(ms / (24 * 60 * 60 * 1000))}d`
 }
 
+/** Human-readable "time since" — clamps sub-minute values to "刚刚". */
+function fmtAgo(timestamp: number): string {
+  const ms = Date.now() - timestamp
+  if (ms < 60_000) return '刚刚'
+  if (ms < 60 * 60 * 1000) return `${Math.round(ms / 60_000)}m 前`
+  if (ms < 24 * 60 * 60 * 1000) return `${Math.round(ms / (60 * 60 * 1000))}h 前`
+  return `${Math.round(ms / (24 * 60 * 60 * 1000))}d 前`
+}
+
 const PEER_STATUS_EMOJI: Record<string, string> = {
   idle: '🟢', working: '⚙️', awaiting_permission: '🔐',
   starting: '🚀', stopped: '⚪',
@@ -623,19 +632,22 @@ export function consoleUsageContent(
     case 'network':
       return `**📊 订阅额度**　拉取失败${usage.reason ? ' — `' + usage.reason + '`' : ''}`
   }
-  // state === 'ok'
+  // state === 'ok' —— stale 时 head 加 "缓存 Xm 前",重置时间加 `~`
+  // 前缀,沿用 omchud HUD 的 stale 标记约定。
+  const staleNote = usage.stale ? ` _· 缓存 ${fmtAgo(usage.fetchedAt)}_` : ''
+  const resetPrefix = usage.stale ? '~' : ''
   const head = usage.subscriptionType
-    ? `**📊 订阅额度** · ${usage.subscriptionType}`
-    : '**📊 订阅额度**'
+    ? `**📊 订阅额度** · ${usage.subscriptionType}${staleNote}`
+    : `**📊 订阅额度**${staleNote}`
   const lines: string[] = [head]
   if (usage.fiveHour) {
     const parts = [`${Math.round(usage.fiveHour.percent)}%`]
-    if (usage.fiveHour.resetsAt) parts.push(`重置 ${fmtResetIn(usage.fiveHour.resetsAt)}`)
+    if (usage.fiveHour.resetsAt) parts.push(`重置 ${resetPrefix}${fmtResetIn(usage.fiveHour.resetsAt)}`)
     lines.push(`　· 5h　${parts.join(' · ')}`)
   }
   if (usage.weekly) {
     const parts = [`${Math.round(usage.weekly.percent)}%`]
-    if (usage.weekly.resetsAt) parts.push(`重置 ${fmtResetIn(usage.weekly.resetsAt)}`)
+    if (usage.weekly.resetsAt) parts.push(`重置 ${resetPrefix}${fmtResetIn(usage.weekly.resetsAt)}`)
     lines.push(`　· 7d　${parts.join(' · ')}`)
   }
   return lines.length === 1 ? '**📊 订阅额度**　_无数据_' : lines.join('\n')
