@@ -511,15 +511,15 @@ export class Session {
     const wasBusy = this.currentTurn !== null || this.openingTurn
     this.pendingUserMessageCount++
     this.lastUserOpenId = userOpenId
-    // When this msg will be merged with siblings into a multi-content
-    // user turn (i.e. the SDK queued it because the daemon was busy),
-    // prepend a `[#N]\n` ordinal so the model can tell the merged
-    // blocks apart. Without it the harness renders multi-content text
-    // back-to-back ("1"+"2"+"5"+"56"+"89" → "1255689") and the model
-    // can't see the original boundaries — surfaced 2026-05-16 when a
-    // 5-msg accumulator test got mis-summed as one big number.
-    const wireText = wasBusy ? `[#${this.pendingUserMessageCount}]\n${text}` : text
-    this.proc!.sendUserText(wireText, files)
+    // 100% TUI merge parity (user-confirmed 2026-05-16): send text
+    // raw, let SDK queue + merge into content[] naturally. No `[#N]`
+    // prefix — the TUI transcript shows N enqueues fed in as separate
+    // text blocks without any structural marker, and the model parses
+    // them fine (TUI accumulator test summed 6 single digits → 21).
+    // If model misreads again under stream-json (which serializes
+    // content[N] possibly differently from TUI internals), we'll find
+    // a less-intrusive marker — but try clean first.
+    this.proc!.sendUserText(text, files)
     if (wasBusy && msgId) {
       // Hold the slot in the map even if the API call hasn't returned
       // yet — empty string is a sentinel meaning "we tried to react;
