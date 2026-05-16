@@ -181,7 +181,7 @@ interface MainCardOpts {
 /** Initial card sent at the start of each turn. Streaming on. */
 export function mainConversationCard(opts: MainCardOpts): object {
   const banner = opts.kind === 'scheduled'
-    ? [{ tag: 'markdown', content: '⏰ **定时任务触发** — Claude 在 idle 间隙被 CronCreate / ScheduleWakeup 唤醒' }]
+    ? [{ tag: 'markdown', content: '⏰ 触发' }]
     : []
   return {
     schema: '2.0',
