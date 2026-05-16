@@ -512,14 +512,16 @@ export class Session {
     this.pendingUserMessageCount++
     this.lastUserOpenId = userOpenId
     // When the SDK will merge this msg with siblings into a multi-
-    // content user turn, prepend U+001E (ASCII Record Separator) so
-    // the model can distinguish merged content blocks even when their
-    // texts stitch together visually (raw `"1"+"45"+"12"+"1"+"76"`
-    // otherwise reads as "14512176"). Contract declared in
-    // CHANNEL_INSTRUCTIONS; user keyboard can't produce \x1E so the
-    // boundary is unambiguous. Solo (eager-open) msgs don't get the
-    // prefix — no sibling, no merge, no need.
-    const wireText = wasBusy ? '\x1E' + text : text
+    // content user turn, wrap it in `<u>...</u>` so the model sees a
+    // structural boundary it actually attends to. Tried U+001E
+    // (ASCII Record Separator) first — invisible and theoretically
+    // perfect, but Anthropic's tokenizer effectively drops control
+    // chars and `<u>1</u><u>45</u>` became "145" to the model
+    // (2026-05-16 accumulator test). HTML-tag wrap is visible but
+    // models parse `<tag>` boundaries very reliably from training.
+    // Solo (eager-open) msgs don't get wrapped — no sibling, no
+    // merge, no need. Contract declared in CHANNEL_INSTRUCTIONS.
+    const wireText = wasBusy ? `<u>${text}</u>` : text
     this.proc!.sendUserText(wireText, files)
     if (wasBusy && msgId) {
       // Hold the slot in the map even if the API call hasn't returned
