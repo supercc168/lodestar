@@ -172,10 +172,18 @@ interface MainCardOpts {
   model?: string
   effort?: string
   userText: string
+  /** What started this turn. `'scheduled'` adds a top-of-card banner so
+   * the user can tell a cron-fired wakeup apart from one of their own
+   * messages — the user's message bubble is otherwise the only visual
+   * cue, and scheduled turns have no preceding bubble in the chat. */
+  kind?: 'user_message' | 'scheduled'
 }
 
 /** Initial card sent at the start of each turn. Streaming on. */
-export function mainConversationCard(_opts: MainCardOpts): object {
+export function mainConversationCard(opts: MainCardOpts): object {
+  const banner = opts.kind === 'scheduled'
+    ? [{ tag: 'markdown', content: '⏰ **定时任务触发** — Claude 在 idle 间隙被 CronCreate / ScheduleWakeup 唤醒' }]
+    : []
   return {
     schema: '2.0',
     config: {
@@ -194,6 +202,7 @@ export function mainConversationCard(_opts: MainCardOpts): object {
       // thinking element starts with a single space placeholder; the first
       // real append overwrites it.
       elements: [
+        ...banner,
         { tag: 'markdown', element_id: ELEMENTS.thinking, content: ' ' },
         { tag: 'markdown', element_id: ELEMENTS.footer, content: '⏳ working…' },
       ],

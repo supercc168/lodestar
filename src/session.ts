@@ -28,6 +28,12 @@ interface TurnState {
    * urgent_app push so only the initiator gets pinged (in case there
    * are other members in the group). Empty string → skip the ping. */
   userOpenId: string
+  /** What kicked off this turn. Only `'user_message'` turns fire the
+   * end-of-turn urgent_app push — scheduled / cron / loop wakeups
+   * finish on their own time and pinging the user would be noise,
+   * not signal. Ask / permission urgents inside the turn still fire
+   * regardless (those genuinely need attention even mid-schedule). */
+  trigger: 'user_message' | 'scheduled'
   userText: string
   thinkingText: string
   toolCount: number
@@ -92,6 +98,79 @@ export class Session {
 
   private proc: ClaudeProcess | null = null
   private currentTurn: TurnState | null = null
+  /** Count of user messages we've written to Claude's stdin since the last
+   * turn opened on our side. NOT a FIFO of individual messages — the SDK
+   * batch-merges every mid-turn user message into a single combined turn
+   * once the in-flight turn finishes, so the daemon only ever observes
+   * **one** init event per batch (no matter how many Feishu messages went
+   * into the batch). Tracking a count + last-sender (rather than an
+   * Array<msg>) keeps the daemon's view in sync with the SDK's actual
+   * dequeue semantics. Empirically verified 2026-05-15 from the SDK's
+   * `queue-operation` transcript events: 4 enqueues during a long turn
+   * → single dequeue at turn end → one merged user message. Count is
+   * decremented to 0 wholesale at the `init` boundary because the SDK
+   * has already collapsed them into one turn. Distinguishes user-msg
+   * turns from cron-fired scheduled wakeups: count > 0 ⇒ user;
+   * count === 0 ⇒ scheduled (and `initCount > 1`). */
+  private pendingUserMessageCount = 0
+  /** Most recent userOpenId seen via `onUserMessage`. Used only when a
+   * merged batch fires its init event and the daemon needs *some* open_id
+   * to scope the eventual `urgent_app` push — there's no obviously right
+   * answer when N messages from possibly different users collapse into
+   * one turn, and "the most recent sender" is a defensible default for
+   * the single-user private-bot scenario this product targets. */
+  private lastUserOpenId = ''
+  /** Feishu message_ids of user messages that arrived while the daemon
+   * was busy (turn in flight or mid-open), mapped to the `reaction_id`
+   * of the `OneSecond` reaction placed at arrival. The reaction_id is
+   * what `deleteReaction` needs to *remove* the OneSecond once the
+   * message has been absorbed by the SDK (either system-reminder
+   * injection mid-turn or a merged-batch dequeue on next turn).
+   * User feedback (2026-05-15): replacing OneSecond with a second
+   * CheckMark stacked two emojis on the same row; cleaner UX is
+   * "queued → released" via removal, not "queued → done" via
+   * stacking. */
+  private pendingReactionIds = new Map<string, string>()
+  /** Snapshot of `pendingReactionIds` taken when the init handler
+   * claims a merged batch — these are the Feishu messages whose
+   * OneSecond reactions are the currently-open turn's responsibility
+   * to clear (via deleteReaction). Empty for eager-opened solo turns
+   * and for scheduled wakeups (no user messages went into those). */
+  private currentBatchReactionIds = new Map<string, string>()
+  /** Set the moment a mid-turn user message lands. Tells the next
+   * content-adding event (assistant text delta or fresh tool_use) to
+   * rotate the card before applying its update — closes the in-flight
+   * card with a `📨 转交新卡` footer and opens a fresh card, so the
+   * continuation has a visible boundary instead of piling up under
+   * one card. Reset to false after the rotation fires (or on
+   * stop/restart/exit). User feedback (2026-05-15): the prior
+   * everything-in-one-card behavior made the order feel jumbled. */
+  private wantsRotation = false
+  /** Holds assistant / thinking / tool_use events that arrive while a
+   * card rotation is mid-flight (close-old → open-new straddles a
+   * Feishu API await window during which `currentTurn` is transiently
+   * null). Replayed onto the new card the moment rotation completes
+   * so no streamed token is lost across the boundary. */
+  private rotationBuffer: Array<
+    | { kind: 'assistant'; delta: string }
+    | { kind: 'thinking'; delta: string }
+    | { kind: 'tool_use'; id: string; name: string; input: any }
+  > = []
+  /** Count of `system/init` events seen this subprocess. The first one is
+   * the boot init (claimed by whichever user message lands first); all
+   * subsequent ones mark the start of an SDK-initiated turn (queued
+   * user message draining or a CronCreate fire). Reset on stop/restart/exit
+   * since `init` re-fires after every spawn. */
+  private initCount = 0
+  /** Sync guard set before any `await` in the eager-open path of
+   * `onUserMessage`, cleared after `currentTurn` is set. Closes the race
+   * where an SDK-emitted `init` event lands during the eager open's
+   * Feishu API await — without this, the init handler would observe
+   * `currentTurn === null && queue empty` (we've already shifted) and
+   * incorrectly open a *second* scheduled card for the same user
+   * message. The flag tells the init handler "an eager open is already
+   * claiming the slot, stand down". */
+  private openingTurn = false
   private pendingPermissions = new Map<string, { toolUseId: string }>()
   /** Open AskUserQuestion tool calls — keyed by tool_use_id. The SDK
    * routes AskUserQuestion through the can_use_tool flow even under
@@ -228,6 +307,14 @@ export class Session {
     this.lastSessionId = proc.sessionId ?? this.lastSessionId
     this.proc = null
     this.currentTurn = null
+    this.pendingUserMessageCount = 0
+    this.lastUserOpenId = ''
+    this.pendingReactionIds = new Map()
+    this.currentBatchReactionIds = new Map()
+    this.wantsRotation = false
+    this.rotationBuffer = []
+    this.initCount = 0
+    this.openingTurn = false
     this.pendingPermissions.clear()
     this.status = 'stopped'
     await proc.kill()
@@ -242,6 +329,14 @@ export class Session {
       this.proc = null
     }
     this.currentTurn = null
+    this.pendingUserMessageCount = 0
+    this.lastUserOpenId = ''
+    this.pendingReactionIds = new Map()
+    this.currentBatchReactionIds = new Map()
+    this.wantsRotation = false
+    this.rotationBuffer = []
+    this.initCount = 0
+    this.openingTurn = false
     this.pendingPermissions.clear()
     if (resume && prevSessionId) {
       this.proc = new ClaudeProcess({
@@ -271,15 +366,18 @@ export class Session {
     }
   }
 
-  /** Run a bare-text control command (`hi`, `kill`, `restart`, `clear`).
+  /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`).
    * Returns true if the command was consumed (don't forward to Claude).
    * Exact match, case-insensitive, ignores trailing whitespace.
    *
-   * Trade-off (user-confirmed 2026-05-15): the four words are reserved
+   * Trade-off (user-confirmed 2026-05-15): these words are reserved
    * globally — typing "hi" as a literal greeting will show the console
    * card instead of reaching Claude. The ergonomic win (no slash, no
    * shift key, one-handed phone use) outweighs the collision in this
-   * product's private-bot use case. */
+   * product's private-bot use case. `stop` was added 2026-05-15 once
+   * auto-interrupt on mid-turn user messages was removed (matching
+   * claude-code's native type-ahead behavior) — explicit barge-out
+   * needed a knob and `kill` (full subprocess teardown) is too heavy. */
   async runCommand(raw: string): Promise<boolean> {
     switch (raw.trim().toLowerCase()) {
       case 'hi':
@@ -288,6 +386,38 @@ export class Session {
           if (!ok) return true
         }
         await this.showConsole()
+        return true
+      case 'stop':
+        // Soft barge-out: interrupt the current turn (if any) AND drop
+        // the pending-message count so a stack of type-ahead doesn't
+        // refire after the interrupt. Subprocess stays alive. Note: the
+        // SDK keeps its OWN internal queue of the user-text frames we
+        // already sendText'd — interrupt should also flush that side,
+        // but the daemon can't reach into it directly; in practice the
+        // sendInterrupt() control_request causes the SDK to discard
+        // queued input alongside the in-flight call.
+        if (!this.currentTurn && this.pendingUserMessageCount === 0) {
+          await feishu.sendText(this.chatId, '⚪ 当前没有正在执行的 turn')
+          return true
+        }
+        log(`session "${this.sessionName}": stop command — interrupt + drop count=${this.pendingUserMessageCount}`)
+        // Cancelled queued msgs: remove the OneSecond (no longer waiting)
+        // and stamp a CrossMark (explicit cancelled state, distinct from
+        // a natural release where reactions just disappear). Cancelled
+        // mid-batch msgs get the same treatment.
+        for (const [msgId, rid] of [
+          ...this.pendingReactionIds.entries(),
+          ...this.currentBatchReactionIds.entries(),
+        ]) {
+          if (rid) void feishu.deleteReaction(msgId, rid)
+          void feishu.addReaction(msgId, 'CrossMark')
+        }
+        this.pendingUserMessageCount = 0
+        this.lastUserOpenId = ''
+        this.pendingReactionIds = new Map()
+        this.currentBatchReactionIds = new Map()
+        this.wantsRotation = false
+        this.interrupt()
         return true
       case 'kill':
         await this.stop()
@@ -359,19 +489,62 @@ export class Session {
   }
 
   // ── Inbound from Feishu ────────────────────────────────────────────
-  async onUserMessage(text: string, files: string[] = [], userOpenId = ''): Promise<void> {
+  /** Inbound user message. Always writes to Claude's stdin immediately —
+   * the SDK queues internally if a turn is in flight (FIFO, exactly the
+   * type-ahead semantics of the native claude-code REPL). Card opening:
+   *   - First msg of session OR no turn in flight  → open card eagerly here
+   *   - Mid-flight msg                              → defer; the `init`
+   *     handler opens its card when the SDK actually starts the turn
+   * This is what lets a single subprocess host both user-typed turns and
+   * cron-fired wakeups without the daemon ever calling `sendInterrupt` —
+   * `kill`/`stop` are the only paths that interrupt now. */
+  async onUserMessage(text: string, files: string[] = [], userOpenId = '', msgId = ''): Promise<void> {
     if (!this.isRunning()) {
       const ok = await this.start()
       if (!ok) return
     }
-    if (this.currentTurn) {
-      log(`session "${this.sessionName}": new turn arriving mid-flight, interrupting`)
-      this.proc!.sendInterrupt()
-      await this.closeTurnCard('🛑 用户打断')
-    }
-    await this.openTurnCard(text, userOpenId)
+    // Capture busy-state SYNC, before any state mutation — this decides
+    // whether the message will visibly queue (gets the OneSecond → later
+    // CheckMark lifecycle reactions on its Feishu chat message) or
+    // eager-open its own card (no reaction needed; the card itself is
+    // the acknowledgement).
+    const wasBusy = this.currentTurn !== null || this.openingTurn
+    this.pendingUserMessageCount++
+    this.lastUserOpenId = userOpenId
     this.proc!.sendUserText(text, files)
-    this.status = 'working'
+    if (wasBusy && msgId) {
+      // Hold the slot in the map even if the API call hasn't returned
+      // yet — empty string is a sentinel meaning "we tried to react;
+      // reaction_id pending". When deleteReaction time comes, an empty
+      // string is a no-op (deleteReaction guards against it), which is
+      // the right behavior if the add failed.
+      this.pendingReactionIds.set(msgId, '')
+      void (async () => {
+        const rid = await feishu.addReaction(msgId, 'OneSecond')
+        if (rid && this.pendingReactionIds.has(msgId)) {
+          this.pendingReactionIds.set(msgId, rid)
+        }
+      })()
+      // Rotation hint: a mid-turn user msg means the next assistant /
+      // tool event should split the visual into a new card.
+      this.wantsRotation = true
+    }
+    if (!this.currentTurn && !this.openingTurn && this.initCount >= 1) {
+      // Eager open: this message is going to be processed solo (no current
+      // turn to merge with on the SDK side, so SDK runs it as its own turn).
+      // Claim one count and open the card with this message's own text +
+      // sender; any *additional* messages arriving during the open's
+      // Feishu API await will pile up in the count and get batched by the
+      // SDK into the NEXT turn (handled by the init handler).
+      this.openingTurn = true
+      this.pendingUserMessageCount--
+      try {
+        await this.openTurnCard(text, userOpenId, 'user_message')
+        this.status = 'working'
+      } finally {
+        this.openingTurn = false
+      }
+    }
   }
 
   async onPermissionDecision(
@@ -418,6 +591,15 @@ export class Session {
    * (routed to onAskMessageAnswer) instead of opening a new turn. */
   hasPendingAsk(): boolean {
     return this.pendingAsks.size > 0
+  }
+
+  /** True iff a turn is currently running (or a queued user message is
+   * waiting for its turn to start). daemon uses this to drop a hourglass
+   * reaction on inbound messages — without it the user sees no visible
+   * acknowledgement that their type-ahead message landed (the card
+   * doesn't open until the current turn finishes). */
+  isBusy(): boolean {
+    return this.currentTurn !== null || this.pendingUserMessageCount > 0
   }
 
   /** Funnel an arbitrary chat message into the *current* question
@@ -575,6 +757,58 @@ export class Session {
         this.lastSessionId = p.sessionId
         feishu.bindSessionResume(this.sessionName, p.sessionId)
       }
+      this.initCount++
+
+      // The boot init (initCount === 1) only happens once per spawn and
+      // is claimed by whichever user message gets processed first — that
+      // message's card is opened eagerly in `onUserMessage`, so the boot
+      // init itself opens nothing. EXCEPTION: if a user message landed
+      // before the boot init (rare race during start()), the queue has
+      // an entry — drain it here.
+      //
+      // Subsequent inits (initCount >= 2) mark the start of an SDK-
+      // initiated turn — either the SDK draining its internal type-ahead
+      // queue (we'll have an entry in `pendingUserMessages` mirroring
+      // it) or a CronCreate / ScheduleWakeup fire (queue empty). The
+      // `currentTurn` / `openingTurn` checks guard the race where
+      // `onUserMessage` already eager-opened (or is mid-open) for the
+      // same user message and the SDK emitted an init#≥2 we don't need
+      // to act on. The init handler ALSO claims `openingTurn` for its
+      // own async open so a user message landing during the open
+      // doesn't spawn a duplicate card.
+      if (this.currentTurn || this.openingTurn) return
+      // `pendingUserMessageCount > 0` ⇒ SDK is about to fire an init for a
+      // merged batch of one-or-more user messages we already sendText'd
+      // (the eager-open path didn't claim them because a turn was still
+      // running at the time). Claim the ENTIRE count here — the SDK
+      // collapses them into ONE turn, so only one card opens; any further
+      // messages that arrive after this point will start a fresh count
+      // and a fresh batch.
+      const isUserBatch = this.pendingUserMessageCount > 0
+      const isScheduledFire = !isUserBatch && this.initCount > 1
+      if (!isUserBatch && !isScheduledFire) return
+      const userOpenId = isUserBatch ? this.lastUserOpenId : ''
+      if (isUserBatch) {
+        this.pendingUserMessageCount = 0
+        // Inherit the queued reaction_ids — this turn is collectively
+        // responsible for releasing their OneSecond reactions when it
+        // closes (via deleteReaction in closeTurnCard).
+        this.currentBatchReactionIds = this.pendingReactionIds
+        this.pendingReactionIds = new Map()
+      }
+      this.openingTurn = true
+      void (async () => {
+        try {
+          await this.openTurnCard(
+            isUserBatch ? '' : '⏰ 定时唤醒',
+            userOpenId,
+            isUserBatch ? 'user_message' : 'scheduled',
+          )
+          this.status = 'working'
+        } finally {
+          this.openingTurn = false
+        }
+      })()
     })
     p.on('assistant_text', ({ text }: { text: string }) => {
       this.appendAssistant(text)
@@ -604,6 +838,13 @@ export class Session {
       log(`session "${this.sessionName}": claude exited code=${code} signal=${signal} expected=${expected}`)
       this.proc = null
       this.currentTurn = null
+      this.pendingUserMessageCount = 0
+      this.lastUserOpenId = ''
+      this.pendingReactionIds = new Map()
+      this.currentBatchReactionIds = new Map()
+      this.wantsRotation = false
+      this.initCount = 0
+      this.openingTurn = false
       this.status = 'stopped'
       if (!expected && code !== 0 && signal !== 'SIGTERM') {
         void feishu.sendText(this.chatId, `⚠️ Claude 异常退出 (code=${code}, signal=${signal})。回复任意消息将重新启动。`)
@@ -642,13 +883,14 @@ export class Session {
     return this.lastTurnDelta?.inputTokens ?? 0
   }
 
-  private async openTurnCard(userText: string, userOpenId: string): Promise<void> {
+  private async openTurnCard(userText: string, userOpenId: string, trigger: 'user_message' | 'scheduled'): Promise<void> {
     const turn = ++this.turnCounter
     const card = cards.mainConversationCard({
       sessionName: this.sessionName,
       turn,
       effort: 'max',
       userText,
+      kind: trigger,
     })
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) { log(`session "${this.sessionName}": openTurnCard sendCard failed`); return }
@@ -659,6 +901,7 @@ export class Session {
       cardId,
       messageId,
       userOpenId,
+      trigger,
       userText,
       thinkingText: '',
       toolCount: 0,
@@ -676,8 +919,43 @@ export class Session {
   // forget here and rely on enqueue source order — that way no `await`
   // can yield mid-handler and let `closeTurnCard` (or another event) race
   // and mutate `this.currentTurn` underfoot.
+  /** Rotate to a fresh card mid-turn: close the in-flight card with a
+   * `📨 转交新卡` footer (distinct from `✅ done` and `🛑 打断`) and
+   * open a new card so the post-user-message continuation has a
+   * visible boundary. Streams that land during the rotation's await
+   * windows are buffered in `rotationBuffer` and replayed onto the
+   * new card the moment it's ready, so no tokens are lost across the
+   * cut. Caller guarantees `wantsRotation` was true sync-immediately
+   * before. */
+  private async rotateCard(): Promise<void> {
+    this.openingTurn = true
+    try {
+      await this.closeTurnCard('📨 转交新卡')
+      await this.openTurnCard('', this.lastUserOpenId, 'user_message')
+    } finally {
+      this.openingTurn = false
+    }
+    if (this.rotationBuffer.length === 0) return
+    const buf = this.rotationBuffer
+    this.rotationBuffer = []
+    for (const e of buf) {
+      if (e.kind === 'assistant') this.appendAssistant(e.delta)
+      else if (e.kind === 'thinking') this.appendThinking(e.delta)
+      else if (e.kind === 'tool_use') this.addTool(e.id, e.name, e.input)
+    }
+  }
+
   private appendAssistant(delta: string): void {
-    if (!this.currentTurn) return
+    if (!this.currentTurn) {
+      if (this.openingTurn) this.rotationBuffer.push({ kind: 'assistant', delta })
+      return
+    }
+    if (this.wantsRotation) {
+      this.wantsRotation = false
+      this.rotationBuffer.push({ kind: 'assistant', delta })
+      void this.rotateCard()
+      return
+    }
     if (!this.currentTurn.currentAssistantSegmentId) {
       const i = this.currentTurn.assistantSegmentCount++
       const segId = cards.ELEMENTS.assistant(i)
@@ -703,7 +981,16 @@ export class Session {
   }
 
   private appendThinking(delta: string): void {
-    if (!this.currentTurn) return
+    if (!this.currentTurn) {
+      if (this.openingTurn) this.rotationBuffer.push({ kind: 'thinking', delta })
+      return
+    }
+    if (this.wantsRotation) {
+      this.wantsRotation = false
+      this.rotationBuffer.push({ kind: 'thinking', delta })
+      void this.rotateCard()
+      return
+    }
     this.currentTurn.thinkingText += delta
     cardkit.streamTextThrottled(
       this.currentTurn.cardId,
@@ -721,7 +1008,16 @@ export class Session {
   }
 
   private addTool(toolUseId: string, name: string, input: any): void {
-    if (!this.currentTurn) return
+    if (!this.currentTurn) {
+      if (this.openingTurn) this.rotationBuffer.push({ kind: 'tool_use', id: toolUseId, name, input })
+      return
+    }
+    if (this.wantsRotation) {
+      this.wantsRotation = false
+      this.rotationBuffer.push({ kind: 'tool_use', id: toolUseId, name, input })
+      void this.rotateCard()
+      return
+    }
     // Close current assistant segment (if any) so the tool panel renders
     // AFTER it in card body order. Flush queues the segment's last
     // buffered delta before the tool element is inserted.
@@ -1007,7 +1303,11 @@ export class Session {
       await cardkit.replaceElement(cardId, cards.ELEMENTS.thinking, cards.thinkingCollapsedPanel(thinkingText))
     }
     const sendNote = sendPaths.length ? ` · 📎 ${sendPaths.length}` : ''
-    const footer = `⏱ ${elapsed}s${suffix ? ' · ' + suffix : ''}${sendNote} · ✅ done`
+    // Suffix REPLACES the trailing `✅ done` — it represents a terminal
+    // state distinct from natural completion (e.g. `📨 转交新卡` for a
+    // mid-turn rotation). When absent, the turn ended cleanly.
+    const stateMark = suffix ? ` · ${suffix}` : ' · ✅ done'
+    const footer = `⏱ ${elapsed}s${sendNote}${stateMark}`
     await cardkit.streamText(cardId, cards.ELEMENTS.footer, footer)
     // Final chat-list preview: clean finish shows "⏱ Xs · NK tokens";
     // interrupted shows the suffix instead (no usage event landed).
@@ -1023,10 +1323,42 @@ export class Session {
 
     // Phone push on clean turn close so the user knows Claude is done
     // even with the chat backgrounded. Skip on interrupts (no real
-    // completion) and when we don't know who to ping. Fire-and-forget;
-    // urgent_app failures are non-fatal and already logged in feishu.ts.
-    if (!suffix && turn.userOpenId && turn.messageId) {
+    // completion), when we don't know who to ping, and when the turn
+    // wasn't kicked off by the user typing a message — scheduled /
+    // cron / loop wakeups finish on their own and shouldn't ping the
+    // phone. Fire-and-forget; urgent_app failures are non-fatal and
+    // already logged in feishu.ts.
+    if (!suffix && turn.trigger === 'user_message' && turn.userOpenId && turn.messageId) {
       void feishu.urgentApp(turn.messageId, [turn.userOpenId])
+    }
+
+    // Release the OneSecond reactions on every queued Feishu message
+    // this turn was responsible for. Two buckets:
+    //   1. `currentBatchReactionIds` — msgs the init handler explicitly
+    //      claimed (SDK dequeued them as a merged next-turn batch).
+    //   2. `pendingReactionIds` — msgs whose fate is invisible to the
+    //      daemon: the SDK either dequeued them as part of the
+    //      JUST-CLOSED turn OR injected them mid-turn as
+    //      `<system-reminder>` and silently removed them from the
+    //      queue (common when the current turn had tool calls).
+    //      Without visibility into queue-operation events the daemon
+    //      can't tell which; the safe default is "the prior turn just
+    //      ended, so the msg is at least *acknowledged* now —
+    //      release the OneSecond and let it stop saying 'queued',
+    //      instead of leaving it stuck permanently."
+    //      For merged-batch follow-ups, this releases slightly early
+    //      (before the merged turn actually runs), which is an
+    //      acceptable trade vs. msgs stuck under OneSecond forever.
+    const releaseEntries = [
+      ...this.currentBatchReactionIds.entries(),
+      ...this.pendingReactionIds.entries(),
+    ]
+    if (releaseEntries.length > 0) {
+      for (const [msgId, rid] of releaseEntries) {
+        if (rid) void feishu.deleteReaction(msgId, rid)
+      }
+      this.currentBatchReactionIds = new Map()
+      this.pendingReactionIds = new Map()
     }
 
     // Fire uploads sequentially AFTER the card is sealed so each file

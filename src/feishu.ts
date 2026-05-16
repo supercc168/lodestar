@@ -194,14 +194,34 @@ export async function sendCard(chatId: string, card: object): Promise<string | n
 }
 
 // ── Reactions ──────────────────────────────────────────────────────────
-export async function addReaction(messageId: string, emojiType: string): Promise<void> {
-  if (!messageId) return
+/** Add an emoji reaction. Returns the new reaction_id on success (needed
+ * to delete the reaction later via {@link deleteReaction}) or null on
+ * failure. Failures are logged and swallowed — reactions are non-load-
+ * bearing UX, not worth bubbling errors. */
+export async function addReaction(messageId: string, emojiType: string): Promise<string | null> {
+  if (!messageId) return null
   try {
-    await client.im.messageReaction.create({
+    const res: any = await client.im.messageReaction.create({
       path: { message_id: messageId },
       data: { reaction_type: { emoji_type: emojiType } },
     })
-  } catch (e) { log(`feishu: addReaction ${emojiType} on ${messageId} failed: ${e}`) }
+    return res?.data?.reaction_id ?? null
+  } catch (e) { log(`feishu: addReaction ${emojiType} on ${messageId} failed: ${e}`); return null }
+}
+
+/** Remove a previously-added reaction by its reaction_id (returned from
+ * {@link addReaction}). Used for the "queued → released" lifecycle: the
+ * OneSecond placed on arrival is *removed* when the daemon hands the
+ * message off to the SDK's batch / system-reminder pipeline, instead of
+ * stacking a second CheckMark on top — keeps the message's reaction row
+ * uncluttered. Quiet on failure. */
+export async function deleteReaction(messageId: string, reactionId: string): Promise<void> {
+  if (!messageId || !reactionId) return
+  try {
+    await client.im.messageReaction.delete({
+      path: { message_id: messageId, reaction_id: reactionId },
+    })
+  } catch (e) { log(`feishu: deleteReaction ${reactionId} on ${messageId} failed: ${e}`) }
 }
 
 // ── Urgent push ───────────────────────────────────────────────────────

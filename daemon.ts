@@ -175,7 +175,7 @@ async function handleMessage(data: any): Promise<void> {
   }
 
   if (!text && !filePath) return
-  await session.onUserMessage(text || '(empty)', filePath ? [filePath] : [], userOpenId)
+  await session.onUserMessage(text || '(empty)', filePath ? [filePath] : [], userOpenId, msgId ?? '')
 }
 
 // ── Card action handler ────────────────────────────────────────────────
