@@ -112,6 +112,15 @@ export class Session {
    * turns from cron-fired scheduled wakeups: count > 0 ⇒ user;
    * count === 0 ⇒ scheduled (and `initCount > 1`). */
   private pendingUserMessageCount = 0
+  /** Mid-turn user messages buffered DAEMON-SIDE (not yet sendUserText'd
+   * to the SDK). Drained in the `result` handler by writing each to SDK
+   * stdin, which doubles as the `priority="now"` wake signal the SDK
+   * polling loop needs to start the next batch turn (the SDK won't
+   * auto-dequeue queued type-ahead msgs after `result` — confirmed via
+   * claude-code issue #39632). Buffering also keeps mid-turn msgs out
+   * of any AskUserQuestion `QUEUE remove` storm, since they were never
+   * in the SDK queue to begin with. */
+  private pendingMidTurnMsgs: Array<{ wireText: string; files: string[]; userOpenId: string; msgId: string }> = []
   /** Most recent userOpenId seen via `onUserMessage`. Used only when a
    * merged batch fires its init event and the daemon needs *some* open_id
    * to scope the eventual `urgent_app` push — there's no obviously right
@@ -288,6 +297,7 @@ export class Session {
     this.proc = null
     this.currentTurn = null
     this.pendingUserMessageCount = 0
+    this.pendingMidTurnMsgs = []
     this.lastUserOpenId = ''
     this.pendingReactionIds = new Map()
     this.currentBatchReactionIds = new Map()
@@ -308,6 +318,7 @@ export class Session {
     }
     this.currentTurn = null
     this.pendingUserMessageCount = 0
+    this.pendingMidTurnMsgs = []
     this.lastUserOpenId = ''
     this.pendingReactionIds = new Map()
     this.currentBatchReactionIds = new Map()
@@ -372,11 +383,11 @@ export class Session {
         // but the daemon can't reach into it directly; in practice the
         // sendInterrupt() control_request causes the SDK to discard
         // queued input alongside the in-flight call.
-        if (!this.currentTurn && this.pendingUserMessageCount === 0) {
+        if (!this.currentTurn && this.pendingUserMessageCount === 0 && this.pendingMidTurnMsgs.length === 0) {
           await feishu.sendText(this.chatId, '⚪ 当前没有正在执行的 turn')
           return true
         }
-        log(`session "${this.sessionName}": stop command — interrupt + drop count=${this.pendingUserMessageCount}`)
+        log(`session "${this.sessionName}": stop command — interrupt + drop count=${this.pendingUserMessageCount} midBuffer=${this.pendingMidTurnMsgs.length}`)
         // Cancelled queued msgs: remove the OneSecond (no longer waiting)
         // and stamp a CrossMark (explicit cancelled state, distinct from
         // a natural release where reactions just disappear). Cancelled
@@ -388,7 +399,12 @@ export class Session {
           if (rid) void feishu.deleteReaction(msgId, rid)
           void feishu.addReaction(msgId, 'CrossMark')
         }
+        // Mid-turn buffer never reached SDK — cancel those too.
+        for (const msg of this.pendingMidTurnMsgs) {
+          if (msg.msgId) void feishu.addReaction(msg.msgId, 'CrossMark')
+        }
         this.pendingUserMessageCount = 0
+        this.pendingMidTurnMsgs = []
         this.lastUserOpenId = ''
         this.pendingReactionIds = new Map()
         this.currentBatchReactionIds = new Map()
@@ -532,8 +548,8 @@ export class Session {
     // reaction) and the model would see e.g. "123" + "321" + "1"
     // glued into a single string "1233211" (2026-05-16 accumulator
     // bug).
-    const wasBusy = this.currentTurn !== null || this.openingTurn || this.pendingUserMessageCount > 0
-    this.pendingUserMessageCount++
+    const wasBusy = this.currentTurn !== null || this.openingTurn
+      || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0
     this.lastUserOpenId = userOpenId
     // When the SDK will merge this msg with siblings into a multi-
     // content user turn, wrap it in `<u>...</u>` so the model sees a
@@ -547,51 +563,53 @@ export class Session {
     // skips the wrap — no sibling, no merge, no need. Contract
     // declared in CHANNEL_INSTRUCTIONS.
     const wireText = wasBusy ? `<u>${text}</u>` : text
-    this.proc!.sendUserText(wireText, files)
-    if (wasBusy && msgId) {
-      // Hold the slot in the map even if the API call hasn't returned
-      // yet — empty string is a sentinel meaning "we tried to react;
-      // reaction_id pending". When deleteReaction time comes, an empty
-      // string is a no-op (deleteReaction guards against it), which is
-      // the right behavior if the add failed.
-      this.pendingReactionIds.set(msgId, '')
+
+    // Reaction helper: track the OneSecond reaction so deleteReaction can
+    // clear it later. Use empty-string sentinel until addReaction returns.
+    const trackReaction = (id: string) => {
+      this.pendingReactionIds.set(id, '')
       void (async () => {
-        const rid = await feishu.addReaction(msgId, 'OneSecond')
+        const rid = await feishu.addReaction(id, 'OneSecond')
         if (!rid) return
-        if (this.pendingReactionIds.has(msgId)) {
-          this.pendingReactionIds.set(msgId, rid)
-        } else if (this.currentBatchReactionIds.has(msgId)) {
-          // Init handler renamed the sentinel into the batch map while
-          // addReaction was in flight — record the rid there so the
-          // batch's close-time deleteReaction sees it.
-          this.currentBatchReactionIds.set(msgId, rid)
+        if (this.pendingReactionIds.has(id)) {
+          this.pendingReactionIds.set(id, rid)
+        } else if (this.currentBatchReactionIds.has(id)) {
+          this.currentBatchReactionIds.set(id, rid)
         } else {
-          // Orphan: both maps cleared (closeTurnCard already released
-          // them) before our add returned. The reaction is now stuck
-          // on the Feishu message with no one tracking it — delete
+          // Orphan: both maps cleared before our add returned. Delete
           // directly so the user doesn't see a stale ⏳ forever.
-          // (Observed bug 2026-05-16: 8 OneSeconds added during a M0
-          // turn, 2 addReaction callbacks landed after close fired the
-          // release loop, those rids never made it back into either
-          // map → 2 stuck ⏳ in chat.)
-          void feishu.deleteReaction(msgId, rid)
+          void feishu.deleteReaction(id, rid)
         }
       })()
     }
-    // Mid-turn user messages don't touch the in-flight card — the SDK
-    // queues them and dequeues them on its next turn boundary, at
-    // which point `result` closes the current card with `📨 转交新卡`
-    // and `init` opens a fresh card for the merged batch turn. The
-    // user's own message bubble in the chat (plus the OneSecond ⏳
-    // reaction added above) is the only mid-flight feedback they get;
-    // no card edit, no echo inside the card.
-    if (!this.currentTurn && !this.openingTurn && this.initCount >= 1) {
-      // Eager open: this message is going to be processed solo (no current
-      // turn to merge with on the SDK side, so SDK runs it as its own turn).
-      // Claim one count and open the card with this message's own text +
-      // sender; any *additional* messages arriving during the open's
-      // Feishu API await will pile up in the count and get batched by the
-      // SDK into the NEXT turn (handled by the init handler).
+
+    if (this.currentTurn !== null) {
+      // Mid-turn — BUFFER instead of immediate sendUserText. The SDK polling
+      // loop will not auto-dequeue queued type-ahead msgs after `result`
+      // (only `priority="now"` writes wake it — claude-code issue #39632),
+      // so writing here would leave the msg stuck until the next user msg
+      // arrives. Drain happens in the `result` handler, which both wakes
+      // the SDK and opens a fresh card for the new batch turn.
+      this.pendingMidTurnMsgs.push({ wireText, files, userOpenId, msgId })
+      if (msgId) trackReaction(msgId)
+      return
+    }
+
+    // No in-flight turn: send straight to SDK. This path handles
+    //   - first message after spawn (init not yet fired)
+    //   - bootstrap race (sibling msgs landing before init#1)
+    //   - solo message after a prior turn has fully closed
+    this.proc!.sendUserText(wireText, files)
+    this.pendingUserMessageCount++
+    if (wasBusy && msgId) {
+      // Bootstrap race: the init handler will open the card for us; until
+      // then the OneSecond ⏳ is the only ack the user gets.
+      trackReaction(msgId)
+    }
+    if (!this.openingTurn && this.initCount >= 1) {
+      // Eager open: SDK is healthy and idle, open card now. Any extra
+      // messages arriving during the open's Feishu API await pile up in
+      // the count and the init handler batches them.
       this.openingTurn = true
       this.pendingUserMessageCount--
       try {
@@ -655,7 +673,7 @@ export class Session {
    * acknowledgement that their type-ahead message landed (the card
    * doesn't open until the current turn finishes). */
   isBusy(): boolean {
-    return this.currentTurn !== null || this.pendingUserMessageCount > 0
+    return this.currentTurn !== null || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0
   }
 
   /** Funnel an arbitrary chat message into the *current* question
@@ -801,6 +819,7 @@ export class Session {
         feishu.bindSessionResume(this.sessionName, p.sessionId)
       }
       this.initCount++
+      log(`session "${this.sessionName}": SDK init#${this.initCount} pendingCount=${this.pendingUserMessageCount} midBuffer=${this.pendingMidTurnMsgs.length} currentTurn=${this.currentTurn ? 'yes' : 'no'} openingTurn=${this.openingTurn}`)
 
       // Boot init (initCount === 1) is claimed by `onUserMessage`'s
       // eager-open path — if a user message landed before the init
@@ -861,21 +880,28 @@ export class Session {
     })
     p.on('result', () => {
       this.accumulateResultStats()
-      // SDK-driven rotation: if any mid-turn user messages stacked up
-      // (the SDK is about to dequeue them into a fresh merged-batch
-      // turn), close the in-flight card with `📨 转交新卡` so the user
-      // sees the cut. The next `init` for that batch turn will open a
-      // new card whose top panel echoes those queued messages. No
-      // pending → natural ✅ close.
-      const suffix = this.pendingUserMessageCount > 0 ? '📨 转交新卡' : undefined
+      // Daemon-driven rotation: mid-turn msgs were buffered (not yet
+      // sent to SDK) — close the in-flight card with `📨 转交新卡` and
+      // drain the buffer in one shot. The drain writes each buffered
+      // msg to SDK stdin, which is the `priority="now"` wake the SDK
+      // polling loop needs (claude-code issue #39632) AND constitutes
+      // the input for the new batch turn. We open the new card here
+      // ourselves rather than waiting on init — the SDK init for this
+      // batch will fire shortly but `currentTurn` will already be set,
+      // so the init handler will return without double-opening.
+      const hasMidTurn = this.pendingMidTurnMsgs.length > 0
+      const suffix = hasMidTurn ? '📨 转交新卡' : undefined
+      log(`session "${this.sessionName}": SDK result midBuffer=${this.pendingMidTurnMsgs.length} suffix=${suffix ?? '<✅>'}`)
       void this.closeTurnCard(suffix)
       this.status = 'idle'
+      if (hasMidTurn) void this.drainMidTurnAndOpen()
     })
     p.on('exit', ({ code, signal, expected }: any) => {
       log(`session "${this.sessionName}": claude exited code=${code} signal=${signal} expected=${expected}`)
       this.proc = null
       this.currentTurn = null
       this.pendingUserMessageCount = 0
+      this.pendingMidTurnMsgs = []
       this.lastUserOpenId = ''
       this.pendingReactionIds = new Map()
       this.currentBatchReactionIds = new Map()
@@ -932,8 +958,39 @@ export class Session {
     return this.proc?.lastContextWindow ?? 200_000
   }
 
+  /** Drain `pendingMidTurnMsgs` to the SDK and open a fresh card for the
+   * resulting batch turn. Called from the `result` handler when buffered
+   * mid-turn messages need to start their own turn. The `sendUserText`
+   * calls wake the SDK polling loop (priority="now" semantics) and
+   * comprise the input for the new turn. Opens the card here rather
+   * than deferring to init because the init for this batch will arrive
+   * with `currentTurn` already set and bail. */
+  private async drainMidTurnAndOpen(): Promise<void> {
+    if (this.pendingMidTurnMsgs.length === 0) return
+    const batch = this.pendingMidTurnMsgs
+    this.pendingMidTurnMsgs = []
+    this.openingTurn = true
+    try {
+      for (const msg of batch) {
+        this.proc!.sendUserText(msg.wireText, msg.files)
+        if (msg.msgId) {
+          const rid = this.pendingReactionIds.get(msg.msgId) ?? ''
+          this.currentBatchReactionIds.set(msg.msgId, rid)
+          this.pendingReactionIds.delete(msg.msgId)
+        }
+      }
+      const last = batch[batch.length - 1]
+      const userOpenId = last?.userOpenId ?? this.lastUserOpenId
+      await this.openTurnCard(userOpenId, 'user_message')
+      this.status = 'working'
+    } finally {
+      this.openingTurn = false
+    }
+  }
+
   private async openTurnCard(userOpenId: string, trigger: 'user_message' | 'scheduled'): Promise<void> {
     const turn = ++this.turnCounter
+    log(`session "${this.sessionName}": openTurnCard turn=${turn} trigger=${trigger}`)
     const card = cards.mainConversationCard({
       sessionName: this.sessionName,
       turn,

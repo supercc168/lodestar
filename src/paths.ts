@@ -47,3 +47,11 @@ export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
  * Lodestar's "you have to send a message to re-spawn it" default. */
 export const ALIVE_MARKER_FILE = join(DATA_DIR, 'alive-on-shutdown.json')
 export const INBOX_DIR = join(DATA_DIR, 'inbox')
+/** Unix-socket endpoint the daemon listens on for debug message
+ * injection (see scripts/test-inject.ts). A real Feishu user sends
+ * a `[DEBUG]…` text once to seed `DEBUG_CTX_FILE` with chat_id +
+ * sender_open_id; the injector then POSTs `{text}` here and the
+ * daemon replays it through `handleMessage` as if WS had delivered
+ * it. File mode 0600 — daemon-private, never network-exposed. */
+export const DEBUG_SOCK_FILE = join(DATA_DIR, 'debug.sock')
+export const DEBUG_CTX_FILE = join(DATA_DIR, 'debug-context.json')

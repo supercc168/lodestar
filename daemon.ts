@@ -11,13 +11,13 @@
  */
 
 import * as lark from '@larksuiteoapi/node-sdk'
-import { mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
+import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { Session } from './src/session'
 import * as feishu from './src/feishu'
 import { config } from './src/config'
 import { log } from './src/log'
-import { PID_FILE } from './src/paths'
+import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
 
 // ── PID guard ───────────────────────────────────────────────────────────
 try {
@@ -44,6 +44,7 @@ const cleanup = () => {
     if (alive.length > 0) log(`alive marker: [${alive.join(', ')}]`)
   } catch (e) { log(`alive marker write failed: ${e}`) }
   try { unlinkSync(PID_FILE) } catch {}
+  try { unlinkSync(DEBUG_SOCK_FILE) } catch {}
 }
 process.on('exit', cleanup)
 process.on('SIGTERM', () => { log('SIGTERM'); cleanup(); process.exit(0) })
@@ -126,6 +127,29 @@ async function handleMessage(data: any): Promise<void> {
   }
 
   const chatId = message.chat_id as string
+
+  // `[DEBUG]` prefix — seed the inject context with the real chat/sender
+  // captured from a live WS event, then strip the prefix and continue as
+  // normal. The injector script (scripts/test-inject.ts) reads this
+  // context to replay arbitrary messages without the user touching Feishu.
+  let contentObjForDebug: any = {}
+  try { contentObjForDebug = JSON.parse(message.content ?? '{}') } catch {}
+  const debugTextRaw = (message.message_type === 'text' ? contentObjForDebug.text ?? '' : '')
+  if (typeof debugTextRaw === 'string' && debugTextRaw.startsWith('[DEBUG]')) {
+    try {
+      writeFileSync(DEBUG_CTX_FILE, JSON.stringify({
+        chat_id: chatId,
+        sender_open_id: userOpenId,
+        seeded_at: new Date().toISOString(),
+        seeded_msg_id: msgId ?? '',
+      }, null, 2))
+      log(`debug: seeded inject context chat=${chatId.slice(0, 8)}… sender=${userOpenId.slice(0, 8)}…`)
+    } catch (e) { log(`debug: seed context failed: ${e}`) }
+    const stripped = debugTextRaw.slice('[DEBUG]'.length)
+    contentObjForDebug.text = stripped
+    message.content = JSON.stringify(contentObjForDebug)
+  }
+
   let groupName = feishu.chatNameCache.get(chatId)
   if (!groupName) {
     await feishu.refreshChatList()
@@ -218,6 +242,55 @@ function fmt(m: any[]): string {
   return m.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')
 }
 
+// ── Debug message injection ─────────────────────────────────────────────
+// Listens on a unix socket so scripts/test-inject.ts can replay messages
+// through the same `handleMessage` path that real WS events take. Seeded
+// by a one-time `[DEBUG]<anything>` from the real Feishu user; from then
+// on the injector reuses that chat_id + sender_open_id.
+function startDebugSocket(): void {
+  try { if (existsSync(DEBUG_SOCK_FILE)) unlinkSync(DEBUG_SOCK_FILE) } catch {}
+  try {
+    Bun.serve({
+      unix: DEBUG_SOCK_FILE,
+      fetch: async (req: Request) => {
+        if (req.method !== 'POST') return new Response('use POST', { status: 405 })
+        let body: any = {}
+        try { body = await req.json() } catch { return new Response('bad json', { status: 400 }) }
+        if (!existsSync(DEBUG_CTX_FILE)) {
+          return new Response('no debug context yet — send `[DEBUG]hi` from Feishu first', { status: 412 })
+        }
+        let ctx: any = {}
+        try { ctx = JSON.parse(readFileSync(DEBUG_CTX_FILE, 'utf8')) } catch (e) {
+          return new Response(`ctx read failed: ${e}`, { status: 500 })
+        }
+        const text: string = String(body.text ?? '')
+        if (!text) return new Response('text required', { status: 400 })
+        const fakeMsgId = `om_DEBUG_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+        const payload = {
+          sender: { sender_id: { open_id: ctx.sender_open_id } },
+          message: {
+            message_id: fakeMsgId,
+            chat_id: ctx.chat_id,
+            message_type: 'text',
+            content: JSON.stringify({ text }),
+            create_time: String(Date.now()),
+          },
+        }
+        log(`debug: inject text=${JSON.stringify(text).slice(0, 80)} fake_id=${fakeMsgId}`)
+        // Don't await — match real WS dispatcher behavior (fire-and-forget per event).
+        handleMessage(payload).catch(e => log(`debug: handleMessage rejected: ${e}`))
+        return new Response(JSON.stringify({ ok: true, fake_msg_id: fakeMsgId }), {
+          headers: { 'content-type': 'application/json' },
+        })
+      },
+    })
+    try { chmodSync(DEBUG_SOCK_FILE, 0o600) } catch {}
+    log(`debug: inject socket listening at ${DEBUG_SOCK_FILE}`)
+  } catch (e) {
+    log(`debug: socket bind failed: ${e}`)
+  }
+}
+
 async function boot(): Promise<void> {
   log(`lodestar-daemon: pid ${process.pid} starting`)
   feishu.loadSessionChatMap()
@@ -268,6 +341,8 @@ async function boot(): Promise<void> {
   })
   ws.start({ eventDispatcher: dispatcher })
   log(`lodestar-daemon: WS started, watching ${feishu.chatNameCache.size} groups`)
+
+  startDebugSocket()
 
   // Auto-revive sessions that were running when we last went down.
   // Runs AFTER the WS is up so any 🔁 revive message lands in the
