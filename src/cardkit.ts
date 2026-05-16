@@ -294,12 +294,22 @@ export function cancelSummary(cardId: string): void {
   summaryStates.delete(cardId)
 }
 
-/** Patch settings — used to flip streaming_mode off when a turn finishes. */
+/** Patch settings — used to flip streaming_mode off when a turn finishes.
+ *
+ * `nextSeq` is called inside the queued task (not at enqueue time) to
+ * match streamText/addElement/replaceElement/deleteElement above. Mixing
+ * call-time and execution-time seq allocation interleaves badly: a
+ * patchSettings enqueued right after a replaceElement would grab the
+ * smaller seq number, but the replaceElement's then-block would grab
+ * the larger one when it ran first, so the patchSettings PATCH lands
+ * with a stale seq and Feishu rejects 300317 "sequence number compare
+ * failed". Keeping all writes on execution-time allocation makes the
+ * seq order match the queue order. */
 export function patchSettings(cardId: string, settings: object): Promise<void> {
   const s = state(cardId)
-  const seq = nextSeq(cardId)
   s.queue = s.queue.then(async () => {
     try {
+      const seq = nextSeq(cardId)
       await call('PATCH', `/cards/${cardId}/settings`, {
         settings: JSON.stringify(settings),
         sequence: seq,
