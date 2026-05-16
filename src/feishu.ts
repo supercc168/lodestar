@@ -8,6 +8,7 @@
 
 import * as lark from '@larksuiteoapi/node-sdk'
 import { execSync } from 'node:child_process'
+import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, realpathSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
@@ -165,32 +166,84 @@ export async function refreshChatList(): Promise<void> {
 }
 
 // ── Outbound: text + card ──────────────────────────────────────────────
-export async function sendText(chatId: string, text: string): Promise<string | null> {
-  try {
-    const res: any = await client.im.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: { receive_id: chatId, msg_type: 'text', content: JSON.stringify({ text }) },
-    })
-    if (res?.code && res.code !== 0) {
-      log(`feishu: sendText rejected chat=${chatId} code=${res.code} msg=${res.msg}`)
-      return null
+/** Delay schedule for sendText/sendCard SDK retries. Three attempts total
+ * (the leading 0 is the eager first try). Tuned for the bun+axios+lark-SDK
+ * ECONNREFUSED transient we've been seeing — by ~5s the socket pool
+ * usually recovers. Business errors (Feishu code != 0) are NOT retried;
+ * only thrown network errors are. */
+const SEND_RETRY_DELAYS_MS = [0, 1000, 4000]
+
+async function sendViaSdkWithRetry(
+  what: 'text' | 'card',
+  chatId: string,
+  msgType: 'text' | 'interactive',
+  content: string,
+): Promise<string | null> {
+  // Same uuid across retries → Feishu dedupes on its side so a successful-
+  // but-response-lost first attempt doesn't produce a duplicate message.
+  const uuid = randomUUID()
+  let lastErr: unknown = null
+  for (let i = 0; i < SEND_RETRY_DELAYS_MS.length; i++) {
+    if (SEND_RETRY_DELAYS_MS[i] > 0) {
+      await new Promise(r => setTimeout(r, SEND_RETRY_DELAYS_MS[i]))
     }
-    return res?.data?.message_id ?? null
-  } catch (e) { log(`feishu: sendText failed chat=${chatId}: ${e}`); return null }
+    try {
+      const res: any = await client.im.message.create({
+        params: { receive_id_type: 'chat_id' },
+        data: { receive_id: chatId, msg_type: msgType, content, uuid },
+      })
+      if (res?.code && res.code !== 0) {
+        log(`feishu: send${what === 'text' ? 'Text' : 'Card'} rejected chat=${chatId} code=${res.code} msg=${res.msg}`)
+        return null
+      }
+      return res?.data?.message_id ?? null
+    } catch (e) {
+      lastErr = e
+      log(`feishu: send${what === 'text' ? 'Text' : 'Card'} attempt ${i + 1}/${SEND_RETRY_DELAYS_MS.length} chat=${chatId} failed: ${e}`)
+    }
+  }
+  log(`feishu: send${what === 'text' ? 'Text' : 'Card'} chat=${chatId} EXHAUSTED ${SEND_RETRY_DELAYS_MS.length} retries: ${lastErr}`)
+  return null
+}
+
+export async function sendText(chatId: string, text: string): Promise<string | null> {
+  return sendViaSdkWithRetry('text', chatId, 'text', JSON.stringify({ text }))
 }
 
 export async function sendCard(chatId: string, card: object): Promise<string | null> {
+  return sendViaSdkWithRetry('card', chatId, 'interactive', JSON.stringify(card))
+}
+
+/** Last-resort text send that bypasses the lark SDK and uses raw fetch
+ * (which is what cardkit.ts uses and has never had stability issues on
+ * this runtime). Used by callers that need to *surface a failure when
+ * the SDK send path itself is the broken thing* — e.g. `openTurnCard`'s
+ * `sendCard` exhausted retries on ECONNREFUSED and we still owe the
+ * user a visible "your message was lost, please retry" notice. Do not
+ * use this as a general-purpose send; it's the failure-surfacing
+ * channel, not a silent fallback. */
+export async function sendTextRaw(chatId: string, text: string): Promise<string | null> {
   try {
-    const res: any = await client.im.message.create({
-      params: { receive_id_type: 'chat_id' },
-      data: { receive_id: chatId, msg_type: 'interactive', content: JSON.stringify(card) },
+    const token = await getTenantToken()
+    const res = await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        receive_id: chatId,
+        msg_type: 'text',
+        content: JSON.stringify({ text }),
+      }),
     })
-    if (res?.code && res.code !== 0) {
-      log(`feishu: sendCard rejected chat=${chatId} code=${res.code} msg=${res.msg}`)
+    const json = await res.json() as any
+    if (json?.code !== 0) {
+      log(`feishu: sendTextRaw rejected chat=${chatId} code=${json?.code} msg=${json?.msg}`)
       return null
     }
-    return res?.data?.message_id ?? null
-  } catch (e) { log(`feishu: sendCard failed chat=${chatId}: ${e}`); return null }
+    return json.data?.message_id ?? null
+  } catch (e) {
+    log(`feishu: sendTextRaw chat=${chatId} failed: ${e}`)
+    return null
+  }
 }
 
 // ── Reactions ──────────────────────────────────────────────────────────

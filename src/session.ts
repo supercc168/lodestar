@@ -890,7 +890,26 @@ export class Session {
       kind: trigger,
     })
     const messageId = await feishu.sendCard(this.chatId, card)
-    if (!messageId) { log(`session "${this.sessionName}": openTurnCard sendCard failed`); return }
+    if (!messageId) {
+      log(`session "${this.sessionName}": openTurnCard sendCard EXHAUSTED retries — surfacing via raw text`)
+      // sendCard already retried 3× through the SDK. If it still came back
+      // null we're either on a sustained SDK-axios outage or a Feishu
+      // business reject. Either way the user just sent us a message and
+      // it's gone into a black hole — surface that explicitly so they
+      // know to resend instead of waiting for a reply that won't come.
+      // Use raw fetch (not sendText) because if the SDK is the broken
+      // thing we'd be doomed to silence otherwise.
+      await feishu.sendTextRaw(
+        this.chatId,
+        '❌ 创建对话卡片失败 (Feishu SDK 重试 3 次后仍连不上)。你这条消息没能送到 Claude,请稍后重发。',
+      )
+      // Halt Claude — we already wrote the user text to its stdin in
+      // onUserMessage, but with no card to stream into the response would
+      // be lost. Interrupt now so the model doesn't burn tokens producing
+      // an answer that has nowhere to land.
+      this.proc?.sendInterrupt()
+      return
+    }
     let cardId: string
     try { cardId = await cardkit.convertMessageToCard(messageId) }
     catch (e) { log(`session "${this.sessionName}": id_convert failed: ${e}`); return }
