@@ -73,9 +73,62 @@ async function call(method: string, path: string, body?: object): Promise<any> {
   })
   const json = await res.json() as any
   if (json?.code && json.code !== 0) {
-    throw new Error(`cardkit ${method} ${path}: code=${json.code} msg=${json.msg}`)
+    const e = new Error(`cardkit ${method} ${path}: code=${json.code} msg=${json.msg}`) as Error & { code: number }
+    e.code = json.code
+    throw e
   }
   return json?.data
+}
+
+function isStreamingClosed(e: unknown): boolean {
+  return typeof e === 'object' && e !== null && (e as any).code === 300309
+}
+
+/** Reopen streaming_mode on a card that Feishu auto-closed after its
+ * 10-minute streaming TTL (no keepalive, no idle reset — the timer
+ * starts when streaming is opened and fires regardless of activity).
+ * Called from inside the per-card queue's catch path, so it allocates
+ * its own sequence and runs inline without re-enqueueing. */
+async function reopenStreaming(cardId: string): Promise<void> {
+  const seq = nextSeq(cardId)
+  await call('PATCH', `/cards/${cardId}/settings`, {
+    settings: JSON.stringify({ config: { streaming_mode: true } }),
+    sequence: seq,
+  })
+}
+
+/** Run `op` inside the per-card queue. If it fails with code=300309
+ * (Feishu auto-closed streaming after the 10-minute TTL), reopen
+ * streaming inline and retry `op` exactly once. Anything else — non-
+ * 300309 failure, reopen failure, retry failure — is logged and
+ * swallowed, matching the fire-and-forget contract every cardkit op
+ * already has at the call sites. */
+async function withReopenOnStreamingClosed(
+  cardId: string,
+  label: string,
+  op: () => Promise<void>,
+): Promise<void> {
+  try {
+    await op()
+    return
+  } catch (e) {
+    if (!isStreamingClosed(e)) {
+      log(`cardkit ${label} ${cardId}: ${e}`)
+      return
+    }
+    log(`cardkit ${label} ${cardId}: streaming closed (300309) — reopening`)
+  }
+  try {
+    await reopenStreaming(cardId)
+  } catch (re) {
+    log(`cardkit STREAMING_REOPEN_FAILED ${cardId}: ${re}`)
+    return
+  }
+  try {
+    await op()
+  } catch (e2) {
+    log(`cardkit ${label} ${cardId} retry-after-reopen: ${e2}`)
+  }
 }
 
 /** Convert a sent interactive message into a card entity. */
@@ -101,17 +154,17 @@ export async function createCardEntity(card: object): Promise<string> {
 export function streamText(cardId: string, elementId: string, content: string): Promise<void> {
   if (!content || !content.trim()) return Promise.resolve()
   const s = state(cardId)
-  const seq = nextSeq(cardId)
-  s.queue = s.queue.then(async () => {
-    try {
+  s.queue = s.queue.then(() => withReopenOnStreamingClosed(
+    cardId,
+    `streamText ${elementId}`,
+    async () => {
+      const seq = nextSeq(cardId)
       await call('PUT', `/cards/${cardId}/elements/${elementId}/content`, {
         content, sequence: seq,
       })
       s.lastSent.set(elementId, content)
-    } catch (e) {
-      log(`cardkit streamText ${cardId}/${elementId}: ${e}`)
-    }
-  })
+    },
+  ))
   return s.queue
 }
 
@@ -155,46 +208,52 @@ export function addElement(
   opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
 ): Promise<void> {
   const s = state(cardId)
-  const seq = nextSeq(cardId)
-  s.queue = s.queue.then(async () => {
-    try {
+  s.queue = s.queue.then(() => withReopenOnStreamingClosed(
+    cardId,
+    `addElement`,
+    async () => {
+      const seq = nextSeq(cardId)
       await call('POST', `/cards/${cardId}/elements`, {
         type: opts.type ?? 'append',
         ...(opts.targetElementId ? { target_element_id: opts.targetElementId } : {}),
         elements: JSON.stringify([element]),
         sequence: seq,
       })
-    } catch (e) { log(`cardkit addElement ${cardId}: ${e}`) }
-  })
+    },
+  ))
   return s.queue
 }
 
 /** Replace an entire element (used to swap a tool placeholder with its result). */
 export function replaceElement(cardId: string, elementId: string, element: object): Promise<void> {
   const s = state(cardId)
-  const seq = nextSeq(cardId)
-  s.queue = s.queue.then(async () => {
-    try {
+  s.queue = s.queue.then(() => withReopenOnStreamingClosed(
+    cardId,
+    `replaceElement ${elementId}`,
+    async () => {
+      const seq = nextSeq(cardId)
       await call('PUT', `/cards/${cardId}/elements/${elementId}`, {
         element: JSON.stringify(element),
         sequence: seq,
       })
-    } catch (e) { log(`cardkit replaceElement ${cardId}/${elementId}: ${e}`) }
-  })
+    },
+  ))
   return s.queue
 }
 
 /** Delete an element by id. */
 export function deleteElement(cardId: string, elementId: string): Promise<void> {
   const s = state(cardId)
-  const seq = nextSeq(cardId)
-  s.queue = s.queue.then(async () => {
-    try {
+  s.queue = s.queue.then(() => withReopenOnStreamingClosed(
+    cardId,
+    `deleteElement ${elementId}`,
+    async () => {
+      const seq = nextSeq(cardId)
       await call('DELETE', `/cards/${cardId}/elements/${elementId}`, {
         sequence: seq,
       })
-    } catch (e) { log(`cardkit deleteElement ${cardId}/${elementId}: ${e}`) }
-  })
+    },
+  ))
   return s.queue
 }
 
