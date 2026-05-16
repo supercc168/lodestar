@@ -16,18 +16,24 @@ AI 不是帮手,是倍率。它放大的不是体力,是你——你的直觉、
 
 ## 你会得到什么
 
-- 🌊 **真·流式卡片** — 飞书 Card Kit v1 streaming,Claude 一个 token 一个 token 地打在同一张卡片里,不是发一堆零碎消息刷屏。每张 turn 卡片 footer 自带 `✅ ⏱ 12.3s · 📊 47% · 💰 $0.45`,本轮上下文占用 / 实付成本一眼可见。
-- 🧠 **思考过程透明** — `thinking` 流式渲染,turn 结束后自动收起为可展开面板。每次工具调用也是一格折叠面板:折起是概述,展开看完整 input/output。
-- 🔐 **权限审批就地完成** — 需要授权的工具调用,**原地**升级为 🔐 等审批状态,三颗按钮 `允许 / 始终允许 / 拒绝` 直接嵌在面板里。不弹独立卡片,不破坏时序。点完按钮,后续 output 接在同一条线上继续往下走。
-- ❓ **结构化追问** — Claude 的 `AskUserQuestion` 在群里呈现为可点击选项行;不满意?直接在群里**打字回答**,daemon 会把自由文本当作 custom answer 发回去。多题串行,有进度计数和"已答 N 题"折叠历史。
-- ⌨️ **Type-ahead 不打断** — Claude 跑着你继续连珠炮,daemon 全部接住排队,排队消息打 `⏳` 反应,消化后清空(`stop` 取消则换 `❌`)。daemon 还会给每条合并消息前面注 `[#N]\n` 序号,模型一眼分得清"这是 5 条独立消息"而不是一个长字符串。turn 中途有新消息进来 + 下一个 tool_use 边界 → 旧卡 `📨 转交新卡` 收尾(既不是 done 也不是打断),新卡续写,边界跟语义对齐。
-- ⏰ **定时唤醒可见化** — Claude 用 `CronCreate` / `ScheduleWakeup` 自己安排周期任务,到点子进程在 idle 间隙 fire,daemon 检测"非首次 init"自动开一张 `⏰ 定时唤醒` 卡片承接;这种自发 turn 不响加急(凌晨 3 点自检不该震你)。
-- 📦 **状态面板一键唤出** — 发 `hi` 弹一张控制台:model、上下文占用 %、累计 tokens/cost、上一轮 delta、session id、订阅额度(5h / 7d 真实 utilization,直读 Anthropic 官方 OAuth Usage API,凭据走 `~/.claude/.credentials.json`,token 过期自动 refresh)、本机所有活跃项目并列展示。
-- 📎 **图片 / 文件双向互传** — 用户在群里发图/文件,Claude 通过消息里的 `[file: /abs/path]` 提示就能读;Claude 在回复里写 `[[send: /abs/path]]`,标记被剥离,文件以独立消息发回群里。出站路径走 realpath + 白名单校验,只允许工作目录、`/tmp/lodestar-*`、inbox 三块,`/etc`、`~/.ssh`、`~/.config` 即使被符号链接绕也拒绝。
-- 📲 **加急锁屏推送** — 需要你回答问题、需要你批准操作、一轮跑完了——三种关键时刻自动触发飞书"应用内加急",直接打穿勿扰、亮屏推送。卡片摘要会同步改写成具体待办("🔐 等审批: Bash · rm -rf …"、"❓ 待回答 3 题: …"),锁屏一瞥就知道发生了什么。
-- 🗂 **多项目并发** — 一个 daemon 同时持有 N 个飞书群 ↔ N 个 Claude session。状态面板能跨群看到所有活跃项目和它们的 uptime,在群 A 里就能查群 B 在干嘛。
-- 🔄 **不丢上下文** — 每次 `system/init` 落盘 SDK session_id;daemon 被 systemd 重启、机器断电、手抖 kill 进程,下次 `restart` 或自动复活都 `--resume` 到同一段对话,Claude 不知道你离开过。
-- 🛡 **后台守护级稳定性** — 单 PID 锁、WS pong watchdog(180s 无心跳自杀,交给 systemd 拉起)、5s 重投 stale 消息丢弃、200 条 message_id 去重、SIGTERM 优雅写盘、`alive marker` 区分"我自己挂的"和"被用户主动 kill 的"——后者不会被复活。
+- 🌊 **真·流式卡片**:token 级渲染同一张卡,不刷屏
+- 🧠 **思考透明**:thinking 流式 + turn 后自动收起
+- 🔧 **工具调用折叠**:每次工具一格面板,折起概述/展开细节
+- 🔐 **审批就地完成**:工具卡上三按钮,不破坏时序
+- ❓ **结构化追问**:Ask 选项行 + 自由文本回答 + 多题翻页
+- ⌨️ **Type-ahead 不打断**:连珠炮全收,排队下一轮合并处理
+- 🔢 **合并消息加序号**:`[#N]\n` 前缀让模型看清独立边界
+- ⏳ **排队反应可见**:消息进队列加 ⏳,消化/取消自动清/换 ❌
+- 📨 **mid-turn 切新卡**:中途新消息 → 下一 tool 边界切新卡续写
+- ⏰ **定时唤醒可见化**:Cron / ScheduleWakeup 到点自开新卡
+- 📊 **footer 实时指标**:`✅ ⏱时长 · 📊上下文% · 💰本轮成本`
+- 📦 **`hi` 弹控制台**:跨群项目、上下文%、订阅额度一屏看完
+- 📎 **图文双向互传**:`[file:]` 进、`[[send:]]` 出,路径白名单
+- 📲 **关键时刻加急**:Ask / 审批 / done 锁屏推送,定时不打扰
+- 🛑 **`stop` 软打断**:取消当前 turn + 清队列,子进程保活
+- 🗂 **多项目并发**:一个 daemon 持 N 群 ↔ N session
+- 🔄 **自动 resume**:重启自动续接,session_id 落盘不丢
+- 🛡 **systemd 守护级**:WS watchdog + 单 PID + alive marker
 
 ## 怎么用
 
@@ -55,15 +61,26 @@ AI 不是帮手,是倍率。它放大的不是体力,是你——你的直觉、
 
 ### 1. 准备
 
-- 一台能常跑后台进程的机器(自家服务器、闲置 NAS、树莓派均可)
-- [Bun](https://bun.sh) 运行时(≥ 1.0)
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) 装好且能跑(怎么认证、走官方账号还是第三方网关,你自己看着办)
-- 一个飞书自建应用 (`cli_xxx`),开通:
-  - `im:message:send_as_bot` / `im:message` / `im:chat:readonly` / `im:resource`
-  - `im:message.urgent`(加急推送)
-  - `cardkit:card:read` `cardkit:card:write`
-    `cardkit:card.element:read` `cardkit:card.element:write`
-    `cardkit:card.settings:read` `cardkit:card.settings:write`
+**机器**:能常跑后台进程的 Linux/macOS(自家服务器、闲置 NAS、树莓派均可)。
+
+**运行时**:[Bun](https://bun.sh) ≥ 1.0。
+
+**Claude Code**:装好且能跑 —— 详见[官方文档](https://docs.anthropic.com/en/docs/claude-code)。**强烈建议用 claude.ai 账号 OAuth 登录**(`claude auth login`),而不是 `ANTHROPIC_API_KEY`:Cron / ScheduleWakeup / `/schedule` 等定时唤醒工具只在 OAuth 模式下注册。
+
+**飞书自建应用**:去[飞书开放平台](https://open.feishu.cn/app)→ 创建企业自建应用,然后:
+
+1. **添加机器人能力**:左侧"添加应用能力"→"机器人"启用。
+2. **配置权限**(权限管理 → API 权限):
+   - 消息:`im:message:send_as_bot` `im:message` `im:chat:readonly` `im:resource`
+   - 加急:`im:message.urgent`(锁屏推送)
+   - 卡片:`cardkit:card:read` `cardkit:card:write` `cardkit:card.element:read` `cardkit:card.element:write` `cardkit:card.settings:read` `cardkit:card.settings:write`
+3. **订阅事件**(事件与回调 → 事件订阅):
+   - 订阅方式选 **长连接**(WebSocket,不需要公网回调地址)
+   - 添加事件 `im.message.receive_v1`(接收群消息)
+   - 添加事件 `card.action.trigger`(卡片按钮回调)
+4. **发布版本**(版本管理与发布)→ 创建版本 → 审批通过 / 自审通过 → 上线。**没发版的应用不会收到事件**,这一步常被忘记。
+5. **拿凭据**:凭据与基础信息页拷 `App ID`(`cli_xxxxxxxxxx`)和 `App Secret`,下一步写到 `config.toml`。
+6. **拉机器人进群**:想用的飞书群 → 群设置 → 群机器人 → 添加机器人 → 选你的应用。**群名要等于 `~/` 下的项目目录名**,daemon 用这个绑定群 ↔ Claude session。
 
 ### 2. 配置
 
