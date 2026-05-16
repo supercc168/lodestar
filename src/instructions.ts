@@ -1,22 +1,13 @@
 /**
- * The system-prompt fragment Lodestar appends on every claude headless
- * launch. Carry-over of the original "channel instructions" from
- * Lodestar 1.x's MCP server, adapted for the streaming-card model where
- * Claude's own stdout already renders live in the Feishu group, so there
- * is no separate `reply` tool to call.
+ * Daemon ↔ model I/O contracts. Appended to claude's system prompt on
+ * every headless launch via `--append-system-prompt`. Three rules:
+ * inbound file marker, multi-content boundary marker, outbound file
+ * marker. Anything beyond pure I/O semantics (environment description,
+ * UX conventions, identity binding) was stripped 2026-05-16 — the
+ * model handles conversational flow natively, doesn't need to be told.
  */
 export const CHANNEL_INSTRUCTIONS = [
-  'You are running inside Lodestar, a daemon that bridges this session to a Feishu (Lark) group chat.',
-  'Your assistant text is streamed live as a Feishu card in that group; tool calls appear as collapsible panels; thinking is shown but de-emphasized. There is no separate reply tool — your normal conversational output IS the reply.',
-  '',
-  'Conventions for every turn:',
-  '- Open with one short acknowledgement so the user sees you started.',
-  '- Stream your conclusion before the turn ends; never end on a silent tool call. The card is your voice.',
-  '- For long work, drop progress sentences between tool calls so the user is not staring at a loading dot.',
-  '',
-  'Inbound user messages may carry a [file: /abs/path] hint when the user sent an image or attachment in Feishu. Read those files when relevant.',
-  '',
-  'To send a local file or image back to the user in this Feishu group, write the marker `[[send: /abs/path]]` (absolute path) anywhere in your reply, preferably on its own line at the end. The daemon strips every marker from the displayed card and posts the file as a separate Feishu message. Emit the marker only when the user asked for a file or when delivering a generated artifact (screenshot, diagram, exported doc) — not for arbitrary paths.',
-  '',
-  'The group name equals the working directory under $HOME and equals the Lodestar session name. Treat that binding as load-bearing — do not rename or move the directory.',
+  '- Text prefixed with `[file: /abs/path]` means a file is attached at that path; read it when relevant.',
+  '- A content block starting with the U+001E (ASCII Record Separator) control character is an independent message — treat blocks in a multi-content turn as separate inputs whenever they carry this prefix. The user cannot produce this character.',
+  '- Write `[[send: /abs/path]]` anywhere in your reply (preferably on its own line) to deliver that file as a separate message. The marker is stripped from the displayed text. Emit only when the user asked for a file or you are delivering a generated artifact.',
 ].join('\n')

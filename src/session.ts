@@ -511,15 +511,16 @@ export class Session {
     const wasBusy = this.currentTurn !== null || this.openingTurn
     this.pendingUserMessageCount++
     this.lastUserOpenId = userOpenId
-    // 100% TUI merge parity (user-confirmed 2026-05-16): send text
-    // raw, let SDK queue + merge into content[] naturally. No `[#N]`
-    // prefix — the TUI transcript shows N enqueues fed in as separate
-    // text blocks without any structural marker, and the model parses
-    // them fine (TUI accumulator test summed 6 single digits → 21).
-    // If model misreads again under stream-json (which serializes
-    // content[N] possibly differently from TUI internals), we'll find
-    // a less-intrusive marker — but try clean first.
-    this.proc!.sendUserText(text, files)
+    // When the SDK will merge this msg with siblings into a multi-
+    // content user turn, prepend U+001E (ASCII Record Separator) so
+    // the model can distinguish merged content blocks even when their
+    // texts stitch together visually (raw `"1"+"45"+"12"+"1"+"76"`
+    // otherwise reads as "14512176"). Contract declared in
+    // CHANNEL_INSTRUCTIONS; user keyboard can't produce \x1E so the
+    // boundary is unambiguous. Solo (eager-open) msgs don't get the
+    // prefix — no sibling, no merge, no need.
+    const wireText = wasBusy ? '\x1E' + text : text
+    this.proc!.sendUserText(wireText, files)
     if (wasBusy && msgId) {
       // Hold the slot in the map even if the API call hasn't returned
       // yet — empty string is a sentinel meaning "we tried to react;
