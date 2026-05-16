@@ -137,25 +137,6 @@ export class Session {
    * to clear (via deleteReaction). Empty for eager-opened solo turns
    * and for scheduled wakeups (no user messages went into those). */
   private currentBatchReactionIds = new Map<string, string>()
-  /** Set the moment a mid-turn user message lands. Tells the next
-   * content-adding event (assistant text delta or fresh tool_use) to
-   * rotate the card before applying its update — closes the in-flight
-   * card with a `📨 转交新卡` footer and opens a fresh card, so the
-   * continuation has a visible boundary instead of piling up under
-   * one card. Reset to false after the rotation fires (or on
-   * stop/restart/exit). User feedback (2026-05-15): the prior
-   * everything-in-one-card behavior made the order feel jumbled. */
-  private wantsRotation = false
-  /** Holds assistant / thinking / tool_use events that arrive while a
-   * card rotation is mid-flight (close-old → open-new straddles a
-   * Feishu API await window during which `currentTurn` is transiently
-   * null). Replayed onto the new card the moment rotation completes
-   * so no streamed token is lost across the boundary. */
-  private rotationBuffer: Array<
-    | { kind: 'assistant'; delta: string }
-    | { kind: 'thinking'; delta: string }
-    | { kind: 'tool_use'; id: string; name: string; input: any }
-  > = []
   /** Count of `system/init` events seen this subprocess. The first one is
    * the boot init (claimed by whichever user message lands first); all
    * subsequent ones mark the start of an SDK-initiated turn (queued
@@ -311,8 +292,6 @@ export class Session {
     this.lastUserOpenId = ''
     this.pendingReactionIds = new Map()
     this.currentBatchReactionIds = new Map()
-    this.wantsRotation = false
-    this.rotationBuffer = []
     this.initCount = 0
     this.openingTurn = false
     this.pendingPermissions.clear()
@@ -333,8 +312,6 @@ export class Session {
     this.lastUserOpenId = ''
     this.pendingReactionIds = new Map()
     this.currentBatchReactionIds = new Map()
-    this.wantsRotation = false
-    this.rotationBuffer = []
     this.initCount = 0
     this.openingTurn = false
     this.pendingPermissions.clear()
@@ -416,7 +393,6 @@ export class Session {
         this.lastUserOpenId = ''
         this.pendingReactionIds = new Map()
         this.currentBatchReactionIds = new Map()
-        this.wantsRotation = false
         this.interrupt()
         return true
       case 'kill':
@@ -453,6 +429,7 @@ export class Session {
       // ~5s; not worth blocking the panel on it).
       usage: undefined,
       contextTokens: this.currentContextTokens(),
+      contextLimit: this.contextWindowMax(),
       cumStats: this.cumStats,
       lastTurn: this.lastTurnDelta
         ? {
@@ -536,9 +513,6 @@ export class Session {
           this.pendingReactionIds.set(msgId, rid)
         }
       })()
-      // Rotation hint: a mid-turn user msg means the next assistant /
-      // tool event should split the visual into a new card.
-      this.wantsRotation = true
     }
     if (!this.currentTurn && !this.openingTurn && this.initCount >= 1) {
       // Eager open: this message is going to be processed solo (no current
@@ -853,7 +827,6 @@ export class Session {
       this.lastUserOpenId = ''
       this.pendingReactionIds = new Map()
       this.currentBatchReactionIds = new Map()
-      this.wantsRotation = false
       this.initCount = 0
       this.openingTurn = false
       this.status = 'stopped'
@@ -884,14 +857,17 @@ export class Session {
 
   /** Current context-window occupancy estimate — uses the most recent
    * assistant `usage` (input + caches), since each assistant reply replays
-   * the full conversation. Falls back to the last-turn delta when no
-   * assistant message has streamed yet this process. */
+   * the full conversation. Returns 0 when no per-call usage is available
+   * (process dead, or fresh spawn before first assistant message);
+   * `lastTurnDelta.inputTokens` is the CUMULATIVE turn input across all
+   * API calls in the turn (sum of cache_read across N steps) — using it
+   * here would inflate the percentage by Nx after a heavy multi-step
+   * turn (observed bug 2026-05-16: 417% in the `hi` panel after killing
+   * the proc with a long turn's delta still on file). */
   private currentContextTokens(): number {
     const u = this.proc?.lastUsage as ClaudeUsage | null | undefined
-    if (u) {
-      return (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0)
-    }
-    return this.lastTurnDelta?.inputTokens ?? 0
+    if (!u) return 0
+    return (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0)
   }
 
   /** Context-window capacity for the model the subprocess is currently
@@ -940,44 +916,8 @@ export class Session {
   // forget here and rely on enqueue source order — that way no `await`
   // can yield mid-handler and let `closeTurnCard` (or another event) race
   // and mutate `this.currentTurn` underfoot.
-  /** Rotate to a fresh card mid-turn: close the in-flight card with a
-   * `📨 转交新卡` footer (distinct from `✅ done` and `🛑 打断`) and
-   * open a new card so the post-user-message continuation has a
-   * visible boundary. Streams that land during the rotation's await
-   * windows are buffered in `rotationBuffer` and replayed onto the
-   * new card the moment it's ready, so no tokens are lost across the
-   * cut. Caller guarantees `wantsRotation` was true sync-immediately
-   * before. */
-  private async rotateCard(): Promise<void> {
-    this.openingTurn = true
-    try {
-      await this.closeTurnCard('📨 转交新卡')
-      await this.openTurnCard('', this.lastUserOpenId, 'user_message')
-    } finally {
-      this.openingTurn = false
-    }
-    if (this.rotationBuffer.length === 0) return
-    const buf = this.rotationBuffer
-    this.rotationBuffer = []
-    for (const e of buf) {
-      if (e.kind === 'assistant') this.appendAssistant(e.delta)
-      else if (e.kind === 'thinking') this.appendThinking(e.delta)
-      else if (e.kind === 'tool_use') this.addTool(e.id, e.name, e.input)
-    }
-  }
-
   private appendAssistant(delta: string): void {
-    if (!this.currentTurn) {
-      if (this.openingTurn) this.rotationBuffer.push({ kind: 'assistant', delta })
-      return
-    }
-    // Note: assistant text DOES NOT trigger rotation, even if a mid-turn
-    // user message landed and set `wantsRotation`. Rotating mid-segment
-    // would chop the model's in-progress reply (often a response to the
-    // ORIGINAL prompt that started this card) onto a fresh card,
-    // visually associating it with the queued msg — which is the bug
-    // the user surfaced 2026-05-16. The rotation defers to the next
-    // tool_use, which is a clean section boundary.
+    if (!this.currentTurn) return
     if (!this.currentTurn.currentAssistantSegmentId) {
       const i = this.currentTurn.assistantSegmentCount++
       const segId = cards.ELEMENTS.assistant(i)
@@ -1003,12 +943,7 @@ export class Session {
   }
 
   private appendThinking(delta: string): void {
-    if (!this.currentTurn) {
-      if (this.openingTurn) this.rotationBuffer.push({ kind: 'thinking', delta })
-      return
-    }
-    // Thinking, like assistant text, doesn't trigger rotation — it's
-    // preamble to the same response, not a section break.
+    if (!this.currentTurn) return
     this.currentTurn.thinkingText += delta
     cardkit.streamTextThrottled(
       this.currentTurn.cardId,
@@ -1026,16 +961,7 @@ export class Session {
   }
 
   private addTool(toolUseId: string, name: string, input: any): void {
-    if (!this.currentTurn) {
-      if (this.openingTurn) this.rotationBuffer.push({ kind: 'tool_use', id: toolUseId, name, input })
-      return
-    }
-    if (this.wantsRotation) {
-      this.wantsRotation = false
-      this.rotationBuffer.push({ kind: 'tool_use', id: toolUseId, name, input })
-      void this.rotateCard()
-      return
-    }
+    if (!this.currentTurn) return
     // Close current assistant segment (if any) so the tool panel renders
     // AFTER it in card body order. Flush queues the segment's last
     // buffered delta before the tool element is inserted.
@@ -1322,15 +1248,15 @@ export class Session {
     }
     const sendNote = sendPaths.length ? ` · 📎 ${sendPaths.length}` : ''
     // State marker leads the footer (✅ for natural completion, or the
-    // suffix verbatim for non-natural states like `📨 转交新卡`). The
+    // suffix verbatim for non-natural states like `🛑 打断`). The
     // trailing "done" word is gone — the ✅ already carries that
     // meaning. User-confirmed footer order 2026-05-16.
     const stateMark = suffix ? suffix : '✅'
     // Per-turn metrics: context-window occupancy (as a real percentage,
     // not a token count) and dollar cost. Only meaningful on a clean
-    // close — suffix-tagged turns (rotation / interrupt) didn't fire
-    // the `result` event that populates `lastTurnDelta`, so these
-    // numbers would be stale and misleading.
+    // close — suffix-tagged turns (interrupt) didn't fire the `result`
+    // event that populates `lastTurnDelta`, so these numbers would be
+    // stale and misleading.
     let metrics = ''
     if (!suffix) {
       const ctxTokens = this.currentContextTokens()

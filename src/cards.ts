@@ -668,7 +668,7 @@ export function consoleCard(opts: ConsoleOpts): object {
       lines.push(`　· ${dot} \`${p.name}\`${up}${mark}`)
     }
   }
-  if (contextTokens != null) {
+  if (contextTokens != null && contextTokens > 0) {
     const limit = contextLimit ?? 1_000_000
     const pct = limit > 0 ? Math.round((contextTokens / limit) * 100) : 0
     lines.push(`**📦 上下文**　${fmtTokens(contextTokens)} / ${fmtTokens(limit)}　(${pct}%)`)

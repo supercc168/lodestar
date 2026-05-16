@@ -24,7 +24,6 @@ AI 不是帮手,是倍率。它放大的不是体力,是你——你的直觉、
 - ⌨️ **Type-ahead 不打断**:连珠炮全收,排队下一轮合并处理
 - 🔢 **合并消息加序号**:`[#N]\n` 前缀让模型看清独立边界
 - ⏳ **排队反应可见**:消息进队列加 ⏳,消化/取消自动清/换 ❌
-- 📨 **mid-turn 切新卡**:中途新消息 → 下一 tool 边界切新卡续写
 - ⏰ **定时唤醒可见化**:Cron / ScheduleWakeup 到点自开新卡
 - 📊 **footer 实时指标**:`✅ ⏱时长 · 📊上下文% · 💰本轮成本`
 - 📦 **`hi` 弹控制台**:跨群项目、上下文%、订阅额度一屏看完
@@ -65,7 +64,7 @@ AI 不是帮手,是倍率。它放大的不是体力,是你——你的直觉、
 
 **运行时**:[Bun](https://bun.sh) ≥ 1.0。
 
-**Claude Code**:装好且能跑 —— 详见[官方文档](https://docs.anthropic.com/en/docs/claude-code)。**强烈建议用 claude.ai 账号 OAuth 登录**(`claude auth login`),而不是 `ANTHROPIC_API_KEY`:Cron / ScheduleWakeup / `/schedule` 等定时唤醒工具只在 OAuth 模式下注册。
+**Claude Code**:装好且能跑 —— 详见[官方文档](https://docs.anthropic.com/en/docs/claude-code)。
 
 **飞书自建应用**:去[飞书开放平台](https://open.feishu.cn/app)→ 创建企业自建应用,然后:
 
