@@ -74,7 +74,7 @@ export function summarizeToolInput(name: string, input: any): string {
     return truncate(summarizeTaskWorkflow(name, input), 80)
   }
   switch (name) {
-    case 'Bash':       return truncate(String(input.command ?? ''), 80)
+    case 'Bash':       return truncate(String(input.description ?? input.command ?? ''), 80)
     case 'Read':
     case 'Write':
     case 'Edit':
@@ -273,6 +273,30 @@ export function toolCallElement(
     elements: [
       { tag: 'markdown', content: body },
     ],
+  }
+}
+
+/** Merged panel for a run of consecutive `Read` tool calls in one turn.
+ * Header shows the dynamic count (`Read · 3 次`), body lists one row per
+ * Read with its own status + file path. Replaces the individual panels
+ * once a second Read joins the batch — single Reads still render as the
+ * full `toolCallElement` (with file-contents dump on completion). */
+export function readBatchElement(
+  i: number,
+  items: Array<{ input: any; output: string | null; isError: boolean }>,
+): object {
+  const n = items.length
+  const anyError = items.some(it => it.isError)
+  const allDone = items.every(it => it.output !== null)
+  const status = anyError ? '❌' : allDone ? '✅' : '⏳'
+  const headerText = `${status} 🔧 Read · ${n} 次`
+  const lines = items.map(it => `\`${String(it.input.file_path ?? '(无 path)')}\``)
+  return {
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.tool(i),
+    header: { title: { tag: 'plain_text', content: headerText } },
+    expanded: false,
+    elements: [{ tag: 'markdown', content: lines.join('\n') }],
   }
 }
 

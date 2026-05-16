@@ -47,7 +47,23 @@ interface TurnState {
     resolvedNote?: string
     output?: string
     isError?: boolean
+    /** Set when this tool is part of a merged Read batch — points to the
+     * batch's slot in `readBatches[i].items`. completeTool uses it to
+     * update the right row instead of rendering a standalone panel. */
+    readBatchSlot?: number
   }>
+  /** Consecutive `Read` calls collapse into a single panel rendered by
+   * `cards.readBatchElement`. Keyed by element index `i` so completeTool
+   * can find the batch after its open-window closed (a non-Read tool or
+   * new assistant segment has since arrived).
+   *
+   * `openReadBatchI` is the i of the batch currently accepting new Reads;
+   * null once the run ends. Subsequent Read calls open a fresh batch at a
+   * new i. */
+  readBatches: Map<number, {
+    items: Array<{ toolUseId: string; input: any; output: string | null; isError: boolean }>
+  }>
+  openReadBatchI: number | null
   assistantSegmentCount: number
   currentAssistantSegmentId: string | null
   currentAssistantText: string
@@ -409,6 +425,10 @@ export class Session {
         this.pendingReactionIds = new Map()
         this.currentBatchReactionIds = new Map()
         this.interrupt()
+        // SDK 收到 interrupt 后不发 `result`,没人会触发 closeTurnCard。
+        // 这里主动封口,把 footer 改成 🛑 打断、折叠 thinking、把
+        // streaming_mode 翻回 false,否则卡片会僵在 `⏳ working…`。
+        await this.closeTurnCard('🛑 打断')
         return true
       case 'kill':
         await this.stop()
@@ -1029,6 +1049,8 @@ export class Session {
       thinkingText: '',
       toolCount: 0,
       toolByUseId: new Map(),
+      readBatches: new Map(),
+      openReadBatchI: null,
       assistantSegmentCount: 0,
       currentAssistantSegmentId: null,
       currentAssistantText: '',
@@ -1045,6 +1067,10 @@ export class Session {
   private appendAssistant(delta: string): void {
     if (!this.currentTurn) return
     if (!this.currentTurn.currentAssistantSegmentId) {
+      // New assistant segment opens a visual break — any prior Read run
+      // is now visually separated from future Reads, so close the batch
+      // window. Future Reads will start a fresh batch at a new i.
+      this.currentTurn.openReadBatchI = null
       const i = this.currentTurn.assistantSegmentCount++
       const segId = cards.ELEMENTS.assistant(i)
       this.currentTurn.currentAssistantSegmentId = segId
@@ -1096,7 +1122,37 @@ export class Session {
       this.currentTurn.currentAssistantSegmentId = null
       this.currentTurn.currentAssistantText = ''
     }
+    // Consecutive Read merger: if a Read run is already open, append to
+    // its batch and re-render the panel instead of inserting a new one.
+    // Any other tool name closes the run (handled below).
+    if (name === 'Read' && this.currentTurn.openReadBatchI !== null) {
+      const batchI = this.currentTurn.openReadBatchI
+      const batch = this.currentTurn.readBatches.get(batchI)!
+      const slot = batch.items.length
+      batch.items.push({ toolUseId, input, output: null, isError: false })
+      this.currentTurn.toolByUseId.set(toolUseId, { i: batchI, name, input, readBatchSlot: slot })
+      const el = cards.readBatchElement(batchI, batch.items)
+      void cardkit.replaceElement(this.currentTurn.cardId, cards.ELEMENTS.tool(batchI), el)
+      return
+    }
+    if (name !== 'Read') this.currentTurn.openReadBatchI = null
     const i = this.currentTurn.toolCount++
+    if (name === 'Read') {
+      // First Read of a potential run — render the existing single-tool
+      // panel (which keeps the full file-contents dump on completion). If
+      // a second Read arrives, completeTool/addTool will switch it to
+      // `readBatchElement`.
+      this.currentTurn.openReadBatchI = i
+      this.currentTurn.readBatches.set(i, {
+        items: [{ toolUseId, input, output: null, isError: false }],
+      })
+      this.currentTurn.toolByUseId.set(toolUseId, { i, name, input, readBatchSlot: 0 })
+      const el = cards.toolCallElement(i, name, input, null, '⏳', undefined, undefined)
+      void cardkit.addElement(this.currentTurn.cardId, el, {
+        type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
+      })
+      return
+    }
     this.currentTurn.toolByUseId.set(toolUseId, { i, name, input })
     // AskUserQuestion is a client-side tool — daemon renders the choice
     // UI in-line and supplies the tool_result itself once the user
@@ -1173,6 +1229,22 @@ export class Session {
     // via toolCallElement would clobber the nice option-row layout
     // with a generic JSON dump. Bail out; the panel is done.
     if (meta.name === 'AskUserQuestion') return
+    // Read batch path: update this row's status in the shared batch then
+    // re-render. Single-item batches keep the original full-output panel
+    // (file-contents dump); 2+ items switch to the compact `Read · N 次`
+    // listing, which overwrites whatever was last drawn at this i.
+    if (meta.name === 'Read' && meta.readBatchSlot != null) {
+      const batch = this.currentTurn.readBatches.get(meta.i)
+      if (batch) {
+        const row = batch.items[meta.readBatchSlot]
+        if (row) { row.output = output; row.isError = isError }
+        const el = batch.items.length >= 2
+          ? cards.readBatchElement(meta.i, batch.items)
+          : cards.toolCallElement(meta.i, meta.name, meta.input, output, isError ? '❌' : '✅', meta.resolvedNote, undefined)
+        void cardkit.replaceElement(this.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
+      }
+      return
+    }
     // Update the local todo mirror BEFORE rendering so the just-
     // completed panel shows the new state too (e.g. a TaskCreate panel
     // already lists the task it just created).
