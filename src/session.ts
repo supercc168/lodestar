@@ -883,6 +883,16 @@ export class Session {
     return this.lastTurnDelta?.inputTokens ?? 0
   }
 
+  /** Context-window capacity for the model the subprocess is currently
+   * running. Read off the model id Anthropic embeds in each assistant
+   * message — the `[1m]` suffix marks the extended-context variant.
+   * Defaults to 200K for stock Opus / Sonnet / Haiku. */
+  private contextWindowMax(): number {
+    const m = this.proc?.lastModel ?? ''
+    if (m.includes('[1m]')) return 1_000_000
+    return 200_000
+  }
+
   private async openTurnCard(userText: string, userOpenId: string, trigger: 'user_message' | 'scheduled'): Promise<void> {
     const turn = ++this.turnCounter
     const card = cards.mainConversationCard({
@@ -1307,7 +1317,23 @@ export class Session {
     // state distinct from natural completion (e.g. `📨 转交新卡` for a
     // mid-turn rotation). When absent, the turn ended cleanly.
     const stateMark = suffix ? ` · ${suffix}` : ' · ✅ done'
-    const footer = `⏱ ${elapsed}s${sendNote}${stateMark}`
+    // Per-turn metrics: context-window occupancy and dollar cost. Only
+    // meaningful on a clean close — a suffix-tagged turn (rotation /
+    // interrupt) didn't fire the `result` event that populates
+    // `lastTurnDelta`, so these numbers would be stale and misleading.
+    let metrics = ''
+    if (!suffix) {
+      const ctxTokens = this.currentContextTokens()
+      const ctxMax = this.contextWindowMax()
+      if (ctxTokens > 0) {
+        const ctxK = Math.round(ctxTokens / 1000)
+        const maxFmt = ctxMax >= 1_000_000 ? `${ctxMax / 1_000_000}M` : `${ctxMax / 1000}K`
+        metrics += ` · 📊 ${ctxK}K/${maxFmt}`
+      }
+      const cost = this.lastTurnDelta?.costUsd ?? 0
+      if (cost > 0) metrics += ` · 💰 $${cost.toFixed(3)}`
+    }
+    const footer = `⏱ ${elapsed}s${metrics}${sendNote}${stateMark}`
     await cardkit.streamText(cardId, cards.ELEMENTS.footer, footer)
     // Final chat-list preview: clean finish shows "⏱ Xs · NK tokens";
     // interrupted shows the suffix instead (no usage event landed).
