@@ -1,0 +1,91 @@
+/**
+ * Shared types split out of session.ts so the main file stays under
+ * Claude Code's per-read token budget (~25K). Pure type-only — no
+ * runtime imports here. Companion modules: session-tools.ts,
+ * session-ask.ts, session-permission.ts.
+ */
+
+export interface TurnState {
+  cardId: string
+  /** Feishu message_id of the card — needed for urgent_app push on clean
+   * turn close. Kept separate from cardId because cardkit's stream APIs
+   * operate on card_id but the urgent_app endpoint takes message_id. */
+  messageId: string
+  /** open_id of the user who started this turn. Used to scope the
+   * urgent_app push so only the initiator gets pinged (in case there
+   * are other members in the group). Empty string → skip the ping. */
+  userOpenId: string
+  /** What kicked off this turn. Only `'user_message'` turns fire the
+   * end-of-turn urgent_app push — scheduled / cron / loop wakeups
+   * finish on their own time and pinging the user would be noise,
+   * not signal. Ask / permission urgents inside the turn still fire
+   * regardless (those genuinely need attention even mid-schedule). */
+  trigger: 'user_message' | 'scheduled'
+  thinkingText: string
+  toolCount: number
+  /** `output` / `isError` are filled in by completeTool — kept on the
+   * meta (instead of being thrown away after the first render) so a
+   * later Task* op can re-render every prior Task* panel with the
+   * latest todo mirror appended. */
+  toolByUseId: Map<string, {
+    i: number
+    name: string
+    input: any
+    resolvedNote?: string
+    output?: string
+    isError?: boolean
+    /** Set when this tool is part of a merged Read batch — points to the
+     * batch's slot in `readBatches[i].items`. completeTool uses it to
+     * update the right row instead of rendering a standalone panel. */
+    readBatchSlot?: number
+  }>
+  /** Consecutive `Read` calls collapse into a single panel rendered by
+   * `cards.readBatchElement`. Keyed by element index `i` so completeTool
+   * can find the batch after its open-window closed (a non-Read tool or
+   * new assistant segment has since arrived).
+   *
+   * `openReadBatchI` is the i of the batch currently accepting new Reads;
+   * null once the run ends. Subsequent Read calls open a fresh batch at a
+   * new i. */
+  readBatches: Map<number, {
+    items: Array<{ toolUseId: string; input: any; output: string | null; isError: boolean }>
+  }>
+  openReadBatchI: number | null
+  assistantSegmentCount: number
+  currentAssistantSegmentId: string | null
+  currentAssistantText: string
+  // Per-assistant-segment cumulative text — used at turn close to strip
+  // [[send: /path]] markers and replace each segment with a cleaned
+  // version, then post the files as separate Feishu messages.
+  segmentTexts: Map<string, string>
+  startedAt: number
+}
+
+export type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
+
+export interface SessionOpts {
+  permissionMode?: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'
+}
+
+/** Per-turn delta extracted from the SDK `result` message — feeds the
+ * "上一轮" line in the console panel. */
+export interface LastTurnDelta {
+  tokens: number      // input + cache_* + output for that turn
+  costUsd: number
+  durationMs: number
+  inputTokens: number // input + cache_* (excludes output) — context-window estimate
+}
+
+/** Cumulative session counters. Reset on full restart (`clear`),
+ * preserved across `restart`/resume and daemon-restart so the `hi`
+ * panel reflects the user's total spend in this conversation
+ * regardless of how many times the underlying ClaudeProcess has been
+ * respawned. Resumed conversations start counting from the resume
+ * point onward — the SDK doesn't replay historical usage on resume,
+ * so a long pre-resume conversation shows up as zero here until the
+ * first new turn lands. */
+export interface CumStats {
+  tokens: number
+  costUsd: number
+  turns: number
+}

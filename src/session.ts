@@ -5,6 +5,13 @@
  * the in-flight permission map.  Wires Claude's stdout events into Card
  * Kit ops, and wires Feishu inbound (text + card-action callbacks) into
  * Claude's stdin.
+ *
+ * Tool tracking, AskUserQuestion flow, and permission rendering live in
+ * sibling modules (session-tools.ts, session-ask.ts,
+ * session-permission.ts) so this file stays under Claude Code's
+ * per-read token budget (~25K). Fields touched by those helpers carry
+ * no `private` modifier — convention is "no modifier = package-internal,
+ * only the session-*.ts helpers should touch it."
  */
 
 import { existsSync } from 'node:fs'
@@ -17,93 +24,14 @@ import * as feishu from './feishu'
 import { log } from './log'
 import { INBOX_DIR } from './paths'
 import { readUsage } from './usage'
+import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
+import * as sessionTools from './session-tools'
+import * as sessionAsk from './session-ask'
+import * as sessionPermission from './session-permission'
 
-interface TurnState {
-  cardId: string
-  /** Feishu message_id of the card — needed for urgent_app push on clean
-   * turn close. Kept separate from cardId because cardkit's stream APIs
-   * operate on card_id but the urgent_app endpoint takes message_id. */
-  messageId: string
-  /** open_id of the user who started this turn. Used to scope the
-   * urgent_app push so only the initiator gets pinged (in case there
-   * are other members in the group). Empty string → skip the ping. */
-  userOpenId: string
-  /** What kicked off this turn. Only `'user_message'` turns fire the
-   * end-of-turn urgent_app push — scheduled / cron / loop wakeups
-   * finish on their own time and pinging the user would be noise,
-   * not signal. Ask / permission urgents inside the turn still fire
-   * regardless (those genuinely need attention even mid-schedule). */
-  trigger: 'user_message' | 'scheduled'
-  thinkingText: string
-  toolCount: number
-  /** `output` / `isError` are filled in by completeTool — kept on the
-   * meta (instead of being thrown away after the first render) so a
-   * later Task* op can re-render every prior Task* panel with the
-   * latest todo mirror appended. */
-  toolByUseId: Map<string, {
-    i: number
-    name: string
-    input: any
-    resolvedNote?: string
-    output?: string
-    isError?: boolean
-    /** Set when this tool is part of a merged Read batch — points to the
-     * batch's slot in `readBatches[i].items`. completeTool uses it to
-     * update the right row instead of rendering a standalone panel. */
-    readBatchSlot?: number
-  }>
-  /** Consecutive `Read` calls collapse into a single panel rendered by
-   * `cards.readBatchElement`. Keyed by element index `i` so completeTool
-   * can find the batch after its open-window closed (a non-Read tool or
-   * new assistant segment has since arrived).
-   *
-   * `openReadBatchI` is the i of the batch currently accepting new Reads;
-   * null once the run ends. Subsequent Read calls open a fresh batch at a
-   * new i. */
-  readBatches: Map<number, {
-    items: Array<{ toolUseId: string; input: any; output: string | null; isError: boolean }>
-  }>
-  openReadBatchI: number | null
-  assistantSegmentCount: number
-  currentAssistantSegmentId: string | null
-  currentAssistantText: string
-  // Per-assistant-segment cumulative text — used at turn close to strip
-  // [[send: /path]] markers and replace each segment with a cleaned
-  // version, then post the files as separate Feishu messages.
-  segmentTexts: Map<string, string>
-  startedAt: number
-}
+export type { SessionOpts } from './session-types'
 
 const SEND_MARKER_RE = /\[\[send:\s*([^\]\n]+?)\s*\]\]/g
-
-type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
-
-export interface SessionOpts {
-  permissionMode?: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'
-}
-
-/** Per-turn delta extracted from the SDK `result` message — feeds the
- * "上一轮" line in the console panel. */
-interface LastTurnDelta {
-  tokens: number      // input + cache_* + output for that turn
-  costUsd: number
-  durationMs: number
-  inputTokens: number // input + cache_* (excludes output) — context-window estimate
-}
-
-/** Cumulative session counters. Reset on full restart (`clear`),
- * preserved across `restart`/resume and daemon-restart so the `hi`
- * panel reflects the user's total spend in this conversation
- * regardless of how many times the underlying ClaudeProcess has been
- * respawned. Resumed conversations start counting from the resume
- * point onward — the SDK doesn't replay historical usage on resume,
- * so a long pre-resume conversation shows up as zero here until the
- * first new turn lands. */
-interface CumStats {
-  tokens: number
-  costUsd: number
-  turns: number
-}
 
 export class Session {
   /** Process-wide registry of every Session ever constructed in this daemon.
@@ -114,8 +42,47 @@ export class Session {
    * want currently-alive Claude processes. */
   static readonly all: Set<Session> = new Set()
 
-  private proc: ClaudeProcess | null = null
-  private currentTurn: TurnState | null = null
+  // ── package-internal state (touched by session-*.ts helpers) ──
+  proc: ClaudeProcess | null = null
+  currentTurn: TurnState | null = null
+  pendingPermissions = new Map<string, { toolUseId: string }>()
+  /** Open AskUserQuestion tool calls — keyed by tool_use_id. The SDK
+   * routes AskUserQuestion through the can_use_tool flow even under
+   * bypass; we have to thread the permission `requestId` through here
+   * so the answer (option click OR custom text submit) can resolve
+   * the permission with `updatedInput.answers` populated.
+   * `deferredAnswer` covers the race where the user clicks/submits
+   * BEFORE can_use_tool arrives (addTool fires on the assistant
+   * message; can_use_tool is a separate control_request that lands
+   * slightly later). */
+  pendingAsks = new Map<string, {
+    questions: cards.AskQuestion[]
+    i: number
+    requestId?: string
+    /** 累计答案 — key 是 question 原文 (SDK 把这条 record 格式
+     * 化进 tool_result), value 是用户选的 option label 或自定
+     * 义文字。全部 question 都答完时一并塞进 updatedInput.answers
+     * 发回 SDK。 */
+    answers: Record<string, string>
+    /** 已答详情 (按 question idx 索引)，用来给历史面板和 terminal
+     * 状态画选中态。answers 同步累计，但这里多保留 customText /
+     * optionIdx 字段以便 UI 区分两种回答路径。 */
+    answered: Map<number, cards.AskAnswered>
+    /** 当前展示的 question idx。undefined 表示全部答完 (terminal)
+     * —— 这时若 requestId 已就位则 finalize；否则等 renderPermission
+     * 一来立即 finalize。 */
+    currentIdx?: number
+  }>()
+  /** Local mirror of the SDK's task list — built incrementally from
+   * TaskCreate / TaskUpdate input+output pairs and rendered as a footer
+   * on every Task* panel. Lives for the lifetime of the Session
+   * instance; daemon restart wipes it (the SDK doesn't replay history).
+   * Not authoritative — Claude calling TaskList is still the source of
+   * truth; this mirror is purely for the panel readout. */
+  currentTodos = new Map<number, cards.Todo>()
+  status: Status = 'stopped'
+
+  // ── strictly private state ──
   /** Count of user messages we've written to Claude's stdin since the last
    * turn opened on our side. NOT a FIFO of individual messages — the SDK
    * USUALLY batch-merges every mid-turn user message into a single
@@ -186,34 +153,6 @@ export class Session {
    * message. The flag tells the init handler "an eager open is already
    * claiming the slot, stand down". */
   private openingTurn = false
-  private pendingPermissions = new Map<string, { toolUseId: string }>()
-  /** Open AskUserQuestion tool calls — keyed by tool_use_id. The SDK
-   * routes AskUserQuestion through the can_use_tool flow even under
-   * bypass; we have to thread the permission `requestId` through here
-   * so the answer (option click OR custom text submit) can resolve
-   * the permission with `updatedInput.answers` populated.
-   * `deferredAnswer` covers the race where the user clicks/submits
-   * BEFORE can_use_tool arrives (addTool fires on the assistant
-   * message; can_use_tool is a separate control_request that lands
-   * slightly later). */
-  private pendingAsks = new Map<string, {
-    questions: cards.AskQuestion[]
-    i: number
-    requestId?: string
-    /** 累计答案 — key 是 question 原文 (SDK 把这条 record 格式
-     * 化进 tool_result), value 是用户选的 option label 或自定
-     * 义文字。全部 question 都答完时一并塞进 updatedInput.answers
-     * 发回 SDK。 */
-    answers: Record<string, string>
-    /** 已答详情 (按 question idx 索引)，用来给历史面板和 terminal
-     * 状态画选中态。answers 同步累计，但这里多保留 customText /
-     * optionIdx 字段以便 UI 区分两种回答路径。 */
-    answered: Map<number, cards.AskAnswered>
-    /** 当前展示的 question idx。undefined 表示全部答完 (terminal)
-     * —— 这时若 requestId 已就位则 finalize；否则等 renderPermission
-     * 一来立即 finalize。 */
-    currentIdx?: number
-  }>()
   private turnCounter = 0
   // Last seen sessionId — preserved across `kill`/`stop` so a later
   // `restart` can resume the same Claude conversation even after the
@@ -222,14 +161,6 @@ export class Session {
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
   private lastTurnDelta: LastTurnDelta | null = null
-  /** Local mirror of the SDK's task list — built incrementally from
-   * TaskCreate / TaskUpdate input+output pairs and rendered as a footer
-   * on every Task* panel. Lives for the lifetime of the Session
-   * instance; daemon restart wipes it (the SDK doesn't replay history).
-   * Not authoritative — Claude calling TaskList is still the source of
-   * truth; this mirror is purely for the panel readout. */
-  private currentTodos = new Map<number, cards.Todo>()
-  status: Status = 'stopped'
 
   constructor(
     public readonly sessionName: string,
@@ -244,19 +175,6 @@ export class Session {
     if (this.lastSessionId) {
       log(`session "${sessionName}": restored lastSessionId=${this.lastSessionId.slice(0, 8)}…`)
     }
-  }
-
-  /** Patch the card-level summary (the text Feishu uses for chat-list
-   * preview AND lock-screen push), then return when the API call has
-   * landed. Used right before urgent_app so the push notification's
-   * derived preview describes the *action that needs attention* (an
-   * unanswered question, a pending permission ask) rather than the
-   * stale assistant-text tail that patchSummaryThrottled was streaming.
-   * cancelSummary kills any in-flight throttled write so our explicit
-   * patch isn't immediately clobbered. */
-  private async setUrgentSummary(cardId: string, content: string): Promise<void> {
-    cardkit.cancelSummary(cardId)
-    await cardkit.patchSettings(cardId, { config: { summary: { content } } })
   }
 
   /** Minimal cross-chat snapshot for the `hi` peer-list section.
@@ -682,191 +600,28 @@ export class Session {
     }
   }
 
-  async onPermissionDecision(
-    requestId: string,
-    decision: 'allow' | 'allow_always' | 'deny',
-    user: string,
-  ): Promise<void> {
-    const pending = this.pendingPermissions.get(requestId)
-    if (!pending) { log(`session "${this.sessionName}": stray permission ${requestId}`); return }
-    this.pendingPermissions.delete(requestId)
+  // ── External API delegated to helpers ──────────────────────────────
+  // Thin wrappers so daemon.ts keeps its `session.xxx(...)` call style;
+  // bodies live in session-ask.ts / session-permission.ts.
 
-    // Update the tool element in the main turn card in place — the
-    // permission decision lives on the same row as the tool call.
-    const turn = this.currentTurn
-    const meta = turn?.toolByUseId.get(pending.toolUseId)
-    if (turn && meta) {
-      const todos = this.isTaskWorkflow(meta.name) ? this.todosArray() : undefined
-      if (decision === 'deny') {
-        const el = cards.toolCallElement(meta.i, meta.name, meta.input, `🚫 已拒绝 by ${user || '匿名'}`, '❌', undefined, todos)
-        void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
-      } else {
-        const label = decision === 'allow_always' ? '始终允许' : '已允许'
-        meta.resolvedNote = `✅ **${label}** by ${user || '匿名'}`
-        const el = cards.toolCallElement(meta.i, meta.name, meta.input, null, '⏳', meta.resolvedNote, todos)
-        void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
-      }
-    }
-
-    const claudeDecision = decision === 'deny' ? 'deny' : 'allow'
-    this.proc?.sendPermissionResponse(requestId, claudeDecision)
-
-    if (decision === 'allow_always') {
-      this.proc?.sendSetPermissionMode('acceptEdits')
-    }
-
-    if (this.pendingPermissions.size === 0 && this.status === 'awaiting_permission') {
-      this.status = 'working'
-    }
-  }
-
-  /** True iff there's at least one open AskUserQuestion awaiting an
-   * answer in this session. `daemon.handleMessage` uses this to
-   * decide whether an inbound chat message should be a custom answer
-   * (routed to onAskMessageAnswer) instead of opening a new turn. */
   hasPendingAsk(): boolean {
-    return this.pendingAsks.size > 0
+    return sessionAsk.hasPendingAsk(this)
   }
 
-  /** True iff a turn is currently running (or a queued user message is
-   * waiting for its turn to start). daemon uses this to drop a hourglass
-   * reaction on inbound messages — without it the user sees no visible
-   * acknowledgement that their type-ahead message landed (the card
-   * doesn't open until the current turn finishes). */
-  isBusy(): boolean {
-    return this.currentTurn !== null || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0
+  onAskMessageAnswer(text: string, user: string): Promise<void> {
+    return sessionAsk.onAskMessageAnswer(this, text, user)
   }
 
-  /** Funnel an arbitrary chat message into the *current* question
-   * of the oldest pending ask as a `customText` answer. Multi-
-   * question semantics: from the user's perspective, the chat
-   * input always answers whatever question is on screen right now
-   * (`pending.currentIdx`), and a new question slides in after. */
-  async onAskMessageAnswer(text: string, user: string): Promise<void> {
-    const firstEntry = this.pendingAsks.entries().next()
-    if (firstEntry.done) {
-      log(`session "${this.sessionName}": onAskMessageAnswer with no pending — falling back to onUserMessage`)
-      await this.onUserMessage(text)
-      return
-    }
-    const [toolUseId, pending] = firstEntry.value
-    if (pending.currentIdx === undefined) {
-      log(`session "${this.sessionName}": pending ask ${toolUseId} already terminal — ignoring message`)
-      return
-    }
-    await this.onAskCustomAnswer(toolUseId, pending.currentIdx, text, user)
+  onAskAnswer(toolUseId: string, questionIdx: number, optionIdx: number, user: string): Promise<void> {
+    return sessionAsk.onAskAnswer(this, toolUseId, questionIdx, optionIdx, user)
   }
 
-  /** Click handler for an option button. The click must target the
-   * question currently on screen (`pending.currentIdx`); a stale
-   * click (e.g. user clicked an older render before it swapped in
-   * the next question) is logged and dropped — better than double-
-   * answering. */
-  async onAskAnswer(toolUseId: string, questionIdx: number, optionIdx: number, user: string): Promise<void> {
-    const pending = this.pendingAsks.get(toolUseId)
-    if (!pending) { log(`session "${this.sessionName}": stray ask answer for ${toolUseId}`); return }
-    if (questionIdx !== pending.currentIdx) {
-      log(`session "${this.sessionName}": stale ask click q=${questionIdx} current=${pending.currentIdx}`)
-      return
-    }
-    this.advanceAsk(toolUseId, { optionIdx, user })
+  onAskCustomAnswer(toolUseId: string, questionIdx: number, customText: string, user: string): Promise<void> {
+    return sessionAsk.onAskCustomAnswer(this, toolUseId, questionIdx, customText, user)
   }
 
-  /** Custom-text branch. Same staleness rule as onAskAnswer; empty
-   * input is silently ignored (panel stays pending). */
-  async onAskCustomAnswer(toolUseId: string, questionIdx: number, customText: string, user: string): Promise<void> {
-    const pending = this.pendingAsks.get(toolUseId)
-    if (!pending) { log(`session "${this.sessionName}": stray ask custom for ${toolUseId}`); return }
-    const trimmed = (customText ?? '').trim()
-    if (!trimmed) { log(`session "${this.sessionName}": empty custom answer, ignoring`); return }
-    if (questionIdx !== pending.currentIdx) {
-      log(`session "${this.sessionName}": stale ask custom q=${questionIdx} current=${pending.currentIdx}`)
-      return
-    }
-    this.advanceAsk(toolUseId, { customText: trimmed, user })
-  }
-
-  /** Record an answer for the current question, advance the state
-   * machine, repaint. If every question is now answered, finalize
-   * (or defer the finalize until can_use_tool lands — the race is
-   * handled by renderPermission). */
-  private advanceAsk(
-    toolUseId: string,
-    answer: { optionIdx?: number; customText?: string; user: string },
-  ): void {
-    const pending = this.pendingAsks.get(toolUseId)
-    if (!pending || pending.currentIdx === undefined) return
-    const cur = pending.currentIdx
-    const q = pending.questions[cur]
-    if (!q) { log(`session "${this.sessionName}": advanceAsk currentIdx=${cur} out of range`); return }
-    // Resolve the literal answer value — custom text wins if both set.
-    let value: string
-    if (answer.customText !== undefined) {
-      value = answer.customText
-    } else if (answer.optionIdx !== undefined) {
-      const opt = q.options?.[answer.optionIdx]
-      if (!opt) { log(`session "${this.sessionName}": advanceAsk option ${answer.optionIdx} out of range`); return }
-      value = opt.label
-    } else {
-      log(`session "${this.sessionName}": advanceAsk with neither customText nor optionIdx`)
-      return
-    }
-    pending.answers[q.question] = value
-    pending.answered.set(cur, {
-      optionIdx: answer.optionIdx,
-      customText: answer.customText,
-      user: answer.user,
-    })
-    // Next unanswered idx — linear from cur+1. Implementation
-    // always moves forward; we don't currently let users revisit a
-    // previous question (would need richer UI affordance for that).
-    const total = pending.questions.length
-    let nextIdx: number | undefined = undefined
-    for (let i = cur + 1; i < total; i++) {
-      if (!pending.answered.has(i)) { nextIdx = i; break }
-    }
-    pending.currentIdx = nextIdx
-
-    const turn = this.currentTurn
-    const meta = turn?.toolByUseId.get(toolUseId)
-    if (turn && meta) {
-      const el = cards.askUserQuestionElement(
-        meta.i, toolUseId, pending.questions,
-        nextIdx === undefined ? '✅' : '🤔',
-        { currentIdx: nextIdx, answered: pending.answered },
-      )
-      void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
-    }
-
-    if (nextIdx === undefined) {
-      // All done. Finalize iff we have the permission request id;
-      // otherwise renderPermission will pick it up when it arrives.
-      if (pending.requestId) this.finalizeAsk(toolUseId)
-      else log(`session "${this.sessionName}": ask ${toolUseId} all answered, waiting for can_use_tool`)
-    }
-  }
-
-  /** Settle a fully-answered AskUserQuestion: emit the SDK allow
-   * with the full `answers` record folded into `updatedInput`,
-   * drop bookkeeping, restore status. The terminal panel paint was
-   * already done by the final advanceAsk; this is just protocol. */
-  private finalizeAsk(toolUseId: string): void {
-    const pending = this.pendingAsks.get(toolUseId)
-    if (!pending || !pending.requestId) return
-    const meta = this.currentTurn?.toolByUseId.get(toolUseId)
-    const originalInput = meta?.input ?? {}
-    this.proc?.sendPermissionResponse(pending.requestId, 'allow', {
-      updatedInput: { ...originalInput, answers: pending.answers },
-    })
-    this.pendingPermissions.delete(pending.requestId)
-    if (meta) {
-      meta.output = JSON.stringify({ answers: pending.answers })
-      meta.isError = false
-    }
-    this.pendingAsks.delete(toolUseId)
-    if (this.pendingPermissions.size === 0 && this.status === 'awaiting_permission') {
-      this.status = 'working'
-    }
+  onPermissionDecision(requestId: string, decision: 'allow' | 'allow_always' | 'deny', user: string): Promise<void> {
+    return sessionPermission.onPermissionDecision(this, requestId, decision, user)
   }
 
   // ── Wiring Claude → Feishu ─────────────────────────────────────────
@@ -939,13 +694,13 @@ export class Session {
       this.appendThinking(text)
     })
     p.on('tool_use', ({ id, name, input }: { id: string; name: string; input: any }) => {
-      this.addTool(id, name, input)
+      sessionTools.addTool(this, id, name, input)
     })
     p.on('tool_result', ({ tool_use_id, content, is_error }: any) => {
-      this.completeTool(tool_use_id, content, is_error)
+      sessionTools.completeTool(this, tool_use_id, content, is_error)
     })
     p.on('can_use_tool', (req: CanUseToolRequest) => {
-      this.renderPermission(req)
+      sessionPermission.renderPermission(this, req)
     })
     p.on('hook_callback', (req: HookCallbackRequest) => {
       // No hooks registered → fail-safe ack.
@@ -1174,307 +929,6 @@ export class Session {
       cards.ELEMENTS.thinking,
       this.currentTurn.thinkingText,
     )
-  }
-
-  private isTaskWorkflow(name: string): boolean {
-    return name.startsWith('Task') && name !== 'Task'
-  }
-
-  private todosArray(): cards.Todo[] {
-    return [...this.currentTodos.values()]
-  }
-
-  private addTool(toolUseId: string, name: string, input: any): void {
-    if (!this.currentTurn) return
-    // Close current assistant segment (if any) so the tool panel renders
-    // AFTER it in card body order. Flush queues the segment's last
-    // buffered delta before the tool element is inserted.
-    if (this.currentTurn.currentAssistantSegmentId) {
-      void cardkit.flush(this.currentTurn.cardId)
-      this.currentTurn.currentAssistantSegmentId = null
-      this.currentTurn.currentAssistantText = ''
-    }
-    // Consecutive Read merger: if a Read run is already open, append to
-    // its batch and re-render the panel instead of inserting a new one.
-    // Any other tool name closes the run (handled below).
-    if (name === 'Read' && this.currentTurn.openReadBatchI !== null) {
-      const batchI = this.currentTurn.openReadBatchI
-      const batch = this.currentTurn.readBatches.get(batchI)!
-      const slot = batch.items.length
-      batch.items.push({ toolUseId, input, output: null, isError: false })
-      this.currentTurn.toolByUseId.set(toolUseId, { i: batchI, name, input, readBatchSlot: slot })
-      const el = cards.readBatchElement(batchI, batch.items)
-      void cardkit.replaceElement(this.currentTurn.cardId, cards.ELEMENTS.tool(batchI), el)
-      return
-    }
-    if (name !== 'Read') this.currentTurn.openReadBatchI = null
-    const i = this.currentTurn.toolCount++
-    if (name === 'Read') {
-      // First Read of a potential run — render the existing single-tool
-      // panel (which keeps the full file-contents dump on completion). If
-      // a second Read arrives, completeTool/addTool will switch it to
-      // `readBatchElement`.
-      this.currentTurn.openReadBatchI = i
-      this.currentTurn.readBatches.set(i, {
-        items: [{ toolUseId, input, output: null, isError: false }],
-      })
-      this.currentTurn.toolByUseId.set(toolUseId, { i, name, input, readBatchSlot: 0 })
-      const el = cards.toolCallElement(i, name, input, null, '⏳', undefined, undefined)
-      void cardkit.addElement(this.currentTurn.cardId, el, {
-        type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
-      })
-      return
-    }
-    this.currentTurn.toolByUseId.set(toolUseId, { i, name, input })
-    // AskUserQuestion is a client-side tool — daemon renders the choice
-    // UI in-line and supplies the tool_result itself once the user
-    // clicks. Branch BEFORE the generic toolCallElement so we never
-    // fall through to a JSON dump or, worse, get clobbered by the
-    // permission flow (which would render 🔐 three-button buttons that
-    // don't match the actual N options).
-    if (name === 'AskUserQuestion') {
-      const questions = Array.isArray(input?.questions) ? input.questions as cards.AskQuestion[] : []
-      const startIdx = questions.length > 0 ? 0 : undefined
-      const answered = new Map<number, cards.AskAnswered>()
-      this.pendingAsks.set(toolUseId, {
-        questions,
-        i,
-        answers: {},
-        answered,
-        currentIdx: startIdx,
-      })
-      const el = cards.askUserQuestionElement(i, toolUseId, questions, '🤔', {
-        currentIdx: startIdx,
-        answered,
-      })
-      void cardkit.addElement(this.currentTurn.cardId, el, {
-        type: 'insert_before',
-        targetElementId: cards.ELEMENTS.footer,
-      })
-      // Phone push — user has to come back and answer before Claude can
-      // continue. Set summary to the question text so the lock-screen
-      // notification preview shows what the user needs to answer.
-      if (this.currentTurn.userOpenId && this.currentTurn.messageId) {
-        const turn = this.currentTurn
-        const q0 = questions[0]?.question?.trim() ?? ''
-        const truncated = q0.length > 40 ? q0.slice(0, 40) + '…' : q0
-        const summary = questions.length > 1
-          ? `❓ 待回答 ${questions.length} 题${truncated ? `: ${truncated}` : ''}`
-          : truncated
-            ? `❓ ${truncated}`
-            : '❓ 等你回答问题'
-        void (async () => {
-          await this.setUrgentSummary(turn.cardId, summary)
-          await feishu.urgentApp(turn.messageId, [turn.userOpenId])
-        })()
-      }
-      return
-    }
-    // Pending Task* panels still show the *pre-op* todo mirror so users
-    // can read the current state immediately, without waiting for the
-    // tool to return.
-    const todos = this.isTaskWorkflow(name) ? this.todosArray() : undefined
-    const el = cards.toolCallElement(i, name, input, null, '⏳', undefined, todos)
-    void cardkit.addElement(this.currentTurn.cardId, el, {
-      type: 'insert_before',
-      targetElementId: cards.ELEMENTS.footer,
-    })
-  }
-
-  private completeTool(toolUseId: string, content: any, isError: boolean): void {
-    if (!this.currentTurn) return
-    const meta = this.currentTurn.toolByUseId.get(toolUseId)
-    if (!meta) return
-    const output = typeof content === 'string'
-      ? content
-      : Array.isArray(content)
-        ? content.map((c: any) => c?.text ?? JSON.stringify(c)).join('\n')
-        : JSON.stringify(content)
-    // Stash on the meta — every Task* op coming after this point may
-    // need to re-render this panel with a fresher todo footer, so we
-    // can't discard the output after the first paint.
-    meta.output = output
-    meta.isError = isError
-    // AskUserQuestion already had its final panel painted by resolveAsk
-    // (✅ + the chosen option marked, others dimmed). The tool_result
-    // arriving here is just the SDK's synthesised echo — re-rendering
-    // via toolCallElement would clobber the nice option-row layout
-    // with a generic JSON dump. Bail out; the panel is done.
-    if (meta.name === 'AskUserQuestion') return
-    // Read batch path: update this row's status in the shared batch then
-    // re-render. Single-item batches keep the original full-output panel
-    // (file-contents dump); 2+ items switch to the compact `Read · N 次`
-    // listing, which overwrites whatever was last drawn at this i.
-    if (meta.name === 'Read' && meta.readBatchSlot != null) {
-      const batch = this.currentTurn.readBatches.get(meta.i)
-      if (batch) {
-        const row = batch.items[meta.readBatchSlot]
-        if (row) { row.output = output; row.isError = isError }
-        const el = batch.items.length >= 2
-          ? cards.readBatchElement(meta.i, batch.items)
-          : cards.toolCallElement(meta.i, meta.name, meta.input, output, isError ? '❌' : '✅', meta.resolvedNote, undefined)
-        void cardkit.replaceElement(this.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
-      }
-      return
-    }
-    // Update the local todo mirror BEFORE rendering so the just-
-    // completed panel shows the new state too (e.g. a TaskCreate panel
-    // already lists the task it just created).
-    if (!isError && this.isTaskWorkflow(meta.name)) {
-      this.updateTodosFromTask(meta.name, meta.input, output)
-    }
-    const todos = this.isTaskWorkflow(meta.name) ? this.todosArray() : undefined
-    const el = cards.toolCallElement(meta.i, meta.name, meta.input, output, isError ? '❌' : '✅', meta.resolvedNote, todos)
-    void cardkit.replaceElement(this.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
-    // Cascade the new mirror into every prior Task* panel in this turn
-    // so any expanded panel reflects the latest state, not the snapshot
-    // captured when that op ran.
-    if (!isError && this.isTaskWorkflow(meta.name)) {
-      this.refreshOtherTaskPanels(toolUseId)
-    }
-  }
-
-  /** Roll a single Task* op into the local mirror — best-effort. Output
-   * parsing is regex-based (the SDK returns plain text like "Task #7
-   * created successfully: …"), so unexpected variants are skipped
-   * silently rather than blowing up the panel render. */
-  private updateTodosFromTask(name: string, input: any, output: string): void {
-    switch (name) {
-      case 'TaskCreate': {
-        const m = output.match(/Task #(\d+) created/)
-        if (!m) return
-        const id = Number(m[1])
-        this.currentTodos.set(id, {
-          id,
-          subject: input.subject,
-          description: input.description,
-          activeForm: input.activeForm,
-          status: 'pending',
-        })
-        return
-      }
-      case 'TaskUpdate': {
-        const id = Number(input.taskId)
-        if (!Number.isFinite(id)) return
-        // status=deleted is the SDK's tombstone — drop from the mirror
-        // so the readout doesn't carry it forever. Server still keeps
-        // it; the mirror is just for the panel footer.
-        if (input.status === 'deleted') { this.currentTodos.delete(id); return }
-        const cur = this.currentTodos.get(id) ?? { id, status: 'pending' as const }
-        if (input.status)      cur.status = input.status
-        if (input.subject)     cur.subject = input.subject
-        if (input.description) cur.description = input.description
-        if (input.owner)       cur.owner = input.owner
-        if (input.activeForm)  cur.activeForm = input.activeForm
-        this.currentTodos.set(id, cur)
-        return
-      }
-      // TaskList / TaskGet / TaskStop / TaskOutput / TaskDelete:
-      // read-only or parse-heavy — skip mirror update. The panel will
-      // still render the SDK's textual result below the operation
-      // block, which is enough to disambiguate.
-    }
-  }
-
-  /** Re-render every Task* panel in the current turn (except the one
-   * that just landed — already up-to-date) so they all show the latest
-   * todo mirror in their footers. Cheap: ELEMENTS.tool(i) replace is
-   * queued through the per-card Promise chain like any other op. */
-  private refreshOtherTaskPanels(skipToolUseId: string): void {
-    if (!this.currentTurn) return
-    const todos = this.todosArray()
-    for (const [id, meta] of this.currentTurn.toolByUseId) {
-      if (id === skipToolUseId) continue
-      if (!this.isTaskWorkflow(meta.name)) continue
-      const status: '⏳' | '✅' | '❌' = meta.output === undefined
-        ? '⏳'
-        : (meta.isError ? '❌' : '✅')
-      const el = cards.toolCallElement(
-        meta.i, meta.name, meta.input, meta.output ?? null,
-        status, meta.resolvedNote, todos,
-      )
-      void cardkit.replaceElement(this.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
-    }
-  }
-
-  /** Merge the permission ask into the existing tool element in the
-   * current turn card. The user sees one continuous timeline: ⏳ pending
-   * → 🔐 awaiting approval (with buttons) → ⏳ allowed / ❌ denied → ✅
-   * with output. No floating orange card.
-   *
-   * `tool_use` is emitted as part of the assistant message and lands on
-   * our `addTool` handler BEFORE the SDK's `can_use_tool` control_request
-   * arrives — so by the time we get here, `toolByUseId` already has the
-   * entry we need to replace.
-   *
-   * Edge cases (no current turn / missing tool_use_id / unknown id) are
-   * surfaced loudly and auto-denied. We don't fall back to a standalone
-   * card — per the project's no-fallbacks rule, hidden anomalies are
-   * worse than visible deny errors. */
-  private renderPermission(req: CanUseToolRequest): void {
-    const turn = this.currentTurn
-    if (!turn) {
-      log(`session "${this.sessionName}": can_use_tool with no current turn — auto-deny req=${req.request_id}`)
-      this.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'no active turn' })
-      return
-    }
-    const toolUseId = req.tool_use_id
-    if (!toolUseId) {
-      log(`session "${this.sessionName}": can_use_tool without tool_use_id — auto-deny req=${req.request_id}`)
-      this.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'no tool_use_id' })
-      return
-    }
-    const meta = turn.toolByUseId.get(toolUseId)
-    if (!meta) {
-      log(`session "${this.sessionName}": can_use_tool for unknown tool_use_id=${toolUseId} — auto-deny req=${req.request_id}`)
-      this.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'unknown tool_use_id' })
-      return
-    }
-    // AskUserQuestion: SDK routes it through can_use_tool even under
-    // bypass. The PAYLOAD of "user has answered" is the permission
-    // response itself — specifically `updatedInput.answers`. So we
-    // CANNOT auto-allow here (that's the v0.1.2 bug: SDK got an empty
-    // answers map and immediately synthesised a "User has answered
-    // your questions: ." tool_result). Park the requestId on the
-    // pendingAsk record and wait for the user to click an option;
-    // onAskAnswer will then send allow + updatedInput.answers in one
-    // shot. If the user already clicked between addTool and now —
-    // the deferredAnswer slot — settle immediately.
-    if (meta.name === 'AskUserQuestion') {
-      const ask = this.pendingAsks.get(toolUseId)
-      if (!ask) {
-        log(`session "${this.sessionName}": AskUserQuestion ${toolUseId} missing pendingAsk — deny`)
-        this.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'no pending ask' })
-        return
-      }
-      ask.requestId = req.request_id
-      this.pendingPermissions.set(req.request_id, { toolUseId })
-      // Fast-clicker race: the user may have answered every question
-      // while we were still waiting for can_use_tool to arrive. If so,
-      // advanceAsk parked the all-done state and we drain it now.
-      if (ask.currentIdx === undefined) this.finalizeAsk(toolUseId)
-      return
-    }
-    this.status = 'awaiting_permission'
-    this.pendingPermissions.set(req.request_id, { toolUseId })
-    const el = cards.toolCallPermissionElement(meta.i, meta.name, meta.input, req.request_id)
-    void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
-    // Phone push — Claude is blocked until the user approves/denies.
-    // Set summary to "🔐 等审批: <tool>(<input summary>)" so the lock-
-    // screen notification shows which tool needs approval.
-    if (turn.userOpenId && turn.messageId) {
-      const inputSummary = cards.summarizeToolInput(meta.name, meta.input)
-      const tail = inputSummary && inputSummary.length > 30
-        ? inputSummary.slice(0, 30) + '…'
-        : inputSummary
-      const summary = tail
-        ? `🔐 等审批: ${meta.name} · ${tail}`
-        : `🔐 等审批: ${meta.name}`
-      void (async () => {
-        await this.setUrgentSummary(turn.cardId, summary)
-        await feishu.urgentApp(turn.messageId, [turn.userOpenId])
-      })()
-    }
   }
 
   private async closeTurnCard(suffix?: string): Promise<void> {
