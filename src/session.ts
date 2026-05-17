@@ -22,7 +22,6 @@ import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
-import { INBOX_DIR } from './paths'
 import { readUsage } from './usage'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionTools from './session-tools'
@@ -1048,13 +1047,8 @@ export class Session {
 
     // Fire uploads sequentially AFTER the card is sealed so each file
     // posts as its own Feishu message below the conversation card.
-    // Path gate: workDir (Claude's project sandbox), the inbox where
-    // user-uploaded attachments land, and the /tmp/lodestar- namespace
-    // for ad-hoc artifacts.  Anything outside is refused — see
-    // feishu.isPathAllowed.
-    const allowedRoots = [this.workDir, INBOX_DIR, '/tmp/lodestar-']
     for (const p of sendPaths) {
-      await feishu.uploadAndSend(this.chatId, p, allowedRoots)
+      await feishu.uploadAndSend(this.chatId, p)
     }
   }
 }

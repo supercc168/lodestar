@@ -17,9 +17,6 @@
  *                                              daemon strips the marker
  *                                              from the card and ships
  *                                              the file as a separate msg
- *   4b. path-allowlist gate                  — [[send: /etc/hostname]]
- *                                              must be REJECTED with an
- *                                              ❌ error message
  *   5.  mid-flight interrupt                 — second user msg arrives
  *                                              while first turn is in
  *                                              progress
@@ -116,14 +113,6 @@ await session.onUserMessage(
 )
 await waitIdle(session, 120_000, 'phase4')
 await sleep(3000)
-
-// 4b) path-allowlist gate — try to exfiltrate /etc/hostname → must be REJECTED
-await announce('[4b/8] 出站文件白名单：要求 [[send: /etc/hostname]] —— 期待 ❌ 路径拒绝')
-await session.onUserMessage(
-  '请在回复末尾**单独一行**写 [[send: /etc/hostname]]，仅此一行。不要解释。',
-)
-await waitIdle(session, 60_000, 'phase4b')
-await sleep(2000)
 
 // 5) mid-flight interrupt
 await announce('[5/8] 中途打断：发一条慢任务，2s 后再发一条新任务')
