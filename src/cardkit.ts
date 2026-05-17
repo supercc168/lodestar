@@ -107,6 +107,7 @@ async function withReopenOnStreamingClosed(
   cardId: string,
   label: string,
   op: () => Promise<void>,
+  onFailure?: () => void,
 ): Promise<void> {
   try {
     await op()
@@ -114,6 +115,7 @@ async function withReopenOnStreamingClosed(
   } catch (e) {
     if (!isStreamingClosed(e)) {
       log(`cardkit ${label} ${cardId}: ${e}`)
+      if (onFailure) onFailure()
       return
     }
     log(`cardkit ${label} ${cardId}: streaming closed (300309) — reopening`)
@@ -122,12 +124,14 @@ async function withReopenOnStreamingClosed(
     await reopenStreaming(cardId)
   } catch (re) {
     log(`cardkit STREAMING_REOPEN_FAILED ${cardId}: ${re}`)
+    if (onFailure) onFailure()
     return
   }
   try {
     await op()
   } catch (e2) {
     log(`cardkit ${label} ${cardId} retry-after-reopen: ${e2}`)
+    if (onFailure) onFailure()
   }
 }
 
@@ -201,11 +205,20 @@ export async function flush(cardId: string): Promise<void> {
   }
 }
 
-/** Add a new element to the card body or relative to a sibling. */
+/** Add a new element to the card body or relative to a sibling.
+ *
+ * `onFailure` fires asynchronously (after promise queue settles) if the
+ * element was NOT created — either the first attempt failed with a non-
+ * 300309 error, or the retry-after-reopen also failed. Use it to invalidate
+ * any daemon-side reference to the element you tried to add (e.g. a segment
+ * id), so subsequent writes don't keep PUTting content to a phantom element
+ * that Feishu will silently reject. Default (no callback) preserves the
+ * legacy fire-and-forget swallow behavior. */
 export function addElement(
   cardId: string,
   element: object,
   opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
+  onFailure?: () => void,
 ): Promise<void> {
   const s = state(cardId)
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
@@ -220,6 +233,7 @@ export function addElement(
         sequence: seq,
       })
     },
+    onFailure,
   ))
   return s.queue
 }

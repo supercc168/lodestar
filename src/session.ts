@@ -91,11 +91,14 @@ interface LastTurnDelta {
   inputTokens: number // input + cache_* (excludes output) — context-window estimate
 }
 
-/** Cumulative session counters. Reset on full restart (`clear`), preserved
- * across resume — but resumed conversations start counting from the
- * resume point, not the original turn 0; the SDK doesn't replay historical
- * usage. The session_id continuity is preserved separately by the resume
- * map; cumStats represents "since the current ClaudeProcess was spawned". */
+/** Cumulative session counters. Reset on full restart (`clear`),
+ * preserved across `restart`/resume and daemon-restart so the `hi`
+ * panel reflects the user's total spend in this conversation
+ * regardless of how many times the underlying ClaudeProcess has been
+ * respawned. Resumed conversations start counting from the resume
+ * point onward — the SDK doesn't replay historical usage on resume,
+ * so a long pre-resume conversation shows up as zero here until the
+ * first new turn lands. */
 interface CumStats {
   tokens: number
   costUsd: number
@@ -294,6 +297,27 @@ export class Session {
     return true
   }
 
+  /** Drop every ⏳ OneSecond reaction this session is currently holding
+   * on user chat messages, then empty the two tracking maps. Used by
+   * every tear-down path (proc exit, kill, restart) so reactions don't
+   * outlive the conversation that placed them — without this, a Claude
+   * crash / daemon SIGTERM leaves orphan ⏳ stuck on user messages until
+   * Feishu's UI eventually GCs them (which it doesn't, in practice).
+   * closeTurnCard has its own release pass (with the slightly-early
+   * merged-batch trade-off documented there); this is the catastrophic-
+   * exit pass. Direct `deleteReaction` calls are fire-and-forget and
+   * swallow their own failures (see feishu.deleteReaction). */
+  private releaseAllReactions(): void {
+    for (const [msgId, rid] of [
+      ...this.pendingReactionIds.entries(),
+      ...this.currentBatchReactionIds.entries(),
+    ]) {
+      if (rid) void feishu.deleteReaction(msgId, rid)
+    }
+    this.pendingReactionIds = new Map()
+    this.currentBatchReactionIds = new Map()
+  }
+
   async stop(reason = '已终止'): Promise<void> {
     if (!this.proc) {
       this.status = 'stopped'
@@ -315,8 +339,7 @@ export class Session {
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
     this.lastUserOpenId = ''
-    this.pendingReactionIds = new Map()
-    this.currentBatchReactionIds = new Map()
+    this.releaseAllReactions()
     this.initCount = 0
     this.openingTurn = false
     this.pendingPermissions.clear()
@@ -336,8 +359,7 @@ export class Session {
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
     this.lastUserOpenId = ''
-    this.pendingReactionIds = new Map()
-    this.currentBatchReactionIds = new Map()
+    this.releaseAllReactions()
     this.initCount = 0
     this.openingTurn = false
     this.pendingPermissions.clear()
@@ -619,25 +641,37 @@ export class Session {
     //   - first message after spawn (init not yet fired)
     //   - bootstrap race (sibling msgs landing before init#1)
     //   - solo message after a prior turn has fully closed
-    this.proc!.sendUserText(wireText, files)
-    this.pendingUserMessageCount++
-    if (wasBusy && msgId) {
-      // Bootstrap race: the init handler will open the card for us; until
-      // then the OneSecond ⏳ is the only ack the user gets.
-      trackReaction(msgId)
-    }
+    // Eager-open path: open the card BEFORE feeding SDK, so a card-open
+    // failure doesn't strand the daemon with SDK processing a turn we
+    // have nowhere to render. `!openingTurn` means no sibling is mid-
+    // open; `initCount >= 1` means SDK boot init has fired (otherwise
+    // the init handler owns turn opening and we just feed the queue
+    // below). On failure openTurnCard surfaces a red banner via
+    // sendTextRaw; SDK was idle so no interrupt needed.
     if (!this.openingTurn && this.initCount >= 1) {
-      // Eager open: SDK is healthy and idle, open card now. Any extra
-      // messages arriving during the open's Feishu API await pile up in
-      // the count and the init handler batches them.
       this.openingTurn = true
-      this.pendingUserMessageCount--
       try {
         await this.openTurnCard(userOpenId, 'user_message')
+        if (!this.currentTurn) return
+        this.proc!.sendUserText(wireText, files)
+        this.pendingUserMessageCount++
         this.status = 'working'
       } finally {
         this.openingTurn = false
       }
+      return
+    }
+
+    // Non-eager path: either init hasn't fired yet (cold start) or a
+    // sibling onUserMessage is already opening. Feed SDK directly; the
+    // init handler / sibling card-opener will batch this message in.
+    this.proc!.sendUserText(wireText, files)
+    this.pendingUserMessageCount++
+    if (wasBusy && msgId) {
+      // Bootstrap race / sibling-opening race: until a card is open,
+      // the OneSecond ⏳ is the only ack the user gets. The init handler
+      // inherits these via currentBatchReactionIds when it opens.
+      trackReaction(msgId)
     }
   }
 
@@ -873,7 +907,19 @@ export class Session {
       void (async () => {
         try {
           await this.openTurnCard(userOpenId, isUserBatch ? 'user_message' : 'scheduled')
-          this.status = 'working'
+          if (!this.currentTurn) {
+            // SDK already started this turn (its `init` is what got us
+            // here) but we have no card to render into. Interrupt so
+            // assistant/tool events aren't silently dropped while the
+            // model burns tokens. Release the reactions this batch
+            // inherited (init handler moved them above) — otherwise
+            // they stay ⏳ forever on the user's chat messages.
+            log(`session "${this.sessionName}": init-path openTurnCard failed — sendInterrupt + release reactions`)
+            this.proc?.sendInterrupt()
+            this.releaseAllReactions()
+          } else {
+            this.status = 'working'
+          }
         } finally {
           this.openingTurn = false
         }
@@ -923,8 +969,7 @@ export class Session {
       this.pendingUserMessageCount = 0
       this.pendingMidTurnMsgs = []
       this.lastUserOpenId = ''
-      this.pendingReactionIds = new Map()
-      this.currentBatchReactionIds = new Map()
+      this.releaseAllReactions()
       this.initCount = 0
       this.openingTurn = false
       this.status = 'stopped'
@@ -1031,11 +1076,10 @@ export class Session {
         this.chatId,
         '❌ 创建对话卡片失败 (Feishu SDK 重试 3 次后仍连不上)。你这条消息没能送到 Claude,请稍后重发。',
       )
-      // Halt Claude — we already wrote the user text to its stdin in
-      // onUserMessage, but with no card to stream into the response would
-      // be lost. Interrupt now so the model doesn't burn tokens producing
-      // an answer that has nowhere to land.
-      this.proc?.sendInterrupt()
+      // currentTurn left null as the failure signal. Caller decides
+      // whether to sendInterrupt: onUserMessage's eager-open path
+      // hasn't fed SDK yet so doesn't need to; the init handler has
+      // (SDK started the turn itself) and must.
       return
     }
     let cardId: string
@@ -1066,32 +1110,42 @@ export class Session {
   // and mutate `this.currentTurn` underfoot.
   private appendAssistant(delta: string): void {
     if (!this.currentTurn) return
-    if (!this.currentTurn.currentAssistantSegmentId) {
+    const turn = this.currentTurn
+    if (!turn.currentAssistantSegmentId) {
       // New assistant segment opens a visual break — any prior Read run
       // is now visually separated from future Reads, so close the batch
       // window. Future Reads will start a fresh batch at a new i.
-      this.currentTurn.openReadBatchI = null
-      const i = this.currentTurn.assistantSegmentCount++
+      turn.openReadBatchI = null
+      const i = turn.assistantSegmentCount++
       const segId = cards.ELEMENTS.assistant(i)
-      this.currentTurn.currentAssistantSegmentId = segId
-      this.currentTurn.currentAssistantText = ''
-      void cardkit.addElement(this.currentTurn.cardId, cards.assistantSegmentElement(i), {
+      turn.currentAssistantSegmentId = segId
+      turn.currentAssistantText = ''
+      void cardkit.addElement(turn.cardId, cards.assistantSegmentElement(i), {
         type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
+      }, () => {
+        // addElement永久失败:reset segmentId 让下次 delta 重新创建
+        // segment,否则后续 streamText 全都 PUT 到不存在的 element,
+        // 整段 assistant text 在用户那看不到。守 segId 不变以防 turn
+        // rotation 或 addTool 已经清掉了它(每次 addElement 闭包带的
+        // 是自己创建那次的 segId,只清自己的)。
+        if (turn.currentAssistantSegmentId === segId) {
+          log(`session "${this.sessionName}": assistant segment ${segId} addElement failed — will retry on next delta`)
+          turn.currentAssistantSegmentId = null
+          turn.currentAssistantText = ''
+          turn.segmentTexts.delete(segId)
+        }
       })
     }
-    this.currentTurn.currentAssistantText += delta
-    const segId = this.currentTurn.currentAssistantSegmentId
-    this.currentTurn.segmentTexts.set(segId, this.currentTurn.currentAssistantText)
-    cardkit.streamTextThrottled(
-      this.currentTurn.cardId,
-      segId,
-      this.currentTurn.currentAssistantText,
-    )
+    turn.currentAssistantText += delta
+    const segId = turn.currentAssistantSegmentId
+    if (!segId) return  // addElement 已失败 reset,等下一次 delta 重建
+    turn.segmentTexts.set(segId, turn.currentAssistantText)
+    cardkit.streamTextThrottled(turn.cardId, segId, turn.currentAssistantText)
     // Chat-list preview: tail of the latest assistant text. Feishu
     // truncates anyway; ~60 chars is what shows on a typical phone
     // preview line. patchSummaryThrottled is rate-limited on its own.
-    const tail = this.currentTurn.currentAssistantText.slice(-60)
-    cardkit.patchSummaryThrottled(this.currentTurn.cardId, tail)
+    const tail = turn.currentAssistantText.slice(-60)
+    cardkit.patchSummaryThrottled(turn.cardId, tail)
   }
 
   private appendThinking(delta: string): void {
