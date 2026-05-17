@@ -118,18 +118,25 @@ export class Session {
   private currentTurn: TurnState | null = null
   /** Count of user messages we've written to Claude's stdin since the last
    * turn opened on our side. NOT a FIFO of individual messages — the SDK
-   * batch-merges every mid-turn user message into a single combined turn
-   * once the in-flight turn finishes, so the daemon only ever observes
-   * **one** init event per batch (no matter how many Feishu messages went
-   * into the batch). Tracking a count + last-sender (rather than an
-   * Array<msg>) keeps the daemon's view in sync with the SDK's actual
-   * dequeue semantics. Empirically verified 2026-05-15 from the SDK's
-   * `queue-operation` transcript events: 4 enqueues during a long turn
-   * → single dequeue at turn end → one merged user message. Count is
-   * decremented to 0 wholesale at the `init` boundary because the SDK
-   * has already collapsed them into one turn. Distinguishes user-msg
-   * turns from cron-fired scheduled wakeups: count > 0 ⇒ user;
-   * count === 0 ⇒ scheduled (and `initCount > 1`). */
+   * USUALLY batch-merges every mid-turn user message into a single
+   * combined turn once the in-flight turn finishes, so most of the time
+   * the daemon observes **one** init event per batch. Tracking a count +
+   * last-sender (rather than an Array<msg>) keeps the daemon's view
+   * loosely in sync with the SDK's dequeue semantics. Caveat verified
+   * 2026-05-17 (test1 accumulator, 8-message rapid-fire): when the first
+   * write lands in an idle SDK, that single msg gets its own turn and
+   * the rest merge into a second turn — i.e. 1+(N-1) split, not always
+   * one merge. To stay coherent with this, `drainMidTurnAndOpen` bumps
+   * the count by `batch.length` up front (covering both the first solo
+   * turn and the eventual merged tail), and the init handler resets to
+   * 0 on the first claim. If the SDK takes the merge path, the bail at
+   * `currentTurn=yes` in the init handler leaves pendingCount stale (>0)
+   * until the GC at the next `onUserMessage`; if it takes the split
+   * path, the second init sees pendingCount>0 and correctly classifies
+   * the trailing batch as user-batch (not a scheduled wakeup).
+   * Distinguishes user-msg turns from cron-fired scheduled
+   * wakeups: count > 0 ⇒ user; count === 0 ⇒ scheduled (and
+   * `initCount > 1`). */
   private pendingUserMessageCount = 0
   /** Mid-turn user messages buffered DAEMON-SIDE (not yet sendUserText'd
    * to the SDK). Drained in the `result` handler by writing each to SDK
@@ -1029,7 +1036,17 @@ export class Session {
    * calls wake the SDK polling loop (priority="now" semantics) and
    * comprise the input for the new turn. Opens the card here rather
    * than deferring to init because the init for this batch will arrive
-   * with `currentTurn` already set and bail. */
+   * with `currentTurn` already set and bail.
+   *
+   * Each sendUserText also bumps `pendingUserMessageCount`. The SDK
+   * USUALLY collapses our N writes into one merged turn, but **not
+   * always** — empirically observed 2026-05-17, test1 accumulator
+   * session: when the first write lands in an idle SDK (turn just
+   * ended), the SDK eagerly starts a turn for that msg alone, then
+   * merges the rest into a second turn. Without the bump here, that
+   * second turn fires an `init` with `pendingUserMessageCount === 0`
+   * and the init handler misclassifies it as a scheduled wakeup,
+   * painting the `⏰ 触发` banner on what is really a user batch. */
   private async drainMidTurnAndOpen(): Promise<void> {
     if (this.pendingMidTurnMsgs.length === 0) return
     const batch = this.pendingMidTurnMsgs
@@ -1038,6 +1055,7 @@ export class Session {
     try {
       for (const msg of batch) {
         this.proc!.sendUserText(msg.wireText, msg.files)
+        this.pendingUserMessageCount++
         if (msg.msgId) {
           const rid = this.pendingReactionIds.get(msg.msgId) ?? ''
           this.currentBatchReactionIds.set(msg.msgId, rid)

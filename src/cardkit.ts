@@ -81,7 +81,12 @@ async function call(method: string, path: string, body?: object): Promise<any> {
 }
 
 function isStreamingClosed(e: unknown): boolean {
-  return typeof e === 'object' && e !== null && (e as any).code === 300309
+  if (typeof e !== 'object' || e === null) return false
+  const code = (e as any).code
+  // 300309 "streaming mode is closed" — TTL already fired before our write.
+  // 200850 "card streaming timeout"   — TTL fired exactly during our write.
+  // Both mean the streaming session is gone and a reopen will unstick the card.
+  return code === 300309 || code === 200850
 }
 
 /** Reopen streaming_mode on a card that Feishu auto-closed after its
@@ -98,11 +103,11 @@ async function reopenStreaming(cardId: string): Promise<void> {
 }
 
 /** Run `op` inside the per-card queue. If it fails with code=300309
- * (Feishu auto-closed streaming after the 10-minute TTL), reopen
- * streaming inline and retry `op` exactly once. Anything else — non-
- * 300309 failure, reopen failure, retry failure — is logged and
- * swallowed, matching the fire-and-forget contract every cardkit op
- * already has at the call sites. */
+ * or 200850 (Feishu auto-closed / timed-out streaming after the 10-
+ * minute TTL), reopen streaming inline and retry `op` exactly once.
+ * Anything else — other failure, reopen failure, retry failure — is
+ * logged and swallowed, matching the fire-and-forget contract every
+ * cardkit op already has at the call sites. */
 async function withReopenOnStreamingClosed(
   cardId: string,
   label: string,
@@ -118,7 +123,7 @@ async function withReopenOnStreamingClosed(
       if (onFailure) onFailure()
       return
     }
-    log(`cardkit ${label} ${cardId}: streaming closed (300309) — reopening`)
+    log(`cardkit ${label} ${cardId}: streaming closed (code=${(e as any).code}) — reopening`)
   }
   try {
     await reopenStreaming(cardId)
