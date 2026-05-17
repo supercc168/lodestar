@@ -105,10 +105,14 @@ export class ClaudeProcess extends EventEmitter {
   }
   /** Context-window capacity of the model that ran the latest turn —
    * lifted from `result.modelUsage[model].contextWindow` so we don't
-   * have to hardcode `[1m]` vs stock variants. 200K is the safe
-   * default if no result has landed yet (e.g. between spawn and the
-   * first turn close). */
-  lastContextWindow: number = 200_000
+   * have to hardcode `[1m]` vs stock variants. `null` until the first
+   * `result` event lands (spawn → first turn close gap). Callers that
+   * render a percentage MUST treat null as "unknown" and drop the %
+   * rather than substituting a default — past life of this field was a
+   * 200K constant default which made fresh-spawn `hi` panels lie about
+   * the limit on this project's opus-4-7[1m] (1M) pin. (no_fallbacks
+   * rule applies: surface absence, don't fabricate.) */
+  lastContextWindow: number | null = null
 
   constructor(opts: SpawnOpts) {
     super()

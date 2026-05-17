@@ -4,6 +4,7 @@
  * src/cards.ts.
  */
 
+import type { SysInfo } from '../sysinfo'
 import type { UsageSnapshot } from '../usage'
 import { ELEMENTS } from './elements'
 
@@ -31,11 +32,25 @@ interface ConsoleOpts {
   /** Current context-window occupancy estimate (input + cache tokens of
    * the last assistant message). 0 if no turn has completed yet. */
   contextTokens?: number
-  /** Window upper bound. Defaults to 1M (claude-opus-4-7[1m]). */
-  contextLimit?: number
+  /** Window upper bound. `null` / undefined → unknown (e.g. spawn happened
+   * but no `result` has landed yet); renderer omits the `/ limit (pct%)`
+   * suffix instead of fabricating a default. */
+  contextLimit?: number | null
   cumStats?: { tokens: number; costUsd: number; turns: number }
   lastTurn?: { tokens: number; costUsd: number; durationMs: number }
   sessionId?: string | null
+  /** Host snapshot: CPU 负载、内存、根/家目录磁盘、cc-* systemd 服务。
+   * undefined → 略过整个 host 段;数据自身字段缺失 (cpu/mem 为 null)
+   * 时单行渲染 `_n/a_`,不假数据。 */
+  sysinfo?: SysInfo
+}
+
+function fmtBytes(n: number): string {
+  if (n < 1024) return `${n}B`
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)}K`
+  if (n < 1024 * 1024 * 1024) return `${(n / (1024 * 1024)).toFixed(0)}M`
+  const gb = n / (1024 * 1024 * 1024)
+  return gb < 10 ? `${gb.toFixed(1)}G` : `${gb.toFixed(0)}G`
 }
 
 /** Format token counts as a compact human-readable string: 1,234 → 1.2K. */
@@ -138,10 +153,76 @@ export function consoleUsageContent(
   return lines.length === 1 ? '**📊 订阅额度**　_无数据_' : lines.join('\n')
 }
 
+const SERVICE_STATUS_EMOJI: Record<string, string> = {
+  active: '🟢', activating: '🚀', reloading: '🔄',
+  inactive: '⚪', deactivating: '🟡', failed: '❌',
+}
+
+/** Host snapshot lines: 1 line for CPU+mem, 1 per disk, then services list.
+ * 跟 peers 同样的缩进风格 (`　· ` 开头),保持视觉一致。 */
+function hostLines(sysinfo: SysInfo): string[] {
+  const out: string[] = []
+  const head: string[] = []
+  if (sysinfo.cpu) {
+    const { cores, load1, load5, load15 } = sysinfo.cpu
+    head.push(`load ${load1.toFixed(2)} / ${load5.toFixed(2)} / ${load15.toFixed(2)} (${cores}核)`)
+  }
+  if (sysinfo.mem) {
+    head.push(`mem ${sysinfo.mem.percent}% (${fmtBytes(sysinfo.mem.usedBytes)}/${fmtBytes(sysinfo.mem.totalBytes)})`)
+  }
+  if (head.length > 0) out.push(`**🖥 主机**　${head.join(' · ')}`)
+  else out.push('**🖥 主机**　_n/a_')
+
+  if (sysinfo.disks.length > 0) {
+    const parts = sysinfo.disks.map(d =>
+      `\`${d.label}\` ${d.percent}% (${fmtBytes(d.usedBytes)}/${fmtBytes(d.totalBytes)})`,
+    )
+    out.push(`**💽 磁盘**　${parts.join(' · ')}`)
+  }
+
+  if (sysinfo.servicesError) {
+    out.push(`**⚙️ 服务** cc-*　_${sysinfo.servicesError}_`)
+  } else if (sysinfo.services.length === 0) {
+    out.push('**⚙️ 服务** cc-*　_无_')
+  } else {
+    out.push(`**⚙️ 服务** cc-* (${sysinfo.services.length})`)
+    for (const s of sysinfo.services) {
+      const dot = SERVICE_STATUS_EMOJI[s.active] ?? '·'
+      // 三件套: 状态 (active/inactive/failed) · 最近活跃 (上次进入
+      // active 距今多久) · 持续时间 (当前状态持续多久)。
+      // - active: 最近活跃 == 持续时间 (同一时刻),合并成"已运行 5m"
+      // - inactive/failed: 两者不同,分开显示"上次活跃 3d前 · 已停 1h"
+      // - activating/deactivating: 只显示当前状态持续时间
+      // - 从未跑过的 inactive: 只标"从未启动"
+      const lastActive = s.lastActiveAgoSec
+      const stateAge = s.stateAgoSec
+      const parts: string[] = [s.active]
+      if (s.active === 'active') {
+        if (stateAge != null) parts.push(`已运行 ${fmtUptime(stateAge * 1000)}`)
+      } else if (s.active === 'inactive' || s.active === 'failed') {
+        if (lastActive != null) {
+          parts.push(`上次活跃 ${fmtUptime(lastActive * 1000)}前`)
+        } else {
+          parts.push('从未启动')
+        }
+        if (stateAge != null) {
+          const verb = s.active === 'failed' ? '已挂' : '已停'
+          parts.push(`${verb} ${fmtUptime(stateAge * 1000)}`)
+        }
+      } else {
+        // activating / deactivating / reloading
+        if (stateAge != null) parts.push(`已 ${fmtUptime(stateAge * 1000)}`)
+      }
+      out.push(`　· ${dot} \`${s.name}\` · ${parts.join(' · ')}`)
+    }
+  }
+  return out
+}
+
 export function consoleCard(opts: ConsoleOpts): object {
   const {
     sessionName, status, model, effort, uptimeMs, peers, usage,
-    contextTokens, contextLimit, cumStats, lastTurn, sessionId,
+    contextTokens, contextLimit, cumStats, lastTurn, sessionId, sysinfo,
   } = opts
   const statusEmoji = {
     idle: '🟢 闲', working: '⚙️ 工作中', awaiting_permission: '🔐 等审批',
@@ -166,9 +247,17 @@ export function consoleCard(opts: ConsoleOpts): object {
     }
   }
   if (contextTokens != null && contextTokens > 0) {
-    const limit = contextLimit ?? 1_000_000
-    const pct = limit > 0 ? Math.round((contextTokens / limit) * 100) : 0
-    lines.push(`**📦 上下文**　${fmtTokens(contextTokens)} / ${fmtTokens(limit)}　(${pct}%)`)
+    // Show `/ limit (pct%)` only when we actually know the window —
+    // `contextLimit` is populated from the SDK's modelUsage on first
+    // `result`. Pre-result panels (fresh spawn / kill+hi / clear+hi)
+    // render token count alone rather than fabricating a 1M or 200K
+    // default that may not match the running model.
+    if (contextLimit != null && contextLimit > 0) {
+      const pct = Math.round((contextTokens / contextLimit) * 100)
+      lines.push(`**📦 上下文**　${fmtTokens(contextTokens)} / ${fmtTokens(contextLimit)}　(${pct}%)`)
+    } else {
+      lines.push(`**📦 上下文**　${fmtTokens(contextTokens)}　_窗口待 result 上报_`)
+    }
   }
   void uptimeMs // session-level uptime is already shown per-project in
   // the 活跃项目 list above (peers[].uptimeMs); the dedicated row would
@@ -181,6 +270,9 @@ export function consoleCard(opts: ConsoleOpts): object {
   }
   if (sessionId) {
     lines.push(`**🆔 session**　\`${sessionId.slice(0, 8)}…\``)
+  }
+  if (sysinfo) {
+    lines.push(...hostLines(sysinfo))
   }
 
   const template = status === 'working' ? 'blue'

@@ -51,6 +51,15 @@ flips `streaming_mode` off on `result`.
   to verify a change, print the restart command and hand it to the user
   — let them pick the moment. Same rule for `kill`/`stop`/`pkill` against
   `bun daemon.ts` or any `claude -p ... --resume` child.
+- **`cc-` 前缀是 hi 面板的契约。** Claude 在这台主机上用
+  `systemd-run --user --unit=cc-<project>-<purpose> -- <cmd>` 拉起的所有
+  常驻进程,都必须带 `cc-` 前缀(沿用全局 CLAUDE.md
+  `background_process_safety` 段的约定)。`hi` 控制台卡片会跑
+  `systemctl --user list-units 'cc-*.service'` 把这些服务以及
+  `active/inactive/failed` 状态、uptime 一并贴在面板上。改前缀就要同步改
+  `src/sysinfo.ts` 里的 `SERVICE_PREFIX`,否则面板会列空。`feishu-daemon`
+  本身不在 `cc-*` 集合里(它是本仓库自己的常驻 service,不归 Claude
+  spawn 这一类),因此 hi 面板不会显示它。
 
 ## Build / run
 

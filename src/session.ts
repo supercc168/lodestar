@@ -22,6 +22,7 @@ import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
+import { readSysInfo } from './sysinfo'
 import { readUsage } from './usage'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionTools from './session-tools'
@@ -222,6 +223,23 @@ export class Session {
     })
     this.wireProc(this.proc)
     this.proc.sendInitialize({})
+    // 等 `system/init` 落地再认定 ready —— sendInitialize 只把 RPC
+    // 写进 stdin,Claude 回包之前 proc.sessionId 还是 null,这时候
+    // showConsole() 看到 null 会 fallback 到磁盘上**上一次**会话的
+    // lastSessionId,面板就把陈年 session_id 当成"当前会话"贴出去,
+    // model / usage / contextWindow 也都没值。等 init 之后再返回,
+    // 后续 `hi`、首条 user message 都能拿到真值。5s 兜底,init 真
+    // 没来也不死循环。
+    await new Promise<void>(resolve => {
+      const proc = this.proc!
+      const timer = setTimeout(() => {
+        proc.off('init', onInit)
+        log(`session "${this.sessionName}": init wait timeout (5s) — proceeding`)
+        resolve()
+      }, 5000)
+      const onInit = () => { clearTimeout(timer); resolve() }
+      proc.once('init', onInit)
+    })
 
     await feishu.sendText(this.chatId, `✅ Lodestar session "${this.sessionName}" 已就绪，发消息开始对话。`)
     this.status = 'idle'
@@ -419,6 +437,10 @@ export class Session {
     // reads better than `claude-opus-4-7` in the small status header.
     const rawModel = this.proc?.lastModel ?? null
     const model = rawModel ? rawModel.replace(/^claude-/, '') : undefined
+    // readSysInfo 全程是本机调用 (/proc + statfs + 本地 systemctl),最坏
+    // 情况由 runSystemctl 的 2s 超时兜底。在 sendCard 前 await 一下,把
+    // CPU/mem/disk/services 一次性塞进首屏,不走 element patch 的二段刷新。
+    const sysinfo = await readSysInfo()
     const card = cards.consoleCard({
       sessionName: this.sessionName,
       status: this.status,
@@ -444,6 +466,7 @@ export class Session {
           }
         : undefined,
       sessionId: this.proc?.sessionId ?? this.lastSessionId,
+      sysinfo,
     })
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) return
@@ -834,9 +857,11 @@ export class Session {
    * .contextWindow` captured by ClaudeProcess on each turn close, so
    * the daemon doesn't have to enumerate model ids itself (was the
    * source of a "560K/200K" display bug — model id didn't include
-   * `[1m]` so the hardcoded fallback won). */
-  private contextWindowMax(): number {
-    return this.proc?.lastContextWindow ?? 200_000
+   * `[1m]` so the hardcoded fallback won). Returns `null` when no turn
+   * has closed yet (fresh spawn / kill / clear / revive); callers must
+   * render percentages only when this is a real number. */
+  private contextWindowMax(): number | null {
+    return this.proc?.lastContextWindow ?? null
   }
 
   /** Drain `pendingMidTurnMsgs` to the SDK and open a fresh card for the
@@ -1039,7 +1064,7 @@ export class Session {
     if (!suffix) {
       const ctxTokens = this.currentContextTokens()
       const ctxMax = this.contextWindowMax()
-      if (ctxTokens > 0 && ctxMax > 0) {
+      if (ctxTokens > 0 && ctxMax !== null && ctxMax > 0) {
         const pct = Math.round((ctxTokens / ctxMax) * 100)
         metrics += ` · 📊 ${pct}%`
       }
