@@ -59,6 +59,15 @@ export interface ClaudeResultMeta {
   duration_ms: number | null
   num_turns: number | null
   usage: ClaudeUsage | null
+  /** SDK `result.subtype` — `success` on natural end_turn,
+   * `error_max_turns` if --max-turns was reached, `error_during_execution`
+   * for API-side failures (rate limit / 5xx / context overflow / refusal).
+   * Session.wireProc uses this to drive auto-retry + suppress phone push
+   * on aborted turns. */
+  subtype: string | null
+  /** Mirror of `subtype !== 'success'`; cached so callers don't have to
+   * re-derive it from the (open-ended) subtype string. */
+  is_error: boolean
 }
 
 export interface HookCallbackRequest {
@@ -92,6 +101,7 @@ export class ClaudeProcess extends EventEmitter {
    * turn" stats even while idle. */
   lastResult: ClaudeResultMeta = {
     cost_usd: null, duration_ms: null, num_turns: null, usage: null,
+    subtype: null, is_error: false,
   }
   /** Context-window capacity of the model that ran the latest turn —
    * lifted from `result.modelUsage[model].contextWindow` so we don't
@@ -242,11 +252,19 @@ export class ClaudeProcess extends EventEmitter {
       return
     }
     if (type === 'result') {
+      const subtype = typeof msg.subtype === 'string' ? msg.subtype : null
       this.lastResult = {
         cost_usd: typeof msg.total_cost_usd === 'number' ? msg.total_cost_usd : null,
         duration_ms: typeof msg.duration_ms === 'number' ? msg.duration_ms : null,
         num_turns: typeof msg.num_turns === 'number' ? msg.num_turns : null,
         usage: msg.usage ?? null,
+        subtype,
+        // Trust the SDK's own bool when present; otherwise derive from
+        // subtype so a future error_* variant we haven't seen still flags
+        // as error.
+        is_error: typeof msg.is_error === 'boolean'
+          ? msg.is_error
+          : (subtype !== null && subtype !== 'success'),
       }
       // modelUsage maps "<model id>" → { contextWindow, maxOutputTokens, … }.
       // For mixed-model runs the SDK reports one entry per model used in

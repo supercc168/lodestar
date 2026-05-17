@@ -153,6 +153,14 @@ export class Session {
    * claiming the slot, stand down". */
   private openingTurn = false
   private turnCounter = 0
+  /** Consecutive SDK error turns since the last `success`. When the SDK
+   * closes a turn with `subtype !== 'success'` (error_during_execution /
+   * error_max_turns), the daemon swallows the phone push and re-pokes
+   * the SDK with a "继续" user message to auto-resume. Two errors in a
+   * row → give up: surface the failure (⛔ footer + forced phone push)
+   * and reset. Any natural-success turn OR user intervention
+   * (mid-turn buffer drain) resets this back to 0. */
+  private consecutiveErrors = 0
   // Last seen sessionId — preserved across `kill`/`stop` so a later
   // `restart` can resume the same Claude conversation even after the
   // child process is gone.
@@ -267,6 +275,7 @@ export class Session {
     this.initCount = 0
     this.openingTurn = false
     this.pendingPermissions.clear()
+    this.consecutiveErrors = 0
     this.status = 'stopped'
     await proc.kill()
     await feishu.sendText(this.chatId, `🔴 ${reason} (session: ${this.sessionName})`)
@@ -287,6 +296,7 @@ export class Session {
     this.initCount = 0
     this.openingTurn = false
     this.pendingPermissions.clear()
+    this.consecutiveErrors = 0
     if (resume && prevSessionId) {
       this.proc = new ClaudeProcess({
         workDir: this.workDir,
@@ -707,21 +717,65 @@ export class Session {
     })
     p.on('result', () => {
       this.accumulateResultStats()
-      // Daemon-driven rotation: mid-turn msgs were buffered (not yet
-      // sent to SDK) — close the in-flight card with `📨 转交新卡` and
-      // drain the buffer in one shot. The drain writes each buffered
-      // msg to SDK stdin, which is the `priority="now"` wake the SDK
-      // polling loop needs (claude-code issue #39632) AND constitutes
-      // the input for the new batch turn. We open the new card here
-      // ourselves rather than waiting on init — the SDK init for this
-      // batch will fire shortly but `currentTurn` will already be set,
-      // so the init handler will return without double-opening.
+      // Three orthogonal signals fold into one footer suffix + push/retry
+      // decision here:
+      //   1. `pendingMidTurnMsgs` — user typed during the turn; their
+      //      messages need a fresh card and SDK wake-up. Takes priority
+      //      over auto-retry (user is back at the keyboard).
+      //   2. `lastResult.is_error` — SDK closed the turn with a non-
+      //      `success` subtype (error_during_execution / error_max_turns).
+      //      First occurrence: swallow the phone push, re-poke SDK with
+      //      "继续" to auto-resume. Second consecutive: give up,
+      //      ⛔ footer + force phone push so the user knows.
+      //   3. Natural success — `✅` footer, normal phone push, reset
+      //      consecutiveErrors.
+      // closeTurnCard's default push-on-clean-close stays the floor;
+      // `forcePush:true` is the override for the "we hit retry ceiling"
+      // case (which has a non-empty suffix and would otherwise be silent).
       const hasMidTurn = this.pendingMidTurnMsgs.length > 0
-      const suffix = hasMidTurn ? '📨 转交新卡' : undefined
-      log(`session "${this.sessionName}": SDK result midBuffer=${this.pendingMidTurnMsgs.length} suffix=${suffix ?? '<✅>'}`)
-      void this.closeTurnCard(suffix)
+      const isError = this.proc?.lastResult.is_error === true
+      const subtype = this.proc?.lastResult.subtype ?? 'success'
+
+      let suffix: string | undefined
+      let autoRetry = false
+      let forcePush = false
+
+      if (hasMidTurn) {
+        // User intervention wins over auto-retry — they're actively
+        // sending new input, no point also auto-poking the SDK.
+        this.consecutiveErrors = 0
+        suffix = isError ? `⚠️ SDK ${subtype},用户已介入` : '📨 转交新卡'
+      } else if (isError) {
+        this.consecutiveErrors++
+        if (this.consecutiveErrors >= 2) {
+          suffix = `⛔ SDK 连续报错 (${subtype}),已停止`
+          forcePush = true
+          this.consecutiveErrors = 0
+        } else {
+          suffix = `⚠️ SDK ${subtype},自动续 turn…`
+          autoRetry = true
+        }
+      } else {
+        this.consecutiveErrors = 0
+      }
+
+      log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} midBuffer=${this.pendingMidTurnMsgs.length} consecErr=${this.consecutiveErrors} autoRetry=${autoRetry} forcePush=${forcePush}`)
+      void this.closeTurnCard(suffix, { forcePush })
       this.status = 'idle'
-      if (hasMidTurn) void this.drainMidTurnAndOpen()
+
+      if (hasMidTurn) {
+        void this.drainMidTurnAndOpen()
+      } else if (autoRetry) {
+        // Re-poke the SDK to start a fresh turn. Anthropic's text-block
+        // API rejects empty content, so use "继续" — minimal Chinese
+        // imperative the model parses cleanly. Bumping
+        // pendingUserMessageCount makes the init handler classify the
+        // resulting turn as user_message (inheriting lastUserOpenId)
+        // rather than scheduled, so the eventual success will still
+        // phone-push the original sender.
+        this.proc?.sendUserText('继续')
+        this.pendingUserMessageCount++
+      }
     })
     p.on('exit', ({ code, signal, expected }: any) => {
       log(`session "${this.sessionName}": claude exited code=${code} signal=${signal} expected=${expected}`)
@@ -733,6 +787,7 @@ export class Session {
       this.releaseAllReactions()
       this.initCount = 0
       this.openingTurn = false
+      this.consecutiveErrors = 0
       this.status = 'stopped'
       if (!expected && code !== 0 && signal !== 'SIGTERM') {
         void feishu.sendText(this.chatId, `⚠️ Claude 异常退出 (code=${code}, signal=${signal})。回复任意消息将重新启动。`)
@@ -930,7 +985,7 @@ export class Session {
     )
   }
 
-  private async closeTurnCard(suffix?: string): Promise<void> {
+  private async closeTurnCard(suffix?: string, opts: { forcePush?: boolean } = {}): Promise<void> {
     // CRITICAL: capture-and-null in a single synchronous block at entry
     // so a parallel `closeTurnCard` (e.g. result event firing while
     // onUserMessage is awaiting an interrupt) can't double-process the
@@ -1010,9 +1065,12 @@ export class Session {
     // completion), when we don't know who to ping, and when the turn
     // wasn't kicked off by the user typing a message — scheduled /
     // cron / loop wakeups finish on their own and shouldn't ping the
-    // phone. Fire-and-forget; urgent_app failures are non-fatal and
-    // already logged in feishu.ts.
-    if (!suffix && turn.trigger === 'user_message' && turn.userOpenId && turn.messageId) {
+    // phone. `opts.forcePush` overrides the suffix-gate for the
+    // "consecutive SDK errors, giving up" case — that close has a non-
+    // empty suffix but the user still needs to know we bailed.
+    // Fire-and-forget; urgent_app failures are non-fatal and already
+    // logged in feishu.ts.
+    if ((opts.forcePush || !suffix) && turn.trigger === 'user_message' && turn.userOpenId && turn.messageId) {
       void feishu.urgentApp(turn.messageId, [turn.userOpenId])
     }
 
