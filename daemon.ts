@@ -15,6 +15,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSy
 import { dirname } from 'node:path'
 import { Session } from './src/session'
 import * as feishu from './src/feishu'
+import { startNotifyServer } from './src/notify'
 import { config } from './src/config'
 import { log } from './src/log'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
@@ -343,6 +344,7 @@ async function boot(): Promise<void> {
   log(`lodestar-daemon: WS started, watching ${feishu.chatNameCache.size} groups`)
 
   startDebugSocket()
+  startNotifyServer({ bind: config.notify.bind, port: config.notify.port })
 
   // Auto-revive sessions that were running when we last went down.
   // Runs AFTER the WS is up so any 🔁 revive message lands in the

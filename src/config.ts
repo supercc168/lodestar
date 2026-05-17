@@ -1,6 +1,6 @@
 /**
  * Read config.toml — minimal hand-rolled parser sufficient for the
- * two-section, scalar-value-only schema we expect:
+ * three-section, scalar-value-only schema we expect:
  *
  *   [feishu]
  *   app_id = "cli_..."
@@ -8,6 +8,10 @@
  *
  *   [runtime]
  *   projects_root = "~/"      # optional, defaults to $HOME
+ *
+ *   [notify]                  # all optional
+ *   bind = "127.0.0.1"        # default 127.0.0.1 (loopback only)
+ *   port = 9876               # default 9876
  *
  * Loaded synchronously at import time; downstream modules read the
  * exported `config` object directly.
@@ -24,6 +28,10 @@ export interface LodestarConfig {
   }
   runtime: {
     projects_root: string
+  }
+  notify: {
+    bind: string
+    port: number
   }
 }
 
@@ -74,9 +82,16 @@ function loadConfig(): LodestarConfig {
     throw new Error(`lodestar: ${CONFIG_FILE} is missing [feishu].app_id / [feishu].app_secret`)
   }
   const projectsRoot = expandTilde(t.runtime?.projects_root ?? homedir())
+  const notifyBind = t.notify?.bind ?? '127.0.0.1'
+  const notifyPortRaw = t.notify?.port ?? '9876'
+  const notifyPort = Number.parseInt(notifyPortRaw, 10)
+  if (!Number.isFinite(notifyPort) || notifyPort <= 0 || notifyPort > 65535) {
+    throw new Error(`lodestar: [notify].port must be 1..65535, got "${notifyPortRaw}"`)
+  }
   return {
     feishu: { app_id: appId, app_secret: appSecret },
     runtime: { projects_root: projectsRoot },
+    notify: { bind: notifyBind, port: notifyPort },
   }
 }
 

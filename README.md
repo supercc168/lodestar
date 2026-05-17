@@ -33,6 +33,7 @@ AI 不是帮手,是倍率。它放大的不是体力,是你——你的直觉、
 - 🗂 **多项目并发**:一个 daemon 持 N 群 ↔ N session
 - 🔄 **自动 resume**:重启自动续接,session_id 落盘不丢
 - 🛡 **systemd 守护级**:WS watchdog + 单 PID + alive marker
+- 📡 **HTTP 通知端点**:任意本机进程 `POST /notify` 一行 curl 把 markdown 推成卡片,info / warn / error 染色
 
 ## 怎么用
 
@@ -135,6 +136,53 @@ systemctl --user enable --now lodestar
 ```
 
 WS watchdog + alive-marker 的联手设计,意味着每次 systemd 拉起,daemon 会把**上次还在运行的 session 全部 `--resume` 自动复活**;你主动 `kill` 过的不会被吵醒。
+
+## 通知端点(Notify)
+
+本机任何进程都能往群里推一张卡片 —— 不走 SDK、不走鉴权,daemon 启动时
+顺带跑一个 loopback HTTP listener,默认绑 `127.0.0.1:9876`。
+
+```bash
+curl -fsS -X POST http://127.0.0.1:9876/notify \
+  -H 'content-type: application/json' \
+  -d '{"project":"feishu","text":"**build done** 12 files"}'
+```
+
+请求体:
+
+| 字段 | 必需 | 说明 |
+| --- | --- | --- |
+| `project` | ✅ | 飞书群名(= session 名 = `~/` 下的项目目录名)|
+| `text` | ✅ | Feishu schema-2.0 markdown:`**bold**`、`` `code` ``、`[link](url)`、`<font color='red'>…</font>`;~30 KB 上限,超限返回 502 |
+| `title` |   | 卡片 header 标题,默认等于 `project` |
+| `level` |   | `info`(默认,蓝)/ `warn`(黄)/ `error`(红)|
+
+响应:`200 {ok, chat_id, message_id}` / `400` 参数错 / `404` 群没绑定过 / `502` 飞书 API 拒收。
+
+> ⚠️ 群必须**至少有一条消息**触达过 daemon(WS 收到过),否则 `chatIdForSession` 查不到绑定,返回 404。新建群第一次发消息后即可用。
+
+可选配置(`~/.config/lodestar/config.toml`):
+
+```toml
+[notify]
+bind = "127.0.0.1"      # 默认 loopback;改 0.0.0.0 必须自己加前置鉴权
+port = 9876
+```
+
+cron / systemd hook 的常见用法:
+
+```cron
+0 3 * * * /usr/local/bin/backup.sh \
+  && curl -fsS -X POST http://127.0.0.1:9876/notify -H 'content-type: application/json' \
+       -d '{"project":"ops","text":"✅ nightly backup OK"}' \
+  || curl -fsS -X POST http://127.0.0.1:9876/notify -H 'content-type: application/json' \
+       -d '{"project":"ops","level":"error","text":"❌ nightly backup FAILED"}'
+```
+
+> 想让 Claude Code 自动调这个 endpoint(说一句"build 完通知我"就自己推),
+> 建议你自己写一个 skill —— 在 `~/.claude/skills/feishu-notify/SKILL.md`
+> 放一个 frontmatter + 触发关键词,把上面这段 curl 的 shape 抄进去即可。
+> 项目本身不附带 skill 文件,要不要装、装成什么样,完全交给你。
 
 ## 许可
 

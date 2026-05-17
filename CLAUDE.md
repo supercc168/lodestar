@@ -42,6 +42,15 @@ flips `streaming_mode` off on `result`.
 - **Streaming text** is throttled in `src/cardkit.ts` (120ms window or
   32-char delta). Do not call `streamText` directly from Claude event
   handlers; use `streamTextThrottled`.
+- **Never `systemctl restart feishu-daemon` on your own.** Daemon restart
+  SIGTERMs every child claude subprocess — including the one rendering
+  the Feishu turn you are currently inside. You may literally BE that
+  subprocess; the symptom is your own `Bash` returning exit code 144
+  the instant the restart command runs, and the user has to re-send the
+  request to spawn you again. Even when you "just need to reload code"
+  to verify a change, print the restart command and hand it to the user
+  — let them pick the moment. Same rule for `kill`/`stop`/`pkill` against
+  `bun daemon.ts` or any `claude -p ... --resume` child.
 
 ## Build / run
 
