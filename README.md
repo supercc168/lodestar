@@ -78,8 +78,9 @@ npm i -g @leviyuan/lodestar
 
 1. **添加机器人能力**:左侧"添加应用能力"→"机器人"→ 点 **添加** 按钮。
 2. **开通权限**(权限管理 → **开通权限**):
-   - 消息:`im:message:send_as_bot` `im:message` `im:chat:readonly` `im:resource` `im:message.urgent`
+   - 消息:`im:message:send_as_bot` `im:message` `im:chat` `im:resource` `im:message.urgent` `im:message.group_msg`(敏感,需审批) `im:message.group_at_msg:readonly`
    - 卡片:`cardkit:card:read` `cardkit:card:write`
+   - ⚠️ **`im:message.group_msg` 是核心**:没它机器人只收 @ 自己的消息,拿不到群里其他对话。敏感权限要走审批,填用途后个人开发者通常秒过。
 3. **订阅事件**(事件与回调,拆两个子页):
    - **事件配置** 页:订阅方式选 **长连接** → 保存 → 添加事件 `im.message.receive_v1`(收群消息)
    - **回调配置** 页:订阅方式选 **长连接** → 保存 → 添加事件 `card.action.trigger`(卡片按钮回调)
