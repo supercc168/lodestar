@@ -18,7 +18,6 @@ export {
   summarizeToolInput,
   mainConversationCard,
   assistantSegmentElement,
-  thinkingCollapsedPanel,
   toolCallElement,
   readBatchElement,
   toolCallPermissionElement,

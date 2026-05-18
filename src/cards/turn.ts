@@ -155,17 +155,39 @@ interface MainCardOpts {
   turn: number
   model?: string
   effort?: string
-  /** What started this turn. `'scheduled'` adds a top-of-card banner so
-   * the user can tell a cron-fired wakeup apart from one of their own
-   * messages — the user's message bubble is otherwise the only visual
-   * cue, and scheduled turns have no preceding bubble in the chat. */
-  kind?: 'user_message' | 'scheduled'
+  /** What started this turn:
+   *   'user_message' — user input batch(panel "📥 收到 (N)" 渲染原文)
+   *   'scheduled'    — cron / ScheduleWakeup 自发开 turn(banner `⏰ 触发`)
+   *   'auto_retry'   — SDK error subtype 后 daemon 自动 sendUserText('继续')
+   *                   触发的续 turn(banner `🔁 SDK 错误自动续`,无 panel) */
+  kind?: 'user_message' | 'scheduled' | 'auto_retry'
+  /** 本轮 SDK 收到的 user wireText 列表。boot turn 通常是 1 条;mid-turn
+   * 用户连发的 N 条会在下一 turn 一并塞进。空数组 / undefined 时不渲染
+   * userInput panel(scheduled / cron-fired turn 没 user input)。 */
+  userInputs?: string[]
 }
 
 /** Initial card sent at the start of each turn. Streaming on. */
 export function mainConversationCard(opts: MainCardOpts): object {
   const banner = opts.kind === 'scheduled'
     ? [{ tag: 'markdown', content: '⏰ 触发' }]
+    : opts.kind === 'auto_retry'
+    ? [{ tag: 'markdown', content: '🔁 SDK 错误自动续' }]
+    : []
+  const inputs = opts.userInputs ?? []
+  const userInputPanel = inputs.length > 0
+    ? [{
+        tag: 'collapsible_panel',
+        element_id: ELEMENTS.userInput,
+        header: { title: { tag: 'plain_text', content: `📥 收到 (${inputs.length})` } },
+        expanded: false,
+        elements: inputs.map(text => ({
+          tag: 'markdown',
+          // Markdown 里 < > 这些字符在 Card Kit 渲染里会被解析,转一下避免
+          // 用户输入里的 `<u>tag</u>` / HTML 之类被当结构吞掉。
+          content: text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+        })),
+      }]
     : []
   return {
     schema: '2.0',
@@ -179,16 +201,19 @@ export function mainConversationCard(opts: MainCardOpts): object {
       },
     },
     body: {
-      // Initial body has just thinking + footer; assistant segments and tool
-      // panels are inserted between them in real time as Claude streams.
-      // Note: empty-string content is rejected by CardKit PUT so the
-      // thinking element starts with a single space placeholder; the first
-      // real append overwrites it. No echo of the user's message inside
-      // the card — the chat bubble above already shows it.
+      // Initial body: [scheduled banner?] + [userInput panel?] + ticker
+      // (活体指示) + footer。assistant segments 和 tool panels insert_before
+      // footer 在 Claude streaming 时实时插入。
+      // 空字符串会被 CardKit PUT 拒,所以两个占位都用单空格;首条真写入
+      // 自动覆盖。footer 留单空格而不是 `⏳ working…` —— 顶部 ticker 已经
+      // 在"模型还在干活"这件事上做活体指示了,底部再喊一遍冗余且突兀。
+      // closeTurnCard 收尾时会 streamText 写真正的最终态 (`✅ 12.3s · 💰 $0.05`
+      // 之类)。
       elements: [
         ...banner,
-        { tag: 'markdown', element_id: ELEMENTS.thinking, content: ' ' },
-        { tag: 'markdown', element_id: ELEMENTS.footer, content: '⏳ working…' },
+        ...userInputPanel,
+        { tag: 'markdown', element_id: ELEMENTS.ticker, content: ' ' },
+        { tag: 'markdown', element_id: ELEMENTS.footer, content: ' ' },
       ],
     },
   }
@@ -197,22 +222,6 @@ export function mainConversationCard(opts: MainCardOpts): object {
 /** Empty assistant segment to be inserted just before the footer. */
 export function assistantSegmentElement(i: number): object {
   return { tag: 'markdown', element_id: ELEMENTS.assistant(i), content: ' ' }
-}
-
-/** Final state for the thinking section once a turn closes — collapse the
- * full thinking text into a panel so the card stays clean.  Replaces the
- * top-level `thinking` markdown element via PUT /elements/:id. */
-export function thinkingCollapsedPanel(fullText: string): object {
-  const trimmed = fullText.trim()
-  return {
-    tag: 'collapsible_panel',
-    element_id: ELEMENTS.thinking,
-    header: { title: { tag: 'plain_text', content: `💭 思考过程 (${trimmed.length} 字)` } },
-    expanded: false,
-    elements: [
-      { tag: 'markdown', content: trimmed.slice(0, 8000) || '_(空)_' },
-    ],
-  }
 }
 
 /** Element to insert for each tool call. Expandable for big results.

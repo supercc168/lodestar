@@ -33,6 +33,23 @@ export type { SessionOpts } from './session-types'
 
 const SEND_MARKER_RE = /\[\[send:\s*([^\]\n]+?)\s*\]\]/g
 
+/** "模型还在干活" 顶部 ticker 的备选动词。turn 起来时随机选一个、整 turn
+ * 固定不变,setInterval 每 TICKER_TICK_MS (1s) 跑一次,只刷经过秒数 ——
+ * 比让 verb 轮播视觉更稳。opus-4-7 上 extended thinking 走 redacted、
+ * 客户端拿不到明文 thinking,这个 ticker 就是 redacted-thinking 阶段
+ * 唯一的活体信号。 */
+const TICKER_VERBS = [
+  '🤔 推敲',
+  '💭 琢磨',
+  '🧐 端详',
+  '🔍 钻研',
+  '✨ 构思',
+  '🧠 凝神',
+  '📐 推演',
+  '🎯 锁定',
+]
+const TICKER_TICK_MS = 1000
+
 export class Session {
   /** Process-wide registry of every Session ever constructed in this daemon.
    * Used by the `hi` console panel to enumerate sibling sessions across
@@ -113,7 +130,14 @@ export class Session {
    * claude-code issue #39632). Buffering also keeps mid-turn msgs out
    * of any AskUserQuestion `QUEUE remove` storm, since they were never
    * in the SDK queue to begin with. */
-  private pendingMidTurnMsgs: Array<{ wireText: string; files: string[]; userOpenId: string; msgId: string }> = []
+  private pendingMidTurnMsgs: Array<{ text: string; wireText: string; userOpenId: string; msgId: string }> = []
+  /** 下一个 turn 的 user inputs 暂存区。所有 sendUserText 的 wireText 在
+   * sendUserText 之前 push 这里;openTurnCard 创建 turn 时一次性取走 + clear。
+   * mainConversationCard 把这些 wireText 渲染成顶部"📥 收到 (N)"折叠面板,
+   * 让用户在卡片自己里就能看到这一轮触发了什么(不必滚群里找原消息)。
+   * mid-turn buffer 的消息不在这里 push —— 它们走 drainMidTurnAndOpen 那条
+   * 路径,drain 时统一 push。 */
+  private pendingTurnInputs: string[] = []
   /** Most recent userOpenId seen via `onUserMessage`. Used only when a
    * merged batch fires its init event and the daemon needs *some* open_id
    * to scope the eventual `urgent_app` push — there's no obviously right
@@ -162,6 +186,13 @@ export class Session {
    * and reset. Any natural-success turn OR user intervention
    * (mid-turn buffer drain) resets this back to 0. */
   private consecutiveErrors = 0
+  /** 让 result handler 把"下一个 turn 不是普通 user_message"这件事透传
+   * 给 init handler / openTurnCard。当前只用于 SDK error 的 autoRetry
+   * 路径 —— sendUserText('继续') 触发的下一 init,daemon 这边知道这是
+   * 续 turn 而不是真用户消息,openTurnCard 用 'auto_retry' kind 出
+   * `🔁 SDK 错误自动续` banner、不渲染 "📥 收到" panel。一次性使用,
+   * 决定 trigger 后立即 reset null。 */
+  private nextOpenKind: 'auto_retry' | null = null
   // Last seen sessionId — preserved across `kill`/`stop` so a later
   // `restart` can resume the same Claude conversation even after the
   // child process is gone.
@@ -285,9 +316,12 @@ export class Session {
     const proc = this.proc
     this.lastSessionId = proc.sessionId ?? this.lastSessionId
     this.proc = null
+    this.stopTicker(this.currentTurn)
     this.currentTurn = null
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
+    this.pendingTurnInputs = []
+    this.nextOpenKind = null
     this.lastUserOpenId = ''
     this.releaseAllReactions()
     this.initCount = 0
@@ -306,9 +340,12 @@ export class Session {
       await this.proc.kill()
       this.proc = null
     }
+    this.stopTicker(this.currentTurn)
     this.currentTurn = null
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
+    this.pendingTurnInputs = []
+    this.nextOpenKind = null
     this.lastUserOpenId = ''
     this.releaseAllReactions()
     this.initCount = 0
@@ -382,19 +419,26 @@ export class Session {
         // and stamp a CrossMark (explicit cancelled state, distinct from
         // a natural release where reactions just disappear). Cancelled
         // mid-batch msgs get the same treatment.
+        // 用 `seen` Set 去重 —— mid-turn buffer 跟 pendingReactionIds 的
+        // msgId 重叠(onUserMessage 进 buffer 时同时 trackReaction),
+        // 两次 addReaction(CrossMark) 会在飞书侧渲染两个 ❌ (P0-1)。
+        const seen = new Set<string>()
         for (const [msgId, rid] of [
           ...this.pendingReactionIds.entries(),
           ...this.currentBatchReactionIds.entries(),
         ]) {
           if (rid) void feishu.deleteReaction(msgId, rid)
           void feishu.addReaction(msgId, 'CrossMark')
+          seen.add(msgId)
         }
         // Mid-turn buffer never reached SDK — cancel those too.
         for (const msg of this.pendingMidTurnMsgs) {
-          if (msg.msgId) void feishu.addReaction(msg.msgId, 'CrossMark')
+          if (msg.msgId && !seen.has(msg.msgId)) void feishu.addReaction(msg.msgId, 'CrossMark')
         }
         this.pendingUserMessageCount = 0
         this.pendingMidTurnMsgs = []
+        this.pendingTurnInputs = []
+        this.nextOpenKind = null
         this.lastUserOpenId = ''
         this.pendingReactionIds = new Map()
         this.currentBatchReactionIds = new Map()
@@ -561,7 +605,16 @@ export class Session {
     // Only the very first solo message of a fresh SDK turn slot
     // skips the wrap — no sibling, no merge, no need. Contract
     // declared in CHANNEL_INSTRUCTIONS.
-    const wireText = wasBusy ? `<u>${text}</u>` : text
+    //
+    // File hint **inline 在 wireText 内部**,而不是依赖 sendUserText 把
+    // files 拼到 message 整体头部。原因:drainMidTurnAndOpen merge N 条
+    // wireText 时,若 files 还按整体拼接 → 所有 file hint 全堆在 long
+    // message 开头、N 个 `<u>...</u>` 在后面,模型分不清哪个文件配哪条
+    // (P1-1 02:22 现场实证)。inline 后每条 sub-message 自带 file hint,
+    // SDK side 所有 sendUserText 调用 files 一律传空。
+    const filePrefix = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n' : ''
+    const body = filePrefix + text
+    const wireText = wasBusy ? `<u>${body}</u>` : body
 
     // Reaction helper: track the OneSecond reaction so deleteReaction can
     // clear it later. Use empty-string sentinel until addReaction returns.
@@ -589,7 +642,7 @@ export class Session {
       // so writing here would leave the msg stuck until the next user msg
       // arrives. Drain happens in the `result` handler, which both wakes
       // the SDK and opens a fresh card for the new batch turn.
-      this.pendingMidTurnMsgs.push({ wireText, files, userOpenId, msgId })
+      this.pendingMidTurnMsgs.push({ text, wireText, userOpenId, msgId })
       if (msgId) trackReaction(msgId)
       return
     }
@@ -608,9 +661,18 @@ export class Session {
     if (!this.openingTurn && this.initCount >= 1) {
       this.openingTurn = true
       try {
+        // openTurnCard 内部读 pendingTurnInputs 渲染 "📥 收到" panel,要在
+        // 它之前 push;之后再 sendUserText 给 SDK,顺序无关紧要(panel 是
+        // daemon 自渲染,跟 SDK input 流分离)。
+        // 真用户消息覆盖 autoRetry 意图 —— autoRetry 设的 nextOpenKind
+        // 在 SDK init 还没回来时被这条 eager-open 抢先开 turn,init handler
+        // 后续看到 currentTurn!=null 直接 return 不会消费 nextOpenKind,
+        // 不 reset 会 leak 到下下个 turn 错 stamp '🔁 SDK 错误自动续'。
+        this.nextOpenKind = null
+        this.pendingTurnInputs.push(text)
         await this.openTurnCard(userOpenId, 'user_message')
         if (!this.currentTurn) return
-        this.proc!.sendUserText(wireText, files)
+        this.proc!.sendUserText(wireText, [])
         this.pendingUserMessageCount++
         this.status = 'working'
       } finally {
@@ -619,10 +681,27 @@ export class Session {
       return
     }
 
-    // Non-eager path: either init hasn't fired yet (cold start) or a
-    // sibling onUserMessage is already opening. Feed SDK directly; the
-    // init handler / sibling card-opener will batch this message in.
-    this.proc!.sendUserText(wireText, files)
+    // Non-eager path 分两支:
+    //   A) openingTurn=true 或 pendingUserMessageCount>0 — sibling 在
+    //      openTurnCard,或者 cold-start 第一条 sendUserText 已经发出在
+    //      等 SDK init#1。两种情况下继续直接 sendUserText 都会让 SDK
+    //      把这条偷偷合并进 sibling 的 turn(或第一条触发的 cold-start
+    //      turn),但 panel input 已经被 snapshot 决定 → "内容跟响应不
+    //      一致"race(02:22 + 03:19 现场,以及 commit 2258af4 注释里的
+    //      cold-start "first write lands in idle SDK" empirical 行为)。
+    //      改成 mid-turn buffer 风格:不 sendUserText、不 push
+    //      pendingTurnInputs,等 sibling turn close 后由 result handler
+    //      的 midBuffer drain 走 merge 一致处理。
+    //   B) cold start 第一条 (initCount===0 且 pendingCount===0) — init
+    //      还没来,必须 sendUserText 喂 SDK 才能 wake;init handler 后续
+    //      触发 openTurnCard 时一次性消费 pendingTurnInputs。
+    if (this.openingTurn || this.pendingUserMessageCount > 0) {
+      this.pendingMidTurnMsgs.push({ text, wireText, userOpenId, msgId })
+      if (msgId) trackReaction(msgId)
+      return
+    }
+    this.pendingTurnInputs.push(text)
+    this.proc!.sendUserText(wireText, [])
     this.pendingUserMessageCount++
     if (wasBusy && msgId) {
       // Bootstrap race / sibling-opening race: until a card is open,
@@ -688,7 +767,16 @@ export class Session {
       const isUserBatch = this.pendingUserMessageCount > 0
       const isScheduledFire = !isUserBatch && this.initCount > 1
       if (!isUserBatch && !isScheduledFire) return
-      const userOpenId = isUserBatch ? this.lastUserOpenId : ''
+      // nextOpenKind 优先(目前只有 autoRetry 路径会设)。autoRetry 自己
+      // sendUserText('继续') + pendingCount++,所以 isUserBatch=true,但
+      // 我们要它出 `🔁 SDK 错误自动续` banner 而不是普通 user_message —
+      // 用 nextOpenKind 顶替。一次性,决定 trigger 后立即 reset。
+      const trigger: 'user_message' | 'scheduled' | 'auto_retry' =
+        this.nextOpenKind ?? (isUserBatch ? 'user_message' : 'scheduled')
+      this.nextOpenKind = null
+      // auto_retry 继承 lastUserOpenId(原 sender),让最终 success push
+      // 还能找到要 phone-notify 谁。scheduled 没 sender,留空。
+      const userOpenId = trigger === 'scheduled' ? '' : this.lastUserOpenId
       if (isUserBatch) {
         this.pendingUserMessageCount = 0
         // Inherit the queued reaction_ids — this turn is collectively
@@ -700,7 +788,7 @@ export class Session {
       this.openingTurn = true
       void (async () => {
         try {
-          await this.openTurnCard(userOpenId, isUserBatch ? 'user_message' : 'scheduled')
+          await this.openTurnCard(userOpenId, trigger)
           if (!this.currentTurn) {
             // SDK already started this turn (its `init` is what got us
             // here) but we have no card to render into. Interrupt so
@@ -721,9 +809,6 @@ export class Session {
     })
     p.on('assistant_text', ({ text }: { text: string }) => {
       this.appendAssistant(text)
-    })
-    p.on('thinking', ({ text }: { text: string }) => {
-      this.appendThinking(text)
     })
     p.on('tool_use', ({ id, name, input }: { id: string; name: string; input: any }) => {
       sessionTools.addTool(this, id, name, input)
@@ -795,17 +880,24 @@ export class Session {
         // pendingUserMessageCount makes the init handler classify the
         // resulting turn as user_message (inheriting lastUserOpenId)
         // rather than scheduled, so the eventual success will still
-        // phone-push the original sender.
+        // phone-push the original sender。同时把 nextOpenKind 设成
+        // 'auto_retry',让 init handler 触发的 openTurnCard 出
+        // `🔁 SDK 错误自动续` banner,用户能看出这是 daemon 自续的 turn
+        // 而不是凭空冒出一张普通卡片。
         this.proc?.sendUserText('继续')
         this.pendingUserMessageCount++
+        this.nextOpenKind = 'auto_retry'
       }
     })
     p.on('exit', ({ code, signal, expected }: any) => {
       log(`session "${this.sessionName}": claude exited code=${code} signal=${signal} expected=${expected}`)
       this.proc = null
+      this.stopTicker(this.currentTurn)
       this.currentTurn = null
       this.pendingUserMessageCount = 0
       this.pendingMidTurnMsgs = []
+      this.pendingTurnInputs = []
+      this.nextOpenKind = null
       this.lastUserOpenId = ''
       this.releaseAllReactions()
       this.initCount = 0
@@ -872,47 +964,69 @@ export class Session {
    * than deferring to init because the init for this batch will arrive
    * with `currentTurn` already set and bail.
    *
-   * Each sendUserText also bumps `pendingUserMessageCount`. The SDK
-   * USUALLY collapses our N writes into one merged turn, but **not
-   * always** — empirically observed 2026-05-17, test1 accumulator
-   * session: when the first write lands in an idle SDK (turn just
-   * ended), the SDK eagerly starts a turn for that msg alone, then
-   * merges the rest into a second turn. Without the bump here, that
-   * second turn fires an `init` with `pendingUserMessageCount === 0`
-   * and the init handler misclassifies it as a scheduled wakeup,
-   * painting the `⏰ 触发` banner on what is really a user batch. */
+   * N 条 wireText 用 `\n` join 成 **单条** sendUserText 发给 SDK,而不是
+   * N 次独立写。背景:SDK polling loop 在 turn 边界一次只 dequeue 一条
+   * user message 进 prompt(claude-code issue #39632),N 次独立写会让
+   * SDK 把第 1 条单独开 turn、剩 N-1 条进下一 turn —— daemon 这边 panel
+   * 在 openTurnCard 时已经 commit 了全部 N 条到 "前一个" turn,跟 SDK
+   * 实际 turn 边界错位(03:19 现场 turn=5 panel 7 条 vs 模型只看到 1 条
+   * "1 和 2 两条都收到了")。join 成单条后,SDK 看到 1 个 user message
+   * (内部含 N 个 `<u>...</u>` 子块),模型按 CHANNEL_INSTRUCTIONS 规约
+   * 拆解 N 条,panel 跟模型实际 input 一致。
+   *
+   * pendingCount 一次 ++(对应一次 sendUserText)。因为 SDK 不再拆 turn,
+   * commit 2258af4 当年用累加保护 spurious 第二 turn 的逻辑不再需要 —
+   * SDK 不会自发开 user_batch 子 turn,init handler 也不会误判 scheduled。 */
   private async drainMidTurnAndOpen(): Promise<void> {
     if (this.pendingMidTurnMsgs.length === 0) return
     const batch = this.pendingMidTurnMsgs
     this.pendingMidTurnMsgs = []
     this.openingTurn = true
     try {
+      // daemon-side state: panel inputs + reaction transfer。不走 sendUserText,
+      // SDK 那边由 join 后的单条统一处理。
       for (const msg of batch) {
-        this.proc!.sendUserText(msg.wireText, msg.files)
-        this.pendingUserMessageCount++
+        this.pendingTurnInputs.push(msg.text)
         if (msg.msgId) {
           const rid = this.pendingReactionIds.get(msg.msgId) ?? ''
           this.currentBatchReactionIds.set(msg.msgId, rid)
           this.pendingReactionIds.delete(msg.msgId)
         }
       }
+      // wireText 每条已经被 onUserMessage 处理过(`<u>${filePrefix}${text}</u>`),
+      // 每条 sub-message 自带 file hint —— SDK side files 一律传空,避免
+      // file ↔ message 归属丢失(P1-1)。join 用 `\n` 让边界视觉上也清楚
+      // (模型按 CHANNEL_INSTRUCTIONS 规约,`<u>1</u><u>2</u>` 拼在一起也
+      // 算独立消息,newline 只是更明显)。
+      const merged = batch.map(m => m.wireText).join('\n')
+      this.proc!.sendUserText(merged, [])
+      this.pendingUserMessageCount++
       const last = batch[batch.length - 1]
       const userOpenId = last?.userOpenId ?? this.lastUserOpenId
       await this.openTurnCard(userOpenId, 'user_message')
+      // 不动 pendingUserMessageCount;init handler 在 isUserBatch 路径
+      // 自己 reset。merge 之后 SDK 不拆 turn,不会再有空 user_message turn。
       this.status = 'working'
     } finally {
       this.openingTurn = false
     }
   }
 
-  private async openTurnCard(userOpenId: string, trigger: 'user_message' | 'scheduled'): Promise<void> {
+  private async openTurnCard(userOpenId: string, trigger: 'user_message' | 'scheduled' | 'auto_retry'): Promise<void> {
     const turn = ++this.turnCounter
-    log(`session "${this.sessionName}": openTurnCard turn=${turn} trigger=${trigger}`)
+    // Snapshot+clear pendingTurnInputs synchronously here so concurrent
+    // pushes between snapshot and the await don't sneak into THIS turn's
+    // panel (they'll be picked up by the next turn's open). scheduled
+    // turns clear too — they shouldn't carry stale inputs from prior runs.
+    const userInputs = this.pendingTurnInputs
+    this.pendingTurnInputs = []
+    log(`session "${this.sessionName}": openTurnCard turn=${turn} trigger=${trigger} inputs=${userInputs.length}`)
     const card = cards.mainConversationCard({
       sessionName: this.sessionName,
       turn,
       effort: 'max',
       kind: trigger,
+      userInputs: trigger === 'user_message' ? userInputs : [],
     })
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) {
@@ -937,12 +1051,11 @@ export class Session {
     let cardId: string
     try { cardId = await cardkit.convertMessageToCard(messageId) }
     catch (e) { log(`session "${this.sessionName}": id_convert failed: ${e}`); return }
-    this.currentTurn = {
+    const turnState: TurnState = {
       cardId,
       messageId,
       userOpenId,
       trigger,
-      thinkingText: '',
       toolCount: 0,
       toolByUseId: new Map(),
       readBatches: new Map(),
@@ -952,7 +1065,10 @@ export class Session {
       currentAssistantText: '',
       segmentTexts: new Map(),
       startedAt: Date.now(),
+      tickerHandle: null,
     }
+    this.currentTurn = turnState
+    this.startTicker(turnState)
   }
 
   // Stream-event handlers are intentionally SYNCHRONOUS. Every cardkit op
@@ -963,6 +1079,13 @@ export class Session {
   private appendAssistant(delta: string): void {
     if (!this.currentTurn) return
     const turn = this.currentTurn
+    // 第一条 assistant text_delta 到达 → 顶部 ticker 活体指示完成使命,
+    // 清掉;footer 切到 `⏳ working…` 接力做"还在干活"指示(跟顶部
+    // ticker 互斥:同一时刻只有一处亮)。后续 delta 跑时 ticker handle
+    // 已 null、stopTicker 短路;footer 的 streamThrottled 由 cardkit
+    // lastSent 自然去重,只 PUT 一次。
+    this.stopTicker(turn)
+    cardkit.streamTextThrottled(turn.cardId, cards.ELEMENTS.footer, '⏳ working…')
     if (!turn.currentAssistantSegmentId) {
       // New assistant segment opens a visual break — any prior Read run
       // is now visually separated from future Reads, so close the batch
@@ -1000,14 +1123,40 @@ export class Session {
     cardkit.patchSummaryThrottled(turn.cardId, tail)
   }
 
-  private appendThinking(delta: string): void {
-    if (!this.currentTurn) return
-    this.currentTurn.thinkingText += delta
-    cardkit.streamTextThrottled(
-      this.currentTurn.cardId,
-      cards.ELEMENTS.thinking,
-      this.currentTurn.thinkingText,
-    )
+  /** 启动 ticker 元素的活体指示。turn 起来时随机选一个 verb,整 turn
+   * 固定不变,setInterval 每 TICKER_TICK_MS (1s) 跑一次,刷新经过秒数。
+   * 先 setInterval 再 render 是故意的 —— 同步首帧时 tickerHandle 已经
+   * set,render 内部的 handle 自检不会误短路;首帧后下一帧要等 1s,
+   * 视觉上 ticker 上来就有内容,无空白窗口。 */
+  startTicker(turn: TurnState): void {
+    if (turn.tickerHandle) return
+    const verb = TICKER_VERBS[Math.floor(Math.random() * TICKER_VERBS.length)]
+    const render = (): void => {
+      // 自检:clearInterval 不撤销已经被 V8 dispatch 进事件循环的那次
+      // callback。stopTicker 把 handle 置 null 后这里短路,避免漏一帧
+      // 把刚 deleteElement 的 ticker 又 replaceElement 回 verb 文本(此时
+      // ticker 元素不存在,PUT 会失败但污染日志)。
+      if (turn.tickerHandle == null) return
+      const elapsedS = Math.floor((Date.now() - turn.startedAt) / 1000)
+      void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.ticker, {
+        tag: 'markdown',
+        element_id: cards.ELEMENTS.ticker,
+        content: `_${verb}中… (${elapsedS}s)_`,
+      })
+    }
+    turn.tickerHandle = setInterval(render, TICKER_TICK_MS)
+    render()
+  }
+
+  /** 清掉 ticker 并把 ticker 元素从卡片上彻底删掉。调用方负责自己把
+   * footer 切到下一态(`⏳ working…` 或 `✅ ...`)。所有 turn 退出路径
+   * 都得调:首条 assistant_text、首个 tool_use、closeTurnCard、stop/
+   * restart/exit。允许 turn 为 null 让调用方少一道判断。 */
+  stopTicker(turn: TurnState | null): void {
+    if (!turn || !turn.tickerHandle) return
+    clearInterval(turn.tickerHandle)
+    turn.tickerHandle = null
+    void cardkit.deleteElement(turn.cardId, cards.ELEMENTS.ticker)
   }
 
   private async closeTurnCard(suffix?: string, opts: { forcePush?: boolean } = {}): Promise<void> {
@@ -1020,9 +1169,9 @@ export class Session {
     const turn = this.currentTurn
     if (!turn) return
     this.currentTurn = null
+    this.stopTicker(turn)
     const elapsed = ((Date.now() - turn.startedAt) / 1000).toFixed(1)
     const cardId = turn.cardId
-    const thinkingText = turn.thinkingText
     const segmentTexts = turn.segmentTexts
     await cardkit.flush(cardId)
 
@@ -1046,9 +1195,11 @@ export class Session {
       }
     }
 
-    if (thinkingText.trim()) {
-      await cardkit.replaceElement(cardId, cards.ELEMENTS.thinking, cards.thinkingCollapsedPanel(thinkingText))
-    }
+    // thinking 区不再 collapse 成 panel —— replaceElement 会把 typewriter
+    // 中段的内容整段换掉,飞书侧用户视觉上"中段消失"。partial 模式下
+    // thinkingText 已经在 turn 期间真 streaming 进飞书,turn 结束保留
+    // markdown 形态完整可见即可。代价是卡片会长一些,但比 typewriter
+    // 被截好得多。
     const sendNote = sendPaths.length ? ` · 📎 ${sendPaths.length}` : ''
     // State marker leads the footer (✅ for natural completion, or the
     // suffix verbatim for non-natural states like `🛑 打断`). The

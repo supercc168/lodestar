@@ -20,8 +20,7 @@ export interface TurnState {
    * finish on their own time and pinging the user would be noise,
    * not signal. Ask / permission urgents inside the turn still fire
    * regardless (those genuinely need attention even mid-schedule). */
-  trigger: 'user_message' | 'scheduled'
-  thinkingText: string
+  trigger: 'user_message' | 'scheduled' | 'auto_retry'
   toolCount: number
   /** `output` / `isError` are filled in by completeTool — kept on the
    * meta (instead of being thrown away after the first render) so a
@@ -59,6 +58,16 @@ export interface TurnState {
   // version, then post the files as separate Feishu messages.
   segmentTexts: Map<string, string>
   startedAt: number
+  /** "模型还在干活" 活体指示的 setInterval 句柄,turn 起来后挂上,
+   * 在卡片顶部 ticker 元素里每 1s 跳一次刷新经过秒数(verb 是 turn 起
+   * 时随机选的、整 turn 固定不变)。首条 assistant_text 或 tool_use
+   * 到达即 deleteElement(ticker),让卡片顶部干净。
+   *
+   * 跟"thinking 文本"无关 —— Anthropic 把 opus-4-7 的 extended thinking
+   * 整段 redacted,客户端只拿到加密 signature 没明文,所以飞书卡片
+   * 中段不会显示任何 thinking 文本,ticker 就是模型工作过程中唯一
+   * 可见的活体信号。 */
+  tickerHandle: ReturnType<typeof setInterval> | null
 }
 
 export type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'

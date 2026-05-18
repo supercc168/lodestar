@@ -20,6 +20,12 @@ export function todosArray(s: Session): cards.Todo[] {
 
 export function addTool(s: Session, toolUseId: string, name: string, input: any): void {
   if (!s.currentTurn) return
+  // 模型出第一个工具 → 顶部 ticker 活体指示完成使命,清掉;footer 切到
+  // `⏳ working…` 接力做"还在干活"的指示。stopTicker 后续调用 handle
+  // null 时短路,所以多次 tool_use 安全。footer 同样写入由 cardkit 的
+  // lastSent 自然去重,只会 PUT 一次。
+  s.stopTicker(s.currentTurn)
+  cardkit.streamTextThrottled(s.currentTurn.cardId, cards.ELEMENTS.footer, '⏳ working…')
   // Close current assistant segment (if any) so the tool panel renders
   // AFTER it in card body order. Flush queues the segment's last
   // buffered delta before the tool element is inserted.

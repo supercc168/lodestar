@@ -121,6 +121,15 @@ export class ClaudeProcess extends EventEmitter {
       '-p',
       '--input-format=stream-json',
       '--output-format=stream-json',
+      // Partial messages 让 assistant text 走真正的 streaming delta(SSE
+      // content_block_delta.text_delta),而不是等整个 assistant message 落地
+      // 后一次性整块 emit。没有这个 flag 时飞书 typewriter 要 30 秒才打完
+      // 一段长 assistant text,turn close 时 streaming_mode off 会让中段
+      // 卡死;加了之后 token-level 同步流出,跟 TUI 体感一致。
+      // 注:opus-4-7 的 extended thinking 是 redacted,客户端只拿得到
+      // signature_delta 加密签名、没有 thinking_delta 明文,partial flag
+      // 解不开;ticker 元素就是用来补这段视觉空白的。
+      '--include-partial-messages',
       '--verbose',
       '--permission-prompt-tool=stdio',
       `--permission-mode=${opts.permissionMode ?? 'default'}`,
@@ -226,15 +235,38 @@ export class ClaudeProcess extends EventEmitter {
       this.emit('control_response', msg)
       return
     }
+    if (type === 'stream_event') {
+      // --include-partial-messages 打开后,SDK 把 Anthropic SSE 的
+      // content_block_delta 逐条转成 NDJSON 行,wrap 在 stream_event 类型
+      // 里。我们只关心 text_delta —— tool_use 是整块 atomic 的,等 assistant
+      // message 终态再 emit 才有 input 全文。
+      // signature_delta 是 opus-4-7 redacted thinking 的加密签名,客户端
+      // 拿到也用不上,silent skip。input_json_delta 是 tool_use 的 input
+      // streaming,等 assistant message 整块再处理,这里也 skip。
+      // thinking_delta 故意 *不* 加白名单 —— 若哪天 Anthropic 解开 redacted、
+      // 真发明文 thinking 过来,落进 unhandled 报警一眼可见,我们再决定接不接。
+      const ev = msg.event
+      if (ev?.type === 'content_block_delta') {
+        const delta = ev.delta
+        if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
+          this.emit('assistant_text', { uuid: msg.uuid, text: delta.text })
+        } else if (delta?.type && delta.type !== 'signature_delta' && delta.type !== 'input_json_delta' && delta.type !== 'citations_delta') {
+          log(`claude-process: unhandled content_block_delta type=${delta.type}`)
+        }
+      }
+      return
+    }
     if (type === 'assistant') {
+      // partial 模式下 text 已经走 stream_event.text_delta 流过,这里只
+      // 处理 tool_use(它没 partial delta,只在 message 终态出现完整 input)。
+      // thinking block 的 thinking 字段也在 message 终态里,但 opus-4-7
+      // 是 redacted 恒空,且即便有明文我们也不渲染(见 stream_event 的
+      // thinking_delta 注释),直接 ignore。usage / model / uuid 仍然在
+      // 这里记录 —— 它们是 message 终态字段,stream_event 不带。
       const content = msg.message?.content ?? []
       for (const block of content) {
-        if (block.type === 'text' && typeof block.text === 'string') {
-          this.emit('assistant_text', { uuid: msg.uuid, text: block.text })
-        } else if (block.type === 'tool_use') {
+        if (block.type === 'tool_use') {
           this.emit('tool_use', { uuid: msg.uuid, id: block.id, name: block.name, input: block.input })
-        } else if (block.type === 'thinking' && typeof block.thinking === 'string') {
-          this.emit('thinking', { uuid: msg.uuid, text: block.thinking })
         }
       }
       if (msg.message?.usage) this.lastUsage = msg.message.usage as ClaudeUsage
