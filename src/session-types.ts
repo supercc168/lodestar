@@ -20,7 +20,7 @@ export interface TurnState {
    * finish on their own time and pinging the user would be noise,
    * not signal. Ask / permission urgents inside the turn still fire
    * regardless (those genuinely need attention even mid-schedule). */
-  trigger: 'user_message' | 'scheduled' | 'auto_retry'
+  trigger: 'user_message' | 'scheduled' | 'auto_retry' | 'no_followup_retry'
   toolCount: number
   /** `output` / `isError` are filled in by completeTool — kept on the
    * meta (instead of being thrown away after the first render) so a
