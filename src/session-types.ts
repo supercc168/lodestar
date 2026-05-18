@@ -68,6 +68,13 @@ export interface TurnState {
    * 中段不会显示任何 thinking 文本,ticker 就是模型工作过程中唯一
    * 可见的活体信号。 */
   tickerHandle: ReturnType<typeof setInterval> | null
+  /** Mid-turn card-rotation lock. Set when this turn's current card is
+   * close to Feishu's per-card element cap (~100; we soft-trigger at 80)
+   * and we've fire-and-forget kicked off `startMidTurnRotate` to open a
+   * fresh card. Stays set until rotation completes so concurrent stream
+   * handlers don't all queue duplicate rotation attempts. null means
+   * "no rotation in flight; element-count check may trigger a new one". */
+  rotating: Promise<void> | null
 }
 
 export type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'

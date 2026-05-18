@@ -2,12 +2,21 @@
 /**
  * Replay messages into the running daemon as if Feishu WS had
  * delivered them. The daemon's unix socket (DEBUG_SOCK_FILE) takes
- * `{text}` JSON and routes it through the real `handleMessage` path.
+ * `{text}` JSON, **really posts the text to the seeded chat** as
+ * `【自动化测试】:<text>` (so the bot's outbound reaction / cardkit
+ * calls get a real Feishu message_id — synthetic `om_DEBUG_*` ids
+ * used to 400 the reactions API and pollute the developer-portal
+ * error log), then routes through the real `handleMessage` path
+ * with `content.text` = the **original** text (the
+ * `【自动化测试】` prefix is only for group-member visibility, not
+ * fed to claude).
  *
  * One-time seeding: from the target Feishu group, send a single
  * `[DEBUG]hi` (or `[DEBUG]<anything>`). The daemon captures that
  * chat_id + sender_open_id to DEBUG_CTX_FILE; subsequent injections
- * reuse it without touching Feishu.
+ * reuse it. Note that injections **do** post to Feishu now — every
+ * inject creates a visible group message (cost: a Feishu API quota
+ * tick + a chat-room ping for group members).
  *
  * Usage:
  *   bun scripts/test-inject.ts "hi"                  # one message

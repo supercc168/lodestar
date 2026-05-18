@@ -404,21 +404,35 @@ function startDebugSocket(): void {
         }
         const text: string = String(body.text ?? '')
         if (!text) return new Response('text required', { status: 400 })
-        const fakeMsgId = `om_DEBUG_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`
+        // 把 inject 内容**真发到目标群**,带"【自动化测试】"前缀让群成员
+        // 一眼能区分。拿飞书返回的真 message_id 再构造 event 灌
+        // handleMessage:
+        //   - msg_id 是真的 → 后续 addReaction / 其它 outbound 不再因
+        //     `om_DEBUG_*` 合成 id 报 99992354 污染飞书侧错误日志。
+        //   - daemon 看到的 content.text 是**原始 text**(不含前缀),
+        //     claude 那头不会被"【自动化测试】"标签干扰。
+        //   - bot 自己发的消息默认不通过 receive_v1 回环(飞书协议层防
+        //     死循环),daemon 只通过这条 inject 路径看到一份消息,不会
+        //     重复触发 handleMessage。
+        const flaggedText = `【自动化测试】:${text}`
+        const realMsgId = await feishu.sendText(ctx.chat_id, flaggedText)
+        if (!realMsgId) {
+          return new Response('sendText failed — see daemon log', { status: 502 })
+        }
         const payload = {
           sender: { sender_id: { open_id: ctx.sender_open_id } },
           message: {
-            message_id: fakeMsgId,
+            message_id: realMsgId,
             chat_id: ctx.chat_id,
             message_type: 'text',
             content: JSON.stringify({ text }),
             create_time: String(Date.now()),
           },
         }
-        log(`debug: inject text=${JSON.stringify(text).slice(0, 80)} fake_id=${fakeMsgId}`)
+        log(`debug: inject text=${JSON.stringify(text).slice(0, 80)} msg_id=${realMsgId}`)
         // Don't await — match real WS dispatcher behavior (fire-and-forget per event).
         handleMessage(payload).catch(e => log(`debug: handleMessage rejected: ${e}`))
-        return new Response(JSON.stringify({ ok: true, fake_msg_id: fakeMsgId }), {
+        return new Response(JSON.stringify({ ok: true, msg_id: realMsgId }), {
           headers: { 'content-type': 'application/json' },
         })
       },

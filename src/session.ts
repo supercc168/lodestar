@@ -50,6 +50,15 @@ const TICKER_VERBS = [
 ]
 const TICKER_TICK_MS = 1000
 
+/** Soft cap on element count per Feishu card before we proactively
+ * rotate to a fresh one. The hard ceiling is ~100 (Feishu rejects
+ * additional `POST /elements` with code=300305/300315 once a card has
+ * ~100 elements); rotating at 80 keeps a 20% headroom for in-flight
+ * stream handlers that already chose the old cardId before this check
+ * fired (cardkit's per-card queue may still drain a few more adds onto
+ * the soft-closed card before turn.cardId swap takes effect). */
+const CARD_ELEMENT_SOFT_LIMIT = 80
+
 export class Session {
   /** Process-wide registry of every Session ever constructed in this daemon.
    * Used by the `hi` console panel to enumerate sibling sessions across
@@ -1051,6 +1060,15 @@ export class Session {
     let cardId: string
     try { cardId = await cardkit.convertMessageToCard(messageId) }
     catch (e) { log(`session "${this.sessionName}": id_convert failed: ${e}`); return }
+    // Tell cardkit how many elements the initial body already has so
+    // its element-count tracker is correct from the first addElement
+    // onwards (banner + userInputPanel + ticker + footer — the latter
+    // two are constant, the former two depend on trigger / userInputs).
+    const initialElementCount =
+      (trigger === 'scheduled' || trigger === 'auto_retry' ? 1 : 0) +
+      (trigger === 'user_message' && userInputs.length > 0 ? 1 : 0) +
+      2
+    cardkit.recordCardCreated(cardId, initialElementCount)
     const turnState: TurnState = {
       cardId,
       messageId,
@@ -1066,9 +1084,104 @@ export class Session {
       segmentTexts: new Map(),
       startedAt: Date.now(),
       tickerHandle: null,
+      rotating: null,
     }
     this.currentTurn = turnState
     this.startTicker(turnState)
+  }
+
+  /** Cheap synchronous check called from stream handlers right before
+   * they `addElement` a new tool / assistant segment / Read batch /
+   * etc. If the current card is close to Feishu's element ceiling and
+   * we haven't already kicked off a rotation, fire-and-forget start a
+   * `startMidTurnRotate` and let it run async on its own. The current
+   * stream handler still uses `turn.cardId` (the old card) for this
+   * iteration — that's fine because (a) cardkit's per-card queue keeps
+   * its writes ordered against the soft-close that's about to happen,
+   * and (b) the soft limit (80) leaves 20 elements of headroom under
+   * the hard cap (~100), so the in-flight adds either fit or are
+   * silently swallowed when the old card is disposed. */
+  maybeMidTurnRotate(): void {
+    const turn = this.currentTurn
+    if (!turn) return
+    if (turn.rotating) return
+    if (cardkit.getElementCount(turn.cardId) < CARD_ELEMENT_SOFT_LIMIT) return
+    this.startMidTurnRotate(turn)
+  }
+
+  /** Open a fresh card under the **same** SDK turn number to dodge
+   * Feishu's per-card element limit. The old card stays in the chat —
+   * we flip its footer to "📨 卡片满,转下一张", turn streaming off,
+   * and dispose its cardkit state — but it never becomes the writable
+   * one again. Everything tool/assistant-related on the turn state is
+   * reset so subsequent stream handlers wire up against the new card
+   * cleanly; in-flight tool calls whose results land *after* rotation
+   * lose their old element ids and re-emerge as fresh tool panels on
+   * the new card (acceptable: the user already saw "⏳" frozen on the
+   * old card, the new panel makes the result visible somewhere). */
+  private startMidTurnRotate(turn: TurnState): void {
+    if (turn.rotating) return
+    const oldCardId = turn.cardId
+    turn.rotating = (async () => {
+      try {
+        log(`session "${this.sessionName}": mid-turn rotate triggered card=${oldCardId.slice(0, 8)}… elementCount=${cardkit.getElementCount(oldCardId)}`)
+        const card = cards.mainConversationCard({
+          sessionName: this.sessionName,
+          turn: this.turnCounter,
+          effort: 'max',
+          kind: 'card_full',
+          userInputs: [],
+        })
+        const newMessageId = await feishu.sendCard(this.chatId, card)
+        if (!newMessageId) {
+          log(`session "${this.sessionName}": mid-turn rotate sendCard EXHAUSTED — staying on old card,subsequent adds will drop`)
+          await feishu.sendTextRaw(
+            this.chatId,
+            '⚠️ 卡片元素超出飞书上限,本轮后续输出仅日志可见(开新卡失败)。',
+          )
+          return
+        }
+        let newCardId: string
+        try { newCardId = await cardkit.convertMessageToCard(newMessageId) }
+        catch (e) {
+          log(`session "${this.sessionName}": mid-turn rotate id_convert failed: ${e}`)
+          return
+        }
+        // card_full body has banner(1) + ticker(1) + footer(1) = 3 elements.
+        cardkit.recordCardCreated(newCardId, 3)
+        // 同步 swap：从这一行起,后续 stream handler 看到的 turn.cardId
+        // 是新卡。reset 所有 element-id 引用 (toolCount / assistantSegmentCount
+        // 等),旧卡上的 element_id 在新卡里查不到,继续 PUT 会 300313。
+        this.stopTicker(turn)
+        turn.cardId = newCardId
+        turn.messageId = newMessageId
+        turn.toolCount = 0
+        turn.toolByUseId = new Map()
+        turn.readBatches = new Map()
+        turn.openReadBatchI = null
+        turn.assistantSegmentCount = 0
+        turn.currentAssistantSegmentId = null
+        turn.currentAssistantText = ''
+        turn.segmentTexts = new Map()
+        this.startTicker(turn)
+        // 旧卡收尾:footer 红字 + streaming_off + dispose。放到 swap 后
+        // 是因为这条链是 async,期间 cardkit 队列上还可能有 stream
+        // handler enqueue 的 streamText / replaceElement 等;让它们排
+        // 在 footer 之前先 flush,视觉更连贯。
+        try {
+          await cardkit.flush(oldCardId)
+          await cardkit.streamText(oldCardId, cards.ELEMENTS.footer, '📨 卡片满,转下一张 ↓')
+          cardkit.cancelSummary(oldCardId)
+          await cardkit.patchSettings(oldCardId, cards.streamingOffSettings({ suffix: '📨 卡片满' }))
+          await cardkit.dispose(oldCardId)
+        } catch (e) {
+          log(`session "${this.sessionName}": mid-turn rotate close-old failed: ${e}`)
+        }
+        log(`session "${this.sessionName}": mid-turn rotate done old=${oldCardId.slice(0, 8)}… new=${newCardId.slice(0, 8)}…`)
+      } finally {
+        turn.rotating = null
+      }
+    })()
   }
 
   // Stream-event handlers are intentionally SYNCHRONOUS. Every cardkit op
@@ -1091,6 +1204,14 @@ export class Session {
       // is now visually separated from future Reads, so close the batch
       // window. Future Reads will start a fresh batch at a new i.
       turn.openReadBatchI = null
+      // Pre-empt the "element exceeds the limit" 300305/300315 cliff —
+      // if the card's element count is approaching Feishu's cap, fire-and-
+      // forget kick off a mid-turn rotation onto a fresh card. The
+      // *current* addElement still goes to turn.cardId (the old card)
+      // and either fits within the headroom or fails silently; the
+      // rotation handler resets turn state once the new card is up so
+      // subsequent stream handlers see the new cardId.
+      this.maybeMidTurnRotate()
       const i = turn.assistantSegmentCount++
       const segId = cards.ELEMENTS.assistant(i)
       turn.currentAssistantSegmentId = segId

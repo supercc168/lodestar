@@ -31,6 +31,16 @@ interface CardState {
   buffer: Map<string, string>          // element_id → latest full text
   lastSent: Map<string, string>        // element_id → text last actually PUT
   flushTimer: ReturnType<typeof setTimeout> | null
+  /** Live count of elements on the card. Initialised by
+   * `recordCardCreated` (session passes the body.elements.length of the
+   * just-sent card), then incremented in addElement's success branch and
+   * decremented in deleteElement's. Used by session to pre-empt the
+   * cardkit "element exceeds the limit" (300305/300315) ceiling — once
+   * the count climbs into the danger zone, session rotates a new card
+   * mid-turn before the next addElement would 400. Approximate (a failed
+   * addElement won't bump it, so the count tracks "elements Feishu
+   * believes exist" not "elements we tried to create"). */
+  elementCount: number
 }
 
 const cards = new Map<string, CardState>()
@@ -52,10 +62,29 @@ function state(cardId: string): CardState {
       buffer: new Map(),
       lastSent: new Map(),
       flushTimer: null,
+      elementCount: 0,
     }
     cards.set(cardId, s)
   }
   return s
+}
+
+/** Session calls this once right after sendCard + convertMessageToCard,
+ * passing the number of elements that were in the card's initial body
+ * (banner + userInputPanel + ticker + footer = 2–4 depending on turn
+ * kind). Without this, the element-count tracker only sees adds/deletes
+ * that happen *after* card creation, and session can't reliably decide
+ * "is this card close to the limit?" — that's the data point that
+ * triggers a mid-turn rotate to dodge `code=300305/300315`. */
+export function recordCardCreated(cardId: string, initialElementCount: number): void {
+  state(cardId).elementCount = initialElementCount
+}
+
+/** Read the live element count maintained by addElement/deleteElement.
+ * Returns 0 if the card has no state yet (which is also the right answer
+ * for "this card has no elements that we know about"). */
+export function getElementCount(cardId: string): number {
+  return cards.get(cardId)?.elementCount ?? 0
 }
 
 function nextSeq(cardId: string): number {
@@ -237,6 +266,10 @@ export function addElement(
         elements: JSON.stringify([element]),
         sequence: seq,
       })
+      // Only bump after the API returns 0 — a 300305/300315 throw will
+      // bypass this line, so the count tracks "elements Feishu actually
+      // accepted" not "elements we tried to push".
+      s.elementCount += 1
     },
     onFailure,
   ))
@@ -271,6 +304,7 @@ export function deleteElement(cardId: string, elementId: string): Promise<void> 
       await call('DELETE', `/cards/${cardId}/elements/${elementId}`, {
         sequence: seq,
       })
+      s.elementCount = Math.max(0, s.elementCount - 1)
     },
   ))
   return s.queue

@@ -20,6 +20,11 @@ export function todosArray(s: Session): cards.Todo[] {
 
 export function addTool(s: Session, toolUseId: string, name: string, input: any): void {
   if (!s.currentTurn) return
+  // 元素接近上限时 fire-and-forget kick off mid-turn rotation。check 是
+  // O(1) 的(只查 cardkit 内部计数 Map),即使 in-batch Read 续走 replace
+  // 路径不会 +1 element,也无害 —— maybeMidTurnRotate 看到 count 没到
+  // 阈值会直接 return。
+  s.maybeMidTurnRotate()
   // 模型出第一个工具 → 顶部 ticker 活体指示完成使命,清掉;footer 切到
   // `⏳ working…` 接力做"还在干活"的指示。stopTicker 后续调用 handle
   // null 时短路,所以多次 tool_use 安全。footer 同样写入由 cardkit 的
