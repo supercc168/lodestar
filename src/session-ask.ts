@@ -167,5 +167,5 @@ export function finalizeAsk(s: Session, toolUseId: string): void {
   // flag 还在(没被 assistant_text / tool_use 清掉)就自动 sendUserText('继续')
   // poke 一下。SDK 合成的 AskUserQuestion tool_result 不清这个 flag —— 它
   // 是 SDK 把答案塞给模型的回环,不算"模型已 followup"的证据。
-  s.awaitingFollowup = true
+  s.awaitingFollowup = 'ask'
 }

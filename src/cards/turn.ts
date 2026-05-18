@@ -160,15 +160,19 @@ interface MainCardOpts {
    *   'scheduled'    — cron / ScheduleWakeup 自发开 turn(banner `⏰ 触发`)
    *   'auto_retry'   — SDK error subtype 后 daemon 自动 sendUserText('继续')
    *                   触发的续 turn(banner `🔁 SDK 错误自动续`,无 panel)
-   *   'no_followup_retry' — turn 结束时最后一项是 tool_result(is_error) 或
-   *                   已答完的 AskUserQuestion,但模型没继续推理就 end_turn
-   *                   (SDK bug 兜底),daemon sendUserText('继续') 触发的续
-   *                   turn(banner `🔁 答完没下文,自动续`,无 panel)
+   *   'no_followup_retry' — turn 结束时最后一项是已答完的 AskUserQuestion,
+   *                   但模型没继续推理就 end_turn(SDK bug 兜底),
+   *                   daemon sendUserText('继续') 触发的续 turn
+   *                   (banner `🔁 答完没下文,自动续`,无 panel)
+   *   'tool_error_retry' — turn 结束时最后一项是 tool_result(is_error),
+   *                   模型没解释 / 没重试直接 end_turn(SDK bug 兜底),
+   *                   daemon sendUserText('继续') 触发的续 turn
+   *                   (banner `🛠️ 工具出错异常终止,自动续`,无 panel)
    *   'card_full'    — 同一 SDK turn 的"续卡":前一张卡的 element 数
    *                   接近飞书上限(~100),session 主动 rotate 出来的新
    *                   卡(banner `📨 接续上一张`,无 panel,turn 号跟旧卡
    *                   相同) */
-  kind?: 'user_message' | 'scheduled' | 'auto_retry' | 'no_followup_retry' | 'card_full'
+  kind?: 'user_message' | 'scheduled' | 'auto_retry' | 'no_followup_retry' | 'tool_error_retry' | 'card_full'
   /** 本轮 SDK 收到的 user wireText 列表。boot turn 通常是 1 条;mid-turn
    * 用户连发的 N 条会在下一 turn 一并塞进。空数组 / undefined 时不渲染
    * userInput panel(scheduled / cron-fired turn 没 user input)。 */
@@ -183,6 +187,8 @@ export function mainConversationCard(opts: MainCardOpts): object {
     ? [{ tag: 'markdown', content: '🔁 SDK 错误自动续' }]
     : opts.kind === 'no_followup_retry'
     ? [{ tag: 'markdown', content: '🔁 答完没下文,自动续' }]
+    : opts.kind === 'tool_error_retry'
+    ? [{ tag: 'markdown', content: '🛠️ 工具出错异常终止,自动续' }]
     : opts.kind === 'card_full'
     ? [{ tag: 'markdown', content: '📨 接续上一张(同一轮 SDK turn,前一张卡 element 已满)' }]
     : []

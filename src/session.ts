@@ -108,13 +108,17 @@ export class Session {
   currentTodos = new Map<number, cards.Todo>()
   /** SDK 偶尔在 turn 的最后一项是 tool_result(is_error=true) 或已答完
    * AskUserQuestion 时直接 end_turn 不让模型 followup。
-   * set 点: tool_result(is_error=true) handler + session-ask.finalizeAsk。
+   * set 点 + reason:
+   *   'ask'        — session-ask.finalizeAsk(AskUserQuestion 答完)
+   *   'tool_error' — tool_result(is_error=true) handler(Edit/Read/Bash 失败)
    * clear 点: assistant_text / tool_use handler 入口(模型还在动就归零)
    *   —— tool_result(is_error=false) 不清,SDK 自己合成的 AskUserQuestion
    *   tool_result 不算 followup 证据。
-   * result handler 看到这个 flag 仍为 true → sendUserText('继续') 续 turn,
-   * banner 写 `🔁 答完没下文,自动续`。一次性,result 里读完即 reset。 */
-  awaitingFollowup = false
+   * result handler 看到 flag 仍非 null → sendUserText('继续') 续 turn,
+   * banner / footer 文案按 reason 区分 —— 用户能直接读出来 turn 是
+   * 因为"答完没下文"还是"工具出错异常终止"被自动续的。
+   * 一次性,result 里读完即 reset。 */
+  awaitingFollowup: 'ask' | 'tool_error' | null = null
   status: Status = 'stopped'
 
   // ── strictly private state ──
@@ -210,7 +214,7 @@ export class Session {
    * 续 turn 而不是真用户消息,openTurnCard 用 'auto_retry' kind 出
    * `🔁 SDK 错误自动续` banner、不渲染 "📥 收到" panel。一次性使用,
    * 决定 trigger 后立即 reset null。 */
-  private nextOpenKind: 'auto_retry' | 'no_followup_retry' | null = null
+  private nextOpenKind: 'auto_retry' | 'no_followup_retry' | 'tool_error_retry' | null = null
   // Last seen sessionId — preserved across `kill`/`stop` so a later
   // `restart` can resume the same Claude conversation even after the
   // child process is gone.
@@ -346,7 +350,7 @@ export class Session {
     this.openingTurn = false
     this.pendingPermissions.clear()
     this.consecutiveErrors = 0
-    this.awaitingFollowup = false
+    this.awaitingFollowup = null
     this.status = 'stopped'
     await proc.kill()
     await feishu.sendText(this.chatId, `🔴 ${reason} (session: ${this.sessionName})`)
@@ -371,7 +375,7 @@ export class Session {
     this.openingTurn = false
     this.pendingPermissions.clear()
     this.consecutiveErrors = 0
-    this.awaitingFollowup = false
+    this.awaitingFollowup = null
     if (resume && prevSessionId) {
       this.proc = new ClaudeProcess({
         workDir: this.workDir,
@@ -791,7 +795,7 @@ export class Session {
       // sendUserText('继续') + pendingCount++,所以 isUserBatch=true,但
       // 我们要它出 `🔁 SDK 错误自动续` banner 而不是普通 user_message —
       // 用 nextOpenKind 顶替。一次性,决定 trigger 后立即 reset。
-      const trigger: 'user_message' | 'scheduled' | 'auto_retry' | 'no_followup_retry' =
+      const trigger: 'user_message' | 'scheduled' | 'auto_retry' | 'no_followup_retry' | 'tool_error_retry' =
         this.nextOpenKind ?? (isUserBatch ? 'user_message' : 'scheduled')
       this.nextOpenKind = null
       // auto_retry 继承 lastUserOpenId(原 sender),让最终 success push
@@ -831,12 +835,12 @@ export class Session {
       // 模型在说话 → 清 followup flag。如果上一项是 tool_result(error) 或
       // 已答完的 AskUserQuestion 留下的 flag,模型现在接上话/解释了,daemon
       // 不需要兜底 poke。
-      this.awaitingFollowup = false
+      this.awaitingFollowup = null
       this.appendAssistant(text)
     })
     p.on('tool_use', ({ id, name, input }: { id: string; name: string; input: any }) => {
       // 模型在出新工具 → 同样清 flag(典型场景:Edit 失败后模型自己重试)。
-      this.awaitingFollowup = false
+      this.awaitingFollowup = null
       sessionTools.addTool(this, id, name, input)
     })
     p.on('tool_result', ({ tool_use_id, content, is_error }: any) => {
@@ -844,7 +848,7 @@ export class Session {
       // (悄悄改完文件直接退),不该被 daemon 续。AskUserQuestion 的 SDK 合成
       // tool_result (is_error=false) 走这条路也命中"不动 flag",finalizeAsk
       // 早已把 flag set 成 true,正好保留到 result 里被检测。
-      if (is_error) this.awaitingFollowup = true
+      if (is_error) this.awaitingFollowup = 'tool_error'
       sessionTools.completeTool(this, tool_use_id, content, is_error)
     })
     p.on('can_use_tool', (req: CanUseToolRequest) => {
@@ -880,8 +884,12 @@ export class Session {
       // 一次性,读完即 reset,不会延续到下一 turn。优先级:hasMidTurn /
       // isError 都更高(用户介入或真错误时不走这条),所以这里只看
       // success 路径。
-      const noFollowupRetry = !hasMidTurn && !isError && this.awaitingFollowup
-      this.awaitingFollowup = false
+      // Snapshot reason 后再清:下面 suffix / nextOpenKind 都要按 reason 出
+      // 不同文案("答完没下文" vs "工具出错异常终止"),用户能直接读出
+      // turn 是因为哪个原因被自动续的。reset 在 snapshot 之后,保证一次性。
+      const followupReason = this.awaitingFollowup
+      this.awaitingFollowup = null
+      const noFollowupRetry = !hasMidTurn && !isError && followupReason !== null
 
       let suffix: string | undefined
       let autoRetry = false
@@ -907,13 +915,15 @@ export class Session {
         // flag 已 reset,如果模型这次仍不接续(罕见),要么再走 AskUserQuestion
         // 流程重新 set flag,要么 turn 是空 result/真错误,都不会无限循环。
         this.consecutiveErrors = 0
-        suffix = '⚠️ 答完没下文,自动续…'
+        suffix = followupReason === 'tool_error'
+          ? '⚠️ 工具出错异常终止,自动续…'
+          : '⚠️ 答完没下文,自动续…'
         autoRetry = true
       } else {
         this.consecutiveErrors = 0
       }
 
-      log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} midBuffer=${this.pendingMidTurnMsgs.length} consecErr=${this.consecutiveErrors} autoRetry=${autoRetry} noFollowup=${noFollowupRetry} forcePush=${forcePush}`)
+      log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} midBuffer=${this.pendingMidTurnMsgs.length} consecErr=${this.consecutiveErrors} autoRetry=${autoRetry} followup=${followupReason ?? 'none'} noFollowupRetry=${noFollowupRetry} forcePush=${forcePush}`)
       void this.closeTurnCard(suffix, { forcePush })
       this.status = 'idle'
 
@@ -927,13 +937,16 @@ export class Session {
         // resulting turn as user_message (inheriting lastUserOpenId)
         // rather than scheduled, so the eventual success will still
         // phone-push the original sender。同时把 nextOpenKind 设成
-        // 'auto_retry' / 'no_followup_retry',让 init handler 触发的
-        // openTurnCard 出对应 banner(`🔁 SDK 错误自动续` 或
-        // `🔁 答完没下文,自动续`),用户能看出这是 daemon 自续的 turn
-        // 而不是凭空冒出一张普通卡片。
+        // 'auto_retry' / 'no_followup_retry' / 'tool_error_retry',让 init
+        // handler 触发的 openTurnCard 出对应 banner(`🔁 SDK 错误自动续` /
+        // `🔁 答完没下文,自动续` / `🛠️ 工具出错异常终止,自动续`),用户
+        // 能看出这是 daemon 自续的 turn 而不是凭空冒出一张普通卡片,且能
+        // 直接读出续 turn 的原因。
         this.proc?.sendUserText('继续')
         this.pendingUserMessageCount++
-        this.nextOpenKind = noFollowupRetry ? 'no_followup_retry' : 'auto_retry'
+        this.nextOpenKind = noFollowupRetry
+          ? (followupReason === 'tool_error' ? 'tool_error_retry' : 'no_followup_retry')
+          : 'auto_retry'
       }
     })
     p.on('exit', ({ code, signal, expected }: any) => {
@@ -950,7 +963,7 @@ export class Session {
       this.initCount = 0
       this.openingTurn = false
       this.consecutiveErrors = 0
-      this.awaitingFollowup = false
+      this.awaitingFollowup = null
       this.status = 'stopped'
       if (!expected && code !== 0 && signal !== 'SIGTERM') {
         void feishu.sendText(this.chatId, `⚠️ Claude 异常退出 (code=${code}, signal=${signal})。回复任意消息将重新启动。`)
@@ -1060,7 +1073,7 @@ export class Session {
     }
   }
 
-  private async openTurnCard(userOpenId: string, trigger: 'user_message' | 'scheduled' | 'auto_retry' | 'no_followup_retry'): Promise<void> {
+  private async openTurnCard(userOpenId: string, trigger: 'user_message' | 'scheduled' | 'auto_retry' | 'no_followup_retry' | 'tool_error_retry'): Promise<void> {
     const turn = ++this.turnCounter
     // Snapshot+clear pendingTurnInputs synchronously here so concurrent
     // pushes between snapshot and the await don't sneak into THIS turn's
@@ -1104,7 +1117,7 @@ export class Session {
     // onwards (banner + userInputPanel + ticker + footer — the latter
     // two are constant, the former two depend on trigger / userInputs).
     const initialElementCount =
-      (trigger === 'scheduled' || trigger === 'auto_retry' || trigger === 'no_followup_retry' ? 1 : 0) +
+      (trigger === 'scheduled' || trigger === 'auto_retry' || trigger === 'no_followup_retry' || trigger === 'tool_error_retry' ? 1 : 0) +
       (trigger === 'user_message' && userInputs.length > 0 ? 1 : 0) +
       2
     cardkit.recordCardCreated(cardId, initialElementCount)
