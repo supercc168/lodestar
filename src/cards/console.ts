@@ -85,14 +85,16 @@ function fmtUptime(ms: number): string {
   return `${d}d ${h % 24}h`
 }
 
-/** Human-readable "time until" — null/past dates collapse to '已重置'. */
+/** Human-readable "time until" — null/past dates collapse to '已重置'.
+ * h/d 段保留 1 位小数(`2.3h` / `5.4d`),m 段已经是整数分钟精度
+ * 够细就不再加小数。 */
 function fmtResetIn(date: Date | null): string {
   if (!date) return '?'
   const ms = date.getTime() - Date.now()
   if (ms <= 0) return '已重置'
   if (ms < 60 * 60 * 1000) return `${Math.max(1, Math.round(ms / 60_000))}m`
-  if (ms < 24 * 60 * 60 * 1000) return `${Math.round(ms / (60 * 60 * 1000))}h`
-  return `${Math.round(ms / (24 * 60 * 60 * 1000))}d`
+  if (ms < 24 * 60 * 60 * 1000) return `${(ms / (60 * 60 * 1000)).toFixed(1)}h`
+  return `${(ms / (24 * 60 * 60 * 1000)).toFixed(1)}d`
 }
 
 /** Human-readable "time since" — clamps sub-minute values to "刚刚". */
@@ -124,7 +126,11 @@ export function consoleUsageContent(
   if (usage === undefined) return '**📊 订阅额度**　_加载中…_'
   switch (usage.state) {
     case 'no_credentials':
-      return '**📊 订阅额度**　未找到 OAuth 凭据 (`~/.claude/.credentials.json`)'
+      // 这一条多半是用户在 setup 向导里选了 DeepSeek / GLM / 其它
+      // anthropic-compatible 后端,claude 子进程跑的是 env 注入的
+      // ANTHROPIC_BASE_URL,根本不走 anthropic.com,所以没 OAuth 凭据。
+      // 不要按"凭据错误"渲染,直接说清能力边界。
+      return '**📊 订阅额度**　_暂时只支持 Claude 订阅额度显示_'
     case 'auth_failed':
       return '**📊 订阅额度**　Token 已过期且刷新失败 — 重新 `claude auth login`'
     case 'rate_limited':
