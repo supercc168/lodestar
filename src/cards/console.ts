@@ -336,13 +336,15 @@ export function menuCard(opts: MenuOpts): object {
  * and updates the chat-list preview with `⏱ duration · NK tokens`
  * (or just the suffix if interrupted before a result event). */
 export function streamingOffSettings(opts: {
-  durationSec: string
+  durationSec?: string
   tokens?: number
   suffix?: string
 }): object {
   const parts: string[] = []
   parts.push(opts.suffix ?? '✅')
-  parts.push(`⏱ ${opts.durationSec}s`)
+  // durationSec 缺省的场景:mid-turn rotate 收尾旧卡 (turn 还在跑,没
+  // turn-final elapsed)。直接省掉 ⏱ 段,避免拼出 "⏱ undefineds"。
+  if (opts.durationSec) parts.push(`⏱ ${opts.durationSec}s`)
   if (opts.tokens != null && opts.tokens > 0) {
     parts.push(`${fmtTokens(opts.tokens)} tokens`)
   }
