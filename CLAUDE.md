@@ -42,15 +42,30 @@ flips `streaming_mode` off on `result`.
 - **Streaming text** is throttled in `src/cardkit.ts` (120ms window or
   32-char delta). Do not call `streamText` directly from Claude event
   handlers; use `streamTextThrottled`.
-- **Never `systemctl restart feishu-daemon` on your own.** Daemon restart
-  SIGTERMs every child claude subprocess — including the one rendering
-  the Feishu turn you are currently inside. You may literally BE that
-  subprocess; the symptom is your own `Bash` returning exit code 144
-  the instant the restart command runs, and the user has to re-send the
-  request to spawn you again. Even when you "just need to reload code"
-  to verify a change, print the restart command and hand it to the user
-  — let them pick the moment. Same rule for `kill`/`stop`/`pkill` against
-  `bun daemon.ts` or any `claude -p ... --resume` child.
+- **`systemctl restart feishu-daemon` 你可以自己跑,但要带脑子。**
+  Daemon restart 会 SIGTERM 每一个 claude 子进程 —— 包括正在渲染
+  当前飞书轮次的那个,通常就是你自己。症状是 `Bash` 在 restart 命令
+  落地的瞬间返回 exit code 143/144(SIGTERM),当前这一轮回复也就到此
+  为止,用户没等到完整结果。所以:
+  - **允许执行**:用户明确说"重启 / restart / 重启 daemon",或者你
+    确实需要重载新代码来验证改动 —— 直接 `systemctl --user restart
+    feishu-daemon` 即可,不必把命令递回给用户。2026-05-18 用户翻盘旧
+    版"绝不自重启"规则,理由是绕一圈反而更烦。
+  - **谨慎姿势**(必做):
+    1. 重启命令一定**放在这一轮回复的最后一步** —— 在重启之前把所有
+       该说的话、该做的验证(typecheck / 文件改动 / 解释)全部讲完,
+       别让 SIGTERM 把半截输出截掉。
+    2. 重启之前先在文字里**明确告知用户**"即将重启,这一轮到此结束,
+       你下条消息我会以新进程身份接上",避免用户以为我卡死。
+    3. **生产 dogfooding 群**(就是 `feishu` 这个自宿主群本身)里慎用 ——
+       重启等于断掉群里所有 session 的当前流转,如果群里同时有别的
+       任务在跑,先 ack 一下再动手。其它群没这个顾虑。
+    4. 仅限 `systemctl --user restart feishu-daemon` 这一条**优雅重启**
+       路径。`kill -9 / pkill -f / systemctl stop` 之类粗暴方案仍然
+       禁止 —— 走 SIGTERM 让 daemon 自己把 SIGINT 传给子进程、把状态
+       写盘,才能让下一次启动干净。
+  - 同条目同样适用于"只是想重载代码看看效果"这种验证需求 ——
+    既然允许自己跑,就不再有"递给用户"的中间态。
 - **`cc-` 前缀是 hi 面板的契约。** Claude 在这台主机上用
   `systemd-run --user --unit=cc-<project>-<purpose> -- <cmd>` 拉起的所有
   常驻进程,都必须带 `cc-` 前缀(沿用全局 CLAUDE.md
