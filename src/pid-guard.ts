@@ -1,0 +1,97 @@
+/**
+ * 防 PID 回收的 daemon 守卫 —— 比 `process.kill(pid, 0)` 多一层验证:
+ * 不光问 OS "这个 pid 活着吗", 还要问 "这个 pid 的 cmdline 跟我们启
+ * 动时记下来的一不一样"。
+ *
+ * 起因: 2026-05-18 用户在 Windows 上看到 `already running (pid 5504)`,
+ * 怀疑那个 pid 是不是早死了 —— Windows 上 PID 回收很快, 单 `kill(pid,
+ * 0)` 探活会把"占了同一个号的无关进程"误判成"我们的 daemon 还在跑",
+ * 把后续启动一直锁住。
+ *
+ * 设计:
+ *   写 PID 文件时, 多写一行: 当前进程的 argv[1] (入口脚本绝对路径)。
+ *   两个无关 lodestar 实例的入口路径不会撞, 所以这串字就是"我们这个
+ *   实例"的唯一指纹。
+ *
+ *   检查时: 读出 pid + 保存的 marker → 查 pid 当前真正的 cmdline → 看
+ *   marker 是不是 cmdline 的子串。在就是我们, 不在就是 PID 被回收, 把
+ *   stale 文件删掉继续启动。
+ *
+ * 平台拿 cmdline 的路子:
+ *   Linux  — 读 `/proc/<pid>/cmdline` (无 spawn, 最快)
+ *   macOS  — `ps -p <pid> -o args=` (没 /proc, ps 退而求其次)
+ *   Windows — PowerShell + Get-CimInstance Win32_Process 拿真 cmdline
+ *             (~500ms 冷启动, 但只在 PID 文件存在时启动一次, 可以忍)
+ */
+
+import { execSync } from 'node:child_process'
+import { readFileSync, writeFileSync } from 'node:fs'
+
+/** 我们这个进程的唯一标记 = 入口脚本的绝对路径 (argv[1])。 */
+export function ourMarker(): string {
+  return process.argv[1] ?? `pid:${process.pid}`
+}
+
+function getCmdline(pid: number): string | null {
+  try {
+    if (process.platform === 'linux') {
+      return readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ').trim()
+    }
+    if (process.platform === 'darwin') {
+      return execSync(`ps -p ${pid} -o args=`, { encoding: 'utf8', timeout: 2000 }).trim()
+    }
+    if (process.platform === 'win32') {
+      const out = execSync(
+        `powershell -NoProfile -Command "(Get-CimInstance Win32_Process -Filter 'ProcessId=${pid}').CommandLine"`,
+        { encoding: 'utf8', timeout: 5000 },
+      ).trim()
+      return out || null
+    }
+    return null
+  } catch {
+    return null
+  }
+}
+
+/** 给定 pid 上是不是真的我们这个 daemon (而非 PID 回收 / 巧合同号)。 */
+export function isOurDaemon(pid: number, marker: string): boolean {
+  if (!Number.isFinite(pid) || pid <= 0 || !marker) return false
+  const cmd = getCmdline(pid)
+  if (!cmd) return false
+  // Windows 路径大小写飘忽 (`C:\Users` vs `C:\users`), 不区分大小写匹配。
+  if (process.platform === 'win32') {
+    return cmd.toLowerCase().includes(marker.toLowerCase())
+  }
+  return cmd.includes(marker)
+}
+
+/** 读 PID 文件 → 看那个 pid 是不是真的我们 → 给调用方一个状态。
+ *   continue → 没有合法 daemon, 启动新的 (调用方负责清 stale 文件 + 写新 PID)
+ *   exit     → 真有 daemon 在跑, 调用方应该自己 exit */
+export function checkPidGuard(pidFile: string): { state: 'continue' } | { state: 'exit'; pid: number } {
+  let raw = ''
+  try { raw = readFileSync(pidFile, 'utf8') } catch { return { state: 'continue' } }
+  const lines = raw.split('\n')
+  const pid = parseInt((lines[0] ?? '').trim(), 10)
+  const savedMarker = (lines[1] ?? '').trim()
+  if (!Number.isFinite(pid) || pid <= 0) return { state: 'continue' }
+
+  if (!savedMarker) {
+    // 老格式 (只有一行 pid, 无 marker) —— 之前版本的 daemon 留下来的。
+    // 退回老的 kill(pid, 0) 单点探活, 这次启动后会被覆盖成新格式。
+    try {
+      process.kill(pid, 0)
+      return { state: 'exit', pid }
+    } catch {
+      return { state: 'continue' }
+    }
+  }
+
+  if (isOurDaemon(pid, savedMarker)) return { state: 'exit', pid }
+  return { state: 'continue' }
+}
+
+/** 写 PID 文件: 第一行 pid, 第二行 marker (argv[1] 绝对路径)。 */
+export function writePidFile(pidFile: string): void {
+  writeFileSync(pidFile, `${process.pid}\n${ourMarker()}`)
+}

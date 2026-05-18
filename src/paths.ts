@@ -1,8 +1,12 @@
 /**
- * Filesystem layout — XDG Base Directory spec, with env-var overrides.
+ * Filesystem layout — XDG Base Directory spec on unix, Windows
+ * standard dirs on Win32, with env-var overrides on every platform.
  *
- *   Config:   $LODESTAR_CONFIG_DIR | $XDG_CONFIG_HOME/lodestar | ~/.config/lodestar
- *   Data:     $LODESTAR_DATA_DIR   | $XDG_DATA_HOME/lodestar   | ~/.local/share/lodestar
+ *   Unix config:    $LODESTAR_CONFIG_DIR | $XDG_CONFIG_HOME/lodestar | ~/.config/lodestar
+ *   Unix data:      $LODESTAR_DATA_DIR   | $XDG_DATA_HOME/lodestar   | ~/.local/share/lodestar
+ *   Windows config: $LODESTAR_CONFIG_DIR | %APPDATA%\Lodestar
+ *   Windows data:   $LODESTAR_DATA_DIR   | %LOCALAPPDATA%\Lodestar
+ *   (XDG_* env vars still honored on Windows for power-users.)
  *
  *   config.toml             — credentials + preferences (in CONFIG_DIR)
  *   daemon.pid              — single-instance lock          (in DATA_DIR)
@@ -16,6 +20,7 @@ import { homedir } from 'node:os'
 import { join } from 'node:path'
 
 const HOME = homedir()
+const IS_WIN = process.platform === 'win32'
 
 function pickDir(envOverride: string | undefined, xdgVar: string | undefined, fallback: string): string {
   if (envOverride) return envOverride
@@ -23,16 +28,32 @@ function pickDir(envOverride: string | undefined, xdgVar: string | undefined, fa
   return fallback
 }
 
+/** Default config dir: %APPDATA%\Lodestar on Windows, XDG path on
+ * unix. APPDATA is set on every modern Windows session; manual
+ * fallback covers the edge case where it's been stripped. */
+function defaultConfigDir(): string {
+  if (IS_WIN) return join(process.env.APPDATA ?? join(HOME, 'AppData', 'Roaming'), 'Lodestar')
+  return join(HOME, '.config', 'lodestar')
+}
+
+/** Default data dir: %LOCALAPPDATA%\Lodestar on Windows (machine-
+ * local, non-roaming; the standard place for app state/logs/cache),
+ * XDG path on unix. */
+function defaultDataDir(): string {
+  if (IS_WIN) return join(process.env.LOCALAPPDATA ?? join(HOME, 'AppData', 'Local'), 'Lodestar')
+  return join(HOME, '.local', 'share', 'lodestar')
+}
+
 export const CONFIG_DIR = pickDir(
   process.env.LODESTAR_CONFIG_DIR,
   process.env.XDG_CONFIG_HOME,
-  join(HOME, '.config', 'lodestar'),
+  defaultConfigDir(),
 )
 
 export const DATA_DIR = pickDir(
   process.env.LODESTAR_DATA_DIR,
   process.env.XDG_DATA_HOME,
-  join(HOME, '.local', 'share', 'lodestar'),
+  defaultDataDir(),
 )
 
 export const CONFIG_FILE = process.env.LODESTAR_CONFIG ?? join(CONFIG_DIR, 'config.toml')

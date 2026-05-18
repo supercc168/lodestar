@@ -31,6 +31,7 @@
  * need to seed the binding without leaving the keyboard.
  */
 
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { log } from './log'
 import * as feishu from './feishu'
 
@@ -69,64 +70,86 @@ export interface NotifyOptions {
 }
 
 export function startNotifyServer(opts: NotifyOptions): void {
+  // node:http instead of Bun.serve so the same source runs on both
+  // Bun (dev: `bun daemon.ts`) and Node (prod: `npm i -g @leviyuan/lodestar`).
+  // Bun has full node:http compat so dev behavior is byte-for-byte preserved.
   try {
-    Bun.serve({
-      hostname: opts.bind,
-      port: opts.port,
-      fetch: async (req: Request) => {
-        const url = new URL(req.url)
-        if (req.method === 'GET' && url.pathname === '/') {
-          return new Response(
-            'lodestar notify\n' +
-            'POST /notify  body={project,text,title?,level?}\n' +
-            'levels: info|warn|error (default info)\n',
-            { headers: { 'content-type': 'text/plain; charset=utf-8' } },
-          )
+    const server = createServer((req, res) => {
+      handleNotifyRequest(req, res).catch((err: any) => {
+        log(`notify: handler crash: ${err?.message ?? err}`)
+        if (!res.headersSent) {
+          res.statusCode = 500
+          res.setHeader('content-type', 'text/plain; charset=utf-8')
+          res.end('internal error')
+        } else {
+          try { res.end() } catch {}
         }
-        if (req.method !== 'POST' || url.pathname !== '/notify') {
-          return new Response('use POST /notify', { status: 405 })
-        }
-
-        let body: any = {}
-        try { body = await req.json() } catch {
-          return new Response('bad json', { status: 400 })
-        }
-        const project = String(body.project ?? '').trim()
-        const text = String(body.text ?? '')
-        const titleRaw = String(body.title ?? '').trim()
-        const levelRaw = String(body.level ?? 'info').toLowerCase()
-        if (!project) return new Response('missing "project"', { status: 400 })
-        if (!text)    return new Response('missing "text"', { status: 400 })
-
-        const level: Level = (VALID_LEVELS.has(levelRaw as Level) ? levelRaw : 'info') as Level
-        const title = titleRaw || project
-
-        const sessionName = feishu.sanitizeSessionName(project)
-        const chatId = feishu.chatIdForSession(sessionName)
-        if (!chatId) {
-          log(`notify: project "${project}" (sanitized "${sessionName}") has no chat binding → 404`)
-          return new Response(
-            `project "${project}" not bound — send any message in that Feishu group at least once after the daemon started, then retry`,
-            { status: 404 },
-          )
-        }
-
-        const card = notifyCard({ title, text, level })
-        const messageId = await feishu.sendCard(chatId, card)
-        if (!messageId) {
-          log(`notify: sendCard failed → 502 (project="${project}" chat=${chatId.slice(0, 8)}…)`)
-          return new Response('feishu sendCard failed (see daemon log)', { status: 502 })
-        }
-        log(`notify: → ${project} (${chatId.slice(0, 8)}…) level=${level} bytes=${text.length} msg=${messageId}`)
-        return Response.json({ ok: true, chat_id: chatId, message_id: messageId })
-      },
-      error: (err: Error) => {
-        log(`notify: handler crash: ${err.message}`)
-        return new Response('internal error', { status: 500 })
-      },
+      })
     })
-    log(`notify: HTTP listening at http://${opts.bind}:${opts.port}/notify`)
+    server.on('error', (err: Error) => {
+      log(`notify: server bind failed (${opts.bind}:${opts.port}): ${err.message}`)
+    })
+    server.listen(opts.port, opts.bind, () => {
+      log(`notify: HTTP listening at http://${opts.bind}:${opts.port}/notify`)
+    })
   } catch (e) {
     log(`notify: server bind failed (${opts.bind}:${opts.port}): ${e}`)
   }
+}
+
+async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+
+  const sendText = (status: number, body: string): void => {
+    res.statusCode = status
+    res.setHeader('content-type', 'text/plain; charset=utf-8')
+    res.end(body)
+  }
+  const sendJson = (status: number, obj: object): void => {
+    res.statusCode = status
+    res.setHeader('content-type', 'application/json')
+    res.end(JSON.stringify(obj))
+  }
+
+  if (req.method === 'GET' && url.pathname === '/') {
+    return sendText(200,
+      'lodestar notify\n' +
+      'POST /notify  body={project,text,title?,level?}\n' +
+      'levels: info|warn|error (default info)\n')
+  }
+  if (req.method !== 'POST' || url.pathname !== '/notify') {
+    return sendText(405, 'use POST /notify')
+  }
+
+  let raw = ''
+  for await (const chunk of req) raw += chunk.toString()
+  let body: any = {}
+  try { body = JSON.parse(raw) } catch { return sendText(400, 'bad json') }
+
+  const project = String(body.project ?? '').trim()
+  const text = String(body.text ?? '')
+  const titleRaw = String(body.title ?? '').trim()
+  const levelRaw = String(body.level ?? 'info').toLowerCase()
+  if (!project) return sendText(400, 'missing "project"')
+  if (!text)    return sendText(400, 'missing "text"')
+
+  const level: Level = (VALID_LEVELS.has(levelRaw as Level) ? levelRaw : 'info') as Level
+  const title = titleRaw || project
+
+  const sessionName = feishu.sanitizeSessionName(project)
+  const chatId = feishu.chatIdForSession(sessionName)
+  if (!chatId) {
+    log(`notify: project "${project}" (sanitized "${sessionName}") has no chat binding → 404`)
+    return sendText(404,
+      `project "${project}" not bound — send any message in that Feishu group at least once after the daemon started, then retry`)
+  }
+
+  const card = notifyCard({ title, text, level })
+  const messageId = await feishu.sendCard(chatId, card)
+  if (!messageId) {
+    log(`notify: sendCard failed → 502 (project="${project}" chat=${chatId.slice(0, 8)}…)`)
+    return sendText(502, 'feishu sendCard failed (see daemon log)')
+  }
+  log(`notify: → ${project} (${chatId.slice(0, 8)}…) level=${level} bytes=${text.length} msg=${messageId}`)
+  sendJson(200, { ok: true, chat_id: chatId, message_id: messageId })
 }

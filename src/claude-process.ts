@@ -19,11 +19,63 @@
  */
 
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
+import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import type { Readable, Writable } from 'node:stream'
+import { config } from './config'
 import { log } from './log'
+
+/** Locate the headless `claude` binary in a way that survives the
+ * Linux dev box (~/.local/bin/claude pinned via `bun add -g`) AND a
+ * Windows end-user install (claude.cmd dropped by `npm i -g
+ * @anthropic-ai/claude-code` under %APPDATA%\npm). Linux/Mac keep the
+ * pinned absolute path so spawn doesn't pay a PATH walk per turn; on
+ * Windows (or if the pinned binary is gone) we fall back to Bun.which,
+ * and finally to the bare name so spawn surfaces a clean ENOENT. */
+function resolveClaudeBin(): string {
+  if (process.platform !== 'win32') {
+    const pinned = join(homedir(), '.local', 'bin', 'claude')
+    if (existsSync(pinned)) return pinned
+  }
+  return whichClaude() ?? 'claude'
+}
+
+/** Tiny cross-runtime PATH walker — replaces `Bun.which('claude')` so
+ * this module runs unchanged under both Bun (`bun daemon.ts` dev) and
+ * Node (`npm i -g @leviyuan/lodestar` prod). On Windows we probe the
+ * usual shim extensions in npm's preferred order. */
+function whichClaude(): string | null {
+  const PATH = process.env.PATH ?? ''
+  if (!PATH) return null
+  const candidates = process.platform === 'win32'
+    ? ['claude.cmd', 'claude.bat', 'claude.exe', 'claude']
+    : ['claude']
+  for (const dir of PATH.split(delimiter)) {
+    if (!dir) continue
+    for (const name of candidates) {
+      const p = join(dir, name)
+      if (existsSync(p)) return p
+    }
+  }
+  return null
+}
+
+/** PATH for the spawned claude. On unix we hand-curate a minimal list
+ * so even a barebones systemd PATH still finds claude + bun. On
+ * Windows we just trust the user's PATH — npm-global puts claude.cmd
+ * under %APPDATA%\npm which is on PATH out of the box, and force-
+ * rewriting it with unix-style entries would just break things. */
+function buildSpawnPath(): string {
+  if (process.platform === 'win32') return process.env.PATH ?? ''
+  return [
+    join(homedir(), '.local', 'bin'),
+    join(homedir(), '.bun', 'bin'),
+    join(homedir(), '.local', 'npm-global', 'bin'),
+    '/usr/local/bin', '/usr/bin', '/bin',
+  ].join(delimiter)
+}
 
 interface SpawnOpts {
   workDir: string
@@ -116,7 +168,7 @@ export class ClaudeProcess extends EventEmitter {
 
   constructor(opts: SpawnOpts) {
     super()
-    const claudeBin = join(homedir(), '.local', 'bin', 'claude')
+    const claudeBin = resolveClaudeBin()
     const args = [
       '-p',
       '--input-format=stream-json',
@@ -143,19 +195,21 @@ export class ClaudeProcess extends EventEmitter {
     }
 
     log(`claude-process: spawn ${claudeBin} (cwd=${opts.workDir})`)
+    // 把 setup 向导写到 config.toml 的 [claude.env] 节整段注入子进程 env。
+    // 设计成"任意 key/value" 让 DeepSeek (8 个 ANTHROPIC_* / CLAUDE_CODE_*
+    // env)、GLM、anthropic-proxy 之流都能一套 schema 装下,不用 Windows
+    // 用户碰系统级环境变量。展开顺序: 默认 env → 我们的 PATH/log → user
+    // 配置的 claude.env (优先级最高,会覆盖前面同名 key)。
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      NPM_CONFIG_LOGLEVEL: 'error',
+      PATH: buildSpawnPath(),
+      ...config.claude.env,
+    }
     this.proc = spawn(claudeBin, args, {
       cwd: opts.workDir,
       stdio: ['pipe', 'pipe', 'pipe'],
-      env: {
-        ...process.env,
-        NPM_CONFIG_LOGLEVEL: 'error',
-        PATH: [
-          join(homedir(), '.local', 'bin'),
-          join(homedir(), '.bun', 'bin'),
-          join(homedir(), '.local', 'npm-global', 'bin'),
-          '/usr/local/bin', '/usr/bin', '/bin',
-        ].join(':'),
-      },
+      env,
     }) as ChildProcessByStdio<Writable, Readable, Readable>
 
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))

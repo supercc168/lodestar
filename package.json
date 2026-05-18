@@ -28,22 +28,31 @@
     "lodestar"
   ],
   "scripts": {
-    "start": "bun daemon.ts"
+    "start": "bun daemon.ts",
+    "build:daemon": "bun build cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar.js",
+    "build:setup":  "bun build src/setup-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-setup.js",
+    "build": "bun run build:daemon && bun run build:setup",
+    "prepublishOnly": "bun run build",
+    "postinstall": "node scripts/postinstall.cjs"
   },
   "bin": {
-    "lodestar-daemon": "./daemon.ts"
+    "lodestar-daemon": "./dist/lodestar.js",
+    "lodestar-setup":  "./dist/lodestar-setup.js"
   },
   "files": [
-    "daemon.ts",
-    "src/",
+    "dist/",
+    "scripts/postinstall.cjs",
     "README.md",
     "LICENSE"
   ],
   "engines": {
-    "bun": ">=1.0.0"
+    "node": ">=18"
   },
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.44.0"
+  },
+  "peerDependencies": {
+    "@anthropic-ai/claude-code": "*"
   },
   "devDependencies": {
     "@types/bun": "latest",

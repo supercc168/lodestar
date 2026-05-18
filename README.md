@@ -32,12 +32,12 @@ AI 不是帮手,是倍率。它放大的不是体力,是你——你的直觉、
 - 🛑 **`stop` 软打断**:取消当前 turn + 清队列,子进程保活
 - 🗂 **多项目并发**:一个 daemon 持 N 群 ↔ N session
 - 🔄 **自动 resume**:重启自动续接,session_id 落盘不丢
-- 🛡 **systemd 守护级**:WS watchdog + 单 PID + alive marker
+- 🛡 **守护级稳定**:WS watchdog + 单 PID + alive marker(自动 resume 上次活跃 session)
 - 📡 **HTTP 通知端点**:任意本机进程 `POST /notify` 一行 curl 把 markdown 推成卡片,info / warn / error 染色
 
 ## 怎么用
 
-每个飞书群对应一个 Claude 会话。**群名 = `~/` 下的项目目录名**。这套绑定是骨架,新群第一次发消息时,daemon 会自动 `mkdir -p ~/{群名}` + `git init` 把项目骨架打起来,**开新群 = 开新项目**。
+每个飞书群对应一个 Claude 会话。**群名 = 用户主目录下的项目目录名**(`projects_root` 配置项可改)。这套绑定是骨架,新群第一次发消息时,daemon 会自动 `mkdir -p <projects_root>/<群名>` + `git init` 把项目骨架打起来,**开新群 = 开新项目**。
 
 在群里发任意文字,Claude 接管这一轮。回复以流式打字机渲染在一张卡片里,工具调用、思考过程、权限审批、追问选项,全都收纳在这张卡片的不同面板里——一目了然,可转发,可回看。
 
@@ -59,62 +59,69 @@ AI 不是帮手,是倍率。它放大的不是体力,是你——你的直觉、
 
 ## 安装
 
-### 1. 准备
+Windows / macOS / Linux 通吃,只要有 Node ≥ 18。
 
-**机器**:能常跑后台进程的 Linux/macOS(自家服务器、闲置 NAS、树莓派均可)。
-
-**运行时**:[Bun](https://bun.sh) ≥ 1.0。
-
-**Claude Code**:装好且能跑 —— 详见[官方文档](https://docs.anthropic.com/en/docs/claude-code)。
-
-**飞书自建应用**:去[飞书开放平台](https://open.feishu.cn/app)→ 创建企业自建应用,然后:
-
-1. **添加机器人能力**:左侧"添加应用能力"→"机器人"启用。
-2. **配置权限**(权限管理 → API 权限):
-   - 消息:`im:message:send_as_bot` `im:message` `im:chat:readonly` `im:resource`
-   - 加急:`im:message.urgent`(锁屏推送)
-   - 卡片:`cardkit:card:read` `cardkit:card:write` `cardkit:card.element:read` `cardkit:card.element:write` `cardkit:card.settings:read` `cardkit:card.settings:write`
-3. **订阅事件**(事件与回调 → 事件订阅):
-   - 订阅方式选 **长连接**(WebSocket,不需要公网回调地址)
-   - 添加事件 `im.message.receive_v1`(接收群消息)
-   - 添加事件 `card.action.trigger`(卡片按钮回调)
-4. **发布版本**(版本管理与发布)→ 创建版本 → 审批通过 / 自审通过 → 上线。**没发版的应用不会收到事件**,这一步常被忘记。
-5. **拿凭据**:凭据与基础信息页拷 `App ID`(`cli_xxxxxxxxxx`)和 `App Secret`,下一步写到 `config.toml`。
-6. **拉机器人进群**:想用的飞书群 → 群设置 → 群机器人 → 添加机器人 → 选你的应用。**群名要等于 `~/` 下的项目目录名**,daemon 用这个绑定群 ↔ Claude session。
-
-### 2. 配置
-
-把凭据写到 `~/.config/lodestar/config.toml`:
-
-```toml
-[feishu]
-app_id     = "cli_xxxxxxxxxxxxxxxx"
-app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
-
-[runtime]
-projects_root = "~/"        # 可选,新建群对应的项目目录会落到这里
-```
-
-也支持 `LODESTAR_CONFIG=/abs/path.toml` 或 `XDG_CONFIG_HOME` 覆盖。运行时状态走 `~/.local/share/lodestar/`(可用 `LODESTAR_DATA_DIR` 或 `XDG_DATA_HOME` 改写)——daemon.pid、daemon.log、session-chat-map、session-resume-map、alive-marker、inbox/ 都在那里。
-
-### 3. 启动
+### 1. 装包
 
 ```bash
-bun install -g @leviyuan/lodestar
+npm i -g @leviyuan/lodestar
+```
+
+`@anthropic-ai/claude-code` 是 peer dep,npm 7+ 会自动连带装,装完终端里 `lodestar-daemon`、`lodestar-setup`、`claude` 三个命令都在 PATH 上。
+
+> **Windows**:[nodejs.org](https://nodejs.org) 下 LTS MSI 装好 Node,然后开 cmd / PowerShell 跑上面那行。
+> **没装过 Bun 也行**,这个包发布出去就是纯 Node 跑的。
+
+### 2. 飞书自建应用
+
+去[飞书开放平台](https://open.feishu.cn/app)→ 创建企业自建应用,然后:
+
+1. **添加机器人能力**:左侧"添加应用能力"→"机器人"→ 点 **添加** 按钮。
+2. **开通权限**(权限管理 → **开通权限**):
+   - 消息:`im:message:send_as_bot` `im:message` `im:chat:readonly` `im:resource` `im:message.urgent`
+   - 卡片:`cardkit:card:read` `cardkit:card:write`
+3. **订阅事件**(事件与回调,拆两个子页):
+   - **事件配置** 页:订阅方式选 **长连接** → 保存 → 添加事件 `im.message.receive_v1`(收群消息)
+   - **回调配置** 页:订阅方式选 **长连接** → 保存 → 添加事件 `card.action.trigger`(卡片按钮回调)
+4. **发布版本**:页面顶部 **创建版本** → 滚到底点 **保存** → 弹框点 **发布**。**没发版的应用不会收到事件**,这一步常被忘记。
+5. **拿凭据**:凭据与基础信息页拷 `App ID`(`cli_xxxxxxxxxx`)和 `App Secret`,下一步配置向导会问你。
+6. **拉机器人进群**:想用的飞书群 → 群设置 → 群机器人 → 添加机器人 → 选你的应用。**群名要等于用户主目录下的项目目录名**,daemon 用这个绑定群 ↔ Claude session。
+
+### 3. 跑配置向导
+
+```bash
+lodestar-setup
+```
+
+交互式问你 3 件事:
+
+1. 上一步拿到的 `App ID` / `App Secret`
+2. **LLM 后端**(4 选 1):
+   - **Anthropic 官方**:`claude.ai` 订阅或 API key,美元结算
+   - **GLM 智谱 coding plan**:国内可访问,人民币计费,跟 Claude Code 协议原生兼容
+   - **DeepSeek + anthropic-proxy**:最便宜,需要自己跑一个 proxy 转协议
+   - **自定义 `base_url`**:高级
+3. `projects_root`(默认是用户主目录)
+
+写到:
+- Linux / macOS:`~/.config/lodestar/config.toml`
+- Windows:`%APPDATA%\Lodestar\config.toml`
+
+设了 LLM 后端的话,daemon 拉起 claude 子进程时会自动注入 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` —— **不用碰系统环境变量**。
+
+> 想跳过向导手写配置也行,schema 见[配置文件](#配置文件)章节。
+
+### 4. 启动
+
+```bash
 lodestar-daemon
 ```
 
-或者一次性跑(无需全局安装):
+把机器人拉进任意飞书群,发一条消息 —— Claude 上线。
 
-```bash
-bunx @leviyuan/lodestar
-```
+### 5. 7×24 守护(可选)
 
-把机器人拉进任意飞书群,发一条消息——Claude 就上线了。
-
-### 4. 守护进程(推荐)
-
-让 daemon 7×24 跑,最简单的方法是配一个 `systemd --user` 单元:
+**Linux / macOS** 用 `systemd --user`(把 `ExecStart` 路径换成你 `which lodestar-daemon` 的结果):
 
 ```ini
 [Unit]
@@ -123,7 +130,7 @@ After=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/home/USER/.bun/bin/lodestar-daemon
+ExecStart=%h/.npm-global/bin/lodestar-daemon
 Restart=always
 RestartSec=3
 
@@ -135,7 +142,32 @@ WantedBy=default.target
 systemctl --user enable --now lodestar
 ```
 
-WS watchdog + alive-marker 的联手设计,意味着每次 systemd 拉起,daemon 会把**上次还在运行的 session 全部 `--resume` 自动复活**;你主动 `kill` 过的不会被吵醒。
+**Windows** 用 Task Scheduler 设登录时拉起 `lodestar-daemon`;或者干脆开一个 cmd / PowerShell 窗口让它一直挂着(关窗就停)。
+
+WS watchdog + alive-marker 联手:每次重启,daemon 会把**上次还在运行的 session 全部 `--resume` 自动复活**;你主动 `kill` 过的不会被吵醒。
+
+### 配置文件
+
+向导写出来的 TOML 长这样:
+
+```toml
+[feishu]
+app_id     = "cli_xxxxxxxxxxxxxxxx"
+app_secret = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+[runtime]
+projects_root = "/home/you"
+
+[claude]                                    # 可选,留空则走 claude 自带登录
+base_url   = "https://open.bigmodel.cn/api/anthropic"
+auth_token = "xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx"
+
+[notify]                                    # 可选,默认 127.0.0.1:9876
+bind = "127.0.0.1"
+port = 9876
+```
+
+路径覆盖:`LODESTAR_CONFIG=/abs/path.toml`、`LODESTAR_CONFIG_DIR=...`、`XDG_CONFIG_HOME` 都认。运行时状态走 Linux/Mac `~/.local/share/lodestar/` 或 Windows `%LOCALAPPDATA%\Lodestar\`(`LODESTAR_DATA_DIR` / `XDG_DATA_HOME` 可改写) —— daemon.pid、daemon.log、session-chat-map、session-resume-map、alive-marker、inbox/ 都在那里。
 
 ## 通知端点(Notify)
 
@@ -161,7 +193,7 @@ curl -fsS -X POST http://127.0.0.1:9876/notify \
 
 > ⚠️ 群必须**至少有一条消息**触达过 daemon(WS 收到过),否则 `chatIdForSession` 查不到绑定,返回 404。新建群第一次发消息后即可用。
 
-可选配置(`~/.config/lodestar/config.toml`):
+可选配置(Linux/Mac `~/.config/lodestar/config.toml`;Windows `%APPDATA%\Lodestar\config.toml`):
 
 ```toml
 [notify]

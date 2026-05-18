@@ -15,3 +15,6 @@ config.toml
 # Stray runtime artifacts
 *.pid
 *.log
+
+# Build outputs
+dist/

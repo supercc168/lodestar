@@ -1,6 +1,13 @@
-#!/usr/bin/env bun
 /**
  * Lodestar 2.0 daemon — Feishu (Lark) ↔ Claude Code headless bridge.
+ *
+ * No source-file shebang on purpose:
+ *   - `bun daemon.ts` and `systemctl --user start feishu-daemon` don't
+ *     need it (they invoke the runtime explicitly).
+ *   - `bun build --target=node --banner='#!/usr/bin/env node'` is the
+ *     official entry; a duplicate shebang in source would survive into
+ *     the bundle below the banner and break Node's parser (line-3
+ *     shebang isn't recognized).
  *
  * Listens on Lark WebSocket for inbound messages and card-action
  * callbacks, routes each to a per-chat Session that owns a headless
@@ -19,19 +26,23 @@ import { startNotifyServer } from './src/notify'
 import { config } from './src/config'
 import { log } from './src/log'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
+import { checkPidGuard, writePidFile } from './src/pid-guard'
 
 // ── PID guard ───────────────────────────────────────────────────────────
-try {
-  const existing = readFileSync(PID_FILE, 'utf8').trim()
-  try {
-    process.kill(Number(existing), 0)
-    console.error(`lodestar-daemon: already running (pid ${existing})`)
+// dev 路径 (`bun daemon.ts` 直接跑) 不经过 cli.ts, 所以这里也守一道。
+// 走 checkPidGuard 同一份逻辑: 校验 PID 文件里那个 pid 的 cmdline 包含
+// 我们启动时记下的 marker, 避免 PID 被回收导致的假阳性把后续启动锁死。
+{
+  const guard = checkPidGuard(PID_FILE)
+  if (guard.state === 'exit') {
+    console.error(`lodestar-daemon: already running (pid ${guard.pid})`)
     process.exit(1)
-  } catch {}
-} catch {}
+  }
+  if (existsSync(PID_FILE)) { try { unlinkSync(PID_FILE) } catch {} }
+}
 
 mkdirSync(dirname(PID_FILE), { recursive: true })
-writeFileSync(PID_FILE, String(process.pid))
+writePidFile(PID_FILE)
 
 const cleanup = () => {
   // Snapshot which sessions are still alive so the next boot can
@@ -50,6 +61,13 @@ const cleanup = () => {
 process.on('exit', cleanup)
 process.on('SIGTERM', () => { log('SIGTERM'); cleanup(); process.exit(0) })
 process.on('SIGINT',  () => { log('SIGINT');  cleanup(); process.exit(0) })
+// Windows 没有 POSIX SIGTERM;NSSM/WinSW 这类 Windows service wrapper
+// 在停服务时通常发 SIGBREAK (Ctrl-Break 的内核映射),让进程优雅退出。
+// 仅在 Win32 上注册,避免 Linux/Mac 跑 listener-count 检查时多出一个
+// 无关的信号 handler。
+if (process.platform === 'win32') {
+  process.on('SIGBREAK', () => { log('SIGBREAK'); cleanup(); process.exit(0) })
+}
 process.on('unhandledRejection', e => log(`unhandledRejection: ${e}`))
 process.on('uncaughtException',  e => log(`uncaughtException: ${e}`))
 
@@ -249,6 +267,22 @@ function fmt(m: any[]): string {
 // by a one-time `[DEBUG]<anything>` from the real Feishu user; from then
 // on the injector reuses that chat_id + sender_open_id.
 function startDebugSocket(): void {
+  if (process.platform === 'win32') {
+    // Bun.serve({unix:...}) 在 Windows 上不支持,且 debug 注入是
+    // dev-only 路径(scripts/test-inject.ts 用的),end user 不需要。
+    // 想在 Windows 上 spike 这个,换成 loopback HTTP 即可。
+    log('debug: inject socket skipped on Windows (dev-only feature)')
+    return
+  }
+  if (typeof Bun === 'undefined') {
+    // 走 npm 发布出去给 end user 时跑的是 node,Bun.serve 不在。
+    // debug 注入纯 dev-only(scripts/test-inject.ts 才用),production
+    // 直接跳过即可 —— 既不报错也不引入 node:http 的 socket-path 端口
+    // 适配工作量。本机 `bun daemon.ts` 因为 Bun 是 defined 的,这条
+    // 分支不进。
+    log('debug: inject socket skipped (Bun runtime only — npm/Node build does not include it)')
+    return
+  }
   try { if (existsSync(DEBUG_SOCK_FILE)) unlinkSync(DEBUG_SOCK_FILE) } catch {}
   try {
     Bun.serve({

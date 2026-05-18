@@ -10,6 +10,7 @@ import * as lark from '@larksuiteoapi/node-sdk'
 import { execSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
 import { config } from './config'
@@ -361,7 +362,7 @@ function looksLikeImage(filePath: string): boolean {
 
 async function uploadImageMultipart(filePath: string): Promise<string | null> {
   const token = await getTenantToken()
-  const file = Bun.file(filePath)
+  const file = new Blob([await readFile(filePath)])
   const form = new FormData()
   form.append('image_type', 'message')
   form.append('image', file, basename(filePath))
@@ -380,7 +381,7 @@ async function uploadImageMultipart(filePath: string): Promise<string | null> {
 
 async function uploadFileMultipart(filePath: string): Promise<string | null> {
   const token = await getTenantToken()
-  const file = Bun.file(filePath)
+  const file = new Blob([await readFile(filePath)])
   const form = new FormData()
   // 'stream' is the catch-all type and works for arbitrary binaries.
   form.append('file_type', 'stream')

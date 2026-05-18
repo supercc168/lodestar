@@ -33,6 +33,13 @@ export interface LodestarConfig {
     bind: string
     port: number
   }
+  /** Env vars injected into the spawned `claude` CLI subprocess.
+   * Lets the setup wizard wire up DeepSeek / GLM / any anthropic-
+   * compatible backend without making the user touch system env vars.
+   * Empty record = no injection, claude runs under its own login. */
+  claude: {
+    env: Record<string, string>
+  }
 }
 
 function expandTilde(v: string): string {
@@ -54,8 +61,14 @@ function parseToml(text: string): Record<string, Record<string, string>> {
     const kv = line.match(/^([\w.-]+)\s*=\s*(.+)$/)
     if (kv) {
       let v = kv[2].trim()
-      if ((v.startsWith('"') && v.endsWith('"')) || (v.startsWith("'") && v.endsWith("'"))) {
+      const dq = v.startsWith('"') && v.endsWith('"')
+      const sq = v.startsWith("'") && v.endsWith("'")
+      if (dq || sq) {
         v = v.slice(1, -1)
+        // TOML basic strings (double-quoted) get \\, \" unescaped;
+        // single-quoted literal strings stay raw per TOML spec.
+        // Mirror escapeTomlString() in src/setup.ts.
+        if (dq) v = v.replace(/\\([\\"])/g, '$1')
       }
       out[section][kv[1]] = v
     }
@@ -70,7 +83,8 @@ function loadConfig(): LodestarConfig {
   } catch (e) {
     process.stderr.write(
       `lodestar: cannot read config at ${CONFIG_FILE}\n` +
-      `  set LODESTAR_CONFIG=/path/to/config.toml to override, or create the file with:\n\n` +
+      `  → 运行 \`lodestar-setup\` 走交互式向导生成 (Feishu / LLM / 工作目录)\n` +
+      `  → 或手写: 设 LODESTAR_CONFIG=/path/to/config.toml 覆盖默认路径\n` +
       `    [feishu]\n    app_id = "cli_xxx"\n    app_secret = "xxx"\n\n`,
     )
     throw e
@@ -88,10 +102,19 @@ function loadConfig(): LodestarConfig {
   if (!Number.isFinite(notifyPort) || notifyPort <= 0 || notifyPort > 65535) {
     throw new Error(`lodestar: [notify].port must be 1..65535, got "${notifyPortRaw}"`)
   }
+  // [claude.env] 节可选 —— 空 record 就维持现状 (用户自己 claude login
+  // 或从外部设过 ANTHROPIC_* env)。有内容就在 spawn claude 子进程时把
+  // 这些键全部注入到子进程 env 里, 优先级覆盖 process.env。
+  const claudeEnvSection = t['claude.env'] ?? {}
+  const claudeEnv: Record<string, string> = {}
+  for (const [k, v] of Object.entries(claudeEnvSection)) {
+    if (typeof v === 'string' && v.length > 0) claudeEnv[k] = v
+  }
   return {
     feishu: { app_id: appId, app_secret: appSecret },
     runtime: { projects_root: projectsRoot },
     notify: { bind: notifyBind, port: notifyPort },
+    claude: { env: claudeEnv },
   }
 }
 

@@ -19,9 +19,13 @@
  * `_n/a_`,绝不假数据 (no_fallbacks)。
  */
 
+import { execFile } from 'node:child_process'
 import { readFileSync, statfsSync, statSync } from 'node:fs'
 import { cpus, homedir } from 'node:os'
+import { promisify } from 'node:util'
 import { log } from './log'
+
+const execFileAsync = promisify(execFile)
 
 export interface CpuInfo {
   cores: number
@@ -172,21 +176,18 @@ function readMonotonicSec(): number | null {
   }
 }
 
-/** 用 Bun.spawn 跑 `systemctl --user`,合并 stdout 并返回 trim 后的字符串。
- * 超时(默认 2s)或非零退出码都返回 null,让调用方走错误分支。 */
+/** 用 `node:child_process.execFile` 跑 `systemctl --user` —— 跨 Bun /
+ * Node 通用,超时(默认 2s)由 execFile 内置 timeout 处理,非零退出码
+ * execFile 会 reject,被外层 catch 统一兜成 null,跟旧版 Bun.spawn 行为
+ * 一致(调用方拿 null 走 error 分支)。Linux-only:Windows 在 readSysInfo
+ * 入口已经 early-return,这里不会被命中。 */
 async function runSystemctl(args: string[], timeoutMs = 2000): Promise<string | null> {
   try {
-    const proc = Bun.spawn(['systemctl', '--user', ...args], {
-      stdout: 'pipe', stderr: 'pipe',
+    const { stdout } = await execFileAsync('systemctl', ['--user', ...args], {
+      timeout: timeoutMs,
+      maxBuffer: 4 * 1024 * 1024,
     })
-    const timer = setTimeout(() => {
-      try { proc.kill('SIGTERM') } catch {}
-    }, timeoutMs)
-    const text = await new Response(proc.stdout).text()
-    const code = await proc.exited
-    clearTimeout(timer)
-    if (code !== 0) return null
-    return text
+    return stdout
   } catch (e) {
     log(`sysinfo: systemctl ${args.join(' ')} failed: ${e}`)
     return null
@@ -265,6 +266,15 @@ async function readServices(): Promise<{ services: ServiceInfo[]; error: string 
 }
 
 export async function readSysInfo(): Promise<SysInfo> {
+  // Linux 专属:CPU/mem/disks 全靠 /proc + statfs,services 走
+  // `systemctl --user`。Windows 上这套全不可用,直接返回空 SysInfo,
+  // 让 `hi` 面板按 no_fallbacks 的约定渲染 `_n/a_`,不假数据也不
+  // 在日志里刷 systemctl/proc 的 ENOENT 噪音。Windows 真实指标
+  // (wmic / PowerShell Get-CimInstance) 留给以后用 Windows 真机
+  // spike,这里只做最低限度的"不崩"。
+  if (process.platform === 'win32') {
+    return { cpu: null, mem: null, disks: [], services: [], servicesError: 'Windows: sysinfo 暂未支持' }
+  }
   const cpu = readCpu()
   const mem = readMem()
   const disks = readDisks()
