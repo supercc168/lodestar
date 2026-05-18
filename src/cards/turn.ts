@@ -269,11 +269,12 @@ export function toolCallElement(
   }
 }
 
-/** Merged panel for a run of consecutive `Read` tool calls in one turn.
- * Header shows the dynamic count (`Read · 3 次`), body lists one row per
- * Read with its own status + file path. Replaces the individual panels
- * once a second Read joins the batch — single Reads still render as the
- * full `toolCallElement` (with file-contents dump on completion). */
+/** Panel for one or more `Read` tool calls in a row. Body lists file
+ * paths only — never the contents, since piping repo source into a
+ * Feishu group is the wrong default (chat history persists, the bot
+ * runs as the user, so anything readable on disk is one tool-call away
+ * from being archived in Lark). Header collapses to `Read: <path>` for
+ * a single item and `Read · N 次` once a run has joined. */
 export function readBatchElement(
   i: number,
   items: Array<{ input: any; output: string | null; isError: boolean }>,
@@ -282,7 +283,12 @@ export function readBatchElement(
   const anyError = items.some(it => it.isError)
   const allDone = items.every(it => it.output !== null)
   const status = anyError ? '❌' : allDone ? '✅' : '⏳'
-  const headerText = `${status} 🔧 Read · ${n} 次`
+  const headerText = n === 1
+    ? (() => {
+        const summary = summarizeToolInput('Read', items[0]?.input)
+        return summary ? `${status} 🔧 Read: ${summary}` : `${status} 🔧 Read`
+      })()
+    : `${status} 🔧 Read · ${n} 次`
   const lines = items.map(it => `\`${String(it.input.file_path ?? '(无 path)')}\``)
   return {
     tag: 'collapsible_panel',

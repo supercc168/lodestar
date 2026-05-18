@@ -50,16 +50,14 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
   if (name !== 'Read') s.currentTurn.openReadBatchI = null
   const i = s.currentTurn.toolCount++
   if (name === 'Read') {
-    // First Read of a potential run — render the existing single-tool
-    // panel (which keeps the full file-contents dump on completion). If
-    // a second Read arrives, completeTool/addTool will switch it to
-    // `readBatchElement`.
+    // First Read of a run — render the batch panel (file-paths only,
+    // never source). Subsequent Reads append into the same batch via
+    // the openReadBatchI fast-path above.
     s.currentTurn.openReadBatchI = i
-    s.currentTurn.readBatches.set(i, {
-      items: [{ toolUseId, input, output: null, isError: false }],
-    })
+    const items = [{ toolUseId, input, output: null, isError: false }]
+    s.currentTurn.readBatches.set(i, { items })
     s.currentTurn.toolByUseId.set(toolUseId, { i, name, input, readBatchSlot: 0 })
-    const el = cards.toolCallElement(i, name, input, null, '⏳', undefined, undefined)
+    const el = cards.readBatchElement(i, items)
     void cardkit.addElement(s.currentTurn.cardId, el, {
       type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
     })
@@ -143,17 +141,15 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
   // with a generic JSON dump. Bail out; the panel is done.
   if (meta.name === 'AskUserQuestion') return
   // Read batch path: update this row's status in the shared batch then
-  // re-render. Single-item batches keep the original full-output panel
-  // (file-contents dump); 2+ items switch to the compact `Read · N 次`
-  // listing, which overwrites whatever was last drawn at this i.
+  // re-render via the path-only `readBatchElement`. We never fall back
+  // to `toolCallElement` for Read — single or batched, the panel only
+  // ever lists file paths, not contents.
   if (meta.name === 'Read' && meta.readBatchSlot != null) {
     const batch = s.currentTurn.readBatches.get(meta.i)
     if (batch) {
       const row = batch.items[meta.readBatchSlot]
       if (row) { row.output = output; row.isError = isError }
-      const el = batch.items.length >= 2
-        ? cards.readBatchElement(meta.i, batch.items)
-        : cards.toolCallElement(meta.i, meta.name, meta.input, output, isError ? '❌' : '✅', meta.resolvedNote, undefined)
+      const el = cards.readBatchElement(meta.i, batch.items)
       void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
     }
     return
