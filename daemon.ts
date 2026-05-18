@@ -451,35 +451,34 @@ async function boot(): Promise<void> {
   await feishu.refreshChatList()
   setInterval(() => { void feishu.refreshChatList() }, 5 * 60 * 1000)
 
-  // Lark WSClient sends pings every ~120s but doesn't verify pongs. On a
-  // half-open TCP (NAT idle-kill, network blip) the socket stays OPEN and
-  // 'close' never fires — we'd go silently deaf. Stamp every inbound pong
-  // and exit(1) after 180s of silence so systemd reconnects us.
-  let lastPongAt = Date.now()
+  // Lark WSClient sends pings every ~120s but doesn't verify pongs by default.
+  // On a half-open TCP (NAT idle-kill, network blip) the socket stays OPEN and
+  // 'close' never fires — we'd go silently deaf. SDK exposes `pingTimeout`:
+  // after sending a ping, if no inbound frame arrives within the window the
+  // socket is terminated, which triggers the 'close' handler and the SDK's
+  // standard reconnect loop. The daemon process stays alive — every claude
+  // subprocess, ScheduleWakeup, card streaming state and setInterval is
+  // preserved across the WS hiccup. We only let systemd restart us if the
+  // SDK's own reconnect loop exhausts its retry budget (onError).
   const wsLogger = {
     error: (m: any[]) => log(`[ws-sdk error] ${fmt(m)}`),
     warn:  (m: any[]) => log(`[ws-sdk warn] ${fmt(m)}`),
     info:  (m: any[]) => log(`[ws-sdk] ${fmt(m)}`),
     debug: (_m: any[]) => { /* drop */ },
-    trace: (m: any[]) => {
-      if (Array.isArray(m) && m[0] === '[ws]' && m[1] === 'receive pong') {
-        lastPongAt = Date.now()
-      }
-    },
+    trace: (_m: any[]) => { /* drop */ },
   }
-  setInterval(() => {
-    const idle = Date.now() - lastPongAt
-    if (idle > 180_000) {
-      log(`[watchdog] no WS pong for ${Math.round(idle / 1000)}s — exit for systemd restart`)
-      process.exit(1)
-    }
-  }, 30_000)
-
   const ws = new lark.WSClient({
     appId: config.feishu.app_id,
     appSecret: config.feishu.app_secret,
-    loggerLevel: lark.LoggerLevel.trace,
+    loggerLevel: lark.LoggerLevel.info,
     logger: wsLogger,
+    wsConfig: { pingTimeout: 180 },
+    onReconnecting: () => log('[ws] reconnecting — WS lost, SDK is retrying'),
+    onReconnected:  () => log('[ws] reconnected'),
+    onError: (err) => {
+      log(`[ws] reconnect exhausted: ${err?.message ?? err} — exit for systemd restart`)
+      process.exit(1)
+    },
   })
   const dispatcher = new lark.EventDispatcher({})
   dispatcher.register({
