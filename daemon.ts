@@ -110,6 +110,85 @@ async function reviveAliveSessions(): Promise<void> {
   }
 }
 
+// ── Feishu `post` (rich-text) → Markdown ────────────────────────────────
+// 飞书客户端发 markdown 时,内容会被编码成 message_type='post' 的二维数组
+// AST,不是 'text'。下面把它反向拼回 markdown 字符串(claude 那头消化
+// markdown 比拍平纯文本更结构化),并把内嵌图片/文件 key 抽出来交给
+// `downloadAttachment` 走附件路径,跟原生 image/file 消息对齐。
+//
+// underline 故意不还原 —— markdown 无原生语法,而本项目用 <u>...</u> 标记
+// "多条独立消息",一旦塞进 text 会被 claude 当成消息边界误解。
+interface PostElement {
+  tag: string
+  text?: string
+  href?: string
+  style?: string[]
+  image_key?: string
+  file_key?: string
+  file_name?: string
+  user_id?: string
+  user_name?: string
+}
+function extractPostMarkdown(
+  contentObj: any,
+): { markdown: string; imageKeys: string[]; fileKeys: { key: string; name?: string }[] } {
+  const imageKeys: string[] = []
+  const fileKeys: { key: string; name?: string }[] = []
+  const paragraphs: string[] = []
+  const title = typeof contentObj?.title === 'string' ? contentObj.title.trim() : ''
+  if (title) paragraphs.push(`# ${title}`)
+  const blocks: PostElement[][] = Array.isArray(contentObj?.content) ? contentObj.content : []
+  for (const para of blocks) {
+    if (!Array.isArray(para)) continue
+    const parts: string[] = []
+    for (const el of para) {
+      if (!el || typeof el !== 'object') continue
+      switch (el.tag) {
+        case 'text': {
+          let t = String(el.text ?? '')
+          const styles = Array.isArray(el.style) ? el.style : []
+          if (styles.includes('bold')) t = `**${t}**`
+          if (styles.includes('italic')) t = `*${t}*`
+          if (styles.includes('lineThrough') || styles.includes('strikethrough')) t = `~~${t}~~`
+          parts.push(t)
+          break
+        }
+        case 'a': {
+          const href = String(el.href ?? '')
+          const t = String(el.text ?? href)
+          parts.push(`[${t}](${href})`)
+          break
+        }
+        case 'at': {
+          const name = String(el.user_name ?? el.user_id ?? '')
+          parts.push(`@${name}`)
+          break
+        }
+        case 'code_inline':
+          parts.push(`\`${String(el.text ?? '')}\``)
+          break
+        case 'hr':
+          parts.push('---')
+          break
+        case 'img':
+          if (el.image_key) imageKeys.push(String(el.image_key))
+          break
+        case 'media':
+          if (el.file_key) fileKeys.push({ key: String(el.file_key), name: el.file_name })
+          break
+        case 'emotion':
+          // 飞书表情没有合适的 markdown 还原,塞 `:key:` 反而像代码引用
+          break
+        default:
+          if (typeof el.text === 'string') parts.push(el.text)
+      }
+    }
+    const line = parts.join('')
+    if (line.trim()) paragraphs.push(line)
+  }
+  return { markdown: paragraphs.join('\n\n'), imageKeys, fileKeys }
+}
+
 // ── Inbound message handler ─────────────────────────────────────────────
 const STALE_THRESHOLD_MS = 5_000
 const seenMessageIds = new Set<string>()
@@ -186,13 +265,32 @@ async function handleMessage(data: any): Promise<void> {
   let contentObj: any = {}
   try { contentObj = JSON.parse(message.content ?? '{}') } catch {}
   const msgType = message.message_type as string
-  let text = (msgType === 'text' ? contentObj.text ?? '' : '').trim()
+  let text = ''
+  const filePaths: string[] = []
+  if (msgType === 'text') {
+    text = (contentObj.text ?? '').trim()
+  } else if (msgType === 'post') {
+    // 飞书客户端 markdown 走 'post' 富文本通道,不是 'text'。反向拼回
+    // markdown 给 claude,内嵌图片/文件 key 走跟原生 image/file 一样的
+    // downloadAttachment 路径。
+    const post = extractPostMarkdown(contentObj)
+    text = post.markdown.trim()
+    for (const key of post.imageKeys) {
+      const p = await feishu.downloadAttachment(message.message_id, key, 'image')
+      if (p) filePaths.push(p)
+    }
+    for (const f of post.fileKeys) {
+      const p = await feishu.downloadAttachment(message.message_id, f.key, 'file', f.name)
+      if (p) filePaths.push(p)
+    }
+  }
 
   // Text-only control commands — intercept before any work that would
   // forward to Claude (download / spawn / interrupt). Exact match,
   // case-insensitive: `hi` `kill` `restart` `clear`. Bare words are
   // reserved globally by user request — typing "hi" as a literal
-  // greeting will trigger the dashboard, not reach Claude.
+  // greeting will trigger the dashboard, not reach Claude. Post 富文本
+  // 整段不可能正好等于这些 bare word,所以这里只对 text 触发。
   if (msgType === 'text' && text) {
     if (await session.runCommand(text)) return
   }
@@ -201,24 +299,30 @@ async function handleMessage(data: any): Promise<void> {
   // instead of opening a new turn. This is how custom-text answers
   // work in this version — Feishu schema 2.0 doesn't support form/
   // input elements, so the chat box itself is the input. Only applies
-  // to text-only messages (an image attachment opens a new turn as
-  // usual). Bare-word commands have already been intercepted above.
+  // to text-only messages (post / 图片 / 文件附件都按一次新轮处理)。
   if (msgType === 'text' && text && session.hasPendingAsk()) {
     if (msgId) void feishu.addReaction(msgId, 'CheckMark')
     await session.onAskMessageAnswer(text, userOpenId)
     return
   }
 
-  let filePath: string | undefined
   if (msgType === 'image' && contentObj.image_key) {
-    filePath = await feishu.downloadAttachment(message.message_id, contentObj.image_key, 'image')
+    const p = await feishu.downloadAttachment(message.message_id, contentObj.image_key, 'image')
+    if (p) filePaths.push(p)
   } else if (msgType === 'file' && contentObj.file_key) {
-    filePath = await feishu.downloadAttachment(message.message_id, contentObj.file_key, 'file', contentObj.file_name)
+    const p = await feishu.downloadAttachment(message.message_id, contentObj.file_key, 'file', contentObj.file_name)
+    if (p) filePaths.push(p)
     if (!text) text = `(file: ${contentObj.file_name})`
   }
 
-  if (!text && !filePath) return
-  await session.onUserMessage(text || '(empty)', filePath ? [filePath] : [], userOpenId, msgId ?? '')
+  if (!text && filePaths.length === 0) {
+    // Post 已经走 markdown 解码;还落到空,要么是不支持的 message_type
+    // (sticker / share_chat / audio / ...),要么是 post 里只剩 emotion /
+    // 未知 tag。留 log 防再有"静默 1.5h"那种 case 没法回溯。
+    log(`drop empty message ${msgId} type=${msgType}`)
+    return
+  }
+  await session.onUserMessage(text || '(empty)', filePaths, userOpenId, msgId ?? '')
 }
 
 // ── Card action handler ────────────────────────────────────────────────
@@ -366,7 +470,15 @@ async function boot(): Promise<void> {
   const dispatcher = new lark.EventDispatcher({})
   dispatcher.register({
     'im.message.receive_v1': async (d: any) => {
-      try { await handleMessage(d) } catch (e) { log(`handleMessage: ${e}`) }
+      // ⚠️ 不要 await handleMessage —— Lark WS 长连接对事件 ack 有 ~4s
+      // 硬超时,handleMessage 内部可能触发 openTurnCard / spawn claude /
+      // sendInterrupt 等数百 ms~数秒的链路,任一组合超 4s 飞书侧就判投递
+      // 失败把事件直接丢弃(后台 event log 里这一类 errorInfo=timeout,
+      // costMills≈3760ms,用户侧表现就是"发的消息 daemon 完全没收到")。
+      // 这里立刻 return 让 dispatcher 回 ack,实际处理后台跑;handleMessage
+      // 入口已用 seenMessageIds 做了同 message_id 去重,fire-and-forget
+      // 不会引入重复处理。
+      handleMessage(d).catch(e => log(`handleMessage: ${e}`))
     },
   })
   dispatcher.register({
