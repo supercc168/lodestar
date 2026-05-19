@@ -23,7 +23,8 @@ import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
 import { readSysInfo } from './sysinfo'
-import { readUsage } from './usage'
+import { readUsage, type UsageSnapshot } from './usage'
+import { listSchedules } from './schedule'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
@@ -499,17 +500,20 @@ export class Session {
     return false
   }
 
-  async showConsole(): Promise<void> {
+  /** Build the hi-panel card object for this session.
+   *
+   * Pulled out of `showConsole` so callback handlers (e.g. schedule
+   * delete / toggle-mode buttons) can re-render the panel in place via
+   * `update_multi: true` without having to send a fresh message. Passing
+   * `usage=undefined` paints the `_加载中…_` placeholder — the caller is
+   * responsible for the async patch if the panel was sent (not just
+   * returned in a callback response). */
+  async buildConsoleCard(usage: UsageSnapshot | undefined): Promise<object> {
     const uptimeMs = this.startedAt ? (Date.now() - this.startedAt) : undefined
-    // Strip the `claude-` prefix so the panel stays compact: `opus-4-7`
-    // reads better than `claude-opus-4-7` in the small status header.
     const rawModel = this.proc?.lastModel ?? null
     const model = rawModel ? rawModel.replace(/^claude-/, '') : undefined
-    // readSysInfo 全程是本机调用 (/proc + statfs + 本地 systemctl),最坏
-    // 情况由 runSystemctl 的 2s 超时兜底。在 sendCard 前 await 一下,把
-    // CPU/mem/disk/services 一次性塞进首屏,不走 element patch 的二段刷新。
     const sysinfo = await readSysInfo()
-    const card = cards.consoleCard({
+    return cards.consoleCard({
       sessionName: this.sessionName,
       status: this.status,
       model,
@@ -518,11 +522,7 @@ export class Session {
       peers: [...Session.all]
         .filter(s => s.isRunning())
         .map(s => ({ ...s.peerSnapshot(), isCurrent: s === this })),
-      // Initial paint without usage → cards.ts renders the
-      // `_加载中…_` placeholder in the consoleUsage element. We patch
-      // it in below once readUsage() resolves (ccusage cold-call is
-      // ~5s; not worth blocking the panel on it).
-      usage: undefined,
+      usage,
       contextTokens: this.currentContextTokens(),
       contextLimit: this.contextWindowMax(),
       cumStats: this.cumStats,
@@ -535,7 +535,26 @@ export class Session {
         : undefined,
       sessionId: this.proc?.sessionId ?? this.lastSessionId,
       sysinfo,
+      // List ALL schedules across every project — hi panel is a global
+      // dashboard. Each panel shows its `project` so the user can tell
+      // them apart; the buttons (toggle / delete) also operate
+      // cross-project, no per-session scoping. The MCP path (claude
+      // invoking schedule_create/delete from inside a chat) still
+      // scopes by project — that's a different attack surface (claude
+      // running with arbitrary prompts inside one group shouldn't be
+      // able to nuke another group's schedules), while the hi card is
+      // operator-only (only humans in your bound groups can press the
+      // button).
+      schedules: listSchedules(),
     })
+  }
+
+  async showConsole(): Promise<void> {
+    // Initial paint without usage → cards.ts renders the
+    // `_加载中…_` placeholder in the consoleUsage element. We patch
+    // it in below once readUsage() resolves (ccusage cold-call is
+    // ~5s; not worth blocking the panel on it).
+    const card = await this.buildConsoleCard(undefined)
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) return
     // Patch the usage element asynchronously so the rest of the panel

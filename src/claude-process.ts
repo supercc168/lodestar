@@ -21,7 +21,7 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { basename, delimiter, join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import type { Readable, Writable } from 'node:stream'
 import { config } from './config'
@@ -193,6 +193,27 @@ export class ClaudeProcess extends EventEmitter {
       args.push('--resume', opts.resumeSessionId)
       if (opts.resumeAtUuid) args.push('--resume-session-at', opts.resumeAtUuid)
     }
+
+    // Inject the daemon-hosted MCP server, scoped to this project via
+    // the URL path. We use the project name (= workDir basename, which
+    // mirrors session name) so each subprocess can only reach its own
+    // schedules — see src/mcp-server.ts. `--mcp-config` accepts the
+    // config as a JSON string directly, no temp file needed, which is
+    // the whole point of this approach: zero disk-touching, the daemon
+    // hands every spawned child the right wiring at spawn time. URL
+    // path is encoded to survive Unicode group names (the project name
+    // pipeline goes through sanitizeSessionName but kept as a defense
+    // in depth in case the workDir contains unexpected chars).
+    const project = basename(opts.workDir)
+    const mcpConfig = {
+      mcpServers: {
+        lodestar: {
+          type: 'http',
+          url: `http://127.0.0.1:${config.notify.port}/mcp/${encodeURIComponent(project)}`,
+        },
+      },
+    }
+    args.push('--mcp-config', JSON.stringify(mcpConfig))
 
     log(`claude-process: spawn ${claudeBin} (cwd=${opts.workDir})`)
     // 把 setup 向导写到 config.toml 的 [claude.env] 节整段注入子进程 env。

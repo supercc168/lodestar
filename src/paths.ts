@@ -61,6 +61,11 @@ export const PID_FILE = join(DATA_DIR, 'daemon.pid')
 export const LOG_FILE = join(DATA_DIR, 'daemon.log')
 export const SESSION_CHAT_MAP_FILE = join(DATA_DIR, 'session-chat-map.json')
 export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
+/** Persisted schedule list — managed by src/schedule.ts. Each entry
+ * is `{ id, project, prompt, mode, level, cron?, fireAt?, ... }`;
+ * see Schedule type for the full shape. Loaded at daemon boot, written
+ * idempotent on any mutation (create / fire / delete). */
+export const SCHEDULES_FILE = join(DATA_DIR, 'schedules.json')
 /** Marker file written at shutdown listing the session names that
  * were still alive. The next daemon boot reads it (and unlinks it)
  * to auto-revive those sessions via `restart(true)` — bridges the

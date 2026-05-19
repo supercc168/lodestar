@@ -23,6 +23,8 @@ import { dirname } from 'node:path'
 import { Session } from './src/session'
 import * as feishu from './src/feishu'
 import { startNotifyServer } from './src/notify'
+import { ensureFeishuNotifySkill } from './src/notify-skill'
+import { startScheduler, deleteSchedule, toggleScheduleMode, getSchedule } from './src/schedule'
 import { config } from './src/config'
 import { log } from './src/log'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
@@ -356,6 +358,36 @@ async function handleCardAction(data: any): Promise<any> {
       await session.onAskAnswer(value.tool_use_id, value.question_idx ?? 0, value.option_idx, userId)
       return { toast: { type: 'success', content: '已回答' } }
     }
+    case 'schedule_delete': {
+      // hi 面板是全局 dashboard,跨群删除允许。button payload 只带 id,
+      // daemon 端按 id 查到 → 直接删。MCP path 那边的 schedule_delete
+      // 仍然是 project-scoped(claude 在 A 群没法删 B 群的),两个路径
+      // 信任模型不同:hi 是 operator-only(只有你飞书账号能按),MCP 是
+      // claude-on-prompts(prompt 注入风险)。
+      const id = String(value.id ?? '')
+      if (!id) return { toast: { type: 'error', content: '缺 id' } }
+      const sched = getSchedule(id)
+      if (!sched) return { toast: { type: 'error', content: '任务不存在(可能已被删除)' } }
+      deleteSchedule(id)
+      const newCard = await session.buildConsoleCard(undefined)
+      return {
+        toast: { type: 'success', content: `已删除 ⏰ ${sched.name} (${sched.project})` },
+        card: { type: 'raw', data: newCard },
+      }
+    }
+    case 'schedule_toggle_mode': {
+      const id = String(value.id ?? '')
+      if (!id) return { toast: { type: 'error', content: '缺 id' } }
+      const sched = getSchedule(id)
+      if (!sched) return { toast: { type: 'error', content: '任务不存在' } }
+      const updated = toggleScheduleMode(id)
+      if (!updated) return { toast: { type: 'error', content: '切换失败' } }
+      const newCard = await session.buildConsoleCard(undefined)
+      return {
+        toast: { type: 'success', content: `⏰ ${updated.name} (${updated.project}) → ${updated.mode}` },
+        card: { type: 'raw', data: newCard },
+      }
+    }
   }
   return { toast: { type: 'info', content: 'unknown action' } }
 }
@@ -504,6 +536,20 @@ async function boot(): Promise<void> {
 
   startDebugSocket()
   startNotifyServer({ bind: config.notify.bind, port: config.notify.port })
+
+  // Sync the feishu-notify skill into ~/.claude/skills (idempotent).
+  // Lets the user's main Claude session push to bound groups via
+  // /notify without manually placing the skill file. Runs after
+  // notify server is up so the port number we bake into the skill
+  // body matches what's actually listening.
+  ensureFeishuNotifySkill()
+
+  // Bring up the scheduler — loads persisted schedules.json, starts
+  // the per-minute tick, fires anything that came due while the
+  // daemon was down. Independent of the sessions Map (each fire
+  // spawns a fresh isolated ClaudeProcess via MCP), so order vs.
+  // reviveAliveSessions does not matter for correctness.
+  startScheduler()
 
   // Auto-revive sessions that were running when we last went down.
   // Runs AFTER the WS is up so any 🔁 revive message lands in the
