@@ -216,6 +216,17 @@ export class Session {
    * `🔁 SDK 错误自动续` banner、不渲染 "📥 收到" panel。一次性使用,
    * 决定 trigger 后立即 reset null。 */
   private nextOpenKind: 'auto_retry' | 'no_followup_retry' | 'tool_error_retry' | null = null
+  /** One-shot: user invoked `stop` during the current turn. Set right
+   * before `sendInterrupt`; consumed by the next `result` handler to
+   * short-circuit the autoRetry branch. Without this, the SDK's post-
+   * interrupt result (typically `is_error:true subtype:error_during_execution`)
+   * falls into `isError && !hasMidTurn` and the daemon helpfully
+   * sendUserText('继续') + opens a fresh card stamped `🔁 SDK 错误自动续`
+   * — exactly the thing the user explicitly told us to stop. The 🛑 打断
+   * footer was already painted by the stop case's own closeTurnCard,
+   * so this just suppresses the follow-up retry. Reset by exit handler
+   * for the proc-died-before-result case. */
+  private userInterrupted = false
   // Last seen sessionId — preserved across `kill`/`stop` so a later
   // `restart` can resume the same Claude conversation even after the
   // child process is gone.
@@ -467,10 +478,19 @@ export class Session {
         this.lastUserOpenId = ''
         this.pendingReactionIds = new Map()
         this.currentBatchReactionIds = new Map()
+        // Tag the imminent SDK `result` (which DOES arrive after sendInterrupt
+        // with is_error:true subtype:error_during_execution — the comment
+        // below was wrong) so the result handler doesn't read it as a real
+        // SDK failure and helpfully autoRetry into `🔁 SDK 错误自动续`. Must
+        // be set BEFORE sendInterrupt — the result can land on the next tick.
+        this.userInterrupted = true
+        this.awaitingFollowup = null
+        this.consecutiveErrors = 0
         this.interrupt()
-        // SDK 收到 interrupt 后不发 `result`,没人会触发 closeTurnCard。
-        // 这里主动封口,把 footer 改成 🛑 打断、折叠 thinking、把
-        // streaming_mode 翻回 false,否则卡片会僵在 `⏳ working…`。
+        // 主动封口,把 footer 改成 🛑 打断、折叠 thinking、把 streaming_mode
+        // 翻回 false,否则卡片会僵在 `⏳ working…`。SDK 的 post-interrupt
+        // result 也会进 closeTurnCard,但 currentTurn 已被这里置空,那条
+        // 路径会 early-return,不会重画 footer。
         await this.closeTurnCard('🛑 打断')
         return true
       case 'kill':
@@ -879,6 +899,20 @@ export class Session {
     })
     p.on('result', () => {
       this.accumulateResultStats()
+      // User just hit `stop` — this result is the SDK closing the in-flight
+      // turn after sendInterrupt landed (subtype=error_during_execution,
+      // is_error=true). The card already shows `🛑 打断` from the stop
+      // case's closeTurnCard. Skip the rest unconditionally: NO suffix
+      // overwrite, NO consecutiveErrors bump, NO sendUserText('继续'),
+      // NO nextOpenKind='auto_retry'. One-shot, read+reset.
+      if (this.userInterrupted) {
+        this.userInterrupted = false
+        const subtype = this.proc?.lastResult.subtype ?? 'unknown'
+        const isError = this.proc?.lastResult.is_error === true
+        log(`session "${this.sessionName}": SDK result after user stop subtype=${subtype} isError=${isError} — suppress autoRetry`)
+        this.status = 'idle'
+        return
+      }
       // Three orthogonal signals fold into one footer suffix + push/retry
       // decision here:
       //   1. `pendingMidTurnMsgs` — user typed during the turn; their
@@ -983,6 +1017,7 @@ export class Session {
       this.openingTurn = false
       this.consecutiveErrors = 0
       this.awaitingFollowup = null
+      this.userInterrupted = false
       this.status = 'stopped'
       if (!expected && code !== 0 && signal !== 'SIGTERM') {
         void feishu.sendText(this.chatId, `⚠️ Claude 异常退出 (code=${code}, signal=${signal})。回复任意消息将重新启动。`)
