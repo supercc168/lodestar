@@ -23,6 +23,7 @@ AI 不是帮手,是倍率。它放大的不是体力,是你——你的直觉、
 - 🔄 **自动 resume**:重启后上次活跃 session 全部 `--resume`,主动 `kill` 过的不吵醒
 - 🛡 **守护级稳定**:WS watchdog + 单 PID + alive marker
 - 📡 **HTTP 通知端点**:任意本机进程 `POST /notify` 把 markdown 推成卡片,info / warn / error 染色
+- ⏰ **定时任务**:让 Claude 自己定期跑一轮,每次 fire 起 fresh 子进程不累积上下文;silent 只推结果 / verbose 全 transcript 可切;hi 面板带删/切按钮
 
 ## 怎么用
 
@@ -172,7 +173,33 @@ cron / systemd hook 用法:
        -d '{"project":"ops","level":"error","text":"❌ nightly backup FAILED"}'
 ```
 
-> 想让 Claude Code 自己说一句 "build 完通知我" 就推送 —— 在 `~/.claude/skills/feishu-notify/SKILL.md` 放一个带触发关键词的 skill,把上面这段 curl 抄进去即可。项目本身不附带 skill 文件。
+> 想让 Claude Code 自己说一句 "build 完通知我" 就推送 —— daemon 启动时**自动同步** `~/.claude/skills/feishu-notify/SKILL.md`,主端 Claude 立即就能用关键词触发(`LODESTAR_DISABLE_SKILL_SYNC=1` 关闭自动同步)。
+
+## 定时任务(Schedule)
+
+让 Claude **自己**定期跑一轮 —— 比上面 cron-curl 推卡片有用一个量级:每次 fire 起一个**全新的 Claude 子进程**(无 `--resume`、fresh `sessionId`、`bypassPermissions`、cwd = 项目目录),让它读最新的 git 状态 / 日志文件 / API,自己分析,然后把结果按你定义的格式贴回群里。
+
+**怎么加**:在群里跟 Claude 说"以后每天早上 9 点 silent 给我总结昨天的 PR"就行 —— claude 会调 MCP 工具 `schedule_create` 落到 daemon 的 `schedules.json`。
+
+| 工具 | 用途 |
+| --- | --- |
+| `schedule_create` | cron 周期(标准 5 段 `m h dom mon dow`,支持 `*` `*/N` `a,b,c` `a-b`) |
+| `schedule_once` | 一次性延时(对齐内置 `ScheduleWakeup` 语义) |
+| `schedule_list` | 当前项目所有 schedule |
+| `schedule_delete` | 按 id 删除 |
+
+MCP 工具是 daemon spawn claude 时通过 `--mcp-config` 注入的 —— **不用碰 `~/.claude.json`**;每个群独立 URL path `/mcp/<project>` 钉死项目,跨群零泄漏。
+
+**两种 fire 输出**:
+
+| 模式 | 输出 | 适用 |
+| --- | --- | --- |
+| `silent`(默认) | 只把最终 assistant text 推一张 notify 风格卡 | 每日报告、状态摘要、不打扰 |
+| `verbose` | 完整 transcript:prompt 折叠 + assistant 段 + 工具调用 panel(input + output)+ 耗时/token footer | 偶尔检查任务跑得对不对 |
+
+**`hi` 面板**:任意群发 `hi`,**⏰ 定时任务** 段列出 daemon 名下所有 schedule(跨项目全局 dashboard),每条带 `📁 项目` + `🔕silent` / `📜verbose` + 下次触发时间,展开看完整 prompt + cron + 上次触发,两个按钮 **切换 mode** / **🗑 删除** 走 `update_multi` 原地刷新当前卡。
+
+**对比 SDK 自带的 `ScheduleWakeup` / `CronCreate`**:daemon 这一层补三件事 —— 持久化(daemon 重启不丢)、每次 fire 干净进程(不累积上下文)、跨项目可见(hi 面板)。
 
 ## 许可
 
