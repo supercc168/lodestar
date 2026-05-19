@@ -6,17 +6,20 @@
  * streaming_mode, no cardkit Promise queue, no sequence dance — just
  * `feishu.sendCard(chatId, scheduledSummaryCard(...))` once.
  *
- * Why a separate renderer instead of reusing src/cards.ts: that module
- * is wired into Session's streaming lifecycle (per-element id, in-place
- * mutation via cardkit PUT, ticker activity indicator, footer slot for
- * streamText). The scheduled fire path has none of that — it gets one
- * shot at rendering a finished transcript and is done. Sharing the
- * helpers would force every "render one tool call" function to handle
- * both modes; cheaper to duplicate ~50 lines.
+ * Tool-panel rendering routes through the same `toolCallElement` /
+ * `readBatchElement` helpers the streaming session uses, so a `Bash`
+ * panel from a cron fire looks byte-for-byte identical to one from a
+ * live user turn (header `⏳ 🔧 Bash: …`, JSON-input block, output
+ * block, all collapsible). Read batches collapse the same way:
+ * consecutive Read calls fold into one path-only panel, broken by
+ * any non-Read tool or assistant text. The differences a reader can
+ * spot are intentional — `⏰ <name>` header, collapsed prompt panel,
+ * `via ⏰ schedule` footer — and limited to the surrounding chrome.
  */
 
 import type { ClaudeResultMeta } from '../claude-process'
 import type { ScheduleLevel } from '../schedule'
+import * as cards from '../cards'
 
 export interface CollectedTool {
   id: string
@@ -38,68 +41,8 @@ interface ScheduledSummaryOpts {
   level: ScheduleLevel
 }
 
-// Same character budget as cards.ts uses for the inline tool input summary.
-const INPUT_SUMMARY_MAX = 80
-// Feishu markdown elements have a ~2000-char practical ceiling per block
-// before render starts misbehaving; tool output that big gets truncated
-// with a clear marker.
-const OUTPUT_TRUNC_AT = 1800
-
 function escapeMd(s: string): string {
   return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-}
-
-function summarizeInput(name: string, input: any): string {
-  if (!input || typeof input !== 'object') return ''
-  // Per-tool sensible-first picks; otherwise fall back to a generic JSON
-  // squashed onto one line. Mirrors the spirit of cards.ts's
-  // inputSummary without sharing code.
-  const get = (k: string) => typeof input[k] === 'string' ? input[k] as string : null
-  let summary = ''
-  switch (name) {
-    case 'Bash': case 'BashOutput':
-      summary = get('command') ?? get('description') ?? '' ; break
-    case 'Read': case 'Write': case 'Edit': case 'NotebookEdit':
-      summary = get('file_path') ?? '' ; break
-    case 'Glob': case 'Grep':
-      summary = get('pattern') ?? '' ; break
-    case 'WebFetch': case 'WebSearch':
-      summary = get('url') ?? get('query') ?? '' ; break
-    default:
-      try { summary = JSON.stringify(input).slice(0, 200) } catch { summary = '' }
-  }
-  summary = summary.replace(/\s+/g, ' ').trim()
-  if (summary.length > INPUT_SUMMARY_MAX) summary = summary.slice(0, INPUT_SUMMARY_MAX - 1) + '…'
-  return summary
-}
-
-function toolPanel(t: CollectedTool, idx: number): object {
-  const status = t.isError ? '❌' : (t.output === null ? '⏳' : '✅')
-  const inputSummary = summarizeInput(t.name, t.input)
-  const header = inputSummary
-    ? `${status} **${t.name}** \`${escapeMd(inputSummary)}\``
-    : `${status} **${t.name}**`
-  const bodyParts: string[] = []
-  // Input block
-  let inputStr: string
-  try { inputStr = JSON.stringify(t.input, null, 2) } catch { inputStr = String(t.input) }
-  bodyParts.push(`**input**\n\`\`\`json\n${inputStr}\n\`\`\``)
-  // Output block (truncated if needed)
-  if (t.output !== null) {
-    let out = t.output
-    if (out.length > OUTPUT_TRUNC_AT) {
-      out = out.slice(0, OUTPUT_TRUNC_AT) + `\n…（截断 ${t.output.length - OUTPUT_TRUNC_AT} 字符）`
-    }
-    bodyParts.push(`**output**${t.isError ? ' ❌' : ''}\n\`\`\`\n${out}\n\`\`\``)
-  } else {
-    bodyParts.push('_(无 output — turn 中途结束或工具未返回)_')
-  }
-  return {
-    tag: 'collapsible_panel',
-    header: { title: { tag: 'plain_text', content: `[${idx + 1}] ${header}` } },
-    expanded: false,
-    elements: bodyParts.map(content => ({ tag: 'markdown', content })),
-  }
 }
 
 function fmtElapsed(ms: number): string {
@@ -120,6 +63,50 @@ function fmtTokens(meta: ClaudeResultMeta): string {
   return `📥 ${fmtN(inT)} · 📤 ${fmtN(outT)}`
 }
 
+function toolStatus(t: CollectedTool): '⏳' | '✅' | '❌' {
+  if (t.output === null) return '⏳'
+  return t.isError ? '❌' : '✅'
+}
+
+/** Render the collected tool list into card elements, mirroring the
+ * streaming-session contract: consecutive `Read` calls fold into one
+ * `readBatchElement`, broken by any non-Read tool or by an assistant
+ * text segment in between. Assistant segments are interleaved at the
+ * positions where the collector flushed them (segs[i] is whatever
+ * landed before tools[i]; segs[N] is the trailing tail after the
+ * last tool). */
+function renderBody(
+  segs: string[],
+  tools: CollectedTool[],
+): object[] {
+  const out: object[] = []
+  let batch: { i: number; items: Array<{ input: any; output: string | null; isError: boolean }> } | null = null
+  const flushBatch = () => {
+    if (!batch) return
+    out.push(cards.readBatchElement(batch.i, batch.items))
+    batch = null
+  }
+  const maxLen = Math.max(segs.length, tools.length)
+  for (let i = 0; i < maxLen; i++) {
+    const seg = segs[i]
+    if (seg && seg.trim()) {
+      flushBatch()
+      out.push({ tag: 'markdown', content: seg })
+    }
+    const t = tools[i]
+    if (!t) continue
+    if (t.name === 'Read') {
+      if (!batch) batch = { i, items: [] }
+      batch.items.push({ input: t.input, output: t.output, isError: t.isError })
+      continue
+    }
+    flushBatch()
+    out.push(cards.toolCallElement(i, t.name, t.input, t.output, toolStatus(t)))
+  }
+  flushBatch()
+  return out
+}
+
 export function scheduledSummaryCard(opts: ScheduledSummaryOpts): object {
   const template = opts.crashed || opts.meta.is_error ? 'red'
     : opts.level === 'error' ? 'red'
@@ -136,28 +123,14 @@ export function scheduledSummaryCard(opts: ScheduledSummaryOpts): object {
     elements: [{ tag: 'markdown', content: escapeMd(opts.prompt) }],
   })
 
-  // 2) Body — interleave assistant segments and tool panels in roughly
-  // source order. We don't actually preserve perfect interleaving (the
-  // collector flushes the current segment whenever a tool fires, so the
-  // segs[i] / tools[i] pairing is the natural order). For a "summary"
-  // card this fidelity is enough — anyone needing full step-by-step
-  // ordering should use silent mode and trigger turns from a real
-  // user-message session.
-  const segs = opts.assistantSegs
-  const tools = opts.tools
-  // First: segments before tool 0
-  const maxLen = Math.max(segs.length, tools.length)
-  for (let i = 0; i < maxLen; i++) {
-    const seg = segs[i]
-    if (seg && seg.trim()) {
-      elements.push({ tag: 'markdown', content: seg })
-    }
-    if (tools[i]) {
-      elements.push(toolPanel(tools[i], i))
-    }
-  }
-  if (segs.length === 0 && tools.length === 0) {
+  // 2) Body — interleaved assistant segments and tool panels in
+  // collector order, with Read batching applied so the panel layout
+  // matches a live streaming turn.
+  const bodyElements = renderBody(opts.assistantSegs, opts.tools)
+  if (bodyElements.length === 0) {
     elements.push({ tag: 'markdown', content: '_（无输出）_' })
+  } else {
+    elements.push(...bodyElements)
   }
 
   // 3) Footer — elapsed + tokens + crashed indicator
