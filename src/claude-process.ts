@@ -216,11 +216,13 @@ export class ClaudeProcess extends EventEmitter {
     args.push('--mcp-config', JSON.stringify(mcpConfig))
 
     log(`claude-process: spawn ${claudeBin} (cwd=${opts.workDir})`)
-    // 把 setup 向导写到 config.toml 的 [claude.env] 节整段注入子进程 env。
-    // 设计成"任意 key/value" 让 DeepSeek (8 个 ANTHROPIC_* / CLAUDE_CODE_*
-    // env)、GLM、anthropic-proxy 之流都能一套 schema 装下,不用 Windows
-    // 用户碰系统级环境变量。展开顺序: 默认 env → 我们的 PATH/log → user
-    // 配置的 claude.env (优先级最高,会覆盖前面同名 key)。
+    // config.toml [claude.env] 节整段注入子进程 env(可选,向后兼容 / 高级
+    // 用户配私有后端用)。注: setup 向导现在把 DeepSeek 这类第三方后端写到
+    // claude 自己的 ~/.claude/settings.json 的 env 字段(claude 原生机制,
+    // 终端直接跑也生效),默认不再往 config.toml [claude.env] 写;这条注入
+    // 留给"只想让 lodestar spawn 的 claude 走某后端、不污染全局 claude 配置"
+    // 的场景。展开顺序: 默认 env → 我们的 PATH/log → config.claude.env
+    // (优先级最高,会覆盖前面同名 key)。
     const env: Record<string, string> = {
       ...(process.env as Record<string, string>),
       NPM_CONFIG_LOGLEVEL: 'error',

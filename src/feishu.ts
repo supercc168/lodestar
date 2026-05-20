@@ -522,16 +522,28 @@ export function provisionProject(workDir: string): void {
   try { execSync('git init -q', { cwd: workDir, stdio: 'ignore' }) } catch {}
 }
 
-/** True when the user wired claude to a non-firstParty backend (DeepSeek /
- * GLM / any anthropic-compatible proxy) via config.toml's [claude.env].
- * Those backends auth with ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY against
- * a custom ANTHROPIC_BASE_URL and never touch `claude auth login` — so the
- * firstParty probe below is simply the wrong question for them.
- * Session.start() short-circuits on this so a perfectly-configured DeepSeek
- * user never hits the bogus "未登录 Anthropic 账号" wall. */
+/** True when claude will hit a non-firstParty backend (DeepSeek / GLM / any
+ * anthropic-compatible proxy) and therefore needs no `claude auth login`.
+ * Such backends auth with ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY against a
+ * custom ANTHROPIC_BASE_URL, so the firstParty probe is the wrong question —
+ * Session.start() short-circuits on this so a configured DeepSeek user never
+ * hits the bogus "未登录 Anthropic 账号" wall. Checks all three places those
+ * vars can reach the spawned claude from:
+ *   ① ~/.claude/settings.json `env` — claude's own config, where the setup
+ *      wizard now writes DeepSeek (claude reads it natively, terminal too);
+ *   ② config.toml [claude.env]    — spawn-time injection (back-compat);
+ *   ③ this daemon's own process env — user `export`ed it, child inherits. */
 export function hasCustomClaudeBackend(): boolean {
-  const env = config.claude.env
-  return !!(env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY || env.ANTHROPIC_BASE_URL)
+  const keys = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'] as const
+  const cfgEnv = config.claude.env
+  if (keys.some(k => cfgEnv[k])) return true
+  if (keys.some(k => process.env[k])) return true
+  try {
+    const settings = JSON.parse(readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8'))
+    const env = settings?.env
+    if (env && typeof env === 'object' && keys.some(k => env[k])) return true
+  } catch {}
+  return false
 }
 
 export function isAnthropicAuthenticated(): boolean {

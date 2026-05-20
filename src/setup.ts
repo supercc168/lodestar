@@ -7,8 +7,11 @@
  *   1. Ensure claude CLI is on PATH (npm i -g @anthropic-ai/claude-code
  *      if missing).
  *   2. Pick LLM backend — user's existing auth (subscription / API
- *      key / pre-set env) OR DeepSeek (auto-configures the 8 env vars
- *      per DeepSeek's official Claude Code integration docs).
+ *      key / pre-set env) OR DeepSeek (writes the 8 env vars from
+ *      DeepSeek's official Claude Code integration docs straight into
+ *      ~/.claude/settings.json's `env` field — claude's own native
+ *      backend-switch mechanism, so a bare `claude` in the terminal
+ *      uses DeepSeek too, not just the one lodestar spawns).
  *   3. Feishu app — opens https://open.feishu.cn/app, lists every
  *      permission scope + event subscription step, and verifies the
  *      pasted app_id / app_secret against tenant_access_token endpoint
@@ -22,7 +25,8 @@
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { homedir } from 'node:os'
 import { createInterface } from 'node:readline/promises'
 import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -82,6 +86,32 @@ function escapeTomlString(s: string): string {
   // Mirrors the unescape in src/config.ts parseToml — \ → \\, " → \".
   // Windows paths (C:\Users\...) round-trip correctly through both.
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+}
+
+/** Merge env vars into Claude Code's own settings.json (`env` field) — the
+ * native, documented mechanism for pointing claude at a third-party
+ * anthropic-compatible backend (DeepSeek / GLM / …). Reads + parses the
+ * existing user settings, sets only the keys we own, leaves the user's
+ * other env vars / hooks / permissions / theme untouched, writes back
+ * pretty-printed (0o600 — it now holds an API token). Returns path +
+ * ok/error so the caller can surface a clear failure instead of silently
+ * dropping the backend config. */
+function mergeClaudeSettingsEnv(envVars: Record<string, string>): { path: string; ok: boolean; error?: string } {
+  const claudeDir = join(homedir(), '.claude')
+  const settingsPath = join(claudeDir, 'settings.json')
+  try {
+    mkdirSync(claudeDir, { recursive: true })
+    let settings: any = {}
+    if (existsSync(settingsPath)) {
+      try { settings = JSON.parse(readFileSync(settingsPath, 'utf8')) } catch { settings = {} }
+    }
+    if (!settings.env || typeof settings.env !== 'object') settings.env = {}
+    for (const [k, v] of Object.entries(envVars)) settings.env[k] = v
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', { mode: 0o600 })
+    return { path: settingsPath, ok: true }
+  } catch (e: any) {
+    return { path: settingsPath, ok: false, error: e?.message ?? String(e) }
+  }
 }
 
 // ── claude CLI detection / install ─────────────────────────────────
@@ -233,7 +263,6 @@ export async function runSetup(): Promise<void> {
     { label: `${C.bold}用 DeepSeek${C.reset}${C.dim} (国内可用, 人民币计费, 推荐)${C.reset}`, value: 'deepseek' },
   ])
 
-  const claudeEnv: Record<string, string> = {}
   if (backend === 'deepseek') {
     console.log()
     console.log('打开浏览器拿 DeepSeek API key:')
@@ -246,16 +275,33 @@ export async function runSetup(): Promise<void> {
 
     // 完全按 DeepSeek 官方 claude_code 集成文档:
     // https://api-docs.deepseek.com/zh-cn/quick_start/agent_integrations/claude_code
-    claudeEnv.ANTHROPIC_BASE_URL          = 'https://api.deepseek.com/anthropic'
-    claudeEnv.ANTHROPIC_AUTH_TOKEN        = dsKey
-    claudeEnv.ANTHROPIC_MODEL             = 'deepseek-v4-pro'
-    claudeEnv.ANTHROPIC_DEFAULT_OPUS_MODEL   = 'deepseek-v4-pro'
-    claudeEnv.ANTHROPIC_DEFAULT_SONNET_MODEL = 'deepseek-v4-pro'
-    claudeEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL  = 'deepseek-v4-flash'
-    claudeEnv.CLAUDE_CODE_SUBAGENT_MODEL  = 'deepseek-v4-flash'
-    claudeEnv.CLAUDE_CODE_EFFORT_LEVEL    = 'max'
+    const deepseekEnv: Record<string, string> = {
+      ANTHROPIC_BASE_URL:             'https://api.deepseek.com/anthropic',
+      ANTHROPIC_AUTH_TOKEN:           dsKey,
+      ANTHROPIC_MODEL:                'deepseek-v4-pro',
+      ANTHROPIC_DEFAULT_OPUS_MODEL:   'deepseek-v4-pro',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'deepseek-v4-pro',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL:  'deepseek-v4-flash',
+      CLAUDE_CODE_SUBAGENT_MODEL:     'deepseek-v4-flash',
+      CLAUDE_CODE_EFFORT_LEVEL:       'max',
+    }
+    // 写进 claude 自己的配置文件 ~/.claude/settings.json 的 env 字段 —— 这是
+    // Claude Code 原生、文档明示"应用于每个 session 和所有子进程"的后端切换
+    // 机制,比 lodestar 运行时注入进程 env 更持久、更标准:用户在终端直接跑
+    // claude 也走 DeepSeek,不只 lodestar spawn 的那个。merge 而非覆盖,保住
+    // 用户既有的 env / hooks / 其它字段。
     console.log()
-    console.log(`${C.green}✓ DeepSeek 配置已记录${C.reset} (写到 [claude.env] 节, daemon 拉起 claude 时自动注入)`)
+    const r = mergeClaudeSettingsEnv(deepseekEnv)
+    if (r.ok) {
+      console.log(`${C.green}✓ DeepSeek 配置已写入 Claude 配置文件${C.reset}`)
+      console.log(`  ${C.cyan}${r.path}${C.reset} ${C.dim}("env" 字段, claude 启动自读)${C.reset}`)
+    } else {
+      console.log(`${C.red}✗ 写入 ${r.path} 失败: ${r.error}${C.reset}`)
+      console.log(`${C.yellow}请手动把下面这些键加到该文件的 "env" 对象里:${C.reset}`)
+      for (const [k, v] of Object.entries(deepseekEnv)) {
+        console.log(`  ${C.dim}"${k}": "${k === 'ANTHROPIC_AUTH_TOKEN' ? '<你的 DeepSeek key>' : v}"${C.reset}`)
+      }
+    }
   } else {
     console.log(`${C.dim}OK, 跳过 LLM 后端配置 — daemon 启动时会继承当前环境 + claude 自带 auth。${C.reset}`)
   }
@@ -356,16 +402,10 @@ export async function runSetup(): Promise<void> {
     `projects_root = "${escapeTomlString(projectsRoot)}"`,
     '',
   ]
-  if (Object.keys(claudeEnv).length > 0) {
-    toml.push('# Env vars injected into the spawned claude CLI subprocess.')
-    toml.push('# Used to redirect claude to DeepSeek / GLM / other anthropic-compatible')
-    toml.push('# backends without touching system env vars.')
-    toml.push('[claude.env]')
-    for (const [k, v] of Object.entries(claudeEnv)) {
-      toml.push(`${k} = "${escapeTomlString(v)}"`)
-    }
-    toml.push('')
-  }
+  // DeepSeek / 第三方后端不再写进 config.toml —— 它已写进 claude 自己的
+  // ~/.claude/settings.json(见 step 2)。config.toml 只留 feishu + runtime。
+  // (config.ts 仍解析 [claude.env]、claude-process 仍注入,作向后兼容 /
+  //  高级用户手动配私有 env 的通道,只是向导默认不再往这里写。)
   writeFileSync(CONFIG_FILE, toml.join('\n'), { mode: 0o600 })
 
   console.log(`\n${C.green}${C.bold}✓ 配置已写入${C.reset}`)
