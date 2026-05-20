@@ -33,7 +33,8 @@
     "build:setup":  "bun build src/setup-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-setup.js",
     "build:stop":   "bun build src/stop-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-stop.js",
     "build:update": "bun build src/update-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-update.js",
-    "build": "bun run build:daemon && bun run build:setup && bun run build:stop && bun run build:update",
+    "build:version": "bun build src/version-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-version.js",
+    "build": "bun run build:daemon && bun run build:setup && bun run build:stop && bun run build:update && bun run build:version",
     "prepublishOnly": "bun run build",
     "postinstall": "node scripts/postinstall.cjs"
   },
@@ -41,7 +42,8 @@
     "lodestar-daemon": "./dist/lodestar.js",
     "lodestar-setup":  "./dist/lodestar-setup.js",
     "lodestar-stop":   "./dist/lodestar-stop.js",
-    "lodestar-update": "./dist/lodestar-update.js"
+    "lodestar-update": "./dist/lodestar-update.js",
+    "lodestar-version": "./dist/lodestar-version.js"
   },
   "files": [
     "dist/",

@@ -196,6 +196,16 @@ export interface HookCallbackRequest {
   tool_use_id?: string
 }
 
+/** content_block_delta 子类型里我们主动忽略的那些 —— 不渲染也不告警。
+ * - signature_delta: opus-4-7 redacted thinking 的加密签名,客户端用不上。
+ * - input_json_delta: tool_use 的 input 流式片段,等 assistant message 整块再处理。
+ * - citations_delta: 引用元数据,当前不渲染。
+ * - thinking_delta: 明文 thinking 流 —— DeepSeek 等后端会逐 token 发(opus 的
+ *   thinking 是 redacted、走 signature_delta,没有明文)。我们用顶部 ticker 补
+ *   思考期的视觉空白、不逐 token 渲染 thinking,所以这里 silent skip;否则
+ *   DeepSeek 一思考就把 "unhandled content_block_delta" 刷满日志。 */
+const SILENT_DELTA_TYPES = new Set(['signature_delta', 'input_json_delta', 'citations_delta', 'thinking_delta'])
+
 export class ClaudeProcess extends EventEmitter {
   private proc: ChildProcessByStdio<Writable, Readable, Readable>
   private stdoutBuf = ''
@@ -384,17 +394,16 @@ export class ClaudeProcess extends EventEmitter {
       // content_block_delta 逐条转成 NDJSON 行,wrap 在 stream_event 类型
       // 里。我们只关心 text_delta —— tool_use 是整块 atomic 的,等 assistant
       // message 终态再 emit 才有 input 全文。
-      // signature_delta 是 opus-4-7 redacted thinking 的加密签名,客户端
-      // 拿到也用不上,silent skip。input_json_delta 是 tool_use 的 input
-      // streaming,等 assistant message 整块再处理,这里也 skip。
-      // thinking_delta 故意 *不* 加白名单 —— 若哪天 Anthropic 解开 redacted、
-      // 真发明文 thinking 过来,落进 unhandled 报警一眼可见,我们再决定接不接。
+      // 只把 text_delta 当 assistant 正文流出 —— tool_use 是整块 atomic 的,
+      // 等 assistant message 终态再 emit 才有 input 全文。其余已知子类型
+      // (thinking_delta / signature_delta / …)在 SILENT_DELTA_TYPES 里 silent
+      // skip,只有真正没见过的类型才落 unhandled 日志。
       const ev = msg.event
       if (ev?.type === 'content_block_delta') {
         const delta = ev.delta
         if (delta?.type === 'text_delta' && typeof delta.text === 'string') {
           this.emit('assistant_text', { uuid: msg.uuid, text: delta.text })
-        } else if (delta?.type && delta.type !== 'signature_delta' && delta.type !== 'input_json_delta' && delta.type !== 'citations_delta') {
+        } else if (delta?.type && !SILENT_DELTA_TYPES.has(delta.type)) {
           log(`claude-process: unhandled content_block_delta type=${delta.type}`)
         }
       }
