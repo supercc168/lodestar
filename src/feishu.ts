@@ -14,6 +14,7 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
 import { config } from './config'
+import { resolveClaudeBin } from './claude-process'
 import { ALIVE_MARKER_FILE, DATA_DIR, INBOX_DIR, SESSION_CHAT_MAP_FILE, SESSION_RESUME_MAP_FILE } from './paths'
 import { log } from './log'
 
@@ -164,6 +165,41 @@ export async function refreshChatList(): Promise<void> {
     } while (pageToken)
     log(`feishu: refreshed chat list — ${chatNameCache.size} groups`)
   } catch (e) { log(`feishu: refresh chat list failed: ${e}`) }
+}
+
+/** Resolve ONE chat's name by chat_id via `im.chat.get`, bypassing the
+ * eventually-consistent `im.chat.list` that {@link refreshChatList} walks.
+ * A group the bot was just added to can lag the list endpoint by several
+ * seconds — exactly the window in which the user fires their first message
+ * — so a direct point-lookup is what lets a freshly-created group resolve
+ * on the first try instead of bouncing off "无法识别群名". Caches the name
+ * on hit. Returns null when the API errors OR the chat genuinely has no
+ * name (an unnamed group — the caller must surface that, since group-name
+ * → project-dir is load-bearing and an empty name can't map anywhere).
+ * Raw fetch + tenant token, same shape as urgentApp / sendTextRaw. */
+export async function fetchChatName(chatId: string): Promise<string | null> {
+  try {
+    const token = await getTenantToken()
+    const res = await fetch(`https://open.feishu.cn/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    })
+    const json = await res.json() as any
+    if (json?.code !== 0) {
+      log(`feishu: fetchChatName ${chatId} code=${json?.code} msg=${json?.msg}`)
+      return null
+    }
+    const name = json.data?.name
+    if (typeof name === 'string' && name) {
+      chatNameCache.set(chatId, name)
+      log(`feishu: fetchChatName ${chatId} → "${name}" (point lookup)`)
+      return name
+    }
+    log(`feishu: fetchChatName ${chatId} — chat has no name (unnamed group?)`)
+    return null
+  } catch (e) {
+    log(`feishu: fetchChatName ${chatId} failed: ${e}`)
+    return null
+  }
 }
 
 // ── Outbound: text + card ──────────────────────────────────────────────
@@ -486,9 +522,27 @@ export function provisionProject(workDir: string): void {
   try { execSync('git init -q', { cwd: workDir, stdio: 'ignore' }) } catch {}
 }
 
+/** True when the user wired claude to a non-firstParty backend (DeepSeek /
+ * GLM / any anthropic-compatible proxy) via config.toml's [claude.env].
+ * Those backends auth with ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY against
+ * a custom ANTHROPIC_BASE_URL and never touch `claude auth login` — so the
+ * firstParty probe below is simply the wrong question for them.
+ * Session.start() short-circuits on this so a perfectly-configured DeepSeek
+ * user never hits the bogus "未登录 Anthropic 账号" wall. */
+export function hasCustomClaudeBackend(): boolean {
+  const env = config.claude.env
+  return !!(env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY || env.ANTHROPIC_BASE_URL)
+}
+
 export function isAnthropicAuthenticated(): boolean {
   try {
-    const out = execSync(`${join(homedir(), '.local', 'bin', 'claude')} auth status 2>&1`, { timeout: 10_000 }).toString()
+    // resolveClaudeBin() rather than a hard-wired ~/.local/bin/claude: an
+    // end-user `npm i -g @anthropic-ai/claude-code` drops the binary under
+    // the npm-global bin (NOT ~/.local/bin), where the old hard path
+    // ENOENT'd → caught → reported "not logged in" even for a properly
+    // logged-in firstParty user. Quote the path so a homedir with spaces
+    // survives the shell.
+    const out = execSync(`"${resolveClaudeBin()}" auth status 2>&1`, { timeout: 10_000 }).toString()
     const status = JSON.parse(out)
     return status.loggedIn === true && status.apiProvider === 'firstParty'
   } catch { return false }

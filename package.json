@@ -55,9 +55,6 @@
   "dependencies": {
     "@larksuiteoapi/node-sdk": "^1.44.0"
   },
-  "peerDependencies": {
-    "@anthropic-ai/claude-code": "*"
-  },
   "devDependencies": {
     "@types/bun": "latest",
     "typescript": "^5.5.0"

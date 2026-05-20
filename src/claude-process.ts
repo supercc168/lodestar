@@ -34,7 +34,7 @@ import { log } from './log'
  * pinned absolute path so spawn doesn't pay a PATH walk per turn; on
  * Windows (or if the pinned binary is gone) we fall back to Bun.which,
  * and finally to the bare name so spawn surfaces a clean ENOENT. */
-function resolveClaudeBin(): string {
+export function resolveClaudeBin(): string {
   if (process.platform !== 'win32') {
     const pinned = join(homedir(), '.local', 'bin', 'claude')
     if (existsSync(pinned)) return pinned

@@ -256,8 +256,15 @@ async function handleMessage(data: any): Promise<void> {
     groupName = feishu.chatNameCache.get(chatId)
   }
   if (!groupName) {
+    // refreshChatList 走的 im.chat.list 是最终一致的：机器人刚被拉进一个
+    // 新群时，群往往要过几秒才出现在列表里，而用户的第一条消息恰恰落在
+    // 这个窗口。按 chat_id 直接点查 im.chat.get —— 同一数据源的更精确查询，
+    // 拿得到列表还没刷出来的新群名，新群第一条消息就能接住。
+    groupName = (await feishu.fetchChatName(chatId)) ?? undefined
+  }
+  if (!groupName) {
     log(`unknown chat ${chatId}, dropping message`)
-    await feishu.sendText(chatId, '❌ 无法识别群名，请确认机器人已加入并稍后重试')
+    await feishu.sendText(chatId, '❌ 无法识别群名。请确认：① 机器人已被拉进本群；② 群已设置名称（未命名群拿不到群名，无法映射项目目录）。设置后再发一条消息即可。')
     return
   }
   const sessionName = feishu.sanitizeSessionName(groupName)

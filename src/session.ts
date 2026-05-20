@@ -266,7 +266,13 @@ export class Session {
   // ── Lifecycle ──────────────────────────────────────────────────────
   async start(): Promise<boolean> {
     if (this.isRunning()) return true
-    if (!feishu.isAnthropicAuthenticated()) {
+    // 只有走 Anthropic 官方 firstParty(订阅 / 官方 API key)时才需要
+    // `claude auth login`。配了 DeepSeek / GLM / 任意 anthropic-compatible
+    // 后端(config.toml [claude.env] 里的 ANTHROPIC_AUTH_TOKEN / API_KEY /
+    // BASE_URL)的用户根本不登录 Anthropic —— 那种情况下跳过这道检查,
+    // claude 真起不来会在子进程自己报错(no_fallbacks: 让真实失败浮现,
+    // 而不是用一道方向错了的前置检查挡在门口)。
+    if (!feishu.hasCustomClaudeBackend() && !feishu.isAnthropicAuthenticated()) {
       await feishu.sendText(this.chatId, '❌ Claude 未登录 Anthropic 账号。\n请在服务器上运行 `claude auth login` 后再试。')
       return false
     }
