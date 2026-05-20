@@ -44,35 +44,69 @@ export function resolveClaudeBin(): string {
 
 /** Resolve HOW to spawn claude. On unix it's just the binary. On Windows the
  * npm-global `claude` is a `claude.cmd` shim, and Node — since the
- * CVE-2024-27980 fix (18.20.2+ / 20.12.2+) — throws `spawn EINVAL` when
- * spawning a `.cmd`/`.bat` without `shell:true`. But `shell:true` would route
- * args through cmd.exe, which mangles our multi-line --append-system-prompt
- * and the --mcp-config JSON (quotes + newlines). So sidestep the shim: read
- * the .cmd, pull out the `cli.js` it invokes, and spawn `node <cli.js>`
- * directly — no shell, args pass through verbatim, EINVAL avoided. If the
- * shim can't be parsed, fall back to the raw binary (which will EINVAL —
- * surfaced loudly in logs, not silently mis-run). */
+ * CVE-2024-27980 fix (18.20.2+ / 20.12.2+) — throws `spawn EINVAL` on a
+ * `.cmd`/`.bat` without `shell:true`; and `shell:true` would mangle our
+ * multi-line --append-system-prompt and --mcp-config JSON via cmd.exe. So
+ * resolve the shim to the REAL target and spawn that directly.
+ * @anthropic-ai/claude-code 2.x ships a native `bin/claude.exe` (NOT a
+ * cli.js) — spawning the .exe is fine (EINVAL only bites .cmd/.bat). We read
+ * the package's package.json `bin` to find it (robust across versions / shim
+ * formats); a .js entry (older/other layouts) is run via node instead.
+ * Can't resolve → fall back to the raw .cmd (will EINVAL — surfaced in logs,
+ * not silently mis-run). */
 function resolveClaudeSpawn(): { file: string; prefixArgs: string[] } {
   const bin = resolveClaudeBin()
   if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin)) {
-    try {
-      const shim = readFileSync(bin, 'utf8')
-      // npm shim invokes "%dp0%\node_modules\…\cli.js" (v7+) or
-      // "%~dp0\…\cli.js" (v6). Grab the dp0-relative .js/.mjs/.cjs entry;
-      // [^"] keeps it from swallowing across the node.exe quote on one line.
-      const m = shim.match(/"%~?dp0%?\\([^"]+?\.[mc]?js)"/i)
-      if (m) {
-        const entry = join(dirname(bin), m[1].replace(/\//g, '\\'))
-        if (existsSync(entry)) return { file: process.execPath, prefixArgs: [entry] }
-        log(`claude-process: shim entry ${entry} missing, falling back to ${bin}`)
-      } else {
-        log(`claude-process: could not parse cli.js out of ${bin}, falling back`)
-      }
-    } catch (e) {
-      log(`claude-process: read .cmd shim ${bin} failed: ${e}`)
+    const real = findWindowsClaudeTarget(bin)
+    if (real) {
+      log(`claude-process: resolved ${bin} → ${real.file}${real.prefixArgs.length ? ' ' + real.prefixArgs.join(' ') : ''}`)
+      return real
     }
+    log(`claude-process: 无法从 ${bin} 定位真实 claude 可执行,退回 .cmd(可能 EINVAL)`)
   }
   return { file: bin, prefixArgs: [] }
+}
+
+/** Find the real executable behind a Windows claude.cmd shim. Primary: the
+ * claude-code package's package.json `bin` (npm-global layout
+ * <prefix>\node_modules\@anthropic-ai\claude-code, prefix = the shim's dir).
+ * Fallback: scrape the .cmd text for the path it invokes. Returns a spawn
+ * target (.exe/.com → direct, .js/.mjs/.cjs → via node) or null. */
+function findWindowsClaudeTarget(cmdPath: string): { file: string; prefixArgs: string[] } | null {
+  const prefix = dirname(cmdPath)
+  const pkgDir = join(prefix, 'node_modules', '@anthropic-ai', 'claude-code')
+  try {
+    const pkg = JSON.parse(readFileSync(join(pkgDir, 'package.json'), 'utf8'))
+    const rel = typeof pkg.bin === 'string'
+      ? pkg.bin
+      : (pkg.bin && typeof pkg.bin === 'object' ? (pkg.bin.claude ?? Object.values(pkg.bin)[0]) : undefined)
+    if (typeof rel === 'string' && rel) {
+      const hit = classifyClaudeTarget(join(pkgDir, rel))
+      if (hit) return hit
+      log(`claude-process: package.json bin "${rel}" 未解析到可 spawn 的入口`)
+    }
+  } catch (e) {
+    log(`claude-process: 读 ${join(pkgDir, 'package.json')} 失败: ${e}`)
+  }
+  // Fallback: pull the exe/js path straight out of the shim text.
+  try {
+    const m = readFileSync(cmdPath, 'utf8').match(/"%~?dp0%?\\([^"]+?\.(?:exe|com|[mc]?js))"/i)
+    if (m) {
+      const hit = classifyClaudeTarget(join(prefix, m[1].replace(/\//g, '\\')))
+      if (hit) return hit
+    }
+  } catch {}
+  return null
+}
+
+/** A resolved bin path → spawn target: native .exe/.com spawns directly, a
+ * .js/.mjs/.cjs entry runs via the current node. Missing file or unknown
+ * kind → null so the caller can fall back. */
+function classifyClaudeTarget(target: string): { file: string; prefixArgs: string[] } | null {
+  if (!existsSync(target)) return null
+  if (/\.(exe|com)$/i.test(target)) return { file: target, prefixArgs: [] }
+  if (/\.[mc]?js$/i.test(target)) return { file: process.execPath, prefixArgs: [target] }
+  return null
 }
 
 /** Tiny cross-runtime PATH walker — replaces `Bun.which('claude')` so
