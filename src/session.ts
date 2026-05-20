@@ -15,7 +15,7 @@
  */
 
 import { existsSync } from 'node:fs'
-import { join } from 'node:path'
+import { isAbsolute, join } from 'node:path'
 import { ClaudeProcess, type CanUseToolRequest, type HookCallbackRequest, type ClaudeUsage } from './claude-process'
 import { CHANNEL_INSTRUCTIONS } from './instructions'
 import * as cardkit from './cardkit'
@@ -1416,7 +1416,11 @@ export class Session {
       const cleaned = fullText.replace(SEND_MARKER_RE, (_m, p1) => {
         changed = true
         const p = String(p1).trim()
-        if (p.startsWith('/')) sendPaths.push(p)
+        // isAbsolute 而非 startsWith('/'):daemon 跑 Windows 时 path=win32,
+        // 认 C:/... / C:\... / UNC;跑 unix 时认 /...。claude 给的 send 路径
+        // 跟 daemon 同平台,所以平台自适应判断正好对。之前只认 / 开头,
+        // Windows 的 C:/Users/... 被当非绝对路径丢掉。
+        if (isAbsolute(p)) sendPaths.push(p)
         else log(`session "${this.sessionName}": ignore non-absolute send path: ${p}`)
         return ''
       })
