@@ -883,6 +883,17 @@ export class Session {
       this.awaitingFollowup = null
       this.appendAssistant(text)
     })
+    p.on('assistant_block_stop', () => {
+      // 一段 content block 收尾(SSE content_block_stop)→ 把当前 assistant 段
+      // 定稿:flush 段尾残留 + replaceElement 整体写成完整内容,然后 reset 段
+      // 游标让下一段开新元素。这条 emit 在该段最后一个 text_delta 之后同步
+      // 到达(claude-process 按 stdout 行序 emit),所以 appendAssistant 已把
+      // 全量累进 currentAssistantText,这里定稿拿到的是完整段。为什么不能只
+      // flush:flush 只保证服务端收到完整内容,客户端打字机仍是异步动画,
+      // 段一旦封存(下一段 / 工具面板 / 关 streaming)没播完的尾巴会留半截 ——
+      // 见 finalizeCurrentAssistantSegment。
+      this.finalizeCurrentAssistantSegment()
+    })
     p.on('tool_use', ({ id, name, input }: { id: string; name: string; input: any }) => {
       // 模型在出新工具 → 同样清 flag(典型场景:Edit 失败后模型自己重试)。
       this.awaitingFollowup = null
@@ -1264,6 +1275,10 @@ export class Session {
         // 同步 swap：从这一行起,后续 stream handler 看到的 turn.cardId
         // 是新卡。reset 所有 element-id 引用 (toolCount / assistantSegmentCount
         // 等),旧卡上的 element_id 在新卡里查不到,继续 PUT 会 300313。
+        // 先快照旧卡上正在流式的 assistant 段,close-old 时定稿它 —— swap 之后
+        // currentAssistant* 立刻被清空,不抓住就没法在旧卡上把它写完整。
+        const oldSegId = turn.currentAssistantSegmentId
+        const oldSegText = (turn.currentAssistantText ?? '').trim()
         this.stopTicker(turn)
         turn.cardId = newCardId
         turn.messageId = newMessageId
@@ -1282,6 +1297,14 @@ export class Session {
         // 在 footer 之前先 flush,视觉更连贯。
         try {
           await cardkit.flush(oldCardId)
+          // 旧卡当前 assistant 段定稿,避免换卡瞬间把没播完的打字机尾巴留在
+          // 旧卡上(replaceElement 直接上屏完整内容,见
+          // finalizeCurrentAssistantSegment)。
+          if (oldSegId && oldSegText) {
+            await cardkit.replaceElement(oldCardId, oldSegId, {
+              tag: 'markdown', element_id: oldSegId, content: oldSegText,
+            })
+          }
           await cardkit.streamText(oldCardId, cards.ELEMENTS.footer, '📨 卡片满,转下一张 ↓')
           cardkit.cancelSummary(oldCardId)
           await cardkit.patchSettings(oldCardId, cards.streamingOffSettings({ suffix: '📨 卡片满' }))
@@ -1308,7 +1331,7 @@ export class Session {
     // 清掉;footer 切到 `⏳ working…` 接力做"还在干活"指示(跟顶部
     // ticker 互斥:同一时刻只有一处亮)。后续 delta 跑时 ticker handle
     // 已 null、stopTicker 短路;footer 的 streamThrottled 由 cardkit
-    // lastSent 自然去重,只 PUT 一次。
+    // lastEnqueued 自然去重,只 PUT 一次。
     this.stopTicker(turn)
     cardkit.streamTextThrottled(turn.cardId, cards.ELEMENTS.footer, '⏳ working…')
     if (!turn.currentAssistantSegmentId) {
@@ -1354,6 +1377,39 @@ export class Session {
     // preview line. patchSummaryThrottled is rate-limited on its own.
     const tail = turn.currentAssistantText.slice(-60)
     cardkit.patchSummaryThrottled(turn.cardId, tail)
+  }
+
+  /** 收尾(定稿)当前 assistant 段:把流式打字的那个 markdown 元素整体
+   * replaceElement 成最终完整内容,再清空当前段游标。无段在写时只清游标。
+   *
+   * 为什么必须主动定稿,而不能依赖"已经 PUT 过完整全量":飞书流式文本是
+   * 客户端**异步打字机动画**,有 print_step / print_frequency 速度上限。模型
+   * 出字通常快于客户端打字,所以每次全量 PUT 落地时客户端大概率还有"未上
+   * 屏"尾巴。官方文档里 fast 策略的"未上屏文本立即上屏"只在**对同一元素
+   * 的下一次流式 PUT** 时触发 —— 一旦封存这个段(开新段 / 插工具面板 / 换卡 /
+   * 关 streaming_mode),不再有后续 PUT,文档也未保证关闭时补全,实测段尾停
+   * 半截。replaceElement 是组件整体更新、直接上屏、不走打字机,能确定性地让
+   * 完整内容立即可见。
+   *
+   * 先 flush 再 replaceElement:flush 把 buffer 里本段最后几个 delta 的全量
+   * 入队、并清空 buffer(避免之后的 flush 又对这个已 reset 的 segId 重发),
+   * replaceElement 紧随其后入队作为该元素最终一笔;两者都经 per-card 队列
+   * 串行,顺序确定。 */
+  finalizeCurrentAssistantSegment(): void {
+    const turn = this.currentTurn
+    if (!turn) return
+    const segId = turn.currentAssistantSegmentId
+    if (segId) {
+      const text = (turn.currentAssistantText ?? '').trim()
+      void cardkit.flush(turn.cardId)
+      if (text) {
+        void cardkit.replaceElement(turn.cardId, segId, {
+          tag: 'markdown', element_id: segId, content: text,
+        })
+      }
+    }
+    turn.currentAssistantSegmentId = null
+    turn.currentAssistantText = ''
   }
 
   /** 启动 ticker 元素的活体指示。turn 起来时随机选一个 verb,整 turn
@@ -1410,11 +1466,16 @@ export class Session {
 
     // [[send: /abs/path]] markers — strip them from each assistant
     // segment and collect paths to upload after the card finalizes.
+    // 同时对**每个** assistant 段做收尾定稿(replaceElement 整体替换为最终
+    // 完整内容),不再只处理含 send marker 的段:turn 收尾后不会再有针对这些
+    // 元素的流式 PUT,紧接着的 streaming_mode=false 会把没播完的打字机尾巴
+    // 封存成半截(飞书 fast 策略的"未上屏立即上屏"只认下一次 PUT,关闭时
+    // 不触发、文档也不保证补全)。replaceElement 走组件整体更新、直接上屏,
+    // 不依赖打字机动画追赶。turn 中途 content_block_stop 通常已定稿过各段,
+    // 这里是收尾兜底(打断 / 最后一段 / 未触发 block_stop 的情况)。
     const sendPaths: string[] = []
     for (const [segId, fullText] of segmentTexts) {
-      let changed = false
       const cleaned = fullText.replace(SEND_MARKER_RE, (_m, p1) => {
-        changed = true
         const p = String(p1).trim()
         // isAbsolute 而非 startsWith('/'):daemon 跑 Windows 时 path=win32,
         // 认 C:/... / C:\... / UNC;跑 unix 时认 /...。claude 给的 send 路径
@@ -1424,12 +1485,10 @@ export class Session {
         else log(`session "${this.sessionName}": ignore non-absolute send path: ${p}`)
         return ''
       })
-      if (changed) {
-        const finalText = cleaned.trim() || ' '
-        await cardkit.replaceElement(cardId, segId, {
-          tag: 'markdown', element_id: segId, content: finalText,
-        })
-      }
+      const finalText = cleaned.trim() || ' '
+      await cardkit.replaceElement(cardId, segId, {
+        tag: 'markdown', element_id: segId, content: finalText,
+      })
     }
 
     // thinking 区不再 collapse 成 panel —— replaceElement 会把 typewriter

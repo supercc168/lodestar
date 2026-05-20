@@ -28,16 +28,19 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
   // 模型出第一个工具 → 顶部 ticker 活体指示完成使命,清掉;footer 切到
   // `⏳ working…` 接力做"还在干活"的指示。stopTicker 后续调用 handle
   // null 时短路,所以多次 tool_use 安全。footer 同样写入由 cardkit 的
-  // lastSent 自然去重,只会 PUT 一次。
+  // lastEnqueued 自然去重,只会 PUT 一次。
   s.stopTicker(s.currentTurn)
   cardkit.streamTextThrottled(s.currentTurn.cardId, cards.ELEMENTS.footer, '⏳ working…')
   // Close current assistant segment (if any) so the tool panel renders
   // AFTER it in card body order. Flush queues the segment's last
   // buffered delta before the tool element is inserted.
   if (s.currentTurn.currentAssistantSegmentId) {
-    void cardkit.flush(s.currentTurn.cardId)
-    s.currentTurn.currentAssistantSegmentId = null
-    s.currentTurn.currentAssistantText = ''
+    // 工具面板插在当前 assistant 段之后 → 先把该段定稿成完整内容
+    // (replaceElement 直接上屏,见 Session.finalizeCurrentAssistantSegment),
+    // 否则段尾没播完的打字机会被随后插入的工具元素"封存"成半截。
+    // content_block_stop 通常已先定稿过这段(那时 segId 已 reset、这里直接
+    // 跳过),本调用是 block_stop 没覆盖时的兜底。finalize 内部会清段游标。
+    s.finalizeCurrentAssistantSegment()
   }
   // Consecutive Read merger: if a Read run is already open, append to
   // its batch and re-render the panel instead of inserting a new one.

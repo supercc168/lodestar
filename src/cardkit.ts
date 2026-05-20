@@ -29,7 +29,13 @@ interface CardState {
   sequence: number
   queue: Promise<void>
   buffer: Map<string, string>          // element_id → latest full text
-  lastSent: Map<string, string>        // element_id → text last actually PUT
+  /** element_id → 最近一次「已入队 PUT」的全量内容。关键:是"已入队"而非
+   * "已送达" —— 在 streamText 入队时同步写,不是 PUT 完成后写。
+   * streamTextThrottled 的增量节流判断和 flush 去重都读它,所以它必须同步
+   * 反映"我已经决定要发到哪",否则慢链路上 PUT 往返期间到达的多个 delta
+   * 会全部误判成"超过阈值"而逐个触发全量 PUT,节流形同虚设(详见
+   * streamText 注释)。 */
+  lastEnqueued: Map<string, string>
   flushTimer: ReturnType<typeof setTimeout> | null
   /** Live count of elements on the card. Initialised by
    * `recordCardCreated` (session passes the body.elements.length of the
@@ -60,7 +66,7 @@ function state(cardId: string): CardState {
       sequence: 0,
       queue: Promise.resolve(),
       buffer: new Map(),
-      lastSent: new Map(),
+      lastEnqueued: new Map(),
       flushTimer: null,
       elementCount: 0,
     }
@@ -192,6 +198,15 @@ export async function createCardEntity(card: object): Promise<string> {
 export function streamText(cardId: string, elementId: string, content: string): Promise<void> {
   if (!content || !content.trim()) return Promise.resolve()
   const s = state(cardId)
+  // 「已入队」位置必须在这里同步推进,而不是等 PUT 完成 —— 否则节流失效:
+  // Card Kit 的 PUT 在慢链路(Windows / 跨网)上往返几百 ms,这期间模型还在
+  // 吐 text_delta;若用 PUT-完成后的长度算增量,每个 delta 看到的都是同一个
+  // 陈旧基线,增量恒大于阈值,streamTextThrottled 退化成「每个 delta 一次全量
+  // PUT」,客户端 typewriter 被高频整段刷新冲击,表现为打字回退 + 卡顿。
+  // 全量 PUT 自带自愈:某次 PUT 失败会被下一个更长的全量覆盖,所以提前把
+  // 「已入队」前移是安全的(失败的内容不会永久丢,除非它正好是最后一帧 ——
+  // 那种情况由 content_block_stop / closeTurnCard 的兜底 flush 覆盖)。
+  s.lastEnqueued.set(elementId, content)
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `streamText ${elementId}`,
@@ -200,7 +215,6 @@ export function streamText(cardId: string, elementId: string, content: string): 
       await call('PUT', `/cards/${cardId}/elements/${elementId}/content`, {
         content, sequence: seq,
       })
-      s.lastSent.set(elementId, content)
     },
   ))
   return s.queue
@@ -213,7 +227,7 @@ export function streamTextThrottled(cardId: string, elementId: string, fullConte
   const s = state(cardId)
   s.buffer.set(elementId, fullContent)
 
-  const last = s.lastSent.get(elementId) ?? ''
+  const last = s.lastEnqueued.get(elementId) ?? ''
   const delta = fullContent.length - last.length
   if (delta >= FLUSH_MIN_DELTA) {
     flush(cardId).catch(e => log(`cardkit flush(min-delta) ${cardId}: ${e}`))
@@ -234,7 +248,7 @@ export async function flush(cardId: string): Promise<void> {
   const pending = [...s.buffer.entries()]
   s.buffer.clear()
   for (const [eid, text] of pending) {
-    if (s.lastSent.get(eid) === text) continue
+    if (s.lastEnqueued.get(eid) === text) continue
     await streamText(cardId, eid, text)
   }
 }

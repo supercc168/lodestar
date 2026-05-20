@@ -406,6 +406,13 @@ export class ClaudeProcess extends EventEmitter {
         } else if (delta?.type && !SILENT_DELTA_TYPES.has(delta.type)) {
           log(`claude-process: unhandled content_block_delta type=${delta.type}`)
         }
+      } else if (ev?.type === 'content_block_stop') {
+        // 一个 content block(通常是一段 assistant 正文)在 SSE 上收尾 —— 该段
+        // 全文此刻已定。立即让上层把节流缓冲里的尾巴 flush 出去,不必再等
+        // 120ms 节流窗口:否则段尾不足 FLUSH_MIN_DELTA 的那截会滞留,用户看到
+        // 「写了一半」。tool_use block 收尾也会走到这里,flush 当前卡是幂等的
+        // (去重 + 全量),无害。
+        this.emit('assistant_block_stop', { index: ev.index })
       }
       return
     }
