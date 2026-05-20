@@ -19,9 +19,9 @@
  */
 
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, delimiter, join } from 'node:path'
+import { basename, delimiter, dirname, join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import type { Readable, Writable } from 'node:stream'
 import { config } from './config'
@@ -40,6 +40,39 @@ export function resolveClaudeBin(): string {
     if (existsSync(pinned)) return pinned
   }
   return whichClaude() ?? 'claude'
+}
+
+/** Resolve HOW to spawn claude. On unix it's just the binary. On Windows the
+ * npm-global `claude` is a `claude.cmd` shim, and Node — since the
+ * CVE-2024-27980 fix (18.20.2+ / 20.12.2+) — throws `spawn EINVAL` when
+ * spawning a `.cmd`/`.bat` without `shell:true`. But `shell:true` would route
+ * args through cmd.exe, which mangles our multi-line --append-system-prompt
+ * and the --mcp-config JSON (quotes + newlines). So sidestep the shim: read
+ * the .cmd, pull out the `cli.js` it invokes, and spawn `node <cli.js>`
+ * directly — no shell, args pass through verbatim, EINVAL avoided. If the
+ * shim can't be parsed, fall back to the raw binary (which will EINVAL —
+ * surfaced loudly in logs, not silently mis-run). */
+function resolveClaudeSpawn(): { file: string; prefixArgs: string[] } {
+  const bin = resolveClaudeBin()
+  if (process.platform === 'win32' && /\.(cmd|bat)$/i.test(bin)) {
+    try {
+      const shim = readFileSync(bin, 'utf8')
+      // npm shim invokes "%dp0%\node_modules\…\cli.js" (v7+) or
+      // "%~dp0\…\cli.js" (v6). Grab the dp0-relative .js/.mjs/.cjs entry;
+      // [^"] keeps it from swallowing across the node.exe quote on one line.
+      const m = shim.match(/"%~?dp0%?\\([^"]+?\.[mc]?js)"/i)
+      if (m) {
+        const entry = join(dirname(bin), m[1].replace(/\//g, '\\'))
+        if (existsSync(entry)) return { file: process.execPath, prefixArgs: [entry] }
+        log(`claude-process: shim entry ${entry} missing, falling back to ${bin}`)
+      } else {
+        log(`claude-process: could not parse cli.js out of ${bin}, falling back`)
+      }
+    } catch (e) {
+      log(`claude-process: read .cmd shim ${bin} failed: ${e}`)
+    }
+  }
+  return { file: bin, prefixArgs: [] }
 }
 
 /** Tiny cross-runtime PATH walker — replaces `Bun.which('claude')` so
@@ -168,7 +201,7 @@ export class ClaudeProcess extends EventEmitter {
 
   constructor(opts: SpawnOpts) {
     super()
-    const claudeBin = resolveClaudeBin()
+    const { file: spawnFile, prefixArgs } = resolveClaudeSpawn()
     const args = [
       '-p',
       '--input-format=stream-json',
@@ -215,7 +248,7 @@ export class ClaudeProcess extends EventEmitter {
     }
     args.push('--mcp-config', JSON.stringify(mcpConfig))
 
-    log(`claude-process: spawn ${claudeBin} (cwd=${opts.workDir})`)
+    log(`claude-process: spawn ${spawnFile}${prefixArgs.length ? ' ' + prefixArgs.join(' ') : ''} (cwd=${opts.workDir})`)
     // config.toml [claude.env] 节整段注入子进程 env(可选,向后兼容 / 高级
     // 用户配私有后端用)。注: setup 向导现在把 DeepSeek 这类第三方后端写到
     // claude 自己的 ~/.claude/settings.json 的 env 字段(claude 原生机制,
@@ -229,7 +262,7 @@ export class ClaudeProcess extends EventEmitter {
       PATH: buildSpawnPath(),
       ...config.claude.env,
     }
-    this.proc = spawn(claudeBin, args, {
+    this.proc = spawn(spawnFile, [...prefixArgs, ...args], {
       cwd: opts.workDir,
       stdio: ['pipe', 'pipe', 'pipe'],
       env,
