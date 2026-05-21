@@ -506,28 +506,45 @@ async function boot(): Promise<void> {
     debug: (_m: any[]) => { /* drop */ },
     trace: (_m: any[]) => { /* drop */ },
   }
-  const ws = new lark.WSClient({
-    appId: config.feishu.app_id,
-    appSecret: config.feishu.app_secret,
-    loggerLevel: lark.LoggerLevel.info,
-    logger: wsLogger,
-    wsConfig: { pingTimeout: 180 },
-    // Without this, connect() awaits the 'open'/'error' event forever when
-    // neither fires (wedged WS upgrade behind NAT/proxy) — start() deadlocks
-    // silently: process alive, REST fine, but permanently deaf, no log and no
-    // reconnect (the pingTimeout watchdog only arms AFTER 'open'). 10s cap →
-    // fail-fast into the SDK's reconnect loop instead of hanging indefinitely.
-    handshakeTimeoutMs: 10_000,
-    onReconnecting: () => log('[ws] reconnecting — WS lost, SDK is retrying'),
-    onReconnected:  () => log('[ws] reconnected'),
-    // SDK exhausted its own reconnect budget. Do NOT exit the process — that
-    // SIGTERMs every claude subprocess / scheduler / live card across all
-    // groups. Re-establish ONLY the WS in place; the rest keeps running.
-    onError: (err) => reviveWs(`SDK onError: ${err?.message ?? err}`),
-  })
   const dispatcher = new lark.EventDispatcher({})
+
+  // ── connected-but-deaf self-heal ────────────────────────────────────────
+  // Feishu 长连接是**集群模式**(官方文档原话:"同一应用部署多个 client,
+  // 只有随机一个 client 收到消息",且每 app ≤50 连接)。SDK 自带的重连
+  // (reConnect → 同一个 WSClient 复用 tryConnect)断线后会重新握手成功、
+  // pong 照常收发、getConnectionStatus().state==='connected' —— 但服务端
+  // gateway 有时仍把旧连接当成该 app 的活跃 client,把事件**随机路由到那条
+  // 已死的旧连接**,新连接 connected 却永远收不到任何 im.message 事件。
+  // 这是 lark 长连接生态公认、但官方至今未修的 bug(同症状见 openclaw
+  // #11719 / hermes-agent #24807)。三道旧防线全看不到它:pingTimeout 因
+  // pong 仍在流动不触发;state 一直是 connected;onError 不报。
+  //
+  // 解法:不信 SDK 的同-client 重连,也不信 close()+start() in-place revive
+  // (底层还是同一个 tryConnect,可能拉回同样被服务端判死的状态)。每次重连
+  // 后**整个换一个全新的 lark.WSClient(新 token、新连接),force-close 旧的**
+  // —— 这复刻了"整进程重启之所以管用"的核心(gateway 只剩一条新连可认),
+  // 但全程不碰任何 claude 子进程、不退进程。lastEventAt 作为唯一可信的"事件
+  // 通道还活着"信号(不信 state);活跃群在 rebuild 后还聋就退避重建,封顶后
+  // 只打日志、绝不 process.exit。
+  let lastEventAt = Date.now()        // 收到任意真实事件就刷新 = 通道存活铁证
+  let consecRebuilds = 0
+  let rebuilding = false
+  let verifyTimer: ReturnType<typeof setTimeout> | null = null
+  const SETTLE_MS = 1500              // 让 SDK 自身重连流程先落定再换 client
+  const VERIFY_WINDOW_MS = 90_000     // rebuild 后等多久确认事件恢复
+  const RECENT_ACTIVITY_MS = 10 * 60_000  // 重连前这段内有过事件 = 活跃群,值得重试
+  const MAX_CONSEC_REBUILDS = 3       // 活跃群连续重建上限,到顶只告警不死循环
+
+  const markEvent = () => {
+    lastEventAt = Date.now()
+    // 收到真实事件 = 通道确认健康:撤掉待验证、清零重建计数。
+    consecRebuilds = 0
+    if (verifyTimer) { clearTimeout(verifyTimer); verifyTimer = null }
+  }
+
   dispatcher.register({
     'im.message.receive_v1': async (d: any) => {
+      markEvent()
       // ⚠️ 不要 await handleMessage —— Lark WS 长连接对事件 ack 有 ~4s
       // 硬超时,handleMessage 内部可能触发 openTurnCard / spawn claude /
       // sendInterrupt 等数百 ms~数秒的链路,任一组合超 4s 飞书侧就判投递
@@ -541,43 +558,114 @@ async function boot(): Promise<void> {
   })
   dispatcher.register({
     'card.action.trigger': async (d: any) => {
+      markEvent()
       try { return await handleCardAction(d) } catch (e) { log(`handleCardAction: ${e}`) }
     },
   })
-  // WS-only in-process revive: tear down just the WebSocket and bring it back
-  // up, leaving every claude subprocess, scheduler, ScheduleWakeup and live
-  // card stream untouched. close({force}) invalidates the SDK's stale reconnect
-  // loops and clears its timers; start() resets terminalError and reconnects
-  // from scratch. Never exits the process.
-  const reviveWs = (reason: string) => {
-    log(`[ws] reviving WS in-process — ${reason}`)
-    try { ws.close({ force: true }) } catch (e) { log(`[ws] revive close failed: ${e}`) }
-    void ws.start({ eventDispatcher: dispatcher }).catch(e => log(`[ws] revive start failed: ${e}`))
+
+  let ws: lark.WSClient
+
+  const makeWs = (): lark.WSClient => new lark.WSClient({
+    appId: config.feishu.app_id,
+    appSecret: config.feishu.app_secret,
+    loggerLevel: lark.LoggerLevel.info,
+    logger: wsLogger,
+    wsConfig: { pingTimeout: 180 },
+    // Without this, connect() awaits the 'open'/'error' event forever when
+    // neither fires (wedged WS upgrade behind NAT/proxy) — start() deadlocks
+    // silently: process alive, REST fine, but permanently deaf, no log and no
+    // reconnect (the pingTimeout watchdog only arms AFTER 'open'). 10s cap →
+    // fail-fast into the SDK's reconnect loop instead of hanging indefinitely.
+    handshakeTimeoutMs: 10_000,
+    onReconnecting: () => log('[ws] reconnecting — WS lost, SDK is retrying'),
+    // SDK 自己重连成功了 —— 但这正是僵尸聋的高发点。不信它,延迟一拍后整个
+    // 换新 client(见 onReconnectedHeal)。
+    onReconnected:  () => onReconnectedHeal(),
+    // SDK exhausted its own reconnect budget. Do NOT exit the process — that
+    // SIGTERMs every claude subprocess / scheduler / live card across all
+    // groups. Rebuild a fresh WS client in place; the rest keeps running.
+    onError: (err) => rebuildWs(`SDK onError: ${err?.message ?? err}`),
+  })
+
+  // Fresh-client rebuild: force-close the (possibly server-side-zombie) old
+  // client, stand up a brand-new WSClient with a fresh token + connection, and
+  // hand it the same dispatcher. Never touches claude subprocesses, schedulers,
+  // ScheduleWakeups or live cards; never exits the process. close({force}) does
+  // removeAllListeners() before terminate(), so the old client fires no stray
+  // reconnect. verifyAfter arms a post-rebuild check (only for active groups).
+  const rebuildWs = (reason: string, verifyAfter = false) => {
+    if (rebuilding) { log(`[ws] rebuild skipped (already rebuilding) — ${reason}`); return }
+    rebuilding = true
+    consecRebuilds++
+    log(`[ws] rebuild #${consecRebuilds} (fresh WSClient) — ${reason}`)
+    const old = ws
+    try { old?.close({ force: true }) } catch (e) { log(`[ws] rebuild: old close failed: ${e}`) }
+    ws = makeWs()
+    void ws.start({ eventDispatcher: dispatcher })
+    rebuilding = false
+    if (verifyAfter) armVerify()
   }
 
-  ws.start({ eventDispatcher: dispatcher })
+  // After a rebuild, confirm events actually resumed. lastEventAt is the only
+  // trustworthy signal (state lies). If nothing arrives in the window, the
+  // rebuild also landed deaf → rebuild again with the same window as backoff,
+  // capped at MAX_CONSEC_REBUILDS. Past the cap we stop and log loudly (no
+  // process exit, no alert spam) — the last client stays up and a manual
+  // `systemctl --user restart feishu-daemon` is the escape hatch.
+  const armVerify = () => {
+    if (verifyTimer) clearTimeout(verifyTimer)
+    const armedAt = Date.now()
+    verifyTimer = setTimeout(() => {
+      verifyTimer = null
+      if (lastEventAt >= armedAt) { consecRebuilds = 0; return }  // events resumed → healthy
+      if (consecRebuilds >= MAX_CONSEC_REBUILDS) {
+        log(`[ws] STILL deaf after ${MAX_CONSEC_REBUILDS} fresh rebuilds — auto-heal exhausted, ` +
+            `leaving last client up (no process exit). Escape hatch: systemctl --user restart feishu-daemon`)
+        consecRebuilds = 0
+        return
+      }
+      rebuildWs(`verify: no event ${Math.round((Date.now() - armedAt) / 1000)}s after rebuild`, true)
+    }, VERIFY_WINDOW_MS)
+  }
+
+  // Every reconnect (any client) → replace it with a fresh one. Cheap (~3s WS
+  // blip, no subprocess loss) and reconnects are rare (~4×/day), so doing it
+  // unconditionally has near-zero cost and zero false-positive risk. Only arm
+  // the verify-and-retry loop for groups that were active just before the drop
+  // — a dormant group's post-reconnect silence is normal, not deafness, so it
+  // gets the single precautionary rebuild and no retry storm.
+  const onReconnectedHeal = () => {
+    const wasRecentlyActive = (Date.now() - lastEventAt) < RECENT_ACTIVITY_MS
+    log(`[ws] reconnected — swapping in a fresh WSClient (cluster-routing precaution; ` +
+        `recentlyActive=${wasRecentlyActive})`)
+    consecRebuilds = 0
+    setTimeout(() => rebuildWs('post-reconnect precaution', wasRecentlyActive), SETTLE_MS)
+  }
+
+  ws = makeWs()
+  void ws.start({ eventDispatcher: dispatcher })
   log(`lodestar-daemon: WS started, watching ${feishu.chatNameCache.size} groups`)
 
-  // Liveness watchdog. The SDK's own loop handles ordinary drops, but a wedged
-  // handshake or zombie socket can leave the client stuck off 'connected' with
-  // no callback firing (the silent-deaf bug). Poll the public state every 60s;
-  // revive in place if it stays non-connected for 3 consecutive ticks (~3min)
-  // or hard-fails. State, not traffic — a quiet group legitimately receives
-  // nothing, so silence never false-triggers a revive.
+  // Liveness watchdog for the OTHER failure mode the deaf-heal can't see: a
+  // wedged handshake / zombie socket that leaves the client stuck OFF
+  // 'connected' with no callback firing. Poll state every 60s; rebuild a fresh
+  // client if it stays non-connected for 3 consecutive ticks (~3min) or
+  // hard-fails. (connected-but-deaf is handled by the event-channel path above,
+  // not here — state stays 'connected' in that case so this never sees it.)
   let wsUnhealthyTicks = 0
   setInterval(() => {
     const { state } = ws.getConnectionStatus()
     if (state === 'connected') { wsUnhealthyTicks = 0; return }
     if (state === 'failed') {
       wsUnhealthyTicks = 0
-      reviveWs('watchdog: state=failed')
+      rebuildWs('watchdog: state=failed')
       return
     }
     wsUnhealthyTicks++
     log(`[ws] watchdog: state=${state} (${wsUnhealthyTicks}/3)`)
     if (wsUnhealthyTicks >= 3) {
       wsUnhealthyTicks = 0
-      reviveWs(`watchdog: stuck in '${state}' ~3min`)
+      rebuildWs(`watchdog: stuck in '${state}' ~3min`)
     }
   }, 60 * 1000)
 
