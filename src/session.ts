@@ -38,7 +38,7 @@ const SEND_MARKER_RE = /\[\[send:\s*([^\]\n]+?)\s*\]\]/g
  * sendUserText('继续') 这么多次来自动续;第 (MAX_SDK_AUTO_RETRY + 1) 次
  * 连续报错就放弃 —— ⛔ footer + 强制推送通知用户。任一次自然 success 或
  * 用户介入都把计数清零。 */
-const MAX_SDK_AUTO_RETRY = 10
+const MAX_SDK_AUTO_RETRY = 5
 
 /** "模型还在干活" 顶部 ticker 的备选动词。turn 起来时随机选一个、整 turn
  * 固定不变,setInterval 每 TICKER_TICK_MS (1s) 跑一次,只刷经过秒数 ——
@@ -211,7 +211,7 @@ export class Session {
    * closes a turn with `subtype !== 'success'` (error_during_execution /
    * error_max_turns), the daemon swallows the phone push and re-pokes
    * the SDK with a "继续" user message to auto-resume. Up to
-   * MAX_SDK_AUTO_RETRY (10) auto-resumes in a row; the next consecutive
+   * MAX_SDK_AUTO_RETRY (5) auto-resumes in a row; the next consecutive
    * error past that → give up: surface the failure (⛔ footer + forced
    * phone push) and reset. Any natural-success turn OR user intervention
    * (mid-turn buffer drain) resets this back to 0. */
