@@ -512,12 +512,18 @@ async function boot(): Promise<void> {
     loggerLevel: lark.LoggerLevel.info,
     logger: wsLogger,
     wsConfig: { pingTimeout: 180 },
+    // Without this, connect() awaits the 'open'/'error' event forever when
+    // neither fires (wedged WS upgrade behind NAT/proxy) — start() deadlocks
+    // silently: process alive, REST fine, but permanently deaf, no log and no
+    // reconnect (the pingTimeout watchdog only arms AFTER 'open'). 10s cap →
+    // fail-fast into the SDK's reconnect loop instead of hanging indefinitely.
+    handshakeTimeoutMs: 10_000,
     onReconnecting: () => log('[ws] reconnecting — WS lost, SDK is retrying'),
     onReconnected:  () => log('[ws] reconnected'),
-    onError: (err) => {
-      log(`[ws] reconnect exhausted: ${err?.message ?? err} — exit for systemd restart`)
-      process.exit(1)
-    },
+    // SDK exhausted its own reconnect budget. Do NOT exit the process — that
+    // SIGTERMs every claude subprocess / scheduler / live card across all
+    // groups. Re-establish ONLY the WS in place; the rest keeps running.
+    onError: (err) => reviveWs(`SDK onError: ${err?.message ?? err}`),
   })
   const dispatcher = new lark.EventDispatcher({})
   dispatcher.register({
@@ -538,8 +544,42 @@ async function boot(): Promise<void> {
       try { return await handleCardAction(d) } catch (e) { log(`handleCardAction: ${e}`) }
     },
   })
+  // WS-only in-process revive: tear down just the WebSocket and bring it back
+  // up, leaving every claude subprocess, scheduler, ScheduleWakeup and live
+  // card stream untouched. close({force}) invalidates the SDK's stale reconnect
+  // loops and clears its timers; start() resets terminalError and reconnects
+  // from scratch. Never exits the process.
+  const reviveWs = (reason: string) => {
+    log(`[ws] reviving WS in-process — ${reason}`)
+    try { ws.close({ force: true }) } catch (e) { log(`[ws] revive close failed: ${e}`) }
+    void ws.start({ eventDispatcher: dispatcher }).catch(e => log(`[ws] revive start failed: ${e}`))
+  }
+
   ws.start({ eventDispatcher: dispatcher })
   log(`lodestar-daemon: WS started, watching ${feishu.chatNameCache.size} groups`)
+
+  // Liveness watchdog. The SDK's own loop handles ordinary drops, but a wedged
+  // handshake or zombie socket can leave the client stuck off 'connected' with
+  // no callback firing (the silent-deaf bug). Poll the public state every 60s;
+  // revive in place if it stays non-connected for 3 consecutive ticks (~3min)
+  // or hard-fails. State, not traffic — a quiet group legitimately receives
+  // nothing, so silence never false-triggers a revive.
+  let wsUnhealthyTicks = 0
+  setInterval(() => {
+    const { state } = ws.getConnectionStatus()
+    if (state === 'connected') { wsUnhealthyTicks = 0; return }
+    if (state === 'failed') {
+      wsUnhealthyTicks = 0
+      reviveWs('watchdog: state=failed')
+      return
+    }
+    wsUnhealthyTicks++
+    log(`[ws] watchdog: state=${state} (${wsUnhealthyTicks}/3)`)
+    if (wsUnhealthyTicks >= 3) {
+      wsUnhealthyTicks = 0
+      reviveWs(`watchdog: stuck in '${state}' ~3min`)
+    }
+  }, 60 * 1000)
 
   startDebugSocket()
   startNotifyServer({ bind: config.notify.bind, port: config.notify.port })
