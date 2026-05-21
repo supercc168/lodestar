@@ -34,6 +34,12 @@ export type { SessionOpts } from './session-types'
 
 const SEND_MARKER_RE = /\[\[send:\s*([^\]\n]+?)\s*\]\]/g
 
+/** SDK error 自动续 turn 的上限:同一 turn 链上连续报错时,daemon 最多
+ * sendUserText('继续') 这么多次来自动续;第 (MAX_SDK_AUTO_RETRY + 1) 次
+ * 连续报错就放弃 —— ⛔ footer + 强制推送通知用户。任一次自然 success 或
+ * 用户介入都把计数清零。 */
+const MAX_SDK_AUTO_RETRY = 10
+
 /** "模型还在干活" 顶部 ticker 的备选动词。turn 起来时随机选一个、整 turn
  * 固定不变,setInterval 每 TICKER_TICK_MS (1s) 跑一次,只刷经过秒数 ——
  * 比让 verb 轮播视觉更稳。opus-4-7 上 extended thinking 走 redacted、
@@ -204,9 +210,10 @@ export class Session {
   /** Consecutive SDK error turns since the last `success`. When the SDK
    * closes a turn with `subtype !== 'success'` (error_during_execution /
    * error_max_turns), the daemon swallows the phone push and re-pokes
-   * the SDK with a "继续" user message to auto-resume. Two errors in a
-   * row → give up: surface the failure (⛔ footer + forced phone push)
-   * and reset. Any natural-success turn OR user intervention
+   * the SDK with a "继续" user message to auto-resume. Up to
+   * MAX_SDK_AUTO_RETRY (10) auto-resumes in a row; the next consecutive
+   * error past that → give up: surface the failure (⛔ footer + forced
+   * phone push) and reset. Any natural-success turn OR user intervention
    * (mid-turn buffer drain) resets this back to 0. */
   private consecutiveErrors = 0
   /** 让 result handler 把"下一个 turn 不是普通 user_message"这件事透传
@@ -937,9 +944,10 @@ export class Session {
       //      over auto-retry (user is back at the keyboard).
       //   2. `lastResult.is_error` — SDK closed the turn with a non-
       //      `success` subtype (error_during_execution / error_max_turns).
-      //      First occurrence: swallow the phone push, re-poke SDK with
-      //      "继续" to auto-resume. Second consecutive: give up,
-      //      ⛔ footer + force phone push so the user knows.
+      //      First occurrences: swallow the phone push, re-poke SDK with
+      //      "继续" to auto-resume (up to MAX_SDK_AUTO_RETRY times). One
+      //      more consecutive error past that: give up, ⛔ footer + force
+      //      phone push so the user knows.
       //   3. Natural success — `✅` footer, normal phone push, reset
       //      consecutiveErrors.
       // closeTurnCard's default push-on-clean-close stays the floor;
@@ -972,12 +980,12 @@ export class Session {
         suffix = isError ? `⚠️ SDK ${subtype},用户已介入` : '📨 转交新卡'
       } else if (isError) {
         this.consecutiveErrors++
-        if (this.consecutiveErrors >= 2) {
-          suffix = `⛔ SDK 连续报错 (${subtype}),已停止`
+        if (this.consecutiveErrors > MAX_SDK_AUTO_RETRY) {
+          suffix = `⛔ SDK ${subtype},自动续 ${MAX_SDK_AUTO_RETRY} 次仍失败,已停止`
           forcePush = true
           this.consecutiveErrors = 0
         } else {
-          suffix = `⚠️ SDK ${subtype},自动续 turn…`
+          suffix = `⚠️ SDK ${subtype},自动续 turn… (${this.consecutiveErrors}/${MAX_SDK_AUTO_RETRY})`
           autoRetry = true
         }
       } else if (noFollowupRetry) {
