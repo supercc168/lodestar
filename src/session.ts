@@ -892,7 +892,7 @@ export class Session {
     })
     p.on('assistant_block_stop', () => {
       // 一段 content block 收尾(SSE content_block_stop)→ 把当前 assistant 段
-      // 定稿(再发一帧带新内容的 /content 触发 fast commit,见 finalizeCurrentAssistant-
+      // 定稿(flush + streaming_mode 瞬切全显未上屏尾巴,见 finalizeCurrentAssistant-
       // Segment),然后 reset 段游标让下一段开新元素。这条 emit 在该段最后一个
       // text_delta 之后同步到达(claude-process 按 stdout 行序 emit),所以
       // appendAssistant 已把全量累进 currentAssistantText,这里定稿拿到的是完整段。
@@ -1384,31 +1384,28 @@ export class Session {
     cardkit.patchSummaryThrottled(turn.cardId, tail)
   }
 
-  /** 收尾(定稿)当前 assistant 段:对该段流式文本组件**再发一帧流式文本更新
-   * (/content PUT,即 cardkit.streamText),内容为「整段全文 + 一个零宽空格」**,
-   * 触发飞书 fast 策略把"未上屏"的打字机尾巴立即全部上屏;再清空当前段游标。
-   * 无段在写时只清游标。
+  /** 收尾(定稿)当前 assistant 段:flush 确保整段全文已 PUT,再对卡片做一次
+   * streaming_mode false→true 瞬切,逼飞书把当前段所有"未上屏"的打字机尾巴
+   * 立即全部上屏;最后清空当前段游标。无段在写时只清游标。
    *
-   * 关键(上一版踩的坑,务必别再改回 replaceElement):飞书流式文本是客户端
-   * **异步打字机动画**,有 print_step / print_frequency 速度上限,模型出字快于
-   * 客户端打字,封存某段时客户端大概率还有"未上屏"尾巴。官方 streaming doc 写
-   * 明:print_strategy=fast 的"未上屏部分立即全部上屏"**只在对同一组件的下一
-   * 次「流式文本更新」(/content PUT)时触发**。replaceElement 是"整体更新组件"
-   * 接口、不是流式文本更新,**不触发**这个 commit —— 上一版用 replaceElement
-   * 定稿,turn 中途插工具面板 / 开新段把没播完的尾巴冻成半截(典型:turn 开头
-   * 那段较长正文,打字机还没追上就被第一个工具封存,停在半句)。turn 末尾之所以
-   * 完整,只是因为 closeTurnCard 紧接着 streaming_mode=false 全局收尾把所有未上屏
-   * 文本一次性上屏 —— 跟 replaceElement 无关。所以这里必须走 /content 再发一次。
+   * 三版演进(务必别再改回前两版):
+   *   - v1 (82d509f) replaceElement 整段定稿:replaceElement 是"整体更新组件"
+   *     接口,streaming_mode 开着时该元素渲染权仍在打字机手里,定稿被盖住,
+   *     turn 中途插工具 / 开新段照样冻半截。
+   *   - v2 (cfecaa0)「全文 + 零宽空格」再发一帧 /content,赌 fast 策略"每次
+   *     /content 调用先把上一帧未上屏部分全显"。官方文档确是这么定义,但实测
+   *     失败:这两帧零间隔背靠背发,客户端把它们合并成一帧(目标=全文+零宽空格),
+   *     不存在"上一帧"可全显,打字机继续慢爬、被下个元素掐断成半截。
+   *   - v3 (本版) streaming_mode 瞬切:turn 末尾 streaming_mode=false 收尾能
+   *     可靠全显是实测验证过的(turn 一结束当前段就完整)。把它搬到 mid-turn:
+   *     off 那一下全显当前段未上屏尾巴,on 紧接着恢复后续段的流式打字机。不再
+   *     依赖客户端是否"按文档 commit 上一帧",直接走全局收尾这条已知可靠的路。
    *
-   * 实现:flush 先确保「全文」这一帧已 PUT 出去(本段最后的 delta 推出 + 清 timer);
-   * 再发一帧「全文 + 零宽空格 U+200B」。**为什么不能只重发全文**:飞书对内容字节
-   * 完全相同的 /content PUT 当 no-op,不算「下一帧」、不触发 fast commit(实测踩过:
-   * 重发跟上一帧字节相同的全文,飞书当没变化、白发,尾巴照样冻着)。零宽空格让这帧字节
-   * 不同 = 真·新帧,飞书据此把**前一帧(全文)**的未上屏部分立即全部上屏;而零宽
-   * 空格自身不可见,即便它这帧的尾巴又没有「下一帧」来 commit 也无所谓(本就看不
-   * 见)。fast 的 commit 永远是「收到新一帧时把上一帧没上屏的补全」,所以任何一段的
-   * 最后一帧的尾巴都需要一帧新内容来兜 —— 零宽空格就是那一帧。turn 末尾 closeTurnCard
-   * 用 segmentTexts(不含零宽空格)replaceElement + streaming_off 收尾,不留痕。 */
+   * flush 必须在 off 之前:把本段最后的 delta 推成全文这一帧,off 才能全显完整
+   * 段。off/on 走 per-card 队列、顺序紧跟 flush。PATCH settings 是合并语义(只改
+   * streaming_mode、不动 turn.ts 设的 streaming_config) —— 旁证:cardkit.reopen-
+   * Streaming 单独 PATCH streaming_mode 重开后打字机仍正常。turn 末尾 closeTurnCard
+   * 自己会再 streaming_mode=false 收尾,这里 on 回来不影响最终态。 */
   finalizeCurrentAssistantSegment(): void {
     const turn = this.currentTurn
     if (!turn) return
@@ -1416,10 +1413,9 @@ export class Session {
     const text = turn.currentAssistantText ?? ''
     if (segId && text.trim()) {
       void cardkit.flush(turn.cardId)
-      // 全文 + 零宽空格(U+200B):制造一帧「字节不同」的新内容,逼飞书 fast 把
-      // 前一帧全文的未上屏尾巴立即全上。零宽空格不可见、不留痕(见上方注释)。
-      // 用 fromCodePoint 而非字面量,免得零宽空格在源码里隐形被误删。
-      void cardkit.streamText(turn.cardId, segId, text + String.fromCodePoint(0x200b))
+      // streaming off→on 瞬切:off 全显当前段未上屏尾巴,on 恢复后续流式。
+      void cardkit.patchSettings(turn.cardId, { config: { streaming_mode: false } })
+      void cardkit.patchSettings(turn.cardId, { config: { streaming_mode: true } })
     }
     turn.currentAssistantSegmentId = null
     turn.currentAssistantText = ''
@@ -1487,8 +1483,8 @@ export class Session {
     // replaceElement 设定的最终内容。**注意**:replaceElement 自身只设组件内容、
     // 不触发流式 commit;turn 中途单独用它定稿会留半截(turn 末尾不留是因为有
     // streaming_mode=false 兜底,跟 replaceElement 无关),所以 mid-turn 的
-    // finalizeCurrentAssistantSegment 改走 /content 再发一次。turn 中途
-    // content_block_stop 已 commit 过各段,这里是收尾兜底兼 marker 清理。
+    // finalizeCurrentAssistantSegment 改用 streaming_mode 瞬切来全显。turn 中途
+    // content_block_stop 已定稿过各段,这里是收尾兜底兼 marker 清理。
     const sendPaths: string[] = []
     for (const [segId, fullText] of segmentTexts) {
       const cleaned = fullText.replace(SEND_MARKER_RE, (_m, p1) => {

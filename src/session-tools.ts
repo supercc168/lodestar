@@ -35,9 +35,9 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
   // AFTER it in card body order. Flush queues the segment's last
   // buffered delta before the tool element is inserted.
   if (s.currentTurn.currentAssistantSegmentId) {
-    // 工具面板插在当前 assistant 段之后 → 先把该段定稿:再发一帧带新内容的 /content
-    // 触发飞书 fast「未上屏立即上屏」(见 Session.finalizeCurrentAssistantSegment),
-    // 否则段尾没播完的打字机会被随后插入的工具元素"封存"成半截。
+    // 工具面板插在当前 assistant 段之后 → 先把该段定稿:flush + streaming_mode
+    // 瞬切全显未上屏尾巴(见 Session.finalizeCurrentAssistantSegment),否则段尾
+    // 没播完的打字机会被随后插入的工具元素"封存"成半截。
     // content_block_stop 通常已先定稿过这段(那时 segId 已 reset、这里直接
     // 跳过),本调用是 block_stop 没覆盖时的兜底。finalize 内部会清段游标。
     s.finalizeCurrentAssistantSegment()
