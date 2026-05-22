@@ -570,7 +570,15 @@ async function boot(): Promise<void> {
     appSecret: config.feishu.app_secret,
     loggerLevel: lark.LoggerLevel.info,
     logger: wsLogger,
-    wsConfig: { pingTimeout: 180 },
+    // MUST be < the SDK's 120s pingInterval. The pong-watchdog is re-armed on
+    // every ping and (deliberately) NOT re-armed on inbound; it only fires if a
+    // full pingTimeout window elapses with no inbound between two pings. With
+    // pingTimeout ≥ 120 the next ping always re-arms it before it can expire, so
+    // on a half-open/zombie socket it NEVER terminates — the whole
+    // close→reConnect→onReconnected→rebuildWs self-heal chain below stays dead.
+    // 60s leaves margin under the 120s interval so a dead link is killed within
+    // ~60s of the next ping. (Earlier 180 silently disabled the watchdog.)
+    wsConfig: { pingTimeout: 60 },
     // Without this, connect() awaits the 'open'/'error' event forever when
     // neither fires (wedged WS upgrade behind NAT/proxy) — start() deadlocks
     // silently: process alive, REST fine, but permanently deaf, no log and no
