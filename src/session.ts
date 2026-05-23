@@ -1055,26 +1055,29 @@ export class Session {
     const r = this.proc?.lastResult
     if (!r) return
     const u = r.usage ?? {}
-    const inputTokens = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0)
-    const outputTokens = u.output_tokens ?? 0
-    const tokens = inputTokens + outputTokens
-    const costUsd = r.cost_usd ?? 0
+    // 有效 token = 真正喂进(input + 本轮新建缓存)+ 产出。故意不含
+    // cache_read_input_tokens —— 那是把整段已缓存上下文又复读一遍的计费量,
+    // 每轮几乎等于全窗口,计进来会让累计虚高一个量级(33.87M 大头就是它),
+    // 反映不了对话真实规模。usage 本身是单轮值(实测跨轮独立、不累计),
+    // 所以逐轮相加即得总量。
+    const tokens = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.output_tokens ?? 0)
+    // cost 取本进程算好的本轮增量,而非 total_cost_usd 累计值 —— 直接累加
+    // total_cost_usd 会三角放大(见 ClaudeProcess.cost_delta_usd)。
+    const costUsd = r.cost_delta_usd ?? 0
     const durationMs = r.duration_ms ?? 0
     this.cumStats.tokens += tokens
     this.cumStats.costUsd += costUsd
     this.cumStats.turns += r.num_turns ?? 1
-    this.lastTurnDelta = { tokens, costUsd, durationMs, inputTokens }
+    this.lastTurnDelta = { tokens, costUsd, durationMs }
   }
 
   /** Current context-window occupancy estimate — uses the most recent
    * assistant `usage` (input + caches), since each assistant reply replays
    * the full conversation. Returns 0 when no per-call usage is available
-   * (process dead, or fresh spawn before first assistant message);
-   * `lastTurnDelta.inputTokens` is the CUMULATIVE turn input across all
-   * API calls in the turn (sum of cache_read across N steps) — using it
-   * here would inflate the percentage by Nx after a heavy multi-step
-   * turn (observed bug 2026-05-16: 417% in the `hi` panel after killing
-   * the proc with a long turn's delta still on file). */
+   * (process dead, or fresh spawn before first assistant message).
+   * 用 proc.lastUsage(最后一条 assistant 的单次 usage)而不是把一轮里 N 次
+   * API 调用的 input 累加 —— 后者(cache_read 跨步累加)会让占比虚高 Nx
+   * (2026-05-16 现场 bug:重一点的多步 turn 后 hi 面板飙到 417%)。 */
   private currentContextTokens(): number {
     const u = this.proc?.lastUsage as ClaudeUsage | null | undefined
     if (!u) return 0

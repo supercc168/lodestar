@@ -86,10 +86,9 @@ export interface SessionOpts {
 /** Per-turn delta extracted from the SDK `result` message — feeds the
  * "上一轮" line in the console panel. */
 export interface LastTurnDelta {
-  tokens: number      // input + cache_* + output for that turn
-  costUsd: number
+  tokens: number      // input + cache_creation + output for that turn (剔除 cache_read 复读)
+  costUsd: number     // 本轮真实成本增量(SDK total_cost_usd 是 session 累计,这里存 delta)
   durationMs: number
-  inputTokens: number // input + cache_* (excludes output) — context-window estimate
 }
 
 /** Cumulative session counters. Reset on full restart (`clear`),

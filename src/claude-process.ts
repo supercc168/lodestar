@@ -175,6 +175,13 @@ export interface ClaudeUsage {
 
 export interface ClaudeResultMeta {
   cost_usd: number | null
+  /** 本轮真实成本增量 = 本轮 total_cost_usd − 上一轮 total_cost_usd。
+   * SDK 的 total_cost_usd 是「本进程 session 从头到现在」的累计值、单调增;
+   * 直接逐轮累加它会三角放大(N 轮把一串前缀和又加一遍)。这里在 result
+   * 落地时一次性算好进程内 delta,Session 累加它即得真实总额。resume 不
+   * replay 历史 usage(见 session-types CumStats 注释),新进程 total_cost_usd
+   * 从 0 起,故 baseline 挂进程实例即可。 */
+  cost_delta_usd: number | null
   duration_ms: number | null
   num_turns: number | null
   usage: ClaudeUsage | null
@@ -229,9 +236,13 @@ export class ClaudeProcess extends EventEmitter {
    * spawn; persists across turns so the console panel can show "last
    * turn" stats even while idle. */
   lastResult: ClaudeResultMeta = {
-    cost_usd: null, duration_ms: null, num_turns: null, usage: null,
-    subtype: null, is_error: false,
+    cost_usd: null, cost_delta_usd: null, duration_ms: null, num_turns: null,
+    usage: null, subtype: null, is_error: false,
   }
+  /** 上一条 result 的 total_cost_usd,用来把累计成本换算成本轮增量
+   * (见 ClaudeResultMeta.cost_delta_usd)。进程内单调增 baseline;
+   * 新进程实例从 0 起,resume 也从 0 重新累计,故无需跨进程结转。 */
+  private prevTotalCostUsd = 0
   /** Context-window capacity of the model that ran the latest turn —
    * lifted from `result.modelUsage[model].contextWindow` so we don't
    * have to hardcode `[1m]` vs stock variants. `null` until the first
@@ -449,8 +460,14 @@ export class ClaudeProcess extends EventEmitter {
     }
     if (type === 'result') {
       const subtype = typeof msg.subtype === 'string' ? msg.subtype : null
+      const totalCost = typeof msg.total_cost_usd === 'number' ? msg.total_cost_usd : null
+      // total_cost_usd 是 session 累计值(单调增),换算成本轮增量再上报。
+      // max(0, …) 兜 resume / 异常导致 baseline 回退时不至于算成负数。
+      const costDelta = totalCost !== null ? Math.max(0, totalCost - this.prevTotalCostUsd) : null
+      if (totalCost !== null) this.prevTotalCostUsd = totalCost
       this.lastResult = {
-        cost_usd: typeof msg.total_cost_usd === 'number' ? msg.total_cost_usd : null,
+        cost_usd: totalCost,
+        cost_delta_usd: costDelta,
         duration_ms: typeof msg.duration_ms === 'number' ? msg.duration_ms : null,
         num_turns: typeof msg.num_turns === 'number' ? msg.num_turns : null,
         usage: msg.usage ?? null,
