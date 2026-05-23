@@ -33,7 +33,24 @@ export async function onAskMessageAnswer(s: Session, text: string, user: string)
   }
   const [toolUseId, pending] = firstEntry.value
   if (pending.currentIdx === undefined) {
-    log(`session "${s.sessionName}": pending ask ${toolUseId} already terminal — ignoring message`)
+    // currentIdx undefined = 所有问题已答完。正常路径下 can_use_tool 一到,
+    // finalizeAsk 立刻把这条 ask 从 pendingAsks 删掉;还能在这里读到它只有
+    // 两种可能:
+    //   1. requestId 已 park,正等 finalize 落地(亚秒级窗口)—— 真·瞬态,
+    //      照旧忽略,别和 fast-clicker race 抢答。
+    //   2. requestId 始终没来 —— can_use_tool 永不会到(SDK 在 ask 握手中途
+    //      静默挂死,turn 既无 result 也不 exit)。这条 ask 是僵尸,会把整个
+    //      session 焊死:hasPendingAsk() 恒 true,后续每条消息都被吞,连
+    //      onUserMessage 都到不了,子进程也没机会重启。识破即逃生 —— 丢弃
+    //      僵尸,把这条消息当普通 user message 重新处理(interrupt + 开新
+    //      turn / 重启子进程),用户随手发一条就能自愈,不必去 stop+重启 daemon。
+    if (pending.requestId) {
+      log(`session "${s.sessionName}": pending ask ${toolUseId} awaiting finalize — ignoring message`)
+      return
+    }
+    log(`session "${s.sessionName}": pending ask ${toolUseId} orphaned (no can_use_tool) — dropping zombie, reprocessing as user message`)
+    s.pendingAsks.delete(toolUseId)
+    await s.onUserMessage(text, [], user)
     return
   }
   await onAskCustomAnswer(s, toolUseId, pending.currentIdx, text, user)

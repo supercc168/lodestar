@@ -373,6 +373,7 @@ export class Session {
     this.releaseAllReactions()
     this.initCount = 0
     this.openingTurn = false
+    this.pendingAsks.clear()
     this.pendingPermissions.clear()
     this.consecutiveErrors = 0
     this.awaitingFollowup = null
@@ -398,6 +399,7 @@ export class Session {
     this.releaseAllReactions()
     this.initCount = 0
     this.openingTurn = false
+    this.pendingAsks.clear()
     this.pendingPermissions.clear()
     this.consecutiveErrors = 0
     this.awaitingFollowup = null
@@ -1037,6 +1039,12 @@ export class Session {
       this.releaseAllReactions()
       this.initCount = 0
       this.openingTurn = false
+      // 进程没了 ⇒ 任何 pending ask 都不可能再收到 can_use_tool 或回传答案,
+      // 定义上已死。不清的话 hasPendingAsk() 恒 true,后续每条消息都被
+      // onAskMessageAnswer 当僵尸答案吞掉,session 焊死到下次 daemon 重启
+      // (kill/restart 同样在上面补了这一清理)。
+      this.pendingAsks.clear()
+      this.pendingPermissions.clear()
       this.consecutiveErrors = 0
       this.awaitingFollowup = null
       this.userInterrupted = false
