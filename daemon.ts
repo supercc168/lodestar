@@ -310,8 +310,11 @@ async function handleMessage(data: any): Promise<void> {
   // input elements, so the chat box itself is the input. Only applies
   // to text-only messages (post / 图片 / 文件附件都按一次新轮处理)。
   if (msgType === 'text' && text && session.hasPendingAsk()) {
-    if (msgId) void feishu.addReaction(msgId, 'CheckMark')
-    await session.onAskMessageAnswer(text, userOpenId)
+    // ✅ 不在这里抢打 —— 只有 onAskMessageAnswer 真把这条文本记成 ask
+    // 答案时才回 ✅。撞上僵尸 ask(can_use_tool 没来)时这条消息会被当
+    // 普通新轮重处理,不该留"答案已收到"标记。msgId 透传下去:成功消费
+    // 时用来打 ✅,兜底重处理时让消息走完整的普通 reaction 生命周期。
+    await session.onAskMessageAnswer(text, userOpenId, msgId ?? '')
     return
   }
 

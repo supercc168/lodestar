@@ -797,15 +797,15 @@ export class Session {
     return sessionAsk.hasPendingAsk(this)
   }
 
-  onAskMessageAnswer(text: string, user: string): Promise<void> {
-    return sessionAsk.onAskMessageAnswer(this, text, user)
+  onAskMessageAnswer(text: string, user: string, msgId: string): Promise<void> {
+    return sessionAsk.onAskMessageAnswer(this, text, user, msgId)
   }
 
   onAskAnswer(toolUseId: string, questionIdx: number, optionIdx: number, user: string): Promise<void> {
     return sessionAsk.onAskAnswer(this, toolUseId, questionIdx, optionIdx, user)
   }
 
-  onAskCustomAnswer(toolUseId: string, questionIdx: number, customText: string, user: string): Promise<void> {
+  onAskCustomAnswer(toolUseId: string, questionIdx: number, customText: string, user: string): Promise<boolean> {
     return sessionAsk.onAskCustomAnswer(this, toolUseId, questionIdx, customText, user)
   }
 

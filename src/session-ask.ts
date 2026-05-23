@@ -9,6 +9,7 @@
 import type { Session } from './session'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
+import * as feishu from './feishu'
 import { log } from './log'
 
 /** True iff there's at least one open AskUserQuestion awaiting an
@@ -24,11 +25,11 @@ export function hasPendingAsk(s: Session): boolean {
  * question semantics: from the user's perspective, the chat
  * input always answers whatever question is on screen right now
  * (`pending.currentIdx`), and a new question slides in after. */
-export async function onAskMessageAnswer(s: Session, text: string, user: string): Promise<void> {
+export async function onAskMessageAnswer(s: Session, text: string, user: string, msgId: string): Promise<void> {
   const firstEntry = s.pendingAsks.entries().next()
   if (firstEntry.done) {
     log(`session "${s.sessionName}": onAskMessageAnswer with no pending — falling back to onUserMessage`)
-    await s.onUserMessage(text)
+    await s.onUserMessage(text, [], user, msgId)
     return
   }
   const [toolUseId, pending] = firstEntry.value
@@ -50,10 +51,16 @@ export async function onAskMessageAnswer(s: Session, text: string, user: string)
     }
     log(`session "${s.sessionName}": pending ask ${toolUseId} orphaned (no can_use_tool) — dropping zombie, reprocessing as user message`)
     s.pendingAsks.delete(toolUseId)
-    await s.onUserMessage(text, [], user)
+    await s.onUserMessage(text, [], user, msgId)
     return
   }
-  await onAskCustomAnswer(s, toolUseId, pending.currentIdx, text, user)
+  // 这条文本确实落在一个 live 问题上 —— 当 ask 答案消费。只有真记账成功
+  // (非空、非 stale)才回 ✅;否则这条消息没被收下,不该留"答案已收到"
+  // 标记。✅ 原先在 daemon 路由层 hasPendingAsk() 为真就无条件抢打,僵尸
+  // 自愈 / 兜底分支会残留一个语义错误的 ✅(消息其实被当普通新轮处理)——
+  // 下沉到这里按真实消费结果打。
+  const consumed = await onAskCustomAnswer(s, toolUseId, pending.currentIdx, text, user)
+  if (consumed && msgId) void feishu.addReaction(msgId, 'CheckMark')
 }
 
 /** Click handler for an option button. The click must target the
@@ -78,23 +85,29 @@ export async function onAskAnswer(
 }
 
 /** Custom-text branch. Same staleness rule as onAskAnswer; empty
- * input is silently ignored (panel stays pending). */
+ * input is silently ignored (panel stays pending). Returns true iff
+ * the text was actually recorded as the answer to the current
+ * question — onAskMessageAnswer uses this to decide whether to stamp
+ * the ✅ "answer received" reaction on the chat message. Stray /
+ * empty / stale inputs return false and earn no ✅. (Card-action
+ * callers ignore the return — they have their own toast.) */
 export async function onAskCustomAnswer(
   s: Session,
   toolUseId: string,
   questionIdx: number,
   customText: string,
   user: string,
-): Promise<void> {
+): Promise<boolean> {
   const pending = s.pendingAsks.get(toolUseId)
-  if (!pending) { log(`session "${s.sessionName}": stray ask custom for ${toolUseId}`); return }
+  if (!pending) { log(`session "${s.sessionName}": stray ask custom for ${toolUseId}`); return false }
   const trimmed = (customText ?? '').trim()
-  if (!trimmed) { log(`session "${s.sessionName}": empty custom answer, ignoring`); return }
+  if (!trimmed) { log(`session "${s.sessionName}": empty custom answer, ignoring`); return false }
   if (questionIdx !== pending.currentIdx) {
     log(`session "${s.sessionName}": stale ask custom q=${questionIdx} current=${pending.currentIdx}`)
-    return
+    return false
   }
   advanceAsk(s, toolUseId, { customText: trimmed, user })
+  return true
 }
 
 /** Record an answer for the current question, advance the state
