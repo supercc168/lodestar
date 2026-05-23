@@ -6,6 +6,7 @@
  */
 
 import type { Session } from './session'
+import type { TurnState } from './session-types'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
@@ -239,5 +240,63 @@ export function refreshOtherTaskPanels(s: Session, skipToolUseId: string): void 
       status, meta.resolvedNote, todos,
     )
     void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
+  }
+}
+
+/** 换卡时把"还在跑 / 在旧卡没渲染成功"的 tool 搬到新卡重建,让它们的
+ * result 回来仍能在新卡更新、建失败的也补上显示。已完成且旧卡上活着的
+ * tool 不搬 —— 旧卡留底,也避免把新卡瞬间塞满又触发连锁 rotate。
+ *
+ * Read 按约定切开:合并 batch 里每个还需搬的 item 各自独立成一个新 panel,
+ * 不再维持 batch 合并。rotate 是异常路径,功能正确(result 不丢)优先于
+ * 合并美观。
+ *
+ * 调用约定:在 startMidTurnRotate 的 swap 完成后调(turn.cardId 已是新卡,
+ * toolByUseId / readBatches / toolCount 已 reset),传入 swap 前同步快照的
+ * oldToolByUseId / oldBatches —— swap 把这俩换成了新空 Map,旧对象只在快照里。 */
+export function rebuildToolsOnRotate(
+  s: Session,
+  oldCardId: string,
+  newCardId: string,
+  oldToolByUseId: TurnState['toolByUseId'],
+  oldBatches: TurnState['readBatches'],
+): void {
+  const turn = s.currentTurn
+  if (!turn) return
+  for (const [useId, meta] of oldToolByUseId) {
+    const isRead = meta.readBatchSlot != null
+    let input = meta.input
+    let output: string | null
+    let isError: boolean
+    if (isRead) {
+      const item = oldBatches.get(meta.i)?.items[meta.readBatchSlot!]
+      if (!item) continue
+      input = item.input
+      output = item.output
+      isError = item.isError
+    } else {
+      output = meta.output ?? null
+      isError = meta.isError ?? false
+    }
+    const done = output != null
+    const deadOnOld = cardkit.isDeadElement(oldCardId, cards.ELEMENTS.tool(meta.i))
+    // 已完成且旧卡上活着 → 留在旧卡,不搬。
+    if (done && !deadOnOld) continue
+    const ni = turn.toolCount++
+    if (isRead) {
+      const item = { toolUseId: useId, input, output, isError }
+      turn.readBatches.set(ni, { items: [item] })
+      turn.toolByUseId.set(useId, { ...meta, i: ni, readBatchSlot: 0 })
+      void cardkit.addElement(newCardId, cards.readBatchElement(ni, [item]), {
+        type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
+      })
+    } else {
+      turn.toolByUseId.set(useId, { ...meta, i: ni })
+      const status: '⏳' | '✅' | '❌' = !done ? '⏳' : (isError ? '❌' : '✅')
+      const todos = isTaskWorkflow(meta.name) ? todosArray(s) : undefined
+      void cardkit.addElement(newCardId, cards.toolCallElement(ni, meta.name, meta.input, output, status, meta.resolvedNote, todos), {
+        type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
+      })
+    }
   }
 }

@@ -168,9 +168,9 @@ interface MainCardOpts {
    *                   模型没解释 / 没重试直接 end_turn(SDK bug 兜底),
    *                   daemon sendUserText('继续') 触发的续 turn
    *                   (banner `🛠️ 工具出错异常终止,自动续`,无 panel)
-   *   'card_full'    — 同一 SDK turn 的"续卡":前一张卡的 element 数
-   *                   接近飞书上限(~100),session 主动 rotate 出来的新
-   *                   卡(banner `📨 接续上一张`,无 panel,turn 号跟旧卡
+   *   'card_full'    — 同一 SDK turn 的"续卡":前一张卡写满(element 数
+   *                   触顶 ~75)或写入被飞书拒,session rotate 出来的新卡
+   *                   (banner `📨 接续上一张`,无 panel,turn 号跟旧卡
    *                   相同) */
   kind?: 'user_message' | 'scheduled' | 'auto_retry' | 'no_followup_retry' | 'tool_error_retry' | 'card_full'
   /** 本轮 SDK 收到的 user wireText 列表。boot turn 通常是 1 条;mid-turn
@@ -200,7 +200,7 @@ export function mainConversationCard(opts: MainCardOpts): object {
     : opts.kind === 'tool_error_retry'
     ? [{ tag: 'markdown', content: '🛠️ 工具出错异常终止,自动续' }]
     : opts.kind === 'card_full'
-    ? [{ tag: 'markdown', content: '📨 接续上一张(同一轮 SDK turn,前一张卡 element 已满)' }]
+    ? [{ tag: 'markdown', content: '📨 接续上一张(同一轮 SDK turn,前一张卡写满或写入受限)' }]
     : []
   const inputs = opts.userInputs ?? []
   const userInputPanel = inputs.length > 0

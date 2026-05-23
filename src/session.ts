@@ -58,13 +58,26 @@ const TICKER_VERBS = [
 const TICKER_TICK_MS = 1000
 
 /** Soft cap on element count per Feishu card before we proactively
- * rotate to a fresh one. The hard ceiling is ~100 (Feishu rejects
- * additional `POST /elements` with code=300305/300315 once a card has
- * ~100 elements); rotating at 80 keeps a 20% headroom for in-flight
- * stream handlers that already chose the old cardId before this check
- * fired (cardkit's per-card queue may still drain a few more adds onto
- * the soft-closed card before turn.cardId swap takes effect). */
-const CARD_ELEMENT_SOFT_LIMIT = 80
+ * rotate to a fresh one. The hard ceiling is NOT ~100 as once assumed:
+ * a 2026-05-23 dogfood turn hit `300305 [element exceeds the limit]` at
+ * ~76 elements (tool_60 + assistant_13 + base). The old soft cap of 80
+ * sat ABOVE the real ceiling, so `getElementCount() >= 80` never became
+ * true before Feishu rejected the add — rotation never fired and the card
+ * froze mid-turn. Keep this comfortably under the observed ~75; 50 leaves
+ * headroom for in-flight stream handlers that already chose the old cardId
+ * before this check fired, and for heavier element mixes that trip the
+ * limit earlier. This number is no longer the only line of defense:
+ * addElement's 300305/300315 now forces a rotate directly (see
+ * Session.onCardWriteFailure), so a wrong guess here still self-heals. */
+const CARD_ELEMENT_SOFT_LIMIT = 50
+
+/** Max mid-turn card rotations per turn. Past this we stop opening fresh
+ * cards and fall back to log-only for the rest of the turn. Guards the
+ * "rotate on any write failure" path against a runaway loop where every
+ * card keeps failing (Feishu outage, or an element whose own content
+ * Feishu rejects on every card) — without a cap that would spray an
+ * endless trail of empty cards into the chat. */
+const MAX_MIDTURN_ROTATES = 5
 
 export class Session {
   /** Process-wide registry of every Session ever constructed in this daemon.
@@ -1207,7 +1220,7 @@ export class Session {
       (trigger === 'scheduled' || trigger === 'auto_retry' || trigger === 'no_followup_retry' || trigger === 'tool_error_retry' ? 1 : 0) +
       (trigger === 'user_message' && userInputs.length > 0 ? 1 : 0) +
       2
-    cardkit.recordCardCreated(cardId, initialElementCount)
+    cardkit.recordCardCreated(cardId, initialElementCount, (code) => this.onCardWriteFailure(code))
     const turnState: TurnState = {
       cardId,
       messageId,
@@ -1224,6 +1237,8 @@ export class Session {
       startedAt: Date.now(),
       tickerHandle: null,
       rotating: null,
+      rotateCount: 0,
+      rotateGivenUp: false,
     }
     this.currentTurn = turnState
     this.startTicker(turnState)
@@ -1237,9 +1252,9 @@ export class Session {
    * stream handler still uses `turn.cardId` (the old card) for this
    * iteration — that's fine because (a) cardkit's per-card queue keeps
    * its writes ordered against the soft-close that's about to happen,
-   * and (b) the soft limit (80) leaves 20 elements of headroom under
-   * the hard cap (~100), so the in-flight adds either fit or are
-   * silently swallowed when the old card is disposed. */
+   * and (b) the soft limit (CARD_ELEMENT_SOFT_LIMIT=50) sits well under
+   * the observed ~75 ceiling, so an in-flight add either fits or — if it
+   * doesn't — trips onCardWriteFailure, which rotates reactively anyway. */
   maybeMidTurnRotate(): void {
     const turn = this.currentTurn
     if (!turn) return
@@ -1248,19 +1263,56 @@ export class Session {
     this.startMidTurnRotate(turn)
   }
 
+  /** Reactive rotation trigger: cardkit calls this (via the addElement
+   * onFailure path) whenever a write to the card was rejected by Feishu —
+   * ANY code, not just 300305/300315. The element limit was the symptom
+   * that surfaced this, but the same response ("the card is unwritable,
+   * move to a fresh one") applies to a schema/rule change, or a transient
+   * server reject that survived the reopen-retry. Deliberately does NOT
+   * consult getElementCount: a failed add never bumps the counter, so the
+   * count is stuck below the soft cap exactly when a rotate is most needed
+   * (the bug that froze the 2026-05-23 turn at ~76 elements). Idempotent
+   * (a rotation already in flight is left alone) and capped
+   * (MAX_MIDTURN_ROTATES) so a persistent failure can't spin forever. */
+  onCardWriteFailure(code?: number): void {
+    const turn = this.currentTurn
+    if (!turn) return
+    if (turn.rotating) return
+    if (turn.rotateCount >= MAX_MIDTURN_ROTATES) {
+      if (!turn.rotateGivenUp) {
+        turn.rotateGivenUp = true
+        log(`session "${this.sessionName}": rotate cap (${MAX_MIDTURN_ROTATES}) hit — giving up, rest of turn is log-only`)
+        void feishu.sendTextRaw(this.chatId, `⚠️ 卡片连续 ${MAX_MIDTURN_ROTATES} 次写入失败(疑似飞书故障或内容超限),本轮后续输出仅日志可见。`)
+      }
+      return
+    }
+    const why = cardkit.isElementLimitCode(code) ? `element limit (${code})` : `write failure (code=${code ?? 'n/a'})`
+    log(`session "${this.sessionName}": ${why} on card=${turn.cardId.slice(0, 8)}… — rotating to fresh card`)
+    this.startMidTurnRotate(turn)
+  }
+
   /** Open a fresh card under the **same** SDK turn number to dodge
    * Feishu's per-card element limit. The old card stays in the chat —
-   * we flip its footer to "📨 卡片满,转下一张", turn streaming off,
-   * and dispose its cardkit state — but it never becomes the writable
-   * one again. Everything tool/assistant-related on the turn state is
-   * reset so subsequent stream handlers wire up against the new card
-   * cleanly; in-flight tool calls whose results land *after* rotation
-   * lose their old element ids and re-emerge as fresh tool panels on
-   * the new card (acceptable: the user already saw "⏳" frozen on the
-   * old card, the new panel makes the result visible somewhere). */
+   * we flip its footer to "📨 已续至下一张卡", turn streaming off, and
+   * dispose its cardkit state — but it never becomes the writable one
+   * again. Turn state is reset so subsequent stream handlers wire up
+   * against the new card cleanly; the still-live content is carried over
+   * rather than dropped: the in-flight assistant segment (rebuilt and
+   * continued) and any unfinished / failed tools (rebuildToolsOnRotate
+   * moves them, Reads split out), while already-finished tools stay on
+   * the old card. */
   private startMidTurnRotate(turn: TurnState): void {
     if (turn.rotating) return
+    turn.rotateCount++
     const oldCardId = turn.cardId
+    // 同步快照 tool 簿子 —— swap 会把这俩 Map 换成新的空 Map,旧对象仍被这俩
+    // 引用持有(切卡 async 窗口里到达的新 tool 也继续 append 进旧 Map),
+    // rebuildToolsOnRotate 用它们把"未完成/建失败"的 tool 搬到新卡。
+    // assistant 段不在这里快照:它要带的是 swap 那一刻的最新全文(含切卡窗口期
+    // 的 delta),所以放到 swap 时再读 —— 配合 appendAssistant onFailure 在
+    // rotating 期间不 reset,这段会一直累积到 swap,窗口期的字一个不丢。
+    const oldToolByUseId = turn.toolByUseId
+    const oldBatches = turn.readBatches
     turn.rotating = (async () => {
       try {
         log(`session "${this.sessionName}": mid-turn rotate triggered card=${oldCardId.slice(0, 8)}… elementCount=${cardkit.getElementCount(oldCardId)}`)
@@ -1287,14 +1339,10 @@ export class Session {
           return
         }
         // card_full body has banner(1) + ticker(1) + footer(1) = 3 elements.
-        cardkit.recordCardCreated(newCardId, 3)
+        cardkit.recordCardCreated(newCardId, 3, (code) => this.onCardWriteFailure(code))
         // 同步 swap：从这一行起,后续 stream handler 看到的 turn.cardId
         // 是新卡。reset 所有 element-id 引用 (toolCount / assistantSegmentCount
         // 等),旧卡上的 element_id 在新卡里查不到,继续 PUT 会 300313。
-        // 先快照旧卡上正在流式的 assistant 段,close-old 时定稿它 —— swap 之后
-        // currentAssistant* 立刻被清空,不抓住就没法在旧卡上把它写完整。
-        const oldSegId = turn.currentAssistantSegmentId
-        const oldSegText = (turn.currentAssistantText ?? '').trim()
         this.stopTicker(turn)
         turn.cardId = newCardId
         turn.messageId = newMessageId
@@ -1302,11 +1350,32 @@ export class Session {
         turn.toolByUseId = new Map()
         turn.readBatches = new Map()
         turn.openReadBatchI = null
+        // swap 那一刻读当前正在写的段(含切卡 async 窗口里到达的全部 delta ——
+        // onFailure 在 rotating 期间不 reset,所以这段一直累积到这里)。先读后清。
+        const carrySegId = turn.currentAssistantSegmentId
+        const carryText = (turn.currentAssistantText ?? '').trim()
         turn.assistantSegmentCount = 0
         turn.currentAssistantSegmentId = null
         turn.currentAssistantText = ''
         turn.segmentTexts = new Map()
         this.startTicker(turn)
+        // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read 切开重建。
+        sessionTools.rebuildToolsOnRotate(this, oldCardId, newCardId, oldToolByUseId, oldBatches)
+        // 重建出错内容:旧卡上没渲染成功的当前 assistant 段(addElement 被拒、
+        // 成了死元素)→ 把已累积的文字(含切卡窗口期的)搬到新卡续写,内容不丢。
+        // 若该段在旧卡 alive(下面会定稿),它留在旧卡,这里不重复建。之后该段的
+        // delta 会顺着 currentAssistantSegmentId 继续 append 到新段,视觉无缝接续。
+        if (carrySegId && carryText && cardkit.isDeadElement(oldCardId, carrySegId)) {
+          const ri = turn.assistantSegmentCount++
+          const reSegId = cards.ELEMENTS.assistant(ri)
+          turn.currentAssistantSegmentId = reSegId
+          turn.currentAssistantText = carryText
+          turn.segmentTexts.set(reSegId, carryText)
+          void cardkit.addElement(newCardId, cards.assistantSegmentElement(ri), {
+            type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
+          })
+          cardkit.streamTextThrottled(newCardId, reSegId, carryText)
+        }
         // 旧卡收尾:footer 红字 + streaming_off + dispose。放到 swap 后
         // 是因为这条链是 async,期间 cardkit 队列上还可能有 stream
         // handler enqueue 的 streamText / replaceElement 等;让它们排
@@ -1316,14 +1385,14 @@ export class Session {
           // 旧卡当前 assistant 段定稿,避免换卡瞬间把没播完的打字机尾巴留在
           // 旧卡上(replaceElement 直接上屏完整内容,见
           // finalizeCurrentAssistantSegment)。
-          if (oldSegId && oldSegText) {
-            await cardkit.replaceElement(oldCardId, oldSegId, {
-              tag: 'markdown', element_id: oldSegId, content: oldSegText,
+          if (carrySegId && carryText) {
+            await cardkit.replaceElement(oldCardId, carrySegId, {
+              tag: 'markdown', element_id: carrySegId, content: carryText,
             })
           }
-          await cardkit.streamText(oldCardId, cards.ELEMENTS.footer, '📨 卡片满,转下一张 ↓')
+          await cardkit.streamText(oldCardId, cards.ELEMENTS.footer, '📨 已续至下一张卡 ↓')
           cardkit.cancelSummary(oldCardId)
-          await cardkit.patchSettings(oldCardId, cards.streamingOffSettings({ suffix: '📨 卡片满' }))
+          await cardkit.patchSettings(oldCardId, cards.streamingOffSettings({ suffix: '📨 转下一张' }))
           await cardkit.dispose(oldCardId)
         } catch (e) {
           log(`session "${this.sessionName}": mid-turn rotate close-old failed: ${e}`)
@@ -1370,11 +1439,12 @@ export class Session {
       void cardkit.addElement(turn.cardId, cards.assistantSegmentElement(i), {
         type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
       }, () => {
-        // addElement永久失败:reset segmentId 让下次 delta 重新创建
-        // segment,否则后续 streamText 全都 PUT 到不存在的 element,
-        // 整段 assistant text 在用户那看不到。守 segId 不变以防 turn
-        // rotation 或 addTool 已经清掉了它(每次 addElement 闭包带的
-        // 是自己创建那次的 segId,只清自己的)。
+        // 切新卡由 card-level onFailure(recordCardCreated 注册)统一触发。
+        // 正在切卡(rotating)时绝不 reset:swap 会读当前 currentAssistantText
+        // carry 到新卡,期间到达的 delta 要继续 append 到本段、一个不丢 —— reset
+        // 会把它们截断。只有"没在切卡"(熔断后不再切的兜底)才 reset 段游标,
+        // 让下个 delta 重建段,免得后续 streamText 全 PUT 到死 element。
+        if (turn.rotating) return
         if (turn.currentAssistantSegmentId === segId) {
           log(`session "${this.sessionName}": assistant segment ${segId} addElement failed — will retry on next delta`)
           turn.currentAssistantSegmentId = null
@@ -1420,6 +1490,11 @@ export class Session {
   finalizeCurrentAssistantSegment(): void {
     const turn = this.currentTurn
     if (!turn) return
+    // 正在切卡:别动当前段 —— rotate 会在 swap 时读 currentAssistantText carry
+    // 到新卡续写。这里若定稿/reset,过渡窗口里的当前段文字会被清空、carry 落空
+    // (跟 appendAssistant onFailure 在 rotating 期间不 reset 同一个道理)。代价是
+    // 切卡窗口恰好跨 block 边界时两段可能并作一段 —— 不丢内容,可接受。
+    if (turn.rotating) return
     const segId = turn.currentAssistantSegmentId
     const text = turn.currentAssistantText ?? ''
     if (segId && text.trim()) {

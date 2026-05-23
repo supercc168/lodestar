@@ -47,6 +47,30 @@ interface CardState {
    * addElement won't bump it, so the count tracks "elements Feishu
    * believes exist" not "elements we tried to create"). */
   elementCount: number
+  /** element_ids whose `addElement` was rejected by Feishu (most often
+   * `300305/300315 [element exceeds the limit]`, but any non-recoverable
+   * add failure counts). The element does NOT exist on Feishu's side, so
+   * every subsequent `streamText`/`replaceElement`/`deleteElement` aimed
+   * at it would 300313/300121 — and the throttled streamer keeps re-PUTting
+   * the growing full text on each delta, turning one dead segment into a
+   * storm of red. We record the id here and short-circuit those writes.
+   * Per-card and dropped on `dispose`, so a rotated-to fresh card starts
+   * clean. */
+  deadElements: Set<string>
+  /** Card-level write-failure callback, set by recordCardCreated. Invoked
+   * by any cardkit write op that fails even after the streaming-closed
+   * reopen+retry; the session uses it to rotate onto a fresh card (see
+   * Session.onCardWriteFailure). Not fired for deletes (a failed delete is
+   * harmless — it doesn't block new content). */
+  onFailure?: (code?: number) => void
+}
+
+/** Feishu's element-ceiling rejection. `300315` wraps the inner
+ * `300305 [element exceeds the limit]`; treat both as "card is full".
+ * Exported so session can turn an add failure into a forced rotate
+ * without re-encoding the magic numbers. */
+export function isElementLimitCode(code?: number): boolean {
+  return code === 300305 || code === 300315
 }
 
 const cards = new Map<string, CardState>()
@@ -69,6 +93,7 @@ function state(cardId: string): CardState {
       lastEnqueued: new Map(),
       flushTimer: null,
       elementCount: 0,
+      deadElements: new Set(),
     }
     cards.set(cardId, s)
   }
@@ -82,8 +107,14 @@ function state(cardId: string): CardState {
  * that happen *after* card creation, and session can't reliably decide
  * "is this card close to the limit?" — that's the data point that
  * triggers a mid-turn rotate to dodge `code=300305/300315`. */
-export function recordCardCreated(cardId: string, initialElementCount: number): void {
-  state(cardId).elementCount = initialElementCount
+export function recordCardCreated(
+  cardId: string,
+  initialElementCount: number,
+  onFailure?: (code?: number) => void,
+): void {
+  const s = state(cardId)
+  s.elementCount = initialElementCount
+  s.onFailure = onFailure
 }
 
 /** Read the live element count maintained by addElement/deleteElement.
@@ -91,6 +122,15 @@ export function recordCardCreated(cardId: string, initialElementCount: number): 
  * for "this card has no elements that we know about"). */
 export function getElementCount(cardId: string): number {
   return cards.get(cardId)?.elementCount ?? 0
+}
+
+/** True if `elementId` was recorded dead on this card (its addElement was
+ * rejected, so the element doesn't exist on Feishu). Mid-turn rotation
+ * reads this to decide whether the just-failed assistant segment needs
+ * rebuilding on the fresh card: dead ⇒ rebuild (its text never made it
+ * onto the old card), alive ⇒ leave it, the old card already shows it. */
+export function isDeadElement(cardId: string, elementId: string): boolean {
+  return cards.get(cardId)?.deadElements.has(elementId) ?? false
 }
 
 function nextSeq(cardId: string): number {
@@ -147,15 +187,25 @@ async function withReopenOnStreamingClosed(
   cardId: string,
   label: string,
   op: () => Promise<void>,
-  onFailure?: () => void,
+  onFailure?: (code?: number) => void,
+  silent = false,
 ): Promise<void> {
+  // 失败统一出口:card-level handler 先(它同步快照当前段/tool 后再异步
+  // 换卡),per-call onFailure 后(addElement 的 deadElements.add + session
+  // 段游标 reset)。顺序要紧 —— 换卡的同步快照必须在 reset 把
+  // currentAssistant* 清空之前跑。silent(deleteElement)跳过 card-level:
+  // 删不掉一个元素不影响新内容,不值得为它换卡。
+  const fail = (code?: number): void => {
+    if (!silent) state(cardId).onFailure?.(code)
+    onFailure?.(code)
+  }
   try {
     await op()
     return
   } catch (e) {
     if (!isStreamingClosed(e)) {
       log(`cardkit ${label} ${cardId}: ${e}`)
-      if (onFailure) onFailure()
+      fail((e as any)?.code)
       return
     }
     log(`cardkit ${label} ${cardId}: streaming closed (code=${(e as any).code}) — reopening`)
@@ -164,14 +214,14 @@ async function withReopenOnStreamingClosed(
     await reopenStreaming(cardId)
   } catch (re) {
     log(`cardkit STREAMING_REOPEN_FAILED ${cardId}: ${re}`)
-    if (onFailure) onFailure()
+    fail((re as any)?.code)
     return
   }
   try {
     await op()
   } catch (e2) {
     log(`cardkit ${label} ${cardId} retry-after-reopen: ${e2}`)
-    if (onFailure) onFailure()
+    fail((e2 as any)?.code)
   }
 }
 
@@ -198,6 +248,10 @@ export async function createCardEntity(card: object): Promise<string> {
 export function streamText(cardId: string, elementId: string, content: string): Promise<void> {
   if (!content || !content.trim()) return Promise.resolve()
   const s = state(cardId)
+  // 死元素(addElement 被飞书拒过,元素根本不存在)直接吞掉:再 PUT 只会
+  // 300313,而 streamTextThrottled 每个 delta 都重发全文,会把一个建失败的段
+  // 放大成一串红。等 rotation 把 turn 切到新卡,新段就正常了。
+  if (s.deadElements.has(elementId)) return Promise.resolve()
   // 「已入队」位置必须在这里同步推进,而不是等 PUT 完成 —— 否则节流失效:
   // Card Kit 的 PUT 在慢链路(Windows / 跨网)上往返几百 ms,这期间模型还在
   // 吐 text_delta;若用 PUT-完成后的长度算增量,每个 delta 看到的都是同一个
@@ -225,6 +279,7 @@ export function streamText(cardId: string, elementId: string, content: string): 
 export function streamTextThrottled(cardId: string, elementId: string, fullContent: string): void {
   if (!fullContent || !fullContent.trim()) return
   const s = state(cardId)
+  if (s.deadElements.has(elementId)) return
   s.buffer.set(elementId, fullContent)
 
   const last = s.lastEnqueued.get(elementId) ?? ''
@@ -266,9 +321,10 @@ export function addElement(
   cardId: string,
   element: object,
   opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
-  onFailure?: () => void,
+  onFailure?: (code?: number) => void,
 ): Promise<void> {
   const s = state(cardId)
+  const elementId = (element as { element_id?: string }).element_id
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `addElement`,
@@ -285,7 +341,17 @@ export function addElement(
       // accepted" not "elements we tried to push".
       s.elementCount += 1
     },
-    onFailure,
+    (code) => {
+      // Add rejected ⇒ this element_id does not exist on Feishu's side.
+      // Mark it dead so subsequent streamText/replace/delete aimed at it
+      // short-circuit instead of spraying 300313/300121. Then forward the
+      // code: session turns an element-limit code into a forced mid-turn
+      // rotate (the local counter can't be trusted here — a failed add
+      // doesn't bump it, so it never reaches the rotate threshold on its
+      // own).
+      if (elementId) s.deadElements.add(elementId)
+      onFailure?.(code)
+    },
   ))
   return s.queue
 }
@@ -293,6 +359,7 @@ export function addElement(
 /** Replace an entire element (used to swap a tool placeholder with its result). */
 export function replaceElement(cardId: string, elementId: string, element: object): Promise<void> {
   const s = state(cardId)
+  if (s.deadElements.has(elementId)) return Promise.resolve()
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `replaceElement ${elementId}`,
@@ -310,6 +377,7 @@ export function replaceElement(cardId: string, elementId: string, element: objec
 /** Delete an element by id. */
 export function deleteElement(cardId: string, elementId: string): Promise<void> {
   const s = state(cardId)
+  if (s.deadElements.has(elementId)) return Promise.resolve()
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `deleteElement ${elementId}`,
@@ -320,6 +388,8 @@ export function deleteElement(cardId: string, elementId: string): Promise<void> 
       })
       s.elementCount = Math.max(0, s.elementCount - 1)
     },
+    undefined,
+    true,
   ))
   return s.queue
 }
