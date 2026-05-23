@@ -179,10 +179,20 @@ interface MainCardOpts {
   userInputs?: string[]
 }
 
+/** Local wall-clock stamp `YYYY-MM-DD HH:MM:SS` for the scheduled-fire
+ * banner. scheduled turns 自发开,没有用户消息做"何时触发"的锚点;卡片又
+ *会一直留在群历史里,夜里 cron 跑的轮次第二天回看时,banner 上带个触发
+ * 时刻才能一眼对上是几点起的。零填充沿用 notify.ts / console.ts 的写法。 */
+function fireStampNow(): string {
+  const d = new Date()
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
+}
+
 /** Initial card sent at the start of each turn. Streaming on. */
 export function mainConversationCard(opts: MainCardOpts): object {
   const banner = opts.kind === 'scheduled'
-    ? [{ tag: 'markdown', content: '⏰ 触发' }]
+    ? [{ tag: 'markdown', content: `⏰ 触发 · ${fireStampNow()}` }]
     : opts.kind === 'auto_retry'
     ? [{ tag: 'markdown', content: '🔁 SDK 错误自动续' }]
     : opts.kind === 'no_followup_retry'
