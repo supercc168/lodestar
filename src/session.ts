@@ -1239,6 +1239,7 @@ export class Session {
       rotating: null,
       rotateCount: 0,
       rotateGivenUp: false,
+      pendingSendPaths: [],
     }
     this.currentTurn = turnState
     this.startTicker(turnState)
@@ -1354,6 +1355,13 @@ export class Session {
         // onFailure 在 rotating 期间不 reset,所以这段一直累积到这里)。先读后清。
         const carrySegId = turn.currentAssistantSegmentId
         const carryText = (turn.currentAssistantText ?? '').trim()
+        // 清空 segmentTexts 前,把"不会被 carry 带走的已完成段"里的 [[send:]] 抠到
+        // turn 级 pending —— 否则 closeTurnCard 扫不到(map 即将清空),文件漏发。
+        // carry 的那段会 re-seed 进新 map、由 closeTurnCard 提取,这里跳过免重复。
+        for (const [sid, stext] of turn.segmentTexts) {
+          if (sid === carrySegId) continue
+          this.collectSendPaths(stext, turn.pendingSendPaths)
+        }
         turn.assistantSegmentCount = 0
         turn.currentAssistantSegmentId = null
         turn.currentAssistantText = ''
@@ -1507,6 +1515,17 @@ export class Session {
     turn.currentAssistantText = ''
   }
 
+  /** 从一段文字里抠出所有合法的 [[send: /abs/path]] 绝对路径 push 进 sink
+   * (只收集、不改原文 —— 标记按用户要求保留在正文显示)。rotate 清 segmentTexts
+   * 前、closeTurnCard 收尾时共用,保证跨卡的 send 一个不漏。 */
+  private collectSendPaths(text: string, sink: string[]): void {
+    for (const m of text.matchAll(SEND_MARKER_RE)) {
+      const p = m[1].trim()
+      if (isAbsolute(p)) sink.push(p)
+      else log(`session "${this.sessionName}": ignore non-absolute send path: ${p}`)
+    }
+  }
+
   /** 启动 ticker 元素的活体指示。turn 起来时随机选一个 verb,整 turn
    * 固定不变,setInterval 每 TICKER_TICK_MS (1s) 跑一次,刷新经过秒数。
    * 先 setInterval 再 render 是故意的 —— 同步首帧时 tickerHandle 已经
@@ -1571,21 +1590,17 @@ export class Session {
     // streaming_mode=false 兜底,跟 replaceElement 无关),所以 mid-turn 的
     // finalizeCurrentAssistantSegment 改用 streaming_mode 瞬切来全显。turn 中途
     // content_block_stop 已定稿过各段,这里是收尾兜底兼 marker 清理。
-    const sendPaths: string[] = []
+    // pending 是 rotate 时从换卡前各段抠出来的 send 路径(那些段的 segmentTexts
+    // 已被 rotate 清掉,只能靠这里补),跟当前卡各段的合并。collectSendPaths 用
+    // isAbsolute(平台自适应:Windows 认 C:/... / UNC,unix 认 /...)。
+    const sendPaths: string[] = [...turn.pendingSendPaths]
     for (const [segId, fullText] of segmentTexts) {
-      const cleaned = fullText.replace(SEND_MARKER_RE, (_m, p1) => {
-        const p = String(p1).trim()
-        // isAbsolute 而非 startsWith('/'):daemon 跑 Windows 时 path=win32,
-        // 认 C:/... / C:\... / UNC;跑 unix 时认 /...。claude 给的 send 路径
-        // 跟 daemon 同平台,所以平台自适应判断正好对。之前只认 / 开头,
-        // Windows 的 C:/Users/... 被当非绝对路径丢掉。
-        if (isAbsolute(p)) sendPaths.push(p)
-        else log(`session "${this.sessionName}": ignore non-absolute send path: ${p}`)
-        return ''
-      })
-      const finalText = cleaned.trim() || ' '
+      this.collectSendPaths(fullText, sendPaths)
+      // 收尾定稿:把流式最后一帧补成完整段。**保留 [[send:]] 标记原文显示**
+      // (用户要求 2026-05-23:标签留着,让用户看到发了哪个文件)。replaceElement
+      // 自身不触发流式 commit,真正全显靠紧随其后的 streaming_mode=false 全局收尾。
       await cardkit.replaceElement(cardId, segId, {
-        tag: 'markdown', element_id: segId, content: finalText,
+        tag: 'markdown', element_id: segId, content: fullText.trim() || ' ',
       })
     }
 

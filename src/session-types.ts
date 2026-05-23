@@ -88,6 +88,10 @@ export interface TurnState {
   /** Latched once we hit the rotate cap and emit the "giving up" notice,
    * so the notice isn't repeated on every later failed write this turn. */
   rotateGivenUp: boolean
+  /** [[send: /path]] 路径在 turn 结束(closeTurnCard)统一上传。但 rotate 会清空
+   * segmentTexts,换卡前那些已完成段里的 send 标记就扫不到了 —— rotate 在清空前先
+   * 把它们抠出来存这里,closeTurnCard 跟当前卡各段的合并。跨多次 rotate 累积。 */
+  pendingSendPaths: string[]
 }
 
 export type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
