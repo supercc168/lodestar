@@ -46,14 +46,16 @@ import { checkPidGuard, writePidFile } from './src/pid-guard'
 mkdirSync(dirname(PID_FILE), { recursive: true })
 writePidFile(PID_FILE)
 
+let cleanupDone = false
 const cleanup = () => {
+  if (cleanupDone) return
+  cleanupDone = true
   // Snapshot which sessions are still alive so the next boot can
   // revive them — only the ones still running at shutdown, NOT
   // anything the user already `kill`-ed (those are absent from the
   // sessions Map filter below and stay stopped after restart).
   try {
-    const alive: string[] = []
-    for (const s of sessions.values()) if (s.isRunning()) alive.push(s.sessionName)
+    const alive = currentAliveSessionNames()
     feishu.writeAliveMarker(alive)
     if (alive.length > 0) log(`alive marker: [${alive.join(', ')}]`)
   } catch (e) { log(`alive marker write failed: ${e}`) }
@@ -75,11 +77,23 @@ process.on('uncaughtException',  e => log(`uncaughtException: ${e}`))
 
 // ── Session registry ────────────────────────────────────────────────────
 const sessions = new Map<string, Session>()  // key = chatId
+let pendingReviveSessionNames = new Set<string>()
+
+function currentAliveSessionNames(): string[] {
+  const alive = new Set<string>()
+  for (const s of sessions.values()) if (s.isRunning()) alive.add(s.sessionName)
+  for (const name of pendingReviveSessionNames) alive.add(name)
+  return [...alive]
+}
+
+function writeCurrentAliveMarker(): void {
+  feishu.writeAliveMarker(currentAliveSessionNames())
+}
 
 function sessionFor(chatId: string, sessionName: string): Session {
   let s = sessions.get(chatId)
   if (!s) {
-    s = new Session(sessionName, chatId)
+    s = new Session(sessionName, chatId, { onLifecycleChange: writeCurrentAliveMarker })
     sessions.set(chatId, s)
   }
   return s
@@ -93,22 +107,34 @@ function sessionFor(chatId: string, sessionName: string): Session {
  * Codex resumes the saved thread id and the in-flight
  * conversation continues without the user typing anything. */
 async function reviveAliveSessions(): Promise<void> {
-  const names = feishu.readAndConsumeAliveMarker()
+  const names = feishu.readAliveMarker()
   if (names.length === 0) return
+  pendingReviveSessionNames = new Set(names)
   log(`revive: ${names.length} session(s) marked alive on shutdown: ${names.join(', ')}`)
-  for (const sessionName of names) {
-    const chatId = feishu.chatIdForSession(sessionName)
-    if (!chatId) {
-      log(`revive: no chatId binding for "${sessionName}", skip`)
-      continue
+  try {
+    for (const sessionName of names) {
+      const chatId = feishu.chatIdForSession(sessionName)
+      if (!chatId) {
+        log(`revive: no chatId binding for "${sessionName}", skip`)
+        pendingReviveSessionNames.delete(sessionName)
+        writeCurrentAliveMarker()
+        continue
+      }
+      const session = sessionFor(chatId, sessionName)
+      try {
+        const ok = await session.restart(true)
+        if (ok) log(`revive: spawned "${sessionName}" (chat ${chatId.slice(0, 8)}…)`)
+        else log(`revive: "${sessionName}" did not start`)
+      } catch (e) {
+        log(`revive: restart "${sessionName}" failed: ${e}`)
+      } finally {
+        pendingReviveSessionNames.delete(sessionName)
+        writeCurrentAliveMarker()
+      }
     }
-    const session = sessionFor(chatId, sessionName)
-    try {
-      await session.restart(true)
-      log(`revive: spawned "${sessionName}" (chat ${chatId.slice(0, 8)}…)`)
-    } catch (e) {
-      log(`revive: restart "${sessionName}" failed: ${e}`)
-    }
+  } finally {
+    pendingReviveSessionNames.clear()
+    writeCurrentAliveMarker()
   }
 }
 

@@ -96,6 +96,10 @@ export type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | '
 
 export interface SessionOpts {
   permissionMode?: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'
+  /** Daemon hook: persist its current alive-session snapshot whenever this
+   * session starts, stops, exits, or changes process lifecycle. Scripts
+   * that construct Session directly can omit it. */
+  onLifecycleChange?: () => void
 }
 
 /** Per-turn delta extracted from the SDK `result` message — feeds the

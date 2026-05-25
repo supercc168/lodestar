@@ -111,7 +111,7 @@ export function getSessionResume(sessionName: string): string | null {
 
 // ── Alive-on-shutdown marker ──────────────────────────────────────────
 // Persists the list of session names that were still running when the
-// daemon went down. Next boot reads + unlinks the file and auto-spawns
+// daemon went down. Next boot reads the file and auto-spawns
 // (via session.restart(true)) only those — sessions that were already
 // `stop`ped before shutdown are deliberately NOT in this list, so they
 // stay stopped after restart.
@@ -122,19 +122,17 @@ export function writeAliveMarker(sessionNames: string[]): void {
   } catch (e) { log(`feishu: write alive marker failed: ${e}`) }
 }
 
-/** Read + unlink in one shot — marker is single-use: revival should
- * happen exactly once per boot, not re-run on every subsequent crash
- * loop where systemd might keep re-launching us. */
-export function readAndConsumeAliveMarker(): string[] {
+/** Read without unlinking. The daemon keeps this marker current while
+ * running, so a rapid second restart cannot lose the revive list after
+ * the first boot consumes it but exits before a clean shutdown. */
+export function readAliveMarker(): string[] {
   if (!existsSync(ALIVE_MARKER_FILE)) return []
   try {
     const raw = readFileSync(ALIVE_MARKER_FILE, 'utf8')
-    try { unlinkSync(ALIVE_MARKER_FILE) } catch {}
     const data = JSON.parse(raw)
     return Array.isArray(data) ? data.filter((x: unknown): x is string => typeof x === 'string') : []
   } catch (e) {
     log(`feishu: read alive marker failed: ${e}`)
-    try { unlinkSync(ALIVE_MARKER_FILE) } catch {}
     return []
   }
 }

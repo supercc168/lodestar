@@ -67,10 +67,12 @@ export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
  * idempotent on any mutation (create / fire / delete). */
 export const SCHEDULES_FILE = join(DATA_DIR, 'schedules.json')
 /** Marker file written at shutdown listing the session names that
- * were still alive. The next daemon boot reads it (and unlinks it)
+ * were still alive. The next daemon boot reads it
  * to auto-revive those sessions via `restart(true)` — bridges the
  * gap between systemctl-restart killing every child Codex process and
- * Lodestar's "you have to send a message to re-spawn it" default. */
+ * Lodestar's "you have to send a message to re-spawn it" default.
+ * The daemon also refreshes it on session lifecycle changes so rapid
+ * repeated restarts do not lose the revive list. */
 export const ALIVE_MARKER_FILE = join(DATA_DIR, 'alive-on-shutdown.json')
 export const INBOX_DIR = join(DATA_DIR, 'inbox')
 /** Unix-socket endpoint the daemon listens on for debug message

@@ -286,6 +286,8 @@ export class Session {
   async start(): Promise<boolean> {
     if (this.isRunning()) return true
     if (!feishu.isOpenAIChatGPTAuthenticated()) {
+      this.status = 'stopped'
+      this.opts.onLifecycleChange?.()
       await feishu.sendText(this.chatId, '❌ Codex 未登录 ChatGPT 账号。\n请在服务器上运行 `codex login` 后再试。')
       return false
     }
@@ -293,6 +295,8 @@ export class Session {
       await feishu.sendText(this.chatId, `🆕 目录 ~/${this.sessionName} 不存在，正在创建…`)
       try { feishu.provisionProject(this.workDir) }
       catch (e) {
+        this.status = 'stopped'
+        this.opts.onLifecycleChange?.()
         await feishu.sendText(this.chatId, `❌ 创建项目失败: ${e}`)
         return false
       }
@@ -314,37 +318,50 @@ export class Session {
     // model / usage / contextWindow 也都没值。等 init 之后再返回,
     // 后续 `hi`、首条 user message 都能拿到真值。5s 兜底,init 真
     // 没来也不死循环。
-    let initError: unknown = null
-    const initState = await new Promise<'init' | 'error' | 'timeout'>(resolve => {
-      const proc = this.proc!
-      const finish = (state: 'init' | 'error' | 'timeout') => {
-        clearTimeout(timer)
-        proc.off('init', onInit)
-        proc.off('error', onError)
-        resolve(state)
-      }
-      const timer = setTimeout(() => {
-        log(`session "${this.sessionName}": init wait timeout (5s) — proceeding`)
-        finish('timeout')
-      }, 5000)
-      const onInit = () => finish('init')
-      const onError = (e: unknown) => { initError = e; finish('error') }
-      proc.once('init', onInit)
-      proc.once('error', onError)
-    })
-    if (initState === 'error') {
-      log(`session "${this.sessionName}": codex init failed: ${initError}`)
-      await feishu.sendText(this.chatId, `❌ Codex 启动失败: ${initError}`)
+    const init = await this.waitForProcInit(this.proc, 5000)
+    if (init.state === 'error' || init.state === 'exit') {
+      log(`session "${this.sessionName}": codex init failed: ${init.error ?? init.state}`)
+      await feishu.sendText(this.chatId, `❌ Codex 启动失败: ${init.error ?? init.state}`)
       await this.proc?.kill(1000).catch(() => {})
       this.proc = null
       this.status = 'stopped'
+      this.opts.onLifecycleChange?.()
       return false
+    }
+    if (init.state === 'timeout') {
+      log(`session "${this.sessionName}": init wait timeout (5s) — proceeding`)
     }
 
     await feishu.sendText(this.chatId, `✅ Lodestar session "${this.sessionName}" 已就绪，发消息开始对话。`)
     this.status = 'idle'
     this.startedAt = Date.now()
+    this.opts.onLifecycleChange?.()
     return true
+  }
+
+  private async waitForProcInit(
+    proc: CodexProcess,
+    timeoutMs: number,
+  ): Promise<{ state: 'init' | 'error' | 'exit' | 'timeout'; error?: unknown }> {
+    return await new Promise(resolve => {
+      let settled = false
+      const finish = (state: 'init' | 'error' | 'exit' | 'timeout', error?: unknown) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        proc.off('init', onInit)
+        proc.off('error', onError)
+        proc.off('exit', onExit)
+        resolve({ state, error })
+      }
+      const timer = setTimeout(() => finish('timeout'), timeoutMs)
+      const onInit = () => finish('init')
+      const onError = (e: unknown) => finish('error', e)
+      const onExit = (e: unknown) => finish('exit', e)
+      proc.once('init', onInit)
+      proc.once('error', onError)
+      proc.once('exit', onExit)
+    })
   }
 
   /** Drop every ⏳ OneSecond reaction this session is currently holding
@@ -371,6 +388,7 @@ export class Session {
   async stop(reason = '已终止'): Promise<void> {
     if (!this.proc) {
       this.status = 'stopped'
+      this.opts.onLifecycleChange?.()
       await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
       return
     }
@@ -400,11 +418,12 @@ export class Session {
     this.consecutiveErrors = 0
     this.awaitingFollowup = null
     this.status = 'stopped'
+    this.opts.onLifecycleChange?.()
     await proc.kill()
     await feishu.sendText(this.chatId, `🔴 ${reason} (session: ${this.sessionName})`)
   }
 
-  async restart(resume = false): Promise<void> {
+  async restart(resume = false): Promise<boolean> {
     const prevSessionId = this.proc?.sessionId ?? this.lastSessionId
     if (this.proc) {
       this.lastSessionId = this.proc.sessionId ?? this.lastSessionId
@@ -426,6 +445,7 @@ export class Session {
     this.consecutiveErrors = 0
     this.awaitingFollowup = null
     if (resume && prevSessionId) {
+      this.status = 'starting'
       this.proc = new CodexProcess({
         workDir: this.workDir,
         effort: 'max',
@@ -435,9 +455,26 @@ export class Session {
       })
       this.wireProc(this.proc)
       this.proc.sendInitialize()
+      const init = await this.waitForProcInit(this.proc, 10_000)
+      if (init.state === 'error' || init.state === 'exit') {
+        log(`session "${this.sessionName}": codex resume failed: ${init.error ?? init.state}`)
+        await feishu.sendText(this.chatId, `❌ Codex 恢复失败: ${init.error ?? init.state}`)
+        await this.proc?.kill(1000).catch(() => {})
+        this.proc = null
+        this.status = 'stopped'
+        this.opts.onLifecycleChange?.()
+        return false
+      }
+      if (init.state === 'timeout') {
+        log(`session "${this.sessionName}": resume init wait timeout (10s) — process still alive`)
+        await feishu.sendText(this.chatId, `⏳ Codex 恢复已发起，但 10s 内尚未确认 init。thread=${prevSessionId.slice(0, 8)}…`)
+      } else {
+        await feishu.sendText(this.chatId, `🔁 已重启并恢复 thread=${prevSessionId.slice(0, 8)}…`)
+      }
       this.status = 'idle'
       this.startedAt = Date.now()
-      await feishu.sendText(this.chatId, `🔁 已重启并恢复 session=${prevSessionId.slice(0, 8)}…`)
+      this.opts.onLifecycleChange?.()
+      return true
     } else {
       // Resume requested but no prior session_id on file — surface it
       // explicitly rather than silently fresh-starting (the old behavior
@@ -449,7 +486,7 @@ export class Session {
       // zeroed counters instead of bleeding numbers from the prior chat.
       this.cumStats = { tokens: 0, costUsd: 0, turns: 0 }
       this.lastTurnDelta = null
-      await this.start()
+      return await this.start()
     }
   }
 
@@ -548,6 +585,8 @@ export class Session {
         // a fresh session the user didn't ask for. To start from cold,
         // use `hi`.
         if (!this.isRunning()) {
+          this.status = 'stopped'
+          this.opts.onLifecycleChange?.()
           await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行,clear 无效;用 \`hi\` 启动或 \`restart\` 恢复上一会话`)
           return true
         }
@@ -1061,6 +1100,7 @@ export class Session {
       this.awaitingFollowup = null
       this.userInterrupted = false
       this.status = 'stopped'
+      this.opts.onLifecycleChange?.()
       if (!expected && code !== 0 && signal !== 'SIGTERM') {
         void feishu.sendText(this.chatId, `⚠️ Codex 异常退出 (code=${code}, signal=${signal})。回复任意消息将重新启动。`)
       }
