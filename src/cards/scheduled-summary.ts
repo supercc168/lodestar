@@ -9,7 +9,7 @@
  * Tool-panel rendering routes through the same `toolCallElement` /
  * `readBatchElement` helpers the streaming session uses, so a `Bash`
  * panel from a cron fire looks byte-for-byte identical to one from a
- * live user turn (header `⏳ 🔧 Bash: …`, JSON-input block, output
+ * live user turn (header `⏳ 🔧 Bash: …`, shell command block, output
  * block, all collapsible). Read batches collapse the same way:
  * consecutive Read calls fold into one path-only panel, broken by
  * any non-Read tool or assistant text. The differences a reader can

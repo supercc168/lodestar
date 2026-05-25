@@ -58,7 +58,7 @@ export function summarizeToolInput(name: string, input: any): string {
     return truncate(summarizeTaskWorkflow(name, input), 80)
   }
   switch (name) {
-    case 'Bash':       return truncate(String(input.description ?? input.command ?? ''), 80)
+    case 'Bash':       return summarizeBashInput(input)
     case 'Read':
     case 'Write':
     case 'Edit':
@@ -76,6 +76,58 @@ export function summarizeToolInput(name: string, input: any): string {
     if (typeof v === 'string' && v) return truncate(v, 80)
   }
   return ''
+}
+
+function summarizeBashInput(input: any): string {
+  const truncate = (s: string, n: number) => s.length > n ? s.slice(0, n) + '…' : s
+  const explicit = String(input.description ?? input.reason ?? '').trim()
+  if (explicit) return truncate(explicit.replace(/\s+/g, ' '), 80)
+  const command = String(input.command ?? '').trim()
+  if (!command) return ''
+  const oneLine = command.replace(/\s+/g, ' ')
+  const lines = command.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
+  if (lines.length <= 1) return truncate(oneLine, 80)
+  const firstMeaningful = lines.find(line =>
+    !line.startsWith('#') &&
+    !/^set\s+-/.test(line) &&
+    !/^cd\s+/.test(line) &&
+    !/^[A-Za-z_][A-Za-z0-9_]*=/.test(line) &&
+    !/^cat\s+<<['"]?\w+['"]?/.test(line)
+  ) ?? lines[0]
+  return `Shell 脚本 · ${lines.length} 行 · ${truncate(firstMeaningful, 46)}`
+}
+
+function fenceBlock(text: string, lang = ''): string {
+  let fence = '```'
+  while (text.includes(fence)) fence += '`'
+  return `${fence}${lang}\n${text}\n${fence}`
+}
+
+function inlineCode(v: unknown): string {
+  return '`' + String(v ?? '').replace(/`/g, "'") + '`'
+}
+
+function renderBashBody(input: any, output: string | null, resolvedNote?: string): string {
+  const command = String(input?.command ?? '').trim()
+  const reason = String(input?.description ?? input?.reason ?? '').trim()
+  const lines: string[] = []
+  if (reason) lines.push(`**目的**: ${reason}`)
+  if (input?.cwd) lines.push(`**cwd**: ${inlineCode(input.cwd)}`)
+  if (input?.source) lines.push(`**source**: ${inlineCode(input.source)}`)
+  if (lines.length > 0) lines.push('')
+  lines.push('**命令**')
+  lines.push(fenceBlock(command || '(空命令)', 'bash'))
+  if (resolvedNote) {
+    lines.push('')
+    lines.push(resolvedNote)
+  }
+  if (output != null) {
+    lines.push('')
+    lines.push('---')
+    lines.push('**output:**')
+    lines.push(fenceBlock(output.slice(0, 3000)))
+  }
+  return lines.join('\n')
 }
 
 /** Header summary for Task* workflow tools — `Task` (singular) is the
@@ -283,9 +335,11 @@ export function toolCallElement(
   // matter.
   const body = isTaskWorkflow
     ? renderTaskWorkflowBody(name, input, output, todos) + noteBlock
-    : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
-      + noteBlock
-      + (output != null ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```' : '')
+    : name === 'Bash'
+      ? renderBashBody(input, output, resolvedNote)
+      : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
+        + noteBlock
+        + (output != null ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```' : '')
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),
@@ -343,7 +397,9 @@ export function toolCallPermissionElement(
   const headerText = summary
     ? `🔐 等审批 · ${name}: ${summary}`
     : `🔐 等审批 · ${name}`
-  const inputBlock = '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
+  const inputBlock = name === 'Bash'
+    ? renderBashBody(input, null)
+    : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),
