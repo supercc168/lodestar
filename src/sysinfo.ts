@@ -1,18 +1,19 @@
 /**
  * Lightweight host snapshot for the `hi` console panel —— CPU 负载、
- * 内存、根/家目录磁盘、以及当前用户下的 codex-* 系列 systemd 服务。
+ * 内存、根/家目录磁盘、以及当前用户下的 cc-* / codex-* 系列 systemd 服务。
  *
- * 服务前缀约定: Codex 自己起的常驻进程统一走
+ * 服务前缀约定:历史上 Claude Code / 当前 Codex 拉起的常驻进程分别可能走
+ *   systemd-run --user --unit=cc-<project>-<purpose> -- <cmd>
  *   systemd-run --user --unit=codex-<project>-<purpose> -- <cmd>
- * `hi` 面板只列 `codex-*` 是要让 daemon 这台机器上的"AI 拉起来的活儿"一眼可见,跟
- * 系统自带 / 第三方服务区分开。
+ * `hi` 面板只列这两个前缀,是要让 daemon 这台机器上的"AI 拉起来的活儿"
+ * 一眼可见,跟系统自带 / 第三方服务区分开。
  *
  * 所有数据源都是本机文件 / 系统调用,没有网络往返:
  *   /proc/loadavg          —— 1m / 5m / 15m
  *   /proc/meminfo          —— Total / Available
  *   statfsSync(path)       —— 各挂载点容量
  *   /proc/uptime           —— monotonic seconds since boot (uptime 推算)
- *   systemctl --user show  —— codex-* 服务的状态与启动时间
+ *   systemctl --user show  —— cc-* / codex-* 服务的状态与启动时间
  *
  * 失败可见: 任何一段读不到就把对应字段标 null,卡片层按 null 渲染
  * `_n/a_`,绝不假数据 (no_fallbacks)。
@@ -77,12 +78,13 @@ export interface SysInfo {
   mem: MemInfo | null
   disks: DiskInfo[]
   services: ServiceInfo[]
-  /** 真的查不到时(systemctl 不存在 / 拒绝)就 null;空数组表示"没有 codex-* 服务"。 */
+  /** 真的查不到时(systemctl 不存在 / 拒绝)就 null;空数组表示"没有匹配服务"。 */
   servicesError: string | null
 }
 
-/** 用户态 systemd-run 服务的统一前缀。 */
-export const SERVICE_PREFIX = 'codex-'
+/** 用户态 systemd-run 服务的统一前缀。cc-* 是历史兼容, codex-* 是新命名。 */
+export const SERVICE_PREFIXES = ['cc-', 'codex-'] as const
+export const SERVICE_LABEL = 'cc-* / codex-*'
 
 function readCpu(): CpuInfo | null {
   try {
@@ -193,7 +195,11 @@ async function runSystemctl(args: string[], timeoutMs = 2000): Promise<string | 
   }
 }
 
-/** 列 `${SERVICE_PREFIX}*` 服务并解析:第 1 步用 list-units 拿名字,
+function isManagedServiceUnit(unit: string): boolean {
+  return SERVICE_PREFIXES.some(prefix => unit.startsWith(prefix)) && unit.endsWith('.service')
+}
+
+/** 列 `${SERVICE_LABEL}` 服务并解析:第 1 步用 list-units 拿名字,
  * 第 2 步用单次 show -p 拿状态 + ActiveEnterTimestampMonotonic。两步
  * 都是本地调用,加起来 < 100ms。 */
 async function readServices(): Promise<{ services: ServiceInfo[]; error: string | null }> {
@@ -201,7 +207,8 @@ async function readServices(): Promise<{ services: ServiceInfo[]; error: string 
   // --all 把 inactive 也列出来 (用户停过的服务也值得在面板看到)。
   // 加 --plain --no-legend 关掉表格修饰和 footer,方便机器解析。
   const listOut = await runSystemctl([
-    'list-units', '--type=service', '--all', '--no-legend', '--plain', `${SERVICE_PREFIX}*`,
+    'list-units', '--type=service', '--all', '--no-legend', '--plain',
+    ...SERVICE_PREFIXES.map(prefix => `${prefix}*`),
   ])
   if (listOut === null) {
     return { services: [], error: 'systemctl 不可用' }
@@ -215,8 +222,7 @@ async function readServices(): Promise<{ services: ServiceInfo[]; error: string 
     const cols = line.replace(/^●\s*/, '').split(/\s+/)
     const unit = cols[0]
     if (!unit) continue
-    if (!unit.startsWith(SERVICE_PREFIX)) continue
-    if (!unit.endsWith('.service')) continue
+    if (!isManagedServiceUnit(unit)) continue
     names.push(unit)
   }
   if (names.length === 0) return { services: [], error: null }
@@ -251,7 +257,7 @@ async function readServices(): Promise<{ services: ServiceInfo[]; error: string 
       props[line.slice(0, eq)] = line.slice(eq + 1)
     }
     const id = props.Id ?? ''
-    if (!id.startsWith(SERVICE_PREFIX) || !id.endsWith('.service')) continue
+    if (!isManagedServiceUnit(id)) continue
     services.push({
       name: id.replace(/\.service$/, ''),
       active: props.ActiveState ?? 'unknown',

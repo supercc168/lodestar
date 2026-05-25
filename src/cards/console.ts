@@ -4,7 +4,7 @@
  * src/cards.ts.
  */
 
-import type { SysInfo } from '../sysinfo'
+import { SERVICE_LABEL, type SysInfo } from '../sysinfo'
 import type { UsageSnapshot } from '../usage'
 import type { Schedule } from '../schedule'
 import { ELEMENTS } from './elements'
@@ -38,7 +38,7 @@ interface ConsoleOpts {
   cumStats?: { tokens: number; costUsd: number; turns: number }
   lastTurn?: { tokens: number; costUsd: number; durationMs: number }
   sessionId?: string | null
-  /** Host snapshot: CPU 负载、内存、根/家目录磁盘、cc-* systemd 服务。
+  /** Host snapshot: CPU 负载、内存、根/家目录磁盘、AI-managed systemd 服务。
    * undefined → 略过整个 host 段;数据自身字段缺失 (cpu/mem 为 null)
    * 时单行渲染 `_n/a_`,不假数据。 */
   sysinfo?: SysInfo
@@ -269,11 +269,11 @@ function hostLines(sysinfo: SysInfo): string[] {
   }
 
   if (sysinfo.servicesError) {
-    out.push(`**⚙️ 服务** cc-*　_${sysinfo.servicesError}_`)
+    out.push(`**⚙️ 服务** ${SERVICE_LABEL}　_${sysinfo.servicesError}_`)
   } else if (sysinfo.services.length === 0) {
-    out.push('**⚙️ 服务** cc-*　_无_')
+    out.push(`**⚙️ 服务** ${SERVICE_LABEL}　_无_`)
   } else {
-    out.push(`**⚙️ 服务** cc-* (${sysinfo.services.length})`)
+    out.push(`**⚙️ 服务** ${SERVICE_LABEL} (${sysinfo.services.length})`)
     for (const s of sysinfo.services) {
       const dot = SERVICE_STATUS_EMOJI[s.active] ?? '·'
       // 三件套: 状态 (active/inactive/failed) · 最近活跃 (上次进入
