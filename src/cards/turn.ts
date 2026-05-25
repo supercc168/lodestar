@@ -98,15 +98,17 @@ function summarizeBashInput(input: any): string {
 }
 
 function bashPresentation(input: any): { description: string; command: string } {
-  const rawCommand = String(input?.command ?? '').replace(/\r\n/g, '\n').trim()
+  const rawCommand = String(input?.command ?? input?.cmd ?? input?.script ?? '').replace(/\r\n/g, '\n').trim()
   const firstLine = rawCommand.split('\n', 1)[0]?.trim() ?? ''
-  const m = firstLine.match(/^#\s*(?:desc|description|说明|目的|用途)\s*[:：]\s*(.+)$/i)
-  const commentDesc = m?.[1]?.trim() ?? ''
+  const comment = firstLine.startsWith('#') && !firstLine.startsWith('#!')
+    ? firstLine.replace(/^#\s*/, '').trim()
+    : ''
+  const commentDesc = comment.replace(/^(?:desc|description|说明|目的|用途)\s*[:：]\s*/i, '').trim()
   const command = commentDesc
     ? rawCommand.split('\n').slice(1).join('\n').trimStart()
     : rawCommand
   const explicit = String(input?.description ?? input?.reason ?? '').trim()
-  return { description: explicit || commentDesc, command: command || rawCommand }
+  return { description: commentDesc || explicit, command: command || rawCommand }
 }
 
 function fenceBlock(text: string, lang = ''): string {
