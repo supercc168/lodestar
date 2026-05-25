@@ -261,7 +261,7 @@ export function mainConversationCard(opts: MainCardOpts): object {
         elements: inputs.map(text => ({
           tag: 'markdown',
           // Markdown 里 < > 这些字符在 Card Kit 渲染里会被解析,转一下避免
-          // 用户输入里的 `<u>tag</u>` / HTML 之类被当结构吞掉。
+          // 用户输入里的 HTML 之类被当结构吞掉。
           content: text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
         })),
       }]

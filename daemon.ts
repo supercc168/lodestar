@@ -144,8 +144,7 @@ async function reviveAliveSessions(): Promise<void> {
 // markdown 比拍平纯文本更结构化),并把内嵌图片/文件 key 抽出来交给
 // `downloadAttachment` 走附件路径,跟原生 image/file 消息对齐。
 //
-// underline 故意不还原 —— markdown 无原生语法,而本项目用 <u>...</u> 标记
-// "多条独立消息",一旦塞进 text 会被 Codex 当成消息边界误解。
+// underline 暂不还原 —— markdown 无原生语法。
 interface PostElement {
   tag: string
   text?: string

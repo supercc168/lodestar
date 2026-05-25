@@ -648,9 +648,9 @@ export class Session {
     // (otherwise we'd be in the bootstrap race window where
     // leftover count IS valid — see wasBusy comment below), the
     // leftover count is stale and must be cleared BEFORE the
-    // wasBusy computation — otherwise this fresh solo message gets
-    // falsely wrapped `<u>…</u>` and its card closes with
-    // `📨 转交新卡` instead of `✅`.
+    // wasBusy computation — otherwise this fresh solo message is
+    // misclassified as queued and its card closes with `📨 转交新卡`
+    // instead of `✅`.
     if (this.initCount >= 1 && !this.currentTurn && !this.openingTurn && this.pendingUserMessageCount > 0) {
       this.pendingUserMessageCount = 0
       // Release stale ⏳ reactions left on the abandoned batch's
@@ -674,34 +674,18 @@ export class Session {
     // we've already sendText'd a previous user message into the SDK.
     // The next message lands in the SAME merged-batch SDK queue, so
     // it IS mid-flight from the SDK's perspective — without this
-    // check, the daemon would mark it as solo (no `<u>` wrap, no ⏳
-    // reaction) and the model would see e.g. "123" + "321" + "1"
-    // glued into a single string "1233211" (2026-05-16 accumulator
-    // bug).
+    // check, the daemon would mark it as solo (no ⏳ reaction) and
+    // lose track of the queued turn.
     const wasBusy = this.currentTurn !== null || this.openingTurn
       || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0
     this.lastUserOpenId = userOpenId
-    // When the SDK will merge this msg with siblings into a multi-
-    // content user turn, wrap it in `<u>...</u>` so the model sees a
-    // structural boundary it actually attends to. Tried U+001E
-    // (ASCII Record Separator) first — invisible and theoretically
-    // perfect, but model tokenizers effectively drop control
-    // chars and `<u>1</u><u>45</u>` became "145" to the model
-    // (2026-05-16 accumulator test). HTML-tag wrap is visible but
-    // models parse `<tag>` boundaries very reliably from training.
-    // Only the very first solo message of a fresh SDK turn slot
-    // skips the wrap — no sibling, no merge, no need. Contract
-    // declared in CHANNEL_INSTRUCTIONS.
-    //
     // File hint **inline 在 wireText 内部**,而不是依赖 sendUserText 把
     // files 拼到 message 整体头部。原因:drainMidTurnAndOpen merge N 条
     // wireText 时,若 files 还按整体拼接 → 所有 file hint 全堆在 long
-    // message 开头、N 个 `<u>...</u>` 在后面,模型分不清哪个文件配哪条
-    // (P1-1 02:22 现场实证)。inline 后每条 sub-message 自带 file hint,
-    // SDK side 所有 sendUserText 调用 files 一律传空。
+    // message 开头,模型分不清哪个文件配哪条。inline 后每条 sub-message
+    // 自带 file hint,SDK side 所有 sendUserText 调用 files 一律传空。
     const filePrefix = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n' : ''
-    const body = filePrefix + text
-    const wireText = wasBusy ? `<u>${body}</u>` : body
+    const wireText = filePrefix + text
 
     // Reaction helper: track the OneSecond reaction so deleteReaction can
     // clear it later. Use empty-string sentinel until addReaction returns.
@@ -1029,15 +1013,14 @@ export class Session {
    * than deferring to init because the init for this batch will arrive
    * with `currentTurn` already set and bail.
    *
-   * N 条 wireText 用 `\n` join 成 **单条** sendUserText 发给 SDK,而不是
+   * N 条 wireText 用 `\n\n` join 成 **单条** sendUserText 发给 SDK,而不是
    * N 次独立写。背景:SDK polling loop 在 turn 边界一次只 dequeue 一条
    * user message 进 prompt,N 次独立写会让
    * SDK 把第 1 条单独开 turn、剩 N-1 条进下一 turn —— daemon 这边 panel
    * 在 openTurnCard 时已经 commit 了全部 N 条到 "前一个" turn,跟 SDK
    * 实际 turn 边界错位(03:19 现场 turn=5 panel 7 条 vs 模型只看到 1 条
-   * "1 和 2 两条都收到了")。join 成单条后,SDK 看到 1 个 user message
-   * (内部含 N 个 `<u>...</u>` 子块),模型按 CHANNEL_INSTRUCTIONS 规约
-   * 拆解 N 条,panel 跟模型实际 input 一致。
+   * "1 和 2 两条都收到了")。join 成单条后,SDK 看到 1 个 user message,
+   * panel 跟模型实际 input 一致。
    *
    * pendingCount 一次 ++(对应一次 sendUserText)。因为 SDK 不再拆 turn,
    * commit 2258af4 当年用累加保护 spurious 第二 turn 的逻辑不再需要 —
@@ -1058,12 +1041,9 @@ export class Session {
           this.pendingReactionIds.delete(msg.msgId)
         }
       }
-      // wireText 每条已经被 onUserMessage 处理过(`<u>${filePrefix}${text}</u>`),
-      // 每条 sub-message 自带 file hint —— SDK side files 一律传空,避免
-      // file ↔ message 归属丢失(P1-1)。join 用 `\n` 让边界视觉上也清楚
-      // (模型按 CHANNEL_INSTRUCTIONS 规约,`<u>1</u><u>2</u>` 拼在一起也
-      // 算独立消息,newline 只是更明显)。
-      const merged = batch.map(m => m.wireText).join('\n')
+      // wireText 每条已经在 onUserMessage 内 inline 了自己的 file hint;
+      // SDK side files 一律传空,避免 file ↔ message 归属丢失(P1-1)。
+      const merged = batch.map(m => m.wireText).join('\n\n')
       this.proc!.sendUserText(merged, [])
       this.pendingUserMessageCount++
       const last = batch[batch.length - 1]
