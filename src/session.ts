@@ -205,9 +205,9 @@ export class Session {
    * does not overwrite the 🛑 footer already painted by the stop path.
    * Reset by exit handler for the proc-died-before-result case. */
   private userInterrupted = false
-  // Last seen thread id — preserved across `kill`/`stop` so a later
-  // `restart` can resume the same Codex conversation even after the
-  // child process is gone.
+  // Last known resumable thread id. Codex can hand back a fresh thread id
+  // during init/resume before any rollout exists; persist only after a
+  // non-error turn result so `restart` never resumes an empty thread.
   private lastSessionId: string | null = null
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
@@ -360,7 +360,6 @@ export class Session {
     // `systemctl restart` revived the killed session on boot).
     log(`session "${this.sessionName}": stop (${reason})`)
     const proc = this.proc
-    this.lastSessionId = proc.sessionId ?? this.lastSessionId
     this.proc = null
     this.stopTicker(this.currentTurn)
     this.currentTurn = null
@@ -380,9 +379,8 @@ export class Session {
   }
 
   async restart(resume = false): Promise<boolean> {
-    const prevSessionId = this.proc?.sessionId ?? this.lastSessionId
+    const prevSessionId = this.lastSessionId
     if (this.proc) {
-      this.lastSessionId = this.proc.sessionId ?? this.lastSessionId
       await this.proc.kill()
       this.proc = null
     }
@@ -802,18 +800,18 @@ export class Session {
   }
 
   // ── Wiring Codex → Feishu ──────────────────────────────────────────
+  private persistResumableSessionId(): void {
+    const sessionId = this.proc?.sessionId
+    if (!sessionId || sessionId === this.lastSessionId) return
+    this.lastSessionId = sessionId
+    feishu.bindSessionResume(this.sessionName, sessionId)
+  }
+
   private wireProc(p: CodexProcess): void {
     p.on('error', err => {
       log(`session "${this.sessionName}": codex process error: ${err}`)
     })
     p.on('init', () => {
-      // Persist the freshly assigned Codex thread id so a later daemon
-      // restart can resume this conversation. Skip if unchanged to
-      // avoid hammering the file on every init for resumed sessions.
-      if (p.sessionId && p.sessionId !== this.lastSessionId) {
-        this.lastSessionId = p.sessionId
-        feishu.bindSessionResume(this.sessionName, p.sessionId)
-      }
       this.initCount++
       log(`session "${this.sessionName}": SDK init#${this.initCount} pendingCount=${this.pendingUserMessageCount} midBuffer=${this.pendingMidTurnMsgs.length} currentTurn=${this.currentTurn ? 'yes' : 'no'} openingTurn=${this.openingTurn}`)
 
@@ -910,6 +908,7 @@ export class Session {
       const hasMidTurn = this.pendingMidTurnMsgs.length > 0
       const isError = this.proc?.lastResult.is_error === true
       const subtype = this.proc?.lastResult.subtype ?? 'success'
+      if (!isError) this.persistResumableSessionId()
 
       let suffix: string | undefined
       let forcePush = false
