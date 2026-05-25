@@ -32,6 +32,7 @@ import { log } from './log'
 import { SCHEDULES_FILE } from './paths'
 import * as feishu from './feishu'
 import { CodexProcess } from './codex-process'
+import { CHANNEL_INSTRUCTIONS } from './instructions'
 import { scheduledSummaryCard, type CollectedTool } from './cards/scheduled-summary'
 import { notifyCardForScheduled } from './notify'
 
@@ -336,6 +337,7 @@ async function fireSchedule(s: Schedule): Promise<void> {
   const proc = new CodexProcess({
     workDir,
     permissionMode: 'bypassPermissions',
+    appendSystemPrompt: CHANNEL_INSTRUCTIONS,
   })
 
   const assistantSegs: string[] = []

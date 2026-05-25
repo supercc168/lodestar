@@ -80,9 +80,9 @@ export function summarizeToolInput(name: string, input: any): string {
 
 function summarizeBashInput(input: any): string {
   const truncate = (s: string, n: number) => s.length > n ? s.slice(0, n) + '…' : s
-  const explicit = String(input.description ?? input.reason ?? '').trim()
-  if (explicit) return truncate(explicit.replace(/\s+/g, ' '), 80)
-  const command = String(input.command ?? '').trim()
+  const info = bashPresentation(input)
+  if (info.description) return truncate(info.description.replace(/\s+/g, ' '), 80)
+  const command = info.command
   if (!command) return ''
   const oneLine = command.replace(/\s+/g, ' ')
   const lines = command.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
@@ -97,6 +97,18 @@ function summarizeBashInput(input: any): string {
   return `Shell 脚本 · ${lines.length} 行 · ${truncate(firstMeaningful, 46)}`
 }
 
+function bashPresentation(input: any): { description: string; command: string } {
+  const rawCommand = String(input?.command ?? '').replace(/\r\n/g, '\n').trim()
+  const firstLine = rawCommand.split('\n', 1)[0]?.trim() ?? ''
+  const m = firstLine.match(/^#\s*(?:desc|description|说明|目的|用途)\s*[:：]\s*(.+)$/i)
+  const commentDesc = m?.[1]?.trim() ?? ''
+  const command = commentDesc
+    ? rawCommand.split('\n').slice(1).join('\n').trimStart()
+    : rawCommand
+  const explicit = String(input?.description ?? input?.reason ?? '').trim()
+  return { description: explicit || commentDesc, command: command || rawCommand }
+}
+
 function fenceBlock(text: string, lang = ''): string {
   let fence = '```'
   while (text.includes(fence)) fence += '`'
@@ -108,8 +120,9 @@ function inlineCode(v: unknown): string {
 }
 
 function renderBashBody(input: any, output: string | null, resolvedNote?: string): string {
-  const command = String(input?.command ?? '').trim()
-  const reason = String(input?.description ?? input?.reason ?? '').trim()
+  const info = bashPresentation(input)
+  const command = info.command
+  const reason = info.description
   const lines: string[] = []
   if (reason) lines.push(`**目的**: ${reason}`)
   if (input?.cwd) lines.push(`**cwd**: ${inlineCode(input.cwd)}`)
