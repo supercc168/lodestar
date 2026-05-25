@@ -34,12 +34,6 @@ export type { SessionOpts } from './session-types'
 
 const SEND_MARKER_RE = /\[\[send:\s*([^\]\n]+?)\s*\]\]/g
 
-/** Codex error 自动续 turn 的上限:同一 turn 链上连续报错时,daemon 最多
- * sendUserText('继续') 这么多次来自动续;第 (MAX_CODEX_AUTO_RETRY + 1) 次
- * 连续报错就放弃 —— ⛔ footer + 强制推送通知用户。任一次自然 success 或
- * 用户介入都把计数清零。 */
-const MAX_CODEX_AUTO_RETRY = 5
-
 /** "模型还在干活" 顶部 ticker 的备选动词。turn 起来时随机选一个、整 turn
  * 固定不变,setInterval 每 TICKER_TICK_MS (1s) 跑一次,只刷经过秒数 ——
  * 比让 verb 轮播视觉更稳。推理阶段没有稳定明文输出时,这个 ticker 就是
@@ -125,19 +119,6 @@ export class Session {
    * Not authoritative — Codex calling TaskList is still the source of
    * truth; this mirror is purely for the panel readout. */
   currentTodos = new Map<number, cards.Todo>()
-  /** SDK 偶尔在 turn 的最后一项是 tool_result(is_error=true) 或已答完
-   * AskUserQuestion 时直接 end_turn 不让模型 followup。
-   * set 点 + reason:
-   *   'ask'        — session-ask.finalizeAsk(AskUserQuestion 答完)
-   *   'tool_error' — tool_result(is_error=true) handler(Edit/Read/Bash 失败)
-   * clear 点: assistant_text / tool_use handler 入口(模型还在动就归零)
-   *   —— tool_result(is_error=false) 不清,SDK 自己合成的 AskUserQuestion
-   *   tool_result 不算 followup 证据。
-   * result handler 看到 flag 仍非 null → sendUserText('继续') 续 turn,
-   * banner / footer 文案按 reason 区分 —— 用户能直接读出来 turn 是
-   * 因为"答完没下文"还是"工具出错异常终止"被自动续的。
-   * 一次性,result 里读完即 reset。 */
-  awaitingFollowup: 'ask' | 'tool_error' | null = null
   status: Status = 'stopped'
 
   // ── strictly private state ──
@@ -219,32 +200,10 @@ export class Session {
    * claiming the slot, stand down". */
   private openingTurn = false
   private turnCounter = 0
-  /** Consecutive SDK error turns since the last `success`. When the SDK
-   * closes a turn with `subtype !== 'success'` (error_during_execution /
-   * error_max_turns), the daemon swallows the phone push and re-pokes
-   * the SDK with a "继续" user message to auto-resume. Up to
-   * MAX_CODEX_AUTO_RETRY (5) auto-resumes in a row; the next consecutive
-   * error past that → give up: surface the failure (⛔ footer + forced
-   * phone push) and reset. Any natural-success turn OR user intervention
-   * (mid-turn buffer drain) resets this back to 0. */
-  private consecutiveErrors = 0
-  /** 让 result handler 把"下一个 turn 不是普通 user_message"这件事透传
-   * 给 init handler / openTurnCard。当前只用于 SDK error 的 autoRetry
-   * 路径 —— sendUserText('继续') 触发的下一 init,daemon 这边知道这是
-   * 续 turn 而不是真用户消息,openTurnCard 用 'auto_retry' kind 出
-   * `🔁 Codex 错误自动续` banner、不渲染 "📥 收到" panel。一次性使用,
-   * 决定 trigger 后立即 reset null。 */
-  private nextOpenKind: 'auto_retry' | 'no_followup_retry' | 'tool_error_retry' | null = null
   /** One-shot: user invoked `stop` during the current turn. Set right
-   * before `sendInterrupt`; consumed by the next `result` handler to
-   * short-circuit the autoRetry branch. Without this, the SDK's post-
-   * interrupt result (typically `is_error:true subtype:error_during_execution`)
-   * falls into `isError && !hasMidTurn` and the daemon helpfully
-   * sendUserText('继续') + opens a fresh card stamped `🔁 Codex 错误自动续`
-   * — exactly the thing the user explicitly told us to stop. The 🛑 打断
-   * footer was already painted by the stop case's own closeTurnCard,
-   * so this just suppresses the follow-up retry. Reset by exit handler
-   * for the proc-died-before-result case. */
+   * before `sendInterrupt`; consumed by the next `result` handler so it
+   * does not overwrite the 🛑 footer already painted by the stop path.
+   * Reset by exit handler for the proc-died-before-result case. */
   private userInterrupted = false
   // Last seen thread id — preserved across `kill`/`stop` so a later
   // `restart` can resume the same Codex conversation even after the
@@ -408,15 +367,12 @@ export class Session {
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
     this.pendingTurnInputs = []
-    this.nextOpenKind = null
     this.lastUserOpenId = ''
     this.releaseAllReactions()
     this.initCount = 0
     this.openingTurn = false
     this.pendingAsks.clear()
     this.pendingPermissions.clear()
-    this.consecutiveErrors = 0
-    this.awaitingFollowup = null
     this.status = 'stopped'
     this.opts.onLifecycleChange?.()
     await proc.kill()
@@ -435,15 +391,12 @@ export class Session {
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
     this.pendingTurnInputs = []
-    this.nextOpenKind = null
     this.lastUserOpenId = ''
     this.releaseAllReactions()
     this.initCount = 0
     this.openingTurn = false
     this.pendingAsks.clear()
     this.pendingPermissions.clear()
-    this.consecutiveErrors = 0
-    this.awaitingFollowup = null
     if (resume && prevSessionId) {
       this.status = 'starting'
       this.proc = new CodexProcess({
@@ -548,18 +501,13 @@ export class Session {
         this.pendingUserMessageCount = 0
         this.pendingMidTurnMsgs = []
         this.pendingTurnInputs = []
-        this.nextOpenKind = null
         this.lastUserOpenId = ''
         this.pendingReactionIds = new Map()
         this.currentBatchReactionIds = new Map()
-        // Tag the imminent SDK `result` (which DOES arrive after sendInterrupt
-        // with is_error:true subtype:error_during_execution — the comment
-        // below was wrong) so the result handler doesn't read it as a real
-        // Codex failure and helpfully autoRetry into `🔁 Codex 错误自动续`. Must
-        // be set BEFORE sendInterrupt — the result can land on the next tick.
+        // Tag the imminent SDK `result` so the result handler does not
+        // repaint the footer after this stop path already closed the card.
+        // Must be set BEFORE sendInterrupt — the result can land next tick.
         this.userInterrupted = true
-        this.awaitingFollowup = null
-        this.consecutiveErrors = 0
         this.interrupt()
         // 主动封口,把 footer 改成 🛑 打断、折叠 thinking、把 streaming_mode
         // 翻回 false,否则卡片会僵在 `⏳ working…`。SDK 的 post-interrupt
@@ -803,11 +751,6 @@ export class Session {
         // openTurnCard 内部读 pendingTurnInputs 渲染 "📥 收到" panel,要在
         // 它之前 push;之后再 sendUserText 给 SDK,顺序无关紧要(panel 是
         // daemon 自渲染,跟 SDK input 流分离)。
-        // 真用户消息覆盖 autoRetry 意图 —— autoRetry 设的 nextOpenKind
-        // 在 SDK init 还没回来时被这条 eager-open 抢先开 turn,init handler
-        // 后续看到 currentTurn!=null 直接 return 不会消费 nextOpenKind,
-        // 不 reset 会 leak 到下下个 turn 错 stamp '🔁 Codex 错误自动续'。
-        this.nextOpenKind = null
         this.pendingTurnInputs.push(text)
         await this.openTurnCard(userOpenId, 'user_message')
         if (!this.currentTurn) return
@@ -823,7 +766,7 @@ export class Session {
     // Non-eager path 分两支:
     //   A) openingTurn=true 或 pendingUserMessageCount>0 — sibling 在
     //      openTurnCard,或者 cold-start 第一条 sendUserText 已经发出在
-    //      等 SDK init#1。两种情况下继续直接 sendUserText 都会让 SDK
+    //      等 SDK init#1。两种情况下直接 sendUserText 都会让 SDK
     //      把这条偷偷合并进 sibling 的 turn(或第一条触发的 cold-start
     //      turn),但 panel input 已经被 snapshot 决定 → "内容跟响应不
     //      一致"race(02:22 + 03:19 现场,以及 commit 2258af4 注释里的
@@ -909,14 +852,8 @@ export class Session {
       const isUserBatch = this.pendingUserMessageCount > 0
       const isScheduledFire = !isUserBatch && this.initCount > 1
       if (!isUserBatch && !isScheduledFire) return
-      // nextOpenKind 优先(目前只有 autoRetry 路径会设)。autoRetry 自己
-      // sendUserText('继续') + pendingCount++,所以 isUserBatch=true,但
-      // 我们要它出 `🔁 Codex 错误自动续` banner 而不是普通 user_message —
-      // 用 nextOpenKind 顶替。一次性,决定 trigger 后立即 reset。
-      const trigger: 'user_message' | 'scheduled' | 'auto_retry' | 'no_followup_retry' | 'tool_error_retry' =
-        this.nextOpenKind ?? (isUserBatch ? 'user_message' : 'scheduled')
-      this.nextOpenKind = null
-      // auto_retry 继承 lastUserOpenId(原 sender),让最终 success push
+      const trigger: 'user_message' | 'scheduled' = isUserBatch ? 'user_message' : 'scheduled'
+      // user_message 继承 lastUserOpenId(原 sender),让最终 success push
       // 还能找到要 phone-notify 谁。scheduled 没 sender,留空。
       const userOpenId = trigger === 'scheduled' ? '' : this.lastUserOpenId
       if (isUserBatch) {
@@ -950,10 +887,6 @@ export class Session {
       })()
     })
     p.on('assistant_text', ({ text }: { text: string }) => {
-      // 模型在说话 → 清 followup flag。如果上一项是 tool_result(error) 或
-      // 已答完的 AskUserQuestion 留下的 flag,模型现在接上话/解释了,daemon
-      // 不需要兜底 poke。
-      this.awaitingFollowup = null
       this.appendAssistant(text)
     })
     p.on('assistant_block_stop', () => {
@@ -965,16 +898,9 @@ export class Session {
       this.finalizeCurrentAssistantSegment()
     })
     p.on('tool_use', ({ id, name, input }: { id: string; name: string; input: any }) => {
-      // 模型在出新工具 → 同样清 flag(典型场景:Edit 失败后模型自己重试)。
-      this.awaitingFollowup = null
       sessionTools.addTool(this, id, name, input)
     })
     p.on('tool_result', ({ tool_use_id, content, is_error }: any) => {
-      // 仅在工具失败时举 flag —— 工具成功时模型选择 end_turn 是合法行为
-      // (悄悄改完文件直接退),不该被 daemon 续。AskUserQuestion 的 SDK 合成
-      // tool_result (is_error=false) 走这条路也命中"不动 flag",finalizeAsk
-      // 早已把 flag set 成 true,正好保留到 result 里被检测。
-      if (is_error) this.awaitingFollowup = 'tool_error'
       sessionTools.completeTool(this, tool_use_id, content, is_error)
     })
     p.on('can_use_tool', (req: CanUseToolRequest) => {
@@ -987,94 +913,36 @@ export class Session {
     p.on('result', () => {
       this.accumulateResultStats()
       // User just hit `stop` — this result is the SDK closing the in-flight
-      // turn after sendInterrupt landed (subtype=error_during_execution,
-      // is_error=true). The card already shows `🛑 打断` from the stop
-      // case's closeTurnCard. Skip the rest unconditionally: NO suffix
-      // overwrite, NO consecutiveErrors bump, NO sendUserText('继续'),
-      // NO nextOpenKind='auto_retry'. One-shot, read+reset.
+      // turn after sendInterrupt landed. The card already shows `🛑 打断`
+      // from the stop path, so skip the rest unconditionally.
       if (this.userInterrupted) {
         this.userInterrupted = false
         const subtype = this.proc?.lastResult.subtype ?? 'unknown'
         const isError = this.proc?.lastResult.is_error === true
-        log(`session "${this.sessionName}": SDK result after user stop subtype=${subtype} isError=${isError} — suppress autoRetry`)
+        log(`session "${this.sessionName}": SDK result after user stop subtype=${subtype} isError=${isError} — ignored`)
         this.status = 'idle'
         return
       }
-      // Three orthogonal signals fold into one footer suffix + push/retry
-      // decision here:
-      //   1. `pendingMidTurnMsgs` — user typed during the turn; their
-      //      messages need a fresh card and SDK wake-up. Takes priority
-      //      over auto-retry (user is back at the keyboard).
-      //   2. `lastResult.is_error` — SDK closed the turn with a non-
-      //      `success` subtype (error_during_execution / error_max_turns).
-      //      First occurrences: swallow the phone push, re-poke SDK with
-      //      "继续" to auto-resume (up to MAX_CODEX_AUTO_RETRY times). One
-      //      more consecutive error past that: give up, ⛔ footer + force
-      //      phone push so the user knows.
-      //   3. Natural success — `✅` footer, normal phone push, reset
-      //      consecutiveErrors.
-      // closeTurnCard's default push-on-clean-close stays the floor;
-      // `forcePush:true` is the override for the "we hit retry ceiling"
-      // case (which has a non-empty suffix and would otherwise be silent).
       const hasMidTurn = this.pendingMidTurnMsgs.length > 0
       const isError = this.proc?.lastResult.is_error === true
       const subtype = this.proc?.lastResult.subtype ?? 'success'
-      // turn 收尾时如果还举着 followup flag,意味着 turn 的最后一项是
-      // tool_result(is_error) 或已答完的 AskUserQuestion,但模型没继续
-      // 推理就 end_turn(success)。SDK bug 兜底 —— daemon 帮 poke 一下。
-      // 一次性,读完即 reset,不会延续到下一 turn。优先级:hasMidTurn /
-      // isError 都更高(用户介入或真错误时不走这条),所以这里只看
-      // success 路径。
-      // Snapshot reason 后再清:下面 suffix / nextOpenKind 都要按 reason 出
-      // 不同文案("答完没下文" vs "工具出错异常终止"),用户能直接读出
-      // turn 是因为哪个原因被自动续的。reset 在 snapshot 之后,保证一次性。
-      const followupReason = this.awaitingFollowup
-      this.awaitingFollowup = null
-      const noFollowupRetry = !hasMidTurn && !isError && followupReason !== null
 
       let suffix: string | undefined
-      let autoRetry = false
       let forcePush = false
 
       if (hasMidTurn) {
-        // User intervention wins over auto-retry — they're actively
-        // sending new input, no point also auto-poking the SDK.
-        this.consecutiveErrors = 0
         suffix = isError ? `⚠️ Codex ${subtype},用户已介入` : '📨 转交新卡'
       } else if (isError) {
-        this.consecutiveErrors++
-        if (this.consecutiveErrors > MAX_CODEX_AUTO_RETRY) {
-          suffix = `⛔ Codex ${subtype},自动续 ${MAX_CODEX_AUTO_RETRY} 次仍失败,已停止`
-          forcePush = true
-          this.consecutiveErrors = 0
-        } else {
-          suffix = `⚠️ Codex ${subtype},自动续 turn… (${this.consecutiveErrors}/${MAX_CODEX_AUTO_RETRY})`
-          autoRetry = true
-        }
-      } else if (noFollowupRetry) {
-        // 不计 consecutiveErrors —— 这不是真错,是 SDK 漏续的兜底。下一轮
-        // flag 已 reset,如果模型这次仍不接续(罕见),要么再走 AskUserQuestion
-        // 流程重新 set flag,要么 turn 是空 result/真错误,都不会无限循环。
-        this.consecutiveErrors = 0
-        suffix = followupReason === 'tool_error'
-          ? '⚠️ 工具出错异常终止,自动续…'
-          : '⚠️ 答完没下文,自动续…'
-        autoRetry = true
-      } else {
-        this.consecutiveErrors = 0
+        suffix = `⚠️ Codex ${subtype}`
+        forcePush = true
       }
 
-      log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} midBuffer=${this.pendingMidTurnMsgs.length} consecErr=${this.consecutiveErrors} autoRetry=${autoRetry} followup=${followupReason ?? 'none'} noFollowupRetry=${noFollowupRetry} forcePush=${forcePush}`)
+      log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} midBuffer=${this.pendingMidTurnMsgs.length} forcePush=${forcePush}`)
       void this.closeTurnCard(suffix, { forcePush })
       this.status = 'idle'
 
       if (hasMidTurn) {
         void this.drainMidTurnAndOpen()
-      } else if (autoRetry) {
-        const kind: 'auto_retry' | 'no_followup_retry' | 'tool_error_retry' = noFollowupRetry
-          ? (followupReason === 'tool_error' ? 'tool_error_retry' : 'no_followup_retry')
-          : 'auto_retry'
-        void this.startSyntheticRetryTurn(kind)
       }
     })
     p.on('exit', ({ code, signal, expected }: any) => {
@@ -1085,7 +953,6 @@ export class Session {
       this.pendingUserMessageCount = 0
       this.pendingMidTurnMsgs = []
       this.pendingTurnInputs = []
-      this.nextOpenKind = null
       this.lastUserOpenId = ''
       this.releaseAllReactions()
       this.initCount = 0
@@ -1096,8 +963,6 @@ export class Session {
       // (kill/restart 同样在上面补了这一清理)。
       this.pendingAsks.clear()
       this.pendingPermissions.clear()
-      this.consecutiveErrors = 0
-      this.awaitingFollowup = null
       this.userInterrupted = false
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
@@ -1156,19 +1021,6 @@ export class Session {
     return this.proc?.lastContextWindow ?? null
   }
 
-  private async startSyntheticRetryTurn(kind: 'auto_retry' | 'no_followup_retry' | 'tool_error_retry'): Promise<void> {
-    if (!this.proc) return
-    this.openingTurn = true
-    try {
-      await this.openTurnCard(this.lastUserOpenId, kind)
-      if (!this.currentTurn) return
-      this.proc.sendUserText('继续')
-      this.status = 'working'
-    } finally {
-      this.openingTurn = false
-    }
-  }
-
   /** Drain `pendingMidTurnMsgs` to the SDK and open a fresh card for the
    * resulting batch turn. Called from the `result` handler when buffered
    * mid-turn messages need to start their own turn. The `sendUserText`
@@ -1225,7 +1077,7 @@ export class Session {
     }
   }
 
-  private async openTurnCard(userOpenId: string, trigger: 'user_message' | 'scheduled' | 'auto_retry' | 'no_followup_retry' | 'tool_error_retry'): Promise<void> {
+  private async openTurnCard(userOpenId: string, trigger: 'user_message' | 'scheduled'): Promise<void> {
     const turn = ++this.turnCounter
     // Snapshot+clear pendingTurnInputs synchronously here so concurrent
     // pushes between snapshot and the await don't sneak into THIS turn's
@@ -1269,7 +1121,7 @@ export class Session {
     // onwards (banner + userInputPanel + ticker + footer — the latter
     // two are constant, the former two depend on trigger / userInputs).
     const initialElementCount =
-      (trigger === 'scheduled' || trigger === 'auto_retry' || trigger === 'no_followup_retry' || trigger === 'tool_error_retry' ? 1 : 0) +
+      (trigger === 'scheduled' ? 1 : 0) +
       (trigger === 'user_message' && userInputs.length > 0 ? 1 : 0) +
       2
     cardkit.recordCardCreated(cardId, initialElementCount, (code) => this.onCardWriteFailure(code))

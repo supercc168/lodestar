@@ -192,10 +192,5 @@ export function finalizeAsk(s: Session, toolUseId: string): void {
   if (s.pendingPermissions.size === 0 && s.status === 'awaiting_permission') {
     s.status = 'working'
   }
-  // 用户答完 → 球踢回 SDK,期望模型基于 answers 推理出后续动作。如果 SDK
-  // bug 把 turn 直接 end_turn 不让模型 followup,result handler 看到这个
-  // flag 还在(没被 assistant_text / tool_use 清掉)就自动 sendUserText('继续')
-  // poke 一下。SDK 合成的 AskUserQuestion tool_result 不清这个 flag —— 它
-  // 是 SDK 把答案塞给模型的回环,不算"模型已 followup"的证据。
-  s.awaitingFollowup = 'ask'
+  // 用户答完 → 球踢回 SDK,期望模型基于 answers 推理出后续动作。
 }
