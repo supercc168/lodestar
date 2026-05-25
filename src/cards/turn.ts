@@ -98,17 +98,36 @@ function summarizeBashInput(input: any): string {
 }
 
 function bashPresentation(input: any): { description: string; command: string } {
-  const rawCommand = String(input?.command ?? input?.cmd ?? input?.script ?? '').replace(/\r\n/g, '\n').trim()
+  const rawCommand = unwrapShellCommand(String(input?.command ?? input?.cmd ?? input?.script ?? ''))
   const firstLine = rawCommand.split('\n', 1)[0]?.trim() ?? ''
   const comment = firstLine.startsWith('#') && !firstLine.startsWith('#!')
     ? firstLine.replace(/^#\s*/, '').trim()
     : ''
-  const commentDesc = comment.replace(/^(?:desc|description|说明|目的|用途)\s*[:：]\s*/i, '').trim()
+  const commentDesc = comment.replace(/^(?:desc|dec|description|说明|目的|用途)\s*[:：]\s*/i, '').trim()
   const command = commentDesc
     ? rawCommand.split('\n').slice(1).join('\n').trimStart()
     : rawCommand
   const explicit = String(input?.description ?? input?.reason ?? '').trim()
   return { description: commentDesc || explicit, command: command || rawCommand }
+}
+
+function unwrapShellCommand(command: string): string {
+  const normalized = command.replace(/\r\n/g, '\n').trim()
+  const shell = normalized.match(/^(?:\/usr\/bin\/env\s+)?(?:\/[\w./-]+\/)?(?:ba|z|fi)?sh\s+-[A-Za-z]*c[A-Za-z]*\s+([\s\S]+)$/)
+  if (!shell) return normalized
+  const inner = stripShellArgQuotes(shell[1])
+  return inner || normalized
+}
+
+function stripShellArgQuotes(arg: string): string {
+  const s = arg.trim()
+  if (s.length < 2) return s
+  const pairs: Record<string, string> = { '"': '"', "'": "'", '“': '”' }
+  const close = pairs[s[0]]
+  if (!close || !s.endsWith(close)) return s
+  const body = s.slice(1, -1)
+  if (s[0] === "'") return body.replace(/'\\''/g, "'")
+  return body.replace(/\\(["\\$`])/g, '$1').replace(/\\n/g, '\n')
 }
 
 function fenceBlock(text: string, lang = ''): string {
