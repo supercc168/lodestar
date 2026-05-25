@@ -39,6 +39,23 @@ Card Kit card per turn.
   throttled helper from event handlers, never the raw one.
 - No fallbacks. On API failure, log + surface; do not silently switch
   transports.
+- `lodestar-daemon` is the packaged daemon entry; local development normally
+  runs `bun daemon.ts` or `bun run start`.
+- Group bare-word controls are `hi`, `stop`, `kill`, `restart`, and `clear`.
+- Local scripts can notify a group through `POST http://127.0.0.1:9876/notify`
+  with `{project, text, level}`.
+
+### Commands
+
+- Install deps: `bun install`
+- Start locally: `bun daemon.ts` or `bun run start`
+- Build package binaries: `bun run build`
+- Persistent local daemon:
+  `systemd-run --user --unit=cc-feishu-lodestar --working-directory=/home/leviyuan/feishu -- /home/leviyuan/.bun/bin/bun daemon.ts`
+- Inspect / stop persistent daemon:
+  `systemctl --user status cc-feishu-lodestar`,
+  `journalctl --user -u cc-feishu-lodestar -f`,
+  `systemctl --user stop cc-feishu-lodestar`
 
 ### Testing
 
