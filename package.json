@@ -1,6 +1,6 @@
 {
   "name": "@leviyuan/lodestar",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "publishConfig": {
     "access": "public"
   },
@@ -30,8 +30,8 @@
   "scripts": {
     "start": "bun daemon.ts",
     "build:daemon": "bun build cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar.js",
-    "build:setup":  "bun build src/setup-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-setup.js",
-    "build:stop":   "bun build src/stop-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-stop.js",
+    "build:setup": "bun build src/setup-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-setup.js",
+    "build:stop": "bun build src/stop-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-stop.js",
     "build:update": "bun build src/update-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-update.js",
     "build:version": "bun build src/version-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-version.js",
     "build": "bun run build:daemon && bun run build:setup && bun run build:stop && bun run build:update && bun run build:version",
@@ -40,8 +40,8 @@
   },
   "bin": {
     "lodestar-daemon": "./dist/lodestar.js",
-    "lodestar-setup":  "./dist/lodestar-setup.js",
-    "lodestar-stop":   "./dist/lodestar-stop.js",
+    "lodestar-setup": "./dist/lodestar-setup.js",
+    "lodestar-stop": "./dist/lodestar-stop.js",
     "lodestar-update": "./dist/lodestar-update.js",
     "lodestar-version": "./dist/lodestar-version.js"
   },
