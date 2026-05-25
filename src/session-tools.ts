@@ -2,7 +2,7 @@
  * Tool-tracking helpers split out of session.ts. Free functions taking
  * a Session; fields they touch are package-internal (no `private`
  * modifier on the class side). Cross-file boundary lets the main
- * session.ts stay under Claude Code's per-read token budget.
+ * session.ts stay small enough for agent review.
  */
 
 import type { Session } from './session'
@@ -98,7 +98,7 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
       type: 'insert_before',
       targetElementId: cards.ELEMENTS.footer,
     })
-    // Phone push — user has to come back and answer before Claude can
+    // Phone push — user has to come back and answer before Codex can
     // continue. Set summary to the question text so the lock-screen
     // notification preview shows what the user needs to answer.
     if (s.currentTurn.userOpenId && s.currentTurn.messageId) {

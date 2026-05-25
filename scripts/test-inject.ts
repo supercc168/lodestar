@@ -9,7 +9,7 @@
  * error log), then routes through the real `handleMessage` path
  * with `content.text` = the **original** text (the
  * `【自动化测试】` prefix is only for group-member visibility, not
- * fed to claude).
+ * fed to Codex).
  *
  * One-time seeding: from the target Feishu group, send a single
  * `[DEBUG]hi` (or `[DEBUG]<anything>`). The daemon captures that

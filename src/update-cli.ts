@@ -1,8 +1,8 @@
 /**
  * CLI entry for `lodestar-update` bin.
  *
- * 跑 `npm i -g @leviyuan/lodestar@latest @anthropic-ai/claude-code@latest`
- * (claude CLI 是 peer dep, 顺手一起升), stdio inherit 让 npm 自己的进度
+ * 跑 `npm i -g @leviyuan/lodestar@latest @openai/codex@latest`
+ * (Codex CLI 是 peer dep, 顺手一起升), stdio inherit 让 npm 自己的进度
  * 条和版本号输出原样透出来。完事后提示用户重启 daemon —— 我们这里 *不*
  * 主动 stop + start, 因为 daemon 可能挂在 systemd / Task Scheduler 下,
  * 由那边接管,自重启会撞两次。让用户自己根据部署方式决定。
@@ -27,7 +27,7 @@ function runNpmInstall(): Promise<number> {
   return new Promise((resolve) => {
     const child = spawn(
       npm,
-      ['install', '-g', '@leviyuan/lodestar@latest', '@anthropic-ai/claude-code@latest'],
+      ['install', '-g', '@leviyuan/lodestar@latest', '@openai/codex@latest'],
       { stdio: 'inherit', shell: process.platform === 'win32' },
     )
     child.on('exit', (code) => resolve(code ?? 1))
@@ -39,8 +39,8 @@ function runNpmInstall(): Promise<number> {
 }
 
 async function main(): Promise<void> {
-  console.log(`${C.bold}更新 Lodestar + Claude Code${C.reset}`)
-  console.log(`${C.dim}npm i -g @leviyuan/lodestar@latest @anthropic-ai/claude-code@latest${C.reset}\n`)
+  console.log(`${C.bold}更新 Lodestar + Codex CLI${C.reset}`)
+  console.log(`${C.dim}npm i -g @leviyuan/lodestar@latest @openai/codex@latest${C.reset}\n`)
 
   const code = await runNpmInstall()
   if (code !== 0) {

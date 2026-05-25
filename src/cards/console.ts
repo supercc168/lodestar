@@ -14,9 +14,9 @@ interface ConsoleOpts {
   status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
   model?: string
   effort?: string
-  /** ms since this ClaudeProcess spawned — formatted to "1h 23m" inside. */
+  /** ms since this CodexProcess spawned — formatted to "1h 23m" inside. */
   uptimeMs?: number
-  /** All sessions currently running Claude across every Feishu group
+  /** All sessions currently running Codex across every Feishu group
    * this daemon owns. Each entry is a sibling project. Empty/undefined
    * → omit the section. The session matching this card's chat is
    * flagged `isCurrent` so the row can be marked. */
@@ -26,9 +26,7 @@ interface ConsoleOpts {
     status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
     uptimeMs?: number
   }>
-  /** Subscription usage snapshot from ccusage. When `installed: false`
-   * the row renders an install hint; otherwise we surface the current
-   * 5h billing block + this week's aggregate. Undefined → omit row. */
+  /** Subscription usage snapshot from Codex app-server. Undefined → omit row. */
   usage?: UsageSnapshot
   /** Current context-window occupancy estimate (input + cache tokens of
    * the last assistant message). 0 if no turn has completed yet. */
@@ -121,8 +119,8 @@ const PEER_STATUS_EMOJI: Record<string, string> = {
  * of `consoleCard` so the caller can patch it in after the initial card
  * is on screen (网络往返可能慢于第一次 paint;先占位、回包后替换)。
  *
- * 数据源是 Anthropic 官方 OAuth Usage API (见 src/usage.ts)。
- * 百分比是真实 utilization,失败态按 state 区分显示具体原因。
+ * 数据源是 Codex app-server 的 ChatGPT 账号与 OpenAI/Codex rate-limit
+ * 快照 (见 src/usage.ts)。百分比是真实 usedPercent,失败态按 state 区分。
  *
  * `usage === undefined` → 初始 loading 占位。
  */
@@ -132,37 +130,40 @@ export function consoleUsageContent(
   if (usage === undefined) return '**📊 订阅额度**　_加载中…_'
   switch (usage.state) {
     case 'no_credentials':
-      // 这一条多半是用户在 setup 向导里选了 DeepSeek / GLM / 其它
-      // anthropic-compatible 后端,claude 子进程跑的是 env 注入的
-      // ANTHROPIC_BASE_URL,根本不走 anthropic.com,所以没 OAuth 凭据。
-      // 不要按"凭据错误"渲染,直接说清能力边界。
-      return '**📊 订阅额度**　_暂时只支持 Claude 订阅额度显示_'
+      return '**📊 Codex 额度**　未登录 ChatGPT — 运行 `codex login`'
     case 'auth_failed':
-      return '**📊 订阅额度**　Token 已过期且刷新失败 — 重新 `claude auth login`'
+      return '**📊 Codex 额度**　当前不是 ChatGPT 登录 — 请运行 `codex login`'
     case 'rate_limited':
-      return '**📊 订阅额度**　API 429 限流,稍后重试'
+      return '**📊 Codex 额度**　API 429 限流,稍后重试'
     case 'network':
-      return `**📊 订阅额度**　拉取失败${usage.reason ? ' — `' + usage.reason + '`' : ''}`
+      return `**📊 Codex 额度**　拉取失败${usage.reason ? ' — `' + usage.reason + '`' : ''}`
   }
   // state === 'ok' —— stale 时 head 加 "缓存 Xm 前",重置时间加 `~`
   // 前缀,沿用 omchud HUD 的 stale 标记约定。
   const staleNote = usage.stale ? ` _· 缓存 ${fmtAgo(usage.fetchedAt)}_` : ''
   const resetPrefix = usage.stale ? '~' : ''
   const head = usage.subscriptionType
-    ? `**📊 订阅额度** · ${usage.subscriptionType}${staleNote}`
-    : `**📊 订阅额度**${staleNote}`
+    ? `**📊 Codex 额度** · ChatGPT ${usage.subscriptionType}${staleNote}`
+    : `**📊 Codex 额度**${staleNote}`
   const lines: string[] = [head]
   if (usage.fiveHour) {
     const parts = [`${Math.round(usage.fiveHour.percent)}%`]
     if (usage.fiveHour.resetsAt) parts.push(`重置 ${resetPrefix}${fmtResetIn(usage.fiveHour.resetsAt)}`)
-    lines.push(`　· 5h　${parts.join(' · ')}`)
+    lines.push(`　· ${fmtWindowLabel(usage.fiveHour.durationMins, '主窗口')}　${parts.join(' · ')}`)
   }
   if (usage.weekly) {
     const parts = [`${Math.round(usage.weekly.percent)}%`]
     if (usage.weekly.resetsAt) parts.push(`重置 ${resetPrefix}${fmtResetIn(usage.weekly.resetsAt)}`)
-    lines.push(`　· 7d　${parts.join(' · ')}`)
+    lines.push(`　· ${fmtWindowLabel(usage.weekly.durationMins, '次窗口')}　${parts.join(' · ')}`)
   }
-  return lines.length === 1 ? '**📊 订阅额度**　_无数据_' : lines.join('\n')
+  return lines.length === 1 ? '**📊 Codex 额度**　_无数据_' : lines.join('\n')
+}
+
+function fmtWindowLabel(mins: number | null | undefined, fallback: string): string {
+  if (!mins || mins <= 0) return fallback
+  if (mins % (24 * 60) === 0) return `${mins / (24 * 60)}d`
+  if (mins % 60 === 0) return `${mins / 60}h`
+  return `${mins}m`
 }
 
 const SERVICE_STATUS_EMOJI: Record<string, string> = {
@@ -357,7 +358,7 @@ export function consoleCard(opts: ConsoleOpts): object {
     lines.push(`**🔄 上一轮**　+${fmtTokens(lastTurn.tokens)} · ${fmtCost(lastTurn.costUsd)} · ${fmtDurationMs(lastTurn.durationMs)}`)
   }
   if (sessionId) {
-    lines.push(`**🆔 session**　\`${sessionId.slice(0, 8)}…\``)
+    lines.push(`**🆔 thread**　\`${sessionId.slice(0, 8)}…\``)
   }
   if (sysinfo) {
     lines.push(...hostLines(sysinfo))
@@ -378,7 +379,7 @@ export function consoleCard(opts: ConsoleOpts): object {
   if (schedules !== undefined) {
     bodyElements.push({ tag: 'markdown', content: `**⏰ 定时任务** (${schedules.length}) · _全局_` })
     if (schedules.length === 0) {
-      bodyElements.push({ tag: 'markdown', content: '_暂无定时任务_ — 让任意群里的 Claude 调 `schedule_create` / `schedule_once` 加一个' })
+      bodyElements.push({ tag: 'markdown', content: '_暂无定时任务_ — 让任意群里的 Codex 调 `schedule_create` / `schedule_once` 加一个' })
     } else {
       for (const s of schedules) bodyElements.push(schedulePanel(s))
     }

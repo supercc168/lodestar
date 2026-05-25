@@ -1,14 +1,14 @@
 /**
- * Session — 1 Feishu chat ↔ 1 Claude headless process ↔ 1 streaming card.
+ * Session — 1 Feishu chat ↔ 1 Codex app-server process ↔ 1 streaming card.
  *
- * Owns the ClaudeProcess lifecycle, the per-turn card state machine, and
- * the in-flight permission map.  Wires Claude's stdout events into Card
+ * Owns the CodexProcess lifecycle, the per-turn card state machine, and
+ * the in-flight permission map.  Wires Codex app-server events into Card
  * Kit ops, and wires Feishu inbound (text + card-action callbacks) into
- * Claude's stdin.
+ * Codex turns.
  *
  * Tool tracking, AskUserQuestion flow, and permission rendering live in
  * sibling modules (session-tools.ts, session-ask.ts,
- * session-permission.ts) so this file stays under Claude Code's
+ * session-permission.ts) so this file stays under Codex's
  * per-read token budget (~25K). Fields touched by those helpers carry
  * no `private` modifier — convention is "no modifier = package-internal,
  * only the session-*.ts helpers should touch it."
@@ -16,7 +16,7 @@
 
 import { existsSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
-import { ClaudeProcess, type CanUseToolRequest, type HookCallbackRequest, type ClaudeUsage } from './claude-process'
+import { CodexProcess, type CanUseToolRequest, type HookCallbackRequest, type CodexUsage } from './codex-process'
 import { CHANNEL_INSTRUCTIONS } from './instructions'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
@@ -34,16 +34,15 @@ export type { SessionOpts } from './session-types'
 
 const SEND_MARKER_RE = /\[\[send:\s*([^\]\n]+?)\s*\]\]/g
 
-/** SDK error 自动续 turn 的上限:同一 turn 链上连续报错时,daemon 最多
- * sendUserText('继续') 这么多次来自动续;第 (MAX_SDK_AUTO_RETRY + 1) 次
+/** Codex error 自动续 turn 的上限:同一 turn 链上连续报错时,daemon 最多
+ * sendUserText('继续') 这么多次来自动续;第 (MAX_CODEX_AUTO_RETRY + 1) 次
  * 连续报错就放弃 —— ⛔ footer + 强制推送通知用户。任一次自然 success 或
  * 用户介入都把计数清零。 */
-const MAX_SDK_AUTO_RETRY = 5
+const MAX_CODEX_AUTO_RETRY = 5
 
 /** "模型还在干活" 顶部 ticker 的备选动词。turn 起来时随机选一个、整 turn
  * 固定不变,setInterval 每 TICKER_TICK_MS (1s) 跑一次,只刷经过秒数 ——
- * 比让 verb 轮播视觉更稳。opus-4-7 上 extended thinking 走 redacted、
- * 客户端拿不到明文 thinking,这个 ticker 就是 redacted-thinking 阶段
+ * 比让 verb 轮播视觉更稳。推理阶段没有稳定明文输出时,这个 ticker 就是
  * 唯一的活体信号。 */
 const TICKER_VERBS = [
   '🤔 推敲',
@@ -85,11 +84,11 @@ export class Session {
    * Feishu groups. Sessions are never removed (matches the daemon's
    * `sessions` map lifecycle — one Session per chat for the daemon's
    * lifetime). Callers should filter on `isRunning()` when they only
-   * want currently-alive Claude processes. */
+   * want currently-alive Codex processes. */
   static readonly all: Set<Session> = new Set()
 
   // ── package-internal state (touched by session-*.ts helpers) ──
-  proc: ClaudeProcess | null = null
+  proc: CodexProcess | null = null
   currentTurn: TurnState | null = null
   pendingPermissions = new Map<string, { toolUseId: string }>()
   /** Open AskUserQuestion tool calls — keyed by tool_use_id. The SDK
@@ -123,7 +122,7 @@ export class Session {
    * TaskCreate / TaskUpdate input+output pairs and rendered as a footer
    * on every Task* panel. Lives for the lifetime of the Session
    * instance; daemon restart wipes it (the SDK doesn't replay history).
-   * Not authoritative — Claude calling TaskList is still the source of
+   * Not authoritative — Codex calling TaskList is still the source of
    * truth; this mirror is purely for the panel readout. */
   currentTodos = new Map<number, cards.Todo>()
   /** SDK 偶尔在 turn 的最后一项是 tool_result(is_error=true) 或已答完
@@ -142,7 +141,7 @@ export class Session {
   status: Status = 'stopped'
 
   // ── strictly private state ──
-  /** Count of user messages we've written to Claude's stdin since the last
+  /** Count of user messages we've sent to Codex since the last
    * turn opened on our side. NOT a FIFO of individual messages — the SDK
    * USUALLY batch-merges every mid-turn user message into a single
    * combined turn once the in-flight turn finishes, so most of the time
@@ -166,10 +165,10 @@ export class Session {
   private pendingUserMessageCount = 0
   /** Mid-turn user messages buffered DAEMON-SIDE (not yet sendUserText'd
    * to the SDK). Drained in the `result` handler by writing each to SDK
-   * stdin, which doubles as the `priority="now"` wake signal the SDK
-   * polling loop needs to start the next batch turn (the SDK won't
-   * auto-dequeue queued type-ahead msgs after `result` — confirmed via
-   * claude-code issue #39632). Buffering also keeps mid-turn msgs out
+   * stdin, which doubles as the wake signal the Codex app-server needs
+   * to start the next batch turn (it won't auto-dequeue queued
+   * type-ahead msgs after `result` — confirmed in dogfood testing).
+   * Buffering also keeps mid-turn msgs out
    * of any AskUserQuestion `QUEUE remove` storm, since they were never
    * in the SDK queue to begin with. */
   private pendingMidTurnMsgs: Array<{ text: string; wireText: string; userOpenId: string; msgId: string }> = []
@@ -224,7 +223,7 @@ export class Session {
    * closes a turn with `subtype !== 'success'` (error_during_execution /
    * error_max_turns), the daemon swallows the phone push and re-pokes
    * the SDK with a "继续" user message to auto-resume. Up to
-   * MAX_SDK_AUTO_RETRY (5) auto-resumes in a row; the next consecutive
+   * MAX_CODEX_AUTO_RETRY (5) auto-resumes in a row; the next consecutive
    * error past that → give up: surface the failure (⛔ footer + forced
    * phone push) and reset. Any natural-success turn OR user intervention
    * (mid-turn buffer drain) resets this back to 0. */
@@ -233,7 +232,7 @@ export class Session {
    * 给 init handler / openTurnCard。当前只用于 SDK error 的 autoRetry
    * 路径 —— sendUserText('继续') 触发的下一 init,daemon 这边知道这是
    * 续 turn 而不是真用户消息,openTurnCard 用 'auto_retry' kind 出
-   * `🔁 SDK 错误自动续` banner、不渲染 "📥 收到" panel。一次性使用,
+   * `🔁 Codex 错误自动续` banner、不渲染 "📥 收到" panel。一次性使用,
    * 决定 trigger 后立即 reset null。 */
   private nextOpenKind: 'auto_retry' | 'no_followup_retry' | 'tool_error_retry' | null = null
   /** One-shot: user invoked `stop` during the current turn. Set right
@@ -241,14 +240,14 @@ export class Session {
    * short-circuit the autoRetry branch. Without this, the SDK's post-
    * interrupt result (typically `is_error:true subtype:error_during_execution`)
    * falls into `isError && !hasMidTurn` and the daemon helpfully
-   * sendUserText('继续') + opens a fresh card stamped `🔁 SDK 错误自动续`
+   * sendUserText('继续') + opens a fresh card stamped `🔁 Codex 错误自动续`
    * — exactly the thing the user explicitly told us to stop. The 🛑 打断
    * footer was already painted by the stop case's own closeTurnCard,
    * so this just suppresses the follow-up retry. Reset by exit handler
    * for the proc-died-before-result case. */
   private userInterrupted = false
-  // Last seen sessionId — preserved across `kill`/`stop` so a later
-  // `restart` can resume the same Claude conversation even after the
+  // Last seen thread id — preserved across `kill`/`stop` so a later
+  // `restart` can resume the same Codex conversation even after the
   // child process is gone.
   private lastSessionId: string | null = null
   private startedAt: number = 0
@@ -261,7 +260,7 @@ export class Session {
     private opts: SessionOpts = {},
   ) {
     Session.all.add(this)
-    // Restore last-known claude session_id from disk so a daemon restart
+    // Restore last-known Codex thread_id from disk so a daemon restart
     // (systemctl, crash, watchdog) doesn't strand the user with a fresh
     // conversation when they next type `restart`.
     this.lastSessionId = feishu.getSessionResume(sessionName)
@@ -286,14 +285,8 @@ export class Session {
   // ── Lifecycle ──────────────────────────────────────────────────────
   async start(): Promise<boolean> {
     if (this.isRunning()) return true
-    // 只有走 Anthropic 官方 firstParty(订阅 / 官方 API key)时才需要
-    // `claude auth login`。配了 DeepSeek / GLM / 任意 anthropic-compatible
-    // 后端(config.toml [claude.env] 里的 ANTHROPIC_AUTH_TOKEN / API_KEY /
-    // BASE_URL)的用户根本不登录 Anthropic —— 那种情况下跳过这道检查,
-    // claude 真起不来会在子进程自己报错(no_fallbacks: 让真实失败浮现,
-    // 而不是用一道方向错了的前置检查挡在门口)。
-    if (!feishu.hasCustomClaudeBackend() && !feishu.isAnthropicAuthenticated()) {
-      await feishu.sendText(this.chatId, '❌ Claude 未登录 Anthropic 账号。\n请在服务器上运行 `claude auth login` 后再试。')
+    if (!feishu.isOpenAIChatGPTAuthenticated()) {
+      await feishu.sendText(this.chatId, '❌ Codex 未登录 ChatGPT 账号。\n请在服务器上运行 `codex login` 后再试。')
       return false
     }
     if (!existsSync(this.workDir)) {
@@ -306,31 +299,47 @@ export class Session {
     }
 
     this.status = 'starting'
-    this.proc = new ClaudeProcess({
+    this.proc = new CodexProcess({
       workDir: this.workDir,
       effort: 'max',
       permissionMode: this.opts.permissionMode ?? 'bypassPermissions',
       appendSystemPrompt: CHANNEL_INSTRUCTIONS,
     })
     this.wireProc(this.proc)
-    this.proc.sendInitialize({})
+    this.proc.sendInitialize()
     // 等 `system/init` 落地再认定 ready —— sendInitialize 只把 RPC
-    // 写进 stdin,Claude 回包之前 proc.sessionId 还是 null,这时候
+    // 写进 app-server 之前 proc.sessionId 还是 null,这时候
     // showConsole() 看到 null 会 fallback 到磁盘上**上一次**会话的
-    // lastSessionId,面板就把陈年 session_id 当成"当前会话"贴出去,
+    // lastSessionId,面板就把陈年 thread_id 当成"当前会话"贴出去,
     // model / usage / contextWindow 也都没值。等 init 之后再返回,
     // 后续 `hi`、首条 user message 都能拿到真值。5s 兜底,init 真
     // 没来也不死循环。
-    await new Promise<void>(resolve => {
+    let initError: unknown = null
+    const initState = await new Promise<'init' | 'error' | 'timeout'>(resolve => {
       const proc = this.proc!
-      const timer = setTimeout(() => {
+      const finish = (state: 'init' | 'error' | 'timeout') => {
+        clearTimeout(timer)
         proc.off('init', onInit)
+        proc.off('error', onError)
+        resolve(state)
+      }
+      const timer = setTimeout(() => {
         log(`session "${this.sessionName}": init wait timeout (5s) — proceeding`)
-        resolve()
+        finish('timeout')
       }, 5000)
-      const onInit = () => { clearTimeout(timer); resolve() }
+      const onInit = () => finish('init')
+      const onError = (e: unknown) => { initError = e; finish('error') }
       proc.once('init', onInit)
+      proc.once('error', onError)
     })
+    if (initState === 'error') {
+      log(`session "${this.sessionName}": codex init failed: ${initError}`)
+      await feishu.sendText(this.chatId, `❌ Codex 启动失败: ${initError}`)
+      await this.proc?.kill(1000).catch(() => {})
+      this.proc = null
+      this.status = 'stopped'
+      return false
+    }
 
     await feishu.sendText(this.chatId, `✅ Lodestar session "${this.sessionName}" 已就绪，发消息开始对话。`)
     this.status = 'idle'
@@ -341,7 +350,7 @@ export class Session {
   /** Drop every ⏳ OneSecond reaction this session is currently holding
    * on user chat messages, then empty the two tracking maps. Used by
    * every tear-down path (proc exit, kill, restart) so reactions don't
-   * outlive the conversation that placed them — without this, a Claude
+   * outlive the conversation that placed them — without this, a Codex
    * crash / daemon SIGTERM leaves orphan ⏳ stuck on user messages until
    * Feishu's UI eventually GCs them (which it doesn't, in practice).
    * closeTurnCard has its own release pass (with the slightly-early
@@ -417,7 +426,7 @@ export class Session {
     this.consecutiveErrors = 0
     this.awaitingFollowup = null
     if (resume && prevSessionId) {
-      this.proc = new ClaudeProcess({
+      this.proc = new CodexProcess({
         workDir: this.workDir,
         effort: 'max',
         permissionMode: this.opts.permissionMode ?? 'bypassPermissions',
@@ -425,7 +434,7 @@ export class Session {
         appendSystemPrompt: CHANNEL_INSTRUCTIONS,
       })
       this.wireProc(this.proc)
-      this.proc.sendInitialize({})
+      this.proc.sendInitialize()
       this.status = 'idle'
       this.startedAt = Date.now()
       await feishu.sendText(this.chatId, `🔁 已重启并恢复 session=${prevSessionId.slice(0, 8)}…`)
@@ -445,16 +454,16 @@ export class Session {
   }
 
   /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`).
-   * Returns true if the command was consumed (don't forward to Claude).
+   * Returns true if the command was consumed (don't forward to Codex).
    * Exact match, case-insensitive, ignores trailing whitespace.
    *
    * Trade-off (user-confirmed 2026-05-15): these words are reserved
    * globally — typing "hi" as a literal greeting will show the console
-   * card instead of reaching Claude. The ergonomic win (no slash, no
+   * card instead of reaching Codex. The ergonomic win (no slash, no
    * shift key, one-handed phone use) outweighs the collision in this
    * product's private-bot use case. `stop` was added 2026-05-15 once
    * auto-interrupt on mid-turn user messages was removed (matching
-   * claude-code's native type-ahead behavior) — explicit barge-out
+   * Codex's native type-ahead behavior) — explicit barge-out
    * needed a knob and `kill` (full subprocess teardown) is too heavy. */
   async runCommand(raw: string): Promise<boolean> {
     switch (raw.trim().toLowerCase()) {
@@ -509,7 +518,7 @@ export class Session {
         // Tag the imminent SDK `result` (which DOES arrive after sendInterrupt
         // with is_error:true subtype:error_during_execution — the comment
         // below was wrong) so the result handler doesn't read it as a real
-        // SDK failure and helpfully autoRetry into `🔁 SDK 错误自动续`. Must
+        // Codex failure and helpfully autoRetry into `🔁 Codex 错误自动续`. Must
         // be set BEFORE sendInterrupt — the result can land on the next tick.
         this.userInterrupted = true
         this.awaitingFollowup = null
@@ -559,7 +568,7 @@ export class Session {
   async buildConsoleCard(usage: UsageSnapshot | undefined): Promise<object> {
     const uptimeMs = this.startedAt ? (Date.now() - this.startedAt) : undefined
     const rawModel = this.proc?.lastModel ?? null
-    const model = rawModel ? rawModel.replace(/^claude-/, '') : undefined
+    const model = rawModel ?? undefined
     const sysinfo = await readSysInfo()
     return cards.consoleCard({
       sessionName: this.sessionName,
@@ -586,9 +595,9 @@ export class Session {
       // List ALL schedules across every project — hi panel is a global
       // dashboard. Each panel shows its `project` so the user can tell
       // them apart; the buttons (toggle / delete) also operate
-      // cross-project, no per-session scoping. The MCP path (claude
+      // cross-project, no per-session scoping. The MCP path (Codex
       // invoking schedule_create/delete from inside a chat) still
-      // scopes by project — that's a different attack surface (claude
+      // scopes by project — that's a different attack surface (Codex
       // running with arbitrary prompts inside one group shouldn't be
       // able to nuke another group's schedules), while the hi card is
       // operator-only (only humans in your bound groups can press the
@@ -600,8 +609,8 @@ export class Session {
   async showConsole(): Promise<void> {
     // Initial paint without usage → cards.ts renders the
     // `_加载中…_` placeholder in the consoleUsage element. We patch
-    // it in below once readUsage() resolves (ccusage cold-call is
-    // ~5s; not worth blocking the panel on it).
+    // it in below once readUsage() resolves; not worth blocking the
+    // panel on the Codex account/rate-limit round trip.
     const card = await this.buildConsoleCard(undefined)
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) return
@@ -628,9 +637,9 @@ export class Session {
   }
 
   // ── Inbound from Feishu ────────────────────────────────────────────
-  /** Inbound user message. Always writes to Claude's stdin immediately —
+  /** Inbound user message. Starts a Codex turn immediately when idle —
    * the SDK queues internally if a turn is in flight (FIFO, exactly the
-   * type-ahead semantics of the native claude-code REPL). Card opening:
+   * type-ahead semantics of the native Codex UI). Card opening:
    *   - First msg of session OR no turn in flight  → open card eagerly here
    *   - Mid-flight msg                              → defer; the `init`
    *     handler opens its card when the SDK actually starts the turn
@@ -689,7 +698,7 @@ export class Session {
     // content user turn, wrap it in `<u>...</u>` so the model sees a
     // structural boundary it actually attends to. Tried U+001E
     // (ASCII Record Separator) first — invisible and theoretically
-    // perfect, but Anthropic's tokenizer effectively drops control
+    // perfect, but model tokenizers effectively drop control
     // chars and `<u>1</u><u>45</u>` became "145" to the model
     // (2026-05-16 accumulator test). HTML-tag wrap is visible but
     // models parse `<tag>` boundaries very reliably from training.
@@ -729,7 +738,7 @@ export class Session {
     if (this.currentTurn !== null) {
       // Mid-turn — BUFFER instead of immediate sendUserText. The SDK polling
       // loop will not auto-dequeue queued type-ahead msgs after `result`
-      // (only `priority="now"` writes wake it — claude-code issue #39632),
+      // (we explicitly write again to wake the Codex app-server),
       // so writing here would leave the msg stuck until the next user msg
       // arrives. Drain happens in the `result` handler, which both wakes
       // the SDK and opens a fresh card for the new batch turn.
@@ -758,7 +767,7 @@ export class Session {
         // 真用户消息覆盖 autoRetry 意图 —— autoRetry 设的 nextOpenKind
         // 在 SDK init 还没回来时被这条 eager-open 抢先开 turn,init handler
         // 后续看到 currentTurn!=null 直接 return 不会消费 nextOpenKind,
-        // 不 reset 会 leak 到下下个 turn 错 stamp '🔁 SDK 错误自动续'。
+        // 不 reset 会 leak 到下下个 turn 错 stamp '🔁 Codex 错误自动续'。
         this.nextOpenKind = null
         this.pendingTurnInputs.push(text)
         await this.openTurnCard(userOpenId, 'user_message')
@@ -826,10 +835,13 @@ export class Session {
     return sessionPermission.onPermissionDecision(this, requestId, decision, user)
   }
 
-  // ── Wiring Claude → Feishu ─────────────────────────────────────────
-  private wireProc(p: ClaudeProcess): void {
+  // ── Wiring Codex → Feishu ──────────────────────────────────────────
+  private wireProc(p: CodexProcess): void {
+    p.on('error', err => {
+      log(`session "${this.sessionName}": codex process error: ${err}`)
+    })
     p.on('init', () => {
-      // Persist the freshly assigned session_id so a later daemon
+      // Persist the freshly assigned Codex thread id so a later daemon
       // restart can resume this conversation. Skip if unchanged to
       // avoid hammering the file on every init for resumed sessions.
       if (p.sessionId && p.sessionId !== this.lastSessionId) {
@@ -860,7 +872,7 @@ export class Session {
       if (!isUserBatch && !isScheduledFire) return
       // nextOpenKind 优先(目前只有 autoRetry 路径会设)。autoRetry 自己
       // sendUserText('继续') + pendingCount++,所以 isUserBatch=true,但
-      // 我们要它出 `🔁 SDK 错误自动续` banner 而不是普通 user_message —
+      // 我们要它出 `🔁 Codex 错误自动续` banner 而不是普通 user_message —
       // 用 nextOpenKind 顶替。一次性,决定 trigger 后立即 reset。
       const trigger: 'user_message' | 'scheduled' | 'auto_retry' | 'no_followup_retry' | 'tool_error_retry' =
         this.nextOpenKind ?? (isUserBatch ? 'user_message' : 'scheduled')
@@ -909,7 +921,7 @@ export class Session {
       // 一段 content block 收尾(SSE content_block_stop)→ 把当前 assistant 段
       // 定稿(flush + streaming_mode 瞬切全显未上屏尾巴,见 finalizeCurrentAssistant-
       // Segment),然后 reset 段游标让下一段开新元素。这条 emit 在该段最后一个
-      // text_delta 之后同步到达(claude-process 按 stdout 行序 emit),所以
+      // text_delta 之后同步到达(codex-process 按 stdout 行序 emit),所以
       // appendAssistant 已把全量累进 currentAssistantText,这里定稿拿到的是完整段。
       this.finalizeCurrentAssistantSegment()
     })
@@ -957,7 +969,7 @@ export class Session {
       //   2. `lastResult.is_error` — SDK closed the turn with a non-
       //      `success` subtype (error_during_execution / error_max_turns).
       //      First occurrences: swallow the phone push, re-poke SDK with
-      //      "继续" to auto-resume (up to MAX_SDK_AUTO_RETRY times). One
+      //      "继续" to auto-resume (up to MAX_CODEX_AUTO_RETRY times). One
       //      more consecutive error past that: give up, ⛔ footer + force
       //      phone push so the user knows.
       //   3. Natural success — `✅` footer, normal phone push, reset
@@ -989,15 +1001,15 @@ export class Session {
         // User intervention wins over auto-retry — they're actively
         // sending new input, no point also auto-poking the SDK.
         this.consecutiveErrors = 0
-        suffix = isError ? `⚠️ SDK ${subtype},用户已介入` : '📨 转交新卡'
+        suffix = isError ? `⚠️ Codex ${subtype},用户已介入` : '📨 转交新卡'
       } else if (isError) {
         this.consecutiveErrors++
-        if (this.consecutiveErrors > MAX_SDK_AUTO_RETRY) {
-          suffix = `⛔ SDK ${subtype},自动续 ${MAX_SDK_AUTO_RETRY} 次仍失败,已停止`
+        if (this.consecutiveErrors > MAX_CODEX_AUTO_RETRY) {
+          suffix = `⛔ Codex ${subtype},自动续 ${MAX_CODEX_AUTO_RETRY} 次仍失败,已停止`
           forcePush = true
           this.consecutiveErrors = 0
         } else {
-          suffix = `⚠️ SDK ${subtype},自动续 turn… (${this.consecutiveErrors}/${MAX_SDK_AUTO_RETRY})`
+          suffix = `⚠️ Codex ${subtype},自动续 turn… (${this.consecutiveErrors}/${MAX_CODEX_AUTO_RETRY})`
           autoRetry = true
         }
       } else if (noFollowupRetry) {
@@ -1020,27 +1032,14 @@ export class Session {
       if (hasMidTurn) {
         void this.drainMidTurnAndOpen()
       } else if (autoRetry) {
-        // Re-poke the SDK to start a fresh turn. Anthropic's text-block
-        // API rejects empty content, so use "继续" — minimal Chinese
-        // imperative the model parses cleanly. Bumping
-        // pendingUserMessageCount makes the init handler classify the
-        // resulting turn as user_message (inheriting lastUserOpenId)
-        // rather than scheduled, so the eventual success will still
-        // phone-push the original sender。同时把 nextOpenKind 设成
-        // 'auto_retry' / 'no_followup_retry' / 'tool_error_retry',让 init
-        // handler 触发的 openTurnCard 出对应 banner(`🔁 SDK 错误自动续` /
-        // `🔁 答完没下文,自动续` / `🛠️ 工具出错异常终止,自动续`),用户
-        // 能看出这是 daemon 自续的 turn 而不是凭空冒出一张普通卡片,且能
-        // 直接读出续 turn 的原因。
-        this.proc?.sendUserText('继续')
-        this.pendingUserMessageCount++
-        this.nextOpenKind = noFollowupRetry
+        const kind: 'auto_retry' | 'no_followup_retry' | 'tool_error_retry' = noFollowupRetry
           ? (followupReason === 'tool_error' ? 'tool_error_retry' : 'no_followup_retry')
           : 'auto_retry'
+        void this.startSyntheticRetryTurn(kind)
       }
     })
     p.on('exit', ({ code, signal, expected }: any) => {
-      log(`session "${this.sessionName}": claude exited code=${code} signal=${signal} expected=${expected}`)
+      log(`session "${this.sessionName}": codex exited code=${code} signal=${signal} expected=${expected}`)
       this.proc = null
       this.stopTicker(this.currentTurn)
       this.currentTurn = null
@@ -1063,12 +1062,12 @@ export class Session {
       this.userInterrupted = false
       this.status = 'stopped'
       if (!expected && code !== 0 && signal !== 'SIGTERM') {
-        void feishu.sendText(this.chatId, `⚠️ Claude 异常退出 (code=${code}, signal=${signal})。回复任意消息将重新启动。`)
+        void feishu.sendText(this.chatId, `⚠️ Codex 异常退出 (code=${code}, signal=${signal})。回复任意消息将重新启动。`)
       }
     })
   }
 
-  /** Pull per-turn numbers off `proc.lastResult` (set by ClaudeProcess when
+  /** Pull per-turn numbers off `proc.lastResult` (set by CodexProcess when
    * the `result` message landed) and roll them into cumStats + the
    * "上一轮" delta. Called exactly once per result event, right before
    * closeTurnCard. */
@@ -1083,7 +1082,7 @@ export class Session {
     // 所以逐轮相加即得总量。
     const tokens = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.output_tokens ?? 0)
     // cost 取本进程算好的本轮增量,而非 total_cost_usd 累计值 —— 直接累加
-    // total_cost_usd 会三角放大(见 ClaudeProcess.cost_delta_usd)。
+    // Codex 当前没有逐 turn dollar cost,这里保持 0/null。
     const costUsd = r.cost_delta_usd ?? 0
     const durationMs = r.duration_ms ?? 0
     this.cumStats.tokens += tokens
@@ -1100,14 +1099,14 @@ export class Session {
    * API 调用的 input 累加 —— 后者(cache_read 跨步累加)会让占比虚高 Nx
    * (2026-05-16 现场 bug:重一点的多步 turn 后 hi 面板飙到 417%)。 */
   private currentContextTokens(): number {
-    const u = this.proc?.lastUsage as ClaudeUsage | null | undefined
+    const u = this.proc?.lastUsage as CodexUsage | null | undefined
     if (!u) return 0
     return (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0)
   }
 
   /** Context-window capacity for the model the subprocess is currently
    * running — sourced authoritatively from `result.modelUsage[model]
-   * .contextWindow` captured by ClaudeProcess on each turn close, so
+   * .contextWindow` captured by CodexProcess on each turn close, so
    * the daemon doesn't have to enumerate model ids itself (was the
    * source of a "560K/200K" display bug — model id didn't include
    * `[1m]` so the hardcoded fallback won). Returns `null` when no turn
@@ -1115,6 +1114,19 @@ export class Session {
    * render percentages only when this is a real number. */
   private contextWindowMax(): number | null {
     return this.proc?.lastContextWindow ?? null
+  }
+
+  private async startSyntheticRetryTurn(kind: 'auto_retry' | 'no_followup_retry' | 'tool_error_retry'): Promise<void> {
+    if (!this.proc) return
+    this.openingTurn = true
+    try {
+      await this.openTurnCard(this.lastUserOpenId, kind)
+      if (!this.currentTurn) return
+      this.proc.sendUserText('继续')
+      this.status = 'working'
+    } finally {
+      this.openingTurn = false
+    }
   }
 
   /** Drain `pendingMidTurnMsgs` to the SDK and open a fresh card for the
@@ -1127,7 +1139,7 @@ export class Session {
    *
    * N 条 wireText 用 `\n` join 成 **单条** sendUserText 发给 SDK,而不是
    * N 次独立写。背景:SDK polling loop 在 turn 边界一次只 dequeue 一条
-   * user message 进 prompt(claude-code issue #39632),N 次独立写会让
+   * user message 进 prompt,N 次独立写会让
    * SDK 把第 1 条单独开 turn、剩 N-1 条进下一 turn —— daemon 这边 panel
    * 在 openTurnCard 时已经 commit 了全部 N 条到 "前一个" turn,跟 SDK
    * 实际 turn 边界错位(03:19 现场 turn=5 panel 7 条 vs 模型只看到 1 条
@@ -1201,7 +1213,7 @@ export class Session {
       // thing we'd be doomed to silence otherwise.
       await feishu.sendTextRaw(
         this.chatId,
-        '❌ 创建对话卡片失败 (Feishu SDK 重试 3 次后仍连不上)。你这条消息没能送到 Claude,请稍后重发。',
+        '❌ 创建对话卡片失败 (Feishu SDK 重试 3 次后仍连不上)。你这条消息没能送到 Codex,请稍后重发。',
       )
       // currentTurn left null as the failure signal. Caller decides
       // whether to sendInterrupt: onUserMessage's eager-open path
@@ -1645,7 +1657,7 @@ export class Session {
     }))
     await cardkit.dispose(cardId)
 
-    // Phone push on clean turn close so the user knows Claude is done
+    // Phone push on clean turn close so the user knows Codex is done
     // even with the chat backgrounded. Skip on interrupts (no real
     // completion), when we don't know who to ping, and when the turn
     // wasn't kicked off by the user typing a message — scheduled /

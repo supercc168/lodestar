@@ -9,7 +9,7 @@
  * sequence inject calls + dump the relevant slice of daemon.log to a
  * result file. Designed to run from a systemd-run transient unit so
  * it survives `systemctl restart feishu-daemon` killing the originating
- * claude subprocess.
+ * Codex subprocess.
  */
 import { readFileSync } from 'node:fs'
 import { request } from 'node:http'

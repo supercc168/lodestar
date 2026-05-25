@@ -5,9 +5,7 @@ node_modules/
 *.swp
 *~
 
-# Local OMC / Claude / IDE state
-.omc/
-.claude/
+# Local IDE state
 
 # Local override config (if dropped in repo for testing)
 config.toml

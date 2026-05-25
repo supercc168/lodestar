@@ -1,7 +1,7 @@
 /**
  * Lodestar MCP server — daemon-hosted, project-scoped.
  *
- * Exposes 4 scheduling tools to whichever Claude subprocess connects:
+ * Exposes 4 scheduling tools to whichever Codex thread connects:
  *   schedule_create  — recurring cron-based schedule
  *   schedule_once    — one-shot delayed schedule
  *   schedule_list    — list this project's schedules
@@ -10,7 +10,7 @@
  * Transport: MCP Streamable HTTP, response body always plain JSON (no
  * SSE — our tools are all request/response, no server→client push).
  * Project scoping is encoded in the URL path: `/mcp/<project>` —
- * daemon hands each spawned Claude an `mcpServers` config pointing at
+ * daemon hands each spawned Codex thread an `mcp_servers` config pointing at
  * the right path, so the subprocess can't reach other projects' state
  * even if the prompt asks it to.
  *
@@ -69,7 +69,7 @@ function rpcSuccess(id: number | string | null, result: any): JsonRpcSuccess {
 
 // ── Tool definitions ────────────────────────────────────────────────
 // JSON Schema for each tool's input. Descriptions are user-facing —
-// claude reads them at tools/list time and decides when to call.
+// Codex reads them at tools/list time and decides when to call.
 
 const SCHEDULE_CREATE_SCHEMA = {
   type: 'object',
@@ -80,7 +80,7 @@ const SCHEDULE_CREATE_SCHEMA = {
     },
     prompt: {
       type: 'string',
-      description: 'The exact text Claude will see as the first user message when this schedule fires. Each fire spawns a FRESH Claude process (no resumed session, no prior conversation context) — write the prompt as if Claude is seeing this group for the first time.',
+      description: 'The exact text Codex will see as the first user message when this schedule fires. Each fire spawns a fresh Codex thread (no resumed session, no prior conversation context) — write the prompt as if Codex is seeing this group for the first time.',
     },
     mode: {
       type: 'string',
@@ -134,7 +134,7 @@ const SCHEDULE_DELETE_SCHEMA = {
 const TOOLS = [
   {
     name: 'schedule_create',
-    description: 'Create a recurring scheduled task for this project. The schedule fires on a cron expression and spawns a fresh Claude process each time (cwd = the project directory, no resumed session, no accumulated context). Use this instead of the built-in ScheduleWakeup/CronCreate tools when you want: (1) the schedule to survive process restarts via daemon persistence, (2) each fire to start from a clean slate rather than accumulating context across runs, (3) the schedule to be visible to humans via the dashboard. Returns the created Schedule with its id.',
+    description: 'Create a recurring scheduled task for this project. The schedule fires on a cron expression and spawns a fresh Codex thread each time (cwd = the project directory, no resumed session, no accumulated context). Use this when you want: (1) the schedule to survive process restarts via daemon persistence, (2) each fire to start from a clean slate rather than accumulating context across runs, (3) the schedule to be visible to humans via the dashboard. Returns the created Schedule with its id.',
     inputSchema: SCHEDULE_CREATE_SCHEMA,
   },
   {
@@ -221,7 +221,7 @@ function callTool(project: string, name: string, args: any): any {
     }
   } catch (e: any) {
     // createSchedule throws on bad cron / missing fields — surface as
-    // isError so claude sees the validation message and can retry.
+    // isError so Codex sees the validation message and can retry.
     return errorContent(`${e?.message ?? e}`)
   }
 }

@@ -4,14 +4,8 @@
  * \\.\CON{IN,OUT}$ on Windows) or manually via `lodestar-setup`.
  *
  * Flow:
- *   1. Ensure claude CLI is on PATH (npm i -g @anthropic-ai/claude-code
- *      if missing).
- *   2. Pick LLM backend — user's existing auth (subscription / API
- *      key / pre-set env) OR DeepSeek (writes the 8 env vars from
- *      DeepSeek's official Claude Code integration docs straight into
- *      ~/.claude/settings.json's `env` field — claude's own native
- *      backend-switch mechanism, so a bare `claude` in the terminal
- *      uses DeepSeek too, not just the one lodestar spawns).
+ *   1. Ensure Codex CLI is on PATH (npm i -g @openai/codex if missing).
+ *   2. Ensure Codex is logged in with ChatGPT (`codex login`).
  *   3. Feishu app — opens https://open.feishu.cn/app, lists every
  *      permission scope + event subscription step, and verifies the
  *      pasted app_id / app_secret against tenant_access_token endpoint
@@ -20,13 +14,12 @@
  *   5. Write config.toml, then auto-spawn `lodestar-daemon` detached
  *      so it survives setup exit.
  *
- * No background detection of claude auth state — it's fragile across
- * versions. Wizard just asks the user, much more reliable.
+ * ChatGPT login is checked with `codex login status`; users can run the
+ * interactive login from the wizard when needed.
  */
 
-import { spawn } from 'node:child_process'
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { execSync, spawn } from 'node:child_process'
+import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline/promises'
 import { delimiter, dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
@@ -58,19 +51,6 @@ async function ask(prompt: string, opts: { required?: boolean; default?: string 
   }
 }
 
-async function chooseOne(prompt: string, options: { label: string; value: string }[]): Promise<string> {
-  while (true) {
-    console.log(`${C.cyan}? ${C.reset}${prompt}`)
-    for (let i = 0; i < options.length; i++) {
-      console.log(`  ${C.bold}[${i + 1}]${C.reset} ${options[i]!.label}`)
-    }
-    const ans = (await rl.question(`${C.green}选择 [1-${options.length}]:${C.reset} `)).trim()
-    const idx = parseInt(ans, 10) - 1
-    if (idx >= 0 && idx < options.length) return options[idx]!.value
-    console.log(`${C.red}无效选择${C.reset}`)
-  }
-}
-
 function header(title: string): void {
   const line = '═'.repeat(58)
   console.log(`\n${C.bold}${C.cyan}╔${line}╗${C.reset}`)
@@ -88,33 +68,7 @@ function escapeTomlString(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 }
 
-/** Merge env vars into Claude Code's own settings.json (`env` field) — the
- * native, documented mechanism for pointing claude at a third-party
- * anthropic-compatible backend (DeepSeek / GLM / …). Reads + parses the
- * existing user settings, sets only the keys we own, leaves the user's
- * other env vars / hooks / permissions / theme untouched, writes back
- * pretty-printed (0o600 — it now holds an API token). Returns path +
- * ok/error so the caller can surface a clear failure instead of silently
- * dropping the backend config. */
-function mergeClaudeSettingsEnv(envVars: Record<string, string>): { path: string; ok: boolean; error?: string } {
-  const claudeDir = join(homedir(), '.claude')
-  const settingsPath = join(claudeDir, 'settings.json')
-  try {
-    mkdirSync(claudeDir, { recursive: true })
-    let settings: any = {}
-    if (existsSync(settingsPath)) {
-      try { settings = JSON.parse(readFileSync(settingsPath, 'utf8')) } catch { settings = {} }
-    }
-    if (!settings.env || typeof settings.env !== 'object') settings.env = {}
-    for (const [k, v] of Object.entries(envVars)) settings.env[k] = v
-    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', { mode: 0o600 })
-    return { path: settingsPath, ok: true }
-  } catch (e: any) {
-    return { path: settingsPath, ok: false, error: e?.message ?? String(e) }
-  }
-}
-
-// ── claude CLI detection / install ─────────────────────────────────
+// ── Codex CLI detection / install ──────────────────────────────────
 function whichBin(name: string): string | null {
   const PATH = process.env.PATH ?? ''
   if (!PATH) return null
@@ -131,10 +85,28 @@ function whichBin(name: string): string | null {
   return null
 }
 
-async function installClaudeCli(): Promise<boolean> {
+async function installCodexCli(): Promise<boolean> {
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
   return new Promise((resolve) => {
-    const child = spawn(npm, ['install', '-g', '@anthropic-ai/claude-code'], {
+    const child = spawn(npm, ['install', '-g', '@openai/codex@latest'], {
+      stdio: 'inherit',
+      shell: process.platform === 'win32',
+    })
+    child.on('exit', (code) => resolve(code === 0))
+    child.on('error', () => resolve(false))
+  })
+}
+
+function isCodexChatGPTLoggedIn(codexBin: string): boolean {
+  try {
+    const out = execSync(`"${codexBin}" login status 2>&1`, { timeout: 10_000 }).toString()
+    return /Logged in using ChatGPT/i.test(out)
+  } catch { return false }
+}
+
+async function runCodexLogin(codexBin: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const child = spawn(codexBin, ['login'], {
       stdio: 'inherit',
       shell: process.platform === 'win32',
     })
@@ -219,91 +191,55 @@ export async function runSetup(): Promise<void> {
   }
 
   header('Lodestar 安装向导')
-  console.log('Lodestar 把 Feishu (飞书) 群聊接到 Claude Code。')
-  console.log('每个群对应一个项目目录, Claude 在那里跑、能读写文件。')
+  console.log('Lodestar 把 Feishu (飞书) 群聊接到 Codex。')
+  console.log('每个群对应一个项目目录, Codex 在那里跑、能读写文件。')
   console.log()
   console.log('本向导依次做 4 件事:')
-  console.log(`  ${C.dim}1) 确保 claude CLI 已装好${C.reset}`)
-  console.log(`  ${C.dim}2) 选 LLM 后端 (订阅 / API key / DeepSeek)${C.reset}`)
+  console.log(`  ${C.dim}1) 确保 Codex CLI 已装好${C.reset}`)
+  console.log(`  ${C.dim}2) 确认 ChatGPT 登录${C.reset}`)
   console.log(`  ${C.dim}3) Feishu 自建应用 (含权限 / 事件 / 发版 + 凭据测试)${C.reset}`)
   console.log(`  ${C.dim}4) 工作目录, 自动启动 daemon${C.reset}`)
   console.log()
   await rl.question(`${C.dim}按 Enter 开始 (Ctrl+C 退出)...${C.reset}`)
 
   // ── Step 1/4 ──────────────────────────────────────────────────
-  step(1, 4, '准备 Claude Code')
-  let claudeBin = whichBin('claude')
-  if (claudeBin) {
-    console.log(`${C.green}✓ claude CLI 已就位${C.reset}: ${C.dim}${claudeBin}${C.reset}`)
+  step(1, 4, '准备 Codex CLI')
+  let codexBin = whichBin('codex')
+  if (codexBin) {
+    console.log(`${C.green}✓ codex CLI 已就位${C.reset}: ${C.dim}${codexBin}${C.reset}`)
   } else {
-    console.log(`${C.yellow}未在 PATH 找到 claude CLI, 自动安装...${C.reset}`)
-    console.log(`${C.dim}运行: npm install -g @anthropic-ai/claude-code${C.reset}`)
+    console.log(`${C.yellow}未在 PATH 找到 codex CLI, 自动安装...${C.reset}`)
+    console.log(`${C.dim}运行: npm install -g @openai/codex@latest${C.reset}`)
     console.log()
-    const ok = await installClaudeCli()
+    const ok = await installCodexCli()
     if (!ok) {
       console.error(`\n${C.red}安装失败。${C.reset}`)
       console.error('请手动运行后再开向导:')
-      console.error(`  ${C.cyan}npm install -g @anthropic-ai/claude-code${C.reset}`)
+      console.error(`  ${C.cyan}npm install -g @openai/codex@latest${C.reset}`)
       console.error(`  ${C.cyan}lodestar-setup${C.reset}`)
       rl.close()
       process.exit(1)
     }
-    claudeBin = whichBin('claude')
-    console.log(`${C.green}✓ 安装完成${C.reset}: ${C.dim}${claudeBin ?? '(应该装好了, 但 PATH 找不到 — 重开终端再试)'}${C.reset}`)
+    codexBin = whichBin('codex')
+    console.log(`${C.green}✓ 安装完成${C.reset}: ${C.dim}${codexBin ?? '(应该装好了, 但 PATH 找不到 — 重开终端再试)'}${C.reset}`)
   }
 
   // ── Step 2/4 ──────────────────────────────────────────────────
-  step(2, 4, 'LLM 后端')
-  console.log('claude CLI 默认走 Anthropic 官方, 需要 claude.ai 订阅或 API key。')
-  console.log('国内访问 anthropic.com 不一定通, 也可以让 claude 走 DeepSeek 后端。')
+  step(2, 4, 'ChatGPT 登录')
+  console.log('Lodestar 使用 Codex 的 ChatGPT 登录态。请确保 `codex login status` 显示 ChatGPT 登录。')
   console.log()
-
-  const backend = await chooseOne('你的 claude 怎么走?', [
-    { label: '已经配过 (订阅 / API key / 已设环境变量), 直接用', value: 'existing' },
-    { label: `${C.bold}用 DeepSeek${C.reset}${C.dim} (国内可用, 人民币计费, 推荐)${C.reset}`, value: 'deepseek' },
-  ])
-
-  if (backend === 'deepseek') {
-    console.log()
-    console.log('打开浏览器拿 DeepSeek API key:')
-    const dsKeyUrl = 'https://platform.deepseek.com/api_keys'
-    console.log(`  ${C.cyan}${dsKeyUrl}${C.reset}`)
-    openBrowser(dsKeyUrl)
-    console.log(`${C.dim}(如果浏览器没自动开, 复制上面 URL 粘到浏览器)${C.reset}`)
-    console.log()
-    const dsKey = await ask('DeepSeek API key (以 sk- 开头)', { required: true })
-
-    // 完全按 DeepSeek 官方 claude_code 集成文档:
-    // https://api-docs.deepseek.com/zh-cn/quick_start/agent_integrations/claude_code
-    const deepseekEnv: Record<string, string> = {
-      ANTHROPIC_BASE_URL:             'https://api.deepseek.com/anthropic',
-      ANTHROPIC_AUTH_TOKEN:           dsKey,
-      ANTHROPIC_MODEL:                'deepseek-v4-pro',
-      ANTHROPIC_DEFAULT_OPUS_MODEL:   'deepseek-v4-pro',
-      ANTHROPIC_DEFAULT_SONNET_MODEL: 'deepseek-v4-pro',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL:  'deepseek-v4-flash',
-      CLAUDE_CODE_SUBAGENT_MODEL:     'deepseek-v4-flash',
-      CLAUDE_CODE_EFFORT_LEVEL:       'max',
-    }
-    // 写进 claude 自己的配置文件 ~/.claude/settings.json 的 env 字段 —— 这是
-    // Claude Code 原生、文档明示"应用于每个 session 和所有子进程"的后端切换
-    // 机制,比 lodestar 运行时注入进程 env 更持久、更标准:用户在终端直接跑
-    // claude 也走 DeepSeek,不只 lodestar spawn 的那个。merge 而非覆盖,保住
-    // 用户既有的 env / hooks / 其它字段。
-    console.log()
-    const r = mergeClaudeSettingsEnv(deepseekEnv)
-    if (r.ok) {
-      console.log(`${C.green}✓ DeepSeek 配置已写入 Claude 配置文件${C.reset}`)
-      console.log(`  ${C.cyan}${r.path}${C.reset} ${C.dim}("env" 字段, claude 启动自读)${C.reset}`)
-    } else {
-      console.log(`${C.red}✗ 写入 ${r.path} 失败: ${r.error}${C.reset}`)
-      console.log(`${C.yellow}请手动把下面这些键加到该文件的 "env" 对象里:${C.reset}`)
-      for (const [k, v] of Object.entries(deepseekEnv)) {
-        console.log(`  ${C.dim}"${k}": "${k === 'ANTHROPIC_AUTH_TOKEN' ? '<你的 DeepSeek key>' : v}"${C.reset}`)
-      }
-    }
+  if (codexBin && isCodexChatGPTLoggedIn(codexBin)) {
+    console.log(`${C.green}✓ Codex 已登录 ChatGPT${C.reset}`)
   } else {
-    console.log(`${C.dim}OK, 跳过 LLM 后端配置 — daemon 启动时会继承当前环境 + claude 自带 auth。${C.reset}`)
+    console.log(`${C.yellow}Codex 尚未登录 ChatGPT。现在启动 \`codex login\`。${C.reset}`)
+    const ok = codexBin ? await runCodexLogin(codexBin) : false
+    if (!ok || !codexBin || !isCodexChatGPTLoggedIn(codexBin)) {
+      console.error(`\n${C.red}Codex ChatGPT 登录未完成。${C.reset}`)
+      console.error(`请手动运行 ${C.cyan}codex login${C.reset} 后再开向导。`)
+      rl.close()
+      process.exit(1)
+    }
+    console.log(`${C.green}✓ Codex 已登录 ChatGPT${C.reset}`)
   }
 
   // ── Step 3/4 ──────────────────────────────────────────────────
@@ -368,7 +304,7 @@ export async function runSetup(): Promise<void> {
       console.log(`${C.green}✓ Feishu 凭据测试通过${C.reset}`)
       break
     }
-    console.log(`${C.red}✗ 测试失败:${C.reset} ${test.error}`)
+    console.log(`${C.red}✗ 测试失败:${C.reset} ${(test as { ok: false; error: string }).error}`)
     console.log(`${C.dim}最常见原因: app_id / app_secret 抄错, 或应用还没 "发布上线" (步骤 ⑤)。${C.reset}`)
     console.log()
     const retry = await ask('重新填? (Y/n)', { default: 'y' })
@@ -402,10 +338,8 @@ export async function runSetup(): Promise<void> {
     `projects_root = "${escapeTomlString(projectsRoot)}"`,
     '',
   ]
-  // DeepSeek / 第三方后端不再写进 config.toml —— 它已写进 claude 自己的
-  // ~/.claude/settings.json(见 step 2)。config.toml 只留 feishu + runtime。
-  // (config.ts 仍解析 [claude.env]、claude-process 仍注入,作向后兼容 /
-  //  高级用户手动配私有 env 的通道,只是向导默认不再往这里写。)
+  // Codex 登录态由 `codex login` 管理。config.toml 只保存 Feishu 和
+  // Lodestar runtime 配置；高级用户可手写 [codex.env] 注入子进程环境。
   writeFileSync(CONFIG_FILE, toml.join('\n'), { mode: 0o600 })
 
   console.log(`\n${C.green}${C.bold}✓ 配置已写入${C.reset}`)
@@ -425,7 +359,7 @@ export async function runSetup(): Promise<void> {
     console.log(`${C.bold}最后一步: 在 Feishu 验证${C.reset}`)
     console.log(`  ① 把机器人拉进任意飞书群`)
     console.log(`  ② 群名 = ${C.cyan}${projectsRoot}${sep}<群名>${C.reset} 下的目录名 (新群第一条消息会自动建)`)
-    console.log(`  ③ 在群里发任意一条消息, Claude 上线`)
+    console.log(`  ③ 在群里发任意一条消息, Codex 上线`)
     console.log()
     console.log(`日志:`)
     console.log(`  ${C.cyan}${logPath}${C.reset}`)

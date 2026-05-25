@@ -2,11 +2,11 @@
  * Daemon-managed scheduled tasks.
  *
  * Each schedule names a project (= group name = session name), a prompt
- * to feed Claude, a render mode, and either a cron expression (recurring)
+ * to feed Codex, a render mode, and either a cron expression (recurring)
  * or a one-shot fireAt timestamp. The scheduler ticks every minute,
  * fires anything whose `nextFireAt` has passed, and spawns an isolated
- * `ClaudeProcess` per fire — fresh sessionId (no --resume), cwd at the
- * project's working directory, `bypassPermissions` mode so the
+ * `CodexProcess` per fire — fresh thread (no resume), cwd at the
+ * project's working directory, with Codex FullAccess policy so the
  * automation isn't blocked waiting for an audience that doesn't exist.
  *
  * Render modes:
@@ -31,7 +31,7 @@ import { randomBytes } from 'node:crypto'
 import { log } from './log'
 import { SCHEDULES_FILE } from './paths'
 import * as feishu from './feishu'
-import { ClaudeProcess } from './claude-process'
+import { CodexProcess } from './codex-process'
 import { scheduledSummaryCard, type CollectedTool } from './cards/scheduled-summary'
 import { notifyCardForScheduled } from './notify'
 
@@ -299,7 +299,7 @@ async function tick(): Promise<void> {
   if (due.length === 0) return
   // Fire each due schedule; one-shot (fireAt) gets deleted, recurring (cron)
   // gets nextFireAt advanced. Fires run concurrently — each gets its own
-  // ClaudeProcess; they don't share state.
+  // CodexProcess; they don't share state.
   for (const s of due) {
     if (s.cron) {
       try {
@@ -333,7 +333,7 @@ async function fireSchedule(s: Schedule): Promise<void> {
   }
   log(`schedule: fire id=${s.id} project=${s.project} mode=${s.mode}`)
 
-  const proc = new ClaudeProcess({
+  const proc = new CodexProcess({
     workDir,
     permissionMode: 'bypassPermissions',
   })
@@ -349,15 +349,8 @@ async function fireSchedule(s: Schedule): Promise<void> {
     if (currentSeg) { assistantSegs.push(currentSeg); currentSeg = '' }
   }
 
-  // NOTE: claude headless emits `system/init` only AFTER the first user
-  // message arrives on stdin (verified empirically — stream-json without
-  // a user_message produces only hook_started/hook_response/control_response,
-  // no system/init). So we do NOT gate sendUserText on the 'init' event
-  // (that's a deadlock — init needs user msg, user msg needs init). The
-  // SDK processes stdin in order: control_request:initialize, then the
-  // user message, then runs the turn and emits the result. We just need
-  // to write both right after spawn and let stream-json sequencing do
-  // its job.
+  // CodexProcess queues sendUserText behind app-server initialization,
+  // so schedules can issue initialize + prompt back-to-back.
   proc.on('assistant_text', ({ text }: { text: string }) => {
     currentSeg += text
   })
@@ -372,6 +365,9 @@ async function fireSchedule(s: Schedule): Promise<void> {
     if (!t) return
     t.output = typeof content === 'string' ? content : JSON.stringify(content)
     t.isError = !!is_error
+  })
+  proc.on('error', err => {
+    log(`schedule: fire id=${s.id} codex error: ${err}`)
   })
 
   const resultPromise = new Promise<void>((resolve) => {
@@ -423,7 +419,7 @@ async function fireSchedule(s: Schedule): Promise<void> {
       log(`schedule: fire id=${s.id} verbose card sent msg=${msgId ?? 'FAILED'}`)
     } else {
       // silent (B mode) — notify-style card with just the final assistant text.
-      // Empty finalText (e.g. claude only used tools and end_turn'd silently)
+      // Empty finalText (e.g. Codex only used tools and ended silently)
       // surfaces as `_（无文字输出）_` instead of an empty body.
       const card = notifyCardForScheduled({
         title: `⏰ ${s.name}`,

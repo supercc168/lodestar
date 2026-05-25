@@ -7,7 +7,7 @@
  */
 
 import type { Session } from './session'
-import type { CanUseToolRequest } from './claude-process'
+import type { CanUseToolRequest } from './codex-process'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
@@ -42,8 +42,8 @@ export async function onPermissionDecision(
     }
   }
 
-  const claudeDecision = decision === 'deny' ? 'deny' : 'allow'
-  s.proc?.sendPermissionResponse(requestId, claudeDecision)
+  const codexDecision = decision === 'deny' ? 'deny' : 'allow'
+  s.proc?.sendPermissionResponse(requestId, codexDecision)
 
   if (decision === 'allow_always') {
     s.proc?.sendSetPermissionMode('acceptEdits')
@@ -116,7 +116,7 @@ export function renderPermission(s: Session, req: CanUseToolRequest): void {
   s.pendingPermissions.set(req.request_id, { toolUseId })
   const el = cards.toolCallPermissionElement(meta.i, meta.name, meta.input, req.request_id)
   void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
-  // Phone push — Claude is blocked until the user approves/denies.
+  // Phone push — Codex is blocked until the user approves/denies.
   // Set summary to "🔐 等审批: <tool>(<input summary>)" so the lock-
   // screen notification shows which tool needs approval.
   if (turn.userOpenId && turn.messageId) {

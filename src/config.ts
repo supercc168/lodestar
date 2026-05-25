@@ -33,11 +33,9 @@ export interface LodestarConfig {
     bind: string
     port: number
   }
-  /** Env vars injected into the spawned `claude` CLI subprocess.
-   * Lets the setup wizard wire up DeepSeek / GLM / any anthropic-
-   * compatible backend without making the user touch system env vars.
-   * Empty record = no injection, claude runs under its own login. */
-  claude: {
+  /** Env vars injected into the spawned `codex app-server` subprocess.
+   * Empty record = no injection; Codex uses the user's ChatGPT login. */
+  codex: {
     env: Record<string, string>
   }
 }
@@ -83,7 +81,7 @@ function loadConfig(): LodestarConfig {
   } catch (e) {
     process.stderr.write(
       `lodestar: cannot read config at ${CONFIG_FILE}\n` +
-      `  → 运行 \`lodestar-setup\` 走交互式向导生成 (Feishu / LLM / 工作目录)\n` +
+      `  → 运行 \`lodestar-setup\` 走交互式向导生成 (Feishu / Codex / 工作目录)\n` +
       `  → 或手写: 设 LODESTAR_CONFIG=/path/to/config.toml 覆盖默认路径\n` +
       `    [feishu]\n    app_id = "cli_xxx"\n    app_secret = "xxx"\n\n`,
     )
@@ -102,19 +100,18 @@ function loadConfig(): LodestarConfig {
   if (!Number.isFinite(notifyPort) || notifyPort <= 0 || notifyPort > 65535) {
     throw new Error(`lodestar: [notify].port must be 1..65535, got "${notifyPortRaw}"`)
   }
-  // [claude.env] 节可选 —— 空 record 就维持现状 (用户自己 claude login
-  // 或从外部设过 ANTHROPIC_* env)。有内容就在 spawn claude 子进程时把
-  // 这些键全部注入到子进程 env 里, 优先级覆盖 process.env。
-  const claudeEnvSection = t['claude.env'] ?? {}
-  const claudeEnv: Record<string, string> = {}
-  for (const [k, v] of Object.entries(claudeEnvSection)) {
-    if (typeof v === 'string' && v.length > 0) claudeEnv[k] = v
+  // [codex.env] 节可选 —— 空 record 就维持现状 (用户自己 `codex login`)。
+  // 兼容读取旧 [claude.env]，但不再由 setup 写入。
+  const codexEnvSection = t['codex.env'] ?? t['claude.env'] ?? {}
+  const codexEnv: Record<string, string> = {}
+  for (const [k, v] of Object.entries(codexEnvSection)) {
+    if (typeof v === 'string' && v.length > 0) codexEnv[k] = v
   }
   return {
     feishu: { app_id: appId, app_secret: appSecret },
     runtime: { projects_root: projectsRoot },
     notify: { bind: notifyBind, port: notifyPort },
-    claude: { env: claudeEnv },
+    codex: { env: codexEnv },
   }
 }
 

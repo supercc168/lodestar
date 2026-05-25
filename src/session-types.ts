@@ -1,6 +1,6 @@
 /**
  * Shared types split out of session.ts so the main file stays under
- * Claude Code's per-read token budget (~25K). Pure type-only — no
+ * agent per-read token budgets. Pure type-only — no
  * runtime imports here. Companion modules: session-tools.ts,
  * session-ask.ts, session-permission.ts.
  */
@@ -63,10 +63,8 @@ export interface TurnState {
    * 时随机选的、整 turn 固定不变)。首条 assistant_text 或 tool_use
    * 到达即 deleteElement(ticker),让卡片顶部干净。
    *
-   * 跟"thinking 文本"无关 —— Anthropic 把 opus-4-7 的 extended thinking
-   * 整段 redacted,客户端只拿到加密 signature 没明文,所以飞书卡片
-   * 中段不会显示任何 thinking 文本,ticker 就是模型工作过程中唯一
-   * 可见的活体信号。 */
+   * 跟"thinking 文本"无关。app-server 不保证中间 reasoning 文本可见,
+   * ticker 是模型工作过程中唯一稳定的活体信号。 */
   tickerHandle: ReturnType<typeof setInterval> | null
   /** Mid-turn card-rotation lock. Set when we've fire-and-forget kicked
    * off `startMidTurnRotate` to open a fresh card — either proactively
@@ -111,7 +109,7 @@ export interface LastTurnDelta {
 /** Cumulative session counters. Reset on full restart (`clear`),
  * preserved across `restart`/resume and daemon-restart so the `hi`
  * panel reflects the user's total spend in this conversation
- * regardless of how many times the underlying ClaudeProcess has been
+ * regardless of how many times the underlying CodexProcess has been
  * respawned. Resumed conversations start counting from the resume
  * point onward — the SDK doesn't replay historical usage on resume,
  * so a long pre-resume conversation shows up as zero here until the

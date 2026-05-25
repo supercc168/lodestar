@@ -1,11 +1,10 @@
 /**
  * Lightweight host snapshot for the `hi` console panel —— CPU 负载、
- * 内存、根/家目录磁盘、以及当前用户下的 cc-* 系列 systemd 服务。
+ * 内存、根/家目录磁盘、以及当前用户下的 codex-* 系列 systemd 服务。
  *
- * 服务前缀约定: claude code 自己起的常驻进程统一走
- *   systemd-run --user --unit=cc-<project>-<purpose> -- <cmd>
- * (见全局 CLAUDE.md 的 background_process_safety 段)。`hi` 面板只列
- * `cc-*` 是要让 daemon 这台机器上的"AI 拉起来的活儿"一眼可见,跟
+ * 服务前缀约定: Codex 自己起的常驻进程统一走
+ *   systemd-run --user --unit=codex-<project>-<purpose> -- <cmd>
+ * `hi` 面板只列 `codex-*` 是要让 daemon 这台机器上的"AI 拉起来的活儿"一眼可见,跟
  * 系统自带 / 第三方服务区分开。
  *
  * 所有数据源都是本机文件 / 系统调用,没有网络往返:
@@ -13,7 +12,7 @@
  *   /proc/meminfo          —— Total / Available
  *   statfsSync(path)       —— 各挂载点容量
  *   /proc/uptime           —— monotonic seconds since boot (uptime 推算)
- *   systemctl --user show  —— cc-* 服务的状态与启动时间
+ *   systemctl --user show  —— codex-* 服务的状态与启动时间
  *
  * 失败可见: 任何一段读不到就把对应字段标 null,卡片层按 null 渲染
  * `_n/a_`,绝不假数据 (no_fallbacks)。
@@ -78,12 +77,12 @@ export interface SysInfo {
   mem: MemInfo | null
   disks: DiskInfo[]
   services: ServiceInfo[]
-  /** 真的查不到时(systemctl 不存在 / 拒绝)就 null;空数组表示"没有 cc-* 服务"。 */
+  /** 真的查不到时(systemctl 不存在 / 拒绝)就 null;空数组表示"没有 codex-* 服务"。 */
   servicesError: string | null
 }
 
-/** 用户态 systemd-run 服务的统一前缀。改这里要同步改 CLAUDE.md。 */
-export const SERVICE_PREFIX = 'cc-'
+/** 用户态 systemd-run 服务的统一前缀。 */
+export const SERVICE_PREFIX = 'codex-'
 
 function readCpu(): CpuInfo | null {
   try {

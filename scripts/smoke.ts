@@ -2,7 +2,7 @@
 /**
  * Lodestar 2.0 smoke test.
  *
- * Drives the full Session pipeline (claude headless + cardkit streaming
+ * Drives the full Session pipeline (Codex app-server + cardkit streaming
  * card) against a real Feishu group, without standing up the WSClient.
  *
  * Usage:
@@ -12,7 +12,7 @@
  *
  * Sends a `[SMOKE]` preface message in the group so you can correlate
  * the run with what you see, then drives Session.onUserMessage directly
- * with the same prompt. All cardkit / claude-process activity logs to
+ * with the same prompt. All cardkit / codex-process activity logs to
  * stderr and to <data_dir>/daemon.log.
  */
 

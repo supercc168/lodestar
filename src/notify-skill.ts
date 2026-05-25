@@ -1,14 +1,13 @@
 /**
- * Auto-install the `feishu-notify` skill so the user's main Claude
- * Code (the one they type into at the terminal) can push to any
+ * Auto-install the `feishu-notify` skill so the user's main Codex
+ * session (the one they type into at the terminal) can push to any
  * bound group via `/notify` without the user manually placing the
  * skill file.
  *
  * Why daemon writes this file:
  *
- * Skills, unlike MCP, can't be injected via CLI args (`--mcp-config`
- * has no `--skill` equivalent). They're discovered from
- * `~/.claude/skills/<name>/SKILL.md` at startup. So the only way to
+ * Skills are discovered from `~/.codex/skills/<name>/SKILL.md` at startup.
+ * So the only way to
  * "ship with the daemon" without making the user run `cp` is to have
  * the daemon write the file itself.
  *
@@ -95,7 +94,7 @@ export function ensureFeishuNotifySkill(): void {
     log('skill: sync disabled via LODESTAR_DISABLE_SKILL_SYNC, skip')
     return
   }
-  const skillFile = join(homedir(), '.claude', 'skills', SKILL_FRONTMATTER_NAME, 'SKILL.md')
+  const skillFile = join(homedir(), '.codex', 'skills', SKILL_FRONTMATTER_NAME, 'SKILL.md')
   const desired = skillBody(config.notify.port)
   try {
     const current = existsSync(skillFile) ? readFileSync(skillFile, 'utf8') : null

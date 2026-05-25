@@ -8,9 +8,9 @@
 
 import { ELEMENTS } from './elements'
 
-/** Minimal projection of an SDK task — used by Session's local mirror,
+/** Minimal projection of a Codex task — used by Session's local mirror,
  * built incrementally from observed TaskCreate / TaskUpdate input+output
- * pairs. Not authoritative (the SDK is the source of truth), but enough
+ * pairs. Not authoritative (Codex is the source of truth), but enough
  * to render the "全部任务清单" footer on every Task* panel. */
 export interface Todo {
   id: number
@@ -107,7 +107,7 @@ function summarizeTaskWorkflow(name: string, input: any): string {
 
 /** Markdown body for Task* workflow tools — replaces the generic JSON
  * dump with a human-readable description of the operation plus, once the
- * tool result is in, the SDK's text reply (which already contains "Task
+ * tool result is in, Codex's text reply (which already contains "Task
  * #N created" / "Updated task #X" / a rendered list for TaskList). When
  * `todos` is non-empty, the full mirror is appended as a "📋 当前任务
  * 清单" footer so every Task* panel doubles as a current-state readout. */
@@ -158,22 +158,22 @@ interface MainCardOpts {
   /** What started this turn:
    *   'user_message' — user input batch(panel "📥 收到 (N)" 渲染原文)
    *   'scheduled'    — cron / ScheduleWakeup 自发开 turn(banner `⏰ 触发`)
-   *   'auto_retry'   — SDK error subtype 后 daemon 自动 sendUserText('继续')
-   *                   触发的续 turn(banner `🔁 SDK 错误自动续`,无 panel)
+   *   'auto_retry'   — Codex error subtype 后 daemon 自动 sendUserText('继续')
+   *                   触发的续 turn(banner `🔁 Codex 错误自动续`,无 panel)
    *   'no_followup_retry' — turn 结束时最后一项是已答完的 AskUserQuestion,
-   *                   但模型没继续推理就 end_turn(SDK bug 兜底),
+   *                   但模型没继续推理就 end_turn(Codex 漏续兜底),
    *                   daemon sendUserText('继续') 触发的续 turn
    *                   (banner `🔁 答完没下文,自动续`,无 panel)
    *   'tool_error_retry' — turn 结束时最后一项是 tool_result(is_error),
-   *                   模型没解释 / 没重试直接 end_turn(SDK bug 兜底),
+   *                   模型没解释 / 没重试直接 end_turn(Codex 漏续兜底),
    *                   daemon sendUserText('继续') 触发的续 turn
    *                   (banner `🛠️ 工具出错异常终止,自动续`,无 panel)
-   *   'card_full'    — 同一 SDK turn 的"续卡":前一张卡写满(element 数
+   *   'card_full'    — 同一 Codex turn 的"续卡":前一张卡写满(element 数
    *                   触顶 ~75)或写入被飞书拒,session rotate 出来的新卡
    *                   (banner `📨 接续上一张`,无 panel,turn 号跟旧卡
    *                   相同) */
   kind?: 'user_message' | 'scheduled' | 'auto_retry' | 'no_followup_retry' | 'tool_error_retry' | 'card_full'
-  /** 本轮 SDK 收到的 user wireText 列表。boot turn 通常是 1 条;mid-turn
+  /** 本轮 Codex 收到的 user wireText 列表。boot turn 通常是 1 条;mid-turn
    * 用户连发的 N 条会在下一 turn 一并塞进。空数组 / undefined 时不渲染
    * userInput panel(scheduled / cron-fired turn 没 user input)。 */
   userInputs?: string[]
@@ -194,13 +194,13 @@ export function mainConversationCard(opts: MainCardOpts): object {
   const banner = opts.kind === 'scheduled'
     ? [{ tag: 'markdown', content: `⏰ 触发 · ${fireStampNow()}` }]
     : opts.kind === 'auto_retry'
-    ? [{ tag: 'markdown', content: '🔁 SDK 错误自动续' }]
+    ? [{ tag: 'markdown', content: '🔁 Codex 错误自动续' }]
     : opts.kind === 'no_followup_retry'
     ? [{ tag: 'markdown', content: '🔁 答完没下文,自动续' }]
     : opts.kind === 'tool_error_retry'
     ? [{ tag: 'markdown', content: '🛠️ 工具出错异常终止,自动续' }]
     : opts.kind === 'card_full'
-    ? [{ tag: 'markdown', content: '📨 接续上一张(同一轮 SDK turn,前一张卡写满或写入受限)' }]
+    ? [{ tag: 'markdown', content: '📨 接续上一张(同一轮 Codex turn,前一张卡写满或写入受限)' }]
     : []
   const inputs = opts.userInputs ?? []
   const userInputPanel = inputs.length > 0
@@ -231,7 +231,7 @@ export function mainConversationCard(opts: MainCardOpts): object {
     body: {
       // Initial body: [scheduled banner?] + [userInput panel?] + ticker
       // (活体指示) + footer。assistant segments 和 tool panels insert_before
-      // footer 在 Claude streaming 时实时插入。
+      // footer 在 Codex streaming 时实时插入。
       // 空字符串会被 CardKit PUT 拒,所以两个占位都用单空格;首条真写入
       // 自动覆盖。footer 留单空格而不是 `⏳ working…` —— 顶部 ticker 已经
       // 在"模型还在干活"这件事上做活体指示了,底部再喊一遍冗余且突兀。
@@ -478,7 +478,7 @@ function renderAskHistoryPanel(
   }
 }
 
-/** Tool-panel renderer for `AskUserQuestion` — the SDK's structured
+/** Tool-panel renderer for `AskUserQuestion` — Codex's structured
  * multiple-choice question. Daemon takes over the client-side role:
  * instead of letting the request fall through to the generic JSON
  * dump (or worse, the permission flow that misappropriates it), we

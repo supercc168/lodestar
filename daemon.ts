@@ -1,5 +1,5 @@
 /**
- * Lodestar 2.0 daemon — Feishu (Lark) ↔ Claude Code headless bridge.
+ * Lodestar 2.0 daemon — Feishu (Lark) ↔ Codex app-server bridge.
  *
  * No source-file shebang on purpose:
  *   - `bun daemon.ts` and `systemctl --user start feishu-daemon` don't
@@ -11,7 +11,7 @@
  *
  * Listens on Lark WebSocket for inbound messages and card-action
  * callbacks, routes each to a per-chat Session that owns a headless
- * `claude` subprocess and a streaming Card Kit card.
+ * `codex app-server` subprocess and a streaming Card Kit card.
  *
  * Run:   bun daemon.ts
  * Stop:  SIGTERM
@@ -90,7 +90,7 @@ function sessionFor(chatId: string, sessionName: string): Session {
  * file ONLY lists sessions that were running, so anything the user
  * had explicitly `kill`-ed before shutdown is intentionally absent
  * and stays stopped. Each revived session is `restart(true)`-ed so
- * the SDK gets `--resume <claudeSessionId>` and the in-flight
+ * Codex resumes the saved thread id and the in-flight
  * conversation continues without the user typing anything. */
 async function reviveAliveSessions(): Promise<void> {
   const names = feishu.readAndConsumeAliveMarker()
@@ -114,12 +114,12 @@ async function reviveAliveSessions(): Promise<void> {
 
 // ── Feishu `post` (rich-text) → Markdown ────────────────────────────────
 // 飞书客户端发 markdown 时,内容会被编码成 message_type='post' 的二维数组
-// AST,不是 'text'。下面把它反向拼回 markdown 字符串(claude 那头消化
+// AST,不是 'text'。下面把它反向拼回 markdown 字符串(Codex 消化
 // markdown 比拍平纯文本更结构化),并把内嵌图片/文件 key 抽出来交给
 // `downloadAttachment` 走附件路径,跟原生 image/file 消息对齐。
 //
 // underline 故意不还原 —— markdown 无原生语法,而本项目用 <u>...</u> 标记
-// "多条独立消息",一旦塞进 text 会被 claude 当成消息边界误解。
+// "多条独立消息",一旦塞进 text 会被 Codex 当成消息边界误解。
 interface PostElement {
   tag: string
   text?: string
@@ -280,7 +280,7 @@ async function handleMessage(data: any): Promise<void> {
     text = (contentObj.text ?? '').trim()
   } else if (msgType === 'post') {
     // 飞书客户端 markdown 走 'post' 富文本通道,不是 'text'。反向拼回
-    // markdown 给 claude,内嵌图片/文件 key 走跟原生 image/file 一样的
+    // markdown 给 Codex,内嵌图片/文件 key 走跟原生 image/file 一样的
     // downloadAttachment 路径。
     const post = extractPostMarkdown(contentObj)
     text = post.markdown.trim()
@@ -295,10 +295,10 @@ async function handleMessage(data: any): Promise<void> {
   }
 
   // Text-only control commands — intercept before any work that would
-  // forward to Claude (download / spawn / interrupt). Exact match,
+  // forward to Codex (download / spawn / interrupt). Exact match,
   // case-insensitive: `hi` `kill` `restart` `clear`. Bare words are
   // reserved globally by user request — typing "hi" as a literal
-  // greeting will trigger the dashboard, not reach Claude. Post 富文本
+  // greeting will trigger the dashboard, not reach Codex. Post 富文本
   // 整段不可能正好等于这些 bare word,所以这里只对 text 触发。
   if (msgType === 'text' && text) {
     if (await session.runCommand(text)) return
@@ -371,9 +371,9 @@ async function handleCardAction(data: any): Promise<any> {
     case 'schedule_delete': {
       // hi 面板是全局 dashboard,跨群删除允许。button payload 只带 id,
       // daemon 端按 id 查到 → 直接删。MCP path 那边的 schedule_delete
-      // 仍然是 project-scoped(claude 在 A 群没法删 B 群的),两个路径
+      // 仍然是 project-scoped(Codex 在 A 群没法删 B 群的),两个路径
       // 信任模型不同:hi 是 operator-only(只有你飞书账号能按),MCP 是
-      // claude-on-prompts(prompt 注入风险)。
+      // Codex-on-prompts(prompt 注入风险)。
       const id = String(value.id ?? '')
       if (!id) return { toast: { type: 'error', content: '缺 id' } }
       const sched = getSchedule(id)
@@ -452,7 +452,7 @@ function startDebugSocket(): void {
         //   - msg_id 是真的 → 后续 addReaction / 其它 outbound 不再因
         //     `om_DEBUG_*` 合成 id 报 99992354 污染飞书侧错误日志。
         //   - daemon 看到的 content.text 是**原始 text**(不含前缀),
-        //     claude 那头不会被"【自动化测试】"标签干扰。
+        //     Codex 那头不会被"【自动化测试】"标签干扰。
         //   - bot 自己发的消息默认不通过 receive_v1 回环(飞书协议层防
         //     死循环),daemon 只通过这条 inject 路径看到一份消息,不会
         //     重复触发 handleMessage。
@@ -498,7 +498,7 @@ async function boot(): Promise<void> {
   // 'close' never fires — we'd go silently deaf. SDK exposes `pingTimeout`:
   // after sending a ping, if no inbound frame arrives within the window the
   // socket is terminated, which triggers the 'close' handler and the SDK's
-  // standard reconnect loop. The daemon process stays alive — every claude
+  // standard reconnect loop. The daemon process stays alive — every Codex
   // subprocess, ScheduleWakeup, card streaming state and setInterval is
   // preserved across the WS hiccup. We only let systemd restart us if the
   // SDK's own reconnect loop exhausts its retry budget (onError).
@@ -526,7 +526,7 @@ async function boot(): Promise<void> {
   // (底层还是同一个 tryConnect,可能拉回同样被服务端判死的状态)。每次重连
   // 后**整个换一个全新的 lark.WSClient(新 token、新连接),force-close 旧的**
   // —— 这复刻了"整进程重启之所以管用"的核心(gateway 只剩一条新连可认),
-  // 但全程不碰任何 claude 子进程、不退进程。lastEventAt 作为唯一可信的"事件
+  // 但全程不碰任何 Codex 子进程、不退进程。lastEventAt 作为唯一可信的"事件
   // 通道还活着"信号(不信 state);活跃群在 rebuild 后还聋就退避重建,封顶后
   // 只打日志、绝不 process.exit。
   let lastEventAt = Date.now()        // 收到任意真实事件就刷新 = 通道存活铁证
@@ -549,7 +549,7 @@ async function boot(): Promise<void> {
     'im.message.receive_v1': async (d: any) => {
       markEvent()
       // ⚠️ 不要 await handleMessage —— Lark WS 长连接对事件 ack 有 ~4s
-      // 硬超时,handleMessage 内部可能触发 openTurnCard / spawn claude /
+      // 硬超时,handleMessage 内部可能触发 openTurnCard / spawn Codex /
       // sendInterrupt 等数百 ms~数秒的链路,任一组合超 4s 飞书侧就判投递
       // 失败把事件直接丢弃(后台 event log 里这一类 errorInfo=timeout,
       // costMills≈3760ms,用户侧表现就是"发的消息 daemon 完全没收到")。
@@ -593,14 +593,14 @@ async function boot(): Promise<void> {
     // 换新 client(见 onReconnectedHeal)。
     onReconnected:  () => onReconnectedHeal(),
     // SDK exhausted its own reconnect budget. Do NOT exit the process — that
-    // SIGTERMs every claude subprocess / scheduler / live card across all
+    // SIGTERMs every Codex subprocess / scheduler / live card across all
     // groups. Rebuild a fresh WS client in place; the rest keeps running.
     onError: (err) => rebuildWs(`SDK onError: ${err?.message ?? err}`),
   })
 
   // Fresh-client rebuild: force-close the (possibly server-side-zombie) old
   // client, stand up a brand-new WSClient with a fresh token + connection, and
-  // hand it the same dispatcher. Never touches claude subprocesses, schedulers,
+  // hand it the same dispatcher. Never touches Codex subprocesses, schedulers,
   // ScheduleWakeups or live cards; never exits the process. close({force}) does
   // removeAllListeners() before terminate(), so the old client fires no stray
   // reconnect. verifyAfter arms a post-rebuild check (only for active groups).
@@ -683,8 +683,8 @@ async function boot(): Promise<void> {
   startDebugSocket()
   startNotifyServer({ bind: config.notify.bind, port: config.notify.port })
 
-  // Sync the feishu-notify skill into ~/.claude/skills (idempotent).
-  // Lets the user's main Claude session push to bound groups via
+  // Sync the feishu-notify skill into ~/.codex/skills (idempotent).
+  // Lets the user's main Codex session push to bound groups via
   // /notify without manually placing the skill file. Runs after
   // notify server is up so the port number we bake into the skill
   // body matches what's actually listening.
@@ -693,7 +693,7 @@ async function boot(): Promise<void> {
   // Bring up the scheduler — loads persisted schedules.json, starts
   // the per-minute tick, fires anything that came due while the
   // daemon was down. Independent of the sessions Map (each fire
-  // spawns a fresh isolated ClaudeProcess via MCP), so order vs.
+  // spawns a fresh isolated CodexProcess via MCP), so order vs.
   // reviveAliveSessions does not matter for correctness.
   startScheduler()
 

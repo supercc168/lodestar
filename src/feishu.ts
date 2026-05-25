@@ -1,7 +1,7 @@
 /**
  * Feishu (Lark) primitives: Lark client, tenant token cache, chat
  * directory, sendText/sendCard, reactions, attachment download, project
- * provisioning, and Anthropic-auth check.
+ * provisioning, and Codex ChatGPT-auth check.
  *
  * Higher layers (cardkit / session / daemon) build on this.
  */
@@ -14,7 +14,7 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
 import { config } from './config'
-import { resolveClaudeBin } from './claude-process'
+import { resolveCodexBin } from './codex-process'
 import { ALIVE_MARKER_FILE, DATA_DIR, INBOX_DIR, SESSION_CHAT_MAP_FILE, SESSION_RESUME_MAP_FILE } from './paths'
 import { log } from './log'
 
@@ -74,10 +74,10 @@ export function bindSessionToChat(sessionName: string, chatId: string): void {
 }
 
 // ── Session resume map ────────────────────────────────────────────────
-// `sessionName → last-known claude session_id`. Persisted so a daemon
+// `sessionName → last-known Codex thread_id`. Persisted so a daemon
 // restart (systemctl, crash, watchdog) doesn't strand the user with a
 // fresh conversation when they next type `restart`. Updated on every
-// `system/init` from a claude subprocess.
+// `thread/start` from a Codex app-server subprocess.
 const lastSessionIdByName = new Map<string, string>()
 
 export function loadSessionResumeMap(): void {
@@ -505,58 +505,31 @@ export async function uploadAndSend(chatId: string, filePath: string): Promise<b
 }
 
 // ── Project provisioning ──────────────────────────────────────────────
-// Bootstrap ~/{name}: create dir, mark as trusted in ~/.claude.json so
-// Claude skips the trust dialog, and `git init` so the project starts as
+// Bootstrap ~/{name}: create dir, mark as trusted in ~/.codex/config.toml so
+// Codex skips the project trust dialog, and `git init` so the project starts as
 // a real repo.
 export function provisionProject(workDir: string): void {
   mkdirSync(workDir, { recursive: true })
   log(`feishu: provisioned ${workDir}`)
-  const claudeJsonPath = join(homedir(), '.claude.json')
+  const codexConfigPath = join(homedir(), '.codex', 'config.toml')
   try {
-    let config: any = {}
-    try { config = JSON.parse(readFileSync(claudeJsonPath, 'utf8')) } catch { config = {} }
-    if (!config.projects || typeof config.projects !== 'object') config.projects = {}
-    config.projects[workDir] = { ...(config.projects[workDir] ?? {}), hasTrustDialogAccepted: true }
-    writeFileSync(claudeJsonPath, JSON.stringify(config, null, 2))
-  } catch (e) { log(`feishu: trust write failed for ${workDir}: ${e}`) }
+    mkdirSync(join(homedir(), '.codex'), { recursive: true })
+    let text = ''
+    try { text = readFileSync(codexConfigPath, 'utf8') } catch {}
+    const header = `[projects.${JSON.stringify(workDir)}]`
+    if (!text.includes(header)) {
+      const prefix = text.trimEnd()
+      text = `${prefix}${prefix ? '\n\n' : ''}${header}\ntrust_level = "trusted"\n`
+      writeFileSync(codexConfigPath, text)
+    }
+  } catch (e) { log(`feishu: codex trust write failed for ${workDir}: ${e}`) }
   try { execSync('git init -q', { cwd: workDir, stdio: 'ignore' }) } catch {}
 }
 
-/** True when claude will hit a non-firstParty backend (DeepSeek / GLM / any
- * anthropic-compatible proxy) and therefore needs no `claude auth login`.
- * Such backends auth with ANTHROPIC_AUTH_TOKEN / ANTHROPIC_API_KEY against a
- * custom ANTHROPIC_BASE_URL, so the firstParty probe is the wrong question —
- * Session.start() short-circuits on this so a configured DeepSeek user never
- * hits the bogus "未登录 Anthropic 账号" wall. Checks all three places those
- * vars can reach the spawned claude from:
- *   ① ~/.claude/settings.json `env` — claude's own config, where the setup
- *      wizard now writes DeepSeek (claude reads it natively, terminal too);
- *   ② config.toml [claude.env]    — spawn-time injection (back-compat);
- *   ③ this daemon's own process env — user `export`ed it, child inherits. */
-export function hasCustomClaudeBackend(): boolean {
-  const keys = ['ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_API_KEY', 'ANTHROPIC_BASE_URL'] as const
-  const cfgEnv = config.claude.env
-  if (keys.some(k => cfgEnv[k])) return true
-  if (keys.some(k => process.env[k])) return true
+export function isOpenAIChatGPTAuthenticated(): boolean {
   try {
-    const settings = JSON.parse(readFileSync(join(homedir(), '.claude', 'settings.json'), 'utf8'))
-    const env = settings?.env
-    if (env && typeof env === 'object' && keys.some(k => env[k])) return true
-  } catch {}
-  return false
-}
-
-export function isAnthropicAuthenticated(): boolean {
-  try {
-    // resolveClaudeBin() rather than a hard-wired ~/.local/bin/claude: an
-    // end-user `npm i -g @anthropic-ai/claude-code` drops the binary under
-    // the npm-global bin (NOT ~/.local/bin), where the old hard path
-    // ENOENT'd → caught → reported "not logged in" even for a properly
-    // logged-in firstParty user. Quote the path so a homedir with spaces
-    // survives the shell.
-    const out = execSync(`"${resolveClaudeBin()}" auth status 2>&1`, { timeout: 10_000 }).toString()
-    const status = JSON.parse(out)
-    return status.loggedIn === true && status.apiProvider === 'firstParty'
+    const out = execSync(`"${resolveCodexBin()}" login status 2>&1`, { timeout: 10_000 }).toString()
+    return /Logged in using ChatGPT/i.test(out)
   } catch { return false }
 }
 

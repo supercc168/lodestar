@@ -12,7 +12,7 @@
  *   daemon.pid              — single-instance lock          (in DATA_DIR)
  *   daemon.log              — append-only run log           (in DATA_DIR)
  *   session-chat-map.json   — duplicate-name routing        (in DATA_DIR)
- *   session-resume-map.json — last-known claude session_id  (in DATA_DIR)
+ *   session-resume-map.json — last-known Codex thread_id  (in DATA_DIR)
  *   inbox/                  — downloaded attachments        (in DATA_DIR)
  */
 
@@ -69,7 +69,7 @@ export const SCHEDULES_FILE = join(DATA_DIR, 'schedules.json')
 /** Marker file written at shutdown listing the session names that
  * were still alive. The next daemon boot reads it (and unlinks it)
  * to auto-revive those sessions via `restart(true)` — bridges the
- * gap between systemctl-restart killing every child Claude and
+ * gap between systemctl-restart killing every child Codex process and
  * Lodestar's "you have to send a message to re-spawn it" default. */
 export const ALIVE_MARKER_FILE = join(DATA_DIR, 'alive-on-shutdown.json')
 export const INBOX_DIR = join(DATA_DIR, 'inbox')

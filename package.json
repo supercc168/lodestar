@@ -4,7 +4,7 @@
   "publishConfig": {
     "access": "public"
   },
-  "description": "Lodestar (夜航星) — IM-native frontend for Claude Code via Feishu Card Kit streaming",
+  "description": "Lodestar (夜航星) — IM-native frontend for Codex via Feishu Card Kit streaming",
   "type": "module",
   "license": "MIT",
   "author": "leviyuan",
@@ -17,8 +17,8 @@
   "keywords": [
     "feishu",
     "lark",
-    "claude-code",
-    "claude",
+    "codex",
+    "openai",
     "ai",
     "agent",
     "im",

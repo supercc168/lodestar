@@ -13,17 +13,6 @@
  * Prints which combo lets PUT element/content succeed.
  */
 
-import { readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
-
-const TOML = readFileSync(join(homedir(), '.deepseek', 'lodestar.toml'), 'utf8')
-function tomlGet(section: string, key: string): string | undefined {
-  return new RegExp(`\\[${section}\\][\\s\\S]*?\\b${key}\\s*=\\s*["']?([^"'\\n]+)["']?`).exec(TOML)?.[1]?.trim()
-}
-process.env.FEISHU_APP_ID = tomlGet('feishu', 'app_id')!
-process.env.FEISHU_APP_SECRET = tomlGet('feishu', 'app_secret')!
-
 const feishu = await import('../src/feishu')
 await feishu.refreshChatList()
 
@@ -131,3 +120,5 @@ for (const c of candidates) {
   })
   console.log(`  ${c.name.padEnd(36)} eid=${c.eid.padEnd(10)} → code=${r.code} ${r.msg ?? ''}`)
 }
+
+export {}

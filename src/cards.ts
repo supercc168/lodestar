@@ -1,7 +1,7 @@
 /**
  * Schema 2.0 Feishu card templates — barrel re-export. Each call site
  * uses `import * as cards from './cards'` and reaches everything through
- * this file. Internal split so each module stays under Claude Code's
+ * this file. Internal split so each module stays under practical
  * per-read token budget:
  *   - cards/elements.ts — ELEMENTS (shared element-id helpers)
  *   - cards/turn.ts     — main turn card, tool panels, ask panels, todos

@@ -17,7 +17,7 @@
  * `via ⏰ schedule` footer — and limited to the surrounding chrome.
  */
 
-import type { ClaudeResultMeta } from '../claude-process'
+import type { CodexResultMeta } from '../codex-process'
 import type { ScheduleLevel } from '../schedule'
 import * as cards from '../cards'
 
@@ -36,7 +36,7 @@ interface ScheduledSummaryOpts {
   assistantSegs: string[]
   tools: CollectedTool[]
   elapsedMs: number
-  meta: ClaudeResultMeta
+  meta: CodexResultMeta
   crashed: boolean
   level: ScheduleLevel
 }
@@ -53,7 +53,7 @@ function fmtElapsed(ms: number): string {
   return `${m}m${s}s`
 }
 
-function fmtTokens(meta: ClaudeResultMeta): string {
+function fmtTokens(meta: CodexResultMeta): string {
   const u = meta.usage
   if (!u) return ''
   const inT = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0)
