@@ -15,7 +15,14 @@ import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
 import { config } from './config'
 import { resolveCodexBin } from './codex-process'
-import { ALIVE_MARKER_FILE, DATA_DIR, INBOX_DIR, SESSION_CHAT_MAP_FILE, SESSION_RESUME_MAP_FILE } from './paths'
+import {
+  ALIVE_MARKER_FILE,
+  DATA_DIR,
+  INBOX_DIR,
+  SESSION_CHAT_MAP_FILE,
+  SESSION_CONTEXT_BASELINE_FILE,
+  SESSION_RESUME_MAP_FILE,
+} from './paths'
 import { log } from './log'
 
 const APP_ID = config.feishu.app_id
@@ -107,6 +114,53 @@ export function bindSessionResume(sessionName: string, sessionId: string): void 
 
 export function getSessionResume(sessionName: string): string | null {
   return lastSessionIdByName.get(sessionName) ?? null
+}
+
+// ── Context-window baseline map ───────────────────────────────────────
+// Codex's `inputTokens` includes a large fixed system/tool prompt. Store
+// the first observed model-call input size per thread so UI percentages
+// show growth after that initial footprint instead of the fixed floor.
+export interface SessionContextBaseline {
+  threadId: string
+  baselineTokens: number
+}
+
+const contextBaselineByName = new Map<string, SessionContextBaseline>()
+
+export function loadSessionContextBaselineMap(): void {
+  try {
+    const obj = JSON.parse(readFileSync(SESSION_CONTEXT_BASELINE_FILE, 'utf8'))
+    for (const [name, value] of Object.entries(obj)) {
+      if (!value || typeof value !== 'object') continue
+      const v = value as Record<string, unknown>
+      if (typeof v.threadId === 'string' && typeof v.baselineTokens === 'number' && v.baselineTokens > 0) {
+        contextBaselineByName.set(name, { threadId: v.threadId, baselineTokens: v.baselineTokens })
+      }
+    }
+    log(`feishu: loaded ${contextBaselineByName.size} session context baselines`)
+  } catch {}
+}
+
+function saveSessionContextBaselineMap(): void {
+  try {
+    const obj: Record<string, SessionContextBaseline> = {}
+    for (const [k, v] of contextBaselineByName) obj[k] = v
+    mkdirSync(DATA_DIR, { recursive: true })
+    writeFileSync(SESSION_CONTEXT_BASELINE_FILE, JSON.stringify(obj, null, 2))
+  } catch (e) { log(`feishu: save session-context-baselines failed: ${e}`) }
+}
+
+export function bindSessionContextBaseline(sessionName: string, threadId: string, baselineTokens: number): void {
+  const prev = contextBaselineByName.get(sessionName)
+  if (prev?.threadId === threadId && prev.baselineTokens === baselineTokens) return
+  contextBaselineByName.set(sessionName, { threadId, baselineTokens })
+  saveSessionContextBaselineMap()
+}
+
+export function getSessionContextBaseline(sessionName: string, threadId: string): SessionContextBaseline | null {
+  const baseline = contextBaselineByName.get(sessionName)
+  if (!baseline || baseline.threadId !== threadId) return null
+  return baseline
 }
 
 // ── Alive-on-shutdown marker ──────────────────────────────────────────

@@ -249,6 +249,14 @@ export class CodexProcess extends EventEmitter {
         }
         const ctx = params.tokenUsage?.modelContextWindow
         if (typeof ctx === 'number' && ctx > 0) this.lastContextWindow = ctx
+        if (this.lastUsage) {
+          this.emit('token_usage', {
+            usage: this.lastUsage,
+            contextWindow: this.lastContextWindow,
+            threadId: params.threadId,
+            turnId: params.turnId,
+          })
+        }
         return
       }
       case 'turn/started': {

@@ -13,6 +13,8 @@
  *   daemon.log              — append-only run log           (in DATA_DIR)
  *   session-chat-map.json   — duplicate-name routing        (in DATA_DIR)
  *   session-resume-map.json — last-known Codex thread_id  (in DATA_DIR)
+ *   session-context-baselines.json — first observed context baseline
+ *                                    by session/thread (in DATA_DIR)
  *   inbox/                  — downloaded attachments        (in DATA_DIR)
  */
 
@@ -61,6 +63,7 @@ export const PID_FILE = join(DATA_DIR, 'daemon.pid')
 export const LOG_FILE = join(DATA_DIR, 'daemon.log')
 export const SESSION_CHAT_MAP_FILE = join(DATA_DIR, 'session-chat-map.json')
 export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
+export const SESSION_CONTEXT_BASELINE_FILE = join(DATA_DIR, 'session-context-baselines.json')
 /** Persisted schedule list — managed by src/schedule.ts. Each entry
  * is `{ id, project, prompt, mode, level, cron?, fireAt?, ... }`;
  * see Schedule type for the full shape. Loaded at daemon boot, written

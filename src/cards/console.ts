@@ -28,13 +28,13 @@ interface ConsoleOpts {
   }>
   /** Subscription usage snapshot from Codex app-server. Undefined → omit row. */
   usage?: UsageSnapshot
-  /** Current context-window occupancy estimate from Codex's last model
-   * request inputTokens. cachedInputTokens is a subset breakdown of that
-   * value, not extra context. 0 if no turn has completed yet. */
+  /** Effective context-window occupancy after subtracting the first
+   * observed prompt baseline. cachedInputTokens is already included in
+   * raw inputTokens, not extra context. 0 if no turn has completed yet. */
   contextTokens?: number
-  /** Window upper bound. `null` / undefined → unknown (e.g. spawn happened
-   * but no `result` has landed yet); renderer omits the `/ limit (pct%)`
-   * suffix instead of fabricating a default. */
+  /** Model-card window upper bound after subtracting the same baseline.
+   * `null` / undefined → unknown model; renderer omits the suffix instead
+   * of fabricating a default. */
   contextLimit?: number | null
   cumStats?: { tokens: number; costUsd: number; turns: number }
   lastTurn?: { tokens: number; costUsd: number; durationMs: number }
@@ -336,17 +336,15 @@ export function consoleCard(opts: ConsoleOpts): object {
       lines.push(`　· ${dot} \`${p.name}\`${up}${mark}`)
     }
   }
-  if (contextTokens != null && contextTokens > 0) {
-    // Show `/ limit (pct%)` only when we actually know the window —
-    // `contextLimit` is populated from the SDK's modelUsage on first
-    // `result`. Pre-result panels (fresh spawn / kill+hi / clear+hi)
-    // render token count alone rather than fabricating a 1M or 200K
-    // default that may not match the running model.
+  if (contextTokens != null && (contextTokens > 0 || (contextLimit != null && contextLimit > 0))) {
+    // Show `/ limit (pct%)` only when the model's documented window is
+    // known. Unknown models render the token count alone instead of
+    // reusing Codex app-server's ambiguous modelContextWindow.
     if (contextLimit != null && contextLimit > 0) {
       const pct = Math.round((contextTokens / contextLimit) * 100)
       lines.push(`**📦 上下文**　${fmtTokens(contextTokens)} / ${fmtTokens(contextLimit)}　(${pct}%)`)
     } else {
-      lines.push(`**📦 上下文**　${fmtTokens(contextTokens)}　_窗口待 result 上报_`)
+      lines.push(`**📦 上下文**　${fmtTokens(contextTokens)}　_模型窗口未知_`)
     }
   }
   void uptimeMs // session-level uptime is already shown per-project in

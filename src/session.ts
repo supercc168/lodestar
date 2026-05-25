@@ -72,6 +72,15 @@ const CARD_ELEMENT_SOFT_LIMIT = 50
  * endless trail of empty cards into the chat. */
 const MAX_MIDTURN_ROTATES = 5
 
+function modelContextLimit(model: string | null | undefined): number | null {
+  if (!model) return null
+  const normalized = model.toLowerCase()
+  if (normalized.startsWith('gpt-5.5')) return 1_050_000
+  if (normalized.startsWith('gpt-5.4')) return 1_050_000
+  if (normalized === 'gpt-5-codex' || normalized.startsWith('gpt-5-codex-')) return 400_000
+  return null
+}
+
 export class Session {
   /** Process-wide registry of every Session ever constructed in this daemon.
    * Used by the `hi` console panel to enumerate sibling sessions across
@@ -212,6 +221,9 @@ export class Session {
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
   private lastTurnDelta: LastTurnDelta | null = null
+  private contextBaselineTokens: number | null = null
+  private contextBaselineThreadId: string | null = null
+  private canInitializeContextBaseline = false
 
   constructor(
     public readonly sessionName: string,
@@ -225,6 +237,12 @@ export class Session {
     this.lastSessionId = feishu.getSessionResume(sessionName)
     if (this.lastSessionId) {
       log(`session "${sessionName}": restored lastSessionId=${this.lastSessionId.slice(0, 8)}…`)
+      const baseline = feishu.getSessionContextBaseline(sessionName, this.lastSessionId)
+      if (baseline) {
+        this.contextBaselineTokens = baseline.baselineTokens
+        this.contextBaselineThreadId = baseline.threadId
+        log(`session "${sessionName}": restored context baseline=${baseline.baselineTokens} for thread=${baseline.threadId.slice(0, 8)}…`)
+      }
     }
   }
 
@@ -261,6 +279,9 @@ export class Session {
       }
     }
 
+    this.contextBaselineTokens = null
+    this.contextBaselineThreadId = null
+    this.canInitializeContextBaseline = true
     this.status = 'starting'
     this.proc = new CodexProcess({
       workDir: this.workDir,
@@ -396,6 +417,10 @@ export class Session {
     this.pendingAsks.clear()
     this.pendingPermissions.clear()
     if (resume && prevSessionId) {
+      const baseline = feishu.getSessionContextBaseline(this.sessionName, prevSessionId)
+      this.contextBaselineTokens = baseline?.baselineTokens ?? null
+      this.contextBaselineThreadId = baseline?.threadId ?? null
+      this.canInitializeContextBaseline = false
       this.status = 'starting'
       this.proc = new CodexProcess({
         workDir: this.workDir,
@@ -437,6 +462,9 @@ export class Session {
       // zeroed counters instead of bleeding numbers from the prior chat.
       this.cumStats = { tokens: 0, costUsd: 0, turns: 0 }
       this.lastTurnDelta = null
+      this.contextBaselineTokens = null
+      this.contextBaselineThreadId = null
+      this.canInitializeContextBaseline = true
       return await this.start()
     }
   }
@@ -566,7 +594,7 @@ export class Session {
         .map(s => ({ ...s.peerSnapshot(), isCurrent: s === this })),
       usage,
       contextTokens: this.currentContextTokens(),
-      contextLimit: this.contextWindowMax(),
+      contextLimit: this.contextLimitForDisplay(),
       cumStats: this.cumStats,
       lastTurn: this.lastTurnDelta
         ? {
@@ -885,6 +913,9 @@ export class Session {
     p.on('tool_result', ({ tool_use_id, content, is_error }: any) => {
       sessionTools.completeTool(this, tool_use_id, content, is_error)
     })
+    p.on('token_usage', ({ usage }: { usage: CodexUsage }) => {
+      this.captureContextBaseline(usage.input_tokens ?? 0)
+    })
     p.on('can_use_tool', (req: CanUseToolRequest) => {
       sessionPermission.renderPermission(this, req)
     })
@@ -979,29 +1010,51 @@ export class Session {
     this.lastTurnDelta = { tokens, costUsd, durationMs }
   }
 
-  /** Current context-window occupancy estimate — uses Codex's most
-   * recent model-call `inputTokens`, i.e. the prompt size sent to the
-   * model. `cachedInputTokens` is a subset of `inputTokens` (cache-hit
-   * breakdown), so adding it double-counts cached context and makes long
-   * threads look much fuller than they are. Returns 0 when no per-call
-   * usage is available (process dead, or fresh spawn before first model
-   * call). */
+  private captureContextBaseline(inputTokens: number): void {
+    if (!this.canInitializeContextBaseline || inputTokens <= 0) return
+    const threadId = this.proc?.sessionId
+    if (!threadId) return
+    this.contextBaselineTokens = inputTokens
+    this.contextBaselineThreadId = threadId
+    this.canInitializeContextBaseline = false
+    feishu.bindSessionContextBaseline(this.sessionName, threadId, inputTokens)
+    log(`session "${this.sessionName}": context baseline=${inputTokens} for thread=${threadId.slice(0, 8)}…`)
+  }
+
+  private contextBaselineForCurrentThread(): number | null {
+    const threadId = this.proc?.sessionId
+    if (!threadId || this.contextBaselineThreadId !== threadId) return null
+    return this.contextBaselineTokens
+  }
+
+  /** Effective context-window occupancy estimate. Codex's model-call
+   * `inputTokens` includes a large fixed system/tool prompt; after the
+   * first tokenUsage event of a fresh thread, subtract that baseline so
+   * the UI tracks growth against the usable remaining window.
+   * `cachedInputTokens` is a subset of `inputTokens`, not extra context.
+   * Returns 0 when no per-call usage is available. */
   private currentContextTokens(): number {
     const u = this.proc?.lastUsage as CodexUsage | null | undefined
     if (!u) return 0
-    return u.input_tokens ?? 0
+    const inputTokens = u.input_tokens ?? 0
+    const baseline = this.contextBaselineForCurrentThread()
+    return baseline == null ? inputTokens : Math.max(0, inputTokens - baseline)
   }
 
-  /** Context-window capacity for the model the subprocess is currently
-   * running — sourced authoritatively from `result.modelUsage[model]
-   * .contextWindow` captured by CodexProcess on each turn close, so
-   * the daemon doesn't have to enumerate model ids itself (was the
-   * source of a "560K/200K" display bug — model id didn't include
-   * `[1m]` so the hardcoded fallback won). Returns `null` when no turn
-   * has closed yet (fresh spawn / kill / clear / revive); callers must
-   * render percentages only when this is a real number. */
-  private contextWindowMax(): number | null {
-    return this.proc?.lastContextWindow ?? null
+  /** Display denominator for context percentage. Use known model-card
+   * context windows instead of Codex app-server's modelContextWindow; the
+   * latter is not documented clearly enough for a user-facing percentage. */
+  private contextLimitForDisplay(): number | null {
+    const rawLimit = modelContextLimit(this.proc?.lastModel)
+    if (rawLimit == null) return null
+    const baseline = this.contextBaselineForCurrentThread()
+    if (baseline == null) return rawLimit
+    const effectiveLimit = rawLimit - baseline
+    if (effectiveLimit <= 0) {
+      log(`session "${this.sessionName}": invalid context baseline=${baseline} rawLimit=${rawLimit}`)
+      return null
+    }
+    return effectiveLimit
   }
 
   /** Drain `pendingMidTurnMsgs` to the SDK and open a fresh card for the
@@ -1506,8 +1559,8 @@ export class Session {
     let metrics = ''
     if (!suffix) {
       const ctxTokens = this.currentContextTokens()
-      const ctxMax = this.contextWindowMax()
-      if (ctxTokens > 0 && ctxMax !== null && ctxMax > 0) {
+      const ctxMax = this.contextLimitForDisplay()
+      if (ctxMax !== null && ctxMax > 0) {
         const pct = Math.round((ctxTokens / ctxMax) * 100)
         metrics += ` · 📊 ${pct}%`
       }
