@@ -28,8 +28,9 @@ interface ConsoleOpts {
   }>
   /** Subscription usage snapshot from Codex app-server. Undefined → omit row. */
   usage?: UsageSnapshot
-  /** Current context-window occupancy estimate (input + cache tokens of
-   * the last assistant message). 0 if no turn has completed yet. */
+  /** Current context-window occupancy estimate from Codex's last model
+   * request inputTokens. cachedInputTokens is a subset breakdown of that
+   * value, not extra context. 0 if no turn has completed yet. */
   contextTokens?: number
   /** Window upper bound. `null` / undefined → unknown (e.g. spawn happened
    * but no `result` has landed yet); renderer omits the `/ limit (pct%)`

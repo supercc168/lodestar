@@ -1131,17 +1131,17 @@ export class Session {
     this.lastTurnDelta = { tokens, costUsd, durationMs }
   }
 
-  /** Current context-window occupancy estimate — uses the most recent
-   * assistant `usage` (input + caches), since each assistant reply replays
-   * the full conversation. Returns 0 when no per-call usage is available
-   * (process dead, or fresh spawn before first assistant message).
-   * 用 proc.lastUsage(最后一条 assistant 的单次 usage)而不是把一轮里 N 次
-   * API 调用的 input 累加 —— 后者(cache_read 跨步累加)会让占比虚高 Nx
-   * (2026-05-16 现场 bug:重一点的多步 turn 后 hi 面板飙到 417%)。 */
+  /** Current context-window occupancy estimate — uses Codex's most
+   * recent model-call `inputTokens`, i.e. the prompt size sent to the
+   * model. `cachedInputTokens` is a subset of `inputTokens` (cache-hit
+   * breakdown), so adding it double-counts cached context and makes long
+   * threads look much fuller than they are. Returns 0 when no per-call
+   * usage is available (process dead, or fresh spawn before first model
+   * call). */
   private currentContextTokens(): number {
     const u = this.proc?.lastUsage as CodexUsage | null | undefined
     if (!u) return 0
-    return (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0)
+    return u.input_tokens ?? 0
   }
 
   /** Context-window capacity for the model the subprocess is currently

@@ -56,7 +56,9 @@ function fmtElapsed(ms: number): string {
 function fmtTokens(meta: CodexResultMeta): string {
   const u = meta.usage
   if (!u) return ''
-  const inT = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0)
+  // cachedInputTokens is already included in inputTokens; it is a cache-hit
+  // breakdown, not additional prompt size.
+  const inT = u.input_tokens ?? 0
   const outT = u.output_tokens ?? 0
   if (inT === 0 && outT === 0) return ''
   const fmtN = (n: number) => n >= 1000 ? `${(n / 1000).toFixed(1)}K` : String(n)
