@@ -67,6 +67,10 @@ Card Kit card per turn.
 - Always create the matching GitHub Release for the tag. `gh` is not
   installed here; use GitHub REST with the token from `~/.git-credentials`
   and build JSON bodies with `jq -n --rawfile body /tmp/notes.md ...`.
+- Before writing release notes, read recent GitHub Releases and match the
+  existing style. Current notes are Chinese, use short sections such as
+  `## 修复` / `## 改进`, and end with
+  `**Full Changelog**: https://github.com/leviyuan/lodestar/compare/vA...vB`.
 - Restart the running user service only when requested; inspect the actual
   unit first with `systemctl --user list-units --all`.
 
