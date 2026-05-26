@@ -30,8 +30,16 @@ function todoStatusIcon(s: string): string {
   }
 }
 
-function isBashTool(name: string): boolean {
+function isBashCommandTool(name: string): boolean {
   return name === 'Bash' || name === 'exec_command' || name.endsWith('.exec_command')
+}
+
+function isShellSessionTool(name: string): boolean {
+  return name === 'write_stdin' || name.endsWith('.write_stdin')
+}
+
+function isBashTool(name: string): boolean {
+  return isBashCommandTool(name) || isShellSessionTool(name)
 }
 
 function displayToolName(name: string): string {
@@ -65,7 +73,8 @@ export function summarizeToolInput(name: string, input: any): string {
   if (name.startsWith('Task') && name !== 'Task') {
     return truncate(summarizeTaskWorkflow(name, input), 80)
   }
-  if (isBashTool(name)) return summarizeBashInput(input)
+  if (isBashCommandTool(name)) return summarizeBashInput(input)
+  if (isShellSessionTool(name)) return summarizeShellSessionInput(input)
   switch (name) {
     case 'Read':
     case 'Write':
@@ -103,6 +112,19 @@ function summarizeBashInput(input: any): string {
     !/^cat\s+<<['"]?\w+['"]?/.test(line)
   ) ?? lines[0]
   return `Shell 脚本 · ${lines.length} 行 · ${truncate(firstMeaningful, 46)}`
+}
+
+function shellSessionAction(input: any): string {
+  const chars = typeof input?.chars === 'string' ? input.chars : ''
+  if (chars === '') return '读取会话输出'
+  if (chars === '\u0003') return '中断会话'
+  return '发送输入'
+}
+
+function summarizeShellSessionInput(input: any): string {
+  const session = input?.session_id ?? input?.sessionId
+  const suffix = session === undefined ? '' : ` ${session}`
+  return `${shellSessionAction(input)}${suffix}`
 }
 
 function bashPresentation(input: any): { description: string; command: string } {
@@ -160,6 +182,30 @@ function renderBashBody(input: any, output: string | null, resolvedNote?: string
   if (lines.length > 0) lines.push('')
   lines.push('**命令**')
   lines.push(fenceBlock(command || '(空命令)', 'bash'))
+  if (resolvedNote) {
+    lines.push('')
+    lines.push(resolvedNote)
+  }
+  if (output != null) {
+    lines.push('')
+    lines.push('---')
+    lines.push('**output:**')
+    lines.push(fenceBlock(output.slice(0, 3000)))
+  }
+  return lines.join('\n')
+}
+
+function renderShellSessionBody(input: any, output: string | null, resolvedNote?: string): string {
+  const lines: string[] = []
+  const session = input?.session_id ?? input?.sessionId
+  lines.push(`**操作**: ${shellSessionAction(input)}`)
+  if (session !== undefined) lines.push(`**session**: ${inlineCode(session)}`)
+  if (typeof input?.chars === 'string' && input.chars.length > 0) {
+    const shown = input.chars === '\u0003' ? '^C' : input.chars
+    lines.push('')
+    lines.push('**输入**')
+    lines.push(fenceBlock(shown))
+  }
   if (resolvedNote) {
     lines.push('')
     lines.push(resolvedNote)
@@ -363,11 +409,13 @@ export function toolCallElement(
   // matter.
   const body = isTaskWorkflow
     ? renderTaskWorkflowBody(name, input, output, todos) + noteBlock
-    : isBashTool(name)
+    : isBashCommandTool(name)
       ? renderBashBody(input, output, resolvedNote)
-      : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
-        + noteBlock
-        + (output != null ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```' : '')
+      : isShellSessionTool(name)
+        ? renderShellSessionBody(input, output, resolvedNote)
+        : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
+          + noteBlock
+          + (output != null ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```' : '')
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),
@@ -426,9 +474,11 @@ export function toolCallPermissionElement(
   const headerText = summary
     ? `🔐 等审批 · ${toolName}: ${summary}`
     : `🔐 等审批 · ${toolName}`
-  const inputBlock = isBashTool(name)
+  const inputBlock = isBashCommandTool(name)
     ? renderBashBody(input, null)
-    : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
+    : isShellSessionTool(name)
+      ? renderShellSessionBody(input, null)
+      : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),

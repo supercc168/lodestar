@@ -29,4 +29,32 @@ describe('bash-like tool card rendering', () => {
     expect(el.elements[0].content).toContain('git remote -v')
     expect(el.elements[0].content).not.toContain('# desc:')
   })
+
+  test('renders write_stdin shell session polling as Bash', () => {
+    const input = {
+      session_id: 97146,
+      chars: '',
+      yield_time_ms: 1000,
+      max_output_tokens: 12000,
+    }
+
+    expect(summarizeToolInput('write_stdin', input)).toBe('读取会话输出 97146')
+
+    const el = toolCallElement(2, 'write_stdin', input, 'poll output', '✅') as any
+    expect(el.header.title.content).toBe('✅ 🔧 Bash: 读取会话输出 97146')
+    expect(el.elements[0].content).toContain('**操作**: 读取会话输出')
+    expect(el.elements[0].content).toContain('**session**: `97146`')
+    expect(el.elements[0].content).not.toContain('"session_id"')
+  })
+
+  test('renders write_stdin interrupt as Bash input', () => {
+    const input = {
+      session_id: 97146,
+      chars: '\u0003',
+    }
+
+    const el = toolCallElement(3, 'functions.write_stdin', input, 'stopped', '✅') as any
+    expect(el.header.title.content).toBe('✅ 🔧 Bash: 中断会话 97146')
+    expect(el.elements[0].content).toContain('^C')
+  })
 })
