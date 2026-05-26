@@ -499,7 +499,7 @@ export class CodexProcess extends EventEmitter {
       ...(this.opts.appendSystemPrompt ? { developerInstructions: this.opts.appendSystemPrompt } : {}),
       config: {
         mcp_servers: {
-          lodestar: {
+          lodestar_schedule: {
             type: 'streamable_http',
             url: `http://127.0.0.1:${config.notify.port}/mcp/${encodeURIComponent(project)}`,
           },

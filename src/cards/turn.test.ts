@@ -175,7 +175,7 @@ describe('web search card rendering', () => {
 describe('other tool card rendering', () => {
   test('renders MCP calls with server, tool, arguments, and text result', () => {
     const input = {
-      server: 'lodestar',
+      server: 'lodestar_schedule',
       tool: 'schedule_list',
       arguments: { project: 'feishu' },
     }
@@ -184,13 +184,13 @@ describe('other tool card rendering', () => {
       structuredContent: { count: 0 },
     }, null, 2)
 
-    expect(summarizeToolInput('MCP', input)).toBe('lodestar.schedule_list: feishu')
+    expect(summarizeToolInput('MCP', input)).toBe('lodestar_schedule.schedule_list: feishu')
 
     const el = toolCallElement(6, 'MCP', input, output, '✅') as any
     const body = el.elements[0].content
 
-    expect(el.header.title.content).toBe('✅ 🔧 MCP: lodestar.schedule_list: feishu')
-    expect(body).toContain('**server**: `lodestar`')
+    expect(el.header.title.content).toBe('✅ 🔧 MCP: lodestar_schedule.schedule_list: feishu')
+    expect(body).toContain('**server**: `lodestar_schedule`')
     expect(body).toContain('**tool**: `schedule_list`')
     expect(body).toContain('"project": "feishu"')
     expect(body).toContain('No schedules configured.')

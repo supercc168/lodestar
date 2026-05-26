@@ -1,7 +1,20 @@
 /**
- * Lodestar MCP server — daemon-hosted, project-scoped.
+ * Lodestar schedule MCP server — daemon-hosted, project-scoped.
  *
- * Exposes 4 scheduling tools to whichever Codex thread connects:
+ * Exposes 4 scheduling tools to whichever Codex thread connects. These are
+ * intentionally narrow: create/list/delete daemon-owned future Codex runs for
+ * this project. The MCP server name is `lodestar_schedule`.
+ *
+ * Scheduled runs execute like a normal Lodestar/Codex turn in the same project
+ * directory: Codex starts a fresh thread with cwd set to the project folder,
+ * reads the same AGENTS.md instructions, has the same installed skills, and
+ * receives the same MCP server injection. The only thing not carried over is
+ * the current chat history, so scheduled prompts must be self-contained.
+ *
+ * These tools are not a general job runner and should only be used when the
+ * user explicitly asks for a reminder, recurring run, delayed check, or
+ * schedule management.
+ *
  *   schedule_create  — recurring cron-based schedule
  *   schedule_once    — one-shot delayed schedule
  *   schedule_list    — list this project's schedules
@@ -35,7 +48,7 @@ import {
 } from './schedule'
 
 const PROTOCOL_VERSION = '2025-06-18'
-const SERVER_INFO = { name: 'lodestar', version: '0.4.2' }
+const SERVER_INFO = { name: 'lodestar_schedule', version: '0.4.3' }
 
 // ── JSON-RPC envelope helpers ────────────────────────────────────────
 interface JsonRpcRequest {
@@ -68,33 +81,34 @@ function rpcSuccess(id: number | string | null, result: any): JsonRpcSuccess {
 }
 
 // ── Tool definitions ────────────────────────────────────────────────
-// JSON Schema for each tool's input. Descriptions are user-facing —
-// Codex reads them at tools/list time and decides when to call.
+// JSON Schema for each tool's input. Descriptions are model-facing: Codex reads
+// them at tools/list time and uses them as the operating contract for when and
+// how to call each scheduling tool.
 
 const SCHEDULE_CREATE_SCHEMA = {
   type: 'object',
   properties: {
     cron: {
       type: 'string',
-      description: '5-field cron expression: "m h dom mon dow". Examples: "0 9 * * *" (every day 9am), "*/15 * * * *" (every 15 min), "0 3 * * 1" (every Monday 3am). Local timezone.',
+      description: 'Required. Five-field cron expression in the daemon local timezone: "minute hour day-of-month month day-of-week". No seconds, year, or named months/weekdays. Examples: "0 9 * * *" daily at 09:00, "*/15 * * * *" every 15 minutes, "0 3 * * 1" Mondays at 03:00.',
     },
     prompt: {
       type: 'string',
-      description: 'The exact text Codex will see as the first user message when this schedule fires. Each fire spawns a fresh Codex thread (no resumed session, no prior conversation context) — write the prompt as if Codex is seeing this group for the first time.',
+      description: 'Required. Self-contained first user message for each future run. Scheduled runs execute with the same project environment as this Codex session: same cwd/project folder, same AGENTS.md instructions, same installed skills, and same MCP servers including lodestar_schedule. They start a fresh Codex thread with no chat history, so include all instructions, paths, expected output, and notification wording needed to complete the job. For recurring checks, tell Codex to inspect .lodestar/schedule-runs.jsonl when previous run status matters.',
     },
     mode: {
       type: 'string',
       enum: ['silent', 'verbose'],
-      description: '"silent" (default): only the final assistant text is posted as a single notification card. "verbose": full transcript card (prompt, assistant segments, every tool call with input+output, result meta). Use silent for routine reports; verbose when you want to occasionally inspect what the schedule is actually doing.',
+      description: 'Output detail. Use "silent" for routine reminders or reports: only the final assistant text is posted. Use "verbose" when the human needs audit details: prompt, assistant segments, tool calls with input/output, and result metadata. Defaults to "silent".',
     },
     level: {
       type: 'string',
       enum: ['info', 'warn', 'error'],
-      description: 'Card template color. "info" (default, blue), "warn" (yellow), "error" (red). Pure visual hint to the human reader.',
+      description: 'Visual severity for the Feishu card only: "info" blue, "warn" yellow, "error" red. This does not change execution behavior. Defaults to "info".',
     },
     name: {
       type: 'string',
-      description: 'Human-readable label shown in the card header (`⏰ <name>`) and `schedule_list`. Defaults to the first 8 hex chars of the id if omitted.',
+      description: 'Optional short human-readable label shown in schedule cards and schedule_list. Use a stable name that explains the job, such as "daily-report" or "check-build". Defaults to the schedule id prefix.',
     },
   },
   required: ['cron', 'prompt'],
@@ -105,15 +119,16 @@ const SCHEDULE_ONCE_SCHEMA = {
   properties: {
     delaySeconds: {
       type: 'number',
-      description: 'Seconds from now until firing. Must be ≥ 0. For "remind me in 10 minutes" use 600.',
+      minimum: 0,
+      description: 'Required finite number of seconds from now until the one-shot run fires. Must be >= 0. For "remind me in 10 minutes" use 600.',
     },
     prompt: {
       type: 'string',
-      description: 'See schedule_create.prompt — same fresh-process semantics.',
+      description: 'Required. Same as schedule_create.prompt: a self-contained first user message for the future run. The run has the same cwd, AGENTS.md, skills, and MCP servers as this project, but starts a fresh Codex thread with no chat history.',
     },
-    mode:  { type: 'string', enum: ['silent', 'verbose'], description: 'See schedule_create.mode' },
-    level: { type: 'string', enum: ['info', 'warn', 'error'], description: 'See schedule_create.level' },
-    name:  { type: 'string', description: 'See schedule_create.name' },
+    mode:  { type: 'string', enum: ['silent', 'verbose'], description: 'Optional output detail. See schedule_create.mode. Defaults to "silent".' },
+    level: { type: 'string', enum: ['info', 'warn', 'error'], description: 'Optional visual severity. See schedule_create.level. Defaults to "info".' },
+    name:  { type: 'string', description: 'Optional short human-readable label. See schedule_create.name.' },
   },
   required: ['delaySeconds', 'prompt'],
 }
@@ -134,22 +149,22 @@ const SCHEDULE_DELETE_SCHEMA = {
 const TOOLS = [
   {
     name: 'schedule_create',
-    description: 'Create a recurring scheduled task for this project. The schedule fires on a cron expression and spawns a fresh Codex thread each time (cwd = the project directory, no resumed session, no accumulated context). Use this when you want: (1) the schedule to survive process restarts via daemon persistence, (2) each fire to start from a clean slate rather than accumulating context across runs, (3) the schedule to be visible to humans via the dashboard. Returns the created Schedule with its id.',
+    description: 'Create a recurring scheduled Codex run for this project. Use only when the user explicitly asks for a recurring schedule, cron job, daily/weekly/hourly report, repeated check, or other future repeated automation. Each fire is daemon-persistent and runs Codex in the same project folder with the same AGENTS.md instructions, installed skills, and MCP servers as a normal Lodestar turn. It starts a fresh thread and does not resume the current conversation, so the prompt must be self-contained. The daemon appends execution records to .lodestar/schedule-runs.jsonl; for inspection-style recurring jobs, include instructions to read that log before deciding what to do. Returns the created schedule, including its id and nextFireAt.',
     inputSchema: SCHEDULE_CREATE_SCHEMA,
   },
   {
     name: 'schedule_once',
-    description: 'Create a one-shot delayed task. Same fresh-process semantics as schedule_create, but fires once after `delaySeconds` and is then deleted. Use this for "remind me later", "check status in 10 minutes", or anywhere ScheduleWakeup would fit but you want the same persistence/freshness guarantees.',
+    description: 'Create a one-shot delayed Codex run for this project. Use only when the user explicitly asks to be reminded later, check something after a delay, or run a task once in the future. It fires once after delaySeconds, runs Codex in the same project folder with the same AGENTS.md instructions, installed skills, and MCP servers as a normal Lodestar turn, then deletes itself. The prompt must be self-contained because no current chat history is carried into the future run. The daemon appends the result to .lodestar/schedule-runs.jsonl for later inspection.',
     inputSchema: SCHEDULE_ONCE_SCHEMA,
   },
   {
     name: 'schedule_list',
-    description: "List all of this project's schedules. Returns id, name, cron|fireAt, mode, level, prompt, nextFireAt (ms unix), lastFiredAt (ms unix or absent).",
+    description: "List this project's scheduled Codex runs. Use when the user asks what reminders, scheduled jobs, cron tasks, or delayed checks exist for this project, or before deleting a schedule whose id is unknown. Execution history is not returned here; scheduled run records are appended in the project file .lodestar/schedule-runs.jsonl. Returns count and schedules with id, name, cron or fireAt, mode, level, prompt, nextFireAt, nextFireAtIso, lastFiredAt, and createdAt.",
     inputSchema: SCHEDULE_LIST_SCHEMA,
   },
   {
     name: 'schedule_delete',
-    description: 'Delete a schedule by id. Project-scoped: returns false if the id belongs to a different project.',
+    description: 'Delete one scheduled Codex run by id for this project. Use when the user asks to cancel/remove/delete a reminder, cron job, or scheduled task. If the id is unknown, call schedule_list first. Project-scoped: returns ok=false if the id does not exist or belongs to a different project.',
     inputSchema: SCHEDULE_DELETE_SCHEMA,
   },
 ]
@@ -196,10 +211,14 @@ function callTool(project: string, name: string, args: any): any {
         return textContent(formatSchedule(s))
       }
       case 'schedule_once': {
+        const delaySeconds = args.delaySeconds
+        if (typeof delaySeconds !== 'number' || !Number.isFinite(delaySeconds)) {
+          return errorContent('delaySeconds must be a finite number')
+        }
         const s = createSchedule({
           project,
           prompt: String(args.prompt ?? ''),
-          delaySeconds: Number(args.delaySeconds),
+          delaySeconds,
           mode: (args.mode as ScheduleMode) ?? undefined,
           level: (args.level as ScheduleLevel) ?? undefined,
           name: args.name ? String(args.name) : undefined,
@@ -291,7 +310,7 @@ export async function handleMcpRequest(
     res.statusCode = 405
     res.setHeader('content-type', 'text/plain; charset=utf-8')
     res.setHeader('allow', 'POST')
-    res.end('lodestar MCP: POST JSON-RPC requests to this URL')
+    res.end('lodestar_schedule MCP: POST JSON-RPC requests to this URL')
     return
   }
   if (req.method !== 'POST') {

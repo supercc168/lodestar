@@ -25,13 +25,13 @@
  * a specific error so the MCP caller can surface it.
  */
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { randomBytes } from 'node:crypto'
 import { log } from './log'
 import { SCHEDULES_FILE } from './paths'
 import * as feishu from './feishu'
-import { CodexProcess } from './codex-process'
+import { CodexProcess, type CodexResultMeta } from './codex-process'
 import { CHANNEL_INSTRUCTIONS } from './instructions'
 import { scheduledSummaryCard, type CollectedTool } from './cards/scheduled-summary'
 import { notifyCardForScheduled } from './notify'
@@ -60,6 +60,9 @@ export interface Schedule {
 }
 
 const schedules = new Map<string, Schedule>()
+const RUN_LOG_DIR = '.lodestar'
+const RUN_LOG_FILE = 'schedule-runs.jsonl'
+const RUN_LOG_TEXT_LIMIT = 6000
 
 // ── Persistence ─────────────────────────────────────────────────────
 function persist(): void {
@@ -218,6 +221,7 @@ export function createSchedule(input: CreateScheduleInput): Schedule {
     nextFireAt = nextCronFire(parsed, now)
     cron = input.cron
   } else {
+    if (!Number.isFinite(input.delaySeconds!)) throw new Error('delaySeconds must be a finite number')
     if (input.delaySeconds! < 0) throw new Error('delaySeconds must be ≥ 0')
     fireAt = now + Math.round(input.delaySeconds! * 1000)
     nextFireAt = fireAt
@@ -289,6 +293,51 @@ export function startScheduler(): void {
 
 export function stopScheduler(): void {
   if (tickTimer) { clearInterval(tickTimer); tickTimer = null }
+}
+
+function clippedText(text: string): string {
+  if (text.length <= RUN_LOG_TEXT_LIMIT) return text
+  return `${text.slice(0, RUN_LOG_TEXT_LIMIT)}\n...[truncated ${text.length - RUN_LOG_TEXT_LIMIT} chars]`
+}
+
+function appendRunInspectionLog(
+  workDir: string,
+  s: Schedule,
+  record: {
+    elapsedMs: number
+    exitCode: number | null
+    finalText: string
+    meta: CodexResultMeta
+    toolCount: number
+    sendMessageId: string | null
+    sendError: string | null
+  },
+): void {
+  const dir = join(workDir, RUN_LOG_DIR)
+  const file = join(dir, RUN_LOG_FILE)
+  try {
+    mkdirSync(dir, { recursive: true })
+    appendFileSync(file, JSON.stringify({
+      firedAt: new Date().toISOString(),
+      scheduleId: s.id,
+      name: s.name,
+      project: s.project,
+      trigger: s.cron ? 'cron' : 'once',
+      cron: s.cron,
+      fireAt: s.fireAt,
+      mode: s.mode,
+      level: s.level,
+      elapsedMs: record.elapsedMs,
+      exitCode: record.exitCode,
+      result: record.meta,
+      toolCount: record.toolCount,
+      sendMessageId: record.sendMessageId,
+      sendError: record.sendError,
+      finalText: clippedText(record.finalText),
+    }) + '\n')
+  } catch (e) {
+    log(`schedule: run inspection log append failed id=${s.id} file=${file}: ${e}`)
+  }
 }
 
 async function tick(): Promise<void> {
@@ -401,6 +450,8 @@ async function fireSchedule(s: Schedule): Promise<void> {
   const elapsedMs = Date.now() - startedAt
   const finalText = assistantSegs.join('\n\n').trim()
   const meta = proc.lastResult
+  let sendMessageId: string | null = null
+  let sendError: string | null = null
 
   // Render output before killing the process — `proc.lastResult` is read
   // while the proc is still alive (already populated by 'result').
@@ -418,6 +469,8 @@ async function fireSchedule(s: Schedule): Promise<void> {
         level: s.level,
       })
       const msgId = await feishu.sendCard(chatId, card)
+      sendMessageId = msgId
+      if (!msgId) sendError = 'sendCard returned null'
       log(`schedule: fire id=${s.id} verbose card sent msg=${msgId ?? 'FAILED'}`)
     } else {
       // silent (B mode) — notify-style card with just the final assistant text.
@@ -430,11 +483,23 @@ async function fireSchedule(s: Schedule): Promise<void> {
         elapsedMs,
       })
       const msgId = await feishu.sendCard(chatId, card)
+      sendMessageId = msgId
+      if (!msgId) sendError = 'sendCard returned null'
       log(`schedule: fire id=${s.id} silent notify sent msg=${msgId ?? 'FAILED'}`)
     }
   } catch (e) {
+    sendError = String(e)
     log(`schedule: fire id=${s.id} render/send failed: ${e}`)
   }
+  appendRunInspectionLog(workDir, s, {
+    elapsedMs,
+    exitCode,
+    finalText,
+    meta,
+    toolCount: toolOrder.length,
+    sendMessageId,
+    sendError,
+  })
 
   // Clean up the subprocess. SIGTERM with short grace — automation
   // shouldn't have anything stateful to flush.
