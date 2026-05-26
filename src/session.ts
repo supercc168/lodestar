@@ -214,9 +214,9 @@ export class Session {
    * does not overwrite the 🛑 footer already painted by the stop path.
    * Reset by exit handler for the proc-died-before-result case. */
   private userInterrupted = false
-  // Last known resumable thread id. Codex can hand back a fresh thread id
-  // during init/resume before any rollout exists; persist only after a
-  // non-error turn result so `restart` never resumes an empty thread.
+  // Last known resumable thread id. Persisted once a turn starts, so
+  // `restart` can resume an in-flight conversation even if the daemon
+  // exits before the turn finishes.
   private lastSessionId: string | null = null
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
@@ -896,6 +896,9 @@ export class Session {
         }
       })()
     })
+    p.on('turn_started', () => {
+      this.persistResumableSessionId()
+    })
     p.on('assistant_text', ({ text }: { text: string }) => {
       this.appendAssistant(text)
     })
@@ -939,7 +942,6 @@ export class Session {
       const hasMidTurn = this.pendingMidTurnMsgs.length > 0
       const isError = this.proc?.lastResult.is_error === true
       const subtype = this.proc?.lastResult.subtype ?? 'success'
-      if (!isError) this.persistResumableSessionId()
 
       let suffix: string | undefined
       let forcePush = false
@@ -1175,7 +1177,8 @@ export class Session {
       rotating: null,
       rotateCount: 0,
       rotateGivenUp: false,
-      pendingSendPaths: [],
+      outboundSeenPaths: new Set(),
+      outboundSentPaths: new Set(),
     }
     this.currentTurn = turnState
     this.startTicker(turnState)
@@ -1291,13 +1294,6 @@ export class Session {
         // onFailure 在 rotating 期间不 reset,所以这段一直累积到这里)。先读后清。
         const carrySegId = turn.currentAssistantSegmentId
         const carryText = (turn.currentAssistantText ?? '').trim()
-        // 清空 segmentTexts 前,把"不会被 carry 带走的已完成段"里的 [[send:]] 抠到
-        // turn 级 pending —— 否则 closeTurnCard 扫不到(map 即将清空),文件漏发。
-        // carry 的那段会 re-seed 进新 map、由 closeTurnCard 提取,这里跳过免重复。
-        for (const [sid, stext] of turn.segmentTexts) {
-          if (sid === carrySegId) continue
-          this.collectSendPaths(stext, turn.pendingSendPaths)
-        }
         turn.assistantSegmentCount = 0
         turn.currentAssistantSegmentId = null
         turn.currentAssistantText = ''
@@ -1401,6 +1397,7 @@ export class Session {
     const segId = turn.currentAssistantSegmentId
     if (!segId) return  // addElement 已失败 reset,等下一次 delta 重建
     turn.segmentTexts.set(segId, turn.currentAssistantText)
+    this.processOutboundMarkers(turn.currentAssistantText)
     cardkit.streamTextThrottled(turn.cardId, segId, turn.currentAssistantText)
     // Chat-list preview: tail of the latest assistant text. Feishu
     // truncates anyway; ~60 chars is what shows on a typical phone
@@ -1457,15 +1454,27 @@ export class Session {
     turn.currentAssistantText = ''
   }
 
-  /** 从一段文字里抠出所有合法的 [[send: /abs/path]] 绝对路径 push 进 sink
-   * (只收集、不改原文 —— 标记按用户要求保留在正文显示)。rotate 清 segmentTexts
-   * 前、closeTurnCard 收尾时共用,保证跨卡的 send 一个不漏。 */
-  private collectSendPaths(text: string, sink: string[]): void {
+  /** 从一段文字里找完整 [[send: /abs/path]] 标记,一看到就立即发。正文保留
+   * 原标记不改,让用户知道触发了哪个文件路径。 */
+  private processOutboundMarkers(text: string): void {
     for (const m of text.matchAll(SEND_MARKER_RE)) {
-      const p = m[1].trim()
-      if (isAbsolute(p)) sink.push(p)
-      else log(`session "${this.sessionName}": ignore non-absolute send path: ${p}`)
+      this.sendOutboundPath(m[1], 'send marker')
     }
+  }
+
+  sendOutboundPath(rawPath: string, source: string): void {
+    const p = rawPath.trim()
+    if (!p) return
+    const turn = this.currentTurn
+    if (turn?.outboundSeenPaths.has(p)) return
+    turn?.outboundSeenPaths.add(p)
+    if (!isAbsolute(p)) {
+      log(`session "${this.sessionName}": ignore non-absolute outbound path from ${source}: ${p}`)
+      return
+    }
+    turn?.outboundSentPaths.add(p)
+    log(`session "${this.sessionName}": outbound send from ${source}: ${p}`)
+    void feishu.uploadAndSend(this.chatId, p)
   }
 
   /** 启动 ticker 元素的活体指示。turn 起来时随机选一个 verb,整 turn
@@ -1520,24 +1529,18 @@ export class Session {
     const segmentTexts = turn.segmentTexts
     await cardkit.flush(cardId)
 
-    // [[send: /abs/path]] markers — strip them from each assistant
-    // segment and collect paths to upload after the card finalizes.
-    // 对**每个** assistant 段 replaceElement 成 marker 清理后的最终内容:这里
-    // replaceElement 的职责是"改内容"(把 [[send:]] 标记从正文中段抠掉,这种
-    // 中段删改用整体更新组件最稳,流式 /content 的前缀光标处理不了删减)。
+    // [[send: /abs/path]] markers are handled mid-stream by
+    // processOutboundMarkers(). closeTurnCard only finalizes text display.
+    // 对**每个** assistant 段 replaceElement 成最终内容:这里 replaceElement
+    // 的职责是把流式元素固化成静态 markdown。
     // "把没播完的打字机尾巴补全上屏"靠的是紧接其后的 streaming_mode=false
     // 全局收尾 —— 实测它会把每个流式文本组件的未上屏部分一次性 commit 到
     // replaceElement 设定的最终内容。**注意**:replaceElement 自身只设组件内容、
     // 不触发流式 commit;turn 中途单独用它定稿会留半截(turn 末尾不留是因为有
     // streaming_mode=false 兜底,跟 replaceElement 无关),所以 mid-turn 的
     // finalizeCurrentAssistantSegment 改用 streaming_mode 瞬切来全显。turn 中途
-    // content_block_stop 已定稿过各段,这里是收尾兜底兼 marker 清理。
-    // pending 是 rotate 时从换卡前各段抠出来的 send 路径(那些段的 segmentTexts
-    // 已被 rotate 清掉,只能靠这里补),跟当前卡各段的合并。collectSendPaths 用
-    // isAbsolute(平台自适应:Windows 认 C:/... / UNC,unix 认 /...)。
-    const sendPaths: string[] = [...turn.pendingSendPaths]
+    // content_block_stop 已定稿过各段,这里是收尾兜底。
     for (const [segId, fullText] of segmentTexts) {
-      this.collectSendPaths(fullText, sendPaths)
       // 收尾定稿:把流式最后一帧补成完整段。**保留 [[send:]] 标记原文显示**
       // (用户要求 2026-05-23:标签留着,让用户看到发了哪个文件)。replaceElement
       // 自身不触发流式 commit,真正全显靠紧随其后的 streaming_mode=false 全局收尾。
@@ -1551,7 +1554,7 @@ export class Session {
     // thinkingText 已经在 turn 期间真 streaming 进飞书,turn 结束保留
     // markdown 形态完整可见即可。代价是卡片会长一些,但比 typewriter
     // 被截好得多。
-    const sendNote = sendPaths.length ? ` · 📎 ${sendPaths.length}` : ''
+    const sendNote = turn.outboundSentPaths.size ? ` · 📎 ${turn.outboundSentPaths.size}` : ''
     // State marker leads the footer (✅ for natural completion, or the
     // suffix verbatim for non-natural states like `🛑 打断`). The
     // trailing "done" word is gone — the ✅ already carries that
@@ -1628,12 +1631,6 @@ export class Session {
       }
       this.currentBatchReactionIds = new Map()
       this.pendingReactionIds = new Map()
-    }
-
-    // Fire uploads sequentially AFTER the card is sealed so each file
-    // posts as its own Feishu message below the conversation card.
-    for (const p of sendPaths) {
-      await feishu.uploadAndSend(this.chatId, p)
     }
   }
 }

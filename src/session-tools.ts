@@ -7,6 +7,7 @@
 
 import type { Session } from './session'
 import type { TurnState } from './session-types'
+import { isAbsolute } from 'node:path'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
@@ -17,6 +18,16 @@ export function isTaskWorkflow(name: string): boolean {
 
 export function todosArray(s: Session): cards.Todo[] {
   return [...s.currentTodos.values()]
+}
+
+function isImageGenerationTool(name: string): boolean {
+  return name === 'ImageGeneration' || name === 'imageGeneration'
+}
+
+export function autoSendPathFromToolResult(name: string, output: string, isError: boolean): string | null {
+  if (isError || !isImageGenerationTool(name)) return null
+  const p = output.trim()
+  return isAbsolute(p) ? p : null
 }
 
 export function addTool(s: Session, toolUseId: string, name: string, input: any): void {
@@ -143,6 +154,8 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
   // can't discard the output after the first paint.
   meta.output = output
   meta.isError = isError
+  const autoSendPath = autoSendPathFromToolResult(meta.name, output, isError)
+  if (autoSendPath) s.sendOutboundPath(autoSendPath, meta.name)
   // AskUserQuestion already had its final panel painted by resolveAsk
   // (✅ + the chosen option marked, others dimmed). The tool_result
   // arriving here is just the SDK's synthesised echo — re-rendering

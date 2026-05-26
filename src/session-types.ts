@@ -86,10 +86,11 @@ export interface TurnState {
   /** Latched once we hit the rotate cap and emit the "giving up" notice,
    * so the notice isn't repeated on every later failed write this turn. */
   rotateGivenUp: boolean
-  /** [[send: /path]] 路径在 turn 结束(closeTurnCard)统一上传。但 rotate 会清空
-   * segmentTexts,换卡前那些已完成段里的 send 标记就扫不到了 —— rotate 在清空前先
-   * 把它们抠出来存这里,closeTurnCard 跟当前卡各段的合并。跨多次 rotate 累积。 */
-  pendingSendPaths: string[]
+  /** 本 turn 已处理过的出站路径请求。包括合法绝对路径和被拒绝的非绝对路径,
+   * 用来避免流式文本反复扫到同一个 [[send: ...]] 时重复上传或刷日志。 */
+  outboundSeenPaths: Set<string>
+  /** 已实际排队上传的绝对路径。用于 footer 计数和跨 rotate 去重。 */
+  outboundSentPaths: Set<string>
 }
 
 export type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'

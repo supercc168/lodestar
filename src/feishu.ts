@@ -83,8 +83,9 @@ export function bindSessionToChat(sessionName: string, chatId: string): void {
 // ── Session resume map ────────────────────────────────────────────────
 // `sessionName → last-known Codex thread_id`. Persisted so a daemon
 // restart (systemctl, crash, watchdog) doesn't strand the user with a
-// fresh conversation when they next type `restart`. Updated on every
-// `thread/start` from a Codex app-server subprocess.
+// fresh conversation when they next type `restart`. Updated when a
+// Codex turn starts, not when it finishes, so in-flight turns are
+// resumable after daemon exit.
 const lastSessionIdByName = new Map<string, string>()
 
 export function loadSessionResumeMap(): void {

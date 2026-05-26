@@ -41,6 +41,9 @@ Card Kit card per turn.
   transports.
 - `lodestar-daemon` is the packaged daemon entry; local development normally
   runs `bun daemon.ts` or `bun run start`.
+- Do not restart the running daemon unless the user explicitly asks for a
+  restart/reload in that turn. After code changes, report that a restart is
+  needed instead of doing it.
 - Group bare-word controls are `hi`, `stop`, `kill`, `restart`, and `clear`.
 - Local scripts can notify a group through `POST http://127.0.0.1:9876/notify`
   with `{project, text, level}`.

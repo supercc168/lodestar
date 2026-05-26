@@ -261,6 +261,10 @@ export class CodexProcess extends EventEmitter {
       }
       case 'turn/started': {
         this.currentTurnId = params.turn?.id ?? null
+        this.emit('turn_started', {
+          turn_id: this.currentTurnId,
+          thread_id: params.threadId ?? this.sessionId,
+        })
         return
       }
       case 'turn/completed': {
