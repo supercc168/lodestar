@@ -67,6 +67,11 @@ Card Kit card per turn.
 - Verify with `bun test` and `bun run build`.
 - Commit the release bump, tag `vX.Y.Z`, push `main`, and push the tag.
 - Publish npm with `npm publish --access public`.
+- Also publish the same version to GitHub Packages. Temporarily write project
+  `.npmrc` with `@leviyuan:registry=https://npm.pkg.github.com` and
+  `//npm.pkg.github.com/:_authToken=$GH_TOKEN`, run
+  `npm publish --registry=https://npm.pkg.github.com --tag latest --access public`,
+  then remove `.npmrc`. Do not skip GitHub Packages.
 - Always create the matching GitHub Release for the tag. `gh` is not
   installed here; use GitHub REST with the token from `~/.git-credentials`
   and build JSON bodies with `jq -n --rawfile body /tmp/notes.md ...`.
