@@ -30,6 +30,14 @@ function todoStatusIcon(s: string): string {
   }
 }
 
+function isBashTool(name: string): boolean {
+  return name === 'Bash' || name === 'exec_command' || name.endsWith('.exec_command')
+}
+
+function displayToolName(name: string): string {
+  return isBashTool(name) ? 'Bash' : name
+}
+
 /** Render the session's full todo mirror as a markdown list. Empty list
  * yields '' so callers can unconditionally concat. Sorted by numeric id
  * so the order matches creation order regardless of Map iteration. */
@@ -57,8 +65,8 @@ export function summarizeToolInput(name: string, input: any): string {
   if (name.startsWith('Task') && name !== 'Task') {
     return truncate(summarizeTaskWorkflow(name, input), 80)
   }
+  if (isBashTool(name)) return summarizeBashInput(input)
   switch (name) {
-    case 'Bash':       return summarizeBashInput(input)
     case 'Read':
     case 'Write':
     case 'Edit':
@@ -146,7 +154,8 @@ function renderBashBody(input: any, output: string | null, resolvedNote?: string
   const reason = info.description
   const lines: string[] = []
   if (reason) lines.push(`**目的**: ${reason}`)
-  if (input?.cwd) lines.push(`**cwd**: ${inlineCode(input.cwd)}`)
+  const cwd = input?.cwd ?? input?.workdir
+  if (cwd) lines.push(`**cwd**: ${inlineCode(cwd)}`)
   if (input?.source) lines.push(`**source**: ${inlineCode(input.source)}`)
   if (lines.length > 0) lines.push('')
   lines.push('**命令**')
@@ -342,9 +351,10 @@ export function toolCallElement(
   todos?: Todo[],
 ): object {
   const summary = summarizeToolInput(name, input)
+  const toolName = displayToolName(name)
   const headerText = summary
-    ? `${status} 🔧 ${name}: ${summary}`
-    : `${status} 🔧 ${name}`
+    ? `${status} 🔧 ${toolName}: ${summary}`
+    : `${status} 🔧 ${toolName}`
   const isTaskWorkflow = name.startsWith('Task') && name !== 'Task'
   const noteBlock = resolvedNote ? `\n\n${resolvedNote}` : ''
   // Task* gets a narrative body (operation + result + current todo list),
@@ -353,7 +363,7 @@ export function toolCallElement(
   // matter.
   const body = isTaskWorkflow
     ? renderTaskWorkflowBody(name, input, output, todos) + noteBlock
-    : name === 'Bash'
+    : isBashTool(name)
       ? renderBashBody(input, output, resolvedNote)
       : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
         + noteBlock
@@ -412,10 +422,11 @@ export function toolCallPermissionElement(
   requestId: string,
 ): object {
   const summary = summarizeToolInput(name, input)
+  const toolName = displayToolName(name)
   const headerText = summary
-    ? `🔐 等审批 · ${name}: ${summary}`
-    : `🔐 等审批 · ${name}`
-  const inputBlock = name === 'Bash'
+    ? `🔐 等审批 · ${toolName}: ${summary}`
+    : `🔐 等审批 · ${toolName}`
+  const inputBlock = isBashTool(name)
     ? renderBashBody(input, null)
     : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
   return {
