@@ -35,7 +35,7 @@ import {
 } from './schedule'
 
 const PROTOCOL_VERSION = '2025-06-18'
-const SERVER_INFO = { name: 'lodestar', version: '0.4.0' }
+const SERVER_INFO = { name: 'lodestar', version: '0.4.2' }
 
 // ── JSON-RPC envelope helpers ────────────────────────────────────────
 interface JsonRpcRequest {
