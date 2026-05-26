@@ -1409,9 +1409,10 @@ export class Session {
     cardkit.patchSummaryThrottled(turn.cardId, tail)
   }
 
-  /** 收尾(定稿)当前 assistant 段:flush 确保整段全文已 PUT,再对卡片做一次
-   * streaming_mode false→true 瞬切,逼飞书把当前段所有"未上屏"的打字机尾巴
-   * 立即全部上屏;最后清空当前段游标。无段在写时只清游标。
+  /** 收尾(定稿)当前 assistant 段:flush 确保整段全文已 PUT,先关
+   * streaming_mode 让飞书 commit 当前打字机,再 replaceElement 把该段改成
+   * 静态 markdown 全文,最后重开 streaming_mode 供后续段继续流式;最后清空
+   * 当前段游标。无段在写时只清游标。
    *
    * 三版演进(务必别再改回前两版):
    *   - v1 (82d509f) replaceElement 整段定稿:replaceElement 是"整体更新组件"
@@ -1421,16 +1422,17 @@ export class Session {
    *     /content 调用先把上一帧未上屏部分全显"。官方文档确是这么定义,但实测
    *     失败:这两帧零间隔背靠背发,客户端把它们合并成一帧(目标=全文+零宽空格),
    *     不存在"上一帧"可全显,打字机继续慢爬、被下个元素掐断成半截。
-   *   - v3 (本版) streaming_mode 瞬切:turn 末尾 streaming_mode=false 收尾能
+   *   - v3 streaming_mode 瞬切:turn 末尾 streaming_mode=false 收尾能
    *     可靠全显是实测验证过的(turn 一结束当前段就完整)。把它搬到 mid-turn:
    *     off 那一下全显当前段未上屏尾巴,on 紧接着恢复后续段的流式打字机。不再
    *     依赖客户端是否"按文档 commit 上一帧",直接走全局收尾这条已知可靠的路。
+   *   - v4 (本版) off 后再 replace 静态全文再 on:针对现场观察到的 v3 问题
+   *     —— off 后先完整显示,但 on 会让已完成段回退到半截,疑似 Feishu 客户端
+   *     把旧 streaming 元素重新挂回 typewriter 进度。
    *
    * flush 必须在 off 之前:把本段最后的 delta 推成全文这一帧,off 才能全显完整
-   * 段。off/on 走 per-card 队列、顺序紧跟 flush。PATCH settings 是合并语义(只改
-   * streaming_mode、不动 turn.ts 设的 streaming_config) —— 旁证:cardkit.reopen-
-   * Streaming 单独 PATCH streaming_mode 重开后打字机仍正常。turn 末尾 closeTurnCard
-   * 自己会再 streaming_mode=false 收尾,这里 on 回来不影响最终态。 */
+   * 段。off/replace/on 走 per-card 队列、顺序紧跟 flush。PATCH settings 是合并
+   * 语义(只改 streaming_mode、不动 turn.ts 设的 streaming_config)。 */
   finalizeCurrentAssistantSegment(): void {
     const turn = this.currentTurn
     if (!turn) return
@@ -1443,8 +1445,12 @@ export class Session {
     const text = turn.currentAssistantText ?? ''
     if (segId && text.trim()) {
       void cardkit.flush(turn.cardId)
-      // streaming off→on 瞬切:off 全显当前段未上屏尾巴,on 恢复后续流式。
+      // off → static replace → on:把当前段从 streaming typewriter 状态固化,
+      // 再恢复后续段的流式。
       void cardkit.patchSettings(turn.cardId, { config: { streaming_mode: false } })
+      void cardkit.replaceElement(turn.cardId, segId, {
+        tag: 'markdown', element_id: segId, content: text.trim() || ' ',
+      })
       void cardkit.patchSettings(turn.cardId, { config: { streaming_mode: true } })
     }
     turn.currentAssistantSegmentId = null
