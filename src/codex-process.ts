@@ -317,7 +317,7 @@ export class CodexProcess extends EventEmitter {
 
   private handleItemStarted(item: any): void {
     if (!item?.id) return
-    const mapped = mapStartedItem(item)
+    const mapped = mapStartedItem(item, this.opts.workDir)
     if (!mapped) return
     this.emit('tool_use', { id: item.id, name: mapped.name, input: mapped.input })
   }
@@ -645,12 +645,12 @@ function numberOrUndefined(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined
 }
 
-function mapStartedItem(item: any): { name: string; input: any } | null {
+function mapStartedItem(item: any, workDir: string): { name: string; input: any } | null {
   switch (item.type) {
     case 'commandExecution':
       return { name: 'Bash', input: { command: item.command, cwd: item.cwd, source: item.source } }
     case 'fileChange':
-      return { name: 'FileChange', input: { changes: item.changes, status: item.status } }
+      return { name: 'FileChange', input: { changes: item.changes, status: item.status, cwd: workDir } }
     case 'mcpToolCall':
       return { name: 'MCP', input: { server: item.server, tool: item.tool, arguments: item.arguments } }
     case 'dynamicToolCall':
