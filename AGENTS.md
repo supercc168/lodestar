@@ -57,6 +57,19 @@ Card Kit card per turn.
   `journalctl --user -u cc-feishu-lodestar -f`,
   `systemctl --user stop cc-feishu-lodestar`
 
+### Release Checklist
+
+- Bump both `package.json` version and `SERVER_INFO.version` in
+  `src/mcp-server.ts`.
+- Verify with `bun test` and `bun run build`.
+- Commit the release bump, tag `vX.Y.Z`, push `main`, and push the tag.
+- Publish npm with `npm publish --access public`.
+- Always create the matching GitHub Release for the tag. `gh` is not
+  installed here; use GitHub REST with the token from `~/.git-credentials`
+  and build JSON bodies with `jq -n --rawfile body /tmp/notes.md ...`.
+- Restart the running user service only when requested; inspect the actual
+  unit first with `systemctl --user list-units --all`.
+
 ### Testing
 
 - Smoke: `bun daemon.ts` then send a text in a bound Feishu group.
