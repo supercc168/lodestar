@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
+import { statusCard } from './console'
 import { mainConversationCard, summarizeToolInput, toolCallElement, toolCallPermissionElement } from './turn'
 
 describe('main conversation card rendering', () => {
@@ -14,7 +15,20 @@ describe('main conversation card rendering', () => {
 
     const ids = card.body.elements.map((el: any) => el.element_id).filter(Boolean)
     expect(ids).toEqual(['footer'])
+    expect(card.body.elements[0].content).toBe('Waiting...(0s)')
     expect(JSON.stringify(card)).not.toContain('ticker')
+  })
+
+  test('status cards render an immediately visible footer', () => {
+    const card = statusCard({
+      sessionName: 'probe',
+      title: 'restart',
+      status: '🔁 重启 Codex (0s)',
+    }) as any
+
+    expect(card.header.title.content).toBe('🌟 Lodestar · probe')
+    expect(card.body.elements[0].element_id).toBe('footer')
+    expect(card.body.elements[0].content).toContain('🔁 重启 Codex (0s)')
   })
 })
 

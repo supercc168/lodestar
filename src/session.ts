@@ -35,7 +35,7 @@ export type { SessionOpts } from './session-types'
 const SEND_MARKER_RE = /\[\[send:\s*([^\]\n]+?)\s*\]\]/g
 
 const FOOTER_STATUS_TICK_MS = 1000
-const FOOTER_THINKING_PREFIX = 'Thinking...'
+const FOOTER_THINKING_PREFIX = 'Waiting...'
 const FOOTER_WORKING = 'Working...'
 
 /** Soft cap on element count per Feishu card before we proactively
@@ -59,6 +59,28 @@ const CARD_ELEMENT_SOFT_LIMIT = 50
  * Feishu rejects on every card) — without a cap that would spray an
  * endless trail of empty cards into the chat. */
 const MAX_MIDTURN_ROTATES = 5
+
+interface LifecycleProgressOpts {
+  announce?: boolean
+  onStatus?: (status: string) => void
+}
+
+interface FooterTimer {
+  setStatus(status: string): void
+  stop(): void
+  elapsedSec(): string
+}
+
+interface StatusCardHandle {
+  cardId: string
+  title: string
+  timer: FooterTimer
+}
+
+function timedStatus(status: string, startedAt: number): string {
+  const elapsedS = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
+  return `${status} (${elapsedS}s)`
+}
 
 export class Session {
   /** Process-wide registry of every Session ever constructed in this daemon.
@@ -225,27 +247,129 @@ export class Session {
   get workDir(): string { return join(feishu.PROJECTS_ROOT, this.sessionName) }
   isRunning(): boolean { return !!this.proc && this.proc.isAlive() }
 
+  private startFooterTimer(
+    cardId: string,
+    initialStatus: string,
+    renderContent: (status: string) => string = status => status,
+  ): FooterTimer {
+    const startedAt = Date.now()
+    let status = initialStatus
+    let stopped = false
+    const render = (): void => {
+      if (stopped) return
+      cardkit.streamTextThrottled(
+        cardId,
+        cards.ELEMENTS.footer,
+        renderContent(timedStatus(status, startedAt)),
+      )
+    }
+    const handle = setInterval(render, FOOTER_STATUS_TICK_MS)
+    render()
+    return {
+      setStatus(next: string): void {
+        status = next
+        render()
+      },
+      stop(): void {
+        if (stopped) return
+        stopped = true
+        clearInterval(handle)
+      },
+      elapsedSec(): string {
+        return ((Date.now() - startedAt) / 1000).toFixed(1)
+      },
+    }
+  }
+
+  private async openStatusCard(
+    title: string,
+    initialStatus: string,
+    template: 'blue' | 'green' | 'orange' | 'red' | 'grey' | 'turquoise' = 'blue',
+  ): Promise<StatusCardHandle | null> {
+    const startedAt = Date.now()
+    const card = cards.statusCard({
+      sessionName: this.sessionName,
+      title,
+      status: timedStatus(initialStatus, startedAt),
+      template,
+    })
+    const messageId = await feishu.sendCard(this.chatId, card)
+    if (!messageId) {
+      log(`session "${this.sessionName}": status card send failed title=${title}`)
+      await feishu.sendTextRaw(this.chatId, `❌ 创建状态卡片失败: ${title}`)
+      return null
+    }
+    let cardId: string
+    try { cardId = await cardkit.convertMessageToCard(messageId) }
+    catch (e) {
+      log(`session "${this.sessionName}": status card id_convert failed title=${title}: ${e}`)
+      await feishu.sendTextRaw(this.chatId, `❌ 状态卡片初始化失败: ${title}`)
+      return null
+    }
+    cardkit.recordCardCreated(cardId, 1)
+    return {
+      cardId,
+      title,
+      timer: this.startFooterTimer(
+        cardId,
+        initialStatus,
+        status => cards.statusCardContent(title, status),
+      ),
+    }
+  }
+
+  private setStatusCard(handle: StatusCardHandle | null, status: string): void {
+    handle?.timer.setStatus(status)
+  }
+
+  private async closeStatusCard(handle: StatusCardHandle | null, finalStatus: string): Promise<void> {
+    if (!handle) return
+    handle.timer.stop()
+    const elapsed = handle.timer.elapsedSec()
+    const content = cards.statusCardContent(handle.title, `${finalStatus} (${elapsed}s)`)
+    await cardkit.flush(handle.cardId)
+    await cardkit.streamText(handle.cardId, cards.ELEMENTS.footer, content)
+    cardkit.cancelSummary(handle.cardId)
+    await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({
+      durationSec: elapsed,
+      suffix: finalStatus,
+    }))
+    await cardkit.dispose(handle.cardId)
+  }
+
   // ── Lifecycle ──────────────────────────────────────────────────────
-  async start(): Promise<boolean> {
-    if (this.isRunning()) return true
+  async start(opts: LifecycleProgressOpts = {}): Promise<boolean> {
+    const announce = opts.announce ?? true
+    const report = opts.onStatus
+    if (this.isRunning()) {
+      report?.('✅ Codex 已运行')
+      return true
+    }
+    report?.('🔎 检查 Codex 登录')
     if (!feishu.isOpenAIChatGPTAuthenticated()) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
-      await feishu.sendText(this.chatId, '❌ Codex 未登录 ChatGPT 账号。\n请在服务器上运行 `codex login` 后再试。')
+      report?.('❌ Codex 未登录 ChatGPT 账号')
+      if (announce) {
+        await feishu.sendText(this.chatId, '❌ Codex 未登录 ChatGPT 账号。\n请在服务器上运行 `codex login` 后再试。')
+      }
       return false
     }
     if (!existsSync(this.workDir)) {
-      await feishu.sendText(this.chatId, `🆕 目录 ~/${this.sessionName} 不存在，正在创建…`)
+      report?.(`🆕 创建项目目录 ~/${this.sessionName}`)
+      if (announce) await feishu.sendText(this.chatId, `🆕 目录 ~/${this.sessionName} 不存在，正在创建…`)
       try { feishu.provisionProject(this.workDir) }
       catch (e) {
         this.status = 'stopped'
         this.opts.onLifecycleChange?.()
-        await feishu.sendText(this.chatId, `❌ 创建项目失败: ${e}`)
+        report?.(`❌ 创建项目失败: ${e}`)
+        if (announce) await feishu.sendText(this.chatId, `❌ 创建项目失败: ${e}`)
         return false
       }
     }
 
     this.status = 'starting'
+    report?.('🚀 启动 Codex')
     this.proc = new CodexProcess({
       workDir: this.workDir,
       model: CODEX_MODEL,
@@ -254,6 +378,7 @@ export class Session {
     })
     this.wireProc(this.proc)
     this.proc.sendInitialize()
+    report?.('⏳ 等待 Codex init')
     // 等 `system/init` 落地再认定 ready —— sendInitialize 只把 RPC
     // 写进 app-server 之前 proc.sessionId 还是 null,这时候
     // showConsole() 看到 null 会 fallback 到磁盘上**上一次**会话的
@@ -264,7 +389,8 @@ export class Session {
     const init = await this.waitForProcInit(this.proc, 5000)
     if (init.state === 'error' || init.state === 'exit') {
       log(`session "${this.sessionName}": codex init failed: ${init.error ?? init.state}`)
-      await feishu.sendText(this.chatId, `❌ Codex 启动失败: ${init.error ?? init.state}`)
+      report?.(`❌ Codex 启动失败: ${init.error ?? init.state}`)
+      if (announce) await feishu.sendText(this.chatId, `❌ Codex 启动失败: ${init.error ?? init.state}`)
       await this.proc?.kill(1000).catch(() => {})
       this.proc = null
       this.status = 'stopped'
@@ -273,12 +399,16 @@ export class Session {
     }
     if (init.state === 'timeout') {
       log(`session "${this.sessionName}": init wait timeout (5s) — proceeding`)
+      report?.('⏳ Codex 已启动，init 确认超时')
     }
 
-    await feishu.sendText(this.chatId, `✅ Lodestar session "${this.sessionName}" 已就绪，发消息开始对话。`)
+    if (announce) {
+      await feishu.sendText(this.chatId, `✅ Lodestar session "${this.sessionName}" 已就绪，发消息开始对话。`)
+    }
     this.status = 'idle'
     this.startedAt = Date.now()
     this.opts.onLifecycleChange?.()
+    report?.('✅ Codex 已就绪')
     return true
   }
 
@@ -362,9 +492,12 @@ export class Session {
     await feishu.sendText(this.chatId, `🔴 ${reason} (session: ${this.sessionName})`)
   }
 
-  async restart(resume = false): Promise<boolean> {
+  async restart(resume = false, opts: LifecycleProgressOpts = {}): Promise<boolean> {
+    const announce = opts.announce ?? true
+    const report = opts.onStatus
     const prevSessionId = this.lastSessionId
     if (this.proc) {
+      report?.('🛑 停止当前 Codex')
       await this.proc.kill()
       this.proc = null
     }
@@ -381,6 +514,7 @@ export class Session {
     this.pendingPermissions.clear()
     if (resume && prevSessionId) {
       this.status = 'starting'
+      report?.(`🔁 恢复 thread=${prevSessionId.slice(0, 8)}…`)
       this.proc = new CodexProcess({
         workDir: this.workDir,
         model: CODEX_MODEL,
@@ -390,10 +524,12 @@ export class Session {
       })
       this.wireProc(this.proc)
       this.proc.sendInitialize()
+      report?.('⏳ 等待 Codex init')
       const init = await this.waitForProcInit(this.proc, 10_000)
       if (init.state === 'error' || init.state === 'exit') {
         log(`session "${this.sessionName}": codex resume failed: ${init.error ?? init.state}`)
-        await feishu.sendText(this.chatId, `❌ Codex 恢复失败: ${init.error ?? init.state}`)
+        report?.(`❌ Codex 恢复失败: ${init.error ?? init.state}`)
+        if (announce) await feishu.sendText(this.chatId, `❌ Codex 恢复失败: ${init.error ?? init.state}`)
         await this.proc?.kill(1000).catch(() => {})
         this.proc = null
         this.status = 'stopped'
@@ -402,9 +538,13 @@ export class Session {
       }
       if (init.state === 'timeout') {
         log(`session "${this.sessionName}": resume init wait timeout (10s) — process still alive`)
-        await feishu.sendText(this.chatId, `⏳ Codex 恢复已发起，但 10s 内尚未确认 init。thread=${prevSessionId.slice(0, 8)}…`)
+        const msg = `⏳ Codex 恢复已发起，但 10s 内尚未确认 init。thread=${prevSessionId.slice(0, 8)}…`
+        report?.(msg)
+        if (announce) await feishu.sendText(this.chatId, msg)
       } else {
-        await feishu.sendText(this.chatId, `🔁 已重启并恢复 thread=${prevSessionId.slice(0, 8)}…`)
+        const msg = `✅ 已重启并恢复 thread=${prevSessionId.slice(0, 8)}…`
+        report?.(msg)
+        if (announce) await feishu.sendText(this.chatId, `🔁 已重启并恢复 thread=${prevSessionId.slice(0, 8)}…`)
       }
       this.status = 'idle'
       this.startedAt = Date.now()
@@ -415,13 +555,14 @@ export class Session {
       // explicitly rather than silently fresh-starting (the old behavior
       // hid the daemon-restart sessionId-loss bug for months).
       if (resume) {
-        await feishu.sendText(this.chatId, '⚠️ 没有可恢复的上一会话，将以新会话启动')
+        report?.('⚠️ 没有可恢复的上一会话，将以新会话启动')
+        if (announce) await feishu.sendText(this.chatId, '⚠️ 没有可恢复的上一会话，将以新会话启动')
       }
       // Fresh conversation — drop cumulative stats so the next `hi` shows
       // zeroed counters instead of bleeding numbers from the prior chat.
       this.cumStats = { tokens: 0, costUsd: 0, turns: 0 }
       this.lastTurnDelta = null
-      return await this.start()
+      return await this.start(opts)
     }
   }
 
@@ -440,9 +581,25 @@ export class Session {
   async runCommand(raw: string): Promise<boolean> {
     switch (raw.trim().toLowerCase()) {
       case 'hi':
-        if (!this.isRunning()) {
-          const ok = await this.start()
-          if (!ok) return true
+        {
+          const statusCard = !this.isRunning()
+            ? await this.openStatusCard('hi', '🚀 启动 Codex')
+            : null
+          let lastStatus = '🚀 启动 Codex'
+          const ok = !this.isRunning()
+            ? await this.start({
+                announce: !statusCard,
+                onStatus: status => {
+                  lastStatus = status
+                  this.setStatusCard(statusCard, status)
+                },
+              })
+            : true
+          if (!ok) {
+            await this.closeStatusCard(statusCard, lastStatus.startsWith('❌') ? lastStatus : '❌ 启动失败')
+            return true
+          }
+          await this.closeStatusCard(statusCard, '✅ Codex 已就绪')
         }
         await this.showConsole()
         return true
@@ -505,7 +662,18 @@ export class Session {
         // any) and spawns a new one with `--resume <lastSessionId>`.
         // If no process is running, this is how the user gets back the
         // previous conversation after a `kill` or a daemon crash.
-        await this.restart(true)
+        {
+          const statusCard = await this.openStatusCard('restart', '🔁 重启 Codex')
+          let lastStatus = '🔁 重启 Codex'
+          const ok = await this.restart(true, {
+            announce: !statusCard,
+            onStatus: status => {
+              lastStatus = status
+              this.setStatusCard(statusCard, status)
+            },
+          })
+          await this.closeStatusCard(statusCard, ok ? '✅ restart 完成' : (lastStatus.startsWith('❌') ? lastStatus : '❌ restart 失败'))
+        }
         return true
       case 'clear':
         // "throw away current conversation, start a new one". By design
@@ -517,10 +685,26 @@ export class Session {
         if (!this.isRunning()) {
           this.status = 'stopped'
           this.opts.onLifecycleChange?.()
-          await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行,clear 无效;用 \`hi\` 启动或 \`restart\` 恢复上一会话`)
+          const statusCard = await this.openStatusCard('clear', '⚪ session 当前未运行', 'grey')
+          if (statusCard) {
+            await this.closeStatusCard(statusCard, '⚪ clear 无效')
+          } else {
+            await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行,clear 无效;用 \`hi\` 启动或 \`restart\` 恢复上一会话`)
+          }
           return true
         }
-        await this.restart(false)
+        {
+          const statusCard = await this.openStatusCard('clear', '🧹 清空并启动新会话', 'orange')
+          let lastStatus = '🧹 清空并启动新会话'
+          const ok = await this.restart(false, {
+            announce: !statusCard,
+            onStatus: status => {
+              lastStatus = status
+              this.setStatusCard(statusCard, status)
+            },
+          })
+          await this.closeStatusCard(statusCard, ok ? '✅ clear 完成' : (lastStatus.startsWith('❌') ? lastStatus : '❌ clear 失败'))
+        }
         return true
     }
     return false
@@ -590,6 +774,45 @@ export class Session {
     this.proc.sendInterrupt()
   }
 
+  private async startColdUserTurn(text: string, wireText: string, userOpenId: string): Promise<void> {
+    this.openingTurn = true
+    this.pendingTurnInputs.push(text)
+    try {
+      await this.openTurnCard(userOpenId, 'user_message', {
+        initialFooter: 'Waiting...(0s)',
+        startThinking: false,
+      })
+      const turn = this.currentTurn
+      if (!turn) return
+      const bootTimer = this.startFooterTimer(turn.cardId, '🚀 启动 Codex')
+      let lastBootStatus = '🚀 启动 Codex'
+      const ok = await this.start({
+        announce: false,
+        onStatus: status => {
+          lastBootStatus = status
+          bootTimer.setStatus(status)
+        },
+      })
+      bootTimer.stop()
+      await cardkit.flush(turn.cardId)
+      if (!ok) {
+        this.pendingUserMessageCount = 0
+        this.pendingMidTurnMsgs = []
+        this.pendingTurnInputs = []
+        this.lastUserOpenId = ''
+        this.releaseAllReactions()
+        await this.closeTurnCard(lastBootStatus.startsWith('❌') ? lastBootStatus : '❌ 启动失败', { forcePush: true })
+        return
+      }
+      this.startThinkingFooter(turn)
+      this.proc!.sendUserText(wireText, [])
+      this.pendingUserMessageCount++
+      this.status = 'working'
+    } finally {
+      this.openingTurn = false
+    }
+  }
+
   // ── Inbound from Feishu ────────────────────────────────────────────
   /** Inbound user message. Starts a Codex turn immediately when idle —
    * the SDK queues internally if a turn is in flight (FIFO, exactly the
@@ -601,10 +824,6 @@ export class Session {
    * cron-fired wakeups without the daemon ever calling `sendInterrupt` —
    * `kill`/`stop` are the only paths that interrupt now. */
   async onUserMessage(text: string, files: string[] = [], userOpenId = '', msgId = ''): Promise<void> {
-    if (!this.isRunning()) {
-      const ok = await this.start()
-      if (!ok) return
-    }
     // Garbage-collect leftover state from a batch the SDK abandoned —
     // most commonly an AskUserQuestion mid-turn, which makes the SDK
     // emit `QUEUE remove × N` and drop every msg we'd already
@@ -671,6 +890,16 @@ export class Session {
           void feishu.deleteReaction(id, rid)
         }
       })()
+    }
+
+    if (!this.isRunning()) {
+      if (this.openingTurn || this.currentTurn) {
+        this.pendingMidTurnMsgs.push({ text, wireText, userOpenId, msgId })
+        if (msgId) trackReaction(msgId)
+        return
+      }
+      await this.startColdUserTurn(text, wireText, userOpenId)
+      return
     }
 
     if (this.currentTurn !== null) {
@@ -1013,7 +1242,11 @@ export class Session {
     }
   }
 
-  private async openTurnCard(userOpenId: string, trigger: 'user_message'): Promise<void> {
+  private async openTurnCard(
+    userOpenId: string,
+    trigger: 'user_message',
+    opts: { initialFooter?: string; startThinking?: boolean } = {},
+  ): Promise<void> {
     const turn = ++this.turnCounter
     // Snapshot+clear pendingTurnInputs synchronously here so concurrent
     // pushes between snapshot and the await don't sneak into THIS turn's
@@ -1027,6 +1260,7 @@ export class Session {
       effort: CODEX_EFFORT,
       kind: trigger,
       userInputs,
+      initialFooter: opts.initialFooter,
     })
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) {
@@ -1081,7 +1315,7 @@ export class Session {
       outboundSentPaths: new Set(),
     }
     this.currentTurn = turnState
-    this.startThinkingFooter(turnState)
+    if (opts.startThinking !== false) this.startThinkingFooter(turnState)
   }
 
   /** Cheap synchronous check called from stream handlers right before

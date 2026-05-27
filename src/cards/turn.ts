@@ -705,6 +705,10 @@ interface MainCardOpts {
    * 用户连发的 N 条会在下一 turn 一并塞进。空数组 / undefined 时不渲染
    * userInput panel。 */
   userInputs?: string[]
+  /** Initial stable footer text. Session replaces it with a live timer
+   * after it has converted message_id → card_id, but this value is what
+   * the user sees immediately when Feishu creates the card. */
+  initialFooter?: string
 }
 
 /** Initial card sent at the start of each turn. Streaming on. */
@@ -742,12 +746,12 @@ export function mainConversationCard(opts: MainCardOpts): object {
       // Initial body: [handoff banner?] + [userInput panel?] + footer.
       // Assistant segments and tool panels insert_before footer during
       // Codex streaming. The footer itself is the only live status element:
-      // `Thinking...(Ns)` while the model is silent, `Working...` while
+      // `Waiting...(Ns)` while the model is silent, `Working...` while
       // content/tools are visible, and the terminal line when the turn ends.
       elements: [
         ...banner,
         ...userInputPanel,
-        { tag: 'markdown', element_id: ELEMENTS.footer, content: ' ' },
+        { tag: 'markdown', element_id: ELEMENTS.footer, content: opts.initialFooter ?? 'Waiting...(0s)' },
       ],
     },
   }

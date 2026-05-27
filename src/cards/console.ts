@@ -44,6 +44,41 @@ interface ConsoleOpts {
   sysinfo?: SysInfo
 }
 
+interface StatusCardOpts {
+  sessionName: string
+  title: string
+  status: string
+  template?: 'blue' | 'green' | 'orange' | 'red' | 'grey' | 'turquoise'
+}
+
+export function statusCardContent(title: string, status: string): string {
+  return `**${title}**\n${status}`
+}
+
+export function statusCard(opts: StatusCardOpts): object {
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      streaming_mode: true,
+      summary: { content: opts.status },
+    },
+    header: {
+      title: { tag: 'plain_text', content: `🌟 Lodestar · ${opts.sessionName}` },
+      template: opts.template ?? 'blue',
+    },
+    body: {
+      elements: [
+        {
+          tag: 'markdown',
+          element_id: ELEMENTS.footer,
+          content: statusCardContent(opts.title, opts.status),
+        },
+      ],
+    },
+  }
+}
+
 function fmtBytes(n: number): string {
   if (n < 1024) return `${n}B`
   if (n < 1024 * 1024) return `${(n / 1024).toFixed(0)}K`

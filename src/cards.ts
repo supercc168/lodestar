@@ -26,6 +26,8 @@ export {
 export {
   consoleUsageContent,
   consoleCard,
+  statusCard,
+  statusCardContent,
   menuCard,
   streamingOffSettings,
 } from './cards/console'
