@@ -62,7 +62,9 @@ Card Kit card per turn.
 
 ### Release Checklist
 
-- Bump `package.json` version.
+- Bump `package.json` version by patch only (`+0.0.1`) unless the user
+  explicitly asks for a minor or major version bump. Do not infer SemVer
+  minor/major from change scope.
 - Verify with `bun test` and `bun run build`.
 - Commit the release bump, tag `vX.Y.Z`, push `main`, and push the tag.
 - Publish npm with `npm publish --access public`.
