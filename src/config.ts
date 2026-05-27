@@ -101,8 +101,7 @@ function loadConfig(): LodestarConfig {
     throw new Error(`lodestar: [notify].port must be 1..65535, got "${notifyPortRaw}"`)
   }
   // [codex.env] 节可选 —— 空 record 就维持现状 (用户自己 `codex login`)。
-  // 兼容读取旧 [claude.env]，但不再由 setup 写入。
-  const codexEnvSection = t['codex.env'] ?? t['claude.env'] ?? {}
+  const codexEnvSection = t['codex.env'] ?? {}
   const codexEnv: Record<string, string> = {}
   for (const [k, v] of Object.entries(codexEnvSection)) {
     if (typeof v === 'string' && v.length > 0) codexEnv[k] = v

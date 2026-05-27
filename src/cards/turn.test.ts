@@ -1,6 +1,22 @@
 import { describe, expect, test } from 'bun:test'
 
-import { summarizeToolInput, toolCallElement, toolCallPermissionElement } from './turn'
+import { mainConversationCard, summarizeToolInput, toolCallElement, toolCallPermissionElement } from './turn'
+
+describe('main conversation card rendering', () => {
+  test('starts with a stable footer status element and no disposable ticker', () => {
+    const card = mainConversationCard({
+      sessionName: 'probe',
+      turn: 1,
+      effort: 'xhigh',
+      kind: 'user_message',
+      userInputs: [],
+    }) as any
+
+    const ids = card.body.elements.map((el: any) => el.element_id).filter(Boolean)
+    expect(ids).toEqual(['footer'])
+    expect(JSON.stringify(card)).not.toContain('ticker')
+  })
+})
 
 describe('bash-like tool card rendering', () => {
   test('summarizes dynamic exec_command input from # desc', () => {
@@ -32,21 +48,21 @@ describe('bash-like tool card rendering', () => {
 
   test('unwraps quoted unified exec desc commands', () => {
     const input = {
-      command: '"# desc: 查看已跟踪文件中 Claude 或 OMC 遗留引用\nrg -n -i \\"claude|omc|anthropic|\\\\.claude\\" "\'$(git ls-files)\'',
+      command: '"# desc: 查看已跟踪文件中旧关键词引用\nrg -n -i \\"legacy|deprecated|old\\" "\'$(git ls-files)\'',
       cwd: '/home/leviyuan/tradefi-shfe-hedge',
       source: 'unifiedExecStartup',
     }
 
-    expect(summarizeToolInput('Bash', input)).toBe('查看已跟踪文件中 Claude 或 OMC 遗留引用')
+    expect(summarizeToolInput('Bash', input)).toBe('查看已跟踪文件中旧关键词引用')
 
     const el = toolCallElement(2, 'Bash', input, null, '✅') as any
     const body = el.elements[0].content
 
-    expect(el.header.title.content).toBe('✅ 🔧 Bash: 查看已跟踪文件中 Claude 或 OMC 遗留引用')
-    expect(body).toContain('**目的**: 查看已跟踪文件中 Claude 或 OMC 遗留引用')
-    expect(body).toContain('rg -n -i "claude|omc|anthropic|\\.claude" $(git ls-files)')
+    expect(el.header.title.content).toBe('✅ 🔧 Bash: 查看已跟踪文件中旧关键词引用')
+    expect(body).toContain('**目的**: 查看已跟踪文件中旧关键词引用')
+    expect(body).toContain('rg -n -i "legacy|deprecated|old" $(git ls-files)')
     expect(body).not.toContain('"# desc:')
-    expect(body).not.toContain('\\"claude')
+    expect(body).not.toContain('\\"legacy')
     expect(body).not.toContain('"\'$(git ls-files)\'')
   })
 

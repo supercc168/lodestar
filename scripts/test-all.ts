@@ -12,7 +12,7 @@
  * Coverage:
  *   1.  kill on a stopped session            — should report "未运行"
  *   2.  hi                                   — start + console card
- *   3.  basic stream + thinking + tool call  — bypassPermissions
+ *   3.  basic stream + thinking + tool call  — full access
  *   4.  outbound [[send: /path]] marker      — Codex generates a file,
  *                                              daemon strips the marker
  *                                              from the card and ships
@@ -26,7 +26,8 @@
  *   8.  clear (fresh)                        — kills + starts new
  *
  * Permission-card flow needs a live WS to click buttons; this script
- * uses bypassPermissions, so the permission card itself is exercised
+ * starts Codex with full access, so tool calls do not need a local
+ * permission listener.
  * separately (manual / WS-based test, not here).
  */
 
@@ -134,7 +135,7 @@ await sleep(1500)
 // ──────────────────────────────────────────────────────────────────────
 // 1) kill on stopped session
 await announce('[1/8] runCommand("kill") @ stopped — 期待 ⚪ 未运行')
-const session = new Session(sessionName, chatId, { permissionMode: 'bypassPermissions' })
+const session = new Session(sessionName, chatId)
 await session.runCommand('kill')
 await sleep(2500)
 

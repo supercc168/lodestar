@@ -54,14 +54,11 @@ export interface TurnState {
   // version, then post the files as separate Feishu messages.
   segmentTexts: Map<string, string>
   startedAt: number
-  /** "模型还在干活" 活体指示的 setInterval 句柄,turn 起来后挂上,
-   * 在卡片顶部 ticker 元素里每 1s 跳一次刷新经过秒数(verb 是 turn 起
-   * 时随机选的、整 turn 固定不变)。首条 assistant_text 或 tool_use
-   * 到达即 deleteElement(ticker),让卡片顶部干净。
-   *
-   * 跟"thinking 文本"无关。app-server 不保证中间 reasoning 文本可见,
-   * ticker 是模型工作过程中唯一稳定的活体信号。 */
-  tickerHandle: ReturnType<typeof setInterval> | null
+  /** Footer thinking timer. While present, footer shows `Thinking...(Ns)`.
+   * Assistant text or tool execution clears it to `Working...`; after all
+   * tools finish it can start again while the model is silent. */
+  thinkingFooterHandle: ReturnType<typeof setInterval> | null
+  thinkingFooterStartedAt: number
   /** Mid-turn card-rotation lock. Set when we've fire-and-forget kicked
    * off `startMidTurnRotate` to open a fresh card — either proactively
    * (element count crossed CARD_ELEMENT_SOFT_LIMIT) or reactively (an
@@ -92,7 +89,6 @@ export interface TurnState {
 export type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
 
 export interface SessionOpts {
-  permissionMode?: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'
   /** Daemon hook: persist its current alive-session snapshot whenever this
    * session starts, stops, exits, or changes process lifecycle. Scripts
    * that construct Session directly can omit it. */

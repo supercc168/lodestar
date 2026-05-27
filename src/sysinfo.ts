@@ -2,7 +2,7 @@
  * Lightweight host snapshot for the `hi` console panel —— CPU 负载、
  * 内存、根/家目录磁盘、以及当前用户下的 cc-* / codex-* 系列 systemd 服务。
  *
- * 服务前缀约定:历史上 Claude Code / 当前 Codex 拉起的常驻进程分别可能走
+ * 服务前缀约定:AI 助手拉起的常驻进程通常走
  *   systemd-run --user --unit=cc-<project>-<purpose> -- <cmd>
  *   systemd-run --user --unit=codex-<project>-<purpose> -- <cmd>
  * `hi` 面板只列这两个前缀,是要让 daemon 这台机器上的"AI 拉起来的活儿"

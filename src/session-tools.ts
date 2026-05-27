@@ -37,12 +37,9 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
   // 路径不会 +1 element,也无害 —— maybeMidTurnRotate 看到 count 没到
   // 阈值会直接 return。
   s.maybeMidTurnRotate()
-  // 模型出第一个工具 → 顶部 ticker 活体指示完成使命,清掉;footer 切到
-  // `⏳ working…` 接力做"还在干活"的指示。stopTicker 后续调用 handle
-  // null 时短路,所以多次 tool_use 安全。footer 同样写入由 cardkit 的
-  // lastEnqueued 自然去重,只会 PUT 一次。
-  s.stopTicker(s.currentTurn)
-  cardkit.streamTextThrottled(s.currentTurn.cardId, cards.ELEMENTS.footer, '⏳ working…')
+  // 模型出第一个工具 → footer 从 Thinking timer 切到 Working。后续
+  // tool_use 调用时 handle 已 null,stopThinkingFooter 短路。
+  s.stopThinkingFooter(s.currentTurn)
   // Close current assistant segment (if any) so the tool panel renders
   // AFTER it in card body order. Flush queues the segment's last
   // buffered delta before the tool element is inserted.
@@ -161,7 +158,10 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
   // arriving here is just the SDK's synthesised echo — re-rendering
   // via toolCallElement would clobber the nice option-row layout
   // with a generic JSON dump. Bail out; the panel is done.
-  if (meta.name === 'AskUserQuestion') return
+  if (meta.name === 'AskUserQuestion') {
+    startThinkingIfNoToolsRunning(s)
+    return
+  }
   // Read batch path: update this row's status in the shared batch then
   // re-render via the path-only `readBatchElement`. We never fall back
   // to `toolCallElement` for Read — single or batched, the panel only
@@ -174,6 +174,7 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
       const el = cards.readBatchElement(meta.i, batch.items)
       void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
     }
+    startThinkingIfNoToolsRunning(s)
     return
   }
   // Update the local todo mirror BEFORE rendering so the just-
@@ -191,6 +192,16 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
   if (!isError && isTaskWorkflow(meta.name)) {
     refreshOtherTaskPanels(s, toolUseId)
   }
+  startThinkingIfNoToolsRunning(s)
+}
+
+function startThinkingIfNoToolsRunning(s: Session): void {
+  const turn = s.currentTurn
+  if (!turn) return
+  for (const tool of turn.toolByUseId.values()) {
+    if (tool.output == null) return
+  }
+  s.startThinkingFooter(turn)
 }
 
 /** Roll a single Task* op into the local mirror — best-effort. Output

@@ -61,9 +61,9 @@ const previewMsgId = await feishu.sendText(
 log(`smoke: preface message_id=${previewMsgId ?? '(failed)'}`)
 
 // ── Drive Session ─────────────────────────────────────────────────────
-// bypassPermissions so smoke can exercise tool calls — there is no WS
-// listener in this script, so a permission card would dead-end.
-const session = new Session(sessionName, chatId, { permissionMode: 'bypassPermissions' })
+// Lodestar starts Codex with full access, so smoke can exercise tool calls
+// without a separate permission listener.
+const session = new Session(sessionName, chatId)
 await session.onUserMessage(userText, [])
 
 // ── Poll for completion ───────────────────────────────────────────────

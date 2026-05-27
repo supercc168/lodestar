@@ -58,11 +58,16 @@ function buildSpawnPath(): string {
 export interface SpawnOpts {
   workDir: string
   resumeSessionId?: string
-  model?: string
-  effort?: 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
-  permissionMode?: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'
+  model: string
+  effort: CodexReasoningEffort
   appendSystemPrompt?: string
 }
+
+export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+// ChatGPT web UI: GPT-5.5 → Pro → 进阶. app-server accepts this as
+// model=gpt-5.5pro with the highest Codex reasoning effort, xhigh.
+export const CODEX_MODEL = 'gpt-5.5pro'
+export const CODEX_EFFORT: CodexReasoningEffort = 'xhigh'
 
 export interface CanUseToolRequest {
   request_id: string
@@ -83,6 +88,7 @@ export interface HookCallbackRequest {
 export interface CodexUsage {
   input_tokens?: number
   output_tokens?: number
+  reasoning_output_tokens?: number
   cache_creation_input_tokens?: number
   cache_read_input_tokens?: number
 }
@@ -238,14 +244,20 @@ export class CodexProcess extends EventEmitter {
         return
       }
       case 'thread/tokenUsage/updated': {
-        const total = params.tokenUsage?.last ?? params.tokenUsage?.total
-        if (total) {
+        // `last` is the latest model request and therefore the current
+        // context-window footprint. `total` is cumulative across requests
+        // in the thread and must not drive context-window percentages.
+        const last = params.tokenUsage?.last
+        if (last) {
           this.lastUsage = {
-            input_tokens: numberOrUndefined(total.inputTokens),
-            output_tokens: numberOrUndefined(total.outputTokens),
-            cache_read_input_tokens: numberOrUndefined(total.cachedInputTokens),
+            input_tokens: numberOrUndefined(last.inputTokens),
+            output_tokens: numberOrUndefined(last.outputTokens),
+            reasoning_output_tokens: numberOrUndefined(last.reasoningOutputTokens),
+            cache_read_input_tokens: numberOrUndefined(last.cachedInputTokens),
           }
           this.lastResult.usage = this.lastUsage
+        } else {
+          log('codex-process: tokenUsage notification missing last breakdown')
         }
         const ctx = params.tokenUsage?.modelContextWindow
         if (typeof ctx === 'number' && ctx > 0) this.lastContextWindow = ctx
@@ -490,15 +502,13 @@ export class CodexProcess extends EventEmitter {
   }
 
   private threadParams(): Record<string, unknown> {
-    const effort = normalizeEffort(this.opts.effort)
     return {
       cwd: this.opts.workDir,
       runtimeWorkspaceRoots: [this.opts.workDir],
       approvalPolicy: 'never',
-      approvalsReviewer: 'user',
       sandbox: 'danger-full-access',
-      ...(this.opts.model ? { model: this.opts.model } : {}),
-      ...(effort ? { effort } : {}),
+      model: this.opts.model,
+      effort: this.opts.effort,
       ...(this.opts.appendSystemPrompt ? { developerInstructions: this.opts.appendSystemPrompt } : {}),
       serviceName: 'lodestar',
     }
@@ -535,16 +545,14 @@ export class CodexProcess extends EventEmitter {
     if (!this.readyPromise) this.sendInitialize()
     await this.readyPromise
     if (!this.sessionId) throw new Error('codex thread not initialized')
-    const effort = normalizeEffort(this.opts.effort)
     await this.request('turn/start', {
       threadId: this.sessionId,
       input: [{ type: 'text', text, text_elements: [] }],
       cwd: this.opts.workDir,
       approvalPolicy: 'never',
-      approvalsReviewer: 'user',
       sandboxPolicy: { type: 'dangerFullAccess' },
-      ...(this.opts.model ? { model: this.opts.model } : {}),
-      ...(effort ? { effort } : {}),
+      model: this.opts.model,
+      effort: this.opts.effort,
     })
   }
 
@@ -609,10 +617,6 @@ export class CodexProcess extends EventEmitter {
     this.respond(requestId, output)
   }
 
-  sendSetPermissionMode(_mode: 'default' | 'acceptEdits' | 'plan' | 'bypassPermissions'): void {
-    // FullAccess migration uses approvalPolicy=never + dangerFullAccess for the thread.
-  }
-
   isAlive(): boolean { return this.alive }
 
   async kill(timeoutMs = 5000): Promise<void> {
@@ -629,11 +633,6 @@ export class CodexProcess extends EventEmitter {
       try { this.proc.kill('SIGKILL') } catch {}
     }
   }
-}
-
-function normalizeEffort(effort: SpawnOpts['effort']): 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | undefined {
-  if (!effort) return undefined
-  return effort === 'max' ? 'xhigh' : effort
 }
 
 function numberOrUndefined(v: unknown): number | undefined {

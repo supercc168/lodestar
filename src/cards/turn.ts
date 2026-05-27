@@ -739,18 +739,14 @@ export function mainConversationCard(opts: MainCardOpts): object {
       },
     },
     body: {
-      // Initial body: [userInput panel?] + ticker (活体指示) + footer。
-      // assistant segments 和 tool panels insert_before footer 在 Codex
-      // streaming 时实时插入。
-      // 空字符串会被 CardKit PUT 拒,所以两个占位都用单空格;首条真写入
-      // 自动覆盖。footer 留单空格而不是 `⏳ working…` —— 顶部 ticker 已经
-      // 在"模型还在干活"这件事上做活体指示了,底部再喊一遍冗余且突兀。
-      // closeTurnCard 收尾时会 streamText 写真正的最终态 (`✅ 12.3s · 💰 $0.05`
-      // 之类)。
+      // Initial body: [handoff banner?] + [userInput panel?] + footer.
+      // Assistant segments and tool panels insert_before footer during
+      // Codex streaming. The footer itself is the only live status element:
+      // `Thinking...(Ns)` while the model is silent, `Working...` while
+      // content/tools are visible, and the terminal line when the turn ends.
       elements: [
         ...banner,
         ...userInputPanel,
-        { tag: 'markdown', element_id: ELEMENTS.ticker, content: ' ' },
         { tag: 'markdown', element_id: ELEMENTS.footer, content: ' ' },
       ],
     },

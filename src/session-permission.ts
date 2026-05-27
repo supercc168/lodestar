@@ -45,10 +45,6 @@ export async function onPermissionDecision(
   const codexDecision = decision === 'deny' ? 'deny' : 'allow'
   s.proc?.sendPermissionResponse(requestId, codexDecision)
 
-  if (decision === 'allow_always') {
-    s.proc?.sendSetPermissionMode('acceptEdits')
-  }
-
   if (s.pendingPermissions.size === 0 && s.status === 'awaiting_permission') {
     s.status = 'working'
   }

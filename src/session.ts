@@ -16,7 +16,7 @@
 
 import { existsSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
-import { CodexProcess, type CanUseToolRequest, type HookCallbackRequest, type CodexUsage } from './codex-process'
+import { CODEX_EFFORT, CODEX_MODEL, CodexProcess, type CanUseToolRequest, type HookCallbackRequest, type CodexUsage } from './codex-process'
 import { CHANNEL_INSTRUCTIONS } from './instructions'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
@@ -24,6 +24,7 @@ import * as feishu from './feishu'
 import { log } from './log'
 import { readSysInfo } from './sysinfo'
 import { readUsage, type UsageSnapshot } from './usage'
+import { contextLimitForModel, contextPercent, contextTokensFromUsage } from './context-window'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
@@ -33,21 +34,9 @@ export type { SessionOpts } from './session-types'
 
 const SEND_MARKER_RE = /\[\[send:\s*([^\]\n]+?)\s*\]\]/g
 
-/** "模型还在干活" 顶部 ticker 的备选动词。turn 起来时随机选一个、整 turn
- * 固定不变,setInterval 每 TICKER_TICK_MS (1s) 跑一次,只刷经过秒数 ——
- * 比让 verb 轮播视觉更稳。推理阶段没有稳定明文输出时,这个 ticker 就是
- * 唯一的活体信号。 */
-const TICKER_VERBS = [
-  '🤔 推敲',
-  '💭 琢磨',
-  '🧐 端详',
-  '🔍 钻研',
-  '✨ 构思',
-  '🧠 凝神',
-  '📐 推演',
-  '🎯 锁定',
-]
-const TICKER_TICK_MS = 1000
+const FOOTER_STATUS_TICK_MS = 1000
+const FOOTER_THINKING_PREFIX = 'Thinking...'
+const FOOTER_WORKING = 'Working...'
 
 /** Soft cap on element count per Feishu card before we proactively
  * rotate to a fresh one. The hard ceiling is NOT ~100 as once assumed:
@@ -70,15 +59,6 @@ const CARD_ELEMENT_SOFT_LIMIT = 50
  * Feishu rejects on every card) — without a cap that would spray an
  * endless trail of empty cards into the chat. */
 const MAX_MIDTURN_ROTATES = 5
-
-function modelContextLimit(model: string | null | undefined): number | null {
-  if (!model) return null
-  const normalized = model.toLowerCase()
-  if (normalized.startsWith('gpt-5.5')) return 1_050_000
-  if (normalized.startsWith('gpt-5.4')) return 1_050_000
-  if (normalized === 'gpt-5-codex' || normalized.startsWith('gpt-5-codex-')) return 400_000
-  return null
-}
 
 export class Session {
   /** Process-wide registry of every Session ever constructed in this daemon.
@@ -216,9 +196,6 @@ export class Session {
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
   private lastTurnDelta: LastTurnDelta | null = null
-  private contextBaselineTokens: number | null = null
-  private contextBaselineThreadId: string | null = null
-  private canInitializeContextBaseline = false
 
   constructor(
     public readonly sessionName: string,
@@ -232,12 +209,6 @@ export class Session {
     this.lastSessionId = feishu.getSessionResume(sessionName)
     if (this.lastSessionId) {
       log(`session "${sessionName}": restored lastSessionId=${this.lastSessionId.slice(0, 8)}…`)
-      const baseline = feishu.getSessionContextBaseline(sessionName, this.lastSessionId)
-      if (baseline) {
-        this.contextBaselineTokens = baseline.baselineTokens
-        this.contextBaselineThreadId = baseline.threadId
-        log(`session "${sessionName}": restored context baseline=${baseline.baselineTokens} for thread=${baseline.threadId.slice(0, 8)}…`)
-      }
     }
   }
 
@@ -274,14 +245,11 @@ export class Session {
       }
     }
 
-    this.contextBaselineTokens = null
-    this.contextBaselineThreadId = null
-    this.canInitializeContextBaseline = true
     this.status = 'starting'
     this.proc = new CodexProcess({
       workDir: this.workDir,
-      effort: 'max',
-      permissionMode: this.opts.permissionMode ?? 'bypassPermissions',
+      model: CODEX_MODEL,
+      effort: CODEX_EFFORT,
       appendSystemPrompt: CHANNEL_INSTRUCTIONS,
     })
     this.wireProc(this.proc)
@@ -377,7 +345,7 @@ export class Session {
     log(`session "${this.sessionName}": stop (${reason})`)
     const proc = this.proc
     this.proc = null
-    this.stopTicker(this.currentTurn)
+    this.stopThinkingFooter(this.currentTurn)
     this.currentTurn = null
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
@@ -400,7 +368,7 @@ export class Session {
       await this.proc.kill()
       this.proc = null
     }
-    this.stopTicker(this.currentTurn)
+    this.stopThinkingFooter(this.currentTurn)
     this.currentTurn = null
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
@@ -412,15 +380,11 @@ export class Session {
     this.pendingAsks.clear()
     this.pendingPermissions.clear()
     if (resume && prevSessionId) {
-      const baseline = feishu.getSessionContextBaseline(this.sessionName, prevSessionId)
-      this.contextBaselineTokens = baseline?.baselineTokens ?? null
-      this.contextBaselineThreadId = baseline?.threadId ?? null
-      this.canInitializeContextBaseline = false
       this.status = 'starting'
       this.proc = new CodexProcess({
         workDir: this.workDir,
-        effort: 'max',
-        permissionMode: this.opts.permissionMode ?? 'bypassPermissions',
+        model: CODEX_MODEL,
+        effort: CODEX_EFFORT,
         resumeSessionId: prevSessionId,
         appendSystemPrompt: CHANNEL_INSTRUCTIONS,
       })
@@ -457,9 +421,6 @@ export class Session {
       // zeroed counters instead of bleeding numbers from the prior chat.
       this.cumStats = { tokens: 0, costUsd: 0, turns: 0 }
       this.lastTurnDelta = null
-      this.contextBaselineTokens = null
-      this.contextBaselineThreadId = null
-      this.canInitializeContextBaseline = true
       return await this.start()
     }
   }
@@ -530,8 +491,8 @@ export class Session {
         // Must be set BEFORE sendInterrupt — the result can land next tick.
         this.userInterrupted = true
         this.interrupt()
-        // 主动封口,把 footer 改成 🛑 打断、折叠 thinking、把 streaming_mode
-        // 翻回 false,否则卡片会僵在 `⏳ working…`。SDK 的 post-interrupt
+        // 主动封口,把 footer 改成 🛑 打断、停止 thinking timer、把 streaming_mode
+        // 翻回 false,否则卡片会僵在运行中状态。SDK 的 post-interrupt
         // result 也会进 closeTurnCard,但 currentTurn 已被这里置空,那条
         // 路径会 early-return,不会重画 footer。
         await this.closeTurnCard('🛑 打断')
@@ -571,14 +532,14 @@ export class Session {
    * caller is responsible for the async patch if the panel was sent. */
   async buildConsoleCard(usage: UsageSnapshot | undefined): Promise<object> {
     const uptimeMs = this.startedAt ? (Date.now() - this.startedAt) : undefined
-    const rawModel = this.proc?.lastModel ?? null
+    const rawModel = this.proc?.lastModel ?? (this.proc ? CODEX_MODEL : null)
     const model = rawModel ?? undefined
     const sysinfo = await readSysInfo()
     return cards.consoleCard({
       sessionName: this.sessionName,
       status: this.status,
       model,
-      effort: 'max',
+      effort: CODEX_EFFORT,
       uptimeMs,
       peers: [...Session.all]
         .filter(s => s.isRunning())
@@ -891,9 +852,6 @@ export class Session {
     p.on('tool_result', ({ tool_use_id, content, is_error }: any) => {
       sessionTools.completeTool(this, tool_use_id, content, is_error)
     })
-    p.on('token_usage', ({ usage }: { usage: CodexUsage }) => {
-      this.captureContextBaseline(usage.input_tokens ?? 0)
-    })
     p.on('can_use_tool', (req: CanUseToolRequest) => {
       sessionPermission.renderPermission(this, req)
     })
@@ -939,7 +897,7 @@ export class Session {
     p.on('exit', ({ code, signal, expected }: any) => {
       log(`session "${this.sessionName}": codex exited code=${code} signal=${signal} expected=${expected}`)
       this.proc = null
-      this.stopTicker(this.currentTurn)
+      this.stopThinkingFooter(this.currentTurn)
       this.currentTurn = null
       this.pendingUserMessageCount = 0
       this.pendingMidTurnMsgs = []
@@ -987,51 +945,20 @@ export class Session {
     this.lastTurnDelta = { tokens, costUsd, durationMs }
   }
 
-  private captureContextBaseline(inputTokens: number): void {
-    if (!this.canInitializeContextBaseline || inputTokens <= 0) return
-    const threadId = this.proc?.sessionId
-    if (!threadId) return
-    this.contextBaselineTokens = inputTokens
-    this.contextBaselineThreadId = threadId
-    this.canInitializeContextBaseline = false
-    feishu.bindSessionContextBaseline(this.sessionName, threadId, inputTokens)
-    log(`session "${this.sessionName}": context baseline=${inputTokens} for thread=${threadId.slice(0, 8)}…`)
-  }
-
-  private contextBaselineForCurrentThread(): number | null {
-    const threadId = this.proc?.sessionId
-    if (!threadId || this.contextBaselineThreadId !== threadId) return null
-    return this.contextBaselineTokens
-  }
-
-  /** Effective context-window occupancy estimate. Codex's model-call
-   * `inputTokens` includes a large fixed system/tool prompt; after the
-   * first tokenUsage event of a fresh thread, subtract that baseline so
-   * the UI tracks growth against the usable remaining window.
-   * `cachedInputTokens` is a subset of `inputTokens`, not extra context.
-   * Returns 0 when no per-call usage is available. */
+  /** Current context-window occupancy estimate. Codex app-server reports
+   * the latest model request in tokenUsage.last; its inputTokens is the
+   * actual prompt size sent to the model. cachedInputTokens is a subset
+   * breakdown of that value, not extra context. */
   private currentContextTokens(): number {
     const u = this.proc?.lastUsage as CodexUsage | null | undefined
-    if (!u) return 0
-    const inputTokens = u.input_tokens ?? 0
-    const baseline = this.contextBaselineForCurrentThread()
-    return baseline == null ? inputTokens : Math.max(0, inputTokens - baseline)
+    return contextTokensFromUsage(u)
   }
 
-  /** Display denominator for context percentage. Use known model-card
-   * context windows instead of Codex app-server's modelContextWindow; the
-   * latter is not documented clearly enough for a user-facing percentage. */
+  /** Display denominator for context percentage, sourced from the
+   * documented maximum window of the running model. app-server's
+   * tokenUsage.modelContextWindow is not the public model maximum. */
   private contextLimitForDisplay(): number | null {
-    const rawLimit = modelContextLimit(this.proc?.lastModel)
-    if (rawLimit == null) return null
-    const baseline = this.contextBaselineForCurrentThread()
-    if (baseline == null) return rawLimit
-    const effectiveLimit = rawLimit - baseline
-    if (effectiveLimit <= 0) {
-      log(`session "${this.sessionName}": invalid context baseline=${baseline} rawLimit=${rawLimit}`)
-      return null
-    }
-    return effectiveLimit
+    return contextLimitForModel(this.proc?.lastModel)
   }
 
   /** Drain `pendingMidTurnMsgs` to the SDK and open a fresh card for the
@@ -1097,7 +1024,7 @@ export class Session {
     const card = cards.mainConversationCard({
       sessionName: this.sessionName,
       turn,
-      effort: 'max',
+      effort: CODEX_EFFORT,
       kind: trigger,
       userInputs,
     })
@@ -1126,10 +1053,10 @@ export class Session {
     catch (e) { log(`session "${this.sessionName}": id_convert failed: ${e}`); return }
     // Tell cardkit how many elements the initial body already has so
     // its element-count tracker is correct from the first addElement
-    // onwards (userInputPanel + ticker + footer).
+    // onwards (userInputPanel + footer).
     const initialElementCount =
       (userInputs.length > 0 ? 1 : 0) +
-      2
+      1
     cardkit.recordCardCreated(cardId, initialElementCount, (code) => this.onCardWriteFailure(code))
     const turnState: TurnState = {
       cardId,
@@ -1145,7 +1072,8 @@ export class Session {
       currentAssistantText: '',
       segmentTexts: new Map(),
       startedAt: Date.now(),
-      tickerHandle: null,
+      thinkingFooterHandle: null,
+      thinkingFooterStartedAt: 0,
       rotating: null,
       rotateCount: 0,
       rotateGivenUp: false,
@@ -1153,7 +1081,7 @@ export class Session {
       outboundSentPaths: new Set(),
     }
     this.currentTurn = turnState
-    this.startTicker(turnState)
+    this.startThinkingFooter(turnState)
   }
 
   /** Cheap synchronous check called from stream handlers right before
@@ -1231,7 +1159,7 @@ export class Session {
         const card = cards.mainConversationCard({
           sessionName: this.sessionName,
           turn: this.turnCounter,
-          effort: 'max',
+          effort: CODEX_EFFORT,
           kind: 'card_full',
           userInputs: [],
         })
@@ -1250,12 +1178,12 @@ export class Session {
           log(`session "${this.sessionName}": mid-turn rotate id_convert failed: ${e}`)
           return
         }
-        // card_full body has banner(1) + ticker(1) + footer(1) = 3 elements.
-        cardkit.recordCardCreated(newCardId, 3, (code) => this.onCardWriteFailure(code))
+        // card_full body has banner(1) + footer(1) = 2 elements.
+        cardkit.recordCardCreated(newCardId, 2, (code) => this.onCardWriteFailure(code))
         // 同步 swap：从这一行起,后续 stream handler 看到的 turn.cardId
         // 是新卡。reset 所有 element-id 引用 (toolCount / assistantSegmentCount
         // 等),旧卡上的 element_id 在新卡里查不到,继续 PUT 会 300313。
-        this.stopTicker(turn)
+        this.stopThinkingFooter(turn)
         turn.cardId = newCardId
         turn.messageId = newMessageId
         turn.toolCount = 0
@@ -1270,7 +1198,8 @@ export class Session {
         turn.currentAssistantSegmentId = null
         turn.currentAssistantText = ''
         turn.segmentTexts = new Map()
-        this.startTicker(turn)
+        if (carryText) cardkit.streamTextThrottled(turn.cardId, cards.ELEMENTS.footer, FOOTER_WORKING)
+        else this.startThinkingFooter(turn)
         // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read 切开重建。
         sessionTools.rebuildToolsOnRotate(this, oldCardId, newCardId, oldToolByUseId, oldBatches)
         // 重建出错内容:旧卡上没渲染成功的当前 assistant 段(addElement 被拒、
@@ -1324,13 +1253,9 @@ export class Session {
   private appendAssistant(delta: string): void {
     if (!this.currentTurn) return
     const turn = this.currentTurn
-    // 第一条 assistant text_delta 到达 → 顶部 ticker 活体指示完成使命,
-    // 清掉;footer 切到 `⏳ working…` 接力做"还在干活"指示(跟顶部
-    // ticker 互斥:同一时刻只有一处亮)。后续 delta 跑时 ticker handle
-    // 已 null、stopTicker 短路;footer 的 streamThrottled 由 cardkit
-    // lastEnqueued 自然去重,只 PUT 一次。
-    this.stopTicker(turn)
-    cardkit.streamTextThrottled(turn.cardId, cards.ELEMENTS.footer, '⏳ working…')
+    // 第一条 assistant text_delta 到达 → footer 从 Thinking timer 切到
+    // Working。后续 delta 跑时 thinking footer handle 已 null,stopThinkingFooter 短路。
+    this.stopThinkingFooter(turn)
     if (!turn.currentAssistantSegmentId) {
       // New assistant segment opens a visual break — any prior Read run
       // is now visually separated from future Reads, so close the batch
@@ -1449,40 +1374,33 @@ export class Session {
     void feishu.uploadAndSend(this.chatId, p)
   }
 
-  /** 启动 ticker 元素的活体指示。turn 起来时随机选一个 verb,整 turn
-   * 固定不变,setInterval 每 TICKER_TICK_MS (1s) 跑一次,刷新经过秒数。
-   * 先 setInterval 再 render 是故意的 —— 同步首帧时 tickerHandle 已经
-   * set,render 内部的 handle 自检不会误短路;首帧后下一帧要等 1s,
-   * 视觉上 ticker 上来就有内容,无空白窗口。 */
-  startTicker(turn: TurnState): void {
-    if (turn.tickerHandle) return
-    const verb = TICKER_VERBS[Math.floor(Math.random() * TICKER_VERBS.length)]
+  /** Start the footer thinking indicator. It lives in the stable footer
+   * element instead of a throwaway top element; deleting that first live
+   * element can make Feishu's typewriter drop the first assistant segment. */
+  startThinkingFooter(turn: TurnState): void {
+    if (turn.thinkingFooterHandle) return
+    turn.thinkingFooterStartedAt = Date.now()
     const render = (): void => {
-      // 自检:clearInterval 不撤销已经被 V8 dispatch 进事件循环的那次
-      // callback。stopTicker 把 handle 置 null 后这里短路,避免漏一帧
-      // 把刚 deleteElement 的 ticker 又 replaceElement 回 verb 文本(此时
-      // ticker 元素不存在,PUT 会失败但污染日志)。
-      if (turn.tickerHandle == null) return
-      const elapsedS = Math.floor((Date.now() - turn.startedAt) / 1000)
-      void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.ticker, {
-        tag: 'markdown',
-        element_id: cards.ELEMENTS.ticker,
-        content: `_${verb}中… (${elapsedS}s)_`,
-      })
+      if (turn.thinkingFooterHandle == null) return
+      const elapsedS = Math.max(1, Math.floor((Date.now() - turn.thinkingFooterStartedAt) / 1000))
+      void cardkit.streamTextThrottled(
+        turn.cardId,
+        cards.ELEMENTS.footer,
+        `${FOOTER_THINKING_PREFIX}(${elapsedS}s)`,
+      )
     }
-    turn.tickerHandle = setInterval(render, TICKER_TICK_MS)
+    turn.thinkingFooterHandle = setInterval(render, FOOTER_STATUS_TICK_MS)
     render()
   }
 
-  /** 清掉 ticker 并把 ticker 元素从卡片上彻底删掉。调用方负责自己把
-   * footer 切到下一态(`⏳ working…` 或 `✅ ...`)。所有 turn 退出路径
-   * 都得调:首条 assistant_text、首个 tool_use、closeTurnCard、stop/
-   * restart/exit。允许 turn 为 null 让调用方少一道判断。 */
-  stopTicker(turn: TurnState | null): void {
-    if (!turn || !turn.tickerHandle) return
-    clearInterval(turn.tickerHandle)
-    turn.tickerHandle = null
-    void cardkit.deleteElement(turn.cardId, cards.ELEMENTS.ticker)
+  /** Stop the thinking timer and leave the stable footer in working state.
+   * There is deliberately no deleteElement here. */
+  stopThinkingFooter(turn: TurnState | null): void {
+    if (!turn || !turn.thinkingFooterHandle) return
+    clearInterval(turn.thinkingFooterHandle)
+    turn.thinkingFooterHandle = null
+    turn.thinkingFooterStartedAt = 0
+    void cardkit.streamTextThrottled(turn.cardId, cards.ELEMENTS.footer, FOOTER_WORKING)
   }
 
   private async closeTurnCard(suffix?: string, opts: { forcePush?: boolean } = {}): Promise<void> {
@@ -1495,7 +1413,7 @@ export class Session {
     const turn = this.currentTurn
     if (!turn) return
     this.currentTurn = null
-    this.stopTicker(turn)
+    this.stopThinkingFooter(turn)
     const elapsed = ((Date.now() - turn.startedAt) / 1000).toFixed(1)
     const cardId = turn.cardId
     const segmentTexts = turn.segmentTexts
@@ -1541,8 +1459,8 @@ export class Session {
     if (!suffix) {
       const ctxTokens = this.currentContextTokens()
       const ctxMax = this.contextLimitForDisplay()
-      if (ctxMax !== null && ctxMax > 0) {
-        const pct = Math.round((ctxTokens / ctxMax) * 100)
+      const pct = contextPercent(ctxTokens, ctxMax)
+      if (pct !== null) {
         metrics += ` · 📊 ${pct}%`
       }
       const cost = this.lastTurnDelta?.costUsd ?? 0

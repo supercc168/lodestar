@@ -102,7 +102,7 @@ function state(cardId: string): CardState {
 
 /** Session calls this once right after sendCard + convertMessageToCard,
  * passing the number of elements that were in the card's initial body
- * (banner + userInputPanel + ticker + footer = 2–4 depending on turn
+ * (banner + userInputPanel + footer = 1–3 depending on turn
  * kind). Without this, the element-count tracker only sees adds/deletes
  * that happen *after* card creation, and session can't reliably decide
  * "is this card close to the limit?" — that's the data point that

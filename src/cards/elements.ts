@@ -4,18 +4,15 @@
  *                       Codex 收到的 user wireText(多条 mid-turn 合并的就是 N>1)。
  *                       默认 expanded=false,把"自己刚才说了啥"收纳进卡片自己,
  *                       不必滚群里找原消息。
- *   ticker            — top-of-card 活体指示,每 1s 跳一次,只刷秒数(verb 是
- *                       turn 起时随机选的、固定不变)。首条 assistant text /
- *                       tool_use 到达时 deleteElement 掉,footer 切到 working。
- *                       推理阶段没有稳定明文输出时,这个 ticker 就是 turn
- *                       中段唯一的活体信号。
  *   tool_<i>          — one collapsible per tool call, indexed from 0
  *   assistant         — the main streaming assistant answer
- *   footer            — runtime footer (timing / status)
+ *   footer            — runtime footer. While the model is thinking it
+ *                       shows `Thinking...(Ns)`; while visible work is
+ *                       streaming/running it shows `Working...`; at turn
+ *                       close it becomes the terminal status line.
  */
 export const ELEMENTS = {
   userInput: 'user_input',
-  ticker: 'ticker',
   footer: 'footer',
   tool: (i: number) => `tool_${i}`,
   /** Assistant text is segmented: every tool call closes the running segment

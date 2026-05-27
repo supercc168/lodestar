@@ -484,7 +484,6 @@ async function boot(): Promise<void> {
   log(`lodestar-daemon: pid ${process.pid} starting`)
   feishu.loadSessionChatMap()
   feishu.loadSessionResumeMap()
-  feishu.loadSessionContextBaselineMap()
   await feishu.refreshChatList()
   setInterval(() => { void feishu.refreshChatList() }, 5 * 60 * 1000)
 
