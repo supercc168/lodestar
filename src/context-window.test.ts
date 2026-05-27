@@ -17,10 +17,10 @@ describe('context window display', () => {
   })
 
   test('uses documented model window as denominator', () => {
-    const limit = contextLimitForModel('gpt-5.5pro')
+    const limit = contextLimitForModel('gpt-5-codex')
 
-    expect(limit).toBe(1_000_000)
-    expect(contextPercent(35_190, limit)).toBe(4)
+    expect(limit).toBe(400_000)
+    expect(contextPercent(35_190, limit)).toBe(9)
   })
 
   test('keeps unknown model limits unknown', () => {
@@ -32,10 +32,10 @@ describe('context window display', () => {
       sessionName: 'probe',
       status: 'idle',
       contextTokens: 35_190,
-      contextLimit: contextLimitForModel('gpt-5.5pro'),
+      contextLimit: contextLimitForModel('gpt-5-codex'),
     })
 
-    expect(JSON.stringify(card)).toContain('35K / 1M')
-    expect(JSON.stringify(card)).toContain('(4%)')
+    expect(JSON.stringify(card)).toContain('35K / 400K')
+    expect(JSON.stringify(card)).toContain('(9%)')
   })
 })

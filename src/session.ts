@@ -16,7 +16,7 @@
 
 import { existsSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
-import { CODEX_EFFORT, CODEX_MODEL, CodexProcess, type CanUseToolRequest, type HookCallbackRequest, type CodexUsage } from './codex-process'
+import { CODEX_EFFORT, CodexProcess, type CanUseToolRequest, type HookCallbackRequest, type CodexUsage } from './codex-process'
 import { CHANNEL_INSTRUCTIONS } from './instructions'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
@@ -372,7 +372,6 @@ export class Session {
     report?.('🚀 启动 Codex')
     this.proc = new CodexProcess({
       workDir: this.workDir,
-      model: CODEX_MODEL,
       effort: CODEX_EFFORT,
       appendSystemPrompt: CHANNEL_INSTRUCTIONS,
     })
@@ -517,7 +516,6 @@ export class Session {
       report?.(`🔁 恢复 thread=${prevSessionId.slice(0, 8)}…`)
       this.proc = new CodexProcess({
         workDir: this.workDir,
-        model: CODEX_MODEL,
         effort: CODEX_EFFORT,
         resumeSessionId: prevSessionId,
         appendSystemPrompt: CHANNEL_INSTRUCTIONS,
@@ -716,7 +714,7 @@ export class Session {
    * caller is responsible for the async patch if the panel was sent. */
   async buildConsoleCard(usage: UsageSnapshot | undefined): Promise<object> {
     const uptimeMs = this.startedAt ? (Date.now() - this.startedAt) : undefined
-    const rawModel = this.proc?.lastModel ?? (this.proc ? CODEX_MODEL : null)
+    const rawModel = this.proc?.lastModel ?? null
     const model = rawModel ?? undefined
     const sysinfo = await readSysInfo()
     return cards.consoleCard({

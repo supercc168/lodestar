@@ -11,6 +11,7 @@ export function contextLimitForModel(model: string | null | undefined): number |
   if (!model) return null
 
   const normalized = model.toLowerCase()
+  if (normalized === 'gpt-5-codex' || normalized.startsWith('gpt-5-codex-')) return 400_000
   if (normalized === 'gpt-5.5' || normalized.startsWith('gpt-5.5')) return 1_000_000
   if (normalized === 'gpt-5.4' || normalized.startsWith('gpt-5.4-')) return 1_050_000
   if (normalized === 'gpt-4.1' || normalized.startsWith('gpt-4.1-')) return 1_000_000

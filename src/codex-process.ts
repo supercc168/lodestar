@@ -58,15 +58,12 @@ function buildSpawnPath(): string {
 export interface SpawnOpts {
   workDir: string
   resumeSessionId?: string
-  model: string
+  model?: string
   effort: CodexReasoningEffort
   appendSystemPrompt?: string
 }
 
 export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
-// ChatGPT web UI: GPT-5.5 → Pro → 进阶. app-server accepts this as
-// model=gpt-5.5pro with the highest Codex reasoning effort, xhigh.
-export const CODEX_MODEL = 'gpt-5.5pro'
 export const CODEX_EFFORT: CodexReasoningEffort = 'xhigh'
 
 export interface CanUseToolRequest {
@@ -507,7 +504,7 @@ export class CodexProcess extends EventEmitter {
       runtimeWorkspaceRoots: [this.opts.workDir],
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
-      model: this.opts.model,
+      ...(this.opts.model ? { model: this.opts.model } : {}),
       effort: this.opts.effort,
       ...(this.opts.appendSystemPrompt ? { developerInstructions: this.opts.appendSystemPrompt } : {}),
       serviceName: 'lodestar',
@@ -551,7 +548,7 @@ export class CodexProcess extends EventEmitter {
       cwd: this.opts.workDir,
       approvalPolicy: 'never',
       sandboxPolicy: { type: 'dangerFullAccess' },
-      model: this.opts.model,
+      ...(this.opts.model ? { model: this.opts.model } : {}),
       effort: this.opts.effort,
     })
   }
