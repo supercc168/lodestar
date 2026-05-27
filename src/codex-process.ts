@@ -13,7 +13,7 @@
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { basename, delimiter, join } from 'node:path'
+import { delimiter, join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import type { Readable, Writable } from 'node:stream'
 import { config } from './config'
@@ -135,7 +135,7 @@ export class CodexProcess extends EventEmitter {
   constructor(opts: SpawnOpts) {
     super()
     // EventEmitter treats unhandled `error` specially. We still expose it
-    // for Session/schedule logging, but a direct utility script should not
+    // for Session logging, but a direct utility script should not
     // crash before it can surface the app-server failure.
     this.on('error', () => {})
     this.opts = opts
@@ -490,7 +490,6 @@ export class CodexProcess extends EventEmitter {
   }
 
   private threadParams(): Record<string, unknown> {
-    const project = basename(this.opts.workDir)
     const effort = normalizeEffort(this.opts.effort)
     return {
       cwd: this.opts.workDir,
@@ -501,14 +500,6 @@ export class CodexProcess extends EventEmitter {
       ...(this.opts.model ? { model: this.opts.model } : {}),
       ...(effort ? { effort } : {}),
       ...(this.opts.appendSystemPrompt ? { developerInstructions: this.opts.appendSystemPrompt } : {}),
-      config: {
-        mcp_servers: {
-          lodestar_schedule: {
-            type: 'streamable_http',
-            url: `http://127.0.0.1:${config.notify.port}/mcp/${encodeURIComponent(project)}`,
-          },
-        },
-      },
       serviceName: 'lodestar',
     }
   }

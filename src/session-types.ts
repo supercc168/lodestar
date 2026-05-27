@@ -15,12 +15,8 @@ export interface TurnState {
    * urgent_app push so only the initiator gets pinged (in case there
    * are other members in the group). Empty string → skip the ping. */
   userOpenId: string
-  /** What kicked off this turn. Only `'user_message'` turns fire the
-   * end-of-turn urgent_app push — scheduled / cron / loop wakeups
-   * finish on their own time and pinging the user would be noise,
-   * not signal. Ask / permission urgents inside the turn still fire
-   * regardless (those genuinely need attention even mid-schedule). */
-  trigger: 'user_message' | 'scheduled'
+  /** What kicked off this turn. Kept explicit for turn lifecycle logic. */
+  trigger: 'user_message'
   toolCount: number
   /** `output` / `isError` are filled in by completeTool — kept on the
    * meta (instead of being thrown away after the first render) so a

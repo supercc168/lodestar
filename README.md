@@ -67,10 +67,6 @@ curl -X POST http://127.0.0.1:9876/notify \
   -d '{"project":"xxx","text":"build done"}'
 ```
 
-### ⏰ 定时任务
-
-在群里跟 Codex 说"每天早上 9 点总结昨天 PR",它自己排好。每次 fire 起一个干净的 Codex 线程跑,不累上下文,silent / verbose 二选一,`hi` 面板带删/切按钮。
-
 ---
 
 > [!TIP]

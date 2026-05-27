@@ -62,8 +62,7 @@ Card Kit card per turn.
 
 ### Release Checklist
 
-- Bump both `package.json` version and `SERVER_INFO.version` in
-  `src/mcp-server.ts`.
+- Bump `package.json` version.
 - Verify with `bun test` and `bun run build`.
 - Commit the release bump, tag `vX.Y.Z`, push `main`, and push the tag.
 - Publish npm with `npm publish --access public`.

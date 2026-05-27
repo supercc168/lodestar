@@ -24,7 +24,6 @@ import * as feishu from './feishu'
 import { log } from './log'
 import { readSysInfo } from './sysinfo'
 import { readUsage, type UsageSnapshot } from './usage'
-import { listSchedules } from './schedule'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
@@ -148,10 +147,7 @@ export class Session {
    * `currentTurn=yes` in the init handler leaves pendingCount stale (>0)
    * until the GC at the next `onUserMessage`; if it takes the split
    * path, the second init sees pendingCount>0 and correctly classifies
-   * the trailing batch as user-batch (not a scheduled wakeup).
-   * Distinguishes user-msg turns from cron-fired scheduled
-   * wakeups: count > 0 ⇒ user; count === 0 ⇒ scheduled (and
-   * `initCount > 1`). */
+   * the trailing batch as user-batch. */
   private pendingUserMessageCount = 0
   /** Mid-turn user messages buffered DAEMON-SIDE (not yet sendUserText'd
    * to the SDK). Drained in the `result` handler by writing each to SDK
@@ -190,13 +186,12 @@ export class Session {
   /** Snapshot of `pendingReactionIds` taken when the init handler
    * claims a merged batch — these are the Feishu messages whose
    * OneSecond reactions are the currently-open turn's responsibility
-   * to clear (via deleteReaction). Empty for eager-opened solo turns
-   * and for scheduled wakeups (no user messages went into those). */
+   * to clear (via deleteReaction). Empty for eager-opened solo turns. */
   private currentBatchReactionIds = new Map<string, string>()
   /** Count of `system/init` events seen this subprocess. The first one is
-   * the boot init (claimed by whichever user message lands first); all
-   * subsequent ones mark the start of an SDK-initiated turn (queued
-   * user message draining or a CronCreate fire). Reset on stop/restart/exit
+   * the boot init (claimed by whichever user message lands first); later
+   * ones can mark the start of SDK-driven queued user message draining.
+   * Reset on stop/restart/exit
    * since `init` re-fires after every spawn. */
   private initCount = 0
   /** Sync guard set before any `await` in the eager-open path of
@@ -204,8 +199,8 @@ export class Session {
    * where an SDK-emitted `init` event lands during the eager open's
    * Feishu API await — without this, the init handler would observe
    * `currentTurn === null && queue empty` (we've already shifted) and
-   * incorrectly open a *second* scheduled card for the same user
-   * message. The flag tells the init handler "an eager open is already
+   * incorrectly open a second card for the same user message. The flag
+   * tells the init handler "an eager open is already
    * claiming the slot, stand down". */
   private openingTurn = false
   private turnCounter = 0
@@ -572,12 +567,8 @@ export class Session {
 
   /** Build the hi-panel card object for this session.
    *
-   * Pulled out of `showConsole` so callback handlers (e.g. schedule
-   * delete / toggle-mode buttons) can re-render the panel in place via
-   * `update_multi: true` without having to send a fresh message. Passing
-   * `usage=undefined` paints the `_加载中…_` placeholder — the caller is
-   * responsible for the async patch if the panel was sent (not just
-   * returned in a callback response). */
+   * Passing `usage=undefined` paints the `_加载中…_` placeholder — the
+   * caller is responsible for the async patch if the panel was sent. */
   async buildConsoleCard(usage: UsageSnapshot | undefined): Promise<object> {
     const uptimeMs = this.startedAt ? (Date.now() - this.startedAt) : undefined
     const rawModel = this.proc?.lastModel ?? null
@@ -605,17 +596,6 @@ export class Session {
         : undefined,
       sessionId: this.proc?.sessionId ?? this.lastSessionId,
       sysinfo,
-      // List ALL schedules across every project — hi panel is a global
-      // dashboard. Each panel shows its `project` so the user can tell
-      // them apart; the buttons (toggle / delete) also operate
-      // cross-project, no per-session scoping. The MCP path (Codex
-      // invoking schedule_create/delete from inside a chat) still
-      // scopes by project — that's a different attack surface (Codex
-      // running with arbitrary prompts inside one group shouldn't be
-      // able to nuke another group's schedules), while the hi card is
-      // operator-only (only humans in your bound groups can press the
-      // button).
-      schedules: listSchedules(),
     })
   }
 
@@ -847,10 +827,9 @@ export class Session {
       // eager-open path — if a user message landed before the init
       // arrived, it sits in `pendingUserMessageCount` and we drain it
       // below; otherwise the init opens nothing. Subsequent inits
-      // (initCount >= 2) mark the start of an SDK-initiated turn:
-      // either the SDK is draining the type-ahead queue we fed it via
-      // `sendUserText` (isUserBatch), or it's a CronCreate /
-      // ScheduleWakeup fire from idle (isScheduledFire).
+      // (initCount >= 2) can mark the start of an SDK-initiated turn
+      // when the SDK is draining the type-ahead queue we fed it via
+      // `sendUserText` (isUserBatch).
       //
       // SDK-driven rotation puts the boundary HERE: the previous
       // turn's `result` already closed the in-flight card with
@@ -860,12 +839,8 @@ export class Session {
       // the openingTurn guard catches the eager-open vs init race.
       if (this.currentTurn || this.openingTurn) return
       const isUserBatch = this.pendingUserMessageCount > 0
-      const isScheduledFire = !isUserBatch && this.initCount > 1
-      if (!isUserBatch && !isScheduledFire) return
-      const trigger: 'user_message' | 'scheduled' = isUserBatch ? 'user_message' : 'scheduled'
-      // user_message 继承 lastUserOpenId(原 sender),让最终 success push
-      // 还能找到要 phone-notify 谁。scheduled 没 sender,留空。
-      const userOpenId = trigger === 'scheduled' ? '' : this.lastUserOpenId
+      if (!isUserBatch) return
+      const userOpenId = this.lastUserOpenId
       if (isUserBatch) {
         this.pendingUserMessageCount = 0
         // Inherit the queued reaction_ids — this turn is collectively
@@ -877,7 +852,7 @@ export class Session {
       this.openingTurn = true
       void (async () => {
         try {
-          await this.openTurnCard(userOpenId, trigger)
+          await this.openTurnCard(userOpenId, 'user_message')
           if (!this.currentTurn) {
             // SDK already started this turn (its `init` is what got us
             // here) but we have no card to render into. Interrupt so
@@ -1078,7 +1053,7 @@ export class Session {
    *
    * pendingCount 一次 ++(对应一次 sendUserText)。因为 SDK 不再拆 turn,
    * commit 2258af4 当年用累加保护 spurious 第二 turn 的逻辑不再需要 —
-   * SDK 不会自发开 user_batch 子 turn,init handler 也不会误判 scheduled。 */
+   * SDK 不会自发开 user_batch 子 turn。 */
   private async drainMidTurnAndOpen(): Promise<void> {
     if (this.pendingMidTurnMsgs.length === 0) return
     const batch = this.pendingMidTurnMsgs
@@ -1111,12 +1086,11 @@ export class Session {
     }
   }
 
-  private async openTurnCard(userOpenId: string, trigger: 'user_message' | 'scheduled'): Promise<void> {
+  private async openTurnCard(userOpenId: string, trigger: 'user_message'): Promise<void> {
     const turn = ++this.turnCounter
     // Snapshot+clear pendingTurnInputs synchronously here so concurrent
     // pushes between snapshot and the await don't sneak into THIS turn's
-    // panel (they'll be picked up by the next turn's open). scheduled
-    // turns clear too — they shouldn't carry stale inputs from prior runs.
+    // panel (they'll be picked up by the next turn's open).
     const userInputs = this.pendingTurnInputs
     this.pendingTurnInputs = []
     log(`session "${this.sessionName}": openTurnCard turn=${turn} trigger=${trigger} inputs=${userInputs.length}`)
@@ -1125,7 +1099,7 @@ export class Session {
       turn,
       effort: 'max',
       kind: trigger,
-      userInputs: trigger === 'user_message' ? userInputs : [],
+      userInputs,
     })
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) {
@@ -1152,11 +1126,9 @@ export class Session {
     catch (e) { log(`session "${this.sessionName}": id_convert failed: ${e}`); return }
     // Tell cardkit how many elements the initial body already has so
     // its element-count tracker is correct from the first addElement
-    // onwards (banner + userInputPanel + ticker + footer — the latter
-    // two are constant, the former two depend on trigger / userInputs).
+    // onwards (userInputPanel + ticker + footer).
     const initialElementCount =
-      (trigger === 'scheduled' ? 1 : 0) +
-      (trigger === 'user_message' && userInputs.length > 0 ? 1 : 0) +
+      (userInputs.length > 0 ? 1 : 0) +
       2
     cardkit.recordCardCreated(cardId, initialElementCount, (code) => this.onCardWriteFailure(code))
     const turnState: TurnState = {
@@ -1593,14 +1565,13 @@ export class Session {
     // Phone push on clean turn close so the user knows Codex is done
     // even with the chat backgrounded. Skip on interrupts (no real
     // completion), when we don't know who to ping, and when the turn
-    // wasn't kicked off by the user typing a message — scheduled /
-    // cron / loop wakeups finish on their own and shouldn't ping the
-    // phone. `opts.forcePush` overrides the suffix-gate for the
+    // wasn't kicked off by the user typing a message. `opts.forcePush`
+    // overrides the suffix-gate for the
     // "consecutive SDK errors, giving up" case — that close has a non-
     // empty suffix but the user still needs to know we bailed.
     // Fire-and-forget; urgent_app failures are non-fatal and already
     // logged in feishu.ts.
-    if ((opts.forcePush || !suffix) && turn.trigger === 'user_message' && turn.userOpenId && turn.messageId) {
+    if ((opts.forcePush || !suffix) && turn.userOpenId && turn.messageId) {
       void feishu.urgentApp(turn.messageId, [turn.userOpenId])
     }
 

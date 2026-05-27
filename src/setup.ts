@@ -364,7 +364,7 @@ export async function runSetup(): Promise<void> {
     console.log(`日志:`)
     console.log(`  ${C.cyan}${logPath}${C.reset}`)
     console.log()
-    console.log(`${C.dim}若长期跑后台, 参考 README "7×24 守护" 一节配 systemd / Task Scheduler。${C.reset}`)
+    console.log(`${C.dim}若长期跑后台, 参考 README "7×24 守护" 一节配 systemd / Windows 后台托管。${C.reset}`)
   } else {
     console.log(`${C.yellow}启动失败: ${r.error}${C.reset}`)
     console.log(`手动运行: ${C.cyan}lodestar-daemon${C.reset}`)

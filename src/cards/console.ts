@@ -6,7 +6,6 @@
 
 import { SERVICE_LABEL, type SysInfo } from '../sysinfo'
 import type { UsageSnapshot } from '../usage'
-import type { Schedule } from '../schedule'
 import { ELEMENTS } from './elements'
 
 interface ConsoleOpts {
@@ -43,11 +42,6 @@ interface ConsoleOpts {
    * undefined → 略过整个 host 段;数据自身字段缺失 (cpu/mem 为 null)
    * 时单行渲染 `_n/a_`,不假数据。 */
   sysinfo?: SysInfo
-  /** Per-project scheduled tasks. Empty array → render 一行 `_无_`;
-   * undefined → 整段省略 (调用方没传)。 schedules 渲染段的所有按钮
-   * (切换 mode / 删除) 都通过 daemon callback 走 update_multi 原地刷新
-   * 当前 hi 面板,不会刷出新卡。 */
-  schedules?: Schedule[]
 }
 
 function fmtBytes(n: number): string {
@@ -172,81 +166,6 @@ const SERVICE_STATUS_EMOJI: Record<string, string> = {
   inactive: '⚪', deactivating: '🟡', failed: '❌',
 }
 
-/** Format "next fire" as a "今天 HH:MM" / "明天 HH:MM" / "MM-DD HH:MM"
- * approximation that's easier to read than a full ISO string in a card. */
-function fmtNextFire(nextFireAtMs: number): string {
-  const d = new Date(nextFireAtMs)
-  const now = new Date()
-  const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
-  // strip time to compare just dates
-  const sameDay = (a: Date, b: Date) =>
-    a.getFullYear() === b.getFullYear() && a.getMonth() === b.getMonth() && a.getDate() === b.getDate()
-  const tomorrow = new Date(now); tomorrow.setDate(tomorrow.getDate() + 1)
-  if (sameDay(d, now)) return `今天 ${hhmm}`
-  if (sameDay(d, tomorrow)) return `明天 ${hhmm}`
-  return `${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')} ${hhmm}`
-}
-
-function escapeMd(s: string): string {
-  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
-}
-
-/** Render one schedule entry as a collapsible_panel with two callback
- * buttons (toggle mode / delete). Cross-project: hi panel lists every
- * schedule daemon-wide, so each panel surfaces its `project` in both
- * the collapsed header and the expanded body — that's how the user
- * tells them apart at a glance. Button callbacks carry just the id;
- * `handleCardAction` looks up the schedule and operates on it
- * regardless of which chat the button was pressed in. */
-function schedulePanel(s: Schedule): object {
-  const modeIcon = s.mode === 'verbose' ? '📜' : '🔕'
-  const modeLabel = s.mode === 'verbose' ? 'verbose' : 'silent'
-  const trigger = s.cron ? `\`${s.cron}\`` : `一次性 · ${fmtNextFire(s.nextFireAt)}`
-  const headerText = `⏰ ${s.name} · 📁 ${s.project} · ${modeIcon} ${modeLabel} · 下次 ${fmtNextFire(s.nextFireAt)}`
-  const promptPreview = s.prompt.length > 200 ? s.prompt.slice(0, 200) + '…' : s.prompt
-  const lastLine = s.lastFiredAt ? `\n　· 上次触发　${fmtAgo(s.lastFiredAt)}` : ''
-  const body =
-    `**项目**　\`${s.project}\`\n` +
-    `**触发**　${trigger}\n` +
-    `**模式**　${modeIcon} ${modeLabel} · **level**　${s.level}\n` +
-    `**id**　\`${s.id}\`${lastLine}\n\n` +
-    `**prompt**\n${escapeMd(promptPreview)}`
-
-  const toggleLabel = s.mode === 'verbose' ? '🔕 切到 silent' : '📜 切到 verbose'
-
-  return {
-    tag: 'collapsible_panel',
-    header: { title: { tag: 'plain_text', content: headerText } },
-    expanded: false,
-    elements: [
-      { tag: 'markdown', content: body },
-      {
-        tag: 'column_set',
-        columns: [
-          {
-            tag: 'column', width: 'weighted', weight: 1,
-            elements: [{
-              tag: 'button',
-              text: { tag: 'plain_text', content: toggleLabel },
-              type: 'default',
-              behaviors: [{ type: 'callback', value: { kind: 'schedule_toggle_mode', id: s.id } }],
-            }],
-          },
-          {
-            tag: 'column', width: 'weighted', weight: 1,
-            elements: [{
-              tag: 'button',
-              text: { tag: 'plain_text', content: '🗑 删除' },
-              type: 'danger',
-              behaviors: [{ type: 'callback', value: { kind: 'schedule_delete', id: s.id } }],
-            }],
-          },
-        ],
-      },
-    ],
-  }
-}
-
 /** Host snapshot lines: 1 line for CPU+mem, 1 per disk, then services list.
  * 跟 peers 同样的缩进风格 (`　· ` 开头),保持视觉一致。 */
 function hostLines(sysinfo: SysInfo): string[] {
@@ -312,7 +231,6 @@ export function consoleCard(opts: ConsoleOpts): object {
   const {
     sessionName, status, model, effort, uptimeMs, peers, usage,
     contextTokens, contextLimit, cumStats, lastTurn, sessionId, sysinfo,
-    schedules,
   } = opts
   const statusEmoji = {
     idle: '🟢 闲', working: '⚙️ 工作中', awaiting_permission: '🔐 等审批',
@@ -368,21 +286,7 @@ export function consoleCard(opts: ConsoleOpts): object {
     : status === 'stopped' ? 'grey'
     : 'green'
 
-  // Body 元素组装:
-  //   1) 基础信息块(单个 markdown,所有 lines 合并)
-  //   2) schedules 段 — 每条一个 collapsible_panel,带切换 mode / 删除按钮
-  //   3) usage 占位(初始 `_加载中…_`,showConsole 之后 patch 真值)
-  // schedules 字段缺省(undefined)时整段省略,这跟 sysinfo 缺省一样
-  // 让早期调用方不强制传值,但 daemon 默认就会传 [] / list。
   const bodyElements: object[] = [{ tag: 'markdown', content: lines.join('\n') }]
-  if (schedules !== undefined) {
-    bodyElements.push({ tag: 'markdown', content: `**⏰ 定时任务** (${schedules.length}) · _全局_` })
-    if (schedules.length === 0) {
-      bodyElements.push({ tag: 'markdown', content: '_暂无定时任务_ — 让任意群里的 Codex 调 `schedule_create` / `schedule_once` 加一个' })
-    } else {
-      for (const s of schedules) bodyElements.push(schedulePanel(s))
-    }
-  }
   bodyElements.push({
     tag: 'markdown',
     element_id: ELEMENTS.consoleUsage,

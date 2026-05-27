@@ -4,7 +4,7 @@
  * 跑 `npm i -g @leviyuan/lodestar@latest @openai/codex@latest`
  * (Codex CLI 是 peer dep, 顺手一起升), stdio inherit 让 npm 自己的进度
  * 条和版本号输出原样透出来。完事后提示用户重启 daemon —— 我们这里 *不*
- * 主动 stop + start, 因为 daemon 可能挂在 systemd / Task Scheduler 下,
+ * 主动 stop + start, 因为 daemon 可能挂在 systemd / Windows 后台托管下,
  * 由那边接管,自重启会撞两次。让用户自己根据部署方式决定。
  */
 
@@ -52,7 +52,7 @@ async function main(): Promise<void> {
   if (existsSync(PID_FILE)) {
     console.log()
     console.log(`${C.yellow}检测到 daemon 仍在跑老版本进程, 用新版本需要重启:${C.reset}`)
-    console.log(`  ${C.dim}# systemd / Task Scheduler 托管的:${C.reset}`)
+    console.log(`  ${C.dim}# systemd / Windows 后台托管的:${C.reset}`)
     console.log(`  ${C.cyan}systemctl --user restart lodestar${C.reset}      ${C.dim}# Linux/macOS${C.reset}`)
     console.log(`  ${C.dim}# 或手动重启:${C.reset}`)
     console.log(`  ${C.cyan}lodestar-stop && lodestar-daemon${C.reset}`)

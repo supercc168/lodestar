@@ -256,7 +256,7 @@ export async function fetchChatName(chatId: string): Promise<string | null> {
 }
 
 // ── Outbound: text + card ──────────────────────────────────────────────
-/** Delay schedule for sendText/sendCard SDK retries. Three attempts total
+/** Retry delays for sendText/sendCard SDK calls. Three attempts total
  * (the leading 0 is the eager first try). Tuned for the bun+axios+lark-SDK
  * ECONNREFUSED transient we've been seeing — by ~5s the socket pool
  * usually recovers. Business errors (Feishu code != 0) are NOT retried;

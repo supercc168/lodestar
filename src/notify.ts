@@ -34,7 +34,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
 import { log } from './log'
 import * as feishu from './feishu'
-import { handleMcpRequest } from './mcp-server'
 
 export type Level = 'info' | 'warn' | 'error'
 const VALID_LEVELS: ReadonlySet<Level> = new Set(['info', 'warn', 'error'])
@@ -60,39 +59,6 @@ function notifyCard(opts: { title: string; text: string; level: Level }): object
         { tag: 'markdown', content: opts.text || '_（空消息）_' },
         { tag: 'hr' },
         { tag: 'markdown', content: `<font color='grey'>via notify · ${hhmm}</font>` },
-      ],
-    },
-  }
-}
-
-/** Silent (B) mode card for scheduled fires. Same shape as `notifyCard`
- * but with the title already carrying `⏰ <name>` and a footer that
- * reads "via ⏰ schedule · ⏱ Xs" so the reader knows it came from a
- * scheduled job rather than an external `/notify` poke. */
-export function notifyCardForScheduled(opts: {
-  title: string
-  text: string
-  level: Level
-  elapsedMs: number
-}): object {
-  const template = opts.level === 'error' ? 'red'
-    : opts.level === 'warn' ? 'yellow'
-    : 'blue'
-  const elapsedStr = opts.elapsedMs < 1000 ? `${opts.elapsedMs}ms`
-    : opts.elapsedMs < 60_000 ? `${(opts.elapsedMs / 1000).toFixed(1)}s`
-    : `${Math.floor(opts.elapsedMs / 60_000)}m${Math.floor((opts.elapsedMs % 60_000) / 1000)}s`
-  return {
-    schema: '2.0',
-    config: {},
-    header: {
-      title: { tag: 'plain_text', content: opts.title },
-      template,
-    },
-    body: {
-      elements: [
-        { tag: 'markdown', content: opts.text || '_（空消息）_' },
-        { tag: 'hr' },
-        { tag: 'markdown', content: `<font color='grey'>via ⏰ schedule · ⏱ ${elapsedStr}</font>` },
       ],
     },
   }
@@ -149,14 +115,7 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
     return sendText(200,
       'lodestar notify\n' +
       'POST /notify        body={project,text,title?,level?}  → push card to group\n' +
-      'POST /mcp/<project> body=<JSON-RPC>                    → MCP server scoped to that project\n' +
       'levels: info|warn|error (default info)\n')
-  }
-  // MCP endpoint — per-project JSON-RPC over plain HTTP. delegate to
-  // mcp-server.ts; that module handles the request lifecycle (parsing,
-  // dispatch, error envelopes) so this file stays focused on notify.
-  if (url.pathname.startsWith('/mcp/')) {
-    return handleMcpRequest(url, req, res)
   }
   if (req.method !== 'POST' || url.pathname !== '/notify') {
     return sendText(405, 'use POST /notify')

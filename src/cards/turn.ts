@@ -696,33 +696,20 @@ interface MainCardOpts {
   effort?: string
   /** What started this turn:
    *   'user_message' — user input batch(panel "📥 收到 (N)" 渲染原文)
-   *   'scheduled'    — cron / ScheduleWakeup 自发开 turn(banner `⏰ 触发`)
    *   'card_full'    — 同一 Codex turn 的"续卡":前一张卡写满(element 数
    *                   触顶 ~75)或写入被飞书拒,session rotate 出来的新卡
    *                   (banner `📨 接续上一张`,无 panel,turn 号跟旧卡
    *                   相同) */
-  kind?: 'user_message' | 'scheduled' | 'card_full'
+  kind?: 'user_message' | 'card_full'
   /** 本轮 Codex 收到的 user wireText 列表。boot turn 通常是 1 条;mid-turn
    * 用户连发的 N 条会在下一 turn 一并塞进。空数组 / undefined 时不渲染
-   * userInput panel(scheduled / cron-fired turn 没 user input)。 */
+   * userInput panel。 */
   userInputs?: string[]
-}
-
-/** Local wall-clock stamp `YYYY-MM-DD HH:MM:SS` for the scheduled-fire
- * banner. scheduled turns 自发开,没有用户消息做"何时触发"的锚点;卡片又
- *会一直留在群历史里,夜里 cron 跑的轮次第二天回看时,banner 上带个触发
- * 时刻才能一眼对上是几点起的。零填充沿用 notify.ts / console.ts 的写法。 */
-function fireStampNow(): string {
-  const d = new Date()
-  const p = (n: number) => String(n).padStart(2, '0')
-  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
 /** Initial card sent at the start of each turn. Streaming on. */
 export function mainConversationCard(opts: MainCardOpts): object {
-  const banner = opts.kind === 'scheduled'
-    ? [{ tag: 'markdown', content: `⏰ 触发 · ${fireStampNow()}` }]
-    : opts.kind === 'card_full'
+  const banner = opts.kind === 'card_full'
     ? [{ tag: 'markdown', content: '📨 接续上一张(同一轮 Codex turn,前一张卡写满或写入受限)' }]
     : []
   const inputs = opts.userInputs ?? []
@@ -752,9 +739,9 @@ export function mainConversationCard(opts: MainCardOpts): object {
       },
     },
     body: {
-      // Initial body: [scheduled banner?] + [userInput panel?] + ticker
-      // (活体指示) + footer。assistant segments 和 tool panels insert_before
-      // footer 在 Codex streaming 时实时插入。
+      // Initial body: [userInput panel?] + ticker (活体指示) + footer。
+      // assistant segments 和 tool panels insert_before footer 在 Codex
+      // streaming 时实时插入。
       // 空字符串会被 CardKit PUT 拒,所以两个占位都用单空格;首条真写入
       // 自动覆盖。footer 留单空格而不是 `⏳ working…` —— 顶部 ticker 已经
       // 在"模型还在干活"这件事上做活体指示了,底部再喊一遍冗余且突兀。
