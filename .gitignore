@@ -6,6 +6,7 @@ node_modules/
 *~
 
 # Local IDE state
+.serena/
 
 # Local override config (if dropped in repo for testing)
 config.toml

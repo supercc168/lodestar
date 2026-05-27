@@ -44,6 +44,13 @@ Card Kit card per turn.
 - Do not restart the running daemon unless the user explicitly asks for a
   restart/reload in that turn. After code changes, report that a restart is
   needed instead of doing it.
+- Restart intent is scoped to the current turn. If the user previously asked
+  for `restart` / `重启` but then gives a new instruction such as `提交`, the
+  newer instruction supersedes the old restart request unless they explicitly
+  repeat it.
+- If a restart command reports `aborted`, do not assume no restart happened;
+  `systemctl restart ...` may already have taken effect. Only report restart
+  outcome after explicit verification, and only verify when the user asks.
 - Group bare-word controls are `hi`, `stop`, `kill`, `restart`, and `clear`.
 - Local scripts can notify a group through `POST http://127.0.0.1:9876/notify`
   with `{project, text, level}`.
