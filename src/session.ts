@@ -35,7 +35,7 @@ export type { SessionOpts } from './session-types'
 const SEND_MARKER_RE = /\[\[send:\s*([^\]\n]+?)\s*\]\]/g
 
 const FOOTER_STATUS_TICK_MS = 1000
-const FOOTER_THINKING_PREFIX = 'Waiting...'
+const FOOTER_THINKING_PREFIX = 'Thinking...'
 const FOOTER_WORKING = 'Working...'
 
 /** Soft cap on element count per Feishu card before we proactively

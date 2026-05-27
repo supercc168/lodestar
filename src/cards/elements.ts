@@ -7,7 +7,7 @@
  *   tool_<i>          — one collapsible per tool call, indexed from 0
  *   assistant         — the main streaming assistant answer
  *   footer            — runtime footer. While the model is silent it
- *                       shows `Waiting...(Ns)`; while visible work is
+ *                       shows `Thinking...(Ns)`; while visible work is
  *                       streaming/running it shows `Working...`; at turn
  *                       close it becomes the terminal status line.
  */

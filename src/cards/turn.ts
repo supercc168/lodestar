@@ -746,7 +746,7 @@ export function mainConversationCard(opts: MainCardOpts): object {
       // Initial body: [handoff banner?] + [userInput panel?] + footer.
       // Assistant segments and tool panels insert_before footer during
       // Codex streaming. The footer itself is the only live status element:
-      // `Waiting...(Ns)` while the model is silent, `Working...` while
+      // `Thinking...(Ns)` while the model is silent, `Working...` while
       // content/tools are visible, and the terminal line when the turn ends.
       elements: [
         ...banner,
