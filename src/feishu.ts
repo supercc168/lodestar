@@ -146,7 +146,13 @@ export function readAliveMarker(): string[] {
 
 export function chatIdForSession(sessionName: string): string | null {
   const preferred = preferredChatForSession.get(sessionName)
-  if (preferred && chatNameCache.get(preferred) === sessionName) return preferred
+  if (preferred) {
+    const cachedName = chatNameCache.get(preferred)
+    if (cachedName && cachedName !== sessionName) {
+      log(`feishu: chatIdForSession("${sessionName}"): persisted binding ${preferred} has cached name "${cachedName}", using persisted binding`)
+    }
+    return preferred
+  }
   const matches: string[] = []
   for (const [id, name] of chatNameCache) if (name === sessionName) matches.push(id)
   if (matches.length === 1) return matches[0]
