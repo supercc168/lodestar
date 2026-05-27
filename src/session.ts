@@ -1067,8 +1067,7 @@ export class Session {
     })
     p.on('assistant_block_stop', () => {
       // 一段 content block 收尾(SSE content_block_stop)→ 把当前 assistant 段
-      // 定稿(flush + streaming_mode 瞬切全显未上屏尾巴,见 finalizeCurrentAssistant-
-      // Segment),然后 reset 段游标让下一段开新元素。这条 emit 在该段最后一个
+      // 直接 PUT 一次完整全文,然后 reset 段游标让下一段开新元素。这条 emit 在该段最后一个
       // text_delta 之后同步到达(codex-process 按 stdout 行序 emit),所以
       // appendAssistant 已把全量累进 currentAssistantText,这里定稿拿到的是完整段。
       this.finalizeCurrentAssistantSegment()
@@ -1535,30 +1534,11 @@ export class Session {
     cardkit.patchSummaryThrottled(turn.cardId, tail)
   }
 
-  /** 收尾(定稿)当前 assistant 段:flush 确保整段全文已 PUT,先关
-   * streaming_mode 让飞书 commit 当前打字机,再 replaceElement 把该段改成
-   * 静态 markdown 全文,最后重开 streaming_mode 供后续段继续流式;最后清空
-   * 当前段游标。无段在写时只清游标。
-   *
-   * 三版演进(务必别再改回前两版):
-   *   - v1 (82d509f) replaceElement 整段定稿:replaceElement 是"整体更新组件"
-   *     接口,streaming_mode 开着时该元素渲染权仍在打字机手里,定稿被盖住,
-   *     turn 中途插工具 / 开新段照样冻半截。
-   *   - v2 (cfecaa0)「全文 + 零宽空格」再发一帧 /content,赌 fast 策略"每次
-   *     /content 调用先把上一帧未上屏部分全显"。官方文档确是这么定义,但实测
-   *     失败:这两帧零间隔背靠背发,客户端把它们合并成一帧(目标=全文+零宽空格),
-   *     不存在"上一帧"可全显,打字机继续慢爬、被下个元素掐断成半截。
-   *   - v3 streaming_mode 瞬切:turn 末尾 streaming_mode=false 收尾能
-   *     可靠全显是实测验证过的(turn 一结束当前段就完整)。把它搬到 mid-turn:
-   *     off 那一下全显当前段未上屏尾巴,on 紧接着恢复后续段的流式打字机。不再
-   *     依赖客户端是否"按文档 commit 上一帧",直接走全局收尾这条已知可靠的路。
-   *   - v4 (本版) off 后再 replace 静态全文再 on:针对现场观察到的 v3 问题
-   *     —— off 后先完整显示,但 on 会让已完成段回退到半截,疑似 Feishu 客户端
-   *     把旧 streaming 元素重新挂回 typewriter 进度。
-   *
-   * flush 必须在 off 之前:把本段最后的 delta 推成全文这一帧,off 才能全显完整
-   * 段。off/replace/on 走 per-card 队列、顺序紧跟 flush。PATCH settings 是合并
-   * 语义(只改 streaming_mode、不动 turn.ts 设的 streaming_config)。 */
+  /** 收尾当前 assistant 段:跳过常规 2s 节流,直接向该 markdown 元素
+   * PUT 一次完整全文,然后清空段游标。这里不再 mid-turn 关开全卡
+   * streaming_mode,也不 replaceElement;让 Feishu 的流式文本接口继续按
+   * /content 全量帧处理,避免客户端 typewriter 状态在 settings toggle 后
+   * 回退或闪烁。turn 结束时 closeTurnCard 仍会做最终全卡 streaming off。 */
   finalizeCurrentAssistantSegment(): void {
     const turn = this.currentTurn
     if (!turn) return
@@ -1570,14 +1550,7 @@ export class Session {
     const segId = turn.currentAssistantSegmentId
     const text = turn.currentAssistantText ?? ''
     if (segId && text.trim()) {
-      void cardkit.flush(turn.cardId)
-      // off → static replace → on:把当前段从 streaming typewriter 状态固化,
-      // 再恢复后续段的流式。
-      void cardkit.patchSettings(turn.cardId, { config: { streaming_mode: false } })
-      void cardkit.replaceElement(turn.cardId, segId, {
-        tag: 'markdown', element_id: segId, content: text.trim() || ' ',
-      })
-      void cardkit.patchSettings(turn.cardId, { config: { streaming_mode: true } })
+      void cardkit.streamText(turn.cardId, segId, text)
     }
     turn.currentAssistantSegmentId = null
     turn.currentAssistantText = ''
@@ -1659,9 +1632,8 @@ export class Session {
     // 全局收尾 —— 实测它会把每个流式文本组件的未上屏部分一次性 commit 到
     // replaceElement 设定的最终内容。**注意**:replaceElement 自身只设组件内容、
     // 不触发流式 commit;turn 中途单独用它定稿会留半截(turn 末尾不留是因为有
-    // streaming_mode=false 兜底,跟 replaceElement 无关),所以 mid-turn 的
-    // finalizeCurrentAssistantSegment 改用 streaming_mode 瞬切来全显。turn 中途
-    // content_block_stop 已定稿过各段,这里是收尾兜底。
+    // streaming_mode=false 兜底,跟 replaceElement 无关)。turn 中途
+    // content_block_stop 已直接 PUT 过完整帧,这里是收尾兜底。
     for (const [segId, fullText] of segmentTexts) {
       // 收尾定稿:把流式最后一帧补成完整段。**保留 [[send:]] 标记原文显示**
       // (用户要求 2026-05-23:标签留着,让用户看到发了哪个文件)。replaceElement

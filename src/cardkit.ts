@@ -13,8 +13,8 @@
  * Per-card invariants enforced here:
  *   - `sequence` is monotonically increasing per card_id
  *   - all writes for a card are serialized through a Promise queue
- *   - text-streaming PUTs are batched on a 120ms / 32-char heuristic to
- *     stay well under cardkit's per-card rate ceiling
+ *   - text-streaming PUTs are batched on a 2s cadence to stay well under
+ *     cardkit's per-card rate ceiling when many project sessions stream at once
  */
 
 import { getTenantToken } from './feishu'
@@ -22,8 +22,7 @@ import { log } from './log'
 
 const BASE = 'https://open.feishu.cn/open-apis/cardkit/v1'
 
-const FLUSH_INTERVAL_MS = 120
-const FLUSH_MIN_DELTA = 32
+const FLUSH_INTERVAL_MS = 2000
 
 interface CardState {
   sequence: number
@@ -31,10 +30,8 @@ interface CardState {
   buffer: Map<string, string>          // element_id → latest full text
   /** element_id → 最近一次「已入队 PUT」的全量内容。关键:是"已入队"而非
    * "已送达" —— 在 streamText 入队时同步写,不是 PUT 完成后写。
-   * streamTextThrottled 的增量节流判断和 flush 去重都读它,所以它必须同步
-   * 反映"我已经决定要发到哪",否则慢链路上 PUT 往返期间到达的多个 delta
-   * 会全部误判成"超过阈值"而逐个触发全量 PUT,节流形同虚设(详见
-   * streamText 注释)。 */
+   * flush 去重读它,所以它必须同步反映"我已经决定要发到哪",否则 block stop
+   * 直接 PUT 完整内容后,后续定时 flush 还会重复发同一帧。 */
   lastEnqueued: Map<string, string>
   flushTimer: ReturnType<typeof setTimeout> | null
   /** Live count of elements on the card. Initialised by
@@ -252,11 +249,8 @@ export function streamText(cardId: string, elementId: string, content: string): 
   // 300313,而 streamTextThrottled 每个 delta 都重发全文,会把一个建失败的段
   // 放大成一串红。等 rotation 把 turn 切到新卡,新段就正常了。
   if (s.deadElements.has(elementId)) return Promise.resolve()
-  // 「已入队」位置必须在这里同步推进,而不是等 PUT 完成 —— 否则节流失效:
-  // Card Kit 的 PUT 在慢链路(Windows / 跨网)上往返几百 ms,这期间模型还在
-  // 吐 text_delta;若用 PUT-完成后的长度算增量,每个 delta 看到的都是同一个
-  // 陈旧基线,增量恒大于阈值,streamTextThrottled 退化成「每个 delta 一次全量
-  // PUT」,客户端 typewriter 被高频整段刷新冲击,表现为打字回退 + 卡顿。
+  // 「已入队」位置必须在这里同步推进,而不是等 PUT 完成。这样 block stop
+  // 的直接完整 PUT 可以让后续定时 flush 通过 lastEnqueued 去重跳过同一帧。
   // 全量 PUT 自带自愈:某次 PUT 失败会被下一个更长的全量覆盖,所以提前把
   // 「已入队」前移是安全的(失败的内容不会永久丢,除非它正好是最后一帧 ——
   // 那种情况由 content_block_stop / closeTurnCard 的兜底 flush 覆盖)。
@@ -274,20 +268,15 @@ export function streamText(cardId: string, elementId: string, content: string): 
   return s.queue
 }
 
-/** Throttled streaming: buffer + auto-flush every FLUSH_INTERVAL_MS or
- * when the buffered delta crosses FLUSH_MIN_DELTA characters. */
+/** Throttled streaming: buffer latest full text and auto-flush on a
+ * per-card timer. Block boundaries call streamText directly to push the
+ * final frame immediately without changing the steady-state cadence. */
 export function streamTextThrottled(cardId: string, elementId: string, fullContent: string): void {
   if (!fullContent || !fullContent.trim()) return
   const s = state(cardId)
   if (s.deadElements.has(elementId)) return
   s.buffer.set(elementId, fullContent)
 
-  const last = s.lastEnqueued.get(elementId) ?? ''
-  const delta = fullContent.length - last.length
-  if (delta >= FLUSH_MIN_DELTA) {
-    flush(cardId).catch(e => log(`cardkit flush(min-delta) ${cardId}: ${e}`))
-    return
-  }
   if (!s.flushTimer) {
     s.flushTimer = setTimeout(() => {
       flush(cardId).catch(e => log(`cardkit flush(timer) ${cardId}: ${e}`))
