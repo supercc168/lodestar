@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { statusCard } from './console'
+import { consoleBodyElements, statusCard } from './console'
 import { mainConversationCard, summarizeToolInput, toolCallElement, toolCallPermissionElement } from './turn'
 
 describe('main conversation card rendering', () => {
@@ -29,6 +29,20 @@ describe('main conversation card rendering', () => {
     expect(card.header.title.content).toBe('🌟 Lodestar · probe')
     expect(card.body.elements[0].element_id).toBe('footer')
     expect(card.body.elements[0].content).toContain('🔁 重启 Codex (0s)')
+  })
+
+  test('console body can replace a status card footer in place', () => {
+    const elements = consoleBodyElements({
+      sessionName: 'probe',
+      status: 'idle',
+      usage: undefined,
+    }, 'footer') as any[]
+
+    expect(elements).toHaveLength(2)
+    expect(elements[0].element_id).toBe('footer')
+    expect(elements[0].content).toContain('🟢 闲')
+    expect(elements[1].element_id).toBe('console_usage')
+    expect(elements[1].content).toContain('加载中')
   })
 })
 

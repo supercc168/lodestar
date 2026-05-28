@@ -320,7 +320,7 @@ async function handleMessage(data: any): Promise<void> {
 
   // Text-only control commands — intercept before any work that would
   // forward to Codex (download / spawn / interrupt). Exact match,
-  // case-insensitive: `hi` `kill` `restart` `clear`. Bare words are
+  // case-insensitive: `hi` `stop` `kill` `restart` `clear`. Bare words are
   // reserved globally by user request — typing "hi" as a literal
   // greeting will trigger the dashboard, not reach Codex. Post 富文本
   // 整段不可能正好等于这些 bare word,所以这里只对 text 触发。

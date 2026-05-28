@@ -24,7 +24,11 @@ export {
   askUserQuestionElement,
 } from './cards/turn'
 export {
+  type ConsoleOpts,
   consoleUsageContent,
+  consoleUsageElement,
+  consoleMainElement,
+  consoleBodyElements,
   consoleCard,
   statusCard,
   statusCardContent,

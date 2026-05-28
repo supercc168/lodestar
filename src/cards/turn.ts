@@ -1094,7 +1094,7 @@ export function askUserQuestionElement(
     bodyElements.push(...renderAskQuestionBody(q, toolUseId, currentIdx))
     bodyElements.push({
       tag: 'markdown',
-      content: '_💬 也可以直接在群里回复你的答案（裸词命令 `hi`/`kill`/`restart`/`clear` 仍然优先）_',
+      content: '_💬 也可以直接在群里回复你的答案（裸词命令 `hi`/`stop`/`kill`/`restart`/`clear` 仍然优先）_',
     })
   } else {
     // Defensive fallback — neither answered nor a valid currentIdx.

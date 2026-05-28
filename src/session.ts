@@ -461,13 +461,17 @@ export class Session {
     this.currentBatchReactionIds = new Map()
   }
 
-  async stop(reason = '已终止'): Promise<void> {
+  async stop(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
+    const announce = opts.announce ?? true
+    const report = opts.onStatus
     if (!this.proc) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
-      await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
+      report?.('⚪ session 当前未运行')
+      if (announce) await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
       return
     }
+    report?.('🛑 停止 Codex')
     // Flip lifecycle state SYNCHRONOUSLY before awaiting kill — daemon's
     // SIGTERM cleanup snapshots `isRunning()` and if we're still mid-
     // `proc.kill()` await it'll see proc!=null and write us into the
@@ -492,7 +496,8 @@ export class Session {
     this.status = 'stopped'
     this.opts.onLifecycleChange?.()
     await proc.kill()
-    await feishu.sendText(this.chatId, `🔴 ${reason} (session: ${this.sessionName})`)
+    report?.(`✅ ${reason}`)
+    if (announce) await feishu.sendText(this.chatId, `🔴 ${reason} (session: ${this.sessionName})`)
   }
 
   async restart(resume = false, opts: LifecycleProgressOpts = {}): Promise<boolean> {
@@ -584,11 +589,12 @@ export class Session {
     switch (raw.trim().toLowerCase()) {
       case 'hi':
         {
-          const statusCard = !this.isRunning()
+          const needsStart = !this.isRunning()
+          const statusCard = needsStart
             ? await this.openStatusCard('hi', '🚀 启动 Codex')
             : null
           let lastStatus = '🚀 启动 Codex'
-          const ok = !this.isRunning()
+          const ok = needsStart
             ? await this.start({
                 announce: !statusCard,
                 onStatus: status => {
@@ -601,7 +607,11 @@ export class Session {
             await this.closeStatusCard(statusCard, lastStatus.startsWith('❌') ? lastStatus : '❌ 启动失败')
             return true
           }
-          await this.closeStatusCard(statusCard, '✅ Codex 已就绪')
+          if (statusCard) {
+            await this.replaceStatusCardWithConsole(statusCard, '✅ Codex 已就绪')
+            return true
+          }
+          if (needsStart) await this.closeStatusCard(statusCard, '✅ Codex 已就绪')
         }
         await this.showConsole()
         return true
@@ -615,7 +625,12 @@ export class Session {
         // sendInterrupt() control_request causes the SDK to discard
         // queued input alongside the in-flight call.
         if (!this.currentTurn && this.pendingUserMessageCount === 0 && this.pendingMidTurnMsgs.length === 0) {
-          await feishu.sendText(this.chatId, '⚪ 当前没有正在执行的 turn')
+          const statusCard = await this.openStatusCard('stop', '⚪ 当前没有正在执行的 turn', 'grey')
+          if (statusCard) {
+            await this.closeStatusCard(statusCard, '⚪ stop 无效')
+          } else {
+            await feishu.sendText(this.chatId, '⚪ 当前没有正在执行的 turn')
+          }
           return true
         }
         log(`session "${this.sessionName}": stop command — interrupt + drop count=${this.pendingUserMessageCount} midBuffer=${this.pendingMidTurnMsgs.length}`)
@@ -657,7 +672,18 @@ export class Session {
         await this.closeTurnCard('🛑 打断')
         return true
       case 'kill':
-        await this.stop()
+        {
+          const wasRunning = this.isRunning()
+          const initialStatus = wasRunning ? '🛑 停止 Codex' : '⚪ session 当前未运行'
+          const statusCard = await this.openStatusCard('kill', initialStatus, wasRunning ? 'red' : 'grey')
+          await this.stop('已终止', {
+            announce: !statusCard,
+            onStatus: status => {
+              this.setStatusCard(statusCard, status)
+            },
+          })
+          await this.closeStatusCard(statusCard, wasRunning ? '✅ kill 完成' : '⚪ kill 无效')
+        }
         return true
       case 'restart':
         // resume the prior conversation — kills the current proc (if
@@ -712,16 +738,16 @@ export class Session {
     return false
   }
 
-  /** Build the hi-panel card object for this session.
+  /** Build the hi-panel data snapshot for this session.
    *
    * Passing `usage=undefined` paints the `_加载中…_` placeholder — the
    * caller is responsible for the async patch if the panel was sent. */
-  async buildConsoleCard(usage: UsageSnapshot | undefined): Promise<object> {
+  async buildConsoleOpts(usage: UsageSnapshot | undefined): Promise<cards.ConsoleOpts> {
     const uptimeMs = this.startedAt ? (Date.now() - this.startedAt) : undefined
     const rawModel = this.proc?.lastModel ?? null
     const model = rawModel ?? undefined
     const sysinfo = await readSysInfo()
-    return cards.consoleCard({
+    return {
       sessionName: this.sessionName,
       status: this.status,
       model,
@@ -743,7 +769,52 @@ export class Session {
         : undefined,
       sessionId: this.proc?.sessionId ?? this.lastSessionId,
       sysinfo,
-    })
+    }
+  }
+
+  async buildConsoleCard(usage: UsageSnapshot | undefined): Promise<object> {
+    return cards.consoleCard(await this.buildConsoleOpts(usage))
+  }
+
+  private async patchConsoleUsage(cardId: string): Promise<void> {
+    const usage = await readUsage()
+    await cardkit.replaceElement(cardId, cards.ELEMENTS.consoleUsage, cards.consoleUsageElement(usage))
+  }
+
+  private patchConsoleUsageLater(cardId: string): void {
+    void (async () => {
+      try {
+        await this.patchConsoleUsage(cardId)
+      } catch (e) {
+        log(`session "${this.sessionName}": consoleUsage patch failed: ${e}`)
+      } finally {
+        try { await cardkit.dispose(cardId) }
+        catch (e) { log(`session "${this.sessionName}": console card dispose failed: ${e}`) }
+      }
+    })()
+  }
+
+  private async replaceStatusCardWithConsole(handle: StatusCardHandle, finalStatus: string): Promise<void> {
+    handle.timer.stop()
+    const elapsed = handle.timer.elapsedSec()
+    const consoleOpts = await this.buildConsoleOpts(undefined)
+    await cardkit.flush(handle.cardId)
+    await cardkit.replaceElement(
+      handle.cardId,
+      cards.ELEMENTS.footer,
+      cards.consoleMainElement(consoleOpts, cards.ELEMENTS.footer),
+    )
+    await cardkit.addElement(
+      handle.cardId,
+      cards.consoleUsageElement(undefined),
+      { type: 'insert_after', targetElementId: cards.ELEMENTS.footer },
+    )
+    cardkit.cancelSummary(handle.cardId)
+    await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({
+      durationSec: elapsed,
+      suffix: finalStatus,
+    }))
+    this.patchConsoleUsageLater(handle.cardId)
   }
 
   async showConsole(): Promise<void> {
@@ -758,15 +829,18 @@ export class Session {
     // stays responsive. We don't await; failures are logged and the
     // placeholder stays visible (no fallback fabrication).
     void (async () => {
+      let cardId = ''
       try {
-        const cardId = await cardkit.convertMessageToCard(messageId)
-        const usage = await readUsage()
-        await cardkit.replaceElement(cardId, cards.ELEMENTS.consoleUsage, {
-          tag: 'markdown',
-          element_id: cards.ELEMENTS.consoleUsage,
-          content: cards.consoleUsageContent(usage),
-        })
-      } catch (e) { log(`session "${this.sessionName}": consoleUsage patch failed: ${e}`) }
+        cardId = await cardkit.convertMessageToCard(messageId)
+        await this.patchConsoleUsage(cardId)
+      } catch (e) {
+        log(`session "${this.sessionName}": consoleUsage patch failed: ${e}`)
+      } finally {
+        if (cardId) {
+          try { await cardkit.dispose(cardId) }
+          catch (e) { log(`session "${this.sessionName}": console card dispose failed: ${e}`) }
+        }
+      }
     })()
   }
 

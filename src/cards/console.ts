@@ -9,7 +9,7 @@ import type { UsageSnapshot } from '../usage'
 import { contextPercent } from '../context-window'
 import { ELEMENTS } from './elements'
 
-interface ConsoleOpts {
+export interface ConsoleOpts {
   sessionName: string
   status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
   model?: string
@@ -262,9 +262,9 @@ function hostLines(sysinfo: SysInfo): string[] {
   return out
 }
 
-export function consoleCard(opts: ConsoleOpts): object {
+export function consoleMainContent(opts: ConsoleOpts): string {
   const {
-    sessionName, status, model, effort, uptimeMs, peers, usage,
+    status, model, effort, uptimeMs, peers,
     contextTokens, contextLimit, cumStats, lastTurn, sessionId, sysinfo,
   } = opts
   const statusEmoji = {
@@ -315,17 +315,38 @@ export function consoleCard(opts: ConsoleOpts): object {
     lines.push(...hostLines(sysinfo))
   }
 
+  return lines.join('\n')
+}
+
+export function consoleMainElement(opts: ConsoleOpts, elementId?: string): object {
+  return {
+    tag: 'markdown',
+    ...(elementId ? { element_id: elementId } : {}),
+    content: consoleMainContent(opts),
+  }
+}
+
+export function consoleUsageElement(usage: UsageSnapshot | undefined): object {
+  return {
+    tag: 'markdown',
+    element_id: ELEMENTS.consoleUsage,
+    content: consoleUsageContent(usage),
+  }
+}
+
+export function consoleBodyElements(opts: ConsoleOpts, mainElementId?: string): object[] {
+  return [
+    consoleMainElement(opts, mainElementId),
+    consoleUsageElement(opts.usage),
+  ]
+}
+
+export function consoleCard(opts: ConsoleOpts): object {
+  const { sessionName, status } = opts
   const template = status === 'working' ? 'blue'
     : status === 'awaiting_permission' ? 'orange'
     : status === 'stopped' ? 'grey'
     : 'green'
-
-  const bodyElements: object[] = [{ tag: 'markdown', content: lines.join('\n') }]
-  bodyElements.push({
-    tag: 'markdown',
-    element_id: ELEMENTS.consoleUsage,
-    content: consoleUsageContent(usage),
-  })
 
   return {
     schema: '2.0',
@@ -334,7 +355,7 @@ export function consoleCard(opts: ConsoleOpts): object {
       title: { tag: 'plain_text', content: `🌟 Lodestar · ${sessionName}` },
       template,
     },
-    body: { elements: bodyElements },
+    body: { elements: consoleBodyElements(opts) },
   }
 }
 

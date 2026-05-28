@@ -48,11 +48,11 @@ lodestar-setup
 
 | 指令 | 行为 |
 | --- | --- |
-| `hi` | 未运行时启动;运行中弹一张状态卡片 |
+| `hi` | 未运行时同一张卡动态启动并收束为控制台;运行中弹控制台 |
 | `stop` | 软打断当前 turn,子进程保活,排队消息打 ❌ |
-| `kill` | 优雅关闭 Codex 进程,`threadId` 落盘 |
-| `restart` | 用上次 `threadId` 重启(保留上下文)|
-| `clear` | 杀进程并开新 thread(等价 `/clear`)|
+| `kill` | 用状态卡展示关闭 Codex 进程,`threadId` 落盘 |
+| `restart` | 用状态卡展示按上次 `threadId` 重启(保留上下文)|
+| `clear` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
 
 ---
 

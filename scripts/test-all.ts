@@ -11,7 +11,7 @@
  *
  * Coverage:
  *   1.  kill on a stopped session            — should report "未运行"
- *   2.  hi                                   — start + console card
+ *   2.  hi                                   — one card: start progress → console
  *   3.  basic stream + thinking + tool call  — full access
  *   4.  outbound [[send: /path]] marker      — Codex generates a file,
  *                                              daemon strips the marker
@@ -139,8 +139,8 @@ const session = new Session(sessionName, chatId)
 await session.runCommand('kill')
 await sleep(2500)
 
-// 2) hi → start + console card
-await announce('[2/8] runCommand("hi") @ stopped — 期待 ✅ 启动 + 控制台卡片（含按钮）')
+// 2) hi → one card starts as progress, then becomes the console
+await announce('[2/8] runCommand("hi") @ stopped — 期待一张卡: ✅ 启动进度 → 控制台')
 await session.runCommand('hi')
 await sleep(4000)
 
