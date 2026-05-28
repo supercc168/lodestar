@@ -82,6 +82,10 @@ function timedStatus(status: string, startedAt: number): string {
   return `${status} (${elapsedS}s)`
 }
 
+function staticAssistantElementId(streamElementId: string): string {
+  return `${streamElementId}_static`
+}
+
 export class Session {
   /** Process-wide registry of every Session ever constructed in this daemon.
    * Used by the `hi` console panel to enumerate sibling sessions across
@@ -1067,7 +1071,7 @@ export class Session {
     })
     p.on('assistant_block_stop', () => {
       // 一段 content block 收尾(SSE content_block_stop)→ 把当前 assistant 段
-      // 直接 PUT 一次完整全文,然后 reset 段游标让下一段开新元素。这条 emit 在该段最后一个
+      // 静态化成完整 markdown,然后 reset 段游标让下一段开新元素。这条 emit 在该段最后一个
       // text_delta 之后同步到达(codex-process 按 stdout 行序 emit),所以
       // appendAssistant 已把全量累进 currentAssistantText,这里定稿拿到的是完整段。
       this.finalizeCurrentAssistantSegment()
@@ -1425,6 +1429,7 @@ export class Session {
         // onFailure 在 rotating 期间不 reset,所以这段一直累积到这里)。先读后清。
         const carrySegId = turn.currentAssistantSegmentId
         const carryText = (turn.currentAssistantText ?? '').trim()
+        const oldSegmentTexts = turn.segmentTexts
         turn.assistantSegmentCount = 0
         turn.currentAssistantSegmentId = null
         turn.currentAssistantText = ''
@@ -1433,11 +1438,9 @@ export class Session {
         else this.startThinkingFooter(turn)
         // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read 切开重建。
         sessionTools.rebuildToolsOnRotate(this, oldCardId, newCardId, oldToolByUseId, oldBatches)
-        // 重建出错内容:旧卡上没渲染成功的当前 assistant 段(addElement 被拒、
-        // 成了死元素)→ 把已累积的文字(含切卡窗口期的)搬到新卡续写,内容不丢。
-        // 若该段在旧卡 alive(下面会定稿),它留在旧卡,这里不重复建。之后该段的
-        // delta 会顺着 currentAssistantSegmentId 继续 append 到新段,视觉无缝接续。
-        if (carrySegId && carryText && cardkit.isDeadElement(oldCardId, carrySegId)) {
+        // 当前 assistant 段还没收尾就换卡时,整段迁到新卡继续写。不要把半段
+        // 留旧卡、半段接新卡；旧卡收尾时会删除原流式元素。
+        if (carrySegId && carryText) {
           const ri = turn.assistantSegmentCount++
           const reSegId = cards.ELEMENTS.assistant(ri)
           turn.currentAssistantSegmentId = reSegId
@@ -1454,13 +1457,17 @@ export class Session {
         // 在 footer 之前先 flush,视觉更连贯。
         try {
           await cardkit.flush(oldCardId)
-          // 旧卡当前 assistant 段定稿,避免换卡瞬间把没播完的打字机尾巴留在
-          // 旧卡上(replaceElement 直接上屏完整内容,见
-          // finalizeCurrentAssistantSegment)。
-          if (carrySegId && carryText) {
-            await cardkit.replaceElement(oldCardId, carrySegId, {
-              tag: 'markdown', element_id: carrySegId, content: carryText,
+          // 旧卡上已完成的 assistant 段做最终替换。当前迁移中的半段要从
+          // 旧卡删除,避免同一段同时出现在两张卡上；已静态化并删除的流式
+          // 元素会被 cardkit 的 deadElements 跳过。
+          for (const [segId, fullText] of oldSegmentTexts) {
+            if (carrySegId && carryText && segId === carrySegId) continue
+            await cardkit.replaceElement(oldCardId, segId, {
+              tag: 'markdown', element_id: segId, content: fullText.trim() || ' ',
             })
+          }
+          if (carrySegId && carryText) {
+            await cardkit.deleteElement(oldCardId, carrySegId)
           }
           await cardkit.streamText(oldCardId, cards.ELEMENTS.footer, '📨 已续至下一张卡 ↓')
           cardkit.cancelSummary(oldCardId)
@@ -1534,11 +1541,10 @@ export class Session {
     cardkit.patchSummaryThrottled(turn.cardId, tail)
   }
 
-  /** 收尾当前 assistant 段:跳过常规 2s 节流,直接向该 markdown 元素
-   * PUT 一次完整全文,然后清空段游标。这里不再 mid-turn 关开全卡
-   * streaming_mode,也不 replaceElement;让 Feishu 的流式文本接口继续按
-   * /content 全量帧处理,避免客户端 typewriter 状态在 settings toggle 后
-   * 回退或闪烁。turn 结束时 closeTurnCard 仍会做最终全卡 streaming off。 */
+  /** 收尾当前 assistant 段:把流式 markdown 元素静态化成完整 markdown,
+   * 然后清空段游标。这里不再 mid-turn 关开全卡 streaming_mode,避免
+   * 客户端 typewriter 状态在 settings toggle 后回退或闪烁；也不再只做
+   * /content 完整帧,因为后续工具/新段可能在客户端打字机追上前冻结该段。 */
   finalizeCurrentAssistantSegment(): void {
     const turn = this.currentTurn
     if (!turn) return
@@ -1550,7 +1556,12 @@ export class Session {
     const segId = turn.currentAssistantSegmentId
     const text = turn.currentAssistantText ?? ''
     if (segId && text.trim()) {
-      void cardkit.streamText(turn.cardId, segId, text)
+      void cardkit.staticizeMarkdownElement(
+        turn.cardId,
+        segId,
+        staticAssistantElementId(segId),
+        text,
+      )
     }
     turn.currentAssistantSegmentId = null
     turn.currentAssistantText = ''
@@ -1629,11 +1640,9 @@ export class Session {
     // 对**每个** assistant 段 replaceElement 成最终内容:这里 replaceElement
     // 的职责是把流式元素固化成静态 markdown。
     // "把没播完的打字机尾巴补全上屏"靠的是紧接其后的 streaming_mode=false
-    // 全局收尾 —— 实测它会把每个流式文本组件的未上屏部分一次性 commit 到
-    // replaceElement 设定的最终内容。**注意**:replaceElement 自身只设组件内容、
-    // 不触发流式 commit;turn 中途单独用它定稿会留半截(turn 末尾不留是因为有
-    // streaming_mode=false 兜底,跟 replaceElement 无关)。turn 中途
-    // content_block_stop 已直接 PUT 过完整帧,这里是收尾兜底。
+    // 全局收尾 —— 对仍在流式状态里的段,实测它会把每个流式文本组件的未上屏
+    // 部分一次性 commit 到 replaceElement 设定的最终内容。中途 block_stop
+    // 已经把多数段静态化,这里主要兜最后一段和异常时没静态化成功的段。
     for (const [segId, fullText] of segmentTexts) {
       // 收尾定稿:把流式最后一帧补成完整段。**保留 [[send:]] 标记原文显示**
       // (用户要求 2026-05-23:标签留着,让用户看到发了哪个文件)。replaceElement

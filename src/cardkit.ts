@@ -44,15 +44,13 @@ interface CardState {
    * addElement won't bump it, so the count tracks "elements Feishu
    * believes exist" not "elements we tried to create"). */
   elementCount: number
-  /** element_ids whose `addElement` was rejected by Feishu (most often
-   * `300305/300315 [element exceeds the limit]`, but any non-recoverable
-   * add failure counts). The element does NOT exist on Feishu's side, so
-   * every subsequent `streamText`/`replaceElement`/`deleteElement` aimed
-   * at it would 300313/300121 — and the throttled streamer keeps re-PUTting
-   * the growing full text on each delta, turning one dead segment into a
-   * storm of red. We record the id here and short-circuit those writes.
-   * Per-card and dropped on `dispose`, so a rotated-to fresh card starts
-   * clean. */
+  /** element_ids that must no longer receive writes. Usually this means
+   * `addElement` was rejected by Feishu (most often `300305/300315
+   * [element exceeds the limit]`), so the element does NOT exist on Feishu's
+   * side and every subsequent `streamText`/`replaceElement`/`deleteElement`
+   * would 300313/300121. It also covers streaming assistant elements that
+   * have been deliberately replaced by static markdown and deleted. Per-card
+   * and dropped on `dispose`, so a rotated-to fresh card starts clean. */
   deadElements: Set<string>
   /** Card-level write-failure callback, set by recordCardCreated. Invoked
    * by any cardkit write op that fails even after the streaming-closed
@@ -134,6 +132,12 @@ function nextSeq(cardId: string): number {
   const s = state(cardId)
   s.sequence += 1
   return s.sequence
+}
+
+function markElementDead(s: CardState, elementId: string): void {
+  s.deadElements.add(elementId)
+  s.buffer.delete(elementId)
+  s.lastEnqueued.delete(elementId)
 }
 
 async function call(method: string, path: string, body?: object): Promise<any> {
@@ -259,6 +263,7 @@ export function streamText(cardId: string, elementId: string, content: string): 
     cardId,
     `streamText ${elementId}`,
     async () => {
+      if (s.deadElements.has(elementId)) return
       const seq = nextSeq(cardId)
       await call('PUT', `/cards/${cardId}/elements/${elementId}/content`, {
         content, sequence: seq,
@@ -338,8 +343,55 @@ export function addElement(
       // rotate (the local counter can't be trusted here — a failed add
       // doesn't bump it, so it never reaches the rotate threshold on its
       // own).
-      if (elementId) s.deadElements.add(elementId)
+      if (elementId) markElementDead(s, elementId)
       onFailure?.(code)
+    },
+  ))
+  return s.queue
+}
+
+/** Freeze a streaming markdown element by inserting a new static markdown
+ * element immediately before it, then deleting the old streaming element.
+ * This avoids toggling whole-card streaming_mode mid-turn while still making
+ * completed assistant blocks fully visible before tools or later blocks land.
+ */
+export function staticizeMarkdownElement(
+  cardId: string,
+  elementId: string,
+  staticElementId: string,
+  content: string,
+): Promise<void> {
+  if (!content || !content.trim()) return Promise.resolve()
+  const s = state(cardId)
+  if (s.deadElements.has(elementId)) return Promise.resolve()
+  const element = {
+    tag: 'markdown',
+    element_id: staticElementId,
+    content: content.trim() || ' ',
+  }
+  s.queue = s.queue.then(() => withReopenOnStreamingClosed(
+    cardId,
+    `staticizeElement ${elementId}`,
+    async () => {
+      if (s.deadElements.has(elementId)) return
+      const addSeq = nextSeq(cardId)
+      await call('POST', `/cards/${cardId}/elements`, {
+        type: 'insert_before',
+        target_element_id: elementId,
+        elements: JSON.stringify([element]),
+        sequence: addSeq,
+      })
+      s.elementCount += 1
+      try {
+        const deleteSeq = nextSeq(cardId)
+        await call('DELETE', `/cards/${cardId}/elements/${elementId}`, {
+          sequence: deleteSeq,
+        })
+        s.elementCount = Math.max(0, s.elementCount - 1)
+        markElementDead(s, elementId)
+      } catch (e) {
+        log(`cardkit staticizeElement delete-old ${elementId} ${cardId}: ${e}`)
+      }
     },
   ))
   return s.queue
@@ -353,6 +405,7 @@ export function replaceElement(cardId: string, elementId: string, element: objec
     cardId,
     `replaceElement ${elementId}`,
     async () => {
+      if (s.deadElements.has(elementId)) return
       const seq = nextSeq(cardId)
       await call('PUT', `/cards/${cardId}/elements/${elementId}`, {
         element: JSON.stringify(element),
@@ -371,11 +424,13 @@ export function deleteElement(cardId: string, elementId: string): Promise<void> 
     cardId,
     `deleteElement ${elementId}`,
     async () => {
+      if (s.deadElements.has(elementId)) return
       const seq = nextSeq(cardId)
       await call('DELETE', `/cards/${cardId}/elements/${elementId}`, {
         sequence: seq,
       })
       s.elementCount = Math.max(0, s.elementCount - 1)
+      markElementDead(s, elementId)
     },
     undefined,
     true,
