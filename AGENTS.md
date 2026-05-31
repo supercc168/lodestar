@@ -39,16 +39,6 @@
 - 涉及真实飞书、Codex 登录或卡片流式行为时，用 `bun scripts/smoke.ts "<group name>"` 或 `bun scripts/test-all.ts "<group name>"` 做人工 smoke。
 - 发布前按项目惯例运行 `bun test`、`bun run build`，再执行版本 bump、tag、npm/GitHub Packages 发布和 GitHub Release 流程。
 
-### Release Checklist
-- 除非用户明确要求 minor 或 major 版本，否则只把 `package.json` 版本号按 patch 递增（`+0.0.1`）。不要根据变更范围自行推断 SemVer minor/major。
-- 发布前用 `bun test` 和 `bun run build` 验证。
-- 提交 release bump，创建 `vX.Y.Z` tag，push `main`，再 push tag。
-- 用 `npm publish --access public` 发布 npm 包。
-- 同一个版本也必须发布到 GitHub Packages。临时写入项目 `.npmrc`，内容包括 `@leviyuan:registry=https://npm.pkg.github.com` 和 `//npm.pkg.github.com/:_authToken=$GH_TOKEN`；运行 `npm publish --registry=https://npm.pkg.github.com --tag latest --access public` 后删除 `.npmrc`。不要跳过 GitHub Packages。
-- 始终为 tag 创建对应的 GitHub Release。本机没有安装 `gh`；使用 GitHub REST API，从 `~/.git-credentials` 读取 token，并用 `jq -n --rawfile body /tmp/notes.md ...` 构造 JSON body。
-- 写 release notes 前先读取最近的 GitHub Releases，并匹配现有风格。当前 notes 是中文，使用 `## 修复` / `## 改进` 这类短章节，并以 `**Full Changelog**: https://github.com/leviyuan/lodestar/compare/vA...vB` 结尾。
-- 只有用户明确要求时才重启正在运行的 user service；重启前先用 `systemctl --user list-units --all` 确认实际 unit。
-
 ### Common Patterns
 - 根入口保持很薄：`cli.ts` 处理首次配置和 PID guard，`daemon.ts` 负责 WS/event loop，核心业务下沉到 `src/`。
 - `Session` 是一个群的状态机；跨群状态只通过 session registry、持久 map 和 Feishu chat 绑定协调。
@@ -71,3 +61,13 @@
 - systemd user service：长期运行部署时常用，但只有用户明确要求时才操作。
 
 <!-- MANUAL: Add manually maintained notes below this line. -->
+
+## Release Checklist
+- 除非用户明确要求 minor 或 major 版本，否则只把 `package.json` 版本号按 patch 递增（`+0.0.1`）。不要根据变更范围自行推断 SemVer minor/major。
+- 发布前用 `bun test` 和 `bun run build` 验证。
+- 提交 release bump，创建 `vX.Y.Z` tag，push `main`，再 push tag。
+- 用 `npm publish --access public` 发布 npm 包。
+- 同一个版本也必须发布到 GitHub Packages。临时写入项目 `.npmrc`，内容包括 `@leviyuan:registry=https://npm.pkg.github.com` 和 `//npm.pkg.github.com/:_authToken=$GH_TOKEN`；运行 `npm publish --registry=https://npm.pkg.github.com --tag latest --access public` 后删除 `.npmrc`。不要跳过 GitHub Packages。
+- 始终为 tag 创建对应的 GitHub Release。本机没有安装 `gh`；使用 GitHub REST API，从 `~/.git-credentials` 读取 token，并用 `jq -n --rawfile body /tmp/notes.md ...` 构造 JSON body。
+- 写 release notes 前先读取最近的 GitHub Releases，并匹配现有风格。当前 notes 是中文，使用 `## 修复` / `## 改进` 这类短章节，并以 `**Full Changelog**: https://github.com/leviyuan/lodestar/compare/vA...vB` 结尾。
+- 只有用户明确要求时才重启正在运行的 user service；重启前先用 `systemctl --user list-units --all` 确认实际 unit。
