@@ -627,7 +627,7 @@ export class Session {
         if (!this.currentTurn && this.pendingUserMessageCount === 0 && this.pendingMidTurnMsgs.length === 0) {
           const statusCard = await this.openStatusCard('stop', '⚪ 当前没有正在执行的 turn', 'grey')
           if (statusCard) {
-            await this.closeStatusCard(statusCard, '⚪ stop 无效')
+            await this.closeStatusCard(statusCard, '⚪ 无效')
           } else {
             await feishu.sendText(this.chatId, '⚪ 当前没有正在执行的 turn')
           }
@@ -682,7 +682,7 @@ export class Session {
               this.setStatusCard(statusCard, status)
             },
           })
-          await this.closeStatusCard(statusCard, wasRunning ? '✅ kill 完成' : '⚪ kill 无效')
+          await this.closeStatusCard(statusCard, wasRunning ? '✅ 完成' : '⚪ 无效')
         }
         return true
       case 'restart':
@@ -700,7 +700,7 @@ export class Session {
               this.setStatusCard(statusCard, status)
             },
           })
-          await this.closeStatusCard(statusCard, ok ? '✅ restart 完成' : (lastStatus.startsWith('❌') ? lastStatus : '❌ restart 失败'))
+          await this.closeStatusCard(statusCard, ok ? '✅ 完成' : (lastStatus.startsWith('❌') ? lastStatus : '❌ 失败'))
         }
         return true
       case 'clear':
@@ -715,7 +715,7 @@ export class Session {
           this.opts.onLifecycleChange?.()
           const statusCard = await this.openStatusCard('clear', '⚪ session 当前未运行', 'grey')
           if (statusCard) {
-            await this.closeStatusCard(statusCard, '⚪ clear 无效')
+            await this.closeStatusCard(statusCard, '⚪ 无效')
           } else {
             await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行,clear 无效;用 \`hi\` 启动或 \`restart\` 恢复上一会话`)
           }
@@ -731,7 +731,7 @@ export class Session {
               this.setStatusCard(statusCard, status)
             },
           })
-          await this.closeStatusCard(statusCard, ok ? '✅ clear 完成' : (lastStatus.startsWith('❌') ? lastStatus : '❌ clear 失败'))
+          await this.closeStatusCard(statusCard, ok ? '✅ 完成' : (lastStatus.startsWith('❌') ? lastStatus : '❌ 失败'))
         }
         return true
     }

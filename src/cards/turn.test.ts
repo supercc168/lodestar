@@ -19,16 +19,17 @@ describe('main conversation card rendering', () => {
     expect(JSON.stringify(card)).not.toContain('ticker')
   })
 
-  test('status cards render an immediately visible footer', () => {
+  test('status cards render one visible status line without a header', () => {
     const card = statusCard({
       sessionName: 'probe',
       title: 'restart',
       status: '🔁 重启 Codex (0s)',
     }) as any
 
-    expect(card.header.title.content).toBe('🌟 Lodestar · probe')
+    expect(card.header).toBeUndefined()
     expect(card.body.elements[0].element_id).toBe('footer')
-    expect(card.body.elements[0].content).toContain('🔁 重启 Codex (0s)')
+    expect(card.body.elements[0].content).toBe('🔁 重启 Codex (0s)')
+    expect(card.body.elements[0].content).not.toContain('restart')
   })
 
   test('console body can replace a status card footer in place', () => {

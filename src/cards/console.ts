@@ -51,8 +51,8 @@ interface StatusCardOpts {
   template?: 'blue' | 'green' | 'orange' | 'red' | 'grey' | 'turquoise'
 }
 
-export function statusCardContent(title: string, status: string): string {
-  return `**${title}**\n${status}`
+export function statusCardContent(_title: string, status: string): string {
+  return status
 }
 
 export function statusCard(opts: StatusCardOpts): object {
@@ -62,10 +62,6 @@ export function statusCard(opts: StatusCardOpts): object {
       update_multi: true,
       streaming_mode: true,
       summary: { content: opts.status },
-    },
-    header: {
-      title: { tag: 'plain_text', content: `🌟 Lodestar · ${opts.sessionName}` },
-      template: opts.template ?? 'blue',
     },
     body: {
       elements: [
