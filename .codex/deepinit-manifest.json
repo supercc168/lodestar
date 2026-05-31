@@ -1,0 +1,80 @@
+{
+  "directories": {
+    ".": {
+      "files": [
+        ".gitignore",
+        "AGENTS.md",
+        "LICENSE",
+        "README.md",
+        "bun.lock",
+        "cli.ts",
+        "daemon.ts",
+        "package.json",
+        "promo.jpg"
+      ],
+      "subdirs": [
+        "scripts",
+        "src"
+      ]
+    },
+    "scripts": {
+      "files": [
+        "AGENTS.md",
+        "cardkit-probe.ts",
+        "postinstall.cjs",
+        "seed-debug-ctx.ts",
+        "smoke.ts",
+        "test-all.ts",
+        "test-inject.ts",
+        "test-mid-turn-rotation.ts"
+      ],
+      "subdirs": []
+    },
+    "src": {
+      "files": [
+        "AGENTS.md",
+        "cardkit.test.ts",
+        "cardkit.ts",
+        "cards.ts",
+        "codex-process.ts",
+        "config.ts",
+        "context-window.test.ts",
+        "context-window.ts",
+        "feishu.ts",
+        "instructions.ts",
+        "log.ts",
+        "notify-skill.ts",
+        "notify.ts",
+        "paths.ts",
+        "pid-guard.ts",
+        "session-ask.ts",
+        "session-permission.ts",
+        "session-tools.ts",
+        "session-types.ts",
+        "session.ts",
+        "setup-cli.ts",
+        "setup.ts",
+        "stop-cli.ts",
+        "sysinfo.ts",
+        "update-cli.ts",
+        "usage.ts",
+        "version-cli.ts"
+      ],
+      "subdirs": [
+        "cards"
+      ]
+    },
+    "src/cards": {
+      "files": [
+        "AGENTS.md",
+        "console.ts",
+        "elements.ts",
+        "turn.test.ts",
+        "turn.ts"
+      ],
+      "subdirs": []
+    }
+  },
+  "generatedAt": "2026-05-31T08:37:36.222095+00:00",
+  "version": 1
+}
