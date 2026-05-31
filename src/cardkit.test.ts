@@ -35,7 +35,7 @@ afterEach(() => {
 })
 
 describe('cardkit streaming finalization', () => {
-  test('staticizes a buffered streaming markdown element without later PUTing to the deleted element', async () => {
+  test('staticizes a buffered streaming markdown element by deleting it before adding the final element', async () => {
     const cardId = 'card_staticize_race'
     const streamId = 'assistant_0'
     const staticId = 'assistant_0_static'
@@ -43,28 +43,32 @@ describe('cardkit streaming finalization', () => {
 
     cardkit.recordCardCreated(cardId, 1)
     cardkit.streamTextThrottled(cardId, streamId, content)
-    const staticize = cardkit.staticizeMarkdownElement(cardId, streamId, staticId, content)
+    const staticize = cardkit.staticizeMarkdownElement(cardId, streamId, staticId, content, 'footer')
 
     await cardkit.flush(cardId)
     await staticize
     await cardkit.dispose(cardId)
 
-    const add = calls.find(call =>
+    const deleteIdx = calls.findIndex(call =>
+      call.method === 'DELETE' &&
+      call.path === `/cards/${cardId}/elements/${streamId}`
+    )
+    const addIdx = calls.findIndex(call =>
       call.method === 'POST' &&
       call.path === `/cards/${cardId}/elements`
     )
+    expect(deleteIdx).toBeGreaterThanOrEqual(0)
+    expect(addIdx).toBeGreaterThan(deleteIdx)
+
+    const add = calls[addIdx]
     expect(add?.body.type).toBe('insert_before')
-    expect(add?.body.target_element_id).toBe(streamId)
+    expect(add?.body.target_element_id).toBe('footer')
     expect(JSON.parse(add?.body.elements ?? '[]')).toEqual([{
       tag: 'markdown',
       element_id: staticId,
       content,
     }])
 
-    expect(calls.some(call =>
-      call.method === 'DELETE' &&
-      call.path === `/cards/${cardId}/elements/${streamId}`
-    )).toBe(true)
     expect(calls.some(call =>
       call.method === 'PUT' &&
       call.path === `/cards/${cardId}/elements/${streamId}/content`

@@ -350,8 +350,9 @@ export function addElement(
   return s.queue
 }
 
-/** Freeze a streaming markdown element by inserting a new static markdown
- * element immediately before it, then deleting the old streaming element.
+/** Freeze a streaming markdown element by deleting the old streaming element
+ * first, then inserting a new static markdown element before the provided
+ * stable sibling.
  * This avoids toggling whole-card streaming_mode mid-turn while still making
  * completed assistant blocks fully visible before tools or later blocks land.
  */
@@ -360,6 +361,7 @@ export function staticizeMarkdownElement(
   elementId: string,
   staticElementId: string,
   content: string,
+  insertBeforeElementId: string,
 ): Promise<void> {
   if (!content || !content.trim()) return Promise.resolve()
   const s = state(cardId)
@@ -369,31 +371,42 @@ export function staticizeMarkdownElement(
     element_id: staticElementId,
     content: content.trim() || ' ',
   }
-  s.queue = s.queue.then(() => withReopenOnStreamingClosed(
-    cardId,
-    `staticizeElement ${elementId}`,
-    async () => {
-      if (s.deadElements.has(elementId)) return
-      const addSeq = nextSeq(cardId)
-      await call('POST', `/cards/${cardId}/elements`, {
-        type: 'insert_before',
-        target_element_id: elementId,
-        elements: JSON.stringify([element]),
-        sequence: addSeq,
-      })
-      s.elementCount += 1
-      try {
+  s.queue = s.queue.then(async () => {
+    if (s.deadElements.has(elementId)) return
+    let deleted = false
+    await withReopenOnStreamingClosed(
+      cardId,
+      `staticizeElement delete-old ${elementId}`,
+      async () => {
+        if (s.deadElements.has(elementId)) return
         const deleteSeq = nextSeq(cardId)
         await call('DELETE', `/cards/${cardId}/elements/${elementId}`, {
           sequence: deleteSeq,
         })
-        s.elementCount = Math.max(0, s.elementCount - 1)
-        markElementDead(s, elementId)
-      } catch (e) {
-        log(`cardkit staticizeElement delete-old ${elementId} ${cardId}: ${e}`)
-      }
-    },
-  ))
+        deleted = true
+      },
+      undefined,
+      true,
+    )
+    if (!deleted) return
+    s.elementCount = Math.max(0, s.elementCount - 1)
+    markElementDead(s, elementId)
+
+    await withReopenOnStreamingClosed(
+      cardId,
+      `staticizeElement add-final ${staticElementId}`,
+      async () => {
+        const addSeq = nextSeq(cardId)
+        await call('POST', `/cards/${cardId}/elements`, {
+          type: 'insert_before',
+          target_element_id: insertBeforeElementId,
+          elements: JSON.stringify([element]),
+          sequence: addSeq,
+        })
+        s.elementCount += 1
+      },
+    )
+  })
   return s.queue
 }
 

@@ -263,7 +263,7 @@ export class Session {
     let stopped = false
     const render = (): void => {
       if (stopped) return
-      cardkit.streamTextThrottled(
+      void cardkit.streamText(
         cardId,
         cards.ELEMENTS.footer,
         renderContent(timedStatus(status, startedAt)),
@@ -1691,6 +1691,7 @@ export class Session {
         segId,
         staticAssistantElementId(segId),
         text,
+        cards.ELEMENTS.footer,
       )
     }
     turn.currentAssistantSegmentId = null
@@ -1729,7 +1730,7 @@ export class Session {
     const render = (): void => {
       if (turn.thinkingFooterHandle == null) return
       const elapsedS = Math.max(1, Math.floor((Date.now() - turn.thinkingFooterStartedAt) / 1000))
-      void cardkit.streamTextThrottled(
+      void cardkit.streamText(
         turn.cardId,
         cards.ELEMENTS.footer,
         `${FOOTER_THINKING_PREFIX}(${elapsedS}s)`,
