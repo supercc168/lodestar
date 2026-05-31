@@ -11,7 +11,7 @@
 |------|-------------|
 | `session.ts` | 一个飞书群对应一个 `Session`；管理 Codex 生命周期、每轮卡片、消息排队、控制命令和统计状态。 |
 | `session-types.ts` | `TurnState`、`Status`、累计统计和 session option 类型定义。 |
-| `session-tools.ts` | 工具调用面板、任务清单镜像、工具结果自动发文件和换卡后的工具面板重建逻辑。 |
+| `session-tools.ts` | 工具调用面板、工具结果自动发文件和换卡后的工具面板重建逻辑。 |
 | `session-ask.ts` | Codex `AskUserQuestion` 交互流程，处理按钮、自定义回答和权限 request 回填。 |
 | `session-permission.ts` | 工具权限请求的卡片渲染与用户决策回传。 |
 | `codex-process.ts` | 启动 `codex app-server --listen stdio://`，处理 JSON-RPC 请求、通知、工具权限和使用量元数据。 |

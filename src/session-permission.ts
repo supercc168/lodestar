@@ -12,7 +12,6 @@ import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
-import { isTaskWorkflow, todosArray } from './session-tools'
 import { finalizeAsk } from './session-ask'
 
 export async function onPermissionDecision(
@@ -30,14 +29,13 @@ export async function onPermissionDecision(
   const turn = s.currentTurn
   const meta = turn?.toolByUseId.get(pending.toolUseId)
   if (turn && meta) {
-    const todos = isTaskWorkflow(meta.name) ? todosArray(s) : undefined
     if (decision === 'deny') {
-      const el = cards.toolCallElement(meta.i, meta.name, meta.input, `🚫 已拒绝 by ${user || '匿名'}`, '❌', undefined, todos)
+      const el = cards.toolCallElement(meta.i, meta.name, meta.input, `🚫 已拒绝 by ${user || '匿名'}`, '❌')
       void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
     } else {
       const label = decision === 'allow_always' ? '始终允许' : '已允许'
       meta.resolvedNote = `✅ **${label}** by ${user || '匿名'}`
-      const el = cards.toolCallElement(meta.i, meta.name, meta.input, null, '⏳', meta.resolvedNote, todos)
+      const el = cards.toolCallElement(meta.i, meta.name, meta.input, null, '⏳', meta.resolvedNote)
       void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
     }
   }

@@ -18,10 +18,8 @@ export interface TurnState {
   /** What kicked off this turn. Kept explicit for turn lifecycle logic. */
   trigger: 'user_message'
   toolCount: number
-  /** `output` / `isError` are filled in by completeTool — kept on the
-   * meta (instead of being thrown away after the first render) so a
-   * later Task* op can re-render every prior Task* panel with the
-   * latest todo mirror appended. */
+  /** `output` / `isError` are filled in by completeTool and kept so
+   * card rotation can rebuild unfinished or failed tool panels. */
   toolByUseId: Map<string, {
     i: number
     name: string
@@ -34,6 +32,14 @@ export interface TurnState {
      * update the right row instead of rendering a standalone panel. */
     readBatchSlot?: number
   }>
+  /** Current turn plan as reported by Codex app-server
+   * turn/plan/updated. Deltas are only for the pre-authoritative
+   * planning draft shown before this structure lands. */
+  planSteps: Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' | string }>
+  planExplanation: string | null
+  planDrafts: Map<string, string>
+  planElementCreated: boolean
+  goalElementCreated: boolean
   /** Consecutive `Read` calls collapse into a single panel rendered by
    * `cards.readBatchElement`. Keyed by element index `i` so completeTool
    * can find the batch after its open-window closed (a non-Read tool or

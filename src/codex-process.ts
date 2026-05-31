@@ -82,6 +82,34 @@ export interface HookCallbackRequest {
   tool_use_id?: string
 }
 
+export interface TurnPlanStep {
+  step: string
+  status: 'pending' | 'inProgress' | 'completed' | string
+}
+
+export interface TurnPlanUpdated {
+  threadId?: string
+  turnId?: string
+  explanation: string | null
+  plan: TurnPlanStep[]
+}
+
+export interface PlanDelta {
+  threadId?: string
+  turnId?: string
+  itemId: string
+  delta: string
+}
+
+export interface ThreadGoal {
+  threadId?: string
+  objective: string
+  status: 'active' | 'paused' | 'blocked' | 'usageLimited' | 'budgetLimited' | 'complete' | string
+  tokenBudget: number | null
+  tokensUsed: number
+  timeUsedSeconds: number
+}
+
 export interface CodexUsage {
   input_tokens?: number
   output_tokens?: number
@@ -292,6 +320,26 @@ export class CodexProcess extends EventEmitter {
         }
         this.currentTurnId = null
         this.emit('result', { subtype, is_error: isError, duration_ms: this.lastResult.duration_ms, usage: this.lastUsage })
+        return
+      }
+      case 'turn/plan/updated': {
+        this.emit('turn_plan_updated', params as TurnPlanUpdated)
+        return
+      }
+      case 'item/plan/delta': {
+        this.emit('plan_delta', params as PlanDelta)
+        return
+      }
+      case 'thread/goal/updated': {
+        if (params.goal) {
+          this.emit('thread_goal_updated', params.goal as ThreadGoal)
+        } else {
+          log('codex-process: thread/goal/updated missing goal')
+        }
+        return
+      }
+      case 'thread/goal/cleared': {
+        this.emit('thread_goal_cleared', params)
         return
       }
       case 'item/agentMessage/delta': {

@@ -9,25 +9,104 @@
 import { isAbsolute, relative } from 'node:path'
 import { ELEMENTS } from './elements'
 
-/** Minimal projection of a Codex task — used by Session's local mirror,
- * built incrementally from observed TaskCreate / TaskUpdate input+output
- * pairs. Not authoritative (Codex is the source of truth), but enough
- * to render the "全部任务清单" footer on every Task* panel. */
-export interface Todo {
-  id: number
-  subject?: string
-  description?: string
-  status: 'pending' | 'in_progress' | 'completed' | string
-  owner?: string
-  activeForm?: string
+export interface TurnPlanStep {
+  step: string
+  status: 'pending' | 'inProgress' | 'completed' | string
 }
 
-function todoStatusIcon(s: string): string {
+export interface ThreadGoal {
+  objective: string
+  status: 'active' | 'paused' | 'blocked' | 'usageLimited' | 'budgetLimited' | 'complete' | string
+  tokenBudget: number | null
+  tokensUsed: number
+  timeUsedSeconds: number
+}
+
+function planStatusIcon(s: string): string {
   switch (s) {
     case 'pending':     return '☐'
-    case 'in_progress': return '🔄'
+    case 'inProgress':  return '🔄'
     case 'completed':   return '✅'
     default:            return '·'
+  }
+}
+
+function goalStatusLabel(s: string): string {
+  switch (s) {
+    case 'active':       return '进行中'
+    case 'paused':       return '已暂停'
+    case 'blocked':      return '受阻'
+    case 'usageLimited': return '额度受限'
+    case 'budgetLimited': return '预算受限'
+    case 'complete':     return '已完成'
+    default:             return s
+  }
+}
+
+function formatGoalTime(seconds: number): string {
+  if (!Number.isFinite(seconds) || seconds < 0) return 'MISS'
+  if (seconds < 60) return `${Math.round(seconds)}s`
+  const minutes = Math.floor(seconds / 60)
+  const rest = Math.round(seconds % 60)
+  if (minutes < 60) return rest ? `${minutes}m ${rest}s` : `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  const min = minutes % 60
+  return min ? `${hours}h ${min}m` : `${hours}h`
+}
+
+function renderPlanContent(plan: TurnPlanStep[], explanation?: string | null, draftText = ''): string {
+  const lines = ['**📋 当前计划**']
+  const cleanExplanation = explanation?.trim()
+  if (cleanExplanation) {
+    lines.push('')
+    lines.push(cleanExplanation)
+  }
+  if (plan.length > 0) {
+    lines.push('')
+    for (const item of plan) {
+      lines.push(`- ${planStatusIcon(item.status)} ${item.step}`)
+    }
+  } else {
+    const draft = draftText.trim()
+    lines.push('')
+    if (draft) {
+      lines.push('正在生成计划草稿...')
+      lines.push('')
+      lines.push(draft)
+    } else {
+      lines.push('--')
+    }
+  }
+  return lines.join('\n')
+}
+
+export function planElement(plan: TurnPlanStep[], explanation?: string | null, draftText = ''): object {
+  return {
+    tag: 'markdown',
+    element_id: ELEMENTS.plan,
+    content: renderPlanContent(plan, explanation, draftText),
+  }
+}
+
+export function goalElement(goal: ThreadGoal): object {
+  const tokensUsed = Number.isFinite(goal.tokensUsed) ? String(goal.tokensUsed) : 'MISS'
+  const tokenBudget = goal.tokenBudget == null
+    ? ''
+    : Number.isFinite(goal.tokenBudget)
+      ? ` / ${goal.tokenBudget}`
+      : ' / MISS'
+  const lines = [
+    `**🎯 当前目标** · ${goalStatusLabel(goal.status)}`,
+    '',
+    goal.objective,
+    '',
+    `- 用量: ${tokensUsed}${tokenBudget} tokens`,
+    `- 用时: ${formatGoalTime(goal.timeUsedSeconds)}`,
+  ]
+  return {
+    tag: 'markdown',
+    element_id: ELEMENTS.goal,
+    content: lines.join('\n'),
   }
 }
 
@@ -70,33 +149,10 @@ function displayToolName(name: string): string {
   return isBashTool(name) ? 'Bash' : name
 }
 
-/** Render the session's full todo mirror as a markdown list. Empty list
- * yields '' so callers can unconditionally concat. Sorted by numeric id
- * so the order matches creation order regardless of Map iteration. */
-function renderTodoList(todos: Todo[]): string {
-  if (!todos || todos.length === 0) return ''
-  const sorted = [...todos].sort((a, b) => a.id - b.id)
-  const lines = ['', '---', `**📋 当前任务清单（${sorted.length} 项）**`, '']
-  for (const t of sorted) {
-    const icon = todoStatusIcon(t.status)
-    const subject = t.subject ?? '(无 subject)'
-    const ownerTag = t.owner ? `  · ${t.owner}` : ''
-    lines.push(`- ${icon} **#${t.id}** ${subject}${ownerTag}`)
-  }
-  return lines.join('\n')
-}
-
 /** Single-line summary used as a collapsible-panel header for a tool call. */
 export function summarizeToolInput(name: string, input: any): string {
   if (!input || typeof input !== 'object') return ''
   const truncate = (s: string, n: number) => s.length > n ? s.slice(0, n) + '…' : s
-  // Task workflow tools (TaskCreate / TaskUpdate / TaskList / ...) carry
-  // structured fields that summarize much better as natural language than
-  // as truncated JSON. Routed first so they don't fall through to the
-  // generic Agent/Task case below.
-  if (name.startsWith('Task') && name !== 'Task') {
-    return truncate(summarizeTaskWorkflow(name, input), 80)
-  }
   if (isBashCommandTool(name)) return summarizeBashInput(input)
   if (isShellSessionTool(name)) return summarizeShellSessionInput(input)
   if (isFileChangeTool(name)) return truncate(summarizeFileChangeInput(input), 80)
@@ -617,78 +673,6 @@ function renderAgentBody(input: any, output: string | null, resolvedNote?: strin
   return lines.length > 0 ? lines.join('\n') : jsonBlock(input ?? {}, 2000)
 }
 
-/** Header summary for Task* workflow tools — `Task` (singular) is the
- * separate subagent-spawn tool and is handled above; everything else
- * (TaskCreate / TaskUpdate / TaskList / TaskGet / TaskStop / TaskOutput /
- * TaskDelete) summarises through here. */
-function summarizeTaskWorkflow(name: string, input: any): string {
-  switch (name) {
-    case 'TaskCreate':
-      return `📝 创建: ${input.subject ?? '(无 subject)'}`
-    case 'TaskUpdate': {
-      const parts: string[] = []
-      if (input.status) parts.push(`→ ${input.status}`)
-      if (input.owner) parts.push(`owner=${input.owner}`)
-      if (input.subject) parts.push(`subject="${input.subject}"`)
-      if (input.addBlocks) parts.push(`blocks=[${(input.addBlocks ?? []).join(',')}]`)
-      if (input.addBlockedBy) parts.push(`blockedBy=[${(input.addBlockedBy ?? []).join(',')}]`)
-      const tail = parts.length ? ' ' + parts.join(', ') : ''
-      return `✏️ #${input.taskId ?? '?'}${tail}`
-    }
-    case 'TaskList':   return '📋 查询任务列表'
-    case 'TaskGet':    return `🔍 查询 #${input.taskId ?? '?'}`
-    case 'TaskStop':   return `⏹ 停止 #${input.taskId ?? '?'}`
-    case 'TaskOutput': return `📤 取输出 #${input.taskId ?? '?'}`
-    case 'TaskDelete': return `🗑 删除 #${input.taskId ?? '?'}`
-  }
-  return name
-}
-
-/** Markdown body for Task* workflow tools — replaces the generic JSON
- * dump with a human-readable description of the operation plus, once the
- * tool result is in, Codex's text reply (which already contains "Task
- * #N created" / "Updated task #X" / a rendered list for TaskList). When
- * `todos` is non-empty, the full mirror is appended as a "📋 当前任务
- * 清单" footer so every Task* panel doubles as a current-state readout. */
-function renderTaskWorkflowBody(name: string, input: any, output: string | null, todos?: Todo[]): string {
-  const lines: string[] = []
-  switch (name) {
-    case 'TaskCreate':
-      lines.push(`**📝 创建任务**`)
-      if (input.subject)    lines.push(`- subject: ${input.subject}`)
-      if (input.description) lines.push(`- 描述: ${input.description}`)
-      if (input.activeForm) lines.push(`- 进行时: ${input.activeForm}`)
-      break
-    case 'TaskUpdate': {
-      lines.push(`**✏️ 更新 #${input.taskId ?? '?'}**`)
-      if (input.status)       lines.push(`- status → \`${input.status}\``)
-      if (input.subject)      lines.push(`- subject: ${input.subject}`)
-      if (input.description)  lines.push(`- description: ${input.description}`)
-      if (input.owner)        lines.push(`- owner: ${input.owner}`)
-      if (input.activeForm)   lines.push(`- 进行时: ${input.activeForm}`)
-      if (input.addBlocks)    lines.push(`- blocks → ${(input.addBlocks).join(', ')}`)
-      if (input.addBlockedBy) lines.push(`- blockedBy → ${(input.addBlockedBy).join(', ')}`)
-      if (input.metadata)     lines.push(`- metadata: \`${JSON.stringify(input.metadata)}\``)
-      break
-    }
-    case 'TaskList':   lines.push('**📋 查询当前任务清单**'); break
-    case 'TaskGet':    lines.push(`**🔍 查询 #${input.taskId ?? '?'}**`); break
-    case 'TaskStop':   lines.push(`**⏹ 停止 #${input.taskId ?? '?'}**`); break
-    case 'TaskOutput': lines.push(`**📤 取 #${input.taskId ?? '?'} 输出**`); break
-    case 'TaskDelete': lines.push(`**🗑 删除 #${input.taskId ?? '?'}**`); break
-    default:
-      lines.push(`**${name}**`)
-      lines.push('```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 1000) + '\n```')
-  }
-  if (output != null) {
-    lines.push('')
-    lines.push('---')
-    lines.push('**结果**')
-    lines.push(output.slice(0, 3000))
-  }
-  return lines.join('\n') + renderTodoList(todos ?? [])
-}
-
 interface MainCardOpts {
   sessionName: string
   turn: number
@@ -776,10 +760,6 @@ export function toolCallElement(
   output: string | null,
   status: '⏳' | '✅' | '❌' = '⏳',
   resolvedNote?: string,
-  /** Session's full todo mirror — only rendered when the tool is a Task*
-   * workflow op. Other tools ignore it. Passed in by Session so every
-   * Task* panel shows the *current* state, not just this op's diff. */
-  todos?: Todo[],
 ): object {
   const rawSummary = isWebSearchTool(name) && output != null
     ? summarizeWebSearchOutput(input, output)
@@ -789,31 +769,24 @@ export function toolCallElement(
   const headerText = summary
     ? `${status} 🔧 ${toolName}: ${summary}`
     : `${status} 🔧 ${toolName}`
-  const isTaskWorkflow = name.startsWith('Task') && name !== 'Task'
   const noteBlock = resolvedNote ? `\n\n${resolvedNote}` : ''
-  // Task* gets a narrative body (operation + result + current todo list),
-  // the rest keeps the JSON-input + raw-output split — generic dump is
-  // better for unfamiliar tools where users can't predict what fields
-  // matter.
-  const body = isTaskWorkflow
-    ? renderTaskWorkflowBody(name, input, output, todos) + noteBlock
-    : isBashCommandTool(name)
-      ? renderBashBody(input, output, resolvedNote)
-      : isShellSessionTool(name)
-        ? renderShellSessionBody(input, output, resolvedNote)
-        : isFileChangeTool(name)
-          ? renderFileChangeBody(input, output, resolvedNote)
-          : isWebSearchTool(name)
-            ? renderWebSearchBody(input, output, resolvedNote)
-            : isMcpTool(name)
-              ? renderMcpBody(input, output, resolvedNote)
-              : isImageGenerationTool(name)
-                ? renderImageGenerationBody(input, output, resolvedNote)
-                : isAgentTool(name)
-                  ? renderAgentBody(input, output, resolvedNote)
-                  : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
-                    + noteBlock
-                    + (output != null ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```' : '')
+  const body = isBashCommandTool(name)
+    ? renderBashBody(input, output, resolvedNote)
+    : isShellSessionTool(name)
+      ? renderShellSessionBody(input, output, resolvedNote)
+      : isFileChangeTool(name)
+        ? renderFileChangeBody(input, output, resolvedNote)
+        : isWebSearchTool(name)
+          ? renderWebSearchBody(input, output, resolvedNote)
+          : isMcpTool(name)
+            ? renderMcpBody(input, output, resolvedNote)
+            : isImageGenerationTool(name)
+              ? renderImageGenerationBody(input, output, resolvedNote)
+              : isAgentTool(name)
+                ? renderAgentBody(input, output, resolvedNote)
+                : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
+                  + noteBlock
+                  + (output != null ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```' : '')
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),

@@ -12,14 +12,6 @@ import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
 
-export function isTaskWorkflow(name: string): boolean {
-  return name.startsWith('Task') && name !== 'Task'
-}
-
-export function todosArray(s: Session): cards.Todo[] {
-  return [...s.currentTodos.values()]
-}
-
 function isImageGenerationTool(name: string): boolean {
   return name === 'ImageGeneration' || name === 'imageGeneration'
 }
@@ -125,11 +117,7 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
     }
     return
   }
-  // Pending Task* panels still show the *pre-op* todo mirror so users
-  // can read the current state immediately, without waiting for the
-  // tool to return.
-  const todos = isTaskWorkflow(name) ? todosArray(s) : undefined
-  const el = cards.toolCallElement(i, name, input, null, '⏳', undefined, todos)
+  const el = cards.toolCallElement(i, name, input, null, '⏳')
   void cardkit.addElement(s.currentTurn.cardId, el, {
     type: 'insert_before',
     targetElementId: cards.ELEMENTS.footer,
@@ -145,9 +133,8 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
     : Array.isArray(content)
       ? content.map((c: any) => c?.text ?? JSON.stringify(c)).join('\n')
       : JSON.stringify(content)
-  // Stash on the meta — every Task* op coming after this point may
-  // need to re-render this panel with a fresher todo footer, so we
-  // can't discard the output after the first paint.
+  // Stash on the meta so rotation can rebuild unfinished or failed
+  // panels after this result lands.
   meta.output = output
   meta.isError = isError
   const autoSendPath = autoSendPathFromToolResult(meta.name, output, isError)
@@ -176,21 +163,8 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
     startThinkingIfNoToolsRunning(s)
     return
   }
-  // Update the local todo mirror BEFORE rendering so the just-
-  // completed panel shows the new state too (e.g. a TaskCreate panel
-  // already lists the task it just created).
-  if (!isError && isTaskWorkflow(meta.name)) {
-    updateTodosFromTask(s, meta.name, meta.input, output)
-  }
-  const todos = isTaskWorkflow(meta.name) ? todosArray(s) : undefined
-  const el = cards.toolCallElement(meta.i, meta.name, meta.input, output, isError ? '❌' : '✅', meta.resolvedNote, todos)
+  const el = cards.toolCallElement(meta.i, meta.name, meta.input, output, isError ? '❌' : '✅', meta.resolvedNote)
   void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
-  // Cascade the new mirror into every prior Task* panel in this turn
-  // so any expanded panel reflects the latest state, not the snapshot
-  // captured when that op ran.
-  if (!isError && isTaskWorkflow(meta.name)) {
-    refreshOtherTaskPanels(s, toolUseId)
-  }
   startThinkingIfNoToolsRunning(s)
 }
 
@@ -201,69 +175,6 @@ function startThinkingIfNoToolsRunning(s: Session): void {
     if (tool.output == null) return
   }
   s.startThinkingFooter(turn)
-}
-
-/** Roll a single Task* op into the local mirror — best-effort. Output
- * parsing is regex-based (the SDK returns plain text like "Task #7
- * created successfully: …"), so unexpected variants are skipped
- * silently rather than blowing up the panel render. */
-export function updateTodosFromTask(s: Session, name: string, input: any, output: string): void {
-  switch (name) {
-    case 'TaskCreate': {
-      const m = output.match(/Task #(\d+) created/)
-      if (!m) return
-      const id = Number(m[1])
-      s.currentTodos.set(id, {
-        id,
-        subject: input.subject,
-        description: input.description,
-        activeForm: input.activeForm,
-        status: 'pending',
-      })
-      return
-    }
-    case 'TaskUpdate': {
-      const id = Number(input.taskId)
-      if (!Number.isFinite(id)) return
-      // status=deleted is the SDK's tombstone — drop from the mirror
-      // so the readout doesn't carry it forever. Server still keeps
-      // it; the mirror is just for the panel footer.
-      if (input.status === 'deleted') { s.currentTodos.delete(id); return }
-      const cur = s.currentTodos.get(id) ?? { id, status: 'pending' as const }
-      if (input.status)      cur.status = input.status
-      if (input.subject)     cur.subject = input.subject
-      if (input.description) cur.description = input.description
-      if (input.owner)       cur.owner = input.owner
-      if (input.activeForm)  cur.activeForm = input.activeForm
-      s.currentTodos.set(id, cur)
-      return
-    }
-    // TaskList / TaskGet / TaskStop / TaskOutput / TaskDelete:
-    // read-only or parse-heavy — skip mirror update. The panel will
-    // still render the SDK's textual result below the operation
-    // block, which is enough to disambiguate.
-  }
-}
-
-/** Re-render every Task* panel in the current turn (except the one
- * that just landed — already up-to-date) so they all show the latest
- * todo mirror in their footers. Cheap: ELEMENTS.tool(i) replace is
- * queued through the per-card Promise chain like any other op. */
-export function refreshOtherTaskPanels(s: Session, skipToolUseId: string): void {
-  if (!s.currentTurn) return
-  const todos = todosArray(s)
-  for (const [id, meta] of s.currentTurn.toolByUseId) {
-    if (id === skipToolUseId) continue
-    if (!isTaskWorkflow(meta.name)) continue
-    const status: '⏳' | '✅' | '❌' = meta.output === undefined
-      ? '⏳'
-      : (meta.isError ? '❌' : '✅')
-    const el = cards.toolCallElement(
-      meta.i, meta.name, meta.input, meta.output ?? null,
-      status, meta.resolvedNote, todos,
-    )
-    void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
-  }
 }
 
 /** 换卡时把"还在跑 / 在旧卡没渲染成功"的 tool 搬到新卡重建,让它们的
@@ -316,8 +227,7 @@ export function rebuildToolsOnRotate(
     } else {
       turn.toolByUseId.set(useId, { ...meta, i: ni })
       const status: '⏳' | '✅' | '❌' = !done ? '⏳' : (isError ? '❌' : '✅')
-      const todos = isTaskWorkflow(meta.name) ? todosArray(s) : undefined
-      void cardkit.addElement(newCardId, cards.toolCallElement(ni, meta.name, meta.input, output, status, meta.resolvedNote, todos), {
+      void cardkit.addElement(newCardId, cards.toolCallElement(ni, meta.name, meta.input, output, status, meta.resolvedNote), {
         type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
       })
     }

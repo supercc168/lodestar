@@ -5,6 +5,10 @@
  *                       默认 expanded=false,把"自己刚才说了啥"收纳进卡片自己,
  *                       不必滚群里找原消息。
  *   tool_<i>          — one collapsible per tool call, indexed from 0
+ *   goal              — current thread goal, when Codex emits
+ *                       thread/goal/updated
+ *   plan              — current turn plan, updated from turn/plan/updated
+ *                       and item/plan/delta
  *   assistant         — the main streaming assistant answer
  *   footer            — runtime footer. While the model is silent it
  *                       shows `Thinking...(Ns)`; while visible work is
@@ -13,6 +17,8 @@
  */
 export const ELEMENTS = {
   userInput: 'user_input',
+  goal: 'goal',
+  plan: 'plan',
   footer: 'footer',
   tool: (i: number) => `tool_${i}`,
   /** Assistant text is segmented: every tool call closes the running segment

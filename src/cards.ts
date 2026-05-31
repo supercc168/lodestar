@@ -4,20 +4,23 @@
  * this file. Internal split so each module stays under practical
  * per-read token budget:
  *   - cards/elements.ts — ELEMENTS (shared element-id helpers)
- *   - cards/turn.ts     — main turn card, tool panels, ask panels, todos
+ *   - cards/turn.ts     — main turn card, plan/goal panels, tool panels, ask panels
  *   - cards/console.ts  — console + menu cards, formatters,
  *                          streamingOffSettings
  */
 
 export { ELEMENTS } from './cards/elements'
 export {
-  type Todo,
+  type ThreadGoal,
+  type TurnPlanStep,
   type AskQuestion,
   type AskAnswered,
   type AskState,
   summarizeToolInput,
   mainConversationCard,
   assistantSegmentElement,
+  goalElement,
+  planElement,
   toolCallElement,
   readBatchElement,
   toolCallPermissionElement,
