@@ -37,9 +37,8 @@ export interface TurnState {
    * planning draft shown before this structure lands. */
   planSteps: Array<{ step: string; status: 'pending' | 'inProgress' | 'completed' | string }>
   planExplanation: string | null
-  planDrafts: Map<string, string>
-  planElementCreated: boolean
-  goalElementCreated: boolean
+  planUpdateCount: number
+  goalUpdateCount: number
   /** Consecutive `Read` calls collapse into a single panel rendered by
    * `cards.readBatchElement`. Keyed by element index `i` so completeTool
    * can find the batch after its open-window closed (a non-Read tool or

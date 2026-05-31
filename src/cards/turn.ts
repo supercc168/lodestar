@@ -80,15 +80,20 @@ function renderPlanContent(plan: TurnPlanStep[], explanation?: string | null, dr
   return lines.join('\n')
 }
 
-export function planElement(plan: TurnPlanStep[], explanation?: string | null, draftText = ''): object {
+export function planElement(
+  plan: TurnPlanStep[],
+  explanation?: string | null,
+  draftText = '',
+  elementId = '',
+): object {
   return {
     tag: 'markdown',
-    element_id: ELEMENTS.plan,
+    element_id: elementId,
     content: renderPlanContent(plan, explanation, draftText),
   }
 }
 
-export function goalElement(goal: ThreadGoal): object {
+export function goalElement(goal: ThreadGoal, elementId = ''): object {
   const tokensUsed = Number.isFinite(goal.tokensUsed) ? String(goal.tokensUsed) : 'MISS'
   const tokenBudget = goal.tokenBudget == null
     ? ''
@@ -105,7 +110,7 @@ export function goalElement(goal: ThreadGoal): object {
   ]
   return {
     tag: 'markdown',
-    element_id: ELEMENTS.goal,
+    element_id: elementId,
     content: lines.join('\n'),
   }
 }

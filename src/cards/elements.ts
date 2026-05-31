@@ -5,10 +5,8 @@
  *                       默认 expanded=false,把"自己刚才说了啥"收纳进卡片自己,
  *                       不必滚群里找原消息。
  *   tool_<i>          — one collapsible per tool call, indexed from 0
- *   goal              — current thread goal, when Codex emits
- *                       thread/goal/updated
- *   plan              — current turn plan, updated from turn/plan/updated
- *                       and item/plan/delta
+ *   plan_update_<i>   — timeline snapshot inserted where a plan update occurs
+ *   goal_update_<i>   — timeline snapshot inserted where a goal update occurs
  *   assistant         — the main streaming assistant answer
  *   footer            — runtime footer. While the model is silent it
  *                       shows `Thinking...(Ns)`; while visible work is
@@ -17,10 +15,10 @@
  */
 export const ELEMENTS = {
   userInput: 'user_input',
-  goal: 'goal',
-  plan: 'plan',
   footer: 'footer',
   tool: (i: number) => `tool_${i}`,
+  planUpdate: (i: number) => `plan_update_${i}`,
+  goalUpdate: (i: number) => `goal_update_${i}`,
   /** Assistant text is segmented: every tool call closes the running segment
    * and the next assistant chunk opens a new one, so element order in the
    * card matches Codex's emission order. */

@@ -60,19 +60,23 @@ describe('plan and goal rendering', () => {
       { step: '读取 app-server 协议', status: 'completed' },
       { step: '接入 plan 通知', status: 'inProgress' },
       { step: '补测试', status: 'pending' },
-    ], '按当前协议渲染。') as any
+    ], '按当前协议渲染。', '', 'plan_update_0') as any
 
-    expect(el.element_id).toBe('plan')
+    expect(el.element_id).toBe('plan_update_0')
     expect(el.content).toContain('**📋 当前计划**')
     expect(el.content).toContain('按当前协议渲染。')
     expect(el.content).toContain('- ✅ 读取 app-server 协议')
     expect(el.content).toContain('- 🔄 接入 plan 通知')
     expect(el.content).toContain('- ☐ 补测试')
+
+    const timelineEl = planElement([{ step: '同步显示更新', status: 'inProgress' }], null, '', 'plan_update_3') as any
+    expect(timelineEl.element_id).toBe('plan_update_3')
   })
 
   test('renders plan draft before authoritative plan lands', () => {
-    const el = planElement([], null, '1. 探查代码\n2. 修改卡片') as any
+    const el = planElement([], null, '1. 探查代码\n2. 修改卡片', 'plan_update_draft') as any
 
+    expect(el.element_id).toBe('plan_update_draft')
     expect(el.content).toContain('正在生成计划草稿')
     expect(el.content).toContain('1. 探查代码')
     expect(el.content).toContain('2. 修改卡片')
@@ -85,13 +89,22 @@ describe('plan and goal rendering', () => {
       tokenBudget: 12000,
       tokensUsed: 3456,
       timeUsedSeconds: 125,
-    }) as any
+    }, 'goal_update_0') as any
 
-    expect(el.element_id).toBe('goal')
+    expect(el.element_id).toBe('goal_update_0')
     expect(el.content).toContain('**🎯 当前目标** · 进行中')
     expect(el.content).toContain('完成 Lodestar plan 展示迁移')
     expect(el.content).toContain('- 用量: 3456 / 12000 tokens')
     expect(el.content).toContain('- 用时: 2m 5s')
+
+    const timelineEl = goalElement({
+      objective: '目标更新位置可见',
+      status: 'complete',
+      tokenBudget: null,
+      tokensUsed: 500,
+      timeUsedSeconds: 9,
+    }, 'goal_update_1') as any
+    expect(timelineEl.element_id).toBe('goal_update_1')
   })
 })
 

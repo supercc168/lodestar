@@ -1451,9 +1451,8 @@ export class Session {
       toolByUseId: new Map(),
       planSteps: [],
       planExplanation: null,
-      planDrafts: new Map(),
-      planElementCreated: false,
-      goalElementCreated: false,
+      planUpdateCount: 0,
+      goalUpdateCount: 0,
       readBatches: new Map(),
       openReadBatchI: null,
       assistantSegmentCount: 0,
@@ -1470,7 +1469,6 @@ export class Session {
       outboundSentPaths: new Set(),
     }
     this.currentTurn = turnState
-    this.renderGoalOnCurrentTurn()
     if (opts.startThinking !== false) this.startThinkingFooter(turnState)
   }
 
@@ -1580,8 +1578,8 @@ export class Session {
         turn.toolByUseId = new Map()
         turn.readBatches = new Map()
         turn.openReadBatchI = null
-        turn.planElementCreated = false
-        turn.goalElementCreated = false
+        turn.planUpdateCount = 0
+        turn.goalUpdateCount = 0
         // swap 那一刻读当前正在写的段(含切卡 async 窗口里到达的全部 delta ——
         // onFailure 在 rotating 期间不 reset,所以这段一直累积到这里)。先读后清。
         const carrySegId = turn.currentAssistantSegmentId
@@ -1593,8 +1591,6 @@ export class Session {
         turn.segmentTexts = new Map()
         if (carryText) cardkit.streamTextThrottled(turn.cardId, cards.ELEMENTS.footer, FOOTER_WORKING)
         else this.startThinkingFooter(turn)
-        this.renderGoalOnCurrentTurn()
-        this.renderPlanOnCurrentTurn()
         // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read 切开重建。
         sessionTools.rebuildToolsOnRotate(this, oldCardId, newCardId, oldToolByUseId, oldBatches)
         // 当前 assistant 段还没收尾就换卡时,整段迁到新卡继续写。不要把半段
@@ -1648,51 +1644,41 @@ export class Session {
   // can yield mid-handler and let `closeTurnCard` (or another event) race
   // and mutate `this.currentTurn` underfoot.
 
-  private renderGoalOnCurrentTurn(): void {
+  private addPlanSnapshotOnCurrentTurn(): void {
     const turn = this.currentTurn
-    const goal = this.currentGoal
-    if (!turn || !goal) return
-    const el = cards.goalElement(goal)
-    if (turn.goalElementCreated) {
-      void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.goal, el)
-      return
-    }
+    if (!turn || turn.planSteps.length === 0) return
     this.maybeMidTurnRotate()
     const cardId = turn.cardId
-    turn.goalElementCreated = true
-    void cardkit.addElement(cardId, el, {
+    const elementId = cards.ELEMENTS.planUpdate(turn.planUpdateCount++)
+    void cardkit.addElement(cardId, cards.planElement(turn.planSteps, turn.planExplanation, '', elementId), {
       type: 'insert_before',
       targetElementId: cards.ELEMENTS.footer,
-    }, () => {
-      if (this.currentTurn === turn && turn.cardId === cardId) {
-        turn.goalElementCreated = false
-      }
     })
   }
 
-  private renderPlanOnCurrentTurn(): void {
+  private addGoalUpdateOnCurrentTurn(goal: cards.ThreadGoal): void {
     const turn = this.currentTurn
     if (!turn) return
-    const hasPlan = turn.planSteps.length > 0
-    const draftText = [...turn.planDrafts.values()].join('')
-    const hasDraft = draftText.trim().length > 0
-    const hasExplanation = (turn.planExplanation ?? '').trim().length > 0
-    if (!hasPlan && !hasDraft && !hasExplanation && !turn.planElementCreated) return
-    const el = cards.planElement(turn.planSteps, turn.planExplanation, draftText)
-    if (turn.planElementCreated) {
-      void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.plan, el)
-      return
-    }
     this.maybeMidTurnRotate()
-    const cardId = turn.cardId
-    turn.planElementCreated = true
-    void cardkit.addElement(cardId, el, {
+    const elementId = cards.ELEMENTS.goalUpdate(turn.goalUpdateCount++)
+    void cardkit.addElement(turn.cardId, cards.goalElement(goal, elementId), {
       type: 'insert_before',
       targetElementId: cards.ELEMENTS.footer,
-    }, () => {
-      if (this.currentTurn === turn && turn.cardId === cardId) {
-        turn.planElementCreated = false
-      }
+    })
+  }
+
+  private addGoalClearedOnCurrentTurn(): void {
+    const turn = this.currentTurn
+    if (!turn) return
+    this.maybeMidTurnRotate()
+    const elementId = cards.ELEMENTS.goalUpdate(turn.goalUpdateCount++)
+    void cardkit.addElement(turn.cardId, {
+      tag: 'markdown',
+      element_id: elementId,
+      content: '**🎯 当前目标**\n\n已清除',
+    }, {
+      type: 'insert_before',
+      targetElementId: cards.ELEMENTS.footer,
     })
   }
 
@@ -1715,30 +1701,17 @@ export class Session {
       }))
     }
     turn.planExplanation = typeof update.explanation === 'string' ? update.explanation : null
-    turn.planDrafts.clear()
-    this.renderPlanOnCurrentTurn()
+    this.addPlanSnapshotOnCurrentTurn()
   }
 
   private handlePlanDelta(delta: PlanDelta): void {
-    const turn = this.currentTurn
-    if (!turn) {
-      log(`session "${this.sessionName}": item/plan/delta with no current turn`)
-      return
-    }
     if (typeof delta.delta !== 'string' || !delta.delta) {
       log(`session "${this.sessionName}": item/plan/delta missing delta text`)
       return
     }
-    this.stopThinkingFooter(turn)
-    if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
-    turn.openReadBatchI = null
     if (typeof delta.itemId !== 'string' || !delta.itemId) {
       log(`session "${this.sessionName}": item/plan/delta missing itemId`)
-      return
     }
-    const itemId = delta.itemId
-    turn.planDrafts.set(itemId, (turn.planDrafts.get(itemId) ?? '') + delta.delta)
-    this.renderPlanOnCurrentTurn()
   }
 
   private handleThreadGoalUpdated(goal: ThreadGoal): void {
@@ -1749,7 +1722,13 @@ export class Session {
     if (goal.tokenBudget != null && typeof goal.tokenBudget !== 'number') {
       log(`session "${this.sessionName}": thread/goal/updated invalid tokenBudget`)
     }
-    this.currentGoal = {
+    const turn = this.currentTurn
+    if (turn) {
+      this.stopThinkingFooter(turn)
+      if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
+      turn.openReadBatchI = null
+    }
+    const currentGoal: cards.ThreadGoal = {
       objective: goal.objective,
       status: typeof goal.status === 'string' && goal.status ? goal.status : 'MISS',
       tokenBudget: typeof goal.tokenBudget === 'number'
@@ -1760,18 +1739,18 @@ export class Session {
       tokensUsed: typeof goal.tokensUsed === 'number' ? goal.tokensUsed : Number.NaN,
       timeUsedSeconds: typeof goal.timeUsedSeconds === 'number' ? goal.timeUsedSeconds : Number.NaN,
     }
-    this.renderGoalOnCurrentTurn()
+    this.currentGoal = currentGoal
+    this.addGoalUpdateOnCurrentTurn(currentGoal)
   }
 
   private handleThreadGoalCleared(): void {
     this.currentGoal = null
     const turn = this.currentTurn
-    if (!turn || !turn.goalElementCreated) return
-    void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.goal, {
-      tag: 'markdown',
-      element_id: cards.ELEMENTS.goal,
-      content: '**🎯 当前目标**\n\n已清除',
-    })
+    if (!turn) return
+    this.stopThinkingFooter(turn)
+    if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
+    turn.openReadBatchI = null
+    this.addGoalClearedOnCurrentTurn()
   }
 
   private appendAssistant(delta: string): void {
