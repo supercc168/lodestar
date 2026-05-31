@@ -31,6 +31,10 @@ function planStatusIcon(s: string): string {
   }
 }
 
+function truncateText(s: string, n: number): string {
+  return s.length > n ? s.slice(0, n) + '…' : s
+}
+
 function goalStatusLabel(s: string): string {
   switch (s) {
     case 'active':       return '进行中'
@@ -41,6 +45,19 @@ function goalStatusLabel(s: string): string {
     case 'complete':     return '已完成'
     default:             return s
   }
+}
+
+function planHeader(plan: TurnPlanStep[], draftText = ''): string {
+  const draft = draftText.trim()
+  if (plan.length === 0) return draft ? '📋 计划草稿' : '📋 计划更新'
+  const completed = plan.filter(item => item.status === 'completed').length
+  const inProgress = plan.filter(item => item.status === 'inProgress').length
+  const pending = plan.filter(item => item.status === 'pending').length
+  const parts = [`${plan.length} 项`]
+  if (inProgress) parts.push(`${inProgress} 进行中`)
+  if (completed) parts.push(`${completed} 完成`)
+  if (pending) parts.push(`${pending} 待办`)
+  return `📋 计划更新 · ${parts.join(' · ')}`
 }
 
 function formatGoalTime(seconds: number): string {
@@ -84,16 +101,18 @@ export function planElement(
   plan: TurnPlanStep[],
   explanation?: string | null,
   draftText = '',
-  elementId = '',
+  elementId: string,
 ): object {
   return {
-    tag: 'markdown',
+    tag: 'collapsible_panel',
     element_id: elementId,
-    content: renderPlanContent(plan, explanation, draftText),
+    header: { title: { tag: 'plain_text', content: planHeader(plan, draftText) } },
+    expanded: false,
+    elements: [{ tag: 'markdown', content: renderPlanContent(plan, explanation, draftText) }],
   }
 }
 
-export function goalElement(goal: ThreadGoal, elementId = ''): object {
+export function goalElement(goal: ThreadGoal, elementId: string): object {
   const tokensUsed = Number.isFinite(goal.tokensUsed) ? String(goal.tokensUsed) : 'MISS'
   const tokenBudget = goal.tokenBudget == null
     ? ''
@@ -109,9 +128,16 @@ export function goalElement(goal: ThreadGoal, elementId = ''): object {
     `- 用时: ${formatGoalTime(goal.timeUsedSeconds)}`,
   ]
   return {
-    tag: 'markdown',
+    tag: 'collapsible_panel',
     element_id: elementId,
-    content: lines.join('\n'),
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: `🎯 目标更新 · ${goalStatusLabel(goal.status)}: ${truncateText(goal.objective, 48)}`,
+      },
+    },
+    expanded: false,
+    elements: [{ tag: 'markdown', content: lines.join('\n') }],
   }
 }
 

@@ -62,12 +62,16 @@ describe('plan and goal rendering', () => {
       { step: '补测试', status: 'pending' },
     ], '按当前协议渲染。', '', 'plan_update_0') as any
 
+    const body = el.elements[0].content
     expect(el.element_id).toBe('plan_update_0')
-    expect(el.content).toContain('**📋 当前计划**')
-    expect(el.content).toContain('按当前协议渲染。')
-    expect(el.content).toContain('- ✅ 读取 app-server 协议')
-    expect(el.content).toContain('- 🔄 接入 plan 通知')
-    expect(el.content).toContain('- ☐ 补测试')
+    expect(el.tag).toBe('collapsible_panel')
+    expect(el.expanded).toBe(false)
+    expect(el.header.title.content).toBe('📋 计划更新 · 3 项 · 1 进行中 · 1 完成 · 1 待办')
+    expect(body).toContain('**📋 当前计划**')
+    expect(body).toContain('按当前协议渲染。')
+    expect(body).toContain('- ✅ 读取 app-server 协议')
+    expect(body).toContain('- 🔄 接入 plan 通知')
+    expect(body).toContain('- ☐ 补测试')
 
     const timelineEl = planElement([{ step: '同步显示更新', status: 'inProgress' }], null, '', 'plan_update_3') as any
     expect(timelineEl.element_id).toBe('plan_update_3')
@@ -75,11 +79,15 @@ describe('plan and goal rendering', () => {
 
   test('renders plan draft before authoritative plan lands', () => {
     const el = planElement([], null, '1. 探查代码\n2. 修改卡片', 'plan_update_draft') as any
+    const body = el.elements[0].content
 
     expect(el.element_id).toBe('plan_update_draft')
-    expect(el.content).toContain('正在生成计划草稿')
-    expect(el.content).toContain('1. 探查代码')
-    expect(el.content).toContain('2. 修改卡片')
+    expect(el.tag).toBe('collapsible_panel')
+    expect(el.expanded).toBe(false)
+    expect(el.header.title.content).toBe('📋 计划草稿')
+    expect(body).toContain('正在生成计划草稿')
+    expect(body).toContain('1. 探查代码')
+    expect(body).toContain('2. 修改卡片')
   })
 
   test('renders thread goal status and budget', () => {
@@ -91,11 +99,15 @@ describe('plan and goal rendering', () => {
       timeUsedSeconds: 125,
     }, 'goal_update_0') as any
 
+    const body = el.elements[0].content
     expect(el.element_id).toBe('goal_update_0')
-    expect(el.content).toContain('**🎯 当前目标** · 进行中')
-    expect(el.content).toContain('完成 Lodestar plan 展示迁移')
-    expect(el.content).toContain('- 用量: 3456 / 12000 tokens')
-    expect(el.content).toContain('- 用时: 2m 5s')
+    expect(el.tag).toBe('collapsible_panel')
+    expect(el.expanded).toBe(false)
+    expect(el.header.title.content).toBe('🎯 目标更新 · 进行中: 完成 Lodestar plan 展示迁移')
+    expect(body).toContain('**🎯 当前目标** · 进行中')
+    expect(body).toContain('完成 Lodestar plan 展示迁移')
+    expect(body).toContain('- 用量: 3456 / 12000 tokens')
+    expect(body).toContain('- 用时: 2m 5s')
 
     const timelineEl = goalElement({
       objective: '目标更新位置可见',
