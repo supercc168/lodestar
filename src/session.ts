@@ -33,7 +33,7 @@ import * as feishu from './feishu'
 import { log } from './log'
 import { readSysInfo } from './sysinfo'
 import { readUsage, type UsageSnapshot } from './usage'
-import { contextLimitForModel, contextPercent, contextTokensFromUsage } from './context-window'
+import { contextLimitFromAppServer, contextTokensFromUsage, contextUsedPercent } from './context-window'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
@@ -1325,19 +1325,18 @@ export class Session {
   }
 
   /** Current context-window occupancy estimate. Codex app-server reports
-   * the latest model request in tokenUsage.last; its inputTokens is the
-   * actual prompt size sent to the model. cachedInputTokens is a subset
-   * breakdown of that value, not extra context. */
-  private currentContextTokens(): number {
+   * the latest model request in tokenUsage.last; its totalTokens is the
+   * active context size. cachedInputTokens is a subset breakdown of
+   * inputTokens, not extra context. */
+  private currentContextTokens(): number | null {
     const u = this.proc?.lastUsage as CodexUsage | null | undefined
     return contextTokensFromUsage(u)
   }
 
-  /** Display denominator for context percentage, sourced from the
-   * documented maximum window of the running model. app-server's
-   * tokenUsage.modelContextWindow is not the public model maximum. */
+  /** Display denominator for context percentage, sourced from Codex
+   * app-server's effective modelContextWindow for this thread. */
   private contextLimitForDisplay(): number | null {
-    return contextLimitForModel(this.proc?.lastModel)
+    return contextLimitFromAppServer(this.proc?.lastContextWindow)
   }
 
   /** Drain `pendingMidTurnMsgs` to the SDK and open a fresh card for the
@@ -1938,7 +1937,7 @@ export class Session {
     if (!suffix) {
       const ctxTokens = this.currentContextTokens()
       const ctxMax = this.contextLimitForDisplay()
-      const pct = contextPercent(ctxTokens, ctxMax)
+      const pct = ctxTokens == null ? null : contextUsedPercent(ctxTokens, ctxMax)
       if (pct !== null) {
         metrics += ` · 📊 ${pct}%`
       }

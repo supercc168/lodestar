@@ -111,6 +111,7 @@ export interface ThreadGoal {
 }
 
 export interface CodexUsage {
+  total_tokens?: number
   input_tokens?: number
   output_tokens?: number
   reasoning_output_tokens?: number
@@ -275,6 +276,7 @@ export class CodexProcess extends EventEmitter {
         const last = params.tokenUsage?.last
         if (last) {
           this.lastUsage = {
+            total_tokens: numberOrUndefined(last.totalTokens),
             input_tokens: numberOrUndefined(last.inputTokens),
             output_tokens: numberOrUndefined(last.outputTokens),
             reasoning_output_tokens: numberOrUndefined(last.reasoningOutputTokens),

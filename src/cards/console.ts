@@ -6,7 +6,7 @@
 
 import { SERVICE_LABEL, type SysInfo } from '../sysinfo'
 import type { UsageSnapshot } from '../usage'
-import { contextPercent } from '../context-window'
+import { contextUsedPercent } from '../context-window'
 import { ELEMENTS } from './elements'
 
 export interface ConsoleOpts {
@@ -28,12 +28,12 @@ export interface ConsoleOpts {
   }>
   /** Subscription usage snapshot from Codex app-server. Undefined → omit row. */
   usage?: UsageSnapshot
-  /** Current context-window occupancy from tokenUsage.last.inputTokens.
-   * cachedInputTokens is already included in raw inputTokens, not extra
-   * context. 0 if no turn has completed yet. */
-  contextTokens?: number
-  /** Documented maximum window for the running model. `null` / undefined
-   * → unknown; renderer omits the suffix instead of fabricating a default. */
+  /** Current context-window occupancy from tokenUsage.last.totalTokens.
+   * cachedInputTokens is a subset of inputTokens, not extra context.
+   * null if no turn has completed yet. */
+  contextTokens?: number | null
+  /** Effective context window reported by Codex app-server. `null` /
+   * undefined → unknown; renderer omits the suffix instead of fabricating a default. */
   contextLimit?: number | null
   cumStats?: { tokens: number; costUsd: number; turns: number }
   lastTurn?: { tokens: number; costUsd: number; durationMs: number }
@@ -286,11 +286,11 @@ export function consoleMainContent(opts: ConsoleOpts): string {
     }
   }
   if (contextTokens != null && (contextTokens > 0 || (contextLimit != null && contextLimit > 0))) {
-    // Show `/ limit (pct%)` only when the running model's documented
-    // maximum context window is known. Unknown windows render tokens alone.
+    // Show `/ limit (pct%)` only when Codex has reported an effective
+    // context window. Unknown windows render tokens alone.
     if (contextLimit != null && contextLimit > 0) {
-      const pct = contextPercent(contextTokens, contextLimit)
-      lines.push(`**📦 上下文**　${fmtTokens(contextTokens)} / ${fmtTokens(contextLimit)}　(${pct}%)`)
+      const pct = contextUsedPercent(contextTokens, contextLimit)
+      lines.push(`**📦 上下文**　${fmtTokens(contextTokens)} / ${fmtTokens(contextLimit)}　(${pct ?? 'MISS'}% 占用)`)
     } else {
       lines.push(`**📦 上下文**　${fmtTokens(contextTokens)}　_模型窗口未知_`)
     }

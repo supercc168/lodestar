@@ -1,25 +1,31 @@
 import type { CodexUsage } from './codex-process'
 
-/** Latest model-call input size is the current context-window occupancy.
+const CONTEXT_BASELINE_TOKENS = 12_000
+
+/** Latest model-call totalTokens is the current active context size.
  * cachedInputTokens is only a cache-hit breakdown inside inputTokens, not
  * additional context. */
-export function contextTokensFromUsage(usage: CodexUsage | null | undefined): number {
-  return usage?.input_tokens ?? 0
+export function contextTokensFromUsage(usage: CodexUsage | null | undefined): number | null {
+  if (!usage) return null
+  return typeof usage.total_tokens === 'number' && Number.isFinite(usage.total_tokens)
+    ? usage.total_tokens
+    : null
 }
 
-export function contextLimitForModel(model: string | null | undefined): number | null {
-  if (!model) return null
-
-  const normalized = model.toLowerCase()
-  if (normalized === 'gpt-5-codex' || normalized.startsWith('gpt-5-codex-')) return 400_000
-  if (normalized === 'gpt-5.5' || normalized.startsWith('gpt-5.5')) return 1_000_000
-  if (normalized === 'gpt-5.4' || normalized.startsWith('gpt-5.4-')) return 1_050_000
-  if (normalized === 'gpt-4.1' || normalized.startsWith('gpt-4.1-')) return 1_000_000
-
-  return null
+export function contextLimitFromAppServer(window: number | null | undefined): number | null {
+  return typeof window === 'number' && Number.isFinite(window) && window > 0 ? window : null
 }
 
-export function contextPercent(tokens: number, limit: number | null | undefined): number | null {
+export function contextRemainingPercent(tokens: number, limit: number | null | undefined): number | null {
   if (limit == null || limit <= 0) return null
-  return Math.round((tokens / limit) * 100)
+  if (limit <= CONTEXT_BASELINE_TOKENS) return 0
+  const effectiveWindow = limit - CONTEXT_BASELINE_TOKENS
+  const used = Math.max(0, tokens - CONTEXT_BASELINE_TOKENS)
+  const remaining = Math.max(0, effectiveWindow - used)
+  return Math.round(Math.min(100, Math.max(0, (remaining / effectiveWindow) * 100)))
+}
+
+export function contextUsedPercent(tokens: number, limit: number | null | undefined): number | null {
+  const remaining = contextRemainingPercent(tokens, limit)
+  return remaining == null ? null : Math.min(100, Math.max(0, 100 - remaining))
 }

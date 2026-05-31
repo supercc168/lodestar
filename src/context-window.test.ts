@@ -2,40 +2,52 @@ import { describe, expect, test } from 'bun:test'
 
 import { consoleCard } from './cards/console'
 import {
-  contextLimitForModel,
-  contextPercent,
+  contextLimitFromAppServer,
+  contextRemainingPercent,
   contextTokensFromUsage,
+  contextUsedPercent,
 } from './context-window'
 
 describe('context window display', () => {
-  test('uses latest input tokens as current occupancy', () => {
+  test('uses latest total tokens as current occupancy', () => {
     expect(contextTokensFromUsage({
+      total_tokens: 35_211,
       input_tokens: 35_190,
       cache_read_input_tokens: 4_480,
       output_tokens: 21,
-    })).toBe(35_190)
+    })).toBe(35_211)
   })
 
-  test('uses documented model window as denominator', () => {
-    const limit = contextLimitForModel('gpt-5-codex')
+  test('uses app-server effective context window and Codex baseline percentage', () => {
+    const limit = contextLimitFromAppServer(258_400)
 
-    expect(limit).toBe(400_000)
-    expect(contextPercent(35_190, limit)).toBe(9)
+    expect(limit).toBe(258_400)
+    expect(contextRemainingPercent(35_211, limit)).toBe(91)
+    expect(contextUsedPercent(35_211, limit)).toBe(9)
   })
 
-  test('keeps unknown model limits unknown', () => {
-    expect(contextLimitForModel('gpt-unknown')).toBeNull()
+  test('keeps missing or invalid app-server windows unknown', () => {
+    expect(contextLimitFromAppServer(null)).toBeNull()
+    expect(contextLimitFromAppServer(0)).toBeNull()
+    expect(contextLimitFromAppServer(Number.NaN)).toBeNull()
   })
 
-  test('renders real window percentage in console cards', () => {
+  test('keeps missing total token counts unknown', () => {
+    expect(contextTokensFromUsage({
+      input_tokens: 35_190,
+      output_tokens: 21,
+    })).toBeNull()
+  })
+
+  test('renders effective window percentage in console cards', () => {
     const card = consoleCard({
       sessionName: 'probe',
       status: 'idle',
-      contextTokens: 35_190,
-      contextLimit: contextLimitForModel('gpt-5-codex'),
+      contextTokens: 35_211,
+      contextLimit: contextLimitFromAppServer(258_400),
     })
 
-    expect(JSON.stringify(card)).toContain('35K / 400K')
-    expect(JSON.stringify(card)).toContain('(9%)')
+    expect(JSON.stringify(card)).toContain('35K / 258K')
+    expect(JSON.stringify(card)).toContain('(9% 占用)')
   })
 })
