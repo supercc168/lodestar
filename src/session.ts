@@ -37,6 +37,8 @@ const SEND_MARKER_RE = /\[\[send:\s*([^\]\n]+?)\s*\]\]/g
 const FOOTER_STATUS_TICK_MS = 1000
 const FOOTER_THINKING_PREFIX = 'Thinking...'
 const FOOTER_WORKING = 'Working...'
+const RESUME_INIT_NOTICE_MS = 10_000
+const RESUME_INIT_TIMEOUT_MS = 120_000
 
 /** Soft cap on element count per Feishu card before we proactively
  * rotate to a fresh one. The hard ceiling is NOT ~100 as once assumed:
@@ -440,6 +442,37 @@ export class Session {
     })
   }
 
+  private async waitForProcResumeInit(
+    proc: CodexProcess,
+    onStillWaiting: () => void,
+  ): Promise<{ state: 'init' | 'error' | 'exit' | 'timeout'; error?: unknown }> {
+    return await new Promise(resolve => {
+      let settled = false
+      const finish = (state: 'init' | 'error' | 'exit' | 'timeout', error?: unknown) => {
+        if (settled) return
+        settled = true
+        clearTimeout(noticeTimer)
+        clearTimeout(timeoutTimer)
+        proc.off('init', onInit)
+        proc.off('error', onError)
+        proc.off('exit', onExit)
+        resolve({ state, error })
+      }
+      const noticeTimer = setTimeout(() => {
+        if (!settled) onStillWaiting()
+      }, RESUME_INIT_NOTICE_MS)
+      const timeoutTimer = setTimeout(() => {
+        finish('timeout', new Error(`resume init timed out after ${RESUME_INIT_TIMEOUT_MS / 1000}s`))
+      }, RESUME_INIT_TIMEOUT_MS)
+      const onInit = () => finish('init')
+      const onError = (e: unknown) => finish('error', e)
+      const onExit = (e: unknown) => finish('exit', e)
+      proc.once('init', onInit)
+      proc.once('error', onError)
+      proc.once('exit', onExit)
+    })
+  }
+
   /** Drop every ⏳ OneSecond reaction this session is currently holding
    * on user chat messages, then empty the two tracking maps. Used by
    * every tear-down path (proc exit, kill, restart) so reactions don't
@@ -502,8 +535,21 @@ export class Session {
 
   async restart(resume = false, opts: LifecycleProgressOpts = {}): Promise<boolean> {
     const announce = opts.announce ?? true
-    const report = opts.onStatus
+    let report = opts.onStatus
     const prevSessionId = this.lastSessionId
+    const prevThreadLabel = prevSessionId ? prevSessionId.slice(0, 8) : ''
+    let statusCard: StatusCardHandle | null = null
+    if (!report && announce && resume && prevSessionId) {
+      const initialStatus = this.proc
+        ? '🔁 重启 Codex'
+        : `🔁 恢复上一会话 thread=${prevThreadLabel}…`
+      statusCard = await this.openStatusCard('restart', initialStatus)
+      if (statusCard) report = status => this.setStatusCard(statusCard, status)
+    }
+    const announceText = announce && !statusCard
+    const closeInternalStatusCard = async (finalStatus: string): Promise<void> => {
+      if (statusCard) await this.closeStatusCard(statusCard, finalStatus)
+    }
     if (this.proc) {
       report?.('🛑 停止当前 Codex')
       await this.proc.kill()
@@ -522,7 +568,7 @@ export class Session {
     this.pendingPermissions.clear()
     if (resume && prevSessionId) {
       this.status = 'starting'
-      report?.(`🔁 恢复 thread=${prevSessionId.slice(0, 8)}…`)
+      report?.(`🔁 恢复上一会话 thread=${prevThreadLabel}…`)
       this.proc = new CodexProcess({
         workDir: this.workDir,
         effort: CODEX_EFFORT,
@@ -531,31 +577,32 @@ export class Session {
       })
       this.wireProc(this.proc)
       this.proc.sendInitialize()
-      report?.('⏳ 等待 Codex init')
-      const init = await this.waitForProcInit(this.proc, 10_000)
-      if (init.state === 'error' || init.state === 'exit') {
+      report?.('⏳ 等待 Codex init 确认')
+      const init = await this.waitForProcResumeInit(this.proc, () => {
+        log(`session "${this.sessionName}": resume init still pending after ${RESUME_INIT_NOTICE_MS / 1000}s`)
+        report?.(`⏳ 仍在等待 Codex init 确认 thread=${prevThreadLabel}…`)
+      })
+      if (init.state === 'error' || init.state === 'exit' || init.state === 'timeout') {
         log(`session "${this.sessionName}": codex resume failed: ${init.error ?? init.state}`)
-        report?.(`❌ Codex 恢复失败: ${init.error ?? init.state}`)
-        if (announce) await feishu.sendText(this.chatId, `❌ Codex 恢复失败: ${init.error ?? init.state}`)
+        const finalStatus = init.state === 'timeout'
+          ? '❌ Codex 恢复超时'
+          : `❌ Codex 恢复失败: ${init.error ?? init.state}`
+        report?.(finalStatus)
+        if (announceText) await feishu.sendText(this.chatId, finalStatus)
         await this.proc?.kill(1000).catch(() => {})
         this.proc = null
         this.status = 'stopped'
         this.opts.onLifecycleChange?.()
+        await closeInternalStatusCard(finalStatus)
         return false
       }
-      if (init.state === 'timeout') {
-        log(`session "${this.sessionName}": resume init wait timeout (10s) — process still alive`)
-        const msg = `⏳ Codex 恢复已发起，但 10s 内尚未确认 init。thread=${prevSessionId.slice(0, 8)}…`
-        report?.(msg)
-        if (announce) await feishu.sendText(this.chatId, msg)
-      } else {
-        const msg = `✅ 已重启并恢复 thread=${prevSessionId.slice(0, 8)}…`
-        report?.(msg)
-        if (announce) await feishu.sendText(this.chatId, `🔁 已重启并恢复 thread=${prevSessionId.slice(0, 8)}…`)
-      }
+      const msg = `✅ 已恢复上一会话 thread=${prevThreadLabel}…`
+      report?.(msg)
+      if (announceText) await feishu.sendText(this.chatId, msg)
       this.status = 'idle'
       this.startedAt = Date.now()
       this.opts.onLifecycleChange?.()
+      await closeInternalStatusCard(msg)
       return true
     } else {
       // Resume requested but no prior session_id on file — surface it
@@ -563,7 +610,7 @@ export class Session {
       // hid the daemon-restart sessionId-loss bug for months).
       if (resume) {
         report?.('⚠️ 没有可恢复的上一会话，将以新会话启动')
-        if (announce) await feishu.sendText(this.chatId, '⚠️ 没有可恢复的上一会话，将以新会话启动')
+        if (announceText) await feishu.sendText(this.chatId, '⚠️ 没有可恢复的上一会话，将以新会话启动')
       }
       // Fresh conversation — drop cumulative stats so the next `hi` shows
       // zeroed counters instead of bleeding numbers from the prior chat.
@@ -691,8 +738,14 @@ export class Session {
         // If no process is running, this is how the user gets back the
         // previous conversation after a `kill` or a daemon crash.
         {
-          const statusCard = await this.openStatusCard('restart', '🔁 重启 Codex')
-          let lastStatus = '🔁 重启 Codex'
+          const resumeThreadLabel = this.lastSessionId ? this.lastSessionId.slice(0, 8) : ''
+          const initialStatus = this.isRunning()
+            ? '🔁 重启 Codex'
+            : resumeThreadLabel
+              ? `🔁 恢复上一会话 thread=${resumeThreadLabel}…`
+              : '🔁 启动 Codex'
+          const statusCard = await this.openStatusCard('restart', initialStatus)
+          let lastStatus = initialStatus
           const ok = await this.restart(true, {
             announce: !statusCard,
             onStatus: status => {
@@ -700,7 +753,10 @@ export class Session {
               this.setStatusCard(statusCard, status)
             },
           })
-          await this.closeStatusCard(statusCard, ok ? '✅ 已重启并恢复上一会话' : (lastStatus.startsWith('❌') ? lastStatus : '❌ 重启失败'))
+          const finalStatus = ok
+            ? (lastStatus.startsWith('✅') ? lastStatus : (resumeThreadLabel ? '✅ 已恢复上一会话' : '✅ Codex 已就绪'))
+            : (lastStatus.startsWith('❌') ? lastStatus : '❌ 重启失败')
+          await this.closeStatusCard(statusCard, finalStatus)
         }
         return true
       case 'clear':
