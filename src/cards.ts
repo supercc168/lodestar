@@ -19,6 +19,7 @@ export {
   summarizeToolInput,
   mainConversationCard,
   assistantSegmentElement,
+  goalDisplaySignature,
   goalElement,
   planElement,
   toolCallElement,

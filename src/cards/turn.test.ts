@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import { consoleBodyElements, statusCard } from './console'
 import {
   goalElement,
+  goalDisplaySignature,
   mainConversationCard,
   planElement,
   summarizeToolInput,
@@ -117,6 +118,28 @@ describe('plan and goal rendering', () => {
       timeUsedSeconds: 9,
     }, 'goal_update_1') as any
     expect(timelineEl.element_id).toBe('goal_update_1')
+  })
+
+  test('keeps goal progress-only accounting out of display signature', () => {
+    const base = {
+      objective: '完成 Lodestar plan 展示迁移',
+      status: 'active',
+      tokenBudget: 12000,
+      tokensUsed: 3456,
+      timeUsedSeconds: 125,
+    }
+
+    expect(goalDisplaySignature({
+      ...base,
+      tokensUsed: 9999,
+      timeUsedSeconds: 3600,
+    })).toBe(goalDisplaySignature(base))
+    expect(goalDisplaySignature({
+      ...base,
+      status: 'complete',
+      tokensUsed: 9999,
+      timeUsedSeconds: 3600,
+    })).not.toBe(goalDisplaySignature(base))
   })
 })
 

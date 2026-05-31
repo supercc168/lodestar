@@ -22,6 +22,14 @@ export interface ThreadGoal {
   timeUsedSeconds: number
 }
 
+export function goalDisplaySignature(goal: ThreadGoal): string {
+  return JSON.stringify({
+    objective: goal.objective,
+    status: goal.status,
+    tokenBudget: goal.tokenBudget,
+  })
+}
+
 function planStatusIcon(s: string): string {
   switch (s) {
     case 'pending':     return '☐'

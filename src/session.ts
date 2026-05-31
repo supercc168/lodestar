@@ -137,9 +137,9 @@ export class Session {
      * 一来立即 finalize。 */
     currentIdx?: number
   }>()
-  /** Thread-scoped goal reported by Codex app-server
-   * thread/goal/updated. It is rendered on each active turn card when
-   * present and kept across turns until thread/goal/cleared. */
+  /** Thread-scoped goal reported by Codex app-server. Pure progress
+   * accounting updates refresh this snapshot without adding card elements;
+   * only objective/status/budget changes are rendered. */
   currentGoal: cards.ThreadGoal | null = null
   status: Status = 'stopped'
 
@@ -1721,12 +1721,7 @@ export class Session {
     if (goal.tokenBudget != null && typeof goal.tokenBudget !== 'number') {
       log(`session "${this.sessionName}": thread/goal/updated invalid tokenBudget`)
     }
-    const turn = this.currentTurn
-    if (turn) {
-      this.stopThinkingFooter(turn)
-      if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
-      turn.openReadBatchI = null
-    }
+    const previousGoal = this.currentGoal
     const currentGoal: cards.ThreadGoal = {
       objective: goal.objective,
       status: typeof goal.status === 'string' && goal.status ? goal.status : 'MISS',
@@ -1739,10 +1734,23 @@ export class Session {
       timeUsedSeconds: typeof goal.timeUsedSeconds === 'number' ? goal.timeUsedSeconds : Number.NaN,
     }
     this.currentGoal = currentGoal
+    if (
+      previousGoal &&
+      cards.goalDisplaySignature(previousGoal) === cards.goalDisplaySignature(currentGoal)
+    ) {
+      return
+    }
+    const turn = this.currentTurn
+    if (turn) {
+      this.stopThinkingFooter(turn)
+      if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
+      turn.openReadBatchI = null
+    }
     this.addGoalUpdateOnCurrentTurn(currentGoal)
   }
 
   private handleThreadGoalCleared(): void {
+    if (!this.currentGoal) return
     this.currentGoal = null
     const turn = this.currentTurn
     if (!turn) return
