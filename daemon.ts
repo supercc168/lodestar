@@ -496,9 +496,60 @@ async function boot(): Promise<void> {
   // subprocess, card streaming state and setInterval is
   // preserved across the WS hiccup. We only let systemd restart us if the
   // SDK's own reconnect loop exhausts its retry budget (onError).
+  let ws: lark.WSClient
+  let lastEventAt = Date.now()        // 收到任意真实事件就刷新 = 通道存活铁证
+  let consecRebuilds = 0
+  let rebuilding = false
+  let verifyTimer: ReturnType<typeof setTimeout> | null = null
+  const SETTLE_MS = 1500              // 让 SDK 自身重连流程先落定再换 client
+  const VERIFY_WINDOW_MS = 90_000     // rebuild 后等多久确认事件恢复
+  const RECENT_ACTIVITY_MS = 10 * 60_000  // 重连前这段内有过事件 = 活跃群,值得重试
+  const MAX_CONSEC_REBUILDS = 3       // 活跃群连续重建上限,到顶只告警不死循环
+
+  let scheduledRebuildTimer: ReturnType<typeof setTimeout> | null = null
+  let scheduledRebuildDueAt = 0
+  let scheduledRebuildReason = ''
+  let scheduledRebuildVerifyAfter = false
+  let rebuildWs: (reason: string, verifyAfter?: boolean) => void = (reason) => {
+    log(`[ws] rebuild requested before WS init — ${reason}`)
+  }
+  const scheduleWsRebuild = (reason: string, delayMs = 0, verifyAfter = false) => {
+    const dueAt = Date.now() + delayMs
+    if (scheduledRebuildTimer) {
+      scheduledRebuildVerifyAfter ||= verifyAfter
+      if (dueAt >= scheduledRebuildDueAt) {
+        log(`[ws] rebuild already scheduled — ${reason}`)
+        return
+      }
+      clearTimeout(scheduledRebuildTimer)
+    }
+    scheduledRebuildDueAt = dueAt
+    scheduledRebuildReason = reason
+    scheduledRebuildVerifyAfter = verifyAfter
+    scheduledRebuildTimer = setTimeout(() => {
+      const scheduledReason = scheduledRebuildReason
+      const scheduledVerifyAfter = scheduledRebuildVerifyAfter
+      scheduledRebuildTimer = null
+      scheduledRebuildDueAt = 0
+      scheduledRebuildReason = ''
+      scheduledRebuildVerifyAfter = false
+      rebuildWs(scheduledReason, scheduledVerifyAfter)
+    }, delayMs)
+  }
+
   const wsLogger = {
     error: (m: any[]) => log(`[ws-sdk error] ${fmt(m)}`),
-    warn:  (m: any[]) => log(`[ws-sdk warn] ${fmt(m)}`),
+    warn:  (m: any[]) => {
+      const text = fmt(m)
+      log(`[ws-sdk warn] ${text}`)
+      if (text.includes('no pong/inbound')) {
+        scheduleWsRebuild(
+          'ping-timeout: SDK liveness watchdog fired',
+          2_000,
+          (Date.now() - lastEventAt) < RECENT_ACTIVITY_MS,
+        )
+      }
+    },
     info:  (m: any[]) => log(`[ws-sdk] ${fmt(m)}`),
     debug: (_m: any[]) => { /* drop */ },
     trace: (_m: any[]) => { /* drop */ },
@@ -523,15 +574,6 @@ async function boot(): Promise<void> {
   // 但全程不碰任何 Codex 子进程、不退进程。lastEventAt 作为唯一可信的"事件
   // 通道还活着"信号(不信 state);活跃群在 rebuild 后还聋就退避重建,封顶后
   // 只打日志、绝不 process.exit。
-  let lastEventAt = Date.now()        // 收到任意真实事件就刷新 = 通道存活铁证
-  let consecRebuilds = 0
-  let rebuilding = false
-  let verifyTimer: ReturnType<typeof setTimeout> | null = null
-  const SETTLE_MS = 1500              // 让 SDK 自身重连流程先落定再换 client
-  const VERIFY_WINDOW_MS = 90_000     // rebuild 后等多久确认事件恢复
-  const RECENT_ACTIVITY_MS = 10 * 60_000  // 重连前这段内有过事件 = 活跃群,值得重试
-  const MAX_CONSEC_REBUILDS = 3       // 活跃群连续重建上限,到顶只告警不死循环
-
   const markEvent = () => {
     lastEventAt = Date.now()
     // 收到真实事件 = 通道确认健康:撤掉待验证、清零重建计数。
@@ -559,8 +601,6 @@ async function boot(): Promise<void> {
       try { return await handleCardAction(d) } catch (e) { log(`handleCardAction: ${e}`) }
     },
   })
-
-  let ws: lark.WSClient
 
   const makeWs = (): lark.WSClient => new lark.WSClient({
     appId: config.feishu.app_id,
@@ -598,8 +638,13 @@ async function boot(): Promise<void> {
   // cards; never exits the process. close({force}) does
   // removeAllListeners() before terminate(), so the old client fires no stray
   // reconnect. verifyAfter arms a post-rebuild check (only for active groups).
-  const rebuildWs = (reason: string, verifyAfter = false) => {
+  rebuildWs = (reason: string, verifyAfter = false) => {
     if (rebuilding) { log(`[ws] rebuild skipped (already rebuilding) — ${reason}`); return }
+    if (scheduledRebuildTimer) {
+      clearTimeout(scheduledRebuildTimer)
+      scheduledRebuildTimer = null
+      scheduledRebuildDueAt = 0
+    }
     rebuilding = true
     consecRebuilds++
     log(`[ws] rebuild #${consecRebuilds} (fresh WSClient) — ${reason}`)
@@ -644,7 +689,7 @@ async function boot(): Promise<void> {
     log(`[ws] reconnected — swapping in a fresh WSClient (cluster-routing precaution; ` +
         `recentlyActive=${wasRecentlyActive})`)
     consecRebuilds = 0
-    setTimeout(() => rebuildWs('post-reconnect precaution', wasRecentlyActive), SETTLE_MS)
+    scheduleWsRebuild('post-reconnect precaution', SETTLE_MS, wasRecentlyActive)
   }
 
   ws = makeWs()
@@ -653,26 +698,29 @@ async function boot(): Promise<void> {
 
   // Liveness watchdog for the OTHER failure mode the deaf-heal can't see: a
   // wedged handshake / zombie socket that leaves the client stuck OFF
-  // 'connected' with no callback firing. Poll state every 60s; rebuild a fresh
-  // client if it stays non-connected for 3 consecutive ticks (~3min) or
-  // hard-fails. (connected-but-deaf is handled by the event-channel path above,
+  // 'connected' with no callback firing. Poll state frequently; `idle` means
+  // the SDK has no live socket and is not reconnecting, so rebuild immediately.
+  // `connecting`/`reconnecting` gets a short grace window before we replace the
+  // client. (connected-but-deaf is handled by the event-channel path above,
   // not here — state stays 'connected' in that case so this never sees it.)
+  const WS_WATCHDOG_INTERVAL_MS = 15_000
+  const WS_CONNECTING_GRACE_TICKS = 2
   let wsUnhealthyTicks = 0
   setInterval(() => {
     const { state } = ws.getConnectionStatus()
     if (state === 'connected') { wsUnhealthyTicks = 0; return }
-    if (state === 'failed') {
+    if (state === 'failed' || state === 'idle') {
       wsUnhealthyTicks = 0
-      rebuildWs('watchdog: state=failed')
+      rebuildWs(`watchdog: state=${state}`)
       return
     }
     wsUnhealthyTicks++
-    log(`[ws] watchdog: state=${state} (${wsUnhealthyTicks}/3)`)
-    if (wsUnhealthyTicks >= 3) {
+    log(`[ws] watchdog: state=${state} (${wsUnhealthyTicks}/${WS_CONNECTING_GRACE_TICKS})`)
+    if (wsUnhealthyTicks >= WS_CONNECTING_GRACE_TICKS) {
       wsUnhealthyTicks = 0
-      rebuildWs(`watchdog: stuck in '${state}' ~3min`)
+      rebuildWs(`watchdog: stuck in '${state}' ~${Math.round((WS_WATCHDOG_INTERVAL_MS * WS_CONNECTING_GRACE_TICKS) / 1000)}s`)
     }
-  }, 60 * 1000)
+  }, WS_WATCHDOG_INTERVAL_MS)
 
   startDebugSocket()
   startNotifyServer({ bind: config.notify.bind, port: config.notify.port })
