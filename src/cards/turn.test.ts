@@ -171,6 +171,21 @@ describe('bash-like tool card rendering', () => {
     expect(el.elements[0].content).not.toContain('# desc:')
   })
 
+  test('limits long bash output in tool panels', () => {
+    const input = {
+      cmd: '# desc: 读取大文件\nsed -n "1,400p" big.log',
+      workdir: '/home/leviyuan/feishu',
+    }
+    const output = 'A'.repeat(300) + 'TAIL'
+
+    const el = toolCallElement(1, 'exec_command', input, output, '✅') as any
+    const body = el.elements[0].content
+
+    expect(body).toContain('_已截断: 仅显示前 300 / 304 字符。_')
+    expect(body).toContain('... output 已截断 ...')
+    expect(body).not.toContain('TAIL')
+  })
+
   test('unwraps quoted unified exec desc commands', () => {
     const input = {
       command: '"# desc: 查看已跟踪文件中旧关键词引用\nrg -n -i \\"legacy|deprecated|old\\" "\'$(git ls-files)\'',

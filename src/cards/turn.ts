@@ -43,6 +43,8 @@ function truncateText(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + '…' : s
 }
 
+const BASH_OUTPUT_PREVIEW_CHARS = 300
+
 function goalStatusLabel(s: string): string {
   switch (s) {
     case 'active':       return '进行中'
@@ -303,6 +305,15 @@ function fenceBlock(text: string, lang = ''): string {
   return `${fence}${lang}\n${text}\n${fence}`
 }
 
+function outputPreviewBlock(text: string, max = BASH_OUTPUT_PREVIEW_CHARS, lang = ''): string {
+  if (text.length <= max) return fenceBlock(text, lang)
+  const preview = text.slice(0, max).trimEnd()
+  return [
+    `_已截断: 仅显示前 ${max} / ${text.length} 字符。_`,
+    fenceBlock(`${preview}\n... output 已截断 ...`, lang),
+  ].join('\n')
+}
+
 function inlineCode(v: unknown): string {
   return '`' + String(v ?? '').replace(/`/g, "'") + '`'
 }
@@ -344,7 +355,7 @@ function renderBashBody(input: any, output: string | null, resolvedNote?: string
     lines.push('')
     lines.push('---')
     lines.push('**output:**')
-    lines.push(fenceBlock(output.slice(0, 3000)))
+    lines.push(outputPreviewBlock(output))
   }
   return lines.join('\n')
 }
@@ -368,7 +379,7 @@ function renderShellSessionBody(input: any, output: string | null, resolvedNote?
     lines.push('')
     lines.push('---')
     lines.push('**output:**')
-    lines.push(fenceBlock(output.slice(0, 3000)))
+    lines.push(outputPreviewBlock(output))
   }
   return lines.join('\n')
 }
