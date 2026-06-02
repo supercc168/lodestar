@@ -79,6 +79,14 @@ export function bindSessionToChat(sessionName: string, chatId: string): void {
   log(`feishu: bound session "${sessionName}" → ${chatId}${prev ? ` (was ${prev})` : ''}`)
 }
 
+export function unbindSessionChat(sessionName: string): void {
+  const prev = preferredChatForSession.get(sessionName)
+  if (!prev) return
+  preferredChatForSession.delete(sessionName)
+  saveSessionChatMap()
+  log(`feishu: unbound session "${sessionName}" from ${prev}`)
+}
+
 // ── Session resume map ────────────────────────────────────────────────
 // `sessionName → last-known Codex thread_id`. Persisted so a daemon
 // restart (systemctl, crash, watchdog) doesn't strand the user with a
@@ -176,6 +184,108 @@ export async function refreshChatList(): Promise<void> {
     } while (pageToken)
     log(`feishu: refreshed chat list — ${chatNameCache.size} groups`)
   } catch (e) { log(`feishu: refresh chat list failed: ${e}`) }
+}
+
+export async function listNormalChatIdsByName(): Promise<Map<string, string[]>> {
+  const out = new Map<string, string[]>()
+  let pageToken: string | undefined
+  do {
+    const res = await client.im.chat.list({
+      params: { page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) },
+    })
+    if (res.code && res.code !== 0) throw new Error(`feishu chat.list failed code=${res.code} msg=${res.msg}`)
+    for (const chat of res.data?.items ?? []) {
+      if (!chat.chat_id || !chat.name) continue
+      if (chat.chat_status && chat.chat_status !== 'normal') continue
+      chatNameCache.set(chat.chat_id, chat.name)
+      const ids = out.get(chat.name) ?? []
+      ids.push(chat.chat_id)
+      out.set(chat.name, ids)
+    }
+    pageToken = res.data?.page_token
+  } while (pageToken)
+  return out
+}
+
+export async function findNormalChatIdByName(sessionName: string): Promise<string | null> {
+  const cachedPreferred = preferredChatForSession.get(sessionName)
+  if (cachedPreferred && chatNameCache.get(cachedPreferred) === sessionName) return cachedPreferred
+  const byName = await listNormalChatIdsByName()
+  const matches = byName.get(sessionName) ?? []
+  if (matches.length === 0) return null
+  const preferred = preferredChatForSession.get(sessionName)
+  if (preferred && matches.includes(preferred)) return preferred
+  if (matches.length === 1) return matches[0]
+  throw new Error(`multiple Feishu groups named "${sessionName}": ${matches.join(', ')}`)
+}
+
+export async function ensureChatForSession(sessionName: string, userOpenId: string): Promise<{ chatId: string; created: boolean; joined: boolean }> {
+  if (!userOpenId) throw new Error('missing sender open_id; cannot add user to worktree group')
+  const existing = await findNormalChatIdByName(sessionName)
+  if (existing) {
+    const joined = await ensureUserInChat(existing, userOpenId)
+    bindSessionToChat(sessionName, existing)
+    return { chatId: existing, created: false, joined }
+  }
+
+  const res = await client.im.chat.create({
+    params: { user_id_type: 'open_id', uuid: randomUUID() },
+    data: {
+      name: sessionName,
+      user_id_list: [userOpenId],
+      group_message_type: 'chat',
+    },
+  })
+  if (res.code && res.code !== 0) {
+    throw new Error(`feishu chat.create failed code=${res.code} msg=${res.msg}`)
+  }
+  const chatId = res.data?.chat_id
+  if (!chatId) throw new Error('feishu chat.create returned no chat_id')
+  chatNameCache.set(chatId, sessionName)
+  bindSessionToChat(sessionName, chatId)
+  return { chatId, created: true, joined: true }
+}
+
+export async function disbandChatForSession(sessionName: string): Promise<{ chatId: string | null; disbanded: boolean }> {
+  const chatId = await findNormalChatIdByName(sessionName)
+  if (!chatId) {
+    unbindSessionChat(sessionName)
+    return { chatId: null, disbanded: false }
+  }
+  const res = await client.im.chat.delete({ path: { chat_id: chatId } })
+  if (res.code && res.code !== 0) {
+    throw new Error(`feishu chat.delete failed code=${res.code} msg=${res.msg}`)
+  }
+  chatNameCache.delete(chatId)
+  unbindSessionChat(sessionName)
+  return { chatId, disbanded: true }
+}
+
+async function ensureUserInChat(chatId: string, userOpenId: string): Promise<boolean> {
+  let pageToken: string | undefined
+  do {
+    const res = await client.im.chatMembers.get({
+      path: { chat_id: chatId },
+      params: { member_id_type: 'open_id', page_size: 100, ...(pageToken ? { page_token: pageToken } : {}) },
+    })
+    if (res.code && res.code !== 0) {
+      throw new Error(`feishu chatMembers.get failed code=${res.code} msg=${res.msg}`)
+    }
+    for (const item of res.data?.items ?? []) {
+      if (item.member_id === userOpenId) return false
+    }
+    pageToken = res.data?.page_token
+  } while (pageToken)
+
+  const add = await client.im.chatMembers.create({
+    path: { chat_id: chatId },
+    params: { member_id_type: 'open_id' },
+    data: { id_list: [userOpenId] },
+  })
+  if (add.code && add.code !== 0) {
+    throw new Error(`feishu chatMembers.create failed code=${add.code} msg=${add.msg}`)
+  }
+  return true
 }
 
 /** Resolve ONE chat's name by chat_id via `im.chat.get`, bypassing the
@@ -545,5 +655,5 @@ export function isOpenAIChatGPTAuthenticated(): boolean {
 }
 
 export function sanitizeSessionName(raw: string): string {
-  return raw.replace(/[^\w一-鿿\-]/g, '_').slice(0, 64)
+  return raw.replace(/[^\w一-鿿\-\[\]]/g, '_').slice(0, 64)
 }

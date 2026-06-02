@@ -39,3 +39,10 @@ export {
   menuCard,
   streamingOffSettings,
 } from './cards/console'
+export {
+  type WorktreeCardEntry,
+  type WorktreeListCardOpts,
+  type WorktreeNoticeCardOpts,
+  worktreeListCard,
+  worktreeNoticeCard,
+} from './cards/worktree'

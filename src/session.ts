@@ -38,6 +38,7 @@ import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
 import * as sessionPermission from './session-permission'
+import * as worktree from './worktree'
 
 export type { SessionOpts } from './session-types'
 
@@ -48,6 +49,10 @@ const FOOTER_THINKING_PREFIX = 'Thinking...'
 const FOOTER_WORKING = 'Working...'
 const RESUME_INIT_NOTICE_MS = 10_000
 const RESUME_INIT_TIMEOUT_MS = 120_000
+
+function messageOf(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
 
 /** Soft cap on element count per Feishu card before we proactively
  * rotate to a fresh one. The hard ceiling is NOT ~100 as once assumed:
@@ -627,6 +632,124 @@ export class Session {
     }
   }
 
+  private worktreeProjectName(): string {
+    return worktree.projectNameFromSessionName(this.sessionName)
+  }
+
+  private worktreeProjectDir(): string {
+    return join(feishu.PROJECTS_ROOT, this.worktreeProjectName())
+  }
+
+  private async runWorktreeCommand(arg: string, userOpenId: string): Promise<void> {
+    if (!arg) {
+      await this.showWorktrees()
+      return
+    }
+    const slug = worktree.normalizeWorktreeSlug(arg)
+    if (!slug) {
+      await feishu.sendText(this.chatId, '❌ 名称无效。用英文/数字/._-，最长 63。')
+      return
+    }
+    if (!userOpenId) {
+      await feishu.sendText(this.chatId, '❌ 找不到发起人，不能拉群。')
+      return
+    }
+
+    const projectName = this.worktreeProjectName()
+    const projectDir = this.worktreeProjectDir()
+    let ensured: worktree.EnsureWorktreeResult
+    try {
+      ensured = worktree.ensureProjectWorktree(projectDir, projectName, slug)
+    } catch (e) {
+      await feishu.sendText(this.chatId, `❌ wt 失败: ${messageOf(e)}`)
+      return
+    }
+
+    try {
+      const chat = await feishu.ensureChatForSession(ensured.chatName, userOpenId)
+      const action = chat.created ? '已创建' : (chat.joined ? '已加入' : '已在群内')
+      const parentMsg = await feishu.sendCard(this.chatId, cards.worktreeNoticeCard({
+        slug,
+        branch: ensured.branch,
+        status: action,
+      }))
+      if (!parentMsg) await feishu.sendTextRaw(this.chatId, `❌ wt 卡片失败: ${slug}`)
+      const childMsg = await feishu.sendCard(chat.chatId, cards.worktreeNoticeCard({
+        slug,
+        branch: ensured.branch,
+        status: '就绪',
+        body: '开始吧。',
+      }))
+      if (!childMsg) await feishu.sendTextRaw(chat.chatId, `❌ wt 卡片失败: ${slug}`)
+    } catch (e) {
+      await feishu.sendText(this.chatId, `❌ wt 已建，拉群失败: ${messageOf(e)}`)
+    }
+  }
+
+  async showWorktrees(): Promise<void> {
+    const projectName = this.worktreeProjectName()
+    const projectDir = this.worktreeProjectDir()
+    try {
+      const entries = worktree.listProjectWorktrees(projectDir, projectName)
+      const chatIndex = await feishu.listNormalChatIdsByName()
+      const card = cards.worktreeListCard({
+        projectName,
+        projectDir,
+        entries: entries.map(entry => {
+          const ids = chatIndex.get(entry.chatName) ?? []
+          const preferred = feishu.preferredChatForSession.get(entry.chatName)
+          const chatId = preferred && ids.includes(preferred)
+            ? preferred
+            : ids.length === 1
+              ? ids[0]
+              : null
+          return {
+            slug: entry.slug,
+            chatName: entry.chatName,
+            branch: entry.branch,
+            path: entry.worktreePath ?? entry.expectedPath,
+            mounted: entry.mounted,
+            dirtyCount: entry.dirtyCount,
+            statusLine: entry.statusLine,
+            error: entry.error,
+            chatId,
+            duplicateChatCount: ids.length,
+          }
+        }),
+      })
+      const messageId = await feishu.sendCard(this.chatId, card)
+      if (!messageId) await feishu.sendTextRaw(this.chatId, '❌ wt 列表失败')
+    } catch (e) {
+      await feishu.sendText(this.chatId, `❌ wt 列表失败: ${messageOf(e)}`)
+    }
+  }
+
+  async onWorktreeDisband(slugRaw: string): Promise<{ ok: boolean; message: string }> {
+    const slug = worktree.normalizeWorktreeSlug(slugRaw)
+    if (!slug) return { ok: false, message: '名称无效' }
+    const projectName = this.worktreeProjectName()
+    const projectDir = this.worktreeProjectDir()
+    try {
+      worktree.assertProjectWorktreeClean(projectDir, projectName, slug)
+      const chatName = worktree.worktreeChatName(projectName, slug)
+      const disbanded = await feishu.disbandChatForSession(chatName)
+      const removed = worktree.removeProjectWorktreeIfClean(projectDir, projectName, slug)
+      const parts = [
+        `✅ ${slug} 已解散`,
+        removed.removedWorktree ? 'dir removed' : 'dir missing',
+        disbanded.disbanded ? 'group removed' : 'group missing',
+        `branch kept: ${removed.branch}`,
+      ]
+      const message = parts.join('\n')
+      await feishu.sendText(this.chatId, message)
+      return { ok: true, message: '已解散' }
+    } catch (e) {
+      const message = `❌ 解散 ${slug} 失败: ${messageOf(e)}`
+      await feishu.sendText(this.chatId, message)
+      return { ok: false, message }
+    }
+  }
+
   /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`).
    * Returns true if the command was consumed (don't forward to Codex).
    * Exact match, case-insensitive, ignores trailing whitespace.
@@ -639,7 +762,12 @@ export class Session {
    * auto-interrupt on mid-turn user messages was removed (matching
    * Codex's native type-ahead behavior) — explicit barge-out
    * needed a knob and `kill` (full subprocess teardown) is too heavy. */
-  async runCommand(raw: string): Promise<boolean> {
+  async runCommand(raw: string, userOpenId = ''): Promise<boolean> {
+    const wt = raw.trim().match(/^wt(?:\s+(.+))?$/i)
+    if (wt) {
+      await this.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId)
+      return true
+    }
     switch (raw.trim().toLowerCase()) {
       case 'hi':
         {

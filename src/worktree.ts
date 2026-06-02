@@ -1,0 +1,230 @@
+import { execFileSync } from 'node:child_process'
+import { existsSync, statSync } from 'node:fs'
+import { dirname, join, resolve } from 'node:path'
+
+export interface WorktreeEntry {
+  slug: string
+  chatName: string
+  branch: string
+  expectedPath: string
+  worktreePath: string | null
+  mounted: boolean
+  dirtyCount: number | null
+  statusLine: string | null
+  error: string | null
+}
+
+export interface EnsureWorktreeResult {
+  slug: string
+  chatName: string
+  branch: string
+  worktreePath: string
+  createdBranch: boolean
+  createdWorktree: boolean
+}
+
+export interface RemoveWorktreeResult {
+  slug: string
+  chatName: string
+  branch: string
+  worktreePath: string
+  removedWorktree: boolean
+}
+
+const WORK_BRANCH_PREFIX = 'work/'
+const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/
+
+export function normalizeWorktreeSlug(raw: string): string | null {
+  const slug = raw.trim()
+  if (!SLUG_RE.test(slug)) return null
+  return slug
+}
+
+export function projectNameFromSessionName(sessionName: string): string {
+  const m = sessionName.match(/^(.+)\[[^\[\]]+\]$/)
+  return m?.[1] ?? sessionName
+}
+
+export function worktreeChatName(projectName: string, slug: string): string {
+  return `${projectName}[${slug}]`
+}
+
+export function worktreeBranch(slug: string): string {
+  return `${WORK_BRANCH_PREFIX}${slug}`
+}
+
+export function expectedWorktreePath(projectDir: string, projectName: string, slug: string): string {
+  return join(dirname(projectDir), worktreeChatName(projectName, slug))
+}
+
+export function listProjectWorktrees(projectDir: string, projectName: string): WorktreeEntry[] {
+  assertGitRepo(projectDir)
+  const branches = git(projectDir, ['for-each-ref', '--format=%(refname:short)', `refs/heads/${WORK_BRANCH_PREFIX}`])
+    .split('\n')
+    .map(s => s.trim())
+    .filter(Boolean)
+    .filter(branch => branch.startsWith(WORK_BRANCH_PREFIX))
+
+  const mountedByBranch = parseWorktreeList(projectDir)
+  const out: WorktreeEntry[] = []
+  for (const branch of branches) {
+    const slug = branch.slice(WORK_BRANCH_PREFIX.length)
+    if (!normalizeWorktreeSlug(slug)) continue
+    const chatName = worktreeChatName(projectName, slug)
+    const expectedPath = expectedWorktreePath(projectDir, projectName, slug)
+    const mountedPath = mountedByBranch.get(branch) ?? null
+    const worktreePath = mountedPath ?? expectedPath
+    const mounted = !!mountedPath && existsSync(mountedPath)
+    const entry: WorktreeEntry = {
+      slug,
+      chatName,
+      branch,
+      expectedPath,
+      worktreePath: mounted ? mountedPath : null,
+      mounted,
+      dirtyCount: null,
+      statusLine: null,
+      error: null,
+    }
+    if (mountedPath && existsSync(mountedPath)) {
+      try {
+        const status = git(mountedPath, ['status', '--porcelain=v1', '--branch'])
+        const lines = status.split('\n').filter(Boolean)
+        entry.statusLine = lines[0]?.startsWith('## ') ? lines[0].slice(3) : null
+        entry.dirtyCount = lines.filter(line => !line.startsWith('## ')).length
+      } catch (e) {
+        entry.error = errorMessage(e)
+      }
+    }
+    out.push(entry)
+  }
+  return out.sort((a, b) => a.slug.localeCompare(b.slug))
+}
+
+export function ensureProjectWorktree(projectDir: string, projectName: string, slug: string): EnsureWorktreeResult {
+  const cleanSlug = normalizeWorktreeSlug(slug)
+  if (!cleanSlug) throw new Error(`invalid worktree name "${slug}"`)
+  assertGitRepo(projectDir)
+
+  const branch = worktreeBranch(cleanSlug)
+  const chatName = worktreeChatName(projectName, cleanSlug)
+  const targetPath = expectedWorktreePath(projectDir, projectName, cleanSlug)
+  const branchExists = hasBranch(projectDir, branch)
+  const mountedPath = parseWorktreeList(projectDir).get(branch) ?? null
+
+  if (mountedPath) {
+    if (resolve(mountedPath) !== resolve(targetPath)) {
+      throw new Error(`branch ${branch} is already mounted at ${mountedPath}`)
+    }
+    assertWorktreeBranch(targetPath, branch)
+    return { slug: cleanSlug, chatName, branch, worktreePath: targetPath, createdBranch: false, createdWorktree: false }
+  }
+
+  if (existsSync(targetPath)) {
+    if (!statSync(targetPath).isDirectory()) {
+      throw new Error(`${targetPath} exists but is not a directory`)
+    }
+    if (!branchExists) {
+      throw new Error(`${targetPath} already exists while branch ${branch} does not`)
+    }
+  }
+
+  if (branchExists) {
+    git(projectDir, ['worktree', 'add', targetPath, branch])
+    return { slug: cleanSlug, chatName, branch, worktreePath: targetPath, createdBranch: false, createdWorktree: true }
+  }
+
+  git(projectDir, ['worktree', 'add', '-b', branch, targetPath, 'HEAD'])
+  return { slug: cleanSlug, chatName, branch, worktreePath: targetPath, createdBranch: true, createdWorktree: true }
+}
+
+export function removeProjectWorktreeIfClean(projectDir: string, projectName: string, slug: string): RemoveWorktreeResult {
+  const target = assertProjectWorktreeClean(projectDir, projectName, slug)
+  if (!existsSync(target.worktreePath)) return target
+  git(projectDir, ['worktree', 'remove', target.worktreePath])
+  return { ...target, removedWorktree: true }
+}
+
+export function assertProjectWorktreeClean(projectDir: string, projectName: string, slug: string): RemoveWorktreeResult {
+  const cleanSlug = normalizeWorktreeSlug(slug)
+  if (!cleanSlug) throw new Error(`invalid worktree name "${slug}"`)
+  assertGitRepo(projectDir)
+  const branch = worktreeBranch(cleanSlug)
+  const chatName = worktreeChatName(projectName, cleanSlug)
+  const targetPath = expectedWorktreePath(projectDir, projectName, cleanSlug)
+  const mountedPath = parseWorktreeList(projectDir).get(branch) ?? null
+  const worktreePath = mountedPath ?? targetPath
+
+  if (!existsSync(worktreePath)) {
+    return { slug: cleanSlug, chatName, branch, worktreePath, removedWorktree: false }
+  }
+  assertWorktreeBranch(worktreePath, branch)
+  const dirty = git(worktreePath, ['status', '--porcelain=v1']).split('\n').filter(Boolean)
+  if (dirty.length > 0) {
+    const preview = dirty.slice(0, 8).join('\n')
+    throw new Error(`worktree has uncommitted changes:\n${preview}`)
+  }
+  return { slug: cleanSlug, chatName, branch, worktreePath, removedWorktree: false }
+}
+
+function assertGitRepo(projectDir: string): void {
+  if (!existsSync(projectDir)) throw new Error(`project directory does not exist: ${projectDir}`)
+  const top = git(projectDir, ['rev-parse', '--show-toplevel']).trim()
+  if (resolve(top) !== resolve(projectDir)) {
+    throw new Error(`${projectDir} is not the git repository root (${top})`)
+  }
+}
+
+function assertWorktreeBranch(worktreePath: string, branch: string): void {
+  const actual = git(worktreePath, ['rev-parse', '--abbrev-ref', 'HEAD']).trim()
+  if (actual !== branch) {
+    throw new Error(`${worktreePath} is on ${actual}, expected ${branch}`)
+  }
+}
+
+function hasBranch(projectDir: string, branch: string): boolean {
+  try {
+    git(projectDir, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`])
+    return true
+  } catch {
+    return false
+  }
+}
+
+function parseWorktreeList(projectDir: string): Map<string, string> {
+  const out = new Map<string, string>()
+  const text = git(projectDir, ['worktree', 'list', '--porcelain'])
+  let currentPath = ''
+  for (const line of text.split('\n')) {
+    if (line.startsWith('worktree ')) {
+      currentPath = line.slice('worktree '.length)
+      continue
+    }
+    if (line.startsWith('branch refs/heads/') && currentPath) {
+      out.set(line.slice('branch refs/heads/'.length), currentPath)
+    }
+  }
+  return out
+}
+
+function git(cwd: string, args: string[]): string {
+  try {
+    return execFileSync('git', args, {
+      cwd,
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+    })
+  } catch (e) {
+    throw new Error(errorMessage(e))
+  }
+}
+
+function errorMessage(e: unknown): string {
+  if (e && typeof e === 'object') {
+    const any = e as { stderr?: Buffer | string; message?: string }
+    const stderr = any.stderr ? String(any.stderr).trim() : ''
+    if (stderr) return stderr
+    if (any.message) return any.message
+  }
+  return String(e)
+}

@@ -319,13 +319,12 @@ async function handleMessage(data: any): Promise<void> {
   }
 
   // Text-only control commands — intercept before any work that would
-  // forward to Codex (download / spawn / interrupt). Exact match,
-  // case-insensitive: `hi` `stop` `kill` `restart` `clear`. Bare words are
-  // reserved globally by user request — typing "hi" as a literal
-  // greeting will trigger the dashboard, not reach Codex. Post 富文本
-  // 整段不可能正好等于这些 bare word,所以这里只对 text 触发。
+  // forward to Codex (download / spawn / interrupt). Bare words are
+  // reserved globally by user request; `wt [name]` is also intercepted
+  // for project worktree/group orchestration. Post 富文本整段不可能正好
+  // 等于这些 bare word,所以这里只对 text 触发。
   if (msgType === 'text' && text) {
-    if (await session.runCommand(text)) return
+    if (await session.runCommand(text, userOpenId)) return
   }
 
   // Pending AskUserQuestion: route the message as a custom answer
@@ -391,6 +390,10 @@ async function handleCardAction(data: any): Promise<any> {
       }
       await session.onAskAnswer(value.tool_use_id, value.question_idx ?? 0, value.option_idx, userId)
       return { toast: { type: 'success', content: '已回答' } }
+    }
+    case 'worktree_disband': {
+      const result = await session.onWorktreeDisband(String(value.slug ?? ''))
+      return { toast: { type: result.ok ? 'success' : 'error', content: result.ok ? result.message : '解散失败，详情见群消息' } }
     }
   }
   return { toast: { type: 'info', content: 'unknown action' } }
