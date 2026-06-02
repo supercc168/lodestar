@@ -58,7 +58,9 @@
         "sysinfo.ts",
         "update-cli.ts",
         "usage.ts",
-        "version-cli.ts"
+        "version-cli.ts",
+        "worktree.test.ts",
+        "worktree.ts"
       ],
       "subdirs": [
         "cards"
@@ -70,11 +72,12 @@
         "console.ts",
         "elements.ts",
         "turn.test.ts",
-        "turn.ts"
+        "turn.ts",
+        "worktree.ts"
       ],
       "subdirs": []
     }
   },
-  "generatedAt": "2026-05-31T08:37:36.222095+00:00",
+  "generatedAt": "2026-06-02T01:06:51.731172+00:00",
   "version": 1
 }

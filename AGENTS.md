@@ -1,9 +1,9 @@
-<!-- Generated: 2026-05-15 | Updated: 2026-05-31 -->
+<!-- Generated: 2026-05-15 | Updated: 2026-06-02 -->
 
 # Lodestar 2.0
 
 ## Purpose
-本仓库实现一个 Bun daemon，把飞书群消息桥接到无头 `codex app-server` 进程。运行时关系是一个飞书群对应一个 Lodestar session、一个 Codex thread，以及每轮对话中的一张流式 Feishu Card Kit 卡片。
+本仓库实现一个 Bun daemon，把飞书群消息桥接到无头 `codex app-server` 进程。运行时关系是一个飞书群对应一个 Lodestar session、一个 Codex thread，以及每轮对话中的一张流式 Feishu Card Kit 卡片；项目主群还可用 `wt` 自动创建/加入同级 Git worktree 群。
 
 ## Key Files
 | File | Description |
@@ -11,7 +11,7 @@
 | `daemon.ts` | daemon 主入口；负责 PID guard、Lark `WSClient`、事件分发、裸词控制命令和 debug socket。 |
 | `cli.ts` | npm 分发入口；在缺少 `config.toml` 时触发安装向导，否则延迟导入 `daemon.ts`。 |
 | `package.json` | Bun/Node 打包脚本、发布元数据、二进制入口和依赖声明。 |
-| `README.md` | 用户安装、首次配置、群控裸词和 HTTP 通知端点说明。 |
+| `README.md` | 用户安装、首次配置、群控裸词、`wt` worktree 群和 HTTP 通知端点说明。 |
 | `bun.lock` | Bun 依赖锁文件；更新依赖后同步提交。 |
 | `LICENSE` | MIT 许可证。 |
 | `promo.jpg` | README 顶部展示图。 |
@@ -31,17 +31,18 @@
 - 处理 Card Kit 流式文本时优先使用 `cardkit.streamTextThrottled`；事件处理路径不要直接高频调用 `streamText`。
 - API 失败要记录并向用户暴露；不要静默切换传输、卡片或消息通道作为“兜底”。
 - 不要主动重启正在运行的 daemon，除非用户在当前回合明确要求 `restart` / `重启` / reload。代码变更后只报告需要重启。
-- 群内裸词控制是 `hi`、`stop`、`kill`、`restart`、`clear`；这些词在 `Session.runCommand` 中作为保留字处理。
+- 群内裸词控制是 `hi`、`stop`、`kill`、`restart`、`clear`、`wt` 和 `wt <name>`；这些词在 `Session.runCommand` 中作为保留字处理。
+- `wt <name>` 约定创建同级目录 `<project>[<name>]` 和本地分支 `work/<name>`，并自动创建/加入同名飞书群；解散按钮只在 worktree 干净时删除目录和解散群，保留分支。
 - 本地脚本可通过 `POST http://127.0.0.1:9876/notify` 发送 `{project, text, level}` 到绑定群。
 
 ### Testing Requirements
 - 常规校验使用 `bun test` 和 `bun run build`。
-- 涉及真实飞书、Codex 登录或卡片流式行为时，用 `bun scripts/smoke.ts "<group name>"` 或 `bun scripts/test-all.ts "<group name>"` 做人工 smoke。
+- 涉及真实飞书、Codex 登录、卡片流式行为或 `wt` 建群/解散时，用 debug 注入、`bun scripts/smoke.ts "<group name>"` 或 `bun scripts/test-all.ts "<group name>"` 做人工 smoke。
 - 发布前按项目惯例运行 `bun test`、`bun run build`，再执行版本 bump、tag、npm/GitHub Packages 发布和 GitHub Release 流程。
 
 ### Common Patterns
 - 根入口保持很薄：`cli.ts` 处理首次配置和 PID guard，`daemon.ts` 负责 WS/event loop，核心业务下沉到 `src/`。
-- `Session` 是一个群的状态机；跨群状态只通过 session registry、持久 map 和 Feishu chat 绑定协调。
+- `Session` 是一个群的状态机；跨群状态只通过 session registry、持久 map、Feishu chat 绑定和 `work/*` 分支约定协调。
 - `cardkit` 负责每张卡的 sequence、队列、限流和写失败检测；session 负责什么时候开卡、换卡、关闭卡。
 - 所有 shell 命令卡片展示依赖第一行 `# desc:` 风格说明，修改相关展示逻辑时同步看 `src/cards/turn.ts`。
 
@@ -57,7 +58,7 @@
 - Bun：源码运行、测试和构建。
 - Node.js >= 18：发布包运行环境。
 - `codex` CLI：需要已通过 ChatGPT 登录，daemon 会启动 `codex app-server`。
-- Feishu Open Platform：IM、reaction、附件、Card Kit v1、tenant token API。
+- Feishu Open Platform：IM、群创建/解散、群成员读写、reaction、附件、Card Kit v1、tenant token API。
 - systemd user service：长期运行部署时常用，但只有用户明确要求时才操作。
 
 <!-- MANUAL: Add manually maintained notes below this line. -->

@@ -42,7 +42,7 @@ lodestar-setup
 
 群名 = `projects_root` 下的目录名(没建会自动建)。发条消息,Codex 接管。
 
-群里发这五个**裸词**(不要斜杠,大小写不敏感)可以控 daemon:
+群里发这些**裸词**(不要斜杠,大小写不敏感)可以控 daemon:
 
 | 指令 | 行为 |
 | --- | --- |
@@ -51,6 +51,17 @@ lodestar-setup
 | `kill` | 用状态卡展示关闭 Codex 进程,`threadId` 落盘 |
 | `restart` | 用状态卡展示按上次 `threadId` 重启(保留上下文)|
 | `clear` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
+
+**并发 worktree 群**
+
+在项目主群发:
+
+| 指令 | 行为 |
+| --- | --- |
+| `wt` | 列出本项目 `work/*` 分支、worktree 状态和对应群,卡片上可点 `删`。 |
+| `wt feature-x` | 创建或加入同级目录/群 `<project>[feature-x]`,分支为 `work/feature-x`。 |
+
+`删` 会先检查 worktree 没有未提交变更,再解散群并删除 worktree 目录;分支保留,合并和分支清理由主群里的 agent 处理。
 
 ---
 
