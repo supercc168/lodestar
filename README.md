@@ -72,8 +72,9 @@ lodestar-setup
 本机任何脚本一行 curl 就能往群里推一张 markdown 卡片(info / warn / error 三档染色):
 
 ```bash
-curl -X POST http://127.0.0.1:9876/notify \
-  -d '{"project":"xxx","text":"build done"}'
+curl -sS -X POST http://127.0.0.1:9876/notify \
+  -H 'Content-Type: application/json' \
+  -d '{"project":"xxx","text":"build done","level":"info"}'
 ```
 
 ---
