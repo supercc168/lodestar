@@ -6,6 +6,7 @@ export interface WorktreeEntry {
   slug: string
   chatName: string
   branch: string
+  state: 'active' | 'merged' | 'stale'
   expectedPath: string
   worktreePath: string | null
   mounted: boolean
@@ -74,11 +75,13 @@ export function listProjectWorktrees(projectDir: string, projectName: string): W
     const expectedPath = expectedWorktreePath(projectDir, projectName, slug)
     const mountedPath = mountedByBranch.get(branch) ?? null
     const worktreePath = mountedPath ?? expectedPath
+    const state = branchState(projectDir, branch)
     const mounted = !!mountedPath && existsSync(mountedPath)
     const entry: WorktreeEntry = {
       slug,
       chatName,
       branch,
+      state,
       expectedPath,
       worktreePath: mounted ? mountedPath : null,
       mounted,
@@ -185,6 +188,24 @@ function assertWorktreeBranch(worktreePath: string, branch: string): void {
 function hasBranch(projectDir: string, branch: string): boolean {
   try {
     git(projectDir, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`])
+    return true
+  } catch {
+    return false
+  }
+}
+
+function branchState(projectDir: string, branch: string): WorktreeEntry['state'] {
+  const head = git(projectDir, ['rev-parse', branch]).trim()
+  const main = git(projectDir, ['rev-parse', 'HEAD']).trim()
+  if (head === main) return 'active'
+  if (isAncestor(projectDir, branch, 'HEAD')) return 'merged'
+  if (isAncestor(projectDir, 'HEAD', branch)) return 'active'
+  return 'stale'
+}
+
+function isAncestor(projectDir: string, ancestor: string, descendant: string): boolean {
+  try {
+    git(projectDir, ['merge-base', '--is-ancestor', ancestor, descendant])
     return true
   } catch {
     return false

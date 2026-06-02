@@ -2,6 +2,7 @@ export interface WorktreeCardEntry {
   slug: string
   chatName: string
   branch: string
+  state: 'active' | 'merged' | 'stale'
   path: string
   mounted: boolean
   dirtyCount: number | null
@@ -22,6 +23,7 @@ export interface WorktreeNoticeCardOpts {
   branch: string
   status: string
   body?: string
+  template?: string
 }
 
 export function worktreeListCard(opts: WorktreeListCardOpts): object {
@@ -50,7 +52,13 @@ function worktreeEntryElements(entry: WorktreeCardEntry): object[] {
   const repoState = entry.error
     ? 'err'
     : entry.mounted
-      ? `${entry.dirtyCount && entry.dirtyCount > 0 ? `dirty ${entry.dirtyCount}` : 'clean'}`
+      ? entry.dirtyCount && entry.dirtyCount > 0
+        ? `dirty ${entry.dirtyCount}`
+        : entry.state === 'merged'
+          ? 'merged'
+          : entry.state === 'stale'
+            ? 'stale'
+            : 'clean'
       : 'off'
   const chatState = entry.duplicateChatCount > 1
     ? `群重复 ${entry.duplicateChatCount}`
@@ -88,7 +96,7 @@ export function worktreeNoticeCard(opts: WorktreeNoticeCardOpts): object {
     config: { update_multi: true },
     header: {
       title: { tag: 'plain_text', content: `🌿 ${opts.slug}` },
-      template: 'green',
+      template: opts.template ?? 'green',
     },
     body: {
       elements: [{

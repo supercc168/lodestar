@@ -58,10 +58,10 @@ lodestar-setup
 
 | 指令 | 行为 |
 | --- | --- |
-| `wt` | 列出本项目 `work/*` 分支、worktree 状态和对应群,卡片上可点 `删`。 |
+| `wt` | 列出本项目 `work/*` 分支状态(clean/dirty/merged/stale),卡片上可点 `删`。 |
 | `wt feature-x` | 创建或加入同级目录/群 `<project>[feature-x]`,分支为 `work/feature-x`。 |
 
-`删` 会先检查 worktree 没有未提交变更,再解散群并删除 worktree 目录;分支保留,合并和分支清理由主群里的 agent 处理。
+`删` 会先检查 worktree 没有未提交变更,再解散群并删除 worktree 目录;分支保留,合并和分支清理由 agent 处理。
 
 ---
 

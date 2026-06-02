@@ -707,6 +707,7 @@ export class Session {
             slug: entry.slug,
             chatName: entry.chatName,
             branch: entry.branch,
+            state: entry.state,
             path: entry.worktreePath ?? entry.expectedPath,
             mounted: entry.mounted,
             dirtyCount: entry.dirtyCount,
@@ -734,14 +735,18 @@ export class Session {
       const chatName = worktree.worktreeChatName(projectName, slug)
       const disbanded = await feishu.disbandChatForSession(chatName)
       const removed = worktree.removeProjectWorktreeIfClean(projectDir, projectName, slug)
-      const parts = [
-        `✅ ${slug} 已解散`,
-        removed.removedWorktree ? 'dir removed' : 'dir missing',
-        disbanded.disbanded ? 'group removed' : 'group missing',
-        `branch kept: ${removed.branch}`,
-      ]
-      const message = parts.join('\n')
-      await feishu.sendText(this.chatId, message)
+      const card = cards.worktreeNoticeCard({
+        slug,
+        branch: removed.branch,
+        status: '已解散',
+        body: [
+          removed.removedWorktree ? 'dir removed' : 'dir missing',
+          disbanded.disbanded ? 'group removed' : 'group missing',
+        ].join('\n'),
+        template: 'grey',
+      })
+      const messageId = await feishu.sendCard(this.chatId, card)
+      if (!messageId) await feishu.sendTextRaw(this.chatId, `✅ ${slug} 已解散`)
       return { ok: true, message: '已解散' }
     } catch (e) {
       const message = `❌ 解散 ${slug} 失败: ${messageOf(e)}`

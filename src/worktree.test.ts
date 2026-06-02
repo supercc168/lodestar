@@ -32,6 +32,7 @@ describe('project worktrees', () => {
       slug: 'feature-worktree',
       chatName: 'feishu[feature-worktree]',
       branch: 'work/feature-worktree',
+      state: 'active',
       mounted: true,
       dirtyCount: 0,
     })
@@ -58,6 +59,28 @@ describe('project worktrees', () => {
     expect(entries[0]?.mounted).toBe(false)
     expect(entries[0]?.worktreePath).toBeNull()
     expect(entries[0]?.expectedPath).toBe(result.worktreePath)
+  })
+
+  test('marks merged and stale work branches', () => {
+    const { repo } = initRepo()
+    ensureProjectWorktree(repo, 'feishu', 'merged-work')
+    git(join(repo, '..', 'feishu[merged-work]'), ['commit', '--allow-empty', '-m', 'feature'])
+    git(repo, ['merge', '--no-ff', 'work/merged-work', '-m', 'merge feature'])
+
+    ensureProjectWorktree(repo, 'feishu', 'stale-work')
+    git(repo, ['commit', '--allow-empty', '-m', 'main moves'])
+
+    const entries = listProjectWorktrees(repo, 'feishu')
+    expect(entries.find(e => e.slug === 'merged-work')?.state).toBe('merged')
+
+    const stalePath = join(repo, '..', 'feishu[stale-work]')
+    writeFileSync(join(stalePath, 'stale.txt'), 'branch work\n')
+    git(stalePath, ['add', 'stale.txt'])
+    git(stalePath, ['commit', '-m', 'branch work'])
+    git(repo, ['commit', '--allow-empty', '-m', 'main moves again'])
+
+    const updated = listProjectWorktrees(repo, 'feishu')
+    expect(updated.find(e => e.slug === 'stale-work')?.state).toBe('stale')
   })
 })
 

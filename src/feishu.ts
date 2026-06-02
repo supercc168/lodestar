@@ -209,7 +209,12 @@ export async function listNormalChatIdsByName(): Promise<Map<string, string[]>> 
 
 export async function findNormalChatIdByName(sessionName: string): Promise<string | null> {
   const cachedPreferred = preferredChatForSession.get(sessionName)
-  if (cachedPreferred && chatNameCache.get(cachedPreferred) === sessionName) return cachedPreferred
+  if (cachedPreferred && chatNameCache.get(cachedPreferred) === sessionName) {
+    const status = await fetchChatStatus(cachedPreferred)
+    if (status.name === sessionName && isNormalChatStatus(status.status)) return cachedPreferred
+    chatNameCache.delete(cachedPreferred)
+    unbindSessionChat(sessionName)
+  }
   const byName = await listNormalChatIdsByName()
   const matches = byName.get(sessionName) ?? []
   if (matches.length === 0) return null
@@ -362,6 +367,21 @@ async function sendViaSdkWithRetry(
   }
   log(`feishu: send${what === 'text' ? 'Text' : 'Card'} chat=${chatId} EXHAUSTED ${SEND_RETRY_DELAYS_MS.length} retries: ${lastErr}`)
   return null
+}
+
+async function fetchChatStatus(chatId: string): Promise<{ name: string | null; status: string | null }> {
+  const res = await client.im.chat.get({ path: { chat_id: chatId } })
+  if (res.code && res.code !== 0) {
+    throw new Error(`feishu chat.get failed code=${res.code} msg=${res.msg}`)
+  }
+  return {
+    name: res.data?.name ?? null,
+    status: res.data?.chat_status ?? null,
+  }
+}
+
+function isNormalChatStatus(status: string | null): boolean {
+  return status === null || status === 'normal'
 }
 
 export async function sendText(chatId: string, text: string): Promise<string | null> {
