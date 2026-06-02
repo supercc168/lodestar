@@ -34,6 +34,7 @@ import { log } from './log'
 import { readSysInfo } from './sysinfo'
 import { readUsage, type UsageSnapshot } from './usage'
 import { contextLimitFromAppServer, contextTokensFromUsage, contextUsedPercent } from './context-window'
+import { extractSendMarkerPaths } from './outbound-markers'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
@@ -41,8 +42,6 @@ import * as sessionPermission from './session-permission'
 import * as worktree from './worktree'
 
 export type { SessionOpts } from './session-types'
-
-const SEND_MARKER_RE = /\[\[send:\s*([^\]\n]+?)\s*\]\]/g
 
 const FOOTER_STATUS_TICK_MS = 1000
 const FOOTER_THINKING_PREFIX = 'Thinking...'
@@ -1976,8 +1975,8 @@ export class Session {
   /** 从一段文字里找完整 [[send: /abs/path]] 标记,一看到就立即发。正文保留
    * 原标记不改,让用户知道触发了哪个文件路径。 */
   private processOutboundMarkers(text: string): void {
-    for (const m of text.matchAll(SEND_MARKER_RE)) {
-      this.sendOutboundPath(m[1], 'send marker')
+    for (const path of extractSendMarkerPaths(text)) {
+      this.sendOutboundPath(path, 'send marker')
     }
   }
 
