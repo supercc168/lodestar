@@ -21,6 +21,7 @@ import {
   CodexProcess,
   type CanUseToolRequest,
   type CodexUsage,
+  type ContextCompactedNotification,
   type HookCallbackRequest,
   type PlanDelta,
   type ThreadGoal,
@@ -1341,6 +1342,9 @@ export class Session {
     p.on('plan_delta', (delta: PlanDelta) => {
       this.handlePlanDelta(delta)
     })
+    p.on('context_compacted', (notice: ContextCompactedNotification) => {
+      this.handleContextCompacted(notice)
+    })
     p.on('thread_goal_updated', (goal: ThreadGoal) => {
       this.handleThreadGoalUpdated(goal)
     })
@@ -1584,6 +1588,7 @@ export class Session {
       planExplanation: null,
       planUpdateCount: 0,
       goalUpdateCount: 0,
+      contextCompactCount: 0,
       readBatches: new Map(),
       openReadBatchI: null,
       assistantSegmentCount: 0,
@@ -1755,7 +1760,10 @@ export class Session {
           if (carrySegId && carryText) {
             await cardkit.deleteElement(oldCardId, carrySegId)
           }
-          await cardkit.streamText(oldCardId, cards.ELEMENTS.footer, '📨 已续至下一张卡 ↓')
+          const compactNote = turn.contextCompactCount > 0
+            ? ` · 🚨 上下文已压缩 ×${turn.contextCompactCount} 🚨`
+            : ''
+          await cardkit.streamText(oldCardId, cards.ELEMENTS.footer, `📨 已续至下一张卡 ↓${compactNote}`)
           cardkit.cancelSummary(oldCardId)
           await cardkit.patchSettings(oldCardId, cards.streamingOffSettings({ suffix: '📨 转下一张' }))
           await cardkit.dispose(oldCardId)
@@ -1811,6 +1819,26 @@ export class Session {
       type: 'insert_before',
       targetElementId: cards.ELEMENTS.footer,
     })
+  }
+
+  private handleContextCompacted(notice: ContextCompactedNotification): void {
+    const turn = this.currentTurn
+    if (!turn) {
+      log(`session "${this.sessionName}": thread/compacted with no current turn`)
+      void feishu.sendTextRaw(this.chatId, '🚨🚨🚨 CONTEXT COMPACTED / 上下文已压缩 🚨🚨🚨\n\nCodex 报告发生了上下文压缩,但当前没有可写的对话卡片。')
+      return
+    }
+    this.stopThinkingFooter(turn)
+    if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
+    turn.openReadBatchI = null
+    this.maybeMidTurnRotate()
+    const i = turn.contextCompactCount++
+    const elementId = cards.ELEMENTS.contextCompact(i)
+    void cardkit.addElement(turn.cardId, cards.contextCompactionElement(i, notice, elementId), {
+      type: 'insert_before',
+      targetElementId: cards.ELEMENTS.footer,
+    })
+    cardkit.patchSummaryThrottled(turn.cardId, '🚨 上下文已压缩 / CONTEXT COMPACTED')
   }
 
   private handleTurnPlanUpdated(update: TurnPlanUpdated): void {
@@ -2063,6 +2091,9 @@ export class Session {
     // markdown 形态完整可见即可。代价是卡片会长一些,但比 typewriter
     // 被截好得多。
     const sendNote = turn.outboundSentPaths.size ? ` · 📎 ${turn.outboundSentPaths.size}` : ''
+    const compactNote = turn.contextCompactCount > 0
+      ? ` · 🚨 上下文已压缩 ×${turn.contextCompactCount} 🚨`
+      : ''
     // State marker leads the footer (✅ for natural completion, or the
     // suffix verbatim for non-natural states like `🛑 打断`). The
     // trailing "done" word is gone — the ✅ already carries that
@@ -2083,7 +2114,7 @@ export class Session {
       const cost = this.lastTurnDelta?.costUsd ?? 0
       if (cost > 0) metrics += ` · 💰 $${cost.toFixed(3)}`
     }
-    const footer = `${stateMark} ⏱ ${elapsed}s${metrics}${sendNote}`
+    const footer = `${stateMark} ⏱ ${elapsed}s${metrics}${compactNote}${sendNote}`
     await cardkit.streamText(cardId, cards.ELEMENTS.footer, footer)
     // Final chat-list preview: clean finish shows "⏱ Xs · NK tokens";
     // interrupted shows the suffix instead (no usage event landed).

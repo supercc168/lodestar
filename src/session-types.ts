@@ -39,6 +39,7 @@ export interface TurnState {
   planExplanation: string | null
   planUpdateCount: number
   goalUpdateCount: number
+  contextCompactCount: number
   /** Consecutive `Read` calls collapse into a single panel rendered by
    * `cards.readBatchElement`. Keyed by element index `i` so completeTool
    * can find the batch after its open-window closed (a non-Read tool or

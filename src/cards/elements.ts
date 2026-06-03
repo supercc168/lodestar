@@ -7,6 +7,8 @@
  *   tool_<i>          — one collapsible per tool call, indexed from 0
  *   plan_update_<i>   — timeline snapshot inserted where a plan update occurs
  *   goal_update_<i>   — timeline snapshot inserted where a goal update occurs
+ *   context_compact_<i> — timeline marker inserted where Codex reports that
+ *                       it compacted the active context.
  *   assistant         — the main streaming assistant answer
  *   footer            — runtime footer. While the model is silent it
  *                       shows `Thinking...(Ns)`; while visible work is
@@ -19,6 +21,7 @@ export const ELEMENTS = {
   tool: (i: number) => `tool_${i}`,
   planUpdate: (i: number) => `plan_update_${i}`,
   goalUpdate: (i: number) => `goal_update_${i}`,
+  contextCompact: (i: number) => `context_compact_${i}`,
   /** Assistant text is segmented: every tool call closes the running segment
    * and the next assistant chunk opens a new one, so element order in the
    * card matches Codex's emission order. */

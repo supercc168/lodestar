@@ -101,6 +101,13 @@ export interface PlanDelta {
   delta: string
 }
 
+export interface ContextCompactedNotification {
+  threadId?: string
+  turnId?: string
+  itemId?: string
+  [key: string]: unknown
+}
+
 export interface ThreadGoal {
   threadId?: string
   objective: string
@@ -296,6 +303,10 @@ export class CodexProcess extends EventEmitter {
             turnId: params.turnId,
           })
         }
+        return
+      }
+      case 'thread/compacted': {
+        this.emit('context_compacted', params as ContextCompactedNotification)
         return
       }
       case 'turn/started': {

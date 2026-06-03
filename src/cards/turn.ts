@@ -22,6 +22,13 @@ export interface ThreadGoal {
   timeUsedSeconds: number
 }
 
+export interface ContextCompactionNotice {
+  threadId?: string
+  turnId?: string
+  itemId?: string
+  [key: string]: unknown
+}
+
 export function goalDisplaySignature(goal: ThreadGoal): string {
   return JSON.stringify({
     objective: goal.objective,
@@ -79,6 +86,60 @@ function formatGoalTime(seconds: number): string {
   const hours = Math.floor(minutes / 60)
   const min = minutes % 60
   return min ? `${hours}h ${min}m` : `${hours}h`
+}
+
+function markdownText(v: unknown): string {
+  if (typeof v === 'string') {
+    const trimmed = v.trim()
+    return trimmed
+      ? trimmed.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+      : 'MISS'
+  }
+  if (v == null) return 'MISS'
+  return String(v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+function stringField(obj: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'string' && value.trim()) return markdownText(value)
+  }
+  return 'MISS'
+}
+
+function numberField(obj: Record<string, unknown>, keys: string[]): string {
+  for (const key of keys) {
+    const value = obj[key]
+    if (typeof value === 'number' && Number.isFinite(value)) return String(value)
+  }
+  return 'MISS'
+}
+
+export function contextCompactionElement(i: number, notice: ContextCompactionNotice, elementId: string): object {
+  const data = notice && typeof notice === 'object' ? notice as Record<string, unknown> : {}
+  const lines = [
+    '**🚨🚨🚨 CONTEXT COMPACTED / 上下文已压缩 🚨🚨🚨**',
+    '',
+    '**!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!**',
+    '',
+    '**压缩发生在这里。** 上方是压缩前的卡片流；下方是压缩后的继续输出。',
+    '',
+    `- 事件: thread/compacted`,
+    `- 序号: ${i + 1}`,
+    `- thread: ${stringField(data, ['threadId', 'thread_id'])}`,
+    `- turn: ${stringField(data, ['turnId', 'turn_id'])}`,
+    `- item: ${stringField(data, ['itemId', 'item_id'])}`,
+    `- tokens: ${numberField(data, ['totalTokens', 'total_tokens'])}`,
+    `- window: ${numberField(data, ['modelContextWindow', 'model_context_window'])}`,
+    `- summary: ${stringField(data, ['summary', 'compactionSummary', 'compaction_summary', 'message'])}`,
+    '',
+    '**!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!**',
+  ]
+  return {
+    tag: 'markdown',
+    element_id: elementId,
+    content: lines.join('\n'),
+  }
 }
 
 function renderPlanContent(plan: TurnPlanStep[], explanation?: string | null, draftText = ''): string {

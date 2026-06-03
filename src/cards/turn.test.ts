@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 
 import { consoleBodyElements, statusCard } from './console'
 import {
+  contextCompactionElement,
   goalElement,
   goalDisplaySignature,
   mainConversationCard,
@@ -56,6 +57,29 @@ describe('main conversation card rendering', () => {
 })
 
 describe('plan and goal rendering', () => {
+  test('renders context compaction marker loudly', () => {
+    const el = contextCompactionElement(1, {
+      threadId: 'thread-123',
+      turnId: 'turn-456',
+      itemId: 'item-789',
+      totalTokens: 120000,
+      modelContextWindow: 258400,
+      summary: '历史已压缩',
+    }, 'context_compact_1') as any
+
+    expect(el.element_id).toBe('context_compact_1')
+    expect(el.tag).toBe('markdown')
+    expect(el.content).toContain('🚨🚨🚨 CONTEXT COMPACTED / 上下文已压缩 🚨🚨🚨')
+    expect(el.content).toContain('压缩发生在这里')
+    expect(el.content).toContain('- 序号: 2')
+    expect(el.content).toContain('- thread: thread-123')
+    expect(el.content).toContain('- turn: turn-456')
+    expect(el.content).toContain('- item: item-789')
+    expect(el.content).toContain('- tokens: 120000')
+    expect(el.content).toContain('- window: 258400')
+    expect(el.content).toContain('- summary: 历史已压缩')
+  })
+
   test('renders authoritative turn plan statuses', () => {
     const el = planElement([
       { step: '读取 app-server 协议', status: 'completed' },
