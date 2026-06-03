@@ -65,12 +65,16 @@ describe('plan and goal rendering', () => {
       totalTokens: 120000,
       modelContextWindow: 258400,
       summary: '历史已压缩',
+      sourceMethod: 'event_msg',
+      sourceType: 'context_compacted',
     }, 'context_compact_1') as any
 
     expect(el.element_id).toBe('context_compact_1')
     expect(el.tag).toBe('markdown')
     expect(el.content).toContain('🚨🚨🚨 CONTEXT COMPACTED / 上下文已压缩 🚨🚨🚨')
     expect(el.content).toContain('压缩发生在这里')
+    expect(el.content).toContain('- 事件: event_msg')
+    expect(el.content).toContain('- 类型: context_compacted')
     expect(el.content).toContain('- 序号: 2')
     expect(el.content).toContain('- thread: thread-123')
     expect(el.content).toContain('- turn: turn-456')

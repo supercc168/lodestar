@@ -1824,7 +1824,7 @@ export class Session {
   private handleContextCompacted(notice: ContextCompactedNotification): void {
     const turn = this.currentTurn
     if (!turn) {
-      log(`session "${this.sessionName}": thread/compacted with no current turn`)
+      log(`session "${this.sessionName}": context compacted with no current turn`)
       void feishu.sendTextRaw(this.chatId, '🚨🚨🚨 CONTEXT COMPACTED / 上下文已压缩 🚨🚨🚨\n\nCodex 报告发生了上下文压缩,但当前没有可写的对话卡片。')
       return
     }
@@ -1834,6 +1834,7 @@ export class Session {
     this.maybeMidTurnRotate()
     const i = turn.contextCompactCount++
     const elementId = cards.ELEMENTS.contextCompact(i)
+    log(`session "${this.sessionName}": context compacted marker #${i + 1}`)
     void cardkit.addElement(turn.cardId, cards.contextCompactionElement(i, notice, elementId), {
       type: 'insert_before',
       targetElementId: cards.ELEMENTS.footer,

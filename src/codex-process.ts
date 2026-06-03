@@ -105,6 +105,8 @@ export interface ContextCompactedNotification {
   threadId?: string
   turnId?: string
   itemId?: string
+  sourceMethod?: string
+  sourceType?: string
   [key: string]: unknown
 }
 
@@ -265,6 +267,12 @@ export class CodexProcess extends EventEmitter {
   }
 
   private handleNotification(method: string, params: any): void {
+    const compaction = contextCompactionNoticeFromNotification(method, params)
+    if (compaction) {
+      log(`codex-process: context compacted via ${compaction.sourceMethod ?? method}`)
+      this.emit('context_compacted', compaction)
+      return
+    }
     switch (method) {
       case 'thread/started': {
         const thread = params.thread
@@ -303,10 +311,6 @@ export class CodexProcess extends EventEmitter {
             turnId: params.turnId,
           })
         }
-        return
-      }
-      case 'thread/compacted': {
-        this.emit('context_compacted', params as ContextCompactedNotification)
         return
       }
       case 'turn/started': {
@@ -695,6 +699,80 @@ export class CodexProcess extends EventEmitter {
 
 function numberOrUndefined(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined
+}
+
+const COMPACTION_METHODS = new Set([
+  'thread/compacted',
+  'context/compacted',
+  'context_compacted',
+  'contextCompacted',
+])
+
+const COMPACTION_TYPES = new Set([
+  'compacted',
+  'compaction',
+  'compaction_trigger',
+  'context_compacted',
+  'context_compaction',
+  'contextCompaction',
+  'ContextCompaction',
+])
+
+function stringOrUndefined(v: unknown): string | undefined {
+  return typeof v === 'string' && v ? v : undefined
+}
+
+function objectOrNull(v: unknown): Record<string, unknown> | null {
+  return v != null && typeof v === 'object' ? v as Record<string, unknown> : null
+}
+
+function compactionTypeOf(v: unknown): string | null {
+  if (typeof v !== 'string') return null
+  return COMPACTION_TYPES.has(v) ? v : null
+}
+
+/** Codex exposes context compaction through more than one surface:
+ * `thread/compacted` notifications in the app-server protocol, raw response
+ * items in newer builds, and `event_msg {type:"context_compacted"}` in the
+ * persisted rollout stream. Match only structured type/method fields; never
+ * scan free-form text, because prompts and instructions may legitimately
+ * mention compaction without an event having occurred. */
+export function contextCompactionNoticeFromNotification(
+  method: string,
+  params: unknown,
+): ContextCompactedNotification | null {
+  const root = objectOrNull(params) ?? {}
+  const candidates = [
+    root,
+    objectOrNull(root.event),
+    objectOrNull(root.payload),
+    objectOrNull(root.item),
+    objectOrNull(root.responseItem),
+    objectOrNull(root.rawItem),
+  ].filter((v): v is Record<string, unknown> => v != null)
+
+  let sourceType: string | null = null
+  for (const candidate of candidates) {
+    sourceType = compactionTypeOf(candidate.type)
+    if (sourceType) break
+  }
+
+  if (!COMPACTION_METHODS.has(method) && !sourceType) return null
+
+  const item = objectOrNull(root.item) ?? objectOrNull(root.responseItem) ?? objectOrNull(root.rawItem) ?? {}
+  return {
+    ...root,
+    threadId: stringOrUndefined(root.threadId) ?? stringOrUndefined(root.thread_id),
+    turnId: stringOrUndefined(root.turnId) ?? stringOrUndefined(root.turn_id),
+    itemId:
+      stringOrUndefined(root.itemId) ??
+      stringOrUndefined(root.item_id) ??
+      stringOrUndefined(item.id) ??
+      stringOrUndefined(item.itemId) ??
+      stringOrUndefined(item.item_id),
+    sourceMethod: method,
+    sourceType: sourceType ?? method,
+  }
 }
 
 function mapStartedItem(item: any, workDir: string): { name: string; input: any } | null {
