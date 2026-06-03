@@ -13,6 +13,7 @@
  *   daemon.log              — append-only run log           (in DATA_DIR)
  *   session-chat-map.json   — duplicate-name routing        (in DATA_DIR)
  *   session-resume-map.json — last-known Codex thread_id  (in DATA_DIR)
+ *   session-model-map.json  — per-session selected Codex model (in DATA_DIR)
  *   inbox/                  — downloaded attachments        (in DATA_DIR)
  */
 
@@ -61,6 +62,7 @@ export const PID_FILE = join(DATA_DIR, 'daemon.pid')
 export const LOG_FILE = join(DATA_DIR, 'daemon.log')
 export const SESSION_CHAT_MAP_FILE = join(DATA_DIR, 'session-chat-map.json')
 export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
+export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
 /** Marker file written at shutdown listing the session names that
  * were still alive. The next daemon boot reads it
  * to auto-revive those sessions via `restart(true)` — bridges the

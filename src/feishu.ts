@@ -20,6 +20,7 @@ import {
   DATA_DIR,
   INBOX_DIR,
   SESSION_CHAT_MAP_FILE,
+  SESSION_MODEL_MAP_FILE,
   SESSION_RESUME_MAP_FILE,
 } from './paths'
 import { log } from './log'
@@ -122,6 +123,41 @@ export function bindSessionResume(sessionName: string, sessionId: string): void 
 
 export function getSessionResume(sessionName: string): string | null {
   return lastSessionIdByName.get(sessionName) ?? null
+}
+
+// ── Session model map ────────────────────────────────────────────────
+// `sessionName → selected Codex model`. This is a Lodestar preference,
+// not a global Codex config edit: each Feishu group can choose a model
+// independently and the selection is reapplied on thread start/resume.
+const selectedModelByName = new Map<string, string>()
+
+export function loadSessionModelMap(): void {
+  try {
+    const obj = JSON.parse(readFileSync(SESSION_MODEL_MAP_FILE, 'utf8'))
+    for (const [name, model] of Object.entries(obj)) {
+      if (typeof model === 'string' && model.trim()) selectedModelByName.set(name, model)
+    }
+    log(`feishu: loaded ${selectedModelByName.size} session→model bindings`)
+  } catch {}
+}
+
+function saveSessionModelMap(): void {
+  try {
+    const obj: Record<string, string> = {}
+    for (const [k, v] of selectedModelByName) obj[k] = v
+    mkdirSync(DATA_DIR, { recursive: true })
+    writeFileSync(SESSION_MODEL_MAP_FILE, JSON.stringify(obj, null, 2))
+  } catch (e) { log(`feishu: save session-model-map failed: ${e}`) }
+}
+
+export function bindSessionModel(sessionName: string, model: string): void {
+  if (selectedModelByName.get(sessionName) === model) return
+  selectedModelByName.set(sessionName, model)
+  saveSessionModelMap()
+}
+
+export function getSessionModel(sessionName: string): string | null {
+  return selectedModelByName.get(sessionName) ?? null
 }
 
 // ── Alive-on-shutdown marker ──────────────────────────────────────────

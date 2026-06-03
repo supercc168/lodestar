@@ -138,6 +138,15 @@ export interface CodexResultMeta {
   is_error: boolean
 }
 
+export interface CodexModel {
+  id: string
+  model: string
+  displayName: string
+  description: string
+  hidden: boolean
+  isDefault: boolean
+}
+
 type PendingRequest = {
   resolve: (v: any) => void
   reject: (e: Error) => void
@@ -161,6 +170,7 @@ export class CodexProcess extends EventEmitter {
   private expectedExit = false
   private opts: SpawnOpts
   private readyPromise: Promise<void> | null = null
+  private catalogInitPromise: Promise<void> | null = null
   private currentTurnId: string | null = null
 
   sessionId: string | null = null
@@ -537,11 +547,26 @@ export class CodexProcess extends EventEmitter {
     }
   }
 
-  private async initializeAndStartThread(): Promise<void> {
-    await this.request('initialize', {
+  private initializeParams(): Record<string, unknown> {
+    return {
       clientInfo: { name: 'lodestar', version: '0.0.0' },
       capabilities: { experimentalApi: true, requestAttestation: false },
-    })
+    }
+  }
+
+  private async ensureCatalogReady(): Promise<void> {
+    if (this.readyPromise) {
+      await this.readyPromise
+      return
+    }
+    if (!this.catalogInitPromise) {
+      this.catalogInitPromise = this.request('initialize', this.initializeParams()).then(() => {})
+    }
+    await this.catalogInitPromise
+  }
+
+  private async initializeAndStartThread(): Promise<void> {
+    await this.request('initialize', this.initializeParams())
 
     const params = this.threadParams()
     const res = this.opts.resumeSessionId
@@ -579,6 +604,48 @@ export class CodexProcess extends EventEmitter {
   sendUserText(text: string, files: string[] = []): void {
     const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
     void this.startTurn(fileHints + text).catch(e => this.failTurnStart(e))
+  }
+
+  async listModels(): Promise<CodexModel[]> {
+    await this.ensureCatalogReady()
+    const models: CodexModel[] = []
+    let cursor: string | null = null
+    do {
+      const res = await this.request('model/list', {
+        cursor,
+        limit: 100,
+        includeHidden: false,
+      })
+      if (!Array.isArray(res?.data)) {
+        throw new Error('model/list returned no data array')
+      }
+      for (const raw of res.data) {
+        if (typeof raw?.model !== 'string' || !raw.model) continue
+        models.push({
+          id: typeof raw.id === 'string' && raw.id ? raw.id : raw.model,
+          model: raw.model,
+          displayName: typeof raw.displayName === 'string' && raw.displayName ? raw.displayName : raw.model,
+          description: typeof raw.description === 'string' ? raw.description : '',
+          hidden: raw.hidden === true,
+          isDefault: raw.isDefault === true,
+        })
+      }
+      cursor = typeof res?.nextCursor === 'string' && res.nextCursor ? res.nextCursor : null
+    } while (cursor)
+    return models
+  }
+
+  async setModel(model: string): Promise<void> {
+    if (!model.trim()) throw new Error('empty model')
+    if (!this.readyPromise) throw new Error('codex thread not initialized')
+    await this.readyPromise
+    if (!this.sessionId) throw new Error('codex thread not initialized')
+    await this.request('thread/settings/update', {
+      threadId: this.sessionId,
+      model,
+    })
+    this.opts.model = model
+    this.lastModel = model
   }
 
   private failTurnStart(e: unknown): void {

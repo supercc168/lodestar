@@ -51,6 +51,20 @@ interface StatusCardOpts {
   template?: 'blue' | 'green' | 'orange' | 'red' | 'grey' | 'turquoise'
 }
 
+export interface ModelChoice {
+  model: string
+  displayName: string
+  description?: string
+  isDefault?: boolean
+  selected?: boolean
+}
+
+interface ModelSelectionCardOpts {
+  sessionName: string
+  currentModel?: string | null
+  models: ModelChoice[]
+}
+
 export function statusCardContent(_title: string, status: string): string {
   return status
 }
@@ -386,6 +400,83 @@ export function menuCard(opts: MenuOpts): object {
       ],
     },
   }
+}
+
+export function modelSelectionCard(opts: ModelSelectionCardOpts): object {
+  const current = opts.currentModel ? inlineCode(opts.currentModel) : '_未选择_'
+  return {
+    schema: '2.0',
+    config: { update_multi: true },
+    header: {
+      title: { tag: 'plain_text', content: `🤖 model · ${opts.sessionName}` },
+      template: 'turquoise',
+    },
+    body: {
+      elements: [
+        {
+          tag: 'markdown',
+          content: `当前选择: ${current}\n选择后会写入本 session,后续 turn 使用该模型。`,
+        },
+        ...(opts.models.length
+          ? opts.models.map(modelChoiceElement)
+          : [{ tag: 'markdown', content: '_Codex 未返回可用模型列表_' }]),
+      ],
+    },
+  }
+}
+
+function modelChoiceElement(model: ModelChoice): object {
+  const title = model.displayName && model.displayName !== model.model
+    ? `**${escapeMarkdown(model.displayName)}**`
+    : `**${inlineCode(model.model)}**`
+  const flags = [
+    model.isDefault ? 'Codex 默认' : '',
+    model.selected ? '当前选择' : '',
+  ].filter(Boolean)
+  const desc = model.description
+    ? '\n' + escapeMarkdown(truncate(model.description, 110))
+    : ''
+  return {
+    tag: 'column_set',
+    columns: [
+      {
+        tag: 'column',
+        width: 'weighted',
+        weight: 4,
+        elements: [{
+          tag: 'markdown',
+          content: [
+            title,
+            inlineCode(model.model),
+            flags.length ? flags.join(' · ') : '',
+          ].filter(Boolean).join('\n') + desc,
+        }],
+      },
+      {
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: model.selected ? '当前' : '选择' },
+          type: model.selected ? 'primary' : 'default',
+          behaviors: [{ type: 'callback', value: { kind: 'model_select', model: model.model } }],
+        }],
+      },
+    ],
+  }
+}
+
+function truncate(s: string, max: number): string {
+  return s.length <= max ? s : s.slice(0, max - 1) + '…'
+}
+
+function escapeMarkdown(s: string): string {
+  return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;')
+}
+
+function inlineCode(s: string): string {
+  return '`' + s.replace(/`/g, '\\`') + '`'
 }
 
 /** Settings patch applied when a turn finishes — flips streaming off

@@ -31,11 +31,13 @@ export {
 } from './cards/turn'
 export {
   type ConsoleOpts,
+  type ModelChoice,
   consoleUsageContent,
   consoleUsageElement,
   consoleMainElement,
   consoleBodyElements,
   consoleCard,
+  modelSelectionCard,
   statusCard,
   statusCardContent,
   menuCard,
