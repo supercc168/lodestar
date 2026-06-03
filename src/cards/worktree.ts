@@ -16,6 +16,7 @@ export interface WorktreeListCardOpts {
   projectName: string
   projectDir: string
   entries: WorktreeCardEntry[]
+  hiddenMergedUnmountedCount?: number
 }
 
 export interface WorktreeNoticeCardOpts {
@@ -27,6 +28,7 @@ export interface WorktreeNoticeCardOpts {
 }
 
 export function worktreeListCard(opts: WorktreeListCardOpts): object {
+  const summary = worktreeListSummary(opts)
   return {
     schema: '2.0',
     config: { update_multi: true },
@@ -36,34 +38,39 @@ export function worktreeListCard(opts: WorktreeListCardOpts): object {
     },
     body: {
       elements: [
-        {
-          tag: 'markdown',
-          content: opts.entries.length
-            ? `${opts.entries.length} 个工作分支`
-            : `_无 work/* 分支。发 ${inlineCode('wt name')} 创建。_`,
-        },
+        ...(summary ? [{ tag: 'markdown', content: summary }] : []),
         ...opts.entries.flatMap(worktreeEntryElements),
       ],
     },
   }
 }
 
+function worktreeListSummary(opts: WorktreeListCardOpts): string {
+  const hidden = opts.hiddenMergedUnmountedCount ?? 0
+  if (!opts.entries.length && hidden === 0) {
+    return `_无 work/* 分支。发 ${inlineCode('wt name')} 创建。_`
+  }
+
+  if (hidden > 0) return `${hidden}个已归档分支`
+  return ''
+}
+
 function worktreeEntryElements(entry: WorktreeCardEntry): object[] {
   const repoState = entry.error
-    ? 'err'
-    : entry.mounted
-      ? entry.dirtyCount && entry.dirtyCount > 0
-        ? `dirty ${entry.dirtyCount}`
-        : entry.state === 'merged'
-          ? 'merged'
-          : entry.state === 'stale'
-            ? 'stale'
-            : 'clean'
-      : 'off'
+    ? '出错'
+    : entry.mounted && entry.dirtyCount && entry.dirtyCount > 0
+      ? `有未提交改动 ${entry.dirtyCount}`
+      : entry.state === 'merged'
+        ? '已合并'
+        : entry.state === 'stale'
+          ? '两边都有新改动'
+          : entry.mounted
+            ? '进行中'
+            : '未挂载'
   const chatState = entry.duplicateChatCount > 1
-    ? `群重复 ${entry.duplicateChatCount}`
+    ? `群重复 ${entry.duplicateChatCount} 个`
     : entry.chatId
-      ? '群 OK'
+      ? '群正常'
       : '无群'
   const columns: object[] = [{
     tag: 'column',

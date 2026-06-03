@@ -691,11 +691,16 @@ export class Session {
     const projectDir = this.worktreeProjectDir()
     try {
       const entries = worktree.listProjectWorktrees(projectDir, projectName)
+      const hiddenMergedUnmountedCount = entries.filter(
+        entry => entry.state === 'merged' && !entry.mounted,
+      ).length
+      const visibleEntries = entries.filter(entry => entry.state !== 'merged' || entry.mounted)
       const chatIndex = await feishu.listNormalChatIdsByName()
       const card = cards.worktreeListCard({
         projectName,
         projectDir,
-        entries: entries.map(entry => {
+        hiddenMergedUnmountedCount,
+        entries: visibleEntries.map(entry => {
           const ids = chatIndex.get(entry.chatName) ?? []
           const preferred = feishu.preferredChatForSession.get(entry.chatName)
           const chatId = preferred && ids.includes(preferred)
