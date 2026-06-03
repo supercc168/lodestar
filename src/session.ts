@@ -15,12 +15,15 @@
  */
 
 import { existsSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import {
   CODEX_EFFORT,
   CodexProcess,
+  isCodexReasoningEffort,
   type CanUseToolRequest,
   type CodexModel,
+  type CodexReasoningEffort,
   type CodexUsage,
   type ContextCompactedNotification,
   type HookCallbackRequest,
@@ -50,6 +53,11 @@ const FOOTER_THINKING_PREFIX = 'Thinking...'
 const FOOTER_WORKING = 'Working...'
 const RESUME_INIT_NOTICE_MS = 10_000
 const RESUME_INIT_TIMEOUT_MS = 120_000
+
+interface ModelPanelState {
+  cardId: string | null
+  models: cards.ModelChoice[]
+}
 
 function messageOf(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
@@ -248,6 +256,8 @@ export class Session {
   // exits before the turn finishes.
   private lastSessionId: string | null = null
   private selectedModel: string | null = null
+  private selectedEffort: CodexReasoningEffort | null = null
+  private modelPanels = new Map<string, ModelPanelState>()
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
   private lastTurnDelta: LastTurnDelta | null = null
@@ -265,9 +275,11 @@ export class Session {
     if (this.lastSessionId) {
       log(`session "${sessionName}": restored lastSessionId=${this.lastSessionId.slice(0, 8)}…`)
     }
-    this.selectedModel = feishu.getSessionModel(sessionName)
+    const selection = feishu.getSessionModelSelection(sessionName)
+    this.selectedModel = selection?.model ?? null
+    this.selectedEffort = selection?.effort ?? null
     if (this.selectedModel) {
-      log(`session "${sessionName}": restored selected model=${this.selectedModel}`)
+      log(`session "${sessionName}": restored selected model=${this.selectedModel} effort=${this.selectedEffort ?? 'unset'}`)
     }
   }
 
@@ -288,19 +300,31 @@ export class Session {
     return this.selectedModel ?? undefined
   }
 
+  private effortForSpawn(): CodexReasoningEffort {
+    return this.selectedEffort ?? CODEX_EFFORT
+  }
+
   private currentModelLabel(): string | null {
     return this.selectedModel ?? this.proc?.lastModel ?? null
   }
 
-  private withModel(text: string): string {
+  private currentEffortLabel(): CodexReasoningEffort {
+    return this.selectedEffort ?? this.proc?.lastEffort ?? CODEX_EFFORT
+  }
+
+  private modelEffortLabel(): string {
     const model = this.currentModelLabel()
-    if (!model || text.includes('model=')) return text
-    return `${text} · model=${model}`
+    const effort = this.currentEffortLabel()
+    return model ? `${model}/${effort}` : effort
+  }
+
+  private withModel(text: string): string {
+    const label = this.modelEffortLabel()
+    return text.includes(label) ? text : `${text} · ${label}`
   }
 
   private modelLine(): string {
-    const model = this.currentModelLabel()
-    return model ? `model=${model}` : ''
+    return this.modelEffortLabel()
   }
 
   private startFooterTimer(
@@ -430,7 +454,7 @@ export class Session {
     this.proc = new CodexProcess({
       workDir: this.workDir,
       model: this.modelForSpawn(),
-      effort: CODEX_EFFORT,
+      effort: this.effortForSpawn(),
       appendSystemPrompt: CHANNEL_INSTRUCTIONS,
     })
     this.wireProc(this.proc)
@@ -628,7 +652,7 @@ export class Session {
       this.proc = new CodexProcess({
         workDir: this.workDir,
         model: this.modelForSpawn(),
-        effort: CODEX_EFFORT,
+        effort: this.effortForSpawn(),
         resumeSessionId: prevSessionId,
         appendSystemPrompt: CHANNEL_INSTRUCTIONS,
       })
@@ -785,7 +809,7 @@ export class Session {
     }
     const proc = new CodexProcess({
       workDir: this.modelListCwd(),
-      effort: CODEX_EFFORT,
+      effort: this.effortForSpawn(),
       appendSystemPrompt: CHANNEL_INSTRUCTIONS,
     })
     try {
@@ -806,8 +830,39 @@ export class Session {
       return
     }
 
+    const panelId = randomUUID()
+    const currentModel = this.currentModelLabel()
+    const currentEffort = this.currentEffortLabel()
+    const choices = this.modelChoices(models)
+    this.modelPanels.set(panelId, { cardId: null, models: choices })
+    const messageId = await feishu.sendCard(this.chatId, cards.modelSelectionCard({
+      sessionName: this.sessionName,
+      panelId,
+      currentModel,
+      currentEffort,
+      models: choices,
+    }))
+    if (!messageId) {
+      this.modelPanels.delete(panelId)
+      await feishu.sendTextRaw(this.chatId, '❌ 模型面板发送失败')
+      return
+    }
+    try {
+      const cardId = await cardkit.convertMessageToCard(messageId)
+      const state = this.modelPanels.get(panelId)
+      if (state) state.cardId = cardId
+      cardkit.recordCardCreated(cardId, 1)
+    } catch (e) {
+      this.modelPanels.delete(panelId)
+      log(`session "${this.sessionName}": model card id_convert failed: ${e}`)
+      await feishu.sendTextRaw(this.chatId, '❌ 模型面板初始化失败')
+    }
+  }
+
+  private modelChoices(models: CodexModel[]): cards.ModelChoice[] {
     const seen = new Set<string>()
     const currentModel = this.currentModelLabel()
+    const currentEffort = this.currentEffortLabel()
     const choices: cards.ModelChoice[] = []
     for (const m of models) {
       if (seen.has(m.model)) continue
@@ -818,42 +873,109 @@ export class Session {
         description: m.description,
         isDefault: m.isDefault,
         selected: currentModel === m.model,
+        efforts: m.supportedReasoningEfforts.map(effort => ({
+          effort: effort.reasoningEffort,
+          description: effort.description,
+          isDefault: m.defaultReasoningEffort === effort.reasoningEffort,
+          selected: currentModel === m.model && currentEffort === effort.reasoningEffort,
+        })),
       })
     }
-    const messageId = await feishu.sendCard(this.chatId, cards.modelSelectionCard({
-      sessionName: this.sessionName,
-      currentModel,
-      models: choices,
-    }))
-    if (!messageId) {
-      await feishu.sendTextRaw(this.chatId, '❌ 模型面板发送失败')
-    }
+    return choices
   }
 
-  async onModelSelect(modelRaw: string, _userOpenId = ''): Promise<{ ok: boolean; message: string }> {
+  private initialEffortForModel(model: cards.ModelChoice): string | null {
+    const currentEffort = this.currentEffortLabel()
+    if (model.selected && model.efforts.some(effort => effort.effort === currentEffort)) return currentEffort
+    return model.efforts.find(effort => effort.isDefault)?.effort ?? model.efforts[0]?.effort ?? null
+  }
+
+  private modelSelectionScope(): string {
+    return this.currentTurn
+      ? '当前 turn 不变,下一轮开始使用。'
+      : this.proc?.isAlive()
+        ? '下一轮开始使用。'
+        : '下次启动 Codex 时使用。'
+  }
+
+  async onModelSelect(modelRaw: string, panelIdRaw = '', _userOpenId = ''): Promise<{ ok: boolean; message: string }> {
     const model = modelRaw.trim()
     if (!model) {
       const message = '模型为空'
       await feishu.sendText(this.chatId, `❌ ${message}`)
       return { ok: false, message }
     }
+    const panelId = panelIdRaw.trim()
+    const panel = this.modelPanels.get(panelId)
+    if (!panel?.cardId) {
+      return { ok: false, message: '模型面板已过期,请重新发送 model' }
+    }
+    const choice = panel.models.find(m => m.model === model)
+    if (!choice) {
+      return { ok: false, message: '模型不在当前面板列表中,请重新发送 model' }
+    }
+    const selectedEffort = this.initialEffortForModel(choice)
+    try {
+      await cardkit.replaceElement(panel.cardId, cards.ELEMENTS.modelPanel, cards.modelEffortPanelElement({
+        sessionName: this.sessionName,
+        panelId,
+        currentModel: this.currentModelLabel(),
+        currentEffort: this.currentEffortLabel(),
+        selectedModel: choice,
+        selectedEffort,
+      }))
+      return {
+        ok: choice.efforts.length > 0,
+        message: choice.efforts.length > 0 ? `已选择模型 ${model},请选择 effort` : '这个模型未返回可用 effort',
+      }
+    } catch (e) {
+      const message = `模型面板更新失败: ${messageOf(e)}`
+      log(`session "${this.sessionName}": model panel update failed: ${messageOf(e)}`)
+      await feishu.sendText(this.chatId, `❌ ${message}`)
+      return { ok: false, message }
+    }
+  }
+
+  async onModelEffortSelect(modelRaw: string, effortRaw: string, panelIdRaw = '', _userOpenId = ''): Promise<{ ok: boolean; message: string }> {
+    const model = modelRaw.trim()
+    const effortValue = effortRaw.trim()
+    if (!model) return { ok: false, message: '模型为空' }
+    if (!isCodexReasoningEffort(effortValue)) return { ok: false, message: 'reasoning effort 无效' }
+    const effort: CodexReasoningEffort = effortValue
+    const panelId = panelIdRaw.trim()
+    const panel = this.modelPanels.get(panelId)
+    if (!panel?.cardId) {
+      return { ok: false, message: '模型面板已过期,请重新发送 model' }
+    }
+    const choice = panel.models.find(m => m.model === model)
+    if (!choice) return { ok: false, message: '模型不在当前面板列表中,请重新发送 model' }
+    if (!choice.efforts.some(item => item.effort === effort)) {
+      return { ok: false, message: 'reasoning effort 不属于该模型' }
+    }
     try {
       if (this.proc?.isAlive()) {
-        await withTimeout(this.proc.setModel(model), 20_000, 'thread/settings/update')
+        await withTimeout(this.proc.setModelSettings(model, effort), 20_000, 'thread/settings/update')
       }
       this.selectedModel = model
-      feishu.bindSessionModel(this.sessionName, model)
-      const scope = this.currentTurn
-        ? '当前 turn 不变,下一轮开始使用。'
-        : this.proc?.isAlive()
-          ? '下一轮开始使用。'
-          : '下次启动 Codex 时使用。'
-      const message = `✅ 已选择 model=${model}\n${scope}`
-      await feishu.sendText(this.chatId, message)
-      return { ok: true, message: `已选择 ${model}` }
+      this.selectedEffort = effort
+      feishu.bindSessionModel(this.sessionName, model, effort)
+      const scope = this.modelSelectionScope()
+      try {
+        await cardkit.replaceElement(panel.cardId, cards.ELEMENTS.modelPanel, cards.modelResultPanelElement({
+          sessionName: this.sessionName,
+          model,
+          effort,
+          scope,
+        }))
+      } catch (e) {
+        log(`session "${this.sessionName}": model result panel update failed: ${e}`)
+        await feishu.sendText(this.chatId, `✅ 已选择 ${model}/${effort}\n${scope}`)
+      }
+      this.modelPanels.delete(panelId)
+      return { ok: true, message: `已选择 ${model} / ${effort}` }
     } catch (e) {
       const message = `模型切换失败: ${messageOf(e)}`
-      log(`session "${this.sessionName}": set model failed: ${messageOf(e)}`)
+      log(`session "${this.sessionName}": set model settings failed: ${messageOf(e)}`)
       await feishu.sendText(this.chatId, `❌ ${message}`)
       return { ok: false, message }
     }
@@ -1084,7 +1206,7 @@ export class Session {
       sessionName: this.sessionName,
       status: this.status,
       model,
-      effort: CODEX_EFFORT,
+      effort: this.currentEffortLabel(),
       uptimeMs,
       peers: [...Session.all]
         .filter(s => s.isRunning())
@@ -1685,7 +1807,7 @@ export class Session {
       sessionName: this.sessionName,
       turn,
       model: this.currentModelLabel() ?? undefined,
-      effort: CODEX_EFFORT,
+      effort: this.currentEffortLabel(),
       kind: trigger,
       userInputs,
       initialFooter,
@@ -1826,7 +1948,8 @@ export class Session {
         const card = cards.mainConversationCard({
           sessionName: this.sessionName,
           turn: this.turnCounter,
-          effort: CODEX_EFFORT,
+          model: this.currentModelLabel() ?? undefined,
+          effort: this.currentEffortLabel(),
           kind: 'card_full',
           userInputs: [],
         })

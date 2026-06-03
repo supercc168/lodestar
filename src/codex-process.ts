@@ -64,7 +64,16 @@ export interface SpawnOpts {
 }
 
 export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+export interface CodexReasoningEffortOption {
+  reasoningEffort: CodexReasoningEffort
+  description: string
+}
+export const CODEX_REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const
 export const CODEX_EFFORT: CodexReasoningEffort = 'xhigh'
+
+export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
+  return typeof value === 'string' && CODEX_REASONING_EFFORTS.includes(value as CodexReasoningEffort)
+}
 
 export interface CanUseToolRequest {
   request_id: string
@@ -145,6 +154,28 @@ export interface CodexModel {
   description: string
   hidden: boolean
   isDefault: boolean
+  supportedReasoningEfforts: CodexReasoningEffortOption[]
+  defaultReasoningEffort: CodexReasoningEffort | null
+}
+
+function parseReasoningEffortOptions(raw: unknown): CodexReasoningEffortOption[] {
+  if (!Array.isArray(raw)) return []
+  const seen = new Set<CodexReasoningEffort>()
+  const options: CodexReasoningEffortOption[] = []
+  for (const item of raw) {
+    const effort = typeof item === 'string'
+      ? item
+      : typeof item === 'object' && item
+        ? (item as { reasoningEffort?: unknown }).reasoningEffort
+        : null
+    if (!isCodexReasoningEffort(effort) || seen.has(effort)) continue
+    seen.add(effort)
+    const description = typeof item === 'object' && item && typeof (item as { description?: unknown }).description === 'string'
+      ? (item as { description: string }).description
+      : ''
+    options.push({ reasoningEffort: effort, description })
+  }
+  return options
 }
 
 type PendingRequest = {
@@ -176,6 +207,7 @@ export class CodexProcess extends EventEmitter {
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
   lastModel: string | null = null
+  lastEffort: CodexReasoningEffort | null = null
   lastUsage: CodexUsage | null = null
   lastResult: CodexResultMeta = {
     cost_usd: null, cost_delta_usd: null, duration_ms: null, num_turns: null,
@@ -292,6 +324,7 @@ export class CodexProcess extends EventEmitter {
       case 'thread/settings/updated': {
         const settings = params.threadSettings
         if (typeof settings?.model === 'string') this.lastModel = settings.model
+        if (isCodexReasoningEffort(settings?.effort)) this.lastEffort = settings.effort
         return
       }
       case 'thread/tokenUsage/updated': {
@@ -584,6 +617,8 @@ export class CodexProcess extends EventEmitter {
     const thread = res?.thread
     this.sessionId = thread?.id ?? this.opts.resumeSessionId ?? null
     if (res?.model) this.lastModel = res.model
+    if (isCodexReasoningEffort(res?.reasoningEffort)) this.lastEffort = res.reasoningEffort
+    else this.lastEffort = this.opts.effort
     log(`codex-process: thread=${this.sessionId}`)
     this.emit('init', { session_id: this.sessionId, thread })
   }
@@ -628,6 +663,10 @@ export class CodexProcess extends EventEmitter {
           description: typeof raw.description === 'string' ? raw.description : '',
           hidden: raw.hidden === true,
           isDefault: raw.isDefault === true,
+          supportedReasoningEfforts: parseReasoningEffortOptions(raw.supportedReasoningEfforts),
+          defaultReasoningEffort: isCodexReasoningEffort(raw.defaultReasoningEffort)
+            ? raw.defaultReasoningEffort
+            : null,
         })
       }
       cursor = typeof res?.nextCursor === 'string' && res.nextCursor ? res.nextCursor : null
@@ -635,17 +674,25 @@ export class CodexProcess extends EventEmitter {
     return models
   }
 
-  async setModel(model: string): Promise<void> {
+  async setModelSettings(model: string, effort: CodexReasoningEffort): Promise<void> {
     if (!model.trim()) throw new Error('empty model')
+    if (!isCodexReasoningEffort(effort)) throw new Error(`invalid reasoning effort: ${String(effort)}`)
     if (!this.readyPromise) throw new Error('codex thread not initialized')
     await this.readyPromise
     if (!this.sessionId) throw new Error('codex thread not initialized')
     await this.request('thread/settings/update', {
       threadId: this.sessionId,
       model,
+      effort,
     })
     this.opts.model = model
+    this.opts.effort = effort
     this.lastModel = model
+    this.lastEffort = effort
+  }
+
+  async setModel(model: string): Promise<void> {
+    await this.setModelSettings(model, this.opts.effort)
   }
 
   private failTurnStart(e: unknown): void {

@@ -31,6 +31,7 @@ export {
 } from './cards/turn'
 export {
   type ConsoleOpts,
+  type ModelEffortChoice,
   type ModelChoice,
   consoleUsageContent,
   consoleUsageElement,
@@ -38,6 +39,9 @@ export {
   consoleBodyElements,
   consoleCard,
   modelSelectionCard,
+  modelSelectionPanelElement,
+  modelEffortPanelElement,
+  modelResultPanelElement,
   statusCard,
   statusCardContent,
   menuCard,

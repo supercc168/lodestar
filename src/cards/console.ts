@@ -57,12 +57,38 @@ export interface ModelChoice {
   description?: string
   isDefault?: boolean
   selected?: boolean
+  efforts: ModelEffortChoice[]
+}
+
+export interface ModelEffortChoice {
+  effort: string
+  description?: string
+  isDefault?: boolean
+  selected?: boolean
 }
 
 interface ModelSelectionCardOpts {
   sessionName: string
+  panelId: string
   currentModel?: string | null
+  currentEffort?: string | null
   models: ModelChoice[]
+}
+
+interface ModelEffortPanelOpts {
+  sessionName: string
+  panelId: string
+  currentModel?: string | null
+  currentEffort?: string | null
+  selectedModel: ModelChoice
+  selectedEffort?: string | null
+}
+
+interface ModelResultPanelOpts {
+  sessionName: string
+  model: string
+  effort: string
+  scope: string
 }
 
 export function statusCardContent(_title: string, status: string): string {
@@ -403,7 +429,6 @@ export function menuCard(opts: MenuOpts): object {
 }
 
 export function modelSelectionCard(opts: ModelSelectionCardOpts): object {
-  const current = opts.currentModel ? inlineCode(opts.currentModel) : '_未选择_'
   return {
     schema: '2.0',
     config: { update_multi: true },
@@ -412,26 +437,84 @@ export function modelSelectionCard(opts: ModelSelectionCardOpts): object {
       template: 'turquoise',
     },
     body: {
-      elements: [
-        {
-          tag: 'markdown',
-          content: `当前选择: ${current}\n选择后会写入本 session,后续 turn 使用该模型。`,
-        },
-        ...(opts.models.length
-          ? opts.models.map(modelChoiceElement)
-          : [{ tag: 'markdown', content: '_Codex 未返回可用模型列表_' }]),
-      ],
+      elements: [modelSelectionPanelElement(opts)],
     },
   }
 }
 
-function modelChoiceElement(model: ModelChoice): object {
+export function modelSelectionPanelElement(opts: ModelSelectionCardOpts): object {
+  return {
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.modelPanel,
+    header: { title: { tag: 'plain_text', content: '选择模型' } },
+    expanded: true,
+    elements: [
+      {
+        tag: 'markdown',
+        content: [
+          `当前: ${settingsLine(opts.currentModel, opts.currentEffort)}`,
+          '先选择模型;下一步会选择 reasoning effort。',
+        ].join('\n'),
+      },
+      ...(opts.models.length
+        ? opts.models.map(model => modelChoiceElement(model, opts.panelId, opts.currentEffort))
+        : [{ tag: 'markdown', content: '_Codex 未返回可用模型列表_' }]),
+    ],
+  }
+}
+
+export function modelEffortPanelElement(opts: ModelEffortPanelOpts): object {
+  const selectedEffort = opts.selectedEffort ?? opts.currentEffort ?? null
+  const efforts = opts.selectedModel.efforts.map(effort => ({
+    ...effort,
+    selected: effort.effort === selectedEffort,
+  }))
+  return {
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.modelPanel,
+    header: { title: { tag: 'plain_text', content: '选择推理强度' } },
+    expanded: true,
+    elements: [
+      {
+        tag: 'markdown',
+        content: [
+          `已选: ${modelTitle(opts.selectedModel)}`,
+          `当前: ${settingsLine(opts.currentModel, opts.currentEffort)}`,
+          '请选择 reasoning effort,确认后写入本项目。',
+        ].join('\n'),
+      },
+      ...(efforts.length
+        ? efforts.map(effort => effortChoiceElement(opts.selectedModel.model, effort, opts.panelId))
+        : [{ tag: 'markdown', content: '_Codex 未返回这个模型的可用推理强度,无法完成切换。_' }]),
+    ],
+  }
+}
+
+export function modelResultPanelElement(opts: ModelResultPanelOpts): object {
+  return {
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.modelPanel,
+    header: { title: { tag: 'plain_text', content: '选择已保存' } },
+    expanded: true,
+    elements: [{
+      tag: 'markdown',
+      content: [
+        '**已保存**',
+        inlineCode(settingsText(opts.model, opts.effort)),
+        escapeMarkdown(opts.scope),
+      ].join('\n'),
+    }],
+  }
+}
+
+function modelChoiceElement(model: ModelChoice, panelId: string, currentEffort?: string | null): object {
   const title = model.displayName && model.displayName !== model.model
     ? `**${escapeMarkdown(model.displayName)}**`
     : `**${inlineCode(model.model)}**`
   const flags = [
     model.isDefault ? 'Codex 默认' : '',
-    model.selected ? '当前选择' : '',
+    model.selected ? '当前模型' : '',
+    model.selected && currentEffort ? currentEffort : '',
   ].filter(Boolean)
   const desc = model.description
     ? '\n' + escapeMarkdown(truncate(model.description, 110))
@@ -458,13 +541,68 @@ function modelChoiceElement(model: ModelChoice): object {
         weight: 1,
         elements: [{
           tag: 'button',
-          text: { tag: 'plain_text', content: model.selected ? '当前' : '选择' },
+          text: { tag: 'plain_text', content: model.selected ? '重选' : '选择' },
           type: model.selected ? 'primary' : 'default',
-          behaviors: [{ type: 'callback', value: { kind: 'model_select', model: model.model } }],
+          behaviors: [{ type: 'callback', value: { kind: 'model_select', panel_id: panelId, model: model.model } }],
         }],
       },
     ],
   }
+}
+
+function effortChoiceElement(model: string, effort: ModelEffortChoice, panelId: string): object {
+  const flags = [
+    effort.isDefault ? 'Codex 默认' : '',
+    effort.selected ? '当前 effort' : '',
+  ].filter(Boolean)
+  const desc = effort.description
+    ? '\n' + escapeMarkdown(truncate(effort.description, 110))
+    : ''
+  return {
+    tag: 'column_set',
+    columns: [
+      {
+        tag: 'column',
+        width: 'weighted',
+        weight: 4,
+        elements: [{
+          tag: 'markdown',
+          content: [
+            `**${inlineCode(effort.effort)}**`,
+            flags.length ? flags.join(' · ') : '',
+          ].filter(Boolean).join('\n') + desc,
+        }],
+      },
+      {
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: '选择' },
+          type: effort.selected ? 'primary' : 'default',
+          behaviors: [{ type: 'callback', value: { kind: 'model_effort_select', panel_id: panelId, model, effort: effort.effort } }],
+        }],
+      },
+    ],
+  }
+}
+
+function modelTitle(model: ModelChoice): string {
+  return model.displayName && model.displayName !== model.model
+    ? `${escapeMarkdown(model.displayName)} (${inlineCode(model.model)})`
+    : inlineCode(model.model)
+}
+
+function settingsLine(model?: string | null, effort?: string | null): string {
+  return inlineCode(settingsText(model, effort))
+}
+
+function settingsText(model?: string | null, effort?: string | null): string {
+  if (model && effort) return `${model}/${effort}`
+  if (model) return model
+  if (effort) return effort
+  return '未选择'
 }
 
 function truncate(s: string, max: number): string {

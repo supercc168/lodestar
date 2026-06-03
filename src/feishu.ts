@@ -14,7 +14,7 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
 import { config } from './config'
-import { resolveCodexBin } from './codex-process'
+import { isCodexReasoningEffort, type CodexReasoningEffort, resolveCodexBin } from './codex-process'
 import {
   ALIVE_MARKER_FILE,
   DATA_DIR,
@@ -126,16 +126,34 @@ export function getSessionResume(sessionName: string): string | null {
 }
 
 // ── Session model map ────────────────────────────────────────────────
-// `sessionName → selected Codex model`. This is a Lodestar preference,
-// not a global Codex config edit: each Feishu group can choose a model
-// independently and the selection is reapplied on thread start/resume.
-const selectedModelByName = new Map<string, string>()
+// `sessionName → selected Codex model+effort`. This is a Lodestar
+// preference, not a global Codex config edit: each Feishu group can
+// choose independently and the selection is reapplied on thread
+// start/resume. Loader accepts the older string value shape for
+// compatibility; saver writes the structured shape.
+export interface SessionModelSelection {
+  model: string
+  effort: CodexReasoningEffort | null
+}
+
+const selectedModelByName = new Map<string, SessionModelSelection>()
 
 export function loadSessionModelMap(): void {
   try {
     const obj = JSON.parse(readFileSync(SESSION_MODEL_MAP_FILE, 'utf8'))
-    for (const [name, model] of Object.entries(obj)) {
-      if (typeof model === 'string' && model.trim()) selectedModelByName.set(name, model)
+    for (const [name, selection] of Object.entries(obj)) {
+      if (typeof selection === 'string' && selection.trim()) {
+        selectedModelByName.set(name, { model: selection, effort: null })
+        continue
+      }
+      if (!selection || typeof selection !== 'object') continue
+      const model = (selection as { model?: unknown }).model
+      if (typeof model !== 'string' || !model.trim()) continue
+      const effort = (selection as { effort?: unknown }).effort
+      selectedModelByName.set(name, {
+        model,
+        effort: isCodexReasoningEffort(effort) ? effort : null,
+      })
     }
     log(`feishu: loaded ${selectedModelByName.size} session→model bindings`)
   } catch {}
@@ -143,21 +161,26 @@ export function loadSessionModelMap(): void {
 
 function saveSessionModelMap(): void {
   try {
-    const obj: Record<string, string> = {}
+    const obj: Record<string, SessionModelSelection> = {}
     for (const [k, v] of selectedModelByName) obj[k] = v
     mkdirSync(DATA_DIR, { recursive: true })
     writeFileSync(SESSION_MODEL_MAP_FILE, JSON.stringify(obj, null, 2))
   } catch (e) { log(`feishu: save session-model-map failed: ${e}`) }
 }
 
-export function bindSessionModel(sessionName: string, model: string): void {
-  if (selectedModelByName.get(sessionName) === model) return
-  selectedModelByName.set(sessionName, model)
+export function bindSessionModel(sessionName: string, model: string, effort: CodexReasoningEffort | null): void {
+  const prev = selectedModelByName.get(sessionName)
+  if (prev?.model === model && prev.effort === effort) return
+  selectedModelByName.set(sessionName, { model, effort })
   saveSessionModelMap()
 }
 
-export function getSessionModel(sessionName: string): string | null {
+export function getSessionModelSelection(sessionName: string): SessionModelSelection | null {
   return selectedModelByName.get(sessionName) ?? null
+}
+
+export function getSessionModel(sessionName: string): string | null {
+  return selectedModelByName.get(sessionName)?.model ?? null
 }
 
 // ── Alive-on-shutdown marker ──────────────────────────────────────────

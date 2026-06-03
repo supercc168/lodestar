@@ -378,8 +378,12 @@ async function handleCardAction(data: any): Promise<any> {
       await session.onUserMessage(`(menu choice ${value.choice + 1})`)
       return { toast: { type: 'success', content: 'OK' } }
     case 'model_select': {
-      const result = await session.onModelSelect(String(value.model ?? ''), userId)
-      return { toast: { type: result.ok ? 'success' : 'error', content: result.ok ? result.message : '切换失败，详情见群消息' } }
+      const result = await session.onModelSelect(String(value.model ?? ''), String(value.panel_id ?? ''), userId)
+      return { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
+    case 'model_effort_select': {
+      const result = await session.onModelEffortSelect(String(value.model ?? ''), String(value.effort ?? ''), String(value.panel_id ?? ''), userId)
+      return { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
     }
     case 'ask': {
       // Custom-text branch: form submit packages the input under
