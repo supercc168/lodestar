@@ -3,7 +3,9 @@ import { describe, expect, test } from 'bun:test'
 import { consoleCard } from './cards/console'
 import {
   contextLimitFromAppServer,
+  contextPercentSummary,
   contextRemainingPercent,
+  contextTokenRatioLabel,
   contextTokensFromUsage,
   contextUsedPercent,
 } from './context-window'
@@ -24,6 +26,9 @@ describe('context window display', () => {
     expect(limit).toBe(258_400)
     expect(contextRemainingPercent(35_211, limit)).toBe(91)
     expect(contextUsedPercent(35_211, limit)).toBe(9)
+    expect(contextPercentSummary(35_211, limit)).toEqual({ used: 9, remaining: 91 })
+    expect(contextTokenRatioLabel(70_123, limit)).toBe('70K/258K')
+    expect(contextTokenRatioLabel(70_123, null)).toBe('70K/--')
   })
 
   test('keeps missing or invalid app-server windows unknown', () => {
@@ -48,6 +53,7 @@ describe('context window display', () => {
     })
 
     expect(JSON.stringify(card)).toContain('35K / 258K')
-    expect(JSON.stringify(card)).toContain('(9% 占用)')
+    expect(JSON.stringify(card)).toContain('9% 占用 · 91% 剩余')
+    expect(JSON.stringify(card)).toContain('非累计, compact 后可下降')
   })
 })

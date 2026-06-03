@@ -29,3 +29,27 @@ export function contextUsedPercent(tokens: number, limit: number | null | undefi
   const remaining = contextRemainingPercent(tokens, limit)
   return remaining == null ? null : Math.min(100, Math.max(0, 100 - remaining))
 }
+
+export function contextPercentSummary(
+  tokens: number,
+  limit: number | null | undefined,
+): { used: number; remaining: number } | null {
+  const remaining = contextRemainingPercent(tokens, limit)
+  if (remaining == null) return null
+  return {
+    used: Math.min(100, Math.max(0, 100 - remaining)),
+    remaining,
+  }
+}
+
+function formatContextTokens(tokens: number): string {
+  const n = Math.max(0, tokens)
+  if (n < 1000) return String(Math.round(n))
+  if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0).replace(/\.0$/, '') + 'K'
+  return (n / 1_000_000).toFixed(n < 10_000_000 ? 1 : 0).replace(/\.0$/, '') + 'M'
+}
+
+export function contextTokenRatioLabel(tokens: number, limit: number | null | undefined): string {
+  const tokenText = formatContextTokens(tokens)
+  return limit != null && limit > 0 ? `${tokenText}/${formatContextTokens(limit)}` : `${tokenText}/--`
+}

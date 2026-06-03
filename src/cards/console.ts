@@ -6,7 +6,7 @@
 
 import { SERVICE_LABEL, type SysInfo } from '../sysinfo'
 import type { UsageSnapshot } from '../usage'
-import { contextUsedPercent } from '../context-window'
+import { contextPercentSummary } from '../context-window'
 import { ELEMENTS } from './elements'
 
 export interface ConsoleOpts {
@@ -289,10 +289,14 @@ export function consoleMainContent(opts: ConsoleOpts): string {
     // Show `/ limit (pct%)` only when Codex has reported an effective
     // context window. Unknown windows render tokens alone.
     if (contextLimit != null && contextLimit > 0) {
-      const pct = contextUsedPercent(contextTokens, contextLimit)
-      lines.push(`**📦 上下文**　${fmtTokens(contextTokens)} / ${fmtTokens(contextLimit)}　(${pct ?? 'MISS'}% 占用)`)
+      const pct = contextPercentSummary(contextTokens, contextLimit)
+      lines.push(
+        pct
+          ? `**🧠 活跃上下文**　${fmtTokens(contextTokens)} / ${fmtTokens(contextLimit)}　${pct.used}% 占用 · ${pct.remaining}% 剩余　_非累计, compact 后可下降_`
+          : `**🧠 活跃上下文**　${fmtTokens(contextTokens)} / ${fmtTokens(contextLimit)}　_百分比未知_`,
+      )
     } else {
-      lines.push(`**📦 上下文**　${fmtTokens(contextTokens)}　_模型窗口未知_`)
+      lines.push(`**🧠 活跃上下文**　${fmtTokens(contextTokens)}　_模型窗口未知_`)
     }
   }
   void uptimeMs // session-level uptime is already shown per-project in

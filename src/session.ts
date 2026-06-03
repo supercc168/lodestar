@@ -33,7 +33,7 @@ import * as feishu from './feishu'
 import { log } from './log'
 import { readSysInfo } from './sysinfo'
 import { readUsage, type UsageSnapshot } from './usage'
-import { contextLimitFromAppServer, contextTokensFromUsage, contextUsedPercent } from './context-window'
+import { contextLimitFromAppServer, contextTokenRatioLabel, contextTokensFromUsage } from './context-window'
 import { extractSendMarkerPaths } from './outbound-markers'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionTools from './session-tools'
@@ -2077,9 +2077,8 @@ export class Session {
     if (!suffix) {
       const ctxTokens = this.currentContextTokens()
       const ctxMax = this.contextLimitForDisplay()
-      const pct = ctxTokens == null ? null : contextUsedPercent(ctxTokens, ctxMax)
-      if (pct !== null) {
-        metrics += ` · 📊 ${pct}%`
+      if (ctxTokens !== null) {
+        metrics += ` · 🧠 ${contextTokenRatioLabel(ctxTokens, ctxMax)}`
       }
       const cost = this.lastTurnDelta?.costUsd ?? 0
       if (cost > 0) metrics += ` · 💰 $${cost.toFixed(3)}`
