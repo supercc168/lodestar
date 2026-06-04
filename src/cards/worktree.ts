@@ -17,6 +17,7 @@ export interface WorktreeListCardOpts {
   projectDir: string
   entries: WorktreeCardEntry[]
   hiddenMergedUnmountedCount?: number
+  notice?: WorktreeListNotice
 }
 
 export interface WorktreeNoticeCardOpts {
@@ -27,6 +28,11 @@ export interface WorktreeNoticeCardOpts {
   template?: string
 }
 
+export interface WorktreeListNotice {
+  type: 'success' | 'error' | 'info'
+  content: string
+}
+
 export function worktreeListCard(opts: WorktreeListCardOpts): object {
   const summary = worktreeListSummary(opts)
   return {
@@ -34,14 +40,36 @@ export function worktreeListCard(opts: WorktreeListCardOpts): object {
     config: { update_multi: true },
     header: {
       title: { tag: 'plain_text', content: '🌿 wt' },
-      template: 'turquoise',
+      template: worktreeListHeaderTemplate(opts.notice),
     },
     body: {
       elements: [
+        ...(opts.notice ? [worktreeListNoticeElement(opts.notice)] : []),
         ...(summary ? [{ tag: 'markdown', content: summary }] : []),
         ...opts.entries.flatMap(worktreeEntryElements),
       ],
     },
+  }
+}
+
+function worktreeListHeaderTemplate(notice?: WorktreeListNotice): string {
+  if (notice?.type === 'error') return 'red'
+  if (notice?.type === 'success') return 'green'
+  return 'turquoise'
+}
+
+function worktreeListNoticeElement(notice: WorktreeListNotice): object {
+  const color = notice.type === 'error'
+    ? 'red'
+    : notice.type === 'success'
+      ? 'green'
+      : 'grey'
+  return {
+    tag: 'markdown',
+    content: notice.content
+      .split('\n')
+      .map(line => `<font color='${color}'>${line || ' '}</font>`)
+      .join('\n'),
   }
 }
 

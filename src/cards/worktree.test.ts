@@ -39,6 +39,19 @@ describe('worktree card rendering', () => {
     expect(json).toContain('未挂载')
     expect(json).toContain('进行中')
   })
+
+  test('renders action notices at the top of the list card', () => {
+    const card = worktreeListCard({
+      projectName: 'feishu',
+      projectDir: '/tmp/feishu',
+      notice: { type: 'success', content: '✅ feature 已解散' },
+      entries: [entry({ slug: 'feature' })],
+    }) as any
+
+    expect(card.header.template).toBe('green')
+    expect(card.body.elements[0].content).toContain('feature 已解散')
+    expect(JSON.stringify(card.body.elements[1])).toContain('feature')
+  })
 })
 
 function entry(overrides: Partial<WorktreeCardEntry>): WorktreeCardEntry {

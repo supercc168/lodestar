@@ -402,7 +402,7 @@ async function handleCardAction(data: any): Promise<any> {
     }
     case 'worktree_disband': {
       const result = await session.onWorktreeDisband(String(value.slug ?? ''))
-      return { toast: { type: result.ok ? 'success' : 'error', content: result.ok ? result.message : '解散失败，详情见群消息' } }
+      return result.card
     }
   }
   return { toast: { type: 'info', content: 'unknown action' } }
