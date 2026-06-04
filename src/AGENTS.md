@@ -15,6 +15,7 @@
 | `session-ask.ts` | Codex `AskUserQuestion` 交互流程，处理按钮、自定义回答和权限 request 回填。 |
 | `session-permission.ts` | 工具权限请求的卡片渲染与用户决策回传。 |
 | `codex-process.ts` | 启动 `codex app-server --listen stdio://`，处理 JSON-RPC 请求、通知、工具权限、模型列表/settings、context compaction 事件和使用量元数据。 |
+| `card-action.ts` | Card action 主动卡片更新辅助；生产 WS 路径 patch 原消息后固定不返回 callback body，避免模型/effort 面板被回调覆盖。 |
 | `cardkit.ts` | Feishu Card Kit v1 封装；维护 per-card sequence、Promise queue、流式限流、元素计数和写失败回调。 |
 | `cards.ts` | 卡片模板 barrel；统一导出 `src/cards/` 下的 turn、console、worktree 和元素 ID 工具。 |
 | `feishu.ts` | Lark client、tenant token 缓存、群名/会话映射、alive session 和模型选择持久 map、群创建/解散/成员拉取、消息发送、reaction、附件下载、文件上传和项目目录初始化。 |
@@ -35,7 +36,7 @@
 | `context-window.ts` | 根据模型和 token usage 估算 context window 占用。 |
 | `outbound-markers.ts` | 解析 assistant 输出中的 `[[send: /abs/path]]` 附件发送标记。 |
 | `log.ts` | 追加写入 `daemon.log` 的轻量 logger。 |
-| `*.test.ts` | Bun 单元测试，覆盖 Card Kit、turn card 渲染、context window 展示、outbound marker、Codex 事件解析和 worktree Git 行为。 |
+| `*.test.ts` | Bun 单元测试，覆盖 Card Kit、turn card 渲染、card action 回调返回、context window 展示、outbound marker、Codex 事件解析和 worktree Git 行为。 |
 
 ## Subdirectories
 | Directory | Purpose |
@@ -67,6 +68,7 @@
 - `wt` 解散按钮不能删除仍有运行中 Codex session 的 worktree 群；先让对应群 `stop` 或 `kill`。
 - 已合并且未挂载的 `work/*` 分支在 `wt` 卡片里折叠为归档摘要；再次 `wt <name>` 会挂载并 rebase 到当前项目 HEAD。
 - `cardkit.streamTextThrottled` 缓冲完整文本帧，`flush` 在 turn 关闭前兜底；直接 `streamText` 只用于明确的终态写入。
+- `card.action.trigger` 需要替换原卡时用 `feishu.updateCard()` 主动 patch，并让 handler 返回 `undefined`；不要在 patch 后再 return toast/card。
 - `feishu.ts` 对 SDK 发送消息做 retry 和 UUID 去重；业务 API 错误要 log 并返回失败，而不是默默换用 raw API。
 - `codex-process.ts` 保存最近模型、effort、usage、context window、context compaction 状态和 result meta，控制台和 footer 读取这些快照展示运行状态。
 - `setup.ts` 写出的 TOML 转义逻辑要与 `config.ts` 的最小 TOML parser 保持一致。

@@ -33,6 +33,8 @@
     "src": {
       "files": [
         "AGENTS.md",
+        "card-action.test.ts",
+        "card-action.ts",
         "cardkit.test.ts",
         "cardkit.ts",
         "cards.ts",
@@ -82,6 +84,6 @@
       "subdirs": []
     }
   },
-  "generatedAt": "2026-06-04T03:20:48.726111+00:00",
+  "generatedAt": "2026-06-04T05:25:52.839345+00:00",
   "version": 1
 }

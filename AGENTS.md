@@ -66,7 +66,7 @@
 
 ## UI Design Notes
 - Card Kit 里的操作按钮要优先按手机窄屏设计；高频、重复出现的选择类按钮文案必须尽量短，`model`/effort 这类选择按钮固定用单字 `选`，不要写成 `选择`、`重选` 等多字按钮。
-- 生产路径使用 `WSClient + EventDispatcher` 接收 `card.action.trigger`，不要依赖 handler 的 return 值更新卡片；需要改卡片时用回调里的 `open_message_id` 调 `feishu.updateCard()` 主动 patch 原消息。
+- 生产路径使用 `WSClient + EventDispatcher` 接收 `card.action.trigger`，不要依赖 handler 的 return 值更新卡片；需要改卡片时用回调里的 `open_message_id` 调 `feishu.updateCard()` 主动 patch 原消息，patch 后不要再 return toast/card，避免 Feishu 客户端把刚更新的卡片回滚。
 
 ## Runtime Operation Notes
 - 从 Lodestar 自己承载的对话里执行 `systemctl --user restart feishu-daemon.service` / `lodestar-stop` / `restart` 这类会重启或停止当前 daemon 的命令时，工具调用显示 `aborted` 通常只是宿主进程被 SIGTERM 中断了，不代表操作失败。恢复后先用 `systemctl --user status feishu-daemon.service`、`journalctl --user -u feishu-daemon.service` 或 PID/日志确认结果，不要直接向用户汇报“重启未完成”。
