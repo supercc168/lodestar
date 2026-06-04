@@ -22,7 +22,7 @@ import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSy
 import { dirname } from 'node:path'
 import { Session } from './src/session'
 import * as feishu from './src/feishu'
-import { updateActionCard } from './src/card-action'
+import { actionCardResponse } from './src/card-action'
 import { startNotifyServer } from './src/notify'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
 import { config } from './src/config'
@@ -78,7 +78,6 @@ process.on('uncaughtException',  e => log(`uncaughtException: ${e}`))
 // ── Session registry ────────────────────────────────────────────────────
 const sessions = new Map<string, Session>()  // key = chatId
 let pendingReviveSessionNames = new Set<string>()
-const actionCardUpdateDeps = { updateCard: feishu.updateCard, sendText: feishu.sendText, log }
 
 function currentAliveSessionNames(): string[] {
   const alive = new Set<string>()
@@ -369,7 +368,6 @@ async function handleCardAction(data: any): Promise<any> {
   const value = action?.value
   if (!value?.kind) return
   const chatId = data?.context?.open_chat_id ?? ''
-  const messageId = data?.context?.open_message_id ?? data?.open_message_id ?? ''
   const userId = data?.operator?.open_id ?? ''
   const session = sessions.get(chatId)
   if (!session) return { toast: { type: 'error', content: '会话不存在，请先发消息启动' } }
@@ -384,13 +382,13 @@ async function handleCardAction(data: any): Promise<any> {
     case 'model_select': {
       const result = await session.onModelSelect(String(value.model ?? ''), String(value.panel_id ?? ''), userId, value)
       return result.card
-        ? await updateActionCard(messageId, chatId, result.card, result.message, actionCardUpdateDeps)
+        ? actionCardResponse(result.card)
         : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
     }
     case 'model_effort_select': {
       const result = await session.onModelEffortSelect(String(value.model ?? ''), String(value.effort ?? ''), String(value.panel_id ?? ''), userId)
       return result.card
-        ? await updateActionCard(messageId, chatId, result.card, result.message, actionCardUpdateDeps)
+        ? actionCardResponse(result.card)
         : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
     }
     case 'ask': {
@@ -409,7 +407,7 @@ async function handleCardAction(data: any): Promise<any> {
     }
     case 'worktree_disband': {
       const result = await session.onWorktreeDisband(String(value.slug ?? ''))
-      return await updateActionCard(messageId, chatId, result.card, result.message, actionCardUpdateDeps)
+      return actionCardResponse(result.card)
     }
   }
   return { toast: { type: 'info', content: 'unknown action' } }
