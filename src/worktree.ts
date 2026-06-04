@@ -114,6 +114,9 @@ export function ensureProjectWorktree(projectDir: string, projectName: string, s
   const targetPath = expectedWorktreePath(projectDir, projectName, cleanSlug)
   const branchExists = hasBranch(projectDir, branch)
   const mountedPath = parseWorktreeList(projectDir).get(branch) ?? null
+  const projectHead = branchExists && !mountedPath && branchState(projectDir, branch) === 'merged'
+    ? git(projectDir, ['rev-parse', 'HEAD']).trim()
+    : null
 
   if (mountedPath) {
     if (resolve(mountedPath) !== resolve(targetPath)) {
@@ -134,6 +137,7 @@ export function ensureProjectWorktree(projectDir: string, projectName: string, s
 
   if (branchExists) {
     git(projectDir, ['worktree', 'add', targetPath, branch])
+    if (projectHead) git(targetPath, ['rebase', projectHead])
     return { slug: cleanSlug, chatName, branch, worktreePath: targetPath, createdBranch: false, createdWorktree: true }
   }
 
