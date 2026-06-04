@@ -429,15 +429,27 @@ export function menuCard(opts: MenuOpts): object {
 }
 
 export function modelSelectionCard(opts: ModelSelectionCardOpts): object {
+  return modelCard(opts.sessionName, modelSelectionPanelElement(opts))
+}
+
+export function modelEffortCard(opts: ModelEffortPanelOpts): object {
+  return modelCard(opts.sessionName, modelEffortPanelElement(opts))
+}
+
+export function modelResultCard(opts: ModelResultPanelOpts): object {
+  return modelCard(opts.sessionName, modelResultPanelElement(opts), 'green')
+}
+
+function modelCard(sessionName: string, element: object, template = 'turquoise'): object {
   return {
     schema: '2.0',
     config: { update_multi: true },
     header: {
-      title: { tag: 'plain_text', content: `🤖 model · ${opts.sessionName}` },
-      template: 'turquoise',
+      title: { tag: 'plain_text', content: `🤖 model · ${sessionName}` },
+      template,
     },
     body: {
-      elements: [modelSelectionPanelElement(opts)],
+      elements: [element],
     },
   }
 }
@@ -541,7 +553,7 @@ function modelChoiceElement(model: ModelChoice, panelId: string, currentEffort?:
         weight: 1,
         elements: [{
           tag: 'button',
-          text: { tag: 'plain_text', content: model.selected ? '重选' : '选择' },
+          text: { tag: 'plain_text', content: '选' },
           type: model.selected ? 'primary' : 'default',
           behaviors: [{ type: 'callback', value: { kind: 'model_select', panel_id: panelId, model: model.model } }],
         }],
@@ -579,7 +591,7 @@ function effortChoiceElement(model: string, effort: ModelEffortChoice, panelId: 
         weight: 1,
         elements: [{
           tag: 'button',
-          text: { tag: 'plain_text', content: '选择' },
+          text: { tag: 'plain_text', content: '选' },
           type: effort.selected ? 'primary' : 'default',
           behaviors: [{ type: 'callback', value: { kind: 'model_effort_select', panel_id: panelId, model, effort: effort.effort } }],
         }],

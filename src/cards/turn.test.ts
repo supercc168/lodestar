@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleBodyElements, modelEffortPanelElement, modelResultPanelElement, modelSelectionCard, statusCard } from './console'
+import { consoleBodyElements, modelEffortCard, modelEffortPanelElement, modelResultCard, modelResultPanelElement, modelSelectionCard, statusCard } from './console'
 import {
   contextCompactionElement,
   goalElement,
@@ -77,7 +77,8 @@ describe('main conversation card rendering', () => {
     const panel = card.body.elements[0]
     expect(panel.element_id).toBe('model_panel')
     expect(panel.elements[0].content).toContain('`gpt-5-codex/high`')
-    expect(panel.elements[1].columns[1].elements[0].text.content).toBe('重选')
+    expect(panel.elements[1].columns[1].elements[0].text.content).toBe('选')
+    expect(panel.elements[1].columns[1].elements[0].text.content).toHaveLength(1)
     expect(panel.elements[1].columns[1].elements[0].behaviors[0].value).toEqual({
       kind: 'model_select',
       panel_id: 'panel-1',
@@ -93,6 +94,8 @@ describe('main conversation card rendering', () => {
       selectedEffort: 'xhigh',
     }) as any
     expect(effortPanel.element_id).toBe('model_panel')
+    expect(effortPanel.elements[2].columns[1].elements[0].text.content).toBe('选')
+    expect(effortPanel.elements[2].columns[1].elements[0].text.content).toHaveLength(1)
     expect(effortPanel.elements[2].columns[1].elements[0].behaviors[0].value).toEqual({
       kind: 'model_effort_select',
       panel_id: 'panel-1',
@@ -108,6 +111,25 @@ describe('main conversation card rendering', () => {
     }) as any
     expect(resultPanel.element_id).toBe('model_panel')
     expect(resultPanel.elements[0].content).toContain('`gpt-5-codex/xhigh`')
+
+    const effortCard = modelEffortCard({
+      sessionName: 'probe',
+      panelId: 'panel-1',
+      currentModel: 'gpt-5-codex',
+      currentEffort: 'high',
+      selectedModel: currentModel,
+      selectedEffort: 'xhigh',
+    }) as any
+    expect(effortCard.body.elements[0].header.title.content).toBe('选择推理强度')
+
+    const savedCard = modelResultCard({
+      sessionName: 'probe',
+      model: 'gpt-5-codex',
+      effort: 'xhigh',
+      scope: '下一轮开始使用。',
+    }) as any
+    expect(savedCard.header.template).toBe('green')
+    expect(savedCard.body.elements[0].header.title.content).toBe('选择已保存')
   })
 })
 

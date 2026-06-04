@@ -73,7 +73,6 @@ const RESUME_INIT_NOTICE_MS = 10_000
 const RESUME_INIT_TIMEOUT_MS = 120_000
 
 interface ModelPanelState {
-  cardId: string | null
   models: cards.ModelChoice[]
 }
 
@@ -96,6 +95,7 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
 }
 
 type WorktreeActionResult = { ok: boolean; message: string; card: object }
+type ModelActionResult = { ok: boolean; message: string; card?: object }
 
 /** Soft cap on element count per Feishu card before we proactively
  * rotate to a fresh one. The hard ceiling is NOT ~100 as once assumed:
@@ -864,7 +864,7 @@ export class Session {
     const currentModel = this.currentModelLabel()
     const currentEffort = this.currentEffortLabel()
     const choices = this.modelChoices(models)
-    this.modelPanels.set(panelId, { cardId: null, models: choices })
+    this.modelPanels.set(panelId, { models: choices })
     const messageId = await feishu.sendCard(this.chatId, cards.modelSelectionCard({
       sessionName: this.sessionName,
       panelId,
@@ -876,16 +876,6 @@ export class Session {
       this.modelPanels.delete(panelId)
       await feishu.sendTextRaw(this.chatId, '❌ 模型面板发送失败')
       return
-    }
-    try {
-      const cardId = await cardkit.convertMessageToCard(messageId)
-      const state = this.modelPanels.get(panelId)
-      if (state) state.cardId = cardId
-      cardkit.recordCardCreated(cardId, 1)
-    } catch (e) {
-      this.modelPanels.delete(panelId)
-      log(`session "${this.sessionName}": model card id_convert failed: ${e}`)
-      await feishu.sendTextRaw(this.chatId, '❌ 模型面板初始化失败')
     }
   }
 
@@ -928,7 +918,7 @@ export class Session {
         : '下次启动 Codex 时使用。'
   }
 
-  async onModelSelect(modelRaw: string, panelIdRaw = '', _userOpenId = ''): Promise<{ ok: boolean; message: string }> {
+  async onModelSelect(modelRaw: string, panelIdRaw = '', _userOpenId = ''): Promise<ModelActionResult> {
     const model = modelRaw.trim()
     if (!model) {
       const message = '模型为空'
@@ -937,7 +927,7 @@ export class Session {
     }
     const panelId = panelIdRaw.trim()
     const panel = this.modelPanels.get(panelId)
-    if (!panel?.cardId) {
+    if (!panel) {
       return { ok: false, message: '模型面板已过期,请重新发送 model' }
     }
     const choice = panel.models.find(m => m.model === model)
@@ -945,28 +935,21 @@ export class Session {
       return { ok: false, message: '模型不在当前面板列表中,请重新发送 model' }
     }
     const selectedEffort = this.initialEffortForModel(choice)
-    try {
-      await cardkit.replaceElement(panel.cardId, cards.ELEMENTS.modelPanel, cards.modelEffortPanelElement({
+    return {
+      ok: choice.efforts.length > 0,
+      message: choice.efforts.length > 0 ? `已选择模型 ${model},请选择 effort` : '这个模型未返回可用 effort',
+      card: cards.modelEffortCard({
         sessionName: this.sessionName,
         panelId,
         currentModel: this.currentModelLabel(),
         currentEffort: this.currentEffortLabel(),
         selectedModel: choice,
         selectedEffort,
-      }))
-      return {
-        ok: choice.efforts.length > 0,
-        message: choice.efforts.length > 0 ? `已选择模型 ${model},请选择 effort` : '这个模型未返回可用 effort',
-      }
-    } catch (e) {
-      const message = `模型面板更新失败: ${messageOf(e)}`
-      log(`session "${this.sessionName}": model panel update failed: ${messageOf(e)}`)
-      await feishu.sendText(this.chatId, `❌ ${message}`)
-      return { ok: false, message }
+      }),
     }
   }
 
-  async onModelEffortSelect(modelRaw: string, effortRaw: string, panelIdRaw = '', _userOpenId = ''): Promise<{ ok: boolean; message: string }> {
+  async onModelEffortSelect(modelRaw: string, effortRaw: string, panelIdRaw = '', _userOpenId = ''): Promise<ModelActionResult> {
     const model = modelRaw.trim()
     const effortValue = effortRaw.trim()
     if (!model) return { ok: false, message: '模型为空' }
@@ -974,7 +957,7 @@ export class Session {
     const effort: CodexReasoningEffort = effortValue
     const panelId = panelIdRaw.trim()
     const panel = this.modelPanels.get(panelId)
-    if (!panel?.cardId) {
+    if (!panel) {
       return { ok: false, message: '模型面板已过期,请重新发送 model' }
     }
     const choice = panel.models.find(m => m.model === model)
@@ -990,19 +973,17 @@ export class Session {
       this.selectedEffort = effort
       feishu.bindSessionModel(this.sessionName, model, effort)
       const scope = this.modelSelectionScope()
-      try {
-        await cardkit.replaceElement(panel.cardId, cards.ELEMENTS.modelPanel, cards.modelResultPanelElement({
+      this.modelPanels.delete(panelId)
+      return {
+        ok: true,
+        message: `已选择 ${model} / ${effort}`,
+        card: cards.modelResultCard({
           sessionName: this.sessionName,
           model,
           effort,
           scope,
-        }))
-      } catch (e) {
-        log(`session "${this.sessionName}": model result panel update failed: ${e}`)
-        await feishu.sendText(this.chatId, `✅ 已选择 ${model}/${effort}\n${scope}`)
+        }),
       }
-      this.modelPanels.delete(panelId)
-      return { ok: true, message: `已选择 ${model} / ${effort}` }
     } catch (e) {
       const message = `模型切换失败: ${messageOf(e)}`
       log(`session "${this.sessionName}": set model settings failed: ${messageOf(e)}`)
