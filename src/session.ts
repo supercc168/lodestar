@@ -910,6 +910,26 @@ export class Session {
     return model.efforts.find(effort => effort.isDefault)?.effort ?? model.efforts[0]?.effort ?? null
   }
 
+  private modelChoiceFromAction(model: string, raw: any): cards.ModelChoice | null {
+    const effortsRaw = Array.isArray(raw?.efforts) ? raw.efforts : []
+    const efforts: cards.ModelEffortChoice[] = effortsRaw
+      .map((item: any) => ({
+        effort: typeof item?.effort === 'string' ? item.effort : '',
+        description: typeof item?.description === 'string' ? item.description : '',
+        isDefault: item?.is_default === true,
+      }))
+      .filter((item: cards.ModelEffortChoice) => item.effort)
+    if (efforts.length === 0) return null
+    return {
+      model,
+      displayName: typeof raw?.display_name === 'string' && raw.display_name ? raw.display_name : model,
+      description: '',
+      isDefault: raw?.is_default === true,
+      selected: this.currentModelLabel() === model,
+      efforts,
+    }
+  }
+
   private modelSelectionScope(): string {
     return this.currentTurn
       ? '当前 turn 不变,下一轮开始使用。'
@@ -918,7 +938,7 @@ export class Session {
         : '下次启动 Codex 时使用。'
   }
 
-  async onModelSelect(modelRaw: string, panelIdRaw = '', _userOpenId = ''): Promise<ModelActionResult> {
+  async onModelSelect(modelRaw: string, panelIdRaw = '', _userOpenId = '', actionValue: any = null): Promise<ModelActionResult> {
     const model = modelRaw.trim()
     if (!model) {
       const message = '模型为空'
@@ -927,10 +947,7 @@ export class Session {
     }
     const panelId = panelIdRaw.trim()
     const panel = this.modelPanels.get(panelId)
-    if (!panel) {
-      return { ok: false, message: '模型面板已过期,请重新发送 model' }
-    }
-    const choice = panel.models.find(m => m.model === model)
+    const choice = panel?.models.find(m => m.model === model) ?? this.modelChoiceFromAction(model, actionValue)
     if (!choice) {
       return { ok: false, message: '模型不在当前面板列表中,请重新发送 model' }
     }
@@ -957,12 +974,8 @@ export class Session {
     const effort: CodexReasoningEffort = effortValue
     const panelId = panelIdRaw.trim()
     const panel = this.modelPanels.get(panelId)
-    if (!panel) {
-      return { ok: false, message: '模型面板已过期,请重新发送 model' }
-    }
-    const choice = panel.models.find(m => m.model === model)
-    if (!choice) return { ok: false, message: '模型不在当前面板列表中,请重新发送 model' }
-    if (!choice.efforts.some(item => item.effort === effort)) {
+    const choice = panel?.models.find(m => m.model === model)
+    if (choice && !choice.efforts.some(item => item.effort === effort)) {
       return { ok: false, message: 'reasoning effort 不属于该模型' }
     }
     try {

@@ -451,6 +451,16 @@ export async function sendCard(chatId: string, card: object): Promise<string | n
   return sendViaSdkWithRetry('card', chatId, 'interactive', JSON.stringify(card))
 }
 
+export async function updateCard(messageId: string, card: object): Promise<void> {
+  const res: any = await client.im.v1.message.patch({
+    path: { message_id: messageId },
+    data: { content: JSON.stringify(card) },
+  })
+  if (res?.code && res.code !== 0) {
+    throw new Error(`feishu message.patch failed code=${res.code} msg=${res.msg}`)
+  }
+}
+
 /** Last-resort text send that bypasses the lark SDK and uses raw fetch
  * (which is what cardkit.ts uses and has never had stability issues on
  * this runtime). Used by callers that need to *surface a failure when

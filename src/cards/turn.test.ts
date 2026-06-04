@@ -83,6 +83,12 @@ describe('main conversation card rendering', () => {
       kind: 'model_select',
       panel_id: 'panel-1',
       model: 'gpt-5-codex',
+      display_name: 'GPT-5 Codex',
+      is_default: false,
+      efforts: [
+        { effort: 'high', description: '', is_default: false },
+        { effort: 'xhigh', description: '', is_default: true },
+      ],
     })
 
     const effortPanel = modelEffortPanelElement({

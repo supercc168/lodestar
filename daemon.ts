@@ -78,6 +78,10 @@ process.on('uncaughtException',  e => log(`uncaughtException: ${e}`))
 const sessions = new Map<string, Session>()  // key = chatId
 let pendingReviveSessionNames = new Set<string>()
 
+function messageOf(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
 function currentAliveSessionNames(): string[] {
   const alive = new Set<string>()
   for (const s of sessions.values()) if (s.isRunning()) alive.add(s.sessionName)
@@ -367,6 +371,7 @@ async function handleCardAction(data: any): Promise<any> {
   const value = action?.value
   if (!value?.kind) return
   const chatId = data?.context?.open_chat_id ?? ''
+  const messageId = data?.context?.open_message_id ?? data?.open_message_id ?? ''
   const userId = data?.operator?.open_id ?? ''
   const session = sessions.get(chatId)
   if (!session) return { toast: { type: 'error', content: '会话不存在，请先发消息启动' } }
@@ -379,12 +384,16 @@ async function handleCardAction(data: any): Promise<any> {
       await session.onUserMessage(`(menu choice ${value.choice + 1})`)
       return { toast: { type: 'success', content: 'OK' } }
     case 'model_select': {
-      const result = await session.onModelSelect(String(value.model ?? ''), String(value.panel_id ?? ''), userId)
-      return result.card ?? { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+      const result = await session.onModelSelect(String(value.model ?? ''), String(value.panel_id ?? ''), userId, value)
+      return result.card
+        ? await updateActionCard(messageId, chatId, result.card, result.message)
+        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
     }
     case 'model_effort_select': {
       const result = await session.onModelEffortSelect(String(value.model ?? ''), String(value.effort ?? ''), String(value.panel_id ?? ''), userId)
-      return result.card ?? { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+      return result.card
+        ? await updateActionCard(messageId, chatId, result.card, result.message)
+        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
     }
     case 'ask': {
       // Custom-text branch: form submit packages the input under
@@ -402,10 +411,27 @@ async function handleCardAction(data: any): Promise<any> {
     }
     case 'worktree_disband': {
       const result = await session.onWorktreeDisband(String(value.slug ?? ''))
-      return result.card
+      return await updateActionCard(messageId, chatId, result.card, result.message)
     }
   }
   return { toast: { type: 'info', content: 'unknown action' } }
+}
+
+async function updateActionCard(messageId: string, chatId: string, card: object, message: string): Promise<any> {
+  if (!messageId) {
+    const text = `❌ 卡片更新失败: 缺少 message_id\n${message}`
+    await feishu.sendText(chatId, text)
+    return { toast: { type: 'error', content: '卡片更新失败，详情见群消息' } }
+  }
+  try {
+    await feishu.updateCard(messageId, card)
+    return { toast: { type: 'success', content: message } }
+  } catch (e) {
+    const text = `❌ 卡片更新失败: ${messageOf(e)}\n${message}`
+    log(`card action update failed message=${messageId}: ${messageOf(e)}`)
+    await feishu.sendText(chatId, text)
+    return { toast: { type: 'error', content: '卡片更新失败，详情见群消息' } }
+  }
 }
 
 // ── WebSocket boot ─────────────────────────────────────────────────────

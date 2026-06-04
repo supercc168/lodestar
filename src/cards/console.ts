@@ -555,10 +555,25 @@ function modelChoiceElement(model: ModelChoice, panelId: string, currentEffort?:
           tag: 'button',
           text: { tag: 'plain_text', content: '选' },
           type: model.selected ? 'primary' : 'default',
-          behaviors: [{ type: 'callback', value: { kind: 'model_select', panel_id: panelId, model: model.model } }],
+          behaviors: [{ type: 'callback', value: modelSelectActionValue(model, panelId) }],
         }],
       },
     ],
+  }
+}
+
+function modelSelectActionValue(model: ModelChoice, panelId: string): object {
+  return {
+    kind: 'model_select',
+    panel_id: panelId,
+    model: model.model,
+    display_name: model.displayName,
+    is_default: model.isDefault === true,
+    efforts: model.efforts.map(effort => ({
+      effort: effort.effort,
+      description: effort.description ?? '',
+      is_default: effort.isDefault === true,
+    })),
   }
 }
 
