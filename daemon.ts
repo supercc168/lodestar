@@ -102,22 +102,23 @@ function sessionFor(chatId: string, sessionName: string): Session {
  * went down. Driven by the marker file written in `cleanup` — that
  * file ONLY lists sessions that were running, so anything the user
  * had explicitly `kill`-ed before shutdown is intentionally absent
- * and stays stopped. Each revived session is `restart(true)`-ed so
- * Codex resumes the saved thread id and the in-flight
- * conversation continues without the user typing anything. */
+ * and stays stopped. Each revived session is `restart(true)`-ed in
+ * parallel so one slow Codex init does not block the rest; Codex resumes
+ * the saved thread id and the in-flight conversation continues without
+ * the user typing anything. */
 async function reviveAliveSessions(): Promise<void> {
-  const names = feishu.readAliveMarker()
+  const names = [...new Set(feishu.readAliveMarker())]
   if (names.length === 0) return
   pendingReviveSessionNames = new Set(names)
   log(`revive: ${names.length} session(s) marked alive on shutdown: ${names.join(', ')}`)
   try {
-    for (const sessionName of names) {
+    await Promise.all(names.map(async sessionName => {
       const chatId = feishu.chatIdForSession(sessionName)
       if (!chatId) {
         log(`revive: no chatId binding for "${sessionName}", skip`)
         pendingReviveSessionNames.delete(sessionName)
         writeCurrentAliveMarker()
-        continue
+        return
       }
       const session = sessionFor(chatId, sessionName)
       try {
@@ -130,7 +131,7 @@ async function reviveAliveSessions(): Promise<void> {
         pendingReviveSessionNames.delete(sessionName)
         writeCurrentAliveMarker()
       }
-    }
+    }))
   } finally {
     pendingReviveSessionNames.clear()
     writeCurrentAliveMarker()
