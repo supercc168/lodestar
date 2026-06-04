@@ -105,6 +105,8 @@ export interface ContextCompactedNotification {
   threadId?: string
   turnId?: string
   itemId?: string
+  sessionId?: string
+  phase?: 'start' | 'end' | 'event'
   sourceMethod?: string
   sourceType?: string
   [key: string]: unknown
@@ -263,14 +265,24 @@ export class CodexProcess extends EventEmitter {
       return
     }
 
+    const compaction = contextCompactionNoticeFromMessage(msg)
+    if (compaction) {
+      const notice = this.withSessionId(compaction)
+      logContextCompactionPayload(compaction.sourceMethod ?? 'raw_message', msg, notice)
+      this.emit('context_compacted', notice)
+      return
+    }
+
+    logUnhandledAppServerPayload('RAW_MESSAGE', msg)
     this.emit('raw', msg)
   }
 
   private handleNotification(method: string, params: any): void {
     const compaction = contextCompactionNoticeFromNotification(method, params)
     if (compaction) {
-      log(`codex-process: context compacted via ${compaction.sourceMethod ?? method}`)
-      this.emit('context_compacted', compaction)
+      const notice = this.withSessionId(compaction)
+      logContextCompactionPayload(method, params, notice)
+      this.emit('context_compacted', notice)
       return
     }
     switch (method) {
@@ -362,19 +374,25 @@ export class CodexProcess extends EventEmitter {
       case 'item/agentMessage/delta': {
         if (typeof params.delta === 'string' && params.delta.length > 0) {
           this.emit('assistant_text', { uuid: params.itemId, text: params.delta })
+        } else {
+          logUnhandledAppServerPayload('AGENT_MESSAGE_DELTA_EMPTY', { method, params })
         }
         return
       }
       case 'item/started': {
-        this.handleItemStarted(params.item)
+        this.handleItemStarted(params)
         return
       }
       case 'item/completed': {
-        this.handleItemCompleted(params.item)
+        this.handleItemCompleted(params)
         return
       }
       case 'mcpServer/startupStatus/updated': {
         log(`codex-process: mcp ${params.name} ${params.status}${params.error ? `: ${params.error}` : ''}`)
+        return
+      }
+      case 'account/rateLimits/updated': {
+        this.emit('rate_limits_updated', params.rateLimits)
         return
       }
       case 'configWarning':
@@ -390,30 +408,50 @@ export class CodexProcess extends EventEmitter {
         return
       }
     }
+    logUnhandledAppServerPayload('NOTIFICATION', { method, params })
     this.emit('raw', { method, params })
   }
 
-  private handleItemStarted(item: any): void {
-    if (!item?.id) return
+  private handleItemStarted(params: any): void {
+    const item = params?.item
+    if (!item?.id) {
+      logUnhandledAppServerPayload('ITEM_STARTED_MISSING_ID', { method: 'item/started', params })
+      return
+    }
     const mapped = mapStartedItem(item, this.opts.workDir)
-    if (!mapped) return
+    if (!mapped) {
+      logUnhandledAppServerPayload('ITEM_STARTED_UNMAPPED', { method: 'item/started', params })
+      return
+    }
     this.emit('tool_use', { id: item.id, name: mapped.name, input: mapped.input })
   }
 
-  private handleItemCompleted(item: any): void {
-    if (!item?.id) return
+  private handleItemCompleted(params: any): void {
+    const item = params?.item
+    if (!item?.id) {
+      logUnhandledAppServerPayload('ITEM_COMPLETED_MISSING_ID', { method: 'item/completed', params })
+      return
+    }
     if (item.type === 'agentMessage') {
       this.lastAssistantUuid = item.id
       this.emit('assistant_block_stop', { index: item.id })
       return
     }
     const mapped = mapCompletedItem(item)
-    if (!mapped) return
+    if (!mapped) {
+      logUnhandledAppServerPayload('ITEM_COMPLETED_UNMAPPED', { method: 'item/completed', params })
+      return
+    }
     this.emit('tool_result', {
       tool_use_id: item.id,
       content: mapped.output,
       is_error: mapped.isError,
     })
+  }
+
+  private withSessionId(notice: ContextCompactedNotification): ContextCompactedNotification {
+    const sessionId = notice.sessionId ?? this.sessionId ?? undefined
+    return sessionId ? { ...notice, sessionId } : notice
   }
 
   private handleServerRequest(req: any): void {
@@ -486,7 +524,7 @@ export class CodexProcess extends EventEmitter {
       case 'applyPatchApproval':
       case 'execCommandApproval':
       default: {
-        log(`codex-process: unsupported server request ${req.method}; declining`)
+        logUnhandledAppServerPayload('SERVER_REQUEST_UNSUPPORTED', req)
         this.respondError(requestId, `unsupported server request: ${req.method}`)
       }
     }
@@ -667,6 +705,13 @@ export class CodexProcess extends EventEmitter {
         return
       }
       default:
+        logUnhandledAppServerPayload('APPROVAL_RESPONSE_UNSUPPORTED', {
+          requestId,
+          method: req.method,
+          params: req.params,
+          decision,
+          payload,
+        })
         this.respondError(requestId, payload?.denyMessage ?? 'unsupported approval request')
     }
   }
@@ -726,9 +771,146 @@ function objectOrNull(v: unknown): Record<string, unknown> | null {
   return v != null && typeof v === 'object' ? v as Record<string, unknown> : null
 }
 
+const COMPACTION_LOG_JSON_CHARS = 200_000
+const COMPACTION_LOG_STRING_CHARS = 50_000
+const COMPACTION_LOG_PATHS = 400
+
+function logValue(v: unknown): string {
+  if (v == null || v === '') return '-'
+  return String(v).replace(/\s+/g, ' ').slice(0, 300)
+}
+
+function formatKeyList(v: Record<string, unknown> | null): string {
+  if (!v) return '[]'
+  const keys = Object.keys(v)
+  const shown = keys.slice(0, 80)
+  const suffix = keys.length > shown.length ? `,...+${keys.length - shown.length}` : ''
+  return `[${shown.join(',')}${suffix}]`
+}
+
+function formatPathList(paths: string[]): string {
+  const shown = paths.slice(0, COMPACTION_LOG_PATHS)
+  const suffix = paths.length > shown.length ? `,...+${paths.length - shown.length}` : ''
+  return `[${shown.join(',')}${suffix}]`
+}
+
+function payloadItem(rawPayload: unknown): Record<string, unknown> | null {
+  const root = objectOrNull(rawPayload)
+  if (!root) return null
+  const event = objectOrNull(root.event)
+  const payload = objectOrNull(root.payload)
+  return objectOrNull(root.item) ??
+    objectOrNull(root.responseItem) ??
+    objectOrNull(root.rawItem) ??
+    objectOrNull(event?.item) ??
+    objectOrNull(event?.responseItem) ??
+    objectOrNull(event?.rawItem) ??
+    objectOrNull(payload?.item) ??
+    objectOrNull(payload?.responseItem) ??
+    objectOrNull(payload?.rawItem) ??
+    (compactionTypeOf(root.type) ? root : null) ??
+    (event && compactionTypeOf(event.type) ? event : null) ??
+    (payload && compactionTypeOf(payload.type) ? payload : null)
+}
+
+function keyPaths(rawPayload: unknown): string[] {
+  const paths: string[] = []
+  const seen = new WeakSet<object>()
+  const visit = (value: unknown, path: string, depth: number) => {
+    if (paths.length >= COMPACTION_LOG_PATHS || depth > 6) return
+    if (Array.isArray(value)) {
+      if (path) paths.push(`${path}[]`)
+      if (value.length > 0) visit(value[0], path ? `${path}[]` : '[]', depth + 1)
+      return
+    }
+    if (value == null || typeof value !== 'object') return
+    if (seen.has(value)) return
+    seen.add(value)
+    for (const key of Object.keys(value as Record<string, unknown>)) {
+      if (paths.length >= COMPACTION_LOG_PATHS) return
+      const childPath = path ? `${path}.${key}` : key
+      paths.push(childPath)
+      visit((value as Record<string, unknown>)[key], childPath, depth + 1)
+    }
+  }
+  visit(rawPayload, '', 0)
+  return paths
+}
+
+function safeJsonForCompactionLog(value: unknown): string {
+  const seen = new WeakSet<object>()
+  let json: string
+  try {
+    json = JSON.stringify(value, (_key, v) => {
+      if (typeof v === 'bigint') return `${v.toString()}n`
+      if (typeof v === 'string' && v.length > COMPACTION_LOG_STRING_CHARS) {
+        return `${v.slice(0, COMPACTION_LOG_STRING_CHARS)}...<truncated ${v.length - COMPACTION_LOG_STRING_CHARS} chars>`
+      }
+      if (v != null && typeof v === 'object') {
+        if (seen.has(v)) return '[Circular]'
+        seen.add(v)
+      }
+      return v
+    }) ?? String(value)
+  } catch (e) {
+    json = `<unserializable: ${e}>`
+  }
+  if (json.length > COMPACTION_LOG_JSON_CHARS) {
+    return `${json.slice(0, COMPACTION_LOG_JSON_CHARS)}...<truncated ${json.length - COMPACTION_LOG_JSON_CHARS} chars>`
+  }
+  return json
+}
+
+function logUnhandledAppServerPayload(reason: string, payload: unknown): void {
+  const root = objectOrNull(payload)
+  const params = root ? objectOrNull(root.params) : null
+  const item = root ? objectOrNull(root.item) ?? objectOrNull(params?.item) : null
+  const method = root ? stringOrUndefined(root.method) ?? '-' : '-'
+  log([
+    `codex-process: APP_SERVER_UNHANDLED_${reason}`,
+    `method=${logValue(method)}`,
+    `rootKeys=${formatKeyList(root)}`,
+    `itemKeys=${formatKeyList(item)}`,
+    `payload=${safeJsonForCompactionLog(payload)}`,
+  ].join(' '))
+}
+
+function logContextCompactionPayload(
+  method: string,
+  rawPayload: unknown,
+  notice: ContextCompactedNotification,
+): void {
+  const root = objectOrNull(rawPayload)
+  const item = payloadItem(rawPayload)
+  const base = [
+    `phase=${logValue(notice.phase ?? 'event')}`,
+    `method=${logValue(method)}`,
+    `sourceMethod=${logValue(notice.sourceMethod)}`,
+    `sourceType=${logValue(notice.sourceType)}`,
+    `sessionId=${logValue(notice.sessionId)}`,
+    `threadId=${logValue(notice.threadId)}`,
+    `turnId=${logValue(notice.turnId)}`,
+    `itemId=${logValue(notice.itemId)}`,
+  ].join(' ')
+  log(`codex-process: CONTEXT_COMPACTION_EVENT ${base} rootKeys=${formatKeyList(root)} itemKeys=${formatKeyList(item)}`)
+  log(`codex-process: CONTEXT_COMPACTION_PATHS ${base} paths=${formatPathList(keyPaths(rawPayload))}`)
+  if (item) {
+    log(`codex-process: CONTEXT_COMPACTION_ITEM ${base} item=${safeJsonForCompactionLog(item)}`)
+  }
+  log(`codex-process: CONTEXT_COMPACTION_PAYLOAD ${base} payload=${safeJsonForCompactionLog(rawPayload)}`)
+}
+
 function compactionTypeOf(v: unknown): string | null {
   if (typeof v !== 'string') return null
   return COMPACTION_TYPES.has(v) ? v : null
+}
+
+function compactionPhase(sourceType: string | null, method: string): 'start' | 'end' | 'event' {
+  if (method === 'item/started') return 'start'
+  if (method === 'item/completed' || method === 'rawResponseItem/completed') return 'end'
+  if (sourceType === 'compacted') return 'start'
+  if (sourceType === 'context_compacted' || COMPACTION_METHODS.has(method)) return 'end'
+  return 'event'
 }
 
 /** Codex exposes context compaction through more than one surface:
@@ -741,11 +923,25 @@ export function contextCompactionNoticeFromNotification(
   method: string,
   params: unknown,
 ): ContextCompactedNotification | null {
-  const root = objectOrNull(params) ?? {}
+  return contextCompactionNoticeFromObject(method, objectOrNull(params) ?? {})
+}
+
+export function contextCompactionNoticeFromMessage(msg: unknown): ContextCompactedNotification | null {
+  const root = objectOrNull(msg)
+  if (!root) return null
+  const method = stringOrUndefined(root.method) ?? stringOrUndefined(root.type) ?? 'raw_message'
+  return contextCompactionNoticeFromObject(method, root)
+}
+
+function contextCompactionNoticeFromObject(
+  method: string,
+  root: Record<string, unknown>,
+): ContextCompactedNotification | null {
+  const payload = objectOrNull(root.payload)
   const candidates = [
     root,
     objectOrNull(root.event),
-    objectOrNull(root.payload),
+    payload,
     objectOrNull(root.item),
     objectOrNull(root.responseItem),
     objectOrNull(root.rawItem),
@@ -759,17 +955,34 @@ export function contextCompactionNoticeFromNotification(
 
   if (!COMPACTION_METHODS.has(method) && !sourceType) return null
 
-  const item = objectOrNull(root.item) ?? objectOrNull(root.responseItem) ?? objectOrNull(root.rawItem) ?? {}
+  const rootItem = objectOrNull(root.item) ?? objectOrNull(root.responseItem) ?? objectOrNull(root.rawItem)
+  const data = sourceType === 'compacted' && payload
+    ? payload
+    : rootItem && compactionTypeOf(rootItem.type)
+      ? rootItem
+      : root
+  const item = objectOrNull(data.item) ?? objectOrNull(data.responseItem) ?? objectOrNull(data.rawItem) ?? rootItem ?? {}
   return {
-    ...root,
-    threadId: stringOrUndefined(root.threadId) ?? stringOrUndefined(root.thread_id),
-    turnId: stringOrUndefined(root.turnId) ?? stringOrUndefined(root.turn_id),
+    ...data,
+    threadId:
+      stringOrUndefined(data.threadId) ??
+      stringOrUndefined(data.thread_id) ??
+      stringOrUndefined(root.threadId) ??
+      stringOrUndefined(root.thread_id),
+    turnId:
+      stringOrUndefined(data.turnId) ??
+      stringOrUndefined(data.turn_id) ??
+      stringOrUndefined(root.turnId) ??
+      stringOrUndefined(root.turn_id),
     itemId:
-      stringOrUndefined(root.itemId) ??
-      stringOrUndefined(root.item_id) ??
+      stringOrUndefined(data.itemId) ??
+      stringOrUndefined(data.item_id) ??
       stringOrUndefined(item.id) ??
       stringOrUndefined(item.itemId) ??
       stringOrUndefined(item.item_id),
+    timestamp: stringOrUndefined(root.timestamp) ?? stringOrUndefined(data.timestamp),
+    recordType: stringOrUndefined(root.type),
+    phase: compactionPhase(sourceType, method),
     sourceMethod: method,
     sourceType: sourceType ?? method,
   }

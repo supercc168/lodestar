@@ -40,6 +40,7 @@ export interface TurnState {
   planUpdateCount: number
   goalUpdateCount: number
   contextCompactCount: number
+  contextCompactionPending: Map<string, { i: number; cardId: string; notice: any }>
   /** Consecutive `Read` calls collapse into a single panel rendered by
    * `cards.readBatchElement`. Keyed by element index `i` so completeTool
    * can find the batch after its open-window closed (a non-Read tool or

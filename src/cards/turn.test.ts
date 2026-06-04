@@ -57,31 +57,48 @@ describe('main conversation card rendering', () => {
 })
 
 describe('plan and goal rendering', () => {
-  test('renders context compaction marker loudly', () => {
+  test('renders context compaction pending panel', () => {
     const el = contextCompactionElement(1, {
       threadId: 'thread-123',
       turnId: 'turn-456',
       itemId: 'item-789',
-      totalTokens: 120000,
-      modelContextWindow: 258400,
-      summary: '历史已压缩',
-      sourceMethod: 'event_msg',
-      sourceType: 'context_compacted',
+      phase: 'start',
+      sourceMethod: 'item/started',
+      sourceType: 'contextCompaction',
     }, 'context_compact_1') as any
 
     expect(el.element_id).toBe('context_compact_1')
-    expect(el.tag).toBe('markdown')
-    expect(el.content).toContain('🚨🚨🚨 CONTEXT COMPACTED / 上下文已压缩 🚨🚨🚨')
-    expect(el.content).toContain('压缩发生在这里')
-    expect(el.content).toContain('- 事件: event_msg')
-    expect(el.content).toContain('- 类型: context_compacted')
-    expect(el.content).toContain('- 序号: 2')
-    expect(el.content).toContain('- thread: thread-123')
-    expect(el.content).toContain('- turn: turn-456')
-    expect(el.content).toContain('- item: item-789')
-    expect(el.content).toContain('- tokens: 120000')
-    expect(el.content).toContain('- window: 258400')
-    expect(el.content).toContain('- summary: 历史已压缩')
+    expect(el.tag).toBe('collapsible_panel')
+    expect(el.expanded).toBe(false)
+    expect(el.header.title.content).toContain('⏳ 🚨 上下文压缩 #2')
+    const body = el.elements[0].content
+    expect(body).toBe('压缩中...')
+  })
+
+  test('renders completed compaction with duration and no summary placeholder', () => {
+    const el = contextCompactionElement(0, {
+      phase: 'end',
+      sourceType: 'contextCompaction',
+      startedAtMs: 1780541325287,
+      completedAtMs: 1780541433236,
+    }, 'context_compact_0') as any
+
+    expect(el.header.title.content).toContain('✅ 🚨 上下文压缩 #1 · 耗时 1m 48s')
+    expect(el.header.title.content).not.toContain('结束压缩')
+    expect(el.elements[0].content).toBe('暂无有效摘要信息')
+  })
+
+  test('renders completed compaction without summary fields explicitly', () => {
+    const el = contextCompactionElement(0, {
+      phase: 'end',
+      sourceType: 'contextCompaction',
+      itemId: 'compact-1',
+    }, 'context_compact_0') as any
+
+    const body = el.elements[0].content
+    expect(el.header.title.content).toContain('✅ 🚨 上下文压缩 #1')
+    expect(body).toBe('暂无有效摘要信息')
+    expect(body).not.toContain('MISS')
   })
 
   test('renders authoritative turn plan statuses', () => {

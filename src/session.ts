@@ -33,7 +33,7 @@ import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
 import { readSysInfo } from './sysinfo'
-import { readUsage, type UsageSnapshot } from './usage'
+import { readUsage, updateUsageFromRateLimits, type UsageSnapshot } from './usage'
 import { contextLimitFromAppServer, contextTokenRatioLabel, contextTokensFromUsage } from './context-window'
 import { extractSendMarkerPaths } from './outbound-markers'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
@@ -43,6 +43,24 @@ import * as sessionPermission from './session-permission'
 import * as worktree from './worktree'
 
 export type { SessionOpts } from './session-types'
+
+function compactionKey(notice: ContextCompactedNotification): string {
+  return notice.itemId || notice.turnId || '__latest__'
+}
+
+function latestPendingCompactionKey(turn: TurnState): string | null {
+  let key: string | null = null
+  for (const k of turn.contextCompactionPending.keys()) key = k
+  return key
+}
+
+function mergeCompactionNotices(
+  start: ContextCompactedNotification | undefined,
+  end: ContextCompactedNotification,
+): ContextCompactedNotification {
+  if (!start) return end
+  return { ...start, ...end, phase: 'end' }
+}
 
 const FOOTER_STATUS_TICK_MS = 1000
 const FOOTER_THINKING_PREFIX = 'Thinking...'
@@ -1345,6 +1363,9 @@ export class Session {
     p.on('context_compacted', (notice: ContextCompactedNotification) => {
       this.handleContextCompacted(notice)
     })
+    p.on('rate_limits_updated', (rateLimits: any) => {
+      updateUsageFromRateLimits(rateLimits)
+    })
     p.on('thread_goal_updated', (goal: ThreadGoal) => {
       this.handleThreadGoalUpdated(goal)
     })
@@ -1589,6 +1610,7 @@ export class Session {
       planUpdateCount: 0,
       goalUpdateCount: 0,
       contextCompactCount: 0,
+      contextCompactionPending: new Map(),
       readBatches: new Map(),
       openReadBatchI: null,
       assistantSegmentCount: 0,
@@ -1761,7 +1783,7 @@ export class Session {
             await cardkit.deleteElement(oldCardId, carrySegId)
           }
           const compactNote = turn.contextCompactCount > 0
-            ? ` · 🚨 上下文已压缩 ×${turn.contextCompactCount} 🚨`
+            ? ` · 🚨 压缩×${turn.contextCompactCount}`
             : ''
           await cardkit.streamText(oldCardId, cards.ELEMENTS.footer, `📨 已续至下一张卡 ↓${compactNote}`)
           cardkit.cancelSummary(oldCardId)
@@ -1824,6 +1846,10 @@ export class Session {
   private handleContextCompacted(notice: ContextCompactedNotification): void {
     const turn = this.currentTurn
     if (!turn) {
+      if (notice.phase === 'start') {
+        log(`session "${this.sessionName}": context compaction start with no current turn`)
+        return
+      }
       log(`session "${this.sessionName}": context compacted with no current turn`)
       void feishu.sendTextRaw(this.chatId, '🚨🚨🚨 CONTEXT COMPACTED / 上下文已压缩 🚨🚨🚨\n\nCodex 报告发生了上下文压缩,但当前没有可写的对话卡片。')
       return
@@ -1832,14 +1858,38 @@ export class Session {
     if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
     turn.openReadBatchI = null
     this.maybeMidTurnRotate()
-    const i = turn.contextCompactCount++
+    if (notice.phase === 'start') {
+      const i = turn.contextCompactCount++
+      const key = compactionKey(notice)
+      turn.contextCompactionPending.set(key, { i, cardId: turn.cardId, notice })
+      const elementId = cards.ELEMENTS.contextCompact(i)
+      log(`session "${this.sessionName}": context compaction start #${i + 1} key=${key}`)
+      void cardkit.addElement(turn.cardId, cards.contextCompactionElement(i, notice, elementId), {
+        type: 'insert_before',
+        targetElementId: cards.ELEMENTS.footer,
+      })
+      cardkit.patchSummaryThrottled(turn.cardId, `🚨 压缩×${turn.contextCompactCount}`)
+      return
+    }
+    const key = notice.itemId && turn.contextCompactionPending.has(notice.itemId)
+      ? notice.itemId
+      : latestPendingCompactionKey(turn)
+    const pending = key ? turn.contextCompactionPending.get(key) : undefined
+    if (key) turn.contextCompactionPending.delete(key)
+    const merged = mergeCompactionNotices(pending?.notice, notice)
+    const i = pending?.i ?? turn.contextCompactCount++
+    const cardId = pending?.cardId ?? turn.cardId
     const elementId = cards.ELEMENTS.contextCompact(i)
-    log(`session "${this.sessionName}": context compacted marker #${i + 1}`)
-    void cardkit.addElement(turn.cardId, cards.contextCompactionElement(i, notice, elementId), {
-      type: 'insert_before',
-      targetElementId: cards.ELEMENTS.footer,
-    })
-    cardkit.patchSummaryThrottled(turn.cardId, '🚨 上下文已压缩 / CONTEXT COMPACTED')
+    log(`session "${this.sessionName}": context compaction completed #${i + 1}${key ? ` key=${key}` : ''}`)
+    if (pending) {
+      void cardkit.replaceElement(cardId, elementId, cards.contextCompactionElement(i, merged, elementId))
+    } else {
+      void cardkit.addElement(cardId, cards.contextCompactionElement(i, merged, elementId), {
+        type: 'insert_before',
+        targetElementId: cards.ELEMENTS.footer,
+      })
+    }
+    cardkit.patchSummaryThrottled(turn.cardId, `🚨 压缩×${turn.contextCompactCount}`)
   }
 
   private handleTurnPlanUpdated(update: TurnPlanUpdated): void {
@@ -2093,7 +2143,7 @@ export class Session {
     // 被截好得多。
     const sendNote = turn.outboundSentPaths.size ? ` · 📎 ${turn.outboundSentPaths.size}` : ''
     const compactNote = turn.contextCompactCount > 0
-      ? ` · 🚨 上下文已压缩 ×${turn.contextCompactCount} 🚨`
+      ? ` · 🚨 压缩×${turn.contextCompactCount}`
       : ''
     // State marker leads the footer (✅ for natural completion, or the
     // suffix verbatim for non-natural states like `🛑 打断`). The

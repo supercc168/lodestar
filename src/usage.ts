@@ -116,6 +116,20 @@ function windowFromRateLimit(w: any): UsageWindow | null {
   }
 }
 
+export function updateUsageFromRateLimits(rateLimits: any): UsageSnapshot {
+  if (!rateLimits) return { state: 'network', reason: 'empty rate limit update' }
+  const snapshot: UsageSnapshotOk = {
+    state: 'ok',
+    subscriptionType: rateLimits.planType,
+    fiveHour: windowFromRateLimit(rateLimits.primary),
+    weekly: windowFromRateLimit(rateLimits.secondary),
+    fetchedAt: Date.now(),
+  }
+  cache = { data: snapshot, at: Date.now() }
+  lastOk = { snapshot, at: Date.now() }
+  return snapshot
+}
+
 async function fetchUsage(): Promise<UsageSnapshot> {
   const app = new AppServerOnce()
   try {

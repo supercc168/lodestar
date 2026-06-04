@@ -7,8 +7,8 @@
  *   tool_<i>          — one collapsible per tool call, indexed from 0
  *   plan_update_<i>   — timeline snapshot inserted where a plan update occurs
  *   goal_update_<i>   — timeline snapshot inserted where a goal update occurs
- *   context_compact_<i> — timeline marker inserted where Codex reports that
- *                       it compacted the active context.
+ *   context_compact_<i> — collapsible context-compaction lifecycle panel.
+ *                       item/started creates it; item/completed replaces it.
  *   assistant         — the main streaming assistant answer
  *   footer            — runtime footer. While the model is silent it
  *                       shows `Thinking...(Ns)`; while visible work is
