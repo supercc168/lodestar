@@ -54,6 +54,8 @@ function messageOf(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }
 
+type WorktreeActionResult = { ok: boolean; message: string; card: object }
+
 /** Soft cap on element count per Feishu card before we proactively
  * rotate to a fresh one. The hard ceiling is NOT ~100 as once assumed:
  * a 2026-05-23 dogfood turn hit `300305 [element exceeds the limit]` at
@@ -686,43 +688,48 @@ export class Session {
     }
   }
 
-  async showWorktrees(): Promise<void> {
+  private async buildWorktreeListCard(notice?: { type: 'success' | 'error' | 'info'; content: string }): Promise<object> {
     const projectName = this.worktreeProjectName()
     const projectDir = this.worktreeProjectDir()
+    const entries = worktree.listProjectWorktrees(projectDir, projectName)
+    const hiddenMergedUnmountedCount = entries.filter(
+      entry => entry.state === 'merged' && !entry.mounted,
+    ).length
+    const visibleEntries = entries.filter(entry => entry.state !== 'merged' || entry.mounted)
+    const chatIndex = await feishu.listNormalChatIdsByName()
+    return cards.worktreeListCard({
+      projectName,
+      projectDir,
+      hiddenMergedUnmountedCount,
+      notice,
+      entries: visibleEntries.map(entry => {
+        const ids = chatIndex.get(entry.chatName) ?? []
+        const preferred = feishu.preferredChatForSession.get(entry.chatName)
+        const chatId = preferred && ids.includes(preferred)
+          ? preferred
+          : ids.length === 1
+            ? ids[0]
+            : null
+        return {
+          slug: entry.slug,
+          chatName: entry.chatName,
+          branch: entry.branch,
+          state: entry.state,
+          path: entry.worktreePath ?? entry.expectedPath,
+          mounted: entry.mounted,
+          dirtyCount: entry.dirtyCount,
+          statusLine: entry.statusLine,
+          error: entry.error,
+          chatId,
+          duplicateChatCount: ids.length,
+        }
+      }),
+    })
+  }
+
+  async showWorktrees(): Promise<void> {
     try {
-      const entries = worktree.listProjectWorktrees(projectDir, projectName)
-      const hiddenMergedUnmountedCount = entries.filter(
-        entry => entry.state === 'merged' && !entry.mounted,
-      ).length
-      const visibleEntries = entries.filter(entry => entry.state !== 'merged' || entry.mounted)
-      const chatIndex = await feishu.listNormalChatIdsByName()
-      const card = cards.worktreeListCard({
-        projectName,
-        projectDir,
-        hiddenMergedUnmountedCount,
-        entries: visibleEntries.map(entry => {
-          const ids = chatIndex.get(entry.chatName) ?? []
-          const preferred = feishu.preferredChatForSession.get(entry.chatName)
-          const chatId = preferred && ids.includes(preferred)
-            ? preferred
-            : ids.length === 1
-              ? ids[0]
-              : null
-          return {
-            slug: entry.slug,
-            chatName: entry.chatName,
-            branch: entry.branch,
-            state: entry.state,
-            path: entry.worktreePath ?? entry.expectedPath,
-            mounted: entry.mounted,
-            dirtyCount: entry.dirtyCount,
-            statusLine: entry.statusLine,
-            error: entry.error,
-            chatId,
-            duplicateChatCount: ids.length,
-          }
-        }),
-      })
+      const card = await this.buildWorktreeListCard()
       const messageId = await feishu.sendCard(this.chatId, card)
       if (!messageId) await feishu.sendTextRaw(this.chatId, '❌ wt 列表失败')
     } catch (e) {
@@ -730,9 +737,33 @@ export class Session {
     }
   }
 
-  async onWorktreeDisband(slugRaw: string): Promise<{ ok: boolean; message: string }> {
+  private async worktreeActionResult(
+    ok: boolean,
+    message: string,
+    type: 'success' | 'error' | 'info',
+  ): Promise<WorktreeActionResult> {
+    try {
+      return { ok, message, card: await this.buildWorktreeListCard({ type, content: message }) }
+    } catch (e) {
+      const listError = `列表刷新失败: ${messageOf(e)}`
+      log(`session "${this.sessionName}": wt action panel refresh failed: ${messageOf(e)}`)
+      return {
+        ok: false,
+        message: `${message}\n${listError}`,
+        card: cards.worktreeNoticeCard({
+          slug: 'wt',
+          branch: 'work/*',
+          status: message,
+          body: listError,
+          template: 'red',
+        }),
+      }
+    }
+  }
+
+  async onWorktreeDisband(slugRaw: string): Promise<WorktreeActionResult> {
     const slug = worktree.normalizeWorktreeSlug(slugRaw)
-    if (!slug) return { ok: false, message: '名称无效' }
+    if (!slug) return this.worktreeActionResult(false, '❌ 名称无效', 'error')
     const projectName = this.worktreeProjectName()
     const projectDir = this.worktreeProjectDir()
     try {
@@ -740,29 +771,21 @@ export class Session {
       const runningSession = [...Session.all].find(s => s.sessionName === chatName && s.isRunning())
       if (runningSession) {
         const message = `❌ 解散 ${slug} 失败: Codex 正在运行，请先在 ${chatName} 群里 stop 或 kill。`
-        await feishu.sendText(this.chatId, message)
-        return { ok: false, message }
+        return this.worktreeActionResult(false, message, 'error')
       }
       worktree.assertProjectWorktreeClean(projectDir, projectName, slug)
       const disbanded = await feishu.disbandChatForSession(chatName)
       const removed = worktree.removeProjectWorktreeIfClean(projectDir, projectName, slug)
-      const card = cards.worktreeNoticeCard({
-        slug,
-        branch: removed.branch,
-        status: '已解散',
-        body: [
-          removed.removedWorktree ? 'dir removed' : 'dir missing',
-          disbanded.disbanded ? 'group removed' : 'group missing',
-        ].join('\n'),
-        template: 'grey',
-      })
-      const messageId = await feishu.sendCard(this.chatId, card)
-      if (!messageId) await feishu.sendTextRaw(this.chatId, `✅ ${slug} 已解散`)
-      return { ok: true, message: '已解散' }
+      const message = [
+        `✅ ${slug} 已解散`,
+        removed.removedWorktree ? 'dir removed' : 'dir missing',
+        disbanded.disbanded ? 'group removed' : 'group missing',
+        removed.branch,
+      ].join('\n')
+      return this.worktreeActionResult(true, message, 'success')
     } catch (e) {
       const message = `❌ 解散 ${slug} 失败: ${messageOf(e)}`
-      await feishu.sendText(this.chatId, message)
-      return { ok: false, message }
+      return this.worktreeActionResult(false, message, 'error')
     }
   }
 

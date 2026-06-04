@@ -44,6 +44,7 @@ export {
 export {
   type WorktreeCardEntry,
   type WorktreeListCardOpts,
+  type WorktreeListNotice,
   type WorktreeNoticeCardOpts,
   worktreeListCard,
   worktreeNoticeCard,
