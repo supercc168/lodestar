@@ -15,11 +15,15 @@
  */
 
 import { existsSync } from 'node:fs'
+import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
 import {
   CODEX_EFFORT,
   CodexProcess,
+  isCodexReasoningEffort,
   type CanUseToolRequest,
+  type CodexModel,
+  type CodexReasoningEffort,
   type CodexUsage,
   type ContextCompactedNotification,
   type HookCallbackRequest,
@@ -68,8 +72,27 @@ const FOOTER_WORKING = 'Working...'
 const RESUME_INIT_NOTICE_MS = 10_000
 const RESUME_INIT_TIMEOUT_MS = 120_000
 
+interface ModelPanelState {
+  cardId: string | null
+  models: cards.ModelChoice[]
+}
+
 function messageOf(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
+}
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs / 1000}s`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
 }
 
 /** Soft cap on element count per Feishu card before we proactively
@@ -250,6 +273,9 @@ export class Session {
   // `restart` can resume an in-flight conversation even if the daemon
   // exits before the turn finishes.
   private lastSessionId: string | null = null
+  private selectedModel: string | null = null
+  private selectedEffort: CodexReasoningEffort | null = null
+  private modelPanels = new Map<string, ModelPanelState>()
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
   private lastTurnDelta: LastTurnDelta | null = null
@@ -267,6 +293,12 @@ export class Session {
     if (this.lastSessionId) {
       log(`session "${sessionName}": restored lastSessionId=${this.lastSessionId.slice(0, 8)}…`)
     }
+    const selection = feishu.getSessionModelSelection(sessionName)
+    this.selectedModel = selection?.model ?? null
+    this.selectedEffort = selection?.effort ?? null
+    if (this.selectedModel) {
+      log(`session "${sessionName}": restored selected model=${this.selectedModel} effort=${this.selectedEffort ?? 'unset'}`)
+    }
   }
 
   /** Minimal cross-chat snapshot for the `hi` peer-list section.
@@ -281,6 +313,37 @@ export class Session {
 
   get workDir(): string { return join(feishu.PROJECTS_ROOT, this.sessionName) }
   isRunning(): boolean { return !!this.proc && this.proc.isAlive() }
+
+  private modelForSpawn(): string | undefined {
+    return this.selectedModel ?? undefined
+  }
+
+  private effortForSpawn(): CodexReasoningEffort {
+    return this.selectedEffort ?? CODEX_EFFORT
+  }
+
+  private currentModelLabel(): string | null {
+    return this.selectedModel ?? this.proc?.lastModel ?? null
+  }
+
+  private currentEffortLabel(): CodexReasoningEffort {
+    return this.selectedEffort ?? this.proc?.lastEffort ?? CODEX_EFFORT
+  }
+
+  private modelEffortLabel(): string {
+    const model = this.currentModelLabel()
+    const effort = this.currentEffortLabel()
+    return model ? `${model}/${effort}` : effort
+  }
+
+  private withModel(text: string): string {
+    const label = this.modelEffortLabel()
+    return text.includes(label) ? text : `${text} · ${label}`
+  }
+
+  private modelLine(): string {
+    return this.modelEffortLabel()
+  }
 
   private startFooterTimer(
     cardId: string,
@@ -377,7 +440,7 @@ export class Session {
     const announce = opts.announce ?? true
     const report = opts.onStatus
     if (this.isRunning()) {
-      report?.('✅ Codex 已运行')
+      report?.(this.withModel('✅ Codex 已运行'))
       return true
     }
     report?.('🔎 检查 Codex 登录')
@@ -405,10 +468,11 @@ export class Session {
 
     this.status = 'starting'
     this.currentGoal = null
-    report?.('🚀 启动 Codex')
+    report?.(this.withModel('🚀 启动 Codex'))
     this.proc = new CodexProcess({
       workDir: this.workDir,
-      effort: CODEX_EFFORT,
+      model: this.modelForSpawn(),
+      effort: this.effortForSpawn(),
       appendSystemPrompt: CHANNEL_INSTRUCTIONS,
     })
     this.wireProc(this.proc)
@@ -434,16 +498,20 @@ export class Session {
     }
     if (init.state === 'timeout') {
       log(`session "${this.sessionName}": init wait timeout (5s) — proceeding`)
-      report?.('⏳ Codex 已启动，init 确认超时')
+      report?.(this.withModel('⏳ Codex 已启动，init 确认超时'))
     }
 
     if (announce) {
-      await feishu.sendText(this.chatId, `✅ Lodestar session "${this.sessionName}" 已就绪，发消息开始对话。`)
+      const modelLine = this.modelLine()
+      await feishu.sendText(this.chatId, [
+        `✅ Lodestar session "${this.sessionName}" 已就绪，发消息开始对话。`,
+        modelLine,
+      ].filter(Boolean).join('\n'))
     }
     this.status = 'idle'
     this.startedAt = Date.now()
     this.opts.onLifecycleChange?.()
-    report?.('✅ Codex 已就绪')
+    report?.(this.withModel('✅ Codex 已就绪'))
     return true
   }
 
@@ -571,8 +639,8 @@ export class Session {
     let statusCard: StatusCardHandle | null = null
     if (!report && announce && resume && prevSessionId) {
       const initialStatus = this.proc
-        ? '🔁 重启 Codex'
-        : `🔁 恢复上一会话 thread=${prevThreadLabel}…`
+        ? this.withModel('🔁 重启 Codex')
+        : this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}…`)
       statusCard = await this.openStatusCard('restart', initialStatus)
       if (statusCard) report = status => this.setStatusCard(statusCard, status)
     }
@@ -598,10 +666,11 @@ export class Session {
     this.pendingPermissions.clear()
     if (resume && prevSessionId) {
       this.status = 'starting'
-      report?.(`🔁 恢复上一会话 thread=${prevThreadLabel}…`)
+      report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}…`))
       this.proc = new CodexProcess({
         workDir: this.workDir,
-        effort: CODEX_EFFORT,
+        model: this.modelForSpawn(),
+        effort: this.effortForSpawn(),
         resumeSessionId: prevSessionId,
         appendSystemPrompt: CHANNEL_INSTRUCTIONS,
       })
@@ -610,7 +679,7 @@ export class Session {
       report?.('⏳ 等待 Codex init 确认')
       const init = await this.waitForProcResumeInit(this.proc, () => {
         log(`session "${this.sessionName}": resume init still pending after ${RESUME_INIT_NOTICE_MS / 1000}s`)
-        report?.(`⏳ 仍在等待 Codex init 确认 thread=${prevThreadLabel}…`)
+        report?.(this.withModel(`⏳ 仍在等待 Codex init 确认 thread=${prevThreadLabel}…`))
       })
       if (init.state === 'error' || init.state === 'exit' || init.state === 'timeout') {
         log(`session "${this.sessionName}": codex resume failed: ${init.error ?? init.state}`)
@@ -626,7 +695,7 @@ export class Session {
         await closeInternalStatusCard(finalStatus)
         return false
       }
-      const msg = `✅ 已恢复上一会话 thread=${prevThreadLabel}…`
+      const msg = this.withModel(`✅ 已恢复上一会话 thread=${prevThreadLabel}…`)
       report?.(msg)
       if (announceText) await feishu.sendText(this.chatId, msg)
       this.status = 'idle'
@@ -743,6 +812,193 @@ export class Session {
     }
   }
 
+  private modelListCwd(): string {
+    if (existsSync(this.workDir)) return this.workDir
+    if (existsSync(feishu.PROJECTS_ROOT)) return feishu.PROJECTS_ROOT
+    return process.cwd()
+  }
+
+  private async listAvailableModels(): Promise<CodexModel[]> {
+    if (this.proc?.isAlive()) {
+      return await withTimeout(this.proc.listModels(), 20_000, 'model/list')
+    }
+    if (!feishu.isOpenAIChatGPTAuthenticated()) {
+      throw new Error('Codex 未登录 ChatGPT 账号。请在服务器上运行 `codex login` 后再试。')
+    }
+    const proc = new CodexProcess({
+      workDir: this.modelListCwd(),
+      effort: this.effortForSpawn(),
+      appendSystemPrompt: CHANNEL_INSTRUCTIONS,
+    })
+    try {
+      return await withTimeout(proc.listModels(), 20_000, 'model/list')
+    } finally {
+      await proc.kill(1000).catch(e => log(`session "${this.sessionName}": temp model-list proc kill failed: ${e}`))
+    }
+  }
+
+  async showModelPanel(): Promise<void> {
+    let models: CodexModel[]
+    try {
+      models = await this.listAvailableModels()
+    } catch (e) {
+      const message = `❌ 模型列表失败: ${messageOf(e)}`
+      log(`session "${this.sessionName}": model list failed: ${messageOf(e)}`)
+      await feishu.sendText(this.chatId, message)
+      return
+    }
+
+    const panelId = randomUUID()
+    const currentModel = this.currentModelLabel()
+    const currentEffort = this.currentEffortLabel()
+    const choices = this.modelChoices(models)
+    this.modelPanels.set(panelId, { cardId: null, models: choices })
+    const messageId = await feishu.sendCard(this.chatId, cards.modelSelectionCard({
+      sessionName: this.sessionName,
+      panelId,
+      currentModel,
+      currentEffort,
+      models: choices,
+    }))
+    if (!messageId) {
+      this.modelPanels.delete(panelId)
+      await feishu.sendTextRaw(this.chatId, '❌ 模型面板发送失败')
+      return
+    }
+    try {
+      const cardId = await cardkit.convertMessageToCard(messageId)
+      const state = this.modelPanels.get(panelId)
+      if (state) state.cardId = cardId
+      cardkit.recordCardCreated(cardId, 1)
+    } catch (e) {
+      this.modelPanels.delete(panelId)
+      log(`session "${this.sessionName}": model card id_convert failed: ${e}`)
+      await feishu.sendTextRaw(this.chatId, '❌ 模型面板初始化失败')
+    }
+  }
+
+  private modelChoices(models: CodexModel[]): cards.ModelChoice[] {
+    const seen = new Set<string>()
+    const currentModel = this.currentModelLabel()
+    const currentEffort = this.currentEffortLabel()
+    const choices: cards.ModelChoice[] = []
+    for (const m of models) {
+      if (seen.has(m.model)) continue
+      seen.add(m.model)
+      choices.push({
+        model: m.model,
+        displayName: m.displayName,
+        description: m.description,
+        isDefault: m.isDefault,
+        selected: currentModel === m.model,
+        efforts: m.supportedReasoningEfforts.map(effort => ({
+          effort: effort.reasoningEffort,
+          description: effort.description,
+          isDefault: m.defaultReasoningEffort === effort.reasoningEffort,
+          selected: currentModel === m.model && currentEffort === effort.reasoningEffort,
+        })),
+      })
+    }
+    return choices
+  }
+
+  private initialEffortForModel(model: cards.ModelChoice): string | null {
+    const currentEffort = this.currentEffortLabel()
+    if (model.selected && model.efforts.some(effort => effort.effort === currentEffort)) return currentEffort
+    return model.efforts.find(effort => effort.isDefault)?.effort ?? model.efforts[0]?.effort ?? null
+  }
+
+  private modelSelectionScope(): string {
+    return this.currentTurn
+      ? '当前 turn 不变,下一轮开始使用。'
+      : this.proc?.isAlive()
+        ? '下一轮开始使用。'
+        : '下次启动 Codex 时使用。'
+  }
+
+  async onModelSelect(modelRaw: string, panelIdRaw = '', _userOpenId = ''): Promise<{ ok: boolean; message: string }> {
+    const model = modelRaw.trim()
+    if (!model) {
+      const message = '模型为空'
+      await feishu.sendText(this.chatId, `❌ ${message}`)
+      return { ok: false, message }
+    }
+    const panelId = panelIdRaw.trim()
+    const panel = this.modelPanels.get(panelId)
+    if (!panel?.cardId) {
+      return { ok: false, message: '模型面板已过期,请重新发送 model' }
+    }
+    const choice = panel.models.find(m => m.model === model)
+    if (!choice) {
+      return { ok: false, message: '模型不在当前面板列表中,请重新发送 model' }
+    }
+    const selectedEffort = this.initialEffortForModel(choice)
+    try {
+      await cardkit.replaceElement(panel.cardId, cards.ELEMENTS.modelPanel, cards.modelEffortPanelElement({
+        sessionName: this.sessionName,
+        panelId,
+        currentModel: this.currentModelLabel(),
+        currentEffort: this.currentEffortLabel(),
+        selectedModel: choice,
+        selectedEffort,
+      }))
+      return {
+        ok: choice.efforts.length > 0,
+        message: choice.efforts.length > 0 ? `已选择模型 ${model},请选择 effort` : '这个模型未返回可用 effort',
+      }
+    } catch (e) {
+      const message = `模型面板更新失败: ${messageOf(e)}`
+      log(`session "${this.sessionName}": model panel update failed: ${messageOf(e)}`)
+      await feishu.sendText(this.chatId, `❌ ${message}`)
+      return { ok: false, message }
+    }
+  }
+
+  async onModelEffortSelect(modelRaw: string, effortRaw: string, panelIdRaw = '', _userOpenId = ''): Promise<{ ok: boolean; message: string }> {
+    const model = modelRaw.trim()
+    const effortValue = effortRaw.trim()
+    if (!model) return { ok: false, message: '模型为空' }
+    if (!isCodexReasoningEffort(effortValue)) return { ok: false, message: 'reasoning effort 无效' }
+    const effort: CodexReasoningEffort = effortValue
+    const panelId = panelIdRaw.trim()
+    const panel = this.modelPanels.get(panelId)
+    if (!panel?.cardId) {
+      return { ok: false, message: '模型面板已过期,请重新发送 model' }
+    }
+    const choice = panel.models.find(m => m.model === model)
+    if (!choice) return { ok: false, message: '模型不在当前面板列表中,请重新发送 model' }
+    if (!choice.efforts.some(item => item.effort === effort)) {
+      return { ok: false, message: 'reasoning effort 不属于该模型' }
+    }
+    try {
+      if (this.proc?.isAlive()) {
+        await withTimeout(this.proc.setModelSettings(model, effort), 20_000, 'thread/settings/update')
+      }
+      this.selectedModel = model
+      this.selectedEffort = effort
+      feishu.bindSessionModel(this.sessionName, model, effort)
+      const scope = this.modelSelectionScope()
+      try {
+        await cardkit.replaceElement(panel.cardId, cards.ELEMENTS.modelPanel, cards.modelResultPanelElement({
+          sessionName: this.sessionName,
+          model,
+          effort,
+          scope,
+        }))
+      } catch (e) {
+        log(`session "${this.sessionName}": model result panel update failed: ${e}`)
+        await feishu.sendText(this.chatId, `✅ 已选择 ${model}/${effort}\n${scope}`)
+      }
+      this.modelPanels.delete(panelId)
+      return { ok: true, message: `已选择 ${model} / ${effort}` }
+    } catch (e) {
+      const message = `模型切换失败: ${messageOf(e)}`
+      log(`session "${this.sessionName}": set model settings failed: ${messageOf(e)}`)
+      await feishu.sendText(this.chatId, `❌ ${message}`)
+      return { ok: false, message }
+    }
+  }
+
   async onWorktreeDisband(slugRaw: string): Promise<{ ok: boolean; message: string }> {
     const slug = worktree.normalizeWorktreeSlug(slugRaw)
     if (!slug) return { ok: false, message: '名称无效' }
@@ -773,7 +1029,7 @@ export class Session {
     }
   }
 
-  /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`).
+  /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `model`).
    * Returns true if the command was consumed (don't forward to Codex).
    * Exact match, case-insensitive, ignores trailing whitespace.
    *
@@ -792,13 +1048,16 @@ export class Session {
       return true
     }
     switch (raw.trim().toLowerCase()) {
+      case 'model':
+        await this.showModelPanel()
+        return true
       case 'hi':
         {
           const needsStart = !this.isRunning()
           const statusCard = needsStart
-            ? await this.openStatusCard('hi', '🚀 启动 Codex')
+            ? await this.openStatusCard('hi', this.withModel('🚀 启动 Codex'))
             : null
-          let lastStatus = '🚀 启动 Codex'
+          let lastStatus = this.withModel('🚀 启动 Codex')
           const ok = needsStart
             ? await this.start({
                 announce: !statusCard,
@@ -813,10 +1072,10 @@ export class Session {
             return true
           }
           if (statusCard) {
-            await this.replaceStatusCardWithConsole(statusCard, '✅ Codex 已就绪')
+            await this.replaceStatusCardWithConsole(statusCard, this.withModel('✅ Codex 已就绪'))
             return true
           }
-          if (needsStart) await this.closeStatusCard(statusCard, '✅ Codex 已就绪')
+          if (needsStart) await this.closeStatusCard(statusCard, this.withModel('✅ Codex 已就绪'))
         }
         await this.showConsole()
         return true
@@ -898,10 +1157,10 @@ export class Session {
         {
           const resumeThreadLabel = this.lastSessionId ? this.lastSessionId.slice(0, 8) : ''
           const initialStatus = this.isRunning()
-            ? '🔁 重启 Codex'
+            ? this.withModel('🔁 重启 Codex')
             : resumeThreadLabel
-              ? `🔁 恢复上一会话 thread=${resumeThreadLabel}…`
-              : '🔁 启动 Codex'
+              ? this.withModel(`🔁 恢复上一会话 thread=${resumeThreadLabel}…`)
+              : this.withModel('🔁 启动 Codex')
           const statusCard = await this.openStatusCard('restart', initialStatus)
           let lastStatus = initialStatus
           const ok = await this.restart(true, {
@@ -914,7 +1173,7 @@ export class Session {
           const finalStatus = ok
             ? (lastStatus.startsWith('✅') ? lastStatus : (resumeThreadLabel ? '✅ 已恢复上一会话' : '✅ Codex 已就绪'))
             : (lastStatus.startsWith('❌') ? lastStatus : '❌ 重启失败')
-          await this.closeStatusCard(statusCard, finalStatus)
+          await this.closeStatusCard(statusCard, ok ? this.withModel(finalStatus) : finalStatus)
         }
         return true
       case 'clear':
@@ -945,7 +1204,7 @@ export class Session {
               this.setStatusCard(statusCard, status)
             },
           })
-          await this.closeStatusCard(statusCard, ok ? '✅ 已清空并启动新会话' : (lastStatus.startsWith('❌') ? lastStatus : '❌ 清空失败'))
+          await this.closeStatusCard(statusCard, ok ? this.withModel('✅ 已清空并启动新会话') : (lastStatus.startsWith('❌') ? lastStatus : '❌ 清空失败'))
         }
         return true
     }
@@ -958,14 +1217,14 @@ export class Session {
    * caller is responsible for the async patch if the panel was sent. */
   async buildConsoleOpts(usage: UsageSnapshot | undefined): Promise<cards.ConsoleOpts> {
     const uptimeMs = this.startedAt ? (Date.now() - this.startedAt) : undefined
-    const rawModel = this.proc?.lastModel ?? null
+    const rawModel = this.currentModelLabel()
     const model = rawModel ?? undefined
     const sysinfo = await readSysInfo()
     return {
       sessionName: this.sessionName,
       status: this.status,
       model,
-      effort: CODEX_EFFORT,
+      effort: this.currentEffortLabel(),
       uptimeMs,
       peers: [...Session.all]
         .filter(s => s.isRunning())
@@ -1074,7 +1333,11 @@ export class Session {
       })
       const turn = this.currentTurn
       if (!turn) return
-      const bootTimer = this.startFooterTimer(turn.cardId, '🚀 启动 Codex')
+      const bootTimer = this.startFooterTimer(
+        turn.cardId,
+        '🚀 启动 Codex',
+        status => this.withModel(status),
+      )
       let lastBootStatus = '🚀 启动 Codex'
       const ok = await this.start({
         announce: false,
@@ -1560,13 +1823,15 @@ export class Session {
     const userInputs = this.pendingTurnInputs
     this.pendingTurnInputs = []
     log(`session "${this.sessionName}": openTurnCard turn=${turn} trigger=${trigger} inputs=${userInputs.length}`)
+    const initialFooter = this.withModel(opts.initialFooter ?? 'Waiting...(0s)')
     const card = cards.mainConversationCard({
       sessionName: this.sessionName,
       turn,
-      effort: CODEX_EFFORT,
+      model: this.currentModelLabel() ?? undefined,
+      effort: this.currentEffortLabel(),
       kind: trigger,
       userInputs,
-      initialFooter: opts.initialFooter,
+      initialFooter,
     })
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) {
@@ -1705,7 +1970,8 @@ export class Session {
         const card = cards.mainConversationCard({
           sessionName: this.sessionName,
           turn: this.turnCounter,
-          effort: CODEX_EFFORT,
+          model: this.currentModelLabel() ?? undefined,
+          effort: this.currentEffortLabel(),
           kind: 'card_full',
           userInputs: [],
         })
@@ -1747,7 +2013,7 @@ export class Session {
         turn.currentAssistantSegmentId = null
         turn.currentAssistantText = ''
         turn.segmentTexts = new Map()
-        if (carryText) cardkit.streamTextThrottled(turn.cardId, cards.ELEMENTS.footer, FOOTER_WORKING)
+        if (carryText) cardkit.streamTextThrottled(turn.cardId, cards.ELEMENTS.footer, this.withModel(FOOTER_WORKING))
         else this.startThinkingFooter(turn)
         // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read 切开重建。
         sessionTools.rebuildToolsOnRotate(this, oldCardId, newCardId, oldToolByUseId, oldBatches)
@@ -1785,7 +2051,7 @@ export class Session {
           const compactNote = turn.contextCompactCount > 0
             ? ` · 🚨 压缩×${turn.contextCompactCount}`
             : ''
-          await cardkit.streamText(oldCardId, cards.ELEMENTS.footer, `📨 已续至下一张卡 ↓${compactNote}`)
+          await cardkit.streamText(oldCardId, cards.ELEMENTS.footer, this.withModel(`📨 已续至下一张卡 ↓${compactNote}`))
           cardkit.cancelSummary(oldCardId)
           await cardkit.patchSettings(oldCardId, cards.streamingOffSettings({ suffix: '📨 转下一张' }))
           await cardkit.dispose(oldCardId)
@@ -2086,7 +2352,7 @@ export class Session {
       void cardkit.streamText(
         turn.cardId,
         cards.ELEMENTS.footer,
-        `${FOOTER_THINKING_PREFIX}(${elapsedS}s)`,
+        this.withModel(`${FOOTER_THINKING_PREFIX}(${elapsedS}s)`),
       )
     }
     turn.thinkingFooterHandle = setInterval(render, FOOTER_STATUS_TICK_MS)
@@ -2100,7 +2366,7 @@ export class Session {
     clearInterval(turn.thinkingFooterHandle)
     turn.thinkingFooterHandle = null
     turn.thinkingFooterStartedAt = 0
-    void cardkit.streamTextThrottled(turn.cardId, cards.ELEMENTS.footer, FOOTER_WORKING)
+    void cardkit.streamTextThrottled(turn.cardId, cards.ELEMENTS.footer, this.withModel(FOOTER_WORKING))
   }
 
   private async closeTurnCard(suffix?: string, opts: { forcePush?: boolean } = {}): Promise<void> {
@@ -2165,7 +2431,7 @@ export class Session {
       const cost = this.lastTurnDelta?.costUsd ?? 0
       if (cost > 0) metrics += ` · 💰 $${cost.toFixed(3)}`
     }
-    const footer = `${stateMark} ⏱ ${elapsed}s${metrics}${compactNote}${sendNote}`
+    const footer = this.withModel(`${stateMark} ⏱ ${elapsed}s${metrics}${compactNote}${sendNote}`)
     await cardkit.streamText(cardId, cards.ELEMENTS.footer, footer)
     // Final chat-list preview: clean finish shows "⏱ Xs · NK tokens";
     // interrupted shows the suffix instead (no usage event landed).

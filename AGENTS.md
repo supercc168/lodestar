@@ -31,7 +31,7 @@
 - 处理 Card Kit 流式文本时优先使用 `cardkit.streamTextThrottled`；事件处理路径不要直接高频调用 `streamText`。
 - API 失败要记录并向用户暴露；不要静默切换传输、卡片或消息通道作为“兜底”。
 - 不要主动重启正在运行的 daemon，除非用户在当前回合明确要求 `restart` / `重启` / reload。代码变更后只报告需要重启。
-- 群内裸词控制是 `hi`、`stop`、`kill`、`restart`、`clear`、`wt` 和 `wt <name>`；这些词在 `Session.runCommand` 中作为保留字处理。
+- 群内裸词控制是 `hi`、`stop`、`kill`、`restart`、`clear`、`model`、`wt` 和 `wt <name>`；这些词在 `Session.runCommand` 中作为保留字处理。
 - `wt <name>` 约定创建同级目录 `<project>[<name>]` 和本地分支 `work/<name>`，并自动创建/加入同名飞书群；解散按钮只在 worktree 干净时删除目录和解散群，保留分支。
 - 本地脚本可通过 `POST http://127.0.0.1:9876/notify` 发送 `{project, text, level}` 到绑定群。
 

@@ -51,6 +51,7 @@ lodestar-setup
 | `kill` | 用状态卡展示关闭 Codex 进程,`threadId` 落盘 |
 | `restart` | 用状态卡展示按上次 `threadId` 重启(保留上下文)|
 | `clear` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
+| `model` | 展示可用 Codex 模型面板,点击按钮切换并按群持久化 |
 
 **并发 worktree 群**
 

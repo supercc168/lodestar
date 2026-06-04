@@ -31,4 +31,7 @@ export const ELEMENTS = {
    * decoupling the slow Codex account fetch from the rest of the panel's
    * synchronous data. */
   consoleUsage: 'console_usage',
+  /** Model command card — one replaceable panel for model → effort
+   * multi-step selection inside a single card. */
+  modelPanel: 'model_panel',
 } as const

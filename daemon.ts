@@ -377,6 +377,14 @@ async function handleCardAction(data: any): Promise<any> {
     case 'menu':
       await session.onUserMessage(`(menu choice ${value.choice + 1})`)
       return { toast: { type: 'success', content: 'OK' } }
+    case 'model_select': {
+      const result = await session.onModelSelect(String(value.model ?? ''), String(value.panel_id ?? ''), userId)
+      return { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
+    case 'model_effort_select': {
+      const result = await session.onModelEffortSelect(String(value.model ?? ''), String(value.effort ?? ''), String(value.panel_id ?? ''), userId)
+      return { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
     case 'ask': {
       // Custom-text branch: form submit packages the input under
       // `form_value`. Try a couple of plausible keys since the exact
@@ -487,6 +495,7 @@ async function boot(): Promise<void> {
   log(`lodestar-daemon: pid ${process.pid} starting`)
   feishu.loadSessionChatMap()
   feishu.loadSessionResumeMap()
+  feishu.loadSessionModelMap()
   await feishu.refreshChatList()
   setInterval(() => { void feishu.refreshChatList() }, 5 * 60 * 1000)
 

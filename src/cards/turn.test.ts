@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleBodyElements, statusCard } from './console'
+import { consoleBodyElements, modelEffortPanelElement, modelResultPanelElement, modelSelectionCard, statusCard } from './console'
 import {
   contextCompactionElement,
   goalElement,
@@ -53,6 +53,61 @@ describe('main conversation card rendering', () => {
     expect(elements[0].content).toContain('🟢 闲')
     expect(elements[1].element_id).toBe('console_usage')
     expect(elements[1].content).toContain('加载中')
+  })
+
+  test('model command card keeps model and effort selection in one replaceable panel', () => {
+    const currentModel = {
+      model: 'gpt-5-codex',
+      displayName: 'GPT-5 Codex',
+      description: 'coding model',
+      selected: true,
+      efforts: [
+        { effort: 'high', selected: true },
+        { effort: 'xhigh', isDefault: true },
+      ],
+    }
+    const card = modelSelectionCard({
+      sessionName: 'probe',
+      panelId: 'panel-1',
+      currentModel: 'gpt-5-codex',
+      currentEffort: 'high',
+      models: [currentModel],
+    }) as any
+
+    const panel = card.body.elements[0]
+    expect(panel.element_id).toBe('model_panel')
+    expect(panel.elements[0].content).toContain('`gpt-5-codex/high`')
+    expect(panel.elements[1].columns[1].elements[0].text.content).toBe('重选')
+    expect(panel.elements[1].columns[1].elements[0].behaviors[0].value).toEqual({
+      kind: 'model_select',
+      panel_id: 'panel-1',
+      model: 'gpt-5-codex',
+    })
+
+    const effortPanel = modelEffortPanelElement({
+      sessionName: 'probe',
+      panelId: 'panel-1',
+      currentModel: 'gpt-5-codex',
+      currentEffort: 'high',
+      selectedModel: currentModel,
+      selectedEffort: 'xhigh',
+    }) as any
+    expect(effortPanel.element_id).toBe('model_panel')
+    expect(effortPanel.elements[2].columns[1].elements[0].behaviors[0].value).toEqual({
+      kind: 'model_effort_select',
+      panel_id: 'panel-1',
+      model: 'gpt-5-codex',
+      effort: 'xhigh',
+    })
+
+    const resultPanel = modelResultPanelElement({
+      sessionName: 'probe',
+      model: 'gpt-5-codex',
+      effort: 'xhigh',
+      scope: '下一轮开始使用。',
+    }) as any
+    expect(resultPanel.element_id).toBe('model_panel')
+    expect(resultPanel.elements[0].content).toContain('`gpt-5-codex/xhigh`')
   })
 })
 
