@@ -51,7 +51,7 @@ lodestar-setup
 | `kill` | 用状态卡展示关闭 Codex 进程,`threadId` 落盘 |
 | `restart` | 用状态卡展示按上次 `threadId` 重启(保留上下文)|
 | `clear` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
-| `model` | 展示可用 Codex 模型面板,点击按钮切换并按群持久化 |
+| `model` | 展示可用 Codex 模型面板,先选模型再选 reasoning effort,并按群持久化 |
 
 **并发 worktree 群**
 
@@ -59,8 +59,8 @@ lodestar-setup
 
 | 指令 | 行为 |
 | --- | --- |
-| `wt` | 列出本项目 `work/*` 分支状态(clean/dirty/merged/stale),卡片上可点 `删`。 |
-| `wt feature-x` | 创建或加入同级目录/群 `<project>[feature-x]`,分支为 `work/feature-x`。 |
+| `wt` | 列出本项目 `work/*` 分支状态(clean/dirty/merged/stale),已合并且未挂载的归档分支会折叠隐藏,卡片上可点 `删`。 |
+| `wt feature-x` | 创建或加入同级目录/群 `<project>[feature-x]`,分支为 `work/feature-x`;重新激活已合并归档分支时会先更新到主线。 |
 
 `删` 会先检查 worktree 没有未提交变更,再解散群并删除 worktree 目录;分支保留,合并和分支清理由 agent 处理。
 
@@ -81,7 +81,7 @@ curl -sS -X POST http://127.0.0.1:9876/notify \
 ---
 
 > [!TIP]
-> 想 7×24 长跑,用 `systemd --user`(Linux/macOS)或 Windows 任务计划程序拉起 `lodestar-daemon`。重启后上次活跃的 session 会自动 `--resume` 接回。
+> 想 7×24 长跑,用 `systemd --user`(Linux/macOS)或 Windows 任务计划程序拉起 `lodestar-daemon`。重启后上次活跃的 sessions 会并发自动 `--resume` 接回。
 
 ---
 

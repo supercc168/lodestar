@@ -36,6 +36,7 @@
         "cardkit.test.ts",
         "cardkit.ts",
         "cards.ts",
+        "codex-process.test.ts",
         "codex-process.ts",
         "config.ts",
         "context-window.test.ts",
@@ -45,6 +46,8 @@
         "log.ts",
         "notify-skill.ts",
         "notify.ts",
+        "outbound-markers.test.ts",
+        "outbound-markers.ts",
         "paths.ts",
         "pid-guard.ts",
         "session-ask.ts",
@@ -73,11 +76,12 @@
         "elements.ts",
         "turn.test.ts",
         "turn.ts",
+        "worktree.test.ts",
         "worktree.ts"
       ],
       "subdirs": []
     }
   },
-  "generatedAt": "2026-06-02T01:06:51.731172+00:00",
+  "generatedAt": "2026-06-04T03:20:48.726111+00:00",
   "version": 1
 }
