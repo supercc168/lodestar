@@ -61,6 +61,23 @@ describe('project worktrees', () => {
     expect(entries[0]?.expectedPath).toBe(result.worktreePath)
   })
 
+  test('rebases archived branches to latest project head when reactivated', () => {
+    const { repo } = initRepo()
+    const first = ensureProjectWorktree(repo, 'feishu', 'archived-work')
+    git(first.worktreePath, ['commit', '--allow-empty', '-m', 'feature'])
+    git(repo, ['merge', '--no-ff', 'work/archived-work', '-m', 'merge feature'])
+    removeProjectWorktreeIfClean(repo, 'feishu', 'archived-work')
+    git(repo, ['commit', '--allow-empty', '-m', 'main moves after archive'])
+
+    const latestProjectHead = git(repo, ['rev-parse', 'HEAD']).trim()
+    const reactivated = ensureProjectWorktree(repo, 'feishu', 'archived-work')
+
+    expect(reactivated.createdBranch).toBe(false)
+    expect(reactivated.createdWorktree).toBe(true)
+    expect(git(repo, ['rev-parse', 'work/archived-work']).trim()).toBe(latestProjectHead)
+    expect(git(reactivated.worktreePath, ['rev-parse', 'HEAD']).trim()).toBe(latestProjectHead)
+  })
+
   test('marks merged and stale work branches', () => {
     const { repo } = initRepo()
     ensureProjectWorktree(repo, 'feishu', 'merged-work')
