@@ -33,7 +33,7 @@
 - 不要主动重启正在运行的 daemon，除非用户在当前回合明确要求 `restart` / `重启` / reload。代码变更后只报告需要重启。
 - 群内裸词控制是 `hi`、`stop`、`kill`、`restart`、`clear`、`model`、`wt` 和 `wt <name>`；这些词在 `Session.runCommand` 中作为保留字处理。
 - `model` 通过 Card Kit 按钮先选 Codex 模型、再选 reasoning effort，并把选择按 session 持久化到 XDG data。
-- `wt <name>` 约定创建同级目录 `<project>[<name>]` 和本地分支 `work/<name>`，并自动创建/加入同名飞书群；解散按钮只在 worktree 干净时删除目录和解散群，保留分支；重新激活已合并归档分支时会更新到主线。
+- `wt <name>` 约定创建同级目录 `<project>[<name>]` 和本地分支 `work/<name>`，并自动创建/加入同名飞书群；解散按钮会先拒绝仍在运行的对应 session，只在 worktree 干净时删除目录和解散群，保留分支；重新激活已合并归档分支时会更新到主线。
 - 本地脚本可通过 `POST http://127.0.0.1:9876/notify` 发送 `{project, text, level}` 到绑定群。
 
 ### Testing Requirements

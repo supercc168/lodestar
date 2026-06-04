@@ -62,7 +62,7 @@ lodestar-setup
 | `wt` | 列出本项目 `work/*` 分支状态(clean/dirty/merged/stale),已合并且未挂载的归档分支会折叠隐藏,卡片上可点 `删`。 |
 | `wt feature-x` | 创建或加入同级目录/群 `<project>[feature-x]`,分支为 `work/feature-x`;重新激活已合并归档分支时会先更新到主线。 |
 
-`删` 会先检查 worktree 没有未提交变更,再解散群并删除 worktree 目录;分支保留,合并和分支清理由 agent 处理。
+`删` 会先确认对应 worktree 群没有正在运行的 Codex session,再检查 worktree 没有未提交变更,然后解散群并删除 worktree 目录;分支保留,合并和分支清理由 agent 处理。
 
 ---
 

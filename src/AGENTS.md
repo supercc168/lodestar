@@ -9,7 +9,7 @@
 ## Key Files
 | File | Description |
 |------|-------------|
-| `session.ts` | 一个飞书群对应一个 `Session`；管理 Codex 生命周期、每轮卡片、消息排队、裸词控制、`model` 选择、`wt` worktree 群命令和统计状态。 |
+| `session.ts` | 一个飞书群对应一个 `Session`；管理 Codex 生命周期、每轮卡片、消息排队、裸词控制、`model` 选择、`wt` worktree 群命令、运行中 worktree 解散保护和统计状态。 |
 | `session-types.ts` | `TurnState`、`Status`、累计统计和 session option 类型定义。 |
 | `session-tools.ts` | 工具调用面板、工具结果自动发文件和换卡后的工具面板重建逻辑。 |
 | `session-ask.ts` | Codex `AskUserQuestion` 交互流程，处理按钮、自定义回答和权限 request 回填。 |
@@ -64,6 +64,7 @@
 ### Common Patterns
 - `daemon.ts` 负责把 Feishu WS 事件转成 `Session` 调用；`Session` 再把 Codex 事件转成 `cardkit` 操作。
 - `wt` 复用群名等于目录名的约定：主项目群 `project` 创建同级 `project[name]`，分支固定为 `work/name`。
+- `wt` 解散按钮不能删除仍有运行中 Codex session 的 worktree 群；先让对应群 `stop` 或 `kill`。
 - 已合并且未挂载的 `work/*` 分支在 `wt` 卡片里折叠为归档摘要；再次 `wt <name>` 会挂载并 rebase 到当前项目 HEAD。
 - `cardkit.streamTextThrottled` 缓冲完整文本帧，`flush` 在 turn 关闭前兜底；直接 `streamText` 只用于明确的终态写入。
 - `feishu.ts` 对 SDK 发送消息做 retry 和 UUID 去重；业务 API 错误要 log 并返回失败，而不是默默换用 raw API。
