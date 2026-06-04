@@ -736,8 +736,14 @@ export class Session {
     const projectName = this.worktreeProjectName()
     const projectDir = this.worktreeProjectDir()
     try {
-      worktree.assertProjectWorktreeClean(projectDir, projectName, slug)
       const chatName = worktree.worktreeChatName(projectName, slug)
+      const runningSession = [...Session.all].find(s => s.sessionName === chatName && s.isRunning())
+      if (runningSession) {
+        const message = `❌ 解散 ${slug} 失败: Codex 正在运行，请先在 ${chatName} 群里 stop 或 kill。`
+        await feishu.sendText(this.chatId, message)
+        return { ok: false, message }
+      }
+      worktree.assertProjectWorktreeClean(projectDir, projectName, slug)
       const disbanded = await feishu.disbandChatForSession(chatName)
       const removed = worktree.removeProjectWorktreeIfClean(projectDir, projectName, slug)
       const card = cards.worktreeNoticeCard({
