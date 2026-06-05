@@ -1304,13 +1304,13 @@ export class Session {
     return {
       sessionName: this.sessionName,
       status: this.status,
+      model: this.currentModelLabel() ?? undefined,
+      effort: this.currentEffortLabel(),
       peers: [...Session.all]
         .filter(s => s.isRunning())
         .map(s => ({
           ...s.peerSnapshot(),
           isCurrent: s === this,
-          model: s === this ? (s.currentModelLabel() ?? undefined) : undefined,
-          effort: s === this ? s.currentEffortLabel() : undefined,
         })),
       usage,
       sysinfo,
@@ -1347,12 +1347,17 @@ export class Session {
     await cardkit.replaceElement(
       handle.cardId,
       cards.ELEMENTS.footer,
-      cards.consoleMainElement(consoleOpts, cards.ELEMENTS.footer),
+      cards.consoleCurrentModelElement(consoleOpts, cards.ELEMENTS.footer),
+    )
+    await cardkit.addElement(
+      handle.cardId,
+      cards.consoleMainElement(consoleOpts),
+      { type: 'insert_after', targetElementId: cards.ELEMENTS.footer },
     )
     await cardkit.addElement(
       handle.cardId,
       cards.consoleHostElement(consoleOpts.sysinfo),
-      { type: 'insert_after', targetElementId: cards.ELEMENTS.footer },
+      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleProjects },
     )
     await cardkit.addElement(
       handle.cardId,

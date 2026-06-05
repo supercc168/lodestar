@@ -38,6 +38,7 @@ export {
   type ModelChoice,
   consoleUsageContent,
   consoleUsageElement,
+  consoleCurrentModelElement,
   consoleMainElement,
   consoleHostElement,
   consoleBodyElements,

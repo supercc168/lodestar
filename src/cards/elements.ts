@@ -30,6 +30,7 @@ export const ELEMENTS = {
    * own element so we can replace it after the initial card lands,
    * decoupling the slow Codex account fetch from the rest of the panel's
    * synchronous data. */
+  consoleCurrentModel: 'console_current_model',
   consoleProjects: 'console_projects',
   consoleHost: 'console_host',
   consoleUsage: 'console_usage',
