@@ -34,6 +34,7 @@ export interface RemoveWorktreeResult {
 
 const WORK_BRANCH_PREFIX = 'work/'
 const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/
+export const WORKTREE_INSTRUCTIONS_FILENAME = 'AGENTS.worktree.md'
 
 export function normalizeWorktreeSlug(raw: string): string | null {
   const slug = raw.trim()
@@ -56,6 +57,23 @@ export function worktreeBranch(slug: string): string {
 
 export function expectedWorktreePath(projectDir: string, projectName: string, slug: string): string {
   return join(dirname(projectDir), worktreeChatName(projectName, slug))
+}
+
+export function worktreeInstructionsPathForManagedBranch(
+  workDir: string,
+  projectDir: string,
+  projectName: string,
+): string | null {
+  const branch = git(workDir, ['rev-parse', '--abbrev-ref', 'HEAD']).trim()
+  if (!branch.startsWith(WORK_BRANCH_PREFIX)) return null
+  const slug = branch.slice(WORK_BRANCH_PREFIX.length)
+  if (!normalizeWorktreeSlug(slug)) {
+    throw new Error(`invalid worktree branch "${branch}"`)
+  }
+  const expectedPath = expectedWorktreePath(projectDir, projectName, slug)
+  if (resolve(workDir) !== resolve(expectedPath)) return null
+  const instructionsPath = join(projectDir, WORKTREE_INSTRUCTIONS_FILENAME)
+  return existsSync(instructionsPath) ? instructionsPath : null
 }
 
 export function listProjectWorktrees(projectDir: string, projectName: string): WorktreeEntry[] {

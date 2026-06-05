@@ -506,7 +506,7 @@ export class Session {
       workDir: this.workDir,
       model: this.modelForSpawn(),
       effort: this.effortForSpawn(),
-      appendSystemPrompt: CHANNEL_INSTRUCTIONS,
+      appendSystemPrompt: this.spawnDeveloperInstructions(),
     })
     this.wireProc(this.proc)
     this.proc.sendInitialize()
@@ -713,7 +713,7 @@ export class Session {
         model: this.modelForSpawn(),
         effort: this.effortForSpawn(),
         resumeSessionId: prevSessionId,
-        appendSystemPrompt: CHANNEL_INSTRUCTIONS,
+        appendSystemPrompt: this.spawnDeveloperInstructions(),
       })
       this.wireProc(this.proc)
       this.proc.sendInitialize()
@@ -768,6 +768,21 @@ export class Session {
 
   private worktreeProjectDir(): string {
     return join(feishu.PROJECTS_ROOT, this.worktreeProjectName())
+  }
+
+  private spawnDeveloperInstructions(): string {
+    const extra = this.worktreeExtraInstruction()
+    return extra ? `${CHANNEL_INSTRUCTIONS}\n${extra}` : CHANNEL_INSTRUCTIONS
+  }
+
+  private worktreeExtraInstruction(): string | null {
+    const instructionsPath = worktree.worktreeInstructionsPathForManagedBranch(
+      this.workDir,
+      this.worktreeProjectDir(),
+      this.worktreeProjectName(),
+    )
+    if (!instructionsPath) return null
+    return `本项目在当前工作目录有额外的约定${instructionsPath}，你必须严格遵守`
   }
 
   private async runWorktreeCommand(arg: string, userOpenId: string): Promise<void> {

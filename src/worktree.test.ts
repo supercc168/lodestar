@@ -8,6 +8,7 @@ import {
   ensureProjectWorktree,
   listProjectWorktrees,
   removeProjectWorktreeIfClean,
+  worktreeInstructionsPathForManagedBranch,
 } from './worktree'
 
 let roots: string[] = []
@@ -98,6 +99,23 @@ describe('project worktrees', () => {
 
     const updated = listProjectWorktrees(repo, 'feishu')
     expect(updated.find(e => e.slug === 'stale-work')?.state).toBe('stale')
+  })
+
+  test('finds AGENTS.worktree.md for managed worktree branches', () => {
+    const { repo } = initRepo()
+    writeFileSync(join(repo, 'AGENTS.worktree.md'), '# extra rules\n')
+    const result = ensureProjectWorktree(repo, 'feishu', 'prompt-work')
+
+    expect(
+      worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu'),
+    ).toBe(join(repo, 'AGENTS.worktree.md'))
+  })
+
+  test('skips AGENTS.worktree.md outside managed worktree branches', () => {
+    const { repo } = initRepo()
+    writeFileSync(join(repo, 'AGENTS.worktree.md'), '# extra rules\n')
+
+    expect(worktreeInstructionsPathForManagedBranch(repo, repo, 'feishu')).toBeNull()
   })
 })
 
