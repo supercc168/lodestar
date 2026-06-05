@@ -101,19 +101,28 @@ describe('project worktrees', () => {
     expect(updated.find(e => e.slug === 'stale-work')?.state).toBe('stale')
   })
 
-  test('finds AGENTS.worktree.md for managed worktree branches', () => {
+  test('finds slug-specific AGENTS file for managed worktree branches', () => {
     const { repo } = initRepo()
-    writeFileSync(join(repo, 'AGENTS.worktree.md'), '# extra rules\n')
+    writeFileSync(join(repo, 'AGENTS.prompt-work.md'), '# extra rules\n')
     const result = ensureProjectWorktree(repo, 'feishu', 'prompt-work')
 
     expect(
       worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu'),
-    ).toBe(join(repo, 'AGENTS.worktree.md'))
+    ).toBe(join(repo, 'AGENTS.prompt-work.md'))
   })
 
-  test('skips AGENTS.worktree.md outside managed worktree branches', () => {
+  test('skips mismatched slug-specific AGENTS files', () => {
     const { repo } = initRepo()
-    writeFileSync(join(repo, 'AGENTS.worktree.md'), '# extra rules\n')
+    writeFileSync(join(repo, 'AGENTS.other-work.md'), '# extra rules\n')
+
+    const result = ensureProjectWorktree(repo, 'feishu', 'prompt-work')
+
+    expect(worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu')).toBeNull()
+  })
+
+  test('skips slug-specific AGENTS files outside managed worktree branches', () => {
+    const { repo } = initRepo()
+    writeFileSync(join(repo, 'AGENTS.main.md'), '# extra rules\n')
 
     expect(worktreeInstructionsPathForManagedBranch(repo, repo, 'feishu')).toBeNull()
   })

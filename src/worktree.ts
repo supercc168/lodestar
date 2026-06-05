@@ -34,7 +34,6 @@ export interface RemoveWorktreeResult {
 
 const WORK_BRANCH_PREFIX = 'work/'
 const SLUG_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/
-export const WORKTREE_INSTRUCTIONS_FILENAME = 'AGENTS.worktree.md'
 
 export function normalizeWorktreeSlug(raw: string): string | null {
   const slug = raw.trim()
@@ -72,7 +71,7 @@ export function worktreeInstructionsPathForManagedBranch(
   }
   const expectedPath = expectedWorktreePath(projectDir, projectName, slug)
   if (resolve(workDir) !== resolve(expectedPath)) return null
-  const instructionsPath = join(projectDir, WORKTREE_INSTRUCTIONS_FILENAME)
+  const instructionsPath = join(projectDir, `AGENTS.${slug}.md`)
   return existsSync(instructionsPath) ? instructionsPath : null
 }
 
