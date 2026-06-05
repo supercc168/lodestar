@@ -155,11 +155,11 @@ describe('plan and goal rendering', () => {
       input_tokens: 4_900,
       cache_read_input_tokens: 4_400,
       output_tokens: 420,
-    })).toBe('入4.9k 缓4.4k 出420')
+    })).toBe('└ 入 4.9k ｜ 缓 4.4k ｜ 出 420')
   })
 
   test('shows placeholders when footer token detail fields are missing', () => {
-    expect(footerTokenDetailLine(null)).toBe('入-- 缓-- 出--')
+    expect(footerTokenDetailLine(null)).toBe('└ 入 -- ｜ 缓 -- ｜ 出 --')
   })
 
   test('renders context compaction pending panel', () => {

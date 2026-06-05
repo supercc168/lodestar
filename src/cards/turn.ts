@@ -119,7 +119,7 @@ export function footerTokenDetailLine(usage: CodexUsage | null | undefined): str
   const input = compactFooterTokens(usage?.input_tokens ?? Number.NaN)
   const cached = compactFooterTokens(usage?.cache_read_input_tokens ?? Number.NaN)
   const output = compactFooterTokens(usage?.output_tokens ?? Number.NaN)
-  return `入${input} 缓${cached} 出${output}`
+  return `└ 入 ${input} ｜ 缓 ${cached} ｜ 出 ${output}`
 }
 
 export function contextCompactionElement(i: number, notice: ContextCompactionNotice, elementId: string): object {

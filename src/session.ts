@@ -2510,10 +2510,6 @@ export class Session {
     // thinkingText 已经在 turn 期间真 streaming 进飞书,turn 结束保留
     // markdown 形态完整可见即可。代价是卡片会长一些,但比 typewriter
     // 被截好得多。
-    const sendNote = turn.outboundSentPaths.size ? ` · 📎 ${turn.outboundSentPaths.size}` : ''
-    const compactNote = turn.contextCompactCount > 0
-      ? ` · 🚨 压缩×${turn.contextCompactCount}`
-      : ''
     // State marker leads the footer (✅ for natural completion, or the
     // suffix verbatim for non-natural states like `🛑 打断`). The
     // trailing "done" word is gone — the ✅ already carries that
@@ -2522,16 +2518,20 @@ export class Session {
     // Footer line 1 keeps the terminal status compact. Usage-derived
     // numbers only render when a fresh SDK result landed for THIS turn;
     // interrupts/boot failures would otherwise show stale prior-turn data.
-    let metrics = ''
+    const line1Parts = [`${stateMark} ⏱ ${elapsed}s`]
     if (opts.hasFreshResult) {
       const ctxTokens = this.currentContextTokens()
       const ctxMax = this.contextLimitForDisplay()
       const ctxPercent = cards.footerContextPercentLabel(ctxTokens, ctxMax)
-      if (ctxPercent) metrics += ` · 🧠 ${ctxPercent}`
+      if (ctxPercent) line1Parts.push(`🧠 ${ctxPercent}`)
       const cost = this.lastTurnDelta?.costUsd ?? 0
-      if (cost > 0) metrics += ` · 💰 $${cost.toFixed(3)}`
+      if (cost > 0) line1Parts.push(`💰 $${cost.toFixed(3)}`)
     }
-    const footerLine1 = this.withModel(`${stateMark} ⏱ ${elapsed}s${metrics}${compactNote}${sendNote}`)
+    if (turn.contextCompactCount > 0) line1Parts.push(`🚨 压缩×${turn.contextCompactCount}`)
+    if (turn.outboundSentPaths.size > 0) line1Parts.push(`📎 ${turn.outboundSentPaths.size}`)
+    const modelLabel = this.modelLine()
+    if (modelLabel) line1Parts.push(modelLabel)
+    const footerLine1 = line1Parts.join(' ｜ ')
     const footerLine2 = opts.hasFreshResult
       ? cards.footerTokenDetailLine(this.proc?.lastUsage)
       : ''
