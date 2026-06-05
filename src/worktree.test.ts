@@ -7,6 +7,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import {
   ensureProjectWorktree,
   listProjectWorktrees,
+  readWorktreeInstructionsForManagedBranch,
   removeProjectWorktreeIfClean,
   worktreeInstructionsPathForManagedBranch,
 } from './worktree'
@@ -109,6 +110,20 @@ describe('project worktrees', () => {
     expect(
       worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu'),
     ).toBe(join(result.worktreePath, 'AGENTS.prompt-work.md'))
+  })
+
+  test('reads slug-specific AGENTS content for managed worktree branches', () => {
+    const { repo } = initRepo()
+    const result = ensureProjectWorktree(repo, 'feishu', 'prompt-work')
+    writeFileSync(join(result.worktreePath, 'AGENTS.prompt-work.md'), '# extra rules\n- be loud\n')
+
+    expect(
+      readWorktreeInstructionsForManagedBranch(result.worktreePath, repo, 'feishu'),
+    ).toEqual({
+      path: join(result.worktreePath, 'AGENTS.prompt-work.md'),
+      content: '# extra rules\n- be loud',
+      slug: 'prompt-work',
+    })
   })
 
   test('skips mismatched slug-specific AGENTS files', () => {

@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, statSync } from 'node:fs'
+import { existsSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 
 export interface WorktreeEntry {
@@ -30,6 +30,12 @@ export interface RemoveWorktreeResult {
   branch: string
   worktreePath: string
   removedWorktree: boolean
+}
+
+export interface WorktreeInstructionsFile {
+  path: string
+  content: string
+  slug: string
 }
 
 const WORK_BRANCH_PREFIX = 'work/'
@@ -73,6 +79,23 @@ export function worktreeInstructionsPathForManagedBranch(
   if (resolve(workDir) !== resolve(expectedPath)) return null
   const instructionsPath = join(workDir, `AGENTS.${slug}.md`)
   return existsSync(instructionsPath) ? instructionsPath : null
+}
+
+export function readWorktreeInstructionsForManagedBranch(
+  workDir: string,
+  projectDir: string,
+  projectName: string,
+): WorktreeInstructionsFile | null {
+  const instructionsPath = worktreeInstructionsPathForManagedBranch(workDir, projectDir, projectName)
+  if (!instructionsPath) return null
+  const content = readFileSync(instructionsPath, 'utf8').trim()
+  if (!content) return null
+  const branch = git(workDir, ['rev-parse', '--abbrev-ref', 'HEAD']).trim()
+  const slug = branch.slice(WORK_BRANCH_PREFIX.length)
+  if (!normalizeWorktreeSlug(slug)) {
+    throw new Error(`invalid worktree branch "${branch}"`)
+  }
+  return { path: instructionsPath, content, slug }
 }
 
 export function listProjectWorktrees(projectDir: string, projectName: string): WorktreeEntry[] {

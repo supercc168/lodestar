@@ -776,13 +776,21 @@ export class Session {
   }
 
   private worktreeExtraInstruction(): string | null {
-    const instructionsPath = worktree.worktreeInstructionsPathForManagedBranch(
+    const instructions = worktree.readWorktreeInstructionsForManagedBranch(
       this.workDir,
       this.worktreeProjectDir(),
       this.worktreeProjectName(),
     )
-    if (!instructionsPath) return null
-    return `本项目在当前工作目录有额外的约定${instructionsPath}，你要把它视为和AGENTS.md一样重要`
+    if (!instructions) return null
+    return [
+      `你要把下面这份额外的工作树约定视为和AGENTS.md一样重要。来源文件：${instructions.path}`,
+      '',
+      `# Additional AGENTS.md instructions for ${this.workDir}`,
+      '',
+      '<INSTRUCTIONS>',
+      instructions.content,
+      '</INSTRUCTIONS>',
+    ].join('\n')
   }
 
   private async runWorktreeCommand(arg: string, userOpenId: string): Promise<void> {
