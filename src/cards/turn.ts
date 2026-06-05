@@ -1003,7 +1003,7 @@ export interface AskState {
 }
 
 function askQuestionTitle(q: AskQuestion, questionIdx: number, total: number): string {
-  const label = q.header?.trim() || q.question.trim() || `问题 ${questionIdx + 1}`
+  const label = q.question.trim() || `问题 ${questionIdx + 1}`
   return `${questionIdx + 1}/${total} · ${label}`
 }
 
@@ -1066,17 +1066,11 @@ function renderAskTimeline(
     if (picked) {
       const answer = askAnswerValue(q, picked)
       const lines = [`**✅ ${title}**`, `**回答**：${answer}`]
-      if (q.question.trim() && q.header?.trim() && q.header.trim() !== q.question.trim()) {
-        lines.splice(1, 0, q.question.trim())
-      }
       body.push({ tag: 'markdown', content: lines.join('\n') })
       continue
     }
     if (idx === currentIdx) {
       body.push({ tag: 'markdown', content: `**🤔 ${title}**` })
-      if (q.question.trim() && (!q.header?.trim() || q.header.trim() !== q.question.trim())) {
-        body.push({ tag: 'markdown', content: q.question.trim() })
-      }
       if (q.options.length > 0) {
         body.push(...renderAskQuestionOptions(q, toolUseId, idx, callbackKind))
       }
