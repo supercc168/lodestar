@@ -48,6 +48,7 @@
 ### Working In This Directory
 - `config.ts` 在 import 时同步读取配置，缺配置会抛错；面向首次安装的延迟导入逻辑在根目录 `cli.ts`，不要在核心模块里吞掉配置错误。
 - `Session` 的无 `private` 字段是 package-internal 约定，只应由 `session-*.ts` 辅助模块访问；新 helper 应遵循同一边界。
+- 修改 `src/` 代码时，**不得**为了验证卡片/交互效果而去停止、重启、切换或并行接管 live daemon；用户若只说“测试”“预览”“发一张看看”，一律视为**未授权**。只有用户明确点名对应 daemon/service 操作时才能执行。
 - `wt` 命令的 Git 操作集中在 `worktree.ts`；不要在 `session.ts` 里散写 `git` shell 命令。
 - `model` 命令的模型列表来自 Codex app-server `model/list`，reasoning effort 必须来自对应模型返回值；不要写静态模型清单。
 - Codex 子进程协议集中在 `codex-process.ts`；新增 app-server 方法或通知映射时要同时考虑 `Session` 事件处理和卡片展示。
@@ -59,6 +60,7 @@
 - 修改核心 TypeScript 后运行 `bun test`。
 - 修改构建入口、CLI 或发布相关文件后运行 `bun run build`。
 - 修改 session、Card Kit、Feishu 消息、权限或 AskUserQuestion 流程后，补充真实群 smoke：`bun scripts/smoke.ts "<group name>"` 或 `bun scripts/test-all.ts "<group name>"`。
+- 真实群 smoke 若会触碰 live daemon/service，先单独征得用户明确许可；“我想先看看效果”或“发个测试卡”不足以授权 stop/restart/switch daemon。
 - 修改 `model` 或 `wt` 创建/加入/解散流程后，用 debug 注入在真实群里验证 `model`、`wt`、`wt <name>` 和解散按钮；测试结束后清理临时 worktree、群和本地分支。
 - 修改 `cards/` 渲染或工具摘要时至少运行相关 Bun 测试：`bun test src/cards/turn.test.ts src/cardkit.test.ts src/context-window.test.ts`。
 

@@ -712,6 +712,17 @@ export class CodexProcess extends EventEmitter {
     return models
   }
 
+  async injectThreadItems(items: any[]): Promise<void> {
+    if (!Array.isArray(items) || items.length === 0) return
+    if (!this.readyPromise) this.sendInitialize()
+    await this.readyPromise
+    if (!this.sessionId) throw new Error('codex thread not initialized')
+    await this.request('thread/inject_items', {
+      threadId: this.sessionId,
+      items,
+    })
+  }
+
   async setModelSettings(model: string, effort: CodexReasoningEffort): Promise<void> {
     if (!model.trim()) throw new Error('empty model')
     if (!isCodexReasoningEffort(effort)) throw new Error(`invalid reasoning effort: ${String(effort)}`)

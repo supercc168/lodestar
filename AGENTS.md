@@ -31,6 +31,7 @@
 - 处理 Card Kit 流式文本时优先使用 `cardkit.streamTextThrottled`；事件处理路径不要直接高频调用 `streamText`。
 - API 失败要记录并向用户暴露；不要静默切换传输、卡片或消息通道作为“兜底”。
 - 不要主动重启正在运行的 daemon，除非用户在当前回合明确要求 `restart` / `重启` / reload。代码变更后只报告需要重启。
+- **禁止**为了“测试”“预览”“发一张看看”“先验证一下”这类目的而停止、重启、替换、shadow、切换或并行接管正在运行的 daemon / user service。只有用户**明确点名**要执行对应操作（例如 `systemctl --user restart feishu-daemon.service`、停止当前 daemon、切换到某个 worktree daemon）时才可动手；任何泛化的“测一下”“发测试卡”都**不构成授权**。
 - 群内裸词控制是 `hi`、`stop`、`kill`、`restart`、`clear`、`model`、`wt` 和 `wt <name>`；这些词在 `Session.runCommand` 中作为保留字处理。
 - `model` 通过 Card Kit 按钮先选 Codex 模型、再选 reasoning effort，并把选择按 session 持久化到 XDG data。
 - `wt <name>` 约定创建同级目录 `<project>[<name>]` 和本地分支 `work/<name>`，并自动创建/加入同名飞书群；解散按钮会先拒绝仍在运行的对应 session，只在 worktree 干净时删除目录和解散群，保留分支；重新激活已合并归档分支时会更新到主线。
@@ -39,6 +40,7 @@
 ### Testing Requirements
 - 常规校验使用 `bun test` 和 `bun run build`。
 - 涉及真实飞书、Codex 登录、卡片流式行为或 `wt` 建群/解散时，用 debug 注入、`bun scripts/smoke.ts "<group name>"` 或 `bun scripts/test-all.ts "<group name>"` 做人工 smoke。
+- 需要验证 live 群里的卡片外观或交互时，优先使用**不影响正在运行 daemon** 的路径；如果做不到，先向用户说明会影响哪些服务，并等待明确许可。不得把“为了验证”当成默认可以碰 live daemon 的理由。
 - 发布前按项目惯例运行 `bun test`、`bun run build`，再执行版本 bump、tag、npm/GitHub Packages 发布和 GitHub Release 流程。
 
 ### Common Patterns
@@ -70,6 +72,7 @@
 
 ## Runtime Operation Notes
 - 从 Lodestar 自己承载的对话里执行 `systemctl --user restart feishu-daemon.service` / `lodestar-stop` / `restart` 这类会重启或停止当前 daemon 的命令时，工具调用显示 `aborted` 通常只是宿主进程被 SIGTERM 中断了，不代表操作失败。恢复后先用 `systemctl --user status feishu-daemon.service`、`journalctl --user -u feishu-daemon.service` 或 PID/日志确认结果，不要直接向用户汇报“重启未完成”。
+- “测试当前改动”“发交互卡片到本群”“先看看效果”默认都属于**非授权**的 live-service 变更理由。除非用户明确要求，否则禁止执行任何会影响 `feishu-daemon.service` 或当前 live daemon 的操作，包括但不限于 `stop`、`restart`、`systemd-run` 起替代 daemon、手工 `bun daemon.ts` 接管、修改 service 指向、覆盖 live repo 代码后重启。
 
 ## Release Checklist
 - 除非用户明确要求 minor 或 major 版本，否则只把 `package.json` 版本号按 patch 递增（`+0.0.1`）。不要根据变更范围自行推断 SemVer minor/major。
