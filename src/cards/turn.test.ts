@@ -49,13 +49,13 @@ describe('main conversation card rendering', () => {
     const elements = consoleBodyElements({
       sessionName: 'probe',
       status: 'idle',
+      model: 'gpt-5-codex',
+      effort: 'xhigh',
       peers: [{
         name: 'probe',
         isCurrent: true,
         status: 'working',
         uptimeMs: 65_000,
-        model: 'gpt-5-codex',
-        effort: 'xhigh',
       }],
       sysinfo: {
         cpu: { cores: 8, load1: 0.42, load5: 0.37, load15: 0.29 },
@@ -78,24 +78,30 @@ describe('main conversation card rendering', () => {
       usage: undefined,
     }, 'footer') as any[]
 
-    expect(elements).toHaveLength(3)
+    expect(elements).toHaveLength(4)
     expect(elements[0].element_id).toBe('footer')
-    expect(elements[0].tag).toBe('collapsible_panel')
-    expect(elements[0].expanded).toBe(false)
-    expect(elements[0].header.title.content).toBe('🗂 活跃项目 (1)')
-    expect(elements[0].elements[0].content).toContain('`probe` · `gpt-5-codex/xhigh` · 工作中 · 1m · 当前')
+    expect(elements[0].tag).toBe('markdown')
+    expect(elements[0].content).toContain('**🤖 当前模型**')
+    expect(elements[0].content).toContain('`gpt-5-codex/xhigh`')
 
-    expect(elements[1].element_id).toBe('console_host')
+    expect(elements[1].element_id).toBe('console_projects')
     expect(elements[1].tag).toBe('collapsible_panel')
     expect(elements[1].expanded).toBe(false)
-    expect(elements[1].header.title.content).toBe('🖥 主机 · L0.42 · M63% · S1')
-    expect(elements[1].elements[0].content).toContain('**负载**')
-    expect(elements[1].elements[0].content).toContain('**内存**')
-    expect(elements[1].elements[0].content).toContain('**服务**')
-    expect(elements[1].elements[0].content).not.toContain('**💽 磁盘**')
+    expect(elements[1].header.title.content).toBe('🗂 活跃项目 (1)')
+    expect(elements[1].elements[0].content).toContain('`probe` · 工作中 · 1m · 当前')
+    expect(elements[1].elements[0].content).not.toContain('gpt-5-codex')
 
-    expect(elements[2].element_id).toBe('console_usage')
-    expect(elements[2].content).toContain('加载中')
+    expect(elements[2].element_id).toBe('console_host')
+    expect(elements[2].tag).toBe('collapsible_panel')
+    expect(elements[2].expanded).toBe(false)
+    expect(elements[2].header.title.content).toBe('🖥 主机 · L0.42 · M63% · S1')
+    expect(elements[2].elements[0].content).toContain('**负载**')
+    expect(elements[2].elements[0].content).toContain('**内存**')
+    expect(elements[2].elements[0].content).toContain('**服务**')
+    expect(elements[2].elements[0].content).not.toContain('**💽 磁盘**')
+
+    expect(elements[3].element_id).toBe('console_usage')
+    expect(elements[3].content).toContain('加载中')
 
     const body = JSON.stringify(elements)
     expect(body).not.toContain('活跃上下文')

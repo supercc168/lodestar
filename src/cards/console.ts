@@ -11,6 +11,8 @@ import { ELEMENTS } from './elements'
 export interface ConsoleOpts {
   sessionName: string
   status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
+  model?: string
+  effort?: string
   /** All sessions currently running Codex across every Feishu group
    * this daemon owns. Each entry is a sibling project. Empty/undefined
    * → 渲染 `_无_`。The session matching this card's chat is
@@ -20,8 +22,6 @@ export interface ConsoleOpts {
     isCurrent: boolean
     status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
     uptimeMs?: number
-    model?: string
-    effort?: string
   }>
   /** Subscription usage snapshot from Codex app-server. Undefined → omit row. */
   usage?: UsageSnapshot
@@ -280,12 +280,9 @@ export function consoleMainContent(opts: ConsoleOpts): string {
   return peers.map((p) => {
     const dot = PEER_STATUS_EMOJI[p.status] ?? '·'
     const label = PEER_STATUS_LABEL[p.status] ?? p.status
-    const model = p.isCurrent && p.model
-      ? ` · \`${p.model}${p.effort ? `/${p.effort}` : ''}\``
-      : ''
     const up = p.uptimeMs != null && p.uptimeMs > 0 ? ` · ${fmtUptime(p.uptimeMs)}` : ''
     const mark = p.isCurrent ? ' · 当前' : ''
-    return `　· ${dot} \`${p.name}\`${model} · ${label}${up}${mark}`
+    return `　· ${dot} \`${p.name}\` · ${label}${up}${mark}`
   }).join('\n')
 }
 
@@ -299,6 +296,26 @@ export function consoleMainElement(opts: ConsoleOpts, elementId = ELEMENTS.conso
     },
     expanded: false,
     elements: [{ tag: 'markdown', content: consoleMainContent(opts) }],
+  }
+}
+
+export function consoleCurrentModelContent(opts: ConsoleOpts): string {
+  const label = opts.model
+    ? `${opts.model}${opts.effort ? `/${opts.effort}` : ''}`
+    : opts.effort
+      ? `强度 ${opts.effort}`
+      : '未就绪'
+  return `**🤖 当前模型**　\`${label}\``
+}
+
+export function consoleCurrentModelElement(
+  opts: ConsoleOpts,
+  elementId = ELEMENTS.consoleCurrentModel,
+): object {
+  return {
+    tag: 'markdown',
+    element_id: elementId,
+    content: consoleCurrentModelContent(opts),
   }
 }
 
@@ -326,9 +343,10 @@ export function consoleUsageElement(usage: UsageSnapshot | undefined): object {
   }
 }
 
-export function consoleBodyElements(opts: ConsoleOpts, mainElementId?: string): object[] {
+export function consoleBodyElements(opts: ConsoleOpts, currentModelElementId?: string): object[] {
   return [
-    consoleMainElement(opts, mainElementId),
+    consoleCurrentModelElement(opts, currentModelElementId),
+    consoleMainElement(opts),
     consoleHostElement(opts.sysinfo),
     consoleUsageElement(opts.usage),
   ]
