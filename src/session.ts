@@ -531,20 +531,20 @@ export class Session {
     }
     if (init.state === 'timeout') {
       log(`session "${this.sessionName}": init wait timeout (5s) — proceeding`)
-      report?.(this.withModel('⏳ Codex 已启动，init 确认超时'))
+      report?.(this.withModel(this.withWorktreeInstructionNotice('⏳ Codex 已启动，init 确认超时')))
     }
 
     if (announce) {
       const modelLine = this.modelLine()
       await feishu.sendText(this.chatId, [
-        `✅ Lodestar session "${this.sessionName}" 已就绪，发消息开始对话。`,
+        this.withWorktreeInstructionNotice(`✅ Lodestar session "${this.sessionName}" 已就绪，发消息开始对话。`),
         modelLine,
       ].filter(Boolean).join('\n'))
     }
     this.status = 'idle'
     this.startedAt = Date.now()
     this.opts.onLifecycleChange?.()
-    report?.(this.withModel('✅ Codex 已就绪'))
+    report?.(this.withModel(this.withWorktreeInstructionNotice('✅ Codex 已就绪')))
     return true
   }
 
@@ -736,7 +736,7 @@ export class Session {
         await closeInternalStatusCard(finalStatus)
         return false
       }
-      const msg = this.withModel(`✅ 已恢复上一会话 thread=${prevThreadLabel}…`)
+      const msg = this.withModel(this.withWorktreeInstructionNotice(`✅ 已恢复上一会话 thread=${prevThreadLabel}…`))
       report?.(msg)
       if (announceText) await feishu.sendText(this.chatId, msg)
       this.status = 'idle'
@@ -773,6 +773,15 @@ export class Session {
   private spawnDeveloperInstructions(): string {
     const extra = this.worktreeExtraInstruction()
     return extra ? `${CHANNEL_INSTRUCTIONS}\n${extra}` : CHANNEL_INSTRUCTIONS
+  }
+
+  private worktreeInstructionLoadedNotice(): string | null {
+    return this.worktreeExtraInstruction() ? '已载入wt特殊约定' : null
+  }
+
+  private withWorktreeInstructionNotice(text: string): string {
+    const notice = this.worktreeInstructionLoadedNotice()
+    return notice ? `${text}\n${notice}` : text
   }
 
   private worktreeExtraInstruction(): string | null {
@@ -1164,10 +1173,18 @@ export class Session {
             return true
           }
           if (statusCard) {
-            await this.replaceStatusCardWithConsole(statusCard, this.withModel('✅ Codex 已就绪'))
+            await this.replaceStatusCardWithConsole(
+              statusCard,
+              this.withModel(this.withWorktreeInstructionNotice('✅ Codex 已就绪')),
+            )
             return true
           }
-          if (needsStart) await this.closeStatusCard(statusCard, this.withModel('✅ Codex 已就绪'))
+          if (needsStart) {
+            await this.closeStatusCard(
+              statusCard,
+              this.withModel(this.withWorktreeInstructionNotice('✅ Codex 已就绪')),
+            )
+          }
         }
         await this.showConsole()
         return true
@@ -1263,7 +1280,11 @@ export class Session {
             },
           })
           const finalStatus = ok
-            ? (lastStatus.startsWith('✅') ? lastStatus : (resumeThreadLabel ? '✅ 已恢复上一会话' : '✅ Codex 已就绪'))
+            ? (
+                lastStatus.startsWith('✅')
+                  ? lastStatus
+                  : this.withWorktreeInstructionNotice(resumeThreadLabel ? '✅ 已恢复上一会话' : '✅ Codex 已就绪')
+              )
             : (lastStatus.startsWith('❌') ? lastStatus : '❌ 重启失败')
           await this.closeStatusCard(statusCard, ok ? this.withModel(finalStatus) : finalStatus)
         }
@@ -1296,7 +1317,12 @@ export class Session {
               this.setStatusCard(statusCard, status)
             },
           })
-          await this.closeStatusCard(statusCard, ok ? this.withModel('✅ 已清空并启动新会话') : (lastStatus.startsWith('❌') ? lastStatus : '❌ 清空失败'))
+          await this.closeStatusCard(
+            statusCard,
+            ok
+              ? this.withModel(this.withWorktreeInstructionNotice('✅ 已清空并启动新会话'))
+              : (lastStatus.startsWith('❌') ? lastStatus : '❌ 清空失败'),
+          )
         }
         return true
     }
