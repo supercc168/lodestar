@@ -81,5 +81,5 @@
 - 用 `npm publish --access public` 发布 npm 包。
 - 同一个版本也必须发布到 GitHub Packages。临时写入项目 `.npmrc`，内容包括 `@leviyuan:registry=https://npm.pkg.github.com` 和 `//npm.pkg.github.com/:_authToken=$GH_TOKEN`；运行 `npm publish --registry=https://npm.pkg.github.com --tag latest --access public` 后删除 `.npmrc`。不要跳过 GitHub Packages。
 - 始终为 tag 创建对应的 GitHub Release。本机没有安装 `gh`；使用 GitHub REST API，从 `~/.git-credentials` 读取 token，并用 `jq -n --rawfile body /tmp/notes.md ...` 构造 JSON body。
-- 写 release notes 前先读取最近的 GitHub Releases，并匹配现有风格。当前 notes 是中文，使用 `## 修复` / `## 改进` 这类短章节，并以 `**Full Changelog**: https://github.com/leviyuan/lodestar/compare/vA...vB` 结尾。
+- 写 release notes 前先读取最近的 GitHub Releases，并匹配现有风格。当前 notes 与 `CHANGELOG.md` 保持一致：使用中文、优先写“用户能感受到什么”，只保留必要的兼容提示；能用平铺短要点说清时不要再按实现拆成 `修复` / `改进`；非首个版本结尾保留 `**Full Changelog**: https://github.com/leviyuan/lodestar/compare/vA...vB`，首个版本改用源码快照链接。
 - 只有用户明确要求时才重启正在运行的 user service；重启前先用 `systemctl --user list-units --all` 确认实际 unit。
