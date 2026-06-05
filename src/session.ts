@@ -1306,7 +1306,12 @@ export class Session {
       status: this.status,
       peers: [...Session.all]
         .filter(s => s.isRunning())
-        .map(s => ({ ...s.peerSnapshot(), isCurrent: s === this })),
+        .map(s => ({
+          ...s.peerSnapshot(),
+          isCurrent: s === this,
+          model: s === this ? (s.currentModelLabel() ?? undefined) : undefined,
+          effort: s === this ? s.currentEffortLabel() : undefined,
+        })),
       usage,
       sysinfo,
     }

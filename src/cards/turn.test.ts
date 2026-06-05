@@ -54,6 +54,8 @@ describe('main conversation card rendering', () => {
         isCurrent: true,
         status: 'working',
         uptimeMs: 65_000,
+        model: 'gpt-5-codex',
+        effort: 'xhigh',
       }],
       sysinfo: {
         cpu: { cores: 8, load1: 0.42, load5: 0.37, load15: 0.29 },
@@ -81,12 +83,12 @@ describe('main conversation card rendering', () => {
     expect(elements[0].tag).toBe('collapsible_panel')
     expect(elements[0].expanded).toBe(false)
     expect(elements[0].header.title.content).toBe('🗂 活跃项目 (1)')
-    expect(elements[0].elements[0].content).toContain('`probe` · 工作中 · 1m · 当前')
+    expect(elements[0].elements[0].content).toContain('`probe` · `gpt-5-codex/xhigh` · 工作中 · 1m · 当前')
 
     expect(elements[1].element_id).toBe('console_host')
     expect(elements[1].tag).toBe('collapsible_panel')
     expect(elements[1].expanded).toBe(false)
-    expect(elements[1].header.title.content).toContain('🖥 主机状态')
+    expect(elements[1].header.title.content).toBe('🖥 主机 · L0.42 · M63% · S1')
     expect(elements[1].elements[0].content).toContain('**负载**')
     expect(elements[1].elements[0].content).toContain('**内存**')
     expect(elements[1].elements[0].content).toContain('**服务**')

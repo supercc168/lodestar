@@ -20,6 +20,8 @@ export interface ConsoleOpts {
     isCurrent: boolean
     status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
     uptimeMs?: number
+    model?: string
+    effort?: string
   }>
   /** Subscription usage snapshot from Codex app-server. Undefined → omit row. */
   usage?: UsageSnapshot
@@ -210,9 +212,9 @@ const SERVICE_STATUS_EMOJI: Record<string, string> = {
 /** Host snapshot panel body: 负载、内存、服务列表。 */
 function hostSummary(sysinfo?: SysInfo): string[] {
   const parts: string[] = []
-  if (sysinfo?.cpu) parts.push(`load ${sysinfo.cpu.load1.toFixed(2)}`)
-  if (sysinfo?.mem) parts.push(`mem ${sysinfo.mem.percent}%`)
-  if (sysinfo && !sysinfo.servicesError) parts.push(`${sysinfo.services.length} 服务`)
+  if (sysinfo?.cpu) parts.push(`L${sysinfo.cpu.load1.toFixed(2)}`)
+  if (sysinfo?.mem) parts.push(`M${sysinfo.mem.percent}%`)
+  if (sysinfo && !sysinfo.servicesError) parts.push(`S${sysinfo.services.length}`)
   return parts
 }
 
@@ -278,9 +280,12 @@ export function consoleMainContent(opts: ConsoleOpts): string {
   return peers.map((p) => {
     const dot = PEER_STATUS_EMOJI[p.status] ?? '·'
     const label = PEER_STATUS_LABEL[p.status] ?? p.status
+    const model = p.isCurrent && p.model
+      ? ` · \`${p.model}${p.effort ? `/${p.effort}` : ''}\``
+      : ''
     const up = p.uptimeMs != null && p.uptimeMs > 0 ? ` · ${fmtUptime(p.uptimeMs)}` : ''
     const mark = p.isCurrent ? ' · 当前' : ''
-    return `　· ${dot} \`${p.name}\` · ${label}${up}${mark}`
+    return `　· ${dot} \`${p.name}\`${model} · ${label}${up}${mark}`
   }).join('\n')
 }
 
@@ -305,7 +310,7 @@ export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.conso
     header: {
       title: {
         tag: 'plain_text',
-        content: summary.length > 0 ? `🖥 主机状态 · ${summary.join(' · ')}` : '🖥 主机状态',
+        content: summary.length > 0 ? `🖥 主机 · ${summary.join(' · ')}` : '🖥 主机',
       },
     },
     expanded: false,
