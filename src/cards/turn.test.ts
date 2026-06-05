@@ -289,10 +289,10 @@ describe('ask card rendering', () => {
 
     expect(el.header.title.content).toBe('🤔 AskUserQuestion · 2/3')
     const body = JSON.stringify(el.elements)
-    expect(body).toContain('✅ 1/3 · 背景')
+    expect(body).toContain('✅ 1/3 · 先确认背景')
     expect(body).toContain('**回答**：第一个答案')
-    expect(body).toContain('🤔 2/3 · 目标')
-    expect(body).toContain('⏳ 3/3 · 期限')
+    expect(body).toContain('🤔 2/3 · 你要哪个目标？')
+    expect(body).toContain('⏳ 3/3 · 什么时候要？')
     expect(body).toContain('也可以直接在群里回复你的答案')
   })
 

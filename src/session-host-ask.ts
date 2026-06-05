@@ -58,45 +58,23 @@ function normalizeAskQuestion(raw: unknown): cards.AskQuestion | null {
     ? (raw as { question: string }).question.trim()
     : ''
   if (!question) return null
-  const header = typeof (raw as { header?: unknown }).header === 'string'
-    ? (raw as { header: string }).header.trim()
-    : undefined
   const options = normalizeAskOptions((raw as { options?: unknown }).options)
+  if (options.length < 2) return null
   return {
     question,
-    ...(header ? { header } : {}),
     options,
   }
 }
 
 function formatHostAskInput(questions: cards.AskQuestion[]): string {
-  const payload: Record<string, unknown> = {
+  return JSON.stringify({
     questions: questions.map(question => {
-      const item: Record<string, unknown> = { question: question.question }
-      if (question.header) item.header = question.header
-      if (question.options.length > 0) {
-        item.options = question.options.map(opt => (
-          opt.description
-            ? { label: opt.label, description: opt.description }
-            : { label: opt.label }
-        ))
+      return {
+        question: question.question,
+        options: question.options.map(opt => opt.label),
       }
-      return item
     }),
-  }
-  if (questions.length === 1) {
-    const [question] = questions
-    payload.question = question.question
-    if (question.header) payload.header = question.header
-    if (question.options.length > 0) {
-      payload.options = question.options.map(opt => (
-        opt.description
-          ? { label: opt.label, description: opt.description }
-          : { label: opt.label }
-      ))
-    }
-  }
-  return JSON.stringify(payload)
+  })
 }
 
 function parseHostAskPayload(payloadText: string): { questions: cards.AskQuestion[]; inputJson: string } | null {
@@ -111,13 +89,11 @@ function parseHostAskPayload(payloadText: string): { questions: cards.AskQuestio
   const questions = Array.isArray((raw as { questions?: unknown[] }).questions)
     ? (raw as { questions: unknown[] }).questions.map(normalizeAskQuestion).filter((q): q is cards.AskQuestion => q != null)
     : []
-  if (questions.length > 0) return { questions, inputJson: formatHostAskInput(questions) }
-  const single = normalizeAskQuestion(raw)
-  if (!single) return null
-  return { questions: [single], inputJson: formatHostAskInput([single]) }
+  if (questions.length === 0) return null
+  return { questions, inputJson: formatHostAskInput(questions) }
 }
 
-function answerPayload(ask: HostAskRecord): { answers: Array<{ header: string; question: string; answer: string; user: string }> } | null {
+function answerPayload(ask: HostAskRecord): { answers: Array<{ question: string; answer: string; user: string }> } | null {
   const answers = ask.questions.map((question, idx) => {
     const answered = ask.answered.get(idx)
     if (!answered) return null
@@ -126,14 +102,13 @@ function answerPayload(ask: HostAskRecord): { answers: Array<{ header: string; q
       ?? ''
     if (!answer) return null
     return {
-      header: question.header?.trim() || `问题 ${idx + 1}`,
       question: question.question,
       answer,
       user: answered.user ?? '',
     }
   })
   if (answers.some(item => item == null)) return null
-  return { answers: answers as Array<{ header: string; question: string; answer: string; user: string }> }
+  return { answers: answers as Array<{ question: string; answer: string; user: string }> }
 }
 
 async function createOrUpdateHostAskCard(s: Session, askId: string): Promise<void> {
