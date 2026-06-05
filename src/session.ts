@@ -38,7 +38,7 @@ import * as feishu from './feishu'
 import { log } from './log'
 import { readSysInfo } from './sysinfo'
 import { readUsage, updateUsageFromRateLimits, type UsageSnapshot } from './usage'
-import { contextLimitFromAppServer, contextTokenRatioLabel, contextTokensFromUsage } from './context-window'
+import { contextLimitFromAppServer, contextTokensFromUsage } from './context-window'
 import { extractAskUsrMarkers, extractSendMarkerPaths, stripAskUsrMarkers } from './outbound-markers'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionTools from './session-tools'
@@ -1765,7 +1765,7 @@ export class Session {
       }
 
       log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} midBuffer=${this.pendingMidTurnMsgs.length} forcePush=${forcePush}`)
-      void this.closeTurnCard(suffix, { forcePush })
+      void this.closeTurnCard(suffix, { forcePush, hasFreshResult: true })
       this.status = 'idle'
       sessionHostAsk.resumeAnsweredHostAsks(this)
 
@@ -2467,7 +2467,10 @@ export class Session {
     void cardkit.streamTextThrottled(turn.cardId, cards.ELEMENTS.footer, this.withModel(FOOTER_WORKING))
   }
 
-  private async closeTurnCard(suffix?: string, opts: { forcePush?: boolean } = {}): Promise<void> {
+  private async closeTurnCard(
+    suffix?: string,
+    opts: { forcePush?: boolean; hasFreshResult?: boolean } = {},
+  ): Promise<void> {
     // CRITICAL: capture-and-null in a single synchronous block at entry
     // so a parallel `closeTurnCard` (e.g. result event firing while
     // onUserMessage is awaiting an interrupt) can't double-process the
@@ -2516,22 +2519,23 @@ export class Session {
     // trailing "done" word is gone — the ✅ already carries that
     // meaning. User-confirmed footer order 2026-05-16.
     const stateMark = suffix ? suffix : '✅'
-    // Per-turn metrics: context-window occupancy (as a real percentage,
-    // not a token count) and dollar cost. Only meaningful on a clean
-    // close — suffix-tagged turns (interrupt) didn't fire the `result`
-    // event that populates `lastTurnDelta`, so these numbers would be
-    // stale and misleading.
+    // Footer line 1 keeps the terminal status compact. Usage-derived
+    // numbers only render when a fresh SDK result landed for THIS turn;
+    // interrupts/boot failures would otherwise show stale prior-turn data.
     let metrics = ''
-    if (!suffix) {
+    if (opts.hasFreshResult) {
       const ctxTokens = this.currentContextTokens()
       const ctxMax = this.contextLimitForDisplay()
-      if (ctxTokens !== null) {
-        metrics += ` · 🧠 ${contextTokenRatioLabel(ctxTokens, ctxMax)}`
-      }
+      const ctxPercent = cards.footerContextPercentLabel(ctxTokens, ctxMax)
+      if (ctxPercent) metrics += ` · 🧠 ${ctxPercent}`
       const cost = this.lastTurnDelta?.costUsd ?? 0
       if (cost > 0) metrics += ` · 💰 $${cost.toFixed(3)}`
     }
-    const footer = this.withModel(`${stateMark} ⏱ ${elapsed}s${metrics}${compactNote}${sendNote}`)
+    const footerLine1 = this.withModel(`${stateMark} ⏱ ${elapsed}s${metrics}${compactNote}${sendNote}`)
+    const footerLine2 = opts.hasFreshResult
+      ? cards.footerTokenDetailLine(this.proc?.lastUsage)
+      : ''
+    const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
     await cardkit.streamText(cardId, cards.ELEMENTS.footer, footer)
     // Final chat-list preview: clean finish shows "⏱ Xs · NK tokens";
     // interrupted shows the suffix instead (no usage event landed).
@@ -2540,7 +2544,7 @@ export class Session {
     cardkit.cancelSummary(cardId)
     await cardkit.patchSettings(cardId, cards.streamingOffSettings({
       durationSec: elapsed,
-      tokens: suffix ? undefined : this.lastTurnDelta?.tokens,
+      tokens: opts.hasFreshResult ? this.lastTurnDelta?.tokens : undefined,
       suffix,
     }))
     await cardkit.dispose(cardId)

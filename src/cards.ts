@@ -18,6 +18,8 @@ export {
   type AskAnswered,
   type AskState,
   summarizeToolInput,
+  footerContextPercentLabel,
+  footerTokenDetailLine,
   mainConversationCard,
   assistantSegmentElement,
   contextCompactionElement,

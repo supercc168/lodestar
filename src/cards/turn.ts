@@ -7,6 +7,8 @@
  */
 
 import { isAbsolute, relative } from 'node:path'
+import type { CodexUsage } from '../codex-process'
+import { contextPercentSummary } from '../context-window'
 import { ELEMENTS } from './elements'
 
 export interface TurnPlanStep {
@@ -49,6 +51,13 @@ function planStatusIcon(s: string): string {
 
 function truncateText(s: string, n: number): string {
   return s.length > n ? s.slice(0, n) + '…' : s
+}
+
+function compactFooterTokens(n: number): string {
+  if (!Number.isFinite(n) || n < 0) return '--'
+  if (n < 1000) return String(Math.round(n))
+  if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0).replace(/\.0$/, '') + 'k'
+  return (n / 1_000_000).toFixed(2).replace(/\.?0+$/, '') + 'm'
 }
 
 const BASH_OUTPUT_PREVIEW_CHARS = 300
@@ -98,6 +107,19 @@ function compactionDurationLabel(data: Record<string, unknown>): string {
   const completedAt = numberValue(data.completedAtMs)
   if (startedAt == null || completedAt == null || completedAt < startedAt) return ''
   return ` · 耗时 ${formatGoalTime((completedAt - startedAt) / 1000)}`
+}
+
+export function footerContextPercentLabel(tokens: number | null, limit: number | null | undefined): string | null {
+  if (tokens == null || !Number.isFinite(tokens)) return null
+  const pct = contextPercentSummary(tokens, limit)
+  return pct ? `${pct.used}%` : '--'
+}
+
+export function footerTokenDetailLine(usage: CodexUsage | null | undefined): string {
+  const input = compactFooterTokens(usage?.input_tokens ?? Number.NaN)
+  const cached = compactFooterTokens(usage?.cache_read_input_tokens ?? Number.NaN)
+  const output = compactFooterTokens(usage?.output_tokens ?? Number.NaN)
+  return `入${input} 缓${cached} 出${output}`
 }
 
 export function contextCompactionElement(i: number, notice: ContextCompactionNotice, elementId: string): object {
