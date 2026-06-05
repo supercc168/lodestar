@@ -782,7 +782,7 @@ export class Session {
       this.worktreeProjectName(),
     )
     if (!instructionsPath) return null
-    return `本项目在当前工作目录有额外的约定${instructionsPath}，你必须严格遵守`
+    return `本项目在当前工作目录有额外的约定${instructionsPath}，你要把它视为和AGENTS.md一样重要`
   }
 
   private async runWorktreeCommand(arg: string, userOpenId: string): Promise<void> {

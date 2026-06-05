@@ -103,19 +103,18 @@ describe('project worktrees', () => {
 
   test('finds slug-specific AGENTS file for managed worktree branches', () => {
     const { repo } = initRepo()
-    writeFileSync(join(repo, 'AGENTS.prompt-work.md'), '# extra rules\n')
     const result = ensureProjectWorktree(repo, 'feishu', 'prompt-work')
+    writeFileSync(join(result.worktreePath, 'AGENTS.prompt-work.md'), '# extra rules\n')
 
     expect(
       worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu'),
-    ).toBe(join(repo, 'AGENTS.prompt-work.md'))
+    ).toBe(join(result.worktreePath, 'AGENTS.prompt-work.md'))
   })
 
   test('skips mismatched slug-specific AGENTS files', () => {
     const { repo } = initRepo()
-    writeFileSync(join(repo, 'AGENTS.other-work.md'), '# extra rules\n')
-
     const result = ensureProjectWorktree(repo, 'feishu', 'prompt-work')
+    writeFileSync(join(result.worktreePath, 'AGENTS.other-work.md'), '# extra rules\n')
 
     expect(worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu')).toBeNull()
   })

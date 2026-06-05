@@ -71,7 +71,7 @@ export function worktreeInstructionsPathForManagedBranch(
   }
   const expectedPath = expectedWorktreePath(projectDir, projectName, slug)
   if (resolve(workDir) !== resolve(expectedPath)) return null
-  const instructionsPath = join(projectDir, `AGENTS.${slug}.md`)
+  const instructionsPath = join(workDir, `AGENTS.${slug}.md`)
   return existsSync(instructionsPath) ? instructionsPath : null
 }
 
