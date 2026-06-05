@@ -1002,81 +1002,93 @@ export interface AskState {
   answered: Map<number, AskAnswered>
 }
 
-/** Render one question's body — either as clickable interactive_container
- * rows (when picked === undefined) or as plain markdown summary
- * (already-answered, shown in history-panel context). */
-function renderAskQuestionBody(
+function askQuestionTitle(q: AskQuestion, questionIdx: number, total: number): string {
+  const label = q.header?.trim() || q.question.trim() || `问题 ${questionIdx + 1}`
+  return `${questionIdx + 1}/${total} · ${label}`
+}
+
+function askAnswerValue(q: AskQuestion, picked?: AskAnswered): string {
+  if (!picked) return '?'
+  return picked.customText
+    ?? (picked.optionIdx !== undefined ? q.options[picked.optionIdx]?.label : undefined)
+    ?? '?'
+}
+
+/** Render only the current question's clickable option rows. Historical
+ * answered rows are rendered as plain markdown in the timeline view. */
+function renderAskQuestionOptions(
   q: AskQuestion,
   toolUseId: string,
   questionIdx: number,
-  picked?: AskAnswered,
+  callbackKind: 'ask' | 'host_ask' = 'ask',
 ): any[] {
   const els: any[] = []
-  els.push({ tag: 'markdown', content: `**${q.question}**` })
   for (let oi = 0; oi < q.options.length; oi++) {
     const opt = q.options[oi]
     const desc = opt.description ? `  ·  ${opt.description}` : ''
-    if (picked) {
-      const isPicked = picked.optionIdx === oi
-      els.push({
-        tag: 'markdown',
-        content: isPicked
-          ? `✅ **${opt.label}**${desc}`
-          : `~~◯ ${opt.label}${desc}~~`,
-      })
-    } else {
-      els.push({
-        tag: 'interactive_container',
-        background_style: 'default',
-        has_border: true,
-        corner_radius: '6px',
-        padding: '8px 12px',
-        margin: '4px 0px 4px 0px',
-        behaviors: [{
-          type: 'callback',
-          value: {
-            kind: 'ask',
-            tool_use_id: toolUseId,
-            question_idx: questionIdx,
-            option_idx: oi,
-          },
-        }],
-        elements: [{ tag: 'markdown', content: `**${opt.label}**${desc}` }],
-      })
-    }
-  }
-  if (picked?.customText) {
-    els.push({ tag: 'markdown', content: `✏️ **自定义回答**：${picked.customText}` })
+    els.push({
+      tag: 'interactive_container',
+      background_style: 'default',
+      has_border: true,
+      corner_radius: '6px',
+      padding: '8px 12px',
+      margin: '4px 0px 4px 0px',
+      behaviors: [{
+        type: 'callback',
+        value: {
+          kind: callbackKind,
+          tool_use_id: toolUseId,
+          question_idx: questionIdx,
+          option_idx: oi,
+        },
+      }],
+      elements: [{ tag: 'markdown', content: `**${opt.label}**${desc}` }],
+    })
   }
   return els
 }
 
-/** Folded "📜 已答 N 题" panel — option C from the multi-question
- * design discussion. Returns null when there's no history to show. */
-function renderAskHistoryPanel(
+function renderAskTimeline(
   questions: AskQuestion[],
+  toolUseId: string,
+  currentIdx: number | undefined,
   answered: Map<number, AskAnswered>,
+  callbackKind: 'ask' | 'host_ask',
 ): any | null {
-  if (answered.size === 0) return null
-  const lines: string[] = []
-  const sortedIdx = [...answered.keys()].sort((a, b) => a - b)
-  for (const idx of sortedIdx) {
+  if (questions.length === 0) return null
+  const total = questions.length
+  const body: any[] = []
+  for (let idx = 0; idx < questions.length; idx++) {
     const q = questions[idx]
-    const a = answered.get(idx)!
-    const tag = q?.header ?? `Q${idx + 1}`
-    const value = a.customText
-      ?? (a.optionIdx !== undefined ? q?.options[a.optionIdx]?.label : undefined)
-      ?? '?'
-    lines.push(`- ✅ **${tag}**：${value}`)
+    if (!q) continue
+    const title = askQuestionTitle(q, idx, total)
+    const picked = answered.get(idx)
+    if (picked) {
+      const answer = askAnswerValue(q, picked)
+      const lines = [`**✅ ${title}**`, `**回答**：${answer}`]
+      if (q.question.trim() && q.header?.trim() && q.header.trim() !== q.question.trim()) {
+        lines.splice(1, 0, q.question.trim())
+      }
+      body.push({ tag: 'markdown', content: lines.join('\n') })
+      continue
+    }
+    if (idx === currentIdx) {
+      body.push({ tag: 'markdown', content: `**🤔 ${title}**` })
+      if (q.question.trim() && (!q.header?.trim() || q.header.trim() !== q.question.trim())) {
+        body.push({ tag: 'markdown', content: q.question.trim() })
+      }
+      if (q.options.length > 0) {
+        body.push(...renderAskQuestionOptions(q, toolUseId, idx, callbackKind))
+      }
+      body.push({
+        tag: 'markdown',
+        content: '_💬 也可以直接在群里回复你的答案（裸词命令 `hi`/`stop`/`kill`/`restart`/`clear`/`model` 仍然优先）_',
+      })
+      continue
+    }
+    body.push({ tag: 'markdown', content: `**⏳ ${title}**` })
   }
-  return {
-    tag: 'collapsible_panel',
-    header: {
-      title: { tag: 'plain_text', content: `📜 已答 ${answered.size} 题（点击展开）` },
-    },
-    expanded: false,
-    elements: [{ tag: 'markdown', content: lines.join('\n') }],
-  }
+  return body
 }
 
 /** Tool-panel renderer for `AskUserQuestion` — Codex's structured
@@ -1097,6 +1109,7 @@ export function askUserQuestionElement(
   questions: AskQuestion[],
   status: '🤔' | '✅' | '❌' = '🤔',
   state?: AskState,
+  callbackKind: 'ask' | 'host_ask' = 'ask',
 ): object {
   const total = questions.length
   const answered = state?.answered ?? new Map<number, AskAnswered>()
@@ -1106,34 +1119,8 @@ export function askUserQuestionElement(
   let headerText: string
 
   if (isTerminal) {
-    // All questions resolved — collapse and roll up answers in header
-    // + body. Single-question case keeps the old "已回答：xxx" header
-    // style; multi-question gets a "已回答 · N 题" count and a flat
-    // listing of Q→A pairs in the body.
-    if (total === 1) {
-      const q0 = questions[0]
-      const a0 = answered.get(0)
-      const value = a0?.customText
-        ?? (a0?.optionIdx !== undefined ? q0?.options[a0.optionIdx]?.label : undefined)
-        ?? '?'
-      const headerTag = q0?.header ? ` · ${q0.header}` : ''
-      headerText = `${status} 已回答${headerTag}：${value}`
-    } else {
-      headerText = `${status} 已回答 · ${total} 题`
-    }
-    const sortedIdx = [...answered.keys()].sort((a, b) => a - b)
-    for (const idx of sortedIdx) {
-      const q = questions[idx]
-      const a = answered.get(idx)!
-      const tag = q?.header ?? `Q${idx + 1}`
-      const value = a.customText
-        ?? (a.optionIdx !== undefined ? q?.options[a.optionIdx]?.label : undefined)
-        ?? '?'
-      bodyElements.push({
-        tag: 'markdown',
-        content: `**${tag}**：${value}`,
-      })
-    }
+    headerText = `${status} 已回答 · ${total}/${total}`
+    bodyElements.push(...(renderAskTimeline(questions, toolUseId, currentIdx, answered, callbackKind) ?? []))
     const lastUser = [...answered.values()].reverse().find(a => a.user)?.user
     if (lastUser) {
       bodyElements.push({
@@ -1142,25 +1129,13 @@ export function askUserQuestionElement(
       })
     }
   } else if (currentIdx !== undefined && questions[currentIdx]) {
-    // In-progress: render current question + folded history above.
-    // Progress tag in header lets the user see how many are left,
-    // even with the history panel folded.
-    const q = questions[currentIdx]
-    const headerTag = q.header ? ` · ${q.header}` : ''
-    const progress = total > 1 ? ` (${currentIdx + 1}/${total})` : ''
-    headerText = `${status} 🤔 AskUserQuestion${headerTag}${progress}`
-    const history = renderAskHistoryPanel(questions, answered)
-    if (history) bodyElements.push(history)
-    bodyElements.push(...renderAskQuestionBody(q, toolUseId, currentIdx))
-    bodyElements.push({
-      tag: 'markdown',
-      content: '_💬 也可以直接在群里回复你的答案（裸词命令 `hi`/`stop`/`kill`/`restart`/`clear`/`model` 仍然优先）_',
-    })
+    headerText = `${status} AskUserQuestion · ${currentIdx + 1}/${total}`
+    bodyElements.push(...(renderAskTimeline(questions, toolUseId, currentIdx, answered, callbackKind) ?? []))
   } else {
     // Defensive fallback — neither answered nor a valid currentIdx.
     headerText = `${status} 🤔 AskUserQuestion`
     if (questions[0]) {
-      bodyElements.push({ tag: 'markdown', content: `**${questions[0].question}**` })
+      bodyElements.push({ tag: 'markdown', content: `**${askQuestionTitle(questions[0], 0, total || 1)}**` })
     }
   }
 
@@ -1170,5 +1145,27 @@ export function askUserQuestionElement(
     header: { title: { tag: 'plain_text', content: headerText } },
     expanded: !isTerminal,
     elements: bodyElements,
+  }
+}
+
+export function hostAskCard(
+  askId: string,
+  questions: AskQuestion[],
+  state: AskState,
+): object {
+  const total = questions.length || 1
+  const currentIdx = state.currentIdx ?? Math.max(0, Math.min(total - 1, state.answered.size))
+  const summary = questions[currentIdx]?.question?.trim() || questions[0]?.question?.trim() || 'Codex 请求澄清'
+  return {
+    schema: '2.0',
+    config: {
+      update_multi: true,
+      summary: { content: `❓ ${Math.min(currentIdx + 1, total)}/${total} ${summary.slice(0, 54)}` },
+    },
+    body: {
+      elements: [
+        askUserQuestionElement(0, askId, questions, state.currentIdx === undefined ? '✅' : '🤔', state, 'host_ask'),
+      ],
+    },
   }
 }

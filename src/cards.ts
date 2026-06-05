@@ -28,6 +28,7 @@ export {
   readBatchElement,
   toolCallPermissionElement,
   askUserQuestionElement,
+  hostAskCard,
 } from './cards/turn'
 export {
   type ConsoleOpts,

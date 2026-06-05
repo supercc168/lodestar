@@ -39,10 +39,11 @@ import { log } from './log'
 import { readSysInfo } from './sysinfo'
 import { readUsage, updateUsageFromRateLimits, type UsageSnapshot } from './usage'
 import { contextLimitFromAppServer, contextTokenRatioLabel, contextTokensFromUsage } from './context-window'
-import { extractSendMarkerPaths } from './outbound-markers'
+import { extractAskUsrMarkers, extractSendMarkerPaths, stripAskUsrMarkers } from './outbound-markers'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
+import * as sessionHostAsk from './session-host-ask'
 import * as sessionPermission from './session-permission'
 import * as worktree from './worktree'
 
@@ -184,6 +185,22 @@ export class Session {
      * —— 这时若 requestId 已就位则 finalize；否则等 renderPermission
      * 一来立即 finalize。 */
     currentIdx?: number
+  }>()
+  /** Host-side askusr cards triggered by assistant marker protocol.
+   * Kept separate from SDK AskUserQuestion because there is no
+   * can_use_tool/requestId handshake here — the host injects the
+   * synthetic tool call/tool result into thread history after the user
+   * answers, then starts a fresh continuation turn. */
+  pendingHostAsks = new Map<string, {
+    questions: cards.AskQuestion[]
+    answered: Map<number, cards.AskAnswered>
+    currentIdx?: number
+    toolCallId: string
+    inputJson: string
+    cardId?: string
+    messageId?: string
+    creatingCard?: boolean
+    resumeStarted?: boolean
   }>()
   /** Thread-scoped goal reported by Codex app-server. Pure progress
    * accounting updates refresh this snapshot without adding card elements;
@@ -625,6 +642,7 @@ export class Session {
     this.initCount = 0
     this.openingTurn = false
     this.pendingAsks.clear()
+    this.pendingHostAsks.clear()
     this.pendingPermissions.clear()
     this.status = 'stopped'
     this.opts.onLifecycleChange?.()
@@ -665,6 +683,7 @@ export class Session {
     this.initCount = 0
     this.openingTurn = false
     this.pendingAsks.clear()
+    this.pendingHostAsks.clear()
     this.pendingPermissions.clear()
     if (resume && prevSessionId) {
       this.status = 'starting'
@@ -1562,20 +1581,51 @@ export class Session {
     return sessionAsk.hasPendingAsk(this)
   }
 
+  hasPendingHostAsk(): boolean {
+    return sessionHostAsk.hasPendingHostAsk(this)
+  }
+
   onAskMessageAnswer(text: string, user: string, msgId: string): Promise<void> {
     return sessionAsk.onAskMessageAnswer(this, text, user, msgId)
+  }
+
+  onHostAskMessageAnswer(text: string, user: string, msgId: string): Promise<void> {
+    return sessionHostAsk.onHostAskMessageAnswer(this, text, user, msgId)
   }
 
   onAskAnswer(toolUseId: string, questionIdx: number, optionIdx: number, user: string): Promise<void> {
     return sessionAsk.onAskAnswer(this, toolUseId, questionIdx, optionIdx, user)
   }
 
+  onHostAskAnswer(toolUseId: string, questionIdx: number, optionIdx: number, user: string): Promise<ModelActionResult> {
+    return sessionHostAsk.onHostAskAnswer(this, toolUseId, questionIdx, optionIdx, user)
+  }
+
   onAskCustomAnswer(toolUseId: string, questionIdx: number, customText: string, user: string): Promise<boolean> {
     return sessionAsk.onAskCustomAnswer(this, toolUseId, questionIdx, customText, user)
   }
 
+  onHostAskCustomAnswer(toolUseId: string, questionIdx: number, customText: string, user: string): Promise<ModelActionResult> {
+    return sessionHostAsk.onHostAskCustomAnswer(this, toolUseId, questionIdx, customText, user)
+  }
+
   onPermissionDecision(requestId: string, decision: 'allow' | 'allow_always' | 'deny', user: string): Promise<void> {
     return sessionPermission.onPermissionDecision(this, requestId, decision, user)
+  }
+
+  async startHostAskContinuation(wireText: string): Promise<void> {
+    if (!this.isRunning()) throw new Error('codex is not running')
+    if (this.currentTurn || this.openingTurn) throw new Error('codex turn still active')
+    this.openingTurn = true
+    try {
+      await this.openTurnCard('', 'user_message')
+      if (!this.currentTurn) throw new Error('failed to open continuation turn card')
+      this.proc!.sendUserText(wireText, [])
+      this.pendingUserMessageCount++
+      this.status = 'working'
+    } finally {
+      this.openingTurn = false
+    }
   }
 
   // ── Wiring Codex → Feishu ──────────────────────────────────────────
@@ -1702,11 +1752,12 @@ export class Session {
       const hasMidTurn = this.pendingMidTurnMsgs.length > 0
       const isError = this.proc?.lastResult.is_error === true
       const subtype = this.proc?.lastResult.subtype ?? 'success'
+      const hostAskFlowActive = this.pendingHostAsks.size > 0
 
       let suffix: string | undefined
       let forcePush = false
 
-      if (hasMidTurn) {
+      if (hasMidTurn && !hostAskFlowActive) {
         suffix = isError ? `⚠️ Codex ${subtype},用户已介入` : '📨 转交新卡'
       } else if (isError) {
         suffix = `⚠️ Codex ${subtype}`
@@ -1716,8 +1767,9 @@ export class Session {
       log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} midBuffer=${this.pendingMidTurnMsgs.length} forcePush=${forcePush}`)
       void this.closeTurnCard(suffix, { forcePush })
       this.status = 'idle'
+      sessionHostAsk.resumeAnsweredHostAsks(this)
 
-      if (hasMidTurn) {
+      if (hasMidTurn && !hostAskFlowActive) {
         void this.drainMidTurnAndOpen()
       }
     })
@@ -1738,6 +1790,7 @@ export class Session {
       // onAskMessageAnswer 当僵尸答案吞掉,session 焊死到下次 daemon 重启
       // (kill/restart 同样在上面补了这一清理)。
       this.pendingAsks.clear()
+      this.pendingHostAsks.clear()
       this.pendingPermissions.clear()
       this.userInterrupted = false
       this.status = 'stopped'
@@ -1918,6 +1971,7 @@ export class Session {
       rotateGivenUp: false,
       outboundSeenPaths: new Set(),
       outboundSentPaths: new Set(),
+      hostAskMarkersSeen: new Set(),
     }
     this.currentTurn = turnState
     if (opts.startThinking !== false) this.startThinkingFooter(turnState)
@@ -2056,7 +2110,7 @@ export class Session {
           void cardkit.addElement(newCardId, cards.assistantSegmentElement(ri), {
             type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
           })
-          cardkit.streamTextThrottled(newCardId, reSegId, carryText)
+          cardkit.streamTextThrottled(newCardId, reSegId, this.cleanAssistantTextForDisplay(carryText))
         }
         // 旧卡收尾:footer 红字 + streaming_off + dispose。放到 swap 后
         // 是因为这条链是 async,期间 cardkit 队列上还可能有 stream
@@ -2070,7 +2124,9 @@ export class Session {
           for (const [segId, fullText] of oldSegmentTexts) {
             if (carrySegId && carryText && segId === carrySegId) continue
             await cardkit.replaceElement(oldCardId, segId, {
-              tag: 'markdown', element_id: segId, content: fullText.trim() || ' ',
+              tag: 'markdown',
+              element_id: segId,
+              content: this.cleanAssistantTextForDisplay(fullText).trim() || ' ',
             })
           }
           if (carrySegId && carryText) {
@@ -2310,11 +2366,13 @@ export class Session {
     if (!segId) return  // addElement 已失败 reset,等下一次 delta 重建
     turn.segmentTexts.set(segId, turn.currentAssistantText)
     this.processOutboundMarkers(turn.currentAssistantText)
-    cardkit.streamTextThrottled(turn.cardId, segId, turn.currentAssistantText)
+    this.processHostAskMarkers(turn.currentAssistantText, turn)
+    const displayText = this.cleanAssistantTextForDisplay(turn.currentAssistantText)
+    cardkit.streamTextThrottled(turn.cardId, segId, displayText)
     // Chat-list preview: tail of the latest assistant text. Feishu
     // truncates anyway; ~60 chars is what shows on a typical phone
     // preview line. patchSummaryThrottled is rate-limited on its own.
-    const tail = turn.currentAssistantText.slice(-60)
+    const tail = displayText.slice(-60)
     cardkit.patchSummaryThrottled(turn.cardId, tail)
   }
 
@@ -2337,7 +2395,7 @@ export class Session {
         turn.cardId,
         segId,
         staticAssistantElementId(segId),
-        text,
+        this.cleanAssistantTextForDisplay(text),
         cards.ELEMENTS.footer,
       )
     }
@@ -2351,6 +2409,18 @@ export class Session {
     for (const path of extractSendMarkerPaths(text)) {
       this.sendOutboundPath(path, 'send marker')
     }
+  }
+
+  private processHostAskMarkers(text: string, turn: TurnState): void {
+    for (const marker of extractAskUsrMarkers(text)) {
+      if (turn.hostAskMarkersSeen.has(marker.raw)) continue
+      turn.hostAskMarkersSeen.add(marker.raw)
+      sessionHostAsk.queueHostAskFromMarker(this, marker.payload, marker.raw)
+    }
+  }
+
+  private cleanAssistantTextForDisplay(text: string): string {
+    return stripAskUsrMarkers(text, '\n\n_已发起澄清问题，请回答对应卡片。_')
   }
 
   sendOutboundPath(rawPath: string, source: string): void {
@@ -2426,7 +2496,9 @@ export class Session {
       // (用户要求 2026-05-23:标签留着,让用户看到发了哪个文件)。replaceElement
       // 自身不触发流式 commit,真正全显靠紧随其后的 streaming_mode=false 全局收尾。
       await cardkit.replaceElement(cardId, segId, {
-        tag: 'markdown', element_id: segId, content: fullText.trim() || ' ',
+        tag: 'markdown',
+        element_id: segId,
+        content: this.cleanAssistantTextForDisplay(fullText).trim() || ' ',
       })
     }
 
