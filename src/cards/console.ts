@@ -13,6 +13,7 @@ export interface ConsoleOpts {
   status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
   model?: string
   effort?: string
+  worktreeInstructionNotice?: string | null
   /** All sessions currently running Codex across every Feishu group
    * this daemon owns. Each entry is a sibling project. Empty/undefined
    * → 渲染 `_无_`。The session matching this card's chat is
@@ -305,7 +306,10 @@ export function consoleCurrentModelContent(opts: ConsoleOpts): string {
     : opts.effort
       ? `强度 ${opts.effort}`
       : '未就绪'
-  return `**🤖 当前模型**　\`${label}\``
+  return [
+    `**🤖 当前模型**　\`${label}\``,
+    ...(opts.worktreeInstructionNotice ? [opts.worktreeInstructionNotice] : []),
+  ].join('\n')
 }
 
 export function consoleCurrentModelElement(

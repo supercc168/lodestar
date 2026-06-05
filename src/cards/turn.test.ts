@@ -51,6 +51,7 @@ describe('main conversation card rendering', () => {
       status: 'idle',
       model: 'gpt-5-codex',
       effort: 'xhigh',
+      worktreeInstructionNotice: '已载入wt特殊约定',
       peers: [{
         name: 'probe',
         isCurrent: true,
@@ -83,6 +84,7 @@ describe('main conversation card rendering', () => {
     expect(elements[0].tag).toBe('markdown')
     expect(elements[0].content).toContain('**🤖 当前模型**')
     expect(elements[0].content).toContain('`gpt-5-codex/xhigh`')
+    expect(elements[0].content).toContain('已载入wt特殊约定')
 
     expect(elements[1].element_id).toBe('console_projects')
     expect(elements[1].tag).toBe('collapsible_panel')

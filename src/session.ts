@@ -1340,6 +1340,7 @@ export class Session {
       status: this.status,
       model: this.currentModelLabel() ?? undefined,
       effort: this.currentEffortLabel(),
+      worktreeInstructionNotice: this.worktreeInstructionLoadedNotice(),
       peers: [...Session.all]
         .filter(s => s.isRunning())
         .map(s => ({
