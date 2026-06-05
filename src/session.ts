@@ -20,6 +20,8 @@ import { isAbsolute, join } from 'node:path'
 import {
   CODEX_EFFORT,
   CodexProcess,
+  diffUsageTotals,
+  effectiveTurnTokens,
   isCodexReasoningEffort,
   type CanUseToolRequest,
   type CodexModel,
@@ -28,6 +30,7 @@ import {
   type ContextCompactedNotification,
   type HookCallbackRequest,
   type PlanDelta,
+  type TokenUsageUpdated,
   type ThreadGoal,
   type TurnPlanUpdated,
 } from './codex-process'
@@ -298,6 +301,14 @@ export class Session {
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
   private lastTurnDelta: LastTurnDelta | null = null
+  private currentTurnUsageBaseline: CodexUsage | null = null
+  private currentTurnUsageBaselineKnown = false
+  private lastTurnUsage: CodexUsage | null = null
+  /** Resume path can restore a historical thread without replaying its
+   * absolute token totals into the new subprocess. Until we observe one
+   * fresh absolute total snapshot, the next turn's baseline is unknown
+   * and must not be guessed as zero. */
+  private usageTotalsSeedUnknown = false
 
   constructor(
     public readonly sessionName: string,
@@ -487,6 +498,9 @@ export class Session {
 
     this.status = 'starting'
     this.currentGoal = null
+    this.currentTurnUsageBaseline = null
+    this.currentTurnUsageBaselineKnown = false
+    this.usageTotalsSeedUnknown = false
     report?.(this.withModel('🚀 启动 Codex'))
     this.proc = new CodexProcess({
       workDir: this.workDir,
@@ -644,6 +658,9 @@ export class Session {
     this.pendingAsks.clear()
     this.pendingHostAsks.clear()
     this.pendingPermissions.clear()
+    this.currentTurnUsageBaseline = null
+    this.currentTurnUsageBaselineKnown = false
+    this.usageTotalsSeedUnknown = false
     this.status = 'stopped'
     this.opts.onLifecycleChange?.()
     await proc.kill()
@@ -685,8 +702,11 @@ export class Session {
     this.pendingAsks.clear()
     this.pendingHostAsks.clear()
     this.pendingPermissions.clear()
+    this.currentTurnUsageBaseline = null
+    this.currentTurnUsageBaselineKnown = false
     if (resume && prevSessionId) {
       this.status = 'starting'
+      this.usageTotalsSeedUnknown = true
       report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}…`))
       this.proc = new CodexProcess({
         workDir: this.workDir,
@@ -736,6 +756,8 @@ export class Session {
       // zeroed counters instead of bleeding numbers from the prior chat.
       this.cumStats = { tokens: 0, costUsd: 0, turns: 0 }
       this.lastTurnDelta = null
+      this.lastTurnUsage = null
+      this.usageTotalsSeedUnknown = false
       return await this.start(opts)
     }
   }
@@ -1694,6 +1716,17 @@ export class Session {
     })
     p.on('turn_started', () => {
       this.persistResumableSessionId()
+      const total = this.proc?.lastTotalUsage
+      if (this.usageTotalsSeedUnknown && !total) {
+        this.currentTurnUsageBaseline = null
+        this.currentTurnUsageBaselineKnown = false
+        return
+      }
+      this.currentTurnUsageBaseline = total ? { ...total } : null
+      this.currentTurnUsageBaselineKnown = true
+    })
+    p.on('token_usage', ({ totalUsage }: TokenUsageUpdated) => {
+      if (totalUsage) this.usageTotalsSeedUnknown = false
     })
     p.on('turn_plan_updated', (plan: TurnPlanUpdated) => {
       this.handleTurnPlanUpdated(plan)
@@ -1793,6 +1826,9 @@ export class Session {
       this.pendingHostAsks.clear()
       this.pendingPermissions.clear()
       this.userInterrupted = false
+      this.currentTurnUsageBaseline = null
+      this.currentTurnUsageBaselineKnown = false
+      this.usageTotalsSeedUnknown = false
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
       if (!expected && code !== 0 && signal !== 'SIGTERM') {
@@ -1803,23 +1839,30 @@ export class Session {
 
   /** Pull per-turn numbers off `proc.lastResult` (set by CodexProcess when
    * the `result` message landed) and roll them into cumStats + the
-   * "上一轮" delta. Called exactly once per result event, right before
-   * closeTurnCard. */
+   * "上一轮" delta. Turn usage uses absolute thread totals from
+   * `thread/tokenUsage/updated.total` minus the baseline captured at
+   * `turn_started`, so a multi-request turn is aggregated correctly
+   * instead of inheriting only the final request's `last` snapshot.
+   * Called exactly once per result event, right before closeTurnCard. */
   private accumulateResultStats(): void {
     const r = this.proc?.lastResult
     if (!r) return
-    const u = r.usage ?? {}
+    const u = this.currentTurnUsageBaselineKnown
+      ? diffUsageTotals(this.proc?.lastTotalUsage, this.currentTurnUsageBaseline)
+      : null
+    this.lastTurnUsage = u
+    this.currentTurnUsageBaseline = null
+    this.currentTurnUsageBaselineKnown = false
     // 有效 token = 真正喂进(input + 本轮新建缓存)+ 产出。故意不含
     // cache_read_input_tokens —— 那是把整段已缓存上下文又复读一遍的计费量,
-    // 每轮几乎等于全窗口,计进来会让累计虚高一个量级(33.87M 大头就是它),
-    // 反映不了对话真实规模。usage 本身是单轮值(实测跨轮独立、不累计),
-    // 所以逐轮相加即得总量。
-    const tokens = (u.input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.output_tokens ?? 0)
+    // 每轮几乎等于全窗口,计进来会让累计虚高一个量级。这里的 usage 是
+    // 整个 turn 的绝对总量差值,不是最后一次模型请求的快照。
+    const tokens = effectiveTurnTokens(u)
     // cost 取本进程算好的本轮增量,而非 total_cost_usd 累计值 —— 直接累加
     // Codex 当前没有逐 turn dollar cost,这里保持 0/null。
     const costUsd = r.cost_delta_usd ?? 0
     const durationMs = r.duration_ms ?? 0
-    this.cumStats.tokens += tokens
+    if (tokens != null) this.cumStats.tokens += tokens
     this.cumStats.costUsd += costUsd
     this.cumStats.turns += r.num_turns ?? 1
     this.lastTurnDelta = { tokens, costUsd, durationMs }
@@ -2533,7 +2576,7 @@ export class Session {
     if (modelLabel) line1Parts.push(modelLabel)
     const footerLine1 = line1Parts.join(' ｜ ')
     const footerLine2 = opts.hasFreshResult
-      ? cards.footerTokenDetailLine(this.proc?.lastUsage)
+      ? cards.footerTokenDetailLine(this.lastTurnUsage)
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
     await cardkit.streamText(cardId, cards.ELEMENTS.footer, footer)
@@ -2544,7 +2587,7 @@ export class Session {
     cardkit.cancelSummary(cardId)
     await cardkit.patchSettings(cardId, cards.streamingOffSettings({
       durationSec: elapsed,
-      tokens: opts.hasFreshResult ? this.lastTurnDelta?.tokens : undefined,
+      outputTokens: opts.hasFreshResult ? this.lastTurnUsage?.output_tokens : undefined,
       suffix,
     }))
     await cardkit.dispose(cardId)

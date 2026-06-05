@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleBodyElements, modelEffortCard, modelEffortPanelElement, modelResultCard, modelResultPanelElement, modelSelectionCard, statusCard } from './console'
+import { consoleBodyElements, modelEffortCard, modelEffortPanelElement, modelResultCard, modelResultPanelElement, modelSelectionCard, statusCard, streamingOffSettings } from './console'
 import {
   askUserQuestionElement,
   contextCompactionElement,
@@ -141,6 +141,15 @@ describe('main conversation card rendering', () => {
     expect(savedCard.header.template).toBe('green')
     expect(savedCard.body.elements[0].header.title.content).toBe('选择已保存')
   })
+
+  test('chat-list summary uses a symbol for turn output', () => {
+    const settings = streamingOffSettings({
+      durationSec: '12.4',
+      outputTokens: 420,
+    }) as any
+
+    expect(settings.config.summary.content).toBe('✅ · ⏱ 12.4s · 📶 420')
+  })
 })
 
 describe('plan and goal rendering', () => {
@@ -153,7 +162,7 @@ describe('plan and goal rendering', () => {
   test('formats compact footer token detail line', () => {
     expect(footerTokenDetailLine({
       input_tokens: 4_900,
-      cache_read_input_tokens: 4_400,
+        cache_read_input_tokens: 4_400,
       output_tokens: 420,
     })).toBe('└ 入 4.9k ｜ 缓 4.4k ｜ 出 420')
   })

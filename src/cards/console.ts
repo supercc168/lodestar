@@ -36,7 +36,7 @@ export interface ConsoleOpts {
    * undefined → unknown; renderer omits the suffix instead of fabricating a default. */
   contextLimit?: number | null
   cumStats?: { tokens: number; costUsd: number; turns: number }
-  lastTurn?: { tokens: number; costUsd: number; durationMs: number }
+  lastTurn?: { tokens: number | null; costUsd: number; durationMs: number }
   sessionId?: string | null
   /** Host snapshot: CPU 负载、内存、根/家目录磁盘、AI-managed systemd 服务。
    * undefined → 略过整个 host 段;数据自身字段缺失 (cpu/mem 为 null)
@@ -129,6 +129,10 @@ function fmtTokens(n: number): string {
   if (n < 1000) return String(n)
   if (n < 1_000_000) return (n / 1000).toFixed(n < 10_000 ? 1 : 0).replace(/\.0$/, '') + 'K'
   return (n / 1_000_000).toFixed(2).replace(/\.?0+$/, '') + 'M'
+}
+
+function fmtMaybeTokens(n: number | null | undefined): string {
+  return typeof n === 'number' && Number.isFinite(n) ? `+${fmtTokens(n)}` : 'MISS'
 }
 
 function fmtCost(c: number): string {
@@ -346,7 +350,7 @@ export function consoleMainContent(opts: ConsoleOpts): string {
     lines.push(`**💬 累计**　${fmtTokens(cumStats.tokens)} tokens · ${fmtCost(cumStats.costUsd)} · ${cumStats.turns} turn${cumStats.turns === 1 ? '' : 's'}`)
   }
   if (lastTurn) {
-    lines.push(`**🔄 上一轮**　+${fmtTokens(lastTurn.tokens)} · ${fmtCost(lastTurn.costUsd)} · ${fmtDurationMs(lastTurn.durationMs)}`)
+    lines.push(`**🔄 上一轮**　${fmtMaybeTokens(lastTurn.tokens)} · ${fmtCost(lastTurn.costUsd)} · ${fmtDurationMs(lastTurn.durationMs)}`)
   }
   if (sessionId) {
     lines.push(`**🆔 thread**　\`${sessionId.slice(0, 8)}…\``)
@@ -645,11 +649,11 @@ function inlineCode(s: string): string {
 }
 
 /** Settings patch applied when a turn finishes — flips streaming off
- * and updates the chat-list preview with `⏱ duration · NK tokens`
+ * and updates the chat-list preview with `⏱ duration · 📶 NK`
  * (or just the suffix if interrupted before a result event). */
 export function streamingOffSettings(opts: {
   durationSec?: string
-  tokens?: number
+  outputTokens?: number | null
   suffix?: string
 }): object {
   const parts: string[] = []
@@ -657,8 +661,8 @@ export function streamingOffSettings(opts: {
   // durationSec 缺省的场景:mid-turn rotate 收尾旧卡 (turn 还在跑,没
   // turn-final elapsed)。直接省掉 ⏱ 段,避免拼出 "⏱ undefineds"。
   if (opts.durationSec) parts.push(`⏱ ${opts.durationSec}s`)
-  if (opts.tokens != null && opts.tokens > 0) {
-    parts.push(`${fmtTokens(opts.tokens)} tokens`)
+  if (opts.outputTokens != null && opts.outputTokens > 0) {
+    parts.push(`📶 ${fmtTokens(opts.outputTokens)}`)
   }
   return {
     config: { streaming_mode: false, summary: { content: parts.join(' · ') } },

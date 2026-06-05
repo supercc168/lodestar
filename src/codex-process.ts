@@ -139,6 +139,14 @@ export interface CodexUsage {
   cache_read_input_tokens?: number
 }
 
+export interface TokenUsageUpdated {
+  usage: CodexUsage | null
+  totalUsage: CodexUsage | null
+  contextWindow: number | null
+  threadId?: string
+  turnId?: string
+}
+
 export interface CodexResultMeta {
   cost_usd: number | null
   cost_delta_usd: number | null
@@ -211,6 +219,7 @@ export class CodexProcess extends EventEmitter {
   lastModel: string | null = null
   lastEffort: CodexReasoningEffort | null = null
   lastUsage: CodexUsage | null = null
+  lastTotalUsage: CodexUsage | null = null
   lastResult: CodexResultMeta = {
     cost_usd: null, cost_delta_usd: null, duration_ms: null, num_turns: null,
     usage: null, subtype: null, is_error: false,
@@ -343,29 +352,23 @@ export class CodexProcess extends EventEmitter {
         // `last` is the latest model request and therefore the current
         // context-window footprint. `total` is cumulative across requests
         // in the thread and must not drive context-window percentages.
-        const last = params.tokenUsage?.last
+        const last = usageFromTokenUsagePayload(params.tokenUsage?.last)
         if (last) {
-          this.lastUsage = {
-            total_tokens: numberOrUndefined(last.totalTokens),
-            input_tokens: numberOrUndefined(last.inputTokens),
-            output_tokens: numberOrUndefined(last.outputTokens),
-            reasoning_output_tokens: numberOrUndefined(last.reasoningOutputTokens),
-            cache_read_input_tokens: numberOrUndefined(last.cachedInputTokens),
-          }
+          this.lastUsage = last
           this.lastResult.usage = this.lastUsage
         } else {
           log('codex-process: tokenUsage notification missing last breakdown')
         }
+        this.lastTotalUsage = usageFromTokenUsagePayload(params.tokenUsage?.total)
         const ctx = params.tokenUsage?.modelContextWindow
         if (typeof ctx === 'number' && ctx > 0) this.lastContextWindow = ctx
-        if (this.lastUsage) {
-          this.emit('token_usage', {
-            usage: this.lastUsage,
-            contextWindow: this.lastContextWindow,
-            threadId: params.threadId,
-            turnId: params.turnId,
-          })
-        }
+        this.emit('token_usage', {
+          usage: this.lastUsage,
+          totalUsage: this.lastTotalUsage,
+          contextWindow: this.lastContextWindow,
+          threadId: params.threadId,
+          turnId: params.turnId,
+        } as TokenUsageUpdated)
         return
       }
       case 'turn/started': {
@@ -869,6 +872,70 @@ export class CodexProcess extends EventEmitter {
 
 function numberOrUndefined(v: unknown): number | undefined {
   return typeof v === 'number' && Number.isFinite(v) ? v : undefined
+}
+
+function anyUsageValue(usage: CodexUsage): boolean {
+  return Object.values(usage).some(v => typeof v === 'number' && Number.isFinite(v))
+}
+
+function nestedNumber(obj: Record<string, unknown> | null, key: string): number | undefined {
+  return obj ? numberOrUndefined(obj[key]) : undefined
+}
+
+export function usageFromTokenUsagePayload(raw: unknown): CodexUsage | null {
+  const obj = objectOrNull(raw)
+  if (!obj) return null
+  const inputDetails = objectOrNull(obj.inputTokensDetails) ?? objectOrNull(obj.input_tokens_details)
+  const outputDetails = objectOrNull(obj.outputTokensDetails) ?? objectOrNull(obj.output_tokens_details)
+  const usage: CodexUsage = {
+    total_tokens: numberOrUndefined(obj.totalTokens ?? obj.total_tokens),
+    input_tokens: numberOrUndefined(obj.inputTokens ?? obj.input_tokens),
+    output_tokens: numberOrUndefined(obj.outputTokens ?? obj.output_tokens),
+    reasoning_output_tokens: numberOrUndefined(
+      obj.reasoningOutputTokens ??
+      obj.reasoning_output_tokens ??
+      nestedNumber(outputDetails, 'reasoningTokens') ??
+      nestedNumber(outputDetails, 'reasoning_tokens'),
+    ),
+    cache_creation_input_tokens: numberOrUndefined(
+      obj.cacheCreationInputTokens ?? obj.cache_creation_input_tokens,
+    ),
+    cache_read_input_tokens: numberOrUndefined(
+      obj.cachedInputTokens ??
+      obj.cached_input_tokens ??
+      obj.cacheReadInputTokens ??
+      obj.cache_read_input_tokens ??
+      nestedNumber(inputDetails, 'cachedTokens') ??
+      nestedNumber(inputDetails, 'cached_tokens'),
+    ),
+  }
+  return anyUsageValue(usage) ? usage : null
+}
+
+export function diffUsageTotals(
+  total: CodexUsage | null | undefined,
+  baseline: CodexUsage | null | undefined,
+): CodexUsage | null {
+  const deltaField = (key: keyof CodexUsage): number | undefined => {
+    const totalVal = numberOrUndefined(total?.[key])
+    const baselineVal = numberOrUndefined(baseline?.[key])
+    if (totalVal === undefined && baselineVal === undefined) return undefined
+    return Math.max(0, (totalVal ?? 0) - (baselineVal ?? 0))
+  }
+  const usage: CodexUsage = {
+    total_tokens: deltaField('total_tokens'),
+    input_tokens: deltaField('input_tokens'),
+    output_tokens: deltaField('output_tokens'),
+    reasoning_output_tokens: deltaField('reasoning_output_tokens'),
+    cache_creation_input_tokens: deltaField('cache_creation_input_tokens'),
+    cache_read_input_tokens: deltaField('cache_read_input_tokens'),
+  }
+  return anyUsageValue(usage) ? usage : null
+}
+
+export function effectiveTurnTokens(usage: CodexUsage | null | undefined): number | null {
+  if (!usage) return null
+  return (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.output_tokens ?? 0)
 }
 
 const COMPACTION_METHODS = new Set([

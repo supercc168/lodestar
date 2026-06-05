@@ -1,8 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  diffUsageTotals,
+  effectiveTurnTokens,
   contextCompactionNoticeFromMessage,
   contextCompactionNoticeFromNotification,
+  usageFromTokenUsagePayload,
 } from './codex-process'
 
 describe('codex process compaction notifications', () => {
@@ -95,5 +98,69 @@ describe('codex process compaction notifications', () => {
     expect(contextCompactionNoticeFromNotification('thread/settings/updated', {
       threadSettings: { model: 'gpt-5' },
     })).toBeNull()
+  })
+})
+
+describe('codex token usage helpers', () => {
+  test('parses app-server token usage payloads for last and total snapshots', () => {
+    expect(usageFromTokenUsagePayload({
+      totalTokens: 1200,
+      inputTokens: 900,
+      outputTokens: 300,
+      reasoningOutputTokens: 220,
+      cachedInputTokens: 400,
+    })).toEqual({
+      total_tokens: 1200,
+      input_tokens: 900,
+      output_tokens: 300,
+      reasoning_output_tokens: 220,
+      cache_creation_input_tokens: undefined,
+      cache_read_input_tokens: 400,
+    })
+  })
+
+  test('computes turn aggregate from absolute thread totals', () => {
+    const usage = diffUsageTotals(
+      {
+        total_tokens: 10_000,
+        input_tokens: 7_000,
+        output_tokens: 3_000,
+        reasoning_output_tokens: 1_200,
+        cache_read_input_tokens: 2_800,
+      },
+      {
+        total_tokens: 4_000,
+        input_tokens: 3_100,
+        output_tokens: 900,
+        reasoning_output_tokens: 500,
+        cache_read_input_tokens: 1_200,
+      },
+    )
+
+    expect(usage).toEqual({
+      total_tokens: 6000,
+      input_tokens: 3900,
+      output_tokens: 2100,
+      reasoning_output_tokens: 700,
+      cache_creation_input_tokens: undefined,
+      cache_read_input_tokens: 1600,
+    })
+    expect(effectiveTurnTokens(usage)).toBe(6000)
+    expect(effectiveTurnTokens(null)).toBeNull()
+  })
+
+  test('clamps negative deltas and treats missing totals as unknown', () => {
+    expect(diffUsageTotals(
+      { input_tokens: 100, output_tokens: 20 },
+      { input_tokens: 120, output_tokens: 10 },
+    )).toEqual({
+      total_tokens: undefined,
+      input_tokens: 0,
+      output_tokens: 10,
+      reasoning_output_tokens: undefined,
+      cache_creation_input_tokens: undefined,
+      cache_read_input_tokens: undefined,
+    })
+    expect(diffUsageTotals(null, null)).toBeNull()
   })
 })
