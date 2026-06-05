@@ -1300,31 +1300,14 @@ export class Session {
    * Passing `usage=undefined` paints the `_加载中…_` placeholder — the
    * caller is responsible for the async patch if the panel was sent. */
   async buildConsoleOpts(usage: UsageSnapshot | undefined): Promise<cards.ConsoleOpts> {
-    const uptimeMs = this.startedAt ? (Date.now() - this.startedAt) : undefined
-    const rawModel = this.currentModelLabel()
-    const model = rawModel ?? undefined
     const sysinfo = await readSysInfo()
     return {
       sessionName: this.sessionName,
       status: this.status,
-      model,
-      effort: this.currentEffortLabel(),
-      uptimeMs,
       peers: [...Session.all]
         .filter(s => s.isRunning())
         .map(s => ({ ...s.peerSnapshot(), isCurrent: s === this })),
       usage,
-      contextTokens: this.currentContextTokens(),
-      contextLimit: this.contextLimitForDisplay(),
-      cumStats: this.cumStats,
-      lastTurn: this.lastTurnDelta
-        ? {
-            tokens: this.lastTurnDelta.tokens,
-            costUsd: this.lastTurnDelta.costUsd,
-            durationMs: this.lastTurnDelta.durationMs,
-          }
-        : undefined,
-      sessionId: this.proc?.sessionId ?? this.lastSessionId,
       sysinfo,
     }
   }
@@ -1363,8 +1346,13 @@ export class Session {
     )
     await cardkit.addElement(
       handle.cardId,
-      cards.consoleUsageElement(undefined),
+      cards.consoleHostElement(consoleOpts.sysinfo),
       { type: 'insert_after', targetElementId: cards.ELEMENTS.footer },
+    )
+    await cardkit.addElement(
+      handle.cardId,
+      cards.consoleUsageElement(undefined),
+      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleHost },
     )
     cardkit.cancelSummary(handle.cardId)
     await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({

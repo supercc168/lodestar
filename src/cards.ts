@@ -39,6 +39,7 @@ export {
   consoleUsageContent,
   consoleUsageElement,
   consoleMainElement,
+  consoleHostElement,
   consoleBodyElements,
   consoleCard,
   modelEffortCard,

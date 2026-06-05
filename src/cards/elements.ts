@@ -30,6 +30,8 @@ export const ELEMENTS = {
    * own element so we can replace it after the initial card lands,
    * decoupling the slow Codex account fetch from the rest of the panel's
    * synchronous data. */
+  consoleProjects: 'console_projects',
+  consoleHost: 'console_host',
   consoleUsage: 'console_usage',
   /** Model command card — one replaceable panel for model → effort
    * multi-step selection inside a single card. */

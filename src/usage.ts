@@ -12,11 +12,9 @@ import { resolveCodexBin } from './codex-process'
 import { log } from './log'
 
 const API_TIMEOUT_MS = 10_000
-const CACHE_TTL_MS = 60_000
-const MAX_STALE_MS = 15 * 60 * 1000
 
 export interface UsageWindow {
-  percent: number
+  percent: number | null
   resetsAt: Date | null
   durationMins?: number | null
 }
@@ -32,13 +30,11 @@ export type UsageSnapshot =
       fiveHour: UsageWindow | null
       weekly: UsageWindow | null
       fetchedAt: number
-      stale?: boolean
     }
 
 type UsageSnapshotOk = Extract<UsageSnapshot, { state: 'ok' }>
 
-let cache: { data: UsageSnapshot; at: number } | null = null
-let lastOk: { snapshot: UsageSnapshotOk; at: number } | null = null
+let cache: UsageSnapshot | null = null
 let inFlight: Promise<UsageSnapshot> | null = null
 
 class AppServerOnce {
@@ -103,8 +99,8 @@ function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
   })
 }
 
-function clampPct(v: unknown): number {
-  return typeof v === 'number' && isFinite(v) ? Math.max(0, Math.min(100, v)) : 0
+function clampPct(v: unknown): number | null {
+  return typeof v === 'number' && isFinite(v) ? Math.max(0, Math.min(100, v)) : null
 }
 
 function windowFromRateLimit(w: any): UsageWindow | null {
@@ -117,7 +113,7 @@ function windowFromRateLimit(w: any): UsageWindow | null {
 }
 
 export function updateUsageFromRateLimits(rateLimits: any): UsageSnapshot {
-  if (!rateLimits) return { state: 'network', reason: 'empty rate limit update' }
+  if (!rateLimits) return cache ?? { state: 'network', reason: 'empty rate limit update' }
   const snapshot: UsageSnapshotOk = {
     state: 'ok',
     subscriptionType: rateLimits.planType,
@@ -125,8 +121,7 @@ export function updateUsageFromRateLimits(rateLimits: any): UsageSnapshot {
     weekly: windowFromRateLimit(rateLimits.secondary),
     fetchedAt: Date.now(),
   }
-  cache = { data: snapshot, at: Date.now() }
-  lastOk = { snapshot, at: Date.now() }
+  cache = snapshot
   return snapshot
 }
 
@@ -161,28 +156,19 @@ async function fetchUsage(): Promise<UsageSnapshot> {
   }
 }
 
-function withStaleFallback(snapshot: UsageSnapshot): UsageSnapshot {
-  if (snapshot.state === 'ok') return snapshot
-  if (lastOk && Date.now() - lastOk.at < MAX_STALE_MS) {
-    return { ...lastOk.snapshot, stale: true }
-  }
-  return snapshot
-}
-
 export async function readUsage(): Promise<UsageSnapshot> {
-  if (cache && Date.now() - cache.at < CACHE_TTL_MS) return withStaleFallback(cache.data)
   if (inFlight) return inFlight
   inFlight = fetchUsage()
     .then(d => {
-      cache = { data: d, at: Date.now() }
-      if (d.state === 'ok') lastOk = { snapshot: d, at: Date.now() }
       inFlight = null
-      return withStaleFallback(d)
+      if (d.state === 'network') return cache ?? d
+      cache = d
+      return d
     })
     .catch(e => {
       log(`usage: fetchUsage threw: ${e}`)
       inFlight = null
-      return withStaleFallback({ state: 'network', reason: String(e) })
+      return cache ?? { state: 'network', reason: String(e) }
     })
   return inFlight
 }
