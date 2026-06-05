@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleBodyElements, modelEffortCard, modelEffortPanelElement, modelResultCard, modelResultPanelElement, modelSelectionCard, statusCard, streamingOffSettings } from './console'
+import { consoleBodyElements, consoleUsageContent, modelEffortCard, modelEffortPanelElement, modelResultCard, modelResultPanelElement, modelSelectionCard, statusCard, streamingOffSettings } from './console'
 import {
   askUserQuestionElement,
   contextCompactionElement,
@@ -49,14 +49,57 @@ describe('main conversation card rendering', () => {
     const elements = consoleBodyElements({
       sessionName: 'probe',
       status: 'idle',
+      peers: [{
+        name: 'probe',
+        isCurrent: true,
+        status: 'working',
+        uptimeMs: 65_000,
+      }],
+      sysinfo: {
+        cpu: { cores: 8, load1: 0.42, load5: 0.37, load15: 0.29 },
+        mem: {
+          totalBytes: 16 * 1024 * 1024 * 1024,
+          availBytes: 6 * 1024 * 1024 * 1024,
+          usedBytes: 10 * 1024 * 1024 * 1024,
+          percent: 63,
+        },
+        disks: [],
+        services: [{
+          name: 'codex-probe-runner',
+          active: 'active',
+          sub: 'running',
+          lastActiveAgoSec: 120,
+          stateAgoSec: 120,
+        }],
+        servicesError: null,
+      },
       usage: undefined,
     }, 'footer') as any[]
 
-    expect(elements).toHaveLength(2)
+    expect(elements).toHaveLength(3)
     expect(elements[0].element_id).toBe('footer')
-    expect(elements[0].content).toContain('🟢 闲')
-    expect(elements[1].element_id).toBe('console_usage')
-    expect(elements[1].content).toContain('加载中')
+    expect(elements[0].tag).toBe('collapsible_panel')
+    expect(elements[0].expanded).toBe(false)
+    expect(elements[0].header.title.content).toBe('🗂 活跃项目 (1)')
+    expect(elements[0].elements[0].content).toContain('`probe` · 工作中 · 1m · 当前')
+
+    expect(elements[1].element_id).toBe('console_host')
+    expect(elements[1].tag).toBe('collapsible_panel')
+    expect(elements[1].expanded).toBe(false)
+    expect(elements[1].header.title.content).toContain('🖥 主机状态')
+    expect(elements[1].elements[0].content).toContain('**负载**')
+    expect(elements[1].elements[0].content).toContain('**内存**')
+    expect(elements[1].elements[0].content).toContain('**服务**')
+    expect(elements[1].elements[0].content).not.toContain('**💽 磁盘**')
+
+    expect(elements[2].element_id).toBe('console_usage')
+    expect(elements[2].content).toContain('加载中')
+
+    const body = JSON.stringify(elements)
+    expect(body).not.toContain('活跃上下文')
+    expect(body).not.toContain('上一轮')
+    expect(body).not.toContain('累计')
+    expect(body).not.toContain('thread')
   })
 
   test('model command card keeps model and effort selection in one replaceable panel', () => {
@@ -149,6 +192,30 @@ describe('main conversation card rendering', () => {
     }) as any
 
     expect(settings.config.summary.content).toBe('✅ · ⏱ 12.4s · 📶 420')
+  })
+
+  test('usage panel shows MISS for missing percentages and no stale badge', () => {
+    const content = consoleUsageContent({
+      state: 'ok',
+      subscriptionType: 'Pro',
+      fiveHour: {
+        percent: null,
+        resetsAt: new Date(Date.now() + 60 * 60 * 1000),
+        durationMins: 300,
+      },
+      weekly: {
+        percent: 0,
+        resetsAt: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+        durationMins: 7 * 24 * 60,
+      },
+      fetchedAt: Date.now() - 10 * 60 * 1000,
+    })
+
+    expect(content).toContain('ChatGPT Pro')
+    expect(content).toContain('5h　MISS')
+    expect(content).toContain('7d　0%')
+    expect(content).not.toContain('缓存')
+    expect(content).not.toContain('~')
   })
 })
 

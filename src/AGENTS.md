@@ -30,7 +30,7 @@
 | `stop-cli.ts` | `lodestar-stop` 入口，通过 PID 文件确认并停止 daemon。 |
 | `update-cli.ts` | `lodestar-update` 入口，封装 npm 更新逻辑并检查 daemon 状态。 |
 | `version-cli.ts` | `lodestar-version` 入口，输出 Lodestar 和 Codex CLI 版本。 |
-| `usage.ts` | 临时 app-server 请求 Codex/ChatGPT 使用额度，并提供 stale fallback。 |
+| `usage.ts` | 临时 app-server 请求 Codex/ChatGPT 使用额度；保留最新快照，只在收到新值时覆盖。 |
 | `sysinfo.ts` | 读取主机 CPU、内存、磁盘和 AI 相关 systemd service 状态，供控制台卡片展示。 |
 | `pid-guard.ts` | PID 文件和进程 cmdline marker 校验，防止误认复用 PID。 |
 | `context-window.ts` | 根据模型和 token usage 估算 context window 占用。 |

@@ -1,6 +1,5 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleCard } from './cards/console'
 import {
   contextLimitFromAppServer,
   contextPercentSummary,
@@ -42,18 +41,5 @@ describe('context window display', () => {
       input_tokens: 35_190,
       output_tokens: 21,
     })).toBeNull()
-  })
-
-  test('renders effective window percentage in console cards', () => {
-    const card = consoleCard({
-      sessionName: 'probe',
-      status: 'idle',
-      contextTokens: 35_211,
-      contextLimit: contextLimitFromAppServer(258_400),
-    })
-
-    expect(JSON.stringify(card)).toContain('35K / 258K')
-    expect(JSON.stringify(card)).toContain('9% 占用 · 91% 剩余')
-    expect(JSON.stringify(card)).toContain('非累计, compact 后可下降')
   })
 })
