@@ -75,6 +75,7 @@ const FOOTER_THINKING_PREFIX = 'Thinking...'
 const FOOTER_WORKING = 'Working...'
 const RESUME_INIT_NOTICE_MS = 10_000
 const RESUME_INIT_TIMEOUT_MS = 120_000
+const CONTEXT_COMPACT_TIMEOUT_MS = 120_000
 
 interface ModelPanelState {
   models: cards.ModelChoice[]
@@ -100,6 +101,21 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
 
 type WorktreeActionResult = { ok: boolean; message: string; card: object }
 type ModelActionResult = { ok: boolean; message: string; card?: object }
+type ManualCompactionWatch = {
+  promise: Promise<ContextCompactedNotification>
+  cancel(): void
+}
+type ControlCommand = 'hi' | 'stop' | 'kill' | 'restart' | 'clear' | 'compact' | 'model'
+
+const CONTROL_COMMAND_ALIASES = new Map<string, ControlCommand>([
+  ['hi', 'hi'],
+  ['stop', 'stop'], ['st', 'stop'],
+  ['kill', 'kill'], ['kl', 'kill'],
+  ['restart', 'restart'], ['rs', 'restart'],
+  ['clear', 'clear'], ['cl', 'clear'],
+  ['compact', 'compact'], ['cm', 'compact'],
+  ['model', 'model'], ['md', 'model'],
+])
 
 /** Soft cap on element count per Feishu card before we proactively
  * rotate to a fresh one. The hard ceiling is NOT ~100 as once assumed:
@@ -309,6 +325,10 @@ export class Session {
    * fresh absolute total snapshot, the next turn's baseline is unknown
    * and must not be guessed as zero. */
   private usageTotalsSeedUnknown = false
+  /** Set while the `compact` command owns a status card for a standalone
+   * compaction. Suppresses the generic no-turn compaction text alert;
+   * command feedback is rendered on that status card instead. */
+  private manualContextCompactionPending = false
 
   constructor(
     public readonly sessionName: string,
@@ -897,6 +917,114 @@ export class Session {
     }
   }
 
+  private watchManualCompaction(proc: CodexProcess, timeoutMs: number): ManualCompactionWatch {
+    let settled = false
+    let timer: ReturnType<typeof setTimeout> | null = null
+    let resolvePromise: (notice: ContextCompactedNotification) => void = () => {}
+    let rejectPromise: (e: Error) => void = () => {}
+    const threadId = proc.sessionId
+    const cleanup = () => {
+      if (timer) {
+        clearTimeout(timer)
+        timer = null
+      }
+      proc.off('context_compacted', onCompacted)
+      proc.off('exit', onExit)
+      proc.off('error', onError)
+    }
+    const finish = (notice: ContextCompactedNotification) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      resolvePromise(notice)
+    }
+    const fail = (e: Error) => {
+      if (settled) return
+      settled = true
+      cleanup()
+      rejectPromise(e)
+    }
+    const onCompacted = (notice: ContextCompactedNotification) => {
+      if (notice.phase === 'start') return
+      if (notice.threadId && threadId && notice.threadId !== threadId) return
+      finish(notice)
+    }
+    const onExit = () => fail(new Error('codex app-server exited before context compaction completed'))
+    const onError = (e: unknown) => fail(e instanceof Error ? e : new Error(String(e)))
+    const promise = new Promise<ContextCompactedNotification>((resolve, reject) => {
+      resolvePromise = resolve
+      rejectPromise = reject
+      timer = setTimeout(() => {
+        fail(new Error(`context compaction completion timed out after ${timeoutMs / 1000}s`))
+      }, timeoutMs)
+    })
+    proc.on('context_compacted', onCompacted)
+    proc.once('exit', onExit)
+    proc.once('error', onError)
+    return {
+      promise,
+      cancel() {
+        if (settled) return
+        settled = true
+        cleanup()
+      },
+    }
+  }
+
+  private async runCompactCommand(): Promise<void> {
+    const noActiveTurn = !this.currentTurn && this.pendingUserMessageCount === 0 && this.pendingMidTurnMsgs.length === 0 && !this.openingTurn
+    if (!this.isRunning() || !this.proc) {
+      this.status = 'stopped'
+      this.opts.onLifecycleChange?.()
+      const statusCard = await this.openStatusCard('compact', '⚪ session 当前未运行', 'grey')
+      if (statusCard) {
+        await this.closeStatusCard(statusCard, '⚪ Codex 未运行，compact 无效')
+      } else {
+        await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行,compact 无效;用 \`hi\` 启动或 \`restart\` 恢复上一会话`)
+      }
+      return
+    }
+    if (!noActiveTurn) {
+      const statusCard = await this.openStatusCard('compact', '⚠️ 当前 turn 正在执行', 'grey')
+      if (statusCard) {
+        await this.closeStatusCard(statusCard, '⚠️ 先 stop 当前 turn，再 compact')
+      } else {
+        await feishu.sendText(this.chatId, '⚠️ 当前 turn 正在执行,先 `stop` 后再 `compact`。')
+      }
+      return
+    }
+    if (this.manualContextCompactionPending) {
+      const statusCard = await this.openStatusCard('compact', '⏳ 上下文压缩已在进行中', 'grey')
+      if (statusCard) await this.closeStatusCard(statusCard, '⏳ 上下文压缩已在进行中')
+      else await feishu.sendText(this.chatId, '⏳ 上下文压缩已在进行中。')
+      return
+    }
+
+    const proc = this.proc
+    const threadLabel = proc.sessionId ? proc.sessionId.slice(0, 8) : ''
+    const initialStatus = this.withModel(threadLabel ? `🧠 压缩上下文 thread=${threadLabel}…` : '🧠 压缩上下文…')
+    const statusCard = await this.openStatusCard('compact', initialStatus, 'orange')
+    const finishStatus = async (status: string) => {
+      if (statusCard) await this.closeStatusCard(statusCard, status)
+      else await feishu.sendText(this.chatId, status)
+    }
+    const watch = this.watchManualCompaction(proc, CONTEXT_COMPACT_TIMEOUT_MS)
+    this.manualContextCompactionPending = true
+    try {
+      this.setStatusCard(statusCard, this.withModel('🧠 发起上下文压缩'))
+      await proc.compactThread()
+      this.setStatusCard(statusCard, this.withModel('⏳ 等待压缩完成事件'))
+      const notice = await watch.promise
+      const doneThread = notice.threadId ? ` thread=${notice.threadId.slice(0, 8)}…` : ''
+      await finishStatus(this.withModel(`✅ 上下文已压缩${doneThread}`))
+    } catch (e) {
+      watch.cancel()
+      await finishStatus(`❌ 上下文压缩失败: ${messageOf(e)}`)
+    } finally {
+      this.manualContextCompactionPending = false
+    }
+  }
+
   private modelListCwd(): string {
     if (existsSync(this.workDir)) return this.workDir
     if (existsSync(feishu.PROJECTS_ROOT)) return feishu.PROJECTS_ROOT
@@ -1130,7 +1258,8 @@ export class Session {
     }
   }
 
-  /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `model`).
+  /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`)
+   * plus their two-letter aliases where applicable.
    * Returns true if the command was consumed (don't forward to Codex).
    * Exact match, case-insensitive, ignores trailing whitespace.
    *
@@ -1143,14 +1272,19 @@ export class Session {
    * Codex's native type-ahead behavior) — explicit barge-out
    * needed a knob and `kill` (full subprocess teardown) is too heavy. */
   async runCommand(raw: string, userOpenId = ''): Promise<boolean> {
-    const wt = raw.trim().match(/^wt(?:\s+(.+))?$/i)
+    const wt = raw.trim().match(/^(?:wt|worktree)(?:\s+(.+))?$/i)
     if (wt) {
       await this.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId)
       return true
     }
-    switch (raw.trim().toLowerCase()) {
+    const command = CONTROL_COMMAND_ALIASES.get(raw.trim().toLowerCase())
+    if (!command) return false
+    switch (command) {
       case 'model':
         await this.showModelPanel()
+        return true
+      case 'compact':
+        await this.runCompactCommand()
         return true
       case 'hi':
         {
@@ -1326,7 +1460,6 @@ export class Session {
         }
         return true
     }
-    return false
   }
 
   /** Build the hi-panel data snapshot for this session.
@@ -2287,6 +2420,10 @@ export class Session {
   private handleContextCompacted(notice: ContextCompactedNotification): void {
     const turn = this.currentTurn
     if (!turn) {
+      if (this.manualContextCompactionPending) {
+        log(`session "${this.sessionName}": manual context compaction ${notice.phase ?? 'event'} with no current turn`)
+        return
+      }
       if (notice.phase === 'start') {
         log(`session "${this.sessionName}": context compaction start with no current turn`)
         return

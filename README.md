@@ -47,11 +47,12 @@ lodestar-setup
 | 指令 | 行为 |
 | --- | --- |
 | `hi` | 未运行时同一张卡动态启动并收束为控制台;运行中弹控制台 |
-| `stop` | 软打断当前 turn,子进程保活,排队消息打 ❌ |
-| `kill` | 用状态卡展示关闭 Codex 进程,`threadId` 落盘 |
-| `restart` | 用状态卡展示按上次 `threadId` 重启(保留上下文)|
-| `clear` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
-| `model` | 展示可用 Codex 模型面板,先选模型再选 reasoning effort,并按群持久化 |
+| `stop` / `st` | 软打断当前 turn,子进程保活,排队消息打 ❌ |
+| `kill` / `kl` | 用状态卡展示关闭 Codex 进程,`threadId` 落盘 |
+| `restart` / `rs` | 用状态卡展示按上次 `threadId` 重启(保留上下文)|
+| `clear` / `cl` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
+| `compact` / `cm` | 主动触发当前 thread 的上下文压缩,完成后状态卡收束 |
+| `model` / `md` | 展示可用 Codex 模型面板,先选模型再选 reasoning effort,并按群持久化 |
 
 **并发 worktree 群**
 
@@ -59,8 +60,8 @@ lodestar-setup
 
 | 指令 | 行为 |
 | --- | --- |
-| `wt` | 列出本项目 `work/*` 分支状态(clean/dirty/merged/stale),已合并且未挂载的归档分支会折叠隐藏,卡片上可点 `删`。 |
-| `wt feature-x` | 创建或加入同级目录/群 `<project>[feature-x]`,分支为 `work/feature-x`;重新激活已合并归档分支时会先更新到主线。 |
+| `wt` / `worktree` | 列出本项目 `work/*` 分支状态(clean/dirty/merged/stale),已合并且未挂载的归档分支会折叠隐藏,卡片上可点 `删`。 |
+| `wt feature-x` / `worktree feature-x` | 创建或加入同级目录/群 `<project>[feature-x]`,分支为 `work/feature-x`;重新激活已合并归档分支时会先更新到主线。 |
 
 `删` 会先确认对应 worktree 群没有正在运行的 Codex session,再检查 worktree 没有未提交变更,然后解散群并删除 worktree 目录;分支保留,合并和分支清理由 agent 处理。
 

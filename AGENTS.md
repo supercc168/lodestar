@@ -32,7 +32,7 @@
 - API 失败要记录并向用户暴露；不要静默切换传输、卡片或消息通道作为“兜底”。
 - 不要主动重启正在运行的 daemon，除非用户在当前回合明确要求 `restart` / `重启` / reload。代码变更后只报告需要重启。
 - **禁止**为了“测试”“预览”“发一张看看”“先验证一下”这类目的而停止、重启、替换、shadow、切换或并行接管正在运行的 daemon / user service。只有用户**明确点名**要执行对应操作（例如 `systemctl --user restart feishu-daemon.service`、停止当前 daemon、切换到某个 worktree daemon）时才可动手；任何泛化的“测一下”“发测试卡”都**不构成授权**。
-- 群内裸词控制是 `hi`、`stop`、`kill`、`restart`、`clear`、`model`、`wt` 和 `wt <name>`；这些词在 `Session.runCommand` 中作为保留字处理。
+- 群内裸词控制是 `hi`、`stop`/`st`、`kill`/`kl`、`restart`/`rs`、`clear`/`cl`、`compact`/`cm`、`model`/`md`、`wt`/`worktree` 和 `wt <name>`/`worktree <name>`；这些词在 `Session.runCommand` 中作为保留字处理。
 - `model` 通过 Card Kit 按钮先选 Codex 模型、再选 reasoning effort，并把选择按 session 持久化到 XDG data。
 - `wt <name>` 约定创建同级目录 `<project>[<name>]` 和本地分支 `work/<name>`，并自动创建/加入同名飞书群；解散按钮会先拒绝仍在运行的对应 session，只在 worktree 干净时删除目录和解散群，保留分支；重新激活已合并归档分支时会更新到主线。
 - 本地脚本可通过 `POST http://127.0.0.1:9876/notify` 发送 `{project, text, level}` 到绑定群。

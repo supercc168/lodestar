@@ -747,6 +747,15 @@ export class CodexProcess extends EventEmitter {
     await this.setModelSettings(model, this.opts.effort)
   }
 
+  async compactThread(): Promise<void> {
+    if (!this.readyPromise) throw new Error('codex thread not initialized')
+    await this.readyPromise
+    if (!this.sessionId) throw new Error('codex thread not initialized')
+    await this.request('thread/compact/start', {
+      threadId: this.sessionId,
+    })
+  }
+
   private failTurnStart(e: unknown): void {
     const message = e instanceof Error ? e.message : String(e)
     log(`codex-process: turn/start failed: ${message}`)
