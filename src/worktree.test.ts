@@ -58,6 +58,7 @@ describe('project worktrees', () => {
     const entries = listProjectWorktrees(repo, 'feishu')
     expect(entries).toHaveLength(1)
     expect(entries[0]?.slug).toBe('clean-work')
+    expect(entries[0]?.state).toBe('merged')
     expect(entries[0]?.mounted).toBe(false)
     expect(entries[0]?.worktreePath).toBeNull()
     expect(entries[0]?.expectedPath).toBe(result.worktreePath)

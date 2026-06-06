@@ -2,6 +2,14 @@
 
 面向使用者的简版更新记录。这里只保留你能直接感受到的变化，以及必要的兼容提示；实现细节请看每个版本末尾的 compare 链接。
 
+## v0.8.1 · 2026-06-06
+
+- `hi` 面板里的 worktree 群提示更直接，会显示当前工作群的指令加载状态。
+- 进入 `wt <name>` 工作群后，会更可靠地加载对应 slug 的本地 `AGENTS` 指令。
+- 已合并但未挂载的 worktree 分支状态显示更准确，避免在主群列表里误判为 active。
+
+**Full Changelog**: https://github.com/leviyuan/lodestar/compare/v0.8.0...v0.8.1
+
 ## v0.8.0 · 2026-06-05
 
 - 群里可以直接用 `model` 选择 Codex 模型和 reasoning effort，且会记住当前 session 的选择。
