@@ -2,6 +2,14 @@
 
 面向使用者的简版更新记录。这里只保留你能直接感受到的变化，以及必要的兼容提示；实现细节请看每个版本末尾的 compare 链接。
 
+## v0.8.2 · 2026-06-06
+
+- 群控裸词现在支持更短的别名：`st`、`kl`、`rs`、`cl`、`md`，`wt` 也可写成 `worktree`。
+- 新增 `compact` / `cm`，可在当前 session 空闲时主动触发上下文压缩，并用状态卡展示进度和结果。
+- README 和 agent 指令里的群控命令说明已同步更新。
+
+**Full Changelog**: https://github.com/leviyuan/lodestar/compare/v0.8.1...v0.8.2
+
 ## v0.8.1 · 2026-06-06
 
 - `hi` 面板里的 worktree 群提示更直接，会显示当前工作群的指令加载状态。
