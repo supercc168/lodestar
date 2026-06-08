@@ -802,6 +802,8 @@ interface MainCardOpts {
    * after it has converted message_id → card_id, but this value is what
    * the user sees immediately when Feishu creates the card. */
   initialFooter?: string
+  /** True when a bare user prompt cold-started Codex. */
+  directStart?: boolean
 }
 
 /** Initial card sent at the start of each turn. Streaming on. */
@@ -810,11 +812,12 @@ export function mainConversationCard(opts: MainCardOpts): object {
     ? [{ tag: 'markdown', content: '📨 接续上一张(同一轮 Codex turn,前一张卡写满或写入受限)' }]
     : []
   const inputs = opts.userInputs ?? []
+  const userInputHeader = `📥 收到 (${inputs.length}) ${opts.directStart ? '🚀' : `#${opts.turn}`}`
   const userInputPanel = inputs.length > 0
     ? [{
         tag: 'collapsible_panel',
         element_id: ELEMENTS.userInput,
-        header: { title: { tag: 'plain_text', content: `📥 收到 (${inputs.length})` } },
+        header: { title: { tag: 'plain_text', content: userInputHeader } },
         expanded: false,
         elements: inputs.map(text => ({
           tag: 'markdown',

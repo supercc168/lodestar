@@ -29,7 +29,33 @@ describe('main conversation card rendering', () => {
     const ids = card.body.elements.map((el: any) => el.element_id).filter(Boolean)
     expect(ids).toEqual(['footer'])
     expect(card.body.elements[0].content).toBe('Waiting...(0s)')
+    expect(card.header).toBeUndefined()
     expect(JSON.stringify(card)).not.toContain('ticker')
+  })
+
+  test('marks bare prompt cold starts in the user input panel header', () => {
+    const card = mainConversationCard({
+      sessionName: 'probe',
+      turn: 1,
+      kind: 'user_message',
+      userInputs: ['直接做一下'],
+      directStart: true,
+    }) as any
+
+    expect(card.header).toBeUndefined()
+    expect(card.body.elements[0].header.title.content).toBe('📥 收到 (1) 🚀')
+  })
+
+  test('shows the turn number for non-cold-start user turns', () => {
+    const card = mainConversationCard({
+      sessionName: 'probe',
+      turn: 2,
+      kind: 'user_message',
+      userInputs: ['继续做一下'],
+    }) as any
+
+    expect(card.header).toBeUndefined()
+    expect(card.body.elements[0].header.title.content).toBe('📥 收到 (1) #2')
   })
 
   test('status cards render one visible status line without a header', () => {

@@ -1607,6 +1607,7 @@ export class Session {
       await this.openTurnCard(userOpenId, 'user_message', {
         initialFooter: 'Waiting...(0s)',
         startThinking: false,
+        directStart: true,
       })
       const turn = this.currentTurn
       if (!turn) return
@@ -2146,7 +2147,7 @@ export class Session {
   private async openTurnCard(
     userOpenId: string,
     trigger: 'user_message',
-    opts: { initialFooter?: string; startThinking?: boolean } = {},
+    opts: { initialFooter?: string; startThinking?: boolean; directStart?: boolean } = {},
   ): Promise<void> {
     const turn = ++this.turnCounter
     // Snapshot+clear pendingTurnInputs synchronously here so concurrent
@@ -2164,6 +2165,7 @@ export class Session {
       kind: trigger,
       userInputs,
       initialFooter,
+      directStart: opts.directStart,
     })
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) {
