@@ -103,25 +103,33 @@ describe('project worktrees', () => {
     expect(updated.find(e => e.slug === 'stale-work')?.state).toBe('stale')
   })
 
-  test('finds slug-specific AGENTS file for managed worktree branches', () => {
+  test('finds first-segment agents file for managed worktree branches', () => {
     const { repo } = initRepo()
-    const result = ensureProjectWorktree(repo, 'feishu', 'prompt-work')
-    writeFileSync(join(result.worktreePath, 'AGENTS.prompt-work.md'), '# extra rules\n')
+    const result = ensureProjectWorktree(repo, 'feishu', 'avatar-art')
+    writeFileSync(join(result.worktreePath, 'agents.avatar.md'), '# extra rules\n')
 
     expect(
       worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu'),
-    ).toBe(join(result.worktreePath, 'AGENTS.prompt-work.md'))
+    ).toBe(join(result.worktreePath, 'agents.avatar.md'))
+  })
+
+  test('skips full dashed slug agents files for managed worktree branches', () => {
+    const { repo } = initRepo()
+    const result = ensureProjectWorktree(repo, 'feishu', 'avatar-art')
+    writeFileSync(join(result.worktreePath, 'agents.avatar-art.md'), '# extra rules\n')
+
+    expect(worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu')).toBeNull()
   })
 
   test('reads slug-specific AGENTS content for managed worktree branches', () => {
     const { repo } = initRepo()
     const result = ensureProjectWorktree(repo, 'feishu', 'prompt-work')
-    writeFileSync(join(result.worktreePath, 'AGENTS.prompt-work.md'), '# extra rules\n- be loud\n')
+    writeFileSync(join(result.worktreePath, 'agents.prompt.md'), '# extra rules\n- be loud\n')
 
     expect(
       readWorktreeInstructionsForManagedBranch(result.worktreePath, repo, 'feishu'),
     ).toEqual({
-      path: join(result.worktreePath, 'AGENTS.prompt-work.md'),
+      path: join(result.worktreePath, 'agents.prompt.md'),
       content: '# extra rules\n- be loud',
       slug: 'prompt-work',
     })
@@ -130,14 +138,14 @@ describe('project worktrees', () => {
   test('skips mismatched slug-specific AGENTS files', () => {
     const { repo } = initRepo()
     const result = ensureProjectWorktree(repo, 'feishu', 'prompt-work')
-    writeFileSync(join(result.worktreePath, 'AGENTS.other-work.md'), '# extra rules\n')
+    writeFileSync(join(result.worktreePath, 'agents.other.md'), '# extra rules\n')
 
     expect(worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu')).toBeNull()
   })
 
   test('skips slug-specific AGENTS files outside managed worktree branches', () => {
     const { repo } = initRepo()
-    writeFileSync(join(repo, 'AGENTS.main.md'), '# extra rules\n')
+    writeFileSync(join(repo, 'agents.main.md'), '# extra rules\n')
 
     expect(worktreeInstructionsPathForManagedBranch(repo, repo, 'feishu')).toBeNull()
   })
@@ -147,7 +155,7 @@ describe('project worktrees', () => {
     roots.push(root)
     const projectDir = join(root, 'test1')
     mkdirSync(projectDir)
-    writeFileSync(join(projectDir, 'AGENTS.prompt-work.md'), '# extra rules\n')
+    writeFileSync(join(projectDir, 'agents.prompt.md'), '# extra rules\n')
 
     expect(worktreeInstructionsPathForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
     expect(readWorktreeInstructionsForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
@@ -159,7 +167,7 @@ describe('project worktrees', () => {
     const projectDir = join(root, 'test1')
     mkdirSync(projectDir)
     git(projectDir, ['init'])
-    writeFileSync(join(projectDir, 'AGENTS.prompt-work.md'), '# extra rules\n')
+    writeFileSync(join(projectDir, 'agents.prompt.md'), '# extra rules\n')
 
     expect(worktreeInstructionsPathForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
     expect(readWorktreeInstructionsForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()

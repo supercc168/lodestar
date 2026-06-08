@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 
 export interface WorktreeEntry {
@@ -228,8 +228,8 @@ function managedWorktreeInstructionContext(
   }
   const expectedPath = expectedWorktreePath(projectDir, projectName, slug)
   if (resolve(workDir) !== resolve(expectedPath)) return null
-  const instructionsPath = join(workDir, `AGENTS.${slug}.md`)
-  return existsSync(instructionsPath) ? { path: instructionsPath, slug } : null
+  const instructionsPath = worktreeInstructionsPath(workDir, worktreeInstructionSlugKey(slug))
+  return instructionsPath ? { path: instructionsPath, slug } : null
 }
 
 function currentGitBranchForOptionalInstructions(workDir: string): string | null {
@@ -240,6 +240,21 @@ function currentGitBranchForOptionalInstructions(workDir: string): string | null
     if (isNotGitRepositoryError(e)) return null
     throw e
   }
+}
+
+function worktreeInstructionSlugKey(slug: string): string {
+  return slug.split('-', 1)[0] ?? slug
+}
+
+function worktreeInstructionsPath(workDir: string, slugKey: string): string | null {
+  const expectedName = `agents.${slugKey}.md`
+  const matches = readdirSync(workDir)
+    .filter(name => name.toLowerCase() === expectedName)
+    .sort()
+  if (matches.length > 1) {
+    throw new Error(`multiple worktree instruction files match ${expectedName}: ${matches.join(', ')}`)
+  }
+  return matches[0] ? join(workDir, matches[0]) : null
 }
 
 function hasBranch(projectDir: string, branch: string): boolean {
