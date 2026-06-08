@@ -522,12 +522,25 @@ export class Session {
     this.currentTurnUsageBaselineKnown = false
     this.usageTotalsSeedUnknown = false
     report?.(this.withModel('🚀 启动 Codex'))
-    this.proc = new CodexProcess({
-      workDir: this.workDir,
-      model: this.modelForSpawn(),
-      effort: this.effortForSpawn(),
-      appendSystemPrompt: this.spawnDeveloperInstructions(),
-    })
+    let proc: CodexProcess
+    try {
+      proc = new CodexProcess({
+        workDir: this.workDir,
+        model: this.modelForSpawn(),
+        effort: this.effortForSpawn(),
+        appendSystemPrompt: this.spawnDeveloperInstructions(),
+      })
+    } catch (e) {
+      const message = `Codex 启动失败: ${messageOf(e)}`
+      log(`session "${this.sessionName}": ${message}`)
+      report?.(`❌ ${message}`)
+      if (announce) await feishu.sendText(this.chatId, `❌ ${message}`)
+      this.proc = null
+      this.status = 'stopped'
+      this.opts.onLifecycleChange?.()
+      return false
+    }
+    this.proc = proc
     this.wireProc(this.proc)
     this.proc.sendInitialize()
     report?.('⏳ 等待 Codex init')
@@ -728,13 +741,27 @@ export class Session {
       this.status = 'starting'
       this.usageTotalsSeedUnknown = true
       report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}…`))
-      this.proc = new CodexProcess({
-        workDir: this.workDir,
-        model: this.modelForSpawn(),
-        effort: this.effortForSpawn(),
-        resumeSessionId: prevSessionId,
-        appendSystemPrompt: this.spawnDeveloperInstructions(),
-      })
+      let proc: CodexProcess
+      try {
+        proc = new CodexProcess({
+          workDir: this.workDir,
+          model: this.modelForSpawn(),
+          effort: this.effortForSpawn(),
+          resumeSessionId: prevSessionId,
+          appendSystemPrompt: this.spawnDeveloperInstructions(),
+        })
+      } catch (e) {
+        const finalStatus = `❌ Codex 恢复失败: ${messageOf(e)}`
+        log(`session "${this.sessionName}": codex resume failed before spawn: ${messageOf(e)}`)
+        report?.(finalStatus)
+        if (announceText) await feishu.sendText(this.chatId, finalStatus)
+        this.proc = null
+        this.status = 'stopped'
+        this.opts.onLifecycleChange?.()
+        await closeInternalStatusCard(finalStatus)
+        return false
+      }
+      this.proc = proc
       this.wireProc(this.proc)
       this.proc.sendInitialize()
       report?.('⏳ 等待 Codex init 确认')

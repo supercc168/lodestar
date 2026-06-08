@@ -69,16 +69,7 @@ export function worktreeInstructionsPathForManagedBranch(
   projectDir: string,
   projectName: string,
 ): string | null {
-  const branch = git(workDir, ['rev-parse', '--abbrev-ref', 'HEAD']).trim()
-  if (!branch.startsWith(WORK_BRANCH_PREFIX)) return null
-  const slug = branch.slice(WORK_BRANCH_PREFIX.length)
-  if (!normalizeWorktreeSlug(slug)) {
-    throw new Error(`invalid worktree branch "${branch}"`)
-  }
-  const expectedPath = expectedWorktreePath(projectDir, projectName, slug)
-  if (resolve(workDir) !== resolve(expectedPath)) return null
-  const instructionsPath = join(workDir, `AGENTS.${slug}.md`)
-  return existsSync(instructionsPath) ? instructionsPath : null
+  return managedWorktreeInstructionContext(workDir, projectDir, projectName)?.path ?? null
 }
 
 export function readWorktreeInstructionsForManagedBranch(
@@ -86,16 +77,11 @@ export function readWorktreeInstructionsForManagedBranch(
   projectDir: string,
   projectName: string,
 ): WorktreeInstructionsFile | null {
-  const instructionsPath = worktreeInstructionsPathForManagedBranch(workDir, projectDir, projectName)
-  if (!instructionsPath) return null
-  const content = readFileSync(instructionsPath, 'utf8').trim()
+  const context = managedWorktreeInstructionContext(workDir, projectDir, projectName)
+  if (!context) return null
+  const content = readFileSync(context.path, 'utf8').trim()
   if (!content) return null
-  const branch = git(workDir, ['rev-parse', '--abbrev-ref', 'HEAD']).trim()
-  const slug = branch.slice(WORK_BRANCH_PREFIX.length)
-  if (!normalizeWorktreeSlug(slug)) {
-    throw new Error(`invalid worktree branch "${branch}"`)
-  }
-  return { path: instructionsPath, content, slug }
+  return { path: context.path, content, slug: context.slug }
 }
 
 export function listProjectWorktrees(projectDir: string, projectName: string): WorktreeEntry[] {
@@ -229,6 +215,33 @@ function assertWorktreeBranch(worktreePath: string, branch: string): void {
   }
 }
 
+function managedWorktreeInstructionContext(
+  workDir: string,
+  projectDir: string,
+  projectName: string,
+): { path: string; slug: string } | null {
+  const branch = currentGitBranchForOptionalInstructions(workDir)
+  if (!branch?.startsWith(WORK_BRANCH_PREFIX)) return null
+  const slug = branch.slice(WORK_BRANCH_PREFIX.length)
+  if (!normalizeWorktreeSlug(slug)) {
+    throw new Error(`invalid worktree branch "${branch}"`)
+  }
+  const expectedPath = expectedWorktreePath(projectDir, projectName, slug)
+  if (resolve(workDir) !== resolve(expectedPath)) return null
+  const instructionsPath = join(workDir, `AGENTS.${slug}.md`)
+  return existsSync(instructionsPath) ? { path: instructionsPath, slug } : null
+}
+
+function currentGitBranchForOptionalInstructions(workDir: string): string | null {
+  if (!existsSync(workDir)) return null
+  try {
+    return git(workDir, ['branch', '--show-current']).trim() || null
+  } catch (e) {
+    if (isNotGitRepositoryError(e)) return null
+    throw e
+  }
+}
+
 function hasBranch(projectDir: string, branch: string): boolean {
   try {
     git(projectDir, ['show-ref', '--verify', '--quiet', `refs/heads/${branch}`])
@@ -292,4 +305,8 @@ function errorMessage(e: unknown): string {
     if (any.message) return any.message
   }
   return String(e)
+}
+
+function isNotGitRepositoryError(e: unknown): boolean {
+  return /not a git repository/i.test(errorMessage(e))
 }

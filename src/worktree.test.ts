@@ -141,6 +141,29 @@ describe('project worktrees', () => {
 
     expect(worktreeInstructionsPathForManagedBranch(repo, repo, 'feishu')).toBeNull()
   })
+
+  test('skips managed-branch AGENTS lookup in non-git project directories', () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-wt-nongit-'))
+    roots.push(root)
+    const projectDir = join(root, 'test1')
+    mkdirSync(projectDir)
+    writeFileSync(join(projectDir, 'AGENTS.prompt-work.md'), '# extra rules\n')
+
+    expect(worktreeInstructionsPathForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
+    expect(readWorktreeInstructionsForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
+  })
+
+  test('skips managed-branch AGENTS lookup in unborn git repositories', () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-wt-unborn-'))
+    roots.push(root)
+    const projectDir = join(root, 'test1')
+    mkdirSync(projectDir)
+    git(projectDir, ['init'])
+    writeFileSync(join(projectDir, 'AGENTS.prompt-work.md'), '# extra rules\n')
+
+    expect(worktreeInstructionsPathForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
+    expect(readWorktreeInstructionsForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
+  })
 })
 
 function initRepo(): { root: string; repo: string } {
