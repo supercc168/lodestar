@@ -142,6 +142,10 @@ const MAX_MIDTURN_ROTATES = 5
 interface LifecycleProgressOpts {
   announce?: boolean
   onStatus?: (status: string) => void
+  /** Internal: startColdUserTurn resets fresh state before opening the
+   * first direct-start card, because the visible turn number is decided
+   * before Codex starts. */
+  freshConversationStateAlreadyReset?: boolean
 }
 
 interface FooterTimer {
@@ -486,6 +490,17 @@ export class Session {
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────
+  private resetFreshConversationState(): void {
+    this.turnCounter = 0
+    this.currentGoal = null
+    this.cumStats = { tokens: 0, costUsd: 0, turns: 0 }
+    this.lastTurnDelta = null
+    this.currentTurnUsageBaseline = null
+    this.currentTurnUsageBaselineKnown = false
+    this.lastTurnUsage = null
+    this.usageTotalsSeedUnknown = false
+  }
+
   async start(opts: LifecycleProgressOpts = {}): Promise<boolean> {
     const announce = opts.announce ?? true
     const report = opts.onStatus
@@ -516,11 +531,8 @@ export class Session {
       }
     }
 
+    if (!opts.freshConversationStateAlreadyReset) this.resetFreshConversationState()
     this.status = 'starting'
-    this.currentGoal = null
-    this.currentTurnUsageBaseline = null
-    this.currentTurnUsageBaselineKnown = false
-    this.usageTotalsSeedUnknown = false
     report?.(this.withModel('🚀 启动 Codex'))
     let proc: CodexProcess
     try {
@@ -799,13 +811,10 @@ export class Session {
         report?.('⚠️ 没有可恢复的上一会话，将以新会话启动')
         if (announceText) await feishu.sendText(this.chatId, '⚠️ 没有可恢复的上一会话，将以新会话启动')
       }
-      // Fresh conversation — drop cumulative stats so the next `hi` shows
-      // zeroed counters instead of bleeding numbers from the prior chat.
-      this.cumStats = { tokens: 0, costUsd: 0, turns: 0 }
-      this.lastTurnDelta = null
-      this.lastTurnUsage = null
-      this.usageTotalsSeedUnknown = false
-      return await this.start(opts)
+      // Fresh conversation — drop cumulative stats and the visible turn
+      // number so the next card starts from turn 1.
+      this.resetFreshConversationState()
+      return await this.start({ ...opts, freshConversationStateAlreadyReset: true })
     }
   }
 
@@ -1602,6 +1611,7 @@ export class Session {
 
   private async startColdUserTurn(text: string, wireText: string, userOpenId: string): Promise<void> {
     this.openingTurn = true
+    this.resetFreshConversationState()
     this.pendingTurnInputs.push(text)
     try {
       await this.openTurnCard(userOpenId, 'user_message', {
@@ -1619,6 +1629,7 @@ export class Session {
       let lastBootStatus = '🚀 启动 Codex'
       const ok = await this.start({
         announce: false,
+        freshConversationStateAlreadyReset: true,
         onStatus: status => {
           lastBootStatus = status
           bootTimer.setStatus(status)
