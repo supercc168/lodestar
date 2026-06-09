@@ -35,6 +35,38 @@ afterEach(() => {
 })
 
 describe('cardkit streaming finalization', () => {
+  test('retries id_convert when Feishu has not indexed the just-sent message yet', async () => {
+    let attempt = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      calls.push({
+        method: String(init?.method ?? 'GET'),
+        path: url.pathname.replace('/open-apis/cardkit/v1', ''),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      })
+      attempt++
+      if (attempt === 1) {
+        return new Response(JSON.stringify({
+          code: 200740,
+          msg: 'ErrMsg: queried result is empty;',
+        }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({
+        code: 0,
+        data: { card_id: 'card_ready' },
+      }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    await expect(cardkit.convertMessageToCard('om_recent', { retryDelaysMs: [0, 0] }))
+      .resolves.toBe('card_ready')
+
+    expect(calls.map(call => call.path)).toEqual(['/cards/id_convert', '/cards/id_convert'])
+  })
+
   test('staticizes a buffered streaming markdown element by deleting it before adding the final element', async () => {
     const cardId = 'card_staticize_race'
     const streamId = 'assistant_0'

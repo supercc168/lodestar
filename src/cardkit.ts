@@ -23,6 +23,7 @@ import { log } from './log'
 const BASE = 'https://open.feishu.cn/open-apis/cardkit/v1'
 
 const FLUSH_INTERVAL_MS = 2000
+const ID_CONVERT_RETRY_DELAYS_MS = [0, 250, 750, 1500]
 
 interface CardState {
   sequence: number
@@ -156,6 +157,10 @@ async function call(method: string, path: string, body?: object): Promise<any> {
   return json?.data
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms))
+}
+
 function isStreamingClosed(e: unknown): boolean {
   if (typeof e !== 'object' || e === null) return false
   const code = (e as any).code
@@ -226,10 +231,38 @@ async function withReopenOnStreamingClosed(
   }
 }
 
+function isIdConvertEmptyResult(e: unknown): boolean {
+  return typeof e === 'object' && e !== null && (e as any).code === 200740
+}
+
+interface IdConvertOptions {
+  retryDelaysMs?: number[]
+}
+
 /** Convert a sent interactive message into a card entity. */
-export async function convertMessageToCard(messageId: string): Promise<string> {
-  const data = await call('POST', '/cards/id_convert', { message_id: messageId })
-  return data.card_id
+export async function convertMessageToCard(
+  messageId: string,
+  opts: IdConvertOptions = {},
+): Promise<string> {
+  const delays = opts.retryDelaysMs?.length ? opts.retryDelaysMs : ID_CONVERT_RETRY_DELAYS_MS
+  let lastErr: unknown = null
+  for (let i = 0; i < delays.length; i++) {
+    const delay = delays[i] ?? 0
+    if (delay > 0) await sleep(delay)
+    try {
+      const data = await call('POST', '/cards/id_convert', { message_id: messageId })
+      if (typeof data?.card_id !== 'string' || !data.card_id) {
+        throw new Error(`cardkit POST /cards/id_convert: missing card_id`)
+      }
+      return data.card_id
+    } catch (e) {
+      lastErr = e
+      if (!isIdConvertEmptyResult(e) || i === delays.length - 1) throw e
+      const nextDelay = delays[i + 1] ?? 0
+      log(`cardkit id_convert ${messageId}: empty result, retry ${i + 2}/${delays.length} in ${nextDelay}ms`)
+    }
+  }
+  throw lastErr
 }
 
 /** Create a card entity from raw schema-2.0 card JSON. */
