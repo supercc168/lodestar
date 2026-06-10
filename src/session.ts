@@ -77,6 +77,7 @@ const FOOTER_WORKING = 'Working...'
 const RESUME_INIT_NOTICE_MS = 10_000
 const RESUME_INIT_TIMEOUT_MS = 120_000
 const CONTEXT_COMPACT_TIMEOUT_MS = 120_000
+const CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS = 1500
 
 interface ModelPanelState {
   models: cards.ModelChoice[]
@@ -104,6 +105,16 @@ type WorktreeActionResult = { ok: boolean; message: string; card: object }
 type ModelActionResult = { ok: boolean; message: string; card?: object }
 type ManualCompactionWatch = {
   promise: Promise<ContextCompactedNotification>
+  cancel(): void
+}
+type ContextUsageSnapshot = {
+  usage: CodexUsage | null
+  contextWindow: number | null
+  threadId?: string
+  turnId?: string
+}
+type ManualCompactionUsageWatch = {
+  waitFor(notice: ContextCompactedNotification, timeoutMs: number): Promise<ContextUsageSnapshot | null>
   cancel(): void
 }
 type ControlCommand = 'hi' | 'stop' | 'kill' | 'restart' | 'clear' | 'compact' | 'model'
@@ -671,6 +682,19 @@ export class Session {
     this.currentBatchReactionIds = new Map()
   }
 
+  private clearStaleIdleQueueState(reason: string): void {
+    if (this.initCount < 1 || this.currentTurn || this.openingTurn || this.pendingUserMessageCount === 0) return
+    log(`session "${this.sessionName}": clear stale pending queue before ${reason} pendingCount=${this.pendingUserMessageCount} reactions=${this.pendingReactionIds.size}`)
+    this.pendingUserMessageCount = 0
+    // Release stale ⏳ reactions left on the abandoned batch's chat
+    // messages. addReaction callbacks still in flight will fall through
+    // to the orphan path in onUserMessage's trackReaction helper.
+    for (const [m, rid] of this.pendingReactionIds) {
+      if (rid) void feishu.deleteReaction(m, rid)
+    }
+    this.pendingReactionIds = new Map()
+  }
+
   async stop(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
     const announce = opts.announce ?? true
     const report = opts.onStatus
@@ -1008,7 +1032,75 @@ export class Session {
     }
   }
 
+  private watchManualCompactionUsage(proc: CodexProcess, threadId: string | null): ManualCompactionUsageWatch {
+    const snapshots: ContextUsageSnapshot[] = []
+    const waiters = new Set<{
+      notice: ContextCompactedNotification
+      finish: (snapshot: ContextUsageSnapshot | null) => void
+    }>()
+    const matches = (snapshot: ContextUsageSnapshot, notice: ContextCompactedNotification): boolean => {
+      const targetThreadId = notice.threadId ?? threadId
+      if (targetThreadId && snapshot.threadId && snapshot.threadId !== targetThreadId) return false
+      if (notice.turnId) return snapshot.turnId === notice.turnId
+      return true
+    }
+    const latestMatching = (notice: ContextCompactedNotification): ContextUsageSnapshot | null => {
+      for (let i = snapshots.length - 1; i >= 0; i--) {
+        const snapshot = snapshots[i]
+        if (snapshot && matches(snapshot, notice)) return snapshot
+      }
+      return null
+    }
+    const onUsage = (update: TokenUsageUpdated) => {
+      if (threadId && update.threadId && update.threadId !== threadId) return
+      const snapshot: ContextUsageSnapshot = {
+        usage: update.usage,
+        contextWindow: update.contextWindow,
+        threadId: update.threadId,
+        turnId: update.turnId,
+      }
+      snapshots.push(snapshot)
+      for (const waiter of [...waiters]) {
+        if (matches(snapshot, waiter.notice)) waiter.finish(snapshot)
+      }
+    }
+    proc.on('token_usage', onUsage)
+    return {
+      waitFor(notice: ContextCompactedNotification, timeoutMs: number): Promise<ContextUsageSnapshot | null> {
+        const existing = latestMatching(notice)
+        if (existing) return Promise.resolve(existing)
+        return new Promise(resolve => {
+          let timer: ReturnType<typeof setTimeout> | null = null
+          const waiter = {
+            notice,
+            finish: (snapshot: ContextUsageSnapshot | null) => {
+              if (timer) clearTimeout(timer)
+              waiters.delete(waiter)
+              resolve(snapshot)
+            },
+          }
+          timer = setTimeout(() => waiter.finish(null), timeoutMs)
+          waiters.add(waiter)
+        })
+      },
+      cancel() {
+        proc.off('token_usage', onUsage)
+        for (const waiter of [...waiters]) waiter.finish(null)
+      },
+    }
+  }
+
+  private compactContextWindowLabel(snapshot: ContextUsageSnapshot | null): string {
+    if (!snapshot) return ' · 🧠 MISS'
+    const pct = cards.footerContextPercentLabel(
+      contextTokensFromUsage(snapshot.usage),
+      contextLimitFromAppServer(snapshot.contextWindow),
+    )
+    return ` · 🧠 ${pct ?? 'MISS'}`
+  }
+
   private async runCompactCommand(): Promise<void> {
+    this.clearStaleIdleQueueState('compact')
     const noActiveTurn = !this.currentTurn && this.pendingUserMessageCount === 0 && this.pendingMidTurnMsgs.length === 0 && !this.openingTurn
     if (!this.isRunning() || !this.proc) {
       this.status = 'stopped'
@@ -1046,18 +1138,21 @@ export class Session {
       else await feishu.sendText(this.chatId, status)
     }
     const watch = this.watchManualCompaction(proc, CONTEXT_COMPACT_TIMEOUT_MS)
+    const usageWatch = this.watchManualCompactionUsage(proc, proc.sessionId)
     this.manualContextCompactionPending = true
     try {
       this.setStatusCard(statusCard, this.withModel('🧠 发起上下文压缩'))
       await proc.compactThread()
       this.setStatusCard(statusCard, this.withModel('⏳ 等待压缩完成事件'))
       const notice = await watch.promise
+      const contextSnapshot = await usageWatch.waitFor(notice, CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS)
       const doneThread = notice.threadId ? ` thread=${notice.threadId.slice(0, 8)}…` : ''
-      await finishStatus(this.withModel(`✅ 上下文已压缩${doneThread}`))
+      await finishStatus(this.withModel(`✅ 上下文已压缩${doneThread}${this.compactContextWindowLabel(contextSnapshot)}`))
     } catch (e) {
       watch.cancel()
       await finishStatus(`❌ 上下文压缩失败: ${messageOf(e)}`)
     } finally {
+      usageWatch.cancel()
       this.manualContextCompactionPending = false
     }
   }
@@ -1368,6 +1463,7 @@ export class Session {
         // but the daemon can't reach into it directly; in practice the
         // sendInterrupt() control_request causes the SDK to discard
         // queued input alongside the in-flight call.
+        this.clearStaleIdleQueueState('stop')
         if (!this.currentTurn && this.pendingUserMessageCount === 0 && this.pendingMidTurnMsgs.length === 0) {
           const statusCard = await this.openStatusCard('stop', '⚪ 当前没有正在执行的 turn', 'grey')
           if (statusCard) {
@@ -1680,18 +1776,7 @@ export class Session {
     // wasBusy computation — otherwise this fresh solo message is
     // misclassified as queued and its card closes with `📨 转交新卡`
     // instead of `✅`.
-    if (this.initCount >= 1 && !this.currentTurn && !this.openingTurn && this.pendingUserMessageCount > 0) {
-      this.pendingUserMessageCount = 0
-      // Release stale ⏳ reactions left on the abandoned batch's
-      // chat messages. addReaction callbacks still in flight will
-      // fall through to the orphan path in the wasBusy branch
-      // below (which deletes whatever rid lands after both maps
-      // are empty).
-      for (const [m, rid] of this.pendingReactionIds) {
-        if (rid) void feishu.deleteReaction(m, rid)
-      }
-      this.pendingReactionIds = new Map()
-    }
+    this.clearStaleIdleQueueState('user_message')
     // Capture busy-state SYNC, before any state mutation — this decides
     // whether the message will visibly queue (gets the OneSecond → later
     // CheckMark lifecycle reactions on its Feishu chat message) or

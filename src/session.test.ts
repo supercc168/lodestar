@@ -1,4 +1,10 @@
+import { EventEmitter } from 'node:events'
 import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+
+let sentCards: object[] = []
+let sentTexts: string[] = []
+let sentRawTexts: string[] = []
+let deletedReactions: Array<[string, string]> = []
 
 mock.module('./feishu', () => ({
   PROJECTS_ROOT: '/tmp/lodestar-projects',
@@ -6,6 +12,21 @@ mock.module('./feishu', () => ({
   getSessionModelSelection: () => null,
   getTenantToken: async () => 'tenant-token',
   preferredChatForSession: new Map(),
+  sendCard: async (_chatId: string, card: object) => {
+    sentCards.push(card)
+    return `om_status_${sentCards.length}`
+  },
+  sendText: async (_chatId: string, text: string) => {
+    sentTexts.push(text)
+    return 'om_text'
+  },
+  sendTextRaw: async (_chatId: string, text: string) => {
+    sentRawTexts.push(text)
+    return 'om_raw'
+  },
+  deleteReaction: async (messageId: string, reactionId: string) => {
+    deletedReactions.push([messageId, reactionId])
+  },
 }))
 
 const { Session } = await import('./session')
@@ -22,14 +43,22 @@ let calls: FetchCall[] = []
 
 beforeEach(() => {
   calls = []
+  sentCards = []
+  sentTexts = []
+  sentRawTexts = []
+  deletedReactions = []
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input))
+    const path = url.pathname.replace('/open-apis/cardkit/v1', '')
     calls.push({
       method: String(init?.method ?? 'GET'),
-      path: url.pathname.replace('/open-apis/cardkit/v1', ''),
+      path,
       body: init?.body ? JSON.parse(String(init.body)) : null,
     })
-    return new Response(JSON.stringify({ code: 0, data: {} }), {
+    const data = path === '/cards/id_convert'
+      ? { card_id: `card_status_${calls.length}` }
+      : {}
+    return new Response(JSON.stringify({ code: 0, data }), {
       headers: { 'Content-Type': 'application/json' },
     })
   }) as typeof fetch
@@ -135,5 +164,59 @@ describe('Session assistant rendering', () => {
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)
     }
+  })
+})
+
+describe('Session compact command', () => {
+  test('clears stale idle pending count before rejecting active turns', async () => {
+    class FakeProc extends EventEmitter {
+      sessionId = 'thread_stale_pending'
+      turnId = 'turn_compact'
+      compactCalls = 0
+
+      isAlive(): boolean {
+        return true
+      }
+
+      async compactThread(): Promise<void> {
+        this.compactCalls++
+        queueMicrotask(() => {
+          this.emit('token_usage', {
+            usage: { total_tokens: 35_211 },
+            totalUsage: { total_tokens: 35_211 },
+            contextWindow: 258_000,
+            threadId: this.sessionId,
+            turnId: this.turnId,
+          })
+          this.emit('context_compacted', {
+            phase: 'end',
+            threadId: this.sessionId,
+            turnId: this.turnId,
+          })
+        })
+      }
+    }
+
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeProc()
+    session.proc = proc
+    session.status = 'idle'
+    session.initCount = 1
+    session.pendingUserMessageCount = 1
+    session.pendingReactionIds = new Map([['om_user_msg', 'reaction_one_second']])
+
+    await expect(session.runCommand('cm')).resolves.toBe(true)
+
+    expect(proc.compactCalls).toBe(1)
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(deletedReactions).toEqual([['om_user_msg', 'reaction_one_second']])
+    expect(sentTexts.some(text => text.includes('先 `stop`'))).toBe(false)
+    expect(sentRawTexts.some(text => text.includes('先 `stop`'))).toBe(false)
+    const footerWrites = calls
+      .filter(call => call.method === 'PUT' && call.path.endsWith('/elements/footer'))
+      .map(call => JSON.parse(call.body.element).content as string)
+    expect(footerWrites.some(content =>
+      content.includes('✅ 上下文已压缩') && content.includes('🧠 9%')
+    )).toBe(true)
   })
 })
