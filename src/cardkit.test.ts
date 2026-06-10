@@ -34,7 +34,7 @@ afterEach(() => {
   globalThis.fetch = originalFetch
 })
 
-describe('cardkit streaming finalization', () => {
+describe('cardkit card operations', () => {
   test('retries id_convert when Feishu has not indexed the just-sent message yet', async () => {
     let attempt = 0
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -67,65 +67,26 @@ describe('cardkit streaming finalization', () => {
     expect(calls.map(call => call.path)).toEqual(['/cards/id_convert', '/cards/id_convert'])
   })
 
-  test('staticizes a buffered streaming markdown element by deleting it before adding the final element', async () => {
-    const cardId = 'card_staticize_race'
-    const streamId = 'assistant_0'
-    const staticId = 'assistant_0_static'
-    const content = 'complete mid-turn assistantMessage'
+  test('flush waits for queued card writes', async () => {
+    const cardId = 'card_flush_queue'
+    const element = { tag: 'markdown', element_id: 'assistant_0', content: 'complete assistantMessage' }
 
     cardkit.recordCardCreated(cardId, 1)
-    cardkit.streamTextThrottled(cardId, streamId, content)
-    const staticize = cardkit.staticizeMarkdownElement(cardId, streamId, staticId, content, 'footer')
+    const write = cardkit.addElement(cardId, element, {
+      type: 'insert_before',
+      targetElementId: 'footer',
+    })
 
     await cardkit.flush(cardId)
-    await staticize
+    await write
     await cardkit.dispose(cardId)
 
-    const deleteIdx = calls.findIndex(call =>
-      call.method === 'DELETE' &&
-      call.path === `/cards/${cardId}/elements/${streamId}`
-    )
-    const addIdx = calls.findIndex(call =>
+    const add = calls.find(call =>
       call.method === 'POST' &&
       call.path === `/cards/${cardId}/elements`
     )
-    expect(deleteIdx).toBeGreaterThanOrEqual(0)
-    expect(addIdx).toBeGreaterThan(deleteIdx)
-
-    const add = calls[addIdx]
     expect(add?.body.type).toBe('insert_before')
     expect(add?.body.target_element_id).toBe('footer')
-    expect(JSON.parse(add?.body.elements ?? '[]')).toEqual([{
-      tag: 'markdown',
-      element_id: staticId,
-      content,
-    }])
-
-    expect(calls.some(call =>
-      call.method === 'PUT' &&
-      call.path === `/cards/${cardId}/elements/${streamId}/content`
-    )).toBe(false)
-  })
-
-  test('delete marks an element dead before a later buffered flush can write it again', async () => {
-    const cardId = 'card_delete_race'
-    const streamId = 'assistant_0'
-
-    cardkit.recordCardCreated(cardId, 1)
-    cardkit.streamTextThrottled(cardId, streamId, 'stale text')
-    const deleted = cardkit.deleteElement(cardId, streamId)
-
-    await cardkit.flush(cardId)
-    await deleted
-    await cardkit.dispose(cardId)
-
-    expect(calls.some(call =>
-      call.method === 'DELETE' &&
-      call.path === `/cards/${cardId}/elements/${streamId}`
-    )).toBe(true)
-    expect(calls.some(call =>
-      call.method === 'PUT' &&
-      call.path === `/cards/${cardId}/elements/${streamId}/content`
-    )).toBe(false)
+    expect(JSON.parse(add?.body.elements ?? '[]')).toEqual([element])
   })
 })

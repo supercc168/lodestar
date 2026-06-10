@@ -61,11 +61,11 @@ export interface TurnState {
   // version, then post the files as separate Feishu messages.
   segmentTexts: Map<string, string>
   startedAt: number
-  /** Footer thinking timer. While present, footer shows `Thinking...(Ns)`.
-   * Assistant text or tool execution clears it to `Working...`; after all
-   * tools finish it can start again while the model is silent. */
-  thinkingFooterHandle: ReturnType<typeof setInterval> | null
-  thinkingFooterStartedAt: number
+  /** Footer phase timer. `Thinking` is model silence, `Writing` is buffered
+   * assistant text, and `Working` is tool execution / visible non-text work. */
+  footerStatusHandle: ReturnType<typeof setInterval> | null
+  footerStatusStartedAt: number
+  footerStatusLabel: string | null
   /** Mid-turn card-rotation lock. Set when we've fire-and-forget kicked
    * off `startMidTurnRotate` to open a fresh card — either proactively
    * (element count crossed CARD_ELEMENT_SOFT_LIMIT) or reactively (an
@@ -87,11 +87,11 @@ export interface TurnState {
    * so the notice isn't repeated on every later failed write this turn. */
   rotateGivenUp: boolean
   /** 本 turn 已处理过的出站路径请求。包括合法绝对路径和被拒绝的非绝对路径,
-   * 用来避免流式文本反复扫到同一个 [[send: ...]] 时重复上传或刷日志。 */
+   * 用来避免增量文本反复扫到同一个 [[send: ...]] 时重复上传或刷日志。 */
   outboundSeenPaths: Set<string>
   /** 已实际排队上传的绝对路径。用于 footer 计数和跨 rotate 去重。 */
   outboundSentPaths: Set<string>
-  /** 已识别过的宿主 askusr marker 原文。assistant 文本是累积流式刷新，
+  /** 已识别过的宿主 askusr marker 原文。assistant 文本是累积增量，
    * 不去重会在每次 delta 上重复建 ask 卡。 */
   hostAskMarkersSeen: Set<string>
 }

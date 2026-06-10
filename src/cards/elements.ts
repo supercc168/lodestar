@@ -9,11 +9,12 @@
  *   goal_update_<i>   — timeline snapshot inserted where a goal update occurs
  *   context_compact_<i> — collapsible context-compaction lifecycle panel.
  *                       item/started creates it; item/completed replaces it.
- *   assistant         — the main streaming assistant answer
+ *   assistant         — completed assistant answer segment
  *   footer            — runtime footer. While the model is silent it
- *                       shows `Thinking...(Ns)`; while visible work is
- *                       streaming/running it shows `Working...`; at turn
- *                       close it becomes the terminal status line.
+ *                       shows `Thinking...(Ns)` while the model is silent,
+ *                       `Writing...(Ns)` while assistant text is buffered,
+ *                       `Working...(Ns)` while tools/non-text work run; at
+ *                       turn close it becomes the terminal status line.
  */
 export const ELEMENTS = {
   userInput: 'user_input',
@@ -22,9 +23,9 @@ export const ELEMENTS = {
   planUpdate: (i: number) => `plan_update_${i}`,
   goalUpdate: (i: number) => `goal_update_${i}`,
   contextCompact: (i: number) => `context_compact_${i}`,
-  /** Assistant text is segmented: every tool call closes the running segment
-   * and the next assistant chunk opens a new one, so element order in the
-   * card matches Codex's emission order. */
+  /** Assistant text is segmented: every completed agentMessage becomes one
+   * static markdown element, so element order in the card matches Codex's
+   * emission order. */
   assistant: (i: number) => `assistant_${i}`,
   /** Console (hi) card — the subscription-usage row is rendered as its
    * own element so we can replace it after the initial card lands,

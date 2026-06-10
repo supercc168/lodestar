@@ -4,7 +4,6 @@
  * Endpoints used (base = https://open.feishu.cn/open-apis/cardkit/v1):
  *   POST   /cards/id_convert                              message_id → card_id
  *   POST   /cards                                         create a card entity
- *   PUT    /cards/:card_id/elements/:element_id/content   stream text (typewriter)
  *   POST   /cards/:card_id/elements                       add element
  *   PUT    /cards/:card_id/elements/:element_id           replace element
  *   DELETE /cards/:card_id/elements/:element_id           remove element
@@ -13,8 +12,6 @@
  * Per-card invariants enforced here:
  *   - `sequence` is monotonically increasing per card_id
  *   - all writes for a card are serialized through a Promise queue
- *   - text-streaming PUTs are batched on a 2s cadence to stay well under
- *     cardkit's per-card rate ceiling when many project sessions stream at once
  */
 
 import { getTenantToken } from './feishu'
@@ -22,19 +19,11 @@ import { log } from './log'
 
 const BASE = 'https://open.feishu.cn/open-apis/cardkit/v1'
 
-const FLUSH_INTERVAL_MS = 2000
 const ID_CONVERT_RETRY_DELAYS_MS = [0, 250, 750, 1500]
 
 interface CardState {
   sequence: number
   queue: Promise<void>
-  buffer: Map<string, string>          // element_id → latest full text
-  /** element_id → 最近一次「已入队 PUT」的全量内容。关键:是"已入队"而非
-   * "已送达" —— 在 streamText 入队时同步写,不是 PUT 完成后写。
-   * flush 去重读它,所以它必须同步反映"我已经决定要发到哪",否则 block stop
-   * 直接 PUT 完整内容后,后续定时 flush 还会重复发同一帧。 */
-  lastEnqueued: Map<string, string>
-  flushTimer: ReturnType<typeof setTimeout> | null
   /** Live count of elements on the card. Initialised by
    * `recordCardCreated` (session passes the body.elements.length of the
    * just-sent card), then incremented in addElement's success branch and
@@ -48,10 +37,9 @@ interface CardState {
   /** element_ids that must no longer receive writes. Usually this means
    * `addElement` was rejected by Feishu (most often `300305/300315
    * [element exceeds the limit]`), so the element does NOT exist on Feishu's
-   * side and every subsequent `streamText`/`replaceElement`/`deleteElement`
-   * would 300313/300121. It also covers streaming assistant elements that
-   * have been deliberately replaced by static markdown and deleted. Per-card
-   * and dropped on `dispose`, so a rotated-to fresh card starts clean. */
+   * side and every subsequent `replaceElement`/`deleteElement`
+   * would 300313/300121. Per-card and dropped on `dispose`, so a rotated-to
+   * fresh card starts clean. */
   deadElements: Set<string>
   /** Card-level write-failure callback, set by recordCardCreated. Invoked
    * by any cardkit write op that fails even after the streaming-closed
@@ -85,9 +73,6 @@ function state(cardId: string): CardState {
     s = {
       sequence: 0,
       queue: Promise.resolve(),
-      buffer: new Map(),
-      lastEnqueued: new Map(),
-      flushTimer: null,
       elementCount: 0,
       deadElements: new Set(),
     }
@@ -121,10 +106,9 @@ export function getElementCount(cardId: string): number {
 }
 
 /** True if `elementId` was recorded dead on this card (its addElement was
- * rejected, so the element doesn't exist on Feishu). Mid-turn rotation
- * reads this to decide whether the just-failed assistant segment needs
- * rebuilding on the fresh card: dead ⇒ rebuild (its text never made it
- * onto the old card), alive ⇒ leave it, the old card already shows it. */
+ * rejected, so the element doesn't exist on Feishu). Mid-turn rotation reads
+ * this for tool panels: dead ⇒ rebuild on the fresh card, alive ⇒ leave it on
+ * the old card. */
 export function isDeadElement(cardId: string, elementId: string): boolean {
   return cards.get(cardId)?.deadElements.has(elementId) ?? false
 }
@@ -137,8 +121,6 @@ function nextSeq(cardId: string): number {
 
 function markElementDead(s: CardState, elementId: string): void {
   s.deadElements.add(elementId)
-  s.buffer.delete(elementId)
-  s.lastEnqueued.delete(elementId)
 }
 
 async function call(method: string, path: string, body?: object): Promise<any> {
@@ -274,65 +256,11 @@ export async function createCardEntity(card: object): Promise<string> {
   return data.card_id
 }
 
-/** PUT element content (full text) — triggers typewriter on prefix-match.
- *
- * NOTE: CardKit rejects empty-string content with code 99992402 ("field
- * validation failed"); we drop empty/whitespace-only writes here so callers
- * can stream naively without per-call empty checks. */
-export function streamText(cardId: string, elementId: string, content: string): Promise<void> {
-  if (!content || !content.trim()) return Promise.resolve()
-  const s = state(cardId)
-  // 死元素(addElement 被飞书拒过,元素根本不存在)直接吞掉:再 PUT 只会
-  // 300313,而 streamTextThrottled 每个 delta 都重发全文,会把一个建失败的段
-  // 放大成一串红。等 rotation 把 turn 切到新卡,新段就正常了。
-  if (s.deadElements.has(elementId)) return Promise.resolve()
-  // 「已入队」位置必须在这里同步推进,而不是等 PUT 完成。这样 block stop
-  // 的直接完整 PUT 可以让后续定时 flush 通过 lastEnqueued 去重跳过同一帧。
-  // 全量 PUT 自带自愈:某次 PUT 失败会被下一个更长的全量覆盖,所以提前把
-  // 「已入队」前移是安全的(失败的内容不会永久丢,除非它正好是最后一帧 ——
-  // 那种情况由 content_block_stop / closeTurnCard 的兜底 flush 覆盖)。
-  s.lastEnqueued.set(elementId, content)
-  s.queue = s.queue.then(() => withReopenOnStreamingClosed(
-    cardId,
-    `streamText ${elementId}`,
-    async () => {
-      if (s.deadElements.has(elementId)) return
-      const seq = nextSeq(cardId)
-      await call('PUT', `/cards/${cardId}/elements/${elementId}/content`, {
-        content, sequence: seq,
-      })
-    },
-  ))
-  return s.queue
-}
-
-/** Throttled streaming: buffer latest full text and auto-flush on a
- * per-card timer. Block boundaries call streamText directly to push the
- * final frame immediately without changing the steady-state cadence. */
-export function streamTextThrottled(cardId: string, elementId: string, fullContent: string): void {
-  if (!fullContent || !fullContent.trim()) return
-  const s = state(cardId)
-  if (s.deadElements.has(elementId)) return
-  s.buffer.set(elementId, fullContent)
-
-  if (!s.flushTimer) {
-    s.flushTimer = setTimeout(() => {
-      flush(cardId).catch(e => log(`cardkit flush(timer) ${cardId}: ${e}`))
-    }, FLUSH_INTERVAL_MS)
-  }
-}
-
-/** Force an immediate flush of the buffered streams for a card. */
+/** Wait for all currently queued writes for a card. */
 export async function flush(cardId: string): Promise<void> {
   const s = cards.get(cardId)
   if (!s) return
-  if (s.flushTimer) { clearTimeout(s.flushTimer); s.flushTimer = null }
-  const pending = [...s.buffer.entries()]
-  s.buffer.clear()
-  for (const [eid, text] of pending) {
-    if (s.lastEnqueued.get(eid) === text) continue
-    await streamText(cardId, eid, text)
-  }
+  await s.queue
 }
 
 /** Add a new element to the card body or relative to a sibling.
@@ -370,7 +298,7 @@ export function addElement(
     },
     (code) => {
       // Add rejected ⇒ this element_id does not exist on Feishu's side.
-      // Mark it dead so subsequent streamText/replace/delete aimed at it
+      // Mark it dead so subsequent replace/delete aimed at it
       // short-circuit instead of spraying 300313/300121. Then forward the
       // code: session turns an element-limit code into a forced mid-turn
       // rotate (the local counter can't be trusted here — a failed add
@@ -380,66 +308,6 @@ export function addElement(
       onFailure?.(code)
     },
   ))
-  return s.queue
-}
-
-/** Freeze a streaming markdown element by deleting the old streaming element
- * first, then inserting a new static markdown element before the provided
- * stable sibling.
- * This avoids toggling whole-card streaming_mode mid-turn while still making
- * completed assistant blocks fully visible before tools or later blocks land.
- */
-export function staticizeMarkdownElement(
-  cardId: string,
-  elementId: string,
-  staticElementId: string,
-  content: string,
-  insertBeforeElementId: string,
-): Promise<void> {
-  if (!content || !content.trim()) return Promise.resolve()
-  const s = state(cardId)
-  if (s.deadElements.has(elementId)) return Promise.resolve()
-  const element = {
-    tag: 'markdown',
-    element_id: staticElementId,
-    content: content.trim() || ' ',
-  }
-  s.queue = s.queue.then(async () => {
-    if (s.deadElements.has(elementId)) return
-    let deleted = false
-    await withReopenOnStreamingClosed(
-      cardId,
-      `staticizeElement delete-old ${elementId}`,
-      async () => {
-        if (s.deadElements.has(elementId)) return
-        const deleteSeq = nextSeq(cardId)
-        await call('DELETE', `/cards/${cardId}/elements/${elementId}`, {
-          sequence: deleteSeq,
-        })
-        deleted = true
-      },
-      undefined,
-      true,
-    )
-    if (!deleted) return
-    s.elementCount = Math.max(0, s.elementCount - 1)
-    markElementDead(s, elementId)
-
-    await withReopenOnStreamingClosed(
-      cardId,
-      `staticizeElement add-final ${staticElementId}`,
-      async () => {
-        const addSeq = nextSeq(cardId)
-        await call('POST', `/cards/${cardId}/elements`, {
-          type: 'insert_before',
-          target_element_id: insertBeforeElementId,
-          elements: JSON.stringify([element]),
-          sequence: addSeq,
-        })
-        s.elementCount += 1
-      },
-    )
-  })
   return s.queue
 }
 
@@ -486,7 +354,7 @@ export function deleteElement(cardId: string, elementId: string): Promise<void> 
 
 /** Throttled card-summary update. The summary text is what Feishu shows
  * in the chat list as the message preview. We coalesce writes on a
- * SUMMARY_FLUSH_MS window so streaming assistant deltas don't blow up
+ * SUMMARY_FLUSH_MS window so assistant deltas don't blow up
  * the settings-PATCH endpoint. Whitespace is collapsed and the input
  * is trimmed; empty content is ignored. */
 export function patchSummaryThrottled(cardId: string, content: string): void {
@@ -513,7 +381,7 @@ export function patchSummaryThrottled(cardId: string, content: string): void {
 
 /** Cancel any pending throttled summary write. Call before emitting
  * a terminal summary (e.g. "✅ ⏱ 12.3s · 4.2K tokens") so a stale
- * mid-stream tail can't fire after and clobber the final preview. */
+ * in-flight update can't fire after and clobber the final preview. */
 export function cancelSummary(cardId: string): void {
   const s = summaryStates.get(cardId)
   if (!s) return
@@ -524,7 +392,7 @@ export function cancelSummary(cardId: string): void {
 /** Patch settings — used to flip streaming_mode off when a turn finishes.
  *
  * `nextSeq` is called inside the queued task (not at enqueue time) to
- * match streamText/addElement/replaceElement/deleteElement above. Mixing
+ * match addElement/replaceElement/deleteElement above. Mixing
  * call-time and execution-time seq allocation interleaves badly: a
  * patchSettings enqueued right after a replaceElement would grab the
  * smaller seq number, but the replaceElement's then-block would grab

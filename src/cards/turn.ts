@@ -1,5 +1,5 @@
 /**
- * Schema 2.0 turn-card templates: the main streaming card, the per-tool
+ * Schema 2.0 turn-card templates: the main dynamic turn card, the per-tool
  * collapsible panels, and the AskUserQuestion interactive panel. All
  * rendering for "the in-flight conversation card" lives here. Console
  * UI lives in console.ts; the shared element-id convention is in
@@ -806,7 +806,9 @@ interface MainCardOpts {
   directStart?: boolean
 }
 
-/** Initial card sent at the start of each turn. Streaming on. */
+/** Initial card sent at the start of each turn. CardKit streaming mode stays
+ * on so the daemon can add/replace elements during the turn; assistant text
+ * and footer status themselves are rendered via static element updates. */
 export function mainConversationCard(opts: MainCardOpts): object {
   const banner = opts.kind === 'card_full'
     ? [{ tag: 'markdown', content: '📨 接续上一张(同一轮 Codex turn,前一张卡写满或写入受限)' }]
@@ -841,9 +843,10 @@ export function mainConversationCard(opts: MainCardOpts): object {
     body: {
       // Initial body: [handoff banner?] + [userInput panel?] + footer.
       // Assistant segments and tool panels insert_before footer during
-      // Codex streaming. The footer itself is the only live status element:
-      // `Thinking...(Ns)` while the model is silent, `Working...` while
-      // content/tools are visible, and the terminal line when the turn ends.
+      // Codex events. The footer itself is the only live status element:
+      // `Thinking...(Ns)` while the model is silent, `Writing...(Ns)` while
+      // assistant text is buffered, `Working...(Ns)` while tools/non-text
+      // work are visible, and the terminal line when the turn ends.
       elements: [
         ...banner,
         ...userInputPanel,

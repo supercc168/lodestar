@@ -69,7 +69,7 @@
 - `wt` 复用群名等于目录名的约定：主项目群 `project` 创建同级 `project[name]`，分支固定为 `work/name`。
 - `wt` 解散按钮不能删除仍有运行中 Codex session 的 worktree 群；先让对应群 `stop` 或 `kill`。
 - 已合并且未挂载的 `work/*` 分支在 `wt` 卡片里折叠为归档摘要；再次 `wt <name>` 会挂载并 rebase 到当前项目 HEAD。
-- `cardkit.streamTextThrottled` 缓冲完整文本帧，`flush` 在 turn 关闭前兜底；直接 `streamText` 只用于明确的终态写入。
+- Assistant 正文和 footer 状态不再走 Card Kit `/content` 打字流；正文在完整 `agentMessage` 到达后一次性 `addElement`，footer 状态用 `replaceElement` 直接替换。`cardkit.flush` 仅等待同卡片已排队写操作完成。
 - `card.action.trigger` 需要 3 秒内替换原 JSON 卡片时 return `{ card: { type: "raw", data: newCard } }`；不要 return 裸卡片 JSON 或 `{ card: newCard }`，也不要在回调 ACK 前调用 `message.patch`。延时更新才先 ACK 再用回调 token 调 `/interactive/v1/card/update`。
 - `feishu.ts` 对 SDK 发送消息做 retry 和 UUID 去重；业务 API 错误要 log 并返回失败，而不是默默换用 raw API。
 - `codex-process.ts` 保存最近模型、effort、usage、context window、context compaction 状态和 result meta，控制台和 footer 读取这些快照展示运行状态。

@@ -29,17 +29,15 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
   // 路径不会 +1 element,也无害 —— maybeMidTurnRotate 看到 count 没到
   // 阈值会直接 return。
   s.maybeMidTurnRotate()
-  // 模型出第一个工具 → footer 从 Thinking timer 切到 Working。后续
-  // tool_use 调用时 handle 已 null,stopThinkingFooter 短路。
-  s.stopThinkingFooter(s.currentTurn)
+  // 模型出第一个工具 → footer 切到 Working 计时。
+  s.startWorkingFooter(s.currentTurn)
   // Close current assistant segment (if any) so the tool panel renders
-  // AFTER it in card body order. This sends one immediate full-text
-  // /content frame before the tool element is inserted.
+  // AFTER it in card body order. The assistant body is inserted once as
+  // static markdown before the tool element is inserted.
   if (s.currentTurn.currentAssistantSegmentId) {
-    // 工具面板插在当前 assistant 段之后 → 先把该段完整全文直接 PUT 一次,
-    // 避免 2s 常规节流还没刷出最后一帧时,后续工具元素已经插入。
-    // content_block_stop 通常已先定稿过这段(那时 segId 已 reset、这里直接
-    // 跳过),本调用是 block_stop 没覆盖时的兜底。finalize 内部会清段游标。
+    // 工具面板插在当前 assistant 段之后 → 先把该段完整全文插入为静态
+    // markdown。content_block_stop 通常已先定稿过这段(那时 segId 已 reset,
+    // 这里直接跳过),本调用是 block_stop 没覆盖时的兜底。
     s.finalizeCurrentAssistantSegment()
   }
   // Consecutive Read merger: if a Read run is already open, append to

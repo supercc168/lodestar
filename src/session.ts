@@ -72,6 +72,7 @@ function mergeCompactionNotices(
 
 const FOOTER_STATUS_TICK_MS = 1000
 const FOOTER_THINKING_PREFIX = 'Thinking...'
+const FOOTER_WRITING = 'Writing...'
 const FOOTER_WORKING = 'Working...'
 const RESUME_INIT_NOTICE_MS = 10_000
 const RESUME_INIT_TIMEOUT_MS = 120_000
@@ -163,10 +164,6 @@ interface StatusCardHandle {
 function timedStatus(status: string, startedAt: number): string {
   const elapsedS = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
   return `${status} (${elapsedS}s)`
-}
-
-function staticAssistantElementId(streamElementId: string): string {
-  return `${streamElementId}_static`
 }
 
 export class Session {
@@ -395,6 +392,14 @@ export class Session {
     return text.includes(label) ? text : `${text} · ${label}`
   }
 
+  private replaceFooterContent(cardId: string, content: string): Promise<void> {
+    return cardkit.replaceElement(cardId, cards.ELEMENTS.footer, {
+      tag: 'markdown',
+      element_id: cards.ELEMENTS.footer,
+      content: content.trim() || ' ',
+    })
+  }
+
   private modelLine(): string {
     return this.modelEffortLabel()
   }
@@ -409,11 +414,7 @@ export class Session {
     let stopped = false
     const render = (): void => {
       if (stopped) return
-      void cardkit.streamText(
-        cardId,
-        cards.ELEMENTS.footer,
-        renderContent(timedStatus(status, startedAt)),
-      )
+      void this.replaceFooterContent(cardId, renderContent(timedStatus(status, startedAt)))
     }
     const handle = setInterval(render, FOOTER_STATUS_TICK_MS)
     render()
@@ -480,7 +481,7 @@ export class Session {
     const elapsed = handle.timer.elapsedSec()
     const content = cards.statusCardContent(handle.title, `${finalStatus} (${elapsed}s)`)
     await cardkit.flush(handle.cardId)
-    await cardkit.streamText(handle.cardId, cards.ELEMENTS.footer, content)
+    await this.replaceFooterContent(handle.cardId, content)
     cardkit.cancelSummary(handle.cardId)
     await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({
       durationSec: elapsed,
@@ -691,7 +692,7 @@ export class Session {
     log(`session "${this.sessionName}": stop (${reason})`)
     const proc = this.proc
     this.proc = null
-    this.stopThinkingFooter(this.currentTurn)
+    this.stopFooterStatus(this.currentTurn)
     this.currentTurn = null
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
@@ -735,7 +736,7 @@ export class Session {
       await this.proc.kill()
       this.proc = null
     }
-    this.stopThinkingFooter(this.currentTurn)
+    this.stopFooterStatus(this.currentTurn)
     this.currentTurn = null
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
@@ -1408,7 +1409,7 @@ export class Session {
         // Must be set BEFORE sendInterrupt — the result can land next tick.
         this.userInterrupted = true
         this.interrupt()
-        // 主动封口,把 footer 改成 🛑 打断、停止 thinking timer、把 streaming_mode
+        // 主动封口,把 footer 改成 🛑 打断、停止 footer 状态计时、把 streaming_mode
         // 翻回 false,否则卡片会僵在运行中状态。SDK 的 post-interrupt
         // result 也会进 closeTurnCard,但 currentTurn 已被这里置空,那条
         // 路径会 early-return,不会重画 footer。
@@ -2029,7 +2030,7 @@ export class Session {
     p.on('exit', ({ code, signal, expected }: any) => {
       log(`session "${this.sessionName}": codex exited code=${code} signal=${signal} expected=${expected}`)
       this.proc = null
-      this.stopThinkingFooter(this.currentTurn)
+      this.stopFooterStatus(this.currentTurn)
       this.currentTurn = null
       this.pendingUserMessageCount = 0
       this.pendingMidTurnMsgs = []
@@ -2228,8 +2229,9 @@ export class Session {
       currentAssistantText: '',
       segmentTexts: new Map(),
       startedAt: Date.now(),
-      thinkingFooterHandle: null,
-      thinkingFooterStartedAt: 0,
+      footerStatusHandle: null,
+      footerStatusStartedAt: 0,
+      footerStatusLabel: null,
       rotating: null,
       rotateCount: 0,
       rotateGivenUp: false,
@@ -2341,7 +2343,7 @@ export class Session {
         // 同步 swap：从这一行起,后续 stream handler 看到的 turn.cardId
         // 是新卡。reset 所有 element-id 引用 (toolCount / assistantSegmentCount
         // 等),旧卡上的 element_id 在新卡里查不到,继续 PUT 会 300313。
-        this.stopThinkingFooter(turn)
+        this.stopFooterStatus(turn)
         turn.cardId = newCardId
         turn.messageId = newMessageId
         turn.toolCount = 0
@@ -2359,47 +2361,53 @@ export class Session {
         turn.currentAssistantSegmentId = null
         turn.currentAssistantText = ''
         turn.segmentTexts = new Map()
-        if (carryText) cardkit.streamTextThrottled(turn.cardId, cards.ELEMENTS.footer, this.withModel(FOOTER_WORKING))
+        if (carryText) this.startWritingFooter(turn)
         else this.startThinkingFooter(turn)
+        // 已完成但在旧卡插入失败的 assistant 段也要搬到新卡。正文现在是
+        // block 完成后一次性 addElement；如果这个 addElement 撞上元素上限,
+        // cardkit 会把旧元素标 dead 并触发轮转,这里负责补显示。
+        for (const [segId, fullText] of oldSegmentTexts) {
+          if (carrySegId && carryText && segId === carrySegId) continue
+          if (!cardkit.isDeadElement(oldCardId, segId)) continue
+          const ri = turn.assistantSegmentCount++
+          const reSegId = cards.ELEMENTS.assistant(ri)
+          turn.segmentTexts.set(reSegId, fullText)
+          void cardkit.addElement(newCardId, this.completedAssistantElement(reSegId, fullText), {
+            type: 'insert_before',
+            targetElementId: cards.ELEMENTS.footer,
+          })
+        }
         // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read 切开重建。
         sessionTools.rebuildToolsOnRotate(this, oldCardId, newCardId, oldToolByUseId, oldBatches)
-        // 当前 assistant 段还没收尾就换卡时,整段迁到新卡继续写。不要把半段
-        // 留旧卡、半段接新卡；旧卡收尾时会删除原流式元素。
+        // 当前 assistant 段还没收尾就换卡时,整段只迁移内存缓冲到新卡继续收。
+        // 正文要等 block_stop / turn close 后一次性插入,不在新旧卡上打字。
         if (carrySegId && carryText) {
           const ri = turn.assistantSegmentCount++
           const reSegId = cards.ELEMENTS.assistant(ri)
           turn.currentAssistantSegmentId = reSegId
           turn.currentAssistantText = carryText
           turn.segmentTexts.set(reSegId, carryText)
-          void cardkit.addElement(newCardId, cards.assistantSegmentElement(ri), {
-            type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
-          })
-          cardkit.streamTextThrottled(newCardId, reSegId, this.cleanAssistantTextForDisplay(carryText))
         }
         // 旧卡收尾:footer 红字 + streaming_off + dispose。放到 swap 后
-        // 是因为这条链是 async,期间 cardkit 队列上还可能有 stream
-        // handler enqueue 的 streamText / replaceElement 等;让它们排
-        // 在 footer 之前先 flush,视觉更连贯。
+        // 是因为这条链是 async,期间 cardkit 队列上还可能有 add/replace 等;
+        // 让它们排在 footer 之前,视觉更连贯。
         try {
           await cardkit.flush(oldCardId)
-          // 旧卡上已完成的 assistant 段做最终替换。当前迁移中的半段要从
-          // 旧卡删除,避免同一段同时出现在两张卡上；已静态化并删除的流式
-          // 元素会被 cardkit 的 deadElements 跳过。
+          // 旧卡上已完成的 assistant 段做最终替换。当前迁移中的半段尚未
+          // 插入旧卡,直接跳过,避免同一段同时出现在两张卡上。
           for (const [segId, fullText] of oldSegmentTexts) {
             if (carrySegId && carryText && segId === carrySegId) continue
+            if (cardkit.isDeadElement(oldCardId, segId)) continue
             await cardkit.replaceElement(oldCardId, segId, {
               tag: 'markdown',
               element_id: segId,
               content: this.cleanAssistantTextForDisplay(fullText).trim() || ' ',
             })
           }
-          if (carrySegId && carryText) {
-            await cardkit.deleteElement(oldCardId, carrySegId)
-          }
           const compactNote = turn.contextCompactCount > 0
             ? ` · 🚨 压缩×${turn.contextCompactCount}`
             : ''
-          await cardkit.streamText(oldCardId, cards.ELEMENTS.footer, this.withModel(`📨 已续至下一张卡 ↓${compactNote}`))
+          await this.replaceFooterContent(oldCardId, this.withModel(`📨 已续至下一张卡 ↓${compactNote}`))
           cardkit.cancelSummary(oldCardId)
           await cardkit.patchSettings(oldCardId, cards.streamingOffSettings({ suffix: '📨 转下一张' }))
           await cardkit.dispose(oldCardId)
@@ -2472,7 +2480,7 @@ export class Session {
       void feishu.sendTextRaw(this.chatId, '🚨🚨🚨 CONTEXT COMPACTED / 上下文已压缩 🚨🚨🚨\n\nCodex 报告发生了上下文压缩,但当前没有可写的对话卡片。')
       return
     }
-    this.stopThinkingFooter(turn)
+    this.startWorkingFooter(turn)
     if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
     turn.openReadBatchI = null
     this.maybeMidTurnRotate()
@@ -2516,7 +2524,7 @@ export class Session {
       log(`session "${this.sessionName}": turn/plan/updated with no current turn`)
       return
     }
-    this.stopThinkingFooter(turn)
+    this.startWorkingFooter(turn)
     if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
     turn.openReadBatchI = null
     if (!Array.isArray(update.plan)) {
@@ -2571,7 +2579,7 @@ export class Session {
     }
     const turn = this.currentTurn
     if (turn) {
-      this.stopThinkingFooter(turn)
+      this.startWorkingFooter(turn)
       if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
       turn.openReadBatchI = null
     }
@@ -2583,7 +2591,7 @@ export class Session {
     this.currentGoal = null
     const turn = this.currentTurn
     if (!turn) return
-    this.stopThinkingFooter(turn)
+    this.startWorkingFooter(turn)
     if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
     turn.openReadBatchI = null
     this.addGoalClearedOnCurrentTurn()
@@ -2592,9 +2600,9 @@ export class Session {
   private appendAssistant(delta: string): void {
     if (!this.currentTurn) return
     const turn = this.currentTurn
-    // 第一条 assistant text_delta 到达 → footer 从 Thinking timer 切到
-    // Working。后续 delta 跑时 thinking footer handle 已 null,stopThinkingFooter 短路。
-    this.stopThinkingFooter(turn)
+    // 第一条 assistant text_delta 到达 → footer 切到 Writing 计时。
+    // 正文自身只进入内存缓冲,等 agentMessage completed 后一次性插入卡片。
+    this.startWritingFooter(turn)
     if (!turn.currentAssistantSegmentId) {
       // New assistant segment opens a visual break — any prior Read run
       // is now visually separated from future Reads, so close the batch
@@ -2602,41 +2610,23 @@ export class Session {
       turn.openReadBatchI = null
       // Pre-empt the "element exceeds the limit" 300305/300315 cliff —
       // if the card's element count is approaching Feishu's cap, fire-and-
-      // forget kick off a mid-turn rotation onto a fresh card. The
-      // *current* addElement still goes to turn.cardId (the old card)
-      // and either fits within the headroom or fails silently; the
-      // rotation handler resets turn state once the new card is up so
-      // subsequent stream handlers see the new cardId.
+      // forget kick off a mid-turn rotation onto a fresh card before this
+      // buffered segment is eventually inserted. The rotation handler resets
+      // turn state once the new card is up so subsequent stream handlers see
+      // the new cardId.
       this.maybeMidTurnRotate()
       const i = turn.assistantSegmentCount++
       const segId = cards.ELEMENTS.assistant(i)
       turn.currentAssistantSegmentId = segId
       turn.currentAssistantText = ''
-      void cardkit.addElement(turn.cardId, cards.assistantSegmentElement(i), {
-        type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
-      }, () => {
-        // 切新卡由 card-level onFailure(recordCardCreated 注册)统一触发。
-        // 正在切卡(rotating)时绝不 reset:swap 会读当前 currentAssistantText
-        // carry 到新卡,期间到达的 delta 要继续 append 到本段、一个不丢 —— reset
-        // 会把它们截断。只有"没在切卡"(熔断后不再切的兜底)才 reset 段游标,
-        // 让下个 delta 重建段,免得后续 streamText 全 PUT 到死 element。
-        if (turn.rotating) return
-        if (turn.currentAssistantSegmentId === segId) {
-          log(`session "${this.sessionName}": assistant segment ${segId} addElement failed — will retry on next delta`)
-          turn.currentAssistantSegmentId = null
-          turn.currentAssistantText = ''
-          turn.segmentTexts.delete(segId)
-        }
-      })
     }
     turn.currentAssistantText += delta
     const segId = turn.currentAssistantSegmentId
-    if (!segId) return  // addElement 已失败 reset,等下一次 delta 重建
+    if (!segId) return
     turn.segmentTexts.set(segId, turn.currentAssistantText)
     this.processOutboundMarkers(turn.currentAssistantText)
     this.processHostAskMarkers(turn.currentAssistantText, turn)
     const displayText = this.cleanAssistantTextForDisplay(turn.currentAssistantText)
-    cardkit.streamTextThrottled(turn.cardId, segId, displayText)
     // Chat-list preview: tail of the latest assistant text. Feishu
     // truncates anyway; ~60 chars is what shows on a typical phone
     // preview line. patchSummaryThrottled is rate-limited on its own.
@@ -2644,10 +2634,24 @@ export class Session {
     cardkit.patchSummaryThrottled(turn.cardId, tail)
   }
 
-  /** 收尾当前 assistant 段:把流式 markdown 元素静态化成完整 markdown,
-   * 然后清空段游标。这里不再 mid-turn 关开全卡 streaming_mode,避免
-   * 客户端 typewriter 状态在 settings toggle 后回退或闪烁；也不再只做
-   * /content 完整帧,因为后续工具/新段可能在客户端打字机追上前冻结该段。 */
+  private completedAssistantElement(segId: string, text: string): object {
+    return {
+      tag: 'markdown',
+      element_id: segId,
+      content: this.cleanAssistantTextForDisplay(text).trim() || ' ',
+    }
+  }
+
+  private addCompletedAssistantSegment(turn: TurnState, segId: string, text: string): Promise<void> {
+    return cardkit.addElement(
+      turn.cardId,
+      this.completedAssistantElement(segId, text),
+      { type: 'insert_before', targetElementId: cards.ELEMENTS.footer },
+    )
+  }
+
+  /** 收尾当前 assistant 段:正文不再逐字流式输出,只在完整段收到后
+   * 一次性插入静态 markdown,然后清空段游标。 */
   finalizeCurrentAssistantSegment(): void {
     const turn = this.currentTurn
     if (!turn) return
@@ -2659,13 +2663,8 @@ export class Session {
     const segId = turn.currentAssistantSegmentId
     const text = turn.currentAssistantText ?? ''
     if (segId && text.trim()) {
-      void cardkit.staticizeMarkdownElement(
-        turn.cardId,
-        segId,
-        staticAssistantElementId(segId),
-        this.cleanAssistantTextForDisplay(text),
-        cards.ELEMENTS.footer,
-      )
+      void this.addCompletedAssistantSegment(turn, segId, text)
+      this.startWorkingFooter(turn)
     }
     turn.currentAssistantSegmentId = null
     turn.currentAssistantText = ''
@@ -2706,33 +2705,41 @@ export class Session {
     void feishu.uploadAndSend(this.chatId, p)
   }
 
-  /** Start the footer thinking indicator. It lives in the stable footer
-   * element instead of a throwaway top element; deleting that first live
-   * element can make Feishu's typewriter drop the first assistant segment. */
-  startThinkingFooter(turn: TurnState): void {
-    if (turn.thinkingFooterHandle) return
-    turn.thinkingFooterStartedAt = Date.now()
+  /** Start or switch the turn footer phase. It lives in the stable footer
+   * element and uses replaceElement so status updates appear immediately
+   * instead of invoking Feishu's typewriter. */
+  private startFooterStatus(turn: TurnState, status: string): void {
+    if (turn.footerStatusHandle && turn.footerStatusLabel === status) return
+    this.stopFooterStatus(turn)
+    turn.footerStatusLabel = status
+    turn.footerStatusStartedAt = Date.now()
     const render = (): void => {
-      if (turn.thinkingFooterHandle == null) return
-      const elapsedS = Math.max(1, Math.floor((Date.now() - turn.thinkingFooterStartedAt) / 1000))
-      void cardkit.streamText(
-        turn.cardId,
-        cards.ELEMENTS.footer,
-        this.withModel(`${FOOTER_THINKING_PREFIX}(${elapsedS}s)`),
-      )
+      if (turn.footerStatusHandle == null || !turn.footerStatusLabel) return
+      const elapsedS = Math.max(0, Math.floor((Date.now() - turn.footerStatusStartedAt) / 1000))
+      void this.replaceFooterContent(turn.cardId, this.withModel(`${turn.footerStatusLabel}(${elapsedS}s)`))
     }
-    turn.thinkingFooterHandle = setInterval(render, FOOTER_STATUS_TICK_MS)
+    turn.footerStatusHandle = setInterval(render, FOOTER_STATUS_TICK_MS)
     render()
   }
 
-  /** Stop the thinking timer and leave the stable footer in working state.
-   * There is deliberately no deleteElement here. */
-  stopThinkingFooter(turn: TurnState | null): void {
-    if (!turn || !turn.thinkingFooterHandle) return
-    clearInterval(turn.thinkingFooterHandle)
-    turn.thinkingFooterHandle = null
-    turn.thinkingFooterStartedAt = 0
-    void cardkit.streamTextThrottled(turn.cardId, cards.ELEMENTS.footer, this.withModel(FOOTER_WORKING))
+  startThinkingFooter(turn: TurnState): void {
+    this.startFooterStatus(turn, FOOTER_THINKING_PREFIX)
+  }
+
+  startWritingFooter(turn: TurnState): void {
+    this.startFooterStatus(turn, FOOTER_WRITING)
+  }
+
+  startWorkingFooter(turn: TurnState): void {
+    this.startFooterStatus(turn, FOOTER_WORKING)
+  }
+
+  stopFooterStatus(turn: TurnState | null): void {
+    if (!turn) return
+    if (turn.footerStatusHandle) clearInterval(turn.footerStatusHandle)
+    turn.footerStatusHandle = null
+    turn.footerStatusStartedAt = 0
+    turn.footerStatusLabel = null
   }
 
   private async closeTurnCard(
@@ -2748,36 +2755,28 @@ export class Session {
     const turn = this.currentTurn
     if (!turn) return
     this.currentTurn = null
-    this.stopThinkingFooter(turn)
+    this.stopFooterStatus(turn)
     const elapsed = ((Date.now() - turn.startedAt) / 1000).toFixed(1)
     const cardId = turn.cardId
     const segmentTexts = turn.segmentTexts
     await cardkit.flush(cardId)
 
-    // [[send: /abs/path]] markers are handled mid-stream by
+    // [[send: /abs/path]] markers are handled while deltas are received by
     // processOutboundMarkers(). closeTurnCard only finalizes text display.
-    // 对**每个** assistant 段 replaceElement 成最终内容:这里 replaceElement
-    // 的职责是把流式元素固化成静态 markdown。
-    // "把没播完的打字机尾巴补全上屏"靠的是紧接其后的 streaming_mode=false
-    // 全局收尾 —— 对仍在流式状态里的段,实测它会把每个流式文本组件的未上屏
-    // 部分一次性 commit 到 replaceElement 设定的最终内容。中途 block_stop
-    // 已经把多数段静态化,这里主要兜最后一段和异常时没静态化成功的段。
-    for (const [segId, fullText] of segmentTexts) {
-      // 收尾定稿:把流式最后一帧补成完整段。**保留 [[send:]] 标记原文显示**
-      // (用户要求 2026-05-23:标签留着,让用户看到发了哪个文件)。replaceElement
-      // 自身不触发流式 commit,真正全显靠紧随其后的 streaming_mode=false 全局收尾。
-      await cardkit.replaceElement(cardId, segId, {
-        tag: 'markdown',
-        element_id: segId,
-        content: this.cleanAssistantTextForDisplay(fullText).trim() || ' ',
-      })
+    // 如果最后一个 assistant 段没有等到 block_stop,这里先把内存缓冲的完整
+    // 文本作为静态 markdown 插入卡片。
+    if (turn.currentAssistantSegmentId && turn.currentAssistantText.trim()) {
+      await this.addCompletedAssistantSegment(turn, turn.currentAssistantSegmentId, turn.currentAssistantText)
+      turn.currentAssistantSegmentId = null
+      turn.currentAssistantText = ''
     }
 
-    // thinking 区不再 collapse 成 panel —— replaceElement 会把 typewriter
-    // 中段的内容整段换掉,飞书侧用户视觉上"中段消失"。partial 模式下
-    // thinkingText 已经在 turn 期间真 streaming 进飞书,turn 结束保留
-    // markdown 形态完整可见即可。代价是卡片会长一些,但比 typewriter
-    // 被截好得多。
+    // 对每个 assistant 段 replaceElement 成最终内容。正文已经是静态 markdown,
+    // 这里只是收尾清洗 askusr 标记和兜住异常路径。
+    for (const [segId, fullText] of segmentTexts) {
+      await cardkit.replaceElement(cardId, segId, this.completedAssistantElement(segId, fullText))
+    }
+
     // State marker leads the footer (✅ for natural completion, or the
     // suffix verbatim for non-natural states like `🛑 打断`). The
     // trailing "done" word is gone — the ✅ already carries that
@@ -2804,11 +2803,11 @@ export class Session {
       ? cards.footerTokenDetailLine(this.lastTurnUsage)
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
-    await cardkit.streamText(cardId, cards.ELEMENTS.footer, footer)
+    await this.replaceFooterContent(cardId, footer)
     // Final chat-list preview: clean finish shows "⏱ Xs · NK tokens";
     // interrupted shows the suffix instead (no usage event landed).
     // cancelSummary kills any in-flight throttled write so a stale
-    // mid-stream tail can't clobber this terminal summary.
+    // in-flight summary update can't clobber this terminal summary.
     cardkit.cancelSummary(cardId)
     await cardkit.patchSettings(cardId, cards.streamingOffSettings({
       durationSec: elapsed,
