@@ -41,7 +41,12 @@ import * as feishu from './feishu'
 import { log } from './log'
 import { readSysInfo } from './sysinfo'
 import { readUsage, updateUsageFromRateLimits, type UsageSnapshot } from './usage'
-import { contextLimitFromAppServer, contextTokensFromUsage } from './context-window'
+import {
+  contextLimitFromAppServer,
+  contextTokenRatioLabel,
+  contextTokensFromUsage,
+  rawContextPercentLabel,
+} from './context-window'
 import { extractAskUsrMarkers, extractSendMarkerPaths, stripAskUsrMarkers } from './outbound-markers'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionTools from './session-tools'
@@ -1092,11 +1097,10 @@ export class Session {
 
   private compactContextWindowLabel(snapshot: ContextUsageSnapshot | null): string {
     if (!snapshot) return ' · 🧠 MISS'
-    const pct = cards.footerContextPercentLabel(
-      contextTokensFromUsage(snapshot.usage),
-      contextLimitFromAppServer(snapshot.contextWindow),
-    )
-    return ` · 🧠 ${pct ?? 'MISS'}`
+    const tokens = contextTokensFromUsage(snapshot.usage)
+    if (tokens == null) return ' · 🧠 MISS'
+    const limit = contextLimitFromAppServer(snapshot.contextWindow)
+    return ` · 🧠 ${rawContextPercentLabel(tokens, limit)} (${contextTokenRatioLabel(tokens, limit)})`
   }
 
   private async runCompactCommand(): Promise<void> {

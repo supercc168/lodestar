@@ -182,8 +182,8 @@ describe('Session compact command', () => {
         this.compactCalls++
         queueMicrotask(() => {
           this.emit('token_usage', {
-            usage: { total_tokens: 35_211 },
-            totalUsage: { total_tokens: 35_211 },
+            usage: { total_tokens: 5_361 },
+            totalUsage: { total_tokens: 5_361 },
             contextWindow: 258_000,
             threadId: this.sessionId,
             turnId: this.turnId,
@@ -216,7 +216,7 @@ describe('Session compact command', () => {
       .filter(call => call.method === 'PUT' && call.path.endsWith('/elements/footer'))
       .map(call => JSON.parse(call.body.element).content as string)
     expect(footerWrites.some(content =>
-      content.includes('✅ 上下文已压缩') && content.includes('🧠 9%')
+      content.includes('✅ 上下文已压缩') && content.includes('🧠 2% (5.4K/258K)')
     )).toBe(true)
   })
 })

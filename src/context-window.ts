@@ -53,3 +53,10 @@ export function contextTokenRatioLabel(tokens: number, limit: number | null | un
   const tokenText = formatContextTokens(tokens)
   return limit != null && limit > 0 ? `${tokenText}/${formatContextTokens(limit)}` : `${tokenText}/--`
 }
+
+export function rawContextPercentLabel(tokens: number, limit: number | null | undefined): string {
+  if (limit == null || limit <= 0) return '--'
+  const percent = Math.max(0, (tokens / limit) * 100)
+  if (percent > 0 && percent < 1) return '<1%'
+  return `${Math.round(Math.min(100, percent))}%`
+}
