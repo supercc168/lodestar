@@ -4,6 +4,7 @@
       "files": [
         ".gitignore",
         "AGENTS.md",
+        "CHANGELOG.md",
         "LICENSE",
         "README.md",
         "bun.lock",
@@ -33,6 +34,8 @@
     "src": {
       "files": [
         "AGENTS.md",
+        "agy-task.test.ts",
+        "agy-task.ts",
         "card-action.test.ts",
         "card-action.ts",
         "cardkit.test.ts",
@@ -53,15 +56,18 @@
         "paths.ts",
         "pid-guard.ts",
         "session-ask.ts",
+        "session-host-ask.ts",
         "session-permission.ts",
         "session-tools.ts",
         "session-types.ts",
+        "session.test.ts",
         "session.ts",
         "setup-cli.ts",
         "setup.ts",
         "stop-cli.ts",
         "sysinfo.ts",
         "update-cli.ts",
+        "usage.test.ts",
         "usage.ts",
         "version-cli.ts",
         "worktree.test.ts",
@@ -74,6 +80,8 @@
     "src/cards": {
       "files": [
         "AGENTS.md",
+        "agy.test.ts",
+        "agy.ts",
         "console.ts",
         "elements.ts",
         "turn.test.ts",
@@ -84,6 +92,6 @@
       "subdirs": []
     }
   },
-  "generatedAt": "2026-06-04T05:25:52.839345+00:00",
+  "generatedAt": "2026-06-12T11:05:47.393459+00:00",
   "version": 1
 }

@@ -1,9 +1,9 @@
-<!-- Generated: 2026-05-15 | Updated: 2026-06-04 -->
+<!-- Generated: 2026-05-15 | Updated: 2026-06-12 -->
 
 # Lodestar 2.0
 
 ## Purpose
-本仓库实现一个 Bun daemon，把飞书群消息桥接到无头 `codex app-server` 进程。运行时关系是一个飞书群对应一个 Lodestar session、一个 Codex thread，以及每轮对话中的一张流式 Feishu Card Kit 卡片；项目主群还可用 `model` 管理模型/effort，用 `wt` 自动创建/加入同级 Git worktree 群。
+本仓库实现一个 Bun daemon，把飞书群消息桥接到无头 `codex app-server` 进程。运行时关系是一个飞书群对应一个 Lodestar session、一个 Codex thread，以及每轮对话中的一张流式 Feishu Card Kit 卡片；项目主群还可用 `model` 管理模型/effort，用 `wt` 自动创建/加入同级 Git worktree 群，并可用 `agy <prompt>` 启动一次性外部 agy 任务。
 
 ## Key Files
 | File | Description |
@@ -12,6 +12,7 @@
 | `cli.ts` | npm 分发入口；在缺少 `config.toml` 时触发安装向导，否则延迟导入 `daemon.ts`。 |
 | `package.json` | Bun/Node 打包脚本、发布元数据、二进制入口和依赖声明。 |
 | `README.md` | 用户安装、首次配置、群控裸词、`model` 选择、`wt` worktree 群和 HTTP 通知端点说明。 |
+| `CHANGELOG.md` | 中文发布记录；release notes 需保持同一风格，优先描述用户可感知变化。 |
 | `bun.lock` | Bun 依赖锁文件；更新依赖后同步提交。 |
 | `LICENSE` | MIT 许可证。 |
 | `promo.jpg` | README 顶部展示图。 |
@@ -33,9 +34,10 @@
 - 不要主动重启正在运行的 daemon，除非用户在**当前用户消息**里明确要求 `restart` / `重启` / reload。代码变更后只报告需要重启。
 - 停止、重启、替换、shadow、切换或并行接管正在运行的 daemon / user service 的授权**只在当前 assistant 回合内一次性有效**，不得跨用户消息、跨中断恢复、跨上下文压缩或跨任务范围沿用；一旦用户发来新的消息，即使上一条消息要求过“重启”，后续也必须重新明确授权后才能再次操作 live service。
 - **禁止**为了“测试”“预览”“发一张看看”“先验证一下”这类目的而停止、重启、替换、shadow、切换或并行接管正在运行的 daemon / user service。只有用户在当前用户消息中**明确点名**要执行对应操作（例如 `systemctl --user restart feishu-daemon.service`、停止当前 daemon、切换到某个 worktree daemon）时才可动手；任何泛化的“测一下”“发测试卡”都**不构成授权**。
-- 群内裸词控制是 `hi`、`stop`/`st`、`kill`/`kl`、`restart`/`rs`、`clear`/`cl`、`compact`/`cm`、`model`/`md`、`wt`/`worktree` 和 `wt <name>`/`worktree <name>`；这些词在 `Session.runCommand` 中作为保留字处理。
+- 群内裸词控制是 `hi`、`stop`/`st`、`kill`/`kl`、`restart`/`rs`、`clear`/`cl`、`compact`/`cm`、`model`/`md`、`wt`/`worktree` 和 `wt <name>`/`worktree <name>`；`agy <prompt>` 启动外部一次性 agy 任务。这些词在 `Session.runCommand` 中作为保留字处理。
 - `model` 通过 Card Kit 按钮先选 Codex 模型、再选 reasoning effort，并把选择按 session 持久化到 XDG data。
 - `wt <name>` 约定创建同级目录 `<project>[<name>]` 和本地分支 `work/<name>`，并自动创建/加入同名飞书群；解散按钮会先拒绝仍在运行的对应 session，只在 worktree 干净时删除目录和解散群，保留分支；重新激活已合并归档分支时会更新到主线。
+- `agy <prompt>` 在当前 session 工作目录内独占运行 `agy --print`，用独立 Card Kit 卡片展示 prompt、状态、输出、仓库变更和“转 Codex”按钮；不要把它混入普通 Codex turn 卡片。
 - 本地脚本可通过 `POST http://127.0.0.1:9876/notify` 发送 `{project, text, level}` 到绑定群。
 
 ### Testing Requirements
@@ -48,13 +50,14 @@
 - 根入口保持很薄：`cli.ts` 处理首次配置和 PID guard，`daemon.ts` 负责 WS/event loop，核心业务下沉到 `src/`。
 - `Session` 是一个群的状态机；跨群状态只通过 session registry、持久 map、Feishu chat 绑定、模型选择 map 和 `work/*` 分支约定协调。
 - `cardkit` 负责每张卡的 sequence、队列、限流和写失败检测；session 负责什么时候开卡、换卡、关闭卡。
+- `agy` 任务由 session 管理生命周期，`src/agy-task.ts` 负责 CLI/Git 快照，`src/cards/agy.ts` 负责卡片结构和输出清理，Card action 再把结果转发给 Codex。
 - 所有 shell 命令卡片展示依赖第一行 `# desc:` 风格说明，修改相关展示逻辑时同步看 `src/cards/turn.ts`。
 
 ## Dependencies
 
 ### Internal
 - `daemon.ts` 依赖 `src/session.ts`、`src/feishu.ts`、`src/config.ts`、`src/paths.ts` 和 `src/notify.ts` 完成启动和事件路由。
-- `src/cards.ts` 是卡片模板 barrel，`src/session.ts` 和 `src/session-*` 辅助模块都通过它访问 Card Kit schema。
+- `src/cards.ts` 是卡片模板 barrel，`src/session.ts`、`src/session-*` 辅助模块和 agy 卡片流程都通过它访问 Card Kit schema。
 - `scripts/` 直接导入 `src/` 模块执行真实环境测试，运行前需要有效 `config.toml`。
 
 ### External
