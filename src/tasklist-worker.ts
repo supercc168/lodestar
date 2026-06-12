@@ -301,7 +301,7 @@ async function processCompletedReviewTask(
   reviewTasks: feishu.TaskSummary[],
 ): Promise<boolean> {
   for (const task of reviewTasks) {
-    if (!task.completedAt) continue
+    if (!isManualMergeSignal(task)) continue
     const state = getTaskState(projectName, task.guid)
     if (state.codexMerge?.status === 'running') return true
     if (state.codexMerge?.status === 'exited') continue
@@ -332,6 +332,10 @@ async function processCompletedReviewTask(
     return true
   }
   return false
+}
+
+export function isManualMergeSignal(task: feishu.TaskSummary): boolean {
+  return typeof task.completedAt === 'string' && task.completedAt.trim().length > 0
 }
 
 async function runCodexPlan(

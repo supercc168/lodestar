@@ -3,6 +3,7 @@ import { describe, expect, test } from 'bun:test'
 import type { TaskComment, TasklistSection, TaskSummary } from './feishu'
 import {
   customSectionsForDesignSubtraction,
+  isManualMergeSignal,
   localReviewRef,
   reviewDiffSpec,
   reviewHeadRef,
@@ -47,6 +48,12 @@ describe('tasklist worker buckets', () => {
 })
 
 describe('tasklist worker local reviews', () => {
+  test('uses task checkbox completion as the merge signal', () => {
+    expect(isManualMergeSignal(task('open'))).toBe(false)
+    expect(isManualMergeSignal({ ...task('blank'), completedAt: '   ' })).toBe(false)
+    expect(isManualMergeSignal({ ...task('done'), completedAt: '2026-06-13T10:30:00Z' })).toBe(true)
+  })
+
   test('formats local review refs as base-to-head diffs', () => {
     expect(localReviewRef('abc123', 'AI-AUTO/task-guid')).toBe('local:abc123..AI-AUTO/task-guid')
   })
