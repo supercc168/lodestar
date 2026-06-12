@@ -66,6 +66,9 @@
         "setup.ts",
         "stop-cli.ts",
         "sysinfo.ts",
+        "tasklist-worker.test.ts",
+        "tasklist-worker.ts",
+        "tasklist.ts",
         "update-cli.ts",
         "usage.test.ts",
         "usage.ts",
@@ -84,6 +87,8 @@
         "agy.ts",
         "console.ts",
         "elements.ts",
+        "task.test.ts",
+        "task.ts",
         "turn.test.ts",
         "turn.ts",
         "worktree.test.ts",
@@ -92,6 +97,6 @@
       "subdirs": []
     }
   },
-  "generatedAt": "2026-06-12T11:05:47.393459+00:00",
+  "generatedAt": "2026-06-12T16:58:28.782098+00:00",
   "version": 1
 }
