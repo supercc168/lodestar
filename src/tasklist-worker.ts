@@ -87,10 +87,7 @@ type TaskBuckets = Record<TasklistSectionKey, feishu.TaskSummary[]>
 async function scanTaskSections(binding: TasklistBinding): Promise<TaskBuckets> {
   const sections = binding.sections ?? {}
   const allOpenTasks = await feishu.listTasklistTasks(binding.guid, false)
-  const designSectionName = tasklist.sectionNameForKey('design')
-  const remoteSections = (await feishu.listTasklistSections(binding.guid))
-    .filter(section => !section.isDefault)
-    .filter(section => section.name !== designSectionName)
+  const remoteSections = customSectionsForDesignSubtraction(await feishu.listTasklistSections(binding.guid))
   const openTasksByCustomSection = await Promise.all(
     remoteSections.map(section => feishu.listSectionTasks(section.guid, false)),
   )
@@ -101,6 +98,15 @@ async function scanTaskSections(binding: TasklistBinding): Promise<TaskBuckets> 
     aiReview: sections.aiReview ? await feishu.listSectionTasks(sections.aiReview) : [],
     done: sections.done ? await feishu.listSectionTasks(sections.done) : [],
   }
+}
+
+export function customSectionsForDesignSubtraction(
+  sections: feishu.TasklistSection[],
+): feishu.TasklistSection[] {
+  const designSectionName = tasklist.sectionNameForKey('design')
+  return sections
+    .filter(section => !section.isDefault)
+    .filter(section => section.name !== designSectionName)
 }
 
 export function tasksOutsideCustomSections(
@@ -278,7 +284,6 @@ async function runCodexPlan(
       '-m', CODEX_MODEL,
       '-c', `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
       '-s', 'read-only',
-      '-a', 'never',
       '-C', projectDir,
       prompt,
     ],
@@ -396,7 +401,6 @@ async function runCodexExecution(
       'exec',
       '-m', CODEX_MODEL,
       '-c', `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
-      '-a', 'never',
       '--dangerously-bypass-approvals-and-sandbox',
       '-C', worktreePath,
       prompt,
@@ -419,8 +423,10 @@ async function runCodexExecution(
     const commitMsg = commitTitle(task?.summary || taskGuid)
     git(worktreePath, ['add', '-A'])
     git(worktreePath, ['commit', '-m', commitMsg])
-    git(worktreePath, ['push', '--force-with-lease', 'origin', `${AI_AUTO_BRANCH}:${AI_AUTO_BRANCH}`])
+    const remote = resolveGitHubRemote(projectDir)
+    git(worktreePath, ['push', '--force-with-lease', remote.name, `${AI_AUTO_BRANCH}:${AI_AUTO_BRANCH}`])
     const pr = await createGitHubPullRequest(projectDir, {
+      remote,
       head: AI_AUTO_BRANCH,
       title: commitMsg,
       body: [
@@ -513,7 +519,6 @@ async function runCodexMerge(
       'exec',
       '-m', CODEX_MODEL,
       '-c', `model_reasoning_effort="${CODEX_REASONING_EFFORT}"`,
-      '-a', 'never',
       '--dangerously-bypass-approvals-and-sandbox',
       '-C', projectDir,
       prompt,
@@ -725,17 +730,16 @@ function git(cwd: string, args: string[]): string {
 }
 
 async function createGitHubPullRequest(projectDir: string, opts: {
+  remote?: GitHubRemote
   head: string
   title: string
   body: string
 }): Promise<{ url: string; number: number }> {
-  const remote = git(projectDir, ['config', '--get', 'remote.origin.url']).trim()
-  const repo = parseGitHubRemote(remote)
-  if (!repo) throw new Error(`remote.origin.url is not a GitHub repo: ${remote}`)
+  const repo = opts.remote ?? resolveGitHubRemote(projectDir)
   const base = git(projectDir, ['branch', '--show-current']).trim()
   if (!base) throw new Error('cannot determine base branch from project directory')
   const token = readGitHubToken()
-  const res = await fetch(`https://api.github.com/repos/${repo.owner}/${repo.repo}/pulls`, {
+  const res = await fetch(`https://api.github.com/repos/${repo.repo.owner}/${repo.repo.repo}/pulls`, {
     method: 'POST',
     headers: {
       Authorization: `Bearer ${token}`,
@@ -754,6 +758,33 @@ async function createGitHubPullRequest(projectDir: string, opts: {
   const json = JSON.parse(text)
   if (!json.html_url || typeof json.number !== 'number') throw new Error(`github PR create returned unexpected body: ${text}`)
   return { url: json.html_url, number: json.number }
+}
+
+interface GitHubRemote {
+  name: string
+  url: string
+  repo: { owner: string; repo: string }
+}
+
+function resolveGitHubRemote(projectDir: string): GitHubRemote {
+  const remotes = git(projectDir, ['remote']).split('\n').map(s => s.trim()).filter(Boolean)
+  const origin = remotes.includes('origin') ? remoteByName(projectDir, 'origin') : null
+  if (origin) return origin
+  for (const name of remotes) {
+    const remote = remoteByName(projectDir, name)
+    if (remote) return remote
+  }
+  throw new Error('no GitHub remote found')
+}
+
+function remoteByName(projectDir: string, name: string): GitHubRemote | null {
+  try {
+    const url = git(projectDir, ['config', '--get', `remote.${name}.url`]).trim()
+    const repo = parseGitHubRemote(url)
+    return repo ? { name, url, repo } : null
+  } catch {
+    return null
+  }
 }
 
 function parseGitHubRemote(remote: string): { owner: string; repo: string } | null {
