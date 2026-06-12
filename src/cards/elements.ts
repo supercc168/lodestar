@@ -42,5 +42,6 @@ export const ELEMENTS = {
   agyPrompt: 'agy_prompt',
   agyStats: 'agy_stats',
   agyResult: 'agy_result',
+  agyForward: 'agy_forward',
   agyRepo: 'agy_repo',
 } as const

@@ -14,9 +14,11 @@
  * only the session-*.ts helpers should touch it."
  */
 
+import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import {
   CODEX_EFFORT,
   CodexProcess,
@@ -200,8 +202,13 @@ interface AgyTaskState {
   beforeGit: GitSnapshot
   stdout: string
   stderr: string
+  stdoutDecoder: StringDecoder
+  stderrDecoder: StringDecoder
+  decodersEnded: boolean
   stdoutBytes: number
   stderrBytes: number
+  lastCpuPercent: number | null
+  lastMemBytes: number | null
   captureTruncated: boolean
   cardWriteFailed: boolean
   finished: boolean
@@ -214,6 +221,11 @@ interface AgyTaskState {
   forceKillTimer?: ReturnType<typeof setTimeout>
   done: Promise<void>
   resolveDone: () => void
+}
+
+interface AgyForwardRecord {
+  prompt: string
+  used: boolean
 }
 
 function timedStatus(status: string, startedAt: number): string {
@@ -387,6 +399,7 @@ export class Session {
   private manualContextCompactionPending = false
   private runningAgy: AgyTaskState | null = null
   private startingAgy = false
+  private agyForwardPrompts = new Map<string, AgyForwardRecord>()
 
   constructor(
     public readonly sessionName: string,
@@ -551,8 +564,31 @@ export class Session {
     return ((now - task.startedAt) / 1000).toFixed(1)
   }
 
+  private agyProcessUsage(task: AgyTaskState): { cpuPercent: number | null; memBytes: number | null } {
+    const pid = task.proc.pid
+    if (!pid || process.platform === 'win32') {
+      return { cpuPercent: task.lastCpuPercent, memBytes: task.lastMemBytes }
+    }
+    try {
+      const out = execFileSync('ps', ['-p', String(pid), '-o', '%cpu=,rss='], {
+        encoding: 'utf8',
+        timeout: 2000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim()
+      const [cpuRaw, rssRaw] = out.split(/\s+/)
+      const cpuPercent = Number.parseFloat(cpuRaw ?? '')
+      const rssKb = Number.parseInt(rssRaw ?? '', 10)
+      if (Number.isFinite(cpuPercent)) task.lastCpuPercent = cpuPercent
+      if (Number.isFinite(rssKb)) task.lastMemBytes = rssKb * 1024
+    } catch {
+      // Process may already have exited between close and the final card update.
+    }
+    return { cpuPercent: task.lastCpuPercent, memBytes: task.lastMemBytes }
+  }
+
   private agyStats(task: AgyTaskState, status: string, endedAt?: number, exit?: { code: number | null; signal: string | null }): cards.AgyStats {
     const stderr = this.agyFinalStderr(task)
+    const usage = this.agyProcessUsage(task)
     return {
       status,
       model: AGY_DEFAULT_MODEL,
@@ -560,6 +596,8 @@ export class Session {
       command: agyDisplayCommand(),
       startedAtMs: task.startedAt,
       elapsedSec: this.agyElapsedSec(task, endedAt ?? Date.now()),
+      cpuPercent: usage.cpuPercent,
+      memBytes: usage.memBytes,
       ...(endedAt ? { endedAtMs: endedAt } : {}),
       ...(exit ? { exitCode: exit.code, signal: exit.signal } : {}),
       stdoutBytes: task.stdoutBytes,
@@ -584,10 +622,26 @@ export class Session {
     return parts.filter(Boolean).join('\n')
   }
 
+  private finishAgyDecoders(task: AgyTaskState): void {
+    if (task.decodersEnded) return
+    task.decodersEnded = true
+    const stdoutTail = task.stdoutDecoder.end()
+    const stderrTail = task.stderrDecoder.end()
+    if (stdoutTail) this.appendAgyText(task, 'stdout', stdoutTail)
+    if (stderrTail) this.appendAgyText(task, 'stderr', stderrTail)
+  }
+
   private appendAgyOutput(task: AgyTaskState, stream: 'stdout' | 'stderr', chunk: Buffer): void {
-    const text = chunk.toString()
     if (stream === 'stdout') task.stdoutBytes += chunk.length
     else task.stderrBytes += chunk.length
+    const text = stream === 'stdout'
+      ? task.stdoutDecoder.write(chunk)
+      : task.stderrDecoder.write(chunk)
+    this.appendAgyText(task, stream, text)
+  }
+
+  private appendAgyText(task: AgyTaskState, stream: 'stdout' | 'stderr', text: string): void {
+    if (!text) return
     const prev = stream === 'stdout' ? task.stdout : task.stderr
     const room = AGY_CAPTURE_CHAR_LIMIT - prev.length
     if (room <= 0) {
@@ -598,6 +652,55 @@ export class Session {
     if (stream === 'stdout') task.stdout = next
     else task.stderr = next
     if (text.length > room) task.captureTruncated = true
+  }
+
+  private agyForwardPrompt(task: AgyTaskState, stderr: string, notice: string): string {
+    const stdout = cards.cleanAgyOutputText(task.stdout).trim()
+    const cleanedStderr = cards.cleanAgyOutputText(stderr).trim()
+    const cleanedNotice = cards.cleanAgyOutputText(notice).trim()
+    const parts = [
+      'agy 返回结果如下，请基于这份结果继续处理。',
+      '',
+      '原始 agy 任务:',
+      task.prompt.trim(),
+      '',
+      'agy 结果:',
+      stdout || '(无 stdout 输出)',
+    ]
+    if (cleanedNotice) parts.push('', 'agy 状态说明:', cleanedNotice)
+    if (cleanedStderr) parts.push('', 'agy stderr:', cleanedStderr)
+    if (task.captureTruncated) parts.push('', '注意: daemon 捕获的 agy 输出已截断。')
+    return parts.join('\n')
+  }
+
+  private rememberAgyForwardPrompt(task: AgyTaskState, stderr: string, notice: string): string {
+    const id = randomUUID()
+    this.agyForwardPrompts.set(id, { prompt: this.agyForwardPrompt(task, stderr, notice), used: false })
+    if (this.agyForwardPrompts.size > 20) {
+      const oldest = this.agyForwardPrompts.keys().next().value
+      if (oldest) this.agyForwardPrompts.delete(oldest)
+    }
+    return id
+  }
+
+  beginAgyForwardToCodex(resultIdRaw: string, userOpenId = ''): ModelActionResult {
+    const resultId = resultIdRaw.trim()
+    const record = this.agyForwardPrompts.get(resultId)
+    if (!record) return { ok: false, message: 'agy 结果已过期，请重新运行 agy' }
+    if (record.used) return { ok: false, message: 'agy 结果已转发，请勿重复点击' }
+    if (this.startingAgy || this.runningAgy) return { ok: false, message: 'agy 任务仍在执行，请稍后再转发' }
+    record.used = true
+    void (async () => {
+      try {
+        await this.onUserMessage(record.prompt, [], userOpenId)
+      } catch (e) {
+        record.used = false
+        const msg = `❌ agy 结果转发 Codex 失败: ${messageOf(e)}`
+        log(`session "${this.sessionName}": ${msg}`)
+        await feishu.sendTextRaw(this.chatId, msg)
+      }
+    })()
+    return { ok: true, message: '已转发 Codex' }
   }
 
   private async runAgyCommand(prompt: string): Promise<void> {
@@ -648,7 +751,7 @@ export class Session {
       }
 
       let taskRef: AgyTaskState | null = null
-      cardkit.recordCardCreated(cardId, 4, code => {
+      cardkit.recordCardCreated(cardId, 5, code => {
         if (taskRef?.cardWriteFailed) return
         if (taskRef) taskRef.cardWriteFailed = true
         const msg = `❌ agy 卡片更新失败${code ? ` code=${code}` : ''}，请查看 daemon 日志。`
@@ -670,8 +773,13 @@ export class Session {
         beforeGit,
         stdout: '',
         stderr: '',
+        stdoutDecoder: new StringDecoder('utf8'),
+        stderrDecoder: new StringDecoder('utf8'),
+        decodersEnded: false,
         stdoutBytes: 0,
         stderrBytes: 0,
+        lastCpuPercent: null,
+        lastMemBytes: null,
         captureTruncated: false,
         cardWriteFailed: false,
         finished: false,
@@ -731,6 +839,7 @@ export class Session {
   private async finishAgyTask(task: AgyTaskState, code: number | null, signal: string | null): Promise<void> {
     if (task.finished) return
     task.finished = true
+    this.finishAgyDecoders(task)
     clearInterval(task.timer)
     clearTimeout(task.hostTimeout)
     if (task.forceKillTimer) clearTimeout(task.forceKillTimer)
@@ -739,16 +848,24 @@ export class Session {
     try {
       const endedAt = Date.now()
       const afterGit = await captureGitSnapshot(this.workDir)
-      const ok = code === 0 && !signal && !task.spawnError && !task.hostTimedOut && !task.stopRequested
+      let stderr = this.agyFinalStderr(task)
+      let notice = ''
+      const cleanedStdout = cards.cleanAgyOutputText(task.stdout).trim()
+      const cleanedStderr = cards.cleanAgyOutputText(stderr).trim()
+      const emptyOutput = !cleanedStdout && !cleanedStderr
+      if (code === 0 && !signal && !task.spawnError && !task.hostTimedOut && !task.stopRequested && emptyOutput) {
+        notice = 'agy 进程退出码为 0，但没有返回 stdout/stderr。'
+      }
+      const ok = code === 0 && !signal && !task.spawnError && !task.hostTimedOut && !task.stopRequested && !emptyOutput
       status = task.stopRequested
         ? (task.stopStatus ?? '🛑 agy 已打断')
         : task.hostTimedOut
           ? '❌ agy 超时'
           : ok
             ? '✅ agy 完成'
-            : '❌ agy 失败'
-      const stderr = this.agyFinalStderr(task)
+            : '❌ agy 出错'
       const cardTruncated = task.stdout.length > AGY_RESULT_CARD_LIMIT || stderr.length > AGY_STDERR_CARD_LIMIT
+      const forwardResultId = this.rememberAgyForwardPrompt(task, stderr, notice)
 
       await cardkit.flush(task.cardId)
       await cardkit.replaceElement(
@@ -763,8 +880,14 @@ export class Session {
           status,
           stdout: task.stdout,
           stderr,
+          notice,
           cardTruncated,
         }),
+      )
+      await cardkit.replaceElement(
+        task.cardId,
+        cards.ELEMENTS.agyForward,
+        cards.agyForwardElement(forwardResultId),
       )
       await cardkit.replaceElement(
         task.cardId,

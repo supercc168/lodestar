@@ -15,6 +15,8 @@ export interface AgyStats {
   command: string
   startedAtMs: number
   elapsedSec: string
+  cpuPercent?: number | null
+  memBytes?: number | null
   endedAtMs?: number
   exitCode?: number | null
   signal?: string | null
@@ -53,6 +55,7 @@ export function agyTaskCard(opts: AgyTaskCardOpts): object {
           stdout: '',
           stderr: '',
         }),
+        agyForwardPlaceholderElement(),
         agyRepoElement({ before: opts.beforeGit }),
       ],
     },
@@ -63,45 +66,34 @@ export function agyPromptElement(prompt: string): object {
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.agyPrompt,
-    header: { title: { tag: 'plain_text', content: `📥 agy 提示词 · ${shortLine(prompt, 42)}` } },
+    header: { title: { tag: 'plain_text', content: '📥 agy收到' } },
     expanded: false,
     elements: [{ tag: 'markdown', content: escapeMarkdown(prompt).trim() || '_空_' }],
   }
 }
 
 export function agyStatsElement(stats: AgyStats): object {
-  const lines = [
-    `**状态**: ${escapeMarkdown(stats.status)}`,
-    `**模型**: ${inlineCode(stats.model)}`,
-    `**工作目录**: ${inlineCode(stats.cwd)}`,
-    `**命令**: ${inlineCode(stats.command)}`,
-    `**开始**: ${inlineCode(iso(stats.startedAtMs))}`,
-    `**已耗时**: ${inlineCode(`${stats.elapsedSec}s`)}`,
-  ]
-  if (stats.endedAtMs) lines.push(`**结束**: ${inlineCode(iso(stats.endedAtMs))}`)
-  if (stats.exitCode !== undefined || stats.signal !== undefined) {
-    lines.push(`**退出**: code=${inlineCode(String(stats.exitCode ?? '-'))} signal=${inlineCode(stats.signal ?? '-')}`)
-  }
-  if (stats.stdoutBytes !== undefined || stats.stderrBytes !== undefined) {
-    lines.push(`**输出**: stdout ${inlineCode(`${stats.stdoutBytes ?? 0}B`)} · stderr ${inlineCode(`${stats.stderrBytes ?? 0}B`)}`)
-  }
-  const flags: string[] = []
-  if (stats.hostTimedOut) flags.push('host timeout')
-  if (stats.captureTruncated) flags.push('capture truncated')
-  if (stats.cardTruncated) flags.push('card truncated')
-  if (flags.length) lines.push(`**标记**: ${flags.map(inlineCode).join(' ')}`)
-
   return {
     tag: 'markdown',
     element_id: ELEMENTS.agyStats,
-    content: lines.join('\n'),
+    content: [
+      statusLabel(stats.status),
+      `${stats.elapsedSec}s`,
+      `CPU ${formatPercent(stats.cpuPercent)}`,
+      `MEM ${formatBytes(stats.memBytes)}`,
+    ].join(' · '),
   }
 }
 
-export function agyResultElement(opts: { status: string; stdout: string; stderr: string; cardTruncated?: boolean }): object {
-  const stdout = opts.stdout.trim()
-  const stderr = opts.stderr.trim()
+export function agyResultElement(opts: { status: string; stdout: string; stderr: string; notice?: string; cardTruncated?: boolean }): object {
+  const stdout = cleanAgyOutputText(opts.stdout).trim()
+  const stderr = cleanAgyOutputText(opts.stderr).trim()
   const lines = [`**${escapeMarkdown(opts.status)}**`]
+  const notice = cleanAgyOutputText(opts.notice ?? '').trim()
+  if (notice) {
+    lines.push('')
+    lines.push(escapeMarkdown(notice))
+  }
   if (stdout) {
     const truncated = truncate(stdout, RESULT_CARD_LIMIT)
     lines.push('')
@@ -127,6 +119,32 @@ export function agyResultElement(opts: { status: string; stdout: string; stderr:
     tag: 'markdown',
     element_id: ELEMENTS.agyResult,
     content: lines.join('\n'),
+  }
+}
+
+export function agyForwardPlaceholderElement(): object {
+  return {
+    tag: 'markdown',
+    element_id: ELEMENTS.agyForward,
+    content: ' ',
+  }
+}
+
+export function agyForwardElement(resultId: string): object {
+  return {
+    tag: 'column_set',
+    element_id: ELEMENTS.agyForward,
+    columns: [{
+      tag: 'column',
+      width: 'weighted',
+      weight: 1,
+      elements: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: '转 Codex' },
+        type: 'primary',
+        behaviors: [{ type: 'callback', value: { kind: 'agy_forward_codex', result_id: resultId } }],
+      }],
+    }],
   }
 }
 
@@ -170,16 +188,15 @@ function snapshotBody(snapshot: AgyGitSnapshot): string {
     return `❌ Git 统计失败\n${fence(escapeMarkdown(snapshot.error ?? 'unknown error'))}`
   }
   const lines: string[] = []
-  lines.push(gitDirty(snapshot) ? '状态: `dirty`' : '状态: `clean`')
+  lines.push(gitDirty(snapshot) ? 'dirty' : 'clean')
   if (snapshot.diffShortStat) lines.push(`diff: ${inlineCode(snapshot.diffShortStat)}`)
   if (snapshot.statusShort) {
     lines.push('')
-    lines.push('status:')
     lines.push(fence(escapeMarkdown(snapshot.statusShort)))
   }
   if (snapshot.diffNameOnly) {
     lines.push('')
-    lines.push('files:')
+    lines.push('files')
     lines.push(fence(escapeMarkdown(snapshot.diffNameOnly)))
   }
   return lines.join('\n')
@@ -191,6 +208,28 @@ function gitDirty(snapshot: AgyGitSnapshot): boolean {
 
 function iso(ms: number): string {
   return new Date(ms).toISOString()
+}
+
+function statusLabel(status: string): string {
+  if (/完成/.test(status)) return '✅ 完成'
+  if (/运行中|等待|正在停止/.test(status)) return '⏳ 执行中'
+  return '❌ 出错'
+}
+
+function formatPercent(value: number | null | undefined): string {
+  return typeof value === 'number' && Number.isFinite(value) ? `${value.toFixed(1)}%` : '--'
+}
+
+function formatBytes(value: number | null | undefined): string {
+  if (typeof value !== 'number' || !Number.isFinite(value)) return '--'
+  if (value < 1024) return `${value}B`
+  const units = ['KB', 'MB', 'GB', 'TB']
+  let n = value / 1024
+  for (const unit of units) {
+    if (n < 1024 || unit === units[units.length - 1]) return `${n.toFixed(n >= 10 ? 0 : 1)}${unit}`
+    n /= 1024
+  }
+  return `${value}B`
 }
 
 function shortLine(text: string, max: number): string {
@@ -214,4 +253,19 @@ function inlineCode(s: string): string {
 
 function fence(s: string): string {
   return '```\n' + s.replace(/```/g, '`\\`\\`') + '\n```'
+}
+
+export function cleanAgyOutputText(text: string): string {
+  return text
+    .replace(/\r\n/g, '\n')
+    .replace(/\x1B\][\s\S]*?(?:\x07|\x1B\\)/g, '')
+    .replace(/\x1B\[[0-?]*[ -/]*[@-~]/g, '')
+    .replace(/\x1B[=>]/g, '')
+    .split('\n')
+    .map(line => {
+      const parts = line.split('\r')
+      return parts[parts.length - 1] ?? ''
+    })
+    .join('\n')
+    .replace(/[\x00-\x08\x0B\x0C\x0E-\x1F\x7F]/g, '')
 }

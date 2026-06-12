@@ -72,7 +72,7 @@ export function spawnAgyPrint(prompt: string, cwd: string): { proc: AgyProcess; 
 }
 
 export async function captureGitSnapshot(cwd: string): Promise<GitSnapshot> {
-  const status = await runGit(cwd, ['status', '--short'])
+  const status = await runGit(cwd, ['status', '--short', '--untracked-files=all'])
   if (!status.ok) {
     return {
       ok: false,
@@ -83,8 +83,10 @@ export async function captureGitSnapshot(cwd: string): Promise<GitSnapshot> {
     }
   }
 
-  const shortStat = await runGit(cwd, ['diff', '--shortstat', 'HEAD', '--'])
-  const nameOnly = await runGit(cwd, ['diff', '--name-only', 'HEAD', '--'])
+  const hasHead = (await runGit(cwd, ['rev-parse', '--verify', 'HEAD'])).ok
+  const diffBase = hasHead ? ['HEAD', '--'] : ['--']
+  const shortStat = await runGit(cwd, ['diff', '--shortstat', ...diffBase])
+  const nameOnly = await runGit(cwd, ['diff', '--name-only', ...diffBase])
   const errors = [shortStat, nameOnly]
     .filter(r => !r.ok)
     .map(r => r.error ?? r.stderr.trim())

@@ -428,6 +428,10 @@ async function handleCardAction(data: any): Promise<any> {
       const result = await session.onWorktreeDisband(String(value.slug ?? ''))
       return actionCardResponse(result.card)
     }
+    case 'agy_forward_codex': {
+      const result = session.beginAgyForwardToCodex(String(value.result_id ?? ''), userId)
+      return { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
   }
   return { toast: { type: 'info', content: 'unknown action' } }
 }

@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import { AGY_DEFAULT_MODEL } from '../agy-task'
-import { agyRepoElement, agyResultElement, agyTaskCard } from './agy'
+import { agyForwardElement, agyRepoElement, agyResultElement, agyTaskCard } from './agy'
 
 const cleanGit = {
   ok: true,
@@ -29,16 +29,18 @@ describe('agy task card rendering', () => {
     }) as any
 
     expect(card.config.streaming_mode).toBe(true)
-    expect(card.body.elements).toHaveLength(4)
+    expect(card.body.elements).toHaveLength(5)
     expect(card.body.elements[0].element_id).toBe('agy_prompt')
     expect(card.body.elements[0].tag).toBe('collapsible_panel')
     expect(card.body.elements[0].expanded).toBe(false)
+    expect(card.body.elements[0].header.title.content).toBe('📥 agy收到')
     expect(card.body.elements[1].element_id).toBe('agy_stats')
-    expect(card.body.elements[1].content).toContain('Gemini 3.1 Pro (High)')
+    expect(card.body.elements[1].content).toBe('⏳ 执行中 · 0.0s · CPU -- · MEM --')
     expect(card.body.elements[2].element_id).toBe('agy_result')
     expect(card.body.elements[2].content).toContain('等待 agy 返回')
-    expect(card.body.elements[3].element_id).toBe('agy_repo')
-    expect(card.body.elements[3].header.title.content).toContain('执行前干净')
+    expect(card.body.elements[3].element_id).toBe('agy_forward')
+    expect(card.body.elements[4].element_id).toBe('agy_repo')
+    expect(card.body.elements[4].header.title.content).toContain('执行前干净')
   })
 
   test('repo panel warns when pre-existing changes were present', () => {
@@ -72,5 +74,30 @@ describe('agy task card rendering', () => {
     expect(result.element_id).toBe('agy_result')
     expect(result.content).toContain('输出已截断')
     expect(result.content.length).toBeLessThan(8300)
+  })
+
+  test('result element strips terminal control sequences', () => {
+    const result = agyResultElement({
+      status: '✅ agy 完成',
+      stdout: '旧内容\r最终结论\x1b[0m\n下一行',
+      stderr: '\x1b[31merr\x1b[0m',
+    }) as any
+
+    expect(result.content).toContain('最终结论')
+    expect(result.content).toContain('下一行')
+    expect(result.content).toContain('err')
+    expect(result.content).not.toContain('\x1b')
+    expect(result.content).not.toContain('旧内容')
+  })
+
+  test('forward element renders a callback button', () => {
+    const button = agyForwardElement('agy-result-1') as any
+
+    expect(button.element_id).toBe('agy_forward')
+    expect(button.columns[0].elements[0].text.content).toBe('转 Codex')
+    expect(button.columns[0].elements[0].behaviors[0].value).toEqual({
+      kind: 'agy_forward_codex',
+      result_id: 'agy-result-1',
+    })
   })
 })
