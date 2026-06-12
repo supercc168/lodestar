@@ -3,6 +3,87 @@ import { DATA_DIR, TASKLIST_MAP_FILE } from './paths'
 import * as feishu from './feishu'
 import { log } from './log'
 
+export type TasklistSectionKey = 'design' | 'aiTodo' | 'aiDoing' | 'aiReview' | 'done'
+
+export interface TasklistSectionSpec {
+  key: TasklistSectionKey
+  name: string
+}
+
+export const TASKLIST_SECTION_SPECS: TasklistSectionSpec[] = [
+  { key: 'design', name: '设计中' },
+  { key: 'aiTodo', name: '[AI]待执行' },
+  { key: 'aiDoing', name: '[AI]执行中' },
+  { key: 'aiReview', name: '[AI]待审核' },
+  { key: 'done', name: '已完成' },
+]
+
+export type TasklistSectionMap = Partial<Record<TasklistSectionKey, string>>
+
+export interface TaskAutomationRunRef {
+  runId: string
+  fingerprint?: string
+  status?: AutomationProcessRecord['status']
+  commentId?: string
+  startedAt?: string
+  finishedAt?: string
+  error?: string
+}
+
+export interface TaskAutomationState {
+  guid: string
+  summary?: string
+  sectionKey?: TasklistSectionKey
+  completedAt?: string
+  updatedAt?: string
+  lastSeenAt?: string
+  lastDesignFingerprint?: string
+  codexPlan?: TaskAutomationRunRef
+  agyPlan?: TaskAutomationRunRef
+  agyPick?: TaskAutomationRunRef
+  codexExecution?: TaskAutomationRunRef
+  agyReview?: TaskAutomationRunRef
+  codexMerge?: TaskAutomationRunRef
+  executionBranch?: string
+  reviewBranch?: string
+  prUrl?: string
+  prNumber?: number
+  errorCommentIds?: string[]
+  lastError?: string
+}
+
+export interface AutomationProcessRecord {
+  runId: string
+  projectName: string
+  tasklistGuid: string
+  taskGuid?: string
+  kind:
+    | 'codex-plan'
+    | 'agy-plan'
+    | 'agy-pick'
+    | 'codex-execute'
+    | 'agy-review'
+    | 'codex-merge'
+  pid?: number
+  pgid?: number
+  command: string[]
+  cwd: string
+  status: 'running' | 'exited' | 'failed'
+  startedAt: string
+  finishedAt?: string
+  exitCode?: number | null
+  signal?: string | null
+  stdoutTail?: string
+  stderrTail?: string
+  error?: string
+}
+
+export interface TasklistWorkerState {
+  lastScanAt?: string
+  lastScanError?: string
+  runningTaskGuid?: string
+}
+
 export interface TasklistBinding {
   guid: string
   name: string
@@ -10,6 +91,10 @@ export interface TasklistBinding {
   projectName: string
   ownerOpenId: string
   createdAt?: string
+  sections?: TasklistSectionMap
+  tasks?: Record<string, TaskAutomationState>
+  processes?: Record<string, AutomationProcessRecord>
+  worker?: TasklistWorkerState
 }
 
 const bindings = new Map<string, TasklistBinding>()
@@ -24,9 +109,22 @@ export function getTasklistBinding(projectName: string): TasklistBinding | null 
   return bindings.get(projectName) ?? null
 }
 
+export function listTasklistBindings(): TasklistBinding[] {
+  return [...bindings.values()].map(cloneBinding)
+}
+
+export function updateTasklistBinding(projectName: string, update: (binding: TasklistBinding) => void): TasklistBinding {
+  const binding = bindings.get(projectName)
+  if (!binding) throw new Error(`tasklist is not enabled for ${projectName}`)
+  update(binding)
+  normalizeBinding(projectName, binding)
+  saveTasklistMap()
+  return cloneBinding(binding)
+}
+
 export async function enableTasklist(projectName: string, chatId: string): Promise<TasklistBinding> {
   const existing = getTasklistBinding(projectName)
-  if (existing) return existing
+  if (existing) return ensureTasklistSections(projectName)
 
   const name = tasklistNameForProject(projectName)
   if (name.length > 100) throw new Error(`tasklist name is too long (${name.length}/100): ${name}`)
@@ -41,10 +139,33 @@ export async function enableTasklist(projectName: string, chatId: string): Promi
     projectName,
     ownerOpenId,
     createdAt: tasklist.createdAt,
+    sections: {},
+    tasks: {},
+    processes: {},
+    worker: {},
   }
   bindings.set(projectName, binding)
   saveTasklistMap()
-  return binding
+  await ensureTasklistSections(projectName)
+  saveTasklistMap()
+  return cloneBinding(binding)
+}
+
+export async function ensureTasklistSections(projectName: string): Promise<TasklistBinding> {
+  const binding = getTasklistBinding(projectName)
+  if (!binding) throw new Error(`tasklist is not enabled for ${projectName}`)
+  const existing = await feishu.listTasklistSections(binding.guid)
+  const byName = new Map(existing.map(section => [section.name, section.guid]))
+  const sections: TasklistSectionMap = { ...(binding.sections ?? {}) }
+  let insertAfter: string | undefined
+  for (const spec of TASKLIST_SECTION_SPECS) {
+    const guid = byName.get(spec.name) ?? await createSection(binding.guid, spec.name, insertAfter)
+    sections[spec.key] = guid
+    insertAfter = guid
+  }
+  binding.sections = sections
+  saveTasklistMap()
+  return cloneBinding(binding)
 }
 
 export async function deleteTasklist(projectName: string, expectedGuid: string): Promise<TasklistBinding> {
@@ -56,7 +177,34 @@ export async function deleteTasklist(projectName: string, expectedGuid: string):
   await feishu.deleteTasklistByGuid(binding.guid)
   bindings.delete(projectName)
   saveTasklistMap()
-  return binding
+  return cloneBinding(binding)
+}
+
+export function taskStateFor(binding: TasklistBinding, taskGuid: string): TaskAutomationState {
+  binding.tasks ??= {}
+  const state = binding.tasks[taskGuid] ?? { guid: taskGuid }
+  binding.tasks[taskGuid] = state
+  return state
+}
+
+export function sectionKeyForGuid(binding: TasklistBinding, sectionGuid: string): TasklistSectionKey | null {
+  const sections = binding.sections ?? {}
+  for (const spec of TASKLIST_SECTION_SPECS) {
+    if (sections[spec.key] === sectionGuid) return spec.key
+  }
+  return null
+}
+
+export function sectionNameForKey(key: TasklistSectionKey): string {
+  return TASKLIST_SECTION_SPECS.find(spec => spec.key === key)?.name ?? key
+}
+
+function createSection(tasklistGuid: string, name: string, insertAfter?: string): Promise<string> {
+  return feishu.createTasklistSection({
+    tasklistGuid,
+    name,
+    insertAfter,
+  })
 }
 
 function loadTasklistMap(): void {
@@ -69,14 +217,20 @@ function loadTasklistMap(): void {
       const item = raw as Partial<TasklistBinding>
       if (typeof item.guid !== 'string' || !item.guid) continue
       if (typeof item.name !== 'string' || !item.name) continue
-      bindings.set(projectName, {
+      const binding: TasklistBinding = {
         guid: item.guid,
         name: item.name,
         url: typeof item.url === 'string' ? item.url : '',
         projectName,
         ownerOpenId: typeof item.ownerOpenId === 'string' ? item.ownerOpenId : '',
         createdAt: typeof item.createdAt === 'string' ? item.createdAt : undefined,
-      })
+        sections: readSectionMap(item.sections),
+        tasks: readTasks(item.tasks),
+        processes: readProcesses(item.processes),
+        worker: readWorker(item.worker),
+      }
+      normalizeBinding(projectName, binding)
+      bindings.set(projectName, binding)
     }
     log(`tasklist: loaded ${bindings.size} project bindings`)
   } catch (e) {
@@ -87,10 +241,89 @@ function loadTasklistMap(): void {
 function saveTasklistMap(): void {
   try {
     const obj: Record<string, TasklistBinding> = {}
-    for (const [projectName, binding] of bindings) obj[projectName] = binding
+    for (const [projectName, binding] of bindings) obj[projectName] = cloneBinding(binding)
     mkdirSync(DATA_DIR, { recursive: true })
     writeFileSync(TASKLIST_MAP_FILE, JSON.stringify(obj, null, 2))
   } catch (e) {
     log(`tasklist: save map failed: ${e}`)
+  }
+}
+
+function normalizeBinding(projectName: string, binding: TasklistBinding): void {
+  binding.projectName = projectName
+  binding.sections ??= {}
+  binding.tasks ??= {}
+  binding.processes ??= {}
+  binding.worker ??= {}
+}
+
+function cloneBinding(binding: TasklistBinding): TasklistBinding {
+  return JSON.parse(JSON.stringify(binding)) as TasklistBinding
+}
+
+function readSectionMap(raw: unknown): TasklistSectionMap {
+  const out: TasklistSectionMap = {}
+  if (!raw || typeof raw !== 'object') return out
+  const obj = raw as Record<string, unknown>
+  for (const spec of TASKLIST_SECTION_SPECS) {
+    if (typeof obj[spec.key] === 'string' && obj[spec.key]) out[spec.key] = obj[spec.key]
+  }
+  return out
+}
+
+function readTasks(raw: unknown): Record<string, TaskAutomationState> {
+  if (!raw || typeof raw !== 'object') return {}
+  const out: Record<string, TaskAutomationState> = {}
+  for (const [guid, value] of Object.entries(raw)) {
+    if (!value || typeof value !== 'object') continue
+    const task = value as Partial<TaskAutomationState>
+    out[guid] = {
+      ...task,
+      guid,
+    }
+  }
+  return out
+}
+
+function readProcesses(raw: unknown): Record<string, AutomationProcessRecord> {
+  if (!raw || typeof raw !== 'object') return {}
+  const out: Record<string, AutomationProcessRecord> = {}
+  for (const [runId, value] of Object.entries(raw)) {
+    if (!value || typeof value !== 'object') continue
+    const process = value as Partial<AutomationProcessRecord>
+    if (typeof process.projectName !== 'string') continue
+    if (typeof process.tasklistGuid !== 'string') continue
+    if (!Array.isArray(process.command)) continue
+    if (typeof process.cwd !== 'string') continue
+    out[runId] = {
+      runId,
+      projectName: process.projectName,
+      tasklistGuid: process.tasklistGuid,
+      taskGuid: typeof process.taskGuid === 'string' ? process.taskGuid : undefined,
+      kind: process.kind ?? 'agy-plan',
+      pid: typeof process.pid === 'number' ? process.pid : undefined,
+      pgid: typeof process.pgid === 'number' ? process.pgid : undefined,
+      command: process.command.map(String),
+      cwd: process.cwd,
+      status: process.status ?? 'failed',
+      startedAt: typeof process.startedAt === 'string' ? process.startedAt : new Date().toISOString(),
+      finishedAt: typeof process.finishedAt === 'string' ? process.finishedAt : undefined,
+      exitCode: typeof process.exitCode === 'number' || process.exitCode === null ? process.exitCode : undefined,
+      signal: typeof process.signal === 'string' || process.signal === null ? process.signal : undefined,
+      stdoutTail: typeof process.stdoutTail === 'string' ? process.stdoutTail : undefined,
+      stderrTail: typeof process.stderrTail === 'string' ? process.stderrTail : undefined,
+      error: typeof process.error === 'string' ? process.error : undefined,
+    }
+  }
+  return out
+}
+
+function readWorker(raw: unknown): TasklistWorkerState {
+  if (!raw || typeof raw !== 'object') return {}
+  const obj = raw as Partial<TasklistWorkerState>
+  return {
+    lastScanAt: typeof obj.lastScanAt === 'string' ? obj.lastScanAt : undefined,
+    lastScanError: typeof obj.lastScanError === 'string' ? obj.lastScanError : undefined,
+    runningTaskGuid: typeof obj.runningTaskGuid === 'string' ? obj.runningTaskGuid : undefined,
   }
 }

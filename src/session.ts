@@ -1310,6 +1310,10 @@ export class Session {
       await feishu.sendText(this.chatId, '❌ 名称无效。用英文/数字/._-，最长 63。')
       return
     }
+    if (worktree.isReservedWorktreeSlug(slug)) {
+      await feishu.sendText(this.chatId, `❌ ${slug} 是 AI 自动化系统保留 worktree，不能用 wt 命令操作。`)
+      return
+    }
     if (!userOpenId) {
       await feishu.sendText(this.chatId, '❌ 找不到发起人，不能拉群。')
       return
@@ -1380,6 +1384,7 @@ export class Session {
           error: entry.error,
           chatId,
           duplicateChatCount: ids.length,
+          protected: worktree.isReservedWorktreeSlug(entry.slug),
         }
       }),
     })
@@ -1869,6 +1874,9 @@ export class Session {
   async onWorktreeDisband(slugRaw: string): Promise<WorktreeActionResult> {
     const slug = worktree.normalizeWorktreeSlug(slugRaw)
     if (!slug) return this.worktreeActionResult(false, '❌ 名称无效', 'error')
+    if (worktree.isReservedWorktreeSlug(slug)) {
+      return this.worktreeActionResult(false, `❌ ${slug} 是 AI 自动化系统保留 worktree，不能解散。`, 'error')
+    }
     const projectName = this.worktreeProjectName()
     const projectDir = this.worktreeProjectDir()
     try {

@@ -1,5 +1,5 @@
 import { ELEMENTS } from './elements'
-import type { TasklistBinding } from '../tasklist'
+import { TASKLIST_SECTION_SPECS, type TasklistBinding } from '../tasklist'
 
 export interface TasklistPanelNotice {
   type: 'success' | 'error' | 'info'
@@ -55,12 +55,20 @@ function panelContent(opts: TasklistPanelOpts): string {
   }
   lines.push('', '已启用')
   lines.push(`GUID：${inlineCode(opts.binding.guid)}`)
+  lines.push(`分组：${sectionSummary(opts.binding)}`)
   if (opts.binding.url) lines.push(`链接：${opts.binding.url}`)
   if (opts.confirmDelete) {
     lines.push('')
     lines.push(`<font color='red'>确认后会删除该清单以及清单内所有任务。</font>`)
   }
   return lines.join('\n')
+}
+
+function sectionSummary(binding: TasklistBinding): string {
+  const sections = binding.sections ?? {}
+  return TASKLIST_SECTION_SPECS
+    .map(spec => `${spec.name}${sections[spec.key] ? '✓' : 'MISS'}`)
+    .join(' · ')
 }
 
 function actionElement(opts: TasklistPanelOpts): object {

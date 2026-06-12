@@ -25,6 +25,7 @@ import * as feishu from './src/feishu'
 import { actionCardResponse } from './src/card-action'
 import { startNotifyServer } from './src/notify'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
+import { startTasklistWorker } from './src/tasklist-worker'
 import { config } from './src/config'
 import { log } from './src/log'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
@@ -539,6 +540,7 @@ async function boot(): Promise<void> {
   feishu.loadSessionModelMap()
   await feishu.refreshChatList()
   setInterval(() => { void feishu.refreshChatList() }, 5 * 60 * 1000)
+  startTasklistWorker()
 
   // Lark WSClient sends pings every ~120s but doesn't verify pongs by default.
   // On a half-open TCP (NAT idle-kill, network blip) the socket stays OPEN and

@@ -393,7 +393,7 @@ export async function fetchChatOwnerOpenId(chatId: string): Promise<string> {
     params: { user_id_type: 'open_id' },
   })
   if (res.code && res.code !== 0) {
-    throw new Error(`feishu chat.get failed code=${res.code} msg=${res.msg}`)
+    throwFeishuApiError('feishu chat.get', res)
   }
   const ownerOpenId = res.data?.owner_id
   if (!ownerOpenId) {
@@ -418,7 +418,7 @@ export async function createTasklistWithOwner(name: string, ownerOpenId: string)
     },
   })
   if (res.code && res.code !== 0) {
-    throw new Error(`feishu tasklist.create failed code=${res.code} msg=${res.msg}`)
+    throwFeishuApiError('feishu tasklist.create', res)
   }
   const tasklist = res.data?.tasklist
   const guid = tasklist?.guid
@@ -436,8 +436,187 @@ export async function deleteTasklistByGuid(guid: string): Promise<void> {
     path: { tasklist_guid: guid },
   })
   if (res.code && res.code !== 0) {
-    throw new Error(`feishu tasklist.delete failed code=${res.code} msg=${res.msg}`)
+    throwFeishuApiError('feishu tasklist.delete', res)
   }
+}
+
+export interface TasklistSection {
+  guid: string
+  name: string
+  isDefault?: boolean
+}
+
+export interface TaskSummary {
+  guid: string
+  summary: string
+  completedAt?: string
+  subtaskCount?: number
+}
+
+export interface TaskComment {
+  id: string
+  content: string
+  createdAt?: string
+  updatedAt?: string
+  creator?: unknown
+}
+
+export async function listTasklistSections(tasklistGuid: string): Promise<TasklistSection[]> {
+  const out: TasklistSection[] = []
+  let pageToken: string | undefined
+  do {
+    const res = await client.task.v2.section.list({
+      params: {
+        resource_type: 'tasklist',
+        resource_id: tasklistGuid,
+        page_size: 50,
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
+    })
+    if (res.code && res.code !== 0) throwFeishuApiError('feishu section.list', res)
+    for (const item of res.data?.items ?? []) {
+      if (!item.guid || !item.name) continue
+      out.push({ guid: item.guid, name: item.name, isDefault: item.is_default })
+    }
+    pageToken = res.data?.has_more ? res.data?.page_token : undefined
+  } while (pageToken)
+  return out
+}
+
+export async function createTasklistSection(opts: {
+  tasklistGuid: string
+  name: string
+  insertAfter?: string
+}): Promise<string> {
+  const res = await client.task.v2.section.create({
+    data: {
+      resource_type: 'tasklist',
+      resource_id: opts.tasklistGuid,
+      name: opts.name,
+      ...(opts.insertAfter ? { insert_after: opts.insertAfter } : {}),
+    },
+  })
+  if (res.code && res.code !== 0) throwFeishuApiError('feishu section.create', res)
+  const guid = res.data?.section?.guid
+  if (!guid) throw new Error(`feishu section.create returned no guid for "${opts.name}"`)
+  return guid
+}
+
+export async function listSectionTasks(sectionGuid: string, completed?: boolean): Promise<TaskSummary[]> {
+  const out: TaskSummary[] = []
+  let pageToken: string | undefined
+  do {
+    const res = await client.task.v2.section.tasks({
+      path: { section_guid: sectionGuid },
+      params: {
+        page_size: 50,
+        ...(typeof completed === 'boolean' ? { completed } : {}),
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
+    })
+    if (res.code && res.code !== 0) throwFeishuApiError('feishu section.tasks', res)
+    for (const item of res.data?.items ?? []) {
+      if (!item.guid) continue
+      out.push({
+        guid: item.guid,
+        summary: item.summary ?? '',
+        completedAt: item.completed_at,
+        subtaskCount: item.subtask_count,
+      })
+    }
+    pageToken = res.data?.has_more ? res.data?.page_token : undefined
+  } while (pageToken)
+  return out
+}
+
+export async function getTask(taskGuid: string): Promise<any> {
+  const res = await client.task.v2.task.get({
+    path: { task_guid: taskGuid },
+    params: { user_id_type: 'open_id' },
+  })
+  if (res.code && res.code !== 0) throwFeishuApiError('feishu task.get', res)
+  const task = res.data?.task
+  if (!task) throw new Error(`feishu task.get returned no task: ${taskGuid}`)
+  return task
+}
+
+export async function listTaskComments(taskGuid: string): Promise<TaskComment[]> {
+  const out: TaskComment[] = []
+  let pageToken: string | undefined
+  do {
+    const res = await client.task.v2.comment.list({
+      params: {
+        resource_type: 'task',
+        resource_id: taskGuid,
+        direction: 'asc',
+        page_size: 50,
+        user_id_type: 'open_id',
+        ...(pageToken ? { page_token: pageToken } : {}),
+      },
+    })
+    if (res.code && res.code !== 0) throwFeishuApiError('feishu comment.list', res)
+    for (const item of res.data?.items ?? []) {
+      if (!item.id) continue
+      out.push({
+        id: item.id,
+        content: item.content ?? '',
+        createdAt: item.created_at,
+        updatedAt: item.updated_at,
+        creator: item.creator,
+      })
+    }
+    pageToken = res.data?.has_more ? res.data?.page_token : undefined
+  } while (pageToken)
+  return out
+}
+
+export async function addTaskComment(taskGuid: string, content: string): Promise<string> {
+  const res = await client.task.v2.comment.create({
+    data: {
+      resource_type: 'task',
+      resource_id: taskGuid,
+      content,
+    },
+    params: { user_id_type: 'open_id' },
+  })
+  if (res.code && res.code !== 0) throwFeishuApiError('feishu comment.create', res)
+  const id = res.data?.comment?.id
+  if (!id) throw new Error(`feishu comment.create returned no id for task ${taskGuid}`)
+  return id
+}
+
+export async function moveTaskToSection(taskGuid: string, tasklistGuid: string, sectionGuid: string): Promise<void> {
+  const res = await client.task.v2.task.addTasklist({
+    path: { task_guid: taskGuid },
+    data: { tasklist_guid: tasklistGuid, section_guid: sectionGuid },
+    params: { user_id_type: 'open_id' },
+  })
+  if (res.code && res.code !== 0) throwFeishuApiError('feishu task.addTasklist', res)
+}
+
+export function formatFeishuApiError(api: string, raw: unknown): string {
+  const data = raw && typeof raw === 'object' ? raw as Record<string, any> : {}
+  const responseData = data.response?.data && typeof data.response.data === 'object'
+    ? data.response.data as Record<string, any>
+    : data.data && typeof data.data === 'object'
+      ? data.data as Record<string, any>
+      : data
+  const code = responseData.code ?? data.code
+  const msg = responseData.msg ?? responseData.message ?? data.msg ?? data.message ?? 'unknown error'
+  const violations = responseData.error?.permission_violations
+    ?? responseData.permission_violations
+    ?? data.error?.permission_violations
+  const scopes = Array.isArray(violations)
+    ? violations
+        .map((v: any) => v?.scope ?? v?.name ?? v)
+        .filter(Boolean)
+        .join(', ')
+    : ''
+  return `${api} failed code=${code ?? 'unknown'} msg=${msg}${scopes ? ` missing_scopes=${scopes}` : ''}`
+}
+
+function throwFeishuApiError(api: string, raw: unknown): never {
+  throw new Error(formatFeishuApiError(api, raw))
 }
 
 // ── Outbound: text + card ──────────────────────────────────────────────
