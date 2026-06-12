@@ -16,7 +16,7 @@ import type {
   TasklistSectionKey,
 } from './tasklist'
 
-const TASKLIST_WORKER_INTERVAL_MS = 5 * 60 * 1000
+const TASKLIST_WORKER_INTERVAL_MS = 30 * 1000
 const TASKLIST_WORKER_BOOT_DELAY_MS = 15_000
 const PROCESS_OUTPUT_TAIL_LIMIT = 20_000
 const COMMENT_OUTPUT_LIMIT = 15_000
