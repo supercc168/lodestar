@@ -760,13 +760,13 @@ async function createGitHubPullRequest(projectDir: string, opts: {
   return { url: json.html_url, number: json.number }
 }
 
-interface GitHubRemote {
+export interface GitHubRemote {
   name: string
   url: string
   repo: { owner: string; repo: string }
 }
 
-function resolveGitHubRemote(projectDir: string): GitHubRemote {
+export function resolveGitHubRemote(projectDir: string): GitHubRemote {
   const remotes = git(projectDir, ['remote']).split('\n').map(s => s.trim()).filter(Boolean)
   const origin = remotes.includes('origin') ? remoteByName(projectDir, 'origin') : null
   if (origin) return origin

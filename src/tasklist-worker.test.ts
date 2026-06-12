@@ -1,7 +1,11 @@
+import { execFileSync } from 'node:child_process'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, test } from 'bun:test'
 
 import type { TasklistSection, TaskSummary } from './feishu'
-import { customSectionsForDesignSubtraction, tasksOutsideCustomSections } from './tasklist-worker'
+import { customSectionsForDesignSubtraction, resolveGitHubRemote, tasksOutsideCustomSections } from './tasklist-worker'
 
 function task(guid: string): TaskSummary {
   return { guid, summary: guid }
@@ -36,3 +40,25 @@ describe('tasklist worker buckets', () => {
     ])
   })
 })
+
+describe('tasklist worker GitHub remotes', () => {
+  test('resolves GitHub remote named github when origin is absent', () => {
+    const repo = mkdtempSync(join(tmpdir(), 'lodestar-tasklist-remote-'))
+    try {
+      git(repo, ['init'])
+      git(repo, ['remote', 'add', 'github', 'git@github.com:leviyuan/lodestar.git'])
+
+      expect(resolveGitHubRemote(repo)).toEqual({
+        name: 'github',
+        url: 'git@github.com:leviyuan/lodestar.git',
+        repo: { owner: 'leviyuan', repo: 'lodestar' },
+      })
+    } finally {
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
+})
+
+function git(cwd: string, args: string[]): string {
+  return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
+}
