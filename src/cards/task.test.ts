@@ -9,7 +9,6 @@ const binding = {
   projectName: 'feishu',
   ownerOpenId: 'ou_owner',
   sections: {
-    design: 'sec-design',
     aiTodo: 'sec-todo',
     aiDoing: 'sec-doing',
     aiReview: 'sec-review',
@@ -43,7 +42,7 @@ describe('tasklist panel card rendering', () => {
 
     const json = JSON.stringify(card)
     expect(json).toContain('已启用')
-    expect(json).toContain('设计中✓')
+    expect(json).toContain('设计中默认')
     expect(json).toContain('[AI]待执行✓')
     expect(json).toContain('已完成✓')
     expect(json).toContain('tl-guid-1')

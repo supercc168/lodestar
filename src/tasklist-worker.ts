@@ -86,13 +86,29 @@ type TaskBuckets = Record<TasklistSectionKey, feishu.TaskSummary[]>
 
 async function scanTaskSections(binding: TasklistBinding): Promise<TaskBuckets> {
   const sections = binding.sections ?? {}
+  const allOpenTasks = await feishu.listTasklistTasks(binding.guid, false)
+  const designSectionName = tasklist.sectionNameForKey('design')
+  const remoteSections = (await feishu.listTasklistSections(binding.guid))
+    .filter(section => !section.isDefault)
+    .filter(section => section.name !== designSectionName)
+  const openTasksByCustomSection = await Promise.all(
+    remoteSections.map(section => feishu.listSectionTasks(section.guid, false)),
+  )
   return {
-    design: sections.design ? await feishu.listSectionTasks(sections.design, false) : [],
+    design: tasksOutsideCustomSections(allOpenTasks, openTasksByCustomSection),
     aiTodo: sections.aiTodo ? await feishu.listSectionTasks(sections.aiTodo, false) : [],
     aiDoing: sections.aiDoing ? await feishu.listSectionTasks(sections.aiDoing, false) : [],
     aiReview: sections.aiReview ? await feishu.listSectionTasks(sections.aiReview) : [],
     done: sections.done ? await feishu.listSectionTasks(sections.done) : [],
   }
+}
+
+export function tasksOutsideCustomSections(
+  allTasks: feishu.TaskSummary[],
+  customSectionTasks: feishu.TaskSummary[][],
+): feishu.TaskSummary[] {
+  const customTaskGuids = new Set(customSectionTasks.flat().map(task => task.guid))
+  return allTasks.filter(task => !customTaskGuids.has(task.guid))
 }
 
 function rememberScan(projectName: string, buckets: TaskBuckets): void {

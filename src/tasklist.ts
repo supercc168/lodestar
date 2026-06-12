@@ -18,6 +18,9 @@ export const TASKLIST_SECTION_SPECS: TasklistSectionSpec[] = [
   { key: 'done', name: '已完成' },
 ]
 
+export const TASKLIST_CUSTOM_SECTION_SPECS: TasklistSectionSpec[] = TASKLIST_SECTION_SPECS
+  .filter(spec => spec.key !== 'design')
+
 export type TasklistSectionMap = Partial<Record<TasklistSectionKey, string>>
 
 export interface TaskAutomationRunRef {
@@ -154,11 +157,13 @@ export async function enableTasklist(projectName: string, chatId: string): Promi
 export async function ensureTasklistSections(projectName: string): Promise<TasklistBinding> {
   const binding = getTasklistBinding(projectName)
   if (!binding) throw new Error(`tasklist is not enabled for ${projectName}`)
-  const existing = await feishu.listTasklistSections(binding.guid)
+  let existing = await feishu.listTasklistSections(binding.guid)
+  existing = await removeEmptyLegacyDesignSections(existing)
   const byName = new Map(existing.map(section => [section.name, section.guid]))
   const sections: TasklistSectionMap = { ...(binding.sections ?? {}) }
+  sections.design = await ensureDefaultDesignSection(binding.guid, sections.design)
   let insertAfter: string | undefined
-  for (const spec of TASKLIST_SECTION_SPECS) {
+  for (const spec of TASKLIST_CUSTOM_SECTION_SPECS) {
     const guid = byName.get(spec.name) ?? await createSection(binding.guid, spec.name, insertAfter)
     sections[spec.key] = guid
     insertAfter = guid
@@ -166,6 +171,54 @@ export async function ensureTasklistSections(projectName: string): Promise<Taskl
   binding.sections = sections
   saveTasklistMap()
   return cloneBinding(binding)
+}
+
+async function ensureDefaultDesignSection(tasklistGuid: string, storedGuid?: string): Promise<string> {
+  const designName = sectionNameForKey('design')
+  let section: feishu.TasklistSection | null = null
+  if (storedGuid) {
+    const stored = await feishu.getTasklistSection(storedGuid)
+    if (stored.tasklistGuid && stored.tasklistGuid !== tasklistGuid) {
+      throw new Error(`stored design section ${storedGuid} belongs to tasklist ${stored.tasklistGuid}, expected ${tasklistGuid}`)
+    }
+    if (stored.isDefault) section = stored
+    else log(`tasklist: ignore non-default stored design section ${storedGuid}`)
+  }
+  if (!section) {
+    const guid = await feishu.discoverTasklistDefaultSectionGuid(tasklistGuid)
+    section = await feishu.getTasklistSection(guid)
+    if (section.tasklistGuid && section.tasklistGuid !== tasklistGuid) {
+      throw new Error(`discovered design section ${guid} belongs to tasklist ${section.tasklistGuid}, expected ${tasklistGuid}`)
+    }
+    if (!section.isDefault) throw new Error(`discovered design section is not default: ${guid}`)
+  }
+  if (section.name !== designName) {
+    section = await feishu.patchTasklistSectionName(section.guid, designName)
+    if (!section.isDefault) throw new Error(`renamed design section is not default: ${section.guid}`)
+  }
+  return section.guid
+}
+
+async function removeEmptyLegacyDesignSections(
+  sections: feishu.TasklistSection[],
+): Promise<feishu.TasklistSection[]> {
+  const out: feishu.TasklistSection[] = []
+  const designName = sectionNameForKey('design')
+  for (const section of sections) {
+    if (section.isDefault || section.name !== designName) {
+      out.push(section)
+      continue
+    }
+    const tasks = await feishu.listSectionTasks(section.guid)
+    if (tasks.length > 0) {
+      log(`tasklist: keep non-empty legacy design section ${section.guid} tasks=${tasks.length}`)
+      out.push(section)
+      continue
+    }
+    await feishu.deleteTasklistSection(section.guid)
+    log(`tasklist: deleted empty legacy design section ${section.guid}`)
+  }
+  return out
 }
 
 export async function deleteTasklist(projectName: string, expectedGuid: string): Promise<TasklistBinding> {

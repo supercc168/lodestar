@@ -67,7 +67,9 @@ function panelContent(opts: TasklistPanelOpts): string {
 function sectionSummary(binding: TasklistBinding): string {
   const sections = binding.sections ?? {}
   return TASKLIST_SECTION_SPECS
-    .map(spec => `${spec.name}${sections[spec.key] ? '✓' : 'MISS'}`)
+    .map(spec => spec.key === 'design'
+      ? `${spec.name}默认`
+      : `${spec.name}${sections[spec.key] ? '✓' : 'MISS'}`)
     .join(' · ')
 }
 
