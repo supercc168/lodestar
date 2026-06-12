@@ -1,12 +1,13 @@
 import { describe, expect, test } from 'bun:test'
 
-import type { TasklistSection, TaskSummary } from './feishu'
+import type { TaskComment, TasklistSection, TaskSummary } from './feishu'
 import {
   customSectionsForDesignSubtraction,
   localReviewRef,
   reviewDiffSpec,
   reviewHeadRef,
   sanitizeTaskCommentContent,
+  shouldIncludeTaskComment,
   taskArtifactTag,
   tasksOutsideCustomSections,
 } from './tasklist-worker'
@@ -67,4 +68,16 @@ describe('tasklist worker comments', () => {
       'Changed [worker](/home/leviyuan/feishu/src/tasklist-worker.ts) and [task](https://example.com/task/1).',
     )).toBe('Changed worker and [task](https://example.com/task/1).')
   })
+
+  test('includes only user comments that are not already recorded automation output', () => {
+    const ownCommentIds = new Set(['own'])
+    expect(shouldIncludeTaskComment(comment('user', 'user'), ownCommentIds)).toBe(true)
+    expect(shouldIncludeTaskComment(comment('app', 'app'), ownCommentIds)).toBe(false)
+    expect(shouldIncludeTaskComment(comment('own', 'user'), ownCommentIds)).toBe(false)
+    expect(shouldIncludeTaskComment({ id: 'unknown', content: 'missing creator' }, ownCommentIds)).toBe(false)
+  })
 })
+
+function comment(id: string, creatorType: string): TaskComment {
+  return { id, content: id, creator: { type: creatorType } }
+}

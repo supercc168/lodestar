@@ -1,6 +1,6 @@
 import { spawn, execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { buildAgySpawnPath, resolveAgyBin, agyPrintArgs } from './agy-task'
@@ -63,7 +63,9 @@ async function processTasklist(projectName: string): Promise<void> {
   const projectDir = join(feishu.PROJECTS_ROOT, projectName)
   try {
     if (!existsSync(projectDir)) throw new Error(`project directory does not exist: ${projectDir}`)
-    const binding = await tasklist.ensureTasklistSections(projectName)
+    let binding = await tasklist.ensureTasklistSections(projectName)
+    await markStaleRunningProcesses(projectName, binding)
+    binding = tasklist.getTasklistBinding(projectName) ?? binding
     const buckets = await scanTaskSections(binding)
     rememberScan(projectName, buckets)
 
@@ -135,6 +137,50 @@ function rememberScan(projectName: string, buckets: TaskBuckets): void {
   })
 }
 
+async function markStaleRunningProcesses(projectName: string, binding: TasklistBinding): Promise<void> {
+  const runningProcesses = Object.values(binding.processes ?? {})
+    .filter(record => record.status === 'running')
+  for (const record of runningProcesses) {
+    if (isRecordedProcessAlive(record)) continue
+    const error = `recorded ${record.kind} process is no longer running (pid ${record.pid ?? 'unknown'})`
+    log(`tasklist-worker: mark stale process failed project=${projectName} run=${record.runId}: ${error}`)
+    markProcessFailed(projectName, record, error)
+    if (record.taskGuid) {
+      try {
+        await commentAndStoreError(projectName, record.taskGuid, `自动化进程已丢失：${error}`)
+      } catch (e) {
+        log(`tasklist-worker: stale process comment failed run=${record.runId}: ${messageOf(e)}`)
+      }
+    }
+  }
+}
+
+function isRecordedProcessAlive(record: AutomationProcessRecord): boolean {
+  if (!record.pid || record.pid <= 0) return false
+  const cmdline = processCmdline(record.pid)
+  if (!cmdline) return false
+  const expected = record.command[0]
+  if (!expected) return true
+  const expectedBase = expected.split(/[\\/]/).pop() ?? expected
+  const commandMatches = cmdline.includes(expected) || cmdline.includes(expectedBase)
+  if (!commandMatches) return false
+  return record.command
+    .slice(1)
+    .filter(arg => arg && arg !== '<prompt>')
+    .every(arg => cmdline.includes(arg))
+}
+
+function processCmdline(pid: number): string | null {
+  try {
+    if (process.platform === 'linux') {
+      return readFileSync(`/proc/${pid}/cmdline`, 'utf8').replace(/\0/g, ' ').trim()
+    }
+    return execFileSync('ps', ['-p', String(pid), '-o', 'args='], { encoding: 'utf8', timeout: 2000 }).trim()
+  } catch {
+    return null
+  }
+}
+
 async function processDesignTask(
   projectName: string,
   projectDir: string,
@@ -185,6 +231,14 @@ async function processReadyTask(
   safeUpdate(projectName, b => {
     const state = tasklist.taskStateFor(b, selected)
     state.sectionKey = 'aiDoing'
+    state.codexExecution = undefined
+    state.agyReview = undefined
+    state.codexMerge = undefined
+    state.executionBranch = undefined
+    state.executionTag = undefined
+    state.reviewBranch = undefined
+    state.reviewRef = undefined
+    state.lastError = undefined
     b.worker ??= {}
     b.worker.runningTaskGuid = selected
   })
@@ -690,8 +744,15 @@ async function loadStructuredTask(binding: TasklistBinding, sectionKey: Tasklist
       section: tasklist.sectionNameForKey(sectionKey),
     },
     task,
-    comments: comments.filter(comment => !ownCommentIds.has(comment.id)),
+    comments: comments.filter(comment => shouldIncludeTaskComment(comment, ownCommentIds)),
   }
+}
+
+export function shouldIncludeTaskComment(comment: feishu.TaskComment, ownCommentIds: Set<string>): boolean {
+  if (ownCommentIds.has(comment.id)) return false
+  const creator = comment.creator
+  if (!creator || typeof creator !== 'object') return false
+  return (creator as { type?: unknown }).type === 'user'
 }
 
 function designFingerprint(structured: any): string {
