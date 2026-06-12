@@ -48,6 +48,7 @@ export interface TaskAutomationState {
   agyReview?: TaskAutomationRunRef
   codexMerge?: TaskAutomationRunRef
   executionBranch?: string
+  executionTag?: string
   reviewBranch?: string
   reviewRef?: string
   errorCommentIds?: string[]

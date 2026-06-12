@@ -256,10 +256,16 @@ async function processCompletedReviewTask(
       await commentAndStoreError(projectName, task.guid, '审核完成后无法合并：本地状态里没有本地审查请求。')
       return true
     }
-    const run = await runCodexMerge(projectName, projectDir, binding, task.guid, reviewRequestText(state))
+    const reviewRequest = reviewRequestText(state)
+    const run = await runCodexMerge(projectName, projectDir, binding, task.guid, reviewRequest)
     if (run.status !== 'exited') return true
     if (!String(run.stdoutTail ?? '').includes('LODESTAR_MERGE_STATUS: MERGED')) {
       await commentAndStoreError(projectName, task.guid, 'Codex 合并进程未明确输出 `LODESTAR_MERGE_STATUS: MERGED`，任务保留在审核分组。')
+      return true
+    }
+    const merged = isReviewHeadMerged(projectDir, reviewRequest)
+    if (!merged.ok) {
+      await commentAndStoreError(projectName, task.guid, `Codex 合并进程输出 MERGED，但本地 Git 未确认合并：${merged.error}`)
       return true
     }
     const doneGuid = binding.sections?.done
@@ -283,9 +289,10 @@ async function runCodexPlan(
   fingerprint: string,
 ): Promise<TaskAutomationRunRef & { stdoutTail?: string }> {
   const prompt = [
-    '你是 Lodestar 任务清单里的 Codex 规划审查 Agent。',
-    '只输出可以直接发到飞书任务评论区的规划意见；不要修改文件，不要执行实现。',
-    '重点说明需求理解、风险、建议拆分、验收点和需要人工确认的问题。',
+    `你是 ${projectName} 项目的任务讨论者。`,
+    '请结合项目实情，对这个需求做简单评审；不执行、不修改文件，可以帮着扩展想法。',
+    '如果任务中有明确的询问性质内容，必须认真回答。',
+    '最终回答以 gpt-5.5 的身份输出，内容会直接发到飞书任务评论区。',
     '',
     '任务完整结构化数据：',
     jsonBlock(structured),
@@ -327,9 +334,10 @@ async function runAgyPlan(
   fingerprint: string,
 ): Promise<TaskAutomationRunRef> {
   const prompt = [
-    '你是 Lodestar 任务清单里的 agy 规划审查 Agent。',
-    '只输出可以直接发到飞书任务评论区的看法；不要修改文件，不要执行实现。',
-    '重点利用长上下文能力补充需求边界、方案选择、潜在遗漏和反对意见。',
+    `你是 ${projectName} 项目的任务讨论者。`,
+    '请结合项目实情，对这个需求做简单评审；不执行、不修改文件，可以帮着扩展想法。',
+    '如果任务中有明确的询问性质内容，必须认真回答。',
+    '最终回答以 gemini-3.1-pro 的身份输出，内容会直接发到飞书任务评论区。',
     '',
     '任务完整结构化数据：',
     jsonBlock(structured),
@@ -397,6 +405,8 @@ async function runCodexExecution(
   binding: TasklistBinding,
   taskGuid: string,
 ): Promise<AutomationProcessRecord> {
+  const artifactTag = taskArtifactTag(taskGuid)
+  assertTaskArtifactTagAvailable(projectDir, artifactTag)
   const worktreePath = prepareAutomationWorktree(projectDir, projectName, AI_AUTO_BRANCH)
   const structured = await loadStructuredTask(binding, 'aiDoing', taskGuid)
   const prompt = [
@@ -441,21 +451,26 @@ async function runCodexExecution(
     const task = await feishu.getTask(taskGuid)
     const baseBranch = git(projectDir, ['branch', '--show-current']).trim()
     if (!baseBranch) throw new Error('cannot determine base branch from project directory')
+    const baseHead = git(projectDir, ['rev-parse', 'HEAD']).trim()
     const commitMsg = commitTitle(task?.summary || taskGuid)
     git(worktreePath, ['add', '-A'])
     git(worktreePath, ['commit', '-m', commitMsg])
     const commitHash = git(worktreePath, ['rev-parse', 'HEAD']).trim()
-    const reviewRef = localReviewRef(baseBranch, AI_AUTO_BRANCH)
+    createTaskArtifactTag(worktreePath, artifactTag, commitHash)
+    git(worktreePath, ['reset', '--hard', baseHead])
+    const reviewRef = localReviewRef(baseHead, artifactTag)
     safeUpdate(projectName, b => {
       const state = tasklist.taskStateFor(b, taskGuid)
       state.executionBranch = AI_AUTO_BRANCH
+      state.executionTag = artifactTag
       state.reviewBranch = AI_REVIEW_BRANCH
       state.reviewRef = reviewRef
     })
     try {
       await feishu.addTaskComment(taskGuid, agentComment('Codex 执行', [
-        `本地 PR：${AI_AUTO_BRANCH} -> ${baseBranch}`,
-        `Diff：${baseBranch}..${AI_AUTO_BRANCH}`,
+        `任务产物：${artifactTag}`,
+        `Base：${baseBranch}@${baseHead.slice(0, 12)}`,
+        `Diff：${baseHead}..${artifactTag}`,
         `提交：${commitHash.slice(0, 12)}`,
         '',
         '输出摘要：',
@@ -486,11 +501,14 @@ async function runAgyReview(
 ): Promise<AutomationProcessRecord> {
   const worktreePath = prepareAutomationWorktree(projectDir, projectName, AI_REVIEW_BRANCH)
   const structured = await loadStructuredTask(binding, 'aiReview', taskGuid)
+  const diffSpec = reviewDiffSpec(reviewRequest)
+  const headRef = reviewHeadRef(reviewRequest)
   const prompt = [
     '你是 Lodestar 自动审核 Agent。',
     `请审核本地审查请求：${reviewRequest}`,
-    `当前工作区在 ${AI_REVIEW_BRANCH}，实现分支是 ${AI_AUTO_BRANCH}。`,
-    `重点查看 git diff HEAD..${AI_AUTO_BRANCH}，输出可以直接发到飞书任务评论区的审核意见。`,
+    `当前工作区在 ${AI_REVIEW_BRANCH}，临时执行 worktree 分支是 ${AI_AUTO_BRANCH}。`,
+    `任务产物 ref 是 ${headRef}。`,
+    `重点查看 git diff ${diffSpec}，输出可以直接发到飞书任务评论区的审核意见。`,
     '不要修改文件，不要合并，不要操作 GitHub 或远端 PR。',
     '',
     '任务完整结构化数据：',
@@ -522,11 +540,14 @@ async function runCodexMerge(
   taskGuid: string,
   reviewRequest: string,
 ): Promise<AutomationProcessRecord> {
+  const diffSpec = reviewDiffSpec(reviewRequest)
+  const headRef = reviewHeadRef(reviewRequest)
   const prompt = [
     '你是 Lodestar 自动合并 Agent。',
     `任务已由人工在飞书清单中勾选完成。请合并本地审查请求：${reviewRequest}`,
-    `只使用本地 Git，把 ${AI_AUTO_BRANCH} 合并到当前主工作区所在分支。`,
-    `合并前确认工作区干净，并查看 git diff HEAD..${AI_AUTO_BRANCH}。`,
+    `任务产物 ref 是 ${headRef}。`,
+    `只使用本地 Git，把 ${headRef} 合并到当前主工作区所在分支。`,
+    `合并前确认工作区干净，并查看 git diff ${diffSpec}。`,
     '不要使用 GitHub、gh CLI、远端 PR 或 push。',
     '如发生冲突，按仓库约定解决并运行与风险匹配的验证。',
     '如果确认已经合并，最终输出一行：LODESTAR_MERGE_STATUS: MERGED',
@@ -761,12 +782,75 @@ export function localReviewRef(baseBranch: string, headBranch: string): string {
   return `local:${base}..${head}`
 }
 
+export function taskArtifactTag(taskGuid: string): string {
+  const guid = taskGuid.trim()
+  if (!guid) throw new Error('task guid is required for task artifact tag')
+  return `${AI_AUTO_BRANCH}/${guid}`
+}
+
+export function reviewDiffSpec(reviewRequest: string): string {
+  const raw = reviewRequest.trim()
+  if (!raw.startsWith('local:')) throw new Error(`unsupported local review request: ${reviewRequest}`)
+  const diffSpec = raw.slice('local:'.length).trim()
+  if (!diffSpec.includes('..')) throw new Error(`unsupported local review diff: ${reviewRequest}`)
+  return diffSpec
+}
+
+export function reviewHeadRef(reviewRequest: string): string {
+  const diffSpec = reviewDiffSpec(reviewRequest)
+  const index = diffSpec.lastIndexOf('..')
+  const head = diffSpec.slice(index + 2).trim()
+  if (!head) throw new Error(`missing review head ref: ${reviewRequest}`)
+  return head
+}
+
+function assertTaskArtifactTagAvailable(cwd: string, tag: string): void {
+  try {
+    git(cwd, ['check-ref-format', `refs/tags/${tag}`])
+  } catch {
+    throw new Error(`invalid task artifact tag: ${tag}`)
+  }
+  if (gitRefExists(cwd, `refs/tags/${tag}`)) {
+    throw new Error(`task artifact tag already exists: ${tag}`)
+  }
+}
+
+function createTaskArtifactTag(cwd: string, tag: string, commitHash: string): void {
+  assertTaskArtifactTagAvailable(cwd, tag)
+  git(cwd, ['tag', tag, commitHash])
+}
+
+function gitRefExists(cwd: string, ref: string): boolean {
+  try {
+    git(cwd, ['rev-parse', '--verify', '--quiet', ref])
+    return true
+  } catch {
+    return false
+  }
+}
+
+function isReviewHeadMerged(cwd: string, reviewRequest: string): { ok: true } | { ok: false; error: string } {
+  let headRef: string
+  try {
+    headRef = reviewHeadRef(reviewRequest)
+  } catch (e) {
+    return { ok: false, error: messageOf(e) }
+  }
+  try {
+    git(cwd, ['merge-base', '--is-ancestor', headRef, 'HEAD'])
+    return { ok: true }
+  } catch {
+    return { ok: false, error: `${headRef} is not an ancestor of HEAD` }
+  }
+}
+
 function hasLocalReviewRequest(state: TaskAutomationState): boolean {
-  return Boolean(state.reviewRef || state.executionBranch)
+  return Boolean(state.reviewRef || state.executionTag || state.executionBranch)
 }
 
 function reviewRequestText(state: TaskAutomationState): string {
   if (state.reviewRef) return state.reviewRef
+  if (state.executionTag) return `local:HEAD..${state.executionTag}`
   if (state.executionBranch) return `local:HEAD..${state.executionBranch}`
   throw new Error('missing local review request')
 }

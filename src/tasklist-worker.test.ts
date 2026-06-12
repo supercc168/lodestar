@@ -4,7 +4,10 @@ import type { TasklistSection, TaskSummary } from './feishu'
 import {
   customSectionsForDesignSubtraction,
   localReviewRef,
+  reviewDiffSpec,
+  reviewHeadRef,
   sanitizeTaskCommentContent,
+  taskArtifactTag,
   tasksOutsideCustomSections,
 } from './tasklist-worker'
 
@@ -44,7 +47,17 @@ describe('tasklist worker buckets', () => {
 
 describe('tasklist worker local reviews', () => {
   test('formats local review refs as base-to-head diffs', () => {
-    expect(localReviewRef('main', 'AI-AUTO')).toBe('local:main..AI-AUTO')
+    expect(localReviewRef('abc123', 'AI-AUTO/task-guid')).toBe('local:abc123..AI-AUTO/task-guid')
+  })
+
+  test('formats task artifact tags under AI-AUTO namespace', () => {
+    expect(taskArtifactTag('task-guid')).toBe('AI-AUTO/task-guid')
+  })
+
+  test('extracts diff spec and head ref from local review refs', () => {
+    const ref = 'local:abc123..AI-AUTO/task-guid'
+    expect(reviewDiffSpec(ref)).toBe('abc123..AI-AUTO/task-guid')
+    expect(reviewHeadRef(ref)).toBe('AI-AUTO/task-guid')
   })
 })
 
