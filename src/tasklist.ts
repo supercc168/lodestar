@@ -49,8 +49,7 @@ export interface TaskAutomationState {
   codexMerge?: TaskAutomationRunRef
   executionBranch?: string
   reviewBranch?: string
-  prUrl?: string
-  prNumber?: number
+  reviewRef?: string
   errorCommentIds?: string[]
   lastError?: string
 }

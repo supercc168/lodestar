@@ -1,13 +1,9 @@
-import { execFileSync } from 'node:child_process'
-import { mkdtempSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
 import { describe, expect, test } from 'bun:test'
 
 import type { TasklistSection, TaskSummary } from './feishu'
 import {
   customSectionsForDesignSubtraction,
-  resolveGitHubRemote,
+  localReviewRef,
   sanitizeTaskCommentContent,
   tasksOutsideCustomSections,
 } from './tasklist-worker'
@@ -46,32 +42,16 @@ describe('tasklist worker buckets', () => {
   })
 })
 
-describe('tasklist worker GitHub remotes', () => {
-  test('resolves GitHub remote named github when origin is absent', () => {
-    const repo = mkdtempSync(join(tmpdir(), 'lodestar-tasklist-remote-'))
-    try {
-      git(repo, ['init'])
-      git(repo, ['remote', 'add', 'github', 'git@github.com:leviyuan/lodestar.git'])
-
-      expect(resolveGitHubRemote(repo)).toEqual({
-        name: 'github',
-        url: 'git@github.com:leviyuan/lodestar.git',
-        repo: { owner: 'leviyuan', repo: 'lodestar' },
-      })
-    } finally {
-      rmSync(repo, { recursive: true, force: true })
-    }
+describe('tasklist worker local reviews', () => {
+  test('formats local review refs as base-to-head diffs', () => {
+    expect(localReviewRef('main', 'AI-AUTO')).toBe('local:main..AI-AUTO')
   })
 })
-
-function git(cwd: string, args: string[]): string {
-  return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
-}
 
 describe('tasklist worker comments', () => {
   test('removes local markdown link targets while preserving valid URLs', () => {
     expect(sanitizeTaskCommentContent(
-      'Changed [worker](/home/leviyuan/feishu/src/tasklist-worker.ts) and [PR](https://github.com/leviyuan/lodestar/pull/1).',
-    )).toBe('Changed worker and [PR](https://github.com/leviyuan/lodestar/pull/1).')
+      'Changed [worker](/home/leviyuan/feishu/src/tasklist-worker.ts) and [task](https://example.com/task/1).',
+    )).toBe('Changed worker and [task](https://example.com/task/1).')
   })
 })

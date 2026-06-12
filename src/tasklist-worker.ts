@@ -1,6 +1,6 @@
 import { spawn, execFileSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
-import { existsSync, readFileSync } from 'node:fs'
+import { existsSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { buildAgySpawnPath, resolveAgyBin, agyPrintArgs } from './agy-task'
@@ -203,7 +203,7 @@ async function processExecutingTask(
   if (state.codexExecution?.status === 'running') return true
   if (state.codexExecution?.status === 'failed') return true
   if (state.codexExecution?.status === 'exited') {
-    return state.prUrl
+    return hasLocalReviewRequest(state)
       ? await reviewExecutedTask(projectName, projectDir, binding, task.guid)
       : true
   }
@@ -221,11 +221,11 @@ async function reviewExecutedTask(
   taskGuid: string,
 ): Promise<boolean> {
   const latest = getTaskState(projectName, taskGuid)
-  if (!latest.prUrl) return true
+  if (!hasLocalReviewRequest(latest)) return true
   if (latest.agyReview?.status === 'running') return true
   if (latest.agyReview?.status === 'failed') return true
   if (latest.agyReview?.status !== 'exited') {
-    const run = await runAgyReview(projectName, projectDir, binding, taskGuid, latest.prUrl)
+    const run = await runAgyReview(projectName, projectDir, binding, taskGuid, reviewRequestText(latest))
     if (run.status !== 'exited') return true
   }
   const reviewGuid = binding.sections?.aiReview
@@ -252,11 +252,11 @@ async function processCompletedReviewTask(
     if (state.codexMerge?.status === 'running') return true
     if (state.codexMerge?.status === 'exited') continue
     if (state.codexMerge?.status === 'failed') return true
-    if (!state.prUrl) {
-      await commentAndStoreError(projectName, task.guid, '审核完成后无法合并：本地状态里没有 PR URL。')
+    if (!hasLocalReviewRequest(state)) {
+      await commentAndStoreError(projectName, task.guid, '审核完成后无法合并：本地状态里没有本地审查请求。')
       return true
     }
-    const run = await runCodexMerge(projectName, projectDir, binding, task.guid, state.prUrl)
+    const run = await runCodexMerge(projectName, projectDir, binding, task.guid, reviewRequestText(state))
     if (run.status !== 'exited') return true
     if (!String(run.stdoutTail ?? '').includes('LODESTAR_MERGE_STATUS: MERGED')) {
       await commentAndStoreError(projectName, task.guid, 'Codex 合并进程未明确输出 `LODESTAR_MERGE_STATUS: MERGED`，任务保留在审核分组。')
@@ -402,7 +402,8 @@ async function runCodexExecution(
   const prompt = [
     '你是 Lodestar 自动执行 Agent。',
     '根据飞书任务完成代码实现，直接在当前仓库工作区修改文件。',
-    '完成后运行与改动风险匹配的验证。不要提交 git commit，不要创建 PR。',
+    '完成后运行与改动风险匹配的验证。不要提交 git commit，不要操作 GitHub 或远端 PR。',
+    'worker 会在你完成后生成本地审查请求。',
     '最终回复必须包含变更摘要和验证结果。',
     '',
     '任务完整结构化数据：',
@@ -434,35 +435,28 @@ async function runCodexExecution(
   try {
     const status = git(worktreePath, ['status', '--porcelain=v1']).trim()
     if (!status) {
-      await commentAndStoreError(projectName, taskGuid, 'Codex 执行完成但没有产生仓库变更，未创建 PR。')
+      await commentAndStoreError(projectName, taskGuid, 'Codex 执行完成但没有产生仓库变更，未生成本地审查请求。')
       return markProcessFailed(projectName, result, 'Codex execution produced no repository changes')
     }
     const task = await feishu.getTask(taskGuid)
+    const baseBranch = git(projectDir, ['branch', '--show-current']).trim()
+    if (!baseBranch) throw new Error('cannot determine base branch from project directory')
     const commitMsg = commitTitle(task?.summary || taskGuid)
     git(worktreePath, ['add', '-A'])
     git(worktreePath, ['commit', '-m', commitMsg])
-    const remote = resolveGitHubRemote(projectDir)
-    git(worktreePath, ['push', '--force-with-lease', remote.name, `${AI_AUTO_BRANCH}:${AI_AUTO_BRANCH}`])
-    const pr = await createGitHubPullRequest(projectDir, {
-      remote,
-      head: AI_AUTO_BRANCH,
-      title: commitMsg,
-      body: [
-        `飞书任务：${task?.url ?? taskGuid}`,
-        '',
-        'Codex 自动执行输出：',
-        fenced(tail(result.stdoutTail ?? '', 6000)),
-      ].join('\n'),
-    })
+    const commitHash = git(worktreePath, ['rev-parse', 'HEAD']).trim()
+    const reviewRef = localReviewRef(baseBranch, AI_AUTO_BRANCH)
     safeUpdate(projectName, b => {
       const state = tasklist.taskStateFor(b, taskGuid)
       state.executionBranch = AI_AUTO_BRANCH
-      state.prUrl = pr.url
-      state.prNumber = pr.number
+      state.reviewBranch = AI_REVIEW_BRANCH
+      state.reviewRef = reviewRef
     })
     try {
       await feishu.addTaskComment(taskGuid, agentComment('Codex 执行', [
-        `PR：${pr.url}`,
+        `本地 PR：${AI_AUTO_BRANCH} -> ${baseBranch}`,
+        `Diff：${baseBranch}..${AI_AUTO_BRANCH}`,
+        `提交：${commitHash.slice(0, 12)}`,
         '',
         '输出摘要：',
         tail(result.stdoutTail ?? '', 6000),
@@ -477,7 +471,7 @@ async function runCodexExecution(
     }
   } catch (e) {
     const msg = messageOf(e)
-    await commentAndStoreError(projectName, taskGuid, `Codex 执行后创建 PR 失败：${msg}`)
+    await commentAndStoreError(projectName, taskGuid, `Codex 执行后生成本地审查请求失败：${msg}`)
     return markProcessFailed(projectName, result, msg)
   }
   return result
@@ -488,16 +482,16 @@ async function runAgyReview(
   projectDir: string,
   binding: TasklistBinding,
   taskGuid: string,
-  prUrl: string,
+  reviewRequest: string,
 ): Promise<AutomationProcessRecord> {
   const worktreePath = prepareAutomationWorktree(projectDir, projectName, AI_REVIEW_BRANCH)
   const structured = await loadStructuredTask(binding, 'aiReview', taskGuid)
   const prompt = [
     '你是 Lodestar 自动审核 Agent。',
-    `请审核 PR：${prUrl}`,
+    `请审核本地审查请求：${reviewRequest}`,
     `当前工作区在 ${AI_REVIEW_BRANCH}，实现分支是 ${AI_AUTO_BRANCH}。`,
     `重点查看 git diff HEAD..${AI_AUTO_BRANCH}，输出可以直接发到飞书任务评论区的审核意见。`,
-    '不要修改文件，不要合并。',
+    '不要修改文件，不要合并，不要操作 GitHub 或远端 PR。',
     '',
     '任务完整结构化数据：',
     jsonBlock(structured),
@@ -526,12 +520,15 @@ async function runCodexMerge(
   projectDir: string,
   binding: TasklistBinding,
   taskGuid: string,
-  prUrl: string,
+  reviewRequest: string,
 ): Promise<AutomationProcessRecord> {
   const prompt = [
     '你是 Lodestar 自动合并 Agent。',
-    `任务已由人工在飞书清单中勾选完成。请合并 PR：${prUrl}`,
-    '遵守仓库 AGENTS.md 和本机 GitHub 操作约定；不要使用 gh CLI。',
+    `任务已由人工在飞书清单中勾选完成。请合并本地审查请求：${reviewRequest}`,
+    `只使用本地 Git，把 ${AI_AUTO_BRANCH} 合并到当前主工作区所在分支。`,
+    `合并前确认工作区干净，并查看 git diff HEAD..${AI_AUTO_BRANCH}。`,
+    '不要使用 GitHub、gh CLI、远端 PR 或 push。',
+    '如发生冲突，按仓库约定解决并运行与风险匹配的验证。',
     '如果确认已经合并，最终输出一行：LODESTAR_MERGE_STATUS: MERGED',
     '如果不能合并，最终输出一行：LODESTAR_MERGE_STATUS: FAILED，并说明原因。',
   ].join('\n')
@@ -756,81 +753,22 @@ function git(cwd: string, args: string[]): string {
   }
 }
 
-async function createGitHubPullRequest(projectDir: string, opts: {
-  remote?: GitHubRemote
-  head: string
-  title: string
-  body: string
-}): Promise<{ url: string; number: number }> {
-  const repo = opts.remote ?? resolveGitHubRemote(projectDir)
-  const base = git(projectDir, ['branch', '--show-current']).trim()
-  if (!base) throw new Error('cannot determine base branch from project directory')
-  const token = readGitHubToken()
-  const res = await fetch(`https://api.github.com/repos/${repo.repo.owner}/${repo.repo.repo}/pulls`, {
-    method: 'POST',
-    headers: {
-      Authorization: `Bearer ${token}`,
-      Accept: 'application/vnd.github+json',
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      title: opts.title,
-      head: opts.head,
-      base,
-      body: opts.body,
-    }),
-  })
-  const text = await res.text()
-  if (!res.ok) throw new Error(`github PR create failed status=${res.status}: ${text}`)
-  const json = JSON.parse(text)
-  if (!json.html_url || typeof json.number !== 'number') throw new Error(`github PR create returned unexpected body: ${text}`)
-  return { url: json.html_url, number: json.number }
+export function localReviewRef(baseBranch: string, headBranch: string): string {
+  const base = baseBranch.trim()
+  const head = headBranch.trim()
+  if (!base) throw new Error('base branch is required for local review ref')
+  if (!head) throw new Error('head branch is required for local review ref')
+  return `local:${base}..${head}`
 }
 
-export interface GitHubRemote {
-  name: string
-  url: string
-  repo: { owner: string; repo: string }
+function hasLocalReviewRequest(state: TaskAutomationState): boolean {
+  return Boolean(state.reviewRef || state.executionBranch)
 }
 
-export function resolveGitHubRemote(projectDir: string): GitHubRemote {
-  const remotes = git(projectDir, ['remote']).split('\n').map(s => s.trim()).filter(Boolean)
-  const origin = remotes.includes('origin') ? remoteByName(projectDir, 'origin') : null
-  if (origin) return origin
-  for (const name of remotes) {
-    const remote = remoteByName(projectDir, name)
-    if (remote) return remote
-  }
-  throw new Error('no GitHub remote found')
-}
-
-function remoteByName(projectDir: string, name: string): GitHubRemote | null {
-  try {
-    const url = git(projectDir, ['config', '--get', `remote.${name}.url`]).trim()
-    const repo = parseGitHubRemote(url)
-    return repo ? { name, url, repo } : null
-  } catch {
-    return null
-  }
-}
-
-function parseGitHubRemote(remote: string): { owner: string; repo: string } | null {
-  const ssh = remote.match(/^git@github\.com:([^/]+)\/(.+?)(?:\.git)?$/)
-  if (ssh) return { owner: ssh[1], repo: ssh[2] }
-  const https = remote.match(/^https:\/\/github\.com\/([^/]+)\/(.+?)(?:\.git)?$/)
-  if (https) return { owner: https[1], repo: https[2] }
-  return null
-}
-
-function readGitHubToken(): string {
-  const path = join(process.env.HOME ?? '', '.git-credentials')
-  const text = readFileSync(path, 'utf8')
-  for (const line of text.split('\n')) {
-    if (!line.includes('github.com')) continue
-    const match = line.match(/https:\/\/[^:]+:([^@]+)@github\.com/)
-    if (match?.[1]) return decodeURIComponent(match[1])
-  }
-  throw new Error('no GitHub token found in ~/.git-credentials')
+function reviewRequestText(state: TaskAutomationState): string {
+  if (state.reviewRef) return state.reviewRef
+  if (state.executionBranch) return `local:HEAD..${state.executionBranch}`
+  throw new Error('missing local review request')
 }
 
 function getTaskState(projectName: string, taskGuid: string): TaskAutomationState {
