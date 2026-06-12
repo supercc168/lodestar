@@ -5,7 +5,12 @@ import { join } from 'node:path'
 import { describe, expect, test } from 'bun:test'
 
 import type { TasklistSection, TaskSummary } from './feishu'
-import { customSectionsForDesignSubtraction, resolveGitHubRemote, tasksOutsideCustomSections } from './tasklist-worker'
+import {
+  customSectionsForDesignSubtraction,
+  resolveGitHubRemote,
+  sanitizeTaskCommentContent,
+  tasksOutsideCustomSections,
+} from './tasklist-worker'
 
 function task(guid: string): TaskSummary {
   return { guid, summary: guid }
@@ -62,3 +67,11 @@ describe('tasklist worker GitHub remotes', () => {
 function git(cwd: string, args: string[]): string {
   return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
 }
+
+describe('tasklist worker comments', () => {
+  test('removes local markdown link targets while preserving valid URLs', () => {
+    expect(sanitizeTaskCommentContent(
+      'Changed [worker](/home/leviyuan/feishu/src/tasklist-worker.ts) and [PR](https://github.com/leviyuan/lodestar/pull/1).',
+    )).toBe('Changed worker and [PR](https://github.com/leviyuan/lodestar/pull/1).')
+  })
+})

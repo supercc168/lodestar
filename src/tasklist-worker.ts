@@ -202,19 +202,37 @@ async function processExecutingTask(
   const state = getTaskState(projectName, task.guid)
   if (state.codexExecution?.status === 'running') return true
   if (state.codexExecution?.status === 'failed') return true
-  if (state.codexExecution?.status === 'exited') return state.prUrl ? false : true
+  if (state.codexExecution?.status === 'exited') {
+    return state.prUrl
+      ? await reviewExecutedTask(projectName, projectDir, binding, task.guid)
+      : true
+  }
 
   const run = await runCodexExecution(projectName, projectDir, binding, task.guid)
   if (run.status !== 'exited') return true
 
-  const latest = getTaskState(projectName, task.guid)
+  return await reviewExecutedTask(projectName, projectDir, binding, task.guid)
+}
+
+async function reviewExecutedTask(
+  projectName: string,
+  projectDir: string,
+  binding: TasklistBinding,
+  taskGuid: string,
+): Promise<boolean> {
+  const latest = getTaskState(projectName, taskGuid)
   if (!latest.prUrl) return true
-  await runAgyReview(projectName, projectDir, binding, task.guid, latest.prUrl)
+  if (latest.agyReview?.status === 'running') return true
+  if (latest.agyReview?.status === 'failed') return true
+  if (latest.agyReview?.status !== 'exited') {
+    const run = await runAgyReview(projectName, projectDir, binding, taskGuid, latest.prUrl)
+    if (run.status !== 'exited') return true
+  }
   const reviewGuid = binding.sections?.aiReview
   if (!reviewGuid) throw new Error('missing [AI]待审核 section guid')
-  await feishu.moveTaskToSection(task.guid, binding.guid, reviewGuid)
+  await feishu.moveTaskToSection(taskGuid, binding.guid, reviewGuid)
   safeUpdate(projectName, b => {
-    const state = tasklist.taskStateFor(b, task.guid)
+    const state = tasklist.taskStateFor(b, taskGuid)
     state.sectionKey = 'aiReview'
     b.worker ??= {}
     b.worker.runningTaskGuid = undefined
@@ -436,18 +454,27 @@ async function runCodexExecution(
         fenced(tail(result.stdoutTail ?? '', 6000)),
       ].join('\n'),
     })
-    await feishu.addTaskComment(taskGuid, agentComment('Codex 执行', [
-      `PR：${pr.url}`,
-      '',
-      '输出摘要：',
-      tail(result.stdoutTail ?? '', 6000),
-    ].join('\n')))
     safeUpdate(projectName, b => {
       const state = tasklist.taskStateFor(b, taskGuid)
       state.executionBranch = AI_AUTO_BRANCH
       state.prUrl = pr.url
       state.prNumber = pr.number
     })
+    try {
+      await feishu.addTaskComment(taskGuid, agentComment('Codex 执行', [
+        `PR：${pr.url}`,
+        '',
+        '输出摘要：',
+        tail(result.stdoutTail ?? '', 6000),
+      ].join('\n')))
+    } catch (e) {
+      const msg = `Codex 执行评论写入失败：${messageOf(e)}`
+      log(`tasklist-worker: ${msg}`)
+      safeUpdate(projectName, b => {
+        const state = tasklist.taskStateFor(b, taskGuid)
+        state.lastError = msg
+      })
+    }
   } catch (e) {
     const msg = messageOf(e)
     await commentAndStoreError(projectName, taskGuid, `Codex 执行后创建 PR 失败：${msg}`)
@@ -941,9 +968,13 @@ function agentComment(title: string, content: string): string {
 }
 
 function trimForComment(content: string): string {
-  const clean = content.trim()
+  const clean = sanitizeTaskCommentContent(content).trim()
   if (clean.length <= COMMENT_OUTPUT_LIMIT) return clean
   return `${clean.slice(0, COMMENT_OUTPUT_LIMIT)}\n\n[truncated ${clean.length - COMMENT_OUTPUT_LIMIT} chars]`
+}
+
+export function sanitizeTaskCommentContent(content: string): string {
+  return content.replace(/\[([^\]\n]+)\]\(((?!https?:\/\/|applink:\/\/)[^)]+)\)/g, '$1')
 }
 
 function commitTitle(summary: string): string {
