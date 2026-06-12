@@ -25,6 +25,7 @@ import * as feishu from './src/feishu'
 import { actionCardResponse } from './src/card-action'
 import { startNotifyServer } from './src/notify'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
+import { startTasklistWorker } from './src/tasklist-worker'
 import { config } from './src/config'
 import { log } from './src/log'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
@@ -428,6 +429,22 @@ async function handleCardAction(data: any): Promise<any> {
       const result = await session.onWorktreeDisband(String(value.slug ?? ''))
       return actionCardResponse(result.card)
     }
+    case 'tasklist_enable': {
+      const result = await session.onTasklistEnable()
+      return actionCardResponse(result.card)
+    }
+    case 'tasklist_delete_prompt': {
+      const result = session.onTasklistDeletePrompt(String(value.guid ?? ''))
+      return actionCardResponse(result.card)
+    }
+    case 'tasklist_delete_confirm': {
+      const result = await session.onTasklistDeleteConfirm(String(value.guid ?? ''))
+      return actionCardResponse(result.card)
+    }
+    case 'agy_forward_codex': {
+      const result = session.beginAgyForwardToCodex(String(value.result_id ?? ''), userId)
+      return { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
   }
   return { toast: { type: 'info', content: 'unknown action' } }
 }
@@ -523,6 +540,7 @@ async function boot(): Promise<void> {
   feishu.loadSessionModelMap()
   await feishu.refreshChatList()
   setInterval(() => { void feishu.refreshChatList() }, 5 * 60 * 1000)
+  startTasklistWorker()
 
   // Lark WSClient sends pings every ~120s but doesn't verify pongs by default.
   // On a half-open TCP (NAT idle-kill, network blip) the socket stays OPEN and

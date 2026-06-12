@@ -62,3 +62,21 @@ export {
   worktreeListCard,
   worktreeNoticeCard,
 } from './cards/worktree'
+export {
+  type AgyGitSnapshot,
+  type AgyStats,
+  type AgyTaskCardOpts,
+  agyForwardElement,
+  agyForwardPlaceholderElement,
+  agyPromptElement,
+  agyRepoElement,
+  agyResultElement,
+  agyStatsElement,
+  agyTaskCard,
+  cleanAgyOutputText,
+} from './cards/agy'
+export {
+  type TasklistPanelNotice,
+  type TasklistPanelOpts,
+  tasklistPanelCard,
+} from './cards/task'

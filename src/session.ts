@@ -14,9 +14,11 @@
  * only the session-*.ts helpers should touch it."
  */
 
+import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import {
   CODEX_EFFORT,
   CodexProcess,
@@ -41,7 +43,12 @@ import * as feishu from './feishu'
 import { log } from './log'
 import { readSysInfo } from './sysinfo'
 import { readUsage, updateUsageFromRateLimits, type UsageSnapshot } from './usage'
-import { contextLimitFromAppServer, contextTokensFromUsage } from './context-window'
+import {
+  contextLimitFromAppServer,
+  contextTokenRatioLabel,
+  contextTokensFromUsage,
+  rawContextPercentLabel,
+} from './context-window'
 import { extractAskUsrMarkers, extractSendMarkerPaths, stripAskUsrMarkers } from './outbound-markers'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionTools from './session-tools'
@@ -49,6 +56,16 @@ import * as sessionAsk from './session-ask'
 import * as sessionHostAsk from './session-host-ask'
 import * as sessionPermission from './session-permission'
 import * as worktree from './worktree'
+import * as tasklist from './tasklist'
+import {
+  AGY_DEFAULT_MODEL,
+  AGY_HOST_TIMEOUT_MS,
+  agyDisplayCommand,
+  captureGitSnapshot,
+  spawnAgyPrint,
+  type AgyProcess,
+  type GitSnapshot,
+} from './agy-task'
 
 export type { SessionOpts } from './session-types'
 
@@ -77,6 +94,12 @@ const FOOTER_WORKING = 'Working...'
 const RESUME_INIT_NOTICE_MS = 10_000
 const RESUME_INIT_TIMEOUT_MS = 120_000
 const CONTEXT_COMPACT_TIMEOUT_MS = 120_000
+const CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS = 1500
+const AGY_CAPTURE_CHAR_LIMIT = 1_000_000
+const AGY_FORCE_KILL_AFTER_MS = 5000
+const AGY_RESULT_CARD_LIMIT = 8000
+const AGY_STDERR_CARD_LIMIT = 2000
+const AGY_STATUS_TICK_MS = 30_000
 
 interface ModelPanelState {
   models: cards.ModelChoice[]
@@ -101,9 +124,20 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
 }
 
 type WorktreeActionResult = { ok: boolean; message: string; card: object }
+type TasklistActionResult = { ok: boolean; message: string; card: object }
 type ModelActionResult = { ok: boolean; message: string; card?: object }
 type ManualCompactionWatch = {
   promise: Promise<ContextCompactedNotification>
+  cancel(): void
+}
+type ContextUsageSnapshot = {
+  usage: CodexUsage | null
+  contextWindow: number | null
+  threadId?: string
+  turnId?: string
+}
+type ManualCompactionUsageWatch = {
+  waitFor(notice: ContextCompactedNotification, timeoutMs: number): Promise<ContextUsageSnapshot | null>
   cancel(): void
 }
 type ControlCommand = 'hi' | 'stop' | 'kill' | 'restart' | 'clear' | 'compact' | 'model'
@@ -159,6 +193,41 @@ interface StatusCardHandle {
   cardId: string
   title: string
   timer: FooterTimer
+}
+
+interface AgyTaskState {
+  proc: AgyProcess
+  cardId: string
+  messageId: string
+  prompt: string
+  startedAt: number
+  beforeGit: GitSnapshot
+  stdout: string
+  stderr: string
+  stdoutDecoder: StringDecoder
+  stderrDecoder: StringDecoder
+  decodersEnded: boolean
+  stdoutBytes: number
+  stderrBytes: number
+  lastCpuPercent: number | null
+  lastMemBytes: number | null
+  captureTruncated: boolean
+  cardWriteFailed: boolean
+  finished: boolean
+  stopRequested: boolean
+  stopStatus?: string
+  hostTimedOut: boolean
+  spawnError?: string
+  timer: ReturnType<typeof setInterval>
+  hostTimeout: ReturnType<typeof setTimeout>
+  forceKillTimer?: ReturnType<typeof setTimeout>
+  done: Promise<void>
+  resolveDone: () => void
+}
+
+interface AgyForwardRecord {
+  prompt: string
+  used: boolean
 }
 
 function timedStatus(status: string, startedAt: number): string {
@@ -330,6 +399,9 @@ export class Session {
    * compaction. Suppresses the generic no-turn compaction text alert;
    * command feedback is rendered on that status card instead. */
   private manualContextCompactionPending = false
+  private runningAgy: AgyTaskState | null = null
+  private startingAgy = false
+  private agyForwardPrompts = new Map<string, AgyForwardRecord>()
 
   constructor(
     public readonly sessionName: string,
@@ -488,6 +560,361 @@ export class Session {
       suffix: finalStatus,
     }))
     await cardkit.dispose(handle.cardId)
+  }
+
+  private agyElapsedSec(task: AgyTaskState, now = Date.now()): string {
+    return ((now - task.startedAt) / 1000).toFixed(1)
+  }
+
+  private agyProcessUsage(task: AgyTaskState): { cpuPercent: number | null; memBytes: number | null } {
+    const pid = task.proc.pid
+    if (!pid || process.platform === 'win32') {
+      return { cpuPercent: task.lastCpuPercent, memBytes: task.lastMemBytes }
+    }
+    try {
+      const out = execFileSync('ps', ['-p', String(pid), '-o', '%cpu=,rss='], {
+        encoding: 'utf8',
+        timeout: 2000,
+        stdio: ['ignore', 'pipe', 'ignore'],
+      }).trim()
+      const [cpuRaw, rssRaw] = out.split(/\s+/)
+      const cpuPercent = Number.parseFloat(cpuRaw ?? '')
+      const rssKb = Number.parseInt(rssRaw ?? '', 10)
+      if (Number.isFinite(cpuPercent)) task.lastCpuPercent = cpuPercent
+      if (Number.isFinite(rssKb)) task.lastMemBytes = rssKb * 1024
+    } catch {
+      // Process may already have exited between close and the final card update.
+    }
+    return { cpuPercent: task.lastCpuPercent, memBytes: task.lastMemBytes }
+  }
+
+  private agyStats(task: AgyTaskState, status: string, endedAt?: number, exit?: { code: number | null; signal: string | null }): cards.AgyStats {
+    const stderr = this.agyFinalStderr(task)
+    const usage = this.agyProcessUsage(task)
+    return {
+      status,
+      model: AGY_DEFAULT_MODEL,
+      cwd: this.workDir,
+      command: agyDisplayCommand(),
+      startedAtMs: task.startedAt,
+      elapsedSec: this.agyElapsedSec(task, endedAt ?? Date.now()),
+      cpuPercent: usage.cpuPercent,
+      memBytes: usage.memBytes,
+      ...(endedAt ? { endedAtMs: endedAt } : {}),
+      ...(exit ? { exitCode: exit.code, signal: exit.signal } : {}),
+      stdoutBytes: task.stdoutBytes,
+      stderrBytes: task.stderrBytes,
+      captureTruncated: task.captureTruncated,
+      cardTruncated: task.stdout.length > AGY_RESULT_CARD_LIMIT || stderr.length > AGY_STDERR_CARD_LIMIT,
+      hostTimedOut: task.hostTimedOut,
+    }
+  }
+
+  private updateAgyStats(task: AgyTaskState, status: string): void {
+    void cardkit.replaceElement(
+      task.cardId,
+      cards.ELEMENTS.agyStats,
+      cards.agyStatsElement(this.agyStats(task, status)),
+    )
+  }
+
+  private agyFinalStderr(task: AgyTaskState): string {
+    const parts = [task.stderr.trim()]
+    if (task.spawnError) parts.push(`spawn error: ${task.spawnError}`)
+    return parts.filter(Boolean).join('\n')
+  }
+
+  private finishAgyDecoders(task: AgyTaskState): void {
+    if (task.decodersEnded) return
+    task.decodersEnded = true
+    const stdoutTail = task.stdoutDecoder.end()
+    const stderrTail = task.stderrDecoder.end()
+    if (stdoutTail) this.appendAgyText(task, 'stdout', stdoutTail)
+    if (stderrTail) this.appendAgyText(task, 'stderr', stderrTail)
+  }
+
+  private appendAgyOutput(task: AgyTaskState, stream: 'stdout' | 'stderr', chunk: Buffer): void {
+    if (stream === 'stdout') task.stdoutBytes += chunk.length
+    else task.stderrBytes += chunk.length
+    const text = stream === 'stdout'
+      ? task.stdoutDecoder.write(chunk)
+      : task.stderrDecoder.write(chunk)
+    this.appendAgyText(task, stream, text)
+  }
+
+  private appendAgyText(task: AgyTaskState, stream: 'stdout' | 'stderr', text: string): void {
+    if (!text) return
+    const prev = stream === 'stdout' ? task.stdout : task.stderr
+    const room = AGY_CAPTURE_CHAR_LIMIT - prev.length
+    if (room <= 0) {
+      task.captureTruncated = true
+      return
+    }
+    const next = prev + text.slice(0, room)
+    if (stream === 'stdout') task.stdout = next
+    else task.stderr = next
+    if (text.length > room) task.captureTruncated = true
+  }
+
+  private agyForwardPrompt(task: AgyTaskState, stderr: string, notice: string): string {
+    const stdout = cards.cleanAgyOutputText(task.stdout).trim()
+    const cleanedStderr = cards.cleanAgyOutputText(stderr).trim()
+    const cleanedNotice = cards.cleanAgyOutputText(notice).trim()
+    const parts = [
+      'agy 返回结果如下，请基于这份结果继续处理。',
+      '',
+      '原始 agy 任务:',
+      task.prompt.trim(),
+      '',
+      'agy 结果:',
+      stdout || '(无 stdout 输出)',
+    ]
+    if (cleanedNotice) parts.push('', 'agy 状态说明:', cleanedNotice)
+    if (cleanedStderr) parts.push('', 'agy stderr:', cleanedStderr)
+    if (task.captureTruncated) parts.push('', '注意: daemon 捕获的 agy 输出已截断。')
+    return parts.join('\n')
+  }
+
+  private rememberAgyForwardPrompt(task: AgyTaskState, stderr: string, notice: string): string {
+    const id = randomUUID()
+    this.agyForwardPrompts.set(id, { prompt: this.agyForwardPrompt(task, stderr, notice), used: false })
+    if (this.agyForwardPrompts.size > 20) {
+      const oldest = this.agyForwardPrompts.keys().next().value
+      if (oldest) this.agyForwardPrompts.delete(oldest)
+    }
+    return id
+  }
+
+  beginAgyForwardToCodex(resultIdRaw: string, userOpenId = ''): ModelActionResult {
+    const resultId = resultIdRaw.trim()
+    const record = this.agyForwardPrompts.get(resultId)
+    if (!record) return { ok: false, message: 'agy 结果已过期，请重新运行 agy' }
+    if (record.used) return { ok: false, message: 'agy 结果已转发，请勿重复点击' }
+    if (this.startingAgy || this.runningAgy) return { ok: false, message: 'agy 任务仍在执行，请稍后再转发' }
+    record.used = true
+    void (async () => {
+      try {
+        await this.onUserMessage(record.prompt, [], userOpenId)
+      } catch (e) {
+        record.used = false
+        const msg = `❌ agy 结果转发 Codex 失败: ${messageOf(e)}`
+        log(`session "${this.sessionName}": ${msg}`)
+        await feishu.sendTextRaw(this.chatId, msg)
+      }
+    })()
+    return { ok: true, message: '已转发 Codex' }
+  }
+
+  private async runAgyCommand(prompt: string): Promise<void> {
+    if (!prompt.trim()) {
+      await feishu.sendText(this.chatId, '用法: agy <任务说明>')
+      return
+    }
+    if (this.startingAgy || this.runningAgy) {
+      await feishu.sendText(this.chatId, '⏳ 当前已有 agy 任务在执行；请等待完成，或发送 stop 打断。')
+      return
+    }
+    if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) {
+      await feishu.sendText(this.chatId, '⚠️ Codex 当前有正在执行或排队的 turn；请先发送 stop，或等待当前 turn 完成后再运行 agy。')
+      return
+    }
+
+    this.startingAgy = true
+    const startedAt = Date.now()
+    try {
+      const beforeGit = await captureGitSnapshot(this.workDir)
+      const initialStats: cards.AgyStats = {
+        status: '⏳ agy 运行中',
+        model: AGY_DEFAULT_MODEL,
+        cwd: this.workDir,
+        command: agyDisplayCommand(),
+        startedAtMs: startedAt,
+        elapsedSec: '0.0',
+        stdoutBytes: 0,
+        stderrBytes: 0,
+      }
+      const messageId = await feishu.sendCard(this.chatId, cards.agyTaskCard({
+        sessionName: this.sessionName,
+        prompt,
+        stats: initialStats,
+        beforeGit,
+      }))
+      if (!messageId) {
+        await feishu.sendTextRaw(this.chatId, '❌ 创建 agy 卡片失败，任务未启动。')
+        return
+      }
+      let cardId: string
+      try {
+        cardId = await cardkit.convertMessageToCard(messageId)
+      } catch (e) {
+        log(`session "${this.sessionName}": agy card id_convert failed: ${e}`)
+        await feishu.sendTextRaw(this.chatId, `❌ agy 卡片初始化失败，任务未启动: ${messageOf(e)}`)
+        return
+      }
+
+      let taskRef: AgyTaskState | null = null
+      cardkit.recordCardCreated(cardId, 5, code => {
+        if (taskRef?.cardWriteFailed) return
+        if (taskRef) taskRef.cardWriteFailed = true
+        const msg = `❌ agy 卡片更新失败${code ? ` code=${code}` : ''}，请查看 daemon 日志。`
+        log(`session "${this.sessionName}": ${msg}`)
+        void feishu.sendTextRaw(this.chatId, msg)
+      })
+
+      const { proc, bin, args } = spawnAgyPrint(prompt, this.workDir)
+      log(`session "${this.sessionName}": spawn agy ${bin} ${args.slice(0, -1).join(' ')} <prompt> cwd=${this.workDir}`)
+      let resolveDone!: () => void
+      const done = new Promise<void>(resolve => { resolveDone = resolve })
+      let task!: AgyTaskState
+      task = {
+        proc,
+        cardId,
+        messageId,
+        prompt,
+        startedAt,
+        beforeGit,
+        stdout: '',
+        stderr: '',
+        stdoutDecoder: new StringDecoder('utf8'),
+        stderrDecoder: new StringDecoder('utf8'),
+        decodersEnded: false,
+        stdoutBytes: 0,
+        stderrBytes: 0,
+        lastCpuPercent: null,
+        lastMemBytes: null,
+        captureTruncated: false,
+        cardWriteFailed: false,
+        finished: false,
+        stopRequested: false,
+        hostTimedOut: false,
+        timer: setInterval(() => this.updateAgyStats(task, task.stopRequested ? '🛑 正在停止 agy' : '⏳ agy 运行中'), AGY_STATUS_TICK_MS),
+        hostTimeout: setTimeout(() => {
+          if (task.finished) return
+          task.hostTimedOut = true
+          task.stopStatus = '❌ agy 超时'
+          this.updateAgyStats(task, '❌ agy 超时，正在停止')
+          this.terminateAgyProcess(task)
+        }, AGY_HOST_TIMEOUT_MS),
+        done,
+        resolveDone,
+      }
+      taskRef = task
+      this.runningAgy = task
+      this.status = 'working'
+      this.opts.onLifecycleChange?.()
+      this.updateAgyStats(task, '⏳ agy 运行中')
+
+      proc.stdout.on('data', chunk => this.appendAgyOutput(task, 'stdout', chunk))
+      proc.stderr.on('data', chunk => this.appendAgyOutput(task, 'stderr', chunk))
+      proc.on('error', err => {
+        task.spawnError = err.message
+        log(`session "${this.sessionName}": agy spawn error: ${err.message}`)
+      })
+      proc.on('close', (code, signal) => {
+        void this.finishAgyTask(task, code, signal)
+      })
+    } finally {
+      this.startingAgy = false
+    }
+  }
+
+  private terminateAgyProcess(task: AgyTaskState): void {
+    if (!task.proc.killed) task.proc.kill('SIGTERM')
+    if (!task.forceKillTimer) {
+      task.forceKillTimer = setTimeout(() => {
+        if (!task.finished) task.proc.kill('SIGKILL')
+      }, AGY_FORCE_KILL_AFTER_MS)
+    }
+  }
+
+  private async stopAgyTask(status = '🛑 agy 已打断'): Promise<boolean> {
+    const task = this.runningAgy
+    if (!task) return false
+    task.stopRequested = true
+    task.stopStatus = status
+    this.updateAgyStats(task, '🛑 正在停止 agy')
+    this.terminateAgyProcess(task)
+    await task.done
+    return true
+  }
+
+  private async finishAgyTask(task: AgyTaskState, code: number | null, signal: string | null): Promise<void> {
+    if (task.finished) return
+    task.finished = true
+    this.finishAgyDecoders(task)
+    clearInterval(task.timer)
+    clearTimeout(task.hostTimeout)
+    if (task.forceKillTimer) clearTimeout(task.forceKillTimer)
+
+    let status = '❌ agy 失败'
+    try {
+      const endedAt = Date.now()
+      const afterGit = await captureGitSnapshot(this.workDir)
+      let stderr = this.agyFinalStderr(task)
+      let notice = ''
+      const cleanedStdout = cards.cleanAgyOutputText(task.stdout).trim()
+      const cleanedStderr = cards.cleanAgyOutputText(stderr).trim()
+      const emptyOutput = !cleanedStdout && !cleanedStderr
+      if (code === 0 && !signal && !task.spawnError && !task.hostTimedOut && !task.stopRequested && emptyOutput) {
+        notice = 'agy 进程退出码为 0，但没有返回 stdout/stderr。'
+      }
+      const ok = code === 0 && !signal && !task.spawnError && !task.hostTimedOut && !task.stopRequested && !emptyOutput
+      status = task.stopRequested
+        ? (task.stopStatus ?? '🛑 agy 已打断')
+        : task.hostTimedOut
+          ? '❌ agy 超时'
+          : ok
+            ? '✅ agy 完成'
+            : '❌ agy 出错'
+      const cardTruncated = task.stdout.length > AGY_RESULT_CARD_LIMIT || stderr.length > AGY_STDERR_CARD_LIMIT
+      const forwardResultId = this.rememberAgyForwardPrompt(task, stderr, notice)
+
+      await cardkit.flush(task.cardId)
+      await cardkit.replaceElement(
+        task.cardId,
+        cards.ELEMENTS.agyStats,
+        cards.agyStatsElement(this.agyStats(task, status, endedAt, { code, signal })),
+      )
+      await cardkit.replaceElement(
+        task.cardId,
+        cards.ELEMENTS.agyResult,
+        cards.agyResultElement({
+          status,
+          stdout: task.stdout,
+          stderr,
+          notice,
+          cardTruncated,
+        }),
+      )
+      await cardkit.replaceElement(
+        task.cardId,
+        cards.ELEMENTS.agyForward,
+        cards.agyForwardElement(forwardResultId),
+      )
+      await cardkit.replaceElement(
+        task.cardId,
+        cards.ELEMENTS.agyRepo,
+        cards.agyRepoElement({ before: task.beforeGit, after: afterGit }),
+      )
+      cardkit.cancelSummary(task.cardId)
+      await cardkit.patchSettings(task.cardId, cards.streamingOffSettings({
+        durationSec: this.agyElapsedSec(task, endedAt),
+        suffix: status,
+      }))
+      await cardkit.dispose(task.cardId)
+    } catch (e) {
+      status = `❌ agy 收尾失败: ${messageOf(e)}`
+      log(`session "${this.sessionName}": ${status}`)
+      await feishu.sendTextRaw(this.chatId, status)
+    } finally {
+      if (this.runningAgy === task) {
+        this.runningAgy = null
+        this.status = this.isRunning() ? 'idle' : 'stopped'
+        this.opts.onLifecycleChange?.()
+      }
+      log(`session "${this.sessionName}": agy finished status=${status} code=${code} signal=${signal} stdout=${task.stdoutBytes} stderr=${task.stderrBytes}`)
+      task.resolveDone()
+    }
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────
@@ -671,14 +1098,28 @@ export class Session {
     this.currentBatchReactionIds = new Map()
   }
 
+  private clearStaleIdleQueueState(reason: string): void {
+    if (this.initCount < 1 || this.currentTurn || this.openingTurn || this.pendingUserMessageCount === 0) return
+    log(`session "${this.sessionName}": clear stale pending queue before ${reason} pendingCount=${this.pendingUserMessageCount} reactions=${this.pendingReactionIds.size}`)
+    this.pendingUserMessageCount = 0
+    // Release stale ⏳ reactions left on the abandoned batch's chat
+    // messages. addReaction callbacks still in flight will fall through
+    // to the orphan path in onUserMessage's trackReaction helper.
+    for (const [m, rid] of this.pendingReactionIds) {
+      if (rid) void feishu.deleteReaction(m, rid)
+    }
+    this.pendingReactionIds = new Map()
+  }
+
   async stop(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
     const announce = opts.announce ?? true
     const report = opts.onStatus
+    const stoppedAgy = await this.stopAgyTask(`🛑 ${reason}`)
     if (!this.proc) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
-      report?.('⚪ session 当前未运行')
-      if (announce) await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
+      report?.(stoppedAgy ? `✅ ${reason}` : '⚪ session 当前未运行')
+      if (announce && !stoppedAgy) await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
       return
     }
     report?.('🛑 停止 Codex')
@@ -869,6 +1310,10 @@ export class Session {
       await feishu.sendText(this.chatId, '❌ 名称无效。用英文/数字/._-，最长 63。')
       return
     }
+    if (worktree.isReservedWorktreeSlug(slug)) {
+      await feishu.sendText(this.chatId, `❌ ${slug} 是 AI 自动化系统保留 worktree，不能用 wt 命令操作。`)
+      return
+    }
     if (!userOpenId) {
       await feishu.sendText(this.chatId, '❌ 找不到发起人，不能拉群。')
       return
@@ -939,6 +1384,7 @@ export class Session {
           error: entry.error,
           chatId,
           duplicateChatCount: ids.length,
+          protected: worktree.isReservedWorktreeSlug(entry.slug),
         }
       }),
     })
@@ -951,6 +1397,94 @@ export class Session {
       if (!messageId) await feishu.sendTextRaw(this.chatId, '❌ wt 列表失败')
     } catch (e) {
       await feishu.sendText(this.chatId, `❌ wt 列表失败: ${messageOf(e)}`)
+    }
+  }
+
+  private tasklistPanel(
+    notice?: cards.TasklistPanelNotice,
+    confirmDelete = false,
+  ): object {
+    const projectName = this.worktreeProjectName()
+    return cards.tasklistPanelCard({
+      projectName,
+      tasklistName: tasklist.tasklistNameForProject(projectName),
+      binding: tasklist.getTasklistBinding(projectName),
+      notice,
+      confirmDelete,
+    })
+  }
+
+  async showTasklistPanel(): Promise<void> {
+    const messageId = await feishu.sendCard(this.chatId, this.tasklistPanel())
+    if (!messageId) await feishu.sendTextRaw(this.chatId, '❌ task 面板发送失败')
+  }
+
+  async onTasklistEnable(): Promise<TasklistActionResult> {
+    const projectName = this.worktreeProjectName()
+    try {
+      const existing = tasklist.getTasklistBinding(projectName)
+      const binding = await tasklist.enableTasklist(projectName, this.chatId)
+      const message = existing ? '已启用' : `已启用 ${binding.name}`
+      return {
+        ok: true,
+        message,
+        card: this.tasklistPanel({ type: 'success', content: `✅ ${message}` }),
+      }
+    } catch (e) {
+      const message = `启用失败: ${messageOf(e)}`
+      log(`session "${this.sessionName}": tasklist enable failed: ${messageOf(e)}`)
+      return {
+        ok: false,
+        message,
+        card: this.tasklistPanel({ type: 'error', content: `❌ ${message}` }),
+      }
+    }
+  }
+
+  onTasklistDeletePrompt(guidRaw: string): TasklistActionResult {
+    const projectName = this.worktreeProjectName()
+    const binding = tasklist.getTasklistBinding(projectName)
+    const guid = guidRaw.trim()
+    if (!binding) {
+      return {
+        ok: false,
+        message: '未启用',
+        card: this.tasklistPanel({ type: 'error', content: '❌ 未启用' }),
+      }
+    }
+    if (binding.guid !== guid) {
+      return {
+        ok: false,
+        message: '清单绑定已变化',
+        card: this.tasklistPanel({ type: 'error', content: '❌ 清单绑定已变化，请重新打开 task 面板' }),
+      }
+    }
+    return {
+      ok: true,
+      message: '请再次确认删除',
+      card: this.tasklistPanel({ type: 'error', content: '⚠️ 删除会删除所有清单内任务' }, true),
+    }
+  }
+
+  async onTasklistDeleteConfirm(guidRaw: string): Promise<TasklistActionResult> {
+    const projectName = this.worktreeProjectName()
+    const guid = guidRaw.trim()
+    try {
+      const deleted = await tasklist.deleteTasklist(projectName, guid)
+      const message = `已删除 ${deleted.name}`
+      return {
+        ok: true,
+        message,
+        card: this.tasklistPanel({ type: 'success', content: `✅ ${message}` }),
+      }
+    } catch (e) {
+      const message = `删除失败: ${messageOf(e)}`
+      log(`session "${this.sessionName}": tasklist delete failed: ${messageOf(e)}`)
+      return {
+        ok: false,
+        message,
+        card: this.tasklistPanel({ type: 'error', content: `❌ ${message}` }),
+      }
     }
   }
 
@@ -1008,7 +1542,74 @@ export class Session {
     }
   }
 
+  private watchManualCompactionUsage(proc: CodexProcess, threadId: string | null): ManualCompactionUsageWatch {
+    const snapshots: ContextUsageSnapshot[] = []
+    const waiters = new Set<{
+      notice: ContextCompactedNotification
+      finish: (snapshot: ContextUsageSnapshot | null) => void
+    }>()
+    const matches = (snapshot: ContextUsageSnapshot, notice: ContextCompactedNotification): boolean => {
+      const targetThreadId = notice.threadId ?? threadId
+      if (targetThreadId && snapshot.threadId && snapshot.threadId !== targetThreadId) return false
+      if (notice.turnId) return snapshot.turnId === notice.turnId
+      return true
+    }
+    const latestMatching = (notice: ContextCompactedNotification): ContextUsageSnapshot | null => {
+      for (let i = snapshots.length - 1; i >= 0; i--) {
+        const snapshot = snapshots[i]
+        if (snapshot && matches(snapshot, notice)) return snapshot
+      }
+      return null
+    }
+    const onUsage = (update: TokenUsageUpdated) => {
+      if (threadId && update.threadId && update.threadId !== threadId) return
+      const snapshot: ContextUsageSnapshot = {
+        usage: update.usage,
+        contextWindow: update.contextWindow,
+        threadId: update.threadId,
+        turnId: update.turnId,
+      }
+      snapshots.push(snapshot)
+      for (const waiter of [...waiters]) {
+        if (matches(snapshot, waiter.notice)) waiter.finish(snapshot)
+      }
+    }
+    proc.on('token_usage', onUsage)
+    return {
+      waitFor(notice: ContextCompactedNotification, timeoutMs: number): Promise<ContextUsageSnapshot | null> {
+        const existing = latestMatching(notice)
+        if (existing) return Promise.resolve(existing)
+        return new Promise(resolve => {
+          let timer: ReturnType<typeof setTimeout> | null = null
+          const waiter = {
+            notice,
+            finish: (snapshot: ContextUsageSnapshot | null) => {
+              if (timer) clearTimeout(timer)
+              waiters.delete(waiter)
+              resolve(snapshot)
+            },
+          }
+          timer = setTimeout(() => waiter.finish(null), timeoutMs)
+          waiters.add(waiter)
+        })
+      },
+      cancel() {
+        proc.off('token_usage', onUsage)
+        for (const waiter of [...waiters]) waiter.finish(null)
+      },
+    }
+  }
+
+  private compactContextWindowLabel(snapshot: ContextUsageSnapshot | null): string {
+    if (!snapshot) return ' · 🧠 MISS'
+    const tokens = contextTokensFromUsage(snapshot.usage)
+    if (tokens == null) return ' · 🧠 MISS'
+    const limit = contextLimitFromAppServer(snapshot.contextWindow)
+    return ` · 🧠 ${rawContextPercentLabel(tokens, limit)} (${contextTokenRatioLabel(tokens, limit)})`
+  }
+
   private async runCompactCommand(): Promise<void> {
+    this.clearStaleIdleQueueState('compact')
     const noActiveTurn = !this.currentTurn && this.pendingUserMessageCount === 0 && this.pendingMidTurnMsgs.length === 0 && !this.openingTurn
     if (!this.isRunning() || !this.proc) {
       this.status = 'stopped'
@@ -1046,18 +1647,21 @@ export class Session {
       else await feishu.sendText(this.chatId, status)
     }
     const watch = this.watchManualCompaction(proc, CONTEXT_COMPACT_TIMEOUT_MS)
+    const usageWatch = this.watchManualCompactionUsage(proc, proc.sessionId)
     this.manualContextCompactionPending = true
     try {
       this.setStatusCard(statusCard, this.withModel('🧠 发起上下文压缩'))
       await proc.compactThread()
       this.setStatusCard(statusCard, this.withModel('⏳ 等待压缩完成事件'))
       const notice = await watch.promise
+      const contextSnapshot = await usageWatch.waitFor(notice, CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS)
       const doneThread = notice.threadId ? ` thread=${notice.threadId.slice(0, 8)}…` : ''
-      await finishStatus(this.withModel(`✅ 上下文已压缩${doneThread}`))
+      await finishStatus(this.withModel(`✅ 上下文已压缩${doneThread}${this.compactContextWindowLabel(contextSnapshot)}`))
     } catch (e) {
       watch.cancel()
       await finishStatus(`❌ 上下文压缩失败: ${messageOf(e)}`)
     } finally {
+      usageWatch.cancel()
       this.manualContextCompactionPending = false
     }
   }
@@ -1270,6 +1874,9 @@ export class Session {
   async onWorktreeDisband(slugRaw: string): Promise<WorktreeActionResult> {
     const slug = worktree.normalizeWorktreeSlug(slugRaw)
     if (!slug) return this.worktreeActionResult(false, '❌ 名称无效', 'error')
+    if (worktree.isReservedWorktreeSlug(slug)) {
+      return this.worktreeActionResult(false, `❌ ${slug} 是 AI 自动化系统保留 worktree，不能解散。`, 'error')
+    }
     const projectName = this.worktreeProjectName()
     const projectDir = this.worktreeProjectDir()
     try {
@@ -1295,7 +1902,7 @@ export class Session {
     }
   }
 
-  /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`)
+  /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
    * plus their two-letter aliases where applicable.
    * Returns true if the command was consumed (don't forward to Codex).
    * Exact match, case-insensitive, ignores trailing whitespace.
@@ -1311,11 +1918,28 @@ export class Session {
   async runCommand(raw: string, userOpenId = ''): Promise<boolean> {
     const wt = raw.trim().match(/^(?:wt|worktree)(?:\s+(.+))?$/i)
     if (wt) {
+      if (this.startingAgy || this.runningAgy) {
+        await feishu.sendText(this.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 wt。')
+        return true
+      }
       await this.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId)
+      return true
+    }
+    const agy = raw.trim().match(/^agy(?:\s+([\s\S]+))?$/i)
+    if (agy) {
+      await this.runAgyCommand((agy[1] ?? '').trim())
+      return true
+    }
+    if (raw.trim().toLowerCase() === 'task') {
+      await this.showTasklistPanel()
       return true
     }
     const command = CONTROL_COMMAND_ALIASES.get(raw.trim().toLowerCase())
     if (!command) return false
+    if ((this.startingAgy || this.runningAgy) && !['stop', 'kill', 'restart', 'hi', 'model'].includes(command)) {
+      await feishu.sendText(this.chatId, `⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再执行 ${command}。`)
+      return true
+    }
     switch (command) {
       case 'model':
         await this.showModelPanel()
@@ -1360,6 +1984,10 @@ export class Session {
         await this.showConsole()
         return true
       case 'stop':
+        if (this.runningAgy) {
+          await this.stopAgyTask('🛑 agy 已打断')
+          return true
+        }
         // Soft barge-out: interrupt the current turn (if any) AND drop
         // the pending-message count so a stack of type-ahead doesn't
         // refire after the interrupt. Subprocess stays alive. Note: the
@@ -1368,6 +1996,7 @@ export class Session {
         // but the daemon can't reach into it directly; in practice the
         // sendInterrupt() control_request causes the SDK to discard
         // queued input alongside the in-flight call.
+        this.clearStaleIdleQueueState('stop')
         if (!this.currentTurn && this.pendingUserMessageCount === 0 && this.pendingMidTurnMsgs.length === 0) {
           const statusCard = await this.openStatusCard('stop', '⚪ 当前没有正在执行的 turn', 'grey')
           if (statusCard) {
@@ -1417,6 +2046,7 @@ export class Session {
         return true
       case 'kill':
         {
+          if (this.runningAgy) await this.stopAgyTask('🛑 agy 已终止')
           const wasRunning = this.isRunning()
           const initialStatus = wasRunning ? '🛑 停止 Codex' : '⚪ session 当前未运行'
           const statusCard = await this.openStatusCard('kill', initialStatus, wasRunning ? 'red' : 'grey')
@@ -1442,6 +2072,10 @@ export class Session {
               ? this.withModel(`🔁 恢复上一会话 thread=${resumeThreadLabel}…`)
               : this.withModel('🔁 启动 Codex')
           const statusCard = await this.openStatusCard('restart', initialStatus)
+          if (this.runningAgy) {
+            this.setStatusCard(statusCard, '🛑 restart 前终止 agy')
+            await this.stopAgyTask('🛑 restart 前已终止 agy')
+          }
           let lastStatus = initialStatus
           const ok = await this.restart(true, {
             announce: !statusCard,
@@ -1680,17 +2314,10 @@ export class Session {
     // wasBusy computation — otherwise this fresh solo message is
     // misclassified as queued and its card closes with `📨 转交新卡`
     // instead of `✅`.
-    if (this.initCount >= 1 && !this.currentTurn && !this.openingTurn && this.pendingUserMessageCount > 0) {
-      this.pendingUserMessageCount = 0
-      // Release stale ⏳ reactions left on the abandoned batch's
-      // chat messages. addReaction callbacks still in flight will
-      // fall through to the orphan path in the wasBusy branch
-      // below (which deletes whatever rid lands after both maps
-      // are empty).
-      for (const [m, rid] of this.pendingReactionIds) {
-        if (rid) void feishu.deleteReaction(m, rid)
-      }
-      this.pendingReactionIds = new Map()
+    this.clearStaleIdleQueueState('user_message')
+    if (this.startingAgy || this.runningAgy) {
+      await feishu.sendText(this.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再继续。')
+      return
     }
     // Capture busy-state SYNC, before any state mutation — this decides
     // whether the message will visibly queue (gets the OneSecond → later

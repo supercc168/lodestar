@@ -52,6 +52,19 @@ describe('worktree card rendering', () => {
     expect(card.body.elements[0].content).toContain('feature 已解散')
     expect(JSON.stringify(card.body.elements[1])).toContain('feature')
   })
+
+  test('renders protected automation worktrees without delete action', () => {
+    const card = worktreeListCard({
+      projectName: 'feishu',
+      projectDir: '/tmp/feishu',
+      entries: [entry({ slug: 'AI-AUTO', protected: true, chatId: 'oc_1' })],
+    }) as any
+
+    const json = JSON.stringify(card)
+    expect(json).toContain('系统保留')
+    expect(json).toContain('AI-AUTO')
+    expect(json).not.toContain('worktree_disband')
+  })
 })
 
 function entry(overrides: Partial<WorktreeCardEntry>): WorktreeCardEntry {

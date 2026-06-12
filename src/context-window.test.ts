@@ -7,6 +7,7 @@ import {
   contextTokenRatioLabel,
   contextTokensFromUsage,
   contextUsedPercent,
+  rawContextPercentLabel,
 } from './context-window'
 
 describe('context window display', () => {
@@ -28,6 +29,15 @@ describe('context window display', () => {
     expect(contextPercentSummary(35_211, limit)).toEqual({ used: 9, remaining: 91 })
     expect(contextTokenRatioLabel(70_123, limit)).toBe('70K/258K')
     expect(contextTokenRatioLabel(70_123, null)).toBe('70K/--')
+  })
+
+  test('formats raw context window occupancy for compact completion', () => {
+    const limit = contextLimitFromAppServer(258_000)
+
+    expect(rawContextPercentLabel(35_211, limit)).toBe('14%')
+    expect(rawContextPercentLabel(1_000, limit)).toBe('<1%')
+    expect(rawContextPercentLabel(0, limit)).toBe('0%')
+    expect(rawContextPercentLabel(35_211, null)).toBe('--')
   })
 
   test('keeps missing or invalid app-server windows unknown', () => {
