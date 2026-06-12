@@ -54,6 +54,15 @@ import * as sessionAsk from './session-ask'
 import * as sessionHostAsk from './session-host-ask'
 import * as sessionPermission from './session-permission'
 import * as worktree from './worktree'
+import {
+  AGY_DEFAULT_MODEL,
+  AGY_HOST_TIMEOUT_MS,
+  agyDisplayCommand,
+  captureGitSnapshot,
+  spawnAgyPrint,
+  type AgyProcess,
+  type GitSnapshot,
+} from './agy-task'
 
 export type { SessionOpts } from './session-types'
 
@@ -83,6 +92,11 @@ const RESUME_INIT_NOTICE_MS = 10_000
 const RESUME_INIT_TIMEOUT_MS = 120_000
 const CONTEXT_COMPACT_TIMEOUT_MS = 120_000
 const CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS = 1500
+const AGY_CAPTURE_CHAR_LIMIT = 1_000_000
+const AGY_FORCE_KILL_AFTER_MS = 5000
+const AGY_RESULT_CARD_LIMIT = 8000
+const AGY_STDERR_CARD_LIMIT = 2000
+const AGY_STATUS_TICK_MS = 30_000
 
 interface ModelPanelState {
   models: cards.ModelChoice[]
@@ -175,6 +189,31 @@ interface StatusCardHandle {
   cardId: string
   title: string
   timer: FooterTimer
+}
+
+interface AgyTaskState {
+  proc: AgyProcess
+  cardId: string
+  messageId: string
+  prompt: string
+  startedAt: number
+  beforeGit: GitSnapshot
+  stdout: string
+  stderr: string
+  stdoutBytes: number
+  stderrBytes: number
+  captureTruncated: boolean
+  cardWriteFailed: boolean
+  finished: boolean
+  stopRequested: boolean
+  stopStatus?: string
+  hostTimedOut: boolean
+  spawnError?: string
+  timer: ReturnType<typeof setInterval>
+  hostTimeout: ReturnType<typeof setTimeout>
+  forceKillTimer?: ReturnType<typeof setTimeout>
+  done: Promise<void>
+  resolveDone: () => void
 }
 
 function timedStatus(status: string, startedAt: number): string {
@@ -346,6 +385,8 @@ export class Session {
    * compaction. Suppresses the generic no-turn compaction text alert;
    * command feedback is rendered on that status card instead. */
   private manualContextCompactionPending = false
+  private runningAgy: AgyTaskState | null = null
+  private startingAgy = false
 
   constructor(
     public readonly sessionName: string,
@@ -504,6 +545,251 @@ export class Session {
       suffix: finalStatus,
     }))
     await cardkit.dispose(handle.cardId)
+  }
+
+  private agyElapsedSec(task: AgyTaskState, now = Date.now()): string {
+    return ((now - task.startedAt) / 1000).toFixed(1)
+  }
+
+  private agyStats(task: AgyTaskState, status: string, endedAt?: number, exit?: { code: number | null; signal: string | null }): cards.AgyStats {
+    const stderr = this.agyFinalStderr(task)
+    return {
+      status,
+      model: AGY_DEFAULT_MODEL,
+      cwd: this.workDir,
+      command: agyDisplayCommand(),
+      startedAtMs: task.startedAt,
+      elapsedSec: this.agyElapsedSec(task, endedAt ?? Date.now()),
+      ...(endedAt ? { endedAtMs: endedAt } : {}),
+      ...(exit ? { exitCode: exit.code, signal: exit.signal } : {}),
+      stdoutBytes: task.stdoutBytes,
+      stderrBytes: task.stderrBytes,
+      captureTruncated: task.captureTruncated,
+      cardTruncated: task.stdout.length > AGY_RESULT_CARD_LIMIT || stderr.length > AGY_STDERR_CARD_LIMIT,
+      hostTimedOut: task.hostTimedOut,
+    }
+  }
+
+  private updateAgyStats(task: AgyTaskState, status: string): void {
+    void cardkit.replaceElement(
+      task.cardId,
+      cards.ELEMENTS.agyStats,
+      cards.agyStatsElement(this.agyStats(task, status)),
+    )
+  }
+
+  private agyFinalStderr(task: AgyTaskState): string {
+    const parts = [task.stderr.trim()]
+    if (task.spawnError) parts.push(`spawn error: ${task.spawnError}`)
+    return parts.filter(Boolean).join('\n')
+  }
+
+  private appendAgyOutput(task: AgyTaskState, stream: 'stdout' | 'stderr', chunk: Buffer): void {
+    const text = chunk.toString()
+    if (stream === 'stdout') task.stdoutBytes += chunk.length
+    else task.stderrBytes += chunk.length
+    const prev = stream === 'stdout' ? task.stdout : task.stderr
+    const room = AGY_CAPTURE_CHAR_LIMIT - prev.length
+    if (room <= 0) {
+      task.captureTruncated = true
+      return
+    }
+    const next = prev + text.slice(0, room)
+    if (stream === 'stdout') task.stdout = next
+    else task.stderr = next
+    if (text.length > room) task.captureTruncated = true
+  }
+
+  private async runAgyCommand(prompt: string): Promise<void> {
+    if (!prompt.trim()) {
+      await feishu.sendText(this.chatId, '用法: agy <任务说明>')
+      return
+    }
+    if (this.startingAgy || this.runningAgy) {
+      await feishu.sendText(this.chatId, '⏳ 当前已有 agy 任务在执行；请等待完成，或发送 stop 打断。')
+      return
+    }
+    if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) {
+      await feishu.sendText(this.chatId, '⚠️ Codex 当前有正在执行或排队的 turn；请先发送 stop，或等待当前 turn 完成后再运行 agy。')
+      return
+    }
+
+    this.startingAgy = true
+    const startedAt = Date.now()
+    try {
+      const beforeGit = await captureGitSnapshot(this.workDir)
+      const initialStats: cards.AgyStats = {
+        status: '⏳ agy 运行中',
+        model: AGY_DEFAULT_MODEL,
+        cwd: this.workDir,
+        command: agyDisplayCommand(),
+        startedAtMs: startedAt,
+        elapsedSec: '0.0',
+        stdoutBytes: 0,
+        stderrBytes: 0,
+      }
+      const messageId = await feishu.sendCard(this.chatId, cards.agyTaskCard({
+        sessionName: this.sessionName,
+        prompt,
+        stats: initialStats,
+        beforeGit,
+      }))
+      if (!messageId) {
+        await feishu.sendTextRaw(this.chatId, '❌ 创建 agy 卡片失败，任务未启动。')
+        return
+      }
+      let cardId: string
+      try {
+        cardId = await cardkit.convertMessageToCard(messageId)
+      } catch (e) {
+        log(`session "${this.sessionName}": agy card id_convert failed: ${e}`)
+        await feishu.sendTextRaw(this.chatId, `❌ agy 卡片初始化失败，任务未启动: ${messageOf(e)}`)
+        return
+      }
+
+      let taskRef: AgyTaskState | null = null
+      cardkit.recordCardCreated(cardId, 4, code => {
+        if (taskRef?.cardWriteFailed) return
+        if (taskRef) taskRef.cardWriteFailed = true
+        const msg = `❌ agy 卡片更新失败${code ? ` code=${code}` : ''}，请查看 daemon 日志。`
+        log(`session "${this.sessionName}": ${msg}`)
+        void feishu.sendTextRaw(this.chatId, msg)
+      })
+
+      const { proc, bin, args } = spawnAgyPrint(prompt, this.workDir)
+      log(`session "${this.sessionName}": spawn agy ${bin} ${args.slice(0, -1).join(' ')} <prompt> cwd=${this.workDir}`)
+      let resolveDone!: () => void
+      const done = new Promise<void>(resolve => { resolveDone = resolve })
+      let task!: AgyTaskState
+      task = {
+        proc,
+        cardId,
+        messageId,
+        prompt,
+        startedAt,
+        beforeGit,
+        stdout: '',
+        stderr: '',
+        stdoutBytes: 0,
+        stderrBytes: 0,
+        captureTruncated: false,
+        cardWriteFailed: false,
+        finished: false,
+        stopRequested: false,
+        hostTimedOut: false,
+        timer: setInterval(() => this.updateAgyStats(task, task.stopRequested ? '🛑 正在停止 agy' : '⏳ agy 运行中'), AGY_STATUS_TICK_MS),
+        hostTimeout: setTimeout(() => {
+          if (task.finished) return
+          task.hostTimedOut = true
+          task.stopStatus = '❌ agy 超时'
+          this.updateAgyStats(task, '❌ agy 超时，正在停止')
+          this.terminateAgyProcess(task)
+        }, AGY_HOST_TIMEOUT_MS),
+        done,
+        resolveDone,
+      }
+      taskRef = task
+      this.runningAgy = task
+      this.status = 'working'
+      this.opts.onLifecycleChange?.()
+      this.updateAgyStats(task, '⏳ agy 运行中')
+
+      proc.stdout.on('data', chunk => this.appendAgyOutput(task, 'stdout', chunk))
+      proc.stderr.on('data', chunk => this.appendAgyOutput(task, 'stderr', chunk))
+      proc.on('error', err => {
+        task.spawnError = err.message
+        log(`session "${this.sessionName}": agy spawn error: ${err.message}`)
+      })
+      proc.on('close', (code, signal) => {
+        void this.finishAgyTask(task, code, signal)
+      })
+    } finally {
+      this.startingAgy = false
+    }
+  }
+
+  private terminateAgyProcess(task: AgyTaskState): void {
+    if (!task.proc.killed) task.proc.kill('SIGTERM')
+    if (!task.forceKillTimer) {
+      task.forceKillTimer = setTimeout(() => {
+        if (!task.finished) task.proc.kill('SIGKILL')
+      }, AGY_FORCE_KILL_AFTER_MS)
+    }
+  }
+
+  private async stopAgyTask(status = '🛑 agy 已打断'): Promise<boolean> {
+    const task = this.runningAgy
+    if (!task) return false
+    task.stopRequested = true
+    task.stopStatus = status
+    this.updateAgyStats(task, '🛑 正在停止 agy')
+    this.terminateAgyProcess(task)
+    await task.done
+    return true
+  }
+
+  private async finishAgyTask(task: AgyTaskState, code: number | null, signal: string | null): Promise<void> {
+    if (task.finished) return
+    task.finished = true
+    clearInterval(task.timer)
+    clearTimeout(task.hostTimeout)
+    if (task.forceKillTimer) clearTimeout(task.forceKillTimer)
+
+    let status = '❌ agy 失败'
+    try {
+      const endedAt = Date.now()
+      const afterGit = await captureGitSnapshot(this.workDir)
+      const ok = code === 0 && !signal && !task.spawnError && !task.hostTimedOut && !task.stopRequested
+      status = task.stopRequested
+        ? (task.stopStatus ?? '🛑 agy 已打断')
+        : task.hostTimedOut
+          ? '❌ agy 超时'
+          : ok
+            ? '✅ agy 完成'
+            : '❌ agy 失败'
+      const stderr = this.agyFinalStderr(task)
+      const cardTruncated = task.stdout.length > AGY_RESULT_CARD_LIMIT || stderr.length > AGY_STDERR_CARD_LIMIT
+
+      await cardkit.flush(task.cardId)
+      await cardkit.replaceElement(
+        task.cardId,
+        cards.ELEMENTS.agyStats,
+        cards.agyStatsElement(this.agyStats(task, status, endedAt, { code, signal })),
+      )
+      await cardkit.replaceElement(
+        task.cardId,
+        cards.ELEMENTS.agyResult,
+        cards.agyResultElement({
+          status,
+          stdout: task.stdout,
+          stderr,
+          cardTruncated,
+        }),
+      )
+      await cardkit.replaceElement(
+        task.cardId,
+        cards.ELEMENTS.agyRepo,
+        cards.agyRepoElement({ before: task.beforeGit, after: afterGit }),
+      )
+      cardkit.cancelSummary(task.cardId)
+      await cardkit.patchSettings(task.cardId, cards.streamingOffSettings({
+        durationSec: this.agyElapsedSec(task, endedAt),
+        suffix: status,
+      }))
+      await cardkit.dispose(task.cardId)
+    } catch (e) {
+      status = `❌ agy 收尾失败: ${messageOf(e)}`
+      log(`session "${this.sessionName}": ${status}`)
+      await feishu.sendTextRaw(this.chatId, status)
+    } finally {
+      if (this.runningAgy === task) {
+        this.runningAgy = null
+        this.status = this.isRunning() ? 'idle' : 'stopped'
+        this.opts.onLifecycleChange?.()
+      }
+      log(`session "${this.sessionName}": agy finished status=${status} code=${code} signal=${signal} stdout=${task.stdoutBytes} stderr=${task.stderrBytes}`)
+      task.resolveDone()
+    }
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────
@@ -703,11 +989,12 @@ export class Session {
   async stop(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
     const announce = opts.announce ?? true
     const report = opts.onStatus
+    const stoppedAgy = await this.stopAgyTask(`🛑 ${reason}`)
     if (!this.proc) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
-      report?.('⚪ session 当前未运行')
-      if (announce) await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
+      report?.(stoppedAgy ? `✅ ${reason}` : '⚪ session 当前未运行')
+      if (announce && !stoppedAgy) await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
       return
     }
     report?.('🛑 停止 Codex')
@@ -1410,11 +1697,24 @@ export class Session {
   async runCommand(raw: string, userOpenId = ''): Promise<boolean> {
     const wt = raw.trim().match(/^(?:wt|worktree)(?:\s+(.+))?$/i)
     if (wt) {
+      if (this.startingAgy || this.runningAgy) {
+        await feishu.sendText(this.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 wt。')
+        return true
+      }
       await this.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId)
+      return true
+    }
+    const agy = raw.trim().match(/^agy(?:\s+([\s\S]+))?$/i)
+    if (agy) {
+      await this.runAgyCommand((agy[1] ?? '').trim())
       return true
     }
     const command = CONTROL_COMMAND_ALIASES.get(raw.trim().toLowerCase())
     if (!command) return false
+    if ((this.startingAgy || this.runningAgy) && !['stop', 'kill', 'restart', 'hi', 'model'].includes(command)) {
+      await feishu.sendText(this.chatId, `⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再执行 ${command}。`)
+      return true
+    }
     switch (command) {
       case 'model':
         await this.showModelPanel()
@@ -1459,6 +1759,10 @@ export class Session {
         await this.showConsole()
         return true
       case 'stop':
+        if (this.runningAgy) {
+          await this.stopAgyTask('🛑 agy 已打断')
+          return true
+        }
         // Soft barge-out: interrupt the current turn (if any) AND drop
         // the pending-message count so a stack of type-ahead doesn't
         // refire after the interrupt. Subprocess stays alive. Note: the
@@ -1517,6 +1821,7 @@ export class Session {
         return true
       case 'kill':
         {
+          if (this.runningAgy) await this.stopAgyTask('🛑 agy 已终止')
           const wasRunning = this.isRunning()
           const initialStatus = wasRunning ? '🛑 停止 Codex' : '⚪ session 当前未运行'
           const statusCard = await this.openStatusCard('kill', initialStatus, wasRunning ? 'red' : 'grey')
@@ -1542,6 +1847,10 @@ export class Session {
               ? this.withModel(`🔁 恢复上一会话 thread=${resumeThreadLabel}…`)
               : this.withModel('🔁 启动 Codex')
           const statusCard = await this.openStatusCard('restart', initialStatus)
+          if (this.runningAgy) {
+            this.setStatusCard(statusCard, '🛑 restart 前终止 agy')
+            await this.stopAgyTask('🛑 restart 前已终止 agy')
+          }
           let lastStatus = initialStatus
           const ok = await this.restart(true, {
             announce: !statusCard,
@@ -1781,6 +2090,10 @@ export class Session {
     // misclassified as queued and its card closes with `📨 转交新卡`
     // instead of `✅`.
     this.clearStaleIdleQueueState('user_message')
+    if (this.startingAgy || this.runningAgy) {
+      await feishu.sendText(this.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再继续。')
+      return
+    }
     // Capture busy-state SYNC, before any state mutation — this decides
     // whether the message will visibly queue (gets the OneSecond → later
     // CheckMark lifecycle reactions on its Feishu chat message) or

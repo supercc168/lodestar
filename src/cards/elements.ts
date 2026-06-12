@@ -38,4 +38,9 @@ export const ELEMENTS = {
   /** Model command card — one replaceable panel for model → effort
    * multi-step selection inside a single card. */
   modelPanel: 'model_panel',
+  /** One-shot agy task card. */
+  agyPrompt: 'agy_prompt',
+  agyStats: 'agy_stats',
+  agyResult: 'agy_result',
+  agyRepo: 'agy_repo',
 } as const
