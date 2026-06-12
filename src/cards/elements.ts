@@ -44,4 +44,6 @@ export const ELEMENTS = {
   agyResult: 'agy_result',
   agyForward: 'agy_forward',
   agyRepo: 'agy_repo',
+  /** Tasklist automation panel. */
+  tasklistPanel: 'tasklist_panel',
 } as const

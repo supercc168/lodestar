@@ -56,6 +56,7 @@ import * as sessionAsk from './session-ask'
 import * as sessionHostAsk from './session-host-ask'
 import * as sessionPermission from './session-permission'
 import * as worktree from './worktree'
+import * as tasklist from './tasklist'
 import {
   AGY_DEFAULT_MODEL,
   AGY_HOST_TIMEOUT_MS,
@@ -123,6 +124,7 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: str
 }
 
 type WorktreeActionResult = { ok: boolean; message: string; card: object }
+type TasklistActionResult = { ok: boolean; message: string; card: object }
 type ModelActionResult = { ok: boolean; message: string; card?: object }
 type ManualCompactionWatch = {
   promise: Promise<ContextCompactedNotification>
@@ -1393,6 +1395,94 @@ export class Session {
     }
   }
 
+  private tasklistPanel(
+    notice?: cards.TasklistPanelNotice,
+    confirmDelete = false,
+  ): object {
+    const projectName = this.worktreeProjectName()
+    return cards.tasklistPanelCard({
+      projectName,
+      tasklistName: tasklist.tasklistNameForProject(projectName),
+      binding: tasklist.getTasklistBinding(projectName),
+      notice,
+      confirmDelete,
+    })
+  }
+
+  async showTasklistPanel(): Promise<void> {
+    const messageId = await feishu.sendCard(this.chatId, this.tasklistPanel())
+    if (!messageId) await feishu.sendTextRaw(this.chatId, '❌ task 面板发送失败')
+  }
+
+  async onTasklistEnable(): Promise<TasklistActionResult> {
+    const projectName = this.worktreeProjectName()
+    try {
+      const existing = tasklist.getTasklistBinding(projectName)
+      const binding = await tasklist.enableTasklist(projectName, this.chatId)
+      const message = existing ? '已启用' : `已启用 ${binding.name}`
+      return {
+        ok: true,
+        message,
+        card: this.tasklistPanel({ type: 'success', content: `✅ ${message}` }),
+      }
+    } catch (e) {
+      const message = `启用失败: ${messageOf(e)}`
+      log(`session "${this.sessionName}": tasklist enable failed: ${messageOf(e)}`)
+      return {
+        ok: false,
+        message,
+        card: this.tasklistPanel({ type: 'error', content: `❌ ${message}` }),
+      }
+    }
+  }
+
+  onTasklistDeletePrompt(guidRaw: string): TasklistActionResult {
+    const projectName = this.worktreeProjectName()
+    const binding = tasklist.getTasklistBinding(projectName)
+    const guid = guidRaw.trim()
+    if (!binding) {
+      return {
+        ok: false,
+        message: '未启用',
+        card: this.tasklistPanel({ type: 'error', content: '❌ 未启用' }),
+      }
+    }
+    if (binding.guid !== guid) {
+      return {
+        ok: false,
+        message: '清单绑定已变化',
+        card: this.tasklistPanel({ type: 'error', content: '❌ 清单绑定已变化，请重新打开 task 面板' }),
+      }
+    }
+    return {
+      ok: true,
+      message: '请再次确认删除',
+      card: this.tasklistPanel({ type: 'error', content: '⚠️ 删除会删除所有清单内任务' }, true),
+    }
+  }
+
+  async onTasklistDeleteConfirm(guidRaw: string): Promise<TasklistActionResult> {
+    const projectName = this.worktreeProjectName()
+    const guid = guidRaw.trim()
+    try {
+      const deleted = await tasklist.deleteTasklist(projectName, guid)
+      const message = `已删除 ${deleted.name}`
+      return {
+        ok: true,
+        message,
+        card: this.tasklistPanel({ type: 'success', content: `✅ ${message}` }),
+      }
+    } catch (e) {
+      const message = `删除失败: ${messageOf(e)}`
+      log(`session "${this.sessionName}": tasklist delete failed: ${messageOf(e)}`)
+      return {
+        ok: false,
+        message,
+        card: this.tasklistPanel({ type: 'error', content: `❌ ${message}` }),
+      }
+    }
+  }
+
   private watchManualCompaction(proc: CodexProcess, timeoutMs: number): ManualCompactionWatch {
     let settled = false
     let timer: ReturnType<typeof setTimeout> | null = null
@@ -1804,7 +1894,7 @@ export class Session {
     }
   }
 
-  /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`)
+  /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
    * plus their two-letter aliases where applicable.
    * Returns true if the command was consumed (don't forward to Codex).
    * Exact match, case-insensitive, ignores trailing whitespace.
@@ -1830,6 +1920,10 @@ export class Session {
     const agy = raw.trim().match(/^agy(?:\s+([\s\S]+))?$/i)
     if (agy) {
       await this.runAgyCommand((agy[1] ?? '').trim())
+      return true
+    }
+    if (raw.trim().toLowerCase() === 'task') {
+      await this.showTasklistPanel()
       return true
     }
     const command = CONTROL_COMMAND_ALIASES.get(raw.trim().toLowerCase())

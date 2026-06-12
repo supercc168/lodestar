@@ -428,6 +428,18 @@ async function handleCardAction(data: any): Promise<any> {
       const result = await session.onWorktreeDisband(String(value.slug ?? ''))
       return actionCardResponse(result.card)
     }
+    case 'tasklist_enable': {
+      const result = await session.onTasklistEnable()
+      return actionCardResponse(result.card)
+    }
+    case 'tasklist_delete_prompt': {
+      const result = session.onTasklistDeletePrompt(String(value.guid ?? ''))
+      return actionCardResponse(result.card)
+    }
+    case 'tasklist_delete_confirm': {
+      const result = await session.onTasklistDeleteConfirm(String(value.guid ?? ''))
+      return actionCardResponse(result.card)
+    }
     case 'agy_forward_codex': {
       const result = session.beginAgyForwardToCodex(String(value.result_id ?? ''), userId)
       return { toast: { type: result.ok ? 'success' : 'error', content: result.message } }

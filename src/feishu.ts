@@ -387,6 +387,59 @@ export async function fetchChatName(chatId: string): Promise<string | null> {
   }
 }
 
+export async function fetchChatOwnerOpenId(chatId: string): Promise<string> {
+  const res = await client.im.chat.get({
+    path: { chat_id: chatId },
+    params: { user_id_type: 'open_id' },
+  })
+  if (res.code && res.code !== 0) {
+    throw new Error(`feishu chat.get failed code=${res.code} msg=${res.msg}`)
+  }
+  const ownerOpenId = res.data?.owner_id
+  if (!ownerOpenId) {
+    throw new Error('feishu chat.get returned no owner_id; cannot add project group owner to tasklist')
+  }
+  return ownerOpenId
+}
+
+export interface CreatedTasklist {
+  guid: string
+  name: string
+  url: string
+  createdAt?: string
+}
+
+export async function createTasklistWithOwner(name: string, ownerOpenId: string): Promise<CreatedTasklist> {
+  const res = await client.task.v2.tasklist.create({
+    params: { user_id_type: 'open_id' },
+    data: {
+      name,
+      members: [{ id: ownerOpenId, type: 'user', role: 'editor' }],
+    },
+  })
+  if (res.code && res.code !== 0) {
+    throw new Error(`feishu tasklist.create failed code=${res.code} msg=${res.msg}`)
+  }
+  const tasklist = res.data?.tasklist
+  const guid = tasklist?.guid
+  if (!guid) throw new Error('feishu tasklist.create returned no guid')
+  return {
+    guid,
+    name: tasklist?.name || name,
+    url: tasklist?.url ?? '',
+    createdAt: tasklist?.created_at,
+  }
+}
+
+export async function deleteTasklistByGuid(guid: string): Promise<void> {
+  const res = await client.task.v2.tasklist.delete({
+    path: { tasklist_guid: guid },
+  })
+  if (res.code && res.code !== 0) {
+    throw new Error(`feishu tasklist.delete failed code=${res.code} msg=${res.msg}`)
+  }
+}
+
 // ── Outbound: text + card ──────────────────────────────────────────────
 /** Retry delays for sendText/sendCard SDK calls. Three attempts total
  * (the leading 0 is the eager first try). Tuned for the bun+axios+lark-SDK

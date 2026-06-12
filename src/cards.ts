@@ -75,3 +75,8 @@ export {
   agyTaskCard,
   cleanAgyOutputText,
 } from './cards/agy'
+export {
+  type TasklistPanelNotice,
+  type TasklistPanelOpts,
+  tasklistPanelCard,
+} from './cards/task'
