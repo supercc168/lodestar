@@ -25,7 +25,8 @@ describe('tasklist panel card rendering', () => {
     }) as any
 
     const json = JSON.stringify(card)
-    expect(card.header.title.content).toBe('task')
+    expect(card.header.title.content).toBe('task · 预览版')
+    expect(json).toContain('阶段：预览版')
     expect(json).toContain('未启用')
     expect(json).toContain('启用')
     expect(json).toContain('tasklist_enable')

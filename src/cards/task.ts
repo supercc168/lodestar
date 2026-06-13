@@ -1,6 +1,8 @@
 import { ELEMENTS } from './elements'
 import { TASKLIST_SECTION_SPECS, type TasklistBinding } from '../tasklist'
 
+const PREVIEW_LABEL = '预览版'
+
 export interface TasklistPanelNotice {
   type: 'success' | 'error' | 'info'
   content: string
@@ -27,7 +29,7 @@ export function tasklistPanelCard(opts: TasklistPanelOpts): object {
     schema: '2.0',
     config: { update_multi: true },
     header: {
-      title: { tag: 'plain_text', content: 'task' },
+      title: { tag: 'plain_text', content: `task · ${PREVIEW_LABEL}` },
       template,
     },
     body: {
@@ -48,6 +50,7 @@ function panelContent(opts: TasklistPanelOpts): string {
   const lines = [
     `项目：${inlineCode(opts.projectName)}`,
     `清单：${inlineCode(opts.tasklistName)}`,
+    `阶段：${PREVIEW_LABEL}`,
   ]
   if (!opts.binding) {
     lines.push('', '未启用')
