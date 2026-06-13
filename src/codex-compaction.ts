@@ -116,7 +116,7 @@ function safeJsonForCompactionLog(value: unknown): string {
   return json
 }
 
-function logUnhandledAppServerPayload(reason: string, payload: unknown): void {
+export function logUnhandledAppServerPayload(reason: string, payload: unknown): void {
   const root = objectOrNull(payload)
   const params = root ? objectOrNull(root.params) : null
   const item = root ? objectOrNull(root.item) ?? objectOrNull(params?.item) : null
@@ -130,7 +130,7 @@ function logUnhandledAppServerPayload(reason: string, payload: unknown): void {
   ].join(' '))
 }
 
-function logContextCompactionPayload(
+export function logContextCompactionPayload(
   method: string,
   rawPayload: unknown,
   notice: ContextCompactedNotification,
@@ -242,4 +242,3 @@ function contextCompactionNoticeFromObject(
     sourceType: sourceType ?? method,
   }
 }
-

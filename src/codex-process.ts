@@ -18,7 +18,12 @@ import { EventEmitter } from 'node:events'
 import type { Readable, Writable } from 'node:stream'
 import { config } from './config'
 import { log } from './log'
-import { contextCompactionNoticeFromMessage, contextCompactionNoticeFromNotification } from './codex-compaction'
+import {
+  contextCompactionNoticeFromMessage,
+  contextCompactionNoticeFromNotification,
+  logContextCompactionPayload,
+  logUnhandledAppServerPayload,
+} from './codex-compaction'
 import { diffUsageTotals, effectiveTurnTokens, usageFromTokenUsagePayload } from './codex-usage'
 
 export function resolveCodexBin(): string {
@@ -159,7 +164,10 @@ export interface CodexResultMeta {
   is_error: boolean
 }
 
-export { contextCompactionNoticeFromMessage, contextCompactionNoticeFromNotification } from './codex-compaction'
+export {
+  contextCompactionNoticeFromMessage,
+  contextCompactionNoticeFromNotification,
+} from './codex-compaction'
 export { diffUsageTotals, effectiveTurnTokens, usageFromTokenUsagePayload } from './codex-usage'
 
 export interface CodexModel {

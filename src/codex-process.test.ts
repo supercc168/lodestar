@@ -5,6 +5,7 @@ import {
   effectiveTurnTokens,
   contextCompactionNoticeFromMessage,
   contextCompactionNoticeFromNotification,
+  CodexProcess,
   usageFromTokenUsagePayload,
 } from './codex-process'
 
@@ -98,6 +99,35 @@ describe('codex process compaction notifications', () => {
     expect(contextCompactionNoticeFromNotification('thread/settings/updated', {
       threadSettings: { model: 'gpt-5' },
     })).toBeNull()
+  })
+
+  test('unmapped app-server notifications are logged without breaking message handling', () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const raw: unknown[] = []
+    const compacted: unknown[] = []
+    proc.opts = { workDir: '/tmp' }
+    proc.emit = (event: string, payload: unknown) => {
+      if (event === 'raw') raw.push(payload)
+      if (event === 'context_compacted') compacted.push(payload)
+      return true
+    }
+
+    expect(() => proc.handleNotification('item/started', {
+      item: { type: 'contextCompaction', id: 'compact-2' },
+      threadId: 'thread-4',
+      turnId: 'turn-4',
+    })).not.toThrow()
+    expect(() => proc.handleNotification('thread/status/changed', {
+      threadId: 'thread-4',
+      status: { type: 'idle' },
+    })).not.toThrow()
+    expect(() => proc.handleNotification('item/started', {
+      item: { type: 'reasoning', id: 'rs-1', summary: [], content: [] },
+      threadId: 'thread-4',
+      turnId: 'turn-4',
+    })).not.toThrow()
+    expect(raw).toHaveLength(1)
+    expect(compacted).toHaveLength(1)
   })
 })
 

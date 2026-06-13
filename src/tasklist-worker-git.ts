@@ -63,7 +63,7 @@ function parseWorktreeList(projectDir: string): Map<string, string> {
   return out
 }
 
-function git(cwd: string, args: string[]): string {
+export function git(cwd: string, args: string[]): string {
   try {
     return execFileSync('git', args, { cwd, encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] })
   } catch (e) {

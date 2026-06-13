@@ -13,6 +13,7 @@ import {
   AI_REVIEW_BRANCH,
   assertTaskArtifactTagAvailable,
   createTaskArtifactTag,
+  git,
   isReviewHeadMerged,
   localReviewRef,
   prepareAutomationWorktree,
