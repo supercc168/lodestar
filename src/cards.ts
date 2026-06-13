@@ -4,7 +4,8 @@
  * this file. Internal split so each module stays under practical
  * per-read token budget:
  *   - cards/elements.ts — ELEMENTS (shared element-id helpers)
- *   - cards/turn.ts     — main turn card, plan/goal panels, tool panels, ask panels
+ *   - cards/turn.ts     — main turn card, plan/goal/context/ask panels
+ *   - cards/tool.ts     — tool summaries, tool panels, permission panels
  *   - cards/console.ts  — console + menu cards, formatters,
  *                          streamingOffSettings
  */
@@ -17,7 +18,6 @@ export {
   type AskQuestion,
   type AskAnswered,
   type AskState,
-  summarizeToolInput,
   footerContextPercentLabel,
   footerTokenDetailLine,
   mainConversationCard,
@@ -26,12 +26,15 @@ export {
   goalDisplaySignature,
   goalElement,
   planElement,
-  toolCallElement,
-  readBatchElement,
-  toolCallPermissionElement,
   askUserQuestionElement,
   hostAskCard,
 } from './cards/turn'
+export {
+  summarizeToolInput,
+  toolCallElement,
+  readBatchElement,
+  toolCallPermissionElement,
+} from './cards/tool'
 export {
   type ConsoleOpts,
   type ModelEffortChoice,

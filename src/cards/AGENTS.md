@@ -10,7 +10,8 @@
 | File | Description |
 |------|-------------|
 | `elements.ts` | 集中定义卡片 `element_id` 命名约定，例如 `user_input`、`footer`、`model_panel`、`tasklist_panel`、`tool_<i>`、`assistant_<i>`。 |
-| `turn.ts` | 对话主卡、assistant 分段、工具折叠面板、权限按钮、AskUserQuestion 面板和工具输入/输出摘要。 |
+| `turn.ts` | 对话主卡、assistant 分段、计划/目标/上下文压缩元素和 AskUserQuestion 面板；工具相关导出从 `tool.ts` 兼容 re-export。 |
+| `tool.ts` | 工具折叠面板、权限按钮、Read 批次面板，以及 Bash/FileChange/WebSearch/MCP/Image/Agent 等工具输入/输出摘要。 |
 | `agy.ts` | `agy <prompt>` 任务卡片，渲染 prompt、状态统计、执行结果、仓库变更和转发 Codex 按钮。 |
 | `console.ts` | `hi` 控制台、状态卡、菜单卡、模型/effort 选择卡、额度/主机信息格式化和关闭 streaming 设置。 |
 | `worktree.ts` | `wt` 列表卡和创建/加入提示卡，展示 `work/*` 分支状态、归档摘要并提供常驻删除按钮。 |
@@ -29,7 +30,7 @@
 
 ### Working In This Directory
 - 保持 schema 2.0 JSON 结构清晰，所有共享 `element_id` 都从 `ELEMENTS` 取值，避免手写重复 ID。
-- `turn.ts` 同时承载展示逻辑和工具摘要规则；新增工具类型时先更新摘要/正文渲染，再在 session 工具流程中接线。
+- 工具摘要和工具面板渲染集中在 `tool.ts`；新增工具类型时先更新摘要/正文渲染，再在 session 工具流程中接线。
 - 模型选择卡使用单个可替换的 `model_panel`，流程是模型列表面板 → effort 面板 → 成功结果面板。
 - Bash 工具摘要会解析第一行 shell 注释里的 `desc` / `说明`；修改这段逻辑会影响飞书卡片中 shell 命令的可读性。
 - 控制台卡片中的 usage、context window、host info 都是传入快照的格式化结果，不要在卡片模板里发起网络或系统调用。
@@ -60,8 +61,8 @@
 
 ### Internal
 - `src/cards.ts` 统一 re-export 本目录导出，调用方通常 `import * as cards from './cards'`。
-- `src/session.ts`、`src/session-tools.ts`、`src/session-permission.ts`、`src/session-ask.ts` 都依赖本目录生成卡片元素。
-- `src/session.ts` 使用 `console.ts` 渲染 `model` 面板，使用 `worktree.ts` 渲染 `wt` 列表卡、创建提示卡和解散按钮，使用 `agy.ts` 渲染外部 agy 任务卡，使用 `task.ts` 渲染任务清单启用/删除面板。
+- `src/session.ts` 和 `src/session-*` helper 依赖本目录生成卡片元素。
+- `session-model.ts` 使用 `console.ts` 渲染 `model` 面板，`session-worktree.ts` 使用 `worktree.ts` 渲染 `wt` 列表卡/提示卡/解散按钮，`session-agy.ts` 使用 `agy.ts` 渲染外部 agy 任务卡，`session-tasklist.ts` 使用 `task.ts` 渲染任务清单启用/删除面板。
 - `task.ts` 依赖 `src/tasklist.ts` 的分组常量和绑定类型，但不直接依赖 `feishu.ts`。
 - `console.ts` 依赖 `src/sysinfo.ts`、`src/usage.ts` 和 `src/context-window.ts` 的类型与格式输入。
 

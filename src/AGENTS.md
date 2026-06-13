@@ -9,8 +9,15 @@
 ## Key Files
 | File | Description |
 |------|-------------|
-| `session.ts` | 一个飞书群对应一个 `Session`；管理 Codex 生命周期、每轮卡片、消息排队、裸词控制、`model` 选择、`wt` worktree 群命令、`agy` 任务生命周期、`task` 面板回调、运行中 worktree 解散保护和统计状态。 |
+| `session.ts` | 一个飞书群对应一个 `Session`；保留核心状态、Codex 生命周期、Feishu 入站消息、app-server 事件接线和 turn/card 流式状态机；具体命令和业务面板下沉到 `session-*` helper。 |
 | `session-types.ts` | `TurnState`、`Status`、累计统计和 session option 类型定义。 |
+| `session-util.ts` | session helper 共享的状态卡、生命周期选项、action result 类型和错误/超时小工具。 |
+| `session-commands.ts` | 群内裸词控制命令路由：`hi`、`stop`、`kill`、`restart`、`clear`、`compact`、`model`、`task`、`wt` 和 `agy`。 |
+| `session-agy.ts` | `agy <prompt>` 外部任务生命周期：进程启动/停止、stdout/stderr 捕获、状态卡更新、仓库快照和转发 Codex。 |
+| `session-worktree.ts` | `wt` session 侧编排：项目名/目录约定、额外 worktree instructions 注入、列表卡、建群/入群和解散回调。 |
+| `session-tasklist.ts` | `task` 面板的 session 回调：启用项目任务清单、删除确认和面板重绘。 |
+| `session-model.ts` | `model` 面板流程：通过 Codex app-server 动态拉取模型列表、选择模型和 reasoning effort、持久化 session 选择。 |
+| `session-compact.ts` | 手动 `compact` 命令流程：发起 app-server 上下文压缩、监听完成事件和 token usage 快照、更新状态卡。 |
 | `session-tools.ts` | 工具调用面板、工具结果自动发文件和换卡后的工具面板重建逻辑。 |
 | `session-ask.ts` | Codex `AskUserQuestion` 交互流程，处理按钮、自定义回答和权限 request 回填。 |
 | `session-host-ask.ts` | 解析 assistant 输出中的 `[[askusr: ...]]` 主机澄清标记，创建独立问答卡并把用户答案回填到 session。 |
@@ -18,11 +25,15 @@
 | `agy-task.ts` | 外部 agy CLI 辅助：解析可执行文件、构造 `agy --print` 参数、补 PATH、采集执行前后 Git 快照和 diff 摘要。 |
 | `tasklist.ts` | `task` 项目清单绑定和状态存储；创建 `<project>[lodestar]` 清单、维护分组 GUID、记录自动化进程和每个任务的运行状态。 |
 | `tasklist-worker.ts` | 任务清单轮询 worker；按 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成` 分组驱动 Codex/agy 规划、选择、执行、审核和本地合并。 |
-| `codex-process.ts` | 启动 `codex app-server --listen stdio://`，处理 JSON-RPC 请求、通知、工具权限、模型列表/settings、context compaction 事件和使用量元数据。 |
+| `tasklist-worker-git.ts` | `tasklist-worker` 的本地 Git worktree、artifact tag 和 local review ref 辅助逻辑。 |
+| `codex-process.ts` | 启动 `codex app-server --listen stdio://`，处理 JSON-RPC 请求、通知、工具权限、模型列表/settings、thread 启停和 app-server 事件映射。 |
+| `codex-usage.ts` | 解析 app-server token usage payload，并计算 per-turn absolute total 差值与有效 token。 |
+| `codex-compaction.ts` | 解析多种 app-server / raw response context compaction 事件，并输出统一 `ContextCompactedNotification`。 |
 | `card-action.ts` | Card action 回调响应辅助；生产 WS 路径用 `{ card: { type: "raw", data: newCard } }` 立即替换 JSON 卡片，避免 200672、裸卡片或提前 patch 导致模型/effort 面板闪退。 |
 | `cardkit.ts` | Feishu Card Kit v1 封装；维护 per-card sequence、Promise queue、流式限流、元素计数和写失败回调。 |
 | `cards.ts` | 卡片模板 barrel；统一导出 `src/cards/` 下的 turn、console、worktree、agy、task 和元素 ID 工具。 |
-| `feishu.ts` | Lark client、tenant token 缓存、群名/会话映射、alive session 和模型选择持久 map、群创建/解散/成员拉取、消息发送、reaction、附件下载、文件上传、Task v2 清单/分组/任务/评论 API 和项目目录初始化。 |
+| `feishu.ts` | Lark client、tenant token 缓存、群名/会话映射、alive session 和模型选择持久 map、群创建/解散/成员拉取、消息发送、reaction、附件下载、文件上传和项目目录初始化；Task v2 API 由 `feishu-task.ts` re-export。 |
+| `feishu-task.ts` | 飞书 Task v2 清单/分组/任务/评论 API 包装，以及 Task API 错误格式化。 |
 | `worktree.ts` | `wt` 的 Git worktree 逻辑：按 `work/*` 分支扫描、创建同级 `<project>[name]` worktree、归档已合并分支、重新激活时更新到主线、干净检查和删除目录。 |
 | `config.ts` | 同步读取 `config.toml`，解析 `[feishu]`、`[runtime]`、`[notify]` 和可选 `[codex.env]`。 |
 | `paths.ts` | XDG/Windows runtime 路径解析，以及 PID、日志、session/chat/resume/model/alive/tasklist map、inbox、debug socket 路径常量。 |
@@ -54,8 +65,8 @@
 - `Session` 的无 `private` 字段是 package-internal 约定，只应由 `session-*.ts` 辅助模块访问；新 helper 应遵循同一边界。
 - 修改 `src/` 代码时，**不得**为了验证卡片/交互效果而去停止、重启、切换或并行接管 live daemon；用户若只说“测试”“预览”“发一张看看”，一律视为**未授权**。只有用户明确点名对应 daemon/service 操作时才能执行。
 - `wt` 命令的 Git 操作集中在 `worktree.ts`；不要在 `session.ts` 里散写 `git` shell 命令。
-- `agy <prompt>` 的 CLI 参数、PATH 和 Git 快照集中在 `agy-task.ts`；`Session` 只负责互斥、进程生命周期、输出收集、状态刷新和卡片接线。
-- `task` 面板按钮由 `Session` 处理，持久状态集中在 `tasklist.ts`，后台自动化集中在 `tasklist-worker.ts`；不要把轮询、进程状态或 Git 产物逻辑塞进卡片模板。
+- `agy <prompt>` 的 CLI 参数、PATH 和 Git 快照集中在 `agy-task.ts`；session 侧进程生命周期、输出收集、状态刷新和卡片接线集中在 `session-agy.ts`。
+- `task` 面板按钮由 `session-tasklist.ts` 处理，持久状态集中在 `tasklist.ts`，后台自动化集中在 `tasklist-worker.ts`；不要把轮询、进程状态或 Git 产物逻辑塞进卡片模板。
 - `model` 命令的模型列表来自 Codex app-server `model/list`，reasoning effort 必须来自对应模型返回值；不要写静态模型清单。
 - Codex 子进程协议集中在 `codex-process.ts`；新增 app-server 方法或通知映射时要同时考虑 `Session` 事件处理和卡片展示。
 - Card Kit 写操作必须经过 `cardkit.ts` 的队列和 sequence 逻辑；不要从 session 或脚本直接 `fetch` 修改同一张生产卡。
@@ -91,8 +102,8 @@
 ## Dependencies
 
 ### Internal
-- `session.ts` 依赖 `codex-process.ts`、`cardkit.ts`、`cards.ts`、`feishu.ts`、`worktree.ts`、`agy-task.ts`、`tasklist.ts`、`session-tools.ts`、`session-ask.ts`、`session-host-ask.ts` 和 `session-permission.ts`。
-- `tasklist-worker.ts` 依赖 `tasklist.ts`、`feishu.ts`、`agy-task.ts`、`codex-process.ts` 和本地 Git 命令，创建/检查自动化 worktree、tag 与审查 diff。
+- `session.ts` 依赖 `codex-process.ts`、`cardkit.ts`、`cards.ts`、`feishu.ts` 和 `session-*` helper；业务面板/命令 helper 再依赖 `worktree.ts`、`tasklist.ts`、`agy-task.ts` 等领域模块。
+- `tasklist-worker.ts` 依赖 `tasklist.ts`、`feishu.ts`、`agy-task.ts`、`codex-process.ts` 和 `tasklist-worker-git.ts`；本地 Git worktree、tag 与审查 diff 约定集中在 `tasklist-worker-git.ts`。
 - `cardkit.ts` 依赖 `feishu.getTenantToken()` 获取 Card Kit API token。
 - `feishu.ts` 依赖 `config.ts`、`paths.ts` 和 `codex-process.resolveCodexBin()`，并维护 session chat/resume/model/alive/tasklist runtime map。
 - CLI 文件依赖 `paths.ts`、`pid-guard.ts`、`setup.ts` 和 Node/Bun process API。

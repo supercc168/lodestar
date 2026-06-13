@@ -1,0 +1,42 @@
+export type FooterTimer = {
+  setStatus(status: string): void
+  stop(): void
+  elapsedSec(): string
+}
+
+export type StatusCardHandle = {
+  cardId: string
+  title: string
+  timer: FooterTimer
+}
+
+export type LifecycleProgressOpts = {
+  announce?: boolean
+  onStatus?: (status: string) => void
+  /** Internal: startColdUserTurn resets fresh state before opening the
+   * first direct-start card, because the visible turn number is decided
+   * before Codex starts. */
+  freshConversationStateAlreadyReset?: boolean
+}
+
+export type WorktreeActionResult = { ok: boolean; message: string; card: object }
+export type TasklistActionResult = { ok: boolean; message: string; card: object }
+export type ModelActionResult = { ok: boolean; message: string; card?: object }
+
+export function messageOf(e: unknown): string {
+  return e instanceof Error ? e.message : String(e)
+}
+
+export async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<T>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs / 1000}s`)), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}

@@ -6,27 +6,21 @@
  * Kit ops, and wires Feishu inbound (text + card-action callbacks) into
  * Codex turns.
  *
- * Tool tracking, AskUserQuestion flow, and permission rendering live in
- * sibling modules (session-tools.ts, session-ask.ts,
- * session-permission.ts) so this file stays under Codex's
- * per-read token budget (~25K). Fields touched by those helpers carry
- * no `private` modifier — convention is "no modifier = package-internal,
+ * Tool tracking, AskUserQuestion flow, permission rendering, command
+ * routing, model/task/wt/compact panels, and agy tasks live in sibling
+ * session-*.ts modules. Fields touched by those helpers carry no
+ * `private` modifier — convention is "no modifier = package-internal,
  * only the session-*.ts helpers should touch it."
  */
 
-import { execFileSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
-import { randomUUID } from 'node:crypto'
 import { isAbsolute, join } from 'node:path'
-import { StringDecoder } from 'node:string_decoder'
 import {
   CODEX_EFFORT,
   CodexProcess,
   diffUsageTotals,
   effectiveTurnTokens,
-  isCodexReasoningEffort,
   type CanUseToolRequest,
-  type CodexModel,
   type CodexReasoningEffort,
   type CodexUsage,
   type ContextCompactedNotification,
@@ -36,7 +30,6 @@ import {
   type ThreadGoal,
   type TurnPlanUpdated,
 } from './codex-process'
-import { CHANNEL_INSTRUCTIONS } from './instructions'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
@@ -45,27 +38,29 @@ import { readSysInfo } from './sysinfo'
 import { readUsage, updateUsageFromRateLimits, type UsageSnapshot } from './usage'
 import {
   contextLimitFromAppServer,
-  contextTokenRatioLabel,
   contextTokensFromUsage,
-  rawContextPercentLabel,
 } from './context-window'
 import { extractAskUsrMarkers, extractSendMarkerPaths, stripAskUsrMarkers } from './outbound-markers'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
+import * as sessionAgy from './session-agy'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
 import * as sessionHostAsk from './session-host-ask'
 import * as sessionPermission from './session-permission'
-import * as worktree from './worktree'
-import * as tasklist from './tasklist'
 import {
-  AGY_DEFAULT_MODEL,
-  AGY_HOST_TIMEOUT_MS,
-  agyDisplayCommand,
-  captureGitSnapshot,
-  spawnAgyPrint,
-  type AgyProcess,
-  type GitSnapshot,
-} from './agy-task'
+  messageOf,
+  type FooterTimer,
+  type LifecycleProgressOpts,
+  type ModelActionResult,
+  type StatusCardHandle,
+  type TasklistActionResult,
+  type WorktreeActionResult,
+} from './session-util'
+import * as sessionCommands from './session-commands'
+import * as sessionCompact from './session-compact'
+import * as sessionModel from './session-model'
+import * as sessionTasklist from './session-tasklist'
+import * as sessionWorktree from './session-worktree'
 
 export type { SessionOpts } from './session-types'
 
@@ -93,65 +88,6 @@ const FOOTER_WRITING = 'Writing...'
 const FOOTER_WORKING = 'Working...'
 const RESUME_INIT_NOTICE_MS = 10_000
 const RESUME_INIT_TIMEOUT_MS = 120_000
-const CONTEXT_COMPACT_TIMEOUT_MS = 120_000
-const CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS = 1500
-const AGY_CAPTURE_CHAR_LIMIT = 1_000_000
-const AGY_FORCE_KILL_AFTER_MS = 5000
-const AGY_RESULT_CARD_LIMIT = 8000
-const AGY_STDERR_CARD_LIMIT = 2000
-const AGY_STATUS_TICK_MS = 30_000
-
-interface ModelPanelState {
-  models: cards.ModelChoice[]
-}
-
-function messageOf(e: unknown): string {
-  return e instanceof Error ? e.message : String(e)
-}
-
-async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
-  let timer: ReturnType<typeof setTimeout> | null = null
-  try {
-    return await Promise.race([
-      promise,
-      new Promise<T>((_, reject) => {
-        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs / 1000}s`)), timeoutMs)
-      }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
-
-type WorktreeActionResult = { ok: boolean; message: string; card: object }
-type TasklistActionResult = { ok: boolean; message: string; card: object }
-type ModelActionResult = { ok: boolean; message: string; card?: object }
-type ManualCompactionWatch = {
-  promise: Promise<ContextCompactedNotification>
-  cancel(): void
-}
-type ContextUsageSnapshot = {
-  usage: CodexUsage | null
-  contextWindow: number | null
-  threadId?: string
-  turnId?: string
-}
-type ManualCompactionUsageWatch = {
-  waitFor(notice: ContextCompactedNotification, timeoutMs: number): Promise<ContextUsageSnapshot | null>
-  cancel(): void
-}
-type ControlCommand = 'hi' | 'stop' | 'kill' | 'restart' | 'clear' | 'compact' | 'model'
-
-const CONTROL_COMMAND_ALIASES = new Map<string, ControlCommand>([
-  ['hi', 'hi'],
-  ['stop', 'stop'], ['st', 'stop'],
-  ['kill', 'kill'], ['kl', 'kill'],
-  ['restart', 'restart'], ['rs', 'restart'],
-  ['clear', 'clear'], ['cl', 'clear'],
-  ['compact', 'compact'], ['cm', 'compact'],
-  ['model', 'model'], ['md', 'model'],
-])
-
 /** Soft cap on element count per Feishu card before we proactively
  * rotate to a fresh one. The hard ceiling is NOT ~100 as once assumed:
  * a 2026-05-23 dogfood turn hit `300305 [element exceeds the limit]` at
@@ -173,62 +109,6 @@ const CARD_ELEMENT_SOFT_LIMIT = 50
  * Feishu rejects on every card) — without a cap that would spray an
  * endless trail of empty cards into the chat. */
 const MAX_MIDTURN_ROTATES = 5
-
-interface LifecycleProgressOpts {
-  announce?: boolean
-  onStatus?: (status: string) => void
-  /** Internal: startColdUserTurn resets fresh state before opening the
-   * first direct-start card, because the visible turn number is decided
-   * before Codex starts. */
-  freshConversationStateAlreadyReset?: boolean
-}
-
-interface FooterTimer {
-  setStatus(status: string): void
-  stop(): void
-  elapsedSec(): string
-}
-
-interface StatusCardHandle {
-  cardId: string
-  title: string
-  timer: FooterTimer
-}
-
-interface AgyTaskState {
-  proc: AgyProcess
-  cardId: string
-  messageId: string
-  prompt: string
-  startedAt: number
-  beforeGit: GitSnapshot
-  stdout: string
-  stderr: string
-  stdoutDecoder: StringDecoder
-  stderrDecoder: StringDecoder
-  decodersEnded: boolean
-  stdoutBytes: number
-  stderrBytes: number
-  lastCpuPercent: number | null
-  lastMemBytes: number | null
-  captureTruncated: boolean
-  cardWriteFailed: boolean
-  finished: boolean
-  stopRequested: boolean
-  stopStatus?: string
-  hostTimedOut: boolean
-  spawnError?: string
-  timer: ReturnType<typeof setInterval>
-  hostTimeout: ReturnType<typeof setTimeout>
-  forceKillTimer?: ReturnType<typeof setTimeout>
-  done: Promise<void>
-  resolveDone: () => void
-}
-
-interface AgyForwardRecord {
-  prompt: string
-  used: boolean
-}
 
 function timedStatus(status: string, startedAt: number): string {
   const elapsedS = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
@@ -316,7 +196,7 @@ export class Session {
    * until the GC at the next `onUserMessage`; if it takes the split
    * path, the second init sees pendingCount>0 and correctly classifies
    * the trailing batch as user-batch. */
-  private pendingUserMessageCount = 0
+  pendingUserMessageCount = 0
   /** Mid-turn user messages buffered DAEMON-SIDE (not yet sendUserText'd
    * to the SDK). Drained in the `result` handler by writing each to SDK
    * stdin, which doubles as the wake signal the Codex app-server needs
@@ -325,21 +205,21 @@ export class Session {
    * Buffering also keeps mid-turn msgs out
    * of any AskUserQuestion `QUEUE remove` storm, since they were never
    * in the SDK queue to begin with. */
-  private pendingMidTurnMsgs: Array<{ text: string; wireText: string; userOpenId: string; msgId: string }> = []
+  pendingMidTurnMsgs: Array<{ text: string; wireText: string; userOpenId: string; msgId: string }> = []
   /** 下一个 turn 的 user inputs 暂存区。所有 sendUserText 的 wireText 在
    * sendUserText 之前 push 这里;openTurnCard 创建 turn 时一次性取走 + clear。
    * mainConversationCard 把这些 wireText 渲染成顶部"📥 收到 (N)"折叠面板,
    * 让用户在卡片自己里就能看到这一轮触发了什么(不必滚群里找原消息)。
    * mid-turn buffer 的消息不在这里 push —— 它们走 drainMidTurnAndOpen 那条
    * 路径,drain 时统一 push。 */
-  private pendingTurnInputs: string[] = []
+  pendingTurnInputs: string[] = []
   /** Most recent userOpenId seen via `onUserMessage`. Used only when a
    * merged batch fires its init event and the daemon needs *some* open_id
    * to scope the eventual `urgent_app` push — there's no obviously right
    * answer when N messages from possibly different users collapse into
    * one turn, and "the most recent sender" is a defensible default for
    * the single-user private-bot scenario this product targets. */
-  private lastUserOpenId = ''
+  lastUserOpenId = ''
   /** Feishu message_ids of user messages that arrived while the daemon
    * was busy (turn in flight or mid-open), mapped to the `reaction_id`
    * of the `OneSecond` reaction placed at arrival. The reaction_id is
@@ -350,12 +230,12 @@ export class Session {
    * CheckMark stacked two emojis on the same row; cleaner UX is
    * "queued → released" via removal, not "queued → done" via
    * stacking. */
-  private pendingReactionIds = new Map<string, string>()
+  pendingReactionIds = new Map<string, string>()
   /** Snapshot of `pendingReactionIds` taken when the init handler
    * claims a merged batch — these are the Feishu messages whose
    * OneSecond reactions are the currently-open turn's responsibility
    * to clear (via deleteReaction). Empty for eager-opened solo turns. */
-  private currentBatchReactionIds = new Map<string, string>()
+  currentBatchReactionIds = new Map<string, string>()
   /** Count of `system/init` events seen this subprocess. The first one is
    * the boot init (claimed by whichever user message lands first); later
    * ones can mark the start of SDK-driven queued user message draining.
@@ -370,20 +250,20 @@ export class Session {
    * incorrectly open a second card for the same user message. The flag
    * tells the init handler "an eager open is already
    * claiming the slot, stand down". */
-  private openingTurn = false
+  openingTurn = false
   private turnCounter = 0
   /** One-shot: user invoked `stop` during the current turn. Set right
    * before `sendInterrupt`; consumed by the next `result` handler so it
    * does not overwrite the 🛑 footer already painted by the stop path.
    * Reset by exit handler for the proc-died-before-result case. */
-  private userInterrupted = false
+  userInterrupted = false
   // Last known resumable thread id. Persisted once a turn starts, so
   // `restart` can resume an in-flight conversation even if the daemon
   // exits before the turn finishes.
-  private lastSessionId: string | null = null
-  private selectedModel: string | null = null
-  private selectedEffort: CodexReasoningEffort | null = null
-  private modelPanels = new Map<string, ModelPanelState>()
+  lastSessionId: string | null = null
+  selectedModel: string | null = null
+  selectedEffort: CodexReasoningEffort | null = null
+  modelPanels = new Map<string, sessionModel.ModelPanelState>()
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
   private lastTurnDelta: LastTurnDelta | null = null
@@ -398,15 +278,15 @@ export class Session {
   /** Set while the `compact` command owns a status card for a standalone
    * compaction. Suppresses the generic no-turn compaction text alert;
    * command feedback is rendered on that status card instead. */
-  private manualContextCompactionPending = false
-  private runningAgy: AgyTaskState | null = null
-  private startingAgy = false
-  private agyForwardPrompts = new Map<string, AgyForwardRecord>()
+  manualContextCompactionPending = false
+  runningAgy: sessionAgy.AgyTaskState | null = null
+  startingAgy = false
+  agyForwardPrompts = new Map<string, sessionAgy.AgyForwardRecord>()
 
   constructor(
     public readonly sessionName: string,
     public readonly chatId: string,
-    private opts: SessionOpts = {},
+    public opts: SessionOpts = {},
   ) {
     Session.all.add(this)
     // Restore last-known Codex thread_id from disk so a daemon restart
@@ -437,19 +317,23 @@ export class Session {
   get workDir(): string { return join(feishu.PROJECTS_ROOT, this.sessionName) }
   isRunning(): boolean { return !!this.proc && this.proc.isAlive() }
 
+  hasRunningPeerSession(sessionName: string): boolean {
+    return [...Session.all].some(s => s.sessionName === sessionName && s.isRunning())
+  }
+
   private modelForSpawn(): string | undefined {
     return this.selectedModel ?? undefined
   }
 
-  private effortForSpawn(): CodexReasoningEffort {
+  effortForSpawn(): CodexReasoningEffort {
     return this.selectedEffort ?? CODEX_EFFORT
   }
 
-  private currentModelLabel(): string | null {
+  currentModelLabel(): string | null {
     return this.selectedModel ?? this.proc?.lastModel ?? null
   }
 
-  private currentEffortLabel(): CodexReasoningEffort {
+  currentEffortLabel(): CodexReasoningEffort {
     return this.selectedEffort ?? this.proc?.lastEffort ?? CODEX_EFFORT
   }
 
@@ -459,7 +343,7 @@ export class Session {
     return model ? `${model}/${effort}` : effort
   }
 
-  private withModel(text: string): string {
+  withModel(text: string): string {
     const label = this.modelEffortLabel()
     return text.includes(label) ? text : `${text} · ${label}`
   }
@@ -506,7 +390,7 @@ export class Session {
     }
   }
 
-  private async openStatusCard(
+  async openStatusCard(
     title: string,
     initialStatus: string,
     template: 'blue' | 'green' | 'orange' | 'red' | 'grey' | 'turquoise' = 'blue',
@@ -543,11 +427,11 @@ export class Session {
     }
   }
 
-  private setStatusCard(handle: StatusCardHandle | null, status: string): void {
+  setStatusCard(handle: StatusCardHandle | null, status: string): void {
     handle?.timer.setStatus(status)
   }
 
-  private async closeStatusCard(handle: StatusCardHandle | null, finalStatus: string): Promise<void> {
+  async closeStatusCard(handle: StatusCardHandle | null, finalStatus: string): Promise<void> {
     if (!handle) return
     handle.timer.stop()
     const elapsed = handle.timer.elapsedSec()
@@ -562,359 +446,16 @@ export class Session {
     await cardkit.dispose(handle.cardId)
   }
 
-  private agyElapsedSec(task: AgyTaskState, now = Date.now()): string {
-    return ((now - task.startedAt) / 1000).toFixed(1)
-  }
-
-  private agyProcessUsage(task: AgyTaskState): { cpuPercent: number | null; memBytes: number | null } {
-    const pid = task.proc.pid
-    if (!pid || process.platform === 'win32') {
-      return { cpuPercent: task.lastCpuPercent, memBytes: task.lastMemBytes }
-    }
-    try {
-      const out = execFileSync('ps', ['-p', String(pid), '-o', '%cpu=,rss='], {
-        encoding: 'utf8',
-        timeout: 2000,
-        stdio: ['ignore', 'pipe', 'ignore'],
-      }).trim()
-      const [cpuRaw, rssRaw] = out.split(/\s+/)
-      const cpuPercent = Number.parseFloat(cpuRaw ?? '')
-      const rssKb = Number.parseInt(rssRaw ?? '', 10)
-      if (Number.isFinite(cpuPercent)) task.lastCpuPercent = cpuPercent
-      if (Number.isFinite(rssKb)) task.lastMemBytes = rssKb * 1024
-    } catch {
-      // Process may already have exited between close and the final card update.
-    }
-    return { cpuPercent: task.lastCpuPercent, memBytes: task.lastMemBytes }
-  }
-
-  private agyStats(task: AgyTaskState, status: string, endedAt?: number, exit?: { code: number | null; signal: string | null }): cards.AgyStats {
-    const stderr = this.agyFinalStderr(task)
-    const usage = this.agyProcessUsage(task)
-    return {
-      status,
-      model: AGY_DEFAULT_MODEL,
-      cwd: this.workDir,
-      command: agyDisplayCommand(),
-      startedAtMs: task.startedAt,
-      elapsedSec: this.agyElapsedSec(task, endedAt ?? Date.now()),
-      cpuPercent: usage.cpuPercent,
-      memBytes: usage.memBytes,
-      ...(endedAt ? { endedAtMs: endedAt } : {}),
-      ...(exit ? { exitCode: exit.code, signal: exit.signal } : {}),
-      stdoutBytes: task.stdoutBytes,
-      stderrBytes: task.stderrBytes,
-      captureTruncated: task.captureTruncated,
-      cardTruncated: task.stdout.length > AGY_RESULT_CARD_LIMIT || stderr.length > AGY_STDERR_CARD_LIMIT,
-      hostTimedOut: task.hostTimedOut,
-    }
-  }
-
-  private updateAgyStats(task: AgyTaskState, status: string): void {
-    void cardkit.replaceElement(
-      task.cardId,
-      cards.ELEMENTS.agyStats,
-      cards.agyStatsElement(this.agyStats(task, status)),
-    )
-  }
-
-  private agyFinalStderr(task: AgyTaskState): string {
-    const parts = [task.stderr.trim()]
-    if (task.spawnError) parts.push(`spawn error: ${task.spawnError}`)
-    return parts.filter(Boolean).join('\n')
-  }
-
-  private finishAgyDecoders(task: AgyTaskState): void {
-    if (task.decodersEnded) return
-    task.decodersEnded = true
-    const stdoutTail = task.stdoutDecoder.end()
-    const stderrTail = task.stderrDecoder.end()
-    if (stdoutTail) this.appendAgyText(task, 'stdout', stdoutTail)
-    if (stderrTail) this.appendAgyText(task, 'stderr', stderrTail)
-  }
-
-  private appendAgyOutput(task: AgyTaskState, stream: 'stdout' | 'stderr', chunk: Buffer): void {
-    if (stream === 'stdout') task.stdoutBytes += chunk.length
-    else task.stderrBytes += chunk.length
-    const text = stream === 'stdout'
-      ? task.stdoutDecoder.write(chunk)
-      : task.stderrDecoder.write(chunk)
-    this.appendAgyText(task, stream, text)
-  }
-
-  private appendAgyText(task: AgyTaskState, stream: 'stdout' | 'stderr', text: string): void {
-    if (!text) return
-    const prev = stream === 'stdout' ? task.stdout : task.stderr
-    const room = AGY_CAPTURE_CHAR_LIMIT - prev.length
-    if (room <= 0) {
-      task.captureTruncated = true
-      return
-    }
-    const next = prev + text.slice(0, room)
-    if (stream === 'stdout') task.stdout = next
-    else task.stderr = next
-    if (text.length > room) task.captureTruncated = true
-  }
-
-  private agyForwardPrompt(task: AgyTaskState, stderr: string, notice: string): string {
-    const stdout = cards.cleanAgyOutputText(task.stdout).trim()
-    const cleanedStderr = cards.cleanAgyOutputText(stderr).trim()
-    const cleanedNotice = cards.cleanAgyOutputText(notice).trim()
-    const parts = [
-      'agy 返回结果如下，请基于这份结果继续处理。',
-      '',
-      '原始 agy 任务:',
-      task.prompt.trim(),
-      '',
-      'agy 结果:',
-      stdout || '(无 stdout 输出)',
-    ]
-    if (cleanedNotice) parts.push('', 'agy 状态说明:', cleanedNotice)
-    if (cleanedStderr) parts.push('', 'agy stderr:', cleanedStderr)
-    if (task.captureTruncated) parts.push('', '注意: daemon 捕获的 agy 输出已截断。')
-    return parts.join('\n')
-  }
-
-  private rememberAgyForwardPrompt(task: AgyTaskState, stderr: string, notice: string): string {
-    const id = randomUUID()
-    this.agyForwardPrompts.set(id, { prompt: this.agyForwardPrompt(task, stderr, notice), used: false })
-    if (this.agyForwardPrompts.size > 20) {
-      const oldest = this.agyForwardPrompts.keys().next().value
-      if (oldest) this.agyForwardPrompts.delete(oldest)
-    }
-    return id
-  }
-
   beginAgyForwardToCodex(resultIdRaw: string, userOpenId = ''): ModelActionResult {
-    const resultId = resultIdRaw.trim()
-    const record = this.agyForwardPrompts.get(resultId)
-    if (!record) return { ok: false, message: 'agy 结果已过期，请重新运行 agy' }
-    if (record.used) return { ok: false, message: 'agy 结果已转发，请勿重复点击' }
-    if (this.startingAgy || this.runningAgy) return { ok: false, message: 'agy 任务仍在执行，请稍后再转发' }
-    record.used = true
-    void (async () => {
-      try {
-        await this.onUserMessage(record.prompt, [], userOpenId)
-      } catch (e) {
-        record.used = false
-        const msg = `❌ agy 结果转发 Codex 失败: ${messageOf(e)}`
-        log(`session "${this.sessionName}": ${msg}`)
-        await feishu.sendTextRaw(this.chatId, msg)
-      }
-    })()
-    return { ok: true, message: '已转发 Codex' }
+    return sessionAgy.beginAgyForwardToCodex(this, resultIdRaw, userOpenId)
   }
 
-  private async runAgyCommand(prompt: string): Promise<void> {
-    if (!prompt.trim()) {
-      await feishu.sendText(this.chatId, '用法: agy <任务说明>')
-      return
-    }
-    if (this.startingAgy || this.runningAgy) {
-      await feishu.sendText(this.chatId, '⏳ 当前已有 agy 任务在执行；请等待完成，或发送 stop 打断。')
-      return
-    }
-    if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) {
-      await feishu.sendText(this.chatId, '⚠️ Codex 当前有正在执行或排队的 turn；请先发送 stop，或等待当前 turn 完成后再运行 agy。')
-      return
-    }
-
-    this.startingAgy = true
-    const startedAt = Date.now()
-    try {
-      const beforeGit = await captureGitSnapshot(this.workDir)
-      const initialStats: cards.AgyStats = {
-        status: '⏳ agy 运行中',
-        model: AGY_DEFAULT_MODEL,
-        cwd: this.workDir,
-        command: agyDisplayCommand(),
-        startedAtMs: startedAt,
-        elapsedSec: '0.0',
-        stdoutBytes: 0,
-        stderrBytes: 0,
-      }
-      const messageId = await feishu.sendCard(this.chatId, cards.agyTaskCard({
-        sessionName: this.sessionName,
-        prompt,
-        stats: initialStats,
-        beforeGit,
-      }))
-      if (!messageId) {
-        await feishu.sendTextRaw(this.chatId, '❌ 创建 agy 卡片失败，任务未启动。')
-        return
-      }
-      let cardId: string
-      try {
-        cardId = await cardkit.convertMessageToCard(messageId)
-      } catch (e) {
-        log(`session "${this.sessionName}": agy card id_convert failed: ${e}`)
-        await feishu.sendTextRaw(this.chatId, `❌ agy 卡片初始化失败，任务未启动: ${messageOf(e)}`)
-        return
-      }
-
-      let taskRef: AgyTaskState | null = null
-      cardkit.recordCardCreated(cardId, 5, code => {
-        if (taskRef?.cardWriteFailed) return
-        if (taskRef) taskRef.cardWriteFailed = true
-        const msg = `❌ agy 卡片更新失败${code ? ` code=${code}` : ''}，请查看 daemon 日志。`
-        log(`session "${this.sessionName}": ${msg}`)
-        void feishu.sendTextRaw(this.chatId, msg)
-      })
-
-      const { proc, bin, args } = spawnAgyPrint(prompt, this.workDir)
-      log(`session "${this.sessionName}": spawn agy ${bin} ${args.slice(0, -1).join(' ')} <prompt> cwd=${this.workDir}`)
-      let resolveDone!: () => void
-      const done = new Promise<void>(resolve => { resolveDone = resolve })
-      let task!: AgyTaskState
-      task = {
-        proc,
-        cardId,
-        messageId,
-        prompt,
-        startedAt,
-        beforeGit,
-        stdout: '',
-        stderr: '',
-        stdoutDecoder: new StringDecoder('utf8'),
-        stderrDecoder: new StringDecoder('utf8'),
-        decodersEnded: false,
-        stdoutBytes: 0,
-        stderrBytes: 0,
-        lastCpuPercent: null,
-        lastMemBytes: null,
-        captureTruncated: false,
-        cardWriteFailed: false,
-        finished: false,
-        stopRequested: false,
-        hostTimedOut: false,
-        timer: setInterval(() => this.updateAgyStats(task, task.stopRequested ? '🛑 正在停止 agy' : '⏳ agy 运行中'), AGY_STATUS_TICK_MS),
-        hostTimeout: setTimeout(() => {
-          if (task.finished) return
-          task.hostTimedOut = true
-          task.stopStatus = '❌ agy 超时'
-          this.updateAgyStats(task, '❌ agy 超时，正在停止')
-          this.terminateAgyProcess(task)
-        }, AGY_HOST_TIMEOUT_MS),
-        done,
-        resolveDone,
-      }
-      taskRef = task
-      this.runningAgy = task
-      this.status = 'working'
-      this.opts.onLifecycleChange?.()
-      this.updateAgyStats(task, '⏳ agy 运行中')
-
-      proc.stdout.on('data', chunk => this.appendAgyOutput(task, 'stdout', chunk))
-      proc.stderr.on('data', chunk => this.appendAgyOutput(task, 'stderr', chunk))
-      proc.on('error', err => {
-        task.spawnError = err.message
-        log(`session "${this.sessionName}": agy spawn error: ${err.message}`)
-      })
-      proc.on('close', (code, signal) => {
-        void this.finishAgyTask(task, code, signal)
-      })
-    } finally {
-      this.startingAgy = false
-    }
+  runAgyCommand(prompt: string): Promise<void> {
+    return sessionAgy.runAgyCommand(this, prompt)
   }
 
-  private terminateAgyProcess(task: AgyTaskState): void {
-    if (!task.proc.killed) task.proc.kill('SIGTERM')
-    if (!task.forceKillTimer) {
-      task.forceKillTimer = setTimeout(() => {
-        if (!task.finished) task.proc.kill('SIGKILL')
-      }, AGY_FORCE_KILL_AFTER_MS)
-    }
-  }
-
-  private async stopAgyTask(status = '🛑 agy 已打断'): Promise<boolean> {
-    const task = this.runningAgy
-    if (!task) return false
-    task.stopRequested = true
-    task.stopStatus = status
-    this.updateAgyStats(task, '🛑 正在停止 agy')
-    this.terminateAgyProcess(task)
-    await task.done
-    return true
-  }
-
-  private async finishAgyTask(task: AgyTaskState, code: number | null, signal: string | null): Promise<void> {
-    if (task.finished) return
-    task.finished = true
-    this.finishAgyDecoders(task)
-    clearInterval(task.timer)
-    clearTimeout(task.hostTimeout)
-    if (task.forceKillTimer) clearTimeout(task.forceKillTimer)
-
-    let status = '❌ agy 失败'
-    try {
-      const endedAt = Date.now()
-      const afterGit = await captureGitSnapshot(this.workDir)
-      let stderr = this.agyFinalStderr(task)
-      let notice = ''
-      const cleanedStdout = cards.cleanAgyOutputText(task.stdout).trim()
-      const cleanedStderr = cards.cleanAgyOutputText(stderr).trim()
-      const emptyOutput = !cleanedStdout && !cleanedStderr
-      if (code === 0 && !signal && !task.spawnError && !task.hostTimedOut && !task.stopRequested && emptyOutput) {
-        notice = 'agy 进程退出码为 0，但没有返回 stdout/stderr。'
-      }
-      const ok = code === 0 && !signal && !task.spawnError && !task.hostTimedOut && !task.stopRequested && !emptyOutput
-      status = task.stopRequested
-        ? (task.stopStatus ?? '🛑 agy 已打断')
-        : task.hostTimedOut
-          ? '❌ agy 超时'
-          : ok
-            ? '✅ agy 完成'
-            : '❌ agy 出错'
-      const cardTruncated = task.stdout.length > AGY_RESULT_CARD_LIMIT || stderr.length > AGY_STDERR_CARD_LIMIT
-      const forwardResultId = this.rememberAgyForwardPrompt(task, stderr, notice)
-
-      await cardkit.flush(task.cardId)
-      await cardkit.replaceElement(
-        task.cardId,
-        cards.ELEMENTS.agyStats,
-        cards.agyStatsElement(this.agyStats(task, status, endedAt, { code, signal })),
-      )
-      await cardkit.replaceElement(
-        task.cardId,
-        cards.ELEMENTS.agyResult,
-        cards.agyResultElement({
-          status,
-          stdout: task.stdout,
-          stderr,
-          notice,
-          cardTruncated,
-        }),
-      )
-      await cardkit.replaceElement(
-        task.cardId,
-        cards.ELEMENTS.agyForward,
-        cards.agyForwardElement(forwardResultId),
-      )
-      await cardkit.replaceElement(
-        task.cardId,
-        cards.ELEMENTS.agyRepo,
-        cards.agyRepoElement({ before: task.beforeGit, after: afterGit }),
-      )
-      cardkit.cancelSummary(task.cardId)
-      await cardkit.patchSettings(task.cardId, cards.streamingOffSettings({
-        durationSec: this.agyElapsedSec(task, endedAt),
-        suffix: status,
-      }))
-      await cardkit.dispose(task.cardId)
-    } catch (e) {
-      status = `❌ agy 收尾失败: ${messageOf(e)}`
-      log(`session "${this.sessionName}": ${status}`)
-      await feishu.sendTextRaw(this.chatId, status)
-    } finally {
-      if (this.runningAgy === task) {
-        this.runningAgy = null
-        this.status = this.isRunning() ? 'idle' : 'stopped'
-        this.opts.onLifecycleChange?.()
-      }
-      log(`session "${this.sessionName}": agy finished status=${status} code=${code} signal=${signal} stdout=${task.stdoutBytes} stderr=${task.stderrBytes}`)
-      task.resolveDone()
-    }
+  stopAgyTask(status = '🛑 agy 已打断'): Promise<boolean> {
+    return sessionAgy.stopAgyTask(this, status)
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────
@@ -1098,7 +639,7 @@ export class Session {
     this.currentBatchReactionIds = new Map()
   }
 
-  private clearStaleIdleQueueState(reason: string): void {
+  clearStaleIdleQueueState(reason: string): void {
     if (this.initCount < 1 || this.currentTurn || this.openingTurn || this.pendingUserMessageCount === 0) return
     log(`session "${this.sessionName}": clear stale pending queue before ${reason} pendingCount=${this.pendingUserMessageCount} reactions=${this.pendingReactionIds.size}`)
     this.pendingUserMessageCount = 0
@@ -1260,877 +801,79 @@ export class Session {
     }
   }
 
-  private worktreeProjectName(): string {
-    return worktree.projectNameFromSessionName(this.sessionName)
+  worktreeProjectName(): string {
+    return sessionWorktree.worktreeProjectName(this)
   }
 
-  private worktreeProjectDir(): string {
-    return join(feishu.PROJECTS_ROOT, this.worktreeProjectName())
+  worktreeProjectDir(): string {
+    return sessionWorktree.worktreeProjectDir(this)
   }
 
   private spawnDeveloperInstructions(): string {
-    const extra = this.worktreeExtraInstruction()
-    return extra ? `${CHANNEL_INSTRUCTIONS}\n${extra}` : CHANNEL_INSTRUCTIONS
+    return sessionWorktree.spawnDeveloperInstructions(this)
   }
 
-  private worktreeInstructionLoadedNotice(): string | null {
-    return this.worktreeExtraInstruction() ? '已载入wt特殊约定' : null
+  worktreeInstructionLoadedNotice(): string | null {
+    return sessionWorktree.worktreeInstructionLoadedNotice(this)
   }
 
-  private withWorktreeInstructionNotice(text: string): string {
-    const notice = this.worktreeInstructionLoadedNotice()
-    return notice ? `${text}\n${notice}` : text
+  withWorktreeInstructionNotice(text: string): string {
+    return sessionWorktree.withWorktreeInstructionNotice(this, text)
   }
 
-  private worktreeExtraInstruction(): string | null {
-    const instructions = worktree.readWorktreeInstructionsForManagedBranch(
-      this.workDir,
-      this.worktreeProjectDir(),
-      this.worktreeProjectName(),
-    )
-    if (!instructions) return null
-    return [
-      `你要把下面这份额外的工作树约定视为和AGENTS.md一样重要。来源文件：${instructions.path}`,
-      '',
-      `# Additional AGENTS.md instructions for ${this.workDir}`,
-      '',
-      '<INSTRUCTIONS>',
-      instructions.content,
-      '</INSTRUCTIONS>',
-    ].join('\n')
+  worktreeExtraInstruction(): string | null {
+    return sessionWorktree.worktreeExtraInstruction(this)
   }
 
-  private async runWorktreeCommand(arg: string, userOpenId: string): Promise<void> {
-    if (!arg) {
-      await this.showWorktrees()
-      return
-    }
-    const slug = worktree.normalizeWorktreeSlug(arg)
-    if (!slug) {
-      await feishu.sendText(this.chatId, '❌ 名称无效。用英文/数字/._-，最长 63。')
-      return
-    }
-    if (worktree.isReservedWorktreeSlug(slug)) {
-      await feishu.sendText(this.chatId, `❌ ${slug} 是 AI 自动化系统保留 worktree，不能用 wt 命令操作。`)
-      return
-    }
-    if (!userOpenId) {
-      await feishu.sendText(this.chatId, '❌ 找不到发起人，不能拉群。')
-      return
-    }
-
-    const projectName = this.worktreeProjectName()
-    const projectDir = this.worktreeProjectDir()
-    let ensured: worktree.EnsureWorktreeResult
-    try {
-      ensured = worktree.ensureProjectWorktree(projectDir, projectName, slug)
-    } catch (e) {
-      await feishu.sendText(this.chatId, `❌ wt 失败: ${messageOf(e)}`)
-      return
-    }
-
-    try {
-      const chat = await feishu.ensureChatForSession(ensured.chatName, userOpenId)
-      const action = chat.created ? '已创建' : (chat.joined ? '已加入' : '已在群内')
-      const parentMsg = await feishu.sendCard(this.chatId, cards.worktreeNoticeCard({
-        slug,
-        branch: ensured.branch,
-        status: action,
-      }))
-      if (!parentMsg) await feishu.sendTextRaw(this.chatId, `❌ wt 卡片失败: ${slug}`)
-      const childMsg = await feishu.sendCard(chat.chatId, cards.worktreeNoticeCard({
-        slug,
-        branch: ensured.branch,
-        status: '就绪',
-        body: '开始吧。',
-      }))
-      if (!childMsg) await feishu.sendTextRaw(chat.chatId, `❌ wt 卡片失败: ${slug}`)
-    } catch (e) {
-      await feishu.sendText(this.chatId, `❌ wt 已建，拉群失败: ${messageOf(e)}`)
-    }
+  runWorktreeCommand(arg: string, userOpenId: string): Promise<void> {
+    return sessionWorktree.runWorktreeCommand(this, arg, userOpenId)
   }
 
-  private async buildWorktreeListCard(notice?: { type: 'success' | 'error' | 'info'; content: string }): Promise<object> {
-    const projectName = this.worktreeProjectName()
-    const projectDir = this.worktreeProjectDir()
-    const entries = worktree.listProjectWorktrees(projectDir, projectName)
-    const hiddenMergedUnmountedCount = entries.filter(
-      entry => entry.state === 'merged' && !entry.mounted,
-    ).length
-    const visibleEntries = entries.filter(entry => entry.state !== 'merged' || entry.mounted)
-    const chatIndex = await feishu.listNormalChatIdsByName()
-    return cards.worktreeListCard({
-      projectName,
-      projectDir,
-      hiddenMergedUnmountedCount,
-      notice,
-      entries: visibleEntries.map(entry => {
-        const ids = chatIndex.get(entry.chatName) ?? []
-        const preferred = feishu.preferredChatForSession.get(entry.chatName)
-        const chatId = preferred && ids.includes(preferred)
-          ? preferred
-          : ids.length === 1
-            ? ids[0]
-            : null
-        return {
-          slug: entry.slug,
-          chatName: entry.chatName,
-          branch: entry.branch,
-          state: entry.state,
-          path: entry.worktreePath ?? entry.expectedPath,
-          mounted: entry.mounted,
-          dirtyCount: entry.dirtyCount,
-          statusLine: entry.statusLine,
-          error: entry.error,
-          chatId,
-          duplicateChatCount: ids.length,
-          protected: worktree.isReservedWorktreeSlug(entry.slug),
-        }
-      }),
-    })
+  showWorktrees(): Promise<void> {
+    return sessionWorktree.showWorktrees(this)
   }
 
-  async showWorktrees(): Promise<void> {
-    try {
-      const card = await this.buildWorktreeListCard()
-      const messageId = await feishu.sendCard(this.chatId, card)
-      if (!messageId) await feishu.sendTextRaw(this.chatId, '❌ wt 列表失败')
-    } catch (e) {
-      await feishu.sendText(this.chatId, `❌ wt 列表失败: ${messageOf(e)}`)
-    }
+  showTasklistPanel(): Promise<void> {
+    return sessionTasklist.showTasklistPanel(this)
   }
 
-  private tasklistPanel(
-    notice?: cards.TasklistPanelNotice,
-    confirmDelete = false,
-  ): object {
-    const projectName = this.worktreeProjectName()
-    return cards.tasklistPanelCard({
-      projectName,
-      tasklistName: tasklist.tasklistNameForProject(projectName),
-      binding: tasklist.getTasklistBinding(projectName),
-      notice,
-      confirmDelete,
-    })
-  }
-
-  async showTasklistPanel(): Promise<void> {
-    const messageId = await feishu.sendCard(this.chatId, this.tasklistPanel())
-    if (!messageId) await feishu.sendTextRaw(this.chatId, '❌ task 面板发送失败')
-  }
-
-  async onTasklistEnable(): Promise<TasklistActionResult> {
-    const projectName = this.worktreeProjectName()
-    try {
-      const existing = tasklist.getTasklistBinding(projectName)
-      const binding = await tasklist.enableTasklist(projectName, this.chatId)
-      const message = existing ? '已启用' : `已启用 ${binding.name}`
-      return {
-        ok: true,
-        message,
-        card: this.tasklistPanel({ type: 'success', content: `✅ ${message}` }),
-      }
-    } catch (e) {
-      const message = `启用失败: ${messageOf(e)}`
-      log(`session "${this.sessionName}": tasklist enable failed: ${messageOf(e)}`)
-      return {
-        ok: false,
-        message,
-        card: this.tasklistPanel({ type: 'error', content: `❌ ${message}` }),
-      }
-    }
+  onTasklistEnable(): Promise<TasklistActionResult> {
+    return sessionTasklist.onTasklistEnable(this)
   }
 
   onTasklistDeletePrompt(guidRaw: string): TasklistActionResult {
-    const projectName = this.worktreeProjectName()
-    const binding = tasklist.getTasklistBinding(projectName)
-    const guid = guidRaw.trim()
-    if (!binding) {
-      return {
-        ok: false,
-        message: '未启用',
-        card: this.tasklistPanel({ type: 'error', content: '❌ 未启用' }),
-      }
-    }
-    if (binding.guid !== guid) {
-      return {
-        ok: false,
-        message: '清单绑定已变化',
-        card: this.tasklistPanel({ type: 'error', content: '❌ 清单绑定已变化，请重新打开 task 面板' }),
-      }
-    }
-    return {
-      ok: true,
-      message: '请再次确认删除',
-      card: this.tasklistPanel({ type: 'error', content: '⚠️ 删除会删除所有清单内任务' }, true),
-    }
+    return sessionTasklist.onTasklistDeletePrompt(this, guidRaw)
   }
 
-  async onTasklistDeleteConfirm(guidRaw: string): Promise<TasklistActionResult> {
-    const projectName = this.worktreeProjectName()
-    const guid = guidRaw.trim()
-    try {
-      const deleted = await tasklist.deleteTasklist(projectName, guid)
-      const message = `已删除 ${deleted.name}`
-      return {
-        ok: true,
-        message,
-        card: this.tasklistPanel({ type: 'success', content: `✅ ${message}` }),
-      }
-    } catch (e) {
-      const message = `删除失败: ${messageOf(e)}`
-      log(`session "${this.sessionName}": tasklist delete failed: ${messageOf(e)}`)
-      return {
-        ok: false,
-        message,
-        card: this.tasklistPanel({ type: 'error', content: `❌ ${message}` }),
-      }
-    }
+  onTasklistDeleteConfirm(guidRaw: string): Promise<TasklistActionResult> {
+    return sessionTasklist.onTasklistDeleteConfirm(this, guidRaw)
   }
 
-  private watchManualCompaction(proc: CodexProcess, timeoutMs: number): ManualCompactionWatch {
-    let settled = false
-    let timer: ReturnType<typeof setTimeout> | null = null
-    let resolvePromise: (notice: ContextCompactedNotification) => void = () => {}
-    let rejectPromise: (e: Error) => void = () => {}
-    const threadId = proc.sessionId
-    const cleanup = () => {
-      if (timer) {
-        clearTimeout(timer)
-        timer = null
-      }
-      proc.off('context_compacted', onCompacted)
-      proc.off('exit', onExit)
-      proc.off('error', onError)
-    }
-    const finish = (notice: ContextCompactedNotification) => {
-      if (settled) return
-      settled = true
-      cleanup()
-      resolvePromise(notice)
-    }
-    const fail = (e: Error) => {
-      if (settled) return
-      settled = true
-      cleanup()
-      rejectPromise(e)
-    }
-    const onCompacted = (notice: ContextCompactedNotification) => {
-      if (notice.phase === 'start') return
-      if (notice.threadId && threadId && notice.threadId !== threadId) return
-      finish(notice)
-    }
-    const onExit = () => fail(new Error('codex app-server exited before context compaction completed'))
-    const onError = (e: unknown) => fail(e instanceof Error ? e : new Error(String(e)))
-    const promise = new Promise<ContextCompactedNotification>((resolve, reject) => {
-      resolvePromise = resolve
-      rejectPromise = reject
-      timer = setTimeout(() => {
-        fail(new Error(`context compaction completion timed out after ${timeoutMs / 1000}s`))
-      }, timeoutMs)
-    })
-    proc.on('context_compacted', onCompacted)
-    proc.once('exit', onExit)
-    proc.once('error', onError)
-    return {
-      promise,
-      cancel() {
-        if (settled) return
-        settled = true
-        cleanup()
-      },
-    }
+  runCompactCommand(): Promise<void> {
+    return sessionCompact.runCompactCommand(this)
   }
 
-  private watchManualCompactionUsage(proc: CodexProcess, threadId: string | null): ManualCompactionUsageWatch {
-    const snapshots: ContextUsageSnapshot[] = []
-    const waiters = new Set<{
-      notice: ContextCompactedNotification
-      finish: (snapshot: ContextUsageSnapshot | null) => void
-    }>()
-    const matches = (snapshot: ContextUsageSnapshot, notice: ContextCompactedNotification): boolean => {
-      const targetThreadId = notice.threadId ?? threadId
-      if (targetThreadId && snapshot.threadId && snapshot.threadId !== targetThreadId) return false
-      if (notice.turnId) return snapshot.turnId === notice.turnId
-      return true
-    }
-    const latestMatching = (notice: ContextCompactedNotification): ContextUsageSnapshot | null => {
-      for (let i = snapshots.length - 1; i >= 0; i--) {
-        const snapshot = snapshots[i]
-        if (snapshot && matches(snapshot, notice)) return snapshot
-      }
-      return null
-    }
-    const onUsage = (update: TokenUsageUpdated) => {
-      if (threadId && update.threadId && update.threadId !== threadId) return
-      const snapshot: ContextUsageSnapshot = {
-        usage: update.usage,
-        contextWindow: update.contextWindow,
-        threadId: update.threadId,
-        turnId: update.turnId,
-      }
-      snapshots.push(snapshot)
-      for (const waiter of [...waiters]) {
-        if (matches(snapshot, waiter.notice)) waiter.finish(snapshot)
-      }
-    }
-    proc.on('token_usage', onUsage)
-    return {
-      waitFor(notice: ContextCompactedNotification, timeoutMs: number): Promise<ContextUsageSnapshot | null> {
-        const existing = latestMatching(notice)
-        if (existing) return Promise.resolve(existing)
-        return new Promise(resolve => {
-          let timer: ReturnType<typeof setTimeout> | null = null
-          const waiter = {
-            notice,
-            finish: (snapshot: ContextUsageSnapshot | null) => {
-              if (timer) clearTimeout(timer)
-              waiters.delete(waiter)
-              resolve(snapshot)
-            },
-          }
-          timer = setTimeout(() => waiter.finish(null), timeoutMs)
-          waiters.add(waiter)
-        })
-      },
-      cancel() {
-        proc.off('token_usage', onUsage)
-        for (const waiter of [...waiters]) waiter.finish(null)
-      },
-    }
+  showModelPanel(): Promise<void> {
+    return sessionModel.showModelPanel(this)
   }
 
-  private compactContextWindowLabel(snapshot: ContextUsageSnapshot | null): string {
-    if (!snapshot) return ' · 🧠 MISS'
-    const tokens = contextTokensFromUsage(snapshot.usage)
-    if (tokens == null) return ' · 🧠 MISS'
-    const limit = contextLimitFromAppServer(snapshot.contextWindow)
-    return ` · 🧠 ${rawContextPercentLabel(tokens, limit)} (${contextTokenRatioLabel(tokens, limit)})`
+  onModelSelect(modelRaw: string, panelIdRaw = '', userOpenId = '', actionValue: any = null): Promise<ModelActionResult> {
+    return sessionModel.onModelSelect(this, modelRaw, panelIdRaw, userOpenId, actionValue)
   }
 
-  private async runCompactCommand(): Promise<void> {
-    this.clearStaleIdleQueueState('compact')
-    const noActiveTurn = !this.currentTurn && this.pendingUserMessageCount === 0 && this.pendingMidTurnMsgs.length === 0 && !this.openingTurn
-    if (!this.isRunning() || !this.proc) {
-      this.status = 'stopped'
-      this.opts.onLifecycleChange?.()
-      const statusCard = await this.openStatusCard('compact', '⚪ session 当前未运行', 'grey')
-      if (statusCard) {
-        await this.closeStatusCard(statusCard, '⚪ Codex 未运行，compact 无效')
-      } else {
-        await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行,compact 无效;用 \`hi\` 启动或 \`restart\` 恢复上一会话`)
-      }
-      return
-    }
-    if (!noActiveTurn) {
-      const statusCard = await this.openStatusCard('compact', '⚠️ 当前 turn 正在执行', 'grey')
-      if (statusCard) {
-        await this.closeStatusCard(statusCard, '⚠️ 先 stop 当前 turn，再 compact')
-      } else {
-        await feishu.sendText(this.chatId, '⚠️ 当前 turn 正在执行,先 `stop` 后再 `compact`。')
-      }
-      return
-    }
-    if (this.manualContextCompactionPending) {
-      const statusCard = await this.openStatusCard('compact', '⏳ 上下文压缩已在进行中', 'grey')
-      if (statusCard) await this.closeStatusCard(statusCard, '⏳ 上下文压缩已在进行中')
-      else await feishu.sendText(this.chatId, '⏳ 上下文压缩已在进行中。')
-      return
-    }
-
-    const proc = this.proc
-    const threadLabel = proc.sessionId ? proc.sessionId.slice(0, 8) : ''
-    const initialStatus = this.withModel(threadLabel ? `🧠 压缩上下文 thread=${threadLabel}…` : '🧠 压缩上下文…')
-    const statusCard = await this.openStatusCard('compact', initialStatus, 'orange')
-    const finishStatus = async (status: string) => {
-      if (statusCard) await this.closeStatusCard(statusCard, status)
-      else await feishu.sendText(this.chatId, status)
-    }
-    const watch = this.watchManualCompaction(proc, CONTEXT_COMPACT_TIMEOUT_MS)
-    const usageWatch = this.watchManualCompactionUsage(proc, proc.sessionId)
-    this.manualContextCompactionPending = true
-    try {
-      this.setStatusCard(statusCard, this.withModel('🧠 发起上下文压缩'))
-      await proc.compactThread()
-      this.setStatusCard(statusCard, this.withModel('⏳ 等待压缩完成事件'))
-      const notice = await watch.promise
-      const contextSnapshot = await usageWatch.waitFor(notice, CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS)
-      const doneThread = notice.threadId ? ` thread=${notice.threadId.slice(0, 8)}…` : ''
-      await finishStatus(this.withModel(`✅ 上下文已压缩${doneThread}${this.compactContextWindowLabel(contextSnapshot)}`))
-    } catch (e) {
-      watch.cancel()
-      await finishStatus(`❌ 上下文压缩失败: ${messageOf(e)}`)
-    } finally {
-      usageWatch.cancel()
-      this.manualContextCompactionPending = false
-    }
+  onModelEffortSelect(modelRaw: string, effortRaw: string, panelIdRaw = '', userOpenId = ''): Promise<ModelActionResult> {
+    return sessionModel.onModelEffortSelect(this, modelRaw, effortRaw, panelIdRaw, userOpenId)
   }
 
-  private modelListCwd(): string {
-    if (existsSync(this.workDir)) return this.workDir
-    if (existsSync(feishu.PROJECTS_ROOT)) return feishu.PROJECTS_ROOT
-    return process.cwd()
-  }
-
-  private async listAvailableModels(): Promise<CodexModel[]> {
-    if (this.proc?.isAlive()) {
-      return await withTimeout(this.proc.listModels(), 20_000, 'model/list')
-    }
-    if (!feishu.isOpenAIChatGPTAuthenticated()) {
-      throw new Error('Codex 未登录 ChatGPT 账号。请在服务器上运行 `codex login` 后再试。')
-    }
-    const proc = new CodexProcess({
-      workDir: this.modelListCwd(),
-      effort: this.effortForSpawn(),
-      appendSystemPrompt: CHANNEL_INSTRUCTIONS,
-    })
-    try {
-      return await withTimeout(proc.listModels(), 20_000, 'model/list')
-    } finally {
-      await proc.kill(1000).catch(e => log(`session "${this.sessionName}": temp model-list proc kill failed: ${e}`))
-    }
-  }
-
-  async showModelPanel(): Promise<void> {
-    let models: CodexModel[]
-    try {
-      models = await this.listAvailableModels()
-    } catch (e) {
-      const message = `❌ 模型列表失败: ${messageOf(e)}`
-      log(`session "${this.sessionName}": model list failed: ${messageOf(e)}`)
-      await feishu.sendText(this.chatId, message)
-      return
-    }
-
-    const panelId = randomUUID()
-    const currentModel = this.currentModelLabel()
-    const currentEffort = this.currentEffortLabel()
-    const choices = this.modelChoices(models)
-    this.modelPanels.set(panelId, { models: choices })
-    const messageId = await feishu.sendCard(this.chatId, cards.modelSelectionCard({
-      sessionName: this.sessionName,
-      panelId,
-      currentModel,
-      currentEffort,
-      models: choices,
-    }))
-    if (!messageId) {
-      this.modelPanels.delete(panelId)
-      await feishu.sendTextRaw(this.chatId, '❌ 模型面板发送失败')
-      return
-    }
-  }
-
-  private modelChoices(models: CodexModel[]): cards.ModelChoice[] {
-    const seen = new Set<string>()
-    const currentModel = this.currentModelLabel()
-    const currentEffort = this.currentEffortLabel()
-    const choices: cards.ModelChoice[] = []
-    for (const m of models) {
-      if (seen.has(m.model)) continue
-      seen.add(m.model)
-      choices.push({
-        model: m.model,
-        displayName: m.displayName,
-        description: m.description,
-        isDefault: m.isDefault,
-        selected: currentModel === m.model,
-        efforts: m.supportedReasoningEfforts.map(effort => ({
-          effort: effort.reasoningEffort,
-          description: effort.description,
-          isDefault: m.defaultReasoningEffort === effort.reasoningEffort,
-          selected: currentModel === m.model && currentEffort === effort.reasoningEffort,
-        })),
-      })
-    }
-    return choices
-  }
-
-  private initialEffortForModel(model: cards.ModelChoice): string | null {
-    const currentEffort = this.currentEffortLabel()
-    if (model.selected && model.efforts.some(effort => effort.effort === currentEffort)) return currentEffort
-    return model.efforts.find(effort => effort.isDefault)?.effort ?? model.efforts[0]?.effort ?? null
-  }
-
-  private modelChoiceFromAction(model: string, raw: any): cards.ModelChoice | null {
-    const effortsRaw = Array.isArray(raw?.efforts) ? raw.efforts : []
-    const efforts: cards.ModelEffortChoice[] = effortsRaw
-      .map((item: any) => ({
-        effort: typeof item?.effort === 'string' ? item.effort : '',
-        description: typeof item?.description === 'string' ? item.description : '',
-        isDefault: item?.is_default === true,
-      }))
-      .filter((item: cards.ModelEffortChoice) => item.effort)
-    if (efforts.length === 0) return null
-    return {
-      model,
-      displayName: typeof raw?.display_name === 'string' && raw.display_name ? raw.display_name : model,
-      description: '',
-      isDefault: raw?.is_default === true,
-      selected: this.currentModelLabel() === model,
-      efforts,
-    }
-  }
-
-  private modelSelectionScope(): string {
-    return this.currentTurn
-      ? '当前 turn 不变,下一轮开始使用。'
-      : this.proc?.isAlive()
-        ? '下一轮开始使用。'
-        : '下次启动 Codex 时使用。'
-  }
-
-  async onModelSelect(modelRaw: string, panelIdRaw = '', _userOpenId = '', actionValue: any = null): Promise<ModelActionResult> {
-    const model = modelRaw.trim()
-    if (!model) {
-      const message = '模型为空'
-      await feishu.sendText(this.chatId, `❌ ${message}`)
-      return { ok: false, message }
-    }
-    const panelId = panelIdRaw.trim()
-    const panel = this.modelPanels.get(panelId)
-    const choice = panel?.models.find(m => m.model === model) ?? this.modelChoiceFromAction(model, actionValue)
-    if (!choice) {
-      return { ok: false, message: '模型不在当前面板列表中,请重新发送 model' }
-    }
-    const selectedEffort = this.initialEffortForModel(choice)
-    return {
-      ok: choice.efforts.length > 0,
-      message: choice.efforts.length > 0 ? `已选择模型 ${model},请选择 effort` : '这个模型未返回可用 effort',
-      card: cards.modelEffortCard({
-        sessionName: this.sessionName,
-        panelId,
-        currentModel: this.currentModelLabel(),
-        currentEffort: this.currentEffortLabel(),
-        selectedModel: choice,
-        selectedEffort,
-      }),
-    }
-  }
-
-  async onModelEffortSelect(modelRaw: string, effortRaw: string, panelIdRaw = '', _userOpenId = ''): Promise<ModelActionResult> {
-    const model = modelRaw.trim()
-    const effortValue = effortRaw.trim()
-    if (!model) return { ok: false, message: '模型为空' }
-    if (!isCodexReasoningEffort(effortValue)) return { ok: false, message: 'reasoning effort 无效' }
-    const effort: CodexReasoningEffort = effortValue
-    const panelId = panelIdRaw.trim()
-    const panel = this.modelPanels.get(panelId)
-    const choice = panel?.models.find(m => m.model === model)
-    if (choice && !choice.efforts.some(item => item.effort === effort)) {
-      return { ok: false, message: 'reasoning effort 不属于该模型' }
-    }
-    try {
-      if (this.proc?.isAlive()) {
-        await withTimeout(this.proc.setModelSettings(model, effort), 20_000, 'thread/settings/update')
-      }
-      this.selectedModel = model
-      this.selectedEffort = effort
-      feishu.bindSessionModel(this.sessionName, model, effort)
-      const scope = this.modelSelectionScope()
-      this.modelPanels.delete(panelId)
-      return {
-        ok: true,
-        message: `已选择 ${model} / ${effort}`,
-        card: cards.modelResultCard({
-          sessionName: this.sessionName,
-          model,
-          effort,
-          scope,
-        }),
-      }
-    } catch (e) {
-      const message = `模型切换失败: ${messageOf(e)}`
-      log(`session "${this.sessionName}": set model settings failed: ${messageOf(e)}`)
-      await feishu.sendText(this.chatId, `❌ ${message}`)
-      return { ok: false, message }
-    }
-  }
-
-  private async worktreeActionResult(
-    ok: boolean,
-    message: string,
-    type: 'success' | 'error' | 'info',
-  ): Promise<WorktreeActionResult> {
-    try {
-      return { ok, message, card: await this.buildWorktreeListCard({ type, content: message }) }
-    } catch (e) {
-      const listError = `列表刷新失败: ${messageOf(e)}`
-      log(`session "${this.sessionName}": wt action panel refresh failed: ${messageOf(e)}`)
-      return {
-        ok: false,
-        message: `${message}\n${listError}`,
-        card: cards.worktreeNoticeCard({
-          slug: 'wt',
-          branch: 'work/*',
-          status: message,
-          body: listError,
-          template: 'red',
-        }),
-      }
-    }
-  }
-
-  async onWorktreeDisband(slugRaw: string): Promise<WorktreeActionResult> {
-    const slug = worktree.normalizeWorktreeSlug(slugRaw)
-    if (!slug) return this.worktreeActionResult(false, '❌ 名称无效', 'error')
-    if (worktree.isReservedWorktreeSlug(slug)) {
-      return this.worktreeActionResult(false, `❌ ${slug} 是 AI 自动化系统保留 worktree，不能解散。`, 'error')
-    }
-    const projectName = this.worktreeProjectName()
-    const projectDir = this.worktreeProjectDir()
-    try {
-      const chatName = worktree.worktreeChatName(projectName, slug)
-      const runningSession = [...Session.all].find(s => s.sessionName === chatName && s.isRunning())
-      if (runningSession) {
-        const message = `❌ 解散 ${slug} 失败: Codex 正在运行，请先在 ${chatName} 群里 stop 或 kill。`
-        return this.worktreeActionResult(false, message, 'error')
-      }
-      worktree.assertProjectWorktreeClean(projectDir, projectName, slug)
-      const disbanded = await feishu.disbandChatForSession(chatName)
-      const removed = worktree.removeProjectWorktreeIfClean(projectDir, projectName, slug)
-      const message = [
-        `✅ ${slug} 已解散`,
-        removed.removedWorktree ? 'dir removed' : 'dir missing',
-        disbanded.disbanded ? 'group removed' : 'group missing',
-        removed.branch,
-      ].join('\n')
-      return this.worktreeActionResult(true, message, 'success')
-    } catch (e) {
-      const message = `❌ 解散 ${slug} 失败: ${messageOf(e)}`
-      return this.worktreeActionResult(false, message, 'error')
-    }
+  onWorktreeDisband(slugRaw: string): Promise<WorktreeActionResult> {
+    return sessionWorktree.onWorktreeDisband(this, slugRaw)
   }
 
   /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
    * plus their two-letter aliases where applicable.
-   * Returns true if the command was consumed (don't forward to Codex).
-   * Exact match, case-insensitive, ignores trailing whitespace.
-   *
-   * Trade-off (user-confirmed 2026-05-15): these words are reserved
-   * globally — typing "hi" as a literal greeting will show the console
-   * card instead of reaching Codex. The ergonomic win (no slash, no
-   * shift key, one-handed phone use) outweighs the collision in this
-   * product's private-bot use case. `stop` was added 2026-05-15 once
-   * auto-interrupt on mid-turn user messages was removed (matching
-   * Codex's native type-ahead behavior) — explicit barge-out
-   * needed a knob and `kill` (full subprocess teardown) is too heavy. */
-  async runCommand(raw: string, userOpenId = ''): Promise<boolean> {
-    const wt = raw.trim().match(/^(?:wt|worktree)(?:\s+(.+))?$/i)
-    if (wt) {
-      if (this.startingAgy || this.runningAgy) {
-        await feishu.sendText(this.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 wt。')
-        return true
-      }
-      await this.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId)
-      return true
-    }
-    const agy = raw.trim().match(/^agy(?:\s+([\s\S]+))?$/i)
-    if (agy) {
-      await this.runAgyCommand((agy[1] ?? '').trim())
-      return true
-    }
-    if (raw.trim().toLowerCase() === 'task') {
-      await this.showTasklistPanel()
-      return true
-    }
-    const command = CONTROL_COMMAND_ALIASES.get(raw.trim().toLowerCase())
-    if (!command) return false
-    if ((this.startingAgy || this.runningAgy) && !['stop', 'kill', 'restart', 'hi', 'model'].includes(command)) {
-      await feishu.sendText(this.chatId, `⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再执行 ${command}。`)
-      return true
-    }
-    switch (command) {
-      case 'model':
-        await this.showModelPanel()
-        return true
-      case 'compact':
-        await this.runCompactCommand()
-        return true
-      case 'hi':
-        {
-          const needsStart = !this.isRunning()
-          const statusCard = needsStart
-            ? await this.openStatusCard('hi', this.withModel('🚀 启动 Codex'))
-            : null
-          let lastStatus = this.withModel('🚀 启动 Codex')
-          const ok = needsStart
-            ? await this.start({
-                announce: !statusCard,
-                onStatus: status => {
-                  lastStatus = status
-                  this.setStatusCard(statusCard, status)
-                },
-              })
-            : true
-          if (!ok) {
-            await this.closeStatusCard(statusCard, lastStatus.startsWith('❌') ? lastStatus : '❌ 启动失败')
-            return true
-          }
-          if (statusCard) {
-            await this.replaceStatusCardWithConsole(
-              statusCard,
-              this.withModel(this.withWorktreeInstructionNotice('✅ Codex 已就绪')),
-            )
-            return true
-          }
-          if (needsStart) {
-            await this.closeStatusCard(
-              statusCard,
-              this.withModel(this.withWorktreeInstructionNotice('✅ Codex 已就绪')),
-            )
-          }
-        }
-        await this.showConsole()
-        return true
-      case 'stop':
-        if (this.runningAgy) {
-          await this.stopAgyTask('🛑 agy 已打断')
-          return true
-        }
-        // Soft barge-out: interrupt the current turn (if any) AND drop
-        // the pending-message count so a stack of type-ahead doesn't
-        // refire after the interrupt. Subprocess stays alive. Note: the
-        // SDK keeps its OWN internal queue of the user-text frames we
-        // already sendText'd — interrupt should also flush that side,
-        // but the daemon can't reach into it directly; in practice the
-        // sendInterrupt() control_request causes the SDK to discard
-        // queued input alongside the in-flight call.
-        this.clearStaleIdleQueueState('stop')
-        if (!this.currentTurn && this.pendingUserMessageCount === 0 && this.pendingMidTurnMsgs.length === 0) {
-          const statusCard = await this.openStatusCard('stop', '⚪ 当前没有正在执行的 turn', 'grey')
-          if (statusCard) {
-            await this.closeStatusCard(statusCard, '⚪ 无正在执行的 turn')
-          } else {
-            await feishu.sendText(this.chatId, '⚪ 当前没有正在执行的 turn')
-          }
-          return true
-        }
-        log(`session "${this.sessionName}": stop command — interrupt + drop count=${this.pendingUserMessageCount} midBuffer=${this.pendingMidTurnMsgs.length}`)
-        // Cancelled queued msgs: remove the OneSecond (no longer waiting)
-        // and stamp a CrossMark (explicit cancelled state, distinct from
-        // a natural release where reactions just disappear). Cancelled
-        // mid-batch msgs get the same treatment.
-        // 用 `seen` Set 去重 —— mid-turn buffer 跟 pendingReactionIds 的
-        // msgId 重叠(onUserMessage 进 buffer 时同时 trackReaction),
-        // 两次 addReaction(CrossMark) 会在飞书侧渲染两个 ❌ (P0-1)。
-        const seen = new Set<string>()
-        for (const [msgId, rid] of [
-          ...this.pendingReactionIds.entries(),
-          ...this.currentBatchReactionIds.entries(),
-        ]) {
-          if (rid) void feishu.deleteReaction(msgId, rid)
-          void feishu.addReaction(msgId, 'CrossMark')
-          seen.add(msgId)
-        }
-        // Mid-turn buffer never reached SDK — cancel those too.
-        for (const msg of this.pendingMidTurnMsgs) {
-          if (msg.msgId && !seen.has(msg.msgId)) void feishu.addReaction(msg.msgId, 'CrossMark')
-        }
-        this.pendingUserMessageCount = 0
-        this.pendingMidTurnMsgs = []
-        this.pendingTurnInputs = []
-        this.lastUserOpenId = ''
-        this.pendingReactionIds = new Map()
-        this.currentBatchReactionIds = new Map()
-        // Tag the imminent SDK `result` so the result handler does not
-        // repaint the footer after this stop path already closed the card.
-        // Must be set BEFORE sendInterrupt — the result can land next tick.
-        this.userInterrupted = true
-        this.interrupt()
-        // 主动封口,把 footer 改成 🛑 打断、停止 footer 状态计时、把 streaming_mode
-        // 翻回 false,否则卡片会僵在运行中状态。SDK 的 post-interrupt
-        // result 也会进 closeTurnCard,但 currentTurn 已被这里置空,那条
-        // 路径会 early-return,不会重画 footer。
-        await this.closeTurnCard('🛑 打断')
-        return true
-      case 'kill':
-        {
-          if (this.runningAgy) await this.stopAgyTask('🛑 agy 已终止')
-          const wasRunning = this.isRunning()
-          const initialStatus = wasRunning ? '🛑 停止 Codex' : '⚪ session 当前未运行'
-          const statusCard = await this.openStatusCard('kill', initialStatus, wasRunning ? 'red' : 'grey')
-          await this.stop('已终止', {
-            announce: !statusCard,
-            onStatus: status => {
-              this.setStatusCard(statusCard, status)
-            },
-          })
-          await this.closeStatusCard(statusCard, wasRunning ? '✅ Codex 已终止' : '⚪ Codex 未运行')
-        }
-        return true
-      case 'restart':
-        // resume the prior conversation — kills the current proc (if
-        // any) and spawns a new one with `--resume <lastSessionId>`.
-        // If no process is running, this is how the user gets back the
-        // previous conversation after a `kill` or a daemon crash.
-        {
-          const resumeThreadLabel = this.lastSessionId ? this.lastSessionId.slice(0, 8) : ''
-          const initialStatus = this.isRunning()
-            ? this.withModel('🔁 重启 Codex')
-            : resumeThreadLabel
-              ? this.withModel(`🔁 恢复上一会话 thread=${resumeThreadLabel}…`)
-              : this.withModel('🔁 启动 Codex')
-          const statusCard = await this.openStatusCard('restart', initialStatus)
-          if (this.runningAgy) {
-            this.setStatusCard(statusCard, '🛑 restart 前终止 agy')
-            await this.stopAgyTask('🛑 restart 前已终止 agy')
-          }
-          let lastStatus = initialStatus
-          const ok = await this.restart(true, {
-            announce: !statusCard,
-            onStatus: status => {
-              lastStatus = status
-              this.setStatusCard(statusCard, status)
-            },
-          })
-          const finalStatus = ok
-            ? (
-                lastStatus.startsWith('✅')
-                  ? lastStatus
-                  : this.withWorktreeInstructionNotice(resumeThreadLabel ? '✅ 已恢复上一会话' : '✅ Codex 已就绪')
-              )
-            : (lastStatus.startsWith('❌') ? lastStatus : '❌ 重启失败')
-          await this.closeStatusCard(statusCard, ok ? this.withModel(finalStatus) : finalStatus)
-        }
-        return true
-      case 'clear':
-        // "throw away current conversation, start a new one". By design
-        // this only makes sense when there IS a current conversation:
-        // calling clear from stopped state is a no-op (user-confirmed
-        // 2026-05-16) — we don't want a stray `clear` to silently spawn
-        // a fresh session the user didn't ask for. To start from cold,
-        // use `hi`.
-        if (!this.isRunning()) {
-          this.status = 'stopped'
-          this.opts.onLifecycleChange?.()
-          const statusCard = await this.openStatusCard('clear', '⚪ session 当前未运行', 'grey')
-          if (statusCard) {
-            await this.closeStatusCard(statusCard, '⚪ Codex 未运行，clear 无效')
-          } else {
-            await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行,clear 无效;用 \`hi\` 启动或 \`restart\` 恢复上一会话`)
-          }
-          return true
-        }
-        {
-          const statusCard = await this.openStatusCard('clear', '🧹 清空并启动新会话', 'orange')
-          let lastStatus = '🧹 清空并启动新会话'
-          const ok = await this.restart(false, {
-            announce: !statusCard,
-            onStatus: status => {
-              lastStatus = status
-              this.setStatusCard(statusCard, status)
-            },
-          })
-          await this.closeStatusCard(
-            statusCard,
-            ok
-              ? this.withModel(this.withWorktreeInstructionNotice('✅ 已清空并启动新会话'))
-              : (lastStatus.startsWith('❌') ? lastStatus : '❌ 清空失败'),
-          )
-        }
-        return true
-    }
+   * Returns true if the command was consumed (don't forward to Codex). */
+  runCommand(raw: string, userOpenId = ''): Promise<boolean> {
+    return sessionCommands.runCommand(this, raw, userOpenId)
   }
 
   /** Build the hi-panel data snapshot for this session.
@@ -2178,7 +921,7 @@ export class Session {
     })()
   }
 
-  private async replaceStatusCardWithConsole(handle: StatusCardHandle, finalStatus: string): Promise<void> {
+  async replaceStatusCardWithConsole(handle: StatusCardHandle, finalStatus: string): Promise<void> {
     handle.timer.stop()
     const elapsed = handle.timer.elapsedSec()
     const consoleOpts = await this.buildConsoleOpts(undefined)
@@ -3369,7 +2112,7 @@ export class Session {
     turn.footerStatusLabel = null
   }
 
-  private async closeTurnCard(
+  async closeTurnCard(
     suffix?: string,
     opts: { forcePush?: boolean; hasFreshResult?: boolean } = {},
   ): Promise<void> {
