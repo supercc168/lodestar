@@ -33,6 +33,7 @@ import type {
   CodexUsage,
   SpawnOpts,
 } from './codex-process'
+import { usageFromTokenUsagePayload } from './codex-usage'
 
 type QueueWaiter<T> = (value: IteratorResult<T>) => void
 
@@ -144,20 +145,8 @@ export function buildClaudeSpawnPath(): string {
 }
 
 function usageFromSdk(raw: any): CodexUsage | null {
-  if (!raw || typeof raw !== 'object') return null
-  const out: CodexUsage = {}
-  const fields: Array<[keyof CodexUsage, string]> = [
-    ['total_tokens', 'total_tokens'],
-    ['input_tokens', 'input_tokens'],
-    ['output_tokens', 'output_tokens'],
-    ['reasoning_output_tokens', 'reasoning_output_tokens'],
-    ['cache_creation_input_tokens', 'cache_creation_input_tokens'],
-    ['cache_read_input_tokens', 'cache_read_input_tokens'],
-  ]
-  for (const [key, rawKey] of fields) {
-    const value = raw[rawKey]
-    if (typeof value === 'number' && Number.isFinite(value)) out[key] = value
-  }
+  const out = usageFromTokenUsagePayload(raw)
+  if (!out) return null
   const summedTotal = (out.input_tokens ?? 0)
     + (out.output_tokens ?? 0)
     + (out.cache_creation_input_tokens ?? 0)
@@ -203,6 +192,11 @@ function totalUsageFromModelUsage(modelUsage: any): { usage: CodexUsage | null; 
 
 function cloneUsage(usage: CodexUsage): CodexUsage {
   return { ...usage }
+}
+
+function objectKeys(raw: unknown): string[] {
+  if (!raw || typeof raw !== 'object') return []
+  return Object.keys(raw as Record<string, unknown>).slice(0, 20)
 }
 
 function addUsageTotals(total: CodexUsage | null, delta: CodexUsage): CodexUsage {
@@ -263,6 +257,9 @@ const CLAUDE_ASK_DIALOG_KINDS = [
   'askUserQuestion',
   'AskUserQuestion',
 ] as const
+
+export const CLAUDE_PERMISSION_MODE = 'bypassPermissions' as const
+export const CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS = true
 
 function normalizeAskDialogInput(request: UserDialogRequest): Record<string, unknown> | null {
   if (!CLAUDE_ASK_DIALOG_KINDS.includes(request.dialogKind as any)) return null
@@ -372,6 +369,8 @@ export class ClaudeAgentProcess extends EventEmitter {
           effort: this.opts.effort as EffortLevel,
           resume: this.opts.resumeSessionId,
           pathToClaudeCodeExecutable: resolveClaudeBin(),
+          permissionMode: CLAUDE_PERMISSION_MODE,
+          allowDangerouslySkipPermissions: CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS,
           env: {
             ...(process.env as Record<string, string>),
             PATH: buildClaudeSpawnPath(),
@@ -766,7 +765,11 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (typeof raw.session_id === 'string' && raw.session_id) this.sessionId = raw.session_id
     this.turnActive = false
     const usage = usageFromSdk(raw.usage)
-    const total = totalUsageFromModelUsage(raw.modelUsage)
+    const modelUsageRaw = raw.modelUsage ?? raw.model_usage
+    const total = totalUsageFromModelUsage(modelUsageRaw)
+    if (!usage && !total.usage) {
+      log(`claude-agent-process: result usage missing rootKeys=${objectKeys(raw).join(',') || '-'} usageKeys=${objectKeys(raw.usage).join(',') || '-'} modelUsageKeys=${objectKeys(modelUsageRaw).join(',') || '-'}`)
+    }
     this.lastUsage = usage
     if (total.usage) {
       this.cumulativeUsageFromResults = cloneUsage(total.usage)

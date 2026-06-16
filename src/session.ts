@@ -1603,9 +1603,14 @@ export class Session {
   private accumulateResultStats(): void {
     const r = this.proc?.lastResult
     if (!r) return
+    // Claude result.usage is scoped to the just-finished SDK query; after a
+    // resumed session starts with no local total baseline, this is the only
+    // accurate per-turn figure we have.
     const u = this.currentTurnUsageBaselineKnown
       ? diffUsageTotals(this.proc?.lastTotalUsage, this.currentTurnUsageBaseline)
-      : null
+      : this.proc?.provider === 'claude' && r.usage
+        ? { ...r.usage }
+        : null
     this.lastTurnUsage = u
     this.currentTurnUsageBaseline = null
     this.currentTurnUsageBaselineKnown = false

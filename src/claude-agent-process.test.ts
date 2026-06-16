@@ -13,6 +13,8 @@ mock.module('./config', () => ({
 
 const {
   buildClaudeSpawnPath,
+  CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS,
+  CLAUDE_PERMISSION_MODE,
   ClaudeAgentProcess,
 } = await import('./claude-agent-process')
 const {
@@ -58,6 +60,13 @@ describe('Claude model profiles', () => {
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'v4pro',
       ANTHROPIC_DEFAULT_HAIKU_MODEL: 'v4flash',
     })
+  })
+})
+
+describe('Claude permission mode', () => {
+  test('runs Claude Code in bypass permission mode', () => {
+    expect(CLAUDE_PERMISSION_MODE).toBe('bypassPermissions')
+    expect(CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS).toBe(true)
   })
 })
 
@@ -349,6 +358,48 @@ describe('Claude token accounting', () => {
     expect(proc.lastTotalUsage).toEqual(usageEvents[1].totalUsage)
   })
 
+  test('parses camelCase per-result usage fields', () => {
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp',
+      effort: 'high',
+    }) as any
+    const usageEvents: any[] = []
+    proc.on('token_usage', (event: any) => usageEvents.push(event))
+
+    proc.handleMessage({
+      type: 'result',
+      subtype: 'success',
+      uuid: 'result-camel-usage',
+      session_id: 'claude-session-1',
+      is_error: false,
+      duration_ms: 10,
+      num_turns: 1,
+      usage: {
+        inputTokens: 10,
+        outputTokens: 2,
+        cacheCreationInputTokens: 1,
+        cacheReadInputTokens: 3,
+      },
+      modelUsage: {},
+    })
+
+    expect(usageEvents).toHaveLength(1)
+    expect(usageEvents[0].usage).toEqual({
+      input_tokens: 10,
+      output_tokens: 2,
+      cache_creation_input_tokens: 1,
+      cache_read_input_tokens: 3,
+      total_tokens: 16,
+    })
+    expect(usageEvents[0].totalUsage).toEqual({
+      input_tokens: 10,
+      output_tokens: 2,
+      cache_creation_input_tokens: 1,
+      cache_read_input_tokens: 3,
+      total_tokens: 16,
+    })
+  })
+
   test('uses modelUsage as authoritative cumulative totals when present', () => {
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
@@ -429,5 +480,52 @@ describe('Claude token accounting', () => {
     })
     expect(usageEvents[1].contextWindow).toBe(258000)
     expect(proc.lastResult.cost_delta_usd).toBeCloseTo(0.06)
+  })
+
+  test('uses model_usage alias as authoritative cumulative totals when present', () => {
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp',
+      effort: 'high',
+    }) as any
+    const usageEvents: any[] = []
+    proc.on('token_usage', (event: any) => usageEvents.push(event))
+
+    proc.handleMessage({
+      type: 'result',
+      subtype: 'success',
+      uuid: 'result-snake-model-usage',
+      session_id: 'claude-session-1',
+      is_error: false,
+      duration_ms: 10,
+      num_turns: 1,
+      usage: { input_tokens: 10, output_tokens: 2 },
+      model_usage: {
+        opus: {
+          inputTokens: 100,
+          outputTokens: 20,
+          cacheCreationInputTokens: 5,
+          cacheReadInputTokens: 30,
+          contextWindow: 200000,
+          costUSD: 0.25,
+        },
+      },
+    })
+
+    expect(usageEvents).toHaveLength(1)
+    expect(usageEvents[0].usage).toEqual({
+      input_tokens: 10,
+      output_tokens: 2,
+      total_tokens: 12,
+    })
+    expect(usageEvents[0].totalUsage).toEqual({
+      input_tokens: 100,
+      output_tokens: 20,
+      reasoning_output_tokens: 0,
+      cache_creation_input_tokens: 5,
+      cache_read_input_tokens: 30,
+      total_tokens: 155,
+    })
+    expect(usageEvents[0].contextWindow).toBe(200000)
+    expect(proc.lastResult.cost_delta_usd).toBeCloseTo(0.25)
   })
 })

@@ -194,6 +194,56 @@ describe('Session fresh conversation state', () => {
   })
 })
 
+describe('Session token accounting', () => {
+  test('uses Claude result usage when resumed totals baseline is unknown', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.currentTurnUsageBaseline = null
+    session.currentTurnUsageBaselineKnown = false
+    session.usageTotalsSeedUnknown = true
+    proc.lastResult = {
+      cost_usd: 0.03,
+      cost_delta_usd: 0.03,
+      duration_ms: 1200,
+      num_turns: 1,
+      usage: {
+        input_tokens: 10,
+        output_tokens: 2,
+        cache_read_input_tokens: 3,
+        total_tokens: 15,
+      },
+      subtype: 'success',
+      is_error: false,
+    }
+    proc.lastTotalUsage = {
+      input_tokens: 100,
+      output_tokens: 20,
+      cache_read_input_tokens: 30,
+      total_tokens: 150,
+    }
+
+    session.accumulateResultStats()
+
+    expect(session.lastTurnUsage).toEqual({
+      input_tokens: 10,
+      output_tokens: 2,
+      cache_read_input_tokens: 3,
+      total_tokens: 15,
+    })
+    expect(session.lastTurnDelta).toEqual({
+      tokens: 12,
+      costUsd: 0.03,
+      durationMs: 1200,
+    })
+    expect(session.cumStats).toEqual({
+      tokens: 12,
+      costUsd: 0.03,
+      turns: 1,
+    })
+  })
+})
+
 describe('Session assistant rendering', () => {
   test('buffers assistant deltas and inserts one completed markdown element without content streaming', async () => {
     const session = new Session('probe', 'chat_id') as any
