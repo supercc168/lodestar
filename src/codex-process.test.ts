@@ -176,6 +176,7 @@ describe('codex token usage helpers', () => {
       cache_read_input_tokens: 1600,
     })
     expect(effectiveTurnTokens(usage)).toBe(6000)
+    expect(effectiveTurnTokens({ total_tokens: 1234 })).toBe(1234)
     expect(effectiveTurnTokens(null)).toBeNull()
   })
 

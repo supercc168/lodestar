@@ -115,12 +115,13 @@ export function renderPermission(s: Session, req: CanUseToolRequest): void {
   // screen notification shows which tool needs approval.
   if (turn.userOpenId && turn.messageId) {
     const inputSummary = cards.summarizeToolInput(meta.name, meta.input)
+    const toolName = cards.displayToolName(meta.name)
     const tail = inputSummary && inputSummary.length > 30
       ? inputSummary.slice(0, 30) + '…'
       : inputSummary
     const summary = tail
-      ? `🔐 等审批: ${meta.name} · ${tail}`
-      : `🔐 等审批: ${meta.name}`
+      ? `🔐 等审批: ${toolName} · ${tail}`
+      : `🔐 等审批: ${toolName}`
     void (async () => {
       cardkit.cancelSummary(turn.cardId)
       await cardkit.patchSettings(turn.cardId, { config: { summary: { content: summary } } })

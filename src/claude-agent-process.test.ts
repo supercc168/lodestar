@@ -180,3 +180,151 @@ describe('Claude user dialog bridge', () => {
     })
   })
 })
+
+describe('Claude token accounting', () => {
+  test('accumulates per-result usage when modelUsage totals are absent', () => {
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp',
+      effort: 'high',
+    }) as any
+    const usageEvents: any[] = []
+    proc.on('token_usage', (event: any) => usageEvents.push(event))
+
+    proc.handleMessage({
+      type: 'result',
+      subtype: 'success',
+      uuid: 'result-1',
+      session_id: 'claude-session-1',
+      is_error: false,
+      duration_ms: 10,
+      num_turns: 1,
+      usage: { input_tokens: 10, output_tokens: 2 },
+      modelUsage: {},
+    })
+    proc.handleMessage({
+      type: 'result',
+      subtype: 'success',
+      uuid: 'result-2',
+      session_id: 'claude-session-1',
+      is_error: false,
+      duration_ms: 12,
+      num_turns: 1,
+      usage: {
+        input_tokens: 7,
+        output_tokens: 1,
+        cache_creation_input_tokens: 1,
+        cache_read_input_tokens: 3,
+      },
+      modelUsage: {},
+    })
+
+    expect(usageEvents).toHaveLength(2)
+    expect(usageEvents[0].usage).toEqual({
+      input_tokens: 10,
+      output_tokens: 2,
+      total_tokens: 12,
+    })
+    expect(usageEvents[0].totalUsage).toEqual({
+      input_tokens: 10,
+      output_tokens: 2,
+      total_tokens: 12,
+    })
+    expect(usageEvents[1].usage).toEqual({
+      input_tokens: 7,
+      output_tokens: 1,
+      cache_creation_input_tokens: 1,
+      cache_read_input_tokens: 3,
+      total_tokens: 12,
+    })
+    expect(usageEvents[1].totalUsage).toEqual({
+      input_tokens: 17,
+      output_tokens: 3,
+      cache_creation_input_tokens: 1,
+      cache_read_input_tokens: 3,
+      total_tokens: 24,
+    })
+    expect(proc.lastTotalUsage).toEqual(usageEvents[1].totalUsage)
+  })
+
+  test('uses modelUsage as authoritative cumulative totals when present', () => {
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp',
+      effort: 'high',
+    }) as any
+    const usageEvents: any[] = []
+    proc.on('token_usage', (event: any) => usageEvents.push(event))
+
+    proc.handleMessage({
+      type: 'result',
+      subtype: 'success',
+      uuid: 'result-1',
+      session_id: 'claude-session-1',
+      is_error: false,
+      duration_ms: 10,
+      num_turns: 1,
+      usage: { input_tokens: 10, output_tokens: 2 },
+      modelUsage: {
+        opus: {
+          inputTokens: 100,
+          outputTokens: 20,
+          cacheCreationInputTokens: 5,
+          cacheReadInputTokens: 30,
+          contextWindow: 200000,
+          costUSD: 0.25,
+        },
+      },
+    })
+    expect(proc.lastResult.cost_delta_usd).toBeCloseTo(0.25)
+    proc.handleMessage({
+      type: 'result',
+      subtype: 'success',
+      uuid: 'result-2',
+      session_id: 'claude-session-1',
+      is_error: false,
+      duration_ms: 12,
+      num_turns: 1,
+      usage: { input_tokens: 4, output_tokens: 1 },
+      modelUsage: {
+        glm: {
+          input_tokens: 130,
+          output_tokens: 25,
+          cache_creation_input_tokens: 8,
+          cache_read_input_tokens: 40,
+          context_window: 258000,
+          cost_usd: 0.31,
+        },
+      },
+    })
+
+    expect(usageEvents[0].usage).toEqual({
+      input_tokens: 10,
+      output_tokens: 2,
+      total_tokens: 12,
+    })
+    expect(usageEvents[0].totalUsage).toEqual({
+      input_tokens: 100,
+      output_tokens: 20,
+      reasoning_output_tokens: 0,
+      cache_creation_input_tokens: 5,
+      cache_read_input_tokens: 30,
+      total_tokens: 155,
+    })
+    expect(usageEvents[0].contextWindow).toBe(200000)
+
+    expect(usageEvents[1].usage).toEqual({
+      input_tokens: 4,
+      output_tokens: 1,
+      total_tokens: 5,
+    })
+    expect(usageEvents[1].totalUsage).toEqual({
+      input_tokens: 130,
+      output_tokens: 25,
+      reasoning_output_tokens: 0,
+      cache_creation_input_tokens: 8,
+      cache_read_input_tokens: 40,
+      total_tokens: 203,
+    })
+    expect(usageEvents[1].contextWindow).toBe(258000)
+    expect(proc.lastResult.cost_delta_usd).toBeCloseTo(0.06)
+  })
+})

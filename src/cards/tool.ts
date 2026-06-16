@@ -28,6 +28,10 @@ function isWebSearchTool(name: string): boolean {
   return name === 'WebSearch' || name === 'webSearch'
 }
 
+function isWebFetchTool(name: string): boolean {
+  return name === 'WebFetch' || name === 'webFetch'
+}
+
 function isMcpTool(name: string): boolean {
   return name === 'MCP'
 }
@@ -37,13 +41,51 @@ function isImageGenerationTool(name: string): boolean {
 }
 
 function isAgentTool(name: string): boolean {
-  return name === 'Agent'
+  return name === 'Agent' || name === 'Task'
 }
 
-function displayToolName(name: string): string {
+function isFileReadTool(name: string): boolean {
+  return name === 'Read'
+}
+
+function isFileWriteTool(name: string): boolean {
+  return name === 'Write'
+}
+
+function isFileEditTool(name: string): boolean {
+  return name === 'Edit' || name === 'NotebookEdit'
+}
+
+function isFileMultiEditTool(name: string): boolean {
+  return name === 'MultiEdit'
+}
+
+function isPathSearchTool(name: string): boolean {
+  return name === 'Glob' || name === 'Grep' || name === 'LS'
+}
+
+function isTodoTool(name: string): boolean {
+  return name === 'TodoWrite'
+}
+
+function isExitPlanModeTool(name: string): boolean {
+  return name === 'ExitPlanMode'
+}
+
+export function displayToolName(name: string): string {
   if (isFileChangeTool(name)) return '文件变更'
   if (isWebSearchTool(name)) return '网页搜索'
+  if (isWebFetchTool(name)) return '网页读取'
   if (isImageGenerationTool(name)) return '图片生成'
+  if (isFileReadTool(name)) return '读取文件'
+  if (isFileWriteTool(name)) return '写入文件'
+  if (isFileEditTool(name) || isFileMultiEditTool(name)) return '编辑文件'
+  if (name === 'Glob') return '匹配文件'
+  if (name === 'Grep') return '搜索文件'
+  if (name === 'LS') return '列目录'
+  if (isTodoTool(name)) return '更新待办'
+  if (isExitPlanModeTool(name)) return '确认计划'
+  if (name === 'Task') return '子任务'
   return isBashTool(name) ? 'Bash' : name
 }
 
@@ -55,20 +97,18 @@ export function summarizeToolInput(name: string, input: any): string {
   if (isShellSessionTool(name)) return summarizeShellSessionInput(input)
   if (isFileChangeTool(name)) return truncate(summarizeFileChangeInput(input), 80)
   if (isWebSearchTool(name)) return truncate(summarizeWebSearchInput(input), 80)
+  if (isWebFetchTool(name)) return truncate(summarizeWebFetchInput(input), 80)
   if (isMcpTool(name)) return truncate(summarizeMcpInput(input), 80)
   if (isImageGenerationTool(name)) return truncate(summarizeImageGenerationInput(input), 80)
   if (isAgentTool(name)) return truncate(summarizeAgentInput(input), 80)
+  if (isFileReadTool(name)) return truncate(summarizeReadInput(input), 80)
+  if (isFileWriteTool(name)) return truncate(summarizeWriteInput(input), 80)
+  if (isFileEditTool(name)) return truncate(summarizeEditInput(input), 80)
+  if (isFileMultiEditTool(name)) return truncate(summarizeMultiEditInput(input), 80)
+  if (isPathSearchTool(name)) return truncate(summarizePathSearchInput(name, input), 80)
+  if (isTodoTool(name)) return truncate(summarizeTodoInput(input), 80)
+  if (isExitPlanModeTool(name)) return truncate(firstStringField(input) || '提交计划', 80)
   switch (name) {
-    case 'Read':
-    case 'Write':
-    case 'Edit':
-    case 'NotebookEdit': return truncate(String(input.file_path ?? ''), 80)
-    case 'Glob':       return truncate(String(input.pattern ?? ''), 80)
-    case 'Grep':       return truncate(`${input.pattern ?? ''}${input.path ? ' in ' + input.path : ''}`, 80)
-    case 'WebFetch':
-    case 'WebSearch': return truncate(String(input.url ?? input.query ?? ''), 80)
-    case 'Agent':
-    case 'Task':       return truncate(String(input.description ?? input.subject ?? ''), 80)
     case 'Skill':      return truncate(String(input.skill ?? ''), 80)
   }
   // generic fallback: first string-valued field
@@ -388,6 +428,227 @@ function renderFileChangeBody(input: any, output: string | null, resolvedNote?: 
   return lines.join('\n')
 }
 
+function toolPath(input: any): string {
+  return String(input?.file_path ?? input?.path ?? input?.notebook_path ?? '')
+}
+
+function summarizeReadInput(input: any): string {
+  const path = toolPath(input)
+  const range = [
+    input?.offset != null ? `offset ${input.offset}` : '',
+    input?.limit != null ? `limit ${input.limit}` : '',
+  ].filter(Boolean).join(' · ')
+  return range && path ? `${path} · ${range}` : path
+}
+
+function summarizeWriteInput(input: any): string {
+  const path = toolPath(input)
+  const content = typeof input?.content === 'string' ? input.content : ''
+  const lines = content ? content.split(/\r?\n/).length : 0
+  return path && lines ? `${path} · ${lines} 行` : path
+}
+
+function summarizeEditInput(input: any): string {
+  const path = toolPath(input)
+  const mode = input?.replace_all ? '全局替换' : '替换'
+  return path ? `${mode} ${path}` : mode
+}
+
+function summarizeMultiEditInput(input: any): string {
+  const path = toolPath(input)
+  const edits = Array.isArray(input?.edits) ? input.edits.length : 0
+  const suffix = edits ? ` · ${edits} 处` : ''
+  return path ? `批量编辑 ${path}${suffix}` : `批量编辑${suffix}`
+}
+
+function summarizePathSearchInput(name: string, input: any): string {
+  if (name === 'Glob') {
+    const pattern = String(input?.pattern ?? '')
+    return input?.path ? `${pattern} · ${input.path}` : pattern
+  }
+  if (name === 'Grep') {
+    const pattern = String(input?.pattern ?? '')
+    return input?.path ? `${pattern} · ${input.path}` : pattern
+  }
+  return String(input?.path ?? '')
+}
+
+function todoStatusLabel(status: unknown): string {
+  switch (status) {
+    case 'pending': return '待办'
+    case 'in_progress': return '进行中'
+    case 'completed': return '完成'
+    default: return String(status ?? '未知')
+  }
+}
+
+function summarizeTodoInput(input: any): string {
+  const todos = Array.isArray(input?.todos) ? input.todos : []
+  if (todos.length === 0) return ''
+  const counts = new Map<string, number>()
+  for (const todo of todos) {
+    const label = todoStatusLabel(todo?.status)
+    counts.set(label, (counts.get(label) ?? 0) + 1)
+  }
+  const summary = [...counts.entries()].map(([label, n]) => `${label} ${n}`).join(' · ')
+  return `${todos.length} 项${summary ? ` · ${summary}` : ''}`
+}
+
+function summarizeWebFetchInput(input: any): string {
+  const url = String(input?.url ?? '')
+  const prompt = typeof input?.prompt === 'string' ? input.prompt.trim() : ''
+  return url && prompt ? `${url} · ${prompt}` : (url || prompt)
+}
+
+function appendResult(lines: string[], output: string | null): void {
+  if (output == null) return
+  lines.push('')
+  lines.push('---')
+  lines.push('**结果**')
+  lines.push(outputPreviewBlock(output, 1200))
+}
+
+function renderReadBody(input: any, output: string | null, resolvedNote?: string): string {
+  const lines: string[] = []
+  const path = toolPath(input)
+  if (path) lines.push(`**路径**: ${inlineCode(path)}`)
+  if (input?.offset != null) lines.push(`**offset**: ${inlineCode(input.offset)}`)
+  if (input?.limit != null) lines.push(`**limit**: ${inlineCode(input.limit)}`)
+  if (resolvedNote) {
+    lines.push('')
+    lines.push(resolvedNote)
+  }
+  // Read 输出可能是源码或敏感文件内容；对话卡只展示路径和范围。
+  if (output != null) {
+    lines.push('')
+    lines.push('_内容已读取，未展开到群聊卡片。_')
+  }
+  return lines.length > 0 ? lines.join('\n') : jsonBlock(input ?? {}, 2000)
+}
+
+function renderWriteBody(input: any, output: string | null, resolvedNote?: string): string {
+  const lines: string[] = []
+  const path = toolPath(input)
+  const content = typeof input?.content === 'string' ? input.content : ''
+  if (path) lines.push(`**路径**: ${inlineCode(path)}`)
+  if (content) {
+    const lineCount = content.split(/\r?\n/).length
+    lines.push(`**内容**: ${lineCount} 行 / ${content.length} 字符`)
+    lines.push(outputPreviewBlock(content, 1200))
+  }
+  if (resolvedNote) {
+    lines.push('')
+    lines.push(resolvedNote)
+  }
+  appendResult(lines, output)
+  return lines.length > 0 ? lines.join('\n') : jsonBlock(input ?? {}, 2000)
+}
+
+function renderEditBody(input: any, output: string | null, resolvedNote?: string): string {
+  const lines: string[] = []
+  const path = toolPath(input)
+  if (path) lines.push(`**路径**: ${inlineCode(path)}`)
+  if (input?.cell_id) lines.push(`**cell**: ${inlineCode(input.cell_id)}`)
+  if (input?.edit_mode) lines.push(`**模式**: ${inlineCode(input.edit_mode)}`)
+  if (input?.replace_all) lines.push('**范围**: 全局替换')
+  if (typeof input?.old_string === 'string') {
+    lines.push('')
+    lines.push('**查找**')
+    lines.push(outputPreviewBlock(input.old_string, 800))
+  }
+  const newText = typeof input?.new_string === 'string'
+    ? input.new_string
+    : typeof input?.new_source === 'string'
+      ? input.new_source
+      : ''
+  if (newText) {
+    lines.push('')
+    lines.push('**替换为**')
+    lines.push(outputPreviewBlock(newText, 800))
+  }
+  if (resolvedNote) {
+    lines.push('')
+    lines.push(resolvedNote)
+  }
+  appendResult(lines, output)
+  return lines.length > 0 ? lines.join('\n') : jsonBlock(input ?? {}, 2000)
+}
+
+function renderMultiEditBody(input: any, output: string | null, resolvedNote?: string): string {
+  const lines: string[] = []
+  const path = toolPath(input)
+  const edits = Array.isArray(input?.edits) ? input.edits : []
+  if (path) lines.push(`**路径**: ${inlineCode(path)}`)
+  lines.push(`**编辑**: ${edits.length} 处`)
+  for (const [idx, edit] of edits.slice(0, 5).entries()) {
+    lines.push('')
+    lines.push(`**#${idx + 1}${edit?.replace_all ? ' · 全局替换' : ''}**`)
+    if (typeof edit?.old_string === 'string') {
+      lines.push('查找:')
+      lines.push(outputPreviewBlock(edit.old_string, 500))
+    }
+    if (typeof edit?.new_string === 'string') {
+      lines.push('替换为:')
+      lines.push(outputPreviewBlock(edit.new_string, 500))
+    }
+  }
+  if (edits.length > 5) {
+    lines.push('')
+    lines.push(`还有 ${edits.length - 5} 处编辑未展开显示。`)
+  }
+  if (resolvedNote) {
+    lines.push('')
+    lines.push(resolvedNote)
+  }
+  appendResult(lines, output)
+  return lines.join('\n')
+}
+
+function renderPathSearchBody(name: string, input: any, output: string | null, resolvedNote?: string): string {
+  const lines: string[] = []
+  if (name === 'Glob') {
+    lines.push('**动作**: 匹配文件')
+    if (input?.pattern) lines.push(`**pattern**: ${inlineCode(input.pattern)}`)
+    if (input?.path) lines.push(`**path**: ${inlineCode(input.path)}`)
+  } else if (name === 'Grep') {
+    lines.push('**动作**: 搜索文件')
+    if (input?.pattern) lines.push(`**pattern**: ${inlineCode(input.pattern)}`)
+    if (input?.path) lines.push(`**path**: ${inlineCode(input.path)}`)
+    if (input?.glob) lines.push(`**glob**: ${inlineCode(input.glob)}`)
+    if (input?.type) lines.push(`**type**: ${inlineCode(input.type)}`)
+    if (input?.output_mode) lines.push(`**output**: ${inlineCode(input.output_mode)}`)
+  } else {
+    lines.push('**动作**: 列目录')
+    if (input?.path) lines.push(`**path**: ${inlineCode(input.path)}`)
+    if (Array.isArray(input?.ignore) && input.ignore.length) {
+      lines.push(`**ignore**: ${input.ignore.map(inlineCode).join(' ')}`)
+    }
+  }
+  if (resolvedNote) {
+    lines.push('')
+    lines.push(resolvedNote)
+  }
+  appendResult(lines, output)
+  return lines.join('\n')
+}
+
+function renderTodoBody(input: any, output: string | null, resolvedNote?: string): string {
+  const todos = Array.isArray(input?.todos) ? input.todos : []
+  const lines: string[] = [`**待办**: ${todos.length} 项`]
+  for (const todo of todos.slice(0, 12)) {
+    const status = todoStatusLabel(todo?.status)
+    const content = String(todo?.content ?? todo?.activeForm ?? '').trim() || '(空)'
+    lines.push(`- ${status}: ${content}`)
+  }
+  if (todos.length > 12) lines.push(`- 还有 ${todos.length - 12} 项未显示`)
+  if (resolvedNote) {
+    lines.push('')
+    lines.push(resolvedNote)
+  }
+  appendResult(lines, output)
+  return lines.join('\n')
+}
+
 function parseJsonObject(text: string | null): any | null {
   if (!text) return null
   try {
@@ -479,6 +740,22 @@ function renderWebSearchBody(input: any, output: string | null, resolvedNote?: s
   return lines.join('\n')
 }
 
+function renderWebFetchBody(input: any, output: string | null, resolvedNote?: string): string {
+  const lines: string[] = ['**动作**: 读取网页']
+  if (input?.url) lines.push(`**URL**: ${inlineCode(input.url)}`)
+  if (input?.prompt) {
+    lines.push('')
+    lines.push('**问题**')
+    lines.push(String(input.prompt).slice(0, 1200))
+  }
+  if (resolvedNote) {
+    lines.push('')
+    lines.push(resolvedNote)
+  }
+  appendResult(lines, output)
+  return lines.join('\n')
+}
+
 function summarizeMcpInput(input: any): string {
   const server = String(input?.server ?? '')
   const tool = String(input?.tool ?? '')
@@ -554,13 +831,18 @@ function renderImageGenerationBody(input: any, output: string | null, resolvedNo
 function summarizeAgentInput(input: any): string {
   const tool = typeof input?.tool === 'string' ? input.tool : ''
   const prompt = typeof input?.prompt === 'string' ? input.prompt : ''
-  return tool && prompt ? `${tool}: ${prompt}` : (prompt || tool)
+  const description = typeof input?.description === 'string' ? input.description : ''
+  const subject = typeof input?.subject === 'string' ? input.subject : ''
+  const title = description || subject || prompt
+  return tool && title ? `${tool}: ${title}` : (title || tool)
 }
 
 function renderAgentBody(input: any, output: string | null, resolvedNote?: string): string {
   const lines: string[] = []
   if (input?.tool) lines.push(`**tool**: ${inlineCode(input.tool)}`)
   if (input?.model) lines.push(`**model**: ${inlineCode(input.model)}`)
+  if (input?.description) lines.push(`**描述**: ${input.description}`)
+  if (input?.subagent_type) lines.push(`**类型**: ${inlineCode(input.subagent_type)}`)
   if (input?.prompt) {
     if (lines.length > 0) lines.push('')
     lines.push('**prompt**')
@@ -612,15 +894,31 @@ export function toolCallElement(
         ? renderFileChangeBody(input, output, resolvedNote)
         : isWebSearchTool(name)
           ? renderWebSearchBody(input, output, resolvedNote)
-          : isMcpTool(name)
-            ? renderMcpBody(input, output, resolvedNote)
-            : isImageGenerationTool(name)
-              ? renderImageGenerationBody(input, output, resolvedNote)
-              : isAgentTool(name)
-                ? renderAgentBody(input, output, resolvedNote)
-                : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
-                  + noteBlock
-                  + (output != null ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```' : '')
+          : isWebFetchTool(name)
+            ? renderWebFetchBody(input, output, resolvedNote)
+            : isMcpTool(name)
+              ? renderMcpBody(input, output, resolvedNote)
+              : isImageGenerationTool(name)
+                ? renderImageGenerationBody(input, output, resolvedNote)
+                : isFileReadTool(name)
+                  ? renderReadBody(input, output, resolvedNote)
+                  : isFileWriteTool(name)
+                    ? renderWriteBody(input, output, resolvedNote)
+                    : isFileEditTool(name)
+                      ? renderEditBody(input, output, resolvedNote)
+                      : isFileMultiEditTool(name)
+                        ? renderMultiEditBody(input, output, resolvedNote)
+                        : isPathSearchTool(name)
+                          ? renderPathSearchBody(name, input, output, resolvedNote)
+                          : isTodoTool(name)
+                            ? renderTodoBody(input, output, resolvedNote)
+                            : isExitPlanModeTool(name)
+                              ? renderAgentBody({ prompt: firstStringField(input) || '提交计划' }, output, resolvedNote)
+                              : isAgentTool(name)
+                                ? renderAgentBody(input, output, resolvedNote)
+                                : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
+                                  + noteBlock
+                                  + (output != null ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```' : '')
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),
@@ -685,13 +983,31 @@ export function toolCallPermissionElement(
       ? renderShellSessionBody(input, null)
       : isFileChangeTool(name)
         ? renderFileChangeBody(input, null)
-        : isMcpTool(name)
-          ? renderMcpBody(input, null)
-          : isImageGenerationTool(name)
-            ? renderImageGenerationBody(input, null)
-            : isAgentTool(name)
-              ? renderAgentBody(input, null)
-              : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
+        : isWebSearchTool(name)
+          ? renderWebSearchBody(input, null)
+          : isWebFetchTool(name)
+            ? renderWebFetchBody(input, null)
+            : isMcpTool(name)
+              ? renderMcpBody(input, null)
+              : isImageGenerationTool(name)
+                ? renderImageGenerationBody(input, null)
+                : isFileReadTool(name)
+                  ? renderReadBody(input, null)
+                  : isFileWriteTool(name)
+                    ? renderWriteBody(input, null)
+                    : isFileEditTool(name)
+                      ? renderEditBody(input, null)
+                      : isFileMultiEditTool(name)
+                        ? renderMultiEditBody(input, null)
+                        : isPathSearchTool(name)
+                          ? renderPathSearchBody(name, input, null)
+                          : isTodoTool(name)
+                            ? renderTodoBody(input, null)
+                            : isExitPlanModeTool(name)
+                              ? renderAgentBody({ prompt: firstStringField(input) || '提交计划' }, null)
+                              : isAgentTool(name)
+                                ? renderAgentBody(input, null)
+                                : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),
@@ -722,4 +1038,3 @@ function permissionButtonColumn(label: string, type: string, requestId: string, 
     }],
   }
 }
-

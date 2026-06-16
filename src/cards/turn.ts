@@ -108,6 +108,23 @@ function compactionDurationLabel(data: Record<string, unknown>): string {
   return ` · 耗时 ${formatGoalTime((completedAt - startedAt) / 1000)}`
 }
 
+function compactTokenLabel(value: unknown): string | null {
+  const n = numberValue(value)
+  return n == null ? null : compactFooterTokens(n)
+}
+
+function compactionDetailLines(data: Record<string, unknown>, done: boolean): string[] {
+  if (!done) return ['压缩中...']
+  const lines: string[] = []
+  const trigger = typeof data.trigger === 'string' && data.trigger.trim() ? data.trigger.trim() : ''
+  const preTokens = compactTokenLabel(data.preTokens)
+  const source = typeof data.sourceType === 'string' && data.sourceType.trim() ? data.sourceType.trim() : ''
+  if (trigger) lines.push(`**触发**: ${trigger}`)
+  if (preTokens) lines.push(`**压缩前**: ${preTokens} tokens`)
+  if (source) lines.push(`**来源**: ${source}`)
+  return lines.length > 0 ? lines : ['压缩完成，无摘要内容']
+}
+
 export function footerContextPercentLabel(tokens: number | null, limit: number | null | undefined): string | null {
   if (tokens == null || !Number.isFinite(tokens)) return null
   const pct = contextPercentSummary(tokens, limit)
@@ -127,7 +144,7 @@ export function contextCompactionElement(i: number, notice: ContextCompactionNot
   const status = done ? '✅' : '⏳'
   const duration = done ? compactionDurationLabel(data) : ''
   const headerText = `${status} 🚨 上下文压缩 #${i + 1}${duration}`
-  const lines = done ? ['暂无有效摘要信息'] : ['压缩中...']
+  const lines = compactionDetailLines(data, done)
   return {
     tag: 'collapsible_panel',
     element_id: elementId,
@@ -240,7 +257,7 @@ interface MainCardOpts {
 export function mainConversationCard(opts: MainCardOpts): object {
   const providerLabel = opts.provider === 'claude' ? 'Claude' : 'Codex'
   const banner = opts.kind === 'card_full'
-    ? [{ tag: 'markdown', content: `📨 接续上一张(同一轮 ${providerLabel} turn,前一张卡写满或写入受限)` }]
+    ? [{ tag: 'markdown', content: `📨 接续上一张（同一轮 ${providerLabel}，前卡写满或写入受限）` }]
     : []
   const inputs = opts.userInputs ?? []
   const userInputHeader = `📥 收到 (${inputs.length}) ${opts.directStart ? '🚀' : `#${opts.turn}`}`
@@ -444,11 +461,11 @@ export function askUserQuestionElement(
       })
     }
   } else if (currentIdx !== undefined && questions[currentIdx]) {
-    headerText = `${status} AskUserQuestion · ${currentIdx + 1}/${total}`
+    headerText = `${status} 等你确认 · ${currentIdx + 1}/${total}`
     bodyElements.push(...(renderAskTimeline(questions, toolUseId, currentIdx, answered, callbackKind) ?? []))
   } else {
     // Defensive fallback — neither answered nor a valid currentIdx.
-    headerText = `${status} 🤔 AskUserQuestion`
+    headerText = `${status} 等你确认`
     if (questions[0]) {
       bodyElements.push({ tag: 'markdown', content: `**${askQuestionTitle(questions[0], 0, total || 1)}**` })
     }

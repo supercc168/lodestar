@@ -133,8 +133,10 @@ function usageFromSdk(raw: any): CodexUsage | null {
   if (!raw || typeof raw !== 'object') return null
   const out: CodexUsage = {}
   const fields: Array<[keyof CodexUsage, string]> = [
+    ['total_tokens', 'total_tokens'],
     ['input_tokens', 'input_tokens'],
     ['output_tokens', 'output_tokens'],
+    ['reasoning_output_tokens', 'reasoning_output_tokens'],
     ['cache_creation_input_tokens', 'cache_creation_input_tokens'],
     ['cache_read_input_tokens', 'cache_read_input_tokens'],
   ]
@@ -142,12 +144,13 @@ function usageFromSdk(raw: any): CodexUsage | null {
     const value = raw[rawKey]
     if (typeof value === 'number' && Number.isFinite(value)) out[key] = value
   }
-  const total = (out.input_tokens ?? 0)
+  const summedTotal = (out.input_tokens ?? 0)
     + (out.output_tokens ?? 0)
     + (out.cache_creation_input_tokens ?? 0)
     + (out.cache_read_input_tokens ?? 0)
-  if (total <= 0) return null
-  out.total_tokens = total
+  const effectiveTotal = out.total_tokens ?? summedTotal
+  if (effectiveTotal <= 0) return null
+  if (out.total_tokens == null) out.total_tokens = summedTotal
   return out
 }
 
@@ -159,13 +162,20 @@ function totalUsageFromModelUsage(modelUsage: any): { usage: CodexUsage | null; 
   for (const value of Object.values(modelUsage)) {
     if (!value || typeof value !== 'object') continue
     const item = value as Record<string, unknown>
-    usage.input_tokens = (usage.input_tokens ?? 0) + numberField(item.inputTokens)
-    usage.output_tokens = (usage.output_tokens ?? 0) + numberField(item.outputTokens)
-    usage.cache_read_input_tokens = (usage.cache_read_input_tokens ?? 0) + numberField(item.cacheReadInputTokens)
-    usage.cache_creation_input_tokens = (usage.cache_creation_input_tokens ?? 0) + numberField(item.cacheCreationInputTokens)
-    const ctx = numberField(item.contextWindow)
+    usage.input_tokens = (usage.input_tokens ?? 0) + numberField(item.inputTokens ?? item.input_tokens)
+    usage.output_tokens = (usage.output_tokens ?? 0) + numberField(item.outputTokens ?? item.output_tokens)
+    usage.reasoning_output_tokens = (usage.reasoning_output_tokens ?? 0) + numberField(
+      item.reasoningOutputTokens ?? item.reasoning_output_tokens,
+    )
+    usage.cache_read_input_tokens = (usage.cache_read_input_tokens ?? 0) + numberField(
+      item.cacheReadInputTokens ?? item.cache_read_input_tokens,
+    )
+    usage.cache_creation_input_tokens = (usage.cache_creation_input_tokens ?? 0) + numberField(
+      item.cacheCreationInputTokens ?? item.cache_creation_input_tokens,
+    )
+    const ctx = numberField(item.contextWindow ?? item.context_window)
     if (ctx > 0) contextWindow = Math.max(contextWindow ?? 0, ctx)
-    const itemCost = numberField(item.costUSD)
+    const itemCost = numberField(item.costUSD ?? item.cost_usd)
     if (itemCost > 0) cost = (cost ?? 0) + itemCost
   }
   const total = (usage.input_tokens ?? 0)
@@ -175,6 +185,26 @@ function totalUsageFromModelUsage(modelUsage: any): { usage: CodexUsage | null; 
   if (total <= 0) return { usage: null, contextWindow, cost }
   usage.total_tokens = total
   return { usage, contextWindow, cost }
+}
+
+function cloneUsage(usage: CodexUsage): CodexUsage {
+  return { ...usage }
+}
+
+function addUsageTotals(total: CodexUsage | null, delta: CodexUsage): CodexUsage {
+  const out: CodexUsage = total ? { ...total } : {}
+  const add = (key: keyof CodexUsage) => {
+    const v = delta[key]
+    if (typeof v !== 'number' || !Number.isFinite(v)) return
+    out[key] = (out[key] ?? 0) + v
+  }
+  add('total_tokens')
+  add('input_tokens')
+  add('output_tokens')
+  add('reasoning_output_tokens')
+  add('cache_creation_input_tokens')
+  add('cache_read_input_tokens')
+  return out
 }
 
 function numberField(value: unknown): number {
@@ -290,6 +320,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   private pendingInjectedContext: string[] = []
   private requestCounter = 0
   private lastTotalCostUsd: number | null = null
+  private cumulativeUsageFromResults: CodexUsage | null = null
   private turnActive = false
 
   sessionId: string | null = null
@@ -691,7 +722,15 @@ export class ClaudeAgentProcess extends EventEmitter {
     const usage = usageFromSdk(raw.usage)
     const total = totalUsageFromModelUsage(raw.modelUsage)
     this.lastUsage = usage
-    this.lastTotalUsage = total.usage ?? usage
+    if (total.usage) {
+      this.cumulativeUsageFromResults = cloneUsage(total.usage)
+      this.lastTotalUsage = cloneUsage(total.usage)
+    } else if (usage) {
+      this.cumulativeUsageFromResults = addUsageTotals(this.cumulativeUsageFromResults, usage)
+      this.lastTotalUsage = cloneUsage(this.cumulativeUsageFromResults)
+    } else {
+      this.lastTotalUsage = this.cumulativeUsageFromResults ? cloneUsage(this.cumulativeUsageFromResults) : null
+    }
     this.lastContextWindow = total.contextWindow
     if (this.lastTotalUsage || this.lastUsage) {
       this.emit('token_usage', {

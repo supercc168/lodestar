@@ -2011,7 +2011,8 @@ export class Session {
         return
       }
       log(`session "${this.sessionName}": context compacted with no current turn`)
-      void feishu.sendTextRaw(this.chatId, '🚨🚨🚨 CONTEXT COMPACTED / 上下文已压缩 🚨🚨🚨\n\nCodex 报告发生了上下文压缩,但当前没有可写的对话卡片。')
+      const backend = this.proc ? this.backendLabel(this.proc.provider) : this.backendLabel()
+      void feishu.sendTextRaw(this.chatId, `🚨🚨🚨 CONTEXT COMPACTED / 上下文已压缩 🚨🚨🚨\n\n${backend} 报告发生了上下文压缩,但当前没有可写的对话卡片。`)
       return
     }
     this.startWorkingFooter(turn)

@@ -30,6 +30,7 @@ export {
   hostAskCard,
 } from './cards/turn'
 export {
+  displayToolName,
   summarizeToolInput,
   toolCallElement,
   readBatchElement,

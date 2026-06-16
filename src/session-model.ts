@@ -126,7 +126,7 @@ function claudeModelChoices(s: Session): cards.ModelChoice[] {
     provider: 'claude',
     model: 'claude:default',
     displayName: 'Claude Code',
-    description: '通过本机 Claude Code SDK 运行；具体模型使用当前 Claude Code/OMC 配置。',
+    description: '使用本机 Claude Code 当前配置，适合沿用默认模型路由。',
     isDefault: false,
     selected: s.currentProvider() === 'claude' && currentModel === 'claude:default',
     efforts: buildEfforts(),
@@ -134,7 +134,7 @@ function claudeModelChoices(s: Session): cards.ModelChoice[] {
     provider: 'claude' as const,
     model: profile.key,
     displayName: profile.displayName,
-    description: `${profile.description} 主线程请求 ${profile.sdkModel} 档。`,
+    description: profile.description,
     isDefault: false,
     selected: s.currentProvider() === 'claude' && currentModel === profile.key,
     efforts: buildEfforts(),
@@ -147,7 +147,7 @@ function claudeEffortDescription(effort: ClaudeReasoningEffort): string {
     case 'medium': return '中等推理强度。'
     case 'high': return '高推理强度。'
     case 'xhigh': return '更高推理强度，适合复杂实现。'
-    case 'max': return '默认最高推理强度；依赖本机 Claude Code 支持。'
+    case 'max': return '最高推理强度，适合长上下文或复杂改动。'
   }
 }
 

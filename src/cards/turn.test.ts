@@ -64,7 +64,7 @@ describe('main conversation card rendering', () => {
       turn: 2,
       kind: 'card_full',
     }) as any
-    expect(codexCard.body.elements[0].content).toContain('同一轮 Codex turn')
+    expect(codexCard.body.elements[0].content).toContain('同一轮 Codex')
 
     const claudeCard = mainConversationCard({
       sessionName: 'probe',
@@ -72,7 +72,7 @@ describe('main conversation card rendering', () => {
       provider: 'claude',
       kind: 'card_full',
     }) as any
-    expect(claudeCard.body.elements[0].content).toContain('同一轮 Claude turn')
+    expect(claudeCard.body.elements[0].content).toContain('同一轮 Claude')
   })
 
   test('status cards render one visible status line without a header', () => {
@@ -299,6 +299,37 @@ describe('main conversation card rendering', () => {
     })
   })
 
+  test('model command groups Codex models and Claude backends when both exist', () => {
+    const card = modelSelectionCard({
+      sessionName: 'probe',
+      panelId: 'panel-mixed',
+      currentModel: 'gpt-5-codex',
+      currentEffort: 'high',
+      models: [
+        {
+          provider: 'codex',
+          model: 'gpt-5-codex',
+          displayName: 'GPT-5 Codex',
+          efforts: [{ effort: 'high' }],
+        },
+        {
+          provider: 'claude',
+          model: 'claude:default',
+          displayName: 'Claude Code',
+          efforts: [{ effort: 'max' }],
+        },
+      ],
+    }) as any
+
+    const elements = card.body.elements[0].elements
+    expect(elements[1].content).toBe('**Codex**')
+    expect(elements[3].content).toBe('**Claude Code 后端**')
+    expect(elements[4].columns[1].elements[0].behaviors[0].value).toMatchObject({
+      provider: 'claude',
+      model: 'claude:default',
+    })
+  })
+
   test('chat-list summary uses a symbol for turn output', () => {
     const settings = streamingOffSettings({
       durationSec: '12.4',
@@ -380,7 +411,21 @@ describe('plan and goal rendering', () => {
 
     expect(el.header.title.content).toContain('✅ 🚨 上下文压缩 #1 · 耗时 1m 48s')
     expect(el.header.title.content).not.toContain('结束压缩')
-    expect(el.elements[0].content).toBe('暂无有效摘要信息')
+    expect(el.elements[0].content).toBe('**来源**: contextCompaction')
+  })
+
+  test('renders completed compaction details when compact boundary fields exist', () => {
+    const el = contextCompactionElement(0, {
+      phase: 'event',
+      sourceType: 'compact_boundary',
+      trigger: 'auto',
+      preTokens: 128_400,
+    }, 'context_compact_0') as any
+
+    const body = el.elements[0].content
+    expect(body).toContain('**触发**: auto')
+    expect(body).toContain('**压缩前**: 128k tokens')
+    expect(body).toContain('**来源**: compact_boundary')
   })
 
   test('renders completed compaction without summary fields explicitly', () => {
@@ -392,7 +437,7 @@ describe('plan and goal rendering', () => {
 
     const body = el.elements[0].content
     expect(el.header.title.content).toContain('✅ 🚨 上下文压缩 #1')
-    expect(body).toBe('暂无有效摘要信息')
+    expect(body).toContain('**来源**: contextCompaction')
     expect(body).not.toContain('MISS')
   })
 
@@ -497,7 +542,7 @@ describe('ask card rendering', () => {
       { header: '期限', question: '什么时候要？', options: [] },
     ], '🤔', state as any, 'host_ask') as any
 
-    expect(el.header.title.content).toBe('🤔 AskUserQuestion · 2/3')
+    expect(el.header.title.content).toBe('🤔 等你确认 · 2/3')
     const body = JSON.stringify(el.elements)
     expect(body).toContain('✅ 1/3 · 先确认背景')
     expect(body).toContain('**回答**：第一个答案')
@@ -764,5 +809,67 @@ describe('other tool card rendering', () => {
     expect(body).toContain('**prompt**')
     expect(body).toContain('Review the card rendering code.')
     expect(body).toContain('"status": "completed"')
+  })
+
+  test('renders Claude Code edit tools without raw JSON panels', () => {
+    const input = {
+      file_path: '/home/leviyuan/feishu/src/session.ts',
+      edits: [
+        { old_string: 'const oldName = true', new_string: 'const newName = true' },
+        { old_string: 'return oldName', new_string: 'return newName' },
+      ],
+    }
+
+    expect(summarizeToolInput('MultiEdit', input)).toBe('批量编辑 /home/leviyuan/feishu/src/session.ts · 2 处')
+
+    const el = toolCallElement(9, 'MultiEdit', input, 'updated', '✅') as any
+    const body = el.elements[0].content
+
+    expect(el.header.title.content).toBe('✅ 🔧 编辑文件: 批量编辑 /home/leviyuan/feishu/src/session.ts · 2 处')
+    expect(body).toContain('**路径**: `/home/leviyuan/feishu/src/session.ts`')
+    expect(body).toContain('**编辑**: 2 处')
+    expect(body).toContain('const oldName = true')
+    expect(body).toContain('const newName = true')
+    expect(body).toContain('**结果**')
+    expect(body).not.toContain('"old_string"')
+  })
+
+  test('renders Claude Code TodoWrite as a compact task list', () => {
+    const input = {
+      todos: [
+        { content: '审查 Claude 卡片', status: 'in_progress' },
+        { content: '补测试', status: 'pending' },
+      ],
+    }
+
+    expect(summarizeToolInput('TodoWrite', input)).toBe('2 项 · 进行中 1 · 待办 1')
+
+    const el = toolCallElement(10, 'TodoWrite', input, null, '⏳') as any
+    const body = el.elements[0].content
+
+    expect(el.header.title.content).toBe('⏳ 🔧 更新待办: 2 项 · 进行中 1 · 待办 1')
+    expect(body).toContain('**待办**: 2 项')
+    expect(body).toContain('- 进行中: 审查 Claude 卡片')
+    expect(body).toContain('- 待办: 补测试')
+    expect(body).not.toContain('"todos"')
+  })
+
+  test('renders Claude Code Task descriptions before prompt details', () => {
+    const input = {
+      description: '审查卡片 UI',
+      subagent_type: 'reviewer',
+      prompt: 'Find issues in card rendering.',
+    }
+
+    expect(summarizeToolInput('Task', input)).toBe('审查卡片 UI')
+
+    const el = toolCallElement(11, 'Task', input, JSON.stringify({ status: 'ok' }), '✅') as any
+    const body = el.elements[0].content
+
+    expect(el.header.title.content).toBe('✅ 🔧 子任务: 审查卡片 UI')
+    expect(body).toContain('**描述**: 审查卡片 UI')
+    expect(body).toContain('**类型**: `reviewer`')
+    expect(body).toContain('Find issues in card rendering.')
+    expect(body).not.toContain('"subagent_type"')
   })
 })

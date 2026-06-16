@@ -69,6 +69,13 @@ export function diffUsageTotals(
 
 export function effectiveTurnTokens(usage: CodexUsage | null | undefined): number | null {
   if (!usage) return null
-  return (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.output_tokens ?? 0)
+  const hasEffectiveBreakdown = typeof usage.input_tokens === 'number'
+    || typeof usage.cache_creation_input_tokens === 'number'
+    || typeof usage.output_tokens === 'number'
+  if (hasEffectiveBreakdown) {
+    return (usage.input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.output_tokens ?? 0)
+  }
+  return typeof usage.total_tokens === 'number' && Number.isFinite(usage.total_tokens)
+    ? usage.total_tokens
+    : null
 }
-

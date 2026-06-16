@@ -435,6 +435,7 @@ function modelCard(sessionName: string, element: object, template = 'turquoise')
 }
 
 export function modelSelectionPanelElement(opts: ModelSelectionCardOpts): object {
+  const modelElements = modelChoiceElements(opts.models, opts.panelId, opts.currentEffort)
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.modelPanel,
@@ -445,11 +446,11 @@ export function modelSelectionPanelElement(opts: ModelSelectionCardOpts): object
         tag: 'markdown',
         content: [
           `当前: ${settingsLine(opts.currentModel, opts.currentEffort)}`,
-          '先选择模型;下一步会选择 reasoning effort。',
+          '先选择模型，下一步选择推理强度。',
         ].join('\n'),
       },
       ...(opts.models.length
-        ? opts.models.map(model => modelChoiceElement(model, opts.panelId, opts.currentEffort))
+        ? modelElements
         : [{ tag: 'markdown', content: '_未返回可用模型列表_' }]),
     ],
   }
@@ -472,7 +473,7 @@ export function modelEffortPanelElement(opts: ModelEffortPanelOpts): object {
         content: [
           `已选: ${modelTitle(opts.selectedModel)}`,
           `当前: ${settingsLine(opts.currentModel, opts.currentEffort)}`,
-          '请选择 reasoning effort,确认后写入本项目。',
+          '请选择推理强度，确认后写入本项目。',
         ].join('\n'),
       },
       ...(efforts.length
@@ -540,6 +541,20 @@ function modelChoiceElement(model: ModelChoice, panelId: string, currentEffort?:
       },
     ],
   }
+}
+
+function modelChoiceElements(models: ModelChoice[], panelId: string, currentEffort?: string | null): object[] {
+  const groups = [
+    { title: 'Codex', models: models.filter(m => (m.provider ?? 'codex') === 'codex') },
+    { title: 'Claude Code 后端', models: models.filter(m => m.provider === 'claude') },
+  ].filter(group => group.models.length > 0)
+  if (groups.length <= 1) return models.map(model => modelChoiceElement(model, panelId, currentEffort))
+  const elements: object[] = []
+  for (const group of groups) {
+    elements.push({ tag: 'markdown', content: `**${group.title}**` })
+    elements.push(...group.models.map(model => modelChoiceElement(model, panelId, currentEffort)))
+  }
+  return elements
 }
 
 function modelSelectActionValue(model: ModelChoice, panelId: string): object {

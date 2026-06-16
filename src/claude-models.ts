@@ -14,14 +14,14 @@ export interface ClaudeModelProfile {
 const DEFAULT_CLAUDE_MODELS: Record<string, Required<Pick<ClaudeModelConfig, 'display_name' | 'description' | 'opus' | 'sonnet' | 'haiku'>>> = {
   glm: {
     display_name: 'Claude Code · GLM',
-    description: '通过 env 将 opus/sonnet/haiku 映射到 GLM: 5.2 / 5.2 / 4.7。',
+    description: '使用 GLM 路由，适合中文交流和通用编码任务。',
     opus: '5.2',
     sonnet: '5.2',
     haiku: '4.7',
   },
   deepseek: {
     display_name: 'Claude Code · DeepSeek',
-    description: '通过 env 将 opus/sonnet/haiku 映射到 DeepSeek: DeepSeekv4pro / v4pro / v4flash。',
+    description: '使用 DeepSeek 路由，适合代码推理和成本敏感任务。',
     opus: 'DeepSeekv4pro',
     sonnet: 'v4pro',
     haiku: 'v4flash',
@@ -46,7 +46,7 @@ function toProfile(name: string): ClaudeModelProfile | null {
     key,
     name,
     displayName: raw.display_name?.trim() || `Claude Code · ${name}`,
-    description: raw.description?.trim() || `通过 env 映射 Claude Code 的 opus/sonnet/haiku 模型档位。`,
+    description: raw.description?.trim() || `使用 ${name} 路由运行 Claude Code 后端。`,
     opus,
     sonnet,
     haiku,
