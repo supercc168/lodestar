@@ -1,6 +1,6 @@
 /**
  * Read config.toml — minimal hand-rolled parser sufficient for the
- * three-section, scalar-value-only schema we expect:
+ * scalar-value-only schema we expect:
  *
  *   [feishu]
  *   app_id = "cli_..."
@@ -38,6 +38,23 @@ export interface LodestarConfig {
   codex: {
     env: Record<string, string>
   }
+  /** Env vars injected into the Claude Code subprocess used by
+   * `@anthropic-ai/claude-agent-sdk`. Empty record = inherit the user's
+   * local Claude Code configuration. */
+  claude: {
+    env: Record<string, string>
+    models: Record<string, ClaudeModelConfig>
+  }
+}
+
+export interface ClaudeModelConfig {
+  display_name?: string
+  description?: string
+  opus?: string
+  sonnet?: string
+  sonet?: string
+  haiku?: string
+  model?: string
 }
 
 function expandTilde(v: string): string {
@@ -100,17 +117,50 @@ function loadConfig(): LodestarConfig {
   if (!Number.isFinite(notifyPort) || notifyPort <= 0 || notifyPort > 65535) {
     throw new Error(`lodestar: [notify].port must be 1..65535, got "${notifyPortRaw}"`)
   }
-  // [codex.env] 节可选 —— 空 record 就维持现状 (用户自己 `codex login`)。
-  const codexEnvSection = t['codex.env'] ?? {}
-  const codexEnv: Record<string, string> = {}
-  for (const [k, v] of Object.entries(codexEnvSection)) {
-    if (typeof v === 'string' && v.length > 0) codexEnv[k] = v
+  const envSection = (name: string): Record<string, string> => {
+    const section = t[name] ?? {}
+    const out: Record<string, string> = {}
+    for (const [k, v] of Object.entries(section)) {
+      if (typeof v === 'string' && v.length > 0) out[k] = v
+    }
+    return out
   }
+  const claudeModelSections = (): Record<string, ClaudeModelConfig> => {
+    const out: Record<string, ClaudeModelConfig> = {}
+    for (const [sectionName, section] of Object.entries(t)) {
+      const prefix = 'claude.models.'
+      if (!sectionName.startsWith(prefix)) continue
+      const key = sectionName.slice(prefix.length).trim()
+      if (!key) continue
+      const profile: ClaudeModelConfig = {}
+      for (const [rawKey, value] of Object.entries(section)) {
+        if (typeof value !== 'string' || value.length === 0) continue
+        const field = rawKey.trim()
+        if (
+          field === 'display_name' ||
+          field === 'description' ||
+          field === 'opus' ||
+          field === 'sonnet' ||
+          field === 'sonet' ||
+          field === 'haiku' ||
+          field === 'model'
+        ) {
+          ;(profile as Record<string, string>)[field] = value
+        }
+      }
+      out[key] = profile
+    }
+    return out
+  }
+  // [codex.env] / [claude.env] 节可选 —— 空 record 就维持各 CLI 自己的登录态。
+  const codexEnv = envSection('codex.env')
+  const claudeEnv = envSection('claude.env')
   return {
     feishu: { app_id: appId, app_secret: appSecret },
     runtime: { projects_root: projectsRoot },
     notify: { bind: notifyBind, port: notifyPort },
     codex: { env: codexEnv },
+    claude: { env: claudeEnv, models: claudeModelSections() },
   }
 }
 

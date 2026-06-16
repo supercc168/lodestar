@@ -20,6 +20,7 @@ import {
   CodexProcess,
   diffUsageTotals,
   effectiveTurnTokens,
+  isCodexReasoningEffort,
   type CanUseToolRequest,
   type CodexReasoningEffort,
   type CodexUsage,
@@ -30,6 +31,16 @@ import {
   type ThreadGoal,
   type TurnPlanUpdated,
 } from './codex-process'
+import {
+  CLAUDE_EFFORT,
+  agentProviderLabel,
+  isClaudeReasoningEffort,
+  type AgentProcess,
+  type AgentProvider,
+  type AgentReasoningEffort,
+  type ClaudeReasoningEffort,
+} from './agent-process'
+import { ClaudeAgentProcess, assertClaudeCodeAvailable } from './claude-agent-process'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
@@ -125,14 +136,14 @@ export class Session {
   static readonly all: Set<Session> = new Set()
 
   // ── package-internal state (touched by session-*.ts helpers) ──
-  proc: CodexProcess | null = null
+  proc: AgentProcess | null = null
   currentTurn: TurnState | null = null
   pendingPermissions = new Map<string, { toolUseId: string }>()
-  /** Open AskUserQuestion tool calls — keyed by tool_use_id. The SDK
-   * routes AskUserQuestion through the can_use_tool flow even under
-   * bypass; we have to thread the permission `requestId` through here
-   * so the answer (option click OR custom text submit) can resolve
-   * the permission with `updatedInput.answers` populated.
+  /** Open AskUserQuestion tool calls — keyed by tool_use_id. Codex and
+   * Claude both route AskUserQuestion through the can_use_tool flow;
+   * we have to thread the permission `requestId` through here so the
+   * answer (option click OR custom text submit) can resolve the
+   * permission with `updatedInput.answers` populated.
    * `deferredAnswer` covers the race where the user clicks/submits
    * BEFORE can_use_tool arrives (addTool fires on the assistant
    * message; can_use_tool is a separate control_request that lands
@@ -261,8 +272,9 @@ export class Session {
   // `restart` can resume an in-flight conversation even if the daemon
   // exits before the turn finishes.
   lastSessionId: string | null = null
+  selectedProvider: AgentProvider = 'codex'
   selectedModel: string | null = null
-  selectedEffort: CodexReasoningEffort | null = null
+  selectedEffort: AgentReasoningEffort | null = null
   modelPanels = new Map<string, sessionModel.ModelPanelState>()
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
@@ -289,18 +301,20 @@ export class Session {
     public opts: SessionOpts = {},
   ) {
     Session.all.add(this)
-    // Restore last-known Codex thread_id from disk so a daemon restart
-    // (systemctl, crash, watchdog) doesn't strand the user with a fresh
-    // conversation when they next type `restart`.
-    this.lastSessionId = feishu.getSessionResume(sessionName)
-    if (this.lastSessionId) {
-      log(`session "${sessionName}": restored lastSessionId=${this.lastSessionId.slice(0, 8)}…`)
-    }
     const selection = feishu.getSessionModelSelection(sessionName)
+    this.selectedProvider = selection?.provider ?? 'codex'
     this.selectedModel = selection?.model ?? null
     this.selectedEffort = selection?.effort ?? null
     if (this.selectedModel) {
-      log(`session "${sessionName}": restored selected model=${this.selectedModel} effort=${this.selectedEffort ?? 'unset'}`)
+      log(`session "${sessionName}": restored selected provider=${this.selectedProvider} model=${this.selectedModel} effort=${this.selectedEffort ?? 'unset'}`)
+    }
+    // Restore last-known thread/session id for the selected backend from
+    // disk so a daemon restart (systemctl, crash, watchdog) doesn't
+    // strand the user with a fresh conversation when they next type
+    // `restart`.
+    this.lastSessionId = feishu.getSessionResume(sessionName, this.selectedProvider)
+    if (this.lastSessionId) {
+      log(`session "${sessionName}": restored ${this.selectedProvider} lastSessionId=${this.lastSessionId.slice(0, 8)}…`)
     }
   }
 
@@ -316,6 +330,7 @@ export class Session {
 
   get workDir(): string { return join(feishu.PROJECTS_ROOT, this.sessionName) }
   isRunning(): boolean { return !!this.proc && this.proc.isAlive() }
+  currentProvider(): AgentProvider { return this.selectedProvider }
 
   hasRunningPeerSession(sessionName: string): boolean {
     return [...Session.all].some(s => s.sessionName === sessionName && s.isRunning())
@@ -326,15 +341,25 @@ export class Session {
   }
 
   effortForSpawn(): CodexReasoningEffort {
-    return this.selectedEffort ?? CODEX_EFFORT
+    return this.selectedProvider === 'codex' && isCodexReasoningEffort(this.selectedEffort)
+      ? this.selectedEffort
+      : CODEX_EFFORT
+  }
+
+  claudeEffortForSpawn(): ClaudeReasoningEffort {
+    return this.selectedProvider === 'claude' && isClaudeReasoningEffort(this.selectedEffort)
+      ? this.selectedEffort
+      : CLAUDE_EFFORT
   }
 
   currentModelLabel(): string | null {
     return this.selectedModel ?? this.proc?.lastModel ?? null
   }
 
-  currentEffortLabel(): CodexReasoningEffort {
-    return this.selectedEffort ?? this.proc?.lastEffort ?? CODEX_EFFORT
+  currentEffortLabel(): AgentReasoningEffort {
+    return this.selectedEffort
+      ?? this.proc?.lastEffort
+      ?? (this.selectedProvider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
   }
 
   private modelEffortLabel(): string {
@@ -357,7 +382,77 @@ export class Session {
   }
 
   private modelLine(): string {
-    return this.modelEffortLabel()
+    const label = this.modelEffortLabel()
+    return this.selectedProvider === 'claude' ? `${agentProviderLabel(this.selectedProvider)} · ${label}` : label
+  }
+
+  backendLabel(provider: AgentProvider = this.selectedProvider): string {
+    return agentProviderLabel(provider)
+  }
+
+  private spawnAgent(resumeSessionId?: string): AgentProcess {
+    if (this.selectedProvider === 'claude') {
+      assertClaudeCodeAvailable()
+      return new ClaudeAgentProcess({
+        workDir: this.workDir,
+        model: this.modelForSpawn(),
+        effort: this.claudeEffortForSpawn(),
+        resumeSessionId,
+        appendSystemPrompt: this.spawnDeveloperInstructions(),
+      })
+    }
+    return new CodexProcess({
+      workDir: this.workDir,
+      model: this.modelForSpawn(),
+      effort: this.effortForSpawn(),
+      resumeSessionId,
+      appendSystemPrompt: this.spawnDeveloperInstructions(),
+    })
+  }
+
+  async applyModelSelection(
+    provider: AgentProvider,
+    model: string,
+    effort: AgentReasoningEffort | null,
+  ): Promise<void> {
+    this.selectedProvider = provider
+    this.selectedModel = model
+    this.selectedEffort = effort
+    this.lastSessionId = feishu.getSessionResume(this.sessionName, provider)
+    feishu.bindSessionModel(this.sessionName, provider, model, effort)
+    await this.stopIdleMismatchedProcess()
+  }
+
+  async stopIdleMismatchedProcess(): Promise<void> {
+    if (!this.proc?.isAlive()) return
+    if (this.proc.provider === this.selectedProvider) return
+    if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return
+    const proc = this.proc
+    log(`session "${this.sessionName}": stop idle ${proc.provider} process after switching to ${this.selectedProvider}`)
+    this.proc = null
+    this.initCount = 0
+    this.currentTurnUsageBaseline = null
+    this.currentTurnUsageBaselineKnown = false
+    this.usageTotalsSeedUnknown = false
+    this.status = 'stopped'
+    this.opts.onLifecycleChange?.()
+    await proc.kill(1000)
+  }
+
+  async stopIdleCurrentProcess(reason: string): Promise<boolean> {
+    if (!this.proc?.isAlive()) return false
+    if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return false
+    const proc = this.proc
+    log(`session "${this.sessionName}": stop idle ${proc.provider} process: ${reason}`)
+    this.proc = null
+    this.initCount = 0
+    this.currentTurnUsageBaseline = null
+    this.currentTurnUsageBaselineKnown = false
+    this.usageTotalsSeedUnknown = false
+    this.status = 'stopped'
+    this.opts.onLifecycleChange?.()
+    await proc.kill(1000)
+    return true
   }
 
   private startFooterTimer(
@@ -474,11 +569,19 @@ export class Session {
     const announce = opts.announce ?? true
     const report = opts.onStatus
     if (this.isRunning()) {
-      report?.(this.withModel('✅ Codex 已运行'))
-      return true
+      if (this.proc?.provider === this.selectedProvider) {
+        report?.(this.withModel(`✅ ${this.backendLabel()} 已运行`))
+        return true
+      }
+      await this.stopIdleMismatchedProcess()
+      if (this.proc?.isAlive()) {
+        report?.(`⚠️ 当前 ${this.backendLabel(this.proc.provider)} turn 尚未结束，模型切换将在后续新 turn 生效`)
+        return true
+      }
     }
-    report?.('🔎 检查 Codex 登录')
-    if (!feishu.isOpenAIChatGPTAuthenticated()) {
+    if (this.selectedProvider === 'codex') report?.('🔎 检查 Codex 登录')
+    else report?.('🔎 检查 Claude Code')
+    if (this.selectedProvider === 'codex' && !feishu.isOpenAIChatGPTAuthenticated()) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
       report?.('❌ Codex 未登录 ChatGPT 账号')
@@ -502,17 +605,12 @@ export class Session {
 
     if (!opts.freshConversationStateAlreadyReset) this.resetFreshConversationState()
     this.status = 'starting'
-    report?.(this.withModel('🚀 启动 Codex'))
-    let proc: CodexProcess
+    report?.(this.withModel(`🚀 启动 ${this.backendLabel()}`))
+    let proc: AgentProcess
     try {
-      proc = new CodexProcess({
-        workDir: this.workDir,
-        model: this.modelForSpawn(),
-        effort: this.effortForSpawn(),
-        appendSystemPrompt: this.spawnDeveloperInstructions(),
-      })
+      proc = this.spawnAgent()
     } catch (e) {
-      const message = `Codex 启动失败: ${messageOf(e)}`
+      const message = `${this.backendLabel()} 启动失败: ${messageOf(e)}`
       log(`session "${this.sessionName}": ${message}`)
       report?.(`❌ ${message}`)
       if (announce) await feishu.sendText(this.chatId, `❌ ${message}`)
@@ -524,7 +622,7 @@ export class Session {
     this.proc = proc
     this.wireProc(this.proc)
     this.proc.sendInitialize()
-    report?.('⏳ 等待 Codex init')
+    report?.(`⏳ 等待 ${this.backendLabel()} init`)
     // 等 `system/init` 落地再认定 ready —— sendInitialize 只把 RPC
     // 写进 app-server 之前 proc.sessionId 还是 null,这时候
     // showConsole() 看到 null 会 fallback 到磁盘上**上一次**会话的
@@ -532,20 +630,22 @@ export class Session {
     // model / usage / contextWindow 也都没值。等 init 之后再返回,
     // 后续 `hi`、首条 user message 都能拿到真值。5s 兜底,init 真
     // 没来也不死循环。
-    const init = await this.waitForProcInit(this.proc, 5000)
-    if (init.state === 'error' || init.state === 'exit') {
-      log(`session "${this.sessionName}": codex init failed: ${init.error ?? init.state}`)
-      report?.(`❌ Codex 启动失败: ${init.error ?? init.state}`)
-      if (announce) await feishu.sendText(this.chatId, `❌ Codex 启动失败: ${init.error ?? init.state}`)
-      await this.proc?.kill(1000).catch(() => {})
-      this.proc = null
-      this.status = 'stopped'
-      this.opts.onLifecycleChange?.()
-      return false
-    }
-    if (init.state === 'timeout') {
-      log(`session "${this.sessionName}": init wait timeout (5s) — proceeding`)
-      report?.(this.withModel(this.withWorktreeInstructionNotice('⏳ Codex 已启动，init 确认超时')))
+    if (this.selectedProvider === 'codex') {
+      const init = await this.waitForProcInit(this.proc, 5000)
+      if (init.state === 'error' || init.state === 'exit') {
+        log(`session "${this.sessionName}": codex init failed: ${init.error ?? init.state}`)
+        report?.(`❌ Codex 启动失败: ${init.error ?? init.state}`)
+        if (announce) await feishu.sendText(this.chatId, `❌ Codex 启动失败: ${init.error ?? init.state}`)
+        await this.proc?.kill(1000).catch(() => {})
+        this.proc = null
+        this.status = 'stopped'
+        this.opts.onLifecycleChange?.()
+        return false
+      }
+      if (init.state === 'timeout') {
+        log(`session "${this.sessionName}": init wait timeout (5s) — proceeding`)
+        report?.(this.withModel(this.withWorktreeInstructionNotice('⏳ Codex 已启动，init 确认超时')))
+      }
     }
 
     if (announce) {
@@ -558,12 +658,12 @@ export class Session {
     this.status = 'idle'
     this.startedAt = Date.now()
     this.opts.onLifecycleChange?.()
-    report?.(this.withModel(this.withWorktreeInstructionNotice('✅ Codex 已就绪')))
+    report?.(this.withModel(this.withWorktreeInstructionNotice(`✅ ${this.backendLabel()} 已就绪`)))
     return true
   }
 
   private async waitForProcInit(
-    proc: CodexProcess,
+    proc: AgentProcess,
     timeoutMs: number,
   ): Promise<{ state: 'init' | 'error' | 'exit' | 'timeout'; error?: unknown }> {
     return await new Promise(resolve => {
@@ -588,7 +688,7 @@ export class Session {
   }
 
   private async waitForProcResumeInit(
-    proc: CodexProcess,
+    proc: AgentProcess,
     onStillWaiting: () => void,
   ): Promise<{ state: 'init' | 'error' | 'exit' | 'timeout'; error?: unknown }> {
     return await new Promise(resolve => {
@@ -663,7 +763,7 @@ export class Session {
       if (announce && !stoppedAgy) await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
       return
     }
-    report?.('🛑 停止 Codex')
+    report?.(`🛑 停止 ${this.backendLabel(this.proc.provider)}`)
     // Flip lifecycle state SYNCHRONOUSLY before awaiting kill — daemon's
     // SIGTERM cleanup snapshots `isRunning()` and if we're still mid-
     // `proc.kill()` await it'll see proc!=null and write us into the
@@ -704,7 +804,7 @@ export class Session {
     let statusCard: StatusCardHandle | null = null
     if (!report && announce && resume && prevSessionId) {
       const initialStatus = this.proc
-        ? this.withModel('🔁 重启 Codex')
+        ? this.withModel(`🔁 重启 ${this.backendLabel(this.proc.provider)}`)
         : this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}…`)
       statusCard = await this.openStatusCard('restart', initialStatus)
       if (statusCard) report = status => this.setStatusCard(statusCard, status)
@@ -714,7 +814,7 @@ export class Session {
       if (statusCard) await this.closeStatusCard(statusCard, finalStatus)
     }
     if (this.proc) {
-      report?.('🛑 停止当前 Codex')
+      report?.(`🛑 停止当前 ${this.backendLabel(this.proc.provider)}`)
       await this.proc.kill()
       this.proc = null
     }
@@ -736,18 +836,12 @@ export class Session {
       this.status = 'starting'
       this.usageTotalsSeedUnknown = true
       report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}…`))
-      let proc: CodexProcess
+      let proc: AgentProcess
       try {
-        proc = new CodexProcess({
-          workDir: this.workDir,
-          model: this.modelForSpawn(),
-          effort: this.effortForSpawn(),
-          resumeSessionId: prevSessionId,
-          appendSystemPrompt: this.spawnDeveloperInstructions(),
-        })
+        proc = this.spawnAgent(prevSessionId)
       } catch (e) {
-        const finalStatus = `❌ Codex 恢复失败: ${messageOf(e)}`
-        log(`session "${this.sessionName}": codex resume failed before spawn: ${messageOf(e)}`)
+        const finalStatus = `❌ ${this.backendLabel()} 恢复失败: ${messageOf(e)}`
+        log(`session "${this.sessionName}": ${this.selectedProvider} resume failed before spawn: ${messageOf(e)}`)
         report?.(finalStatus)
         if (announceText) await feishu.sendText(this.chatId, finalStatus)
         this.proc = null
@@ -759,24 +853,28 @@ export class Session {
       this.proc = proc
       this.wireProc(this.proc)
       this.proc.sendInitialize()
-      report?.('⏳ 等待 Codex init 确认')
-      const init = await this.waitForProcResumeInit(this.proc, () => {
-        log(`session "${this.sessionName}": resume init still pending after ${RESUME_INIT_NOTICE_MS / 1000}s`)
-        report?.(this.withModel(`⏳ 仍在等待 Codex init 确认 thread=${prevThreadLabel}…`))
-      })
-      if (init.state === 'error' || init.state === 'exit' || init.state === 'timeout') {
-        log(`session "${this.sessionName}": codex resume failed: ${init.error ?? init.state}`)
-        const finalStatus = init.state === 'timeout'
-          ? '❌ Codex 恢复超时'
-          : `❌ Codex 恢复失败: ${init.error ?? init.state}`
-        report?.(finalStatus)
-        if (announceText) await feishu.sendText(this.chatId, finalStatus)
-        await this.proc?.kill(1000).catch(() => {})
-        this.proc = null
-        this.status = 'stopped'
-        this.opts.onLifecycleChange?.()
-        await closeInternalStatusCard(finalStatus)
-        return false
+      if (this.selectedProvider === 'codex') {
+        report?.('⏳ 等待 Codex init 确认')
+        const init = await this.waitForProcResumeInit(this.proc, () => {
+          log(`session "${this.sessionName}": resume init still pending after ${RESUME_INIT_NOTICE_MS / 1000}s`)
+          report?.(this.withModel(`⏳ 仍在等待 Codex init 确认 thread=${prevThreadLabel}…`))
+        })
+        if (init.state === 'error' || init.state === 'exit' || init.state === 'timeout') {
+          log(`session "${this.sessionName}": codex resume failed: ${init.error ?? init.state}`)
+          const finalStatus = init.state === 'timeout'
+            ? '❌ Codex 恢复超时'
+            : `❌ Codex 恢复失败: ${init.error ?? init.state}`
+          report?.(finalStatus)
+          if (announceText) await feishu.sendText(this.chatId, finalStatus)
+          await this.proc?.kill(1000).catch(() => {})
+          this.proc = null
+          this.status = 'stopped'
+          this.opts.onLifecycleChange?.()
+          await closeInternalStatusCard(finalStatus)
+          return false
+        }
+      } else {
+        report?.(this.withModel(`⏳ ${this.backendLabel()} 将在首条消息时确认恢复 thread=${prevThreadLabel}…`))
       }
       const msg = this.withModel(this.withWorktreeInstructionNotice(`✅ 已恢复上一会话 thread=${prevThreadLabel}…`))
       report?.(msg)
@@ -861,8 +959,8 @@ export class Session {
     return sessionModel.onModelSelect(this, modelRaw, panelIdRaw, userOpenId, actionValue)
   }
 
-  onModelEffortSelect(modelRaw: string, effortRaw: string, panelIdRaw = '', userOpenId = ''): Promise<ModelActionResult> {
-    return sessionModel.onModelEffortSelect(this, modelRaw, effortRaw, panelIdRaw, userOpenId)
+  onModelEffortSelect(modelRaw: string, effortRaw: string, panelIdRaw = '', userOpenId = '', providerRaw = ''): Promise<ModelActionResult> {
+    return sessionModel.onModelEffortSelect(this, modelRaw, effortRaw, panelIdRaw, userOpenId, providerRaw)
   }
 
   onWorktreeDisband(slugRaw: string): Promise<WorktreeActionResult> {
@@ -885,6 +983,7 @@ export class Session {
     return {
       sessionName: this.sessionName,
       status: this.status,
+      provider: this.selectedProvider,
       model: this.currentModelLabel() ?? undefined,
       effort: this.currentEffortLabel(),
       worktreeInstructionNotice: this.worktreeInstructionLoadedNotice(),
@@ -1001,10 +1100,10 @@ export class Session {
       if (!turn) return
       const bootTimer = this.startFooterTimer(
         turn.cardId,
-        '🚀 启动 Codex',
+        `🚀 启动 ${this.backendLabel()}`,
         status => this.withModel(status),
       )
-      let lastBootStatus = '🚀 启动 Codex'
+      let lastBootStatus = `🚀 启动 ${this.backendLabel()}`
       const ok = await this.start({
         announce: false,
         freshConversationStateAlreadyReset: true,
@@ -1061,6 +1160,16 @@ export class Session {
     if (this.startingAgy || this.runningAgy) {
       await feishu.sendText(this.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再继续。')
       return
+    }
+    if (
+      this.proc?.isAlive() &&
+      this.proc.provider !== this.selectedProvider &&
+      !this.currentTurn &&
+      !this.openingTurn &&
+      this.pendingUserMessageCount === 0 &&
+      this.pendingMidTurnMsgs.length === 0
+    ) {
+      await this.stopIdleMismatchedProcess()
     }
     // Capture busy-state SYNC, before any state mutation — this decides
     // whether the message will visibly queue (gets the OneSecond → later
@@ -1227,8 +1336,9 @@ export class Session {
   }
 
   async startHostAskContinuation(wireText: string): Promise<void> {
-    if (!this.isRunning()) throw new Error('codex is not running')
-    if (this.currentTurn || this.openingTurn) throw new Error('codex turn still active')
+    if (!this.isRunning()) throw new Error(`${this.backendLabel()} is not running`)
+    if (this.proc?.provider !== 'codex') throw new Error('askusr host continuation is only supported by Codex')
+    if (this.currentTurn || this.openingTurn) throw new Error(`${this.backendLabel()} turn still active`)
     this.openingTurn = true
     try {
       await this.openTurnCard('', 'user_message')
@@ -1243,15 +1353,18 @@ export class Session {
 
   // ── Wiring Codex → Feishu ──────────────────────────────────────────
   private persistResumableSessionId(): void {
-    const sessionId = this.proc?.sessionId
-    if (!sessionId || sessionId === this.lastSessionId) return
+    const proc = this.proc
+    const sessionId = proc?.sessionId
+    if (!proc || !sessionId) return
+    feishu.bindSessionResume(this.sessionName, sessionId, proc.provider)
+    if (proc.provider !== this.selectedProvider) return
+    if (sessionId === this.lastSessionId) return
     this.lastSessionId = sessionId
-    feishu.bindSessionResume(this.sessionName, sessionId)
   }
 
-  private wireProc(p: CodexProcess): void {
+  private wireProc(p: AgentProcess): void {
     p.on('error', err => {
-      log(`session "${this.sessionName}": codex process error: ${err}`)
+      log(`session "${this.sessionName}": ${p.provider} process error: ${err}`)
     })
     p.on('init', () => {
       this.initCount++
@@ -1381,10 +1494,11 @@ export class Session {
       let suffix: string | undefined
       let forcePush = false
 
+      const backend = this.proc ? this.backendLabel(this.proc.provider) : this.backendLabel()
       if (hasMidTurn && !hostAskFlowActive) {
-        suffix = isError ? `⚠️ Codex ${subtype},用户已介入` : '📨 转交新卡'
+        suffix = isError ? `⚠️ ${backend} ${subtype},用户已介入` : '📨 转交新卡'
       } else if (isError) {
-        suffix = `⚠️ Codex ${subtype}`
+        suffix = `⚠️ ${backend} ${subtype}`
         forcePush = true
       }
 
@@ -1398,7 +1512,11 @@ export class Session {
       }
     })
     p.on('exit', ({ code, signal, expected }: any) => {
-      log(`session "${this.sessionName}": codex exited code=${code} signal=${signal} expected=${expected}`)
+      log(`session "${this.sessionName}": ${p.provider} exited code=${code} signal=${signal} expected=${expected}`)
+      if (this.proc !== p) {
+        log(`session "${this.sessionName}": ignore stale ${p.provider} exit; current=${this.proc?.provider ?? 'none'}`)
+        return
+      }
       this.proc = null
       this.stopFooterStatus(this.currentTurn)
       this.currentTurn = null
@@ -1423,7 +1541,7 @@ export class Session {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
       if (!expected && code !== 0 && signal !== 'SIGTERM') {
-        void feishu.sendText(this.chatId, `⚠️ Codex 异常退出 (code=${code}, signal=${signal})。回复任意消息将重新启动。`)
+        void feishu.sendText(this.chatId, `⚠️ ${this.backendLabel(p.provider)} 异常退出 (code=${code}, signal=${signal})。回复任意消息将重新启动。`)
       }
     })
   }
@@ -1542,6 +1660,7 @@ export class Session {
     const card = cards.mainConversationCard({
       sessionName: this.sessionName,
       turn,
+      provider: this.proc?.provider ?? this.selectedProvider,
       model: this.currentModelLabel() ?? undefined,
       effort: this.currentEffortLabel(),
       kind: trigger,
@@ -1688,6 +1807,7 @@ export class Session {
         const card = cards.mainConversationCard({
           sessionName: this.sessionName,
           turn: this.turnCounter,
+          provider: this.proc?.provider ?? this.selectedProvider,
           model: this.currentModelLabel() ?? undefined,
           effort: this.currentEffortLabel(),
           kind: 'card_full',
@@ -2049,6 +2169,7 @@ export class Session {
   }
 
   private processHostAskMarkers(text: string, turn: TurnState): void {
+    if (this.proc?.provider !== 'codex') return
     for (const marker of extractAskUsrMarkers(text)) {
       if (turn.hostAskMarkersSeen.has(marker.raw)) continue
       turn.hostAskMarkersSeen.add(marker.raw)
@@ -2057,7 +2178,10 @@ export class Session {
   }
 
   private cleanAssistantTextForDisplay(text: string): string {
-    return stripAskUsrMarkers(text, '\n\n_已发起澄清问题，请回答对应卡片。_')
+    const replacement = this.proc?.provider === 'codex'
+      ? '\n\n_已发起澄清问题，请回答对应卡片。_'
+      : ''
+    return stripAskUsrMarkers(text, replacement)
   }
 
   sendOutboundPath(rawPath: string, source: string): void {

@@ -342,8 +342,9 @@ export async function runSetup(): Promise<void> {
     `projects_root = "${escapeTomlString(projectsRoot)}"`,
     '',
   ]
-  // Codex 登录态由 `codex login` 管理。config.toml 只保存 Feishu 和
-  // Lodestar runtime 配置；高级用户可手写 [codex.env] 注入子进程环境。
+  // Codex / Claude 登录态由各自 CLI 管理。config.toml 只保存 Feishu 和
+  // Lodestar runtime 配置；高级用户可手写 [codex.env] / [claude.env]
+  // 注入子进程环境。
   writeFileSync(CONFIG_FILE, toml.join('\n'), { mode: 0o600 })
 
   console.log(`\n${C.green}${C.bold}✓ 配置已写入${C.reset}`)

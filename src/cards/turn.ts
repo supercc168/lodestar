@@ -7,6 +7,7 @@
  */
 
 import type { CodexUsage } from '../codex-process'
+import type { AgentProvider } from '../agent-process'
 import { contextPercentSummary } from '../context-window'
 import { ELEMENTS } from './elements'
 
@@ -211,6 +212,7 @@ export function goalElement(goal: ThreadGoal, elementId: string): object {
 interface MainCardOpts {
   sessionName: string
   turn: number
+  provider?: AgentProvider
   model?: string
   effort?: string
   /** What started this turn:
@@ -236,8 +238,9 @@ interface MainCardOpts {
  * on so the daemon can add/replace elements during the turn; assistant text
  * and footer status themselves are rendered via static element updates. */
 export function mainConversationCard(opts: MainCardOpts): object {
+  const providerLabel = opts.provider === 'claude' ? 'Claude' : 'Codex'
   const banner = opts.kind === 'card_full'
-    ? [{ tag: 'markdown', content: '📨 接续上一张(同一轮 Codex turn,前一张卡写满或写入受限)' }]
+    ? [{ tag: 'markdown', content: `📨 接续上一张(同一轮 ${providerLabel} turn,前一张卡写满或写入受限)` }]
     : []
   const inputs = opts.userInputs ?? []
   const userInputHeader = `📥 收到 (${inputs.length}) ${opts.directStart ? '🚀' : `#${opts.turn}`}`

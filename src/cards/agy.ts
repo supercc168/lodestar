@@ -130,7 +130,7 @@ export function agyForwardPlaceholderElement(): object {
   }
 }
 
-export function agyForwardElement(resultId: string): object {
+export function agyForwardElement(resultId: string, label = 'Codex'): object {
   return {
     tag: 'column_set',
     element_id: ELEMENTS.agyForward,
@@ -140,7 +140,7 @@ export function agyForwardElement(resultId: string): object {
       weight: 1,
       elements: [{
         tag: 'button',
-        text: { tag: 'plain_text', content: '转 Codex' },
+        text: { tag: 'plain_text', content: `转 ${label}` },
         type: 'primary',
         behaviors: [{ type: 'callback', value: { kind: 'agy_forward_codex', result_id: resultId } }],
       }],

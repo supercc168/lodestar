@@ -6,13 +6,23 @@ import {
   CodexProcess,
   isCodexReasoningEffort,
   type CodexModel,
-  type CodexReasoningEffort,
 } from './codex-process'
+import {
+  CLAUDE_EFFORT,
+  CLAUDE_REASONING_EFFORTS,
+  agentProviderLabel,
+  isClaudeReasoningEffort,
+  providerFromModel,
+  type AgentProvider,
+  type AgentReasoningEffort,
+  type ClaudeReasoningEffort,
+} from './agent-process'
 import { CHANNEL_INSTRUCTIONS } from './instructions'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
 import { messageOf, withTimeout, type ModelActionResult } from './session-util'
+import { claudeModelProfiles } from './claude-models'
 
 export interface ModelPanelState {
   models: cards.ModelChoice[]
@@ -24,9 +34,9 @@ function modelListCwd(s: Session): string {
   return process.cwd()
 }
 
-async function listAvailableModels(s: Session): Promise<CodexModel[]> {
+async function listAvailableCodexModels(s: Session): Promise<CodexModel[]> {
   if (s.proc?.isAlive()) {
-    return await withTimeout(s.proc.listModels(), 20_000, 'model/list')
+    if (s.proc.provider === 'codex') return await withTimeout(s.proc.listModels(), 20_000, 'model/list')
   }
   if (!feishu.isOpenAIChatGPTAuthenticated()) {
     throw new Error('Codex 未登录 ChatGPT 账号。请在服务器上运行 `codex login` 后再试。')
@@ -44,20 +54,25 @@ async function listAvailableModels(s: Session): Promise<CodexModel[]> {
 }
 
 export async function showModelPanel(s: Session): Promise<void> {
-  let models: CodexModel[]
+  let codexModels: CodexModel[] = []
+  let codexError: string | null = null
   try {
-    models = await listAvailableModels(s)
+    codexModels = await listAvailableCodexModels(s)
   } catch (e) {
-    const message = `❌ 模型列表失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": model list failed: ${messageOf(e)}`)
-    await feishu.sendText(s.chatId, message)
-    return
+    codexError = messageOf(e)
+    log(`session "${s.sessionName}": codex model list failed: ${codexError}`)
   }
 
   const panelId = randomUUID()
   const currentModel = s.currentModelLabel()
   const currentEffort = s.currentEffortLabel()
-  const choices = modelChoices(s, models)
+  const choices = [
+    ...codexModelChoices(s, codexModels),
+    ...claudeModelChoices(s),
+  ]
+  if (codexError) {
+    await feishu.sendText(s.chatId, `⚠️ Codex 模型列表失败: ${codexError}\n仍可选择 Claude Code 后端。`)
+  }
   s.modelPanels.set(panelId, { models: choices })
   const messageId = await feishu.sendCard(s.chatId, cards.modelSelectionCard({
     sessionName: s.sessionName,
@@ -72,7 +87,7 @@ export async function showModelPanel(s: Session): Promise<void> {
   }
 }
 
-function modelChoices(s: Session, models: CodexModel[]): cards.ModelChoice[] {
+function codexModelChoices(s: Session, models: CodexModel[]): cards.ModelChoice[] {
   const seen = new Set<string>()
   const currentModel = s.currentModelLabel()
   const currentEffort = s.currentEffortLabel()
@@ -81,6 +96,7 @@ function modelChoices(s: Session, models: CodexModel[]): cards.ModelChoice[] {
     if (seen.has(m.model)) continue
     seen.add(m.model)
     choices.push({
+      provider: 'codex',
       model: m.model,
       displayName: m.displayName,
       description: m.description,
@@ -97,10 +113,54 @@ function modelChoices(s: Session, models: CodexModel[]): cards.ModelChoice[] {
   return choices
 }
 
+function claudeModelChoices(s: Session): cards.ModelChoice[] {
+  const currentModel = s.currentModelLabel()
+  const currentEffort = s.currentEffortLabel()
+  const buildEfforts = () => CLAUDE_REASONING_EFFORTS.map(effort => ({
+    effort,
+    description: claudeEffortDescription(effort),
+    isDefault: effort === CLAUDE_EFFORT,
+    selected: s.currentProvider() === 'claude' && currentEffort === effort,
+  }))
+  return [{
+    provider: 'claude',
+    model: 'claude:default',
+    displayName: 'Claude Code',
+    description: '通过本机 Claude Code SDK 运行；具体模型使用当前 Claude Code/OMC 配置。',
+    isDefault: false,
+    selected: s.currentProvider() === 'claude' && currentModel === 'claude:default',
+    efforts: buildEfforts(),
+  }, ...claudeModelProfiles().map(profile => ({
+    provider: 'claude' as const,
+    model: profile.key,
+    displayName: profile.displayName,
+    description: `${profile.description} 主线程请求 ${profile.sdkModel} 档。`,
+    isDefault: false,
+    selected: s.currentProvider() === 'claude' && currentModel === profile.key,
+    efforts: buildEfforts(),
+  }))]
+}
+
+function claudeEffortDescription(effort: ClaudeReasoningEffort): string {
+  switch (effort) {
+    case 'low': return '低推理强度，响应更快。'
+    case 'medium': return '中等推理强度。'
+    case 'high': return '默认推理强度。'
+    case 'xhigh': return '更高推理强度，适合复杂实现。'
+    case 'max': return '最高推理强度；依赖本机 Claude Code 支持。'
+  }
+}
+
 function initialEffortForModel(s: Session, model: cards.ModelChoice): string | null {
   const currentEffort = s.currentEffortLabel()
   if (model.selected && model.efforts.some(effort => effort.effort === currentEffort)) return currentEffort
   return model.efforts.find(effort => effort.isDefault)?.effort ?? model.efforts[0]?.effort ?? null
+}
+
+function actionProvider(model: string, raw: any): AgentProvider {
+  return raw?.provider === 'claude' || raw?.provider === 'codex'
+    ? raw.provider
+    : providerFromModel(model)
 }
 
 function modelChoiceFromAction(s: Session, model: string, raw: any): cards.ModelChoice | null {
@@ -113,22 +173,22 @@ function modelChoiceFromAction(s: Session, model: string, raw: any): cards.Model
     }))
     .filter((item: cards.ModelEffortChoice) => item.effort)
   if (efforts.length === 0) return null
+  const provider = actionProvider(model, raw)
   return {
+    provider,
     model,
     displayName: typeof raw?.display_name === 'string' && raw.display_name ? raw.display_name : model,
     description: '',
     isDefault: raw?.is_default === true,
-    selected: s.currentModelLabel() === model,
+    selected: s.currentProvider() === provider && s.currentModelLabel() === model,
     efforts,
   }
 }
 
-function modelSelectionScope(s: Session): string {
-  return s.currentTurn
-    ? '当前 turn 不变,下一轮开始使用。'
-    : s.proc?.isAlive()
-      ? '下一轮开始使用。'
-      : '下次启动 Codex 时使用。'
+function modelSelectionScope(s: Session, provider: AgentProvider): string {
+  if (s.currentTurn) return '当前 turn 不变,后续新 turn 使用。'
+  if (s.proc?.isAlive() && s.proc.provider === provider) return '下一轮开始使用。'
+  return `下次启动 ${agentProviderLabel(provider)} 时使用。`
 }
 
 export async function onModelSelect(
@@ -146,7 +206,9 @@ export async function onModelSelect(
   }
   const panelId = panelIdRaw.trim()
   const panel = s.modelPanels.get(panelId)
-  const choice = panel?.models.find(m => m.model === model) ?? modelChoiceFromAction(s, model, actionValue)
+  const provider = actionProvider(model, actionValue)
+  const choice = panel?.models.find(m => m.model === model && (m.provider ?? 'codex') === provider)
+    ?? modelChoiceFromAction(s, model, actionValue)
   if (!choice) {
     return { ok: false, message: '模型不在当前面板列表中,请重新发送 model' }
   }
@@ -171,32 +233,72 @@ export async function onModelEffortSelect(
   effortRaw: string,
   panelIdRaw = '',
   _userOpenId = '',
+  providerRaw = '',
 ): Promise<ModelActionResult> {
   const model = modelRaw.trim()
   const effortValue = effortRaw.trim()
   if (!model) return { ok: false, message: '模型为空' }
-  if (!isCodexReasoningEffort(effortValue)) return { ok: false, message: 'reasoning effort 无效' }
-  const effort: CodexReasoningEffort = effortValue
   const panelId = panelIdRaw.trim()
   const panel = s.modelPanels.get(panelId)
-  const choice = panel?.models.find(m => m.model === model)
+  const provider: AgentProvider = providerRaw === 'claude' || providerRaw === 'codex'
+    ? providerRaw
+    : panel?.models.find(m => m.model === model)?.provider ?? providerFromModel(model)
+  if (provider === 'claude') {
+    if (!isClaudeReasoningEffort(effortValue)) return { ok: false, message: 'Claude reasoning effort 无效' }
+  } else if (!isCodexReasoningEffort(effortValue)) {
+    return { ok: false, message: 'Codex reasoning effort 无效' }
+  }
+  const effort = effortValue as AgentReasoningEffort
+  const choice = panel?.models.find(m => m.model === model && (m.provider ?? 'codex') === provider)
   if (choice && !choice.efforts.some(item => item.effort === effort)) {
     return { ok: false, message: 'reasoning effort 不属于该模型' }
   }
-  try {
-    if (s.proc?.isAlive()) {
-      await withTimeout(s.proc.setModelSettings(model, effort), 20_000, 'thread/settings/update')
+  if (
+    s.proc?.isAlive() &&
+    s.proc.provider !== provider &&
+    (s.currentTurn || s.openingTurn || s.pendingUserMessageCount > 0 || s.pendingMidTurnMsgs.length > 0)
+  ) {
+    return {
+      ok: false,
+      message: `当前 ${s.backendLabel(s.proc.provider)} turn 正在执行或排队；请等结束或 stop 后再切换到 ${agentProviderLabel(provider)}`,
     }
-    s.selectedModel = model
-    s.selectedEffort = effort
-    feishu.bindSessionModel(s.sessionName, model, effort)
-    const scope = modelSelectionScope(s)
+  }
+  const modelChanged = s.currentModelLabel() !== model
+  const procBusy = !!(s.currentTurn || s.openingTurn || s.pendingUserMessageCount > 0 || s.pendingMidTurnMsgs.length > 0)
+  if (
+    provider === 'claude' &&
+    s.proc?.isAlive() &&
+    s.proc.provider === 'claude' &&
+    modelChanged &&
+    procBusy
+  ) {
+    return {
+      ok: false,
+      message: '当前 Claude turn 正在执行或排队；Claude 模型 profile 通过 env 生效，请等结束或 stop 后再切换',
+    }
+  }
+  const shouldRespawnIdleClaude = provider === 'claude' &&
+    s.proc?.isAlive() &&
+    s.proc.provider === 'claude' &&
+    modelChanged
+  try {
+    if (s.proc?.isAlive() && s.proc.provider === provider) {
+      if (!shouldRespawnIdleClaude) {
+        await withTimeout(s.proc.setModelSettings(model, effort), 20_000, 'thread/settings/update')
+      }
+    }
+    await s.applyModelSelection(provider, model, effort)
+    if (shouldRespawnIdleClaude) {
+      await s.stopIdleCurrentProcess('Claude model profile changed; env will apply on next spawn')
+    }
+    const scope = modelSelectionScope(s, provider)
     s.modelPanels.delete(panelId)
     return {
       ok: true,
-      message: `已选择 ${model} / ${effort}`,
+      message: `已选择 ${agentProviderLabel(provider)} · ${model} / ${effort}`,
       card: cards.modelResultCard({
         sessionName: s.sessionName,
+        provider,
         model,
         effort,
         scope,

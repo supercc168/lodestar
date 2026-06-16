@@ -392,7 +392,13 @@ async function handleCardAction(data: any): Promise<any> {
         : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
     }
     case 'model_effort_select': {
-      const result = await session.onModelEffortSelect(String(value.model ?? ''), String(value.effort ?? ''), String(value.panel_id ?? ''), userId)
+      const result = await session.onModelEffortSelect(
+        String(value.model ?? ''),
+        String(value.effort ?? ''),
+        String(value.panel_id ?? ''),
+        userId,
+        String(value.provider ?? ''),
+      )
       return result.card
         ? actionCardResponse(result.card)
         : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }

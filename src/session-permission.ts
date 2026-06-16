@@ -81,8 +81,8 @@ export function renderPermission(s: Session, req: CanUseToolRequest): void {
     s.proc?.sendPermissionResponse(req.request_id, 'deny', { denyMessage: 'unknown tool_use_id' })
     return
   }
-  // AskUserQuestion: SDK routes it through can_use_tool even under
-  // bypass. The PAYLOAD of "user has answered" is the permission
+  // AskUserQuestion: SDK routes it through can_use_tool. The PAYLOAD
+  // of "user has answered" is the permission
   // response itself — specifically `updatedInput.answers`. So we
   // CANNOT auto-allow here (that's the v0.1.2 bug: SDK got an empty
   // answers map and immediately synthesised a "User has answered

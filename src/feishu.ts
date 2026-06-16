@@ -14,7 +14,13 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
 import { config } from './config'
-import { isCodexReasoningEffort, type CodexReasoningEffort, resolveCodexBin } from './codex-process'
+import { isCodexReasoningEffort, resolveCodexBin } from './codex-process'
+import {
+  isClaudeReasoningEffort,
+  providerFromModel,
+  type AgentProvider,
+  type AgentReasoningEffort,
+} from './agent-process'
 import {
   ALIVE_MARKER_FILE,
   DATA_DIR,
@@ -89,18 +95,44 @@ export function unbindSessionChat(sessionName: string): void {
 }
 
 // ── Session resume map ────────────────────────────────────────────────
-// `sessionName → last-known Codex thread_id`. Persisted so a daemon
-// restart (systemctl, crash, watchdog) doesn't strand the user with a
-// fresh conversation when they next type `restart`. Updated when a
-// Codex turn starts, not when it finishes, so in-flight turns are
-// resumable after daemon exit.
-const lastSessionIdByName = new Map<string, string>()
+// `sessionName → provider → last-known thread/session id`. Persisted so
+// daemon restarts don't strand the user with a fresh conversation when
+// they next type `restart`. Updated when a turn starts, not when it
+// finishes, so in-flight turns are resumable after daemon exit.
+const lastSessionIdByName = new Map<string, Partial<Record<AgentProvider, string>>>()
+
+function setSessionResumeInMemory(sessionName: string, provider: AgentProvider, sessionId: string): void {
+  const entry = lastSessionIdByName.get(sessionName) ?? {}
+  entry[provider] = sessionId
+  lastSessionIdByName.set(sessionName, entry)
+}
 
 export function loadSessionResumeMap(): void {
   try {
     const obj = JSON.parse(readFileSync(SESSION_RESUME_MAP_FILE, 'utf8'))
-    for (const [name, id] of Object.entries(obj)) {
-      if (typeof id === 'string') lastSessionIdByName.set(name, id)
+    for (const [name, value] of Object.entries(obj)) {
+      if (typeof value === 'string' && value.trim()) {
+        setSessionResumeInMemory(name, 'codex', value)
+        continue
+      }
+      if (!value || typeof value !== 'object') continue
+      const record = value as Record<string, unknown>
+      const provider = record.provider === 'claude' || record.provider === 'codex'
+        ? record.provider
+        : null
+      const sessionId = typeof record.sessionId === 'string'
+        ? record.sessionId
+        : typeof record.session_id === 'string'
+          ? record.session_id
+          : null
+      if (provider && sessionId?.trim()) {
+        setSessionResumeInMemory(name, provider, sessionId)
+        continue
+      }
+      for (const p of ['codex', 'claude'] as const) {
+        const id = record[p]
+        if (typeof id === 'string' && id.trim()) setSessionResumeInMemory(name, p, id)
+      }
     }
     log(`feishu: loaded ${lastSessionIdByName.size} session→resume bindings`)
   } catch {}
@@ -108,32 +140,34 @@ export function loadSessionResumeMap(): void {
 
 function saveSessionResumeMap(): void {
   try {
-    const obj: Record<string, string> = {}
-    for (const [k, v] of lastSessionIdByName) obj[k] = v
+    const obj: Record<string, Partial<Record<AgentProvider, string>>> = {}
+    for (const [k, v] of lastSessionIdByName) obj[k] = { ...v }
     mkdirSync(DATA_DIR, { recursive: true })
     writeFileSync(SESSION_RESUME_MAP_FILE, JSON.stringify(obj, null, 2))
   } catch (e) { log(`feishu: save session-resume-map failed: ${e}`) }
 }
 
-export function bindSessionResume(sessionName: string, sessionId: string): void {
-  if (lastSessionIdByName.get(sessionName) === sessionId) return
-  lastSessionIdByName.set(sessionName, sessionId)
+export function bindSessionResume(sessionName: string, sessionId: string, provider: AgentProvider = 'codex'): void {
+  const prev = lastSessionIdByName.get(sessionName)?.[provider]
+  if (prev === sessionId) return
+  setSessionResumeInMemory(sessionName, provider, sessionId)
   saveSessionResumeMap()
 }
 
-export function getSessionResume(sessionName: string): string | null {
-  return lastSessionIdByName.get(sessionName) ?? null
+export function getSessionResume(sessionName: string, provider: AgentProvider = 'codex'): string | null {
+  return lastSessionIdByName.get(sessionName)?.[provider] ?? null
 }
 
 // ── Session model map ────────────────────────────────────────────────
-// `sessionName → selected Codex model+effort`. This is a Lodestar
-// preference, not a global Codex config edit: each Feishu group can
-// choose independently and the selection is reapplied on thread
-// start/resume. Loader accepts the older string value shape for
-// compatibility; saver writes the structured shape.
+// `sessionName → selected provider+model+effort`. This is a Lodestar
+// preference, not a global CLI config edit: each Feishu group can choose
+// independently and the selection is reapplied on thread start/resume.
+// Loader accepts the older string value shape for compatibility; saver
+// writes the provider-aware structured shape.
 export interface SessionModelSelection {
+  provider: AgentProvider
   model: string
-  effort: CodexReasoningEffort | null
+  effort: AgentReasoningEffort | null
 }
 
 const selectedModelByName = new Map<string, SessionModelSelection>()
@@ -143,16 +177,28 @@ export function loadSessionModelMap(): void {
     const obj = JSON.parse(readFileSync(SESSION_MODEL_MAP_FILE, 'utf8'))
     for (const [name, selection] of Object.entries(obj)) {
       if (typeof selection === 'string' && selection.trim()) {
-        selectedModelByName.set(name, { model: selection, effort: null })
+        selectedModelByName.set(name, {
+          provider: providerFromModel(selection),
+          model: selection,
+          effort: null,
+        })
         continue
       }
       if (!selection || typeof selection !== 'object') continue
       const model = (selection as { model?: unknown }).model
       if (typeof model !== 'string' || !model.trim()) continue
+      const providerRaw = (selection as { provider?: unknown }).provider
+      const provider: AgentProvider = providerRaw === 'claude' || providerRaw === 'codex'
+        ? providerRaw
+        : providerFromModel(model)
       const effort = (selection as { effort?: unknown }).effort
+      const normalizedEffort = provider === 'claude'
+        ? isClaudeReasoningEffort(effort) ? effort : null
+        : isCodexReasoningEffort(effort) ? effort : null
       selectedModelByName.set(name, {
+        provider,
         model,
-        effort: isCodexReasoningEffort(effort) ? effort : null,
+        effort: normalizedEffort,
       })
     }
     log(`feishu: loaded ${selectedModelByName.size} session→model bindings`)
@@ -168,10 +214,15 @@ function saveSessionModelMap(): void {
   } catch (e) { log(`feishu: save session-model-map failed: ${e}`) }
 }
 
-export function bindSessionModel(sessionName: string, model: string, effort: CodexReasoningEffort | null): void {
+export function bindSessionModel(
+  sessionName: string,
+  provider: AgentProvider,
+  model: string,
+  effort: AgentReasoningEffort | null,
+): void {
   const prev = selectedModelByName.get(sessionName)
-  if (prev?.model === model && prev.effort === effort) return
-  selectedModelByName.set(sessionName, { model, effort })
+  if (prev?.provider === provider && prev.model === model && prev.effort === effort) return
+  selectedModelByName.set(sessionName, { provider, model, effort })
   saveSessionModelMap()
 }
 

@@ -164,6 +164,7 @@ async function createOrUpdateHostAskCard(s: Session, askId: string): Promise<voi
 async function maybeContinueHostAsk(s: Session, askId: string): Promise<void> {
   const ask = s.pendingHostAsks.get(askId)
   if (!ask || ask.currentIdx !== undefined || ask.resumeStarted) return
+  if (s.proc?.provider !== 'codex') return
   if (!s.isRunning() || s.currentTurn || s.status !== 'idle') return
   const result = answerPayload(ask)
   if (!result) return
@@ -242,6 +243,10 @@ export function hasPendingHostAsk(s: Session): boolean {
 }
 
 export function queueHostAskFromMarker(s: Session, payloadText: string, _rawMarker: string): void {
+  if (s.proc?.provider !== 'codex') {
+    log(`session "${s.sessionName}": ignore askusr marker from non-Codex backend`)
+    return
+  }
   if (s.pendingHostAsks.size > 0) {
     log(`session "${s.sessionName}": ignore askusr marker because another host ask is pending`)
     return

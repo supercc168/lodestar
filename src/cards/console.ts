@@ -6,11 +6,13 @@
 
 import { SERVICE_LABEL, type SysInfo } from '../sysinfo'
 import type { UsageSnapshot } from '../usage'
+import type { AgentProvider } from '../agent-process'
 import { ELEMENTS } from './elements'
 
 export interface ConsoleOpts {
   sessionName: string
   status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
+  provider?: AgentProvider
   model?: string
   effort?: string
   worktreeInstructionNotice?: string | null
@@ -39,6 +41,7 @@ interface StatusCardOpts {
 }
 
 export interface ModelChoice {
+  provider?: AgentProvider
   model: string
   displayName: string
   description?: string
@@ -73,6 +76,7 @@ interface ModelEffortPanelOpts {
 
 interface ModelResultPanelOpts {
   sessionName: string
+  provider?: AgentProvider
   model: string
   effort: string
   scope: string
@@ -306,8 +310,9 @@ export function consoleCurrentModelContent(opts: ConsoleOpts): string {
     : opts.effort
       ? `强度 ${opts.effort}`
       : '未就绪'
+  const provider = opts.provider === 'claude' ? ` (${providerLabel(opts.provider)})` : ''
   return [
-    `**🤖 当前模型**　\`${label}\``,
+    `**🤖 当前模型${provider}**　\`${label}\``,
     ...(opts.worktreeInstructionNotice ? [opts.worktreeInstructionNotice] : []),
   ].join('\n')
 }
@@ -445,7 +450,7 @@ export function modelSelectionPanelElement(opts: ModelSelectionCardOpts): object
       },
       ...(opts.models.length
         ? opts.models.map(model => modelChoiceElement(model, opts.panelId, opts.currentEffort))
-        : [{ tag: 'markdown', content: '_Codex 未返回可用模型列表_' }]),
+        : [{ tag: 'markdown', content: '_未返回可用模型列表_' }]),
     ],
   }
 }
@@ -471,8 +476,8 @@ export function modelEffortPanelElement(opts: ModelEffortPanelOpts): object {
         ].join('\n'),
       },
       ...(efforts.length
-        ? efforts.map(effort => effortChoiceElement(opts.selectedModel.model, effort, opts.panelId))
-        : [{ tag: 'markdown', content: '_Codex 未返回这个模型的可用推理强度,无法完成切换。_' }]),
+        ? efforts.map(effort => effortChoiceElement(opts.selectedModel, effort, opts.panelId))
+        : [{ tag: 'markdown', content: '_未返回这个模型的可用推理强度,无法完成切换。_' }]),
     ],
   }
 }
@@ -487,7 +492,7 @@ export function modelResultPanelElement(opts: ModelResultPanelOpts): object {
       tag: 'markdown',
       content: [
         '**已保存**',
-        inlineCode(settingsText(opts.model, opts.effort)),
+        inlineCode(settingsText(opts.model, opts.effort, opts.provider)),
         escapeMarkdown(opts.scope),
       ].join('\n'),
     }],
@@ -499,7 +504,7 @@ function modelChoiceElement(model: ModelChoice, panelId: string, currentEffort?:
     ? `**${escapeMarkdown(model.displayName)}**`
     : `**${inlineCode(model.model)}**`
   const flags = [
-    model.isDefault ? 'Codex 默认' : '',
+    model.isDefault ? `${providerLabel(model.provider)} 默认` : '',
     model.selected ? '当前模型' : '',
     model.selected && currentEffort ? currentEffort : '',
   ].filter(Boolean)
@@ -541,6 +546,7 @@ function modelSelectActionValue(model: ModelChoice, panelId: string): object {
   return {
     kind: 'model_select',
     panel_id: panelId,
+    ...(model.provider && model.provider !== 'codex' ? { provider: model.provider } : {}),
     model: model.model,
     display_name: model.displayName,
     is_default: model.isDefault === true,
@@ -552,9 +558,9 @@ function modelSelectActionValue(model: ModelChoice, panelId: string): object {
   }
 }
 
-function effortChoiceElement(model: string, effort: ModelEffortChoice, panelId: string): object {
+function effortChoiceElement(model: ModelChoice, effort: ModelEffortChoice, panelId: string): object {
   const flags = [
-    effort.isDefault ? 'Codex 默认' : '',
+    effort.isDefault ? `${providerLabel(model.provider)} 默认` : '',
     effort.selected ? '当前 effort' : '',
   ].filter(Boolean)
   const desc = effort.description
@@ -583,7 +589,13 @@ function effortChoiceElement(model: string, effort: ModelEffortChoice, panelId: 
           tag: 'button',
           text: { tag: 'plain_text', content: '选' },
           type: effort.selected ? 'primary' : 'default',
-          behaviors: [{ type: 'callback', value: { kind: 'model_effort_select', panel_id: panelId, model, effort: effort.effort } }],
+          behaviors: [{ type: 'callback', value: {
+            kind: 'model_effort_select',
+            panel_id: panelId,
+            ...(model.provider && model.provider !== 'codex' ? { provider: model.provider } : {}),
+            model: model.model,
+            effort: effort.effort,
+          } }],
         }],
       },
     ],
@@ -600,11 +612,16 @@ function settingsLine(model?: string | null, effort?: string | null): string {
   return inlineCode(settingsText(model, effort))
 }
 
-function settingsText(model?: string | null, effort?: string | null): string {
-  if (model && effort) return `${model}/${effort}`
-  if (model) return model
-  if (effort) return effort
+function settingsText(model?: string | null, effort?: string | null, provider?: AgentProvider): string {
+  const prefix = provider && provider !== 'codex' ? `${providerLabel(provider)} · ` : ''
+  if (model && effort) return `${prefix}${model}/${effort}`
+  if (model) return `${prefix}${model}`
+  if (effort) return `${prefix}${effort}`
   return '未选择'
+}
+
+function providerLabel(provider?: AgentProvider): string {
+  return provider === 'claude' ? 'Claude' : 'Codex'
 }
 
 function truncate(s: string, max: number): string {

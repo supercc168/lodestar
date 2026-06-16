@@ -99,5 +99,8 @@ describe('agy task card rendering', () => {
       kind: 'agy_forward_codex',
       result_id: 'agy-result-1',
     })
+
+    const claudeButton = agyForwardElement('agy-result-2', 'Claude') as any
+    expect(claudeButton.columns[0].elements[0].text.content).toBe('转 Claude')
   })
 })

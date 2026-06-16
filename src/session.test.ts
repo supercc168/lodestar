@@ -5,6 +5,7 @@ let sentCards: object[] = []
 let sentTexts: string[] = []
 let sentRawTexts: string[] = []
 let deletedReactions: Array<[string, string]> = []
+let boundResumes: Array<[string, string, string | undefined]> = []
 
 mock.module('./feishu', () => ({
   PROJECTS_ROOT: '/tmp/lodestar-projects',
@@ -27,6 +28,10 @@ mock.module('./feishu', () => ({
   deleteReaction: async (messageId: string, reactionId: string) => {
     deletedReactions.push([messageId, reactionId])
   },
+  bindSessionResume: (sessionName: string, sessionId: string, provider?: string) => {
+    boundResumes.push([sessionName, sessionId, provider])
+  },
+  bindSessionModel: () => {},
 }))
 
 const { Session } = await import('./session')
@@ -47,6 +52,7 @@ beforeEach(() => {
   sentTexts = []
   sentRawTexts = []
   deletedReactions = []
+  boundResumes = []
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input))
     const path = url.pathname.replace('/open-apis/cardkit/v1', '')
@@ -63,6 +69,67 @@ beforeEach(() => {
     })
   }) as typeof fetch
 })
+
+class FakeAgentProc extends EventEmitter {
+  lastAssistantUuid = null
+  lastModel = null
+  lastEffort = null
+  lastUsage = null
+  lastTotalUsage = null
+  lastResult = {
+    cost_usd: null,
+    cost_delta_usd: null,
+    duration_ms: null,
+    num_turns: null,
+    usage: null,
+    subtype: null,
+    is_error: false,
+  }
+  lastContextWindow = null
+  sentTexts: string[] = []
+  killCalls = 0
+  setModelSettingsCalls: Array<[string, string]> = []
+  alive = true
+
+  constructor(
+    readonly provider: 'codex' | 'claude',
+    public sessionId: string | null = null,
+  ) {
+    super()
+  }
+
+  sendInitialize(): void {}
+
+  sendUserText(text: string): void {
+    this.sentTexts.push(text)
+  }
+
+  sendInterrupt(): void {}
+  sendPermissionResponse(): void {}
+  sendToolResult(): void {}
+  sendHookResponse(): void {}
+
+  isAlive(): boolean {
+    return this.alive
+  }
+
+  async kill(): Promise<void> {
+    this.killCalls++
+    this.alive = false
+    this.emit('exit', { code: 0, signal: null, expected: true })
+  }
+
+  async listModels(): Promise<any[]> {
+    return []
+  }
+
+  async setModelSettings(model: string, effort: string): Promise<void> {
+    this.setModelSettingsCalls.push([model, effort])
+  }
+  async setModel(): Promise<void> {}
+  async compactThread(): Promise<void> {}
+  async injectThreadItems(): Promise<void> {}
+}
 
 afterEach(() => {
   globalThis.fetch = originalFetch
@@ -165,6 +232,35 @@ describe('Session assistant rendering', () => {
       await cardkit.dispose(turn.cardId)
     }
   })
+
+  test('treats askusr host markers as Codex-only', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const turn = turnState()
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.appendAssistant('Before [[askusr: {"questions":[{"question":"Pick?","options":["A","B"]}]}]] after')
+      session.finalizeCurrentAssistantSegment()
+      await cardkit.flush(turn.cardId)
+
+      expect(session.pendingHostAsks.size).toBe(0)
+      expect(sentCards.length).toBe(0)
+      const assistantAdd = calls.find(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements`
+      )
+      const elements = JSON.parse(assistantAdd?.body.elements ?? '[]')
+      expect(elements[0]?.content).not.toContain('askusr')
+      expect(elements[0]?.content).not.toContain('已发起澄清问题')
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
 })
 
 describe('Session compact command', () => {
@@ -219,4 +315,78 @@ describe('Session compact command', () => {
       content.includes('✅ 上下文已压缩') && content.includes('🧠 2% (5.4K/258K)')
     )).toBe(true)
   })
+})
+
+describe('Session provider switching', () => {
+  test('uses provider-specific ask instructions', () => {
+    const session = new Session('probe', 'chat_id') as any
+
+    session.selectedProvider = 'codex'
+    expect(session.spawnDeveloperInstructions()).toContain('[[askusr:')
+
+    session.selectedProvider = 'claude'
+    const instructions = session.spawnDeveloperInstructions()
+    expect(instructions).toContain('AskUserQuestion')
+    expect(instructions).not.toContain('[[askusr:')
+  })
+
+  test('keeps selected provider resume id from being overwritten by stale backend events', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'claude-session-1'
+
+    session.persistResumableSessionId()
+
+    expect(boundResumes).toEqual([['probe', 'codex-thread-1', 'codex']])
+    expect(session.lastSessionId).toBe('claude-session-1')
+  })
+
+  test('rejects cross-provider model switch while a turn is active', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.proc = new FakeAgentProc('codex', 'codex-thread-1')
+    session.currentTurn = turnState()
+
+    const result = await session.onModelEffortSelect('claude:default', 'high', '', 'ou_user', 'claude')
+
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('正在执行或排队')
+    expect(boundResumes).toEqual([])
+    expect(session.selectedProvider).toBe('codex')
+  })
+
+  test('respawns idle Claude process when selecting an env-backed model profile', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedModel = 'claude:default'
+
+    const result = await session.onModelEffortSelect('claude:glm', 'high', '', 'ou_user', 'claude')
+
+    expect(result.ok).toBe(true)
+    expect(session.selectedModel).toBe('claude:glm')
+    expect(proc.killCalls).toBe(1)
+    expect(session.proc).toBeNull()
+    expect(proc.setModelSettingsCalls).toEqual([])
+    expect(result.card ? JSON.stringify(result.card) : '').toContain('下次启动 Claude')
+  })
+
+  test('rejects Claude env-backed model profile switch while a turn is active', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedModel = 'claude:default'
+    session.currentTurn = turnState()
+
+    const result = await session.onModelEffortSelect('claude:deepseek', 'high', '', 'ou_user', 'claude')
+
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('env 生效')
+    expect(session.selectedModel).toBe('claude:default')
+    expect(proc.killCalls).toBe(0)
+  })
+
 })

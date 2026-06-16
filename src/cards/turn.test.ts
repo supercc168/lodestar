@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleBodyElements, consoleUsageContent, modelEffortCard, modelEffortPanelElement, modelResultCard, modelResultPanelElement, modelSelectionCard, statusCard, streamingOffSettings } from './console'
+import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, modelEffortCard, modelEffortPanelElement, modelResultCard, modelResultPanelElement, modelSelectionCard, statusCard, streamingOffSettings } from './console'
 import {
   askUserQuestionElement,
   contextCompactionElement,
@@ -56,6 +56,23 @@ describe('main conversation card rendering', () => {
 
     expect(card.header).toBeUndefined()
     expect(card.body.elements[0].header.title.content).toBe('📥 收到 (1) #2')
+  })
+
+  test('card-full continuation banner keeps Codex default and labels Claude only when requested', () => {
+    const codexCard = mainConversationCard({
+      sessionName: 'probe',
+      turn: 2,
+      kind: 'card_full',
+    }) as any
+    expect(codexCard.body.elements[0].content).toContain('同一轮 Codex turn')
+
+    const claudeCard = mainConversationCard({
+      sessionName: 'probe',
+      turn: 2,
+      provider: 'claude',
+      kind: 'card_full',
+    }) as any
+    expect(claudeCard.body.elements[0].content).toContain('同一轮 Claude turn')
   })
 
   test('status cards render one visible status line without a header', () => {
@@ -136,6 +153,24 @@ describe('main conversation card rendering', () => {
     expect(body).not.toContain('上一轮')
     expect(body).not.toContain('累计')
     expect(body).not.toContain('thread')
+  })
+
+  test('console keeps the original Codex model header but labels Claude explicitly', () => {
+    expect(consoleCurrentModelContent({
+      sessionName: 'probe',
+      status: 'idle',
+      provider: 'codex',
+      model: 'gpt-5-codex',
+      effort: 'xhigh',
+    })).toContain('**🤖 当前模型**　`gpt-5-codex/xhigh`')
+
+    expect(consoleCurrentModelContent({
+      sessionName: 'probe',
+      status: 'idle',
+      provider: 'claude',
+      model: 'claude:default',
+      effort: 'high',
+    })).toContain('**🤖 当前模型 (Claude)**　`claude:default/high`')
   })
 
   test('model command card keeps model and effort selection in one replaceable panel', () => {
@@ -219,6 +254,49 @@ describe('main conversation card rendering', () => {
     }) as any
     expect(savedCard.header.template).toBe('green')
     expect(savedCard.body.elements[0].header.title.content).toBe('选择已保存')
+  })
+
+  test('model command card carries provider only for Claude backend actions', () => {
+    const claudeModel = {
+      provider: 'claude' as const,
+      model: 'claude:default',
+      displayName: 'Claude Code',
+      description: 'local Claude Code backend',
+      selected: true,
+      efforts: [
+        { effort: 'high', selected: true, isDefault: true },
+        { effort: 'max' },
+      ],
+    }
+    const card = modelSelectionCard({
+      sessionName: 'probe',
+      panelId: 'panel-claude',
+      currentModel: 'claude:default',
+      currentEffort: 'high',
+      models: [claudeModel],
+    }) as any
+    expect(card.body.elements[0].elements[1].columns[1].elements[0].behaviors[0].value).toMatchObject({
+      kind: 'model_select',
+      panel_id: 'panel-claude',
+      provider: 'claude',
+      model: 'claude:default',
+    })
+
+    const effortPanel = modelEffortPanelElement({
+      sessionName: 'probe',
+      panelId: 'panel-claude',
+      currentModel: 'claude:default',
+      currentEffort: 'high',
+      selectedModel: claudeModel,
+      selectedEffort: 'max',
+    }) as any
+    expect(effortPanel.elements[2].columns[1].elements[0].behaviors[0].value).toEqual({
+      kind: 'model_effort_select',
+      panel_id: 'panel-claude',
+      provider: 'claude',
+      model: 'claude:default',
+      effort: 'max',
+    })
   })
 
   test('chat-list summary uses a symbol for turn output', () => {

@@ -189,6 +189,7 @@ function rememberAgyForwardPrompt(s: Session, task: AgyTaskState, stderr: string
 }
 
 export function beginAgyForwardToCodex(s: Session, resultIdRaw: string, userOpenId = ''): ModelActionResult {
+  const backend = s.backendLabel()
   const resultId = resultIdRaw.trim()
   const record = s.agyForwardPrompts.get(resultId)
   if (!record) return { ok: false, message: 'agy 结果已过期，请重新运行 agy' }
@@ -200,12 +201,12 @@ export function beginAgyForwardToCodex(s: Session, resultIdRaw: string, userOpen
       await s.onUserMessage(record.prompt, [], userOpenId)
     } catch (e) {
       record.used = false
-      const msg = `❌ agy 结果转发 Codex 失败: ${messageOf(e)}`
+      const msg = `❌ agy 结果转发 ${backend} 失败: ${messageOf(e)}`
       log(`session "${s.sessionName}": ${msg}`)
       await feishu.sendTextRaw(s.chatId, msg)
     }
   })()
-  return { ok: true, message: '已转发 Codex' }
+  return { ok: true, message: `已转发 ${backend}` }
 }
 
 export async function runAgyCommand(s: Session, prompt: string): Promise<void> {
@@ -218,7 +219,7 @@ export async function runAgyCommand(s: Session, prompt: string): Promise<void> {
     return
   }
   if (s.currentTurn || s.openingTurn || s.pendingUserMessageCount > 0 || s.pendingMidTurnMsgs.length > 0) {
-    await feishu.sendText(s.chatId, '⚠️ Codex 当前有正在执行或排队的 turn；请先发送 stop，或等待当前 turn 完成后再运行 agy。')
+    await feishu.sendText(s.chatId, `⚠️ ${s.backendLabel()} 当前有正在执行或排队的 turn；请先发送 stop，或等待当前 turn 完成后再运行 agy。`)
     return
   }
 
@@ -392,7 +393,7 @@ async function finishAgyTask(s: Session, task: AgyTaskState, code: number | null
     await cardkit.replaceElement(
       task.cardId,
       cards.ELEMENTS.agyForward,
-      cards.agyForwardElement(forwardResultId),
+      cards.agyForwardElement(forwardResultId, s.backendLabel()),
     )
     await cardkit.replaceElement(
       task.cardId,

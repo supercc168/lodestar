@@ -62,10 +62,11 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     case 'hi':
       {
         const needsStart = !s.isRunning()
+        const backend = s.backendLabel()
         const statusCard = needsStart
-          ? await s.openStatusCard('hi', s.withModel('🚀 启动 Codex'))
+          ? await s.openStatusCard('hi', s.withModel(`🚀 启动 ${backend}`))
           : null
-        let lastStatus = s.withModel('🚀 启动 Codex')
+        let lastStatus = s.withModel(`🚀 启动 ${backend}`)
         const ok = needsStart
           ? await s.start({
               announce: !statusCard,
@@ -82,14 +83,14 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
         if (statusCard) {
           await s.replaceStatusCardWithConsole(
             statusCard,
-            s.withModel(s.withWorktreeInstructionNotice('✅ Codex 已就绪')),
+            s.withModel(s.withWorktreeInstructionNotice(`✅ ${s.backendLabel()} 已就绪`)),
           )
           return true
         }
         if (needsStart) {
           await s.closeStatusCard(
             statusCard,
-            s.withModel(s.withWorktreeInstructionNotice('✅ Codex 已就绪')),
+            s.withModel(s.withWorktreeInstructionNotice(`✅ ${s.backendLabel()} 已就绪`)),
           )
         }
       }
@@ -160,7 +161,8 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       {
         if (s.runningAgy) await s.stopAgyTask('🛑 agy 已终止')
         const wasRunning = s.isRunning()
-        const initialStatus = wasRunning ? '🛑 停止 Codex' : '⚪ session 当前未运行'
+        const backend = s.backendLabel(s.proc?.provider ?? s.currentProvider())
+        const initialStatus = wasRunning ? `🛑 停止 ${backend}` : '⚪ session 当前未运行'
         const statusCard = await s.openStatusCard('kill', initialStatus, wasRunning ? 'red' : 'grey')
         await s.stop('已终止', {
           announce: !statusCard,
@@ -168,7 +170,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
             s.setStatusCard(statusCard, status)
           },
         })
-        await s.closeStatusCard(statusCard, wasRunning ? '✅ Codex 已终止' : '⚪ Codex 未运行')
+        await s.closeStatusCard(statusCard, wasRunning ? `✅ ${backend} 已终止` : `⚪ ${backend} 未运行`)
       }
       return true
     case 'restart':
@@ -178,11 +180,12 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       // previous conversation after a `kill` or a daemon crash.
       {
         const resumeThreadLabel = s.lastSessionId ? s.lastSessionId.slice(0, 8) : ''
+        const backend = s.backendLabel(s.proc?.provider ?? s.currentProvider())
         const initialStatus = s.isRunning()
-          ? s.withModel('🔁 重启 Codex')
+          ? s.withModel(`🔁 重启 ${backend}`)
           : resumeThreadLabel
             ? s.withModel(`🔁 恢复上一会话 thread=${resumeThreadLabel}…`)
-            : s.withModel('🔁 启动 Codex')
+            : s.withModel(`🔁 启动 ${backend}`)
         const statusCard = await s.openStatusCard('restart', initialStatus)
         if (s.runningAgy) {
           s.setStatusCard(statusCard, '🛑 restart 前终止 agy')
@@ -200,7 +203,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
           ? (
               lastStatus.startsWith('✅')
                 ? lastStatus
-                : s.withWorktreeInstructionNotice(resumeThreadLabel ? '✅ 已恢复上一会话' : '✅ Codex 已就绪')
+                : s.withWorktreeInstructionNotice(resumeThreadLabel ? '✅ 已恢复上一会话' : `✅ ${s.backendLabel()} 已就绪`)
             )
           : (lastStatus.startsWith('❌') ? lastStatus : '❌ 重启失败')
         await s.closeStatusCard(statusCard, ok ? s.withModel(finalStatus) : finalStatus)
@@ -218,7 +221,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
         s.opts.onLifecycleChange?.()
         const statusCard = await s.openStatusCard('clear', '⚪ session 当前未运行', 'grey')
         if (statusCard) {
-          await s.closeStatusCard(statusCard, '⚪ Codex 未运行，clear 无效')
+          await s.closeStatusCard(statusCard, `⚪ ${s.backendLabel()} 未运行，clear 无效`)
         } else {
           await feishu.sendText(s.chatId, `⚪ session "${s.sessionName}" 当前未运行,clear 无效;用 \`hi\` 启动或 \`restart\` 恢复上一会话`)
         }

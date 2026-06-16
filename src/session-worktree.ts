@@ -1,7 +1,7 @@
 import { join } from 'node:path'
 
 import type { Session } from './session'
-import { CHANNEL_INSTRUCTIONS } from './instructions'
+import { CHANNEL_INSTRUCTIONS, CLAUDE_CHANNEL_INSTRUCTIONS } from './instructions'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
@@ -17,8 +17,9 @@ export function worktreeProjectDir(s: Session): string {
 }
 
 export function spawnDeveloperInstructions(s: Session): string {
+  const base = s.currentProvider() === 'claude' ? CLAUDE_CHANNEL_INSTRUCTIONS : CHANNEL_INSTRUCTIONS
   const extra = worktreeExtraInstruction(s)
-  return extra ? `${CHANNEL_INSTRUCTIONS}\n${extra}` : CHANNEL_INSTRUCTIONS
+  return extra ? `${base}\n${extra}` : base
 }
 
 export function worktreeInstructionLoadedNotice(s: Session): string | null {

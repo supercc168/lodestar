@@ -1,9 +1,9 @@
 /**
- * AskUserQuestion flow split out of session.ts. The SDK routes
- * AskUserQuestion through can_use_tool even under bypass mode, so the
- * "answered" state lives across two SDK control messages — option
- * clicks/custom text land via Feishu callbacks first, then
- * can_use_tool arrives and we finalize with `updatedInput.answers`.
+ * AskUserQuestion flow split out of session.ts. Codex and Claude both
+ * route AskUserQuestion through can_use_tool, so the "answered" state
+ * lives across two SDK control messages — option clicks/custom text
+ * land via Feishu callbacks first, then can_use_tool arrives and we
+ * finalize with `updatedInput.answers`.
  */
 
 import type { Session } from './session'

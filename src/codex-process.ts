@@ -25,6 +25,7 @@ import {
   logUnhandledAppServerPayload,
 } from './codex-compaction'
 import { diffUsageTotals, effectiveTurnTokens, usageFromTokenUsagePayload } from './codex-usage'
+import type { AgentReasoningEffort } from './agent-process'
 
 export function resolveCodexBin(): string {
   if (process.platform !== 'win32') {
@@ -214,6 +215,7 @@ type ServerRequestState = {
 }
 
 export class CodexProcess extends EventEmitter {
+  readonly provider = 'codex' as const
   private proc: ChildProcessByStdio<Writable, Readable, Readable>
   private stdoutBuf = ''
   private stderrBuf = ''
@@ -739,7 +741,7 @@ export class CodexProcess extends EventEmitter {
     })
   }
 
-  async setModelSettings(model: string, effort: CodexReasoningEffort): Promise<void> {
+  async setModelSettings(model: string, effort: AgentReasoningEffort): Promise<void> {
     if (!model.trim()) throw new Error('empty model')
     if (!isCodexReasoningEffort(effort)) throw new Error(`invalid reasoning effort: ${String(effort)}`)
     if (!this.readyPromise) throw new Error('codex thread not initialized')

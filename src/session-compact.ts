@@ -1,10 +1,10 @@
 import type { Session } from './session'
 import {
-  type CodexProcess,
   type CodexUsage,
   type ContextCompactedNotification,
   type TokenUsageUpdated,
 } from './codex-process'
+import type { AgentProcess } from './agent-process'
 import * as feishu from './feishu'
 import { log } from './log'
 import {
@@ -35,7 +35,7 @@ type ManualCompactionUsageWatch = {
   cancel(): void
 }
 
-function watchManualCompaction(proc: CodexProcess, timeoutMs: number): ManualCompactionWatch {
+function watchManualCompaction(proc: AgentProcess, timeoutMs: number): ManualCompactionWatch {
   let settled = false
   let timer: ReturnType<typeof setTimeout> | null = null
   let resolvePromise: (notice: ContextCompactedNotification) => void = () => {}
@@ -89,7 +89,7 @@ function watchManualCompaction(proc: CodexProcess, timeoutMs: number): ManualCom
   }
 }
 
-function watchManualCompactionUsage(proc: CodexProcess, threadId: string | null): ManualCompactionUsageWatch {
+function watchManualCompactionUsage(proc: AgentProcess, threadId: string | null): ManualCompactionUsageWatch {
   const snapshots: ContextUsageSnapshot[] = []
   const waiters = new Set<{
     notice: ContextCompactedNotification
@@ -163,7 +163,7 @@ export async function runCompactCommand(s: Session): Promise<void> {
     s.opts.onLifecycleChange?.()
     const statusCard = await s.openStatusCard('compact', '⚪ session 当前未运行', 'grey')
     if (statusCard) {
-      await s.closeStatusCard(statusCard, '⚪ Codex 未运行，compact 无效')
+      await s.closeStatusCard(statusCard, '⚪ 后端未运行，compact 无效')
     } else {
       await feishu.sendText(s.chatId, `⚪ session "${s.sessionName}" 当前未运行,compact 无效;用 \`hi\` 启动或 \`restart\` 恢复上一会话`)
     }
