@@ -621,31 +621,45 @@ export class Session {
     }
     this.proc = proc
     this.wireProc(this.proc)
+    const backend = this.backendLabel()
+    const initTimeoutMs = this.selectedProvider === 'claude' ? 20_000 : 5000
+    const initWait = this.waitForProcInit(this.proc, initTimeoutMs)
+    report?.(`⏳ 等待 ${backend} init`)
     this.proc.sendInitialize()
-    report?.(`⏳ 等待 ${this.backendLabel()} init`)
     // 等 `system/init` 落地再认定 ready —— sendInitialize 只把 RPC
-    // 写进 app-server 之前 proc.sessionId 还是 null,这时候
+    // 写进 app-server/Claude SDK 之前 proc.sessionId 还是 null,这时候
     // showConsole() 看到 null 会 fallback 到磁盘上**上一次**会话的
     // lastSessionId,面板就把陈年 thread_id 当成"当前会话"贴出去,
     // model / usage / contextWindow 也都没值。等 init 之后再返回,
-    // 后续 `hi`、首条 user message 都能拿到真值。5s 兜底,init 真
-    // 没来也不死循环。
-    if (this.selectedProvider === 'codex') {
-      const init = await this.waitForProcInit(this.proc, 5000)
-      if (init.state === 'error' || init.state === 'exit') {
-        log(`session "${this.sessionName}": codex init failed: ${init.error ?? init.state}`)
-        report?.(`❌ Codex 启动失败: ${init.error ?? init.state}`)
-        if (announce) await feishu.sendText(this.chatId, `❌ Codex 启动失败: ${init.error ?? init.state}`)
+    // 后续 `hi`、首条 user message 都能拿到真值。Codex 保留既有
+    // 5s 兜底,Claude 必须确认 init 才认 ready。监听必须先于
+    // sendInitialize 注册,否则 Claude wrapper 内同步暴露的启动失败
+    // 会被错过。
+    const init = await initWait
+    if (init.state === 'error' || init.state === 'exit') {
+      const detail = init.error ? messageOf(init.error) : init.state
+      log(`session "${this.sessionName}": ${this.selectedProvider} init failed: ${detail}`)
+      report?.(`❌ ${backend} 启动失败: ${detail}`)
+      if (announce) await feishu.sendText(this.chatId, `❌ ${backend} 启动失败: ${detail}`)
+      await this.proc?.kill(1000).catch(() => {})
+      this.proc = null
+      this.status = 'stopped'
+      this.opts.onLifecycleChange?.()
+      return false
+    }
+    if (init.state === 'timeout') {
+      log(`session "${this.sessionName}": ${this.selectedProvider} init wait timeout (${initTimeoutMs / 1000}s)`)
+      if (this.selectedProvider === 'claude') {
+        const message = `${backend} 启动超时: init 未确认`
+        report?.(`❌ ${message}`)
+        if (announce) await feishu.sendText(this.chatId, `❌ ${message}`)
         await this.proc?.kill(1000).catch(() => {})
         this.proc = null
         this.status = 'stopped'
         this.opts.onLifecycleChange?.()
         return false
       }
-      if (init.state === 'timeout') {
-        log(`session "${this.sessionName}": init wait timeout (5s) — proceeding`)
-        report?.(this.withModel(this.withWorktreeInstructionNotice('⏳ Codex 已启动，init 确认超时')))
-      }
+      report?.(this.withModel(this.withWorktreeInstructionNotice(`⏳ ${backend} 已启动，init 确认超时`)))
     }
 
     if (announce) {
@@ -852,29 +866,28 @@ export class Session {
       }
       this.proc = proc
       this.wireProc(this.proc)
+      const backend = this.backendLabel()
+      const initWait = this.waitForProcResumeInit(this.proc, () => {
+        log(`session "${this.sessionName}": ${this.selectedProvider} resume init still pending after ${RESUME_INIT_NOTICE_MS / 1000}s`)
+        report?.(this.withModel(`⏳ 仍在等待 ${backend} init 确认 thread=${prevThreadLabel}…`))
+      })
+      report?.(`⏳ 等待 ${backend} init 确认`)
       this.proc.sendInitialize()
-      if (this.selectedProvider === 'codex') {
-        report?.('⏳ 等待 Codex init 确认')
-        const init = await this.waitForProcResumeInit(this.proc, () => {
-          log(`session "${this.sessionName}": resume init still pending after ${RESUME_INIT_NOTICE_MS / 1000}s`)
-          report?.(this.withModel(`⏳ 仍在等待 Codex init 确认 thread=${prevThreadLabel}…`))
-        })
-        if (init.state === 'error' || init.state === 'exit' || init.state === 'timeout') {
-          log(`session "${this.sessionName}": codex resume failed: ${init.error ?? init.state}`)
-          const finalStatus = init.state === 'timeout'
-            ? '❌ Codex 恢复超时'
-            : `❌ Codex 恢复失败: ${init.error ?? init.state}`
-          report?.(finalStatus)
-          if (announceText) await feishu.sendText(this.chatId, finalStatus)
-          await this.proc?.kill(1000).catch(() => {})
-          this.proc = null
-          this.status = 'stopped'
-          this.opts.onLifecycleChange?.()
-          await closeInternalStatusCard(finalStatus)
-          return false
-        }
-      } else {
-        report?.(this.withModel(`⏳ ${this.backendLabel()} 将在首条消息时确认恢复 thread=${prevThreadLabel}…`))
+      const init = await initWait
+      if (init.state === 'error' || init.state === 'exit' || init.state === 'timeout') {
+        const detail = init.error ? messageOf(init.error) : init.state
+        log(`session "${this.sessionName}": ${this.selectedProvider} resume failed: ${detail}`)
+        const finalStatus = init.state === 'timeout'
+          ? `❌ ${backend} 恢复超时`
+          : `❌ ${backend} 恢复失败: ${detail}`
+        report?.(finalStatus)
+        if (announceText) await feishu.sendText(this.chatId, finalStatus)
+        await this.proc?.kill(1000).catch(() => {})
+        this.proc = null
+        this.status = 'stopped'
+        this.opts.onLifecycleChange?.()
+        await closeInternalStatusCard(finalStatus)
+        return false
       }
       const msg = this.withModel(this.withWorktreeInstructionNotice(`✅ 已恢复上一会话 thread=${prevThreadLabel}…`))
       report?.(msg)

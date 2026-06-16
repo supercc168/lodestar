@@ -86,8 +86,11 @@ export interface ClaudeSpawnOpts extends SpawnOpts {
 
 export function resolveClaudeBin(): string {
   if (process.platform !== 'win32') {
-    const local = join(homedir(), '.local', 'bin', 'claude')
-    if (existsSync(local)) return local
+    const candidates = [
+      join(homedir(), '.local', 'npm-global', 'bin', 'claude'),
+      join(homedir(), '.local', 'bin', 'claude'),
+    ]
+    for (const candidate of candidates) if (existsSync(candidate)) return candidate
   }
   const found = whichClaude()
   if (found) return found
@@ -114,14 +117,16 @@ function whichClaude(): string | null {
   return null
 }
 
-function buildSpawnPath(): string {
+export function buildClaudeSpawnPath(): string {
   if (process.platform === 'win32') return process.env.PATH ?? ''
-  return [
+  const entries = [
     join(homedir(), '.local', 'npm-global', 'bin'),
     join(homedir(), '.local', 'bin'),
     join(homedir(), '.bun', 'bin'),
+    ...(process.env.PATH ?? '').split(delimiter),
     '/usr/local/bin', '/usr/bin', '/bin',
-  ].join(delimiter)
+  ]
+  return [...new Set(entries.filter(Boolean))].join(delimiter)
 }
 
 function usageFromSdk(raw: any): CodexUsage | null {
@@ -285,6 +290,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   private pendingInjectedContext: string[] = []
   private requestCounter = 0
   private lastTotalCostUsd: number | null = null
+  private turnActive = false
 
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
@@ -322,7 +328,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           pathToClaudeCodeExecutable: resolveClaudeBin(),
           env: {
             ...(process.env as Record<string, string>),
-            PATH: buildSpawnPath(),
+            PATH: buildClaudeSpawnPath(),
             ...resolveClaudeModelEnv(this.opts.model),
             ...config.claude.env,
           },
@@ -568,6 +574,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   private finishExit(code: number | null, signal: string | null): void {
     if (!this.alive) return
     this.alive = false
+    this.turnActive = false
     for (const [id, pending] of this.pendingPermissions) {
       if (pending.kind === 'dialog') pending.resolve({ behavior: 'cancelled' })
       else pending.resolve({ behavior: 'deny', message: 'Claude backend exited before permission response', toolUseID: pending.request.tool_use_id })
@@ -609,7 +616,14 @@ export class ClaudeAgentProcess extends EventEmitter {
         if (typeof raw.model === 'string' && raw.model) this.lastModel = claudeModelKey(raw.model)
         this.lastEffort = this.opts.effort
         this.emit('init', { session_id: this.sessionId, raw })
-        this.emit('turn_started', { turn_id: raw.uuid, thread_id: this.sessionId })
+        return
+      case 'session_state_changed':
+        if (raw.state === 'running' && !this.turnActive) {
+          this.turnActive = true
+          this.emit('turn_started', { turn_id: raw.uuid, thread_id: this.sessionId })
+        } else if (raw.state === 'idle') {
+          this.turnActive = false
+        }
         return
       case 'compact_boundary':
         this.emit('context_compacted', {
@@ -673,6 +687,7 @@ export class ClaudeAgentProcess extends EventEmitter {
 
   private handleResultMessage(raw: any): void {
     if (typeof raw.session_id === 'string' && raw.session_id) this.sessionId = raw.session_id
+    this.turnActive = false
     const usage = usageFromSdk(raw.usage)
     const total = totalUsageFromModelUsage(raw.modelUsage)
     this.lastUsage = usage
@@ -713,6 +728,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   private failTurnStart(e: Error): void {
+    this.turnActive = false
     this.lastResult = {
       cost_usd: null,
       cost_delta_usd: null,

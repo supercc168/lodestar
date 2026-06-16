@@ -1,3 +1,5 @@
+import { homedir } from 'node:os'
+import { delimiter, join } from 'node:path'
 import { describe, expect, mock, test } from 'bun:test'
 
 mock.module('./config', () => ({
@@ -10,6 +12,7 @@ mock.module('./config', () => ({
 }))
 
 const {
+  buildClaudeSpawnPath,
   ClaudeAgentProcess,
 } = await import('./claude-agent-process')
 const {
@@ -18,6 +21,22 @@ const {
 } = await import('./claude-models')
 
 describe('Claude model profiles', () => {
+  test('keeps npm-global, local bins, and existing PATH in Claude spawn PATH', () => {
+    if (process.platform === 'win32') return
+    const originalPath = process.env.PATH
+    try {
+      process.env.PATH = ['/opt/custom/bin', '/usr/bin'].join(delimiter)
+      const entries = buildClaudeSpawnPath().split(delimiter)
+
+      expect(entries).toContain(join(homedir(), '.local', 'npm-global', 'bin'))
+      expect(entries).toContain(join(homedir(), '.local', 'bin'))
+      expect(entries).toContain('/opt/custom/bin')
+      expect(entries.filter(entry => entry === '/usr/bin')).toHaveLength(1)
+    } finally {
+      process.env.PATH = originalPath
+    }
+  })
+
   test('maps GLM and DeepSeek profiles to SDK model and env tiers', () => {
     expect(resolveClaudeSdkModel('claude:glm')).toBe('sonnet')
     expect(resolveClaudeModelEnv('claude:glm')).toEqual({
@@ -42,6 +61,74 @@ describe('Claude model profiles', () => {
 })
 
 describe('Claude user dialog bridge', () => {
+  test('uses session_state_changed running as turn start boundary', () => {
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp',
+      effort: 'high',
+    }) as any
+    const inits: any[] = []
+    const started: any[] = []
+    proc.on('init', (event: any) => inits.push(event))
+    proc.on('turn_started', (event: any) => started.push(event))
+
+    proc.handleMessage({
+      type: 'system',
+      subtype: 'init',
+      uuid: 'init-1',
+      session_id: 'claude-session-1',
+      model: 'sonnet',
+    })
+    expect(inits).toHaveLength(1)
+    expect(started).toEqual([])
+
+    proc.handleMessage({
+      type: 'system',
+      subtype: 'session_state_changed',
+      state: 'running',
+      uuid: 'turn-1',
+      session_id: 'claude-session-1',
+    })
+    proc.handleMessage({
+      type: 'system',
+      subtype: 'session_state_changed',
+      state: 'requires_action',
+      uuid: 'turn-1-permission',
+      session_id: 'claude-session-1',
+    })
+    proc.handleMessage({
+      type: 'system',
+      subtype: 'session_state_changed',
+      state: 'running',
+      uuid: 'turn-1-resumed',
+      session_id: 'claude-session-1',
+    })
+    expect(started).toEqual([{ turn_id: 'turn-1', thread_id: 'claude-session-1' }])
+
+    proc.handleMessage({
+      type: 'result',
+      subtype: 'success',
+      uuid: 'result-1',
+      session_id: 'claude-session-1',
+      is_error: false,
+      duration_ms: 10,
+      num_turns: 1,
+      total_cost_usd: 0,
+      usage: { input_tokens: 1, output_tokens: 1 },
+      modelUsage: {},
+    })
+    proc.handleMessage({
+      type: 'system',
+      subtype: 'session_state_changed',
+      state: 'running',
+      uuid: 'turn-2',
+      session_id: 'claude-session-1',
+    })
+    expect(started).toEqual([
+      { turn_id: 'turn-1', thread_id: 'claude-session-1' },
+      { turn_id: 'turn-2', thread_id: 'claude-session-1' },
+    ])
+  })
+
   test('routes askUserQuestion dialog through AskUserQuestion permission flow', async () => {
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',

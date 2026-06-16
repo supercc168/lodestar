@@ -32,6 +32,7 @@ mock.module('./feishu', () => ({
     boundResumes.push([sessionName, sessionId, provider])
   },
   bindSessionModel: () => {},
+  provisionProject: () => {},
 }))
 
 const { Session } = await import('./session')
@@ -387,6 +388,28 @@ describe('Session provider switching', () => {
     expect(result.message).toContain('env 生效')
     expect(session.selectedModel).toBe('claude:default')
     expect(proc.killCalls).toBe(0)
+  })
+
+  test('catches synchronous Claude init failure before reporting ready', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', null)
+    const statuses: string[] = []
+    session.selectedProvider = 'claude'
+    session.spawnAgent = () => proc
+    proc.sendInitialize = () => {
+      proc.emit('error', new Error('Claude auth failed'))
+    }
+
+    const ok = await session.start({
+      announce: false,
+      onStatus: status => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(statuses).toContain('❌ Claude 启动失败: Claude auth failed')
+    expect(proc.killCalls).toBe(1)
+    expect(session.proc).toBeNull()
+    expect(session.status).toBe('stopped')
   })
 
 })
