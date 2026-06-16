@@ -101,6 +101,7 @@ Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
 - 跨 provider 切换只允许在空闲/启动边界执行；当前 turn 或排队消息存在时直接拒绝，避免中途切换改变原 turn 调度。
 - 旧后端的迟到 `session_id` / exit 事件不会覆盖当前已选择后端的 `lastSessionId` 或新进程状态。
 - Claude 启动前会显式检查 `claude` 可执行文件；找不到时直接启动失败并提示，不让 session 先进入 ready 再异步报错。
+- Claude streaming-input 后端在首条用户输入前不会发 `init`；Lodestar 启动 Claude 时只等待短暂同步/早期错误，不再把“无输入所以没 init”当启动失败。
 - Claude 不使用 `bypassPermissions`；危险工具调用通过 SDK `canUseTool` 进入现有飞书权限卡路径，避免绕过 Codex 原有审批体验。
 - Codex 控制台和启动消息恢复原显示，不新增 `Codex ·` / `(Codex)` 这类额外标记。
 - `claude:default` 运行中重新选择时只更新 effort，不再尝试给 SDK 设置空模型名。
@@ -119,8 +120,9 @@ Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
 - 构建验证：`bun run build`。
 
 ## Verification Result
-- `bun test`: 107 pass。
+- `bun test`: 112 pass。
 - `bun run build`: daemon / setup / stop / update / version 全部 bundle 成功。
+- Claude init probe: `sendInitialize()` 后无首条输入时 8 秒内没有 stream `init`；`start()` 已改为短暂等待早期错误后 ready，冷启动首条用户消息会先发 input 再由 SDK 触发 init。
 - Claude SDK smoke: 临时目录中连续发送“只回复数字 1”和“只回复数字 2”，中途执行 `setModelSettings("claude:default", "low")` 成功；收到两次 `result subtype=success`，且两次 `session_id` 均为 `1e18c8b5-90f8-452f-a39a-e485e3ec4734`。
 - Claude ask smoke: `claude:glm` 启动时 SDK 日志显示 `model=sonnet`；实际触发 `AskUserQuestion`，自动回答后 assistant 输出 `DONE`，`result subtype=success` 且 `is_error=false`。
 - smoke 结束时本机 Claude 插件的 `SessionEnd` hook 在 stderr 报 `/bin/sh` ENOENT；`/bin/sh` 本机存在，turn 已成功完成。该警告来自外部 Claude 插件 hook，不属于 Lodestar ask/model 路径失败。

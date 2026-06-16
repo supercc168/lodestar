@@ -120,6 +120,10 @@ const CARD_ELEMENT_SOFT_LIMIT = 50
  * Feishu rejects on every card) — without a cap that would spray an
  * endless trail of empty cards into the chat. */
 const MAX_MIDTURN_ROTATES = 5
+/** Claude Agent SDK does not emit stream `init` until the first user input.
+ * Still give synchronous/early startup failures a chance to surface before
+ * presenting the session as ready. */
+const CLAUDE_STARTUP_GRACE_MS = 250
 
 function timedStatus(status: string, startedAt: number): string {
   const elapsedS = Math.max(0, Math.floor((Date.now() - startedAt) / 1000))
@@ -622,19 +626,23 @@ export class Session {
     this.proc = proc
     this.wireProc(this.proc)
     const backend = this.backendLabel()
-    const initTimeoutMs = this.selectedProvider === 'claude' ? 20_000 : 5000
-    const initWait = this.waitForProcInit(this.proc, initTimeoutMs)
-    report?.(`⏳ 等待 ${backend} init`)
+    const initWait = this.selectedProvider === 'claude'
+      ? this.waitForProcEarlyFailure(this.proc, CLAUDE_STARTUP_GRACE_MS)
+      : this.waitForProcInit(this.proc, 5000)
+    report?.(this.selectedProvider === 'claude'
+      ? `⏳ 检查 ${backend} 启动`
+      : `⏳ 等待 ${backend} init`)
     this.proc.sendInitialize()
-    // 等 `system/init` 落地再认定 ready —— sendInitialize 只把 RPC
-    // 写进 app-server/Claude SDK 之前 proc.sessionId 还是 null,这时候
-    // showConsole() 看到 null 会 fallback 到磁盘上**上一次**会话的
-    // lastSessionId,面板就把陈年 thread_id 当成"当前会话"贴出去,
-    // model / usage / contextWindow 也都没值。等 init 之后再返回,
-    // 后续 `hi`、首条 user message 都能拿到真值。Codex 保留既有
-    // 5s 兜底,Claude 必须确认 init 才认 ready。监听必须先于
-    // sendInitialize 注册,否则 Claude wrapper 内同步暴露的启动失败
-    // 会被错过。
+    // Codex: 等 `system/init` 落地再认定 ready —— sendInitialize 只把 RPC
+    // 写进 app-server 之前 proc.sessionId 还是 null,这时候 showConsole()
+    // 看到 null 会 fallback 到磁盘上**上一次**会话的 lastSessionId,
+    // 面板就把陈年 thread_id 当成"当前会话"贴出去。
+    //
+    // Claude: SDK 的 streaming-input 模式在第一条 user message 到达前
+    // 不发 stream `init`。这里不能硬等 init,否则 `hi` 和冷启动首条消息
+    // 都会超时;只短暂等待同步/早期 error 或 exit,首条输入触发的 init
+    // 仍由 wireProc 正常处理。监听必须先于 sendInitialize 注册,否则
+    // Claude wrapper 内同步暴露的启动失败会被错过。
     const init = await initWait
     if (init.state === 'error' || init.state === 'exit') {
       const detail = init.error ? messageOf(init.error) : init.state
@@ -648,17 +656,7 @@ export class Session {
       return false
     }
     if (init.state === 'timeout') {
-      log(`session "${this.sessionName}": ${this.selectedProvider} init wait timeout (${initTimeoutMs / 1000}s)`)
-      if (this.selectedProvider === 'claude') {
-        const message = `${backend} 启动超时: init 未确认`
-        report?.(`❌ ${message}`)
-        if (announce) await feishu.sendText(this.chatId, `❌ ${message}`)
-        await this.proc?.kill(1000).catch(() => {})
-        this.proc = null
-        this.status = 'stopped'
-        this.opts.onLifecycleChange?.()
-        return false
-      }
+      log(`session "${this.sessionName}": ${this.selectedProvider} init wait timeout (5s)`)
       report?.(this.withModel(this.withWorktreeInstructionNotice(`⏳ ${backend} 已启动，init 确认超时`)))
     }
 
@@ -692,6 +690,31 @@ export class Session {
         resolve({ state, error })
       }
       const timer = setTimeout(() => finish('timeout'), timeoutMs)
+      const onInit = () => finish('init')
+      const onError = (e: unknown) => finish('error', e)
+      const onExit = (e: unknown) => finish('exit', e)
+      proc.once('init', onInit)
+      proc.once('error', onError)
+      proc.once('exit', onExit)
+    })
+  }
+
+  private async waitForProcEarlyFailure(
+    proc: AgentProcess,
+    graceMs: number,
+  ): Promise<{ state: 'init' | 'error' | 'exit' | 'ready'; error?: unknown }> {
+    return await new Promise(resolve => {
+      let settled = false
+      const finish = (state: 'init' | 'error' | 'exit' | 'ready', error?: unknown) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        proc.off('init', onInit)
+        proc.off('error', onError)
+        proc.off('exit', onExit)
+        resolve({ state, error })
+      }
+      const timer = setTimeout(() => finish('ready'), graceMs)
       const onInit = () => finish('init')
       const onError = (e: unknown) => finish('error', e)
       const onExit = (e: unknown) => finish('exit', e)
@@ -867,11 +890,15 @@ export class Session {
       this.proc = proc
       this.wireProc(this.proc)
       const backend = this.backendLabel()
-      const initWait = this.waitForProcResumeInit(this.proc, () => {
-        log(`session "${this.sessionName}": ${this.selectedProvider} resume init still pending after ${RESUME_INIT_NOTICE_MS / 1000}s`)
-        report?.(this.withModel(`⏳ 仍在等待 ${backend} init 确认 thread=${prevThreadLabel}…`))
-      })
-      report?.(`⏳ 等待 ${backend} init 确认`)
+      const initWait = this.selectedProvider === 'claude'
+        ? this.waitForProcEarlyFailure(this.proc, CLAUDE_STARTUP_GRACE_MS)
+        : this.waitForProcResumeInit(this.proc, () => {
+            log(`session "${this.sessionName}": ${this.selectedProvider} resume init still pending after ${RESUME_INIT_NOTICE_MS / 1000}s`)
+            report?.(this.withModel(`⏳ 仍在等待 ${backend} init 确认 thread=${prevThreadLabel}…`))
+          })
+      report?.(this.selectedProvider === 'claude'
+        ? `⏳ 检查 ${backend} 恢复启动`
+        : `⏳ 等待 ${backend} init 确认`)
       this.proc.sendInitialize()
       const init = await initWait
       if (init.state === 'error' || init.state === 'exit' || init.state === 'timeout') {
@@ -889,7 +916,11 @@ export class Session {
         await closeInternalStatusCard(finalStatus)
         return false
       }
-      const msg = this.withModel(this.withWorktreeInstructionNotice(`✅ 已恢复上一会话 thread=${prevThreadLabel}…`))
+      const msg = this.withModel(this.withWorktreeInstructionNotice(
+        this.selectedProvider === 'claude' && init.state === 'ready'
+          ? `✅ 已准备恢复上一会话 thread=${prevThreadLabel}…`
+          : `✅ 已恢复上一会话 thread=${prevThreadLabel}…`,
+      ))
       report?.(msg)
       if (announceText) await feishu.sendText(this.chatId, msg)
       this.status = 'idle'

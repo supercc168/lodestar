@@ -412,4 +412,46 @@ describe('Session provider switching', () => {
     expect(session.status).toBe('stopped')
   })
 
+  test('does not require Claude stream init before reporting ready', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', null)
+    const statuses: string[] = []
+    let initializeCalls = 0
+    session.selectedProvider = 'claude'
+    session.spawnAgent = () => proc
+    proc.sendInitialize = () => {
+      initializeCalls++
+    }
+
+    const ok = await session.start({
+      announce: false,
+      onStatus: status => statuses.push(status),
+    })
+
+    expect(ok).toBe(true)
+    expect(initializeCalls).toBe(1)
+    expect(statuses).toContain('✅ Claude 已就绪 · high')
+    expect(proc.killCalls).toBe(0)
+    expect(session.proc).toBe(proc)
+    expect(session.status).toBe('idle')
+  })
+
+  test('sends cold-start Claude user text before stream init exists', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', null)
+    session.selectedProvider = 'claude'
+    session.spawnAgent = () => proc
+
+    try {
+      await session.startColdUserTurn('hello', 'hello', 'ou_user')
+
+      expect(proc.sentTexts).toEqual(['hello'])
+      expect(session.currentTurn).not.toBeNull()
+      expect(session.status).toBe('working')
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      if (session.currentTurn) await cardkit.dispose(session.currentTurn.cardId)
+    }
+  })
+
 })
