@@ -428,7 +428,8 @@ describe('Claude token accounting', () => {
         },
       },
     })
-    expect(proc.lastResult.cost_delta_usd).toBeCloseTo(0.25)
+    expect(proc.lastResult.cost_usd).toBeNull()
+    expect(proc.lastResult.cost_delta_usd).toBeNull()
     proc.handleMessage({
       type: 'result',
       subtype: 'success',
@@ -479,7 +480,8 @@ describe('Claude token accounting', () => {
       total_tokens: 203,
     })
     expect(usageEvents[1].contextWindow).toBe(258000)
-    expect(proc.lastResult.cost_delta_usd).toBeCloseTo(0.06)
+    expect(proc.lastResult.cost_usd).toBeNull()
+    expect(proc.lastResult.cost_delta_usd).toBeNull()
   })
 
   test('uses model_usage alias as authoritative cumulative totals when present', () => {
@@ -526,6 +528,7 @@ describe('Claude token accounting', () => {
       total_tokens: 155,
     })
     expect(usageEvents[0].contextWindow).toBe(200000)
-    expect(proc.lastResult.cost_delta_usd).toBeCloseTo(0.25)
+    expect(proc.lastResult.cost_usd).toBeNull()
+    expect(proc.lastResult.cost_delta_usd).toBeNull()
   })
 })

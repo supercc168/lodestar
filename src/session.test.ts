@@ -233,12 +233,12 @@ describe('Session token accounting', () => {
     })
     expect(session.lastTurnDelta).toEqual({
       tokens: 12,
-      costUsd: 0.03,
+      costUsd: 0,
       durationMs: 1200,
     })
     expect(session.cumStats).toEqual({
       tokens: 12,
-      costUsd: 0.03,
+      costUsd: 0,
       turns: 1,
     })
   })

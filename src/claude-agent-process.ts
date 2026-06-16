@@ -157,11 +157,10 @@ function usageFromSdk(raw: any): CodexUsage | null {
   return out
 }
 
-function totalUsageFromModelUsage(modelUsage: any): { usage: CodexUsage | null; contextWindow: number | null; cost: number | null } {
-  if (!modelUsage || typeof modelUsage !== 'object') return { usage: null, contextWindow: null, cost: null }
+function totalUsageFromModelUsage(modelUsage: any): { usage: CodexUsage | null; contextWindow: number | null } {
+  if (!modelUsage || typeof modelUsage !== 'object') return { usage: null, contextWindow: null }
   const usage: CodexUsage = {}
   let contextWindow: number | null = null
-  let cost: number | null = null
   for (const value of Object.values(modelUsage)) {
     if (!value || typeof value !== 'object') continue
     const item = value as Record<string, unknown>
@@ -178,16 +177,14 @@ function totalUsageFromModelUsage(modelUsage: any): { usage: CodexUsage | null; 
     )
     const ctx = numberField(item.contextWindow ?? item.context_window)
     if (ctx > 0) contextWindow = Math.max(contextWindow ?? 0, ctx)
-    const itemCost = numberField(item.costUSD ?? item.cost_usd)
-    if (itemCost > 0) cost = (cost ?? 0) + itemCost
   }
   const total = (usage.input_tokens ?? 0)
     + (usage.output_tokens ?? 0)
     + (usage.cache_creation_input_tokens ?? 0)
     + (usage.cache_read_input_tokens ?? 0)
-  if (total <= 0) return { usage: null, contextWindow, cost }
+  if (total <= 0) return { usage: null, contextWindow }
   usage.total_tokens = total
-  return { usage, contextWindow, cost }
+  return { usage, contextWindow }
 }
 
 function cloneUsage(usage: CodexUsage): CodexUsage {
@@ -330,7 +327,6 @@ export class ClaudeAgentProcess extends EventEmitter {
   private pendingPermissions = new Map<string, PendingControl>()
   private pendingInjectedContext: string[] = []
   private requestCounter = 0
-  private lastTotalCostUsd: number | null = null
   private cumulativeUsageFromResults: CodexUsage | null = null
   private turnActive = false
   private emittedToolUseIds = new Set<string>()
@@ -790,17 +786,10 @@ export class ClaudeAgentProcess extends EventEmitter {
         turnId: raw.uuid,
       })
     }
-    const totalCost = typeof raw.total_cost_usd === 'number' && Number.isFinite(raw.total_cost_usd)
-      ? raw.total_cost_usd
-      : total.cost
-    const costDelta = totalCost != null
-      ? Math.max(0, totalCost - (this.lastTotalCostUsd ?? 0))
-      : null
-    if (totalCost != null) this.lastTotalCostUsd = totalCost
     const subtype = typeof raw.subtype === 'string' ? raw.subtype : raw.is_error ? 'error' : 'success'
     this.lastResult = {
-      cost_usd: totalCost,
-      cost_delta_usd: costDelta,
+      cost_usd: null,
+      cost_delta_usd: null,
       duration_ms: typeof raw.duration_ms === 'number' ? raw.duration_ms : null,
       num_turns: typeof raw.num_turns === 'number' ? raw.num_turns : 1,
       usage: this.lastUsage,

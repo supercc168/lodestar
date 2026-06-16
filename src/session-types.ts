@@ -109,7 +109,7 @@ export interface SessionOpts {
  * "上一轮" line in the console panel. */
 export interface LastTurnDelta {
   tokens: number | null // input + cache_creation + output for that turn; null 表示口径未知
-  costUsd: number     // 本轮真实成本增量(SDK total_cost_usd 是 session 累计,这里存 delta)
+  costUsd: number     // 可展示的本轮 dollar cost；Claude 后端不展示不可靠金额，固定为 0
   durationMs: number
 }
 

@@ -1619,9 +1619,9 @@ export class Session {
     // 每轮几乎等于全窗口,计进来会让累计虚高一个量级。这里的 usage 是
     // 整个 turn 的绝对总量差值,不是最后一次模型请求的快照。
     const tokens = effectiveTurnTokens(u)
-    // cost 取本进程算好的本轮增量,而非 total_cost_usd 累计值 —— 直接累加
-    // Codex 当前没有逐 turn dollar cost,这里保持 0/null。
-    const costUsd = r.cost_delta_usd ?? 0
+    // Claude subscription/router cost fields are not reliable enough to show
+    // as billing. Keep Claude turns token-only even if the SDK sends dollars.
+    const costUsd = this.proc?.provider === 'claude' ? 0 : r.cost_delta_usd ?? 0
     const durationMs = r.duration_ms ?? 0
     if (tokens != null) this.cumStats.tokens += tokens
     this.cumStats.costUsd += costUsd
