@@ -50,7 +50,7 @@ function toProfile(name: string): ClaudeModelProfile | null {
     opus,
     sonnet,
     haiku,
-    sdkModel: raw.model?.trim() || 'sonnet',
+    sdkModel: raw.model?.trim() || 'opus',
   }
 }
 
@@ -76,11 +76,11 @@ export function claudeModelKey(model: string): string {
 }
 
 export function resolveClaudeSdkModel(model: string | null | undefined): string | undefined {
-  if (!model) return undefined
+  if (!model) return 'opus'
   const profile = claudeModelProfile(model)
   if (profile) return profile.sdkModel
   const stripped = model.startsWith('claude:') ? model.slice('claude:'.length) : model
-  return stripped === 'default' ? undefined : stripped
+  return stripped === 'default' ? 'opus' : stripped
 }
 
 export function resolveClaudeModelEnv(model: string | null | undefined): Record<string, string> {

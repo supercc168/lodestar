@@ -145,9 +145,9 @@ function claudeEffortDescription(effort: ClaudeReasoningEffort): string {
   switch (effort) {
     case 'low': return '低推理强度，响应更快。'
     case 'medium': return '中等推理强度。'
-    case 'high': return '默认推理强度。'
+    case 'high': return '高推理强度。'
     case 'xhigh': return '更高推理强度，适合复杂实现。'
-    case 'max': return '最高推理强度；依赖本机 Claude Code 支持。'
+    case 'max': return '默认最高推理强度；依赖本机 Claude Code 支持。'
   }
 }
 

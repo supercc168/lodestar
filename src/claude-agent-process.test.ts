@@ -38,7 +38,8 @@ describe('Claude model profiles', () => {
   })
 
   test('maps GLM and DeepSeek profiles to SDK model and env tiers', () => {
-    expect(resolveClaudeSdkModel('claude:glm')).toBe('sonnet')
+    expect(resolveClaudeSdkModel('claude:default')).toBe('opus')
+    expect(resolveClaudeSdkModel('claude:glm')).toBe('opus')
     expect(resolveClaudeModelEnv('claude:glm')).toEqual({
       OMC_MODEL_HIGH: '5.2',
       OMC_MODEL_MEDIUM: '5.2',
@@ -48,7 +49,7 @@ describe('Claude model profiles', () => {
       ANTHROPIC_DEFAULT_HAIKU_MODEL: '4.7',
     })
 
-    expect(resolveClaudeSdkModel('claude:deepseek')).toBe('sonnet')
+    expect(resolveClaudeSdkModel('claude:deepseek')).toBe('opus')
     expect(resolveClaudeModelEnv('claude:deepseek')).toEqual({
       OMC_MODEL_HIGH: 'DeepSeekv4pro',
       OMC_MODEL_MEDIUM: 'v4pro',

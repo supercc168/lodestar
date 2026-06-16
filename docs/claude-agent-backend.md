@@ -45,7 +45,7 @@ haiku = "v4flash"
 - `OMC_MODEL_HIGH` / `OMC_MODEL_MEDIUM` / `OMC_MODEL_LOW`
 - `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_SONNET_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL`
 
-主线程 SDK `model` 不直传 `5.2` / `v4pro` 这类上游模型代码，而是传 `sonnet` 档位 alias，让 OMC / Claude Code 按 env 做映射。实际 smoke 证明直传 `5.2` 会返回 “模型不存在”。
+主线程 SDK `model` 不直传 `5.2` / `v4pro` 这类上游模型代码，而是默认传 `opus` 档位 alias，让 OMC / Claude Code 按 env 做映射。实际 smoke 证明直传 `5.2` 会返回 “模型不存在”。
 
 配置字段标准拼写是 `sonnet`；为兼容口头输入，解析器也接受 `sonet`。
 
@@ -90,7 +90,7 @@ Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
 这些差异来自 Claude Agent SDK 能力边界或本机模型路由，不能伪装成 Codex 完全同构：
 
 - 启动时机：Claude SDK 在没有第一条 user input 前不会发 `system/init`，所以 `hi` 启动 Claude 后不会强等 init；首条消息触发 init 和真实 session id。
-- 模型项：Claude 暴露 `claude:default`、`claude:glm`、`claude:deepseek`。GLM/DeepSeek profile 通过 env 做档位映射，SDK 主模型只请求 `sonnet` alias。
+- 模型项：Claude 暴露 `claude:default`、`claude:glm`、`claude:deepseek`。GLM/DeepSeek profile 通过 env 做档位映射，SDK 主模型默认请求 `opus` alias。
 - resume id：Claude `session_id` 与 Codex thread id 分开保存；切换 provider 不共享上下文。
 - compact：Claude SDK 没有 Lodestar 所用的 Codex `thread/compact/start` 等价接口，`compact` 会明确失败并说明不支持。
 - ask：Codex 的 `[[askusr: ...]]` host marker 不给 Claude 使用；Claude 的 ask 来自 SDK `AskUserQuestion` / user-dialog，仍渲染成同一套飞书问答卡。
@@ -106,7 +106,7 @@ Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
 - Codex 控制台和启动消息恢复原显示，不新增 `Codex ·` / `(Codex)` 这类额外标记。
 - `claude:default` 运行中重新选择时只更新 effort，不再尝试给 SDK 设置空模型名。
 - Claude profile 变化需要 env 生效；空闲切换时停止当前 Claude 子进程，下轮按新 env 启动；忙碌时拒绝，避免声称当前进程已切换。
-- `claude:glm` / `claude:deepseek` 的主线程 SDK model 修正为 `sonnet` alias；具体 GLM/DeepSeek 代码只通过 env 传递。
+- `claude:glm` / `claude:deepseek` 的主线程 SDK model 修正为 `opus` alias；具体 GLM/DeepSeek 代码只通过 env 传递。
 - `[[askusr: ...]]` 处理链路加 provider 守卫，Claude 输出同名 marker 不会触发 Codex host ask 卡或续跑。
 - Claude `onUserDialog` 接入现有 `AskUserQuestion` 卡片和 `updatedInput.answers` 回填协议，并修复同步权限回包 race。
 - spawn prompt 按 provider 分开：Codex 继续收到 `[[askusr: ...]]` 说明，Claude 收到 “使用 AskUserQuestion，不要输出 askusr marker”。
@@ -124,5 +124,5 @@ Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
 - `bun run build`: daemon / setup / stop / update / version 全部 bundle 成功。
 - Claude init probe: `sendInitialize()` 后无首条输入时 8 秒内没有 stream `init`；`start()` 已改为短暂等待早期错误后 ready，冷启动首条用户消息会先发 input 再由 SDK 触发 init。
 - Claude SDK smoke: 临时目录中连续发送“只回复数字 1”和“只回复数字 2”，中途执行 `setModelSettings("claude:default", "low")` 成功；收到两次 `result subtype=success`，且两次 `session_id` 均为 `1e18c8b5-90f8-452f-a39a-e485e3ec4734`。
-- Claude ask smoke: `claude:glm` 启动时 SDK 日志显示 `model=sonnet`；实际触发 `AskUserQuestion`，自动回答后 assistant 输出 `DONE`，`result subtype=success` 且 `is_error=false`。
+- Claude ask smoke: `claude:glm` 启动时 SDK 日志显示 `model=opus`；实际触发 `AskUserQuestion`，自动回答后 assistant 输出 `DONE`，`result subtype=success` 且 `is_error=false`。
 - smoke 结束时本机 Claude 插件的 `SessionEnd` hook 在 stderr 报 `/bin/sh` ENOENT；`/bin/sh` 本机存在，turn 已成功完成。该警告来自外部 Claude 插件 hook，不属于 Lodestar ask/model 路径失败。

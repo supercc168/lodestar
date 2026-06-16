@@ -430,7 +430,7 @@ describe('Session provider switching', () => {
 
     expect(ok).toBe(true)
     expect(initializeCalls).toBe(1)
-    expect(statuses).toContain('✅ Claude 已就绪 · high')
+    expect(statuses).toContain('✅ Claude 已就绪 · max')
     expect(proc.killCalls).toBe(0)
     expect(session.proc).toBe(proc)
     expect(session.status).toBe('idle')

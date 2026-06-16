@@ -18,7 +18,7 @@ export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort
 
 export const CLAUDE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
-export const CLAUDE_EFFORT: ClaudeReasoningEffort = 'high'
+export const CLAUDE_EFFORT: ClaudeReasoningEffort = 'max'
 
 export function isClaudeReasoningEffort(value: unknown): value is ClaudeReasoningEffort {
   return typeof value === 'string' && CLAUDE_REASONING_EFFORTS.includes(value as ClaudeReasoningEffort)
