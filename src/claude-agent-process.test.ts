@@ -62,6 +62,109 @@ describe('Claude model profiles', () => {
 })
 
 describe('Claude user dialog bridge', () => {
+  test('emits direct tool call before permission request and resolves allow-always suggestions', async () => {
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp',
+      effort: 'high',
+    }) as any
+    const events: Array<[string, any]> = []
+    const suggestions = [{ toolName: 'Bash', ruleContent: 'echo hi' }]
+    proc.on('tool_use', (event: any) => events.push(['tool_use', event]))
+    proc.on('can_use_tool', (event: any) => events.push(['can_use_tool', event]))
+
+    const resultPromise = proc.onCanUseTool('Bash', { command: 'echo hi' }, {
+      toolUseID: 'tool_perm_1',
+      title: 'Claude wants to run a shell command',
+      suggestions,
+    })
+
+    expect(events.map(([name]) => name)).toEqual(['tool_use', 'can_use_tool'])
+    expect(events[0][1]).toEqual({
+      id: 'tool_perm_1',
+      name: 'Bash',
+      input: {
+        command: 'echo hi',
+        __lodestar_permission_title: 'Claude wants to run a shell command',
+      },
+    })
+    expect(events[1][1]).toMatchObject({
+      request_id: 'claude_perm_1',
+      tool_name: 'Bash',
+      tool_use_id: 'tool_perm_1',
+      permission_suggestions: suggestions,
+    })
+
+    proc.sendPermissionResponse(events[1][1].request_id, 'allow', {
+      updatedPermissions: suggestions,
+    })
+    await expect(resultPromise).resolves.toEqual({
+      behavior: 'allow',
+      updatedInput: {
+        command: 'echo hi',
+        __lodestar_permission_title: 'Claude wants to run a shell command',
+      },
+      updatedPermissions: suggestions,
+    })
+  })
+
+  test('deduplicates assistant tool_use after permission callback pre-emits it', async () => {
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp',
+      effort: 'high',
+    }) as any
+    const toolUses: any[] = []
+    proc.on('tool_use', (event: any) => toolUses.push(event))
+
+    const resultPromise = proc.onCanUseTool('Read', { file_path: '/tmp/a.txt' }, {
+      toolUseID: 'tool_dup_1',
+    })
+    proc.handleMessage({
+      type: 'assistant',
+      uuid: 'assistant-1',
+      message: {
+        model: 'opus',
+        content: [{
+          type: 'tool_use',
+          id: 'tool_dup_1',
+          name: 'Read',
+          input: { file_path: '/tmp/a.txt' },
+        }],
+      },
+    })
+
+    expect(toolUses).toEqual([{
+      id: 'tool_dup_1',
+      name: 'Read',
+      input: { file_path: '/tmp/a.txt' },
+    }])
+    proc.sendPermissionResponse('claude_perm_1', 'deny')
+    await expect(resultPromise).resolves.toMatchObject({
+      behavior: 'deny',
+      message: 'denied by user',
+    })
+  })
+
+  test('accepts alternate tool use id field names from permission context', async () => {
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp',
+      effort: 'high',
+    }) as any
+    const permissions: any[] = []
+    proc.on('can_use_tool', (event: any) => permissions.push(event))
+
+    const resultPromise = proc.onCanUseTool('Edit', { file_path: '/tmp/a.txt' }, {
+      toolUseId: 'tool_alias_1',
+    })
+
+    expect(permissions).toHaveLength(1)
+    expect(permissions[0].tool_use_id).toBe('tool_alias_1')
+    proc.sendPermissionResponse(permissions[0].request_id, 'allow')
+    await expect(resultPromise).resolves.toEqual({
+      behavior: 'allow',
+      updatedInput: { file_path: '/tmp/a.txt' },
+    })
+  })
+
   test('uses session_state_changed running as turn start boundary', () => {
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',

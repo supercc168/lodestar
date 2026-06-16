@@ -49,7 +49,7 @@ export interface AgentProcess extends EventEmitter {
   sendPermissionResponse(
     requestId: string | number,
     decision: 'allow' | 'deny',
-    payload?: { updatedInput?: Record<string, unknown>; denyMessage?: string },
+    payload?: { updatedInput?: Record<string, unknown>; updatedPermissions?: unknown; denyMessage?: string },
   ): void
   sendToolResult(toolUseId: string, content: string, isError?: boolean): void
   sendHookResponse(requestId: string, output?: object): void

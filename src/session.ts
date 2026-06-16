@@ -142,7 +142,7 @@ export class Session {
   // ── package-internal state (touched by session-*.ts helpers) ──
   proc: AgentProcess | null = null
   currentTurn: TurnState | null = null
-  pendingPermissions = new Map<string, { toolUseId: string }>()
+  pendingPermissions = new Map<string, { toolUseId: string; permissionSuggestions?: unknown }>()
   /** Open AskUserQuestion tool calls — keyed by tool_use_id. Codex and
    * Claude both route AskUserQuestion through the can_use_tool flow;
    * we have to thread the permission `requestId` through here so the
@@ -1411,6 +1411,7 @@ export class Session {
       log(`session "${this.sessionName}": ${p.provider} process error: ${err}`)
     })
     p.on('init', () => {
+      this.persistResumableSessionId()
       this.initCount++
       log(`session "${this.sessionName}": SDK init#${this.initCount} pendingCount=${this.pendingUserMessageCount} midBuffer=${this.pendingMidTurnMsgs.length} currentTurn=${this.currentTurn ? 'yes' : 'no'} openingTurn=${this.openingTurn}`)
 
@@ -1474,6 +1475,7 @@ export class Session {
       this.currentTurnUsageBaselineKnown = true
     })
     p.on('token_usage', ({ totalUsage }: TokenUsageUpdated) => {
+      this.persistResumableSessionId()
       if (totalUsage) this.usageTotalsSeedUnknown = false
     })
     p.on('turn_plan_updated', (plan: TurnPlanUpdated) => {
@@ -1518,6 +1520,7 @@ export class Session {
       this.proc?.sendHookResponse(req.request_id, {})
     })
     p.on('result', () => {
+      this.persistResumableSessionId()
       this.accumulateResultStats()
       // User just hit `stop` — this result is the SDK closing the in-flight
       // turn after sendInterrupt landed. The card already shows `🛑 打断`

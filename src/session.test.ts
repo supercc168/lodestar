@@ -344,6 +344,32 @@ describe('Session provider switching', () => {
     expect(session.lastSessionId).toBe('claude-session-1')
   })
 
+  test('persists selected Claude resume id from init before a turn boundary', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-init')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+
+    session.wireProc(proc)
+    proc.emit('init', { session_id: 'claude-session-init' })
+
+    expect(boundResumes).toEqual([['probe', 'claude-session-init', 'claude']])
+    expect(session.lastSessionId).toBe('claude-session-init')
+  })
+
+  test('persists selected Claude resume id from result if turn_started was missed', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-result')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+
+    session.wireProc(proc)
+    proc.emit('result', {})
+
+    expect(boundResumes).toEqual([['probe', 'claude-session-result', 'claude']])
+    expect(session.lastSessionId).toBe('claude-session-result')
+  })
+
   test('rejects cross-provider model switch while a turn is active', async () => {
     const session = new Session('probe', 'chat_id') as any
     session.proc = new FakeAgentProc('codex', 'codex-thread-1')

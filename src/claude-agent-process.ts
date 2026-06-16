@@ -69,15 +69,29 @@ type PendingPermission = {
   kind: 'permission'
   resolve: (value: PermissionResult) => void
   request: CanUseToolRequest
+  cleanup?: () => void
 }
 
 type PendingUserDialog = {
   kind: 'dialog'
   resolve: (value: UserDialogResult) => void
   request: CanUseToolRequest
+  cleanup?: () => void
 }
 
 type PendingControl = PendingPermission | PendingUserDialog
+
+type ClaudeCanUseToolOptions = {
+  suggestions?: any
+  blockedPath?: string
+  toolUseID?: string
+  toolUseId?: string
+  tool_use_id?: string
+  title?: string
+  displayName?: string
+  description?: string
+  signal?: AbortSignal
+}
 
 export interface ClaudeSpawnOpts extends SpawnOpts {
   model?: string
@@ -322,6 +336,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   private lastTotalCostUsd: number | null = null
   private cumulativeUsageFromResults: CodexUsage | null = null
   private turnActive = false
+  private emittedToolUseIds = new Set<string>()
 
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
@@ -428,7 +443,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   sendPermissionResponse(
     requestId: string | number,
     decision: 'allow' | 'deny',
-    payload?: { updatedInput?: Record<string, unknown>; denyMessage?: string },
+    payload?: { updatedInput?: Record<string, unknown>; updatedPermissions?: unknown; denyMessage?: string },
   ): void {
     const pending = this.pendingPermissions.get(String(requestId))
     if (!pending) {
@@ -436,6 +451,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       return
     }
     this.pendingPermissions.delete(String(requestId))
+    pending.cleanup?.()
     if (pending.kind === 'dialog') {
       if (decision === 'allow') {
         const updatedInput = payload?.updatedInput ?? {}
@@ -449,18 +465,16 @@ export class ClaudeAgentProcess extends EventEmitter {
       return
     }
     if (decision === 'allow') {
-      pending.resolve({
+      const result: PermissionResult = {
         behavior: 'allow',
-        updatedInput: payload?.updatedInput,
-        toolUseID: pending.request.tool_use_id,
-        decisionClassification: 'user_temporary',
-      })
+        updatedInput: payload?.updatedInput ?? pending.request.input ?? {},
+      }
+      if (payload?.updatedPermissions !== undefined) result.updatedPermissions = payload.updatedPermissions as any
+      pending.resolve(result)
     } else {
       pending.resolve({
         behavior: 'deny',
         message: payload?.denyMessage ?? 'denied by user',
-        toolUseID: pending.request.tool_use_id,
-        decisionClassification: 'user_reject',
       })
     }
   }
@@ -534,24 +548,49 @@ export class ClaudeAgentProcess extends EventEmitter {
   private onCanUseTool(
     toolName: string,
     input: Record<string, unknown>,
-    options: { suggestions?: any; blockedPath?: string; toolUseID?: string; title?: string; description?: string },
+    options: ClaudeCanUseToolOptions,
   ): Promise<PermissionResult> {
     const requestId = `claude_perm_${++this.requestCounter}`
+    const requestInput = {
+      ...input,
+      ...(options.title ? { __lodestar_permission_title: options.title } : {}),
+      ...(options.displayName ? { __lodestar_permission_display_name: options.displayName } : {}),
+      ...(options.description ? { __lodestar_permission_description: options.description } : {}),
+    }
+    const rawToolUseId = firstString(options.toolUseID, options.toolUseId, options.tool_use_id)
+    const toolUseId = rawToolUseId ?? requestId
+    if (!rawToolUseId) {
+      log(`claude-agent-process: canUseTool missing toolUseID for ${toolName}; using ${toolUseId}`)
+    }
     const req: CanUseToolRequest = {
       request_id: requestId,
       tool_name: toolName,
-      input: {
-        ...input,
-        ...(options.title ? { __lodestar_permission_title: options.title } : {}),
-        ...(options.description ? { __lodestar_permission_description: options.description } : {}),
-      },
+      input: requestInput,
       permission_suggestions: options.suggestions,
       blocked_paths: options.blockedPath ? [options.blockedPath] : undefined,
-      tool_use_id: options.toolUseID,
+      tool_use_id: toolUseId,
     }
     const pending = new Promise<PermissionResult>(resolve => {
-      this.pendingPermissions.set(requestId, { kind: 'permission', resolve, request: req })
+      const finish = (value: PermissionResult) => {
+        options.signal?.removeEventListener('abort', abort)
+        resolve(value)
+      }
+      const abort = () => {
+        if (!this.pendingPermissions.delete(requestId)) return
+        finish({
+          behavior: 'deny',
+          message: 'permission request aborted by Claude backend',
+        })
+      }
+      options.signal?.addEventListener('abort', abort, { once: true })
+      this.pendingPermissions.set(requestId, {
+        kind: 'permission',
+        resolve: finish,
+        request: req,
+        cleanup: () => options.signal?.removeEventListener('abort', abort),
+      })
     })
+    this.emitToolUseOnce(toolUseId, toolName, requestInput)
     this.emit('can_use_tool', req)
     return pending
   }
@@ -585,7 +624,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       options.signal.addEventListener('abort', abort, { once: true })
       this.pendingPermissions.set(requestId, { kind: 'dialog', resolve: finish, request: req })
     })
-    this.emit('tool_use', { id: toolUseId, name: 'AskUserQuestion', input })
+    this.emitToolUseOnce(toolUseId, 'AskUserQuestion', input)
     this.emit('can_use_tool', req)
     return pending
   }
@@ -607,6 +646,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.alive = false
     this.turnActive = false
     for (const [id, pending] of this.pendingPermissions) {
+      pending.cleanup?.()
       if (pending.kind === 'dialog') pending.resolve({ behavior: 'cancelled' })
       else pending.resolve({ behavior: 'deny', message: 'Claude backend exited before permission response', toolUseID: pending.request.tool_use_id })
       this.pendingPermissions.delete(id)
@@ -691,9 +731,15 @@ export class ClaudeAgentProcess extends EventEmitter {
         this.emit('assistant_text', { uuid, text: block.text })
         this.emit('assistant_block_stop', { index: uuid })
       } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
-        this.emit('tool_use', { id: block.id, name: block.name, input: block.input ?? {} })
+        this.emitToolUseOnce(block.id, block.name, block.input ?? {})
       }
     }
+  }
+
+  private emitToolUseOnce(id: string, name: string, input: any): void {
+    if (this.emittedToolUseIds.has(id)) return
+    this.emittedToolUseIds.add(id)
+    this.emit('tool_use', { id, name, input })
   }
 
   private handleUserMessage(raw: any): void {

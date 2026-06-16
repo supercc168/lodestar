@@ -41,7 +41,10 @@ export async function onPermissionDecision(
   }
 
   const codexDecision = decision === 'deny' ? 'deny' : 'allow'
-  s.proc?.sendPermissionResponse(requestId, codexDecision)
+  log(`session "${s.sessionName}": permission decision request=${requestId} tool_use_id=${pending.toolUseId} decision=${decision}`)
+  s.proc?.sendPermissionResponse(requestId, codexDecision, decision === 'allow_always'
+    ? { updatedPermissions: pending.permissionSuggestions }
+    : undefined)
 
   if (s.pendingPermissions.size === 0 && s.status === 'awaiting_permission') {
     s.status = 'working'
@@ -107,7 +110,8 @@ export function renderPermission(s: Session, req: CanUseToolRequest): void {
     return
   }
   s.status = 'awaiting_permission'
-  s.pendingPermissions.set(req.request_id, { toolUseId })
+  s.pendingPermissions.set(req.request_id, { toolUseId, permissionSuggestions: req.permission_suggestions })
+  log(`session "${s.sessionName}": can_use_tool request=${req.request_id} tool_use_id=${toolUseId} tool=${meta.name}`)
   const el = cards.toolCallPermissionElement(meta.i, meta.name, meta.input, req.request_id)
   void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
   // Phone push — Codex is blocked until the user approves/denies.

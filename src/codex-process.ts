@@ -817,7 +817,7 @@ export class CodexProcess extends EventEmitter {
   sendPermissionResponse(
     requestId: string | number,
     decision: 'allow' | 'deny',
-    payload?: { updatedInput?: Record<string, unknown>; denyMessage?: string },
+    payload?: { updatedInput?: Record<string, unknown>; updatedPermissions?: unknown; denyMessage?: string },
   ): void {
     const req = this.serverRequests.get(String(requestId))
     if (!req) {
