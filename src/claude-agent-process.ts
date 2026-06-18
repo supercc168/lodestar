@@ -83,6 +83,11 @@ type PendingUserDialog = {
 
 type PendingControl = PendingPermission | PendingUserDialog
 
+type PendingServerToolInput = {
+  name: string
+  input: unknown
+}
+
 type ClaudeCanUseToolOptions = {
   suggestions?: any
   blockedPath?: string
@@ -267,6 +272,18 @@ function sanitizeServerToolInput(input: unknown): unknown {
   return input
 }
 
+function serverToolInputFromScaffoldText(text: string): PendingServerToolInput | null {
+  const name = text.match(/Built-in Tool:\s*([A-Za-z0-9_.:-]+)/)?.[1]
+  if (!name) return null
+  const inputText = text.match(/\*\*Input:\*\*\s*```(?:json)?\s*([\s\S]*?)```/)?.[1]?.trim()
+  if (!inputText) return { name, input: {} }
+  try {
+    return { name, input: sanitizeServerToolInput(JSON.parse(inputText)) }
+  } catch {
+    return { name, input: { raw: sanitizeServerToolInput(inputText) } }
+  }
+}
+
 function isServerToolScaffoldText(text: string): boolean {
   const trimmed = text.trim()
   return trimmed.includes('Built-in Tool:')
@@ -374,6 +391,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   private turnActive = false
   private emittedToolUseIds = new Set<string>()
   private emittedToolResultIds = new Set<string>()
+  private pendingServerToolInputs: PendingServerToolInput[] = []
 
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
@@ -766,6 +784,11 @@ export class ClaudeAgentProcess extends EventEmitter {
     for (const block of content) {
       if (!block || typeof block !== 'object') continue
       if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
+        const pendingServerToolInput = serverToolInputFromScaffoldText(block.text)
+        if (pendingServerToolInput) {
+          this.pendingServerToolInputs.push(pendingServerToolInput)
+          if (this.pendingServerToolInputs.length > 20) this.pendingServerToolInputs.shift()
+        }
         if (isServerToolScaffoldText(block.text)) continue
         const uuid = raw.uuid ?? message?.id
         this.emit('assistant_text', { uuid, text: block.text })
@@ -775,7 +798,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       } else if (block.type === 'server_tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
         this.emitToolUseOnce(block.id, serverToolName(block.name), {
           tool: block.name,
-          input: sanitizeServerToolInput(block.input ?? {}),
+          input: this.serverToolInput(block.name, block.input ?? {}),
         })
       } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
         this.emitToolResultOnce(
@@ -791,6 +814,24 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (this.emittedToolUseIds.has(id)) return
     this.emittedToolUseIds.add(id)
     this.emit('tool_use', { id, name, input })
+  }
+
+  private serverToolInput(name: string, rawInput: unknown): unknown {
+    const structuredInput = sanitizeServerToolInput(rawInput)
+    if (
+      structuredInput &&
+      typeof structuredInput === 'object' &&
+      !Array.isArray(structuredInput) &&
+      Object.keys(structuredInput as Record<string, unknown>).length > 0
+    ) {
+      return structuredInput
+    }
+    const idx = this.pendingServerToolInputs.findIndex(item => item.name === name)
+    if (idx >= 0) {
+      const [item] = this.pendingServerToolInputs.splice(idx, 1)
+      return item.input
+    }
+    return structuredInput
   }
 
   private emitToolResultOnce(toolUseId: string, content: string, isError: boolean): void {

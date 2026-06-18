@@ -320,7 +320,7 @@ describe('Claude user dialog bridge', () => {
         model: 'opus',
         content: [{
           type: 'text',
-          text: '**🌐 Z.ai Built-in Tool: analyze_image**\n\n**Input:**\n```json\n{"imageSource":"https://signed.example/img"}\n```',
+          text: '**🌐 Z.ai Built-in Tool: analyze_image**\n\n**Input:**\n```json\n{"imageSource":"https://signed.example/img","prompt":"识别截图内容"}\n```',
         }],
       },
     })
@@ -333,7 +333,7 @@ describe('Claude user dialog bridge', () => {
           type: 'server_tool_use',
           id: 'call_image_1',
           name: 'analyze_image',
-          input: { imageSource: 'https://signed.example/img' },
+          input: {},
         }],
       },
     })
@@ -371,7 +371,10 @@ describe('Claude user dialog bridge', () => {
         name: 'server_tool:analyze_image',
         input: {
           tool: 'analyze_image',
-          input: { imageSource: '<url-redacted>' },
+          input: {
+            imageSource: '<url-redacted>',
+            prompt: '识别截图内容',
+          },
         },
       }],
       ['tool_result', {

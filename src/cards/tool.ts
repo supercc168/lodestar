@@ -827,10 +827,14 @@ function renderServerSideToolBody(name: string, input: any, output: string | nul
     `**tool**: ${inlineCode(typeof input?.tool === 'string' && input.tool ? input.tool : serverSideToolName(name))}`,
   ]
   const rawInput = input?.input
-  if (rawInput && typeof rawInput === 'object' && Object.keys(rawInput).length > 0) {
+  if (rawInput && typeof rawInput === 'object') {
     lines.push('')
     lines.push('**input**')
-    lines.push(jsonBlock(rawInput, 2000))
+    if (Object.keys(rawInput).length > 0) {
+      lines.push(jsonBlock(rawInput, 2000))
+    } else {
+      lines.push('_provider 未提供结构化 input_')
+    }
   } else if (rawInput != null && rawInput !== '') {
     lines.push(`**input**: ${inlineCode(rawInput)}`)
   }

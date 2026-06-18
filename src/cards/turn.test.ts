@@ -778,22 +778,39 @@ describe('other tool card rendering', () => {
   test('renders provider server tools as collapsed tool panels', () => {
     const input = {
       tool: 'analyze_image',
-      input: { imageSource: '<url-redacted>' },
+      input: {
+        imageSource: '<url-redacted>',
+        prompt: '识别截图内容',
+      },
     }
 
-    expect(summarizeToolInput('server_tool:analyze_image', input)).toBe('analyze_image: <url-redacted>')
+    expect(summarizeToolInput('server_tool:analyze_image', input)).toBe('analyze_image: 识别截图内容')
 
     const el = toolCallElement(7, 'server_tool:analyze_image', input, '完整识图结果', '✅') as any
     const body = el.elements[0].content
 
     expect(el.tag).toBe('collapsible_panel')
     expect(el.expanded).toBe(false)
-    expect(el.header.title.content).toBe('✅ 🔧 服务端工具: analyze_image: <url-redacted>')
+    expect(el.header.title.content).toBe('✅ 🔧 服务端工具: analyze_image: 识别截图内容')
     expect(body).toContain('**类型**: 模型服务端内置工具')
     expect(body).toContain('**tool**: `analyze_image`')
     expect(body).toContain('"imageSource": "<url-redacted>"')
+    expect(body).toContain('"prompt": "识别截图内容"')
     expect(body).toContain('完整识图结果')
     expect(body).not.toContain('"tool": "analyze_image"')
+  })
+
+  test('renders empty provider server tool input without object coercion', () => {
+    const input = {
+      tool: 'analyze_image',
+      input: {},
+    }
+
+    const el = toolCallElement(7, 'server_tool:analyze_image', input, null, '⏳') as any
+    const body = el.elements[0].content
+
+    expect(body).toContain('_provider 未提供结构化 input_')
+    expect(body).not.toContain('[object Object]')
   })
 
   test('renders image generation without generic JSON panels', () => {
