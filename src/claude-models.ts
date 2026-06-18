@@ -9,15 +9,21 @@ export interface ClaudeModelProfile {
   sonnet: string
   haiku: string
   sdkModel: string
+  contextWindow: number | null
 }
 
-const DEFAULT_CLAUDE_MODELS: Record<string, Required<Pick<ClaudeModelConfig, 'display_name' | 'description' | 'opus' | 'sonnet' | 'haiku'>>> = {
+type DefaultClaudeModelConfig = Required<
+  Pick<ClaudeModelConfig, 'display_name' | 'description' | 'opus' | 'sonnet' | 'haiku'>
+> & Pick<ClaudeModelConfig, 'context_window'>
+
+const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
   glm: {
     display_name: 'Claude Code · GLM',
     description: '使用 GLM 路由，适合中文交流和通用编码任务。',
     opus: '5.2',
     sonnet: '5.2',
     haiku: '4.7',
+    context_window: '1000000',
   },
   deepseek: {
     display_name: 'Claude Code · DeepSeek',
@@ -33,6 +39,14 @@ function mergedConfig(name: string): ClaudeModelConfig {
     ...(DEFAULT_CLAUDE_MODELS[name] ?? {}),
     ...(config.claude.models[name] ?? {}),
   }
+}
+
+function parseContextWindow(value: string | undefined): number | null {
+  if (!value) return null
+  const normalized = value.trim().replace(/_/g, '')
+  if (!normalized) return null
+  const n = Number.parseInt(normalized, 10)
+  return Number.isFinite(n) && n > 0 ? n : null
 }
 
 function toProfile(name: string): ClaudeModelProfile | null {
@@ -51,6 +65,7 @@ function toProfile(name: string): ClaudeModelProfile | null {
     sonnet,
     haiku,
     sdkModel: raw.model?.trim() || 'opus',
+    contextWindow: parseContextWindow(raw.context_window),
   }
 }
 
@@ -81,6 +96,10 @@ export function resolveClaudeSdkModel(model: string | null | undefined): string 
   if (profile) return profile.sdkModel
   const stripped = model.startsWith('claude:') ? model.slice('claude:'.length) : model
   return stripped === 'default' ? 'opus' : stripped
+}
+
+export function resolveClaudeContextWindow(model: string | null | undefined): number | null {
+  return claudeModelProfile(model)?.contextWindow ?? null
 }
 
 export function resolveClaudeModelEnv(model: string | null | undefined): Record<string, string> {

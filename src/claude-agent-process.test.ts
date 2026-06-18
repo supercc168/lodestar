@@ -18,6 +18,7 @@ const {
   ClaudeAgentProcess,
 } = await import('./claude-agent-process')
 const {
+  resolveClaudeContextWindow,
   resolveClaudeModelEnv,
   resolveClaudeSdkModel,
 } = await import('./claude-models')
@@ -42,6 +43,7 @@ describe('Claude model profiles', () => {
   test('maps GLM and DeepSeek profiles to SDK model and env tiers', () => {
     expect(resolveClaudeSdkModel('claude:default')).toBe('opus')
     expect(resolveClaudeSdkModel('claude:glm')).toBe('opus')
+    expect(resolveClaudeContextWindow('claude:glm')).toBe(1_000_000)
     expect(resolveClaudeModelEnv('claude:glm')).toEqual({
       OMC_MODEL_HIGH: '5.2',
       OMC_MODEL_MEDIUM: '5.2',
@@ -52,6 +54,7 @@ describe('Claude model profiles', () => {
     })
 
     expect(resolveClaudeSdkModel('claude:deepseek')).toBe('opus')
+    expect(resolveClaudeContextWindow('claude:deepseek')).toBeNull()
     expect(resolveClaudeModelEnv('claude:deepseek')).toEqual({
       OMC_MODEL_HIGH: 'DeepSeekv4pro',
       OMC_MODEL_MEDIUM: 'v4pro',
@@ -530,5 +533,39 @@ describe('Claude token accounting', () => {
     expect(usageEvents[0].contextWindow).toBe(200000)
     expect(proc.lastResult.cost_usd).toBeNull()
     expect(proc.lastResult.cost_delta_usd).toBeNull()
+  })
+
+  test('uses Claude profile context window over SDK router defaults', () => {
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp',
+      effort: 'high',
+      model: 'claude:glm',
+    }) as any
+    const usageEvents: any[] = []
+    proc.on('token_usage', (event: any) => usageEvents.push(event))
+
+    proc.handleMessage({
+      type: 'result',
+      subtype: 'success',
+      uuid: 'result-glm-router-window',
+      session_id: 'claude-session-1',
+      is_error: false,
+      duration_ms: 10,
+      num_turns: 1,
+      usage: { input_tokens: 87_000, output_tokens: 700 },
+      modelUsage: {
+        opus: {
+          inputTokens: 87_000,
+          outputTokens: 700,
+          cacheCreationInputTokens: 0,
+          cacheReadInputTokens: 0,
+          contextWindow: 100_000,
+        },
+      },
+    })
+
+    expect(usageEvents).toHaveLength(1)
+    expect(usageEvents[0].contextWindow).toBe(1_000_000)
+    expect(proc.lastContextWindow).toBe(1_000_000)
   })
 })

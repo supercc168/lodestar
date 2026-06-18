@@ -55,6 +55,7 @@ export interface ClaudeModelConfig {
   sonet?: string
   haiku?: string
   model?: string
+  context_window?: string
 }
 
 function expandTilde(v: string): string {
@@ -143,7 +144,8 @@ function loadConfig(): LodestarConfig {
           field === 'sonnet' ||
           field === 'sonet' ||
           field === 'haiku' ||
-          field === 'model'
+          field === 'model' ||
+          field === 'context_window'
         ) {
           ;(profile as Record<string, string>)[field] = value
         }

@@ -23,6 +23,7 @@ import {
 } from './agent-process'
 import {
   claudeModelKey,
+  resolveClaudeContextWindow,
   resolveClaudeModelEnv,
   resolveClaudeSdkModel,
 } from './claude-models'
@@ -776,7 +777,15 @@ export class ClaudeAgentProcess extends EventEmitter {
     } else {
       this.lastTotalUsage = this.cumulativeUsageFromResults ? cloneUsage(this.cumulativeUsageFromResults) : null
     }
-    this.lastContextWindow = total.contextWindow
+    const profileContextWindow = resolveClaudeContextWindow(this.opts.model)
+    this.lastContextWindow = profileContextWindow ?? total.contextWindow
+    if (
+      profileContextWindow != null &&
+      total.contextWindow != null &&
+      profileContextWindow !== total.contextWindow
+    ) {
+      log(`claude-agent-process: override SDK contextWindow ${total.contextWindow} with profile ${profileContextWindow} for model=${this.opts.model ?? 'default'}`)
+    }
     if (this.lastTotalUsage || this.lastUsage) {
       this.emit('token_usage', {
         usage: this.lastUsage,
