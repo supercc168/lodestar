@@ -294,6 +294,67 @@ describe('Claude user dialog bridge', () => {
       result: { 'Pick one?': 'A' },
     })
   })
+
+  test('bridges provider server tools and suppresses scaffold text', () => {
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp',
+      effort: 'high',
+    }) as any
+    const events: Array<[string, any]> = []
+    proc.on('assistant_text', (event: any) => events.push(['assistant_text', event]))
+    proc.on('tool_use', (event: any) => events.push(['tool_use', event]))
+    proc.on('tool_result', (event: any) => events.push(['tool_result', event]))
+
+    proc.handleMessage({
+      type: 'assistant',
+      uuid: 'assistant-server-tool',
+      message: {
+        model: 'opus',
+        content: [
+          { type: 'text', text: '我用视觉分析工具来看这两张图。' },
+          {
+            type: 'text',
+            text: '**🌐 Z.ai Built-in Tool: analyze_image**\n\n**Input:**\n```json\n{"imageSource":"https://signed.example/img"}\n```',
+          },
+          {
+            type: 'server_tool_use',
+            id: 'call_image_1',
+            name: 'analyze_image',
+            input: { imageSource: 'https://signed.example/img' },
+          },
+          {
+            type: 'text',
+            text: '**Output:**\n**analyze_image_result_summary:** [{"text":"完整识图结果"}]',
+          },
+          {
+            type: 'tool_result',
+            tool_use_id: 'call_image_1',
+            content: '["完整识图结果"]',
+          },
+        ],
+      },
+    })
+
+    expect(events).toEqual([
+      ['assistant_text', {
+        uuid: 'assistant-server-tool',
+        text: '我用视觉分析工具来看这两张图。',
+      }],
+      ['tool_use', {
+        id: 'call_image_1',
+        name: 'server_tool:analyze_image',
+        input: {
+          tool: 'analyze_image',
+          input: { imageSource: '<url-redacted>' },
+        },
+      }],
+      ['tool_result', {
+        tool_use_id: 'call_image_1',
+        content: '完整识图结果',
+        is_error: false,
+      }],
+    ])
+  })
 })
 
 describe('Claude token accounting', () => {

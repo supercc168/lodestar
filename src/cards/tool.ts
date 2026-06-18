@@ -72,7 +72,18 @@ function isExitPlanModeTool(name: string): boolean {
   return name === 'ExitPlanMode'
 }
 
+const SERVER_TOOL_PREFIX = 'server_tool:'
+
+function isServerSideTool(name: string): boolean {
+  return name.startsWith(SERVER_TOOL_PREFIX)
+}
+
+function serverSideToolName(name: string): string {
+  return isServerSideTool(name) ? name.slice(SERVER_TOOL_PREFIX.length) : name
+}
+
 export function displayToolName(name: string): string {
+  if (isServerSideTool(name)) return '服务端工具'
   if (isFileChangeTool(name)) return '文件变更'
   if (isWebSearchTool(name)) return '网页搜索'
   if (isWebFetchTool(name)) return '网页读取'
@@ -91,8 +102,9 @@ export function displayToolName(name: string): string {
 
 /** Single-line summary used as a collapsible-panel header for a tool call. */
 export function summarizeToolInput(name: string, input: any): string {
-  if (!input || typeof input !== 'object') return ''
   const truncate = (s: string, n: number) => s.length > n ? s.slice(0, n) + '…' : s
+  if (isServerSideTool(name)) return truncate(summarizeServerSideToolInput(name, input), 80)
+  if (!input || typeof input !== 'object') return ''
   if (isBashCommandTool(name)) return summarizeBashInput(input)
   if (isShellSessionTool(name)) return summarizeShellSessionInput(input)
   if (isFileChangeTool(name)) return truncate(summarizeFileChangeInput(input), 80)
@@ -116,6 +128,14 @@ export function summarizeToolInput(name: string, input: any): string {
     if (typeof v === 'string' && v) return truncate(v, 80)
   }
   return ''
+}
+
+function summarizeServerSideToolInput(name: string, input: any): string {
+  const tool = typeof input?.tool === 'string' && input.tool
+    ? input.tool
+    : serverSideToolName(name)
+  const detail = firstStringField(input?.input)
+  return detail ? `${tool}: ${detail}` : tool
 }
 
 function summarizeBashInput(input: any): string {
@@ -801,6 +821,32 @@ function renderMcpBody(input: any, output: string | null, resolvedNote?: string)
   return lines.length > 0 ? lines.join('\n') : jsonBlock(input ?? {}, 2000)
 }
 
+function renderServerSideToolBody(name: string, input: any, output: string | null, resolvedNote?: string): string {
+  const lines: string[] = [
+    `**类型**: 模型服务端内置工具`,
+    `**tool**: ${inlineCode(typeof input?.tool === 'string' && input.tool ? input.tool : serverSideToolName(name))}`,
+  ]
+  const rawInput = input?.input
+  if (rawInput && typeof rawInput === 'object' && Object.keys(rawInput).length > 0) {
+    lines.push('')
+    lines.push('**input**')
+    lines.push(jsonBlock(rawInput, 2000))
+  } else if (rawInput != null && rawInput !== '') {
+    lines.push(`**input**: ${inlineCode(rawInput)}`)
+  }
+  if (resolvedNote) {
+    lines.push('')
+    lines.push(resolvedNote)
+  }
+  if (output != null) {
+    lines.push('')
+    lines.push('---')
+    lines.push('**结果**')
+    lines.push(outputPreviewBlock(output, 3000))
+  }
+  return lines.join('\n')
+}
+
 function summarizeImageGenerationInput(input: any): string {
   const prompt = typeof input?.revisedPrompt === 'string' ? input.revisedPrompt : ''
   const status = typeof input?.status === 'string' ? input.status : ''
@@ -890,35 +936,37 @@ export function toolCallElement(
     ? renderBashBody(input, output, resolvedNote)
     : isShellSessionTool(name)
       ? renderShellSessionBody(input, output, resolvedNote)
-      : isFileChangeTool(name)
-        ? renderFileChangeBody(input, output, resolvedNote)
-        : isWebSearchTool(name)
-          ? renderWebSearchBody(input, output, resolvedNote)
-          : isWebFetchTool(name)
-            ? renderWebFetchBody(input, output, resolvedNote)
-            : isMcpTool(name)
-              ? renderMcpBody(input, output, resolvedNote)
-              : isImageGenerationTool(name)
-                ? renderImageGenerationBody(input, output, resolvedNote)
-                : isFileReadTool(name)
-                  ? renderReadBody(input, output, resolvedNote)
-                  : isFileWriteTool(name)
-                    ? renderWriteBody(input, output, resolvedNote)
-                    : isFileEditTool(name)
-                      ? renderEditBody(input, output, resolvedNote)
-                      : isFileMultiEditTool(name)
-                        ? renderMultiEditBody(input, output, resolvedNote)
-                        : isPathSearchTool(name)
-                          ? renderPathSearchBody(name, input, output, resolvedNote)
-                          : isTodoTool(name)
-                            ? renderTodoBody(input, output, resolvedNote)
-                            : isExitPlanModeTool(name)
-                              ? renderAgentBody({ prompt: firstStringField(input) || '提交计划' }, output, resolvedNote)
-                              : isAgentTool(name)
-                                ? renderAgentBody(input, output, resolvedNote)
-                                : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
-                                  + noteBlock
-                                  + (output != null ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```' : '')
+      : isServerSideTool(name)
+        ? renderServerSideToolBody(name, input, output, resolvedNote)
+        : isFileChangeTool(name)
+          ? renderFileChangeBody(input, output, resolvedNote)
+          : isWebSearchTool(name)
+            ? renderWebSearchBody(input, output, resolvedNote)
+            : isWebFetchTool(name)
+              ? renderWebFetchBody(input, output, resolvedNote)
+              : isMcpTool(name)
+                ? renderMcpBody(input, output, resolvedNote)
+                : isImageGenerationTool(name)
+                  ? renderImageGenerationBody(input, output, resolvedNote)
+                  : isFileReadTool(name)
+                    ? renderReadBody(input, output, resolvedNote)
+                    : isFileWriteTool(name)
+                      ? renderWriteBody(input, output, resolvedNote)
+                      : isFileEditTool(name)
+                        ? renderEditBody(input, output, resolvedNote)
+                        : isFileMultiEditTool(name)
+                          ? renderMultiEditBody(input, output, resolvedNote)
+                          : isPathSearchTool(name)
+                            ? renderPathSearchBody(name, input, output, resolvedNote)
+                            : isTodoTool(name)
+                              ? renderTodoBody(input, output, resolvedNote)
+                              : isExitPlanModeTool(name)
+                                ? renderAgentBody({ prompt: firstStringField(input) || '提交计划' }, output, resolvedNote)
+                                : isAgentTool(name)
+                                  ? renderAgentBody(input, output, resolvedNote)
+                                  : '```\n' + JSON.stringify(input ?? {}, null, 2).slice(0, 2000) + '\n```'
+                                    + noteBlock
+                                    + (output != null ? '\n---\n**output:**\n```\n' + output.slice(0, 3000) + '\n```' : '')
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),

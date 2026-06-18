@@ -231,6 +231,48 @@ function textFromToolResultContent(content: unknown): string {
   return content == null ? '' : JSON.stringify(content, null, 2)
 }
 
+function textFromServerToolResultContent(content: unknown): string {
+  const text = textFromToolResultContent(content)
+  try {
+    const parsed = JSON.parse(text)
+    if (Array.isArray(parsed)) {
+      const parts = parsed.map(item => {
+        if (typeof item === 'string') return item
+        if (item && typeof item === 'object' && typeof item.text === 'string') return item.text
+        return JSON.stringify(item)
+      }).filter(Boolean)
+      if (parts.length > 0) return parts.join('\n')
+    }
+  } catch {
+    // Provider server-tool output is often a JSON string array, but plain
+    // text is valid too. Keep the original text when it is not JSON.
+  }
+  return text
+}
+
+function serverToolName(name: string): string {
+  return `server_tool:${name}`
+}
+
+function sanitizeServerToolInput(input: unknown): unknown {
+  if (typeof input === 'string') return input.replace(/https?:\/\/[^\s"'`<>]+/g, '<url-redacted>')
+  if (Array.isArray(input)) return input.map(item => sanitizeServerToolInput(item))
+  if (input && typeof input === 'object') {
+    const out: Record<string, unknown> = {}
+    for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
+      out[key] = sanitizeServerToolInput(value)
+    }
+    return out
+  }
+  return input
+}
+
+function isServerToolScaffoldText(text: string): boolean {
+  const trimmed = text.trim()
+  return trimmed.includes('Built-in Tool:')
+    || (trimmed.startsWith('**Output:**') && trimmed.includes('_result'))
+}
+
 function mapModelInfo(info: ModelInfo): CodexModel {
   const efforts = info.supportedEffortLevels && info.supportedEffortLevels.length > 0
     ? info.supportedEffortLevels
@@ -331,6 +373,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   private cumulativeUsageFromResults: CodexUsage | null = null
   private turnActive = false
   private emittedToolUseIds = new Set<string>()
+  private emittedToolResultIds = new Set<string>()
 
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
@@ -720,14 +763,31 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (typeof raw.uuid === 'string') this.lastAssistantUuid = raw.uuid
     if (typeof message?.model === 'string' && message.model) this.lastModel = claudeModelKey(message.model)
     const content = Array.isArray(message?.content) ? message.content : []
+    const hasServerToolBlocks = content.some(block =>
+      block && typeof block === 'object' && (
+        block.type === 'server_tool_use' || block.type === 'tool_result'
+      ),
+    )
     for (const block of content) {
       if (!block || typeof block !== 'object') continue
       if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
+        if (hasServerToolBlocks && isServerToolScaffoldText(block.text)) continue
         const uuid = raw.uuid ?? message?.id
         this.emit('assistant_text', { uuid, text: block.text })
         this.emit('assistant_block_stop', { index: uuid })
       } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
         this.emitToolUseOnce(block.id, block.name, block.input ?? {})
+      } else if (block.type === 'server_tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
+        this.emitToolUseOnce(block.id, serverToolName(block.name), {
+          tool: block.name,
+          input: sanitizeServerToolInput(block.input ?? {}),
+        })
+      } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
+        this.emitToolResultOnce(
+          block.tool_use_id,
+          textFromServerToolResultContent(block.content),
+          block.is_error === true,
+        )
       }
     }
   }
@@ -736,6 +796,16 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (this.emittedToolUseIds.has(id)) return
     this.emittedToolUseIds.add(id)
     this.emit('tool_use', { id, name, input })
+  }
+
+  private emitToolResultOnce(toolUseId: string, content: string, isError: boolean): void {
+    if (this.emittedToolResultIds.has(toolUseId)) return
+    this.emittedToolResultIds.add(toolUseId)
+    this.emit('tool_result', {
+      tool_use_id: toolUseId,
+      content,
+      is_error: isError,
+    })
   }
 
   private handleUserMessage(raw: any): void {
@@ -750,11 +820,7 @@ export class ClaudeAgentProcess extends EventEmitter {
             typeof toolResult.stderr === 'string' ? toolResult.stderr : '',
           ].filter(Boolean).join('\n')
         : textFromToolResultContent(block.content)
-      this.emit('tool_result', {
-        tool_use_id: block.tool_use_id,
-        content: output,
-        is_error: block.is_error === true || toolResult?.interrupted === true,
-      })
+      this.emitToolResultOnce(block.tool_use_id, output, block.is_error === true || toolResult?.interrupted === true)
     }
   }
 

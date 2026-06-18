@@ -775,6 +775,27 @@ describe('other tool card rendering', () => {
     expect(body).toContain('**structuredContent**')
   })
 
+  test('renders provider server tools as collapsed tool panels', () => {
+    const input = {
+      tool: 'analyze_image',
+      input: { imageSource: '<url-redacted>' },
+    }
+
+    expect(summarizeToolInput('server_tool:analyze_image', input)).toBe('analyze_image: <url-redacted>')
+
+    const el = toolCallElement(7, 'server_tool:analyze_image', input, '完整识图结果', '✅') as any
+    const body = el.elements[0].content
+
+    expect(el.tag).toBe('collapsible_panel')
+    expect(el.expanded).toBe(false)
+    expect(el.header.title.content).toBe('✅ 🔧 服务端工具: analyze_image: <url-redacted>')
+    expect(body).toContain('**类型**: 模型服务端内置工具')
+    expect(body).toContain('**tool**: `analyze_image`')
+    expect(body).toContain('"imageSource": "<url-redacted>"')
+    expect(body).toContain('完整识图结果')
+    expect(body).not.toContain('"tool": "analyze_image"')
+  })
+
   test('renders image generation without generic JSON panels', () => {
     const input = {
       status: 'completed',
