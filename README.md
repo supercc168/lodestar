@@ -27,7 +27,7 @@ npm i -g @leviyuan/lodestar
 | `lodestar-setup` | 首次配置向导 |
 | `lodestar-daemon` | 启动 daemon |
 | `lodestar-stop` | 停止 daemon |
-| `lodestar-update` | 升级到最新版(含 Codex CLI)|
+| `lodestar-update` | 升级到最新版(含 Codex CLI、Claude Code 和 Claude SDK)|
 | `lodestar-version` | 查看 Lodestar 和 Codex CLI 版本 |
 
 **2. 跑向导**

@@ -2,6 +2,14 @@
 
 面向使用者的简版更新记录。这里只保留你能直接感受到的变化，以及必要的兼容提示；实现细节请看每个版本末尾的 compare 链接。
 
+## v0.10.1 · 2026-06-18
+
+- Windows 设备选择 Claude Code 后端时更可靠：遇到 `claude.cmd` / `claude.bat` 这类 npm shim 不再直接触发 `spawn EINVAL`。
+- 没有全局 `claude` 命令时，会交给 Claude Agent SDK 自带的本机二进制处理；真实缺失时会暴露 SDK 的具体错误。
+- `lodestar-update` 现在会同时升级 Claude Code、Claude Agent SDK 和 Anthropic SDK，不再只更新 Lodestar 与 Codex CLI。
+
+**Full Changelog**: https://github.com/leviyuan/lodestar/compare/v0.10.0...v0.10.1
+
 ## v0.10.0 · 2026-06-18
 
 - `model` 面板新增 Claude Code 后端，可在保留 Codex 的同时选择本机 Claude 配置、GLM 或 DeepSeek 路由。

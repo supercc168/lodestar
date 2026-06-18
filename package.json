@@ -1,6 +1,6 @@
 {
   "name": "@leviyuan/lodestar",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "publishConfig": {
     "access": "public"
   },
@@ -55,7 +55,7 @@
     "node": ">=18"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "0.3.178",
+    "@anthropic-ai/claude-agent-sdk": "^0.3.181",
     "@anthropic-ai/sdk": "^0.104.2",
     "@larksuiteoapi/node-sdk": "^1.64.0",
     "@modelcontextprotocol/sdk": "^1.29.0",

@@ -1,5 +1,5 @@
 import { homedir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { delimiter, join, win32 } from 'node:path'
 import { describe, expect, mock, test } from 'bun:test'
 
 mock.module('./config', () => ({
@@ -16,6 +16,7 @@ const {
   CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS,
   CLAUDE_PERMISSION_MODE,
   ClaudeAgentProcess,
+  resolveClaudeExecutableConfig,
 } = await import('./claude-agent-process')
 const {
   resolveClaudeContextWindow,
@@ -24,6 +25,45 @@ const {
 } = await import('./claude-models')
 
 describe('Claude model profiles', () => {
+  test('uses SDK default executable when no global Claude command is found', () => {
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'win32',
+      pathEnv: '',
+      exists: () => false,
+    })
+
+    expect(executable).toEqual({ description: 'sdk-default' })
+  })
+
+  test('runs Windows npm command shims through the SDK custom spawn hook', () => {
+    const binDir = 'C:\\Users\\me\\AppData\\Roaming\\npm'
+    const shim = win32.join(binDir, 'claude.cmd')
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'win32',
+      pathEnv: binDir,
+      exists: path => path === shim,
+    })
+
+    expect(executable.pathToClaudeCodeExecutable).toBe(shim)
+    expect(typeof executable.spawnClaudeCodeProcess).toBe('function')
+    expect(executable.description).toBe(`windows-shell-shim:${shim}`)
+  })
+
+  test('passes Windows native executables directly to the SDK', () => {
+    const binDir = 'C:\\Program Files\\ClaudeCode'
+    const exe = win32.join(binDir, 'claude.exe')
+    const shim = win32.join(binDir, 'claude.cmd')
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'win32',
+      pathEnv: binDir,
+      exists: path => path === exe || path === shim,
+    })
+
+    expect(executable.pathToClaudeCodeExecutable).toBe(exe)
+    expect(executable.spawnClaudeCodeProcess).toBeUndefined()
+    expect(executable.description).toBe(exe)
+  })
+
   test('keeps npm-global, local bins, and existing PATH in Claude spawn PATH', () => {
     if (process.platform === 'win32') return
     const originalPath = process.env.PATH

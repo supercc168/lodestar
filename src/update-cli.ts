@@ -1,11 +1,11 @@
 /**
  * CLI entry for `lodestar-update` bin.
  *
- * 跑 `npm i -g @leviyuan/lodestar@latest @openai/codex@latest`
- * (Codex CLI 是 peer dep, 顺手一起升), stdio inherit 让 npm 自己的进度
- * 条和版本号输出原样透出来。完事后提示用户重启 daemon —— 我们这里 *不*
- * 主动 stop + start, 因为 daemon 可能挂在 systemd / Windows 后台托管下,
- * 由那边接管,自重启会撞两次。让用户自己根据部署方式决定。
+ * 跑全局 npm install，把 Lodestar、Codex CLI、Claude Code CLI 以及
+ * Claude Agent SDK / Anthropic SDK 一起升。stdio inherit 让 npm 自己的
+ * 进度条和版本号输出原样透出来。完事后提示用户重启 daemon —— 我们
+ * 这里 *不* 主动 stop + start, 因为 daemon 可能挂在 systemd / Windows
+ * 后台托管下,由那边接管,自重启会撞两次。让用户自己根据部署方式决定。
  */
 
 import { spawn } from 'node:child_process'
@@ -22,12 +22,20 @@ const C = {
   dim:   '\x1b[2m',
 }
 
+const UPDATE_PACKAGES = [
+  '@leviyuan/lodestar@latest',
+  '@openai/codex@latest',
+  '@anthropic-ai/claude-code@latest',
+  '@anthropic-ai/claude-agent-sdk@latest',
+  '@anthropic-ai/sdk@latest',
+] as const
+
 function runNpmInstall(): Promise<number> {
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
   return new Promise((resolve) => {
     const child = spawn(
       npm,
-      ['install', '-g', '@leviyuan/lodestar@latest', '@openai/codex@latest'],
+      ['install', '-g', ...UPDATE_PACKAGES],
       { stdio: 'inherit', shell: process.platform === 'win32' },
     )
     child.on('exit', (code) => resolve(code ?? 1))
@@ -39,8 +47,8 @@ function runNpmInstall(): Promise<number> {
 }
 
 async function main(): Promise<void> {
-  console.log(`${C.bold}更新 Lodestar + Codex CLI${C.reset}`)
-  console.log(`${C.dim}npm i -g @leviyuan/lodestar@latest @openai/codex@latest${C.reset}\n`)
+  console.log(`${C.bold}更新 Lodestar + Codex CLI + Claude Code / SDK${C.reset}`)
+  console.log(`${C.dim}npm i -g ${UPDATE_PACKAGES.join(' ')}${C.reset}\n`)
 
   const code = await runNpmInstall()
   if (code !== 0) {

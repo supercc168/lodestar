@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { spawn } from 'node:child_process'
+import { delimiter, join, posix, win32 } from 'node:path'
 import { EventEmitter } from 'node:events'
 import {
   query,
@@ -10,6 +11,8 @@ import {
   type Query,
   type SDKMessage,
   type SDKUserMessage,
+  type SpawnOptions as ClaudeSdkSpawnOptions,
+  type SpawnedProcess,
   type UserDialogRequest,
   type UserDialogResult,
 } from '@anthropic-ai/claude-agent-sdk'
@@ -105,34 +108,108 @@ export interface ClaudeSpawnOpts extends SpawnOpts {
   effort: ClaudeReasoningEffort
 }
 
-export function resolveClaudeBin(): string {
-  if (process.platform !== 'win32') {
-    const candidates = [
-      join(homedir(), '.local', 'npm-global', 'bin', 'claude'),
-      join(homedir(), '.local', 'bin', 'claude'),
-    ]
-    for (const candidate of candidates) if (existsSync(candidate)) return candidate
+type ClaudePathLookup = {
+  platform?: NodeJS.Platform
+  pathEnv?: string
+  homeDir?: string
+  exists?: (path: string) => boolean
+}
+
+type ClaudeExecutableConfig = {
+  pathToClaudeCodeExecutable?: string
+  spawnClaudeCodeProcess?: (options: ClaudeSdkSpawnOptions) => SpawnedProcess
+  description: string
+}
+
+function pathDelimiterForPlatform(platform: NodeJS.Platform): string {
+  return platform === 'win32' ? ';' : ':'
+}
+
+function joinForPlatform(platform: NodeJS.Platform, ...parts: string[]): string {
+  return platform === 'win32' ? win32.join(...parts) : posix.join(...parts)
+}
+
+function windowsShellShim(path: string): boolean {
+  const lower = path.toLowerCase()
+  return lower.endsWith('.cmd') || lower.endsWith('.bat')
+}
+
+function spawnWindowsShellShim(options: ClaudeSdkSpawnOptions): SpawnedProcess {
+  const child = spawn(options.command, options.args, {
+    cwd: options.cwd,
+    env: options.env as NodeJS.ProcessEnv,
+    shell: true,
+    signal: options.signal,
+    stdio: ['pipe', 'pipe', 'ignore'],
+    windowsHide: true,
+  })
+  if (!child.stdin || !child.stdout) {
+    child.kill()
+    throw new Error('failed to open stdio for Claude Code Windows shell shim')
   }
-  const found = whichClaude()
+  return child as unknown as SpawnedProcess
+}
+
+export function resolveClaudeBin(): string {
+  const found = findClaudeBin()
   if (found) return found
   throw new Error('Claude Code executable not found. Install Claude Code or add `claude` to PATH.')
 }
 
-export function assertClaudeCodeAvailable(): void {
-  resolveClaudeBin()
+function findClaudeBin(lookup: ClaudePathLookup = {}): string | null {
+  const platform = lookup.platform ?? process.platform
+  const exists = lookup.exists ?? existsSync
+  const home = lookup.homeDir ?? homedir()
+  if (platform !== 'win32') {
+    const candidates = [
+      joinForPlatform(platform, home, '.local', 'npm-global', 'bin', 'claude'),
+      joinForPlatform(platform, home, '.local', 'bin', 'claude'),
+    ]
+    for (const candidate of candidates) if (exists(candidate)) return candidate
+  }
+  const found = whichClaude(lookup)
+  if (found) return found
+  return null
 }
 
-function whichClaude(): string | null {
-  const PATH = process.env.PATH ?? ''
+export function assertClaudeCodeAvailable(): void {
+  // The Agent SDK ships platform-specific native Claude Code binaries as
+  // optional dependencies. Do not reject startup just because no global
+  // `claude` command is on PATH; if the SDK binary is missing, query() will
+  // surface that concrete failure.
+  findClaudeBin()
+}
+
+export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): ClaudeExecutableConfig {
+  const platform = lookup.platform ?? process.platform
+  const bin = findClaudeBin(lookup)
+  if (!bin) return { description: 'sdk-default' }
+  if (platform === 'win32' && windowsShellShim(bin)) {
+    return {
+      pathToClaudeCodeExecutable: bin,
+      spawnClaudeCodeProcess: spawnWindowsShellShim,
+      description: `windows-shell-shim:${bin}`,
+    }
+  }
+  return {
+    pathToClaudeCodeExecutable: bin,
+    description: bin,
+  }
+}
+
+function whichClaude(lookup: ClaudePathLookup = {}): string | null {
+  const platform = lookup.platform ?? process.platform
+  const PATH = lookup.pathEnv ?? process.env.PATH ?? ''
   if (!PATH) return null
-  const candidates = process.platform === 'win32'
-    ? ['claude.cmd', 'claude.bat', 'claude.exe', 'claude']
+  const exists = lookup.exists ?? existsSync
+  const candidates = platform === 'win32'
+    ? ['claude.exe', 'claude.cmd', 'claude.bat', 'claude']
     : ['claude']
-  for (const dir of PATH.split(delimiter)) {
+  for (const dir of PATH.split(pathDelimiterForPlatform(platform))) {
     if (!dir) continue
     for (const name of candidates) {
-      const p = join(dir, name)
-      if (existsSync(p)) return p
+      const p = joinForPlatform(platform, dir, name)
+      if (exists(p)) return p
     }
   }
   return null
@@ -417,7 +494,8 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (this.started) return
     this.started = true
     const model = resolveClaudeSdkModel(this.opts.model)
-    log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} cwd=${this.opts.workDir}`)
+    const executable = resolveClaudeExecutableConfig()
+    log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} cwd=${this.opts.workDir} executable=${executable.description}`)
     try {
       this.query = query({
         prompt: this.input,
@@ -426,7 +504,12 @@ export class ClaudeAgentProcess extends EventEmitter {
           ...(model ? { model } : {}),
           effort: this.opts.effort as EffortLevel,
           resume: this.opts.resumeSessionId,
-          pathToClaudeCodeExecutable: resolveClaudeBin(),
+          ...(executable.pathToClaudeCodeExecutable
+            ? { pathToClaudeCodeExecutable: executable.pathToClaudeCodeExecutable }
+            : {}),
+          ...(executable.spawnClaudeCodeProcess
+            ? { spawnClaudeCodeProcess: executable.spawnClaudeCodeProcess }
+            : {}),
           permissionMode: CLAUDE_PERMISSION_MODE,
           allowDangerouslySkipPermissions: CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS,
           env: {
