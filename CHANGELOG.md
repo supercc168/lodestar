@@ -2,6 +2,14 @@
 
 面向使用者的简版更新记录。这里只保留你能直接感受到的变化，以及必要的兼容提示；实现细节请看每个版本末尾的 compare 链接。
 
+## v0.10.0 · 2026-06-18
+
+- `model` 面板新增 Claude Code 后端，可在保留 Codex 的同时选择本机 Claude 配置、GLM 或 DeepSeek 路由。
+- Claude 后端接入了同一套飞书卡片体验：工具调用、权限确认、问答卡、输出续卡、usage 和上下文占比都会继续显示在群里。
+- Codex 与 Claude 的模型选择、resume id 和不支持能力会分开处理；例如 Claude 不支持 `compact` 时会直接说明原因，不会静默换成别的路径。
+
+**Full Changelog**: https://github.com/leviyuan/lodestar/compare/v0.9.0...v0.10.0
+
 ## v0.9.0 · 2026-06-13
 
 - `task` 飞书任务清单自动化以预览版开放：项目群里发 `task` 可启用 `<project>[lodestar]` 清单，并按 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成` 推进。
