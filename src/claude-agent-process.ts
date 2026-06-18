@@ -763,15 +763,10 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (typeof raw.uuid === 'string') this.lastAssistantUuid = raw.uuid
     if (typeof message?.model === 'string' && message.model) this.lastModel = claudeModelKey(message.model)
     const content = Array.isArray(message?.content) ? message.content : []
-    const hasServerToolBlocks = content.some(block =>
-      block && typeof block === 'object' && (
-        block.type === 'server_tool_use' || block.type === 'tool_result'
-      ),
-    )
     for (const block of content) {
       if (!block || typeof block !== 'object') continue
       if (block.type === 'text' && typeof block.text === 'string' && block.text.length > 0) {
-        if (hasServerToolBlocks && isServerToolScaffoldText(block.text)) continue
+        if (isServerToolScaffoldText(block.text)) continue
         const uuid = raw.uuid ?? message?.id
         this.emit('assistant_text', { uuid, text: block.text })
         this.emit('assistant_block_stop', { index: uuid })

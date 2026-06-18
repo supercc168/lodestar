@@ -307,37 +307,63 @@ describe('Claude user dialog bridge', () => {
 
     proc.handleMessage({
       type: 'assistant',
-      uuid: 'assistant-server-tool',
+      uuid: 'assistant-intro',
       message: {
         model: 'opus',
-        content: [
-          { type: 'text', text: '我用视觉分析工具来看这两张图。' },
-          {
-            type: 'text',
-            text: '**🌐 Z.ai Built-in Tool: analyze_image**\n\n**Input:**\n```json\n{"imageSource":"https://signed.example/img"}\n```',
-          },
-          {
-            type: 'server_tool_use',
-            id: 'call_image_1',
-            name: 'analyze_image',
-            input: { imageSource: 'https://signed.example/img' },
-          },
-          {
-            type: 'text',
-            text: '**Output:**\n**analyze_image_result_summary:** [{"text":"完整识图结果"}]',
-          },
-          {
-            type: 'tool_result',
-            tool_use_id: 'call_image_1',
-            content: '["完整识图结果"]',
-          },
-        ],
+        content: [{ type: 'text', text: '我用视觉分析工具来看这两张图。' }],
+      },
+    })
+    proc.handleMessage({
+      type: 'assistant',
+      uuid: 'assistant-server-tool-scaffold',
+      message: {
+        model: 'opus',
+        content: [{
+          type: 'text',
+          text: '**🌐 Z.ai Built-in Tool: analyze_image**\n\n**Input:**\n```json\n{"imageSource":"https://signed.example/img"}\n```',
+        }],
+      },
+    })
+    proc.handleMessage({
+      type: 'assistant',
+      uuid: 'assistant-server-tool-use',
+      message: {
+        model: 'opus',
+        content: [{
+          type: 'server_tool_use',
+          id: 'call_image_1',
+          name: 'analyze_image',
+          input: { imageSource: 'https://signed.example/img' },
+        }],
+      },
+    })
+    proc.handleMessage({
+      type: 'assistant',
+      uuid: 'assistant-server-tool-output-scaffold',
+      message: {
+        model: 'opus',
+        content: [{
+          type: 'text',
+          text: '**Output:**\n**analyze_image_result_summary:** [{"text":"完整识图结果"}]',
+        }],
+      },
+    })
+    proc.handleMessage({
+      type: 'assistant',
+      uuid: 'assistant-server-tool-result',
+      message: {
+        model: 'opus',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'call_image_1',
+          content: '["完整识图结果"]',
+        }],
       },
     })
 
     expect(events).toEqual([
       ['assistant_text', {
-        uuid: 'assistant-server-tool',
+        uuid: 'assistant-intro',
         text: '我用视觉分析工具来看这两张图。',
       }],
       ['tool_use', {
