@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import {
   diffUsageTotals,
@@ -6,6 +9,7 @@ import {
   contextCompactionNoticeFromMessage,
   contextCompactionNoticeFromNotification,
   CodexProcess,
+  imageGenerationOutput,
   usageFromTokenUsagePayload,
 } from './codex-process'
 
@@ -128,6 +132,71 @@ describe('codex process compaction notifications', () => {
     })).not.toThrow()
     expect(raw).toHaveLength(1)
     expect(compacted).toHaveLength(1)
+  })
+
+  test('maps snake_case image generation fields to a sendable result path', () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const events: Array<[string, any]> = []
+    proc.opts = { workDir: '/tmp' }
+    proc.emittedImageGenerationIds = new Set()
+    proc.emit = (event: string, payload: unknown) => {
+      events.push([event, payload])
+      return true
+    }
+
+    proc.handleNotification('item/started', {
+      item: {
+        type: 'imageGeneration',
+        id: 'img-1',
+        status: 'inProgress',
+        revised_prompt: 'A cute cat curled up in a sunbeam.',
+      },
+      threadId: 'thread-5',
+      turnId: 'turn-5',
+    })
+    proc.handleNotification('item/completed', {
+      item: {
+        type: 'imageGeneration',
+        id: 'img-1',
+        status: 'completed',
+        revised_prompt: 'A cute cat curled up in a sunbeam.',
+        saved_path: '/tmp/cat.png',
+        result: 'ignored when saved_path exists',
+      },
+      threadId: 'thread-5',
+      turnId: 'turn-5',
+    })
+
+    expect(events).toEqual([
+      ['tool_use', {
+        id: 'img-1',
+        name: 'ImageGeneration',
+        input: {
+          status: 'inProgress',
+          revisedPrompt: 'A cute cat curled up in a sunbeam.',
+        },
+      }],
+      ['tool_result', {
+        tool_use_id: 'img-1',
+        content: '/tmp/cat.png',
+        is_error: false,
+      }],
+    ])
+  })
+
+  test('materializes inline base64 image generation results to a sendable file path', () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-imggen-'))
+    try {
+      const output = imageGenerationOutput({
+        call_id: 'ig-inline',
+        result: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=',
+      }, 'thread-inline', root)
+
+      expect(output).toBe(join(root, 'thread-inline', 'ig-inline.png'))
+      expect(readFileSync(output).subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
   })
 })
 

@@ -11,9 +11,9 @@
  */
 
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
-import { existsSync } from 'node:fs'
+import { existsSync, mkdirSync, readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
-import { delimiter, join } from 'node:path'
+import { delimiter, isAbsolute, join } from 'node:path'
 import { EventEmitter } from 'node:events'
 import type { Readable, Writable } from 'node:stream'
 import { config } from './config'
@@ -62,6 +62,9 @@ function buildSpawnPath(): string {
     '/usr/local/bin', '/usr/bin', '/bin',
   ].join(delimiter)
 }
+
+const CODEX_SESSIONS_DIR = join(homedir(), '.codex', 'sessions')
+const CODEX_GENERATED_IMAGES_DIR = join(homedir(), '.codex', 'generated_images')
 
 export interface SpawnOpts {
   workDir: string
@@ -228,6 +231,9 @@ export class CodexProcess extends EventEmitter {
   private readyPromise: Promise<void> | null = null
   private catalogInitPromise: Promise<void> | null = null
   private currentTurnId: string | null = null
+  private rolloutFilePath: string | null = null
+  private rolloutReadOffset = 0
+  private emittedImageGenerationIds = new Set<string>()
 
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
@@ -395,6 +401,7 @@ export class CodexProcess extends EventEmitter {
         return
       }
       case 'turn/completed': {
+        this.flushRolloutImageGenerations()
         const turn = params.turn ?? {}
         const status = turn.status
         const isError = status === 'failed' || !!turn.error
@@ -498,7 +505,7 @@ export class CodexProcess extends EventEmitter {
       this.emit('assistant_block_stop', { index: item.id })
       return
     }
-    const mapped = mapCompletedItem(item)
+    const mapped = mapCompletedItem(item, this.sessionId ?? undefined)
     if (!mapped) {
       logUnhandledAppServerPayload('ITEM_COMPLETED_UNMAPPED', { method: 'item/completed', params })
       return
@@ -507,6 +514,87 @@ export class CodexProcess extends EventEmitter {
       tool_use_id: item.id,
       content: mapped.output,
       is_error: mapped.isError,
+    })
+    if (item.type === 'imageGeneration') this.emittedImageGenerationIds.add(item.id)
+  }
+
+  private primeRolloutImageGenerationScan(): void {
+    this.rolloutFilePath = null
+    this.rolloutReadOffset = 0
+    this.emittedImageGenerationIds.clear()
+    if (!this.sessionId) return
+    const filePath = findCodexRolloutFile(this.sessionId)
+    if (!filePath) return
+    this.rolloutFilePath = filePath
+    try {
+      this.rolloutReadOffset = statSync(filePath).size
+      log(`codex-process: image generation rollout scan primed ${filePath} offset=${this.rolloutReadOffset}`)
+    } catch (e) {
+      log(`codex-process: image generation rollout stat failed ${filePath}: ${e instanceof Error ? e.message : e}`)
+      this.rolloutFilePath = null
+      this.rolloutReadOffset = 0
+    }
+  }
+
+  private flushRolloutImageGenerations(): void {
+    if (!this.sessionId) return
+    const filePath = this.rolloutFilePath ?? findCodexRolloutFile(this.sessionId)
+    if (!filePath) {
+      log(`codex-process: image generation rollout file not found for thread=${this.sessionId}`)
+      return
+    }
+    this.rolloutFilePath = filePath
+    let buf: Buffer
+    try {
+      const size = statSync(filePath).size
+      if (size <= this.rolloutReadOffset) return
+      buf = readFileSync(filePath).subarray(this.rolloutReadOffset, size)
+      this.rolloutReadOffset = size
+    } catch (e) {
+      log(`codex-process: image generation rollout read failed ${filePath}: ${e instanceof Error ? e.message : e}`)
+      return
+    }
+
+    for (const line of buf.toString('utf8').split(/\r?\n/)) {
+      if (!line.trim()) continue
+      let record: any
+      try {
+        record = JSON.parse(line)
+      } catch (e) {
+        log(`codex-process: image generation rollout JSON parse failed ${filePath}: ${e instanceof Error ? e.message : e}`)
+        continue
+      }
+      const payload = record?.payload
+      const type = payload?.type
+      if (type !== 'image_generation_end' && type !== 'image_generation_call') continue
+      this.emitRolloutImageGeneration(payload)
+    }
+  }
+
+  private emitRolloutImageGeneration(payload: any): void {
+    const callId = typeof payload?.call_id === 'string'
+      ? payload.call_id
+      : typeof payload?.id === 'string'
+        ? payload.id
+        : ''
+    if (!callId || this.emittedImageGenerationIds.has(callId)) return
+    const output = imageGenerationOutput(payload, this.sessionId ?? undefined)
+    if (!output) return
+    const isError = payload?.status === 'failed'
+    const status = payload?.status === 'generating' && isAbsolute(output) ? 'completed' : payload?.status
+    this.emittedImageGenerationIds.add(callId)
+    this.emit('tool_use', {
+      id: callId,
+      name: 'ImageGeneration',
+      input: {
+        status,
+        revisedPrompt: imageGenerationRevisedPrompt(payload),
+      },
+    })
+    this.emit('tool_result', {
+      tool_use_id: callId,
+      content: output,
+      is_error: isError,
     })
   }
 
@@ -676,6 +764,7 @@ export class CodexProcess extends EventEmitter {
     if (isCodexReasoningEffort(res?.reasoningEffort)) this.lastEffort = res.reasoningEffort
     else this.lastEffort = this.opts.effort
     log(`codex-process: thread=${this.sessionId}`)
+    this.primeRolloutImageGenerationScan()
     this.emit('init', { session_id: this.sessionId, thread })
   }
 
@@ -907,14 +996,164 @@ function mapStartedItem(item: any, workDir: string): { name: string; input: any 
     case 'webSearch':
       return { name: 'WebSearch', input: { query: item.query, action: item.action } }
     case 'imageGeneration':
-      return { name: 'ImageGeneration', input: { status: item.status, revisedPrompt: item.revisedPrompt } }
+      return { name: 'ImageGeneration', input: { status: item.status, revisedPrompt: imageGenerationRevisedPrompt(item) } }
     case 'collabAgentToolCall':
       return { name: 'Agent', input: { tool: item.tool, prompt: item.prompt, model: item.model } }
   }
   return null
 }
 
-function mapCompletedItem(item: any): { output: string; isError: boolean } | null {
+function imageGenerationRevisedPrompt(item: any): string | undefined {
+  const prompt = item?.revisedPrompt ?? item?.revised_prompt
+  return typeof prompt === 'string' && prompt ? prompt : undefined
+}
+
+function findCodexRolloutFile(sessionId: string): string | null {
+  if (!sessionId || !existsSync(CODEX_SESSIONS_DIR)) return null
+  let best: { path: string; mtimeMs: number } | null = null
+  const stack = [CODEX_SESSIONS_DIR]
+  while (stack.length) {
+    const dir = stack.pop()!
+    let entries: ReturnType<typeof readdirSync>
+    try {
+      entries = readdirSync(dir, { withFileTypes: true })
+    } catch (e) {
+      log(`codex-process: cannot scan Codex session dir ${dir}: ${e instanceof Error ? e.message : e}`)
+      continue
+    }
+    for (const entry of entries) {
+      const path = join(dir, entry.name)
+      if (entry.isDirectory()) {
+        stack.push(path)
+        continue
+      }
+      if (!entry.isFile()) continue
+      if (!entry.name.startsWith('rollout-') || !entry.name.endsWith(`${sessionId}.jsonl`)) continue
+      try {
+        const mtimeMs = statSync(path).mtimeMs
+        if (!best || mtimeMs > best.mtimeMs) best = { path, mtimeMs }
+      } catch (e) {
+        log(`codex-process: cannot stat Codex rollout ${path}: ${e instanceof Error ? e.message : e}`)
+      }
+    }
+  }
+  return best?.path ?? null
+}
+
+export function imageGenerationOutput(
+  item: any,
+  threadId?: string,
+  outputRoot = CODEX_GENERATED_IMAGES_DIR,
+): string {
+  const directPath = item?.savedPath ?? item?.saved_path
+  if (typeof directPath === 'string' && directPath) return directPath
+
+  const result = item?.result
+  if (typeof result === 'string') {
+    const materialized = materializeImageGenerationResult(item, threadId, outputRoot)
+    if (materialized) return materialized
+    if (result.length > 2048) {
+      const id = imageGenerationCallId(item)
+      log(`codex-process: image generation inline result could not be decoded id=${id} length=${result.length}`)
+      return `Image generation returned ${result.length} chars of inline data, but Lodestar could not materialize it as an image file.`
+    }
+    return result
+  }
+  if (result && typeof result === 'object') {
+    const resultPath = result.savedPath ?? result.saved_path ?? result.path
+    if (typeof resultPath === 'string' && resultPath) return resultPath
+    return JSON.stringify(result, null, 2)
+  }
+  return ''
+}
+
+function materializeImageGenerationResult(item: any, threadId: string | undefined, outputRoot: string): string | null {
+  const result = item?.result
+  if (typeof result !== 'string') return null
+  const decoded = imageBufferFromBase64Result(result)
+  if (!decoded) return null
+
+  const threadPart = sanitizeGeneratedImagePart(threadId ?? 'unknown-thread')
+  const callPart = sanitizeGeneratedImagePart(imageGenerationCallId(item))
+  const dir = join(outputRoot, threadPart)
+  const path = join(dir, `${callPart}.${decoded.ext}`)
+  try {
+    mkdirSync(dir, { recursive: true })
+    writeFileSync(path, decoded.buffer)
+    return path
+  } catch (e) {
+    log(`codex-process: failed to write image generation result ${path}: ${e instanceof Error ? e.message : e}`)
+    return null
+  }
+}
+
+function imageGenerationCallId(item: any): string {
+  const id = item?.callId ?? item?.call_id ?? item?.id
+  return typeof id === 'string' && id ? id : `image-${Date.now()}`
+}
+
+function sanitizeGeneratedImagePart(part: string): string {
+  const sanitized = part.trim().replace(/[^a-zA-Z0-9_.-]/g, '_').replace(/^_+|_+$/g, '')
+  return sanitized ? sanitized.slice(0, 140) : 'unknown'
+}
+
+function imageBufferFromBase64Result(result: string): { buffer: Buffer; ext: string } | null {
+  const trimmed = result.trim()
+  let base64 = trimmed
+  let hintedExt: string | null = null
+  const dataUrl = trimmed.match(/^data:image\/([a-zA-Z0-9.+-]+);base64,(.*)$/s)
+  if (dataUrl) {
+    hintedExt = mimeSubtypeToExtension(dataUrl[1])
+    base64 = dataUrl[2]
+  } else {
+    if (trimmed.length < 64) return null
+    if (!/^[a-zA-Z0-9+/=_\-\s]+$/.test(trimmed)) return null
+  }
+  base64 = base64.replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/')
+  if (!base64 || base64.length % 4 === 1) return null
+
+  const padded = base64.padEnd(Math.ceil(base64.length / 4) * 4, '=')
+  let buffer: Buffer
+  try {
+    buffer = Buffer.from(padded, 'base64')
+  } catch {
+    return null
+  }
+  if (buffer.length < 12) return null
+
+  const ext = detectImageExtension(buffer) ?? hintedExt
+  if (!ext) return null
+  return { buffer, ext }
+}
+
+function detectImageExtension(buffer: Buffer): string | null {
+  if (
+    buffer[0] === 0x89 &&
+    buffer[1] === 0x50 &&
+    buffer[2] === 0x4e &&
+    buffer[3] === 0x47 &&
+    buffer[4] === 0x0d &&
+    buffer[5] === 0x0a &&
+    buffer[6] === 0x1a &&
+    buffer[7] === 0x0a
+  ) return 'png'
+  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return 'jpg'
+  const header = buffer.subarray(0, 6).toString('ascii')
+  if (header === 'GIF87a' || header === 'GIF89a') return 'gif'
+  if (buffer.subarray(0, 4).toString('ascii') === 'RIFF' && buffer.subarray(8, 12).toString('ascii') === 'WEBP') return 'webp'
+  return null
+}
+
+function mimeSubtypeToExtension(subtype: string): string | null {
+  const normalized = subtype.toLowerCase()
+  if (normalized === 'jpeg' || normalized === 'jpg') return 'jpg'
+  if (normalized === 'png') return 'png'
+  if (normalized === 'gif') return 'gif'
+  if (normalized === 'webp') return 'webp'
+  return null
+}
+
+function mapCompletedItem(item: any, threadId?: string): { output: string; isError: boolean } | null {
   switch (item.type) {
     case 'commandExecution':
       return {
@@ -936,7 +1175,7 @@ function mapCompletedItem(item: any): { output: string; isError: boolean } | nul
     case 'webSearch':
       return { output: JSON.stringify(item.action ?? {}, null, 2), isError: false }
     case 'imageGeneration':
-      return { output: item.savedPath ?? item.result ?? '', isError: item.status === 'failed' }
+      return { output: imageGenerationOutput(item, threadId), isError: item.status === 'failed' }
     case 'collabAgentToolCall':
       return { output: JSON.stringify(item.agentsStates ?? {}, null, 2), isError: item.status === 'failed' }
   }
