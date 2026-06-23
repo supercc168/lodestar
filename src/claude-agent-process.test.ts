@@ -85,12 +85,12 @@ describe('Claude model profiles', () => {
     expect(resolveClaudeSdkModel('claude:glm')).toBe('opus')
     expect(resolveClaudeContextWindow('claude:glm')).toBe(1_000_000)
     expect(resolveClaudeModelEnv('claude:glm')).toEqual({
-      OMC_MODEL_HIGH: '5.2',
-      OMC_MODEL_MEDIUM: '5.2',
-      OMC_MODEL_LOW: '4.7',
-      ANTHROPIC_DEFAULT_OPUS_MODEL: '5.2',
-      ANTHROPIC_DEFAULT_SONNET_MODEL: '5.2',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: '4.7',
+      OMC_MODEL_HIGH: 'GLM-5.2[1m]',
+      OMC_MODEL_MEDIUM: 'GLM-5.2[1m]',
+      OMC_MODEL_LOW: 'GLM-4.7',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'GLM-5.2[1m]',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'GLM-5.2[1m]',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'GLM-4.7',
     })
 
     expect(resolveClaudeSdkModel('claude:deepseek')).toBe('opus')
@@ -665,7 +665,10 @@ describe('Claude token accounting', () => {
     expect(proc.lastResult.cost_delta_usd).toBeNull()
   })
 
-  test('uses Claude profile context window over SDK router defaults', () => {
+  test('prefers SDK-measured context window over profile fallback', () => {
+    // GLM-5.2 官方 1M,但 Claude Code → GLM 链路实测 200K(profile 兜底值)。
+    // 当 SDK 上报了窗口时,以 SDK 实测为准(它决定 compact 时机),不被
+    // profile 覆盖,避免分母虚高导致百分比显示偏低。
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
       effort: 'high',
@@ -677,7 +680,7 @@ describe('Claude token accounting', () => {
     proc.handleMessage({
       type: 'result',
       subtype: 'success',
-      uuid: 'result-glm-router-window',
+      uuid: 'result-glm-sdk-window',
       session_id: 'claude-session-1',
       is_error: false,
       duration_ms: 10,
@@ -690,6 +693,39 @@ describe('Claude token accounting', () => {
           cacheCreationInputTokens: 0,
           cacheReadInputTokens: 0,
           contextWindow: 100_000,
+        },
+      },
+    })
+
+    expect(usageEvents).toHaveLength(1)
+    expect(usageEvents[0].contextWindow).toBe(100_000)
+    expect(proc.lastContextWindow).toBe(100_000)
+  })
+
+  test('falls back to profile context window when SDK does not report one', () => {
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp',
+      effort: 'high',
+      model: 'claude:glm',
+    }) as any
+    const usageEvents: any[] = []
+    proc.on('token_usage', (event: any) => usageEvents.push(event))
+
+    proc.handleMessage({
+      type: 'result',
+      subtype: 'success',
+      uuid: 'result-glm-no-sdk-window',
+      session_id: 'claude-session-1',
+      is_error: false,
+      duration_ms: 10,
+      num_turns: 1,
+      usage: { input_tokens: 87_000, output_tokens: 700 },
+      modelUsage: {
+        opus: {
+          inputTokens: 87_000,
+          outputTokens: 700,
+          cacheCreationInputTokens: 0,
+          cacheReadInputTokens: 0,
         },
       },
     })

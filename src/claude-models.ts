@@ -20,9 +20,12 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
   glm: {
     display_name: 'Claude Code · GLM',
     description: '使用 GLM 路由，适合中文交流和通用编码任务。',
-    opus: '5.2',
-    sonnet: '5.2',
-    haiku: '4.7',
+    // 智谱 Anthropic 兼容端点要求模型名用官方完整名(GLM-5.2)并带 [1m]
+    // 后缀才放开 1M 上下文;简写名(5.2)或无后缀只给 200K。haiku 同理
+    // 用完整名 GLM-4.7(轻量档不加 [1m])。
+    opus: 'GLM-5.2[1m]',
+    sonnet: 'GLM-5.2[1m]',
+    haiku: 'GLM-4.7',
     context_window: '1000000',
   },
   deepseek: {

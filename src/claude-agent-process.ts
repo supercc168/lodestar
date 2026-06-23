@@ -963,13 +963,17 @@ export class ClaudeAgentProcess extends EventEmitter {
       this.lastTotalUsage = this.cumulativeUsageFromResults ? cloneUsage(this.cumulativeUsageFromResults) : null
     }
     const profileContextWindow = resolveClaudeContextWindow(this.opts.model)
-    this.lastContextWindow = profileContextWindow ?? total.contextWindow
+    // SDK 运行时实测的 contextWindow 代表这条 Claude Code → 模型链路的真实
+    // 可用窗口(它也决定 compact 时机),优先采用;profile 的 context_window
+    // 仅在 SDK 不上报时兜底。例如 GLM-5.2 官方 1M,但经本链路实测为 200K,
+    // 此处以 SDK 实测为准,避免分母虚高导致百分比显示偏低。
+    this.lastContextWindow = total.contextWindow ?? profileContextWindow
     if (
       profileContextWindow != null &&
       total.contextWindow != null &&
       profileContextWindow !== total.contextWindow
     ) {
-      log(`claude-agent-process: override SDK contextWindow ${total.contextWindow} with profile ${profileContextWindow} for model=${this.opts.model ?? 'default'}`)
+      log(`claude-agent-process: using SDK contextWindow ${total.contextWindow} (profile fallback ${profileContextWindow}) for model=${this.opts.model ?? 'default'}`)
     }
     if (this.lastTotalUsage || this.lastUsage) {
       this.emit('token_usage', {
