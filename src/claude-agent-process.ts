@@ -875,18 +875,17 @@ export class ClaudeAgentProcess extends EventEmitter {
       this.lastTotalUsage = this.cumulativeUsageFromResults ? cloneUsage(this.cumulativeUsageFromResults) : null
     }
     const profileContextWindow = resolveClaudeContextWindow(this.opts.model)
-    // 以 SDK 运行时实测的 contextWindow 为唯一事实源(它代表 Claude Code →
-    // 模型链路的真实可用窗口,也决定 compact 时机)。profile 的 context_window
-    // 仅当用户在 config.toml 显式声明时才有值,作为 SDK 未上报时的后备;内置
-    // profile 不再硬编码窗口,避免静态值与实测矛盾时分母虚高(原 GLM 写死
-    // 1M 而链路实测 200K 即此病)。符合 no_fallbacks:不拿可疑静态值兜底。
-    this.lastContextWindow = total.contextWindow ?? profileContextWindow
+    // profile 的 context_window 优先:GLM-5.2[1m] 真实窗口 1M,而 SDK 经
+    // Claude Code→GLM 链路实测的 contextWindow 系统性偏低(100K~200K 波动、
+    // 不稳定),作分母会让百分比虚高到 100%。SDK 实测仅在 profile 未声明时
+    // 用作 fallback。
+    this.lastContextWindow = profileContextWindow ?? total.contextWindow
     if (
       profileContextWindow != null &&
       total.contextWindow != null &&
       profileContextWindow !== total.contextWindow
     ) {
-      log(`claude-agent-process: using SDK contextWindow ${total.contextWindow} (profile override ${profileContextWindow}) for model=${this.opts.model ?? 'default'}`)
+      log(`claude-agent-process: using profile contextWindow ${profileContextWindow} (SDK reported ${total.contextWindow}) for model=${this.opts.model ?? 'default'}`)
     }
     if (this.lastTotalUsage || this.lastUsage) {
       this.emit('token_usage', {

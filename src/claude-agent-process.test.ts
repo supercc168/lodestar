@@ -82,7 +82,7 @@ describe('Claude model profiles', () => {
   test('maps GLM and DeepSeek profiles to SDK model and env tiers', () => {
     expect(resolveClaudeSdkModel('claude:default')).toBe('opus')
     expect(resolveClaudeSdkModel('claude:glm')).toBe('opus')
-    expect(resolveClaudeContextWindow('claude:glm')).toBeNull()
+    expect(resolveClaudeContextWindow('claude:glm')).toBe(1_000_000)
   })
 })
 
@@ -542,10 +542,9 @@ describe('Claude token accounting', () => {
     expect(proc.lastResult.cost_delta_usd).toBeNull()
   })
 
-  test('prefers SDK-measured context window over profile fallback', () => {
-    // GLM-5.2 官方 1M,但 Claude Code → GLM 链路实测 200K(profile 兜底值)。
-    // 当 SDK 上报了窗口时,以 SDK 实测为准(它决定 compact 时机),不被
-    // profile 覆盖,避免分母虚高导致百分比显示偏低。
+  test('profile context window overrides smaller SDK measurement', () => {
+    // GLM-5.2[1m] 真实窗口 1M;SDK 经 Claude Code→GLM 链路实测偏低(此处
+    // 100K),不可信。profile 的 1M 优先作分母,避免百分比虚高到 100%。
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
       effort: 'high',
@@ -575,13 +574,12 @@ describe('Claude token accounting', () => {
     })
 
     expect(usageEvents).toHaveLength(1)
-    expect(usageEvents[0].contextWindow).toBe(100_000)
-    expect(proc.lastContextWindow).toBe(100_000)
+    expect(usageEvents[0].contextWindow).toBe(1_000_000)
+    expect(proc.lastContextWindow).toBe(1_000_000)
   })
 
-  test('leaves context window null when SDK does not report one and profile has no override', () => {
-    // 内置 profile 不再硬编码 context_window,SDK 未上报即如实留空,符合
-    // no_fallbacks:不拿与实测矛盾的静态假值兜底,分母留待 SDK 实测。
+  test('uses profile context window when SDK does not report one', () => {
+    // SDK 没上报 contextWindow 时,用 profile 的 1M(GLM-5.2[1m] 真实值)。
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
       effort: 'high',
@@ -610,7 +608,7 @@ describe('Claude token accounting', () => {
     })
 
     expect(usageEvents).toHaveLength(1)
-    expect(usageEvents[0].contextWindow).toBeNull()
-    expect(proc.lastContextWindow).toBeNull()
+    expect(usageEvents[0].contextWindow).toBe(1_000_000)
+    expect(proc.lastContextWindow).toBe(1_000_000)
   })
 })

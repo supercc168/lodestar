@@ -26,6 +26,9 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
     opus: 'GLM-5.2[1m]',
     sonnet: 'GLM-5.2[1m]',
     haiku: 'GLM-4.7',
+    // GLM-5.2[1m] 真实窗口 1M;SDK 经 Claude Code→GLM 链路实测的 contextWindow
+    // 系统性偏低(100K~200K 波动,见 daemon.log),不可信,故此值优先覆盖实测。
+    context_window: '1000000',
   },
 }
 
