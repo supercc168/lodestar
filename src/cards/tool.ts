@@ -690,19 +690,32 @@ function renderTodoBody(input: any, output: string | null, resolvedNote?: string
   return lines.join('\n')
 }
 
+function extractPlanTaskTodos(name: string, input: any, output: string | null) {
+  const fromObj = (t: any) => ({
+    content: String(t?.subject ?? t?.content ?? t?.description ?? t?.id ?? '').trim(),
+    status: t?.status,
+    activeForm: t?.activeForm,
+  })
+  const parsed = parseJsonObject(output)
+  if (Array.isArray(parsed?.tasks)) return parsed.tasks.map(fromObj).filter((t: any) => t.content)
+  if (Array.isArray(parsed)) return parsed.map(fromObj).filter((t: any) => t.content)
+  if (parsed && typeof parsed === 'object' && (parsed.subject || parsed.id)) return [fromObj(parsed)]
+  if (name === 'TaskCreate') return [{ content: String(input?.subject ?? '').trim(), status: 'pending' }].filter((t: any) => t.content)
+  if (name === 'TaskUpdate') return [{ content: String(input?.subject ?? input?.taskId ?? '').trim(), status: input?.status }].filter((t: any) => t.content)
+  return []
+}
+
 function renderPlanTaskBody(name: string, input: any, output: string | null, resolvedNote?: string): string {
+  // 完全复用 codex TodoWrite 的列表渲染:从 tool_result(output)或 input 提取任务,
+  // 喂给 renderTodoBody,产出与 codex 一致的 "待办 N 项 / - 状态: 内容" 列表。
+  const todos = extractPlanTaskTodos(name, input, output)
+  if (todos.length > 0) return renderTodoBody({ todos }, output, resolvedNote)
+  // fallback:无任务数据时显示操作字段
   const lines: string[] = []
-  if (name === 'TaskCreate') {
-    if (input?.subject) lines.push(`**主题**: ${input.subject}`)
-    if (input?.description) lines.push(`**说明**: ${String(input.description).slice(0, 500)}`)
-    if (input?.activeForm) lines.push(`**进行中显示**: ${input.activeForm}`)
-  } else if (name === 'TaskUpdate') {
-    if (input?.taskId) lines.push(`**任务**: ${inlineCode(String(input.taskId).slice(0, 12))}`)
-    if (input?.status) lines.push(`**状态**: ${todoStatusLabel(input.status)}`)
-    if (input?.subject) lines.push(`**主题**: ${input.subject}`)
-  } else if (name === 'TaskGet') {
-    if (input?.taskId) lines.push(`**任务**: ${inlineCode(String(input.taskId).slice(0, 12))}`)
-  }
+  if (input?.subject) lines.push(`**主题**: ${input.subject}`)
+  if (input?.description) lines.push(`**说明**: ${String(input.description).slice(0, 500)}`)
+  if (input?.taskId) lines.push(`**任务**: ${inlineCode(String(input.taskId).slice(0, 12))}`)
+  if (input?.status) lines.push(`**状态**: ${todoStatusLabel(input.status)}`)
   if (resolvedNote) {
     if (lines.length > 0) lines.push('')
     lines.push(resolvedNote)
