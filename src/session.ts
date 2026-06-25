@@ -298,6 +298,13 @@ export class Session {
   runningAgy: sessionAgy.AgyTaskState | null = null
   startingAgy = false
   agyForwardPrompts = new Map<string, sessionAgy.AgyForwardRecord>()
+  /** Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板。codex
+   * 的 TodoWrite 一次就带完整列表,直接渲染即可;但 Claude Code 把它拆成 4
+   * 个单点工具,只有 TaskList 才有完整快照。这里跨 turn / rotate 累积一份
+   * 以 task id 为 key 的 board(官方 todo-tracking 文档推荐的做法),每次 Task
+   * 工具完成时由 session-tools.ts 调 applyTaskTool 更新,渲染整个 board 而非
+   * 孤立的单条 —— 见 cards/task-board.ts。 */
+  taskBoard: cards.TaskBoardEntry[] = []
 
   constructor(
     public readonly sessionName: string,

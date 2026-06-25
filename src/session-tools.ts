@@ -70,6 +70,19 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
     return
   }
   s.currentTurn.toolByUseId.set(toolUseId, { i, name, input })
+  // Claude Code Task 工具走累积 board 路径:TaskCreate/Update/Get 都是单点
+  // 操作,只有 TaskList 才有完整快照。这里用 session 级累积的 taskBoard
+  // 渲染整个任务板(⏳ 占位,board 暂不变 —— TaskCreate 的 id 要等 output
+  // 才有),让用户每一步都看到完整进度,而非孤立单条。见 cards/task-board.ts。
+  const taskName = cards.asTaskToolName(name)
+  if (taskName) {
+    const el = cards.taskBoardElement(i, s.taskBoard, { name: taskName, status: '⏳' })
+    void cardkit.addElement(s.currentTurn.cardId, el, {
+      type: 'insert_before',
+      targetElementId: cards.ELEMENTS.footer,
+    })
+    return
+  }
   // AskUserQuestion is a client-side tool — daemon renders the choice
   // UI in-line and supplies the tool_result itself once the user
   // clicks. Branch BEFORE the generic toolCallElement so we never
@@ -161,7 +174,28 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
     startThinkingIfNoToolsRunning(s)
     return
   }
+  // Task 工具走累积 board 路径(见 cards/task-board.ts):用当次 input/output
+  // 累积进 session board,渲染整个任务板而非孤立单条。
+  const taskName = cards.asTaskToolName(meta.name)
+  if (taskName) {
+    completeTaskTool(s, meta, taskName, meta.input, output, isError, meta.resolvedNote)
+    return
+  }
   const el = cards.toolCallElement(meta.i, meta.name, meta.input, output, isError ? '❌' : '✅', meta.resolvedNote)
+  void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
+  startThinkingIfNoToolsRunning(s)
+}
+
+/** Task 工具完成:用单次调用的 input/output 累积进 session board,再渲染整个
+ * board(而非孤立的当次结果)。TaskCreate 抓 output 里的 id、TaskUpdate 按 id
+ * 改 status、TaskList 全量替换、TaskGet 补全。出错时 ❌ 但不动 board(避免
+ * 一次坏结果污染累积状态)。 */
+function completeTaskTool(s: Session, meta: { i: number; name: string }, taskName: cards.TaskToolName, input: any, output: string, isError: boolean, resolvedNote?: string): void {
+  if (!s.currentTurn) return
+  if (!isError) {
+    s.taskBoard = cards.applyTaskTool(s.taskBoard, taskName, input, output)
+  }
+  const el = cards.taskBoardElement(meta.i, s.taskBoard, { name: taskName, status: isError ? '❌' : '✅' }, resolvedNote)
   void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
   startThinkingIfNoToolsRunning(s)
 }
@@ -225,7 +259,11 @@ export function rebuildToolsOnRotate(
     } else {
       turn.toolByUseId.set(useId, { ...meta, i: ni })
       const status: '⏳' | '✅' | '❌' = !done ? '⏳' : (isError ? '❌' : '✅')
-      void cardkit.addElement(newCardId, cards.toolCallElement(ni, meta.name, meta.input, output, status, meta.resolvedNote), {
+      const rotatedTaskName = cards.asTaskToolName(meta.name)
+      const el = rotatedTaskName
+        ? cards.taskBoardElement(ni, s.taskBoard, { name: rotatedTaskName, status }, meta.resolvedNote)
+        : cards.toolCallElement(ni, meta.name, meta.input, output, status, meta.resolvedNote)
+      void cardkit.addElement(newCardId, el, {
         type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
       })
     }

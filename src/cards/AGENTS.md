@@ -4,7 +4,7 @@
 # cards
 
 ## Purpose
-`src/cards/` 维护所有 Feishu Card Kit schema 2.0 模板和渲染辅助函数。它把一轮 Codex 对话、工具调用、权限请求、AskUserQuestion、控制台、状态卡、`model` 选择卡、`wt` worktree 卡、`agy` 任务卡和 `task` 清单面板都格式化成 session 可以交给 `cardkit.ts` 写入的 JSON 结构。
+`src/cards/` 维护所有 Feishu Card Kit schema 2.0 模板和渲染辅助函数。它把一轮 Codex 对话、工具调用、权限请求、AskUserQuestion、控制台、状态卡、`model` 选择卡、`wt` worktree 卡、`agy` 任务卡、`task` 清单面板和 Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板都格式化成 session 可以交给 `cardkit.ts` 写入的 JSON 结构。
 
 ## Key Files
 | File | Description |
@@ -12,6 +12,7 @@
 | `elements.ts` | 集中定义卡片 `element_id` 命名约定，例如 `user_input`、`footer`、`model_panel`、`tasklist_panel`、`tool_<i>`、`assistant_<i>`。 |
 | `turn.ts` | 对话主卡、assistant 分段、计划/目标/上下文压缩元素和 AskUserQuestion 面板；工具相关导出从 `tool.ts` 兼容 re-export。 |
 | `tool.ts` | 工具折叠面板、权限按钮、Read 批次面板，以及 Bash/FileChange/WebSearch/MCP/Image/Agent 等工具输入/输出摘要。 |
+| `task-board.ts` | Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板。codex 的 TodoWrite 一次就带完整列表,但 Claude Code 拆成 4 个单点工具,这里维护一份以 task id 为 key 的 board(`applyTaskTool` 跨调用累积),`taskBoardElement` 渲染整个板产出与 codex 一致的列表效果。board 由 `session-tools.ts` 在 Session 级持有。 |
 | `agy.ts` | `agy <prompt>` 任务卡片，渲染 prompt、状态统计、执行结果、仓库变更和转发 Codex 按钮。 |
 | `console.ts` | `hi` 控制台、状态卡、菜单卡、模型/effort 选择卡、额度/主机信息格式化和关闭 streaming 设置。 |
 | `worktree.ts` | `wt` 列表卡和创建/加入提示卡，展示 `work/*` 分支状态、归档摘要并提供常驻删除按钮。 |
@@ -20,6 +21,7 @@
 | `agy.test.ts` | Bun 测试，覆盖 agy 卡片结构、状态行、输出清理、仓库摘要和转发按钮。 |
 | `worktree.test.ts` | Bun 测试，覆盖 `wt` 卡片的归档隐藏和状态排序。 |
 | `task.test.ts` | Bun 测试，覆盖 `task` 面板未启用、已启用和删除确认状态。 |
+| `task-board.test.ts` | Bun 测试，覆盖 Task 工具累积语义(Create 抓 id/Update 改 status/List 全量替换与空数组清空/Get 补全)、board 统计摘要和整个板的列表渲染。 |
 
 ## Subdirectories
 | Directory | Purpose |

@@ -82,3 +82,12 @@ export {
   type TasklistPanelOpts,
   tasklistPanelCard,
 } from './cards/task'
+export {
+  type TaskBoardEntry,
+  type TaskBoardOp,
+  type TaskToolName,
+  asTaskToolName,
+  applyTaskTool,
+  summarizeTaskBoard,
+  taskBoardElement,
+} from './cards/task-board'

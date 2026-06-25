@@ -29,13 +29,22 @@ export async function onPermissionDecision(
   const turn = s.currentTurn
   const meta = turn?.toolByUseId.get(pending.toolUseId)
   if (turn && meta) {
+    // Task 工具的面板由 session board 渲染(见 cards/task-board.ts),审批
+    // 决策时 board 尚未因本次调用改变(deny=操作没生效;allow=等 completeTool
+    // 才更新),所以这里只换 status emoji + 把审批备注塞进 resolvedNote。
+    const taskName = cards.asTaskToolName(meta.name)
     if (decision === 'deny') {
-      const el = cards.toolCallElement(meta.i, meta.name, meta.input, `🚫 已拒绝 by ${user || '匿名'}`, '❌')
+      const note = `🚫 已拒绝 by ${user || '匿名'}`
+      const el = taskName
+        ? cards.taskBoardElement(meta.i, s.taskBoard, { name: taskName, status: '❌' }, note)
+        : cards.toolCallElement(meta.i, meta.name, meta.input, note, '❌')
       void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
     } else {
       const label = decision === 'allow_always' ? '始终允许' : '已允许'
       meta.resolvedNote = `✅ **${label}** by ${user || '匿名'}`
-      const el = cards.toolCallElement(meta.i, meta.name, meta.input, null, '⏳', meta.resolvedNote)
+      const el = taskName
+        ? cards.taskBoardElement(meta.i, s.taskBoard, { name: taskName, status: '⏳' }, meta.resolvedNote)
+        : cards.toolCallElement(meta.i, meta.name, meta.input, null, '⏳', meta.resolvedNote)
       void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i), el)
     }
   }
