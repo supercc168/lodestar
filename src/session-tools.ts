@@ -11,6 +11,7 @@ import { isAbsolute } from 'node:path'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
+import { log } from './log'
 
 function isImageGenerationTool(name: string): boolean {
   return name === 'ImageGeneration' || name === 'imageGeneration'
@@ -60,8 +61,18 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
   const taskName = cards.asTaskToolName(name)
   if (taskName) {
     const turn = s.currentTurn
-    const isFirst = turn.taskToolI === null
-    const ti = isFirst ? (turn.taskToolI = turn.toolCount++) : turn.taskToolI
+    // 连续同类合并:TaskCreate→创建面板,TaskUpdate/List/Get→进度快照面板。
+    // 切到另一类则前一类面板定稿(不再更新);board 始终累积。timeline 效果:
+    // 创建面板(全待办) → 进度快照(含进行中/完成)。
+    const isCreate = taskName === 'TaskCreate'
+    if (isCreate) turn.taskUpdateI = null
+    else turn.taskCreateI = null
+    const isFirst = (isCreate ? turn.taskCreateI : turn.taskUpdateI) === null
+    if (isFirst) {
+      if (isCreate) turn.taskCreateI = turn.toolCount++
+      else turn.taskUpdateI = turn.toolCount++
+    }
+    const ti = (isCreate ? turn.taskCreateI : turn.taskUpdateI) as number
     turn.toolByUseId.set(toolUseId, { i: ti, name, input })
     const el = cards.taskBoardElement(ti, s.taskBoard, { name: taskName, status: '⏳' })
     void (isFirst
@@ -69,6 +80,9 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
       : cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(ti), el))
     return
   }
+  // 非 Task 工具:Task 面板合并窗口关闭(创建/进度面板各自定稿)
+  s.currentTurn.taskCreateI = null
+  s.currentTurn.taskUpdateI = null
   const i = s.currentTurn.toolCount++
   if (name === 'Read') {
     // First Read of a run — render the batch panel (file-paths only,
@@ -194,9 +208,12 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
  * 一次坏结果污染累积状态)。 */
 function completeTaskTool(s: Session, meta: { i: number; name: string }, taskName: cards.TaskToolName, input: any, output: string, isError: boolean, resolvedNote?: string): void {
   if (!s.currentTurn) return
+  const before = s.taskBoard.map(t => `${t.id}:${t.status}`).join('|')
   if (!isError) {
     s.taskBoard = cards.applyTaskTool(s.taskBoard, taskName, input, output)
   }
+  const after = s.taskBoard.map(t => `${t.id}:${t.status}`).join('|')
+  log(`[TASK] complete ${taskName} output=${JSON.stringify(output).slice(0, 100)} input=${JSON.stringify(input).slice(0, 50)} before=[${before}] after=[${after}]`)
   const el = cards.taskBoardElement(meta.i, s.taskBoard, { name: taskName, status: isError ? '❌' : '✅' }, resolvedNote)
   void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
   startThinkingIfNoToolsRunning(s)
@@ -264,9 +281,15 @@ export function rebuildToolsOnRotate(
     // 累积快照,重复建多个相同面板无意义)。第一个 task 工具建槽,后续 replace。
     const rotatedTaskName = cards.asTaskToolName(meta.name)
     if (rotatedTaskName) {
-      const isFirst = turn.taskToolI === null
-      if (isFirst) turn.taskToolI = turn.toolCount++
-      const ti = turn.taskToolI
+      const isCreate = rotatedTaskName === 'TaskCreate'
+      if (isCreate) turn.taskUpdateI = null
+      else turn.taskCreateI = null
+      const isFirst = (isCreate ? turn.taskCreateI : turn.taskUpdateI) === null
+      if (isFirst) {
+        if (isCreate) turn.taskCreateI = turn.toolCount++
+        else turn.taskUpdateI = turn.toolCount++
+      }
+      const ti = (isCreate ? turn.taskCreateI : turn.taskUpdateI) as number
       turn.toolByUseId.set(useId, { ...meta, i: ti })
       const status: '⏳' | '✅' | '❌' = !done ? '⏳' : (isError ? '❌' : '✅')
       const el = cards.taskBoardElement(ti, s.taskBoard, { name: rotatedTaskName, status }, meta.resolvedNote)

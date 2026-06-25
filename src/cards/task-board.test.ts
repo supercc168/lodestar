@@ -190,7 +190,8 @@ describe('taskBoardElement — 渲染整个 board', () => {
     expect(el.elements[0].content).toContain('- 🔄 正在重构')
   })
 
-  test('进行中排最前,完成沉底', () => {
+  test('始终按 #N(创建顺序)排列,不按状态重排', () => {
+    // 之前按状态排序(进行中→待办→完成),#1 完成就沉底顺序乱;现按 id 数字升序。
     const board: TaskBoardEntry[] = [
       { id: '1', subject: '完成项', status: 'completed' },
       { id: '2', subject: '进行项', status: 'in_progress' },
@@ -199,9 +200,9 @@ describe('taskBoardElement — 渲染整个 board', () => {
     const el = taskBoardElement(0, board, { name: 'TaskList', status: '✅' }) as any
     const lines: string[] = el.elements[0].content.split('\n')
     const items = lines.filter(l => l.startsWith('- '))
-    expect(items[0]).toContain('进行项')
-    expect(items[1]).toContain('待办项')
-    expect(items[2]).toContain('完成项')
+    expect(items[0]).toContain('完成项')  // #1
+    expect(items[1]).toContain('进行项')  // #2
+    expect(items[2]).toContain('待办项')  // #3
   })
 
   test('resolvedNote 附加在 body 末尾', () => {

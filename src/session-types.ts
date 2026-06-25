@@ -53,13 +53,15 @@ export interface TurnState {
     items: Array<{ toolUseId: string; input: any; output: string | null; isError: boolean }>
   }>
   openReadBatchI: number | null
-  /** 本 turn 的 Task 工具(TaskCreate/Update/List/Get)共用的面板 element
-   * slot。codex 的 TodoWrite 一次调用一个面板,但 Claude Code 一次任务流程
-   * 会 TaskCreate×N + TaskUpdate×N 高频调用 —— 若每次都新建面板会堆成一串
-   * 重复视图。所以整个流程复用同一面板:第一个 Task 工具 addElement 建槽并
-   * 记 i,后续 Task 工具 replaceElement 同一 i。null = 本 turn 还没出现过
-   * Task 工具。board 本身累积在 session 级(session.taskBoard),这里只管 slot。 */
-  taskToolI: number | null
+  /** Task 工具按类型分两个合并槽(连续同类调用复用同一面板,切类则前一类定稿):
+   * - taskCreateI:连续 TaskCreate 合并成"创建任务"面板(列待办,按 #1#2#3 顺序),
+   *   遇到任何非 Create 工具(含 TaskUpdate)即定稿,board 后续变化不再回写它。
+   * - taskUpdateI:连续 TaskUpdate/List/Get 合并成"进度快照"面板(复制任务列表
+   *   + 标记进行中/完成),遇到非该类工具即定稿。形成 timeline:
+   *   创建面板(全待办) → 进度快照1 → 进度快照2 → ...
+   *   null = 该类本 turn 还没活动槽。board 累积在 session 级(session.taskBoard)。 */
+  taskCreateI: number | null
+  taskUpdateI: number | null
   assistantSegmentCount: number
   currentAssistantSegmentId: string | null
   currentAssistantText: string

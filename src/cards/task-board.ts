@@ -277,11 +277,15 @@ export function summarizeTaskBoard(board: TaskBoardEntry[]): string {
 function renderTaskBoardBody(board: TaskBoardEntry[], resolvedNote?: string): string {
   const visible = board.filter(t => t.status !== 'deleted')
   const lines: string[] = [`**待办**: ${visible.length} 项`]
-  // 进行中的排最前,完成的沉底 —— 跟实际工作焦点一致。
-  const rank: Record<TaskBoardEntry['status'], number> = {
-    in_progress: 0, pending: 1, completed: 2, deleted: 3,
+  // 始终按 #N(创建顺序)排列 —— 不按状态重排,否则 #1 一旦完成就沉底,顺序乱。
+  const numId = (id: string): number => {
+    const n = parseInt(id, 10)
+    return Number.isNaN(n) ? Number.MAX_SAFE_INTEGER : n
   }
-  const ordered = [...visible].sort((a, b) => rank[a.status] - rank[b.status])
+  const ordered = [...visible].sort((a, b) => {
+    const d = numId(a.id) - numId(b.id)
+    return d !== 0 ? d : a.id.localeCompare(b.id)
+  })
   for (const t of ordered.slice(0, 12)) {
     const emoji = STATUS_EMOJI[t.status]
     // 进行中时优先用 activeForm(更"正在进行"的语气),其余用 subject。
