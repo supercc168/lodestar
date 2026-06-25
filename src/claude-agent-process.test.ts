@@ -493,8 +493,10 @@ describe('Claude token accounting', () => {
       total_tokens: 203,
     })
     expect(usageEvents[1].contextWindow).toBe(258000)
-    // 输入侧占用 = input(130) + cache_read(40) + cache_creation(8) = 178,不含 output(25)
-    expect(proc.lastContextTokens).toBe(178)
+    // 占用改用单次 result.usage:result-2 的 usage.input=4(无 cache)= 4。
+    // 不再用累计 modelUsage(input130+cache_read40+creation8=178)—— 累计会随轮数
+    // 破分母,带 cache 连续会话恒显 100%。
+    expect(proc.lastContextTokens).toBe(4)
     expect(proc.lastResult.cost_usd).toBeNull()
     expect(proc.lastResult.cost_delta_usd).toBeNull()
   })

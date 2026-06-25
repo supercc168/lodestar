@@ -922,8 +922,11 @@ export class ClaudeAgentProcess extends EventEmitter {
       }
     }
     this.lastContextWindow = contextWindowMaxByRoute.get(claudeRouteKey(this.opts.model)) ?? total.contextWindow ?? null
-    // 上下文占用 = 输入侧 token,不含 output(Claude Code 底栏同口径)。
-    this.lastContextTokens = contextOccupancyFromUsage(this.lastTotalUsage)
+    // 上下文占用 = 最后一次请求的输入侧 token(input+cache_read+cache_creation),
+    // 不含 output,用单次 lastUsage(result.usage = just-finished SDK query)。
+    // 不能用累计 lastTotalUsage —— modelUsage 是会话级累计,带 prompt cache 的连续
+    // 会话每轮上下文都叠进 cache_read,N 轮后累计破 1M 分母 → 占用恒显 100%。
+    this.lastContextTokens = contextOccupancyFromUsage(this.lastUsage)
     if (this.lastTotalUsage || this.lastUsage) {
       this.emit('token_usage', {
         usage: this.lastUsage,
