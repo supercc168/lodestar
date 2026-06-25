@@ -10,7 +10,7 @@
  *
  *   config.toml             — credentials + preferences (in CONFIG_DIR)
  *   daemon.pid              — single-instance lock          (in DATA_DIR)
- *   daemon.log              — append-only run log           (in DATA_DIR)
+ *   daemon-YYYY-MM-DD.log   — 按日滚动运行日志, 保留近 7 天  (in DATA_DIR)
  *   session-chat-map.json   — duplicate-name routing        (in DATA_DIR)
  *   session-resume-map.json — last-known Codex thread_id  (in DATA_DIR)
  *   session-model-map.json  — per-session selected Codex model (in DATA_DIR)
@@ -60,6 +60,9 @@ export const DATA_DIR = pickDir(
 
 export const CONFIG_FILE = process.env.LODESTAR_CONFIG ?? join(CONFIG_DIR, 'config.toml')
 export const PID_FILE = join(DATA_DIR, 'daemon.pid')
+/** Legacy 单文件日志(append-only)。启动时 `src/log.ts` 把它一次性迁移
+ * 成按日文件 `daemon-YYYY-MM-DD.log`(按本地日期,保留近 7 天),之后
+ * 新日志只写按日文件;本路径仅作迁移源存在。 */
 export const LOG_FILE = join(DATA_DIR, 'daemon.log')
 export const SESSION_CHAT_MAP_FILE = join(DATA_DIR, 'session-chat-map.json')
 export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')

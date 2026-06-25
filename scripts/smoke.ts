@@ -13,7 +13,7 @@
  * Sends a `[SMOKE]` preface message in the group so you can correlate
  * the run with what you see, then drives Session.onUserMessage directly
  * with the same prompt. All cardkit / codex-process activity logs to
- * stderr and to <data_dir>/daemon.log.
+ * stderr and to <data_dir>/daemon-YYYY-MM-DD.log.
  */
 
 // Smoke imports the daemon modules directly; they auto-load config.toml

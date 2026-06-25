@@ -58,8 +58,8 @@ async function main(): Promise<void> {
     console.error(`${C.yellow}Lodestar: 已经有一个 daemon 在运行 (pid ${guard.pid})${C.reset}`)
     console.error('  • 想看日志:'
       + (process.platform === 'win32'
-          ? ' %LOCALAPPDATA%\\Lodestar\\daemon.log'
-          : ' ~/.local/share/lodestar/daemon.log'))
+          ? ' %LOCALAPPDATA%\\Lodestar\\daemon-YYYY-MM-DD.log'
+          : ' ~/.local/share/lodestar/daemon-YYYY-MM-DD.log'))
     console.error('  • 想停: 任务管理器结束 pid 上面那个号 (Windows) / `kill ' + guard.pid + '` (Linux/macOS)')
     console.error(`  • 误判 / 已经死了: 手删 ${PID_FILE} 后再跑`)
     process.exit(1)

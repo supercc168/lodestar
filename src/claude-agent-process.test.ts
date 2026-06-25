@@ -1,6 +1,6 @@
 import { homedir } from 'node:os'
 import { delimiter, join, win32 } from 'node:path'
-import { describe, expect, mock, test } from 'bun:test'
+import { beforeEach, describe, expect, mock, test } from 'bun:test'
 
 mock.module('./config', () => ({
   config: {
@@ -16,11 +16,16 @@ const {
   CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS,
   CLAUDE_PERMISSION_MODE,
   ClaudeAgentProcess,
+  resetClaudeContextWindowMaxCache,
   resolveClaudeExecutableConfig,
 } = await import('./claude-agent-process')
 const {
   resolveClaudeSdkModel,
 } = await import('./claude-models')
+
+// context window max 是 daemon 全局缓存(按路由 key 跨 session 共享),
+// 每个用例前重置,避免互相污染。
+beforeEach(() => resetClaudeContextWindowMaxCache())
 
 describe('Claude model profiles', () => {
   test('uses SDK default executable when no global Claude command is found', () => {
@@ -542,9 +547,10 @@ describe('Claude token accounting', () => {
     expect(proc.lastResult.cost_delta_usd).toBeNull()
   })
 
-  test('uses SDK-reported context window as the denominator', () => {
-    // SDK modelUsage 上报的 contextWindow 就是当前路由的真实窗口(settings 配
-    // GLM-5.2[1m] 自动 1M,无后缀 200K/100K),分母纯信它,不再有 profile 声明值。
+  test('single SDK context-window report becomes the locked denominator', () => {
+    // 分母取该路由 SDK contextWindow 的全局历史 max;单次上报 → max 即该值。
+    // 首轮 SDK 常回落默认 200K,真实窗口(GLM-5.2[1m] → 1M)跑几轮才上报,
+    // 见下方 lock-max 与跨 session 共享测试。
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
       effort: 'high',
@@ -579,6 +585,82 @@ describe('Claude token accounting', () => {
     expect(proc.lastContextWindow).toBe(100_000)
     // 输入侧占用 = input(87000) + cache_read(0) + cache_creation(0) = 87000,不含 output(700)
     expect(proc.lastContextTokens).toBe(87_000)
+  })
+
+  test('context window locks to historical max and never decreases', () => {
+    // 分母锁定 SDK 历史 max(单调不降):首轮回落默认 200K,真实窗口 1M 上报
+    // 后升上去,再回 200K / 异常 258K 都不再覆盖 → 百分比不会忽高忽低。
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp',
+      effort: 'high',
+      model: 'claude:glm',
+    }) as any
+    const events: any[] = []
+    proc.on('token_usage', (e: any) => events.push(e))
+
+    const result = (ctx: number) => proc.handleMessage({
+      type: 'result',
+      subtype: 'success',
+      uuid: `r-${ctx}`,
+      session_id: 'claude-session-1',
+      is_error: false,
+      duration_ms: 1,
+      num_turns: 1,
+      usage: { input_tokens: 1000, output_tokens: 10 },
+      modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: ctx } },
+    })
+
+    result(200_000)
+    expect(events).toHaveLength(1)
+    expect(proc.lastContextWindow).toBe(200_000)
+    expect(events[0].contextWindow).toBe(200_000)
+    result(1_000_000)
+    expect(proc.lastContextWindow).toBe(1_000_000) // 升到真实窗口
+    expect(events[1].contextWindow).toBe(1_000_000)
+    result(200_000)
+    expect(proc.lastContextWindow).toBe(1_000_000) // 不降
+    expect(events[2].contextWindow).toBe(1_000_000)
+    result(258_000)
+    expect(proc.lastContextWindow).toBe(1_000_000) // 异常值也不覆盖
+  })
+
+  test('context window max is shared across sessions (daemon-global per route)', () => {
+    // 全局锁定:任一 session 探测到真实窗口后, 同路由的其它 session 立即用作
+    // 分母, 不各自首轮回落 200K。context window 是路由属性, 与 session 无关。
+    const proc1 = new ClaudeAgentProcess({
+      workDir: '/tmp', effort: 'high', model: 'claude:glm',
+    }) as any
+    proc1.handleMessage({
+      type: 'result', subtype: 'success', uuid: 'r-global-1', session_id: 's1',
+      is_error: false, duration_ms: 1, num_turns: 1,
+      usage: { input_tokens: 1000, output_tokens: 10 },
+      modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 1_000_000 } },
+    })
+    expect(proc1.lastContextWindow).toBe(1_000_000)
+
+    // 全新 session/实例, 同路由; 即便 SDK 首轮报 200K 也立即取全局锁定的 1M
+    const proc2 = new ClaudeAgentProcess({
+      workDir: '/tmp', effort: 'high', model: 'claude:glm',
+    }) as any
+    proc2.handleMessage({
+      type: 'result', subtype: 'success', uuid: 'r-global-2', session_id: 's2',
+      is_error: false, duration_ms: 1, num_turns: 1,
+      usage: { input_tokens: 1000, output_tokens: 10 },
+      modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 200_000 } },
+    })
+    expect(proc2.lastContextWindow).toBe(1_000_000) // 全局锁定, 不是首轮 200K
+
+    // 不同路由不串扰:default 路由的探测独立于 glm 路由
+    const proc3 = new ClaudeAgentProcess({
+      workDir: '/tmp', effort: 'high', model: 'claude:default',
+    }) as any
+    proc3.handleMessage({
+      type: 'result', subtype: 'success', uuid: 'r-global-3', session_id: 's3',
+      is_error: false, duration_ms: 1, num_turns: 1,
+      usage: { input_tokens: 1000, output_tokens: 10 },
+      modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 200_000 } },
+    })
+    expect(proc3.lastContextWindow).toBe(200_000) // default 路由独立, 200K
   })
 
   test('context window stays null when SDK does not report one', () => {

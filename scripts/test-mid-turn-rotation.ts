@@ -13,7 +13,8 @@
  */
 import { readFileSync } from 'node:fs'
 import { request } from 'node:http'
-import { DEBUG_SOCK_FILE, LOG_FILE } from '../src/paths'
+import { DEBUG_SOCK_FILE } from '../src/paths'
+import { logFileForDate } from '../src/log'
 
 function inject(text: string): Promise<{ status: number; body: string }> {
   return new Promise((resolve, reject) => {
@@ -36,7 +37,10 @@ function inject(text: string): Promise<{ status: number; body: string }> {
 }
 
 async function main() {
-  const startLine = readFileSync(LOG_FILE, 'utf8').split('\n').length
+  // 锁定本次测试的日志文件(今天的按日文件)。测试时长 <1 分钟, 跨午夜
+  // 极罕见;若跨天, 尾部日志会落到次日文件、本切片漏掉, 属可接受边角。
+  const logFile = logFileForDate(new Date())
+  const startLine = readFileSync(logFile, 'utf8').split('\n').length
   console.log(`[${new Date().toISOString()}] start_line=${startLine}`)
 
   // First inject `kill` to force a clean spawn (no resumed-turn leftover)
@@ -49,7 +53,7 @@ async function main() {
   await inject('停下,告诉我你数到几了'); await Bun.sleep(45000)
   console.log(`[${new Date().toISOString()}] done waiting, dumping log slice`)
 
-  const lines = readFileSync(LOG_FILE, 'utf8').split('\n').slice(startLine)
+  const lines = readFileSync(logFile, 'utf8').split('\n').slice(startLine)
   const filtered = lines.filter(l =>
     /test1|debug:|SDK init|SDK result|openTurnCard|drainMidTurn|cardkit/.test(l))
   console.log('=== RELEVANT LOG ===')

@@ -229,6 +229,22 @@ function contextOccupancyFromUsage(usage: CodexUsage | null | undefined): number
   return occ > 0 ? occ : null
 }
 
+/** SDK contextWindow 历史 max,按 claude 路由 key 在 daemon 进程内全局共享。
+ * context window 是模型路由属性(与 session 无关):任一 session 探测到的真实
+ * 窗口(GLM-5.2[1m] → 1M)锁定后,同路由所有 session 立即用作分母,不再各自
+ * 首轮回落默认 200K。daemon 重启后重新探测(不持久化,重启不常发生)。 */
+const contextWindowMaxByRoute = new Map<string, number>()
+
+function claudeRouteKey(model: string | null | undefined): string {
+  // opts.model 形如 'claude:glm' / 'claude:default';null 归一到 default。
+  return model && model.trim() ? model : 'claude:default'
+}
+
+/** 仅供测试重置全局缓存,保证用例隔离。 */
+export function resetClaudeContextWindowMaxCache(): void {
+  contextWindowMaxByRoute.clear()
+}
+
 function totalUsageFromModelUsage(modelUsage: any): { usage: CodexUsage | null; contextWindow: number | null } {
   if (!modelUsage || typeof modelUsage !== 'object') return { usage: null, contextWindow: null }
   const usage: CodexUsage = {}
@@ -891,13 +907,21 @@ export class ClaudeAgentProcess extends EventEmitter {
     } else {
       this.lastTotalUsage = this.cumulativeUsageFromResults ? cloneUsage(this.cumulativeUsageFromResults) : null
     }
-    // 分母纯信 SDK modelUsage 上报的 contextWindow —— 它就是当前路由的真实
-    // 窗口(settings 配 GLM-5.2[1m] 自动 1M,无后缀 200K/100K)。SDK 没上报就是
-    // null,contextLimit 显示 '--',不为它兜底假窗口(no fallback)。
-    this.lastContextWindow = total.contextWindow ?? null
+    // 分母 = 该路由的 SDK contextWindow 历史 max(daemon 全局,按路由 key 共享)。
+    // context window 是模型路由属性,与 session 无关:任一 session 探测到的真实
+    // 窗口(GLM-5.2[1m] → 1M)全局锁定,所有 session 立即用作分母,不再各自首轮
+    // 回落默认 200K。取 max 且单调不降,避免忽高忽低。SDK 从未上报 → null(--)。
     if (total.contextWindow != null) {
-      log(`claude-agent-process: SDK contextWindow ${total.contextWindow} for model=${this.opts.model ?? 'default'}`)
+      const routeKey = claudeRouteKey(this.opts.model)
+      const prev = contextWindowMaxByRoute.get(routeKey) ?? 0
+      if (total.contextWindow > prev) {
+        contextWindowMaxByRoute.set(routeKey, total.contextWindow)
+        log(`claude-agent-process: SDK contextWindow ${total.contextWindow} (global max for ${routeKey}, prev ${prev || '-'})`)
+      } else if (total.contextWindow < (contextWindowMaxByRoute.get(routeKey) ?? 0)) {
+        log(`claude-agent-process: SDK contextWindow ${total.contextWindow} ignored (global max ${contextWindowMaxByRoute.get(routeKey)} locked for ${routeKey})`)
+      }
     }
+    this.lastContextWindow = contextWindowMaxByRoute.get(claudeRouteKey(this.opts.model)) ?? total.contextWindow ?? null
     // 上下文占用 = 输入侧 token,不含 output(Claude Code 底栏同口径)。
     this.lastContextTokens = contextOccupancyFromUsage(this.lastTotalUsage)
     if (this.lastTotalUsage || this.lastUsage) {

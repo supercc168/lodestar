@@ -406,7 +406,14 @@ export class Session {
   }
 
   private modelLine(): string {
-    const label = this.modelEffortLabel()
+    const model = this.currentModelLabel()
+    const effort = this.currentEffortLabel()
+    // claude 路径:provider 已显示 "Claude",model 去掉 "claude:" 前缀,
+    // 否则 footer 会变成 "Claude · claude:GLM-5.2[1m]/max" 两个 claude。
+    const shownModel = this.selectedProvider === 'claude'
+      ? model?.replace(/^claude:/i, '')
+      : model
+    const label = shownModel ? `${shownModel}/${effort}` : effort
     return this.selectedProvider === 'claude' ? `${agentProviderLabel(this.selectedProvider)} · ${label}` : label
   }
 

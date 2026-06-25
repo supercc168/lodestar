@@ -355,8 +355,8 @@ export async function runSetup(): Promise<void> {
   const r = spawnDaemonDetached()
   const sep = process.platform === 'win32' ? '\\' : '/'
   const logPath = process.platform === 'win32'
-    ? `${process.env.LOCALAPPDATA ?? '%LOCALAPPDATA%'}\\Lodestar\\daemon.log`
-    : `${process.env.HOME ?? '~'}/.local/share/lodestar/daemon.log`
+    ? `${process.env.LOCALAPPDATA ?? '%LOCALAPPDATA%'}\\Lodestar\\daemon-YYYY-MM-DD.log`
+    : `${process.env.HOME ?? '~'}/.local/share/lodestar/daemon-YYYY-MM-DD.log`
 
   if (r.pid) {
     console.log(`${C.green}✓ daemon 已在后台启动${C.reset} (pid ${r.pid})`)
@@ -366,7 +366,7 @@ export async function runSetup(): Promise<void> {
     console.log(`  ② 群名 = ${C.cyan}${projectsRoot}${sep}<群名>${C.reset} 下的目录名 (新群第一条消息会自动建)`)
     console.log(`  ③ 在群里发任意一条消息, Codex 上线`)
     console.log()
-    console.log(`日志:`)
+    console.log(`日志 (按日滚动, 保留近 7 天):`)
     console.log(`  ${C.cyan}${logPath}${C.reset}`)
     console.log()
     console.log(`${C.dim}若长期跑后台, 参考 README "7×24 守护" 一节配 systemd / Windows 后台托管。${C.reset}`)

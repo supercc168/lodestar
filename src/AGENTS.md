@@ -50,7 +50,7 @@
 | `pid-guard.ts` | PID 文件和进程 cmdline marker 校验，防止误认复用 PID。 |
 | `context-window.ts` | 根据模型和 token usage 估算 context window 占用。 |
 | `outbound-markers.ts` | 解析 assistant 输出中的 `[[send: /abs/path]]` 附件发送标记。 |
-| `log.ts` | 追加写入 `daemon.log` 的轻量 logger。 |
+| `log.ts` | 按日滚动 logger：写 `daemon-YYYY-MM-DD.log`（本地日期），跨天与启动时清理超过 7 天的旧日志；启动把老 `daemon.log` 迁移成按日文件。 |
 | `*.test.ts` | Bun 单元测试，覆盖 Card Kit、turn/agy/task card 渲染、tasklist worker、card action 回调返回、context window 展示、outbound marker、Codex 事件解析、usage 快照、session 行为和 worktree/agy Git 行为。 |
 
 ## Subdirectories
