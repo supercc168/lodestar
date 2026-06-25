@@ -50,9 +50,6 @@ export interface LodestarConfig {
 export interface ClaudeModelConfig {
   display_name?: string
   description?: string
-  opus?: string
-  sonnet?: string
-  haiku?: string
   model?: string
   context_window?: string
 }
@@ -139,9 +136,6 @@ function loadConfig(): LodestarConfig {
         if (
           field === 'display_name' ||
           field === 'description' ||
-          field === 'opus' ||
-          field === 'sonnet' ||
-          field === 'haiku' ||
           field === 'model' ||
           field === 'context_window'
         ) {

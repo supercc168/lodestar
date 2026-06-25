@@ -5,29 +5,22 @@ export interface ClaudeModelProfile {
   name: string
   displayName: string
   description: string
-  opus: string
-  sonnet: string
-  haiku: string
   sdkModel: string
   contextWindow: number | null
 }
 
 type DefaultClaudeModelConfig = Required<
-  Pick<ClaudeModelConfig, 'display_name' | 'description' | 'opus' | 'sonnet' | 'haiku'>
+  Pick<ClaudeModelConfig, 'display_name' | 'description'>
 > & Pick<ClaudeModelConfig, 'context_window'>
 
 const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
   glm: {
     display_name: 'Claude Code · GLM',
     description: '使用 GLM 路由，适合中文交流和通用编码任务。',
-    // 智谱 Anthropic 兼容端点要求模型名用官方完整名(GLM-5.2)并带 [1m]
-    // 后缀才放开 1M 上下文;简写名(5.2)或无后缀只给 200K。haiku 同理
-    // 用完整名 GLM-4.7(轻量档不加 [1m])。
-    opus: 'GLM-5.2[1m]',
-    sonnet: 'GLM-5.2[1m]',
-    haiku: 'GLM-4.7',
     // GLM-5.2[1m] 真实窗口 1M;SDK 经 Claude Code→GLM 链路实测的 contextWindow
     // 系统性偏低(100K~200K 波动,见 daemon.log),不可信,故此值优先覆盖实测。
+    // 模型名路由(GLM-5.2[1m] / GLM-4.7)完全靠 ~/.claude/settings.json 的
+    // ANTHROPIC_DEFAULT_*_MODEL,lodestar 不再重复声明。
     context_window: '1000000',
   },
 }
@@ -49,19 +42,12 @@ function parseContextWindow(value: string | undefined): number | null {
 
 function toProfile(name: string): ClaudeModelProfile | null {
   const raw = mergedConfig(name)
-  const opus = raw.opus?.trim()
-  const sonnet = raw.sonnet?.trim()
-  const haiku = raw.haiku?.trim()
-  if (!opus || !sonnet || !haiku) return null
   const key = `claude:${name}`
   return {
     key,
     name,
     displayName: raw.display_name?.trim() || `Claude Code · ${name}`,
     description: raw.description?.trim() || `使用 ${name} 路由运行 Claude Code 后端。`,
-    opus,
-    sonnet,
-    haiku,
     sdkModel: raw.model?.trim() || 'opus',
     contextWindow: parseContextWindow(raw.context_window),
   }
