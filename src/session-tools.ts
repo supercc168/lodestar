@@ -11,7 +11,6 @@ import { isAbsolute } from 'node:path'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
-import { log } from './log'
 
 function isImageGenerationTool(name: string): boolean {
   return name === 'ImageGeneration' || name === 'imageGeneration'
@@ -208,12 +207,9 @@ export function completeTool(s: Session, toolUseId: string, content: any, isErro
  * 一次坏结果污染累积状态)。 */
 function completeTaskTool(s: Session, meta: { i: number; name: string }, taskName: cards.TaskToolName, input: any, output: string, isError: boolean, resolvedNote?: string): void {
   if (!s.currentTurn) return
-  const before = s.taskBoard.map(t => `${t.id}:${t.status}`).join('|')
   if (!isError) {
     s.taskBoard = cards.applyTaskTool(s.taskBoard, taskName, input, output)
   }
-  const after = s.taskBoard.map(t => `${t.id}:${t.status}`).join('|')
-  log(`[TASK] complete ${taskName} output=${JSON.stringify(output).slice(0, 100)} input=${JSON.stringify(input).slice(0, 50)} before=[${before}] after=[${after}]`)
   const el = cards.taskBoardElement(meta.i, s.taskBoard, { name: taskName, status: isError ? '❌' : '✅' }, resolvedNote)
   void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
   startThinkingIfNoToolsRunning(s)

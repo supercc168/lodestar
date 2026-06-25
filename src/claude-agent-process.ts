@@ -832,7 +832,6 @@ export class ClaudeAgentProcess extends EventEmitter {
   private emitToolResultOnce(toolUseId: string, content: string, isError: boolean): void {
     if (this.emittedToolResultIds.has(toolUseId)) return
     this.emittedToolResultIds.add(toolUseId)
-    log(`[TASKEMIT] useId=${toolUseId.slice(-8)} content=${JSON.stringify(content).slice(0, 100)} isError=${isError}`)
     this.emit('tool_result', {
       tool_use_id: toolUseId,
       content,
