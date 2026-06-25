@@ -156,8 +156,18 @@ async function fetchUsage(): Promise<UsageSnapshot> {
   }
 }
 
+/** 读最近一次 usage cache,不触发 fetch。给 turn footer 用 —— codex turn
+ * 中 `updateUsageFromRateLimits` 已把当轮 rateLimit 写进 cache,这里直接
+ * 复用,避免每轮 turn 都为拿一个百分比去 spawn 一个 codex app-server
+ * 子进程(readUsage 的代价)。cache 为空(turn 中没收到 rateLimit)返回 null,
+ * 调用方按 no_fallbacks 省略 5h 段。 */
+export function peekUsage(): UsageSnapshot | null {
+  return cache
+}
+
 export async function readUsage(): Promise<UsageSnapshot> {
   if (inFlight) return inFlight
+
   inFlight = fetchUsage()
     .then(d => {
       inFlight = null

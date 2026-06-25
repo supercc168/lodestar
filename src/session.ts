@@ -46,7 +46,8 @@ import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
 import { readSysInfo } from './sysinfo'
-import { readUsage, updateUsageFromRateLimits, type UsageSnapshot } from './usage'
+import { readUsage, updateUsageFromRateLimits, peekUsage, type UsageSnapshot } from './usage'
+import { readGlmUsage, type GlmUsageSnapshot } from './glm-usage'
 import {
   contextLimitFromAppServer,
   contextTokensFromUsage,
@@ -1041,7 +1042,10 @@ export class Session {
    *
    * Passing `usage=undefined` paints the `_加载中…_` placeholder — the
    * caller is responsible for the async patch if the panel was sent. */
-  async buildConsoleOpts(usage: UsageSnapshot | undefined): Promise<cards.ConsoleOpts> {
+  async buildConsoleOpts(
+    usage: UsageSnapshot | undefined,
+    glmUsage?: GlmUsageSnapshot,
+  ): Promise<cards.ConsoleOpts> {
     const sysinfo = await readSysInfo()
     return {
       sessionName: this.sessionName,
@@ -1057,6 +1061,7 @@ export class Session {
           isCurrent: s === this,
         })),
       usage,
+      glmUsage,
       sysinfo,
     }
   }
@@ -1066,8 +1071,16 @@ export class Session {
   }
 
   private async patchConsoleUsage(cardId: string): Promise<void> {
-    const usage = await readUsage()
-    await cardkit.replaceElement(cardId, cards.ELEMENTS.consoleUsage, cards.consoleUsageElement(usage))
+    // 按当前 provider 只拉对应后端那一个数据源(方案 C,始终一行):
+    //   claude/GLM → src/glm-usage.ts(open.bigmodel.cn / z.ai quota/limit)
+    //   codex      → src/usage.ts(codex app-server rate-limit)
+    const opts = await this.buildConsoleOpts(undefined)
+    if (this.currentProvider() === 'claude') {
+      opts.glmUsage = await readGlmUsage()
+    } else {
+      opts.usage = await readUsage()
+    }
+    await cardkit.replaceElement(cardId, cards.ELEMENTS.consoleUsage, cards.consoleUsageElement(opts))
   }
 
   private patchConsoleUsageLater(cardId: string): void {
@@ -1105,7 +1118,7 @@ export class Session {
     )
     await cardkit.addElement(
       handle.cardId,
-      cards.consoleUsageElement(undefined),
+      cards.consoleUsageElement(consoleOpts),
       { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleHost },
     )
     cardkit.cancelSummary(handle.cardId)
@@ -2312,6 +2325,23 @@ export class Session {
     turn.footerStatusLabel = null
   }
 
+  /** turn footer 末尾的 5h 额度后缀(`  |  5h·N%`),按当前 provider:
+   *   claude/GLM → readGlmUsage(轻量 HTTP,主动拉当前 5h 窗口百分比)
+   *   codex      → peekUsage(turn 中 updateUsageFromRateLimits 已更新 cache,
+   *                纯读不 fetch,避免每轮为一个百分比 spawn codex app-server)
+   * 拿不到百分比就返回空串 —— footer 不假数据 (no_fallbacks)。 */
+  private async footerFiveHourSuffix(): Promise<string> {
+    let pct: number | null = null
+    if (this.proc?.provider === 'claude') {
+      const g = await readGlmUsage()
+      if (g.state === 'ok') pct = g.fiveHour?.percent ?? null
+    } else {
+      const u = peekUsage()
+      if (u?.state === 'ok') pct = u.fiveHour?.percent ?? null
+    }
+    return pct != null ? `  |  5h·${Math.round(pct)}%` : ''
+  }
+
   async closeTurnCard(
     suffix?: string,
     opts: { forcePush?: boolean; hasFreshResult?: boolean } = {},
@@ -2373,7 +2403,7 @@ export class Session {
     if (modelLabel) line1Parts.push(modelLabel)
     const footerLine1 = line1Parts.join(' ｜ ')
     const footerLine2 = opts.hasFreshResult
-      ? cards.footerTokenDetailLine(this.lastTurnUsage)
+      ? cards.footerTokenDetailLine(this.lastTurnUsage) + await this.footerFiveHourSuffix()
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
     await this.replaceFooterContent(cardId, footer)
