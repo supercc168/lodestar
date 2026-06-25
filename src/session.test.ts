@@ -423,6 +423,7 @@ describe('Session provider switching', () => {
   test('rejects cross-provider model switch while a turn is active', async () => {
     const session = new Session('probe', 'chat_id') as any
     session.proc = new FakeAgentProc('codex', 'codex-thread-1')
+    session.selectedProvider = 'codex'
     session.currentTurn = turnState()
 
     const result = await session.onModelEffortSelect('claude:glm', 'max', '', 'ou_user', 'claude')
