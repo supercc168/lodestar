@@ -54,6 +54,21 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
     return
   }
   if (name !== 'Read') s.currentTurn.openReadBatchI = null
+  // Claude Code Task 工具:整个流程复用本 turn 同一面板(codex 单面板效果),
+  // 而非每次调用新建 —— 否则一次 TaskCreate×N + TaskUpdate×N 会堆成一串重复
+  // 视图。board 累积在 session 级,这里只占/复用 element slot。
+  const taskName = cards.asTaskToolName(name)
+  if (taskName) {
+    const turn = s.currentTurn
+    const isFirst = turn.taskToolI === null
+    const ti = isFirst ? (turn.taskToolI = turn.toolCount++) : turn.taskToolI
+    turn.toolByUseId.set(toolUseId, { i: ti, name, input })
+    const el = cards.taskBoardElement(ti, s.taskBoard, { name: taskName, status: '⏳' })
+    void (isFirst
+      ? cardkit.addElement(turn.cardId, el, { type: 'insert_before', targetElementId: cards.ELEMENTS.footer })
+      : cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(ti), el))
+    return
+  }
   const i = s.currentTurn.toolCount++
   if (name === 'Read') {
     // First Read of a run — render the batch panel (file-paths only,
@@ -70,19 +85,6 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
     return
   }
   s.currentTurn.toolByUseId.set(toolUseId, { i, name, input })
-  // Claude Code Task 工具走累积 board 路径:TaskCreate/Update/Get 都是单点
-  // 操作,只有 TaskList 才有完整快照。这里用 session 级累积的 taskBoard
-  // 渲染整个任务板(⏳ 占位,board 暂不变 —— TaskCreate 的 id 要等 output
-  // 才有),让用户每一步都看到完整进度,而非孤立单条。见 cards/task-board.ts。
-  const taskName = cards.asTaskToolName(name)
-  if (taskName) {
-    const el = cards.taskBoardElement(i, s.taskBoard, { name: taskName, status: '⏳' })
-    void cardkit.addElement(s.currentTurn.cardId, el, {
-      type: 'insert_before',
-      targetElementId: cards.ELEMENTS.footer,
-    })
-    return
-  }
   // AskUserQuestion is a client-side tool — daemon renders the choice
   // UI in-line and supplies the tool_result itself once the user
   // clicks. Branch BEFORE the generic toolCallElement so we never
@@ -248,24 +250,36 @@ export function rebuildToolsOnRotate(
     const deadOnOld = cardkit.isDeadElement(oldCardId, cards.ELEMENTS.tool(meta.i))
     // 已完成且旧卡上活着 → 留在旧卡,不搬。
     if (done && !deadOnOld) continue
-    const ni = turn.toolCount++
     if (isRead) {
+      const ni = turn.toolCount++
       const item = { toolUseId: useId, input, output, isError }
       turn.readBatches.set(ni, { items: [item] })
       turn.toolByUseId.set(useId, { ...meta, i: ni, readBatchSlot: 0 })
       void cardkit.addElement(newCardId, cards.readBatchElement(ni, [item]), {
         type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
       })
-    } else {
-      turn.toolByUseId.set(useId, { ...meta, i: ni })
-      const status: '⏳' | '✅' | '❌' = !done ? '⏳' : (isError ? '❌' : '✅')
-      const rotatedTaskName = cards.asTaskToolName(meta.name)
-      const el = rotatedTaskName
-        ? cards.taskBoardElement(ni, s.taskBoard, { name: rotatedTaskName, status }, meta.resolvedNote)
-        : cards.toolCallElement(ni, meta.name, meta.input, output, status, meta.resolvedNote)
-      void cardkit.addElement(newCardId, el, {
-        type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
-      })
+      continue
     }
+    // Task 工具:与新卡 addTool 一致,整个流程复用本 turn 同一面板(board 是
+    // 累积快照,重复建多个相同面板无意义)。第一个 task 工具建槽,后续 replace。
+    const rotatedTaskName = cards.asTaskToolName(meta.name)
+    if (rotatedTaskName) {
+      const isFirst = turn.taskToolI === null
+      if (isFirst) turn.taskToolI = turn.toolCount++
+      const ti = turn.taskToolI
+      turn.toolByUseId.set(useId, { ...meta, i: ti })
+      const status: '⏳' | '✅' | '❌' = !done ? '⏳' : (isError ? '❌' : '✅')
+      const el = cards.taskBoardElement(ti, s.taskBoard, { name: rotatedTaskName, status }, meta.resolvedNote)
+      void (isFirst
+        ? cardkit.addElement(newCardId, el, { type: 'insert_before', targetElementId: cards.ELEMENTS.footer })
+        : cardkit.replaceElement(newCardId, cards.ELEMENTS.tool(ti), el))
+      continue
+    }
+    const ni = turn.toolCount++
+    turn.toolByUseId.set(useId, { ...meta, i: ni })
+    const status: '⏳' | '✅' | '❌' = !done ? '⏳' : (isError ? '❌' : '✅')
+    void cardkit.addElement(newCardId, cards.toolCallElement(ni, meta.name, meta.input, output, status, meta.resolvedNote), {
+      type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
+    })
   }
 }

@@ -1784,6 +1784,7 @@ export class Session {
       contextCompactionPending: new Map(),
       readBatches: new Map(),
       openReadBatchI: null,
+      taskToolI: null,
       assistantSegmentCount: 0,
       currentAssistantSegmentId: null,
       currentAssistantText: '',

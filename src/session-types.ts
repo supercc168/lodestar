@@ -53,6 +53,13 @@ export interface TurnState {
     items: Array<{ toolUseId: string; input: any; output: string | null; isError: boolean }>
   }>
   openReadBatchI: number | null
+  /** 本 turn 的 Task 工具(TaskCreate/Update/List/Get)共用的面板 element
+   * slot。codex 的 TodoWrite 一次调用一个面板,但 Claude Code 一次任务流程
+   * 会 TaskCreate×N + TaskUpdate×N 高频调用 —— 若每次都新建面板会堆成一串
+   * 重复视图。所以整个流程复用同一面板:第一个 Task 工具 addElement 建槽并
+   * 记 i,后续 Task 工具 replaceElement 同一 i。null = 本 turn 还没出现过
+   * Task 工具。board 本身累积在 session 级(session.taskBoard),这里只管 slot。 */
+  taskToolI: number | null
   assistantSegmentCount: number
   currentAssistantSegmentId: string | null
   currentAssistantText: string

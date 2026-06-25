@@ -58,9 +58,37 @@ describe('applyTaskTool — 累积语义', () => {
     expect(board).toEqual([{ id: 'task_2', subject: 'B', status: 'pending' }])
   })
 
-  test('TaskUpdate 未知 id 用 input 兜底建一条(等 List 校正)', () => {
-    const board = applyTaskTool([], 'TaskUpdate', { taskId: 'task_9', status: 'in_progress', subject: '新发现' }, 'Updated')
-    expect(board).toEqual([{ id: 'task_9', subject: '新发现', status: 'in_progress' }])
+  test('TaskUpdate 未知 id 不造假条目(no-op,等 Create/List 校正)', () => {
+    // 曾经的 bug:找不到 id 时用 taskId 当 subject 显示成裸 "1/2/3"。
+    // 现在 no-op —— TaskCreate 拿到正确 id 后自然对上,或等 TaskList 校正。
+    const board = applyTaskTool([], 'TaskUpdate', { taskId: 'task_9', status: 'in_progress' }, 'Updated')
+    expect(board).toEqual([])
+  })
+
+  test('TaskCreate 纯文本 output 解析 id(实测 Claude Code 流的是文本非 JSON)', () => {
+    // 官方文档说 tool_result 是 JSON {task:{id}},但真实流是
+    // "Task #N created successfully: <subject>" 纯文本。必须正则解析 #N。
+    let board: TaskBoardEntry[] = []
+    board = applyTaskTool(board, 'TaskCreate', { subject: '查询模型' }, 'Task #1 created successfully: 查询模型')
+    board = applyTaskTool(board, 'TaskCreate', { subject: '调研口碑' }, 'Task #2 created successfully: 调研口碑')
+    expect(board).toEqual([
+      { id: '1', subject: '查询模型', status: 'pending' },
+      { id: '2', subject: '调研口碑', status: 'pending' },
+    ])
+  })
+
+  test('TaskCreate 文本 id + TaskUpdate taskId 对得上(不再显示裸 1/2/3)', () => {
+    let board: TaskBoardEntry[] = []
+    board = applyTaskTool(board, 'TaskCreate', { subject: '查询模型' }, 'Task #1 created successfully: 查询模型')
+    // TaskUpdate input taskId="1" 必须命中 TaskCreate 解析出的 id="1"
+    board = applyTaskTool(board, 'TaskUpdate', { taskId: '1', status: 'in_progress' }, 'Updated task #1 status')
+    expect(board).toEqual([{ id: '1', subject: '查询模型', status: 'in_progress' }])
+  })
+
+  test('TaskUpdate 无 status 字段(只改 addBlockedBy 等)不动状态', () => {
+    let board: TaskBoardEntry[] = [{ id: '1', subject: 'A', status: 'pending' }]
+    board = applyTaskTool(board, 'TaskUpdate', { taskId: '1', addBlockedBy: ['2'] }, 'Updated task #1 blockedBy')
+    expect(board[0].status).toBe('pending')
   })
 
   test('TaskList 全量替换(权威快照,校正之前漂移)', () => {
@@ -150,8 +178,8 @@ describe('taskBoardElement — 渲染整个 board', () => {
     expect(el.header.title.content).toBe('✅ 🔧 更新任务: 2 项 · 进行中 1 · 待办 1')
     const body: string = el.elements[0].content
     expect(body).toContain('**待办**: 2 项')
-    expect(body).toContain('- 进行中: 读文件')
-    expect(body).toContain('- 待办: 改代码')
+    expect(body).toContain('- 🔄 读文件')
+    expect(body).toContain('- ⬜ 改代码')
   })
 
   test('进行中项优先用 activeForm', () => {
@@ -159,7 +187,7 @@ describe('taskBoardElement — 渲染整个 board', () => {
       { id: '1', subject: '重构', activeForm: '正在重构', status: 'in_progress' },
     ]
     const el = taskBoardElement(0, board, { name: 'TaskList', status: '✅' }) as any
-    expect(el.elements[0].content).toContain('- 进行中: 正在重构')
+    expect(el.elements[0].content).toContain('- 🔄 正在重构')
   })
 
   test('进行中排最前,完成沉底', () => {
