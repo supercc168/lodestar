@@ -845,12 +845,18 @@ export class ClaudeAgentProcess extends EventEmitter {
       if (!block || typeof block !== 'object') continue
       if (block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue
       const toolResult = raw.tool_use_result
-      const output = toolResult && typeof toolResult === 'object'
+      // 优先 block.content(tool_result 的标准结果文本 —— Claude Code 把 Task/
+      // Read/WebSearch 等工具结果放这里);为空时才回退 tool_use_result.stdout/stderr
+      // (codex 风格命令输出)。之前只看 stdout/stderr,非命令工具 output 全丢:
+      // TaskCreate 的 "Task #N created" 丢失 → id 解析失败 → 任务板永远卡在待办。
+      const contentText = textFromToolResultContent(block.content)
+      const stdoutStderr = toolResult && typeof toolResult === 'object'
         ? [
             typeof toolResult.stdout === 'string' ? toolResult.stdout : '',
             typeof toolResult.stderr === 'string' ? toolResult.stderr : '',
           ].filter(Boolean).join('\n')
-        : textFromToolResultContent(block.content)
+        : ''
+      const output = contentText || stdoutStderr
       this.emitToolResultOnce(block.tool_use_id, output, block.is_error === true || toolResult?.interrupted === true)
     }
   }
