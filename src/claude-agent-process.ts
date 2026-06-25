@@ -25,7 +25,6 @@ import {
 } from './agent-process'
 import {
   claudeModelKey,
-  resolveClaudeContextWindow,
   resolveClaudeSdkModel,
 } from './claude-models'
 import type {
@@ -217,6 +216,17 @@ function usageFromSdk(raw: any): CodexUsage | null {
   if (effectiveTotal <= 0) return null
   if (out.total_tokens == null) out.total_tokens = summedTotal
   return out
+}
+
+/** Claude 路径当前上下文占用 = 输入侧 token(喂进模型的全部 input:未缓存新输入
+ * + 缓存命中复读 + 本轮新建缓存),不含 output。Claude Code 底栏百分比用的
+ * 就是这个口径。取 modelUsage 聚合后的 totalUsage,即会话级输入侧累计。 */
+function contextOccupancyFromUsage(usage: CodexUsage | null | undefined): number | null {
+  if (!usage) return null
+  const occ = (usage.input_tokens ?? 0)
+    + (usage.cache_read_input_tokens ?? 0)
+    + (usage.cache_creation_input_tokens ?? 0)
+  return occ > 0 ? occ : null
 }
 
 function totalUsageFromModelUsage(modelUsage: any): { usage: CodexUsage | null; contextWindow: number | null } {
@@ -460,6 +470,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     usage: null, subtype: null, is_error: false,
   }
   lastContextWindow: number | null = null
+  lastContextTokens: number | null = null
 
   constructor(opts: ClaudeSpawnOpts) {
     super()
@@ -880,19 +891,15 @@ export class ClaudeAgentProcess extends EventEmitter {
     } else {
       this.lastTotalUsage = this.cumulativeUsageFromResults ? cloneUsage(this.cumulativeUsageFromResults) : null
     }
-    const profileContextWindow = resolveClaudeContextWindow(this.opts.model)
-    // profile 的 context_window 优先:GLM-5.2[1m] 真实窗口 1M,而 SDK 经
-    // Claude Code→GLM 链路实测的 contextWindow 系统性偏低(100K~200K 波动、
-    // 不稳定),作分母会让百分比虚高到 100%。SDK 实测仅在 profile 未声明时
-    // 用作 fallback。
-    this.lastContextWindow = profileContextWindow ?? total.contextWindow
-    if (
-      profileContextWindow != null &&
-      total.contextWindow != null &&
-      profileContextWindow !== total.contextWindow
-    ) {
-      log(`claude-agent-process: using profile contextWindow ${profileContextWindow} (SDK reported ${total.contextWindow}) for model=${this.opts.model ?? 'default'}`)
+    // 分母纯信 SDK modelUsage 上报的 contextWindow —— 它就是当前路由的真实
+    // 窗口(settings 配 GLM-5.2[1m] 自动 1M,无后缀 200K/100K)。SDK 没上报就是
+    // null,contextLimit 显示 '--',不为它兜底假窗口(no fallback)。
+    this.lastContextWindow = total.contextWindow ?? null
+    if (total.contextWindow != null) {
+      log(`claude-agent-process: SDK contextWindow ${total.contextWindow} for model=${this.opts.model ?? 'default'}`)
     }
+    // 上下文占用 = 输入侧 token,不含 output(Claude Code 底栏同口径)。
+    this.lastContextTokens = contextOccupancyFromUsage(this.lastTotalUsage)
     if (this.lastTotalUsage || this.lastUsage) {
       this.emit('token_usage', {
         usage: this.lastUsage,

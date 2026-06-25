@@ -19,7 +19,6 @@ const {
   resolveClaudeExecutableConfig,
 } = await import('./claude-agent-process')
 const {
-  resolveClaudeContextWindow,
   resolveClaudeSdkModel,
 } = await import('./claude-models')
 
@@ -82,7 +81,6 @@ describe('Claude model profiles', () => {
   test('maps GLM and DeepSeek profiles to SDK model and env tiers', () => {
     expect(resolveClaudeSdkModel('claude:default')).toBe('opus')
     expect(resolveClaudeSdkModel('claude:glm')).toBe('opus')
-    expect(resolveClaudeContextWindow('claude:glm')).toBe(1_000_000)
   })
 })
 
@@ -490,6 +488,8 @@ describe('Claude token accounting', () => {
       total_tokens: 203,
     })
     expect(usageEvents[1].contextWindow).toBe(258000)
+    // 输入侧占用 = input(130) + cache_read(40) + cache_creation(8) = 178,不含 output(25)
+    expect(proc.lastContextTokens).toBe(178)
     expect(proc.lastResult.cost_usd).toBeNull()
     expect(proc.lastResult.cost_delta_usd).toBeNull()
   })
@@ -542,9 +542,9 @@ describe('Claude token accounting', () => {
     expect(proc.lastResult.cost_delta_usd).toBeNull()
   })
 
-  test('profile context window overrides smaller SDK measurement', () => {
-    // GLM-5.2[1m] 真实窗口 1M;SDK 经 Claude Code→GLM 链路实测偏低(此处
-    // 100K),不可信。profile 的 1M 优先作分母,避免百分比虚高到 100%。
+  test('uses SDK-reported context window as the denominator', () => {
+    // SDK modelUsage 上报的 contextWindow 就是当前路由的真实窗口(settings 配
+    // GLM-5.2[1m] 自动 1M,无后缀 200K/100K),分母纯信它,不再有 profile 声明值。
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
       effort: 'high',
@@ -574,12 +574,15 @@ describe('Claude token accounting', () => {
     })
 
     expect(usageEvents).toHaveLength(1)
-    expect(usageEvents[0].contextWindow).toBe(1_000_000)
-    expect(proc.lastContextWindow).toBe(1_000_000)
+    // SDK 实测 100K 优先于 profile 声明的 1M
+    expect(usageEvents[0].contextWindow).toBe(100_000)
+    expect(proc.lastContextWindow).toBe(100_000)
+    // 输入侧占用 = input(87000) + cache_read(0) + cache_creation(0) = 87000,不含 output(700)
+    expect(proc.lastContextTokens).toBe(87_000)
   })
 
-  test('uses profile context window when SDK does not report one', () => {
-    // SDK 没上报 contextWindow 时,用 profile 的 1M(GLM-5.2[1m] 真实值)。
+  test('context window stays null when SDK does not report one', () => {
+    // SDK 没上报 contextWindow → null,不为它兜底假窗口(no fallback)。
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
       effort: 'high',
@@ -608,7 +611,7 @@ describe('Claude token accounting', () => {
     })
 
     expect(usageEvents).toHaveLength(1)
-    expect(usageEvents[0].contextWindow).toBe(1_000_000)
-    expect(proc.lastContextWindow).toBe(1_000_000)
+    expect(usageEvents[0].contextWindow).toBeNull()
+    expect(proc.lastContextWindow).toBeNull()
   })
 })

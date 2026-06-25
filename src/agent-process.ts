@@ -42,6 +42,10 @@ export interface AgentProcess extends EventEmitter {
   lastTotalUsage: CodexUsage | null
   lastResult: CodexResultMeta
   lastContextWindow: number | null
+  /** Claude 路径的当前上下文占用 = 输入侧 token(input + cache_read +
+   * cache_creation,不含 output),直接取自 SDK modelUsage。Codex 路径不用,
+   * 恒 null(继续走 lastUsage.total_tokens)。 */
+  lastContextTokens: number | null
 
   sendInitialize(): void
   sendUserText(text: string, files?: string[]): void

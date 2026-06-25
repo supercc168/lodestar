@@ -1648,17 +1648,19 @@ export class Session {
     this.lastTurnDelta = { tokens, costUsd, durationMs }
   }
 
-  /** Current context-window occupancy estimate. Codex app-server reports
-   * the latest model request in tokenUsage.last; its totalTokens is the
-   * active context size. cachedInputTokens is a subset breakdown of
-   * inputTokens, not extra context. */
+  /** Current context-window occupancy. Claude 路径直接读 SDK modelUsage 算好
+   * 的输入侧占用(proc.lastContextTokens = input+cache_read+cache_creation,
+   * 不含 output);Codex 路径继续用 lastUsage.total_tokens。 */
   private currentContextTokens(): number | null {
+    if (this.proc?.provider === 'claude') {
+      return this.proc?.lastContextTokens ?? null
+    }
     const u = this.proc?.lastUsage as CodexUsage | null | undefined
     return contextTokensFromUsage(u)
   }
 
-  /** Display denominator for context percentage, sourced from Codex
-   * app-server's effective modelContextWindow for this thread. */
+  /** Display denominator for context percentage. Codex: app-server's
+   * effective modelContextWindow;Claude: SDK modelUsage.contextWindow。 */
   private contextLimitForDisplay(): number | null {
     return contextLimitFromAppServer(this.proc?.lastContextWindow)
   }
@@ -2357,7 +2359,10 @@ export class Session {
     if (opts.hasFreshResult) {
       const ctxTokens = this.currentContextTokens()
       const ctxMax = this.contextLimitForDisplay()
-      const ctxPercent = cards.footerContextPercentLabel(ctxTokens, ctxMax)
+      // Claude 路径分母已是 SDK 实测窗口、分子是输入侧占用,走纯除法(baseline=0);
+      // Codex 路径保留 12K baseline 扣减。
+      const isClaude = this.proc?.provider === 'claude'
+      const ctxPercent = cards.footerContextPercentLabel(ctxTokens, ctxMax, isClaude ? 0 : undefined)
       if (ctxPercent) line1Parts.push(`🧠 ${ctxPercent}`)
       const cost = this.lastTurnDelta?.costUsd ?? 0
       if (cost > 0) line1Parts.push(`💰 $${cost.toFixed(3)}`)

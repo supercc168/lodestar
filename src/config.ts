@@ -51,7 +51,6 @@ export interface ClaudeModelConfig {
   display_name?: string
   description?: string
   model?: string
-  context_window?: string
 }
 
 function expandTilde(v: string): string {
@@ -136,8 +135,7 @@ function loadConfig(): LodestarConfig {
         if (
           field === 'display_name' ||
           field === 'description' ||
-          field === 'model' ||
-          field === 'context_window'
+          field === 'model'
         ) {
           ;(profile as Record<string, string>)[field] = value
         }

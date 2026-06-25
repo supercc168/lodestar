@@ -246,6 +246,7 @@ export class CodexProcess extends EventEmitter {
     usage: null, subtype: null, is_error: false,
   }
   lastContextWindow: number | null = null
+  lastContextTokens: number | null = null
 
   constructor(opts: SpawnOpts) {
     super()

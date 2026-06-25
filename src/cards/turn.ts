@@ -125,9 +125,13 @@ function compactionDetailLines(data: Record<string, unknown>, done: boolean): st
   return lines.length > 0 ? lines : ['压缩完成，无摘要内容']
 }
 
-export function footerContextPercentLabel(tokens: number | null, limit: number | null | undefined): string | null {
+export function footerContextPercentLabel(
+  tokens: number | null,
+  limit: number | null | undefined,
+  baseline?: number,
+): string | null {
   if (tokens == null || !Number.isFinite(tokens)) return null
-  const pct = contextPercentSummary(tokens, limit)
+  const pct = contextPercentSummary(tokens, limit, baseline)
   return pct ? `${pct.used}%` : '--'
 }
 
