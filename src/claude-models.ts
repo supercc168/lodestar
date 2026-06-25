@@ -27,13 +27,6 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
     sonnet: 'GLM-5.2[1m]',
     haiku: 'GLM-4.7',
   },
-  deepseek: {
-    display_name: 'Claude Code · DeepSeek',
-    description: '使用 DeepSeek 路由，适合代码推理和成本敏感任务。',
-    opus: 'DeepSeekv4pro',
-    sonnet: 'v4pro',
-    haiku: 'v4flash',
-  },
 }
 
 function mergedConfig(name: string): ClaudeModelConfig {

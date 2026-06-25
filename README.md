@@ -52,7 +52,7 @@ lodestar-setup
 | `restart` / `rs` | 用状态卡展示按上次 `threadId` 重启(保留上下文)|
 | `clear` / `cl` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
 | `compact` / `cm` | 主动触发当前 thread 的上下文压缩,完成后状态卡收束 |
-| `model` / `md` | 展示可用 Codex 模型面板,先选模型再选 reasoning effort,并按群持久化 |
+| `model` / `md` | 展示固定两项面板(Codex·GPT-5.5 / Claude·GLM-5.2),一键生效,按群持久化 |
 | `task` | 打开项目任务清单面板,启用飞书任务清单自动化（预览版） |
 
 **并发 worktree 群**

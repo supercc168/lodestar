@@ -65,15 +65,6 @@ interface ModelSelectionCardOpts {
   models: ModelChoice[]
 }
 
-interface ModelEffortPanelOpts {
-  sessionName: string
-  panelId: string
-  currentModel?: string | null
-  currentEffort?: string | null
-  selectedModel: ModelChoice
-  selectedEffort?: string | null
-}
-
 interface ModelResultPanelOpts {
   sessionName: string
   provider?: AgentProvider
@@ -412,10 +403,6 @@ export function modelSelectionCard(opts: ModelSelectionCardOpts): object {
   return modelCard(opts.sessionName, modelSelectionPanelElement(opts))
 }
 
-export function modelEffortCard(opts: ModelEffortPanelOpts): object {
-  return modelCard(opts.sessionName, modelEffortPanelElement(opts))
-}
-
 export function modelResultCard(opts: ModelResultPanelOpts): object {
   return modelCard(opts.sessionName, modelResultPanelElement(opts), 'green')
 }
@@ -446,39 +433,12 @@ export function modelSelectionPanelElement(opts: ModelSelectionCardOpts): object
         tag: 'markdown',
         content: [
           `当前: ${settingsLine(opts.currentModel, opts.currentEffort)}`,
-          '先选择模型，下一步选择推理强度。',
+          '选择后立即生效(effort 已按模型锁死)。',
         ].join('\n'),
       },
       ...(opts.models.length
         ? modelElements
         : [{ tag: 'markdown', content: '_未返回可用模型列表_' }]),
-    ],
-  }
-}
-
-export function modelEffortPanelElement(opts: ModelEffortPanelOpts): object {
-  const selectedEffort = opts.selectedEffort ?? opts.currentEffort ?? null
-  const efforts = opts.selectedModel.efforts.map(effort => ({
-    ...effort,
-    selected: effort.effort === selectedEffort,
-  }))
-  return {
-    tag: 'collapsible_panel',
-    element_id: ELEMENTS.modelPanel,
-    header: { title: { tag: 'plain_text', content: '选择推理强度' } },
-    expanded: true,
-    elements: [
-      {
-        tag: 'markdown',
-        content: [
-          `已选: ${modelTitle(opts.selectedModel)}`,
-          `当前: ${settingsLine(opts.currentModel, opts.currentEffort)}`,
-          '请选择推理强度，确认后写入本项目。',
-        ].join('\n'),
-      },
-      ...(efforts.length
-        ? efforts.map(effort => effortChoiceElement(opts.selectedModel, effort, opts.panelId))
-        : [{ tag: 'markdown', content: '_未返回这个模型的可用推理强度,无法完成切换。_' }]),
     ],
   }
 }
@@ -570,50 +530,6 @@ function modelSelectActionValue(model: ModelChoice, panelId: string): object {
       description: effort.description ?? '',
       is_default: effort.isDefault === true,
     })),
-  }
-}
-
-function effortChoiceElement(model: ModelChoice, effort: ModelEffortChoice, panelId: string): object {
-  const flags = [
-    effort.isDefault ? `${providerLabel(model.provider)} 默认` : '',
-    effort.selected ? '当前 effort' : '',
-  ].filter(Boolean)
-  const desc = effort.description
-    ? '\n' + escapeMarkdown(truncate(effort.description, 110))
-    : ''
-  return {
-    tag: 'column_set',
-    columns: [
-      {
-        tag: 'column',
-        width: 'weighted',
-        weight: 4,
-        elements: [{
-          tag: 'markdown',
-          content: [
-            `**${inlineCode(effort.effort)}**`,
-            flags.length ? flags.join(' · ') : '',
-          ].filter(Boolean).join('\n') + desc,
-        }],
-      },
-      {
-        tag: 'column',
-        width: 'weighted',
-        weight: 1,
-        elements: [{
-          tag: 'button',
-          text: { tag: 'plain_text', content: '选' },
-          type: effort.selected ? 'primary' : 'default',
-          behaviors: [{ type: 'callback', value: {
-            kind: 'model_effort_select',
-            panel_id: panelId,
-            ...(model.provider && model.provider !== 'codex' ? { provider: model.provider } : {}),
-            model: model.model,
-            effort: effort.effort,
-          } }],
-        }],
-      },
-    ],
   }
 }
 

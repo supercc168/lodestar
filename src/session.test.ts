@@ -425,7 +425,7 @@ describe('Session provider switching', () => {
     session.proc = new FakeAgentProc('codex', 'codex-thread-1')
     session.currentTurn = turnState()
 
-    const result = await session.onModelEffortSelect('claude:default', 'high', '', 'ou_user', 'claude')
+    const result = await session.onModelEffortSelect('claude:glm', 'max', '', 'ou_user', 'claude')
 
     expect(result.ok).toBe(false)
     expect(result.message).toContain('正在执行或排队')
@@ -440,7 +440,7 @@ describe('Session provider switching', () => {
     session.selectedProvider = 'claude'
     session.selectedModel = 'claude:default'
 
-    const result = await session.onModelEffortSelect('claude:glm', 'high', '', 'ou_user', 'claude')
+    const result = await session.onModelEffortSelect('claude:glm', 'max', '', 'ou_user', 'claude')
 
     expect(result.ok).toBe(true)
     expect(session.selectedModel).toBe('claude:glm')
@@ -450,18 +450,17 @@ describe('Session provider switching', () => {
     expect(result.card ? JSON.stringify(result.card) : '').toContain('下次启动 Claude')
   })
 
-  test('rejects Claude env-backed model profile switch while a turn is active', async () => {
+  test('rejects non-fixed Claude model outside the two fixed choices', async () => {
     const session = new Session('probe', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'claude-session-1')
     session.proc = proc
     session.selectedProvider = 'claude'
     session.selectedModel = 'claude:default'
-    session.currentTurn = turnState()
 
     const result = await session.onModelEffortSelect('claude:deepseek', 'high', '', 'ou_user', 'claude')
 
     expect(result.ok).toBe(false)
-    expect(result.message).toContain('env 生效')
+    expect(result.message).toContain('不在固定选项中')
     expect(session.selectedModel).toBe('claude:default')
     expect(proc.killCalls).toBe(0)
   })

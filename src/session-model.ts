@@ -141,6 +141,12 @@ export async function onModelEffortSelect(
     return { ok: false, message: 'Codex reasoning effort 无效' }
   }
   const effort = effortValue as AgentReasoningEffort
+  // 二元锁死:只放行 FIXED_MODEL_CHOICES 的 (provider, model, effort) 组合,
+  // 拒绝旧 effort 回调/伪造把 session 切到非固定项或非锁死 effort。
+  const fixed = FIXED_MODEL_CHOICES.find(c => c.provider === provider && c.model === model)
+  if (!fixed || fixed.effort !== effort) {
+    return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在固定选项中` }
+  }
   const choice = panel?.models.find(m => m.model === model && (m.provider ?? 'codex') === provider)
   if (choice && !choice.efforts.some(item => item.effort === effort)) {
     return { ok: false, message: 'reasoning effort 不属于该模型' }

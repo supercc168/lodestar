@@ -40,11 +40,9 @@ sonnet = "v4pro"
 haiku = "v4flash"
 ```
 
-运行时注入这些 env：
+模型路由的真相源是 `~/.claude/settings.json`(SDK 经 `settingSources:['user']` 读取):`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_DEFAULT_OPUS_MODEL` 等都在那里配。Lodestar 不再注入这些 env,`[claude.env]` 仅作可选 escape hatch。
 
-- `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_SONNET_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL`
-
-主线程 SDK `model` 不直传 `5.2` / `v4pro` 这类上游模型代码，而是默认传 `opus` 档位 alias，让 Claude Code 按 env 做映射。实际 smoke 证明直传 `5.2` 会返回 “模型不存在”。
+主线程 SDK `model` 不直传 `5.2` / `v4pro` 这类上游模型代码,而是传 `opus` 档位 alias,Claude Code 再按 settings.json 的 `ANTHROPIC_DEFAULT_*_MODEL` 路由。实际 smoke 证明直传 `5.2` 会返回 “模型不存在”。
 
 ## Claude Event Mapping
 `ClaudeAgentProcess` 把 SDK message 映射为现有 Session 已会处理的事件：
@@ -99,11 +97,11 @@ Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
 - 旧后端的迟到 `session_id` / exit 事件不会覆盖当前已选择后端的 `lastSessionId` 或新进程状态。
 - Claude 启动前会显式检查 `claude` 可执行文件；找不到时直接启动失败并提示，不让 session 先进入 ready 再异步报错。
 - Claude streaming-input 后端在首条用户输入前不会发 `init`；Lodestar 启动 Claude 时只等待短暂同步/早期错误，不再把“无输入所以没 init”当启动失败。
-- Claude 不使用 `bypassPermissions`；危险工具调用通过 SDK `canUseTool` 进入现有飞书权限卡路径，避免绕过 Codex 原有审批体验。
+- Claude 使用 `bypassPermissions` 全自动;`canUseTool` 在该模式下被 SDK override(旧飞书审批 UI 已清),不再走权限卡。
 - Codex 控制台和启动消息恢复原显示，不新增 `Codex ·` / `(Codex)` 这类额外标记。
 - `claude:default` 运行中重新选择时只更新 effort，不再尝试给 SDK 设置空模型名。
 - Claude profile 变化需要 env 生效；空闲切换时停止当前 Claude 子进程，下轮按新 env 启动；忙碌时拒绝，避免声称当前进程已切换。
-- `claude:glm` / `claude:deepseek` 的主线程 SDK model 修正为 `opus` alias；具体 GLM/DeepSeek 代码只通过 env 传递。
+- `claude:glm` 的主线程 SDK model 为 `opus` alias;具体 GLM 代码通过 settings.json 的 env 路由(`claude:deepseek` 已随二元化下线)。
 - `[[askusr: ...]]` 处理链路加 provider 守卫，Claude 输出同名 marker 不会触发 Codex host ask 卡或续跑。
 - Claude `onUserDialog` 接入现有 `AskUserQuestion` 卡片和 `updatedInput.answers` 回填协议，并修复同步权限回包 race。
 - spawn prompt 按 provider 分开：Codex 继续收到 `[[askusr: ...]]` 说明，Claude 收到 “使用 AskUserQuestion，不要输出 askusr marker”。

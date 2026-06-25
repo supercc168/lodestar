@@ -622,7 +622,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (!this.started) this.sendInitialize()
     if (claudeModel) await this.query!.setModel(claudeModel)
     if (effort === 'max') {
-      await this.query!.applyFlagSettings({ ultracode: true })
+      await this.query!.applyFlagSettings({ ultracode: true, effortLevel: null })
     } else {
       await this.query!.applyFlagSettings({ effortLevel: effort, ultracode: null })
     }

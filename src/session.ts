@@ -309,6 +309,18 @@ export class Session {
     this.selectedProvider = selection?.provider ?? 'codex'
     this.selectedModel = selection?.model ?? null
     this.selectedEffort = selection?.effort ?? null
+    // model 命令已二元化:历史持久化的非固定值归一到固定两项,避免旧
+    // session-model-map 把 session 带到已下线的 profile(如 claude:deepseek)。
+    // 仅在有持久化选择时归一;无选择(默认)保持 null,交给 spawn 默认逻辑。
+    if (selection) {
+      if (this.selectedProvider === 'claude' && this.selectedModel !== 'claude:glm') {
+        this.selectedModel = 'claude:glm'
+        this.selectedEffort = 'max'
+      } else if (this.selectedProvider === 'codex' && this.selectedModel !== 'gpt-5.5') {
+        this.selectedModel = 'gpt-5.5'
+        this.selectedEffort = 'xhigh'
+      }
+    }
     if (this.selectedModel) {
       log(`session "${sessionName}": restored selected provider=${this.selectedProvider} model=${this.selectedModel} effort=${this.selectedEffort ?? 'unset'}`)
     }

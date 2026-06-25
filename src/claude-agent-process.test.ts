@@ -83,8 +83,6 @@ describe('Claude model profiles', () => {
     expect(resolveClaudeSdkModel('claude:default')).toBe('opus')
     expect(resolveClaudeSdkModel('claude:glm')).toBe('opus')
     expect(resolveClaudeContextWindow('claude:glm')).toBeNull()
-    expect(resolveClaudeSdkModel('claude:deepseek')).toBe('opus')
-    expect(resolveClaudeContextWindow('claude:deepseek')).toBeNull()
   })
 })
 
