@@ -276,7 +276,7 @@ export class Session {
   // `restart` can resume an in-flight conversation even if the daemon
   // exits before the turn finishes.
   lastSessionId: string | null = null
-  selectedProvider: AgentProvider = 'codex'
+  selectedProvider: AgentProvider = 'claude'
   selectedModel: string | null = null
   selectedEffort: AgentReasoningEffort | null = null
   modelPanels = new Map<string, sessionModel.ModelPanelState>()
@@ -313,7 +313,7 @@ export class Session {
   ) {
     Session.all.add(this)
     const selection = feishu.getSessionModelSelection(sessionName)
-    this.selectedProvider = selection?.provider ?? 'codex'
+    this.selectedProvider = selection?.provider ?? 'claude'
     this.selectedModel = selection?.model ?? null
     this.selectedEffort = selection?.effort ?? null
     // model 命令已二元化:历史持久化的非固定值归一到固定两项,避免旧
