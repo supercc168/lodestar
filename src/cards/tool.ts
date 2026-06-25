@@ -68,6 +68,11 @@ function isTodoTool(name: string): boolean {
   return name === 'TodoWrite'
 }
 
+/** Claude Code 的计划/任务工具(TaskCreate/Update/List/Get),对应 codex 的 TodoWrite。 */
+function isPlanTaskTool(name: string): boolean {
+  return name === 'TaskCreate' || name === 'TaskUpdate' || name === 'TaskList' || name === 'TaskGet'
+}
+
 function isExitPlanModeTool(name: string): boolean {
   return name === 'ExitPlanMode'
 }
@@ -96,6 +101,10 @@ export function displayToolName(name: string): string {
   if (name === 'LS') return '列目录'
   if (isTodoTool(name)) return '更新待办'
   if (isExitPlanModeTool(name)) return '确认计划'
+  if (name === 'TaskCreate') return '创建任务'
+  if (name === 'TaskUpdate') return '更新任务'
+  if (name === 'TaskList') return '任务列表'
+  if (name === 'TaskGet') return '查看任务'
   if (name === 'Task') return '子任务'
   return isBashTool(name) ? 'Bash' : name
 }
@@ -119,6 +128,7 @@ export function summarizeToolInput(name: string, input: any): string {
   if (isFileMultiEditTool(name)) return truncate(summarizeMultiEditInput(input), 80)
   if (isPathSearchTool(name)) return truncate(summarizePathSearchInput(name, input), 80)
   if (isTodoTool(name)) return truncate(summarizeTodoInput(input), 80)
+  if (isPlanTaskTool(name)) return truncate(summarizePlanTaskInput(name, input), 80)
   if (isExitPlanModeTool(name)) return truncate(firstStringField(input) || '提交计划', 80)
   switch (name) {
     case 'Skill':      return truncate(String(input.skill ?? ''), 80)
@@ -514,6 +524,17 @@ function summarizeTodoInput(input: any): string {
   return `${todos.length} 项${summary ? ` · ${summary}` : ''}`
 }
 
+function summarizePlanTaskInput(name: string, input: any): string {
+  if (name === 'TaskCreate') return String(input?.subject ?? '').trim()
+  if (name === 'TaskUpdate') {
+    const status = todoStatusLabel(input?.status)
+    const taskId = String(input?.taskId ?? '').slice(0, 8)
+    return taskId ? `${taskId}… · ${status}` : status
+  }
+  if (name === 'TaskGet') return String(input?.taskId ?? '').slice(0, 8)
+  return ''
+}
+
 function summarizeWebFetchInput(input: any): string {
   const url = String(input?.url ?? '')
   const prompt = typeof input?.prompt === 'string' ? input.prompt.trim() : ''
@@ -667,6 +688,27 @@ function renderTodoBody(input: any, output: string | null, resolvedNote?: string
   }
   appendResult(lines, output)
   return lines.join('\n')
+}
+
+function renderPlanTaskBody(name: string, input: any, output: string | null, resolvedNote?: string): string {
+  const lines: string[] = []
+  if (name === 'TaskCreate') {
+    if (input?.subject) lines.push(`**主题**: ${input.subject}`)
+    if (input?.description) lines.push(`**说明**: ${String(input.description).slice(0, 500)}`)
+    if (input?.activeForm) lines.push(`**进行中显示**: ${input.activeForm}`)
+  } else if (name === 'TaskUpdate') {
+    if (input?.taskId) lines.push(`**任务**: ${inlineCode(String(input.taskId).slice(0, 12))}`)
+    if (input?.status) lines.push(`**状态**: ${todoStatusLabel(input.status)}`)
+    if (input?.subject) lines.push(`**主题**: ${input.subject}`)
+  } else if (name === 'TaskGet') {
+    if (input?.taskId) lines.push(`**任务**: ${inlineCode(String(input.taskId).slice(0, 12))}`)
+  }
+  if (resolvedNote) {
+    if (lines.length > 0) lines.push('')
+    lines.push(resolvedNote)
+  }
+  appendResult(lines, output)
+  return lines.length > 0 ? lines.join('\n') : jsonBlock(input ?? {}, 2000)
 }
 
 function parseJsonObject(text: string | null): any | null {
@@ -964,7 +1006,9 @@ export function toolCallElement(
                             ? renderPathSearchBody(name, input, output, resolvedNote)
                             : isTodoTool(name)
                               ? renderTodoBody(input, output, resolvedNote)
-                              : isExitPlanModeTool(name)
+                              : isPlanTaskTool(name)
+                                ? renderPlanTaskBody(name, input, output, resolvedNote)
+                                : isExitPlanModeTool(name)
                                 ? renderAgentBody({ prompt: firstStringField(input) || '提交计划' }, output, resolvedNote)
                                 : isAgentTool(name)
                                   ? renderAgentBody(input, output, resolvedNote)
