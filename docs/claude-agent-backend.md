@@ -42,12 +42,9 @@ haiku = "v4flash"
 
 运行时注入这些 env：
 
-- `OMC_MODEL_HIGH` / `OMC_MODEL_MEDIUM` / `OMC_MODEL_LOW`
 - `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_SONNET_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL`
 
-主线程 SDK `model` 不直传 `5.2` / `v4pro` 这类上游模型代码，而是默认传 `opus` 档位 alias，让 OMC / Claude Code 按 env 做映射。实际 smoke 证明直传 `5.2` 会返回 “模型不存在”。
-
-配置字段标准拼写是 `sonnet`；为兼容口头输入，解析器也接受 `sonet`。
+主线程 SDK `model` 不直传 `5.2` / `v4pro` 这类上游模型代码，而是默认传 `opus` 档位 alias，让 Claude Code 按 env 做映射。实际 smoke 证明直传 `5.2` 会返回 “模型不存在”。
 
 ## Claude Event Mapping
 `ClaudeAgentProcess` 把 SDK message 映射为现有 Session 已会处理的事件：
@@ -59,7 +56,7 @@ haiku = "v4flash"
 - `result` -> `token_usage` + `result`
 - `system/compact_boundary` -> `context_compacted`
 
-权限走 SDK `canUseTool` callback：callback 挂起并 emit `can_use_tool` 给 Session，飞书按钮回调再通过 `sendPermissionResponse()` resolve。
+权限：Codex 侧走 SDK `canUseTool` callback，callback 挂起并 emit `can_use_tool` 给 Session，飞书按钮回调再通过 `sendPermissionResponse()` resolve。Claude 侧 `bypassPermissions` 全自动，`canUseTool` 不触发（无审批 UI 死代码）；其 `askUserQuestion` 走 `onUserDialog`，同样 emit `can_use_tool` 给 Session 处理。
 
 Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
 

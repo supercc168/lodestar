@@ -7,7 +7,6 @@ import {
   query,
   type EffortLevel,
   type ModelInfo,
-  type PermissionResult,
   type Query,
   type SDKMessage,
   type SDKUserMessage,
@@ -27,7 +26,6 @@ import {
 import {
   claudeModelKey,
   resolveClaudeContextWindow,
-  resolveClaudeModelEnv,
   resolveClaudeSdkModel,
 } from './claude-models'
 import type {
@@ -70,13 +68,6 @@ class AsyncQueue<T> implements AsyncIterableIterator<T> {
   }
 }
 
-type PendingPermission = {
-  kind: 'permission'
-  resolve: (value: PermissionResult) => void
-  request: CanUseToolRequest
-  cleanup?: () => void
-}
-
 type PendingUserDialog = {
   kind: 'dialog'
   resolve: (value: UserDialogResult) => void
@@ -84,23 +75,11 @@ type PendingUserDialog = {
   cleanup?: () => void
 }
 
-type PendingControl = PendingPermission | PendingUserDialog
+type PendingControl = PendingUserDialog
 
 type PendingServerToolInput = {
   name: string
   input: unknown
-}
-
-type ClaudeCanUseToolOptions = {
-  suggestions?: any
-  blockedPath?: string
-  toolUseID?: string
-  toolUseId?: string
-  tool_use_id?: string
-  title?: string
-  displayName?: string
-  description?: string
-  signal?: AbortSignal
 }
 
 export interface ClaudeSpawnOpts extends SpawnOpts {
@@ -515,7 +494,6 @@ export class ClaudeAgentProcess extends EventEmitter {
           env: {
             ...(process.env as Record<string, string>),
             PATH: buildClaudeSpawnPath(),
-            ...resolveClaudeModelEnv(this.opts.model),
             ...config.claude.env,
           },
           settingSources: ['user'],
@@ -531,7 +509,6 @@ export class ClaudeAgentProcess extends EventEmitter {
             preset: 'claude_code',
             ...(this.opts.appendSystemPrompt ? { append: this.opts.appendSystemPrompt } : {}),
           },
-          canUseTool: (toolName, input, options) => this.onCanUseTool(toolName, input, options),
           stderr: data => {
             const text = data.trim()
             if (text) log(`claude-agent-process[stderr]: ${text}`)
@@ -585,6 +562,8 @@ export class ClaudeAgentProcess extends EventEmitter {
     decision: 'allow' | 'deny',
     payload?: { updatedInput?: Record<string, unknown>; updatedPermissions?: unknown; denyMessage?: string },
   ): void {
+    // bypassPermissions 模式下权限审批永不触发;此方法现在只服务于
+    // onUserDialog(AskUserQuestion):allow = 回填 answers,deny = 取消。
     const pending = this.pendingPermissions.get(String(requestId))
     if (!pending) {
       log(`claude-agent-process: permission response for unknown request ${requestId}`)
@@ -592,30 +571,14 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
     this.pendingPermissions.delete(String(requestId))
     pending.cleanup?.()
-    if (pending.kind === 'dialog') {
-      if (decision === 'allow') {
-        const updatedInput = payload?.updatedInput ?? {}
-        pending.resolve({
-          behavior: 'completed',
-          result: 'answers' in updatedInput ? updatedInput.answers : updatedInput,
-        })
-      } else {
-        pending.resolve({ behavior: 'cancelled' })
-      }
-      return
-    }
     if (decision === 'allow') {
-      const result: PermissionResult = {
-        behavior: 'allow',
-        updatedInput: payload?.updatedInput ?? pending.request.input ?? {},
-      }
-      if (payload?.updatedPermissions !== undefined) result.updatedPermissions = payload.updatedPermissions as any
-      pending.resolve(result)
-    } else {
+      const updatedInput = payload?.updatedInput ?? {}
       pending.resolve({
-        behavior: 'deny',
-        message: payload?.denyMessage ?? 'denied by user',
+        behavior: 'completed',
+        result: 'answers' in updatedInput ? updatedInput.answers : updatedInput,
       })
+    } else {
+      pending.resolve({ behavior: 'cancelled' })
     }
   }
 
@@ -685,56 +648,6 @@ export class ClaudeAgentProcess extends EventEmitter {
     ].join('\n'))
   }
 
-  private onCanUseTool(
-    toolName: string,
-    input: Record<string, unknown>,
-    options: ClaudeCanUseToolOptions,
-  ): Promise<PermissionResult> {
-    const requestId = `claude_perm_${++this.requestCounter}`
-    const requestInput = {
-      ...input,
-      ...(options.title ? { __lodestar_permission_title: options.title } : {}),
-      ...(options.displayName ? { __lodestar_permission_display_name: options.displayName } : {}),
-      ...(options.description ? { __lodestar_permission_description: options.description } : {}),
-    }
-    const rawToolUseId = firstString(options.toolUseID, options.toolUseId, options.tool_use_id)
-    const toolUseId = rawToolUseId ?? requestId
-    if (!rawToolUseId) {
-      log(`claude-agent-process: canUseTool missing toolUseID for ${toolName}; using ${toolUseId}`)
-    }
-    const req: CanUseToolRequest = {
-      request_id: requestId,
-      tool_name: toolName,
-      input: requestInput,
-      permission_suggestions: options.suggestions,
-      blocked_paths: options.blockedPath ? [options.blockedPath] : undefined,
-      tool_use_id: toolUseId,
-    }
-    const pending = new Promise<PermissionResult>(resolve => {
-      const finish = (value: PermissionResult) => {
-        options.signal?.removeEventListener('abort', abort)
-        resolve(value)
-      }
-      const abort = () => {
-        if (!this.pendingPermissions.delete(requestId)) return
-        finish({
-          behavior: 'deny',
-          message: 'permission request aborted by Claude backend',
-        })
-      }
-      options.signal?.addEventListener('abort', abort, { once: true })
-      this.pendingPermissions.set(requestId, {
-        kind: 'permission',
-        resolve: finish,
-        request: req,
-        cleanup: () => options.signal?.removeEventListener('abort', abort),
-      })
-    })
-    this.emitToolUseOnce(toolUseId, toolName, requestInput)
-    this.emit('can_use_tool', req)
-    return pending
-  }
-
   private onUserDialog(
     request: UserDialogRequest,
     options: { signal: AbortSignal },
@@ -787,8 +700,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.turnActive = false
     for (const [id, pending] of this.pendingPermissions) {
       pending.cleanup?.()
-      if (pending.kind === 'dialog') pending.resolve({ behavior: 'cancelled' })
-      else pending.resolve({ behavior: 'deny', message: 'Claude backend exited before permission response', toolUseID: pending.request.tool_use_id })
+      pending.resolve({ behavior: 'cancelled' })
       this.pendingPermissions.delete(id)
     }
     log(`claude-agent-process: exited code=${code} signal=${signal} expected=${this.expectedExit}`)
@@ -963,17 +875,18 @@ export class ClaudeAgentProcess extends EventEmitter {
       this.lastTotalUsage = this.cumulativeUsageFromResults ? cloneUsage(this.cumulativeUsageFromResults) : null
     }
     const profileContextWindow = resolveClaudeContextWindow(this.opts.model)
-    // SDK 运行时实测的 contextWindow 代表这条 Claude Code → 模型链路的真实
-    // 可用窗口(它也决定 compact 时机),优先采用;profile 的 context_window
-    // 仅在 SDK 不上报时兜底。例如 GLM-5.2 官方 1M,但经本链路实测为 200K,
-    // 此处以 SDK 实测为准,避免分母虚高导致百分比显示偏低。
+    // 以 SDK 运行时实测的 contextWindow 为唯一事实源(它代表 Claude Code →
+    // 模型链路的真实可用窗口,也决定 compact 时机)。profile 的 context_window
+    // 仅当用户在 config.toml 显式声明时才有值,作为 SDK 未上报时的后备;内置
+    // profile 不再硬编码窗口,避免静态值与实测矛盾时分母虚高(原 GLM 写死
+    // 1M 而链路实测 200K 即此病)。符合 no_fallbacks:不拿可疑静态值兜底。
     this.lastContextWindow = total.contextWindow ?? profileContextWindow
     if (
       profileContextWindow != null &&
       total.contextWindow != null &&
       profileContextWindow !== total.contextWindow
     ) {
-      log(`claude-agent-process: using SDK contextWindow ${total.contextWindow} (profile fallback ${profileContextWindow}) for model=${this.opts.model ?? 'default'}`)
+      log(`claude-agent-process: using SDK contextWindow ${total.contextWindow} (profile override ${profileContextWindow}) for model=${this.opts.model ?? 'default'}`)
     }
     if (this.lastTotalUsage || this.lastUsage) {
       this.emit('token_usage', {

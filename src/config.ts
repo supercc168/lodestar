@@ -52,7 +52,6 @@ export interface ClaudeModelConfig {
   description?: string
   opus?: string
   sonnet?: string
-  sonet?: string
   haiku?: string
   model?: string
   context_window?: string
@@ -142,7 +141,6 @@ function loadConfig(): LodestarConfig {
           field === 'description' ||
           field === 'opus' ||
           field === 'sonnet' ||
-          field === 'sonet' ||
           field === 'haiku' ||
           field === 'model' ||
           field === 'context_window'

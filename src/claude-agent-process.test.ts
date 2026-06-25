@@ -20,7 +20,6 @@ const {
 } = await import('./claude-agent-process')
 const {
   resolveClaudeContextWindow,
-  resolveClaudeModelEnv,
   resolveClaudeSdkModel,
 } = await import('./claude-models')
 
@@ -83,26 +82,9 @@ describe('Claude model profiles', () => {
   test('maps GLM and DeepSeek profiles to SDK model and env tiers', () => {
     expect(resolveClaudeSdkModel('claude:default')).toBe('opus')
     expect(resolveClaudeSdkModel('claude:glm')).toBe('opus')
-    expect(resolveClaudeContextWindow('claude:glm')).toBe(1_000_000)
-    expect(resolveClaudeModelEnv('claude:glm')).toEqual({
-      OMC_MODEL_HIGH: 'GLM-5.2[1m]',
-      OMC_MODEL_MEDIUM: 'GLM-5.2[1m]',
-      OMC_MODEL_LOW: 'GLM-4.7',
-      ANTHROPIC_DEFAULT_OPUS_MODEL: 'GLM-5.2[1m]',
-      ANTHROPIC_DEFAULT_SONNET_MODEL: 'GLM-5.2[1m]',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'GLM-4.7',
-    })
-
+    expect(resolveClaudeContextWindow('claude:glm')).toBeNull()
     expect(resolveClaudeSdkModel('claude:deepseek')).toBe('opus')
     expect(resolveClaudeContextWindow('claude:deepseek')).toBeNull()
-    expect(resolveClaudeModelEnv('claude:deepseek')).toEqual({
-      OMC_MODEL_HIGH: 'DeepSeekv4pro',
-      OMC_MODEL_MEDIUM: 'v4pro',
-      OMC_MODEL_LOW: 'v4flash',
-      ANTHROPIC_DEFAULT_OPUS_MODEL: 'DeepSeekv4pro',
-      ANTHROPIC_DEFAULT_SONNET_MODEL: 'v4pro',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'v4flash',
-    })
   })
 })
 
@@ -114,109 +96,6 @@ describe('Claude permission mode', () => {
 })
 
 describe('Claude user dialog bridge', () => {
-  test('emits direct tool call before permission request and resolves allow-always suggestions', async () => {
-    const proc = new ClaudeAgentProcess({
-      workDir: '/tmp',
-      effort: 'high',
-    }) as any
-    const events: Array<[string, any]> = []
-    const suggestions = [{ toolName: 'Bash', ruleContent: 'echo hi' }]
-    proc.on('tool_use', (event: any) => events.push(['tool_use', event]))
-    proc.on('can_use_tool', (event: any) => events.push(['can_use_tool', event]))
-
-    const resultPromise = proc.onCanUseTool('Bash', { command: 'echo hi' }, {
-      toolUseID: 'tool_perm_1',
-      title: 'Claude wants to run a shell command',
-      suggestions,
-    })
-
-    expect(events.map(([name]) => name)).toEqual(['tool_use', 'can_use_tool'])
-    expect(events[0][1]).toEqual({
-      id: 'tool_perm_1',
-      name: 'Bash',
-      input: {
-        command: 'echo hi',
-        __lodestar_permission_title: 'Claude wants to run a shell command',
-      },
-    })
-    expect(events[1][1]).toMatchObject({
-      request_id: 'claude_perm_1',
-      tool_name: 'Bash',
-      tool_use_id: 'tool_perm_1',
-      permission_suggestions: suggestions,
-    })
-
-    proc.sendPermissionResponse(events[1][1].request_id, 'allow', {
-      updatedPermissions: suggestions,
-    })
-    await expect(resultPromise).resolves.toEqual({
-      behavior: 'allow',
-      updatedInput: {
-        command: 'echo hi',
-        __lodestar_permission_title: 'Claude wants to run a shell command',
-      },
-      updatedPermissions: suggestions,
-    })
-  })
-
-  test('deduplicates assistant tool_use after permission callback pre-emits it', async () => {
-    const proc = new ClaudeAgentProcess({
-      workDir: '/tmp',
-      effort: 'high',
-    }) as any
-    const toolUses: any[] = []
-    proc.on('tool_use', (event: any) => toolUses.push(event))
-
-    const resultPromise = proc.onCanUseTool('Read', { file_path: '/tmp/a.txt' }, {
-      toolUseID: 'tool_dup_1',
-    })
-    proc.handleMessage({
-      type: 'assistant',
-      uuid: 'assistant-1',
-      message: {
-        model: 'opus',
-        content: [{
-          type: 'tool_use',
-          id: 'tool_dup_1',
-          name: 'Read',
-          input: { file_path: '/tmp/a.txt' },
-        }],
-      },
-    })
-
-    expect(toolUses).toEqual([{
-      id: 'tool_dup_1',
-      name: 'Read',
-      input: { file_path: '/tmp/a.txt' },
-    }])
-    proc.sendPermissionResponse('claude_perm_1', 'deny')
-    await expect(resultPromise).resolves.toMatchObject({
-      behavior: 'deny',
-      message: 'denied by user',
-    })
-  })
-
-  test('accepts alternate tool use id field names from permission context', async () => {
-    const proc = new ClaudeAgentProcess({
-      workDir: '/tmp',
-      effort: 'high',
-    }) as any
-    const permissions: any[] = []
-    proc.on('can_use_tool', (event: any) => permissions.push(event))
-
-    const resultPromise = proc.onCanUseTool('Edit', { file_path: '/tmp/a.txt' }, {
-      toolUseId: 'tool_alias_1',
-    })
-
-    expect(permissions).toHaveLength(1)
-    expect(permissions[0].tool_use_id).toBe('tool_alias_1')
-    proc.sendPermissionResponse(permissions[0].request_id, 'allow')
-    await expect(resultPromise).resolves.toEqual({
-      behavior: 'allow',
-      updatedInput: { file_path: '/tmp/a.txt' },
-    })
-  })
-
   test('uses session_state_changed running as turn start boundary', () => {
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
@@ -702,7 +581,9 @@ describe('Claude token accounting', () => {
     expect(proc.lastContextWindow).toBe(100_000)
   })
 
-  test('falls back to profile context window when SDK does not report one', () => {
+  test('leaves context window null when SDK does not report one and profile has no override', () => {
+    // 内置 profile 不再硬编码 context_window,SDK 未上报即如实留空,符合
+    // no_fallbacks:不拿与实测矛盾的静态假值兜底,分母留待 SDK 实测。
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
       effort: 'high',
@@ -731,7 +612,7 @@ describe('Claude token accounting', () => {
     })
 
     expect(usageEvents).toHaveLength(1)
-    expect(usageEvents[0].contextWindow).toBe(1_000_000)
-    expect(proc.lastContextWindow).toBe(1_000_000)
+    expect(usageEvents[0].contextWindow).toBeNull()
+    expect(proc.lastContextWindow).toBeNull()
   })
 })

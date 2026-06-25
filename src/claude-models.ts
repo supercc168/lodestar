@@ -26,7 +26,6 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
     opus: 'GLM-5.2[1m]',
     sonnet: 'GLM-5.2[1m]',
     haiku: 'GLM-4.7',
-    context_window: '1000000',
   },
   deepseek: {
     display_name: 'Claude Code · DeepSeek',
@@ -55,7 +54,7 @@ function parseContextWindow(value: string | undefined): number | null {
 function toProfile(name: string): ClaudeModelProfile | null {
   const raw = mergedConfig(name)
   const opus = raw.opus?.trim()
-  const sonnet = (raw.sonnet ?? raw.sonet)?.trim()
+  const sonnet = raw.sonnet?.trim()
   const haiku = raw.haiku?.trim()
   if (!opus || !sonnet || !haiku) return null
   const key = `claude:${name}`
@@ -103,17 +102,4 @@ export function resolveClaudeSdkModel(model: string | null | undefined): string 
 
 export function resolveClaudeContextWindow(model: string | null | undefined): number | null {
   return claudeModelProfile(model)?.contextWindow ?? null
-}
-
-export function resolveClaudeModelEnv(model: string | null | undefined): Record<string, string> {
-  const profile = claudeModelProfile(model)
-  if (!profile) return {}
-  return {
-    OMC_MODEL_HIGH: profile.opus,
-    OMC_MODEL_MEDIUM: profile.sonnet,
-    OMC_MODEL_LOW: profile.haiku,
-    ANTHROPIC_DEFAULT_OPUS_MODEL: profile.opus,
-    ANTHROPIC_DEFAULT_SONNET_MODEL: profile.sonnet,
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: profile.haiku,
-  }
 }
