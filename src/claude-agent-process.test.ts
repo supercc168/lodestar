@@ -1,4 +1,5 @@
-import { homedir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
+import { writeFileSync, unlinkSync } from 'node:fs'
 import { delimiter, join, win32 } from 'node:path'
 import { beforeEach, describe, expect, mock, test } from 'bun:test'
 
@@ -16,6 +17,8 @@ const {
   CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS,
   CLAUDE_PERMISSION_MODE,
   ClaudeAgentProcess,
+  claudeTranscriptPath,
+  readLastCallUsageFromTranscript,
   resetClaudeContextWindowMaxCache,
   resolveClaudeExecutableConfig,
 } = await import('./claude-agent-process')
@@ -493,10 +496,9 @@ describe('Claude token accounting', () => {
       total_tokens: 203,
     })
     expect(usageEvents[1].contextWindow).toBe(258000)
-    // 占用改用单次 result.usage:result-2 的 usage.input=4(无 cache)= 4。
-    // 不再用累计 modelUsage(input130+cache_read40+creation8=178)—— 累计会随轮数
-    // 破分母,带 cache 连续会话恒显 100%。
-    expect(proc.lastContextTokens).toBe(4)
+    // 占用从 transcript 读 per-call usage,test 环境无 transcript → null(MISS)。
+    // (result.usage 是 turn 聚合、modelUsage 是 session 累计,都不代表当前上下文)
+    expect(proc.lastContextTokens).toBeNull()
     expect(proc.lastResult.cost_usd).toBeNull()
     expect(proc.lastResult.cost_delta_usd).toBeNull()
   })
@@ -585,8 +587,8 @@ describe('Claude token accounting', () => {
     // SDK 实测 100K 优先于 profile 声明的 1M
     expect(usageEvents[0].contextWindow).toBe(100_000)
     expect(proc.lastContextWindow).toBe(100_000)
-    // 输入侧占用 = input(87000) + cache_read(0) + cache_creation(0) = 87000,不含 output(700)
-    expect(proc.lastContextTokens).toBe(87_000)
+    // 占用从 transcript 读 per-call usage,test 无 transcript → null
+    expect(proc.lastContextTokens).toBeNull()
   })
 
   test('context window locks to historical max and never decreases', () => {
@@ -697,5 +699,29 @@ describe('Claude token accounting', () => {
     expect(usageEvents).toHaveLength(1)
     expect(usageEvents[0].contextWindow).toBeNull()
     expect(proc.lastContextWindow).toBeNull()
+  })
+})
+
+describe('Claude transcript context tokens', () => {
+  test('claudeTranscriptPath encodes cwd slashes to dashes', () => {
+    const p = claudeTranscriptPath('/home/leviyuan/feishu', 'sid-1')
+    expect(p.endsWith('projects/-home-leviyuan-feishu/sid-1.jsonl')).toBe(true)
+  })
+
+  test('readLastCallUsageFromTranscript returns the last assistant per-call usage', () => {
+    const tmp = join(tmpdir(), `lodestar-t-${Date.now()}.jsonl`)
+    writeFileSync(tmp, [
+      JSON.stringify({ type: 'user', message: { role: 'user', content: 'hi' } }),
+      JSON.stringify({ type: 'assistant', message: { usage: { input_tokens: 100, cache_read_input_tokens: 200, cache_creation_input_tokens: 50 } } }),
+      JSON.stringify({ type: 'assistant', message: { usage: { input_tokens: 30, cache_read_input_tokens: 41728, cache_creation_input_tokens: 0 } } }),
+    ].join('\n'))
+    // 取最后一条 assistant 的 per-call usage(transcript finalize 后的真实值,
+    // = session 当前上下文,与 omc hud context_window.current_usage 同口径)
+    expect(readLastCallUsageFromTranscript(tmp)).toEqual({ input_tokens: 30, cache_read_input_tokens: 41728, cache_creation_input_tokens: 0 })
+    unlinkSync(tmp)
+  })
+
+  test('readLastCallUsageFromTranscript returns null when file missing', () => {
+    expect(readLastCallUsageFromTranscript(join(tmpdir(), 'lodestar-no-such.jsonl'))).toBeNull()
   })
 })

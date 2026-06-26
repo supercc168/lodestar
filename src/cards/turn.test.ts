@@ -323,7 +323,7 @@ describe('main conversation card rendering', () => {
 
 describe('plan and goal rendering', () => {
   test('formats footer context as a percentage', () => {
-    expect(footerContextPercentLabel(35_211, 258_000)).toBe('9%')
+    expect(footerContextPercentLabel(35_211, 258_000)).toBe('9% · 35K/258K')
     expect(footerContextPercentLabel(35_211, null)).toBe('--')
     expect(footerContextPercentLabel(null, 258_000)).toBeNull()
   })

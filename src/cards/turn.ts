@@ -8,7 +8,7 @@
 
 import type { CodexUsage } from '../codex-process'
 import type { AgentProvider } from '../agent-process'
-import { contextPercentSummary } from '../context-window'
+import { contextPercentSummary, contextTokenRatioLabel } from '../context-window'
 import { ELEMENTS } from './elements'
 
 export interface TurnPlanStep {
@@ -132,7 +132,7 @@ export function footerContextPercentLabel(
 ): string | null {
   if (tokens == null || !Number.isFinite(tokens)) return null
   const pct = contextPercentSummary(tokens, limit, baseline)
-  return pct ? `${pct.used}%` : '--'
+  return pct ? `${pct.used}% · ${contextTokenRatioLabel(tokens, limit)}` : '--'
 }
 
 export function footerTokenDetailLine(usage: CodexUsage | null | undefined): string {

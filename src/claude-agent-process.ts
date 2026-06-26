@@ -1,4 +1,4 @@
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { spawn } from 'node:child_process'
 import { delimiter, join, posix, win32 } from 'node:path'
@@ -218,15 +218,48 @@ function usageFromSdk(raw: any): CodexUsage | null {
   return out
 }
 
-/** Claude 路径当前上下文占用 = 输入侧 token(喂进模型的全部 input:未缓存新输入
- * + 缓存命中复读 + 本轮新建缓存),不含 output。Claude Code 底栏百分比用的
- * 就是这个口径。取 modelUsage 聚合后的 totalUsage,即会话级输入侧累计。 */
+/** Claude 路径上下文占用 = 输入侧 token(喂进模型的全部 input:未缓存新输入
+ * + 缓存命中复读 + 本轮新建缓存),不含 output。与 Claude Code 底栏(omc hud)
+ * 同口径 = input_tokens + cache_read_input_tokens + cache_creation_input_tokens。
+ * 调用方传 result.usage(单 turn query = 当前上下文);modelUsage 是会话累计、
+ * assistant.message.usage 在 stream-json 下恒 0/0,都不能用。 */
 function contextOccupancyFromUsage(usage: CodexUsage | null | undefined): number | null {
   if (!usage) return null
   const occ = (usage.input_tokens ?? 0)
     + (usage.cache_read_input_tokens ?? 0)
     + (usage.cache_creation_input_tokens ?? 0)
   return occ > 0 ? occ : null
+}
+
+/** Claude Code session transcript 路径:~/.claude/projects/<cwd 编码>/<sid>.jsonl。
+ * cwd 编码 = 绝对路径的 / 全替换成 -(claude code 约定,如 /home/x → -home-x)。 */
+export function claudeTranscriptPath(workDir: string, sessionId: string): string {
+  const encoded = workDir.replace(/\//g, '-')
+  const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+  return join(configDir, 'projects', encoded, `${sessionId}.jsonl`)
+}
+
+/** 读 transcript jsonl,取最后一条 assistant message 的 usage —— 这是最后一次 API
+ * call 的真实 per-call usage(transcript 是 claude CLI 写的,assistant 行带 finalize
+ * 后的 usage;不像 stream-json 的 assistant event 恒 0/0)。= session 当前上下文快照,
+ * 与 Claude Code 底栏(omc hud)的 context_window.current_usage 同口径。失败/空 → null。 */
+export function readLastCallUsageFromTranscript(path: string): CodexUsage | null {
+  let content: string
+  try {
+    content = readFileSync(path, 'utf8')
+  } catch {
+    return null
+  }
+  const lines = content.split('\n')
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i].trim()
+    if (!line) continue
+    try {
+      const m = JSON.parse(line)
+      if (m?.type === 'assistant' && m?.message?.usage) return m.message.usage as CodexUsage
+    } catch { /* skip malformed line */ }
+  }
+  return null
 }
 
 /** SDK contextWindow 历史 max,按 claude 路由 key 在 daemon 进程内全局共享。
@@ -922,11 +955,14 @@ export class ClaudeAgentProcess extends EventEmitter {
       }
     }
     this.lastContextWindow = contextWindowMaxByRoute.get(claudeRouteKey(this.opts.model)) ?? total.contextWindow ?? null
-    // 上下文占用 = 最后一次请求的输入侧 token(input+cache_read+cache_creation),
-    // 不含 output,用单次 lastUsage(result.usage = just-finished SDK query)。
-    // 不能用累计 lastTotalUsage —— modelUsage 是会话级累计,带 prompt cache 的连续
-    // 会话每轮上下文都叠进 cache_read,N 轮后累计破 1M 分母 → 占用恒显 100%。
-    this.lastContextTokens = contextOccupancyFromUsage(this.lastUsage)
+    // 上下文占用 = session 当前上下文 = 最后一次 API call 的输入侧 token。从 claude
+    // session transcript 读最后一条 assistant 的 per-call usage(transcript 带 finalize
+    // 后的真实值;stream-json 的 assistant event 恒 0/0、result.usage 是 turn 聚合、
+    // modelUsage 是 session 累计,都不能代表当前上下文)。与 Claude Code 底栏(omc hud)
+    // context_window.current_usage 同口径。transcript 不可读 → null → footer 显 MISS。
+    this.lastContextTokens = contextOccupancyFromUsage(
+      readLastCallUsageFromTranscript(claudeTranscriptPath(this.opts.workDir, this.sessionId ?? ''))
+    )
     if (this.lastTotalUsage || this.lastUsage) {
       this.emit('token_usage', {
         usage: this.lastUsage,
