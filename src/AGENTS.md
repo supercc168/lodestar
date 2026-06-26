@@ -1,10 +1,10 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-31 | Updated: 2026-06-13 -->
+<!-- Generated: 2026-05-31 | Updated: 2026-06-26 -->
 
 # src
 
 ## Purpose
-`src/` 是 Lodestar daemon 的核心实现层，封装飞书 API、Codex app-server 子进程、每个群的 session 状态机、Card Kit 流式更新、模型/effort 持久选择、`wt` worktree 群编排、`agy <prompt>` 外部任务、`task` 飞书任务清单自动化、安装/停止/升级 CLI，以及 runtime state 路径和配置读取。
+`src/` 是 Lodestar daemon 的核心实现层，封装飞书 API、统一 `AgentProcess` 后端接口及其 Codex / Claude 两类实现、每个群的 session 状态机、Card Kit 流式更新、模型/effort 持久选择、`wt` worktree 群编排、`agy <prompt>` 外部任务、`task` 飞书任务清单自动化、安装/停止/升级 CLI，以及 runtime state 路径和配置读取。session 默认 provider 为 Claude/GLM，可经 `model` 切到 Codex。
 
 ## Key Files
 | File | Description |
@@ -26,9 +26,12 @@
 | `tasklist.ts` | `task` 项目清单绑定和状态存储；创建 `<project>[lodestar]` 清单、维护分组 GUID、记录自动化进程和每个任务的运行状态。 |
 | `tasklist-worker.ts` | 任务清单轮询 worker；按 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成` 分组驱动 Codex/agy 规划、选择、执行、审核和本地合并。 |
 | `tasklist-worker-git.ts` | `tasklist-worker` 的本地 Git worktree、artifact tag 和 local review ref 辅助逻辑。 |
-| `codex-process.ts` | 启动 `codex app-server --listen stdio://`，处理 JSON-RPC 请求、通知、工具权限、模型列表/settings、thread 启停和 app-server 事件映射。 |
+| `agent-process.ts` | 统一 agent 后端接口：定义 `AgentProcess`（`EventEmitter`）、`AgentProvider = 'codex' \| 'claude'`、统一 `AgentProcessEventMap`、Claude reasoning effort 集合（`low`/`medium`/`high`/`xhigh`/`max`，默认 `max`）和 `providerFromModel` 等 provider 辅助；`CodexProcess` 与 `ClaudeAgentProcess` 都实现该接口。 |
+| `codex-process.ts` | 实现 `AgentProcess` 的 Codex 后端：启动 `codex app-server --listen stdio://`，处理 JSON-RPC 请求、通知、工具权限、模型列表/settings、thread 启停和 app-server 事件映射。 |
 | `codex-usage.ts` | 解析 app-server token usage payload，并计算 per-turn absolute total 差值与有效 token。 |
 | `codex-compaction.ts` | 解析多种 app-server / raw response context compaction 事件，并输出统一 `ContextCompactedNotification`。 |
+| `claude-agent-process.ts` | 实现 `AgentProcess` 的 Claude 后端：用 `@anthropic-ai/claude-agent-sdk` 的 `query({ prompt: AsyncIterable })` streaming-input 长驻进程，把 SDK message（`system/init`、assistant text/tool_use、`tool_result`、`result`、`compact_boundary`）映射为统一 Session 事件；`bypassPermissions` 全自动（旧飞书审批 UI 已清），`onUserDialog` 接现有 `AskUserQuestion` 卡片；启动前 `assertClaudeCodeAvailable` 检查 `claude` 可执行文件。 |
+| `claude-models.ts` | Claude model profile：内置 `glm`（GLM-5.2）一项，可被 `config.toml` 的 `[claude.models.*]` 覆盖/新增；`resolveClaudeSdkModel` 把 `claude:glm` 映射为 SDK 主模型 `opus` alias，真实上游模型（GLM-5.2/4.7）由 `~/.claude/settings.json` 的 `ANTHROPIC_DEFAULT_*_MODEL` 路由。 |
 | `card-action.ts` | Card action 回调响应辅助；生产 WS 路径用 `{ card: { type: "raw", data: newCard } }` 立即替换 JSON 卡片，避免 200672、裸卡片或提前 patch 导致模型/effort 面板闪退。 |
 | `cardkit.ts` | Feishu Card Kit v1 封装；维护 per-card sequence、Promise queue、流式限流、元素计数和写失败回调。 |
 | `cards.ts` | 卡片模板 barrel；统一导出 `src/cards/` 下的 turn、console、worktree、agy、task 和元素 ID 工具。 |
@@ -46,6 +49,7 @@
 | `update-cli.ts` | `lodestar-update` 入口，封装 npm 更新逻辑并检查 daemon 状态。 |
 | `version-cli.ts` | `lodestar-version` 入口，输出 Lodestar 和 Codex CLI 版本。 |
 | `usage.ts` | 临时 app-server 请求 Codex/ChatGPT 使用额度；保留最新快照，只在收到新值时覆盖。 |
+| `glm-usage.ts` | GLM Coding Plan 用量快照（给 `hi` console 的 Claude/GLM 后端用）：直打 GLM 官方 `quota/limit` monitor API，凭据从 `~/.claude/settings.json` 的 env 读 `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` 判平台（open.bigmodel.cn / api.z.ai）；无凭据/非 GLM/限流/网络各自显式 MISS，绝不假数据，与 `usage.ts` 的 snapshot 模式对齐。 |
 | `sysinfo.ts` | 读取主机 CPU、内存、磁盘和 AI 相关 systemd service 状态，供控制台卡片展示。 |
 | `pid-guard.ts` | PID 文件和进程 cmdline marker 校验，防止误认复用 PID。 |
 | `context-window.ts` | 根据模型和 token usage 估算 context window 占用。 |
@@ -102,7 +106,8 @@
 ## Dependencies
 
 ### Internal
-- `session.ts` 依赖 `codex-process.ts`、`cardkit.ts`、`cards.ts`、`feishu.ts` 和 `session-*` helper；业务面板/命令 helper 再依赖 `worktree.ts`、`tasklist.ts`、`agy-task.ts` 等领域模块。
+- `session.ts` 经 `AgentProcess` 接口（`agent-process.ts`）持有当前 `proc`，按 `selectedProvider` 在 `ClaudeAgentProcess`（默认）和 `CodexProcess` 之间 spawn；并依赖 `cardkit.ts`、`cards.ts`、`feishu.ts` 和 `session-*` helper；业务面板/命令 helper 再依赖 `worktree.ts`、`tasklist.ts`、`agy-task.ts` 等领域模块。
+- `claude-agent-process.ts` 依赖 `@anthropic-ai/claude-agent-sdk`、`agent-process.ts`、`claude-models.ts`、`codex-usage.ts`（token usage 解析复用）和 `config.ts`；`glm-usage.ts` 被 `session.ts`（console opts）和 `cards/console.ts` 消费。
 - `tasklist-worker.ts` 依赖 `tasklist.ts`、`feishu.ts`、`agy-task.ts`、`codex-process.ts` 和 `tasklist-worker-git.ts`；本地 Git worktree、tag 与审查 diff 约定集中在 `tasklist-worker-git.ts`。
 - `cardkit.ts` 依赖 `feishu.getTenantToken()` 获取 Card Kit API token。
 - `feishu.ts` 依赖 `config.ts`、`paths.ts` 和 `codex-process.resolveCodexBin()`，并维护 session chat/resume/model/alive/tasklist runtime map。
@@ -111,6 +116,8 @@
 ### External
 - `@larksuiteoapi/node-sdk`：Lark client、WS client、IM API、群管理和群成员 API。
 - `codex` CLI：无头 app-server、ChatGPT 登录状态、模型使用量。
+- `@anthropic-ai/claude-agent-sdk` / `@anthropic-ai/sdk`：Claude 后端 `query()` streaming-input transport、模型档位路由、user dialog。
+- `claude` CLI：Claude Code 本机可执行文件，`assertClaudeCodeAvailable` 启动前检查；模型路由真相源是其 `~/.claude/settings.json`。
 - Feishu Card Kit v1、IM Open API 和 Task v2 Open API：卡片、消息、reaction、附件、urgent app、任务清单、分组、任务和评论。
 - Bun test/build runtime，Node.js child process/fs/http/path/os API。
 - systemd：`sysinfo.ts` 只读用户服务状态，用于控制台展示。

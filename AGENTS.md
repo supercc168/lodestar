@@ -1,9 +1,9 @@
-<!-- Generated: 2026-05-15 | Updated: 2026-06-13 -->
+<!-- Generated: 2026-05-15 | Updated: 2026-06-26 -->
 
 # Lodestar 2.0
 
 ## Purpose
-本仓库实现一个 Bun daemon，把飞书群消息桥接到无头 `codex app-server` 进程。运行时关系是一个飞书群对应一个 Lodestar session、一个 Codex thread，以及每轮对话中的一张流式 Feishu Card Kit 卡片；项目主群还可用 `model` 管理模型/effort，用 `wt` 自动创建/加入同级 Git worktree 群，用 `agy <prompt>` 启动一次性外部 agy 任务，并用 `task` 启用飞书任务清单自动化。
+本仓库实现一个 Bun daemon，把飞书群消息桥接到无头 agent 后端进程——按 session 选择 `codex app-server`（GPT）或 `@anthropic-ai/claude-agent-sdk` 的 `query()` streaming-input 长驻进程（Claude/GLM，默认 provider）。运行时关系是一个飞书群对应一个 Lodestar session、一个选定 provider 的 agent 进程（Codex thread 或 Claude session），以及每轮对话中的一张流式 Feishu Card Kit 卡片；项目主群还可用 `model` 管理模型/effort，用 `wt` 自动创建/加入同级 Git worktree 群，用 `agy <prompt>` 启动一次性外部 agy 任务，并用 `task` 启用飞书任务清单自动化。
 
 ## Key Files
 | File | Description |
@@ -22,12 +22,13 @@
 |-----------|---------|
 | `src/` | daemon 的核心 TypeScript 模块，包括 session、Codex 子进程、飞书 API、Card Kit、任务清单 worker 和 CLI 辅助逻辑（见 `src/AGENTS.md`）。 |
 | `scripts/` | 面向真实飞书环境的 smoke、调试注入、Card Kit 探针和安装后向导脚本（见 `scripts/AGENTS.md`）。 |
+| `docs/` | 设计备忘录，目前只有 Claude Agent SDK 后端的架构 memo（见 `docs/AGENTS.md`）。 |
 
 ## For AI Agents
 
 ### Working In This Directory
 - Runtime 是 **Bun**；源码开发通常用 `bun daemon.ts` 或 `bun run start`，发布包通过 `bun build --target=node` 生成 Node 可执行文件。
-- daemon 只驱动 `codex app-server --listen stdio://` 的 app-server JSON-RPC 协议；不要恢复 tmux、JSONL 队列或 1.x 传输机制。
+- daemon 通过统一 `AgentProcess` 接口（`src/agent-process.ts`）驱动两类后端：Codex 走 `codex app-server --listen stdio://` JSON-RPC，Claude 走 `@anthropic-ai/claude-agent-sdk` 的 `query()` streaming-input 长驻进程；session 默认 provider 是 Claude/GLM，可用 `model` 切到 Codex。不要恢复 tmux、JSONL 队列或 1.x 传输机制。
 - 运行状态全部在 XDG 目录外置：配置默认在 `~/.config/lodestar/config.toml`，日志和 runtime map 默认在 `~/.local/share/lodestar/`。凭据只应存在于 `config.toml`，不要写入仓库。
 - Assistant 正文和 footer 状态不使用 Card Kit `/content` 打字流；正文按完整段 `addElement` 插入，footer 状态用 `replaceElement` 直接替换。
 - API 失败要记录并向用户暴露；不要静默切换传输、卡片或消息通道作为“兜底”。
@@ -35,7 +36,7 @@
 - 停止、重启、替换、shadow、切换或并行接管正在运行的 daemon / user service 的授权**只在当前 assistant 回合内一次性有效**，不得跨用户消息、跨中断恢复、跨上下文压缩或跨任务范围沿用；一旦用户发来新的消息，即使上一条消息要求过“重启”，后续也必须重新明确授权后才能再次操作 live service。
 - **禁止**为了“测试”“预览”“发一张看看”“先验证一下”这类目的而停止、重启、替换、shadow、切换或并行接管正在运行的 daemon / user service。只有用户在当前用户消息中**明确点名**要执行对应操作（例如 `systemctl --user restart feishu-daemon.service`、停止当前 daemon、切换到某个 worktree daemon）时才可动手；任何泛化的“测一下”“发测试卡”都**不构成授权**。
 - 群内裸词控制是 `hi`、`stop`/`st`、`kill`/`kl`、`restart`/`rs`、`clear`/`cl`、`compact`/`cm`、`model`/`md`、`task`、`wt`/`worktree` 和 `wt <name>`/`worktree <name>`；`agy <prompt>` 启动外部一次性 agy 任务。这些词在 `Session.runCommand` 中作为保留字处理。
-- `model` 通过 Card Kit 按钮先选 Codex 模型、再选 reasoning effort，并把选择按 session 持久化到 XDG data。
+- `model` 是固定二元选项：Codex（`gpt-5.5`/`xhigh`）或 Claude（`claude:glm` = GLM-5.2/`max`），effort 锁死、选了即生效，不再动态拉取模型列表；选择按 session+provider 持久化到 XDG data，跨 provider 切换只在空闲或下次启动边界生效，turn 进行中或排队时直接拒绝。
 - `wt <name>` 约定创建同级目录 `<project>[<name>]` 和本地分支 `work/<name>`，并自动创建/加入同名飞书群；解散按钮会先拒绝仍在运行的对应 session，只在 worktree 干净时删除目录和解散群，保留分支；重新激活已合并归档分支时会更新到主线。
 - `agy <prompt>` 在当前 session 工作目录内独占运行 `agy --print`，用独立 Card Kit 卡片展示 prompt、状态、输出、仓库变更和“转 Codex”按钮；不要把它混入普通 Codex turn 卡片。
 - `task` 打开项目任务清单面板；启用后创建/绑定 `<project>[lodestar]` 飞书任务清单，daemon 内置 worker 会扫描 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成` 分组并驱动规划、执行、审核和本地合并。
