@@ -12,7 +12,6 @@
 | `cli.ts` | npm 分发入口；在缺少 `config.toml` 时触发安装向导，否则延迟导入 `daemon.ts`。 |
 | `package.json` | Bun/Node 打包脚本、发布元数据、二进制入口和依赖声明。 |
 | `README.md` | 用户安装、首次配置、群控裸词、`model` 选择、`wt` worktree 群、`task` 任务清单自动化和 HTTP 通知端点说明。 |
-| `CHANGELOG.md` | 中文发布记录；release notes 需保持同一风格，优先描述用户可感知变化。 |
 | `bun.lock` | Bun 依赖锁文件；更新依赖后同步提交。 |
 | `LICENSE` | MIT 许可证。 |
 | `promo.jpg` | README 顶部展示图。 |
@@ -89,5 +88,5 @@
 - 用 `npm publish --access public` 发布 npm 包。
 - 同一个版本也必须发布到 GitHub Packages。临时写入项目 `.npmrc`，内容包括 `@leviyuan:registry=https://npm.pkg.github.com` 和 `//npm.pkg.github.com/:_authToken=$GH_TOKEN`；运行 `npm publish --registry=https://npm.pkg.github.com --tag latest --access public` 后删除 `.npmrc`。不要跳过 GitHub Packages。
 - 始终为 tag 创建对应的 GitHub Release。本机没有安装 `gh`；使用 GitHub REST API，从 `~/.git-credentials` 读取 token，并用 `jq -n --rawfile body /tmp/notes.md ...` 构造 JSON body。
-- 写 release notes 前先读取最近的 GitHub Releases，并匹配现有风格。当前 notes 与 `CHANGELOG.md` 保持一致：使用中文、优先写“用户能感受到什么”，只保留必要的兼容提示；能用平铺短要点说清时不要再按实现拆成 `修复` / `改进`；非首个版本结尾保留 `**Full Changelog**: https://github.com/leviyuan/lodestar/compare/vA...vB`，首个版本改用源码快照链接。
+- 写 release notes 前先读取最近的 GitHub Releases，并匹配现有风格：使用中文、优先写“用户能感受到什么”，只保留必要的兼容提示；能用平铺短要点说清时不要再按实现拆成 `修复` / `改进`；非首个版本结尾保留 `**Full Changelog**: https://github.com/leviyuan/lodestar/compare/vA...vB`，首个版本改用源码快照链接。
 - 只有用户在当前用户消息中明确要求时才重启正在运行的 user service；重启前先用 `systemctl --user list-units --all` 确认实际 unit，且该授权不得跨 turn 复用。
