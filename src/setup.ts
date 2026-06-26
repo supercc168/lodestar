@@ -3,25 +3,31 @@
  * triggered either by the postinstall hook (via /dev/tty on unix,
  * \\.\CON{IN,OUT}$ on Windows) or manually via `lodestar-setup`.
  *
- * Flow:
- *   1. Ensure Codex CLI is on PATH (npm i -g @openai/codex if missing).
- *   2. Ensure Codex is logged in with ChatGPT (`codex login`).
- *   3. Feishu app — opens https://open.feishu.cn/app, lists every
- *      permission scope + event subscription step, and verifies the
- *      pasted app_id / app_secret against tenant_access_token endpoint
- *      before accepting. Loop on failure.
- *   4. projects_root — default = user home.
- *   5. Write config.toml, then auto-spawn `lodestar-daemon` detached
- *      so it survives setup exit.
+ * Lodestar 默认后端是 Claude Code (Agent SDK),Codex 是可选第二后端
+ * (群里发 `model` 切换)。本向导依次做 4 件事:
  *
- * ChatGPT login is checked with `codex login status`; users can run the
- * interactive login from the wizard when needed.
+ *   1. 确保 Claude Code CLI 在 PATH (npm i -g @anthropic-ai/claude-code)。
+ *      特别提醒: 受 Claude 官方限制, Claude 订阅 (Pro/Max OAuth 登录)
+ *      不支持本项目; 必须走 API 方式 —— GLM Coding Plan 或 Anthropic API key。
+ *   2. GLM Coding Plan API key (推荐, 可选) —— 给了就自动写入
+ *      ~/.claude/settings.json 的 env (1M context + 中文优化); 不给就
+ *      沿用本机 Claude Code 现有配置启动。同一歩末尾可选顺带配置 Codex。
+ *   3. Feishu 自建应用 —— 打开 https://open.feishu.cn/app, 列出每个
+ *      权限 scope + 事件订阅步骤, 粘贴的 app_id / app_secret 先调
+ *      tenant_access_token endpoint 验证再收。失败循环重试。
+ *   4. projects_root —— 默认 = 用户主目录; 写 config.toml 后 detached
+ *      自动拉起 lodestar-daemon, 向导退出后继续跑。
+ *
+ * GLM 路由的真相源是 ~/.claude/settings.json (SDK 经 settingSources:
+ * ['user'] 读取, 见 docs/claude-agent-backend.md), 不走 config.toml 的
+ * [claude.env] —— 后者仅作可选 escape hatch。
  */
 
 import { execSync, spawn } from 'node:child_process'
-import { existsSync, mkdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline/promises'
 import { delimiter, dirname, join } from 'node:path'
+import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { CONFIG_DIR, CONFIG_FILE } from './paths'
 
@@ -68,7 +74,7 @@ function escapeTomlString(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 }
 
-// ── Codex CLI detection / install ──────────────────────────────────
+// ── bin detection / install ────────────────────────────────────────
 function whichBin(name: string): string | null {
   const PATH = process.env.PATH ?? ''
   if (!PATH) return null
@@ -85,10 +91,10 @@ function whichBin(name: string): string | null {
   return null
 }
 
-async function installCodexCli(): Promise<boolean> {
+function npmInstallGlobal(pkg: string): Promise<boolean> {
   const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
   return new Promise((resolve) => {
-    const child = spawn(npm, ['install', '-g', '@openai/codex@latest'], {
+    const child = spawn(npm, ['install', '-g', `${pkg}@latest`], {
       stdio: 'inherit',
       shell: process.platform === 'win32',
     })
@@ -97,6 +103,7 @@ async function installCodexCli(): Promise<boolean> {
   })
 }
 
+// ── Codex CLI (optional second backend) ────────────────────────────
 function isCodexChatGPTLoggedIn(codexBin: string): boolean {
   try {
     const out = execSync(`"${codexBin}" login status 2>&1`, { timeout: 10_000 }).toString()
@@ -113,6 +120,58 @@ async function runCodexLogin(codexBin: string): Promise<boolean> {
     child.on('exit', (code) => resolve(code === 0))
     child.on('error', () => resolve(false))
   })
+}
+
+// ── Claude Code settings.json (GLM route) ──────────────────────────
+function claudeConfigDir(): string {
+  return process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+}
+
+/** 把 GLM Coding Plan 路由 merge 进 ~/.claude/settings.json 的 env 段。
+ *  真相源与 docs/claude-agent-backend.md / glm-usage.ts 一致; 保留用户
+ *  已有字段 (permissions / hooks / plugins …), 只覆盖 GLM 相关 env key。
+ *  settings.json 存在但 JSON 解析失败时绝不静默覆盖 —— surface 出来。 */
+function writeClaudeGlmEnv(glmKey: string): { path: string } | { error: string } {
+  try {
+    const dir = claudeConfigDir()
+    mkdirSync(dir, { recursive: true })
+    const settingsPath = join(dir, 'settings.json')
+
+    let settings: Record<string, unknown> = {}
+    if (existsSync(settingsPath)) {
+      const raw = readFileSync(settingsPath, 'utf8')
+      try {
+        const parsed = JSON.parse(raw)
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return { error: `${settingsPath} 内容不是 JSON 对象, 拒绝覆盖, 请手动检查` }
+        }
+        settings = parsed as Record<string, unknown>
+      } catch {
+        return { error: `${settingsPath} 解析失败 (JSON 语法错), 拒绝覆盖, 请手动修复后重跑` }
+      }
+    }
+
+    const prevEnv = (settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env))
+      ? settings.env as Record<string, string>
+      : {}
+    // 与本机验证过的 GLM 配置一致: opus/sonnet → GLM-5.2[1m] (1M context),
+    // haiku → GLM-4.7。ANTHROPIC_AUTH_TOKEN 裸 token, 不带 Bearer。
+    const glmEnv: Record<string, string> = {
+      ANTHROPIC_AUTH_TOKEN: glmKey,
+      ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
+      API_TIMEOUT_MS: '3000000',
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'GLM-5.2[1m]',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'GLM-5.2[1m]',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'GLM-4.7',
+    }
+    settings.env = { ...prevEnv, ...glmEnv }
+
+    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', { mode: 0o600 })
+    return { path: settingsPath }
+  } catch (e: any) {
+    return { error: e?.message ?? String(e) }
+  }
 }
 
 // ── browser launcher (best-effort, never throws) ───────────────────
@@ -191,55 +250,96 @@ export async function runSetup(): Promise<void> {
   }
 
   header('Lodestar 安装向导')
-  console.log('Lodestar 把 Feishu (飞书) 群聊接到 Codex。')
-  console.log('每个群对应一个项目目录, Codex 在那里跑、能读写文件。')
+  console.log('Lodestar 把 Feishu (飞书) 群聊接到 AI agent。')
+  console.log('默认后端是 Claude Code; Codex 是可选第二后端, 群里发 model 一键切换。')
+  console.log('每个群对应一个项目目录, agent 在那里跑、能读写文件。')
+  console.log()
+  console.log(`${C.yellow}⚠ Claude 官方限制:${C.reset}`)
+  console.log(`  ${C.bold}Claude 订阅 (Pro/Max OAuth 登录) 不支持本项目${C.reset},`)
+  console.log(`  必须走 API 方式 —— 推荐 GLM Coding Plan, 或自备 Anthropic API key。`)
   console.log()
   console.log('本向导依次做 4 件事:')
-  console.log(`  ${C.dim}1) 确保 Codex CLI 已装好${C.reset}`)
-  console.log(`  ${C.dim}2) 确认 ChatGPT 登录${C.reset}`)
+  console.log(`  ${C.dim}1) 确保 Claude Code CLI 已装好${C.reset}`)
+  console.log(`  ${C.dim}2) GLM Coding Plan API key (推荐, 可选) + Codex (可选)${C.reset}`)
   console.log(`  ${C.dim}3) Feishu 自建应用 (含权限 / 事件 / 发版 + 凭据测试)${C.reset}`)
   console.log(`  ${C.dim}4) 工作目录, 自动启动 daemon${C.reset}`)
   console.log()
   await rl.question(`${C.dim}按 Enter 开始 (Ctrl+C 退出)...${C.reset}`)
 
   // ── Step 1/4 ──────────────────────────────────────────────────
-  step(1, 4, '准备 Codex CLI')
-  let codexBin = whichBin('codex')
-  if (codexBin) {
-    console.log(`${C.green}✓ codex CLI 已就位${C.reset}: ${C.dim}${codexBin}${C.reset}`)
+  step(1, 4, '准备 Claude Code CLI')
+  let claudeBin = whichBin('claude')
+  if (claudeBin) {
+    console.log(`${C.green}✓ claude CLI 已就位${C.reset}: ${C.dim}${claudeBin}${C.reset}`)
   } else {
-    console.log(`${C.yellow}未在 PATH 找到 codex CLI, 自动安装...${C.reset}`)
-    console.log(`${C.dim}运行: npm install -g @openai/codex@latest${C.reset}`)
+    console.log(`${C.yellow}未在 PATH 找到 claude CLI, 自动安装...${C.reset}`)
+    console.log(`${C.dim}运行: npm install -g @anthropic-ai/claude-code@latest${C.reset}`)
     console.log()
-    const ok = await installCodexCli()
+    const ok = await npmInstallGlobal('@anthropic-ai/claude-code')
     if (!ok) {
       console.error(`\n${C.red}安装失败。${C.reset}`)
       console.error('请手动运行后再开向导:')
-      console.error(`  ${C.cyan}npm install -g @openai/codex@latest${C.reset}`)
+      console.error(`  ${C.cyan}npm install -g @anthropic-ai/claude-code@latest${C.reset}`)
       console.error(`  ${C.cyan}lodestar-setup${C.reset}`)
       rl.close()
       process.exit(1)
     }
-    codexBin = whichBin('codex')
-    console.log(`${C.green}✓ 安装完成${C.reset}: ${C.dim}${codexBin ?? '(应该装好了, 但 PATH 找不到 — 重开终端再试)'}${C.reset}`)
+    claudeBin = whichBin('claude')
+    console.log(`${C.green}✓ 安装完成${C.reset}: ${C.dim}${claudeBin ?? '(应该装好了, 但 PATH 找不到 — 重开终端再试)'}${C.reset}`)
   }
+  console.log()
+  console.log(`${C.dim}下一步可选配 GLM Coding Plan 自动写入路由; 不配则用本机 Claude Code 现有配置。${C.reset}`)
+  console.log(`${C.dim}记住: 别用 \`claude\` 走订阅 OAuth 登录 —— 订阅不支持本项目, 要用 API key。${C.reset}`)
 
   // ── Step 2/4 ──────────────────────────────────────────────────
-  step(2, 4, 'ChatGPT 登录')
-  console.log('Lodestar 使用 Codex 的 ChatGPT 登录态。请确保 `codex login status` 显示 ChatGPT 登录。')
+  step(2, 4, 'GLM Coding Plan (推荐, 可选)')
+  console.log('GLM Coding Plan 给 Claude Code 接 GLM-5.2 (开放 1M token 上下文, 中文友好)。')
+  console.log('订阅后在智谱开放平台拿一个 API key, 粘到下面 —— 向导自动写进 ~/.claude/settings.json。')
+  console.log(`  ${C.dim}拿 key: https://open.bigmodel.cn → 控制台 → API Keys${C.reset}`)
+  console.log(`  ${C.dim}不给也行: 以本机 Claude Code 现有配置启动 (确保是 API key 方式, 非订阅)。${C.reset}`)
   console.log()
-  if (codexBin && isCodexChatGPTLoggedIn(codexBin)) {
-    console.log(`${C.green}✓ Codex 已登录 ChatGPT${C.reset}`)
-  } else {
-    console.log(`${C.yellow}Codex 尚未登录 ChatGPT。现在启动 \`codex login\`。${C.reset}`)
-    const ok = codexBin ? await runCodexLogin(codexBin) : false
-    if (!ok || !codexBin || !isCodexChatGPTLoggedIn(codexBin)) {
-      console.error(`\n${C.red}Codex ChatGPT 登录未完成。${C.reset}`)
-      console.error(`请手动运行 ${C.cyan}codex login${C.reset} 后再开向导。`)
-      rl.close()
-      process.exit(1)
+
+  const glmKey = await ask('GLM API key (直接回车跳过)', {})
+  if (glmKey) {
+    const r = writeClaudeGlmEnv(glmKey)
+    if ('path' in r) {
+      console.log(`${C.green}✓ GLM 路由已写入${C.reset}: ${C.dim}${r.path}${C.reset}`)
+      console.log(`${C.dim}opus/sonnet → GLM-5.2[1m] (1M ctx), haiku → GLM-4.7${C.reset}`)
+    } else {
+      console.log(`${C.red}✗ 写入失败:${C.reset} ${r.error}`)
+      console.log(`${C.dim}跳过 GLM 配置, 以本机 Claude Code 现有配置启动。${C.reset}`)
     }
-    console.log(`${C.green}✓ Codex 已登录 ChatGPT${C.reset}`)
+  } else {
+    console.log(`${C.dim}已跳过 GLM, 以本机 Claude Code 现有配置启动。${C.reset}`)
+  }
+
+  // ── Codex (可选第二后端) ──────────────────────────────────────
+  console.log()
+  console.log(`${C.bold}Codex (可选第二后端)${C.reset}`)
+  console.log(`  ${C.dim}想用 Codex·GPT-5.5 的话, 登录 ChatGPT 订阅即可, 群里发 model 切换。${C.reset}`)
+  const wantCodex = await ask('现在顺便配置 Codex 后端吗?', { default: 'n' })
+  if (wantCodex.toLowerCase() === 'y') {
+    let codexBin = whichBin('codex')
+    if (!codexBin) {
+      console.log(`${C.dim}未找到 codex CLI, 安装 @openai/codex...${C.reset}`)
+      const ok = await npmInstallGlobal('@openai/codex')
+      if (ok) codexBin = whichBin('codex')
+    }
+    if (codexBin && isCodexChatGPTLoggedIn(codexBin)) {
+      console.log(`${C.green}✓ Codex 已登录 ChatGPT${C.reset}`)
+    } else if (codexBin) {
+      console.log(`${C.dim}启动 \`codex login\`...${C.reset}`)
+      const ok = await runCodexLogin(codexBin)
+      if (ok && isCodexChatGPTLoggedIn(codexBin)) {
+        console.log(`${C.green}✓ Codex 已登录 ChatGPT${C.reset}`)
+      } else {
+        console.log(`${C.yellow}Codex 登录未完成 — 不影响默认 Claude 后端; 需要时随时跑 codex login。${C.reset}`)
+      }
+    } else {
+      console.log(`${C.yellow}Codex 安装失败 — 不影响默认 Claude 后端; 需要时手动 npm i -g @openai/codex。${C.reset}`)
+    }
+  } else {
+    console.log(`${C.dim}已跳过 Codex (需要时随时跑 codex login, 群里发 model 切)。${C.reset}`)
   }
 
   // ── Step 3/4 ──────────────────────────────────────────────────
@@ -270,7 +370,7 @@ export async function runSetup(): Promise<void> {
   console.log(`       • ${C.bold}im:chat.members:write_only${C.reset}        ${C.dim}# wt: 把发起人拉进已有 worktree 群${C.reset}`)
   console.log(`       • ${C.bold}im:resource${C.reset}                       ${C.dim}# 上传/下载附件 (图文双向)${C.reset}`)
   console.log(`       • ${C.bold}im:message.urgent${C.reset}                 ${C.dim}# 加急推送 (锁屏通知 / Ask)${C.reset}`)
-  console.log(`       • ${C.bold}im:message.group_msg${C.reset}              ${C.red}# 敏感: 接收群里所有消息${C.reset}`)
+  console.log(`       • ${C.bold}im:message.group_msg${C.reset}              ${C.dim}# 敏感: 接收群里所有消息${C.reset}`)
   console.log(`         ${C.dim}└ 关键: 没它机器人只收 @ 自己的消息, 拿不到群里其他对话, 一定要开${C.reset}`)
   console.log(`         ${C.dim}└ 敏感权限要走审批: 申请时填用途, 个人开发者通常秒过${C.reset}`)
   console.log(`       • ${C.bold}im:message.group_at_msg:readonly${C.reset}  ${C.dim}# 读 @ 机器人消息 (兜底)${C.reset}`)
@@ -342,9 +442,10 @@ export async function runSetup(): Promise<void> {
     `projects_root = "${escapeTomlString(projectsRoot)}"`,
     '',
   ]
-  // Codex / Claude 登录态由各自 CLI 管理。config.toml 只保存 Feishu 和
-  // Lodestar runtime 配置；高级用户可手写 [codex.env] / [claude.env]
-  // 注入子进程环境。
+  // Claude / GLM 路由由 ~/.claude/settings.json 管 (向导已写入或沿用你的
+  // 现有配置); Codex 登录态由 codex CLI 管。config.toml 只保存 Feishu 和
+  // Lodestar runtime; 高级用户可手写 [codex.env] / [claude.env] 注入子进程
+  // 环境 (escape hatch, 通常不需要)。
   writeFileSync(CONFIG_FILE, toml.join('\n'), { mode: 0o600 })
 
   console.log(`\n${C.green}${C.bold}✓ 配置已写入${C.reset}`)
@@ -364,7 +465,8 @@ export async function runSetup(): Promise<void> {
     console.log(`${C.bold}最后一步: 在 Feishu 验证${C.reset}`)
     console.log(`  ① 把机器人拉进任意飞书群`)
     console.log(`  ② 群名 = ${C.cyan}${projectsRoot}${sep}<群名>${C.reset} 下的目录名 (新群第一条消息会自动建)`)
-    console.log(`  ③ 在群里发任意一条消息, Codex 上线`)
+    console.log(`  ③ 在群里发任意一条消息, 默认由 Claude 接管`)
+    console.log(`     ${C.dim}(群里发 model 可切到 Codex·GPT-5.5)${C.reset}`)
     console.log()
     console.log(`日志 (按日滚动, 保留近 7 天):`)
     console.log(`  ${C.cyan}${logPath}${C.reset}`)

@@ -1,7 +1,7 @@
 /**
  * CLI entry for `lodestar-version` bin. 打印 npm 实际装的 lodestar 版本(读
- * 包根 package.json,而不是编译时内联的常量),顺带探测 Codex CLI 版本和
- * runtime,排障时一眼确认环境。
+ * 包根 package.json,而不是编译时内联的常量),顺带探测默认后端 Claude Code
+ * 与可选 Codex CLI 的版本和 runtime,排障时一眼确认环境。
  */
 import { execSync } from 'node:child_process'
 import { readFileSync } from 'node:fs'
@@ -20,6 +20,14 @@ function lodestarVersion(): string {
   } catch { return '(unknown)' }
 }
 
+function claudeVersion(): string {
+  // execSync 默认走 shell,Windows 上能直接跑 claude.cmd。
+  try {
+    const out = execSync('claude --version', { timeout: 10_000, stdio: ['ignore', 'pipe', 'ignore'] }).toString().trim()
+    return out || '(unknown)'
+  } catch { return '(未找到 / 未安装)' }
+}
+
 function codexVersion(): string {
   // execSync 默认走 shell,Windows 上能直接跑 codex.cmd。
   try {
@@ -29,5 +37,6 @@ function codexVersion(): string {
 }
 
 console.log(`${C.bold}Lodestar${C.reset} ${C.green}v${lodestarVersion()}${C.reset}`)
-console.log(`${C.dim}Codex CLI:${C.reset} ${codexVersion()}`)
+console.log(`${C.dim}Claude Code:${C.reset} ${claudeVersion()}`)
+console.log(`${C.dim}Codex CLI:${C.reset}   ${codexVersion()}`)
 console.log(`${C.dim}Runtime:${C.reset}     ${process.version} (${process.platform}-${process.arch})`)

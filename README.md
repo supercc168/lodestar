@@ -42,7 +42,9 @@ npm i -g @leviyuan/lodestar
 lodestar-setup
 ```
 
-手把手带你装 Codex、登录 ChatGPT、建飞书应用、启动 lodestar。
+手把手带你装 Claude Code、可选配 GLM Coding Plan(1M 上下文)、建飞书应用、启动 lodestar。Codex 是可选第二后端。
+
+> Claude 订阅(Pro/Max OAuth 登录)不支持本项目,需走 API 方式(GLM Coding Plan 或自备 Anthropic API key)。
 
 **3. 拉机器人进群**
 
