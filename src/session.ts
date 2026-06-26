@@ -2363,6 +2363,17 @@ export class Session {
     if (!turn) return
     this.currentTurn = null
     this.stopFooterStatus(turn)
+    // 竞态修复:mid-turn rotation 的 swap 阶段(sendCard / id_convert 的 await
+    // 之后,见 startMidTurnRotate)会切 turn.cardId 到新卡并 startWritingFooter
+    // 重启一个 footer 计时 interval。若 result 在那个 await 窗口里抢先到达,
+    // 本函数会先终态化旧卡、置 currentTurn=null,随后 swap 才重启 interval ——
+    // 该 interval 再没有路径会 stop(closeTurnCard 只跑一次;stop/kill/exit 的
+    // stopFooterStatus(this.currentTurn) 拿到的是 null),新卡 footer 一直计时。
+    // 首 turn 长输出触发 rotation 时必现(2026-06-26 turn=1 计时不止)。等
+    // rotating 落定后再终态化:turn.cardId 此时是新卡,再 stop 一次清掉 swap
+    // 重启的 interval,终态 footer 也写在新卡上。
+    if (turn.rotating) await turn.rotating
+    this.stopFooterStatus(turn)
     const elapsed = ((Date.now() - turn.startedAt) / 1000).toFixed(1)
     const cardId = turn.cardId
     const segmentTexts = turn.segmentTexts

@@ -531,3 +531,47 @@ describe('Session provider switching', () => {
   })
 
 })
+
+describe('Session turn close vs mid-turn rotation race', () => {
+  test('closeTurnCard awaits in-flight rotation so the swap-restarted footer interval is cleared (no orphan timer)', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-session-1')
+    const turn = turnState('card_old')
+    turn.userOpenId = '' // 跳过 closeTurnCard 末尾 urgentApp(feishu mock 无此方法)
+    session.currentTurn = turn
+    cardkit.recordCardCreated('card_old', 1)
+
+    // 复现竞态:result 在 startMidTurnRotate 的 sendCard/id_convert await 窗口
+    // 里抢先到达 → closeTurnCard 先跑;swap 随后才落定,切 turn.cardId 到新卡
+    // 并 startWritingFooter 重启一个 footer 计时 interval。修复前这个 interval
+    // 再没有路径会 stop(closeTurnCard 只跑一次;stop/kill/exit 的
+    // stopFooterStatus(this.currentTurn) 拿到 null),新卡 footer 一直计时
+    // (2026-06-26 turn=1 计时不止)。
+    let swapRan = false
+    let releaseSwap: () => void = () => {}
+    turn.rotating = new Promise<void>(r => { releaseSwap = r }).then(() => {
+      // swap 同步块(真实代码 startMidTurnRotate 1927/1932/1949)
+      cardkit.recordCardCreated('card_new', 2)
+      turn.cardId = 'card_new'
+      session.startWritingFooter(turn)
+      swapRan = true
+    })
+
+    try {
+      const closed = session.closeTurnCard(undefined, { hasFreshResult: false })
+      await Promise.resolve(); await Promise.resolve(); await Promise.resolve()
+      releaseSwap() // rotation 的 swap 现在落定
+      await closed
+
+      expect(swapRan).toBe(true)
+      // swap 重启的 interval 必须被清掉,否则新卡 footer 一直计时
+      expect(turn.footerStatusHandle).toBeNull()
+      // 终态 footer 写到 swap 切换后的新卡,不是旧卡
+      const newCardFooter = calls.filter(c => c.method === 'PUT' && c.path === '/cards/card_new/elements/footer')
+      expect(newCardFooter.length).toBeGreaterThan(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+})
