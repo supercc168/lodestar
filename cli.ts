@@ -11,12 +11,12 @@
  * config. If the config exists, we fall through to the daemon body via
  * `await import('./daemon')`.
  *
- * This is the npm-distribution replacement for "postinstall auto-launch
- * the wizard": npm 7+ pipes postinstall stdio so any `console.log` in
- * scripts/postinstall.cjs is invisible by default, and a /dev/tty
- * bypass attempt didn't work reliably on Windows. Trigger-on-first-run
- * sidesteps the whole npm stdio mess: the user invokes us themselves
- * inside cmd / PowerShell, where the TTY check is trivially true.
+ * This is the canonical first-run wizard trigger. postinstall.cjs used
+ * to auto-launch the wizard by hijacking /dev/tty, but that was fragile:
+ * on some mac installs the wizard's readline got no input and deadlocked
+ * against npm's wait (terminal froze, killing it tripped npm's rollback).
+ * So postinstall now just prints a banner; the wizard runs here, on the
+ * first `lodestar-daemon`, where the TTY check is trivially true.
  */
 
 import { existsSync, unlinkSync } from 'node:fs'
