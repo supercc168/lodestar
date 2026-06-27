@@ -5,6 +5,7 @@ import {
   asTaskToolName,
   summarizeTaskBoard,
   taskBoardElement,
+  taskBoardLiveElement,
   type TaskBoardEntry,
 } from './task-board'
 
@@ -142,6 +143,39 @@ describe('applyTaskTool — 累积语义', () => {
     const next = applyTaskTool(prev, 'TaskUpdate', { taskId: 'task_1', status: 'completed' }, 'Updated')
     expect(prev[0].status).toBe('pending') // 入参未被改
     expect(next[0].status).toBe('completed')
+  })
+})
+
+describe('taskBoardLiveElement — 实时总览面板(footer 正前常驻)', () => {
+  test('固定 element_id、默认展开、header 含 📋 任务总览 + 统计、body 列出全部项', () => {
+    const board: TaskBoardEntry[] = [
+      { id: '1', subject: '读文件', status: 'in_progress' },
+      { id: '2', subject: '改代码', status: 'pending' },
+    ]
+    const el = taskBoardLiveElement(board) as any
+    expect(el.tag).toBe('collapsible_panel')
+    expect(el.element_id).toBe('task_board_live')
+    expect(el.expanded).toBe(true)  // 与 timeline 面板(expanded:false)的关键区别
+    expect(el.header.title.content).toBe('📋 任务总览 · 2 项 · 进行中 1 · 待办 1')
+    const body: string = el.elements[0].content
+    expect(body).toContain('- 🔄 读文件')
+    expect(body).toContain('- ⬜ 改代码')
+  })
+
+  test('空 board 也渲染(header 显示 空,不抛)—— live 区一旦建立就常驻,空态要能显示', () => {
+    const el = taskBoardLiveElement([]) as any
+    expect(el.expanded).toBe(true)
+    expect(el.header.title.content).toBe('📋 任务总览 · 空')
+  })
+
+  test('body 与 timeline 面板同源(同 renderTaskBoardBody)—— 按 #N 排序、进行中用 activeForm', () => {
+    const board: TaskBoardEntry[] = [
+      { id: '1', subject: '完成项', status: 'completed' },
+      { id: '2', subject: '重构', activeForm: '正在重构', status: 'in_progress' },
+    ]
+    const liveEl = taskBoardLiveElement(board) as any
+    const timelineEl = taskBoardElement(0, board, { name: 'TaskList', status: '✅' }) as any
+    expect(liveEl.elements[0].content).toBe(timelineEl.elements[0].content)
   })
 })
 

@@ -19,6 +19,13 @@
 export const ELEMENTS = {
   userInput: 'user_input',
   footer: 'footer',
+  /** Live task-board overview panel — 本 turn 一旦出现 Task 工具就在 footer
+   *  正前建立(固定 id,后续只 replace 内容、不挪位)。默认展开、每次 Task 工具
+   *  add/complete 都刷新成整个 board 的最新快照,对齐 claude cli 底部常驻 todo。
+   *  独立于 tool_<i>(那是每次工具调用的过程变更记录、折叠);这个是实时总览。
+   *  建立后它成为新的插入锚点 —— 后续过程元素 insert_before 它而非 footer,
+   *  保证实时区永远压在 footer 正前(见 session-tools.taskLiveAnchor)。 */
+  taskBoardLive: 'task_board_live',
   tool: (i: number) => `tool_${i}`,
   planUpdate: (i: number) => `plan_update_${i}`,
   goalUpdate: (i: number) => `goal_update_${i}`,

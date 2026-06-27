@@ -62,6 +62,16 @@ export interface TurnState {
    *   null = 该类本 turn 还没活动槽。board 累积在 session 级(session.taskBoard)。 */
   taskCreateI: number | null
   taskUpdateI: number | null
+  /** 2b 懒清空:本 turn 是否已因首次 TaskCreate 把 session.taskBoard 清空过。
+   *  首次 TaskCreate 清空(=换主题重建整张清单),同 turn 后续 TaskCreate 累积;
+   *  下个 turn 首次 TaskCreate 再清空。只 TaskUpdate/List/Get 不清空(同任务延续)。
+   *  per-turn,openTurnCard 初始化为 false。 */
+  taskBoardResetThisTurn: boolean
+  /** 实时任务总览区(task_board_live)是否已在本 turn 卡片建立。首个 Task 工具触发
+   *  建立(footer 正前),之后每次 Task 工具 add/complete 都 replace 内容。换卡时
+   *  rebuildToolsOnRotate 在新卡重建。建立后它成为插入锚点 —— 后续过程元素
+   *  insert_before 它而非 footer(见 session-tools.taskLiveAnchor)。per-turn。 */
+  taskLiveInserted: boolean
   assistantSegmentCount: number
   currentAssistantSegmentId: string | null
   currentAssistantText: string

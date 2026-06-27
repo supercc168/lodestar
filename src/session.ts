@@ -1808,6 +1808,8 @@ export class Session {
       openReadBatchI: null,
       taskCreateI: null,
       taskUpdateI: null,
+      taskBoardResetThisTurn: false,
+      taskLiveInserted: false,
       assistantSegmentCount: 0,
       currentAssistantSegmentId: null,
       currentAssistantText: '',
@@ -1948,6 +1950,15 @@ export class Session {
         turn.segmentTexts = new Map()
         if (carryText) this.startWritingFooter(turn)
         else this.startThinkingFooter(turn)
+        // 先在新卡重建实时任务总览区(紧贴 footer)。必须在 assistant/tool 重建
+        // 之前 —— 后者 insert_before taskLiveAnchor(turn),live 区没建就会指向
+        // 不存在的 target 而写入失败。taskLiveInserted 是 turn 级 flag,swap 不重置,
+        // 新卡照搬本 turn 是否建过实时区,保证换卡后任务总览不丢。
+        if (turn.taskLiveInserted) {
+          void cardkit.addElement(turn.cardId, cards.taskBoardLiveElement(this.taskBoard), {
+            type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
+          })
+        }
         // 已完成但在旧卡插入失败的 assistant 段也要搬到新卡。正文现在是
         // block 完成后一次性 addElement；如果这个 addElement 撞上元素上限,
         // cardkit 会把旧元素标 dead 并触发轮转,这里负责补显示。
@@ -1959,7 +1970,7 @@ export class Session {
           turn.segmentTexts.set(reSegId, fullText)
           void cardkit.addElement(newCardId, this.completedAssistantElement(reSegId, fullText), {
             type: 'insert_before',
-            targetElementId: cards.ELEMENTS.footer,
+            targetElementId: sessionTools.taskLiveAnchor(turn),
           })
         }
         // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read 切开重建。
@@ -2020,7 +2031,7 @@ export class Session {
     const elementId = cards.ELEMENTS.planUpdate(turn.planUpdateCount++)
     void cardkit.addElement(cardId, cards.planElement(turn.planSteps, turn.planExplanation, '', elementId), {
       type: 'insert_before',
-      targetElementId: cards.ELEMENTS.footer,
+      targetElementId: sessionTools.taskLiveAnchor(turn),
     })
   }
 
@@ -2031,7 +2042,7 @@ export class Session {
     const elementId = cards.ELEMENTS.goalUpdate(turn.goalUpdateCount++)
     void cardkit.addElement(turn.cardId, cards.goalElement(goal, elementId), {
       type: 'insert_before',
-      targetElementId: cards.ELEMENTS.footer,
+      targetElementId: sessionTools.taskLiveAnchor(turn),
     })
   }
 
@@ -2046,7 +2057,7 @@ export class Session {
       content: '**🎯 当前目标**\n\n已清除',
     }, {
       type: 'insert_before',
-      targetElementId: cards.ELEMENTS.footer,
+      targetElementId: sessionTools.taskLiveAnchor(turn),
     })
   }
 
@@ -2078,7 +2089,7 @@ export class Session {
       log(`session "${this.sessionName}": context compaction start #${i + 1} key=${key}`)
       void cardkit.addElement(turn.cardId, cards.contextCompactionElement(i, notice, elementId), {
         type: 'insert_before',
-        targetElementId: cards.ELEMENTS.footer,
+        targetElementId: sessionTools.taskLiveAnchor(turn),
       })
       cardkit.patchSummaryThrottled(turn.cardId, `🚨 压缩×${turn.contextCompactCount}`)
       return
@@ -2098,7 +2109,7 @@ export class Session {
     } else {
       void cardkit.addElement(cardId, cards.contextCompactionElement(i, merged, elementId), {
         type: 'insert_before',
-        targetElementId: cards.ELEMENTS.footer,
+        targetElementId: sessionTools.taskLiveAnchor(turn),
       })
     }
     cardkit.patchSummaryThrottled(turn.cardId, `🚨 压缩×${turn.contextCompactCount}`)
@@ -2232,7 +2243,7 @@ export class Session {
     return cardkit.addElement(
       turn.cardId,
       this.completedAssistantElement(segId, text),
-      { type: 'insert_before', targetElementId: cards.ELEMENTS.footer },
+      { type: 'insert_before', targetElementId: sessionTools.taskLiveAnchor(turn) },
     )
   }
 

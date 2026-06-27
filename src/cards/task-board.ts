@@ -325,3 +325,23 @@ export function taskBoardElement(
     ],
   }
 }
+
+/**
+ * 实时任务总览面板(footer 正前常驻)。与 timeline 上的 taskBoardElement 并存:
+ * 那个折叠、记录"每次 Task 工具调用时的 board 快照"(过程变更记录);这个展开、
+ * 始终反映 board 最新态(实时总览),对齐 claude cli 底部常驻 todo。
+ *
+ * header 固定 "📋 任务总览 · 统计" —— 不挂操作名也不挂 ⏳/✅,因为它不代表某次
+ * 工具调用,而是全局任务进度的持续视图。expanded=true 让用户不用点开就能看任务。
+ * body 复用 renderTaskBoardBody,与 timeline 面板视觉一致(同 emoji/排序/截断)。 */
+export function taskBoardLiveElement(board: TaskBoardEntry[]): object {
+  return {
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.taskBoardLive,
+    header: { title: { tag: 'plain_text', content: `📋 任务总览 · ${summarizeTaskBoard(board)}` } },
+    expanded: true,
+    elements: [
+      { tag: 'markdown', content: renderTaskBoardBody(board) },
+    ],
+  }
+}

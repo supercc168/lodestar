@@ -12,6 +12,14 @@ import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
 
+/** 过程元素(tool/assistant/plan/goal/context_compact)的插入锚点:实时任务总览区
+ * 建立后,新元素 insert_before 它(让实时区永远压在 footer 正前,过程记录堆在它
+ * 上方、相对顺序不变);否则 insert_before footer(本 turn 没 Task 工具时,行为同
+ * 改前)。turn=null 兜底 footer —— 调用方都在 turn 生命周期内,turn 非空,仅类型安全。 */
+export function taskLiveAnchor(turn: TurnState | null | undefined): string {
+  return turn?.taskLiveInserted ? cards.ELEMENTS.taskBoardLive : cards.ELEMENTS.footer
+}
+
 function isImageGenerationTool(name: string): boolean {
   return name === 'ImageGeneration' || name === 'imageGeneration'
 }
@@ -60,6 +68,27 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
   const taskName = cards.asTaskToolName(name)
   if (taskName) {
     const turn = s.currentTurn
+    // 2b 懒清空:本 turn 首次 TaskCreate → 清空 board(换主题重建整张清单,不再
+    // 和上轮任务堆叠);同 turn 后续 TaskCreate 累积(不清)。TaskUpdate/List/Get
+    // 不清空 —— 同任务跨 turn 延续时,它们要么按 id 改状态、要么 TaskList 全量
+    // 替换,都该基于现有 board。清空只认"重新建任务"这个换主题信号。
+    if (taskName === 'TaskCreate' && !turn.taskBoardResetThisTurn) {
+      s.taskBoard = []
+      turn.taskBoardResetThisTurn = true
+    }
+    // 实时任务总览区:本 turn 首个 Task 工具触发建立(insert_before footer,紧贴
+    // footer),之后每次 Task 工具都 replace 成最新 board。建立后它成为插入锚点,
+    // 后续过程元素 insert_before 它而非 footer(见 taskLiveAnchor),保证它永远
+    // 压在 footer 正前。与 timeline 上的 taskBoardElement(折叠、记每次操作快照)
+    // 并存 —— 那个是过程变更记录,这个是实时总览,对齐 claude cli 底部常驻 todo。
+    if (!turn.taskLiveInserted) {
+      turn.taskLiveInserted = true
+      void cardkit.addElement(turn.cardId, cards.taskBoardLiveElement(s.taskBoard), {
+        type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
+      })
+    } else {
+      void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.taskBoardLive, cards.taskBoardLiveElement(s.taskBoard))
+    }
     // 连续同类合并:TaskCreate→创建面板,TaskUpdate/List/Get→进度快照面板。
     // 切到另一类则前一类面板定稿(不再更新);board 始终累积。timeline 效果:
     // 创建面板(全待办) → 进度快照(含进行中/完成)。
@@ -75,7 +104,7 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
     turn.toolByUseId.set(toolUseId, { i: ti, name, input })
     const el = cards.taskBoardElement(ti, s.taskBoard, { name: taskName, status: '⏳' })
     void (isFirst
-      ? cardkit.addElement(turn.cardId, el, { type: 'insert_before', targetElementId: cards.ELEMENTS.footer })
+      ? cardkit.addElement(turn.cardId, el, { type: 'insert_before', targetElementId: taskLiveAnchor(turn) })
       : cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(ti), el))
     return
   }
@@ -93,7 +122,7 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
     s.currentTurn.toolByUseId.set(toolUseId, { i, name, input, readBatchSlot: 0 })
     const el = cards.readBatchElement(i, items)
     void cardkit.addElement(s.currentTurn.cardId, el, {
-      type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
+      type: 'insert_before', targetElementId: taskLiveAnchor(s.currentTurn),
     })
     return
   }
@@ -121,7 +150,7 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
     })
     void cardkit.addElement(s.currentTurn.cardId, el, {
       type: 'insert_before',
-      targetElementId: cards.ELEMENTS.footer,
+      targetElementId: taskLiveAnchor(s.currentTurn),
     })
     // Phone push — user has to come back and answer before Codex can
     // continue. Set summary to the question text so the lock-screen
@@ -146,7 +175,7 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
   const el = cards.toolCallElement(i, name, input, null, '⏳')
   void cardkit.addElement(s.currentTurn.cardId, el, {
     type: 'insert_before',
-    targetElementId: cards.ELEMENTS.footer,
+    targetElementId: taskLiveAnchor(s.currentTurn),
   })
 }
 
@@ -212,6 +241,11 @@ function completeTaskTool(s: Session, meta: { i: number; name: string }, taskNam
   }
   const el = cards.taskBoardElement(meta.i, s.taskBoard, { name: taskName, status: isError ? '❌' : '✅' }, resolvedNote)
   void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(meta.i), el)
+  // 实时任务总览区同步刷新:applyTaskTool 已把 board 更新到最新,这里 replace
+  // 让总览跟上(isError 不动 board,总览维持上次有效态,不显示坏结果)。
+  if (s.currentTurn.taskLiveInserted) {
+    void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.taskBoardLive, cards.taskBoardLiveElement(s.taskBoard))
+  }
   startThinkingIfNoToolsRunning(s)
 }
 
@@ -244,6 +278,9 @@ export function rebuildToolsOnRotate(
 ): void {
   const turn = s.currentTurn
   if (!turn) return
+  // 实时任务总览区的重建在 startMidTurnRotate 里(swap 后、assistant 重建前)
+  // 已先于本函数完成 —— 这里搬过来的 tool insert_before taskLiveAnchor(turn)
+  // 时 live 区已在新卡就位。board 是 session 级累积快照,这里直接用。
   for (const [useId, meta] of oldToolByUseId) {
     const isRead = meta.readBatchSlot != null
     let input = meta.input
@@ -269,7 +306,7 @@ export function rebuildToolsOnRotate(
       turn.readBatches.set(ni, { items: [item] })
       turn.toolByUseId.set(useId, { ...meta, i: ni, readBatchSlot: 0 })
       void cardkit.addElement(newCardId, cards.readBatchElement(ni, [item]), {
-        type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
+        type: 'insert_before', targetElementId: taskLiveAnchor(turn),
       })
       continue
     }
@@ -290,7 +327,7 @@ export function rebuildToolsOnRotate(
       const status: '⏳' | '✅' | '❌' = !done ? '⏳' : (isError ? '❌' : '✅')
       const el = cards.taskBoardElement(ti, s.taskBoard, { name: rotatedTaskName, status }, meta.resolvedNote)
       void (isFirst
-        ? cardkit.addElement(newCardId, el, { type: 'insert_before', targetElementId: cards.ELEMENTS.footer })
+        ? cardkit.addElement(newCardId, el, { type: 'insert_before', targetElementId: taskLiveAnchor(turn) })
         : cardkit.replaceElement(newCardId, cards.ELEMENTS.tool(ti), el))
       continue
     }
@@ -298,7 +335,7 @@ export function rebuildToolsOnRotate(
     turn.toolByUseId.set(useId, { ...meta, i: ni })
     const status: '⏳' | '✅' | '❌' = !done ? '⏳' : (isError ? '❌' : '✅')
     void cardkit.addElement(newCardId, cards.toolCallElement(ni, meta.name, meta.input, output, status, meta.resolvedNote), {
-      type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
+      type: 'insert_before', targetElementId: taskLiveAnchor(turn),
     })
   }
 }

@@ -90,4 +90,5 @@ export {
   applyTaskTool,
   summarizeTaskBoard,
   taskBoardElement,
+  taskBoardLiveElement,
 } from './cards/task-board'
