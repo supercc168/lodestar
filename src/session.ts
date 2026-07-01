@@ -2343,21 +2343,31 @@ export class Session {
     turn.footerStatusLabel = null
   }
 
-  /** turn footer 末尾的 5h 额度后缀(`  |  5h·N%`),按当前 provider:
-   *   claude/GLM → readGlmUsage(轻量 HTTP,主动拉当前 5h 窗口百分比)
+  /** turn footer 末尾的 5h 额度后缀(`  |  5h·N%·[Xh]`),按当前 provider:
+   *   claude/GLM → readGlmUsage(轻量 HTTP,主动拉当前 5h 窗口)
    *   codex      → peekUsage(turn 中 updateUsageFromRateLimits 已更新 cache,
    *                纯读不 fetch,避免每轮为一个百分比 spawn codex app-server)
-   * 拿不到百分比就返回空串 —— footer 不假数据 (no_fallbacks)。 */
+   * 拿不到百分比就返回空串;resetsAt 在未来时追加剩余重置时长
+   * (`·[2.3h]`),缺数据不硬凑 —— footer 不假数据 (no_fallbacks)。 */
   private async footerFiveHourSuffix(): Promise<string> {
     let pct: number | null = null
+    let resetsAt: Date | null = null
     if (this.proc?.provider === 'claude') {
       const g = await readGlmUsage()
-      if (g.state === 'ok') pct = g.fiveHour?.percent ?? null
+      if (g.state === 'ok') {
+        pct = g.fiveHour?.percent ?? null
+        resetsAt = g.fiveHour?.resetsAt ?? null
+      }
     } else {
       const u = peekUsage()
-      if (u?.state === 'ok') pct = u.fiveHour?.percent ?? null
+      if (u?.state === 'ok') {
+        pct = u.fiveHour?.percent ?? null
+        resetsAt = u.fiveHour?.resetsAt ?? null
+      }
     }
-    return pct != null ? `  |  5h·${Math.round(pct)}%` : ''
+    if (pct == null) return ''
+    const resetIn = resetsAt && resetsAt.getTime() > Date.now() ? cards.fmtResetIn(resetsAt) : ''
+    return resetIn ? `  |  5h·${Math.round(pct)}%·[${resetIn}]` : `  |  5h·${Math.round(pct)}%`
   }
 
   async closeTurnCard(

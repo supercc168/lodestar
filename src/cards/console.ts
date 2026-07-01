@@ -132,7 +132,7 @@ function fmtUptime(ms: number): string {
 /** Human-readable "time until" — null/past dates collapse to '已重置'.
  * h/d 段保留 1 位小数(`2.3h` / `5.4d`),m 段已经是整数分钟精度
  * 够细就不再加小数。 */
-function fmtResetIn(date: Date | null): string {
+export function fmtResetIn(date: Date | null): string {
   if (!date) return '?'
   const ms = date.getTime() - Date.now()
   if (ms <= 0) return '已重置'
