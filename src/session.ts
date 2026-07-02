@@ -53,6 +53,7 @@ import {
   contextTokensFromUsage,
 } from './context-window'
 import { extractAskUsrMarkers, extractSendMarkerPaths, stripAskUsrMarkers } from './outbound-markers'
+import * as sessionMultimsg from './session-multimsg'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionAgy from './session-agy'
 import * as sessionTools from './session-tools'
@@ -229,6 +230,14 @@ export class Session {
    * mid-turn buffer 的消息不在这里 push —— 它们走 drainMidTurnAndOpen 那条
    * 路径,drain 时统一 push。 */
   pendingTurnInputs: string[] = []
+  /** 用户用 `>>>`(≥3 个 >)主动开启的多条消息缓冲。null = 当前不在多条
+   *  收集模式;非 null = 正在累积,直到 `<<<`(≥3 个 <)收尾合并成一条
+   *  onUserMessage。跟 pendingMidTurnMsgs 不同:后者是 turn 进行中被动到达
+   *  的排队,这个是用户显式分段。状态机在 session-multimsg.ts,永不超时。*/
+  multiMsgBuffer: sessionMultimsg.MultiMsgSegment[] | null = null
+  /** multiMsgBuffer 里每条消息上挂的 📌 reaction_id('' = addReaction 还在
+   *  飞)。flush 时释放 📌,clear 时换成 ❌。*/
+  multiMsgReactions = new Map<string, string>()
   /** Most recent userOpenId seen via `onUserMessage`. Used only when a
    * merged batch fires its init event and the daemon needs *some* open_id
    * to scope the eventual `urgent_app` push — there's no obviously right
@@ -840,6 +849,7 @@ export class Session {
     this.proc = null
     this.stopFooterStatus(this.currentTurn)
     this.currentTurn = null
+    this.clearMultiMsgBuffer('stop')
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
     this.pendingTurnInputs = []
@@ -884,6 +894,7 @@ export class Session {
     }
     this.stopFooterStatus(this.currentTurn)
     this.currentTurn = null
+    this.clearMultiMsgBuffer('restart')
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
     this.pendingTurnInputs = []
@@ -1390,6 +1401,17 @@ export class Session {
     return sessionHostAsk.hasPendingHostAsk(this)
   }
 
+  /** 多条消息缓冲入口(`>>>` 开始 / `<<<` 收尾 / 中段普通消息)。返回 true
+   *  表示这条已被缓冲或已合并 flush,daemon 不应再调 onUserMessage。*/
+  onMultiMessageInbound(text: string, files: string[], userOpenId: string, msgId: string): Promise<boolean> {
+    return sessionMultimsg.onMultiMessageInbound(this, text, files, userOpenId, msgId)
+  }
+
+  /** 丢弃多条消息缓冲并给每条打 ❌。stop/kill/restart/clear/exit 调用。*/
+  clearMultiMsgBuffer(reason: string): void {
+    sessionMultimsg.clearMultiMsgBuffer(this, reason)
+  }
+
   onAskMessageAnswer(text: string, user: string, msgId: string): Promise<void> {
     return sessionAsk.onAskMessageAnswer(this, text, user, msgId)
   }
@@ -1606,6 +1628,7 @@ export class Session {
       this.proc = null
       this.stopFooterStatus(this.currentTurn)
       this.currentTurn = null
+      this.clearMultiMsgBuffer('process exit')
       this.pendingUserMessageCount = 0
       this.pendingMidTurnMsgs = []
       this.pendingTurnInputs = []

@@ -365,6 +365,9 @@ async function handleMessage(data: any): Promise<void> {
     log(`drop empty message ${msgId} type=${msgType}`)
     return
   }
+  // 多条消息缓冲:>>> 开始收集 / <<< 收尾合并。返回 true = 已缓冲或已合并,
+  // 不再往下走 onUserMessage。裸词控制命令已在上面 runCommand 先于本拦截。
+  if (await session.onMultiMessageInbound(text, filePaths, userOpenId, msgId ?? '')) return
   await session.onUserMessage(text || '(empty)', filePaths, userOpenId, msgId ?? '')
 }
 

@@ -110,6 +110,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       // sendInterrupt() control_request causes the SDK to discard
       // queued input alongside the in-flight call.
       s.clearStaleIdleQueueState('stop')
+      s.clearMultiMsgBuffer('stop command')
       if (!s.currentTurn && s.pendingUserMessageCount === 0 && s.pendingMidTurnMsgs.length === 0) {
         const statusCard = await s.openStatusCard('stop', '⚪ 当前没有正在执行的 turn', 'grey')
         if (statusCard) {
