@@ -219,7 +219,7 @@ function extractPostMarkdown(
 }
 
 // ── Inbound message handler ─────────────────────────────────────────────
-const STALE_THRESHOLD_MS = 5_000
+const STALE_THRESHOLD_MS = 30_000
 const seenMessageIds = new Set<string>()
 
 async function handleMessage(data: any): Promise<void> {
