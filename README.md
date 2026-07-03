@@ -94,6 +94,19 @@ lodestar-setup
 
 `task` 面板里的 `删` 会二次确认,确认后删除整个清单和清单内任务。这个能力需要飞书应用开通任务清单/任务/评论相关权限;缺权限时面板会显示 Open API 返回的失败原因和缺失 scope。
 
+### 🔀 自定义 Claude Code 可执行文件(reclaude 等)
+
+默认自动查找 `claude`(`~/.local/npm-global/bin` → `~/.local/bin` → PATH,都没有则用 SDK 自带二进制)。要换成 [reclaude](https://docs.reclaude.ai) 这类"参数原样透传给 claude"的包装器,在 `config.toml` 显式指定:
+
+```toml
+[claude]
+bin = "~/.local/bin/reclaude"
+```
+
+配置后跳过自动查找;路径不存在会在会话启动时直接报错,不会静默回退。日志里 `executable=config:<路径>` 可确认生效。
+
+迁移到 reclaude 时注意:`[claude.env]` 或 `~/.claude/settings.json` 里遗留的 GLM `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 必须清掉 —— base URL 指向 GLM 时流量不经官方域名,reclaude 的拦截不会生效,烧的还是 GLM 额度。`[claude.models.*]` 里的 GLM profile 也需换回官方模型档位。
+
 ### 🔔 HTTP 通知端点
 
 本机任何脚本一行 curl 就能往群里推一张 markdown 卡片(info / warn / error 三档染色):
