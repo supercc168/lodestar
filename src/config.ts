@@ -48,12 +48,36 @@ export interface LodestarConfig {
     env: Record<string, string>
     models: Record<string, ClaudeModelConfig>
   }
+  /** Per-project launch profiles keyed by session name (= group name).
+   * Empty record ⇒ every project runs with Lodestar defaults. */
+  projects: Record<string, ProjectProfile>
 }
 
 export interface ClaudeModelConfig {
   display_name?: string
   description?: string
   model?: string
+}
+
+/** Per-project agent launch profile, sourced from `[projects.<name>].*`
+ * sections in config.toml. Absent section ⇒ no override (Lodestar defaults:
+ * `settingSources:['user']`, `claude_code` tool preset, no project MCP).
+ * Lets an external project (e.g. evolving) run a clean, isolated Claude
+ * session pointed at an arbitrary cwd with a restricted tool set and its
+ * own `.mcp.json`, without touching any other project. */
+export interface ProjectProfile {
+  /** Absolute working directory. Falls back to `PROJECTS_ROOT/<name>`. */
+  cwd?: string
+  /** Comma-separated setting sources, e.g. `"project"` or `"user,project"`. */
+  settingSources?: string
+  /** Only use MCP servers loaded via `loadProjectMcp`; ignore user/global MCP. */
+  strictMcp?: boolean
+  /** Comma-separated built-in tool allow-list, e.g. `"Read,Write,Edit,Bash,Glob,Grep"`. */
+  tools?: string
+  /** Read `<cwd>/.mcp.json` and pass its servers to the SDK. */
+  loadProjectMcp?: boolean
+  /** Keep Lodestar's appended system instructions (card markers etc). Default true. */
+  keepLodestarInstructions?: boolean
 }
 
 function expandTilde(v: string): string {
@@ -147,6 +171,32 @@ function loadConfig(): LodestarConfig {
     }
     return out
   }
+  // [projects.<name>] 节可选 —— 一个外部项目(如 evolving)想跑干净隔离的
+  // Claude session:指定 cwd、限定内置工具、只挂自己的 .mcp.json。未配置的
+  // 项目完全走 Lodestar 默认(settingSources:['user'] + claude_code 工具集)。
+  const projectSections = (): Record<string, ProjectProfile> => {
+    const out: Record<string, ProjectProfile> = {}
+    const prefix = 'projects.'
+    for (const [sectionName, section] of Object.entries(t)) {
+      if (!sectionName.startsWith(prefix)) continue
+      const name = sectionName.slice(prefix.length).trim()
+      if (!name) continue
+      const profile: ProjectProfile = {}
+      for (const [rawKey, value] of Object.entries(section)) {
+        if (typeof value !== 'string' || value.length === 0) continue
+        switch (rawKey.trim()) {
+          case 'cwd': profile.cwd = value; break
+          case 'setting_sources': profile.settingSources = value; break
+          case 'strict_mcp': profile.strictMcp = value === 'true'; break
+          case 'tools': profile.tools = value; break
+          case 'load_project_mcp': profile.loadProjectMcp = value === 'true'; break
+          case 'keep_lodestar_instructions': profile.keepLodestarInstructions = value === 'true'; break
+        }
+      }
+      out[name] = profile
+    }
+    return out
+  }
   // [codex.env] / [claude.env] 节可选 —— 空 record 就维持各 CLI 自己的登录态。
   const codexEnv = envSection('codex.env')
   const claudeEnv = envSection('claude.env')
@@ -157,6 +207,7 @@ function loadConfig(): LodestarConfig {
     notify: { bind: notifyBind, port: notifyPort },
     codex: { env: codexEnv },
     claude: { bin: claudeBin, env: claudeEnv, models: claudeModelSections() },
+    projects: projectSections(),
   }
 }
 

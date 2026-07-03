@@ -131,6 +131,45 @@ curl -sS -X POST http://127.0.0.1:9876/notify \
   -d '{"project":"xxx","text":"build done","level":"info"}'
 ```
 
+`/notify` 还支持可选的 `images` 字段,传本地图片绝对路径,夜航星上传到飞书后渲染在正文之前(上传失败会在卡片里显式标红,不会静默丢):
+
+```bash
+curl -sS -X POST http://127.0.0.1:9876/notify \
+  -H 'Content-Type: application/json' \
+  -d '{"project":"xxx","level":"warn","text":"卡点截图如下","images":["/abs/shot.png"]}'
+```
+
+### 🧩 项目级隔离配置（外部项目接入）
+
+默认每个飞书群对应 `projects_root` 下同名目录,跑 Claude Code 默认工具集。当一个外部项目(不在 `projects_root` 下、且需要干净隔离的 agent)想接入时,在 `~/.config/lodestar/config.toml` 加一个 `[projects.<群名>]` 节即可 —— **未配置的项目行为完全不变**:
+
+```toml
+[projects.calculator2]
+cwd                       = "/abs/path/to/evolving_data/calculator2"
+setting_sources           = "project"
+strict_mcp                = "true"
+tools                     = "Read,Write,Edit,Bash,Glob,Grep"
+load_project_mcp          = "true"
+keep_lodestar_instructions = "true"
+```
+
+| 字段 | 作用 | 默认 |
+| --- | --- | --- |
+| `cwd` | agent 工作目录(绝对路径) | `projects_root/<群名>` |
+| `setting_sources` | `project` 只读项目级设置,不加载用户级全局插件/技能 | `user` |
+| `strict_mcp` | 只挂下方项目 MCP,忽略全局 MCP | 关 |
+| `tools` | 允许的内置工具(逗号分隔);MCP 工具由 `load_project_mcp` 自动可用,不用列在这里 | claude_code 全套 |
+| `load_project_mcp` | 读取 `<cwd>/.mcp.json` 并挂载其 MCP 服务 | 关 |
+| `keep_lodestar_instructions` | 保留夜航星卡片/输出约定系统提示 | 开 |
+
+`strict_mcp = "true"` 时,项目 `.mcp.json` 是 agent 能挂上 MCP 的唯一通路 —— 全局插件/技能被全部挡掉,agent 干净专注。典型用法:外部自动化引擎在自己的目录里维护规则文件,夜航星负责飞书通道和卡片渲染,两者通过群消息驱动协作。
+
+> ⚠️ **这组配置必须完整,配一半会把对话卡死。** `[projects.*]` 的字段是联动的,任一项开启后,它依赖的链路都要一起配齐:
+>
+> - **`setting_sources = "project"`** 会排除用户级 `~/.claude/settings.json`。如果你的 GLM 路由 / `ANTHROPIC_BASE_URL` 是写在 `~/.claude/settings.json`(而不是 lodestar 的 `[claude.env]`),会被丢掉、请求发不出去 → 卡死。**走 `project` 模式时,GLM 路由必须落在 `config.toml` 的 `[claude.env]`**(`env` 不受 `setting_sources` 影响)。
+> - **`load_project_mcp = "true"`** 要求 `<cwd>/.mcp.json` 存在,且其声明的 MCP server 能秒级启动并完成 stdio 握手。server 卡住(路径错、二进制不存在、stdio 不响应)会让对话卡在真正调用模型之前 —— 表现是卡片底部一直 `Thinking...` 且 model 显示成 `<synthetic>`,此时模型其实根本没被调用。
+> - **排查卡死**:看到 `model=<synthetic>` + 长时间 `Thinking`,先把 `[projects.*]` 整节注释掉重启 daemon;不卡了就是 profile 没配齐,按上面两条逐项检查。
+
 ---
 
 > [!TIP]

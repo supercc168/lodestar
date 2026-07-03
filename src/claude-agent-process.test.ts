@@ -1,5 +1,5 @@
 import { homedir, tmpdir } from 'node:os'
-import { writeFileSync, unlinkSync } from 'node:fs'
+import { mkdtempSync, writeFileSync, unlinkSync } from 'node:fs'
 import { delimiter, join, win32 } from 'node:path'
 import { beforeEach, describe, expect, mock, test } from 'bun:test'
 
@@ -19,8 +19,11 @@ const {
   ClaudeAgentProcess,
   claudeTranscriptPath,
   readLastCallUsageFromTranscript,
+  readProjectMcpServers,
   resetClaudeContextWindowMaxCache,
   resolveClaudeExecutableConfig,
+  settingSourcesFromProfile,
+  toolsFromProfile,
 } = await import('./claude-agent-process')
 const {
   resolveClaudeSdkModel,
@@ -798,5 +801,65 @@ describe('Claude transcript context tokens', () => {
 
   test('readLastCallUsageFromTranscript returns null when file missing', () => {
     expect(readLastCallUsageFromTranscript(join(tmpdir(), 'lodestar-no-such.jsonl'))).toBeNull()
+  })
+})
+
+describe('Claude project profile overrides', () => {
+  test('settingSourcesFromProfile falls back to user when absent', () => {
+    expect(settingSourcesFromProfile(undefined)).toEqual(['user'])
+    expect(settingSourcesFromProfile({})).toEqual(['user'])
+  })
+
+  test('settingSourcesFromProfile splits and trims comma-separated sources', () => {
+    expect(settingSourcesFromProfile({ settingSources: 'project' })).toEqual(['project'])
+    expect(settingSourcesFromProfile({ settingSources: 'user, project' })).toEqual(['user', 'project'])
+  })
+
+  test('settingSourcesFromProfile falls back when only blanks given', () => {
+    expect(settingSourcesFromProfile({ settingSources: '' })).toEqual(['user'])
+    expect(settingSourcesFromProfile({ settingSources: ' , ' })).toEqual(['user'])
+  })
+
+  test('toolsFromProfile falls back to claude_code preset when absent', () => {
+    expect(toolsFromProfile(undefined)).toEqual({ type: 'preset', preset: 'claude_code' })
+    expect(toolsFromProfile({})).toEqual({ type: 'preset', preset: 'claude_code' })
+  })
+
+  test('toolsFromProfile splits comma-separated built-in tool names', () => {
+    expect(toolsFromProfile({ tools: 'Read,Write,Edit,Bash,Glob,Grep' })).toEqual([
+      'Read', 'Write', 'Edit', 'Bash', 'Glob', 'Grep',
+    ])
+  })
+
+  test('toolsFromProfile falls back when only blanks given', () => {
+    expect(toolsFromProfile({ tools: '' })).toEqual({ type: 'preset', preset: 'claude_code' })
+    expect(toolsFromProfile({ tools: ' , ' })).toEqual({ type: 'preset', preset: 'claude_code' })
+  })
+
+  test('readProjectMcpServers reads <workDir>/.mcp.json mcpServers', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-mcp-'))
+    writeFileSync(join(dir, '.mcp.json'), JSON.stringify({
+      mcpServers: { evolving: { command: '/bin/evolving', args: ['mcp-notify'] } },
+    }))
+    expect(readProjectMcpServers(dir)).toEqual({
+      evolving: { command: '/bin/evolving', args: ['mcp-notify'] },
+    })
+  })
+
+  test('readProjectMcpServers returns undefined when .mcp.json missing', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-mcp-'))
+    expect(readProjectMcpServers(dir)).toBeUndefined()
+  })
+
+  test('readProjectMcpServers returns undefined for malformed json', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-mcp-'))
+    writeFileSync(join(dir, '.mcp.json'), '{ not json')
+    expect(readProjectMcpServers(dir)).toBeUndefined()
+  })
+
+  test('readProjectMcpServers returns undefined when mcpServers absent', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-mcp-'))
+    writeFileSync(join(dir, '.mcp.json'), JSON.stringify({ foo: 'bar' }))
+    expect(readProjectMcpServers(dir)).toBeUndefined()
   })
 })

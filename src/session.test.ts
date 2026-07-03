@@ -6,6 +6,7 @@ let sentTexts: string[] = []
 let sentRawTexts: string[] = []
 let deletedReactions: Array<[string, string]> = []
 let boundResumes: Array<[string, string, string | undefined]> = []
+const projectProfiles = new Map<string, { cwd?: string }>()
 
 mock.module('./feishu', () => ({
   PROJECTS_ROOT: '/tmp/lodestar-projects',
@@ -33,6 +34,7 @@ mock.module('./feishu', () => ({
   },
   bindSessionModel: () => {},
   provisionProject: () => {},
+  projectProfile: (name: string) => projectProfiles.get(name),
 }))
 
 const { Session } = await import('./session')
@@ -54,6 +56,7 @@ beforeEach(() => {
   sentRawTexts = []
   deletedReactions = []
   boundResumes = []
+  projectProfiles.clear()
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input))
     const path = url.pathname.replace('/open-apis/cardkit/v1', '')
@@ -573,5 +576,24 @@ describe('Session turn close vs mid-turn rotation race', () => {
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)
     }
+  })
+})
+
+describe('Session workDir project profile override', () => {
+  test('uses profile cwd when present', () => {
+    projectProfiles.set('withoverride', { cwd: '/abs/custom/dir' })
+    const session = new Session('withoverride', 'oc_test_override')
+    expect(session.workDir).toBe('/abs/custom/dir')
+  })
+
+  test('falls back to PROJECTS_ROOT/<name> without profile', () => {
+    const session = new Session('plainproject', 'oc_test_plain')
+    expect(session.workDir).toBe('/tmp/lodestar-projects/plainproject')
+  })
+
+  test('ignores a blank cwd override', () => {
+    projectProfiles.set('blankcwd', { cwd: '   ' })
+    const session = new Session('blankcwd', 'oc_test_blank')
+    expect(session.workDir).toBe('/tmp/lodestar-projects/blankcwd')
   })
 })
