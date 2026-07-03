@@ -42,6 +42,9 @@ export interface LodestarConfig {
    * `@anthropic-ai/claude-agent-sdk`. Empty record = inherit the user's
    * local Claude Code configuration. */
   claude: {
+    /** 显式指定 SDK spawn 的 Claude Code 可执行文件(如 reclaude 这类
+     * 参数透传包装器)。未设置 = 自动查找。 */
+    bin?: string
     env: Record<string, string>
     models: Record<string, ClaudeModelConfig>
   }
@@ -197,12 +200,13 @@ function loadConfig(): LodestarConfig {
   // [codex.env] / [claude.env] 节可选 —— 空 record 就维持各 CLI 自己的登录态。
   const codexEnv = envSection('codex.env')
   const claudeEnv = envSection('claude.env')
+  const claudeBin = t.claude?.bin ? expandTilde(t.claude.bin) : undefined
   return {
     feishu: { app_id: appId, app_secret: appSecret },
     runtime: { projects_root: projectsRoot },
     notify: { bind: notifyBind, port: notifyPort },
     codex: { env: codexEnv },
-    claude: { env: claudeEnv, models: claudeModelSections() },
+    claude: { bin: claudeBin, env: claudeEnv, models: claudeModelSections() },
     projects: projectSections(),
   }
 }

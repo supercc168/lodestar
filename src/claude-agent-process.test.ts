@@ -95,6 +95,53 @@ describe('Claude model profiles', () => {
   })
 })
 
+describe('Claude configured executable ([claude] bin)', () => {
+  test('uses configured bin as the SDK executable', () => {
+    const bin = '/home/me/.local/bin/reclaude'
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'linux',
+      configuredBin: bin,
+      exists: path => path === bin,
+    })
+
+    expect(executable.pathToClaudeCodeExecutable).toBe(bin)
+    expect(executable.spawnClaudeCodeProcess).toBeUndefined()
+    expect(executable.description).toBe(`config:${bin}`)
+  })
+
+  test('throws instead of silently falling back when configured bin is missing', () => {
+    expect(() => resolveClaudeExecutableConfig({
+      platform: 'linux',
+      configuredBin: '/nope/reclaude',
+      exists: () => false,
+    })).toThrow('/nope/reclaude')
+  })
+
+  test('runs configured Windows .cmd bin through the shell shim spawn hook', () => {
+    const bin = win32.join('C:\\Users\\me\\bin', 'reclaude.cmd')
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'win32',
+      configuredBin: bin,
+      exists: path => path === bin,
+    })
+
+    expect(executable.pathToClaudeCodeExecutable).toBe(bin)
+    expect(typeof executable.spawnClaudeCodeProcess).toBe('function')
+    expect(executable.description).toBe(`windows-shell-shim:${bin}`)
+  })
+
+  test('explicit null configuredBin falls back to auto discovery', () => {
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'win32',
+      pathEnv: '',
+      configuredBin: null,
+      exists: () => false,
+    })
+
+    expect(executable).toEqual({ description: 'sdk-default' })
+  })
+})
+
 describe('Claude permission mode', () => {
   test('runs Claude Code in bypass permission mode', () => {
     expect(CLAUDE_PERMISSION_MODE).toBe('bypassPermissions')
