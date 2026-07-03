@@ -91,6 +91,8 @@ type ClaudePathLookup = {
   pathEnv?: string
   homeDir?: string
   exists?: (path: string) => boolean
+  /** undefined = 读 config.claude.bin;显式 null = 视为未配置(测试隔离 config 用)。 */
+  configuredBin?: string | null
 }
 
 type ClaudeExecutableConfig = {
@@ -160,6 +162,23 @@ export function assertClaudeCodeAvailable(): void {
 
 export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): ClaudeExecutableConfig {
   const platform = lookup.platform ?? process.platform
+  const configured = lookup.configuredBin === undefined ? config.claude.bin : lookup.configuredBin
+  if (configured) {
+    const exists = lookup.exists ?? existsSync
+    // [claude].bin 配错时必须 fail fast:静默回退会让用户以为在烧包装器
+    // (如 reclaude)的额度,实际走了别的 key。
+    if (!exists(configured)) {
+      throw new Error(`lodestar: [claude].bin not found: ${configured} (config.toml)`)
+    }
+    if (platform === 'win32' && windowsShellShim(configured)) {
+      return {
+        pathToClaudeCodeExecutable: configured,
+        spawnClaudeCodeProcess: spawnWindowsShellShim,
+        description: `windows-shell-shim:${configured}`,
+      }
+    }
+    return { pathToClaudeCodeExecutable: configured, description: `config:${configured}` }
+  }
   const bin = findClaudeBin(lookup)
   if (!bin) return { description: 'sdk-default' }
   if (platform === 'win32' && windowsShellShim(bin)) {
