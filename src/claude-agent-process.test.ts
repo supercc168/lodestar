@@ -28,6 +28,7 @@ const {
 const {
   resolveClaudeSdkModel,
 } = await import('./claude-models')
+const { config } = await import('./config')
 
 // context window max 是 daemon 全局缓存(按路由 key 跨 session 共享),
 // 每个用例前重置,避免互相污染。
@@ -139,6 +140,33 @@ describe('Claude configured executable ([claude] bin)', () => {
     })
 
     expect(executable).toEqual({ description: 'sdk-default' })
+  })
+
+  test('sendInitialize 配错 bin 路径时走 error/exit 事件而非同步抛出', () => {
+    // [claude].bin 指向不存在的路径 → resolveClaudeExecutableConfig 同步抛出;
+    // 修复确保该抛出在 sendInitialize 的 try/catch 内被捕获,转为事件输出,
+    // 调用方不会收到同步异常,session 层可通过 error/exit 事件做正常清理。
+    ;(config.claude as any).bin = '/nope/reclaude'
+    try {
+      const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' })
+      const errors: Error[] = []
+      const exits: any[] = []
+      proc.on('error', (err: Error) => errors.push(err))
+      proc.on('exit', (ev: any) => exits.push(ev))
+
+      // 不能同步抛出
+      expect(() => proc.sendInitialize()).not.toThrow()
+
+      // error 事件携带路径信息
+      expect(errors).toHaveLength(1)
+      expect(errors[0].message).toContain('/nope/reclaude')
+
+      // exit 事件 code=1
+      expect(exits).toHaveLength(1)
+      expect(exits[0].code).toBe(1)
+    } finally {
+      delete (config.claude as any).bin
+    }
   })
 })
 

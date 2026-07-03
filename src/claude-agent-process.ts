@@ -658,8 +658,6 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (this.started) return
     this.started = true
     const model = resolveClaudeSdkModel(this.opts.model)
-    const executable = resolveClaudeExecutableConfig()
-    log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} cwd=${this.opts.workDir} executable=${executable.description}`)
     const profile = this.opts.profile
     if (profile) {
       log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? false} keepInstructions=${(profile.keepLodestarInstructions ?? true)}`)
@@ -672,6 +670,10 @@ export class ClaudeAgentProcess extends EventEmitter {
     // Lodestar's appended card/output markers for a fully isolated agent.
     const appendSystemPrompt = profile?.keepLodestarInstructions === false ? undefined : this.opts.appendSystemPrompt
     try {
+      // resolveClaudeExecutableConfig 在 [claude].bin 配错路径时同步抛出;
+      // 必须在 try 内调用,确保错误走 error/exit 事件而非穿透到调用方。
+      const executable = resolveClaudeExecutableConfig()
+      log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} cwd=${this.opts.workDir} executable=${executable.description}`)
       this.query = query({
         prompt: this.input,
         options: {
