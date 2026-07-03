@@ -137,6 +137,12 @@ keep_lodestar_instructions = "true"
 
 `strict_mcp = "true"` 时,项目 `.mcp.json` 是 agent 能挂上 MCP 的唯一通路 —— 全局插件/技能被全部挡掉,agent 干净专注。典型用法:外部自动化引擎在自己的目录里维护规则文件,夜航星负责飞书通道和卡片渲染,两者通过群消息驱动协作。
 
+> ⚠️ **这组配置必须完整,配一半会把对话卡死。** `[projects.*]` 的字段是联动的,任一项开启后,它依赖的链路都要一起配齐:
+>
+> - **`setting_sources = "project"`** 会排除用户级 `~/.claude/settings.json`。如果你的 GLM 路由 / `ANTHROPIC_BASE_URL` 是写在 `~/.claude/settings.json`(而不是 lodestar 的 `[claude.env]`),会被丢掉、请求发不出去 → 卡死。**走 `project` 模式时,GLM 路由必须落在 `config.toml` 的 `[claude.env]`**(`env` 不受 `setting_sources` 影响)。
+> - **`load_project_mcp = "true"`** 要求 `<cwd>/.mcp.json` 存在,且其声明的 MCP server 能秒级启动并完成 stdio 握手。server 卡住(路径错、二进制不存在、stdio 不响应)会让对话卡在真正调用模型之前 —— 表现是卡片底部一直 `Thinking...` 且 model 显示成 `<synthetic>`,此时模型其实根本没被调用。
+> - **排查卡死**:看到 `model=<synthetic>` + 长时间 `Thinking`,先把 `[projects.*]` 整节注释掉重启 daemon;不卡了就是 profile 没配齐,按上面两条逐项检查。
+
 ---
 
 > [!TIP]
