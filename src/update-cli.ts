@@ -1,8 +1,10 @@
 /**
  * CLI entry for `lodestar-update` bin.
  *
- * 跑全局 npm install，把 Lodestar、Codex CLI、Claude Code CLI 以及
- * Claude Agent SDK / Anthropic SDK 一起升。stdio inherit 让 npm 自己的
+ * 跑全局 npm install，把 Codex CLI、Claude Code CLI 以及
+ * Claude Agent SDK / Anthropic SDK 一起升。Lodestar 本体是源码构建安装
+ * (fork 未发 npm 包),npm 升不到 —— 完事后打印 git pull + 重新构建的
+ * 指引。stdio inherit 让 npm 自己的
  * 进度条和版本号输出原样透出来。完事后提示用户重启 daemon —— 我们
  * 这里 *不* 主动 stop + start, 因为 daemon 可能挂在 systemd / Windows
  * 后台托管下,由那边接管,自重启会撞两次。让用户自己根据部署方式决定。
@@ -23,7 +25,6 @@ const C = {
 }
 
 const UPDATE_PACKAGES = [
-  '@leviyuan/lodestar@latest',
   '@openai/codex@latest',
   '@anthropic-ai/claude-code@latest',
   '@anthropic-ai/claude-agent-sdk@latest',
@@ -47,7 +48,7 @@ function runNpmInstall(): Promise<number> {
 }
 
 async function main(): Promise<void> {
-  console.log(`${C.bold}更新 Lodestar + Codex CLI + Claude Code / SDK${C.reset}`)
+  console.log(`${C.bold}更新 Codex CLI + Claude Code / SDK${C.reset}`)
   console.log(`${C.dim}npm i -g ${UPDATE_PACKAGES.join(' ')}${C.reset}\n`)
 
   const code = await runNpmInstall()
@@ -56,7 +57,10 @@ async function main(): Promise<void> {
     process.exit(code)
   }
 
-  console.log(`\n${C.green}✓ 更新完成${C.reset}`)
+  console.log(`\n${C.green}✓ 依赖更新完成${C.reset}`)
+  console.log()
+  console.log(`${C.yellow}Lodestar 本体从源码更新 (fork 未发 npm 包):${C.reset}`)
+  console.log(`  ${C.cyan}cd <lodestar 源码目录> && git pull && bun install && bun run build && npm i -g .${C.reset}`)
   if (existsSync(PID_FILE)) {
     console.log()
     console.log(`${C.yellow}检测到 daemon 仍在跑老版本进程, 用新版本需要重启:${C.reset}`)

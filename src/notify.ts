@@ -71,7 +71,7 @@ export interface NotifyOptions {
 
 export function startNotifyServer(opts: NotifyOptions): void {
   // node:http instead of Bun.serve so the same source runs on both
-  // Bun (dev: `bun daemon.ts`) and Node (prod: `npm i -g @leviyuan/lodestar`).
+  // Bun (dev: `bun daemon.ts`) and Node (prod: `源码构建后 npm i -g .`).
   // Bun has full node:http compat so dev behavior is byte-for-byte preserved.
   try {
     const server = createServer((req, res) => {

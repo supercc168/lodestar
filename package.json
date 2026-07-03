@@ -1,5 +1,5 @@
 {
-  "name": "@leviyuan/lodestar",
+  "name": "@supercc168/lodestar",
   "version": "0.11.9",
   "publishConfig": {
     "access": "public"
@@ -8,11 +8,11 @@
   "type": "module",
   "license": "MIT",
   "author": "leviyuan",
-  "homepage": "https://github.com/leviyuan/lodestar#readme",
-  "bugs": "https://github.com/leviyuan/lodestar/issues",
+  "homepage": "https://github.com/supercc168/lodestar#readme",
+  "bugs": "https://github.com/supercc168/lodestar/issues",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/leviyuan/lodestar.git"
+    "url": "git+https://github.com/supercc168/lodestar.git"
   },
   "keywords": [
     "feishu",

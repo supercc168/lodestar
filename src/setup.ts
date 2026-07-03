@@ -1,5 +1,5 @@
 /**
- * Interactive setup wizard — runs after `npm i -g @leviyuan/lodestar`,
+ * Interactive setup wizard — runs after `源码构建后 npm i -g .`,
  * triggered either by the postinstall hook (via /dev/tty on unix,
  * \\.\CON{IN,OUT}$ on Windows) or manually via `lodestar-setup`.
  *
