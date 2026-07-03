@@ -58,7 +58,8 @@ function notifyCard(opts: {
   const elements: object[] = []
   for (const img of opts.images ?? []) {
     if (img.key) {
-      elements.push({ tag: 'image', img_key: img.key, alt: { tag: 'plain_text', content: 'screenshot' } })
+      // Card JSON 2.0 图片组件 tag 固定为 "img"(非 "image"),alt 为必填 struct。
+      elements.push({ tag: 'img', img_key: img.key, alt: { tag: 'plain_text', content: 'screenshot' } })
     } else {
       // No silent fallback: surface the failed upload inline so the caller
       // knows which local image never made it onto the card.
