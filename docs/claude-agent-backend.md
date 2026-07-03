@@ -42,6 +42,8 @@ haiku = "v4flash"
 
 模型路由的真相源是 `~/.claude/settings.json`(SDK 经 `settingSources:['user']` 读取):`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_DEFAULT_OPUS_MODEL` 等都在那里配。Lodestar 不再注入这些 env,`[claude.env]` 仅作可选 escape hatch。
 
+可执行文件解析:`resolveClaudeExecutableConfig()` 默认自动查找 `claude`(`~/.local/npm-global/bin` → `~/.local/bin` → PATH → SDK 自带)。`config.toml` 设 `[claude].bin`(支持 `~`)可显式覆盖,用于 reclaude 这类参数透传包装器;路径不存在时 `sendInitialize` 直接抛错,不静默回退。日志 `executable=config:<路径>` 确认生效。
+
 主线程 SDK `model` 不直传 `5.2` / `v4pro` 这类上游模型代码,而是传 `opus` 档位 alias,Claude Code 再按 settings.json 的 `ANTHROPIC_DEFAULT_*_MODEL` 路由。实际 smoke 证明直传 `5.2` 会返回 “模型不存在”。
 
 ## Claude Event Mapping
