@@ -15,7 +15,7 @@ import {
   type UserDialogRequest,
   type UserDialogResult,
 } from '@anthropic-ai/claude-agent-sdk'
-import { config } from './config'
+import { config, type ProjectProfile } from './config'
 import { log } from './log'
 import {
   CLAUDE_EFFORT,
@@ -84,6 +84,11 @@ type PendingServerToolInput = {
 export interface ClaudeSpawnOpts extends SpawnOpts {
   model?: string
   effort: ClaudeReasoningEffort
+  /** Optional per-project launch profile from `[projects.<name>].*` in
+   * config.toml. When present, overrides setting sources / tool set /
+   * strict-mcp / project-mcp loading for an isolated session. Absent ⇒
+   * Lodestar defaults (user sources, claude_code preset, no project MCP). */
+  profile?: ProjectProfile
 }
 
 type ClaudePathLookup = {
@@ -433,6 +438,54 @@ const CLAUDE_ASK_DIALOG_KINDS = [
 export const CLAUDE_PERMISSION_MODE = 'bypassPermissions' as const
 export const CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS = true
 
+/** Default setting sources when no project profile overrides them. */
+const DEFAULT_SETTING_SOURCES: readonly string[] = ['user']
+
+/** Resolve SDK `settingSources` from a project profile's comma-separated
+ * string (e.g. `"project"`), falling back to `['user']`. */
+export function settingSourcesFromProfile(profile: ProjectProfile | undefined): string[] {
+  if (!profile?.settingSources) return [...DEFAULT_SETTING_SOURCES]
+  const list = profile.settingSources.split(',').map(s => s.trim()).filter(Boolean)
+  return list.length ? list : [...DEFAULT_SETTING_SOURCES]
+}
+
+/** Resolve SDK `tools` from a project profile's comma-separated built-in
+ * tool allow-list (e.g. `"Read,Write,Edit,Bash,Glob,Grep"`), falling back
+ * to the `claude_code` preset. MCP tools are NOT listed here — they are
+ * enabled separately via `mcpServers` and auto-join the tool set. */
+export function toolsFromProfile(
+  profile: ProjectProfile | undefined,
+): string[] | { type: 'preset'; preset: 'claude_code' } {
+  if (!profile?.tools) return { type: 'preset', preset: 'claude_code' }
+  const list = profile.tools.split(',').map(s => s.trim()).filter(Boolean)
+  return list.length ? list : { type: 'preset', preset: 'claude_code' }
+}
+
+/** Read `<workDir>/.mcp.json` and return its `mcpServers` map, or undefined
+ * when missing / unreadable / malformed. No silent fallback — the failure
+ * is logged so the project knows its MCP didn't load. */
+export function readProjectMcpServers(workDir: string): Record<string, unknown> | undefined {
+  const mcpPath = join(workDir, '.mcp.json')
+  let raw: string
+  try {
+    raw = readFileSync(mcpPath, 'utf8')
+  } catch (e) {
+    log(`claude-agent-process: project .mcp.json not readable at ${mcpPath}: ${e}`)
+    return undefined
+  }
+  try {
+    const parsed = JSON.parse(raw)
+    if (parsed && typeof parsed === 'object' && parsed.mcpServers && typeof parsed.mcpServers === 'object') {
+      return parsed.mcpServers as Record<string, unknown>
+    }
+    log(`claude-agent-process: project .mcp.json has no mcpServers object at ${mcpPath}`)
+    return undefined
+  } catch (e) {
+    log(`claude-agent-process: project .mcp.json parse failed at ${mcpPath}: ${e}`)
+    return undefined
+  }
+}
+
 function normalizeAskDialogInput(request: UserDialogRequest): Record<string, unknown> | null {
   if (!CLAUDE_ASK_DIALOG_KINDS.includes(request.dialogKind as any)) return null
   const payload = request.payload && typeof request.payload === 'object' ? request.payload : {}
@@ -535,6 +588,17 @@ export class ClaudeAgentProcess extends EventEmitter {
     const model = resolveClaudeSdkModel(this.opts.model)
     const executable = resolveClaudeExecutableConfig()
     log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} cwd=${this.opts.workDir} executable=${executable.description}`)
+    const profile = this.opts.profile
+    if (profile) {
+      log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? false} keepInstructions=${(profile.keepLodestarInstructions ?? true)}`)
+    }
+    const settingSources = settingSourcesFromProfile(profile)
+    const toolsOption = toolsFromProfile(profile)
+    const strictMcpConfig = profile?.strictMcp === true
+    const mcpServers = profile?.loadProjectMcp ? readProjectMcpServers(this.opts.workDir) : undefined
+    // keepLodestarInstructions defaults to true; an explicit false drops
+    // Lodestar's appended card/output markers for a fully isolated agent.
+    const appendSystemPrompt = profile?.keepLodestarInstructions === false ? undefined : this.opts.appendSystemPrompt
     try {
       this.query = query({
         prompt: this.input,
@@ -556,8 +620,10 @@ export class ClaudeAgentProcess extends EventEmitter {
             PATH: buildClaudeSpawnPath(),
             ...config.claude.env,
           },
-          settingSources: ['user'],
-          tools: { type: 'preset', preset: 'claude_code' },
+          settingSources,
+          tools: toolsOption,
+          ...(strictMcpConfig ? { strictMcpConfig: true } : {}),
+          ...(mcpServers ? { mcpServers } : {}),
           toolConfig: {
             askUserQuestion: { previewFormat: 'markdown' },
           },
@@ -567,7 +633,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           systemPrompt: {
             type: 'preset',
             preset: 'claude_code',
-            ...(this.opts.appendSystemPrompt ? { append: this.opts.appendSystemPrompt } : {}),
+            ...(appendSystemPrompt ? { append: appendSystemPrompt } : {}),
           },
           stderr: data => {
             const text = data.trim()

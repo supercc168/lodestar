@@ -361,7 +361,10 @@ export class Session {
     }
   }
 
-  get workDir(): string { return join(feishu.PROJECTS_ROOT, this.sessionName) }
+  get workDir(): string {
+    const override = feishu.projectProfile(this.sessionName)?.cwd
+    return override && override.trim() ? override : join(feishu.PROJECTS_ROOT, this.sessionName)
+  }
   isRunning(): boolean { return !!this.proc && this.proc.isAlive() }
   currentProvider(): AgentProvider { return this.selectedProvider }
 
@@ -439,6 +442,7 @@ export class Session {
         effort: this.claudeEffortForSpawn(),
         resumeSessionId,
         appendSystemPrompt: this.spawnDeveloperInstructions(),
+        profile: feishu.projectProfile(this.sessionName),
       })
     }
     return new CodexProcess({

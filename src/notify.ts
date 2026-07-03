@@ -15,6 +15,7 @@
  *       "text":    "**build done** 12 files",
  *       "title":   "build",                    // optional, default = project
  *       "level":   "info" | "warn" | "error"   // optional, default "info"
+ *       "images":  ["/abs/a.png", ...]         // optional, uploaded + embedded
  *     }
  *   → 200 { ok: true, chat_id, message_id }
  *   → 400 bad/empty json or missing field
@@ -38,7 +39,14 @@ import * as feishu from './feishu'
 export type Level = 'info' | 'warn' | 'error'
 const VALID_LEVELS: ReadonlySet<Level> = new Set(['info', 'warn', 'error'])
 
-function notifyCard(opts: { title: string; text: string; level: Level }): object {
+function notifyCard(opts: {
+  title: string
+  text: string
+  level: Level
+  /** Uploaded images, in insertion order. `key==''` marks an upload
+   * failure — rendered as an inline red error so the caller sees it. */
+  images?: Array<{ key: string; src: string }>
+}): object {
   const template = opts.level === 'error' ? 'red'
     : opts.level === 'warn' ? 'yellow'
     : 'blue'
@@ -47,6 +55,19 @@ function notifyCard(opts: { title: string; text: string; level: Level }): object
     : '🔔'
   const d = new Date()
   const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  const elements: object[] = []
+  for (const img of opts.images ?? []) {
+    if (img.key) {
+      elements.push({ tag: 'image', img_key: img.key, alt: { tag: 'plain_text', content: 'screenshot' } })
+    } else {
+      // No silent fallback: surface the failed upload inline so the caller
+      // knows which local image never made it onto the card.
+      elements.push({ tag: 'markdown', content: `<font color='red'>📷 图片上传失败: ${img.src}</font>` })
+    }
+  }
+  elements.push({ tag: 'markdown', content: opts.text || '_（空消息）_' })
+  elements.push({ tag: 'hr' })
+  elements.push({ tag: 'markdown', content: `<font color='grey'>via notify · ${hhmm}</font>` })
   return {
     schema: '2.0',
     config: {},
@@ -54,13 +75,7 @@ function notifyCard(opts: { title: string; text: string; level: Level }): object
       title: { tag: 'plain_text', content: `${emoji} ${opts.title}` },
       template,
     },
-    body: {
-      elements: [
-        { tag: 'markdown', content: opts.text || '_（空消息）_' },
-        { tag: 'hr' },
-        { tag: 'markdown', content: `<font color='grey'>via notify · ${hhmm}</font>` },
-      ],
-    },
+    body: { elements },
   }
 }
 
@@ -114,8 +129,8 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
   if (req.method === 'GET' && url.pathname === '/') {
     return sendText(200,
       'lodestar notify\n' +
-      'POST /notify        body={project,text,title?,level?}  → push card to group\n' +
-      'levels: info|warn|error (default info)\n')
+      'POST /notify        body={project,text,title?,level?,images?}  → push card to group\n' +
+      'levels: info|warn|error (default info); images=[/abs/*.png] uploaded + embedded\n')
   }
   if (req.method !== 'POST' || url.pathname !== '/notify') {
     return sendText(405, 'use POST /notify')
@@ -144,12 +159,21 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
       `project "${project}" not bound — send any message in that Feishu group at least once after the daemon started, then retry`)
   }
 
-  const card = notifyCard({ title, text, level })
+  const imageInputs = Array.isArray(body.images) ? body.images : []
+  const images: Array<{ key: string; src: string }> = []
+  for (const entry of imageInputs) {
+    const src = String(entry ?? '').trim()
+    if (!src) continue
+    const key = await feishu.uploadImageKey(src)
+    images.push({ key: key ?? '', src })
+  }
+
+  const card = notifyCard({ title, text, level, images })
   const messageId = await feishu.sendCard(chatId, card)
   if (!messageId) {
     log(`notify: sendCard failed → 502 (project="${project}" chat=${chatId.slice(0, 8)}…)`)
     return sendText(502, 'feishu sendCard failed (see daemon log)')
   }
-  log(`notify: → ${project} (${chatId.slice(0, 8)}…) level=${level} bytes=${text.length} msg=${messageId}`)
+  log(`notify: → ${project} (${chatId.slice(0, 8)}…) level=${level} bytes=${text.length} images=${images.length} msg=${messageId}`)
   sendJson(200, { ok: true, chat_id: chatId, message_id: messageId })
 }

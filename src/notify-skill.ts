@@ -55,6 +55,7 @@ Body (JSON):
 | \`text\` | ✅ | Feishu schema-2.0 markdown — \`**bold**\`, \`\` \`code\` \`\`, \`[link](url)\`, \`<font color='red'>…</font>\` |
 | \`title\` |   | Card header, defaults to \`project\` |
 | \`level\` |   | \`info\` (blue, default) / \`warn\` (yellow) / \`error\` (red) |
+| \`images\` |   | Array of local image paths \`["/abs/a.png"]\` — uploaded to Feishu and embedded above the text (failed uploads surface inline in red, never dropped silently) |
 
 Response: \`200 {ok, chat_id, message_id}\` / \`400\` bad params / \`404\`
 group not bound / \`502\` Feishu API rejected.

@@ -13,7 +13,7 @@ import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSyn
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
-import { config } from './config'
+import { config, type ProjectProfile } from './config'
 import { isCodexReasoningEffort, resolveCodexBin } from './codex-process'
 import {
   isClaudeReasoningEffort,
@@ -34,6 +34,14 @@ import { log } from './log'
 const APP_ID = config.feishu.app_id
 const APP_SECRET = config.feishu.app_secret
 export const PROJECTS_ROOT = config.runtime.projects_root
+
+/** Per-project launch profile for `sessionName`, or undefined when the
+ * project runs with Lodestar defaults. Sourced from `[projects.<name>].*`
+ * in config.toml. Lets an external project (e.g. evolving) override cwd,
+ * tool set, and MCP loading without touching other projects. */
+export function projectProfile(sessionName: string): ProjectProfile | undefined {
+  return config.projects[sessionName]
+}
 
 export const client = new lark.Client({
   appId: APP_ID, appSecret: APP_SECRET, disableTokenCache: false,
@@ -676,6 +684,29 @@ async function uploadImageMultipart(filePath: string): Promise<string | null> {
     return null
   }
   return data.data?.image_key ?? null
+}
+
+/** Upload a local image for embedding inside a Card Kit card. Returns the
+ * Feishu-accessible `image_key`, or null on any failure (missing/oversize
+ * file, API rejection). Mirrors `uploadAndSend`'s validation but yields the
+ * key so the caller can place an `{tag:'image'}` element instead of sending
+ * a standalone image message. */
+export async function uploadImageKey(filePath: string): Promise<string | null> {
+  try {
+    const stats = statSync(filePath)
+    if (!stats.isFile()) {
+      log(`feishu: uploadImageKey not a file — ${filePath}`)
+      return null
+    }
+    if (stats.size > MAX_UPLOAD_BYTES) {
+      log(`feishu: uploadImageKey oversize — ${filePath} (${(stats.size / 1024 / 1024).toFixed(1)} MB)`)
+      return null
+    }
+  } catch (e) {
+    log(`feishu: uploadImageKey stat failed — ${filePath}: ${e}`)
+    return null
+  }
+  return uploadImageMultipart(filePath)
 }
 
 async function uploadFileMultipart(filePath: string): Promise<string | null> {
