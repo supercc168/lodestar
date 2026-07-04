@@ -168,6 +168,23 @@ describe('Claude configured executable ([claude] bin)', () => {
       delete (config.claude as any).bin
     }
   })
+
+  test('listModels/setModelSettings 在 sendInitialize 失败后抛清晰错误', async () => {
+    // sendInitialize 因配错 bin 走 catch → this.query 保持 undefined。
+    // 旧实现此时调 listModels/setModelSettings 会抛模糊的
+    // "Cannot read properties of undefined (reading 'supportedModels')";
+    // 守卫后改成可定位的清晰错误(2026-07-04 review follow-up)。
+    ;(config.claude as any).bin = '/nope/reclaude'
+    try {
+      const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' })
+      proc.sendInitialize() // 走 catch,this.query 仍 undefined
+
+      await expect(proc.listModels()).rejects.toThrow('SDK query not initialized')
+      await expect(proc.setModelSettings('opus', 'high')).rejects.toThrow('SDK query not initialized')
+    } finally {
+      delete (config.claude as any).bin
+    }
+  })
 })
 
 describe('Claude permission mode', () => {

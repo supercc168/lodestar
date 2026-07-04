@@ -812,7 +812,8 @@ export class ClaudeAgentProcess extends EventEmitter {
 
   async listModels(): Promise<CodexModel[]> {
     if (!this.started) this.sendInitialize()
-    const models = await this.query!.supportedModels()
+    if (!this.query) throw new Error('claude-agent-process: SDK query not initialized (sendInitialize failed or not called)')
+    const models = await this.query.supportedModels()
     return models.map(mapModelInfo)
   }
 
@@ -820,11 +821,12 @@ export class ClaudeAgentProcess extends EventEmitter {
     const claudeModel = resolveClaudeSdkModel(model)
     if (!isClaudeReasoningEffort(effort)) throw new Error(`invalid Claude effort: ${String(effort)}`)
     if (!this.started) this.sendInitialize()
-    if (claudeModel) await this.query!.setModel(claudeModel)
+    if (!this.query) throw new Error('claude-agent-process: SDK query not initialized (sendInitialize failed or not called)')
+    if (claudeModel) await this.query.setModel(claudeModel)
     if (effort === 'max') {
-      await this.query!.applyFlagSettings({ ultracode: true, effortLevel: null })
+      await this.query.applyFlagSettings({ ultracode: true, effortLevel: null })
     } else {
-      await this.query!.applyFlagSettings({ effortLevel: effort, ultracode: null })
+      await this.query.applyFlagSettings({ effortLevel: effort, ultracode: null })
     }
     this.opts.model = model
     this.opts.effort = effort
