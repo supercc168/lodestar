@@ -67,6 +67,10 @@ export interface ClaudeModelConfig {
   api_key?: string
   /** 显式声明路由类型;缺省时由是否配置了 base_url/auth_token 推断。 */
   route?: 'login' | 'api'
+  /** 该档位在 model 面板锁死的思考强度(low/medium/high/xhigh/max)。第三方
+   * 路由(GLM)用它复刻各自最优配置 —— 如 GLM-5.2 直连智谱走 xhigh 触发
+   * extended thinking。官方档位不读此字段(锁 max)。非法值忽略、回落固定值。 */
+  effort?: string
 }
 
 /** Per-project agent launch profile, sourced from `[projects.<name>].*`
@@ -175,7 +179,8 @@ function loadConfig(): LodestarConfig {
           field === 'base_url' ||
           field === 'auth_token' ||
           field === 'api_key' ||
-          field === 'route'
+          field === 'route' ||
+          field === 'effort'
         ) {
           ;(profile as Record<string, string>)[field] = value
         }

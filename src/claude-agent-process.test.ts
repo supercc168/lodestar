@@ -30,6 +30,7 @@ const {
   claudeModelEnv,
   claudeModelIsApiRoute,
   claudeModelConfigured,
+  claudeModelEffort,
 } = await import('./claude-models')
 const { config } = await import('./config')
 
@@ -135,6 +136,31 @@ describe('Claude model profiles', () => {
       })
       // 官方模型仍然干净,GLM 的 token 不外泄到登录态档位。
       expect(claudeModelEnv('claude:opus')).toEqual({})
+    } finally {
+      ;(config.claude as any).models = prev
+    }
+  })
+
+  test('claudeModelEffort: GLM 档位读 config 里的 effort;缺省/官方档位返回 undefined', () => {
+    const prev = config.claude.models
+    ;(config.claude as any).models = {
+      glm: { model: 'glm-5.2', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
+    }
+    try {
+      expect(claudeModelEffort('claude:glm')).toBe('xhigh')
+      expect(claudeModelEffort('claude:opus')).toBeUndefined() // 官方档位不从 config 取 effort
+    } finally {
+      ;(config.claude as any).models = prev
+    }
+  })
+
+  test('claudeModelEffort: 非法 effort 值被忽略(返回 undefined,回落固定值)', () => {
+    const prev = config.claude.models
+    ;(config.claude as any).models = {
+      glm: { model: 'glm-5.2', base_url: 'https://x', auth_token: 't', effort: 'turbo' },
+    }
+    try {
+      expect(claudeModelEffort('claude:glm')).toBeUndefined()
     } finally {
       ;(config.claude as any).models = prev
     }
