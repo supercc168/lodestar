@@ -50,6 +50,12 @@ export interface LodestarConfig {
      * 未设置 = 硬编码登录默认 Fable 5。只订阅 GLM 的用户设 "glm" 后,新群首条
      * 消息直接走 GLM,不必先手动切一次。 */
     defaultModel?: string
+    /** 全局默认 setting_sources,兜底所有未在 [projects.<name>] 里显式配置
+     * setting_sources 的项目。语法与项目级完全一致("auto" / 逗号列表),
+     * 项目级优先。未设置 = 硬编码 "user"。设 "auto" 后新建项目(新群)自动
+     * 按目录探测加载 .claude//CLAUDE.md —— 注意 auto 会整体加载项目 hooks,
+     * 见 README「auto 档要点」。解析在 settingSourcesFromProfile。 */
+    defaultSettingSources?: string
     env: Record<string, string>
     models: Record<string, ClaudeModelConfig>
   }
@@ -230,12 +236,20 @@ function loadConfig(): LodestarConfig {
   const claudeEnv = envSection('claude.env')
   const claudeBin = t.claude?.bin ? expandTilde(t.claude.bin) : undefined
   const claudeDefaultModel = t.claude?.default_model?.trim() || undefined
+  // 原样存储;"auto" 与白名单校验在 settingSourcesFromProfile 处理(与项目级同一套解析)
+  const claudeDefaultSettingSources = t.claude?.default_setting_sources?.trim() || undefined
   return {
     feishu: { app_id: appId, app_secret: appSecret },
     runtime: { projects_root: projectsRoot },
     notify: { bind: notifyBind, port: notifyPort },
     codex: { env: codexEnv },
-    claude: { bin: claudeBin, defaultModel: claudeDefaultModel, env: claudeEnv, models: claudeModelSections() },
+    claude: {
+      bin: claudeBin,
+      defaultModel: claudeDefaultModel,
+      defaultSettingSources: claudeDefaultSettingSources,
+      env: claudeEnv,
+      models: claudeModelSections(),
+    },
     projects: projectSections(),
   }
 }

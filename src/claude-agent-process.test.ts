@@ -1085,6 +1085,74 @@ describe('Claude project profile overrides', () => {
     expect(settingSourcesFromProfile({ settingSources: 'user,bogus' })).toEqual(['user'])
   })
 
+  test('settingSources 全局默认: [claude].default_setting_sources 兜底无 profile 的项目', () => {
+    const prev = (config.claude as any).defaultSettingSources
+    ;(config.claude as any).defaultSettingSources = 'user,project'
+    try {
+      expect(settingSourcesFromProfile(undefined)).toEqual(['user', 'project'])
+      expect(settingSourcesFromProfile({})).toEqual(['user', 'project'])
+    } finally {
+      ;(config.claude as any).defaultSettingSources = prev
+    }
+  })
+
+  test('settingSources 全局默认 "auto": 按各项目目录独立探测', () => {
+    const prev = (config.claude as any).defaultSettingSources
+    ;(config.claude as any).defaultSettingSources = 'auto'
+    try {
+      const hit = tmpProjectDir({ claudeDir: true })
+      expect(settingSourcesFromProfile(undefined, hit)).toEqual(['user', 'project', 'local'])
+      const miss = tmpProjectDir()
+      expect(settingSourcesFromProfile(undefined, miss)).toEqual(['user'])
+    } finally {
+      ;(config.claude as any).defaultSettingSources = prev
+    }
+  })
+
+  test('settingSources 全局默认: 项目级 setting_sources 优先于全局', () => {
+    const prev = (config.claude as any).defaultSettingSources
+    ;(config.claude as any).defaultSettingSources = 'auto'
+    try {
+      // 目录带 .claude/,auto 本会给三源 —— project 档生效才说明项目级赢了
+      const hit = tmpProjectDir({ claudeDir: true })
+      expect(settingSourcesFromProfile({ settingSources: 'project' }, hit)).toEqual(['project'])
+    } finally {
+      ;(config.claude as any).defaultSettingSources = prev
+    }
+  })
+
+  test('settingSources 全局默认: 项目级空白值回落到全局默认', () => {
+    const prev = (config.claude as any).defaultSettingSources
+    ;(config.claude as any).defaultSettingSources = 'user,project'
+    try {
+      expect(settingSourcesFromProfile({ settingSources: ' , ' })).toEqual(['user', 'project'])
+    } finally {
+      ;(config.claude as any).defaultSettingSources = prev
+    }
+  })
+
+  test('settingSources 全局默认: 非法值整体丢弃后回落 user', () => {
+    const prev = (config.claude as any).defaultSettingSources
+    ;(config.claude as any).defaultSettingSources = 'bogus'
+    try {
+      expect(settingSourcesFromProfile(undefined)).toEqual(['user'])
+    } finally {
+      ;(config.claude as any).defaultSettingSources = prev
+    }
+  })
+
+  test('settingSources 全局默认: 项目级全非法 token 时落回全局默认(非直接 user)', () => {
+    // 钉住本次的唯一语义变化:旧实现项目级 'bogus' 直接回 ['user'],
+    // 新实现视为"该层不可用"、穿透到全局默认层。
+    const prev = (config.claude as any).defaultSettingSources
+    ;(config.claude as any).defaultSettingSources = 'project'
+    try {
+      expect(settingSourcesFromProfile({ settingSources: 'bogus' })).toEqual(['project'])
+    } finally {
+      ;(config.claude as any).defaultSettingSources = prev
+    }
+  })
+
   test('toolsFromProfile falls back to claude_code preset when absent', () => {
     expect(toolsFromProfile(undefined)).toEqual({ type: 'preset', preset: 'claude_code' })
     expect(toolsFromProfile({})).toEqual({ type: 'preset', preset: 'claude_code' })

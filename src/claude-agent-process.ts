@@ -465,8 +465,10 @@ const DEFAULT_SETTING_SOURCES: readonly string[] = ['user']
 /** Valid SDK setting sources; anything else in an explicit list is dropped. */
 const VALID_SETTING_SOURCES = new Set(['user', 'project', 'local'])
 
-/** Resolve SDK `settingSources` from a project profile's comma-separated
- * string. Falls back to `['user']`.
+/** Resolve SDK `settingSources`, first usable level wins:
+ * project profile `setting_sources` → global `[claude].default_setting_sources`
+ * → `['user']`. Both levels share the same grammar (`auto` / comma list);
+ * a level whose value is blank or all-invalid falls through to the next.
  *
  * Special value `auto` (exclusive — may appear in a list but ignores the rest):
  * if `<workDir>/.claude` or `<workDir>/CLAUDE.md` exists, expand to
@@ -480,10 +482,16 @@ export function settingSourcesFromProfile(
   profile: ProjectProfile | undefined,
   workDir?: string,
 ): string[] {
-  const raw = profile?.settingSources
-  if (!raw) return [...DEFAULT_SETTING_SOURCES]
+  return parseSettingSources(profile?.settingSources, workDir)
+    ?? parseSettingSources(config.claude.defaultSettingSources, workDir)
+    ?? [...DEFAULT_SETTING_SOURCES]
+}
+
+/** One level of the settingSources chain; null = unset/unusable, fall through. */
+function parseSettingSources(raw: string | undefined, workDir?: string): string[] | null {
+  if (!raw) return null
   const tokens = raw.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
-  if (tokens.length === 0) return [...DEFAULT_SETTING_SOURCES]
+  if (tokens.length === 0) return null
 
   if (tokens.includes('auto')) {
     const extra = tokens.filter(t => t !== 'auto')
@@ -500,7 +508,7 @@ export function settingSourcesFromProfile(
   if (dropped.length) {
     log(`claude-agent-process: setting_sources dropping unknown token(s) [${dropped.join(',')}]`)
   }
-  return valid.length ? valid : [...DEFAULT_SETTING_SOURCES]
+  return valid.length ? valid : null
 }
 
 /** Resolve SDK `tools` from a project profile's comma-separated built-in
