@@ -122,10 +122,12 @@ const cardsByProject = new Map<string, AutomationCardState>()
 let opening = new Set<string>()   // 开卡中的 projectName,防并发重复开卡
 ```
 
+**核心不变式:内存 run 视图(`cardsByProject[project].runs`)是唯一真源;所有卡写(`sendCard`/`replaceElement`/`updateCard`)都是对它的尽力 reconcile。** 三个 `onXxx` 必须**先改视图、再尝试写卡**;开卡未就绪(句柄为 null)时写卡静默跳过、不丢状态——开卡完成后有一次全量重建兜底(§7.1)。这是消除"异步开卡窗口内 run 结算→墓碑打在不存在的卡上被丢弃"竞态的关键(对标 `background.ts` 以 store 为真源、卡增量 reconcile)。
+
 导出的接线点(供 `tasklist-worker.ts` 调用):
-- `onRunStart(record: AutomationProcessRecord): void` — 若 kind 入卡且该 project 无活卡且不在开卡中 → 异步开卡;把 run 追加进 `runs`(状态 running);置 `sawActivityThisScan=true`。
+- `onRunStart(record: AutomationProcessRecord): void` — 若 kind 入卡:**先**把 run 追加进 `runs`(status=running;`taskSummary` 由 `tasklist.getTasklistBinding(projectName)?.tasks[taskGuid]?.summary` 取,`rememberScan` 每轮已写入,缺则 `(无任务标题)`),置 `sawActivityThisScan=true`;**再**在该 project 无活卡且不在开卡中时触发异步开卡。次序保证开卡渲染时 `runs` 已含本 run。
 - `onRunStdout(runId, projectName, tail): void` — 更新对应 run 的 `stdoutTail`(便宜赋值,不发请求;由 timer 统一重渲染)。
-- `onRunSettle(record): void` — run 置终态(`exited`→completed,其余→failed),记 `endTime`;`replaceElement` 该 panel 成墓碑;更新 summary;置 `sawActivityThisScan=true`。
+- `onRunSettle(record): void` — **先**把 run 视图置终态(`exited`→completed,其余→failed)、记 `endTime`、置 `sawActivityThisScan=true`;**再**尽力 `replaceElement` 该 panel 成墓碑 + 更新 summary。开卡窗口内结算时此 `replaceElement` 无卡可打、静默跳过,终态靠 §7.1 开卡后重建落地。
 - `settleIdleProjects(): void` — **每轮扫描末尾调一次**(无参)。逐活卡:`sawActivityThisScan` 为真 → 复位为 false、`idleScans=0`;否则 `idleScans++`,达阈值 → `settleCard`。
 - (内部)`openCard`、`refreshCard`(30s tick)、`settleCard`(→`feishu.updateCard(messageId, automationHistoryCard(...))` + 清 timer + 从 map 删除)。
 
@@ -139,15 +141,20 @@ let opening = new Set<string>()   // 开卡中的 projectName,防并发重复开
 4. **settle**:`runAgentProcess` 拿到 `finalRecord` 后调 `tasklistCards.onRunSettle(finalRecord)`。
 5. **沉降**:`runTasklistWorkerOnce` 循环末尾,统计本轮有活动的 project 集合,调 `tasklistCards.settleIdleProjects(active)`。
 
-**chatId 解析**:开卡时优先 `binding.chatId`(§9 新增字段),回退 `feishu.chatIdForSession(projectName)`;都为 null → 记一条日志、本波次不开卡(自动化照常跑)。
+**chatId 解析(持久化优先 + 一次性回填 + 失败可见)**——`binding.chatId` 是唯一运行时来源:
+1. **新绑定**:`enableTasklist(projectName, chatId)` 起就把 chatId 落进 `binding.chatId`(chatId 本在手,现被丢弃),天然自带,不依赖任何模糊匹配。
+2. **旧绑定回填**(如 etmmo,无 `chatId`):worker 每轮 `processTasklist` 开头若 `binding.chatId` 缺失,用 `feishu.chatIdForSession(projectName)` 解析**一次并 `updateTasklistBinding` 持久化回 binding**——把模糊路径收敛为一次性操作,之后开卡只读 `binding.chatId`。
+3. **回填也失败**(0/多群名命中、群改名、`preferredChatForSession` 被清):记日志;且下次用户在项目群发 `task` 时(**此刻 chatId 在手**),`task` 面板检测 `binding.chatId` 缺失 → 用当前群自愈写入并提示「状态卡已绑定本群」。把"静默无卡、不可调试"变成用户可见、可自愈。
+
+开卡时直接读已回填的 `binding.chatId`;仍为空 → 本波次不开卡(自动化照常跑)。
 
 **panel 归属**:element_id = `auto_run_<runId>`,run 视图以 `runId` 为 key。天然无跨 run 混淆(runId 全局唯一)。
 
 ## 7. 卡片生命周期(按波次 · per-project)
 
-- **7.1 开卡** `onRunStart`:该 project 无活卡且非开卡中 → 加入 `opening` 集合 → 解析 chatId → `feishu.sendCard(chatId, automationLiveCard(...))` → `cardkit.convertMessageToCard(messageId)` → 存 `AutomationCardState`,`recordCardCreated(cardId, 5, onFail)` 挂失败降级 → 启 30s tick → 从 `opening` 移除。`opening` 集合防并发事件重复开卡(对标 `openingBackground`)。
+- **7.1 开卡** `onRunStart`:该 project 无活卡且非开卡中 → 加入 `opening` 集合 → 读 `binding.chatId`(§6) → `feishu.sendCard(chatId, automationLiveCard(project, 当下 runs 快照))`(初始 body 用**当下** `runs`,已含开卡触发的那个 run)→ `cardkit.convertMessageToCard(messageId)` → 存 `AutomationCardState`,`recordCardCreated(cardId, 5, onFail)` 挂失败降级 → **开卡后立即按当前 `runs` 全量重建一次(reconcile)**,吸收异步开卡窗口内 `onRunSettle`/`onRunStdout` 对视图的改动(对标 `openBackgroundCard` 初始 body 读 live store)→ 启 30s tick → 从 `opening` 移除。`opening` 集合防并发事件重复开卡(对标 `openingBackground`)。
 - **7.2 刷新** tick + stdout:`replaceElement(cardId, AUTO_ELEMENTS.panel(runId), automationRunPanel(run, now))` 刷 running panel;`patchSummaryThrottled`。
-- **7.3 加墓碑** `onRunSettle`:run 终态化,`replaceElement` 该 panel 成 ✅/❌ 墓碑,`endTime` 定格时长。墓碑留在活卡里。
+- **7.3 加墓碑** `onRunSettle`:**先**视图终态化(`endTime` 定格时长),**再**尽力 `replaceElement` 该 panel 成 ✅/❌ 墓碑;句柄未就绪则跳过写、由 §7.1 开卡后重建补上。墓碑留在活卡里。
 - **7.4 沉降** `settleIdleProjects`:该 project 本轮无 running 成员且未推进任何阶段 → `idleScans++`;`idleScans >= 1`(即连续 1 个空闲扫描周期的宽限,防多阶段任务在 plan→execute→review 阶段间被误沉降)→ `feishu.updateCard(messageId, automationHistoryCard(...))`(streaming 关,留原地)+ 清 timer + `cardsByProject.delete(projectName)`。下一波 `onRunStart` → 开新卡。任一 run 重新 running 时 `idleScans` 归零。
 - **7.5 `agy-pick`**:秒级选任务,不入卡(`onRunStart` 对该 kind 直接 return)。其存在感靠它选出的任务随后 `codex-execute` 建 panel 体现。
 
@@ -160,7 +167,8 @@ let opening = new Set<string>()   // 开卡中的 projectName,防并发重复开
 
 ## 9. 状态字段改动(最小)
 
-- `TasklistBinding` 加可选 `chatId?: string`(`src/tasklist.ts:90-101`);`enableTasklist`(:128)落它(chatId 本就在手)。**纯增字段,旧 JSON 兼容;旧 binding 靠 §6 回退解析,无需迁移。** `normalizeBinding`/`cloneBinding` 带上该字段。
+- `TasklistBinding` 加可选 `chatId?: string`(`src/tasklist.ts:90-101`);`enableTasklist`(:128)落它(chatId 本就在手,现被丢弃)。`normalizeBinding`/`cloneBinding` 带上该字段。**纯增字段,旧 JSON 兼容。**
+- 旧 binding 回填(§6):worker 首轮 `feishu.chatIdForSession` 解析后 `updateTasklistBinding` 持久化;`task` 面板在 `chatId` 缺失时用当前群自愈写入。**无需一次性迁移脚本。**
 - 卡注册表纯内存(`Map<projectName, AutomationCardState>`),不进 `tasklist-map.json`。
 
 ## 10. 范围
@@ -179,15 +187,16 @@ let opening = new Set<string>()   // 开卡中的 projectName,防并发重复开
 
 - **新增** `src/cards/automation.ts`:§5.1 全部渲染 + 类型 + `AUTO_ELEMENTS`。
 - **新增** `src/cards/automation.test.ts`。
-- **新增** `src/tasklist-cards.ts`:§5.2 生命周期。
+- **新增** `src/tasklist-cards.ts`:§5.2 生命周期(import `feishu`/`cardkit`/`cards`/`tasklist`/`log`)。
 - **新增** `src/tasklist-cards.test.ts`。
 - **改** `src/cards.ts`:re-export `./cards/automation`。
 - **改** `src/tasklist.ts`:`TasklistBinding` 加 `chatId?`;`enableTasklist` 落 chatId;`normalizeBinding`/`cloneBinding` 带上。
-- **改** `src/tasklist-worker.ts`:`runAgentProcess` 接 `onRunStart`/`onRunStdout`/`onRunSettle`;`runTasklistWorkerOnce` 末尾接 `settleIdleProjects`。import `./tasklist-cards`。
+- **改** `src/tasklist-worker.ts`:`runAgentProcess` 接 `onRunStart`/`onRunStdout`/`onRunSettle`;`runTasklistWorkerOnce` 末尾接 `settleIdleProjects()`;`processTasklist` 开头缺 `chatId` 时 `chatIdForSession` 解析 + 持久化(§6 回填)。import `./tasklist-cards`。
+- **改**(自愈) `src/session-tasklist.ts` / `src/cards/task.ts`:`task` 面板在 `binding.chatId` 缺失时用当前群写入并提示(§6 步骤 3)。
 - **改**(可能) `src/cards/AGENTS.md`:补 `automation.ts` 条目。
 
 ## 13. 待计划阶段确认的假设
 
-1. `feishu.chatIdForSession(binding.projectName)` 对 etmmo 主群确实解析到目标群(projectName↔会话名等价,worktree 子群走主项目名)——计划阶段读 `worktreeProjectName()` 与会话名 sanitize 逻辑核实。
-2. `runAgentProcess` 里 `record.projectName` / `record.taskGuid` 在 spawn 时已具备(用于 `onRunStart` 的任务标题)——任务标题可能需从 `binding.tasks[taskGuid].summary` 取。
+1. `feishu.chatIdForSession(binding.projectName)` 对 etmmo 主群解析到目标群——已确认解析优先读持久化 `preferredChatForSession`(键 = `sanitizeSessionName(群名)`,主群发消息时经 `bindSessionToChat` 绑定),回退 `chatNameCache` 名字匹配(0/多命中返 null)。§6 的"落库+回填+自愈"已兜住失败(不再全功能静默无卡),但计划阶段仍核实 `enableTasklist` 用的 `worktreeProjectName()` 与该 map 键一致(worktree 子群走主项目名)。
+2. 已确认:5 个入卡 kind 的 `runAgentProcess` 调用都带 `taskGuid`(`agy-pick` 无、不入卡);`taskSummary` 由 `onRunStart` 从 `binding.tasks[taskGuid]?.summary` 取(`rememberScan` 每轮写入),缺则 `(无任务标题)` —— `tasklist-cards.ts` 因此 import `tasklist`。
 3. 30s tick 与飞书 streaming TTL 的具体阈值——smoke 校准。
