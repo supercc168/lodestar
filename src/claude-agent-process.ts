@@ -726,7 +726,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (profile) {
       log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? false} keepInstructions=${(profile.keepLodestarInstructions ?? true)}`)
     }
-    const settingSources = settingSourcesFromProfile(profile)
+    const settingSources = settingSourcesFromProfile(profile, this.opts.workDir)
     const toolsOption = toolsFromProfile(profile)
     const strictMcpConfig = profile?.strictMcp === true
     const mcpServers = profile?.loadProjectMcp ? readProjectMcpServers(this.opts.workDir) : undefined
@@ -739,7 +739,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       const executable = resolveClaudeExecutableConfig()
       const spawnEnv = this.buildSpawnEnv()
       const routeLabel = claudeModelIsApiRoute(this.opts.model) ? 'api' : 'login'
-      log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} route=${routeLabel} cwd=${this.opts.workDir} executable=${executable.description}`)
+      log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} route=${routeLabel} cwd=${this.opts.workDir} settingSources=${settingSources.join('+')} executable=${executable.description}`)
       this.query = query({
         prompt: this.input,
         options: {
