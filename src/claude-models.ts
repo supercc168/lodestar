@@ -13,7 +13,7 @@ export interface ClaudeModelProfile {
   /** spawn 时注入的 ANTHROPIC_* env 覆盖。login 档位恒为空;api 档位配好
    * 后为 { ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN[, ANTHROPIC_API_KEY] }。 */
   env: Record<string, string>
-  /** login 恒 true;api 需 base_url + auth_token 都配好才 true。 */
+  /** login 恒 true;api 需 base_url + auth_token + model 都配好才 true。 */
   configured: boolean
 }
 
@@ -81,10 +81,13 @@ function toProfile(name: string): ClaudeModelProfile | null {
       ? raw.route
       : Object.keys(env).length > 0 ? 'api' : 'login'
   // login 恒就绪;api 需 base_url + auth_token 都在(api_key 单独也算,GLM 用
-  // auth_token,少数三方用 api_key)。
+  // auth_token,少数三方用 api_key),且必须显式配 model —— 缺 model 时 sdkModel
+  // 回落官方 DEFAULT_CLAUDE_SDK_MODEL,拿官方 model id 打第三方端点必然误路由。
   const configured =
     route === 'login' ||
-    (!!env.ANTHROPIC_BASE_URL && (!!env.ANTHROPIC_AUTH_TOKEN || !!env.ANTHROPIC_API_KEY))
+    (!!env.ANTHROPIC_BASE_URL &&
+      (!!env.ANTHROPIC_AUTH_TOKEN || !!env.ANTHROPIC_API_KEY) &&
+      !!raw.model?.trim())
   return {
     key,
     name,
