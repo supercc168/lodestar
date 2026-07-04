@@ -20,12 +20,15 @@ export const boundResumes: Array<[string, string, string | undefined]> = []
 export const urgentPushes: Array<[string, string[]]> = []
 /** [projects.<name>] 项目 profile 替身,测试往里 set 后 Session 构造时可查到。 */
 export const projectProfiles = new Map<string, { cwd?: string }>()
+/** chatIdForSession 替身返回值,测试可改。 */
+export const feishuMockState = { chatIdForSession: null as string | null }
 
 export function resetFeishuMock(): void {
   for (const arr of [sentCards, sentTexts, sentRawTexts, deletedReactions, boundResumes, urgentPushes]) {
     arr.length = 0
   }
   projectProfiles.clear()
+  feishuMockState.chatIdForSession = null
 }
 
 mock.module('./feishu', () => ({
@@ -58,4 +61,6 @@ mock.module('./feishu', () => ({
   bindSessionModel: () => {},
   provisionProject: () => {},
   projectProfile: (name: string) => projectProfiles.get(name),
+  updateCard: async () => {},
+  chatIdForSession: (_sessionName: string) => feishuMockState.chatIdForSession,
 }))
