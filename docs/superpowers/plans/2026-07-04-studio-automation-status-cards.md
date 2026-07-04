@@ -21,6 +21,8 @@
 
 ## File Structure
 
+- **新增** `src/cards/format.ts` — 共享时长格式化 `fmtElapsed`(从 `background.ts` 提取,`background`/`automation` 共用)。
+- **改** `src/cards/background.ts` — 删本地 `fmtElapsed`,改 import `./format`。
 - **新增** `src/cards/automation.ts` — 纯 reducer(`AutomationBurst` 累积)+ 纯渲染 + 类型 + `AUTO_ELEMENTS`。责任:自动化状态卡的所有决策逻辑与 JSON 结构。
 - **新增** `src/cards/automation.test.ts` — 纯层单测。
 - **新增** `src/tasklist-cards.ts` — I/O 生命周期:内存 `Map<projectName, ProjectCard>`、开卡/tick/沉降、chatId 解析+回填。责任:把纯层累积推到飞书。
@@ -336,13 +338,16 @@ git commit -m "feat(automation): 状态卡纯 reducer 层(burst 累积 + isCarde
 ## Task 2: 纯渲染层 + barrel 导出
 
 **Files:**
-- Modify: `src/cards/automation.ts`(追加渲染函数)
+- Create: `src/cards/format.ts`(共享 `fmtElapsed`)
+- Modify: `src/cards/background.ts:377-385`(删本地 `fmtElapsed`,改 import `./format`)
+- Modify: `src/cards/automation.ts`(追加渲染函数,import `./format` 的 `fmtElapsed`)
 - Modify: `src/cards/automation.test.ts`(追加渲染测试)
 - Modify: `src/cards.ts`(re-export)
 
 **Interfaces:**
-- Consumes: Task 1 的 `AutomationRunView` / `AutomationBurst` / `AUTO_ELEMENTS`。
+- Consumes: Task 1 的 `AutomationRunView` / `AutomationBurst` / `AUTO_ELEMENTS`;`fmtElapsed`(来自新 `./format`)。
 - Produces:
+  - `fmtElapsed(ms: number): string`(`src/cards/format.ts`,`background.ts`/`automation.ts` 共用)
   - `memberLabel(kind: AutomationRunKind): string`
   - `statusLabel(run: AutomationRunView, now: number): string`
   - `summarizeAutomation(runs: AutomationRunView[]): string`
@@ -458,9 +463,27 @@ describe('automationLiveCard / automationHistoryCard', () => {
 Run: `bun test src/cards/automation.test.ts`
 Expected: FAIL —「memberLabel is not a function / not exported」。
 
-- [ ] **Step 3: 追加渲染实现**
+- [ ] **Step 3: 提取共享 `fmtElapsed` + 追加渲染实现**
 
-Append to `src/cards/automation.ts`:
+先创建 `src/cards/format.ts`:
+
+```ts
+/** 共享时长格式化 —— background / automation 状态卡共用。
+ *  ms → "45s" / "2m13s" / "1h5m"。 */
+export function fmtElapsed(ms: number): string {
+  if (!ms || ms < 0) return '0s'
+  const s = Math.floor(ms / 1000)
+  if (s < 60) return `${s}s`
+  const m = Math.floor(s / 60)
+  if (m < 60) return `${m}m${s % 60}s`
+  const h = Math.floor(m / 60)
+  return `${h}h${m % 60}m`
+}
+```
+
+再改 `src/cards/background.ts`:删掉本地 `fmtElapsed`(第 377-385 行整个函数),在顶部 import 区加 `import { fmtElapsed } from './format'`。`background.ts` 其余调用点不变(原本就是本地私有函数,改成 import 后行为一致)。
+
+最后在 `src/cards/automation.ts` 顶部加 `import { fmtElapsed } from './format'`,并 append 渲染实现(**不**再本地定义 `fmtElapsed`):
 
 ```ts
 // ── 渲染(纯) ─────────────────────────────────────────────────────────
@@ -476,17 +499,6 @@ const KIND_LABEL: Record<AutomationRunKind, string> = {
 
 export function memberLabel(kind: AutomationRunKind): string {
   return KIND_LABEL[kind]
-}
-
-/** ms → "45s" / "2m13s" / "1h5m"(复刻 background.ts fmtElapsed)。 */
-function fmtElapsed(ms: number): string {
-  if (!ms || ms < 0) return '0s'
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  if (m < 60) return `${m}m${s % 60}s`
-  const h = Math.floor(m / 60)
-  return `${h}h${m % 60}m`
 }
 
 function terminalElapsed(run: AutomationRunView): number {
@@ -551,10 +563,10 @@ export function automationHistoryCard(projectName: string, runs: AutomationRunVi
 }
 ```
 
-- [ ] **Step 4: 跑测试确认通过**
+- [ ] **Step 4: 跑测试确认通过(automation + background 都不破)**
 
-Run: `bun test src/cards/automation.test.ts`
-Expected: PASS(reducer + 渲染全部)。
+Run: `bun test src/cards/automation.test.ts src/cards/background.test.ts`
+Expected: PASS(automation reducer+渲染全部;background 抽走 `fmtElapsed` 后行为不变)。
 
 - [ ] **Step 5: barrel re-export**
 
@@ -591,8 +603,8 @@ Expected: PASS。
 - [ ] **Step 7: 提交**
 
 ```bash
-git add src/cards/automation.ts src/cards/automation.test.ts src/cards.ts
-git commit -m "feat(automation): 状态卡渲染层 + barrel 导出"
+git add src/cards/format.ts src/cards/background.ts src/cards/automation.ts src/cards/automation.test.ts src/cards.ts
+git commit -m "feat(automation): 状态卡渲染层 + 提取共享 fmtElapsed + barrel 导出"
 ```
 
 ---
