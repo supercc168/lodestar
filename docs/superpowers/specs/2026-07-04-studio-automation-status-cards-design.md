@@ -155,7 +155,7 @@ let opening = new Set<string>()   // 开卡中的 projectName,防并发重复开
 - **7.1 开卡** `onRunStart`:该 project 无活卡且非开卡中 → 加入 `opening` 集合 → 读 `binding.chatId`(§6) → `feishu.sendCard(chatId, automationLiveCard(project, 当下 runs 快照))`(初始 body 用**当下** `runs`,已含开卡触发的那个 run)→ `cardkit.convertMessageToCard(messageId)` → 存 `AutomationCardState`,`recordCardCreated(cardId, 5, onFail)` 挂失败降级 → **开卡后立即按当前 `runs` 全量重建一次(reconcile)**,吸收异步开卡窗口内 `onRunSettle`/`onRunStdout` 对视图的改动(对标 `openBackgroundCard` 初始 body 读 live store)→ 启 30s tick → 从 `opening` 移除。`opening` 集合防并发事件重复开卡(对标 `openingBackground`)。
 - **7.2 刷新** tick + stdout:`replaceElement(cardId, AUTO_ELEMENTS.panel(runId), automationRunPanel(run, now))` 刷 running panel;`patchSummaryThrottled`。
 - **7.3 加墓碑** `onRunSettle`:**先**视图终态化(`endTime` 定格时长),**再**尽力 `replaceElement` 该 panel 成 ✅/❌ 墓碑;句柄未就绪则跳过写、由 §7.1 开卡后重建补上。墓碑留在活卡里。
-- **7.4 沉降** `settleIdleProjects`:该 project 本轮无 running 成员且未推进任何阶段 → `idleScans++`;`idleScans >= 1`(即连续 1 个空闲扫描周期的宽限,防多阶段任务在 plan→execute→review 阶段间被误沉降)→ `feishu.updateCard(messageId, automationHistoryCard(...))`(streaming 关,留原地)+ 清 timer + `cardsByProject.delete(projectName)`。下一波 `onRunStart` → 开新卡。任一 run 重新 running 时 `idleScans` 归零。
+- **7.4 沉降** `settleIdleProjects`:该 project 本轮无 run 开始/结束(`sawActivityThisScan=false`)→ `idleScans++`;`idleScans >= idleThreshold`(默认 1,即**首个完全空闲的扫描**就沉降,不额外留宽限)→ `feishu.updateCard(messageId, automationHistoryCard(...))`(streaming 关,留原地)+ 清 timer + `cardsByProject.delete(projectName)`。下一波 `onRunStart` → 开新卡。任一 run 有活动时 `idleScans` 归零。**防误沉降靠的是"相邻阶段落在相邻扫描"这一 intra-scan 聚簇性(§5.2),不是 grace 窗口**;若某天阶段间真出现跨扫描空档,把 `idleThreshold` 调到 2 才是"留一个空闲扫描宽限"的正解。
 - **7.5 `agy-pick`**:秒级选任务,不入卡(`onRunStart` 对该 kind 直接 return)。其存在感靠它选出的任务随后 `codex-execute` 建 panel 体现。
 
 ## 8. 错误处理 & 边界
