@@ -68,7 +68,10 @@ export interface ClaudeModelConfig {
 export interface ProjectProfile {
   /** Absolute working directory. Falls back to `PROJECTS_ROOT/<name>`. */
   cwd?: string
-  /** Comma-separated setting sources, e.g. `"project"` or `"user,project"`. */
+  /** Comma-separated setting sources, e.g. `"project"` or `"user,project"`.
+   * Special value `"auto"`: auto-detect `<cwd>/.claude` or `<cwd>/CLAUDE.md` →
+   * `['user','project','local']` if present, else `['user']`.
+   * See `settingSourcesFromProfile` in claude-agent-process.ts. */
   settingSources?: string
   /** Only use MCP servers loaded via `loadProjectMcp`; ignore user/global MCP. */
   strictMcp?: boolean
@@ -186,6 +189,7 @@ function loadConfig(): LodestarConfig {
         if (typeof value !== 'string' || value.length === 0) continue
         switch (rawKey.trim()) {
           case 'cwd': profile.cwd = value; break
+          // value stored raw; `"auto"` + whitelist validation live in settingSourcesFromProfile
           case 'setting_sources': profile.settingSources = value; break
           case 'strict_mcp': profile.strictMcp = value === 'true'; break
           case 'tools': profile.tools = value; break

@@ -142,13 +142,17 @@ keep_lodestar_instructions = "true"
 | 字段 | 作用 | 默认 |
 | --- | --- | --- |
 | `cwd` | agent 工作目录(绝对路径) | `projects_root/<群名>` |
-| `setting_sources` | `project` 只读项目级设置,不加载用户级全局插件/技能 | `user` |
+| `setting_sources` | `auto`(推荐)检测到项目 `.claude/` 或 `CLAUDE.md` 就自动 `user,project,local`、否则退回 `user`(始终含 `user`,不卡死);`project` 只读项目级设置,不加载用户级全局插件/技能;也可显式逗号列表 | `user` |
 | `strict_mcp` | 只挂下方项目 MCP,忽略全局 MCP | 关 |
 | `tools` | 允许的内置工具(逗号分隔);MCP 工具由 `load_project_mcp` 自动可用,不用列在这里 | claude_code 全套 |
 | `load_project_mcp` | 读取 `<cwd>/.mcp.json` 并挂载其 MCP 服务 | 关 |
 | `keep_lodestar_instructions` | 保留夜航星卡片/输出约定系统提示 | 开 |
 
 `strict_mcp = "true"` 时,项目 `.mcp.json` 是 agent 能挂上 MCP 的唯一通路 —— 全局插件/技能被全部挡掉,agent 干净专注。典型用法:外部自动化引擎在自己的目录里维护规则文件,夜航星负责飞书通道和卡片渲染,两者通过群消息驱动协作。
+
+> 💡 **`setting_sources = "auto"`** 是"像在项目目录里直接启动 claude code"的推荐档:cwd 有 `.claude/` 或 `CLAUDE.md` 就自动 `user,project,local`(项目 `CLAUDE.md` / skills / agents / `settings.json` 全生效),否则退回 `user`。两个分支都含 `user`,不会踩下面 `project` 那个卡死坑。仅对 **Claude 引擎**有效(Codex 无论如何自动读 `AGENTS.md`)。
+>
+> ⚠️ 命中后会**整体加载**项目 `.claude/settings.json` 的 hooks(`SessionStart`/`UserPromptSubmit`/`PreToolUse`/`Stop`),每轮在 daemon 内执行且无 TTY 回显 —— `PreToolUse` hook 退出非零会**拦掉该次工具调用**;`settingSources` 全有全无,无法只要 skills/agents 而摘掉 hooks。接入前先审项目 hooks 是否会在自动化通道阻塞。
 
 > ⚠️ **这组配置必须完整,配一半会把对话卡死。** `[projects.*]` 的字段是联动的,任一项开启后,它依赖的链路都要一起配齐:
 >
