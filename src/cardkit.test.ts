@@ -1,8 +1,6 @@
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-
-mock.module('./feishu', () => ({
-  getTenantToken: async () => 'tenant-token',
-}))
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+// 注册共享 ./feishu mock(见该文件头注释:多文件各自 mock 会互相覆盖)
+import './feishu-test-mock'
 
 const cardkit = await import('./cardkit')
 
@@ -88,5 +86,21 @@ describe('cardkit card operations', () => {
     expect(add?.body.type).toBe('insert_before')
     expect(add?.body.target_element_id).toBe('footer')
     expect(JSON.parse(add?.body.elements ?? '[]')).toEqual([element])
+  })
+})
+
+describe('cardkit write-dead card', () => {
+  test('markCardWriteDead makes all subsequent writes no-ops', async () => {
+    cardkit.recordCardCreated('card_wd', 3)
+    cardkit.markCardWriteDead('card_wd')
+
+    await cardkit.addElement('card_wd', { tag: 'markdown', element_id: 'e1', content: 'x' })
+    await cardkit.replaceElement('card_wd', 'footer', { tag: 'markdown', element_id: 'footer', content: 'x' })
+    await cardkit.deleteElement('card_wd', 'e1')
+    await cardkit.patchSettings('card_wd', { config: {} })
+
+    expect(calls.length).toBe(0)
+    expect(cardkit.getElementCount('card_wd')).toBe(3)
+    await cardkit.dispose('card_wd')
   })
 })
