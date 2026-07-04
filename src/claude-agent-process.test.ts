@@ -285,6 +285,7 @@ describe('Claude user dialog bridge', () => {
           options: [{ label: 'A' }, { label: 'B' }],
         }],
       },
+      parentToolUseId: null,
     }])
     expect(permissions).toHaveLength(1)
     expect(permissions[0].tool_name).toBe('AskUserQuestion')
@@ -377,11 +378,13 @@ describe('Claude user dialog bridge', () => {
             prompt: '识别截图内容',
           },
         },
+        parentToolUseId: null,
       }],
       ['tool_result', {
         tool_use_id: 'call_image_1',
         content: '完整识图结果',
         is_error: false,
+        parentToolUseId: null,
       }],
     ])
   })
