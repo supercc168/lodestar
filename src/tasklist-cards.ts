@@ -86,41 +86,60 @@ function taskSummaryFor(projectName: string, taskGuid: string | undefined): stri
 // ── worker hook(先改视图,再尽力写卡) ─────────────────────────────────
 
 export function onRunStart(record: AutomationProcessRecord): void {
-  if (!cards.isCardedKind(record.kind)) return
-  const pc = getOrInit(record.projectName)
-  pc.burst = cards.burstAddRun(
-    pc.burst, record.runId, record.kind, record.taskGuid,
-    taskSummaryFor(record.projectName, record.taskGuid), Date.now(),
-  )
-  if (pc.handle) { renderRun(pc, record.runId); patchSummary(pc) }
-  else if (!opening.has(record.projectName)) void openCard(record.projectName)
-  // opening 中:仅落视图,openCard 完成后 reconcileAll 兜底。
+  try {
+    if (!cards.isCardedKind(record.kind)) return
+    const pc = getOrInit(record.projectName)
+    pc.burst = cards.burstAddRun(
+      pc.burst, record.runId, record.kind, record.taskGuid,
+      taskSummaryFor(record.projectName, record.taskGuid), Date.now(),
+    )
+    if (pc.handle) { renderRun(pc, record.runId); patchSummary(pc) }
+    else if (!opening.has(record.projectName)) void openCard(record.projectName)
+    // opening 中:仅落视图,openCard 完成后 reconcileAll 兜底。
+  } catch (e) {
+    log(`tasklist-cards: onRunStart failed: ${e}`)
+  }
 }
 
 export function onRunStdout(runId: string, projectName: string, tail: string): void {
-  const pc = cardsByProject.get(projectName)
-  if (!pc) return
-  pc.burst = cards.burstUpdateStdout(pc.burst, runId, tail)
-  // 不主动写卡;30s tick 统一重渲染 running panel。
+  try {
+    const pc = cardsByProject.get(projectName)
+    if (!pc) return
+    pc.burst = cards.burstUpdateStdout(pc.burst, runId, tail)
+    // 不主动写卡;30s tick 统一重渲染 running panel。
+  } catch (e) {
+    log(`tasklist-cards: onRunStdout failed: ${e}`)
+  }
 }
 
 export function onRunSettle(record: AutomationProcessRecord): void {
-  if (!cards.isCardedKind(record.kind)) return
-  const pc = cardsByProject.get(record.projectName)
-  if (!pc) return
-  const processStatus: 'exited' | 'failed' = record.status === 'exited' ? 'exited' : 'failed'
-  pc.burst = cards.burstSettleRun(pc.burst, record.runId, processStatus, record.error, Date.now())
-  if (pc.handle) { renderRun(pc, record.runId); patchSummary(pc) }
+  try {
+    if (!cards.isCardedKind(record.kind)) return
+    const pc = cardsByProject.get(record.projectName)
+    if (!pc) return
+    const processStatus: 'exited' | 'failed' = record.status === 'exited' ? 'exited' : 'failed'
+    pc.burst = cards.burstSettleRun(pc.burst, record.runId, processStatus, record.error, Date.now())
+    if (pc.handle) { renderRun(pc, record.runId); patchSummary(pc) }
+  } catch (e) {
+    log(`tasklist-cards: onRunSettle failed: ${e}`)
+  }
 }
 
 /** worker 每轮扫描末尾调一次:空闲计数 + 达阈值沉降。 */
 export function settleIdleProjects(): void {
-  for (const pc of [...cardsByProject.values()]) {
-    const { burst, shouldSettle } = cards.burstMarkScan(pc.burst)
-    pc.burst = burst
-    if (!shouldSettle) continue
-    if (pc.handle) void settleCard(pc.projectName)
-    else cardsByProject.delete(pc.projectName) // 无卡空壳直接清
+  try {
+    for (const pc of [...cardsByProject.values()]) {
+      const { burst, shouldSettle } = cards.burstMarkScan(pc.burst)
+      pc.burst = burst
+      if (!shouldSettle) continue
+      if (pc.handle) void settleCard(pc.projectName)
+      // 无卡空壳:仅在没有 openCard 在途时才清。若正在开卡(handle 未就绪),此时清了
+      // 壳,飞书那边可能已发出的卡就没人管了(orphan);留给 openCard 完成/失败后自然
+      // 处理(成功设 handle 供下轮沉降,或失败在 finally 清 opening 后下轮再回收)。
+      else if (!opening.has(pc.projectName)) cardsByProject.delete(pc.projectName)
+    }
+  } catch (e) {
+    log(`tasklist-cards: settleIdleProjects failed: ${e}`)
   }
 }
 
