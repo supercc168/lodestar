@@ -57,6 +57,16 @@ export interface ClaudeModelConfig {
   display_name?: string
   description?: string
   model?: string
+  /** 第三方路由(如 GLM)的接入配置。官方 Anthropic 档位(Fable 5/Opus)
+   * 留空 —— 它们走用户的 Claude 登录态,绝不注入 API key。设置任一即视为
+   * API 路由:spawn 时按档位注入对应 ANTHROPIC_* env(见 claude-models.ts
+   * claudeModelEnv)。GLM 的 token 应放在 [claude.models.glm] 这个档位节里,
+   * 不要放全局 [claude.env],否则会污染官方登录档位。 */
+  base_url?: string
+  auth_token?: string
+  api_key?: string
+  /** 显式声明路由类型;缺省时由是否配置了 base_url/auth_token 推断。 */
+  route?: 'login' | 'api'
 }
 
 /** Per-project agent launch profile, sourced from `[projects.<name>].*`
@@ -162,7 +172,11 @@ function loadConfig(): LodestarConfig {
         if (
           field === 'display_name' ||
           field === 'description' ||
-          field === 'model'
+          field === 'model' ||
+          field === 'base_url' ||
+          field === 'auth_token' ||
+          field === 'api_key' ||
+          field === 'route'
         ) {
           ;(profile as Record<string, string>)[field] = value
         }

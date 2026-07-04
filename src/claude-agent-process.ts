@@ -25,6 +25,8 @@ import {
 } from './agent-process'
 import {
   claudeModelKey,
+  claudeModelEnv,
+  claudeModelIsApiRoute,
   resolveClaudeSdkModel,
 } from './claude-models'
 import type {
@@ -654,6 +656,35 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.lastModel = opts.model ? claudeModelKey(opts.model) : null
   }
 
+  /** spawn 用的 env。先建一个"无任何 ANTHROPIC_* 路由痕迹"的干净基线,再
+   * 按档位类型决定是否注入,两条路径对称,精确对应用户诉求:
+   *   - 官方登录档位(Fable 5/Opus,route:'login'):抹掉后不再注入 →
+   *     Claude Code 只用用户的登录态,绝不被残留 API key 悄悄改路由。
+   *   - 第三方 API 路由(GLM,route:'api'):抹掉后只注入该档位 config 声明
+   *     的 ANTHROPIC_* env(base_url + auth_token)→ 不会夹带残留的官方
+   *     ANTHROPIC_API_KEY 打到第三方端点(反之亦然)。
+   * 关键:scrub 放在 `...config.claude.env` 叠加之后 —— 所以即使误把 token
+   * 放进全局 [claude.env] 也会被抹掉;GLM token 必须放 [claude.models.glm]。
+   * 注意:此 scrub 只作用于 spawn 进程的 env;若 ~/.claude/settings.json 的
+   * env 块里配了 ANTHROPIC_BASE_URL/AUTH_TOKEN,Claude Code 仍会加载它 ——
+   * 故第三方路由请一律走 [claude.models.*],不要写进 settings.json。 */
+  private buildSpawnEnv(): Record<string, string> {
+    const env: Record<string, string> = {
+      ...(process.env as Record<string, string>),
+      PATH: buildClaudeSpawnPath(),
+      ...config.claude.env,
+    }
+    // 干净基线:无条件抹掉三个路由 key。
+    delete env.ANTHROPIC_BASE_URL
+    delete env.ANTHROPIC_AUTH_TOKEN
+    delete env.ANTHROPIC_API_KEY
+    // 第三方路由才注入该档位声明的接入 env;登录档位保持干净基线。
+    if (claudeModelIsApiRoute(this.opts.model)) {
+      Object.assign(env, claudeModelEnv(this.opts.model))
+    }
+    return env
+  }
+
   sendInitialize(): void {
     if (this.started) return
     this.started = true
@@ -673,7 +704,9 @@ export class ClaudeAgentProcess extends EventEmitter {
       // resolveClaudeExecutableConfig 在 [claude].bin 配错路径时同步抛出;
       // 必须在 try 内调用,确保错误走 error/exit 事件而非穿透到调用方。
       const executable = resolveClaudeExecutableConfig()
-      log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} cwd=${this.opts.workDir} executable=${executable.description}`)
+      const spawnEnv = this.buildSpawnEnv()
+      const routeLabel = claudeModelIsApiRoute(this.opts.model) ? 'api' : 'login'
+      log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} route=${routeLabel} cwd=${this.opts.workDir} executable=${executable.description}`)
       this.query = query({
         prompt: this.input,
         options: {
@@ -689,11 +722,7 @@ export class ClaudeAgentProcess extends EventEmitter {
             : {}),
           permissionMode: CLAUDE_PERMISSION_MODE,
           allowDangerouslySkipPermissions: CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS,
-          env: {
-            ...(process.env as Record<string, string>),
-            PATH: buildClaudeSpawnPath(),
-            ...config.claude.env,
-          },
+          env: spawnEnv,
           settingSources,
           tools: toolsOption,
           ...(strictMcpConfig ? { strictMcpConfig: true } : {}),

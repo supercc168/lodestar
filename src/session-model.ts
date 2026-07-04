@@ -11,6 +11,7 @@ import {
 } from './agent-process'
 import * as cards from './cards'
 import * as feishu from './feishu'
+import { claudeModelConfigured, claudeModelIsApiRoute } from './claude-models'
 import { log } from './log'
 import { messageOf, withTimeout, type ModelActionResult } from './session-util'
 
@@ -18,10 +19,13 @@ export interface ModelPanelState {
   models: cards.ModelChoice[]
 }
 
-/** model 命令的二元固定选项:effort 锁死,选了即生效(无 effort 二级面板)。
- * codex = gpt-5.5 / xhigh;claude = claude:glm (GLM-5.2) / max (ultracode)。
- * claude 的 max 由 ClaudeAgentProcess.setModelSettings 强制 applyFlagSettings,
- * 不依赖 ~/.claude/settings.json 的 effortLevel。 */
+/** model 命令的固定选项:每项 effort 锁死,选了即生效(无 effort 二级面板)。
+ * codex = gpt-5.5 / xhigh;claude 第一方档位 = Fable 5 / Opus 4.8,均 max
+ * (ultracode 最高思考强度)。claude 的 max 由 ClaudeAgentProcess.setModelSettings
+ * 强制 applyFlagSettings,不依赖 ~/.claude/settings.json 的 effortLevel。
+ * 各 claude:<key> 的实际 SDK model id 由 claude-models.ts 的 profile 决定
+ * (claude:fable→claude-fable-5,claude:opus→claude-opus-4-8),reclaude 透传
+ * --model 到 Claude Code,走用户的 Anthropic 登录态。 */
 const FIXED_MODEL_CHOICES = [
   {
     provider: 'codex' as const,
@@ -32,14 +36,71 @@ const FIXED_MODEL_CHOICES = [
   },
   {
     provider: 'claude' as const,
+    model: 'claude:fable',
+    displayName: 'Claude · Fable 5',
+    description: 'Fable 5 · max (ultracode) · 1M 上下文,当前最强通用模型。',
+    effort: 'max' as AgentReasoningEffort,
+  },
+  {
+    provider: 'claude' as const,
+    model: 'claude:opus',
+    displayName: 'Claude · Opus 4.8',
+    description: 'Opus 4.8 · max (ultracode) · 1M 上下文,擅长架构与深度分析。',
+    effort: 'max' as AgentReasoningEffort,
+  },
+  {
+    // GLM 第三方路由:走 config.toml [claude.models.glm] 的 base_url + auth_token,
+    // 不用官方登录态。未配置 token 时 picker 仍显示(描述提示去配置),但选择
+    // 会被 onModelEffortSelect 拦截。
+    provider: 'claude' as const,
     model: 'claude:glm',
-    displayName: 'Claude · GLM-5.2',
-    description: 'GLM-5.2 · max (ultracode) 推理强度。',
+    displayName: 'Claude · GLM',
+    description: 'GLM 第三方路由 · max。',
     effort: 'max' as AgentReasoningEffort,
   },
 ]
 
-function fixedModelChoices(s: Session): cards.ModelChoice[] {
+/** provider 的默认固定档位(该 provider 的第一个固定项)。归一化未知/退役
+ * 选择时回落到它。 */
+function defaultFixedChoiceFor(provider: AgentProvider): typeof FIXED_MODEL_CHOICES[number] {
+  return FIXED_MODEL_CHOICES.find(c => c.provider === provider) ?? FIXED_MODEL_CHOICES[0]
+}
+
+/** 把持久化的 (provider, model, effort) 归一到当前固定选项集。
+ *   - 命中固定项 → 原样保留(强制该项锁死的 effort)。
+ *   - legacy/退役 model(如 claude:glm、claude:deepseek)→ 回落到该 provider
+ *     的默认固定项(claude→claude:fable,底层同为 claude-fable-5,行为不变,
+ *     只是把误导性的 GLM 标签迁移成准确的 Fable 5)。
+ * daemon 重启后 restoreModelSelection 用它,避免旧 map 把 session 带到已
+ * 下线的档位或非锁死 effort。 */
+export function normalizeFixedModelSelection(
+  provider: AgentProvider,
+  model: string | null | undefined,
+  _effort: AgentReasoningEffort | null | undefined,
+): { model: string; effort: AgentReasoningEffort } {
+  const hit = FIXED_MODEL_CHOICES.find(c => c.provider === provider && c.model === model)
+  // 第三方 API 路由(GLM)持久化了但当前未配置 token → 回落到该 provider 的
+  // 登录默认档位(claude:fable)。否则启动 restore 会以未鉴权状态拉起该档位:
+  // 既跑不通(resolveClaudeSdkModel 回落到官方 model id 打第三方端点),又
+  // 绕过了 picker 的配置门槛(restore 不走 onModelEffortSelect)。配好 token
+  // 的 GLM 正常保留 —— 满足"别丢 GLM 设置"。
+  if (hit && provider === 'claude' && claudeModelIsApiRoute(model) && !claudeModelConfigured(model)) {
+    const fallback = defaultFixedChoiceFor(provider)
+    return { model: fallback.model, effort: fallback.effort }
+  }
+  const choice = hit ?? defaultFixedChoiceFor(provider)
+  return { model: choice.model, effort: choice.effort }
+}
+
+/** 第三方 API 路由(GLM)未配 token 时的描述后缀,提示去 config.toml 设置。 */
+function choiceDescription(item: typeof FIXED_MODEL_CHOICES[number]): string {
+  if (item.provider === 'claude' && claudeModelIsApiRoute(item.model) && !claudeModelConfigured(item.model)) {
+    return `${item.description}(未配置 · 需在 config.toml 的 [claude.models.glm] 填 base_url + auth_token)`
+  }
+  return item.description
+}
+
+export function fixedModelChoices(s: Session): cards.ModelChoice[] {
   const currentProvider = s.currentProvider()
   const currentModel = s.currentModelLabel()
   const currentEffort = s.currentEffortLabel()
@@ -49,7 +110,7 @@ function fixedModelChoices(s: Session): cards.ModelChoice[] {
       provider: item.provider,
       model: item.model,
       displayName: item.displayName,
-      description: item.description,
+      description: choiceDescription(item),
       isDefault: false,
       selected,
       efforts: [{
@@ -146,6 +207,14 @@ export async function onModelEffortSelect(
   const fixed = FIXED_MODEL_CHOICES.find(c => c.provider === provider && c.model === model)
   if (!fixed || fixed.effort !== effort) {
     return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在固定选项中` }
+  }
+  // 第三方 API 路由(GLM)必须先在 lodestar config 配好 token 才能切换 ——
+  // 官方登录档位(Fable 5/Opus)无需配置。拦截未配置的 GLM,给出清晰指引。
+  if (provider === 'claude' && claudeModelIsApiRoute(model) && !claudeModelConfigured(model)) {
+    return {
+      ok: false,
+      message: `GLM(${model})未配置:请在 ~/.config/lodestar/config.toml 的 [claude.models.glm] 填写 base_url 和 auth_token 后重试(官方 Fable 5 / Opus 走登录态,无需配置)`,
+    }
   }
   const choice = panel?.models.find(m => m.model === model && (m.provider ?? 'codex') === provider)
   if (choice && !choice.efforts.some(item => item.effort === effort)) {

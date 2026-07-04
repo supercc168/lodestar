@@ -337,6 +337,45 @@ describe('Session compact command', () => {
   })
 })
 
+describe('Fixed model selection normalization', () => {
+  test('keeps valid first-party Claude choices intact', () => {
+    expect(normalizeFixedModelSelection('claude', 'claude:opus', 'max'))
+      .toEqual({ model: 'claude:opus', effort: 'max' })
+    expect(normalizeFixedModelSelection('claude', 'claude:fable', 'max'))
+      .toEqual({ model: 'claude:fable', effort: 'max' })
+  })
+
+  test('falls an UNCONFIGURED GLM selection back to the login default (Fable 5)', () => {
+    // 无 token 配置时,持久化的 claude:glm 回落到 claude:fable(登录态),
+    // 避免启动以未鉴权状态拉起、且绕过 picker 门槛。
+    expect(normalizeFixedModelSelection('claude', 'claude:glm', 'max'))
+      .toEqual({ model: 'claude:fable', effort: 'max' })
+  })
+
+  test('keeps a CONFIGURED GLM selection intact (不丢用户设好的 GLM)', () => {
+    const prev = config.claude.models
+    ;(config.claude as any).models = {
+      glm: { model: 'glm-4.6', base_url: 'https://glm.example/anthropic', auth_token: 'tok' },
+    }
+    try {
+      expect(normalizeFixedModelSelection('claude', 'claude:glm', 'max'))
+        .toEqual({ model: 'claude:glm', effort: 'max' })
+    } finally {
+      ;(config.claude as any).models = prev
+    }
+  })
+
+  test('resets an unknown/retired Claude model to the Claude default', () => {
+    expect(normalizeFixedModelSelection('claude', 'claude:deepseek', 'high'))
+      .toEqual({ model: 'claude:fable', effort: 'max' })
+  })
+
+  test('normalizes any Codex selection to the fixed GPT-5.5 / xhigh', () => {
+    expect(normalizeFixedModelSelection('codex', 'gpt-4', 'low'))
+      .toEqual({ model: 'gpt-5.5', effort: 'xhigh' })
+  })
+})
+
 describe('Session provider switching', () => {
   test('uses provider-specific ask instructions', () => {
     const session = new Session('probe', 'chat_id') as any
@@ -395,7 +434,7 @@ describe('Session provider switching', () => {
     session.selectedProvider = 'codex'
     session.currentTurn = turnState()
 
-    const result = await session.onModelEffortSelect('claude:glm', 'max', '', 'ou_user', 'claude')
+    const result = await session.onModelEffortSelect('claude:opus', 'max', '', 'ou_user', 'claude')
 
     expect(result.ok).toBe(false)
     expect(result.message).toContain('正在执行或排队')
@@ -410,17 +449,17 @@ describe('Session provider switching', () => {
     session.selectedProvider = 'claude'
     session.selectedModel = 'claude:default'
 
-    const result = await session.onModelEffortSelect('claude:glm', 'max', '', 'ou_user', 'claude')
+    const result = await session.onModelEffortSelect('claude:opus', 'max', '', 'ou_user', 'claude')
 
     expect(result.ok).toBe(true)
-    expect(session.selectedModel).toBe('claude:glm')
+    expect(session.selectedModel).toBe('claude:opus')
     expect(proc.killCalls).toBe(1)
     expect(session.proc).toBeNull()
     expect(proc.setModelSettingsCalls).toEqual([])
     expect(result.card ? JSON.stringify(result.card) : '').toContain('下次启动 Claude')
   })
 
-  test('rejects non-fixed Claude model outside the two fixed choices', async () => {
+  test('rejects non-fixed Claude model outside the fixed choices', async () => {
     const session = new Session('probe', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'claude-session-1')
     session.proc = proc
@@ -432,6 +471,56 @@ describe('Session provider switching', () => {
     expect(result.ok).toBe(false)
     expect(result.message).toContain('不在固定选项中')
     expect(session.selectedModel).toBe('claude:default')
+    expect(proc.killCalls).toBe(0)
+  })
+
+  test('accepts the first-party Claude Code choices (Opus 4.8 / Fable 5, max)', async () => {
+    for (const model of ['claude:opus', 'claude:fable']) {
+      const session = new Session('probe', 'chat_id') as any
+      const proc = new FakeAgentProc('claude', 'claude-session-1')
+      session.proc = proc
+      session.selectedProvider = 'claude'
+      session.selectedModel = 'claude:default'
+
+      const result = await session.onModelEffortSelect(model, 'max', '', 'ou_user', 'claude')
+
+      expect(result.ok).toBe(true)
+      expect(session.selectedModel).toBe(model)
+      expect(proc.killCalls).toBe(1) // model 变更 → 空闲 Claude 进程重生,新 env 下轮生效
+      expect(session.proc).toBeNull()
+    }
+  })
+
+  test('model 选择器展示 Opus 4.8 / Fable 5 官方档位 + GLM 第三方档位', () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const choices = fixedModelChoices(session)
+    const claudeModels = choices.filter((c: any) => c.provider === 'claude').map((c: any) => c.model)
+    expect(claudeModels).toContain('claude:opus')
+    expect(claudeModels).toContain('claude:fable')
+    expect(claudeModels).toContain('claude:glm')
+    // 每个 Claude 档位锁死 max 最高思考强度
+    for (const c of choices.filter((c: any) => c.provider === 'claude')) {
+      expect(c.efforts.map((e: any) => e.effort)).toEqual(['max'])
+    }
+    // GLM 未配置 token 时,描述提示需要设置。
+    const glm = choices.find((c: any) => c.model === 'claude:glm')
+    expect(glm.description).toContain('配置')
+  })
+
+  test('未配置 token 时选 GLM 被拦截并提示去 config.toml 设置', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedModel = 'claude:fable'
+
+    const result = await session.onModelEffortSelect('claude:glm', 'max', '', 'ou_user', 'claude')
+
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('GLM')
+    expect(result.message).toMatch(/配置|config/)
+    expect(session.selectedModel).toBe('claude:fable') // 未切换
     expect(proc.killCalls).toBe(0)
   })
 
