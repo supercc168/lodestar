@@ -118,6 +118,29 @@ describe('Claude model profiles', () => {
     expect(claudeModelEnv('claude:glm')).toEqual({})
   })
 
+  test('API route profile without an explicit model stays unconfigured', () => {
+    // 只配了接入信息、忘了 model:sdkModel 会回落官方 claude-fable-5,
+    // 拿官方 model id 打第三方端点必然失败/误路由 —— 必须挡在 configured 门槛。
+    const prev = config.claude.models
+    ;(config.claude as any).models = {
+      glm: {
+        base_url: 'https://open.bigmodel.cn/api/anthropic',
+        auth_token: 'glm-secret-token',
+      },
+      // 非内建档位同样适用:任意第三方 relay 忘配 model 也一样拦。
+      relay: {
+        base_url: 'https://relay.example/api',
+        auth_token: 'relay-token',
+      },
+    }
+    try {
+      expect(claudeModelConfigured('claude:glm')).toBe(false)
+      expect(claudeModelConfigured('claude:relay')).toBe(false)
+    } finally {
+      ;(config.claude as any).models = prev
+    }
+  })
+
   test('a configured GLM profile injects base_url + auth_token as ANTHROPIC_* env', () => {
     const prev = config.claude.models
     ;(config.claude as any).models = {

@@ -126,7 +126,7 @@ export function configuredDefaultSelection(): {
 /** 第三方 API 路由(GLM)未配 token 时的描述后缀,提示去 config.toml 设置。 */
 function choiceDescription(item: typeof FIXED_MODEL_CHOICES[number]): string {
   if (item.provider === 'claude' && claudeModelIsApiRoute(item.model) && !claudeModelConfigured(item.model)) {
-    return `${item.description}(未配置 · 需在 config.toml 的 [claude.models.glm] 填 base_url + auth_token)`
+    return `${item.description}(未配置 · 需在 config.toml 的 [claude.models.glm] 填 base_url + auth_token + model)`
   }
   return item.description
 }
@@ -245,7 +245,7 @@ export async function onModelEffortSelect(
   if (provider === 'claude' && claudeModelIsApiRoute(model) && !claudeModelConfigured(model)) {
     return {
       ok: false,
-      message: `GLM(${model})未配置:请在 ~/.config/lodestar/config.toml 的 [claude.models.glm] 填写 base_url 和 auth_token 后重试(官方 Fable 5 / Opus 走登录态,无需配置)`,
+      message: `GLM(${model})未配置:请在 ~/.config/lodestar/config.toml 的 [claude.models.glm] 填写 base_url、auth_token 和 model 后重试(官方 Fable 5 / Opus 走登录态,无需配置)`,
     }
   }
   const choice = panel?.models.find(m => m.model === model && (m.provider ?? 'codex') === provider)
