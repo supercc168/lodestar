@@ -17,11 +17,12 @@ export const sentTexts: string[] = []
 export const sentRawTexts: string[] = []
 export const deletedReactions: Array<[string, string]> = []
 export const boundResumes: Array<[string, string, string | undefined]> = []
+export const urgentPushes: Array<[string, string[]]> = []
 /** [projects.<name>] 项目 profile 替身,测试往里 set 后 Session 构造时可查到。 */
 export const projectProfiles = new Map<string, { cwd?: string }>()
 
 export function resetFeishuMock(): void {
-  for (const arr of [sentCards, sentTexts, sentRawTexts, deletedReactions, boundResumes]) {
+  for (const arr of [sentCards, sentTexts, sentRawTexts, deletedReactions, boundResumes, urgentPushes]) {
     arr.length = 0
   }
   projectProfiles.clear()
@@ -47,6 +48,9 @@ mock.module('./feishu', () => ({
   },
   deleteReaction: async (messageId: string, reactionId: string) => {
     deletedReactions.push([messageId, reactionId])
+  },
+  urgentApp: async (messageId: string, openIds: string[]) => {
+    urgentPushes.push([messageId, openIds])
   },
   bindSessionResume: (sessionName: string, sessionId: string, provider?: string) => {
     boundResumes.push([sessionName, sessionId, provider])

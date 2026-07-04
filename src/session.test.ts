@@ -2,11 +2,13 @@ import { EventEmitter } from 'node:events'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
   boundResumes, deletedReactions, projectProfiles, resetFeishuMock,
-  sentCards, sentRawTexts, sentTexts,
+  sentCards, sentRawTexts, sentTexts, urgentPushes,
 } from './feishu-test-mock'
 
 const { Session } = await import('./session')
 const cardkit = await import('./cardkit')
+const { fixedModelChoices, normalizeFixedModelSelection } = await import('./session-model')
+const { config } = await import('./config')
 
 interface FetchCall {
   method: string
@@ -625,5 +627,231 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
       session.stopFooterStatus(turn)
       await cardkit.dispose('card_dead')
     }
+  })
+})
+
+describe('Session SDK-initiated bg-task resume turns', () => {
+  // 2026-07-04 事故:reviewer 后台 agent 完成 → SDK 自发恢复轮(init 无用户
+  // 消息)合并出终报告,但 init handler 因 pendingUserMessageCount=0 不开卡,
+  // appendAssistant 无 currentTurn 直接丢字 —— 6.6KB 终报告只存在于
+  // transcript,飞书全程无痕。恢复轮必须开卡;开不了卡也必须纯文本兜底。
+  async function waitFor(cond: () => boolean, ms = 2000): Promise<void> {
+    const t0 = Date.now()
+    while (!cond()) {
+      if (Date.now() - t0 > ms) throw new Error('waitFor timeout')
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+  }
+
+  function emitClaudeResult(proc: any): void {
+    proc.lastResult = {
+      cost_usd: null,
+      cost_delta_usd: null,
+      duration_ms: 1000,
+      num_turns: 1,
+      usage: null,
+      subtype: 'success',
+      is_error: false,
+    }
+    proc.emit('result', {})
+  }
+
+  function wiredClaudeSession(): { session: any; proc: any } {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.lastUserOpenId = 'ou_user'
+    session.wireProc(proc)
+    proc.emit('init', { session_id: 'claude-session-1' }) // boot init,无用户批次,不开卡
+    return { session, proc }
+  }
+
+  test('settle 后的自发 init 开 bg_task_resume 卡,终报告落卡、正常收尾并加急推送', async () => {
+    const { session, proc } = wiredClaudeSession()
+    expect(session.currentTurn).toBeNull()
+
+    proc.emit('bg_task_settled', { task_id: 't1', status: 'completed' })
+    proc.emit('init', { session_id: 'claude-session-1' }) // SDK 自发恢复轮
+    await waitFor(() => session.currentTurn !== null)
+
+    try {
+      expect(session.currentTurn.trigger).toBe('bg_task_resume')
+      expect(session.status).toBe('working')
+
+      proc.emit('assistant_text', { text: '双盲 review 合并终报告' })
+      proc.emit('assistant_block_stop', {})
+      emitClaudeResult(proc)
+      await waitFor(() => session.currentTurn === null)
+      // closeTurnCard 是 fire-and-forget:等终态 settings patch 落地再断言
+      await waitFor(() => calls.some(c => c.method === 'PATCH' && c.path.includes('/settings')))
+
+      const wroteReport = calls.some(c =>
+        c.method === 'POST' &&
+        /\/cards\/[^/]+\/elements$/.test(c.path) &&
+        String(c.body?.elements ?? '').includes('终报告'),
+      )
+      expect(wroteReport).toBe(true)
+      expect(session.status).toBe('idle')
+      expect(urgentPushes.length).toBe(1)
+      expect(sentTexts).toEqual([]) // 走了卡,不该触发纯文本兜底
+    } finally {
+      if (session.currentTurn) {
+        session.stopFooterStatus(session.currentTurn)
+        await cardkit.dispose(session.currentTurn.cardId)
+      }
+    }
+  })
+
+  test('开卡窗口期先到的 assistant 文本并入新卡,不丢', async () => {
+    const { session, proc } = wiredClaudeSession()
+
+    proc.emit('bg_task_settled', { task_id: 't1', status: 'completed' })
+    proc.emit('init', { session_id: 'claude-session-1' })
+    // openTurnCard 还在 await sendCard/id_convert,文本已经开始流 —— 事故里
+    // 55ms 后模型就开写。这些字必须并入随后落地的卡。
+    proc.emit('assistant_text', { text: '窗口期先到的段落' })
+    proc.emit('assistant_block_stop', {})
+    await waitFor(() => session.currentTurn !== null)
+
+    try {
+      emitClaudeResult(proc)
+      await waitFor(() => session.currentTurn === null)
+      await waitFor(() => calls.some(c => c.method === 'PATCH' && c.path.includes('/settings')))
+
+      const wrote = calls.some(c =>
+        c.method === 'POST' &&
+        /\/cards\/[^/]+\/elements$/.test(c.path) &&
+        String(c.body?.elements ?? '').includes('窗口期先到的段落'),
+      )
+      expect(wrote).toBe(true)
+    } finally {
+      if (session.currentTurn) {
+        session.stopFooterStatus(session.currentTurn)
+        await cardkit.dispose(session.currentTurn.cardId)
+      }
+    }
+  })
+
+  test('没有 settle 的空 init 不开卡(probe/模型切换等场景不受影响)', async () => {
+    const { session, proc } = wiredClaudeSession()
+
+    proc.emit('init', { session_id: 'claude-session-1' }) // 无 settle、无用户批次
+    await new Promise(resolve => setTimeout(resolve, 20))
+
+    expect(session.currentTurn).toBeNull()
+    expect(sentCards.length).toBe(0)
+  })
+
+  test('恢复轮开卡失败(id_convert 报错)时,输出纯文本兜底不丢', async () => {
+    const { session, proc } = wiredClaudeSession()
+    // 让本轮 id_convert 报错 → openTurnCard 拿不到 cardId → 开卡失败。
+    const base = globalThis.fetch
+    globalThis.fetch = (async (input: any, init?: any) => {
+      const url = new URL(String(input))
+      if (url.pathname.endsWith('/cards/id_convert')) {
+        return new Response(JSON.stringify({ code: 99, msg: 'boom' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return base(input, init)
+    }) as typeof fetch
+
+    try {
+      proc.emit('bg_task_settled', { task_id: 't1', status: 'completed' })
+      proc.emit('init', { session_id: 'claude-session-1' })
+      // 开卡在 await 中就会失败;这些字必须仍被兜住(开卡窗口 + cardless 续窗)。
+      proc.emit('assistant_text', { text: '孤儿终报告内容' })
+      proc.emit('assistant_block_stop', {})
+      await waitFor(() => session.bgResumeCardless === true || session.currentTurn !== null)
+      emitClaudeResult(proc)
+      await waitFor(() => sentTexts.length > 0)
+
+      expect(sentTexts.join('\n')).toContain('孤儿终报告内容')
+      expect(session.currentTurn).toBeNull()
+    } finally {
+      globalThis.fetch = base
+    }
+  })
+
+  test('用户打断后,残留的 post-interrupt 正文被丢弃,不推送 📄 兜底消息', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    const turn = turnState('card_live')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated('card_live', 1)
+
+    try {
+      // 模拟软停止:置 userInterrupted、封口卡片(currentTurn 置空)。
+      session.userInterrupted = true
+      await session.closeTurnCard('🛑 打断')
+      expect(session.currentTurn).toBeNull()
+
+      // interrupt 落地前 SDK 仍在流式:这些 delta 到达时已无卡。旧行为是
+      // 静默丢弃 —— 修复后必须仍然丢弃,不能变成 📄 纯文本兜底。
+      proc.emit('assistant_text', { text: '被取消的轮次尾巴' })
+      proc.emit('assistant_block_stop', {})
+      emitClaudeResult(proc)
+      await new Promise(resolve => setTimeout(resolve, 30))
+
+      expect(sentTexts.join('\n')).not.toContain('被取消的轮次尾巴')
+      expect(sentTexts.some(t => t.includes('📄'))).toBe(false)
+      expect(session.status).toBe('idle')
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose('card_live')
+    }
+  })
+
+  test('result 抢在 bg-resume 开卡 await 窗口内到达:不重复兜底,卡片正常收尾,不卡在 working', async () => {
+    const { session, proc } = wiredClaudeSession()
+
+    proc.emit('bg_task_settled', { task_id: 't1', status: 'completed' })
+    proc.emit('init', { session_id: 'claude-session-1' }) // 开始开卡(await sendCard/id_convert)
+    proc.emit('assistant_text', { text: '短恢复轮输出' })
+    proc.emit('assistant_block_stop', {})
+    // 开卡还没落地(openingTurn 仍 true)就来 result —— 竞态窗口。
+    emitClaudeResult(proc)
+
+    await waitFor(() => session.currentTurn === null && session.openingTurn === false)
+    await waitFor(() => calls.some(c => c.method === 'PATCH' && c.path.includes('/settings')))
+
+    // 文本进了卡(不是纯文本兜底),且只出现一次。
+    expect(sentTexts.some(t => t.includes('📄'))).toBe(false)
+    const inCard = calls.some(c =>
+      c.method === 'POST' &&
+      /\/cards\/[^/]+\/elements$/.test(c.path) &&
+      String(c.body?.elements ?? '').includes('短恢复轮输出'),
+    )
+    expect(inCard).toBe(true)
+    // 卡片已收尾(有终态 settings patch),session 不卡在 working。
+    expect(session.status).toBe('idle')
+  })
+
+  test('切换 provider 停旧进程时清掉 bgResumePending,新进程 boot init 不误开恢复卡', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'codex' // 与 proc.provider 不一致 → 视为 idle mismatched
+    session.bgResumePending = true
+
+    await session.stopIdleMismatchedProcess()
+
+    expect(session.bgResumePending).toBe(false)
+    expect(session.proc).toBeNull()
+  })
+
+  test('非开卡/非恢复窗口的游离正文被丢弃,不进孤儿缓冲', () => {
+    const session = new Session('probe', 'chat_id') as any
+    // 无 currentTurn、无 openingTurn、无 bgResumeCardless:任何游离 delta 都该丢。
+    session.appendAssistant('进程 kill 窗口的残字')
+    session.finalizeCurrentAssistantSegment()
+
+    expect(session.orphanAssistantSegments).toEqual([])
+    expect(session.orphanAssistantCurrent).toBe('')
   })
 })

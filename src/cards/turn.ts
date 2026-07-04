@@ -237,12 +237,14 @@ interface MainCardOpts {
   model?: string
   effort?: string
   /** What started this turn:
-   *   'user_message' — user input batch(panel "📥 收到 (N)" 渲染原文)
-   *   'card_full'    — 同一 Codex turn 的"续卡":前一张卡写满(element 数
-   *                   触顶 ~75)或写入被飞书拒,session rotate 出来的新卡
-   *                   (banner `📨 接续上一张`,无 panel,turn 号跟旧卡
-   *                   相同) */
-  kind?: 'user_message' | 'card_full'
+   *   'user_message'   — user input batch(panel "📥 收到 (N)" 渲染原文)
+   *   'card_full'      — 同一 Codex turn 的"续卡":前一张卡写满(element 数
+   *                     触顶 ~75)或写入被飞书拒,session rotate 出来的新卡
+   *                     (banner `📨 接续上一张`,无 panel,turn 号跟旧卡
+   *                     相同)
+   *   'bg_task_resume' — 后台任务结算后 SDK 自发的恢复轮(无用户消息,
+   *                     banner `🔁 后台任务完成`,无 panel) */
+  kind?: 'user_message' | 'card_full' | 'bg_task_resume'
   /** 本轮 Codex 收到的 user wireText 列表。boot turn 通常是 1 条;mid-turn
    * 用户连发的 N 条会在下一 turn 一并塞进。空数组 / undefined 时不渲染
    * userInput panel。 */
@@ -262,7 +264,9 @@ export function mainConversationCard(opts: MainCardOpts): object {
   const providerLabel = opts.provider === 'claude' ? 'Claude' : 'Codex'
   const banner = opts.kind === 'card_full'
     ? [{ tag: 'markdown', content: `📨 接续上一张（同一轮 ${providerLabel}，前卡写满或写入受限）` }]
-    : []
+    : opts.kind === 'bg_task_resume'
+      ? [{ tag: 'markdown', content: `🔁 后台任务完成，${providerLabel} 继续处理结果 #${opts.turn}` }]
+      : []
   const inputs = opts.userInputs ?? []
   const userInputHeader = `📥 收到 (${inputs.length}) ${opts.directStart ? '🚀' : `#${opts.turn}`}`
   const userInputPanel = inputs.length > 0
