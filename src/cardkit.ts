@@ -41,6 +41,13 @@ interface CardState {
    * would 300313/300121. Per-card and dropped on `dispose`, so a rotated-to
    * fresh card starts clean. */
   deadElements: Set<string>
+  /** Card-level write kill-switch (see markCardWriteDead). Once set, every
+   * write op short-circuits to a resolved promise — no HTTP, no onFailure.
+   * Session flips this when it hits the failure-rotate cap and goes
+   * log-only: without it, the per-second footer ticker and stream handlers
+   * keep hammering the unwritable card (2026-07-04: 663 × code=300308 in
+   * 11 minutes against one dead card). */
+  writeDead?: boolean
   /** Card-level write-failure callback, set by recordCardCreated. Invoked
    * by any cardkit write op that fails even after the streaming-closed
    * reopen+retry; the session uses it to rotate onto a fresh card (see
@@ -111,6 +118,15 @@ export function getElementCount(cardId: string): number {
  * the old card. */
 export function isDeadElement(cardId: string, elementId: string): boolean {
   return cards.get(cardId)?.deadElements.has(elementId) ?? false
+}
+
+/** Stop all future writes to this card. Idempotent; cleared only by
+ * dispose (a rotated-to fresh card has its own state). Covers both new
+ * enqueues and already-queued tasks that haven't reached the wire yet
+ * (each op re-checks the flag when it runs). */
+export function markCardWriteDead(cardId: string): void {
+  state(cardId).writeDead = true
+  cancelSummary(cardId)
 }
 
 function nextSeq(cardId: string): number {
@@ -279,11 +295,13 @@ export function addElement(
   onFailure?: (code?: number) => void,
 ): Promise<void> {
   const s = state(cardId)
+  if (s.writeDead) return Promise.resolve()
   const elementId = (element as { element_id?: string }).element_id
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `addElement`,
     async () => {
+      if (s.writeDead) return
       const seq = nextSeq(cardId)
       await call('POST', `/cards/${cardId}/elements`, {
         type: opts.type ?? 'append',
@@ -314,12 +332,12 @@ export function addElement(
 /** Replace an entire element (used to swap a tool placeholder with its result). */
 export function replaceElement(cardId: string, elementId: string, element: object): Promise<void> {
   const s = state(cardId)
-  if (s.deadElements.has(elementId)) return Promise.resolve()
+  if (s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `replaceElement ${elementId}`,
     async () => {
-      if (s.deadElements.has(elementId)) return
+      if (s.writeDead || s.deadElements.has(elementId)) return
       const seq = nextSeq(cardId)
       await call('PUT', `/cards/${cardId}/elements/${elementId}`, {
         element: JSON.stringify(element),
@@ -333,12 +351,12 @@ export function replaceElement(cardId: string, elementId: string, element: objec
 /** Delete an element by id. */
 export function deleteElement(cardId: string, elementId: string): Promise<void> {
   const s = state(cardId)
-  if (s.deadElements.has(elementId)) return Promise.resolve()
+  if (s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `deleteElement ${elementId}`,
     async () => {
-      if (s.deadElements.has(elementId)) return
+      if (s.writeDead || s.deadElements.has(elementId)) return
       const seq = nextSeq(cardId)
       await call('DELETE', `/cards/${cardId}/elements/${elementId}`, {
         sequence: seq,
@@ -358,6 +376,7 @@ export function deleteElement(cardId: string, elementId: string): Promise<void> 
  * the settings-PATCH endpoint. Whitespace is collapsed and the input
  * is trimmed; empty content is ignored. */
 export function patchSummaryThrottled(cardId: string, content: string): void {
+  if (cards.get(cardId)?.writeDead) return
   const trimmed = (content ?? '').replace(/\s+/g, ' ').trim()
   if (!trimmed) return
   let s = summaryStates.get(cardId)
@@ -402,7 +421,9 @@ export function cancelSummary(cardId: string): void {
  * seq order match the queue order. */
 export function patchSettings(cardId: string, settings: object): Promise<void> {
   const s = state(cardId)
+  if (s.writeDead) return Promise.resolve()
   s.queue = s.queue.then(async () => {
+    if (s.writeDead) return
     try {
       const seq = nextSeq(cardId)
       await call('PATCH', `/cards/${cardId}/settings`, {

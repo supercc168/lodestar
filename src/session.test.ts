@@ -1,41 +1,9 @@
 import { EventEmitter } from 'node:events'
-import { afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
-
-let sentCards: object[] = []
-let sentTexts: string[] = []
-let sentRawTexts: string[] = []
-let deletedReactions: Array<[string, string]> = []
-let boundResumes: Array<[string, string, string | undefined]> = []
-const projectProfiles = new Map<string, { cwd?: string }>()
-
-mock.module('./feishu', () => ({
-  PROJECTS_ROOT: '/tmp/lodestar-projects',
-  getSessionResume: () => null,
-  getSessionModelSelection: () => null,
-  getTenantToken: async () => 'tenant-token',
-  preferredChatForSession: new Map(),
-  sendCard: async (_chatId: string, card: object) => {
-    sentCards.push(card)
-    return `om_status_${sentCards.length}`
-  },
-  sendText: async (_chatId: string, text: string) => {
-    sentTexts.push(text)
-    return 'om_text'
-  },
-  sendTextRaw: async (_chatId: string, text: string) => {
-    sentRawTexts.push(text)
-    return 'om_raw'
-  },
-  deleteReaction: async (messageId: string, reactionId: string) => {
-    deletedReactions.push([messageId, reactionId])
-  },
-  bindSessionResume: (sessionName: string, sessionId: string, provider?: string) => {
-    boundResumes.push([sessionName, sessionId, provider])
-  },
-  bindSessionModel: () => {},
-  provisionProject: () => {},
-  projectProfile: (name: string) => projectProfiles.get(name),
-}))
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import {
+  boundResumes, deletedReactions, projectProfiles, resetFeishuMock,
+  sentCards, sentRawTexts, sentTexts,
+} from './feishu-test-mock'
 
 const { Session } = await import('./session')
 const cardkit = await import('./cardkit')
@@ -51,12 +19,7 @@ let calls: FetchCall[] = []
 
 beforeEach(() => {
   calls = []
-  sentCards = []
-  sentTexts = []
-  sentRawTexts = []
-  deletedReactions = []
-  boundResumes = []
-  projectProfiles.clear()
+  resetFeishuMock()
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = new URL(String(input))
     const path = url.pathname.replace('/open-apis/cardkit/v1', '')
@@ -165,6 +128,7 @@ function turnState(cardId = 'card_session_turn'): any {
     footerStatusLabel: null,
     rotating: null,
     rotateCount: 0,
+    failureRotateCount: 0,
     rotateGivenUp: false,
     outboundSeenPaths: new Set(),
     outboundSentPaths: new Set(),
@@ -595,5 +559,71 @@ describe('Session workDir project profile override', () => {
     projectProfiles.set('blankcwd', { cwd: '   ' })
     const session = new Session('blankcwd', 'oc_test_blank')
     expect(session.workDir).toBe('/tmp/lodestar-projects/blankcwd')
+  })
+})
+
+describe('Session rotate cap counts only failure-triggered rotations', () => {
+  // 2026-07-04 03:46 事故:turn 2 里 5 次正常满卡轮转(elementCount=50)把
+  // rotateCount 耗光,第 2 次真实写失败(300308)一来就撞 cap 放弃。cap 的
+  // 设计意图(session-types.ts)是只约束失败路径 —— 主动满卡轮转被真实输出
+  // 天然节流,不该消耗失败额度。
+  test('proactive full-card rotations do not consume the failure cap', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-session-1')
+    const turn = turnState('card_old')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated('card_old', 1)
+    turn.rotateCount = 5 // 5 次主动满卡轮转已发生,但从未因写失败换过卡
+
+    try {
+      session.onCardWriteFailure(300308)
+
+      expect(turn.rotateGivenUp).toBe(false)
+      expect(turn.rotating).not.toBeNull()
+      await turn.rotating
+      expect(turn.cardId).not.toBe('card_old') // 真的换到了新卡
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('give-up stops the footer ticker, blocks its restart, and kills card writes', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-session-1')
+    const turn = turnState('card_dead')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated('card_dead', 1)
+    turn.failureRotateCount = 5 // 失败额度已耗尽
+
+    try {
+      session.startWritingFooter(turn)
+      expect(turn.footerStatusHandle).not.toBeNull()
+
+      session.onCardWriteFailure(300308)
+
+      expect(turn.rotateGivenUp).toBe(true)
+      expect(turn.rotating).toBeNull() // 不再尝试换卡
+      // 事故根因 1:log-only 后 footer 每秒 ticker 没停,对死卡刷了 11 分钟
+      // 663 条 300308。放弃时必须停表,且 phase 切换不能把它拉起来。
+      expect(turn.footerStatusHandle).toBeNull()
+      session.startWorkingFooter(turn)
+      expect(turn.footerStatusHandle).toBeNull()
+      // log-only 语义:本轮剩余对该卡的写全部短路,不再打飞书。
+      const before = calls.length
+      await cardkit.replaceElement('card_dead', 'footer', { tag: 'markdown', element_id: 'footer', content: 'x' })
+      await cardkit.addElement('card_dead', { tag: 'markdown', element_id: 'e_new', content: 'x' })
+      expect(calls.length).toBe(before)
+      // 告警文案说的是真实语义(换卡耗尽),不是「连续 N 次写入失败」
+      expect(sentRawTexts.length).toBe(1)
+      expect(sentRawTexts[0]).toContain('换卡')
+      expect(sentRawTexts[0]).toContain('仅日志可见')
+      expect(sentRawTexts[0]).not.toContain('连续 5 次写入失败')
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose('card_dead')
+    }
   })
 })
