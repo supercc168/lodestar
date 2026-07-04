@@ -93,6 +93,9 @@ export interface TasklistBinding {
   url: string
   projectName: string
   ownerOpenId: string
+  /** 项目主群 chatId —— 自动化状态卡发送目标。enableTasklist 落库,
+   *  旧 binding 由 tasklist-cards.backfillChatId 首轮回填。 */
+  chatId?: string
   createdAt?: string
   sections?: TasklistSectionMap
   tasks?: Record<string, TaskAutomationState>
@@ -141,6 +144,7 @@ export async function enableTasklist(projectName: string, chatId: string): Promi
     url: tasklist.url,
     projectName,
     ownerOpenId,
+    chatId,
     createdAt: tasklist.createdAt,
     sections: {},
     tasks: {},
@@ -276,6 +280,7 @@ function loadTasklistMap(): void {
         url: typeof item.url === 'string' ? item.url : '',
         projectName,
         ownerOpenId: typeof item.ownerOpenId === 'string' ? item.ownerOpenId : '',
+        chatId: typeof item.chatId === 'string' && item.chatId ? item.chatId : undefined,
         createdAt: typeof item.createdAt === 'string' ? item.createdAt : undefined,
         sections: readSectionMap(item.sections),
         tasks: readTasks(item.tasks),
