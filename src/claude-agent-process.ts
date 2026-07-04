@@ -96,6 +96,8 @@ type ClaudePathLookup = {
   pathEnv?: string
   homeDir?: string
   exists?: (path: string) => boolean
+  /** undefined = 读 config.claude.bin;显式 null = 视为未配置(测试隔离 config 用)。 */
+  configuredBin?: string | null
 }
 
 type ClaudeExecutableConfig = {
@@ -165,6 +167,23 @@ export function assertClaudeCodeAvailable(): void {
 
 export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): ClaudeExecutableConfig {
   const platform = lookup.platform ?? process.platform
+  const configured = lookup.configuredBin === undefined ? config.claude.bin : lookup.configuredBin
+  if (configured) {
+    const exists = lookup.exists ?? existsSync
+    // [claude].bin 配错时必须 fail fast:静默回退会让用户以为在烧包装器
+    // (如 reclaude)的额度,实际走了别的 key。
+    if (!exists(configured)) {
+      throw new Error(`lodestar: [claude].bin not found: ${configured} (config.toml)`)
+    }
+    if (platform === 'win32' && windowsShellShim(configured)) {
+      return {
+        pathToClaudeCodeExecutable: configured,
+        spawnClaudeCodeProcess: spawnWindowsShellShim,
+        description: `windows-shell-shim:${configured}`,
+      }
+    }
+    return { pathToClaudeCodeExecutable: configured, description: `config:${configured}` }
+  }
   const bin = findClaudeBin(lookup)
   if (!bin) return { description: 'sdk-default' }
   if (platform === 'win32' && windowsShellShim(bin)) {
@@ -639,8 +658,6 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (this.started) return
     this.started = true
     const model = resolveClaudeSdkModel(this.opts.model)
-    const executable = resolveClaudeExecutableConfig()
-    log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} cwd=${this.opts.workDir} executable=${executable.description}`)
     const profile = this.opts.profile
     if (profile) {
       log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? false} keepInstructions=${(profile.keepLodestarInstructions ?? true)}`)
@@ -653,6 +670,10 @@ export class ClaudeAgentProcess extends EventEmitter {
     // Lodestar's appended card/output markers for a fully isolated agent.
     const appendSystemPrompt = profile?.keepLodestarInstructions === false ? undefined : this.opts.appendSystemPrompt
     try {
+      // resolveClaudeExecutableConfig 在 [claude].bin 配错路径时同步抛出;
+      // 必须在 try 内调用,确保错误走 error/exit 事件而非穿透到调用方。
+      const executable = resolveClaudeExecutableConfig()
+      log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} cwd=${this.opts.workDir} executable=${executable.description}`)
       this.query = query({
         prompt: this.input,
         options: {

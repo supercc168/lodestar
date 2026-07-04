@@ -28,6 +28,7 @@ const {
 const {
   resolveClaudeSdkModel,
 } = await import('./claude-models')
+const { config } = await import('./config')
 
 // context window max 是 daemon 全局缓存(按路由 key 跨 session 共享),
 // 每个用例前重置,避免互相污染。
@@ -92,6 +93,80 @@ describe('Claude model profiles', () => {
   test('maps GLM and DeepSeek profiles to SDK model and env tiers', () => {
     expect(resolveClaudeSdkModel('claude:default')).toBe('opus')
     expect(resolveClaudeSdkModel('claude:glm')).toBe('opus')
+  })
+})
+
+describe('Claude configured executable ([claude] bin)', () => {
+  test('uses configured bin as the SDK executable', () => {
+    const bin = '/home/me/.local/bin/reclaude'
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'linux',
+      configuredBin: bin,
+      exists: path => path === bin,
+    })
+
+    expect(executable.pathToClaudeCodeExecutable).toBe(bin)
+    expect(executable.spawnClaudeCodeProcess).toBeUndefined()
+    expect(executable.description).toBe(`config:${bin}`)
+  })
+
+  test('throws instead of silently falling back when configured bin is missing', () => {
+    expect(() => resolveClaudeExecutableConfig({
+      platform: 'linux',
+      configuredBin: '/nope/reclaude',
+      exists: () => false,
+    })).toThrow('/nope/reclaude')
+  })
+
+  test('runs configured Windows .cmd bin through the shell shim spawn hook', () => {
+    const bin = win32.join('C:\\Users\\me\\bin', 'reclaude.cmd')
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'win32',
+      configuredBin: bin,
+      exists: path => path === bin,
+    })
+
+    expect(executable.pathToClaudeCodeExecutable).toBe(bin)
+    expect(typeof executable.spawnClaudeCodeProcess).toBe('function')
+    expect(executable.description).toBe(`windows-shell-shim:${bin}`)
+  })
+
+  test('explicit null configuredBin falls back to auto discovery', () => {
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'win32',
+      pathEnv: '',
+      configuredBin: null,
+      exists: () => false,
+    })
+
+    expect(executable).toEqual({ description: 'sdk-default' })
+  })
+
+  test('sendInitialize 配错 bin 路径时走 error/exit 事件而非同步抛出', () => {
+    // [claude].bin 指向不存在的路径 → resolveClaudeExecutableConfig 同步抛出;
+    // 修复确保该抛出在 sendInitialize 的 try/catch 内被捕获,转为事件输出,
+    // 调用方不会收到同步异常,session 层可通过 error/exit 事件做正常清理。
+    ;(config.claude as any).bin = '/nope/reclaude'
+    try {
+      const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' })
+      const errors: Error[] = []
+      const exits: any[] = []
+      proc.on('error', (err: Error) => errors.push(err))
+      proc.on('exit', (ev: any) => exits.push(ev))
+
+      // 不能同步抛出
+      expect(() => proc.sendInitialize()).not.toThrow()
+
+      // error 事件携带路径信息
+      expect(errors).toHaveLength(1)
+      expect(errors[0].message).toContain('/nope/reclaude')
+
+      // exit 事件 code=1
+      expect(exits).toHaveLength(1)
+      expect(exits[0].code).toBe(1)
+    } finally {
+      delete (config.claude as any).bin
+    }
   })
 })
 
