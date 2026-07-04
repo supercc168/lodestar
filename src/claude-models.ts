@@ -12,6 +12,11 @@ type DefaultClaudeModelConfig = Required<
   Pick<ClaudeModelConfig, 'display_name' | 'description'>
 >
 
+// 未在 config.toml [claude.models.*] 指定 model 时的默认档位。
+// Fable 5 是 Anthropic 当前最强模型(1M ctx / 128K out),官方 API 路由可用;
+// GLM 等第三方路由不认这个 id,需在 profile 里显式配 model 覆盖。
+export const DEFAULT_CLAUDE_SDK_MODEL = 'claude-fable-5'
+
 const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
   glm: {
     display_name: 'Claude Code · GLM',
@@ -37,7 +42,7 @@ function toProfile(name: string): ClaudeModelProfile | null {
     name,
     displayName: raw.display_name?.trim() || `Claude Code · ${name}`,
     description: raw.description?.trim() || `使用 ${name} 路由运行 Claude Code 后端。`,
-    sdkModel: raw.model?.trim() || 'opus',
+    sdkModel: raw.model?.trim() || DEFAULT_CLAUDE_SDK_MODEL,
   }
 }
 
@@ -63,9 +68,9 @@ export function claudeModelKey(model: string): string {
 }
 
 export function resolveClaudeSdkModel(model: string | null | undefined): string | undefined {
-  if (!model) return 'opus'
+  if (!model) return DEFAULT_CLAUDE_SDK_MODEL
   const profile = claudeModelProfile(model)
   if (profile) return profile.sdkModel
   const stripped = model.startsWith('claude:') ? model.slice('claude:'.length) : model
-  return stripped === 'default' ? 'opus' : stripped
+  return stripped === 'default' ? DEFAULT_CLAUDE_SDK_MODEL : stripped
 }
