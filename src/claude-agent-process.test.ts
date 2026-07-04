@@ -27,6 +27,9 @@ const {
 } = await import('./claude-agent-process')
 const {
   resolveClaudeSdkModel,
+  claudeModelEnv,
+  claudeModelIsApiRoute,
+  claudeModelConfigured,
 } = await import('./claude-models')
 const { config } = await import('./config')
 
@@ -93,6 +96,78 @@ describe('Claude model profiles', () => {
   test('maps GLM and DeepSeek profiles to SDK model and env tiers', () => {
     expect(resolveClaudeSdkModel('claude:default')).toBe('claude-fable-5')
     expect(resolveClaudeSdkModel('claude:glm')).toBe('claude-fable-5')
+  })
+
+  test('maps first-party Claude Code profiles to their SDK model ids', () => {
+    expect(resolveClaudeSdkModel('claude:opus')).toBe('claude-opus-4-8')
+    expect(resolveClaudeSdkModel('claude:fable')).toBe('claude-fable-5')
+  })
+
+  test('official (login) Claude models inject no ANTHROPIC_* env and are not API routes', () => {
+    expect(claudeModelEnv('claude:fable')).toEqual({})
+    expect(claudeModelEnv('claude:opus')).toEqual({})
+    expect(claudeModelIsApiRoute('claude:fable')).toBe(false)
+    expect(claudeModelIsApiRoute('claude:opus')).toBe(false)
+  })
+
+  test('GLM is an API route that stays unconfigured until a token is set in lodestar config', () => {
+    // 默认(无 config)→ GLM 是 api 路由但未配置,env 为空。
+    expect(claudeModelIsApiRoute('claude:glm')).toBe(true)
+    expect(claudeModelConfigured('claude:glm')).toBe(false)
+    expect(claudeModelEnv('claude:glm')).toEqual({})
+  })
+
+  test('a configured GLM profile injects base_url + auth_token as ANTHROPIC_* env', () => {
+    const prev = config.claude.models
+    ;(config.claude as any).models = {
+      glm: {
+        model: 'glm-4.6',
+        base_url: 'https://open.bigmodel.cn/api/anthropic',
+        auth_token: 'glm-secret-token',
+      },
+    }
+    try {
+      expect(claudeModelConfigured('claude:glm')).toBe(true)
+      expect(resolveClaudeSdkModel('claude:glm')).toBe('glm-4.6')
+      expect(claudeModelEnv('claude:glm')).toEqual({
+        ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
+        ANTHROPIC_AUTH_TOKEN: 'glm-secret-token',
+      })
+      // 官方模型仍然干净,GLM 的 token 不外泄到登录态档位。
+      expect(claudeModelEnv('claude:opus')).toEqual({})
+    } finally {
+      ;(config.claude as any).models = prev
+    }
+  })
+
+  test('buildSpawnEnv: 登录档位抹掉环境里的 ANTHROPIC_*;GLM 只注入自己的 key,不夹带残留官方 key', () => {
+    const prevKey = process.env.ANTHROPIC_API_KEY
+    const prevModels = config.claude.models
+    // 残留一个官方 API key 在环境里(模拟用户 shell / 全局注入)。
+    process.env.ANTHROPIC_API_KEY = 'stray-official-key'
+    ;(config.claude as any).models = {
+      glm: { model: 'glm-4.6', base_url: 'https://glm.example/anthropic', auth_token: 'glm-tok' },
+    }
+    try {
+      // 官方登录档位:三个路由 key 全被抹掉,保证纯登录态。
+      const login = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:opus' })
+      const loginEnv = (login as any).buildSpawnEnv()
+      expect(loginEnv.ANTHROPIC_API_KEY).toBeUndefined()
+      expect(loginEnv.ANTHROPIC_BASE_URL).toBeUndefined()
+      expect(loginEnv.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+
+      // GLM 第三方路由:注入自己的 base_url + auth_token,但残留的官方 key
+      // 被先抹掉,不会夹带打到第三方端点。
+      const glm = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:glm' })
+      const glmEnv = (glm as any).buildSpawnEnv()
+      expect(glmEnv.ANTHROPIC_BASE_URL).toBe('https://glm.example/anthropic')
+      expect(glmEnv.ANTHROPIC_AUTH_TOKEN).toBe('glm-tok')
+      expect(glmEnv.ANTHROPIC_API_KEY).toBeUndefined()
+    } finally {
+      if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY
+      else process.env.ANTHROPIC_API_KEY = prevKey
+      ;(config.claude as any).models = prevModels
+    }
   })
 })
 
