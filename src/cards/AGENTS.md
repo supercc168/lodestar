@@ -14,6 +14,8 @@
 | `tool.ts` | 工具折叠面板、权限按钮、Read 批次面板，以及 Bash/FileChange/WebSearch/MCP/Image/Agent 等工具输入/输出摘要。 |
 | `task-board.ts` | Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板。codex 的 TodoWrite 一次就带完整列表,但 Claude Code 拆成 4 个单点工具,这里维护一份以 task id 为 key 的 board(`applyTaskTool` 跨调用累积),`taskBoardElement` 渲染整个板产出与 codex 一致的列表效果。board 由 `session-tools.ts` 在 Session 级持有。 |
 | `agy.ts` | `agy <prompt>` 任务卡片，渲染 prompt、状态统计、执行结果、仓库变更和转发 Codex 按钮。 |
+| `format.ts` | 共享时长格式化 `fmtElapsed`(ms → `45s`/`2m13s`/`1h5m`)，`background.ts`/`automation.ts` 状态卡共用。 |
+| `automation.ts` | 任务清单自动化「工作室成员」运行的累积视图(`AutomationBurst`)+ 状态卡渲染(每运行一个折叠 panel),纯层;I/O 生命周期在 `src/tasklist-cards.ts`。 |
 | `console.ts` | `hi` 控制台、状态卡、菜单卡、模型/effort 选择卡、额度/主机信息格式化和关闭 streaming 设置。 |
 | `worktree.ts` | `wt` 列表卡和创建/加入提示卡，展示 `work/*` 分支状态、归档摘要并提供常驻删除按钮。 |
 | `task.ts` | `task` 清单面板卡，展示项目、清单名、绑定 GUID、分组状态、清单链接，以及启用/删除/确认删除按钮。 |
