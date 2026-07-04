@@ -543,6 +543,59 @@ function firstString(...values: unknown[]): string | undefined {
   return undefined
 }
 
+// ── 后台任务 / 子 agent 生命周期事件 payload ─────────────────────────
+// 对应 SDK 的 task_started / task_progress / task_updated / task_notification
+// 四个 system subtype(见 handleSystemMessage 的 case 分支)。session 据此维护
+// backgroundTasks 状态并驱动后台游标卡。之前这四个 subtype 全落 default 静默丢,
+// 子 agent 启动后全程黑盒直到 tool_result 回来。
+
+export type BgTaskStatus = 'pending' | 'running' | 'completed' | 'failed' | 'killed' | 'paused'
+
+export interface BgTaskUsage {
+  total_tokens: number
+  tool_uses: number
+  duration_ms: number
+}
+
+export interface BgTaskStartedEvent {
+  task_id: string
+  tool_use_id?: string
+  task_type?: string
+  description: string
+  subagent_type?: string
+  workflow_name?: string
+  prompt?: string
+}
+
+export interface BgTaskProgressEvent {
+  task_id: string
+  description?: string
+  subagent_type?: string
+  usage?: BgTaskUsage
+  last_tool_name?: string
+  summary?: string
+}
+
+export interface BgTaskUpdatedEvent {
+  task_id: string
+  patch: {
+    status?: BgTaskStatus
+    description?: string
+    end_time?: number
+    total_paused_ms?: number
+    error?: string
+    is_backgrounded?: boolean
+  }
+}
+
+export interface BgTaskSettledEvent {
+  task_id: string
+  tool_use_id?: string
+  status: 'completed' | 'failed' | 'stopped'
+  summary?: string
+  usage?: BgTaskUsage
+}
+
 export class ClaudeAgentProcess extends EventEmitter {
   readonly provider = 'claude' as const
 
@@ -803,7 +856,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       options.signal.addEventListener('abort', abort, { once: true })
       this.pendingPermissions.set(requestId, { kind: 'dialog', resolve: finish, request: req })
     })
-    this.emitToolUseOnce(toolUseId, 'AskUserQuestion', input)
+    this.emitToolUseOnce(toolUseId, 'AskUserQuestion', input, null)
     this.emit('can_use_tool', req)
     return pending
   }
@@ -892,6 +945,48 @@ export class ClaudeAgentProcess extends EventEmitter {
       case 'permission_denied':
         log(`claude-agent-process: permission denied ${raw.tool_name} ${raw.tool_use_id}: ${raw.message}`)
         return
+      // ── 后台任务 / 子 agent 生命周期(SDK 的 task_* 消息族,统一 type:'system')
+      // 全部 emit 出去给 session 维护 backgroundTasks 状态 + 驱动后台游标卡。
+      // 之前落 default 静默丢,子 agent 启动后全程黑盒直到 tool_result 回来。
+      case 'task_started':
+        this.emit('bg_task_started', {
+          task_id: String(raw.task_id ?? ''),
+          tool_use_id: typeof raw.tool_use_id === 'string' ? raw.tool_use_id : undefined,
+          task_type: typeof raw.task_type === 'string' ? raw.task_type : undefined,
+          description: String(raw.description ?? ''),
+          subagent_type: typeof raw.subagent_type === 'string' ? raw.subagent_type : undefined,
+          workflow_name: typeof raw.workflow_name === 'string' ? raw.workflow_name : undefined,
+          prompt: typeof raw.prompt === 'string' ? raw.prompt : undefined,
+        })
+        return
+      case 'task_progress':
+        this.emit('bg_task_progress', {
+          task_id: String(raw.task_id ?? ''),
+          description: typeof raw.description === 'string' ? raw.description : undefined,
+          subagent_type: typeof raw.subagent_type === 'string' ? raw.subagent_type : undefined,
+          usage: raw.usage,
+          last_tool_name: typeof raw.last_tool_name === 'string' ? raw.last_tool_name : undefined,
+          summary: typeof raw.summary === 'string' ? raw.summary : undefined,
+        })
+        return
+      case 'task_updated':
+        this.emit('bg_task_updated', {
+          task_id: String(raw.task_id ?? ''),
+          patch: raw.patch && typeof raw.patch === 'object' ? raw.patch : {},
+        })
+        return
+      case 'task_notification':
+        // task_notification 是任务结算的权威信号:带终态 status + 最终 usage。
+        this.emit('bg_task_settled', {
+          task_id: String(raw.task_id ?? ''),
+          tool_use_id: typeof raw.tool_use_id === 'string' ? raw.tool_use_id : undefined,
+          status: raw.status === 'completed' || raw.status === 'failed' || raw.status === 'stopped'
+            ? raw.status
+            : 'completed',
+          summary: typeof raw.summary === 'string' ? raw.summary : undefined,
+          usage: raw.usage,
+        })
+        return
       default:
         return
     }
@@ -915,26 +1010,29 @@ export class ClaudeAgentProcess extends EventEmitter {
         this.emit('assistant_text', { uuid, text: block.text })
         this.emit('assistant_block_stop', { index: uuid })
       } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
-        this.emitToolUseOnce(block.id, block.name, block.input ?? {})
+        this.emitToolUseOnce(block.id, block.name, block.input ?? {}, raw.parent_tool_use_id ?? null)
       } else if (block.type === 'server_tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
         this.emitToolUseOnce(block.id, serverToolName(block.name), {
           tool: block.name,
           input: this.serverToolInput(block.name, block.input ?? {}),
-        })
+        }, raw.parent_tool_use_id ?? null)
       } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
         this.emitToolResultOnce(
           block.tool_use_id,
           textFromServerToolResultContent(block.content),
           block.is_error === true,
+          raw.parent_tool_use_id ?? null,
         )
       }
     }
   }
 
-  private emitToolUseOnce(id: string, name: string, input: any): void {
+  private emitToolUseOnce(id: string, name: string, input: any, parentToolUseId: string | null): void {
     if (this.emittedToolUseIds.has(id)) return
     this.emittedToolUseIds.add(id)
-    this.emit('tool_use', { id, name, input })
+    // parentToolUseId:子 agent 内的工具调用 = 触发它的 Task tool_use id;主线程为 null。
+    // session 据此把子 agent 的逐步过程累积进对应后台 task 的 steps[]。
+    this.emit('tool_use', { id, name, input, parentToolUseId })
   }
 
   private serverToolInput(name: string, rawInput: unknown): unknown {
@@ -955,13 +1053,14 @@ export class ClaudeAgentProcess extends EventEmitter {
     return structuredInput
   }
 
-  private emitToolResultOnce(toolUseId: string, content: string, isError: boolean): void {
+  private emitToolResultOnce(toolUseId: string, content: string, isError: boolean, parentToolUseId: string | null): void {
     if (this.emittedToolResultIds.has(toolUseId)) return
     this.emittedToolResultIds.add(toolUseId)
     this.emit('tool_result', {
       tool_use_id: toolUseId,
       content,
       is_error: isError,
+      parentToolUseId,
     })
   }
 
@@ -983,7 +1082,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           ].filter(Boolean).join('\n')
         : ''
       const output = contentText || stdoutStderr
-      this.emitToolResultOnce(block.tool_use_id, output, block.is_error === true || toolResult?.interrupted === true)
+      this.emitToolResultOnce(block.tool_use_id, output, block.is_error === true || toolResult?.interrupted === true, raw.parent_tool_use_id ?? null)
     }
   }
 

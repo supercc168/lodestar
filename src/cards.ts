@@ -93,3 +93,22 @@ export {
   taskBoardElement,
   taskBoardLiveElement,
 } from './cards/task-board'
+export {
+  type BgTaskEntry,
+  type BgTaskStep,
+  type BgTaskType,
+  BG_ELEMENTS,
+  applyBgTaskStarted,
+  applyBgTaskProgress,
+  applyBgTaskUpdated,
+  applyBgTaskSettled,
+  applyBgToolUse,
+  applyBgToolResult,
+  isBgTerminal,
+  hasActiveBgTask,
+  summarizeBackground,
+  backgroundTaskPanel,
+  backgroundLiveCard,
+  backgroundHistoryCard,
+  backgroundMigratedMarker,
+} from './cards/background'
