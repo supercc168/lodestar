@@ -15,36 +15,36 @@
 
 - `CodexProcess` 继续负责 GPT / Codex app-server。
 - `ClaudeAgentProcess` 负责 Claude Agent SDK streaming input。
-- `model` 命令仍展示 Codex app-server 返回的 GPT 模型，同时追加 Claude 后端选项：
-  - `claude:default`：不注入模型 profile，使用本机 Claude Code / OMC 当前配置。
-  - `claude:glm`：通过 env 把 opus / sonnet / haiku 映射为 `5.2` / `5.2` / `4.7`。
-  - `claude:deepseek`：通过 env 把 opus / sonnet / haiku 映射为 `DeepSeekv4pro` / `v4pro` / `v4flash`。
+- `model` 命令展示四个固定档位（现状，见 `src/session-model.ts` 的 `FIXED_MODEL_CHOICES`）：
+  - `claude:fable`（Fable 5）/ `claude:opus`（Opus 4.8）：官方登录档位，直传 `claude-fable-5` / `claude-opus-4-8`，走用户 Anthropic 登录态，绝不注入 API key，effort 锁 max。
+  - `claude:glm`：第三方 API 路由，token 配在 `[claude.models.glm]`，spawn 时注入 `ANTHROPIC_*` env，effort 跟随 config（如 xhigh）；未配 token 时 picker 可见但选择被拦截。
+  - `codex`（GPT-5.5）：Codex app-server 后端。
+  - （早期的 `claude:default` / `claude:deepseek` 已随二元化 / per-model 路由下线。）
 - 持久化模型选择扩展为 provider-aware，旧数据默认视为 Codex。
 - 会话 resume id 也按 provider 分开保存，避免 Claude session id 覆盖 Codex thread id。
 - `[[askusr: ...]]` 是 Codex 专属 host marker；Claude 不消费这个 marker，Claude 需要问用户时走 SDK 自己的 `AskUserQuestion` / `request_user_dialog` 路径。
 
 ## Claude Model Profiles
-内置 profile 位于 `src/claude-models.ts`，也可在 `config.toml` 中覆盖或新增：
+内置档位位于 `src/claude-models.ts`:官方 `fable`(Fable 5)/ `opus`(Opus 4.8)走用户的 Anthropic 登录态、绝不注入 API key;`glm` 是第三方 API 路由,token 在 `config.toml` 的 `[claude.models.glm]` 配置。也可在 `config.toml` 覆盖档位或加新档位:
 
 ```toml
-[claude.models.glm]
-display_name = "Claude Code · GLM"
-opus = "5.2"
-sonnet = "5.2"
-haiku = "4.7"
+# 新群默认档位(可选;不写则默认 fable 登录档位)
+[claude]
+default_model = "glm"
 
-[claude.models.deepseek]
-display_name = "Claude Code · DeepSeek"
-opus = "DeepSeekv4pro"
-sonnet = "v4pro"
-haiku = "v4flash"
+# GLM 第三方路由:base_url + auth_token 只注入该档位,不碰官方登录档位
+[claude.models.glm]
+base_url   = "https://open.bigmodel.cn/api/anthropic"
+auth_token = "<GLM API key>"
+model      = "GLM-5.2[1m]"   # 直连智谱,开放 1M 上下文
+effort     = "xhigh"          # 复刻 GLM-5.2 最高思维;官方登录档位锁 max
 ```
 
-模型路由的真相源是 `~/.claude/settings.json`(SDK 经 `settingSources:['user']` 读取):`ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_DEFAULT_OPUS_MODEL` 等都在那里配。Lodestar 不再注入这些 env,`[claude.env]` 仅作可选 escape hatch。
+模型路由的真相源是 `config.toml` 的 `[claude.models.glm]`(第三方 per-model token 路由):`ClaudeAgentProcess.buildSpawnEnv` 只在 GLM 一类 API 档位 spawn 时注入 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`,官方 Fable 5 / Opus 登录档位保持干净基线(无条件抹掉环境里的 `ANTHROPIC_*`)。`[claude.models.*]` 的字段仅认 `display_name / description / model / base_url / auth_token / api_key / route / effort` —— 早期文档里的 `opus= / sonnet= / haiku=` 已不再解析。**别把 GLM env 写进 `~/.claude/settings.json`**:SDK 经 `settingSources:['user']` 会加载它、污染登录档位;`[claude.env]` 仅作可选 escape hatch。
 
 可执行文件解析:`resolveClaudeExecutableConfig()` 默认自动查找 `claude`(`~/.local/npm-global/bin` → `~/.local/bin` → PATH → SDK 自带)。`config.toml` 设 `[claude].bin`(支持 `~`)可显式覆盖,用于 reclaude 这类参数透传包装器;路径不存在时 `sendInitialize` 直接抛错,不静默回退。日志 `executable=config:<路径>` 确认生效。
 
-主线程 SDK `model` 不直传 `5.2` / `v4pro` 这类上游模型代码,而是传 `opus` 档位 alias,Claude Code 再按 settings.json 的 `ANTHROPIC_DEFAULT_*_MODEL` 路由。实际 smoke 证明直传 `5.2` 会返回 “模型不存在”。
+SDK `model`:官方档位直传 `claude-fable-5` / `claude-opus-4-8`(reclaude 透传 `--model`,走用户登录态);第三方档位直传该 profile 的 `model` 字段声明的上游 id(如 GLM 直连智谱走 `GLM-5.2[1m]`),配套 `[claude.models.glm]` 注入的 `ANTHROPIC_BASE_URL` 打到智谱的 Anthropic 兼容端点。早期走 settings.json `ANTHROPIC_DEFAULT_*_MODEL` alias(直传 `5.2` 会 “模型不存在”)的做法已随 per-model 路由废弃。
 
 ## Claude Event Mapping
 `ClaudeAgentProcess` 把 SDK message 映射为现有 Session 已会处理的事件：

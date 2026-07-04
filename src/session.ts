@@ -375,7 +375,11 @@ export class Session {
     public opts: SessionOpts = {},
   ) {
     Session.all.add(this)
+    // 无持久化选择(全新群 / 从未切过 model)时,采用 config.toml [claude]
+    // default_model 声明的默认档位 —— 让只订阅 GLM 的用户首条消息直接走 GLM,
+    // 不必先手动切一次。未声明时保持 null,走下方 spawn 的硬编码登录默认(Fable 5)。
     const selection = feishu.getSessionModelSelection(sessionName)
+      ?? sessionModel.configuredDefaultSelection()
     this.selectedProvider = selection?.provider ?? 'claude'
     this.selectedModel = selection?.model ?? null
     this.selectedEffort = selection?.effort ?? null

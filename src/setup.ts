@@ -9,18 +9,20 @@
  *   1. 确保 Claude Code CLI 在 PATH (npm i -g @anthropic-ai/claude-code)。
  *      特别提醒: 受 Claude 官方限制, Claude 订阅 (Pro/Max OAuth 登录)
  *      不支持本项目; 必须走 API 方式 —— GLM Coding Plan 或 Anthropic API key。
- *   2. GLM Coding Plan API key (推荐, 可选) —— 给了就自动写入
- *      ~/.claude/settings.json 的 env (1M context + 中文优化); 不给就
- *      沿用本机 Claude Code 现有配置启动。同一歩末尾可选顺带配置 Codex。
+ *   2. GLM Coding Plan API key (推荐, 可选) —— 给了就写进 config.toml 的
+ *      [claude.models.glm] 档位 (model=GLM-5.2[1m] 1M context, effort=xhigh)
+ *      并设为 [claude] default_model; 不给就用 Anthropic 登录态跑
+ *      Fable 5 / Opus。同一歩末尾可选顺带配置 Codex。
  *   3. Feishu 自建应用 —— 打开 https://open.feishu.cn/app, 列出每个
  *      权限 scope + 事件订阅步骤, 粘贴的 app_id / app_secret 先调
  *      tenant_access_token endpoint 验证再收。失败循环重试。
  *   4. projects_root —— 默认 = 用户主目录; 写 config.toml 后 detached
  *      自动拉起 lodestar-daemon, 向导退出后继续跑。
  *
- * GLM 路由的真相源是 ~/.claude/settings.json (SDK 经 settingSources:
- * ['user'] 读取, 见 docs/claude-agent-backend.md), 不走 config.toml 的
- * [claude.env] —— 后者仅作可选 escape hatch。
+ * GLM 路由的真相源是 config.toml 的 [claude.models.glm] (第三方 per-model
+ * token 路由, spawn 时只给 GLM 档位注入 ANTHROPIC_* env; 官方 Fable 5 / Opus
+ * 登录档位保持干净)。旧版把 GLM 写进 ~/.claude/settings.json 的做法已废弃 ——
+ * 那会经 settingSources:['user'] 污染登录档位, 向导会检测残留并提示清理。
  */
 
 import { execSync, spawn } from 'node:child_process'
@@ -122,56 +124,41 @@ async function runCodexLogin(codexBin: string): Promise<boolean> {
   })
 }
 
-// ── Claude Code settings.json (GLM route) ──────────────────────────
+// ── Claude Code settings.json (GLM 路由迁移检测) ────────────────────
 function claudeConfigDir(): string {
   return process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
 }
 
-/** 把 GLM Coding Plan 路由 merge 进 ~/.claude/settings.json 的 env 段。
- *  真相源与 docs/claude-agent-backend.md / glm-usage.ts 一致; 保留用户
- *  已有字段 (permissions / hooks / plugins …), 只覆盖 GLM 相关 env key。
- *  settings.json 存在但 JSON 解析失败时绝不静默覆盖 —— surface 出来。 */
-function writeClaudeGlmEnv(glmKey: string): { path: string } | { error: string } {
+/** GLM 路由现在的真相源是 config.toml 的 [claude.models.glm](见 setup 头注释
+ *  与 docs/claude-agent-backend.md)。旧版本把 GLM env 写进 ~/.claude/settings.json,
+ *  而 SDK 经 settingSources:['user'] 会加载它 —— 那会污染官方登录档位(Fable 5 /
+ *  Opus 被偷偷路由去 GLM,标签失真)。检测残留并提示用户手动清掉;只读,绝不
+ *  改写用户的 settings.json(可能夹带自备 Anthropic API key / 其他配置)。 */
+function warnResidualGlmSettings(): void {
   try {
-    const dir = claudeConfigDir()
-    mkdirSync(dir, { recursive: true })
-    const settingsPath = join(dir, 'settings.json')
-
-    let settings: Record<string, unknown> = {}
-    if (existsSync(settingsPath)) {
-      const raw = readFileSync(settingsPath, 'utf8')
-      try {
-        const parsed = JSON.parse(raw)
-        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
-          return { error: `${settingsPath} 内容不是 JSON 对象, 拒绝覆盖, 请手动检查` }
-        }
-        settings = parsed as Record<string, unknown>
-      } catch {
-        return { error: `${settingsPath} 解析失败 (JSON 语法错), 拒绝覆盖, 请手动修复后重跑` }
-      }
+    const settingsPath = join(claudeConfigDir(), 'settings.json')
+    if (!existsSync(settingsPath)) return
+    let parsed: any
+    try {
+      parsed = JSON.parse(readFileSync(settingsPath, 'utf8'))
+    } catch {
+      return // 解析不了就不打扰
     }
-
-    const prevEnv = (settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env))
-      ? settings.env as Record<string, string>
-      : {}
-    // 与本机验证过的 GLM 配置一致: opus/sonnet → GLM-5.2[1m] (1M context),
-    // haiku → GLM-4.7。ANTHROPIC_AUTH_TOKEN 裸 token, 不带 Bearer。
-    const glmEnv: Record<string, string> = {
-      ANTHROPIC_AUTH_TOKEN: glmKey,
-      ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
-      API_TIMEOUT_MS: '3000000',
-      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
-      ANTHROPIC_DEFAULT_OPUS_MODEL: 'GLM-5.2[1m]',
-      ANTHROPIC_DEFAULT_SONNET_MODEL: 'GLM-5.2[1m]',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'GLM-4.7',
-    }
-    settings.env = { ...prevEnv, ...glmEnv }
-
-    writeFileSync(settingsPath, JSON.stringify(settings, null, 2) + '\n', { mode: 0o600 })
-    return { path: settingsPath }
-  } catch (e: any) {
-    return { error: e?.message ?? String(e) }
-  }
+    const env = (parsed && typeof parsed === 'object' && !Array.isArray(parsed.env)) ? parsed.env : null
+    if (!env || typeof env !== 'object') return
+    const baseUrl = String(env.ANTHROPIC_BASE_URL ?? '')
+    const looksGlm = /bigmodel|z\.ai|glm/i.test(baseUrl) ||
+      /GLM/i.test(String(env.ANTHROPIC_DEFAULT_OPUS_MODEL ?? env.ANTHROPIC_DEFAULT_SONNET_MODEL ?? ''))
+    if (!looksGlm && !baseUrl) return
+    if (!looksGlm) return
+    console.log()
+    console.log(`${C.yellow}⚠ 检测到 ~/.claude/settings.json 里有 GLM 路由 env${C.reset}`)
+    console.log(`  ${C.dim}(${settingsPath})${C.reset}`)
+    console.log(`  新版 GLM 走 config.toml 的 ${C.bold}[claude.models.glm]${C.reset};settings.json 里这些`)
+    console.log(`  会被 Claude Code 经 settingSources 加载,把 ${C.bold}Fable 5 / Opus 登录档位也偷偷路由去 GLM${C.reset}。`)
+    console.log(`  ${C.dim}建议手动删掉 env 里这些 key(自备 Anthropic API key 的除外):${C.reset}`)
+    console.log(`    ${C.dim}ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL${C.reset}`)
+  } catch { /* 检测失败不影响向导 */ }
 }
 
 // ── browser launcher (best-effort, never throws) ───────────────────
@@ -294,24 +281,20 @@ export async function runSetup(): Promise<void> {
   // ── Step 2/4 ──────────────────────────────────────────────────
   step(2, 4, 'GLM Coding Plan (推荐, 可选)')
   console.log('GLM Coding Plan 给 Claude Code 接 GLM-5.2 (开放 1M token 上下文, 中文友好)。')
-  console.log('订阅后在智谱开放平台拿一个 API key, 粘到下面 —— 向导自动写进 ~/.claude/settings.json。')
+  console.log('订阅后在智谱开放平台拿一个 API key, 粘到下面 —— 向导写进 config.toml 的')
+  console.log(`${C.bold}[claude.models.glm]${C.reset} 档位并设为默认; 群里发 model 可在 Fable 5 / Opus / GLM 间切换。`)
   console.log(`  ${C.dim}拿 key: https://open.bigmodel.cn → 控制台 → API Keys${C.reset}`)
-  console.log(`  ${C.dim}不给也行: 以本机 Claude Code 现有配置启动 (确保是 API key 方式, 非订阅)。${C.reset}`)
+  console.log(`  ${C.dim}不给也行: 用 Anthropic 登录态跑 Fable 5 / Opus (确保是 API key 方式, 非订阅 OAuth)。${C.reset}`)
   console.log()
 
   const glmKey = await ask('GLM API key (直接回车跳过)', {})
   if (glmKey) {
-    const r = writeClaudeGlmEnv(glmKey)
-    if ('path' in r) {
-      console.log(`${C.green}✓ GLM 路由已写入${C.reset}: ${C.dim}${r.path}${C.reset}`)
-      console.log(`${C.dim}opus/sonnet → GLM-5.2[1m] (1M ctx), haiku → GLM-4.7${C.reset}`)
-    } else {
-      console.log(`${C.red}✗ 写入失败:${C.reset} ${r.error}`)
-      console.log(`${C.dim}跳过 GLM 配置, 以本机 Claude Code 现有配置启动。${C.reset}`)
-    }
+    console.log(`${C.green}✓ 已记录 GLM key${C.reset} ${C.dim}(稍后写进 config.toml 的 [claude.models.glm]: model=GLM-5.2[1m] · effort=xhigh · 设为默认档位)${C.reset}`)
   } else {
-    console.log(`${C.dim}已跳过 GLM, 以本机 Claude Code 现有配置启动。${C.reset}`)
+    console.log(`${C.dim}已跳过 GLM, 用 Anthropic 登录态跑 Fable 5 / Opus。${C.reset}`)
   }
+  // 旧版本把 GLM 写进 ~/.claude/settings.json;检测残留并提示清理(只读, 不改写)。
+  warnResidualGlmSettings()
 
   // ── Codex (可选第二后端) ──────────────────────────────────────
   console.log()
@@ -442,10 +425,27 @@ export async function runSetup(): Promise<void> {
     `projects_root = "${escapeTomlString(projectsRoot)}"`,
     '',
   ]
-  // Claude / GLM 路由由 ~/.claude/settings.json 管 (向导已写入或沿用你的
-  // 现有配置); Codex 登录态由 codex CLI 管。config.toml 只保存 Feishu 和
-  // Lodestar runtime; 高级用户可手写 [codex.env] / [claude.env] 注入子进程
-  // 环境 (escape hatch, 通常不需要)。
+  // GLM 走 [claude.models.glm] 档位路由(第三方 per-model token),SDK spawn 时
+  // 注入 ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN,且只作用于 GLM 档位 —— 官方
+  // Fable 5 / Opus 登录档位保持干净、绝不注入 key。[claude] default_model 让新群
+  // 首条消息直接走 GLM,不必先手动切一次。model=GLM-5.2[1m] 开放 1M 上下文,
+  // effort=xhigh 复刻 GLM-5.2 最高思维。
+  if (glmKey) {
+    toml.push(
+      '[claude]',
+      'default_model = "glm"',
+      '',
+      '[claude.models.glm]',
+      'base_url = "https://open.bigmodel.cn/api/anthropic"',
+      `auth_token = "${escapeTomlString(glmKey)}"`,
+      'model = "GLM-5.2[1m]"',
+      'effort = "xhigh"',
+      '',
+    )
+  }
+  // 没配 GLM 就用 Anthropic 登录态跑 Fable 5 / Opus(默认档位),Codex 登录态由
+  // codex CLI 管。高级用户可手写 [codex.env] / [claude.env] 注入子进程环境
+  // (escape hatch, 通常不需要);GLM 之外的第三方路由照 [claude.models.<名>] 加。
   writeFileSync(CONFIG_FILE, toml.join('\n'), { mode: 0o600 })
 
   console.log(`\n${C.green}${C.bold}✓ 配置已写入${C.reset}`)

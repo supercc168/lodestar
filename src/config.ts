@@ -45,6 +45,11 @@ export interface LodestarConfig {
     /** 显式指定 SDK spawn 的 Claude Code 可执行文件(如 reclaude 这类
      * 参数透传包装器)。未设置 = 自动查找。 */
     bin?: string
+    /** 新 session(无持久化 model 选择)的默认档位,取 [claude.models.*] /
+     * 内建档位的 key(如 "glm")或固定项 model(如 "claude:glm" / "gpt-5.5")。
+     * 未设置 = 硬编码登录默认 Fable 5。只订阅 GLM 的用户设 "glm" 后,新群首条
+     * 消息直接走 GLM,不必先手动切一次。 */
+    defaultModel?: string
     env: Record<string, string>
     models: Record<string, ClaudeModelConfig>
   }
@@ -220,12 +225,13 @@ function loadConfig(): LodestarConfig {
   const codexEnv = envSection('codex.env')
   const claudeEnv = envSection('claude.env')
   const claudeBin = t.claude?.bin ? expandTilde(t.claude.bin) : undefined
+  const claudeDefaultModel = t.claude?.default_model?.trim() || undefined
   return {
     feishu: { app_id: appId, app_secret: appSecret },
     runtime: { projects_root: projectsRoot },
     notify: { bind: notifyBind, port: notifyPort },
     codex: { env: codexEnv },
-    claude: { bin: claudeBin, env: claudeEnv, models: claudeModelSections() },
+    claude: { bin: claudeBin, defaultModel: claudeDefaultModel, env: claudeEnv, models: claudeModelSections() },
     projects: projectSections(),
   }
 }

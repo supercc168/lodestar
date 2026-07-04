@@ -11,6 +11,7 @@ import {
 } from './agent-process'
 import * as cards from './cards'
 import * as feishu from './feishu'
+import { config } from './config'
 import { claudeModelConfigured, claudeModelEffort, claudeModelIsApiRoute } from './claude-models'
 import { log } from './log'
 import { messageOf, withTimeout, type ModelActionResult } from './session-util'
@@ -101,6 +102,25 @@ export function normalizeFixedModelSelection(
   }
   const choice = hit ?? defaultFixedChoiceFor(provider)
   return { model: choice.model, effort: resolvedEffort(choice) }
+}
+
+/** 新 session(无持久化 model 选择)的默认档位,取自 config.toml 的
+ * [claude] default_model。接受档位 key("glm")或固定项 model("claude:glm" /
+ * "gpt-5.5")。未配置 / 无法识别 → null(调用方回落到硬编码登录默认 Fable 5)。
+ * 返回的档位仍会经 Session 构造器的 normalizeFixedModelSelection —— 未配置
+ * token 的 GLM 会在那里回落到 Fable 5,不会让新群默认就落到打不通的未鉴权
+ * API 路由。让只订阅 GLM 的用户设 default_model="glm" 后首条消息直接走 GLM。 */
+export function configuredDefaultSelection(): {
+  provider: AgentProvider
+  model: string
+  effort: AgentReasoningEffort
+} | null {
+  const raw = config.claude.defaultModel?.trim()
+  if (!raw) return null
+  const wanted = raw.startsWith('claude:') || raw === 'gpt-5.5' ? raw : `claude:${raw}`
+  const hit = FIXED_MODEL_CHOICES.find(c => c.model === wanted)
+  if (!hit) return null
+  return { provider: hit.provider, model: hit.model, effort: resolvedEffort(hit) }
 }
 
 /** 第三方 API 路由(GLM)未配 token 时的描述后缀,提示去 config.toml 设置。 */

@@ -7,7 +7,7 @@ import {
 
 const { Session } = await import('./session')
 const cardkit = await import('./cardkit')
-const { fixedModelChoices, normalizeFixedModelSelection } = await import('./session-model')
+const { fixedModelChoices, normalizeFixedModelSelection, configuredDefaultSelection } = await import('./session-model')
 const { config } = await import('./config')
 
 interface FetchCall {
@@ -334,6 +334,103 @@ describe('Session compact command', () => {
     expect(footerWrites.some(content =>
       content.includes('✅ 上下文已压缩') && content.includes('🧠 2% (5.4K/258K)')
     )).toBe(true)
+  })
+})
+
+describe('configuredDefaultSelection ([claude] default_model)', () => {
+  test('未设 default_model → null(回落硬编码登录默认 Fable 5)', () => {
+    const prev = config.claude.defaultModel
+    ;(config.claude as any).defaultModel = undefined
+    try {
+      expect(configuredDefaultSelection()).toBeNull()
+    } finally {
+      ;(config.claude as any).defaultModel = prev
+    }
+  })
+
+  test('default_model="glm" + 配好 token → 默认档位 claude:glm(effort 跟随 config)', () => {
+    const prevModels = config.claude.models
+    const prevDefault = config.claude.defaultModel
+    ;(config.claude as any).models = {
+      glm: { model: 'glm-5.2', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
+    }
+    ;(config.claude as any).defaultModel = 'glm'
+    try {
+      expect(configuredDefaultSelection()).toEqual({ provider: 'claude', model: 'claude:glm', effort: 'xhigh' })
+    } finally {
+      ;(config.claude as any).models = prevModels
+      ;(config.claude as any).defaultModel = prevDefault
+    }
+  })
+
+  test('接受完整形式 "claude:glm";effort 未配则回落固定 max', () => {
+    const prevModels = config.claude.models
+    const prevDefault = config.claude.defaultModel
+    ;(config.claude as any).models = { glm: { model: 'glm-5.2', base_url: 'https://x', auth_token: 't' } }
+    ;(config.claude as any).defaultModel = 'claude:glm'
+    try {
+      expect(configuredDefaultSelection()).toEqual({ provider: 'claude', model: 'claude:glm', effort: 'max' })
+    } finally {
+      ;(config.claude as any).models = prevModels
+      ;(config.claude as any).defaultModel = prevDefault
+    }
+  })
+
+  test('无法识别的 default_model → null', () => {
+    const prev = config.claude.defaultModel
+    ;(config.claude as any).defaultModel = 'nope'
+    try {
+      expect(configuredDefaultSelection()).toBeNull()
+    } finally {
+      ;(config.claude as any).defaultModel = prev
+    }
+  })
+})
+
+describe('新 session 默认档位来自 [claude] default_model', () => {
+  test('default_model=glm(配好 token)→ 新群首条消息默认走 GLM', () => {
+    const prevModels = config.claude.models
+    const prevDefault = config.claude.defaultModel
+    ;(config.claude as any).models = {
+      glm: { model: 'glm-5.2', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
+    }
+    ;(config.claude as any).defaultModel = 'glm'
+    try {
+      const s = new Session('probe', 'chat_id') as any
+      expect(s.selectedProvider).toBe('claude')
+      expect(s.selectedModel).toBe('claude:glm')
+      expect(s.selectedEffort).toBe('xhigh')
+    } finally {
+      ;(config.claude as any).models = prevModels
+      ;(config.claude as any).defaultModel = prevDefault
+    }
+  })
+
+  test('default_model=glm 但未配 token → 构造器 normalize 回落 Fable 5(不落到打不通的路由)', () => {
+    const prevModels = config.claude.models
+    const prevDefault = config.claude.defaultModel
+    ;(config.claude as any).models = {}
+    ;(config.claude as any).defaultModel = 'glm'
+    try {
+      const s = new Session('probe', 'chat_id') as any
+      expect(s.selectedModel).toBe('claude:fable')
+      expect(s.selectedEffort).toBe('max')
+    } finally {
+      ;(config.claude as any).models = prevModels
+      ;(config.claude as any).defaultModel = prevDefault
+    }
+  })
+
+  test('无 default_model → selectedModel 保持 null(交给 spawn 硬编码登录默认)', () => {
+    const prev = config.claude.defaultModel
+    ;(config.claude as any).defaultModel = undefined
+    try {
+      const s = new Session('probe', 'chat_id') as any
+      expect(s.selectedProvider).toBe('claude')
+      expect(s.selectedModel).toBeNull()
+    } finally {
+      ;(config.claude as any).defaultModel = prev
+    }
   })
 })
 
