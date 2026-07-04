@@ -171,6 +171,27 @@ export class Session {
   private lastMainTaskToolUseId: string | null = null
   /** onUserMessage 沉降旧卡后置位;主卡落地后据此重建后台卡(游标重回末尾)。 */
   private pendingRebuildBackgroundCard = false
+  /** turn 收尾后有后台任务结算 → SDK 会自发开一轮恢复轮(task_notification
+   *  合并结果),该轮 init 没有伴随用户消息。置位后,下一个无用户批次的 init
+   *  据此开 bg_task_resume 卡承接输出;任何 turn 开卡即消费(结算通知会被
+   *  并入那一轮),避免陈旧标记把无关的空 init 误判成恢复轮。 */
+  private bgResumePending = false
+  /** 无 currentTurn 时到达的 assistant 正文(恢复轮开卡前的窗口期 / 开卡
+   *  失败)。openTurnCard 落地时并入新卡;result/exit 时纯文本兜底推送。
+   *  决不静默丢弃(2026-07-04 etmmo 终报告事故:恢复轮 6.6KB 合并终报告
+   *  整轮无卡,appendAssistant 首行 return 全部丢光,飞书无痕)。
+   *  只在"合法无卡窗口"缓冲(openingTurn 正在开卡 / bgResumeCardless 恢复轮
+   *  开卡失败续窗);其余无卡场景(被打断的轮尾、kill 窗口残字)一律丢弃,
+   *  否则会被错误推送或并入下一张不相干的卡。 */
+  private orphanAssistantSegments: string[] = []
+  private orphanAssistantCurrent = ''
+  /** 恢复轮 openTurnCard 失败后置位:该轮此后再无卡,正文继续进孤儿缓冲直到
+   *  result 纯文本兜底。区别于 openingTurn(仅开卡 await 窗口)。 */
+  private bgResumeCardless = false
+  /** result 抢在 openTurnCard 的 sendCard/id_convert await 窗口内到达 →
+   *  置位;开卡 IIFE 落地后据此立即收尾,避免卡片永远悬挂、session 卡在
+   *  working(旧代码对 user turn 也有此隐患,这里一并收口)。 */
+  private sawResultWhileOpening = false
   pendingPermissions = new Map<string, { toolUseId: string; permissionSuggestions?: unknown }>()
   /** Open AskUserQuestion tool calls — keyed by tool_use_id. Codex and
    * Claude both route AskUserQuestion through the can_use_tool flow;
@@ -502,6 +523,11 @@ export class Session {
     log(`session "${this.sessionName}": stop idle ${proc.provider} process after switching to ${this.selectedProvider}`)
     this.proc = null
     this.initCount = 0
+    // 进程换掉:恢复轮标记 / 孤儿缓冲随旧进程作废,否则会泄漏到新进程的
+    // boot init,把一次干净启动误判成 bg_task_resume 轮开出幽灵卡。
+    this.bgResumePending = false
+    this.sawResultWhileOpening = false
+    this.discardOrphanAssistant()
     this.currentTurnUsageBaseline = null
     this.currentTurnUsageBaselineKnown = false
     this.usageTotalsSeedUnknown = false
@@ -517,6 +543,9 @@ export class Session {
     log(`session "${this.sessionName}": stop idle ${proc.provider} process: ${reason}`)
     this.proc = null
     this.initCount = 0
+    this.bgResumePending = false
+    this.sawResultWhileOpening = false
+    this.discardOrphanAssistant()
     this.currentTurnUsageBaseline = null
     this.currentTurnUsageBaselineKnown = false
     this.usageTotalsSeedUnknown = false
@@ -888,6 +917,10 @@ export class Session {
     this.releaseAllReactions()
     this.initCount = 0
     this.openingTurn = false
+    this.bgResumePending = false
+    this.sawResultWhileOpening = false
+    // 用户主动停止:孤儿缓冲随轮作废,不兜底推送。
+    this.discardOrphanAssistant()
     this.pendingAsks.clear()
     this.pendingHostAsks.clear()
     this.pendingPermissions.clear()
@@ -918,10 +951,18 @@ export class Session {
     const closeInternalStatusCard = async (finalStatus: string): Promise<void> => {
       if (statusCard) await this.closeStatusCard(statusCard, finalStatus)
     }
+    // 主动重启:孤儿缓冲随轮作废,不兜底推送。必须在 kill 之前丢弃 ——
+    // 否则 kill 触发的 exit 处理器会抢先把缓冲当作"进程崩溃残留"兜底推出去,
+    // 违背 restart 的作废语义。null this.proc 也放到 kill 之前,让 exit 走
+    // stale-proc 早退,不再重复兜底(与 stop() 同一模式)。
+    this.bgResumePending = false
+    this.sawResultWhileOpening = false
+    this.discardOrphanAssistant()
     if (this.proc) {
       report?.(`🛑 停止当前 ${this.backendLabel(this.proc.provider)}`)
-      await this.proc.kill()
+      const proc = this.proc
       this.proc = null
+      await proc.kill()
     }
     this.stopFooterStatus(this.currentTurn)
     this.currentTurn = null
@@ -933,6 +974,7 @@ export class Session {
     this.releaseAllReactions()
     this.initCount = 0
     this.openingTurn = false
+    // bgResumePending / 孤儿缓冲已在 kill 前作废(见上)。
     this.pendingAsks.clear()
     this.pendingHostAsks.clear()
     this.pendingPermissions.clear()
@@ -1647,7 +1689,14 @@ export class Session {
       // the openingTurn guard catches the eager-open vs init race.
       if (this.currentTurn || this.openingTurn) return
       const isUserBatch = this.pendingUserMessageCount > 0
-      if (!isUserBatch) return
+      // SDK 自发恢复轮:后台任务结算通知唤醒 SDK 合并结果,init 没有伴随
+      // 用户消息。必须照样开卡,否则这一轮的全部正文会被 appendAssistant
+      // 静默丢弃(2026-07-04 etmmo 终报告事故)。bgResumePending 只在
+      // bg_task_settled 落在无活跃 turn 时置位,保证 probe/模型切换等
+      // 无关的空 init 不受影响。
+      const isBgResume = !isUserBatch && this.bgResumePending
+      if (!isUserBatch && !isBgResume) return
+      this.bgResumePending = false
       const userOpenId = this.lastUserOpenId
       if (isUserBatch) {
         this.pendingUserMessageCount = 0
@@ -1658,19 +1707,43 @@ export class Session {
         this.pendingReactionIds = new Map()
       }
       this.openingTurn = true
+      this.sawResultWhileOpening = false // 本次开卡的竞态标记,落地时判定
       void (async () => {
         try {
-          await this.openTurnCard(userOpenId, 'user_message')
+          await this.openTurnCard(userOpenId, isUserBatch ? 'user_message' : 'bg_task_resume')
           if (!this.currentTurn) {
-            // SDK already started this turn (its `init` is what got us
-            // here) but we have no card to render into. Interrupt so
-            // assistant/tool events aren't silently dropped while the
-            // model burns tokens. Release the reactions this batch
-            // inherited (init handler moved them above) — otherwise
-            // they stay ⏳ forever on the user's chat messages.
-            log(`session "${this.sessionName}": init-path openTurnCard failed — sendInterrupt + release reactions`)
-            this.proc?.sendInterrupt()
-            this.releaseAllReactions()
+            if (isUserBatch) {
+              // SDK already started this turn (its `init` is what got us
+              // here) but we have no card to render into. Interrupt so
+              // assistant/tool events aren't silently dropped while the
+              // model burns tokens. Release the reactions this batch
+              // inherited (init handler moved them above) — otherwise
+              // they stay ⏳ forever on the user's chat messages.
+              log(`session "${this.sessionName}": init-path openTurnCard failed — sendInterrupt + release reactions`)
+              this.proc?.sendInterrupt()
+              this.releaseAllReactions()
+            } else {
+              // 恢复轮开卡失败不打断 —— 打断会把正在合并的后台结果整轮
+              // 作废。cardless 续窗:此后正文继续进孤儿缓冲。若 result 已在
+              // 开卡窗口内到达(不会再有第二次),这里立即兜底,否则由
+              // result 处理器 flush。
+              this.bgResumeCardless = true
+              if (this.sawResultWhileOpening) {
+                this.sawResultWhileOpening = false
+                log(`session "${this.sessionName}": bg-resume openTurnCard failed, result already arrived — flushing orphan now`)
+                this.flushOrphanAssistantToChat('bg-resume open failed, result already arrived')
+              } else {
+                log(`session "${this.sessionName}": bg-resume openTurnCard failed — orphan text flush will cover the output`)
+              }
+            }
+          } else if (this.sawResultWhileOpening) {
+            // 卡片开成了,但这一轮的 result 已在开卡 await 窗口内到达 ——
+            // result 处理器当时 currentTurn 还是 null,closeTurnCard 空转了。
+            // 这里补一次收尾,否则卡片 footer 永远计时、session 卡在 working。
+            this.sawResultWhileOpening = false
+            log(`session "${this.sessionName}": result raced card-open — closing freshly-opened turn card now`)
+            await this.closeTurnCard(undefined, { hasFreshResult: true })
+            this.status = 'idle'
           } else {
             this.status = 'working'
           }
@@ -1749,17 +1822,27 @@ export class Session {
     p.on('result', () => {
       this.persistResumableSessionId()
       this.accumulateResultStats()
+      // result 抢在 openTurnCard 的 await 窗口内到达:标记给开卡 IIFE,
+      // 它落地后据此立即收尾(否则卡片悬挂、session 卡在 working)。
+      if (this.openingTurn) this.sawResultWhileOpening = true
       // User just hit `stop` — this result is the SDK closing the in-flight
       // turn after sendInterrupt landed. The card already shows `🛑 打断`
-      // from the stop path, so skip the rest unconditionally.
+      // from the stop path, so skip the rest unconditionally. 被取消轮次的
+      // post-interrupt 尾巴随之作废,不兜底推送。
       if (this.userInterrupted) {
         this.userInterrupted = false
+        this.discardOrphanAssistant()
+        this.bgResumePending = false
         const subtype = this.proc?.lastResult.subtype ?? 'unknown'
         const isError = this.proc?.lastResult.is_error === true
         log(`session "${this.sessionName}": SDK result after user stop subtype=${subtype} isError=${isError} — ignored`)
         this.status = 'idle'
         return
       }
+      // 整轮无卡且不在开卡中(恢复轮开卡失败):孤儿正文纯文本兜底。开卡
+      // 窗口内(openingTurn)不 flush —— 让 openTurnCard 把缓冲并入卡片,
+      // 避免又推一遍。有卡的轮次已在开卡时并入,这里 flush 为 no-op。
+      if (!this.currentTurn && !this.openingTurn) this.flushOrphanAssistantToChat('result with no turn card')
       const hasMidTurn = this.pendingMidTurnMsgs.length > 0
       const isError = this.proc?.lastResult.is_error === true
       const subtype = this.proc?.lastResult.subtype ?? 'success'
@@ -1805,6 +1888,11 @@ export class Session {
       log(`session "${this.sessionName}": bg_task_settled task=${e.task_id} status=${e.status}`)
       this.backgroundTasks = cards.applyBgTaskSettled(this.backgroundTasks, e)
       this.onBackgroundTaskChanged()
+      // turn 已收尾后才结算的任务:SDK 会自发开一轮恢复轮合并结果,
+      // 标记给下一个无用户批次的 init 开卡。
+      if (!this.currentTurn && !this.openingTurn && this.initCount >= 1) {
+        this.bgResumePending = true
+      }
     })
     p.on('exit', ({ code, signal, expected }: any) => {
       log(`session "${this.sessionName}": ${p.provider} exited code=${code} signal=${signal} expected=${expected}`)
@@ -1813,6 +1901,13 @@ export class Session {
         return
       }
       this.proc = null
+      // 进程死了,残留的孤儿正文再不兜底就永远丢了(非用户主动停止的崩溃
+      // 路径;stop/restart 已在 kill 前 null 掉 this.proc,走上面的 stale
+      // 早退不到这里)。
+      this.flushOrphanAssistantToChat('process exit')
+      this.bgResumePending = false
+      this.bgResumeCardless = false
+      this.sawResultWhileOpening = false
       this.stopFooterStatus(this.currentTurn)
       this.currentTurn = null
       this.clearMultiMsgBuffer('process exit')
@@ -1949,9 +2044,12 @@ export class Session {
 
   private async openTurnCard(
     userOpenId: string,
-    trigger: 'user_message',
+    trigger: TurnState['trigger'],
     opts: { initialFooter?: string; startThinking?: boolean; directStart?: boolean } = {},
   ): Promise<void> {
+    // 任何 turn 开卡都消费掉 pending 的恢复轮标记 —— 若用户消息抢在恢复轮
+    // init 前开了卡,SDK 会把结算通知并入该轮,标记留着只会误伤后续空 init。
+    this.bgResumePending = false
     // ── 后台游标卡迁移 ── 发新主卡前,先把旧后台卡沉降(终态墓碑/固定标识),
     // 主卡落地后(currentTurn 赋值处)重建后台卡重回末尾。迁移失败不阻塞主卡。
     if (this.backgroundCard && cards.hasActiveBgTask(this.backgroundTasks)) {
@@ -1991,10 +2089,14 @@ export class Session {
       // know to resend instead of waiting for a reply that won't come.
       // Use raw fetch (not sendText) because if the SDK is the broken
       // thing we'd be doomed to silence otherwise.
-      await feishu.sendTextRaw(
-        this.chatId,
-        '❌ 创建对话卡片失败 (Feishu SDK 重试 3 次后仍连不上)。你这条消息没能送到 Codex,请稍后重发。',
-      )
+      // bg-resume 轮没有"用户这条消息",提示重发只会误导;其输出会走
+      // 孤儿缓冲纯文本兜底,这里不必告警。
+      if (trigger === 'user_message') {
+        await feishu.sendTextRaw(
+          this.chatId,
+          '❌ 创建对话卡片失败 (Feishu SDK 重试 3 次后仍连不上)。你这条消息没能送到 Codex,请稍后重发。',
+        )
+      }
       // currentTurn left null as the failure signal. Caller decides
       // whether to sendInterrupt: onUserMessage's eager-open path
       // hasn't fed SDK yet so doesn't need to; the init handler has
@@ -2006,8 +2108,9 @@ export class Session {
     catch (e) { log(`session "${this.sessionName}": id_convert failed: ${e}`); return }
     // Tell cardkit how many elements the initial body already has so
     // its element-count tracker is correct from the first addElement
-    // onwards (userInputPanel + footer).
+    // onwards (bg-resume banner + userInputPanel + footer).
     const initialElementCount =
+      (trigger === 'bg_task_resume' ? 1 : 0) +
       (userInputs.length > 0 ? 1 : 0) +
       1
     cardkit.recordCardCreated(cardId, initialElementCount, (code) => this.onCardWriteFailure(code))
@@ -2048,6 +2151,13 @@ export class Session {
     }
     this.currentTurn = turnState
     if (opts.startThinking !== false) this.startThinkingFooter(turnState)
+    // 开卡 await 窗口期(sendCard/id_convert)先到的 assistant 正文攒在
+    // 孤儿缓冲里,现在有卡了,作为首段并入 —— 后续 delta 接着正常追加。
+    const orphan = this.takeOrphanAssistantText()
+    if (orphan) {
+      this.appendAssistant(orphan)
+      this.finalizeCurrentAssistantSegment()
+    }
     // 主卡落地 → 若刚迁移过旧后台卡且仍有活跃任务,重建后台卡重回末尾。
     if (this.pendingRebuildBackgroundCard) {
       this.pendingRebuildBackgroundCard = false
@@ -2426,7 +2536,14 @@ export class Session {
   }
 
   private appendAssistant(delta: string): void {
-    if (!this.currentTurn) return
+    if (!this.currentTurn) {
+      // 只在合法无卡窗口缓冲:正在开卡(openingTurn),或恢复轮开卡失败后
+      // 的续窗(bgResumeCardless)。其余无卡场景(被打断的轮尾、进程 kill
+      // 窗口的残字、轮间游离 delta)一律丢弃 —— 缓冲下来只会被错误推送或
+      // 并入下一张不相干的卡(旧代码此处直接 return 丢弃,行为一致)。
+      if (this.openingTurn || this.bgResumeCardless) this.orphanAssistantCurrent += delta
+      return
+    }
     const turn = this.currentTurn
     // 第一条 assistant text_delta 到达 → footer 切到 Writing 计时。
     // 正文自身只进入内存缓冲,等 agentMessage completed 后一次性插入卡片。
@@ -2462,6 +2579,33 @@ export class Session {
     cardkit.patchSummaryThrottled(turn.cardId, tail)
   }
 
+  /** 取走并清空孤儿 assistant 缓冲(定稿段 + 未定稿尾段,空行分隔)。 */
+  private takeOrphanAssistantText(): string {
+    const parts = [...this.orphanAssistantSegments]
+    if (this.orphanAssistantCurrent.trim()) parts.push(this.orphanAssistantCurrent)
+    this.orphanAssistantSegments = []
+    this.orphanAssistantCurrent = ''
+    return parts.join('\n\n').trim()
+  }
+
+  /** 丢弃孤儿缓冲并复位 cardless 续窗标记 —— 用户主动作废(打断/停止/重启)
+   *  或进程被替换时调用,内容随轮作废不兜底。 */
+  private discardOrphanAssistant(): void {
+    this.orphanAssistantSegments = []
+    this.orphanAssistantCurrent = ''
+    this.bgResumeCardless = false
+  }
+
+  /** 无卡兜底:孤儿正文以纯文本消息推进聊天 —— 宁可丢排版,不可丢内容。 */
+  private flushOrphanAssistantToChat(reason: string): void {
+    const text = this.takeOrphanAssistantText()
+    if (!text) return
+    const display = this.cleanAssistantTextForDisplay(text).trim()
+    if (!display) return
+    log(`session "${this.sessionName}": flushing ${display.length} chars of orphan assistant text (${reason})`)
+    void feishu.sendText(this.chatId, `📄 后台轮输出(未能建卡,纯文本兜底):\n\n${display}`)
+  }
+
   private completedAssistantElement(segId: string, text: string): object {
     return {
       tag: 'markdown',
@@ -2482,7 +2626,12 @@ export class Session {
    * 一次性插入静态 markdown,然后清空段游标。 */
   finalizeCurrentAssistantSegment(): void {
     const turn = this.currentTurn
-    if (!turn) return
+    if (!turn) {
+      // 无卡窗口的段边界:当前孤儿段定稿进列表,flush 时段间以空行分隔。
+      if (this.orphanAssistantCurrent.trim()) this.orphanAssistantSegments.push(this.orphanAssistantCurrent)
+      this.orphanAssistantCurrent = ''
+      return
+    }
     // 正在切卡:别动当前段 —— rotate 会在 swap 时读 currentAssistantText carry
     // 到新卡续写。这里若定稿/reset,过渡窗口里的当前段文字会被清空、carry 落空
     // (跟 appendAssistant onFailure 在 rotating 期间不 reset 同一个道理)。代价是

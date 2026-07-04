@@ -15,8 +15,11 @@ export interface TurnState {
    * urgent_app push so only the initiator gets pinged (in case there
    * are other members in the group). Empty string → skip the ping. */
   userOpenId: string
-  /** What kicked off this turn. Kept explicit for turn lifecycle logic. */
-  trigger: 'user_message'
+  /** What kicked off this turn. Kept explicit for turn lifecycle logic.
+   *   'user_message'   — 用户消息批次
+   *   'bg_task_resume' — 后台任务结算后 SDK 自发的恢复轮(无用户消息;
+   *                      不开卡的话整轮正文会被丢弃) */
+  trigger: 'user_message' | 'bg_task_resume'
   toolCount: number
   /** `output` / `isError` are filled in by completeTool and kept so
    * card rotation can rebuild unfinished or failed tool panels. */
