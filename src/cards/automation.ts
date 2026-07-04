@@ -11,6 +11,8 @@
  * src/tasklist-cards.ts。本文件不 import feishu/cardkit/tasklist。
  */
 
+import { fmtElapsed } from './format'
+
 export type AutomationRunKind =
   | 'codex-plan' | 'agy-plan' | 'codex-execute' | 'agy-review' | 'codex-merge'
 
@@ -129,4 +131,80 @@ export function burstMarkScan(
 
 export function hasRunningRun(burst: AutomationBurst): boolean {
   return burst.runs.some(r => r.status === 'running')
+}
+
+// ── 渲染(纯) ─────────────────────────────────────────────────────────
+
+const KIND_ICON: Record<AutomationRunKind, string> = {
+  'codex-plan': '📝', 'agy-plan': '📝', 'codex-execute': '🛠️', 'agy-review': '🔍', 'codex-merge': '🔀',
+}
+
+const KIND_LABEL: Record<AutomationRunKind, string> = {
+  'codex-plan': 'Codex规划', 'agy-plan': 'agy规划', 'codex-execute': 'Codex执行',
+  'agy-review': 'agy审核', 'codex-merge': 'Codex合并',
+}
+
+export function memberLabel(kind: AutomationRunKind): string {
+  return KIND_LABEL[kind]
+}
+
+function terminalElapsed(run: AutomationRunView): number {
+  if (run.endTime && run.endTime > run.startedAt) return run.endTime - run.startedAt
+  return 0
+}
+
+/** 标题里的状态+时长标签(折叠时常驻可见)。 */
+export function statusLabel(run: AutomationRunView, now: number): string {
+  switch (run.status) {
+    case 'running': return `🟡 运行中 ${fmtElapsed(now - run.startedAt)}`
+    case 'completed': return `✅ 用时 ${fmtElapsed(terminalElapsed(run))}`
+    case 'failed': return `❌ 失败 ${fmtElapsed(terminalElapsed(run))}`
+  }
+}
+
+/** 聊天列表预览(config.summary)用:N 进行中(· M 已结束)。 */
+export function summarizeAutomation(runs: AutomationRunView[]): string {
+  const running = runs.filter(r => r.status === 'running').length
+  const done = runs.length - running
+  if (running > 0) return `${running} 进行中${done ? ` · ${done} 已结束` : ''}`
+  return done ? `${done} 已结束` : '空'
+}
+
+/** 详情 body:error 一行 + stdout tail;都空显 (暂无输出)。 */
+function renderBody(run: AutomationRunView): string {
+  const lines: string[] = []
+  if (run.error) lines.push(`⚠ ${run.error}`)
+  const tail = run.stdoutTail.trim()
+  if (tail) lines.push(tail)
+  return lines.length ? lines.join('\n') : '_(暂无输出)_'
+}
+
+/** 单运行的整 panel —— 标题「图标 成员 · 任务 — 状态·时长」,展开看 body。 */
+export function automationRunPanel(run: AutomationRunView, now: number = Date.now()): object {
+  return {
+    tag: 'collapsible_panel',
+    element_id: AUTO_ELEMENTS.panel(run.runId),
+    header: { title: { tag: 'plain_text', content: `${KIND_ICON[run.kind]} ${memberLabel(run.kind)} · ${run.taskSummary} — ${statusLabel(run, now)}` } },
+    expanded: false,
+    elements: [{ tag: 'markdown', element_id: AUTO_ELEMENTS.body(run.runId), content: renderBody(run) }],
+  }
+}
+
+/** 活卡整张 JSON —— 首个成员运行到来时 sendCard 用,streaming 开。 */
+export function automationLiveCard(projectName: string, runs: AutomationRunView[], now: number = Date.now()): object {
+  return {
+    schema: '2.0',
+    config: { streaming_mode: true, summary: { content: `🧭 ${projectName} 自动化 · ${summarizeAutomation(runs)}` } },
+    body: { elements: runs.map(r => automationRunPanel(r, now)) },
+  }
+}
+
+/** 历史沉降卡 —— 波次全空闲后 updateCard 成这个,只渲染终态 run,streaming 关。 */
+export function automationHistoryCard(projectName: string, runs: AutomationRunView[], now: number = Date.now()): object {
+  const terminal = runs.filter(r => r.status !== 'running')
+  return {
+    schema: '2.0',
+    config: { streaming_mode: false, summary: { content: `🧭 ${projectName} 自动化(历史) · ${terminal.length} 已结束` } },
+    body: { elements: terminal.map(r => automationRunPanel(r, now)) },
+  }
 }

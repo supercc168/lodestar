@@ -111,3 +111,100 @@ describe('hasRunningRun', () => {
     expect(hasRunningRun(b)).toBe(false)
   })
 })
+
+import {
+  memberLabel,
+  statusLabel,
+  summarizeAutomation,
+  automationRunPanel,
+  automationLiveCard,
+  automationHistoryCard,
+  AUTO_ELEMENTS,
+  type AutomationRunView,
+} from './automation'
+
+const run = (over: Partial<AutomationRunView> & Pick<AutomationRunView, 'runId' | 'kind' | 'status'>): AutomationRunView => ({
+  taskSummary: '任务', startedAt: 0, stdoutTail: '', ...over,
+})
+
+describe('memberLabel / statusLabel', () => {
+  test('kind → 中文成员名', () => {
+    expect(memberLabel('codex-execute')).toBe('Codex执行')
+    expect(memberLabel('agy-review')).toBe('agy审核')
+    expect(memberLabel('codex-merge')).toBe('Codex合并')
+  })
+
+  test('running 显示已运行时长', () => {
+    expect(statusLabel(run({ runId: 'r', kind: 'codex-execute', status: 'running', startedAt: 0 }), 193000))
+      .toBe('🟡 运行中 3m13s')
+  })
+
+  test('completed 显示用时(endTime-startedAt)', () => {
+    expect(statusLabel(run({ runId: 'r', kind: 'agy-plan', status: 'completed', startedAt: 1000, endTime: 49000 }), 999999))
+      .toBe('✅ 用时 48s')
+  })
+
+  test('failed 显示失败时长', () => {
+    expect(statusLabel(run({ runId: 'r', kind: 'agy-review', status: 'failed', startedAt: 0, endTime: 65000 }), 0))
+      .toBe('❌ 失败 1m5s')
+  })
+})
+
+describe('summarizeAutomation', () => {
+  test('N 进行中 · M 已结束', () => {
+    const runs = [
+      run({ runId: 'a', kind: 'codex-execute', status: 'running' }),
+      run({ runId: 'b', kind: 'agy-plan', status: 'completed' }),
+      run({ runId: 'c', kind: 'codex-plan', status: 'failed' }),
+    ]
+    expect(summarizeAutomation(runs)).toBe('1 进行中 · 2 已结束')
+  })
+
+  test('全终态只显示已结束', () => {
+    expect(summarizeAutomation([run({ runId: 'b', kind: 'agy-plan', status: 'completed' })])).toBe('1 已结束')
+  })
+
+  test('空', () => {
+    expect(summarizeAutomation([])).toBe('空')
+  })
+})
+
+describe('automationRunPanel', () => {
+  test('panel 结构:element_id + 标题含成员/任务/状态,body 有 tail', () => {
+    const p = automationRunPanel(run({ runId: 'r1', kind: 'codex-execute', status: 'running', taskSummary: '修登录bug', startedAt: 0, stdoutTail: 'building...' }), 12000) as any
+    expect(p.tag).toBe('collapsible_panel')
+    expect(p.element_id).toBe(AUTO_ELEMENTS.panel('r1'))
+    expect(p.header.title.content).toBe('🛠️ Codex执行 · 修登录bug — 🟡 运行中 12s')
+    expect(p.elements[0].element_id).toBe(AUTO_ELEMENTS.body('r1'))
+    expect(p.elements[0].content).toBe('building...')
+  })
+
+  test('无输出 body 显 (暂无输出);有 error 首行 ⚠', () => {
+    const p1 = automationRunPanel(run({ runId: 'r1', kind: 'agy-plan', status: 'running' })) as any
+    expect(p1.elements[0].content).toBe('_(暂无输出)_')
+    const p2 = automationRunPanel(run({ runId: 'r2', kind: 'agy-plan', status: 'failed', error: 'boom' })) as any
+    expect(p2.elements[0].content).toBe('⚠ boom')
+  })
+})
+
+describe('automationLiveCard / automationHistoryCard', () => {
+  test('live:streaming 开,summary 带项目名,body 每 run 一个 panel', () => {
+    const runs = [run({ runId: 'a', kind: 'codex-execute', status: 'running' })]
+    const c = automationLiveCard('etmmo', runs, 0) as any
+    expect(c.schema).toBe('2.0')
+    expect(c.config.streaming_mode).toBe(true)
+    expect(c.config.summary.content).toBe('🧭 etmmo 自动化 · 1 进行中')
+    expect(c.body.elements).toHaveLength(1)
+  })
+
+  test('history:streaming 关,只渲染终态 run', () => {
+    const runs = [
+      run({ runId: 'a', kind: 'codex-execute', status: 'running' }),
+      run({ runId: 'b', kind: 'agy-plan', status: 'completed' }),
+    ]
+    const c = automationHistoryCard('etmmo', runs, 0) as any
+    expect(c.config.streaming_mode).toBe(false)
+    expect(c.config.summary.content).toBe('🧭 etmmo 自动化(历史) · 1 已结束')
+    expect(c.body.elements).toHaveLength(1) // running 的被过滤
+  })
+})

@@ -114,3 +114,23 @@ export {
   backgroundHistoryCard,
   backgroundMigratedMarker,
 } from './cards/background'
+export {
+  type AutomationRunKind,
+  type AutomationRunStatus,
+  type AutomationRunView,
+  type AutomationBurst,
+  AUTO_ELEMENTS,
+  isCardedKind,
+  emptyBurst,
+  burstAddRun,
+  burstUpdateStdout,
+  burstSettleRun,
+  burstMarkScan,
+  hasRunningRun,
+  memberLabel,
+  statusLabel,
+  summarizeAutomation,
+  automationRunPanel,
+  automationLiveCard,
+  automationHistoryCard,
+} from './cards/automation'
