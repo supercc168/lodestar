@@ -2074,6 +2074,7 @@ export class Session {
       footerStatusLabel: null,
       rotating: null,
       rotateCount: 0,
+      failureRotateCount: 0,
       rotateGivenUp: false,
       outboundSeenPaths: new Set(),
       outboundSentPaths: new Set(),
@@ -2122,16 +2123,21 @@ export class Session {
     const turn = this.currentTurn
     if (!turn) return
     if (turn.rotating) return
-    if (turn.rotateCount >= MAX_MIDTURN_ROTATES) {
-      if (!turn.rotateGivenUp) {
-        turn.rotateGivenUp = true
-        log(`session "${this.sessionName}": rotate cap (${MAX_MIDTURN_ROTATES}) hit — giving up, rest of turn is log-only`)
-        void feishu.sendTextRaw(this.chatId, `⚠️ 卡片连续 ${MAX_MIDTURN_ROTATES} 次写入失败(疑似飞书故障或内容超限),本轮后续输出仅日志可见。`)
-      }
+    if (turn.rotateGivenUp) return
+    if (turn.failureRotateCount >= MAX_MIDTURN_ROTATES) {
+      turn.rotateGivenUp = true
+      // log-only 要名副其实:停掉每秒 footer 计时器,并把当前卡整卡标记
+      // 拒写,否则 ticker + stream handler 会对着死卡刷到 turn 结束
+      // (2026-07-04:11 分钟 663 条 300308)。
+      this.stopFooterStatus(turn)
+      cardkit.markCardWriteDead(turn.cardId)
+      log(`session "${this.sessionName}": failure-rotate cap (${MAX_MIDTURN_ROTATES}) hit — giving up, rest of turn is log-only`)
+      void feishu.sendTextRaw(this.chatId, `⚠️ 卡片写入失败已触发 ${MAX_MIDTURN_ROTATES} 次换卡仍未恢复(疑似飞书故障或元素超限),本轮后续输出仅日志可见。`)
       return
     }
     const why = cardkit.isElementLimitCode(code) ? `element limit (${code})` : `write failure (code=${code ?? 'n/a'})`
     log(`session "${this.sessionName}": ${why} on card=${turn.cardId.slice(0, 8)}… — rotating to fresh card`)
+    turn.failureRotateCount++
     this.startMidTurnRotate(turn)
   }
 
@@ -2569,6 +2575,9 @@ export class Session {
    * element and uses replaceElement so status updates appear immediately
    * instead of invoking Feishu's typewriter. */
   private startFooterStatus(turn: TurnState, status: string): void {
+    // log-only 之后 phase 切换(Thinking/Writing/Working)不许把每秒
+    // ticker 重新拉起来 —— 卡已标记拒写,计时纯属空转。
+    if (turn.rotateGivenUp) return
     if (turn.footerStatusHandle && turn.footerStatusLabel === status) return
     this.stopFooterStatus(turn)
     turn.footerStatusLabel = status

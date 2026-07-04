@@ -1,8 +1,8 @@
-import { mkdtempSync, readdirSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, readdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { describe, expect, test } from 'bun:test'
-import { localDayKey, logFileForDate, parseLogFileDate, pruneOldLogs } from './log'
+import { fileLoggingEnabled, localDayKey, log, logFileForDate, parseLogFileDate, pruneOldLogs } from './log'
 
 describe('log day key', () => {
   test('localDayKey formats local date as YYYY-MM-DD', () => {
@@ -84,5 +84,28 @@ describe('pruneOldLogs', () => {
     touch(dir, 'daemon-2026-06-17.log') // 8 天前
     touch(dir, 'daemon-2026-06-18.log') // 7 天前
     expect(pruneOldLogs(dir, now)).toBe(2)
+  })
+})
+
+describe('test-env file logging guard', () => {
+  // 跑测试会把 log() 输出写进生产 daemon-*.log(07-02 的 session "probe"
+  // "Claude auth failed" 全是历史测试污染)。bun test 固定设 NODE_ENV=test,
+  // 以此为闸:测试进程只打 stderr,不落盘、不迁移、不清理。
+  test('fileLoggingEnabled gates on NODE_ENV=test', () => {
+    expect(fileLoggingEnabled('test')).toBe(false)
+    expect(fileLoggingEnabled('production')).toBe(true)
+    expect(fileLoggingEnabled('development')).toBe(true)
+    // 显式 undefined 走默认参数(取本进程 env),等价于无参调用;
+    // 本进程就是 bun test,必须已处于禁用态
+    expect(fileLoggingEnabled(undefined)).toBe(false)
+    expect(fileLoggingEnabled()).toBe(false)
+  })
+
+  test('log() under bun test writes stderr only — marker never lands in the real day file', () => {
+    const marker = `log-test-marker-${process.pid}-${Date.now()}`
+    log(marker)
+    const todayFile = logFileForDate(new Date())
+    const content = existsSync(todayFile) ? readFileSync(todayFile, 'utf8') : ''
+    expect(content).not.toContain(marker)
   })
 })

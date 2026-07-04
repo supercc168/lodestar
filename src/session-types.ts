@@ -93,15 +93,21 @@ export interface TurnState {
    * don't all queue duplicate rotation attempts. null means "no rotation
    * in flight". */
   rotating: Promise<void> | null
-  /** How many times this turn has rotated to a fresh card. The cap
-   * (MAX_MIDTURN_ROTATES) is enforced ONLY on the reactive failure path
-   * (onCardWriteFailure) — that's the only one that can run away (Feishu
-   * outage, or a poisoned element that fails on every card). The proactive
-   * path (maybeMidTurnRotate) bumps this too but isn't capped: it needs ~50
-   * genuinely-successful elements per card to fire again, so it's naturally
-   * throttled by real output, not by failures. Reset per turn (a fresh
-   * TurnState starts at 0). */
+  /** How many times this turn has rotated to a fresh card, proactive and
+   * reactive combined. Informational (logging) — NOT what the cap reads.
+   * Reset per turn (a fresh TurnState starts at 0). */
   rotateCount: number
+  /** Rotations triggered by the reactive failure path only
+   * (onCardWriteFailure). This is the counter MAX_MIDTURN_ROTATES caps —
+   * the failure path is the only one that can run away (Feishu outage, or
+   * a poisoned element that fails on every card). The proactive path
+   * (maybeMidTurnRotate) deliberately does NOT consume this budget: it
+   * needs ~50 genuinely-successful elements per card to fire again, so
+   * it's naturally throttled by real output. Sharing one counter was the
+   * 2026-07-04 bug — a long turn's 5 legitimate full-card rotations
+   * exhausted the cap, and the next transient 300308 flipped the turn to
+   * log-only. */
+  failureRotateCount: number
   /** Latched once we hit the rotate cap and emit the "giving up" notice,
    * so the notice isn't repeated on every later failed write this turn. */
   rotateGivenUp: boolean
