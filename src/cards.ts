@@ -103,6 +103,7 @@ export {
   applyBgTaskStarted,
   applyBgTaskProgress,
   applyBgTaskUpdated,
+  promotePendingOnAdvance,
   applyBgTaskSettled,
   applyBgToolUse,
   applyBgToolResult,

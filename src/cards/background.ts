@@ -15,20 +15,27 @@
  *   │ ...
  *
  * 状态机由 session 驱动(事件来自 claude-agent-process.handleSystemMessage):
- *   task_started      → applyBgTaskStarted  (workflow/monitor 白名单直入 active;
- *                                            其余前台 task 进 pending 观察池)
+ *   task_started      → applyBgTaskStarted  (subagent/workflow/monitor 白名单直入
+ *                                            active;其余前台 task 进 pending 观察池)
  *   task_progress     → applyBgTaskProgress (刷 usage / last_tool / summary)
  *   task_updated      → applyBgTaskUpdated  (is_backgrounded:true 时 pending→active
  *                                            提升;其余 patch 原地改)
+ *   主线程推进         → promotePendingOnAdvance (主 agent 继续发起 tool_use / 说新段 =
+ *                            没在等 pending task → 全部提升入 active。run_in_background
+ *                            的 Bash 靠它入卡 —— SDK 不给它发 is_backgrounded)
  *   task_notification → applyBgTaskSettled  (active 结算成墓碑;pending 前台 task 直接丢)
  * 子 agent 逐步工具调用(tool_use/tool_result 带 parent_tool_use_id)归属到对应
  * task,累积成 steps[](trim 到最近 ~1000 字)。
  *
- * 前台/后台区分(SDK sdk.d.ts:2750):Bash 命令和子 agent 默认都是前台 task,
- * 每条都发 task_started。子agent(具名,实质工作)天生入卡:task_started 即入
- * active。前台裸 Bash / unknown 是噪音源,先落 pending 观察池,只有被显式后台化
- * (Ctrl+B / background_tasks 控制请求)收到 is_backgrounded:true 才提升入 active。
- * workflow/monitor 是天生后台执行模型,同样白名单直入 active。
+ * 前台/后台区分:两条入卡路径并存。
+ *  ① 类型天生入卡 —— subagent(具名子agent,实质工作)/ workflow / monitor,
+ *     task_started 即入 active(isInherentlyBackground 白名单)。
+ *  ② 控制流事实 —— 主线程(tool_use / assistant)在某 task 未结算前继续推进了,
+ *     该 task 没在阻塞主线程 = 后台,由 promotePendingOnAdvance 从 pending 提升入
+ *     active;run_in_background 的 Bash 靠它(SDK 不给它发 is_backgrounded)。显式
+ *     后台化(Ctrl+B / background_tasks)的 is_backgrounded:true 也走提升。
+ * 前台裸 Bash 先落 pending 观察池:它的 settled 先于主线程下一个动作到达,pending
+ * 已空,不会被误提 —— 结算即丢,不冒卡(治「随便跑个命令就冒一项」)。
  */
 
 import type {
@@ -234,6 +241,19 @@ export function applyBgTaskUpdated(store: BgStore, e: BgTaskUpdatedEvent): BgSto
   }
   // 未知 task:no-op。没 started 也没后台化信号的 task 不凭空入卡(no-fallback)。
   return store
+}
+
+/** 主线程推进信号(新的主线程 tool_use / 新的 assistant 段定稿)到达:pending 观察
+ *  池里的 task 都没在阻塞主线程(主 agent 还在往前走) —— 判为后台,提升入 active。
+ *  控制流事实判据,不依赖 SDK 回传 is_backgrounded:run_in_background 的 Bash、
+ *  后台子 agent 都靠它入卡。前台 task 不会被误提 —— 它的 task_settled 先于主线程
+ *  下一个动作到达,pending 已清空。 */
+export function promotePendingOnAdvance(store: BgStore): BgStore {
+  if (store.pending.length === 0) return store
+  return {
+    active: [...store.active, ...store.pending.map(t => ({ ...t, isBackgrounded: true }))],
+    pending: [],
+  }
 }
 
 export function applyBgTaskSettled(

@@ -4,6 +4,7 @@ import {
   applyBgTaskStarted,
   applyBgTaskProgress,
   applyBgTaskUpdated,
+  promotePendingOnAdvance,
   applyBgTaskSettled,
   applyBgToolUse,
   applyBgToolResult,
@@ -386,5 +387,41 @@ describe('整卡三态', () => {
   test('BG_ELEMENTS id 生成', () => {
     expect(BG_ELEMENTS.panel('t1')).toBe('bg_t1')
     expect(BG_ELEMENTS.body('t1')).toBe('bg_body_t1')
+  })
+})
+
+describe('promotePendingOnAdvance — 主线程推进判后台', () => {
+  test('pending 里的 shell task 在主线程推进时提升到 active,标 isBackgrounded', () => {
+    const s0 = applyBgTaskStarted(emptyBgStore(), { task_id: 'b1', task_type: 'local_bash', description: 'codex 出图' })
+    expect(s0.active).toHaveLength(0)
+    expect(s0.pending).toHaveLength(1)
+    const s1 = promotePendingOnAdvance(s0)
+    expect(s1.pending).toHaveLength(0)
+    expect(s1.active).toHaveLength(1)
+    expect(s1.active[0]).toMatchObject({ id: 'b1', isBackgrounded: true, status: 'running' })
+  })
+
+  test('空 pending 返回原引用(无推进 no-op)', () => {
+    const s = emptyBgStore()
+    expect(promotePendingOnAdvance(s)).toBe(s)
+  })
+
+  test('多个 pending task 全部提升,active 原有保留', () => {
+    let s = applyBgTaskStarted(emptyBgStore(), { task_id: 'b1', task_type: 'local_bash', description: 'a' })
+    s = applyBgTaskStarted(s, { task_id: 'b2', task_type: 'local_agent', subagent_type: 'Explore', description: 'b' })
+    const r = promotePendingOnAdvance(s)
+    expect(r.active).toHaveLength(2)
+    expect(r.pending).toHaveLength(0)
+    expect(r.active.map(t => t.id).sort()).toEqual(['b1', 'b2'])
+    expect(r.active.every(t => t.isBackgrounded === true)).toBe(true)
+  })
+
+  test('前台 task 先结算被从 pending 丢,推进时不会被提', () => {
+    // 前台生命周期:started(pending) → settled(从 pending 丢);主线程推进时 pending 已空
+    let s = applyBgTaskStarted(emptyBgStore(), { task_id: 'f1', task_type: 'local_bash', description: 'echo' })
+    s = applyBgTaskSettled(s, { task_id: 'f1', status: 'completed' })
+    expect(s.pending).toHaveLength(0)
+    const r = promotePendingOnAdvance(s)
+    expect(r.active).toHaveLength(0)
   })
 })
