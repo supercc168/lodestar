@@ -1,4 +1,5 @@
 import { config, type ClaudeModelConfig } from './config'
+import { isClaudeReasoningEffort, type ClaudeReasoningEffort } from './agent-process'
 
 export interface ClaudeModelProfile {
   key: string
@@ -143,4 +144,14 @@ export function claudeModelConfigured(model: string | null | undefined): boolean
   const profile = claudeModelProfile(model)
   // 未知/默认档位当作登录态就绪。
   return profile ? profile.configured : true
+}
+
+/** 该档位在 config 里声明的思考强度(仅第三方 API 路由有意义,官方登录档位
+ * 不配)。非法/未配返回 undefined,由调用方回落到 FIXED_MODEL_CHOICES 的锁死
+ * 值。让 GLM 能复刻各自最优 effort(如 GLM-5.2 直连智谱走 xhigh)。 */
+export function claudeModelEffort(model: string | null | undefined): ClaudeReasoningEffort | undefined {
+  const profile = claudeModelProfile(model)
+  if (!profile || profile.route !== 'api') return undefined
+  const raw = mergedConfig(profile.name).effort?.trim()
+  return raw && isClaudeReasoningEffort(raw) ? raw : undefined
 }

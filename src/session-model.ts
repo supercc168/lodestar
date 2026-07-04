@@ -11,7 +11,7 @@ import {
 } from './agent-process'
 import * as cards from './cards'
 import * as feishu from './feishu'
-import { claudeModelConfigured, claudeModelIsApiRoute } from './claude-models'
+import { claudeModelConfigured, claudeModelEffort, claudeModelIsApiRoute } from './claude-models'
 import { log } from './log'
 import { messageOf, withTimeout, type ModelActionResult } from './session-util'
 
@@ -66,6 +66,17 @@ function defaultFixedChoiceFor(provider: AgentProvider): typeof FIXED_MODEL_CHOI
   return FIXED_MODEL_CHOICES.find(c => c.provider === provider) ?? FIXED_MODEL_CHOICES[0]
 }
 
+/** 档位实际锁死的 effort:第三方路由(GLM)优先用 config 声明的 effort
+ * (如 xhigh 复刻智谱最高思维),否则回落到 FIXED_MODEL_CHOICES 的默认值。
+ * picker 渲染、选择校验、归一化都走这里,保持三处一致。 */
+function resolvedEffort(item: typeof FIXED_MODEL_CHOICES[number]): AgentReasoningEffort {
+  if (item.provider === 'claude') {
+    const configured = claudeModelEffort(item.model)
+    if (configured) return configured
+  }
+  return item.effort
+}
+
 /** 把持久化的 (provider, model, effort) 归一到当前固定选项集。
  *   - 命中固定项 → 原样保留(强制该项锁死的 effort)。
  *   - legacy/退役 model(如 claude:glm、claude:deepseek)→ 回落到该 provider
@@ -86,10 +97,10 @@ export function normalizeFixedModelSelection(
   // 的 GLM 正常保留 —— 满足"别丢 GLM 设置"。
   if (hit && provider === 'claude' && claudeModelIsApiRoute(model) && !claudeModelConfigured(model)) {
     const fallback = defaultFixedChoiceFor(provider)
-    return { model: fallback.model, effort: fallback.effort }
+    return { model: fallback.model, effort: resolvedEffort(fallback) }
   }
   const choice = hit ?? defaultFixedChoiceFor(provider)
-  return { model: choice.model, effort: choice.effort }
+  return { model: choice.model, effort: resolvedEffort(choice) }
 }
 
 /** 第三方 API 路由(GLM)未配 token 时的描述后缀,提示去 config.toml 设置。 */
@@ -106,6 +117,7 @@ export function fixedModelChoices(s: Session): cards.ModelChoice[] {
   const currentEffort = s.currentEffortLabel()
   return FIXED_MODEL_CHOICES.map(item => {
     const selected = currentProvider === item.provider && currentModel === item.model
+    const effort = resolvedEffort(item)
     return {
       provider: item.provider,
       model: item.model,
@@ -114,10 +126,10 @@ export function fixedModelChoices(s: Session): cards.ModelChoice[] {
       isDefault: false,
       selected,
       efforts: [{
-        effort: item.effort,
+        effort,
         description: '',
         isDefault: true,
-        selected: selected && currentEffort === item.effort,
+        selected: selected && currentEffort === effort,
       }],
     }
   })
@@ -205,7 +217,7 @@ export async function onModelEffortSelect(
   // 二元锁死:只放行 FIXED_MODEL_CHOICES 的 (provider, model, effort) 组合,
   // 拒绝旧 effort 回调/伪造把 session 切到非固定项或非锁死 effort。
   const fixed = FIXED_MODEL_CHOICES.find(c => c.provider === provider && c.model === model)
-  if (!fixed || fixed.effort !== effort) {
+  if (!fixed || resolvedEffort(fixed) !== effort) {
     return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在固定选项中` }
   }
   // 第三方 API 路由(GLM)必须先在 lodestar config 配好 token 才能切换 ——

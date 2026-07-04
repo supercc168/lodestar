@@ -508,6 +508,47 @@ describe('Session provider switching', () => {
     expect(glm.description).toContain('配置')
   })
 
+  test('GLM 档位的 effort 跟随 config(xhigh)而非写死 max;官方档位仍 max', () => {
+    const prev = config.claude.models
+    ;(config.claude as any).models = {
+      glm: { model: 'glm-5.2', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
+    }
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      session.selectedProvider = 'claude'
+      const choices = fixedModelChoices(session)
+      const glm = choices.find((c: any) => c.model === 'claude:glm')
+      expect(glm.efforts.map((e: any) => e.effort)).toEqual(['xhigh'])
+      const opus = choices.find((c: any) => c.model === 'claude:opus')
+      expect(opus.efforts.map((e: any) => e.effort)).toEqual(['max'])
+    } finally {
+      ;(config.claude as any).models = prev
+    }
+  })
+
+  test('配好 xhigh 的 GLM:选 xhigh 通过,选 max 因不匹配被拒', async () => {
+    const prev = config.claude.models
+    ;(config.claude as any).models = {
+      glm: { model: 'glm-5.2', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
+    }
+    try {
+      const mk = () => {
+        const s = new Session('probe', 'chat_id') as any
+        s.proc = new FakeAgentProc('claude', 'claude-session-1')
+        s.selectedProvider = 'claude'
+        s.selectedModel = 'claude:fable'
+        return s
+      }
+      const ok = await mk().onModelEffortSelect('claude:glm', 'xhigh', '', 'ou_user', 'claude')
+      expect(ok.ok).toBe(true)
+      const bad = await mk().onModelEffortSelect('claude:glm', 'max', '', 'ou_user', 'claude')
+      expect(bad.ok).toBe(false)
+      expect(bad.message).toContain('不在固定选项中')
+    } finally {
+      ;(config.claude as any).models = prev
+    }
+  })
+
   test('未配置 token 时选 GLM 被拦截并提示去 config.toml 设置', async () => {
     const session = new Session('probe', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'claude-session-1')
