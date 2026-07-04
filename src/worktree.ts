@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { existsSync, readdirSync, readFileSync, statSync } from 'node:fs'
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 
 export interface WorktreeEntry {
@@ -209,7 +209,10 @@ export function assertProjectWorktreeClean(projectDir: string, projectName: stri
 function assertGitRepo(projectDir: string): void {
   if (!existsSync(projectDir)) throw new Error(`project directory does not exist: ${projectDir}`)
   const top = git(projectDir, ['rev-parse', '--show-toplevel']).trim()
-  if (resolve(top) !== resolve(projectDir)) {
+  // realpath 两边再比:git 返回的是解掉符号链接的真实路径,而传入的
+  // projectDir 可能带符号链接段(macOS /var → /private/var,tmpdir 下
+  // 的测试仓库全踩这个),lexical resolve 会把同一目录判成两个。
+  if (realpathSync(top) !== realpathSync(projectDir)) {
     throw new Error(`${projectDir} is not the git repository root (${top})`)
   }
 }

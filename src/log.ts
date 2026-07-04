@@ -5,7 +5,16 @@ import {
 import { join } from 'node:path'
 import { LOG_FILE, DATA_DIR } from './paths'
 
-try { mkdirSync(DATA_DIR, { recursive: true }) } catch {}
+/** 测试进程(bun test 固定设 NODE_ENV=test)禁止碰生产 DATA_DIR:
+ * 不落盘、不迁移旧日志、不清理 —— 否则跑一遍测试就往真实
+ * daemon-*.log 里塞 session "probe" 噪音,排障时被当成线上故障。 */
+export function fileLoggingEnabled(nodeEnv: string | undefined = process.env.NODE_ENV): boolean {
+  return nodeEnv !== 'test'
+}
+
+if (fileLoggingEnabled()) {
+  try { mkdirSync(DATA_DIR, { recursive: true }) } catch {}
+}
 
 /** 按日日志保留天数(含今天);超过即清理。 */
 const LOG_RETENTION_DAYS = 7
@@ -83,6 +92,7 @@ export function log(msg: string): void {
   const now = new Date()
   const line = `[${now.toISOString()}] ${msg}\n`
   process.stderr.write(line)
+  if (!fileLoggingEnabled()) return
   try {
     const key = localDayKey(now)
     if (lastDayKey !== key) {
@@ -94,5 +104,7 @@ export function log(msg: string): void {
 }
 
 // 启动:先把老 daemon.log 迁移成按日文件,再清理过期日志。
-try { migrateLegacyLogFile() } catch {}
-try { pruneOldLogs(DATA_DIR) } catch {}
+if (fileLoggingEnabled()) {
+  try { migrateLegacyLogFile() } catch {}
+  try { pruneOldLogs(DATA_DIR) } catch {}
+}
