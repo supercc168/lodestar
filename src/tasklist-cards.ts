@@ -135,17 +135,27 @@ async function openCard(projectName: string): Promise<void> {
     if (!binding) return
     const chatId = resolveChatId(binding, feishu.chatIdForSession)
     if (!chatId) { log(`tasklist-cards: no chatId for "${projectName}", skip card this burst`); return }
-    const messageId = await feishu.sendCard(chatId, cards.automationLiveCard(projectName, pc.burst.runs))
+    // 开卡前一次性快照 runs:openCard 跨两个 await,期间 onRunStart 可能已给同项目
+    // 追加新 run(onRunStart 只挡"开卡调用"这一次,不挡视图追加)。若后续用 post-await
+    // 的 pc.burst.runs 重新取值,会把"发卡时其实没写进去"的 run 误标进 addedPanels,
+    // 导致 reconcileAll 对一个从未 addElement 过的 element_id 发 replaceElement → 飞书拒绝。
+    const initialRuns = pc.burst.runs
+    const messageId = await feishu.sendCard(chatId, cards.automationLiveCard(projectName, initialRuns))
     if (!messageId) { log(`tasklist-cards: sendCard failed for "${projectName}"`); return }
     let cardId: string
     try { cardId = await cardkit.convertMessageToCard(messageId) }
     catch (e) { log(`tasklist-cards: convertMessageToCard failed "${projectName}": ${e}`); return }
+    // 两次 await 期间,settleIdleProjects 可能已把这个空壳 pc(handle 仍为 null)当空闲
+    // 沉降清掉。此时 registry 里要么没有条目、要么是新壳的 pc,和局部变量 pc 不再是
+    // 同一对象 —— 说明这次开卡已被回收/替换,不能再提交 handle,否则 timer 挂在一个
+    // 没人引用的孤儿 pc 上永远泄漏,飞书那张卡也再没人更新。
+    if (cardsByProject.get(projectName) !== pc) return // reaped/replaced while opening; abandon
     const handle: CardHandle = {
       chatId, messageId, cardId,
-      addedPanels: new Set(pc.burst.runs.map(r => r.runId)),
+      addedPanels: new Set(initialRuns.map(r => r.runId)),
       refreshTimer: null, cardWriteFailed: false,
     }
-    cardkit.recordCardCreated(cardId, pc.burst.runs.length, () => { handle.cardWriteFailed = true })
+    cardkit.recordCardCreated(cardId, initialRuns.length, () => { handle.cardWriteFailed = true })
     pc.handle = handle
     // 开卡后全量重建:吸收异步开卡窗口内 settle/stdout 对视图的改动。
     reconcileAll(pc)
