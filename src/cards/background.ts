@@ -15,12 +15,20 @@
  *   │ ...
  *
  * 状态机由 session 驱动(事件来自 claude-agent-process.handleSystemMessage):
- *   task_started      → applyBgTaskStarted  (新增 running,记 startedAt)
+ *   task_started      → applyBgTaskStarted  (workflow/monitor 白名单直入 active;
+ *                                            其余前台 task 进 pending 观察池)
  *   task_progress     → applyBgTaskProgress (刷 usage / last_tool / summary)
- *   task_updated      → applyBgTaskUpdated  (改 status / is_backgrounded / error)
- *   task_notification → applyBgTaskSettled  (终态 + endTime)
+ *   task_updated      → applyBgTaskUpdated  (is_backgrounded:true 时 pending→active
+ *                                            提升;其余 patch 原地改)
+ *   task_notification → applyBgTaskSettled  (active 结算成墓碑;pending 前台 task 直接丢)
  * 子 agent 逐步工具调用(tool_use/tool_result 带 parent_tool_use_id)归属到对应
  * task,累积成 steps[](trim 到最近 ~1000 字)。
+ *
+ * 前台/后台区分(SDK sdk.d.ts:2750):Bash 命令和子 agent 默认全是前台 task,
+ * 每条都发 task_started;只有被显式后台化(Ctrl+B / background_tasks 控制请求 /
+ * background:true 子 agent)才是真后台。前台 task 不该进「后台任务」卡 —— 故
+ * task_started 先落 pending 观察池,等 task_updated.is_backgrounded=true 才提升
+ * 入 active 建卡。workflow/monitor 是天生后台执行模型,白名单直入 active。
  */
 
 import type {
@@ -69,6 +77,21 @@ export interface BgTaskStep {
   brief: string
 }
 
+/** 后台任务累积库 —— 双池结构,session 以此为单一可变状态。
+ *  - active:已确认后台(workflow/monitor 白名单,或收到 is_backgrounded:true 提升),
+ *    驱动游标卡渲染。
+ *  - pending:观察池。task_started 进来但还没后台化的前台 task(Bash 命令/前台子 agent),
+ *    不渲染;等 task_updated.is_backgrounded=true 提升到 active,或 task_settled 时丢弃。 */
+export interface BgStore {
+  active: BgTaskEntry[]
+  pending: BgTaskEntry[]
+}
+
+/** 空库 —— session 初始化 / settle 后复位用。 */
+export function emptyBgStore(): BgStore {
+  return { active: [], pending: [] }
+}
+
 /** 后台卡内部 element_id:每任务一个 panel(bg_<id>),其 body 是 bg_body_<id>。
  * 刷新任务时 replaceElement 整个 panel(header 状态/时长 + body 一起)。 */
 export const BG_ELEMENTS = {
@@ -89,6 +112,13 @@ function normalizeType(taskType?: string, subagentType?: string): BgTaskType {
   return 'unknown'
 }
 
+/** 天生后台的 task_type:workflow / monitor 在 SDK 里是 fire-and-forget 后台执行
+ *  模型,task_started 即可入 active;subagent / shell / unknown 默认前台,先进
+ *  pending 观察池,等 is_backgrounded:true 才提升。 */
+function isInherentlyBackground(type: BgTaskType): boolean {
+  return type === 'workflow' || type === 'monitor'
+}
+
 /** 终态:不再变化,不再占活跃计数。running / pending / paused 都算活跃。 */
 export function isBgTerminal(t: BgTaskEntry): boolean {
   return t.status === 'completed' || t.status === 'failed' || t.status === 'killed'
@@ -102,25 +132,31 @@ export function hasActiveBgTask(tasks: BgTaskEntry[]): boolean {
 // ── 累积器(纯函数,不可变更新;now 默认 Date.now()) ────────────────────
 
 export function applyBgTaskStarted(
-  entries: BgTaskEntry[],
+  store: BgStore,
   e: BgTaskStartedEvent,
   now: number = Date.now(),
-): BgTaskEntry[] {
+): BgStore {
   const type = normalizeType(e.task_type, e.subagent_type)
-  if (entries.some(t => t.id === e.task_id)) {
-    return entries.map(t => t.id === e.task_id
-      ? {
-          ...t,
-          type,
-          toolUseId: e.tool_use_id ?? t.toolUseId,
-          description: e.description || t.description,
-          subagentType: e.subagent_type ?? t.subagentType,
-          workflowName: e.workflow_name ?? t.workflowName,
-          prompt: e.prompt ?? t.prompt,
-        }
-      : t)
+  const inActive = store.active.some(t => t.id === e.task_id)
+  const inPending = store.pending.some(t => t.id === e.task_id)
+  // 已知 task:补全字段,留在原池(不跨池迁移;提升只由 applyBgTaskUpdated 做)。
+  if (inActive || inPending) {
+    const patchField = (t: BgTaskEntry): BgTaskEntry => ({
+      ...t,
+      type,
+      toolUseId: e.tool_use_id ?? t.toolUseId,
+      description: e.description || t.description,
+      subagentType: e.subagent_type ?? t.subagentType,
+      workflowName: e.workflow_name ?? t.workflowName,
+      prompt: e.prompt ?? t.prompt,
+    })
+    return {
+      active: inActive ? store.active.map(t => t.id === e.task_id ? patchField(t) : t) : store.active,
+      pending: inPending ? store.pending.map(t => t.id === e.task_id ? patchField(t) : t) : store.pending,
+    }
   }
-  return [...entries, {
+  // 新 task:workflow/monitor 白名单天生后台 → 直入 active;其余前台 → pending 观察池。
+  const entry: BgTaskEntry = {
     id: e.task_id,
     toolUseId: e.tool_use_id,
     type,
@@ -131,64 +167,98 @@ export function applyBgTaskStarted(
     status: 'running',
     startedAt: now,
     steps: [],
-  }]
+    ...(isInherentlyBackground(type) ? { isBackgrounded: true } : {}),
+  }
+  return isInherentlyBackground(type)
+    ? { active: [...store.active, entry], pending: store.pending }
+    : { active: store.active, pending: [...store.pending, entry] }
 }
 
-export function applyBgTaskProgress(entries: BgTaskEntry[], e: BgTaskProgressEvent): BgTaskEntry[] {
-  if (!entries.some(t => t.id === e.task_id)) return entries
-  return entries.map(t => t.id === e.task_id
-    ? {
-        ...t,
-        description: e.description ?? t.description,
-        subagentType: e.subagent_type ?? t.subagentType,
-        usage: e.usage ?? t.usage,
-        lastToolName: e.last_tool_name ?? t.lastToolName,
-        summary: e.summary ?? t.summary,
-        status: t.status === 'pending' ? 'running' : t.status,
-      }
-    : t)
+export function applyBgTaskProgress(store: BgStore, e: BgTaskProgressEvent): BgStore {
+  const inActive = store.active.some(t => t.id === e.task_id)
+  const inPending = store.pending.some(t => t.id === e.task_id)
+  if (!inActive && !inPending) return store
+  const patchField = (t: BgTaskEntry): BgTaskEntry => ({
+    ...t,
+    description: e.description ?? t.description,
+    subagentType: e.subagent_type ?? t.subagentType,
+    usage: e.usage ?? t.usage,
+    lastToolName: e.last_tool_name ?? t.lastToolName,
+    summary: e.summary ?? t.summary,
+    status: t.status === 'pending' ? 'running' : t.status,
+  })
+  return {
+    active: inActive ? store.active.map(t => t.id === e.task_id ? patchField(t) : t) : store.active,
+    pending: inPending ? store.pending.map(t => t.id === e.task_id ? patchField(t) : t) : store.pending,
+  }
 }
 
-export function applyBgTaskUpdated(entries: BgTaskEntry[], e: BgTaskUpdatedEvent): BgTaskEntry[] {
-  if (!entries.some(t => t.id === e.task_id)) return entries
-  return entries.map(t => {
-    if (t.id !== e.task_id) return t
-    const p = e.patch
+export function applyBgTaskUpdated(store: BgStore, e: BgTaskUpdatedEvent): BgStore {
+  const idxPending = store.pending.findIndex(t => t.id === e.task_id)
+  const p = e.patch
+  // 前台 task 被后台化(is_backgrounded:true) —— 提升到 active,带 steps。
+  // 「观察池 → 入卡」的唯一路径。SDK 触发:Ctrl+B / background_tasks 控制请求 /
+  // background:true 子 agent 被标记后台。
+  if (p.is_backgrounded === true && idxPending >= 0) {
+    const entry = store.pending[idxPending]
+    const promoted: BgTaskEntry = {
+      ...entry,
+      isBackgrounded: true,
+      status: p.status ?? entry.status,
+      description: p.description ?? entry.description,
+      error: p.error ?? entry.error,
+      endTime: p.end_time ?? entry.endTime,
+    }
     return {
+      active: [...store.active, promoted],
+      pending: store.pending.filter(t => t.id !== e.task_id),
+    }
+  }
+  const inActive = store.active.some(t => t.id === e.task_id)
+  const inPending = idxPending >= 0
+  // 已在 active 的非提升 patch(status/error 等),或已在 pending 的 patch(不提升)。
+  if (inActive || inPending) {
+    const patchField = (t: BgTaskEntry): BgTaskEntry => ({
       ...t,
       status: p.status ?? t.status,
       description: p.description ?? t.description,
       error: p.error ?? t.error,
       isBackgrounded: p.is_backgrounded ?? t.isBackgrounded,
       endTime: p.end_time ?? t.endTime,
+    })
+    return {
+      active: inActive ? store.active.map(t => t.id === e.task_id ? patchField(t) : t) : store.active,
+      pending: inPending ? store.pending.map(t => t.id === e.task_id ? patchField(t) : t) : store.pending,
     }
-  })
+  }
+  // 未知 task:no-op。没 started 也没后台化信号的 task 不凭空入卡(no-fallback)。
+  return store
 }
 
 export function applyBgTaskSettled(
-  entries: BgTaskEntry[],
+  store: BgStore,
   e: BgTaskSettledEvent,
   now: number = Date.now(),
-): BgTaskEntry[] {
+): BgStore {
   const mapped: BgTaskStatus = e.status === 'completed' ? 'completed'
     : e.status === 'failed' ? 'failed'
     : 'killed'
-  if (!entries.some(t => t.id === e.task_id)) {
-    return [...entries, {
-      id: e.task_id,
-      type: 'unknown',
-      description: e.summary ?? '(已结束)',
-      status: mapped,
-      startedAt: now,
-      usage: e.usage,
-      summary: e.summary,
-      endTime: now,
-      steps: [],
-    }]
+  // 前台 task 结算,从未后台化 —— 不进卡,直接从观察池丢。这是治「随便跑个命令就
+  // 冒一项」的关键:前台 Bash/子 agent 从 pending 沉掉,不进 active 不渲染。
+  if (store.pending.some(t => t.id === e.task_id)) {
+    return { active: store.active, pending: store.pending.filter(t => t.id !== e.task_id) }
   }
-  return entries.map(t => t.id === e.task_id
-    ? { ...t, status: mapped, usage: e.usage ?? t.usage, summary: e.summary ?? t.summary, endTime: t.endTime ?? now }
-    : t)
+  // 在 active:结算成墓碑(终态任务留在卡里显示「用时/失败 Ns」)。
+  if (store.active.some(t => t.id === e.task_id)) {
+    return {
+      active: store.active.map(t => t.id === e.task_id
+        ? { ...t, status: mapped, usage: e.usage ?? t.usage, summary: e.summary ?? t.summary, endTime: t.endTime ?? now }
+        : t),
+      pending: store.pending,
+    }
+  }
+  // 未知 task 终态:no-op。漏接 started 的前台命令结算不该冒充后台任务(no-fallback)。
+  return store
 }
 
 // ── 子 agent 逐步工具调用(parent_tool_use_id 关联) ────────────────────
@@ -227,30 +297,43 @@ function briefResult(content: string, isError: boolean): string {
 }
 
 /** tool_use 到达:parent_tool_use_id 匹配的 task 追加一步(无结果)。主线程工具
- *  (parentToolUseId 为 null/undefined)跳过 —— 它们不属于任何后台 task。 */
+ *  (parentToolUseId 为 null/undefined)或无归属 task 跳过 —— 返回原 store 引用。
+ *  同时在 active 和 pending 累积:前台子 agent 跑时 steps 暂存 pending,
+ *  is_backgrounded 提升后 entry 自带 steps 带到 active。 */
 export function applyBgToolUse(
-  tasks: BgTaskEntry[],
+  store: BgStore,
   parentToolUseId: string | null | undefined,
   toolUseId: string,
   name: string,
   input: any,
-): BgTaskEntry[] {
-  if (!parentToolUseId) return tasks
-  return tasks.map(t => t.toolUseId === parentToolUseId
+): BgStore {
+  if (!parentToolUseId) return store
+  const inActive = store.active.some(t => t.toolUseId === parentToolUseId)
+  const inPending = store.pending.some(t => t.toolUseId === parentToolUseId)
+  if (!inActive && !inPending) return store
+  const acc = (tasks: BgTaskEntry[]): BgTaskEntry[] => tasks.map(t => t.toolUseId === parentToolUseId
     ? { ...t, steps: trimSteps([...t.steps, { toolUseId, tool: name, brief: `${name} ${briefInput(name, input)}`.trim() }]) }
     : t)
+  return {
+    active: inActive ? acc(store.active) : store.active,
+    pending: inPending ? acc(store.pending) : store.pending,
+  }
 }
 
-/** tool_result 到达:按 tool_use_id 回填结果摘要到对应 step(同 task 内)。 */
+/** tool_result 到达:按 tool_use_id 回填结果摘要到对应 step(同 task 内)。
+ *  同 applyBgToolUse,active/pending 双池都处理;无归属 task 返回原 store 引用。 */
 export function applyBgToolResult(
-  tasks: BgTaskEntry[],
+  store: BgStore,
   parentToolUseId: string | null | undefined,
   toolUseId: string,
   content: string,
   isError: boolean,
-): BgTaskEntry[] {
-  if (!parentToolUseId) return tasks
-  return tasks.map(t => {
+): BgStore {
+  if (!parentToolUseId) return store
+  const inActive = store.active.some(t => t.toolUseId === parentToolUseId)
+  const inPending = store.pending.some(t => t.toolUseId === parentToolUseId)
+  if (!inActive && !inPending) return store
+  const acc = (tasks: BgTaskEntry[]): BgTaskEntry[] => tasks.map(t => {
     if (t.toolUseId !== parentToolUseId) return t
     let matched = false
     const steps = t.steps.map(s => {
@@ -260,6 +343,10 @@ export function applyBgToolResult(
     })
     return { ...t, steps: trimSteps(steps) }
   })
+  return {
+    active: inActive ? acc(store.active) : store.active,
+    pending: inPending ? acc(store.pending) : store.pending,
+  }
 }
 
 // ── 渲染 ─────────────────────────────────────────────────────────────

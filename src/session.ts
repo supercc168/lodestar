@@ -151,9 +151,14 @@ export class Session {
   // ── package-internal state (touched by session-*.ts helpers) ──
   proc: AgentProcess | null = null
   currentTurn: TurnState | null = null
-  /** 后台任务 / 子 agent 的累积状态(SDK task_* 消息族)。以 task_id 为 key,
-   *  跨 turn 累积 —— 后台任务生命周期不受 turn 边界约束。驱动后台游标卡。 */
+  /** 已确认后台的任务(workflow/monitor 白名单,或收到 is_backgrounded:true 提升)。
+   *  驱动后台游标卡渲染。以 task_id 为 key,跨 turn 累积 —— 后台任务生命周期
+   *  不受 turn 边界约束。 */
   backgroundTasks: cards.BgTaskEntry[] = []
+  /** 观察池:task_started 进来但还没后台化的前台 task(Bash 命令/前台子 agent)。
+   *  不渲染;等 task_updated.is_backgrounded=true 提升到 backgroundTasks,或
+   *  task_settled 时丢弃。治「随便跑个命令就冒一项后台任务」的关键。 */
+  pendingBgTasks: cards.BgTaskEntry[] = []
   /** 后台游标卡句柄。null = 当前无活卡(从未建/已沉降/已固化)。活卡期间
    *  streaming 开,replaceElement body 刷新任务行。卡吸附在对话末尾,被新消息
    *  超越时沉降(updateCard),只在全部终态时固化留在原地。 */
@@ -1544,6 +1549,26 @@ export class Session {
   // 消息超越时沉降为历史快照(updateCard),只在全部终态时固化留在原地。
   // 阶段①:建卡 + 节流刷新 + 全终态沉降。游标迁移(onUserMessage 沉降+重建)
   // 是阶段②(待 pendingRebuildBackgroundCard 接入)。
+
+  /** 当前双池快照 —— 喂给纯函数累积器的入参。 */
+  private bgStore(): cards.BgStore {
+    return { active: this.backgroundTasks, pending: this.pendingBgTasks }
+  }
+
+  /** 把 BgStore 双池结果写回 backgroundTasks(active)+ pendingBgTasks。
+   *  bg_task_* 事件与子 agent tool_use/tool_result 累积的统一落点。 */
+  private applyBgStore(next: cards.BgStore): void {
+    this.backgroundTasks = next.active
+    this.pendingBgTasks = next.pending
+  }
+
+  /** parentToolUseId 是否归属某个已知后台 task(active 入卡池或 pending 观察池)。
+   *  子 agent 前台跑时在 pending,提升后在 active,两池都要认才能持续累积 steps。 */
+  private bgTaskOwns(parentToolUseId: string): boolean {
+    return this.backgroundTasks.some(t => t.toolUseId === parentToolUseId)
+      || this.pendingBgTasks.some(t => t.toolUseId === parentToolUseId)
+  }
+
   private onBackgroundTaskChanged(): void {
     const hasActive = cards.hasActiveBgTask(this.backgroundTasks)
     // 全部终态 → 活卡沉降成历史快照,关 streaming,清句柄
@@ -1628,7 +1653,8 @@ export class Session {
     cardkit.cancelSummary(handle.cardId)
     await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({ suffix: '🧭 后台任务已结束' }))
     await cardkit.dispose(handle.cardId)
-    // 全部终态 → 清空跟踪(已固化在历史卡);下次新 task 从空数组起步。
+    // 全部终态 → 清空 active 跟踪(已固化在历史卡);下次新后台 task 从空数组起步。
+    // pending 观察池不动:前台 task 可能仍在跑,它们结算时自己从 pending 丢。
     this.backgroundTasks = []
     this.backgroundDetailAdded.clear()
     log(`session "${this.sessionName}": background card settled cardId=${handle.cardId.slice(0, 12)}`)
@@ -1798,16 +1824,24 @@ export class Session {
       sessionTools.addTool(this, id, name, input)
       // 主线程 Task tool_use(触发子 agent):记 id 供 task_started 缺 tool_use_id 时兜底关联
       if (!parentToolUseId && (name === 'Task' || name === 'Agent')) this.lastMainTaskToolUseId = id
-      // 子 agent 内的工具调用(parentToolUseId 非空)额外累积进对应后台 task 的 steps[]
-      if (parentToolUseId && this.backgroundTasks.some(t => t.toolUseId === parentToolUseId)) {
-        this.backgroundTasks = cards.applyBgToolUse(this.backgroundTasks, parentToolUseId, id, name, input)
+      // 子 agent 内的工具调用(parentToolUseId 非空)额外累积进对应后台 task 的 steps[]。
+      // 同时覆盖 active 和 pending:前台子 agent 跑时 steps 暂存 pending,
+      // is_backgrounded 提升后自带 steps 带到 active。
+      if (parentToolUseId && this.bgTaskOwns(parentToolUseId)) {
+        this.applyBgStore(cards.applyBgToolUse(
+          { active: this.backgroundTasks, pending: this.pendingBgTasks },
+          parentToolUseId, id, name, input,
+        ))
         this.onBackgroundTaskChanged()
       }
     })
     p.on('tool_result', ({ tool_use_id, content, is_error, parentToolUseId }: any) => {
       sessionTools.completeTool(this, tool_use_id, content, is_error)
-      if (parentToolUseId && this.backgroundTasks.some(t => t.toolUseId === parentToolUseId)) {
-        this.backgroundTasks = cards.applyBgToolResult(this.backgroundTasks, parentToolUseId, tool_use_id, content, is_error)
+      if (parentToolUseId && this.bgTaskOwns(parentToolUseId)) {
+        this.applyBgStore(cards.applyBgToolResult(
+          { active: this.backgroundTasks, pending: this.pendingBgTasks },
+          parentToolUseId, tool_use_id, content, is_error,
+        ))
         this.onBackgroundTaskChanged()
       }
     })
@@ -1872,20 +1906,20 @@ export class Session {
       //  的 parent_tool_use_id 等于它,据此才能把 steps 关联到 task。
       const toolUseId = e.tool_use_id ?? this.lastMainTaskToolUseId ?? undefined
       log(`session "${this.sessionName}": bg_task_started task=${e.task_id} type=${e.task_type ?? '-'} subagent=${e.subagent_type ?? '-'} toolUseId=${toolUseId?.slice(0, 8) ?? '-'} desc=${(e.description ?? '').slice(0, 40)}`)
-      this.backgroundTasks = cards.applyBgTaskStarted(this.backgroundTasks, { ...e, tool_use_id: toolUseId })
+      this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), { ...e, tool_use_id: toolUseId }))
       this.onBackgroundTaskChanged()
     })
     p.on('bg_task_progress', (e: BgTaskProgressEvent) => {
-      this.backgroundTasks = cards.applyBgTaskProgress(this.backgroundTasks, e)
+      this.applyBgStore(cards.applyBgTaskProgress(this.bgStore(), e))
       this.onBackgroundTaskChanged()
     })
     p.on('bg_task_updated', (e: BgTaskUpdatedEvent) => {
-      this.backgroundTasks = cards.applyBgTaskUpdated(this.backgroundTasks, e)
+      this.applyBgStore(cards.applyBgTaskUpdated(this.bgStore(), e))
       this.onBackgroundTaskChanged()
     })
     p.on('bg_task_settled', (e: BgTaskSettledEvent) => {
       log(`session "${this.sessionName}": bg_task_settled task=${e.task_id} status=${e.status}`)
-      this.backgroundTasks = cards.applyBgTaskSettled(this.backgroundTasks, e)
+      this.applyBgStore(cards.applyBgTaskSettled(this.bgStore(), e))
       this.onBackgroundTaskChanged()
       // turn 已收尾后才结算的任务:SDK 会自发开一轮恢复轮合并结果,
       // 标记给下一个无用户批次的 init 开卡。
@@ -2824,7 +2858,7 @@ export class Session {
     if (modelLabel) line1Parts.push(modelLabel)
     const footerLine1 = line1Parts.join(' ｜ ')
     const footerLine2 = opts.hasFreshResult
-      ? cards.footerTokenDetailLine(this.lastTurnUsage) + await this.footerFiveHourSuffix()
+      ? cards.footerTokenDetailLine(this.lastTurnUsage) + (turn.rotateGivenUp ? '' : await this.footerFiveHourSuffix())
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
     await this.replaceFooterContent(cardId, footer)
@@ -2849,7 +2883,9 @@ export class Session {
     // empty suffix but the user still needs to know we bailed.
     // Fire-and-forget; urgent_app failures are non-fatal and already
     // logged in feishu.ts.
-    if ((opts.forcePush || !suffix) && turn.userOpenId && turn.messageId) {
+    // log-only 的 turn 已发过"仅日志可见"告警,用户知晓 —— 不再为
+    // 一张写死的卡响手机推送(2026-07-04 review follow-up)。
+    if ((opts.forcePush || !suffix) && turn.userOpenId && turn.messageId && !turn.rotateGivenUp) {
       void feishu.urgentApp(turn.messageId, [turn.userOpenId])
     }
 

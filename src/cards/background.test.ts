@@ -14,8 +14,10 @@ import {
   backgroundLiveCard,
   backgroundHistoryCard,
   backgroundMigratedMarker,
+  emptyBgStore,
   BG_ELEMENTS,
   type BgTaskEntry,
+  type BgStore,
 } from './background'
 
 const mk = (over: Partial<BgTaskEntry> & Pick<BgTaskEntry, 'id' | 'status'>): BgTaskEntry => ({
@@ -26,136 +28,241 @@ const mk = (over: Partial<BgTaskEntry> & Pick<BgTaskEntry, 'id' | 'status'>): Bg
   ...over,
 })
 
-describe('applyBgTaskStarted — 新增 + 归一化 + startedAt', () => {
-  test('新增 running,type 归一化 local_workflow→workflow,记 startedAt', () => {
-    let tasks: BgTaskEntry[] = []
-    tasks = applyBgTaskStarted(tasks, { task_id: 't1', task_type: 'local_workflow', description: '跑 spec', workflow_name: 'spec' }, 1000)
-    expect(tasks).toHaveLength(1)
-    expect(tasks[0]).toMatchObject({ id: 't1', type: 'workflow', status: 'running', startedAt: 1000, workflowName: 'spec' })
+describe('applyBgTaskStarted — 白名单直入 active / 前台落 pending', () => {
+  test('workflow 白名单直入 active 并标 isBackgrounded', () => {
+    let s = emptyBgStore()
+    s = applyBgTaskStarted(s, { task_id: 'w1', task_type: 'local_workflow', description: '跑 spec', workflow_name: 'spec' }, 1000)
+    expect(s.active).toHaveLength(1)
+    expect(s.pending).toHaveLength(0)
+    expect(s.active[0]).toMatchObject({ id: 'w1', type: 'workflow', status: 'running', startedAt: 1000, workflowName: 'spec', isBackgrounded: true })
   })
 
-  test('有 subagent_type 无 task_type → type=subagent', () => {
-    let tasks: BgTaskEntry[] = []
-    tasks = applyBgTaskStarted(tasks, { task_id: 't2', description: '搜索', subagent_type: 'Explore' })
-    expect(tasks[0].type).toBe('subagent')
-    expect(tasks[0].subagentType).toBe('Explore')
+  test('monitor 白名单直入 active', () => {
+    const s = applyBgTaskStarted(emptyBgStore(), { task_id: 'm1', task_type: 'local_monitor', description: '盯盘' })
+    expect(s.active[0].type).toBe('monitor')
+    expect(s.active[0].isBackgrounded).toBe(true)
+    expect(s.pending).toHaveLength(0)
+  })
+
+  test('前台 shell(Bash 命令)进 pending,active 空,不标 isBackgrounded', () => {
+    const s = applyBgTaskStarted(emptyBgStore(), { task_id: 'b1', task_type: 'local_bash', description: 'build' })
+    expect(s.active).toHaveLength(0)
+    expect(s.pending).toHaveLength(1)
+    expect(s.pending[0]).toMatchObject({ id: 'b1', type: 'shell', status: 'running' })
+    expect(s.pending[0].isBackgrounded).toBeUndefined()
+  })
+
+  test('前台子 agent 进 pending', () => {
+    const s = applyBgTaskStarted(emptyBgStore(), { task_id: 'a1', description: '搜索', subagent_type: 'Explore' })
+    expect(s.active).toHaveLength(0)
+    expect(s.pending[0]).toMatchObject({ id: 'a1', type: 'subagent', subagentType: 'Explore' })
   })
 
   test('local_ 前缀归一化:local_bash→shell / local_agent→subagent / local_workflow→workflow', () => {
-    expect(applyBgTaskStarted([], { task_id: 'b', task_type: 'local_bash', description: 'build' })[0].type).toBe('shell')
-    expect(applyBgTaskStarted([], { task_id: 'a', task_type: 'local_agent', description: 'explore' })[0].type).toBe('subagent')
-    expect(applyBgTaskStarted([], { task_id: 'w', task_type: 'local_workflow', description: 'spec' })[0].type).toBe('workflow')
+    expect(applyBgTaskStarted(emptyBgStore(), { task_id: 'b', task_type: 'local_bash', description: 'x' }).pending[0].type).toBe('shell')
+    expect(applyBgTaskStarted(emptyBgStore(), { task_id: 'a', task_type: 'local_agent', description: 'x' }).pending[0].type).toBe('subagent')
+    expect(applyBgTaskStarted(emptyBgStore(), { task_id: 'w', task_type: 'local_workflow', description: 'x' }).active[0].type).toBe('workflow')
   })
 
-  test('重复 task_id 不堆叠,补全字段但保留 status/usage/startedAt', () => {
-    let tasks: BgTaskEntry[] = [mk({ id: 't1', type: 'unknown', description: '旧', status: 'running', startedAt: 1000, usage: { total_tokens: 100, tool_uses: 2, duration_ms: 1000 } })]
-    tasks = applyBgTaskStarted(tasks, { task_id: 't1', task_type: 'shell', description: '新描述' }, 9999)
-    expect(tasks).toHaveLength(1)
-    expect(tasks[0].description).toBe('新描述')
-    expect(tasks[0].type).toBe('shell')
-    expect(tasks[0].status).toBe('running')
-    expect(tasks[0].startedAt).toBe(1000)  // 不被覆盖
-    expect(tasks[0].usage?.total_tokens).toBe(100)
+  test('重复 task_id 不堆叠,补全字段但留在原池 + 保留 status/startedAt', () => {
+    // pending 里的前台 task 再次收到 started:补全字段,不提升
+    const s0: BgStore = {
+      active: [],
+      pending: [mk({ id: 't1', type: 'unknown', description: '旧', status: 'running', startedAt: 1000, usage: { total_tokens: 100, tool_uses: 2, duration_ms: 1000 } })],
+    }
+    const s = applyBgTaskStarted(s0, { task_id: 't1', task_type: 'shell', description: '新描述' }, 9999)
+    expect(s.pending).toHaveLength(1)
+    expect(s.active).toHaveLength(0)
+    expect(s.pending[0].description).toBe('新描述')
+    expect(s.pending[0].type).toBe('shell')
+    expect(s.pending[0].startedAt).toBe(1000)  // 不被覆盖
+    expect(s.pending[0].usage?.total_tokens).toBe(100)
   })
 })
 
-describe('applyBgTaskProgress — 刷新 + 状态提升', () => {
-  test('刷 usage/last_tool/summary', () => {
-    let tasks: BgTaskEntry[] = [mk({ id: 't1', status: 'running', subagentType: 'Explore' })]
-    tasks = applyBgTaskProgress(tasks, { task_id: 't1', usage: { total_tokens: 500, tool_uses: 3, duration_ms: 2000 }, last_tool_name: 'Grep', summary: '命中 3 处' })
-    expect(tasks[0].usage?.total_tokens).toBe(500)
-    expect(tasks[0].lastToolName).toBe('Grep')
-    expect(tasks[0].summary).toBe('命中 3 处')
+describe('applyBgTaskProgress — active/pending 双池刷新', () => {
+  test('刷 active 里的 task', () => {
+    const s0: BgStore = { active: [mk({ id: 't1', status: 'running', subagentType: 'Explore' })], pending: [] }
+    const s = applyBgTaskProgress(s0, { task_id: 't1', usage: { total_tokens: 500, tool_uses: 3, duration_ms: 2000 }, last_tool_name: 'Grep', summary: '命中 3 处' })
+    expect(s.active[0].usage?.total_tokens).toBe(500)
+    expect(s.active[0].lastToolName).toBe('Grep')
+    expect(s.active[0].summary).toBe('命中 3 处')
   })
 
-  test('pending → running', () => {
-    let tasks: BgTaskEntry[] = [mk({ id: 't1', status: 'pending' })]
-    tasks = applyBgTaskProgress(tasks, { task_id: 't1' })
-    expect(tasks[0].status).toBe('running')
+  test('刷 pending 里的前台 task(提升前攒数据)', () => {
+    const s0: BgStore = { active: [], pending: [mk({ id: 't1', status: 'running' })] }
+    const s = applyBgTaskProgress(s0, { task_id: 't1', summary: '跑着' })
+    expect(s.pending[0].summary).toBe('跑着')
+  })
+
+  test('pending → running 状态提升', () => {
+    const s0: BgStore = { active: [], pending: [mk({ id: 't1', status: 'pending' })] }
+    const s = applyBgTaskProgress(s0, { task_id: 't1' })
+    expect(s.pending[0].status).toBe('running')
   })
 
   test('未知 task_id no-op', () => {
-    const tasks: BgTaskEntry[] = [mk({ id: 't1', status: 'running' })]
-    expect(applyBgTaskProgress(tasks, { task_id: 'tX' })).toBe(tasks)
+    const s: BgStore = { active: [mk({ id: 't1', status: 'running' })], pending: [] }
+    expect(applyBgTaskProgress(s, { task_id: 'tX' })).toBe(s)
   })
 })
 
-describe('applyBgTaskUpdated — 状态变更', () => {
-  test('改 status + is_backgrounded + error', () => {
-    let tasks: BgTaskEntry[] = [mk({ id: 't1', type: 'shell', description: 'build', status: 'running' })]
-    tasks = applyBgTaskUpdated(tasks, { task_id: 't1', patch: { status: 'paused', is_backgrounded: true, error: 'oom' } })
-    expect(tasks[0].status).toBe('paused')
-    expect(tasks[0].isBackgrounded).toBe(true)
-    expect(tasks[0].error).toBe('oom')
+describe('applyBgTaskUpdated — is_backgrounded 提升 + 原池 patch', () => {
+  test('is_backgrounded:true 把 pending 前台 task 提升到 active,带 steps', () => {
+    const s0: BgStore = {
+      active: [],
+      pending: [mk({ id: 't1', type: 'shell', toolUseId: 'p', description: 'build', status: 'running', steps: [{ toolUseId: 'tu', tool: 'Bash', brief: 'old' }] })],
+    }
+    const s = applyBgTaskUpdated(s0, { task_id: 't1', patch: { is_backgrounded: true } })
+    expect(s.pending).toHaveLength(0)
+    expect(s.active).toHaveLength(1)
+    expect(s.active[0].isBackgrounded).toBe(true)
+    expect(s.active[0].steps).toHaveLength(1)  // steps 带过来
   })
 
-  test('未知 task_id no-op', () => {
-    const tasks: BgTaskEntry[] = [mk({ id: 't1', status: 'running' })]
-    expect(applyBgTaskUpdated(tasks, { task_id: 'tX', patch: { status: 'completed' } })).toBe(tasks)
+  test('已在 active 的 task 收 is_backgrounded:true 不重复添加(原地标记)', () => {
+    const s0: BgStore = { active: [mk({ id: 't1', status: 'running' })], pending: [] }
+    const s = applyBgTaskUpdated(s0, { task_id: 't1', patch: { is_backgrounded: true, status: 'paused', error: 'oom' } })
+    expect(s.active).toHaveLength(1)
+    expect(s.active[0].isBackgrounded).toBe(true)
+    expect(s.active[0].status).toBe('paused')
+    expect(s.active[0].error).toBe('oom')
+  })
+
+  test('pending 里的非提升 patch(改 status)不提升', () => {
+    const s0: BgStore = { active: [], pending: [mk({ id: 't1', status: 'running' })] }
+    const s = applyBgTaskUpdated(s0, { task_id: 't1', patch: { status: 'paused' } })
+    expect(s.pending).toHaveLength(1)
+    expect(s.active).toHaveLength(0)
+    expect(s.pending[0].status).toBe('paused')
+  })
+
+  test('未知 task_id no-op(不凭空造)', () => {
+    const s: BgStore = { active: [], pending: [] }
+    expect(applyBgTaskUpdated(s, { task_id: 'tX', patch: { is_backgrounded: true } })).toBe(s)
   })
 })
 
-describe('applyBgTaskSettled — 终态映射 + endTime', () => {
-  test('completed/failed/stopped → completed/failed/killed,记 endTime', () => {
-    let tasks: BgTaskEntry[] = [
-      mk({ id: 't1', status: 'running', startedAt: 1000 }),
-      mk({ id: 't2', status: 'running', startedAt: 1000 }),
-      mk({ id: 't3', status: 'running', startedAt: 1000 }),
-    ]
-    tasks = applyBgTaskSettled(tasks, { task_id: 't1', status: 'completed', usage: { total_tokens: 1, tool_uses: 1, duration_ms: 7000 } }, 8000)
-    tasks = applyBgTaskSettled(tasks, { task_id: 't2', status: 'failed' }, 8000)
-    tasks = applyBgTaskSettled(tasks, { task_id: 't3', status: 'stopped' }, 8000)
-    expect(tasks.map(t => t.status)).toEqual(['completed', 'failed', 'killed'])
-    expect(tasks[0].endTime).toBe(8000)
-    expect(tasks[0].usage?.duration_ms).toBe(7000)
+describe('applyBgTaskSettled — 前台丢弃 / active 结算墓碑', () => {
+  test('pending 前台 task 结算 → 直接丢,不进 active', () => {
+    const s0: BgStore = { active: [], pending: [mk({ id: 't1', status: 'running', startedAt: 1000 })] }
+    const s = applyBgTaskSettled(s0, { task_id: 't1', status: 'completed' }, 8000)
+    expect(s.active).toHaveLength(0)
+    expect(s.pending).toHaveLength(0)
   })
 
-  test('错过 started → 补建终态记录', () => {
-    const next = applyBgTaskSettled([], { task_id: 'tZ', status: 'completed', summary: 'done' }, 8000)
-    expect(next).toHaveLength(1)
-    expect(next[0]).toMatchObject({ id: 'tZ', status: 'completed', type: 'unknown', summary: 'done', endTime: 8000 })
+  test('active 后台 task 结算 → 墓碑 + endTime', () => {
+    const s0: BgStore = { active: [mk({ id: 't1', status: 'running', startedAt: 1000 })], pending: [] }
+    const s = applyBgTaskSettled(s0, { task_id: 't1', status: 'completed', usage: { total_tokens: 1, tool_uses: 1, duration_ms: 7000 } }, 8000)
+    expect(s.active[0]).toMatchObject({ status: 'completed', endTime: 8000 })
+    expect(s.active[0].usage?.duration_ms).toBe(7000)
+  })
+
+  test('failed/stopped → failed/killed', () => {
+    const s0: BgStore = {
+      active: [
+        mk({ id: 't1', status: 'running', startedAt: 1000 }),
+        mk({ id: 't2', status: 'running', startedAt: 1000 }),
+      ],
+      pending: [],
+    }
+    let s = applyBgTaskSettled(s0, { task_id: 't1', status: 'failed' }, 8000)
+    s = applyBgTaskSettled(s, { task_id: 't2', status: 'stopped' }, 8000)
+    expect(s.active.map(t => t.status)).toEqual(['failed', 'killed'])
+  })
+
+  test('未知 task 终态 no-op(不补建墓碑,避免冒充后台任务)', () => {
+    const s: BgStore = { active: [], pending: [] }
+    expect(applyBgTaskSettled(s, { task_id: 'tZ', status: 'completed', summary: 'done' }, 8000)).toBe(s)
   })
 })
 
-describe('applyBgToolUse / applyBgToolResult — 子 agent 逐步过程', () => {
+describe('applyBgToolUse / applyBgToolResult — 双池 steps 累积', () => {
   test('parentToolUseId 匹配的 task 追加 step;主线程(null)/不匹配跳过', () => {
-    let tasks: BgTaskEntry[] = [mk({ id: 't1', toolUseId: 'parent_1', status: 'running' })]
-    tasks = applyBgToolUse(tasks, 'parent_1', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
-    expect(tasks[0].steps).toHaveLength(1)
-    expect(tasks[0].steps[0]).toMatchObject({ toolUseId: 'tu_1', tool: 'Grep' })
-    expect(tasks[0].steps[0].brief).toContain('auth')
+    let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'parent_1', status: 'running' })], pending: [] }
+    s = applyBgToolUse(s, 'parent_1', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
+    expect(s.active[0].steps).toHaveLength(1)
+    expect(s.active[0].steps[0]).toMatchObject({ toolUseId: 'tu_1', tool: 'Grep' })
+    expect(s.active[0].steps[0].brief).toContain('auth')
     // 主线程工具(null)跳过
-    tasks = applyBgToolUse(tasks, null, 'tu_2', 'Bash', { command: 'ls' })
-    expect(tasks[0].steps).toHaveLength(1)
+    expect(applyBgToolUse(s, null, 'tu_2', 'Bash', { command: 'ls' })).toBe(s)
     // 不匹配的 parent 跳过
-    tasks = applyBgToolUse(tasks, 'other_parent', 'tu_3', 'Read', { file_path: '/x' })
-    expect(tasks[0].steps).toHaveLength(1)
+    expect(applyBgToolUse(s, 'other_parent', 'tu_3', 'Read', { file_path: '/x' })).toBe(s)
   })
 
-  test('tool_result 按 tool_use_id 回填结果到对应 step', () => {
-    let tasks: BgTaskEntry[] = [mk({ id: 't1', toolUseId: 'parent_1', status: 'running' })]
-    tasks = applyBgToolUse(tasks, 'parent_1', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
-    tasks = applyBgToolResult(tasks, 'parent_1', 'tu_1', '命中 3 处', false)
-    expect(tasks[0].steps[0].brief).toBe('Grep "auth" in src → 命中 3 处')
+  test('pending 里的前台子 agent 也累积 steps(提升前攒过程)', () => {
+    let s: BgStore = { active: [], pending: [mk({ id: 't1', toolUseId: 'p', status: 'running' })] }
+    s = applyBgToolUse(s, 'p', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
+    expect(s.pending[0].steps).toHaveLength(1)
+  })
+
+  test('tool_result 按 tool_use_id 回填结果到对应 step(双池)', () => {
+    let s: BgStore = { active: [], pending: [mk({ id: 't1', toolUseId: 'p', status: 'running' })] }
+    s = applyBgToolUse(s, 'p', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
+    s = applyBgToolResult(s, 'p', 'tu_1', '命中 3 处', false)
+    expect(s.pending[0].steps[0].brief).toBe('Grep "auth" in src → 命中 3 处')
   })
 
   test('tool_result 错误加 ❌', () => {
-    let tasks: BgTaskEntry[] = [mk({ id: 't1', toolUseId: 'p', status: 'running' })]
-    tasks = applyBgToolUse(tasks, 'p', 'tu', 'Bash', { command: 'npm test' })
-    tasks = applyBgToolResult(tasks, 'p', 'tu', 'tests failed', true)
-    expect(tasks[0].steps[0].brief).toContain('❌')
-    expect(tasks[0].steps[0].brief).toContain('tests failed')
+    let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
+    s = applyBgToolUse(s, 'p', 'tu', 'Bash', { command: 'npm test' })
+    s = applyBgToolResult(s, 'p', 'tu', 'tests failed', true)
+    expect(s.active[0].steps[0].brief).toContain('❌')
+    expect(s.active[0].steps[0].brief).toContain('tests failed')
   })
 
   test('trim:steps 累积超 ~1000 字只留最新', () => {
-    let tasks: BgTaskEntry[] = [mk({ id: 't1', toolUseId: 'p', status: 'running' })]
+    let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
     for (let i = 0; i < 50; i++) {
-      tasks = applyBgToolUse(tasks, 'p', `tu_${i}`, 'Read', { file_path: `/very/long/path/to/file/number/${i}/source.ts` })
+      s = applyBgToolUse(s, 'p', `tu_${i}`, 'Read', { file_path: `/very/long/path/to/file/number/${i}/source.ts` })
     }
-    const totalBrief = tasks[0].steps.reduce((n, s) => n + s.brief.length + 5, 0)
+    const totalBrief = s.active[0].steps.reduce((n, st) => n + st.brief.length + 5, 0)
     expect(totalBrief).toBeLessThanOrEqual(1100)
-    expect(tasks[0].steps.length).toBeLessThan(50)
-    expect(tasks[0].steps[tasks[0].steps.length - 1].brief).toContain('number/49')
+    expect(s.active[0].steps.length).toBeLessThan(50)
+    expect(s.active[0].steps[s.active[0].steps.length - 1].brief).toContain('number/49')
+  })
+
+  test('端到端:前台子 agent 攒 steps → 后台化提升 → steps 随 entry 到 active', () => {
+    let s = emptyBgStore()
+    s = applyBgTaskStarted(s, { task_id: 'a1', task_type: 'local_agent', description: '搜索', subagent_type: 'Explore', tool_use_id: 'p' })
+    s = applyBgToolUse(s, 'p', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
+    s = applyBgToolResult(s, 'p', 'tu_1', '命中', false)
+    // 提升前:active 空,pending 攒了 steps
+    expect(s.active).toHaveLength(0)
+    expect(s.pending[0].steps).toHaveLength(1)
+    // 后台化 → 提升,steps 带到 active
+    s = applyBgTaskUpdated(s, { task_id: 'a1', patch: { is_backgrounded: true } })
+    expect(s.active).toHaveLength(1)
+    expect(s.active[0].steps).toHaveLength(1)
+    expect(s.pending).toHaveLength(0)
+  })
+})
+
+describe('端到端:前台命令全程不进 active(治「随便跑个命令就冒一项」)', () => {
+  test('前台 Bash:started→pending,settled→丢,active 全程空,不建卡', () => {
+    let s = emptyBgStore()
+    s = applyBgTaskStarted(s, { task_id: 'b1', task_type: 'local_bash', description: 'echo hi' })
+    expect(hasActiveBgTask(s.active)).toBe(false)  // active 空,不该建卡
+    s = applyBgTaskSettled(s, { task_id: 'b1', status: 'completed' })
+    expect(s.active).toHaveLength(0)
+    expect(s.pending).toHaveLength(0)
+    expect(hasActiveBgTask(s.active)).toBe(false)
+  })
+
+  test('前台命令被 Ctrl+B 后台化 → 入卡 → 结算墓碑', () => {
+    let s = emptyBgStore()
+    s = applyBgTaskStarted(s, { task_id: 'b2', task_type: 'local_bash', description: '长跑构建' })
+    expect(hasActiveBgTask(s.active)).toBe(false)
+    s = applyBgTaskUpdated(s, { task_id: 'b2', patch: { is_backgrounded: true } })
+    expect(hasActiveBgTask(s.active)).toBe(true)  // 后台化后该建卡
+    s = applyBgTaskSettled(s, { task_id: 'b2', status: 'completed' })
+    expect(s.active[0].status).toBe('completed')
+    expect(hasActiveBgTask(s.active)).toBe(false)  // 终态,不再活跃
+  })
+
+  test('workflow 天生后台:started 即入 active', () => {
+    const s = applyBgTaskStarted(emptyBgStore(), { task_id: 'w1', task_type: 'local_workflow', description: 'spec', workflow_name: 'spec' })
+    expect(hasActiveBgTask(s.active)).toBe(true)
   })
 })
 
@@ -220,10 +327,10 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
   })
 
   test('body 含 steps(精简,无 prompt/标题)', () => {
-    let t = mk({ id: 't1', type: 'subagent', toolUseId: 'p', description: '搜索', status: 'running', subagentType: 'Explore', prompt: '找 auth 代码' })
-    t = applyBgToolUse([t], 'p', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })[0]
-    t = applyBgToolResult([t], 'p', 'tu_1', '命中 3 处', false)[0]
-    const panel = backgroundTaskPanel(t, 1000) as any
+    let s: BgStore = { active: [mk({ id: 't1', type: 'subagent', toolUseId: 'p', description: '搜索', status: 'running', subagentType: 'Explore', prompt: '找 auth 代码' })], pending: [] }
+    s = applyBgToolUse(s, 'p', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
+    s = applyBgToolResult(s, 'p', 'tu_1', '命中 3 处', false)
+    const panel = backgroundTaskPanel(s.active[0], 1000) as any
     const body = panel.elements[0]
     expect(body.content).toContain('Grep')
     expect(body.content).toContain('命中 3 处')
@@ -265,5 +372,10 @@ describe('整卡三态', () => {
     const card = backgroundMigratedMarker() as any
     expect(card.config.streaming_mode).toBe(false)
     expect(card.body.elements[0].content).toContain('迁至最新卡片')
+  })
+
+  test('BG_ELEMENTS id 生成', () => {
+    expect(BG_ELEMENTS.panel('t1')).toBe('bg_t1')
+    expect(BG_ELEMENTS.body('t1')).toBe('bg_body_t1')
   })
 })

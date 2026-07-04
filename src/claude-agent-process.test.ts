@@ -271,6 +271,97 @@ describe('Claude configured executable ([claude] bin)', () => {
   })
 })
 
+describe('Claude configured executable ([claude] bin)', () => {
+  test('uses configured bin as the SDK executable', () => {
+    const bin = '/home/me/.local/bin/reclaude'
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'linux',
+      configuredBin: bin,
+      exists: path => path === bin,
+    })
+
+    expect(executable.pathToClaudeCodeExecutable).toBe(bin)
+    expect(executable.spawnClaudeCodeProcess).toBeUndefined()
+    expect(executable.description).toBe(`config:${bin}`)
+  })
+
+  test('throws instead of silently falling back when configured bin is missing', () => {
+    expect(() => resolveClaudeExecutableConfig({
+      platform: 'linux',
+      configuredBin: '/nope/reclaude',
+      exists: () => false,
+    })).toThrow('/nope/reclaude')
+  })
+
+  test('runs configured Windows .cmd bin through the shell shim spawn hook', () => {
+    const bin = win32.join('C:\\Users\\me\\bin', 'reclaude.cmd')
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'win32',
+      configuredBin: bin,
+      exists: path => path === bin,
+    })
+
+    expect(executable.pathToClaudeCodeExecutable).toBe(bin)
+    expect(typeof executable.spawnClaudeCodeProcess).toBe('function')
+    expect(executable.description).toBe(`windows-shell-shim:${bin}`)
+  })
+
+  test('explicit null configuredBin falls back to auto discovery', () => {
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'win32',
+      pathEnv: '',
+      configuredBin: null,
+      exists: () => false,
+    })
+
+    expect(executable).toEqual({ description: 'sdk-default' })
+  })
+
+  test('sendInitialize 配错 bin 路径时走 error/exit 事件而非同步抛出', () => {
+    // [claude].bin 指向不存在的路径 → resolveClaudeExecutableConfig 同步抛出;
+    // 修复确保该抛出在 sendInitialize 的 try/catch 内被捕获,转为事件输出,
+    // 调用方不会收到同步异常,session 层可通过 error/exit 事件做正常清理。
+    ;(config.claude as any).bin = '/nope/reclaude'
+    try {
+      const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' })
+      const errors: Error[] = []
+      const exits: any[] = []
+      proc.on('error', (err: Error) => errors.push(err))
+      proc.on('exit', (ev: any) => exits.push(ev))
+
+      // 不能同步抛出
+      expect(() => proc.sendInitialize()).not.toThrow()
+
+      // error 事件携带路径信息
+      expect(errors).toHaveLength(1)
+      expect(errors[0].message).toContain('/nope/reclaude')
+
+      // exit 事件 code=1
+      expect(exits).toHaveLength(1)
+      expect(exits[0].code).toBe(1)
+    } finally {
+      delete (config.claude as any).bin
+    }
+  })
+
+  test('listModels/setModelSettings 在 sendInitialize 失败后抛清晰错误', async () => {
+    // sendInitialize 因配错 bin 走 catch → this.query 保持 undefined。
+    // 旧实现此时调 listModels/setModelSettings 会抛模糊的
+    // "Cannot read properties of undefined (reading 'supportedModels')";
+    // 守卫后改成可定位的清晰错误(2026-07-04 review follow-up)。
+    ;(config.claude as any).bin = '/nope/reclaude'
+    try {
+      const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' })
+      proc.sendInitialize() // 走 catch,this.query 仍 undefined
+
+      await expect(proc.listModels()).rejects.toThrow('SDK query not initialized')
+      await expect(proc.setModelSettings('opus', 'high')).rejects.toThrow('SDK query not initialized')
+    } finally {
+      delete (config.claude as any).bin
+    }
+  })
+})
+
 describe('Claude permission mode', () => {
   test('runs Claude Code in bypass permission mode', () => {
     expect(CLAUDE_PERMISSION_MODE).toBe('bypassPermissions')
