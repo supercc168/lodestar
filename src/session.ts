@@ -2710,7 +2710,7 @@ export class Session {
     if (modelLabel) line1Parts.push(modelLabel)
     const footerLine1 = line1Parts.join(' ｜ ')
     const footerLine2 = opts.hasFreshResult
-      ? cards.footerTokenDetailLine(this.lastTurnUsage) + await this.footerFiveHourSuffix()
+      ? cards.footerTokenDetailLine(this.lastTurnUsage) + (turn.rotateGivenUp ? '' : await this.footerFiveHourSuffix())
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
     await this.replaceFooterContent(cardId, footer)
@@ -2735,7 +2735,9 @@ export class Session {
     // empty suffix but the user still needs to know we bailed.
     // Fire-and-forget; urgent_app failures are non-fatal and already
     // logged in feishu.ts.
-    if ((opts.forcePush || !suffix) && turn.userOpenId && turn.messageId) {
+    // log-only 的 turn 已发过"仅日志可见"告警,用户知晓 —— 不再为
+    // 一张写死的卡响手机推送(2026-07-04 review follow-up)。
+    if ((opts.forcePush || !suffix) && turn.userOpenId && turn.messageId && !turn.rotateGivenUp) {
       void feishu.urgentApp(turn.messageId, [turn.userOpenId])
     }
 
