@@ -21,6 +21,7 @@ import {
   reviewHeadRef,
   taskArtifactTag,
 } from './tasklist-worker-git'
+import * as tasklistCards from './tasklist-cards'
 export { localReviewRef, reviewDiffSpec, reviewHeadRef, taskArtifactTag } from './tasklist-worker-git'
 import type {
   AutomationProcessRecord,
@@ -64,6 +65,7 @@ export async function runTasklistWorkerOnce(): Promise<void> {
     for (const binding of tasklist.listTasklistBindings()) {
       await processTasklist(binding.projectName)
     }
+    tasklistCards.settleIdleProjects()
   } catch (e) {
     log(`tasklist-worker: scan failed: ${messageOf(e)}`)
   } finally {
@@ -76,6 +78,7 @@ async function processTasklist(projectName: string): Promise<void> {
   try {
     if (!existsSync(projectDir)) throw new Error(`project directory does not exist: ${projectDir}`)
     let binding = await tasklist.ensureTasklistSections(projectName)
+    tasklistCards.backfillChatId(projectName)
     await markStaleRunningProcesses(projectName, binding)
     binding = tasklist.getTasklistBinding(projectName) ?? binding
     const buckets = await scanTaskSections(binding)
@@ -680,6 +683,7 @@ async function runAgentProcess(opts: {
   })
   record = { ...record, pid: proc.pid || undefined }
   storeProcessRecord(opts.projectName, record)
+  tasklistCards.onRunStart(record)
   if (opts.taskGuid && opts.refKey) {
     markRunOnTask(opts.projectName, opts.taskGuid, opts.refKey, runId, opts.fingerprint, 'running')
   }
@@ -689,7 +693,10 @@ async function runAgentProcess(opts: {
   const stderrDecoder = new StringDecoder('utf8')
   let stdout = ''
   let stderr = ''
-  proc.stdout.on('data', chunk => { stdout = tail(stdout + stdoutDecoder.write(chunk), PROCESS_OUTPUT_TAIL_LIMIT) })
+  proc.stdout.on('data', chunk => {
+    stdout = tail(stdout + stdoutDecoder.write(chunk), PROCESS_OUTPUT_TAIL_LIMIT)
+    tasklistCards.onRunStdout(runId, opts.projectName, stdout)
+  })
   proc.stderr.on('data', chunk => { stderr = tail(stderr + stderrDecoder.write(chunk), PROCESS_OUTPUT_TAIL_LIMIT) })
 
   const finished = await waitForProcess(proc, opts.timeoutMs)
@@ -709,6 +716,7 @@ async function runAgentProcess(opts: {
     error: finished.error ?? (finished.timedOut ? `${opts.kind} timed out after ${opts.timeoutMs / 1000}s` : undefined),
   }
   storeProcessRecord(opts.projectName, finalRecord)
+  tasklistCards.onRunSettle(finalRecord)
   if (opts.taskGuid && opts.refKey) {
     markRunOnTask(opts.projectName, opts.taskGuid, opts.refKey, runId, opts.fingerprint, status, finalRecord.error)
   }
