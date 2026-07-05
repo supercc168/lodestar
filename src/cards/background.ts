@@ -38,6 +38,7 @@ import type {
   BgTaskSettledEvent,
   BgTaskStatus,
 } from '../claude-agent-process'
+import { fmtElapsed } from './format'
 
 export type { BgTaskStatus }
 
@@ -371,17 +372,6 @@ function fmtTokens(n: number): string {
   if (n < 1000) return `${n}`
   if (n < 1_000_000) return `${(n / 1000).toFixed(1)}K`
   return `${(n / 1_000_000).toFixed(1)}M`
-}
-
-/** ms → "45s" / "2m13s" / "1h5m"。 */
-function fmtElapsed(ms: number): string {
-  if (!ms || ms < 0) return '0s'
-  const s = Math.floor(ms / 1000)
-  if (s < 60) return `${s}s`
-  const m = Math.floor(s / 60)
-  if (m < 60) return `${m}m${s % 60}s`
-  const h = Math.floor(m / 60)
-  return `${h}h${m % 60}m`
 }
 
 function ownerOf(t: BgTaskEntry): string {

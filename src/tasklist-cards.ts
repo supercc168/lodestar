@@ -1,0 +1,235 @@
+/**
+ * 任务清单自动化状态卡的 I/O 生命周期(按活跃波次 · per-project)。
+ *
+ * 纯累积/渲染在 cards/automation.ts;这里持内存卡句柄、开卡/30s tick 刷新/
+ * 沉降,调 feishu + cardkit 写飞书。核心不变式:内存 burst 是唯一真源,所有
+ * 卡写都是尽力 reconcile;先改视图、再写卡;开卡未就绪时写卡跳过,靠开卡后
+ * 全量重建兜底。所有卡写失败绝不阻塞 tasklist-worker。
+ */
+
+import * as cardkit from './cardkit'
+import * as cards from './cards'
+import * as feishu from './feishu'
+import { log } from './log'
+import * as tasklist from './tasklist'
+import type { AutomationProcessRecord } from './tasklist'
+
+const REFRESH_TICK_MS = 30_000
+
+interface CardHandle {
+  chatId: string
+  messageId: string
+  cardId: string
+  /** 已 addElement 过 panel 的 runId(区分 add vs replace)。 */
+  addedPanels: Set<string>
+  refreshTimer: ReturnType<typeof setInterval> | null
+  /** cardkit 写失败(recordCardCreated 回调置)后停止一切刷卡。 */
+  cardWriteFailed: boolean
+}
+
+interface ProjectCard {
+  projectName: string
+  burst: cards.AutomationBurst
+  handle: CardHandle | null
+}
+
+const cardsByProject = new Map<string, ProjectCard>()
+const opening = new Set<string>()
+
+function getOrInit(projectName: string): ProjectCard {
+  let pc = cardsByProject.get(projectName)
+  if (!pc) { pc = { projectName, burst: cards.emptyBurst(), handle: null }; cardsByProject.set(projectName, pc) }
+  return pc
+}
+
+/** 测试清理:清空内存卡壳 + 停所有 tick timer(仅供 *.test.ts)。 */
+export function __resetCardsForTest(): void {
+  for (const pc of cardsByProject.values()) if (pc.handle?.refreshTimer) clearInterval(pc.handle.refreshTimer)
+  cardsByProject.clear()
+  opening.clear()
+}
+
+/** §6 chatId 解析(DI 纯):优先 binding.chatId,回退 lookup。lookup 注入以便单测。 */
+export function resolveChatId(
+  binding: { chatId?: string; projectName: string },
+  lookup: (name: string) => string | null,
+): string | null {
+  return binding.chatId ?? lookup(binding.projectName)
+}
+
+/** §6 步骤2 决策(DI 纯):缺 chatId 时返回待落库 chatId,否则 null。 */
+export function computeBackfill(
+  binding: { chatId?: string; projectName: string } | null,
+  lookup: (name: string) => string | null,
+): string | null {
+  if (!binding || binding.chatId) return null
+  return lookup(binding.projectName)
+}
+
+/** §6 步骤2:旧 binding 缺 chatId 时 worker 每轮开头调一次,解析成功即持久化。 */
+export function backfillChatId(projectName: string): void {
+  const chatId = computeBackfill(tasklist.getTasklistBinding(projectName), feishu.chatIdForSession)
+  if (!chatId) return
+  try {
+    tasklist.updateTasklistBinding(projectName, b => { b.chatId = chatId })
+    log(`tasklist-cards: backfilled chatId for "${projectName}" → ${chatId}`)
+  } catch (e) {
+    log(`tasklist-cards: backfill chatId failed for "${projectName}": ${e}`)
+  }
+}
+
+function taskSummaryFor(projectName: string, taskGuid: string | undefined): string {
+  if (!taskGuid) return ''
+  return tasklist.getTasklistBinding(projectName)?.tasks?.[taskGuid]?.summary ?? ''
+}
+
+// ── worker hook(先改视图,再尽力写卡) ─────────────────────────────────
+
+export function onRunStart(record: AutomationProcessRecord): void {
+  try {
+    if (!cards.isCardedKind(record.kind)) return
+    const pc = getOrInit(record.projectName)
+    pc.burst = cards.burstAddRun(
+      pc.burst, record.runId, record.kind, record.taskGuid,
+      taskSummaryFor(record.projectName, record.taskGuid), Date.now(),
+    )
+    if (pc.handle) { renderRun(pc, record.runId); patchSummary(pc) }
+    else if (!opening.has(record.projectName)) void openCard(record.projectName)
+    // opening 中:仅落视图,openCard 完成后 reconcileAll 兜底。
+  } catch (e) {
+    log(`tasklist-cards: onRunStart failed: ${e}`)
+  }
+}
+
+export function onRunStdout(runId: string, projectName: string, tail: string): void {
+  try {
+    const pc = cardsByProject.get(projectName)
+    if (!pc) return
+    pc.burst = cards.burstUpdateStdout(pc.burst, runId, tail)
+    // 不主动写卡;30s tick 统一重渲染 running panel。
+  } catch (e) {
+    log(`tasklist-cards: onRunStdout failed: ${e}`)
+  }
+}
+
+export function onRunSettle(record: AutomationProcessRecord): void {
+  try {
+    if (!cards.isCardedKind(record.kind)) return
+    const pc = cardsByProject.get(record.projectName)
+    if (!pc) return
+    const processStatus: 'exited' | 'failed' = record.status === 'exited' ? 'exited' : 'failed'
+    pc.burst = cards.burstSettleRun(pc.burst, record.runId, processStatus, record.error, Date.now())
+    if (pc.handle) { renderRun(pc, record.runId); patchSummary(pc) }
+  } catch (e) {
+    log(`tasklist-cards: onRunSettle failed: ${e}`)
+  }
+}
+
+/** worker 每轮扫描末尾调一次:空闲计数 + 达阈值沉降。 */
+export function settleIdleProjects(): void {
+  try {
+    for (const pc of [...cardsByProject.values()]) {
+      const { burst, shouldSettle } = cards.burstMarkScan(pc.burst)
+      pc.burst = burst
+      if (!shouldSettle) continue
+      if (pc.handle) void settleCard(pc.projectName)
+      // 无卡空壳:仅在没有 openCard 在途时才清。若正在开卡(handle 未就绪),此时清了
+      // 壳,飞书那边可能已发出的卡就没人管了(orphan);留给 openCard 完成/失败后自然
+      // 处理(成功设 handle 供下轮沉降,或失败在 finally 清 opening 后下轮再回收)。
+      else if (!opening.has(pc.projectName)) cardsByProject.delete(pc.projectName)
+    }
+  } catch (e) {
+    log(`tasklist-cards: settleIdleProjects failed: ${e}`)
+  }
+}
+
+// ── 内部 I/O ──────────────────────────────────────────────────────────
+
+async function openCard(projectName: string): Promise<void> {
+  opening.add(projectName)
+  try {
+    const pc = cardsByProject.get(projectName)
+    if (!pc || pc.handle) return
+    const binding = tasklist.getTasklistBinding(projectName)
+    if (!binding) return
+    const chatId = resolveChatId(binding, feishu.chatIdForSession)
+    if (!chatId) { log(`tasklist-cards: no chatId for "${projectName}", skip card this burst`); return }
+    // 开卡前一次性快照 runs:openCard 跨两个 await,期间 onRunStart 可能已给同项目
+    // 追加新 run(onRunStart 只挡"开卡调用"这一次,不挡视图追加)。若后续用 post-await
+    // 的 pc.burst.runs 重新取值,会把"发卡时其实没写进去"的 run 误标进 addedPanels,
+    // 导致 reconcileAll 对一个从未 addElement 过的 element_id 发 replaceElement → 飞书拒绝。
+    const initialRuns = pc.burst.runs
+    const messageId = await feishu.sendCard(chatId, cards.automationLiveCard(projectName, initialRuns))
+    if (!messageId) { log(`tasklist-cards: sendCard failed for "${projectName}"`); return }
+    let cardId: string
+    try { cardId = await cardkit.convertMessageToCard(messageId) }
+    catch (e) { log(`tasklist-cards: convertMessageToCard failed "${projectName}": ${e}`); return }
+    // 两次 await 期间,settleIdleProjects 可能已把这个空壳 pc(handle 仍为 null)当空闲
+    // 沉降清掉。此时 registry 里要么没有条目、要么是新壳的 pc,和局部变量 pc 不再是
+    // 同一对象 —— 说明这次开卡已被回收/替换,不能再提交 handle,否则 timer 挂在一个
+    // 没人引用的孤儿 pc 上永远泄漏,飞书那张卡也再没人更新。
+    if (cardsByProject.get(projectName) !== pc) return // reaped/replaced while opening; abandon
+    const handle: CardHandle = {
+      chatId, messageId, cardId,
+      addedPanels: new Set(initialRuns.map(r => r.runId)),
+      refreshTimer: null, cardWriteFailed: false,
+    }
+    cardkit.recordCardCreated(cardId, initialRuns.length, () => { handle.cardWriteFailed = true })
+    pc.handle = handle
+    // 开卡后全量重建:吸收异步开卡窗口内 settle/stdout 对视图的改动。
+    reconcileAll(pc)
+    handle.refreshTimer = setInterval(() => tick(projectName), REFRESH_TICK_MS)
+  } catch (e) {
+    log(`tasklist-cards: openCard error "${projectName}": ${e}`)
+  } finally {
+    opening.delete(projectName)
+  }
+}
+
+/** 30s tick:只重渲染仍 running 的 panel(刷时长/tail)+ 刷 summary。 */
+function tick(projectName: string): void {
+  const pc = cardsByProject.get(projectName)
+  if (!pc || !pc.handle || pc.handle.cardWriteFailed) return
+  const now = Date.now()
+  for (const run of pc.burst.runs) if (run.status === 'running') renderRun(pc, run.runId, now)
+  patchSummary(pc)
+}
+
+/** 单 run 渲染:未加过 panel → addElement;加过 → replaceElement。cardkit 内部
+ *  队列化 + 失败经 recordCardCreated 回调置 cardWriteFailed,故此处 void 即可。 */
+function renderRun(pc: ProjectCard, runId: string, now: number = Date.now()): void {
+  const handle = pc.handle
+  if (!handle || handle.cardWriteFailed) return
+  const run = pc.burst.runs.find(r => r.runId === runId)
+  if (!run) return
+  const panel = cards.automationRunPanel(run, now)
+  if (handle.addedPanels.has(runId)) {
+    void cardkit.replaceElement(handle.cardId, cards.AUTO_ELEMENTS.panel(runId), panel)
+  } else {
+    handle.addedPanels.add(runId)
+    void cardkit.addElement(handle.cardId, panel)
+  }
+}
+
+function reconcileAll(pc: ProjectCard): void {
+  const now = Date.now()
+  for (const run of pc.burst.runs) renderRun(pc, run.runId, now)
+  patchSummary(pc)
+}
+
+function patchSummary(pc: ProjectCard): void {
+  if (!pc.handle || pc.handle.cardWriteFailed) return
+  cardkit.patchSummaryThrottled(pc.handle.cardId, `🧭 ${pc.projectName} 自动化 · ${cards.summarizeAutomation(pc.burst.runs)}`)
+}
+
+async function settleCard(projectName: string): Promise<void> {
+  const pc = cardsByProject.get(projectName)
+  cardsByProject.delete(projectName)
+  if (!pc || !pc.handle) return
+  if (pc.handle.refreshTimer) clearInterval(pc.handle.refreshTimer)
+  try {
+    await feishu.updateCard(pc.handle.messageId, cards.automationHistoryCard(projectName, pc.burst.runs))
+  } catch (e) {
+    log(`tasklist-cards: settleCard updateCard failed "${projectName}": ${e}`)
+  }
+}

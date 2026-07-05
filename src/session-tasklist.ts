@@ -21,6 +21,18 @@ function tasklistPanel(
 }
 
 export async function showTasklistPanel(s: Session): Promise<void> {
+  const projectName = s.worktreeProjectName()
+  const binding = tasklist.getTasklistBinding(projectName)
+  // §6 步骤3:旧 binding 缺 chatId → 用当前群自愈写入,让自动化状态卡能定位群。
+  if (binding && !binding.chatId) {
+    try {
+      tasklist.updateTasklistBinding(projectName, b => { b.chatId = s.chatId })
+      log(`session "${s.sessionName}": backfilled tasklist chatId → ${s.chatId}`)
+      await feishu.sendTextRaw(s.chatId, '✅ 已将自动化状态卡绑定到本群')
+    } catch (e) {
+      log(`session "${s.sessionName}": tasklist chatId self-heal failed: ${messageOf(e)}`)
+    }
+  }
   const messageId = await feishu.sendCard(s.chatId, tasklistPanel(s))
   if (!messageId) await feishu.sendTextRaw(s.chatId, '❌ task 面板发送失败')
 }
