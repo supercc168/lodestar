@@ -1,21 +1,22 @@
 /**
- * Auto-install the `feishu-notify` skill so the user's main Codex
- * session (the one they type into at the terminal) can push to any
- * bound group via `/notify` without the user manually placing the
- * skill file.
+ * Auto-install the `feishu-notify` skill into BOTH agent backends
+ * lodestar supports — Codex (`~/.codex/skills/`) and Claude Code
+ * (`~/.claude/skills/`) — so whichever the user drives at the terminal
+ * can push to any bound group via `/notify` without manually placing
+ * the skill file.
  *
- * Why daemon writes this file:
+ * Why daemon writes these files:
  *
- * Skills are discovered from `~/.codex/skills/<name>/SKILL.md` at startup.
- * So the only way to
+ * Skills are discovered from `~/.codex/skills/<name>/SKILL.md` and
+ * `~/.claude/skills/<name>/SKILL.md` at startup. So the only way to
  * "ship with the daemon" without making the user run `cp` is to have
- * the daemon write the file itself.
+ * the daemon write the files itself.
  *
- * Idempotent: re-runs on every daemon boot. If the on-disk content
- * matches what we'd write, no I/O. If different (daemon upgraded with
- * a new skill body, or the user hand-edited it), overwrite with the
- * daemon's canonical version. The user's edits are not preserved by
- * design — daemon owns this skill, version-locked.
+ * Idempotent: re-runs on every daemon boot, per location. If the
+ * on-disk content matches what we'd write, no I/O. If different (daemon
+ * upgraded with a new skill body, or the user hand-edited it), overwrite
+ * with the daemon's canonical version. The user's edits are not
+ * preserved by design — daemon owns this skill, version-locked.
  *
  * Reasonable opt-out: setting `LODESTAR_DISABLE_SKILL_SYNC=1` skips
  * the sync, for users who want to maintain the skill content
@@ -208,15 +209,25 @@ export function ensureFeishuNotifySkill(): void {
     log('skill: sync disabled via LODESTAR_DISABLE_SKILL_SYNC, skip')
     return
   }
-  const skillFile = join(homedir(), '.codex', 'skills', SKILL_FRONTMATTER_NAME, 'SKILL.md')
+  // Sync to BOTH agent backends lodestar supports — Codex (codex CLI) and
+  // Claude Code. Same body, two locations; each is idempotent and a per-
+  // location failure (e.g. one dir not created yet) doesn't block the
+  // other. Both follow the same `*/<name>/SKILL.md` convention.
+  const skillDirs = [
+    join(homedir(), '.codex', 'skills'),
+    join(homedir(), '.claude', 'skills'),
+  ]
   const desired = skillBody(config.notify.port)
-  try {
-    const current = existsSync(skillFile) ? readFileSync(skillFile, 'utf8') : null
-    if (current === desired) return  // already up to date
-    mkdirSync(dirname(skillFile), { recursive: true })
-    writeFileSync(skillFile, desired)
-    log(`skill: ${current === null ? 'installed' : 'updated'} ${skillFile}`)
-  } catch (e) {
-    log(`skill: sync failed (${skillFile}): ${e}`)
+  for (const dir of skillDirs) {
+    const skillFile = join(dir, SKILL_FRONTMATTER_NAME, 'SKILL.md')
+    try {
+      const current = existsSync(skillFile) ? readFileSync(skillFile, 'utf8') : null
+      if (current === desired) continue  // already up to date
+      mkdirSync(dirname(skillFile), { recursive: true })
+      writeFileSync(skillFile, desired)
+      log(`skill: ${current === null ? 'installed' : 'updated'} ${skillFile}`)
+    } catch (e) {
+      log(`skill: sync failed (${skillFile}): ${e}`)
+    }
   }
 }
