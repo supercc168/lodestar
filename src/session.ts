@@ -103,6 +103,9 @@ function mergeCompactionNotices(
 }
 
 const FOOTER_STATUS_TICK_MS = 1000
+/** 后台游标卡周期刷新间隔:无 task_progress 事件的 shell 后台任务(如 codex exec)靠
+ *  这个 tick 定时 replaceElement 刷 panel header 的运行时长,否则冻在开卡那刻。 */
+const BACKGROUND_REFRESH_TICK_MS = 2000
 const FOOTER_THINKING_PREFIX = 'Thinking...'
 const FOOTER_WRITING = 'Writing...'
 const FOOTER_WORKING = 'Working...'
@@ -165,6 +168,9 @@ export class Session {
   backgroundCard: { messageId: string; cardId: string } | null = null
   /** task_progress 风暴的刷新节流 timer。 */
   private backgroundRefreshTimer: ReturnType<typeof setTimeout> | null = null
+  /** 后台卡周期 tick:每 BACKGROUND_REFRESH_TICK_MS 刷一次活跃任务的 header 时长,
+   *  治无 task_progress 的 shell 后台任务时长冻结。活卡期间常驻,沉降/迁移时清。 */
+  private backgroundRefreshTick: ReturnType<typeof setInterval> | null = null
   /** openBackgroundCard 进行中标记 —— 防止并发 bg_task 事件在 await sendCard
    *  期间重复开卡(sendCard 未返回前 backgroundCard 仍 null,第二个事件会再开一张)。 */
   private openingBackground = false
@@ -1566,6 +1572,15 @@ export class Session {
     this.pendingBgTasks = next.pending
   }
 
+  /** 主线程推进(新的主线程 tool_use / assistant 段定稿):pending 观察池里还没结算
+   *  的 task 都没在阻塞主线程 —— 判为后台,提升到 active 入卡。治 run_in_background
+   *  的 Bash 不发 is_backgrounded、永远卡 pending 不渲染。 */
+  private onMainThreadAdvance(): void {
+    if (this.pendingBgTasks.length === 0) return
+    this.applyBgStore(cards.promotePendingOnAdvance(this.bgStore()))
+    this.onBackgroundTaskChanged()
+  }
+
   /** parentToolUseId 是否归属某个已知后台 task(active 入卡池或 pending 观察池)。
    *  子 agent 前台跑时在 pending,提升后在 active,两池都要认才能持续累积 steps。 */
   private bgTaskOwns(parentToolUseId: string): boolean {
@@ -1611,6 +1626,25 @@ export class Session {
     this.backgroundCard = { messageId, cardId }
     this.backgroundDetailAdded = new Set(this.backgroundTasks.map(t => t.id))
     log(`session "${this.sessionName}": background card opened cardId=${cardId.slice(0, 12)} tasks=${this.backgroundTasks.length}`)
+    this.startBackgroundRefreshTick()
+  }
+
+  /** 周期 tick:无 task_progress 事件的 shell 后台任务(如 codex exec)靠它刷新 header
+   *  运行时长。事件触发的节流刷新(scheduleBackgroundRefresh)负责详情 diff,tick 只补时长。 */
+  private startBackgroundRefreshTick(): void {
+    if (this.backgroundRefreshTick) return
+    this.backgroundRefreshTick = setInterval(() => {
+      if (!this.backgroundCard) return
+      if (!cards.hasActiveBgTask(this.backgroundTasks)) return
+      this.refreshBackgroundCardFull()
+    }, BACKGROUND_REFRESH_TICK_MS)
+  }
+
+  private stopBackgroundRefreshTick(): void {
+    if (this.backgroundRefreshTick) {
+      clearInterval(this.backgroundRefreshTick)
+      this.backgroundRefreshTick = null
+    }
   }
 
   /** 节流刷新:合并 1.5s 窗口内的 task_progress 风暴,避免打爆 cardkit。
@@ -1652,10 +1686,11 @@ export class Session {
       clearTimeout(this.backgroundRefreshTimer)
       this.backgroundRefreshTimer = null
     }
+    this.stopBackgroundRefreshTick()
     await cardkit.flush(handle.cardId)
     await feishu.updateCard(handle.messageId, cards.backgroundHistoryCard(this.backgroundTasks))
     cardkit.cancelSummary(handle.cardId)
-    await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({ suffix: '🧭 后台任务已结束' }))
+    await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({ suffix: '🧭 子agent已结束' }))
     await cardkit.dispose(handle.cardId)
     // 全部终态 → 清空 active 跟踪(已固化在历史卡);下次新后台 task 从空数组起步。
     // pending 观察池不动:前台 task 可能仍在跑,它们结算时自己从 pending 丢。
@@ -1674,6 +1709,7 @@ export class Session {
       clearTimeout(this.backgroundRefreshTimer)
       this.backgroundRefreshTimer = null
     }
+    this.stopBackgroundRefreshTick()
     const terminalCount = this.backgroundTasks.filter(cards.isBgTerminal).length
     await cardkit.flush(handle.cardId)
     if (terminalCount > 0) {
@@ -1826,9 +1862,14 @@ export class Session {
       // text_delta 之后同步到达(codex-process 按 stdout 行序 emit),所以
       // appendAssistant 已把全量累进 currentAssistantText,这里定稿拿到的是完整段。
       this.finalizeCurrentAssistantSegment()
+      // 主线程定稿一段 assistant = 主 agent 在继续说话、没在等 pending task → 提升后台入卡。
+      this.onMainThreadAdvance()
     })
     p.on('tool_use', ({ id, name, input, parentToolUseId }: { id: string; name: string; input: any; parentToolUseId: string | null }) => {
       sessionTools.addTool(this, id, name, input)
+      // 主线程发起新 tool_use = 主 agent 没在等 pending 里的 task → 它们是后台,提升入卡。
+      // 前台 task 的 settled 先于主线程下一个 tool_use 到达,pending 已空,不会误提。
+      if (!parentToolUseId) this.onMainThreadAdvance()
       // 主线程 Task tool_use(触发子 agent):记 id 供 task_started 缺 tool_use_id 时兜底关联
       if (!parentToolUseId && (name === 'Task' || name === 'Agent')) this.lastMainTaskToolUseId = id
       // 子 agent 内的工具调用(parentToolUseId 非空)额外累积进对应后台 task 的 steps[]。

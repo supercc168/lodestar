@@ -4,6 +4,7 @@ import {
   applyBgTaskStarted,
   applyBgTaskProgress,
   applyBgTaskUpdated,
+  promotePendingOnAdvance,
   applyBgTaskSettled,
   applyBgToolUse,
   applyBgToolResult,
@@ -52,15 +53,15 @@ describe('applyBgTaskStarted — 白名单直入 active / 前台落 pending', ()
     expect(s.pending[0].isBackgrounded).toBeUndefined()
   })
 
-  test('前台子 agent 进 pending', () => {
+  test('前台子 agent 直入 active 并标 isBackgrounded', () => {
     const s = applyBgTaskStarted(emptyBgStore(), { task_id: 'a1', description: '搜索', subagent_type: 'Explore' })
-    expect(s.active).toHaveLength(0)
-    expect(s.pending[0]).toMatchObject({ id: 'a1', type: 'subagent', subagentType: 'Explore' })
+    expect(s.pending).toHaveLength(0)
+    expect(s.active[0]).toMatchObject({ id: 'a1', type: 'subagent', subagentType: 'Explore', isBackgrounded: true })
   })
 
   test('local_ 前缀归一化:local_bash→shell / local_agent→subagent / local_workflow→workflow', () => {
     expect(applyBgTaskStarted(emptyBgStore(), { task_id: 'b', task_type: 'local_bash', description: 'x' }).pending[0].type).toBe('shell')
-    expect(applyBgTaskStarted(emptyBgStore(), { task_id: 'a', task_type: 'local_agent', description: 'x' }).pending[0].type).toBe('subagent')
+    expect(applyBgTaskStarted(emptyBgStore(), { task_id: 'a', task_type: 'local_agent', description: 'x' }).active[0].type).toBe('subagent')
     expect(applyBgTaskStarted(emptyBgStore(), { task_id: 'w', task_type: 'local_workflow', description: 'x' }).active[0].type).toBe('workflow')
   })
 
@@ -190,14 +191,14 @@ describe('applyBgToolUse / applyBgToolResult — 双池 steps 累积', () => {
     expect(applyBgToolUse(s, 'other_parent', 'tu_3', 'Read', { file_path: '/x' })).toBe(s)
   })
 
-  test('pending 里的前台子 agent 也累积 steps(提升前攒过程)', () => {
-    let s: BgStore = { active: [], pending: [mk({ id: 't1', toolUseId: 'p', status: 'running' })] }
+  test('pending 池的 task 也累积 steps(双池对称)', () => {
+    let s: BgStore = { active: [], pending: [mk({ id: 't1', type: 'shell', toolUseId: 'p', status: 'running' })] }
     s = applyBgToolUse(s, 'p', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
     expect(s.pending[0].steps).toHaveLength(1)
   })
 
   test('tool_result 按 tool_use_id 回填结果到对应 step(双池)', () => {
-    let s: BgStore = { active: [], pending: [mk({ id: 't1', toolUseId: 'p', status: 'running' })] }
+    let s: BgStore = { active: [], pending: [mk({ id: 't1', type: 'shell', toolUseId: 'p', status: 'running' })] }
     s = applyBgToolUse(s, 'p', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
     s = applyBgToolResult(s, 'p', 'tu_1', '命中 3 处', false)
     expect(s.pending[0].steps[0].brief).toBe('Grep "auth" in src → 命中 3 处')
@@ -222,19 +223,15 @@ describe('applyBgToolUse / applyBgToolResult — 双池 steps 累积', () => {
     expect(s.active[0].steps[s.active[0].steps.length - 1].brief).toContain('number/49')
   })
 
-  test('端到端:前台子 agent 攒 steps → 后台化提升 → steps 随 entry 到 active', () => {
+  test('端到端:前台子 agent started 直入 active,steps 直接落 active', () => {
     let s = emptyBgStore()
     s = applyBgTaskStarted(s, { task_id: 'a1', task_type: 'local_agent', description: '搜索', subagent_type: 'Explore', tool_use_id: 'p' })
+    expect(s.active).toHaveLength(1)
+    expect(s.pending).toHaveLength(0)
     s = applyBgToolUse(s, 'p', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
     s = applyBgToolResult(s, 'p', 'tu_1', '命中', false)
-    // 提升前:active 空,pending 攒了 steps
-    expect(s.active).toHaveLength(0)
-    expect(s.pending[0].steps).toHaveLength(1)
-    // 后台化 → 提升,steps 带到 active
-    s = applyBgTaskUpdated(s, { task_id: 'a1', patch: { is_backgrounded: true } })
-    expect(s.active).toHaveLength(1)
     expect(s.active[0].steps).toHaveLength(1)
-    expect(s.pending).toHaveLength(0)
+    expect(s.active[0].steps[0].brief).toBe('Grep "auth" in src → 命中')
   })
 })
 
@@ -263,6 +260,19 @@ describe('端到端:前台命令全程不进 active(治「随便跑个命令就�
   test('workflow 天生后台:started 即入 active', () => {
     const s = applyBgTaskStarted(emptyBgStore(), { task_id: 'w1', task_type: 'local_workflow', description: 'spec', workflow_name: 'spec' })
     expect(hasActiveBgTask(s.active)).toBe(true)
+  })
+})
+
+describe('summary 文案:🧭 子agent', () => {
+  test('live 卡 summary 用「🧭 子agent」', () => {
+    const card = backgroundLiveCard([mk({ id: 't1', type: 'subagent', subagentType: 'Explore', status: 'running' })]) as any
+    expect(card.config.summary.content).toContain('🧭 子agent')
+    expect(card.config.summary.content).not.toContain('后台任务')
+  })
+
+  test('history 卡 summary 用「🧭 子agent(历史)」', () => {
+    const card = backgroundHistoryCard([mk({ id: 't1', type: 'subagent', status: 'completed', endTime: 5000 })]) as any
+    expect(card.config.summary.content).toContain('🧭 子agent(历史)')
   })
 })
 
@@ -377,5 +387,41 @@ describe('整卡三态', () => {
   test('BG_ELEMENTS id 生成', () => {
     expect(BG_ELEMENTS.panel('t1')).toBe('bg_t1')
     expect(BG_ELEMENTS.body('t1')).toBe('bg_body_t1')
+  })
+})
+
+describe('promotePendingOnAdvance — 主线程推进判后台', () => {
+  test('pending 里的 shell task 在主线程推进时提升到 active,标 isBackgrounded', () => {
+    const s0 = applyBgTaskStarted(emptyBgStore(), { task_id: 'b1', task_type: 'local_bash', description: 'codex 出图' })
+    expect(s0.active).toHaveLength(0)
+    expect(s0.pending).toHaveLength(1)
+    const s1 = promotePendingOnAdvance(s0)
+    expect(s1.pending).toHaveLength(0)
+    expect(s1.active).toHaveLength(1)
+    expect(s1.active[0]).toMatchObject({ id: 'b1', isBackgrounded: true, status: 'running' })
+  })
+
+  test('空 pending 返回原引用(无推进 no-op)', () => {
+    const s = emptyBgStore()
+    expect(promotePendingOnAdvance(s)).toBe(s)
+  })
+
+  test('多个 pending task 全部提升,active 原有保留', () => {
+    let s = applyBgTaskStarted(emptyBgStore(), { task_id: 'b1', task_type: 'local_bash', description: 'a' })
+    s = applyBgTaskStarted(s, { task_id: 'b2', task_type: 'local_agent', subagent_type: 'Explore', description: 'b' })
+    const r = promotePendingOnAdvance(s)
+    expect(r.active).toHaveLength(2)
+    expect(r.pending).toHaveLength(0)
+    expect(r.active.map(t => t.id).sort()).toEqual(['b1', 'b2'])
+    expect(r.active.every(t => t.isBackgrounded === true)).toBe(true)
+  })
+
+  test('前台 task 先结算被从 pending 丢,推进时不会被提', () => {
+    // 前台生命周期:started(pending) → settled(从 pending 丢);主线程推进时 pending 已空
+    let s = applyBgTaskStarted(emptyBgStore(), { task_id: 'f1', task_type: 'local_bash', description: 'echo' })
+    s = applyBgTaskSettled(s, { task_id: 'f1', status: 'completed' })
+    expect(s.pending).toHaveLength(0)
+    const r = promotePendingOnAdvance(s)
+    expect(r.active).toHaveLength(0)
   })
 })
