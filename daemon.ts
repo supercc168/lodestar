@@ -23,6 +23,18 @@ import { dirname } from 'node:path'
 import { Session } from './src/session'
 import * as feishu from './src/feishu'
 import { actionCardResponse } from './src/card-action'
+import {
+  get as getNotifyCallback,
+  markResolved as markNotifyCallbackResolved,
+  dispatchCallback,
+  isDispatching,
+  setDispatching,
+  clearDispatching,
+  loadCallbacks,
+  type NotifyButton,
+  type NotifyRegistration,
+} from './src/notify-callbacks'
+import { buildNotifyCardFromReg } from './src/notify'
 import { startNotifyServer } from './src/notify'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
 import { startTasklistWorker } from './src/tasklist-worker'
@@ -378,6 +390,15 @@ async function handleCardAction(data: any): Promise<any> {
   if (!value?.kind) return
   const chatId = data?.context?.open_chat_id ?? ''
   const userId = data?.operator?.open_id ?? ''
+
+  // Interactive /notify cards must route even when no Session exists for
+  // this chat — a notify push doesn't start a session, and the click's
+  // job is to ping the local caller, not drive a turn. Short-circuit
+  // before the session guard below.
+  if (value.kind === 'notify_callback') {
+    return await handleNotifyCallback(value, chatId, userId)
+  }
+
   const session = sessions.get(chatId)
   if (!session) return { toast: { type: 'error', content: '会话不存在，请先发消息启动' } }
 
@@ -456,6 +477,113 @@ async function handleCardAction(data: any): Promise<any> {
     }
   }
   return { toast: { type: 'info', content: 'unknown action' } }
+}
+
+// ── Interactive /notify button callback ───────────────────────────────
+// A group member tapped a button on a /notify card. Two visual phases
+// (push mode), both rendered via message.patch on the original card:
+//
+//   ACK: a toast ("⏳ 已选择:X · 推送中…") returned instantly. Deliberately
+//     NOT an inline card ACK, and NOT the callback-token endpoint:
+//       • Method 1 (inline card ACK) + a follow-up update silently fails
+//         to re-render.
+//       • The callback-token endpoint `/interactive/v1/card/update` is a
+//         legacy path that returns code=0 for our schema-2.0 card but
+//         draws it BLANK (verified live, 2026-07-05).
+//     So both card states go through message.patch AFTER the toast ACK.
+//     The AGENTS.md footgun ("don't message.patch around a click") is
+//     specifically BEFORE-ACK — the patch races the ACK response. After
+//     a toast ACK (no card in the response) there's nothing to race.
+//
+//   Phase 1: message.patch → "⏳ 已选择:X · 推送中…", fired immediately so
+//     the push's ~2.5s in-flight window shows progress.
+//   Phase 2: message.patch → "✅ 反馈已送达" / "⚠️ 回调失败:…" once the
+//     loopback push resolves.
+//
+// Pull / display-only mode (no callback) freezes on the verdict in a
+// single inline step (no push to wait for). Every failure is surfaced
+// on the card or toast — no silent swallow.
+async function handleNotifyCallback(value: any, _chatId: string, userId: string): Promise<any> {
+  const notifyId = String(value?.notify_id ?? '')
+  const buttonId = String(value?.button_id ?? '')
+  if (!notifyId) return { toast: { type: 'error', content: '回调缺少 notify_id' } }
+
+  const reg = getNotifyCallback(notifyId)
+  if (!reg) {
+    log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… not found (expired or pre-restart)`)
+    return { toast: { type: 'error', content: '通知已过期或已移除' } }
+  }
+  // Idempotency: a finalized card refuses re-fire ("已处理过"); an
+  // in-flight Phase-2 refuses concurrent double-click ("处理中"). Both
+  // prevent two members / a double-click from firing the push twice.
+  if (reg.resolvedAt) {
+    return { toast: { type: 'info', content: '已处理过' } }
+  }
+  if (isDispatching(notifyId)) {
+    return { toast: { type: 'info', content: '处理中…' } }
+  }
+  const button = reg.buttons.find((b) => b.id === buttonId)
+  if (!button) {
+    log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… unknown button_id="${buttonId}"`)
+    return { toast: { type: 'error', content: '未知按钮' } }
+  }
+
+  // Pull / display-only mode: no push to wait for — freeze on the
+  // verdict now (single phase).
+  if (!reg.callbackUrl) {
+    markNotifyCallbackResolved(reg.notifyId, button.id, userId)
+    log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… resolved button="${buttonId}" by=${userId.slice(0, 8)}… (no callback, pull/display)`)
+    return actionCardResponse(
+      buildNotifyCardFromReg(reg, { status: 'done', buttonId: button.id, text: button.text, operatorOpenId: userId }),
+    )
+  }
+
+  // Push mode: ACK with a toast immediately, then async drive BOTH card
+  // states via message.patch on the original card (Phase 1 processing →
+  // push → Phase 2 final). The dispatching guard is set synchronously
+  // here so a fast second click is blocked before the async work starts.
+  setDispatching(reg.notifyId)
+  void pushNotifyCallbackPhase2(reg, button, userId)
+  return { toast: { type: 'info', content: `⏳ 已选择:${button.text} · 推送中…` } }
+}
+
+// Drive the two card states via message.patch, fire-and-forget from
+// {@link handleNotifyCallback} so the ACK toasts fast. Phase 1
+// (processing) must precede the push so the in-flight window shows
+// progress; Phase 2 (delivered/failed) lands once the push resolves.
+// On push failure resolvedAt is NOT set (the dispatching guard is
+// cleared) so the user can tap again to retry.
+async function pushNotifyCallbackPhase2(
+  reg: NotifyRegistration,
+  button: NotifyButton,
+  userId: string,
+): Promise<void> {
+  // Phase 1: processing card via message.patch (after the toast ACK).
+  const processingCard = buildNotifyCardFromReg(reg, {
+    status: 'processing', buttonId: button.id, text: button.text, operatorOpenId: userId,
+  })
+  try {
+    await feishu.updateCard(reg.messageId, processingCard)
+  } catch (e) {
+    log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-1 (processing) updateCard failed: ${e instanceof Error ? e.message : e}`)
+  }
+
+  // Push + Phase 2 final card.
+  const result = await dispatchCallback(reg, button, userId)
+  const resolution = result.ok
+    ? { status: 'delivered' as const, buttonId: button.id, text: button.text, operatorOpenId: userId, reply: result.reply }
+    : { status: 'failed' as const, buttonId: button.id, text: button.text, operatorOpenId: userId, detail: result.detail }
+  const finalCard = buildNotifyCardFromReg(reg, resolution)
+  try {
+    await feishu.updateCard(reg.messageId, finalCard)
+  } catch (e) {
+    log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-2 (final) updateCard failed: ${e instanceof Error ? e.message : e}`)
+  }
+  if (result.ok) {
+    markNotifyCallbackResolved(reg.notifyId, button.id, userId)
+  }
+  clearDispatching(reg.notifyId)
+  log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… button="${button.id}" ${result.ok ? 'delivered' : `failed: ${result.detail}`} by=${userId.slice(0, 8)}…`)
 }
 
 // ── WebSocket boot ─────────────────────────────────────────────────────
@@ -787,6 +915,10 @@ async function boot(): Promise<void> {
   }, WS_WATCHDOG_INTERVAL_MS)
 
   startDebugSocket()
+  // Reload persisted /notify button→callback registrations before the
+  // notify server starts serving, so a card tapped right after a daemon
+  // restart still routes to its caller. Prunes entries older than 7 days.
+  loadCallbacks()
   startNotifyServer({ bind: config.notify.bind, port: config.notify.port })
 
   // Sync the feishu-notify skill into ~/.codex/skills (idempotent).

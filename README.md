@@ -125,6 +125,40 @@ curl -sS -X POST http://127.0.0.1:9876/notify \
   -d '{"project":"xxx","level":"warn","text":"卡点截图如下","images":["/abs/shot.png"]}'
 ```
 
+`/notify` 还支持**交互按钮**:带上 `buttons`(最多 5 个)和一个本机 `callback` URL,群里点按钮后夜航星会把选择 POST 回这个 URL,整条回路都在本机 loopback 上。
+
+```bash
+curl -sS -X POST http://127.0.0.1:9876/notify \
+  -H 'Content-Type: application/json' \
+  -d '{"project":"ops","text":"deploy ready — approve?",
+       "buttons":[
+         {"id":"approve","text":"✅ 通过","type":"primary"},
+         {"id":"reject","text":"❌ 拒绝","type":"danger"}
+       ],
+       "callback":"http://127.0.0.1:9999/hook"}'
+# → 200 {"ok":true,"chat_id":"oc_…","message_id":"om_…","notify_id":"nf_…"}
+```
+
+有人在飞书点了按钮,daemon 就向 `callback` POST 这样一个 JSON,你的本机服务 2xx 应答即可。卡片是**两段式**反馈:点击瞬间立刻冻结成「⏳ 已选择:X · 推送中…」,推送送达后再刷成「✅ … · 反馈已送达」(失败则「⚠️ … · 回调失败:原因」,可再点重试)。调用方还可以在 2xx **响应体**里回一段文本(JSON `{"text":"…"}` 或纯文本,≤500 字,支持飞书 markdown),daemon 会把它显示在最终卡片「反馈已送达」下面那一行 —— 比如回 `{"text":"已发布 v1.2.3,提交 abc123"}`:
+
+```json
+{"notify_id":"nf_…","message_id":"om_…","chat_id":"oc_…","project":"ops",
+ "button":{"id":"approve","text":"✅ 通过","type":"primary"},
+ "operator":{"open_id":"ou_…"},"timestamp":1700000000}
+```
+
+约束:`button.id` 需匹配 `^[A-Za-z0-9_-]{1,64}$` 且不重复;`button.text` ≤ 64 字(每个按钮独占一整行,放短句也行);`type` 为 `default`/`primary`/`danger`;按钮数量不限,有几个就往下排几行;`callback` 可选 —— 给了就是 push(必须是 `http://` 且 host 为 `127.0.0.1`/`localhost`/`::1`,否则 400;回调需在 ~2.5s 内 2xx,否则点选显示"回调失败"并保持可重试)。**不给 `callback` 就走 pull**:daemon 照样把卡片冻结在已选项上并记下结果,调用方拿 `notify_id` 去轮询:
+
+```bash
+curl -sS http://127.0.0.1:9876/notify/result/<notify_id>
+# 未点 → {"notify_id":"nf_…","project":"ops","message_id":"om_…","resolved":false}
+# 点后 → {"notify_id":"nf_…",...,"resolved":true,
+#         "button":{"id":"approve","text":"✅ 通过","type":"primary"},
+#         "resolved_at":1783242381786,"resolved_by":"ou_…"}
+```
+
+绑定持久化在 `~/.local/share/lodestar/notify-callbacks.json`,daemon 重启不丢,7 天后自动清理。
+
 ### 🧩 项目级隔离配置（外部项目接入）
 
 默认每个飞书群对应 `projects_root` 下同名目录,跑 Claude Code 默认工具集。当一个外部项目(不在 `projects_root` 下、且需要干净隔离的 agent)想接入时,在 `~/.config/lodestar/config.toml` 加一个 `[projects.<群名>]` 节即可 —— **未配置的项目行为完全不变**:
