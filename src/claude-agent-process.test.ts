@@ -825,9 +825,9 @@ describe('Claude transcript context tokens', () => {
 })
 
 describe('Claude project profile overrides', () => {
-  test('settingSourcesFromProfile falls back to user when absent', () => {
-    expect(settingSourcesFromProfile(undefined)).toEqual(['user'])
-    expect(settingSourcesFromProfile({})).toEqual(['user'])
+  test('settingSourcesFromProfile falls back to CLI parity (user+project+local) when absent', () => {
+    expect(settingSourcesFromProfile(undefined)).toEqual(['user', 'project', 'local'])
+    expect(settingSourcesFromProfile({})).toEqual(['user', 'project', 'local'])
   })
 
   test('settingSourcesFromProfile splits and trims comma-separated sources', () => {
@@ -835,9 +835,9 @@ describe('Claude project profile overrides', () => {
     expect(settingSourcesFromProfile({ settingSources: 'user, project' })).toEqual(['user', 'project'])
   })
 
-  test('settingSourcesFromProfile falls back when only blanks given', () => {
-    expect(settingSourcesFromProfile({ settingSources: '' })).toEqual(['user'])
-    expect(settingSourcesFromProfile({ settingSources: ' , ' })).toEqual(['user'])
+  test('settingSourcesFromProfile falls back to CLI parity when only blanks given', () => {
+    expect(settingSourcesFromProfile({ settingSources: '' })).toEqual(['user', 'project', 'local'])
+    expect(settingSourcesFromProfile({ settingSources: ' , ' })).toEqual(['user', 'project', 'local'])
   })
 
   test('toolsFromProfile falls back to claude_code preset when absent', () => {

@@ -457,11 +457,14 @@ const CLAUDE_ASK_DIALOG_KINDS = [
 export const CLAUDE_PERMISSION_MODE = 'bypassPermissions' as const
 export const CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS = true
 
-/** Default setting sources when no project profile overrides them. */
-const DEFAULT_SETTING_SOURCES: readonly string[] = ['user']
+/** Default setting sources when no project profile overrides them.
+ * Matches the bare `claude` CLI (user + project + local) so a project's
+ * CLAUDE.md / skills / agents / settings.json are honored when claude runs
+ * under lodestar — parity with launching claude directly in that dir. */
+const DEFAULT_SETTING_SOURCES: readonly string[] = ['user', 'project', 'local']
 
 /** Resolve SDK `settingSources` from a project profile's comma-separated
- * string (e.g. `"project"`), falling back to `['user']`. */
+ * string (e.g. `"project"`), falling back to CLI parity (user+project+local). */
 export function settingSourcesFromProfile(profile: ProjectProfile | undefined): string[] {
   if (!profile?.settingSources) return [...DEFAULT_SETTING_SOURCES]
   const list = profile.settingSources.split(',').map(s => s.trim()).filter(Boolean)
@@ -660,12 +663,15 @@ export class ClaudeAgentProcess extends EventEmitter {
     const model = resolveClaudeSdkModel(this.opts.model)
     const profile = this.opts.profile
     if (profile) {
-      log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? false} keepInstructions=${(profile.keepLodestarInstructions ?? true)}`)
+      log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? true} keepInstructions=${(profile.keepLodestarInstructions ?? true)}`)
     }
     const settingSources = settingSourcesFromProfile(profile)
     const toolsOption = toolsFromProfile(profile)
     const strictMcpConfig = profile?.strictMcp === true
-    const mcpServers = profile?.loadProjectMcp ? readProjectMcpServers(this.opts.workDir) : undefined
+    // Default true (CLI parity): discover <cwd>/.mcp.json like bare `claude`.
+    // readProjectMcpServers returns undefined when no .mcp.json is present, so
+    // this is a no-op for projects without one. Opt out: load_project_mcp = "false".
+    const mcpServers = profile?.loadProjectMcp !== false ? readProjectMcpServers(this.opts.workDir) : undefined
     // keepLodestarInstructions defaults to true; an explicit false drops
     // Lodestar's appended card/output markers for a fully isolated agent.
     const appendSystemPrompt = profile?.keepLodestarInstructions === false ? undefined : this.opts.appendSystemPrompt

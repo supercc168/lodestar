@@ -176,10 +176,10 @@ keep_lodestar_instructions = "true"
 | 字段 | 作用 | 默认 |
 | --- | --- | --- |
 | `cwd` | agent 工作目录(绝对路径) | `projects_root/<群名>` |
-| `setting_sources` | `project` 只读项目级设置,不加载用户级全局插件/技能 | `user` |
+| `setting_sources` | 显式列表如 `"project"`(只项目级,会丢全局)或 `"user,project"`;不配则**对齐裸 `claude` CLI**,读项目 `CLAUDE.md`/skills/agents/`settings.json` | `user,project,local` |
 | `strict_mcp` | 只挂下方项目 MCP,忽略全局 MCP | 关 |
 | `tools` | 允许的内置工具(逗号分隔);MCP 工具由 `load_project_mcp` 自动可用,不用列在这里 | claude_code 全套 |
-| `load_project_mcp` | 读取 `<cwd>/.mcp.json` 并挂载其 MCP 服务 | 关 |
+| `load_project_mcp` | 读取 `<cwd>/.mcp.json` 并挂载其 MCP 服务(对齐裸 `claude` 自动发现;无则无效果) | 开 |
 | `keep_lodestar_instructions` | 保留夜航星卡片/输出约定系统提示 | 开 |
 
 `strict_mcp = "true"` 时,项目 `.mcp.json` 是 agent 能挂上 MCP 的唯一通路 —— 全局插件/技能被全部挡掉,agent 干净专注。典型用法:外部自动化引擎在自己的目录里维护规则文件,夜航星负责飞书通道和卡片渲染,两者通过群消息驱动协作。
@@ -187,7 +187,7 @@ keep_lodestar_instructions = "true"
 > ⚠️ **这组配置必须完整,配一半会把对话卡死。** `[projects.*]` 的字段是联动的,任一项开启后,它依赖的链路都要一起配齐:
 >
 > - **`setting_sources = "project"`** 会排除用户级 `~/.claude/settings.json`。如果你的 GLM 路由 / `ANTHROPIC_BASE_URL` 是写在 `~/.claude/settings.json`(而不是 lodestar 的 `[claude.env]`),会被丢掉、请求发不出去 → 卡死。**走 `project` 模式时,GLM 路由必须落在 `config.toml` 的 `[claude.env]`**(`env` 不受 `setting_sources` 影响)。
-> - **`load_project_mcp = "true"`** 要求 `<cwd>/.mcp.json` 存在,且其声明的 MCP server 能秒级启动并完成 stdio 握手。server 卡住(路径错、二进制不存在、stdio 不响应)会让对话卡在真正调用模型之前 —— 表现是卡片底部一直 `Thinking...` 且 model 显示成 `<synthetic>`,此时模型其实根本没被调用。
+> - 项目 `<cwd>/.mcp.json` 现在**默认读取**(对齐裸 `claude`)。若它存在,其声明的 MCP server 必须能秒级启动并完成 stdio 握手 —— server 卡住(路径错、二进制不存在、stdio 不响应)会让对话卡在真正调用模型之前,表现是卡片底部一直 `Thinking...` 且 model 显示成 `<synthetic>`。要跳过:显式 `load_project_mcp = "false"`。
 > - **排查卡死**:看到 `model=<synthetic>` + 长时间 `Thinking`,先把 `[projects.*]` 整节注释掉重启 daemon;不卡了就是 profile 没配齐,按上面两条逐项检查。
 
 ---

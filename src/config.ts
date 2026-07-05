@@ -74,7 +74,8 @@ export interface ProjectProfile {
   strictMcp?: boolean
   /** Comma-separated built-in tool allow-list, e.g. `"Read,Write,Edit,Bash,Glob,Grep"`. */
   tools?: string
-  /** Read `<cwd>/.mcp.json` and pass its servers to the SDK. */
+  /** Read `<cwd>/.mcp.json` and pass its servers to the SDK. Default true
+   * (parity with bare `claude`, which discovers project .mcp.json). */
   loadProjectMcp?: boolean
   /** Keep Lodestar's appended system instructions (card markers etc). Default true. */
   keepLodestarInstructions?: boolean
