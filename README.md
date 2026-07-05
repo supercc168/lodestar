@@ -94,101 +94,70 @@ lodestar-setup
 
 `task` 面板里的 `删` 会二次确认,确认后删除整个清单和清单内任务。这个能力需要飞书应用开通任务清单/任务/评论相关权限;缺权限时面板会显示 Open API 返回的失败原因和缺失 scope。
 
-### 🔀 自定义 Claude Code 可执行文件(reclaude 等)
+### 🔔 HTTP 通知端点
 
-默认自动查找 `claude`(`~/.local/npm-global/bin` → `~/.local/bin` → PATH,都没有则用 SDK 自带二进制)。要换成 [reclaude](https://docs.reclaude.ai) 这类"参数原样透传给 claude"的包装器,在 `config.toml` 显式指定:
+本机任意脚本一行 curl 就能往群里推一张 markdown 卡片:`info` / `warn` / `error` 三档染色,正文支持飞书 markdown,还能附本地图片、加交互按钮、把点击结果 POST 回你自己的回调。这条能力对应的 skill,daemon 每次启动会自动装进 `~/.claude/skills/` 和 `~/.codex/skills/`(不用自己放文件),完整字段、按钮和回调协议看 [`feishu-notify` skill](src/notify-skill.ts)。
+
+推一条带图的告警:
+
+```bash
+curl -sS -X POST http://127.0.0.1:9876/notify \
+  -H 'Content-Type: application/json' \
+  -d '{"project":"ops","level":"error","text":"卡点了,截图如下","images":["/abs/shot.png"]}'
+```
+
+发一张带按钮的审批卡,点了按钮 daemon 把选择 POST 回你本机的 callback:
+
+```bash
+curl -sS -X POST http://127.0.0.1:9876/notify \
+  -H 'Content-Type: application/json' \
+  -d '{"project":"ops","text":"deploy ready — 审批?",
+       "buttons":[
+         {"id":"approve","text":"✅ 通过","type":"primary"},
+         {"id":"reject","text":"❌ 拒绝","type":"danger"}
+       ],
+       "callback":"http://127.0.0.1:9999/hook"}'
+```
+
+---
+
+## ⚙️ 配置参考
+
+配置在 `~/.config/lodestar/config.toml`,`lodestar-setup` 会帮你生成,手改也行。两个常被问的:
+
+### 想让某个外部项目跑在别的目录?
+
+默认群名就是 `projects_root` 下的目录名。但如果你的项目放在别处、不想搬进来,在 config.toml 指一下它的目录就行,其它项目不受影响:
+
+```toml
+[projects.calculator2]
+cwd = "/abs/path/to/calculator2"
+```
+
+下面几个开关是给"想在这个项目里跑个更受限的 Claude session"的人准备的(限定工具、只挂项目自己的 MCP、只读项目级配置之类)。普通用法用不着,默认全不开,也只对 Claude 后端有效。**要开就整节配齐,配一半对话会卡死**:
+
+```toml
+[projects.calculator2]
+cwd                        = "/abs/path/to/calculator2"
+setting_sources            = "project"   # 只读项目级配置(会丢全局)
+strict_mcp                 = "true"      # 只挂项目 .mcp.json,挡掉全局 MCP
+tools                      = "Read,Write,Edit,Bash,Glob,Grep"
+load_project_mcp           = "true"      # 读 <cwd>/.mcp.json
+keep_lodestar_instructions = "true"      # 保留夜航星卡片/输出约定
+```
+
+> 最常踩的坑:`setting_sources = "project"` 会把 `~/.claude/settings.json` 里的 GLM 路由一起丢掉 —— 走 project 模式时,GLM 路由得改落在 config.toml 的 `[claude.env]` 里。要是看到卡片一直 `Thinking...`、model 显示 `<synthetic>`,先把整节注释掉重启,基本就是这几个开关没配齐。
+
+### 想换成 reclaude 之类的 claude 包装器?
+
+默认 lodestar 自己找 `claude`。想让它改用 [reclaude](https://docs.reclaude.ai)(或别的"参数原样透传"的包装器),指定一下路径:
 
 ```toml
 [claude]
 bin = "~/.local/bin/reclaude"
 ```
 
-配置后跳过自动查找;路径不存在会在会话启动时直接报错,不会静默回退。日志里 `executable=config:<路径>` 可确认生效。
-
-迁移到 reclaude 时注意:`[claude.env]` 或 `~/.claude/settings.json` 里遗留的 GLM `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 必须清掉 —— base URL 指向 GLM 时流量不经官方域名,reclaude 的拦截不会生效,烧的还是 GLM 额度。`[claude.models.*]` 里的 GLM profile 也需换回官方模型档位。
-
-### 🔔 HTTP 通知端点
-
-本机任何脚本一行 curl 就能往群里推一张 markdown 卡片(info / warn / error 三档染色):
-
-```bash
-curl -sS -X POST http://127.0.0.1:9876/notify \
-  -H 'Content-Type: application/json' \
-  -d '{"project":"xxx","text":"build done","level":"info"}'
-```
-
-`/notify` 还支持可选的 `images` 字段,传本地图片绝对路径,夜航星上传到飞书后渲染在正文之前(上传失败会在卡片里显式标红,不会静默丢):
-
-```bash
-curl -sS -X POST http://127.0.0.1:9876/notify \
-  -H 'Content-Type: application/json' \
-  -d '{"project":"xxx","level":"warn","text":"卡点截图如下","images":["/abs/shot.png"]}'
-```
-
-`/notify` 还支持**交互按钮**:带上 `buttons`(最多 5 个)和一个本机 `callback` URL,群里点按钮后夜航星会把选择 POST 回这个 URL,整条回路都在本机 loopback 上。
-
-```bash
-curl -sS -X POST http://127.0.0.1:9876/notify \
-  -H 'Content-Type: application/json' \
-  -d '{"project":"ops","text":"deploy ready — approve?",
-       "buttons":[
-         {"id":"approve","text":"✅ 通过","type":"primary"},
-         {"id":"reject","text":"❌ 拒绝","type":"danger"}
-       ],
-       "callback":"http://127.0.0.1:9999/hook"}'
-# → 200 {"ok":true,"chat_id":"oc_…","message_id":"om_…","notify_id":"nf_…"}
-```
-
-有人在飞书点了按钮,daemon 就向 `callback` POST 这样一个 JSON,你的本机服务 2xx 应答即可。卡片是**两段式**反馈:点击瞬间立刻冻结成「⏳ 已选择:X · 推送中…」,推送送达后再刷成「✅ … · 反馈已送达」(失败则「⚠️ … · 回调失败:原因」,可再点重试)。调用方还可以在 2xx **响应体**里回一段文本(JSON `{"text":"…"}` 或纯文本,≤500 字,支持飞书 markdown),daemon 会把它显示在最终卡片「反馈已送达」下面那一行 —— 比如回 `{"text":"已发布 v1.2.3,提交 abc123"}`:
-
-```json
-{"notify_id":"nf_…","message_id":"om_…","chat_id":"oc_…","project":"ops",
- "button":{"id":"approve","text":"✅ 通过","type":"primary"},
- "operator":{"open_id":"ou_…"},"timestamp":1700000000}
-```
-
-约束:`button.id` 需匹配 `^[A-Za-z0-9_-]{1,64}$` 且不重复;`button.text` ≤ 64 字(每个按钮独占一整行,放短句也行);`type` 为 `default`/`primary`/`danger`;按钮数量不限,有几个就往下排几行;`callback` 可选 —— 给了就是 push(必须是 `http://` 且 host 为 `127.0.0.1`/`localhost`/`::1`,否则 400;回调需在 ~2.5s 内 2xx,否则点选显示"回调失败"并保持可重试)。**不给 `callback` 就走 pull**:daemon 照样把卡片冻结在已选项上并记下结果,调用方拿 `notify_id` 去轮询:
-
-```bash
-curl -sS http://127.0.0.1:9876/notify/result/<notify_id>
-# 未点 → {"notify_id":"nf_…","project":"ops","message_id":"om_…","resolved":false}
-# 点后 → {"notify_id":"nf_…",...,"resolved":true,
-#         "button":{"id":"approve","text":"✅ 通过","type":"primary"},
-#         "resolved_at":1783242381786,"resolved_by":"ou_…"}
-```
-
-绑定持久化在 `~/.local/share/lodestar/notify-callbacks.json`,daemon 重启不丢,7 天后自动清理。
-
-### 🧩 项目级隔离配置（外部项目接入）
-
-默认每个飞书群对应 `projects_root` 下同名目录,跑 Claude Code 默认工具集。当一个外部项目(不在 `projects_root` 下、且需要干净隔离的 agent)想接入时,在 `~/.config/lodestar/config.toml` 加一个 `[projects.<群名>]` 节即可 —— **未配置的项目行为完全不变**:
-
-```toml
-[projects.calculator2]
-cwd                       = "/abs/path/to/evolving_data/calculator2"
-setting_sources           = "project"
-strict_mcp                = "true"
-tools                     = "Read,Write,Edit,Bash,Glob,Grep"
-load_project_mcp          = "true"
-keep_lodestar_instructions = "true"
-```
-
-| 字段 | 作用 | 默认 |
-| --- | --- | --- |
-| `cwd` | agent 工作目录(绝对路径) | `projects_root/<群名>` |
-| `setting_sources` | 显式列表如 `"project"`(只项目级,会丢全局)或 `"user,project"`;不配则**对齐裸 `claude` CLI**,读项目 `CLAUDE.md`/skills/agents/`settings.json` | `user,project,local` |
-| `strict_mcp` | 只挂下方项目 MCP,忽略全局 MCP | 关 |
-| `tools` | 允许的内置工具(逗号分隔);MCP 工具由 `load_project_mcp` 自动可用,不用列在这里 | claude_code 全套 |
-| `load_project_mcp` | 读取 `<cwd>/.mcp.json` 并挂载其 MCP 服务(对齐裸 `claude` 自动发现;无则无效果) | 开 |
-| `keep_lodestar_instructions` | 保留夜航星卡片/输出约定系统提示 | 开 |
-
-`strict_mcp = "true"` 时,项目 `.mcp.json` 是 agent 能挂上 MCP 的唯一通路 —— 全局插件/技能被全部挡掉,agent 干净专注。典型用法:外部自动化引擎在自己的目录里维护规则文件,夜航星负责飞书通道和卡片渲染,两者通过群消息驱动协作。
-
-> ⚠️ **这组配置必须完整,配一半会把对话卡死。** `[projects.*]` 的字段是联动的,任一项开启后,它依赖的链路都要一起配齐:
->
-> - **`setting_sources = "project"`** 会排除用户级 `~/.claude/settings.json`。如果你的 GLM 路由 / `ANTHROPIC_BASE_URL` 是写在 `~/.claude/settings.json`(而不是 lodestar 的 `[claude.env]`),会被丢掉、请求发不出去 → 卡死。**走 `project` 模式时,GLM 路由必须落在 `config.toml` 的 `[claude.env]`**(`env` 不受 `setting_sources` 影响)。
-> - 项目 `<cwd>/.mcp.json` 现在**默认读取**(对齐裸 `claude`)。若它存在,其声明的 MCP server 必须能秒级启动并完成 stdio 握手 —— server 卡住(路径错、二进制不存在、stdio 不响应)会让对话卡在真正调用模型之前,表现是卡片底部一直 `Thinking...` 且 model 显示成 `<synthetic>`。要跳过:显式 `load_project_mcp = "false"`。
-> - **排查卡死**:看到 `model=<synthetic>` + 长时间 `Thinking`,先把 `[projects.*]` 整节注释掉重启 daemon;不卡了就是 profile 没配齐,按上面两条逐项检查。
+路径填错会直接报错,不会偷偷回退到自动查找。换成 reclaude 的话,记得把 `~/.claude/settings.json` 或 `[claude.env]` 里残留的 GLM 地址 / Token 清掉,否则流量还走 GLM、reclaude 的拦截不生效。更多细节看 `docs/claude-agent-backend.md`。
 
 ---
 
