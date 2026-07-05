@@ -100,6 +100,12 @@ type ClaudePathLookup = {
   exists?: (path: string) => boolean
   /** undefined = 读 config.claude.bin;显式 null = 视为未配置(测试隔离 config 用)。 */
   configuredBin?: string | null
+  /** 第三方 API 路由(GLM 一类)必须绕开 [claude].bin 包装器(如 reclaude):
+   * reclaude 的 gateway 会把注入的 ANTHROPIC_BASE_URL 劫持回官方 Anthropic,
+   * 第三方 model id(如 glm-5.2)会被官方 deployment 判为"模型不存在"而客户端
+   * 直接报错。true 时忽略 configuredBin,解析裸 claude 二进制直连第三方端点;
+   * 官方登录档位(Fable 5/Opus)仍走包装器以回收登录态额度。 */
+  apiRoute?: boolean
 }
 
 type ClaudeExecutableConfig = {
@@ -169,7 +175,15 @@ export function assertClaudeCodeAvailable(): void {
 
 export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): ClaudeExecutableConfig {
   const platform = lookup.platform ?? process.platform
-  const configured = lookup.configuredBin === undefined ? config.claude.bin : lookup.configuredBin
+  // 第三方 API 路由(GLM 一类)强制绕开包装器 bin(见 ClaudePathLookup.apiRoute):
+  // reclaude 的 gateway 会劫持 ANTHROPIC_BASE_URL 打回官方 Anthropic,glm-5.2
+  // 这类第三方 id 会被判为"模型不存在"。其它档位读 config.claude.bin
+  // (显式 configuredBin 覆盖,供测试隔离 config)。
+  const configured = lookup.apiRoute
+    ? null
+    : lookup.configuredBin === undefined
+      ? config.claude.bin
+      : lookup.configuredBin
   if (configured) {
     const exists = lookup.exists ?? existsSync
     // [claude].bin 配错时必须 fail fast:静默回退会让用户以为在烧包装器
@@ -744,9 +758,12 @@ export class ClaudeAgentProcess extends EventEmitter {
     try {
       // resolveClaudeExecutableConfig 在 [claude].bin 配错路径时同步抛出;
       // 必须在 try 内调用,确保错误走 error/exit 事件而非穿透到调用方。
-      const executable = resolveClaudeExecutableConfig()
+      const isApiRoute = claudeModelIsApiRoute(this.opts.model)
+      // 第三方 API 路由(GLM)绕开 reclaude 包装器,直连第三方端点;官方登录
+      // 档位仍走包装器回收登录态额度。见 resolveClaudeExecutableConfig。
+      const executable = resolveClaudeExecutableConfig({ apiRoute: isApiRoute })
       const spawnEnv = this.buildSpawnEnv()
-      const routeLabel = claudeModelIsApiRoute(this.opts.model) ? 'api' : 'login'
+      const routeLabel = isApiRoute ? 'api' : 'login'
       log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} route=${routeLabel} cwd=${this.opts.workDir} settingSources=${settingSources.join('+')} executable=${executable.description}`)
       this.query = query({
         prompt: this.input,

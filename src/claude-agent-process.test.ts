@@ -1196,3 +1196,52 @@ describe('Claude project profile overrides', () => {
     expect(readProjectMcpServers(dir)).toBeUndefined()
   })
 })
+
+describe('Claude executable: third-party API routes bypass the wrapper bin', () => {
+  // 回归:GLM(route:api)绝不能走 reclaude 包装器 —— reclaude 的 gateway 会
+  // 把注入的 ANTHROPIC_BASE_URL 劫持回官方 Anthropic,glm-5.2 这类第三方 id
+  // 被官方 deployment 判为"模型不存在",客户端直接报
+  // "There's an issue with the selected model"。apiRoute:true 强制解析裸
+  // claude 直连第三方端点。
+  const wrapper = '/home/me/.local/bin/reclaude'
+  const plain = '/home/me/.local/bin/claude'
+
+  test('apiRoute:true ignores the configured wrapper bin and resolves plain claude', () => {
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'linux',
+      homeDir: '/home/me',
+      configuredBin: wrapper,
+      apiRoute: true,
+      exists: path => path === wrapper || path === plain,
+    })
+
+    expect(executable.pathToClaudeCodeExecutable).toBe(plain)
+    expect(executable.description).toBe(plain)
+  })
+
+  test('apiRoute:true still bypasses the wrapper even when no plain claude exists (sdk-default)', () => {
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'linux',
+      pathEnv: '',
+      homeDir: '/home/me',
+      configuredBin: wrapper,
+      apiRoute: true,
+      exists: path => path === wrapper, // wrapper present, but never selected for api routes
+    })
+
+    expect(executable).toEqual({ description: 'sdk-default' })
+  })
+
+  test('login routes (apiRoute:false) keep using the configured wrapper bin', () => {
+    const executable = resolveClaudeExecutableConfig({
+      platform: 'linux',
+      homeDir: '/home/me',
+      configuredBin: wrapper,
+      apiRoute: false,
+      exists: path => path === wrapper || path === plain,
+    })
+
+    expect(executable.pathToClaudeCodeExecutable).toBe(wrapper)
+    expect(executable.description).toBe(`config:${wrapper}`)
+  })
+})
