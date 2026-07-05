@@ -29,7 +29,7 @@ default_model = "glm"          # 新群默认走 GLM(可选;不写则默认 Fabl
 [claude.models.glm]
 base_url   = "https://open.bigmodel.cn/api/anthropic"
 auth_token = "<你的 GLM API key>"
-model      = "GLM-5.2[1m]"      # 直连智谱,开放 1M 上下文
+model      = "glm-5.2[1m]"      # 直连智谱;[1m] 开满 1M 上下文(裸 glm-5.2 只给 ~200K)
 effort     = "xhigh"           # 复刻 GLM-5.2 最高思维
 ```
 
