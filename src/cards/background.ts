@@ -24,11 +24,11 @@
  * 子 agent 逐步工具调用(tool_use/tool_result 带 parent_tool_use_id)归属到对应
  * task,累积成 steps[](trim 到最近 ~1000 字)。
  *
- * 前台/后台区分(SDK sdk.d.ts:2750):Bash 命令和子 agent 默认全是前台 task,
- * 每条都发 task_started;只有被显式后台化(Ctrl+B / background_tasks 控制请求 /
- * background:true 子 agent)才是真后台。前台 task 不该进「后台任务」卡 —— 故
- * task_started 先落 pending 观察池,等 task_updated.is_backgrounded=true 才提升
- * 入 active 建卡。workflow/monitor 是天生后台执行模型,白名单直入 active。
+ * 前台/后台区分(SDK sdk.d.ts:2750):Bash 命令和子 agent 默认都是前台 task,
+ * 每条都发 task_started。子agent(具名,实质工作)天生入卡:task_started 即入
+ * active。前台裸 Bash / unknown 是噪音源,先落 pending 观察池,只有被显式后台化
+ * (Ctrl+B / background_tasks 控制请求)收到 is_backgrounded:true 才提升入 active。
+ * workflow/monitor 是天生后台执行模型,同样白名单直入 active。
  */
 
 import type {
@@ -112,11 +112,12 @@ function normalizeType(taskType?: string, subagentType?: string): BgTaskType {
   return 'unknown'
 }
 
-/** 天生后台的 task_type:workflow / monitor 在 SDK 里是 fire-and-forget 后台执行
- *  模型,task_started 即可入 active;subagent / shell / unknown 默认前台,先进
- *  pending 观察池,等 is_backgrounded:true 才提升。 */
+/** 天生入卡的 task_type:workflow / monitor 是 fire-and-forget 后台执行模型;
+ *  subagent(Task 工具派的具名子agent)是实质工作,即便前台执行也值得单独建卡
+ *  显示进度。三者 task_started 即入 active。shell(前台裸 bash)/ unknown 仍是
+ *  噪音源,先落 pending 观察池,等 is_backgrounded:true(Ctrl+B)才提升。 */
 function isInherentlyBackground(type: BgTaskType): boolean {
-  return type === 'workflow' || type === 'monitor'
+  return type === 'workflow' || type === 'monitor' || type === 'subagent'
 }
 
 /** 终态:不再变化,不再占活跃计数。running / pending / paused 都算活跃。 */
@@ -444,7 +445,7 @@ export function backgroundLiveCard(tasks: BgTaskEntry[], now: number = Date.now(
     schema: '2.0',
     config: {
       streaming_mode: true,
-      summary: { content: `🧭 后台任务 · ${summarizeBackground(tasks)}` },
+      summary: { content: `🧭 子agent · ${summarizeBackground(tasks)}` },
     },
     body: {
       elements: tasks.map(t => backgroundTaskPanel(t, now)),
@@ -460,7 +461,7 @@ export function backgroundHistoryCard(tasks: BgTaskEntry[], now: number = Date.n
     schema: '2.0',
     config: {
       streaming_mode: false,
-      summary: { content: `🧭 后台任务(历史) · ${terminal.length} 已结束` },
+      summary: { content: `🧭 子agent(历史) · ${terminal.length} 已结束` },
     },
     body: {
       elements: terminal.map(t => backgroundTaskPanel(t, now)),
@@ -474,13 +475,13 @@ export function backgroundMigratedMarker(): object {
     schema: '2.0',
     config: {
       streaming_mode: false,
-      summary: { content: '↪ 后台任务进行中' },
+      summary: { content: '↪ 子agent进行中' },
     },
     body: {
       elements: [{
         tag: 'markdown',
         element_id: 'bg_marker',
-        content: '↪ 本轮后台任务仍在进行，进度已迁至最新卡片',
+        content: '↪ 本轮子agent仍在进行，进度已迁至最新卡片',
       }],
     },
   }

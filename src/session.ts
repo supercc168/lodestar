@@ -1655,7 +1655,7 @@ export class Session {
     await cardkit.flush(handle.cardId)
     await feishu.updateCard(handle.messageId, cards.backgroundHistoryCard(this.backgroundTasks))
     cardkit.cancelSummary(handle.cardId)
-    await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({ suffix: '🧭 后台任务已结束' }))
+    await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({ suffix: '🧭 子agent已结束' }))
     await cardkit.dispose(handle.cardId)
     // 全部终态 → 清空 active 跟踪(已固化在历史卡);下次新后台 task 从空数组起步。
     // pending 观察池不动:前台 task 可能仍在跑,它们结算时自己从 pending 丢。
