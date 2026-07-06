@@ -203,7 +203,7 @@ export function consoleGlmUsageContent(glmUsage: GlmUsageSnapshot | undefined): 
   if (glmUsage === undefined) return '**📊 GLM 额度**　_加载中…_'
   switch (glmUsage.state) {
     case 'no_credentials':
-      return '**📊 GLM 额度**　未配置 `ANTHROPIC_AUTH_TOKEN` — 检查 ~/.claude/settings.json'
+      return '**📊 GLM 额度**　未配置 GLM — 在 `config.toml` 的 `[claude.models.glm]` 填 `base_url` + `auth_token` + `model`'
     case 'not_glm':
       return '**📊 GLM 额度**　非 GLM 后端 — ANTHROPIC_BASE_URL 不是 bigmodel / z.ai'
     case 'rate_limited':
