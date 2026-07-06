@@ -542,15 +542,21 @@ export function toolsFromProfile(
 }
 
 /** Read `<workDir>/.mcp.json` and return its `mcpServers` map, or undefined
- * when missing / unreadable / malformed. No silent fallback — the failure
- * is logged so the project knows its MCP didn't load. */
+ * when missing / unreadable / malformed. Missing (ENOENT) is silent — it's
+ * the common case (most projects ship no .mcp.json, and loadProjectMcp
+ * defaults to true so every spawn probes once); other failures are logged
+ * so the project knows its MCP didn't load. */
 export function readProjectMcpServers(workDir: string): Record<string, unknown> | undefined {
   const mcpPath = join(workDir, '.mcp.json')
   let raw: string
   try {
     raw = readFileSync(mcpPath, 'utf8')
   } catch (e) {
-    log(`claude-agent-process: project .mcp.json not readable at ${mcpPath}: ${e}`)
+    // 无 .mcp.json (ENOENT) 是常态 —— 多数项目没有,而 loadProjectMcp 默认 true
+    // 时每次 spawn 都会探一次,静默跳过避免日志噪音;只在文件存在却读不了时才报警。
+    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
+      log(`claude-agent-process: project .mcp.json not readable at ${mcpPath}: ${e}`)
+    }
     return undefined
   }
   try {
