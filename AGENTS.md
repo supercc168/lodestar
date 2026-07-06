@@ -2,6 +2,8 @@
 
 # Lodestar 2.0
 
+> 🧭 **接手开发/维护本项目先读**:[`docs/开发与调试指南.md`](docs/开发与调试指南.md) —— 面向 AI 的心智模型、代码地图、开发红线、调试(含免飞书 debug 注入)与发布流程。本文件(`AGENTS.md`)是权威规则源,那份是上手导航。
+
 ## Purpose
 本仓库实现一个 Bun daemon，把飞书群消息桥接到无头 agent 后端进程——按 session 选择 `codex app-server`（GPT）或 `@anthropic-ai/claude-agent-sdk` 的 `query()` streaming-input 长驻进程（Claude/GLM，默认 provider）。运行时关系是一个飞书群对应一个 Lodestar session、一个选定 provider 的 agent 进程（Codex thread 或 Claude session），以及每轮对话中的一张流式 Feishu Card Kit 卡片；项目主群还可用 `model` 管理模型/effort，用 `wt` 自动创建/加入同级 Git worktree 群，用 `agy <prompt>` 启动一次性外部 agy 任务，并用 `task` 启用飞书任务清单自动化。
 
