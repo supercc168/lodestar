@@ -57,7 +57,6 @@ export function codexEnvFromConfig(raw: CodexModelConfig, slug: string): Record<
 export function codexConfigArgs(raw: CodexModelConfig, slug: string): string[] {
   const provider = codexProviderSlug(slug)
   const base = `model_providers.${provider}`
-  const envKey = raw.env_key?.trim() || codexEnvKeyName(slug)
   const args: string[] = [
     '-c', `model_provider="${provider}"`,
     '-c', `${base}.name="${sanitizeSlug(slug)}"`,
@@ -65,7 +64,12 @@ export function codexConfigArgs(raw: CodexModelConfig, slug: string): string[] {
   const baseUrl = raw.base_url?.trim()
   if (baseUrl) args.push('-c', `${base}.base_url="${baseUrl}"`)
   args.push('-c', `${base}.wire_api="${wireApiOf(raw)}"`)
-  args.push('-c', `${base}.env_key="${envKey}"`)
+  // env_key 只在真注入 api_key 时声明:codex 对"env_key 指向未设环境变量"会直接
+  // 报 `Missing environment variable` 并中止,故 requires_openai_auth(走 codex 的
+  // OpenAI 登录态、无独立 key)的档位绝不能声明 env_key。与 codexEnvFromConfig
+  // 的 api_key 门槛保持一致。(2026-07-06 实测:无痕 wuhen 带 env_key 必报错。)
+  const apiKey = raw.api_key?.trim()
+  if (apiKey) args.push('-c', `${base}.env_key="${raw.env_key?.trim() || codexEnvKeyName(slug)}"`)
   if (requiresOpenaiAuth(raw)) args.push('-c', `${base}.requires_openai_auth=true`)
   return args
 }
