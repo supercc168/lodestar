@@ -319,6 +319,29 @@ describe('main conversation card rendering', () => {
     expect(content).not.toContain('缓存')
     expect(content).not.toContain('~')
   })
+
+  test('usage panel does not ask for codex login when auth is non-ChatGPT', () => {
+    const content = consoleUsageContent({ state: 'auth_failed' })
+
+    expect(content).toContain('官方 ChatGPT 额度不适用')
+    expect(content).not.toContain('codex login')
+    expect(content).not.toContain('请运行')
+  })
+
+  test('usage panel renders third-party provider balance when available', () => {
+    const content = consoleUsageContent({
+      state: 'provider_usage',
+      providerName: 'Codex · Wuhen',
+      remaining: 12.34,
+      unit: 'USD',
+      isValid: true,
+      fetchedAt: Date.now(),
+    })
+
+    expect(content).toContain('Codex · Wuhen')
+    expect(content).toContain('渠道余额')
+    expect(content).toContain('12.34 USD')
+  })
 })
 
 describe('plan and goal rendering', () => {

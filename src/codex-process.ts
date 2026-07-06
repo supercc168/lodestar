@@ -66,14 +66,24 @@ function whichCodex(): string | null {
   return null
 }
 
-function buildSpawnPath(): string {
-  if (process.platform === 'win32') return process.env.PATH ?? ''
-  return [
+/**
+ * spawn codex 子进程用的 PATH。
+ *
+ * 把确定性白名单 **prepend** 到继承的 PATH 之前,而不是整体替换。codex 在很多机器上是
+ * homebrew / npm 全局装的 `#!/usr/bin/env node` shim,若把 PATH 整个替换成白名单,会丢掉
+ * node 所在目录(典型如 Apple Silicon 的 /opt/homebrew/bin),shim 启动时 `env` 找不到
+ * node,直接退出 127(2026-07-06 实测:任意 codex 档位首次 spawn 即撞,daemon 报
+ * "Codex 异常退出 code=127")。白名单仍排在前以保持工具解析的确定性优先级。
+ */
+export function buildSpawnPath(inherited: string = process.env.PATH ?? ''): string {
+  if (process.platform === 'win32') return inherited
+  const whitelist = [
     join(homedir(), '.local', 'npm-global', 'bin'),
     join(homedir(), '.local', 'bin'),
     join(homedir(), '.bun', 'bin'),
     '/usr/local/bin', '/usr/bin', '/bin',
-  ].join(delimiter)
+  ]
+  return [...whitelist, inherited].filter(Boolean).join(delimiter)
 }
 
 const CODEX_SESSIONS_DIR = join(homedir(), '.codex', 'sessions')

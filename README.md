@@ -98,6 +98,8 @@ requires_openai_auth = "true"
 
 配好后面板出现 `codex:<slug>` 档位。lodestar spawn 时用 `codex app-server -c model_provider="lodestar_<slug>" …` 注入一个前缀隔离的 provider,并把 `api_key` 注入 env —— **不改你全局 `~/.codex/config.toml`,也不覆盖你已有的 `[model_providers.*]`**。缺 `base_url` / `api_key` / `model` 的档位在面板可见但选择被拦截。API 档位跳过 `codex login` 的 ChatGPT 登录检查(用 key 鉴权)。
 
+`hi` 控制台里的额度也会按当前 Codex 档位分流:官方 ChatGPT 登录档继续显示 5h / 周窗口;第三方 `codex:<slug>` 档位如果配置了 `api_key`,会尝试按 CCSwitch 同类约定读取 `<base_url>/v1/usage` 的 `remaining` / `quota.remaining` / `balance` 作为渠道余额。没有余额接口或只走 `requires_openai_auth` 时,面板会明确显示“第三方渠道,官方 ChatGPT 额度不适用”,不会再误提示去 `codex login`。
+
 > 已知限制(Windows):macOS/Linux 下 codex 以离散 argv 直接 spawn(不过 shell),`-c` 的 TOML 字面量精确传入;但 Windows 为兼容 `.cmd`/`.bat` shim 走 `shell:true`,`-c model_providers.<slug>.base_url="…"` 里的引号可能被 cmd.exe 处理。Windows 用户如遇自定义 provider 不生效,可改用全局 `~/.codex/config.toml` 配置。
 
 ---

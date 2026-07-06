@@ -4,10 +4,17 @@
  * Source: Codex app-server `account/read` + `account/rateLimits/read`.
  * This stays on the same auth path as the daemon itself: the user's
  * local `codex login` ChatGPT session.
+ *
+ * Third-party Codex routes (`codex:<slug>`) do not expose the official
+ * ChatGPT rolling quota. For those routes we optionally query the
+ * provider `/v1/usage` endpoint using the CCSwitch-compatible balance
+ * response shape.
  */
 
 import { spawn, type ChildProcessByStdio } from 'node:child_process'
 import type { Readable, Writable } from 'node:stream'
+import { config } from './config'
+import { codexModelProfile } from './codex-models'
 import { resolveCodexBin } from './codex-process'
 import { log } from './log'
 
@@ -24,6 +31,19 @@ export type UsageSnapshot =
   | { state: 'auth_failed' }
   | { state: 'rate_limited' }
   | { state: 'network'; reason?: string }
+  | {
+      state: 'provider_usage'
+      providerName: string
+      remaining: number | string
+      unit: string
+      isValid: boolean
+      fetchedAt: number
+    }
+  | {
+      state: 'provider_unavailable'
+      providerName: string
+      reason?: string
+    }
   | {
       state: 'ok'
       subscriptionType?: string
@@ -112,6 +132,73 @@ function windowFromRateLimit(w: any): UsageWindow | null {
   }
 }
 
+function providerUsageEndpoint(baseUrl: string): string {
+  const trimmed = baseUrl.trim().replace(/\/+$/, '')
+  const root = trimmed.replace(/\/v1$/i, '')
+  return `${root}/v1/usage`
+}
+
+function firstPresent(...values: unknown[]): unknown {
+  return values.find(v => v !== undefined && v !== null && v !== '')
+}
+
+function contentTypeIsJson(contentType: string | null): boolean {
+  return /\bjson\b/i.test(contentType ?? '')
+}
+
+function providerUsageSnapshotFromBody(providerName: string, body: string, contentType: string | null): UsageSnapshot {
+  const text = body.trim()
+  if (!text) {
+    return {
+      state: 'provider_unavailable',
+      providerName,
+      reason: '渠道余额接口返回空响应',
+    }
+  }
+
+  const looksJson = text.startsWith('{') || text.startsWith('[')
+  if (!looksJson && !contentTypeIsJson(contentType)) {
+    return {
+      state: 'provider_unavailable',
+      providerName,
+      reason: `渠道余额接口返回非 JSON${contentType ? ` (${contentType})` : ''}`,
+    }
+  }
+
+  try {
+    return providerUsageSnapshotFromResponse(providerName, JSON.parse(text))
+  } catch {
+    return {
+      state: 'provider_unavailable',
+      providerName,
+      reason: text.startsWith('<')
+        ? `渠道余额接口返回非 JSON${contentType ? ` (${contentType})` : ''}`
+        : '渠道余额接口 JSON 解析失败',
+    }
+  }
+}
+
+export function providerUsageSnapshotFromResponse(providerName: string, response: any): UsageSnapshot {
+  const remaining = firstPresent(response?.remaining, response?.quota?.remaining, response?.balance)
+  if (remaining === undefined) {
+    return {
+      state: 'provider_unavailable',
+      providerName,
+      reason: '余额接口未返回 remaining',
+    }
+  }
+  const unit = firstPresent(response?.unit, response?.quota?.unit, 'USD')
+  const isValid = firstPresent(response?.is_active, response?.isValid, true) !== false
+  return {
+    state: 'provider_usage',
+    providerName,
+    remaining: typeof remaining === 'number' ? remaining : String(remaining),
+    unit: String(unit),
+    isValid,
+    fetchedAt: Date.now(),
+  }
+}
+
 export function updateUsageFromRateLimits(rateLimits: any): UsageSnapshot {
   if (!rateLimits) return cache ?? { state: 'network', reason: 'empty rate limit update' }
   const snapshot: UsageSnapshotOk = {
@@ -123,6 +210,72 @@ export function updateUsageFromRateLimits(rateLimits: any): UsageSnapshot {
   }
   cache = snapshot
   return snapshot
+}
+
+async function fetchProviderUsage(model: string): Promise<UsageSnapshot | null> {
+  const profile = codexModelProfile(model)
+  if (!profile || profile.route !== 'api') return null
+  const providerName = profile.displayName || profile.name
+  const raw = config.codex.models[profile.name]
+  const baseUrl = raw?.base_url?.trim()
+  const apiKey = raw?.api_key?.trim()
+  if (!baseUrl) {
+    return {
+      state: 'provider_unavailable',
+      providerName,
+      reason: '未配置 base_url',
+    }
+  }
+  if (!apiKey) {
+    return {
+      state: 'provider_unavailable',
+      providerName,
+      reason: '未配置 api_key,无法查询渠道余额',
+    }
+  }
+
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS)
+  try {
+    const res = await fetch(providerUsageEndpoint(baseUrl), {
+      method: 'GET',
+      headers: { authorization: `Bearer ${apiKey}`, accept: 'application/json' },
+      signal: controller.signal,
+    })
+    if (res.status === 429) return { state: 'rate_limited' }
+    if (res.status === 401 || res.status === 403) {
+      return {
+        state: 'provider_unavailable',
+        providerName,
+        reason: '渠道余额接口鉴权失败',
+      }
+    }
+    if (res.status === 404) {
+      return {
+        state: 'provider_unavailable',
+        providerName,
+        reason: '渠道未提供 /v1/usage',
+      }
+    }
+    if (!res.ok) {
+      return {
+        state: 'provider_unavailable',
+        providerName,
+        reason: `渠道余额接口 HTTP ${res.status}`,
+      }
+    }
+    return providerUsageSnapshotFromBody(providerName, await res.text(), res.headers.get('content-type'))
+  } catch (e: any) {
+    const reason = e?.name === 'AbortError' ? `timeout after ${API_TIMEOUT_MS}ms` : (e?.message ?? String(e))
+    log(`usage: provider usage fetch failed for ${providerName}: ${reason}`)
+    return {
+      state: 'provider_unavailable',
+      providerName,
+      reason,
+    }
+  } finally {
+    clearTimeout(timer)
+  }
 }
 
 async function fetchUsage(): Promise<UsageSnapshot> {
@@ -165,7 +318,12 @@ export function peekUsage(): UsageSnapshot | null {
   return cache
 }
 
-export async function readUsage(): Promise<UsageSnapshot> {
+export async function readUsage(model?: string): Promise<UsageSnapshot> {
+  if (model) {
+    const providerUsage = await fetchProviderUsage(model)
+    if (providerUsage) return providerUsage
+  }
+
   if (inFlight) return inFlight
 
   inFlight = fetchUsage()
