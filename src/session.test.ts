@@ -446,8 +446,15 @@ describe('Fixed model selection normalization', () => {
   test('falls an UNCONFIGURED GLM selection back to the login default (Fable 5)', () => {
     // 无 token 配置时,持久化的 claude:glm 回落到 claude:fable(登录态),
     // 避免启动以未鉴权状态拉起、且绕过 picker 门槛。
-    expect(normalizeFixedModelSelection('claude', 'claude:glm', 'max'))
-      .toEqual({ model: 'claude:fable', effort: 'max' })
+    // 隔离 config:测试机可能已配 GLM(reclaude/GLM 环境),强制未配置态。
+    const prev = config.claude.models
+    ;(config.claude as any).models = {}
+    try {
+      expect(normalizeFixedModelSelection('claude', 'claude:glm', 'max'))
+        .toEqual({ model: 'claude:fable', effort: 'max' })
+    } finally {
+      ;(config.claude as any).models = prev
+    }
   })
 
   test('keeps a CONFIGURED GLM selection intact (不丢用户设好的 GLM)', () => {
@@ -590,20 +597,28 @@ describe('Session provider switching', () => {
   })
 
   test('model 选择器展示 Opus 4.8 / Fable 5 官方档位 + GLM 第三方档位', () => {
-    const session = new Session('probe', 'chat_id') as any
-    session.selectedProvider = 'claude'
-    const choices = fixedModelChoices(session)
-    const claudeModels = choices.filter((c: any) => c.provider === 'claude').map((c: any) => c.model)
-    expect(claudeModels).toContain('claude:opus')
-    expect(claudeModels).toContain('claude:fable')
-    expect(claudeModels).toContain('claude:glm')
-    // 每个 Claude 档位锁死 max 最高思考强度
-    for (const c of choices.filter((c: any) => c.provider === 'claude')) {
-      expect(c.efforts.map((e: any) => e.effort)).toEqual(['max'])
+    // 隔离 config:GLM description 的「未配置」提示只在 config 无 glm 时出现,
+    // 测试机可能已配 GLM(reclaude/GLM 环境),强制未配置态。
+    const prev = config.claude.models
+    ;(config.claude as any).models = {}
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      session.selectedProvider = 'claude'
+      const choices = fixedModelChoices(session)
+      const claudeModels = choices.filter((c: any) => c.provider === 'claude').map((c: any) => c.model)
+      expect(claudeModels).toContain('claude:opus')
+      expect(claudeModels).toContain('claude:fable')
+      expect(claudeModels).toContain('claude:glm')
+      // 每个 Claude 档位锁死 max 最高思考强度
+      for (const c of choices.filter((c: any) => c.provider === 'claude')) {
+        expect(c.efforts.map((e: any) => e.effort)).toEqual(['max'])
+      }
+      // GLM 未配置 token 时,描述提示需要设置。
+      const glm = choices.find((c: any) => c.model === 'claude:glm')
+      expect(glm.description).toContain('配置')
+    } finally {
+      ;(config.claude as any).models = prev
     }
-    // GLM 未配置 token 时,描述提示需要设置。
-    const glm = choices.find((c: any) => c.model === 'claude:glm')
-    expect(glm.description).toContain('配置')
   })
 
   test('GLM 档位的 effort 跟随 config(xhigh)而非写死 max;官方档位仍 max', () => {
@@ -648,19 +663,26 @@ describe('Session provider switching', () => {
   })
 
   test('未配置 token 时选 GLM 被拦截并提示去 config.toml 设置', async () => {
-    const session = new Session('probe', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'claude-session-1')
-    session.proc = proc
-    session.selectedProvider = 'claude'
-    session.selectedModel = 'claude:fable'
+    // 隔离 config:拦截只在 GLM 未配置时触发;测试机可能已配 GLM,强制未配置态。
+    const prev = config.claude.models
+    ;(config.claude as any).models = {}
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      const proc = new FakeAgentProc('claude', 'claude-session-1')
+      session.proc = proc
+      session.selectedProvider = 'claude'
+      session.selectedModel = 'claude:fable'
 
-    const result = await session.onModelEffortSelect('claude:glm', 'max', '', 'ou_user', 'claude')
+      const result = await session.onModelEffortSelect('claude:glm', 'max', '', 'ou_user', 'claude')
 
-    expect(result.ok).toBe(false)
-    expect(result.message).toContain('GLM')
-    expect(result.message).toMatch(/配置|config/)
-    expect(session.selectedModel).toBe('claude:fable') // 未切换
-    expect(proc.killCalls).toBe(0)
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('GLM')
+      expect(result.message).toMatch(/配置|config/)
+      expect(session.selectedModel).toBe('claude:fable') // 未切换
+      expect(proc.killCalls).toBe(0)
+    } finally {
+      ;(config.claude as any).models = prev
+    }
   })
 
   test('catches synchronous Claude init failure before reporting ready', async () => {
