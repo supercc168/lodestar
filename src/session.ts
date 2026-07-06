@@ -31,6 +31,7 @@ import {
   type ThreadGoal,
   type TurnPlanUpdated,
 } from './codex-process'
+import { codexModelIsApiRoute, codexSpawnOverrides } from './codex-models'
 import {
   CLAUDE_EFFORT,
   agentProviderLabel,
@@ -507,12 +508,15 @@ export class Session {
         profile: feishu.projectProfile(this.sessionName),
       })
     }
+    const overrides = codexSpawnOverrides(this.modelForSpawn())
     return new CodexProcess({
       workDir: this.workDir,
-      model: this.modelForSpawn(),
+      model: overrides.modelId,
       effort: this.effortForSpawn(),
       resumeSessionId,
       appendSystemPrompt: this.spawnDeveloperInstructions(),
+      configArgs: overrides.configArgs,
+      providerEnv: overrides.env,
     })
   }
 
@@ -695,7 +699,11 @@ export class Session {
     }
     if (this.selectedProvider === 'codex') report?.('🔎 检查 Codex 登录')
     else report?.('🔎 检查 Claude Code')
-    if (this.selectedProvider === 'codex' && !feishu.isOpenAIChatGPTAuthenticated()) {
+    if (
+      this.selectedProvider === 'codex' &&
+      !codexModelIsApiRoute(this.selectedModel) &&
+      !feishu.isOpenAIChatGPTAuthenticated()
+    ) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
       report?.('❌ Codex 未登录 ChatGPT 账号')

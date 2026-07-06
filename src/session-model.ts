@@ -13,6 +13,12 @@ import * as cards from './cards'
 import * as feishu from './feishu'
 import { config } from './config'
 import { claudeModelConfigured, claudeModelEffort, claudeModelIsApiRoute } from './claude-models'
+import {
+  codexModelChoices,
+  codexModelConfigured,
+  codexModelEffort,
+  codexModelIsApiRoute,
+} from './codex-models'
 import { log } from './log'
 import { messageOf, withTimeout, type ModelActionResult } from './session-util'
 
@@ -75,6 +81,10 @@ function resolvedEffort(item: typeof FIXED_MODEL_CHOICES[number]): AgentReasonin
     const configured = claudeModelEffort(item.model)
     if (configured) return configured
   }
+  if (item.provider === 'codex') {
+    const configured = codexModelEffort(item.model)
+    if (configured) return configured
+  }
   return item.effort
 }
 
@@ -90,13 +100,15 @@ export function normalizeFixedModelSelection(
   model: string | null | undefined,
   _effort: AgentReasoningEffort | null | undefined,
 ): { model: string; effort: AgentReasoningEffort } {
-  const hit = FIXED_MODEL_CHOICES.find(c => c.provider === provider && c.model === model)
-  // 第三方 API 路由(GLM)持久化了但当前未配置 token → 回落到该 provider 的
-  // 登录默认档位(claude:fable)。否则启动 restore 会以未鉴权状态拉起该档位:
-  // 既跑不通(resolveClaudeSdkModel 回落到官方 model id 打第三方端点),又
-  // 绕过了 picker 的配置门槛(restore 不走 onModelEffortSelect)。配好 token
-  // 的 GLM 正常保留 —— 满足"别丢 GLM 设置"。
-  if (hit && provider === 'claude' && claudeModelIsApiRoute(model) && !claudeModelConfigured(model)) {
+  const all = [...FIXED_MODEL_CHOICES, ...codexModelChoices()]
+  const hit = all.find(c => c.provider === provider && c.model === model)
+  // 第三方 API 路由(claude GLM / codex 自定义 provider)持久化了但当前未配置 →
+  // 回落到该 provider 的登录默认档(claude→claude:fable,codex→gpt-5.5)。否则
+  // restore 会以未鉴权状态拉起该档位:既跑不通,又绕过 picker 的配置门槛。
+  const unconfiguredApiRoute =
+    (provider === 'claude' && claudeModelIsApiRoute(model) && !claudeModelConfigured(model)) ||
+    (provider === 'codex' && codexModelIsApiRoute(model) && !codexModelConfigured(model))
+  if (hit && unconfiguredApiRoute) {
     const fallback = defaultFixedChoiceFor(provider)
     return { model: fallback.model, effort: resolvedEffort(fallback) }
   }
@@ -117,8 +129,10 @@ export function configuredDefaultSelection(): {
 } | null {
   const raw = config.claude.defaultModel?.trim()
   if (!raw) return null
-  const wanted = raw.startsWith('claude:') || raw === 'gpt-5.5' ? raw : `claude:${raw}`
-  const hit = FIXED_MODEL_CHOICES.find(c => c.model === wanted)
+  const wanted = raw.startsWith('claude:') || raw.startsWith('codex:') || raw === 'gpt-5.5'
+    ? raw
+    : `claude:${raw}`
+  const hit = [...FIXED_MODEL_CHOICES, ...codexModelChoices()].find(c => c.model === wanted)
   if (!hit) return null
   return { provider: hit.provider, model: hit.model, effort: resolvedEffort(hit) }
 }
@@ -128,6 +142,9 @@ function choiceDescription(item: typeof FIXED_MODEL_CHOICES[number]): string {
   if (item.provider === 'claude' && claudeModelIsApiRoute(item.model) && !claudeModelConfigured(item.model)) {
     return `${item.description}(未配置 · 需在 config.toml 的 [claude.models.glm] 填 base_url + auth_token + model)`
   }
+  if (item.provider === 'codex' && codexModelIsApiRoute(item.model) && !codexModelConfigured(item.model)) {
+    return `${item.description}(未配置 · 需在 config.toml 的 [codex.models.<slug>] 填 base_url + api_key + model)`
+  }
   return item.description
 }
 
@@ -135,7 +152,7 @@ export function fixedModelChoices(s: Session): cards.ModelChoice[] {
   const currentProvider = s.currentProvider()
   const currentModel = s.currentModelLabel()
   const currentEffort = s.currentEffortLabel()
-  return FIXED_MODEL_CHOICES.map(item => {
+  return [...FIXED_MODEL_CHOICES, ...codexModelChoices()].map(item => {
     const selected = currentProvider === item.provider && currentModel === item.model
     const effort = resolvedEffort(item)
     return {
@@ -236,7 +253,8 @@ export async function onModelEffortSelect(
   const effort = effortValue as AgentReasoningEffort
   // 二元锁死:只放行 FIXED_MODEL_CHOICES 的 (provider, model, effort) 组合,
   // 拒绝旧 effort 回调/伪造把 session 切到非固定项或非锁死 effort。
-  const fixed = FIXED_MODEL_CHOICES.find(c => c.provider === provider && c.model === model)
+  const fixed = [...FIXED_MODEL_CHOICES, ...codexModelChoices()]
+    .find(c => c.provider === provider && c.model === model)
   if (!fixed || resolvedEffort(fixed) !== effort) {
     return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在固定选项中` }
   }
@@ -246,6 +264,12 @@ export async function onModelEffortSelect(
     return {
       ok: false,
       message: `GLM(${model})未配置:请在 ~/.config/lodestar/config.toml 的 [claude.models.glm] 填写 base_url、auth_token 和 model 后重试(官方 Fable 5 / Opus 走登录态,无需配置)`,
+    }
+  }
+  if (provider === 'codex' && codexModelIsApiRoute(model) && !codexModelConfigured(model)) {
+    return {
+      ok: false,
+      message: `Codex API 档位(${model})未配置:请在 ~/.config/lodestar/config.toml 的 [codex.models.<slug>] 填写 base_url、api_key(或 requires_openai_auth)和 model 后重试(内建 gpt-5.5 走全局 codex 配置,无需配置)`,
     }
   }
   const choice = panel?.models.find(m => m.model === model && (m.provider ?? 'codex') === provider)

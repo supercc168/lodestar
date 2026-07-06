@@ -11,6 +11,15 @@ const { fixedModelChoices, normalizeFixedModelSelection, configuredDefaultSelect
 const { config } = await import('./config')
 const { peekUsage, updateUsageFromRateLimits } = await import('./usage')
 
+// 全量跑时,claude-agent-process.test.ts 的 mock.module('./config') 把 ./config 整体
+// 换成只含 { claude } 的桩,且 Bun 的 mock.module 是进程级、跨文件不还原 —— 泄漏到
+// 本文件后 config.codex 变 undefined。session-model 现在会经 codex-models 读
+// config.codex.models,桩缺 codex 字段会让归一化/默认档/picker 全线 throw。补齐
+// codex 字段,复原本文件"用真实 config 单例"的前提(真实 config 恒有 codex,
+// 生产不受影响;单独跑本文件时 codex 已在,下面两行为 no-op)。
+;(config as any).codex ??= { env: {}, models: {} }
+;(config.codex as any).models ??= {}
+
 interface FetchCall {
   method: string
   path: string
@@ -384,6 +393,53 @@ describe('configuredDefaultSelection ([claude] default_model)', () => {
       expect(configuredDefaultSelection()).toBeNull()
     } finally {
       ;(config.claude as any).defaultModel = prev
+    }
+  })
+})
+
+describe('normalizeFixedModelSelection ([codex.models.*] api 档位)', () => {
+  test('配好的 codex api 档位保留 + 跟随 config effort', () => {
+    const prev = config.codex.models
+    ;(config.codex as any).models = {
+      kimi: { base_url: 'https://api.moonshot.cn/v1', api_key: 'sk', model: 'kimi-k2', effort: 'high' },
+    }
+    try {
+      expect(normalizeFixedModelSelection('codex', 'codex:kimi', null)).toEqual({ model: 'codex:kimi', effort: 'high' })
+    } finally {
+      ;(config.codex as any).models = prev
+    }
+  })
+
+  test('未配置的 codex api 档位(缺 model)回落 gpt-5.5/xhigh', () => {
+    const prev = config.codex.models
+    ;(config.codex as any).models = { broken: { base_url: 'https://x', api_key: 'sk' } }
+    try {
+      const r = normalizeFixedModelSelection('codex', 'codex:broken', null)
+      expect(r.model).toBe('gpt-5.5')
+      expect(r.effort).toBe('xhigh')
+    } finally {
+      ;(config.codex as any).models = prev
+    }
+  })
+
+  test('裸 gpt-5.5 保持登录默认档', () => {
+    expect(normalizeFixedModelSelection('codex', 'gpt-5.5', null).model).toBe('gpt-5.5')
+  })
+})
+
+describe('configuredDefaultSelection ([codex] api 档位)', () => {
+  test('default_model="codex:kimi" + 配好 → 默认档位 codex:kimi(effort 跟随 config)', () => {
+    const prevModels = config.codex.models
+    const prevDefault = config.claude.defaultModel
+    ;(config.codex as any).models = {
+      kimi: { base_url: 'https://api.moonshot.cn/v1', api_key: 'sk', model: 'kimi-k2', effort: 'high' },
+    }
+    ;(config.claude as any).defaultModel = 'codex:kimi'
+    try {
+      expect(configuredDefaultSelection()).toEqual({ provider: 'codex', model: 'codex:kimi', effort: 'high' })
+    } finally {
+      ;(config.codex as any).models = prevModels
+      ;(config.claude as any).defaultModel = prevDefault
     }
   })
 })
