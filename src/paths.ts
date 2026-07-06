@@ -15,6 +15,7 @@
  *   session-resume-map.json — last-known Codex thread_id  (in DATA_DIR)
  *   session-model-map.json  — per-session selected Codex model (in DATA_DIR)
  *   tasklist-map.json       — project tasklist bindings     (in DATA_DIR)
+ *   notify-callbacks.json   — /notify button→callback map   (in DATA_DIR)
  *   inbox/                  — downloaded attachments        (in DATA_DIR)
  */
 
@@ -68,6 +69,12 @@ export const SESSION_CHAT_MAP_FILE = join(DATA_DIR, 'session-chat-map.json')
 export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
 export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
 export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
+/** Persisted registrations for `/notify` cards that carry interactive
+ * buttons. Each entry binds a `notify_id` → caller-supplied loopback
+ * callback URL + the original card params (so a click can rebuild the
+ * card into a resolved state). Survives daemon restarts so a card the
+ * user taps hours later still routes. Pruned to 7 days on load. */
+export const NOTIFY_CALLBACKS_FILE = join(DATA_DIR, 'notify-callbacks.json')
 /** Marker file written at shutdown listing the session names that
  * were still alive. The next daemon boot reads it
  * to auto-revive those sessions via `restart(true)` — bridges the

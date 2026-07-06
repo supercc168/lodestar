@@ -138,20 +138,27 @@ lodestar-setup
 
 ### 🔔 HTTP 通知端点
 
-本机任何脚本一行 curl 就能往群里推一张 markdown 卡片(info / warn / error 三档染色):
+本机任意脚本一行 curl 就能往群里推一张 markdown 卡片:`info` / `warn` / `error` 三档染色,正文支持飞书 markdown,还能附本地图片、加交互按钮、把点击结果 POST 回你自己的回调。这条能力对应的 skill,daemon 每次启动会自动装进 `~/.claude/skills/` 和 `~/.codex/skills/`(不用自己放文件),完整字段、按钮和回调协议看 [`feishu-notify` skill](src/notify-skill.ts)。
+
+推一条带图的告警:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:9876/notify \
   -H 'Content-Type: application/json' \
-  -d '{"project":"xxx","text":"build done","level":"info"}'
+  -d '{"project":"ops","level":"error","text":"卡点了,截图如下","images":["/abs/shot.png"]}'
 ```
 
-`/notify` 还支持可选的 `images` 字段,传本地图片绝对路径,夜航星上传到飞书后渲染在正文之前(上传失败会在卡片里显式标红,不会静默丢):
+发一张带按钮的审批卡,点了按钮 daemon 把选择 POST 回你本机的 callback:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:9876/notify \
   -H 'Content-Type: application/json' \
-  -d '{"project":"xxx","level":"warn","text":"卡点截图如下","images":["/abs/shot.png"]}'
+  -d '{"project":"ops","text":"deploy ready — 审批?",
+       "buttons":[
+         {"id":"approve","text":"✅ 通过","type":"primary"},
+         {"id":"reject","text":"❌ 拒绝","type":"danger"}
+       ],
+       "callback":"http://127.0.0.1:9999/hook"}'
 ```
 
 ### 🧩 项目级隔离配置（外部项目接入）

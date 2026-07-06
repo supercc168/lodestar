@@ -1035,9 +1035,9 @@ describe('Claude project profile overrides', () => {
     for (const d of ssTmpDirs) rmSync(d, { recursive: true, force: true })
   })
 
-  test('settingSourcesFromProfile falls back to user when absent', () => {
-    expect(settingSourcesFromProfile(undefined)).toEqual(['user'])
-    expect(settingSourcesFromProfile({})).toEqual(['user'])
+  test('settingSourcesFromProfile falls back to CLI parity (user+project+local) when absent', () => {
+    expect(settingSourcesFromProfile(undefined)).toEqual(['user', 'project', 'local'])
+    expect(settingSourcesFromProfile({})).toEqual(['user', 'project', 'local'])
   })
 
   test('settingSourcesFromProfile splits and trims comma-separated sources', () => {
@@ -1045,9 +1045,9 @@ describe('Claude project profile overrides', () => {
     expect(settingSourcesFromProfile({ settingSources: 'user, project' })).toEqual(['user', 'project'])
   })
 
-  test('settingSourcesFromProfile falls back when only blanks given', () => {
-    expect(settingSourcesFromProfile({ settingSources: '' })).toEqual(['user'])
-    expect(settingSourcesFromProfile({ settingSources: ' , ' })).toEqual(['user'])
+  test('settingSourcesFromProfile falls back to CLI parity when only blanks given', () => {
+    expect(settingSourcesFromProfile({ settingSources: '' })).toEqual(['user', 'project', 'local'])
+    expect(settingSourcesFromProfile({ settingSources: ' , ' })).toEqual(['user', 'project', 'local'])
   })
 
   test('settingSourcesFromProfile auto detects project .claude → three sources', () => {
@@ -1131,11 +1131,11 @@ describe('Claude project profile overrides', () => {
     }
   })
 
-  test('settingSources 全局默认: 非法值整体丢弃后回落 user', () => {
+  test('settingSources 全局默认: 非法值整体丢弃后回落内置默认(user+project+local)', () => {
     const prev = (config.claude as any).defaultSettingSources
     ;(config.claude as any).defaultSettingSources = 'bogus'
     try {
-      expect(settingSourcesFromProfile(undefined)).toEqual(['user'])
+      expect(settingSourcesFromProfile(undefined)).toEqual(['user', 'project', 'local'])
     } finally {
       ;(config.claude as any).defaultSettingSources = prev
     }

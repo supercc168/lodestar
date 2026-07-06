@@ -40,8 +40,9 @@
 | `worktree.ts` | `wt` 的 Git worktree 逻辑：按 `work/*` 分支扫描、创建同级 `<project>[name]` worktree、归档已合并分支、重新激活时更新到主线、干净检查和删除目录。 |
 | `config.ts` | 同步读取 `config.toml`，解析 `[feishu]`、`[runtime]`、`[notify]` 和可选 `[codex.env]`。 |
 | `paths.ts` | XDG/Windows runtime 路径解析，以及 PID、日志、session/chat/resume/model/alive/tasklist map、inbox、debug socket 路径常量。 |
-| `notify.ts` | 本机 HTTP 通知服务，接收 `{project, text, level}` 并发送飞书 markdown 卡片。 |
-| `notify-skill.ts` | 在本机 Codex skills 目录生成/维护 Feishu notify 技能说明。 |
+| `notify.ts` | 本机 HTTP 通知服务，接收 `{project, text, title?, level?, images?, buttons?, callback?}` 并发送飞书 markdown 卡片；`buttons` 把卡片变成交互卡 —— `callback` 在则点击时 push 给调用方 loopback 服务，不在则 `GET /notify/result/<notify_id>` pull 取结果。 |
+| `notify-callbacks.ts` | `/notify` 交互按钮的注册表与回调分发：持久化 `notify_id → callback URL + 原始卡片参数` 到 `notify-callbacks.json`(7 天 TTL)；`callback` 在时把 `{notify_id, button, operator, …}` POST 到调用方 loopback URL(2.5s 超时)，失败显式暴露不兜底；`buildNotifyResult` 供 pull 端点输出裁决；in-memory `dispatching` Set 做两阶段点击的并发护栏(仅内存,restart 清零)。 |
+| `notify-skill.ts` | 在本机 Codex(`~/.codex/skills/`)和 Claude Code(`~/.claude/skills/`)两个 skills 目录生成/维护 Feishu notify 技能说明;两侧同源、幂等覆盖。 |
 | `instructions.ts` | 注入给每个 Codex thread 的 channel developer instructions。 |
 | `setup.ts` | 交互式首次配置向导；安装/检查 Codex、校验 Feishu 凭据和 `wt` 所需群权限、写 `config.toml` 并拉起 daemon。 |
 | `setup-cli.ts` | `lodestar-setup` 入口。 |
@@ -98,7 +99,8 @@
 - `tasklist-worker` 启动后延迟 15 秒首次扫描，此后每 30 秒扫描一次；同一时间只跑一个 scan，运行记录写入 `tasklist-map.json` 并在进程丢失时向任务评论暴露错误。
 - 任务自动执行使用 `AI-AUTO`/`AI-REVIEW` 本地 worktree 和 `AI-AUTO/<task-guid>` tag 作为审查产物；人工在 `[AI]待审核` 中勾选完成是触发本地合并的信号。
 - Assistant 正文和 footer 状态不再走 Card Kit `/content` 打字流；正文在完整 `agentMessage` 到达后一次性 `addElement`，footer 状态用 `replaceElement` 直接替换。`cardkit.flush` 仅等待同卡片已排队写操作完成。
-- `card.action.trigger` 需要 3 秒内替换原 JSON 卡片时 return `{ card: { type: "raw", data: newCard } }`；不要 return 裸卡片 JSON 或 `{ card: newCard }`，也不要在回调 ACK 前调用 `message.patch`。延时更新才先 ACK 再用回调 token 调 `/interactive/v1/card/update`。
+- `card.action.trigger` 需要 3 秒内替换原 JSON 卡片时 return `{ card: { type: "raw", data: newCard } }`；不要 return 裸卡片 JSON 或 `{ card: newCard }`，也不要在回调 ACK 前调用 `message.patch`（会和 ACK 响应竞态）。延时更新：ACK 用 toast（不带卡），再用 `feishu.updateCard`（message.patch）改原卡——`/notify` 按钮的两段式反馈(processing→delivered/failed)走这条路径。⚠️ 不要用 `/interactive/v1/card/update` 回调 token 端点:它是 legacy,对 schema-2.0 卡返回 code=0 但渲染空白(2026-07-05 实测)。内联带卡 ACK(Method 1)+ 任何后续更新也不兼容(后续不重绘)。
+- `handleCardAction` 里 `kind:'notify_callback'` 必须在 session 存在性检查**之前**短路(`/notify` 卡片所在的群不一定有 Session);分发走 `notify-callbacks.ts`,点击 → POST 调用方 loopback URL → 2xx 后冻结成已选卡片,失败显式 toast 不兜底。
 - `feishu.ts` 对 SDK 发送消息做 retry 和 UUID 去重；业务 API 错误要 log 并返回失败，而不是默默换用 raw API。
 - `codex-process.ts` 保存最近模型、effort、usage、context window、context compaction 状态和 result meta，控制台和 footer 读取这些快照展示运行状态。
 - `setup.ts` 写出的 TOML 转义逻辑要与 `config.ts` 的最小 TOML parser 保持一致。
