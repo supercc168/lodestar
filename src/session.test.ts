@@ -11,15 +11,6 @@ const { fixedModelChoices, normalizeFixedModelSelection, configuredDefaultSelect
 const { config } = await import('./config')
 const { peekUsage, updateUsageFromRateLimits } = await import('./usage')
 
-// 全量跑时,claude-agent-process.test.ts 的 mock.module('./config') 把 ./config 整体
-// 换成只含 { claude } 的桩,且 Bun 的 mock.module 是进程级、跨文件不还原 —— 泄漏到
-// 本文件后 config.codex 变 undefined。session-model 现在会经 codex-models 读
-// config.codex.models,桩缺 codex 字段会让归一化/默认档/picker 全线 throw。补齐
-// codex 字段,复原本文件"用真实 config 单例"的前提(真实 config 恒有 codex,
-// 生产不受影响;单独跑本文件时 codex 已在,下面两行为 no-op)。
-;(config as any).codex ??= { env: {}, models: {} }
-;(config.codex as any).models ??= {}
-
 interface FetchCall {
   method: string
   path: string

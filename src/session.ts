@@ -31,7 +31,7 @@ import {
   type ThreadGoal,
   type TurnPlanUpdated,
 } from './codex-process'
-import { codexModelIsApiRoute, codexSpawnOverrides } from './codex-models'
+import { codexModelIsApiRoute, codexModelRequiresOpenaiAuth, codexSpawnOverrides } from './codex-models'
 import {
   CLAUDE_EFFORT,
   agentProviderLabel,
@@ -701,7 +701,7 @@ export class Session {
     else report?.('🔎 检查 Claude Code')
     if (
       this.selectedProvider === 'codex' &&
-      !codexModelIsApiRoute(this.selectedModel) &&
+      (!codexModelIsApiRoute(this.selectedModel) || codexModelRequiresOpenaiAuth(this.selectedModel)) &&
       !feishu.isOpenAIChatGPTAuthenticated()
     ) {
       this.status = 'stopped'

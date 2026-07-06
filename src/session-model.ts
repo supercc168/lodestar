@@ -143,7 +143,7 @@ function choiceDescription(item: typeof FIXED_MODEL_CHOICES[number]): string {
     return `${item.description}(未配置 · 需在 config.toml 的 [claude.models.glm] 填 base_url + auth_token + model)`
   }
   if (item.provider === 'codex' && codexModelIsApiRoute(item.model) && !codexModelConfigured(item.model)) {
-    return `${item.description}(未配置 · 需在 config.toml 的 [codex.models.<slug>] 填 base_url + api_key + model)`
+    return `${item.description}(未配置 · 需在 config.toml 的 [codex.models.<slug>] 填 base_url + api_key(或 requires_openai_auth)+ model)`
   }
   return item.description
 }
