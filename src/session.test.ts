@@ -1,4 +1,5 @@
 import { EventEmitter } from 'node:events'
+import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
   boundResumes, deletedReactions, projectProfiles, resetFeishuMock,
@@ -9,6 +10,7 @@ const { Session } = await import('./session')
 const cardkit = await import('./cardkit')
 const { fixedModelChoices, normalizeFixedModelSelection } = await import('./session-model')
 const { config } = await import('./config')
+const { PROJECTS_ROOT } = await import('./feishu')
 const { peekUsage, updateUsageFromRateLimits } = await import('./usage')
 
 // Some test files mock ./config with only the fields they need. Keep this
@@ -633,13 +635,13 @@ describe('Session workDir project profile override', () => {
 
   test('falls back to PROJECTS_ROOT/<name> without profile', () => {
     const session = new Session('plainproject', 'oc_test_plain')
-    expect(session.workDir).toBe('/tmp/lodestar-projects/plainproject')
+    expect(session.workDir).toBe(join(PROJECTS_ROOT, 'plainproject'))
   })
 
   test('ignores a blank cwd override', () => {
     projectProfiles.set('blankcwd', { cwd: '   ' })
     const session = new Session('blankcwd', 'oc_test_blank')
-    expect(session.workDir).toBe('/tmp/lodestar-projects/blankcwd')
+    expect(session.workDir).toBe(join(PROJECTS_ROOT, 'blankcwd'))
   })
 })
 
