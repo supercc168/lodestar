@@ -92,6 +92,32 @@ lodestar-setup
 
 `删` 会先确认对应 worktree 群没有正在运行的 Codex session,再检查 worktree 没有未提交变更,然后解散群并删除 worktree 目录;分支保留,合并和分支清理由 agent 处理。
 
+### 🧩 Codex API 档位(自定义 provider)
+
+默认 `Codex · GPT-5.5` 档位继承用户全局 `~/.codex/config.toml`(`model_provider` 指向哪就走哪)。要在飞书 `model` 面板里按档位/按群切换 Codex 的第三方 OpenAI 兼容端点,在 `config.toml` 加 `[codex.models.<slug>]`:
+
+```toml
+# 第三方 OpenAI 兼容端点(自带 key)
+[codex.models.kimi]
+display_name = "Codex · Kimi"
+base_url     = "https://api.moonshot.cn/v1"
+wire_api     = "chat"          # chat | responses,默认 chat
+api_key      = "sk-..."
+model        = "kimi-k2"
+effort       = "high"          # none|minimal|low|medium|high|xhigh,默认回落 xhigh
+
+# 走 codex OpenAI auth 的端点(无需 api_key)
+[codex.models.wuhen]
+base_url     = "https://api.wuhen-ai.com"
+wire_api     = "responses"
+model        = "gpt-5.5"
+requires_openai_auth = "true"
+```
+
+配好后面板出现 `codex:<slug>` 档位。lodestar spawn 时用 `codex app-server -c model_provider="lodestar_<slug>" …` 注入一个前缀隔离的 provider,并把 `api_key` 注入 env —— **不改你全局 `~/.codex/config.toml`,也不覆盖你已有的 `[model_providers.*]`**。缺 `base_url` / `api_key` / `model` 的档位在面板可见但选择被拦截。API 档位跳过 `codex login` 的 ChatGPT 登录检查(用 key 鉴权)。
+
+> 已知限制(Windows):macOS/Linux 下 codex 以离散 argv 直接 spawn(不过 shell),`-c` 的 TOML 字面量精确传入;但 Windows 为兼容 `.cmd`/`.bat` shim 走 `shell:true`,`-c model_providers.<slug>.base_url="…"` 里的引号可能被 cmd.exe 处理。Windows 用户如遇自定义 provider 不生效,可改用全局 `~/.codex/config.toml` 配置。
+
 ---
 
 ## 🎁 附加能力
