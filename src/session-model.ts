@@ -11,6 +11,12 @@ import {
 } from './agent-process'
 import * as cards from './cards'
 import * as feishu from './feishu'
+import {
+  codexModelChoices,
+  codexModelConfigured,
+  codexModelEffort,
+  codexModelIsApiRoute,
+} from './codex-models'
 import { log } from './log'
 import { messageOf, withTimeout, type ModelActionResult } from './session-util'
 
@@ -39,24 +45,59 @@ const FIXED_MODEL_CHOICES = [
   },
 ]
 
-function fixedModelChoices(s: Session): cards.ModelChoice[] {
+function defaultFixedChoiceFor(provider: AgentProvider): typeof FIXED_MODEL_CHOICES[number] {
+  return FIXED_MODEL_CHOICES.find(c => c.provider === provider) ?? FIXED_MODEL_CHOICES[0]
+}
+
+function resolvedEffort(item: typeof FIXED_MODEL_CHOICES[number]): AgentReasoningEffort {
+  if (item.provider === 'codex') {
+    const configured = codexModelEffort(item.model)
+    if (configured) return configured
+  }
+  return item.effort
+}
+
+export function normalizeFixedModelSelection(
+  provider: AgentProvider,
+  model: string | null | undefined,
+  _effort: AgentReasoningEffort | null | undefined,
+): { model: string; effort: AgentReasoningEffort } {
+  const all = [...FIXED_MODEL_CHOICES, ...codexModelChoices()]
+  const hit = all.find(c => c.provider === provider && c.model === model)
+  if (hit && provider === 'codex' && codexModelIsApiRoute(model) && !codexModelConfigured(model)) {
+    const fallback = defaultFixedChoiceFor(provider)
+    return { model: fallback.model, effort: resolvedEffort(fallback) }
+  }
+  const choice = hit ?? defaultFixedChoiceFor(provider)
+  return { model: choice.model, effort: resolvedEffort(choice) }
+}
+
+function choiceDescription(item: typeof FIXED_MODEL_CHOICES[number]): string {
+  if (item.provider === 'codex' && codexModelIsApiRoute(item.model) && !codexModelConfigured(item.model)) {
+    return `${item.description}(未配置 · 需在 config.toml 的 [codex.models.<slug>] 填 base_url + api_key(或 requires_openai_auth)+ model)`
+  }
+  return item.description
+}
+
+export function fixedModelChoices(s: Session): cards.ModelChoice[] {
   const currentProvider = s.currentProvider()
   const currentModel = s.currentModelLabel()
   const currentEffort = s.currentEffortLabel()
-  return FIXED_MODEL_CHOICES.map(item => {
+  return [...FIXED_MODEL_CHOICES, ...codexModelChoices()].map(item => {
     const selected = currentProvider === item.provider && currentModel === item.model
+    const effort = resolvedEffort(item)
     return {
       provider: item.provider,
       model: item.model,
       displayName: item.displayName,
-      description: item.description,
+      description: choiceDescription(item),
       isDefault: false,
       selected,
       efforts: [{
-        effort: item.effort,
+        effort,
         description: '',
         isDefault: true,
-        selected: selected && currentEffort === item.effort,
+        selected: selected && currentEffort === effort,
       }],
     }
   })
@@ -143,9 +184,16 @@ export async function onModelEffortSelect(
   const effort = effortValue as AgentReasoningEffort
   // 二元锁死:只放行 FIXED_MODEL_CHOICES 的 (provider, model, effort) 组合,
   // 拒绝旧 effort 回调/伪造把 session 切到非固定项或非锁死 effort。
-  const fixed = FIXED_MODEL_CHOICES.find(c => c.provider === provider && c.model === model)
-  if (!fixed || fixed.effort !== effort) {
+  const fixed = [...FIXED_MODEL_CHOICES, ...codexModelChoices()]
+    .find(c => c.provider === provider && c.model === model)
+  if (!fixed || resolvedEffort(fixed) !== effort) {
     return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在固定选项中` }
+  }
+  if (provider === 'codex' && codexModelIsApiRoute(model) && !codexModelConfigured(model)) {
+    return {
+      ok: false,
+      message: `Codex API 档位(${model})未配置:请在 ~/.config/lodestar/config.toml 的 [codex.models.<slug>] 填写 base_url、api_key(或 requires_openai_auth)和 model 后重试(内建 gpt-5.5 走全局 codex 配置,无需配置)`,
+    }
   }
   const choice = panel?.models.find(m => m.model === model && (m.provider ?? 'codex') === provider)
   if (choice && !choice.efforts.some(item => item.effort === effort)) {

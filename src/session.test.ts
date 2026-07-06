@@ -11,6 +11,11 @@ const { fixedModelChoices, normalizeFixedModelSelection } = await import('./sess
 const { config } = await import('./config')
 const { peekUsage, updateUsageFromRateLimits } = await import('./usage')
 
+// Some test files mock ./config with only the fields they need. Keep this
+// file's Codex model tests isolated when the suite runs in one Bun process.
+;(config as any).codex ??= { env: {}, models: {} }
+;(config.codex as any).models ??= {}
+
 interface FetchCall {
   method: string
   path: string
@@ -335,6 +340,79 @@ describe('Session compact command', () => {
     expect(footerWrites.some(content =>
       content.includes('✅ 上下文已压缩') && content.includes('🧠 2% (5.4K/258K)')
     )).toBe(true)
+  })
+})
+
+describe('Codex API model choices', () => {
+  test('keeps configured codex api selections and uses configured effort', () => {
+    const prev = config.codex.models
+    ;(config.codex as any).models = {
+      kimi: {
+        base_url: 'https://api.moonshot.cn/v1',
+        api_key: 'sk',
+        model: 'kimi-k2',
+        effort: 'high',
+      },
+    }
+    try {
+      expect(normalizeFixedModelSelection('codex', 'codex:kimi', null))
+        .toEqual({ model: 'codex:kimi', effort: 'high' })
+    } finally {
+      ;(config.codex as any).models = prev
+    }
+  })
+
+  test('falls back to gpt-5.5 when a persisted codex api selection is incomplete', () => {
+    const prev = config.codex.models
+    ;(config.codex as any).models = {
+      broken: { base_url: 'https://x.example.com', api_key: 'sk' },
+    }
+    try {
+      expect(normalizeFixedModelSelection('codex', 'codex:broken', null))
+        .toEqual({ model: 'gpt-5.5', effort: 'xhigh' })
+    } finally {
+      ;(config.codex as any).models = prev
+    }
+  })
+
+  test('renders configured codex api profiles in the model panel', () => {
+    const prev = config.codex.models
+    ;(config.codex as any).models = {
+      kimi: {
+        display_name: 'Codex · Kimi',
+        description: 'Kimi API route.',
+        base_url: 'https://api.moonshot.cn/v1',
+        api_key: 'sk',
+        model: 'kimi-k2',
+        effort: 'high',
+      },
+    }
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      const choices = fixedModelChoices(session)
+      const kimi = choices.find((choice: any) => choice.model === 'codex:kimi')
+      expect(kimi?.displayName).toBe('Codex · Kimi')
+      expect(kimi?.description).toBe('Kimi API route.')
+      expect(kimi?.efforts.map((e: any) => e.effort)).toEqual(['high'])
+    } finally {
+      ;(config.codex as any).models = prev
+    }
+  })
+
+  test('rejects incomplete codex api profiles during model selection', async () => {
+    const prev = config.codex.models
+    ;(config.codex as any).models = {
+      broken: { base_url: 'https://x.example.com', api_key: 'sk' },
+    }
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      const result = await session.onModelEffortSelect('codex:broken', 'xhigh', '', 'ou_user', 'codex')
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('未配置')
+      expect(result.message).toContain('[codex.models.<slug>]')
+    } finally {
+      ;(config.codex as any).models = prev
+    }
   })
 })
 
