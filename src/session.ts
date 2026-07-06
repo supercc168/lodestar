@@ -706,9 +706,9 @@ export class Session {
     ) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
-      report?.('❌ Codex 未登录 ChatGPT 账号')
+      report?.('❌ Codex 未登录(ChatGPT 或 API key)')
       if (announce) {
-        await feishu.sendText(this.chatId, '❌ Codex 未登录 ChatGPT 账号。\n请在服务器上运行 `codex login` 后再试。')
+        await feishu.sendText(this.chatId, '❌ Codex 未登录(ChatGPT 或 API key 均可)。\n请在服务器上运行 `codex login`(或配好 API key)后再试。')
       }
       return false
     }

@@ -42,6 +42,14 @@ export function resolveCodexBin(): string {
   return whichCodex() ?? 'codex'
 }
 
+/** `codex login status` 的输出是否表示已认证 —— ChatGPT OAuth 或 API key 皆可。
+ * codex 对 API key 登录输出 "Logged in using an API key - sk-…";ChatGPT 登录输出
+ * "Logged in using ChatGPT"。第三方档位(无痕 wuhen 一类)与全局也走 key 的内建
+ * gpt-5.5 档都用 API key,若只认 ChatGPT 会把它们误判为未登录而拦掉。 */
+export function codexLoginStatusAuthenticated(output: string): boolean {
+  return /Logged in using ChatGPT/i.test(output) || /Logged in using an API key/i.test(output)
+}
+
 function whichCodex(): string | null {
   const PATH = process.env.PATH ?? ''
   if (!PATH) return null

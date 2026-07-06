@@ -5,6 +5,7 @@ import { join } from 'node:path'
 
 import {
   buildCodexAppServerArgs,
+  codexLoginStatusAuthenticated,
   diffUsageTotals,
   effectiveTurnTokens,
   contextCompactionNoticeFromMessage,
@@ -277,5 +278,18 @@ describe('buildCodexAppServerArgs', () => {
       '-c', 'model_provider="lodestar_kimi"',
       '--listen', 'stdio://',
     ])
+  })
+})
+
+describe('codexLoginStatusAuthenticated', () => {
+  test('ChatGPT OAuth login counts as authenticated', () => {
+    expect(codexLoginStatusAuthenticated('Logged in using ChatGPT')).toBe(true)
+  })
+  test('API key login counts as authenticated (无痕 wuhen 一类第三方 key)', () => {
+    expect(codexLoginStatusAuthenticated('Logged in using an API key - sk-69c70***37641')).toBe(true)
+  })
+  test('not-logged-in output is unauthenticated', () => {
+    expect(codexLoginStatusAuthenticated('Not logged in')).toBe(false)
+    expect(codexLoginStatusAuthenticated('')).toBe(false)
   })
 })
