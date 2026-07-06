@@ -14,7 +14,7 @@ import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
 import { config, type ProjectProfile } from './config'
-import { isCodexReasoningEffort, resolveCodexBin } from './codex-process'
+import { codexLoginStatusAuthenticated, isCodexReasoningEffort, resolveCodexBin } from './codex-process'
 import {
   isClaudeReasoningEffort,
   providerFromModel,
@@ -823,7 +823,7 @@ export function provisionProject(workDir: string): void {
 export function isOpenAIChatGPTAuthenticated(): boolean {
   try {
     const out = execSync(`"${resolveCodexBin()}" login status 2>&1`, { timeout: 10_000 }).toString()
-    return /Logged in using ChatGPT/i.test(out)
+    return codexLoginStatusAuthenticated(out)
   } catch { return false }
 }
 
