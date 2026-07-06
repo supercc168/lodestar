@@ -119,6 +119,15 @@ export function codexModelIsApiRoute(model: string | null | undefined): boolean 
   return codexModelProfile(model)?.route === 'api'
 }
 
+/** 该档位是否依赖 codex 的 OpenAI/ChatGPT 登录态(requires_openai_auth="true")。
+ * 这类 API 档位(如无痕 wuhen)不像自带 key 的档位,仍需 ChatGPT 登录,故 start()
+ * 的登录预检对它们保留。 */
+export function codexModelRequiresOpenaiAuth(model: string | null | undefined): boolean {
+  const p = codexModelProfile(model)
+  if (!p || p.route !== 'api') return false
+  return config.codex.models[p.name]?.requires_openai_auth?.trim() === 'true'
+}
+
 /** 该档位是否可用:登录/未知档恒 true;API 路由需 base_url + key + model 配好。 */
 export function codexModelConfigured(model: string | null | undefined): boolean {
   const p = codexModelProfile(model)

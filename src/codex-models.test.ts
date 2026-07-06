@@ -17,6 +17,12 @@ mock.module('./config', () => ({
         broken: { base_url: 'https://x.example.com', api_key: 'sk-x' },
         // 登录档(无 base_url)
         legacy: { model: 'gpt-5.5' },
+        // API 档但靠 codex 的 ChatGPT 登录态(无痕),不自带 key
+        wuhen: {
+          base_url: 'https://api.wuhen-ai.com',
+          requires_openai_auth: 'true',
+          model: 'gpt-5.5',
+        },
       },
     },
     claude: { env: {}, models: {} },
@@ -32,6 +38,7 @@ const {
   codexModelProfiles,
   codexModelProfile,
   codexModelIsApiRoute,
+  codexModelRequiresOpenaiAuth,
   codexModelConfigured,
   codexModelEffort,
   resolveCodexModelId,
@@ -141,7 +148,15 @@ describe('config-driven lookups', () => {
   test('codexModelChoices lists only api slots (incl unconfigured)', () => {
     const choices = codexModelChoices()
     const models = choices.map(c => c.model).sort()
-    expect(models).toEqual(['codex:broken', 'codex:kimi'])
+    expect(models).toEqual(['codex:broken', 'codex:kimi', 'codex:wuhen'])
     expect(choices.find(c => c.model === 'codex:kimi')!.effort).toBe('high')
+  })
+  test('codexModelRequiresOpenaiAuth: only requires_openai_auth api slots keep the login precheck', () => {
+    // 无痕:API 档但仍需 ChatGPT 登录态 → 保留预检
+    expect(codexModelRequiresOpenaiAuth('codex:wuhen')).toBe(true)
+    // kimi:自带 key 的 API 档 → 跳过预检
+    expect(codexModelRequiresOpenaiAuth('codex:kimi')).toBe(false)
+    // 内建登录档(非 codex: 档位)→ 不适用
+    expect(codexModelRequiresOpenaiAuth('gpt-5.5')).toBe(false)
   })
 })

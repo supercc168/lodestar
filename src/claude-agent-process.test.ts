@@ -9,6 +9,10 @@ mock.module('./config', () => ({
       env: {},
       models: {},
     },
+    codex: {
+      env: {},
+      models: {},
+    },
   },
 }))
 
