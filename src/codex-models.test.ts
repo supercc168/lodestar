@@ -56,9 +56,9 @@ describe('codex model slug helpers', () => {
 })
 
 describe('codexConfigArgs', () => {
-  test('builds -c overrides for provider + endpoint', () => {
+  test('builds -c overrides for provider + endpoint (api_key → env_key declared)', () => {
     const args = codexConfigArgs(
-      { base_url: 'https://api.moonshot.cn/v1', wire_api: 'chat', model: 'kimi-k2' },
+      { base_url: 'https://api.moonshot.cn/v1', wire_api: 'chat', api_key: 'sk-kimi', model: 'kimi-k2' },
       'kimi',
     )
     // flat ['-c','k=v', …];断言关键对存在
@@ -69,12 +69,14 @@ describe('codexConfigArgs', () => {
     // 每个 k=v 前面都跟一个 '-c'
     expect(args.filter(a => a === '-c').length).toBe((args.length) / 2)
   })
-  test('adds requires_openai_auth when set', () => {
+  test('adds requires_openai_auth and OMITS env_key when no api_key', () => {
     const args = codexConfigArgs(
       { base_url: 'https://api.wuhen-ai.com', requires_openai_auth: 'true', model: 'gpt-5.5' },
       'wuhen',
     )
     expect(args).toContain('model_providers.lodestar_wuhen.requires_openai_auth=true')
+    // codex 对未设的 env_key 变量会中止 → 无 api_key 时绝不声明 env_key(2026-07-06 实测)
+    expect(args.some(a => a.includes('.env_key='))).toBe(false)
   })
   test('defaults wire_api to chat', () => {
     const args = codexConfigArgs({ base_url: 'https://x' }, 'x')
