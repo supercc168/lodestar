@@ -27,6 +27,11 @@ import {
 import { diffUsageTotals, effectiveTurnTokens, usageFromTokenUsagePayload } from './codex-usage'
 import type { AgentReasoningEffort } from './agent-process'
 
+/** 拼 `codex app-server` 命令行:把 provider 覆盖 `-c` 对插在 `--listen` 之前。 */
+export function buildCodexAppServerArgs(configArgs: string[] = []): string[] {
+  return ['app-server', ...configArgs, '--listen', 'stdio://']
+}
+
 export function resolveCodexBin(): string {
   if (process.platform !== 'win32') {
     const pinned = join(homedir(), '.local', 'npm-global', 'bin', 'codex')
@@ -72,6 +77,11 @@ export interface SpawnOpts {
   model?: string
   effort: CodexReasoningEffort
   appendSystemPrompt?: string
+  /** 追加到 `codex app-server` 命令行的 `-c` 覆盖对(flat:'-c','k=v',…),
+   * 由 codex API 档位注入自定义 provider。缺省 = 无覆盖(登录/默认档)。 */
+  configArgs?: string[]
+  /** 叠加进 spawn env 的 provider 接入变量(装 api_key)。缺省 = 无注入。 */
+  providerEnv?: Record<string, string>
 }
 
 export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
@@ -256,7 +266,7 @@ export class CodexProcess extends EventEmitter {
     this.on('error', () => {})
     this.opts = opts
     const codexBin = resolveCodexBin()
-    const args = ['app-server', '--listen', 'stdio://']
+    const args = buildCodexAppServerArgs(opts.configArgs)
     log(`codex-process: spawn ${codexBin} app-server (cwd=${opts.workDir})`)
     this.proc = spawn(codexBin, args, {
       cwd: opts.workDir,
@@ -267,6 +277,7 @@ export class CodexProcess extends EventEmitter {
         NPM_CONFIG_LOGLEVEL: 'error',
         PATH: buildSpawnPath(),
         ...config.codex.env,
+        ...(opts.providerEnv ?? {}),
       },
     }) as ChildProcessByStdio<Writable, Readable, Readable>
 
