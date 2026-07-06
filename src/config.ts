@@ -37,6 +37,9 @@ export interface LodestarConfig {
    * Empty record = no injection; Codex uses the user's ChatGPT login. */
   codex: {
     env: Record<string, string>
+    /** Per-slot 第三方 provider 档位,对应 `[codex.models.<slug>]`。空 record =
+     * 只有内建 gpt-5.5 登录/默认档。见 src/codex-models.ts。 */
+    models: Record<string, CodexModelConfig>
   }
   /** Env vars injected into the Claude Code subprocess used by
    * `@anthropic-ai/claude-agent-sdk`. Empty record = inherit the user's
@@ -81,6 +84,28 @@ export interface ClaudeModelConfig {
   /** 该档位在 model 面板锁死的思考强度(low/medium/high/xhigh/max)。第三方
    * 路由(GLM)用它复刻各自最优配置 —— 如 GLM-5.2 直连智谱走 xhigh 触发
    * extended thinking。官方档位不读此字段(锁 max)。非法值忽略、回落固定值。 */
+  effort?: string
+}
+
+/** 第三方 Codex provider(OpenAI 兼容端点)接入配置,对应 `[codex.models.<slug>]`。
+ * 配了 base_url 即视为 API 路由:spawn 时用 `codex app-server -c` 覆盖注入一个
+ * `lodestar_<slug>` provider,并把 api_key 注入 env。都不配 = 登录档,继承用户
+ * 全局 `~/.codex/config.toml`。见 src/codex-models.ts。 */
+export interface CodexModelConfig {
+  display_name?: string
+  description?: string
+  model?: string
+  base_url?: string
+  /** `chat` | `responses`;缺省 `chat`。第三方 OpenAI 兼容端点多用 chat。 */
+  wire_api?: string
+  api_key?: string
+  /** 覆盖装 key 的环境变量名(缺省 lodestar 生成 LODESTAR_CODEX_<SLUG>_KEY)。 */
+  env_key?: string
+  /** 走 codex 的 OpenAI auth(如无痕 wuhen);置 "true" 时可不配 api_key。 */
+  requires_openai_auth?: string
+  /** 显式声明路由;缺省由是否配了 base_url 推断。 */
+  route?: 'login' | 'api'
+  /** 该档位锁定的思考强度(none|minimal|low|medium|high|xhigh);缺省回落 xhigh。 */
   effort?: string
 }
 
@@ -205,6 +230,36 @@ function loadConfig(): LodestarConfig {
     }
     return out
   }
+  const codexModelSections = (): Record<string, CodexModelConfig> => {
+    const out: Record<string, CodexModelConfig> = {}
+    const prefix = 'codex.models.'
+    for (const [sectionName, section] of Object.entries(t)) {
+      if (!sectionName.startsWith(prefix)) continue
+      const key = sectionName.slice(prefix.length).trim()
+      if (!key) continue
+      const profile: CodexModelConfig = {}
+      for (const [rawKey, value] of Object.entries(section)) {
+        if (typeof value !== 'string' || value.length === 0) continue
+        const field = rawKey.trim()
+        if (
+          field === 'display_name' ||
+          field === 'description' ||
+          field === 'model' ||
+          field === 'base_url' ||
+          field === 'wire_api' ||
+          field === 'api_key' ||
+          field === 'env_key' ||
+          field === 'requires_openai_auth' ||
+          field === 'route' ||
+          field === 'effort'
+        ) {
+          ;(profile as Record<string, string>)[field] = value
+        }
+      }
+      out[key] = profile
+    }
+    return out
+  }
   // [projects.<name>] 节可选 —— 一个外部项目(如 evolving)想跑干净隔离的
   // Claude session:指定 cwd、限定内置工具、只挂自己的 .mcp.json。未配置的
   // 项目完全走 Lodestar 默认(settingSources:['user'] + claude_code 工具集)。
@@ -243,7 +298,7 @@ function loadConfig(): LodestarConfig {
     feishu: { app_id: appId, app_secret: appSecret },
     runtime: { projects_root: projectsRoot },
     notify: { bind: notifyBind, port: notifyPort },
-    codex: { env: codexEnv },
+    codex: { env: codexEnv, models: codexModelSections() },
     claude: {
       bin: claudeBin,
       defaultModel: claudeDefaultModel,
