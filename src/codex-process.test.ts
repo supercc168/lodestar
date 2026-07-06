@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  buildCodexAppServerArgs,
   diffUsageTotals,
   effectiveTurnTokens,
   contextCompactionNoticeFromMessage,
@@ -262,5 +263,19 @@ describe('codex token usage helpers', () => {
       cache_read_input_tokens: undefined,
     })
     expect(diffUsageTotals(null, null)).toBeNull()
+  })
+})
+
+describe('buildCodexAppServerArgs', () => {
+  test('no overrides → bare app-server on stdio', () => {
+    expect(buildCodexAppServerArgs([])).toEqual(['app-server', '--listen', 'stdio://'])
+  })
+  test('inserts -c overrides before --listen', () => {
+    const args = buildCodexAppServerArgs(['-c', 'model_provider="lodestar_kimi"'])
+    expect(args).toEqual([
+      'app-server',
+      '-c', 'model_provider="lodestar_kimi"',
+      '--listen', 'stdio://',
+    ])
   })
 })
