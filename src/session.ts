@@ -944,6 +944,9 @@ export class Session {
     this.status = 'stopped'
     this.opts.onLifecycleChange?.()
     await proc.kill()
+    // 后台任务随轮作废:翻 killed 终态 + 活卡沉降历史墓碑,否则 SDK 一死 entry
+    // 永远卡 running,refresh tick 还在伪造运行时长。
+    await this.resetBackgroundTasks()
     report?.(`✅ ${reason}`)
     if (announce) await feishu.sendText(this.chatId, `🔴 ${reason} (session: ${this.sessionName})`)
   }
@@ -994,6 +997,9 @@ export class Session {
     this.pendingPermissions.clear()
     this.currentTurnUsageBaseline = null
     this.currentTurnUsageBaselineKnown = false
+    // 后台任务随轮作废:旧 proc 的活跃 entry 不能带进新会话(会跨会话「复活」
+    // 到新卡)。翻 killed 终态 + 活卡沉降,在 spawn 新 proc 之前清干净。
+    await this.resetBackgroundTasks()
     if (resume && prevSessionId) {
       this.status = 'starting'
       this.usageTotalsSeedUnknown = true
@@ -1672,6 +1678,34 @@ export class Session {
         void cardkit.replaceElement(handle.cardId, cards.BG_ELEMENTS.panel(t.id), cards.backgroundTaskPanel(t, now))
       }
     }
+  }
+
+  /** kill / restart 时强制结算后台任务状态。SDK 子进程一死就不再发 task_settled,
+   *  活跃 entry 会永远卡 running,且 backgroundRefreshTick(setInterval 不归 SDK 管)
+   *  还在每 tick 把「🟡 运行中 Ns」时长往上推 —— 卡片永不沉降,伪造「还在跑」。
+   *  这里把活跃 entry 翻成 killed 终态,有活卡则沉降成历史墓碑(settleBackgroundCard
+   *  内部关 tick/timer + 渲染墓碑 + 清空数组),无卡只清内存。语义同 clearMultiMsgBuffer
+   *  / releaseAllReactions —— 属于「轮作废」清理,此前漏了这一层。 */
+  private async resetBackgroundTasks(): Promise<void> {
+    if (this.backgroundTasks.some(t => !cards.isBgTerminal(t))) {
+      const now = Date.now()
+      this.backgroundTasks = this.backgroundTasks.map(t =>
+        cards.isBgTerminal(t) ? t : { ...t, status: 'killed', endTime: t.endTime ?? now }
+      )
+    }
+    this.pendingBgTasks = []
+    if (this.backgroundCard) {
+      await this.settleBackgroundCard()
+      return
+    }
+    this.stopBackgroundRefreshTick()
+    if (this.backgroundRefreshTimer) {
+      clearTimeout(this.backgroundRefreshTimer)
+      this.backgroundRefreshTimer = null
+    }
+    this.backgroundTasks = []
+    this.backgroundDetailAdded.clear()
+    this.openingBackground = false
   }
 
   /** 全部后台任务终态:活卡 updateCard 成历史快照(只终态墓碑),关 streaming,

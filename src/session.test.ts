@@ -1119,3 +1119,74 @@ describe('Session usage cache cross-backend isolation', () => {
     expect(snap?.fiveHour?.percent).toBe(7)
   })
 })
+
+describe('Session resetBackgroundTasks on kill/restart', () => {
+  // 复现:SDK 子进程一死就不再发 task_settled,活跃 entry 永远卡 running,
+  // backgroundRefreshTick(setInterval,不归 SDK 管)还在每 tick 把「🟡 运行中
+  // Ns」时长往上推 —— 卡片永不沉降,伪造「还在跑」。kill(stop)/restart 必须
+  // 主动结算。回归:2026-07-06。
+  function makeRunningTask(id: string): any {
+    return { id, type: 'shell', description: `bg ${id}`, status: 'running', startedAt: Date.now() - 5000, steps: [] }
+  }
+
+  test('stop() kills proc AND clears running background tasks (public kill path)', async () => {
+    // 用户真实触发路径:kill 命令 → session.stop()。修复前 stop 只杀进程,
+    // 不碰 backgroundTasks,running entry 留在内存 + refresh tick 继续伪造时长。
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.backgroundTasks = [makeRunningTask('t1'), makeRunningTask('t2')]
+    session.pendingBgTasks = [makeRunningTask('p1')]
+    session.backgroundCard = null // 无活卡 → 走纯内存清理分支(避开 feishu.updateCard)
+    session.openingBackground = true
+
+    await session.stop('已终止', { announce: false })
+
+    expect(proc.killCalls).toBe(1) // 进程被杀
+    expect(session.backgroundTasks).toEqual([]) // running entry 不再残留
+    expect(session.pendingBgTasks).toEqual([])
+    expect(session.openingBackground).toBe(false)
+  })
+
+  test('live card: flips running tasks to killed terminal BEFORE settling (so the tombstone shows 💀 已终止)', async () => {
+    // 有活卡路径:先翻 killed,再 settleBackgroundCard 用终态 entry 渲染墓碑
+    // (用户看到「💀 已终止 Ns」而非「🟡 运行中」)。settle 内部 feishu.updateCard
+    // 在测试 mock 里不存在,stub 掉以聚焦本次修复边界(settle 老逻辑另有覆盖)。
+    const session = new Session('probe', 'chat_id') as any
+    const completedTask = { id: 't0', type: 'subagent', description: 'done', status: 'completed', startedAt: 0, endTime: 1000, steps: [] }
+    session.backgroundTasks = [makeRunningTask('t1'), completedTask]
+    session.backgroundCard = { messageId: 'om_bg', cardId: 'card_bg' }
+    let settleCalls = 0
+    let statusesAtSettle = ''
+    session.settleBackgroundCard = async function () {
+      settleCalls++
+      statusesAtSettle = JSON.stringify(this.backgroundTasks.map((t: any) => t.status))
+    }
+
+    await session.resetBackgroundTasks()
+
+    expect(settleCalls).toBe(1) // 有卡 → 沉降被调
+    // 活跃 entry 在 settle 之前已翻 killed(供墓碑渲染);已终态的保持原状。
+    expect(statusesAtSettle).toBe('["killed","completed"]')
+    expect(session.pendingBgTasks).toEqual([])
+  })
+
+  test('no live card: clears tasks + pending pool + refresh timer + detail set', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('t1')]
+    session.pendingBgTasks = [makeRunningTask('p1')]
+    session.backgroundCard = null
+    const liveTimer = setTimeout(() => {}, 100000)
+    session.backgroundRefreshTimer = liveTimer
+    session.backgroundDetailAdded = new Set(['t1'])
+    session.openingBackground = true
+
+    await session.resetBackgroundTasks()
+
+    expect(session.backgroundTasks).toEqual([])
+    expect(session.pendingBgTasks).toEqual([])
+    expect(session.backgroundRefreshTimer).toBeNull() // timer 引用已清
+    expect(session.backgroundDetailAdded.size).toBe(0)
+    expect(session.openingBackground).toBe(false)
+  })
+})
