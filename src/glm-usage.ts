@@ -7,9 +7,10 @@
  *
  *   GET {baseDomain}/api/monitor/usage/quota/limit
  *
- * 鉴权用 Claude Code 自己的两个标准环境变量 —— 它们不在 daemon 进程 env 里
- * (systemd 起的 daemon 不继承),而是写在 `~/.claude/settings.json` 的 env
- * 段、由 Claude CLI 启动子进程时注入。所以这里自己读文件拿:
+ * 鉴权凭据从 config.toml 的 [claude.models.glm] 档位拿 —— 经 claude-models.ts
+ * 的 claudeModelProfile('claude:glm') 读出,与 spawn 子进程时注入的 env 同源
+ * (base_url/auth_token → ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN),额度查询看
+ * 到的就是实际跑会话用的那套配置:
  *   ANTHROPIC_AUTH_TOKEN → 裸 token,直接作 Authorization header(不带 Bearer)
  *   ANTHROPIC_BASE_URL   → 判定平台 host(open.bigmodel.cn=ZHIPU / api.z.ai=ZAI)
  *
@@ -17,9 +18,7 @@
  * 绝不假数据。与 src/usage.ts(Codex 侧)的 snapshot 模式对齐。
  */
 
-import { readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
-import { join } from 'node:path'
+import { claudeModelProfile } from './claude-models'
 import { log } from './log'
 
 const API_TIMEOUT_MS = 10_000
@@ -58,27 +57,6 @@ type GlmUsageSnapshotOk = Extract<GlmUsageSnapshot, { state: 'ok' }>
 
 let cache: GlmUsageSnapshot | null = null
 let inFlight: Promise<GlmUsageSnapshot> | null = null
-
-/** Claude Code settings 目录:优先 CLAUDE_CONFIG_DIR,否则 ~/.claude。 */
-function claudeConfigDir(): string {
-  return process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
-}
-
-/**
- * 读 ~/.claude/settings.json 的 env 段。daemon 进程默认 env 里没有
- * ANTHROPIC_* —— 那是 Claude CLI 注入给子进程的;这里从文件读才是真相源。
- * 读不到(文件缺失/解析失败)返回空 record,调用方按 no_credentials 处理。
- */
-function readClaudeSettingsEnv(): Record<string, string> {
-  try {
-    const raw = readFileSync(join(claudeConfigDir(), 'settings.json'), 'utf8')
-    const env = JSON.parse(raw)?.env
-    return env && typeof env === 'object' ? env as Record<string, string> : {}
-  } catch (e) {
-    log(`glm-usage: read settings.json env failed: ${e}`)
-    return {}
-  }
-}
 
 /** 从 ANTHROPIC_BASE_URL 取 protocol//host;非法返回 null。 */
 function baseDomain(baseUrl: string): string | null {
@@ -134,7 +112,9 @@ function parseQuotaLimit(data: any): GlmUsageSnapshotOk {
 }
 
 async function fetchGlmUsage(): Promise<GlmUsageSnapshot> {
-  const env = readClaudeSettingsEnv()
+  // 与 spawn 子进程同源:从 config.toml [claude.models.glm] 档位拿注入用的
+  // ANTHROPIC_* env。读不到 token = 该档位未配置 → no_credentials。
+  const env = claudeModelProfile('claude:glm')?.env ?? {}
   const token = env.ANTHROPIC_AUTH_TOKEN
   const baseUrl = env.ANTHROPIC_BASE_URL || ''
   if (!token) return { state: 'no_credentials' }
