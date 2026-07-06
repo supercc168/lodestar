@@ -1,10 +1,11 @@
 import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { delimiter, join } from 'node:path'
 
 import {
   buildCodexAppServerArgs,
+  buildSpawnPath,
   codexLoginStatusAuthenticated,
   diffUsageTotals,
   effectiveTurnTokens,
@@ -278,6 +279,24 @@ describe('buildCodexAppServerArgs', () => {
       '-c', 'model_provider="lodestar_kimi"',
       '--listen', 'stdio://',
     ])
+  })
+})
+
+describe('buildSpawnPath', () => {
+  test('prepends whitelist onto inherited PATH so homebrew/nvm node stays reachable', () => {
+    // codex 常是 `#!/usr/bin/env node` 的 npm shim,node 可能只存在于继承 PATH 的某个目录
+    // (如 Apple Silicon 的 /opt/homebrew/bin)。替换式 PATH 会丢掉它 → shim 退出 127。
+    const path = buildSpawnPath('/opt/homebrew/bin:/usr/local/bin')
+    expect(path).toContain('/opt/homebrew/bin')
+    // 白名单目录仍排在前,保持工具解析的确定性优先级
+    expect(path.indexOf(join(homedir(), '.local', 'bin')))
+      .toBeLessThan(path.indexOf('/opt/homebrew/bin'))
+  })
+
+  test('empty inherited PATH does not leave a stray/trailing delimiter', () => {
+    const path = buildSpawnPath('')
+    expect(path).not.toContain(delimiter + delimiter)
+    expect(path.endsWith(delimiter)).toBe(false)
   })
 })
 

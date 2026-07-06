@@ -171,11 +171,20 @@ export function consoleUsageContent(
     case 'no_credentials':
       return '**📊 Codex 额度**　未登录 ChatGPT — 运行 `codex login`'
     case 'auth_failed':
-      return '**📊 Codex 额度**　当前不是 ChatGPT 登录 — 请运行 `codex login`'
+      return '**📊 Codex 额度**　非 ChatGPT 登录态 — 官方 ChatGPT 额度不适用'
     case 'rate_limited':
       return '**📊 Codex 额度**　API 429 限流,稍后重试'
     case 'network':
       return `**📊 Codex 额度**　拉取失败${usage.reason ? ' — `' + usage.reason + '`' : ''}`
+    case 'provider_usage': {
+      const valid = usage.isValid ? '' : ' · 渠道已停用'
+      return [
+        `**📊 Codex 额度** · ${usage.providerName}`,
+        `　· 渠道余额　${fmtProviderRemaining(usage.remaining, usage.unit)}${valid}`,
+      ].join('\n')
+    }
+    case 'provider_unavailable':
+      return `**📊 Codex 额度** · ${usage.providerName}　第三方渠道 — 官方 ChatGPT 额度不适用${usage.reason ? ' · ' + usage.reason : ''}`
   }
   const head = usage.subscriptionType
     ? `**📊 Codex 额度** · ChatGPT ${usage.subscriptionType}`
@@ -237,6 +246,13 @@ export function consoleGlmUsageContent(glmUsage: GlmUsageSnapshot | undefined): 
 
 function fmtUsagePercent(percent: number | null | undefined): string {
   return typeof percent === 'number' && Number.isFinite(percent) ? `${Math.round(percent)}%` : 'MISS'
+}
+
+function fmtProviderRemaining(remaining: number | string, unit: string): string {
+  const value = typeof remaining === 'number' && Number.isFinite(remaining)
+    ? String(Math.round(remaining * 100) / 100)
+    : String(remaining)
+  return unit ? `${value} ${unit}` : value
 }
 
 function fmtWindowLabel(mins: number | null | undefined, fallback: string): string {

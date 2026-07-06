@@ -1197,7 +1197,7 @@ export class Session {
     if (this.currentProvider() === 'claude') {
       opts.glmUsage = await readGlmUsage()
     } else {
-      opts.usage = await readUsage()
+      opts.usage = await readUsage(this.currentModelLabel() ?? undefined)
     }
     await cardkit.replaceElement(cardId, cards.ELEMENTS.consoleUsage, cards.consoleUsageElement(opts))
   }
