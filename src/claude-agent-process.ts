@@ -86,6 +86,12 @@ type PendingServerToolInput = {
 export interface ClaudeSpawnOpts extends SpawnOpts {
   model?: string
   effort: ClaudeReasoningEffort
+  /** SDK resumeSessionAt:只 resume 到该 assistant 消息 uuid 为止(回到历史某点)。
+   *  用于 fk/bk —— 不传则 resume 完整历史。Claude 专属(Codex 无此能力)。 */
+  resumeSessionAt?: string
+  /** SDK forkSession:true = resume 时派生新 session id,原 transcript 不动。
+   *  fk/bk 都用它(避免破坏/污染原会话)。 */
+  forkSession?: boolean
   /** Optional per-project launch profile from `[projects.<name>].*` in
    * config.toml. When present, overrides setting sources / tool set /
    * strict-mcp / project-mcp loading for an isolated session. Absent ⇒
@@ -271,12 +277,18 @@ function contextOccupancyFromUsage(usage: CodexUsage | null | undefined): number
   return occ > 0 ? occ : null
 }
 
-/** Claude Code session transcript 路径:~/.claude/projects/<cwd 编码>/<sid>.jsonl。
- * cwd 编码 = 绝对路径的 / 全替换成 -(claude code 约定,如 /home/x → -home-x)。 */
-export function claudeTranscriptPath(workDir: string, sessionId: string): string {
+/** Claude Code transcript 目录:~/.claude/projects/<cwd 编码>/。同 cwd 的所有会话
+ *  jsonl 都在此 —— rs 历史列表扫这个目录,得到同工作目录的全部 claude 会话
+ *  (worktree 不同 cwd → 不同编码目录,自然不混进来)。cwd 编码 = 绝对路径 / 全替换成 -。 */
+export function claudeTranscriptDir(workDir: string): string {
   const encoded = workDir.replace(/\//g, '-')
   const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
-  return join(configDir, 'projects', encoded, `${sessionId}.jsonl`)
+  return join(configDir, 'projects', encoded)
+}
+
+/** Claude Code session transcript 路径:~/.claude/projects/<cwd 编码>/<sid>.jsonl。 */
+export function claudeTranscriptPath(workDir: string, sessionId: string): string {
+  return join(claudeTranscriptDir(workDir), `${sessionId}.jsonl`)
 }
 
 /** 读 transcript jsonl,取最后一条 assistant message 的 usage —— 这是最后一次 API
@@ -785,6 +797,8 @@ export class ClaudeAgentProcess extends EventEmitter {
           ...(model ? { model } : {}),
           effort: this.opts.effort as EffortLevel,
           resume: this.opts.resumeSessionId,
+          ...(this.opts.resumeSessionAt ? { resumeSessionAt: this.opts.resumeSessionAt } : {}),
+          ...(this.opts.forkSession ? { forkSession: true } : {}),
           ...(executable.pathToClaudeCodeExecutable
             ? { pathToClaudeCodeExecutable: executable.pathToClaudeCodeExecutable }
             : {}),

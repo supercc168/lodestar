@@ -28,6 +28,7 @@ import {
   SESSION_CHAT_MAP_FILE,
   SESSION_MODEL_MAP_FILE,
   SESSION_RESUME_MAP_FILE,
+  SESSION_TURNS_MAP_FILE,
 } from './paths'
 import { log } from './log'
 
@@ -164,6 +165,126 @@ export function bindSessionResume(sessionName: string, sessionId: string, provid
 
 export function getSessionResume(sessionName: string, provider: AgentProvider = 'codex'): string | null {
   return lastSessionIdByName.get(sessionName)?.[provider] ?? null
+}
+
+// ── Session turns map (fk/bk anchors + rs recent) ───────────────────
+// `sessionName → TurnAnchor[]`。每 turn 结束记一条:本 turn 最后一条 assistant
+// 消息的 uuid(SDK resumeSessionAt 锚点)+ 用户输入预览 + 时间。fk/bk 列"用户
+// 输入前的分界点";rs 空闲模式列项目最近 24h 会话。fork/back 派生新会话时用
+// seedTurnAnchors 给新群继承分叉点之前的历史锚点。
+export interface TurnWrite {
+  tool: string
+  path: string
+  body: string
+}
+
+export interface TurnAnchor {
+  /** 本 turn 最后一条 assistant 消息 uuid — SDK resumeSessionAt 锚点 */
+  uuid: string
+  /** 该 uuid 所属的 Claude session_id。sid 漂移(provider切/clear/fork 后)校验用:
+   *  旧 sid 的 uuid 不能配新 sid 的 transcript → 锚点失效,不展示/不可选。 */
+  sid: string
+  /** 本 turn 用户输入预览(首条文本,截断) */
+  preview: string
+  /** 时间戳 ms */
+  ts: number
+  /** 本 turn 的 Write 类工具记录(Write/Edit/NotebookEdit/MultiEdit),bk 回滚说明用 */
+  writes: TurnWrite[]
+}
+
+const turnsBySession = new Map<string, TurnAnchor[]>()
+const TURN_ANCHOR_MAX = 200
+
+export function loadSessionTurnsMap(): void {
+  try {
+    const obj = JSON.parse(readFileSync(SESSION_TURNS_MAP_FILE, 'utf8'))
+    let n = 0
+    for (const [name, arr] of Object.entries(obj)) {
+      if (!Array.isArray(arr)) continue
+      const clean = arr
+        .filter((a: any) => a && typeof a.uuid === 'string' && typeof a.ts === 'number')
+        .map((a: any) => ({
+          uuid: String(a.uuid),
+          sid: String(a.sid ?? ''),
+          preview: String(a.preview ?? ''),
+          ts: Number(a.ts),
+          writes: Array.isArray(a.writes)
+            ? a.writes
+              .filter((w: any) => w && typeof w.path === 'string')
+              .map((w: any) => ({ tool: String(w.tool ?? 'Write'), path: String(w.path), body: String(w.body ?? '') }))
+              .filter((w: TurnWrite) => w.path !== '' || w.body !== '')
+            : [],
+        }))
+      if (clean.length) { turnsBySession.set(name, clean); n += clean.length }
+    }
+    log(`feishu: loaded ${n} turn anchors across ${turnsBySession.size} sessions`)
+  } catch (e: any) {
+    // ENOENT(首次启动无文件)静默;其他(JSON 损坏等)要暴露,符合 no-fallbacks。
+    if (e?.code !== 'ENOENT') log(`feishu: load session-turns-map failed: ${e?.message ?? e}`)
+  }
+}
+
+function saveSessionTurnsMap(): void {
+  try {
+    const obj: Record<string, TurnAnchor[]> = {}
+    for (const [k, v] of turnsBySession) obj[k] = v
+    mkdirSync(DATA_DIR, { recursive: true })
+    writeFileSync(SESSION_TURNS_MAP_FILE, JSON.stringify(obj, null, 2))
+  } catch (e) { log(`feishu: save session-turns-map failed: ${e}`) }
+}
+
+export function appendTurnAnchor(sessionName: string, anchor: TurnAnchor): void {
+  const arr = turnsBySession.get(sessionName) ?? []
+  arr.push(anchor)
+  if (arr.length > TURN_ANCHOR_MAX) arr.splice(0, arr.length - TURN_ANCHOR_MAX)
+  turnsBySession.set(sessionName, arr)
+  saveSessionTurnsMap()
+}
+
+export function getTurnAnchors(sessionName: string): TurnAnchor[] {
+  return turnsBySession.get(sessionName) ?? []
+}
+
+/** back 回滚后:截断该 session 锚点到 keepCount 条(回滚点之后作废,reset 语义)。 */
+export function truncateTurnAnchors(sessionName: string, keepCount: number): void {
+  const arr = turnsBySession.get(sessionName)
+  if (!arr || arr.length <= keepCount) return
+  turnsBySession.set(sessionName, arr.slice(0, keepCount))
+  saveSessionTurnsMap()
+}
+
+/** fork/back 派生新会话时,把分叉点之前的锚点继承给新群(不含分叉点本身)。 */
+export function seedTurnAnchors(sessionName: string, from: TurnAnchor[]): void {
+  if (from.length === 0) return
+  turnsBySession.set(sessionName, from.slice())
+  saveSessionTurnsMap()
+}
+
+export function clearTurnAnchors(sessionName: string): void {
+  if (!turnsBySession.has(sessionName)) return
+  turnsBySession.delete(sessionName)
+  saveSessionTurnsMap()
+}
+
+// ── 临时群名(*MMDD-HHMM 后缀,同目录多会话) ─────────────────────────
+// 与 worktree 的 [slug](独立目录 + git 分支)区分:*后缀 = 同一项目目录、新群、
+// 新会话。workDir 解析靠 tempProjectName 剥后缀回原目录。
+const TEMP_SUFFIX_RE = /\*[0-9]{4}-[0-9]{4}(-[0-9]+)?$/
+
+/** 剥临时群 *MMDD-HHMM 后缀,返回原项目名;非临时群返回 null。 */
+export function tempProjectName(sessionName: string): string | null {
+  return TEMP_SUFFIX_RE.test(sessionName) ? sessionName.replace(TEMP_SUFFIX_RE, '') : null
+}
+
+/** 拼临时群名:projectName*MMDD-HHMM。同分钟已有同名则加 -2、-3… 去重。 */
+export function tempChatName(projectName: string): string {
+  const d = new Date()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  const stamp = `${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`
+  const used = new Set<string>([...chatNameCache.values(), ...turnsBySession.keys()])
+  let name = `${projectName}*${stamp}`
+  for (let seq = 2; used.has(name); seq++) name = `${projectName}*${stamp}-${seq}`
+  return name
 }
 
 // ── Session model map ────────────────────────────────────────────────
@@ -828,5 +949,6 @@ export function isOpenAIChatGPTAuthenticated(): boolean {
 }
 
 export function sanitizeSessionName(raw: string): string {
-  return raw.replace(/[^\w一-鿿\-\[\]]/g, '_').slice(0, 64)
+  // `*` 给临时群后缀(*MMDD-HHMM)用,和 worktree 的 `[]` 一样显式放行。
+  return raw.replace(/[^\w一-鿿\-\[\]\*]/g, '_').slice(0, 64)
 }

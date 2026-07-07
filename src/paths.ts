@@ -67,6 +67,10 @@ export const PID_FILE = join(DATA_DIR, 'daemon.pid')
 export const LOG_FILE = join(DATA_DIR, 'daemon.log')
 export const SESSION_CHAT_MAP_FILE = join(DATA_DIR, 'session-chat-map.json')
 export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
+/** Per-session turn 锚点列表:每条 = {本 turn 最后 assistant uuid, 用户输入预览, 时间}。
+ *  fk/bk 用它列"用户输入前的分界点";rs 空闲模式用它列项目最近 24h 会话。
+ *  key = sessionName(主群名或 <project>*MMDD-HHMM 临时群名)。 */
+export const SESSION_TURNS_MAP_FILE = join(DATA_DIR, 'session-turns-map.json')
 export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
 export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
 /** Persisted registrations for `/notify` cards that carry interactive
