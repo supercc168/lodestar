@@ -1,10 +1,10 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-31 | Updated: 2026-06-26 -->
+<!-- Generated: 2026-05-31 | Updated: 2026-07-08 -->
 
 # src
 
 ## Purpose
-`src/` 是 Lodestar daemon 的核心实现层，封装飞书 API、统一 `AgentProcess` 后端接口及其 Codex / Claude 两类实现、每个群的 session 状态机、Card Kit 流式更新、模型/effort 持久选择、`wt` worktree 群编排、`agy <prompt>` 外部任务、`task` 飞书任务清单自动化、安装/停止/升级 CLI，以及 runtime state 路径和配置读取。session 默认 provider 为 Claude/GLM，可经 `model` 切到 Codex。
+`src/` 是 Lodestar daemon 的核心实现层，封装飞书 API、统一 `AgentProcess` 后端接口及其 Codex / Claude 两类实现、每个群的 session 状态机、Card Kit 流式更新、模型/effort 持久选择、`wt` worktree 群编排、`agy <prompt>` 外部任务、`task` 飞书任务清单自动化、入站多条消息合并(`>>>`/`<<<`)、临时会话 `fk`/`bk`/`rs`/`btw`/`bye` 分叉回滚与临时群、安装/停止/升级 CLI，以及 runtime state 路径和配置读取。session 默认 provider 为 Claude/GLM，可经 `model` 切到 Codex。
 
 ## Key Files
 | File | Description |
@@ -22,6 +22,8 @@
 | `session-ask.ts` | Codex `AskUserQuestion` 交互流程，处理按钮、自定义回答和权限 request 回填。 |
 | `session-host-ask.ts` | 解析 assistant 输出中的 `[[askusr: ...]]` 主机澄清标记，创建独立问答卡并把用户答案回填到 session。 |
 | `session-permission.ts` | 工具权限请求的卡片渲染与用户决策回传。 |
+| `session-multimsg.ts` | 入站多条消息缓冲状态机:`>>>`(≥3) 开缓冲、`<<<`(≥3) 合并 flush 成一条发给 agent、缓冲中的普通消息原样追加;缓冲期间每条打 📌,flush 释放,`stop`/`kill`/`restart`/`clear` 经 `clearMultiMsgBuffer` 丢弃并打 ❌;永不超时,只活在内存(daemon 重启会丢并打 ❌ 让失败可见)。 |
+| `session-temp.ts` | 临时会话 / fork / back / rs 恢复:`fk` 列 turn 锚点 fork、`bk` 终止当前 + 列 turn 回滚(选后回滚 + 发 Write 记录卡)、`rs` 空闲态列项目最近 24h 会话、`btw` 建临时群启动干净会话、`bye` 散临时群;`rs` 历史数据源是 claude code 自己的 transcript 目录(`~/.claude/projects/<encoded-cwd>/*.jsonl`,同 cwd 天然同目录,worktree 不混入),不维护自有会话索引(旧 resume-map + 后缀归属判断是错的)。 |
 | `agy-task.ts` | 外部 agy CLI 辅助：解析可执行文件、构造 `agy --print` 参数、补 PATH、采集执行前后 Git 快照和 diff 摘要。 |
 | `tasklist.ts` | `task` 项目清单绑定和状态存储；创建 `<project>[lodestar]` 清单、维护分组 GUID、记录自动化进程和每个任务的运行状态。 |
 | `tasklist-worker.ts` | 任务清单轮询 worker；按 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成` 分组驱动 Codex/agy 规划、选择、执行、审核和本地合并。 |
@@ -55,8 +57,10 @@
 | `pid-guard.ts` | PID 文件和进程 cmdline marker 校验，防止误认复用 PID。 |
 | `context-window.ts` | 根据模型和 token usage 估算 context window 占用。 |
 | `outbound-markers.ts` | 解析 assistant 输出中的 `[[send: /abs/path]]` 附件发送标记。 |
+| `inbound-markers.ts` | 与 `outbound-markers.ts` 对称,解析用户入站消息里的多条消息起始/收尾标记:`>>>`(≥3) 开始收集、`<<<`(≥3) 收尾合并,标记前缀从 body 去掉不转发给 agent;阈值 ≥3 是用户确认的本意(普通 `>`/`>>` 引用不误触,三级嵌套引用 `>>>` 会——可接受)。 |
 | `log.ts` | 按日滚动 logger：写 `daemon-YYYY-MM-DD.log`（本地日期），跨天与启动时清理超过 7 天的旧日志；启动把老 `daemon.log` 迁移成按日文件。 |
-| `*.test.ts` | Bun 单元测试，覆盖 Card Kit、turn/agy/task card 渲染、tasklist worker、card action 回调返回、context window 展示、outbound marker、Codex 事件解析、usage 快照、session 行为和 worktree/agy Git 行为。 |
+| `feishu-test-mock.ts` | 共享的 `./feishu` 测试替身(仅供 `*.test.ts` import):统一 `mock.module` 注册,避免多测试文件的窄 mock 互相覆盖(cardkit 的窄 mock 曾顶掉 session 的全量 mock,导致单进程 `bun test src/` 时 Session 构造炸 `getSessionModelSelection`);导出 `sentCards`/`sentTexts`/`deletedReactions` 等捕获数组和 `resetFeishuMock()`。 |
+| `*.test.ts` | Bun 单元测试，覆盖 Card Kit、turn/agy/task card 渲染、tasklist worker、card action 回调返回、context window 展示、outbound/inbound marker、入站多条消息合并、后台任务卡、临时会话卡、notify 回调、Codex 事件解析、usage 快照、session 行为和 worktree/agy Git 行为。 |
 
 ## Subdirectories
 | Directory | Purpose |
@@ -98,6 +102,9 @@
 - `task` 清单名固定为 `<project>[lodestar]`，分组固定为 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成`；默认分组会被重命名为 `设计中`，其他分组按缺失补齐。
 - `tasklist-worker` 启动后延迟 15 秒首次扫描，此后每 30 秒扫描一次；同一时间只跑一个 scan，运行记录写入 `tasklist-map.json` 并在进程丢失时向任务评论暴露错误。
 - 任务自动执行使用 `AI-AUTO`/`AI-REVIEW` 本地 worktree 和 `AI-AUTO/<task-guid>` tag 作为审查产物；人工在 `[AI]待审核` 中勾选完成是触发本地合并的信号。
+- 入站多条消息合并走 `session-multimsg.ts` 状态机 + `inbound-markers.ts` 解析;`>>>`/`<<<` 阈值 ≥3,缓冲只活在内存(daemon 重启会丢并打 ❌ 让失败可见,符合 no_fallbacks)。
+- 临时会话 `fk`/`bk` 的 turn 锚点用 daemon 记的 turn-map(每 turn 的 assistant uuid + Write 记录,是 transcript 的预存索引,同源);`rs` 空闲态的历史列表直接读 claude code transcript 目录(`~/.claude/projects/<encoded-cwd>/*.jsonl`),不维护自有会话索引——之前的 resume-map + 后缀归属判断会漏会话并把 worktree 群误归项目。
+- `rs` 是 `restart` 的别名,但行为分两种:会话进行中 = 打断 + 弃后台 + `--resume` 恢复上一会话;空闲态 = 列项目最近 24h 会话供选择恢复(比"只恢复上一会话"实用)。
 - Assistant 正文和 footer 状态不再走 Card Kit `/content` 打字流；正文在完整 `agentMessage` 到达后一次性 `addElement`，footer 状态用 `replaceElement` 直接替换。`cardkit.flush` 仅等待同卡片已排队写操作完成。
 - `card.action.trigger` 需要 3 秒内替换原 JSON 卡片时 return `{ card: { type: "raw", data: newCard } }`；不要 return 裸卡片 JSON 或 `{ card: newCard }`，也不要在回调 ACK 前调用 `message.patch`（会和 ACK 响应竞态）。延时更新：ACK 用 toast（不带卡），再用 `feishu.updateCard`（message.patch）改原卡——`/notify` 按钮的两段式反馈(processing→delivered/failed)走这条路径。⚠️ 不要用 `/interactive/v1/card/update` 回调 token 端点:它是 legacy,对 schema-2.0 卡返回 code=0 但渲染空白(2026-07-05 实测)。内联带卡 ACK(Method 1)+ 任何后续更新也不兼容(后续不重绘)。
 - `handleCardAction` 里 `kind:'notify_callback'` 必须在 session 存在性检查**之前**短路(`/notify` 卡片所在的群不一定有 Session);分发走 `notify-callbacks.ts`,点击 → POST 调用方 loopback URL → 2xx 后冻结成已选卡片,失败显式 toast 不兜底。
@@ -111,6 +118,7 @@
 - `session.ts` 经 `AgentProcess` 接口（`agent-process.ts`）持有当前 `proc`，按 `selectedProvider` 在 `ClaudeAgentProcess`（默认）和 `CodexProcess` 之间 spawn；并依赖 `cardkit.ts`、`cards.ts`、`feishu.ts` 和 `session-*` helper；业务面板/命令 helper 再依赖 `worktree.ts`、`tasklist.ts`、`agy-task.ts` 等领域模块。
 - `claude-agent-process.ts` 依赖 `@anthropic-ai/claude-agent-sdk`、`agent-process.ts`、`claude-models.ts`、`codex-usage.ts`（token usage 解析复用）和 `config.ts`；`glm-usage.ts` 被 `session.ts`（console opts）和 `cards/console.ts` 消费。
 - `tasklist-worker.ts` 依赖 `tasklist.ts`、`feishu.ts`、`agy-task.ts`、`codex-process.ts` 和 `tasklist-worker-git.ts`；本地 Git worktree、tag 与审查 diff 约定集中在 `tasklist-worker-git.ts`。
+- 后台任务卡 `cards/background.ts` 由 `claude-agent-process.ts` 的 SDK `task_*` 事件(started/progress/updated/settled)经 `session.ts`/`session-tools.ts` 驱动;`session-temp.ts` 依赖 `cards/temp.ts` + turn-map,`session-multimsg.ts` 依赖 `inbound-markers.ts`。
 - `cardkit.ts` 依赖 `feishu.getTenantToken()` 获取 Card Kit API token。
 - `feishu.ts` 依赖 `config.ts`、`paths.ts` 和 `codex-process.resolveCodexBin()`，并维护 session chat/resume/model/alive/tasklist runtime map。
 - CLI 文件依赖 `paths.ts`、`pid-guard.ts`、`setup.ts` 和 Node/Bun process API。
