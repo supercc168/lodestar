@@ -106,10 +106,66 @@ function writeCurrentAliveMarker(): void {
 function sessionFor(chatId: string, sessionName: string): Session {
   let s = sessions.get(chatId)
   if (!s) {
-    s = new Session(sessionName, chatId, { onLifecycleChange: writeCurrentAliveMarker })
+    s = new Session(sessionName, chatId, {
+      onLifecycleChange: writeCurrentAliveMarker,
+      onCreateTempSession: createTempSession,
+      onDisbandTempSession: disbandTempSession,
+    })
     sessions.set(chatId, s)
   }
   return s
+}
+
+/** 建临时群 + 在其中启动 session(btw 干净新会话 / fk 从 resumeSessionAt 锚点 fork)。
+ *  SessionOpts 回调,由 session-temp 通过 s.opts 调用。*/
+async function createTempSession(opts: {
+  chatName: string
+  userOpenId: string
+  resumeSessionId?: string
+  resumeSessionAt?: string
+}): Promise<{ ok: boolean; chatId?: string; error?: string }> {
+  try {
+    const ensured = await feishu.ensureChatForSession(opts.chatName, opts.userOpenId)
+    const tempSession = sessionFor(ensured.chatId, opts.chatName)
+    if (tempSession.isRunning()) {
+      return { ok: false, error: `${opts.chatName} 已有会话在跑,先 bye 解散再重试` }
+    }
+    const ok = opts.resumeSessionId
+      ? await tempSession.startForked(opts.resumeSessionId, opts.resumeSessionAt, { announce: true })
+      : await tempSession.start({ announce: true })
+    if (!ok) {
+      // 启动失败:解散刚建的群 + 清 Session,不留半创建状态(群在但没 claude)。
+      try { await feishu.disbandChatForSession(opts.chatName) } catch {}
+      sessions.delete(ensured.chatId)
+      tempSession.dispose()
+      return { ok: false, error: `${tempSession.backendLabel()} 启动失败,已自动解散临时群` }
+    }
+    return { ok: true, chatId: ensured.chatId }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    log(`daemon: createTempSession "${opts.chatName}" failed: ${msg}`)
+    return { ok: false, error: msg }
+  }
+}
+
+/** 解散临时群 + 停掉它的 Session + 清锚点(bye 用)。*/
+async function disbandTempSession(chatName: string): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const cid = feishu.chatIdForSession(chatName)
+    if (cid) {
+      const s = sessions.get(cid)
+      if (s?.isRunning()) await s.stop('bye 解散', { announce: false })
+      s?.dispose()
+      sessions.delete(cid)
+    }
+    await feishu.disbandChatForSession(chatName)
+    feishu.clearTurnAnchors(chatName)
+    return { ok: true }
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e)
+    log(`daemon: disbandTempSession "${chatName}" failed: ${msg}`)
+    return { ok: false, error: msg }
+  }
 }
 
 /** Auto-restart any session that was alive when the previous daemon
@@ -459,6 +515,18 @@ async function handleCardAction(data: any): Promise<any> {
       const result = await session.onWorktreeDisband(String(value.slug ?? ''))
       return actionCardResponse(result.card)
     }
+    case 'temp_fork_select': {
+      await session.onForkSelect(Number(value.anchorIdx ?? -1), userId)
+      return { toast: { type: 'success', content: '分叉中…' } }
+    }
+    case 'temp_back_select': {
+      await session.onBackSelect(Number(value.anchorIdx ?? -1))
+      return { toast: { type: 'success', content: '回滚中…' } }
+    }
+    case 'temp_resume_select': {
+      await session.onResumeSelect(String(value.sessionId ?? ''))
+      return { toast: { type: 'success', content: '恢复中…' } }
+    }
     case 'tasklist_enable': {
       const result = await session.onTasklistEnable()
       return actionCardResponse(result.card)
@@ -674,6 +742,7 @@ async function boot(): Promise<void> {
   log(`lodestar-daemon: pid ${process.pid} starting`)
   feishu.loadSessionChatMap()
   feishu.loadSessionResumeMap()
+  feishu.loadSessionTurnsMap()
   feishu.loadSessionModelMap()
   await feishu.refreshChatList()
   setInterval(() => { void feishu.refreshChatList() }, 5 * 60 * 1000)

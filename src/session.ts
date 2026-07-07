@@ -82,6 +82,7 @@ import * as sessionCompact from './session-compact'
 import * as sessionModel from './session-model'
 import * as sessionTasklist from './session-tasklist'
 import * as sessionWorktree from './session-worktree'
+import * as sessionTemp from './session-temp'
 
 export type { SessionOpts } from './session-types'
 
@@ -425,8 +426,12 @@ export class Session {
   }
 
   get workDir(): string {
-    const override = feishu.projectProfile(this.sessionName)?.cwd
-    return override && override.trim() ? override : join(feishu.PROJECTS_ROOT, this.sessionName)
+    // 临时群(*MMDD-HHMM)剥后缀回原项目目录(同目录多会话)。
+    // worktree 群([slug])不剥 —— sessionName 直接拼出 worktree 路径(~/project[slug]),
+    // 与 worktree.expectedWorktreePath 殊途同归(保持原有路径巧合)。
+    const baseName = feishu.tempProjectName(this.sessionName) ?? this.sessionName
+    const override = feishu.projectProfile(baseName)?.cwd
+    return override && override.trim() ? override : join(feishu.PROJECTS_ROOT, baseName)
   }
   isRunning(): boolean { return !!this.proc && this.proc.isAlive() }
   currentProvider(): AgentProvider { return this.selectedProvider }
@@ -496,24 +501,38 @@ export class Session {
     return agentProviderLabel(provider)
   }
 
+  /** fork/back 期间非空:让 spawnAgent 派生新 sid(resume 到 resumeSessionAt)。
+   *  startForked/rollbackTo 在调 start/restart 前设、finally 清空 —— 复用现有
+   *  spawn+wire+init 流程,只在 spawn 注入 fork 参数(Claude SDK resumeSessionAt+forkSession)。 */
+  private _forkSpawn: { resumeSessionId?: string; resumeSessionAt?: string } | null = null
+  /** 最近一个 turn 的用户输入预览(首条文本,recordTurnAnchor 用;openTurnCard 时设)。 */
+  private lastTurnUserPreview = ''
+
   private spawnAgent(resumeSessionId?: string): AgentProcess {
+    const fs = this._forkSpawn
+    const sid = fs?.resumeSessionId ?? resumeSessionId
+    const resumeSessionAt = fs?.resumeSessionAt
+    const forkSession = !!fs
     if (this.selectedProvider === 'claude') {
       assertClaudeCodeAvailable()
       return new ClaudeAgentProcess({
         workDir: this.workDir,
         model: this.modelForSpawn(),
         effort: this.claudeEffortForSpawn(),
-        resumeSessionId,
+        resumeSessionId: sid,
+        resumeSessionAt,
+        forkSession,
         appendSystemPrompt: this.spawnDeveloperInstructions(),
-        profile: feishu.projectProfile(this.sessionName),
+        profile: feishu.projectProfile(feishu.tempProjectName(this.sessionName) ?? this.sessionName),
       })
     }
+    // Codex 不支持 resumeSessionAt/forkSession —— fork 退化成普通 resume(Codex 路径暂不做分叉/回滚)。
     const overrides = codexSpawnOverrides(this.modelForSpawn())
     return new CodexProcess({
       workDir: this.workDir,
       model: overrides.modelId,
       effort: this.effortForSpawn(),
-      resumeSessionId,
+      resumeSessionId: sid,
       appendSystemPrompt: this.spawnDeveloperInstructions(),
       configArgs: overrides.configArgs,
       providerEnv: overrides.env,
@@ -529,6 +548,7 @@ export class Session {
     this.selectedModel = model
     this.selectedEffort = effort
     this.lastSessionId = feishu.getSessionResume(this.sessionName, provider)
+    feishu.clearTurnAnchors(this.sessionName)  // provider 切换 → 旧 provider 的 assistant uuid 配不上新 sid,清锚点
     feishu.bindSessionModel(this.sessionName, provider, model, effort)
     await this.stopIdleMismatchedProcess()
   }
@@ -674,6 +694,7 @@ export class Session {
   // ── Lifecycle ──────────────────────────────────────────────────────
   private resetFreshConversationState(): void {
     this.turnCounter = 0
+    feishu.clearTurnAnchors(this.sessionName)  // clear/全新会话 → 旧 uuid 配不上新 sid,清锚点
     this.currentGoal = null
     this.cumStats = { tokens: 0, costUsd: 0, turns: 0 }
     this.lastTurnDelta = null
@@ -1082,6 +1103,74 @@ export class Session {
     }
   }
 
+  /** 以 fork 模式启动:resume resumeSessionId 到 resumeSessionAt 锚点,派生新 sid。
+   *  用于 btw/fk 的临时群首启、rs 的跨会话恢复。复用 start 的 spawn+wire+init。 */
+  async startForked(resumeSessionId: string, resumeSessionAt: string | undefined, opts: LifecycleProgressOpts = {}): Promise<boolean> {
+    this._forkSpawn = { resumeSessionId, resumeSessionAt }
+    try {
+      return await this.start(opts)
+    } finally {
+      this._forkSpawn = null
+    }
+  }
+
+  /** 回滚当前会话:kill 当前 proc,fork 到 (resumeSessionId, resumeSessionAt) 重启。
+   *  当前时间线作废。用于 bk 回滚 + rs 跨会话恢复(把当前群的 resume 目标换掉)。 */
+  async rollbackTo(resumeSessionId: string | undefined, resumeSessionAt: string | undefined, opts: LifecycleProgressOpts = {}): Promise<boolean> {
+    // resumeSessionId=undefined → 回到会话起点(fresh,等价 clear),不 fork、不 resume。
+    // 否则 fork 到 (sid, resumeSessionAt) 派生新 sid。失败时恢复原 lastSessionId,避免
+    // 脏状态(rs 恢复外部会话失败后,当前群 lastSessionId 仍指向原会话)。
+    const prevLast = this.lastSessionId
+    if (resumeSessionId) {
+      this.lastSessionId = resumeSessionId
+      this._forkSpawn = { resumeSessionId, resumeSessionAt }
+    } else {
+      this._forkSpawn = null
+    }
+    try {
+      const ok = resumeSessionId ? await this.restart(true, opts) : await this.restart(false, opts)
+      if (!ok) this.lastSessionId = prevLast
+      return ok
+    } finally {
+      this._forkSpawn = null
+    }
+  }
+
+  /** daemon 解散临时群(bye)时调:从 Session.all registry 移除,避免长期运行的 daemon
+   *  因临时群不断建/散而累积孤立 Session 实例(sessions Map 已 delete,但 static all 不会)。 */
+  dispose(): void { Session.all.delete(this) }
+
+  /** result 时记一个 turn 锚点:本 turn 最后 assistant uuid + 用户输入预览 + Write 记录。
+   *  fk/bk 靠它列"用户输入前的分界点";bk 回滚说明靠其中的 writes。 */
+  private recordTurnAnchor(): void {
+    const proc = this.proc
+    if (!proc) return
+    const uuid = proc.lastAssistantUuid
+    if (!uuid) return  // 纯系统轮(无 assistant)不记
+    const writes = this.collectTurnWrites()
+    feishu.appendTurnAnchor(this.sessionName, {
+      uuid,
+      sid: proc.sessionId ?? '',
+      preview: this.lastTurnUserPreview.slice(0, 80),
+      ts: Date.now(),
+      writes,
+    })
+    this.lastTurnUserPreview = ''
+  }
+
+  private collectTurnWrites(): feishu.TurnWrite[] {
+    const turn = this.currentTurn
+    if (!turn) return []
+    const out: feishu.TurnWrite[] = []
+    for (const t of turn.toolByUseId.values()) {
+      if (!['Write', 'Edit', 'NotebookEdit', 'MultiEdit'].includes(t.name)) continue
+      const path = t.input?.file_path ?? t.input?.path ?? '?'
+      const body = cards.writeBodyFromToolInput(t.name, t.input)
+      out.push({ tool: t.name, path, body })
+    }
+    return out
+  }
+
   worktreeProjectName(): string {
     return sessionWorktree.worktreeProjectName(this)
   }
@@ -1149,6 +1238,16 @@ export class Session {
   onWorktreeDisband(slugRaw: string): Promise<WorktreeActionResult> {
     return sessionWorktree.onWorktreeDisband(this, slugRaw)
   }
+
+  // ── 临时会话 / fork / back / rs 恢复(委托 session-temp)──
+  showForkList(): Promise<void> { return sessionTemp.showForkList(this) }
+  showBackList(): Promise<void> { return sessionTemp.showBackList(this) }
+  showResumeList(): Promise<void> { return sessionTemp.showResumeList(this) }
+  runBtwCommand(userOpenId: string): Promise<void> { return sessionTemp.runBtwCommand(this, userOpenId) }
+  runByeCommand(): Promise<void> { return sessionTemp.runByeCommand(this) }
+  onForkSelect(anchorIdx: number, userOpenId = ''): Promise<void> { return sessionTemp.onForkSelect(this, anchorIdx, userOpenId) }
+  onBackSelect(anchorIdx: number): Promise<void> { return sessionTemp.onBackSelect(this, anchorIdx) }
+  onResumeSelect(sessionId: string): Promise<void> { return sessionTemp.onResumeSelect(this, sessionId) }
 
   /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
    * plus their two-letter aliases where applicable.
@@ -1983,6 +2082,9 @@ export class Session {
       }
 
       log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} midBuffer=${this.pendingMidTurnMsgs.length} forcePush=${forcePush}`)
+      // 仅干净的、已完成的 result 记 turn 锚点(被 userInterrupted 的轮不记 ——
+      // 它的 lastAssistantUuid 指向被取消/截断的 assistant,resumeSessionAt 到它可能异常)。
+      this.recordTurnAnchor()
       void this.closeTurnCard(suffix, { forcePush, hasFreshResult: true })
       this.status = 'idle'
       sessionHostAsk.resumeAnsweredHostAsks(this)
@@ -2189,6 +2291,7 @@ export class Session {
     // panel (they'll be picked up by the next turn's open).
     const userInputs = this.pendingTurnInputs
     this.pendingTurnInputs = []
+    this.lastTurnUserPreview = userInputs[0]?.slice(0, 80) ?? this.lastTurnUserPreview
     log(`session "${this.sessionName}": openTurnCard turn=${turn} trigger=${trigger} inputs=${userInputs.length}`)
     const initialFooter = this.withModel(opts.initialFooter ?? 'Waiting...(0s)')
     const card = cards.mainConversationCard({

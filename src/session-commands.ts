@@ -37,6 +37,29 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     await s.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId)
     return true
   }
+  // btw = 开临时会话(同目录,自动启动);bye = 散临时群;fk/fork = 列当前会话 turn 分叉;
+  // bk/back = 立刻终止当前 + 列 turn 回滚(选后回滚 + 发 Write 记录卡)。
+  if (raw.trim().match(/^btw$/i)) {
+    if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 btw。'); return true }
+    await s.runBtwCommand(userOpenId)
+    return true
+  }
+  if (raw.trim().match(/^bye$/i)) {
+    await s.runByeCommand()
+    return true
+  }
+  if (raw.trim().match(/^(?:fk|fork)$/i)) {
+    if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 fk。'); return true }
+    await s.showForkList()
+    return true
+  }
+  if (raw.trim().match(/^(?:bk|back)$/i)) {
+    if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 bk。'); return true }
+    // 立刻终止当前会话(保留 lastSessionId 供选后回滚),再弹回滚列表
+    if (s.isRunning()) await s.stop('回滚前终止', { announce: false })
+    await s.showBackList()
+    return true
+  }
   const agy = raw.trim().match(/^agy(?:\s+([\s\S]+))?$/i)
   if (agy) {
     await s.runAgyCommand((agy[1] ?? '').trim())
@@ -175,10 +198,14 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       }
       return true
     case 'restart':
-      // resume the prior conversation — kills the current proc (if
-      // any) and spawns a new one with `--resume <lastSessionId>`.
-      // If no process is running, this is how the user gets back the
-      // previous conversation after a `kill` or a daemon crash.
+      // rs 优化:会话进行中 = 打断 + 弃后台 + 恢复(走下面 restart(true),它已
+      // resetBackgroundTasks);空闲 = 列项目最近 24h 会话选恢复(比"只恢复上一会话"实用)。
+      if (!s.isRunning()) {
+        await s.showResumeList()
+        return true
+      }
+      // 进行中:resume the prior conversation — kills the current proc and
+      // spawns a new one with `--resume <lastSessionId>`(放弃后台进程)。
       {
         const resumeThreadLabel = s.lastSessionId ? s.lastSessionId.slice(0, 8) : ''
         const backend = s.backendLabel(s.proc?.provider ?? s.currentProvider())
