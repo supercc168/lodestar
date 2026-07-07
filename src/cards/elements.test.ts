@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { sanitizeMarkdownForCardKit } from './elements'
+import { sanitizeMarkdownForCardKit, downgradeExternalImagesForCardKit } from './elements'
 
 describe('sanitizeMarkdownForCardKit', () => {
   test('降级 prose 里的外链图片,保留 alt + url', () => {
@@ -63,5 +63,34 @@ describe('sanitizeMarkdownForCardKit', () => {
     // 当边界劈开 fence,把 fence 内的 & < > 当 prose 转义。
     const src = '````\nsee ```a < b & c``` here\n````'
     expect(sanitizeMarkdownForCardKit(src)).toBe(src)
+  })
+
+  test('图片 url 含空格时保留完整(不截断到空白)', () => {
+    const out = sanitizeMarkdownForCardKit('![diagram](https://example.com/my architecture.png)')
+    expect(out).not.toMatch(/!\[/)
+    expect(out).toContain('https://example.com/my architecture.png')
+  })
+})
+
+describe('downgradeExternalImagesForCardKit', () => {
+  test('降级 prose 外链图片,代码块内图片原样保留', () => {
+    const out = downgradeExternalImagesForCardKit('图 ![](https://x/y.png) 代码\n```\n![](https://c/d.png)\n```')
+    expect(out).not.toMatch(/!\[\]\(https:\/\/x\//)
+    expect(out).toContain('https://x/y.png')
+    expect(out).toContain('![](https://c/d.png)')
+  })
+
+  test('保留 <font> 等 HTML 标签不转义(供 notify 调用方做彩色)', () => {
+    expect(downgradeExternalImagesForCardKit("<font color='red'>构建失败</font>"))
+      .toBe("<font color='red'>构建失败</font>")
+  })
+
+  test('prose 里的 & < > 不转义(与 sanitizeMarkdownForCardKit 的关键区别)', () => {
+    expect(downgradeExternalImagesForCardKit('a < b & c > d')).toBe('a < b & c > d')
+  })
+
+  test('代码块内的图片语法与 HTML 标签原样保留(字面)', () => {
+    const src = "```\n![](https://x/y.png)\n<font color='red'>x</font>\n```"
+    expect(downgradeExternalImagesForCardKit(src)).toBe(src)
   })
 })
