@@ -67,23 +67,28 @@ function whichCodex(): string | null {
 }
 
 /**
- * spawn codex 子进程用的 PATH。
+ * spawn codex 子进程用的 PATH。分三段拼接,兼顾「确定性工具解析」与「用对 node 版本」:
+ *   1) 用户级 bin(npm-global/.local/.bun)—— prepend,保证 lodestar 自装的 codex/工具
+ *      优先命中,不受用户 shell PATH 影响。
+ *   2) 继承 PATH —— 紧随其后,让 homebrew/nvm 的现代 node 胜出。
+ *   3) 系统兜底(/usr/local/bin、/usr/bin、/bin)—— 放最后,仅当前两段都没有 node 时兜底,
+ *      避免整机唯一 node 只在 /usr/local/bin 时退出 127。
  *
- * 把确定性白名单 **prepend** 到继承的 PATH 之前,而不是整体替换。codex 在很多机器上是
- * homebrew / npm 全局装的 `#!/usr/bin/env node` shim,若把 PATH 整个替换成白名单,会丢掉
- * node 所在目录(典型如 Apple Silicon 的 /opt/homebrew/bin),shim 启动时 `env` 找不到
- * node,直接退出 127(2026-07-06 实测:任意 codex 档位首次 spawn 即撞,daemon 报
- * "Codex 异常退出 code=127")。白名单仍排在前以保持工具解析的确定性优先级。
+ * 为何系统目录不能再 prepend:codex 启动器是 `#!/usr/bin/env node` 的 ESM,`env node` 取
+ * PATH 首个命中。若 /usr/local/bin 排在继承 PATH 前面、而该目录存在陈旧 node(实测某机
+ * /usr/local/bin/node = v10.20.1),就会抢在 homebrew/nvm 的新 node 前被选中,ESM 解析
+ * 失败 → codex 退出 code=1(2026-07-07 实测无痕 wuhen 启动即撞)。此前只把系统目录 prepend,
+ * 修的是「白名单里没有 node → 退出 127」,修不了这种「老 node 抢占 → 退出 1」。
  */
 export function buildSpawnPath(inherited: string = process.env.PATH ?? ''): string {
   if (process.platform === 'win32') return inherited
-  const whitelist = [
+  const userBins = [
     join(homedir(), '.local', 'npm-global', 'bin'),
     join(homedir(), '.local', 'bin'),
     join(homedir(), '.bun', 'bin'),
-    '/usr/local/bin', '/usr/bin', '/bin',
   ]
-  return [...whitelist, inherited].filter(Boolean).join(delimiter)
+  const systemFallback = ['/usr/local/bin', '/usr/bin', '/bin']
+  return [...userBins, inherited, ...systemFallback].filter(Boolean).join(delimiter)
 }
 
 const CODEX_SESSIONS_DIR = join(homedir(), '.codex', 'sessions')

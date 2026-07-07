@@ -283,14 +283,24 @@ describe('buildCodexAppServerArgs', () => {
 })
 
 describe('buildSpawnPath', () => {
-  test('prepends whitelist onto inherited PATH so homebrew/nvm node stays reachable', () => {
+  test('user-level bins stay ahead of inherited PATH (deterministic codex/tool resolution)', () => {
     // codex 常是 `#!/usr/bin/env node` 的 npm shim,node 可能只存在于继承 PATH 的某个目录
     // (如 Apple Silicon 的 /opt/homebrew/bin)。替换式 PATH 会丢掉它 → shim 退出 127。
     const path = buildSpawnPath('/opt/homebrew/bin:/usr/local/bin')
     expect(path).toContain('/opt/homebrew/bin')
-    // 白名单目录仍排在前,保持工具解析的确定性优先级
+    // 用户级 bin 仍排在继承 PATH 前,保持工具解析的确定性优先级
     expect(path.indexOf(join(homedir(), '.local', 'bin')))
       .toBeLessThan(path.indexOf('/opt/homebrew/bin'))
+  })
+
+  test('inherited node dirs win over the stale /usr/local/bin fallback (codex ESM needs modern node)', () => {
+    // 回归:/usr/local/bin 可能有陈旧 node(实测某机 v10.20.1)。codex 启动器是
+    // `#!/usr/bin/env node` 的 ESM,必须让继承 PATH 里的 homebrew/nvm 新 node 先命中,
+    // 否则老 node 解析 ESM 失败 → codex 退出 code=1。
+    const seg = buildSpawnPath('/opt/homebrew/bin').split(delimiter)
+    expect(seg.indexOf('/opt/homebrew/bin')).toBeLessThan(seg.lastIndexOf('/usr/local/bin'))
+    // 但系统兜底仍保留:整机唯一 node 只在 /usr/local/bin 时不至于退出 127
+    expect(seg).toContain('/usr/local/bin')
   })
 
   test('empty inherited PATH does not leave a stray/trailing delimiter', () => {
