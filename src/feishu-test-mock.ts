@@ -58,4 +58,14 @@ mock.module('./feishu', () => ({
   bindSessionModel: () => {},
   provisionProject: () => {},
   projectProfile: (name: string) => projectProfiles.get(name),
+  // 临时群 / fork / back / rs 恢复相关 stub(测试不验证这些路径,no-op / 空返回)
+  tempProjectName: () => null,
+  tempChatName: (project: string) => `${project}*0000-0000`,
+  appendTurnAnchor: () => {},
+  getTurnAnchors: () => [],
+  truncateTurnAnchors: () => {},
+  seedTurnAnchors: () => {},
+  clearTurnAnchors: () => {},
+  ensureChatForSession: async (chatName: string) => ({ chatId: `oc_${chatName}`, created: true, joined: true }),
+  disbandChatForSession: async () => ({ chatId: null, disbanded: true }),
 }))
