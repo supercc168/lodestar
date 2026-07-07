@@ -9,7 +9,7 @@
 import type { CodexUsage } from '../codex-process'
 import type { AgentProvider } from '../agent-process'
 import { contextPercentSummary, contextTokenRatioLabel } from '../context-window'
-import { ELEMENTS } from './elements'
+import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 
 export interface TurnPlanStep {
   step: string
@@ -275,12 +275,7 @@ export function mainConversationCard(opts: MainCardOpts): object {
         element_id: ELEMENTS.userInput,
         header: { title: { tag: 'plain_text', content: userInputHeader } },
         expanded: false,
-        elements: inputs.map(text => ({
-          tag: 'markdown',
-          // Markdown 里 < > 这些字符在 Card Kit 渲染里会被解析,转一下避免
-          // 用户输入里的 HTML 之类被当结构吞掉。
-          content: text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
-        })),
+        elements: inputs.map(text => ({ tag: 'markdown', content: sanitizeMarkdownForCardKit(text) })),
       }]
     : []
   return {
@@ -371,7 +366,7 @@ function renderAskQuestionOptions(
   const els: any[] = []
   for (let oi = 0; oi < q.options.length; oi++) {
     const opt = q.options[oi]
-    const desc = opt.description ? `  ·  ${opt.description}` : ''
+    const desc = opt.description ? `  ·  ${sanitizeMarkdownForCardKit(opt.description)}` : ''
     els.push({
       tag: 'interactive_container',
       background_style: 'default',
@@ -388,7 +383,7 @@ function renderAskQuestionOptions(
           option_idx: oi,
         },
       }],
-      elements: [{ tag: 'markdown', content: `**${opt.label}**${desc}` }],
+      elements: [{ tag: 'markdown', content: `**${sanitizeMarkdownForCardKit(opt.label)}**${desc}` }],
     })
   }
   return els

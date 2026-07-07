@@ -10,7 +10,7 @@
  *                          streamingOffSettings
  */
 
-export { ELEMENTS } from './cards/elements'
+export { ELEMENTS, sanitizeMarkdownForCardKit } from './cards/elements'
 export {
   type ThreadGoal,
   type TurnPlanStep,

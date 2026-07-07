@@ -4,7 +4,7 @@
  */
 
 import { isAbsolute, relative } from 'node:path'
-import { ELEMENTS } from './elements'
+import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 
 const BASH_OUTPUT_PREVIEW_CHARS = 300
 
@@ -977,7 +977,7 @@ export function toolCallElement(
     header: { title: { tag: 'plain_text', content: headerText } },
     expanded: false,
     elements: [
-      { tag: 'markdown', content: body },
+      { tag: 'markdown', content: sanitizeMarkdownForCardKit(body) },
     ],
   }
 }
@@ -1008,7 +1008,7 @@ export function readBatchElement(
     element_id: ELEMENTS.tool(i),
     header: { title: { tag: 'plain_text', content: headerText } },
     expanded: false,
-    elements: [{ tag: 'markdown', content: lines.join('\n') }],
+    elements: [{ tag: 'markdown', content: sanitizeMarkdownForCardKit(lines.join('\n')) }],
   }
 }
 

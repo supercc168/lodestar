@@ -2883,7 +2883,10 @@ export class Session {
     const replacement = this.proc?.provider === 'codex'
       ? '\n\n_已发起澄清问题，请回答对应卡片。_'
       : ''
-    return stripAskUsrMarkers(text, replacement)
+    // stripAskUsrMarkers 剥离 ask 标记;sanitize 再把外链图片降级、HTML 实体
+    // 转义 —— LLM 正文里出现 ![alt](url) 会让该 assistant 段 CardKit 更新
+    // 失败(ErrCode 200570),必须先清掉。
+    return cards.sanitizeMarkdownForCardKit(stripAskUsrMarkers(text, replacement))
   }
 
   sendOutboundPath(rawPath: string, source: string): void {
