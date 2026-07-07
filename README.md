@@ -143,7 +143,6 @@ setting_sources            = "project"   # 只读项目级配置(会丢全局)
 strict_mcp                 = "true"      # 只挂项目 .mcp.json,挡掉全局 MCP
 tools                      = "Read,Write,Edit,Bash,Glob,Grep"
 load_project_mcp           = "true"      # 读 <cwd>/.mcp.json
-keep_lodestar_instructions = "true"      # 保留夜航星卡片/输出约定
 ```
 
 > 最常踩的坑:`setting_sources = "project"` 会把 `~/.claude/settings.json` 里的 GLM 路由一起丢掉 —— 走 project 模式时,GLM 路由得改落在 config.toml 的 `[claude.env]` 里。要是看到卡片一直 `Thinking...`、model 显示 `<synthetic>`,先把整节注释掉重启,基本就是这几个开关没配齐。
