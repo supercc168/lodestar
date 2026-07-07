@@ -185,6 +185,15 @@ describe('automationRunPanel', () => {
     const p2 = automationRunPanel(run({ runId: 'r2', kind: 'agy-plan', status: 'failed', error: 'boom' })) as any
     expect(p2.elements[0].content).toBe('⚠ boom')
   })
+
+  test('stdout 含外链图片 → body 降级,不残留会被 CardKit 解析成 image 的 ![]()', () => {
+    const p = automationRunPanel(run({
+      runId: 'r1', kind: 'codex-execute', status: 'running',
+      stdoutTail: '产物 ![架构图](https://x/y.png) 已生成',
+    })) as any
+    expect(p.elements[0].content).not.toMatch(/!\[/)
+    expect(p.elements[0].content).toContain('https://x/y.png')
+  })
 })
 
 describe('automationLiveCard / automationHistoryCard', () => {

@@ -2461,7 +2461,7 @@ export class Session {
             await cardkit.replaceElement(oldCardId, segId, {
               tag: 'markdown',
               element_id: segId,
-              content: this.cleanAssistantTextForDisplay(fullText).trim() || ' ',
+              content: cards.sanitizeMarkdownForCardKit(this.cleanAssistantTextForDisplay(fullText).trim()) || ' ',
             })
           }
           const compactNote = turn.contextCompactCount > 0
@@ -2733,7 +2733,7 @@ export class Session {
     return {
       tag: 'markdown',
       element_id: segId,
-      content: this.cleanAssistantTextForDisplay(text).trim() || ' ',
+      content: cards.sanitizeMarkdownForCardKit(this.cleanAssistantTextForDisplay(text).trim()) || ' ',
     }
   }
 
@@ -2791,6 +2791,11 @@ export class Session {
     const replacement = this.proc?.provider === 'codex'
       ? '\n\n_已发起澄清问题，请回答对应卡片。_'
       : ''
+    // 只剥离 ask 标记;不做 HTML 转义/图片降级 —— 本函数同时服务纯文本
+    // sink(聊天列表预览 patchSummaryThrottled、orphan 纯文本兜底
+    // flushOrphanAssistantToChat)与卡片 markdown sink。sanitize 只在卡片
+    // markdown 出口(completedAssistantElement / 旧卡段迁移 replaceElement)
+    // 做,否则纯文本 sink 会把 &lt; &amp; 等实体原样显示给用户。
     return stripAskUsrMarkers(text, replacement)
   }
 

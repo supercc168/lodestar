@@ -46,6 +46,7 @@ import type {
   BgTaskStatus,
 } from '../claude-agent-process'
 import { fmtElapsed } from './format'
+import { sanitizeMarkdownForCardKit } from './elements'
 
 export type { BgTaskStatus }
 
@@ -433,7 +434,7 @@ function renderDetailBody(t: BgTaskEntry): string {
   for (let i = 0; i < t.steps.length; i++) {
     lines.push(`${i + 1}. ${t.steps[i].brief}`)
   }
-  return lines.length > 0 ? lines.join('\n') : '_(暂无执行记录)_'
+  return sanitizeMarkdownForCardKit(lines.length > 0 ? lines.join('\n') : '_(暂无执行记录)_')
 }
 
 /** 单任务的整 panel —— 标题写「图标 责任人·描述 — 状态·时长」,展开看详情 body。

@@ -9,7 +9,7 @@
 import type { CodexUsage } from '../codex-process'
 import type { AgentProvider } from '../agent-process'
 import { contextPercentSummary, contextTokenRatioLabel } from '../context-window'
-import { ELEMENTS } from './elements'
+import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 
 export interface TurnPlanStep {
   step: string
@@ -197,7 +197,7 @@ export function planElement(
     element_id: elementId,
     header: { title: { tag: 'plain_text', content: planHeader(plan, draftText) } },
     expanded: false,
-    elements: [{ tag: 'markdown', content: renderPlanContent(plan, explanation, draftText) }],
+    elements: [{ tag: 'markdown', content: sanitizeMarkdownForCardKit(renderPlanContent(plan, explanation, draftText)) }],
   }
 }
 
@@ -226,7 +226,7 @@ export function goalElement(goal: ThreadGoal, elementId: string): object {
       },
     },
     expanded: false,
-    elements: [{ tag: 'markdown', content: lines.join('\n') }],
+    elements: [{ tag: 'markdown', content: sanitizeMarkdownForCardKit(lines.join('\n')) }],
   }
 }
 
@@ -277,9 +277,7 @@ export function mainConversationCard(opts: MainCardOpts): object {
         expanded: false,
         elements: inputs.map(text => ({
           tag: 'markdown',
-          // Markdown 里 < > 这些字符在 Card Kit 渲染里会被解析,转一下避免
-          // 用户输入里的 HTML 之类被当结构吞掉。
-          content: text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;'),
+          content: sanitizeMarkdownForCardKit(text),
         })),
       }]
     : []
@@ -371,7 +369,7 @@ function renderAskQuestionOptions(
   const els: any[] = []
   for (let oi = 0; oi < q.options.length; oi++) {
     const opt = q.options[oi]
-    const desc = opt.description ? `  ·  ${opt.description}` : ''
+    const desc = opt.description ? `  ·  ${sanitizeMarkdownForCardKit(opt.description)}` : ''
     els.push({
       tag: 'interactive_container',
       background_style: 'default',
@@ -388,7 +386,7 @@ function renderAskQuestionOptions(
           option_idx: oi,
         },
       }],
-      elements: [{ tag: 'markdown', content: `**${opt.label}**${desc}` }],
+      elements: [{ tag: 'markdown', content: `**${sanitizeMarkdownForCardKit(opt.label)}**${desc}` }],
     })
   }
   return els
@@ -412,11 +410,11 @@ function renderAskTimeline(
     if (picked) {
       const answer = askAnswerValue(q, picked)
       const lines = [`**✅ ${title}**`, `**回答**：${answer}`]
-      body.push({ tag: 'markdown', content: lines.join('\n') })
+      body.push({ tag: 'markdown', content: sanitizeMarkdownForCardKit(lines.join('\n')) })
       continue
     }
     if (idx === currentIdx) {
-      body.push({ tag: 'markdown', content: `**🤔 ${title}**` })
+      body.push({ tag: 'markdown', content: sanitizeMarkdownForCardKit(`**🤔 ${title}**`) })
       if (q.options.length > 0) {
         body.push(...renderAskQuestionOptions(q, toolUseId, idx, callbackKind))
       }
@@ -426,7 +424,7 @@ function renderAskTimeline(
       })
       continue
     }
-    body.push({ tag: 'markdown', content: `**⏳ ${title}**` })
+    body.push({ tag: 'markdown', content: sanitizeMarkdownForCardKit(`**⏳ ${title}**`) })
   }
   return body
 }

@@ -12,6 +12,7 @@
  */
 
 import { fmtElapsed } from './format'
+import { sanitizeMarkdownForCardKit } from './elements'
 
 export type AutomationRunKind =
   | 'codex-plan' | 'agy-plan' | 'codex-execute' | 'agy-review' | 'codex-merge'
@@ -176,7 +177,7 @@ function renderBody(run: AutomationRunView): string {
   if (run.error) lines.push(`⚠ ${run.error}`)
   const tail = run.stdoutTail.trim()
   if (tail) lines.push(tail)
-  return lines.length ? lines.join('\n') : '_(暂无输出)_'
+  return sanitizeMarkdownForCardKit(lines.length ? lines.join('\n') : '_(暂无输出)_')
 }
 
 /** 单运行的整 panel —— 标题「图标 成员 · 任务 — 状态·时长」,展开看 body。 */

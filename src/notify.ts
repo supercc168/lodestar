@@ -53,6 +53,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { randomUUID } from 'node:crypto'
 import { log } from './log'
 import * as feishu from './feishu'
+import { sanitizeMarkdownForCardKit } from './cards/elements'
 import {
   buildNotifyResult,
   get as getCallback,
@@ -147,7 +148,7 @@ export function buildNotifyCard(opts: {
       elements.push({ tag: 'markdown', content: `<font color='red'>📷 图片上传失败: ${img.src}</font>` })
     }
   }
-  elements.push({ tag: 'markdown', content: opts.text || '_（空消息）_' })
+  elements.push({ tag: 'markdown', content: sanitizeMarkdownForCardKit(opts.text ?? '') || '_（空消息）_' })
 
   if (opts.resolution) {
     // Post-click status marker replaces the button row. operator open_id
