@@ -75,7 +75,7 @@ lodestar-setup
 | `hi` | 未运行时同一张卡动态启动并收束为控制台;运行中弹控制台 |
 | `stop` / `st` | 软打断当前 turn,子进程保活,排队消息打 ❌ |
 | `kill` / `kl` | 用状态卡展示关闭 Codex 进程,`threadId` 落盘 |
-| `restart` / `rs` | 用状态卡展示按上次 `threadId` 重启(保留上下文)|
+| `restart` / `rs` | 进行中:打断 + 放弃后台进程 + 恢复;空闲:列出项目最近 24h 会话(不足 10 条补更早),选一个在本群接续恢复 |
 | `clear` / `cl` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
 | `compact` / `cm` | 主动触发当前 thread 的上下文压缩,完成后状态卡收束 |
 | `model` / `md` | 展示四个固定档位(Claude·Fable 5 / Opus 4.8 / GLM · Codex·GPT-5.5),一键生效,按群持久化 |
@@ -91,6 +91,19 @@ lodestar-setup
 | `wt feature-x` / `worktree feature-x` | 创建或加入同级目录/群 `<project>[feature-x]`,分支为 `work/feature-x`;重新激活已合并归档分支时会先更新到主线。 |
 
 `删` 会先确认对应 worktree 群没有正在运行的 Codex session,再检查 worktree 没有未提交变更,然后解散群并删除 worktree 目录;分支保留,合并和分支清理由 agent 处理。
+
+**临时会话 / 分叉 / 回滚**(Claude 后端)
+
+在同一个项目目录里多开 Claude 会话,加上语义化的分叉/回滚——基于 Claude 原生的会话 fork(派生新会话 id,原对话不动):
+
+| 指令 | 行为 |
+| --- | --- |
+| `btw` | 开一个临时群 `<project>*MMDD-HHMM`(同一个项目目录,自动启动一个干净 Claude) |
+| `bye` | 解散当前临时群(只能在 `*` 开头的临时群里用) |
+| `fk` / `fork` | 列出当前会话的每条用户输入(倒序),选一条 → 从这条**之前**开临时群分叉,原会话不动 |
+| `bk` / `back` | 立刻终止当前 + 列用户输入,选一条 → 当前会话回退到这条**之前**,并发一张回滚段 Write 记录卡(代码块,可复制后编辑重发) |
+
+分叉/回滚点以「用户输入」为分界:选第 N 条 = 回到这条发出之前的状态。`rs` 空闲模式的历史列表数据源是 Claude 自己的会话存档(`~/.claude/projects/<本项目目录编码>/*.jsonl`),同一工作目录的全部会话都列出来,worktree(不同目录)不会混进来。
 
 ### 🧩 Codex API 档位(自定义 provider)
 
