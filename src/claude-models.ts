@@ -68,6 +68,12 @@ function envFromConfig(raw: ClaudeModelConfig): Record<string, string> {
   if (baseUrl) env.ANTHROPIC_BASE_URL = baseUrl
   if (authToken) env.ANTHROPIC_AUTH_TOKEN = authToken
   if (apiKey) env.ANTHROPIC_API_KEY = apiKey
+  // per-档位 env 注入(GLM 用它映射 opus/sonnet/fable 别名到 GLM 真实模型;
+  // 官方登录档位 raw.env 恒空 → 不注入)。trim + 非空过滤,与上面三字段一致。
+  for (const [k, v] of Object.entries(raw.env ?? {})) {
+    const sv = v?.trim()
+    if (sv) env[k] = sv
+  }
   return env
 }
 
