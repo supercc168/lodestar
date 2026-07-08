@@ -198,9 +198,12 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       }
       return true
     case 'restart':
-      // rs 优化:会话进行中 = 打断 + 弃后台 + 恢复(走下面 restart(true),它已
-      // resetBackgroundTasks);空闲 = 列项目最近 24h 会话选恢复(比"只恢复上一会话"实用)。
-      if (!s.isRunning()) {
+      // rs 双模式:会话进行中 = 打断 + 弃后台 + 恢复(走下面 restart(true));空闲 =
+      // 列项目最近 24h 会话选恢复(比"只恢复上一会话"实用)。空闲判定用「无进行中
+      // turn」语义,与上面 stop 命令对齐 —— 不能用 !isRunning():isRunning() 判的是
+      // 进程存活,而 claude 进程 turn 间常驻保活(stop 故意 "Subprocess stays alive"),
+      // stop 后仍为 true,会让列表分支永远不可达(实测踩中,见 session.test.ts)。
+      if (!s.currentTurn && s.pendingUserMessageCount === 0 && s.pendingMidTurnMsgs.length === 0) {
         await s.showResumeList()
         return true
       }

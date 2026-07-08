@@ -1259,3 +1259,36 @@ describe('Session resetBackgroundTasks on kill/restart', () => {
     expect(session.openingBackground).toBe(false)
   })
 })
+
+describe('rs (restart) — 双模式列表分支', () => {
+  test('空闲态(proc 存活但无进行中 turn)应走 showResumeList,而非恢复上一会话', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    // 复现 stop 后状态:进程保活(isRunning()=true)但无进行中 turn —— stop 注释明说
+    // "Subprocess stays alive",只 interrupt 不杀进程。这是用户实测踩中的场景。
+    session.proc = { isAlive: () => true, provider: 'claude' }
+    session.currentTurn = null
+    session.pendingUserMessageCount = 0
+    session.pendingMidTurnMsgs = []
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'aaaaaaaabbbbcccc'
+    session.runningAgy = false
+
+    let listCalled = false
+    let restartCalled = false
+    session.showResumeList = async () => { listCalled = true }
+    session.restart = async () => { restartCalled = true; return true }
+    // 恢复分支(修复前会走)依赖这些 —— stub 掉避免真发卡/报错,聚焦分支选择断言
+    session.openStatusCard = async () => null
+    session.closeStatusCard = async () => {}
+    session.withModel = (s: string) => s
+    session.withWorktreeInstructionNotice = (s: string) => s
+    session.backendLabel = () => 'claude'
+
+    await session.runCommand('rs')
+
+    // 修复前(!isRunning() 判定):isRunning=true → 走恢复分支 → listCalled=false、restartCalled=true → FAIL
+    // 修复后(无 turn 判定):走 showResumeList → listCalled=true、restartCalled=false → PASS
+    expect(listCalled).toBe(true)
+    expect(restartCalled).toBe(false)
+  })
+})
