@@ -1292,3 +1292,91 @@ describe('rs (restart) — 双模式列表分支', () => {
     expect(restartCalled).toBe(false)
   })
 })
+
+describe('Session warm-resume 工程师续跑感知(已结算 agent 档案复活)', () => {
+  // 2026-07-08 事故:pokemon 群主 agent 用 SendMessage 热续跑刚完成的工程师
+  // ("was stopped (completed); resumed it"),SDK 不重发 task_started,只在最终
+  // 完成时来一条 task_notification。卡沉降已清池 → unknown no-op → 续跑 6 分钟
+  // 全程飞书无任何状态。冷续跑("resumed from transcript")会重发 task_started,
+  // 不受影响。
+  async function waitFor(cond: () => boolean, ms = 2000): Promise<void> {
+    const t0 = Date.now()
+    while (!cond()) {
+      if (Date.now() - t0 > ms) throw new Error('waitFor timeout')
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+  }
+
+  function wiredClaudeSession(): { session: any; proc: any } {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    return { session, proc }
+  }
+
+  /** 走完一轮正常生命周期:started → 开卡 → settled → 卡沉降清池(档案应留名片)。 */
+  async function runAgentToSettled(session: any, proc: any): Promise<void> {
+    proc.emit('bg_task_started', {
+      task_id: 'ag1', task_type: 'local_agent', subagent_type: 'client-engineer',
+      tool_use_id: 'tu1', description: '稀有度钳制下沉实施',
+    })
+    await waitFor(() => session.backgroundCard !== null)
+    proc.emit('bg_task_settled', { task_id: 'ag1', status: 'completed' })
+    await waitFor(() => session.backgroundTasks.length === 0 && session.backgroundCard === null)
+  }
+
+  test('卡沉降清池后档案留有 agent 名片;热续跑只来终态 → 补发一次性墓碑卡', async () => {
+    const { session, proc } = wiredClaudeSession()
+    await runAgentToSettled(session, proc)
+
+    expect(session.bgArchive).toHaveLength(1)
+    expect(session.bgArchive[0]).toMatchObject({ id: 'ag1', subagentType: 'client-engineer' })
+
+    const cardsBefore = sentCards.length
+    // 热续跑:运行期零事件,只有最终 task_notification
+    proc.emit('bg_task_settled', {
+      task_id: 'ag1', status: 'completed',
+      usage: { total_tokens: 100, tool_uses: 5, duration_ms: 360_000 },
+    })
+    await waitFor(() => sentCards.length === cardsBefore + 1)
+
+    const tombstone = JSON.stringify(sentCards[sentCards.length - 1])
+    expect(tombstone).toContain('client-engineer(续跑)')
+    expect(tombstone).toContain('已结束')
+    // 一次性卡不留活卡句柄、不占池
+    expect(session.backgroundCard).toBeNull()
+    expect(session.backgroundTasks).toEqual([])
+  })
+
+  test('未知且不在档案的 settle 维持 no-fallback(前台噪音不回归)', async () => {
+    const { session, proc } = wiredClaudeSession()
+    proc.emit('bg_task_settled', { task_id: 'ghost', status: 'completed' })
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(sentCards.length).toBe(0)
+    expect(session.backgroundTasks).toEqual([])
+  })
+
+  test('热续跑运行期来了 task_updated → 以「续跑」running 条目复活并重开活卡,再 settle 走正常沉降', async () => {
+    const { session, proc } = wiredClaudeSession()
+    await runAgentToSettled(session, proc)
+
+    const cardsBefore = sentCards.length
+    proc.emit('bg_task_updated', { task_id: 'ag1', patch: { status: 'running' } })
+    await waitFor(() => session.backgroundCard !== null)
+
+    expect(session.backgroundTasks).toHaveLength(1)
+    expect(session.backgroundTasks[0]).toMatchObject({ id: 'ag1', status: 'running', resumed: true, type: 'subagent' })
+    const liveCard = JSON.stringify(sentCards[sentCards.length - 1])
+    expect(sentCards.length).toBe(cardsBefore + 1)
+    expect(liveCard).toContain('client-engineer(续跑)')
+
+    // 复活后的正常结算:走已知 task 沉降路径,不再发一次性卡
+    proc.emit('bg_task_settled', { task_id: 'ag1', status: 'completed' })
+    await waitFor(() => session.backgroundTasks.length === 0 && session.backgroundCard === null)
+    expect(sentCards.length).toBe(cardsBefore + 1)
+    // 再次清池后名片仍在档案里,支持同一工程师第二次续跑
+    expect(session.bgArchive.some((a: any) => a.id === 'ag1')).toBe(true)
+  })
+})

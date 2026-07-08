@@ -106,6 +106,7 @@ export {
   taskBoardLiveElement,
 } from './cards/task-board'
 export {
+  type BgArchiveEntry,
   type BgTaskEntry,
   type BgTaskStep,
   type BgTaskType,
@@ -119,6 +120,9 @@ export {
   applyBgTaskSettled,
   applyBgToolUse,
   applyBgToolResult,
+  archiveTerminalAgents,
+  resurrectRunning,
+  resurrectSettled,
   isBgTerminal,
   hasActiveBgTask,
   summarizeBackground,

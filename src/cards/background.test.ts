@@ -8,6 +8,9 @@ import {
   applyBgTaskSettled,
   applyBgToolUse,
   applyBgToolResult,
+  archiveTerminalAgents,
+  resurrectRunning,
+  resurrectSettled,
   isBgTerminal,
   hasActiveBgTask,
   summarizeBackground,
@@ -17,6 +20,7 @@ import {
   backgroundMigratedMarker,
   emptyBgStore,
   BG_ELEMENTS,
+  type BgArchiveEntry,
   type BgTaskEntry,
   type BgStore,
 } from './background'
@@ -423,5 +427,62 @@ describe('promotePendingOnAdvance — 主线程推进判后台', () => {
     expect(s.pending).toHaveLength(0)
     const r = promotePendingOnAdvance(s)
     expect(r.active).toHaveLength(0)
+  })
+})
+
+describe('已结算 agent 档案 — warm-resume 复活(SendMessage 续跑不重发 task_started)', () => {
+  // 2026-07-08 事故:pokemon 群 SendMessage 热续跑已完成的工程师,SDK 只在最终
+  // 完成时来一条 task_notification;卡沉降清池后全命中 unknown no-op → 续跑全程
+  // 隐形。档案在清池时留下 agent「名片」,unknown 事件命中档案即复活。
+  test('archiveTerminalAgents 只收终态 subagent,shell/运行中不入', () => {
+    const tasks: BgTaskEntry[] = [
+      mk({ id: 'a1', status: 'completed', type: 'subagent', subagentType: 'client-engineer', toolUseId: 'tu1', description: '稀有度下沉' }),
+      mk({ id: 'a2', status: 'running', type: 'subagent' }),
+      mk({ id: 'b1', status: 'completed', type: 'shell' }),
+    ]
+    const archive = archiveTerminalAgents([], tasks)
+    expect(archive).toHaveLength(1)
+    expect(archive[0]).toMatchObject({ id: 'a1', toolUseId: 'tu1', subagentType: 'client-engineer', description: '稀有度下沉' })
+  })
+
+  test('同 id 去重取最新;超 cap 丢最旧', () => {
+    let archive: BgArchiveEntry[] = [{ id: 'a1', description: '旧描述' }]
+    archive = archiveTerminalAgents(archive, [mk({ id: 'a1', status: 'completed', type: 'subagent', description: '新描述' })])
+    expect(archive).toHaveLength(1)
+    expect(archive[0].description).toBe('新描述')
+
+    const many = Array.from({ length: 5 }, (_, i) =>
+      mk({ id: `t${i}`, status: 'completed', type: 'subagent', description: `d${i}` }))
+    const capped = archiveTerminalAgents([], many, 3)
+    expect(capped.map(a => a.id)).toEqual(['t2', 't3', 't4'])
+  })
+
+  test('resurrectRunning 命中 → resumed running 条目(保留 toolUseId 供 steps 归属);未命中 → null', () => {
+    const archive: BgArchiveEntry[] = [{ id: 'a1', toolUseId: 'tu1', subagentType: 'client-engineer', description: '稀有度下沉' }]
+    const entry = resurrectRunning(archive, 'a1', 5000)
+    expect(entry).toMatchObject({
+      id: 'a1', type: 'subagent', subagentType: 'client-engineer', toolUseId: 'tu1',
+      status: 'running', startedAt: 5000, resumed: true, isBackgrounded: true, steps: [],
+    })
+    expect(resurrectRunning(archive, 'ghost', 5000)).toBeNull()
+  })
+
+  test('resurrectSettled 命中 → 终态墓碑(status 映射 + usage/summary);未命中 → null', () => {
+    const archive: BgArchiveEntry[] = [{ id: 'a1', subagentType: 'client-engineer', description: '稀有度下沉' }]
+    const usage = { total_tokens: 100, tool_uses: 3, duration_ms: 360_000 }
+    const entry = resurrectSettled(archive, { task_id: 'a1', status: 'completed', usage, summary: '终版diff' }, 9000)
+    expect(entry).toMatchObject({
+      id: 'a1', type: 'subagent', status: 'completed', resumed: true,
+      usage, summary: '终版diff', endTime: 9000,
+    })
+    expect(resurrectSettled(archive, { task_id: 'a1', status: 'failed' }, 9000)!.status).toBe('failed')
+    expect(resurrectSettled(archive, { task_id: 'a1', status: 'stopped' }, 9000)!.status).toBe('killed')
+    expect(resurrectSettled(archive, { task_id: 'ghost', status: 'completed' }, 9000)).toBeNull()
+  })
+
+  test('panel 标题给续跑条目标「(续跑)」', () => {
+    const t = mk({ id: 'a1', status: 'running', type: 'subagent', subagentType: 'client-engineer', resumed: true })
+    const panel = backgroundTaskPanel(t, 1000) as any
+    expect(panel.header.title.content).toContain('client-engineer(续跑)')
   })
 })

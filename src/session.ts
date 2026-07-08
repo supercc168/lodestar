@@ -164,6 +164,10 @@ export class Session {
    *  不渲染;等 task_updated.is_backgrounded=true 提升到 backgroundTasks,或
    *  task_settled 时丢弃。治「随便跑个命令就冒一项后台任务」的关键。 */
   pendingBgTasks: cards.BgTaskEntry[] = []
+  /** 已结算 agent 任务档案:卡沉降/迁移清池时留下 subagent 的「名片」。SDK 热续跑
+   *  (SendMessage 到刚完成的 agent)不重发 task_started,后续 unknown 事件命中
+   *  档案即以「续跑」条目复活入卡;shell 不入档案,前台噪音 no-fallback 不回归。 */
+  bgArchive: cards.BgArchiveEntry[] = []
   /** 后台游标卡句柄。null = 当前无活卡(从未建/已沉降/已固化)。活卡期间
    *  streaming 开,replaceElement body 刷新任务行。卡吸附在对话末尾,被新消息
    *  超越时沉降(updateCard),只在全部终态时固化留在原地。 */
@@ -1701,6 +1705,32 @@ export class Session {
       || this.pendingBgTasks.some(t => t.toolUseId === parentToolUseId)
   }
 
+  /** task_id 是否在双池(active 入卡池或 pending 观察池)中。 */
+  private bgTaskKnown(taskId: string): boolean {
+    return this.backgroundTasks.some(t => t.id === taskId)
+      || this.pendingBgTasks.some(t => t.id === taskId)
+  }
+
+  /** 热续跑感知:SendMessage 续跑刚完成的 agent 时 SDK 不重发 task_started,运行期
+   *  只可能来 progress/updated。未知 task 命中已结算 agent 档案 → 以「续跑」running
+   *  条目复活入 active,活卡照常重开/刷新;未命中(前台命令等)no-op。 */
+  private tryResurrectBgTask(taskId: string, via: string): void {
+    if (this.bgTaskKnown(taskId)) return
+    const entry = cards.resurrectRunning(this.bgArchive, taskId)
+    if (!entry) return
+    this.backgroundTasks = [...this.backgroundTasks, entry]
+    log(`session "${this.sessionName}": bg resurrect via ${via} task=${taskId} subagent=${entry.subagentType ?? '-'} → 续跑入卡`)
+  }
+
+  /** 热续跑全程零运行期事件、只来最终 task_notification:命中档案就补一张一次性
+   *  墓碑卡(静态历史卡,不走活卡 streaming 生命周期),让「续跑已完成」在群里留痕。 */
+  private async sendResumedAgentTombstone(e: BgTaskSettledEvent): Promise<void> {
+    const entry = cards.resurrectSettled(this.bgArchive, e)
+    if (!entry) return
+    const messageId = await feishu.sendCard(this.chatId, cards.backgroundHistoryCard([entry]))
+    log(`session "${this.sessionName}": bg resurrect settled task=${e.task_id} subagent=${entry.subagentType ?? '-'} tombstone=${messageId ? 'sent' : 'FAILED'}`)
+  }
+
   private onBackgroundTaskChanged(): void {
     const hasActive = cards.hasActiveBgTask(this.backgroundTasks)
     // 全部终态 → 活卡沉降成历史快照,关 streaming,清句柄
@@ -1835,6 +1865,8 @@ export class Session {
     await cardkit.dispose(handle.cardId)
     // 全部终态 → 清空 active 跟踪(已固化在历史卡);下次新后台 task 从空数组起步。
     // pending 观察池不动:前台 task 可能仍在跑,它们结算时自己从 pending 丢。
+    // 清池前把 subagent 名片存档,供热续跑(不重发 task_started)复活。
+    this.bgArchive = cards.archiveTerminalAgents(this.bgArchive, this.backgroundTasks)
     this.backgroundTasks = []
     this.backgroundDetailAdded.clear()
     log(`session "${this.sessionName}": background card settled cardId=${handle.cardId.slice(0, 12)}`)
@@ -1865,6 +1897,8 @@ export class Session {
     await cardkit.dispose(handle.cardId)
     this.backgroundCard = null
     // 终态任务已固化在旧卡历史,从活跃跟踪移除;活跃任务保留(新卡重建时显示)。
+    // 移除前把 subagent 名片存档,供热续跑(不重发 task_started)复活。
+    this.bgArchive = cards.archiveTerminalAgents(this.bgArchive, this.backgroundTasks)
     this.backgroundTasks = this.backgroundTasks.filter(t => !cards.isBgTerminal(t))
     this.backgroundDetailAdded.clear()
     log(`session "${this.sessionName}": background card migrated cardId=${handle.cardId.slice(0, 12)} terminal=${terminalCount} active=${this.backgroundTasks.length}`)
@@ -2102,17 +2136,26 @@ export class Session {
       this.onBackgroundTaskChanged()
     })
     p.on('bg_task_progress', (e: BgTaskProgressEvent) => {
+      this.tryResurrectBgTask(e.task_id, 'progress')
       this.applyBgStore(cards.applyBgTaskProgress(this.bgStore(), e))
       this.onBackgroundTaskChanged()
     })
     p.on('bg_task_updated', (e: BgTaskUpdatedEvent) => {
+      log(`session "${this.sessionName}": bg_task_updated task=${e.task_id} patch=${JSON.stringify(e.patch ?? {}).slice(0, 100)}`)
+      this.tryResurrectBgTask(e.task_id, 'updated')
       this.applyBgStore(cards.applyBgTaskUpdated(this.bgStore(), e))
       this.onBackgroundTaskChanged()
     })
     p.on('bg_task_settled', (e: BgTaskSettledEvent) => {
       log(`session "${this.sessionName}": bg_task_settled task=${e.task_id} status=${e.status}`)
-      this.applyBgStore(cards.applyBgTaskSettled(this.bgStore(), e))
-      this.onBackgroundTaskChanged()
+      if (!this.bgTaskKnown(e.task_id)) {
+        // 双池都不认识的终态:热续跑全程零运行期事件,只来这一条 task_notification。
+        // 命中档案 → 补一次性墓碑卡留痕;未命中(漏 started 的前台命令)维持 no-fallback。
+        void this.sendResumedAgentTombstone(e)
+      } else {
+        this.applyBgStore(cards.applyBgTaskSettled(this.bgStore(), e))
+        this.onBackgroundTaskChanged()
+      }
       // turn 已收尾后才结算的任务:SDK 会自发开一轮恢复轮合并结果,
       // 标记给下一个无用户批次的 init 开卡。
       if (!this.currentTurn && !this.openingTurn && this.initCount >= 1) {

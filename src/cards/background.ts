@@ -75,6 +75,8 @@ export interface BgTaskEntry {
   endTime?: number
   /** 子 agent 逐步工具调用(按 parent_tool_use_id 归属),trim 到最近 ~1000 字。 */
   steps: BgTaskStep[]
+  /** warm-resume 从档案复活的续跑条目(panel 标题标「(续跑)」)。 */
+  resumed?: boolean
 }
 
 /** 一步工具调用的简述(tool_use 到达时建,tool_result 到达时回填结果)。 */
@@ -284,6 +286,78 @@ export function applyBgTaskSettled(
   return store
 }
 
+// ── 已结算 agent 档案(warm-resume 复活) ──────────────────────────────
+// SendMessage 热续跑刚完成的 agent 时("was stopped (completed); resumed it"),
+// SDK 不重发 task_started(冷续跑 "resumed from transcript" 才发),运行期最多
+// 只有 progress/updated,甚至只有最终 task_notification。卡沉降清池后这些事件
+// 全命中 unknown no-op → 续跑全程隐形。档案在清池时留下 agent 的「名片」,
+// unknown 事件命中档案即以「续跑」条目复活;shell 等不入档案,前台命令噪音的
+// no-fallback 语义不回归。
+
+export interface BgArchiveEntry {
+  id: string
+  toolUseId?: string
+  subagentType?: string
+  description: string
+}
+
+const BG_ARCHIVE_CAP = 50
+
+/** 清池(settle/migrate)时调用:终态 subagent 条目存入档案。同 id 取最新;
+ *  超 cap 丢最旧。 */
+export function archiveTerminalAgents(
+  archive: BgArchiveEntry[],
+  tasks: BgTaskEntry[],
+  cap = BG_ARCHIVE_CAP,
+): BgArchiveEntry[] {
+  const adds = tasks
+    .filter(t => t.type === 'subagent' && isBgTerminal(t))
+    .map(t => ({ id: t.id, toolUseId: t.toolUseId, subagentType: t.subagentType, description: t.description }))
+  if (adds.length === 0) return archive
+  const ids = new Set(adds.map(a => a.id))
+  const merged = [...archive.filter(a => !ids.has(a.id)), ...adds]
+  return merged.length <= cap ? merged : merged.slice(merged.length - cap)
+}
+
+/** 续跑复活(running):taskId 命中档案 → 以档案身份建 running 条目(resumed 标记,
+ *  startedAt=now 是本次续跑起点,steps 清零,保留 toolUseId 供 steps 归属);
+ *  未命中 → null。 */
+export function resurrectRunning(
+  archive: BgArchiveEntry[],
+  taskId: string,
+  now: number = Date.now(),
+): BgTaskEntry | null {
+  const a = archive.find(x => x.id === taskId)
+  if (!a) return null
+  return {
+    id: a.id, toolUseId: a.toolUseId, type: 'subagent',
+    description: a.description, subagentType: a.subagentType,
+    status: 'running', startedAt: now, steps: [],
+    isBackgrounded: true, resumed: true,
+  }
+}
+
+/** 续跑只收到终态(运行期零事件):命中档案 → 直接建终态墓碑条目(时长尽力取
+ *  usage.duration_ms);未命中 → null。 */
+export function resurrectSettled(
+  archive: BgArchiveEntry[],
+  e: BgTaskSettledEvent,
+  now: number = Date.now(),
+): BgTaskEntry | null {
+  const a = archive.find(x => x.id === e.task_id)
+  if (!a) return null
+  const status: BgTaskStatus = e.status === 'completed' ? 'completed'
+    : e.status === 'failed' ? 'failed'
+    : 'killed'
+  return {
+    id: a.id, toolUseId: a.toolUseId, type: 'subagent',
+    description: a.description, subagentType: a.subagentType,
+    status, startedAt: now, endTime: now, steps: [],
+    usage: e.usage, summary: e.summary,
+    isBackgrounded: true, resumed: true,
+  }
+}
+
 // ── 子 agent 逐步工具调用(parent_tool_use_id 关联) ────────────────────
 
 const STEP_CHAR_BUDGET = 1000
@@ -443,7 +517,7 @@ export function backgroundTaskPanel(t: BgTaskEntry, now: number = Date.now()): o
   return {
     tag: 'collapsible_panel',
     element_id: BG_ELEMENTS.panel(t.id),
-    header: { title: { tag: 'plain_text', content: `${TYPE_ICON[t.type]} ${ownerOf(t)} · ${t.description || '(无描述)'} — ${statusLabel(t, now)}` } },
+    header: { title: { tag: 'plain_text', content: `${TYPE_ICON[t.type]} ${ownerOf(t)}${t.resumed ? '(续跑)' : ''} · ${t.description || '(无描述)'} — ${statusLabel(t, now)}` } },
     expanded: false,
     elements: [{ tag: 'markdown', element_id: BG_ELEMENTS.body(t.id), content: renderDetailBody(t) }],
   }
