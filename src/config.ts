@@ -95,7 +95,7 @@ export interface CodexModelConfig {
 
 /** Per-project agent launch profile, sourced from `[projects.<name>].*`
  * sections in config.toml. Absent section ⇒ no override (Lodestar defaults:
- * `settingSources:['user']`, `claude_code` tool preset, no project MCP).
+ * `settingSources:['user','project','local']`, `claude_code` tool preset, project MCP auto-discovered).
  * Lets an external project (e.g. evolving) run a clean, isolated Claude
  * session pointed at an arbitrary cwd with a restricted tool set and its
  * own `.mcp.json`, without touching any other project. */
@@ -114,8 +114,6 @@ export interface ProjectProfile {
   /** Read `<cwd>/.mcp.json` and pass its servers to the SDK. Default true
    * (parity with bare `claude`, which discovers project .mcp.json). */
   loadProjectMcp?: boolean
-  /** Keep Lodestar's appended system instructions (card markers etc). Default true. */
-  keepLodestarInstructions?: boolean
 }
 
 function expandTilde(v: string): string {
@@ -229,7 +227,7 @@ function loadConfig(): LodestarConfig {
   }
   // [projects.<name>] 节可选 —— 一个外部项目(如 evolving)想跑干净隔离的
   // Claude session:指定 cwd、限定内置工具、只挂自己的 .mcp.json。未配置的
-  // 项目完全走 Lodestar 默认(settingSources:['user'] + claude_code 工具集)。
+  // 项目完全走 Lodestar 默认(settingSources:['user','project','local'] + claude_code 工具集 + 项目 .mcp.json 自动发现)。
   const projectSections = (): Record<string, ProjectProfile> => {
     const out: Record<string, ProjectProfile> = {}
     const prefix = 'projects.'
@@ -247,7 +245,6 @@ function loadConfig(): LodestarConfig {
           case 'strict_mcp': profile.strictMcp = value === 'true'; break
           case 'tools': profile.tools = value; break
           case 'load_project_mcp': profile.loadProjectMcp = value === 'true'; break
-          case 'keep_lodestar_instructions': profile.keepLodestarInstructions = value === 'true'; break
         }
       }
       out[name] = profile

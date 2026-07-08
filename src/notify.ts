@@ -53,7 +53,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { randomUUID } from 'node:crypto'
 import { log } from './log'
 import * as feishu from './feishu'
-import { downgradeExternalImagesForCardKit } from './cards/elements'
+import { downgradeExternalImagesForCardKit, sanitizeMarkdownForCardKit } from './cards/elements'
 import {
   buildNotifyResult,
   get as getCallback,
@@ -170,7 +170,7 @@ export function buildNotifyCard(opts: {
     // Caller's reply (push mode, delivered) — its own line below the
     // marker, so the caller can surface an outcome to the group.
     if (r.status === 'delivered' && r.reply) {
-      elements.push({ tag: 'markdown', content: r.reply })
+      elements.push({ tag: 'markdown', content: sanitizeMarkdownForCardKit(r.reply) })
     }
   } else if (interactive) {
     // One full-width column whose elements stack vertically ⇒ each

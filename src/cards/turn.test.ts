@@ -58,6 +58,35 @@ describe('main conversation card rendering', () => {
     expect(card.body.elements[0].header.title.content).toBe('📥 收到 (1) #2')
   })
 
+  test('user input panel neutralizes markdown image syntax that would break card creation', () => {
+    // Card Kit 把 `![alt](url)` 解析成 image 并拿 url 当 img_key;外链 URL
+    // 被服务端拒(ErrCode 200570 invalid image keys),整张卡 create 失败。
+    const card = mainConversationCard({
+      sessionName: 'probe',
+      turn: 1,
+      kind: 'user_message',
+      userInputs: ['看这张 ![logo](https://res.mail.qq.com/x/test_pic_msg1.png) 怎么样'],
+    }) as any
+    const md = card.body.elements[0].elements[0].content
+
+    expect(md).not.toMatch(/!\[/) // 不残留会被解析成 image 的语法
+    expect(md).toContain('https://res.mail.qq.com/x/test_pic_msg1.png') // 地址仍可见
+    expect(md).toContain('logo') // alt 文本保留
+  })
+
+  test('user input panel shows bare image url when alt text is empty', () => {
+    const card = mainConversationCard({
+      sessionName: 'probe',
+      turn: 1,
+      kind: 'user_message',
+      userInputs: ['![](https://res.mail.qq.com/x/test_pic_msg1.png)'],
+    }) as any
+    const md = card.body.elements[0].elements[0].content
+
+    expect(md).not.toMatch(/!\[/)
+    expect(md).toContain('https://res.mail.qq.com/x/test_pic_msg1.png')
+  })
+
   test('card-full continuation banner keeps Codex default and labels Claude only when requested', () => {
     const codexCard = mainConversationCard({
       sessionName: 'probe',

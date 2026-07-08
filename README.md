@@ -215,7 +215,6 @@ setting_sources           = "project"
 strict_mcp                = "true"
 tools                     = "Read,Write,Edit,Bash,Glob,Grep"
 load_project_mcp          = "true"
-keep_lodestar_instructions = "true"
 ```
 
 | 字段 | 作用 | 默认 |
@@ -225,7 +224,6 @@ keep_lodestar_instructions = "true"
 | `strict_mcp` | 只挂下方项目 MCP,忽略全局 MCP | 关 |
 | `tools` | 允许的内置工具(逗号分隔);MCP 工具由 `load_project_mcp` 自动可用,不用列在这里 | claude_code 全套 |
 | `load_project_mcp` | 读取 `<cwd>/.mcp.json` 并挂载其 MCP 服务 | 关 |
-| `keep_lodestar_instructions` | 保留夜航星卡片/输出约定系统提示 | 开 |
 
 `strict_mcp = "true"` 时,项目 `.mcp.json` 是 agent 能挂上 MCP 的唯一通路 —— 全局插件/技能被全部挡掉,agent 干净专注。典型用法:外部自动化引擎在自己的目录里维护规则文件,夜航星负责飞书通道和卡片渲染,两者通过群消息驱动协作。
 

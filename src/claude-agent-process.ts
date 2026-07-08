@@ -768,7 +768,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     const model = resolveClaudeSdkModel(this.opts.model)
     const profile = this.opts.profile
     if (profile) {
-      log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? true} keepInstructions=${(profile.keepLodestarInstructions ?? true)}`)
+      log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? true}`)
     }
     const settingSources = settingSourcesFromProfile(profile, this.opts.workDir)
     const toolsOption = toolsFromProfile(profile)
@@ -777,9 +777,6 @@ export class ClaudeAgentProcess extends EventEmitter {
     // readProjectMcpServers returns undefined when no .mcp.json is present, so
     // this is a no-op for projects without one. Opt out: load_project_mcp = "false".
     const mcpServers = profile?.loadProjectMcp !== false ? readProjectMcpServers(this.opts.workDir) : undefined
-    // keepLodestarInstructions defaults to true; an explicit false drops
-    // Lodestar's appended card/output markers for a fully isolated agent.
-    const appendSystemPrompt = profile?.keepLodestarInstructions === false ? undefined : this.opts.appendSystemPrompt
     try {
       // resolveClaudeExecutableConfig 在 [claude].bin 配错路径时同步抛出;
       // 必须在 try 内调用,确保错误走 error/exit 事件而非穿透到调用方。
@@ -821,7 +818,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           systemPrompt: {
             type: 'preset',
             preset: 'claude_code',
-            ...(appendSystemPrompt ? { append: appendSystemPrompt } : {}),
+            ...(this.opts.appendSystemPrompt ? { append: this.opts.appendSystemPrompt } : {}),
           },
           stderr: data => {
             const text = data.trim()

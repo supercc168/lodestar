@@ -1,10 +1,10 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-31 | Updated: 2026-06-26 -->
+<!-- Generated: 2026-05-31 | Updated: 2026-07-08 -->
 
 # cards
 
 ## Purpose
-`src/cards/` 维护所有 Feishu Card Kit schema 2.0 模板和渲染辅助函数。它把一轮 Codex 对话、工具调用、权限请求、AskUserQuestion、控制台、状态卡、`model` 选择卡、`wt` worktree 卡、`agy` 任务卡、`task` 清单面板和 Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板都格式化成 session 可以交给 `cardkit.ts` 写入的 JSON 结构。
+`src/cards/` 维护所有 Feishu Card Kit schema 2.0 模板和渲染辅助函数。它把一轮 Codex 对话、工具调用、权限请求、AskUserQuestion、控制台、状态卡、`model` 选择卡、`wt` worktree 卡、`agy` 任务卡、`task` 清单面板和 Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板、SDK `task_*` 后台任务/子 agent 的「后台游标卡」、临时会话 `fk`/`bk`/`rs` 的列表与回滚卡,都格式化成 session 可以交给 `cardkit.ts` 写入的 JSON 结构。
 
 ## Key Files
 | File | Description |
@@ -19,11 +19,16 @@
 | `console.ts` | `hi` 控制台、状态卡、菜单卡、模型/effort 选择卡、额度/主机信息格式化和关闭 streaming 设置。 |
 | `worktree.ts` | `wt` 列表卡和创建/加入提示卡，展示 `work/*` 分支状态、归档摘要并提供常驻删除按钮。 |
 | `task.ts` | `task` 清单面板卡，展示项目、清单名、绑定 GUID、分组状态、清单链接，以及启用/删除/确认删除按钮。 |
+| `background.ts` | SDK `task_*` 消息族(子 agent / 后台 bash / MCP / workflow)的状态累积 + 「后台游标卡」渲染:active/pending 双池(workflow/monitor 白名单 task_started 直入 active,其余前台 task 进 pending,对话推进时提升),吸附对话末尾,被新消息超越时沉降为历史快照,全终态固化留在原地。 |
+| `temp.ts` | 临时会话 `fk`/`bk`/`rs` 卡片:`fk`/`bk` 的用户输入(turn 锚点)列表卡、`rs` 空闲模式的项目最近会话列表卡、`bk` 回滚后的 Write 记录卡;按钮 `value.kind`(`temp_fork_select`/`temp_back_select`/`temp_resume_select`)在 `daemon.ts` `handleCardAction` 里 dispatch。 |
 | `turn.test.ts` | Bun 测试，覆盖 turn card、模型选择、工具摘要、权限元素和 console/status card 的关键渲染。 |
 | `agy.test.ts` | Bun 测试，覆盖 agy 卡片结构、状态行、输出清理、仓库摘要和转发按钮。 |
 | `worktree.test.ts` | Bun 测试，覆盖 `wt` 卡片的归档隐藏和状态排序。 |
 | `task.test.ts` | Bun 测试，覆盖 `task` 面板未启用、已启用和删除确认状态。 |
 | `task-board.test.ts` | Bun 测试，覆盖 Task 工具累积语义(Create 抓 id/Update 改 status/List 全量替换与空数组清空/Get 补全)、board 统计摘要和整个板的列表渲染。 |
+| `background.test.ts` | Bun 测试，覆盖后台任务状态机(started/progress/updated/settled/tool_use/tool_result)、active/pending 双池提升、live 卡与 history 卡切换。 |
+| `temp.test.ts` | Bun 测试，覆盖 `fk`/`bk` turn 锚点列表卡、`rs` 会话列表卡和回滚 Write 记录卡的渲染。 |
+| `elements.test.ts` | Bun 测试，覆盖 `ELEMENTS` element_id 命名约定和 `sanitizeMarkdownForCardKit`。 |
 
 ## Subdirectories
 | Directory | Purpose |
@@ -48,6 +53,8 @@
 - 修改 `agy.ts` 后运行 `bun test src/cards/agy.test.ts src/agy-task.test.ts`。
 - 修改 `worktree.ts` 后运行 `bun test src/cards/worktree.test.ts src/worktree.test.ts`，必要时用 debug 注入在真实群里检查卡片渲染和按钮回调。
 - 修改 `task.ts` 后运行 `bun test src/cards/task.test.ts src/tasklist-worker.test.ts`。
+- 修改 `background.ts` 后运行 `bun test src/cards/background.test.ts`;触及 session 事件接线时再跑全量 `bun test`。
+- 修改 `temp.ts` 后运行 `bun test src/cards/temp.test.ts`;触及 `session-temp.ts` 或 `daemon.ts` `handleCardAction` 的 `temp_*_select` dispatch 时再跑全量 `bun test`。
 - 如果变更影响 `contextPercent`、usage 或控制台展示，也运行 `bun test src/context-window.test.ts`。
 - 影响真实 Card Kit schema、按钮 action 或 streaming 设置时，需要在飞书群里做 smoke。
 
@@ -60,13 +67,15 @@
 - `task` 面板的按钮 action value 使用 `tasklist_enable`、`tasklist_delete_prompt` 和 `tasklist_delete_confirm`；删除前必须进入确认态，并携带当前绑定 GUID 防止旧卡删除新清单。
 - 控制台和状态卡统一通过 `streamingOffSettings` 在终态关闭 streaming 并写 summary。
 - `wt` 列表使用 `column_set` 保持状态和删除按钮同屏可见；创建/加入提示使用轻量 notice card。
+- 「后台游标卡」维护 active/pending 双池:workflow/monitor 白名单 task_started 直入 active,其余前台 task 进 pending 观察池,待对话推进(`promotePendingOnAdvance`)再提升;全终态时固化留在原地,只有被新消息超越才沉降成历史快照(`backgroundHistoryCard`)。
+- `temp` 列表卡(`fk`/`bk`/`rs`)按钮 `value.kind` 固定为 `temp_fork_select`/`temp_back_select`/`temp_resume_select`,并带锚点/会话 id 防止旧卡回调污染新选择;回滚后额外发一张 Write 记录卡供复制。
 
 ## Dependencies
 
 ### Internal
 - `src/cards.ts` 统一 re-export 本目录导出，调用方通常 `import * as cards from './cards'`。
 - `src/session.ts` 和 `src/session-*` helper 依赖本目录生成卡片元素。
-- `session-model.ts` 使用 `console.ts` 渲染 `model` 面板，`session-worktree.ts` 使用 `worktree.ts` 渲染 `wt` 列表卡/提示卡/解散按钮，`session-agy.ts` 使用 `agy.ts` 渲染外部 agy 任务卡，`session-tasklist.ts` 使用 `task.ts` 渲染任务清单启用/删除面板。
+- `session-model.ts` 使用 `console.ts` 渲染 `model` 面板，`session-worktree.ts` 使用 `worktree.ts` 渲染 `wt` 列表卡/提示卡/解散按钮，`session-agy.ts` 使用 `agy.ts` 渲染外部 agy 任务卡，`session-tasklist.ts` 使用 `task.ts` 渲染任务清单启用/删除面板,`session-temp.ts` 使用 `temp.ts` 渲染 `fk`/`bk`/`rs` 列表与回滚卡;`background.ts` 的 active/pending 双池由 `session.ts`/`session-tools.ts` 经 SDK `task_*` 事件驱动,渲染成吸附对话末尾的后台游标卡。
 - `task.ts` 依赖 `src/tasklist.ts` 的分组常量和绑定类型，但不直接依赖 `feishu.ts`。
 - `console.ts` 依赖 `src/sysinfo.ts`、`src/usage.ts` 和 `src/context-window.ts` 的类型与格式输入。
 

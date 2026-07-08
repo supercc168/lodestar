@@ -320,7 +320,6 @@ setting_sources            = "project"
 strict_mcp                 = "true"
 tools                      = "Read,Write,Edit,Bash,Glob,Grep"
 load_project_mcp           = "true"
-keep_lodestar_instructions = "true"
 ```
 > ⚠️ 这组字段是**联动的,配一半会把对话卡死**。若遇到卡片底部一直 `Thinking...` 且 model 显示 `<synthetic>`,先把 `[projects.*]` 整节注释掉重启排查。
 
