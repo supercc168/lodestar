@@ -1,0 +1,7 @@
+[test]
+# 先于任何测试文件注册 ./feishu 的共享 mock(feishu-test-mock.ts)。
+# bun 的 mock.module 是异步注册,静态 import 间无 await 点:一旦某个被测模块
+# (如 notify.ts → ./feishu)在 mock 生效前被加载,真实 feishu 会被缓存,
+# 后续 session.test.ts 等拿到的就是真实模块(读到宿主真实 config)。
+# preload 保证 mock 在首个测试文件加载前注册,加载顺序不再影响结果。
+preload = ["./src/feishu-test-mock.ts"]
