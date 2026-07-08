@@ -136,6 +136,24 @@ describe('buildNotifyCard', () => {
     expect(md.some((c: string) => c === '已发布 **v1.2.3** · 提交 `abc123`')).toBe(true)
   })
 
+  test('reply 里的外链图片被降级(防炸卡),<font> 彩色保留', () => {
+    const card: any = buildNotifyCard({
+      title: 'ops', text: 'approve?', level: 'info',
+      resolution: {
+        status: 'delivered', buttonId: 'ship', text: '🚢 发布',
+        operatorOpenId: 'ou_x',
+        reply: "<font color='green'>done</font> ![证据](https://x/proof.png)",
+      },
+    })
+    const md = cardBody(card).filter((e: any) => e.tag === 'markdown').map((e: any) => e.content)
+    const reply = md.find((c: string) => c.includes('done'))
+    expect(reply).toBeTruthy()
+    // 外链图片语法被降级成纯文本标记,url 保留;<font> 不被转义。
+    expect(reply).not.toMatch(/!\[/)
+    expect(reply).toContain('https://x/proof.png')
+    expect(reply).toContain("<font color='green'>done</font>")
+  })
+
   test('failed image upload surfaces inline in red, never dropped', () => {
     const card: any = buildNotifyCard({
       title: 't', text: 'x', level: 'info',

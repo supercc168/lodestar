@@ -53,7 +53,7 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { randomUUID } from 'node:crypto'
 import { log } from './log'
 import * as feishu from './feishu'
-import { downgradeExternalImagesForCardKit, sanitizeMarkdownForCardKit } from './cards/elements'
+import { downgradeExternalImagesForCardKit } from './cards/elements'
 import {
   buildNotifyResult,
   get as getCallback,
@@ -168,9 +168,11 @@ export function buildNotifyCard(opts: {
     }
     elements.push({ tag: 'markdown', content: marker })
     // Caller's reply (push mode, delivered) — its own line below the
-    // marker, so the caller can surface an outcome to the group.
+    // marker, so the caller can surface an outcome to the group. 与
+    // opts.text 同一变体:reply 也是 notify 调用方文本,允许 <font> 彩色,
+    // 只降级外链图片防炸卡(外链 url 被当 img_key 拒会让整次 update 失败)。
     if (r.status === 'delivered' && r.reply) {
-      elements.push({ tag: 'markdown', content: sanitizeMarkdownForCardKit(r.reply) })
+      elements.push({ tag: 'markdown', content: downgradeExternalImagesForCardKit(r.reply) })
     }
   } else if (interactive) {
     // One full-width column whose elements stack vertically ⇒ each
