@@ -85,6 +85,13 @@ export interface ClaudeModelConfig {
    * 路由(GLM)用它复刻各自最优配置 —— 如 GLM-5.2 直连智谱走 xhigh 触发
    * extended thinking。官方档位不读此字段(锁 max)。非法值忽略、回落固定值。 */
   effort?: string
+  /** Per-档位 env 注入(仅 API 路由档位生效)。config 里用扁平标量 env_<NAME>
+   *  表达(本解析器只支持 scalar),如 env_ANTHROPIC_DEFAULT_OPUS_MODEL。
+   *  spawn 时合并进档位 env:选 GLM 时注入别名→GLM 模型映射,官方登录档位
+   *  raw.env 恒空→不注入→三档别名走 Claude Code 默认解析,零污染。
+   *  注意:env 非空会让 toProfile 把 route 推断为 'api',故 env_* 只能配在
+   *  已配 base_url/auth_token 的第三方档位(如 glm),不可配官方登录档位。 */
+  env?: Record<string, string>
 }
 
 /** 第三方 Codex provider(OpenAI 兼容端点)接入配置,对应 `[codex.models.<slug>]`。
@@ -168,6 +175,37 @@ function parseToml(text: string): Record<string, Record<string, string>> {
   return out
 }
 
+/** 从单个 [claude.models.<name>] section 组装 ClaudeModelConfig。
+ *  env_<NAME> 扁平标量收进 profile.env(绕过手写解析器对嵌套 table 的不支持)。
+ *  Export 出来便于单测解析逻辑(否则只能经 loadConfig 全链路间接测)。 */
+export function parseClaudeModelProfile(section: Record<string, unknown>): ClaudeModelConfig {
+  const profile: ClaudeModelConfig = {}
+  for (const [rawKey, value] of Object.entries(section)) {
+    if (typeof value !== 'string' || value.length === 0) continue
+    const field = rawKey.trim()
+    if (field.startsWith('env_')) {
+      const envKey = field.slice(4)
+      if (envKey) {
+        ;((profile.env ??= {}) as Record<string, string>)[envKey] = value
+      }
+      continue
+    }
+    if (
+      field === 'display_name' ||
+      field === 'description' ||
+      field === 'model' ||
+      field === 'base_url' ||
+      field === 'auth_token' ||
+      field === 'api_key' ||
+      field === 'route' ||
+      field === 'effort'
+    ) {
+      ;(profile as Record<string, string>)[field] = value
+    }
+  }
+  return profile
+}
+
 function loadConfig(): LodestarConfig {
   let raw: string
   try {
@@ -209,24 +247,7 @@ function loadConfig(): LodestarConfig {
       if (!sectionName.startsWith(prefix)) continue
       const key = sectionName.slice(prefix.length).trim()
       if (!key) continue
-      const profile: ClaudeModelConfig = {}
-      for (const [rawKey, value] of Object.entries(section)) {
-        if (typeof value !== 'string' || value.length === 0) continue
-        const field = rawKey.trim()
-        if (
-          field === 'display_name' ||
-          field === 'description' ||
-          field === 'model' ||
-          field === 'base_url' ||
-          field === 'auth_token' ||
-          field === 'api_key' ||
-          field === 'route' ||
-          field === 'effort'
-        ) {
-          ;(profile as Record<string, string>)[field] = value
-        }
-      }
-      out[key] = profile
+      out[key] = parseClaudeModelProfile(section)
     }
     return out
   }
