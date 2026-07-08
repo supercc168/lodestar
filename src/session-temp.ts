@@ -26,6 +26,14 @@ function projectName(s: Session): string {
   return feishu.tempProjectName(s.sessionName) ?? s.worktreeProjectName() ?? s.sessionName
 }
 
+/** 主群当前 model 选择,供 btw/fk 创建的临时群继承。selectedModel 为空(主群未显式选过
+ *  档位、走默认)时返回 undefined —— 此时临时群也走自己的默认,结果一致,无需特判。 */
+function inheritSelection(s: Session): feishu.SessionModelSelection | undefined {
+  return s.selectedModel
+    ? { provider: s.selectedProvider, model: s.selectedModel, effort: s.selectedEffort }
+    : undefined
+}
+
 /** idx==0 = 会话起点(undefined,全新);idx>=1 = anchors[idx-1] 的 uuid。 */
 function resumeAt(anchors: feishu.TurnAnchor[], idx: number): string | undefined {
   return idx >= 1 ? anchors[idx - 1]?.uuid : undefined
@@ -132,7 +140,7 @@ export async function runBtwCommand(s: Session, userOpenId: string): Promise<voi
   }
   const chatName = feishu.tempChatName(projectName(s))
   await feishu.sendText(s.chatId, `🚀 开临时会话 ${chatName}(同目录,自动启动)…`)
-  const r = await s.opts.onCreateTempSession({ chatName, userOpenId })
+  const r = await s.opts.onCreateTempSession({ chatName, userOpenId, inheritModel: inheritSelection(s) })
   if (!r.ok) await feishu.sendText(s.chatId, `❌ 建临时会话失败: ${r.error ?? '未知'}`)
 }
 
@@ -164,7 +172,7 @@ export async function onForkSelect(s: Session, anchorIdx: number, userOpenId: st
   const chatName = feishu.tempChatName(projectName(s))
   log(`session-temp: fork ${s.sessionName}@${anchorIdx} → ${chatName} (at=${resumeSessionAt?.slice(0, 8) ?? 'origin'})`)
   await feishu.sendText(s.chatId, `🔱 分叉到 ${chatName}…`)
-  const r = await s.opts.onCreateTempSession({ chatName, userOpenId, resumeSessionId, resumeSessionAt })
+  const r = await s.opts.onCreateTempSession({ chatName, userOpenId, resumeSessionId, resumeSessionAt, inheritModel: inheritSelection(s) })
   if (!r?.ok) await feishu.sendText(s.chatId, `❌ 分叉失败: ${r?.error ?? '未知'}`)
   // 不继承锚点:新临时群派生新 sid,旧 uuid 跨 sid 复用易错;新会话自己重新累积。
 }

@@ -123,9 +123,15 @@ async function createTempSession(opts: {
   userOpenId: string
   resumeSessionId?: string
   resumeSessionAt?: string
+  inheritModel?: feishu.SessionModelSelection
 }): Promise<{ ok: boolean; chatId?: string; error?: string }> {
   try {
     const ensured = await feishu.ensureChatForSession(opts.chatName, opts.userOpenId)
+    // 预绑主群档位:必须在 sessionFor() 之前 —— new Session() 构造时会立刻读 model map
+    // 定档位,放后面就晚了。inheritModel 缺省(主群未显式选过)则不绑,临时群走默认。
+    if (opts.inheritModel) {
+      feishu.bindSessionModel(opts.chatName, opts.inheritModel.provider, opts.inheritModel.model, opts.inheritModel.effort)
+    }
     const tempSession = sessionFor(ensured.chatId, opts.chatName)
     if (tempSession.isRunning()) {
       return { ok: false, error: `${opts.chatName} 已有会话在跑,先 bye 解散再重试` }
@@ -136,6 +142,7 @@ async function createTempSession(opts: {
     if (!ok) {
       // 启动失败:解散刚建的群 + 清 Session,不留半创建状态(群在但没 claude)。
       try { await feishu.disbandChatForSession(opts.chatName) } catch {}
+      feishu.unbindSessionModel(opts.chatName)
       sessions.delete(ensured.chatId)
       tempSession.dispose()
       return { ok: false, error: `${tempSession.backendLabel()} 启动失败,已自动解散临时群` }
@@ -160,6 +167,7 @@ async function disbandTempSession(chatName: string): Promise<{ ok: boolean; erro
     }
     await feishu.disbandChatForSession(chatName)
     feishu.clearTurnAnchors(chatName)
+    feishu.unbindSessionModel(chatName)
     return { ok: true }
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e)

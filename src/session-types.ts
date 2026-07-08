@@ -5,6 +5,8 @@
  * session-ask.ts, session-permission.ts.
  */
 
+import type { SessionModelSelection } from './feishu'
+
 export interface TurnState {
   cardId: string
   /** Feishu message_id of the card — needed for urgent_app push on clean
@@ -139,6 +141,9 @@ export interface SessionOpts {
     userOpenId: string
     resumeSessionId?: string
     resumeSessionAt?: string
+    /** 继承触发群(主群)当前的 model 选择,预绑到新临时群名下,让临时群首启就用主群档位
+     *  而非 config 默认。undefined = 主群未显式选过档位,让临时群走默认。*/
+    inheritModel?: SessionModelSelection
   }) => Promise<{ ok: boolean; chatId?: string; error?: string }>
   /** Daemon hook:解散临时群 + 清掉它的 Session 对象(bye 用)。*/
   onDisbandTempSession?: (chatName: string) => Promise<{ ok: boolean; error?: string }>

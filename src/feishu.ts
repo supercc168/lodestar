@@ -359,6 +359,14 @@ export function getSessionModelSelection(sessionName: string): SessionModelSelec
   return selectedModelByName.get(sessionName) ?? null
 }
 
+/** 删除某 session 的 model 绑定。临时群 bye 解散、或首启失败回滚时调,
+ *  避免 `*MMDD-HHMM` 废记录在 model map 里堆积。不存在则 no-op。 */
+export function unbindSessionModel(sessionName: string): void {
+  if (!selectedModelByName.has(sessionName)) return
+  selectedModelByName.delete(sessionName)
+  saveSessionModelMap()
+}
+
 export function getSessionModel(sessionName: string): string | null {
   return selectedModelByName.get(sessionName)?.model ?? null
 }
