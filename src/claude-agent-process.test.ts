@@ -156,6 +156,11 @@ describe('Claude model profiles', () => {
       expect(claudeModelEnv('claude:glm')).toEqual({
         ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
         ANTHROPIC_AUTH_TOKEN: 'glm-secret-token',
+        // 内置默认别名映射(智谱最强组合):config 未配 env_* 时自动注入
+        ANTHROPIC_DEFAULT_FABLE_MODEL: 'glm-5.2[1m]',
+        ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2[1m]',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5-turbo',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5-turbo',
       })
       // 官方模型仍然干净,GLM 的 token 不外泄到登录态档位。
       expect(claudeModelEnv('claude:opus')).toEqual({})

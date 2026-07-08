@@ -51,6 +51,16 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
   },
 }
 
+// GLM 档位内置默认别名映射(智谱端点最强组合)。glm 档位 config 未显式配某 env_*
+// 时用这套默认;config 显式配的逐 key 覆盖。让其他机器装新版后 config.toml 只配
+// token 即开箱用,无需手写 env_*。智谱出新模型时改这里 + 发新版即可。
+const DEFAULT_GLM_ENV: Record<string, string> = {
+  ANTHROPIC_DEFAULT_FABLE_MODEL: 'glm-5.2[1m]',
+  ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2[1m]',
+  ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5-turbo',
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5-turbo',
+}
+
 function mergedConfig(name: string): ClaudeModelConfig {
   return {
     ...(DEFAULT_CLAUDE_MODELS[name] ?? {}),
@@ -81,6 +91,14 @@ function toProfile(name: string): ClaudeModelProfile | null {
   const raw = mergedConfig(name)
   const key = `claude:${name}`
   const env = envFromConfig(raw)
+  // glm 档位内置默认别名映射(智谱最强组合):仅在 glm 实际配了接入(token)时注入,
+  // config 未配的 key 用默认、显式配的逐 key 覆盖;未配置(token 缺)时不注入(保持
+  // env 空,configured=false 由 picker 拦截)。装新版即开箱用,config.toml 只配 token 即可。
+  if (name === 'glm' && (env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY)) {
+    for (const [k, v] of Object.entries(DEFAULT_GLM_ENV)) {
+      if (!(k in env)) env[k] = v
+    }
+  }
   // route:显式 config > 内建默认 > 由是否配了接入信息推断。
   const route: 'login' | 'api' =
     raw.route === 'api' || raw.route === 'login'
