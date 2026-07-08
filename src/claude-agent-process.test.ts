@@ -222,6 +222,43 @@ describe('Claude model profiles', () => {
       ;(config.claude as any).models = prevModels
     }
   })
+
+  test('buildSpawnEnv: GLM 档位注入 per-档位 env 别名映射(ANTHROPIC_DEFAULT_*);官方档位不注入', () => {
+    const prevModels = config.claude.models
+    // 清掉宿主 process.env 里残留的全局别名映射(模拟 Task5 删 [claude.env] 污染后),
+    // 否则官方档位会继承宿主的 DEFAULT_OPUS=claude-fable-5,干扰"零注入"断言。
+    const prevDefaultOpus = process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
+    delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
+    ;(config.claude as any).models = {
+      glm: {
+        model: 'glm-5.2[1m]',
+        base_url: 'https://open.bigmodel.cn/api/anthropic',
+        auth_token: 'glm-tok',
+        env: {
+          ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2[1m]',
+          ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5-turbo',
+        },
+      },
+    }
+    try {
+      // GLM 档位:别名映射随 base_url/token 一起注入子进程。
+      const glm = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:glm' })
+      const glmEnv = (glm as any).buildSpawnEnv()
+      expect(glmEnv.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic')
+      expect(glmEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.2[1m]')
+      expect(glmEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5-turbo')
+
+      // 官方登录档位:不注入任何 per-档位 env,opus/sonnet 别名走 CC 默认解析。
+      const opus = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:opus' })
+      const opusEnv = (opus as any).buildSpawnEnv()
+      expect(opusEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBeUndefined()
+      expect(opusEnv.ANTHROPIC_BASE_URL).toBeUndefined()
+    } finally {
+      ;(config.claude as any).models = prevModels
+      if (prevDefaultOpus === undefined) delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
+      else process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = prevDefaultOpus
+    }
+  })
 })
 
 describe('Claude configured executable ([claude] bin)', () => {
