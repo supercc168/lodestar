@@ -140,7 +140,7 @@ curl -sS -X POST http://127.0.0.1:9876/notify \
 
 ### 想让某个外部项目跑在别的目录?
 
-默认群名就是 `projects_root` 下的目录名。但如果你的项目放在别处、不想搬进来,在 config.toml 指一下它的目录就行,其它项目不受影响:
+默认群名就是 `projects_root` 下的目录名。但如果你的项目放在别处、不想搬进来,在 config.toml 指一下它的目录就行——**section 名就是飞书群名**(daemon 用群名去 `config.projects[群名]` 取 cwd),其它项目不受影响:
 
 ```toml
 [projects.calculator2]
@@ -155,10 +155,11 @@ cwd                        = "/abs/path/to/calculator2"
 setting_sources            = "project"   # 只读项目级配置(会丢全局)
 strict_mcp                 = "true"      # 只挂项目 .mcp.json,挡掉全局 MCP
 tools                      = "Read,Write,Edit,Bash,Glob,Grep"
-load_project_mcp           = "true"      # 读 <cwd>/.mcp.json
 ```
 
-> 最常踩的坑:`setting_sources = "project"` 会把 `~/.claude/settings.json` 里的 GLM 路由一起丢掉 —— 走 project 模式时,GLM 路由得改落在 config.toml 的 `[claude.env]` 里。要是看到卡片一直 `Thinking...`、model 显示 `<synthetic>`,先把整节注释掉重启,基本就是这几个开关没配齐。
+> `<cwd>/.mcp.json` 默认就会被读(对齐裸 `claude` 的项目 MCP 自动发现),不用单独开;只有想关掉才设 `load_project_mcp = "false"`。
+>
+> 最常踩的坑:`setting_sources = "project"` 会把 `~/.claude/settings.json` 里的 GLM 路由一起丢掉 —— `[claude.env]` 是**无差别注入到所有项目** spawn env 的(不只对这一个项目生效),把 GLM 的 base_url / token 挪过去就能兜住。要是看到卡片一直 `Thinking...`、model 显示 `<synthetic>`,先把整节注释掉重启,基本就是这几个开关没配齐。
 
 ### 想换成 reclaude 之类的 claude 包装器?
 
