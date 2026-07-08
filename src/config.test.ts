@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { parseClaudeModelProfile } from './config'
+import { parseClaudeModelProfile } from './config-parse'
 
 describe('parseClaudeModelProfile', () => {
   test('env_<NAME> 扁平标量收进 profile.env', () => {
