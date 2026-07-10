@@ -21,7 +21,7 @@ mock.module('./config', () => ({
         wuhen: {
           base_url: 'https://api.wuhen-ai.com',
           requires_openai_auth: 'true',
-          model: 'gpt-5.5',
+          model: 'gpt-5.6-sol',
         },
       },
     },
@@ -71,7 +71,7 @@ describe('codexConfigArgs', () => {
   })
   test('adds requires_openai_auth and OMITS env_key when no api_key', () => {
     const args = codexConfigArgs(
-      { base_url: 'https://api.wuhen-ai.com', requires_openai_auth: 'true', model: 'gpt-5.5' },
+      { base_url: 'https://api.wuhen-ai.com', requires_openai_auth: 'true', model: 'gpt-5.6-sol' },
       'wuhen',
     )
     expect(args).toContain('model_providers.lodestar_wuhen.requires_openai_auth=true')

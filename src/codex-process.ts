@@ -45,7 +45,7 @@ export function resolveCodexBin(): string {
 /** `codex login status` 的输出是否表示已认证 —— ChatGPT OAuth 或 API key 皆可。
  * codex 对 API key 登录输出 "Logged in using an API key - sk-…";ChatGPT 登录输出
  * "Logged in using ChatGPT"。第三方档位(无痕 wuhen 一类)与全局也走 key 的内建
- * gpt-5.5 档都用 API key,若只认 ChatGPT 会把它们误判为未登录而拦掉。 */
+ * gpt-5.6-sol 档都用 API key,若只认 ChatGPT 会把它们误判为未登录而拦掉。 */
 export function codexLoginStatusAuthenticated(output: string): boolean {
   return /Logged in using ChatGPT/i.test(output) || /Logged in using an API key/i.test(output)
 }
@@ -107,13 +107,18 @@ export interface SpawnOpts {
   providerEnv?: Record<string, string>
 }
 
-export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
+/** max / ultra 是 GPT-5.6 系新增的两档(高于 xhigh):max 延长思维链预算,
+ * ultra 在模型内部做多智能体分解(Terminal-Bench 2.1 上 Sol ultra 91.9% vs
+ * 标准 88.8%)。2026-07-09 在 codex-cli 0.142.5 + 无痕中转实测两档均跑通。 */
+export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'
 export interface CodexReasoningEffortOption {
   reasoningEffort: CodexReasoningEffort
   description: string
 }
-export const CODEX_REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh'] as const
-export const CODEX_EFFORT: CodexReasoningEffort = 'xhigh'
+export const CODEX_REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const
+/** codex 档位的回落默认 effort,与内建 GPT-5.6 Sol 档锁死值一致。ultra 仅
+ * GPT-5.6 系认识;跑旧模型的自配档位应在 [codex.models.<slug>] 显式配 effort。 */
+export const CODEX_EFFORT: CodexReasoningEffort = 'ultra'
 
 export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
   return typeof value === 'string' && CODEX_REASONING_EFFORTS.includes(value as CodexReasoningEffort)

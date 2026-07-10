@@ -42,7 +42,7 @@ export interface LodestarConfig {
   codex: {
     env: Record<string, string>
     /** Per-slot 第三方 provider 档位,对应 `[codex.models.<slug>]`。空 record =
-     * 只有内建 gpt-5.5 登录/默认档。见 src/codex-models.ts。 */
+     * 只有内建 gpt-5.6-sol 登录/默认档。见 src/codex-models.ts。 */
     models: Record<string, CodexModelConfig>
   }
   /** Env vars injected into the Claude Code subprocess used by
@@ -53,7 +53,7 @@ export interface LodestarConfig {
      * 参数透传包装器)。未设置 = 自动查找。 */
     bin?: string
     /** 新 session(无持久化 model 选择)的默认档位,取 [claude.models.*] /
-     * 内建档位的 key(如 "glm")或固定项 model(如 "claude:glm" / "gpt-5.5")。
+     * 内建档位的 key(如 "glm")或固定项 model(如 "claude:glm" / "gpt-5.6-sol")。
      * 未设置 = 硬编码登录默认 Fable 5。只订阅 GLM 的用户设 "glm" 后,新群首条
      * 消息直接走 GLM,不必先手动切一次。 */
     defaultModel?: string

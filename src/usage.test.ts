@@ -57,7 +57,7 @@ describe('provider usage snapshots', () => {
         display_name: 'Codex · 无痕',
         base_url: 'https://api.wuhen-ai.com',
         api_key: 'sk-test',
-        model: 'gpt-5.5',
+        model: 'gpt-5.6-sol',
       },
     }
     globalThis.fetch = async () => new Response('<!doctype html><html></html>', {

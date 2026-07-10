@@ -146,7 +146,7 @@ export function codexModelEffort(model: string | null | undefined): CodexReasoni
   return raw && isCodexReasoningEffort(raw) ? raw : undefined
 }
 
-/** codex:<slug> → 真实 modelId;非档位 key(裸 gpt-5.5)原样;未知 codex: → undefined。 */
+/** codex:<slug> → 真实 modelId;非档位 key(裸 gpt-5.6-sol)原样;未知 codex: → undefined。 */
 export function resolveCodexModelId(model: string | null | undefined): string | undefined {
   const p = codexModelProfile(model)
   if (p) return p.modelId || undefined
@@ -155,7 +155,7 @@ export function resolveCodexModelId(model: string | null | undefined): string | 
 }
 
 /** spawn 时的 codex provider 覆盖。登录/未知档 → 空覆盖 + 原样 modelId,
- * 绝不误伤现有 gpt-5.5。 */
+ * 绝不误伤内建 gpt-5.6-sol。 */
 export function codexSpawnOverrides(model: string | null | undefined): {
   modelId: string | undefined
   configArgs: string[]

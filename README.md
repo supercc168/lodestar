@@ -109,7 +109,7 @@ lodestar-setup
 
 ### 🧩 Codex API 档位(自定义 provider)
 
-默认 `Codex · GPT-5.5` 档位继承用户全局 `~/.codex/config.toml`(`model_provider` 指向哪就走哪)。要在飞书 `model` 面板里按档位/按群切换 Codex 的第三方 OpenAI 兼容端点,在 `config.toml` 加 `[codex.models.<slug>]`:
+默认 `Codex · GPT-5.6 Sol` 档位继承用户全局 `~/.codex/config.toml`(`model_provider` 指向哪就走哪)。要在飞书 `model` 面板里按档位/按群切换 Codex 的第三方 OpenAI 兼容端点,在 `config.toml` 加 `[codex.models.<slug>]`:
 
 ```toml
 # 第三方 OpenAI 兼容端点(自带 key)
@@ -119,13 +119,14 @@ base_url     = "https://api.moonshot.cn/v1"
 wire_api     = "chat"          # chat | responses,默认 chat
 api_key      = "sk-..."
 model        = "kimi-k2"
-effort       = "high"          # none|minimal|low|medium|high|xhigh,默认回落 xhigh
+effort       = "high"          # none|minimal|low|medium|high|xhigh|max|ultra,默认回落 ultra
+                               # (max/ultra 为 GPT-5.6 新增档,旧模型端点请显式配)
 
 # 走 codex OpenAI auth 的端点(无需 api_key)
 [codex.models.wuhen]
 base_url     = "https://api.wuhen-ai.com"
 wire_api     = "responses"
-model        = "gpt-5.5"
+model        = "gpt-5.6-sol"
 requires_openai_auth = "true"
 ```
 

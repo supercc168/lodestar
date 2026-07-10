@@ -27,7 +27,8 @@ export interface ModelPanelState {
 }
 
 /** model 命令的固定选项:每项 effort 锁死,选了即生效(无 effort 二级面板)。
- * codex = gpt-5.5 / xhigh;claude 第一方档位 = Fable 5 / Opus 4.8,均 max
+ * codex = gpt-5.6-sol / ultra(2026-07-09 GA 的旗舰,ultra 为模型内多智能体
+ * 推理档);claude 第一方档位 = Fable 5 / Opus 4.8,均 max
  * (ultracode 最高思考强度)。claude 的 max 由 ClaudeAgentProcess.setModelSettings
  * 强制 applyFlagSettings,不依赖 ~/.claude/settings.json 的 effortLevel。
  * 各 claude:<key> 的实际 SDK model id 由 claude-models.ts 的 profile 决定
@@ -36,10 +37,10 @@ export interface ModelPanelState {
 const FIXED_MODEL_CHOICES = [
   {
     provider: 'codex' as const,
-    model: 'gpt-5.5',
-    displayName: 'Codex · GPT-5.5',
-    description: 'GPT-5.5 · xhigh 推理强度。',
-    effort: 'xhigh' as AgentReasoningEffort,
+    model: 'gpt-5.6-sol',
+    displayName: 'Codex · GPT-5.6 Sol',
+    description: 'GPT-5.6 Sol · ultra 推理强度(模型内多智能体)· 1.5M 上下文。',
+    effort: 'ultra' as AgentReasoningEffort,
   },
   {
     provider: 'claude' as const,
@@ -103,7 +104,7 @@ export function normalizeFixedModelSelection(
   const all = [...FIXED_MODEL_CHOICES, ...codexModelChoices()]
   const hit = all.find(c => c.provider === provider && c.model === model)
   // 第三方 API 路由(claude GLM / codex 自定义 provider)持久化了但当前未配置 →
-  // 回落到该 provider 的登录默认档(claude→claude:fable,codex→gpt-5.5)。否则
+  // 回落到该 provider 的登录默认档(claude→claude:fable,codex→gpt-5.6-sol)。否则
   // restore 会以未鉴权状态拉起该档位:既跑不通,又绕过 picker 的配置门槛。
   const unconfiguredApiRoute =
     (provider === 'claude' && claudeModelIsApiRoute(model) && !claudeModelConfigured(model)) ||
@@ -118,7 +119,8 @@ export function normalizeFixedModelSelection(
 
 /** 新 session(无持久化 model 选择)的默认档位,取自 config.toml 的
  * [claude] default_model。接受档位 key("glm")或固定项 model("claude:glm" /
- * "gpt-5.5")。未配置 / 无法识别 → null(调用方回落到硬编码登录默认 Fable 5)。
+ * "gpt-5.6-sol";legacy 裸 "gpt-5.5" 自动迁移到 gpt-5.6-sol)。未配置 / 无法
+ * 识别 → null(调用方回落到硬编码登录默认 Fable 5)。
  * 返回的档位仍会经 Session 构造器的 normalizeFixedModelSelection —— 未配置
  * token 的 GLM 会在那里回落到 Fable 5,不会让新群默认就落到打不通的未鉴权
  * API 路由。让只订阅 GLM 的用户设 default_model="glm" 后首条消息直接走 GLM。 */
@@ -129,9 +131,12 @@ export function configuredDefaultSelection(): {
 } | null {
   const raw = config.claude.defaultModel?.trim()
   if (!raw) return null
-  const wanted = raw.startsWith('claude:') || raw.startsWith('codex:') || raw === 'gpt-5.5'
-    ? raw
-    : `claude:${raw}`
+  // legacy:内建 codex 档从 gpt-5.5 升级到 gpt-5.6-sol(2026-07-09),旧 config
+  // 写的裸 "gpt-5.5" 迁移到新内建档,不让老配置静默退回 Fable 5。
+  const bare = raw === 'gpt-5.5' ? 'gpt-5.6-sol' : raw
+  const wanted = bare.startsWith('claude:') || bare.startsWith('codex:') || bare === 'gpt-5.6-sol'
+    ? bare
+    : `claude:${bare}`
   const hit = [...FIXED_MODEL_CHOICES, ...codexModelChoices()].find(c => c.model === wanted)
   if (!hit) return null
   return { provider: hit.provider, model: hit.model, effort: resolvedEffort(hit) }
@@ -269,7 +274,7 @@ export async function onModelEffortSelect(
   if (provider === 'codex' && codexModelIsApiRoute(model) && !codexModelConfigured(model)) {
     return {
       ok: false,
-      message: `Codex API 档位(${model})未配置:请在 ~/.config/lodestar/config.toml 的 [codex.models.<slug>] 填写 base_url、api_key(或 requires_openai_auth)和 model 后重试(内建 gpt-5.5 走全局 codex 配置,无需配置)`,
+      message: `Codex API 档位(${model})未配置:请在 ~/.config/lodestar/config.toml 的 [codex.models.<slug>] 填写 base_url、api_key(或 requires_openai_auth)和 model 后重试(内建 gpt-5.6-sol 走全局 codex 配置,无需配置)`,
     }
   }
   const choice = panel?.models.find(m => m.model === model && (m.provider ?? 'codex') === provider)

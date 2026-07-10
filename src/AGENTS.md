@@ -76,7 +76,7 @@
 - `wt` 命令的 Git 操作集中在 `worktree.ts`；不要在 `session.ts` 里散写 `git` shell 命令。
 - `agy <prompt>` 的 CLI 参数、PATH 和 Git 快照集中在 `agy-task.ts`；session 侧进程生命周期、输出收集、状态刷新和卡片接线集中在 `session-agy.ts`。
 - `task` 面板按钮由 `session-tasklist.ts` 处理，持久状态集中在 `tasklist.ts`，后台自动化集中在 `tasklist-worker.ts`；不要把轮询、进程状态或 Git 产物逻辑塞进卡片模板。
-- `model` 命令为固定二元选项(codex=gpt-5.5/xhigh、claude=claude:glm/max),effort 锁死一键生效,不动态拉取 `model/list`。
+- `model` 命令为固定选项(codex 内建=gpt-5.6-sol/ultra、claude 第一方=Fable 5/Opus 4.8 均 max、glm=effort 随 config),effort 锁死一键生效,不动态拉取 `model/list`。
 - Codex 子进程协议集中在 `codex-process.ts`；新增 app-server 方法或通知映射时要同时考虑 `Session` 事件处理和卡片展示。
 - Card Kit 写操作必须经过 `cardkit.ts` 的队列和 sequence 逻辑；不要从 session 或脚本直接 `fetch` 修改同一张生产卡。
 - 处理附件、文件返回和项目目录时使用 `feishu.ts` 里的 sanitizer、upload/download/provision helper。

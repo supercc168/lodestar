@@ -38,7 +38,9 @@ const COMMENT_OUTPUT_LIMIT = 15_000
 const PLAN_TIMEOUT_MS = 60 * 60 * 1000
 const EXEC_TIMEOUT_MS = 180 * 60 * 1000
 const KILL_AFTER_MS = 5000
-const CODEX_MODEL = process.env.LODESTAR_TASK_CODEX_MODEL ?? 'gpt-5.5'
+const CODEX_MODEL = process.env.LODESTAR_TASK_CODEX_MODEL ?? 'gpt-5.6-sol'
+// 后台任务评审自动触发、量大,默认 xhigh 控成本(ultra 是模型内多智能体,
+// token 消耗高);想要最高档用 LODESTAR_TASK_CODEX_EFFORT=ultra 覆盖。
 const CODEX_REASONING_EFFORT = process.env.LODESTAR_TASK_CODEX_EFFORT ?? 'xhigh'
 
 let timer: ReturnType<typeof setInterval> | null = null
@@ -365,7 +367,7 @@ async function runCodexPlan(
     `你是 ${projectName} 项目的任务讨论者。`,
     '请结合项目实情，对这个需求做简单评审；不执行、不修改文件，可以帮着扩展想法。',
     '如果任务中有明确的询问性质内容，必须认真回答。',
-    '最终回答以 gpt-5.5 的身份输出，内容会直接发到飞书任务评论区。',
+    `最终回答以 ${CODEX_MODEL} 的身份输出，内容会直接发到飞书任务评论区。`,
     '',
     '任务完整结构化数据：',
     jsonBlock(structured),

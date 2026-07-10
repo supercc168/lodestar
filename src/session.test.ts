@@ -401,20 +401,25 @@ describe('normalizeFixedModelSelection ([codex.models.*] api 档位)', () => {
     }
   })
 
-  test('未配置的 codex api 档位(缺 model)回落 gpt-5.5/xhigh', () => {
+  test('未配置的 codex api 档位(缺 model)回落 gpt-5.6-sol/ultra', () => {
     const prev = config.codex.models
     ;(config.codex as any).models = { broken: { base_url: 'https://x', api_key: 'sk' } }
     try {
       const r = normalizeFixedModelSelection('codex', 'codex:broken', null)
-      expect(r.model).toBe('gpt-5.5')
-      expect(r.effort).toBe('xhigh')
+      expect(r.model).toBe('gpt-5.6-sol')
+      expect(r.effort).toBe('ultra')
     } finally {
       ;(config.codex as any).models = prev
     }
   })
 
-  test('裸 gpt-5.5 保持登录默认档', () => {
-    expect(normalizeFixedModelSelection('codex', 'gpt-5.5', null).model).toBe('gpt-5.5')
+  test('裸 gpt-5.6-sol 保持登录默认档', () => {
+    expect(normalizeFixedModelSelection('codex', 'gpt-5.6-sol', null).model).toBe('gpt-5.6-sol')
+  })
+
+  test('legacy 裸 gpt-5.5(旧持久化)归一到 gpt-5.6-sol/ultra', () => {
+    expect(normalizeFixedModelSelection('codex', 'gpt-5.5', 'xhigh'))
+      .toEqual({ model: 'gpt-5.6-sol', effort: 'ultra' })
   })
 })
 
@@ -430,6 +435,18 @@ describe('configuredDefaultSelection ([codex] api 档位)', () => {
       expect(configuredDefaultSelection()).toEqual({ provider: 'codex', model: 'codex:kimi', effort: 'high' })
     } finally {
       ;(config.codex as any).models = prevModels
+      ;(config.claude as any).defaultModel = prevDefault
+    }
+  })
+
+  test('default_model 裸 gpt-5.6-sol → 内建 codex 档;legacy 裸 gpt-5.5 自动迁移', () => {
+    const prevDefault = config.claude.defaultModel
+    try {
+      ;(config.claude as any).defaultModel = 'gpt-5.6-sol'
+      expect(configuredDefaultSelection()).toEqual({ provider: 'codex', model: 'gpt-5.6-sol', effort: 'ultra' })
+      ;(config.claude as any).defaultModel = 'gpt-5.5'
+      expect(configuredDefaultSelection()).toEqual({ provider: 'codex', model: 'gpt-5.6-sol', effort: 'ultra' })
+    } finally {
       ;(config.claude as any).defaultModel = prevDefault
     }
   })
@@ -522,9 +539,9 @@ describe('Fixed model selection normalization', () => {
       .toEqual({ model: 'claude:fable', effort: 'max' })
   })
 
-  test('normalizes any Codex selection to the fixed GPT-5.5 / xhigh', () => {
+  test('normalizes any Codex selection to the fixed GPT-5.6 Sol / ultra', () => {
     expect(normalizeFixedModelSelection('codex', 'gpt-4', 'low'))
-      .toEqual({ model: 'gpt-5.5', effort: 'xhigh' })
+      .toEqual({ model: 'gpt-5.6-sol', effort: 'ultra' })
   })
 })
 
