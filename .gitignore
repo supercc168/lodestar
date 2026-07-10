@@ -11,6 +11,9 @@ node_modules/
 # OMC operational state (oh-my-claudecode runtime artifacts)
 .omc/
 
+# Claude Code operational state (worktrees, local settings)
+.claude/
+
 # Local override config (if dropped in repo for testing)
 config.toml
 
