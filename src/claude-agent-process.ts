@@ -199,10 +199,10 @@ export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): Cl
       description: `windows-shell-shim:${bin}`,
     }
   }
-  return {
-    pathToClaudeCodeExecutable: bin,
-    description: bin,
-  }
+  // 非 windows 且未配 [claude].bin:不设 pathToClaudeCodeExecutable。显式指定会让
+  // claude 走 CLI 二进制的 stream-json 模式,该模式不下发 AskUserQuestion 等 dialog
+  // 工具;SDK 默认入口才会下发。需要显式指定时用 [claude].bin(走 configured 分支)。
+  return { description: 'sdk-default' }
 }
 
 function whichClaude(lookup: ClaudePathLookup = {}): string | null {
