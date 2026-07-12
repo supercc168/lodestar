@@ -379,6 +379,10 @@ export class CodexProcess extends EventEmitter {
 
     const compaction = contextCompactionNoticeFromMessage(msg)
     if (compaction) {
+      if (this.isForeignThread(compaction.threadId)) {
+        log(`codex-process: ignore raw context compaction for child thread=${compaction.threadId} primary=${this.knownPrimaryThreadId()}`)
+        return
+      }
       const notice = this.withSessionId(compaction)
       logContextCompactionPayload(compaction.sourceMethod ?? 'raw_message', msg, notice)
       this.emit('context_compacted', notice)
@@ -390,6 +394,17 @@ export class CodexProcess extends EventEmitter {
   }
 
   private handleNotification(method: string, params: any): void {
+    // A single app-server also reports collab/sub-agent threads. Only the
+    // primary thread owns this process's Session card and turn lifecycle.
+    const notificationThreadId = params?.threadId ?? params?.thread_id ??
+      (method === 'thread/started' ? params?.thread?.id : undefined)
+    if (this.isForeignThread(notificationThreadId)) {
+      const itemType = params?.item?.type
+      if (method === 'turn/started' || method === 'turn/completed' || itemType === 'contextCompaction') {
+        log(`codex-process: ignore ${method}${itemType ? ` (${itemType})` : ''} for child thread=${notificationThreadId} primary=${this.knownPrimaryThreadId()}`)
+      }
+      return
+    }
     const compaction = contextCompactionNoticeFromNotification(method, params)
     if (compaction) {
       const notice = this.withSessionId(compaction)
@@ -520,6 +535,15 @@ export class CodexProcess extends EventEmitter {
     this.emit('raw', { method, params })
   }
 
+  private knownPrimaryThreadId(): string | null {
+    return this.sessionId ?? this.opts.resumeSessionId ?? null
+  }
+
+  private isForeignThread(threadId: unknown): threadId is string {
+    const primaryThreadId = this.knownPrimaryThreadId()
+    return typeof threadId === 'string' && !!threadId && !!primaryThreadId && threadId !== primaryThreadId
+  }
+
   private handleItemStarted(params: any): void {
     const item = params?.item
     if (!item?.id) {
@@ -646,6 +670,12 @@ export class CodexProcess extends EventEmitter {
   private handleServerRequest(req: any): void {
     const requestId = String(req.id)
     this.serverRequests.set(requestId, { id: req.id, method: req.method, params: req.params })
+    const requestThreadId = req.params?.threadId ?? req.params?.thread_id
+    if (this.isForeignThread(requestThreadId)) {
+      log(`codex-process: reject ${req.method} for child thread=${requestThreadId} primary=${this.knownPrimaryThreadId()}`)
+      this.respondError(requestId, 'server request belongs to a child thread')
+      return
+    }
     switch (req.method) {
       case 'item/commandExecution/requestApproval': {
         const p = req.params ?? {}

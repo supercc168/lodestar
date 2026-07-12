@@ -137,6 +137,118 @@ describe('codex process compaction notifications', () => {
     expect(compacted).toHaveLength(1)
   })
 
+  test('ignores child-thread completion and compaction while the primary turn is running', () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const events: string[] = []
+    proc.opts = { workDir: '/tmp' }
+    proc.sessionId = 'primary-thread'
+    proc.currentTurnId = 'primary-turn'
+    proc.lastUsage = null
+    proc.emit = (event: string) => {
+      events.push(event)
+      return true
+    }
+
+    proc.handleNotification('thread/started', {
+      thread: { id: 'child-thread' },
+    })
+    proc.handleNotification('turn/started', {
+      threadId: 'child-thread',
+      turn: { id: 'child-turn' },
+    })
+    proc.handleNotification('turn/completed', {
+      threadId: 'child-thread',
+      turn: { id: 'child-turn', status: 'completed' },
+    })
+    proc.handleNotification('item/completed', {
+      threadId: 'child-thread',
+      turnId: 'child-turn',
+      item: { type: 'contextCompaction', id: 'child-compact' },
+    })
+    proc.handleMessage({
+      type: 'context_compacted',
+      threadId: 'child-thread',
+      turnId: 'child-turn',
+    })
+
+    expect(proc.sessionId).toBe('primary-thread')
+    expect(proc.currentTurnId).toBe('primary-turn')
+    expect(events).toEqual([])
+
+    proc.handleNotification('item/completed', {
+      threadId: 'primary-thread',
+      turnId: 'primary-turn',
+      item: { type: 'contextCompaction', id: 'primary-compact' },
+    })
+    proc.handleNotification('turn/completed', {
+      threadId: 'primary-thread',
+      turn: { id: 'primary-turn', status: 'completed' },
+    })
+
+    expect(events).toEqual(['context_compacted', 'result'])
+    expect(proc.currentTurnId).toBeNull()
+  })
+
+  test('uses the requested resume thread as the primary filter before init completes', () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    proc.opts = { workDir: '/tmp', resumeSessionId: 'resume-thread' }
+    proc.sessionId = null
+
+    proc.handleNotification('thread/started', {
+      thread: { id: 'child-thread' },
+    })
+    expect(proc.sessionId).toBeNull()
+
+    proc.handleNotification('thread/started', {
+      thread: { id: 'resume-thread' },
+    })
+    expect(proc.sessionId).toBe('resume-thread')
+  })
+
+  test('rejects child-thread server requests without exposing them to the primary session', () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const events: string[] = []
+    const responses: any[] = []
+    proc.opts = { workDir: '/tmp' }
+    proc.sessionId = 'primary-thread'
+    proc.serverRequests = new Map()
+    proc.emit = (event: string) => {
+      events.push(event)
+      return true
+    }
+    proc.write = (response: any) => responses.push(response)
+
+    proc.handleMessage({
+      id: 1,
+      method: 'item/tool/requestUserInput',
+      params: {
+        threadId: 'child-thread',
+        itemId: 'child-ask',
+        questions: [],
+      },
+    })
+
+    expect(events).toEqual([])
+    expect(responses).toEqual([{
+      id: 1,
+      error: { message: 'server request belongs to a child thread' },
+    }])
+    expect(proc.serverRequests.size).toBe(0)
+
+    proc.handleMessage({
+      id: 2,
+      method: 'item/tool/requestUserInput',
+      params: {
+        threadId: 'primary-thread',
+        itemId: 'primary-ask',
+        questions: [],
+      },
+    })
+
+    expect(events).toEqual(['tool_use', 'can_use_tool'])
+    expect(proc.serverRequests.has('2')).toBe(true)
+  })
+
   test('maps snake_case image generation fields to a sendable result path', () => {
     const proc = Object.create(CodexProcess.prototype) as any
     const events: Array<[string, any]> = []
