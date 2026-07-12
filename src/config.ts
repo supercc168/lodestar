@@ -19,6 +19,7 @@
 
 import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
+import { resolve } from 'node:path'
 import { CONFIG_FILE } from './paths'
 // 纯类型/纯解析从 ./config-parse 引入并对外再导出(保持 './config' 公开 API 不变)。
 // 拆分是为了让解析逻辑的单测可从 './config-parse' 导入,不受 mock.module('./config') 污染。
@@ -120,6 +121,12 @@ function expandTilde(v: string): string {
   return v.replace(/^~(?=\/|$)/, homedir())
 }
 
+/** Agent protocols require absolute workspace roots. Resolve relative config
+ * values against the daemon's cwd, preserving their existing runtime target. */
+function resolveProjectPath(v: string): string {
+  return resolve(expandTilde(v))
+}
+
 function parseToml(text: string): Record<string, Record<string, string>> {
   const out: Record<string, Record<string, string>> = { _: {} }
   let section = '_'
@@ -169,7 +176,7 @@ function loadConfig(): LodestarConfig {
   if (!appId || !appSecret) {
     throw new Error(`lodestar: ${CONFIG_FILE} is missing [feishu].app_id / [feishu].app_secret`)
   }
-  const projectsRoot = expandTilde(t.runtime?.projects_root ?? homedir())
+  const projectsRoot = resolveProjectPath(t.runtime?.projects_root ?? homedir())
   const notifyBind = t.notify?.bind ?? '127.0.0.1'
   const notifyPortRaw = t.notify?.port ?? '9876'
   const notifyPort = Number.parseInt(notifyPortRaw, 10)
@@ -239,7 +246,9 @@ function loadConfig(): LodestarConfig {
       for (const [rawKey, value] of Object.entries(section)) {
         if (typeof value !== 'string' || value.length === 0) continue
         switch (rawKey.trim()) {
-          case 'cwd': profile.cwd = value; break
+          case 'cwd':
+            if (value.trim()) profile.cwd = resolveProjectPath(value)
+            break
           // 原样存储;`"auto"` 与白名单校验在 settingSourcesFromProfile 处理
           case 'setting_sources': profile.settingSources = value; break
           case 'strict_mcp': profile.strictMcp = value === 'true'; break
