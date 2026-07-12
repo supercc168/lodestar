@@ -12,8 +12,7 @@ import {
   type SDKUserMessage,
   type SpawnOptions as ClaudeSdkSpawnOptions,
   type SpawnedProcess,
-  type UserDialogRequest,
-  type UserDialogResult,
+  type PermissionResult,
 } from '@anthropic-ai/claude-agent-sdk'
 import { config, type ProjectProfile } from './config'
 import { log } from './log'
@@ -69,7 +68,7 @@ class AsyncQueue<T> implements AsyncIterableIterator<T> {
 
 type PendingUserDialog = {
   kind: 'dialog'
-  resolve: (value: UserDialogResult) => void
+  resolve: (value: PermissionResult) => void
   request: CanUseToolRequest
   cleanup?: () => void
 }
@@ -461,14 +460,11 @@ function mapModelInfo(info: ModelInfo): CodexModel {
   }
 }
 
-const CLAUDE_ASK_DIALOG_KINDS = [
-  'ask_user_question',
-  'askUserQuestion',
-  'AskUserQuestion',
-] as const
-
-export const CLAUDE_PERMISSION_MODE = 'bypassPermissions' as const
-export const CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS = true
+// default(非 bypassPermissions):AskUserQuestion 经 canUseTool 下发,host 才能
+// 拦下渲染卡片。bypassPermissions 会 shadow 掉 canUseTool(SDK 警告
+// CLAUDE_SDK_CAN_USE_TOOL_SHADOWED),AskUserQuestion 被秒批空答案、模型不等用户。
+// 普通工具的"不弹审批"语义改由 canUseTool 内部秒放复刻。
+export const CLAUDE_PERMISSION_MODE = 'default' as const
 
 /** Default setting sources when no project profile overrides them.
  * Matches the bare `claude` CLI (user + project + local) so a project's
@@ -519,14 +515,6 @@ export function readProjectMcpServers(workDir: string): Record<string, unknown> 
     log(`claude-agent-process: project .mcp.json parse failed at ${mcpPath}: ${e}`)
     return undefined
   }
-}
-
-function normalizeAskDialogInput(request: UserDialogRequest): Record<string, unknown> | null {
-  if (!CLAUDE_ASK_DIALOG_KINDS.includes(request.dialogKind as any)) return null
-  const payload = request.payload && typeof request.payload === 'object' ? request.payload : {}
-  const questions = normalizeDialogQuestions(payload)
-  if (questions.length === 0) return null
-  return { ...payload, questions }
 }
 
 function normalizeDialogQuestions(payload: Record<string, unknown>): Array<Record<string, unknown>> {
@@ -706,7 +694,6 @@ export class ClaudeAgentProcess extends EventEmitter {
             ? { spawnClaudeCodeProcess: executable.spawnClaudeCodeProcess }
             : {}),
           permissionMode: CLAUDE_PERMISSION_MODE,
-          allowDangerouslySkipPermissions: CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS,
           env: {
             ...(process.env as Record<string, string>),
             PATH: buildClaudeSpawnPath(),
@@ -719,8 +706,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           toolConfig: {
             askUserQuestion: { previewFormat: 'markdown' },
           },
-          supportedDialogKinds: [...CLAUDE_ASK_DIALOG_KINDS],
-          onUserDialog: (request, options) => this.onUserDialog(request, options),
+          canUseTool: (toolName, input, opts) => this.canUseTool(toolName, input, opts),
           includePartialMessages: false,
           systemPrompt: {
             type: 'preset',
@@ -780,8 +766,8 @@ export class ClaudeAgentProcess extends EventEmitter {
     decision: 'allow' | 'deny',
     payload?: { updatedInput?: Record<string, unknown>; updatedPermissions?: unknown; denyMessage?: string },
   ): void {
-    // bypassPermissions 模式下权限审批永不触发;此方法现在只服务于
-    // onUserDialog(AskUserQuestion):allow = 回填 answers,deny = 取消。
+    // default 模式下 canUseTool 是唯一权限入口;此方法同时服务于两条路:
+    // AskUserQuestion(allow 回填 answers / deny 取消)和普通工具审批卡片。
     const pending = this.pendingPermissions.get(String(requestId))
     if (!pending) {
       log(`claude-agent-process: permission response for unknown request ${requestId}`)
@@ -790,13 +776,14 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.pendingPermissions.delete(String(requestId))
     pending.cleanup?.()
     if (decision === 'allow') {
-      const updatedInput = payload?.updatedInput ?? {}
+      // allow 的 updatedInput 运行时必填(SDK Zod 校验,比 .d.ts 可选更严):给空=不改。
       pending.resolve({
-        behavior: 'completed',
-        result: 'answers' in updatedInput ? updatedInput.answers : updatedInput,
+        behavior: 'allow',
+        updatedInput: payload?.updatedInput ?? {},
       })
     } else {
-      pending.resolve({ behavior: 'cancelled' })
+      // deny 的 message 同样必填;空字符串=无附加说明。
+      pending.resolve({ behavior: 'deny', message: payload?.denyMessage ?? '' })
     }
   }
 
@@ -868,36 +855,45 @@ export class ClaudeAgentProcess extends EventEmitter {
     ].join('\n'))
   }
 
-  private onUserDialog(
-    request: UserDialogRequest,
-    options: { signal: AbortSignal },
-  ): Promise<UserDialogResult> {
-    const input = normalizeAskDialogInput(request)
-    if (!input) {
-      log(`claude-agent-process: cancel unsupported user dialog kind=${request.dialogKind}`)
-      return Promise.resolve({ behavior: 'cancelled' })
+  private canUseTool(
+    toolName: string,
+    input: Record<string, unknown>,
+    options: { signal: AbortSignal; toolUseID: string },
+  ): Promise<PermissionResult> {
+    // 非 AskUserQuestion:秒放,复刻旧 bypassPermissions「不弹审批」语义。
+    // default 模式下 canUseTool 对每个需权限的工具都会被调,这里只拦 AskUserQuestion。
+    if (toolName !== 'AskUserQuestion') {
+      return Promise.resolve({ behavior: 'allow', updatedInput: input })
     }
-    const requestId = `claude_dialog_${++this.requestCounter}`
-    const toolUseId = request.toolUseID || requestId
+    // AskUserQuestion:SDK 把它当权限工具经 canUseTool 下发。host 渲染卡片、等用户
+    // 点选,再以 allow + updatedInput.answers 回送,模型据此续跑。
+    const questions = normalizeDialogQuestions(input)
+    if (questions.length === 0) {
+      log('claude-agent-process: AskUserQuestion 无有效 questions — allow 原样')
+      return Promise.resolve({ behavior: 'allow', updatedInput: input })
+    }
+    const normalizedInput = { ...input, questions }
+    const requestId = `claude_perm_${++this.requestCounter}`
+    const toolUseId = options.toolUseID || requestId
     const req: CanUseToolRequest = {
       request_id: requestId,
       tool_name: 'AskUserQuestion',
-      input,
+      input: normalizedInput,
       tool_use_id: toolUseId,
     }
-    const pending = new Promise<UserDialogResult>(resolve => {
-      const finish = (value: UserDialogResult) => {
+    const pending = new Promise<PermissionResult>(resolve => {
+      const finish = (value: PermissionResult) => {
         options.signal.removeEventListener('abort', abort)
         resolve(value)
       }
       const abort = () => {
         if (!this.pendingPermissions.delete(requestId)) return
-        finish({ behavior: 'cancelled' })
+        finish({ behavior: 'deny', message: 'aborted' })
       }
       options.signal.addEventListener('abort', abort, { once: true })
       this.pendingPermissions.set(requestId, { kind: 'dialog', resolve: finish, request: req })
     })
-    this.emitToolUseOnce(toolUseId, 'AskUserQuestion', input, null)
+    this.emitToolUseOnce(toolUseId, 'AskUserQuestion', normalizedInput, null)
     this.emit('can_use_tool', req)
     return pending
   }
