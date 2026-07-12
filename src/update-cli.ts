@@ -35,7 +35,7 @@ function runNpmInstall(): Promise<number> {
   return new Promise((resolve) => {
     const child = spawn(
       npm,
-      ['install', '-g', ...UPDATE_PACKAGES],
+      ['install', '-g', '--include=optional', ...UPDATE_PACKAGES],
       { stdio: 'inherit', shell: process.platform === 'win32' },
     )
     child.on('exit', (code) => resolve(code ?? 1))
