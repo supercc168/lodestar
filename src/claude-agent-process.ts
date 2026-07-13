@@ -694,11 +694,17 @@ export class ClaudeAgentProcess extends EventEmitter {
             ? { spawnClaudeCodeProcess: executable.spawnClaudeCodeProcess }
             : {}),
           permissionMode: CLAUDE_PERMISSION_MODE,
-          env: {
-            ...(process.env as Record<string, string>),
-            PATH: buildClaudeSpawnPath(),
-            ...config.claude.env,
-          },
+          env: this.opts.transformEnv
+            ? this.opts.transformEnv({
+                ...(process.env as Record<string, string>),
+                PATH: buildClaudeSpawnPath(),
+                ...config.claude.env,
+              })
+            : {
+                ...(process.env as Record<string, string>),
+                PATH: buildClaudeSpawnPath(),
+                ...config.claude.env,
+              },
           settingSources,
           tools: toolsOption,
           ...(strictMcpConfig ? { strictMcpConfig: true } : {}),

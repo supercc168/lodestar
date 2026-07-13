@@ -51,12 +51,42 @@ export interface LodestarConfig {
   /** Per-project launch profiles keyed by session name (= group name).
    * Empty record ⇒ every project runs with Lodestar defaults. */
   projects: Record<string, ProjectProfile>
+  /** Token source 声明:每个 [token_source.<id>] = 一个账号(凭据 + 模型 + 额度查询)。
+   * 取代散落的 [codex.env] / [claude.env] / ~/.claude/settings.json 全局 env。
+   * daemon 可读写(飞书 config 命令);agent 层(codex/claude 进程)固定不变。 */
+  token_sources: Record<string, TokenSourceConfig>
 }
 
 export interface ClaudeModelConfig {
   display_name?: string
   description?: string
   model?: string
+}
+
+/** Token source 配置(一个账号)。parseToml 只支持标量,故 models/slots 用复合字符串。
+ *  agent       — 'codex' | 'claude'(协议强制)
+ *  auth        — 'chatgpt-login'(codex 订阅)
+ *  base_url + auth_token / api_key — claude 第三方(GLM/DeepSeek/中转)
+ *  bin         — claude 包装器(reclaude)
+ *  model       — 默认模型 slug(codex 下发 gpt-5.6-sol;claude 真实模型走 slots)
+ *  effort      — 默认 effort
+ *  models      — 可选模型列表(逗号分隔,如 'gpt-5.6-sol,gpt-5.5,gpt-5.4')
+ *  slots       — claude 槽位映射 'opus=X,sonnet=Y,haiku=Z'
+ *  usage       — 额度查询策略 'codex-rate-limit' | 'glm-coding-plan' | 'none' */
+export interface TokenSourceConfig {
+  agent?: string
+  display?: string
+  auth?: string
+  base_url?: string
+  auth_token?: string
+  api_key?: string
+  bin?: string
+  model?: string
+  effort?: string
+  models?: string
+  slots?: string
+  usage?: string
+  default?: boolean
 }
 
 /** Per-project agent launch profile, sourced from `[projects.<name>].*`
@@ -195,6 +225,33 @@ function loadConfig(): LodestarConfig {
     }
     return out
   }
+  // [token_source.<id>] 节 —— 每节一个账号(凭据 + 模型 + 额度查询)。
+  const tokenSourceSections = (): Record<string, TokenSourceConfig> => {
+    const out: Record<string, TokenSourceConfig> = {}
+    const prefix = 'token_source.'
+    for (const [sectionName, section] of Object.entries(t)) {
+      if (!sectionName.startsWith(prefix)) continue
+      const id = sectionName.slice(prefix.length).trim()
+      if (!id) continue
+      const cfg: TokenSourceConfig = {}
+      for (const [rawKey, value] of Object.entries(section)) {
+        if (typeof value !== 'string' || value.length === 0) continue
+        const field = rawKey.trim()
+        if (field === 'default') {
+          cfg.default = value === 'true'
+        } else if (
+          field === 'agent' || field === 'display' || field === 'auth' ||
+          field === 'base_url' || field === 'auth_token' || field === 'api_key' ||
+          field === 'bin' || field === 'model' || field === 'effort' ||
+          field === 'models' || field === 'slots' || field === 'usage'
+        ) {
+          ;(cfg as Record<string, string>)[field] = value
+        }
+      }
+      out[id] = cfg
+    }
+    return out
+  }
   // [codex.env] / [claude.env] 节可选 —— 空 record 就维持各 CLI 自己的登录态。
   const codexEnv = envSection('codex.env')
   const claudeEnv = envSection('claude.env')
@@ -206,6 +263,7 @@ function loadConfig(): LodestarConfig {
     codex: { env: codexEnv },
     claude: { bin: claudeBin, env: claudeEnv, models: claudeModelSections() },
     projects: projectSections(),
+    token_sources: tokenSourceSections(),
   }
 }
 

@@ -39,6 +39,8 @@ import {
   type AgentReasoningEffort,
   type ClaudeReasoningEffort,
 } from './agent-process'
+import { getTokenSource, listTokenSourcesByAgent, defaultTokenSourceId, type TokenSource } from './token-source'
+import { clearRollbackWatchdog } from './rollback-watchdog'
 import {
   ClaudeAgentProcess,
   assertClaudeCodeAvailable,
@@ -348,6 +350,9 @@ export class Session {
   selectedProvider: AgentProvider = 'claude'
   selectedModel: string | null = null
   selectedEffort: AgentReasoningEffort | null = null
+  /** 当前 token source id(账号)。token source 决定 agent + 凭据 + 模型 + 额度查询。
+   *  null = 未配 token source,走旧路径(provider/model 自治)。 */
+  selectedTokenSourceId: string | null = null
   modelPanels = new Map<string, sessionModel.ModelPanelState>()
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
@@ -399,6 +404,11 @@ export class Session {
         this.selectedEffort = null
       }
     }
+    // 推导 tokenSourceId(账号):优先持久化值,否则从 provider/model 映射 registry 的 source。
+    // 推导到 token source 后,以 ts.agent 校正 selectedProvider(token source 决定 agent)。
+    this.selectedTokenSourceId = this.deriveTokenSourceId(selection)
+    const derivedTs = getTokenSource(this.selectedTokenSourceId)
+    if (derivedTs) this.selectedProvider = derivedTs.agent
     if (this.selectedModel) {
       log(`session "${sessionName}": restored selected provider=${this.selectedProvider} model=${this.selectedModel} effort=${this.selectedEffort ?? 'unset'}`)
     }
@@ -431,6 +441,25 @@ export class Session {
     return override && override.trim() ? override : join(feishu.PROJECTS_ROOT, baseName)
   }
   isRunning(): boolean { return !!this.proc && this.proc.isAlive() }
+  /** 从持久化 selection 推导 tokenSourceId;无匹配返回 default 或 null(走旧路径)。 */
+  private deriveTokenSourceId(selection: { tokenSourceId?: string; provider?: string; model?: string | null } | null): string | null {
+    const explicit = selection?.tokenSourceId
+    if (typeof explicit === 'string' && getTokenSource(explicit)) return explicit
+    const provider: AgentProvider = (selection?.provider as AgentProvider) ?? this.selectedProvider
+    const model = selection?.model ?? ''
+    const list = listTokenSourcesByAgent(provider === 'codex' ? 'codex' : 'claude')
+    if (provider === 'claude' && model.includes('glm')) {
+      const glm = list.find(s => s.id === 'glm') ?? list[0]
+      if (glm) return glm.id
+    }
+    return list[0]?.id ?? defaultTokenSourceId()
+  }
+
+  /** 当前 token source(账号);未配返回 undefined → 调用方走旧路径 fallback。 */
+  currentTokenSource(): TokenSource | undefined {
+    return getTokenSource(this.selectedTokenSourceId)
+  }
+
   currentProvider(): AgentProvider { return this.selectedProvider }
 
   hasRunningPeerSession(sessionName: string): boolean {
@@ -512,26 +541,34 @@ export class Session {
     const sid = fs?.resumeSessionId ?? resumeSessionId
     const resumeSessionAt = fs?.resumeSessionAt
     const forkSession = !!fs
+    const ts = this.currentTokenSource()
+    const transformEnv = ts
+      ? (base: Record<string, string | undefined>) => ts.spawnEnv(base)
+      : undefined
+    // 有 token source:下发 ts.resolveSpawnModel(默认或面板选的模型);无:走旧 modelForSpawn
+    const tsModel = ts ? ts.resolveSpawnModel(this.selectedModel ?? ts.defaultModel) : this.modelForSpawn()
     if (this.selectedProvider === 'claude') {
       assertClaudeCodeAvailable()
       return new ClaudeAgentProcess({
         workDir: this.workDir,
-        model: this.modelForSpawn(),
+        model: tsModel,
         effort: this.claudeEffortForSpawn(),
         resumeSessionId: sid,
         resumeSessionAt,
         forkSession,
         appendSystemPrompt: this.spawnDeveloperInstructions(),
         profile: feishu.projectProfile(feishu.tempProjectName(this.sessionName) ?? this.sessionName),
+        transformEnv,
       })
     }
     // Codex 不支持 resumeSessionAt/forkSession —— fork 退化成普通 resume(Codex 路径暂不做分叉/回滚)。
     return new CodexProcess({
       workDir: this.workDir,
-      model: this.modelForSpawn(),
+      model: tsModel,
       effort: this.effortForSpawn(),
       resumeSessionId: sid,
       appendSystemPrompt: this.spawnDeveloperInstructions(),
+      transformEnv,
     })
   }
 
@@ -1872,6 +1909,7 @@ export class Session {
       log(`session "${this.sessionName}": ${p.provider} process error: ${err}`)
     })
     p.on('init', () => {
+      clearRollbackWatchdog()  // dead-man's switch: 会话 init 成功 = 我起来了,清回滚看门狗
       this.persistResumableSessionId()
       this.initCount++
       log(`session "${this.sessionName}": SDK init#${this.initCount} pendingCount=${this.pendingUserMessageCount} midBuffer=${this.pendingMidTurnMsgs.length} currentTurn=${this.currentTurn ? 'yes' : 'no'} openingTurn=${this.openingTurn}`)

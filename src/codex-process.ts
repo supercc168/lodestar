@@ -72,6 +72,8 @@ export interface SpawnOpts {
   model?: string
   effort?: CodexReasoningEffort
   appendSystemPrompt?: string
+  /** token source 注入:对 spawn env 做 scrub+inject(防 A 账号夹带 B 凭据)。未传 = 走 config 默认。 */
+  transformEnv?: (env: Record<string, string | undefined>) => Record<string, string | undefined>
 }
 
 export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh'
@@ -258,16 +260,17 @@ export class CodexProcess extends EventEmitter {
     const codexBin = resolveCodexBin()
     const args = ['app-server', '--listen', 'stdio://']
     log(`codex-process: spawn ${codexBin} app-server (cwd=${opts.workDir})`)
+    const baseEnv = {
+      ...(process.env as Record<string, string>),
+      NPM_CONFIG_LOGLEVEL: 'error',
+      PATH: buildSpawnPath(),
+      ...config.codex.env,
+    }
     this.proc = spawn(codexBin, args, {
       cwd: opts.workDir,
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: process.platform === 'win32',
-      env: {
-        ...(process.env as Record<string, string>),
-        NPM_CONFIG_LOGLEVEL: 'error',
-        PATH: buildSpawnPath(),
-        ...config.codex.env,
-      },
+      env: opts.transformEnv ? opts.transformEnv(baseEnv) : baseEnv,
     }) as ChildProcessByStdio<Writable, Readable, Readable>
 
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))
@@ -770,13 +773,15 @@ export class CodexProcess extends EventEmitter {
   }
 
   private threadParams(): Record<string, unknown> {
-    // codex 后端走 ~/.codex/config.toml:model / model_reasoning_effort 不由 lodestar 下发,
-    // 与裸 codex CLI 行为对齐(飞书=CLI)。订阅升级模型只改 config.toml 即可生效。
+    // model/effort 由 token source 决定、经 opts 下发(取代自治 ~/.codex/config.toml)。
+    // opts 为空(无 token source,如旧路径)则不下发,走 codex 原生配置 —— 平滑过渡。
     return {
       cwd: this.opts.workDir,
       runtimeWorkspaceRoots: [this.opts.workDir],
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
+      ...(this.opts.model ? { model: this.opts.model } : {}),
+      ...(this.opts.effort ? { effort: this.opts.effort } : {}),
       ...(this.opts.appendSystemPrompt ? { developerInstructions: this.opts.appendSystemPrompt } : {}),
       serviceName: 'lodestar',
     }

@@ -740,6 +740,10 @@ function startDebugSocket(): void {
 
 async function boot(): Promise<void> {
   log(`lodestar-daemon: pid ${process.pid} starting`)
+  // token source registry 先于 session 构建填充:session 构造会查 registry 推导 tokenSourceId。
+  // config.toml [token_source.*] 在此落地为可用的 TokenSource。
+  const { buildTokenSourcesFromConfig } = await import('./src/token-source-builtins')
+  buildTokenSourcesFromConfig()
   feishu.loadSessionChatMap()
   feishu.loadSessionResumeMap()
   feishu.loadSessionTurnsMap()
