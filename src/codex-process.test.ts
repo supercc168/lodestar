@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
+import { Writable } from 'node:stream'
 
 import {
   buildCodexAppServerArgs,
@@ -28,6 +29,375 @@ function notificationHarness(): { proc: any; events: Array<[string, any]> } {
   }
   return { proc, events }
 }
+
+function deferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((res, rej) => {
+    resolve = res
+    reject = rej
+  })
+  return { promise, resolve, reject }
+}
+
+function pendingTurnStartFixture(threadId: string): {
+  proc: any
+  resolveTurnStart: (value: unknown) => void
+  rejectTurnStart: (error: Error) => void
+  resultEvents: any[]
+} {
+  const proc = Object.create(CodexProcess.prototype) as any
+  const turnStart = deferred<unknown>()
+  const resultEvents: any[] = []
+  proc.opts = { workDir: '/tmp', effort: 'high' }
+  proc.sessionId = threadId
+  proc.alive = true
+  proc.deliveryCounter = 0
+  proc.pendingTurnStart = null
+  proc.currentTurnId = null
+  proc.lastUsage = null
+  proc.emittedImageGenerationIds = new Set()
+  proc.flushRolloutImageGenerations = () => {}
+  proc.startTurn = () => turnStart.promise
+  proc.emit = (event: string, payload: unknown) => {
+    if (event === 'result') resultEvents.push(payload)
+    return true
+  }
+  return {
+    proc,
+    resolveTurnStart: turnStart.resolve,
+    rejectTurnStart: turnStart.reject,
+    resultEvents,
+  }
+}
+
+function requestFailureTurnStartFixture(
+  threadId: string,
+  stdin: { write: (...args: any[]) => unknown },
+): { proc: any; resultEvents: any[] } {
+  const proc = Object.create(CodexProcess.prototype) as any
+  const resultEvents: any[] = []
+  proc.opts = { workDir: '/tmp', effort: 'high' }
+  proc.sessionId = threadId
+  proc.readyPromise = Promise.resolve()
+  proc.alive = true
+  proc.deliveryCounter = 0
+  proc.pendingTurnStart = null
+  proc.currentTurnId = null
+  proc.lastUsage = null
+  proc.requestCounter = 0
+  proc.pending = new Map()
+  proc.proc = { stdin }
+  proc.emit = (event: string, payload: unknown) => {
+    if (event === 'result') resultEvents.push(payload)
+    return true
+  }
+  return { proc, resultEvents }
+}
+
+async function receiptWithin(dispatch: any, timeoutMs = 50): Promise<any> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      dispatch.settlement,
+      new Promise(resolve => {
+        timer = setTimeout(() => resolve({ kind: 'timeout' }), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+describe('codex turn/start delivery receipt', () => {
+  test('turn/started ACK wins over a later RPC rejection', async () => {
+    const { proc, rejectTurnStart, resultEvents } = pendingTurnStartFixture('thread-1')
+    const dispatch = proc.sendUserText('hello') as any
+    expect(dispatch.kind).toBe('turn_start_pending')
+
+    proc.handleNotification('turn/started', {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1' },
+    })
+    rejectTurnStart(new Error('late reject'))
+
+    expect(await dispatch.settlement).toEqual({
+      kind: 'ack',
+      deliveryId: dispatch.deliveryId,
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+    })
+    await Promise.resolve()
+    expect(resultEvents).toEqual([])
+  })
+
+  test('RPC rejection settles rejected without throwing from the receipt', async () => {
+    const { proc, rejectTurnStart, resultEvents } = pendingTurnStartFixture('thread-1')
+    const dispatch = proc.sendUserText('hello') as any
+    rejectTurnStart(new Error('rejected'))
+
+    const settlement = await dispatch.settlement
+    expect(settlement).toMatchObject({
+      kind: 'rejected',
+      deliveryId: dispatch.deliveryId,
+      threadId: 'thread-1',
+    })
+    expect(settlement.error).toBeInstanceOf(Error)
+    expect(resultEvents).toContainEqual(expect.objectContaining({
+      subtype: 'codex_turn_start_failed',
+      delivery_id: dispatch.deliveryId,
+      thread_id: 'thread-1',
+    }))
+  })
+
+  test('a dead process settles rejected instead of hanging', async () => {
+    const { proc } = requestFailureTurnStartFixture('thread-dead', { write: () => {} })
+    proc.alive = false
+    const dispatch = proc.sendUserText('hello') as any
+
+    expect(await receiptWithin(dispatch)).toMatchObject({
+      kind: 'rejected',
+      deliveryId: dispatch.deliveryId,
+      threadId: 'thread-dead',
+    })
+  })
+
+  test('a stdin write failure settles rejected instead of hanging', async () => {
+    const { proc } = requestFailureTurnStartFixture('thread-write-failed', {
+      write: () => {
+        throw new Error('stdin closed')
+      },
+    })
+    const dispatch = proc.sendUserText('hello') as any
+
+    expect(await receiptWithin(dispatch)).toMatchObject({
+      kind: 'rejected',
+      deliveryId: dispatch.deliveryId,
+      threadId: 'thread-write-failed',
+    })
+  })
+
+  test('an asynchronous stdin EPIPE rejects the registered request and receipt', async () => {
+    const epipe = Object.assign(new Error('broken pipe'), { code: 'EPIPE' })
+    let failWrite: (() => void) | null = null
+    const stdin = new Writable({
+      write(_chunk, _encoding, callback) {
+        failWrite = () => callback(epipe)
+      },
+    })
+    const { proc } = requestFailureTurnStartFixture('thread-async-write-failed', stdin)
+    const dispatch = proc.sendUserText('hello') as any
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(proc.pending.size).toBe(1)
+    expect(failWrite).not.toBeNull()
+    failWrite!()
+
+    expect(await receiptWithin(dispatch)).toMatchObject({
+      kind: 'rejected',
+      deliveryId: dispatch.deliveryId,
+      threadId: 'thread-async-write-failed',
+      error: expect.objectContaining({ code: 'EPIPE' }),
+    })
+    expect(proc.pending.size).toBe(0)
+    await new Promise(resolve => setImmediate(resolve))
+  })
+
+  test('turn/completed before the RPC response ACKs once with the same delivery identity', async () => {
+    const { proc, resolveTurnStart, resultEvents } = pendingTurnStartFixture('thread-1')
+    const dispatch = proc.sendUserText('hello') as any
+    proc.handleNotification('turn/completed', {
+      threadId: 'thread-1',
+      turn: { id: 'turn-1', status: 'completed' },
+    })
+    resolveTurnStart({ turn: { id: 'turn-1' } })
+
+    expect(await dispatch.settlement).toEqual({
+      kind: 'ack',
+      deliveryId: dispatch.deliveryId,
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+    })
+    await Promise.resolve()
+    expect(resultEvents).toEqual([
+      expect.objectContaining({
+        delivery_id: dispatch.deliveryId,
+        thread_id: 'thread-1',
+        turn_id: 'turn-1',
+      }),
+    ])
+  })
+
+  test('an RPC ACK binds the turn early enough for an immediate interrupt', async () => {
+    const { proc, resolveTurnStart } = pendingTurnStartFixture('thread-rpc-interrupt')
+    const requests: Array<{ method: string; params: unknown }> = []
+    proc.request = (method: string, params: unknown) => {
+      requests.push({ method, params })
+      return Promise.resolve({})
+    }
+    const dispatch = proc.sendUserText('hello') as any
+
+    resolveTurnStart({ turn: { id: 'turn-rpc-interrupt' } })
+    expect(await dispatch.settlement).toMatchObject({
+      kind: 'ack',
+      turnId: 'turn-rpc-interrupt',
+    })
+
+    proc.sendInterrupt()
+    expect(requests).toContainEqual({
+      method: 'turn/interrupt',
+      params: {
+        threadId: 'thread-rpc-interrupt',
+        turnId: 'turn-rpc-interrupt',
+      },
+    })
+  })
+
+  test('an overlapping second send is rejected without orphaning the first receipt', async () => {
+    const { proc, rejectTurnStart } = pendingTurnStartFixture('thread-1')
+    const first = proc.sendUserText('first') as any
+    const second = proc.sendUserText('second') as any
+
+    expect(second).toMatchObject({ kind: 'rejected', provider: 'codex' })
+    rejectTurnStart(new Error('first rejected'))
+    expect(await first.settlement).toMatchObject({
+      kind: 'rejected',
+      deliveryId: first.deliveryId,
+      threadId: 'thread-1',
+    })
+  })
+
+  test('a conflicting same-thread completion cannot clear or complete the newer turn', async () => {
+    const { proc, resultEvents } = pendingTurnStartFixture('thread-1')
+    const dispatch = proc.sendUserText('newer') as any
+    proc.handleNotification('turn/started', {
+      threadId: 'thread-1',
+      turn: { id: 'turn-newer' },
+    })
+    expect(await dispatch.settlement).toMatchObject({ kind: 'ack', turnId: 'turn-newer' })
+
+    proc.handleNotification('turn/completed', {
+      threadId: 'thread-1',
+      turn: { id: 'turn-stale', status: 'completed' },
+    })
+
+    expect(proc.currentTurnId).toBe('turn-newer')
+    expect(proc.pendingTurnStart?.deliveryId).toBe(dispatch.deliveryId)
+    expect(resultEvents).toEqual([])
+  })
+
+  for (const lateTurn of [
+    { label: 'conflicting', value: { id: 'turn-bad' } },
+    { label: 'empty', value: {} },
+  ]) {
+    test(`a late ${lateTurn.label} turn/started cannot replace an RPC-bound turn`, async () => {
+      const { proc, resolveTurnStart, resultEvents } = pendingTurnStartFixture('thread-1')
+      const startedEvents: unknown[] = []
+      const emit = proc.emit
+      proc.emit = (event: string, payload: unknown) => {
+        if (event === 'turn_started') startedEvents.push(payload)
+        return emit(event, payload)
+      }
+      const dispatch = proc.sendUserText('hello') as any
+      resolveTurnStart({ turn: { id: 'turn-good' } })
+      expect(await dispatch.settlement).toMatchObject({ kind: 'ack', turnId: 'turn-good' })
+
+      proc.handleNotification('turn/started', {
+        threadId: 'thread-1',
+        turn: lateTurn.value,
+      })
+
+      expect(proc.currentTurnId).toBe('turn-good')
+      expect(startedEvents).toEqual([])
+
+      proc.handleNotification('turn/completed', {
+        threadId: 'thread-1',
+        turn: { id: 'turn-good', status: 'completed' },
+      })
+      expect(resultEvents).toEqual([
+        expect.objectContaining({
+          delivery_id: dispatch.deliveryId,
+          thread_id: 'thread-1',
+          turn_id: 'turn-good',
+        }),
+      ])
+    })
+  }
+
+  test('a pre-init send defers turn/start until the thread initializes', async () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const turnStart = deferred<unknown>()
+    const requests: Array<{ method: string; params: any }> = []
+    proc.opts = { workDir: '/tmp', effort: 'high' }
+    proc.sessionId = null
+    proc.alive = true
+    proc.deliveryCounter = 0
+    proc.pendingTurnStart = null
+    proc.currentTurnId = null
+    proc.lastUsage = null
+    proc.emittedImageGenerationIds = new Set()
+    proc.primeRolloutImageGenerationScan = () => {}
+    proc.flushRolloutImageGenerations = () => {}
+    proc.emit = () => true
+    proc.request = (method: string, params: any) => {
+      requests.push({ method, params })
+      if (method === 'thread/start') return Promise.resolve({ thread: { id: 'thread-late-init' } })
+      if (method === 'turn/start') return turnStart.promise
+      return Promise.resolve({})
+    }
+
+    const dispatch = proc.sendUserText('early hello') as any
+    expect(dispatch.kind).toBe('turn_start_pending')
+    expect(dispatch.threadId).toBeNull()
+    expect(requests.filter(r => r.method === 'turn/start')).toEqual([])
+
+    proc.sendInitialize()
+    await proc.readyPromise
+    for (let i = 0; i < 20 && !requests.some(r => r.method === 'turn/start'); i++) {
+      await Promise.resolve()
+    }
+    expect(dispatch.threadId).toBe('thread-late-init')
+    expect(requests).toContainEqual({
+      method: 'turn/start',
+      params: expect.objectContaining({ threadId: 'thread-late-init' }),
+    })
+
+    turnStart.resolve({ turn: { id: 'turn-late-init' } })
+    expect(await dispatch.settlement).toEqual({
+      kind: 'ack',
+      deliveryId: dispatch.deliveryId,
+      threadId: 'thread-late-init',
+      turnId: 'turn-late-init',
+    })
+    expect(proc.currentTurnId).toBe('turn-late-init')
+  })
+
+  test('exit before init settles a pre-init delivery as rejected with its unbound thread', async () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    proc.opts = { workDir: '/tmp', effort: 'high' }
+    proc.sessionId = null
+    proc.alive = true
+    proc.deliveryCounter = 0
+    proc.pendingTurnStart = null
+    proc.currentTurnId = null
+    proc.lastUsage = null
+    proc.emittedImageGenerationIds = new Set()
+    proc.readyPromise = new Promise<void>(() => {})
+    proc.emit = () => true
+
+    const dispatch = proc.sendUserText('doomed hello') as any
+    expect(dispatch.kind).toBe('turn_start_pending')
+
+    proc.alive = false
+    proc.rejectTurnStart(proc.pendingTurnStart, new Error('codex app-server exited'))
+    expect(await dispatch.settlement).toMatchObject({
+      kind: 'rejected',
+      deliveryId: dispatch.deliveryId,
+      threadId: null,
+    })
+  })
+})
 
 describe('codex process compaction notifications', () => {
   test('detects explicit thread compaction notifications', () => {

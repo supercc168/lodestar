@@ -104,3 +104,75 @@ describe('cardkit write-dead card', () => {
     await cardkit.dispose('card_wd')
   })
 })
+
+describe('cardkit terminal write failure observation', () => {
+  /** 只让下一次 Card Kit HTTP 调用失败(返回指定 code),之后恢复默认 mock。 */
+  function failNextCardKitCall(code: number): void {
+    const previousFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      globalThis.fetch = previousFetch
+      const url = new URL(String(input))
+      calls.push({
+        method: String(init?.method ?? 'GET'),
+        path: url.pathname.replace('/open-apis/cardkit/v1', ''),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      })
+      return new Response(JSON.stringify({ code, msg: `injected failure ${code}` }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+  }
+
+  const footer = () => ({ tag: 'markdown', element_id: 'footer', content: '✅ 完成' })
+
+  test('replaceElement reports API failure, write-dead, and dead-element short circuits', async () => {
+    const failures: Array<number | undefined> = []
+
+    cardkit.recordCardCreated('card_replace_fail', 2)
+    failNextCardKitCall(300313)
+    await cardkit.replaceElement('card_replace_fail', 'footer', footer(), code => failures.push(code))
+
+    cardkit.recordCardCreated('card_replace_dead', 2)
+    cardkit.markCardWriteDead('card_replace_dead')
+    await cardkit.replaceElement('card_replace_dead', 'footer', footer(), code => failures.push(code))
+
+    cardkit.recordCardCreated('card_replace_element_dead', 1)
+    failNextCardKitCall(300305)
+    await cardkit.addElement('card_replace_element_dead', footer(), {}, () => {})
+    await cardkit.replaceElement('card_replace_element_dead', 'footer', footer(), code => failures.push(code))
+
+    expect(failures).toEqual([300313, undefined, undefined])
+    await cardkit.dispose('card_replace_fail')
+    await cardkit.dispose('card_replace_dead')
+    await cardkit.dispose('card_replace_element_dead')
+  })
+
+  test('patchSettings reports API failure and write-dead short circuit', async () => {
+    const failures: Array<number | undefined> = []
+
+    cardkit.recordCardCreated('card_patch_fail', 1)
+    failNextCardKitCall(300317)
+    await cardkit.patchSettings('card_patch_fail', { config: {} }, code => failures.push(code))
+
+    cardkit.recordCardCreated('card_patch_dead', 1)
+    cardkit.markCardWriteDead('card_patch_dead')
+    await cardkit.patchSettings('card_patch_dead', { config: {} }, code => failures.push(code))
+
+    expect(failures).toEqual([300317, undefined])
+    await cardkit.dispose('card_patch_fail')
+    await cardkit.dispose('card_patch_dead')
+  })
+
+  test('successful terminal writes do not invoke the failure callback', async () => {
+    const failures: Array<number | undefined> = []
+    cardkit.recordCardCreated('card_terminal_ok', 2)
+
+    await cardkit.replaceElement('card_terminal_ok', 'footer', footer(), code => failures.push(code))
+    await cardkit.patchSettings('card_terminal_ok', { config: {} }, code => failures.push(code))
+
+    expect(failures).toEqual([])
+    expect(calls.filter(call => call.path === '/cards/card_terminal_ok/elements/footer')).toHaveLength(1)
+    expect(calls.filter(call => call.path === '/cards/card_terminal_ok/settings')).toHaveLength(1)
+    await cardkit.dispose('card_terminal_ok')
+  })
+})

@@ -22,6 +22,7 @@ import {
   isClaudeReasoningEffort,
   type AgentReasoningEffort,
   type ClaudeReasoningEffort,
+  type UserTextDispatch,
 } from './agent-process'
 import {
   claudeModelKey,
@@ -836,12 +837,20 @@ export class ClaudeAgentProcess extends EventEmitter {
     void this.readLoop(this.query)
   }
 
-  sendUserText(text: string, files: string[] = []): void {
+  sendUserText(text: string, files: string[] = []): UserTextDispatch {
     if (!this.alive) {
-      log('claude-agent-process: sendUserText ignored on dead process')
-      return
+      const error = new Error('claude agent process is not running')
+      log(`claude-agent-process: sendUserText rejected: ${error.message}`)
+      return { kind: 'rejected', provider: 'claude', error }
     }
     if (!this.started) this.sendInitialize()
+    if (!this.alive) {
+      return {
+        kind: 'rejected',
+        provider: 'claude',
+        error: new Error('claude agent process failed to initialize'),
+      }
+    }
     const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
     const injected = this.pendingInjectedContext.length
       ? this.pendingInjectedContext.splice(0).join('\n\n') + '\n\n'
@@ -857,10 +866,11 @@ export class ClaudeAgentProcess extends EventEmitter {
         parent_tool_use_id: null,
         priority: 'now',
       } as SDKUserMessage)
+      return { kind: 'queued', provider: 'claude' }
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e))
       log(`claude-agent-process: sendUserText failed: ${err.message}`)
-      this.failTurnStart(err)
+      return { kind: 'rejected', provider: 'claude', error: err }
     }
   }
 
@@ -1289,23 +1299,4 @@ export class ClaudeAgentProcess extends EventEmitter {
     })
   }
 
-  private failTurnStart(e: Error): void {
-    this.turnActive = false
-    this.lastResult = {
-      cost_usd: null,
-      cost_delta_usd: null,
-      duration_ms: null,
-      num_turns: null,
-      usage: this.lastUsage,
-      subtype: 'claude_turn_start_failed',
-      is_error: true,
-    }
-    this.emit('result', {
-      subtype: this.lastResult.subtype,
-      is_error: true,
-      duration_ms: null,
-      usage: this.lastUsage,
-      error: e.message,
-    })
-  }
 }

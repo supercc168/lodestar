@@ -54,9 +54,15 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     return true
   }
   if (raw.trim().match(/^(?:bk|back)$/i)) {
+    if (s.hasPreservedWatchdogRecovery()) {
+      await feishu.sendText(s.chatId, '⚠️ thread 自动恢复尚未完成，暂不能回滚。请先发送 restart 恢复，或 clear/kill 丢弃。')
+      return true
+    }
+    const lease = s.beginLifecycle('back')
     if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 bk。'); return true }
     // 立刻终止当前会话(保留 lastSessionId 供选后回滚),再弹回滚列表
-    if (s.isRunning()) await s.stop('回滚前终止', { announce: false })
+    if (s.isRunning()) await s.stop('回滚前终止', { announce: false, lifecycleLease: lease })
+    if (!s.ownsLifecycle(lease)) return true
     await s.showBackList()
     return true
   }
@@ -84,21 +90,32 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       return true
     case 'hi':
       {
+        const lease = s.beginLifecycle('hi')
+        if (s.watchdogResumeFailed) {
+          await feishu.sendText(
+            s.chatId,
+            '⚠️ thread 自动恢复失败，消息仍已保留。发送 restart 恢复同一 thread；发送 clear 或 kill 可主动丢弃。',
+          )
+          return true
+        }
         const needsStart = !s.isRunning()
         const backend = s.backendLabel()
         const statusCard = needsStart
           ? await s.openStatusCard('hi', s.withModel(`🚀 启动 ${backend}`))
           : null
+        if (!s.ownsLifecycle(lease)) return true
         let lastStatus = s.withModel(`🚀 启动 ${backend}`)
         const ok = needsStart
           ? await s.start({
               announce: !statusCard,
+              lifecycleLease: lease,
               onStatus: status => {
                 lastStatus = status
                 s.setStatusCard(statusCard, status)
               },
             })
           : true
+        if (!s.ownsLifecycle(lease)) return true
         if (!ok) {
           await s.closeStatusCard(statusCard, lastStatus.startsWith('❌') ? lastStatus : '❌ 启动失败')
           return true
@@ -116,10 +133,13 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
             s.withModel(s.withWorktreeInstructionNotice(`✅ ${s.backendLabel()} 已就绪`)),
           )
         }
+        if (s.ownsLifecycle(lease)) await s.showConsole()
       }
-      await s.showConsole()
       return true
     case 'stop':
+      {
+      const lease = s.beginLifecycle('soft_stop')
+      const preserveRecovery = s.hasPreservedWatchdogRecovery()
       if (s.runningAgy) {
         await s.stopAgyTask('🛑 agy 已打断')
         return true
@@ -132,15 +152,23 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       // but the daemon can't reach into it directly; in practice the
       // sendInterrupt() control_request causes the SDK to discard
       // queued input alongside the in-flight call.
-      s.clearStaleIdleQueueState('stop')
-      s.clearMultiMsgBuffer('stop command')
+      if (!preserveRecovery) {
+        s.clearStaleIdleQueueState('stop')
+        s.clearMultiMsgBuffer('stop command')
+      }
+      if (preserveRecovery && !s.currentTurn) {
+        await feishu.sendText(s.chatId, '🛑 已停止自动恢复尝试；原 thread 和排队消息仍保留，可发送 restart 继续。')
+        return true
+      }
       if (!s.currentTurn && s.pendingUserMessageCount === 0 && s.pendingMidTurnMsgs.length === 0) {
         const statusCard = await s.openStatusCard('stop', '⚪ 当前没有正在执行的 turn', 'grey')
+        if (!s.ownsLifecycle(lease)) return true
         if (statusCard) {
           await s.closeStatusCard(statusCard, '⚪ 无正在执行的 turn')
         } else {
           await feishu.sendText(s.chatId, '⚪ 当前没有正在执行的 turn')
         }
+        if (!s.ownsLifecycle(lease)) return true
         return true
       }
       log(`session "${s.sessionName}": stop command — interrupt + drop count=${s.pendingUserMessageCount} midBuffer=${s.pendingMidTurnMsgs.length}`)
@@ -151,55 +179,87 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       // 用 `seen` Set 去重 —— mid-turn buffer 跟 pendingReactionIds 的
       // msgId 重叠(onUserMessage 进 buffer 时同时 trackReaction),
       // 两次 addReaction(CrossMark) 会在飞书侧渲染两个 ❌ (P0-1)。
-      const seen = new Set<string>()
-      for (const [msgId, rid] of [
-        ...s.pendingReactionIds.entries(),
-        ...s.currentBatchReactionIds.entries(),
-      ]) {
-        if (rid) void feishu.deleteReaction(msgId, rid)
-        void feishu.addReaction(msgId, 'CrossMark')
-        seen.add(msgId)
+      if (!preserveRecovery) {
+        const seen = new Set<string>()
+        for (const [msgId, rid] of [
+          ...s.pendingReactionIds.entries(),
+          ...s.currentBatchReactionIds.entries(),
+        ]) {
+          if (rid) void feishu.deleteReaction(msgId, rid)
+          void feishu.addReaction(msgId, 'CrossMark')
+          seen.add(msgId)
+        }
+        // Mid-turn buffer never reached SDK — cancel those too.
+        for (const msg of s.pendingMidTurnMsgs) {
+          if (msg.msgId && !seen.has(msg.msgId)) void feishu.addReaction(msg.msgId, 'CrossMark')
+        }
+        s.pendingUserMessageCount = 0
+        s.pendingMidTurnMsgs = []
+        s.pendingTurnInputs = []
+        s.lastUserOpenId = ''
+        s.pendingReactionIds = new Map()
+        s.currentBatchReactionIds = new Map()
       }
-      // Mid-turn buffer never reached SDK — cancel those too.
-      for (const msg of s.pendingMidTurnMsgs) {
-        if (msg.msgId && !seen.has(msg.msgId)) void feishu.addReaction(msg.msgId, 'CrossMark')
-      }
-      s.pendingUserMessageCount = 0
-      s.pendingMidTurnMsgs = []
-      s.pendingTurnInputs = []
-      s.lastUserOpenId = ''
-      s.pendingReactionIds = new Map()
-      s.currentBatchReactionIds = new Map()
       const interrupt = s.beginTurnInterrupt('user')
       if (!interrupt) log(`session "${s.sessionName}": stop command found no live process`)
       // 主动封口,把 footer 改成 🛑 打断、停止 footer 状态计时、把 streaming_mode
       // 翻回 false,否则卡片会僵在运行中状态。SDK 的 post-interrupt
       // result 也会进 closeTurnCard,但 currentTurn 已被这里置空,那条
       // 路径会 early-return,不会重画 footer。
-      await s.closeTurnCard('🛑 打断')
+      await s.closeTurnCard('🛑 打断', { preservePendingReactions: preserveRecovery })
       return true
+      }
     case 'kill':
       {
+        const lease = s.beginLifecycle('kill')
         if (s.runningAgy) await s.stopAgyTask('🛑 agy 已终止')
+        if (!s.ownsLifecycle(lease)) return true
         const wasRunning = s.isRunning()
         const backend = s.backendLabel(s.proc?.provider ?? s.currentProvider())
         const initialStatus = wasRunning ? `🛑 停止 ${backend}` : '⚪ session 当前未运行'
         const statusCard = await s.openStatusCard('kill', initialStatus, wasRunning ? 'red' : 'grey')
+        if (!s.ownsLifecycle(lease)) return true
         await s.stop('已终止', {
           announce: !statusCard,
+          lifecycleLease: lease,
           onStatus: status => {
             s.setStatusCard(statusCard, status)
           },
         })
+        if (!s.ownsLifecycle(lease)) return true
         await s.closeStatusCard(statusCard, wasRunning ? `✅ ${backend} 已终止` : `⚪ ${backend} 未运行`)
       }
       return true
     case 'restart':
+      {
+      const lease = s.beginLifecycle(s.watchdogResumeFailed ? 'strict-retry' : 'restart')
       // rs 双模式:会话进行中 = 打断 + 弃后台 + 恢复(走下面 restart(true));空闲 =
       // 列项目最近 24h 会话选恢复(比"只恢复上一会话"实用)。空闲判定用「无进行中
       // turn」语义,与上面 stop 命令对齐 —— 不能用 !isRunning():isRunning() 判的是
       // 进程存活,而 claude 进程 turn 间常驻保活(stop 故意 "Subprocess stays alive"),
       // stop 后仍为 true,会让列表分支永远不可达(实测踩中,见 session.test.ts)。
+      if (s.watchdogResumeFailed) {
+        const initialStatus = '🔁 恢复失败 thread 并发送已保留消息'
+        const statusCard = await s.openStatusCard('restart', initialStatus)
+        if (!s.ownsLifecycle(lease)) return true
+        let lastStatus = initialStatus
+        const ok = await s.resumeFailedWatchdogQueue({
+          announce: !statusCard,
+          lifecycleLease: lease,
+          onStatus: status => {
+            lastStatus = status
+            s.setStatusCard(statusCard, status)
+          },
+        })
+        if (!s.ownsLifecycle(lease)) return true
+        await s.closeStatusCard(
+          statusCard,
+          ok
+            ? s.withModel('✅ thread 已恢复，已保留消息开始执行')
+            : (lastStatus.startsWith('❌') ? lastStatus : '❌ thread 恢复失败，消息仍已保留'),
+        )
+        return true
+      }
       if (!s.currentTurn && s.pendingUserMessageCount === 0 && s.pendingMidTurnMsgs.length === 0) {
         await s.showResumeList()
         return true
@@ -215,18 +275,22 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
             ? s.withModel(`🔁 恢复上一会话 thread=${resumeThreadLabel}…`)
             : s.withModel(`🔁 启动 ${backend}`)
         const statusCard = await s.openStatusCard('restart', initialStatus)
+        if (!s.ownsLifecycle(lease)) return true
         if (s.runningAgy) {
           s.setStatusCard(statusCard, '🛑 restart 前终止 agy')
           await s.stopAgyTask('🛑 restart 前已终止 agy')
+          if (!s.ownsLifecycle(lease)) return true
         }
         let lastStatus = initialStatus
         const ok = await s.restart(true, {
           announce: !statusCard,
+          lifecycleLease: lease,
           onStatus: status => {
             lastStatus = status
             s.setStatusCard(statusCard, status)
           },
         })
+        if (!s.ownsLifecycle(lease)) return true
         const finalStatus = ok
           ? (
               lastStatus.startsWith('✅')
@@ -237,7 +301,10 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
         await s.closeStatusCard(statusCard, ok ? s.withModel(finalStatus) : finalStatus)
       }
       return true
+      }
     case 'clear':
+      {
+      const lease = s.beginLifecycle('clear')
       // "throw away current conversation, start a new one". By design
       // this only makes sense when there IS a current conversation:
       // calling clear from stopped state is a no-op (user-confirmed
@@ -245,9 +312,24 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       // a fresh session the user didn't ask for. To start from cold,
       // use `hi`.
       if (!s.isRunning()) {
+        if (s.watchdogResumeFailed) {
+          s.discardPreservedWatchdogRecovery('clear command')
+          s.discardQueuedHumanWork('clear command')
+          s.status = 'stopped'
+          s.opts.onLifecycleChange?.()
+          const statusCard = await s.openStatusCard('clear', '🧹 清除已保留消息', 'orange')
+          if (!s.ownsLifecycle(lease)) return true
+          if (statusCard) {
+            await s.closeStatusCard(statusCard, '✅ 已清除自动恢复失败后保留的消息')
+          } else {
+            await feishu.sendText(s.chatId, '✅ 已清除自动恢复失败后保留的消息')
+          }
+          return true
+        }
         s.status = 'stopped'
         s.opts.onLifecycleChange?.()
         const statusCard = await s.openStatusCard('clear', '⚪ session 当前未运行', 'grey')
+        if (!s.ownsLifecycle(lease)) return true
         if (statusCard) {
           await s.closeStatusCard(statusCard, `⚪ ${s.backendLabel()} 未运行，clear 无效`)
         } else {
@@ -257,14 +339,17 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       }
       {
         const statusCard = await s.openStatusCard('clear', '🧹 清空并启动新会话', 'orange')
+        if (!s.ownsLifecycle(lease)) return true
         let lastStatus = '🧹 清空并启动新会话'
         const ok = await s.restart(false, {
           announce: !statusCard,
+          lifecycleLease: lease,
           onStatus: status => {
             lastStatus = status
             s.setStatusCard(statusCard, status)
           },
         })
+        if (!s.ownsLifecycle(lease)) return true
         await s.closeStatusCard(
           statusCard,
           ok
@@ -273,5 +358,6 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
         )
       }
       return true
+      }
   }
 }

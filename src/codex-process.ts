@@ -25,7 +25,12 @@ import {
   logUnhandledAppServerPayload,
 } from './codex-compaction'
 import { diffUsageTotals, effectiveTurnTokens, usageFromTokenUsagePayload } from './codex-usage'
-import type { AgentReasoningEffort, CollabAgentStates } from './agent-process'
+import type {
+  AgentReasoningEffort,
+  CodexUserTextSettlement,
+  CollabAgentStates,
+  UserTextDispatch,
+} from './agent-process'
 
 /** 拼 `codex app-server` 命令行:把 provider 覆盖 `-c` 对插在 `--listen` 之前。 */
 export function buildCodexAppServerArgs(configArgs: string[] = []): string[] {
@@ -249,6 +254,16 @@ type PendingRequest = {
   method: string
 }
 
+type PendingTurnStart = {
+  deliveryId: string
+  // null = pre-init 投递,线程还没创建;init 成功后由
+  // initializeAndStartThread 在 emit('init') 之前就地绑定。
+  threadId: string | null
+  turnId: string | null
+  settled: boolean
+  settle: (value: CodexUserTextSettlement) => void
+}
+
 type ServerRequestState = {
   id: string | number
   method: string
@@ -263,12 +278,15 @@ export class CodexProcess extends EventEmitter {
   private requestCounter = 0
   private pending = new Map<string | number, PendingRequest>()
   private serverRequests = new Map<string | number, ServerRequestState>()
+  private stdinErrorListenerAttached = false
   private alive = true
   private expectedExit = false
   private opts: SpawnOpts
   private readyPromise: Promise<void> | null = null
   private catalogInitPromise: Promise<void> | null = null
   private currentTurnId: string | null = null
+  private deliveryCounter = 0
+  private pendingTurnStart: PendingTurnStart | null = null
   private rolloutFilePath: string | null = null
   private rolloutReadOffset = 0
   private emittedImageGenerationIds = new Set<string>()
@@ -313,6 +331,10 @@ export class CodexProcess extends EventEmitter {
     this.proc.stderr.on('data', (chunk: Buffer) => this.onStderr(chunk))
     this.proc.on('exit', (code, signal) => {
       this.alive = false
+      const exitError = new Error(`codex app-server exited code=${code} signal=${signal}`)
+      if (this.pendingTurnStart && !this.pendingTurnStart.settled) {
+        this.rejectTurnStart(this.pendingTurnStart, exitError)
+      }
       for (const [id, pending] of this.pending) {
         pending.reject(new Error(`codex app-server exited before ${pending.method} response (id=${id})`))
       }
@@ -448,16 +470,46 @@ export class CodexProcess extends EventEmitter {
         return
       }
       case 'turn/started': {
-        this.currentTurnId = params.turn?.id ?? null
+        const threadId = this.stringId(params.threadId) ?? this.sessionId
+        const turnId = this.stringId(params.turn?.id)
+        const delivery = this.pendingTurnStart
+        if (!turnId) {
+          log(`codex-process: ignore turn/started with empty turn id thread=${threadId ?? '-'}`)
+          return
+        }
+        if (this.currentTurnId && this.currentTurnId !== turnId) {
+          log(`codex-process: ignore conflicting turn/started thread=${threadId ?? '-'} turn=${turnId} current=${this.currentTurnId}`)
+          return
+        }
+        if (delivery && threadId === delivery.threadId) {
+          if (!this.ackTurnStart(delivery, turnId)) return
+        }
+        this.currentTurnId = turnId
         this.emit('turn_started', {
-          turn_id: this.currentTurnId,
+          turn_id: turnId,
           thread_id: params.threadId ?? this.sessionId,
         })
         return
       }
       case 'turn/completed': {
-        this.flushRolloutImageGenerations()
         const turn = params.turn ?? {}
+        const threadId = this.stringId(params.threadId) ?? this.sessionId
+        const turnId = this.stringId(turn.id)
+        const delivery = this.pendingTurnStart && this.pendingTurnStart.threadId === threadId
+          ? this.pendingTurnStart
+          : null
+        if (
+          turnId &&
+          (
+            (this.currentTurnId && this.currentTurnId !== turnId) ||
+            (delivery?.turnId && delivery.turnId !== turnId)
+          )
+        ) {
+          log(`codex-process: ignore conflicting turn/completed thread=${threadId ?? '-'} turn=${turnId} current=${this.currentTurnId ?? '-'} deliveryTurn=${delivery?.turnId ?? '-'}`)
+          return
+        }
+        if (delivery) this.ackTurnStart(delivery, turnId)
+        this.flushRolloutImageGenerations()
         const status = turn.status
         const isError = status === 'failed' || !!turn.error
         const subtype = isError ? (turn.error?.type ?? turn.error?.message ?? 'failed') : 'success'
@@ -471,7 +523,20 @@ export class CodexProcess extends EventEmitter {
           is_error: isError,
         }
         this.currentTurnId = null
-        this.emit('result', { subtype, is_error: isError, duration_ms: this.lastResult.duration_ms, usage: this.lastUsage })
+        this.emit('result', {
+          subtype,
+          is_error: isError,
+          duration_ms: this.lastResult.duration_ms,
+          usage: this.lastUsage,
+          ...(delivery
+            ? {
+                delivery_id: delivery.deliveryId,
+                thread_id: delivery.threadId,
+                turn_id: turnId ?? delivery.turnId,
+              }
+            : {}),
+        })
+        if (delivery && this.pendingTurnStart === delivery) this.pendingTurnStart = null
         return
       }
       case 'turn/plan/updated': {
@@ -772,23 +837,55 @@ export class CodexProcess extends EventEmitter {
     }
   }
 
-  private write(obj: object): void {
+  private ensureStdinErrorListener(): void {
+    if (this.stdinErrorListenerAttached) return
+    const stdin = this.proc.stdin as Writable & { on?: Writable['on'] }
+    if (typeof stdin.on !== 'function') return
+    this.stdinErrorListenerAttached = true
+    stdin.on('error', error => {
+      log(`codex-process: stdin error: ${error}`)
+    })
+  }
+
+  private write(obj: object, onError?: (error: Error) => void): Error | null {
     if (!this.alive) {
+      const error = new Error('codex app-server is not running')
       log(`codex-process: write to dead process: ${JSON.stringify(obj).slice(0, 200)}`)
-      return
+      return error
     }
     try {
-      this.proc.stdin.write(JSON.stringify(obj) + '\n')
+      this.ensureStdinErrorListener()
+      this.proc.stdin.write(JSON.stringify(obj) + '\n', error => {
+        if (!error) return
+        const writeError = error instanceof Error ? error : new Error(String(error))
+        log(`codex-process: stdin write failed: ${writeError}`)
+        onError?.(writeError)
+      })
+      return null
     } catch (e) {
-      log(`codex-process: stdin write failed: ${e}`)
+      const error = e instanceof Error ? e : new Error(String(e))
+      log(`codex-process: stdin write failed: ${error}`)
+      return error
     }
   }
 
   private request(method: string, params: any): Promise<any> {
     const id = ++this.requestCounter
-    this.write({ id, method, params })
     return new Promise((resolve, reject) => {
       this.pending.set(id, { resolve, reject, method })
+      const rejectWrite = (error: Error) => {
+        const pending = this.pending.get(id)
+        if (!pending) {
+          log(`codex-process: ignore late stdin write failure method=${method} id=${id}: ${error}`)
+          return
+        }
+        this.pending.delete(id)
+        pending.reject(error)
+      }
+      const writeError = this.write({ id, method, params }, rejectWrite)
+      if (writeError) {
+        rejectWrite(writeError)
+      }
     })
   }
 
@@ -853,6 +950,12 @@ export class CodexProcess extends EventEmitter {
         })
     const thread = res?.thread
     this.sessionId = thread?.id ?? this.opts.resumeSessionId ?? null
+    // pre-init 投递在这里绑定线程身份 —— 必须在 emit('init') 之前,
+    // 让 Session 的 init 处理器读到已绑定的 dispatch.threadId。
+    const preInitDelivery = this.pendingTurnStart
+    if (preInitDelivery && preInitDelivery.threadId === null && this.sessionId) {
+      preInitDelivery.threadId = this.sessionId
+    }
     if (res?.model) this.lastModel = res.model
     if (isCodexReasoningEffort(res?.reasoningEffort)) this.lastEffort = res.reasoningEffort
     else this.lastEffort = this.opts.effort
@@ -874,9 +977,68 @@ export class CodexProcess extends EventEmitter {
     }
   }
 
-  sendUserText(text: string, files: string[] = []): void {
+  sendUserText(text: string, files: string[] = []): UserTextDispatch {
+    if (this.pendingTurnStart) {
+      return {
+        kind: 'rejected',
+        provider: 'codex',
+        error: new Error(`codex turn delivery ${this.pendingTurnStart.deliveryId} is still active`),
+      }
+    }
     const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
-    void this.startTurn(fileHints + text).catch(e => this.failTurnStart(e))
+    const deliveryId = String(++this.deliveryCounter)
+    let settle!: (value: CodexUserTextSettlement) => void
+    const settlement = new Promise<CodexUserTextSettlement>(resolve => {
+      settle = resolve
+    })
+    const delivery: PendingTurnStart = {
+      deliveryId,
+      // pre-init(冷启动第一条)时为 null,init 成功后就地绑定;
+      // dispatch.threadId getter 让 Session 始终读到绑定后的实时值。
+      threadId: this.sessionId,
+      turnId: null,
+      settled: false,
+      settle,
+    }
+    this.pendingTurnStart = delivery
+    void this.launchTurnStart(delivery, fileHints + text)
+    return {
+      kind: 'turn_start_pending',
+      provider: 'codex',
+      deliveryId,
+      get threadId() {
+        return delivery.threadId
+      },
+      settlement,
+    }
+  }
+
+  private async launchTurnStart(delivery: PendingTurnStart, text: string): Promise<void> {
+    try {
+      // 只有 pre-init 投递需要先等线程建立;已绑定线程的投递直接走
+      // startTurn(其内部本就会等待 readyPromise)。
+      if (delivery.threadId === null) {
+        if (!this.readyPromise) this.sendInitialize()
+        await this.readyPromise
+      }
+      const threadId = delivery.threadId
+      if (!threadId || this.sessionId !== threadId) {
+        throw new Error(
+          `codex thread owner changed before turn/start: expected ${threadId ?? 'pending'}, got ${this.sessionId ?? 'none'}`,
+        )
+      }
+      const result = await this.startTurn(text, threadId)
+      const responseThreadId = this.stringId(result?.threadId ?? result?.thread?.id)
+      if (responseThreadId && responseThreadId !== threadId) {
+        this.rejectTurnStart(delivery, new Error(
+          `codex turn/start response thread mismatch: expected ${threadId}, got ${responseThreadId}`,
+        ))
+        return
+      }
+      this.ackTurnStart(delivery, this.stringId(result?.turn?.id ?? result?.turnId))
+    } catch (error) {
+      this.rejectTurnStart(delivery, error)
+    }
   }
 
   async listModels(): Promise<CodexModel[]> {
@@ -953,7 +1115,55 @@ export class CodexProcess extends EventEmitter {
     })
   }
 
-  private failTurnStart(e: unknown): void {
+  private stringId(value: unknown): string | null {
+    return typeof value === 'string' && value.length > 0 ? value : null
+  }
+
+  private ackTurnStart(delivery: PendingTurnStart, turnId: string | null): boolean {
+    if (this.pendingTurnStart !== delivery) return false
+    const threadId = delivery.threadId
+    if (!threadId) {
+      log(`codex-process: ignore ACK for unbound delivery=${delivery.deliveryId}`)
+      return false
+    }
+    if (turnId) {
+      if (delivery.turnId && delivery.turnId !== turnId) {
+        log(`codex-process: ignore conflicting ACK delivery=${delivery.deliveryId} expectedTurn=${delivery.turnId} got=${turnId}`)
+        return false
+      }
+      delivery.turnId = turnId
+      this.currentTurnId = turnId
+    }
+    if (delivery.settled) return true
+    delivery.settled = true
+    delivery.settle({
+      kind: 'ack',
+      deliveryId: delivery.deliveryId,
+      threadId,
+      turnId: delivery.turnId,
+    })
+    return true
+  }
+
+  private rejectTurnStart(delivery: PendingTurnStart, cause: unknown): boolean {
+    if (this.pendingTurnStart !== delivery || delivery.settled) {
+      log(`codex-process: ignore late turn/start rejection delivery=${delivery.deliveryId}: ${cause}`)
+      return false
+    }
+    const error = cause instanceof Error ? cause : new Error(String(cause))
+    delivery.settled = true
+    delivery.settle({
+      kind: 'rejected',
+      deliveryId: delivery.deliveryId,
+      threadId: delivery.threadId,
+      error,
+    })
+    this.pendingTurnStart = null
+    this.failTurnStart(error, delivery)
+    return true
+  }
+
+  private failTurnStart(e: unknown, delivery: PendingTurnStart): void {
     const message = e instanceof Error ? e.message : String(e)
     log(`codex-process: turn/start failed: ${message}`)
     this.lastResult = {
@@ -972,15 +1182,20 @@ export class CodexProcess extends EventEmitter {
       duration_ms: null,
       usage: this.lastUsage,
       error: message,
+      delivery_id: delivery.deliveryId,
+      thread_id: delivery.threadId ?? undefined,
+      turn_id: delivery.turnId,
     })
   }
 
-  private async startTurn(text: string): Promise<void> {
+  private async startTurn(text: string, threadId: string): Promise<any> {
     if (!this.readyPromise) this.sendInitialize()
     await this.readyPromise
-    if (!this.sessionId) throw new Error('codex thread not initialized')
-    await this.request('turn/start', {
-      threadId: this.sessionId,
+    if (this.sessionId !== threadId) {
+      throw new Error(`codex thread owner changed before turn/start: expected ${threadId}, got ${this.sessionId ?? 'none'}`)
+    }
+    return await this.request('turn/start', {
+      threadId,
       input: [{ type: 'text', text, text_elements: [] }],
       cwd: this.opts.workDir,
       approvalPolicy: 'never',

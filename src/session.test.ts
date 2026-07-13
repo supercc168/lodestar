@@ -5,8 +5,9 @@ import {
   TurnWatchdog,
   type WatchdogSettings,
 } from './turn-watchdog'
+import type { CodexUserTextSettlement, UserTextDispatch } from './agent-process'
 import {
-  boundResumes, deletedReactions, feishuMockState, projectProfiles, resetFeishuMock,
+  addedReactions, boundResumes, deletedReactions, feishuMockState, projectProfiles, resetFeishuMock,
   sentCards, sentRawTexts, sentTexts, updatedCards, urgentPushes,
 } from './feishu-test-mock'
 
@@ -70,6 +71,8 @@ class FakeAgentProc extends EventEmitter {
   onInterrupt: (() => void) | null = null
   setModelSettingsCalls: Array<[string, string]> = []
   alive = true
+  dispatchFactory: ((text: string) => UserTextDispatch) | null = null
+  dispatchCounter = 0
 
   constructor(
     readonly provider: 'codex' | 'claude',
@@ -80,8 +83,19 @@ class FakeAgentProc extends EventEmitter {
 
   sendInitialize(): void {}
 
-  sendUserText(text: string): void {
+  sendUserText(text: string): UserTextDispatch {
     this.sentTexts.push(text)
+    if (this.dispatchFactory) return this.dispatchFactory(text)
+    if (this.provider === 'claude') return { kind: 'queued', provider: 'claude' }
+    const deliveryId = String(++this.dispatchCounter)
+    const threadId = this.sessionId ?? 'fake-codex-thread'
+    return {
+      kind: 'turn_start_pending',
+      provider: 'codex',
+      deliveryId,
+      threadId,
+      settlement: Promise.resolve({ kind: 'ack', deliveryId, threadId, turnId: null }),
+    }
   }
 
   sendInterrupt(): void {
@@ -124,10 +138,13 @@ class FakeAgentProc extends EventEmitter {
 
 afterEach(() => {
   for (const session of Session.all as Set<any>) {
-    session.endWatchdogTurn()
+    if (session.clearWatchdogRuntime) session.clearWatchdogRuntime('test cleanup')
+    else session.endWatchdogTurn()
     session.stopFooterStatus(session.currentTurn)
-    if (session.watchdogTickHandle) clearInterval(session.watchdogTickHandle)
-    session.watchdogTickHandle = null
+    if (!session.clearWatchdogRuntime) {
+      if (session.watchdogTickHandle) clearInterval(session.watchdogTickHandle)
+      session.watchdogTickHandle = null
+    }
     session.dispose()
   }
   globalThis.fetch = originalFetch
@@ -198,14 +215,17 @@ function useDeterministicFooterStatus(session: any): void {
   session.startWorkingFooter = (turn: any) => start(turn, 'Working...')
 }
 
-function wiredWatchdogSession(provider: 'codex' | 'claude' = 'codex'): {
+function wiredWatchdogSession(
+  provider: 'codex' | 'claude' = 'codex',
+  mode: 'warn' | 'recover_once' = 'warn',
+): {
   session: any
   proc: FakeAgentProc
   turn: any
 } {
   const fixtureId = ++watchdogFixtureCount
   const sessionName = `watchdog-${provider}-${fixtureId}`
-  projectProfiles.set(sessionName, { watchdogMode: 'warn' })
+  projectProfiles.set(sessionName, { watchdogMode: mode })
   const session = new Session(sessionName, 'chat_id') as any
   const proc = new FakeAgentProc(provider, provider === 'codex' ? 'thread-1' : 'claude-thread-1')
   const turn = turnState(`card_${provider}_watchdog_${fixtureId}`)
@@ -225,13 +245,117 @@ const recoverVerdict = {
 } as const
 
 function armedRecoverySession(override: Partial<WatchdogSettings> = {}) {
-  const { session, proc, turn } = wiredWatchdogSession('codex')
+  // 生产一致性:recover 流程测试的 session 本身必须是 recover_once 档,
+  // 而不是 warn 档 session 拿着注入的 verdict 硬跑(那种状态生产不可达)。
+  const { session, proc, turn } = wiredWatchdogSession('codex', 'recover_once')
   const settings = { ...DEFAULT_CODEX_WATCHDOG, ...override }
   session.configuredWatchdogSettings = () => settings
   session.watchdog = new TurnWatchdog(settings)
   session.beginWatchdogTurn(turn, proc, 0)
   proc.emit('turn_started', { thread_id: 'thread-1', turn_id: 'turn-1' })
   return { session, proc, turn }
+}
+
+const WATCHDOG_DUE_AT = DEFAULT_CODEX_WATCHDOG.stallMs
+
+function dueWatchdogSession(opts: { recoveryAttempt?: 0 | 1 } = {}) {
+  const fixture = armedRecoverySession()
+  for (let index = 0; index < DEFAULT_CODEX_WATCHDOG.repeatNoopLimit; index++) {
+    const id = `due-noop-${index}`
+    const startedAt = index * 2 + 1
+    fixture.session.watchdog.observeToolStart(id, 'exec', 'text("ready")', startedAt)
+    fixture.session.watchdog.observeToolResult(id, strictExecResult('ready'), false, startedAt + 1)
+  }
+  if (opts.recoveryAttempt === 1) fixture.session.watchdog.consumeRecovery()
+  return fixture
+}
+
+function installFailedWatchdogRecovery(
+  session: any,
+  opts: {
+    provider?: 'codex' | 'claude'
+    threadId?: string
+    turnId?: string
+    proc?: FakeAgentProc
+    turn?: any
+  } = {},
+): any {
+  const provider = opts.provider ?? 'codex'
+  const threadId = opts.threadId ?? 'thread-1'
+  const turnId = opts.turnId ?? 'turn-1'
+  const proc = opts.proc ?? new FakeAgentProc(provider, threadId)
+  const turn = opts.turn ?? turnState(`card_failed_recovery_${++watchdogFixtureCount}`)
+  turn.backendThreadId = threadId
+  turn.backendTurnId = turnId
+  const lease = session.beginLifecycle('watchdog-recovery')
+  const recovery = {
+    token: {},
+    lease,
+    provider,
+    threadId,
+    turn,
+    turnId,
+    recoveryAttempt: 1,
+    phase: 'failed',
+    replacementProc: null,
+  }
+  session.preservedWatchdogRecovery = recovery
+  return recovery
+}
+
+function ownedFailedWatchdogRecoverySession(): {
+  session: any
+  proc: FakeAgentProc
+  turn: any
+  action: any
+  recovery: any
+} {
+  const fixture = armedRecoverySession()
+  const action = fixture.session.beginWatchdogAction(
+    fixture.session.watchdogContext,
+    'watchdog-recovery',
+  )
+  if (!action) throw new Error('failed to acquire watchdog action fixture')
+  const recovery = fixture.session.preserveWatchdogRecovery(action)
+  if (!recovery) throw new Error('failed to preserve watchdog recovery fixture')
+  recovery.phase = 'failed'
+  return { ...fixture, action, recovery }
+}
+
+function stoppedFailedRecoverySession(suffix: string): any {
+  const session = new Session(`watchdog-stopped-cleanup-${suffix}`, 'chat_id') as any
+  session.selectedProvider = 'codex'
+  session.proc = null
+  installFailedWatchdogRecovery(session)
+  session.pendingUserMessageCount = 2
+  session.pendingMidTurnMsgs = [{
+    text: 'queued human',
+    wireText: '[file: /tmp/queued.txt]\nqueued human',
+    userOpenId: 'ou_queued_human',
+    msgId: 'om_queued_human',
+  }]
+  session.pendingTurnInputs = ['queued turn input']
+  session.lastUserOpenId = 'ou_queued_human'
+  session.multiMsgBuffer = [{
+    text: 'buffered segment', files: [],
+    userOpenId: 'ou_buffered', msgId: 'om_buffered',
+  }]
+  session.multiMsgReactions = new Map([['om_buffered', 'reaction-buffered']])
+  session.pendingReactionIds = new Map([['om_queued_human', 'reaction-queued']])
+  session.currentBatchReactionIds = new Map([['om_current_batch', 'reaction-current']])
+  return session
+}
+
+function expectStoppedFailedRecoveryQueueCleared(session: any): void {
+  expect(session.watchdogResumeFailed).toBe(false)
+  expect(session.pendingUserMessageCount).toBe(0)
+  expect(session.pendingMidTurnMsgs).toEqual([])
+  expect(session.pendingTurnInputs).toEqual([])
+  expect(session.lastUserOpenId).toBe('')
+  expect(session.multiMsgBuffer).toBeNull()
+  expect(session.multiMsgReactions.size).toBe(0)
+  expect(session.pendingReactionIds.size).toBe(0)
+  expect(session.currentBatchReactionIds.size).toBe(0)
 }
 
 async function waitFor(condition: () => boolean, timeoutMs = 1_000): Promise<void> {
@@ -396,6 +520,276 @@ describe('Session shared turn interrupt', () => {
     expect(await interrupt.promise).toEqual({ type: 'cancelled', reason: 'restart' })
   })
 
+  test('a superseded restart cannot resume after a newer kill wins during status-card creation', async () => {
+    const session = new Session('lifecycle-restart-kill-status-race', 'chat_id') as any
+    const oldProc = new FakeAgentProc('codex', 'thread-restart-kill-race')
+    const staleReplacement = new FakeAgentProc('codex', 'thread-restart-kill-race')
+    const restartCardEntered = deferred<void>()
+    const releaseRestartCard = deferred<void>()
+    let cardCalls = 0
+    let spawnCalls = 0
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'thread-restart-kill-race'
+    session.proc = oldProc
+    session.currentTurn = turnState('card_restart_kill_race')
+    session.wireProc(oldProc)
+    session.spawnAgent = () => {
+      spawnCalls++
+      return staleReplacement
+    }
+    staleReplacement.sendInitialize = () => {
+      staleReplacement.emit('init', { session_id: 'thread-restart-kill-race' })
+    }
+    feishuMockState.sendCard = async () => {
+      cardCalls++
+      if (cardCalls === 1) {
+        restartCardEntered.resolve()
+        await releaseRestartCard.promise
+      }
+      return `om_lifecycle_race_${cardCalls}`
+    }
+
+    try {
+      const restarting = session.runCommand('restart')
+      await restartCardEntered.promise
+      await session.runCommand('kill')
+      releaseRestartCard.resolve()
+      await restarting
+
+      expect(spawnCalls).toBe(0)
+      expect(staleReplacement.killCalls).toBe(0)
+      expect(session.proc).toBeNull()
+      expect(session.status).toBe('stopped')
+    } finally {
+      feishuMockState.sendCard = null
+    }
+  })
+
+  test('dispose invalidates an in-flight start before it publishes idle', async () => {
+    const session = new Session('lifecycle-dispose-start-race', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', null)
+    const initializeEntered = deferred<void>()
+    session.selectedProvider = 'claude'
+    session.spawnAgent = () => proc
+    proc.sendInitialize = () => { initializeEntered.resolve() }
+
+    const starting = session.start({ announce: false })
+    await initializeEntered.promise
+    session.dispose()
+    const ok = await starting
+
+    expect(ok).toBe(false)
+    expect(proc.killCalls).toBe(1)
+    expect(session.proc).toBeNull()
+    expect(session.status).not.toBe('idle')
+  })
+
+  test('running hi retains the same pending process when it supersedes start', async () => {
+    const session = new Session('lifecycle-hi-retains-pending-start', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', null)
+    const initializeEntered = deferred<void>()
+    let consoleCalls = 0
+    session.selectedProvider = 'claude'
+    session.spawnAgent = () => proc
+    session.showConsole = async () => { consoleCalls++ }
+    proc.sendInitialize = () => { initializeEntered.resolve() }
+
+    const starting = session.start({ announce: false })
+    await initializeEntered.promise
+    await session.runCommand('hi')
+    const ok = await starting
+
+    expect(ok).toBe(false)
+    expect(consoleCalls).toBe(1)
+    expect(proc.killCalls).toBe(0)
+    expect(session.proc).toBe(proc)
+  })
+
+  test('a stale spawn still kills its local process after a newer pending spawn replaces the marker', async () => {
+    const session = new Session('lifecycle-overlapping-pending-spawns', 'chat_id') as any
+    const staleProc = new FakeAgentProc('codex', 'thread-stale-pending')
+    const newerProc = new FakeAgentProc('codex', 'thread-newer-pending')
+    const staleLease = session.beginLifecycle('start')
+    session.pendingSpawnOwnership = { lease: staleLease, proc: staleProc }
+    const newerLease = session.beginLifecycle('restart')
+    session.pendingSpawnOwnership = { lease: newerLease, proc: newerProc }
+    session.proc = newerProc
+
+    await session.discardLocalProcess(staleLease, staleProc)
+
+    expect(staleProc.killCalls).toBe(1)
+    expect(newerProc.killCalls).toBe(0)
+    expect(session.proc).toBe(newerProc)
+    expect(session.pendingSpawnOwnership).toEqual({ lease: newerLease, proc: newerProc })
+  })
+
+  test('a stale start spawn exception cannot clear a newer process owner', async () => {
+    const session = new Session('lifecycle-stale-start-spawn-throw', 'chat_id') as any
+    const newerProc = new FakeAgentProc('claude', 'thread-newer-start-throw')
+    let lifecycleChanges = 0
+    session.selectedProvider = 'claude'
+    session.opts.onLifecycleChange = () => { lifecycleChanges++ }
+    session.spawnAgent = () => {
+      session.beginLifecycle('hi')
+      session.proc = newerProc
+      session.status = 'working'
+      throw new Error('stale start spawn failed')
+    }
+
+    const ok = await session.start({ announce: false })
+
+    expect(ok).toBe(false)
+    expect(session.proc).toBe(newerProc)
+    expect(session.status).toBe('working')
+    expect(lifecycleChanges).toBe(0)
+  })
+
+  test('a superseded kill cannot close its status card over a newer lifecycle owner', async () => {
+    const session = new Session('lifecycle-stale-kill-status', 'chat_id') as any
+    const oldProc = new FakeAgentProc('codex', 'thread-stale-kill')
+    const newerProc = new FakeAgentProc('codex', 'thread-newer-owner')
+    const statusCard = { cardId: 'card_stale_kill' }
+    let closeCalls = 0
+    session.selectedProvider = 'codex'
+    session.proc = oldProc
+    session.openStatusCard = async () => statusCard
+    session.closeStatusCard = async () => { closeCalls++ }
+    session.stop = async () => {
+      session.beginLifecycle('hi')
+      session.proc = newerProc
+    }
+
+    await session.runCommand('kill')
+
+    expect(closeCalls).toBe(0)
+    expect(session.proc).toBe(newerProc)
+    expect(newerProc.killCalls).toBe(0)
+  })
+
+  test('a superseded idle soft stop cannot close a status card returned after losing its lease', async () => {
+    const session = new Session('lifecycle-stale-soft-stop-card', 'chat_id') as any
+    const openEntered = deferred<void>()
+    const openRelease = deferred<void>()
+    const statusCard = { cardId: 'card_stale_soft_stop' }
+    let closeCalls = 0
+    session.openStatusCard = async () => {
+      openEntered.resolve()
+      await openRelease.promise
+      return statusCard
+    }
+    session.closeStatusCard = async () => { closeCalls++ }
+
+    const stopping = session.runCommand('st')
+    await openEntered.promise
+    session.beginLifecycle('hi')
+    openRelease.resolve()
+    await stopping
+
+    expect(closeCalls).toBe(0)
+  })
+
+  test('a superseded idle soft stop cannot send fallback text after a null status-card result', async () => {
+    const session = new Session('lifecycle-stale-soft-stop-fallback', 'chat_id') as any
+    const openEntered = deferred<void>()
+    const openRelease = deferred<void>()
+    session.openStatusCard = async () => {
+      openEntered.resolve()
+      await openRelease.promise
+      return null
+    }
+
+    const stopping = session.runCommand('st')
+    await openEntered.promise
+    session.beginLifecycle('hi')
+    openRelease.resolve()
+    await stopping
+
+    expect(sentTexts).not.toContain('⚪ 当前没有正在执行的 turn')
+  })
+
+  test('idle soft stop owns an explicit soft_stop lease while its status card opens', async () => {
+    const session = new Session('lifecycle-soft-stop-kind', 'chat_id') as any
+    const openEntered = deferred<void>()
+    const openRelease = deferred<void>()
+    let observedKind: unknown = null
+    session.openStatusCard = async () => {
+      observedKind = session.lifecycleOwner?.kind
+      openEntered.resolve()
+      await openRelease.promise
+      return null
+    }
+
+    const stopping = session.runCommand('st')
+    await openEntered.promise
+    openRelease.resolve()
+    await stopping
+
+    expect(observedKind).toBe('soft_stop')
+  })
+
+  test('a superseded hi cannot publish a ready console over a newer lifecycle owner', async () => {
+    const session = new Session('lifecycle-stale-hi-ready-status', 'chat_id') as any
+    const newerProc = new FakeAgentProc('claude', 'thread-newer-hi-owner')
+    const statusCard = { cardId: 'card_stale_hi' }
+    let replaceCalls = 0
+    session.selectedProvider = 'claude'
+    session.openStatusCard = async () => statusCard
+    session.replaceStatusCardWithConsole = async () => { replaceCalls++ }
+    session.start = async () => {
+      session.beginLifecycle('model')
+      session.proc = newerProc
+      session.status = 'working'
+      return true
+    }
+
+    await session.runCommand('hi')
+
+    expect(replaceCalls).toBe(0)
+    expect(session.proc).toBe(newerProc)
+    expect(session.status).toBe('working')
+  })
+
+  for (const [label, command, arrange] of [
+    ['restart', 'restart', (session: any, supersede: () => void) => {
+      session.currentTurn = turnState('card_stale_restart_status')
+      session.lastSessionId = 'thread-stale-status'
+      session.restart = async () => { supersede(); return false }
+    }],
+    ['strict retry', 'restart', (session: any, supersede: () => void) => {
+      installFailedWatchdogRecovery(session, {
+        proc: session.proc,
+        threadId: 'thread-stale-status',
+      })
+      session.resumeFailedWatchdogQueue = async () => { supersede(); return false }
+    }],
+    ['clear', 'clear', (session: any, supersede: () => void) => {
+      session.restart = async () => { supersede(); return false }
+    }],
+  ] as const) {
+    test(`a superseded ${label} cannot close its status card over a newer lifecycle owner`, async () => {
+      const session = new Session(`lifecycle-stale-${label.replaceAll(' ', '-')}-status`, 'chat_id') as any
+      const oldProc = new FakeAgentProc('codex', 'thread-stale-status')
+      const newerProc = new FakeAgentProc('codex', 'thread-newer-status-owner')
+      const statusCard = { cardId: `card_stale_${label.replaceAll(' ', '_')}` }
+      let closeCalls = 0
+      session.selectedProvider = 'codex'
+      session.proc = oldProc
+      session.openStatusCard = async () => statusCard
+      session.closeStatusCard = async () => { closeCalls++ }
+      const supersede = () => {
+        session.beginLifecycle('hi')
+        session.proc = newerProc
+      }
+      arrange(session, supersede)
+
+      await session.runCommand(command)
+
+      expect(closeCalls).toBe(0)
+      expect(session.proc).toBe(newerProc)
+      expect(newerProc.killCalls).toBe(0)
+    })
+  }
+
   test('idle provider teardown cancels a stopped turn interrupt and the replacement can interrupt', async () => {
     const session = new Session('interrupt-idle-provider-switch', 'chat_id') as any
     const oldProc = new FakeAgentProc('codex', 'thread-idle-old')
@@ -497,6 +891,45 @@ describe('Session watchdog recover-once action', () => {
     expect(JSON.stringify(sentCards.at(-1))).not.toContain('📥 收到')
   })
 
+  test('recovery waits for its Codex receipt and fails visibly when rejected', async () => {
+    const { session, proc } = armedRecoverySession()
+    const control = controlCodexDispatch(proc)
+    proc.onInterrupt = () => proc.emit('result', {})
+    let finished = false
+    const recovery = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+      .then(() => { finished = true })
+
+    await control.started
+    await Promise.resolve()
+    expect(finished).toBe(false)
+    control.reject(new Error('watchdog turn/start rejected'))
+    await recovery
+
+    expect(session.currentTurn).toBeNull()
+    expect(session.status).toBe('stopped')
+    expect(session.watchdogResumeFailed).toBe(true)
+    expect(proc.sentTexts).toContain(WATCHDOG_RECOVERY_PROMPT)
+  })
+
+  test('recovery ACK cannot complete after its recovery turn owner is replaced', async () => {
+    const { session, proc } = armedRecoverySession()
+    const control = controlCodexDispatch(proc)
+    proc.onInterrupt = () => proc.emit('result', {})
+    const recovery = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+
+    await control.started
+    const replacementTurn = turnState('card_watchdog_receipt_replacement')
+    replacementTurn.trigger = 'user_message'
+    session.currentTurn = replacementTurn
+    session.status = 'starting'
+    control.ack('turn-old-watchdog-recovery')
+    await recovery
+
+    expect(session.currentTurn).toBe(replacementTurn)
+    expect(session.status).toBe('starting')
+    expect(session.watchdogResumeFailed).toBe(true)
+  })
+
   test('process exit settles the old turn then immediately resumes the same thread', async () => {
     const { session, proc } = armedRecoverySession()
     const resumed = new FakeAgentProc('codex', 'thread-1')
@@ -511,11 +944,23 @@ describe('Session watchdog recover-once action', () => {
       session.proc = resumed
       return true
     }
-    proc.onInterrupt = () => proc.emit('exit', { code: 0, signal: 'SIGTERM', expected: true })
+    proc.onInterrupt = () => {
+      // 模拟 ask/permission 恰好落在恢复 grace 窗口内、随后进程退出:
+      // 早于 runWatchdogRecovery 播种会被人工介入 guard 拦下,不达本分支。
+      session.pendingAsks.set('ask-interrupted-exit', { toolUseId: 'ask-interrupted-exit' })
+      session.pendingHostAsks.set('hask-interrupted-exit', { requestId: 'hask-interrupted-exit' })
+      session.pendingPermissions.set('perm-interrupted-exit', { requestId: 'perm-interrupted-exit' })
+      proc.emit('exit', { code: 0, signal: 'SIGTERM', expected: true })
+    }
 
     await session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
 
     expect(resumed.sentTexts).toEqual([WATCHDOG_RECOVERY_PROMPT])
+    // 死进程的问答状态不可能再被回答;真实 restart 会清,但这个分支
+    // 自身也必须清 —— 恢复流程里 restart 可能被 mock/失败短路。
+    expect(session.pendingAsks.size).toBe(0)
+    expect(session.pendingHostAsks.size).toBe(0)
+    expect(session.pendingPermissions.size).toBe(0)
   })
 
   test('Task 6 repair: stale ownership after awaited strict restart leaves the replacement human turn untouched', async () => {
@@ -591,41 +1036,30 @@ describe('Session watchdog recover-once action', () => {
     }
   })
 
-  test('Task 6 repair: strict resume skips restart when the persisted thread no longer matches the capture', async () => {
+  test('strict resume uses the captured thread when mutable lastSessionId no longer matches', async () => {
     const { session, proc, turn } = armedRecoverySession()
     const capturedThreadId = 'captured-thread-id-123456789'
     const currentThreadId = 'current-thread-id-987654321'
-    let restartCalls = 0
+    const restartOptions: any[] = []
     proc.sessionId = capturedThreadId
     session.watchdogContext.threadId = capturedThreadId
     turn.backendThreadId = capturedThreadId
     session.lastSessionId = currentThreadId
-    session.restart = async () => {
-      restartCalls++
+    session.restart = async (_resume: boolean, opts: any) => {
+      restartOptions.push(opts)
       return false
     }
     proc.onInterrupt = () => proc.emit('exit', { code: 0, signal: 'SIGTERM', expected: true })
     cardkit.recordCardCreated(turn.cardId, 1)
-    const originalStderrWrite = process.stderr.write
-    let stderr = ''
-    process.stderr.write = ((chunk: any) => {
-      stderr += String(chunk)
-      return true
-    }) as typeof process.stderr.write
+    await session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
 
-    try {
-      await session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
-    } finally {
-      process.stderr.write = originalStderrWrite
-    }
-
-    expect(restartCalls).toBe(0)
-    expect(session.currentTurn).toBe(turn)
-    expect(sentRawTexts.some(text => text.includes('自动恢复失败'))).toBe(false)
-    expect(stderr).toContain(capturedThreadId.slice(0, 8))
-    expect(stderr).toContain(currentThreadId.slice(0, 8))
-    expect(stderr).not.toContain(capturedThreadId)
-    expect(stderr).not.toContain(currentThreadId)
+    expect(restartOptions).toHaveLength(1)
+    expect(restartOptions[0].resumeIdentity).toEqual({
+      provider: 'codex',
+      threadId: capturedThreadId,
+    })
+    expect(session.lastSessionId).toBe(currentThreadId)
+    expect(session.watchdogResumeFailed).toBe(true)
   })
 
   test('grace timeout cancels the waiter then tears down and resumes once', async () => {
@@ -650,6 +1084,7 @@ describe('Session watchdog recover-once action', () => {
     await session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
 
     expect(session.status).toBe('stopped')
+    expect(session.watchdogResumeFailed).toBe(true)
     expect(proc.sentTexts).toEqual([])
     expect(sentCards.some(card => JSON.stringify(card).includes('自动恢复 1/1'))).toBe(false)
   })
@@ -691,6 +1126,7 @@ describe('Session watchdog recover-once action', () => {
     ).resolves.toBeUndefined()
 
     expect(session.status).toBe('stopped')
+    expect(session.watchdogResumeFailed).toBe(true)
     expect(sentRawTexts.some(text => text.includes('自动恢复失败'))).toBe(true)
     expect(proc.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
   })
@@ -708,6 +1144,8 @@ describe('Session watchdog recover-once action', () => {
   test('strict resume without a captured thread fails before destructive cleanup', async () => {
     const { session, proc, turn } = armedRecoverySession()
     session.lastSessionId = null
+    session.watchdogContext.threadId = null
+    turn.backendThreadId = null
     session.pendingMidTurnMsgs = [{
       text: 'human queued', wireText: 'human queued', userOpenId: 'ou_human', msgId: 'om_human',
     }]
@@ -996,6 +1434,25 @@ describe('Session watchdog recover-once action', () => {
     expect(proc.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
     expect(resumed.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
     expect(session.preservingRestartProc).toBeNull()
+    expect(session.proc).toBeNull()
+    expect(session.watchdogResumeFailed).toBe(true)
+    expect(session.status).toBe('stopped')
+
+    let coldStarts = 0
+    session.startColdUserTurn = async () => { coldStarts++ }
+    await session.onUserMessage(
+      'third human stays queued',
+      ['/tmp/third-human.txt'],
+      'ou_third_human',
+      'om_third_human',
+    )
+    expect(coldStarts).toBe(0)
+    expect(session.pendingMidTurnMsgs.map((msg: any) => msg.wireText)).toEqual([
+      'first queued human',
+      'second queued human',
+      '[file: /tmp/third-human.txt]\nthird human stays queued',
+    ])
+    expect(sentTexts).toContain('⚠️ thread 自动恢复失败；这条消息已保留，修复后发送 restart 继续。')
   })
 
   test('Task 6 repair: ordinary resume restart never installs a preserving marker', async () => {
@@ -1187,6 +1644,1515 @@ describe('Session watchdog recover-once action', () => {
   })
 })
 
+describe('Session detached watchdog card terminalization', () => {
+  /** 只让下一次 Card Kit HTTP 调用失败(返回指定 code),之后恢复本文件默认 mock。 */
+  function failNextCardKitWrite(code: number): void {
+    const previousFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      globalThis.fetch = previousFetch
+      const url = new URL(String(input))
+      calls.push({
+        method: String(init?.method ?? 'GET'),
+        path: url.pathname.replace('/open-apis/cardkit/v1', ''),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      })
+      return new Response(JSON.stringify({ code, msg: `injected failure ${code}` }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+  }
+
+  function cardTerminalWrites(cardId: string): { footer: FetchCall | undefined; settings: FetchCall | undefined } {
+    return {
+      footer: calls.find(call => call.method === 'PUT' && call.path === `/cards/${cardId}/elements/footer`),
+      settings: calls.find(call => call.method === 'PATCH' && call.path === `/cards/${cardId}/settings`),
+    }
+  }
+
+  test('captured watchdog process exit closes only its old card', async () => {
+    const { session, proc, turn } = armedRecoverySession()
+    const action = session.beginWatchdogAction(session.watchdogContext, 'watchdog-recovery')
+    expect(action).not.toBeNull()
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.pendingAsks.set('ask-watchdog-exit', { toolUseId: 'ask-watchdog-exit' })
+    session.pendingHostAsks.set('hask-watchdog-exit', { requestId: 'hask-watchdog-exit' })
+    session.pendingPermissions.set('perm-watchdog-exit', { requestId: 'perm-watchdog-exit' })
+
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+
+    expect(session.currentTurn).toBeNull()
+    expect(session.status).toBe('stopped')
+    expect(session.watchdogResumeFailed).toBe(true)
+    expect(session.pendingAsks.size).toBe(0)
+    expect(session.pendingHostAsks.size).toBe(0)
+    expect(session.pendingPermissions.size).toBe(0)
+
+    await waitFor(() => cardTerminalWrites(turn.cardId).settings !== undefined)
+    const writes = cardTerminalWrites(turn.cardId)
+    expect(JSON.parse(writes.footer?.body?.element ?? '{}').content)
+      .toContain('自动恢复失败')
+    expect(JSON.parse(writes.settings?.body?.settings ?? '{}'))
+      .toMatchObject({ config: { streaming_mode: false } })
+    // dispose 清掉卡状态(elementCount 归 0)后 fallback 决策已成定局,
+    // 此时再断言"成功路径不发 raw 文本"才不会漏掉迟到的兜底发送。
+    await waitFor(() => cardkit.getElementCount(turn.cardId) === 0)
+    await Promise.resolve()
+    expect(sentRawTexts.some(text => text.includes('自动恢复失败'))).toBe(false)
+  })
+
+  test('deferred old-card cleanup cannot mutate a replacement turn', async () => {
+    const { session, proc, turn } = armedRecoverySession()
+    const action = session.beginWatchdogAction(session.watchdogContext, 'watchdog-recovery')
+    expect(action).not.toBeNull()
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const rotating = deferred<void>()
+    turn.rotating = rotating.promise
+
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+    expect(session.currentTurn).toBeNull()
+
+    const replacementProc = new FakeAgentProc('codex', 'thread-replacement')
+    const replacementTurn = turnState('card_watchdog_detached_replacement')
+    const replacementReactions = new Map([['om_replacement', 'reaction-replacement']])
+    session.proc = replacementProc
+    session.currentTurn = replacementTurn
+    session.status = 'working'
+    session.pendingReactionIds = replacementReactions
+    session.beginWatchdogTurn(replacementTurn, replacementProc, 0)
+    const replacementContext = session.watchdogContext
+    expect(replacementContext?.turn).toBe(replacementTurn)
+    // 哨兵 footer 计时器:若清理误停 replacement 的 footer(读了可变
+    // currentTurn),这个句柄会被清空。afterEach 的 stopFooterStatus 会回收。
+    replacementTurn.footerStatusHandle = setInterval(() => {}, 60_000)
+
+    rotating.resolve(undefined)
+    await waitFor(() => cardTerminalWrites(turn.cardId).settings !== undefined)
+
+    expect(session.proc).toBe(replacementProc)
+    expect(session.currentTurn).toBe(replacementTurn)
+    expect(session.status).toBe('working')
+    expect(session.pendingReactionIds).toBe(replacementReactions)
+    expect(session.watchdogContext).toBe(replacementContext)
+    expect(replacementTurn.footerStatusHandle).not.toBeNull()
+    expect(cardTerminalWrites('card_watchdog_detached_replacement').footer).toBeUndefined()
+    expect(cardTerminalWrites('card_watchdog_detached_replacement').settings).toBeUndefined()
+  })
+
+  test('failed old-card terminal write sends one raw fallback', async () => {
+    const { session, proc, turn } = armedRecoverySession()
+    const action = session.beginWatchdogAction(session.watchdogContext, 'watchdog-recovery')
+    expect(action).not.toBeNull()
+    cardkit.recordCardCreated(turn.cardId, 1)
+    failNextCardKitWrite(300317)
+
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+
+    await waitFor(() => sentRawTexts.some(text => text.includes('自动恢复失败')))
+    // 等 dispose 落地(elementCount 归 0)再校验只发过一次兜底。
+    await waitFor(() => cardkit.getElementCount(turn.cardId) === 0)
+    await Promise.resolve()
+    expect(sentRawTexts.filter(text => text.includes('自动恢复失败'))).toHaveLength(1)
+  })
+})
+
+describe('Session watchdog human-priority races', () => {
+  test('captured process exit before watchdog interrupt ownership preserves queued human work', async () => {
+    const { session, proc, turn } = dueWatchdogSession()
+    const resumed = new FakeAgentProc('codex', 'thread-1')
+    const footerEntered = deferred<void>()
+    const footerRelease = deferred<void>()
+    session.lastSessionId = 'thread-1'
+    session.spawnAgent = (resumeSessionId?: string) => {
+      expect(resumeSessionId).toBe('thread-1')
+      return resumed
+    }
+    resumed.sendInitialize = () => resumed.emit('init', { session_id: 'thread-1' })
+    session.replaceFooterContent = async () => {
+      footerEntered.resolve()
+      await footerRelease.promise
+    }
+
+    const action = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+    await footerEntered.promise
+    await session.onUserMessage(
+      'first before interrupt exit',
+      ['/tmp/first-before-exit.txt'],
+      'ou_first_before_exit',
+      'om_first_before_exit',
+    )
+    await session.onUserMessage(
+      'second before interrupt exit',
+      ['/tmp/second-a-before-exit.txt', '/tmp/second-b-before-exit.txt'],
+      'ou_second_before_exit',
+      'om_second_before_exit',
+    )
+    await waitFor(() => (
+      session.pendingReactionIds.get('om_first_before_exit') === 'reaction-om_first_before_exit' &&
+      session.pendingReactionIds.get('om_second_before_exit') === 'reaction-om_second_before_exit'
+    ))
+
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+    footerRelease.resolve()
+    await action
+
+    expect(session.pendingMidTurnMsgs).toEqual([{
+      text: 'first before interrupt exit',
+      wireText: '[file: /tmp/first-before-exit.txt]\nfirst before interrupt exit',
+      userOpenId: 'ou_first_before_exit',
+      msgId: 'om_first_before_exit',
+    }, {
+      text: 'second before interrupt exit',
+      wireText: '[file: /tmp/second-a-before-exit.txt] [file: /tmp/second-b-before-exit.txt]\nsecond before interrupt exit',
+      userOpenId: 'ou_second_before_exit',
+      msgId: 'om_second_before_exit',
+    }])
+    expect(session.pendingReactionIds).toEqual(new Map([
+      ['om_first_before_exit', 'reaction-om_first_before_exit'],
+      ['om_second_before_exit', 'reaction-om_second_before_exit'],
+    ]))
+    expect(deletedReactions).not.toContainEqual([
+      'om_first_before_exit',
+      'reaction-om_first_before_exit',
+    ])
+    expect(deletedReactions).not.toContainEqual([
+      'om_second_before_exit',
+      'reaction-om_second_before_exit',
+    ])
+    expect(session.proc).toBeNull()
+    expect(session.watchdogResumeFailed).toBe(true)
+    expect(session.status).toBe('stopped')
+
+    expect(await session.resumeFailedWatchdogQueue({ announce: false })).toBe(true)
+    expect(session.watchdogResumeFailed).toBe(false)
+    expect(resumed.sentTexts).toEqual([
+      '[file: /tmp/first-before-exit.txt]\nfirst before interrupt exit\n\n' +
+      '[file: /tmp/second-a-before-exit.txt] [file: /tmp/second-b-before-exit.txt]\nsecond before interrupt exit',
+    ])
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(session.pendingReactionIds).toEqual(new Map())
+    expect(session.currentBatchReactionIds).toEqual(new Map([
+      ['om_first_before_exit', 'reaction-om_first_before_exit'],
+      ['om_second_before_exit', 'reaction-om_second_before_exit'],
+    ]))
+    expect(session.currentTurn).not.toBe(turn)
+    expect(session.currentTurn).toMatchObject({
+      trigger: 'user_message',
+      userOpenId: 'ou_second_before_exit',
+    })
+  })
+
+  test('multi-message flush after a captured exit strict retry starts on the resumed process', async () => {
+    const { session, proc, turn } = dueWatchdogSession()
+    const resumed = new FakeAgentProc('codex', 'thread-1')
+    const footerEntered = deferred<void>()
+    const footerRelease = deferred<void>()
+    session.lastSessionId = 'thread-1'
+    session.spawnAgent = (resumeSessionId?: string) => {
+      expect(resumeSessionId).toBe('thread-1')
+      return resumed
+    }
+    resumed.sendInitialize = () => resumed.emit('init', { session_id: 'thread-1' })
+    session.replaceFooterContent = async () => {
+      footerEntered.resolve()
+      await footerRelease.promise
+    }
+
+    const action = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+    await footerEntered.promise
+    expect(await session.onMultiMessageInbound(
+      '>>>first buffered segment',
+      ['/tmp/first-buffered-a.txt', '/tmp/first-buffered-b.txt'],
+      'ou_first_buffered',
+      'om_first_buffered',
+    )).toBe(true)
+    expect(await session.onMultiMessageInbound(
+      'second buffered segment',
+      ['/tmp/second-buffered.txt'],
+      'ou_second_buffered',
+      'om_second_buffered',
+    )).toBe(true)
+    await waitFor(() => (
+      session.multiMsgReactions.get('om_first_buffered') === 'reaction-om_first_buffered' &&
+      session.multiMsgReactions.get('om_second_buffered') === 'reaction-om_second_buffered'
+    ))
+
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+    footerRelease.resolve()
+    await action
+
+    expect(session.watchdogResumeFailed).toBe(true)
+    expect(session.multiMsgBuffer).toEqual([{
+      text: 'first buffered segment',
+      files: ['/tmp/first-buffered-a.txt', '/tmp/first-buffered-b.txt'],
+      userOpenId: 'ou_first_buffered',
+      msgId: 'om_first_buffered',
+    }, {
+      text: 'second buffered segment',
+      files: ['/tmp/second-buffered.txt'],
+      userOpenId: 'ou_second_buffered',
+      msgId: 'om_second_buffered',
+    }])
+    expect(session.multiMsgReactions).toEqual(new Map([
+      ['om_first_buffered', 'reaction-om_first_buffered'],
+      ['om_second_buffered', 'reaction-om_second_buffered'],
+    ]))
+
+    expect(await session.resumeFailedWatchdogQueue({ announce: false })).toBe(true)
+    expect(session.watchdogResumeFailed).toBe(false)
+    expect(await session.onMultiMessageInbound(
+      '<<<third buffered segment',
+      ['/tmp/third-buffered.txt'],
+      'ou_third_buffered',
+      'om_third_buffered',
+    )).toBe(true)
+
+    expect(resumed.sentTexts).toEqual([
+      '[file: /tmp/first-buffered-a.txt] [file: /tmp/first-buffered-b.txt]\nfirst buffered segment\n\n' +
+      '[file: /tmp/second-buffered.txt]\nsecond buffered segment\n\n' +
+      '[file: /tmp/third-buffered.txt]\nthird buffered segment',
+    ])
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(session.pendingReactionIds).toEqual(new Map())
+    expect(session.multiMsgBuffer).toBeNull()
+    expect(session.multiMsgReactions).toEqual(new Map())
+    expect(session.currentTurn).not.toBe(turn)
+    expect(session.currentTurn).toMatchObject({
+      trigger: 'user_message',
+      userOpenId: 'ou_third_buffered',
+    })
+    expect(addedReactions).toEqual(expect.arrayContaining([
+      ['om_first_buffered', 'Pin'],
+      ['om_second_buffered', 'Pin'],
+      ['om_third_buffered', 'Pin'],
+    ]))
+    expect(addedReactions).not.toContainEqual(['om_third_buffered', 'OneSecond'])
+    expect(deletedReactions).toEqual(expect.arrayContaining([
+      ['om_first_buffered', 'reaction-om_first_buffered'],
+      ['om_second_buffered', 'reaction-om_second_buffered'],
+      ['om_third_buffered', 'reaction-om_third_buffered'],
+    ]))
+  })
+
+  test('manual retry after a captured exit without queued work detaches the stale turn', async () => {
+    const { session, proc, turn } = dueWatchdogSession()
+    const resumed = new FakeAgentProc('codex', 'thread-1')
+    const footerEntered = deferred<void>()
+    const footerRelease = deferred<void>()
+    session.lastSessionId = 'thread-1'
+    session.spawnAgent = (resumeSessionId?: string) => {
+      expect(resumeSessionId).toBe('thread-1')
+      return resumed
+    }
+    resumed.sendInitialize = () => resumed.emit('init', { session_id: 'thread-1' })
+    session.replaceFooterContent = async () => {
+      footerEntered.resolve()
+      await footerRelease.promise
+    }
+
+    const action = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+    await footerEntered.promise
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+    footerRelease.resolve()
+    await action
+
+    expect(session.watchdogResumeFailed).toBe(true)
+
+    expect(await session.resumeFailedWatchdogQueue({ announce: false })).toBe(true)
+    expect(session.watchdogResumeFailed).toBe(false)
+    expect(session.currentTurn).toBeNull()
+
+    await session.onUserMessage(
+      'first human after strict retry',
+      ['/tmp/after-strict-retry.txt'],
+      'ou_after_strict_retry',
+      'om_after_strict_retry',
+    )
+
+    expect(resumed.sentTexts).toEqual([
+      '[file: /tmp/after-strict-retry.txt]\nfirst human after strict retry',
+    ])
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(session.currentTurn).not.toBe(turn)
+    expect(session.currentTurn).toMatchObject({
+      trigger: 'user_message',
+      userOpenId: 'ou_after_strict_retry',
+    })
+  })
+
+  test('captured process exit after watchdog settlement preserves later human work', async () => {
+    const { session, proc, turn } = dueWatchdogSession()
+    const closeRelease = deferred<void>()
+    session.lastSessionId = 'thread-1'
+    proc.onInterrupt = () => {
+      turn.rotating = closeRelease.promise
+      proc.emit('result', {})
+    }
+
+    const action = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+    await waitFor(() => session.currentTurn === null && session.watchdogActionInFlight)
+    await session.onUserMessage(
+      'human after settlement before exit',
+      ['/tmp/after-settlement.txt'],
+      'ou_after_settlement',
+      'om_after_settlement',
+    )
+    await waitFor(() => (
+      session.pendingReactionIds.get('om_after_settlement') === 'reaction-om_after_settlement'
+    ))
+
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+    closeRelease.resolve()
+    await action
+
+    expect(session.pendingMidTurnMsgs).toEqual([{
+      text: 'human after settlement before exit',
+      wireText: '[file: /tmp/after-settlement.txt]\nhuman after settlement before exit',
+      userOpenId: 'ou_after_settlement',
+      msgId: 'om_after_settlement',
+    }])
+    expect(session.pendingReactionIds).toEqual(new Map([
+      ['om_after_settlement', 'reaction-om_after_settlement'],
+    ]))
+    expect(deletedReactions).not.toContainEqual([
+      'om_after_settlement',
+      'reaction-om_after_settlement',
+    ])
+    expect(session.proc).toBeNull()
+    expect(session.watchdogResumeFailed).toBe(true)
+    expect(session.status).toBe('stopped')
+  })
+
+  test('human input before the recovery footer patch completes cancels without consuming budget', async () => {
+    const { session, proc } = dueWatchdogSession()
+    const ctx = session.watchdogContext
+    const verdict = session.watchdog.evaluate(
+      WATCHDOG_DUE_AT,
+      session.watchdogSafetySnapshot(ctx),
+    )
+    expect(verdict.type).toBe('recover')
+    if (verdict.type !== 'recover') return
+
+    const footerEntered = deferred<void>()
+    const footerRelease = deferred<void>()
+    session.replaceFooterContent = async () => {
+      footerEntered.resolve()
+      await footerRelease.promise
+    }
+
+    const recovery = session.runWatchdogRecovery(ctx, verdict)
+    await footerEntered.promise
+    await session.onUserMessage(
+      'human wins before interrupt',
+      ['/tmp/watchdog-race.txt'],
+      'ou_human',
+      'om_before_interrupt',
+    )
+    footerRelease.resolve()
+    await recovery
+    await Promise.resolve()
+
+    expect(proc.interruptCalls).toBe(0)
+    expect(session.watchdog.snapshot().recoveryAttempt).toBe(0)
+    expect(session.pendingMidTurnMsgs).toEqual([{
+      text: 'human wins before interrupt',
+      wireText: '[file: /tmp/watchdog-race.txt]\nhuman wins before interrupt',
+      userOpenId: 'ou_human',
+      msgId: 'om_before_interrupt',
+    }])
+    expect(addedReactions).toContainEqual(['om_before_interrupt', 'OneSecond'])
+  })
+
+  test('two human messages during interrupt grace become one ordered human turn', async () => {
+    const { session, proc, turn } = dueWatchdogSession()
+    const interrupted = deferred<void>()
+    proc.onInterrupt = () => interrupted.resolve()
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    const recovery = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+    await interrupted.promise
+    await session.onUserMessage('first human', ['/tmp/first.txt'], 'ou_first', 'om_first')
+    await session.onUserMessage('second human', [], 'ou_second', 'om_second')
+    await Promise.resolve()
+    proc.emit('result', {})
+    await recovery
+
+    expect(proc.interruptCalls).toBe(1)
+    expect(proc.sentTexts).toEqual([
+      '[file: /tmp/first.txt]\nfirst human\n\nsecond human',
+    ])
+    expect(proc.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+    expect(session.currentTurn).toMatchObject({
+      trigger: 'user_message',
+      userOpenId: 'ou_second',
+    })
+    expect(deletedReactions).not.toContainEqual(['om_first', 'reaction-om_first'])
+    expect(deletedReactions).not.toContainEqual(['om_second', 'reaction-om_second'])
+  })
+
+  test('human input while strict resume awaits init is sent on the resumed process', async () => {
+    const { session, proc, turn } = dueWatchdogSession()
+    const resumed = new FakeAgentProc('codex', 'thread-1')
+    const initAwaited = deferred<void>()
+    session.lastSessionId = 'thread-1'
+    session.spawnAgent = () => resumed
+    resumed.sendInitialize = () => initAwaited.resolve()
+    proc.onInterrupt = () => proc.emit('exit', { code: 0, signal: 'SIGTERM', expected: true })
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    const recovery = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+    await initAwaited.promise
+    await session.onUserMessage(
+      'human while resume waits',
+      ['/tmp/resume.txt'],
+      'ou_resume_human',
+      'om_resume_human',
+    )
+    resumed.emit('init', { session_id: 'thread-1' })
+    await recovery
+
+    expect(resumed.sentTexts).toEqual([
+      '[file: /tmp/resume.txt]\nhuman while resume waits',
+    ])
+    expect(resumed.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+    expect(session.currentTurn).toMatchObject({
+      trigger: 'user_message',
+      userOpenId: 'ou_resume_human',
+    })
+  })
+
+  test('human input during recovery-card creation closes the empty recovery card and wins', async () => {
+    const { session, proc, turn } = dueWatchdogSession()
+    const recoveryCardStarted = deferred<void>()
+    const recoveryCardResult = deferred<string | null>()
+    let sendCount = 0
+    proc.onInterrupt = () => proc.emit('result', {})
+    cardkit.recordCardCreated(turn.cardId, 1)
+    feishuMockState.sendCard = async () => {
+      sendCount++
+      if (sendCount === 1) {
+        recoveryCardStarted.resolve()
+        return await recoveryCardResult.promise
+      }
+      return 'om_human_after_recovery_card'
+    }
+
+    try {
+      const recovery = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+      await recoveryCardStarted.promise
+      await session.onUserMessage(
+        'human during recovery card',
+        [],
+        'ou_recovery_card_human',
+        'om_recovery_card_human',
+      )
+      recoveryCardResult.resolve('om_empty_recovery_card')
+      await recovery
+
+      expect(proc.sentTexts).toEqual(['human during recovery card'])
+      expect(proc.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+      expect(session.currentTurn).toMatchObject({
+        trigger: 'user_message',
+        userOpenId: 'ou_recovery_card_human',
+      })
+      expect(calls.some(call => {
+        if (call.method !== 'PATCH' || !call.path.endsWith('/settings')) return false
+        return String(call.body?.settings ?? '').includes('真人消息优先')
+      })).toBe(true)
+    } finally {
+      recoveryCardResult.resolve(null)
+      feishuMockState.sendCard = null
+    }
+  })
+
+  test('failed recovery queues later human input instead of cold-starting', async () => {
+    const session = new Session('watchdog-failed-queue', 'chat_id') as any
+    let coldStarts = 0
+    session.selectedProvider = 'codex'
+    installFailedWatchdogRecovery(session)
+    session.startColdUserTurn = async () => { coldStarts++ }
+
+    await session.onUserMessage(
+      'preserve after failed resume',
+      ['/tmp/failed-resume.txt'],
+      'ou_failed_resume',
+      'om_failed_resume',
+    )
+    await Promise.resolve()
+
+    expect(coldStarts).toBe(0)
+    expect(session.pendingMidTurnMsgs).toEqual([{
+      text: 'preserve after failed resume',
+      wireText: '[file: /tmp/failed-resume.txt]\npreserve after failed resume',
+      userOpenId: 'ou_failed_resume',
+      msgId: 'om_failed_resume',
+    }])
+    expect(sentTexts).toContain('⚠️ thread 自动恢复失败；这条消息已保留，修复后发送 restart 继续。')
+    expect(addedReactions).toContainEqual(['om_failed_resume', 'OneSecond'])
+  })
+})
+
+describe('Session watchdog scheduler and exhausted budget', () => {
+  test('arming the watchdog turn wires a live tick interval to the real evaluator', () => {
+    // 不注入时间、不直接调 evaluateWatchdogTick:捕获 beginWatchdogTurn
+    // 真正注册的 interval 回调并触发它,覆盖 setInterval 接线 + 默认
+    // Date.now() 路径 —— 这条接线断了,449 个注入式测试全绿但生产永远不触发。
+    const originalSetInterval = globalThis.setInterval
+    const tickCallbacks: Array<() => void> = []
+    globalThis.setInterval = ((handler: () => void, ms?: number, ...rest: unknown[]) => {
+      tickCallbacks.push(handler)
+      return (originalSetInterval as any)(() => {}, ms ?? 60_000, ...rest)
+    }) as typeof setInterval
+    try {
+      const { session, turn } = wiredWatchdogSession('codex')
+      expect(session.watchdogTickHandle).not.toBeNull()
+      expect(tickCallbacks.length).toBeGreaterThan(0)
+      expect(() => {
+        for (const tick of tickCallbacks) tick()
+      }).not.toThrow()
+      // 刚开轮、无 idle:真实时间路径下不得产生任何告警/恢复副作用。
+      expect(turn.footerStatusOverride ?? null).toBeNull()
+      expect(session.watchdogActionInFlight).toBe(false)
+    } finally {
+      globalThis.setInterval = originalSetInterval
+    }
+  })
+
+  test('stale watchdog recovery finally cannot clear a newer watchdog action token', async () => {
+    const { session } = dueWatchdogSession()
+    const footerEntered = deferred<void>()
+    const footerRelease = deferred<void>()
+    session.replaceFooterContent = async () => {
+      footerEntered.resolve()
+      await footerRelease.promise
+    }
+
+    const staleRecovery = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+    await footerEntered.promise
+    const staleTransaction = session.watchdogAction
+    session.beginLifecycle('hi')
+    const newerTransaction = session.beginWatchdogAction(
+      session.watchdogContext,
+      'watchdog-recovery',
+    )
+    expect(newerTransaction).not.toBeNull()
+    expect(newerTransaction).not.toBe(staleTransaction)
+
+    footerRelease.resolve()
+    await staleRecovery
+
+    expect(session.watchdogAction).toBe(newerTransaction)
+    expect(session.watchdogActionInFlight).toBe(true)
+    session.finishWatchdogAction(newerTransaction)
+  })
+
+  test('two due ticks launch exactly one recovery interrupt', async () => {
+    const { session, proc, turn } = dueWatchdogSession()
+    expect(typeof session.evaluateWatchdogTick).toBe('function')
+    const footerEntered = deferred<void>()
+    const footerRelease = deferred<void>()
+    session.replaceFooterContent = async () => {
+      footerEntered.resolve()
+      await footerRelease.promise
+    }
+    proc.onInterrupt = () => proc.emit('result', {})
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    session.evaluateWatchdogTick(WATCHDOG_DUE_AT)
+    await footerEntered.promise
+    session.evaluateWatchdogTick(WATCHDOG_DUE_AT)
+    footerRelease.resolve()
+    await waitFor(() => !session.watchdogActionInFlight)
+
+    expect(proc.interruptCalls).toBe(1)
+  })
+
+  test('an open multi-message buffer suppresses recovery and survives a preserving restart', async () => {
+    const { session, proc } = dueWatchdogSession()
+    const resumed = new FakeAgentProc('codex', 'thread-1')
+    const buffered = [{
+      text: 'buffered segment', files: ['/tmp/buffered.txt'],
+      userOpenId: 'ou_buffered', msgId: 'om_buffered',
+    }]
+    session.multiMsgBuffer = buffered
+    session.lastSessionId = 'thread-1'
+    session.spawnAgent = () => resumed
+    resumed.sendInitialize = () => resumed.emit('init', { session_id: 'thread-1' })
+    expect(typeof session.evaluateWatchdogTick).toBe('function')
+
+    session.evaluateWatchdogTick(WATCHDOG_DUE_AT)
+    await Promise.resolve()
+    expect(proc.interruptCalls).toBe(0)
+
+    const ok = await session.restart(true, {
+      announce: false,
+      requireResumeSession: true,
+      preserveCurrentTurn: true,
+      preserveQueuedHumanWork: true,
+    })
+    expect(ok).toBe(true)
+    expect(session.multiMsgBuffer).toEqual(buffered)
+  })
+
+  test('the second confirmed loop interrupts and stops without a third turn', async () => {
+    const { session, proc, turn } = dueWatchdogSession({ recoveryAttempt: 1 })
+    const interrupted = deferred<void>()
+    proc.onInterrupt = () => interrupted.resolve()
+    cardkit.recordCardCreated(turn.cardId, 1)
+    expect(typeof session.evaluateWatchdogTick).toBe('function')
+
+    session.evaluateWatchdogTick(WATCHDOG_DUE_AT)
+    await interrupted.promise
+    proc.emit('result', {})
+    await waitFor(() => !session.watchdogActionInFlight)
+
+    expect(proc.interruptCalls).toBe(1)
+    expect(proc.sentTexts).toEqual([])
+    expect(proc.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+    expect(sentCards).toEqual([])
+    expect(session.currentTurn).toBeNull()
+    expect(session.status).toBe('idle')
+  })
+
+  test('human input after the exhausted interrupt starts a fresh human chain', async () => {
+    const { session, proc, turn } = dueWatchdogSession({ recoveryAttempt: 1 })
+    const interrupted = deferred<void>()
+    proc.onInterrupt = () => interrupted.resolve()
+    cardkit.recordCardCreated(turn.cardId, 1)
+    expect(typeof session.evaluateWatchdogTick).toBe('function')
+
+    session.evaluateWatchdogTick(WATCHDOG_DUE_AT)
+    await interrupted.promise
+    await session.onUserMessage(
+      'human after exhausted interrupt',
+      [],
+      'ou_exhausted_human',
+      'om_exhausted_human',
+    )
+    proc.emit('result', {})
+    await waitFor(() => !session.watchdogActionInFlight)
+
+    expect(proc.sentTexts).toEqual(['human after exhausted interrupt'])
+    expect(proc.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+    expect(session.currentTurn).toMatchObject({
+      trigger: 'user_message',
+      userOpenId: 'ou_exhausted_human',
+    })
+    expect(session.watchdog.snapshot().recoveryAttempt).toBe(0)
+  })
+
+  test('exhausted settlement never drains queued human work into a replacement thread', async () => {
+    const { session, proc, turn } = dueWatchdogSession({ recoveryAttempt: 1 })
+    const replacement = new FakeAgentProc('codex', 'thread-replacement')
+    const settlementEntered = deferred<void>()
+    const settlementRelease = deferred<any>()
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.waitForTurnSettlement = async () => {
+      settlementEntered.resolve()
+      return await settlementRelease.promise
+    }
+
+    const action = session.runWatchdogExhausted(session.watchdogContext, {
+      type: 'stop_exhausted', idleMs: 900_000, repeatCount: 10,
+      fingerprintHash: 'b'.repeat(64),
+    })
+    await settlementEntered.promise
+    session.proc = replacement
+    session.wireProc(replacement)
+    await session.onUserMessage(
+      'human must stay on captured thread',
+      [],
+      'ou_wrong_thread_guard',
+      'om_wrong_thread_guard',
+    )
+    settlementRelease.resolve({ type: 'result', proc, turn })
+    await action
+
+    expect(replacement.sentTexts).toEqual([])
+    expect(replacement.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+    expect(session.pendingMidTurnMsgs.map((msg: any) => msg.text)).toEqual([
+      'human must stay on captured thread',
+    ])
+    expect(session.watchdogResumeFailed).toBe(true)
+    expect(session.status).toBe('stopped')
+  })
+
+  test('exhausted settlement never drains queued human work into a same-thread replacement process', async () => {
+    const { session, proc, turn } = dueWatchdogSession({ recoveryAttempt: 1 })
+    const replacement = new FakeAgentProc('codex', 'thread-1')
+    const settlementEntered = deferred<void>()
+    const settlementRelease = deferred<any>()
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.waitForTurnSettlement = async () => {
+      settlementEntered.resolve()
+      return await settlementRelease.promise
+    }
+
+    const action = session.runWatchdogExhausted(session.watchdogContext, {
+      type: 'stop_exhausted', idleMs: 900_000, repeatCount: 10,
+      fingerprintHash: 'c'.repeat(64),
+    })
+    await settlementEntered.promise
+    session.proc = replacement
+    session.wireProc(replacement)
+    await session.onUserMessage(
+      'human must stay on captured process',
+      [],
+      'ou_same_thread_guard',
+      'om_same_thread_guard',
+    )
+    settlementRelease.resolve({ type: 'result', proc, turn })
+    await action
+
+    expect(proc.isAlive()).toBe(true)
+    expect(replacement.isAlive()).toBe(true)
+    expect(replacement.sentTexts).toEqual([])
+    expect(replacement.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+    expect(session.pendingMidTurnMsgs.map((msg: any) => msg.text)).toEqual([
+      'human must stay on captured process',
+    ])
+    expect(session.watchdogResumeFailed).toBe(true)
+    expect(session.status).toBe('stopped')
+  })
+
+  test('exhausted timeout detaches then kills only the captured process', async () => {
+    const { session, proc, turn } = dueWatchdogSession({ recoveryAttempt: 1 })
+    const verdict = session.watchdog.evaluate(
+      WATCHDOG_DUE_AT,
+      session.watchdogSafetySnapshot(session.watchdogContext),
+    )
+    expect(verdict.type).toBe('stop_exhausted')
+    expect(typeof session.runWatchdogExhausted).toBe('function')
+    if (verdict.type !== 'stop_exhausted') return
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.waitForTurnSettlement = async () => ({ type: 'timeout' })
+    let detachedAtKill = false
+    proc.kill = async () => {
+      proc.killCalls++
+      detachedAtKill = session.proc === null
+      proc.alive = false
+      proc.emit('exit', { code: 0, signal: 'SIGTERM', expected: true })
+    }
+
+    await session.runWatchdogExhausted(session.watchdogContext, verdict)
+
+    expect(detachedAtKill).toBe(true)
+    expect(proc.killCalls).toBe(1)
+    expect(session.proc).toBeNull()
+    expect(session.status).toBe('stopped')
+  })
+
+  test('exhausted timeout kills the captured process without touching a replacement owner', async () => {
+    const { session, proc, turn } = dueWatchdogSession({ recoveryAttempt: 1 })
+    const replacement = new FakeAgentProc('codex', 'thread-replacement')
+    const verdict = session.watchdog.evaluate(
+      WATCHDOG_DUE_AT,
+      session.watchdogSafetySnapshot(session.watchdogContext),
+    )
+    expect(verdict.type).toBe('stop_exhausted')
+    if (verdict.type !== 'stop_exhausted') return
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.waitForTurnSettlement = async () => {
+      session.proc = replacement
+      session.wireProc(replacement)
+      return { type: 'timeout' }
+    }
+
+    await session.runWatchdogExhausted(session.watchdogContext, verdict)
+
+    expect(proc.killCalls).toBe(1)
+    expect(replacement.killCalls).toBe(0)
+    expect(session.proc).toBe(replacement)
+  })
+})
+
+describe('Session watchdog runtime cleanup', () => {
+  test('natural result closes the watchdog context and scheduler tick', async () => {
+    const { session, proc, turn } = armedRecoverySession()
+    const closed = deferred<void>()
+    const realClose = session.closeTurnCard.bind(session)
+    session.closeTurnCard = async (...args: any[]) => {
+      await realClose(...args)
+      closed.resolve()
+    }
+    cardkit.recordCardCreated(turn.cardId, 1)
+    expect(session.watchdogTickHandle).not.toBeNull()
+
+    proc.emit('result', {})
+    await closed.promise
+
+    expect(session.watchdogContext).toBeNull()
+    expect(session.watchdogTickHandle).toBeNull()
+    expect(session.activeTurnInterrupt).toBeNull()
+  })
+
+  test('natural exit clears watchdog state, waiter, and Codex activity ownership', async () => {
+    const { session, proc } = armedRecoverySession()
+    const interrupt = session.beginTurnInterrupt('user')
+    session.codexCollabAgentStates.set('agent-1', 'running')
+    session.codexCollabAgentStatesByTool.set('tool-1', new Map([['agent-1', 'running']]))
+    session.codexSubagentActivityIds.add('activity-1')
+    session.activeCodexSubagentActivities.add('agent-1')
+    session.pendingWatchdogIdentity = {
+      proc, threadId: 'thread-1', turnId: 'turn-1', turnCounter: 1,
+    }
+    expect(interrupt).not.toBeNull()
+    expect(session.watchdogTickHandle).not.toBeNull()
+
+    proc.alive = false
+    proc.emit('exit', { code: 0, signal: null, expected: true })
+
+    expect(session.watchdogContext).toBeNull()
+    expect(session.watchdogTickHandle).toBeNull()
+    expect(session.activeTurnInterrupt).toBeNull()
+    expect(session.codexCollabAgentStates.size).toBe(0)
+    expect(session.codexCollabAgentStatesByTool.size).toBe(0)
+    expect(session.codexSubagentActivityIds.size).toBe(0)
+    expect(session.activeCodexSubagentActivities.size).toBe(0)
+    expect(session.pendingWatchdogIdentity).toBeNull()
+  })
+
+  test('soft stop ends watchdog observation but leaves its user waiter settleable', async () => {
+    const { session, proc, turn } = armedRecoverySession()
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    await session.runCommand('st')
+    const interrupt = session.activeTurnInterrupt
+
+    expect(interrupt?.source).toBe('user')
+    expect(session.watchdogContext).toBeNull()
+    expect(session.watchdogTickHandle).toBeNull()
+    proc.emit('result', {})
+    expect(await interrupt.promise).toMatchObject({ type: 'result' })
+    expect(session.activeTurnInterrupt).toBeNull()
+  })
+
+  test('soft stop preserves failed-recovery reaction ownership while closing the turn', async () => {
+    const { session, proc, turn } = armedRecoverySession()
+    installFailedWatchdogRecovery(session, { proc, turn })
+    session.pendingMidTurnMsgs = [{
+      text: 'preserved after st',
+      wireText: 'preserved after st',
+      userOpenId: 'ou_preserved_after_st',
+      msgId: 'om_preserved_after_st',
+    }]
+    session.pendingReactionIds = new Map([
+      ['om_preserved_after_st', 'reaction-preserved-after-st'],
+    ])
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    await session.runCommand('st')
+
+    expect(session.watchdogResumeFailed).toBe(true)
+    expect(session.pendingMidTurnMsgs).toHaveLength(1)
+    expect(session.pendingReactionIds).toEqual(new Map([
+      ['om_preserved_after_st', 'reaction-preserved-after-st'],
+    ]))
+    expect(deletedReactions).not.toContainEqual([
+      'om_preserved_after_st',
+      'reaction-preserved-after-st',
+    ])
+  })
+
+  for (const [label, action] of [
+    ['full stop', async (session: any) => { await session.stop('cleanup test', { announce: false }) }],
+    ['ordinary restart', async (session: any) => {
+      session.start = async () => true
+      await session.restart(false, { announce: false })
+    }],
+    ['dispose', async (session: any) => { session.dispose() }],
+    ['kl command', async (session: any) => { await session.runCommand('kl') }],
+  ] as const) {
+    test(`${label} cancels the outstanding waiter and scheduler tick`, async () => {
+      const { session } = armedRecoverySession()
+      const interrupt = session.beginTurnInterrupt('user')
+      expect(interrupt).not.toBeNull()
+      expect(session.watchdogTickHandle).not.toBeNull()
+
+      await action(session)
+
+      expect(session.activeTurnInterrupt).toBeNull()
+      expect(session.watchdogTickHandle).toBeNull()
+      expect((await interrupt.promise).type).toBe('cancelled')
+    })
+  }
+
+  test('failed resume latch survives a failed manual retry and clears after success', async () => {
+    const { session, proc } = armedRecoverySession()
+    session.currentTurn = null
+    session.endWatchdogTurn()
+    installFailedWatchdogRecovery(session, { proc, turn: turnState('card_manual_retry_latch') })
+    session.pendingMidTurnMsgs = [{
+      text: 'queued human', wireText: 'queued human',
+      userOpenId: 'ou_queued', msgId: 'om_queued_human',
+    }]
+    const restartResults = [false, true]
+    const restartOptions: any[] = []
+    let drains = 0
+    session.restart = async (resume: boolean, opts: any) => {
+      expect(resume).toBe(true)
+      restartOptions.push(opts)
+      session.proc = proc
+      proc.alive = true
+      const result = restartResults.shift() ?? false
+      if (result) session.preservedWatchdogRecovery.replacementProc = proc
+      return result
+    }
+    session.drainMidTurnAndOpen = async () => {
+      drains++
+      session.pendingMidTurnMsgs = []
+      return 'committed'
+    }
+    expect(typeof session.resumeFailedWatchdogQueue).toBe('function')
+
+    expect(await session.resumeFailedWatchdogQueue({ announce: false })).toBe(false)
+    expect(session.watchdogResumeFailed).toBe(true)
+    expect(session.pendingMidTurnMsgs).toHaveLength(1)
+    expect(drains).toBe(0)
+
+    expect(await session.resumeFailedWatchdogQueue({ announce: false })).toBe(true)
+    expect(session.watchdogResumeFailed).toBe(false)
+    expect(session.preservingRestartProc).toBeNull()
+    expect(drains).toBe(1)
+    expect(restartOptions).toEqual([
+      expect.objectContaining({
+        requireResumeSession: true,
+        preserveCurrentTurn: true,
+        preserveQueuedHumanWork: true,
+      }),
+      expect.objectContaining({
+        requireResumeSession: true,
+        preserveCurrentTurn: true,
+        preserveQueuedHumanWork: true,
+      }),
+    ])
+  })
+
+  test('manual failed-recovery retry commits its captured batch when newer input arrives during card open', async () => {
+    const { session, proc } = armedRecoverySession()
+    const cardOpenEntered = deferred<void>()
+    const cardOpenResult = deferred<string | null>()
+    const captured = {
+      text: 'captured preserved input',
+      wireText: '[file: /tmp/captured-preserved.txt]\ncaptured preserved input',
+      userOpenId: 'ou_captured_preserved',
+      msgId: 'om_captured_preserved',
+    }
+    session.currentTurn = null
+    session.endWatchdogTurn()
+    installFailedWatchdogRecovery(session, { proc, turn: turnState('card_manual_retry_batch') })
+    session.pendingMidTurnMsgs = [captured]
+    session.pendingReactionIds = new Map([
+      ['om_captured_preserved', 'reaction-om_captured_preserved'],
+    ])
+    session.restart = async () => {
+      session.proc = proc
+      proc.alive = true
+      session.preservedWatchdogRecovery.replacementProc = proc
+      return true
+    }
+    feishuMockState.sendCard = async () => {
+      cardOpenEntered.resolve()
+      return await cardOpenResult.promise
+    }
+
+    let resumed = false
+    try {
+      const retry = session.resumeFailedWatchdogQueue({ announce: false })
+      await cardOpenEntered.promise
+      await session.onUserMessage(
+        'newer input during captured open',
+        ['/tmp/newer-during-open.txt'],
+        'ou_newer_during_open',
+        'om_newer_during_open',
+      )
+      await waitFor(() => (
+        session.pendingReactionIds.get('om_newer_during_open') === 'reaction-om_newer_during_open'
+      ))
+      cardOpenResult.resolve('om_captured_preserved_card')
+      resumed = await retry
+    } finally {
+      cardOpenResult.resolve(null)
+      feishuMockState.sendCard = null
+    }
+
+    expect(resumed).toBe(true)
+    expect(session.watchdogResumeFailed).toBe(false)
+    expect(session.status).toBe('working')
+    expect(proc.sentTexts).toEqual([
+      '[file: /tmp/captured-preserved.txt]\ncaptured preserved input',
+    ])
+    expect(session.pendingMidTurnMsgs).toEqual([{
+      text: 'newer input during captured open',
+      wireText: '[file: /tmp/newer-during-open.txt]\nnewer input during captured open',
+      userOpenId: 'ou_newer_during_open',
+      msgId: 'om_newer_during_open',
+    }])
+    expect(session.currentBatchReactionIds).toEqual(new Map([
+      ['om_captured_preserved', 'reaction-om_captured_preserved'],
+    ]))
+    expect(session.pendingReactionIds).toEqual(new Map([
+      ['om_newer_during_open', 'reaction-om_newer_during_open'],
+    ]))
+  })
+
+  for (const [label, recoveryAttempt] of [
+    ['recovery', 0],
+    ['exhausted', 1],
+  ] as const) {
+    test(`${label} keeps failed-resume ownership when the captured human batch card cannot open`, async () => {
+      const { session, proc, turn } = dueWatchdogSession({ recoveryAttempt })
+      const humanQueued = deferred<void>()
+      session.lastSessionId = 'thread-1'
+      cardkit.recordCardCreated(turn.cardId, 1)
+      feishuMockState.sendCard = async () => null
+      proc.onInterrupt = () => {
+        void session.onUserMessage(
+          `${label} captured human`,
+          [`/tmp/${label}-captured.txt`],
+          `ou_${label}_captured`,
+          `om_${label}_captured`,
+        ).then(() => {
+          humanQueued.resolve()
+          proc.emit('result', {})
+        })
+      }
+
+      try {
+        const action = recoveryAttempt === 0
+          ? session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+          : session.runWatchdogExhausted(session.watchdogContext, {
+              type: 'stop_exhausted', idleMs: 900_000, repeatCount: 10,
+              fingerprintHash: 'd'.repeat(64),
+            })
+        await humanQueued.promise
+        await action
+        await waitFor(() => (
+          session.pendingReactionIds.get(`om_${label}_captured`) === `reaction-om_${label}_captured`
+        ))
+
+        expect(proc.sentTexts).toEqual([])
+        expect(session.pendingMidTurnMsgs).toEqual([{
+          text: `${label} captured human`,
+          wireText: `[file: /tmp/${label}-captured.txt]\n${label} captured human`,
+          userOpenId: `ou_${label}_captured`,
+          msgId: `om_${label}_captured`,
+        }])
+        expect(session.pendingReactionIds).toEqual(new Map([
+          [`om_${label}_captured`, `reaction-om_${label}_captured`],
+        ]))
+        expect(session.watchdogResumeFailed).toBe(true)
+        expect(session.status).toBe('stopped')
+        expect(sentRawTexts.some(text => text.includes('自动恢复失败'))).toBe(true)
+      } finally {
+        feishuMockState.sendCard = null
+      }
+    })
+  }
+
+  test('hi preserves the failed-resume latch and cannot run newer input ahead of the saved queue', async () => {
+    const session = new Session('watchdog-hi-failed-resume', 'chat_id') as any
+    const freshProc = new FakeAgentProc('codex', 'fresh-thread')
+    let startCalls = 0
+    let coldStarts = 0
+    session.selectedProvider = 'codex'
+    installFailedWatchdogRecovery(session)
+    session.lastSessionId = 'thread-1'
+    session.pendingMidTurnMsgs = [{
+      text: 'preserved older input',
+      wireText: '[file: /tmp/preserved-older.txt]\npreserved older input',
+      userOpenId: 'ou_preserved_older',
+      msgId: 'om_preserved_older',
+    }]
+    session.pendingReactionIds = new Map([
+      ['om_preserved_older', 'reaction-om_preserved_older'],
+    ])
+    session.openStatusCard = async () => null
+    session.closeStatusCard = async () => {}
+    session.showConsole = async () => {}
+    session.start = async () => {
+      startCalls++
+      session.proc = freshProc
+      return true
+    }
+    session.startColdUserTurn = async () => { coldStarts++ }
+
+    await session.runCommand('hi')
+    await session.onUserMessage(
+      'newer input after hi',
+      ['/tmp/newer-after-hi.txt'],
+      'ou_newer_after_hi',
+      'om_newer_after_hi',
+    )
+    await waitFor(() => (
+      session.pendingReactionIds.get('om_newer_after_hi') === 'reaction-om_newer_after_hi'
+    ))
+
+    expect(startCalls).toBe(0)
+    expect(coldStarts).toBe(0)
+    expect(session.proc).toBeNull()
+    expect(freshProc.sentTexts).toEqual([])
+    expect(session.watchdogResumeFailed).toBe(true)
+    expect(session.pendingMidTurnMsgs).toEqual([{
+      text: 'preserved older input',
+      wireText: '[file: /tmp/preserved-older.txt]\npreserved older input',
+      userOpenId: 'ou_preserved_older',
+      msgId: 'om_preserved_older',
+    }, {
+      text: 'newer input after hi',
+      wireText: '[file: /tmp/newer-after-hi.txt]\nnewer input after hi',
+      userOpenId: 'ou_newer_after_hi',
+      msgId: 'om_newer_after_hi',
+    }])
+    expect(sentTexts.some(text => text.includes('已保留') && text.includes('restart'))).toBe(true)
+  })
+
+  test('restart command routes a failed-recovery queue through strict resume helper', async () => {
+    const session = new Session('watchdog-manual-retry', 'chat_id') as any
+    installFailedWatchdogRecovery(session)
+    session.pendingMidTurnMsgs = [{
+      text: 'queued human', wireText: 'queued human',
+      userOpenId: 'ou_queued', msgId: 'om_queued_human',
+    }]
+    let helperCalls = 0
+    let ordinaryCalls = 0
+    session.resumeFailedWatchdogQueue = async () => { helperCalls++; return false }
+    session.restart = async () => { ordinaryCalls++; return false }
+    session.openStatusCard = async () => null
+
+    await session.runCommand('restart')
+
+    expect(helperCalls).toBe(1)
+    expect(ordinaryCalls).toBe(0)
+  })
+
+  test('manual retry keeps the latch when the preserved human card cannot open', async () => {
+    const { session, proc } = armedRecoverySession()
+    session.currentTurn = null
+    session.endWatchdogTurn()
+    installFailedWatchdogRecovery(session, { proc, turn: turnState('card_manual_retry_open_failure') })
+    session.pendingMidTurnMsgs = [{
+      text: 'still queued', wireText: 'still queued',
+      userOpenId: 'ou_still_queued', msgId: 'om_still_queued',
+    }]
+    session.restart = async () => {
+      session.proc = proc
+      session.preservedWatchdogRecovery.replacementProc = proc
+      return true
+    }
+    session.drainMidTurnAndOpen = async () => 'preserved'
+
+    expect(await session.resumeFailedWatchdogQueue({ announce: false })).toBe(false)
+    expect(session.watchdogResumeFailed).toBe(true)
+    expect(session.preservingRestartProc).toBe(proc)
+    expect(session.preservedWatchdogRecovery).toMatchObject({
+      provider: 'codex',
+      threadId: 'thread-1',
+      phase: 'failed',
+      replacementProc: proc,
+    })
+    expect(session.pendingMidTurnMsgs).toHaveLength(1)
+  })
+
+  test('explicit full stop clears the failed-recovery latch', async () => {
+    const { session } = armedRecoverySession()
+    installFailedWatchdogRecovery(session)
+
+    await session.stop('explicit full stop', { announce: false })
+
+    expect(session.watchdogResumeFailed).toBe(false)
+  })
+
+  test('full stop destructively clears failed-recovery human work while already stopped', async () => {
+    const session = stoppedFailedRecoverySession('full-stop')
+
+    await session.stop('discard failed recovery', { announce: false })
+
+    expectStoppedFailedRecoveryQueueCleared(session)
+  })
+
+  test('full stop discards human work that arrives while agy stop is awaiting completion', async () => {
+    const { session, proc } = wiredWatchdogSession('codex')
+    const agyStopEntered = deferred<void>()
+    const agyStopRelease = deferred<void>()
+    session.stopAgyTask = async () => {
+      agyStopEntered.resolve()
+      await agyStopRelease.promise
+      return true
+    }
+
+    const stopping = session.stop('discard agy-stop arrivals', { announce: false })
+    await agyStopEntered.promise
+    await session.onUserMessage(
+      'human during agy stop',
+      [],
+      'ou_during_agy_stop',
+      'om_during_agy_stop',
+    )
+    await session.onMultiMessageInbound(
+      '>>>buffered during agy stop',
+      [],
+      'ou_multi_during_agy_stop',
+      'om_multi_during_agy_stop',
+    )
+    session.pendingUserMessageCount = 1
+    session.pendingTurnInputs = ['pending input during agy stop']
+    session.currentBatchReactionIds.set(
+      'om_batch_during_agy_stop',
+      'reaction-om_batch_during_agy_stop',
+    )
+    await waitFor(() => (
+      session.pendingReactionIds.get('om_during_agy_stop') === 'reaction-om_during_agy_stop' &&
+      session.multiMsgReactions.get('om_multi_during_agy_stop') === 'reaction-om_multi_during_agy_stop'
+    ))
+
+    agyStopRelease.resolve()
+    await stopping
+
+    expect(proc.killCalls).toBe(1)
+    expect(session.status).toBe('stopped')
+    expectStoppedFailedRecoveryQueueCleared(session)
+    expect(deletedReactions).toContainEqual([
+      'om_during_agy_stop',
+      'reaction-om_during_agy_stop',
+    ])
+    expect(deletedReactions).toContainEqual([
+      'om_multi_during_agy_stop',
+      'reaction-om_multi_during_agy_stop',
+    ])
+    expect(deletedReactions).toContainEqual([
+      'om_batch_during_agy_stop',
+      'reaction-om_batch_during_agy_stop',
+    ])
+  })
+
+  test('kl destructively clears failed-recovery human work while already stopped', async () => {
+    const session = stoppedFailedRecoverySession('kl')
+
+    await session.runCommand('kl')
+
+    expectStoppedFailedRecoveryQueueCleared(session)
+  })
+
+  test('clear explicitly discards a stopped failed-recovery queue without starting', async () => {
+    const session = stoppedFailedRecoverySession('clear')
+    let restartCalls = 0
+    session.restart = async () => { restartCalls++; return true }
+
+    await session.runCommand('clear')
+
+    expect(restartCalls).toBe(0)
+    expectStoppedFailedRecoveryQueueCleared(session)
+  })
+
+  for (const [label, action, preservesRecovery] of [
+    ['public stop', async (session: any) => { await session.stop('superseding stop', { announce: false }) }, false],
+    ['kl', async (session: any) => { await session.runCommand('kl') }, false],
+    ['clear', async (session: any) => { await session.runCommand('clear') }, false],
+    ['dispose', async (session: any) => { session.dispose() }, false],
+    ['st', async (session: any) => { await session.runCommand('st') }, true],
+  ] as const) {
+    test(`${label} supersedes a strict retry before install and kills only its stale replacement`, async () => {
+      const session = stoppedFailedRecoverySession(`strict-spawn-${label}`)
+      const staleReplacement = new FakeAgentProc('codex', 'thread-1')
+      const preservedQueue = [...session.pendingMidTurnMsgs]
+      let superseding: Promise<void> | null = null
+      session.spawnAgent = () => {
+        superseding = Promise.resolve(action(session))
+        return staleReplacement
+      }
+
+      const resumed = await session.resumeFailedWatchdogQueue({ announce: false })
+      await superseding
+
+      expect(resumed).toBe(false)
+      expect(staleReplacement.killCalls).toBe(1)
+      expect(session.proc).not.toBe(staleReplacement)
+      if (preservesRecovery) {
+        expect(session.preservedWatchdogRecovery).not.toBeNull()
+        expect(session.watchdogResumeFailed).toBe(true)
+        expect(session.pendingMidTurnMsgs).toEqual(preservedQueue)
+      } else {
+        expect(session.preservedWatchdogRecovery).toBeNull()
+        expect(session.pendingMidTurnMsgs).toEqual([])
+      }
+    })
+  }
+
+  test('a stale strict replacement cleanup never kills a newer process owner', async () => {
+    const session = stoppedFailedRecoverySession('strict-spawn-newer-owner')
+    const staleReplacement = new FakeAgentProc('codex', 'thread-1')
+    const newerProc = new FakeAgentProc('codex', 'thread-newer-owner')
+    session.spawnAgent = () => {
+      session.beginLifecycle('hi')
+      session.proc = newerProc
+      return staleReplacement
+    }
+
+    const resumed = await session.resumeFailedWatchdogQueue({ announce: false })
+
+    expect(resumed).toBe(false)
+    expect(staleReplacement.killCalls).toBe(1)
+    expect(newerProc.killCalls).toBe(0)
+    expect(session.proc).toBe(newerProc)
+  })
+
+  test('strict retry rejects a supplied identity mismatch before acquiring lifecycle ownership', async () => {
+    const { session, proc, action, recovery } = ownedFailedWatchdogRecoverySession()
+    const lifecycleEpoch = session.lifecycleEpoch
+    const lifecycleOwner = session.lifecycleOwner
+    const replacement = new FakeAgentProc('codex', 'thread-other')
+    let spawnCalls = 0
+    session.spawnAgent = () => {
+      spawnCalls++
+      return replacement
+    }
+    replacement.sendInitialize = () => replacement.emit('init', { session_id: 'thread-other' })
+
+    const resumed = await session.restart(true, {
+      announce: false,
+      requireResumeSession: true,
+      preserveCurrentTurn: true,
+      preserveQueuedHumanWork: true,
+      preservedRecoveryToken: recovery.token,
+      resumeIdentity: { provider: 'codex', threadId: 'thread-other' },
+    })
+
+    expect(resumed).toBe(false)
+    expect(spawnCalls).toBe(0)
+    expect(session.proc).toBe(proc)
+    expect(proc.killCalls).toBe(0)
+    expect(session.lifecycleEpoch).toBe(lifecycleEpoch)
+    expect(session.lifecycleOwner).toBe(lifecycleOwner)
+    expect(session.preservedWatchdogRecovery).toBe(recovery)
+    expect(recovery.phase).toBe('failed')
+    expect(session.watchdogAction).toBe(action)
+    expect(session.ownsWatchdogAction(action)).toBe(true)
+  })
+
+  test('strict retry accepts a matching replay identity but derives spawn identity from recovery', async () => {
+    const { session, recovery } = ownedFailedWatchdogRecoverySession()
+    const replacement = new FakeAgentProc('codex', recovery.threadId)
+    const spawnArgs: Array<[string | undefined, string | undefined]> = []
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'mutable-wrong-thread'
+    session.spawnAgent = (resumeSessionId?: string, provider?: string) => {
+      spawnArgs.push([resumeSessionId, provider])
+      return replacement
+    }
+    replacement.sendInitialize = () => replacement.emit('init', { session_id: recovery.threadId })
+
+    const resumed = await session.restart(true, {
+      announce: false,
+      requireResumeSession: true,
+      preserveCurrentTurn: true,
+      preserveQueuedHumanWork: true,
+      preservedRecoveryToken: recovery.token,
+      resumeIdentity: { provider: recovery.provider, threadId: recovery.threadId },
+    })
+
+    expect(resumed).toBe(true)
+    expect(spawnArgs).toEqual([[recovery.threadId, recovery.provider]])
+    expect(session.proc).toBe(replacement)
+    expect(session.preservedWatchdogRecovery).toBe(recovery)
+  })
+
+  test('strict retry uses the preserved Codex thread after mutable selection changes', async () => {
+    const session = stoppedFailedRecoverySession('strict-immutable-identity')
+    const replacement = new FakeAgentProc('codex', 'thread-1')
+    const spawnArgs: Array<[string | undefined, string | undefined]> = []
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'mutable-wrong-thread'
+    session.pendingMidTurnMsgs = []
+    session.spawnAgent = (resumeSessionId?: string, provider?: string) => {
+      spawnArgs.push([resumeSessionId, provider])
+      return replacement
+    }
+    replacement.sendInitialize = () => replacement.emit('init', { session_id: 'thread-1' })
+
+    const resumed = await session.resumeFailedWatchdogQueue({ announce: false })
+
+    expect(resumed).toBe(true)
+    expect(spawnArgs).toEqual([['thread-1', 'codex']])
+    expect(session.proc).toBe(replacement)
+    expect(session.preservedWatchdogRecovery).toBeNull()
+  })
+
+  for (const [label, replacement] of [
+    ['wrong provider', new FakeAgentProc('claude', 'thread-1')],
+    ['wrong thread', new FakeAgentProc('codex', 'thread-wrong')],
+  ] as const) {
+    test(`strict retry kills a ${label} replacement and never drains the batch`, async () => {
+      const session = stoppedFailedRecoverySession(`strict-${label}`)
+      let drains = 0
+      session.selectedProvider = 'claude'
+      session.lastSessionId = 'mutable-wrong-thread'
+      session.spawnAgent = () => replacement
+      replacement.alive = true
+      replacement.sendInitialize = () => replacement.emit('init', { session_id: replacement.sessionId })
+      session.drainMidTurnAndOpen = async () => { drains++; return 'committed' }
+
+      const resumed = await session.resumeFailedWatchdogQueue({ announce: false })
+
+      expect(resumed).toBe(false)
+      expect(replacement.killCalls).toBe(1)
+      expect(drains).toBe(0)
+      expect(session.watchdogResumeFailed).toBe(true)
+      expect(session.pendingMidTurnMsgs).toHaveLength(1)
+    })
+  }
+
+  test('wrong-provider replacement cleanup cannot stop a newer lifecycle owner', async () => {
+    const session = stoppedFailedRecoverySession('strict-wrong-provider-cleanup-race')
+    const wrongProvider = new FakeAgentProc('claude', 'thread-1')
+    const newerProc = new FakeAgentProc('codex', 'thread-newer-cleanup-owner')
+    let lifecycleChanges = 0
+    session.opts.onLifecycleChange = () => { lifecycleChanges++ }
+    session.spawnAgent = () => wrongProvider
+    wrongProvider.kill = async () => {
+      wrongProvider.killCalls++
+      wrongProvider.alive = false
+      session.beginLifecycle('hi')
+      session.proc = newerProc
+      session.status = 'working'
+    }
+
+    const resumed = await session.resumeFailedWatchdogQueue({ announce: false })
+
+    expect(resumed).toBe(false)
+    expect(wrongProvider.killCalls).toBe(1)
+    expect(session.proc).toBe(newerProc)
+    expect(session.status).toBe('working')
+    expect(lifecycleChanges).toBe(0)
+  })
+
+  test('a stale strict-retry spawn exception cannot stop a newer lifecycle owner', async () => {
+    const session = stoppedFailedRecoverySession('strict-stale-spawn-throw')
+    const newerProc = new FakeAgentProc('codex', 'thread-newer-strict-throw')
+    let lifecycleChanges = 0
+    session.opts.onLifecycleChange = () => { lifecycleChanges++ }
+    session.spawnAgent = () => {
+      session.beginLifecycle('hi')
+      session.proc = newerProc
+      session.status = 'working'
+      throw new Error('stale strict retry spawn failed')
+    }
+
+    const resumed = await session.resumeFailedWatchdogQueue({ announce: false })
+
+    expect(resumed).toBe(false)
+    expect(session.proc).toBe(newerProc)
+    expect(session.status).toBe('working')
+    expect(lifecycleChanges).toBe(0)
+  })
+})
+
 function confirmSessionNoop(
   proc: FakeAgentProc,
   id = 'noop-1',
@@ -1218,6 +3184,980 @@ function deferred<T>(): {
     reject = onReject
   })
   return { promise, resolve, reject }
+}
+
+type ControlledCodexDispatch = {
+  dispatch: Extract<UserTextDispatch, { kind: 'turn_start_pending' }>
+  started: Promise<void>
+  ack: (turnId?: string | null) => void
+  reject: (error: Error) => void
+}
+
+let humanDeliveryFixtureCount = 0
+
+type PreInitCodexDispatchControl = {
+  dispatch: Extract<UserTextDispatch, { kind: 'turn_start_pending' }>
+  started: Promise<void>
+  bind: (threadId: string) => void
+  ack: (turnId?: string | null) => void
+  reject: (error: Error) => void
+}
+
+/** 模拟真实 pre-init CodexProcess:dispatch.threadId 起始为 null,
+ *  init 后由 bind() 就地绑定(与 initializeAndStartThread 的行为一致)。 */
+function controlPreInitCodexDispatch(
+  proc: FakeAgentProc,
+  deliveryId = `delivery-${++humanDeliveryFixtureCount}`,
+): PreInitCodexDispatchControl {
+  const record: { threadId: string | null } = { threadId: null }
+  const settlement = deferred<CodexUserTextSettlement>()
+  const started = deferred<void>()
+  const dispatch = {
+    kind: 'turn_start_pending' as const,
+    provider: 'codex' as const,
+    deliveryId,
+    get threadId() {
+      return record.threadId
+    },
+    settlement: settlement.promise,
+  }
+  proc.dispatchFactory = () => {
+    started.resolve(undefined)
+    return dispatch
+  }
+  return {
+    dispatch,
+    started: started.promise,
+    bind: threadId => {
+      record.threadId = threadId
+    },
+    ack: (turnId = null) => settlement.resolve({
+      kind: 'ack', deliveryId, threadId: record.threadId!, turnId,
+    }),
+    reject: error => settlement.resolve({
+      kind: 'rejected', deliveryId, threadId: record.threadId, error,
+    }),
+  }
+}
+
+function controlCodexDispatch(
+  proc: FakeAgentProc,
+  deliveryId = `delivery-${++humanDeliveryFixtureCount}`,
+): ControlledCodexDispatch {
+  const threadId = proc.sessionId ?? `thread-${humanDeliveryFixtureCount}`
+  const settlement = deferred<CodexUserTextSettlement>()
+  const started = deferred<void>()
+  const dispatch = {
+    kind: 'turn_start_pending' as const,
+    provider: 'codex' as const,
+    deliveryId,
+    threadId,
+    settlement: settlement.promise,
+  }
+  proc.dispatchFactory = () => {
+    started.resolve(undefined)
+    return dispatch
+  }
+  return {
+    dispatch,
+    started: started.promise,
+    ack: (turnId = null) => settlement.resolve({
+      kind: 'ack', deliveryId, threadId, turnId,
+    }),
+    reject: error => settlement.resolve({
+      kind: 'rejected', deliveryId, threadId, error,
+    }),
+  }
+}
+
+function pendingHumanDrainFixture(provider: 'codex' | 'claude' = 'codex') {
+  const id = ++humanDeliveryFixtureCount
+  const session = new Session(`pending-human-delivery-${provider}-${id}`, 'chat_id') as any
+  const proc = new FakeAgentProc(provider, `${provider}-thread-${id}`)
+  const batch = [
+    {
+      text: 'first human input',
+      wireText: '[file: /tmp/first-human.png]\nfirst human input',
+      userOpenId: 'ou_first_human',
+      msgId: 'om_first_human',
+    },
+    {
+      text: 'second human input',
+      wireText: '[file: /tmp/second-a.txt] [file: /tmp/second-b.txt]\nsecond human input',
+      userOpenId: 'ou_second_human',
+      msgId: 'om_second_human',
+    },
+  ]
+  session.selectedProvider = provider
+  session.proc = proc
+  session.status = 'idle'
+  session.pendingMidTurnMsgs = batch
+  session.pendingReactionIds = new Map([
+    ['om_first_human', 'reaction-first-human'],
+    ['om_second_human', 'reaction-second-human'],
+  ])
+  session.wireProc(proc)
+  const control = provider === 'codex' ? controlCodexDispatch(proc) : null
+  return { session, proc, batch, control }
+}
+
+describe('Session pending human delivery', () => {
+  test('Codex exit before ACK restores the exact drained batch and reactions once', async () => {
+    const { session, proc, batch, control } = pendingHumanDrainFixture('codex')
+    const draining = session.drainMidTurnAndOpen()
+    await control!.started
+
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+    control!.reject(new Error('exited'))
+    expect(await draining).toBe('preserved')
+
+    expect(session.pendingMidTurnMsgs).toEqual(batch)
+    expect(session.pendingMidTurnMsgs[0]).toBe(batch[0])
+    expect(session.pendingMidTurnMsgs[1]).toBe(batch[1])
+    expect(session.pendingReactionIds).toEqual(new Map([
+      ['om_first_human', 'reaction-first-human'],
+      ['om_second_human', 'reaction-second-human'],
+    ]))
+    expect(proc.sentTexts).toEqual([
+      `${batch[0]!.wireText}\n\n${batch[1]!.wireText}`,
+    ])
+    expect(session.pendingUserMessageCount).toBe(0)
+
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+    expect(session.pendingMidTurnMsgs).toEqual(batch)
+  })
+
+  test('an exit-restored batch stays ahead of the next cold-start message', async () => {
+    const { session, proc, batch, control } = pendingHumanDrainFixture('codex')
+    const draining = session.drainMidTurnAndOpen()
+    await control!.started
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+    control!.reject(new Error('exited before ACK'))
+    expect(await draining).toBe('preserved')
+
+    const replacement = new FakeAgentProc('codex', 'thread-exit-retry')
+    const retry = controlCodexDispatch(replacement)
+    session.start = async () => {
+      session.proc = replacement
+      session.status = 'idle'
+      session.wireProc(replacement)
+      return true
+    }
+    const nextMessage = session.onUserMessage(
+      'new cold-start input', ['/tmp/new-cold.txt'], 'ou_new_cold', 'om_new_cold',
+    )
+    await retry.started
+
+    expect(replacement.sentTexts).toEqual([[
+      batch[0]!.wireText,
+      batch[1]!.wireText,
+      '[file: /tmp/new-cold.txt]\nnew cold-start input',
+    ].join('\n\n')])
+    retry.ack('turn-exit-retry')
+    await nextMessage
+  })
+
+  test('Codex ACK before exit commits once and never replays the drained batch', async () => {
+    const { session, proc, control } = pendingHumanDrainFixture('codex')
+    const draining = session.drainMidTurnAndOpen()
+    await control!.started
+    control!.ack('turn-acked')
+
+    expect(await draining).toBe('committed')
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(session.pendingUserMessageCount).toBe(1)
+    expect(proc.sentTexts).toHaveLength(1)
+  })
+
+  test('Codex RPC rejection before ACK restores the drained batch', async () => {
+    const { session, proc, batch, control } = pendingHumanDrainFixture('codex')
+    const draining = session.drainMidTurnAndOpen()
+    await control!.started
+    control!.reject(new Error('turn/start rejected'))
+
+    expect(await draining).toBe('preserved')
+    expect(session.currentTurn).toBeNull()
+    expect(session.pendingMidTurnMsgs).toEqual(batch)
+    expect(session.pendingUserMessageCount).toBe(0)
+
+    const retry = controlCodexDispatch(proc)
+    const nextMessage = session.onUserMessage(
+      'newer human input', ['/tmp/newer.txt'], 'ou_newer', 'om_newer',
+    )
+    await retry.started
+    expect(proc.sentTexts.at(-1)).toBe([
+      batch[0]!.wireText,
+      batch[1]!.wireText,
+      '[file: /tmp/newer.txt]\nnewer human input',
+    ].join('\n\n'))
+    retry.ack('turn-retry')
+    await nextMessage
+  })
+
+  test('synchronous human dispatch rejection closes its card and preserves FIFO retry order', async () => {
+    const { session, proc, batch } = pendingHumanDrainFixture('claude')
+    proc.dispatchFactory = () => ({
+      kind: 'rejected',
+      provider: 'claude',
+      error: new Error('input queue closed'),
+    })
+
+    expect(await session.drainMidTurnAndOpen()).toBe('preserved')
+    expect(session.currentTurn).toBeNull()
+    expect(session.pendingMidTurnMsgs).toEqual(batch)
+
+    proc.dispatchFactory = null
+    await session.onUserMessage('newer sync input', [], 'ou_newer_sync', 'om_newer_sync')
+    expect(proc.sentTexts.at(-1)).toBe([
+      batch[0]!.wireText,
+      batch[1]!.wireText,
+      'newer sync input',
+    ].join('\n\n'))
+  })
+
+  test('a rejected result immediately followed by exit cannot clear the restored batch', async () => {
+    const { session, proc, batch, control } = pendingHumanDrainFixture('codex')
+    const draining = session.drainMidTurnAndOpen()
+    await control!.started
+
+    control!.reject(new Error('app-server exited'))
+    proc.emit('result', {
+      subtype: 'codex_turn_start_failed',
+      is_error: true,
+      delivery_id: control!.dispatch.deliveryId,
+      thread_id: control!.dispatch.threadId,
+      turn_id: null,
+    })
+    expect(proc.sentTexts).toHaveLength(1)
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+
+    expect(await draining).toBe('preserved')
+    expect(session.pendingMidTurnMsgs).toEqual(batch)
+    expect(session.pendingReactionIds).toEqual(new Map([
+      ['om_first_human', 'reaction-first-human'],
+      ['om_second_human', 'reaction-second-human'],
+    ]))
+  })
+
+  test('a matching result commits synchronously before the receipt continuation', async () => {
+    const { session, proc, control } = pendingHumanDrainFixture('codex')
+    let closeCalls = 0
+    session.closeTurnCard = async () => { closeCalls++ }
+    const draining = session.drainMidTurnAndOpen()
+    await control!.started
+
+    control!.ack('turn-result-first')
+    proc.emit('result', {
+      delivery_id: control!.dispatch.deliveryId,
+      thread_id: control!.dispatch.threadId,
+      turn_id: 'turn-result-first',
+    })
+
+    expect(session.pendingUserMessageCount).toBe(1)
+    expect(session.pendingHumanDelivery).toBeNull()
+    expect(session.ackedHumanDelivery).toBeNull()
+    expect(closeCalls).toBe(1)
+    expect(await draining).toBe('committed')
+  })
+
+  test('matching human completion releases its owner before a later system completion', async () => {
+    const { session, proc, control } = pendingHumanDrainFixture('codex')
+    const draining = session.drainMidTurnAndOpen()
+    await control!.started
+    control!.ack('turn-human-complete')
+    proc.emit('result', {
+      delivery_id: control!.dispatch.deliveryId,
+      thread_id: control!.dispatch.threadId,
+      turn_id: 'turn-human-complete',
+    })
+    expect(await draining).toBe('committed')
+    expect(session.ackedHumanDelivery).toBeNull()
+
+    const systemTurn = turnState('card_system_after_human')
+    systemTurn.trigger = 'watchdog_resume'
+    systemTurn.backendThreadId = proc.sessionId
+    systemTurn.backendTurnId = 'turn-system-after-human'
+    session.currentTurn = systemTurn
+    session.status = 'working'
+
+    proc.emit('result', {
+      delivery_id: 'system-delivery-after-human',
+      thread_id: proc.sessionId,
+      turn_id: 'turn-system-after-human',
+    })
+
+    expect(session.currentTurn).toBeNull()
+    expect(session.status).toBe('idle')
+  })
+
+  for (const [label, eventPatch] of [
+    ['delivery ID', { delivery_id: 'delivery-stale' }],
+    ['thread ID', { thread_id: 'thread-stale' }],
+    ['turn ID', { turn_id: 'turn-stale' }],
+  ] as const) {
+    test(`a stale ${label} cannot commit or close the pending delivery`, async () => {
+      const { session, proc, control } = pendingHumanDrainFixture('codex')
+      let closeCalls = 0
+      session.closeTurnCard = async () => { closeCalls++ }
+      const draining = session.drainMidTurnAndOpen()
+      await control!.started
+      session.currentTurn.backendThreadId = control!.dispatch.threadId
+      session.currentTurn.backendTurnId = 'turn-current'
+
+      proc.emit('result', {
+        delivery_id: control!.dispatch.deliveryId,
+        thread_id: control!.dispatch.threadId,
+        turn_id: 'turn-current',
+        ...eventPatch,
+      })
+
+      expect(session.pendingHumanDelivery?.state).toBe('pending')
+      expect(session.pendingUserMessageCount).toBe(0)
+      expect(closeCalls).toBe(0)
+      control!.reject(new Error('settle stale fixture'))
+      expect(await draining).toBe('preserved')
+    })
+  }
+
+  test('a stale process result cannot settle or close the replacement turn', async () => {
+    const { session, proc, control } = pendingHumanDrainFixture('codex')
+    let closeCalls = 0
+    session.closeTurnCard = async () => { closeCalls++ }
+    const draining = session.drainMidTurnAndOpen()
+    await control!.started
+    const replacement = new FakeAgentProc('codex', 'replacement-thread')
+    const replacementTurn = turnState('card_replacement_delivery')
+    session.proc = replacement
+    session.currentTurn = replacementTurn
+    session.status = 'starting'
+
+    proc.emit('result', {
+      delivery_id: control!.dispatch.deliveryId,
+      thread_id: control!.dispatch.threadId,
+      turn_id: 'turn-old',
+    })
+
+    expect(session.pendingHumanDelivery?.state).toBe('pending')
+    expect(session.currentTurn).toBe(replacementTurn)
+    expect(session.status).toBe('starting')
+    expect(closeCalls).toBe(0)
+    control!.reject(new Error('old owner rejected'))
+    expect(await draining).toBe('preserved')
+  })
+
+  test('an ACK after process owner replacement does not mutate or replay into the replacement', async () => {
+    const { session, batch, control } = pendingHumanDrainFixture('codex')
+    const draining = session.drainMidTurnAndOpen()
+    await control!.started
+    const replacement = new FakeAgentProc('codex', 'replacement-ack-thread')
+    const replacementTurn = turnState('card_replacement_ack')
+    session.proc = replacement
+    session.currentTurn = replacementTurn
+    session.status = 'starting'
+
+    control!.ack('turn-old-owner')
+    expect(await draining).toBe('preserved')
+
+    expect(session.pendingMidTurnMsgs).toEqual(batch)
+    expect(session.pendingMidTurnMsgs[0]).toBe(batch[0])
+    expect(session.pendingMidTurnMsgs[1]).toBe(batch[1])
+    expect(session.pendingReactionIds).toEqual(new Map([
+      ['om_first_human', 'reaction-first-human'],
+      ['om_second_human', 'reaction-second-human'],
+    ]))
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(session.currentTurn).toBe(replacementTurn)
+    expect(session.status).toBe('starting')
+  })
+
+  test('an ACK after turn owner replacement restores the batch without closing the replacement', async () => {
+    const { session, proc, batch, control } = pendingHumanDrainFixture('codex')
+    const draining = session.drainMidTurnAndOpen()
+    await control!.started
+    const replacementTurn = turnState('card_replacement_ack_same_proc')
+    session.currentTurn = replacementTurn
+    session.status = 'starting'
+
+    control!.ack('turn-old-owner')
+    expect(await draining).toBe('preserved')
+
+    expect(session.proc).toBe(proc)
+    expect(session.currentTurn).toBe(replacementTurn)
+    expect(session.status).toBe('starting')
+    expect(session.pendingMidTurnMsgs).toEqual(batch)
+    expect(session.pendingReactionIds).toEqual(new Map([
+      ['om_first_human', 'reaction-first-human'],
+      ['om_second_human', 'reaction-second-human'],
+    ]))
+  })
+
+  test('an ACK after opening owner replacement cannot commit the old delivery', async () => {
+    const { session, batch, control } = pendingHumanDrainFixture('codex')
+    const draining = session.drainMidTurnAndOpen()
+    await control!.started
+    const replacementOpening = session.beginTurnOpening()
+    session.status = 'starting'
+
+    control!.ack('turn-old-owner')
+    expect(await draining).toBe('preserved')
+
+    expect(session.openingTurn).toBe(true)
+    expect(session.openingTurnOwner).toBe(replacementOpening)
+    expect(session.status).toBe('starting')
+    expect(session.pendingMidTurnMsgs).toEqual(batch)
+    session.finishTurnOpening(replacementOpening)
+  })
+
+  test('a second pre-init Codex message queues while the first receipt is pending', async () => {
+    const session = new Session('pending-human-overlap', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-overlap')
+    const control = controlCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'starting'
+    session.wireProc(proc)
+    let firstDone = false
+    const first = session.onUserMessage('first overlap', [], 'ou_first', 'om_first')
+      .then(() => { firstDone = true })
+    await control.started
+
+    const second = session.onUserMessage('second overlap', ['/tmp/second.txt'], 'ou_second', 'om_second')
+    await Promise.resolve()
+    expect(firstDone).toBe(false)
+    expect(proc.sentTexts).toEqual(['first overlap'])
+    expect(session.pendingMidTurnMsgs).toEqual([{
+      text: 'second overlap',
+      wireText: '[file: /tmp/second.txt]\nsecond overlap',
+      userOpenId: 'ou_second',
+      msgId: 'om_second',
+    }])
+
+    control.ack('turn-overlap')
+    await first
+    await second
+  })
+
+  test('a delayed reaction ID stays owned by the pending delivery', async () => {
+    const { session, control } = pendingHumanDrainFixture('codex')
+    session.pendingReactionIds.set('om_first_human', '')
+    session.trackQueuedReaction('om_first_human')
+    const draining = session.drainMidTurnAndOpen()
+    await control!.started
+    await Promise.resolve()
+
+    expect(session.pendingHumanDelivery?.reactions.get('om_first_human'))
+      .toBe('reaction-om_first_human')
+    expect(session.currentBatchReactionIds.has('om_first_human')).toBe(false)
+
+    control!.reject(new Error('reaction fixture rejected'))
+    expect(await draining).toBe('preserved')
+  })
+
+  test('cold-start Codex input commits only after its receipt ACK', async () => {
+    const session = new Session('pending-human-cold-start', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-cold-start')
+    const control = controlCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.start = async () => {
+      session.proc = proc
+      session.status = 'idle'
+      session.wireProc(proc)
+      return true
+    }
+    let finished = false
+    const sending = session.onUserMessage(
+      'cold input', ['/tmp/cold.png'], 'ou_cold', 'om_cold',
+    ).then(() => { finished = true })
+    await control.started
+    await Promise.resolve()
+
+    expect(finished).toBe(false)
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(session.pendingHumanDelivery?.batch).toEqual([{
+      text: 'cold input',
+      wireText: '[file: /tmp/cold.png]\ncold input',
+      userOpenId: 'ou_cold',
+      msgId: 'om_cold',
+    }])
+
+    control.ack('turn-cold')
+    await sending
+    expect(session.pendingUserMessageCount).toBe(1)
+  })
+
+  test('idle eager-open Codex input commits only after its receipt ACK', async () => {
+    const session = new Session('pending-human-idle-eager', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-idle-eager')
+    const control = controlCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'idle'
+    session.initCount = 1
+    session.wireProc(proc)
+    let finished = false
+    const sending = session.onUserMessage('idle eager', [], 'ou_eager', 'om_eager')
+      .then(() => { finished = true })
+    await control.started
+    await Promise.resolve()
+
+    expect(finished).toBe(false)
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(session.pendingHumanDelivery?.turn).toBe(session.currentTurn)
+
+    control.ack('turn-eager')
+    await sending
+    expect(session.pendingUserMessageCount).toBe(1)
+  })
+
+  test('cold-start receipt settlement cannot clear a replacement opening owner', async () => {
+    const session = new Session('pending-human-cold-owner-replaced', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-cold-owner-replaced')
+    const control = controlCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.start = async () => {
+      session.proc = proc
+      session.wireProc(proc)
+      return true
+    }
+    const sending = session.onUserMessage('old cold owner', [], 'ou_old', 'om_old')
+    await control.started
+    const replacement = new FakeAgentProc('codex', 'thread-cold-replacement')
+    const replacementTurn = turnState('card_cold_replacement')
+    session.proc = replacement
+    session.currentTurn = replacementTurn
+    session.beginTurnOpening()
+    session.status = 'starting'
+
+    control.ack('turn-old-cold')
+    await sending
+
+    expect(session.proc).toBe(replacement)
+    expect(session.currentTurn).toBe(replacementTurn)
+    expect(session.openingTurn).toBe(true)
+    expect(session.status).toBe('starting')
+  })
+
+  test('idle eager receipt settlement cannot clear a replacement opening owner', async () => {
+    const session = new Session('pending-human-eager-owner-replaced', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-eager-owner-replaced')
+    const control = controlCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'idle'
+    session.initCount = 1
+    session.wireProc(proc)
+    const sending = session.onUserMessage('old eager owner', [], 'ou_old', 'om_old')
+    await control.started
+    const replacement = new FakeAgentProc('codex', 'thread-eager-replacement')
+    const replacementTurn = turnState('card_eager_replacement')
+    session.proc = replacement
+    session.currentTurn = replacementTurn
+    session.beginTurnOpening()
+    session.status = 'starting'
+
+    control.ack('turn-old-eager')
+    await sending
+
+    expect(session.proc).toBe(replacement)
+    expect(session.currentTurn).toBe(replacementTurn)
+    expect(session.openingTurn).toBe(true)
+    expect(session.status).toBe('starting')
+  })
+
+  test('pre-init bootstrap ACK commits before a card exists and later binds that card', async () => {
+    const session = new Session('pending-human-bootstrap-ack', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-bootstrap-ack')
+    const control = controlCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'starting'
+    session.wireProc(proc)
+    const sending = session.onUserMessage('bootstrap input', [], 'ou_boot', 'om_boot')
+    await control.started
+    expect(session.currentTurn).toBeNull()
+    expect(session.pendingHumanDelivery?.turn).toBeNull()
+
+    control.ack('turn-bootstrap')
+    await sending
+    expect(session.pendingUserMessageCount).toBe(1)
+    expect(session.currentTurn).toBeNull()
+
+    proc.emit('init', { session_id: proc.sessionId })
+    await waitFor(() => session.currentTurn !== null)
+    expect(session.ackedHumanDelivery?.turn).toBe(session.currentTurn)
+  })
+
+  test('pre-init bootstrap exit restores the exact input before init', async () => {
+    const session = new Session('pending-human-bootstrap-exit', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-bootstrap-exit')
+    const control = controlCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'starting'
+    session.wireProc(proc)
+    const sending = session.onUserMessage(
+      'bootstrap exit', ['/tmp/bootstrap.txt'], 'ou_boot_exit', 'om_boot_exit',
+    )
+    await control.started
+
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+    control.reject(new Error('bootstrap exited'))
+    await sending
+
+    expect(session.pendingMidTurnMsgs).toEqual([{
+      text: 'bootstrap exit',
+      wireText: '[file: /tmp/bootstrap.txt]\nbootstrap exit',
+      userOpenId: 'ou_boot_exit',
+      msgId: 'om_boot_exit',
+    }])
+    expect(session.pendingUserMessageCount).toBe(0)
+  })
+
+  test('pre-init bootstrap card-open failure releases the ACKed delivery owner', async () => {
+    const session = new Session('pending-human-bootstrap-open-failed', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-bootstrap-open-failed')
+    const control = controlCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'starting'
+    session.wireProc(proc)
+    const sending = session.onUserMessage('bootstrap open failure', [], 'ou_boot_fail', 'om_boot_fail')
+    await control.started
+    control.ack('turn-bootstrap-open-failed')
+    await sending
+    expect(session.ackedHumanDelivery).not.toBeNull()
+    session.openTurnCard = async () => ({ kind: 'failed' })
+
+    proc.emit('init', { session_id: proc.sessionId })
+    await waitFor(() => session.openingTurn === false)
+
+    expect(session.ackedHumanDelivery).toBeNull()
+    expect(session.currentTurn).toBeNull()
+    expect(session.status).toBe('idle')
+  })
+
+  test('a real pre-init bootstrap dispatch with an unbound thread is not synchronously rejected', async () => {
+    const session = new Session('pending-human-bootstrap-preinit', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', null)
+    const control = controlPreInitCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'starting'
+    session.wireProc(proc)
+    let finished = false
+    const sending = session.onUserMessage('preinit input', [], 'ou_pre', 'om_pre')
+      .then(() => { finished = true })
+    await control.started
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(finished).toBe(false)
+    expect(session.pendingHumanDelivery).not.toBeNull()
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(session.pendingTurnInputs).toEqual(['preinit input'])
+
+    proc.sessionId = 'thread-preinit'
+    control.bind('thread-preinit')
+    control.ack('turn-preinit')
+    await sending
+    expect(session.pendingUserMessageCount).toBe(1)
+    expect(session.pendingMidTurnMsgs).toEqual([])
+  })
+
+  test('a synchronously rejected bootstrap dispatch rolls back its panel input', async () => {
+    const session = new Session('pending-human-bootstrap-rollback', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', null)
+    proc.dispatchFactory = () => ({
+      kind: 'rejected',
+      provider: 'codex',
+      error: new Error('spawn failed'),
+    })
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'starting'
+    session.wireProc(proc)
+
+    await session.onUserMessage('rollback input', [], 'ou_rb', 'om_rb')
+
+    expect(session.pendingMidTurnMsgs).toEqual([{
+      text: 'rollback input',
+      wireText: 'rollback input',
+      userOpenId: 'ou_rb',
+      msgId: 'om_rb',
+    }])
+    expect(session.pendingTurnInputs).toEqual([])
+  })
+
+  test('bootstrap ACK after the init card opens commits without replay', async () => {
+    const session = new Session('pending-human-bootstrap-late-ack', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', null)
+    const control = controlPreInitCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'starting'
+    session.wireProc(proc)
+    const sending = session.onUserMessage('late ack input', [], 'ou_late', 'om_late')
+    await control.started
+
+    proc.sessionId = 'thread-late-ack'
+    control.bind('thread-late-ack')
+    proc.emit('init', { session_id: 'thread-late-ack' })
+    await waitFor(() => session.currentTurn !== null && session.openingTurn === false)
+    expect(session.pendingHumanDelivery?.turn).toBe(session.currentTurn)
+
+    control.ack('turn-late-ack')
+    await sending
+
+    expect(session.pendingHumanDelivery).toBeNull()
+    expect(session.ackedHumanDelivery?.turn).toBe(session.currentTurn)
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(session.pendingUserMessageCount).toBe(1)
+    expect(session.status).toBe('working')
+    expect(proc.sentTexts).toEqual(['late ack input'])
+  })
+
+  test('a turn/completed result after the init card opens settles the bootstrap turn', async () => {
+    const session = new Session('pending-human-bootstrap-result-first', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', null)
+    const control = controlPreInitCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'starting'
+    session.wireProc(proc)
+    const sending = session.onUserMessage('result first input', [], 'ou_rf', 'om_rf')
+    await control.started
+
+    proc.sessionId = 'thread-result-first'
+    control.bind('thread-result-first')
+    proc.emit('init', { session_id: 'thread-result-first' })
+    await waitFor(() => session.currentTurn !== null && session.openingTurn === false)
+
+    proc.lastResult.subtype = 'success'
+    proc.emit('result', {
+      subtype: 'success',
+      is_error: false,
+      delivery_id: control.dispatch.deliveryId,
+      thread_id: 'thread-result-first',
+      turn_id: 'turn-result-first',
+    })
+    control.ack('turn-result-first')
+    await sending
+    await waitFor(() => session.currentTurn === null)
+
+    expect(session.status).toBe('idle')
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(session.ackedHumanDelivery).toBeNull()
+    expect(proc.sentTexts).toEqual(['result first input'])
+  })
+
+  test('process exit with a preserved delivery clears zombie asks and permissions', async () => {
+    const { session, proc, control } = pendingHumanDrainFixture('codex')
+    const draining = session.drainMidTurnAndOpen()
+    await control!.started
+    session.pendingAsks.set('ask-zombie', { toolUseId: 'ask-zombie' })
+    session.pendingHostAsks.set('hask-zombie', { requestId: 'hask-zombie' })
+    session.pendingPermissions.set('perm-zombie', { requestId: 'perm-zombie' })
+    session.currentBatchReactionIds.set('om_stale_batch', 'reaction-stale-batch')
+
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+    control!.reject(new Error('exited'))
+    expect(await draining).toBe('preserved')
+
+    expect(session.pendingAsks.size).toBe(0)
+    expect(session.pendingHostAsks.size).toBe(0)
+    expect(session.pendingPermissions.size).toBe(0)
+    expect(session.pendingMidTurnMsgs).toHaveLength(2)
+    // 残留的当轮批次 ⏳ 必须删除而非静默丢弃 —— 否则用户消息上的
+    // 沙漏永远挂着(与普通 exit 路径的 delete-before-reset 对齐)。
+    expect(session.currentBatchReactionIds.size).toBe(0)
+    expect(deletedReactions).toContainEqual(['om_stale_batch', 'reaction-stale-batch'])
+  })
+
+  test('a message during a pending bootstrap delivery queues instead of eager-opening', async () => {
+    const session = new Session('pending-human-eager-gate', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', null)
+    const control = controlPreInitCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'starting'
+    session.wireProc(proc)
+    const first = session.onUserMessage('first preinit', [], 'ou_first_gate', 'om_first_gate')
+    await control.started
+
+    session.openTurnCard = async () => ({ kind: 'failed' })
+    proc.sessionId = 'thread-eager-gate'
+    control.bind('thread-eager-gate')
+    proc.emit('init', { session_id: 'thread-eager-gate' })
+    await waitFor(() => session.initCount >= 1 && session.openingTurn === false)
+
+    const second = session.onUserMessage('second while pending', [], 'ou_second_gate', 'om_second_gate')
+    await Promise.resolve()
+    await Promise.resolve()
+
+    expect(session.pendingMidTurnMsgs).toEqual([{
+      text: 'second while pending',
+      wireText: 'second while pending',
+      userOpenId: 'ou_second_gate',
+      msgId: 'om_second_gate',
+    }])
+    expect(proc.sentTexts).toEqual(['first preinit'])
+    expect(session.pendingTurnInputs).toEqual(['first preinit'])
+
+    control.ack('turn-eager-gate')
+    await first
+    await second
+  })
+
+  test('Claude synchronous queued dispatch commits the drained batch', async () => {
+    const { session, proc } = pendingHumanDrainFixture('claude')
+
+    expect(await session.drainMidTurnAndOpen()).toBe('committed')
+    const capturedTurn = session.currentTurn
+    expect(proc.sentTexts).toHaveLength(1)
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(session.pendingUserMessageCount).toBe(1)
+    expect(session.ackedHumanDelivery?.turn).toBe(capturedTurn)
+
+    proc.emit('result', {})
+
+    expect(session.ackedHumanDelivery).toBeNull()
+    expect(session.currentTurn).toBeNull()
+    expect(session.status).toBe('idle')
+  })
+
+  test('a stale Claude result cannot close a replacement turn or release its captured owner', async () => {
+    const { session, proc } = pendingHumanDrainFixture('claude')
+    expect(await session.drainMidTurnAndOpen()).toBe('committed')
+    const capturedOwner = session.ackedHumanDelivery
+    const replacementTurn = turnState('card_claude_replacement')
+    session.currentTurn = replacementTurn
+    session.status = 'starting'
+
+    proc.emit('result', {})
+
+    expect(session.ackedHumanDelivery).toBe(capturedOwner)
+    expect(session.currentTurn).toBe(replacementTurn)
+    expect(session.status).toBe('starting')
+  })
+
+  test('Claude synchronous rejection restores the drained batch without committing', async () => {
+    const { session, proc, batch } = pendingHumanDrainFixture('claude')
+    proc.dispatchFactory = () => ({
+      kind: 'rejected',
+      provider: 'claude',
+      error: new Error('claude input closed'),
+    })
+
+    expect(await session.drainMidTurnAndOpen()).toBe('preserved')
+    expect(session.pendingMidTurnMsgs).toEqual(batch)
+    expect(session.pendingUserMessageCount).toBe(0)
+  })
+})
+
+describe('Session system-owned Codex dispatch receipts', () => {
+  test('host continuation rejects synchronously without claiming a started turn', async () => {
+    const session = new Session('host-continuation-sync-rejected', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-host-sync-rejected')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'idle'
+    session.wireProc(proc)
+    proc.dispatchFactory = () => ({
+      kind: 'rejected',
+      provider: 'codex',
+      error: new Error('host continuation rejected'),
+    })
+
+    expect(await session.startHostAskContinuation('continue host ask', proc)).toBe('failed')
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(session.currentTurn).toBeNull()
+    expect(session.status).toBe('idle')
+  })
+
+  test('host continuation waits for its Codex receipt before reporting started', async () => {
+    const session = new Session('host-continuation-receipt-rejected', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-host-receipt-rejected')
+    const control = controlCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'idle'
+    session.wireProc(proc)
+    let finished = false
+    const continuation = session.startHostAskContinuation('continue host ask', proc)
+      .then((outcome: string) => {
+        finished = true
+        return outcome
+      })
+    await control.started
+    await Promise.resolve()
+    expect(finished).toBe(false)
+
+    control.reject(new Error('host receipt rejected'))
+    expect(await continuation).toBe('failed')
+    expect(session.currentTurn).toBeNull()
+    expect(session.pendingUserMessageCount).toBe(0)
+  })
+
+  test('host continuation becomes stale when its turn owner changes before ACK', async () => {
+    const session = new Session('host-continuation-owner-replaced', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-host-owner-replaced')
+    const control = controlCodexDispatch(proc)
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'idle'
+    session.wireProc(proc)
+
+    const continuation = session.startHostAskContinuation('continue host ask', proc)
+    await control.started
+    const replacementTurn = turnState('card_host_owner_replacement')
+    session.currentTurn = replacementTurn
+    session.status = 'starting'
+
+    control.ack('turn-old-host-continuation')
+
+    expect(await continuation).toBe('stale')
+    expect(session.currentTurn).toBe(replacementTurn)
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(session.status).toBe('starting')
+  })
+})
+
+function deferCardSettingsPatch(cardId: string): {
+  entered: Promise<void>
+  release: () => void
+  restore: () => void
+} {
+  const entered = deferred<void>()
+  const release = deferred<void>()
+  const passthroughFetch = globalThis.fetch
+  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+    const url = new URL(String(input))
+    if (
+      String(init?.method ?? 'GET') === 'PATCH' &&
+      url.pathname.endsWith(`/cards/${cardId}/settings`)
+    ) {
+      entered.resolve()
+      await release.promise
+    }
+    return await passthroughFetch(input, init)
+  }) as typeof fetch
+  return {
+    entered: entered.promise,
+    release: () => release.resolve(),
+    restore: () => {
+      release.resolve()
+      globalThis.fetch = passthroughFetch
+    },
+  }
 }
 
 async function waitForHostAskAttempt(ask: { resumeStarted?: boolean }, session: any): Promise<void> {
@@ -1285,7 +4225,7 @@ function replaceOpenProcess(session: any, suffix: string): {
   const nextTurn = turnState(`card_watchdog_${suffix}`)
   session.proc = nextProc
   session.currentTurn = nextTurn
-  session.openingTurn = false
+  session.clearTurnOpening()
   session.status = 'starting'
   session.wireProc(nextProc)
   return { nextProc, nextTurn }
@@ -1332,6 +4272,43 @@ describe('Session Codex watchdog turn identity', () => {
     expect(turn.backendThreadId).toBe('thread-1')
     expect(turn.backendTurnId).toBe('codex-turn-1')
     expect(session.watchdogSafetySnapshot(session.watchdogContext).currentTurn).toBe(true)
+  })
+
+  test('a mismatched second turn_started cannot rewrite a bound recovery identity', () => {
+    const { session, proc, turn } = wiredWatchdogSession()
+    proc.emit('turn_started', {
+      thread_id: 'thread-1',
+      turn_id: 'codex-turn-bound',
+    })
+    const context = session.watchdogContext
+
+    proc.emit('turn_started', {
+      thread_id: 'thread-1',
+      turn_id: 'codex-turn-conflict',
+    })
+
+    expect(session.watchdogContext).toBe(context)
+    expect(context).toMatchObject({
+      threadId: 'thread-1',
+      turnId: 'codex-turn-bound',
+      identityConflict: true,
+    })
+    expect(turn.backendThreadId).toBe('thread-1')
+    expect(turn.backendTurnId).toBe('codex-turn-bound')
+    expect(session.watchdogSafetySnapshot(context).currentTurn).toBe(false)
+  })
+
+  test('a preserved recovery provider and thread identity are runtime immutable', () => {
+    const { session } = armedRecoverySession()
+    const transaction = session.beginWatchdogAction(
+      session.watchdogContext,
+      'watchdog-recovery',
+    )
+    const recovery = session.preserveWatchdogRecovery(transaction)
+
+    expect(Reflect.set(recovery, 'provider', 'claude')).toBe(false)
+    expect(Reflect.set(recovery, 'threadId', 'thread-rewritten')).toBe(false)
+    expect(recovery).toMatchObject({ provider: 'codex', threadId: 'thread-1' })
   })
 
   test('uses the exact supplied timestamp when beginning a watchdog turn', () => {
@@ -1423,7 +4400,7 @@ describe('Session Codex watchdog turn identity', () => {
     const proc = new FakeAgentProc('codex', 'codex-thread-opening')
     session.selectedProvider = 'codex'
     session.proc = proc
-    session.openingTurn = true
+    const openingToken = session.beginTurnOpening()
     session.pendingTurnInputs = ['hello']
     session.wireProc(proc)
 
@@ -1453,6 +4430,7 @@ describe('Session Codex watchdog turn identity', () => {
       expect(session.currentTurn.backendTurnId).toBe('codex-turn-opening')
       expect(session.pendingWatchdogIdentity).toBeNull()
     } finally {
+      session.finishTurnOpening(openingToken)
       session.stopFooterStatus(session.currentTurn)
       if (session.currentTurn) await cardkit.dispose(session.currentTurn.cardId)
     }
@@ -1464,7 +4442,7 @@ describe('Session Codex watchdog turn identity', () => {
     const proc = new FakeAgentProc('codex', 'codex-thread-opening-failure')
     session.selectedProvider = 'codex'
     session.proc = proc
-    session.openingTurn = true
+    const openingToken = session.beginTurnOpening()
     session.pendingTurnInputs = ['first']
     session.wireProc(proc)
     proc.emit('turn_started', {
@@ -1478,6 +4456,7 @@ describe('Session Codex watchdog turn identity', () => {
     })) as typeof fetch
     await session.openTurnCard('ou_user', 'user_message', { startThinking: false })
     expect(session.currentTurn).toBeNull()
+    session.finishTurnOpening(openingToken)
 
     globalThis.fetch = healthyFetch
     session.pendingTurnInputs = ['second']
@@ -1511,10 +4490,22 @@ describe('Session Codex watchdog turn identity', () => {
     }
     proc.sendUserText = (text: string) => {
       order.push(session.watchdogContext ? `send:observed:${text}` : `send:unobserved:${text}`)
+      return {
+        kind: 'turn_start_pending',
+        provider: 'codex',
+        deliveryId: 'cold-order-delivery',
+        threadId: 'codex-thread-cold',
+        settlement: Promise.resolve({
+          kind: 'ack',
+          deliveryId: 'cold-order-delivery',
+          threadId: 'codex-thread-cold',
+          turnId: null,
+        }),
+      }
     }
 
     try {
-      await session.startColdUserTurn('hello', 'hello', 'ou_user')
+      await session.startColdUserTurn('hello', 'hello', 'ou_user', '')
 
       expect(order).toEqual(['start', 'footer:observed', 'send:observed:hello'])
       expect(session.watchdogContext).toMatchObject({
@@ -1923,7 +4914,7 @@ describe('Session Codex watchdog progress observation', () => {
       expect(session.backgroundTasks.map((task: any) => task.id)).toEqual(['bg-still-running'])
     } finally {
       globalThis.fetch = healthyFetch
-      session.openingTurn = false
+      session.clearTurnOpening()
       await session.resetBackgroundTasks()
     }
   })
@@ -1943,7 +4934,7 @@ describe('Session Codex watchdog progress observation', () => {
       await sendStarted.promise
       const staleCounter = session.watchdogOpeningTurnCounter
       const { nextProc, nextTurn } = replaceOpenProcess(session, 'after-send-card')
-      session.openingTurn = true
+      const nextOpeningToken = session.beginTurnOpening()
       session.watchdogOpeningTurnCounter = staleCounter
       session.watchdogOpeningProc = nextProc
       session.pendingWatchdogIdentity = {
@@ -1964,9 +4955,10 @@ describe('Session Codex watchdog progress observation', () => {
       expect(session.watchdogOpeningProc).toBe(nextProc)
       expect(session.pendingWatchdogIdentity?.proc).toBe(nextProc)
       expectStaleCardClosed('card_status_1')
+      session.finishTurnOpening(nextOpeningToken)
     } finally {
       feishuMockState.sendCard = null
-      session.openingTurn = false
+      session.clearTurnOpening()
       session.stopFooterStatus(session.currentTurn)
     }
   })
@@ -2078,7 +5070,7 @@ describe('Session Codex watchdog progress observation', () => {
       expectStaleCardClosed('card_status_1')
     } finally {
       feishuMockState.sendCard = null
-      session.openingTurn = false
+      session.clearTurnOpening()
       session.stopFooterStatus(session.currentTurn)
     }
   })
@@ -2286,7 +5278,7 @@ describe('Session Codex watchdog progress observation', () => {
       session.currentBatchReactionIds.set('om_replacement_turn', 'reaction_replacement_turn')
 
       sendResult.resolve('om_stale_drain_caller')
-      await staleDrain
+      expect(await staleDrain).toBe('preserved')
       await Promise.resolve()
 
       expect(session.currentTurn).toBe(nextTurn)
@@ -2307,7 +5299,7 @@ describe('Session Codex watchdog progress observation', () => {
       expect(deletedReactions).toEqual([])
     } finally {
       feishuMockState.sendCard = null
-      session.openingTurn = false
+      session.clearTurnOpening()
       session.stopFooterStatus(session.currentTurn)
     }
   })
@@ -2337,7 +5329,7 @@ describe('Session Codex watchdog progress observation', () => {
     const statusBefore = session.status
 
     try {
-      await session.drainMidTurnAndOpen()
+      expect(await session.drainMidTurnAndOpen()).toBe('preserved')
 
       expect(proc.sentTexts).toEqual([])
       expect(session.pendingUserMessageCount).toBe(0)
@@ -2354,7 +5346,7 @@ describe('Session Codex watchdog progress observation', () => {
       ]))
     } finally {
       feishuMockState.sendCard = null
-      session.openingTurn = false
+      session.clearTurnOpening()
       session.stopFooterStatus(session.currentTurn)
     }
   })
@@ -2399,7 +5391,7 @@ describe('Session Codex watchdog progress observation', () => {
       expect(session.status).toBe('starting')
     } finally {
       closeRelease.resolve()
-      session.openingTurn = false
+      session.clearTurnOpening()
       session.stopFooterStatus(session.currentTurn)
     }
   })
@@ -2512,7 +5504,7 @@ describe('Session host ask continuation ownership', () => {
     } finally {
       sendResult.resolve(null)
       feishuMockState.sendCard = null
-      session.openingTurn = false
+      session.clearTurnOpening()
       session.stopFooterStatus(session.currentTurn)
     }
   })
@@ -2968,10 +5960,12 @@ describe('Session Codex watchdog structured activity and safety', () => {
     expect(session.watchdogSafetySnapshot(context).queuedHumanWork).toBe(true)
     session.multiMsgBuffer = null
 
-    session.modelSwitchPending = true
+    const modelLease = session.beginLifecycle('model')
+    const modelSwitch = session.beginModelSwitch(modelLease)
+    expect(modelSwitch).not.toBeNull()
     expect(session.watchdogSafetySnapshot(context).modelSwitchPending).toBe(true)
-    session.modelSwitchPending = false
-    session.watchdogActionInFlight = true
+    session.finishModelSwitch(modelSwitch)
+    expect(session.beginWatchdogAction(context, 'watchdog-recovery')).not.toBeNull()
     expect(session.watchdogSafetySnapshot(context).recoveryActionInFlight).toBe(true)
   })
 
@@ -3179,6 +6173,104 @@ describe('Session Codex watchdog warning and model guard', () => {
     expect(session.modelSwitchPending).toBe(false)
   })
 
+  test('model selection rejects an existing preserved recovery before applying settings', async () => {
+    const session = new Session('watchdog-model-preserved-before', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-model-preserved-before')
+    session.selectedProvider = 'codex'
+    session.selectedModel = null
+    session.proc = proc
+    installFailedWatchdogRecovery(session, {
+      proc,
+      threadId: 'thread-model-preserved-before',
+    })
+
+    const result = await session.onModelEffortSelect(
+      'gpt-5.6-sol', 'ultra', '', 'ou_user', 'codex',
+    )
+
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('自动恢复')
+    expect(proc.setModelSettingsCalls).toEqual([])
+    expect(session.selectedModel).toBeNull()
+  })
+
+  test('model selection rechecks preserved recovery after awaited settings', async () => {
+    const session = new Session('watchdog-model-preserved-after', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-model-preserved-after')
+    const settingsEntered = deferred<void>()
+    const settingsRelease = deferred<void>()
+    let applyCalls = 0
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    proc.setModelSettings = async () => {
+      settingsEntered.resolve()
+      await settingsRelease.promise
+    }
+    session.applyModelSelection = async () => { applyCalls++ }
+
+    const selecting = session.onModelEffortSelect(
+      'gpt-5.6-sol', 'ultra', '', 'ou_user', 'codex',
+    )
+    await settingsEntered.promise
+    installFailedWatchdogRecovery(session, {
+      proc,
+      threadId: 'thread-model-preserved-after',
+    })
+    settingsRelease.resolve()
+    const result = await selecting
+
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('自动恢复')
+    expect(applyCalls).toBe(0)
+  })
+
+  test('a stale model selection cannot apply or clear a newer pending token', async () => {
+    const session = new Session('watchdog-model-token-race', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-model-token-race')
+    const firstEntered = deferred<void>()
+    const firstRelease = deferred<void>()
+    const secondEntered = deferred<void>()
+    const secondRelease = deferred<void>()
+    const applied: string[] = []
+    let settingsCalls = 0
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    proc.setModelSettings = async () => {
+      settingsCalls++
+      if (settingsCalls === 1) {
+        firstEntered.resolve()
+        await firstRelease.promise
+      } else {
+        secondEntered.resolve()
+        await secondRelease.promise
+      }
+    }
+    session.applyModelSelection = async (_provider: string, model: string) => {
+      applied.push(model)
+    }
+
+    const first = session.onModelEffortSelect(
+      'gpt-5.6-sol', 'ultra', '', 'ou_first', 'codex',
+    )
+    await firstEntered.promise
+    const second = session.onModelEffortSelect(
+      'gpt-5.6-sol', 'ultra', '', 'ou_second', 'codex',
+    )
+    await secondEntered.promise
+    firstRelease.resolve()
+    const firstResult = await first
+
+    expect(firstResult.ok).toBe(false)
+    expect(applied).toEqual([])
+    expect(session.modelSwitchPending).toBe(true)
+
+    secondRelease.resolve()
+    const secondResult = await second
+    expect(secondResult.ok).toBe(true)
+    expect(applied).toEqual(['gpt-5.6-sol'])
+    expect(session.modelSwitchPending).toBe(false)
+  })
+
   test('ends the active observation when the turn card closes', async () => {
     const { session, proc, turn } = wiredWatchdogSession()
     proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-close' })
@@ -3219,6 +6311,119 @@ describe('Session fresh conversation state', () => {
     expect(session.currentTurnUsageBaselineKnown).toBe(false)
     expect(session.lastTurnUsage).toBeNull()
     expect(session.usageTotalsSeedUnknown).toBe(false)
+  })
+})
+
+describe('Session preserved recovery guards for rollback and history selection', () => {
+  test('startForked rejects preserved recovery before changing lifecycle or action ownership', async () => {
+    const { session, action, recovery } = ownedFailedWatchdogRecoverySession()
+    const lifecycleEpoch = session.lifecycleEpoch
+    const lifecycleOwner = session.lifecycleOwner
+    let spawnCalls = 0
+    session.spawnAgent = () => {
+      spawnCalls++
+      return new FakeAgentProc('codex', 'forked-thread')
+    }
+
+    const started = await session.startForked('history-thread', 'assistant-anchor')
+
+    expect(started).toBe(false)
+    expect(spawnCalls).toBe(0)
+    expect(session.lifecycleEpoch).toBe(lifecycleEpoch)
+    expect(session.lifecycleOwner).toBe(lifecycleOwner)
+    expect(session.preservedWatchdogRecovery).toBe(recovery)
+    expect(recovery.phase).toBe('failed')
+    expect(session.watchdogAction).toBe(action)
+    expect(session.ownsWatchdogAction(action)).toBe(true)
+  })
+
+  for (const [label, action] of [
+    ['model panel', async (session: any) => { await session.showModelPanel() }],
+    ['model selection', async (session: any) => {
+      await session.onModelSelect('gpt-5.6-sol', '', '', { provider: 'codex' })
+    }],
+    ['back command', async (session: any) => { await session.runCommand('bk') }],
+    ['back selection', async (session: any) => { await session.onBackSelect(0) }],
+    ['resume selection', async (session: any) => { await session.onResumeSelect('history-thread') }],
+    ['rollback', async (session: any) => { await session.rollbackTo('history-thread', undefined) }],
+  ] as const) {
+    test(`${label} rejection does not supersede an active preserved recovery`, async () => {
+      const session = new Session(`preserved-guard-${label.replaceAll(' ', '-')}`, 'chat_id') as any
+      session.selectedProvider = 'codex'
+      const recovery = installFailedWatchdogRecovery(session)
+      recovery.phase = 'recovering'
+      const lifecycleOwner = session.lifecycleOwner
+
+      await action(session)
+
+      expect(session.lifecycleOwner).toBe(lifecycleOwner)
+      expect(session.preservedWatchdogRecovery).toBe(recovery)
+      expect(recovery.phase).toBe('recovering')
+    })
+  }
+
+  test('rollbackTo rejects preserved recovery before changing its target identity', async () => {
+    const session = new Session('rollback-preserved-before', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'claude-original-thread'
+    installFailedWatchdogRecovery(session)
+    let restartCalls = 0
+    session.restart = async () => { restartCalls++; return true }
+
+    const ok = await session.rollbackTo('claude-new-thread', 'assistant-anchor')
+
+    expect(ok).toBe(false)
+    expect(restartCalls).toBe(0)
+    expect(session.lastSessionId).toBe('claude-original-thread')
+  })
+
+  test('rollbackTo cannot commit after a newer preserved recovery wins during restart', async () => {
+    const session = new Session('rollback-preserved-after', 'chat_id') as any
+    const restartEntered = deferred<void>()
+    const restartRelease = deferred<void>()
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'claude-original-thread'
+    session.restart = async () => {
+      restartEntered.resolve()
+      await restartRelease.promise
+      return true
+    }
+
+    const rollingBack = session.rollbackTo('claude-new-thread', 'assistant-anchor')
+    await restartEntered.promise
+    installFailedWatchdogRecovery(session)
+    restartRelease.resolve()
+    const ok = await rollingBack
+
+    expect(ok).toBe(false)
+    expect(session.lastSessionId).toBe('claude-original-thread')
+  })
+
+  test('back selection rejects preserved recovery before preliminary card work', async () => {
+    const session = new Session('back-select-preserved', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    installFailedWatchdogRecovery(session)
+    let rollbackCalls = 0
+    session.rollbackTo = async () => { rollbackCalls++; return true }
+
+    await session.onBackSelect(0)
+
+    expect(rollbackCalls).toBe(0)
+    expect(sentTexts.at(-1)).toContain('自动恢复')
+  })
+
+  test('resume selection rejects preserved recovery before its preliminary message', async () => {
+    const session = new Session('resume-select-preserved', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    installFailedWatchdogRecovery(session)
+    let rollbackCalls = 0
+    session.rollbackTo = async () => { rollbackCalls++; return true }
+
+    await session.onResumeSelect('claude-history-thread')
+
+    expect(rollbackCalls).toBe(0)
+    expect(sentTexts.at(-1)).toContain('自动恢复')
+    expect(sentTexts.some(text => text.includes('在本群恢复会话'))).toBe(false)
   })
 })
 
@@ -3623,7 +6828,7 @@ describe('Session provider switching', () => {
     session.selectedProvider = 'claude'
     session.lastSessionId = 'claude-session-1'
 
-    session.persistResumableSessionId()
+    session.persistResumableSessionId(proc)
 
     expect(boundResumes).toEqual([['probe', 'codex-thread-1', 'codex']])
     expect(session.lastSessionId).toBe('claude-session-1')
@@ -4364,6 +7569,34 @@ describe('Session resetBackgroundTasks on kill/restart', () => {
     return { id, type: 'shell', description: `bg ${id}`, status: 'running', startedAt: Date.now() - 5000, steps: [] }
   }
 
+  function installConcurrentBackgroundState(session: any, prefix: string): {
+    tasks: any[]
+    pending: any[]
+    card: { messageId: string; cardId: string }
+    details: Set<string>
+    archive: Array<{ id: string; description: string }>
+  } {
+    const taskId = `${prefix}-completed`
+    const pendingId = `${prefix}-pending`
+    const tasks = [{
+      ...makeRunningTask(taskId),
+      type: 'subagent',
+      subagentType: 'verifier',
+      status: 'completed',
+      endTime: Date.now(),
+    }]
+    const pending = [makeRunningTask(pendingId)]
+    const card = { messageId: `om_bg_${prefix}`, cardId: `card_bg_${prefix}` }
+    const details = new Set([taskId])
+    const archive = [{ id: `${prefix}-archive`, description: `${prefix} archive` }]
+    session.backgroundTasks = tasks
+    session.pendingBgTasks = pending
+    session.backgroundCard = card
+    session.backgroundDetailAdded = details
+    session.bgArchive = archive
+    return { tasks, pending, card, details, archive }
+  }
+
   test('stop() kills proc AND clears running background tasks (public kill path)', async () => {
     // 用户真实触发路径:kill 命令 → session.stop()。修复前 stop 只杀进程,
     // 不碰 backgroundTasks,running entry 留在内存 + refresh tick 继续伪造时长。
@@ -4423,6 +7656,130 @@ describe('Session resetBackgroundTasks on kill/restart', () => {
     expect(session.backgroundRefreshTimer).toBeNull() // timer 引用已清
     expect(session.backgroundDetailAdded.size).toBe(0)
     expect(session.openingBackground).toBe(false)
+  })
+
+  test('stop cleanup cannot clear background state installed by a newer lifecycle during old-card settlement', async () => {
+    const session = new Session('background-stop-cleanup-race', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-background-session')
+    const oldCardPatch = deferCardSettingsPatch('card_bg_old')
+    session.proc = oldProc
+    session.status = 'working'
+    session.backgroundTasks = [{
+      ...makeRunningTask('old-active'),
+      type: 'subagent',
+      subagentType: 'executor',
+    }]
+    session.pendingBgTasks = [makeRunningTask('old-pending')]
+    session.backgroundCard = { messageId: 'om_bg_old', cardId: 'card_bg_old' }
+    session.backgroundDetailAdded = new Set(['old-active'])
+    session.bgArchive = [{ id: 'old-archive', description: 'old archive' }]
+    cardkit.recordCardCreated('card_bg_old', 1)
+
+    const stopping = session.stop('background cleanup race', { announce: false })
+    try {
+      await oldCardPatch.entered
+      const newerLease = session.beginLifecycle('hi')
+      const newerProc = new FakeAgentProc('claude', 'new-background-session')
+      session.proc = newerProc
+      session.status = 'working'
+      const newer = installConcurrentBackgroundState(session, 'new')
+      session.openingBackground = true
+
+      oldCardPatch.release()
+      await stopping
+
+      expect(session.lifecycleOwner).toBe(newerLease)
+      expect(session.proc).toBe(newerProc)
+      expect(session.status).toBe('working')
+      expect(session.backgroundTasks).toBe(newer.tasks)
+      expect(session.backgroundTasks.map((task: any) => task.id)).toEqual(['new-completed'])
+      expect(session.pendingBgTasks).toBe(newer.pending)
+      expect(session.pendingBgTasks.map((task: any) => task.id)).toEqual(['new-pending'])
+      expect(session.backgroundCard).toBe(newer.card)
+      expect(session.backgroundDetailAdded).toBe(newer.details)
+      expect(session.backgroundDetailAdded).toEqual(new Set(['new-completed']))
+      expect(session.bgArchive).toBe(newer.archive)
+      expect(session.bgArchive).toEqual([{ id: 'new-archive', description: 'new archive' }])
+      expect(session.openingBackground).toBe(true)
+    } finally {
+      oldCardPatch.restore()
+    }
+  })
+
+  test('natural old-card settlement cannot clear a concurrently installed background state', async () => {
+    const session = new Session('background-natural-settle-race', 'chat_id') as any
+    const oldCardPatch = deferCardSettingsPatch('card_bg_natural_old')
+    session.backgroundTasks = [{
+      ...makeRunningTask('old-completed'),
+      type: 'subagent',
+      subagentType: 'executor',
+      status: 'completed',
+      endTime: Date.now(),
+    }]
+    session.backgroundCard = { messageId: 'om_bg_natural_old', cardId: 'card_bg_natural_old' }
+    session.backgroundDetailAdded = new Set(['old-completed'])
+    session.bgArchive = [{ id: 'natural-old-archive', description: 'natural old archive' }]
+    cardkit.recordCardCreated('card_bg_natural_old', 1)
+
+    const settling = session.settleBackgroundCard()
+    try {
+      await oldCardPatch.entered
+      const newer = installConcurrentBackgroundState(session, 'natural-new')
+
+      oldCardPatch.release()
+      await settling
+
+      expect(session.backgroundTasks).toBe(newer.tasks)
+      expect(session.backgroundTasks.map((task: any) => task.id)).toEqual(['natural-new-completed'])
+      expect(session.pendingBgTasks).toBe(newer.pending)
+      expect(session.pendingBgTasks.map((task: any) => task.id)).toEqual(['natural-new-pending'])
+      expect(session.backgroundCard).toBe(newer.card)
+      expect(session.backgroundDetailAdded).toBe(newer.details)
+      expect(session.backgroundDetailAdded).toEqual(new Set(['natural-new-completed']))
+      expect(session.bgArchive).toBe(newer.archive)
+      expect(session.bgArchive).toEqual([{
+        id: 'natural-new-archive',
+        description: 'natural-new archive',
+      }])
+    } finally {
+      oldCardPatch.restore()
+    }
+  })
+
+  test('old-card settlement renders its captured killed tasks when flush overlaps newer background state', async () => {
+    const session = new Session('background-captured-history-race', 'chat_id') as any
+    const oldCardPatch = deferCardSettingsPatch('card_bg_captured_old')
+    session.backgroundTasks = [{
+      ...makeRunningTask('captured-old-active'),
+      type: 'subagent',
+      subagentType: 'executor',
+    }]
+    session.backgroundCard = {
+      messageId: 'om_bg_captured_old',
+      cardId: 'card_bg_captured_old',
+    }
+    session.backgroundDetailAdded = new Set(['captured-old-active'])
+    cardkit.recordCardCreated('card_bg_captured_old', 1)
+    const queuedPatch = cardkit.patchSettings('card_bg_captured_old', { config: {} })
+
+    try {
+      await oldCardPatch.entered
+      const resetting = session.resetBackgroundTasks()
+      const newer = installConcurrentBackgroundState(session, 'render-new')
+      oldCardPatch.release()
+      await queuedPatch
+      await resetting
+
+      const historyCard = updatedCards.find(([messageId]) => (
+        messageId === 'om_bg_captured_old'
+      ))?.[1]
+      expect(JSON.stringify(historyCard)).toContain('captured-old-active')
+      expect(JSON.stringify(historyCard)).not.toContain('render-new-completed')
+      expect(session.backgroundTasks).toBe(newer.tasks)
+      expect(session.backgroundCard).toBe(newer.card)
+    } finally {
+      oldCardPatch.restore()
+    }
   })
 })
 

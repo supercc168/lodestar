@@ -10,6 +10,33 @@ export type StatusCardHandle = {
   timer: FooterTimer
 }
 
+export type LifecycleKind =
+  | 'start'
+  | 'restart'
+  | 'strict-retry'
+  | 'hi'
+  | 'soft_stop'
+  | 'stop'
+  | 'kill'
+  | 'clear'
+  | 'dispose'
+  | 'model'
+  | 'back'
+  | 'resume'
+  | 'fork'
+  | 'watchdog-recovery'
+  | 'watchdog-exhausted'
+
+export type LifecycleLease = Readonly<{
+  epoch: number
+  kind: LifecycleKind
+}>
+
+export type ResumeIdentity = Readonly<{
+  provider: import('./agent-process').AgentProvider
+  threadId: string
+}>
+
 export type LifecycleProgressOpts = {
   announce?: boolean
   onStatus?: (status: string) => void
@@ -21,6 +48,12 @@ export type LifecycleProgressOpts = {
    * first direct-start card, because the visible turn number is decided
    * before Codex starts. */
   freshConversationStateAlreadyReset?: boolean
+  /** Internal: nested lifecycle operations retain the caller's lease. */
+  lifecycleLease?: LifecycleLease
+  /** Internal: strict recovery must use this immutable provider/thread. */
+  resumeIdentity?: ResumeIdentity
+  /** Internal: binds preserve flags to one identity-bearing recovery. */
+  preservedRecoveryToken?: object
 }
 
 export type WorktreeActionResult = { ok: boolean; message: string; card: object }

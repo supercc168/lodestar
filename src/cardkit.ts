@@ -329,21 +329,40 @@ export function addElement(
   return s.queue
 }
 
-/** Replace an entire element (used to swap a tool placeholder with its result). */
-export function replaceElement(cardId: string, elementId: string, element: object): Promise<void> {
+/** Replace an entire element (used to swap a tool placeholder with its result).
+ *
+ * `onFailure` fires exactly once if the replace did NOT land — API failure
+ * (with the parsed Card Kit code), or a write-dead / dead-element short
+ * circuit (no code). 注意与 addElement 的差异:addElement 的 write-dead
+ * 短路是静默的,这里短路也回调 —— 终态写(footer 终态、streaming 收尾)
+ * 必须可观测,否则调用方无从决定 raw 文本兜底。Default (no callback)
+ * preserves the legacy fire-and-forget swallow behavior. */
+export function replaceElement(
+  cardId: string,
+  elementId: string,
+  element: object,
+  onFailure?: (code?: number) => void,
+): Promise<void> {
   const s = state(cardId)
-  if (s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
+  if (s.writeDead || s.deadElements.has(elementId)) {
+    onFailure?.()
+    return Promise.resolve()
+  }
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `replaceElement ${elementId}`,
     async () => {
-      if (s.writeDead || s.deadElements.has(elementId)) return
+      if (s.writeDead || s.deadElements.has(elementId)) {
+        onFailure?.()
+        return
+      }
       const seq = nextSeq(cardId)
       await call('PUT', `/cards/${cardId}/elements/${elementId}`, {
         element: JSON.stringify(element),
         sequence: seq,
       })
     },
+    onFailure,
   ))
   return s.queue
 }
@@ -419,18 +438,31 @@ export function cancelSummary(cardId: string): void {
  * with a stale seq and Feishu rejects 300317 "sequence number compare
  * failed". Keeping all writes on execution-time allocation makes the
  * seq order match the queue order. */
-export function patchSettings(cardId: string, settings: object): Promise<void> {
+export function patchSettings(
+  cardId: string,
+  settings: object,
+  onFailure?: (code?: number) => void,
+): Promise<void> {
   const s = state(cardId)
-  if (s.writeDead) return Promise.resolve()
+  if (s.writeDead) {
+    onFailure?.()
+    return Promise.resolve()
+  }
   s.queue = s.queue.then(async () => {
-    if (s.writeDead) return
+    if (s.writeDead) {
+      onFailure?.()
+      return
+    }
     try {
       const seq = nextSeq(cardId)
       await call('PATCH', `/cards/${cardId}/settings`, {
         settings: JSON.stringify(settings),
         sequence: seq,
       })
-    } catch (e) { log(`cardkit patchSettings ${cardId}: ${e}`) }
+    } catch (e) {
+      log(`cardkit patchSettings ${cardId}: ${e}`)
+      onFailure?.((e as any)?.code)
+    }
   })
   return s.queue
 }

@@ -178,6 +178,11 @@ export async function onForkSelect(s: Session, anchorIdx: number, userOpenId: st
 }
 
 export async function onBackSelect(s: Session, anchorIdx: number): Promise<void> {
+  if (s.hasPreservedWatchdogRecovery()) {
+    await feishu.sendText(s.chatId, '⚠️ thread 自动恢复尚未完成，暂不能回滚。请先发送 restart 恢复，或 clear/kill 丢弃。')
+    return
+  }
+  const lease = s.beginLifecycle('back')
   if (s.selectedProvider !== 'claude') { await feishu.sendText(s.chatId, '❌ back 暂只支持 Claude 后端(Codex 无 resumeSessionAt 能力)。群里发 model 切到 Claude。'); return }
   const anchors = feishu.getTurnAnchors(s.sessionName)
   if (anchorIdx < 0 || anchorIdx >= anchors.length) { await feishu.sendText(s.chatId, '❌ 无效的回滚点。'); return }
@@ -187,8 +192,10 @@ export async function onBackSelect(s: Session, anchorIdx: number): Promise<void>
   // 先发 Write 记录卡(回滚段 = anchors[anchorIdx..end] 的 writes,被回滚掉的操作)
   const writes = anchors.slice(anchorIdx).flatMap(a => a.writes)
   await feishu.sendCard(s.chatId, cards.writeLogCard({ projectName: projectName(s), entries: writes })).catch(() => {})
+  if (!s.ownsLifecycle(lease) || s.hasPreservedWatchdogRecovery()) return
   log(`session-temp: back ${s.sessionName}@${anchorIdx} (at=${resumeSessionAt?.slice(0, 8) ?? 'origin'}, writes=${writes.length})`)
-  const ok = await s.rollbackTo(resumeSessionId, resumeSessionAt)
+  const ok = await s.rollbackTo(resumeSessionId, resumeSessionAt, { lifecycleLease: lease })
+  if (!s.ownsLifecycle(lease) || s.hasPreservedWatchdogRecovery()) return
   if (ok) {
     // 成功后再截断(reset 语义:回滚点之后作废)。失败则不动锚点 —— 用户可重试,不丢历史。
     feishu.truncateTurnAnchors(s.sessionName, anchorIdx)
@@ -198,14 +205,21 @@ export async function onBackSelect(s: Session, anchorIdx: number): Promise<void>
 }
 
 export async function onResumeSelect(s: Session, sessionId: string): Promise<void> {
+  if (s.hasPreservedWatchdogRecovery()) {
+    await feishu.sendText(s.chatId, '⚠️ thread 自动恢复尚未完成，暂不能选择历史会话。请先发送 restart 恢复，或 clear/kill 丢弃。')
+    return
+  }
+  const lease = s.beginLifecycle('resume')
   // sessionId 来自 transcript 文件名(同 cwd 的 claude 会话),直接 resume。
   if (s.selectedProvider !== 'claude') {
     await feishu.sendText(s.chatId, '❌ 历史会话恢复只支持 Claude 后端(transcript 是 Claude 的)。群里发 model 切到 Claude 再 rs。')
     return
   }
   await feishu.sendText(s.chatId, `🔁 在本群恢复会话 ${sessionId.slice(0, 8)}…`)
+  if (!s.ownsLifecycle(lease) || s.hasPreservedWatchdogRecovery()) return
   log(`session-temp: resume ${s.sessionName} ← claude session ${sessionId.slice(0, 8)}`)
-  const ok = await s.rollbackTo(sessionId, undefined)
+  const ok = await s.rollbackTo(sessionId, undefined, { lifecycleLease: lease })
+  if (!s.ownsLifecycle(lease) || s.hasPreservedWatchdogRecovery()) return
   if (ok) feishu.clearTurnAnchors(s.sessionName)
   else await feishu.sendText(s.chatId, '❌ 恢复失败,请检查日志。')
 }

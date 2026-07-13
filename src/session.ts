@@ -39,8 +39,11 @@ import {
   type AgentProcess,
   type AgentProvider,
   type AgentReasoningEffort,
+  type AgentResultEvent,
   type ClaudeReasoningEffort,
+  type CodexUserTextSettlement,
   type CollabAgentStates,
+  type UserTextDispatch,
 } from './agent-process'
 import {
   ClaudeAgentProcess,
@@ -73,8 +76,11 @@ import * as sessionPermission from './session-permission'
 import {
   messageOf,
   type FooterTimer,
+  type LifecycleKind,
+  type LifecycleLease,
   type LifecycleProgressOpts,
   type ModelActionResult,
+  type ResumeIdentity,
   type StatusCardHandle,
   type TasklistActionResult,
   type WorktreeActionResult,
@@ -104,11 +110,40 @@ export const WATCHDOG_RECOVERY_PROMPT = `[Lodestar 自动恢复 1/1]
 不要用空的 text(...) 调用代替实际派发、等待或结果汇报。
 完成任务或遇到真实阻塞时直接给出明确结果。`
 
+export const WATCHDOG_TICK_MS = 15_000
+
 export interface WatchdogTurnContext {
   proc: AgentProcess
   turn: TurnState
   threadId: string | null
   turnId: string | null
+  identityConflict: boolean
+}
+
+export type PreservedWatchdogRecoveryPhase = 'recovering' | 'retrying' | 'draining' | 'failed'
+
+export interface PreservedWatchdogRecovery extends ResumeIdentity {
+  readonly token: object
+  readonly turn: TurnState
+  readonly turnId: string
+  readonly recoveryAttempt: number
+  lease: LifecycleLease
+  phase: PreservedWatchdogRecoveryPhase
+  replacementProc: AgentProcess | null
+}
+
+export interface WatchdogActionTransaction extends ResumeIdentity {
+  readonly token: object
+  readonly lease: LifecycleLease
+  readonly proc: AgentProcess
+  readonly turn: TurnState
+  readonly turnId: string
+  readonly recoveryAttempt: number
+}
+
+export interface ModelSwitchTransaction {
+  readonly token: object
+  readonly lease: LifecycleLease
 }
 
 type TurnInterruptSource = 'user' | 'watchdog_recover' | 'watchdog_exhausted'
@@ -134,12 +169,33 @@ interface PendingWatchdogIdentity {
   threadId: string | null
   turnId: string | null
   turnCounter: number | null
+  identityConflict?: boolean
 }
 
 type TurnCardOpenResult =
   | { kind: 'opened'; turn: TurnState }
   | { kind: 'failed' }
   | { kind: 'stale' }
+
+type MidTurnDrainOutcome = 'no_batch' | 'committed' | 'preserved'
+
+type HumanBatchMessage = {
+  text: string
+  wireText: string
+  userOpenId: string
+  msgId: string
+}
+
+type PendingHumanDelivery = {
+  readonly proc: AgentProcess
+  readonly batch: HumanBatchMessage[]
+  readonly reactions: Map<string, string>
+  dispatch: Extract<UserTextDispatch, { kind: 'turn_start_pending' }> | null
+  openingOwner: object | null
+  turn: TurnState | null
+  turnId: string | null
+  state: 'pending' | 'acked' | 'restored'
+}
 
 function formatProcessExitDetail(event: unknown): string {
   const value = event && typeof event === 'object'
@@ -419,7 +475,7 @@ export class Session {
    * Buffering also keeps mid-turn msgs out
    * of any AskUserQuestion `QUEUE remove` storm, since they were never
    * in the SDK queue to begin with. */
-  pendingMidTurnMsgs: Array<{ text: string; wireText: string; userOpenId: string; msgId: string }> = []
+  pendingMidTurnMsgs: HumanBatchMessage[] = []
   /** 下一个 turn 的 user inputs 暂存区。所有 sendUserText 的 wireText 在
    * sendUserText 之前 push 这里;openTurnCard 创建 turn 时一次性取走 + clear。
    * mainConversationCard 把这些 wireText 渲染成顶部"📥 收到 (N)"折叠面板,
@@ -458,6 +514,9 @@ export class Session {
    * OneSecond reactions are the currently-open turn's responsibility
    * to clear (via deleteReaction). Empty for eager-opened solo turns. */
   currentBatchReactionIds = new Map<string, string>()
+  private pendingHumanDelivery: PendingHumanDelivery | null = null
+  private ackedHumanDelivery: PendingHumanDelivery | null = null
+  private restoredHumanDelivery: PendingHumanDelivery | null = null
   /** Count of `system/init` events seen this subprocess. The first one is
    * the boot init (claimed by whichever user message lands first); later
    * ones can mark the start of SDK-driven queued user message draining.
@@ -473,10 +532,13 @@ export class Session {
    * tells the init handler "an eager open is already
    * claiming the slot, stand down". */
   openingTurn = false
+  private openingTurnOwner: object | null = null
   private turnCounter = 0
+  private lifecycleEpoch = 0
+  private lifecycleOwner: LifecycleLease | null = null
+  private disposed = false
+  private pendingSpawnOwnership: { lease: LifecycleLease; proc: AgentProcess } | null = null
   activeTurnInterrupt: TurnInterruptContext | null = null
-  /** A pre-init replacement must not own cleanup of the captured watchdog turn. */
-  private preservingRestartProc: AgentProcess | null = null
   // Last known resumable thread id. Persisted once a turn starts, so
   // `restart` can resume an in-flight conversation even if the daemon
   // exits before the turn finishes.
@@ -513,9 +575,10 @@ export class Session {
   readonly watchdog: TurnWatchdog
   readonly watchdogSettings: WatchdogSettings
   watchdogContext: WatchdogTurnContext | null = null
-  watchdogActionInFlight = false
+  watchdogAction: WatchdogActionTransaction | null = null
+  preservedWatchdogRecovery: PreservedWatchdogRecovery | null = null
   watchdogTickHandle: ReturnType<typeof setInterval> | null = null
-  modelSwitchPending = false
+  modelSwitchOperation: ModelSwitchTransaction | null = null
   codexCollabAgentStates = new Map<string, string>()
   codexCollabAgentStatesByTool = new Map<string, Map<string, string>>()
   codexSubagentActivityIds = new Set<string>()
@@ -595,6 +658,232 @@ export class Session {
   isRunning(): boolean { return !!this.proc && this.proc.isAlive() }
   currentProvider(): AgentProvider { return this.selectedProvider }
 
+  beginLifecycle(kind: LifecycleKind): LifecycleLease {
+    const lease = Object.freeze({ epoch: ++this.lifecycleEpoch, kind })
+    this.lifecycleOwner = lease
+    if (this.preservedWatchdogRecovery && this.preservedWatchdogRecovery.lease !== lease) {
+      this.preservedWatchdogRecovery.phase = 'failed'
+    }
+    return lease
+  }
+
+  ownsLifecycle(lease: LifecycleLease | null | undefined): lease is LifecycleLease {
+    if (!lease || this.lifecycleOwner !== lease) return false
+    return !this.disposed || lease.kind === 'dispose'
+  }
+
+  private lifecycleLease(kind: LifecycleKind, opts: LifecycleProgressOpts): LifecycleLease {
+    return opts.lifecycleLease ?? this.beginLifecycle(kind)
+  }
+
+  private clearPendingSpawn(lease: LifecycleLease, proc: AgentProcess): void {
+    if (this.pendingSpawnOwnership?.lease === lease && this.pendingSpawnOwnership.proc === proc) {
+      this.pendingSpawnOwnership = null
+    }
+  }
+
+  private async discardLocalProcess(lease: LifecycleLease, proc: AgentProcess): Promise<void> {
+    this.clearPendingSpawn(lease, proc)
+    if (this.proc === proc && !this.ownsLifecycle(lease)) return
+    if (this.proc === proc) this.proc = null
+    if (proc.isAlive()) await proc.kill(1_000).catch(() => {})
+  }
+
+  get watchdogActionInFlight(): boolean {
+    return !!this.watchdogAction && this.ownsLifecycle(this.watchdogAction.lease)
+  }
+
+  get watchdogActionProc(): AgentProcess | null {
+    return this.watchdogActionInFlight ? this.watchdogAction?.proc ?? null : null
+  }
+
+  get watchdogResumeFailed(): boolean {
+    return this.preservedWatchdogRecovery?.phase === 'failed'
+  }
+
+  get preservingRestartProc(): AgentProcess | null {
+    return this.preservedWatchdogRecovery?.replacementProc ?? null
+  }
+
+  get modelSwitchPending(): boolean {
+    return !!this.modelSwitchOperation && this.ownsLifecycle(this.modelSwitchOperation.lease)
+  }
+
+  beginModelSwitch(lease: LifecycleLease): ModelSwitchTransaction | null {
+    if (!this.ownsLifecycle(lease) || this.hasPreservedWatchdogRecovery()) return null
+    const transaction: ModelSwitchTransaction = Object.freeze({ token: {}, lease })
+    this.modelSwitchOperation = transaction
+    return transaction
+  }
+
+  ownsModelSwitch(transaction: ModelSwitchTransaction): boolean {
+    return this.modelSwitchOperation === transaction && this.ownsLifecycle(transaction.lease)
+  }
+
+  finishModelSwitch(transaction: ModelSwitchTransaction): void {
+    if (this.modelSwitchOperation === transaction) this.modelSwitchOperation = null
+  }
+
+  hasPreservedWatchdogRecovery(): boolean {
+    return this.preservedWatchdogRecovery !== null
+  }
+
+  beginWatchdogAction(
+    ctx: WatchdogTurnContext,
+    kind: 'watchdog-recovery' | 'watchdog-exhausted',
+  ): WatchdogActionTransaction | null {
+    if (
+      !ctx.threadId ||
+      !ctx.turnId ||
+      ctx.proc.provider !== 'codex' ||
+      !this.watchdogContextIsCurrent(ctx) ||
+      this.hasPreservedWatchdogRecovery()
+    ) return null
+    if (this.watchdogAction && this.ownsLifecycle(this.watchdogAction.lease)) return null
+    const lease = this.beginLifecycle(kind)
+    const transaction: WatchdogActionTransaction = Object.freeze({
+      token: {},
+      lease,
+      proc: ctx.proc,
+      turn: ctx.turn,
+      provider: 'codex' as const,
+      threadId: ctx.threadId,
+      turnId: ctx.turnId,
+      recoveryAttempt: this.watchdog.snapshot().recoveryAttempt,
+    })
+    this.watchdogAction = transaction
+    return transaction
+  }
+
+  ownsWatchdogAction(transaction: WatchdogActionTransaction): boolean {
+    return this.watchdogAction === transaction && this.ownsLifecycle(transaction.lease)
+  }
+
+  finishWatchdogAction(transaction: WatchdogActionTransaction): void {
+    if (this.watchdogAction === transaction) this.watchdogAction = null
+  }
+
+  private createPreservedWatchdogRecovery(input: {
+    token: object
+    lease: LifecycleLease
+    provider: AgentProvider
+    threadId: string
+    turn: TurnState
+    turnId: string
+    recoveryAttempt: number
+    phase: PreservedWatchdogRecoveryPhase
+  }): PreservedWatchdogRecovery {
+    const recovery: PreservedWatchdogRecovery = {
+      ...input,
+      replacementProc: null,
+    }
+    Object.defineProperties(recovery, {
+      provider: { value: input.provider, enumerable: true, writable: false },
+      threadId: { value: input.threadId, enumerable: true, writable: false },
+    })
+    return recovery
+  }
+
+  private watchdogActionTurnStillOwned(transaction: WatchdogActionTransaction): boolean {
+    return this.currentTurn === transaction.turn &&
+      transaction.turn.backendThreadId === transaction.threadId &&
+      transaction.turn.backendTurnId === transaction.turnId
+  }
+
+  private watchdogActionProcessMatches(
+    transaction: WatchdogActionTransaction,
+    proc: AgentProcess | null | undefined,
+  ): proc is AgentProcess {
+    return !!proc && proc.isAlive() &&
+      proc.provider === transaction.provider &&
+      proc.sessionId === transaction.threadId
+  }
+
+  preserveWatchdogRecovery(transaction: WatchdogActionTransaction): PreservedWatchdogRecovery | null {
+    if (!this.ownsWatchdogAction(transaction)) return null
+    const existing = this.preservedWatchdogRecovery
+    if (existing) {
+      if (existing.provider !== transaction.provider || existing.threadId !== transaction.threadId) return null
+      existing.lease = transaction.lease
+      existing.phase = 'recovering'
+      return existing
+    }
+    const recovery = this.createPreservedWatchdogRecovery({
+      token: transaction.token,
+      lease: transaction.lease,
+      provider: transaction.provider,
+      threadId: transaction.threadId,
+      turn: transaction.turn,
+      turnId: transaction.turnId,
+      recoveryAttempt: transaction.recoveryAttempt,
+      phase: 'recovering',
+    })
+    this.preservedWatchdogRecovery = recovery
+    return recovery
+  }
+
+  beginPreservedWatchdogRetry(lease: LifecycleLease): PreservedWatchdogRecovery | null {
+    const recovery = this.preservedWatchdogRecovery
+    if (!recovery || !this.ownsLifecycle(lease)) return null
+    recovery.lease = lease
+    recovery.phase = 'retrying'
+    recovery.replacementProc = null
+    return recovery
+  }
+
+  ownsPreservedWatchdogRecovery(
+    recovery: PreservedWatchdogRecovery,
+    lease: LifecycleLease = recovery.lease,
+  ): boolean {
+    return this.preservedWatchdogRecovery === recovery &&
+      recovery.lease === lease &&
+      this.ownsLifecycle(lease)
+  }
+
+  markPreservedWatchdogRecoveryFailed(
+    recovery: PreservedWatchdogRecovery,
+    lease: LifecycleLease = recovery.lease,
+  ): void {
+    if (this.preservedWatchdogRecovery !== recovery || recovery.lease !== lease) return
+    recovery.phase = 'failed'
+  }
+
+  completePreservedWatchdogRecovery(
+    recovery: PreservedWatchdogRecovery,
+    lease: LifecycleLease = recovery.lease,
+  ): void {
+    if (!this.ownsPreservedWatchdogRecovery(recovery, lease)) return
+    this.preservedWatchdogRecovery = null
+  }
+
+  discardPreservedWatchdogRecovery(_reason: string): void {
+    this.preservedWatchdogRecovery = null
+  }
+
+  private preserveCurrentWatchdogContext(lease: LifecycleLease): PreservedWatchdogRecovery | null {
+    const context = this.watchdogContext
+    if (
+      !context ||
+      !context.threadId ||
+      !context.turnId ||
+      context.proc.provider !== 'codex' ||
+      !this.watchdogTurnStillOwned(context) ||
+      !this.ownsLifecycle(lease)
+    ) return null
+    const recovery = this.createPreservedWatchdogRecovery({
+      token: {},
+      lease,
+      provider: 'codex',
+      threadId: context.threadId,
+      turn: context.turn,
+      turnId: context.turnId,
+      recoveryAttempt: this.watchdog.snapshot().recoveryAttempt,
+      phase: 'retrying',
+    })
+    this.preservedWatchdogRecovery = recovery
+    return recovery
+  }
+
   beginWatchdogTurn(turn: TurnState, proc: AgentProcess, now = Date.now()): void {
     this.endWatchdogTurn()
     if (
@@ -611,6 +900,7 @@ export class Session {
       turn,
       threadId: proc.sessionId,
       turnId: null,
+      identityConflict: false,
     }
     const pending = this.pendingWatchdogIdentity
     if (
@@ -618,15 +908,89 @@ export class Session {
       pending.turnCounter === this.turnCounter &&
       (!proc.sessionId || !pending.threadId || pending.threadId === proc.sessionId)
     ) {
-      this.applyWatchdogIdentity(pending.threadId, pending.turnId)
+      if (pending.identityConflict) this.watchdogContext.identityConflict = true
+      else this.applyWatchdogIdentity(pending.threadId, pending.turnId)
     }
     this.pendingWatchdogIdentity = null
+    this.startWatchdogTick(this.watchdogContext)
   }
 
   endWatchdogTurn(): void {
+    this.stopWatchdogTick()
     this.watchdog.endTurn()
     this.watchdogContext = null
     if (!this.proc) this.clearCodexProcessActivityState()
+  }
+
+  startWatchdogTick(ctx: WatchdogTurnContext): void {
+    this.stopWatchdogTick()
+    if (
+      this.watchdogContext !== ctx ||
+      this.currentTurn !== ctx.turn ||
+      this.proc !== ctx.proc ||
+      !ctx.proc.isAlive() ||
+      ctx.proc.provider !== 'codex' ||
+      this.watchdogSettings.mode === 'off'
+    ) return
+    this.watchdogTickHandle = setInterval(() => {
+      this.evaluateWatchdogTick()
+    }, WATCHDOG_TICK_MS)
+    ;(this.watchdogTickHandle as { unref?: () => void }).unref?.()
+  }
+
+  stopWatchdogTick(): void {
+    if (this.watchdogTickHandle) clearInterval(this.watchdogTickHandle)
+    this.watchdogTickHandle = null
+  }
+
+  clearWatchdogRuntime(reason: string): void {
+    this.endWatchdogTurn()
+    this.cancelTurnInterrupt(reason)
+    this.watchdogAction = null
+    this.pendingWatchdogIdentity = null
+    this.watchdogOpeningTurnCounter = null
+    this.watchdogOpeningProc = null
+    this.watchdogOpeningToken = null
+    this.clearCodexProcessActivityState()
+  }
+
+  evaluateWatchdogTick(now = Date.now()): void {
+    const ctx = this.watchdogContext
+    if (
+      !ctx ||
+      this.watchdogContext !== ctx ||
+      this.currentTurn !== ctx.turn ||
+      this.proc !== ctx.proc ||
+      !ctx.proc.isAlive() ||
+      ctx.proc.provider !== 'codex' ||
+      this.watchdogSettings.mode === 'off'
+    ) {
+      this.stopWatchdogTick()
+      return
+    }
+
+    const verdict = this.watchdog.evaluate(now, this.watchdogSafetySnapshot(ctx))
+    if (verdict.type === 'none') return
+    if (verdict.type === 'silent_warn' || verdict.type === 'loop_warn') {
+      this.applyWatchdogWarning(verdict)
+      this.logWatchdog(
+        verdict.type === 'silent_warn'
+          ? 'turn_watchdog_silent_warn'
+          : 'turn_watchdog_loop_warn',
+        ctx,
+        verdict,
+      )
+      return
+    }
+    if (verdict.type === 'recover') {
+      void this.runWatchdogRecovery(ctx, verdict).catch(e => {
+        log(`session "${this.sessionName}": watchdog scheduler recovery rejected: ${messageOf(e)}`)
+      })
+      return
+    }
+    void this.runWatchdogExhausted(ctx, verdict).catch(e => {
+      log(`session "${this.sessionName}": watchdog scheduler exhausted action rejected: ${messageOf(e)}`)
+    })
   }
 
   private clearCodexProcessActivityState(): void {
@@ -637,7 +1001,7 @@ export class Session {
   }
 
   watchdogContextIsCurrent(ctx: WatchdogTurnContext): boolean {
-    return this.watchdogContext === ctx && this.currentTurn === ctx.turn && this.proc === ctx.proc && ctx.proc.isAlive() &&
+    return !ctx.identityConflict && this.watchdogContext === ctx && this.currentTurn === ctx.turn && this.proc === ctx.proc && ctx.proc.isAlive() &&
       (!ctx.threadId || (ctx.proc.sessionId === ctx.threadId && ctx.turn.backendThreadId === ctx.threadId)) &&
       (!ctx.turnId || ctx.turn.backendTurnId === ctx.turnId)
   }
@@ -647,7 +1011,7 @@ export class Session {
   }
 
   private watchdogTurnStillOwned(ctx: WatchdogTurnContext): boolean {
-    return this.currentTurn === ctx.turn &&
+    return !ctx.identityConflict && this.currentTurn === ctx.turn &&
       (!ctx.threadId || ctx.turn.backendThreadId === ctx.threadId) &&
       (!ctx.turnId || ctx.turn.backendTurnId === ctx.turnId)
   }
@@ -748,13 +1112,29 @@ export class Session {
     this.renderFooterStatus(context.turn)
   }
 
-  private applyWatchdogIdentity(threadId: string | null, turnId: string | null): void {
+  private applyWatchdogIdentity(threadId: string | null, turnId: string | null): boolean {
     const context = this.watchdogContext
-    if (!context || this.currentTurn !== context.turn || this.proc !== context.proc) return
-    context.threadId = threadId ?? context.proc.sessionId
-    context.turnId = turnId
-    context.turn.backendThreadId = context.threadId
-    context.turn.backendTurnId = turnId
+    if (!context || this.currentTurn !== context.turn || this.proc !== context.proc) return false
+    if (context.identityConflict) return false
+    const resolvedThreadId = threadId ?? context.proc.sessionId
+    const threadConflict = !!(
+      (context.threadId && resolvedThreadId && context.threadId !== resolvedThreadId) ||
+      (context.turn.backendThreadId && resolvedThreadId && context.turn.backendThreadId !== resolvedThreadId)
+    )
+    const turnConflict = !!(
+      (context.turnId && turnId && context.turnId !== turnId) ||
+      (context.turn.backendTurnId && turnId && context.turn.backendTurnId !== turnId)
+    )
+    if (threadConflict || turnConflict) {
+      context.identityConflict = true
+      log(`session "${this.sessionName}": watchdog identity conflict; observation disabled`)
+      return false
+    }
+    if (!context.threadId && resolvedThreadId) context.threadId = resolvedThreadId
+    if (!context.turnId && turnId) context.turnId = turnId
+    if (!context.turn.backendThreadId && context.threadId) context.turn.backendThreadId = context.threadId
+    if (!context.turn.backendTurnId && context.turnId) context.turn.backendTurnId = context.turnId
+    return true
   }
 
   private finishWatchdogOpening(
@@ -784,18 +1164,18 @@ export class Session {
     return [...Session.all].some(s => s.sessionName === sessionName && s.isRunning())
   }
 
-  private modelForSpawn(): string | undefined {
-    return this.selectedModel ?? undefined
+  private modelForSpawn(provider: AgentProvider = this.selectedProvider): string | undefined {
+    return provider === this.selectedProvider ? this.selectedModel ?? undefined : undefined
   }
 
-  effortForSpawn(): CodexReasoningEffort {
-    return this.selectedProvider === 'codex' && isCodexReasoningEffort(this.selectedEffort)
+  effortForSpawn(provider: AgentProvider = this.selectedProvider): CodexReasoningEffort {
+    return provider === 'codex' && this.selectedProvider === provider && isCodexReasoningEffort(this.selectedEffort)
       ? this.selectedEffort
       : CODEX_EFFORT
   }
 
-  claudeEffortForSpawn(): ClaudeReasoningEffort {
-    return this.selectedProvider === 'claude' && isClaudeReasoningEffort(this.selectedEffort)
+  claudeEffortForSpawn(provider: AgentProvider = this.selectedProvider): ClaudeReasoningEffort {
+    return provider === 'claude' && this.selectedProvider === provider && isClaudeReasoningEffort(this.selectedEffort)
       ? this.selectedEffort
       : CLAUDE_EFFORT
   }
@@ -848,21 +1228,31 @@ export class Session {
   /** fork/back 期间非空:让 spawnAgent 派生新 sid(resume 到 resumeSessionAt)。
    *  startForked/rollbackTo 在调 start/restart 前设、finally 清空 —— 复用现有
    *  spawn+wire+init 流程,只在 spawn 注入 fork 参数(Claude SDK resumeSessionAt+forkSession)。 */
-  private _forkSpawn: { resumeSessionId?: string; resumeSessionAt?: string } | null = null
+  private _forkSpawn: {
+    lease: LifecycleLease
+    resumeSessionId?: string
+    resumeSessionAt?: string
+  } | null = null
   /** 最近一个 turn 的用户输入预览(首条文本,recordTurnAnchor 用;openTurnCard 时设)。 */
   private lastTurnUserPreview = ''
 
-  private spawnAgent(resumeSessionId?: string): AgentProcess {
-    const fs = this._forkSpawn
+  private spawnAgent(
+    resumeSessionId?: string,
+    provider: AgentProvider = this.selectedProvider,
+    lease?: LifecycleLease,
+  ): AgentProcess {
+    const fs = this._forkSpawn && (!lease || this._forkSpawn.lease === lease)
+      ? this._forkSpawn
+      : null
     const sid = fs?.resumeSessionId ?? resumeSessionId
     const resumeSessionAt = fs?.resumeSessionAt
     const forkSession = !!fs
-    if (this.selectedProvider === 'claude') {
+    if (provider === 'claude') {
       assertClaudeCodeAvailable()
       return new ClaudeAgentProcess({
         workDir: this.workDir,
-        model: this.modelForSpawn(),
-        effort: this.claudeEffortForSpawn(),
+        model: this.modelForSpawn(provider),
+        effort: this.claudeEffortForSpawn(provider),
         resumeSessionId: sid,
         resumeSessionAt,
         forkSession,
@@ -871,11 +1261,11 @@ export class Session {
       })
     }
     // Codex 不支持 resumeSessionAt/forkSession —— fork 退化成普通 resume(Codex 路径暂不做分叉/回滚)。
-    const overrides = codexSpawnOverrides(this.modelForSpawn())
+    const overrides = codexSpawnOverrides(this.modelForSpawn(provider))
     return new CodexProcess({
       workDir: this.workDir,
       model: overrides.modelId,
-      effort: this.effortForSpawn(),
+      effort: this.effortForSpawn(provider),
       resumeSessionId: sid,
       appendSystemPrompt: this.spawnDeveloperInstructions(),
       configArgs: overrides.configArgs,
@@ -887,17 +1277,21 @@ export class Session {
     provider: AgentProvider,
     model: string,
     effort: AgentReasoningEffort | null,
-  ): Promise<void> {
+    lease?: LifecycleLease,
+  ): Promise<boolean> {
+    if (lease && !this.ownsLifecycle(lease)) return false
     this.selectedProvider = provider
     this.selectedModel = model
     this.selectedEffort = effort
     this.lastSessionId = feishu.getSessionResume(this.sessionName, provider)
     feishu.clearTurnAnchors(this.sessionName)  // provider 切换 → 旧 provider 的 assistant uuid 配不上新 sid,清锚点
     feishu.bindSessionModel(this.sessionName, provider, model, effort)
-    await this.stopIdleMismatchedProcess()
+    await this.stopIdleMismatchedProcess(lease)
+    return !lease || this.ownsLifecycle(lease)
   }
 
-  async stopIdleMismatchedProcess(): Promise<void> {
+  async stopIdleMismatchedProcess(lease?: LifecycleLease): Promise<void> {
+    if (lease && !this.ownsLifecycle(lease)) return
     if (!this.proc?.isAlive()) return
     if (this.proc.provider === this.selectedProvider) return
     if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return
@@ -920,7 +1314,8 @@ export class Session {
     await proc.kill(1000)
   }
 
-  async stopIdleCurrentProcess(reason: string): Promise<boolean> {
+  async stopIdleCurrentProcess(reason: string, lease?: LifecycleLease): Promise<boolean> {
+    if (lease && !this.ownsLifecycle(lease)) return false
     if (!this.proc?.isAlive()) return false
     if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return false
     const proc = this.proc
@@ -1053,23 +1448,28 @@ export class Session {
   }
 
   async start(opts: LifecycleProgressOpts = {}): Promise<boolean> {
+    const lease = this.lifecycleLease('start', opts)
+    if (!this.ownsLifecycle(lease)) return false
+    if (this.hasPreservedWatchdogRecovery()) return false
+    const provider = this.selectedProvider
     const announce = opts.announce ?? true
     const report = opts.onStatus
     if (this.isRunning()) {
-      if (this.proc?.provider === this.selectedProvider) {
+      if (this.proc?.provider === provider) {
         report?.(this.withModel(`✅ ${this.backendLabel()} 已运行`))
         return true
       }
-      await this.stopIdleMismatchedProcess()
+      await this.stopIdleMismatchedProcess(lease)
+      if (!this.ownsLifecycle(lease)) return false
       if (this.proc?.isAlive()) {
         report?.(`⚠️ 当前 ${this.backendLabel(this.proc.provider)} turn 尚未结束，模型切换将在后续新 turn 生效`)
         return true
       }
     }
-    if (this.selectedProvider === 'codex') report?.('🔎 检查 Codex 登录')
+    if (provider === 'codex') report?.('🔎 检查 Codex 登录')
     else report?.('🔎 检查 Claude Code')
     if (
-      this.selectedProvider === 'codex' &&
+      provider === 'codex' &&
       (!codexModelIsApiRoute(this.selectedModel) || codexModelRequiresOpenaiAuth(this.selectedModel)) &&
       !feishu.isOpenAIChatGPTAuthenticated()
     ) {
@@ -1078,18 +1478,25 @@ export class Session {
       report?.('❌ Codex 未登录(ChatGPT 或 API key)')
       if (announce) {
         await feishu.sendText(this.chatId, '❌ Codex 未登录(ChatGPT 或 API key 均可)。\n请在服务器上运行 `codex login`(或配好 API key)后再试。')
+        if (!this.ownsLifecycle(lease)) return false
       }
       return false
     }
     if (!existsSync(this.workDir)) {
       report?.(`🆕 创建项目目录 ~/${this.sessionName}`)
-      if (announce) await feishu.sendText(this.chatId, `🆕 目录 ~/${this.sessionName} 不存在，正在创建…`)
+      if (announce) {
+        await feishu.sendText(this.chatId, `🆕 目录 ~/${this.sessionName} 不存在，正在创建…`)
+        if (!this.ownsLifecycle(lease)) return false
+      }
       try { feishu.provisionProject(this.workDir) }
       catch (e) {
         this.status = 'stopped'
         this.opts.onLifecycleChange?.()
         report?.(`❌ 创建项目失败: ${e}`)
-        if (announce) await feishu.sendText(this.chatId, `❌ 创建项目失败: ${e}`)
+        if (announce) {
+          await feishu.sendText(this.chatId, `❌ 创建项目失败: ${e}`)
+          if (!this.ownsLifecycle(lease)) return false
+        }
         return false
       }
     }
@@ -1099,27 +1506,37 @@ export class Session {
     report?.(this.withModel(`🚀 启动 ${this.backendLabel()}`))
     let proc: AgentProcess
     try {
-      proc = this.spawnAgent()
+      proc = this.spawnAgent(undefined, provider, lease)
+      this.pendingSpawnOwnership = { lease, proc }
     } catch (e) {
-      const message = `${this.backendLabel()} 启动失败: ${messageOf(e)}`
+      const message = `${this.backendLabel(provider)} 启动失败: ${messageOf(e)}`
       log(`session "${this.sessionName}": ${message}`)
+      if (!this.ownsLifecycle(lease)) return false
       report?.(`❌ ${message}`)
-      if (announce) await feishu.sendText(this.chatId, `❌ ${message}`)
+      if (!this.ownsLifecycle(lease)) return false
+      if (announce) {
+        await feishu.sendText(this.chatId, `❌ ${message}`)
+        if (!this.ownsLifecycle(lease)) return false
+      }
       this.proc = null
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
       return false
     }
+    if (!this.ownsLifecycle(lease)) {
+      await this.discardLocalProcess(lease, proc)
+      return false
+    }
     this.proc = proc
-    this.wireProc(this.proc)
-    const backend = this.backendLabel()
-    const initWait = this.selectedProvider === 'claude'
-      ? this.waitForProcEarlyFailure(this.proc, CLAUDE_STARTUP_GRACE_MS)
-      : this.waitForProcInit(this.proc, 5000)
-    report?.(this.selectedProvider === 'claude'
+    this.wireProc(proc)
+    const backend = this.backendLabel(provider)
+    const initWait = provider === 'claude'
+      ? this.waitForProcEarlyFailure(proc, CLAUDE_STARTUP_GRACE_MS)
+      : this.waitForProcInit(proc, 5000)
+    report?.(provider === 'claude'
       ? `⏳ 检查 ${backend} 启动`
       : `⏳ 等待 ${backend} init`)
-    this.proc.sendInitialize()
+    proc.sendInitialize()
     // Codex: 等 `system/init` 落地再认定 ready —— sendInitialize 只把 RPC
     // 写进 app-server 之前 proc.sessionId 还是 null,这时候 showConsole()
     // 看到 null 会 fallback 到磁盘上**上一次**会话的 lastSessionId,
@@ -1131,20 +1548,30 @@ export class Session {
     // 仍由 wireProc 正常处理。监听必须先于 sendInitialize 注册,否则
     // Claude wrapper 内同步暴露的启动失败会被错过。
     const init = await initWait
+    if (!this.ownsLifecycle(lease) || this.proc !== proc) {
+      await this.discardLocalProcess(lease, proc)
+      return false
+    }
     if (init.state === 'error' || init.state === 'exit') {
       const detail = init.error ? messageOf(init.error) : init.state
       log(`session "${this.sessionName}": ${this.selectedProvider} init failed: ${detail}`)
       report?.(`❌ ${backend} 启动失败: ${detail}`)
-      if (announce) await feishu.sendText(this.chatId, `❌ ${backend} 启动失败: ${detail}`)
-      await this.proc?.kill(1000).catch(() => {})
-      this.proc = null
+      if (announce) {
+        await feishu.sendText(this.chatId, `❌ ${backend} 启动失败: ${detail}`)
+        if (!this.ownsLifecycle(lease) || this.proc !== proc) {
+          await this.discardLocalProcess(lease, proc)
+          return false
+        }
+      }
+      await this.discardLocalProcess(lease, proc)
+      if (!this.ownsLifecycle(lease)) return false
       this.clearCodexProcessActivityState()
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
       return false
     }
     if (init.state === 'timeout') {
-      log(`session "${this.sessionName}": ${this.selectedProvider} init wait timeout (5s)`)
+      log(`session "${this.sessionName}": ${provider} init wait timeout (5s)`)
       report?.(this.withModel(this.withWorktreeInstructionNotice(`⏳ ${backend} 已启动，init 确认超时`)))
     }
 
@@ -1154,7 +1581,12 @@ export class Session {
         this.withWorktreeInstructionNotice(`✅ Lodestar session "${this.sessionName}" 已就绪，发消息开始对话。`),
         modelLine,
       ].filter(Boolean).join('\n'))
+      if (!this.ownsLifecycle(lease) || this.proc !== proc || !proc.isAlive()) {
+        await this.discardLocalProcess(lease, proc)
+        return false
+      }
     }
+    this.clearPendingSpawn(lease, proc)
     this.status = 'idle'
     this.startedAt = Date.now()
     this.opts.onLifecycleChange?.()
@@ -1264,8 +1696,52 @@ export class Session {
     this.currentBatchReactionIds = new Map()
   }
 
+  private beginTurnOpening(): object {
+    const token = {}
+    this.openingTurnOwner = token
+    this.openingTurn = true
+    return token
+  }
+
+  private finishTurnOpening(token: object): void {
+    if (this.openingTurnOwner !== token) return
+    this.openingTurnOwner = null
+    this.openingTurn = false
+  }
+
+  private clearTurnOpening(): void {
+    this.openingTurnOwner = null
+    this.openingTurn = false
+  }
+
+  discardQueuedHumanWork(reason: string): void {
+    this.clearMultiMsgBuffer(reason)
+    const pendingDelivery = this.pendingHumanDelivery
+    if (pendingDelivery) {
+      pendingDelivery.state = 'restored'
+      for (const [msgId, reactionId] of pendingDelivery.reactions) {
+        if (reactionId) void feishu.deleteReaction(msgId, reactionId)
+      }
+      this.pendingHumanDelivery = null
+    }
+    this.ackedHumanDelivery = null
+    this.restoredHumanDelivery = null
+    this.pendingUserMessageCount = 0
+    this.pendingMidTurnMsgs = []
+    this.pendingTurnInputs = []
+    this.lastUserOpenId = ''
+    this.releaseAllReactions()
+  }
+
   clearStaleIdleQueueState(reason: string): void {
-    if (this.initCount < 1 || this.currentTurn || this.openingTurn || this.pendingUserMessageCount === 0) return
+    if (
+      this.initCount < 1 ||
+      this.currentTurn ||
+      this.openingTurn ||
+      this.pendingHumanDelivery ||
+      this.ackedHumanDelivery?.turn === null ||
+      this.pendingUserMessageCount === 0
+    ) return
     log(`session "${this.sessionName}": clear stale pending queue before ${reason} pendingCount=${this.pendingUserMessageCount} reactions=${this.pendingReactionIds.size}`)
     this.pendingUserMessageCount = 0
     // Release stale ⏳ reactions left on the abandoned batch's chat
@@ -1278,10 +1754,16 @@ export class Session {
   }
 
   async stop(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
+    const lease = this.lifecycleLease('stop', opts)
+    if (!this.ownsLifecycle(lease)) return
     const announce = opts.announce ?? true
     const report = opts.onStatus
-    this.cancelTurnInterrupt(`stop: ${reason}`)
+    this.discardPreservedWatchdogRecovery(`stop: ${reason}`)
+    this.clearWatchdogRuntime(`stop: ${reason}`)
+    this.discardQueuedHumanWork('stop')
     const stoppedAgy = await this.stopAgyTask(`🛑 ${reason}`)
+    if (!this.ownsLifecycle(lease)) return
+    this.discardQueuedHumanWork('stop')
     if (!this.proc) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
@@ -1302,19 +1784,8 @@ export class Session {
     this.proc = null
     this.stopFooterStatus(this.currentTurn)
     this.currentTurn = null
-    this.endWatchdogTurn()
-    this.pendingWatchdogIdentity = null
-    this.watchdogOpeningTurnCounter = null
-    this.watchdogOpeningProc = null
-    this.watchdogOpeningToken = null
-    this.clearMultiMsgBuffer('stop')
-    this.pendingUserMessageCount = 0
-    this.pendingMidTurnMsgs = []
-    this.pendingTurnInputs = []
-    this.lastUserOpenId = ''
-    this.releaseAllReactions()
     this.initCount = 0
-    this.openingTurn = false
+    this.clearTurnOpening()
     this.bgResumePending = false
     this.sawResultWhileOpening = false
     // 用户主动停止:孤儿缓冲随轮作废,不兜底推送。
@@ -1328,29 +1799,70 @@ export class Session {
     this.status = 'stopped'
     this.opts.onLifecycleChange?.()
     await proc.kill()
+    if (!this.ownsLifecycle(lease)) return
     // 后台任务随轮作废:翻 killed 终态 + 活卡沉降历史墓碑,否则 SDK 一死 entry
     // 永远卡 running,refresh tick 还在伪造运行时长。
-    await this.resetBackgroundTasks()
+    await this.resetBackgroundTasks(lease)
+    if (!this.ownsLifecycle(lease)) return
     report?.(`✅ ${reason}`)
     if (announce) await feishu.sendText(this.chatId, `🔴 ${reason} (session: ${this.sessionName})`)
   }
 
   async restart(resume = false, opts: LifecycleProgressOpts = {}): Promise<boolean> {
-    const prevSessionId = this.lastSessionId
-    if (resume && opts.requireResumeSession && !prevSessionId) {
+    const strictResume = resume && opts.requireResumeSession === true
+    const wantsPreservation = !!(opts.preserveCurrentTurn || opts.preserveQueuedHumanWork)
+    const existingRecovery = strictResume ? this.preservedWatchdogRecovery : null
+    if (
+      existingRecovery &&
+      opts.resumeIdentity &&
+      (
+        opts.resumeIdentity.provider !== existingRecovery.provider ||
+        opts.resumeIdentity.threadId !== existingRecovery.threadId
+      )
+    ) return false
+    const lease = this.lifecycleLease(opts.requireResumeSession ? 'strict-retry' : 'restart', opts)
+    if (!this.ownsLifecycle(lease)) return false
+    let recovery: PreservedWatchdogRecovery | null = null
+    if (strictResume && wantsPreservation) {
+      const existing = this.preservedWatchdogRecovery
+      if (existing) {
+        if (opts.preservedRecoveryToken !== existing.token) return false
+        recovery = this.beginPreservedWatchdogRetry(lease)
+      } else {
+        recovery = this.preserveCurrentWatchdogContext(lease)
+      }
+      if (!recovery) return false
+    } else if (wantsPreservation) {
+      return false
+    }
+
+    const resumeIdentity: ResumeIdentity | null = strictResume
+      ? (recovery
+          ? { provider: recovery.provider, threadId: recovery.threadId }
+          : (opts.resumeIdentity ?? null))
+      : (resume
+          ? (opts.resumeIdentity ?? (this.lastSessionId
+              ? { provider: this.selectedProvider, threadId: this.lastSessionId }
+              : null))
+          : null)
+    const provider = resumeIdentity?.provider ?? this.selectedProvider
+    const prevSessionId = resumeIdentity?.threadId ?? null
+    if (strictResume && (!recovery || !prevSessionId)) {
       const message = '❌ 自动恢复失败:没有可恢复的 thread'
       opts.onStatus?.(message)
       log(`session "${this.sessionName}": watchdog strict resume rejected missing thread`)
+      if (recovery) this.markPreservedWatchdogRecoveryFailed(recovery, lease)
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
       return false
     }
-    const preserveWatchdogTransaction = !!(
-      opts.preserveCurrentTurn || opts.preserveQueuedHumanWork
-    )
+    const preserveWatchdogTransaction = !!recovery &&
+      recovery.provider === provider &&
+      recovery.threadId === prevSessionId &&
+      this.ownsPreservedWatchdogRecovery(recovery, lease)
     if (!preserveWatchdogTransaction) {
-      this.cancelTurnInterrupt('restart')
-      this.preservingRestartProc = null
+      this.discardPreservedWatchdogRecovery('ordinary restart')
+      this.clearWatchdogRuntime('restart')
     }
     const announce = opts.announce ?? true
     let report = opts.onStatus
@@ -1361,6 +1873,7 @@ export class Session {
         ? this.withModel(`🔁 重启 ${this.backendLabel(this.proc.provider)}`)
         : this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}…`)
       statusCard = await this.openStatusCard('restart', initialStatus)
+      if (!this.ownsLifecycle(lease)) return false
       if (statusCard) report = status => this.setStatusCard(statusCard, status)
     }
     const announceText = announce && !statusCard
@@ -1379,15 +1892,11 @@ export class Session {
       const proc = this.proc
       this.proc = null
       await proc.kill()
+      if (!this.ownsLifecycle(lease)) return false
     }
     this.stopFooterStatus(this.currentTurn)
     if (!opts.preserveCurrentTurn) {
       this.currentTurn = null
-      this.endWatchdogTurn()
-      this.pendingWatchdogIdentity = null
-      this.watchdogOpeningTurnCounter = null
-      this.watchdogOpeningProc = null
-      this.watchdogOpeningToken = null
     }
     this.pendingUserMessageCount = 0
     if (!opts.preserveQueuedHumanWork) {
@@ -1398,7 +1907,7 @@ export class Session {
       this.releaseAllReactions()
     }
     this.initCount = 0
-    this.openingTurn = false
+    this.clearTurnOpening()
     // bgResumePending / 孤儿缓冲已在 kill 前作废(见上)。
     this.pendingAsks.clear()
     this.pendingHostAsks.clear()
@@ -1407,76 +1916,124 @@ export class Session {
     this.currentTurnUsageBaselineKnown = false
     // 后台任务随轮作废:旧 proc 的活跃 entry 不能带进新会话(会跨会话「复活」
     // 到新卡)。翻 killed 终态 + 活卡沉降,在 spawn 新 proc 之前清干净。
-    await this.resetBackgroundTasks()
+    await this.resetBackgroundTasks(lease)
+    if (!this.ownsLifecycle(lease)) return false
     if (resume && prevSessionId) {
+      if (recovery && !this.ownsPreservedWatchdogRecovery(recovery, lease)) return false
       this.status = 'starting'
       this.usageTotalsSeedUnknown = true
       report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}…`))
       let proc: AgentProcess
       try {
-        proc = this.spawnAgent(prevSessionId)
+        proc = this.spawnAgent(prevSessionId, provider, lease)
+        this.pendingSpawnOwnership = { lease, proc }
       } catch (e) {
-        const finalStatus = `❌ ${this.backendLabel()} 恢复失败: ${messageOf(e)}`
-        log(`session "${this.sessionName}": ${this.selectedProvider} resume failed before spawn: ${messageOf(e)}`)
+        const finalStatus = `❌ ${this.backendLabel(provider)} 恢复失败: ${messageOf(e)}`
+        log(`session "${this.sessionName}": ${provider} resume failed before spawn: ${messageOf(e)}`)
+        if (!this.ownsLifecycle(lease)) return false
         report?.(finalStatus)
-        if (announceText) await feishu.sendText(this.chatId, finalStatus)
-        this.proc = null
+        if (!this.ownsLifecycle(lease)) return false
+        if (announceText) {
+          await feishu.sendText(this.chatId, finalStatus)
+          if (!this.ownsLifecycle(lease)) return false
+        }
+        if (recovery) this.markPreservedWatchdogRecoveryFailed(recovery, lease)
         this.status = 'stopped'
         this.opts.onLifecycleChange?.()
         await closeInternalStatusCard(finalStatus)
         return false
       }
+      if (!this.ownsLifecycle(lease)) {
+        await this.discardLocalProcess(lease, proc)
+        return false
+      }
+      if (proc.provider !== provider) {
+        await this.discardLocalProcess(lease, proc)
+        if (!this.ownsLifecycle(lease)) return false
+        if (recovery) this.markPreservedWatchdogRecoveryFailed(recovery, lease)
+        this.status = 'stopped'
+        this.opts.onLifecycleChange?.()
+        return false
+      }
       this.proc = proc
-      if (preserveWatchdogTransaction) this.preservingRestartProc = proc
-      this.wireProc(this.proc)
+      if (recovery) recovery.replacementProc = proc
+      this.wireProc(proc)
       const cleanupFailedReplacement = async (): Promise<boolean> => {
         const ownedReplacement = this.proc === proc
         if (ownedReplacement) this.proc = null
-        if (this.preservingRestartProc === proc) this.preservingRestartProc = null
+        if (recovery?.replacementProc === proc) recovery.replacementProc = null
+        this.clearPendingSpawn(lease, proc)
         if (proc.isAlive()) await proc.kill(1000).catch(() => {})
-        return ownedReplacement && this.proc === null
+        return ownedReplacement && this.ownsLifecycle(lease) && this.proc === null
       }
-      const backend = this.backendLabel()
-      const initWait = this.selectedProvider === 'claude'
-        ? this.waitForProcEarlyFailure(this.proc, CLAUDE_STARTUP_GRACE_MS)
-        : this.waitForProcResumeInit(this.proc, () => {
-            log(`session "${this.sessionName}": ${this.selectedProvider} resume init still pending after ${RESUME_INIT_NOTICE_MS / 1000}s`)
+      const backend = this.backendLabel(provider)
+      const initWait = provider === 'claude'
+        ? this.waitForProcEarlyFailure(proc, CLAUDE_STARTUP_GRACE_MS)
+        : this.waitForProcResumeInit(proc, () => {
+            log(`session "${this.sessionName}": ${provider} resume init still pending after ${RESUME_INIT_NOTICE_MS / 1000}s`)
             report?.(this.withModel(`⏳ 仍在等待 ${backend} init 确认 thread=${prevThreadLabel}…`))
           })
-      report?.(this.selectedProvider === 'claude'
+      report?.(provider === 'claude'
         ? `⏳ 检查 ${backend} 恢复启动`
         : `⏳ 等待 ${backend} init 确认`)
-      this.proc.sendInitialize()
+      proc.sendInitialize()
       const init = await initWait
+      if (!this.ownsLifecycle(lease)) {
+        await this.discardLocalProcess(lease, proc)
+        return false
+      }
+      if (this.proc !== proc && this.proc !== null) {
+        await this.discardLocalProcess(lease, proc)
+        return false
+      }
       if (init.state === 'error' || init.state === 'exit' || init.state === 'timeout') {
         const detail = init.error ? messageOf(init.error) : init.state
-        log(`session "${this.sessionName}": ${this.selectedProvider} resume failed: ${detail}`)
+        log(`session "${this.sessionName}": ${provider} resume failed: ${detail}`)
         const finalStatus = init.state === 'timeout'
           ? `❌ ${backend} 恢复超时`
           : `❌ ${backend} 恢复失败: ${detail}`
         report?.(finalStatus)
-        if (announceText) await feishu.sendText(this.chatId, finalStatus)
+        if (announceText) {
+          await feishu.sendText(this.chatId, finalStatus)
+          if (!this.ownsLifecycle(lease) || this.proc !== proc) {
+            await this.discardLocalProcess(lease, proc)
+            return false
+          }
+        }
         const mayMutateSession = await cleanupFailedReplacement()
         if (!mayMutateSession) {
           await closeInternalStatusCard(finalStatus)
           return false
         }
+        if (recovery) this.markPreservedWatchdogRecoveryFailed(recovery, lease)
         this.clearCodexProcessActivityState()
         this.status = 'stopped'
         this.opts.onLifecycleChange?.()
         await closeInternalStatusCard(finalStatus)
         return false
       }
-      if (this.proc !== proc || !proc.isAlive()) {
-        const finalStatus = `❌ ${backend} 恢复失败: replacement ownership lost`
-        log(`session "${this.sessionName}": ${this.selectedProvider} resume lost replacement ownership after init`)
+      if (
+        this.proc !== proc ||
+        !proc.isAlive() ||
+        proc.provider !== provider ||
+        (strictResume && proc.sessionId !== prevSessionId)
+      ) {
+        const finalStatus = `❌ ${backend} 恢复失败: replacement identity mismatch`
+        log(`session "${this.sessionName}": ${provider} resume lost replacement identity after init`)
         report?.(finalStatus)
-        if (announceText) await feishu.sendText(this.chatId, finalStatus)
+        if (announceText) {
+          await feishu.sendText(this.chatId, finalStatus)
+          if (!this.ownsLifecycle(lease) || this.proc !== proc) {
+            await this.discardLocalProcess(lease, proc)
+            return false
+          }
+        }
         const mayMutateSession = await cleanupFailedReplacement()
         if (!mayMutateSession) {
           await closeInternalStatusCard(finalStatus)
           return false
         }
+        if (recovery) this.markPreservedWatchdogRecoveryFailed(recovery, lease)
         this.clearCodexProcessActivityState()
         this.status = 'stopped'
         this.opts.onLifecycleChange?.()
@@ -1484,12 +2041,17 @@ export class Session {
         return false
       }
       const msg = this.withModel(this.withWorktreeInstructionNotice(
-        this.selectedProvider === 'claude' && init.state === 'ready'
+        provider === 'claude' && init.state === 'ready'
           ? `✅ 已准备恢复上一会话 thread=${prevThreadLabel}…`
           : `✅ 已恢复上一会话 thread=${prevThreadLabel}…`,
       ))
       report?.(msg)
       if (announceText) await feishu.sendText(this.chatId, msg)
+      if (!this.ownsLifecycle(lease) || this.proc !== proc || !proc.isAlive()) {
+        await this.discardLocalProcess(lease, proc)
+        return false
+      }
+      this.clearPendingSpawn(lease, proc)
       this.status = 'idle'
       this.startedAt = Date.now()
       this.opts.onLifecycleChange?.()
@@ -1501,23 +2063,100 @@ export class Session {
       // hid the daemon-restart sessionId-loss bug for months).
       if (resume) {
         report?.('⚠️ 没有可恢复的上一会话，将以新会话启动')
-        if (announceText) await feishu.sendText(this.chatId, '⚠️ 没有可恢复的上一会话，将以新会话启动')
+        if (announceText) {
+          await feishu.sendText(this.chatId, '⚠️ 没有可恢复的上一会话，将以新会话启动')
+          if (!this.ownsLifecycle(lease)) return false
+        }
       }
       // Fresh conversation — drop cumulative stats and the visible turn
       // number so the next card starts from turn 1.
       this.resetFreshConversationState()
-      return await this.start({ ...opts, freshConversationStateAlreadyReset: true })
+      return await this.start({ ...opts, lifecycleLease: lease, freshConversationStateAlreadyReset: true })
     }
+  }
+
+  async resumeFailedWatchdogQueue(opts: LifecycleProgressOpts = {}): Promise<boolean> {
+    const lease = this.lifecycleLease('strict-retry', opts)
+    if (!this.ownsLifecycle(lease)) return false
+    const recovery = this.beginPreservedWatchdogRetry(lease)
+    if (!recovery) return false
+    const identity: ResumeIdentity = {
+      provider: recovery.provider,
+      threadId: recovery.threadId,
+    }
+    let resumed = false
+    try {
+      resumed = await this.restart(true, {
+        ...opts,
+        announce: opts.announce ?? false,
+        lifecycleLease: lease,
+        resumeIdentity: identity,
+        preservedRecoveryToken: recovery.token,
+        requireResumeSession: true,
+        preserveCurrentTurn: true,
+        preserveQueuedHumanWork: true,
+      })
+    } catch (e) {
+      log(`session "${this.sessionName}": failed watchdog queue resume rejected: ${messageOf(e)}`)
+    }
+    if (!this.ownsPreservedWatchdogRecovery(recovery, lease)) return false
+    const replacement = recovery.replacementProc
+    if (
+      !resumed ||
+      !replacement ||
+      this.proc !== replacement ||
+      !replacement.isAlive() ||
+      replacement.provider !== recovery.provider ||
+      replacement.sessionId !== recovery.threadId
+    ) {
+      if (replacement?.isAlive()) await this.discardLocalProcess(lease, replacement)
+      if (this.ownsPreservedWatchdogRecovery(recovery, lease)) {
+        this.markPreservedWatchdogRecoveryFailed(recovery, lease)
+        this.status = 'stopped'
+        this.opts.onLifecycleChange?.()
+      }
+      return false
+    }
+
+    recovery.phase = 'draining'
+    let drainOutcome: MidTurnDrainOutcome = 'no_batch'
+    if (this.pendingMidTurnMsgs.length > 0) {
+      drainOutcome = 'preserved'
+      try {
+        drainOutcome = await this.drainMidTurnAndOpen({ proc: replacement, lease, recovery })
+      } catch (e) {
+        log(`session "${this.sessionName}": preserved watchdog queue drain failed: ${messageOf(e)}`)
+      }
+    }
+    if (!this.ownsPreservedWatchdogRecovery(recovery, lease)) return false
+    if (drainOutcome === 'preserved') {
+      this.markPreservedWatchdogRecoveryFailed(recovery, lease)
+      if (this.proc === replacement) {
+        this.status = 'stopped'
+        this.opts.onLifecycleChange?.()
+      }
+      opts.onStatus?.('❌ thread 已恢复，但保留消息开卡失败')
+      return false
+    }
+
+    recovery.replacementProc = null
+    this.completePreservedWatchdogRecovery(recovery, lease)
+    if (!this.currentTurn) this.status = 'idle'
+    return true
   }
 
   /** 以 fork 模式启动:resume resumeSessionId 到 resumeSessionAt 锚点,派生新 sid。
    *  用于 btw/fk 的临时群首启、rs 的跨会话恢复。复用 start 的 spawn+wire+init。 */
   async startForked(resumeSessionId: string, resumeSessionAt: string | undefined, opts: LifecycleProgressOpts = {}): Promise<boolean> {
-    this._forkSpawn = { resumeSessionId, resumeSessionAt }
+    if (this.hasPreservedWatchdogRecovery()) return false
+    const lease = this.lifecycleLease('fork', opts)
+    if (!this.ownsLifecycle(lease) || this.hasPreservedWatchdogRecovery()) return false
+    const forkSpawn = { lease, resumeSessionId, resumeSessionAt }
+    this._forkSpawn = forkSpawn
     try {
-      return await this.start(opts)
+      return await this.start({ ...opts, lifecycleLease: lease })
     } finally {
-      this._forkSpawn = null
+      if (this._forkSpawn === forkSpawn) this._forkSpawn = null
     }
   }
 
@@ -1527,27 +2166,49 @@ export class Session {
     // resumeSessionId=undefined → 回到会话起点(fresh,等价 clear),不 fork、不 resume。
     // 否则 fork 到 (sid, resumeSessionAt) 派生新 sid。失败时恢复原 lastSessionId,避免
     // 脏状态(rs 恢复外部会话失败后,当前群 lastSessionId 仍指向原会话)。
+    if (this.hasPreservedWatchdogRecovery()) return false
+    const lease = this.lifecycleLease('back', opts)
+    if (!this.ownsLifecycle(lease) || this.hasPreservedWatchdogRecovery()) return false
     const prevLast = this.lastSessionId
-    if (resumeSessionId) {
-      this.lastSessionId = resumeSessionId
-      this._forkSpawn = { resumeSessionId, resumeSessionAt }
-    } else {
-      this._forkSpawn = null
-    }
+    const forkSpawn = resumeSessionId
+      ? { lease, resumeSessionId, resumeSessionAt }
+      : null
+    this._forkSpawn = forkSpawn
     try {
-      const ok = resumeSessionId ? await this.restart(true, opts) : await this.restart(false, opts)
+      const ok = resumeSessionId
+        ? await this.restart(true, {
+            ...opts,
+            lifecycleLease: lease,
+            resumeIdentity: {
+              provider: this.selectedProvider,
+              threadId: resumeSessionId,
+            },
+          })
+        : await this.restart(false, { ...opts, lifecycleLease: lease })
+      if (!this.ownsLifecycle(lease) || this.hasPreservedWatchdogRecovery()) return false
       if (!ok) this.lastSessionId = prevLast
+      else if (this.lastSessionId === prevLast) this.lastSessionId = resumeSessionId ?? null
       return ok
     } finally {
-      this._forkSpawn = null
+      if (this._forkSpawn === forkSpawn) this._forkSpawn = null
     }
   }
 
   /** daemon 解散临时群(bye)时调:从 Session.all registry 移除,避免长期运行的 daemon
    *  因临时群不断建/散而累积孤立 Session 实例(sessions Map 已 delete,但 static all 不会)。 */
   dispose(): void {
-    this.cancelTurnInterrupt('dispose')
+    const lease = this.beginLifecycle('dispose')
+    this.disposed = true
+    this.lifecycleOwner = lease
+    const pendingProc = this.pendingSpawnOwnership?.proc ?? null
+    if (this.proc === pendingProc) this.proc = null
+    this.pendingSpawnOwnership = null
+    this.clearWatchdogRuntime('dispose')
+    this.discardPreservedWatchdogRecovery('dispose')
+    this.discardQueuedHumanWork('dispose')
+    this.status = 'stopped'
     Session.all.delete(this)
+    if (pendingProc?.isAlive()) void pendingProc.kill(1_000).catch(() => {})
   }
 
   /** result 时记一个 turn 锚点:本 turn 最后 assistant uuid + 用户输入预览 + Write 记录。
@@ -1870,16 +2531,299 @@ export class Session {
     }
   }
 
-  private async startColdUserTurn(text: string, wireText: string, userOpenId: string): Promise<void> {
-    this.openingTurn = true
+  private beginHumanDelivery(
+    proc: AgentProcess,
+    batch: HumanBatchMessage[],
+    turn: TurnState | null,
+  ): PendingHumanDelivery | null {
+    if (this.pendingHumanDelivery) {
+      this.pendingMidTurnMsgs = [...batch, ...this.pendingMidTurnMsgs]
+      return null
+    }
+    this.restoredHumanDelivery = null
+    const reactions = new Map<string, string>()
+    for (const message of batch) {
+      if (!message.msgId || !this.pendingReactionIds.has(message.msgId)) continue
+      reactions.set(message.msgId, this.pendingReactionIds.get(message.msgId) ?? '')
+      this.pendingReactionIds.delete(message.msgId)
+    }
+    const context: PendingHumanDelivery = {
+      proc,
+      batch,
+      reactions,
+      dispatch: null,
+      openingOwner: this.openingTurnOwner,
+      turn,
+      turnId: null,
+      state: 'pending',
+    }
+    this.pendingHumanDelivery = context
+    return context
+  }
+
+  private humanDeliveryStillOwnsTurn(context: PendingHumanDelivery): boolean {
+    if (this.proc !== context.proc) return false
+    if (context.dispatch && context.proc.sessionId !== context.dispatch.threadId) return false
+    if (context.openingOwner !== this.openingTurnOwner) return false
+    if (context.turn) return this.currentTurn === context.turn
+    // 认领了本投递的开卡窗口仍在进行中(bootstrap init 开卡):
+    // openTurnCard 可能已装好 currentTurn 但尚未 bindHumanDeliveryTurn,
+    // 窗口没结束前不算易主。
+    if (context.openingOwner !== null) return true
+    return this.currentTurn === null
+  }
+
+  private commitHumanDelivery(context: PendingHumanDelivery): boolean {
+    if (this.pendingHumanDelivery !== context || context.state !== 'pending') return false
+    context.state = 'acked'
+    this.pendingHumanDelivery = null
+    this.restoredHumanDelivery = null
+    this.ackedHumanDelivery = context
+    if (this.humanDeliveryStillOwnsTurn(context)) {
+      this.pendingUserMessageCount++
+      for (const [msgId, reactionId] of context.reactions) {
+        this.currentBatchReactionIds.set(msgId, reactionId)
+      }
+      this.status = 'working'
+    } else {
+      for (const [msgId, reactionId] of context.reactions) {
+        if (reactionId) void feishu.deleteReaction(msgId, reactionId)
+      }
+    }
+    return true
+  }
+
+  private restoreHumanDelivery(context: PendingHumanDelivery): boolean {
+    if (this.pendingHumanDelivery !== context || context.state !== 'pending') return false
+    context.state = 'restored'
+    this.pendingHumanDelivery = null
+    this.restoredHumanDelivery = context
+    if (this.ackedHumanDelivery === context) this.ackedHumanDelivery = null
+    this.pendingMidTurnMsgs = [...context.batch, ...this.pendingMidTurnMsgs]
+    for (const [msgId, capturedReactionId] of context.reactions) {
+      if (!this.pendingReactionIds.has(msgId)) {
+        this.pendingReactionIds.set(msgId, capturedReactionId)
+      }
+    }
+    return true
+  }
+
+  private async rejectHumanDelivery(
+    context: PendingHumanDelivery,
+  ): Promise<Exclude<MidTurnDrainOutcome, 'no_batch'>> {
+    this.restoreHumanDelivery(context)
+    const turn = context.turn
+    if (turn && this.currentTurn === turn) {
+      const ownsProcess = this.proc === context.proc
+      const closing = this.closeTurnCard('⚠️ 消息未被后端接受，已保留待重试', {
+        forcePush: true,
+        preservePendingReactions: true,
+      })
+      if (ownsProcess && this.proc === context.proc) this.status = 'idle'
+      await closing
+    }
+    return this.humanDeliveryOutcome(context)
+  }
+
+  private humanDeliveryOutcome(context: PendingHumanDelivery): Exclude<MidTurnDrainOutcome, 'no_batch'> {
+    return context.state === 'acked' ? 'committed' : 'preserved'
+  }
+
+  private async dispatchHumanBatch(
+    context: PendingHumanDelivery,
+  ): Promise<Exclude<MidTurnDrainOutcome, 'no_batch'>> {
+    if (this.pendingHumanDelivery !== context || context.state !== 'pending') {
+      return this.humanDeliveryOutcome(context)
+    }
+    const merged = context.batch.map(message => message.wireText).join('\n\n')
+    let dispatch: UserTextDispatch
+    try {
+      dispatch = context.proc.sendUserText(merged, [])
+    } catch (cause) {
+      const error = cause instanceof Error ? cause : new Error(String(cause))
+      log(`session "${this.sessionName}": ${context.proc.provider} human dispatch threw: ${error.message}`)
+      return await this.rejectHumanDelivery(context)
+    }
+    if (this.pendingHumanDelivery !== context || context.state !== 'pending') {
+      return this.humanDeliveryOutcome(context)
+    }
+    if (dispatch.kind === 'rejected') {
+      log(`session "${this.sessionName}": ${dispatch.provider} human dispatch rejected: ${dispatch.error.message}`)
+      return await this.rejectHumanDelivery(context)
+    }
+    if (dispatch.kind === 'queued') {
+      if (context.proc.provider !== 'claude') {
+        log(`session "${this.sessionName}": reject mismatched queued dispatch from ${context.proc.provider}`)
+        return await this.rejectHumanDelivery(context)
+      } else if (!this.humanDeliveryStillOwnsTurn(context)) {
+        this.restoreHumanDelivery(context)
+      } else {
+        this.commitHumanDelivery(context)
+      }
+      return this.humanDeliveryOutcome(context)
+    }
+    context.dispatch = dispatch
+    // threadId 为 null 只允许出现在真正的 pre-init 投递上(进程线程
+    // 也还没建);其余场景必须与进程主线程一致。
+    if (
+      context.proc.provider !== 'codex' ||
+      (dispatch.threadId === null
+        ? context.proc.sessionId !== null
+        : !!context.proc.sessionId && context.proc.sessionId !== dispatch.threadId)
+    ) {
+      log(`session "${this.sessionName}": reject mismatched Codex human dispatch owner`)
+      return await this.rejectHumanDelivery(context)
+    }
+    let settlement
+    try {
+      settlement = await dispatch.settlement
+    } catch (cause) {
+      log(`session "${this.sessionName}": Codex human receipt unexpectedly rejected: ${messageOf(cause)}`)
+      return await this.rejectHumanDelivery(context)
+    }
+    if (this.pendingHumanDelivery !== context || context.state !== 'pending') {
+      return this.humanDeliveryOutcome(context)
+    }
+    if (
+      settlement.deliveryId !== dispatch.deliveryId ||
+      settlement.threadId !== dispatch.threadId
+    ) {
+      log(`session "${this.sessionName}": ignore mismatched Codex human receipt delivery=${settlement.deliveryId} thread=${settlement.threadId}`)
+      return await this.rejectHumanDelivery(context)
+    }
+    if (settlement.kind === 'rejected') {
+      return await this.rejectHumanDelivery(context)
+    }
+    if (!this.humanDeliveryStillOwnsTurn(context)) {
+      // 刻意的 at-least-once 取舍:ACK 到达时 turn/opening 所有权已易主
+      // (进程与线程可能仍一致),后端也许已接受这份输入,但新 owner 的
+      // 状态不能被旧回执改写 —— 宁可保留待重投(可能重复),不可静默丢失
+      // 或污染 replacement。不要"修复"成 ACK 即提交。
+      log(`session "${this.sessionName}": restore Codex human delivery after ACK lost its turn owner`)
+      this.restoreHumanDelivery(context)
+      return this.humanDeliveryOutcome(context)
+    }
+    if (
+      settlement.turnId &&
+      context.turn?.backendTurnId &&
+      context.turn.backendTurnId !== settlement.turnId
+    ) {
+      log(`session "${this.sessionName}": reject conflicting Codex human receipt turn=${settlement.turnId} current=${context.turn.backendTurnId}`)
+      return await this.rejectHumanDelivery(context)
+    }
+    context.turnId = settlement.turnId
+    this.commitHumanDelivery(context)
+    return this.humanDeliveryOutcome(context)
+  }
+
+  private bindHumanDeliveryTurn(proc: AgentProcess, turn: TurnState): PendingHumanDelivery | null {
+    const context = [this.pendingHumanDelivery, this.ackedHumanDelivery].find(candidate =>
+      candidate?.proc === proc && candidate.turn === null && candidate.state !== 'restored',
+    ) ?? null
+    if (!context) return null
+    if (context.dispatch) {
+      if (
+        context.dispatch.threadId !== proc.sessionId ||
+        !context.dispatch.deliveryId
+      ) return null
+      if (turn.backendThreadId && turn.backendThreadId !== context.dispatch.threadId) return null
+      if (!turn.backendThreadId) turn.backendThreadId = context.dispatch.threadId
+    }
+    if (context.turnId) {
+      if (turn.backendTurnId && turn.backendTurnId !== context.turnId) return null
+      if (!turn.backendTurnId) turn.backendTurnId = context.turnId
+    }
+    context.turn = turn
+    return context
+  }
+
+  private matchingHumanDeliveryResult(
+    proc: AgentProcess,
+    event: AgentResultEvent,
+  ): PendingHumanDelivery | null {
+    if (proc.provider === 'claude') {
+      return [this.pendingHumanDelivery, this.ackedHumanDelivery].find(context =>
+        context?.proc === proc &&
+        context.dispatch === null &&
+        context.turn === this.currentTurn,
+      ) ?? null
+    }
+    const deliveryId = typeof event.delivery_id === 'string' && event.delivery_id
+      ? event.delivery_id
+      : null
+    const threadId = typeof event.thread_id === 'string' && event.thread_id
+      ? event.thread_id
+      : null
+    if (!deliveryId || !threadId) return null
+    const turnId = typeof event.turn_id === 'string' && event.turn_id ? event.turn_id : null
+    for (const context of [this.pendingHumanDelivery, this.ackedHumanDelivery]) {
+      const dispatch = context?.dispatch
+      if (!context || !dispatch || context.proc !== proc) continue
+      if (dispatch.deliveryId !== deliveryId || dispatch.threadId !== threadId) continue
+      if (context.turnId && turnId && context.turnId !== turnId) return null
+      if (context.turn?.backendThreadId && context.turn.backendThreadId !== threadId) return null
+      if (context.turn?.backendTurnId && turnId && context.turn.backendTurnId !== turnId) return null
+      if (turnId && !context.turnId) context.turnId = turnId
+      return context
+    }
+    return null
+  }
+
+  private resultOwnsCurrentHumanTurn(
+    proc: AgentProcess,
+    event: AgentResultEvent,
+    matchingContext: PendingHumanDelivery | null,
+  ): boolean {
+    if (this.proc !== proc) return false
+    if (proc.provider === 'claude') {
+      const currentOwner = [this.pendingHumanDelivery, this.ackedHumanDelivery]
+        .find(context => context?.proc === proc && context.state !== 'restored') ?? null
+      return currentOwner ? currentOwner === matchingContext : true
+    }
+    const carriesIdentity = event.delivery_id !== undefined ||
+      event.thread_id !== undefined || event.turn_id !== undefined
+    if (!carriesIdentity) return true
+    const currentOwner = [this.pendingHumanDelivery, this.ackedHumanDelivery]
+      .find(context => context?.proc === proc && context.state !== 'restored') ?? null
+    if (currentOwner && currentOwner !== matchingContext) return false
+    if (matchingContext) {
+      if (matchingContext.state === 'pending') {
+        return this.humanDeliveryStillOwnsTurn(matchingContext)
+      }
+      return matchingContext.turn === null
+        ? this.currentTurn === null
+        : this.currentTurn === matchingContext.turn
+    }
+    const turn = this.currentTurn
+    if (!turn) return false
+    const threadId = typeof event.thread_id === 'string' ? event.thread_id : null
+    const turnId = typeof event.turn_id === 'string' && event.turn_id ? event.turn_id : null
+    if (threadId && turn.backendThreadId && turn.backendThreadId !== threadId) return false
+    if (threadId && !turn.backendThreadId && proc.sessionId !== threadId) return false
+    if (turnId && turn.backendTurnId && turn.backendTurnId !== turnId) return false
+    return true
+  }
+
+  private async startColdUserTurn(
+    text: string,
+    wireText: string,
+    userOpenId: string,
+    msgId: string,
+    batch: HumanBatchMessage[] = [{ text, wireText, userOpenId, msgId }],
+  ): Promise<void> {
+    const lease = this.beginLifecycle('start')
+    let startedProc: AgentProcess | null = null
+    let batchTransferred = false
+    const openingToken = this.beginTurnOpening()
     this.resetFreshConversationState()
-    this.pendingTurnInputs.push(text)
+    this.pendingTurnInputs.push(...batch.map(message => message.text))
     try {
       const openResult = await this.openTurnCard(userOpenId, 'user_message', {
         initialFooter: 'Waiting...(0s)',
         startThinking: false,
         directStart: true,
       })
+      if (!this.ownsLifecycle(lease)) return
       if (openResult.kind !== 'opened') return
       const turn = openResult.turn
       if (this.currentTurn !== turn) return
@@ -1891,6 +2835,7 @@ export class Session {
       let lastBootStatus = `🚀 启动 ${this.backendLabel()}`
       const ok = await this.start({
         announce: false,
+        lifecycleLease: lease,
         freshConversationStateAlreadyReset: true,
         onStatus: status => {
           lastBootStatus = status
@@ -1902,7 +2847,7 @@ export class Session {
         await this.settleCapturedStaleTurn(turn)
         return
       }
-      const startedProc = ok ? this.proc : null
+      startedProc = ok ? this.proc : null
       await cardkit.flush(turn.cardId)
       if (this.currentTurn !== turn) {
         await this.settleCapturedStaleTurn(turn)
@@ -1910,11 +2855,11 @@ export class Session {
       }
       if (!ok) {
         this.pendingUserMessageCount = 0
-        this.pendingMidTurnMsgs = []
         this.pendingTurnInputs = []
-        this.lastUserOpenId = ''
-        this.releaseAllReactions()
-        await this.closeTurnCard(lastBootStatus.startsWith('❌') ? lastBootStatus : '❌ 启动失败', { forcePush: true })
+        await this.closeTurnCard(lastBootStatus.startsWith('❌') ? lastBootStatus : '❌ 启动失败', {
+          forcePush: true,
+          preservePendingReactions: true,
+        })
         return
       }
       if (!startedProc || this.proc !== startedProc || !startedProc.isAlive()) {
@@ -1923,15 +2868,58 @@ export class Session {
       }
       this.beginWatchdogTurn(turn, startedProc)
       this.startThinkingFooter(turn)
-      startedProc.sendUserText(wireText, [])
-      this.pendingUserMessageCount++
-      this.status = 'working'
+      const delivery = this.beginHumanDelivery(startedProc, batch, turn)
+      batchTransferred = true
+      if (delivery) await this.dispatchHumanBatch(delivery)
     } finally {
-      this.openingTurn = false
+      if (
+        !batchTransferred &&
+        this.ownsLifecycle(lease) &&
+        (!startedProc || this.proc === startedProc || this.proc === null)
+      ) {
+        this.pendingMidTurnMsgs = [...batch, ...this.pendingMidTurnMsgs]
+      }
+      this.finishTurnOpening(openingToken)
     }
   }
 
   // ── Inbound from Feishu ────────────────────────────────────────────
+  trackQueuedReaction(msgId: string): void {
+    if (!msgId) return
+    this.pendingReactionIds.set(msgId, '')
+    void (async () => {
+      try {
+        const reactionId = await feishu.addReaction(msgId, 'OneSecond')
+        if (!reactionId) return
+        if (this.pendingReactionIds.has(msgId)) {
+          this.pendingReactionIds.set(msgId, reactionId)
+        } else if (
+          this.pendingHumanDelivery?.state === 'pending' &&
+          this.pendingHumanDelivery.reactions.has(msgId)
+        ) {
+          this.pendingHumanDelivery.reactions.set(msgId, reactionId)
+        } else if (this.currentBatchReactionIds.has(msgId)) {
+          this.currentBatchReactionIds.set(msgId, reactionId)
+        } else {
+          void feishu.deleteReaction(msgId, reactionId)
+        }
+      } catch (e) {
+        log(`session "${this.sessionName}": queued reaction failed msg=${msgId}: ${messageOf(e)}`)
+      }
+    })()
+  }
+
+  private queueHumanMessage(
+    text: string,
+    wireText: string,
+    userOpenId: string,
+    msgId: string,
+  ): void {
+    this.lastUserOpenId = userOpenId
+    this.pendingMidTurnMsgs.push({ text, wireText, userOpenId, msgId })
+    this.trackQueuedReaction(msgId)
+  }
+
   /** Inbound user message. Starts a Codex turn immediately when idle —
    * the SDK queues internally if a turn is in flight (FIFO, exactly the
    * type-ahead semantics of the native Codex UI). Card opening:
@@ -1942,6 +2930,10 @@ export class Session {
    * cron-fired wakeups without the daemon ever calling `sendInterrupt` —
    * `kill`/`stop` are the only paths that interrupt now. */
   async onUserMessage(text: string, files: string[] = [], userOpenId = '', msgId = ''): Promise<void> {
+    // File hints stay attached to their own message when a queued human
+    // batch is later merged into one SDK input.
+    const filePrefix = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n' : ''
+    const wireText = filePrefix + text
     // Garbage-collect leftover state from a batch the SDK abandoned —
     // most commonly an AskUserQuestion mid-turn, which makes the SDK
     // emit `QUEUE remove × N` and drop every msg we'd already
@@ -1960,6 +2952,16 @@ export class Session {
       await feishu.sendText(this.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再继续。')
       return
     }
+    if (this.watchdogActionInFlight || this.watchdogResumeFailed) {
+      this.queueHumanMessage(text, wireText, userOpenId, msgId)
+      if (this.watchdogResumeFailed) {
+        await feishu.sendText(
+          this.chatId,
+          '⚠️ thread 自动恢复失败；这条消息已保留，修复后发送 restart 继续。',
+        )
+      }
+      return
+    }
     if (
       this.proc?.isAlive() &&
       this.proc.provider !== this.selectedProvider &&
@@ -1969,6 +2971,17 @@ export class Session {
       this.pendingMidTurnMsgs.length === 0
     ) {
       await this.stopIdleMismatchedProcess()
+    }
+    if (
+      this.proc?.isAlive() &&
+      !this.currentTurn &&
+      !this.openingTurn &&
+      !this.pendingHumanDelivery &&
+      this.pendingMidTurnMsgs.length > 0
+    ) {
+      this.queueHumanMessage(text, wireText, userOpenId, msgId)
+      await this.drainMidTurnAndOpen()
+      return
     }
     // Capture busy-state SYNC, before any state mutation — this decides
     // whether the message will visibly queue (gets the OneSecond → later
@@ -1986,40 +2999,16 @@ export class Session {
     const wasBusy = this.currentTurn !== null || this.openingTurn
       || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0
     this.lastUserOpenId = userOpenId
-    // File hint **inline 在 wireText 内部**,而不是依赖 sendUserText 把
-    // files 拼到 message 整体头部。原因:drainMidTurnAndOpen merge N 条
-    // wireText 时,若 files 还按整体拼接 → 所有 file hint 全堆在 long
-    // message 开头,模型分不清哪个文件配哪条。inline 后每条 sub-message
-    // 自带 file hint,SDK side 所有 sendUserText 调用 files 一律传空。
-    const filePrefix = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n' : ''
-    const wireText = filePrefix + text
-
-    // Reaction helper: track the OneSecond reaction so deleteReaction can
-    // clear it later. Use empty-string sentinel until addReaction returns.
-    const trackReaction = (id: string) => {
-      this.pendingReactionIds.set(id, '')
-      void (async () => {
-        const rid = await feishu.addReaction(id, 'OneSecond')
-        if (!rid) return
-        if (this.pendingReactionIds.has(id)) {
-          this.pendingReactionIds.set(id, rid)
-        } else if (this.currentBatchReactionIds.has(id)) {
-          this.currentBatchReactionIds.set(id, rid)
-        } else {
-          // Orphan: both maps cleared before our add returned. Delete
-          // directly so the user doesn't see a stale ⏳ forever.
-          void feishu.deleteReaction(id, rid)
-        }
-      })()
-    }
 
     if (!this.isRunning()) {
       if (this.openingTurn || this.currentTurn) {
-        this.pendingMidTurnMsgs.push({ text, wireText, userOpenId, msgId })
-        if (msgId) trackReaction(msgId)
+        this.queueHumanMessage(text, wireText, userOpenId, msgId)
         return
       }
-      await this.startColdUserTurn(text, wireText, userOpenId)
+      const message = { text, wireText, userOpenId, msgId }
+      const batch = [...this.pendingMidTurnMsgs, message]
+      this.pendingMidTurnMsgs = []
+      await this.startColdUserTurn(text, wireText, userOpenId, msgId, batch)
       return
     }
 
@@ -2030,8 +3019,7 @@ export class Session {
       // so writing here would leave the msg stuck until the next user msg
       // arrives. Drain happens in the `result` handler, which both wakes
       // the SDK and opens a fresh card for the new batch turn.
-      this.pendingMidTurnMsgs.push({ text, wireText, userOpenId, msgId })
-      if (msgId) trackReaction(msgId)
+      this.queueHumanMessage(text, wireText, userOpenId, msgId)
       return
     }
 
@@ -2044,10 +3032,11 @@ export class Session {
     // have nowhere to render. `!openingTurn` means no sibling is mid-
     // open; `initCount >= 1` means SDK boot init has fired (otherwise
     // the init handler owns turn opening and we just feed the queue
-    // below). On failure openTurnCard surfaces a red banner via
-    // sendTextRaw; SDK was idle so no interrupt needed.
-    if (!this.openingTurn && this.initCount >= 1) {
-      this.openingTurn = true
+    // below); `!pendingHumanDelivery` means no earlier batch is still
+    // awaiting its receipt — eager-opening over one would double-render
+    // the input and make its later ACK look owner-lost (replay).
+    if (!this.openingTurn && this.initCount >= 1 && !this.pendingHumanDelivery) {
+      const openingToken = this.beginTurnOpening()
       try {
         // openTurnCard 内部读 pendingTurnInputs 渲染 "📥 收到" panel,要在
         // 它之前 push;之后再 sendUserText 给 SDK,顺序无关紧要(panel 是
@@ -2062,11 +3051,15 @@ export class Session {
           this.proc !== proc ||
           !proc.isAlive()
         ) return
-        proc.sendUserText(wireText, [])
-        this.pendingUserMessageCount++
-        this.status = 'working'
+        const delivery = this.beginHumanDelivery(proc, [{
+          text,
+          wireText,
+          userOpenId,
+          msgId,
+        }], openResult.turn)
+        if (delivery) await this.dispatchHumanBatch(delivery)
       } finally {
-        this.openingTurn = false
+        this.finishTurnOpening(openingToken)
       }
       return
     }
@@ -2085,19 +3078,27 @@ export class Session {
     //   B) cold start 第一条 (initCount===0 且 pendingCount===0) — init
     //      还没来,必须 sendUserText 喂 SDK 才能 wake;init handler 后续
     //      触发 openTurnCard 时一次性消费 pendingTurnInputs。
-    if (this.openingTurn || this.pendingUserMessageCount > 0) {
-      this.pendingMidTurnMsgs.push({ text, wireText, userOpenId, msgId })
-      if (msgId) trackReaction(msgId)
+    if (this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingHumanDelivery) {
+      this.queueHumanMessage(text, wireText, userOpenId, msgId)
       return
     }
     this.pendingTurnInputs.push(text)
-    this.proc!.sendUserText(wireText, [])
-    this.pendingUserMessageCount++
     if (wasBusy && msgId) {
       // Bootstrap race / sibling-opening race: until a card is open,
       // the OneSecond ⏳ is the only ack the user gets. The init handler
       // inherits these via currentBatchReactionIds when it opens.
-      trackReaction(msgId)
+      this.trackQueuedReaction(msgId)
+    }
+    const proc = this.proc!
+    const delivery = this.beginHumanDelivery(proc, [{ text, wireText, userOpenId, msgId }], null)
+    if (delivery) {
+      const outcome = await this.dispatchHumanBatch(delivery)
+      if (outcome === 'preserved') {
+        // 批次已回存 pendingMidTurnMsgs,面板快照必须同步回滚,
+        // 否则之后重投时同一条输入会在卡片顶栏渲染两遍。
+        const inputIndex = this.pendingTurnInputs.lastIndexOf(text)
+        if (inputIndex >= 0) this.pendingTurnInputs.splice(inputIndex, 1)
+      }
     }
   }
 
@@ -2155,11 +3156,11 @@ export class Session {
   async startHostAskContinuation(
     wireText: string,
     expectedProc: AgentProcess,
-  ): Promise<'started' | 'stale'> {
+  ): Promise<'started' | 'stale' | 'failed'> {
     if (this.proc !== expectedProc || !expectedProc.isAlive()) return 'stale'
     if (expectedProc.provider !== 'codex') throw new Error('askusr host continuation is only supported by Codex')
     if (this.currentTurn || this.openingTurn) throw new Error(`${this.backendLabel()} turn still active`)
-    this.openingTurn = true
+    const openingToken = this.beginTurnOpening()
     try {
       const openResult = await this.openTurnCard('', 'user_message', { expectedProc })
       if (openResult.kind === 'failed') throw new Error('failed to open continuation turn card')
@@ -2169,20 +3170,99 @@ export class Session {
         this.proc !== expectedProc ||
         !expectedProc.isAlive()
       ) return 'stale'
-      expectedProc.sendUserText(wireText, [])
-      this.pendingUserMessageCount++
-      this.status = 'working'
+      const dispatch = await this.dispatchSystemUserText(
+        expectedProc,
+        wireText,
+        openResult.turn,
+        openingToken,
+      )
+      if (dispatch !== 'accepted') {
+        if (dispatch === 'rejected') {
+          await this.closeRejectedSystemTurn(
+            openResult.turn,
+            expectedProc,
+            '⚠️ Codex 未接受继续请求',
+          )
+          return 'failed'
+        }
+        return 'stale'
+      }
+      if (this.proc === expectedProc && this.currentTurn === openResult.turn) {
+        this.pendingUserMessageCount++
+        this.status = 'working'
+      }
       return 'started'
     } finally {
-      this.openingTurn = false
+      this.finishTurnOpening(openingToken)
     }
   }
 
+  private async dispatchSystemUserText(
+    proc: AgentProcess,
+    text: string,
+    turn: TurnState,
+    openingOwner: object,
+  ): Promise<'accepted' | 'rejected' | 'stale'> {
+    let dispatch: UserTextDispatch
+    try {
+      dispatch = proc.sendUserText(text, [])
+    } catch (cause) {
+      log(`session "${this.sessionName}": system dispatch threw: ${messageOf(cause)}`)
+      return 'rejected'
+    }
+    if (dispatch.kind === 'rejected') {
+      log(`session "${this.sessionName}": system dispatch rejected: ${dispatch.error.message}`)
+      return 'rejected'
+    }
+    if (dispatch.kind !== 'turn_start_pending' || proc.provider !== 'codex') {
+      log(`session "${this.sessionName}": system dispatch returned unexpected ${dispatch.kind} handle`)
+      return 'rejected'
+    }
+    let settlement: CodexUserTextSettlement
+    try {
+      settlement = await dispatch.settlement
+    } catch (cause) {
+      log(`session "${this.sessionName}": system dispatch receipt rejected: ${messageOf(cause)}`)
+      return 'rejected'
+    }
+    if (
+      settlement.deliveryId !== dispatch.deliveryId ||
+      settlement.threadId !== dispatch.threadId ||
+      settlement.kind === 'rejected'
+    ) return 'rejected'
+    if (
+      this.proc !== proc ||
+      !proc.isAlive() ||
+      this.currentTurn !== turn ||
+      this.openingTurnOwner !== openingOwner ||
+      (settlement.turnId && turn.backendTurnId && settlement.turnId !== turn.backendTurnId)
+    ) return 'stale'
+    if (settlement.turnId && !turn.backendTurnId) turn.backendTurnId = settlement.turnId
+    return 'accepted'
+  }
+
+  private async closeRejectedSystemTurn(
+    turn: TurnState,
+    proc: AgentProcess,
+    suffix: string,
+  ): Promise<void> {
+    if (this.currentTurn !== turn) return
+    const ownsProcess = this.proc === proc
+    const closing = this.closeTurnCard(suffix, {
+      forcePush: true,
+      preservePendingReactions: true,
+    })
+    if (ownsProcess && this.proc === proc) this.status = 'idle'
+    await closing
+  }
+
   // ── Wiring Codex → Feishu ──────────────────────────────────────────
-  private persistResumableSessionId(): void {
-    const proc = this.proc
+  private persistResumableSessionId(proc: AgentProcess): void {
+    if (this.proc !== proc) return
     const sessionId = proc?.sessionId
     if (!proc || !sessionId) return
+    const recovery = this.preservedWatchdogRecovery
+    if (recovery && (proc.provider !== recovery.provider || sessionId !== recovery.threadId)) return
     feishu.bindSessionResume(this.sessionName, sessionId, proc.provider)
     if (proc.provider !== this.selectedProvider) return
     if (sessionId === this.lastSessionId) return
@@ -2341,16 +3421,31 @@ export class Session {
    *  这里把活跃 entry 翻成 killed 终态,有活卡则沉降成历史墓碑(settleBackgroundCard
    *  内部关 tick/timer + 渲染墓碑 + 清空数组),无卡只清内存。语义同 clearMultiMsgBuffer
    *  / releaseAllReactions —— 属于「轮作废」清理,此前漏了这一层。 */
-  private async resetBackgroundTasks(): Promise<void> {
-    if (this.backgroundTasks.some(t => !cards.isBgTerminal(t))) {
+  private async resetBackgroundTasks(lease?: LifecycleLease): Promise<void> {
+    if (lease && !this.ownsLifecycle(lease)) return
+    const handle = this.backgroundCard
+    const tasksOwner = this.backgroundTasks
+    const pendingOwner = this.pendingBgTasks
+    const detailOwner = this.backgroundDetailAdded
+    const archiveOwner = this.bgArchive
+    let settledTasks = tasksOwner
+    if (tasksOwner.some(t => !cards.isBgTerminal(t))) {
       const now = Date.now()
-      this.backgroundTasks = this.backgroundTasks.map(t =>
+      settledTasks = tasksOwner.map(t =>
         cards.isBgTerminal(t) ? t : { ...t, status: 'killed', endTime: t.endTime ?? now }
       )
     }
-    this.pendingBgTasks = []
-    if (this.backgroundCard) {
-      await this.settleBackgroundCard()
+    if (this.backgroundTasks === tasksOwner) this.backgroundTasks = settledTasks
+    if (this.pendingBgTasks === pendingOwner) this.pendingBgTasks = []
+    if (handle) {
+      await this.settleBackgroundCard({
+        lease,
+        handle,
+        tasks: settledTasks,
+        tasksOwner: settledTasks,
+        detailOwner,
+        archiveOwner,
+      })
       return
     }
     this.stopBackgroundRefreshTick()
@@ -2358,16 +3453,28 @@ export class Session {
       clearTimeout(this.backgroundRefreshTimer)
       this.backgroundRefreshTimer = null
     }
-    this.backgroundTasks = []
-    this.backgroundDetailAdded.clear()
+    if (this.backgroundTasks === settledTasks) this.backgroundTasks = []
+    if (this.backgroundDetailAdded === detailOwner) detailOwner.clear()
     this.openingBackground = false
   }
 
   /** 全部后台任务终态:活卡 updateCard 成历史快照(只终态墓碑),关 streaming,
    *  dispose,清句柄。卡留在原地不再跟随。 */
-  private async settleBackgroundCard(): Promise<void> {
-    const handle = this.backgroundCard
-    if (!handle) return
+  private async settleBackgroundCard(snapshot?: Readonly<{
+    lease?: LifecycleLease
+    handle: { messageId: string; cardId: string }
+    tasks: cards.BgTaskEntry[]
+    tasksOwner: cards.BgTaskEntry[]
+    detailOwner: Set<string>
+    archiveOwner: cards.BgArchiveEntry[]
+  }>): Promise<void> {
+    const handle = snapshot?.handle ?? this.backgroundCard
+    if (!handle || (snapshot?.lease && !this.ownsLifecycle(snapshot.lease))) return
+    if (this.backgroundCard !== handle) return
+    const tasks = snapshot?.tasks ?? this.backgroundTasks
+    const tasksOwner = snapshot?.tasksOwner ?? this.backgroundTasks
+    const detailOwner = snapshot?.detailOwner ?? this.backgroundDetailAdded
+    const archiveOwner = snapshot?.archiveOwner ?? this.bgArchive
     // 同步清空句柄 —— 防止并发 bg_task_settled(多任务同毫秒结算)触发两次 settle
     // 都读到非 null 的 race。后续 await 期间再来的 settle 看到 null 直接 return。
     this.backgroundCard = null
@@ -2377,16 +3484,26 @@ export class Session {
     }
     this.stopBackgroundRefreshTick()
     await cardkit.flush(handle.cardId)
-    await feishu.updateCard(handle.messageId, cards.backgroundHistoryCard(this.backgroundTasks))
+    await feishu.updateCard(handle.messageId, cards.backgroundHistoryCard(tasks))
     cardkit.cancelSummary(handle.cardId)
     await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({ suffix: '🧭 子agent已结束' }))
     await cardkit.dispose(handle.cardId)
     // 全部终态 → 清空 active 跟踪(已固化在历史卡);下次新后台 task 从空数组起步。
     // pending 观察池不动:前台 task 可能仍在跑,它们结算时自己从 pending 丢。
     // 清池前把 subagent 名片存档,供热续跑(不重发 task_started)复活。
-    this.bgArchive = cards.archiveTerminalAgents(this.bgArchive, this.backgroundTasks)
+    if (
+      (snapshot?.lease && !this.ownsLifecycle(snapshot.lease)) ||
+      this.backgroundCard !== null ||
+      this.backgroundTasks !== tasksOwner ||
+      this.backgroundDetailAdded !== detailOwner ||
+      this.bgArchive !== archiveOwner
+    ) {
+      log(`session "${this.sessionName}": background card settled without clearing newer state cardId=${handle.cardId.slice(0, 12)}`)
+      return
+    }
+    this.bgArchive = cards.archiveTerminalAgents(archiveOwner, tasks)
     this.backgroundTasks = []
-    this.backgroundDetailAdded.clear()
+    detailOwner.clear()
     log(`session "${this.sessionName}": background card settled cardId=${handle.cardId.slice(0, 12)}`)
   }
 
@@ -2429,7 +3546,7 @@ export class Session {
     })
     p.on('init', () => {
       if (this.proc !== p) return
-      this.persistResumableSessionId()
+      this.persistResumableSessionId(p)
       this.initCount++
       log(`session "${this.sessionName}": SDK init#${this.initCount} pendingCount=${this.pendingUserMessageCount} midBuffer=${this.pendingMidTurnMsgs.length} currentTurn=${this.currentTurn ? 'yes' : 'no'} openingTurn=${this.openingTurn}`)
 
@@ -2448,7 +3565,9 @@ export class Session {
       // currentTurn should be null at this point (result null'd it);
       // the openingTurn guard catches the eager-open vs init race.
       if (this.currentTurn || this.openingTurn) return
-      const isUserBatch = this.pendingUserMessageCount > 0
+      const bootstrapDelivery = [this.pendingHumanDelivery, this.ackedHumanDelivery]
+        .find(context => context?.proc === p && context.turn === null && context.state !== 'restored') ?? null
+      const isUserBatch = this.pendingUserMessageCount > 0 || bootstrapDelivery !== null
       // SDK 自发恢复轮:后台任务结算通知唤醒 SDK 合并结果,init 没有伴随
       // 用户消息。必须照样开卡,否则这一轮的全部正文会被 appendAssistant
       // 静默丢弃(2026-07-04 etmmo 终报告事故)。bgResumePending 只在
@@ -2463,10 +3582,13 @@ export class Session {
         // Inherit the queued reaction_ids — this turn is collectively
         // responsible for releasing their OneSecond reactions when it
         // closes (via deleteReaction in closeTurnCard).
-        this.currentBatchReactionIds = this.pendingReactionIds
-        this.pendingReactionIds = new Map()
+        if (!bootstrapDelivery) {
+          this.currentBatchReactionIds = this.pendingReactionIds
+          this.pendingReactionIds = new Map()
+        }
       }
-      this.openingTurn = true
+      const openingToken = this.beginTurnOpening()
+      if (bootstrapDelivery) bootstrapDelivery.openingOwner = openingToken
       this.sawResultWhileOpening = false // 本次开卡的竞态标记,落地时判定
       void (async () => {
         try {
@@ -2476,8 +3598,15 @@ export class Session {
             { expectedProc: p },
           )
           if (this.proc !== p || openResult.kind === 'stale') return
+          if (openResult.kind === 'opened') this.bindHumanDeliveryTurn(p, openResult.turn)
           if (openResult.kind === 'failed') {
             if (isUserBatch) {
+              if (
+                bootstrapDelivery?.state === 'acked' &&
+                this.ackedHumanDelivery === bootstrapDelivery
+              ) {
+                this.ackedHumanDelivery = null
+              }
               // SDK already started this turn (its `init` is what got us
               // here) but we have no card to render into. Interrupt so
               // assistant/tool events aren't silently dropped while the
@@ -2487,6 +3616,7 @@ export class Session {
               log(`session "${this.sessionName}": init-path openTurnCard failed — sendInterrupt + release reactions`)
               this.proc?.sendInterrupt()
               this.releaseAllReactions()
+              this.status = 'idle'
             } else {
               // 恢复轮开卡失败不打断 —— 打断会把正在合并的后台结果整轮
               // 作废。cardless 续窗:此后正文继续进孤儿缓冲。若 result 已在
@@ -2520,21 +3650,26 @@ export class Session {
             this.status = 'working'
           }
         } finally {
-          if (this.proc === p) this.openingTurn = false
+          this.finishTurnOpening(openingToken)
+          // 开卡窗口结束:释放 bootstrap 投递对该窗口的绑定,此后的
+          // 所有权由已绑定的 turn(bindHumanDeliveryTurn)接管;否则
+          // ACK/result 会把仍然同主的投递误判为易主(token ≠ null)。
+          if (bootstrapDelivery && bootstrapDelivery.openingOwner === openingToken) {
+            bootstrapDelivery.openingOwner = null
+          }
         }
       })()
     })
     p.on('turn_started', (identity: { turn_id?: string | null; thread_id?: string | null }) => {
       if (this.proc !== p) return
-      this.persistResumableSessionId()
+      this.persistResumableSessionId(p)
       const threadId = typeof identity?.thread_id === 'string' ? identity.thread_id : p.sessionId
       const turnId = typeof identity?.turn_id === 'string' ? identity.turn_id : null
       const context = this.watchdogContext
       if (
         this.proc === p &&
         context?.proc === p &&
-        context.turn === this.currentTurn &&
-        (!context.threadId || !threadId || context.threadId === threadId)
+        context.turn === this.currentTurn
       ) {
         this.applyWatchdogIdentity(threadId, turnId)
       } else if (
@@ -2543,11 +3678,27 @@ export class Session {
         this.watchdogSettings.mode !== 'off' &&
         (this.openingTurn || this.pendingTurnInputs.length > 0 || this.pendingUserMessageCount > 0)
       ) {
-        this.pendingWatchdogIdentity = {
-          proc: p,
-          threadId,
-          turnId,
-          turnCounter: this.watchdogOpeningTurnCounter,
+        const pending = this.pendingWatchdogIdentity
+        if (
+          pending?.proc === p &&
+          pending.turnCounter === this.watchdogOpeningTurnCounter
+        ) {
+          const conflicts = !!(
+            (pending.threadId && threadId && pending.threadId !== threadId) ||
+            (pending.turnId && turnId && pending.turnId !== turnId)
+          )
+          if (conflicts) pending.identityConflict = true
+          else {
+            if (!pending.threadId && threadId) pending.threadId = threadId
+            if (!pending.turnId && turnId) pending.turnId = turnId
+          }
+        } else {
+          this.pendingWatchdogIdentity = {
+            proc: p,
+            threadId,
+            turnId,
+            turnCounter: this.watchdogOpeningTurnCounter,
+          }
         }
       }
       const total = this.proc?.lastTotalUsage
@@ -2561,7 +3712,7 @@ export class Session {
     })
     p.on('token_usage', ({ totalUsage }: TokenUsageUpdated) => {
       if (this.proc !== p) return
-      this.persistResumableSessionId()
+      this.persistResumableSessionId(p)
       if (totalUsage) this.usageTotalsSeedUnknown = false
     })
     p.on('turn_plan_updated', (plan: TurnPlanUpdated) => {
@@ -2716,9 +3867,39 @@ export class Session {
       // No hooks registered → fail-safe ack.
       this.proc?.sendHookResponse(req.request_id, {})
     })
-    p.on('result', () => {
-      if (this.proc !== p && this.activeTurnInterrupt?.proc !== p) {
+    p.on('result', (event: AgentResultEvent) => {
+      const deliveryContext = this.matchingHumanDeliveryResult(p, event ?? {})
+      const ownsHumanTurn = this.resultOwnsCurrentHumanTurn(p, event ?? {}, deliveryContext)
+      if (!ownsHumanTurn && this.activeTurnInterrupt?.proc !== p) {
         log(`session "${this.sessionName}": ignore stale ${p.provider} result`)
+        return
+      }
+      const rejectedHumanStart = deliveryContext?.state === 'pending' &&
+        event?.subtype === 'codex_turn_start_failed'
+      if (deliveryContext?.state === 'pending') {
+        if (rejectedHumanStart) {
+          this.restoreHumanDelivery(deliveryContext)
+        } else {
+          this.commitHumanDelivery(deliveryContext)
+        }
+      }
+      if (
+        !rejectedHumanStart &&
+        deliveryContext?.state === 'acked' &&
+        this.ackedHumanDelivery === deliveryContext
+      ) {
+        this.ackedHumanDelivery = null
+      }
+      if (rejectedHumanStart) {
+        this.persistResumableSessionId(p)
+        if (this.openingTurn) this.sawResultWhileOpening = true
+        log(`session "${this.sessionName}": Codex human turn/start rejected; preserve batch without automatic drain`)
+        void this.closeTurnCard('⚠️ Codex 未接受消息，已保留待重试', {
+          forcePush: true,
+          hasFreshResult: true,
+          preservePendingReactions: true,
+        })
+        this.status = 'idle'
         return
       }
       const pendingInterrupt = this.activeTurnInterrupt
@@ -2740,7 +3921,7 @@ export class Session {
         log(`session "${this.sessionName}": ignore unmatched ${p.provider} result during turn interrupt`)
         return
       }
-      this.persistResumableSessionId()
+      this.persistResumableSessionId(p)
       this.accumulateResultStats()
       // result 抢在 openTurnCard 的 await 窗口内到达:标记给开卡 IIFE,
       // 它落地后据此立即收尾(否则卡片悬挂、session 卡在 working)。
@@ -2834,18 +4015,43 @@ export class Session {
     })
     p.on('exit', ({ code, signal, expected }: any) => {
       log(`session "${this.sessionName}": ${p.provider} exited code=${code} signal=${signal} expected=${expected}`)
-      if (this.preservingRestartProc === p) {
-        this.preservingRestartProc = null
-        if (this.proc === p) this.proc = null
-        this.status = 'stopped'
-        this.opts.onLifecycleChange?.()
-        log(`session "${this.sessionName}": preserving restart replacement exit ignored captured turn state`)
+      const pendingDelivery = this.pendingHumanDelivery?.proc === p
+        ? this.pendingHumanDelivery
+        : null
+      const alreadyRestoredDelivery = this.restoredHumanDelivery?.proc === p
+        ? this.restoredHumanDelivery
+        : null
+      const restoredHumanDelivery = pendingDelivery
+        ? this.restoreHumanDelivery(pendingDelivery)
+        : alreadyRestoredDelivery !== null
+      const ackedHumanDelivery = this.ackedHumanDelivery?.proc === p &&
+        this.ackedHumanDelivery.state === 'acked'
+        ? this.ackedHumanDelivery
+        : null
+      const preservedRecovery = this.preservedWatchdogRecovery
+      if (preservedRecovery?.replacementProc === p) {
+        preservedRecovery.replacementProc = null
+        preservedRecovery.phase = 'failed'
+        if (this.proc === p) {
+          this.proc = null
+          this.status = 'stopped'
+          this.opts.onLifecycleChange?.()
+          log(`session "${this.sessionName}": preserving restart replacement exit latched recovery failure`)
+        } else {
+          log(`session "${this.sessionName}": ignore stale preserving restart replacement exit`)
+        }
         return
       }
       const pendingInterrupt = this.activeTurnInterrupt
       const interrupted = this.settleTurnInterrupt(p, 'exit')
       if (interrupted?.source === 'watchdog_recover' || interrupted?.source === 'watchdog_exhausted') {
         this.proc = null
+        // 死进程的 ask/permission 定义上已死(见普通 exit 路径注释);
+        // 恢复流程随后可能 restart,但 restart 可能失败或被测试 mock,
+        // 这个分支自身必须完成清理。
+        this.pendingAsks.clear()
+        this.pendingHostAsks.clear()
+        this.pendingPermissions.clear()
         this.status = 'stopped'
         this.opts.onLifecycleChange?.()
         return
@@ -2853,8 +4059,68 @@ export class Session {
       if (!interrupted && pendingInterrupt?.proc === p && this.activeTurnInterrupt === pendingInterrupt) {
         this.cancelTurnInterrupt('process exit no longer owns captured turn')
       }
+      const watchdogAction = this.watchdogAction
+      if (watchdogAction && watchdogAction.proc === p && this.proc === p) {
+        this.proc = null
+        this.pendingAsks.clear()
+        this.pendingHostAsks.clear()
+        this.pendingPermissions.clear()
+        const recovery = this.preserveWatchdogRecovery(watchdogAction)
+        if (recovery) this.markPreservedWatchdogRecoveryFailed(recovery, watchdogAction.lease)
+        this.status = 'stopped'
+        this.opts.onLifecycleChange?.()
+        log(`session "${this.sessionName}": captured watchdog process exit latched recovery failure`)
+        // 只终结本次 action 捕获的 turn(同步前缀立即摘下台面,卡片异步
+        // 写终态);不得读可变 currentTurn —— replacement turn 归新 owner。
+        void this.terminalizeDetachedTurn(watchdogAction.turn, {
+          footerContent: watchdogFooterContent('failed'),
+          settingsSuffix: watchdogFooterContent('failed'),
+          rawFallback: watchdogFooterContent('failed'),
+        }).catch(e => log(`session "${this.sessionName}": detached watchdog card terminalization failed: ${messageOf(e)}`))
+        return
+      }
       if (this.proc !== p) {
+        if (ackedHumanDelivery && this.ackedHumanDelivery === ackedHumanDelivery) {
+          this.ackedHumanDelivery = null
+        }
+        if (this.restoredHumanDelivery?.proc === p) this.restoredHumanDelivery = null
         log(`session "${this.sessionName}": ignore stale ${p.provider} exit; current=${this.proc?.provider ?? 'none'}`)
+        return
+      }
+      if (restoredHumanDelivery) {
+        this.proc = null
+        this.flushOrphanAssistantToChat('process exit with preserved human delivery')
+        this.bgResumePending = false
+        this.bgResumeCardless = false
+        this.sawResultWhileOpening = false
+        this.stopFooterStatus(this.currentTurn)
+        this.currentTurn = null
+        this.clearWatchdogRuntime('process exit with preserved human delivery')
+        this.pendingUserMessageCount = 0
+        this.pendingTurnInputs = []
+        // 当轮批次的 ⏳ 先删再重置(与普通 exit 路径对齐)—— 保留的
+        // pending 投递持有自己的 reactions,不在这个 map 里。
+        for (const [msgId, reactionId] of this.currentBatchReactionIds) {
+          if (reactionId) void feishu.deleteReaction(msgId, reactionId)
+        }
+        this.currentBatchReactionIds = new Map()
+        this.initCount = 0
+        this.clearTurnOpening()
+        // 与普通 exit 路径同样必须清僵尸 ask/permission(见下方注释):
+        // 保留的是真人消息,不是死进程的问答状态;不清的话恢复后每条
+        // 消息都会被 onAskMessageAnswer 当僵尸答案吞掉。
+        this.pendingAsks.clear()
+        this.pendingHostAsks.clear()
+        this.pendingPermissions.clear()
+        this.currentTurnUsageBaseline = null
+        this.currentTurnUsageBaselineKnown = false
+        this.usageTotalsSeedUnknown = false
+        this.status = 'stopped'
+        if (this.restoredHumanDelivery?.proc === p) this.restoredHumanDelivery = null
+        this.opts.onLifecycleChange?.()
+        if (!expected && code !== 0 && signal !== 'SIGTERM') {
+          void feishu.sendText(this.chatId, `⚠️ ${this.backendLabel(p.provider)} 异常退出 (code=${code}, signal=${signal})。真人消息已保留，回复任意消息将重新启动。`)
+        }
         return
       }
       this.proc = null
@@ -2867,19 +4133,25 @@ export class Session {
       this.sawResultWhileOpening = false
       this.stopFooterStatus(this.currentTurn)
       this.currentTurn = null
-      this.endWatchdogTurn()
-      this.pendingWatchdogIdentity = null
-      this.watchdogOpeningTurnCounter = null
-      this.watchdogOpeningProc = null
-      this.watchdogOpeningToken = null
+      this.clearWatchdogRuntime('process exit')
       this.clearMultiMsgBuffer('process exit')
-      this.pendingUserMessageCount = 0
-      this.pendingMidTurnMsgs = []
+      this.pendingUserMessageCount = ackedHumanDelivery
+        ? Math.max(1, this.pendingUserMessageCount)
+        : 0
+      if (!ackedHumanDelivery) this.pendingMidTurnMsgs = []
       this.pendingTurnInputs = []
-      this.lastUserOpenId = ''
-      this.releaseAllReactions()
+      if (!ackedHumanDelivery) {
+        this.lastUserOpenId = ''
+        this.releaseAllReactions()
+      } else {
+        for (const [msgId, reactionId] of this.currentBatchReactionIds) {
+          if (reactionId) void feishu.deleteReaction(msgId, reactionId)
+        }
+        this.currentBatchReactionIds = new Map()
+        if (this.ackedHumanDelivery === ackedHumanDelivery) this.ackedHumanDelivery = null
+      }
       this.initCount = 0
-      this.openingTurn = false
+      this.clearTurnOpening()
       // 进程没了 ⇒ 任何 pending ask 都不可能再收到 can_use_tool 或回传答案,
       // 定义上已死。不清的话 hasPendingAsk() 恒 true,后续每条消息都被
       // onAskMessageAnswer 当僵尸答案吞掉,session 焊死到下次 daemon 重启
@@ -2971,30 +4243,34 @@ export class Session {
    * pendingCount 一次 ++(对应一次 sendUserText)。因为 SDK 不再拆 turn,
    * commit 2258af4 当年用累加保护 spurious 第二 turn 的逻辑不再需要 —
    * SDK 不会自发开 user_batch 子 turn。 */
-  private async drainMidTurnAndOpen(): Promise<void> {
-    if (this.pendingMidTurnMsgs.length === 0) return
+  private async drainMidTurnAndOpen(ownership?: {
+    proc: AgentProcess
+    lease: LifecycleLease
+    recovery: PreservedWatchdogRecovery
+  }): Promise<MidTurnDrainOutcome> {
+    if (
+      ownership &&
+      (
+        !this.ownsPreservedWatchdogRecovery(ownership.recovery, ownership.lease) ||
+        this.proc !== ownership.proc ||
+        ownership.proc.provider !== ownership.recovery.provider ||
+        ownership.proc.sessionId !== ownership.recovery.threadId
+      )
+    ) return 'preserved'
+    if (this.pendingMidTurnMsgs.length === 0) return 'no_batch'
     const proc = this.proc
-    if (!proc?.isAlive()) return
+    if (!proc?.isAlive()) return 'preserved'
     const batch = this.pendingMidTurnMsgs
     this.pendingMidTurnMsgs = []
-    const batchReactions = new Map<string, string>()
-    let committed = false
-    this.openingTurn = true
+    const delivery = this.beginHumanDelivery(proc, batch, null)
+    if (!delivery) return 'preserved'
+    const openingToken = this.beginTurnOpening()
+    delivery.openingOwner = openingToken
     try {
-      // daemon-side state: panel inputs + reaction transfer。不走 sendUserText,
-      // SDK 那边由 join 后的单条统一处理。
+      // daemon-side panel state; wire delivery is one joined SDK input.
       for (const msg of batch) {
         this.pendingTurnInputs.push(msg.text)
-        if (msg.msgId) {
-          const rid = this.pendingReactionIds.get(msg.msgId) ?? ''
-          batchReactions.set(msg.msgId, rid)
-          this.currentBatchReactionIds.set(msg.msgId, rid)
-          this.pendingReactionIds.delete(msg.msgId)
-        }
       }
-      // wireText 每条已经在 onUserMessage 内 inline 了自己的 file hint;
-      // SDK side files 一律传空,避免 file ↔ message 归属丢失(P1-1)。
-      const merged = batch.map(m => m.wireText).join('\n\n')
       const last = batch[batch.length - 1]
       const userOpenId = last?.userOpenId ?? this.lastUserOpenId
       const openResult = await this.openTurnCard(userOpenId, 'user_message', { expectedProc: proc })
@@ -3002,36 +4278,33 @@ export class Session {
         openResult.kind !== 'opened' ||
         this.currentTurn !== openResult.turn ||
         this.proc !== proc ||
-        !proc.isAlive()
-      ) return
-      proc.sendUserText(merged, [])
-      committed = true
-      this.pendingUserMessageCount++
-      // 不动 pendingUserMessageCount;init handler 在 isUserBatch 路径
-      // 自己 reset。merge 之后 SDK 不拆 turn,不会再有空 user_message turn。
-      this.status = 'working'
-    } finally {
-      if (!committed) {
-        this.pendingMidTurnMsgs = [...batch, ...this.pendingMidTurnMsgs]
-        for (const [msgId, capturedRid] of batchReactions) {
-          const currentRid = this.currentBatchReactionIds.get(msgId)
-          this.currentBatchReactionIds.delete(msgId)
-          if (!this.pendingReactionIds.has(msgId)) {
-            this.pendingReactionIds.set(msgId, currentRid ?? capturedRid)
-          }
-        }
+        !proc.isAlive() ||
+        (ownership && !this.ownsPreservedWatchdogRecovery(ownership.recovery, ownership.lease))
+      ) {
+        this.restoreHumanDelivery(delivery)
+        return 'preserved'
       }
-      this.openingTurn = false
+      delivery.turn = openResult.turn
+      return await this.dispatchHumanBatch(delivery)
+    } finally {
+      this.finishTurnOpening(openingToken)
     }
   }
 
   private async startWatchdogResumeTurn(
     userOpenId: string,
     proc: AgentProcess,
-  ): Promise<'started' | 'human_priority' | 'stale' | 'failed'> {
-    if (this.proc !== proc || !proc.isAlive()) return 'stale'
+    transaction: WatchdogActionTransaction,
+    recovery: PreservedWatchdogRecovery,
+  ): Promise<'started' | 'human_priority' | 'human_priority_failed' | 'stale' | 'failed'> {
+    if (
+      !this.ownsWatchdogAction(transaction) ||
+      !this.ownsPreservedWatchdogRecovery(recovery, transaction.lease) ||
+      this.proc !== proc ||
+      !this.watchdogActionProcessMatches(transaction, proc)
+    ) return 'stale'
     if (this.currentTurn || this.openingTurn || this.hasQueuedHumanWork()) return 'stale'
-    this.openingTurn = true
+    const openingToken = this.beginTurnOpening()
     try {
       let openResult: TurnCardOpenResult
       try {
@@ -3042,6 +4315,10 @@ export class Session {
         log(`session "${this.sessionName}": watchdog recovery-card open failed: ${messageOf(e)}`)
         return 'failed'
       }
+      if (
+        !this.ownsWatchdogAction(transaction) ||
+        !this.ownsPreservedWatchdogRecovery(recovery, transaction.lease)
+      ) return 'stale'
       if (openResult.kind === 'stale') return 'stale'
       if (openResult.kind === 'failed') return 'failed'
       if (
@@ -3054,17 +4331,50 @@ export class Session {
         await this.closeTurnCard('🛟 自动恢复取消 · 真人消息优先', {
           preservePendingReactions: true,
         })
-        if (this.proc !== proc || !proc.isAlive()) return 'stale'
-        if (this.pendingMidTurnMsgs.length > 0) await this.drainMidTurnAndOpen()
-        else this.status = 'idle'
+        if (
+          !this.ownsWatchdogAction(transaction) ||
+          !this.ownsPreservedWatchdogRecovery(recovery, transaction.lease) ||
+          this.proc !== proc ||
+          !this.watchdogActionProcessMatches(transaction, proc)
+        ) return 'stale'
+        if (this.pendingMidTurnMsgs.length > 0) {
+          let drainOutcome: MidTurnDrainOutcome = 'preserved'
+          try {
+            recovery.phase = 'draining'
+            drainOutcome = await this.drainMidTurnAndOpen({
+              proc,
+              lease: transaction.lease,
+              recovery,
+            })
+          } catch (e) {
+            log(`session "${this.sessionName}": watchdog human-priority drain failed: ${messageOf(e)}`)
+          }
+          if (drainOutcome === 'preserved') return 'human_priority_failed'
+        } else this.status = 'idle'
         return 'human_priority'
       }
 
-      proc.sendUserText(WATCHDOG_RECOVERY_PROMPT, [])
-      this.status = 'working'
+      const dispatch = await this.dispatchSystemUserText(
+        proc,
+        WATCHDOG_RECOVERY_PROMPT,
+        openResult.turn,
+        openingToken,
+      )
+      if (dispatch !== 'accepted') {
+        if (dispatch === 'rejected') {
+          await this.closeRejectedSystemTurn(
+            openResult.turn,
+            proc,
+            '⚠️ Codex 未接受自动恢复请求',
+          )
+          return 'failed'
+        }
+        return 'stale'
+      }
+      if (this.proc === proc && this.currentTurn === openResult.turn) this.status = 'working'
       return 'started'
     } finally {
-      this.openingTurn = false
+      this.finishTurnOpening(openingToken)
     }
   }
 
@@ -3073,10 +4383,31 @@ export class Session {
     verdict: Extract<WatchdogVerdict, { type: 'recover' }>,
   ): Promise<void> {
     if (!this.watchdogGuardsPass(ctx)) return
-    this.watchdogActionInFlight = true
+    const transaction = this.beginWatchdogAction(ctx, 'watchdog-recovery')
+    if (!transaction) return
     this.stopFooterStatus(ctx.turn)
     ctx.turn.footerStatusOverride = watchdogFooterContent('recovering')
-    let preservingRecoveryProc: AgentProcess | null = null
+    let recovery: PreservedWatchdogRecovery | null = null
+    const failRecovery = async (outcome: string): Promise<void> => {
+      if (!this.ownsWatchdogAction(transaction)) return
+      recovery ??= this.preserveWatchdogRecovery(transaction)
+      if (!recovery || !this.ownsPreservedWatchdogRecovery(recovery, transaction.lease)) return
+      this.markPreservedWatchdogRecoveryFailed(recovery, transaction.lease)
+      this.status = 'stopped'
+      this.opts.onLifecycleChange?.()
+      try {
+        await this.closeTurnCard(watchdogFooterContent('failed'), {
+          forcePush: true,
+          preservePendingReactions: true,
+        })
+      } catch (e) {
+        log(`session "${this.sessionName}": watchdog failed-card close failed: ${messageOf(e)}`)
+      }
+      if (!this.ownsWatchdogAction(transaction)) return
+      await feishu.sendTextRaw(this.chatId, watchdogFooterContent('failed')).catch(() => {})
+      if (!this.ownsWatchdogAction(transaction)) return
+      this.logWatchdog('turn_watchdog_recover_failed', ctx, { ...verdict, outcome })
+    }
     try {
       try {
         await this.replaceFooterContent(
@@ -3087,9 +4418,12 @@ export class Session {
         log(`session "${this.sessionName}": watchdog footer patch failed: ${messageOf(e)}`)
       }
 
+      if (!this.ownsWatchdogAction(transaction)) return
       if (!this.watchdogGuardsPass(ctx, true)) {
-        ctx.turn.footerStatusOverride = null
-        if (this.watchdogTurnStillOwned(ctx)) this.startThinkingFooter(ctx.turn)
+        if (this.currentTurn === ctx.turn && this.watchdogContext === ctx) {
+          ctx.turn.footerStatusOverride = null
+          if (this.watchdogTurnStillOwned(ctx)) this.startThinkingFooter(ctx.turn)
+        }
         return
       }
 
@@ -3101,6 +4435,7 @@ export class Session {
         interrupt,
         this.configuredWatchdogSettings().interruptGraceMs,
       )
+      if (!this.ownsWatchdogAction(transaction)) return
       this.logWatchdog('turn_watchdog_interrupt_settled', ctx, {
         ...verdict,
         outcome: outcome.type,
@@ -3124,48 +4459,58 @@ export class Session {
       }
 
       if (!liveProcess) {
-        if (!this.watchdogTurnStillOwned(ctx)) return
-        if (ctx.threadId && this.lastSessionId !== ctx.threadId) {
-          log(`session "${this.sessionName}": watchdog strict resume skipped changed thread captured=${ctx.threadId.slice(0, 8)} current=${this.lastSessionId?.slice(0, 8) ?? 'none'}`)
+        if (!this.watchdogActionTurnStillOwned(transaction)) return
+        if (this.proc && this.proc !== transaction.proc) {
+          recovery = this.preserveWatchdogRecovery(transaction)
+          if (recovery) this.markPreservedWatchdogRecoveryFailed(recovery, transaction.lease)
+          this.status = 'stopped'
+          this.opts.onLifecycleChange?.()
           return
         }
+        recovery = this.preserveWatchdogRecovery(transaction)
+        if (!recovery) return
         const resumed = await this.restart(true, {
           announce: false,
+          lifecycleLease: transaction.lease,
+          resumeIdentity: {
+            provider: transaction.provider,
+            threadId: transaction.threadId,
+          },
+          preservedRecoveryToken: recovery.token,
           requireResumeSession: true,
           preserveCurrentTurn: true,
           preserveQueuedHumanWork: true,
         })
-        preservingRecoveryProc = this.preservingRestartProc
-        if (!this.watchdogTurnStillOwned(ctx)) return
+        if (
+          !this.ownsWatchdogAction(transaction) ||
+          !this.ownsPreservedWatchdogRecovery(recovery, transaction.lease)
+        ) return
+        if (!this.watchdogActionTurnStillOwned(transaction)) return
+        let replacement = recovery.replacementProc
+        if (!replacement && this.watchdogActionProcessMatches(transaction, this.proc)) {
+          replacement = this.proc
+          recovery.replacementProc = replacement
+        }
         if (
           !resumed ||
-          !this.proc?.isAlive() ||
-          (ctx.threadId && this.proc.sessionId !== ctx.threadId)
+          !replacement ||
+          this.proc !== replacement ||
+          !this.watchdogActionProcessMatches(transaction, replacement)
         ) {
-          this.status = 'stopped'
-          try {
-            await this.closeTurnCard(watchdogFooterContent('failed'), {
-              forcePush: true,
-              preservePendingReactions: true,
-            })
-          } catch (e) {
-            log(`session "${this.sessionName}": watchdog failed-card close failed: ${messageOf(e)}`)
-          }
-          await feishu.sendTextRaw(this.chatId, watchdogFooterContent('failed'))
-          this.logWatchdog('turn_watchdog_recover_failed', ctx, {
-            ...verdict,
-            outcome: 'resume_failed',
-          })
+          if (replacement?.isAlive()) await this.discardLocalProcess(transaction.lease, replacement)
+          await failRecovery('resume_failed')
           return
         }
         liveProcess = true
       }
 
-      if (!this.watchdogTurnStillOwned(ctx) || !liveProcess) return
+      if (
+        !this.ownsWatchdogAction(transaction) ||
+        !this.watchdogActionTurnStillOwned(transaction) ||
+        !liveProcess
+      ) return
       const recoveryProc = this.proc
-      if (!recoveryProc?.isAlive() || (ctx.threadId && recoveryProc.sessionId !== ctx.threadId)) {
-        return
-      }
+      if (!this.watchdogActionProcessMatches(transaction, recoveryProc)) return
       try {
         await this.closeTurnCard(watchdogFooterContent('interrupted', verdict), {
           forcePush: true,
@@ -3175,21 +4520,59 @@ export class Session {
         log(`session "${this.sessionName}": watchdog interrupted-card close failed: ${messageOf(e)}`)
       }
       if (
+        !this.ownsWatchdogAction(transaction) ||
         this.proc !== recoveryProc ||
-        !recoveryProc.isAlive() ||
-        (ctx.threadId && recoveryProc.sessionId !== ctx.threadId)
+        !this.watchdogActionProcessMatches(transaction, recoveryProc)
       ) return
 
       if (this.currentTurn?.trigger === 'user_message' || this.openingTurn) return
       if (this.hasQueuedHumanWork()) {
-        if (this.pendingMidTurnMsgs.length > 0) await this.drainMidTurnAndOpen()
-        else this.status = 'idle'
+        recovery ??= this.preserveWatchdogRecovery(transaction)
+        if (!recovery) return
+        if (this.pendingMidTurnMsgs.length > 0) {
+          let drainOutcome: MidTurnDrainOutcome = 'preserved'
+          try {
+            recovery.phase = 'draining'
+            drainOutcome = await this.drainMidTurnAndOpen({
+              proc: recoveryProc,
+              lease: transaction.lease,
+              recovery,
+            })
+          } catch (e) {
+            log(`session "${this.sessionName}": watchdog recovery human drain failed: ${messageOf(e)}`)
+          }
+          if (
+            !this.ownsWatchdogAction(transaction) ||
+            !this.ownsPreservedWatchdogRecovery(recovery, transaction.lease)
+          ) return
+          if (drainOutcome === 'preserved') {
+            await failRecovery('human_priority_failed')
+            return
+          }
+        } else this.status = 'idle'
+        recovery.replacementProc = null
+        this.completePreservedWatchdogRecovery(recovery, transaction.lease)
         return
       }
 
-      const start = await this.startWatchdogResumeTurn(ctx.turn.userOpenId, recoveryProc)
+      recovery ??= this.preserveWatchdogRecovery(transaction)
+      if (!recovery) return
+      const start = await this.startWatchdogResumeTurn(
+        transaction.turn.userOpenId,
+        recoveryProc,
+        transaction,
+        recovery,
+      )
+      if (!this.ownsWatchdogAction(transaction)) return
       if (start === 'started') {
         this.logWatchdog('turn_watchdog_recover_started', ctx, verdict)
+        recovery.replacementProc = null
+        this.completePreservedWatchdogRecovery(recovery, transaction.lease)
+      } else if (start === 'human_priority') {
+        recovery.replacementProc = null
+        this.completePreservedWatchdogRecovery(recovery, transaction.lease)
+      } else if (start === 'human_priority_failed') {
+        await failRecovery('human_priority_failed')
       } else if (start === 'failed') {
         if (
           this.proc !== recoveryProc ||
@@ -3198,18 +4581,188 @@ export class Session {
           this.openingTurn ||
           this.hasQueuedHumanWork()
         ) return
-        this.status = 'stopped'
-        await feishu.sendTextRaw(this.chatId, watchdogFooterContent('failed'))
-        this.logWatchdog('turn_watchdog_recover_failed', ctx, {
-          ...verdict,
-          outcome: 'open_failed',
+        await failRecovery('open_failed')
+      } else if (start === 'stale') {
+        // 恢复 turn 在 ACK 前被更新的 owner 顶替:替换方的 currentTurn/status/
+        // 卡片必须原样保留,这里只把仍归本次 action 所有的保留记录标记为
+        // failed,让用户之后能用 restart 恢复排队消息。
+        if (this.ownsPreservedWatchdogRecovery(recovery, transaction.lease)) {
+          this.markPreservedWatchdogRecoveryFailed(recovery, transaction.lease)
+          this.logWatchdog('turn_watchdog_recover_failed', ctx, { ...verdict, outcome: 'stale_owner' })
+        }
+      }
+    } catch (e) {
+      log(`session "${this.sessionName}": watchdog recovery action failed: ${messageOf(e)}`)
+      if (this.ownsWatchdogAction(transaction)) await failRecovery('exception')
+    } finally {
+      this.finishWatchdogAction(transaction)
+    }
+  }
+
+  async runWatchdogExhausted(
+    ctx: WatchdogTurnContext,
+    verdict: Extract<WatchdogVerdict, { type: 'stop_exhausted' }>,
+  ): Promise<void> {
+    if (!this.watchdogGuardsPass(ctx)) return
+    const transaction = this.beginWatchdogAction(ctx, 'watchdog-exhausted')
+    if (!transaction) return
+    this.stopFooterStatus(ctx.turn)
+    ctx.turn.footerStatusOverride = watchdogFooterContent('exhausted')
+    let recovery: PreservedWatchdogRecovery | null = null
+    const failQueuedRecovery = async (): Promise<void> => {
+      if (!this.ownsWatchdogAction(transaction)) return
+      recovery ??= this.preserveWatchdogRecovery(transaction)
+      if (!recovery || !this.ownsPreservedWatchdogRecovery(recovery, transaction.lease)) return
+      this.markPreservedWatchdogRecoveryFailed(recovery, transaction.lease)
+      this.status = 'stopped'
+      this.opts.onLifecycleChange?.()
+      await feishu.sendTextRaw(this.chatId, watchdogFooterContent('failed')).catch(() => {})
+    }
+    try {
+      try {
+        await this.replaceFooterContent(
+          ctx.turn.cardId,
+          this.withModel(ctx.turn.footerStatusOverride),
+        )
+      } catch (e) {
+        log(`session "${this.sessionName}": watchdog exhausted footer patch failed: ${messageOf(e)}`)
+      }
+
+      if (!this.ownsWatchdogAction(transaction)) return
+      if (!this.watchdogGuardsPass(ctx, true)) {
+        if (this.currentTurn === ctx.turn && this.watchdogContext === ctx) {
+          ctx.turn.footerStatusOverride = null
+          if (this.watchdogTurnStillOwned(ctx)) this.startThinkingFooter(ctx.turn)
+        }
+        return
+      }
+
+      const interrupt = this.beginTurnInterrupt('watchdog_exhausted', ctx)
+      if (!interrupt) return
+      const outcome = await this.waitForTurnSettlement(
+        interrupt,
+        this.configuredWatchdogSettings().interruptGraceMs,
+      )
+      if (!this.ownsWatchdogAction(transaction)) return
+      if (outcome.type === 'cancelled') return
+
+      if (outcome.type === 'timeout') {
+        this.cancelTurnInterrupt('watchdog exhausted grace timeout')
+        if (this.proc === ctx.proc) this.proc = null
+        if (ctx.proc.isAlive()) {
+          await ctx.proc.kill(1_000).catch(e => {
+            log(`session "${this.sessionName}": watchdog exhausted kill failed: ${messageOf(e)}`)
+          })
+        }
+        if (!this.ownsWatchdogAction(transaction)) return
+      }
+
+      if (this.proc && this.proc !== transaction.proc) {
+        recovery = this.preserveWatchdogRecovery(transaction)
+        if (recovery) await failQueuedRecovery()
+        return
+      }
+
+      if (!this.watchdogActionTurnStillOwned(transaction)) return
+      try {
+        await this.closeTurnCard(watchdogFooterContent('exhausted'), {
+          forcePush: true,
+          preservePendingReactions: true,
         })
+      } catch (e) {
+        log(`session "${this.sessionName}": watchdog exhausted-card close failed: ${messageOf(e)}`)
+      }
+      if (!this.ownsWatchdogAction(transaction)) return
+      this.logWatchdog('turn_watchdog_exhausted', ctx, {
+        ...verdict,
+        outcome: outcome.type,
+      })
+
+      if (this.hasQueuedHumanWork()) {
+        recovery = this.preserveWatchdogRecovery(transaction)
+        if (!recovery) return
+        if (
+          this.proc?.isAlive() &&
+          !this.watchdogActionProcessMatches(transaction, this.proc)
+        ) {
+          await failQueuedRecovery()
+          return
+        }
+        if (!this.proc?.isAlive()) {
+          const resumed = await this.restart(true, {
+            announce: false,
+            lifecycleLease: transaction.lease,
+            resumeIdentity: {
+              provider: transaction.provider,
+              threadId: transaction.threadId,
+            },
+            preservedRecoveryToken: recovery.token,
+            requireResumeSession: true,
+            preserveCurrentTurn: true,
+            preserveQueuedHumanWork: true,
+          })
+          if (
+            !this.ownsWatchdogAction(transaction) ||
+            !this.ownsPreservedWatchdogRecovery(recovery, transaction.lease)
+          ) return
+          if (!this.watchdogActionTurnStillOwned(transaction)) return
+          let replacement = recovery.replacementProc
+          if (!replacement && this.watchdogActionProcessMatches(transaction, this.proc)) {
+            replacement = this.proc
+            recovery.replacementProc = replacement
+          }
+          if (
+            !resumed ||
+            !replacement ||
+            this.proc !== replacement ||
+            !this.watchdogActionProcessMatches(transaction, replacement)
+          ) {
+            if (replacement?.isAlive()) await this.discardLocalProcess(transaction.lease, replacement)
+            await failQueuedRecovery()
+            return
+          }
+        }
+        const recoveryProc = this.proc
+        if (!this.watchdogActionProcessMatches(transaction, recoveryProc)) {
+          await failQueuedRecovery()
+          return
+        }
+        if (this.pendingMidTurnMsgs.length > 0) {
+          let drainOutcome: MidTurnDrainOutcome = 'preserved'
+          try {
+            recovery.phase = 'draining'
+            drainOutcome = await this.drainMidTurnAndOpen({
+              proc: recoveryProc,
+              lease: transaction.lease,
+              recovery,
+            })
+          } catch (e) {
+            log(`session "${this.sessionName}": watchdog exhausted human drain failed: ${messageOf(e)}`)
+          }
+          if (
+            !this.ownsWatchdogAction(transaction) ||
+            !this.ownsPreservedWatchdogRecovery(recovery, transaction.lease)
+          ) return
+          if (drainOutcome === 'preserved') {
+            await failQueuedRecovery()
+            return
+          }
+        } else this.status = 'idle'
+        recovery.replacementProc = null
+        this.completePreservedWatchdogRecovery(recovery, transaction.lease)
+        return
+      }
+
+      this.status = this.proc?.isAlive() ? 'idle' : 'stopped'
+    } catch (e) {
+      log(`session "${this.sessionName}": watchdog exhausted action failed: ${messageOf(e)}`)
+      if (this.hasQueuedHumanWork() && this.ownsWatchdogAction(transaction)) {
+        await failQueuedRecovery()
+      } else if (this.ownsWatchdogAction(transaction)) {
+        await feishu.sendTextRaw(this.chatId, watchdogFooterContent('failed')).catch(() => {})
       }
     } finally {
-      if (preservingRecoveryProc && this.preservingRestartProc === preservingRecoveryProc) {
-        this.preservingRestartProc = null
-      }
-      this.watchdogActionInFlight = false
+      this.finishWatchdogAction(transaction)
     }
   }
 
@@ -3231,21 +4784,55 @@ export class Session {
     }
   }
 
-  private async settleCapturedStaleTurn(turn: TurnState): Promise<void> {
-    const status = '⚪ 本轮已取消 · 后端已切换'
+  /** 终结一个已(或即将)脱离归属的 turn 的旧卡片。同步前缀先把捕获的
+   * turn 摘下台面(currentTurn / watchdog context 只在仍指向它时清理),
+   * 第一个 await 之后只使用局部捕获值 —— 不得读写 replacement 的
+   * currentTurn、进程、watchdog context、状态或全局 reaction 归属。
+   * 任一终态卡片写失败(API 失败或 write-dead/dead-element 短路)且
+   * 提供了 rawFallback 时,只发一次纯文本兜底。 */
+  private async terminalizeDetachedTurn(
+    turn: TurnState,
+    opts: { footerContent: string; settingsSuffix: string; rawFallback?: string },
+  ): Promise<void> {
     if (this.currentTurn === turn) {
       this.currentTurn = null
       if (this.watchdogContext?.turn === turn) this.endWatchdogTurn()
     }
     this.stopFooterStatus(turn)
-    await cardkit.replaceElement(turn.cardId, cards.ELEMENTS.footer, {
+    // rotating 拒绝也不能中止终结 —— 否则旧卡永远停在 streaming 态,
+    // 这正是本 helper 要消除的症状;终态写自身的失败由 onFailure 兜底。
+    if (turn.rotating) await turn.rotating.catch(() => {})
+    this.stopFooterStatus(turn)
+
+    const cardId = turn.cardId
+    let writeFailed = false
+    const onFailure = (): void => {
+      writeFailed = true
+    }
+    await cardkit.flush(cardId)
+    await cardkit.replaceElement(cardId, cards.ELEMENTS.footer, {
       tag: 'markdown',
       element_id: cards.ELEMENTS.footer,
-      content: status,
+      content: opts.footerContent,
+    }, onFailure)
+    cardkit.cancelSummary(cardId)
+    await cardkit.patchSettings(
+      cardId,
+      cards.streamingOffSettings({ suffix: opts.settingsSuffix }),
+      onFailure,
+    )
+    await cardkit.dispose(cardId)
+
+    if (writeFailed && opts.rawFallback) {
+      await feishu.sendTextRaw(this.chatId, opts.rawFallback).catch(() => {})
+    }
+  }
+
+  private async settleCapturedStaleTurn(turn: TurnState): Promise<void> {
+    await this.terminalizeDetachedTurn(turn, {
+      footerContent: '⚪ 本轮已取消 · 后端已切换',
+      settingsSuffix: '⚪ 后端已切换',
     })
-    cardkit.cancelSummary(turn.cardId)
-    await cardkit.patchSettings(turn.cardId, cards.streamingOffSettings({ suffix: '⚪ 后端已切换' }))
-    await cardkit.dispose(turn.cardId)
   }
 
   private async cleanupStaleTurnOpen(opts: {

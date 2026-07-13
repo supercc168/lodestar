@@ -18,6 +18,35 @@ export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort
 export type CollabAgentStates = Record<string, { status?: string }>
 
+export type CodexUserTextSettlement =
+  | { kind: 'ack'; deliveryId: string; threadId: string; turnId: string | null }
+  | { kind: 'rejected'; deliveryId: string; threadId: string | null; error: Error }
+
+export type UserTextDispatch =
+  | { kind: 'queued'; provider: 'claude' }
+  | { kind: 'rejected'; provider: AgentProvider; error: Error }
+  | {
+      // threadId 为 null 表示 pre-init 投递:线程尚未创建,init 成功后
+      // 由 CodexProcess 就地绑定(读取方看到的是绑定后的实时值)。
+      kind: 'turn_start_pending'
+      provider: 'codex'
+      deliveryId: string
+      readonly threadId: string | null
+      settlement: Promise<CodexUserTextSettlement>
+    }
+
+export type AgentResultEvent = {
+  subtype?: string | null
+  is_error?: boolean
+  duration_ms?: number | null
+  usage?: CodexUsage | null
+  error?: string
+  delivery_id?: string
+  thread_id?: string
+  turn_id?: string | null
+  [key: string]: unknown
+}
+
 export const CLAUDE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 export const CLAUDE_EFFORT: ClaudeReasoningEffort = 'max'
 
@@ -49,7 +78,7 @@ export interface AgentProcess extends EventEmitter {
   lastContextTokens: number | null
 
   sendInitialize(): void
-  sendUserText(text: string, files?: string[]): void
+  sendUserText(text: string, files?: string[]): UserTextDispatch
   sendInterrupt(): void
   sendPermissionResponse(
     requestId: string | number,
@@ -92,6 +121,6 @@ export type AgentProcessEventMap = {
   collab_agent_state: { toolUseId: string; agentsStates: CollabAgentStates }
   can_use_tool: CanUseToolRequest
   hook_callback: HookCallbackRequest
-  result: any
+  result: AgentResultEvent
   exit: { code: number | null; signal: string | null; expected: boolean }
 }

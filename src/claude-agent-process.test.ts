@@ -1291,3 +1291,67 @@ describe('Claude executable: third-party API routes bypass the wrapper bin', () 
     expect(executable.description).toBe(`config:${wrapper}`)
   })
 })
+
+describe('Claude sendUserText dispatch contract', () => {
+  function claudeSendFixture(): { proc: any; pushed: any[] } {
+    const proc = Object.create(ClaudeAgentProcess.prototype) as any
+    const pushed: any[] = []
+    proc.alive = true
+    proc.started = true
+    proc.sessionId = 'claude-session-1'
+    proc.pendingInjectedContext = []
+    proc.input = {
+      push: (message: unknown) => {
+        pushed.push(message)
+      },
+    }
+    return { proc, pushed }
+  }
+
+  test('a live process queues synchronously without waiting on SDK events', () => {
+    const { proc, pushed } = claudeSendFixture()
+    const dispatch = proc.sendUserText('hello claude', ['/tmp/a.txt'])
+
+    expect(dispatch).toEqual({ kind: 'queued', provider: 'claude' })
+    expect(pushed).toHaveLength(1)
+    expect(pushed[0].message.content[0].text).toBe('[file: /tmp/a.txt]\n\nhello claude')
+  })
+
+  test('a dead process rejects without claiming the input was queued', () => {
+    const { proc, pushed } = claudeSendFixture()
+    proc.alive = false
+
+    const dispatch = proc.sendUserText('hello claude')
+
+    expect(dispatch).toMatchObject({ kind: 'rejected', provider: 'claude' })
+    expect(pushed).toHaveLength(0)
+  })
+
+  test('a failed lazy initialize rejects instead of queueing', () => {
+    const { proc, pushed } = claudeSendFixture()
+    proc.started = false
+    proc.sendInitialize = () => {
+      proc.alive = false
+    }
+
+    const dispatch = proc.sendUserText('hello claude') as any
+
+    expect(dispatch).toMatchObject({ kind: 'rejected', provider: 'claude' })
+    expect(dispatch.error.message).toContain('failed to initialize')
+    expect(pushed).toHaveLength(0)
+  })
+
+  test('an input.push throw rejects and never claims queued', () => {
+    const { proc } = claudeSendFixture()
+    proc.input = {
+      push: () => {
+        throw new Error('input stream closed')
+      },
+    }
+
+    const dispatch = proc.sendUserText('hello claude') as any
+
+    expect(dispatch).toMatchObject({ kind: 'rejected', provider: 'claude' })
+    expect(dispatch.error.message).toBe('input stream closed')
+  })
+})

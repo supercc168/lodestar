@@ -17,6 +17,7 @@ export const sentCards: object[] = []
 export const sentTexts: string[] = []
 export const sentRawTexts: string[] = []
 export const updatedCards: Array<[string, object]> = []
+export const addedReactions: Array<[string, string]> = []
 export const deletedReactions: Array<[string, string]> = []
 export const boundResumes: Array<[string, string, string | undefined]> = []
 export const urgentPushes: Array<[string, string[]]> = []
@@ -29,7 +30,7 @@ export const feishuMockState = {
 }
 
 export function resetFeishuMock(): void {
-  for (const arr of [sentCards, sentTexts, sentRawTexts, updatedCards, deletedReactions, boundResumes, urgentPushes]) {
+  for (const arr of [sentCards, sentTexts, sentRawTexts, updatedCards, addedReactions, deletedReactions, boundResumes, urgentPushes]) {
     arr.length = 0
   }
   projectProfiles.clear()
@@ -59,7 +60,10 @@ mock.module('./feishu', () => ({
   deleteReaction: async (messageId: string, reactionId: string) => {
     deletedReactions.push([messageId, reactionId])
   },
-  addReaction: async () => '',
+  addReaction: async (messageId: string, reactionType: string) => {
+    addedReactions.push([messageId, reactionType])
+    return `reaction-${messageId}`
+  },
   urgentApp: async (messageId: string, openIds: string[]) => {
     urgentPushes.push([messageId, openIds])
   },

@@ -20,7 +20,12 @@ import {
   codexModelIsApiRoute,
 } from './codex-models'
 import { log } from './log'
-import { messageOf, withTimeout, type ModelActionResult } from './session-util'
+import {
+  messageOf,
+  withTimeout,
+  type LifecycleLease,
+  type ModelActionResult,
+} from './session-util'
 
 export interface ModelPanelState {
   models: cards.ModelChoice[]
@@ -178,6 +183,11 @@ export function fixedModelChoices(s: Session): cards.ModelChoice[] {
 }
 
 export async function showModelPanel(s: Session): Promise<void> {
+  if (s.hasPreservedWatchdogRecovery()) {
+    await feishu.sendText(s.chatId, '⚠️ thread 自动恢复尚未完成，暂不能切换模型。请先发送 restart 恢复，或 clear/kill 丢弃。')
+    return
+  }
+  const lease = s.beginLifecycle('model')
   const panelId = randomUUID()
   const currentModel = s.currentModelLabel()
   const currentEffort = s.currentEffortLabel()
@@ -190,6 +200,10 @@ export async function showModelPanel(s: Session): Promise<void> {
     currentEffort,
     models: choices,
   }))
+  if (!s.ownsLifecycle(lease) || s.hasPreservedWatchdogRecovery()) {
+    s.modelPanels.delete(panelId)
+    return
+  }
   if (!messageId) {
     s.modelPanels.delete(panelId)
     await feishu.sendTextRaw(s.chatId, '❌ 模型面板发送失败')
@@ -215,6 +229,8 @@ export async function onModelSelect(
   _userOpenId = '',
   actionValue: any = null,
 ): Promise<ModelActionResult> {
+  if (s.hasPreservedWatchdogRecovery()) return interruptedModelSelection(s)
+  const lease = s.beginLifecycle('model')
   const model = modelRaw.trim()
   if (!model) {
     const message = '模型为空'
@@ -231,7 +247,13 @@ export async function onModelSelect(
   // 二元选择:effort 锁死,选了直接应用,跳过 effort 二级面板。
   const effort = choice.efforts[0]?.effort
   if (!effort) return { ok: false, message: '模型未返回 effort' }
-  return onModelEffortSelect(s, model, effort, panelIdRaw, _userOpenId, provider)
+  return onModelEffortSelect(s, model, effort, panelIdRaw, _userOpenId, provider, lease)
+}
+
+function interruptedModelSelection(s: Session): ModelActionResult {
+  return s.hasPreservedWatchdogRecovery()
+    ? { ok: false, message: 'thread 自动恢复尚未完成，暂不能切换模型' }
+    : { ok: false, message: '模型切换已被较新的会话操作取代' }
 }
 
 export async function onModelEffortSelect(
@@ -241,7 +263,13 @@ export async function onModelEffortSelect(
   panelIdRaw = '',
   _userOpenId = '',
   providerRaw = '',
+  lifecycleLease?: LifecycleLease,
 ): Promise<ModelActionResult> {
+  if (s.hasPreservedWatchdogRecovery()) return interruptedModelSelection(s)
+  const lease = lifecycleLease ?? s.beginLifecycle('model')
+  if (!s.ownsLifecycle(lease)) {
+    return interruptedModelSelection(s)
+  }
   const model = modelRaw.trim()
   const effortValue = effortRaw.trim()
   if (!model) return { ok: false, message: '模型为空' }
@@ -309,16 +337,29 @@ export async function onModelEffortSelect(
     s.proc?.isAlive() &&
     s.proc.provider === 'claude' &&
     modelChanged
-  s.modelSwitchPending = true
+  const operation = s.beginModelSwitch(lease)
+  if (!operation) return interruptedModelSelection(s)
+  const settingsProc = s.proc
   try {
-    if (s.proc?.isAlive() && s.proc.provider === provider) {
+    if (settingsProc?.isAlive() && settingsProc.provider === provider) {
       if (!shouldRespawnIdleClaude) {
-        await withTimeout(s.proc.setModelSettings(model, effort), 20_000, 'thread/settings/update')
+        await withTimeout(settingsProc.setModelSettings(model, effort), 20_000, 'thread/settings/update')
       }
     }
-    await s.applyModelSelection(provider, model, effort)
+    if (
+      !s.ownsModelSwitch(operation) ||
+      s.hasPreservedWatchdogRecovery() ||
+      (settingsProc && s.proc !== settingsProc)
+    ) return interruptedModelSelection(s)
+    const applied = await s.applyModelSelection(provider, model, effort, lease)
+    if (applied === false || !s.ownsModelSwitch(operation) || s.hasPreservedWatchdogRecovery()) {
+      return interruptedModelSelection(s)
+    }
     if (shouldRespawnIdleClaude) {
-      await s.stopIdleCurrentProcess('Claude model profile changed; env will apply on next spawn')
+      await s.stopIdleCurrentProcess('Claude model profile changed; env will apply on next spawn', lease)
+      if (!s.ownsModelSwitch(operation) || s.hasPreservedWatchdogRecovery()) {
+        return interruptedModelSelection(s)
+      }
     }
     const scope = modelSelectionScope(s, provider)
     s.modelPanels.delete(panelId)
@@ -334,11 +375,14 @@ export async function onModelEffortSelect(
       }),
     }
   } catch (e) {
+    if (!s.ownsModelSwitch(operation) || s.hasPreservedWatchdogRecovery()) {
+      return interruptedModelSelection(s)
+    }
     const message = `模型切换失败: ${messageOf(e)}`
     log(`session "${s.sessionName}": set model settings failed: ${messageOf(e)}`)
     await feishu.sendText(s.chatId, `❌ ${message}`)
     return { ok: false, message }
   } finally {
-    s.modelSwitchPending = false
+    s.finishModelSwitch(operation)
   }
 }
