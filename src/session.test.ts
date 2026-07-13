@@ -2,15 +2,13 @@ import { EventEmitter } from 'node:events'
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import {
   boundResumes, deletedReactions, projectProfiles, resetFeishuMock,
-  sentCards, sentRawTexts, sentTexts, urgentPushes,
+  modelSelections, sentCards, sentRawTexts, sentTexts, urgentPushes,
 } from './feishu-test-mock'
 
 const { Session } = await import('./session')
 const cardkit = await import('./cardkit')
-const { fixedModelChoices, normalizeFixedModelSelection } = await import('./session-model')
 const { resetTokenSourceRegistry } = await import('./token-source')
 const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
-const { config } = await import('./config')
 const { peekUsage, updateUsageFromRateLimits } = await import('./usage')
 
 interface FetchCall {
@@ -110,6 +108,9 @@ afterEach(() => {
 function turnState(cardId = 'card_session_turn'): any {
   return {
     cardId,
+    provider: 'codex',
+    model: 'gpt-5.6-sol',
+    effort: 'xhigh',
     messageId: 'om_session_turn',
     userOpenId: 'ou_user',
     trigger: 'user_message',
@@ -395,13 +396,52 @@ describe('Session provider switching', () => {
     expect(session.lastSessionId).toBe('claude-session-result')
   })
 
+  test('footer follows the actual Claude process while the persisted target points to Codex', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    proc.lastModel = 'claude:GLM-5.2[1m]'
+    proc.lastEffort = 'max'
+    session.proc = proc
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = 'codex-sub'
+    session.selectedModel = 'gpt-5.6-sol'
+    session.selectedEffort = 'xhigh'
+
+    const footer = session.withModel('Thinking(1s)')
+
+    expect(footer).toContain('Claude · GLM-5.2[1m]/max')
+    expect(footer).not.toContain('gpt-5.6-sol')
+  })
+
+  test('footer keeps the turn snapshot after the persisted target changes', () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.currentTurn = {
+      ...turnState(),
+      provider: 'claude',
+      model: 'claude:GLM-5.2[1m]',
+      effort: 'max',
+    }
+    session.selectedProvider = 'codex'
+    session.selectedModel = 'gpt-5.6-sol'
+    session.selectedEffort = 'xhigh'
+
+    const footer = session.withModel('Writing(2s)')
+
+    expect(footer).toContain('Claude · GLM-5.2[1m]/max')
+    expect(footer).not.toContain('gpt-5.6-sol')
+  })
+
   test('rejects cross-provider model switch while a turn is active', async () => {
     const session = new Session('probe', 'chat_id') as any
     session.proc = new FakeAgentProc('codex', 'codex-thread-1')
     session.selectedProvider = 'codex'
     session.currentTurn = turnState()
+    session.modelPanels.set('panel-glm', { models: [{
+      provider: 'claude', sourceId: 'glm', model: 'GLM-5.2', displayName: 'GLM-5.2',
+      efforts: [{ effort: 'max', isDefault: true }],
+    }] })
 
-    const result = await session.onModelEffortSelect('glm', 'max', '', 'ou_user', 'claude')
+    const result = await session.onModelEffortSelect('GLM-5.2', 'max', 'panel-glm', 'ou_user', 'claude')
 
     expect(result.ok).toBe(false)
     expect(result.message).toContain('正在执行或排队')
@@ -414,17 +454,77 @@ describe('Session provider switching', () => {
     const proc = new FakeAgentProc('claude', 'claude-session-1')
     session.proc = proc
     session.selectedProvider = 'claude'
-    session.selectedModel = 'claude:default'
+    session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-4.7'
+    session.selectedEffort = 'max'
+    session.modelPanels.set('panel-glm', { models: [{
+      provider: 'claude', sourceId: 'glm', model: 'GLM-5.2', displayName: 'GLM-5.2',
+      efforts: [{ effort: 'max', isDefault: true }],
+    }] })
 
-    const result = await session.onModelEffortSelect('glm', 'max', '', 'ou_user', 'claude')
+    const result = await session.onModelEffortSelect('GLM-5.2', 'max', 'panel-glm', 'ou_user', 'claude')
 
     expect(result.ok).toBe(true)
-    expect(session.selectedModel).toBe(null)
+    expect(session.selectedModel).toBe('GLM-5.2')
     expect(session.selectedTokenSourceId).toBe('glm')
     expect(proc.killCalls).toBe(1)
     expect(session.proc).toBeNull()
     expect(proc.setModelSettingsCalls).toEqual([])
     expect(result.card ? JSON.stringify(result.card) : '').toContain('下次启动 Claude')
+  })
+
+  test('reselecting the active GLM model and max effort is idempotent', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'
+    session.selectedEffort = 'max'
+    session.modelPanels.set('panel-glm', { models: [{
+      provider: 'claude', sourceId: 'glm', model: 'GLM-5.2', displayName: 'GLM-5.2',
+      efforts: [{ effort: 'max', isDefault: true, selected: true }],
+    }] })
+
+    const result = await session.onModelEffortSelect('GLM-5.2', 'max', 'panel-glm', 'ou_user', 'claude')
+
+    expect(result.ok).toBe(true)
+    expect(result.message).toContain('当前已是')
+    expect(proc.setModelSettingsCalls).toEqual([])
+    expect(proc.killCalls).toBe(0)
+    expect(session.proc).toBe(proc)
+  })
+
+  test('selecting a model opens the third-level effort card without applying settings', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'
+    session.selectedEffort = 'max'
+    session.modelPanels.set('panel-glm', { models: [{
+      provider: 'claude', sourceId: 'glm', model: 'GLM-5.2', displayName: 'GLM-5.2',
+      efforts: [{ effort: 'high' }, { effort: 'max', isDefault: true }],
+    }] })
+
+    const result = await session.onModelSelect('GLM-5.2', 'panel-glm', 'ou_user', { provider: 'claude' })
+
+    expect(result.ok).toBe(true)
+    expect(result.card ? JSON.stringify(result.card) : '').toContain('选择 effort')
+    expect(session.selectedModel).toBe('GLM-5.2')
+    expect(session.selectedEffort).toBe('max')
+  })
+
+  test('preserves a persisted GLM-5.2 slug instead of rewriting it to a legacy profile key', () => {
+    modelSelections.set('persisted-glm', {
+      provider: 'claude', model: 'GLM-5.2', effort: 'max', tokenSourceId: 'glm',
+    })
+
+    const session = new Session('persisted-glm', 'chat_id') as any
+
+    expect(session.selectedProvider).toBe('claude')
+    expect(session.selectedTokenSourceId).toBe('glm')
+    expect(session.selectedModel).toBe('GLM-5.2')
+    expect(session.selectedEffort).toBe('max')
   })
 
   test('rejects non-fixed Claude model outside the two fixed choices', async () => {

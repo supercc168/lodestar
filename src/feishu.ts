@@ -295,7 +295,7 @@ export function tempChatName(projectName: string): string {
 // writes the provider-aware structured shape.
 export interface SessionModelSelection {
   provider: AgentProvider
-  /** codex 后端走 ~/.codex/config.toml,model 为 null(由 codex 决定);claude 必填。 */
+  /** token source 路径保存用户选中的真实 model slug；旧 Codex 记录可为 null。 */
   model: string | null
   effort: AgentReasoningEffort | null
   /** token source id(账号);新字段,旧数据无(构造时从 provider/model 推导)。 */
@@ -323,9 +323,13 @@ export function loadSessionModelMap(): void {
         ? providerRaw
         : (typeof model === 'string' && model.trim() ? providerFromModel(model) : 'claude')
       const modelStr = typeof model === 'string' && model.trim() ? model : null
-      // codex 走 ~/.codex/config.toml,model 可为空;claude 必须有具体 model,否则丢弃
+      // 兼容旧 Codex 空 model；Claude 必须有具体 model，否则丢弃。
       if (provider === 'claude' && !modelStr) continue
       const effort = (selection as { effort?: unknown }).effort
+      const tokenSourceIdRaw = (selection as { tokenSourceId?: unknown }).tokenSourceId
+      const tokenSourceId = typeof tokenSourceIdRaw === 'string' && tokenSourceIdRaw.trim()
+        ? tokenSourceIdRaw.trim()
+        : null
       const normalizedEffort = provider === 'claude'
         ? isClaudeReasoningEffort(effort) ? effort : null
         : isCodexReasoningEffort(effort) ? effort : null
@@ -333,6 +337,7 @@ export function loadSessionModelMap(): void {
         provider,
         model: modelStr,
         effort: normalizedEffort,
+        ...(tokenSourceId ? { tokenSourceId } : {}),
       })
     }
     log(`feishu: loaded ${selectedModelByName.size} session→model bindings`)

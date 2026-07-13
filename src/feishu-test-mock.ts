@@ -18,6 +18,12 @@ export const sentRawTexts: string[] = []
 export const deletedReactions: Array<[string, string]> = []
 export const boundResumes: Array<[string, string, string | undefined]> = []
 export const urgentPushes: Array<[string, string[]]> = []
+export const modelSelections = new Map<string, {
+  provider: 'codex' | 'claude'
+  model: string | null
+  effort: string | null
+  tokenSourceId?: string | null
+}>()
 /** [projects.<name>] 项目 profile 替身,测试往里 set 后 Session 构造时可查到。 */
 export const projectProfiles = new Map<string, { cwd?: string }>()
 
@@ -26,12 +32,13 @@ export function resetFeishuMock(): void {
     arr.length = 0
   }
   projectProfiles.clear()
+  modelSelections.clear()
 }
 
 mock.module('./feishu', () => ({
   PROJECTS_ROOT: '/tmp/lodestar-projects',
   getSessionResume: () => null,
-  getSessionModelSelection: () => null,
+  getSessionModelSelection: (sessionName: string) => modelSelections.get(sessionName) ?? null,
   getTenantToken: async () => 'tenant-token',
   preferredChatForSession: new Map(),
   sendCard: async (_chatId: string, card: object) => {

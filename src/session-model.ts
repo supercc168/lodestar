@@ -114,7 +114,7 @@ function modelSelectionScope(s: Session, provider: AgentProvider): string {
   return `下次启动 ${agentProviderLabel(provider)} 时使用。`
 }
 
-/** 第2级点模型 → 应用(provider/model/effort)。 */
+/** 第2级点模型 → 第3级 effort 列表。 */
 export async function onModelSelect(
   s: Session,
   modelRaw: string,
@@ -137,12 +137,18 @@ export async function onModelSelect(
   if (choice.enabled === false) {
     return { ok: false, message: `${choice.displayName} 未配置,请先点「启用」` }
   }
-  // effort 由用户点的按钮决定(每个 effort 一个按钮);未带则 fallback default。
-  const effort = (typeof actionValue?.effort === 'string' && actionValue.effort)
-    ? actionValue.effort
-    : (choice.efforts.find(e => e.isDefault)?.effort ?? choice.efforts[0]?.effort)
-  if (!effort) return { ok: false, message: '模型未返回 effort' }
-  return onModelEffortSelect(s, model, effort, panelIdRaw, _userOpenId, provider)
+  if (choice.efforts.length === 0) return { ok: false, message: '模型未返回 effort' }
+  return {
+    ok: true,
+    message: '',
+    card: cards.modelEffortSelectionCard({
+      sessionName: s.sessionName,
+      panelId: panelIdRaw.trim(),
+      currentModel: s.currentModelLabel(),
+      currentEffort: s.currentEffortLabel(),
+      model: choice,
+    }),
+  }
 }
 
 export async function onModelEffortSelect(
@@ -171,6 +177,25 @@ export async function onModelEffortSelect(
   if (!choice || !choice.efforts.some(item => item.effort === effort)) {
     return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在选项中` }
   }
+  const sourceChanged = !!choice.sourceId && s.currentTokenSource()?.id !== choice.sourceId
+  const selectionUnchanged = s.currentProvider() === provider &&
+    !sourceChanged &&
+    s.currentModelLabel() === model &&
+    s.currentEffortLabel() === effort
+  if (selectionUnchanged) {
+    s.modelPanels.delete(panelId)
+    return {
+      ok: true,
+      message: `当前已是 ${agentProviderLabel(provider)} · ${model} / ${effort}`,
+      card: cards.modelResultCard({
+        sessionName: s.sessionName,
+        provider,
+        model,
+        effort,
+        scope: '当前已是此设置，无需变更。',
+      }),
+    }
+  }
   if (
     s.proc?.isAlive() &&
     s.proc.provider !== provider &&
@@ -182,12 +207,13 @@ export async function onModelEffortSelect(
     }
   }
   const modelChanged = s.currentModelLabel() !== model
+  const profileChanged = modelChanged || sourceChanged
   const procBusy = !!(s.currentTurn || s.openingTurn || s.pendingUserMessageCount > 0 || s.pendingMidTurnMsgs.length > 0)
   if (
     provider === 'claude' &&
     s.proc?.isAlive() &&
     s.proc.provider === 'claude' &&
-    modelChanged &&
+    profileChanged &&
     procBusy
   ) {
     return {
@@ -198,11 +224,14 @@ export async function onModelEffortSelect(
   const shouldRespawnIdleClaude = provider === 'claude' &&
     s.proc?.isAlive() &&
     s.proc.provider === 'claude' &&
-    modelChanged
+    profileChanged
   try {
     if (s.proc?.isAlive() && s.proc.provider === provider) {
       if (!shouldRespawnIdleClaude) {
-        await withTimeout(s.proc.setModelSettings(model, effort), 20_000, 'thread/settings/update')
+        const processModel = choice.sourceId
+          ? getTokenSource(choice.sourceId)?.resolveSpawnModel(model) ?? model
+          : model
+        await withTimeout(s.proc.setModelSettings(processModel, effort), 20_000, 'thread/settings/update')
       }
     }
     await s.applyModelSelection(provider, model, effort, choice.sourceId)

@@ -78,6 +78,14 @@ interface ModelSelectionCardOpts {
   models: ModelChoice[]
 }
 
+interface ModelEffortSelectionCardOpts {
+  sessionName: string
+  panelId: string
+  currentModel?: string | null
+  currentEffort?: string | null
+  model: ModelChoice
+}
+
 interface ModelResultPanelOpts {
   sessionName: string
   provider?: AgentProvider
@@ -567,6 +575,10 @@ export function modelSelectionCard(opts: ModelSelectionCardOpts): object {
   return modelCard(opts.sessionName, modelSelectionPanelElement(opts))
 }
 
+export function modelEffortSelectionCard(opts: ModelEffortSelectionCardOpts): object {
+  return modelCard(opts.sessionName, modelEffortSelectionPanelElement(opts))
+}
+
 export function modelResultCard(opts: ModelResultPanelOpts): object {
   return modelCard(opts.sessionName, modelResultPanelElement(opts), 'green')
 }
@@ -586,7 +598,7 @@ function modelCard(sessionName: string, element: object, template = 'turquoise')
 }
 
 export function modelSelectionPanelElement(opts: ModelSelectionCardOpts): object {
-  const modelElements = modelChoiceElements(opts.models, opts.panelId, opts.currentEffort)
+  const modelElements = modelChoiceElements(opts.models, opts.panelId)
   return {
     tag: 'collapsible_panel',
     element_id: ELEMENTS.modelPanel,
@@ -597,12 +609,39 @@ export function modelSelectionPanelElement(opts: ModelSelectionCardOpts): object
         tag: 'markdown',
         content: [
           `当前: ${settingsLine(opts.currentModel, opts.currentEffort)}`,
-          '选模型下方的 effort 按钮即时生效。',
+          '选模型进入 effort 选择。',
         ].join('\n'),
       },
       ...(opts.models.length
         ? modelElements
         : [{ tag: 'markdown', content: '_未返回可用模型列表_' }]),
+    ],
+  }
+}
+
+export function modelEffortSelectionPanelElement(opts: ModelEffortSelectionCardOpts): object {
+  return {
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.modelPanel,
+    header: { title: { tag: 'plain_text', content: '选择 effort' } },
+    expanded: true,
+    elements: [
+      {
+        tag: 'markdown',
+        content: [
+          `模型: ${modelTitle(opts.model)}`,
+          `当前: ${settingsLine(opts.currentModel, opts.currentEffort)}`,
+        ].join('\n'),
+      },
+      ...(opts.model.efforts.length
+        ? opts.model.efforts.map(effort => effortChoiceElement(
+            opts.model,
+            effort,
+            opts.panelId,
+            opts.currentModel,
+            opts.currentEffort,
+          ))
+        : [{ tag: 'markdown', content: '_该模型未返回可用 effort_' }]),
     ],
   }
 }
@@ -624,7 +663,7 @@ export function modelResultPanelElement(opts: ModelResultPanelOpts): object {
   }
 }
 
-function modelChoiceElement(model: ModelChoice, panelId: string, currentEffort?: string | null): object[] {
+function modelChoiceElement(model: ModelChoice, panelId: string): object[] {
   // 未配置 source 的占位项:灰显 + 「启用」按钮
   if (model.enabled === false) {
     return [{
@@ -655,49 +694,44 @@ function modelChoiceElement(model: ModelChoice, panelId: string, currentEffort?:
   const flags = [
     model.isDefault ? `${providerLabel(model.provider)} 默认` : '',
     model.selected ? '当前模型' : '',
-    model.selected && currentEffort ? currentEffort : '',
   ].filter(Boolean)
   const desc = model.description
     ? '\n' + escapeMarkdown(truncate(model.description, 110))
     : ''
-  const nameEl = {
-    tag: 'markdown',
-    content: [
-      title,
-      inlineCode(model.model),
-      flags.length ? flags.join(' · ') : '',
-    ].filter(Boolean).join('\n') + desc,
-  }
-  // effort 按钮组:每个 effort 一个按钮,点 (model, effort) 直接选 —— 不再锁死 default。
-  const effortRow = {
+  const row = {
     tag: 'column_set',
-    columns: model.efforts.map(e => ({
-      tag: 'column', width: 'weighted', weight: 1,
-      elements: [{
-        tag: 'button',
-        text: { tag: 'plain_text', content: e.effort },
-        type: model.selected && currentEffort === e.effort ? 'primary' : 'default',
-        behaviors: [{
-          type: 'callback',
-          value: {
-            kind: 'model_select', panel_id: panelId,
-            ...(model.sourceId ? { source_id: model.sourceId } : {}),
-            ...(model.provider && model.provider !== 'codex' ? { provider: model.provider } : {}),
-            model: model.model, effort: e.effort,
-          },
+    columns: [
+      {
+        tag: 'column', width: 'weighted', weight: 4,
+        elements: [{
+          tag: 'markdown',
+          content: [
+            title,
+            inlineCode(model.model),
+            flags.length ? flags.join(' · ') : '',
+          ].filter(Boolean).join('\n') + desc,
         }],
-      }],
-    })),
+      },
+      {
+        tag: 'column', width: 'weighted', weight: 1,
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: '选' },
+          type: model.selected ? 'primary' : 'default',
+          behaviors: [{ type: 'callback', value: modelSelectActionValue(model, panelId) }],
+        }],
+      },
+    ],
   }
-  return [nameEl, effortRow]
+  return [row]
 }
 
-function modelChoiceElements(models: ModelChoice[], panelId: string, currentEffort?: string | null): object[] {
+function modelChoiceElements(models: ModelChoice[], panelId: string): object[] {
   const groups = [
     { title: 'Codex', models: models.filter(m => (m.provider ?? 'codex') === 'codex') },
     { title: 'Claude Code 后端', models: models.filter(m => m.provider === 'claude') },
   ].filter(group => group.models.length > 0)
-  const flat = (ms: ModelChoice[]) => ms.flatMap(model => modelChoiceElement(model, panelId, currentEffort))
+  const flat = (ms: ModelChoice[]) => ms.flatMap(model => modelChoiceElement(model, panelId))
   if (groups.length <= 1) return flat(models)
   const elements: object[] = []
   for (const group of groups) {
@@ -705,6 +739,52 @@ function modelChoiceElements(models: ModelChoice[], panelId: string, currentEffo
     elements.push(...flat(group.models))
   }
   return elements
+}
+
+function effortChoiceElement(
+  model: ModelChoice,
+  effort: ModelEffortChoice,
+  panelId: string,
+  currentModel?: string | null,
+  currentEffort?: string | null,
+): object {
+  const isCurrent = currentModel === model.model && currentEffort === effort.effort
+  const flags = [effort.isDefault ? '默认' : '', isCurrent ? '当前' : ''].filter(Boolean).join(' · ')
+  return {
+    tag: 'column_set',
+    columns: [
+      {
+        tag: 'column', width: 'weighted', weight: 4,
+        elements: [{
+          tag: 'markdown',
+          content: [
+            `**${escapeMarkdown(effort.effort)}**`,
+            flags,
+            effort.description ? escapeMarkdown(effort.description) : '',
+          ].filter(Boolean).join('\n'),
+        }],
+      },
+      {
+        tag: 'column', width: 'weighted', weight: 1,
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: '选' },
+          type: isCurrent ? 'primary' : 'default',
+          behaviors: [{
+            type: 'callback',
+            value: {
+              kind: 'model_effort_select',
+              panel_id: panelId,
+              ...(model.sourceId ? { source_id: model.sourceId } : {}),
+              ...(model.provider ? { provider: model.provider } : {}),
+              model: model.model,
+              effort: effort.effort,
+            },
+          }],
+        }],
+      },
+    ],
+  }
 }
 
 function modelSelectActionValue(model: ModelChoice, panelId: string): object {

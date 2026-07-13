@@ -5,8 +5,15 @@
  * session-ask.ts, session-permission.ts.
  */
 
+import type { AgentProvider, AgentReasoningEffort } from './agent-process'
+
 export interface TurnState {
   cardId: string
+  /** 本轮开卡时实际运行的后端快照。持久模型选择可指向下一轮，不能反过来
+   * 改写已经在跑的 turn footer。 */
+  provider: AgentProvider
+  model: string | null
+  effort: AgentReasoningEffort
   /** Feishu message_id of the card — needed for urgent_app push on clean
    * turn close. Kept separate from cardId because cardkit's stream APIs
    * operate on card_id but the urgent_app endpoint takes message_id. */

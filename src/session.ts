@@ -390,25 +390,19 @@ export class Session {
     this.selectedProvider = selection?.provider ?? 'claude'
     this.selectedModel = selection?.model ?? null
     this.selectedEffort = selection?.effort ?? null
-    // model 命令已二元化:历史持久化的非固定值归一到固定两项,避免旧
-    // session-model-map 把 session 带到已下线的 profile(如 claude:deepseek)。
-    // 仅在有持久化选择时归一;无选择(默认)保持 null,交给 spawn 默认逻辑。
-    if (selection) {
-      if (this.selectedProvider === 'claude' && this.selectedModel !== 'claude:glm') {
-        this.selectedModel = 'claude:glm'
-        this.selectedEffort = 'max'
-      } else if (this.selectedProvider === 'codex' && this.selectedModel !== null) {
-        // codex 走 ~/.codex/config.toml:model/effort 不在 lodestar 侧固定,归一到 null。
-        // 旧 session-model-map 持久化的 'gpt-5.5' 在此迁移为 null。
-        this.selectedModel = null
-        this.selectedEffort = null
-      }
-    }
     // 推导 tokenSourceId(账号):优先持久化值,否则从 provider/model 映射 registry 的 source。
     // 推导到 token source 后,以 ts.agent 校正 selectedProvider(token source 决定 agent)。
     this.selectedTokenSourceId = this.deriveTokenSourceId(selection)
     const derivedTs = getTokenSource(this.selectedTokenSourceId)
-    if (derivedTs) this.selectedProvider = derivedTs.agent
+    if (derivedTs) {
+      this.selectedProvider = derivedTs.agent
+      // 仅迁移旧版固定 profile 键。新版 token source 持久化真实模型 slug，
+      // 不能再把 GLM-5.2 归一成 claude:glm，否则重启会把错误模型名交给 SDK。
+      if (derivedTs.id === 'glm' && this.selectedModel === 'claude:glm') {
+        this.selectedModel = derivedTs.defaultModel
+        this.selectedEffort = 'max'
+      }
+    }
     if (this.selectedModel) {
       log(`session "${sessionName}": restored selected provider=${this.selectedProvider} model=${this.selectedModel} effort=${this.selectedEffort ?? 'unset'}`)
     }
@@ -464,13 +458,13 @@ export class Session {
   }
 
   private modelForSpawn(): string | undefined {
-    // codex 后端走 ~/.codex/config.toml,不下发 model;claude 用 selectedModel。
+    // 无 token source 的旧 Codex 路径不下发 model；Claude 用 selectedModel。
     if (this.selectedProvider === 'codex') return undefined
     return this.selectedModel ?? undefined
   }
 
   effortForSpawn(): CodexReasoningEffort | undefined {
-    // codex 后端走 ~/.codex/config.toml(model_reasoning_effort),不下发 effort。
+    // 无 token source 的旧 Codex 路径不下发 effort。
     if (this.selectedProvider === 'codex') return undefined
     return CODEX_EFFORT
   }
@@ -493,14 +487,38 @@ export class Session {
       ?? (this.selectedProvider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
   }
 
-  private modelEffortLabel(): string {
-    const model = this.currentModelLabel()
-    const effort = this.currentEffortLabel()
-    return model ? `${model}/${effort}` : effort
+  /** 当前实际进程的显示快照。selected* 是持久目标；只要旧 proc 还活着，
+   * footer/console 就必须显示 proc，而不能提前冒充下一次启动目标。 */
+  private runtimeModelSelection(): Pick<TurnState, 'provider' | 'model' | 'effort'> {
+    const proc = this.proc?.isAlive() ? this.proc : null
+    const provider = proc?.provider ?? this.selectedProvider
+    const selectedMatchesProc = !proc || proc.provider === this.selectedProvider
+    const model = proc?.lastModel
+      ?? (selectedMatchesProc ? this.currentModelLabel() : null)
+    const effort = proc?.lastEffort
+      ?? (selectedMatchesProc
+        ? this.currentEffortLabel()
+        : provider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
+    return { provider, model, effort }
   }
 
-  withModel(text: string): string {
-    const label = this.modelEffortLabel()
+  private modelEffortLabel(
+    selection: Pick<TurnState, 'provider' | 'model' | 'effort'> = this.currentTurn ?? this.runtimeModelSelection(),
+  ): string {
+    const shownModel = selection.provider === 'claude'
+      ? selection.model?.replace(/^claude:/i, '')
+      : selection.model
+    const label = shownModel ? `${shownModel}/${selection.effort}` : selection.effort
+    return selection.provider === 'claude'
+      ? `${agentProviderLabel(selection.provider)} · ${label}`
+      : label
+  }
+
+  withModel(
+    text: string,
+    selection?: Pick<TurnState, 'provider' | 'model' | 'effort'>,
+  ): string {
+    const label = this.modelEffortLabel(selection)
     return text.includes(label) ? text : `${text} · ${label}`
   }
 
@@ -512,16 +530,10 @@ export class Session {
     })
   }
 
-  private modelLine(): string {
-    const model = this.currentModelLabel()
-    const effort = this.currentEffortLabel()
-    // claude 路径:provider 已显示 "Claude",model 去掉 "claude:" 前缀,
-    // 否则 footer 会变成 "Claude · claude:GLM-5.2[1m]/max" 两个 claude。
-    const shownModel = this.selectedProvider === 'claude'
-      ? model?.replace(/^claude:/i, '')
-      : model
-    const label = shownModel ? `${shownModel}/${effort}` : effort
-    return this.selectedProvider === 'claude' ? `${agentProviderLabel(this.selectedProvider)} · ${label}` : label
+  private modelLine(
+    selection?: Pick<TurnState, 'provider' | 'model' | 'effort'>,
+  ): string {
+    return this.modelEffortLabel(selection)
   }
 
   backendLabel(provider: AgentProvider = this.selectedProvider): string {
@@ -577,6 +589,7 @@ export class Session {
     effort: AgentReasoningEffort | null,
     tokenSourceId?: string,
   ): Promise<void> {
+    const previousProvider = this.selectedProvider
     this.selectedProvider = provider
     // 有 token source 时:用 source.id;model/effort 走 ts.defaultModel(真实模型,非 SDK alias)
     this.selectedTokenSourceId = tokenSourceId ?? this.selectedTokenSourceId
@@ -590,7 +603,10 @@ export class Session {
       this.selectedEffort = provider === 'codex' ? null : effort
     }
     this.lastSessionId = feishu.getSessionResume(this.sessionName, provider)
-    feishu.clearTurnAnchors(this.sessionName)  // provider 切换 → 旧 provider 的 assistant uuid 配不上新 sid,清锚点
+    if (previousProvider !== provider) {
+      // provider 切换 → 旧 provider 的 assistant uuid 配不上新 sid,清锚点。
+      feishu.clearTurnAnchors(this.sessionName)
+    }
     feishu.bindSessionModel(this.sessionName, provider, this.selectedModel, this.selectedEffort, this.selectedTokenSourceId)
     await this.stopIdleMismatchedProcess()
   }
@@ -1306,12 +1322,13 @@ export class Session {
     glmUsage?: GlmUsageSnapshot,
   ): Promise<cards.ConsoleOpts> {
     const sysinfo = await readSysInfo()
+    const runtime = this.runtimeModelSelection()
     return {
       sessionName: this.sessionName,
       status: this.status,
-      provider: this.selectedProvider,
-      model: this.currentModelLabel() ?? undefined,
-      effort: this.currentEffortLabel(),
+      provider: runtime.provider,
+      model: runtime.model ?? undefined,
+      effort: runtime.effort,
       worktreeInstructionNotice: this.worktreeInstructionLoadedNotice(),
       peers: [...Session.all]
         .filter(s => s.isRunning())
@@ -1334,10 +1351,13 @@ export class Session {
     //   claude/GLM → src/glm-usage.ts(open.bigmodel.cn / z.ai quota/limit)
     //   codex      → src/usage.ts(codex app-server rate-limit)
     const opts = await this.buildConsoleOpts(undefined)
-    const ts = this.currentTokenSource()
+    const selectedTs = this.currentTokenSource()
+    const ts = selectedTs?.agent === opts.provider
+      ? selectedTs
+      : listTokenSourcesByAgent(opts.provider)[0]
     if (ts) {
       opts.unifiedUsage = await ts.readUsage()
-    } else if (this.currentProvider() === 'claude') {
+    } else if (opts.provider === 'claude') {
       opts.glmUsage = await readGlmUsage()
     } else {
       opts.usage = await readUsage()
@@ -2341,13 +2361,14 @@ export class Session {
     this.pendingTurnInputs = []
     this.lastTurnUserPreview = userInputs[0]?.slice(0, 80) ?? this.lastTurnUserPreview
     log(`session "${this.sessionName}": openTurnCard turn=${turn} trigger=${trigger} inputs=${userInputs.length}`)
-    const initialFooter = this.withModel(opts.initialFooter ?? 'Waiting...(0s)')
+    const turnSelection = this.runtimeModelSelection()
+    const initialFooter = this.withModel(opts.initialFooter ?? 'Waiting...(0s)', turnSelection)
     const card = cards.mainConversationCard({
       sessionName: this.sessionName,
       turn,
-      provider: this.proc?.provider ?? this.selectedProvider,
-      model: this.currentModelLabel() ?? undefined,
-      effort: this.currentEffortLabel(),
+      provider: turnSelection.provider,
+      model: turnSelection.model ?? undefined,
+      effort: turnSelection.effort,
       kind: trigger,
       userInputs,
       initialFooter,
@@ -2390,6 +2411,7 @@ export class Session {
     cardkit.recordCardCreated(cardId, initialElementCount, (code) => this.onCardWriteFailure(code))
     const turnState: TurnState = {
       cardId,
+      ...turnSelection,
       messageId,
       userOpenId,
       trigger,
@@ -2519,9 +2541,9 @@ export class Session {
         const card = cards.mainConversationCard({
           sessionName: this.sessionName,
           turn: this.turnCounter,
-          provider: this.proc?.provider ?? this.selectedProvider,
-          model: this.currentModelLabel() ?? undefined,
-          effort: this.currentEffortLabel(),
+          provider: turn.provider,
+          model: turn.model ?? undefined,
+          effort: turn.effort,
           kind: 'card_full',
           userInputs: [],
         })
@@ -3009,10 +3031,10 @@ export class Session {
    *                纯读不 fetch,避免每轮为一个百分比 spawn codex app-server)
    * 拿不到百分比就返回空串;resetsAt 在未来时追加剩余重置时长
    * (`·[2.3h]`),缺数据不硬凑 —— footer 不假数据 (no_fallbacks)。 */
-  private async footerFiveHourSuffix(): Promise<string> {
+  private async footerFiveHourSuffix(provider: AgentProvider): Promise<string> {
     let pct: number | null = null
     let resetsAt: Date | null = null
-    if (this.proc?.provider === 'claude') {
+    if (provider === 'claude') {
       const g = await readGlmUsage()
       if (g.state === 'ok') {
         pct = g.fiveHour?.percent ?? null
@@ -3090,7 +3112,7 @@ export class Session {
       const ctxMax = this.contextLimitForDisplay()
       // Claude 路径分母已是 SDK 实测窗口、分子是输入侧占用,走纯除法(baseline=0);
       // Codex 路径保留 12K baseline 扣减。
-      const isClaude = this.proc?.provider === 'claude'
+      const isClaude = turn.provider === 'claude'
       const ctxPercent = cards.footerContextPercentLabel(ctxTokens, ctxMax, isClaude ? 0 : undefined)
       if (ctxPercent) line1Parts.push(`🧠 ${ctxPercent}`)
       const cost = this.lastTurnDelta?.costUsd ?? 0
@@ -3098,11 +3120,11 @@ export class Session {
     }
     if (turn.contextCompactCount > 0) line1Parts.push(`🚨 压缩×${turn.contextCompactCount}`)
     if (turn.outboundSentPaths.size > 0) line1Parts.push(`📎 ${turn.outboundSentPaths.size}`)
-    const modelLabel = this.modelLine()
+    const modelLabel = this.modelLine(turn)
     if (modelLabel) line1Parts.push(modelLabel)
     const footerLine1 = line1Parts.join(' ｜ ')
     const footerLine2 = opts.hasFreshResult
-      ? cards.footerTokenDetailLine(this.lastTurnUsage) + (turn.rotateGivenUp ? '' : await this.footerFiveHourSuffix())
+      ? cards.footerTokenDetailLine(this.lastTurnUsage) + (turn.rotateGivenUp ? '' : await this.footerFiveHourSuffix(turn.provider))
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
     await this.replaceFooterContent(cardId, footer)

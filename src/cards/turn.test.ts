@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, modelResultCard, modelResultPanelElement, modelSelectionCard, statusCard, streamingOffSettings } from './console'
+import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, modelEffortSelectionCard, modelResultCard, modelResultPanelElement, modelSelectionCard, statusCard, streamingOffSettings } from './console'
 import {
   askUserQuestionElement,
   contextCompactionElement,
@@ -202,7 +202,7 @@ describe('main conversation card rendering', () => {
     })).toContain('**🤖 当前模型 (Claude)**　`claude:default/high`')
   })
 
-  test('model command card keeps model and effort selection in one replaceable panel', () => {
+  test('model command uses separate model and effort levels in one replaceable panel', () => {
     const currentModel = {
       model: 'gpt-5-codex',
       displayName: 'GPT-5 Codex',
@@ -237,6 +237,24 @@ describe('main conversation card rendering', () => {
         { effort: 'xhigh', description: '', is_default: true },
       ],
     })
+
+    const effortCard = modelEffortSelectionCard({
+      sessionName: 'probe',
+      panelId: 'panel-1',
+      currentModel: 'gpt-5-codex',
+      currentEffort: 'high',
+      model: currentModel,
+    }) as any
+    const effortPanel = effortCard.body.elements[0]
+    expect(effortPanel.header.title.content).toBe('选择 effort')
+    expect(effortPanel.elements[1].columns[1].elements[0].text.content).toBe('选')
+    expect(effortPanel.elements[1].columns[1].elements[0].behaviors[0].value).toEqual({
+      kind: 'model_effort_select',
+      panel_id: 'panel-1',
+      model: 'gpt-5-codex',
+      effort: 'high',
+    })
+    expect(effortPanel.elements[2].columns[1].elements[0].behaviors[0].value.effort).toBe('xhigh')
 
     const resultPanel = modelResultPanelElement({
       sessionName: 'probe',
@@ -282,7 +300,19 @@ describe('main conversation card rendering', () => {
       provider: 'claude',
       model: 'claude:default',
     })
-
+    const effortCard = modelEffortSelectionCard({
+      sessionName: 'probe',
+      panelId: 'panel-claude',
+      currentModel: 'claude:default',
+      currentEffort: 'high',
+      model: claudeModel,
+    }) as any
+    expect(effortCard.body.elements[0].elements[1].columns[1].elements[0].behaviors[0].value).toMatchObject({
+      kind: 'model_effort_select',
+      provider: 'claude',
+      model: 'claude:default',
+      effort: 'high',
+    })
   })
 
   test('model command groups Codex models and Claude backends when both exist', () => {

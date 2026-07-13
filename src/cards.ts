@@ -51,6 +51,8 @@ export {
   providerSelectionCard,
   modelSelectionCard,
   modelSelectionPanelElement,
+  modelEffortSelectionCard,
+  modelEffortSelectionPanelElement,
   modelResultCard,
   modelResultPanelElement,
   statusCard,
