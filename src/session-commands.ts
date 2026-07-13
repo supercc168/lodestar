@@ -170,11 +170,8 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       s.lastUserOpenId = ''
       s.pendingReactionIds = new Map()
       s.currentBatchReactionIds = new Map()
-      // Tag the imminent SDK `result` so the result handler does not
-      // repaint the footer after this stop path already closed the card.
-      // Must be set BEFORE sendInterrupt — the result can land next tick.
-      s.userInterrupted = true
-      s.interrupt()
+      const interrupt = s.beginTurnInterrupt('user')
+      if (!interrupt) log(`session "${s.sessionName}": stop command found no live process`)
       // 主动封口,把 footer 改成 🛑 打断、停止 footer 状态计时、把 streaming_mode
       // 翻回 false,否则卡片会僵在运行中状态。SDK 的 post-interrupt
       // result 也会进 closeTurnCard,但 currentTurn 已被这里置空,那条

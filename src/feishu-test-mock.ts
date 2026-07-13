@@ -59,6 +59,7 @@ mock.module('./feishu', () => ({
   deleteReaction: async (messageId: string, reactionId: string) => {
     deletedReactions.push([messageId, reactionId])
   },
+  addReaction: async () => '',
   urgentApp: async (messageId: string, openIds: string[]) => {
     urgentPushes.push([messageId, openIds])
   },

@@ -103,6 +103,24 @@ export interface WatchdogTurnContext {
   turnId: string | null
 }
 
+type TurnInterruptSource = 'user' | 'watchdog_recover' | 'watchdog_exhausted'
+
+type TurnSettlement =
+  | { type: 'result'; proc: AgentProcess; turn: TurnState | null }
+  | { type: 'exit'; proc: AgentProcess; turn: TurnState | null }
+  | { type: 'cancelled'; reason: string }
+
+type TurnInterruptContext = {
+  source: TurnInterruptSource
+  proc: AgentProcess
+  turn: TurnState | null
+  threadId: string | null
+  turnId: string | null
+  promise: Promise<TurnSettlement>
+  resolve: (outcome: TurnSettlement) => void
+  settled: boolean
+}
+
 interface PendingWatchdogIdentity {
   proc: AgentProcess
   threadId: string | null
@@ -440,11 +458,7 @@ export class Session {
    * claiming the slot, stand down". */
   openingTurn = false
   private turnCounter = 0
-  /** One-shot: user invoked `stop` during the current turn. Set right
-   * before `sendInterrupt`; consumed by the next `result` handler so it
-   * does not overwrite the 🛑 footer already painted by the stop path.
-   * Reset by exit handler for the proc-died-before-result case. */
-  userInterrupted = false
+  activeTurnInterrupt: TurnInterruptContext | null = null
   // Last known resumable thread id. Persisted once a turn starts, so
   // `restart` can resume an in-flight conversation even if the daemon
   // exits before the turn finishes.
@@ -830,6 +844,7 @@ export class Session {
     if (this.proc.provider === this.selectedProvider) return
     if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return
     const proc = this.proc
+    this.cancelTurnInterrupt('idle provider switch')
     log(`session "${this.sessionName}": stop idle ${proc.provider} process after switching to ${this.selectedProvider}`)
     this.proc = null
     this.clearCodexProcessActivityState()
@@ -851,6 +866,7 @@ export class Session {
     if (!this.proc?.isAlive()) return false
     if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return false
     const proc = this.proc
+    this.cancelTurnInterrupt(`idle process stop: ${reason}`)
     log(`session "${this.sessionName}": stop idle ${proc.provider} process: ${reason}`)
     this.proc = null
     this.clearCodexProcessActivityState()
@@ -1215,6 +1231,7 @@ export class Session {
   async stop(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
     const announce = opts.announce ?? true
     const report = opts.onStatus
+    this.cancelTurnInterrupt(`stop: ${reason}`)
     const stoppedAgy = await this.stopAgyTask(`🛑 ${reason}`)
     if (!this.proc) {
       this.status = 'stopped'
@@ -1270,6 +1287,7 @@ export class Session {
   }
 
   async restart(resume = false, opts: LifecycleProgressOpts = {}): Promise<boolean> {
+    this.cancelTurnInterrupt('restart')
     const announce = opts.announce ?? true
     let report = opts.onStatus
     const prevSessionId = this.lastSessionId
@@ -1433,7 +1451,10 @@ export class Session {
 
   /** daemon 解散临时群(bye)时调:从 Session.all registry 移除,避免长期运行的 daemon
    *  因临时群不断建/散而累积孤立 Session 实例(sessions Map 已 delete,但 static all 不会)。 */
-  dispose(): void { Session.all.delete(this) }
+  dispose(): void {
+    this.cancelTurnInterrupt('dispose')
+    Session.all.delete(this)
+  }
 
   /** result 时记一个 turn 锚点:本 turn 最后 assistant uuid + 用户输入预览 + Write 记录。
    *  fk/bk 靠它列"用户输入前的分界点";bk 回滚说明靠其中的 writes。 */
@@ -1669,10 +1690,90 @@ export class Session {
     })()
   }
 
-  interrupt(): void {
-    if (!this.proc) return
-    log(`session "${this.sessionName}": interrupt`)
-    this.proc.sendInterrupt()
+  beginTurnInterrupt(
+    source: TurnInterruptSource,
+    watchdogCtx: WatchdogTurnContext | null = null,
+  ): TurnInterruptContext | null {
+    const proc = this.proc
+    const turn = this.currentTurn
+    if (!proc) return null
+    if (
+      source !== 'user' &&
+      (!watchdogCtx || !turn || !watchdogCtx.threadId || !watchdogCtx.turnId || !this.watchdogContextIsCurrent(watchdogCtx))
+    ) return null
+    if (this.activeTurnInterrupt) {
+      const existing = this.activeTurnInterrupt
+      if (existing.proc !== proc || existing.turn !== turn) return null
+      if (existing.source === source) return existing
+      if (source === 'user') {
+        existing.source = 'user'
+        log(`session "${this.sessionName}": turn interrupt ownership=user`)
+        return existing
+      }
+      return null
+    }
+    let resolve!: (outcome: TurnSettlement) => void
+    const promise = new Promise<TurnSettlement>(done => { resolve = done })
+    const context: TurnInterruptContext = {
+      source,
+      proc,
+      turn,
+      threadId: turn?.backendThreadId ?? proc.sessionId,
+      turnId: turn?.backendTurnId ?? null,
+      promise,
+      resolve,
+      settled: false,
+    }
+    this.activeTurnInterrupt = context
+    log(`session "${this.sessionName}": turn interrupt source=${source}`)
+    proc.sendInterrupt()
+    return context
+  }
+
+  settleTurnInterrupt(proc: AgentProcess, type: 'result' | 'exit'): TurnInterruptContext | null {
+    const context = this.activeTurnInterrupt
+    if (!context || context.settled || context.proc !== proc) return null
+    if (context.source === 'user') {
+      if (this.proc !== proc || (this.currentTurn && this.currentTurn !== context.turn)) return null
+    } else if (this.proc !== proc || this.currentTurn !== context.turn) {
+      return null
+    }
+    if (context.threadId && proc.sessionId !== context.threadId) return null
+    if (context.turn) {
+      if (context.source !== 'user' && context.threadId && context.turn.backendThreadId !== context.threadId) return null
+      if (context.source === 'user' && context.threadId && context.turn.backendThreadId && context.turn.backendThreadId !== context.threadId) return null
+      if (context.turnId && context.turn.backendTurnId !== context.turnId) return null
+    }
+    context.settled = true
+    this.activeTurnInterrupt = null
+    context.resolve({ type, proc, turn: context.turn })
+    return context
+  }
+
+  cancelTurnInterrupt(reason: string): TurnInterruptContext | null {
+    const context = this.activeTurnInterrupt
+    if (!context || context.settled) return null
+    context.settled = true
+    this.activeTurnInterrupt = null
+    context.resolve({ type: 'cancelled', reason })
+    return context
+  }
+
+  async waitForTurnSettlement(
+    context: TurnInterruptContext,
+    graceMs: number,
+  ): Promise<TurnSettlement | { type: 'timeout' }> {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    try {
+      return await Promise.race([
+        context.promise,
+        new Promise<{ type: 'timeout' }>(resolve => {
+          timer = setTimeout(() => resolve({ type: 'timeout' }), Math.max(0, graceMs))
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   }
 
   private async startColdUserTurn(text: string, wireText: string, userOpenId: string): Promise<void> {
@@ -2522,26 +2623,34 @@ export class Session {
       this.proc?.sendHookResponse(req.request_id, {})
     })
     p.on('result', () => {
-      if (this.proc !== p) return
+      if (this.proc !== p && this.activeTurnInterrupt?.proc !== p) {
+        log(`session "${this.sessionName}": ignore stale ${p.provider} result`)
+        return
+      }
+      const pendingInterrupt = this.activeTurnInterrupt
+      const interrupted = this.settleTurnInterrupt(p, 'result')
+      if (interrupted?.source === 'user') {
+        this.discardOrphanAssistant()
+        this.bgResumePending = false
+        const subtype = p.lastResult.subtype ?? 'unknown'
+        const isError = p.lastResult.is_error === true
+        log(`session "${this.sessionName}": SDK result after user stop subtype=${subtype} isError=${isError} — ignored`)
+        this.status = 'idle'
+        return
+      }
+      if (interrupted?.source === 'watchdog_recover' || interrupted?.source === 'watchdog_exhausted') return
+      if (pendingInterrupt?.proc === p) {
+        if (this.activeTurnInterrupt === pendingInterrupt) {
+          this.cancelTurnInterrupt('result no longer owns captured turn')
+        }
+        log(`session "${this.sessionName}": ignore unmatched ${p.provider} result during turn interrupt`)
+        return
+      }
       this.persistResumableSessionId()
       this.accumulateResultStats()
       // result 抢在 openTurnCard 的 await 窗口内到达:标记给开卡 IIFE,
       // 它落地后据此立即收尾(否则卡片悬挂、session 卡在 working)。
       if (this.openingTurn) this.sawResultWhileOpening = true
-      // User just hit `stop` — this result is the SDK closing the in-flight
-      // turn after sendInterrupt landed. The card already shows `🛑 打断`
-      // from the stop path, so skip the rest unconditionally. 被取消轮次的
-      // post-interrupt 尾巴随之作废,不兜底推送。
-      if (this.userInterrupted) {
-        this.userInterrupted = false
-        this.discardOrphanAssistant()
-        this.bgResumePending = false
-        const subtype = this.proc?.lastResult.subtype ?? 'unknown'
-        const isError = this.proc?.lastResult.is_error === true
-        log(`session "${this.sessionName}": SDK result after user stop subtype=${subtype} isError=${isError} — ignored`)
-        this.status = 'idle'
-        return
-      }
       // 整轮无卡且不在开卡中(恢复轮开卡失败):孤儿正文纯文本兜底。开卡
       // 窗口内(openingTurn)不 flush —— 让 openTurnCard 把缓冲并入卡片,
       // 避免又推一遍。有卡的轮次已在开卡时并入,这里 flush 为 no-op。
@@ -2563,7 +2672,7 @@ export class Session {
       }
 
       log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} midBuffer=${this.pendingMidTurnMsgs.length} forcePush=${forcePush}`)
-      // 仅干净的、已完成的 result 记 turn 锚点(被 userInterrupted 的轮不记 ——
+      // 仅干净的、已完成的 result 记 turn 锚点(被用户打断的轮不记 ——
       // 它的 lastAssistantUuid 指向被取消/截断的 assistant,resumeSessionAt 到它可能异常)。
       this.recordTurnAnchor()
       void this.closeTurnCard(suffix, { forcePush, hasFreshResult: true })
@@ -2631,6 +2740,17 @@ export class Session {
     })
     p.on('exit', ({ code, signal, expected }: any) => {
       log(`session "${this.sessionName}": ${p.provider} exited code=${code} signal=${signal} expected=${expected}`)
+      const pendingInterrupt = this.activeTurnInterrupt
+      const interrupted = this.settleTurnInterrupt(p, 'exit')
+      if (interrupted?.source === 'watchdog_recover' || interrupted?.source === 'watchdog_exhausted') {
+        this.proc = null
+        this.status = 'stopped'
+        this.opts.onLifecycleChange?.()
+        return
+      }
+      if (!interrupted && pendingInterrupt?.proc === p && this.activeTurnInterrupt === pendingInterrupt) {
+        this.cancelTurnInterrupt('process exit no longer owns captured turn')
+      }
       if (this.proc !== p) {
         log(`session "${this.sessionName}": ignore stale ${p.provider} exit; current=${this.proc?.provider ?? 'none'}`)
         return
@@ -2665,7 +2785,6 @@ export class Session {
       this.pendingAsks.clear()
       this.pendingHostAsks.clear()
       this.pendingPermissions.clear()
-      this.userInterrupted = false
       this.currentTurnUsageBaseline = null
       this.currentTurnUsageBaselineKnown = false
       this.usageTotalsSeedUnknown = false

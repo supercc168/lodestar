@@ -61,6 +61,8 @@ class FakeAgentProc extends EventEmitter {
   permissionResponses: Array<[string | number, 'allow' | 'deny', unknown]> = []
   hookResponses: Array<[string, object | undefined]> = []
   killCalls = 0
+  interruptCalls = 0
+  onInterrupt: (() => void) | null = null
   setModelSettingsCalls: Array<[string, string]> = []
   alive = true
 
@@ -77,7 +79,10 @@ class FakeAgentProc extends EventEmitter {
     this.sentTexts.push(text)
   }
 
-  sendInterrupt(): void {}
+  sendInterrupt(): void {
+    this.interruptCalls++
+    this.onInterrupt?.()
+  }
   sendPermissionResponse(
     requestId: string | number,
     decision: 'allow' | 'deny',
@@ -208,6 +213,242 @@ function wiredWatchdogSession(provider: 'codex' | 'claude' = 'codex'): {
   session.beginWatchdogTurn(turn, proc)
   return { session, proc, turn }
 }
+
+test('human st still cancels queued work, interrupts once, and owns the stopped footer', async () => {
+  const session = new Session('probe', 'chat_id') as any
+  const proc = new FakeAgentProc('codex', 'thread-1')
+  session.proc = proc
+  session.currentTurn = turnState('card-stop')
+  session.pendingMidTurnMsgs = [
+    { text: 'queued', wireText: 'queued', userOpenId: 'ou_user', msgId: 'om_queued' },
+  ]
+  session.pendingReactionIds.set('om_queued', 'reaction-1')
+  session.wireProc(proc)
+
+  await session.runCommand('st')
+  expect(proc.interruptCalls).toBe(1)
+  expect(session.pendingMidTurnMsgs).toEqual([])
+  expect(session.pendingReactionIds.size).toBe(0)
+  expect(session.currentTurn).toBeNull()
+  proc.emit('result', {})
+  await Promise.resolve()
+  expect(session.currentTurn).toBeNull()
+})
+
+describe('Session shared turn interrupt', () => {
+  test('registers waiter before sendInterrupt and settles a synchronous result', async () => {
+    const { session, proc, turn } = wiredWatchdogSession('codex')
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-interrupt-sync' })
+    proc.onInterrupt = () => proc.emit('result', {})
+    const interrupt = session.beginTurnInterrupt('watchdog_recover', session.watchdogContext)
+    expect(interrupt).not.toBeNull()
+    expect(await interrupt.promise).toMatchObject({ type: 'result', proc, turn })
+    expect(proc.interruptCalls).toBe(1)
+  })
+
+  test('only matching proc and TurnState can settle the waiter', async () => {
+    const { session, proc } = wiredWatchdogSession('codex')
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-interrupt-identity' })
+    const interrupt = session.beginTurnInterrupt('watchdog_recover', session.watchdogContext)
+    const stale = new FakeAgentProc('codex', 'thread-1')
+    expect(session.settleTurnInterrupt(stale, 'result')).toBeNull()
+    expect(session.settleTurnInterrupt(proc, 'result')).toBe(interrupt)
+    expect(await interrupt.promise).toMatchObject({ type: 'result' })
+  })
+
+  test('timeout does not masquerade as result or exit', async () => {
+    const { session, proc } = wiredWatchdogSession('codex')
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-interrupt-timeout' })
+    const interrupt = session.beginTurnInterrupt('watchdog_recover', session.watchdogContext)
+    expect(await session.waitForTurnSettlement(interrupt, 1)).toEqual({ type: 'timeout' })
+  })
+
+  test('duplicate interrupt calls reuse one context and send once', () => {
+    const { session, proc } = wiredWatchdogSession('codex')
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-interrupt-duplicate' })
+    const first = session.beginTurnInterrupt('watchdog_recover', session.watchdogContext)
+    const second = session.beginTurnInterrupt('watchdog_recover', session.watchdogContext)
+    expect(second).toBe(first)
+    expect(proc.interruptCalls).toBe(1)
+  })
+
+  test('a stale result cancels its waiter without touching the replacement turn', async () => {
+    const { session, proc } = wiredWatchdogSession('codex')
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-interrupt-replaced' })
+    const interrupt = session.beginTurnInterrupt('watchdog_recover', session.watchdogContext)
+    const replacement = turnState('card-interrupt-replacement')
+    session.currentTurn = replacement
+
+    proc.emit('result', {})
+
+    expect(session.currentTurn).toBe(replacement)
+    expect(session.activeTurnInterrupt).toBeNull()
+    expect(await interrupt.promise).toEqual({
+      type: 'cancelled',
+      reason: 'result no longer owns captured turn',
+    })
+  })
+
+  test('human st takes ownership of an existing watchdog interrupt without sending twice', async () => {
+    const { session, proc } = wiredWatchdogSession('codex')
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-interrupt-user-takeover' })
+    session.status = 'working'
+    const interrupt = session.beginTurnInterrupt('watchdog_recover', session.watchdogContext)
+
+    await session.runCommand('st')
+    expect(session.activeTurnInterrupt).toBe(interrupt)
+    expect(interrupt.source).toBe('user')
+    expect(proc.interruptCalls).toBe(1)
+
+    proc.emit('result', {})
+    expect(session.status).toBe('idle')
+  })
+
+  test('rejects settlement when the captured watchdog thread identity is cleared', () => {
+    const { session, proc, turn } = wiredWatchdogSession('codex')
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-interrupt-thread-cleared' })
+    const interrupt = session.beginTurnInterrupt('watchdog_recover', session.watchdogContext)
+    turn.backendThreadId = null
+
+    expect(session.settleTurnInterrupt(proc, 'result')).toBeNull()
+    expect(session.activeTurnInterrupt).toBe(interrupt)
+  })
+
+  test('rejects a watchdog interrupt until both backend identities are confirmed', () => {
+    const { session, proc } = wiredWatchdogSession('codex')
+    proc.emit('turn_started', { thread_id: proc.sessionId })
+
+    expect(session.beginTurnInterrupt('watchdog_recover', session.watchdogContext)).toBeNull()
+    expect(proc.interruptCalls).toBe(0)
+  })
+
+  test('rejects a user settlement after process ownership is lost', () => {
+    const session = new Session('interrupt-user-stale-proc', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-user-stale')
+    session.proc = proc
+    session.currentTurn = turnState('card-user-stale-proc')
+    const interrupt = session.beginTurnInterrupt('user')
+    session.currentTurn = null
+    session.proc = null
+
+    expect(session.settleTurnInterrupt(proc, 'result')).toBeNull()
+    expect(session.activeTurnInterrupt).toBe(interrupt)
+  })
+
+  test('stop cancels an active waiter before its first await', async () => {
+    const { session, proc } = wiredWatchdogSession('codex')
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-interrupt-stop-cancel' })
+    const interrupt = session.beginTurnInterrupt('watchdog_recover', session.watchdogContext)
+    let interruptAtFirstAwait: unknown = undefined
+    session.stopAgyTask = async () => {
+      interruptAtFirstAwait = session.activeTurnInterrupt
+      return false
+    }
+
+    await session.stop('test stop', { announce: false })
+
+    expect(interruptAtFirstAwait).toBeNull()
+    expect(await interrupt.promise).toEqual({ type: 'cancelled', reason: 'stop: test stop' })
+  })
+
+  test('restart cancels an active waiter before opening its status card', async () => {
+    const { session, proc } = wiredWatchdogSession('codex')
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-interrupt-restart-cancel' })
+    const interrupt = session.beginTurnInterrupt('watchdog_recover', session.watchdogContext)
+    session.lastSessionId = 'resume-thread'
+    let interruptWhileOpeningStatus: unknown = undefined
+    session.openStatusCard = async () => {
+      interruptWhileOpeningStatus = session.activeTurnInterrupt
+      throw new Error('stop after cancellation probe')
+    }
+
+    await expect(session.restart(true)).rejects.toThrow('stop after cancellation probe')
+
+    expect(interruptWhileOpeningStatus).toBeNull()
+    expect(await interrupt.promise).toEqual({ type: 'cancelled', reason: 'restart' })
+  })
+
+  test('idle provider teardown cancels a stopped turn interrupt and the replacement can interrupt', async () => {
+    const session = new Session('interrupt-idle-provider-switch', 'chat_id') as any
+    const oldProc = new FakeAgentProc('codex', 'thread-idle-old')
+    session.selectedProvider = 'codex'
+    session.proc = oldProc
+    session.currentTurn = turnState('card-idle-old')
+    session.status = 'working'
+    session.wireProc(oldProc)
+
+    await session.runCommand('st')
+    const oldInterrupt = session.activeTurnInterrupt
+    expect(oldInterrupt?.source).toBe('user')
+    let interruptAtKill: unknown = undefined
+    oldProc.kill = async () => {
+      interruptAtKill = session.activeTurnInterrupt
+      oldProc.killCalls++
+      oldProc.alive = false
+      oldProc.emit('exit', { code: 0, signal: null, expected: true })
+    }
+
+    session.selectedProvider = 'claude'
+    await session.stopIdleMismatchedProcess()
+
+    expect(interruptAtKill).toBeNull()
+    expect(session.activeTurnInterrupt).toBeNull()
+    expect(await oldInterrupt.promise).toMatchObject({ type: 'cancelled' })
+
+    const replacement = new FakeAgentProc('claude', 'thread-idle-replacement')
+    session.proc = replacement
+    session.currentTurn = turnState('card-idle-replacement')
+    session.wireProc(replacement)
+
+    expect(session.beginTurnInterrupt('user')).not.toBeNull()
+    expect(replacement.interruptCalls).toBe(1)
+  })
+
+  test('idle current-process teardown cancels a stopped turn interrupt before kill', async () => {
+    const session = new Session('interrupt-idle-current-stop', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'thread-idle-current')
+    session.selectedProvider = 'claude'
+    session.proc = proc
+    session.currentTurn = turnState('card-idle-current')
+    session.status = 'working'
+    session.wireProc(proc)
+
+    await session.runCommand('st')
+    const interrupt = session.activeTurnInterrupt
+    let interruptAtKill: unknown = undefined
+    proc.kill = async () => {
+      interruptAtKill = session.activeTurnInterrupt
+      proc.killCalls++
+      proc.alive = false
+      proc.emit('exit', { code: 0, signal: null, expected: true })
+    }
+
+    await session.stopIdleCurrentProcess('model profile changed')
+
+    expect(interruptAtKill).toBeNull()
+    expect(session.activeTurnInterrupt).toBeNull()
+    expect(await interrupt.promise).toEqual({
+      type: 'cancelled',
+      reason: 'idle process stop: model profile changed',
+    })
+  })
+
+  test('an unmatched exit cancels the captured process interrupt before natural cleanup', async () => {
+    const { session, proc, turn } = wiredWatchdogSession('codex')
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-interrupt-exit-mismatch' })
+    const interrupt = session.beginTurnInterrupt('watchdog_recover', session.watchdogContext)
+    turn.backendThreadId = 'thread-replaced-before-exit'
+
+    proc.emit('exit', { code: 0, signal: null, expected: true })
+
+    expect(session.activeTurnInterrupt).toBeNull()
+    expect(await interrupt.promise).toEqual({
+      type: 'cancelled',
+      reason: 'process exit no longer owns captured turn',
+    })
+    expect(session.proc).toBeNull()
+  })
+})
 
 function confirmSessionNoop(
   proc: FakeAgentProc,
@@ -3246,8 +3487,8 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     cardkit.recordCardCreated('card_live', 1)
 
     try {
-      // 模拟软停止:置 userInterrupted、封口卡片(currentTurn 置空)。
-      session.userInterrupted = true
+      // 模拟软停止:注册 user interrupt、封口卡片(currentTurn 置空)。
+      session.beginTurnInterrupt('user')
       await session.closeTurnCard('🛑 打断')
       expect(session.currentTurn).toBeNull()
 
