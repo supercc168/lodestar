@@ -7,6 +7,7 @@
 import { SERVICE_LABEL, type SysInfo } from '../sysinfo'
 import type { UsageSnapshot } from '../usage'
 import type { GlmUsageSnapshot } from '../glm-usage'
+import type { UsageSnapshotUnified } from '../token-source'
 import type { AgentProvider } from '../agent-process'
 import { ELEMENTS } from './elements'
 
@@ -33,6 +34,9 @@ export interface ConsoleOpts {
   /** GLM Coding Plan 用量快照(claude/GLM 后端)。Undefined → loading 占位。
    * 仅 claude 后端渲染;codex 后端走 usage。按 provider 二选一(方案 C)。 */
   glmUsage?: GlmUsageSnapshot
+  /** 统一用量快照(来自 tokenSource.readUsage)。设了优先用它(取代 usage/glmUsage 二元)。
+   * 加新 token source 的额度自动支持 —— 只要 source.readUsage 返回 unified。 */
+  unifiedUsage?: UsageSnapshotUnified
   /** Host snapshot: CPU 负载、内存、AI-managed systemd 服务。
    * undefined 或字段缺失时明确渲染 `_n/a_`,不假数据。 */
   sysinfo?: SysInfo
@@ -381,13 +385,36 @@ export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.conso
   }
 }
 
-/** 订阅额度行 —— 按当前 provider 渲染 Codex(src/usage.ts)或 GLM
- * (src/glm-usage.ts)那一行,始终一行(方案 C)。复用同一个 element_id,
- * content 随 provider 分流;patch 时也只补当前后端那一个数据源。 */
+/** 统一额度渲染:从 tokenSource.readUsage() 的 UsageSnapshotUnified 渲染。
+ * 取代 consoleUsageContent/consoleGlmUsageContent 二元 —— 加新 token source 的额度
+ * 自动支持(只要它的 readUsage 返回 unified)。失败态按 no_fallbacks 显式 MISS。 */
+export function consoleUnifiedUsageContent(snap: UsageSnapshotUnified | undefined): string {
+  if (snap === undefined) return '**📊 额度**　_加载中…_'
+  switch (snap.state) {
+    case 'no_credentials': return '**📊 额度**　未配置凭据 — 检查 config.toml [token_source.*]'
+    case 'not_applicable': return '**📊 额度**　—(该来源无额度查询)'
+    case 'rate_limited': return '**📊 额度**　API 限流,稍后重试'
+    case 'network': return `**📊 额度**　拉取失败${snap.reason ? ' — `' + snap.reason + '`' : ''}`
+  }
+  const head = snap.planLabel ? `**📊 额度** · ${snap.planLabel}` : '**📊 额度**'
+  const lines: string[] = [head]
+  for (const w of snap.windows) {
+    const parts = [fmtUsagePercent(w.percent)]
+    if (typeof w.used === 'number' && typeof w.total === 'number') parts.push(`${w.used}/${w.total}`)
+    if (w.resetsAt) parts.push(`重置 ${fmtResetIn(w.resetsAt)}`)
+    lines.push(`　· ${w.label}　${parts.join(' · ')}`)
+  }
+  return lines.length === 1 ? '**📊 额度**　_无数据_' : lines.join('\n')
+}
+
+/** 订阅额度行:有 unifiedUsage(tokenSource.readUsage)优先统一渲染;
+ * 否则按 provider 二元回退 Codex/GLM(兼容未配 token source 的旧路径)。 */
 export function consoleUsageElement(opts: ConsoleOpts): object {
-  const content = opts.provider === 'claude'
-    ? consoleGlmUsageContent(opts.glmUsage)
-    : consoleUsageContent(opts.usage)
+  const content = opts.unifiedUsage !== undefined
+    ? consoleUnifiedUsageContent(opts.unifiedUsage)
+    : opts.provider === 'claude'
+      ? consoleGlmUsageContent(opts.glmUsage)
+      : consoleUsageContent(opts.usage)
   return {
     tag: 'markdown',
     element_id: ELEMENTS.consoleUsage,

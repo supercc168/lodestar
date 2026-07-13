@@ -1333,7 +1333,10 @@ export class Session {
     //   claude/GLM → src/glm-usage.ts(open.bigmodel.cn / z.ai quota/limit)
     //   codex      → src/usage.ts(codex app-server rate-limit)
     const opts = await this.buildConsoleOpts(undefined)
-    if (this.currentProvider() === 'claude') {
+    const ts = this.currentTokenSource()
+    if (ts) {
+      opts.unifiedUsage = await ts.readUsage()
+    } else if (this.currentProvider() === 'claude') {
       opts.glmUsage = await readGlmUsage()
     } else {
       opts.usage = await readUsage()
