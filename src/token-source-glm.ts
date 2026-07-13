@@ -14,7 +14,7 @@ import {
   scrubAnthropicEnv,
   registerTokenSourceFactory,
 } from './token-source'
-import { readGlmUsage, type GlmUsageSnapshot, type GlmUsageWindow, type GlmMonthlyWindow } from './glm-usage'
+import { fetchGlmUsage, type GlmUsageSnapshot, type GlmUsageWindow, type GlmMonthlyWindow } from './glm-usage'
 import { fetchGlmModels } from './token-source-models'
 import { log } from './log'
 
@@ -97,9 +97,8 @@ registerTokenSourceFactory({
         return model === 'GLM-5.2' ? 'GLM-5.2[1m]' : model
       },
       async readUsage(): Promise<UsageSnapshotUnified> {
-        // 额度查询走 ~/.claude/settings.json 的 GLM 凭据(glm-usage);
-        // spawn 注入的 config.toml 凭据应与之保持同一份 token。
-        return glmUsageToUnified(await readGlmUsage())
+        // 额度用本 source 的 baseUrl/token 查(不经全局 readGlmUsage 的 settings.json,避免凭据不一致)
+        return glmUsageToUnified(await fetchGlmUsage(baseUrl, token))
       },
     }
     return ts

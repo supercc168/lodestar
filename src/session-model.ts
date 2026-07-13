@@ -110,7 +110,11 @@ function actionProvider(model: string, raw: any): AgentProvider {
 
 function modelSelectionScope(s: Session, provider: AgentProvider): string {
   if (s.currentTurn) return '当前 turn 不变,后续新 turn 使用。'
-  if (s.proc?.isAlive() && s.proc.provider === provider) return '下一轮开始使用。'
+  if (s.proc?.isAlive() && s.proc.provider === provider) {
+    // codex 热切换 setModelSettings no-op(thread/settings/update 踩坑避),需重启进程生效;
+    // claude 冷热都靠 env slots + SDK model,下一轮即生效。
+    return provider === 'codex' ? 'Codex 需重启进程生效(发 restart)。' : '下一轮开始使用。'
+  }
   return `下次启动 ${agentProviderLabel(provider)} 时使用。`
 }
 

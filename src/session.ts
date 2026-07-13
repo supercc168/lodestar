@@ -464,8 +464,13 @@ export class Session {
   }
 
   effortForSpawn(): CodexReasoningEffort | undefined {
-    // 无 token source 的旧 Codex 路径不下发 effort。
-    if (this.selectedProvider === 'codex') return undefined
+    // codex 有 token source(订阅):下发 effort(面板选,冷启动随面板,与 model 下发一致);
+    // 无 ts 旧路径:走 ~/.codex/config.toml。
+    // 热切换 setModelSettings 仍 no-op(thread/settings/update 踩坑避),需重启进程生效。
+    if (this.selectedProvider === 'codex') {
+      if (!this.currentTokenSource()) return undefined
+      return isCodexReasoningEffort(this.selectedEffort) ? this.selectedEffort : CODEX_EFFORT
+    }
     return CODEX_EFFORT
   }
 

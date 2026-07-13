@@ -133,8 +133,10 @@ function parseQuotaLimit(data: any): GlmUsageSnapshotOk {
   }
 }
 
-async function fetchGlmUsage(): Promise<GlmUsageSnapshot> {
-  const env = readClaudeSettingsEnv()
+export async function fetchGlmUsage(baseUrlOverride?: string, tokenOverride?: string): Promise<GlmUsageSnapshot> {
+  const env = (baseUrlOverride && tokenOverride)
+    ? { ANTHROPIC_BASE_URL: baseUrlOverride, ANTHROPIC_AUTH_TOKEN: tokenOverride }
+    : readClaudeSettingsEnv()
   const token = env.ANTHROPIC_AUTH_TOKEN
   const baseUrl = env.ANTHROPIC_BASE_URL || ''
   if (!token) return { state: 'no_credentials' }
