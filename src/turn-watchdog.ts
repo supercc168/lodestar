@@ -23,6 +23,81 @@ export const DEFAULT_CODEX_WATCHDOG: WatchdogSettings = {
   interruptGraceMs: 10_000,
 }
 
+export function parseWatchdogMode(
+  raw: string | undefined,
+  field: string,
+  fallback: WatchdogMode,
+): WatchdogMode {
+  if (raw === undefined || raw === '') return fallback
+  if (raw === 'off' || raw === 'warn' || raw === 'recover_once') return raw
+  throw new Error(`lodestar: ${field} must be off|warn|recover_once, got "${raw}"`)
+}
+
+function parseWatchdogInteger(
+  raw: string | undefined,
+  field: string,
+  fallback: number,
+  min: number,
+  max: number,
+): number {
+  const valueText = raw === undefined || raw === '' ? String(fallback) : raw
+  if (!/^\d+$/.test(valueText)) {
+    throw new Error(`lodestar: ${field} must be an integer in ${min}..${max}, got "${valueText}"`)
+  }
+
+  const value = Number(valueText)
+  if (!Number.isSafeInteger(value) || value < min || value > max) {
+    throw new Error(`lodestar: ${field} must be an integer in ${min}..${max}, got "${valueText}"`)
+  }
+  return value
+}
+
+export function parseWatchdogSettings(
+  section: Record<string, string> = {},
+): WatchdogSettings {
+  const mode = parseWatchdogMode(
+    section.codex_mode,
+    'watchdog.codex_mode',
+    DEFAULT_CODEX_WATCHDOG.mode,
+  )
+  const stallSeconds = parseWatchdogInteger(
+    section.stall_seconds,
+    'watchdog.stall_seconds',
+    DEFAULT_CODEX_WATCHDOG.stallMs / 1_000,
+    60,
+    86_400,
+  )
+  const repeatNoopLimit = parseWatchdogInteger(
+    section.repeat_noop_limit,
+    'watchdog.repeat_noop_limit',
+    DEFAULT_CODEX_WATCHDOG.repeatNoopLimit,
+    3,
+    100,
+  )
+  const silentWarnSeconds = parseWatchdogInteger(
+    section.silent_warn_seconds,
+    'watchdog.silent_warn_seconds',
+    DEFAULT_CODEX_WATCHDOG.silentWarnMs / 1_000,
+    stallSeconds,
+    172_800,
+  )
+  const interruptGraceSeconds = parseWatchdogInteger(
+    section.interrupt_grace_seconds,
+    'watchdog.interrupt_grace_seconds',
+    DEFAULT_CODEX_WATCHDOG.interruptGraceMs / 1_000,
+    1,
+    60,
+  )
+
+  return {
+    mode,
+    stallMs: stallSeconds * 1_000,
+    repeatNoopLimit,
+    silentWarnMs: silentWarnSeconds * 1_000,
+    interruptGraceMs: interruptGraceSeconds * 1_000,
+  }
+}
+
 export type WatchdogTrigger = 'user_message' | 'bg_task_resume' | 'watchdog_resume'
 
 export interface WatchdogSafetySnapshot {

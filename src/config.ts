@@ -21,6 +21,7 @@ import { readFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { resolve } from 'node:path'
 import { CONFIG_FILE } from './paths'
+import { parseWatchdogMode, parseWatchdogSettings, type WatchdogMode } from './turn-watchdog'
 // 纯类型/纯解析从 ./config-parse 引入并对外再导出(保持 './config' 公开 API 不变)。
 // 拆分是为了让解析逻辑的单测可从 './config-parse' 导入,不受 mock.module('./config') 污染。
 import { parseClaudeModelProfile, type ClaudeModelConfig } from './config-parse'
@@ -37,6 +38,13 @@ export interface LodestarConfig {
   notify: {
     bind: string
     port: number
+  }
+  watchdog: {
+    codexMode: WatchdogMode
+    stallMs: number
+    repeatNoopLimit: number
+    silentWarnMs: number
+    interruptGraceMs: number
   }
   /** Env vars injected into the spawned `codex app-server` subprocess.
    * Empty record = no injection; Codex uses the user's ChatGPT login. */
@@ -115,6 +123,8 @@ export interface ProjectProfile {
   /** Read `<cwd>/.mcp.json` and pass its servers to the SDK. Default true
    * (parity with bare `claude`, which discovers project .mcp.json). */
   loadProjectMcp?: boolean
+  /** Optional Codex watchdog mode override for this project. */
+  watchdogMode?: WatchdogMode
 }
 
 function expandTilde(v: string): string {
@@ -183,6 +193,7 @@ function loadConfig(): LodestarConfig {
   if (!Number.isFinite(notifyPort) || notifyPort <= 0 || notifyPort > 65535) {
     throw new Error(`lodestar: [notify].port must be 1..65535, got "${notifyPortRaw}"`)
   }
+  const configWatchdog = parseWatchdogSettings(t.watchdog)
   const envSection = (name: string): Record<string, string> => {
     const section = t[name] ?? {}
     const out: Record<string, string> = {}
@@ -244,8 +255,10 @@ function loadConfig(): LodestarConfig {
       if (!name) continue
       const profile: ProjectProfile = {}
       for (const [rawKey, value] of Object.entries(section)) {
-        if (typeof value !== 'string' || value.length === 0) continue
-        switch (rawKey.trim()) {
+        if (typeof value !== 'string') continue
+        const field = rawKey.trim()
+        if (value.length === 0 && field !== 'watchdog_mode') continue
+        switch (field) {
           case 'cwd':
             if (value.trim()) profile.cwd = resolveProjectPath(value)
             break
@@ -254,6 +267,13 @@ function loadConfig(): LodestarConfig {
           case 'strict_mcp': profile.strictMcp = value === 'true'; break
           case 'tools': profile.tools = value; break
           case 'load_project_mcp': profile.loadProjectMcp = value === 'true'; break
+          case 'watchdog_mode':
+            profile.watchdogMode = parseWatchdogMode(
+              value,
+              `projects.${name}.watchdog_mode`,
+              configWatchdog.mode,
+            )
+            break
         }
       }
       out[name] = profile
@@ -271,6 +291,13 @@ function loadConfig(): LodestarConfig {
     feishu: { app_id: appId, app_secret: appSecret },
     runtime: { projects_root: projectsRoot },
     notify: { bind: notifyBind, port: notifyPort },
+    watchdog: {
+      codexMode: configWatchdog.mode,
+      stallMs: configWatchdog.stallMs,
+      repeatNoopLimit: configWatchdog.repeatNoopLimit,
+      silentWarnMs: configWatchdog.silentWarnMs,
+      interruptGraceMs: configWatchdog.interruptGraceMs,
+    },
     codex: { env: codexEnv, models: codexModelSections() },
     claude: {
       bin: claudeBin,
