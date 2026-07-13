@@ -1779,6 +1779,9 @@ export class Session {
         void cardkit.replaceElement(handle.cardId, cards.BG_ELEMENTS.panel(t.id), cards.backgroundTaskPanel(t, now))
       }
     }
+    // 同步聊天列表预览(config.summary) —— 建卡后任务增减 / 结算都要反映到预览,
+    // 否则 summary 永远停在首任务到达时的"1 进行中"。patchSummaryThrottled 自带节流。
+    cardkit.patchSummaryThrottled(handle.cardId, cards.backgroundLiveSummary(this.backgroundTasks))
   }
 
   /** kill / restart 时强制结算后台任务状态。SDK 子进程一死就不再发 task_settled,

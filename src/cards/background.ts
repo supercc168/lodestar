@@ -433,6 +433,13 @@ export function summarizeBackground(tasks: BgTaskEntry[]): string {
   return terminal ? `${terminal} 已结束` : '空'
 }
 
+/** 聊天列表预览全文(🧭 前缀 + 计数)。活卡建卡(sendCard)与增量刷新(patchSummary)
+ *  共用此函数 —— 否则建卡后 summary 永远停在首任务到达时的"1 进行中",后续任务
+ *  增减 / 结算都不再反映到预览。 */
+export function backgroundLiveSummary(tasks: BgTaskEntry[]): string {
+  return `🧭 后台任务 · ${summarizeBackground(tasks)}`
+}
+
 /** 详情 body —— 精简:仅 error(异常一行) + steps(执行过程,每步一行)。
  *  用量/摘要/prompt 等元信息不入 body(header 状态行已够,后面占行越少越好)。 */
 function renderDetailBody(t: BgTaskEntry): string {
@@ -463,7 +470,7 @@ export function backgroundLiveCard(tasks: BgTaskEntry[], now: number = Date.now(
     schema: '2.0',
     config: {
       streaming_mode: true,
-      summary: { content: `🧭 后台任务 · ${summarizeBackground(tasks)}` },
+      summary: { content: backgroundLiveSummary(tasks) },
     },
     body: {
       elements: tasks.map(t => backgroundTaskPanel(t, now)),
