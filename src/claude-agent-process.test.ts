@@ -58,7 +58,7 @@ describe('Claude model profiles', () => {
     expect(executable.description).toBe(`windows-shell-shim:${shim}`)
   })
 
-  test('passes Windows native executables directly to the SDK', () => {
+  test('win32 native exe falls through to SDK default entry (not passed directly, so dialog tools work)', () => {
     const binDir = 'C:\\Program Files\\ClaudeCode'
     const exe = win32.join(binDir, 'claude.exe')
     const shim = win32.join(binDir, 'claude.cmd')
@@ -68,9 +68,12 @@ describe('Claude model profiles', () => {
       exists: path => path === exe || path === shim,
     })
 
-    expect(executable.pathToClaudeCodeExecutable).toBe(exe)
+    // 走 SDK 默认入口(不显式传 pathToClaudeCodeExecutable):显式传会让 claude 走
+    // CLI stream-json 模式,不下发 AskUserQuestion 等 dialog 工具。SDK 默认入口
+    // 自己解析平台 native binary。见 resolveClaudeExecutableConfig 201-204 注释。
+    expect(executable.pathToClaudeCodeExecutable).toBeUndefined()
     expect(executable.spawnClaudeCodeProcess).toBeUndefined()
-    expect(executable.description).toBe(exe)
+    expect(executable.description).toBe('sdk-default')
   })
 
   test('keeps npm-global, local bins, and existing PATH in Claude spawn PATH', () => {
