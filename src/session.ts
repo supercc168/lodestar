@@ -1272,6 +1272,9 @@ export class Session {
   onModelEffortSelect(modelRaw: string, effortRaw: string, panelIdRaw = '', userOpenId = '', providerRaw = ''): Promise<ModelActionResult> {
     return sessionModel.onModelEffortSelect(this, modelRaw, effortRaw, panelIdRaw, userOpenId, providerRaw)
   }
+  onProviderSelect(sourceIdRaw: string, panelIdRaw = ''): Promise<ModelActionResult> {
+    return sessionModel.onProviderSelect(this, sourceIdRaw, panelIdRaw)
+  }
 
   onWorktreeDisband(slugRaw: string): Promise<WorktreeActionResult> {
     return sessionWorktree.onWorktreeDisband(this, slugRaw)

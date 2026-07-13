@@ -482,6 +482,87 @@ export function menuCard(opts: MenuOpts): object {
   }
 }
 
+export interface ProviderChoice {
+  provider?: AgentProvider
+  sourceId: string
+  display: string
+  enabled: boolean
+  modelCount: number
+  selected?: boolean
+}
+
+interface ProviderSelectionCardOpts {
+  sessionName: string
+  panelId: string
+  currentDisplay?: string | null
+  providers: ProviderChoice[]
+}
+
+/** 第1级 model 面板:选账号(codex订阅/glm)。点 enabled 账号 → 第2级(该账号模型)。 */
+export function providerSelectionCard(opts: ProviderSelectionCardOpts): object {
+  return modelCard(opts.sessionName, {
+    tag: 'collapsible_panel',
+    element_id: ELEMENTS.modelPanel,
+    header: { title: { tag: 'plain_text', content: '选择账号' } },
+    expanded: true,
+    elements: [
+      {
+        tag: 'markdown',
+        content: `当前: ${inlineCode(opts.currentDisplay ?? '未选择')}\n选账号进入模型选择。`,
+      },
+      ...opts.providers.map(p => providerChoiceElement(p, opts.panelId)),
+    ],
+  })
+}
+
+function providerChoiceElement(p: ProviderChoice, panelId: string): object {
+  if (!p.enabled) {
+    return {
+      tag: 'column_set',
+      columns: [
+        {
+          tag: 'column', width: 'weighted', weight: 4,
+          elements: [{ tag: 'markdown', content: `⚙️ **${escapeMarkdown(p.display)}** · 未配置` }],
+        },
+        {
+          tag: 'column', width: 'weighted', weight: 1,
+          elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: '启用' },
+            type: 'primary',
+            behaviors: [{ type: 'callback', value: { kind: 'token_source_enable', source_id: p.sourceId } }],
+          }],
+        },
+      ],
+    }
+  }
+  const flags = [p.selected ? '当前账号' : '', `${p.modelCount} 个模型`].filter(Boolean).join(' · ')
+  return {
+    tag: 'column_set',
+    columns: [
+      {
+        tag: 'column', width: 'weighted', weight: 4,
+        elements: [{ tag: 'markdown', content: `**${escapeMarkdown(p.display)}**\n${flags}` }],
+      },
+      {
+        tag: 'column', width: 'weighted', weight: 1,
+        elements: [{
+          tag: 'button',
+          text: { tag: 'plain_text', content: '选' },
+          type: p.selected ? 'primary' : 'default',
+          behaviors: [{
+            type: 'callback',
+            value: {
+              kind: 'provider_select', panel_id: panelId, source_id: p.sourceId,
+              ...(p.provider ? { provider: p.provider } : {}),
+            },
+          }],
+        }],
+      },
+    ],
+  }
+}
+
 export function modelSelectionCard(opts: ModelSelectionCardOpts): object {
   return modelCard(opts.sessionName, modelSelectionPanelElement(opts))
 }

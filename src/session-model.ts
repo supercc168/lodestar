@@ -1,7 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
 import type { Session } from './session'
-import { listTokenSources } from './token-source'
+import { listTokenSources, getTokenSource, type TokenSource } from './token-source'
 import { isCodexReasoningEffort } from './codex-process'
 import {
   agentProviderLabel,
@@ -19,95 +19,86 @@ export interface ModelPanelState {
   models: cards.ModelChoice[]
 }
 
-/** model 命令选项:从 token source registry 动态枚举(每个 source 一项 = 一个账号)。
- * effort 锁死(每个 source 默认 effort);选了 → applyModelSelection 传 tokenSourceId。 */
-type SourceModelChoice = {
-  provider: AgentProvider
-  sourceId: string
-  model: string
-  displayName: string
-  description: string
-  enabled: boolean
-  efforts: AgentReasoningEffort[]
-  defaultEffort: AgentReasoningEffort
+// ── 第1级:账号(provider)选项 —— 每个 token source 一项 ─────
+function providerChoices(s: Session): cards.ProviderChoice[] {
+  const cur = s.currentTokenSource()
+  const curModel = s.currentModelLabel()
+  return listTokenSources().map(ts => ({
+    provider: ts.agent as AgentProvider,
+    sourceId: ts.id,
+    display: ts.display + (cur?.id === ts.id && curModel ? ` · ${curModel}` : ''),
+    enabled: ts.enabled,
+    modelCount: ts.models.length,
+    selected: cur?.id === ts.id,
+  }))
 }
 
-/** 面板选项:每个 enabled source 展开成它的每个模型(订阅模型列表);未配置 source 占位一项(灰显+启用)。 */
-function tokenSourceChoices(): SourceModelChoice[] {
-  const out: SourceModelChoice[] = []
-  for (const ts of listTokenSources()) {
-    if (!ts.enabled || !ts.models.length) {
-      out.push({
-        provider: ts.agent as AgentProvider,
-        sourceId: ts.id,
-        model: ts.id,
-        displayName: ts.display,
-        description: '未配置 · 点「启用」',
-        enabled: false,
-        efforts: [],
-        defaultEffort: ts.agent === 'codex' ? 'xhigh' : 'max',
-      })
-      continue
-    }
-    for (const m of ts.models) {
-      out.push({
-        provider: ts.agent as AgentProvider,
-        sourceId: ts.id,
-        model: m.model,
-        displayName: m.display,
-        description: ts.display,
-        enabled: true,
-        efforts: m.efforts,
-        defaultEffort: m.defaultEffort,
-      })
-    }
-  }
-  return out
-}
-
-function fixedModelChoices(s: Session): cards.ModelChoice[] {
-  const currentTs = s.currentTokenSource()
-  const currentModel = s.currentModelLabel()
-  const currentEffort = s.currentEffortLabel()
-  return tokenSourceChoices().map(item => {
-    const selected = item.enabled && currentTs?.id === item.sourceId && currentModel === item.model
+// ── 第2级:某账号下的具体模型(点 provider 后展示) ──────────
+function modelChoicesFor(s: Session, ts: TokenSource): cards.ModelChoice[] {
+  const curModel = s.currentModelLabel()
+  const curEffort = s.currentEffortLabel()
+  const isCurrent = s.currentTokenSource()?.id === ts.id
+  return ts.models.map(m => {
+    const selected = isCurrent && curModel === m.model
     return {
-      provider: item.provider,
-      sourceId: item.sourceId,
-      model: item.model,
-      displayName: item.displayName,
-      description: item.description,
-      enabled: item.enabled,
+      provider: ts.agent as AgentProvider,
+      sourceId: ts.id,
+      model: m.model,
+      displayName: m.display,
+      description: ts.display,
+      enabled: true,
       isDefault: false,
       selected,
-      efforts: item.enabled
-        ? item.efforts.map(e => ({
-            effort: e,
-            description: '',
-            isDefault: e === item.defaultEffort,
-            selected: selected && currentEffort === e,
-          }))
-        : [],
+      efforts: m.efforts.map(e => ({
+        effort: e,
+        description: '',
+        isDefault: e === m.defaultEffort,
+        selected: selected && curEffort === e,
+      })),
     }
   })
 }
 
+/** model 命令:发第1级面板(选账号)。点账号 → onProviderSelect 发第2级(该账号模型)。 */
 export async function showModelPanel(s: Session): Promise<void> {
   const panelId = randomUUID()
-  const currentModel = s.currentModelLabel()
-  const currentEffort = s.currentEffortLabel()
-  const choices = fixedModelChoices(s)
-  s.modelPanels.set(panelId, { models: choices })
-  const messageId = await feishu.sendCard(s.chatId, cards.modelSelectionCard({
+  const providers = providerChoices(s)
+  s.modelPanels.set(panelId, { models: [] })  // 第1级;第2级 onProviderSelect 填 models
+  const messageId = await feishu.sendCard(s.chatId, cards.providerSelectionCard({
     sessionName: s.sessionName,
     panelId,
-    currentModel,
-    currentEffort,
-    models: choices,
+    currentDisplay: s.currentTokenSource()?.display ?? s.currentModelLabel(),
+    providers,
   }))
   if (!messageId) {
     s.modelPanels.delete(panelId)
     await feishu.sendTextRaw(s.chatId, '❌ 模型面板发送失败')
+  }
+}
+
+/** 第1级点账号 → 发第2级(该账号的模型列表)。返回第2级卡替换当前卡。 */
+export async function onProviderSelect(
+  s: Session,
+  sourceIdRaw: string,
+  panelIdRaw = '',
+): Promise<ModelActionResult> {
+  const sourceId = sourceIdRaw.trim()
+  const ts = getTokenSource(sourceId)
+  if (!ts) return { ok: false, message: `未知账号: ${sourceId}` }
+  if (!ts.enabled) return { ok: false, message: `${ts.display} 未配置,请先点「启用」` }
+  const panelId = panelIdRaw.trim()
+  const models = modelChoicesFor(s, ts)
+  s.modelPanels.set(panelId, { models })
+  return {
+    ok: true,
+    message: '',
+    card: cards.modelSelectionCard({
+      sessionName: s.sessionName,
+      panelId,
+      currentModel: s.currentModelLabel(),
+      currentEffort: s.currentEffortLabel(),
+      models,
+    }),
   }
 }
 
@@ -123,6 +114,7 @@ function modelSelectionScope(s: Session, provider: AgentProvider): string {
   return `下次启动 ${agentProviderLabel(provider)} 时使用。`
 }
 
+/** 第2级点模型 → 应用(provider/model/effort)。 */
 export async function onModelSelect(
   s: Session,
   modelRaw: string,
@@ -139,7 +131,6 @@ export async function onModelSelect(
   const provider = actionProvider(model, actionValue)
   const choice = s.modelPanels.get(panelIdRaw.trim())?.models
     .find(m => m.model === model && (m.provider ?? 'codex') === provider)
-    ?? fixedModelChoices(s).find(m => m.model === model && m.provider === provider)
   if (!choice) {
     return { ok: false, message: '模型不在当前选项中,请重新发送 model' }
   }
@@ -174,14 +165,9 @@ export async function onModelEffortSelect(
     return { ok: false, message: 'Codex reasoning effort 无效' }
   }
   const effort = effortValue as AgentReasoningEffort
-  // 锁死:只放行 tokenSourceChoices 里该模型支持的 effort(per-model)
-  const fixed = tokenSourceChoices().find(c => c.provider === provider && c.model === model)
-  if (!fixed || !fixed.efforts.includes(effort)) {
-    return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在选项中` }
-  }
   const choice = panel?.models.find(m => m.model === model && (m.provider ?? 'codex') === provider)
-  if (choice && !choice.efforts.some(item => item.effort === effort)) {
-    return { ok: false, message: 'reasoning effort 不属于该模型' }
+  if (!choice || !choice.efforts.some(item => item.effort === effort)) {
+    return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在选项中` }
   }
   if (
     s.proc?.isAlive() &&
@@ -217,7 +203,7 @@ export async function onModelEffortSelect(
         await withTimeout(s.proc.setModelSettings(model, effort), 20_000, 'thread/settings/update')
       }
     }
-    await s.applyModelSelection(provider, model, effort, choice?.sourceId)
+    await s.applyModelSelection(provider, model, effort, choice.sourceId)
     if (shouldRespawnIdleClaude) {
       await s.stopIdleCurrentProcess('Claude model profile changed; env will apply on next spawn')
     }
