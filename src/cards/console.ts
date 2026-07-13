@@ -597,7 +597,7 @@ export function modelSelectionPanelElement(opts: ModelSelectionCardOpts): object
         tag: 'markdown',
         content: [
           `当前: ${settingsLine(opts.currentModel, opts.currentEffort)}`,
-          '选择后立即生效(effort 已按模型锁死)。',
+          '选模型下方的 effort 按钮即时生效。',
         ].join('\n'),
       },
       ...(opts.models.length
@@ -624,10 +624,10 @@ export function modelResultPanelElement(opts: ModelResultPanelOpts): object {
   }
 }
 
-function modelChoiceElement(model: ModelChoice, panelId: string, currentEffort?: string | null): object {
-  // 未配置 source 的占位项:灰显 + 「启用」按钮(不渲染选/effort)
+function modelChoiceElement(model: ModelChoice, panelId: string, currentEffort?: string | null): object[] {
+  // 未配置 source 的占位项:灰显 + 「启用」按钮
   if (model.enabled === false) {
-    return {
+    return [{
       tag: 'column_set',
       columns: [
         {
@@ -647,7 +647,7 @@ function modelChoiceElement(model: ModelChoice, panelId: string, currentEffort?:
           }],
         },
       ],
-    }
+    }]
   }
   const title = model.displayName && model.displayName !== model.model
     ? `**${escapeMarkdown(model.displayName)}**`
@@ -660,35 +660,36 @@ function modelChoiceElement(model: ModelChoice, panelId: string, currentEffort?:
   const desc = model.description
     ? '\n' + escapeMarkdown(truncate(model.description, 110))
     : ''
-  return {
-    tag: 'column_set',
-    columns: [
-      {
-        tag: 'column',
-        width: 'weighted',
-        weight: 4,
-        elements: [{
-          tag: 'markdown',
-          content: [
-            title,
-            inlineCode(model.model),
-            flags.length ? flags.join(' · ') : '',
-          ].filter(Boolean).join('\n') + desc,
-        }],
-      },
-      {
-        tag: 'column',
-        width: 'weighted',
-        weight: 1,
-        elements: [{
-          tag: 'button',
-          text: { tag: 'plain_text', content: '选' },
-          type: model.selected ? 'primary' : 'default',
-          behaviors: [{ type: 'callback', value: modelSelectActionValue(model, panelId) }],
-        }],
-      },
-    ],
+  const nameEl = {
+    tag: 'markdown',
+    content: [
+      title,
+      inlineCode(model.model),
+      flags.length ? flags.join(' · ') : '',
+    ].filter(Boolean).join('\n') + desc,
   }
+  // effort 按钮组:每个 effort 一个按钮,点 (model, effort) 直接选 —— 不再锁死 default。
+  const effortRow = {
+    tag: 'column_set',
+    columns: model.efforts.map(e => ({
+      tag: 'column', width: 'weighted', weight: 1,
+      elements: [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: e.effort },
+        type: model.selected && currentEffort === e.effort ? 'primary' : 'default',
+        behaviors: [{
+          type: 'callback',
+          value: {
+            kind: 'model_select', panel_id: panelId,
+            ...(model.sourceId ? { source_id: model.sourceId } : {}),
+            ...(model.provider && model.provider !== 'codex' ? { provider: model.provider } : {}),
+            model: model.model, effort: e.effort,
+          },
+        }],
+      }],
+    })),
+  }
+  return [nameEl, effortRow]
 }
 
 function modelChoiceElements(models: ModelChoice[], panelId: string, currentEffort?: string | null): object[] {
@@ -696,11 +697,12 @@ function modelChoiceElements(models: ModelChoice[], panelId: string, currentEffo
     { title: 'Codex', models: models.filter(m => (m.provider ?? 'codex') === 'codex') },
     { title: 'Claude Code 后端', models: models.filter(m => m.provider === 'claude') },
   ].filter(group => group.models.length > 0)
-  if (groups.length <= 1) return models.map(model => modelChoiceElement(model, panelId, currentEffort))
+  const flat = (ms: ModelChoice[]) => ms.flatMap(model => modelChoiceElement(model, panelId, currentEffort))
+  if (groups.length <= 1) return flat(models)
   const elements: object[] = []
   for (const group of groups) {
     elements.push({ tag: 'markdown', content: `**${group.title}**` })
-    elements.push(...group.models.map(model => modelChoiceElement(model, panelId, currentEffort)))
+    elements.push(...flat(group.models))
   }
   return elements
 }

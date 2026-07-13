@@ -137,8 +137,10 @@ export async function onModelSelect(
   if (choice.enabled === false) {
     return { ok: false, message: `${choice.displayName} 未配置,请先点「启用」` }
   }
-  // effort 锁死该模型 default effort;要换 effort 重发 model 选。
-  const effort = choice.efforts.find(e => e.isDefault)?.effort ?? choice.efforts[0]?.effort
+  // effort 由用户点的按钮决定(每个 effort 一个按钮);未带则 fallback default。
+  const effort = (typeof actionValue?.effort === 'string' && actionValue.effort)
+    ? actionValue.effort
+    : (choice.efforts.find(e => e.isDefault)?.effort ?? choice.efforts[0]?.effort)
   if (!effort) return { ok: false, message: '模型未返回 effort' }
   return onModelEffortSelect(s, model, effort, panelIdRaw, _userOpenId, provider)
 }
