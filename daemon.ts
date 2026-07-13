@@ -539,6 +539,11 @@ async function handleCardAction(data: any): Promise<any> {
       const result = await session.onTasklistDeleteConfirm(String(value.guid ?? ''))
       return actionCardResponse(result.card)
     }
+    case 'token_source_delete': {
+      const { onTokenSourceDelete } = await import('./src/token-source-ui')
+      await onTokenSourceDelete(session, String(value.id ?? ''))
+      return { toast: { type: 'success', content: '已处理' } }
+    }
     case 'agy_forward_codex': {
       const result = session.beginAgyForwardToCodex(String(value.result_id ?? ''), userId)
       return { toast: { type: result.ok ? 'success' : 'error', content: result.message } }

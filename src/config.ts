@@ -268,3 +268,10 @@ function loadConfig(): LodestarConfig {
 }
 
 export const config = loadConfig()
+
+/** 飞书 config 命令改 [token_source.*] 后重载:重读 config.toml 的 token_sources 节,
+ * 更新 config 单例的 token_sources 字段(其他 feishu/runtime 等字段不动,避免重启)。
+ * 调用方接着调 buildTokenSourcesFromConfig() 重建 registry。 */
+export function reloadTokenSources(): void {
+  config.token_sources = loadConfig().token_sources
+}
