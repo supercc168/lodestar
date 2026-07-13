@@ -1,6 +1,7 @@
 import { randomUUID } from 'node:crypto'
 
 import type { Session } from './session'
+import { listTokenSources } from './token-source'
 import { isCodexReasoningEffort } from './codex-process'
 import {
   agentProviderLabel,
@@ -18,39 +19,26 @@ export interface ModelPanelState {
   models: cards.ModelChoice[]
 }
 
-/** model 命令的二元固定选项:effort 锁死,选了即生效(无 effort 二级面板)。
- * codex = 走 ~/.codex/config.toml(model/effort 不由 lodestar 下发,实际模型由
- * currentModelLabel() 动态显示 codex 返回值);claude = claude:glm (GLM-5.2) / max (ultracode)。
- * claude 的 max 由 ClaudeAgentProcess.setModelSettings 强制 applyFlagSettings,
- * 不依赖 ~/.claude/settings.json 的 effortLevel。 */
-const FIXED_MODEL_CHOICES = [
-  {
-    provider: 'codex' as const,
-    // model 字段仅作面板/回调标识;codex 实际 model/effort 走 ~/.codex/config.toml,
-    // 不由 lodestar 下发。currentModelLabel() 会动态显示 codex 返回的真实模型。
-    model: 'codex',
-    displayName: 'Codex',
-    description: '走 ~/.codex/config.toml 配置(model + effort)',
-    effort: 'xhigh' as AgentReasoningEffort,
-  },
-  {
-    provider: 'claude' as const,
-    model: 'claude:glm',
-    displayName: 'Claude · GLM-5.2',
-    description: 'GLM-5.2 · max (ultracode) 推理强度。',
-    effort: 'max' as AgentReasoningEffort,
-  },
-]
+/** model 命令选项:从 token source registry 动态枚举(每个 source 一项 = 一个账号)。
+ * effort 锁死(每个 source 默认 effort);选了 → applyModelSelection 传 tokenSourceId。 */
+function tokenSourceChoices() {
+  return listTokenSources().map(ts => ({
+    provider: ts.agent as AgentProvider,
+    // model 字段用 source.id 作面板/回调标识;spawn 走 ts.defaultModel(selectedModel 设 null)
+    model: ts.id,
+    displayName: ts.display,
+    description: ts.agent === 'codex' ? 'Codex 订阅' : 'Claude 第三方',
+    effort: ts.models[0]?.defaultEffort ?? (ts.agent === 'codex' ? 'xhigh' : 'max'),
+  }))
+}
 
 function fixedModelChoices(s: Session): cards.ModelChoice[] {
   const currentProvider = s.currentProvider()
-  const currentModel = s.currentModelLabel()
+  const currentTs = s.currentTokenSource()
   const currentEffort = s.currentEffortLabel()
-  return FIXED_MODEL_CHOICES.map(item => {
-    // codex 走 codex 配置,currentModel 是 codex 返回的真实模型(≠ 'codex' 占位),
-    // 故 codex 项只比 provider;claude 项比 provider + model。
-    const selected = currentProvider === item.provider
-      && (item.provider === 'codex' || currentModel === item.model)
+  return tokenSourceChoices().map(item => {
+    // 有 token source 时比 source.id;否则比 provider(兼容未配 ts 的旧路径)
+    const selected = currentTs ? currentTs.id === item.model : currentProvider === item.provider
     return {
       provider: item.provider,
       model: item.model,
@@ -147,11 +135,10 @@ export async function onModelEffortSelect(
     return { ok: false, message: 'Codex reasoning effort 无效' }
   }
   const effort = effortValue as AgentReasoningEffort
-  // 二元锁死:只放行 FIXED_MODEL_CHOICES 的 (provider, model, effort) 组合,
-  // 拒绝旧 effort 回调/伪造把 session 切到非固定项或非锁死 effort。
-  const fixed = FIXED_MODEL_CHOICES.find(c => c.provider === provider && c.model === model)
+  // 锁死:只放行 tokenSourceChoices 的 (provider, model=source.id, effort) 组合
+  const fixed = tokenSourceChoices().find(c => c.provider === provider && c.model === model)
   if (!fixed || fixed.effort !== effort) {
-    return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在固定选项中` }
+    return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在选项中` }
   }
   const choice = panel?.models.find(m => m.model === model && (m.provider ?? 'codex') === provider)
   if (choice && !choice.efforts.some(item => item.effort === effort)) {
@@ -191,7 +178,7 @@ export async function onModelEffortSelect(
         await withTimeout(s.proc.setModelSettings(model, effort), 20_000, 'thread/settings/update')
       }
     }
-    await s.applyModelSelection(provider, model, effort)
+    await s.applyModelSelection(provider, model, effort, model)
     if (shouldRespawnIdleClaude) {
       await s.stopIdleCurrentProcess('Claude model profile changed; env will apply on next spawn')
     }

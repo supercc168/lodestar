@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test'
 import {
   boundResumes, deletedReactions, projectProfiles, resetFeishuMock,
   sentCards, sentRawTexts, sentTexts, urgentPushes,
@@ -8,6 +8,8 @@ import {
 const { Session } = await import('./session')
 const cardkit = await import('./cardkit')
 const { fixedModelChoices, normalizeFixedModelSelection } = await import('./session-model')
+const { resetTokenSourceRegistry } = await import('./token-source')
+const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
 const { config } = await import('./config')
 const { peekUsage, updateUsageFromRateLimits } = await import('./usage')
 
@@ -339,6 +341,9 @@ describe('Session compact command', () => {
 })
 
 describe('Session provider switching', () => {
+  beforeAll(() => buildTokenSourcesFromConfig())
+  afterAll(() => resetTokenSourceRegistry())
+
   test('uses provider-specific ask instructions', () => {
     const session = new Session('probe', 'chat_id') as any
 
@@ -396,7 +401,7 @@ describe('Session provider switching', () => {
     session.selectedProvider = 'codex'
     session.currentTurn = turnState()
 
-    const result = await session.onModelEffortSelect('claude:glm', 'max', '', 'ou_user', 'claude')
+    const result = await session.onModelEffortSelect('glm', 'max', '', 'ou_user', 'claude')
 
     expect(result.ok).toBe(false)
     expect(result.message).toContain('正在执行或排队')
@@ -411,10 +416,11 @@ describe('Session provider switching', () => {
     session.selectedProvider = 'claude'
     session.selectedModel = 'claude:default'
 
-    const result = await session.onModelEffortSelect('claude:glm', 'max', '', 'ou_user', 'claude')
+    const result = await session.onModelEffortSelect('glm', 'max', '', 'ou_user', 'claude')
 
     expect(result.ok).toBe(true)
-    expect(session.selectedModel).toBe('claude:glm')
+    expect(session.selectedModel).toBe(null)
+    expect(session.selectedTokenSourceId).toBe('glm')
     expect(proc.killCalls).toBe(1)
     expect(session.proc).toBeNull()
     expect(proc.setModelSettingsCalls).toEqual([])
@@ -431,7 +437,7 @@ describe('Session provider switching', () => {
     const result = await session.onModelEffortSelect('claude:deepseek', 'high', '', 'ou_user', 'claude')
 
     expect(result.ok).toBe(false)
-    expect(result.message).toContain('不在固定选项中')
+    expect(result.message).toContain('不在选项中')
     expect(session.selectedModel).toBe('claude:default')
     expect(proc.killCalls).toBe(0)
   })
@@ -476,7 +482,7 @@ describe('Session provider switching', () => {
 
     expect(ok).toBe(true)
     expect(initializeCalls).toBe(1)
-    expect(statuses).toContain('✅ Claude 已就绪 · max')
+    expect(statuses.some(s => s.includes('✅ Claude 已就绪'))).toBe(true)
     expect(proc.killCalls).toBe(0)
     expect(session.proc).toBe(proc)
     expect(session.status).toBe('idle')

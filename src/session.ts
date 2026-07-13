@@ -485,7 +485,9 @@ export class Session {
   }
 
   currentModelLabel(): string | null {
-    return this.selectedModel ?? this.proc?.lastModel ?? null
+    // 有 token source 时 fallback 到它声明的真实模型(ts.defaultModel 如 GLM-5.2[1m]),
+    // 而非 proc.lastModel —— 那是 SDK alias(如 'opus'),用户看着像切错了模型。
+    return this.selectedModel ?? this.currentTokenSource()?.defaultModel ?? this.proc?.lastModel ?? null
   }
 
   currentEffortLabel(): AgentReasoningEffort {
@@ -576,15 +578,22 @@ export class Session {
     provider: AgentProvider,
     model: string,
     effort: AgentReasoningEffort | null,
+    tokenSourceId?: string,
   ): Promise<void> {
     this.selectedProvider = provider
-    // codex 走 ~/.codex/config.toml:model/effort 不在 lodestar 侧固定 → 存 null,
-    // currentModelLabel()/currentEffortLabel() 会 fallback 到 codex 返回的真实值。
-    this.selectedModel = provider === 'codex' ? null : model
-    this.selectedEffort = provider === 'codex' ? null : effort
+    // 有 token source 时:用 source.id;model/effort 走 ts.defaultModel(真实模型,非 SDK alias)
+    this.selectedTokenSourceId = tokenSourceId ?? this.selectedTokenSourceId
+    const ts = getTokenSource(this.selectedTokenSourceId)
+    if (ts) {
+      this.selectedModel = null  // currentModelLabel fallback ts.defaultModel
+      this.selectedEffort = ts.models[0]?.defaultEffort ?? effort
+    } else {
+      this.selectedModel = provider === 'codex' ? null : model
+      this.selectedEffort = provider === 'codex' ? null : effort
+    }
     this.lastSessionId = feishu.getSessionResume(this.sessionName, provider)
     feishu.clearTurnAnchors(this.sessionName)  // provider 切换 → 旧 provider 的 assistant uuid 配不上新 sid,清锚点
-    feishu.bindSessionModel(this.sessionName, provider, this.selectedModel, this.selectedEffort)
+    feishu.bindSessionModel(this.sessionName, provider, this.selectedModel, this.selectedEffort, this.selectedTokenSourceId)
     await this.stopIdleMismatchedProcess()
   }
 

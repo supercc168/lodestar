@@ -298,6 +298,8 @@ export interface SessionModelSelection {
   /** codex 后端走 ~/.codex/config.toml,model 为 null(由 codex 决定);claude 必填。 */
   model: string | null
   effort: AgentReasoningEffort | null
+  /** token source id(账号);新字段,旧数据无(构造时从 provider/model 推导)。 */
+  tokenSourceId?: string | null
 }
 
 const selectedModelByName = new Map<string, SessionModelSelection>()
@@ -351,10 +353,11 @@ export function bindSessionModel(
   provider: AgentProvider,
   model: string | null,
   effort: AgentReasoningEffort | null,
+  tokenSourceId?: string | null,
 ): void {
   const prev = selectedModelByName.get(sessionName)
-  if (prev?.provider === provider && prev.model === model && prev.effort === effort) return
-  selectedModelByName.set(sessionName, { provider, model, effort })
+  if (prev?.provider === provider && prev.model === model && prev.effort === effort && (prev.tokenSourceId ?? null) === (tokenSourceId ?? null)) return
+  selectedModelByName.set(sessionName, { provider, model, effort, ...(tokenSourceId ? { tokenSourceId } : {}) })
   saveSessionModelMap()
 }
 
