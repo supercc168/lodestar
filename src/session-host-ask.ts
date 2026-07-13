@@ -164,13 +164,17 @@ async function createOrUpdateHostAskCard(s: Session, askId: string): Promise<voi
 async function maybeContinueHostAsk(s: Session, askId: string): Promise<void> {
   const ask = s.pendingHostAsks.get(askId)
   if (!ask || ask.currentIdx !== undefined || ask.resumeStarted) return
-  if (s.proc?.provider !== 'codex') return
+  const proc = s.proc
+  if (proc?.provider !== 'codex') return
   if (!s.isRunning() || s.currentTurn || s.status !== 'idle') return
   const result = answerPayload(ask)
   if (!result) return
   ask.resumeStarted = true
+  const resetResume = (): void => {
+    if (s.pendingHostAsks.get(askId) === ask) ask.resumeStarted = false
+  }
   try {
-    await s.proc!.injectThreadItems([
+    await proc.injectThreadItems([
       {
         type: 'custom_tool_call',
         call_id: ask.toolCallId,
@@ -184,10 +188,21 @@ async function maybeContinueHostAsk(s: Session, askId: string): Promise<void> {
         output: JSON.stringify(result),
       },
     ])
-    await s.startHostAskContinuation('Continue using the askusr tool result above.')
-    s.pendingHostAsks.delete(askId)
+    if (s.proc !== proc || !proc.isAlive()) {
+      resetResume()
+      return
+    }
+    const continuation = await s.startHostAskContinuation(
+      'Continue using the askusr tool result above.',
+      proc,
+    )
+    if (continuation !== 'started' || s.proc !== proc || !proc.isAlive()) {
+      resetResume()
+      return
+    }
+    if (s.pendingHostAsks.get(askId) === ask) s.pendingHostAsks.delete(askId)
   } catch (e) {
-    ask.resumeStarted = false
+    resetResume()
     const message = e instanceof Error ? e.message : String(e)
     log(`session "${s.sessionName}": host ask continue failed: ${message}`)
     await feishu.sendText(s.chatId, `❌ askusr 续跑失败: ${message}`)

@@ -16,6 +16,19 @@ import {
   usageFromTokenUsagePayload,
 } from './codex-process'
 
+function notificationHarness(): { proc: any; events: Array<[string, any]> } {
+  const proc = Object.create(CodexProcess.prototype) as any
+  const events: Array<[string, any]> = []
+  proc.opts = { workDir: '/tmp' }
+  proc.sessionId = 'thread-structured'
+  proc.emittedImageGenerationIds = new Set()
+  proc.emit = (event: string, payload: unknown) => {
+    events.push([event, payload])
+    return true
+  }
+  return { proc, events }
+}
+
 describe('codex process compaction notifications', () => {
   test('detects explicit thread compaction notifications', () => {
     const notice = contextCompactionNoticeFromNotification('thread/compacted', {
@@ -312,6 +325,187 @@ describe('codex process compaction notifications', () => {
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
+  })
+})
+
+describe('codex structured progress notifications', () => {
+  test('preserves dynamic tool input and camelCase completion content from stdin notifications', () => {
+    const { proc, events } = notificationHarness()
+
+    proc.handleNotification('item/started', {
+      threadId: 'thread-structured',
+      turnId: 'turn-structured',
+      item: {
+        type: 'dynamicToolCall',
+        id: 'call-1',
+        tool: 'exec',
+        arguments: 'text("ready");\n',
+      },
+    })
+    proc.handleNotification('item/completed', {
+      threadId: 'thread-structured',
+      turnId: 'turn-structured',
+      item: {
+        type: 'dynamicToolCall',
+        id: 'call-1',
+        tool: 'exec',
+        success: true,
+        contentItems: [
+          { type: 'inputText', text: 'Script completed\nWall time 0.1 seconds\nOutput:\n' },
+          { type: 'inputText', text: 'ready' },
+        ],
+      },
+    })
+
+    expect(events).toEqual([
+      ['tool_use', {
+        id: 'call-1',
+        name: 'exec',
+        input: 'text("ready");\n',
+      }],
+      ['tool_result', {
+        tool_use_id: 'call-1',
+        content: JSON.stringify([
+          { type: 'inputText', text: 'Script completed\nWall time 0.1 seconds\nOutput:\n' },
+          { type: 'inputText', text: 'ready' },
+        ], null, 2),
+        is_error: false,
+      }],
+    ])
+  })
+
+  test('maps sub-agent activity items without relying on a status field', () => {
+    const { proc, events } = notificationHarness()
+    const shared = {
+      type: 'subAgentActivity',
+      agentThreadId: 'agent-thread-1',
+      agentPath: '/root/worker-1',
+    }
+
+    proc.handleNotification('item/started', {
+      threadId: 'thread-structured',
+      turnId: 'turn-structured',
+      item: { ...shared, id: 'activity-start', kind: 'started' },
+    })
+    proc.handleNotification('item/completed', {
+      threadId: 'thread-structured',
+      turnId: 'turn-structured',
+      item: { ...shared, id: 'activity-interact', kind: 'interacted' },
+    })
+    proc.handleNotification('item/completed', {
+      threadId: 'thread-structured',
+      turnId: 'turn-structured',
+      item: { ...shared, id: 'activity-stop', kind: 'interrupted' },
+    })
+
+    expect(events).toEqual([
+      ['subagent_activity', {
+        activityId: 'activity-start',
+        agentThreadId: 'agent-thread-1',
+        agentPath: '/root/worker-1',
+        kind: 'started',
+      }],
+      ['subagent_activity', {
+        activityId: 'activity-interact',
+        agentThreadId: 'agent-thread-1',
+        agentPath: '/root/worker-1',
+        kind: 'interacted',
+      }],
+      ['subagent_activity', {
+        activityId: 'activity-stop',
+        agentThreadId: 'agent-thread-1',
+        agentPath: '/root/worker-1',
+        kind: 'interrupted',
+      }],
+    ])
+  })
+
+  test('emits collab agent state before preserving the completed tool result', () => {
+    const { proc, events } = notificationHarness()
+    const agentsStates = {
+      'agent-thread-running': { status: 'running' },
+      'agent-thread-completed': { status: 'completed' },
+      'agent-thread-missing': {},
+    }
+
+    proc.handleNotification('item/completed', {
+      threadId: 'thread-structured',
+      turnId: 'turn-structured',
+      item: {
+        type: 'collabAgentToolCall',
+        id: 'collab-1',
+        tool: 'spawn_agent',
+        status: 'completed',
+        agentsStates,
+      },
+    })
+
+    expect(events).toEqual([
+      ['collab_agent_state', { toolUseId: 'collab-1', agentsStates }],
+      ['tool_result', {
+        tool_use_id: 'collab-1',
+        content: JSON.stringify(agentsStates, null, 2),
+        is_error: false,
+      }],
+    ])
+  })
+
+  test.each([
+    ['empty string', ''],
+    ['number', 42],
+  ])('suppresses collab state but preserves the tool result for an invalid %s id', (_label, id) => {
+    const { proc, events } = notificationHarness()
+    const agentsStates = { 'agent-thread-1': { status: 'running' } }
+
+    proc.handleNotification('item/completed', {
+      threadId: 'thread-structured',
+      turnId: 'turn-structured',
+      item: {
+        type: 'collabAgentToolCall',
+        id,
+        tool: 'spawn_agent',
+        status: 'completed',
+        agentsStates,
+      },
+    })
+
+    expect(events.filter(([event]) => event === 'collab_agent_state')).toEqual([])
+    expect(events.filter(([event]) => event === 'tool_result')).toEqual([
+      ['tool_result', {
+        tool_use_id: id,
+        content: JSON.stringify(agentsStates, null, 2),
+        is_error: false,
+      }],
+    ])
+  })
+
+  test.each([
+    ['array payload', []],
+    ['string payload', 'running'],
+    ['number payload', 1],
+    ['non-plain payload', new Date(0)],
+    ['null entry', { 'agent-thread-1': null }],
+    ['array entry', { 'agent-thread-1': [] }],
+    ['string entry', { 'agent-thread-1': 'running' }],
+    ['non-plain entry', { 'agent-thread-1': new Date(0) }],
+    ['non-string status', { 'agent-thread-1': { status: 1 } }],
+  ])('rejects malformed collab agent state %s', (_label, agentsStates) => {
+    const { proc, events } = notificationHarness()
+
+    proc.handleNotification('item/completed', {
+      threadId: 'thread-structured',
+      turnId: 'turn-structured',
+      item: {
+        type: 'collabAgentToolCall',
+        id: 'collab-invalid',
+        tool: 'spawn_agent',
+        status: 'completed',
+        agentsStates,
+      },
+    })
+
+    expect(events.filter(([event]) => event === 'collab_agent_state')).toEqual([])
+    expect(events.filter(([event]) => event === 'tool_result')).toHaveLength(1)
   })
 })
 

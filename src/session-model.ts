@@ -309,6 +309,7 @@ export async function onModelEffortSelect(
     s.proc?.isAlive() &&
     s.proc.provider === 'claude' &&
     modelChanged
+  s.modelSwitchPending = true
   try {
     if (s.proc?.isAlive() && s.proc.provider === provider) {
       if (!shouldRespawnIdleClaude) {
@@ -337,5 +338,7 @@ export async function onModelEffortSelect(
     log(`session "${s.sessionName}": set model settings failed: ${messageOf(e)}`)
     await feishu.sendText(s.chatId, `❌ ${message}`)
     return { ok: false, message }
+  } finally {
+    s.modelSwitchPending = false
   }
 }

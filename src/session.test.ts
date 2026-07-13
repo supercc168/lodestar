@@ -1,12 +1,13 @@
 import { EventEmitter } from 'node:events'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
-  boundResumes, deletedReactions, projectProfiles, resetFeishuMock,
-  sentCards, sentRawTexts, sentTexts, urgentPushes,
+  boundResumes, deletedReactions, feishuMockState, projectProfiles, resetFeishuMock,
+  sentCards, sentRawTexts, sentTexts, updatedCards, urgentPushes,
 } from './feishu-test-mock'
 
 const { Session } = await import('./session')
 const cardkit = await import('./cardkit')
+const sessionHostAsk = await import('./session-host-ask')
 const { fixedModelChoices, normalizeFixedModelSelection, configuredDefaultSelection } = await import('./session-model')
 const { config } = await import('./config')
 const { peekUsage, updateUsageFromRateLimits } = await import('./usage')
@@ -57,6 +58,8 @@ class FakeAgentProc extends EventEmitter {
   }
   lastContextWindow = null
   sentTexts: string[] = []
+  permissionResponses: Array<[string | number, 'allow' | 'deny', unknown]> = []
+  hookResponses: Array<[string, object | undefined]> = []
   killCalls = 0
   setModelSettingsCalls: Array<[string, string]> = []
   alive = true
@@ -75,9 +78,17 @@ class FakeAgentProc extends EventEmitter {
   }
 
   sendInterrupt(): void {}
-  sendPermissionResponse(): void {}
+  sendPermissionResponse(
+    requestId: string | number,
+    decision: 'allow' | 'deny',
+    payload?: unknown,
+  ): void {
+    this.permissionResponses.push([requestId, decision, payload])
+  }
   sendToolResult(): void {}
-  sendHookResponse(): void {}
+  sendHookResponse(requestId: string, output?: object): void {
+    this.hookResponses.push([requestId, output])
+  }
 
   isAlive(): boolean {
     return this.alive
@@ -102,6 +113,13 @@ class FakeAgentProc extends EventEmitter {
 }
 
 afterEach(() => {
+  for (const session of Session.all as Set<any>) {
+    session.endWatchdogTurn()
+    session.stopFooterStatus(session.currentTurn)
+    if (session.watchdogTickHandle) clearInterval(session.watchdogTickHandle)
+    session.watchdogTickHandle = null
+    session.dispose()
+  }
   globalThis.fetch = originalFetch
 })
 
@@ -111,6 +129,8 @@ function turnState(cardId = 'card_session_turn'): any {
     messageId: 'om_session_turn',
     userOpenId: 'ou_user',
     trigger: 'user_message',
+    backendThreadId: null,
+    backendTurnId: null,
     toolCount: 0,
     toolByUseId: new Map(),
     planSteps: [],
@@ -119,6 +139,7 @@ function turnState(cardId = 'card_session_turn'): any {
     goalUpdateCount: 0,
     contextCompactCount: 0,
     contextCompactionPending: new Map(),
+    watchdogSeenCompactionPhases: new Set(),
     readBatches: new Map(),
     openReadBatchI: null,
     assistantSegmentCount: 0,
@@ -129,6 +150,7 @@ function turnState(cardId = 'card_session_turn'): any {
     footerStatusHandle: null,
     footerStatusStartedAt: 0,
     footerStatusLabel: null,
+    footerStatusOverride: null,
     rotating: null,
     rotateCount: 0,
     failureRotateCount: 0,
@@ -138,6 +160,2041 @@ function turnState(cardId = 'card_session_turn'): any {
     hostAskMarkersSeen: new Set(),
   }
 }
+
+function strictExecResult(literal = 'ready'): string {
+  return JSON.stringify([
+    { type: 'inputText', text: 'Script completed\nWall time 0.1 seconds\nOutput:\n' },
+    { type: 'inputText', text: literal },
+  ], null, 2)
+}
+
+let watchdogFixtureCount = 0
+
+const DETERMINISTIC_FOOTER_HANDLE = -1 as unknown as ReturnType<typeof setInterval>
+
+function setDeterministicFooterStatus(turn: any, label: string): void {
+  turn.footerStatusHandle = DETERMINISTIC_FOOTER_HANDLE
+  turn.footerStatusStartedAt = Date.now()
+  turn.footerStatusLabel = label
+}
+
+function useDeterministicFooterStatus(session: any): void {
+  const start = (turn: any, label: string): void => {
+    setDeterministicFooterStatus(turn, label)
+    session.renderFooterStatus(turn)
+  }
+  session.startThinkingFooter = (turn: any) => start(turn, 'Thinking...')
+  session.startWritingFooter = (turn: any) => start(turn, 'Writing...')
+  session.startWorkingFooter = (turn: any) => start(turn, 'Working...')
+}
+
+function wiredWatchdogSession(provider: 'codex' | 'claude' = 'codex'): {
+  session: any
+  proc: FakeAgentProc
+  turn: any
+} {
+  const fixtureId = ++watchdogFixtureCount
+  const sessionName = `watchdog-${provider}-${fixtureId}`
+  projectProfiles.set(sessionName, { watchdogMode: 'warn' })
+  const session = new Session(sessionName, 'chat_id') as any
+  const proc = new FakeAgentProc(provider, `${provider}-thread-1`)
+  const turn = turnState(`card_${provider}_watchdog_${fixtureId}`)
+  session.selectedProvider = provider
+  session.proc = proc
+  session.currentTurn = turn
+  session.turnCounter = 1
+  useDeterministicFooterStatus(session)
+  session.wireProc(proc)
+  session.beginWatchdogTurn(turn, proc)
+  return { session, proc, turn }
+}
+
+function confirmSessionNoop(
+  proc: FakeAgentProc,
+  id = 'noop-1',
+  literal = 'ready',
+): void {
+  proc.emit('tool_use', {
+    id,
+    name: 'exec',
+    input: `text(${JSON.stringify(literal)});\n`,
+    parentToolUseId: null,
+  })
+  proc.emit('tool_result', {
+    tool_use_id: id,
+    content: strictExecResult(literal),
+    is_error: false,
+    parentToolUseId: null,
+  })
+}
+
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+  reject: (reason?: unknown) => void
+} {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((onResolve, onReject) => {
+    resolve = onResolve
+    reject = onReject
+  })
+  return { promise, resolve, reject }
+}
+
+async function waitForHostAskAttempt(ask: { resumeStarted?: boolean }, session: any): Promise<void> {
+  const deadline = Date.now() + 2_000
+  while (session.pendingHostAsks.has('host-ask-race') && ask.resumeStarted !== false) {
+    if (Date.now() >= deadline) throw new Error('host ask continuation did not settle')
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+}
+
+function answeredHostAsk(): any {
+  return {
+    questions: [{ question: 'Pick?', options: [{ label: 'A' }, { label: 'B' }] }],
+    answered: new Map([[0, { optionIdx: 0, user: 'ou_user' }]]),
+    currentIdx: undefined,
+    toolCallId: 'call_host_ask_race',
+    inputJson: '{"questions":[{"question":"Pick?","options":["A","B"]}]}',
+    resumeStarted: false,
+  }
+}
+
+function staleInitOpenFixture(sessionName: string): {
+  session: any
+  oldProc: FakeAgentProc
+  start: () => void
+  openPromise: () => Promise<void>
+} {
+  const session = new Session(sessionName, 'chat_id') as any
+  const oldProc = new FakeAgentProc('codex', `${sessionName}-old-thread`)
+  session.selectedProvider = 'codex'
+  session.proc = oldProc
+  session.pendingUserMessageCount = 1
+  session.pendingTurnInputs = ['old queued input']
+  session.lastUserOpenId = 'ou_old'
+  session.pendingWatchdogIdentity = {
+    proc: oldProc,
+    threadId: oldProc.sessionId,
+    turnId: 'old-turn',
+    turnCounter: null,
+  }
+  session.wireProc(oldProc)
+
+  const realOpenTurnCard = session.openTurnCard.bind(session)
+  let pendingOpen: Promise<void> | null = null
+  session.openTurnCard = (...args: any[]) => {
+    pendingOpen = realOpenTurnCard(...args)
+    return pendingOpen
+  }
+  return {
+    session,
+    oldProc,
+    start: () => oldProc.emit('init', { session_id: oldProc.sessionId }),
+    openPromise: () => {
+      if (!pendingOpen) throw new Error('stale init open did not start')
+      return pendingOpen
+    },
+  }
+}
+
+function replaceOpenProcess(session: any, suffix: string): {
+  nextProc: FakeAgentProc
+  nextTurn: any
+} {
+  const nextProc = new FakeAgentProc('codex', `codex-thread-${suffix}`)
+  const nextTurn = turnState(`card_watchdog_${suffix}`)
+  session.proc = nextProc
+  session.currentTurn = nextTurn
+  session.openingTurn = false
+  session.status = 'starting'
+  session.wireProc(nextProc)
+  return { nextProc, nextTurn }
+}
+
+function expectStaleCardClosed(cardId: string): void {
+  const footerCall = calls.find(call => {
+    if (call.method !== 'PUT' || call.path !== `/cards/${cardId}/elements/footer`) return false
+    const footer = JSON.parse(String(call.body?.element ?? '{}'))
+    return String(footer.content ?? '').includes('后端已切换')
+  })
+  expect(footerCall).toBeDefined()
+  const footer = JSON.parse(String(footerCall?.body?.element ?? '{}'))
+  expect(footer.content).toContain('后端已切换')
+
+  const settingsCall = calls.find(call => {
+    if (call.method !== 'PATCH' || call.path !== `/cards/${cardId}/settings`) return false
+    const settings = JSON.parse(String(call.body?.settings ?? '{}'))
+    return String(settings.config?.summary?.content ?? '').includes('后端已切换')
+  })
+  expect(settingsCall).toBeDefined()
+  const settings = JSON.parse(String(settingsCall?.body?.settings ?? '{}'))
+  expect(settings.config?.streaming_mode).toBe(false)
+  expect(settings.config?.summary?.content).toContain('后端已切换')
+}
+
+describe('Session Codex watchdog turn identity', () => {
+  test('fails closed until the active Codex thread and turn identity are confirmed', () => {
+    const { session, proc, turn } = wiredWatchdogSession()
+
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).currentTurn).toBe(false)
+
+    proc.emit('turn_started', {
+      thread_id: 'codex-thread-1',
+      turn_id: 'codex-turn-1',
+    })
+
+    expect(session.watchdogContext).toMatchObject({
+      proc,
+      turn,
+      threadId: 'codex-thread-1',
+      turnId: 'codex-turn-1',
+    })
+    expect(turn.backendThreadId).toBe('codex-thread-1')
+    expect(turn.backendTurnId).toBe('codex-turn-1')
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).currentTurn).toBe(true)
+  })
+
+  test('uses the exact supplied timestamp when beginning a watchdog turn', () => {
+    projectProfiles.set('watchdog-fixed-time', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-fixed-time', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-fixed-time')
+    const turn = turnState('card_watchdog_fixed_time')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.currentTurn = turn
+    session.turnCounter = 1
+    session.wireProc(proc)
+
+    session.beginWatchdogTurn(turn, proc, 0)
+
+    expect(session.watchdog.snapshot()).toMatchObject({
+      turnKey: 'turn:1',
+      lastMeaningfulAt: 0,
+      lastMeaningfulLabel: 'turn_start',
+    })
+  })
+
+  test('rejects a stale captured context after the active turn is replaced', () => {
+    const { session, proc } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'codex-turn-stale' })
+    const staleContext = session.watchdogContext
+    const replacementTurn = turnState('card_watchdog_replacement')
+    replacementTurn.backendThreadId = proc.sessionId
+    replacementTurn.backendTurnId = 'codex-turn-replacement'
+    session.currentTurn = replacementTurn
+    session.watchdogContext = {
+      proc,
+      turn: replacementTurn,
+      threadId: proc.sessionId,
+      turnId: 'codex-turn-replacement',
+    }
+
+    expect(session.watchdogContextIsCurrent(session.watchdogContext)).toBe(true)
+    expect(session.watchdogContextIsCurrent(staleContext)).toBe(false)
+    expect(session.watchdogSafetySnapshot(staleContext).currentTurn).toBe(false)
+  })
+
+  test('rejects a captured context when the bound process loses its session id', () => {
+    const { session, proc } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'codex-turn-lost-session' })
+    const capturedContext = session.watchdogContext
+    proc.sessionId = null
+
+    expect(session.watchdogContextIsCurrent(capturedContext)).toBe(false)
+    expect(session.watchdogSafetySnapshot(capturedContext).currentTurn).toBe(false)
+  })
+
+  test('requires a live process and the captured backend thread on TurnState', () => {
+    const { session, proc, turn } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'codex-turn-live-thread' })
+    const capturedContext = session.watchdogContext
+
+    turn.backendThreadId = null
+    expect(session.watchdogContextIsCurrent(capturedContext)).toBe(false)
+    turn.backendThreadId = proc.sessionId
+    expect(session.watchdogContextIsCurrent(capturedContext)).toBe(true)
+    turn.backendThreadId = 'codex-thread-replaced'
+    expect(session.watchdogContextIsCurrent(capturedContext)).toBe(false)
+    turn.backendThreadId = proc.sessionId
+    proc.alive = false
+    expect(session.watchdogContextIsCurrent(capturedContext)).toBe(false)
+  })
+
+  test('does not begin watchdog observation for a dead Codex process', () => {
+    projectProfiles.set('watchdog-dead-process', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-dead-process', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-dead')
+    const turn = turnState('card_watchdog_dead_process')
+    proc.alive = false
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.currentTurn = turn
+    session.turnCounter = 1
+
+    session.beginWatchdogTurn(turn, proc, 0)
+
+    expect(session.watchdogContext).toBeNull()
+    expect(session.watchdog.snapshot().turnKey).toBeNull()
+  })
+
+  test('caches an early turn identity while the card is opening and consumes it for the new turn', async () => {
+    projectProfiles.set('watchdog-opening', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-opening', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-opening')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.openingTurn = true
+    session.pendingTurnInputs = ['hello']
+    session.wireProc(proc)
+
+    proc.emit('turn_started', {
+      thread_id: 'codex-thread-opening',
+      turn_id: 'codex-turn-opening',
+    })
+
+    expect(session.pendingWatchdogIdentity).toEqual({
+      proc,
+      threadId: 'codex-thread-opening',
+      turnId: 'codex-turn-opening',
+      turnCounter: null,
+    })
+
+    try {
+      await session.openTurnCard('ou_user', 'user_message', { startThinking: false })
+
+      expect(session.currentTurn).not.toBeNull()
+      expect(session.watchdogContext).toMatchObject({
+        proc,
+        turn: session.currentTurn,
+        threadId: 'codex-thread-opening',
+        turnId: 'codex-turn-opening',
+      })
+      expect(session.currentTurn.backendThreadId).toBe('codex-thread-opening')
+      expect(session.currentTurn.backendTurnId).toBe('codex-turn-opening')
+      expect(session.pendingWatchdogIdentity).toBeNull()
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      if (session.currentTurn) await cardkit.dispose(session.currentTurn.cardId)
+    }
+  })
+
+  test('does not carry an early identity from a failed card open into the next turn', async () => {
+    projectProfiles.set('watchdog-opening-failure', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-opening-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-opening-failure')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.openingTurn = true
+    session.pendingTurnInputs = ['first']
+    session.wireProc(proc)
+    proc.emit('turn_started', {
+      thread_id: 'codex-thread-opening-failure',
+      turn_id: 'stale-turn-id',
+    })
+
+    const healthyFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify({ code: 99, msg: 'boom' }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as typeof fetch
+    await session.openTurnCard('ou_user', 'user_message', { startThinking: false })
+    expect(session.currentTurn).toBeNull()
+
+    globalThis.fetch = healthyFetch
+    session.pendingTurnInputs = ['second']
+    await session.openTurnCard('ou_user', 'user_message', { startThinking: false })
+
+    try {
+      expect(session.currentTurn).not.toBeNull()
+      expect(session.currentTurn.backendTurnId).toBeNull()
+      expect(session.watchdogContext?.turnId).toBeNull()
+      expect(session.watchdogSafetySnapshot(session.watchdogContext).currentTurn).toBe(false)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      if (session.currentTurn) await cardkit.dispose(session.currentTurn.cardId)
+    }
+  })
+
+  test('begins a cold Codex observation only after start succeeds and before footer or user text', async () => {
+    projectProfiles.set('watchdog-cold', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-cold', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-cold')
+    const order: string[] = []
+    session.selectedProvider = 'codex'
+    session.start = async () => {
+      order.push('start')
+      session.proc = proc
+      session.wireProc(proc)
+      return true
+    }
+    session.startThinkingFooter = () => {
+      order.push(session.watchdogContext ? 'footer:observed' : 'footer:unobserved')
+    }
+    proc.sendUserText = (text: string) => {
+      order.push(session.watchdogContext ? `send:observed:${text}` : `send:unobserved:${text}`)
+    }
+
+    try {
+      await session.startColdUserTurn('hello', 'hello', 'ou_user')
+
+      expect(order).toEqual(['start', 'footer:observed', 'send:observed:hello'])
+      expect(session.watchdogContext).toMatchObject({
+        proc,
+        turn: session.currentTurn,
+        threadId: 'codex-thread-cold',
+        turnId: null,
+      })
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      if (session.currentTurn) await cardkit.dispose(session.currentTurn.cardId)
+    }
+  })
+
+  test('does not begin observation for Claude or a project with watchdog off', () => {
+    const { session: claudeSession } = wiredWatchdogSession('claude')
+    expect(claudeSession.watchdog.snapshot().turnKey).toBeNull()
+    expect(claudeSession.watchdogContext).toBeNull()
+
+    projectProfiles.set('watchdog-off', { watchdogMode: 'off' })
+    const offSession = new Session('watchdog-off', 'chat_id') as any
+    const offProc = new FakeAgentProc('codex', 'codex-thread-off')
+    const offTurn = turnState('card_watchdog_off')
+    offSession.selectedProvider = 'codex'
+    offSession.proc = offProc
+    offSession.currentTurn = offTurn
+    offSession.turnCounter = 1
+    offSession.wireProc(offProc)
+    offSession.beginWatchdogTurn(offTurn, offProc)
+
+    expect(offSession.watchdog.snapshot().turnKey).toBeNull()
+    expect(offSession.watchdogContext).toBeNull()
+  })
+})
+
+describe('Session Codex watchdog progress observation', () => {
+  test('counts only a matched exec start/result pair and records backend identity', () => {
+    const { session, proc, turn } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'codex-turn-progress' })
+
+    confirmSessionNoop(proc)
+
+    expect(session.watchdog.snapshot()).toMatchObject({
+      repeatCount: 1,
+      pendingCandidateCount: 0,
+      activeRealToolCount: 0,
+    })
+    expect(turn.backendThreadId).toBe('codex-thread-1')
+    expect(turn.backendTurnId).toBe('codex-turn-progress')
+  })
+
+  test('clears no-op evidence for each meaningful in-memory Codex progress event', () => {
+    const { session, proc, turn } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'codex-turn-meaningful' })
+    let noopIndex = 0
+    const seed = (): void => {
+      confirmSessionNoop(proc, `noop-${++noopIndex}`)
+      expect(session.watchdog.snapshot().repeatCount).toBe(1)
+    }
+    const expectCleared = (label: string): void => {
+      expect(session.watchdog.snapshot()).toMatchObject({
+        repeatCount: 0,
+        fingerprintHash: null,
+        lastMeaningfulLabel: label,
+      })
+    }
+
+    try {
+      seed()
+      proc.emit('assistant_text', { text: 'visible progress' })
+      expectCleared('assistant_text')
+
+      seed()
+      proc.emit('tool_use', { id: 'bash-1', name: 'Bash', input: { command: 'pwd' }, parentToolUseId: null })
+      expectCleared('tool_use:Bash')
+      proc.emit('tool_result', { tool_use_id: 'bash-1', content: 'done', is_error: false, parentToolUseId: null })
+
+      seed()
+      proc.emit('turn_plan_updated', {
+        plan: [{ step: 'Inspect', status: 'inProgress' }],
+        explanation: 'Start here',
+      })
+      expectCleared('turn_plan_updated')
+
+      seed()
+      proc.emit('plan_delta', { itemId: 'plan-1', delta: 'Drafting next step' })
+      expectCleared('plan_delta')
+
+      seed()
+      proc.emit('thread_goal_updated', {
+        objective: 'Ship the watchdog',
+        status: 'active',
+        tokenBudget: 10_000,
+        tokensUsed: 100,
+        timeUsedSeconds: 2,
+      })
+      expectCleared('thread_goal_updated')
+
+      seed()
+      proc.emit('thread_goal_cleared', {})
+      expectCleared('thread_goal_cleared')
+
+      seed()
+      proc.emit('context_compacted', { itemId: 'compact-1', phase: 'start' })
+      expectCleared('context_compaction:start')
+    } finally {
+      session.stopFooterStatus(turn)
+    }
+  })
+
+  test('does not clear no-op evidence for telemetry, blank text, or duplicate structured state', () => {
+    const { session, proc, turn } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'codex-turn-duplicates' })
+    proc.emit('turn_plan_updated', {
+      plan: [{ step: 'Inspect', status: 'inProgress' }],
+      explanation: 'Start here',
+    })
+    proc.emit('thread_goal_updated', {
+      objective: 'Ship the watchdog',
+      status: 'active',
+      tokenBudget: 10_000,
+      tokensUsed: 100,
+      timeUsedSeconds: 2,
+    })
+    proc.emit('context_compacted', { itemId: 'compact-duplicate', phase: 'start' })
+    confirmSessionNoop(proc, 'duplicate-evidence')
+
+    proc.emit('assistant_text', { text: '   \n' })
+    proc.emit('token_usage', { totalUsage: null })
+    proc.emit('rate_limits_updated', {})
+    proc.emit('error', new Error('diagnostic only'))
+    proc.emit('plan_delta', { itemId: 'plan-empty', delta: '' })
+    proc.emit('turn_plan_updated', {
+      plan: [{ step: 'Inspect', status: 'inProgress' }],
+      explanation: 'Start here',
+    })
+    proc.emit('thread_goal_updated', {
+      objective: 'Ship the watchdog',
+      status: 'active',
+      tokenBudget: 10_000,
+      tokensUsed: 999,
+      timeUsedSeconds: 99,
+    })
+    proc.emit('context_compacted', { itemId: 'compact-duplicate', phase: 'start' })
+
+    expect(session.watchdog.snapshot().repeatCount).toBe(1)
+    session.stopFooterStatus(turn)
+  })
+
+  test('ignores every side-effecting event from a replaced process', async () => {
+    const first = wiredWatchdogSession()
+    first.proc.emit('turn_started', { thread_id: first.proc.sessionId, turn_id: 'turn-old' })
+
+    const nextProc = new FakeAgentProc('codex', 'codex-thread-new')
+    nextProc.lastTotalUsage = {
+      input_tokens: 500,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      output_tokens: 50,
+    } as any
+    nextProc.lastResult = {
+      cost_usd: 1,
+      cost_delta_usd: 0.5,
+      duration_ms: 500,
+      num_turns: 1,
+      usage: null,
+      subtype: 'success',
+      is_error: false,
+    }
+    const nextTurn = turnState('card_watchdog_new')
+    first.session.proc = nextProc
+    first.session.currentTurn = nextTurn
+    first.session.turnCounter = 2
+    first.session.wireProc(nextProc)
+    first.session.beginWatchdogTurn(nextTurn, nextProc)
+    nextProc.emit('turn_started', { thread_id: 'codex-thread-new', turn_id: 'turn-new' })
+    confirmSessionNoop(nextProc, 'current-evidence')
+    await cardkit.flush(nextTurn.cardId)
+
+    const stableGoal = {
+      objective: 'Keep the current turn intact',
+      status: 'active',
+      tokenBudget: 20_000,
+      tokensUsed: 200,
+      timeUsedSeconds: 3,
+    }
+    first.session.currentGoal = stableGoal
+    nextTurn.planSteps = [{ step: 'Current', status: 'inProgress' }]
+    nextTurn.planExplanation = 'Current process plan'
+    nextTurn.currentAssistantSegmentId = 'assistant_current'
+    nextTurn.currentAssistantText = 'current assistant text'
+    nextTurn.segmentTexts.set('assistant_previous', 'previous assistant text')
+    first.session.initCount = 7
+    first.session.currentTurnUsageBaseline = {
+      input_tokens: 400,
+      cache_creation_input_tokens: 0,
+      cache_read_input_tokens: 0,
+      output_tokens: 40,
+    }
+    first.session.currentTurnUsageBaselineKnown = true
+    first.session.usageTotalsSeedUnknown = true
+    first.session.cumStats = { tokens: 10, costUsd: 0.25, turns: 2 }
+    first.session.lastTurnDelta = { tokens: 5, costUsd: 0.1, durationMs: 100 }
+    first.session.pendingMidTurnMsgs = [{
+      text: 'current queued message',
+      wireText: 'current queued message',
+      userOpenId: 'ou_current',
+      msgId: 'om_current',
+    }]
+    first.session.status = 'working'
+
+    const seededUsage = updateUsageFromRateLimits({
+      planType: 'stable',
+      primary: { usedPercent: 17, resetsAt: 1_700_000_000, windowDurationMins: 300 },
+    })
+    const planBefore = JSON.stringify({
+      steps: nextTurn.planSteps,
+      explanation: nextTurn.planExplanation,
+      count: nextTurn.planUpdateCount,
+    })
+    const toolsBefore = JSON.stringify([...nextTurn.toolByUseId.entries()])
+    const assistantBefore = {
+      segmentCount: nextTurn.assistantSegmentCount,
+      segmentId: nextTurn.currentAssistantSegmentId,
+      text: nextTurn.currentAssistantText,
+      segments: JSON.stringify([...nextTurn.segmentTexts.entries()]),
+    }
+    const compactionBefore = {
+      count: nextTurn.contextCompactCount,
+      pending: JSON.stringify([...nextTurn.contextCompactionPending.entries()]),
+    }
+    const usageBaselineBefore = { ...first.session.currentTurnUsageBaseline }
+    const identityBefore = {
+      backendThreadId: nextTurn.backendThreadId,
+      backendTurnId: nextTurn.backendTurnId,
+      watchdogThreadId: first.session.watchdogContext.threadId,
+      watchdogTurnId: first.session.watchdogContext.turnId,
+    }
+    const statsBefore = JSON.stringify({
+      cumStats: first.session.cumStats,
+      lastTurnDelta: first.session.lastTurnDelta,
+    })
+    const boundResumesBefore = JSON.stringify(boundResumes)
+    const lastSessionIdBefore = first.session.lastSessionId
+    const cardWritesBefore = calls.length
+    let closeCalls = 0
+    let closePromise: Promise<void> | null = null
+    let drainCalls = 0
+    const realCloseTurnCard = first.session.closeTurnCard.bind(first.session)
+    first.session.closeTurnCard = (...args: any[]) => {
+      closeCalls++
+      closePromise = realCloseTurnCard(...args)
+      return closePromise
+    }
+    first.session.drainMidTurnAndOpen = async () => {
+      drainCalls++
+    }
+
+    first.proc.emit('init', { session_id: first.proc.sessionId })
+    first.proc.emit('turn_started', { thread_id: first.proc.sessionId, turn_id: 'late-turn' })
+    first.proc.emit('token_usage', {
+      totalUsage: {
+        input_tokens: 900,
+        cache_creation_input_tokens: 0,
+        cache_read_input_tokens: 0,
+        output_tokens: 90,
+      },
+    })
+    first.proc.emit('rate_limits_updated', {
+      planType: 'stale',
+      primary: { usedPercent: 99, resetsAt: 1_800_000_000, windowDurationMins: 300 },
+    })
+    first.proc.emit('assistant_text', { text: 'late assistant' })
+    first.proc.emit('assistant_block_stop', {})
+    first.proc.emit('tool_use', { id: 'late-bash', name: 'Bash', input: { command: 'pwd' }, parentToolUseId: null })
+    first.proc.emit('tool_result', { tool_use_id: 'late-bash', content: 'late', is_error: false, parentToolUseId: null })
+    first.proc.emit('turn_plan_updated', {
+      plan: [{ step: 'Stale', status: 'completed' }],
+      explanation: 'old process',
+    })
+    first.proc.emit('plan_delta', { itemId: 'late-plan', delta: 'late delta' })
+    first.proc.emit('context_compacted', { itemId: 'late-compact', phase: 'start' })
+    first.proc.emit('thread_goal_updated', {
+      objective: 'Stale process goal',
+      status: 'completed',
+      tokenBudget: 1,
+      tokensUsed: 1,
+      timeUsedSeconds: 1,
+    })
+    first.proc.emit('thread_goal_cleared', {})
+    first.proc.emit('can_use_tool', {
+      request_id: 'late-permission',
+      tool_use_id: 'late-bash',
+      tool_name: 'Bash',
+      input: { command: 'pwd' },
+      permission_suggestions: [],
+    })
+    first.proc.emit('hook_callback', { request_id: 'late-hook', hook_name: 'PostToolUse' })
+    first.proc.emit('bg_task_started', {
+      task_id: 'late-background',
+      task_type: 'workflow',
+      description: 'late background event',
+    })
+    first.proc.emit('result', {})
+
+    if (closePromise) await closePromise
+    else await cardkit.flush(nextTurn.cardId)
+
+    expect(first.session.currentTurn).toBe(nextTurn)
+    expect(JSON.stringify({
+      steps: nextTurn.planSteps,
+      explanation: nextTurn.planExplanation,
+      count: nextTurn.planUpdateCount,
+    })).toBe(planBefore)
+    expect(first.session.currentGoal).toBe(stableGoal)
+    expect(JSON.stringify([...nextTurn.toolByUseId.entries()])).toBe(toolsBefore)
+    expect({
+      segmentCount: nextTurn.assistantSegmentCount,
+      segmentId: nextTurn.currentAssistantSegmentId,
+      text: nextTurn.currentAssistantText,
+      segments: JSON.stringify([...nextTurn.segmentTexts.entries()]),
+    }).toEqual(assistantBefore)
+    expect({
+      count: nextTurn.contextCompactCount,
+      pending: JSON.stringify([...nextTurn.contextCompactionPending.entries()]),
+    }).toEqual(compactionBefore)
+    expect(calls.length).toBe(cardWritesBefore)
+    expect(first.session.pendingPermissions.size).toBe(0)
+    expect(first.proc.permissionResponses).toEqual([])
+    expect(nextProc.permissionResponses).toEqual([])
+    expect(first.proc.hookResponses).toEqual([])
+    expect(nextProc.hookResponses).toEqual([])
+    expect(closeCalls).toBe(0)
+    expect(drainCalls).toBe(0)
+    expect(first.session.initCount).toBe(7)
+    expect(first.session.currentTurnUsageBaseline).toEqual(usageBaselineBefore)
+    expect(first.session.currentTurnUsageBaselineKnown).toBe(true)
+    expect(first.session.usageTotalsSeedUnknown).toBe(true)
+    expect({
+      backendThreadId: nextTurn.backendThreadId,
+      backendTurnId: nextTurn.backendTurnId,
+      watchdogThreadId: first.session.watchdogContext.threadId,
+      watchdogTurnId: first.session.watchdogContext.turnId,
+    }).toEqual(identityBefore)
+    expect(peekUsage()).toBe(seededUsage)
+    expect(JSON.stringify({
+      cumStats: first.session.cumStats,
+      lastTurnDelta: first.session.lastTurnDelta,
+    })).toBe(statsBefore)
+    expect(JSON.stringify(boundResumes)).toBe(boundResumesBefore)
+    expect(first.session.lastSessionId).toBe(lastSessionIdBefore)
+    expect(first.session.status).toBe('working')
+    expect(first.session.watchdog.snapshot().repeatCount).toBe(1)
+    expect(first.session.backgroundTasks).toEqual([])
+    expect(first.session.pendingBgTasks).toEqual([])
+    expect(first.session.watchdogSafetySnapshot(first.session.watchdogContext).backgroundWorkRunning).toBe(false)
+    first.session.stopFooterStatus(nextTurn)
+  })
+
+  test('cleans stale opening markers and rebuilds an active background card after migration', async () => {
+    const fixture = staleInitOpenFixture('watchdog-stale-after-bg-migrate')
+    const { session } = fixture
+    session.backgroundTasks = [{
+      id: 'bg-still-running',
+      type: 'subagent',
+      description: 'still running',
+      status: 'running',
+      startedAt: Date.now(),
+      steps: [],
+    }]
+    session.backgroundCard = { messageId: 'om_bg_old', cardId: 'card_bg_old' }
+    cardkit.recordCardCreated('card_bg_old', 1)
+
+    const migrateRequestStarted = deferred<void>()
+    const migrateRequest = deferred<Response>()
+    const healthyFetch = globalThis.fetch
+    let holdFirstRequest = true
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (holdFirstRequest) {
+        holdFirstRequest = false
+        migrateRequestStarted.resolve()
+        return await migrateRequest.promise
+      }
+      return await healthyFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      fixture.start()
+      await migrateRequestStarted.promise
+      expect(session.watchdogOpeningTurnCounter).toBe(1)
+      expect(session.pendingWatchdogIdentity?.turnCounter).toBe(1)
+
+      const { nextProc, nextTurn } = replaceOpenProcess(session, 'after-bg-migrate')
+      migrateRequest.resolve(new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      }))
+      await fixture.openPromise()
+      await Promise.resolve()
+
+      expect(session.proc).toBe(nextProc)
+      expect(session.currentTurn).toBe(nextTurn)
+      expect(session.watchdogOpeningTurnCounter).toBeNull()
+      expect(session.pendingWatchdogIdentity).toBeNull()
+      expect(session.pendingRebuildBackgroundCard).toBe(false)
+      expect(session.backgroundCard).not.toBeNull()
+      expect(session.backgroundTasks.map((task: any) => task.id)).toEqual(['bg-still-running'])
+    } finally {
+      globalThis.fetch = healthyFetch
+      session.openingTurn = false
+      await session.resetBackgroundTasks()
+    }
+  })
+
+  test('closes a stale main card after sendCard and preserves new opening markers', async () => {
+    const fixture = staleInitOpenFixture('watchdog-stale-after-send-card')
+    const { session } = fixture
+    const sendStarted = deferred<void>()
+    const sendResult = deferred<string | null>()
+    feishuMockState.sendCard = async () => {
+      sendStarted.resolve()
+      return await sendResult.promise
+    }
+
+    try {
+      fixture.start()
+      await sendStarted.promise
+      const staleCounter = session.watchdogOpeningTurnCounter
+      const { nextProc, nextTurn } = replaceOpenProcess(session, 'after-send-card')
+      session.openingTurn = true
+      session.watchdogOpeningTurnCounter = staleCounter
+      session.watchdogOpeningProc = nextProc
+      session.pendingWatchdogIdentity = {
+        proc: nextProc,
+        threadId: nextProc.sessionId,
+        turnId: 'new-turn',
+        turnCounter: staleCounter,
+      }
+
+      sendResult.resolve('om_stale_after_send')
+      await fixture.openPromise()
+      await Promise.resolve()
+
+      expect(session.proc).toBe(nextProc)
+      expect(session.currentTurn).toBe(nextTurn)
+      expect(session.openingTurn).toBe(true)
+      expect(session.watchdogOpeningTurnCounter).toBe(staleCounter)
+      expect(session.watchdogOpeningProc).toBe(nextProc)
+      expect(session.pendingWatchdogIdentity?.proc).toBe(nextProc)
+      expectStaleCardClosed('card_status_1')
+    } finally {
+      feishuMockState.sendCard = null
+      session.openingTurn = false
+      session.stopFooterStatus(session.currentTurn)
+    }
+  })
+
+  test('falls back to message update when stale card conversion fails', async () => {
+    const fixture = staleInitOpenFixture('watchdog-stale-during-convert')
+    const { session } = fixture
+    const convertStarted = deferred<void>()
+    const convertResult = deferred<Response>()
+    const healthyFetch = globalThis.fetch
+    let holdFirstRequest = true
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (holdFirstRequest) {
+        holdFirstRequest = false
+        convertStarted.resolve()
+        return await convertResult.promise
+      }
+      return await healthyFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      fixture.start()
+      await convertStarted.promise
+      expect(session.watchdogOpeningTurnCounter).toBe(1)
+      expect(session.pendingWatchdogIdentity?.turnCounter).toBe(1)
+      const { nextProc, nextTurn } = replaceOpenProcess(session, 'during-convert')
+
+      convertResult.resolve(new Response(JSON.stringify({ code: 99, msg: 'convert failed' }), {
+        headers: { 'Content-Type': 'application/json' },
+      }))
+      await fixture.openPromise()
+      await Promise.resolve()
+
+      expect(session.proc).toBe(nextProc)
+      expect(session.currentTurn).toBe(nextTurn)
+      expect(session.watchdogOpeningTurnCounter).toBeNull()
+      expect(session.pendingWatchdogIdentity).toBeNull()
+      expect(updatedCards).toHaveLength(1)
+      expect(updatedCards[0]?.[0]).toBe('om_status_1')
+      const terminalCard = updatedCards[0]?.[1] as any
+      expect(terminalCard?.config?.streaming_mode).toBe(false)
+      expect(JSON.stringify(terminalCard)).toContain('后端已切换')
+    } finally {
+      globalThis.fetch = healthyFetch
+      session.stopFooterStatus(session.currentTurn)
+    }
+  })
+
+  test('settles an eager stale open without expectedProc after process replacement', async () => {
+    projectProfiles.set('watchdog-stale-eager-no-expected-proc', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-stale-eager-no-expected-proc', 'chat_id') as any
+    const oldProc = new FakeAgentProc('codex', 'codex-thread-stale-eager')
+    const sendStarted = deferred<void>()
+    const sendResult = deferred<string | null>()
+    session.selectedProvider = 'codex'
+    session.proc = oldProc
+    session.pendingTurnInputs = ['stale eager input']
+    session.wireProc(oldProc)
+    feishuMockState.sendCard = async () => {
+      sendStarted.resolve()
+      return await sendResult.promise
+    }
+
+    try {
+      const staleOpen = session.openTurnCard('ou_old', 'user_message', { startThinking: false })
+      await sendStarted.promise
+      const { nextProc, nextTurn } = replaceOpenProcess(session, 'eager-no-expected-proc')
+
+      sendResult.resolve('om_stale_eager_no_expected_proc')
+      await staleOpen
+      await Promise.resolve()
+
+      expect(session.proc).toBe(nextProc)
+      expect(session.currentTurn).toBe(nextTurn)
+      expectStaleCardClosed('card_status_1')
+    } finally {
+      feishuMockState.sendCard = null
+      session.stopFooterStatus(session.currentTurn)
+    }
+  })
+
+  test('does not continue an eager user turn after its card open loses ownership', async () => {
+    projectProfiles.set('watchdog-stale-eager-caller', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-stale-eager-caller', 'chat_id') as any
+    const oldProc = new FakeAgentProc('codex', 'codex-thread-stale-eager-caller')
+    const sendStarted = deferred<void>()
+    const sendResult = deferred<string | null>()
+    session.selectedProvider = 'codex'
+    session.proc = oldProc
+    session.initCount = 1
+    session.wireProc(oldProc)
+    feishuMockState.sendCard = async () => {
+      sendStarted.resolve()
+      return await sendResult.promise
+    }
+
+    try {
+      const staleMessage = session.onUserMessage('stale prompt', [], 'ou_old')
+      await sendStarted.promise
+      const { nextProc, nextTurn } = replaceOpenProcess(session, 'eager-caller')
+
+      sendResult.resolve('om_stale_eager_caller')
+      await staleMessage
+      await Promise.resolve()
+
+      expect(session.currentTurn).toBe(nextTurn)
+      expect(nextProc.sentTexts).toEqual([])
+      expect(session.status).toBe('starting')
+      expectStaleCardClosed('card_status_1')
+    } finally {
+      feishuMockState.sendCard = null
+      session.openingTurn = false
+      session.stopFooterStatus(session.currentTurn)
+    }
+  })
+
+  test('does not send a cold-start prompt after its opened turn is replaced', async () => {
+    projectProfiles.set('watchdog-stale-cold-caller', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-stale-cold-caller', 'chat_id') as any
+    const startedProc = new FakeAgentProc('codex', 'codex-thread-stale-cold-caller')
+    const startEntered = deferred<void>()
+    const startResult = deferred<void>()
+    let staleTurn: any = null
+    session.selectedProvider = 'codex'
+    session.start = async () => {
+      session.proc = startedProc
+      session.wireProc(startedProc)
+      startEntered.resolve()
+      await startResult.promise
+      return true
+    }
+
+    try {
+      const staleMessage = session.onUserMessage('cold stale prompt', [], 'ou_old')
+      await startEntered.promise
+      staleTurn = session.currentTurn
+      const { nextProc, nextTurn } = replaceOpenProcess(session, 'cold-caller')
+
+      startResult.resolve()
+      await staleMessage
+
+      expect(session.currentTurn).toBe(nextTurn)
+      expect(startedProc.sentTexts).toEqual([])
+      expect(nextProc.sentTexts).toEqual([])
+      expect(session.status).toBe('starting')
+      expectStaleCardClosed(staleTurn.cardId)
+    } finally {
+      startResult.resolve()
+      session.stopFooterStatus(staleTurn)
+      session.stopFooterStatus(session.currentTurn)
+    }
+  })
+
+  test('settles a cold-start card replaced while its queued writes flush', async () => {
+    projectProfiles.set('watchdog-stale-cold-flush', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-stale-cold-flush', 'chat_id') as any
+    const startedProc = new FakeAgentProc('codex', 'codex-thread-stale-cold-flush')
+    const footerWriteStarted = deferred<void>()
+    const footerWriteResult = deferred<Response>()
+    const healthyFetch = globalThis.fetch
+    let heldFooterWrite = false
+    let staleTurn: any = null
+    session.selectedProvider = 'codex'
+    session.start = async () => {
+      session.proc = startedProc
+      session.wireProc(startedProc)
+      return true
+    }
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      if (!heldFooterWrite && init?.method === 'PUT' && path.endsWith('/elements/footer')) {
+        heldFooterWrite = true
+        footerWriteStarted.resolve()
+        return await footerWriteResult.promise
+      }
+      return await healthyFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      const staleMessage = session.onUserMessage('cold flush stale prompt', [], 'ou_old')
+      await footerWriteStarted.promise
+      staleTurn = session.currentTurn
+      await new Promise(resolve => setTimeout(resolve, 0))
+      const { nextProc, nextTurn } = replaceOpenProcess(session, 'cold-flush')
+
+      footerWriteResult.resolve(new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      }))
+      await staleMessage
+
+      expect(session.currentTurn).toBe(nextTurn)
+      expect(startedProc.sentTexts).toEqual([])
+      expect(nextProc.sentTexts).toEqual([])
+      expect(session.status).toBe('starting')
+      expectStaleCardClosed(staleTurn.cardId)
+    } finally {
+      footerWriteResult.resolve(new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      }))
+      globalThis.fetch = healthyFetch
+      session.stopFooterStatus(staleTurn)
+      session.stopFooterStatus(session.currentTurn)
+    }
+  })
+
+  test('clears the captured cold-start turn when only its process owner changes during flush', async () => {
+    projectProfiles.set('watchdog-stale-cold-same-turn', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-stale-cold-same-turn', 'chat_id') as any
+    const startedProc = new FakeAgentProc('codex', 'codex-thread-stale-cold-same-turn')
+    const footerWriteStarted = deferred<void>()
+    const footerWriteResult = deferred<Response>()
+    const healthyFetch = globalThis.fetch
+    let heldFooterWrite = false
+    let staleTurn: any = null
+    session.selectedProvider = 'codex'
+    session.start = async () => {
+      session.proc = startedProc
+      session.wireProc(startedProc)
+      return true
+    }
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      if (!heldFooterWrite && init?.method === 'PUT' && path.endsWith('/elements/footer')) {
+        heldFooterWrite = true
+        footerWriteStarted.resolve()
+        return await footerWriteResult.promise
+      }
+      return await healthyFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      const staleMessage = session.onUserMessage('cold same-turn stale prompt', [], 'ou_old')
+      await footerWriteStarted.promise
+      staleTurn = session.currentTurn
+      await new Promise(resolve => setTimeout(resolve, 0))
+      session.beginWatchdogTurn(staleTurn, startedProc)
+      startedProc.emit('turn_started', {
+        thread_id: startedProc.sessionId,
+        turn_id: 'codex-turn-stale-cold-same-turn',
+      })
+      expect(session.watchdogContext?.turn).toBe(staleTurn)
+
+      const nextProc = new FakeAgentProc('codex', 'codex-thread-stale-cold-same-turn-next')
+      session.proc = nextProc
+      session.wireProc(nextProc)
+      footerWriteResult.resolve(new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      }))
+      await staleMessage
+
+      expect(session.proc).toBe(nextProc)
+      expect(session.currentTurn).toBeNull()
+      expect(session.watchdogContext).toBeNull()
+      expectStaleCardClosed(staleTurn.cardId)
+
+      await session.onUserMessage('next owner work', [], 'ou_next')
+      expect(nextProc.sentTexts).toEqual(['next owner work'])
+      expect(session.pendingMidTurnMsgs).toEqual([])
+    } finally {
+      footerWriteResult.resolve(new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      }))
+      globalThis.fetch = healthyFetch
+      session.stopFooterStatus(staleTurn)
+      session.stopFooterStatus(session.currentTurn)
+    }
+  })
+
+  test('does not restore working status after a drained turn open loses ownership', async () => {
+    projectProfiles.set('watchdog-stale-drain-caller', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-stale-drain-caller', 'chat_id') as any
+    const oldProc = new FakeAgentProc('codex', 'codex-thread-stale-drain-caller')
+    const sendStarted = deferred<void>()
+    const sendResult = deferred<string | null>()
+    session.selectedProvider = 'codex'
+    session.proc = oldProc
+    session.pendingMidTurnMsgs = [{
+      text: 'queued stale prompt',
+      wireText: 'queued stale prompt',
+      userOpenId: 'ou_old',
+      msgId: 'om_stale_drain_reaction',
+    }]
+    session.pendingReactionIds = new Map([
+      ['om_stale_drain_reaction', 'reaction_stale_drain'],
+    ])
+    session.wireProc(oldProc)
+    feishuMockState.sendCard = async () => {
+      sendStarted.resolve()
+      return await sendResult.promise
+    }
+
+    try {
+      const staleDrain = session.drainMidTurnAndOpen()
+      await sendStarted.promise
+      const { nextProc, nextTurn } = replaceOpenProcess(session, 'drain-caller')
+      session.currentBatchReactionIds.set('om_replacement_turn', 'reaction_replacement_turn')
+
+      sendResult.resolve('om_stale_drain_caller')
+      await staleDrain
+      await Promise.resolve()
+
+      expect(session.currentTurn).toBe(nextTurn)
+      expect(oldProc.sentTexts).toEqual([])
+      expect(nextProc.sentTexts).toEqual([])
+      expect(session.pendingUserMessageCount).toBe(0)
+      expect(session.status).toBe('starting')
+      expectStaleCardClosed('card_status_1')
+      expect(deletedReactions).toEqual([
+        ['om_stale_drain_reaction', 'reaction_stale_drain'],
+      ])
+      expect(session.pendingReactionIds.has('om_stale_drain_reaction')).toBe(false)
+      expect(session.currentBatchReactionIds).toEqual(new Map([
+        ['om_replacement_turn', 'reaction_replacement_turn'],
+      ]))
+    } finally {
+      feishuMockState.sendCard = null
+      session.openingTurn = false
+      session.stopFooterStatus(session.currentTurn)
+    }
+  })
+
+  test('does not send a drained prompt when its turn card fails to open', async () => {
+    projectProfiles.set('watchdog-failed-drain-caller', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-failed-drain-caller', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-failed-drain-caller')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.pendingMidTurnMsgs = [{
+      text: 'failed drain prompt',
+      wireText: 'failed drain prompt',
+      userOpenId: 'ou_old',
+      msgId: 'om_failed_drain_reaction',
+    }]
+    session.pendingReactionIds = new Map([
+      ['om_failed_drain_reaction', 'reaction_failed_drain'],
+      ['om_unrelated_pending', 'reaction_unrelated_pending'],
+    ])
+    session.currentBatchReactionIds = new Map([
+      ['om_unrelated_batch', 'reaction_unrelated_batch'],
+    ])
+    session.wireProc(proc)
+    feishuMockState.sendCard = async () => null
+    const statusBefore = session.status
+
+    try {
+      await session.drainMidTurnAndOpen()
+
+      expect(proc.sentTexts).toEqual([])
+      expect(session.pendingUserMessageCount).toBe(0)
+      expect(session.currentTurn).toBeNull()
+      expect(session.status).toBe(statusBefore)
+      expect(deletedReactions).toEqual([
+        ['om_failed_drain_reaction', 'reaction_failed_drain'],
+      ])
+      expect(session.pendingReactionIds).toEqual(new Map([
+        ['om_unrelated_pending', 'reaction_unrelated_pending'],
+      ]))
+      expect(session.currentBatchReactionIds).toEqual(new Map([
+        ['om_unrelated_batch', 'reaction_unrelated_batch'],
+      ]))
+    } finally {
+      feishuMockState.sendCard = null
+      session.openingTurn = false
+      session.stopFooterStatus(session.currentTurn)
+    }
+  })
+
+  test('does not mark a replacement idle after a raced open close settles', async () => {
+    projectProfiles.set('watchdog-raced-open-close', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-raced-open-close', 'chat_id') as any
+    const oldProc = new FakeAgentProc('codex', 'codex-thread-raced-open-close')
+    const openedTurn = turnState('card_watchdog_raced_open_close')
+    const closeStarted = deferred<void>()
+    const closeRelease = deferred<void>()
+    const closeReturned = deferred<void>()
+    session.selectedProvider = 'codex'
+    session.proc = oldProc
+    session.pendingUserMessageCount = 1
+    session.pendingTurnInputs = ['raced close input']
+    session.wireProc(oldProc)
+    session.openTurnCard = async () => {
+      session.currentTurn = openedTurn
+      session.sawResultWhileOpening = true
+      return { kind: 'opened', turn: openedTurn }
+    }
+    session.closeTurnCard = async () => {
+      expect(session.currentTurn).toBe(openedTurn)
+      session.currentTurn = null
+      closeStarted.resolve()
+      await closeRelease.promise
+      closeReturned.resolve()
+    }
+
+    try {
+      oldProc.emit('init', { session_id: oldProc.sessionId })
+      await closeStarted.promise
+      const { nextProc, nextTurn } = replaceOpenProcess(session, 'raced-open-close')
+
+      closeRelease.resolve()
+      await closeReturned.promise
+      await Promise.resolve()
+
+      expect(session.proc).toBe(nextProc)
+      expect(session.currentTurn).toBe(nextTurn)
+      expect(session.status).toBe('starting')
+    } finally {
+      closeRelease.resolve()
+      session.openingTurn = false
+      session.stopFooterStatus(session.currentTurn)
+    }
+  })
+
+  test('settles an older same-process open after a newer open generation wins', async () => {
+    projectProfiles.set('watchdog-stale-open-generation', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-stale-open-generation', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-open-generation')
+    const firstSendStarted = deferred<void>()
+    const firstSendResult = deferred<string | null>()
+    let sendCount = 0
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.pendingTurnInputs = ['older input']
+    session.wireProc(proc)
+    feishuMockState.sendCard = async () => {
+      sendCount++
+      if (sendCount === 1) {
+        firstSendStarted.resolve()
+        return await firstSendResult.promise
+      }
+      return 'om_newer_open_generation'
+    }
+
+    try {
+      const olderOpen = session.openTurnCard('ou_old', 'user_message', { startThinking: false })
+      await firstSendStarted.promise
+      session.pendingTurnInputs = ['newer input']
+      await session.openTurnCard('ou_new', 'user_message', { startThinking: false })
+      const newerTurn = session.currentTurn
+      expect(newerTurn?.messageId).toBe('om_newer_open_generation')
+
+      firstSendResult.resolve('om_stale_open_generation')
+      await olderOpen
+      await Promise.resolve()
+
+      expect(session.currentTurn).toBe(newerTurn)
+      expectStaleCardClosed('card_status_2')
+    } finally {
+      feishuMockState.sendCard = null
+      session.stopFooterStatus(session.currentTurn)
+    }
+  })
+})
+
+describe('Session host ask continuation ownership', () => {
+  test('retains the answered ask when the process changes during thread item injection', async () => {
+    const session = new Session('host-ask-inject-race', 'chat_id') as any
+    const oldProc = new FakeAgentProc('codex', 'codex-thread-host-ask-old')
+    const injectionStarted = deferred<void>()
+    const injectionResult = deferred<void>()
+    const ask = answeredHostAsk()
+    oldProc.injectThreadItems = async () => {
+      injectionStarted.resolve()
+      await injectionResult.promise
+    }
+    session.selectedProvider = 'codex'
+    session.proc = oldProc
+    session.status = 'idle'
+    session.pendingHostAsks.set('host-ask-race', ask)
+    session.wireProc(oldProc)
+
+    sessionHostAsk.resumeAnsweredHostAsks(session)
+    await injectionStarted.promise
+    expect(ask.resumeStarted).toBe(true)
+
+    const nextProc = new FakeAgentProc('codex', 'codex-thread-host-ask-next')
+    session.proc = nextProc
+    session.wireProc(nextProc)
+    injectionResult.resolve()
+    await waitForHostAskAttempt(ask, session)
+
+    expect(oldProc.sentTexts).toEqual([])
+    expect(nextProc.sentTexts).toEqual([])
+    expect(session.pendingHostAsks.get('host-ask-race')).toBe(ask)
+    expect(ask.resumeStarted).toBe(false)
+  })
+
+  test('retains the answered ask when the process changes during continuation card open', async () => {
+    const session = new Session('host-ask-open-race', 'chat_id') as any
+    const oldProc = new FakeAgentProc('codex', 'codex-thread-host-ask-open-old')
+    const sendStarted = deferred<void>()
+    const sendResult = deferred<string | null>()
+    const ask = answeredHostAsk()
+    session.selectedProvider = 'codex'
+    session.proc = oldProc
+    session.status = 'idle'
+    session.pendingHostAsks.set('host-ask-race', ask)
+    session.wireProc(oldProc)
+    feishuMockState.sendCard = async () => {
+      sendStarted.resolve()
+      return await sendResult.promise
+    }
+
+    try {
+      sessionHostAsk.resumeAnsweredHostAsks(session)
+      await sendStarted.promise
+      expect(ask.resumeStarted).toBe(true)
+
+      const nextProc = new FakeAgentProc('codex', 'codex-thread-host-ask-open-next')
+      session.proc = nextProc
+      session.wireProc(nextProc)
+      sendResult.resolve('om_host_ask_stale_open')
+      await waitForHostAskAttempt(ask, session)
+
+      expect(oldProc.sentTexts).toEqual([])
+      expect(nextProc.sentTexts).toEqual([])
+      expect(session.pendingHostAsks.get('host-ask-race')).toBe(ask)
+      expect(ask.resumeStarted).toBe(false)
+    } finally {
+      sendResult.resolve(null)
+      feishuMockState.sendCard = null
+      session.openingTurn = false
+      session.stopFooterStatus(session.currentTurn)
+    }
+  })
+})
+
+describe('Session Codex watchdog structured activity and safety', () => {
+  test('keeps active child-agent state and activity dedupe across watchdog turn boundaries', () => {
+    const { session, proc } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-agent-boundary-1' })
+    const startedActivity = {
+      activityId: 'activity-boundary-start',
+      agentThreadId: 'agent-boundary',
+      agentPath: '/root/agent-boundary',
+      kind: 'started',
+    }
+    proc.emit('subagent_activity', startedActivity)
+    proc.emit('collab_agent_state', {
+      toolUseId: 'collab-boundary',
+      agentsStates: { 'agent-boundary': { status: 'running' } },
+    })
+
+    session.endWatchdogTurn()
+    expect(session.codexCollabAgentStates).toEqual(new Map([['agent-boundary', 'running']]))
+    expect(session.codexCollabAgentStatesByTool).toEqual(new Map([
+      ['collab-boundary', new Map([['agent-boundary', 'running']])],
+    ]))
+    expect(session.codexSubagentActivityIds).toEqual(new Set(['activity-boundary-start']))
+    expect(session.activeCodexSubagentActivities).toEqual(new Set(['agent-boundary']))
+
+    const nextTurn = turnState('card_watchdog_agent_boundary_2')
+    session.currentTurn = nextTurn
+    session.turnCounter = 2
+    session.beginWatchdogTurn(nextTurn, proc, 123)
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-agent-boundary-2' })
+
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(true)
+    confirmSessionNoop(proc, 'boundary-noop')
+    proc.emit('subagent_activity', startedActivity)
+    expect(session.watchdog.snapshot().repeatCount).toBe(1)
+
+    proc.emit('collab_agent_state', {
+      toolUseId: 'collab-boundary',
+      agentsStates: { 'agent-boundary': { status: 'completed' } },
+    })
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(false)
+  })
+
+  test('accepts cross-tool terminal child-agent cleanup from the current process between turns', () => {
+    const { session, proc } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-agent-cleanup-1' })
+    proc.emit('subagent_activity', {
+      activityId: 'activity-cleanup-a-start',
+      agentThreadId: 'agent-cleanup-a',
+      agentPath: '/root/agent-cleanup-a',
+      kind: 'started',
+    })
+    proc.emit('subagent_activity', {
+      activityId: 'activity-cleanup-b-start',
+      agentThreadId: 'agent-cleanup-b',
+      agentPath: '/root/agent-cleanup-b',
+      kind: 'started',
+    })
+    proc.emit('collab_agent_state', {
+      toolUseId: 'collab-cleanup-b-running',
+      agentsStates: { 'agent-cleanup-b': { status: 'running' } },
+    })
+    session.endWatchdogTurn()
+    const watchdogAfterEnd = session.watchdog.snapshot()
+
+    proc.emit('subagent_activity', {
+      activityId: 'activity-cleanup-a-stop',
+      agentThreadId: 'agent-cleanup-a',
+      agentPath: '/root/agent-cleanup-a',
+      kind: 'interrupted',
+    })
+    proc.emit('collab_agent_state', {
+      toolUseId: 'collab-cleanup-b-terminal',
+      agentsStates: { 'agent-cleanup-b': { status: 'completed' } },
+    })
+
+    expect(session.activeCodexSubagentActivities.size).toBe(0)
+    expect(session.codexCollabAgentStates.size).toBe(0)
+    expect(session.codexCollabAgentStatesByTool.size).toBe(0)
+    expect(session.watchdog.snapshot()).toEqual(watchdogAfterEnd)
+  })
+
+  test('ignores nonterminal child-agent events without a current watchdog turn', () => {
+    const { session, proc } = wiredWatchdogSession()
+    session.endWatchdogTurn()
+    const watchdogAfterEnd = session.watchdog.snapshot()
+
+    proc.emit('subagent_activity', {
+      activityId: 'activity-no-turn-start',
+      agentThreadId: 'agent-no-turn',
+      agentPath: '/root/agent-no-turn',
+      kind: 'started',
+    })
+    proc.emit('collab_agent_state', {
+      toolUseId: 'collab-no-turn',
+      agentsStates: { 'agent-no-turn': { status: 'waiting' } },
+    })
+
+    expect(session.codexSubagentActivityIds.size).toBe(0)
+    expect(session.activeCodexSubagentActivities.size).toBe(0)
+    expect(session.codexCollabAgentStates.size).toBe(0)
+    expect(session.codexCollabAgentStatesByTool.size).toBe(0)
+    expect(session.watchdog.snapshot()).toEqual(watchdogAfterEnd)
+  })
+
+  test('clears process-owned child-agent state on process replacement and exit', () => {
+    const first = wiredWatchdogSession()
+    first.proc.emit('turn_started', { thread_id: first.proc.sessionId, turn_id: 'turn-process-owner-1' })
+    first.proc.emit('subagent_activity', {
+      activityId: 'activity-old-process',
+      agentThreadId: 'agent-old-process',
+      agentPath: '/root/agent-old-process',
+      kind: 'started',
+    })
+    first.proc.emit('collab_agent_state', {
+      toolUseId: 'collab-old-process',
+      agentsStates: { 'agent-old-process': { status: 'running' } },
+    })
+
+    const nextProc = new FakeAgentProc('codex', 'codex-thread-next-process')
+    first.session.proc = nextProc
+    first.session.wireProc(nextProc)
+    expect(first.session.codexSubagentActivityIds.size).toBe(0)
+    expect(first.session.activeCodexSubagentActivities.size).toBe(0)
+    expect(first.session.codexCollabAgentStates.size).toBe(0)
+    expect(first.session.codexCollabAgentStatesByTool.size).toBe(0)
+
+    const nextTurn = turnState('card_watchdog_next_process')
+    first.session.currentTurn = nextTurn
+    first.session.turnCounter = 2
+    first.session.beginWatchdogTurn(nextTurn, nextProc, 0)
+    nextProc.emit('turn_started', { thread_id: nextProc.sessionId, turn_id: 'turn-process-owner-2' })
+    nextProc.emit('subagent_activity', {
+      activityId: 'activity-next-process',
+      agentThreadId: 'agent-next-process',
+      agentPath: '/root/agent-next-process',
+      kind: 'started',
+    })
+    nextProc.emit('collab_agent_state', {
+      toolUseId: 'collab-next-process',
+      agentsStates: { 'agent-next-process': { status: 'running' } },
+    })
+
+    nextProc.emit('exit', { code: 1, signal: null, expected: true })
+    expect(first.session.codexSubagentActivityIds.size).toBe(0)
+    expect(first.session.activeCodexSubagentActivities.size).toBe(0)
+    expect(first.session.codexCollabAgentStates.size).toBe(0)
+    expect(first.session.codexCollabAgentStatesByTool.size).toBe(0)
+  })
+
+  test('deduplicates activity ids while tracking sub-agent lifetime by agent thread id', () => {
+    const { session, proc } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-subagent' })
+    confirmSessionNoop(proc, 'subagent-seed-1')
+
+    proc.emit('subagent_activity', {
+      activityId: 'activity-start',
+      agentThreadId: 'agent-thread-1',
+      agentPath: '/root/worker-1',
+      kind: 'started',
+    })
+    expect(session.watchdog.snapshot()).toMatchObject({ repeatCount: 0, lastMeaningfulLabel: 'subagent_activity:started' })
+    expect(session.activeCodexSubagentActivities).toEqual(new Set(['agent-thread-1']))
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(true)
+
+    confirmSessionNoop(proc, 'subagent-seed-2')
+    proc.emit('subagent_activity', {
+      activityId: 'activity-start',
+      agentThreadId: 'agent-thread-1',
+      agentPath: '/root/worker-1',
+      kind: 'started',
+    })
+    expect(session.watchdog.snapshot().repeatCount).toBe(1)
+
+    proc.emit('subagent_activity', {
+      activityId: 'activity-interact',
+      agentThreadId: 'agent-thread-1',
+      agentPath: '/root/worker-1',
+      kind: 'interacted',
+    })
+    expect(session.watchdog.snapshot()).toMatchObject({ repeatCount: 0, lastMeaningfulLabel: 'subagent_activity:interacted' })
+    expect(session.activeCodexSubagentActivities).toEqual(new Set(['agent-thread-1']))
+
+    confirmSessionNoop(proc, 'subagent-seed-3')
+    proc.emit('subagent_activity', {
+      activityId: 'activity-stop',
+      agentThreadId: 'agent-thread-1',
+      agentPath: '/root/worker-1',
+      kind: 'interrupted',
+    })
+    expect(session.watchdog.snapshot()).toMatchObject({ repeatCount: 0, lastMeaningfulLabel: 'subagent_activity:interrupted' })
+    expect(session.activeCodexSubagentActivities.size).toBe(0)
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(false)
+  })
+
+  test('tracks changed collab states and clears terminal or residual active agents', () => {
+    const { session, proc } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-collab' })
+    confirmSessionNoop(proc, 'collab-seed-1')
+
+    proc.emit('collab_agent_state', {
+      toolUseId: 'collab-1',
+      agentsStates: {
+        'agent-running': { status: 'running' },
+        'agent-done': { status: 'completed' },
+      },
+    })
+    expect(session.watchdog.snapshot()).toMatchObject({ repeatCount: 0, lastMeaningfulLabel: 'collab_agent_state' })
+    expect(session.codexCollabAgentStates).toEqual(new Map([['agent-running', 'running']]))
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(true)
+
+    confirmSessionNoop(proc, 'collab-seed-2')
+    proc.emit('collab_agent_state', {
+      toolUseId: 'collab-1',
+      agentsStates: {
+        'agent-running': { status: 'running' },
+        'agent-done': { status: 'completed' },
+      },
+    })
+    expect(session.watchdog.snapshot().repeatCount).toBe(1)
+
+    session.activeCodexSubagentActivities.add('agent-running')
+    proc.emit('collab_agent_state', {
+      toolUseId: 'collab-1',
+      agentsStates: {
+        'agent-running': { status: 'completed' },
+        'agent-done': { status: 'shutdown' },
+      },
+    })
+    expect(session.watchdog.snapshot()).toMatchObject({ repeatCount: 0, lastMeaningfulLabel: 'collab_agent_state' })
+    expect(session.codexCollabAgentStates.size).toBe(0)
+    expect(session.activeCodexSubagentActivities.size).toBe(0)
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(false)
+  })
+
+  test('fails closed while any nonterminal collab status remains', () => {
+    const { session, proc } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-collab-unknown-status' })
+
+    proc.emit('collab_agent_state', {
+      toolUseId: 'collab-unknown-status',
+      agentsStates: { 'agent-waiting': { status: 'waiting' } },
+    })
+
+    expect(session.codexCollabAgentStates).toEqual(new Map([['agent-waiting', 'waiting']]))
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(true)
+  })
+
+  test('treats an omitted collab status as notFound terminal state', () => {
+    const { session, proc } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-collab-missing-status' })
+    proc.emit('subagent_activity', {
+      activityId: 'agent-missing-started',
+      agentThreadId: 'agent-missing-status',
+      agentPath: '/root/agent-missing-status',
+      kind: 'started',
+    })
+    confirmSessionNoop(proc, 'collab-missing-seed')
+
+    proc.emit('collab_agent_state', {
+      toolUseId: 'collab-missing-status',
+      agentsStates: { 'agent-missing-status': {} },
+    })
+
+    expect(session.watchdog.snapshot()).toMatchObject({
+      repeatCount: 0,
+      lastMeaningfulLabel: 'collab_agent_state',
+    })
+    expect(session.codexCollabAgentStatesByTool.size).toBe(0)
+    expect(session.codexCollabAgentStates.size).toBe(0)
+    expect(session.activeCodexSubagentActivities.size).toBe(0)
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(false)
+
+    confirmSessionNoop(proc, 'collab-missing-duplicate-seed')
+    proc.emit('collab_agent_state', {
+      toolUseId: 'collab-missing-status',
+      agentsStates: { 'agent-missing-status': {} },
+    })
+    expect(session.watchdog.snapshot().repeatCount).toBe(1)
+  })
+
+  test('isolates concurrent collab snapshots by tool use id', () => {
+    const { session, proc } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-collab-concurrent' })
+
+    proc.emit('collab_agent_state', {
+      toolUseId: 'tool-a',
+      agentsStates: { 'agent-a': { status: 'running' } },
+    })
+    proc.emit('collab_agent_state', {
+      toolUseId: 'tool-b',
+      agentsStates: { 'agent-b': { status: 'running' } },
+    })
+    proc.emit('subagent_activity', {
+      activityId: 'agent-b-started',
+      agentThreadId: 'agent-b',
+      agentPath: '/root/agent-b',
+      kind: 'started',
+    })
+
+    expect(session.codexCollabAgentStates).toEqual(new Map([
+      ['agent-a', 'running'],
+      ['agent-b', 'running'],
+    ]))
+    expect(session.codexCollabAgentStatesByTool).toEqual(new Map([
+      ['tool-a', new Map([['agent-a', 'running']])],
+      ['tool-b', new Map([['agent-b', 'running']])],
+    ]))
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(true)
+
+    confirmSessionNoop(proc, 'collab-concurrent-seed')
+    proc.emit('collab_agent_state', {
+      toolUseId: 'tool-a',
+      agentsStates: { 'agent-a': { status: 'running' } },
+    })
+    expect(session.watchdog.snapshot().repeatCount).toBe(1)
+
+    proc.emit('collab_agent_state', {
+      toolUseId: 'tool-a',
+      agentsStates: { 'agent-a': { status: 'completed' } },
+    })
+    expect(session.codexCollabAgentStates).toEqual(new Map([['agent-b', 'running']]))
+    expect(session.activeCodexSubagentActivities).toEqual(new Set(['agent-b']))
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(true)
+
+    proc.emit('collab_agent_state', {
+      toolUseId: 'tool-b',
+      agentsStates: { 'agent-b': { status: 'completed' } },
+    })
+    expect(session.codexCollabAgentStatesByTool.size).toBe(0)
+    expect(session.codexCollabAgentStates.size).toBe(0)
+    expect(session.activeCodexSubagentActivities.size).toBe(0)
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(false)
+  })
+
+  test('removes terminal agents from every collab tool pool during an active turn', () => {
+    const { session, proc } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-collab-shared-agent' })
+    const running = { 'agent-shared': { status: 'running' } }
+
+    proc.emit('collab_agent_state', { toolUseId: 'tool-running', agentsStates: running })
+
+    expect(session.watchdog.snapshot()).toMatchObject({
+      repeatCount: 0,
+      lastMeaningfulLabel: 'collab_agent_state',
+    })
+    expect(session.codexCollabAgentStatesByTool).toEqual(new Map([
+      ['tool-running', new Map([['agent-shared', 'running']])],
+    ]))
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(true)
+
+    confirmSessionNoop(proc, 'collab-shared-terminal-pool')
+    proc.emit('collab_agent_state', {
+      toolUseId: 'tool-terminal',
+      agentsStates: { 'agent-shared': { status: 'completed' } },
+    })
+
+    expect(session.watchdog.snapshot()).toMatchObject({
+      repeatCount: 0,
+      lastMeaningfulLabel: 'collab_agent_state',
+    })
+    expect(session.codexCollabAgentStatesByTool.size).toBe(0)
+    expect(session.codexCollabAgentStates.size).toBe(0)
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(false)
+  })
+
+  test('observes only real background task projection changes', () => {
+    const { session, proc } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-background' })
+    session.onBackgroundTaskChanged = () => {}
+    const started = {
+      task_id: 'bg-1',
+      task_type: 'workflow',
+      description: 'Run workflow',
+    }
+
+    confirmSessionNoop(proc, 'bg-seed-1')
+    proc.emit('bg_task_started', started)
+    expect(session.watchdog.snapshot()).toMatchObject({ repeatCount: 0, lastMeaningfulLabel: 'bg_task_started' })
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(true)
+
+    confirmSessionNoop(proc, 'bg-seed-2')
+    proc.emit('bg_task_started', { ...started, description: 'Description-only update is excluded' })
+    expect(session.watchdog.snapshot().repeatCount).toBe(1)
+
+    proc.emit('bg_task_progress', { task_id: 'bg-1', summary: 'Halfway' })
+    expect(session.watchdog.snapshot()).toMatchObject({ repeatCount: 0, lastMeaningfulLabel: 'bg_task_progress' })
+
+    confirmSessionNoop(proc, 'bg-seed-3')
+    proc.emit('bg_task_progress', { task_id: 'bg-1', summary: 'Halfway' })
+    expect(session.watchdog.snapshot().repeatCount).toBe(1)
+
+    proc.emit('bg_task_settled', { task_id: 'bg-1', status: 'completed', summary: 'Done' })
+    expect(session.watchdog.snapshot()).toMatchObject({ repeatCount: 0, lastMeaningfulLabel: 'bg_task_settled' })
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).backgroundWorkRunning).toBe(false)
+
+    confirmSessionNoop(proc, 'bg-seed-4')
+    proc.emit('bg_task_settled', { task_id: 'bg-1', status: 'completed', summary: 'Done' })
+    expect(session.watchdog.snapshot().repeatCount).toBe(1)
+  })
+
+  test('reports every unsafe state and excludes the current input count from queued human work', () => {
+    const { session, proc, turn } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-safety' })
+    const context = session.watchdogContext
+    expect(session.watchdogSafetySnapshot(context)).toEqual({
+      currentTurn: true,
+      eligibleTrigger: true,
+      realToolRunning: false,
+      backgroundWorkRunning: false,
+      awaitingInput: false,
+      compactionRunning: false,
+      rotationRunning: false,
+      agyRunning: false,
+      queuedHumanWork: false,
+      modelSwitchPending: false,
+      recoveryActionInFlight: false,
+    })
+
+    proc.emit('tool_use', { id: 'pending-noop', name: 'exec', input: 'text("ready")', parentToolUseId: null })
+    expect(session.watchdogSafetySnapshot(context).realToolRunning).toBe(true)
+    proc.emit('tool_result', { tool_use_id: 'pending-noop', content: strictExecResult(), is_error: false, parentToolUseId: null })
+
+    session.pendingPermissions.set('permission-1', { toolUseId: 'tool-1' })
+    expect(session.watchdogSafetySnapshot(context).awaitingInput).toBe(true)
+    session.pendingPermissions.clear()
+
+    turn.contextCompactionPending.set('compact', { i: 0, cardId: turn.cardId, notice: {} })
+    expect(session.watchdogSafetySnapshot(context).compactionRunning).toBe(true)
+    turn.contextCompactionPending.clear()
+
+    turn.rotating = Promise.resolve()
+    expect(session.watchdogSafetySnapshot(context).rotationRunning).toBe(true)
+    turn.rotating = null
+
+    session.startingAgy = true
+    expect(session.watchdogSafetySnapshot(context).agyRunning).toBe(true)
+    session.startingAgy = false
+
+    session.pendingUserMessageCount = 1
+    expect(session.watchdogSafetySnapshot(context).queuedHumanWork).toBe(false)
+    session.pendingTurnInputs = ['next']
+    expect(session.watchdogSafetySnapshot(context).queuedHumanWork).toBe(true)
+    session.pendingTurnInputs = []
+    session.pendingMidTurnMsgs = [{ text: 'next', wireText: 'next', userOpenId: 'ou', msgId: 'om' }]
+    expect(session.watchdogSafetySnapshot(context).queuedHumanWork).toBe(true)
+    session.pendingMidTurnMsgs = []
+    session.multiMsgBuffer = []
+    expect(session.watchdogSafetySnapshot(context).queuedHumanWork).toBe(true)
+    session.multiMsgBuffer = null
+
+    session.modelSwitchPending = true
+    expect(session.watchdogSafetySnapshot(context).modelSwitchPending).toBe(true)
+    session.modelSwitchPending = false
+    session.watchdogActionInFlight = true
+    expect(session.watchdogSafetySnapshot(context).recoveryActionInFlight).toBe(true)
+  })
+
+  test('reuses one watchdog instance and recovery budget across a watchdog resume turn', () => {
+    const { session, proc } = wiredWatchdogSession()
+    const watchdog = session.watchdog
+    session.watchdog.consumeRecovery()
+    session.endWatchdogTurn()
+
+    const resumed = turnState('card_watchdog_resumed')
+    resumed.trigger = 'watchdog_resume'
+    session.currentTurn = resumed
+    session.turnCounter = 2
+    session.beginWatchdogTurn(resumed, proc)
+
+    expect(session.watchdog).toBe(watchdog)
+    expect(session.watchdog.snapshot()).toMatchObject({
+      turnKey: 'turn:2',
+      trigger: 'watchdog_resume',
+      recoveryAttempt: 1,
+    })
+  })
+})
+
+describe('Session Codex watchdog warning and model guard', () => {
+  test('renders footer status only while both its timer and label are active', async () => {
+    const { session, turn } = wiredWatchdogSession()
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const footerWrites = (): FetchCall[] => calls.filter(call =>
+      call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+
+    try {
+      turn.footerStatusStartedAt = Date.now()
+      turn.footerStatusLabel = 'Thinking...'
+      turn.footerStatusHandle = null
+      session.renderFooterStatus(turn, turn.footerStatusStartedAt + 1_000)
+      await cardkit.flush(turn.cardId)
+      expect(footerWrites()).toHaveLength(0)
+
+      turn.footerStatusLabel = null
+      turn.footerStatusHandle = DETERMINISTIC_FOOTER_HANDLE
+      session.renderFooterStatus(turn, turn.footerStatusStartedAt + 2_000)
+      await cardkit.flush(turn.cardId)
+      expect(footerWrites()).toHaveLength(0)
+
+      turn.footerStatusLabel = 'Thinking...'
+      session.renderFooterStatus(turn, turn.footerStatusStartedAt + 3_000)
+      await cardkit.flush(turn.cardId)
+      expect(footerWrites()).toHaveLength(1)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('keeps a watchdog warning sticky across footer ticks and clears it on valid progress', async () => {
+    const { session, proc, turn } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-warning' })
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.startThinkingFooter(turn)
+
+    try {
+      session.applyWatchdogWarning({ type: 'silent_warn', idleMs: 3_600_000 })
+      session.renderFooterStatus(turn, turn.footerStatusStartedAt + 10_000)
+      await cardkit.flush(turn.cardId)
+
+      let footerWrites = calls
+        .filter(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+        .map(call => JSON.parse(call.body.element).content as string)
+      expect(turn.footerStatusOverride).toBe('⚠️ 长时间无可见进展 · 仍在等待')
+      expect(footerWrites.at(-1)).toContain('⚠️ 长时间无可见进展 · 仍在等待')
+
+      proc.emit('assistant_text', { text: 'real progress' })
+      await cardkit.flush(turn.cardId)
+
+      footerWrites = calls
+        .filter(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+        .map(call => JSON.parse(call.body.element).content as string)
+      expect(turn.footerStatusOverride).toBeNull()
+      expect(footerWrites.at(-1)).toContain('Writing...(0s)')
+      expect(footerWrites.at(-1)).not.toContain('长时间无可见进展')
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('clears sticky warnings for real tools but preserves matched no-op evidence', async () => {
+    const { session, proc, turn } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-warning-tools' })
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.startThinkingFooter(turn)
+
+    try {
+      session.applyWatchdogWarning({ type: 'silent_warn', idleMs: 3_600_000 })
+      confirmSessionNoop(proc, 'warning-matched-noop')
+      expect(turn.footerStatusOverride).toBe('⚠️ 长时间无可见进展 · 仍在等待')
+      expect(session.watchdog.snapshot().repeatCount).toBe(1)
+
+      proc.emit('tool_use', {
+        id: 'warning-real-tool',
+        name: 'Bash',
+        input: { command: 'pwd' },
+        parentToolUseId: null,
+      })
+      await cardkit.flush(turn.cardId)
+      expect(turn.footerStatusOverride).toBeNull()
+      expect(session.watchdog.snapshot()).toMatchObject({
+        repeatCount: 0,
+        lastMeaningfulLabel: 'tool_use:Bash',
+      })
+
+      session.applyWatchdogWarning({ type: 'silent_warn', idleMs: 3_600_000 })
+      proc.emit('tool_result', {
+        tool_use_id: 'warning-real-tool',
+        content: 'real tool result',
+        is_error: false,
+        parentToolUseId: null,
+      })
+      await cardkit.flush(turn.cardId)
+      expect(turn.footerStatusOverride).toBeNull()
+      expect(session.watchdog.snapshot().lastMeaningfulLabel).toBe('tool_result')
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('applies only silent or loop warnings and a footer render does not clear evidence', async () => {
+    const { session, proc, turn } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-warning-types' })
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.startThinkingFooter(turn)
+    confirmSessionNoop(proc, 'warning-seed')
+
+    try {
+      session.applyWatchdogWarning({
+        type: 'recover',
+        idleMs: 900_000,
+        repeatCount: 10,
+        fingerprintHash: 'hash',
+      })
+      session.renderFooterStatus(turn, turn.footerStatusStartedAt + 2_000)
+      expect(turn.footerStatusOverride).toBeNull()
+      expect(session.watchdog.snapshot().repeatCount).toBe(1)
+
+      session.applyWatchdogWarning({
+        type: 'loop_warn',
+        idleMs: 900_000,
+        repeatCount: 10,
+        fingerprintHash: 'hash',
+      })
+      await cardkit.flush(turn.cardId)
+      expect(turn.footerStatusOverride).toBe('⚠️ 检测到重复空调用 · 未自动中断')
+      expect(session.watchdog.snapshot().repeatCount).toBe(1)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('sets modelSwitchPending during async settings and clears it after success', async () => {
+    projectProfiles.set('watchdog-model-success', { watchdogMode: 'warn' })
+    const session = new Session('watchdog-model-success', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-model')
+    const turn = turnState('card_watchdog_model_success')
+    const settingsEntered = deferred<void>()
+    let release: () => void = () => {}
+    const gate = new Promise<void>(resolve => { release = resolve })
+    proc.setModelSettings = async () => {
+      settingsEntered.resolve()
+      await gate
+    }
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.currentTurn = turn
+    session.turnCounter = 1
+    session.beginWatchdogTurn(turn, proc, 0)
+
+    const resultPromise = session.onModelEffortSelect('gpt-5.6-sol', 'ultra', '', 'ou_user', 'codex')
+    await settingsEntered.promise
+    expect(session.watchdogSafetySnapshot(session.watchdogContext).modelSwitchPending).toBe(true)
+
+    release()
+    const result = await resultPromise
+    expect(result.ok).toBe(true)
+    expect(session.modelSwitchPending).toBe(false)
+  })
+
+  test('clears modelSwitchPending when model settings throw', async () => {
+    const session = new Session('watchdog-model-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-model')
+    let sawPending = false
+    proc.setModelSettings = async () => {
+      sawPending = session.modelSwitchPending
+      throw new Error('settings failed')
+    }
+    session.selectedProvider = 'codex'
+    session.proc = proc
+
+    const result = await session.onModelEffortSelect('gpt-5.6-sol', 'ultra', '', 'ou_user', 'codex')
+
+    expect(result.ok).toBe(false)
+    expect(sawPending).toBe(true)
+    expect(session.modelSwitchPending).toBe(false)
+  })
+
+  test('ends the active observation when the turn card closes', async () => {
+    const { session, proc, turn } = wiredWatchdogSession()
+    proc.emit('turn_started', { thread_id: proc.sessionId, turn_id: 'turn-close' })
+    turn.userOpenId = ''
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      await session.closeTurnCard()
+
+      expect(session.watchdogContext).toBeNull()
+      expect(session.watchdog.snapshot().turnKey).toBeNull()
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+})
 
 describe('Session fresh conversation state', () => {
   test('resets visible turn numbering and per-conversation counters', () => {
@@ -879,6 +2936,95 @@ describe('Session workDir project profile override', () => {
 })
 
 describe('Session rotate cap counts only failure-triggered rotations', () => {
+  test('ignores a stale card callback without mutating the replacement turn', async () => {
+    const session = new Session('stale-card-write-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-stale-card-write-failure')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.pendingTurnInputs = ['old card input']
+    session.wireProc(proc)
+    const openResult = await session.openTurnCard('ou_old', 'user_message', { startThinking: false })
+    if (openResult.kind !== 'opened') throw new Error('old turn card did not open')
+    const oldTurn = openResult.turn
+    const replacementTurn = turnState('card_replacement_write_failure')
+    session.currentTurn = replacementTurn
+    cardkit.recordCardCreated(replacementTurn.cardId, 1)
+    const healthyFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      if (init?.method === 'PUT' && path === `/cards/${oldTurn.cardId}/elements/footer`) {
+        return new Response(JSON.stringify({ code: 300308, msg: 'stale card rejected' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return await healthyFetch(input, init)
+    }) as typeof fetch
+    feishuMockState.sendCard = async () => null
+
+    try {
+      await cardkit.replaceElement(oldTurn.cardId, 'footer', {
+        tag: 'markdown', element_id: 'footer', content: 'settle stale card',
+      })
+
+      expect(session.currentTurn).toBe(replacementTurn)
+      expect(replacementTurn.cardId).toBe('card_replacement_write_failure')
+      expect(replacementTurn.failureRotateCount).toBe(0)
+      expect(replacementTurn.rotateCount).toBe(0)
+      expect(replacementTurn.rotating).toBeNull()
+      expect(replacementTurn.rotateGivenUp).toBe(false)
+    } finally {
+      const rotation = replacementTurn.rotating
+      if (rotation) await rotation
+      feishuMockState.sendCard = null
+      globalThis.fetch = healthyFetch
+      session.stopFooterStatus(oldTurn)
+      session.stopFooterStatus(replacementTurn)
+      await cardkit.dispose(oldTurn.cardId)
+      await cardkit.dispose(replacementTurn.cardId)
+    }
+  })
+
+  test('still rotates when the active card callback reports a write failure', async () => {
+    const session = new Session('current-card-write-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-current-card-write-failure')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.pendingTurnInputs = ['current card input']
+    session.wireProc(proc)
+    const openResult = await session.openTurnCard('ou_current', 'user_message', { startThinking: false })
+    if (openResult.kind !== 'opened') throw new Error('current turn card did not open')
+    const turn = openResult.turn
+    const failedCardId = turn.cardId
+    const healthyFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      if (init?.method === 'PUT' && path === `/cards/${failedCardId}/elements/footer`) {
+        return new Response(JSON.stringify({ code: 300308, msg: 'current card rejected' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return await healthyFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      await cardkit.replaceElement(failedCardId, 'footer', {
+        tag: 'markdown', element_id: 'footer', content: 'trigger current failure',
+      })
+      const rotation = turn.rotating
+
+      expect(turn.failureRotateCount).toBe(1)
+      expect(rotation).not.toBeNull()
+      if (rotation) await rotation
+      expect(turn.cardId).not.toBe(failedCardId)
+    } finally {
+      globalThis.fetch = healthyFetch
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
   // 2026-07-04 03:46 事故:turn 2 里 5 次正常满卡轮转(elementCount=50)把
   // rotateCount 耗光,第 2 次真实写失败(300308)一来就撞 cap 放弃。cap 的
   // 设计意图(session-types.ts)是只约束失败路径 —— 主动满卡轮转被真实输出
@@ -893,7 +3039,7 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
     turn.rotateCount = 5 // 5 次主动满卡轮转已发生,但从未因写失败换过卡
 
     try {
-      session.onCardWriteFailure(300308)
+      session.onCardWriteFailure('card_old', 300308)
 
       expect(turn.rotateGivenUp).toBe(false)
       expect(turn.rotating).not.toBeNull()
@@ -918,7 +3064,7 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
       session.startWritingFooter(turn)
       expect(turn.footerStatusHandle).not.toBeNull()
 
-      session.onCardWriteFailure(300308)
+      session.onCardWriteFailure('card_dead', 300308)
 
       expect(turn.rotateGivenUp).toBe(true)
       expect(turn.rotating).toBeNull() // 不再尝试换卡
@@ -1181,6 +3327,7 @@ describe('Session usage cache cross-backend isolation', () => {
 
     const session = new Session('probe', 'chat_id') as any
     const claudeProc = new FakeAgentProc('claude')
+    session.proc = claudeProc
     session.wireProc(claudeProc)
     // claude 的 rate_limit_info 形状(无 planType/primary/secondary):
     // truthy 但与 codex 完全不同,穿过共享 handler 会被包成空窗口 ok 快照。
@@ -1193,6 +3340,7 @@ describe('Session usage cache cross-backend isolation', () => {
   test('codex 的 rate_limits_updated 照常更新用量缓存', () => {
     const session = new Session('probe', 'chat_id') as any
     const codexProc = new FakeAgentProc('codex')
+    session.proc = codexProc
     session.wireProc(codexProc)
     codexProc.emit('rate_limits_updated', {
       planType: 'pro',

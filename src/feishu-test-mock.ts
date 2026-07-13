@@ -11,24 +11,30 @@
  * 捕获数组是共享可变状态,测试文件在 beforeEach 里调 resetFeishuMock()。
  */
 import { mock } from 'bun:test'
+import type { WatchdogMode } from './turn-watchdog'
 
 export const sentCards: object[] = []
 export const sentTexts: string[] = []
 export const sentRawTexts: string[] = []
+export const updatedCards: Array<[string, object]> = []
 export const deletedReactions: Array<[string, string]> = []
 export const boundResumes: Array<[string, string, string | undefined]> = []
 export const urgentPushes: Array<[string, string[]]> = []
 /** [projects.<name>] 项目 profile 替身,测试往里 set 后 Session 构造时可查到。 */
-export const projectProfiles = new Map<string, { cwd?: string }>()
+export const projectProfiles = new Map<string, { cwd?: string; watchdogMode?: WatchdogMode }>()
 /** chatIdForSession 替身返回值,测试可改。 */
-export const feishuMockState = { chatIdForSession: null as string | null }
+export const feishuMockState = {
+  chatIdForSession: null as string | null,
+  sendCard: null as null | ((chatId: string, card: object) => Promise<string | null>),
+}
 
 export function resetFeishuMock(): void {
-  for (const arr of [sentCards, sentTexts, sentRawTexts, deletedReactions, boundResumes, urgentPushes]) {
+  for (const arr of [sentCards, sentTexts, sentRawTexts, updatedCards, deletedReactions, boundResumes, urgentPushes]) {
     arr.length = 0
   }
   projectProfiles.clear()
   feishuMockState.chatIdForSession = null
+  feishuMockState.sendCard = null
 }
 
 mock.module('./feishu', () => ({
@@ -37,8 +43,9 @@ mock.module('./feishu', () => ({
   getSessionModelSelection: () => null,
   getTenantToken: async () => 'tenant-token',
   preferredChatForSession: new Map(),
-  sendCard: async (_chatId: string, card: object) => {
+  sendCard: async (chatId: string, card: object) => {
     sentCards.push(card)
+    if (feishuMockState.sendCard) return await feishuMockState.sendCard(chatId, card)
     return `om_status_${sentCards.length}`
   },
   sendText: async (_chatId: string, text: string) => {
@@ -61,7 +68,9 @@ mock.module('./feishu', () => ({
   bindSessionModel: () => {},
   provisionProject: () => {},
   projectProfile: (name: string) => projectProfiles.get(name),
-  updateCard: async () => {},
+  updateCard: async (messageId: string, card: object) => {
+    updatedCards.push([messageId, card])
+  },
   chatIdForSession: (_sessionName: string) => feishuMockState.chatIdForSession,
   // 临时群 / fork / back / rs 恢复相关 stub(测试不验证这些路径,no-op / 空返回)
   tempProjectName: () => null,

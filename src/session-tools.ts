@@ -7,6 +7,7 @@
 
 import type { Session } from './session'
 import type { TurnState } from './session-types'
+import type { AgentProcess } from './agent-process'
 import { isAbsolute } from 'node:path'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
@@ -30,7 +31,8 @@ export function autoSendPathFromToolResult(name: string, output: string, isError
   return isAbsolute(p) ? p : null
 }
 
-export function addTool(s: Session, toolUseId: string, name: string, input: any): void {
+export function addTool(s: Session, source: AgentProcess, toolUseId: string, name: string, input: any): void {
+  s.observeWatchdogToolStart(source, toolUseId, name, input)
   if (!s.currentTurn) return
   // 元素接近上限时 fire-and-forget kick off mid-turn rotation。check 是
   // O(1) 的(只查 cardkit 内部计数 Map),即使 in-batch Read 续走 replace
@@ -179,7 +181,8 @@ export function addTool(s: Session, toolUseId: string, name: string, input: any)
   })
 }
 
-export function completeTool(s: Session, toolUseId: string, content: any, isError: boolean): void {
+export function completeTool(s: Session, source: AgentProcess, toolUseId: string, content: any, isError: boolean): void {
+  s.observeWatchdogToolResult(source, toolUseId, content, isError)
   if (!s.currentTurn) return
   const meta = s.currentTurn.toolByUseId.get(toolUseId)
   if (!meta) return

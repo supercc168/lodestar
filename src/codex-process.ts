@@ -25,7 +25,7 @@ import {
   logUnhandledAppServerPayload,
 } from './codex-compaction'
 import { diffUsageTotals, effectiveTurnTokens, usageFromTokenUsagePayload } from './codex-usage'
-import type { AgentReasoningEffort } from './agent-process'
+import type { AgentReasoningEffort, CollabAgentStates } from './agent-process'
 
 /** 拼 `codex app-server` 命令行:把 provider 覆盖 `-c` 对插在 `--listen` 之前。 */
 export function buildCodexAppServerArgs(configArgs: string[] = []): string[] {
@@ -546,6 +546,11 @@ export class CodexProcess extends EventEmitter {
 
   private handleItemStarted(params: any): void {
     const item = params?.item
+    if (item?.type === 'subAgentActivity') {
+      const activity = mapSubAgentActivity(item)
+      if (activity) this.emit('subagent_activity', activity)
+      return
+    }
     if (!item?.id) {
       logUnhandledAppServerPayload('ITEM_STARTED_MISSING_ID', { method: 'item/started', params })
       return
@@ -560,7 +565,13 @@ export class CodexProcess extends EventEmitter {
 
   private handleItemCompleted(params: any): void {
     const item = params?.item
-    if (!item?.id) {
+    if (item?.type === 'subAgentActivity') {
+      const activity = mapSubAgentActivity(item)
+      if (activity) this.emit('subagent_activity', activity)
+      return
+    }
+    const isCollabAgentToolCall = item?.type === 'collabAgentToolCall'
+    if (!item?.id && !isCollabAgentToolCall) {
       logUnhandledAppServerPayload('ITEM_COMPLETED_MISSING_ID', { method: 'item/completed', params })
       return
     }
@@ -568,6 +579,18 @@ export class CodexProcess extends EventEmitter {
       this.lastAssistantUuid = item.id
       this.emit('assistant_block_stop', { index: item.id })
       return
+    }
+    if (isCollabAgentToolCall && item.agentsStates != null) {
+      if (typeof item.id !== 'string' || item.id.length === 0) {
+        logUnhandledAppServerPayload('COLLAB_AGENT_TOOL_ID_INVALID', { method: 'item/completed', params })
+      } else if (isCollabAgentStates(item.agentsStates)) {
+        this.emit('collab_agent_state', {
+          toolUseId: item.id,
+          agentsStates: item.agentsStates,
+        })
+      } else {
+        logUnhandledAppServerPayload('COLLAB_AGENT_STATES_INVALID', { method: 'item/completed', params })
+      }
     }
     const mapped = mapCompletedItem(item, this.sessionId ?? undefined)
     if (!mapped) {
@@ -1051,6 +1074,36 @@ export class CodexProcess extends EventEmitter {
       try { this.proc.kill('SIGKILL') } catch {}
     }
   }
+}
+
+function mapSubAgentActivity(item: any): {
+  activityId: string
+  agentThreadId: string
+  agentPath: string | null
+  kind: string
+} | null {
+  if (typeof item?.id !== 'string' || typeof item?.agentThreadId !== 'string') return null
+  return {
+    activityId: item.id,
+    agentThreadId: item.agentThreadId,
+    agentPath: typeof item.agentPath === 'string' ? item.agentPath : null,
+    kind: typeof item.kind === 'string' ? item.kind : 'unknown',
+  }
+}
+
+function isCollabAgentStates(value: unknown): value is CollabAgentStates {
+  if (!isPlainObject(value)) return false
+  return Object.values(value).every(state => {
+    if (!isPlainObject(state)) return false
+    const status = (state as { status?: unknown }).status
+    return status === undefined || typeof status === 'string'
+  })
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const prototype = Object.getPrototypeOf(value)
+  return prototype === Object.prototype || prototype === null
 }
 
 function mapStartedItem(item: any, workDir: string): { name: string; input: any } | null {

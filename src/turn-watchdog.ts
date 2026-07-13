@@ -235,8 +235,8 @@ export class TurnWatchdog {
     this.loopWarned = false
   }
 
-  observeToolStart(id: string, name: string, input: unknown, now: number): void {
-    if (this.turnKey === null) return
+  observeToolStart(id: string, name: string, input: unknown, now: number): boolean {
+    if (this.turnKey === null) return false
     const candidate = parseNoopExecCall(name, input)
     const reusedId = this.seenToolIds.has(id)
     this.seenToolIds.add(id)
@@ -244,28 +244,32 @@ export class TurnWatchdog {
       this.pendingCandidates.delete(id)
       this.activeRealTools.add(id)
       this.taintedToolIds.add(id)
-      if (!candidate) this.observeMeaningful(now, `tool_use:${name}`)
-      return
+      if (!candidate) {
+        this.observeMeaningful(now, `tool_use:${name}`)
+        return true
+      }
+      return false
     }
 
     if (candidate) {
       this.pendingCandidates.set(id, candidate)
-      return
+      return false
     }
 
     this.activeRealTools.add(id)
     this.observeMeaningful(now, `tool_use:${name}`)
+    return true
   }
 
-  observeToolResult(id: string, content: unknown, isError: boolean, now: number): void {
-    if (this.turnKey === null) return
-    if (this.taintedToolIds.has(id)) return
+  observeToolResult(id: string, content: unknown, isError: boolean, now: number): boolean {
+    if (this.turnKey === null) return false
+    if (this.taintedToolIds.has(id)) return false
     const candidate = this.pendingCandidates.get(id)
     if (candidate) {
       this.pendingCandidates.delete(id)
       if (isError || !matchesNoopExecResult(content, candidate.literal)) {
         this.observeMeaningful(now, 'tool_result:exec')
-        return
+        return true
       }
 
       if (this.fingerprintHash === candidate.fingerprintHash) this.repeatCount += 1
@@ -273,10 +277,12 @@ export class TurnWatchdog {
         this.fingerprintHash = candidate.fingerprintHash
         this.repeatCount = 1
       }
-      return
+      return false
     }
 
-    if (this.activeRealTools.delete(id)) this.observeMeaningful(now, 'tool_result')
+    if (!this.activeRealTools.delete(id)) return false
+    this.observeMeaningful(now, 'tool_result')
+    return true
   }
 
   consumeRecovery(): void {

@@ -40,6 +40,7 @@ import {
   type AgentProvider,
   type AgentReasoningEffort,
   type ClaudeReasoningEffort,
+  type CollabAgentStates,
 } from './agent-process'
 import {
   ClaudeAgentProcess,
@@ -51,6 +52,7 @@ import {
 } from './claude-agent-process'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
+import { watchdogFooterContent } from './cards/turn'
 import * as feishu from './feishu'
 import { log } from './log'
 import { readSysInfo } from './sysinfo'
@@ -83,8 +85,35 @@ import * as sessionModel from './session-model'
 import * as sessionTasklist from './session-tasklist'
 import * as sessionWorktree from './session-worktree'
 import * as sessionTemp from './session-temp'
+import { config } from './config'
+import {
+  DEFAULT_CODEX_WATCHDOG,
+  TurnWatchdog,
+  type WatchdogSafetySnapshot,
+  type WatchdogSettings,
+  type WatchdogVerdict,
+} from './turn-watchdog'
 
 export type { SessionOpts } from './session-types'
+
+export interface WatchdogTurnContext {
+  proc: AgentProcess
+  turn: TurnState
+  threadId: string | null
+  turnId: string | null
+}
+
+interface PendingWatchdogIdentity {
+  proc: AgentProcess
+  threadId: string | null
+  turnId: string | null
+  turnCounter: number | null
+}
+
+type TurnCardOpenResult =
+  | { kind: 'opened'; turn: TurnState }
+  | { kind: 'failed' }
+  | { kind: 'stale' }
 
 function compactionKey(notice: ContextCompactedNotification): string {
   return notice.itemId || notice.turnId || '__latest__'
@@ -103,6 +132,75 @@ function mergeCompactionNotices(
   if (!start) return end
   return { ...start, ...end, phase: 'end' }
 }
+
+function backgroundWatchdogSignature(active: cards.BgTaskEntry[], pending: cards.BgTaskEntry[]): string {
+  return JSON.stringify([...active, ...pending]
+    .map(task => ({
+      id: task.id,
+      status: task.status,
+      summary: task.summary,
+      usage: task.usage,
+      lastToolName: task.lastToolName,
+      error: task.error,
+      isBackgrounded: task.isBackgrounded,
+      steps: task.steps,
+      endTime: task.endTime,
+    }))
+    .sort((a, b) => a.id.localeCompare(b.id)))
+}
+
+function collabAgentEntries(value: CollabAgentStates): Array<[string, string]> {
+  return Object.entries(value).map(([id, state]) => [id, state.status ?? 'notFound'])
+}
+
+function stringMapSignature(value: Map<string, string>): string {
+  return JSON.stringify([...value.entries()].sort(([a], [b]) => a.localeCompare(b)))
+}
+
+function stringSetSignature(value: Set<string>): string {
+  return JSON.stringify([...value].sort())
+}
+
+function collabAgentPoolsSignature(value: Map<string, Map<string, string>>): string {
+  return JSON.stringify([...value.entries()]
+    .map(([toolUseId, states]) => [toolUseId, stringMapSignature(states)] as const)
+    .sort(([a], [b]) => a.localeCompare(b)))
+}
+
+function flattenCollabAgentStates(
+  pools: Map<string, Map<string, string>>,
+): Map<string, string> {
+  const flattened = new Map<string, string>()
+  for (const pool of pools.values()) {
+    for (const [agentThreadId, status] of pool) {
+      const previous = flattened.get(agentThreadId)
+      const statusIsRunning = status === 'pendingInit' || status === 'running'
+      const previousIsRunning = previous === 'pendingInit' || previous === 'running'
+      if (!previous || statusIsRunning || !previousIsRunning) flattened.set(agentThreadId, status)
+    }
+  }
+  return flattened
+}
+
+function removeCollabAgentsFromAllPools(
+  pools: Map<string, Map<string, string>>,
+  agentThreadIds: Iterable<string>,
+): void {
+  const terminalAgents = new Set(agentThreadIds)
+  if (terminalAgents.size === 0) return
+  for (const [toolUseId, pool] of pools) {
+    for (const agentThreadId of terminalAgents) pool.delete(agentThreadId)
+    if (pool.size === 0) pools.delete(toolUseId)
+  }
+}
+
+const TERMINAL_COLLAB_AGENT_STATES = new Set([
+  'interrupted',
+  'completed',
+  'errored',
+  'shutdown',
+  'notFound',
+])
 
 const FOOTER_STATUS_TICK_MS = 1000
 /** 后台游标卡周期刷新间隔:无 task_progress 事件的 shell 后台任务(如 codex exec)靠
@@ -380,6 +478,20 @@ export class Session {
    * 工具完成时由 session-tools.ts 调 applyTaskTool 更新,渲染整个 board 而非
    * 孤立的单条 —— 见 cards/task-board.ts。 */
   taskBoard: cards.TaskBoardEntry[] = []
+  readonly watchdog: TurnWatchdog
+  readonly watchdogSettings: WatchdogSettings
+  watchdogContext: WatchdogTurnContext | null = null
+  watchdogActionInFlight = false
+  watchdogTickHandle: ReturnType<typeof setInterval> | null = null
+  modelSwitchPending = false
+  codexCollabAgentStates = new Map<string, string>()
+  codexCollabAgentStatesByTool = new Map<string, Map<string, string>>()
+  codexSubagentActivityIds = new Set<string>()
+  activeCodexSubagentActivities = new Set<string>()
+  pendingWatchdogIdentity: PendingWatchdogIdentity | null = null
+  watchdogOpeningTurnCounter: number | null = null
+  watchdogOpeningProc: AgentProcess | null = null
+  watchdogOpeningToken: object | null = null
 
   constructor(
     public readonly sessionName: string,
@@ -409,6 +521,17 @@ export class Session {
     if (this.selectedModel) {
       log(`session "${sessionName}": restored selected provider=${this.selectedProvider} model=${this.selectedModel} effort=${this.selectedEffort ?? 'unset'}`)
     }
+    const projectName = feishu.tempProjectName(sessionName) ?? sessionName
+    const projectWatchdogMode = feishu.projectProfile(projectName)?.watchdogMode
+    const configuredWatchdog = config.watchdog
+    this.watchdogSettings = {
+      mode: projectWatchdogMode ?? configuredWatchdog?.codexMode ?? DEFAULT_CODEX_WATCHDOG.mode,
+      stallMs: configuredWatchdog?.stallMs ?? DEFAULT_CODEX_WATCHDOG.stallMs,
+      repeatNoopLimit: configuredWatchdog?.repeatNoopLimit ?? DEFAULT_CODEX_WATCHDOG.repeatNoopLimit,
+      silentWarnMs: configuredWatchdog?.silentWarnMs ?? DEFAULT_CODEX_WATCHDOG.silentWarnMs,
+      interruptGraceMs: configuredWatchdog?.interruptGraceMs ?? DEFAULT_CODEX_WATCHDOG.interruptGraceMs,
+    }
+    this.watchdog = new TurnWatchdog(this.watchdogSettings)
     // Restore last-known thread/session id for the selected backend from
     // disk so a daemon restart (systemctl, crash, watchdog) doesn't
     // strand the user with a fresh conversation when they next type
@@ -439,6 +562,151 @@ export class Session {
   }
   isRunning(): boolean { return !!this.proc && this.proc.isAlive() }
   currentProvider(): AgentProvider { return this.selectedProvider }
+
+  beginWatchdogTurn(turn: TurnState, proc: AgentProcess, now = Date.now()): void {
+    this.endWatchdogTurn()
+    if (
+      proc.provider !== 'codex' ||
+      !proc.isAlive() ||
+      this.watchdogSettings.mode === 'off' ||
+      this.proc !== proc ||
+      this.currentTurn !== turn
+    ) return
+
+    this.watchdog.beginTurn(`turn:${this.turnCounter}`, turn.trigger, now)
+    this.watchdogContext = {
+      proc,
+      turn,
+      threadId: proc.sessionId,
+      turnId: null,
+    }
+    const pending = this.pendingWatchdogIdentity
+    if (
+      pending?.proc === proc &&
+      pending.turnCounter === this.turnCounter &&
+      (!proc.sessionId || !pending.threadId || pending.threadId === proc.sessionId)
+    ) {
+      this.applyWatchdogIdentity(pending.threadId, pending.turnId)
+    }
+    this.pendingWatchdogIdentity = null
+  }
+
+  endWatchdogTurn(): void {
+    this.watchdog.endTurn()
+    this.watchdogContext = null
+    if (!this.proc) this.clearCodexProcessActivityState()
+  }
+
+  private clearCodexProcessActivityState(): void {
+    this.codexCollabAgentStates.clear()
+    this.codexCollabAgentStatesByTool.clear()
+    this.codexSubagentActivityIds.clear()
+    this.activeCodexSubagentActivities.clear()
+  }
+
+  watchdogContextIsCurrent(ctx: WatchdogTurnContext): boolean {
+    return this.watchdogContext === ctx && this.currentTurn === ctx.turn && this.proc === ctx.proc && ctx.proc.isAlive() &&
+      (!ctx.threadId || (ctx.proc.sessionId === ctx.threadId && ctx.turn.backendThreadId === ctx.threadId)) &&
+      (!ctx.turnId || ctx.turn.backendTurnId === ctx.turnId)
+  }
+
+  hasQueuedHumanWork(): boolean {
+    return this.pendingMidTurnMsgs.length > 0 ||
+      this.pendingTurnInputs.length > 0 ||
+      this.multiMsgBuffer !== null
+  }
+
+  watchdogSafetySnapshot(ctx: WatchdogTurnContext): WatchdogSafetySnapshot {
+    const watchdog = this.watchdog.snapshot()
+    const backgroundWorkRunning =
+      this.backgroundTasks.some(task => !cards.isBgTerminal(task)) ||
+      this.pendingBgTasks.some(task => !cards.isBgTerminal(task)) ||
+      this.activeCodexSubagentActivities.size > 0 ||
+      this.codexCollabAgentStates.size > 0
+    return {
+      currentTurn: this.watchdogContextIsCurrent(ctx) && !!ctx.threadId && !!ctx.turnId,
+      eligibleTrigger: ['user_message', 'bg_task_resume', 'watchdog_resume'].includes(ctx.turn.trigger),
+      realToolRunning: watchdog.pendingCandidateCount > 0 || watchdog.activeRealToolCount > 0,
+      backgroundWorkRunning,
+      awaitingInput: this.pendingPermissions.size > 0 || this.pendingAsks.size > 0 || this.pendingHostAsks.size > 0,
+      compactionRunning: this.manualContextCompactionPending || ctx.turn.contextCompactionPending.size > 0,
+      rotationRunning: ctx.turn.rotating !== null,
+      agyRunning: this.startingAgy || this.runningAgy !== null,
+      queuedHumanWork: this.hasQueuedHumanWork(),
+      modelSwitchPending: this.modelSwitchPending,
+      recoveryActionInFlight: this.watchdogActionInFlight,
+    }
+  }
+
+  observeWatchdogToolStart(source: AgentProcess, id: string, name: string, input: unknown): void {
+    const context = this.watchdogContext
+    if (!context || context.proc !== source || this.proc !== source || !this.watchdogContextIsCurrent(context)) return
+    if (this.watchdog.observeToolStart(id, name, input, Date.now())) {
+      this.clearWatchdogFooterWarning(context)
+    }
+  }
+
+  observeWatchdogToolResult(source: AgentProcess, id: string, content: unknown, isError: boolean): void {
+    const context = this.watchdogContext
+    if (!context || context.proc !== source || this.proc !== source || !this.watchdogContextIsCurrent(context)) return
+    if (this.watchdog.observeToolResult(id, content, isError, Date.now())) {
+      this.clearWatchdogFooterWarning(context)
+    }
+  }
+
+  observeWatchdogMeaningful(source: AgentProcess, label: string): boolean {
+    const context = this.watchdogContext
+    if (this.proc !== source || context?.proc !== source || !this.watchdogContextIsCurrent(context)) return false
+    this.watchdog.observeMeaningful(Date.now(), label)
+    this.clearWatchdogFooterWarning(context)
+    return true
+  }
+
+  private clearWatchdogFooterWarning(context: WatchdogTurnContext): void {
+    if (!context.turn.footerStatusOverride) return
+    context.turn.footerStatusOverride = null
+    this.renderFooterStatus(context.turn)
+  }
+
+  applyWatchdogWarning(verdict: WatchdogVerdict): void {
+    if (verdict.type !== 'silent_warn' && verdict.type !== 'loop_warn') return
+    const context = this.watchdogContext
+    if (!context || !this.watchdogContextIsCurrent(context)) return
+    context.turn.footerStatusOverride = watchdogFooterContent(verdict.type)
+    this.renderFooterStatus(context.turn)
+  }
+
+  private applyWatchdogIdentity(threadId: string | null, turnId: string | null): void {
+    const context = this.watchdogContext
+    if (!context || this.currentTurn !== context.turn || this.proc !== context.proc) return
+    context.threadId = threadId ?? context.proc.sessionId
+    context.turnId = turnId
+    context.turn.backendThreadId = context.threadId
+    context.turn.backendTurnId = turnId
+  }
+
+  private finishWatchdogOpening(
+    turnCounter: number,
+    discardPending: boolean,
+    openingProc: AgentProcess | null,
+    openingToken: object,
+  ): void {
+    const ownsOpening =
+      this.watchdogOpeningToken === openingToken &&
+      this.watchdogOpeningTurnCounter === turnCounter &&
+      (!openingProc || this.watchdogOpeningProc === openingProc)
+    if (!ownsOpening) return
+    this.watchdogOpeningTurnCounter = null
+    this.watchdogOpeningProc = null
+    this.watchdogOpeningToken = null
+    if (
+      discardPending &&
+      this.pendingWatchdogIdentity?.turnCounter === turnCounter &&
+      (!openingProc || this.pendingWatchdogIdentity.proc === openingProc)
+    ) {
+      this.pendingWatchdogIdentity = null
+    }
+  }
 
   hasRunningPeerSession(sessionName: string): boolean {
     return [...Session.all].some(s => s.sessionName === sessionName && s.isRunning())
@@ -564,6 +832,7 @@ export class Session {
     const proc = this.proc
     log(`session "${this.sessionName}": stop idle ${proc.provider} process after switching to ${this.selectedProvider}`)
     this.proc = null
+    this.clearCodexProcessActivityState()
     this.initCount = 0
     // 进程换掉:恢复轮标记 / 孤儿缓冲随旧进程作废,否则会泄漏到新进程的
     // boot init,把一次干净启动误判成 bg_task_resume 轮开出幽灵卡。
@@ -584,6 +853,7 @@ export class Session {
     const proc = this.proc
     log(`session "${this.sessionName}": stop idle ${proc.provider} process: ${reason}`)
     this.proc = null
+    this.clearCodexProcessActivityState()
     this.initCount = 0
     this.bgResumePending = false
     this.sawResultWhileOpening = false
@@ -794,6 +1064,7 @@ export class Session {
       if (announce) await feishu.sendText(this.chatId, `❌ ${backend} 启动失败: ${detail}`)
       await this.proc?.kill(1000).catch(() => {})
       this.proc = null
+      this.clearCodexProcessActivityState()
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
       return false
@@ -919,6 +1190,15 @@ export class Session {
     this.currentBatchReactionIds = new Map()
   }
 
+  private releaseBatchReactions(messageIds: Iterable<string>): void {
+    for (const msgId of messageIds) {
+      const rid = this.currentBatchReactionIds.get(msgId)
+      if (rid === undefined) continue
+      this.currentBatchReactionIds.delete(msgId)
+      if (rid) void feishu.deleteReaction(msgId, rid)
+    }
+  }
+
   clearStaleIdleQueueState(reason: string): void {
     if (this.initCount < 1 || this.currentTurn || this.openingTurn || this.pendingUserMessageCount === 0) return
     log(`session "${this.sessionName}": clear stale pending queue before ${reason} pendingCount=${this.pendingUserMessageCount} reactions=${this.pendingReactionIds.size}`)
@@ -956,6 +1236,11 @@ export class Session {
     this.proc = null
     this.stopFooterStatus(this.currentTurn)
     this.currentTurn = null
+    this.endWatchdogTurn()
+    this.pendingWatchdogIdentity = null
+    this.watchdogOpeningTurnCounter = null
+    this.watchdogOpeningProc = null
+    this.watchdogOpeningToken = null
     this.clearMultiMsgBuffer('stop')
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
@@ -1016,6 +1301,11 @@ export class Session {
     }
     this.stopFooterStatus(this.currentTurn)
     this.currentTurn = null
+    this.endWatchdogTurn()
+    this.pendingWatchdogIdentity = null
+    this.watchdogOpeningTurnCounter = null
+    this.watchdogOpeningProc = null
+    this.watchdogOpeningToken = null
     this.clearMultiMsgBuffer('restart')
     this.pendingUserMessageCount = 0
     this.pendingMidTurnMsgs = []
@@ -1075,6 +1365,7 @@ export class Session {
         if (announceText) await feishu.sendText(this.chatId, finalStatus)
         await this.proc?.kill(1000).catch(() => {})
         this.proc = null
+        this.clearCodexProcessActivityState()
         this.status = 'stopped'
         this.opts.onLifecycleChange?.()
         await closeInternalStatusCard(finalStatus)
@@ -1389,13 +1680,14 @@ export class Session {
     this.resetFreshConversationState()
     this.pendingTurnInputs.push(text)
     try {
-      await this.openTurnCard(userOpenId, 'user_message', {
+      const openResult = await this.openTurnCard(userOpenId, 'user_message', {
         initialFooter: 'Waiting...(0s)',
         startThinking: false,
         directStart: true,
       })
-      const turn = this.currentTurn
-      if (!turn) return
+      if (openResult.kind !== 'opened') return
+      const turn = openResult.turn
+      if (this.currentTurn !== turn) return
       const bootTimer = this.startFooterTimer(
         turn.cardId,
         `🚀 启动 ${this.backendLabel()}`,
@@ -1411,7 +1703,16 @@ export class Session {
         },
       })
       bootTimer.stop()
+      if (this.currentTurn !== turn) {
+        await this.settleCapturedStaleTurn(turn)
+        return
+      }
+      const startedProc = ok ? this.proc : null
       await cardkit.flush(turn.cardId)
+      if (this.currentTurn !== turn) {
+        await this.settleCapturedStaleTurn(turn)
+        return
+      }
       if (!ok) {
         this.pendingUserMessageCount = 0
         this.pendingMidTurnMsgs = []
@@ -1421,8 +1722,13 @@ export class Session {
         await this.closeTurnCard(lastBootStatus.startsWith('❌') ? lastBootStatus : '❌ 启动失败', { forcePush: true })
         return
       }
+      if (!startedProc || this.proc !== startedProc || !startedProc.isAlive()) {
+        await this.settleCapturedStaleTurn(turn)
+        return
+      }
+      this.beginWatchdogTurn(turn, startedProc)
       this.startThinkingFooter(turn)
-      this.proc!.sendUserText(wireText, [])
+      startedProc.sendUserText(wireText, [])
       this.pendingUserMessageCount++
       this.status = 'working'
     } finally {
@@ -1551,10 +1857,17 @@ export class Session {
         // openTurnCard 内部读 pendingTurnInputs 渲染 "📥 收到" panel,要在
         // 它之前 push;之后再 sendUserText 给 SDK,顺序无关紧要(panel 是
         // daemon 自渲染,跟 SDK input 流分离)。
+        const proc = this.proc
+        if (!proc) return
         this.pendingTurnInputs.push(text)
-        await this.openTurnCard(userOpenId, 'user_message')
-        if (!this.currentTurn) return
-        this.proc!.sendUserText(wireText, [])
+        const openResult = await this.openTurnCard(userOpenId, 'user_message', { expectedProc: proc })
+        if (
+          openResult.kind !== 'opened' ||
+          this.currentTurn !== openResult.turn ||
+          this.proc !== proc ||
+          !proc.isAlive()
+        ) return
+        proc.sendUserText(wireText, [])
         this.pendingUserMessageCount++
         this.status = 'working'
       } finally {
@@ -1644,17 +1957,27 @@ export class Session {
     return sessionPermission.onPermissionDecision(this, requestId, decision, user)
   }
 
-  async startHostAskContinuation(wireText: string): Promise<void> {
-    if (!this.isRunning()) throw new Error(`${this.backendLabel()} is not running`)
-    if (this.proc?.provider !== 'codex') throw new Error('askusr host continuation is only supported by Codex')
+  async startHostAskContinuation(
+    wireText: string,
+    expectedProc: AgentProcess,
+  ): Promise<'started' | 'stale'> {
+    if (this.proc !== expectedProc || !expectedProc.isAlive()) return 'stale'
+    if (expectedProc.provider !== 'codex') throw new Error('askusr host continuation is only supported by Codex')
     if (this.currentTurn || this.openingTurn) throw new Error(`${this.backendLabel()} turn still active`)
     this.openingTurn = true
     try {
-      await this.openTurnCard('', 'user_message')
-      if (!this.currentTurn) throw new Error('failed to open continuation turn card')
-      this.proc!.sendUserText(wireText, [])
+      const openResult = await this.openTurnCard('', 'user_message', { expectedProc })
+      if (openResult.kind === 'failed') throw new Error('failed to open continuation turn card')
+      if (
+        openResult.kind !== 'opened' ||
+        this.currentTurn !== openResult.turn ||
+        this.proc !== expectedProc ||
+        !expectedProc.isAlive()
+      ) return 'stale'
+      expectedProc.sendUserText(wireText, [])
       this.pendingUserMessageCount++
       this.status = 'working'
+      return 'started'
     } finally {
       this.openingTurn = false
     }
@@ -1905,10 +2228,12 @@ export class Session {
   }
 
   private wireProc(p: AgentProcess): void {
+    this.clearCodexProcessActivityState()
     p.on('error', err => {
       log(`session "${this.sessionName}": ${p.provider} process error: ${err}`)
     })
     p.on('init', () => {
+      if (this.proc !== p) return
       this.persistResumableSessionId()
       this.initCount++
       log(`session "${this.sessionName}": SDK init#${this.initCount} pendingCount=${this.pendingUserMessageCount} midBuffer=${this.pendingMidTurnMsgs.length} currentTurn=${this.currentTurn ? 'yes' : 'no'} openingTurn=${this.openingTurn}`)
@@ -1950,8 +2275,13 @@ export class Session {
       this.sawResultWhileOpening = false // 本次开卡的竞态标记,落地时判定
       void (async () => {
         try {
-          await this.openTurnCard(userOpenId, isUserBatch ? 'user_message' : 'bg_task_resume')
-          if (!this.currentTurn) {
+          const openResult = await this.openTurnCard(
+            userOpenId,
+            isUserBatch ? 'user_message' : 'bg_task_resume',
+            { expectedProc: p },
+          )
+          if (this.proc !== p || openResult.kind === 'stale') return
+          if (openResult.kind === 'failed') {
             if (isUserBatch) {
               // SDK already started this turn (its `init` is what got us
               // here) but we have no card to render into. Interrupt so
@@ -1976,24 +2306,55 @@ export class Session {
                 log(`session "${this.sessionName}": bg-resume openTurnCard failed — orphan text flush will cover the output`)
               }
             }
+          } else if (this.currentTurn !== openResult.turn) {
+            return
           } else if (this.sawResultWhileOpening) {
+            const openedTurn = openResult.turn
             // 卡片开成了,但这一轮的 result 已在开卡 await 窗口内到达 ——
             // result 处理器当时 currentTurn 还是 null,closeTurnCard 空转了。
             // 这里补一次收尾,否则卡片 footer 永远计时、session 卡在 working。
             this.sawResultWhileOpening = false
             log(`session "${this.sessionName}": result raced card-open — closing freshly-opened turn card now`)
             await this.closeTurnCard(undefined, { hasFreshResult: true })
+            if (
+              this.proc !== p ||
+              (this.currentTurn !== null && this.currentTurn !== openedTurn)
+            ) return
             this.status = 'idle'
           } else {
             this.status = 'working'
           }
         } finally {
-          this.openingTurn = false
+          if (this.proc === p) this.openingTurn = false
         }
       })()
     })
-    p.on('turn_started', () => {
+    p.on('turn_started', (identity: { turn_id?: string | null; thread_id?: string | null }) => {
+      if (this.proc !== p) return
       this.persistResumableSessionId()
+      const threadId = typeof identity?.thread_id === 'string' ? identity.thread_id : p.sessionId
+      const turnId = typeof identity?.turn_id === 'string' ? identity.turn_id : null
+      const context = this.watchdogContext
+      if (
+        this.proc === p &&
+        context?.proc === p &&
+        context.turn === this.currentTurn &&
+        (!context.threadId || !threadId || context.threadId === threadId)
+      ) {
+        this.applyWatchdogIdentity(threadId, turnId)
+      } else if (
+        this.proc === p &&
+        p.provider === 'codex' &&
+        this.watchdogSettings.mode !== 'off' &&
+        (this.openingTurn || this.pendingTurnInputs.length > 0 || this.pendingUserMessageCount > 0)
+      ) {
+        this.pendingWatchdogIdentity = {
+          proc: p,
+          threadId,
+          turnId,
+          turnCounter: this.watchdogOpeningTurnCounter,
+        }
+      }
       const total = this.proc?.lastTotalUsage
       if (this.usageTotalsSeedUnknown && !total) {
         this.currentTurnUsageBaseline = null
@@ -2004,34 +2365,44 @@ export class Session {
       this.currentTurnUsageBaselineKnown = true
     })
     p.on('token_usage', ({ totalUsage }: TokenUsageUpdated) => {
+      if (this.proc !== p) return
       this.persistResumableSessionId()
       if (totalUsage) this.usageTotalsSeedUnknown = false
     })
     p.on('turn_plan_updated', (plan: TurnPlanUpdated) => {
-      this.handleTurnPlanUpdated(plan)
+      if (this.proc !== p) return
+      this.handleTurnPlanUpdated(p, plan)
     })
     p.on('plan_delta', (delta: PlanDelta) => {
-      this.handlePlanDelta(delta)
+      if (this.proc !== p) return
+      this.handlePlanDelta(p, delta)
     })
     p.on('context_compacted', (notice: ContextCompactedNotification) => {
-      this.handleContextCompacted(notice)
+      if (this.proc !== p) return
+      this.handleContextCompacted(p, notice)
     })
     p.on('rate_limits_updated', (rateLimits: any) => {
+      if (this.proc !== p) return
       // usage.ts 的缓存是 codex 专属(planType/primary/secondary 形状)。claude
       // 的 rate_limit_info 形状不同但同样 truthy,写入会把 codex 快照覆盖成
       // 全 null 的假 ok 数据 —— 只放行 codex 进程的事件。
       if (p.provider === 'codex') updateUsageFromRateLimits(rateLimits)
     })
     p.on('thread_goal_updated', (goal: ThreadGoal) => {
-      this.handleThreadGoalUpdated(goal)
+      if (this.proc !== p) return
+      this.handleThreadGoalUpdated(p, goal)
     })
     p.on('thread_goal_cleared', () => {
-      this.handleThreadGoalCleared()
+      if (this.proc !== p) return
+      this.handleThreadGoalCleared(p)
     })
     p.on('assistant_text', ({ text }: { text: string }) => {
+      if (this.proc !== p) return
+      if (text.trim()) this.observeWatchdogMeaningful(p, 'assistant_text')
       this.appendAssistant(text)
     })
     p.on('assistant_block_stop', () => {
+      if (this.proc !== p) return
       // 一段 content block 收尾(SSE content_block_stop)→ 把当前 assistant 段
       // 静态化成完整 markdown,然后 reset 段游标让下一段开新元素。这条 emit 在该段最后一个
       // text_delta 之后同步到达(codex-process 按 stdout 行序 emit),所以
@@ -2041,7 +2412,8 @@ export class Session {
       this.onMainThreadAdvance()
     })
     p.on('tool_use', ({ id, name, input, parentToolUseId }: { id: string; name: string; input: any; parentToolUseId: string | null }) => {
-      sessionTools.addTool(this, id, name, input)
+      if (this.proc !== p) return
+      sessionTools.addTool(this, p, id, name, input)
       // 主线程发起新 tool_use = 主 agent 没在等 pending 里的 task → 它们是后台,提升入卡。
       // 前台 task 的 settled 先于主线程下一个 tool_use 到达,pending 已空,不会误提。
       if (!parentToolUseId) this.onMainThreadAdvance()
@@ -2059,7 +2431,8 @@ export class Session {
       }
     })
     p.on('tool_result', ({ tool_use_id, content, is_error, parentToolUseId }: any) => {
-      sessionTools.completeTool(this, tool_use_id, content, is_error)
+      if (this.proc !== p) return
+      sessionTools.completeTool(this, p, tool_use_id, content, is_error)
       if (parentToolUseId && this.bgTaskOwns(parentToolUseId)) {
         this.applyBgStore(cards.applyBgToolResult(
           { active: this.backgroundTasks, pending: this.pendingBgTasks },
@@ -2068,14 +2441,88 @@ export class Session {
         this.onBackgroundTaskChanged()
       }
     })
+    p.on('subagent_activity', (activity: {
+      activityId: string
+      agentThreadId: string
+      agentPath: string | null
+      kind: string
+    }) => {
+      const context = this.watchdogContext
+      const contextIsCurrent = !!context && context.proc === p && this.watchdogContextIsCurrent(context)
+      const terminal = activity?.kind === 'interrupted'
+      if (
+        this.proc !== p ||
+        typeof activity?.activityId !== 'string' ||
+        typeof activity?.agentThreadId !== 'string' ||
+        (!contextIsCurrent && !terminal) ||
+        this.codexSubagentActivityIds.has(activity.activityId)
+      ) return
+      this.codexSubagentActivityIds.add(activity.activityId)
+      if (activity.kind === 'started') this.activeCodexSubagentActivities.add(activity.agentThreadId)
+      if (terminal && !this.codexCollabAgentStates.has(activity.agentThreadId)) {
+        this.activeCodexSubagentActivities.delete(activity.agentThreadId)
+      }
+      if (contextIsCurrent) this.observeWatchdogMeaningful(p, `subagent_activity:${activity.kind || 'unknown'}`)
+    })
+    p.on('collab_agent_state', ({ toolUseId, agentsStates }: { toolUseId: string; agentsStates: CollabAgentStates }) => {
+      if (this.proc !== p || typeof toolUseId !== 'string' || !toolUseId) return
+      const context = this.watchdogContext
+      const contextIsCurrent = !!context && context.proc === p && this.watchdogContextIsCurrent(context)
+      const entries = collabAgentEntries(agentsStates)
+      if (!contextIsCurrent) {
+        const terminalAgents = entries
+          .filter(([, status]) => TERMINAL_COLLAB_AGENT_STATES.has(status))
+          .map(([agentThreadId]) => agentThreadId)
+        if (terminalAgents.length === 0) return
+        removeCollabAgentsFromAllPools(this.codexCollabAgentStatesByTool, terminalAgents)
+        this.codexCollabAgentStates = flattenCollabAgentStates(this.codexCollabAgentStatesByTool)
+        for (const agentThreadId of terminalAgents) {
+          if (!this.codexCollabAgentStates.has(agentThreadId)) {
+            this.activeCodexSubagentActivities.delete(agentThreadId)
+          }
+        }
+        return
+      }
+      const beforeMap = stringMapSignature(this.codexCollabAgentStates)
+      const beforePools = collabAgentPoolsSignature(this.codexCollabAgentStatesByTool)
+      const beforeActive = stringSetSignature(this.activeCodexSubagentActivities)
+      const nextPool = new Map<string, string>()
+      const terminalAgents = new Set<string>()
+      for (const [agentThreadId, status] of entries) {
+        if (TERMINAL_COLLAB_AGENT_STATES.has(status)) {
+          terminalAgents.add(agentThreadId)
+          continue
+        }
+        nextPool.set(agentThreadId, status)
+      }
+      if (nextPool.size > 0) this.codexCollabAgentStatesByTool.set(toolUseId, nextPool)
+      else this.codexCollabAgentStatesByTool.delete(toolUseId)
+      removeCollabAgentsFromAllPools(this.codexCollabAgentStatesByTool, terminalAgents)
+      this.codexCollabAgentStates = flattenCollabAgentStates(this.codexCollabAgentStatesByTool)
+      for (const agentThreadId of terminalAgents) {
+        if (!this.codexCollabAgentStates.has(agentThreadId)) {
+          this.activeCodexSubagentActivities.delete(agentThreadId)
+        }
+      }
+      if (
+        beforeMap !== stringMapSignature(this.codexCollabAgentStates) ||
+        beforePools !== collabAgentPoolsSignature(this.codexCollabAgentStatesByTool) ||
+        beforeActive !== stringSetSignature(this.activeCodexSubagentActivities)
+      ) {
+        this.observeWatchdogMeaningful(p, 'collab_agent_state')
+      }
+    })
     p.on('can_use_tool', (req: CanUseToolRequest) => {
+      if (this.proc !== p) return
       sessionPermission.renderPermission(this, req)
     })
     p.on('hook_callback', (req: HookCallbackRequest) => {
+      if (this.proc !== p) return
       // No hooks registered → fail-safe ack.
       this.proc?.sendHookResponse(req.request_id, {})
     })
     p.on('result', () => {
+      if (this.proc !== p) return
       this.persistResumableSessionId()
       this.accumulateResultStats()
       // result 抢在 openTurnCard 的 await 窗口内到达:标记给开卡 IIFE,
@@ -2128,25 +2575,42 @@ export class Session {
       }
     })
     p.on('bg_task_started', (e: BgTaskStartedEvent) => {
+      if (this.proc !== p) return
+      const before = backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)
       // SDK 若没填 tool_use_id,用最近的主线程 Task tool_use id 兜底 —— 子 agent 消息
       //  的 parent_tool_use_id 等于它,据此才能把 steps 关联到 task。
       const toolUseId = e.tool_use_id ?? this.lastMainTaskToolUseId ?? undefined
       log(`session "${this.sessionName}": bg_task_started task=${e.task_id} type=${e.task_type ?? '-'} subagent=${e.subagent_type ?? '-'} toolUseId=${toolUseId?.slice(0, 8) ?? '-'} desc=${(e.description ?? '').slice(0, 40)}`)
       this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), { ...e, tool_use_id: toolUseId }))
+      if (before !== backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)) {
+        this.observeWatchdogMeaningful(p, 'bg_task_started')
+      }
       this.onBackgroundTaskChanged()
     })
     p.on('bg_task_progress', (e: BgTaskProgressEvent) => {
+      if (this.proc !== p) return
+      const before = backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)
       this.tryResurrectBgTask(e.task_id, 'progress')
       this.applyBgStore(cards.applyBgTaskProgress(this.bgStore(), e))
+      if (before !== backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)) {
+        this.observeWatchdogMeaningful(p, 'bg_task_progress')
+      }
       this.onBackgroundTaskChanged()
     })
     p.on('bg_task_updated', (e: BgTaskUpdatedEvent) => {
+      if (this.proc !== p) return
+      const before = backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)
       log(`session "${this.sessionName}": bg_task_updated task=${e.task_id} patch=${JSON.stringify(e.patch ?? {}).slice(0, 100)}`)
       this.tryResurrectBgTask(e.task_id, 'updated')
       this.applyBgStore(cards.applyBgTaskUpdated(this.bgStore(), e))
+      if (before !== backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)) {
+        this.observeWatchdogMeaningful(p, 'bg_task_updated')
+      }
       this.onBackgroundTaskChanged()
     })
     p.on('bg_task_settled', (e: BgTaskSettledEvent) => {
+      if (this.proc !== p) return
+      const before = backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)
       log(`session "${this.sessionName}": bg_task_settled task=${e.task_id} status=${e.status}`)
       if (!this.bgTaskKnown(e.task_id)) {
         // 双池都不认识的终态:热续跑全程零运行期事件,只来这一条 task_notification。
@@ -2155,6 +2619,9 @@ export class Session {
       } else {
         this.applyBgStore(cards.applyBgTaskSettled(this.bgStore(), e))
         this.onBackgroundTaskChanged()
+      }
+      if (before !== backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)) {
+        this.observeWatchdogMeaningful(p, 'bg_task_settled')
       }
       // turn 已收尾后才结算的任务:SDK 会自发开一轮恢复轮合并结果,
       // 标记给下一个无用户批次的 init 开卡。
@@ -2178,6 +2645,11 @@ export class Session {
       this.sawResultWhileOpening = false
       this.stopFooterStatus(this.currentTurn)
       this.currentTurn = null
+      this.endWatchdogTurn()
+      this.pendingWatchdogIdentity = null
+      this.watchdogOpeningTurnCounter = null
+      this.watchdogOpeningProc = null
+      this.watchdogOpeningToken = null
       this.clearMultiMsgBuffer('process exit')
       this.pendingUserMessageCount = 0
       this.pendingMidTurnMsgs = []
@@ -2280,8 +2752,12 @@ export class Session {
    * SDK 不会自发开 user_batch 子 turn。 */
   private async drainMidTurnAndOpen(): Promise<void> {
     if (this.pendingMidTurnMsgs.length === 0) return
+    const proc = this.proc
+    if (!proc?.isAlive()) return
     const batch = this.pendingMidTurnMsgs
     this.pendingMidTurnMsgs = []
+    const batchReactionMessageIds = new Set<string>()
+    let opened = false
     this.openingTurn = true
     try {
       // daemon-side state: panel inputs + reaction transfer。不走 sendUserText,
@@ -2292,41 +2768,167 @@ export class Session {
           const rid = this.pendingReactionIds.get(msg.msgId) ?? ''
           this.currentBatchReactionIds.set(msg.msgId, rid)
           this.pendingReactionIds.delete(msg.msgId)
+          batchReactionMessageIds.add(msg.msgId)
         }
       }
       // wireText 每条已经在 onUserMessage 内 inline 了自己的 file hint;
       // SDK side files 一律传空,避免 file ↔ message 归属丢失(P1-1)。
       const merged = batch.map(m => m.wireText).join('\n\n')
-      this.proc!.sendUserText(merged, [])
-      this.pendingUserMessageCount++
       const last = batch[batch.length - 1]
       const userOpenId = last?.userOpenId ?? this.lastUserOpenId
-      await this.openTurnCard(userOpenId, 'user_message')
+      const openResult = await this.openTurnCard(userOpenId, 'user_message', { expectedProc: proc })
+      if (
+        openResult.kind !== 'opened' ||
+        this.currentTurn !== openResult.turn ||
+        this.proc !== proc ||
+        !proc.isAlive()
+      ) return
+      proc.sendUserText(merged, [])
+      opened = true
+      this.pendingUserMessageCount++
       // 不动 pendingUserMessageCount;init handler 在 isUserBatch 路径
       // 自己 reset。merge 之后 SDK 不拆 turn,不会再有空 user_message turn。
       this.status = 'working'
     } finally {
+      if (!opened) this.releaseBatchReactions(batchReactionMessageIds)
       this.openingTurn = false
+    }
+  }
+
+  private staleOpenTerminalCard(): object {
+    const status = '⚪ 本轮已取消 · 后端已切换'
+    return {
+      schema: '2.0',
+      config: {
+        streaming_mode: false,
+        summary: { content: status },
+      },
+      body: {
+        elements: [{
+          tag: 'markdown',
+          element_id: cards.ELEMENTS.footer,
+          content: status,
+        }],
+      },
+    }
+  }
+
+  private async settleCapturedStaleTurn(turn: TurnState): Promise<void> {
+    const status = '⚪ 本轮已取消 · 后端已切换'
+    if (this.currentTurn === turn) {
+      this.currentTurn = null
+      if (this.watchdogContext?.turn === turn) this.endWatchdogTurn()
+    }
+    this.stopFooterStatus(turn)
+    await cardkit.replaceElement(turn.cardId, cards.ELEMENTS.footer, {
+      tag: 'markdown',
+      element_id: cards.ELEMENTS.footer,
+      content: status,
+    })
+    cardkit.cancelSummary(turn.cardId)
+    await cardkit.patchSettings(turn.cardId, cards.streamingOffSettings({ suffix: '⚪ 后端已切换' }))
+    await cardkit.dispose(turn.cardId)
+  }
+
+  private async cleanupStaleTurnOpen(opts: {
+    openingTurnCounter: number
+    openingProc: AgentProcess | null
+    openingToken: object
+    messageId?: string | null
+    cardId?: string | null
+    backgroundMigrated?: boolean
+  }): Promise<void> {
+    this.finishWatchdogOpening(opts.openingTurnCounter, true, opts.openingProc, opts.openingToken)
+
+    const status = '⚪ 本轮已取消 · 后端已切换'
+    if (opts.cardId) {
+      await cardkit.replaceElement(opts.cardId, cards.ELEMENTS.footer, {
+        tag: 'markdown',
+        element_id: cards.ELEMENTS.footer,
+        content: status,
+      })
+      cardkit.cancelSummary(opts.cardId)
+      await cardkit.patchSettings(opts.cardId, cards.streamingOffSettings({ suffix: '⚪ 后端已切换' }))
+      await cardkit.dispose(opts.cardId)
+    } else if (opts.messageId) {
+      try {
+        await feishu.updateCard(opts.messageId, this.staleOpenTerminalCard())
+      } catch (e) {
+        log(`session "${this.sessionName}": stale turn card terminal update failed message=${opts.messageId}: ${e}`)
+      }
+    }
+
+    if (
+      opts.backgroundMigrated &&
+      cards.hasActiveBgTask(this.backgroundTasks) &&
+      !this.backgroundCard
+    ) {
+      this.pendingRebuildBackgroundCard = true
+      if (this.currentTurn && !this.openingBackground) {
+        this.openingBackground = true
+        try {
+          await this.openBackgroundCard()
+          if (this.backgroundCard) this.pendingRebuildBackgroundCard = false
+        } catch (e) {
+          log(`session "${this.sessionName}": stale open background rebuild failed: ${e}`)
+        } finally {
+          this.openingBackground = false
+        }
+      }
     }
   }
 
   private async openTurnCard(
     userOpenId: string,
     trigger: TurnState['trigger'],
-    opts: { initialFooter?: string; startThinking?: boolean; directStart?: boolean } = {},
-  ): Promise<void> {
+    opts: {
+      initialFooter?: string
+      startThinking?: boolean
+      directStart?: boolean
+      expectedProc?: AgentProcess
+    } = {},
+  ): Promise<TurnCardOpenResult> {
+    if (opts.expectedProc && this.proc !== opts.expectedProc) return { kind: 'stale' }
+    const watchdogOpeningTurnCounter = this.turnCounter + 1
+    const watchdogOpeningProc = opts.expectedProc ?? this.proc
+    const openingTurn = this.currentTurn
+    const openingToken = {}
+    const openingIsCurrent = (): boolean =>
+      this.watchdogOpeningToken === openingToken &&
+      this.proc === watchdogOpeningProc &&
+      this.currentTurn === openingTurn
+    this.watchdogOpeningTurnCounter = watchdogOpeningTurnCounter
+    this.watchdogOpeningProc = watchdogOpeningProc
+    this.watchdogOpeningToken = openingToken
+    if (
+      this.pendingWatchdogIdentity?.proc === this.proc &&
+      this.pendingWatchdogIdentity.turnCounter === null
+    ) {
+      this.pendingWatchdogIdentity.turnCounter = watchdogOpeningTurnCounter
+    }
     // 任何 turn 开卡都消费掉 pending 的恢复轮标记 —— 若用户消息抢在恢复轮
     // init 前开了卡,SDK 会把结算通知并入该轮,标记留着只会误伤后续空 init。
     this.bgResumePending = false
     // ── 后台游标卡迁移 ── 发新主卡前,先把旧后台卡沉降(终态墓碑/固定标识),
     // 主卡落地后(currentTurn 赋值处)重建后台卡重回末尾。迁移失败不阻塞主卡。
+    let backgroundMigrated = false
     if (this.backgroundCard && cards.hasActiveBgTask(this.backgroundTasks)) {
       try {
         await this.migrateBackgroundCard()
+        backgroundMigrated = true
         this.pendingRebuildBackgroundCard = true
       } catch (e) {
         log(`session "${this.sessionName}": background migrate failed (non-blocking): ${e}`)
       }
+    }
+    if (!openingIsCurrent()) {
+      await this.cleanupStaleTurnOpen({
+        openingTurnCounter: watchdogOpeningTurnCounter,
+        openingProc: watchdogOpeningProc,
+        openingToken,
+        backgroundMigrated,
+      })
+      return { kind: 'stale' }
     }
     const turn = ++this.turnCounter
     // Snapshot+clear pendingTurnInputs synchronously here so concurrent
@@ -2348,8 +2950,33 @@ export class Session {
       initialFooter,
       directStart: opts.directStart,
     })
-    const messageId = await feishu.sendCard(this.chatId, card)
+    let messageId: string | null
+    try {
+      messageId = await feishu.sendCard(this.chatId, card)
+    } catch (e) {
+      if (!openingIsCurrent()) {
+        await this.cleanupStaleTurnOpen({
+          openingTurnCounter: watchdogOpeningTurnCounter,
+          openingProc: watchdogOpeningProc,
+          openingToken,
+          backgroundMigrated,
+        })
+        return { kind: 'stale' }
+      }
+      this.finishWatchdogOpening(watchdogOpeningTurnCounter, true, watchdogOpeningProc, openingToken)
+      throw e
+    }
+    const staleAfterSend = !openingIsCurrent()
     if (!messageId) {
+      if (staleAfterSend) {
+        await this.cleanupStaleTurnOpen({
+          openingTurnCounter: watchdogOpeningTurnCounter,
+          openingProc: watchdogOpeningProc,
+          openingToken,
+          backgroundMigrated,
+        })
+        return { kind: 'stale' }
+      }
       log(`session "${this.sessionName}": openTurnCard sendCard EXHAUSTED retries — surfacing via raw text`)
       // sendCard already retried 3× through the SDK. If it still came back
       // null we're either on a sustained SDK-axios outage or a Feishu
@@ -2360,34 +2987,85 @@ export class Session {
       // thing we'd be doomed to silence otherwise.
       // bg-resume 轮没有"用户这条消息",提示重发只会误导;其输出会走
       // 孤儿缓冲纯文本兜底,这里不必告警。
-      if (trigger === 'user_message') {
-        await feishu.sendTextRaw(
-          this.chatId,
-          '❌ 创建对话卡片失败 (Feishu SDK 重试 3 次后仍连不上)。你这条消息没能送到 Codex,请稍后重发。',
-        )
+      try {
+        if (trigger === 'user_message') {
+          await feishu.sendTextRaw(
+            this.chatId,
+            '❌ 创建对话卡片失败 (Feishu SDK 重试 3 次后仍连不上)。你这条消息没能送到 Codex,请稍后重发。',
+          )
+        }
+      } catch (e) {
+        if (!openingIsCurrent()) {
+          await this.cleanupStaleTurnOpen({
+            openingTurnCounter: watchdogOpeningTurnCounter,
+            openingProc: watchdogOpeningProc,
+            openingToken,
+            backgroundMigrated,
+          })
+        } else {
+          this.finishWatchdogOpening(watchdogOpeningTurnCounter, true, watchdogOpeningProc, openingToken)
+        }
+        throw e
       }
+      if (!openingIsCurrent()) {
+        await this.cleanupStaleTurnOpen({
+          openingTurnCounter: watchdogOpeningTurnCounter,
+          openingProc: watchdogOpeningProc,
+          openingToken,
+          backgroundMigrated,
+        })
+        return { kind: 'stale' }
+      }
+      this.finishWatchdogOpening(watchdogOpeningTurnCounter, true, watchdogOpeningProc, openingToken)
       // currentTurn left null as the failure signal. Caller decides
       // whether to sendInterrupt: onUserMessage's eager-open path
       // hasn't fed SDK yet so doesn't need to; the init handler has
       // (SDK started the turn itself) and must.
-      return
+      return { kind: 'failed' }
     }
     let cardId: string
     try { cardId = await cardkit.convertMessageToCard(messageId) }
-    catch (e) { log(`session "${this.sessionName}": id_convert failed: ${e}`); return }
+    catch (e) {
+      if (staleAfterSend || !openingIsCurrent()) {
+        await this.cleanupStaleTurnOpen({
+          openingTurnCounter: watchdogOpeningTurnCounter,
+          openingProc: watchdogOpeningProc,
+          openingToken,
+          messageId,
+          backgroundMigrated,
+        })
+        return { kind: 'stale' }
+      }
+      this.finishWatchdogOpening(watchdogOpeningTurnCounter, true, watchdogOpeningProc, openingToken)
+      log(`session "${this.sessionName}": id_convert failed: ${e}`)
+      return { kind: 'failed' }
+    }
+    if (staleAfterSend || !openingIsCurrent()) {
+      await this.cleanupStaleTurnOpen({
+        openingTurnCounter: watchdogOpeningTurnCounter,
+        openingProc: watchdogOpeningProc,
+        openingToken,
+        messageId,
+        cardId,
+        backgroundMigrated,
+      })
+      return { kind: 'stale' }
+    }
     // Tell cardkit how many elements the initial body already has so
     // its element-count tracker is correct from the first addElement
     // onwards (bg-resume banner + userInputPanel + footer).
     const initialElementCount =
-      (trigger === 'bg_task_resume' ? 1 : 0) +
+      (trigger === 'bg_task_resume' || trigger === 'watchdog_resume' ? 1 : 0) +
       (userInputs.length > 0 ? 1 : 0) +
       1
-    cardkit.recordCardCreated(cardId, initialElementCount, (code) => this.onCardWriteFailure(code))
+    cardkit.recordCardCreated(cardId, initialElementCount, (code) => this.onCardWriteFailure(cardId, code))
     const turnState: TurnState = {
       cardId,
       messageId,
       userOpenId,
       trigger,
+      backendThreadId: null,
+      backendTurnId: null,
       toolCount: 0,
       toolByUseId: new Map(),
       planSteps: [],
@@ -2396,6 +3074,7 @@ export class Session {
       goalUpdateCount: 0,
       contextCompactCount: 0,
       contextCompactionPending: new Map(),
+      watchdogSeenCompactionPhases: new Set(),
       readBatches: new Map(),
       openReadBatchI: null,
       taskCreateI: null,
@@ -2410,6 +3089,7 @@ export class Session {
       footerStatusHandle: null,
       footerStatusStartedAt: 0,
       footerStatusLabel: null,
+      footerStatusOverride: null,
       rotating: null,
       rotateCount: 0,
       failureRotateCount: 0,
@@ -2419,6 +3099,8 @@ export class Session {
       hostAskMarkersSeen: new Set(),
     }
     this.currentTurn = turnState
+    if (this.proc) this.beginWatchdogTurn(turnState, this.proc)
+    this.finishWatchdogOpening(watchdogOpeningTurnCounter, false, watchdogOpeningProc, openingToken)
     if (opts.startThinking !== false) this.startThinkingFooter(turnState)
     // 开卡 await 窗口期(sendCard/id_convert)先到的 assistant 正文攒在
     // 孤儿缓冲里,现在有卡了,作为首段并入 —— 后续 delta 接着正常追加。
@@ -2432,6 +3114,7 @@ export class Session {
       this.pendingRebuildBackgroundCard = false
       if (cards.hasActiveBgTask(this.backgroundTasks)) void this.openBackgroundCard()
     }
+    return { kind: 'opened', turn: turnState }
   }
 
   /** Cheap synchronous check called from stream handlers right before
@@ -2464,9 +3147,9 @@ export class Session {
    * (the bug that froze the 2026-05-23 turn at ~76 elements). Idempotent
    * (a rotation already in flight is left alone) and capped
    * (MAX_MIDTURN_ROTATES) so a persistent failure can't spin forever. */
-  onCardWriteFailure(code?: number): void {
+  onCardWriteFailure(failedCardId: string, code?: number): void {
     const turn = this.currentTurn
-    if (!turn) return
+    if (!turn || turn.cardId !== failedCardId) return
     if (turn.rotating) return
     if (turn.rotateGivenUp) return
     if (turn.failureRotateCount >= MAX_MIDTURN_ROTATES) {
@@ -2536,7 +3219,7 @@ export class Session {
           return
         }
         // card_full body has banner(1) + footer(1) = 2 elements.
-        cardkit.recordCardCreated(newCardId, 2, (code) => this.onCardWriteFailure(code))
+        cardkit.recordCardCreated(newCardId, 2, (code) => this.onCardWriteFailure(newCardId, code))
         // 同步 swap：从这一行起,后续 stream handler 看到的 turn.cardId
         // 是新卡。reset 所有 element-id 引用 (toolCount / assistantSegmentCount
         // 等),旧卡上的 element_id 在新卡里查不到,继续 PUT 会 300313。
@@ -2671,7 +3354,7 @@ export class Session {
     })
   }
 
-  private handleContextCompacted(notice: ContextCompactedNotification): void {
+  private handleContextCompacted(source: AgentProcess, notice: ContextCompactedNotification): void {
     const turn = this.currentTurn
     if (!turn) {
       if (this.manualContextCompactionPending) {
@@ -2686,6 +3369,13 @@ export class Session {
       const backend = this.proc ? this.backendLabel(this.proc.provider) : this.backendLabel()
       void feishu.sendTextRaw(this.chatId, `🚨🚨🚨 CONTEXT COMPACTED / 上下文已压缩 🚨🚨🚨\n\n${backend} 报告发生了上下文压缩,但当前没有可写的对话卡片。`)
       return
+    }
+    const watchdogPhase = `${compactionKey(notice)}:${notice.phase ?? 'event'}`
+    if (
+      !turn.watchdogSeenCompactionPhases.has(watchdogPhase) &&
+      this.observeWatchdogMeaningful(source, `context_compaction:${notice.phase ?? 'event'}`)
+    ) {
+      turn.watchdogSeenCompactionPhases.add(watchdogPhase)
     }
     this.startWorkingFooter(turn)
     if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
@@ -2725,12 +3415,16 @@ export class Session {
     cardkit.patchSummaryThrottled(turn.cardId, `🚨 压缩×${turn.contextCompactCount}`)
   }
 
-  private handleTurnPlanUpdated(update: TurnPlanUpdated): void {
+  private handleTurnPlanUpdated(source: AgentProcess, update: TurnPlanUpdated): void {
     const turn = this.currentTurn
     if (!turn) {
       log(`session "${this.sessionName}": turn/plan/updated with no current turn`)
       return
     }
+    const previous = JSON.stringify({
+      planSteps: turn.planSteps,
+      planExplanation: turn.planExplanation,
+    })
     this.startWorkingFooter(turn)
     if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
     turn.openReadBatchI = null
@@ -2744,20 +3438,26 @@ export class Session {
       }))
     }
     turn.planExplanation = typeof update.explanation === 'string' ? update.explanation : null
+    const current = JSON.stringify({
+      planSteps: turn.planSteps,
+      planExplanation: turn.planExplanation,
+    })
+    if (current !== previous) this.observeWatchdogMeaningful(source, 'turn_plan_updated')
     this.addPlanSnapshotOnCurrentTurn()
   }
 
-  private handlePlanDelta(delta: PlanDelta): void {
+  private handlePlanDelta(source: AgentProcess, delta: PlanDelta): void {
     if (typeof delta.delta !== 'string' || !delta.delta) {
       log(`session "${this.sessionName}": item/plan/delta missing delta text`)
       return
     }
+    this.observeWatchdogMeaningful(source, 'plan_delta')
     if (typeof delta.itemId !== 'string' || !delta.itemId) {
       log(`session "${this.sessionName}": item/plan/delta missing itemId`)
     }
   }
 
-  private handleThreadGoalUpdated(goal: ThreadGoal): void {
+  private handleThreadGoalUpdated(source: AgentProcess, goal: ThreadGoal): void {
     if (!goal || typeof goal.objective !== 'string') {
       log(`session "${this.sessionName}": thread/goal/updated missing objective`)
       return
@@ -2784,6 +3484,7 @@ export class Session {
     ) {
       return
     }
+    this.observeWatchdogMeaningful(source, 'thread_goal_updated')
     const turn = this.currentTurn
     if (turn) {
       this.startWorkingFooter(turn)
@@ -2793,9 +3494,10 @@ export class Session {
     this.addGoalUpdateOnCurrentTurn(currentGoal)
   }
 
-  private handleThreadGoalCleared(): void {
+  private handleThreadGoalCleared(source: AgentProcess): void {
     if (!this.currentGoal) return
     this.currentGoal = null
+    this.observeWatchdogMeaningful(source, 'thread_goal_cleared')
     const turn = this.currentTurn
     if (!turn) return
     this.startWorkingFooter(turn)
@@ -2963,6 +3665,13 @@ export class Session {
   /** Start or switch the turn footer phase. It lives in the stable footer
    * element and uses replaceElement so status updates appear immediately
    * instead of invoking Feishu's typewriter. */
+  renderFooterStatus(turn: TurnState | null, now: number = Date.now()): void {
+    if (!turn?.footerStatusHandle || !turn.footerStatusLabel) return
+    const elapsedS = Math.max(0, Math.floor((now - turn.footerStatusStartedAt) / 1000))
+    const content = turn.footerStatusOverride ?? `${turn.footerStatusLabel}(${elapsedS}s)`
+    void this.replaceFooterContent(turn.cardId, this.withModel(content))
+  }
+
   private startFooterStatus(turn: TurnState, status: string): void {
     // log-only 之后 phase 切换(Thinking/Writing/Working)不许把每秒
     // ticker 重新拉起来 —— 卡已标记拒写,计时纯属空转。
@@ -2973,8 +3682,7 @@ export class Session {
     turn.footerStatusStartedAt = Date.now()
     const render = (): void => {
       if (turn.footerStatusHandle == null || !turn.footerStatusLabel) return
-      const elapsedS = Math.max(0, Math.floor((Date.now() - turn.footerStatusStartedAt) / 1000))
-      void this.replaceFooterContent(turn.cardId, this.withModel(`${turn.footerStatusLabel}(${elapsedS}s)`))
+      this.renderFooterStatus(turn)
     }
     turn.footerStatusHandle = setInterval(render, FOOTER_STATUS_TICK_MS)
     render()
@@ -3040,6 +3748,7 @@ export class Session {
     const turn = this.currentTurn
     if (!turn) return
     this.currentTurn = null
+    this.endWatchdogTurn()
     this.stopFooterStatus(turn)
     // 竞态修复:mid-turn rotation 的 swap 阶段(sendCard / id_convert 的 await
     // 之后,见 startMidTurnRotate)会切 turn.cardId 到新卡并 startWritingFooter

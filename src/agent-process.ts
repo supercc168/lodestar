@@ -16,6 +16,7 @@ import type {
 export type AgentProvider = 'codex' | 'claude'
 export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort
+export type CollabAgentStates = Record<string, { status?: string }>
 
 export const CLAUDE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
 export const CLAUDE_EFFORT: ClaudeReasoningEffort = 'max'
@@ -82,6 +83,13 @@ export type AgentProcessEventMap = {
   assistant_block_stop: { index?: string }
   tool_use: { id: string; name: string; input: any }
   tool_result: { tool_use_id: string; content: any; is_error: boolean }
+  subagent_activity: {
+    activityId: string
+    agentThreadId: string
+    agentPath: string | null
+    kind: string
+  }
+  collab_agent_state: { toolUseId: string; agentsStates: CollabAgentStates }
   can_use_tool: CanUseToolRequest
   hook_callback: HookCallbackRequest
   result: any
