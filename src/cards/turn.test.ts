@@ -14,6 +14,7 @@ import {
   summarizeToolInput,
   toolCallElement,
   toolCallPermissionElement,
+  watchdogFooterContent,
 } from './turn'
 
 describe('main conversation card rendering', () => {
@@ -102,6 +103,25 @@ describe('main conversation card rendering', () => {
       kind: 'card_full',
     }) as any
     expect(claudeCard.body.elements[0].content).toContain('同一轮 Claude')
+  })
+
+  test('watchdog recovery starts with its banner and never renders queued human input', () => {
+    const card = mainConversationCard({
+      sessionName: 'probe',
+      turn: 3,
+      kind: 'watchdog_resume',
+      userInputs: ['must-not-render'],
+      initialFooter: 'recovering',
+    }) as any
+
+    expect(card.body.elements[0].content).toBe('🛟 自动恢复 1/1 · 从上次有效进展继续')
+    expect(JSON.stringify(card)).not.toContain('must-not-render')
+    expect(JSON.stringify(card)).not.toContain('📥 收到')
+    expect(card.body.elements.at(-1)).toEqual({
+      tag: 'markdown',
+      element_id: 'footer',
+      content: 'recovering',
+    })
   })
 
   test('status cards render one visible status line without a header', () => {
@@ -370,6 +390,25 @@ describe('main conversation card rendering', () => {
     expect(content).toContain('Codex · Wuhen')
     expect(content).toContain('渠道余额')
     expect(content).toContain('12.34 USD')
+  })
+})
+
+describe('watchdog footer rendering', () => {
+  test('formats every watchdog footer state with fixed user-safe copy', () => {
+    expect(watchdogFooterContent('silent_warn')).toBe('⚠️ 长时间无可见进展 · 仍在等待')
+    expect(watchdogFooterContent('loop_warn')).toBe('⚠️ 检测到重复空调用 · 未自动中断')
+    expect(watchdogFooterContent('recovering')).toBe('🛟 检测到无效循环 · 自动恢复 1/1')
+    expect(watchdogFooterContent('exhausted')).toBe('⛔ 自动恢复后仍无进展 · 已停止')
+    expect(watchdogFooterContent('failed')).toBe('❌ 自动恢复失败 · thread 恢复失败')
+  })
+
+  test('formats interrupted detail from bounded minutes and repeat count', () => {
+    expect(watchdogFooterContent('interrupted', {
+      idleMs: 900_000,
+      repeatCount: 12,
+      rawToolText: 'must-not-render',
+      toolHash: 'must-not-render-hash',
+    } as any)).toBe('🛟 已自动中断 · 无进展 15m · 重复空调用 x12')
   })
 })
 

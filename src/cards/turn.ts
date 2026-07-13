@@ -142,6 +142,36 @@ export function footerTokenDetailLine(usage: CodexUsage | null | undefined): str
   return `└ 入 ${input} ｜ 缓 ${cached} ｜ 出 ${output}`
 }
 
+export type WatchdogFooterState =
+  | 'silent_warn'
+  | 'loop_warn'
+  | 'recovering'
+  | 'interrupted'
+  | 'exhausted'
+  | 'failed'
+
+export function watchdogFooterContent(
+  state: WatchdogFooterState,
+  detail: { idleMs?: number; repeatCount?: number } = {},
+): string {
+  switch (state) {
+    case 'silent_warn':
+      return '⚠️ 长时间无可见进展 · 仍在等待'
+    case 'loop_warn':
+      return '⚠️ 检测到重复空调用 · 未自动中断'
+    case 'recovering':
+      return '🛟 检测到无效循环 · 自动恢复 1/1'
+    case 'interrupted': {
+      const idleMinutes = Math.max(0, Math.floor((detail.idleMs ?? 0) / 60_000))
+      return `🛟 已自动中断 · 无进展 ${idleMinutes}m · 重复空调用 x${detail.repeatCount ?? 0}`
+    }
+    case 'exhausted':
+      return '⛔ 自动恢复后仍无进展 · 已停止'
+    case 'failed':
+      return '❌ 自动恢复失败 · thread 恢复失败'
+  }
+}
+
 export function contextCompactionElement(i: number, notice: ContextCompactionNotice, elementId: string): object {
   const data = notice && typeof notice === 'object' ? notice as Record<string, unknown> : {}
   const done = data.phase === 'end' || data.phase === 'event'
@@ -243,8 +273,10 @@ interface MainCardOpts {
    *                     (banner `📨 接续上一张`,无 panel,turn 号跟旧卡
    *                     相同)
    *   'bg_task_resume' — 后台任务结算后 SDK 自发的恢复轮(无用户消息,
-   *                     banner `🔁 后台任务完成`,无 panel) */
-  kind?: 'user_message' | 'card_full' | 'bg_task_resume'
+   *                     banner `🔁 后台任务完成`,无 panel)
+   *   'watchdog_resume' — watchdog 自动恢复轮(固定恢复 banner,无用户
+   *                       输入 panel) */
+  kind?: 'user_message' | 'card_full' | 'bg_task_resume' | 'watchdog_resume'
   /** 本轮 Codex 收到的 user wireText 列表。boot turn 通常是 1 条;mid-turn
    * 用户连发的 N 条会在下一 turn 一并塞进。空数组 / undefined 时不渲染
    * userInput panel。 */
@@ -262,12 +294,14 @@ interface MainCardOpts {
  * and footer status themselves are rendered via static element updates. */
 export function mainConversationCard(opts: MainCardOpts): object {
   const providerLabel = opts.provider === 'claude' ? 'Claude' : 'Codex'
-  const banner = opts.kind === 'card_full'
-    ? [{ tag: 'markdown', content: `📨 接续上一张（同一轮 ${providerLabel}，前卡写满或写入受限）` }]
-    : opts.kind === 'bg_task_resume'
-      ? [{ tag: 'markdown', content: `🔁 后台任务完成，${providerLabel} 继续处理结果 #${opts.turn}` }]
-      : []
-  const inputs = opts.userInputs ?? []
+  const banner = opts.kind === 'watchdog_resume'
+    ? [{ tag: 'markdown', content: '🛟 自动恢复 1/1 · 从上次有效进展继续' }]
+    : opts.kind === 'card_full'
+      ? [{ tag: 'markdown', content: `📨 接续上一张（同一轮 ${providerLabel}，前卡写满或写入受限）` }]
+      : opts.kind === 'bg_task_resume'
+        ? [{ tag: 'markdown', content: `🔁 后台任务完成，${providerLabel} 继续处理结果 #${opts.turn}` }]
+        : []
+  const inputs = opts.kind === 'watchdog_resume' ? [] : (opts.userInputs ?? [])
   const userInputHeader = `📥 收到 (${inputs.length}) ${opts.directStart ? '🚀' : `#${opts.turn}`}`
   const userInputPanel = inputs.length > 0
     ? [{

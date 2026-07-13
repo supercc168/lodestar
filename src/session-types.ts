@@ -7,6 +7,8 @@
 
 import type { SessionModelSelection } from './feishu'
 
+export type TurnTrigger = 'user_message' | 'bg_task_resume' | 'watchdog_resume'
+
 export interface TurnState {
   cardId: string
   /** Feishu message_id of the card — needed for urgent_app push on clean
@@ -17,11 +19,13 @@ export interface TurnState {
    * urgent_app push so only the initiator gets pinged (in case there
    * are other members in the group). Empty string → skip the ping. */
   userOpenId: string
-  /** What kicked off this turn. Kept explicit for turn lifecycle logic.
-   *   'user_message'   — 用户消息批次
-   *   'bg_task_resume' — 后台任务结算后 SDK 自发的恢复轮(无用户消息;
-   *                      不开卡的话整轮正文会被丢弃) */
-  trigger: 'user_message' | 'bg_task_resume'
+  /** What kicked off this turn. Kept explicit for turn lifecycle logic. */
+  trigger: TurnTrigger
+  /** TurnState object identity is the primary async-event fence; these
+   * backend IDs add protocol-level matching so stale events from a prior
+   * or recovered backend turn cannot mutate the active card. */
+  backendThreadId: string | null
+  backendTurnId: string | null
   toolCount: number
   /** `output` / `isError` are filled in by completeTool and kept so
    * card rotation can rebuild unfinished or failed tool panels. */
@@ -46,6 +50,9 @@ export interface TurnState {
   goalUpdateCount: number
   contextCompactCount: number
   contextCompactionPending: Map<string, { i: number; cardId: string; notice: any }>
+  /** Compaction phases already observed by the watchdog, used to deduplicate
+   * repeated phase notifications for the same active turn. */
+  watchdogSeenCompactionPhases: Set<string>
   /** Consecutive `Read` calls collapse into a single panel rendered by
    * `cards.readBatchElement`. Keyed by element index `i` so completeTool
    * can find the batch after its open-window closed (a non-Read tool or
@@ -90,6 +97,9 @@ export interface TurnState {
   footerStatusHandle: ReturnType<typeof setInterval> | null
   footerStatusStartedAt: number
   footerStatusLabel: string | null
+  /** Sticky watchdog footer copy. While set, ordinary phase timers must not
+   * overwrite it; the lifecycle owner clears it at the intended boundary. */
+  footerStatusOverride: string | null
   /** Mid-turn card-rotation lock. Set when we've fire-and-forget kicked
    * off `startMidTurnRotate` to open a fresh card — either proactively
    * (element count crossed CARD_ELEMENT_SOFT_LIMIT) or reactively (an
