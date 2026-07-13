@@ -4,6 +4,7 @@ import { describe, expect, test } from 'bun:test'
 import {
   DEFAULT_CODEX_WATCHDOG,
   TurnWatchdog,
+  formatWatchdogLog,
   matchesNoopExecResult,
   parseNoopExecCall,
   type WatchdogSafetySnapshot,
@@ -59,6 +60,24 @@ function addMatchedNoops(watchdog: TurnWatchdog, count: number, literal = 'ready
 function verdictType(verdict: WatchdogVerdict): WatchdogVerdict['type'] {
   return verdict.type
 }
+
+test('watchdog log formatter truncates identity and cannot carry raw task data', () => {
+  const line = formatWatchdogLog('turn_watchdog_recover_start', {
+    session: 'pokemon',
+    threadId: 'thread-123456789',
+    turnId: 'turn-123456789',
+    idleMs: 900_000,
+    repeatCount: 10,
+    fingerprintHash: 'a'.repeat(64),
+    attempt: 1,
+    outcome: 'result',
+  })
+  expect(line).toContain('thread=thread-1')
+  expect(line).toContain('turn=turn-123')
+  expect(line).not.toContain('thread-123456789')
+  expect(line).not.toContain('turn-123456789')
+  expect(line).not.toMatch(/ready|Lodestar 自动恢复|api_key|OPENAI_API_KEY/)
+})
 
 describe('parseNoopExecCall', () => {
   test('accepts an exact text literal and hashes only the decoded literal', () => {

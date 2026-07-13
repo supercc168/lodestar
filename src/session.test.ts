@@ -1,11 +1,16 @@
 import { EventEmitter } from 'node:events'
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import {
+  DEFAULT_CODEX_WATCHDOG,
+  TurnWatchdog,
+  type WatchdogSettings,
+} from './turn-watchdog'
+import {
   boundResumes, deletedReactions, feishuMockState, projectProfiles, resetFeishuMock,
   sentCards, sentRawTexts, sentTexts, updatedCards, urgentPushes,
 } from './feishu-test-mock'
 
-const { Session } = await import('./session')
+const { Session, WATCHDOG_RECOVERY_PROMPT } = await import('./session')
 const cardkit = await import('./cardkit')
 const sessionHostAsk = await import('./session-host-ask')
 const { fixedModelChoices, normalizeFixedModelSelection, configuredDefaultSelection } = await import('./session-model')
@@ -202,7 +207,7 @@ function wiredWatchdogSession(provider: 'codex' | 'claude' = 'codex'): {
   const sessionName = `watchdog-${provider}-${fixtureId}`
   projectProfiles.set(sessionName, { watchdogMode: 'warn' })
   const session = new Session(sessionName, 'chat_id') as any
-  const proc = new FakeAgentProc(provider, `${provider}-thread-1`)
+  const proc = new FakeAgentProc(provider, provider === 'codex' ? 'thread-1' : 'claude-thread-1')
   const turn = turnState(`card_${provider}_watchdog_${fixtureId}`)
   session.selectedProvider = provider
   session.proc = proc
@@ -212,6 +217,29 @@ function wiredWatchdogSession(provider: 'codex' | 'claude' = 'codex'): {
   session.wireProc(proc)
   session.beginWatchdogTurn(turn, proc)
   return { session, proc, turn }
+}
+
+const recoverVerdict = {
+  type: 'recover', idleMs: 900_000, repeatCount: 10,
+  fingerprintHash: 'a'.repeat(64),
+} as const
+
+function armedRecoverySession(override: Partial<WatchdogSettings> = {}) {
+  const { session, proc, turn } = wiredWatchdogSession('codex')
+  const settings = { ...DEFAULT_CODEX_WATCHDOG, ...override }
+  session.configuredWatchdogSettings = () => settings
+  session.watchdog = new TurnWatchdog(settings)
+  session.beginWatchdogTurn(turn, proc, 0)
+  proc.emit('turn_started', { thread_id: 'thread-1', turn_id: 'turn-1' })
+  return { session, proc, turn }
+}
+
+async function waitFor(condition: () => boolean, timeoutMs = 1_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs
+  while (!condition()) {
+    if (Date.now() >= deadline) throw new Error('waitFor timeout')
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
 }
 
 test('human st still cancels queued work, interrupts once, and owns the stopped footer', async () => {
@@ -450,6 +478,715 @@ describe('Session shared turn interrupt', () => {
   })
 })
 
+describe('Session watchdog recover-once action', () => {
+  test('result continues on the live process without respawn', async () => {
+    const { session, proc } = armedRecoverySession()
+    let restartCalls = 0
+    session.restart = async () => { restartCalls++; return true }
+    proc.onInterrupt = () => proc.emit('result', {})
+
+    await session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+
+    expect(proc.killCalls).toBe(0)
+    expect(restartCalls).toBe(0)
+    expect(proc.sentTexts).toEqual([WATCHDOG_RECOVERY_PROMPT])
+    expect(session.currentTurn.trigger).toBe('watchdog_resume')
+    expect(session.watchdog.snapshot().recoveryAttempt).toBe(1)
+    expect(session.pendingTurnInputs).toEqual([])
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(JSON.stringify(sentCards.at(-1))).not.toContain('📥 收到')
+  })
+
+  test('process exit settles the old turn then immediately resumes the same thread', async () => {
+    const { session, proc } = armedRecoverySession()
+    const resumed = new FakeAgentProc('codex', 'thread-1')
+    session.restart = async (resume: boolean, opts: any) => {
+      expect(resume).toBe(true)
+      expect(opts).toMatchObject({
+        requireResumeSession: true,
+        preserveCurrentTurn: true,
+        preserveQueuedHumanWork: true,
+        announce: false,
+      })
+      session.proc = resumed
+      return true
+    }
+    proc.onInterrupt = () => proc.emit('exit', { code: 0, signal: 'SIGTERM', expected: true })
+
+    await session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+
+    expect(resumed.sentTexts).toEqual([WATCHDOG_RECOVERY_PROMPT])
+  })
+
+  test('Task 6 repair: stale ownership after awaited strict restart leaves the replacement human turn untouched', async () => {
+    const { session, proc } = armedRecoverySession()
+    const restartEntered = deferred<void>()
+    const restartResult = deferred<boolean>()
+    session.lastSessionId = 'thread-1'
+    session.restart = async () => {
+      restartEntered.resolve()
+      return await restartResult.promise
+    }
+    proc.onInterrupt = () => proc.emit('exit', { code: 0, signal: 'SIGTERM', expected: true })
+
+    const recovery = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+    await restartEntered.promise
+
+    const replacementProc = new FakeAgentProc('codex', 'thread-replacement')
+    const replacementTurn = turnState('card_watchdog_replacement_human')
+    replacementTurn.trigger = 'user_message'
+    replacementTurn.userOpenId = ''
+    session.proc = replacementProc
+    session.currentTurn = replacementTurn
+    session.status = 'working'
+    session.wireProc(replacementProc)
+    session.beginWatchdogTurn(replacementTurn, replacementProc)
+    replacementProc.emit('turn_started', {
+      thread_id: replacementProc.sessionId,
+      turn_id: 'turn-replacement',
+    })
+    cardkit.recordCardCreated(replacementTurn.cardId, 1)
+
+    restartResult.resolve(false)
+    await recovery
+
+    expect(session.proc).toBe(replacementProc)
+    expect(session.currentTurn).toBe(replacementTurn)
+    expect(session.status).toBe('working')
+    expect(sentRawTexts.some(text => text.includes('自动恢复失败'))).toBe(false)
+  })
+
+  test('Task 6 repair: a stale recovery-card open cannot stop or notify over a replacement human turn', async () => {
+    const { session, proc, turn } = armedRecoverySession()
+    const sendStarted = deferred<void>()
+    const sendResult = deferred<string | null>()
+    cardkit.recordCardCreated(turn.cardId, 1)
+    proc.onInterrupt = () => proc.emit('result', {})
+    feishuMockState.sendCard = async () => {
+      sendStarted.resolve()
+      return await sendResult.promise
+    }
+
+    try {
+      const recovery = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+      await sendStarted.promise
+
+      const replacementTurn = turnState('card_watchdog_open_replacement')
+      replacementTurn.trigger = 'user_message'
+      replacementTurn.backendThreadId = proc.sessionId
+      replacementTurn.backendTurnId = 'turn-open-replacement'
+      session.currentTurn = replacementTurn
+      session.status = 'working'
+      session.beginWatchdogTurn(replacementTurn, proc)
+
+      sendResult.resolve('om_watchdog_stale_resume_open')
+      await recovery
+
+      expect(session.currentTurn).toBe(replacementTurn)
+      expect(session.status).toBe('working')
+      expect(sentRawTexts.some(text => text.includes('自动恢复失败'))).toBe(false)
+    } finally {
+      sendResult.resolve(null)
+      feishuMockState.sendCard = null
+    }
+  })
+
+  test('Task 6 repair: strict resume skips restart when the persisted thread no longer matches the capture', async () => {
+    const { session, proc, turn } = armedRecoverySession()
+    const capturedThreadId = 'captured-thread-id-123456789'
+    const currentThreadId = 'current-thread-id-987654321'
+    let restartCalls = 0
+    proc.sessionId = capturedThreadId
+    session.watchdogContext.threadId = capturedThreadId
+    turn.backendThreadId = capturedThreadId
+    session.lastSessionId = currentThreadId
+    session.restart = async () => {
+      restartCalls++
+      return false
+    }
+    proc.onInterrupt = () => proc.emit('exit', { code: 0, signal: 'SIGTERM', expected: true })
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const originalStderrWrite = process.stderr.write
+    let stderr = ''
+    process.stderr.write = ((chunk: any) => {
+      stderr += String(chunk)
+      return true
+    }) as typeof process.stderr.write
+
+    try {
+      await session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+    } finally {
+      process.stderr.write = originalStderrWrite
+    }
+
+    expect(restartCalls).toBe(0)
+    expect(session.currentTurn).toBe(turn)
+    expect(sentRawTexts.some(text => text.includes('自动恢复失败'))).toBe(false)
+    expect(stderr).toContain(capturedThreadId.slice(0, 8))
+    expect(stderr).toContain(currentThreadId.slice(0, 8))
+    expect(stderr).not.toContain(capturedThreadId)
+    expect(stderr).not.toContain(currentThreadId)
+  })
+
+  test('grace timeout cancels the waiter then tears down and resumes once', async () => {
+    const { session } = armedRecoverySession({ interruptGraceMs: 1 })
+    let resumes = 0
+    session.restart = async () => {
+      resumes++
+      session.proc = new FakeAgentProc('codex', 'thread-1')
+      return true
+    }
+
+    await session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+
+    expect(resumes).toBe(1)
+    expect(session.activeTurnInterrupt).toBeNull()
+  })
+
+  test('strict resume failure stops visibly and never sends a recovery prompt', async () => {
+    const { session, proc } = armedRecoverySession({ interruptGraceMs: 1 })
+    session.restart = async () => false
+
+    await session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+
+    expect(session.status).toBe('stopped')
+    expect(proc.sentTexts).toEqual([])
+    expect(sentCards.some(card => JSON.stringify(card).includes('自动恢复 1/1'))).toBe(false)
+  })
+
+  test('Task 6 repair: strict resume failure sends raw fallback even when CardKit close writes fail', async () => {
+    const { session, proc, turn } = armedRecoverySession()
+    const healthyFetch = globalThis.fetch
+    session.lastSessionId = 'thread-1'
+    session.restart = async () => false
+    proc.onInterrupt = () => proc.emit('exit', { code: 0, signal: 'SIGTERM', expected: true })
+    cardkit.recordCardCreated(turn.cardId, 1)
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      code: 999,
+      msg: 'forced CardKit write failure',
+    }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as typeof fetch
+
+    try {
+      await session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+
+      expect(sentRawTexts.some(text => text.includes('自动恢复失败'))).toBe(true)
+      expect(proc.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+    } finally {
+      globalThis.fetch = healthyFetch
+    }
+  })
+
+  test('Task 6 repair: recovery-card open exceptions become a visible failure without rejecting', async () => {
+    const { session, proc, turn } = armedRecoverySession()
+    proc.onInterrupt = () => proc.emit('result', {})
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.openTurnCard = async () => {
+      throw new Error('forced recovery-card open exception')
+    }
+
+    await expect(
+      session.runWatchdogRecovery(session.watchdogContext, recoverVerdict),
+    ).resolves.toBeUndefined()
+
+    expect(session.status).toBe('stopped')
+    expect(sentRawTexts.some(text => text.includes('自动恢复失败'))).toBe(true)
+    expect(proc.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+  })
+
+  test('footer patch failure cannot prevent the soft interrupt', async () => {
+    const { session, proc } = armedRecoverySession()
+    session.replaceFooterContent = async () => { throw new Error('card unavailable') }
+    const action = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+
+    await waitFor(() => proc.interruptCalls === 1)
+    proc.emit('result', {})
+    await action
+  })
+
+  test('strict resume without a captured thread fails before destructive cleanup', async () => {
+    const { session, proc, turn } = armedRecoverySession()
+    session.lastSessionId = null
+    session.pendingMidTurnMsgs = [{
+      text: 'human queued', wireText: 'human queued', userOpenId: 'ou_human', msgId: 'om_human',
+    }]
+    session.start = async () => true
+
+    const resumed = await session.restart(true, {
+      announce: false,
+      requireResumeSession: true,
+      preserveCurrentTurn: true,
+      preserveQueuedHumanWork: true,
+    })
+
+    expect(resumed).toBe(false)
+    expect(proc.killCalls).toBe(0)
+    expect(session.proc).toBe(proc)
+    expect(session.currentTurn).toBe(turn)
+    expect(session.pendingMidTurnMsgs).toHaveLength(1)
+    expect(session.status).toBe('stopped')
+  })
+
+  test('watchdog restart preserves the captured turn, human queues, reactions, and context', async () => {
+    const { session, proc, turn } = armedRecoverySession()
+    const context = session.watchdogContext
+    const resumed = new FakeAgentProc('codex', 'thread-1')
+    session.lastSessionId = 'thread-1'
+    session.pendingMidTurnMsgs = [{
+      text: 'queued', wireText: 'queued', userOpenId: 'ou_human', msgId: 'om_queued',
+    }]
+    session.pendingTurnInputs = ['queued input']
+    session.multiMsgBuffer = [{ text: 'part', files: [], userOpenId: 'ou_human', msgId: 'om_part' }]
+    session.pendingReactionIds = new Map([['om_queued', 'reaction_queued']])
+    session.currentBatchReactionIds = new Map([['om_old_batch', 'reaction_old_batch']])
+    session.lastUserOpenId = 'ou_human'
+    session.spawnAgent = (resumeSessionId?: string) => {
+      expect(resumeSessionId).toBe('thread-1')
+      return resumed
+    }
+    resumed.sendInitialize = () => resumed.emit('init', { session_id: 'thread-1' })
+
+    const ok = await session.restart(true, {
+      announce: false,
+      requireResumeSession: true,
+      preserveCurrentTurn: true,
+      preserveQueuedHumanWork: true,
+    })
+
+    expect(ok).toBe(true)
+    expect(proc.killCalls).toBe(1)
+    expect(session.proc).toBe(resumed)
+    expect(session.currentTurn).toBe(turn)
+    expect(session.watchdogContext).toBe(context)
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(session.pendingMidTurnMsgs).toHaveLength(1)
+    expect(session.pendingTurnInputs).toEqual(['queued input'])
+    expect(session.multiMsgBuffer).toHaveLength(1)
+    expect(session.pendingReactionIds).toEqual(new Map([['om_queued', 'reaction_queued']]))
+    expect(session.currentBatchReactionIds).toEqual(new Map([['om_old_batch', 'reaction_old_batch']]))
+    expect(session.lastUserOpenId).toBe('ou_human')
+    expect(session.preservingRestartProc).toBe(resumed)
+  })
+
+  test('real strict restart init failure cannot mutate a newer process owner', async () => {
+    const { session } = armedRecoverySession()
+    const failedReplacement = new FakeAgentProc('codex', 'thread-1')
+    const initStarted = deferred<void>()
+    let lifecycleChanges = 0
+    session.opts.onLifecycleChange = () => { lifecycleChanges++ }
+    session.lastSessionId = 'thread-1'
+    session.spawnAgent = () => failedReplacement
+    failedReplacement.sendInitialize = () => initStarted.resolve()
+
+    const restarting = session.restart(true, {
+      announce: false,
+      requireResumeSession: true,
+      preserveCurrentTurn: true,
+      preserveQueuedHumanWork: true,
+    })
+    await initStarted.promise
+
+    const newerProc = new FakeAgentProc('codex', 'thread-newer-init-error')
+    const newerTurn = turnState('card_newer_init_error')
+    const newerQueued = [{
+      text: 'newer queued text',
+      wireText: '[file: /tmp/newer.txt]\nnewer queued text',
+      userOpenId: 'ou_newer',
+      msgId: 'om_newer_init_error',
+    }]
+    session.proc = newerProc
+    session.currentTurn = newerTurn
+    session.status = 'working'
+    session.wireProc(newerProc)
+    session.beginWatchdogTurn(newerTurn, newerProc)
+    newerProc.emit('turn_started', {
+      thread_id: newerProc.sessionId,
+      turn_id: 'turn-newer-init-error',
+    })
+    newerProc.emit('subagent_activity', {
+      activityId: 'activity-newer-init-error',
+      agentThreadId: 'agent-newer-init-error',
+      agentPath: '/root/newer-init-error',
+      kind: 'started',
+    })
+    newerProc.emit('collab_agent_state', {
+      toolUseId: 'tool-newer-init-error',
+      agentsStates: { 'agent-newer-init-error': { status: 'running' } },
+    })
+    session.pendingMidTurnMsgs = newerQueued
+    session.pendingTurnInputs = ['newer queued text']
+    session.pendingReactionIds = new Map([
+      ['om_newer_init_error', 'reaction_newer_init_error'],
+    ])
+    session.currentBatchReactionIds = new Map([
+      ['om_newer_batch', 'reaction_newer_batch'],
+    ])
+
+    failedReplacement.emit('error', new Error('captured replacement init failed'))
+    const ok = await restarting
+
+    expect(ok).toBe(false)
+    expect(failedReplacement.killCalls).toBe(1)
+    expect(session.preservingRestartProc).toBeNull()
+    expect(session.proc).toBe(newerProc)
+    expect(session.currentTurn).toBe(newerTurn)
+    expect(session.status).toBe('working')
+    expect(session.codexCollabAgentStates).toEqual(new Map([
+      ['agent-newer-init-error', 'running'],
+    ]))
+    expect(session.codexCollabAgentStatesByTool).toEqual(new Map([
+      ['tool-newer-init-error', new Map([['agent-newer-init-error', 'running']])],
+    ]))
+    expect(session.codexSubagentActivityIds).toEqual(new Set(['activity-newer-init-error']))
+    expect(session.activeCodexSubagentActivities).toEqual(new Set(['agent-newer-init-error']))
+    expect(session.pendingMidTurnMsgs).toEqual(newerQueued)
+    expect(session.pendingTurnInputs).toEqual(['newer queued text'])
+    expect(session.pendingReactionIds).toEqual(new Map([
+      ['om_newer_init_error', 'reaction_newer_init_error'],
+    ]))
+    expect(session.currentBatchReactionIds).toEqual(new Map([
+      ['om_newer_batch', 'reaction_newer_batch'],
+    ]))
+    expect(lifecycleChanges).toBe(0)
+  })
+
+  test('real strict restart post-init ownership loss cannot stop a newer turn', async () => {
+    const { session } = armedRecoverySession()
+    const staleReplacement = new FakeAgentProc('codex', 'thread-1')
+    const newerProc = new FakeAgentProc('codex', 'thread-newer-post-init')
+    const newerTurn = turnState('card_newer_post_init')
+    let lifecycleChanges = 0
+    session.opts.onLifecycleChange = () => { lifecycleChanges++ }
+    session.lastSessionId = 'thread-1'
+    session.spawnAgent = () => staleReplacement
+    staleReplacement.sendInitialize = () => {
+      staleReplacement.once('init', () => {
+        session.proc = newerProc
+        session.currentTurn = newerTurn
+        session.status = 'working'
+        session.wireProc(newerProc)
+        session.codexCollabAgentStates = new Map([['agent-newer-post-init', 'running']])
+        session.codexCollabAgentStatesByTool = new Map([
+          ['tool-newer-post-init', new Map([['agent-newer-post-init', 'running']])],
+        ])
+        session.codexSubagentActivityIds = new Set(['activity-newer-post-init'])
+        session.activeCodexSubagentActivities = new Set(['agent-newer-post-init'])
+        session.pendingMidTurnMsgs = [{
+          text: 'post-init newer queue',
+          wireText: 'post-init newer queue',
+          userOpenId: 'ou_newer',
+          msgId: 'om_newer_post_init',
+        }]
+        session.pendingReactionIds = new Map([
+          ['om_newer_post_init', 'reaction_newer_post_init'],
+        ])
+      })
+      staleReplacement.emit('init', { session_id: 'thread-1' })
+    }
+
+    const ok = await session.restart(true, {
+      announce: false,
+      requireResumeSession: true,
+      preserveCurrentTurn: true,
+      preserveQueuedHumanWork: true,
+    })
+
+    expect(ok).toBe(false)
+    expect(staleReplacement.killCalls).toBe(1)
+    expect(session.preservingRestartProc).toBeNull()
+    expect(session.proc).toBe(newerProc)
+    expect(session.currentTurn).toBe(newerTurn)
+    expect(session.status).toBe('working')
+    expect(session.codexCollabAgentStates).toEqual(new Map([
+      ['agent-newer-post-init', 'running'],
+    ]))
+    expect(session.codexCollabAgentStatesByTool).toEqual(new Map([
+      ['tool-newer-post-init', new Map([['agent-newer-post-init', 'running']])],
+    ]))
+    expect(session.codexSubagentActivityIds).toEqual(new Set(['activity-newer-post-init']))
+    expect(session.activeCodexSubagentActivities).toEqual(new Set(['agent-newer-post-init']))
+    expect(session.pendingMidTurnMsgs.map((msg: any) => msg.msgId)).toEqual([
+      'om_newer_post_init',
+    ])
+    expect(session.pendingReactionIds).toEqual(new Map([
+      ['om_newer_post_init', 'reaction_newer_post_init'],
+    ]))
+    expect(lifecycleChanges).toBe(0)
+  })
+
+  test('Task 6 repair: preserving restart ownership survives init through old-card close', async () => {
+    const { session, proc, turn } = armedRecoverySession()
+    const context = session.watchdogContext
+    const resumed = new FakeAgentProc('codex', 'thread-1')
+    const closeEntered = deferred<void>()
+    const closeRelease = deferred<void>()
+    const realCloseTurnCard = session.closeTurnCard.bind(session)
+    session.lastSessionId = 'thread-1'
+    session.spawnAgent = () => resumed
+    session.closeTurnCard = async (...args: any[]) => {
+      if (String(args[0] ?? '').includes('已自动中断')) {
+        closeEntered.resolve()
+        await closeRelease.promise
+      }
+      return await realCloseTurnCard(...args)
+    }
+    resumed.sendInitialize = () => {
+      session.pendingMidTurnMsgs = [
+        {
+          text: 'first queued human',
+          wireText: 'first queued human',
+          userOpenId: 'ou_human',
+          msgId: 'om_queued_first',
+        },
+        {
+          text: 'second queued human',
+          wireText: 'second queued human',
+          userOpenId: 'ou_human',
+          msgId: 'om_queued_second',
+        },
+      ]
+      session.pendingTurnInputs = ['first queued human', 'second queued human']
+      session.pendingReactionIds = new Map([
+        ['om_queued_first', 'reaction_queued_first'],
+        ['om_queued_second', 'reaction_queued_second'],
+      ])
+      session.currentBatchReactionIds = new Map([
+        ['om_captured_turn', 'reaction_captured_turn'],
+      ])
+      resumed.emit('init', { session_id: 'thread-1' })
+    }
+    proc.onInterrupt = () => proc.emit('exit', { code: 0, signal: 'SIGTERM', expected: true })
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    const recovery = session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+    await closeEntered.promise
+    const markerDuringClose = session.preservingRestartProc
+
+    resumed.alive = false
+    resumed.emit('exit', { code: 9, signal: null, expected: false })
+    const stateAfterReplacementExit = {
+      turn: session.currentTurn,
+      context: session.watchdogContext,
+      queued: session.pendingMidTurnMsgs.map((msg: any) => [msg.text, msg.msgId]),
+      inputs: [...session.pendingTurnInputs],
+      pendingReactions: new Map(session.pendingReactionIds),
+      batchReactions: new Map(session.currentBatchReactionIds),
+    }
+    closeRelease.resolve()
+    await recovery
+
+    expect(markerDuringClose).toBe(resumed)
+    expect(stateAfterReplacementExit).toEqual({
+      turn,
+      context,
+      queued: [
+        ['first queued human', 'om_queued_first'],
+        ['second queued human', 'om_queued_second'],
+      ],
+      inputs: ['first queued human', 'second queued human'],
+      pendingReactions: new Map([
+        ['om_queued_first', 'reaction_queued_first'],
+        ['om_queued_second', 'reaction_queued_second'],
+      ]),
+      batchReactions: new Map([
+        ['om_captured_turn', 'reaction_captured_turn'],
+      ]),
+    })
+    expect(proc.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+    expect(resumed.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+    expect(session.preservingRestartProc).toBeNull()
+  })
+
+  test('Task 6 repair: ordinary resume restart never installs a preserving marker', async () => {
+    const session = new Session('watchdog-ordinary-restart-marker', 'chat_id') as any
+    const oldProc = new FakeAgentProc('codex', 'thread-ordinary')
+    const resumed = new FakeAgentProc('codex', 'thread-ordinary')
+    session.selectedProvider = 'codex'
+    session.proc = oldProc
+    session.lastSessionId = 'thread-ordinary'
+    session.wireProc(oldProc)
+    session.spawnAgent = () => resumed
+    resumed.sendInitialize = () => resumed.emit('init', { session_id: 'thread-ordinary' })
+
+    const ok = await session.restart(true, { announce: false })
+
+    expect(ok).toBe(true)
+    expect(session.proc).toBe(resumed)
+    expect(session.preservingRestartProc).toBeNull()
+  })
+
+  test('strict resume init error preserves captured state through replacement exit', async () => {
+    const { session, turn } = armedRecoverySession()
+    const context = session.watchdogContext
+    const resumed = new FakeAgentProc('codex', 'thread-1')
+    session.lastSessionId = 'thread-1'
+    session.pendingMidTurnMsgs = [{
+      text: 'queued during resume',
+      wireText: 'queued during resume',
+      userOpenId: 'ou_human',
+      msgId: 'om_resume_failure',
+    }]
+    session.pendingTurnInputs = ['queued input during resume']
+    session.pendingReactionIds = new Map([
+      ['om_resume_failure', 'reaction_resume_failure'],
+    ])
+    session.spawnAgent = () => resumed
+    resumed.sendInitialize = () => resumed.emit('error', new Error('resume init failed'))
+    let stateAfterReplacementExit: {
+      turn: any
+      context: any
+      midTurn: any[]
+      inputs: string[]
+      reactions: Map<string, string>
+    } | null = null
+    resumed.kill = async () => {
+      resumed.killCalls++
+      resumed.alive = false
+      resumed.emit('exit', { code: 1, signal: null, expected: true })
+      stateAfterReplacementExit = {
+        turn: session.currentTurn,
+        context: session.watchdogContext,
+        midTurn: [...session.pendingMidTurnMsgs],
+        inputs: [...session.pendingTurnInputs],
+        reactions: new Map(session.pendingReactionIds),
+      }
+    }
+
+    const ok = await session.restart(true, {
+      announce: false,
+      requireResumeSession: true,
+      preserveCurrentTurn: true,
+      preserveQueuedHumanWork: true,
+    })
+
+    expect(ok).toBe(false)
+    expect(resumed.killCalls).toBe(1)
+    expect(stateAfterReplacementExit).toMatchObject({ turn, context })
+    expect(stateAfterReplacementExit?.midTurn).toHaveLength(1)
+    expect(stateAfterReplacementExit?.inputs).toEqual(['queued input during resume'])
+    expect(stateAfterReplacementExit?.reactions).toEqual(new Map([
+      ['om_resume_failure', 'reaction_resume_failure'],
+    ]))
+    expect(session.proc).toBeNull()
+    expect(session.currentTurn).toBe(turn)
+    expect(session.watchdogContext).toBe(context)
+    expect(session.pendingMidTurnMsgs).toHaveLength(1)
+    expect(session.pendingTurnInputs).toEqual(['queued input during resume'])
+    expect(session.pendingReactionIds).toEqual(new Map([
+      ['om_resume_failure', 'reaction_resume_failure'],
+    ]))
+  })
+
+  test('strict resume direct init exit cannot run ordinary destructive cleanup', async () => {
+    const { session, turn } = armedRecoverySession()
+    const context = session.watchdogContext
+    const resumed = new FakeAgentProc('codex', 'thread-1')
+    session.lastSessionId = 'thread-1'
+    session.pendingMidTurnMsgs = [{
+      text: 'queued before init exit',
+      wireText: 'queued before init exit',
+      userOpenId: 'ou_human',
+      msgId: 'om_init_exit',
+    }]
+    session.pendingReactionIds = new Map([['om_init_exit', 'reaction_init_exit']])
+    session.spawnAgent = () => resumed
+    const statuses: string[] = []
+    let stateAfterReplacementExit: { turn: any; context: any; midTurnCount: number } | null = null
+    resumed.sendInitialize = () => {
+      resumed.alive = false
+      resumed.emit('exit', { code: 1, signal: null, expected: true })
+      stateAfterReplacementExit = {
+        turn: session.currentTurn,
+        context: session.watchdogContext,
+        midTurnCount: session.pendingMidTurnMsgs.length,
+      }
+    }
+
+    const ok = await session.restart(true, {
+      announce: false,
+      requireResumeSession: true,
+      preserveCurrentTurn: true,
+      preserveQueuedHumanWork: true,
+      onStatus: status => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(stateAfterReplacementExit).toEqual({ turn, context, midTurnCount: 1 })
+    expect(session.currentTurn).toBe(turn)
+    expect(session.watchdogContext).toBe(context)
+    expect(session.pendingMidTurnMsgs).toHaveLength(1)
+    expect(session.pendingReactionIds).toEqual(new Map([
+      ['om_init_exit', 'reaction_init_exit'],
+    ]))
+    expect(statuses.at(-1)).toContain('code=1')
+    expect(statuses.at(-1)).toContain('signal=null')
+    expect(statuses.at(-1)).toContain('expected=true')
+    expect(statuses.at(-1)).not.toContain('[object Object]')
+  })
+
+  test('real strict resume failure closes the old card and preserves queued human work', async () => {
+    const { session, proc, turn } = armedRecoverySession({ interruptGraceMs: 1 })
+    const resumed = new FakeAgentProc('codex', 'thread-1')
+    session.lastSessionId = 'thread-1'
+    session.spawnAgent = () => resumed
+    cardkit.recordCardCreated(turn.cardId, 1)
+    let queuedHuman = Promise.resolve()
+    resumed.sendInitialize = () => {
+      queuedHuman = session.onUserMessage(
+        'human survives failed resume',
+        [],
+        'ou_human',
+        'om_human_survives',
+      ).then(() => {
+        session.pendingReactionIds.set('om_human_survives', 'reaction_human_survives')
+        resumed.emit('error', new Error('resume init failed'))
+      })
+    }
+
+    await session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
+    await queuedHuman
+
+    const failedFooter = calls.find(call => {
+      if (call.method !== 'PUT' || call.path !== `/cards/${turn.cardId}/elements/footer`) return false
+      return String(JSON.parse(call.body.element).content).includes('自动恢复失败')
+    })
+    const closedSettings = calls.find(call => {
+      if (call.method !== 'PATCH' || call.path !== `/cards/${turn.cardId}/settings`) return false
+      const settings = JSON.parse(call.body.settings)
+      return settings.config?.streaming_mode === false &&
+        String(settings.config?.summary?.content).includes('自动恢复失败')
+    })
+    expect(failedFooter).toBeDefined()
+    expect(closedSettings).toBeDefined()
+    expect(session.status).toBe('stopped')
+    expect(session.currentTurn).toBeNull()
+    expect(session.watchdogContext).toBeNull()
+    expect(session.pendingMidTurnMsgs.map((msg: any) => msg.text)).toEqual([
+      'human survives failed resume',
+    ])
+    expect(session.pendingReactionIds).toEqual(new Map([
+      ['om_human_survives', 'reaction_human_survives'],
+    ]))
+    expect(proc.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+    expect(resumed.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+  })
+
+  test('closing an interrupted turn preserves pending reaction ownership only', async () => {
+    const { session, turn } = armedRecoverySession()
+    turn.userOpenId = ''
+    session.pendingReactionIds = new Map([['om_pending', 'reaction_pending']])
+    session.currentBatchReactionIds = new Map([['om_batch', 'reaction_batch']])
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    await session.closeTurnCard('🛟 已自动中断', { preservePendingReactions: true })
+
+    expect(deletedReactions).toEqual([['om_batch', 'reaction_batch']])
+    expect(session.currentBatchReactionIds).toEqual(new Map())
+    expect(session.pendingReactionIds).toEqual(new Map([['om_pending', 'reaction_pending']]))
+  })
+})
+
 function confirmSessionNoop(
   proc: FakeAgentProc,
   id = 'noop-1',
@@ -582,17 +1319,17 @@ describe('Session Codex watchdog turn identity', () => {
     expect(session.watchdogSafetySnapshot(session.watchdogContext).currentTurn).toBe(false)
 
     proc.emit('turn_started', {
-      thread_id: 'codex-thread-1',
+      thread_id: 'thread-1',
       turn_id: 'codex-turn-1',
     })
 
     expect(session.watchdogContext).toMatchObject({
       proc,
       turn,
-      threadId: 'codex-thread-1',
+      threadId: 'thread-1',
       turnId: 'codex-turn-1',
     })
-    expect(turn.backendThreadId).toBe('codex-thread-1')
+    expect(turn.backendThreadId).toBe('thread-1')
     expect(turn.backendTurnId).toBe('codex-turn-1')
     expect(session.watchdogSafetySnapshot(session.watchdogContext).currentTurn).toBe(true)
   })
@@ -825,7 +1562,7 @@ describe('Session Codex watchdog progress observation', () => {
       pendingCandidateCount: 0,
       activeRealToolCount: 0,
     })
-    expect(turn.backendThreadId).toBe('codex-thread-1')
+    expect(turn.backendThreadId).toBe('thread-1')
     expect(turn.backendTurnId).toBe('codex-turn-progress')
   })
 
@@ -1500,22 +2237,38 @@ describe('Session Codex watchdog progress observation', () => {
     }
   })
 
-  test('does not restore working status after a drained turn open loses ownership', async () => {
+  test('restores a drained batch ahead of later messages when card opening loses ownership', async () => {
     projectProfiles.set('watchdog-stale-drain-caller', { watchdogMode: 'warn' })
     const session = new Session('watchdog-stale-drain-caller', 'chat_id') as any
     const oldProc = new FakeAgentProc('codex', 'codex-thread-stale-drain-caller')
     const sendStarted = deferred<void>()
     const sendResult = deferred<string | null>()
+    const capturedBatch = [
+      {
+        text: 'first queued prompt',
+        wireText: '[file: /tmp/first.png]\nfirst queued prompt',
+        userOpenId: 'ou_first',
+        msgId: 'om_stale_drain_first',
+      },
+      {
+        text: 'second queued prompt',
+        wireText: '[file: /tmp/second-a.txt] [file: /tmp/second-b.txt]\nsecond queued prompt',
+        userOpenId: 'ou_second',
+        msgId: 'om_stale_drain_second',
+      },
+    ]
+    const laterMessage = {
+      text: 'later queued prompt',
+      wireText: '[file: /tmp/later.txt]\nlater queued prompt',
+      userOpenId: 'ou_later',
+      msgId: 'om_stale_drain_later',
+    }
     session.selectedProvider = 'codex'
     session.proc = oldProc
-    session.pendingMidTurnMsgs = [{
-      text: 'queued stale prompt',
-      wireText: 'queued stale prompt',
-      userOpenId: 'ou_old',
-      msgId: 'om_stale_drain_reaction',
-    }]
+    session.pendingMidTurnMsgs = capturedBatch
     session.pendingReactionIds = new Map([
-      ['om_stale_drain_reaction', 'reaction_stale_drain'],
+      ['om_stale_drain_first', 'reaction_stale_drain_first'],
+      ['om_stale_drain_second', 'reaction_stale_drain_second'],
     ])
     session.wireProc(oldProc)
     feishuMockState.sendCard = async () => {
@@ -1526,6 +2279,9 @@ describe('Session Codex watchdog progress observation', () => {
     try {
       const staleDrain = session.drainMidTurnAndOpen()
       await sendStarted.promise
+      session.pendingMidTurnMsgs.push(laterMessage)
+      session.pendingReactionIds.set('om_stale_drain_second', 'reaction_newer_second_owner')
+      session.pendingReactionIds.set('om_stale_drain_later', 'reaction_stale_drain_later')
       const { nextProc, nextTurn } = replaceOpenProcess(session, 'drain-caller')
       session.currentBatchReactionIds.set('om_replacement_turn', 'reaction_replacement_turn')
 
@@ -1539,13 +2295,16 @@ describe('Session Codex watchdog progress observation', () => {
       expect(session.pendingUserMessageCount).toBe(0)
       expect(session.status).toBe('starting')
       expectStaleCardClosed('card_status_1')
-      expect(deletedReactions).toEqual([
-        ['om_stale_drain_reaction', 'reaction_stale_drain'],
-      ])
-      expect(session.pendingReactionIds.has('om_stale_drain_reaction')).toBe(false)
+      expect(session.pendingMidTurnMsgs).toEqual([...capturedBatch, laterMessage])
+      expect(session.pendingReactionIds).toEqual(new Map([
+        ['om_stale_drain_second', 'reaction_newer_second_owner'],
+        ['om_stale_drain_later', 'reaction_stale_drain_later'],
+        ['om_stale_drain_first', 'reaction_stale_drain_first'],
+      ]))
       expect(session.currentBatchReactionIds).toEqual(new Map([
         ['om_replacement_turn', 'reaction_replacement_turn'],
       ]))
+      expect(deletedReactions).toEqual([])
     } finally {
       feishuMockState.sendCard = null
       session.openingTurn = false
@@ -1559,12 +2318,13 @@ describe('Session Codex watchdog progress observation', () => {
     const proc = new FakeAgentProc('codex', 'codex-thread-failed-drain-caller')
     session.selectedProvider = 'codex'
     session.proc = proc
-    session.pendingMidTurnMsgs = [{
+    const failedMessage = {
       text: 'failed drain prompt',
-      wireText: 'failed drain prompt',
+      wireText: '[file: /tmp/failed-drain.txt]\nfailed drain prompt',
       userOpenId: 'ou_old',
       msgId: 'om_failed_drain_reaction',
-    }]
+    }
+    session.pendingMidTurnMsgs = [failedMessage]
     session.pendingReactionIds = new Map([
       ['om_failed_drain_reaction', 'reaction_failed_drain'],
       ['om_unrelated_pending', 'reaction_unrelated_pending'],
@@ -1583,10 +2343,10 @@ describe('Session Codex watchdog progress observation', () => {
       expect(session.pendingUserMessageCount).toBe(0)
       expect(session.currentTurn).toBeNull()
       expect(session.status).toBe(statusBefore)
-      expect(deletedReactions).toEqual([
-        ['om_failed_drain_reaction', 'reaction_failed_drain'],
-      ])
+      expect(session.pendingMidTurnMsgs).toEqual([failedMessage])
+      expect(deletedReactions).toEqual([])
       expect(session.pendingReactionIds).toEqual(new Map([
+        ['om_failed_drain_reaction', 'reaction_failed_drain'],
         ['om_unrelated_pending', 'reaction_unrelated_pending'],
       ]))
       expect(session.currentBatchReactionIds).toEqual(new Map([

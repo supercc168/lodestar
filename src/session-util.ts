@@ -13,6 +13,10 @@ export type StatusCardHandle = {
 export type LifecycleProgressOpts = {
   announce?: boolean
   onStatus?: (status: string) => void
+  /** Internal watchdog transaction flags; ordinary commands leave all false. */
+  requireResumeSession?: boolean
+  preserveCurrentTurn?: boolean
+  preserveQueuedHumanWork?: boolean
   /** Internal: startColdUserTurn resets fresh state before opening the
    * first direct-start card, because the visible turn number is decided
    * before Codex starts. */

@@ -15,6 +15,45 @@ export interface WatchdogSettings {
   interruptGraceMs: number
 }
 
+export type WatchdogLogEvent =
+  | 'turn_watchdog_silent_warn'
+  | 'turn_watchdog_loop_warn'
+  | 'turn_watchdog_recover_start'
+  | 'turn_watchdog_interrupt_settled'
+  | 'turn_watchdog_resume_fallback'
+  | 'turn_watchdog_recover_started'
+  | 'turn_watchdog_exhausted'
+  | 'turn_watchdog_recover_failed'
+
+export interface WatchdogLogFields {
+  session: string
+  threadId: string | null
+  turnId: string | null
+  idleMs?: number
+  repeatCount?: number
+  fingerprintHash?: string
+  attempt: 0 | 1
+  outcome?: string
+}
+
+export function formatWatchdogLog(
+  event: WatchdogLogEvent,
+  fields: WatchdogLogFields,
+): string {
+  return [
+    `event=${event}`,
+    `session=${JSON.stringify(fields.session)}`,
+    'provider=codex',
+    `thread=${(fields.threadId ?? '-').slice(0, 8)}`,
+    `turn=${(fields.turnId ?? '-').slice(0, 8)}`,
+    `idle_s=${Math.floor((fields.idleMs ?? 0) / 1_000)}`,
+    `repeat=${fields.repeatCount ?? 0}`,
+    `fingerprint=${fields.fingerprintHash ?? '-'}`,
+    `attempt=${fields.attempt}`,
+    `outcome=${fields.outcome ?? '-'}`,
+  ].join(' ')
+}
+
 export const DEFAULT_CODEX_WATCHDOG: WatchdogSettings = {
   mode: 'recover_once',
   stallMs: 900_000,
