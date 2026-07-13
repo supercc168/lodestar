@@ -51,11 +51,15 @@ interface StatusCardOpts {
 
 export interface ModelChoice {
   provider?: AgentProvider
+  /** 关联的 token source id(面板展开成 source×model 后,标记这条属于哪个 source) */
+  sourceId?: string
   model: string
   displayName: string
   description?: string
   isDefault?: boolean
   selected?: boolean
+  /** 该 source 是否已配置凭据;false = 灰显 +「启用」按钮(未配置 source 的占位项) */
+  enabled?: boolean
   efforts: ModelEffortChoice[]
 }
 
@@ -540,6 +544,30 @@ export function modelResultPanelElement(opts: ModelResultPanelOpts): object {
 }
 
 function modelChoiceElement(model: ModelChoice, panelId: string, currentEffort?: string | null): object {
+  // 未配置 source 的占位项:灰显 + 「启用」按钮(不渲染选/effort)
+  if (model.enabled === false) {
+    return {
+      tag: 'column_set',
+      columns: [
+        {
+          tag: 'column', width: 'weighted', weight: 4,
+          elements: [{
+            tag: 'markdown',
+            content: `⚙️ **${escapeMarkdown(model.displayName)}** · 未配置\n${escapeMarkdown(model.description ?? '')}`,
+          }],
+        },
+        {
+          tag: 'column', width: 'weighted', weight: 1,
+          elements: [{
+            tag: 'button',
+            text: { tag: 'plain_text', content: '启用' },
+            type: 'primary',
+            behaviors: [{ type: 'callback', value: { kind: 'token_source_enable', source_id: model.sourceId } }],
+          }],
+        },
+      ],
+    }
+  }
   const title = model.displayName && model.displayName !== model.model
     ? `**${escapeMarkdown(model.displayName)}**`
     : `**${inlineCode(model.model)}**`
@@ -600,6 +628,7 @@ function modelSelectActionValue(model: ModelChoice, panelId: string): object {
   return {
     kind: 'model_select',
     panel_id: panelId,
+    ...(model.sourceId ? { source_id: model.sourceId } : {}),
     ...(model.provider && model.provider !== 'codex' ? { provider: model.provider } : {}),
     model: model.model,
     display_name: model.displayName,

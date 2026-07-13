@@ -21,37 +21,73 @@ export interface ModelPanelState {
 
 /** model 命令选项:从 token source registry 动态枚举(每个 source 一项 = 一个账号)。
  * effort 锁死(每个 source 默认 effort);选了 → applyModelSelection 传 tokenSourceId。 */
-function tokenSourceChoices() {
-  return listTokenSources().map(ts => ({
-    provider: ts.agent as AgentProvider,
-    // model 字段用 source.id 作面板/回调标识;spawn 走 ts.defaultModel(selectedModel 设 null)
-    model: ts.id,
-    displayName: ts.display,
-    description: ts.agent === 'codex' ? 'Codex 订阅' : 'Claude 第三方',
-    effort: ts.models[0]?.defaultEffort ?? (ts.agent === 'codex' ? 'xhigh' : 'max'),
-  }))
+type SourceModelChoice = {
+  provider: AgentProvider
+  sourceId: string
+  model: string
+  displayName: string
+  description: string
+  enabled: boolean
+  efforts: AgentReasoningEffort[]
+  defaultEffort: AgentReasoningEffort
+}
+
+/** 面板选项:每个 enabled source 展开成它的每个模型(订阅模型列表);未配置 source 占位一项(灰显+启用)。 */
+function tokenSourceChoices(): SourceModelChoice[] {
+  const out: SourceModelChoice[] = []
+  for (const ts of listTokenSources()) {
+    if (!ts.enabled || !ts.models.length) {
+      out.push({
+        provider: ts.agent as AgentProvider,
+        sourceId: ts.id,
+        model: ts.id,
+        displayName: ts.display,
+        description: '未配置 · 点「启用」',
+        enabled: false,
+        efforts: [],
+        defaultEffort: ts.agent === 'codex' ? 'xhigh' : 'max',
+      })
+      continue
+    }
+    for (const m of ts.models) {
+      out.push({
+        provider: ts.agent as AgentProvider,
+        sourceId: ts.id,
+        model: m.model,
+        displayName: m.display,
+        description: ts.display,
+        enabled: true,
+        efforts: m.efforts,
+        defaultEffort: m.defaultEffort,
+      })
+    }
+  }
+  return out
 }
 
 function fixedModelChoices(s: Session): cards.ModelChoice[] {
-  const currentProvider = s.currentProvider()
   const currentTs = s.currentTokenSource()
+  const currentModel = s.currentModelLabel()
   const currentEffort = s.currentEffortLabel()
   return tokenSourceChoices().map(item => {
-    // 有 token source 时比 source.id;否则比 provider(兼容未配 ts 的旧路径)
-    const selected = currentTs ? currentTs.id === item.model : currentProvider === item.provider
+    const selected = item.enabled && currentTs?.id === item.sourceId && currentModel === item.model
     return {
       provider: item.provider,
+      sourceId: item.sourceId,
       model: item.model,
       displayName: item.displayName,
       description: item.description,
+      enabled: item.enabled,
       isDefault: false,
       selected,
-      efforts: [{
-        effort: item.effort,
-        description: '',
-        isDefault: true,
-        selected: selected && currentEffort === item.effort,
-      }],
+      efforts: item.enabled
+        ? item.efforts.map(e => ({
+            effort: e,
+            description: '',
+            isDefault: e === item.defaultEffort,
+            selected: selected && currentEffort === e,
+          }))
+        : [],
     }
   })
 }
@@ -107,8 +143,11 @@ export async function onModelSelect(
   if (!choice) {
     return { ok: false, message: '模型不在当前选项中,请重新发送 model' }
   }
-  // 二元选择:effort 锁死,选了直接应用,跳过 effort 二级面板。
-  const effort = choice.efforts[0]?.effort
+  if (choice.enabled === false) {
+    return { ok: false, message: `${choice.displayName} 未配置,请先点「启用」` }
+  }
+  // effort 锁死该模型 default effort;要换 effort 重发 model 选。
+  const effort = choice.efforts.find(e => e.isDefault)?.effort ?? choice.efforts[0]?.effort
   if (!effort) return { ok: false, message: '模型未返回 effort' }
   return onModelEffortSelect(s, model, effort, panelIdRaw, _userOpenId, provider)
 }
@@ -135,9 +174,9 @@ export async function onModelEffortSelect(
     return { ok: false, message: 'Codex reasoning effort 无效' }
   }
   const effort = effortValue as AgentReasoningEffort
-  // 锁死:只放行 tokenSourceChoices 的 (provider, model=source.id, effort) 组合
+  // 锁死:只放行 tokenSourceChoices 里该模型支持的 effort(per-model)
   const fixed = tokenSourceChoices().find(c => c.provider === provider && c.model === model)
-  if (!fixed || fixed.effort !== effort) {
+  if (!fixed || !fixed.efforts.includes(effort)) {
     return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在选项中` }
   }
   const choice = panel?.models.find(m => m.model === model && (m.provider ?? 'codex') === provider)
@@ -178,7 +217,7 @@ export async function onModelEffortSelect(
         await withTimeout(s.proc.setModelSettings(model, effort), 20_000, 'thread/settings/update')
       }
     }
-    await s.applyModelSelection(provider, model, effort, model)
+    await s.applyModelSelection(provider, model, effort, choice?.sourceId)
     if (shouldRespawnIdleClaude) {
       await s.stopIdleCurrentProcess('Claude model profile changed; env will apply on next spawn')
     }

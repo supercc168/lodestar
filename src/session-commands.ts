@@ -69,15 +69,11 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     await s.showTasklistPanel()
     return true
   }
-  // config / cfg —— 飞书内增删 token source(不 SSH 改 config.toml)。
-  //   config           → 列出所有 token source + [🗑 删] + 新增引导
-  //   config add ...   → 新增(见 runConfigAddCommand 用法)
-  const cfg = raw.trim().match(/^config(?:\s+([\s\S]+))?$/i) || raw.trim().match(/^cfg(?:\s+([\s\S]+))?$/i)
-  if (cfg) {
-    const { showConfigPanel, runConfigAddCommand } = await import('./token-source-ui')
-    const sub = (cfg[1] ?? '').trim()
-    if (sub.toLowerCase().startsWith('add ')) await runConfigAddCommand(s, sub.slice(4))
-    else await showConfigPanel(s)
+  // glm-setup <base_url> <token> —— 启用 GLM Coding Plan(未配置 source 的「启用」入口,配合 model 面板)
+  const glmSetup = raw.trim().match(/^glm-setup\s+([\s\S]+)$/i)
+  if (glmSetup) {
+    const { runGlmSetupCommand } = await import('./token-source-setup')
+    await runGlmSetupCommand(s, glmSetup[1].trim())
     return true
   }
   const command = CONTROL_COMMAND_ALIASES.get(raw.trim().toLowerCase())

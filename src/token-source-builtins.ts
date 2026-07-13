@@ -1,10 +1,22 @@
 /**
- * 内置 TokenSource 实现 —— 从 config.toml [token_source.*] 构建 codex/glm source。
+ * 两个固定 TokenSourceKind 的实现(代码内置,不再泛化 add):
  *
- * 由 daemon 启动时调用 buildTokenSourcesFromConfig() 注册到 registry。
- * 飞书 config 命令改 token_source 后可重新调用(reload)。
+ *   codex-subscription — 本地 codex login 的 ChatGPT 订阅:
+ *     模型 = app-server `model/list` 动态拉(per-model effort、过滤 hidden);
+ *     额度 = account/rateLimits/read(真);enabled = ~/.codex/auth.json 在。
+ *
+ *   glm-coding-plan — GLM Coding Plan 订阅:
+ *     模型 = 订阅固定覆盖内置(GLM-5.2[1m]/GLM-4.7;开放平台 /paas/v4/models 命名
+ *     匹配不上 anthropic 端点要的大写+[1m],且是全集非 Coding Plan 覆盖,故不拉);
+ *     额度 = quota/limit(真);enabled = config 有 base_url+token。
+ *
+ * daemon 启动调 buildTokenSourcesFromConfig() 注册这两枚 + 各自 refreshModels()
+ * 拉模型填 models(失败留空 MISS)。model 面板据 enabled 显示可选 / 灰显「启用」。
  */
 
+import { existsSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { config, type TokenSourceConfig } from './config'
 import {
   type TokenSource,
@@ -13,12 +25,14 @@ import {
   type UsageWindowUnified,
   registerTokenSource,
   resetTokenSourceRegistry,
+  setDefaultTokenSource,
 } from './token-source'
 import { readUsage, type UsageSnapshot, type UsageWindow } from './usage'
 import { readGlmUsage, type GlmUsageSnapshot, type GlmUsageWindow, type GlmMonthlyWindow } from './glm-usage'
+import { fetchCodexModels } from './token-source-models'
+import { log } from './log'
 import type { AgentReasoningEffort } from './agent-process'
 
-const CODEX_EFFORTS: AgentReasoningEffort[] = ['xhigh', 'high', 'medium', 'low', 'minimal', 'none']
 const CLAUDE_EFFORTS: AgentReasoningEffort[] = ['max', 'xhigh', 'high', 'medium', 'low']
 
 const ANTHROPIC_ENV_KEYS = [
@@ -28,32 +42,18 @@ const ANTHROPIC_ENV_KEYS = [
 
 type Env = Record<string, string | undefined>
 
-/** scrub 残留的 Anthropic 凭据 env(防 A 账号夹带 B 的 key) */
+/** scrub 残留的 Anthropic 凭据 env(防 A 账号夹带 B 的 key)。 */
 function scrubAnthropicEnv(base: Env): Env {
   const out: Env = { ...base }
   for (const k of ANTHROPIC_ENV_KEYS) delete out[k]
   return out
 }
 
-/** 'opus=X,sonnet=Y,haiku=Z' → {opus:X, sonnet:Y, haiku:Z} */
-function parseSlots(slots?: string): Record<string, string> {
-  const out: Record<string, string> = {}
-  if (!slots) return out
-  for (const pair of slots.split(',')) {
-    const eq = pair.indexOf('=')
-    if (eq < 0) continue
-    const k = pair.slice(0, eq).trim()
-    const v = pair.slice(eq + 1).trim()
-    if (k && v) out[k] = v
-  }
-  return out
-}
-
-/** 'a,b,c' → ['a','b','c'] */
-function parseList(list?: string): string[] {
-  if (!list) return []
-  return list.split(',').map(s => s.trim()).filter(Boolean)
-}
+// ── GLM Coding Plan 订阅固定覆盖模型(内置;非动态拉,见文件头) ────────
+const GLM_MODELS: TokenSourceModel[] = [
+  { model: 'GLM-5.2[1m]', display: 'GLM-5.2 · 1M 上下文', efforts: CLAUDE_EFFORTS, defaultEffort: 'max' },
+  { model: 'GLM-4.7', display: 'GLM-4.7', efforts: CLAUDE_EFFORTS, defaultEffort: 'max' },
+]
 
 // ── usage → unified 转换 ─────────────────────────────────
 
@@ -74,7 +74,7 @@ function codexUsageToUnified(s: UsageSnapshot): UsageSnapshotUnified {
 }
 
 function windowToUnified(w: UsageWindow, kind: string, label: string): UsageWindowUnified {
-  return { kind, label, percent: w.percent, resetsAt: w.resetsAt, ...(w.durationMins != null ? {} : {}) }
+  return { kind, label, percent: w.percent, resetsAt: w.resetsAt }
 }
 
 function glmUsageToUnified(s: GlmUsageSnapshot): UsageSnapshotUnified {
@@ -111,104 +111,106 @@ function glmMonthlyToUnified(w: GlmMonthlyWindow): UsageWindowUnified {
   }
 }
 
-// ── codex TokenSource(订阅 / OpenAI key) ────────────────
+// ── codex-subscription(本地 ChatGPT login) ───────────────
 
-function buildCodexSource(id: string, cfg: TokenSourceConfig): TokenSource {
-  const defaultModel = cfg.model?.trim() || 'gpt-5.6-sol'
-  const modelIds = parseList(cfg.models).length ? parseList(cfg.models) : [defaultModel]
-  const defaultEffort: AgentReasoningEffort =
-    (cfg.effort as AgentReasoningEffort) || 'xhigh'
-  const models: TokenSourceModel[] = modelIds.map(m => ({
-    model: m,
-    display: m,
-    efforts: CODEX_EFFORTS,
-    defaultEffort,
-  }))
-  return {
-    id,
+/** codex 本地登录态:~/.codex/auth.json 存在即视为已配置(廉价同步信号;
+ *  订阅是否有效在 account/rateLimits 查询时如实暴露 MISS)。 */
+function codexLoggedIn(): boolean {
+  const codexHome = process.env.CODEX_HOME || join(homedir(), '.codex')
+  return existsSync(join(codexHome, 'auth.json'))
+}
+
+function buildCodexSubscriptionSource(): TokenSource {
+  const enabled = codexLoggedIn()
+  const ts: TokenSource = {
+    id: 'codex-sub',
+    kind: 'codex-subscription',
     agent: 'codex',
-    display: cfg.display?.trim() || `Codex · ${defaultModel}`,
+    display: 'Codex 订阅',
     capabilities: { resumeSessionAt: false, fork: false, hostAsk: true },
-    models,
-    defaultModel,
+    enabled,
+    models: [],
+    defaultModel: 'gpt-5.5',
+    async refreshModels(): Promise<void> {
+      if (!ts.enabled) { ts.models = []; return }
+      try {
+        ts.models = await fetchCodexModels()
+        if (ts.models.length) ts.defaultModel = ts.models[0].model
+      } catch (e: any) {
+        // MISS:拉取失败如实留空,绝不假数据。面板会显示空模型 + 失败态。
+        log(`codex-sub refreshModels MISS: ${e?.message ?? e}`)
+        ts.models = []
+      }
+    },
     spawnEnv(base: Env): Env {
-      // codex 不需要 Anthropic 凭据 —— scrub 掉残留(防上个 claude 会话的 env 串号)
-      const out: Env = scrubAnthropicEnv(base)
+      const out = scrubAnthropicEnv(base)
       Object.assign(out, config.codex.env)
-      if (cfg.api_key) out.OPENAI_API_KEY = cfg.api_key
       return out
     },
     resolveSpawnModel(model: string): string {
-      // codex 恢复下发具体 slug(取代 ~/.codex/config.toml 自治)
+      // codex 下发具体 slug(取代 ~/.codex/config.toml 自治)
       return model
     },
     async readUsage(): Promise<UsageSnapshotUnified> {
-      if (cfg.usage === 'none') return { state: 'not_applicable', windows: [] }
       return codexUsageToUnified(await readUsage())
     },
   }
+  return ts
 }
 
-// ── claude TokenSource(GLM/DeepSeek/reclaude/官方) ───────
+// ── glm-coding-plan(第三方 anthropic 兼容端点) ──────────
 
-function buildClaudeSource(id: string, cfg: TokenSourceConfig): TokenSource {
-  const slots = parseSlots(cfg.slots)
-  const defaultModel = cfg.model?.trim() || slots.opus || 'opus'
-  const modelIds = parseList(cfg.models).length
-    ? parseList(cfg.models)
-    : [...new Set(Object.values(slots).filter(Boolean))]
-  const defaultEffort: AgentReasoningEffort = (cfg.effort as AgentReasoningEffort) || 'max'
-  const models: TokenSourceModel[] = (modelIds.length ? modelIds : [defaultModel]).map(m => ({
-    model: m,
-    display: m,
-    efforts: CLAUDE_EFFORTS,
-    defaultEffort,
-  }))
-  const hasBin = !!cfg.bin
-  return {
-    id,
+function buildGlmCodingPlanSource(cfg: TokenSourceConfig): TokenSource {
+  const baseUrl = cfg.base_url?.trim() || ''
+  const token = cfg.auth_token?.trim() || ''
+  const enabled = !!(baseUrl && token)
+  const ts: TokenSource = {
+    id: 'glm',
+    kind: 'glm-coding-plan',
     agent: 'claude',
-    display: cfg.display?.trim() || `Claude · ${defaultModel}`,
+    display: 'GLM Coding Plan',
     capabilities: { resumeSessionAt: true, fork: true, hostAsk: false },
-    models,
-    defaultModel,
+    enabled,
+    models: enabled ? GLM_MODELS : [],
+    defaultModel: 'GLM-5.2[1m]',
+    async refreshModels(): Promise<void> {
+      // Coding Plan 模型订阅固定覆盖,不动态拉(见文件头注释)。
+      ts.models = ts.enabled ? GLM_MODELS : []
+    },
     spawnEnv(base: Env): Env {
-      // reclaude(bin 包装器):不注入凭据 env,走 bin 自己的链路
-      if (hasBin) return { ...base, ...config.claude.env }
-      // 第三方(base_url + token):scrub 残留 + 注入本 source 凭据 + slots
       const out = scrubAnthropicEnv(base)
       const merged = { ...config.claude.env }
-      if (cfg.base_url) merged.ANTHROPIC_BASE_URL = cfg.base_url
-      if (cfg.auth_token) merged.ANTHROPIC_AUTH_TOKEN = cfg.auth_token
-      if (cfg.api_key) merged.ANTHROPIC_API_KEY = cfg.api_key
-      if (slots.opus) merged.ANTHROPIC_DEFAULT_OPUS_MODEL = slots.opus
-      if (slots.sonnet) merged.ANTHROPIC_DEFAULT_SONNET_MODEL = slots.sonnet
-      if (slots.haiku) merged.ANTHROPIC_DEFAULT_HAIKU_MODEL = slots.haiku
+      merged.ANTHROPIC_BASE_URL = baseUrl
+      merged.ANTHROPIC_AUTH_TOKEN = token
+      merged.ANTHROPIC_DEFAULT_OPUS_MODEL = 'GLM-5.2[1m]'
+      merged.ANTHROPIC_DEFAULT_SONNET_MODEL = 'GLM-5.2[1m]'
+      merged.ANTHROPIC_DEFAULT_HAIKU_MODEL = 'GLM-4.7'
       return { ...out, ...merged }
     },
     resolveSpawnModel(_model: string): string | undefined {
-      // claude 用 SDK alias('opus'),真实上游模型靠 spawnEnv 注入的 DEFAULT_*_MODEL slots。
-      // reclaude 同理(参数透传)。
+      // claude 用 SDK alias('opus'),真实上游模型靠 spawnEnv 注入的 DEFAULT_*_MODEL。
       return 'opus'
     },
     async readUsage(): Promise<UsageSnapshotUnified> {
-      if (cfg.usage === 'none') return { state: 'not_applicable', windows: [] }
-      // GLM coding plan 额度(glm-usage 读 ~/.claude/settings.json,后续收口到 config)
-      if (cfg.usage === 'glm-coding-plan') return glmUsageToUnified(await readGlmUsage())
-      return { state: 'not_applicable', windows: [] }
+      // 额度查询走 ~/.claude/settings.json 的 GLM 凭据(glm-usage);
+      // spawn 注入的 config.toml 凭据应与之保持同一份 token。
+      return glmUsageToUnified(await readGlmUsage())
     },
   }
+  return ts
 }
 
-// ── 从 config 构建并注册 ─────────────────────────────────
+// ── 从 config 构建并注册(固定两个 kind,无条件注册,enabled 决定面板态) ──
 
 export function buildTokenSourcesFromConfig(): number {
   resetTokenSourceRegistry()
-  let n = 0
-  for (const [id, cfg] of Object.entries(config.token_sources)) {
-    const src = cfg.agent === 'codex' ? buildCodexSource(id, cfg) : buildClaudeSource(id, cfg)
-    registerTokenSource(src, { default: cfg.default === true })
-    n++
-  }
-  return n
+  const sources = [
+    buildCodexSubscriptionSource(),
+    buildGlmCodingPlanSource(config.token_sources['glm'] ?? {}),
+  ]
+  for (const s of sources) registerTokenSource(s)
+  // default = 第一个 enabled 的(codex 优先);都未配置则保持 registry 默认(codex-sub)。
+  const firstEnabled = sources.find(s => s.enabled)
+  if (firstEnabled) setDefaultTokenSource(firstEnabled.id)
+  return sources.length
 }

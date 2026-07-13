@@ -447,11 +447,8 @@ export class Session {
     if (typeof explicit === 'string' && getTokenSource(explicit)) return explicit
     const provider: AgentProvider = (selection?.provider as AgentProvider) ?? this.selectedProvider
     const model = selection?.model ?? ''
+    // agent 固定:claude→glm、codex→codex-sub。model 是具体 slug,不再靠字符串猜 source。
     const list = listTokenSourcesByAgent(provider === 'codex' ? 'codex' : 'claude')
-    if (provider === 'claude' && model.includes('glm')) {
-      const glm = list.find(s => s.id === 'glm') ?? list[0]
-      if (glm) return glm.id
-    }
     return list[0]?.id ?? defaultTokenSourceId()
   }
 
@@ -585,8 +582,9 @@ export class Session {
     this.selectedTokenSourceId = tokenSourceId ?? this.selectedTokenSourceId
     const ts = getTokenSource(this.selectedTokenSourceId)
     if (ts) {
-      this.selectedModel = null  // currentModelLabel fallback ts.defaultModel
-      this.selectedEffort = ts.models[0]?.defaultEffort ?? effort
+      // model = 用户面板选的具体 slug(gpt-5.6-sol / GLM-5.2[1m]);空 → fallback ts.defaultModel
+      this.selectedModel = model || null
+      this.selectedEffort = effort ?? ts.models.find(m => m.model === model)?.defaultEffort ?? ts.models[0]?.defaultEffort ?? null
     } else {
       this.selectedModel = provider === 'codex' ? null : model
       this.selectedEffort = provider === 'codex' ? null : effort

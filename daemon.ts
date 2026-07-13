@@ -539,10 +539,10 @@ async function handleCardAction(data: any): Promise<any> {
       const result = await session.onTasklistDeleteConfirm(String(value.guid ?? ''))
       return actionCardResponse(result.card)
     }
-    case 'token_source_delete': {
-      const { onTokenSourceDelete } = await import('./src/token-source-ui')
-      await onTokenSourceDelete(session, String(value.id ?? ''))
-      return { toast: { type: 'success', content: '已处理' } }
+    case 'token_source_enable': {
+      const { onTokenSourceEnable } = await import('./src/token-source-setup')
+      await onTokenSourceEnable(session, String(value.source_id ?? ''))
+      return { toast: { type: 'info', content: '已处理' } }
     }
     case 'agy_forward_codex': {
       const result = session.beginAgyForwardToCodex(String(value.result_id ?? ''), userId)
@@ -749,6 +749,13 @@ async function boot(): Promise<void> {
   // config.toml [token_source.*] 在此落地为可用的 TokenSource。
   const { buildTokenSourcesFromConfig } = await import('./src/token-source-builtins')
   buildTokenSourcesFromConfig()
+  // 各 source 后台拉模型填 models(codex 拉 model/list,几秒;glm 内置同步)。
+  // 不阻塞 boot —— 拉完前面板显 MISS,拉完自动有。失败如实留空,绝不假数据。
+  const { listTokenSources } = await import('./src/token-source')
+  void Promise.allSettled(listTokenSources().map(async ts => {
+    await ts.refreshModels()
+    log(`token-source ${ts.id}: ${ts.models.length} models loaded`)
+  }))
   feishu.loadSessionChatMap()
   feishu.loadSessionResumeMap()
   feishu.loadSessionTurnsMap()

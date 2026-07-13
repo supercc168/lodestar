@@ -37,7 +37,7 @@ type UsageSnapshotOk = Extract<UsageSnapshot, { state: 'ok' }>
 let cache: UsageSnapshot | null = null
 let inFlight: Promise<UsageSnapshot> | null = null
 
-class AppServerOnce {
+export class AppServerOnce {
   private proc: ChildProcessByStdio<Writable, Readable, Readable>
   private buf = ''
   private nextId = 1
