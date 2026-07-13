@@ -449,7 +449,7 @@ describe('Session provider switching', () => {
     expect(session.selectedProvider).toBe('codex')
   })
 
-  test('respawns idle Claude process when selecting an env-backed model profile', async () => {
+  test('keeps idle Claude process, hot-swaps model via setModelSettings (no respawn)', async () => {
     const session = new Session('probe', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'claude-session-1')
     session.proc = proc
@@ -467,10 +467,11 @@ describe('Session provider switching', () => {
     expect(result.ok).toBe(true)
     expect(session.selectedModel).toBe('GLM-5.2')
     expect(session.selectedTokenSourceId).toBe('glm')
-    expect(proc.killCalls).toBe(1)
-    expect(session.proc).toBeNull()
-    expect(proc.setModelSettingsCalls).toEqual([])
-    expect(result.card ? JSON.stringify(result.card) : '').toContain('下次启动 Claude')
+    // 不重启 agent(保持之前体验):热切换 setModelSettings,不 kill、proc 还在
+    expect(proc.killCalls).toBe(0)
+    expect(session.proc).toBe(proc)
+    expect(proc.setModelSettingsCalls).toEqual([['GLM-5.2[1m]', 'max']])
+    expect(result.card ? JSON.stringify(result.card) : '').toContain('下一轮')
   })
 
   test('reselecting the active GLM model and max effort is idempotent', async () => {

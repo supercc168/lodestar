@@ -225,23 +225,17 @@ export async function onModelEffortSelect(
       message: '当前 Claude turn 正在执行或排队；Claude 模型 profile 通过 env 生效，请等结束或 stop 后再切换',
     }
   }
-  const shouldRespawnIdleClaude = provider === 'claude' &&
-    s.proc?.isAlive() &&
-    s.proc.provider === 'claude' &&
-    profileChanged
   try {
+    // 不重启 agent(保持之前体验):同 provider 切 model/effort 一律 setModelSettings 热切换
+    // (SDK 记新 model,下轮/下次生效)。不再 stopIdle respawn —— 那基于旧 env-alias 假设,
+    // 且会静默打断用户(发 model 选个模型就把 claude 进程杀了,离谱)。
     if (s.proc?.isAlive() && s.proc.provider === provider) {
-      if (!shouldRespawnIdleClaude) {
-        const processModel = choice.sourceId
-          ? getTokenSource(choice.sourceId)?.resolveSpawnModel(model) ?? model
-          : model
-        await withTimeout(s.proc.setModelSettings(processModel, effort), 20_000, 'thread/settings/update')
-      }
+      const processModel = choice.sourceId
+        ? getTokenSource(choice.sourceId)?.resolveSpawnModel(model) ?? model
+        : model
+      await withTimeout(s.proc.setModelSettings(processModel, effort), 20_000, 'thread/settings/update')
     }
     await s.applyModelSelection(provider, model, effort, choice.sourceId)
-    if (shouldRespawnIdleClaude) {
-      await s.stopIdleCurrentProcess('Claude model profile changed; env will apply on next spawn')
-    }
     const scope = modelSelectionScope(s, provider)
     s.modelPanels.delete(panelId)
     return {
