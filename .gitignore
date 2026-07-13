@@ -14,6 +14,9 @@ node_modules/
 # Claude Code operational state (worktrees, local settings)
 .claude/
 
+# Codex/Superpowers isolated worktrees
+.worktrees/
+
 # Local override config (if dropped in repo for testing)
 config.toml
 
