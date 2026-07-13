@@ -6,8 +6,7 @@
  *     额度 = account/rateLimits/read(真);enabled = ~/.codex/auth.json 在。
  *
  *   glm-coding-plan — GLM Coding Plan 订阅:
- *     模型 = 订阅固定覆盖内置(GLM-5.2[1m]/GLM-4.7;开放平台 /paas/v4/models 命名
- *     匹配不上 anthropic 端点要的大写+[1m],且是全集非 Coding Plan 覆盖,故不拉);
+ *     模型 = anthropic 端点 /v1/models 动态拉(display_name;GLM-5.2 spawn 加 [1m] 给 1M);
  *     额度 = quota/limit(真);enabled = config 有 base_url+token。
  *
  * daemon 启动调 buildTokenSourcesFromConfig() 注册这两枚 + 各自 refreshModels()
@@ -20,7 +19,6 @@ import { join } from 'node:path'
 import { config, type TokenSourceConfig } from './config'
 import {
   type TokenSource,
-  type TokenSourceModel,
   type UsageSnapshotUnified,
   type UsageWindowUnified,
   registerTokenSource,
@@ -29,18 +27,15 @@ import {
 } from './token-source'
 import { readUsage, type UsageSnapshot, type UsageWindow } from './usage'
 import { readGlmUsage, type GlmUsageSnapshot, type GlmUsageWindow, type GlmMonthlyWindow } from './glm-usage'
-import { fetchCodexModels } from './token-source-models'
+import { fetchCodexModels, fetchGlmModels } from './token-source-models'
 import { log } from './log'
-import type { AgentReasoningEffort } from './agent-process'
 
-const CLAUDE_EFFORTS: AgentReasoningEffort[] = ['max', 'xhigh', 'high', 'medium', 'low']
+type Env = Record<string, string | undefined>
 
 const ANTHROPIC_ENV_KEYS = [
   'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
 ]
-
-type Env = Record<string, string | undefined>
 
 /** scrub 残留的 Anthropic 凭据 env(防 A 账号夹带 B 的 key)。 */
 function scrubAnthropicEnv(base: Env): Env {
@@ -48,12 +43,6 @@ function scrubAnthropicEnv(base: Env): Env {
   for (const k of ANTHROPIC_ENV_KEYS) delete out[k]
   return out
 }
-
-// ── GLM Coding Plan 订阅固定覆盖模型(内置;非动态拉,见文件头) ────────
-const GLM_MODELS: TokenSourceModel[] = [
-  { model: 'GLM-5.2[1m]', display: 'GLM-5.2 · 1M 上下文', efforts: CLAUDE_EFFORTS, defaultEffort: 'max' },
-  { model: 'GLM-4.7', display: 'GLM-4.7', efforts: CLAUDE_EFFORTS, defaultEffort: 'max' },
-]
 
 // ── usage → unified 转换 ─────────────────────────────────
 
@@ -158,7 +147,7 @@ function buildCodexSubscriptionSource(): TokenSource {
   return ts
 }
 
-// ── glm-coding-plan(第三方 anthropic 兼容端点) ──────────
+// ── glm-coding-plan(anthropic 兼容端点) ──────────────────
 
 function buildGlmCodingPlanSource(cfg: TokenSourceConfig): TokenSource {
   const baseUrl = cfg.base_url?.trim() || ''
@@ -171,25 +160,35 @@ function buildGlmCodingPlanSource(cfg: TokenSourceConfig): TokenSource {
     display: 'GLM Coding Plan',
     capabilities: { resumeSessionAt: true, fork: true, hostAsk: false },
     enabled,
-    models: enabled ? GLM_MODELS : [],
-    defaultModel: 'GLM-5.2[1m]',
+    models: [],
+    defaultModel: 'GLM-5.2',
     async refreshModels(): Promise<void> {
-      // Coding Plan 模型订阅固定覆盖,不动态拉(见文件头注释)。
-      ts.models = ts.enabled ? GLM_MODELS : []
+      if (!ts.enabled) { ts.models = []; return }
+      try {
+        ts.models = await fetchGlmModels(baseUrl, token)
+        const main = ts.models.find(m => m.model === 'GLM-5.2')
+        if (main) ts.defaultModel = main.model
+      } catch (e: any) {
+        // MISS:动态拉取失败如实留空,绝不假数据。
+        log(`glm refreshModels MISS: ${e?.message ?? e}`)
+        ts.models = []
+      }
     },
     spawnEnv(base: Env): Env {
       const out = scrubAnthropicEnv(base)
       const merged = { ...config.claude.env }
       merged.ANTHROPIC_BASE_URL = baseUrl
       merged.ANTHROPIC_AUTH_TOKEN = token
+      // 默认 slots(SDK 走 alias 时的 fallback);resolveSpawnModel 下发具体 model 时不读这些。
       merged.ANTHROPIC_DEFAULT_OPUS_MODEL = 'GLM-5.2[1m]'
       merged.ANTHROPIC_DEFAULT_SONNET_MODEL = 'GLM-5.2[1m]'
       merged.ANTHROPIC_DEFAULT_HAIKU_MODEL = 'GLM-4.7'
       return { ...out, ...merged }
     },
-    resolveSpawnModel(_model: string): string | undefined {
-      // claude 用 SDK alias('opus'),真实上游模型靠 spawnEnv 注入的 DEFAULT_*_MODEL。
-      return 'opus'
+    resolveSpawnModel(model: string): string | undefined {
+      // 下发具体 model(不再走 'opus' alias)—— 否则面板选 GLM-4.7 还是路由到 OPUS_MODEL,假动态。
+      // GLM-5.2 带 [1m] 给 1M context(memory);其他用基础 id。
+      return model === 'GLM-5.2' ? 'GLM-5.2[1m]' : model
     },
     async readUsage(): Promise<UsageSnapshotUnified> {
       // 额度查询走 ~/.claude/settings.json 的 GLM 凭据(glm-usage);

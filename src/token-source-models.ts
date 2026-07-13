@@ -1,14 +1,9 @@
 /**
- * Token source 模型列表拉取 —— codex 订阅走 `model/list`(真相源)。
+ * Token source 模型列表拉取 —— 动态获取订阅真实模型,零写死。
  *
- * codex 订阅的可用模型由 app-server 的 `model/list` 返回:每个模型带
- * displayName / description / isDefault / per-model supportedReasoningEfforts /
- * hidden。这里过滤 hidden、映射 effort,产出 TokenSourceModel[]。零写死。
- *
- * glm Coding Plan 的模型是订阅固定覆盖(GLM-5.2[1m] / GLM-4.7),直接内置在
- * token-source-builtins.ts —— 因为 /paas/v4/models 返回的是开放平台全集、命名
- * (小写 glm-5.2)还匹配不上 anthropic 端点要的大写 GLM-5.2[1m],非 Coding Plan
- * 真相。额度仍动态拉(quota/limit)。
+ * codex 订阅:app-server `model/list`(per-model effort、过滤 hidden)。
+ * glm Coding Plan:anthropic 端点 `/v1/models`(返回 display_name + id + created_at)。
+ * 失败都抛错 —— 调用方(refreshModels)按 MISS 留空 models,绝不假数据。
  */
 
 import { AppServerOnce } from './usage'
@@ -31,11 +26,9 @@ function codexEffort(e: unknown): AgentReasoningEffort | null {
     : null
 }
 
-/**
- * 拉取 codex 订阅的可用模型(app-server `model/list`)。过滤 hidden,effort 用
- * 每个模型各自的 supportedReasoningEfforts(defaultReasoningEffort 落点)。
- * 失败抛错 —— 调用方(refreshModels)按 MISS 留空 models,绝不假数据。
- */
+const CLAUDE_EFFORTS: AgentReasoningEffort[] = ['max', 'xhigh', 'high', 'medium', 'low']
+
+/** codex 订阅可用模型(app-server model/list),过滤 hidden,effort 用 per-model。 */
 export async function fetchCodexModels(): Promise<TokenSourceModel[]> {
   const app = new AppServerOnce()
   try {
@@ -64,4 +57,23 @@ export async function fetchCodexModels(): Promise<TokenSourceModel[]> {
   } finally {
     await app.close()
   }
+}
+
+/** glm Coding Plan 可用模型(anthropic 端点 /v1/models)。用 display_name(端点接受的大写形式)。 */
+export async function fetchGlmModels(baseUrl: string, token: string): Promise<TokenSourceModel[]> {
+  const u = new URL(baseUrl)
+  const url = `${u.protocol}//${u.host}/api/anthropic/v1/models`
+  const res = await fetch(url, {
+    headers: { Authorization: `Bearer ${token}` },
+    signal: AbortSignal.timeout(TIMEOUT_MS),
+  })
+  if (!res.ok) throw new Error(`HTTP ${res.status}`)
+  const json = await res.json()
+  const data: any[] = Array.isArray(json?.data) ? json.data : []
+  return data
+    .filter(m => m && (m.display_name || m.id))
+    .map(m => {
+      const id = String(m.display_name || m.id)
+      return { model: id, display: id, efforts: CLAUDE_EFFORTS, defaultEffort: 'max' as AgentReasoningEffort }
+    })
 }
