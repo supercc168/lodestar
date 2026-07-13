@@ -316,7 +316,7 @@ export async function runSetup(): Promise<void> {
   // ── Codex (可选第二后端) ──────────────────────────────────────
   console.log()
   console.log(`${C.bold}Codex (可选第二后端)${C.reset}`)
-  console.log(`  ${C.dim}想用 Codex·GPT-5.5 的话, 登录 ChatGPT 订阅即可, 群里发 model 切换。${C.reset}`)
+  console.log(`  ${C.dim}想用 Codex 的话, 登录 ChatGPT 订阅即可, 模型/effort 走 ~/.codex/config.toml, 群里发 model 切换。${C.reset}`)
   const wantCodex = await ask('现在顺便配置 Codex 后端吗?', { default: 'n' })
   if (wantCodex.toLowerCase() === 'y') {
     let codexBin = whichBin('codex')

@@ -70,7 +70,7 @@ export interface SpawnOpts {
   workDir: string
   resumeSessionId?: string
   model?: string
-  effort: CodexReasoningEffort
+  effort?: CodexReasoningEffort
   appendSystemPrompt?: string
 }
 
@@ -763,20 +763,20 @@ export class CodexProcess extends EventEmitter {
     this.sessionId = thread?.id ?? this.opts.resumeSessionId ?? null
     if (res?.model) this.lastModel = res.model
     if (isCodexReasoningEffort(res?.reasoningEffort)) this.lastEffort = res.reasoningEffort
-    else this.lastEffort = this.opts.effort
+    else this.lastEffort = this.opts.effort ?? null
     log(`codex-process: thread=${this.sessionId}`)
     this.primeRolloutImageGenerationScan()
     this.emit('init', { session_id: this.sessionId, thread })
   }
 
   private threadParams(): Record<string, unknown> {
+    // codex 后端走 ~/.codex/config.toml:model / model_reasoning_effort 不由 lodestar 下发,
+    // 与裸 codex CLI 行为对齐(飞书=CLI)。订阅升级模型只改 config.toml 即可生效。
     return {
       cwd: this.opts.workDir,
       runtimeWorkspaceRoots: [this.opts.workDir],
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
-      ...(this.opts.model ? { model: this.opts.model } : {}),
-      effort: this.opts.effort,
       ...(this.opts.appendSystemPrompt ? { developerInstructions: this.opts.appendSystemPrompt } : {}),
       serviceName: 'lodestar',
     }
@@ -831,25 +831,15 @@ export class CodexProcess extends EventEmitter {
     })
   }
 
-  async setModelSettings(model: string, effort: AgentReasoningEffort): Promise<void> {
-    if (!model.trim()) throw new Error('empty model')
-    if (!isCodexReasoningEffort(effort)) throw new Error(`invalid reasoning effort: ${String(effort)}`)
-    if (!this.readyPromise) throw new Error('codex thread not initialized')
-    await this.readyPromise
-    if (!this.sessionId) throw new Error('codex thread not initialized')
-    await this.request('thread/settings/update', {
-      threadId: this.sessionId,
-      model,
-      effort,
-    })
-    this.opts.model = model
-    this.opts.effort = effort
-    this.lastModel = model
-    this.lastEffort = effort
+  async setModelSettings(_model: string, _effort: AgentReasoningEffort): Promise<void> {
+    // codex 后端走 ~/.codex/config.toml:model / effort 由 codex 决定,lodestar 不下发
+    // thread/settings/update。保留方法签名以满足 AgentProcess 接口(session-model 切换时仍会调用)。
+    log('codex-process: setModelSettings no-op (codex model/effort governed by ~/.codex/config.toml)')
   }
 
-  async setModel(model: string): Promise<void> {
-    await this.setModelSettings(model, this.opts.effort)
+  async setModel(_model: string): Promise<void> {
+    // codex 走配置:setModel/setModelSettings 均 no-op(model 由 ~/.codex/config.toml 决定)
+    log('codex-process: setModel no-op (codex model governed by ~/.codex/config.toml)')
   }
 
   async compactThread(): Promise<void> {
@@ -893,8 +883,6 @@ export class CodexProcess extends EventEmitter {
       cwd: this.opts.workDir,
       approvalPolicy: 'never',
       sandboxPolicy: { type: 'dangerFullAccess' },
-      ...(this.opts.model ? { model: this.opts.model } : {}),
-      effort: this.opts.effort,
     })
   }
 

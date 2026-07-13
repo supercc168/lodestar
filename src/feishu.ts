@@ -295,7 +295,8 @@ export function tempChatName(projectName: string): string {
 // writes the provider-aware structured shape.
 export interface SessionModelSelection {
   provider: AgentProvider
-  model: string
+  /** codex 后端走 ~/.codex/config.toml,model 为 null(由 codex 决定);claude 必填。 */
+  model: string | null
   effort: AgentReasoningEffort | null
 }
 
@@ -315,18 +316,20 @@ export function loadSessionModelMap(): void {
       }
       if (!selection || typeof selection !== 'object') continue
       const model = (selection as { model?: unknown }).model
-      if (typeof model !== 'string' || !model.trim()) continue
       const providerRaw = (selection as { provider?: unknown }).provider
       const provider: AgentProvider = providerRaw === 'claude' || providerRaw === 'codex'
         ? providerRaw
-        : providerFromModel(model)
+        : (typeof model === 'string' && model.trim() ? providerFromModel(model) : 'claude')
+      const modelStr = typeof model === 'string' && model.trim() ? model : null
+      // codex 走 ~/.codex/config.toml,model 可为空;claude 必须有具体 model,否则丢弃
+      if (provider === 'claude' && !modelStr) continue
       const effort = (selection as { effort?: unknown }).effort
       const normalizedEffort = provider === 'claude'
         ? isClaudeReasoningEffort(effort) ? effort : null
         : isCodexReasoningEffort(effort) ? effort : null
       selectedModelByName.set(name, {
         provider,
-        model,
+        model: modelStr,
         effort: normalizedEffort,
       })
     }
@@ -346,7 +349,7 @@ function saveSessionModelMap(): void {
 export function bindSessionModel(
   sessionName: string,
   provider: AgentProvider,
-  model: string,
+  model: string | null,
   effort: AgentReasoningEffort | null,
 ): void {
   const prev = selectedModelByName.get(sessionName)

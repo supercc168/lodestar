@@ -19,15 +19,18 @@ export interface ModelPanelState {
 }
 
 /** model 命令的二元固定选项:effort 锁死,选了即生效(无 effort 二级面板)。
- * codex = gpt-5.5 / xhigh;claude = claude:glm (GLM-5.2) / max (ultracode)。
+ * codex = 走 ~/.codex/config.toml(model/effort 不由 lodestar 下发,实际模型由
+ * currentModelLabel() 动态显示 codex 返回值);claude = claude:glm (GLM-5.2) / max (ultracode)。
  * claude 的 max 由 ClaudeAgentProcess.setModelSettings 强制 applyFlagSettings,
  * 不依赖 ~/.claude/settings.json 的 effortLevel。 */
 const FIXED_MODEL_CHOICES = [
   {
     provider: 'codex' as const,
-    model: 'gpt-5.5',
-    displayName: 'Codex · GPT-5.5',
-    description: 'GPT-5.5 · xhigh 推理强度。',
+    // model 字段仅作面板/回调标识;codex 实际 model/effort 走 ~/.codex/config.toml,
+    // 不由 lodestar 下发。currentModelLabel() 会动态显示 codex 返回的真实模型。
+    model: 'codex',
+    displayName: 'Codex',
+    description: '走 ~/.codex/config.toml 配置(model + effort)',
     effort: 'xhigh' as AgentReasoningEffort,
   },
   {
@@ -44,7 +47,10 @@ function fixedModelChoices(s: Session): cards.ModelChoice[] {
   const currentModel = s.currentModelLabel()
   const currentEffort = s.currentEffortLabel()
   return FIXED_MODEL_CHOICES.map(item => {
-    const selected = currentProvider === item.provider && currentModel === item.model
+    // codex 走 codex 配置,currentModel 是 codex 返回的真实模型(≠ 'codex' 占位),
+    // 故 codex 项只比 provider;claude 项比 provider + model。
+    const selected = currentProvider === item.provider
+      && (item.provider === 'codex' || currentModel === item.model)
     return {
       provider: item.provider,
       model: item.model,

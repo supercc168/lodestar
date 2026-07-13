@@ -20,7 +20,6 @@ import {
   CodexProcess,
   diffUsageTotals,
   effectiveTurnTokens,
-  isCodexReasoningEffort,
   type CanUseToolRequest,
   type CodexReasoningEffort,
   type CodexUsage,
@@ -393,9 +392,11 @@ export class Session {
       if (this.selectedProvider === 'claude' && this.selectedModel !== 'claude:glm') {
         this.selectedModel = 'claude:glm'
         this.selectedEffort = 'max'
-      } else if (this.selectedProvider === 'codex' && this.selectedModel !== 'gpt-5.5') {
-        this.selectedModel = 'gpt-5.5'
-        this.selectedEffort = 'xhigh'
+      } else if (this.selectedProvider === 'codex' && this.selectedModel !== null) {
+        // codex 走 ~/.codex/config.toml:model/effort 不在 lodestar 侧固定,归一到 null。
+        // 旧 session-model-map 持久化的 'gpt-5.5' 在此迁移为 null。
+        this.selectedModel = null
+        this.selectedEffort = null
       }
     }
     if (this.selectedModel) {
@@ -437,13 +438,15 @@ export class Session {
   }
 
   private modelForSpawn(): string | undefined {
+    // codex 后端走 ~/.codex/config.toml,不下发 model;claude 用 selectedModel。
+    if (this.selectedProvider === 'codex') return undefined
     return this.selectedModel ?? undefined
   }
 
-  effortForSpawn(): CodexReasoningEffort {
-    return this.selectedProvider === 'codex' && isCodexReasoningEffort(this.selectedEffort)
-      ? this.selectedEffort
-      : CODEX_EFFORT
+  effortForSpawn(): CodexReasoningEffort | undefined {
+    // codex 后端走 ~/.codex/config.toml(model_reasoning_effort),不下发 effort。
+    if (this.selectedProvider === 'codex') return undefined
+    return CODEX_EFFORT
   }
 
   claudeEffortForSpawn(): ClaudeReasoningEffort {
@@ -538,11 +541,13 @@ export class Session {
     effort: AgentReasoningEffort | null,
   ): Promise<void> {
     this.selectedProvider = provider
-    this.selectedModel = model
-    this.selectedEffort = effort
+    // codex 走 ~/.codex/config.toml:model/effort 不在 lodestar 侧固定 → 存 null,
+    // currentModelLabel()/currentEffortLabel() 会 fallback 到 codex 返回的真实值。
+    this.selectedModel = provider === 'codex' ? null : model
+    this.selectedEffort = provider === 'codex' ? null : effort
     this.lastSessionId = feishu.getSessionResume(this.sessionName, provider)
     feishu.clearTurnAnchors(this.sessionName)  // provider 切换 → 旧 provider 的 assistant uuid 配不上新 sid,清锚点
-    feishu.bindSessionModel(this.sessionName, provider, model, effort)
+    feishu.bindSessionModel(this.sessionName, provider, this.selectedModel, this.selectedEffort)
     await this.stopIdleMismatchedProcess()
   }
 
