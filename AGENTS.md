@@ -81,6 +81,13 @@
 - “测试当前改动”“发交互卡片到本群”“先看看效果”默认都属于**非授权**的 live-service 变更理由。除非用户在当前用户消息中明确要求，否则禁止执行任何会影响 `feishu-daemon.service` 或当前 live daemon 的操作，包括但不限于 `stop`、`restart`、`systemd-run` 起替代 daemon、手工 `bun daemon.ts` 接管、修改 service 指向、覆盖 live repo 代码后重启。
 - live-service 操作授权不得跨 turn 生效：如果上一个 turn 同时要求“提交、重启”，后续新 turn 只说“提交”“继续”“再改一下”或提出新需求时，必须视为没有重启授权；需要重启时先停下来向用户要新的明确许可。
 
+### Restart 铁律（2026-07-13 一次会话反复 restart 4-5 次后立）
+- **「我跑在 daemon 里」是根因**：lodestar daemon 就是承载当前这个 Claude 会话的宿主。`systemctl --user restart feishu-daemon` = 给自己发 SIGTERM = 当前会话被切断；恢复（新 turn / compaction 后）时**前面命令的执行结果、自己「有没有 restart 过」的记忆都不可信**——它们是被自己中断的旧会话产物。因此恢复后判断 daemon 状态**只看客观证据**（启动时间、PID、journalctl），绝不凭记忆。
+- **「用户说重启」≠ 立刻执行 restart**：用户消息出现 `restart`/`重启`/`reload` 时，第一步是**只读核实 daemon 是否真需要 restart**（它跑的代码是不是落后于工作区），不是直接执行。daemon 跑的是它**启动那一刻**工作区的源码（`bun daemon.ts`，加载即固化），之后工作区的任何修改（含未提交）它都没加载。判断看**代码文件 mtime vs daemon 启动时间**：`systemctl --user show feishu-daemon -p ActiveEnterTimestamp`（启动时间）+ 看 `git status` / 源码文件 mtime 是否有**晚于**该启动时间的改动；只有「daemon 启动后工作区代码改过」才需要 restart，否则就是已跑最新、**绝不 restart**。**不要用「最新 commit 时间」判断**——restart 未必是因为提交（systemd `Restart=always` 自动重启、看门狗回滚、手动调试、工作区未提交改动都不涉及 commit；commit 时间既会漏判未提交改动，也会误判非 deploy 重启）。journalctl 里 `models loaded` 等代码特征可作交叉确认，但不作唯一依据。
+- **死循环铁律（本会话反复犯的就是这个）**：restart 断我自己 → 恢复后丢失「刚 restart 过」的上下文 → 凭失效记忆又提议/执行 restart → 再断 → 循环。打破：**任何恢复后（restart、中断、compaction），第一反应是只读核实 daemon 状态，不是 restart**。同一会话内只要核实过「daemon 已跑最新」，无论之后多少轮、记忆多模糊，都**不再 restart**，除非用户新消息明确要求 + 重新核实确认跑旧。
+- **restart 一次到位，禁止 sleep+核实**：执行 restart 的那条 Bash 只做「清残留看门狗 + 起回滚看门狗 + `systemctl --user restart feishu-daemon`」，**不要在同一 Bash 里 sleep 后核实**——restart 会切断自己，sleep 后的核实结果要么收不到、要么是旧会话残留，不可信。核实一律放到 restart 之后**恢复出来的新回合**，用 journalctl/PID 客观确认。
+- **绝不连续 restart**：同一会话内，一次 restart 之后不再发起第二次，除非（a）用户在**新的**用户消息里再次明确点名 restart，且（b）重新只读核实确认 daemon 仍跑旧代码。两条都满足才动手；否则停下问用户。
+
 ## Release Checklist
 - 除非用户明确要求 minor 或 major 版本，否则只把 `package.json` 版本号按 patch 递增（`+0.0.1`）。不要根据变更范围自行推断 SemVer minor/major。
 - 发布前用 `bun test` 和 `bun run build` 验证。
