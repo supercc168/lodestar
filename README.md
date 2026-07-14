@@ -156,6 +156,35 @@ requires_openai_auth = "true"
 
 `task` 面板里的 `删` 会二次确认,确认后删除整个清单和清单内任务。这个能力需要飞书应用开通任务清单/任务/评论相关权限;缺权限时面板会显示 Open API 返回的失败原因和缺失 scope。
 
+### 🛟 Codex 长任务卡死自动恢复(turn watchdog)
+
+Codex 长任务偶发进入"空转循环":模型持续发完全相同、无副作用的 `text(...)` 空调用,不再推进也不结束。夜航星内置一个 turn watchdog,按如下契约处理:
+
+> Codex 默认 `recover_once`。最后一次有效进展后持续 15 分钟,且确认至少 10 次完全相同、成功、无副作用的 `text(...)` 空调用时,Lodestar 才会在原 thread 自动恢复一次。纯静默推理只在 30 分钟后提示,不会自动打断;同一任务链第二次确认循环只停止,不再恢复。真人排队消息始终优先并保留附件、顺序与 reaction;Claude 不启用自动恢复。
+
+行为细节:
+
+- **提示不打断**:长时间纯静默(默认 30 分钟)只把卡片 footer 换成 `⚠️ 长时间无可见进展 · 仍在等待`,推理继续。
+- **恢复只有一次**:确认空转循环后,先软打断(默认 10 秒宽限),进程还活着就在同一 thread 上追加一条恢复提示继续跑;进程死了则严格按原 provider + 原 thread 复活再继续,绝不偷偷开新 thread。
+- **失败不吞消息**:自动恢复失败时卡片和群里都会明确报 `❌ 自动恢复失败`,期间排队的真人消息(含附件与 ⏳ reaction)原样保留,发送 `restart` 继续。
+- **人类优先**:恢复窗口内到达的真人消息永远优先于恢复动作本身。
+
+默认配置即上述行为,可在 `~/.config/lodestar/config.toml` 全局调整,或按项目关闭:
+
+```toml
+[watchdog]
+codex_mode = 'recover_once'        # recover_once(默认)| warn(只提示)| off
+stall_seconds = '900'              # 空转判定的无进展时长(默认 15 分钟)
+repeat_noop_limit = '10'           # 连续相同空调用次数阈值
+silent_warn_seconds = '1800'       # 纯静默提示阈值(默认 30 分钟)
+interrupt_grace_seconds = '10'     # 软打断宽限
+
+[projects.某项目群名]
+watchdog_mode = 'off'              # 单项目覆盖(off / warn / recover_once)
+```
+
+> 注意:改代码或改 `config.toml` **不会**自动重启 daemon;要让新配置在 live 环境生效,需要另行明确执行重启操作。
+
 ### 🔀 接入 reclaude(自定义 Claude Code 可执行文件)
 
 [reclaude](https://docs.reclaude.ai) 用本地 daemon 代理 Claude Code 流量、换成官方分配账号。它的 CLI 会把所有非管理参数**原样透传**给 `claude`、自身输出只走 stderr,且每次启动自动确保 daemon 存活 —— 正好可以作为 lodestar 的 Claude 可执行文件。

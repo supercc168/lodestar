@@ -42,7 +42,7 @@
 2. A stale operation may kill only a process it locally spawned or captured. It must never null, kill, publish success for, or mutate a newer owner.
 3. Preserved recovery has immutable `{ provider, threadId }` identity and remains owned until its human batch is acknowledged or explicitly discarded.
 4. Strict retry never falls back to a fresh thread and never follows mutable `selectedProvider` or `lastSessionId` after preservation begins.
-5. Codex human input is committed only after the exact delivery's `turn/start` is accepted. Reject/exit before ACK restores the original message objects, order, attachments, `msgId`, `userOpenId`, and reactions exactly once.
+5. Every Codex human-input send path (cold start, idle eager open, pre-init bootstrap, and merged drain) is committed only after the exact delivery's `turn/start` is accepted. Reject/exit before ACK restores the original message objects, order, attachments, `msgId`, `userOpenId`, and reactions exactly once.
 6. ACK before exit commits exactly once and prevents duplicate replay. Stale ACK/result/exit events cannot settle another process, thread, delivery, or turn.
 7. Claude input stays synchronously queued and does not depend on a later SDK event.
 8. Detached-card cleanup acts only on the captured `TurnState`; after any `await` it cannot mutate a replacement `currentTurn`, process, watchdog context, status, or reaction owner.
@@ -413,6 +413,14 @@ test('RPC rejection settles rejected without throwing from the receipt', async (
   })
 })
 
+test('a dead or failed stdin write settles rejected instead of hanging', async () => {
+  const { proc } = failedWriteTurnStartFixture('thread-1')
+  const dispatch = proc.sendUserText('hello')
+  await expect(dispatch.settlement).resolves.toMatchObject({
+    kind: 'rejected', deliveryId: dispatch.deliveryId, threadId: 'thread-1',
+  })
+})
+
 test('turn/completed before the RPC response ACKs once with the same delivery identity', async () => {
   const { proc, resolveTurnStart, resultEvents } = pendingTurnStartFixture('thread-1')
   const dispatch = proc.sendUserText('hello')
@@ -448,6 +456,7 @@ export type CodexUserTextSettlement =
 
 export type UserTextDispatch =
   | { kind: 'queued'; provider: 'claude' }
+  | { kind: 'rejected'; provider: AgentProvider; error: Error }
   | {
       kind: 'turn_start_pending'
       provider: 'codex'
@@ -458,6 +467,8 @@ export type UserTextDispatch =
 
 sendUserText(text: string, files?: string[]): UserTextDispatch
 ```
+
+Replace `AgentProcessEventMap.result: any` with an `AgentResultEvent` type whose optional `delivery_id`, `thread_id`, and `turn_id` fields carry exact Codex ownership while preserving Claude's existing result fields.
 
 In `CodexProcess`, keep one active primary-thread delivery record. Its resolver must be idempotent and its `settlement` promise must never reject:
 
@@ -474,13 +485,17 @@ private deliveryCounter = 0
 private pendingTurnStart: PendingTurnStart | null = null
 ```
 
-`sendUserText()` captures `sessionId`, creates `deliveryId = String(++this.deliveryCounter)`, stores the record, calls `startTurn`, and resolves `ack` on the first exact primary-thread RPC response, `turn/started`, or `turn/completed`. Keep the settled record until `turn/completed` so a prior RPC/notification ACK does not lose the delivery identity needed by the later result event. RPC reject or process exit before any ACK resolves `rejected`; a late RPC rejection after notification/completion ACK is logged and ignored, and must not emit a synthetic `codex_turn_start_failed` result. Add `delivery_id`, `thread_id`, and `turn_id` to both completion and genuine pre-ACK `codex_turn_start_failed` result payloads.
+`sendUserText()` captures `sessionId`, creates `deliveryId = String(++this.deliveryCounter)`, stores the record, calls `startTurn`, and resolves `ack` on the first exact primary-thread RPC response, `turn/started`, or `turn/completed`. Keep the settled record until `turn/completed` so a prior RPC/notification ACK does not lose the delivery identity needed by the later result event. RPC reject, stdin write failure, or process exit before any ACK resolves `rejected`; a late RPC rejection after notification/completion ACK is logged and ignored, and must not emit a synthetic `codex_turn_start_failed` result. Register the JSON-RPC pending request before writing to stdin, and make dead/write failure reject that request instead of being swallowed. Add `delivery_id`, `thread_id`, and `turn_id` to both completion and genuine pre-ACK `codex_turn_start_failed` result payloads.
 
-In `ClaudeAgentProcess.sendUserText()`, return `{ kind: 'queued', provider: 'claude' }` immediately after the existing synchronous `input.push(...)`; do not wait for `init`, `turn_started`, or `session_state_changed`.
+If a second Codex send arrives while an unsettled `pendingTurnStart` exists, return `{ kind: 'rejected', provider: 'codex', error }` without replacing or orphaning the first receipt.
+
+For `turn/completed`, reject a same-thread completion whose non-empty `turn.id` conflicts with the active primary `currentTurnId` or the active delivery's already-bound `turnId`. A stale completion must not clear the newer turn ID or emit a Session-closing `result`.
+
+In `ClaudeAgentProcess.sendUserText()`, return `{ kind: 'queued', provider: 'claude' }` immediately after the existing synchronous `input.push(...)`; do not wait for `init`, `turn_started`, or `session_state_changed`. If the process is dead or `input.push()` throws, return `{ kind: 'rejected', provider: 'claude', error }` and never claim the input was queued.
 
 - [ ] **Step 4: Add RED tests for exact human-batch ownership**
 
-In `src/session.test.ts`, update `FakeAgentProc.sendUserText()` to return configurable dispatch handles. Add a `Session pending human delivery` group covering:
+In `src/session.test.ts`, update `FakeAgentProc.sendUserText()` to return configurable dispatch handles. Add a `Session pending human delivery` group covering merged drain plus the cold-start, idle eager-open, and pre-init bootstrap send sites:
 
 ```ts
 test('Codex exit before ACK restores the exact batch and reactions once', async () => {
@@ -512,7 +527,7 @@ test('Codex ACK before exit commits and cannot replay the batch', async () => {
 })
 ```
 
-Also cover: RPC reject before ACK; result-before-RPC-ACK; stale delivery ID; stale thread ID; stale process; ACK after owner replacement; late reaction arrival while the batch is pending; Claude synchronous commit; and exact preservation of two messages' `text`, `wireText` file hints, `userOpenId`, `msgId`, and order.
+Also cover: RPC reject before ACK; result-before-RPC-ACK; stale delivery ID; stale thread ID; stale turn ID; stale process; overlapping Codex sends; ACK after owner replacement; late reaction arrival while the batch is pending; bootstrap ACK before a card exists; bootstrap exit before init; Claude synchronous commit; Claude synchronous rejection; and exact preservation of two messages' `text`, `wireText` file hints, `userOpenId`, `msgId`, and order.
 
 - [ ] **Step 5: Implement `PendingHumanDelivery` and commit only on ACK**
 
@@ -522,25 +537,25 @@ Add to `src/session.ts`:
 type PendingHumanDelivery = {
   readonly token: object
   readonly proc: AgentProcess
-  readonly turn: TurnState
   readonly dispatch: Extract<UserTextDispatch, { kind: 'turn_start_pending' }>
   readonly batch: Array<{ text: string; wireText: string; userOpenId: string; msgId: string }>
   readonly reactions: Map<string, string>
+  turn: TurnState | null
   state: 'pending' | 'acked' | 'restored'
 }
 
 private pendingHumanDelivery: PendingHumanDelivery | null = null
 ```
 
-Refactor `drainMidTurnAndOpen()` so the batch remains owned by this context after the card opens. For Claude's `queued` handle, commit synchronously. For Codex, await the exact settlement and use idempotent helpers:
+Refactor `drainMidTurnAndOpen()` so the batch remains owned by this context after the card opens. For Claude's `queued` handle, commit synchronously; for either provider's synchronous `rejected` handle, restore synchronously. For Codex `turn_start_pending`, await the exact settlement and use idempotent helpers:
 
 ```ts
 private commitHumanDelivery(ctx: PendingHumanDelivery): boolean {
   if (this.pendingHumanDelivery !== ctx || ctx.state !== 'pending') return false
   ctx.state = 'acked'
   this.pendingHumanDelivery = null
-  this.pendingUserMessageCount++
-  if (this.proc === ctx.proc && this.currentTurn === ctx.turn) {
+  if (this.proc === ctx.proc && (!ctx.turn || this.currentTurn === ctx.turn)) {
+    this.pendingUserMessageCount++
     for (const [msgId, reactionId] of ctx.reactions) {
       this.currentBatchReactionIds.set(msgId, reactionId)
     }
@@ -567,7 +582,11 @@ private restoreHumanDelivery(ctx: PendingHumanDelivery): boolean {
 }
 ```
 
-Move batch reactions from `pendingReactionIds` into `ctx.reactions`, not `currentBatchReactionIds`, before sending. Settlement must match the context's `proc`, `deliveryId`, and `threadId`. The process `exit` handler restores only when the exiting process is `ctx.proc` and the context is still pending; after restoration it must take the preserved-queue exit branch and return before ordinary exit cleanup clears human state. An ACKed context is never restored. Extend `trackQueuedReaction()` so a delayed reaction ID updates `pendingHumanDelivery.reactions` when that context currently owns the `msgId`.
+Create one shared `dispatchHumanBatch()` path and use it from cold start, idle eager open, pre-init bootstrap, and `drainMidTurnAndOpen()`. A bootstrap delivery starts with `turn: null`; the exact later `openTurnCard()`/`init` owner may bind its `TurnState` only while token, process, thread, and delivery still match.
+
+Move batch reactions from `pendingReactionIds` into `ctx.reactions`, not `currentBatchReactionIds`, before sending. Settlement must match the context's `proc`, `deliveryId`, and `threadId`. Because EventEmitter `result`/`exit` handlers run before Promise continuations, `wireProc(result)` must synchronously commit a matching delivery from `{delivery_id, thread_id, turn_id}` before closing any card, and `wireProc(exit)` must synchronously restore a matching pending delivery before ordinary cleanup. Promise settlement then becomes an idempotent second signal. After restoration the exit handler must take the preserved-queue branch and return before ordinary exit cleanup clears human state. An ACKed context is never restored. Extend `trackQueuedReaction()` so a delayed reaction ID updates `pendingHumanDelivery.reactions` when that context currently owns the `msgId`.
+
+Before `wireProc(result)` calls `closeTurnCard`, require the event's process, thread, delivery, and non-conflicting turn identity to match the current/pending human delivery or captured `TurnState`. A stale same-thread completion cannot close a newer Session turn.
 
 Do not release `currentBatchReactionIds` while a pending delivery owns them. Do not update a replacement turn/status after any awaited receipt settles.
 
@@ -615,7 +634,10 @@ test('replaceElement reports API failure and write-dead short circuit', async ()
   await cardkit.replaceElement('card-fail', 'footer', footer(), code => failures.push(code))
   cardkit.markCardWriteDead('card-dead')
   await cardkit.replaceElement('card-dead', 'footer', footer(), code => failures.push(code))
-  expect(failures).toEqual([300313, undefined])
+  failNextCardKitCall(300305)
+  await cardkit.addElement('card-element-dead', footer(), {}, () => {})
+  await cardkit.replaceElement('card-element-dead', 'footer', footer(), code => failures.push(code))
+  expect(failures).toEqual([300313, undefined, undefined])
 })
 
 test('patchSettings reports API failure and write-dead short circuit', async () => {
@@ -665,6 +687,8 @@ In `src/session.test.ts`, add `Session detached watchdog card terminalization` t
 ```ts
 test('captured watchdog process exit closes only its old card', async () => {
   const { session, proc, turn } = armedRecoverySession()
+  session.watchdogActionToken = {}
+  session.watchdogActionProc = proc
   proc.emit('exit', { code: 1, signal: null, expected: false })
   await cardkit.flush(turn.cardId)
 
@@ -727,7 +751,7 @@ private async terminalizeDetachedTurn(
 }
 ```
 
-The actual implementation may share footer-element construction with `replaceFooterContent`, but it must not call `closeTurnCard()` and must not temporarily install the old turn into `currentTurn`. It must not read, clear, or release global pending reactions after any `await`.
+Reuse or replace the existing `settleCapturedStaleTurn()` implementation rather than adding a competing old-card finalizer. The resulting helper may share footer-element construction with `replaceFooterContent`, but it must not call `closeTurnCard()` and must not temporarily install the old turn into `currentTurn`. It must not read, clear, or release global pending reactions after any `await`.
 
 Call this helper from the captured-watchdog-process exit branches after synchronously taking the captured turn off the table. Keep lifecycle/status mutation outside the helper and guarded by the exact process/record ownership established in Tasks 1-2.
 
