@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { config } from './config'
-import { claudeModelEnv, claudeModelIsApiRoute } from './claude-models'
+import {
+  claudeModelConfigured,
+  claudeModelEffort,
+  claudeModelEnv,
+  claudeModelIsApiRoute,
+} from './claude-models'
 
 // 固定的 GLM 测试档位(不依赖宿主 config.toml,保证测试确定性)。
 // 注意:不用 mock.module('./config')。bun 的模块 mock 无法被 mock.restore() 撤销,
@@ -77,5 +82,58 @@ describe('claudeModelEnv per-档位 env 注入', () => {
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-4.6') // config 覆盖
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5-turbo') // 默认
     expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.2[1m]') // 默认
+  })
+})
+
+// Grok 走 wuhen-ai 的 Anthropic 兼容端点,与 GLM 同为第三方 API 路由,但 tier
+// 映射 + CLAUDE_CODE_* flag 全部经 config env_* 注入(代码无 grok 专用默认,
+// 不像 glm 有 DEFAULT_GLM_ENV 硬编码)。此处复刻 GLM 的 config 隔离范式。
+describe('grok 档位(wuhen-ai 第三方 Anthropic 兼容路由)', () => {
+  let prevGrok: unknown
+
+  beforeEach(() => {
+    prevGrok = config.claude.models.grok
+    ;(config.claude as any).models.grok = {
+      model: 'grok-4.5',
+      base_url: 'https://api.wuhen-ai.com',
+      auth_token: 'grok-tok',
+      effort: 'xhigh',
+      env: {
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+        CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
+        ANTHROPIC_DEFAULT_FABLE_MODEL: 'grok-4.5',
+        ANTHROPIC_DEFAULT_OPUS_MODEL: 'grok-4.5',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'grok-4.5',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'grok-4.5',
+      },
+    }
+  })
+
+  afterEach(() => {
+    ;(config.claude as any).models.grok = prevGrok
+  })
+
+  test('grok 档位注入 base_url + auth_token + tier 映射 + CLAUDE_CODE_* flag', () => {
+    expect(claudeModelIsApiRoute('claude:grok')).toBe(true)
+    expect(claudeModelConfigured('claude:grok')).toBe(true)
+    expect(claudeModelEffort('claude:grok')).toBe('xhigh')
+    const env = claudeModelEnv('claude:grok')
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://api.wuhen-ai.com')
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('grok-tok')
+    // 四档 tier 别名全指 grok-4.5,防止 Claude Code 辅助调用打到官方 claude id
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('grok-4.5')
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('grok-4.5')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('grok-4.5')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('grok-4.5')
+    // 关掉非必要流量与 attribution 头(第三方端点不需要)
+    expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1')
+    expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
+  })
+
+  test('grok 未配 token → 未配置、env 为空(route 仍为 api,被 picker 拦截)', () => {
+    ;(config.claude as any).models.grok = {} // 仅 DEFAULT_CLAUDE_MODELS 提供 route:'api'
+    expect(claudeModelIsApiRoute('claude:grok')).toBe(true)
+    expect(claudeModelConfigured('claude:grok')).toBe(false)
+    expect(claudeModelEnv('claude:grok')).toEqual({})
   })
 })

@@ -66,6 +66,17 @@ const FIXED_MODEL_CHOICES = [
     description: 'GLM 第三方路由 · max。',
     effort: 'max' as AgentReasoningEffort,
   },
+  {
+    // Grok 第三方路由(wuhen-ai,Anthropic 兼容端点):与 GLM 同构,走
+    // config.toml [claude.models.grok] 的 base_url + auth_token + model。
+    // effort 锁死值由 config 的 effort 覆盖(第三方中转惯例 xhigh,见
+    // resolvedEffort);未配置时 picker 仍显示,选择被 onModelEffortSelect 拦截。
+    provider: 'claude' as const,
+    model: 'claude:grok',
+    displayName: 'Claude · Grok 4.5',
+    description: 'Grok 4.5 · 第三方路由(wuhen-ai,Anthropic 兼容端点)。',
+    effort: 'max' as AgentReasoningEffort,
+  },
 ]
 
 /** provider 的默认固定档位(该 provider 的第一个固定项)。归一化未知/退役
@@ -142,10 +153,12 @@ export function configuredDefaultSelection(): {
   return { provider: hit.provider, model: hit.model, effort: resolvedEffort(hit) }
 }
 
-/** 第三方 API 路由(GLM)未配 token 时的描述后缀,提示去 config.toml 设置。 */
+/** 第三方 API 路由(GLM/Grok)未配 token 时的描述后缀,提示去 config.toml 设置。
+ * section 名按 model 推导(claude:glm → [claude.models.glm]),不再写死 glm。 */
 function choiceDescription(item: typeof FIXED_MODEL_CHOICES[number]): string {
   if (item.provider === 'claude' && claudeModelIsApiRoute(item.model) && !claudeModelConfigured(item.model)) {
-    return `${item.description}(未配置 · 需在 config.toml 的 [claude.models.glm] 填 base_url + auth_token + model)`
+    const section = item.model.startsWith('claude:') ? item.model.slice('claude:'.length) : item.model
+    return `${item.description}(未配置 · 需在 config.toml 的 [claude.models.${section}] 填 base_url + auth_token + model)`
   }
   if (item.provider === 'codex' && codexModelIsApiRoute(item.model) && !codexModelConfigured(item.model)) {
     return `${item.description}(未配置 · 需在 config.toml 的 [codex.models.<slug>] 填 base_url + api_key(或 requires_openai_auth)+ model)`
@@ -263,12 +276,14 @@ export async function onModelEffortSelect(
   if (!fixed || resolvedEffort(fixed) !== effort) {
     return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在固定选项中` }
   }
-  // 第三方 API 路由(GLM)必须先在 lodestar config 配好 token 才能切换 ——
-  // 官方登录档位(Fable 5/Opus)无需配置。拦截未配置的 GLM,给出清晰指引。
+  // 第三方 API 路由(GLM/Grok)必须先在 lodestar config 配好 token 才能切换 ——
+  // 官方登录档位(Fable 5/Opus)无需配置。拦截未配置的第三方档位,给出清晰指引。
+  // label/section 按 model 推导(claude:glm → GLM / [claude.models.glm]),不再写死 GLM。
   if (provider === 'claude' && claudeModelIsApiRoute(model) && !claudeModelConfigured(model)) {
+    const name = model.startsWith('claude:') ? model.slice('claude:'.length) : model
     return {
       ok: false,
-      message: `GLM(${model})未配置:请在 ~/.config/lodestar/config.toml 的 [claude.models.glm] 填写 base_url、auth_token 和 model 后重试(官方 Fable 5 / Opus 走登录态,无需配置)`,
+      message: `${name.toUpperCase()}(${model})未配置:请在 ~/.config/lodestar/config.toml 的 [claude.models.${name}] 填写 base_url、auth_token 和 model 后重试(官方 Fable 5 / Opus 走登录态,无需配置)`,
     }
   }
   if (provider === 'codex' && codexModelIsApiRoute(model) && !codexModelConfigured(model)) {

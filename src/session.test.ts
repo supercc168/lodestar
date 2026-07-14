@@ -660,9 +660,9 @@ describe('Session provider switching', () => {
     }
   })
 
-  test('model 选择器展示 Opus 4.8 / Fable 5 官方档位 + GLM 第三方档位', () => {
-    // 隔离 config:GLM description 的「未配置」提示只在 config 无 glm 时出现,
-    // 测试机可能已配 GLM(reclaude/GLM 环境),强制未配置态。
+  test('model 选择器展示 Opus 4.8 / Fable 5 官方档位 + GLM / Grok 第三方档位', () => {
+    // 隔离 config:第三方档位 description 的「未配置」提示只在 config 无该档位时
+    // 出现,测试机可能已配 GLM/Grok,强制未配置态。
     const prev = config.claude.models
     ;(config.claude as any).models = {}
     try {
@@ -673,13 +673,17 @@ describe('Session provider switching', () => {
       expect(claudeModels).toContain('claude:opus')
       expect(claudeModels).toContain('claude:fable')
       expect(claudeModels).toContain('claude:glm')
-      // 每个 Claude 档位锁死 max 最高思考强度
+      expect(claudeModels).toContain('claude:grok')
+      // 每个 Claude 档位锁死 max 最高思考强度(第三方档位未配 effort 时回落 max)
       for (const c of choices.filter((c: any) => c.provider === 'claude')) {
         expect(c.efforts.map((e: any) => e.effort)).toEqual(['max'])
       }
-      // GLM 未配置 token 时,描述提示需要设置。
+      // GLM / Grok 未配置 token 时,描述提示去 config.toml 设置,且 section 名按
+      // model 正确推导(不再写死 glm)。
       const glm = choices.find((c: any) => c.model === 'claude:glm')
-      expect(glm.description).toContain('配置')
+      expect(glm.description).toContain('[claude.models.glm]')
+      const grok = choices.find((c: any) => c.model === 'claude:grok')
+      expect(grok.description).toContain('[claude.models.grok]')
     } finally {
       ;(config.claude as any).models = prev
     }
@@ -696,6 +700,24 @@ describe('Session provider switching', () => {
       const choices = fixedModelChoices(session)
       const glm = choices.find((c: any) => c.model === 'claude:glm')
       expect(glm.efforts.map((e: any) => e.effort)).toEqual(['xhigh'])
+      const opus = choices.find((c: any) => c.model === 'claude:opus')
+      expect(opus.efforts.map((e: any) => e.effort)).toEqual(['max'])
+    } finally {
+      ;(config.claude as any).models = prev
+    }
+  })
+
+  test('Grok 档位的 effort 跟随 config(xhigh);官方档位仍 max', () => {
+    const prev = config.claude.models
+    ;(config.claude as any).models = {
+      grok: { model: 'grok-4.5', base_url: 'https://api.wuhen-ai.com', auth_token: 't', effort: 'xhigh' },
+    }
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      session.selectedProvider = 'claude'
+      const choices = fixedModelChoices(session)
+      const grok = choices.find((c: any) => c.model === 'claude:grok')
+      expect(grok.efforts.map((e: any) => e.effort)).toEqual(['xhigh'])
       const opus = choices.find((c: any) => c.model === 'claude:opus')
       expect(opus.efforts.map((e: any) => e.effort)).toEqual(['max'])
     } finally {
@@ -742,6 +764,29 @@ describe('Session provider switching', () => {
       expect(result.ok).toBe(false)
       expect(result.message).toContain('GLM')
       expect(result.message).toMatch(/配置|config/)
+      expect(session.selectedModel).toBe('claude:fable') // 未切换
+      expect(proc.killCalls).toBe(0)
+    } finally {
+      ;(config.claude as any).models = prev
+    }
+  })
+
+  test('未配置 token 时选 Grok 被拦截,提示 section 名按 model 推导', async () => {
+    // 隔离 config:拦截只在 Grok 未配置时触发;测试机可能已配 Grok,强制未配置态。
+    const prev = config.claude.models
+    ;(config.claude as any).models = {}
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      const proc = new FakeAgentProc('claude', 'claude-session-1')
+      session.proc = proc
+      session.selectedProvider = 'claude'
+      session.selectedModel = 'claude:fable'
+
+      const result = await session.onModelEffortSelect('claude:grok', 'max', '', 'ou_user', 'claude')
+
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('GROK')
+      expect(result.message).toContain('[claude.models.grok]')
       expect(session.selectedModel).toBe('claude:fable') // 未切换
       expect(proc.killCalls).toBe(0)
     } finally {

@@ -49,6 +49,15 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
     // 不写死在代码里(避免 GLM 版本过期 + token 入库)。未配置时该档位
     // 在 picker 里可见但选择被拦截,提示去 config.toml 设置。
   },
+  grok: {
+    display_name: 'Claude Code · Grok 4.5',
+    description: 'xAI Grok 4.5 第三方路由(wuhen-ai,Anthropic 兼容端点)。需在 config.toml 配置 token。',
+    route: 'api',
+    // 与 glm 同构:base_url / auth_token / model 由 [claude.models.grok] 提供,
+    // 不写死(避免 token 入库 + 模型 id 过期)。tier 映射(把 fable/opus/sonnet/
+    // haiku 四档别名都指到 grok-4.5)与 CLAUDE_CODE_* flag 经 config 的 env_* 注入,
+    // 防止 Claude Code 内部辅助调用打到第三方端点不认识的官方 claude id。
+  },
 }
 
 // GLM 档位内置默认别名映射(智谱端点最强组合)。glm 档位 config 未显式配某 env_*
