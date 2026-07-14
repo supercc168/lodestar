@@ -1,6 +1,11 @@
 import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { config } from './config'
-import { claudeModelEnv, claudeModelIsApiRoute } from './claude-models'
+import {
+  claudeModelConfigured,
+  claudeModelEffort,
+  claudeModelEnv,
+  claudeModelIsApiRoute,
+} from './claude-models'
 
 // 固定的 GLM 测试档位(不依赖宿主 config.toml,保证测试确定性)。
 // 注意:不用 mock.module('./config')。bun 的模块 mock 无法被 mock.restore() 撤销,
@@ -77,5 +82,115 @@ describe('claudeModelEnv per-档位 env 注入', () => {
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-4.6') // config 覆盖
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5-turbo') // 默认
     expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.2[1m]') // 默认
+  })
+})
+
+// Grok 走 wuhen-ai 的 Anthropic 兼容端点,与 GLM 同为第三方 API 路由。
+// 与 glm 一样有 DEFAULT_GROK_ENV 内置默认(500K ctx + 450K auto-compact +
+// CLAUDE_CODE_* flag + tier 别名回落 profile.model);config env_* 可逐 key 覆盖。
+describe('grok 档位(wuhen-ai 第三方 Anthropic 兼容路由)', () => {
+  let prevGrok: unknown
+
+  beforeEach(() => {
+    prevGrok = config.claude.models.grok
+    ;(config.claude as any).models.grok = {
+      model: 'grok-4.5',
+      base_url: 'https://api.wuhen-ai.com',
+      auth_token: 'grok-tok',
+      effort: 'xhigh',
+    }
+  })
+
+  afterEach(() => {
+    ;(config.claude as any).models.grok = prevGrok
+  })
+
+  test('grok 档位 config 未配 env_* → 注入 DEFAULT_GROK_ENV + tier 映射', () => {
+    expect(claudeModelIsApiRoute('claude:grok')).toBe(true)
+    expect(claudeModelConfigured('claude:grok')).toBe(true)
+    expect(claudeModelEffort('claude:grok')).toBe('xhigh')
+    const env = claudeModelEnv('claude:grok')
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://api.wuhen-ai.com')
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('grok-tok')
+    // 上游硬限 500K;Claude Code 默认 200K 会让长会话撞 400
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('500000')
+    expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('450000')
+    // 四档 tier 别名回落 profile.model,防止 Claude Code 辅助调用打到官方 claude id
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('grok-4.5')
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('grok-4.5')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('grok-4.5')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('grok-4.5')
+    // 关掉非必要流量与 attribution 头(第三方端点不需要)
+    expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1')
+    expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
+  })
+
+  test('grok 档位 config 显式配某 env_* → 仅覆盖该 key,其余用默认', () => {
+    ;(config.claude as any).models.grok = {
+      model: 'grok-4.5',
+      base_url: 'https://api.wuhen-ai.com',
+      auth_token: 'grok-tok',
+      effort: 'xhigh',
+      env: {
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: '400000',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'grok-fast',
+      },
+    }
+    const env = claudeModelEnv('claude:grok')
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('400000') // 显式覆盖
+    expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('450000') // 默认
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('grok-fast') // 显式覆盖
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('grok-4.5') // 默认回落 model
+  })
+
+  test('grok 未配 token → 未配置、env 为空(route 仍为 api,被 picker 拦截)', () => {
+    ;(config.claude as any).models.grok = {} // 仅 DEFAULT_CLAUDE_MODELS 提供 route:'api'
+    expect(claudeModelIsApiRoute('claude:grok')).toBe(true)
+    expect(claudeModelConfigured('claude:grok')).toBe(false)
+    expect(claudeModelEnv('claude:grok')).toEqual({})
+  })
+})
+
+// grokcc 是第二个 grok 渠道(CatCodex / catcodexapi,new-api 网关),与 grok
+// (wuhen)同构并共享 DEFAULT_GROK_ENV。
+describe('grokcc 档位(CatCodex catcodexapi 第三方 Anthropic 兼容路由)', () => {
+  let prevGrokcc: unknown
+
+  beforeEach(() => {
+    prevGrokcc = config.claude.models.grokcc
+    ;(config.claude as any).models.grokcc = {
+      model: 'grok-4.5',
+      base_url: 'https://catcodexapi.com',
+      auth_token: 'grokcc-tok',
+      effort: 'xhigh',
+    }
+  })
+
+  afterEach(() => {
+    ;(config.claude as any).models.grokcc = prevGrokcc
+  })
+
+  test('grokcc 档位 config 未配 env_* → 注入 DEFAULT_GROK_ENV + tier 映射', () => {
+    expect(claudeModelIsApiRoute('claude:grokcc')).toBe(true)
+    expect(claudeModelConfigured('claude:grokcc')).toBe(true)
+    expect(claudeModelEffort('claude:grokcc')).toBe('xhigh')
+    const env = claudeModelEnv('claude:grokcc')
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://catcodexapi.com')
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('grokcc-tok')
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('500000')
+    expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('450000')
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('grok-4.5')
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('grok-4.5')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('grok-4.5')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('grok-4.5')
+    expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1')
+    expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
+  })
+
+  test('grokcc 未配 token → 未配置、env 为空(route 仍为 api)', () => {
+    ;(config.claude as any).models.grokcc = {}
+    expect(claudeModelIsApiRoute('claude:grokcc')).toBe(true)
+    expect(claudeModelConfigured('claude:grokcc')).toBe(false)
+    expect(claudeModelEnv('claude:grokcc')).toEqual({})
   })
 })
