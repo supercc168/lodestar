@@ -660,7 +660,7 @@ describe('Session provider switching', () => {
     }
   })
 
-  test('model 选择器展示 Opus 4.8 / Fable 5 官方档位 + GLM / Grok 第三方档位', () => {
+  test('model 选择器展示 Opus 4.8 / Fable 5 官方档位 + GLM / Grok(无痕·CatCodex)第三方档位', () => {
     // 隔离 config:第三方档位 description 的「未配置」提示只在 config 无该档位时
     // 出现,测试机可能已配 GLM/Grok,强制未配置态。
     const prev = config.claude.models
@@ -674,16 +674,19 @@ describe('Session provider switching', () => {
       expect(claudeModels).toContain('claude:fable')
       expect(claudeModels).toContain('claude:glm')
       expect(claudeModels).toContain('claude:grok')
+      expect(claudeModels).toContain('claude:grokcc')
       // 每个 Claude 档位锁死 max 最高思考强度(第三方档位未配 effort 时回落 max)
       for (const c of choices.filter((c: any) => c.provider === 'claude')) {
         expect(c.efforts.map((e: any) => e.effort)).toEqual(['max'])
       }
-      // GLM / Grok 未配置 token 时,描述提示去 config.toml 设置,且 section 名按
+      // 第三方档位未配置 token 时,描述提示去 config.toml 设置,且 section 名按
       // model 正确推导(不再写死 glm)。
       const glm = choices.find((c: any) => c.model === 'claude:glm')
       expect(glm.description).toContain('[claude.models.glm]')
       const grok = choices.find((c: any) => c.model === 'claude:grok')
       expect(grok.description).toContain('[claude.models.grok]')
+      const grokcc = choices.find((c: any) => c.model === 'claude:grokcc')
+      expect(grokcc.description).toContain('[claude.models.grokcc]')
     } finally {
       ;(config.claude as any).models = prev
     }

@@ -137,3 +137,53 @@ describe('grok 档位(wuhen-ai 第三方 Anthropic 兼容路由)', () => {
     expect(claudeModelEnv('claude:grok')).toEqual({})
   })
 })
+
+// grokcc 是第二个 grok 渠道(CatCodex / catcodexapi,new-api 网关),与 grok
+// (wuhen)同构。复刻 grok 的 config 隔离范式验证 env 注入与未配置态。
+describe('grokcc 档位(CatCodex catcodexapi 第三方 Anthropic 兼容路由)', () => {
+  let prevGrokcc: unknown
+
+  beforeEach(() => {
+    prevGrokcc = config.claude.models.grokcc
+    ;(config.claude as any).models.grokcc = {
+      model: 'grok-4.5',
+      base_url: 'https://catcodexapi.com',
+      auth_token: 'grokcc-tok',
+      effort: 'xhigh',
+      env: {
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+        CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
+        ANTHROPIC_DEFAULT_FABLE_MODEL: 'grok-4.5',
+        ANTHROPIC_DEFAULT_OPUS_MODEL: 'grok-4.5',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'grok-4.5',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'grok-4.5',
+      },
+    }
+  })
+
+  afterEach(() => {
+    ;(config.claude as any).models.grokcc = prevGrokcc
+  })
+
+  test('grokcc 档位注入 base_url + auth_token + tier 映射 + CLAUDE_CODE_* flag', () => {
+    expect(claudeModelIsApiRoute('claude:grokcc')).toBe(true)
+    expect(claudeModelConfigured('claude:grokcc')).toBe(true)
+    expect(claudeModelEffort('claude:grokcc')).toBe('xhigh')
+    const env = claudeModelEnv('claude:grokcc')
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://catcodexapi.com')
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('grokcc-tok')
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('grok-4.5')
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('grok-4.5')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('grok-4.5')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('grok-4.5')
+    expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1')
+    expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
+  })
+
+  test('grokcc 未配 token → 未配置、env 为空(route 仍为 api)', () => {
+    ;(config.claude as any).models.grokcc = {}
+    expect(claudeModelIsApiRoute('claude:grokcc')).toBe(true)
+    expect(claudeModelConfigured('claude:grokcc')).toBe(false)
+    expect(claudeModelEnv('claude:grokcc')).toEqual({})
+  })
+})

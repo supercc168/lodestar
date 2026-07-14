@@ -67,14 +67,23 @@ const FIXED_MODEL_CHOICES = [
     effort: 'max' as AgentReasoningEffort,
   },
   {
-    // Grok 第三方路由(wuhen-ai,Anthropic 兼容端点):与 GLM 同构,走
+    // Grok 第三方路由 · 无痕(wuhen-ai,Anthropic 兼容端点):与 GLM 同构,走
     // config.toml [claude.models.grok] 的 base_url + auth_token + model。
     // effort 锁死值由 config 的 effort 覆盖(第三方中转惯例 xhigh,见
     // resolvedEffort);未配置时 picker 仍显示,选择被 onModelEffortSelect 拦截。
     provider: 'claude' as const,
     model: 'claude:grok',
-    displayName: 'Claude · Grok 4.5',
-    description: 'Grok 4.5 · 第三方路由(wuhen-ai,Anthropic 兼容端点)。',
+    displayName: 'Claude · Grok 4.5 · 无痕',
+    description: 'Grok 4.5 · 无痕(wuhen-ai,Anthropic 兼容端点)。',
+    effort: 'max' as AgentReasoningEffort,
+  },
+  {
+    // Grok 第三方路由 · CatCodex(catcodexapi):第二个 grok 渠道,走
+    // [claude.models.grokcc]。与 grok(无痕)同构;displayName 带渠道名以便区分。
+    provider: 'claude' as const,
+    model: 'claude:grokcc',
+    displayName: 'Claude · Grok 4.5 · CatCodex',
+    description: 'Grok 4.5 · CatCodex(catcodexapi,Anthropic 兼容端点)。',
     effort: 'max' as AgentReasoningEffort,
   },
 ]

@@ -50,13 +50,21 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
     // 在 picker 里可见但选择被拦截,提示去 config.toml 设置。
   },
   grok: {
-    display_name: 'Claude Code · Grok 4.5',
-    description: 'xAI Grok 4.5 第三方路由(wuhen-ai,Anthropic 兼容端点)。需在 config.toml 配置 token。',
+    display_name: 'Claude Code · Grok 4.5(无痕 wuhen)',
+    description: 'xAI Grok 4.5 第三方路由 · 无痕(wuhen-ai,Anthropic 兼容端点)。需在 config.toml 配置 token。',
     route: 'api',
     // 与 glm 同构:base_url / auth_token / model 由 [claude.models.grok] 提供,
     // 不写死(避免 token 入库 + 模型 id 过期)。tier 映射(把 fable/opus/sonnet/
     // haiku 四档别名都指到 grok-4.5)与 CLAUDE_CODE_* flag 经 config 的 env_* 注入,
     // 防止 Claude Code 内部辅助调用打到第三方端点不认识的官方 claude id。
+  },
+  grokcc: {
+    display_name: 'Claude Code · Grok 4.5(CatCodex)',
+    description: 'xAI Grok 4.5 第三方路由 · CatCodex(catcodexapi,Anthropic 兼容端点)。需在 config.toml 配置 token。',
+    route: 'api',
+    // 第二个 grok 渠道,与 grok(无痕 wuhen)同构,走 [claude.models.grokcc]。
+    // 同样不写死 token/model;displayName 带渠道名,与 grok(无痕)在 picker 区分。
+    // catcodex 是 new-api 网关,/v1/messages + Bearer 实测可用(回显 grok-4.5-build)。
   },
 }
 
