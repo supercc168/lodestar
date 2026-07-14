@@ -38,13 +38,26 @@ base_url   = "https://open.bigmodel.cn/api/anthropic"
 auth_token = "<GLM API key>"
 model      = "glm-5.2[1m]"   # 直连智谱;[1m] 开满 1M 上下文
 effort     = "xhigh"          # 复刻 GLM-5.2 最高思维;官方登录档位锁 max
+
+# Grok 第三方路由(无痕 / CatCodex 同构):token 只放档位节。
+# 配好 token 后 lodestar 自动注入 DEFAULT_GROK_ENV:
+#   CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000  # 上游硬限(Claude Code 默认 200K)
+#   CLAUDE_CODE_AUTO_COMPACT_WINDOW=450000 # 提前 auto-compact,留 50K 余量
+#   四档 ANTHROPIC_DEFAULT_*_MODEL → profile.model
+#   CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC / ATTRIBUTION_HEADER
+# config 显式 env_* 可逐 key 覆盖;未配 token 时 picker 可见但选择被拦截。
+[claude.models.grok]
+base_url   = "https://api.wuhen-ai.com"
+auth_token = "<wuhen key>"
+model      = "grok-4.5"
+effort     = "xhigh"
 ```
 
-模型路由的真相源是 `config.toml` 的 `[claude.models.glm]`(第三方 per-model token 路由):`ClaudeAgentProcess.buildSpawnEnv` 只在 GLM 一类 API 档位 spawn 时注入 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`,官方 Fable 5 / Opus 登录档位保持干净基线(无条件抹掉环境里的 `ANTHROPIC_*`)。`[claude.models.*]` 的字段仅认 `display_name / description / model / base_url / auth_token / api_key / route / effort` —— 早期文档里的 `opus= / sonnet= / haiku=` 已不再解析。**别把 GLM env 写进 `~/.claude/settings.json`**:SDK 经 `settingSources:['user']` 会加载它、污染登录档位;`[claude.env]` 仅作可选 escape hatch。
+模型路由的真相源是 `config.toml` 的 `[claude.models.*]`(第三方 per-model token 路由):`ClaudeAgentProcess.buildSpawnEnv` 只在 GLM/Grok 一类 API 档位 spawn 时注入 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`(+ 档位默认 env),官方 Fable 5 / Opus 登录档位保持干净基线(无条件抹掉环境里的 `ANTHROPIC_*`)。`[claude.models.*]` 的字段仅认 `display_name / description / model / base_url / auth_token / api_key / route / effort` 以及扁平 `env_<NAME>` —— 早期文档里的 `opus= / sonnet= / haiku=` 已不再解析。**别把第三方 env 写进 `~/.claude/settings.json`**:SDK 经 `settingSources:['user']` 会加载它、污染登录档位;`[claude.env]` 仅作可选 escape hatch。
 
-可执行文件解析:`resolveClaudeExecutableConfig({ apiRoute })` 默认自动查找 `claude`(`~/.local/npm-global/bin` → `~/.local/bin` → PATH → SDK 自带)。`config.toml` 设 `[claude].bin`(支持 `~`)可显式覆盖,用于 reclaude 这类参数透传包装器;路径不存在时 `sendInitialize` 直接抛错,不静默回退。**关键:第三方 API 路由(GLM,`route:api`)会强制绕开 `[claude].bin`、改用裸 `claude`** —— reclaude 是网关代理,会把注入的 `ANTHROPIC_BASE_URL` 劫持回官方 Anthropic,`glm-5.2` 这类第三方 id 在官方 deployment 上不存在、Claude Code 客户端直接报 `There's an issue with the selected model`(智谱端点本身对 `glm-5.2` 正常,`--model glm-5.2` 直接喂裸 `claude` 可正常回包)。故只有官方登录档位(Fable 5/Opus)走包装器回收登录态额度,日志 `executable=config:<路径>`;GLM 走裸 claude,日志 `executable=<claude 路径>`。
+可执行文件解析:`resolveClaudeExecutableConfig({ apiRoute })` 默认自动查找 `claude`(`~/.local/npm-global/bin` → `~/.local/bin` → PATH → SDK 自带)。`config.toml` 设 `[claude].bin`(支持 `~`)可显式覆盖,用于 reclaude 这类参数透传包装器;路径不存在时 `sendInitialize` 直接抛错,不静默回退。**关键:第三方 API 路由(GLM/Grok,`route:api`)会强制绕开 `[claude].bin`、改用裸 `claude`** —— reclaude 是网关代理,会把注入的 `ANTHROPIC_BASE_URL` 劫持回官方 Anthropic,`glm-5.2` / `grok-4.5` 这类第三方 id 在官方 deployment 上不存在、Claude Code 客户端直接报 `There's an issue with the selected model`(智谱/中转端点本身正常,`--model …` 直接喂裸 `claude` 可正常回包)。故只有官方登录档位(Fable 5/Opus)走包装器回收登录态额度,日志 `executable=config:<路径>`;第三方走裸 claude,日志 `executable=<claude 路径>`。
 
-SDK `model`:官方档位直传 `claude-fable-5` / `claude-opus-4-8`(reclaude 透传 `--model`,走用户登录态);第三方档位把该 profile `model` 字段声明的上游 id 交给**裸 `claude`**(GLM 走 `glm-5.2[1m]`),配套 `[claude.models.glm]` 注入的 `ANTHROPIC_BASE_URL` 打到智谱的 Anthropic 兼容端点。`[1m]` 后缀让 Claude Code 开满 GLM-5.2 的 1M 上下文窗口(裸 `glm-5.2` 也能跑,但只给默认 ~200K,footer 的 `SDK contextWindow` 会停在 ~200K 而非 1M)。**上游 id 必须交给裸 claude、不能经 reclaude**(见上一段:reclaude 劫持 base_url 回官方,`glm-5.2` 会报"模型不存在")。早期走 settings.json `ANTHROPIC_DEFAULT_*_MODEL` alias(直传 `5.2` 会 “模型不存在”)的做法已随 per-model 路由废弃。
+SDK `model`:官方档位直传 `claude-fable-5` / `claude-opus-4-8`(reclaude 透传 `--model`,走用户登录态);第三方档位把该 profile `model` 字段声明的上游 id 交给**裸 `claude`**(GLM 走 `glm-5.2[1m]`,Grok 走 `grok-4.5`),配套 `[claude.models.*]` 注入的 `ANTHROPIC_BASE_URL` 打到对应 Anthropic 兼容端点。GLM 的 `[1m]` 后缀开满 1M 上下文;Grok 没有 `[1m]` 后缀,改由 `CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000` 把 Claude Code 默认 200K 抬到上游 500K 硬限,并配 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=450000` 提前压缩,避免长会话撞 `maximum prompt length is 500000`。**上游 id 必须交给裸 claude、不能经 reclaude**(见上一段:reclaude 劫持 base_url 回官方)。早期走 settings.json `ANTHROPIC_DEFAULT_*_MODEL` alias 的做法已随 per-model 路由废弃。
 
 ## Claude Event Mapping
 `ClaudeAgentProcess` 把 SDK message 映射为现有 Session 已会处理的事件：

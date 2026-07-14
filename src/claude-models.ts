@@ -54,9 +54,9 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
     description: 'xAI Grok 4.5 第三方路由 · 无痕(wuhen-ai,Anthropic 兼容端点)。需在 config.toml 配置 token。',
     route: 'api',
     // 与 glm 同构:base_url / auth_token / model 由 [claude.models.grok] 提供,
-    // 不写死(避免 token 入库 + 模型 id 过期)。tier 映射(把 fable/opus/sonnet/
-    // haiku 四档别名都指到 grok-4.5)与 CLAUDE_CODE_* flag 经 config 的 env_* 注入,
-    // 防止 Claude Code 内部辅助调用打到第三方端点不认识的官方 claude id。
+    // 不写死(避免 token 入库 + 模型 id 过期)。配好 token 后 DEFAULT_GROK_ENV
+    // 注入 500K 上下文窗口 + 450K auto-compact 阈值 + CLAUDE_CODE_* flag,
+    // 四档 tier 别名回落 profile.model,防止辅助调用打到官方 claude id。
   },
   grokcc: {
     display_name: 'Claude Code · Grok 4.5(CatCodex)',
@@ -65,6 +65,7 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
     // 第二个 grok 渠道,与 grok(无痕 wuhen)同构,走 [claude.models.grokcc]。
     // 同样不写死 token/model;displayName 带渠道名,与 grok(无痕)在 picker 区分。
     // catcodex 是 new-api 网关,/v1/messages + Bearer 实测可用(回显 grok-4.5-build)。
+    // 默认 env 与 grok 共享 DEFAULT_GROK_ENV(500K ctx / 450K compact)。
   },
 }
 
@@ -77,6 +78,29 @@ const DEFAULT_GLM_ENV: Record<string, string> = {
   ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5-turbo',
   ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5-turbo',
 }
+
+// Grok 第三方路由(无痕 / CatCodex)上下文默认。
+// Claude Code 对非 claude-* 模型默认 context window = 200K($$t);wuhen/catcodex
+// 的 grok-4.5 实际上限是 500K。不注入 MAX_CONTEXT 时,长会话会在客户端以为
+// 仍在 200K 档、auto-compact 阈值偏低/失配的情况下,把请求撑到 >500K 被上游
+// 直接 400 拒绝(`maximum prompt length is 500000`)。
+// AUTO_COMPACT_WINDOW 留 50K 余量给本轮 tool/thinking,避免压线撞硬限。
+// CLAUDE_CODE_* flag 与 config.toml 惯例一致:关掉非必要流量与 attribution 头。
+// 四档 tier 别名在 toProfile 里按 profile.model 动态填(不写死 grok-4.5)。
+const DEFAULT_GROK_ENV: Record<string, string> = {
+  CLAUDE_CODE_MAX_CONTEXT_TOKENS: '500000',
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW: '450000',
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+  CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
+}
+
+const GROK_ROUTE_NAMES = new Set(['grok', 'grokcc'])
+const GROK_TIER_ENV_KEYS = [
+  'ANTHROPIC_DEFAULT_FABLE_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+] as const
 
 function mergedConfig(name: string): ClaudeModelConfig {
   return {
@@ -114,6 +138,19 @@ function toProfile(name: string): ClaudeModelProfile | null {
   if (name === 'glm' && (env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY)) {
     for (const [k, v] of Object.entries(DEFAULT_GLM_ENV)) {
       if (!(k in env)) env[k] = v
+    }
+  }
+  // grok / grokcc:同 glm 的"配好 token 才注入默认"语义。上下文窗口 + auto-compact
+  // 阈值对齐上游 500K 硬限;tier 别名回落 profile.model,防止辅助调用打到官方 id。
+  if (GROK_ROUTE_NAMES.has(name) && (env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY)) {
+    for (const [k, v] of Object.entries(DEFAULT_GROK_ENV)) {
+      if (!(k in env)) env[k] = v
+    }
+    const tierModel = raw.model?.trim()
+    if (tierModel) {
+      for (const k of GROK_TIER_ENV_KEYS) {
+        if (!(k in env)) env[k] = tierModel
+      }
     }
   }
   // route:显式 config > 内建默认 > 由是否配了接入信息推断。
