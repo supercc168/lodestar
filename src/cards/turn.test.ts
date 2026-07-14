@@ -624,9 +624,13 @@ describe('bash-like tool card rendering', () => {
 
     const el = toolCallElement(0, 'exec_command', input, 'ok', '✅') as any
     expect(el.header.title.content).toBe('✅ 🔧 Bash: 查看当前分支和工作区状态')
-    expect(el.elements[0].content).toContain('**cwd**: `/home/leviyuan/feishu`')
-    expect(el.elements[0].content).toContain('git status --short --branch')
-    expect(el.elements[0].content).not.toContain('# desc:')
+    const body0 = el.elements[0].content
+    expect(body0).toContain('**标题**: 查看当前分支和工作区状态')
+    expect(body0).toContain('**状态**: 已完成')
+    expect(body0).toContain('**cwd**: `/home/leviyuan/feishu`')
+    expect(body0).toContain('命令与输出已隐藏')
+    expect(body0).not.toContain('git status --short --branch')
+    expect(body0).not.toContain('# desc:')
   })
 
   test('renders namespaced exec_command as Bash in permission panels', () => {
@@ -637,11 +641,14 @@ describe('bash-like tool card rendering', () => {
 
     const el = toolCallPermissionElement(1, 'functions.exec_command', input, 'req-1') as any
     expect(el.header.title.content).toBe('🔐 等审批 · Bash: 查看 Git 远端地址')
-    expect(el.elements[0].content).toContain('git remote -v')
-    expect(el.elements[0].content).not.toContain('# desc:')
+    const body1 = el.elements[0].content
+    expect(body1).toContain('**标题**: 查看 Git 远端地址')
+    expect(body1).toContain('**状态**: 执行中')
+    expect(body1).not.toContain('git remote -v')
+    expect(body1).not.toContain('# desc:')
   })
 
-  test('limits long bash output in tool panels', () => {
+  test('hides long bash command and output in tool panels', () => {
     const input = {
       cmd: '# desc: 读取大文件\nsed -n "1,400p" big.log',
       workdir: '/home/leviyuan/feishu',
@@ -651,9 +658,13 @@ describe('bash-like tool card rendering', () => {
     const el = toolCallElement(1, 'exec_command', input, output, '✅') as any
     const body = el.elements[0].content
 
-    expect(body).toContain('_已截断: 仅显示前 300 / 304 字符。_')
-    expect(body).toContain('... output 已截断 ...')
+    expect(body).toContain('**标题**: 读取大文件')
+    expect(body).toContain('**状态**: 已完成')
+    expect(body).toContain('命令与输出已隐藏')
+    expect(body).not.toContain('sed -n')
+    expect(body).not.toContain('AAA')
     expect(body).not.toContain('TAIL')
+    expect(body).not.toContain('_已截断:')
   })
 
   test('unwraps quoted unified exec desc commands', () => {
@@ -669,8 +680,10 @@ describe('bash-like tool card rendering', () => {
     const body = el.elements[0].content
 
     expect(el.header.title.content).toBe('✅ 🔧 Bash: 查看已跟踪文件中旧关键词引用')
-    expect(body).toContain('**目的**: 查看已跟踪文件中旧关键词引用')
-    expect(body).toContain('rg -n -i "legacy|deprecated|old" $(git ls-files)')
+    expect(body).toContain('**标题**: 查看已跟踪文件中旧关键词引用')
+    expect(body).toContain('**状态**: 执行中')
+    expect(body).toContain('命令与输出已隐藏')
+    expect(body).not.toContain('rg -n')
     expect(body).not.toContain('"# desc:')
     expect(body).not.toContain('\\"legacy')
     expect(body).not.toContain('"\'$(git ls-files)\'')
@@ -688,9 +701,12 @@ describe('bash-like tool card rendering', () => {
 
     const el = toolCallElement(2, 'write_stdin', input, 'poll output', '✅') as any
     expect(el.header.title.content).toBe('✅ 🔧 Bash: 读取会话输出 97146')
-    expect(el.elements[0].content).toContain('**操作**: 读取会话输出')
-    expect(el.elements[0].content).toContain('**session**: `97146`')
-    expect(el.elements[0].content).not.toContain('"session_id"')
+    const body = el.elements[0].content
+    expect(body).toContain('**标题**: 读取会话输出 97146')
+    expect(body).toContain('**session**: `97146`')
+    expect(body).toContain('**状态**: 已完成')
+    expect(body).not.toContain('poll output')
+    expect(body).not.toContain('"session_id"')
   })
 
   test('renders write_stdin interrupt as Bash input', () => {
@@ -701,7 +717,11 @@ describe('bash-like tool card rendering', () => {
 
     const el = toolCallElement(3, 'functions.write_stdin', input, 'stopped', '✅') as any
     expect(el.header.title.content).toBe('✅ 🔧 Bash: 中断会话 97146')
-    expect(el.elements[0].content).toContain('^C')
+    const body = el.elements[0].content
+    expect(body).toContain('**标题**: 中断会话 97146')
+    expect(body).toContain('**状态**: 已完成')
+    expect(body).not.toContain('^C')
+    expect(body).not.toContain('stopped')
   })
 })
 

@@ -5165,10 +5165,14 @@ export class Session {
       this.stopFooterStatus(turn)
       cardkit.markCardWriteDead(turn.cardId)
       log(`session "${this.sessionName}": failure-rotate cap (${MAX_MIDTURN_ROTATES}) hit — giving up, rest of turn is log-only`)
-      void feishu.sendTextRaw(this.chatId, `⚠️ 卡片写入失败已触发 ${MAX_MIDTURN_ROTATES} 次换卡仍未恢复(疑似飞书故障或元素超限),本轮后续输出仅日志可见。`)
+      void feishu.sendTextRaw(this.chatId, `⚠️ 卡片写入失败已触发 ${MAX_MIDTURN_ROTATES} 次换卡仍未恢复(疑似飞书故障、元素超限或卡片体积超限),本轮后续输出仅日志可见。`)
       return
     }
-    const why = cardkit.isElementLimitCode(code) ? `element limit (${code})` : `write failure (code=${code ?? 'n/a'})`
+    const why = cardkit.isElementLimitCode(code)
+      ? `element limit (${code})`
+      : cardkit.isCardSizeLimitCode(code)
+        ? `card size limit (${code})`
+        : `write failure (code=${code ?? 'n/a'})`
     log(`session "${this.sessionName}": ${why} on card=${turn.cardId.slice(0, 8)}… — rotating to fresh card`)
     turn.failureRotateCount++
     this.startMidTurnRotate(turn)
@@ -5292,11 +5296,7 @@ export class Session {
           for (const [segId, fullText] of oldSegmentTexts) {
             if (carrySegId && carryText && segId === carrySegId) continue
             if (cardkit.isDeadElement(oldCardId, segId)) continue
-            await cardkit.replaceElement(oldCardId, segId, {
-              tag: 'markdown',
-              element_id: segId,
-              content: cards.sanitizeMarkdownForCardKit(this.cleanAssistantTextForDisplay(fullText).trim()) || ' ',
-            })
+            await cardkit.replaceElement(oldCardId, segId, this.completedAssistantElement(segId, fullText))
           }
           const compactNote = turn.contextCompactCount > 0
             ? ` · 🚨 压缩×${turn.contextCompactCount}`
@@ -5583,10 +5583,18 @@ export class Session {
   }
 
   private completedAssistantElement(segId: string, text: string): object {
+    // Cap a single assistant markdown element so one giant block can't alone
+    // push the card over Feishu's total size ceiling (200860). Excess stays in
+    // daemon logs / transcript; the card keeps a readable head.
+    const ASSISTANT_CARD_CHARS = 12_000
+    const cleaned = this.cleanAssistantTextForDisplay(text).trim()
+    const content = cleaned.length > ASSISTANT_CARD_CHARS
+      ? `${cleaned.slice(0, ASSISTANT_CARD_CHARS).trimEnd()}\n\n_…正文已截断（卡片体积限制），完整内容见日志。_`
+      : cleaned
     return {
       tag: 'markdown',
       element_id: segId,
-      content: cards.sanitizeMarkdownForCardKit(this.cleanAssistantTextForDisplay(text).trim()) || ' ',
+      content: cards.sanitizeMarkdownForCardKit(content) || ' ',
     }
   }
 

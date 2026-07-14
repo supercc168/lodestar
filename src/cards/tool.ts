@@ -6,8 +6,6 @@
 import { isAbsolute, relative } from 'node:path'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 
-const BASH_OUTPUT_PREVIEW_CHARS = 300
-
 function isBashCommandTool(name: string): boolean {
   return name === 'Bash' || name === 'exec_command' || name.endsWith('.exec_command')
 }
@@ -222,6 +220,8 @@ function fenceBlock(text: string, lang = ''): string {
   return `${fence}${lang}\n${text}\n${fence}`
 }
 
+const BASH_OUTPUT_PREVIEW_CHARS = 300
+
 function outputPreviewBlock(text: string, max = BASH_OUTPUT_PREVIEW_CHARS, lang = ''): string {
   if (text.length <= max) return fenceBlock(text, lang)
   const preview = text.slice(0, max).trimEnd()
@@ -233,6 +233,35 @@ function outputPreviewBlock(text: string, max = BASH_OUTPUT_PREVIEW_CHARS, lang 
 
 function inlineCode(v: unknown): string {
   return '`' + String(v ?? '').replace(/`/g, "'") + '`'
+}
+
+/** Compact status-only shell panels: keep title/status on the card, hide
+ * command text and stdout/stderr so long shell runs don't bloat Feishu cards
+ * into 200860 "card over max size". */
+function shellStatusLabel(output: string | null): string {
+  if (output == null) return '执行中'
+  return '已完成'
+}
+
+function renderCompactShellBody(
+  title: string,
+  output: string | null,
+  resolvedNote?: string,
+  extras: string[] = [],
+): string {
+  const lines: string[] = []
+  if (title) lines.push(`**标题**: ${title}`)
+  lines.push(`**状态**: ${shellStatusLabel(output)}`)
+  for (const line of extras) {
+    if (line) lines.push(line)
+  }
+  if (resolvedNote) {
+    lines.push('')
+    lines.push(resolvedNote)
+  }
+  lines.push('')
+  lines.push('_命令与输出已隐藏，详见服务端日志。_')
+  return lines.join('\n')
 }
 
 function jsonBlock(value: unknown, max = 3000): string {
@@ -253,52 +282,22 @@ function firstStringField(value: unknown): string {
 }
 
 function renderBashBody(input: any, output: string | null, resolvedNote?: string): string {
+  // Feishu card size (200860) is easily blown by dumping full command + stdout.
+  // Header already carries title+status; body stays compact: title/status only.
   const info = bashPresentation(input)
-  const command = info.command
-  const reason = info.description
-  const lines: string[] = []
-  if (reason) lines.push(`**目的**: ${reason}`)
+  const title = info.description || summarizeBashInput(input) || 'Shell'
+  const extras: string[] = []
   const cwd = input?.cwd ?? input?.workdir
-  if (cwd) lines.push(`**cwd**: ${inlineCode(cwd)}`)
-  if (input?.source) lines.push(`**source**: ${inlineCode(input.source)}`)
-  if (lines.length > 0) lines.push('')
-  lines.push('**命令**')
-  lines.push(fenceBlock(command || '(空命令)', 'bash'))
-  if (resolvedNote) {
-    lines.push('')
-    lines.push(resolvedNote)
-  }
-  if (output != null) {
-    lines.push('')
-    lines.push('---')
-    lines.push('**output:**')
-    lines.push(outputPreviewBlock(output))
-  }
-  return lines.join('\n')
+  if (cwd) extras.push(`**cwd**: ${inlineCode(cwd)}`)
+  return renderCompactShellBody(title, output, resolvedNote, extras)
 }
 
 function renderShellSessionBody(input: any, output: string | null, resolvedNote?: string): string {
-  const lines: string[] = []
   const session = input?.session_id ?? input?.sessionId
-  lines.push(`**操作**: ${shellSessionAction(input)}`)
-  if (session !== undefined) lines.push(`**session**: ${inlineCode(session)}`)
-  if (typeof input?.chars === 'string' && input.chars.length > 0) {
-    const shown = input.chars === '\u0003' ? '^C' : input.chars
-    lines.push('')
-    lines.push('**输入**')
-    lines.push(fenceBlock(shown))
-  }
-  if (resolvedNote) {
-    lines.push('')
-    lines.push(resolvedNote)
-  }
-  if (output != null) {
-    lines.push('')
-    lines.push('---')
-    lines.push('**output:**')
-    lines.push(outputPreviewBlock(output))
-  }
-  return lines.join('\n')
+  const title = summarizeShellSessionInput(input)
+  const extras: string[] = []
+  if (session !== undefined) extras.push(`**session**: ${inlineCode(session)}`)
+  return renderCompactShellBody(title, output, resolvedNote, extras)
 }
 
 function fileChangeEntries(input: any): any[] {

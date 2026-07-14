@@ -176,3 +176,18 @@ describe('cardkit terminal write failure observation', () => {
     await cardkit.dispose('card_terminal_ok')
   })
 })
+
+describe('cardkit capacity codes', () => {
+  test('classifies element-count and total-size ceilings', () => {
+    expect(cardkit.isElementLimitCode(300305)).toBe(true)
+    expect(cardkit.isElementLimitCode(300315)).toBe(true)
+    expect(cardkit.isElementLimitCode(200860)).toBe(false)
+
+    expect(cardkit.isCardSizeLimitCode(200860)).toBe(true)
+    expect(cardkit.isCardSizeLimitCode(300305)).toBe(false)
+
+    expect(cardkit.isCardCapacityCode(300305)).toBe(true)
+    expect(cardkit.isCardCapacityCode(200860)).toBe(true)
+    expect(cardkit.isCardCapacityCode(300308)).toBe(false)
+  })
+})

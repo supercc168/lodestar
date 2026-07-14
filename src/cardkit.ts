@@ -64,6 +64,20 @@ export function isElementLimitCode(code?: number): boolean {
   return code === 300305 || code === 300315
 }
 
+/** Feishu total-card payload ceiling (`200860 card over max size`). Distinct
+ * from element-count limits: a card with ~40 panels can still 200860 if each
+ * panel carries a fat command/stdout dump. Session treats this the same as
+ * "card is full" for mid-turn rotate, and renderers must also clamp content
+ * so a single oversized element doesn't burn the rotate budget on every card. */
+export function isCardSizeLimitCode(code?: number): boolean {
+  return code === 200860
+}
+
+/** Any "this card can't take more content" signal — element count or bytes. */
+export function isCardCapacityCode(code?: number): boolean {
+  return isElementLimitCode(code) || isCardSizeLimitCode(code)
+}
+
 const cards = new Map<string, CardState>()
 
 interface SummaryState {
