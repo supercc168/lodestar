@@ -20,6 +20,7 @@ import {
   CodexProcess,
   diffUsageTotals,
   effectiveTurnTokens,
+  isCodexReasoningEffort,
   type CanUseToolRequest,
   type CodexReasoningEffort,
   type CodexUsage,
