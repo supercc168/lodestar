@@ -53,6 +53,8 @@ export const ELEMENTS = {
   agyRepo: 'agy_repo',
   /** Tasklist automation panel. */
   tasklistPanel: 'tasklist_panel',
+  /** GSD status panel (TRACKER / active task / bridge). */
+  gsdPanel: 'gsd_panel',
 } as const
 
 /** 代码块感知遍历:fence(用「同长反向引用」识别可变长度,tool.ts 的

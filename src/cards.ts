@@ -96,6 +96,11 @@ export {
   tasklistPanelCard,
 } from './cards/task'
 export {
+  type GsdPanelNotice,
+  type GsdPanelOpts,
+  gsdPanelCard,
+} from './cards/gsd'
+export {
   type TaskBoardEntry,
   type TaskBoardOp,
   type TaskToolName,
