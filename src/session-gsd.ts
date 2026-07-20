@@ -51,6 +51,34 @@ function isSessionBusy(s: Session): boolean {
   )
 }
 
+/** Drop abandoned idle queue counters before GSD busy checks (no-op when mid-turn). */
+function clearStaleIdleQueueIfSafe(s: Session, reason: string): void {
+  if (typeof s.clearStaleIdleQueueState !== 'function') return
+  // Only when the session looks idle enough that a false busy is plausible.
+  if (s.currentTurn || s.openingTurn) return
+  s.clearStaleIdleQueueState(reason)
+}
+
+/** Invalidate the current panel gen so a concurrent second click fails validatePanelGen. */
+export function bumpGsdPanelGen(s: Session): string {
+  s.gsdPanelGen = String(Date.now())
+  return s.gsdPanelGen
+}
+
+/**
+ * Pure ordering helper for continue: busy must be decided before any resume/bridge mutation.
+ * Used by unit tests to lock the side-effect order.
+ */
+export function gsdContinueMayMutateStore(args: {
+  panelGenOk: boolean
+  isRunning: boolean
+  isBusy: boolean
+}): boolean {
+  if (!args.panelGenOk) return false
+  if (args.isRunning && args.isBusy) return false
+  return true
+}
+
 function buildCard(
   s: Session,
   notice?: cards.GsdPanelNotice,
@@ -153,27 +181,38 @@ export async function onGsdContinue(
   if (stale) return stale
 
   try {
-    let snap = readGsdSnapshot(s.workDir)
-    if (snap.status !== '运行中' && snap.status !== '已暂停') {
+    // Read-only prechecks first — never resume / switch bridge while busy.
+    const snapBefore = readGsdSnapshot(s.workDir)
+    if (snapBefore.status !== '运行中' && snapBefore.status !== '已暂停') {
       return resultWithCard(s, false, '没有可继续的 GSD 任务（需运行中或已暂停）')
     }
-    if (taskSlug && snap.taskSlug && taskSlug !== snap.taskSlug) {
+    if (taskSlug && snapBefore.taskSlug && taskSlug !== snapBefore.taskSlug) {
       return resultWithCard(s, false, '任务已切换，请刷新面板')
     }
+    if (!snapBefore.taskSlug) {
+      return resultWithCard(s, false, '没有活跃 task_slug')
+    }
 
+    // Clear abandoned idle queue counters (safe no-op mid-turn) before busy check.
+    clearStaleIdleQueueIfSafe(s, 'gsd_continue')
+    if (s.isRunning() && isSessionBusy(s)) {
+      // Busy: return without mutating store/bridge or bumping panelGen for inject.
+      return resultWithCard(s, false, GSD_BUSY_MSG)
+    }
+
+    let snap = snapBefore
     if (snap.status === '已暂停') {
       snap = resumeActiveTask(s.workDir)
     }
-
     if (!snap.taskSlug) {
       return resultWithCard(s, false, '没有活跃 task_slug')
     }
 
     ensureBridge(s.workDir, snap.taskSlug)
 
-    if (s.isRunning() && isSessionBusy(s)) {
-      return resultWithCard(s, false, GSD_BUSY_MSG)
-    }
+    // Invalidate panel gen before await inject so a second click with the old
+    // gen fails validatePanelGen (anti double-continue / double-inject).
+    bumpGsdPanelGen(s)
 
     // Continue supersedes name capture; never treat the inject template as a name.
     s.gsdAwaitingNameUntil = 0
@@ -280,6 +319,7 @@ export async function maybeConsumeGsdTaskName(s: Session, text: string): Promise
   s.gsdAwaitingNameUntil = 0
 
   try {
+    clearStaleIdleQueueIfSafe(s, 'gsd_new_task_name')
     if (s.isRunning() && isSessionBusy(s)) {
       // Re-arm so user can retry after the turn settles.
       s.gsdAwaitingNameUntil = Date.now() + GSD_AWAITING_NAME_MS
@@ -291,6 +331,9 @@ export async function maybeConsumeGsdTaskName(s: Session, text: string): Promise
 
     const snap: GsdSnapshot = createAndActivateTask(s.workDir, name)
     ensureBridge(s.workDir, snap.taskSlug)
+
+    // Invalidate panel gen before await inject (anti double-create / double-inject).
+    bumpGsdPanelGen(s)
 
     const prompt = buildGsdInjectPrompt({
       action: 'new-task-discuss',
