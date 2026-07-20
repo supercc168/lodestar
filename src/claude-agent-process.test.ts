@@ -1058,7 +1058,7 @@ describe('Claude transcript context tokens', () => {
       JSON.stringify({ type: 'assistant', message: { usage: { input_tokens: 30, cache_read_input_tokens: 41728, cache_creation_input_tokens: 0 } } }),
     ].join('\n'))
     // 取最后一条 assistant 的 per-call usage(transcript finalize 后的真实值,
-    // = session 当前上下文,与 omc hud context_window.current_usage 同口径)
+    // = session 当前上下文,与 Claude Code 底栏 context 占用同口径)
     expect(readLastCallUsageFromTranscript(tmp)).toEqual({ input_tokens: 30, cache_read_input_tokens: 41728, cache_creation_input_tokens: 0 })
     unlinkSync(tmp)
   })

@@ -266,8 +266,8 @@ function usageFromSdk(raw: any): CodexUsage | null {
 }
 
 /** Claude 路径上下文占用 = 输入侧 token(喂进模型的全部 input:未缓存新输入
- * + 缓存命中复读 + 本轮新建缓存),不含 output。与 Claude Code 底栏(omc hud)
- * 同口径 = input_tokens + cache_read_input_tokens + cache_creation_input_tokens。
+ * + 缓存命中复读 + 本轮新建缓存),不含 output。与 Claude Code 底栏
+ * context 占用同口径 = input_tokens + cache_read_input_tokens + cache_creation_input_tokens。
  * 调用方传 result.usage(单 turn query = 当前上下文);modelUsage 是会话累计、
  * assistant.message.usage 在 stream-json 下恒 0/0,都不能用。 */
 function contextOccupancyFromUsage(usage: CodexUsage | null | undefined): number | null {
@@ -295,7 +295,7 @@ export function claudeTranscriptPath(workDir: string, sessionId: string): string
 /** 读 transcript jsonl,取最后一条 assistant message 的 usage —— 这是最后一次 API
  * call 的真实 per-call usage(transcript 是 claude CLI 写的,assistant 行带 finalize
  * 后的 usage;不像 stream-json 的 assistant event 恒 0/0)。= session 当前上下文快照,
- * 与 Claude Code 底栏(omc hud)的 context_window.current_usage 同口径。失败/空 → null。 */
+ * 与 Claude Code 底栏 context 占用同口径。失败/空 → null。 */
 export function readLastCallUsageFromTranscript(path: string): CodexUsage | null {
   let content: string
   try {
@@ -1267,8 +1267,8 @@ export class ClaudeAgentProcess extends EventEmitter {
     // 上下文占用 = session 当前上下文 = 最后一次 API call 的输入侧 token。从 claude
     // session transcript 读最后一条 assistant 的 per-call usage(transcript 带 finalize
     // 后的真实值;stream-json 的 assistant event 恒 0/0、result.usage 是 turn 聚合、
-    // modelUsage 是 session 累计,都不能代表当前上下文)。与 Claude Code 底栏(omc hud)
-    // context_window.current_usage 同口径。transcript 不可读 → null → footer 显 MISS。
+    // modelUsage 是 session 累计,都不能代表当前上下文)。与 Claude Code 底栏
+    // context 占用同口径。transcript 不可读 → null → footer 显 MISS。
     this.lastContextTokens = contextOccupancyFromUsage(
       readLastCallUsageFromTranscript(claudeTranscriptPath(this.opts.workDir, this.sessionId ?? ''))
     )
