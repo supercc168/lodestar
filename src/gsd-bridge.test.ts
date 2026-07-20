@@ -1,8 +1,8 @@
 // src/gsd-bridge.test.ts
 import { describe, expect, test, beforeEach, afterEach } from 'bun:test'
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, lstatSync, readlinkSync, symlinkSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync, lstatSync } from 'node:fs'
 import { join } from 'node:path'
-import { tmpdir } from 'node:os'
+import { platform, tmpdir } from 'node:os'
 import {
   ensureTaskPlanningDir,
   switchActivePlanning,
@@ -23,7 +23,12 @@ describe('gsd-bridge', () => {
     expect(health.ok).toBe(true)
     expect(existsSync(join(root, '.planning'))).toBe(true)
     const st = lstatSync(join(root, '.planning'))
-    expect(st.isSymbolicLink() || st.isDirectory()).toBe(true)
+    if (platform() === 'win32') {
+      // Junctions present as directories on Windows.
+      expect(st.isDirectory()).toBe(true)
+    } else {
+      expect(st.isSymbolicLink()).toBe(true)
+    }
     // canonical dir exists
     expect(existsSync(join(root, '.gsd', 'demo-task', '.planning'))).toBe(true)
     writeFileSync(join(root, '.gsd', 'demo-task', '.planning', 'STATE.md'), '# ok\n')

@@ -48,8 +48,12 @@ function removeLinkOnly(link: string): void {
   }
 
   if (st.isDirectory()) {
-    // Windows junction often appears as directory + reparse; try unlink first.
+    // Unix: real directories must not be clobbered (empty or not).
+    // Windows: junctions often appear as directory + reparse; try unlink/rmdir only.
     // Never recursive-delete — that would wipe the canonical target.
+    if (platform() !== 'win32') {
+      throw new Error('.planning exists and is not a symlink/junction/link')
+    }
     try {
       unlinkSync(link)
       return
