@@ -1,4 +1,4 @@
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { execSync } from 'node:child_process'
 import {
@@ -483,6 +483,36 @@ function pauseRunningIfAny(projectRoot: string, content: string, updated: string
   return next
 }
 
+function indexHasSlug(content: string, slug: string): boolean {
+  const lines = content.split(/\r?\n/)
+  let inIndex = false
+  let headerSeen = false
+  for (const line of lines) {
+    if (/^##\s*任务索引/.test(line)) {
+      inIndex = true
+      continue
+    }
+    if (inIndex && /^##\s+/.test(line)) break
+    if (!inIndex) continue
+    if (!headerSeen && isTableRow(line) && /task_slug/i.test(line)) {
+      headerSeen = true
+      continue
+    }
+    if (headerSeen && isTableRow(line)) {
+      const cells = parseTableCells(line)
+      if (cells[0] === slug) return true
+    }
+  }
+  return false
+}
+
+function removeIncompleteTaskDir(projectRoot: string, slug: string): void {
+  if (!slug) return
+  const dir = taskDir(projectRoot, slug)
+  if (!existsSync(dir)) return
+  rmSync(dir, { recursive: true, force: true })
+}
+
 export function createAndActivateTask(
   projectRoot: string,
   taskName: string,
@@ -491,18 +521,28 @@ export function createAndActivateTask(
   const updated = nowIso()
   let content = readTrackerRaw(projectRoot)
 
-  // Pause any existing 运行中 (TASK + tracker index)
-  content = pauseRunningIfAny(projectRoot, content, updated)
-
   const base = opts?.slug ? slugifyTaskName(opts.slug) : slugifyTaskName(taskName)
   const slug = uniqueSlug(projectRoot, base || 'task')
 
-  // Write new TASK
+  // Prepare NEW task only first. Do not pause the previous task until the
+  // planning bridge can switch, so a bridge failure cannot leave the old
+  // TASK permanently 已暂停 while TRACKER still shows 运行中.
   writeTaskMd(projectRoot, slug, taskName, '运行中', updated)
   ensureTaskPlanningDir(projectRoot, slug)
 
-  // Bridge
-  const bridge = switchActivePlanning(projectRoot, slug)
+  let bridge: BridgeHealth
+  try {
+    bridge = switchActivePlanning(projectRoot, slug)
+  } catch (err) {
+    // New slug is not in TRACKER yet — clean incomplete dir and leave previous task intact.
+    if (!indexHasSlug(content, slug)) {
+      removeIncompleteTaskDir(projectRoot, slug)
+    }
+    throw err
+  }
+
+  // Bridge switched successfully: now pause any previous 运行中 and activate new.
+  content = pauseRunningIfAny(projectRoot, content, updated)
 
   const phaseHint = readPhaseHint(projectRoot, slug)
   const phase = phaseHint && phaseHint !== 'unknown' ? phaseHint : 'unknown'
@@ -541,15 +581,11 @@ export function pauseActiveTask(projectRoot: string): GsdSnapshot {
   const status = normalizeStatus(active.状态)
   const slug = active.task_slug
 
-  if (!slug || status === '无任务') {
+  // Only a 运行中 task can be paused. 已完成 / 无任务 / 已暂停 are no-ops.
+  if (!slug || status !== '运行中') {
     return snapshotFromDisk(projectRoot)
   }
 
-  if (status === '已暂停') {
-    return snapshotFromDisk(projectRoot)
-  }
-
-  // complete path can call after pause; for pause from running:
   updateTaskStatus(projectRoot, slug, '已暂停', updated)
   const name = active.任务名称 || readTaskName(projectRoot, slug, slug)
   content = updateActiveBlock(content, {
