@@ -119,7 +119,7 @@ base_url     = "https://api.moonshot.cn/v1"
 wire_api     = "chat"          # chat | responses,默认 chat
 api_key      = "sk-..."
 model        = "kimi-k2"
-effort       = "high"          # none|minimal|low|medium|high|xhigh|max|ultra,默认回落 ultra
+effort       = "high"          # none|minimal|low|medium|high|xhigh|max|ultra,默认回落 max
                                # (max/ultra 为 GPT-5.6 新增档,旧模型端点请显式配)
 
 # 走 codex OpenAI auth 的端点(无需 api_key)

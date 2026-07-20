@@ -6145,7 +6145,7 @@ describe('Session Codex watchdog warning and model guard', () => {
     session.turnCounter = 1
     session.beginWatchdogTurn(turn, proc, 0)
 
-    const resultPromise = session.onModelEffortSelect('gpt-5.6-sol', 'ultra', '', 'ou_user', 'codex')
+    const resultPromise = session.onModelEffortSelect('gpt-5.6-sol', 'max', '', 'ou_user', 'codex')
     await settingsEntered.promise
     expect(session.watchdogSafetySnapshot(session.watchdogContext).modelSwitchPending).toBe(true)
 
@@ -6166,7 +6166,7 @@ describe('Session Codex watchdog warning and model guard', () => {
     session.selectedProvider = 'codex'
     session.proc = proc
 
-    const result = await session.onModelEffortSelect('gpt-5.6-sol', 'ultra', '', 'ou_user', 'codex')
+    const result = await session.onModelEffortSelect('gpt-5.6-sol', 'max', '', 'ou_user', 'codex')
 
     expect(result.ok).toBe(false)
     expect(sawPending).toBe(true)
@@ -6185,7 +6185,7 @@ describe('Session Codex watchdog warning and model guard', () => {
     })
 
     const result = await session.onModelEffortSelect(
-      'gpt-5.6-sol', 'ultra', '', 'ou_user', 'codex',
+      'gpt-5.6-sol', 'max', '', 'ou_user', 'codex',
     )
 
     expect(result.ok).toBe(false)
@@ -6209,7 +6209,7 @@ describe('Session Codex watchdog warning and model guard', () => {
     session.applyModelSelection = async () => { applyCalls++ }
 
     const selecting = session.onModelEffortSelect(
-      'gpt-5.6-sol', 'ultra', '', 'ou_user', 'codex',
+      'gpt-5.6-sol', 'max', '', 'ou_user', 'codex',
     )
     await settingsEntered.promise
     installFailedWatchdogRecovery(session, {
@@ -6250,11 +6250,11 @@ describe('Session Codex watchdog warning and model guard', () => {
     }
 
     const first = session.onModelEffortSelect(
-      'gpt-5.6-sol', 'ultra', '', 'ou_first', 'codex',
+      'gpt-5.6-sol', 'max', '', 'ou_first', 'codex',
     )
     await firstEntered.promise
     const second = session.onModelEffortSelect(
-      'gpt-5.6-sol', 'ultra', '', 'ou_second', 'codex',
+      'gpt-5.6-sol', 'max', '', 'ou_second', 'codex',
     )
     await secondEntered.promise
     firstRelease.resolve()
@@ -6664,13 +6664,13 @@ describe('normalizeFixedModelSelection ([codex.models.*] api 档位)', () => {
     }
   })
 
-  test('未配置的 codex api 档位(缺 model)回落 gpt-5.6-sol/ultra', () => {
+  test('未配置的 codex api 档位(缺 model)回落 gpt-5.6-sol/max', () => {
     const prev = config.codex.models
     ;(config.codex as any).models = { broken: { base_url: 'https://x', api_key: 'sk' } }
     try {
       const r = normalizeFixedModelSelection('codex', 'codex:broken', null)
       expect(r.model).toBe('gpt-5.6-sol')
-      expect(r.effort).toBe('ultra')
+      expect(r.effort).toBe('max')
     } finally {
       ;(config.codex as any).models = prev
     }
@@ -6680,9 +6680,9 @@ describe('normalizeFixedModelSelection ([codex.models.*] api 档位)', () => {
     expect(normalizeFixedModelSelection('codex', 'gpt-5.6-sol', null).model).toBe('gpt-5.6-sol')
   })
 
-  test('legacy 裸 gpt-5.5(旧持久化)归一到 gpt-5.6-sol/ultra', () => {
+  test('legacy 裸 gpt-5.5(旧持久化)归一到 gpt-5.6-sol/max', () => {
     expect(normalizeFixedModelSelection('codex', 'gpt-5.5', 'xhigh'))
-      .toEqual({ model: 'gpt-5.6-sol', effort: 'ultra' })
+      .toEqual({ model: 'gpt-5.6-sol', effort: 'max' })
   })
 })
 
@@ -6706,9 +6706,9 @@ describe('configuredDefaultSelection ([codex] api 档位)', () => {
     const prevDefault = config.claude.defaultModel
     try {
       ;(config.claude as any).defaultModel = 'gpt-5.6-sol'
-      expect(configuredDefaultSelection()).toEqual({ provider: 'codex', model: 'gpt-5.6-sol', effort: 'ultra' })
+      expect(configuredDefaultSelection()).toEqual({ provider: 'codex', model: 'gpt-5.6-sol', effort: 'max' })
       ;(config.claude as any).defaultModel = 'gpt-5.5'
-      expect(configuredDefaultSelection()).toEqual({ provider: 'codex', model: 'gpt-5.6-sol', effort: 'ultra' })
+      expect(configuredDefaultSelection()).toEqual({ provider: 'codex', model: 'gpt-5.6-sol', effort: 'max' })
     } finally {
       ;(config.claude as any).defaultModel = prevDefault
     }
@@ -6802,9 +6802,9 @@ describe('Fixed model selection normalization', () => {
       .toEqual({ model: 'claude:fable', effort: 'max' })
   })
 
-  test('normalizes any Codex selection to the fixed GPT-5.6 Sol / ultra', () => {
+  test('normalizes any Codex selection to the fixed GPT-5.6 Sol / max', () => {
     expect(normalizeFixedModelSelection('codex', 'gpt-4', 'low'))
-      .toEqual({ model: 'gpt-5.6-sol', effort: 'ultra' })
+      .toEqual({ model: 'gpt-5.6-sol', effort: 'max' })
   })
 })
 

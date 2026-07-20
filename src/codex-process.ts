@@ -121,9 +121,10 @@ export interface CodexReasoningEffortOption {
   description: string
 }
 export const CODEX_REASONING_EFFORTS = ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'] as const
-/** codex 档位的回落默认 effort,与内建 GPT-5.6 Sol 档锁死值一致。ultra 仅
- * GPT-5.6 系认识;跑旧模型的自配档位应在 [codex.models.<slug>] 显式配 effort。 */
-export const CODEX_EFFORT: CodexReasoningEffort = 'ultra'
+/** codex 档位的回落默认 effort,与内建 GPT-5.6 Sol 档锁死值一致。
+ * 2026-07-20:所有 GPT/Codex 档位统一 max(延长思维链预算);ultra(模型内多智能体)
+ * 仍可在 [codex.models.*] 显式开启。旧模型端点请在档位节显式配 effort。 */
+export const CODEX_EFFORT: CodexReasoningEffort = 'max'
 
 export function isCodexReasoningEffort(value: unknown): value is CodexReasoningEffort {
   return typeof value === 'string' && CODEX_REASONING_EFFORTS.includes(value as CodexReasoningEffort)
