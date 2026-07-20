@@ -142,12 +142,23 @@ Codex App 的计划栏是 GSD 状态的**只读镜像**，不属于 GSD canonica
 6. GREEN / 已验证只能凭新鲜、可复现失败证据重开，并记录 `reopen_reason`。一次最终审查新增超过 3 个独立阻断项时，暂停当前收口并拆分新 GSD。
 7. 同一代际的有效最终验收只运行一次；未形成测试结果的基础设施故障不计次数，但必须记录原因。验收失败后的修复属于新代际，不得直接重跑旧代际。
 
+## 跨设备首次安装（Lodestar 仓库）
+
+其它机器 checkout lodestar 后，项目 skill 已在 `.agents/skills/yiui-gsd`，但全局 GSD 运行时不会随主仓 git 走。在 **lodestar 仓库根** 执行：
+
+```bash
+bash install/yiui-gsd/install.sh
+bash install/yiui-gsd/verify.sh
+```
+
+Windows / pwsh：`install/yiui-gsd/install.ps1` 与 `verify.ps1`。可选 `--channel next`、`--init-gsd`、`--apply-agent-policy`、`--project <其它工程>`。说明见 `install/yiui-gsd/README.md`。
+
 ## GSD 更新
 
 1. 读取 `~/.codex/gsd-core/VERSION` 和 npm dist-tag，区分稳定版 `latest` 与预发布版 `next`。
-2. 首次安装或全局 `$gsd-update` 不存在时，1.7 RC/next 使用 `npx --yes @opengsd/gsd-core@next --codex --global`；稳定版把 `@next` 改为 `@latest`。
+2. 首次安装或全局 `$gsd-update` 不存在时，优先用仓库 `install/yiui-gsd/install.sh`（或 `.ps1`）；也可直接 `npx --yes @opengsd/gsd-core@next --codex --global`（稳定版把 `@next` 改为 `@latest`）。
 3. 已安装时，稳定版执行 `$gsd-update`；用户明确要求 1.7 RC/最新版预发布时执行 `$gsd-update --next`。
-4. 更新后验证 `~/.agents/skills/gsd-*`、`~/.codex/gsd-core/`、`~/.codex/agents/gsd-*` 和 hooks，确认项目 `.agents/skills/` 下没有官方 `gsd-*`。
+4. 更新后验证 `~/.agents/skills/gsd-*`、`~/.codex/gsd-core/`、`~/.codex/agents/gsd-*` 和 hooks，确认项目 `.agents/skills/` 下没有官方 `gsd-*`；也可用 `bash install/yiui-gsd/verify.sh`。
 5. 执行 `scripts/apply-codex-agent-policy.ps1`，再用 `-VerifyOnly` 复验模型、推理强度与 Flex 清理结果；生成文件只允许由该脚本幂等重放，禁止手工逐个维护。
 6. 对照新版命令更新本 skill 的白话映射；不得直接维护安装器生成的官方 `gsd-*` 文件。
 7. Codex 需要在新任务中重新发现全局 skills；当前任务只做文件与配置验证，不把“文件已安装”等同于“当前任务已热加载”。

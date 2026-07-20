@@ -1,0 +1,164 @@
+# Install GSD global runtime + ensure yiui-gsd project wiring after checkout.
+# Usage (from lodestar root or any cwd):
+#   pwsh -NoProfile -File install/yiui-gsd/install.ps1
+#   pwsh -NoProfile -File install/yiui-gsd/install.ps1 -Channel next -InitGsd -ApplyAgentPolicy
+[CmdletBinding()]
+param(
+    [ValidateSet('latest', 'next')]
+    [string]$Channel = 'latest',
+    [switch]$SkipCore,
+    [switch]$InitGsd,
+    [switch]$ApplyAgentPolicy,
+    [string]$Project = '',
+    [switch]$Yes
+)
+
+$ErrorActionPreference = 'Stop'
+
+function Write-Log([string]$Message) {
+    Write-Host "==> $Message"
+}
+
+function Die([string]$Message) {
+    Write-Error $Message
+    exit 1
+}
+
+$ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
+$Root = (Resolve-Path (Join-Path $ScriptDir '../..')).Path
+$SkillSrc = Join-Path $Root '.agents/skills/yiui-gsd'
+$ClaudeMdSrc = Join-Path $Root '.claude/CLAUDE.md'
+
+if (-not (Test-Path (Join-Path $SkillSrc 'SKILL.md'))) {
+    Die "not a lodestar checkout? missing $SkillSrc/SKILL.md"
+}
+
+function Ensure-Dir([string]$Path) {
+    if (-not (Test-Path $Path)) {
+        New-Item -ItemType Directory -Path $Path -Force | Out-Null
+    }
+}
+
+function Wire-Project([string]$ProjectRoot) {
+    if (-not (Test-Path $ProjectRoot)) {
+        Die "project path not found: $ProjectRoot"
+    }
+
+    $skillDst = Join-Path $ProjectRoot '.agents/skills/yiui-gsd'
+    $claudeSkill = Join-Path $ProjectRoot '.claude/skills/yiui-gsd'
+    $claudeMd = Join-Path $ProjectRoot '.claude/CLAUDE.md'
+
+    Ensure-Dir (Join-Path $ProjectRoot '.agents/skills')
+    Ensure-Dir (Join-Path $ProjectRoot '.claude/skills')
+
+    if ($ProjectRoot -ne $Root) {
+        if ((Test-Path $skillDst) -and -not ((Get-Item $skillDst).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            Write-Log "project skill exists (not link): $skillDst (leave as-is)"
+        } else {
+            if (Test-Path $skillDst) { Remove-Item $skillDst -Force -Recurse }
+            if ($IsWindows -or $env:OS -match 'Windows') {
+                cmd /c "mklink /J `"$skillDst`" `"$SkillSrc`"" | Out-Null
+            } else {
+                New-Item -ItemType SymbolicLink -Path $skillDst -Target $SkillSrc -Force | Out-Null
+            }
+            Write-Log "linked project skill -> $skillDst"
+        }
+    } else {
+        if (-not (Test-Path (Join-Path $SkillSrc 'SKILL.md'))) {
+            Die "missing skill at $SkillSrc"
+        }
+    }
+
+    if (-not (Test-Path $claudeSkill)) {
+        $linkTarget = Join-Path $ProjectRoot '.agents/skills/yiui-gsd'
+        if ($IsWindows -or $env:OS -match 'Windows') {
+            cmd /c "mklink /J `"$claudeSkill`" `"$linkTarget`"" | Out-Null
+        } else {
+            New-Item -ItemType SymbolicLink -Path $claudeSkill -Target '../../.agents/skills/yiui-gsd' -Force | Out-Null
+        }
+        Write-Log "created claude skill link: $claudeSkill"
+    } else {
+        Write-Log "claude skill entry ok: $claudeSkill"
+    }
+
+    if (-not (Test-Path $claudeMd)) {
+        Ensure-Dir (Split-Path $claudeMd -Parent)
+        if (Test-Path $ClaudeMdSrc) {
+            Copy-Item $ClaudeMdSrc $claudeMd -Force
+        } else {
+            @'
+# Project rules (Claude)
+
+## GSD / 长任务规划
+- 多阶段、长任务、需要 TRACKER/阶段推进时，**必须**使用项目 skill `yiui-gsd`（路径 `.agents/skills/yiui-gsd`，Claude 入口 `.claude/skills/yiui-gsd`）。
+- 任何 GSD 操作前先读 `.gsd/TRACKER.md`；活跃任务 STATE 经项目根 `.planning/`。
+- **禁止**使用 superpowers / oh-my-claudecode(OMC) / ralplan / ralph / ultrawork / “plan this” 作为规划入口。
+'@ | Set-Content -Path $claudeMd -Encoding UTF8
+        }
+        Write-Log "wrote $claudeMd"
+    } else {
+        Write-Log "claude rules present: $claudeMd"
+    }
+}
+
+function Install-Core {
+    if (-not (Get-Command npx -ErrorAction SilentlyContinue)) {
+        Die 'missing command: npx (Node.js >= 18 required)'
+    }
+    Write-Log "installing @opengsd/gsd-core@$Channel --codex --global"
+    & npx --yes "@opengsd/gsd-core@$Channel" --codex --global
+    if ($LASTEXITCODE -ne 0) {
+        Die "npx gsd-core install failed with exit $LASTEXITCODE"
+    }
+}
+
+Write-Log "lodestar root: $Root"
+Wire-Project $Root
+
+if ($Project) {
+    $extra = (Resolve-Path $Project).Path
+    Write-Log "wiring extra project: $extra"
+    Wire-Project $extra
+}
+
+if (-not $SkipCore) {
+    $versionPath = Join-Path $HOME '.codex/gsd-core/VERSION'
+    $shouldInstall = $true
+    if ((Test-Path $versionPath) -and -not $Yes) {
+        $cur = (Get-Content $versionPath -Raw).Trim()
+        Write-Log "existing GSD core VERSION=$cur (channel=$Channel)"
+        $ans = Read-Host "Re-run installer for channel $Channel? [Y/n]"
+        if ($ans -match '^[nN]') { $shouldInstall = $false }
+    }
+    if ($shouldInstall) {
+        Install-Core
+    } else {
+        Write-Log 'skip core reinstall'
+    }
+} else {
+    Write-Log 'SkipCore: not installing @opengsd/gsd-core'
+}
+
+if ($InitGsd) {
+    $initPs1 = Join-Path $SkillSrc 'scripts/init-gsd-repo.ps1'
+    if (-not (Test-Path $initPs1)) { Die "missing $initPs1" }
+    Push-Location $Root
+    try {
+        & pwsh -NoProfile -ExecutionPolicy Bypass -File $initPs1
+    } finally {
+        Pop-Location
+    }
+}
+
+if ($ApplyAgentPolicy) {
+    $policy = Join-Path $SkillSrc 'scripts/apply-codex-agent-policy.ps1'
+    if (-not (Test-Path $policy)) { Die "missing $policy" }
+    & pwsh -NoProfile -ExecutionPolicy Bypass -File $policy
+    & pwsh -NoProfile -ExecutionPolicy Bypass -File $policy -VerifyOnly
+}
+
+Write-Log 'running verify'
+& pwsh -NoProfile -File (Join-Path $ScriptDir 'verify.ps1') -Root $Root
+if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+Write-Log "done. Next: bun install && bun run build (for Lodestar daemon); use group command 'gsd' after daemon restart."

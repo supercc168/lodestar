@@ -82,6 +82,19 @@ lodestar-setup
 | `gsd` | 打开 GSD 状态卡(进度/继续/暂停/完成/新任务);跟随当前 model,规划只走 yiui-gsd |
 | `task` | 打开项目任务清单面板,启用飞书任务清单自动化（预览版） |
 
+**GSD / yiui-gsd(其它设备 checkout 后)**
+
+仓库会带上项目 skill(`.agents/skills/yiui-gsd`),但全局 GSD 运行时(`~/.codex/gsd-core`、`gsd-*` skills/agents)不会随 git 走。新机器在仓库根执行:
+
+```bash
+bash install/yiui-gsd/install.sh          # macOS / Linux
+# 或
+pwsh -NoProfile -File install/yiui-gsd/install.ps1
+bash install/yiui-gsd/verify.sh           # 装完校验
+```
+
+说明与参数见 [`install/yiui-gsd/README.md`](install/yiui-gsd/README.md)。Lodestar daemon 仍需 `bun run build` + 重启;飞书侧发 `gsd` 开状态卡。
+
 **并发 worktree 群**
 
 在项目主群发:
