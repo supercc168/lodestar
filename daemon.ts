@@ -547,6 +547,36 @@ async function handleCardAction(data: any): Promise<any> {
       const result = await session.onTasklistDeleteConfirm(String(value.guid ?? ''))
       return actionCardResponse(result.card)
     }
+    case 'gsd_refresh': {
+      const result = await session.onGsdRefresh(String(value.task_slug ?? ''), String(value.panel_gen ?? ''))
+      return result.card
+        ? actionCardResponse(result.card)
+        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
+    case 'gsd_continue': {
+      const result = await session.onGsdContinue(String(value.task_slug ?? ''), String(value.panel_gen ?? ''))
+      return result.card
+        ? actionCardResponse(result.card)
+        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
+    case 'gsd_pause': {
+      const result = await session.onGsdPause(String(value.task_slug ?? ''), String(value.panel_gen ?? ''))
+      return result.card
+        ? actionCardResponse(result.card)
+        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
+    case 'gsd_complete': {
+      const result = await session.onGsdComplete(String(value.task_slug ?? ''), String(value.panel_gen ?? ''))
+      return result.card
+        ? actionCardResponse(result.card)
+        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
+    case 'gsd_new_prompt': {
+      const result = await session.onGsdNewPrompt(String(value.task_slug ?? ''), String(value.panel_gen ?? ''))
+      return result.card
+        ? actionCardResponse(result.card)
+        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
     case 'agy_forward_codex': {
       const result = session.beginAgyForwardToCodex(String(value.result_id ?? ''), userId)
       return { toast: { type: result.ok ? 'success' : 'error', content: result.message } }

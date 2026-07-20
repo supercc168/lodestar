@@ -75,6 +75,10 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     await s.showTasklistPanel()
     return true
   }
+  if (raw.trim().match(/^gsd(?:\s+status)?$/i)) {
+    await s.showGsdPanel()
+    return true
+  }
   const command = CONTROL_COMMAND_ALIASES.get(raw.trim().toLowerCase())
   if (!command) return false
   if ((s.startingAgy || s.runningAgy) && !['stop', 'kill', 'restart', 'hi', 'model'].includes(command)) {

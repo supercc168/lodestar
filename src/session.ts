@@ -85,10 +85,12 @@ import {
   type TasklistActionResult,
   type WorktreeActionResult,
 } from './session-util'
+import type { GsdActionResult } from './session-gsd'
 import * as sessionCommands from './session-commands'
 import * as sessionCompact from './session-compact'
 import * as sessionModel from './session-model'
 import * as sessionTasklist from './session-tasklist'
+import * as sessionGsd from './session-gsd'
 import * as sessionWorktree from './session-worktree'
 import * as sessionTemp from './session-temp'
 import { config } from './config'
@@ -547,6 +549,12 @@ export class Session {
   selectedModel: string | null = null
   selectedEffort: AgentReasoningEffort | null = null
   modelPanels = new Map<string, sessionModel.ModelPanelState>()
+  /** Feishu message id of the live GSD status panel (session-memory only). */
+  gsdPanelMessageId: string | null = null
+  /** Generation stamp for GSD panel buttons; actions must match or are stale. */
+  gsdPanelGen = ''
+  /** Until-ms for “new task name” capture; 0 = off. */
+  gsdAwaitingNameUntil = 0
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
   private lastTurnDelta: LastTurnDelta | null = null
@@ -2290,6 +2298,38 @@ export class Session {
     return sessionTasklist.onTasklistDeleteConfirm(this, guidRaw)
   }
 
+  showGsdPanel(): Promise<void> {
+    return sessionGsd.showGsdPanel(this)
+  }
+
+  onGsdRefresh(taskSlug: string, panelGen: string): Promise<GsdActionResult> {
+    return sessionGsd.onGsdRefresh(this, taskSlug, panelGen)
+  }
+
+  onGsdContinue(taskSlug: string, panelGen: string): Promise<GsdActionResult> {
+    return sessionGsd.onGsdContinue(this, taskSlug, panelGen)
+  }
+
+  onGsdPause(taskSlug: string, panelGen: string): Promise<GsdActionResult> {
+    return sessionGsd.onGsdPause(this, taskSlug, panelGen)
+  }
+
+  onGsdComplete(taskSlug: string, panelGen: string): Promise<GsdActionResult> {
+    return sessionGsd.onGsdComplete(this, taskSlug, panelGen)
+  }
+
+  onGsdNewPrompt(taskSlug: string, panelGen: string): Promise<GsdActionResult> {
+    return sessionGsd.onGsdNewPrompt(this, taskSlug, panelGen)
+  }
+
+  maybeConsumeGsdTaskName(text: string): Promise<boolean> {
+    return sessionGsd.maybeConsumeGsdTaskName(this, text)
+  }
+
+  refreshGsdPanelIfPresent(): Promise<void> {
+    return sessionGsd.refreshGsdPanelIfPresent(this)
+  }
+
   runCompactCommand(): Promise<void> {
     return sessionCompact.runCompactCommand(this)
   }
@@ -2948,6 +2988,11 @@ export class Session {
     // misclassified as queued and its card closes with `📨 转交新卡`
     // instead of `✅`.
     this.clearStaleIdleQueueState('user_message')
+    // GSD “new task” name capture must run before agent forward when armed.
+    // Only pure text (no files) is treated as a candidate name.
+    if (!files.length && this.gsdAwaitingNameUntil > Date.now()) {
+      if (await sessionGsd.maybeConsumeGsdTaskName(this, text)) return
+    }
     if (this.startingAgy || this.runningAgy) {
       await feishu.sendText(this.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再继续。')
       return
@@ -5856,6 +5901,12 @@ export class Session {
     // 一张写死的卡响手机推送(2026-07-04 review follow-up)。
     if ((opts.forcePush || !suffix) && turn.userOpenId && turn.messageId && !turn.rotateGivenUp) {
       void feishu.urgentApp(turn.messageId, [turn.userOpenId])
+    }
+
+    // After a natural/successful turn close, refresh the GSD panel if one is live.
+    // Ignore errors — panel refresh must never block turn teardown.
+    if (!suffix || opts.hasFreshResult) {
+      void sessionGsd.refreshGsdPanelIfPresent(this)
     }
 
     // Release the OneSecond reactions on every queued Feishu message

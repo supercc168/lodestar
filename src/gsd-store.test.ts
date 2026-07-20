@@ -8,6 +8,7 @@ import {
   createAndActivateTask,
   pauseActiveTask,
   completeActiveTask,
+  resumeActiveTask,
   slugifyTaskName,
 } from './gsd-store'
 
@@ -63,6 +64,21 @@ test('pause and complete', () => {
   createAndActivateTask(root, 'X')
   expect(pauseActiveTask(root).status).toBe('已暂停')
   expect(completeActiveTask(root).status).toBe('已完成')
+})
+
+test('resume 已暂停 → 运行中; complete from 已暂停 allowed', () => {
+  const created = createAndActivateTask(root, 'Resume Me')
+  expect(pauseActiveTask(root).status).toBe('已暂停')
+
+  const resumed = resumeActiveTask(root)
+  expect(resumed.status).toBe('运行中')
+  expect(resumed.taskSlug).toBe(created.taskSlug)
+  expect(resumed.bridge.ok).toBe(true)
+
+  expect(pauseActiveTask(root).status).toBe('已暂停')
+  expect(completeActiveTask(root).status).toBe('已完成')
+  // resume no-ops on completed
+  expect(resumeActiveTask(root).status).toBe('已完成')
 })
 
 test('pause after complete does not rewrite to 已暂停', () => {

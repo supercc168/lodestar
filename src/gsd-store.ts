@@ -607,7 +607,8 @@ export function completeActiveTask(projectRoot: string): GsdSnapshot {
   const status = normalizeStatus(active.状态)
   const slug = active.task_slug
 
-  if (!slug || status === '无任务') {
+  // 运行中 / 已暂停 both may complete. 无任务 / already 已完成 are no-ops.
+  if (!slug || status === '无任务' || status === '已完成') {
     return snapshotFromDisk(projectRoot)
   }
 
@@ -623,4 +624,49 @@ export function completeActiveTask(projectRoot: string): GsdSnapshot {
 
   const snap = snapshotFromDisk(projectRoot)
   return { ...snap, status: '已完成', updatedAt: updated }
+}
+
+/** Resume a 已暂停 active task to 运行中 and re-point the planning bridge. */
+export function resumeActiveTask(projectRoot: string): GsdSnapshot {
+  const updated = nowIso()
+  let content = readTrackerRaw(projectRoot)
+  const active = parseActiveBlock(content)
+  const status = normalizeStatus(active.状态)
+  const slug = active.task_slug
+
+  if (!slug || status !== '已暂停') {
+    return snapshotFromDisk(projectRoot)
+  }
+
+  ensureTaskPlanningDir(projectRoot, slug)
+  const bridge = switchActivePlanning(projectRoot, slug)
+
+  updateTaskStatus(projectRoot, slug, '运行中', updated)
+  const name = active.任务名称 || readTaskName(projectRoot, slug, slug)
+  const phaseHint = readPhaseHint(projectRoot, slug)
+  const phase = phaseHint && phaseHint !== 'unknown'
+    ? phaseHint
+    : (active.当前阶段 || 'unknown')
+  const planningPath = planningPathFor(slug)
+
+  content = updateActiveBlock(content, {
+    状态: '运行中',
+    最后更新: updated,
+    当前阶段: phase,
+    planning_path: planningPath,
+  })
+  content = upsertIndexRow(content, slug, name, '运行中', updated)
+  writeTracker(projectRoot, content)
+  commitGsd(projectRoot, `gsd(${slug}): 恢复任务`)
+
+  const snap = snapshotFromDisk(projectRoot)
+  return {
+    ...snap,
+    status: '运行中',
+    updatedAt: updated,
+    phase,
+    planningPath,
+    bridge,
+    phaseHint,
+  }
 }
