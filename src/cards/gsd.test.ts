@@ -47,6 +47,11 @@ describe('gsd panel card rendering', () => {
     expect(json).toContain('新任务')
     expect(json).toContain('gen-1')
     expect(json).toContain('OK')
+    // Two action rows so Feishu does not clip five equal-width labels to "..."
+    const columnSets = (card.body.elements as any[]).filter(e => e.tag === 'column_set')
+    expect(columnSets.length).toBe(2)
+    expect(columnSets[0].columns.length).toBe(3)
+    expect(columnSets[1].columns.length).toBe(2)
   })
 
   test('includes notice and awaitingName prompt', () => {

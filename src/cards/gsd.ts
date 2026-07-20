@@ -47,7 +47,9 @@ export function gsdPanelCard(opts: GsdPanelOpts): object {
           element_id: ELEMENTS.gsdPanel,
           content: panelContent(opts),
         },
-        actionElement(opts),
+        // Two rows: five equal-weight buttons in one column_set are too
+        // narrow on Feishu and render as "..." with labels clipped.
+        ...actionElements(opts),
       ],
     },
   }
@@ -165,37 +167,52 @@ function bridgeLabel(bridge: BridgeHealth): string {
   }
 }
 
-function actionElement(opts: GsdPanelOpts): object {
+type GsdActionButton = { label: string; kind: string; type?: string }
+
+function actionElements(opts: GsdPanelOpts): object[] {
   const taskSlug = opts.snapshot.taskSlug || ''
   const panelGen = opts.panelGen
-  const buttons: Array<{ label: string; kind: string; type?: string }> = [
-    { label: '进度', kind: 'gsd_refresh', type: 'default' },
-    { label: '继续', kind: 'gsd_continue', type: 'primary' },
-    { label: '暂停', kind: 'gsd_pause', type: 'default' },
-    { label: '完成', kind: 'gsd_complete', type: 'default' },
-    { label: '新任务', kind: 'gsd_new_prompt', type: 'primary' },
+  // Keep ≤3 buttons per row (same practical density as permission cards).
+  const rows: GsdActionButton[][] = [
+    [
+      { label: '进度', kind: 'gsd_refresh', type: 'default' },
+      { label: '继续', kind: 'gsd_continue', type: 'primary' },
+      { label: '暂停', kind: 'gsd_pause', type: 'default' },
+    ],
+    [
+      { label: '完成', kind: 'gsd_complete', type: 'default' },
+      { label: '新任务', kind: 'gsd_new_prompt', type: 'primary' },
+    ],
   ]
 
-  return {
+  return rows.map(buttons => ({
     tag: 'column_set',
-    columns: buttons.map(btn => ({
-      tag: 'column',
-      width: 'weighted',
-      weight: 1,
-      elements: [{
-        tag: 'button',
-        text: { tag: 'plain_text', content: btn.label },
-        type: btn.type ?? 'default',
-        behaviors: [{
-          type: 'callback',
-          value: {
-            kind: btn.kind,
-            task_slug: taskSlug,
-            panel_gen: panelGen,
-          },
-        }],
+    columns: buttons.map(btn => buttonColumn(btn, taskSlug, panelGen)),
+  }))
+}
+
+function buttonColumn(
+  btn: GsdActionButton,
+  taskSlug: string,
+  panelGen: string,
+): object {
+  return {
+    tag: 'column',
+    width: 'weighted',
+    weight: 1,
+    elements: [{
+      tag: 'button',
+      text: { tag: 'plain_text', content: btn.label },
+      type: btn.type ?? 'default',
+      behaviors: [{
+        type: 'callback',
+        value: {
+          kind: btn.kind,
+          task_slug: taskSlug,
+          panel_gen: panelGen,
+        },
       }],
-    })),
+    }],
   }
 }
 
