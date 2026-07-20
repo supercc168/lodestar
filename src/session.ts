@@ -555,6 +555,12 @@ export class Session {
   gsdPanelGen = ''
   /** Until-ms for “new task name” capture; 0 = off. */
   gsdAwaitingNameUntil = 0
+  /**
+   * Session-local: this chat is currently executing GSD for `taskSlug`.
+   * Set on GSD inject / `[Lodestar GSD]` user text; cleared on pause/complete/
+   * stop, or when a non-GSD message opens its own turn. Not persisted.
+   */
+  gsdExecution: { taskSlug: string; source: 'inject' | 'message'; at: number } | null = null
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
   private lastTurnDelta: LastTurnDelta | null = null
@@ -1769,6 +1775,8 @@ export class Session {
     this.discardPreservedWatchdogRecovery(`stop: ${reason}`)
     this.clearWatchdogRuntime(`stop: ${reason}`)
     this.discardQueuedHumanWork('stop')
+    // stop ends any in-session GSD execution signal (panel fine-progress gate).
+    sessionGsd.clearGsdExecution(this)
     const stoppedAgy = await this.stopAgyTask(`🛑 ${reason}`)
     if (!this.ownsLifecycle(lease)) return
     this.discardQueuedHumanWork('stop')
@@ -1905,6 +1913,8 @@ export class Session {
     this.stopFooterStatus(this.currentTurn)
     if (!opts.preserveCurrentTurn) {
       this.currentTurn = null
+      // Ordinary restart ends session-local GSD execution signal.
+      sessionGsd.clearGsdExecution(this)
     }
     this.pendingUserMessageCount = 0
     if (!opts.preserveQueuedHumanWork) {
@@ -2302,23 +2312,23 @@ export class Session {
     return sessionGsd.showGsdPanel(this)
   }
 
-  onGsdRefresh(taskSlug: string, panelGen: string): Promise<GsdActionResult> {
+  onGsdRefresh(taskSlug: string, panelGen: string | null = null): Promise<GsdActionResult> {
     return sessionGsd.onGsdRefresh(this, taskSlug, panelGen)
   }
 
-  onGsdContinue(taskSlug: string, panelGen: string): Promise<GsdActionResult> {
+  onGsdContinue(taskSlug: string, panelGen: string | null = null): Promise<GsdActionResult> {
     return sessionGsd.onGsdContinue(this, taskSlug, panelGen)
   }
 
-  onGsdPause(taskSlug: string, panelGen: string): Promise<GsdActionResult> {
+  onGsdPause(taskSlug: string, panelGen: string | null = null): Promise<GsdActionResult> {
     return sessionGsd.onGsdPause(this, taskSlug, panelGen)
   }
 
-  onGsdComplete(taskSlug: string, panelGen: string): Promise<GsdActionResult> {
+  onGsdComplete(taskSlug: string, panelGen: string | null = null): Promise<GsdActionResult> {
     return sessionGsd.onGsdComplete(this, taskSlug, panelGen)
   }
 
-  onGsdNewPrompt(taskSlug: string, panelGen: string): Promise<GsdActionResult> {
+  onGsdNewPrompt(taskSlug: string, panelGen: string | null = null): Promise<GsdActionResult> {
     return sessionGsd.onGsdNewPrompt(this, taskSlug, panelGen)
   }
 
@@ -2993,6 +3003,19 @@ export class Session {
     if (!files.length && this.gsdAwaitingNameUntil > Date.now()) {
       if (await sessionGsd.maybeConsumeGsdTaskName(this, text)) return
     }
+    // Session-level GSD execution detection (inject vs ordinary chat).
+    // Mid-turn buffers do not clear: the in-flight turn may still be GSD.
+    // Idle/cold paths that open their own turn clear when text is non-GSD.
+    sessionGsd.noteGsdUserMessage(this, text, {
+      // Approximate: if already mid-flight, this msg queues; else it owns a turn.
+      startsOwnTurn: !(
+        this.currentTurn ||
+        this.openingTurn ||
+        this.pendingUserMessageCount > 0 ||
+        this.pendingMidTurnMsgs.length > 0 ||
+        this.pendingHumanDelivery
+      ),
+    })
     if (this.startingAgy || this.runningAgy) {
       await feishu.sendText(this.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再继续。')
       return

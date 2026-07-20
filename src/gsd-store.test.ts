@@ -10,6 +10,8 @@ import {
   completeActiveTask,
   resumeActiveTask,
   slugifyTaskName,
+  parseStateProgress,
+  readGsdSnapshot,
 } from './gsd-store'
 
 let root: string
@@ -110,6 +112,121 @@ test('pause after complete does not rewrite to 已暂停', () => {
   const task = readFileSync(join(root, '.gsd', snap.taskSlug, 'TASK.md'), 'utf8')
   expect(task).toMatch(/状态:\s*已完成/)
   expect(task).not.toMatch(/状态:\s*已暂停/)
+})
+
+test('parseStateProgress reads frontmatter plans, body scalars, and cursor', () => {
+  const state = `---
+gsd_state_version: '1.0'
+status: in_progress
+progress:
+  total_phases: 3
+  completed_phases: 1
+  total_plans: 5
+  completed_plans: 2
+  percent: 40
+---
+
+# Project State
+
+- current_phase: execute
+- current_plan: 03-PLAN.md
+- next_action: implement panel progress
+
+## 单向执行游标
+
+| 游标 | 项 | 状态 |
+|------|----|------|
+| 03/A | scaffold | GREEN |
+| 03/B | wire card | 已验证 |
+| 04/F | assert panel | RED |
+| 05/A | docs | pending |
+`
+
+  const p = parseStateProgress(state)
+  expect(p).toBeDefined()
+  expect(p!.totalPlans).toBe(5)
+  expect(p!.completedPlans).toBe(2)
+  expect(p!.totalPhases).toBe(3)
+  expect(p!.completedPhases).toBe(1)
+  expect(p!.percent).toBe(40)
+  expect(p!.currentPlan).toBe('03-PLAN.md')
+  expect(p!.nextAction).toBe('implement panel progress')
+  expect(p!.cursor).toEqual({
+    cursor: '04/F',
+    item: 'assert panel',
+    status: 'RED',
+  })
+})
+
+test('parseStateProgress body Plan of / Progress % fallbacks', () => {
+  const state = `# Project State
+
+Phase: 2 of 4 (Execute)
+Plan: 3 of 7 in current phase
+Status: In progress
+Progress: [████░░░░░░] 40%
+`
+  const p = parseStateProgress(state)
+  expect(p).toBeDefined()
+  // "Plan 3 of 7" → completed ~2, total 7
+  expect(p!.totalPlans).toBe(7)
+  expect(p!.completedPlans).toBe(2)
+  expect(p!.percent).toBe(40)
+})
+
+test('parseStateProgress returns undefined on empty state', () => {
+  expect(parseStateProgress('# empty\n')).toBeUndefined()
+})
+
+test('parseStateProgress drops illegal plan counters', () => {
+  const state = `---
+progress:
+  total_plans: 2
+  completed_plans: 9
+---
+`
+  const p = parseStateProgress(state)
+  // illegal 9/2 dropped; no other fields → undefined
+  expect(p).toBeUndefined()
+})
+
+test('readGsdSnapshot surfaces STATE progress via bridge', () => {
+  const created = createAndActivateTask(root, 'Progress Panel')
+  writeFileSync(
+    join(root, '.gsd', created.taskSlug, '.planning', 'STATE.md'),
+    `---
+status: in_progress
+progress:
+  total_phases: 2
+  completed_phases: 0
+  total_plans: 4
+  completed_plans: 1
+  percent: 25
+---
+
+- current_phase: plan
+- current_plan: 02-PLAN.md
+- next_action: write tests
+
+## 单向执行游标
+
+| 游标 | 项 | 状态 |
+|------|----|------|
+| 02/A | draft | GREEN |
+| 02/B | implement | RED |
+`,
+  )
+
+  const snap = readGsdSnapshot(root)
+  expect(snap.taskSlug).toBe(created.taskSlug)
+  expect(snap.phaseHint).toBe('plan')
+  expect(snap.progress).toBeDefined()
+  expect(snap.progress!.completedPlans).toBe(1)
+  expect(snap.progress!.totalPlans).toBe(4)
+  expect(snap.progress!.percent).toBe(25)
+  expect(snap.progress!.currentPlan).toBe('02-PLAN.md')
+  expect(snap.progress!.cursor?.cursor).toBe('02/B')
+  expect(snap.progress!.cursor?.status).toBe('RED')
 })
 
 test('create rolls back previous task when bridge switch fails', () => {

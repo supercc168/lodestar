@@ -13,6 +13,12 @@ export type GsdPanelOpts = {
   panelGen: string
   notice?: GsdPanelNotice
   awaitingName?: boolean
+  /**
+   * Session-level gate: true only when this chat is actively executing the
+   * active GSD task (daemon inject / `[Lodestar GSD]` message). Disk-only
+   * 运行中 without session execution must not show plan/cursor detail.
+   */
+  showProgress?: boolean
 }
 
 export function gsdPanelCard(opts: GsdPanelOpts): object {
@@ -52,13 +58,18 @@ function panelContent(opts: GsdPanelOpts): string {
   const name = s.taskName || '—'
   const slug = s.taskSlug || '—'
   const phase = s.phase || 'unknown'
-  const phaseHint = s.phaseHint ? ` / ${s.phaseHint}` : ''
+  // Avoid duplicating phase when TRACKER phase already equals STATE phaseHint.
+  const phaseHint =
+    s.phaseHint && s.phaseHint !== 'unknown' && s.phaseHint !== phase
+      ? ` / ${s.phaseHint}`
+      : ''
   const updated = s.updatedAt || '—'
   const lines = [
     `任务：${inlineCode(name)}`,
     `slug：${inlineCode(slug)}`,
     `状态：${s.status}`,
     `阶段：${inlineCode(phase)}${phaseHint}`,
+    ...progressLines(s, opts.showProgress === true),
     `bridge：${bridgeLabel(s.bridge)}`,
     `provider：${inlineCode(opts.providerLabel)}`,
     `更新：${inlineCode(updated)}`,
@@ -69,6 +80,75 @@ function panelContent(opts: GsdPanelOpts): string {
     lines.push(`<font color='orange'>等待任务名：请发送下一条消息作为新任务名称（约 300s 内）。</font>`)
   }
   return lines.join('\n')
+}
+
+/**
+ * Extra lines from STATE.md plan/cursor progress (read-only mirror).
+ * Requires both disk status **运行中** and session `showProgress` (this chat
+ * is executing GSD). Paused/completed/idle or ordinary non-GSD chat keep the
+ * coarse header only.
+ */
+function progressLines(
+  s: GsdPanelOpts['snapshot'],
+  showProgress: boolean,
+): string[] {
+  if (!showProgress) return []
+  if (s.status !== '运行中') return []
+  const p = s.progress
+  if (!p) return []
+  const lines: string[] = []
+
+  if (p.totalPlans != null && p.completedPlans != null) {
+    const bar = progressBar(p.completedPlans, p.totalPlans, p.percent)
+    lines.push(
+      `计划：${inlineCode(`${p.completedPlans}/${p.totalPlans}`)}${bar ? ` ${bar}` : ''}`,
+    )
+  } else if (p.percent != null) {
+    lines.push(`进度：${inlineCode(`${p.percent}%`)}`)
+  }
+
+  if (p.totalPhases != null && p.completedPhases != null && p.totalPhases > 0) {
+    lines.push(`phase 进度：${inlineCode(`${p.completedPhases}/${p.totalPhases}`)}`)
+  }
+
+  if (p.currentPlan) {
+    lines.push(`当前计划：${inlineCode(truncate(p.currentPlan, 80))}`)
+  }
+
+  if (p.cursor) {
+    const item = p.cursor.item ? ` ${truncate(p.cursor.item, 48)}` : ''
+    lines.push(
+      `游标：${inlineCode(`[GSD ${p.cursor.cursor}]`)} ${inlineCode(p.cursor.status)}${item ? ` ${item}` : ''}`,
+    )
+  }
+
+  if (p.nextAction) {
+    lines.push(`下一步：${inlineCode(truncate(p.nextAction, 80))}`)
+  }
+
+  return lines
+}
+
+function progressBar(
+  completed: number,
+  total: number,
+  percent: number | null,
+): string {
+  if (total <= 0) return ''
+  const pct =
+    percent != null && Number.isFinite(percent)
+      ? Math.max(0, Math.min(100, percent))
+      : Math.max(0, Math.min(100, Math.round((completed / total) * 100)))
+  const width = 10
+  const filled = Math.round((pct / 100) * width)
+  const bar = '█'.repeat(filled) + '░'.repeat(width - filled)
+  return `\`${bar}\` ${pct}%`
+}
+
+function truncate(s: string, max: number): string {
+  const t = s.replace(/\s+/g, ' ').trim()
+  if (t.length <= max) return t
+  return t.slice(0, Math.max(0, max - 1)) + '…'
 }
 
 function bridgeLabel(bridge: BridgeHealth): string {

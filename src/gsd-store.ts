@@ -11,6 +11,22 @@ import {
 
 export type GsdTaskStatus = '无任务' | '运行中' | '已暂停' | '已完成'
 
+/** Fine-grained plan/cursor progress read from active STATE.md (read-only mirror). */
+export type GsdProgressDetail = {
+  completedPlans: number | null
+  totalPlans: number | null
+  completedPhases: number | null
+  totalPhases: number | null
+  percent: number | null
+  currentPlan: string
+  nextAction: string
+  cursor?: {
+    cursor: string
+    item: string
+    status: string
+  }
+}
+
 export type GsdSnapshot = {
   status: GsdTaskStatus
   taskSlug: string
@@ -21,6 +37,8 @@ export type GsdSnapshot = {
   note: string
   bridge: BridgeHealth
   phaseHint?: string
+  /** Present when STATE.md yields at least one useful progress field. */
+  progress?: GsdProgressDetail
 }
 
 const TRACKER_FILE = 'TRACKER.md'
@@ -381,32 +399,225 @@ function commitGsd(projectRoot: string, message: string): void {
   }
 }
 
-function readPhaseHint(projectRoot: string, slug: string): string {
+function readStateMdText(projectRoot: string, slug: string): string | null {
   const candidates = [
     join(projectRoot, '.planning', 'STATE.md'),
     join(projectRoot, '.gsd', slug, '.planning', 'STATE.md'),
   ]
   for (const p of candidates) {
     if (!existsSync(p)) continue
-    const text = readFileSync(p, 'utf8')
-    const lines = text.split(/\r?\n/)
-    for (const line of lines) {
-      const m = line.match(
-        /^(?:#+\s*)?(?:phase|current_phase|Progress|当前阶段)\s*[:：=]\s*(.+)$/i,
-      )
-      if (m?.[1]) {
-        const v = m[1].trim().replace(/^['"]|['"]$/g, '')
-        if (v) return v
+    try {
+      return readFileSync(p, 'utf8')
+    } catch {
+      // try next candidate
+    }
+  }
+  return null
+}
+
+function stripScalar(raw: string): string {
+  return raw.trim().replace(/^['"]|['"]$/g, '')
+}
+
+function readProgressInteger(frontMatter: string, name: string): number | null {
+  // JS has no \z; capture indented lines after `progress:` until a non-indented line or EOF.
+  const progressMatch = frontMatter.match(
+    /^progress:\s*\r?\n((?:[ \t]+[^\r\n]*(?:\r?\n|$))*)/m,
+  )
+  if (!progressMatch?.[1]) return null
+  const field = progressMatch[1].match(
+    new RegExp(`^[ \\t]+${name}:\\s*(\\d+)\\s*$`, 'm'),
+  )
+  if (!field?.[1]) return null
+  const n = Number.parseInt(field[1], 10)
+  return Number.isFinite(n) ? n : null
+}
+
+function readStateBodyScalar(content: string, name: string): string {
+  // Prefer list form used by yiui-gsd / render-codex-plan: `- current_plan: ...`
+  const list = content.match(
+    new RegExp(`^\\-\\s*${name}:\\s*(.+?)\\s*$`, 'im'),
+  )
+  if (list?.[1]) return stripScalar(list[1])
+  // Bold markdown: **Current plan:** ...
+  const bold = content.match(
+    new RegExp(`\\*\\*${name}\\*\\*\\s*[:：]\\s*(.+?)\\s*$`, 'im'),
+  )
+  if (bold?.[1]) return stripScalar(bold[1])
+  // Plain "Current plan: ..." / "current_plan: ..."
+  const plain = content.match(
+    new RegExp(`^(?:#+\\s*)?${name}\\s*[:：=]\\s*(.+?)\\s*$`, 'im'),
+  )
+  if (plain?.[1]) return stripScalar(plain[1])
+  return ''
+}
+
+function readCurrentCursor(
+  stateContent: string,
+): GsdProgressDetail['cursor'] | undefined {
+  // JS has no \z; take heading body then cut at the next ## heading.
+  const section = stateContent.match(/^##\s+单向执行游标\s*\r?\n([\s\S]*)/m)
+  if (!section?.[1]) return undefined
+  let body = section[1]
+  const nextHeading = body.search(/^##\s+/m)
+  if (nextHeading >= 0) body = body.slice(0, nextHeading)
+
+  const rowRe = /^\|\s*([^|\r\n]+?)\s*\|\s*([^|\r\n]+?)\s*\|\s*([^|\r\n]+?)\s*\|/gm
+  let m: RegExpExecArray | null
+  while ((m = rowRe.exec(body)) !== null) {
+    const cursor = m[1].trim()
+    const item = m[2].trim()
+    const status = m[3].trim()
+    if (cursor === '游标' || /^-+$/.test(cursor.replace(/\s/g, ''))) continue
+    if (status === 'GREEN' || status === '已验证') continue
+    return { cursor, item, status }
+  }
+  return undefined
+}
+
+/**
+ * Parse plan/phase progress from STATE.md text.
+ * Aligns with `.agents/skills/yiui-gsd/scripts/render-codex-plan.ps1` field names.
+ * Missing or partial STATE is non-fatal — returns undefined when nothing useful.
+ */
+export function parseStateProgress(stateContent: string): GsdProgressDetail | undefined {
+  // YAML frontmatter at start of file (JS has no \A; use ^ without /m).
+  const fm = stateContent.match(/^---\r?\n([\s\S]*?)\r?\n---(?:\r?\n|$)/)
+  const frontMatter = fm?.[1] ?? ''
+
+  let totalPlans = frontMatter ? readProgressInteger(frontMatter, 'total_plans') : null
+  let completedPlans = frontMatter
+    ? readProgressInteger(frontMatter, 'completed_plans')
+    : null
+  let totalPhases = frontMatter
+    ? readProgressInteger(frontMatter, 'total_phases')
+    : null
+  let completedPhases = frontMatter
+    ? readProgressInteger(frontMatter, 'completed_phases')
+    : null
+  let percent = frontMatter ? readProgressInteger(frontMatter, 'percent') : null
+
+  // Body fallbacks: "Plan: 2 of 5" / "Progress: 40%"
+  if (totalPlans == null || completedPlans == null) {
+    const planOf = stateContent.match(
+      /Plan\s*[:：]\s*(\d+)\s+of\s+(\d+)/i,
+    )
+    if (planOf) {
+      if (completedPlans == null) {
+        // "Plan A of B" is current position; completed is usually A-1 when in progress
+        const current = Number.parseInt(planOf[1], 10)
+        completedPlans = Number.isFinite(current) ? Math.max(0, current - 1) : null
       }
-      // YAML-ish: phase: discuss
-      const y = line.match(/^\s*(?:phase|current_phase|progress)\s*:\s*(.+)$/i)
-      if (y?.[1]) {
-        const v = y[1].trim().replace(/^['"]|['"]$/g, '')
-        if (v && !v.startsWith('{') && !v.startsWith('[')) return v
+      if (totalPlans == null) {
+        const total = Number.parseInt(planOf[2], 10)
+        totalPlans = Number.isFinite(total) ? total : null
       }
     }
   }
+  if (
+    totalPlans != null &&
+    completedPlans != null &&
+    (totalPlans < 0 || completedPlans < 0 || completedPlans > totalPlans)
+  ) {
+    // Illegal counters — drop plan counts before deriving percent
+    totalPlans = null
+    completedPlans = null
+  }
+
+  if (percent == null) {
+    const bar = stateContent.match(/Progress\s*[:：].*?(\d+)\s*%/i)
+    if (bar?.[1]) {
+      const p = Number.parseInt(bar[1], 10)
+      if (Number.isFinite(p) && p >= 0 && p <= 100) percent = p
+    }
+  }
+  if (
+    percent == null &&
+    totalPlans != null &&
+    totalPlans > 0 &&
+    completedPlans != null &&
+    completedPlans >= 0
+  ) {
+    percent = Math.round((completedPlans / totalPlans) * 100)
+  }
+  if (percent != null && (percent < 0 || percent > 100)) {
+    percent = null
+  }
+
+  const currentPlan =
+    readStateBodyScalar(stateContent, 'current_plan') ||
+    readStateBodyScalar(stateContent, 'Current plan') ||
+    readStateBodyScalar(stateContent, '当前计划')
+  const nextAction =
+    readStateBodyScalar(stateContent, 'next_action') ||
+    readStateBodyScalar(stateContent, 'Next action') ||
+    readStateBodyScalar(stateContent, '下一步')
+  const cursor = readCurrentCursor(stateContent)
+
+  const has =
+    totalPlans != null ||
+    completedPlans != null ||
+    totalPhases != null ||
+    completedPhases != null ||
+    percent != null ||
+    !!currentPlan ||
+    !!nextAction ||
+    !!cursor
+  if (!has) return undefined
+
+  return {
+    completedPlans,
+    totalPlans,
+    completedPhases,
+    totalPhases,
+    percent,
+    currentPlan,
+    nextAction,
+    cursor,
+  }
+}
+
+function readPhaseHint(projectRoot: string, slug: string): string {
+  const text = readStateMdText(projectRoot, slug)
+  if (!text) return 'unknown'
+
+  // Prefer explicit body scalars used by yiui-gsd projection.
+  const preferred =
+    readStateBodyScalar(text, 'current_phase') ||
+    readStateBodyScalar(text, 'Current phase') ||
+    readStateBodyScalar(text, '当前阶段')
+  if (preferred) return preferred
+
+  const lines = text.split(/\r?\n/)
+  for (const line of lines) {
+    // Skip YAML frontmatter progress block keys (progress: is nested, not phase).
+    if (/^\s*progress\s*:/i.test(line)) continue
+    const m = line.match(
+      /^(?:#+\s*)?(?:phase|current_phase|当前阶段)\s*[:：=]\s*(.+)$/i,
+    )
+    if (m?.[1]) {
+      const v = stripScalar(m[1])
+      // Avoid matching "Progress: [██] 40%" style lines as phase.
+      if (v && !/^\[[█░\s\d%]+/.test(v) && !/^\d+\s*%/.test(v)) return v
+    }
+    // YAML-ish top-level: phase: discuss / status: planning
+    const y = line.match(/^\s*(?:phase|current_phase)\s*:\s*(.+)$/i)
+    if (y?.[1]) {
+      const v = stripScalar(y[1])
+      if (v && !v.startsWith('{') && !v.startsWith('[')) return v
+    }
+  }
   return 'unknown'
+}
+
+function readProgressDetail(
+  projectRoot: string,
+  slug: string,
+): GsdProgressDetail | undefined {
+  if (!slug) return undefined
+  const text = readStateMdText(projectRoot, slug)
+  if (!text) return undefined
+  return parseStateProgress(text)
 }
 
 function normalizeStatus(raw: string): GsdTaskStatus {
@@ -460,6 +671,7 @@ function snapshotFromDisk(projectRoot: string): GsdSnapshot {
   const note = active.备注 || ''
   const bridge = planningHealth(projectRoot)
   const phaseHint = taskSlug ? readPhaseHint(projectRoot, taskSlug) : 'unknown'
+  const progress = taskSlug ? readProgressDetail(projectRoot, taskSlug) : undefined
   return {
     status,
     taskSlug,
@@ -470,6 +682,7 @@ function snapshotFromDisk(projectRoot: string): GsdSnapshot {
     note,
     bridge,
     phaseHint,
+    progress,
   }
 }
 
@@ -557,6 +770,7 @@ export function createAndActivateTask(
   const phaseHint = readPhaseHint(projectRoot, slug)
   const phase = phaseHint && phaseHint !== 'unknown' ? phaseHint : 'unknown'
   const planningPath = planningPathFor(slug)
+  const progress = readProgressDetail(projectRoot, slug)
 
   content = updateActiveBlock(content, {
     状态: '运行中',
@@ -581,6 +795,7 @@ export function createAndActivateTask(
     note: '',
     bridge,
     phaseHint,
+    progress,
   }
 }
 

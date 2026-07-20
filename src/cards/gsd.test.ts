@@ -77,4 +77,103 @@ describe('gsd panel card rendering', () => {
     const json = JSON.stringify(card)
     expect(json).toContain('缺失')
   })
+
+  test('renders plan progress bar, current plan, and cursor when showProgress', () => {
+    const card = gsdPanelCard({
+      snapshot: snap({
+        phase: 'execute',
+        phaseHint: 'execute',
+        progress: {
+          completedPlans: 2,
+          totalPlans: 5,
+          completedPhases: 1,
+          totalPhases: 3,
+          percent: 40,
+          currentPlan: '03-PLAN.md — wire GSD panel',
+          nextAction: 'run bun test src/cards/gsd.test.ts',
+          cursor: {
+            cursor: '04/F',
+            item: 'assert panel progress lines',
+            status: 'RED',
+          },
+        },
+      }),
+      providerLabel: 'claude',
+      panelGen: 'gen-4',
+      showProgress: true,
+    }) as any
+
+    const json = JSON.stringify(card)
+    expect(json).toContain('2/5')
+    expect(json).toContain('40%')
+    expect(json).toContain('1/3')
+    expect(json).toContain('03-PLAN.md')
+    expect(json).toContain('[GSD 04/F]')
+    expect(json).toContain('RED')
+    expect(json).toContain('下一步')
+    // phaseHint equal to phase should not be duplicated
+    expect(json).not.toMatch(/execute` \/ `execute/)
+  })
+
+  test('omits progress lines when snapshot has no progress', () => {
+    const card = gsdPanelCard({
+      snapshot: snap({ progress: undefined }),
+      providerLabel: 'claude',
+      panelGen: 'gen-5',
+      showProgress: true,
+    }) as any
+    const json = JSON.stringify(card)
+    expect(json).not.toContain('计划：')
+    expect(json).not.toContain('游标：')
+    expect(json).not.toContain('下一步：')
+  })
+
+  test('hides plan/cursor detail unless showProgress and status is 运行中', () => {
+    const progress = {
+      completedPlans: 2,
+      totalPlans: 5,
+      completedPhases: 1,
+      totalPhases: 3,
+      percent: 40,
+      currentPlan: '03-PLAN.md',
+      nextAction: 'wire panel',
+      cursor: { cursor: '04/F', item: 'assert', status: 'RED' },
+    }
+
+    // Disk running but session not executing GSD → no fine progress.
+    const idleRunning = gsdPanelCard({
+      snapshot: snap({ status: '运行中', progress }),
+      providerLabel: 'claude',
+      panelGen: 'gen-idle-running',
+      showProgress: false,
+    }) as any
+    expect(JSON.stringify(idleRunning)).not.toContain('2/5')
+    expect(JSON.stringify(idleRunning)).not.toContain('[GSD 04/F]')
+
+    for (const status of ['已暂停', '已完成', '无任务'] as const) {
+      const card = gsdPanelCard({
+        snapshot: snap({ status, progress }),
+        providerLabel: 'claude',
+        panelGen: `gen-${status}`,
+        showProgress: true,
+      }) as any
+      const json = JSON.stringify(card)
+      expect(json).toContain(status)
+      expect(json).not.toContain('2/5')
+      expect(json).not.toContain('计划：')
+      expect(json).not.toContain('游标：')
+      expect(json).not.toContain('下一步：')
+      expect(json).not.toContain('[GSD 04/F]')
+    }
+
+    const running = gsdPanelCard({
+      snapshot: snap({ status: '运行中', progress }),
+      providerLabel: 'claude',
+      panelGen: 'gen-running',
+      showProgress: true,
+    }) as any
+    const runningJson = JSON.stringify(running)
+    expect(runningJson).toContain('2/5')
+    expect(runningJson).toContain('[GSD 04/F]')
+  })
 })
