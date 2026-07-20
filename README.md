@@ -214,7 +214,7 @@ watchdog_mode = 'off'              # 单项目覆盖(off / warn / recover_once)
    bin = "~/.local/bin/reclaude"
    ```
 
-4. 重启 daemon:`lodestar-stop` 后再 `lodestar-daemon`
+4. 重启 daemon:裸跑时 `lodestar-stop` 后再 `lodestar-daemon`;已由 launchd / systemd 托管时改用 `launchctl kickstart -k gui/$(id -u)/<label>` / `systemctl --user restart <unit>`,**不要**手动再起实例(托管器 KeepAlive 会拉起自己的实例并与手动实例互杀)
 5. 验证:群里发条消息,daemon 日志出现 `executable=config:…/reclaude` 即生效(stderr 里 reclaude 的 `同步配置…` 属正常输出)
 
 **没配就发消息的典型症状**:群里报 `Failed to authenticate. API Error: 401 Invalid bearer token` —— 裸 `claude` 拿着 reclaude 的本地凭据直连官方 API 必然 401,补上第 3、4 步即可。
