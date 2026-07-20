@@ -3003,19 +3003,10 @@ export class Session {
     if (!files.length && this.gsdAwaitingNameUntil > Date.now()) {
       if (await sessionGsd.maybeConsumeGsdTaskName(this, text)) return
     }
-    // Session-level GSD execution detection (inject vs ordinary chat).
-    // Mid-turn buffers do not clear: the in-flight turn may still be GSD.
-    // Idle/cold paths that open their own turn clear when text is non-GSD.
-    sessionGsd.noteGsdUserMessage(this, text, {
-      // Approximate: if already mid-flight, this msg queues; else it owns a turn.
-      startsOwnTurn: !(
-        this.currentTurn ||
-        this.openingTurn ||
-        this.pendingUserMessageCount > 0 ||
-        this.pendingMidTurnMsgs.length > 0 ||
-        this.pendingHumanDelivery
-      ),
-    })
+    // Inject templates may arm gsdExecution immediately. Do NOT clear
+    // execution on early-return paths below (agy busy / watchdog hold) —
+    // those messages never open a real superseding user turn.
+    sessionGsd.noteGsdInjectIfAny(this, text)
     if (this.startingAgy || this.runningAgy) {
       await feishu.sendText(this.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再继续。')
       return
@@ -3047,6 +3038,8 @@ export class Session {
       !this.pendingHumanDelivery &&
       this.pendingMidTurnMsgs.length > 0
     ) {
+      // Batch will open a new turn via drain — non-GSD text ends execution mark.
+      sessionGsd.noteGsdUserMessage(this, text, { startsOwnTurn: true })
       this.queueHumanMessage(text, wireText, userOpenId, msgId)
       await this.drainMidTurnAndOpen()
       return
@@ -3070,9 +3063,12 @@ export class Session {
 
     if (!this.isRunning()) {
       if (this.openingTurn || this.currentTurn) {
+        // Queued behind an in-flight open — not a superseding own turn yet.
         this.queueHumanMessage(text, wireText, userOpenId, msgId)
         return
       }
+      // Cold start opens a real turn for this text.
+      sessionGsd.noteGsdUserMessage(this, text, { startsOwnTurn: true })
       const message = { text, wireText, userOpenId, msgId }
       const batch = [...this.pendingMidTurnMsgs, message]
       this.pendingMidTurnMsgs = []
@@ -3087,6 +3083,7 @@ export class Session {
       // so writing here would leave the msg stuck until the next user msg
       // arrives. Drain happens in the `result` handler, which both wakes
       // the SDK and opens a fresh card for the new batch turn.
+      // Do not clear gsdExecution: in-flight GSD may still be active.
       this.queueHumanMessage(text, wireText, userOpenId, msgId)
       return
     }
@@ -3104,6 +3101,8 @@ export class Session {
     // awaiting its receipt — eager-opening over one would double-render
     // the input and make its later ACK look owner-lost (replay).
     if (!this.openingTurn && this.initCount >= 1 && !this.pendingHumanDelivery) {
+      // This message owns the next turn card — non-GSD chat ends execution mark.
+      sessionGsd.noteGsdUserMessage(this, text, { startsOwnTurn: true })
       const openingToken = this.beginTurnOpening()
       try {
         // openTurnCard 内部读 pendingTurnInputs 渲染 "📥 收到" panel,要在
@@ -3147,9 +3146,12 @@ export class Session {
     //      还没来,必须 sendUserText 喂 SDK 才能 wake;init handler 后续
     //      触发 openTurnCard 时一次性消费 pendingTurnInputs。
     if (this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingHumanDelivery) {
+      // Queued behind sibling open / cold batch — not a clear own-turn yet.
       this.queueHumanMessage(text, wireText, userOpenId, msgId)
       return
     }
+    // Cold first write that wakes SDK — this text will own the turn after init.
+    sessionGsd.noteGsdUserMessage(this, text, { startsOwnTurn: true })
     this.pendingTurnInputs.push(text)
     if (wasBusy && msgId) {
       // Bootstrap race / sibling-opening race: until a card is open,

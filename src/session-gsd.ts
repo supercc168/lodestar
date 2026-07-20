@@ -58,6 +58,9 @@ export function markGsdExecution(
  * - Inject templates (`[Lodestar GSD]`) arm execution for their task_slug.
  * - Non-GSD text that **starts its own turn** clears execution (ordinary chat).
  * - Mid-turn buffered messages do not clear (in-flight GSD may still be active).
+ *
+ * Callers must not pass `startsOwnTurn: true` on early-return paths that never
+ * open/queue a real agent turn (agy busy reject, watchdog hold, etc.).
  */
 export function noteGsdUserMessage(
   s: Session,
@@ -77,6 +80,11 @@ export function noteGsdUserMessage(
     // Ordinary user turn supersedes prior GSD-exec signal.
     clearGsdExecution(s)
   }
+}
+
+/** Arm execution from inject text only — never clears. Safe before early returns. */
+export function noteGsdInjectIfAny(s: Session, text: string): void {
+  noteGsdUserMessage(s, text, { startsOwnTurn: false })
 }
 
 /**
@@ -227,16 +235,17 @@ function buildCard(
   })
 }
 
+/** @returns true when the card was updated or a new panel message id was stored. */
 async function publishCard(
   s: Session,
   card: object,
   opts?: { preferUpdate?: boolean },
-): Promise<void> {
+): Promise<boolean> {
   const preferUpdate = opts?.preferUpdate !== false
   if (preferUpdate && s.gsdPanelMessageId) {
     try {
       await feishu.updateCard(s.gsdPanelMessageId, card)
-      return
+      return true
     } catch (e) {
       log(`session "${s.sessionName}": gsd panel update failed: ${messageOf(e)}; resending`)
     }
@@ -244,10 +253,11 @@ async function publishCard(
   const messageId = await feishu.sendCard(s.chatId, card)
   if (messageId) {
     s.gsdPanelMessageId = messageId
-  } else {
-    log(`session "${s.sessionName}": gsd panel send failed`)
-    await feishu.sendTextRaw(s.chatId, '❌ gsd 面板发送失败')
+    return true
   }
+  log(`session "${s.sessionName}": gsd panel send failed`)
+  await feishu.sendTextRaw(s.chatId, '❌ gsd 面板发送失败')
+  return false
 }
 
 function resultWithCard(
@@ -370,18 +380,21 @@ export async function onGsdContinue(
     })
     // Non-blocking inject: after validation / busy / resume / bridge, fire
     // onUserMessage and return the card immediately so Feishu ACK is not
-    // blocked on cold-start / openTurnCard latency. Residual risk: inject
-    // failure is only logged (store already resumed); prefer low ACK latency
-    // over awaiting full turn open. Matches daemon toast-first long-ops
-    // (fork/back/resume). Create-task path still awaits (needs inject outcome
-    // for re-arm awaiting on failure).
+    // blocked on cold-start / openTurnCard latency. On inject failure clear
+    // the session execution marker so the panel does not keep showing fine
+    // progress as if GSD were running. Disk may stay 运行中 after resume —
+    // user can retry `gsd continue`. Matches daemon toast-first long-ops
+    // (fork/back/resume). Create-task path still awaits (needs inject outcome).
     void s.onUserMessage(prompt).catch(e => {
       log(`session "${s.sessionName}": gsd continue inject failed: ${messageOf(e)}`)
+      clearGsdExecution(s)
+      void refreshGsdPanelIfPresent(s)
     })
     return resultWithCard(s, true, '已注入')
   } catch (e) {
     const message = `继续失败: ${messageOf(e)}`
     log(`session "${s.sessionName}": gsd continue failed: ${messageOf(e)}`)
+    clearGsdExecution(s)
     return resultWithCard(s, false, message)
   }
 }
@@ -469,6 +482,7 @@ export async function startNamedGsdTask(
     return resultWithCard(s, false, '任务名不能为空', 'error', true)
   }
 
+  let createdSlug = ''
   try {
     clearStaleIdleQueueIfSafe(s, 'gsd_new_task_name')
     if (s.isRunning() && isSessionBusy(s)) {
@@ -476,6 +490,7 @@ export async function startNamedGsdTask(
     }
 
     const snap: GsdSnapshot = createAndActivateTask(s.workDir, taskName)
+    createdSlug = snap.taskSlug
     ensureBridge(s.workDir, snap.taskSlug)
 
     // Invalidate panel gen before await inject (anti double-create / double-inject).
@@ -503,8 +518,14 @@ export async function startNamedGsdTask(
       card,
     }
   } catch (e) {
-    const message = `创建任务失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": gsd create task failed: ${messageOf(e)}`)
+    // Disk may already have the new task as 运行中 after createAndActivateTask.
+    // Never leave a sticky session execution marker without a live inject turn.
+    clearGsdExecution(s)
+    const detail = messageOf(e)
+    const message = createdSlug
+      ? `任务已创建（${createdSlug}）但未成功注入: ${detail}。可发 gsd continue 重试。`
+      : `创建任务失败: ${detail}`
+    log(`session "${s.sessionName}": gsd create task failed: ${detail}`)
     return resultWithCard(s, false, message)
   }
 }
@@ -557,15 +578,15 @@ export async function runGsdTextCommand(
       return false
   }
 
-  if (result.card) await publishCard(s, result.card)
+  const published = result.card ? await publishCard(s, result.card) : false
   if (!result.ok) {
     await feishu.sendText(s.chatId, `❌ ${result.message}`)
-  } else if (cmd.kind === 'continue' || cmd.kind === 'pause' || cmd.kind === 'complete') {
-    // Light ack when card update might be missed (no prior panel).
-    // Card already carries the notice; skip extra spam if panel was updated.
-    if (!s.gsdPanelMessageId) {
-      await feishu.sendText(s.chatId, `${result.ok ? '✅' : '❌'} ${result.message}`)
-    }
+  } else if (!result.card) {
+    await feishu.sendText(s.chatId, `✅ ${result.message}`)
+  } else if (!published) {
+    // publishCard already posted "面板发送失败"; do not also claim ✅ success.
+    // Surface that the control action itself still ran (continue inject, etc.).
+    await feishu.sendText(s.chatId, `⚠️ 面板未更新：${result.message}`)
   }
   return true
 }

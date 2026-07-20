@@ -168,10 +168,24 @@ Progress: [████░░░░░░] 40%
 `
   const p = parseStateProgress(state)
   expect(p).toBeDefined()
-  // "Plan 3 of 7" → completed ~2, total 7
+  // "Plan 3 of 7" in progress → completed ~2, total 7
   expect(p!.totalPlans).toBe(7)
   expect(p!.completedPlans).toBe(2)
   expect(p!.percent).toBe(40)
+})
+
+test('parseStateProgress Plan A of B treats complete status as A completed', () => {
+  const state = `# Project State
+
+Plan: 5 of 5 in current phase
+Status: Phase complete
+Progress: [██████████] 100%
+`
+  const p = parseStateProgress(state)
+  expect(p).toBeDefined()
+  expect(p!.totalPlans).toBe(5)
+  expect(p!.completedPlans).toBe(5)
+  expect(p!.percent).toBe(100)
 })
 
 test('parseStateProgress returns undefined on empty state', () => {

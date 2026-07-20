@@ -498,19 +498,32 @@ export function parseStateProgress(stateContent: string): GsdProgressDetail | un
   let percent = frontMatter ? readProgressInteger(frontMatter, 'percent') : null
 
   // Body fallbacks: "Plan: 2 of 5" / "Progress: 40%"
+  // Only used when frontmatter counters are missing. "Plan A of B" is a
+  // position line — treat A as completed when status says phase/plan complete,
+  // otherwise A-1 (in progress on plan A).
   if (totalPlans == null || completedPlans == null) {
     const planOf = stateContent.match(
       /Plan\s*[:：]\s*(\d+)\s+of\s+(\d+)/i,
     )
     if (planOf) {
-      if (completedPlans == null) {
-        // "Plan A of B" is current position; completed is usually A-1 when in progress
-        const current = Number.parseInt(planOf[1], 10)
-        completedPlans = Number.isFinite(current) ? Math.max(0, current - 1) : null
-      }
       if (totalPlans == null) {
         const total = Number.parseInt(planOf[2], 10)
         totalPlans = Number.isFinite(total) ? total : null
+      }
+      if (completedPlans == null) {
+        const current = Number.parseInt(planOf[1], 10)
+        if (Number.isFinite(current)) {
+          const statusLine = stateContent.match(
+            /(?:\*\*)?Status(?:\*\*)?\s*[:：]\s*(.+)$/im,
+          )
+          const statusText = statusLine?.[1]?.trim() ?? ''
+          const looksComplete =
+            /phase\s*complete|complete|completed|done|finished/i.test(statusText) ||
+            (totalPlans != null && current >= totalPlans && /100\s*%/.test(stateContent))
+          completedPlans = looksComplete
+            ? Math.min(current, totalPlans ?? current)
+            : Math.max(0, current - 1)
+        }
       }
     }
   }

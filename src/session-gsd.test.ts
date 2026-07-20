@@ -12,6 +12,7 @@ import {
   gsdContinueMayMutateStore,
   isGsdBareword,
   markGsdExecution,
+  noteGsdInjectIfAny,
   noteGsdUserMessage,
   onGsdContinue,
   onGsdPause,
@@ -203,6 +204,19 @@ describe('session GSD execution detection', () => {
     expect(s.gsdExecution).toBeNull()
   })
 
+  test('noteGsdInjectIfAny never clears ordinary text', () => {
+    const s = {
+      workDir: '/tmp/unused',
+      gsdExecution: {
+        taskSlug: 'wire-panel',
+        source: 'inject' as const,
+        at: 1,
+      },
+    } as unknown as Session
+    noteGsdInjectIfAny(s, '被 agy 挡住的闲聊')
+    expect(s.gsdExecution?.taskSlug).toBe('wire-panel')
+  })
+
   test('mark/clear helpers', () => {
     const s = { gsdExecution: null } as Session
     markGsdExecution(s, '  abc  ', 'message')
@@ -374,5 +388,37 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
     expect(injectCalls.length).toBe(1)
     expect(injectCalls[0]).toContain('[Lodestar GSD]')
     expect(s.gsdExecution?.taskSlug).toBe(created.taskSlug)
+  })
+
+  test('continue inject failure clears gsdExecution', async () => {
+    const created = createAndActivateTask(root, 'Inject Fail')
+    const s = {
+      workDir: root,
+      sessionName: 't',
+      gsdPanelGen: 'gen-1',
+      gsdAwaitingNameUntil: 0,
+      gsdPanelMessageId: '',
+      gsdExecution: null,
+      currentTurn: null,
+      openingTurn: null,
+      pendingUserMessageCount: 0,
+      pendingMidTurnMsgs: [],
+      isRunning: () => true,
+      currentProvider: () => 'claude' as const,
+      clearStaleIdleQueueState() {},
+      async onUserMessage() {
+        throw new Error('open turn failed')
+      },
+    } as unknown as Session
+
+    const result = await onGsdContinue(s, '', null)
+    expect(result.ok).toBe(true)
+    // fire-and-forget: allow microtask rejection handler to run
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(s.gsdExecution).toBeNull()
+    // disk may remain 运行中 after continue path; marker must not stick
+    expect(readGsdSnapshot(root).status).toBe('运行中')
+    expect(created.taskSlug).toBeTruthy()
   })
 })
