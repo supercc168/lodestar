@@ -25,6 +25,11 @@ export type GsdActionResult = {
   card?: object
 }
 
+/** Cancel awaiting_name capture (timeout / control command / bare gsd / successful consume). */
+export function clearGsdAwaitingName(s: Session): void {
+  s.gsdAwaitingNameUntil = 0
+}
+
 /** Bareword: `gsd` or `gsd status` (case-insensitive). */
 export function isGsdBareword(raw: string): boolean {
   return /^gsd(?:\s+status)?$/i.test(raw.trim())
@@ -210,19 +215,28 @@ export async function onGsdContinue(
 
     ensureBridge(s.workDir, snap.taskSlug)
 
-    // Invalidate panel gen before await inject so a second click with the old
+    // Invalidate panel gen before inject so a second click with the old
     // gen fails validatePanelGen (anti double-continue / double-inject).
     bumpGsdPanelGen(s)
 
     // Continue supersedes name capture; never treat the inject template as a name.
-    s.gsdAwaitingNameUntil = 0
+    clearGsdAwaitingName(s)
     const prompt = buildGsdInjectPrompt({
       action: 'continue',
       taskSlug: snap.taskSlug,
       taskName: snap.taskName || snap.taskSlug,
       provider: s.currentProvider(),
     })
-    await s.onUserMessage(prompt)
+    // Non-blocking inject: after validation / busy / resume / bridge, fire
+    // onUserMessage and return the card immediately so Feishu ACK is not
+    // blocked on cold-start / openTurnCard latency. Residual risk: inject
+    // failure is only logged (store already resumed); prefer low ACK latency
+    // over awaiting full turn open. Matches daemon toast-first long-ops
+    // (fork/back/resume). Create-task path still awaits (needs inject outcome
+    // for re-arm awaiting on failure).
+    void s.onUserMessage(prompt).catch(e => {
+      log(`session "${s.sessionName}": gsd continue inject failed: ${messageOf(e)}`)
+    })
     return resultWithCard(s, true, '已注入')
   } catch (e) {
     const message = `继续失败: ${messageOf(e)}`
@@ -311,12 +325,14 @@ export async function maybeConsumeGsdTaskName(s: Session, text: string): Promise
   // Internal inject templates (and accidental re-entry) must reach the agent.
   if (name.startsWith('[Lodestar GSD]')) return false
   // Control barewords and nested gsd commands should not become task names.
+  // (Primary path: session-commands clears awaiting when the control is
+  // consumed; this is a belt-and-suspenders for gsd if it ever lands here.)
   if (isGsdBareword(name)) {
-    s.gsdAwaitingNameUntil = 0
+    clearGsdAwaitingName(s)
     return false
   }
 
-  s.gsdAwaitingNameUntil = 0
+  clearGsdAwaitingName(s)
 
   try {
     clearStaleIdleQueueIfSafe(s, 'gsd_new_task_name')

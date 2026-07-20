@@ -7,6 +7,7 @@ import {
   GSD_BUSY_MSG,
   GSD_PANEL_STALE_MSG,
   bumpGsdPanelGen,
+  clearGsdAwaitingName,
   gsdContinueMayMutateStore,
   isGsdBareword,
   onGsdContinue,
@@ -90,6 +91,20 @@ describe('bumpGsdPanelGen anti double-continue', () => {
     expect(next).not.toBe(old)
     expect(validatePanelGen(s, old)).toEqual({ ok: false, message: GSD_PANEL_STALE_MSG })
     expect(validatePanelGen(s, next)).toBeNull()
+  })
+})
+
+describe('clearGsdAwaitingName', () => {
+  test('sets gsdAwaitingNameUntil to 0', () => {
+    const s = { gsdAwaitingNameUntil: Date.now() + 300_000 } as Session
+    clearGsdAwaitingName(s)
+    expect(s.gsdAwaitingNameUntil).toBe(0)
+  })
+
+  test('is idempotent when already 0', () => {
+    const s = { gsdAwaitingNameUntil: 0 } as Session
+    clearGsdAwaitingName(s)
+    expect(s.gsdAwaitingNameUntil).toBe(0)
   })
 })
 

@@ -1,6 +1,7 @@
 import type { Session } from './session'
 import * as feishu from './feishu'
 import { log } from './log'
+import { clearGsdAwaitingName } from './session-gsd'
 
 type ControlCommand = 'hi' | 'stop' | 'kill' | 'restart' | 'clear' | 'compact' | 'model'
 
@@ -13,6 +14,25 @@ const CONTROL_COMMAND_ALIASES = new Map<string, ControlCommand>([
   ['compact', 'compact'], ['cm', 'compact'],
   ['model', 'model'], ['md', 'model'],
 ])
+
+/**
+ * True when `raw` is a reserved control bareword (or wt/agy with args) that
+ * runCommand will consume. Used so awaiting_name is cancelled before the
+ * control side-effects run.
+ */
+function isControlCommandText(raw: string): boolean {
+  const t = raw.trim()
+  if (!t) return false
+  if (/^(?:wt|worktree)(?:\s+.*)?$/i.test(t)) return true
+  if (/^btw$/i.test(t)) return true
+  if (/^bye$/i.test(t)) return true
+  if (/^(?:fk|fork)$/i.test(t)) return true
+  if (/^(?:bk|back)$/i.test(t)) return true
+  if (/^agy(?:\s+[\s\S]*)?$/i.test(t)) return true
+  if (t.toLowerCase() === 'task') return true
+  if (/^gsd(?:\s+status)?$/i.test(t)) return true
+  return CONTROL_COMMAND_ALIASES.has(t.toLowerCase())
+}
 
 /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
  * plus their two-letter aliases where applicable.
@@ -28,6 +48,13 @@ const CONTROL_COMMAND_ALIASES = new Map<string, ControlCommand>([
  * Codex's native type-ahead behavior) — explicit barge-out
  * needed a knob and `kill` (full subprocess teardown) is too heavy. */
 export async function runCommand(s: Session, raw: string, userOpenId = ''): Promise<boolean> {
+  // Spec: explicit non-task control commands cancel awaiting_name.
+  // Daemon routes controls here before onUserMessage / maybeConsumeGsdTaskName,
+  // so clear on every consumed control (including bare `gsd` panel open).
+  if (isControlCommandText(raw)) {
+    clearGsdAwaitingName(s)
+  }
+
   const wt = raw.trim().match(/^(?:wt|worktree)(?:\s+(.+))?$/i)
   if (wt) {
     if (s.startingAgy || s.runningAgy) {

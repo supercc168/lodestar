@@ -1,6 +1,7 @@
 import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { execSync } from 'node:child_process'
+import { createHash } from 'node:crypto'
 import {
   type BridgeHealth,
   ensureTaskPlanningDir,
@@ -418,6 +419,12 @@ function normalizeStatus(raw: string): GsdTaskStatus {
   return '无任务'
 }
 
+/**
+ * Stable task-dir slug from a display name.
+ * - Prefer ASCII/latin/digits (kebab-case) when present.
+ * - Pure CJK / non-latin names fall back to `t-` + sha1 hex prefix so
+ *   distinct Chinese names don't all collide on `task` / `task-2`.
+ */
 export function slugifyTaskName(name: string): string {
   const nfkd = name.normalize('NFKD').replace(/[̀-ͯ]/g, '')
   const lowered = nfkd.toLowerCase()
@@ -426,7 +433,10 @@ export function slugifyTaskName(name: string): string {
     .replace(/[^a-z0-9]+/g, '-')
     .replace(/^-+|-+$/g, '')
     .replace(/-+/g, '-')
-  if (!slug) slug = 'task'
+  if (!slug) {
+    const hash = createHash('sha1').update(name).digest('hex').slice(0, 8)
+    return `t-${hash}`
+  }
   return slug
 }
 

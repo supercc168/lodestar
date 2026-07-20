@@ -39,6 +39,21 @@ afterEach(() => rmSync(root, { recursive: true, force: true }))
 
 test('slugifyTaskName kebab', () => {
   expect(slugifyTaskName('Watchdog 恢复 边界')).toMatch(/^[a-z0-9]+(-[a-z0-9]+)*$/)
+  expect(slugifyTaskName('Watchdog 恢复 边界')).toBe('watchdog')
+  expect(slugifyTaskName('Hello World')).toBe('hello-world')
+})
+
+test('slugifyTaskName pure CJK uses stable t- hash slug', () => {
+  const a = slugifyTaskName('飞书面板恢复')
+  const b = slugifyTaskName('任务跟踪优化')
+  expect(a).toMatch(/^t-[0-9a-f]{8}$/)
+  expect(b).toMatch(/^t-[0-9a-f]{8}$/)
+  expect(a).not.toBe(b)
+  // Same name → same slug (collision-resistant identity, not random).
+  expect(slugifyTaskName('飞书面板恢复')).toBe(a)
+  // Must not collapse pure CJK to generic `task`.
+  expect(a).not.toBe('task')
+  expect(b).not.toBe('task')
 })
 
 test('createAndActivateTask sets running and bridge', () => {
