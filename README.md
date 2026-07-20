@@ -79,6 +79,7 @@ lodestar-setup
 | `clear` / `cl` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
 | `compact` / `cm` | 主动触发当前 thread 的上下文压缩,完成后状态卡收束 |
 | `model` / `md` | 展示四个固定档位(Claude·Fable 5 / Opus 4.8 / GLM · Codex·GPT-5.5),一键生效,按群持久化 |
+| `gsd` | 打开 GSD 状态卡(进度/继续/暂停/完成/新任务);跟随当前 model,规划只走 yiui-gsd |
 | `task` | 打开项目任务清单面板,启用飞书任务清单自动化（预览版） |
 
 **并发 worktree 群**
