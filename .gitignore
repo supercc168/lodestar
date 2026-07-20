@@ -8,13 +8,13 @@ node_modules/
 # Local IDE state
 .serena/
 
-# OMC operational state (oh-my-claudecode runtime artifacts)
+# Legacy OMC operational state (if recreated)
 .omc/
 
 # Claude Code operational state (worktrees, local settings)
 .claude/
 
-# Codex/Superpowers isolated worktrees
+# Isolated worktrees
 .worktrees/
 
 # Local override config (if dropped in repo for testing)
@@ -26,3 +26,12 @@ config.toml
 
 # Build outputs
 dist/
+
+# GSD multi-task local repo (independent git; not part of project history)
+.gsd/
+
+# Legacy superpowers local runtime/artifacts
+.superpowers/
+
+# macOS junk under agents
+.agents/.DS_Store
