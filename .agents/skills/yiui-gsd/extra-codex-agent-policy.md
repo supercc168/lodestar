@@ -10,11 +10,11 @@
 
 ## 应用与验证
 
-在项目根或任意目录执行：
+在项目根或任意目录执行（Node.js >= 18；不依赖 pwsh）：
 
-```powershell
-powershell -NoProfile -ExecutionPolicy Bypass -File .agents/skills/yiui-gsd/scripts/apply-codex-agent-policy.ps1
-powershell -NoProfile -ExecutionPolicy Bypass -File .agents/skills/yiui-gsd/scripts/apply-codex-agent-policy.ps1 -VerifyOnly
+```bash
+node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs apply-agent-policy
+node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs apply-agent-policy --verify-only
 ```
 
 脚本负责：
@@ -25,7 +25,7 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .agents/skills/yiui-gsd/scri
 - 按官方 catalog 重放 `~/.codex/agents/gsd-*.toml`，移除 `service_tier="flex"`。
 - 修改前备份 defaults 与发生变化的 agent TOML。
 
-首次启用、GSD 安装/更新后、或 `-VerifyOnly` 报告漂移时执行应用模式。不要逐个手改生成文件。
+首次启用、GSD 安装/更新后、或 `--verify-only` 报告漂移时执行应用模式。不要逐个手改生成文件。旧的 `.ps1` 入口会转发到同一个 Node helper。
 
 ## 并行与上下文隔离
 

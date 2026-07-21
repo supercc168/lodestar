@@ -13,10 +13,10 @@ GSD hooks 与 workflow 硬编码项目根 `.planning/`。多任务 canonical 数
 
 ## 推荐脚本
 
-使用本 skill 的 `scripts/switch-active-task.ps1`，在项目根目录执行：
+使用本 skill 的 Node helper，在项目根目录执行（Windows 也可继续调用同名 `.ps1` 包装层）：
 
-```powershell
-powershell -ExecutionPolicy Bypass -File ".agents/skills/yiui-gsd/scripts/switch-active-task.ps1" -TaskSlug "client-quest-system"
+```bash
+node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs switch-active-task --task-slug client-quest-system --project-root .
 ```
 
 脚本会按平台选择 symlink 或 junction，并拒绝覆盖真实的非链接 `.planning` 目录。

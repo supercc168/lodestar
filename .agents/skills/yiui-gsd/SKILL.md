@@ -36,13 +36,13 @@ et-* / yiui-* 硬规则 > yiui-gsd 流程编排 > 原生 gsd-* 执行
 
 ## 默认流程
 
-1. **首次使用前**：若不存在 `.gsd/.git`，执行本 skill 同目录下 `scripts/init-gsd-repo.ps1`（在项目根目录运行）。
+1. **首次使用前**：若不存在 `.gsd/.git`，在项目根执行 `node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs init-gsd-repo --project-root .`。PowerShell 文件仅是兼容包装层。
 2. **每次 GSD 相关操作前**：读取 `.gsd/TRACKER.md`，确认当前活跃任务与状态。
    - 当前会话暴露 `update_plan` 时，紧接着执行“Codex App 原生计划镜像”同步；App 计划栏不得成为第二状态源。
 3. **识别用户白话意图**：对照本 skill 同目录下 `extra-phrase-map.md` 路由到具体动作。
-4. **需要切换活跃任务时**：执行 `scripts/switch-active-task.ps1 -TaskSlug <slug>`（在项目根目录运行）。
+4. **需要切换活跃任务时**：在项目根执行 `node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs switch-active-task --task-slug <slug> --project-root .`。
 5. **执行底层 GSD 命令**：由 agent 内部调用对应 `$gsd-*` skill，**禁止**要求用户手写 `$gsd-*`；向用户用中文回报阶段名（如「正在进入计划阶段」）。
-6. **变更 TRACKER / TASK.md 后**：执行 `scripts/gsd-local-commit.ps1 -Message "<message>"` 提交到 `.gsd` 本地 git。
+6. **变更 TRACKER / TASK.md 后**：在项目根执行 `node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs gsd-local-commit --message "<message>" --project-root .` 提交到 `.gsd` 本地 git。
 
 ## Codex 子 agent 质量与存活策略
 
@@ -73,8 +73,8 @@ Codex App 的计划栏是 GSD 状态的**只读镜像**，不属于 GSD canonica
 
 1. 在项目根执行本 skill 同目录下：
 
-   ```powershell
-   powershell -NoProfile -ExecutionPolicy Bypass -File .agents/skills/yiui-gsd/scripts/render-codex-plan.ps1 -ProjectRoot (Get-Location).Path
+   ```bash
+   node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs render-codex-plan --project-root .
    ```
 
 2. 解析脚本输出的 JSON；若当前会话存在 `update_plan`，将 `plan` 数组原样传给 `update_plan`，并使用输出的 `explanation`。
@@ -104,9 +104,9 @@ Codex App 的计划栏是 GSD 状态的**只读镜像**，不属于 GSD canonica
 1. 从用户白话提取任务名称，生成 `task-slug`（小写 kebab-case；冲突追加 `-2`、`-3`…）。规则见 `extra-tracker-schema.md`。
 2. 创建 `.gsd/{task-slug}/TASK.md` 与空目录 `.gsd/{task-slug}/.planning/`。
 3. 若已有「运行中」任务，先将其 TASK.md 与 TRACKER 索引标为「已暂停」。
-4. 运行 `switch-active-task.ps1` 指向新任务。
+4. 运行 `node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs switch-active-task --task-slug <slug> --project-root .` 指向新任务。
 5. 更新 `TRACKER.md`（状态=运行中，阶段=unknown 或 discuss）。
-6. `gsd-local-commit.ps1` 提交。
+6. `node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs gsd-local-commit --message "gsd(<slug>): 创建任务" --project-root .` 提交。
 7. 成熟老项目首次建立 GSD planning workspace 时优先执行 `$gsd-onboard`；只需要刷新代码图谱时执行 `$gsd-map-codebase`；已有完整 planning 基线时进入 `$gsd-discuss-phase 1` 并附带用户描述。
 
 ## 创建 AutoUI 任务（GSD 专用分支）
@@ -116,7 +116,7 @@ Codex App 的计划栏是 GSD 状态的**只读镜像**，不属于 GSD canonica
 > AutoUI 不是独立于 GSD 的另一套编排，而是 GSD 上叠加的 UI 专用规则；只要用户说“执行 AutoUI / 用 AUTOUI 做 / 做这个 UI”，即使没有明确说“长任务”或“注意上下文压缩”，也按长任务处理。
 
 1. 生成 `task-slug`（建议含 `-autoui`）。
-2. **仅**执行 `scripts/bootstrap-autoui-task.ps1 -TaskSlug … -TaskName … -UserBrief …`（脚本原子完成：暂停旧运行中任务、TASK、evidence/milestones/notes、PROJECT 种子、TRACKER、planning bridge、`.gsd` commit）。
+2. **仅**执行 `node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs bootstrap-autoui-task --task-slug … --task-name … --user-brief … --project-root .`（命令原子完成：暂停旧运行中任务、TASK、evidence/milestones/notes、PROJECT 种子、TRACKER、planning bridge、`.gsd` commit）。
 3. 叠加 [`yiui-auto-ui`](../yiui-auto-ui/SKILL.md)：**discuss 必须先跑完 [`extra-ui-spec-intake.md`](../yiui-auto-ui/extra-ui-spec-intake.md)**，再读 strategies / learnings。
 4. `$gsd-discuss-phase 1`。
 
@@ -136,7 +136,7 @@ Codex App 的计划栏是 GSD 状态的**只读镜像**，不属于 GSD canonica
 
 1. 固定收口顺序：实现完成 → 阻断级审查收敛 → 冻结范围 → 最终验收一次 → 完成。
 2. 进入收口前，按 `extra-finalization-gate.md` 在活跃 `STATE.md` 维护 `finalization`；缺字段不得靠聊天上下文补猜。
-3. 最终验收前执行 `scripts/assert-finalization-gate.ps1`。只有审查代际等于变更代际、范围已冻结且阻断项为零才允许继续。
+3. 最终验收前执行 `node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs assert-finalization-gate --state-path .planning/STATE.md`。只有审查代际等于变更代际、范围已冻结且阻断项为零才允许继续。
 4. 一个单调子游标内的交付物变更批次只增加一次 `change_generation`。产生新变化后，旧审查与旧终验自动失效；修复终验失败也必须进入新代际。
 5. 只有违反当前 `TASK.md` 完成标准的 Critical / Important 才阻断。Moderate / Minor、额外强化与范围外改进进入延后清单。
 6. GREEN / 已验证只能凭新鲜、可复现失败证据重开，并记录 `reopen_reason`。一次最终审查新增超过 3 个独立阻断项时，暂停当前收口并拆分新 GSD。
@@ -159,7 +159,7 @@ Windows / pwsh：`install/yiui-gsd/install.ps1` 与 `verify.ps1`。可选 `--cha
 2. 首次安装或全局 `$gsd-update` 不存在时，优先用仓库 `install/yiui-gsd/install.sh`（或 `.ps1`）；也可直接 `npx --yes @opengsd/gsd-core@next --codex --global`（稳定版把 `@next` 改为 `@latest`）。
 3. 已安装时，稳定版执行 `$gsd-update`；用户明确要求 1.7 RC/最新版预发布时执行 `$gsd-update --next`。
 4. 更新后验证 `~/.agents/skills/gsd-*`、`~/.codex/gsd-core/`、`~/.codex/agents/gsd-*` 和 hooks，确认项目 `.agents/skills/` 下没有官方 `gsd-*`；也可用 `bash install/yiui-gsd/verify.sh`。
-5. 执行 `scripts/apply-codex-agent-policy.ps1`，再用 `-VerifyOnly` 复验模型、推理强度与 Flex 清理结果；生成文件只允许由该脚本幂等重放，禁止手工逐个维护。
+5. 执行 `node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs apply-agent-policy`，再用 `--verify-only` 复验模型、推理强度与 Flex 清理结果；生成文件只允许由该命令幂等重放，禁止手工逐个维护。
 6. 对照新版命令更新本 skill 的白话映射；不得直接维护安装器生成的官方 `gsd-*` 文件。
 7. Codex 需要在新任务中重新发现全局 skills；当前任务只做文件与配置验证，不把“文件已安装”等同于“当前任务已热加载”。
 

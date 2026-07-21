@@ -93,6 +93,8 @@ pwsh -NoProfile -File install/yiui-gsd/install.ps1
 bash install/yiui-gsd/verify.sh           # 装完校验
 ```
 
+安装器默认用 Node.js >= 18 重放并校验 Codex 子 agent 策略，不依赖 macOS 的 `pwsh`；`pwsh` 入口仅保留给 Windows 或旧脚本调用。
+
 说明与参数见 [`install/yiui-gsd/README.md`](install/yiui-gsd/README.md)。Lodestar daemon 仍需 `bun run build` + 重启;飞书侧发 `gsd` 开状态卡。
 
 **并发 worktree 群**

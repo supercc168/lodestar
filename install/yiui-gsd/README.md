@@ -18,8 +18,9 @@
 
 - Node.js ≥ 18（`npx` 可用）
 - 网络可访问 npm
-- macOS / Linux：`bash`
-- Windows：PowerShell 5+ 或 `pwsh`；可选装 PowerShell 以便跑 agent policy 脚本
+- macOS / Linux：`bash` + Node.js ≥ 18
+- Windows：Node.js ≥ 18；若使用 `.ps1` 安装入口还需要 PowerShell 5+ 或 `pwsh`
+- agent policy、计划投影和任务 bridge 的实际逻辑由 `scripts/yiui-gsd.mjs` 提供，不依赖 PowerShell
 
 ## 用法
 
@@ -47,7 +48,8 @@ pwsh -NoProfile -File install/yiui-gsd/verify.ps1
 | `--channel next` | 预发布 / 1.7 RC 通道 |
 | `--skip-core` | 不跑 `@opengsd/gsd-core`，只补项目入口 |
 | `--init-gsd` | 在 lodestar 根初始化 `.gsd` 本地任务仓 |
-| `--apply-agent-policy` | 安装后重放 Codex 子 agent 策略（需 `pwsh`） |
+| `--apply-agent-policy` | 兼容旧命令；策略现在默认自动重放 |
+| `--skip-agent-policy` | 跳过策略重放（仅在明确需要时使用） |
 | `--project <path>` | 额外把 `yiui-gsd` 接到另一个项目目录 |
 | `--yes` / `-y` | 非交互（已有 core 时仍会按通道重装/更新） |
 
@@ -55,7 +57,7 @@ pwsh -NoProfile -File install/yiui-gsd/verify.ps1
 
 ```bash
 # 对齐本机曾用的 1.7 next 通道，并初始化任务仓
-bash install/yiui-gsd/install.sh --channel next --init-gsd --apply-agent-policy
+bash install/yiui-gsd/install.sh --channel next --init-gsd
 
 # 只把 skill 接到 ~/work/foo（不重装全局 core）
 bash install/yiui-gsd/install.sh --skip-core --project ~/work/foo
@@ -73,6 +75,7 @@ bash install/yiui-gsd/install.sh --skip-core --project ~/work/foo
 - `~/.codex/gsd-core/VERSION` 存在
 - `~/.agents/skills` 下有多个 `gsd-*`
 - `~/.codex/agents` 下有 `gsd-*`
+- agent TOML 与 `model-catalog.json` 对齐（model、effort、无 `service_tier="flex"`）
 - 项目存在 `.agents/skills/yiui-gsd/SKILL.md`
 - `.claude/skills/yiui-gsd` 可解析到该 skill
 - 项目 `.agents/skills` **没有**官方 `gsd-*` 副本
@@ -82,3 +85,15 @@ bash install/yiui-gsd/install.sh --skip-core --project ~/work/foo
 - skill 正文：`.agents/skills/yiui-gsd/SKILL.md`
 - 飞书面板：`docs/开发与调试指南.md` §2.5
 - 设计：`docs/archive/specs/2026-07-20-yiui-gsd-feishu-stable-design.md`
+
+## 跨平台 helper
+
+日常 GSD 操作统一使用：
+
+```bash
+node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs <command> [options]
+```
+
+支持 `init-gsd-repo`、`switch-active-task`、`gsd-local-commit`、`render-codex-plan`、
+`apply-agent-policy`、`assert-finalization-gate`、`bootstrap-autoui-task` 和 `verify-install`。
+同名 `.ps1` 文件保留为 Windows/旧提示词的转发包装层。这样 macOS 上即使 PowerShell 启动缓存损坏，也不影响安装、策略校验或 GSD 状态操作。

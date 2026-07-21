@@ -50,15 +50,15 @@ finalization:
 4. 冻结 `TASK.md` 完成标准和剩余范围，设置 `scope_frozen: true`、`blocking_findings: 0`。
 5. 运行只读门禁：
 
-   ```powershell
-   pwsh ./.agents/skills/yiui-gsd/scripts/assert-finalization-gate.ps1
+   ```bash
+   node ./.agents/skills/yiui-gsd/scripts/yiui-gsd.mjs assert-finalization-gate --state-path .planning/STATE.md
    ```
 
 6. 门禁通过后，对当前代际运行一次最终验收。通过后增加 `final_verification_runs`，并将 `final_verified_generation` 设为当前 `change_generation`。
 7. 标记任务完成前再运行：
 
-   ```powershell
-   pwsh ./.agents/skills/yiui-gsd/scripts/assert-finalization-gate.ps1 -RequireCompleted
+   ```bash
+   node ./.agents/skills/yiui-gsd/scripts/yiui-gsd.mjs assert-finalization-gate --state-path .planning/STATE.md --require-completed
    ```
 
 ## 失败恢复

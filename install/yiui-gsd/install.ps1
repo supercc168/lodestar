@@ -1,14 +1,16 @@
 # Install GSD global runtime + ensure yiui-gsd project wiring after checkout.
 # Usage (from lodestar root or any cwd):
 #   pwsh -NoProfile -File install/yiui-gsd/install.ps1
-#   pwsh -NoProfile -File install/yiui-gsd/install.ps1 -Channel next -InitGsd -ApplyAgentPolicy
+#   pwsh -NoProfile -File install/yiui-gsd/install.ps1 -Channel next -InitGsd
 [CmdletBinding()]
 param(
     [ValidateSet('latest', 'next')]
     [string]$Channel = 'latest',
     [switch]$SkipCore,
     [switch]$InitGsd,
+    # Kept for command-line compatibility; policy is now applied by default.
     [switch]$ApplyAgentPolicy,
+    [switch]$SkipAgentPolicy,
     [string]$Project = '',
     [switch]$Yes
 )
@@ -28,9 +30,16 @@ $ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $Root = (Resolve-Path (Join-Path $ScriptDir '../..')).Path
 $SkillSrc = Join-Path $Root '.agents/skills/yiui-gsd'
 $ClaudeMdSrc = Join-Path $Root '.claude/CLAUDE.md'
+$Helper = Join-Path $SkillSrc 'scripts/yiui-gsd.mjs'
 
 if (-not (Test-Path (Join-Path $SkillSrc 'SKILL.md'))) {
     Die "not a lodestar checkout? missing $SkillSrc/SKILL.md"
+}
+if (-not (Test-Path $Helper)) {
+    Die "missing $Helper"
+}
+if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
+    Die 'missing command: node (Node.js >= 18 required)'
 }
 
 function Ensure-Dir([string]$Path) {
@@ -140,25 +149,21 @@ if (-not $SkipCore) {
 }
 
 if ($InitGsd) {
-    $initPs1 = Join-Path $SkillSrc 'scripts/init-gsd-repo.ps1'
-    if (-not (Test-Path $initPs1)) { Die "missing $initPs1" }
-    Push-Location $Root
-    try {
-        & pwsh -NoProfile -ExecutionPolicy Bypass -File $initPs1
-    } finally {
-        Pop-Location
-    }
+    & node $Helper 'init-gsd-repo' '--project-root' $Root
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 }
 
-if ($ApplyAgentPolicy) {
-    $policy = Join-Path $SkillSrc 'scripts/apply-codex-agent-policy.ps1'
-    if (-not (Test-Path $policy)) { Die "missing $policy" }
-    & pwsh -NoProfile -ExecutionPolicy Bypass -File $policy
-    & pwsh -NoProfile -ExecutionPolicy Bypass -File $policy -VerifyOnly
+if (-not $SkipAgentPolicy) {
+    & node $Helper 'apply-agent-policy'
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & node $Helper 'apply-agent-policy' '--verify-only'
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+} else {
+    Write-Log 'SkipAgentPolicy: not applying Codex agent policy'
 }
 
 Write-Log 'running verify'
-& pwsh -NoProfile -File (Join-Path $ScriptDir 'verify.ps1') -Root $Root
+& node $Helper 'verify-install' '--project-root' $Root
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
 Write-Log "done. Next: bun install && bun run build (for Lodestar daemon); use group command 'gsd' after daemon restart."

@@ -6,7 +6,7 @@ set -euo pipefail
 CHANNEL="latest"
 SKIP_CORE=0
 INIT_GSD=0
-APPLY_POLICY=0
+SKIP_AGENT_POLICY=0
 YES=0
 EXTRA_PROJECT=""
 
@@ -17,7 +17,8 @@ Usage: install/yiui-gsd/install.sh [options]
   --channel latest|next   GSD core dist-tag (default: latest)
   --skip-core             Skip npx @opengsd/gsd-core install
   --init-gsd              Init .gsd local task repo in lodestar root
-  --apply-agent-policy    Re-apply Codex agent policy (requires pwsh)
+  --apply-agent-policy    Accepted for compatibility; policy is applied by default
+  --skip-agent-policy     Skip Codex agent policy apply/verify
   --project <path>        Also wire yiui-gsd into another project
   --yes, -y               Non-interactive
   -h, --help              Show help
@@ -32,7 +33,8 @@ while [[ $# -gt 0 ]]; do
       ;;
     --skip-core) SKIP_CORE=1; shift ;;
     --init-gsd) INIT_GSD=1; shift ;;
-    --apply-agent-policy) APPLY_POLICY=1; shift ;;
+    --apply-agent-policy) shift ;;
+    --skip-agent-policy) SKIP_AGENT_POLICY=1; shift ;;
     --project)
       EXTRA_PROJECT="${2:-}"
       shift 2
@@ -81,7 +83,7 @@ wire_project() {
     else
       # Relative link when possible so the target project stays relocatable.
       local rel
-      if rel=$(python3 -c 'import os,sys; print(os.path.relpath(sys.argv[1], sys.argv[2]))' "$SKILL_SRC" "$project/.agents/skills" 2>/dev/null); then
+      if rel=$(node -e 'const fs = require("node:fs"); const path = require("node:path"); const target = fs.realpathSync(process.argv[1]); const from = fs.realpathSync(process.argv[2]); process.stdout.write(path.relative(from, target) || ".")' "$SKILL_SRC" "$project/.agents/skills" 2>/dev/null); then
         ln -sfn "$rel" "$skill_dst"
       else
         ln -sfn "$SKILL_SRC" "$skill_dst"
@@ -126,63 +128,20 @@ install_core() {
 }
 
 init_gsd_repo() {
-  local init_ps1="$SKILL_SRC/scripts/init-gsd-repo.ps1"
-  [[ -f "$init_ps1" ]] || die "missing $init_ps1"
-  if command -v pwsh >/dev/null 2>&1; then
-    (cd "$ROOT" && pwsh -NoProfile -ExecutionPolicy Bypass -File "$init_ps1")
-  elif command -v powershell >/dev/null 2>&1; then
-    (cd "$ROOT" && powershell -NoProfile -ExecutionPolicy Bypass -File "$init_ps1")
-  else
-    # Minimal bash fallback (same shape as init-gsd-repo.ps1)
-    local gsd="$ROOT/.gsd"
-    mkdir -p "$gsd"
-    if [[ ! -f "$gsd/.gitignore" ]]; then
-      printf '%s\n' '# GSD sensitive config (may contain API keys)' '**/.planning/config.json' >"$gsd/.gitignore"
-    fi
-    if [[ ! -f "$gsd/TRACKER.md" ]]; then
-      cat >"$gsd/TRACKER.md" <<'EOF'
-# GSD 任务跟踪
-
-## 当前活跃任务
-
-- 状态：无任务
-- task_slug：
-- 任务名称：
-- 当前阶段：unknown
-- 最后更新：
-- planning_path：
-- 备注：
-
-## 任务索引
-
-| task_slug | 名称 | 状态 | 创建时间 | 最后更新 |
-|-----------|------|------|----------|----------|
-EOF
-    fi
-    if [[ ! -d "$gsd/.git" ]]; then
-      git -C "$gsd" init
-      git -C "$gsd" add .gitignore TRACKER.md
-      git -C "$gsd" commit -m 'init gsd task repo' || true
-    fi
-    log "initialized .gsd (bash fallback)"
-  fi
+  local helper="$SKILL_SRC/scripts/yiui-gsd.mjs"
+  [[ -f "$helper" ]] || die "missing $helper"
+  node "$helper" init-gsd-repo --project-root "$ROOT"
 }
 
 apply_policy() {
-  local script="$SKILL_SRC/scripts/apply-codex-agent-policy.ps1"
-  [[ -f "$script" ]] || die "missing $script"
-  if command -v pwsh >/dev/null 2>&1; then
-    pwsh -NoProfile -ExecutionPolicy Bypass -File "$script"
-    pwsh -NoProfile -ExecutionPolicy Bypass -File "$script" -VerifyOnly
-  elif command -v powershell >/dev/null 2>&1; then
-    powershell -NoProfile -ExecutionPolicy Bypass -File "$script"
-    powershell -NoProfile -ExecutionPolicy Bypass -File "$script" -VerifyOnly
-  else
-    die "--apply-agent-policy requires pwsh or powershell"
-  fi
+  local helper="$SKILL_SRC/scripts/yiui-gsd.mjs"
+  [[ -f "$helper" ]] || die "missing $helper"
+  node "$helper" apply-agent-policy
+  node "$helper" apply-agent-policy --verify-only
 }
 
 [[ -f "$SKILL_SRC/SKILL.md" ]] || die "not a lodestar checkout? missing $SKILL_SRC/SKILL.md"
+need_cmd node
 log "lodestar root: $ROOT"
 
 wire_project "$ROOT"
@@ -214,8 +173,10 @@ if [[ "$INIT_GSD" -eq 1 ]]; then
   init_gsd_repo
 fi
 
-if [[ "$APPLY_POLICY" -eq 1 ]]; then
+if [[ "$SKIP_AGENT_POLICY" -eq 0 ]]; then
   apply_policy
+else
+  log "skip-agent-policy: not applying Codex agent policy"
 fi
 
 log "running verify"

@@ -6,7 +6,7 @@
 
 | 用户白话（示例） | Skill 行为 | 底层 GSD（agent 内部） |
 |------------------|------------|------------------------|
-| 用 AUTOUI 做… / UI 全自动… / AUTOUI 开发… / 撤回文档后执行 AutoUI | 先按通用 GSD 创建/切换任务；若判定为 AutoUI，则**仅**用 `bootstrap-autoui-task.ps1` 建档，再叠加 `yiui-auto-ui` 跑完 extra-ui-spec-intake（四表+边界+≥1轮确认）→ strategies + learnings | `$gsd-discuss-phase 1` + 策划/描述 |
+| 用 AUTOUI 做… / UI 全自动… / AUTOUI 开发… / 撤回文档后执行 AutoUI | 先按通用 GSD 创建/切换任务；若判定为 AutoUI，则**仅**用 `node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs bootstrap-autoui-task …` 建档，再叠加 `yiui-auto-ui` 跑完 extra-ui-spec-intake（四表+边界+≥1轮确认）→ strategies + learnings | `$gsd-discuss-phase 1` + 策划/描述 |
 | 继续 AutoUI / 接着做 UI 任务 / 恢复 AutoUI | 同「继续 gsd」；确认 TASK 为 autoui；叠加 yiui-auto-ui 恢复自检 | `$gsd-progress --next` |
 | AutoUI 进度 / UI 任务到哪了 | 读 TRACKER+STATE+最近 SUMMARY/VERIFICATION | 可选 `$gsd-progress` |
 
