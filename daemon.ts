@@ -37,6 +37,7 @@ import {
 import { buildNotifyCardFromReg } from './src/notify'
 import { startNotifyServer } from './src/notify'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
+import { ensureImagegenSkill } from './src/imagegen-skill'
 import { startTasklistWorker } from './src/tasklist-worker'
 import { config } from './src/config'
 import { log } from './src/log'
@@ -1034,6 +1035,11 @@ async function boot(): Promise<void> {
   // notify server is up so the port number we bake into the skill
   // body matches what's actually listening.
   ensureFeishuNotifySkill()
+
+  // Sync imagegen skill (CLI-first, independent Images API channel) into
+  // ~/.claude/skills + ~/.codex/skills, and write the credential wrapper
+  // under DATA_DIR/bin/lodestar-imagegen. Orthogonal to chat model slots.
+  ensureImagegenSkill()
 
   // Auto-revive sessions that were running when we last went down.
   // Runs AFTER the WS is up so any 🔁 revive message lands in the

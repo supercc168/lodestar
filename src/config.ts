@@ -13,6 +13,12 @@
  *   bind = "127.0.0.1"        # default 127.0.0.1 (loopback only)
  *   port = 9876               # default 9876
  *
+ *   [imagegen]                # optional independent Images API channel
+ *   api_key = "sk-..."
+ *   base_url = "https://..."  # optional OpenAI-compatible proxy
+ *   model = "gpt-image-2"     # optional default CLI model
+ *   enabled = "true"          # optional; default true iff api_key set
+ *
  * Loaded synchronously at import time; downstream modules read the
  * exported `config` object directly.
  */
@@ -78,6 +84,25 @@ export interface LodestarConfig {
   /** Per-project launch profiles keyed by session name (= group name).
    * Empty record ⇒ every project runs with Lodestar defaults. */
   projects: Record<string, ProjectProfile>
+  /**
+   * Independent image-generation channel for the bundled `imagegen` skill
+   * (CLI → OpenAI Images API). Orthogonal to chat `[codex.models.*]` /
+   * `[claude.models.*]` — main task model stays unchanged; agents call the
+   * skill/wrapper when they need a bitmap. See `src/imagegen-skill.ts`.
+   */
+  imagegen: ImagegenConfig
+}
+
+/** `[imagegen]` — optional independent Images API channel. */
+export interface ImagegenConfig {
+  /** Master switch. Default true when `api_key` is set, else false. */
+  enabled: boolean
+  /** OpenAI-compatible Images API base, e.g. `https://api.wuhen-ai.com`. */
+  baseUrl?: string
+  /** Bearer key for the Images API (injected only into the lodestar-imagegen wrapper). */
+  apiKey?: string
+  /** Default `--model` for the CLI (e.g. `gpt-image-2`). */
+  model: string
 }
 
 /** 第三方 Codex provider(OpenAI 兼容端点)接入配置,对应 `[codex.models.<slug>]`。
@@ -287,6 +312,25 @@ function loadConfig(): LodestarConfig {
   const claudeDefaultModel = t.claude?.default_model?.trim() || undefined
   // 原样存储;"auto" 与白名单校验在 settingSourcesFromProfile 处理(与项目级同一套解析)
   const claudeDefaultSettingSources = t.claude?.default_setting_sources?.trim() || undefined
+  // [imagegen] 可选 —— 独立 Images API 渠道(与聊天 model 档正交)。
+  const imagegenSection = t.imagegen ?? {}
+  const imagegenApiKey = typeof imagegenSection.api_key === 'string' ? imagegenSection.api_key.trim() : ''
+  const imagegenBaseUrl = typeof imagegenSection.base_url === 'string' ? imagegenSection.base_url.trim() : ''
+  const imagegenModelRaw = typeof imagegenSection.model === 'string' ? imagegenSection.model.trim() : ''
+  const imagegenEnabledRaw = typeof imagegenSection.enabled === 'string' ? imagegenSection.enabled.trim() : ''
+  // 显式 enabled=false 关闭;显式 true 开启;缺省 = 有 api_key 才开。
+  const imagegenEnabled =
+    imagegenEnabledRaw === 'false' || imagegenEnabledRaw === '0'
+      ? false
+      : imagegenEnabledRaw === 'true' || imagegenEnabledRaw === '1'
+        ? true
+        : imagegenApiKey.length > 0
+  const imagegen: ImagegenConfig = {
+    enabled: imagegenEnabled,
+    baseUrl: imagegenBaseUrl || undefined,
+    apiKey: imagegenApiKey || undefined,
+    model: imagegenModelRaw || 'gpt-image-2',
+  }
   return {
     feishu: { app_id: appId, app_secret: appSecret },
     runtime: { projects_root: projectsRoot },
@@ -307,6 +351,7 @@ function loadConfig(): LodestarConfig {
       models: claudeModelSections(),
     },
     projects: projectSections(),
+    imagegen,
   }
 }
 
