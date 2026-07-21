@@ -69,7 +69,7 @@ function claudeConfigDir(): string {
  * ANTHROPIC_* —— 那是 Claude CLI 注入给子进程的;这里从文件读才是真相源。
  * 读不到(文件缺失/解析失败)返回空 record,调用方按 no_credentials 处理。
  */
-function readClaudeSettingsEnv(): Record<string, string> {
+export function readClaudeSettingsEnv(): Record<string, string> {
   try {
     const raw = readFileSync(join(claudeConfigDir(), 'settings.json'), 'utf8')
     const env = JSON.parse(raw)?.env

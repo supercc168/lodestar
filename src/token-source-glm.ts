@@ -14,7 +14,7 @@ import {
   scrubAnthropicEnv,
   registerTokenSourceFactory,
 } from './token-source'
-import { fetchGlmUsage, type GlmUsageSnapshot, type GlmUsageWindow, type GlmMonthlyWindow } from './glm-usage'
+import { fetchGlmUsage, readClaudeSettingsEnv, type GlmUsageSnapshot, type GlmUsageWindow, type GlmMonthlyWindow } from './glm-usage'
 import { fetchGlmModels } from './token-source-models'
 import { log } from './log'
 
@@ -58,8 +58,17 @@ registerTokenSourceFactory({
   kind: 'glm-coding-plan',
   configSectionId: 'glm',
   build: (cfg: TokenSourceConfig): TokenSource => {
-    const baseUrl = cfg.base_url?.trim() || ''
-    const token = cfg.auth_token?.trim() || ''
+    // 兼容:config.toml 没配 [token_source.glm] 时,若 ~/.claude/settings.json 的 env
+    // 配的是 GLM 平台(base_url 含 bigmodel.cn/api.z.ai),fallback 借它的凭据启用本
+    // source —— 让早期靠 settings.json env 裸跑 GLM 的机器也能被 lodestar 统一管理
+    // (models/usage/切换)。优先级 config.toml > settings.json env;非 GLM provider
+    // (真 Anthropic 等)不会被误吞。关联 readClaudeSettingsEnv(glm-usage.ts)。
+    const se = readClaudeSettingsEnv()
+    const envBaseUrl = se.ANTHROPIC_BASE_URL?.trim() ?? ''
+    const envToken = se.ANTHROPIC_AUTH_TOKEN?.trim() ?? ''
+    const envIsGlm = envBaseUrl.includes('bigmodel.cn') || envBaseUrl.includes('api.z.ai')
+    const baseUrl = cfg.base_url?.trim() || (envIsGlm ? envBaseUrl : '')
+    const token = cfg.auth_token?.trim() || (envIsGlm ? envToken : '')
     const enabled = !!(baseUrl && token)
     const ts: TokenSource = {
       id: 'glm',
