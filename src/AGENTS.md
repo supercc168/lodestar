@@ -45,6 +45,7 @@
 | `notify.ts` | 本机 HTTP 通知服务，接收 `{project, text, title?, level?, images?, buttons?, callback?}` 并发送飞书 markdown 卡片；`buttons` 把卡片变成交互卡 —— `callback` 在则点击时 push 给调用方 loopback 服务，不在则 `GET /notify/result/<notify_id>` pull 取结果。 |
 | `notify-callbacks.ts` | `/notify` 交互按钮的注册表与回调分发：持久化 `notify_id → callback URL + 原始卡片参数` 到 `notify-callbacks.json`(7 天 TTL)；`callback` 在时把 `{notify_id, button, operator, …}` POST 到调用方 loopback URL(2.5s 超时)，失败显式暴露不兜底；`buildNotifyResult` 供 pull 端点输出裁决；in-memory `dispatching` Set 做两阶段点击的并发护栏(仅内存,restart 清零)。 |
 | `notify-skill.ts` | 在本机 Codex(`~/.codex/skills/`)和 Claude Code(`~/.claude/skills/`)两个 skills 目录生成/维护 Feishu notify 技能说明;两侧同源、幂等覆盖。 |
+| `imagegen-skill.ts` | 同步独立生图 skill 到 `~/.claude/skills/imagegen` + `~/.codex/skills/imagegen`,并写 `DATA_DIR/bin/lodestar-imagegen` 凭据包装器;`[imagegen]` 与聊天 model 档正交。CLI 优先(非 Codex 内置 `image_gen`)。 |
 | `instructions.ts` | 注入给每个 Codex thread 的 channel developer instructions。 |
 | `setup.ts` | 交互式首次配置向导；安装/检查 Codex、校验 Feishu 凭据和 `wt` 所需群权限、写 `config.toml` 并拉起 daemon。 |
 | `setup-cli.ts` | `lodestar-setup` 入口。 |

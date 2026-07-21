@@ -225,6 +225,22 @@ watchdog_mode = 'off'              # 单项目覆盖(off / warn / recover_once)
 
 **从 GLM 迁移过来时**:`~/.claude/settings.json` 或 `[claude.env]` 里遗留的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 必须清掉 —— base URL 指向 GLM 时流量不经官方域名,reclaude 的拦截不会生效,烧的还是 GLM 额度。同时把 `[claude] default_model` 改回官方档位(或删掉,默认即 Fable 5);`[claude.models.glm]` 档位可保留但别设成默认。
 
+### 🖼️ 独立生图渠道 (`imagegen` skill)
+
+主对话继续用 Claude / GLM / 其它 Codex 档位;需要位图时 agent 调 **imagegen skill**,走单独的 Images API(与聊天 provider 正交)。daemon 每次启动会把 skill 同步到 `~/.claude/skills/imagegen` 与 `~/.codex/skills/imagegen`,并写凭据包装脚本 `~/.local/share/lodestar/bin/lodestar-imagegen`(mode `0700`,key 不进 agent 进程 env)。
+
+在 `~/.config/lodestar/config.toml` 增加:
+
+```toml
+[imagegen]
+api_key  = "sk-..."                       # 必填才启用
+base_url = "https://api.wuhen-ai.com"     # 可选;OpenAI 兼容中转
+model    = "gpt-image-2"                  # 可选;默认 gpt-image-2
+# enabled = "false"                       # 可选;有 key 时默认 true
+```
+
+改完后按文档重启 daemon。群里任意主模型下说「生成一张…图」即可;agent 应跑 `lodestar-imagegen generate ...`,成功后用 `[[send: /abs/path.png]]` 发到飞书。daemon 会在 `~/.local/share/lodestar/imagegen-venv` 自动建 venv 并安装 `openai`(只需系统有 `python3 -m venv`)。手改 skill 目录会被覆盖;设 `LODESTAR_DISABLE_SKILL_SYNC=1` 可跳过同步。实现见 [`src/imagegen-skill.ts`](src/imagegen-skill.ts),脚本源自 `skills/imagegen/`(Apache-2.0)。
+
 ### 🔔 HTTP 通知端点
 
 本机任意脚本一行 curl 就能往群里推一张 markdown 卡片:`info` / `warn` / `error` 三档染色,正文支持飞书 markdown,还能附本地图片、加交互按钮、把点击结果 POST 回你自己的回调。这条能力对应的 skill,daemon 每次启动会自动装进 `~/.claude/skills/` 和 `~/.codex/skills/`(不用自己放文件),完整字段、按钮和回调协议看 [`feishu-notify` skill](src/notify-skill.ts)。
