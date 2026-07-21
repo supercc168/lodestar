@@ -22,6 +22,7 @@
  *     OpenAI auth and leaking the image key into every Bash)
  */
 
+import { spawnSync } from 'node:child_process'
 import {
   chmodSync,
   copyFileSync,
@@ -319,40 +320,35 @@ export function ensureImagegenVenv(): boolean {
     if (!existsSync(py)) {
       log(`imagegen-skill: creating venv at ${venvDir}`)
       mkdirSync(dirname(venvDir), { recursive: true })
-      const created = Bun.spawnSync({
-        cmd: ['python3', '-m', 'venv', venvDir],
-        stdout: 'pipe',
-        stderr: 'pipe',
-      })
-      if (created.exitCode !== 0) {
+      // daemon 以 Node 运行(launchd → node dist/lodestar.js),不能用 Bun.spawnSync。
+      const created = spawnSync('python3', ['-m', 'venv', venvDir], { encoding: 'utf8' })
+      if (created.status !== 0) {
         log(
-          `imagegen-skill: venv create failed code=${created.exitCode}: ${created.stderr.toString().trim() || created.stdout.toString().trim()}`,
+          `imagegen-skill: venv create failed code=${created.status}: ${(created.stderr || created.stdout || '').toString().trim()}`,
         )
         return false
       }
     }
     // Always try to ensure openai is present (cheap if already installed).
-    const pip = Bun.spawnSync({
-      cmd: [py, '-m', 'pip', 'install', '--disable-pip-version-check', '-q', 'openai>=1.0'],
-      stdout: 'pipe',
-      stderr: 'pipe',
-    })
-    if (pip.exitCode !== 0) {
+    const pip = spawnSync(
+      py,
+      ['-m', 'pip', 'install', '--disable-pip-version-check', '-q', 'openai>=1.0'],
+      { encoding: 'utf8' },
+    )
+    if (pip.status !== 0) {
       log(
-        `imagegen-skill: pip install openai failed code=${pip.exitCode}: ${pip.stderr.toString().trim() || pip.stdout.toString().trim()}`,
+        `imagegen-skill: pip install openai failed code=${pip.status}: ${(pip.stderr || pip.stdout || '').toString().trim()}`,
       )
       return false
     }
-    const check = Bun.spawnSync({
-      cmd: [py, '-c', 'import openai; print(openai.__version__)'],
-      stdout: 'pipe',
-      stderr: 'pipe',
+    const check = spawnSync(py, ['-c', 'import openai; print(openai.__version__)'], {
+      encoding: 'utf8',
     })
-    if (check.exitCode !== 0) {
-      log(`imagegen-skill: openai import check failed: ${check.stderr.toString().trim()}`)
+    if (check.status !== 0) {
+      log(`imagegen-skill: openai import check failed: ${(check.stderr || '').toString().trim()}`)
       return false
     }
-    log(`imagegen-skill: venv ok openai=${check.stdout.toString().trim()} py=${py}`)
+    log(`imagegen-skill: venv ok openai=${(check.stdout || '').toString().trim()} py=${py}`)
     return true
   } catch (e) {
     log(`imagegen-skill: venv bootstrap error: ${e}`)
