@@ -5,14 +5,15 @@ import { agentProviderLabel } from './agent-process'
 import { log } from './log'
 import { messageOf } from './session-util'
 import {
-  completeActiveTask,
+  completeGsdTask,
   createAndActivateTask,
-  pauseActiveTask,
+  pauseGsdTask,
   readGsdSnapshot,
-  resumeActiveTask,
+  resumeGsdTask,
+  selectGsdTask,
   type GsdSnapshot,
 } from './gsd-store'
-import { planningHealth, switchActivePlanning } from './gsd-bridge'
+import { ensureWorkstreamRoute, planningHealth } from './gsd-bridge'
 import {
   buildGsdInjectPrompt,
   isGsdInjectPrompt,
@@ -70,10 +71,14 @@ export function noteGsdUserMessage(
   if (isGsdInjectPrompt(text)) {
     const slug =
       parseGsdInjectTaskSlug(text) ||
+      s.gsdSelectedTaskSlug ||
       readGsdSnapshot(s.workDir).taskSlug ||
       s.gsdExecution?.taskSlug ||
       ''
-    if (slug) markGsdExecution(s, slug, 'inject')
+    if (slug) {
+      s.gsdSelectedTaskSlug = slug
+      markGsdExecution(s, slug, 'inject')
+    }
     return
   }
   if (opts?.startsOwnTurn) {
@@ -89,7 +94,7 @@ export function noteGsdInjectIfAny(s: Session, text: string): void {
 
 /**
  * Fine progress (plan bar / cursor) is shown only when:
- * 1. disk active task is 运行中, and
+ * 1. the session-selected disk task is 运行中, and
  * 2. this session is marked as executing that same task (gsdExecution).
  */
 export function shouldShowGsdProgress(
@@ -152,9 +157,10 @@ export function parseGsdTextCommand(raw: string): GsdTextCommand | null {
 export const GSD_HELP_TEXT = [
   'GSD 命令：',
   '· `gsd` / `gsd status` — 打开/刷新状态卡',
-  '· `gsd continue`（go/next/继续）— 标记本会话执行并注入推进',
-  '· `gsd pause`（暂停）— 暂停活跃任务',
-  '· `gsd done`（complete/完成）— 标记完成',
+  '· 任务列表里的 `选` — 选择本会话要操作的任务',
+  '· `gsd continue`（go/next/继续）— 继续本会话所选任务',
+  '· `gsd pause`（暂停）— 暂停本会话所选任务',
+  '· `gsd done`（complete/完成）— 完成本会话所选任务（强制终验门禁）',
   '· `gsd new [任务名]` / `gsd start [任务名]` — 无名称则等下一条消息；有名称则直接创建并注入',
   '· `gsd help` — 本说明',
   '细进度仅在本会话标记为执行中且磁盘任务为运行中时显示。',
@@ -214,7 +220,14 @@ function buildCard(
   notice?: cards.GsdPanelNotice,
   awaitingName = false,
 ): object {
-  const snapshot = readGsdSnapshot(s.workDir)
+  let snapshot = readGsdSnapshot(s.workDir, s.gsdSelectedTaskSlug)
+  if (s.gsdSelectedTaskSlug && (!snapshot.taskSlug || snapshot.status === '已完成')) {
+    s.gsdSelectedTaskSlug = ''
+    snapshot = readGsdSnapshot(s.workDir)
+  } else if (!s.gsdSelectedTaskSlug && snapshot.taskSlug) {
+    // One-time compatibility for the legacy TRACKER active block.
+    s.gsdSelectedTaskSlug = snapshot.taskSlug
+  }
   // Stale execution marker (task switched / no longer running) → drop it.
   if (
     s.gsdExecution &&
@@ -277,9 +290,9 @@ function resultWithCard(
 }
 
 function ensureBridge(projectRoot: string, taskSlug: string): void {
-  let health = planningHealth(projectRoot)
+  let health = planningHealth(projectRoot, taskSlug)
   if (health.ok) return
-  health = switchActivePlanning(projectRoot, taskSlug)
+  health = ensureWorkstreamRoute(projectRoot, taskSlug)
   if (!health.ok) {
     throw new Error(`planning bridge 不可用 (${health.kind})`)
   }
@@ -326,6 +339,29 @@ export async function onGsdRefresh(
   return resultWithCard(s, true, '已刷新', 'success', awaiting)
 }
 
+export async function onGsdSelect(
+  s: Session,
+  taskSlug: string,
+  panelGen: string | null = null,
+): Promise<GsdActionResult> {
+  const stale = checkPanelGen(s, panelGen)
+  if (stale) return stale
+  const slug = taskSlug.trim()
+  if (!slug) return resultWithCard(s, false, '缺少 task_slug，请刷新面板')
+  try {
+    const previous = s.gsdSelectedTaskSlug
+    const snapshot = selectGsdTask(s.workDir, slug)
+    s.gsdSelectedTaskSlug = snapshot.taskSlug
+    if (previous !== snapshot.taskSlug) clearGsdExecution(s)
+    clearGsdAwaitingName(s)
+    return resultWithCard(s, true, `已选择 ${snapshot.taskName || snapshot.taskSlug}`)
+  } catch (e) {
+    const message = `选择失败: ${messageOf(e)}`
+    log(`session "${s.sessionName}": gsd select failed: ${messageOf(e)}`)
+    return resultWithCard(s, false, message)
+  }
+}
+
 export async function onGsdContinue(
   s: Session,
   taskSlug: string,
@@ -335,16 +371,17 @@ export async function onGsdContinue(
   if (stale) return stale
 
   try {
+    const selectedSlug = taskSlug.trim() || s.gsdSelectedTaskSlug
+    if (!selectedSlug) {
+      return resultWithCard(s, false, '当前会话未选择任务，请先点“选”')
+    }
     // Read-only prechecks first — never resume / switch bridge while busy.
-    const snapBefore = readGsdSnapshot(s.workDir)
+    const snapBefore = readGsdSnapshot(s.workDir, selectedSlug)
     if (snapBefore.status !== '运行中' && snapBefore.status !== '已暂停') {
       return resultWithCard(s, false, '没有可继续的 GSD 任务（需运行中或已暂停）')
     }
-    if (taskSlug && snapBefore.taskSlug && taskSlug !== snapBefore.taskSlug) {
-      return resultWithCard(s, false, '任务已切换，请刷新面板')
-    }
     if (!snapBefore.taskSlug) {
-      return resultWithCard(s, false, '没有活跃 task_slug')
+      return resultWithCard(s, false, '所选任务不存在，请刷新面板')
     }
 
     // Clear abandoned idle queue counters (safe no-op mid-turn) before busy check.
@@ -356,13 +393,14 @@ export async function onGsdContinue(
 
     let snap = snapBefore
     if (snap.status === '已暂停') {
-      snap = resumeActiveTask(s.workDir)
+      snap = resumeGsdTask(s.workDir, selectedSlug)
     }
     if (!snap.taskSlug) {
       return resultWithCard(s, false, '没有活跃 task_slug')
     }
 
     ensureBridge(s.workDir, snap.taskSlug)
+    s.gsdSelectedTaskSlug = snap.taskSlug
 
     // Invalidate panel gen before inject so a second click with the old
     // gen fails validatePanelGen (anti double-continue / double-inject).
@@ -408,14 +446,14 @@ export async function onGsdPause(
   if (stale) return stale
 
   try {
-    const before = readGsdSnapshot(s.workDir)
-    if (taskSlug && before.taskSlug && taskSlug !== before.taskSlug) {
-      return resultWithCard(s, false, '任务已切换，请刷新面板')
-    }
+    const selectedSlug = taskSlug.trim() || s.gsdSelectedTaskSlug
+    if (!selectedSlug) return resultWithCard(s, false, '当前会话未选择任务，请先点“选”')
+    const before = readGsdSnapshot(s.workDir, selectedSlug)
     if (before.status !== '运行中') {
       return resultWithCard(s, false, '仅运行中任务可暂停')
     }
-    const snap = pauseActiveTask(s.workDir)
+    const snap = pauseGsdTask(s.workDir, selectedSlug)
+    s.gsdSelectedTaskSlug = selectedSlug
     clearGsdExecution(s)
     return resultWithCard(s, true, snap.status === '已暂停' ? '已暂停' : '暂停未生效')
   } catch (e) {
@@ -434,15 +472,15 @@ export async function onGsdComplete(
   if (stale) return stale
 
   try {
-    const before = readGsdSnapshot(s.workDir)
-    if (taskSlug && before.taskSlug && taskSlug !== before.taskSlug) {
-      return resultWithCard(s, false, '任务已切换，请刷新面板')
-    }
+    const selectedSlug = taskSlug.trim() || s.gsdSelectedTaskSlug
+    if (!selectedSlug) return resultWithCard(s, false, '当前会话未选择任务，请先点“选”')
+    const before = readGsdSnapshot(s.workDir, selectedSlug)
     if (before.status !== '运行中' && before.status !== '已暂停') {
       return resultWithCard(s, false, '没有可完成的 GSD 任务')
     }
-    const snap = completeActiveTask(s.workDir)
+    const snap = completeGsdTask(s.workDir, selectedSlug)
     clearGsdExecution(s)
+    s.gsdSelectedTaskSlug = ''
     return resultWithCard(s, true, snap.status === '已完成' ? '已完成' : '完成未生效')
   } catch (e) {
     const message = `完成失败: ${messageOf(e)}`
@@ -491,6 +529,7 @@ export async function startNamedGsdTask(
 
     const snap: GsdSnapshot = createAndActivateTask(s.workDir, taskName)
     createdSlug = snap.taskSlug
+    s.gsdSelectedTaskSlug = snap.taskSlug
     ensureBridge(s.workDir, snap.taskSlug)
 
     // Invalidate panel gen before await inject (anti double-create / double-inject).

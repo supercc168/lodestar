@@ -51,14 +51,14 @@ finalization:
 5. 运行只读门禁：
 
    ```bash
-   node ./.agents/skills/yiui-gsd/scripts/yiui-gsd.mjs assert-finalization-gate --state-path .planning/STATE.md
+   node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs assert-finalization-gate --project-root . --task-slug <task-slug>
    ```
 
 6. 门禁通过后，对当前代际运行一次最终验收。通过后增加 `final_verification_runs`，并将 `final_verified_generation` 设为当前 `change_generation`。
 7. 标记任务完成前再运行：
 
    ```bash
-   node ./.agents/skills/yiui-gsd/scripts/yiui-gsd.mjs assert-finalization-gate --state-path .planning/STATE.md --require-completed
+   node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs assert-finalization-gate --project-root . --task-slug <task-slug> --require-completed
    ```
 
 ## 失败恢复

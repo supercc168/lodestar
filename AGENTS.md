@@ -77,8 +77,9 @@
 
 ## GSD / 长任务
 - 多阶段、长任务、TRACKER/阶段推进：用项目 skill **`yiui-gsd`**（canonical `.agents/skills/yiui-gsd`；Claude 入口 `.claude/skills/yiui-gsd`）。
-- 操作前先读 `.gsd/TRACKER.md`；活跃 STATE 在项目根 `.planning/`。
-- 飞书侧用 **gsd 卡**做暂停/完成/切换活跃；agent 只推进 phase 内容，继续时以磁盘为准，勿重复创建冲突任务。
+- 操作前先读 `.gsd/TRACKER.md`；任务 STATE 的 canonical 路径是 `.gsd/<slug>/.planning/STATE.md`，底层 GSD 命令必须显式带 `--ws <slug>`。
+- 根 `.planning/` 是稳定路由目录：`.planning/workstreams/<slug>` 指向对应 canonical planning；不要把根 `.planning` 当作某个任务的 STATE 目录。
+- 允许多个任务同时为运行中；飞书 **gsd 卡**的单字 `选` 只绑定当前 session，暂停/完成/继续只作用于所选 slug，不得隐式暂停其它任务。继续时以磁盘为准，勿重复创建冲突任务。
 
 ## UI Design Notes
 - Card Kit 里的操作按钮要优先按手机窄屏设计；高频、重复出现的选择类按钮文案必须尽量短，`model`/effort 这类选择按钮固定用单字 `选`，不要写成 `选择`、`重选` 等多字按钮。

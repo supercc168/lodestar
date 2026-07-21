@@ -554,6 +554,12 @@ async function handleCardAction(data: any): Promise<any> {
         ? actionCardResponse(result.card)
         : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
     }
+    case 'gsd_select': {
+      const result = await session.onGsdSelect(String(value.task_slug ?? ''), String(value.panel_gen ?? ''))
+      return result.card
+        ? actionCardResponse(result.card)
+        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
     case 'gsd_continue': {
       const result = await session.onGsdContinue(String(value.task_slug ?? ''), String(value.panel_gen ?? ''))
       return result.card

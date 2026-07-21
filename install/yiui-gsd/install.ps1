@@ -100,7 +100,8 @@ function Wire-Project([string]$ProjectRoot) {
 
 ## GSD / 长任务规划
 - 多阶段、长任务、需要 TRACKER/阶段推进时，**必须**使用项目 skill `yiui-gsd`（路径 `.agents/skills/yiui-gsd`，Claude 入口 `.claude/skills/yiui-gsd`）。
-- 任何 GSD 操作前先读 `.gsd/TRACKER.md`；活跃任务 STATE 经项目根 `.planning/`。
+- 任何 GSD 操作前先读 `.gsd/TRACKER.md`；目标任务 STATE 位于 `.gsd/<slug>/.planning/STATE.md`，底层命令显式带 `--ws <slug>`。
+- 根 `.planning/` 是稳定 workstream 路由目录；当前会话选择不写入 TRACKER，也不暂停其他运行中任务。
 - **禁止**使用 superpowers / oh-my-claudecode(OMC) / ralplan / ralph / ultrawork / “plan this” 作为规划入口。
 '@ | Set-Content -Path $claudeMd -Encoding UTF8
         }

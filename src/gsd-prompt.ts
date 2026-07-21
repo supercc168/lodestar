@@ -8,18 +8,21 @@ export function buildGsdInjectPrompt(input: {
   provider: string
 }): string {
   const actionLine = input.action === 'continue'
-    ? '当前动作: continue — 从 STATE 单调游标推进唯一下一步（$gsd-progress --next 语义）'
-    : '当前动作: new-task-discuss — 按 yiui-gsd 为新任务建立/刷新 planning 基线并进入 discuss/onboard'
+    ? `当前动作: continue — 从 STATE 单调游标推进唯一下一步（$gsd-progress --next --ws ${input.taskSlug}）`
+    : `当前动作: new-task-discuss — 按 yiui-gsd 建立 planning 基线并进入 discuss/onboard，所有命令显式带 --ws ${input.taskSlug}`
   return [
     GSD_INJECT_PREFIX,
     '- 只用 yiui-gsd；禁止 superpowers / OMC / oh-my-claudecode / ralplan / ralph / ultrawork / “plan this” 旧规划入口',
-    '- 先读 .gsd/TRACKER.md 与活跃任务 STATE.md（经项目根 .planning）',
+    `- 先读 .gsd/TRACKER.md、.gsd/${input.taskSlug}/TASK.md 与 .gsd/${input.taskSlug}/.planning/STATE.md`,
+    `- 根 .planning 是稳定目录；本任务路由为 .planning/workstreams/${input.taskSlug}，不要把根 .planning 当成任务目录`,
+    '- TRACKER 只是未完成任务聚合索引，不表示当前选择，也不得因切换本任务而暂停其他任务',
     actionLine,
     `- task_slug: ${input.taskSlug}`,
     `- 任务名: ${input.taskName}`,
     `- provider: ${input.provider}`,
     '- 完成后用中文简报：状态、phase、下一步；不得重做已 GREEN/已验证项',
-    '- 状态以磁盘为准；不要把聊天计划当作 TRACKER',
+    `- 所有底层 gsd-* 命令显式追加 --ws ${input.taskSlug}`,
+    '- 状态以 TASK/STATE 磁盘事实为准；不要把聊天计划或 TRACKER 当成 session 选择',
   ].join('\n')
 }
 

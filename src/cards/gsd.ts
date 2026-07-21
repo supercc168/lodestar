@@ -15,7 +15,7 @@ export type GsdPanelOpts = {
   awaitingName?: boolean
   /**
    * Session-level gate: true only when this chat is actively executing the
-   * active GSD task (daemon inject / `[Lodestar GSD]` message). Disk-only
+   * selected GSD task (daemon inject / `[Lodestar GSD]` message). Disk-only
    * 运行中 without session execution must not show plan/cursor detail.
    */
   showProgress?: boolean
@@ -47,6 +47,7 @@ export function gsdPanelCard(opts: GsdPanelOpts): object {
           element_id: ELEMENTS.gsdPanel,
           content: panelContent(opts),
         },
+        ...taskListElements(opts),
         // Two rows: five equal-weight buttons in one column_set are too
         // narrow on Feishu and render as "..." with labels clipped.
         ...actionElements(opts),
@@ -57,6 +58,20 @@ export function gsdPanelCard(opts: GsdPanelOpts): object {
 
 function panelContent(opts: GsdPanelOpts): string {
   const s = opts.snapshot
+  if (!s.taskSlug) {
+    const unfinishedTasks = s.unfinishedTasks ?? []
+    const lines = [
+      '当前会话：未选择任务',
+      `未完成：${inlineCode(String(unfinishedTasks.length))}`,
+      `bridge：${bridgeLabel(s.bridge)}`,
+      `provider：${inlineCode(opts.providerLabel)}`,
+    ]
+    if (opts.awaitingName) {
+      lines.push('')
+      lines.push(`<font color='orange'>等待任务名：请发送下一条消息作为新任务名称（约 300s 内）。</font>`)
+    }
+    return lines.join('\n')
+  }
   const name = s.taskName || '—'
   const slug = s.taskSlug || '—'
   const phase = s.phase || 'unknown'
@@ -169,21 +184,61 @@ function bridgeLabel(bridge: BridgeHealth): string {
 
 type GsdActionButton = { label: string; kind: string; type?: string }
 
+function taskListElements(opts: GsdPanelOpts): object[] {
+  const tasks = opts.snapshot.unfinishedTasks ?? []
+  if (!tasks.length || (opts.snapshot.taskSlug && tasks.length === 1)) return []
+  return [
+    { tag: 'hr' },
+    {
+      tag: 'markdown',
+      content: `**未完成任务 (${tasks.length})**`,
+    },
+    ...tasks.map(task => ({
+      tag: 'column_set',
+      columns: [
+        {
+          tag: 'column',
+          width: 'weighted',
+          weight: 5,
+          elements: [{
+            tag: 'markdown',
+            content: [
+              `${task.taskSlug === opts.snapshot.taskSlug ? '**当前** · ' : ''}${escapeMarkdown(task.taskName)}`,
+              `${inlineCode(task.taskSlug)} · ${task.status} · ${inlineCode(task.phase || 'unknown')}`,
+              ...(task.summary ? [escapeMarkdown(truncate(task.summary, 72))] : []),
+            ].join('\n'),
+          }],
+        },
+        buttonColumn(
+          { label: '选', kind: 'gsd_select', type: task.taskSlug === opts.snapshot.taskSlug ? 'default' : 'primary' },
+          task.taskSlug,
+          opts.panelGen,
+        ),
+      ],
+    })),
+  ]
+}
+
 function actionElements(opts: GsdPanelOpts): object[] {
   const taskSlug = opts.snapshot.taskSlug || ''
   const panelGen = opts.panelGen
   // Keep ≤3 buttons per row (same practical density as permission cards).
-  const rows: GsdActionButton[][] = [
-    [
-      { label: '进度', kind: 'gsd_refresh', type: 'default' },
-      { label: '继续', kind: 'gsd_continue', type: 'primary' },
-      { label: '暂停', kind: 'gsd_pause', type: 'default' },
-    ],
-    [
-      { label: '完成', kind: 'gsd_complete', type: 'default' },
-      { label: '新任务', kind: 'gsd_new_prompt', type: 'primary' },
-    ],
-  ]
+  const rows: GsdActionButton[][] = taskSlug
+    ? [
+        [
+          { label: '进度', kind: 'gsd_refresh', type: 'default' },
+          { label: '继续', kind: 'gsd_continue', type: 'primary' },
+          { label: '暂停', kind: 'gsd_pause', type: 'default' },
+        ],
+        [
+          { label: '完成', kind: 'gsd_complete', type: 'default' },
+          { label: '新任务', kind: 'gsd_new_prompt', type: 'primary' },
+        ],
+      ]
+    : [[
+        { label: '进度', kind: 'gsd_refresh', type: 'default' },
+        { label: '新任务', kind: 'gsd_new_prompt', type: 'primary' },
+      ]]
 
   return rows.map(buttons => ({
     tag: 'column_set',

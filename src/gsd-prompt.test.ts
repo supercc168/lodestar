@@ -18,6 +18,10 @@ test('prompt forces yiui-gsd and bans old planners', () => {
   expect(p).toContain('demo')
   expect(p).toMatch(/superpowers|OMC|ralplan/i)
   expect(p).toContain('TRACKER')
+  expect(p).toContain('.gsd/demo/.planning/STATE.md')
+  expect(p).toContain('.planning/workstreams/demo')
+  expect(p).toContain('--ws demo')
+  expect(p).toContain('聚合索引')
 })
 
 test('new-task-discuss action line differs from continue', () => {

@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { execSync } from 'node:child_process'
+import { execFileSync } from 'node:child_process'
 import {
   GSD_BUSY_MSG,
   GSD_PANEL_STALE_MSG,
@@ -16,13 +16,14 @@ import {
   noteGsdUserMessage,
   onGsdContinue,
   onGsdPause,
+  onGsdSelect,
   parseGsdTextCommand,
   shouldShowGsdProgress,
   validatePanelGen,
 } from './session-gsd'
 import {
   createAndActivateTask,
-  pauseActiveTask,
+  pauseGsdTask,
   readGsdSnapshot,
 } from './gsd-store'
 import { buildGsdInjectPrompt } from './gsd-prompt'
@@ -155,6 +156,7 @@ describe('session GSD execution detection', () => {
       planningPath: '',
       note: '',
       bridge: { ok: true, kind: 'symlink' as const, target: 'x' },
+      unfinishedTasks: [],
     }
     expect(shouldShowGsdProgress(base, null)).toBe(false)
     expect(
@@ -182,6 +184,7 @@ describe('session GSD execution detection', () => {
   test('noteGsdUserMessage arms on inject and clears on own-turn chat', () => {
     const s = {
       workDir: '/tmp/unused',
+      gsdSelectedTaskSlug: '',
       gsdExecution: null,
     } as unknown as Session
 
@@ -194,6 +197,7 @@ describe('session GSD execution detection', () => {
     noteGsdUserMessage(s, inject, { startsOwnTurn: true })
     expect(s.gsdExecution?.taskSlug).toBe('wire-panel')
     expect(s.gsdExecution?.source).toBe('inject')
+    expect(s.gsdSelectedTaskSlug).toBe('wire-panel')
 
     // Mid-turn ordinary text must not clear (in-flight GSD may still run).
     noteGsdUserMessage(s, '顺手改一下注释', { startsOwnTurn: false })
@@ -237,33 +241,36 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
   beforeEach(() => {
     root = mkdtempSync(join(tmpdir(), 'gsd-continue-'))
     mkdirSync(join(root, '.gsd'), { recursive: true })
-    writeFileSync(
-      join(root, '.gsd', 'TRACKER.md'),
-      `# GSD 任务跟踪
-
-## 当前活跃任务
-
-- 状态：无任务
-- task_slug：
-- 任务名称：
-- 当前阶段：unknown
-- 最后更新：
-- planning_path：
-- 备注：
-
-## 任务索引
-
-| task_slug | 名称 | 状态 | 创建时间 | 最后更新 |
-|-----------|------|------|----------|----------|
-`,
-    )
-    execSync('git init', { cwd: join(root, '.gsd') })
+    execFileSync('git', ['init', '-q'], { cwd: join(root, '.gsd') })
+    execFileSync('git', ['config', 'user.email', 'session-gsd-test@example.invalid'], { cwd: join(root, '.gsd') })
+    execFileSync('git', ['config', 'user.name', 'Session GSD Test'], { cwd: join(root, '.gsd') })
   })
   afterEach(() => rmSync(root, { recursive: true, force: true }))
 
+  test('select changes only the session-local target', async () => {
+    const alpha = createAndActivateTask(root, 'Alpha')
+    const beta = createAndActivateTask(root, 'Beta')
+    const s = {
+      workDir: root,
+      sessionName: 't',
+      gsdPanelGen: 'gen-1',
+      gsdAwaitingNameUntil: 0,
+      gsdSelectedTaskSlug: alpha.taskSlug,
+      gsdExecution: { taskSlug: alpha.taskSlug, source: 'inject' as const, at: 1 },
+      currentProvider: () => 'claude' as const,
+    } as unknown as Session
+
+    const result = await onGsdSelect(s, beta.taskSlug, 'gen-1')
+    expect(result.ok).toBe(true)
+    expect(s.gsdSelectedTaskSlug).toBe(beta.taskSlug)
+    expect(s.gsdExecution).toBeNull()
+    expect(readGsdSnapshot(root, alpha.taskSlug).status).toBe('运行中')
+    expect(readGsdSnapshot(root, beta.taskSlug).status).toBe('运行中')
+  })
+
   test('busy: returns busy without resuming 已暂停', async () => {
-    createAndActivateTask(root, 'Busy Resume Guard')
-    expect(pauseActiveTask(root).status).toBe('已暂停')
+    const created = createAndActivateTask(root, 'Busy Resume Guard')
+    expect(pauseGsdTask(root, created.taskSlug).status).toBe('已暂停')
 
     const injectCalls: string[] = []
     const clearCalls: string[] = []
@@ -274,6 +281,7 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
       gsdAwaitingNameUntil: 0,
       gsdPanelMessageId: '',
       gsdExecution: null,
+      gsdSelectedTaskSlug: created.taskSlug,
       currentTurn: { id: 'turn-1' },
       openingTurn: null,
       pendingUserMessageCount: 0,
@@ -295,7 +303,7 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
     // Mid-turn: clearStaleIdleQueueIfSafe must not call (currentTurn set).
     expect(clearCalls).toEqual([])
     // Store must stay 已暂停 — resume was not applied.
-    expect(readGsdSnapshot(root).status).toBe('已暂停')
+    expect(readGsdSnapshot(root, created.taskSlug).status).toBe('已暂停')
   })
 
   test('idle inject bumps panel gen so second click with old gen is stale', async () => {
@@ -308,6 +316,7 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
       gsdAwaitingNameUntil: 99,
       gsdPanelMessageId: '',
       gsdExecution: null,
+      gsdSelectedTaskSlug: created.taskSlug,
       currentTurn: null,
       openingTurn: null,
       pendingUserMessageCount: 0,
@@ -352,13 +361,14 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
         source: 'inject' as const,
         at: Date.now(),
       },
+      gsdSelectedTaskSlug: created.taskSlug,
       currentProvider: () => 'claude' as const,
     } as unknown as Session
 
     const result = await onGsdPause(s, created.taskSlug, 'gen-1')
     expect(result.ok).toBe(true)
     expect(s.gsdExecution).toBeNull()
-    expect(readGsdSnapshot(root).status).toBe('已暂停')
+    expect(readGsdSnapshot(root, created.taskSlug).status).toBe('已暂停')
   })
 
   test('text continue (panelGen null) arms execution without panel gen', async () => {
@@ -371,6 +381,7 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
       gsdAwaitingNameUntil: 0,
       gsdPanelMessageId: '',
       gsdExecution: null,
+      gsdSelectedTaskSlug: created.taskSlug,
       currentTurn: null,
       openingTurn: null,
       pendingUserMessageCount: 0,
@@ -399,6 +410,7 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
       gsdAwaitingNameUntil: 0,
       gsdPanelMessageId: '',
       gsdExecution: null,
+      gsdSelectedTaskSlug: created.taskSlug,
       currentTurn: null,
       openingTurn: null,
       pendingUserMessageCount: 0,
@@ -418,7 +430,7 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
     await Promise.resolve()
     expect(s.gsdExecution).toBeNull()
     // disk may remain 运行中 after continue path; marker must not stick
-    expect(readGsdSnapshot(root).status).toBe('运行中')
+    expect(readGsdSnapshot(root, created.taskSlug).status).toBe('运行中')
     expect(created.taskSlug).toBeTruthy()
   })
 })

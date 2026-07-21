@@ -3,9 +3,10 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$TaskSlug,
     [Parameter(Mandatory = $true)]
-    [string]$Message,
-    [string]$ProjectRoot = (Get-Location).Path,
-    [switch]$IncludeSharedProject
+    [string]$TaskName,
+    [Parameter(Mandatory = $true)]
+    [string]$Summary,
+    [string]$ProjectRoot = (Get-Location).Path
 )
 
 $ErrorActionPreference = 'Stop'
@@ -14,13 +15,5 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
     throw 'Node.js >= 18 is required to run yiui-gsd helpers.'
 }
 
-$nodeArgs = @(
-    $helper,
-    'gsd-local-commit',
-    '--project-root', $ProjectRoot,
-    '--task-slug', $TaskSlug,
-    '--message', $Message
-)
-if ($IncludeSharedProject) { $nodeArgs += '--include-shared-project' }
-& node @nodeArgs
+& node $helper 'new-gsd-task' '--project-root' $ProjectRoot '--task-slug' $TaskSlug '--task-name' $TaskName '--summary' $Summary
 if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }

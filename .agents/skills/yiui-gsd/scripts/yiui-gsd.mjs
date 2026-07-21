@@ -12,11 +12,16 @@
 import {
   copyFileSync,
   existsSync,
+  linkSync,
   lstatSync,
   mkdirSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   realpathSync,
+  renameSync,
+  rmSync,
+  statSync,
   symlinkSync,
   unlinkSync,
   writeFileSync,
@@ -25,26 +30,35 @@ import { spawnSync } from 'node:child_process'
 import { homedir } from 'node:os'
 import { basename, dirname, join, relative, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
+import { randomUUID } from 'node:crypto'
 
 const SCRIPT_PATH = fileURLToPath(import.meta.url)
 const DEFAULT_TRACKER = `# GSD 任务跟踪
 
-## 当前活跃任务
+> 这里只列出未完成任务。当前会话选择由 GSD session-local workstream 保存，不属于任务状态。
 
-- 状态：无任务
-- task_slug：
-- 任务名称：
-- 任务类型：
-- 当前阶段：unknown
-- 最后更新：
-- planning_path：
-- 备注：
+## 未完成任务
 
-## 任务索引
-
-| task_slug | 名称 | 状态 | 创建时间 | 最后更新 |
-|-----------|------|------|----------|----------|
+| task_slug | 名称 | 类型 | 状态 | 当前阶段 | 创建时间 | 最后更新 | 简述 |
+|-----------|------|------|------|----------|----------|----------|------|
 `
+
+const LOCK_TIMEOUT_MS = 30_000
+const LOCK_RETRY_MS = 100
+const SESSION_KEY_NAMES = [
+  'GSD_SESSION_KEY',
+  'CODEX_THREAD_ID',
+  'CLAUDE_SESSION_ID',
+  'CLAUDE_CODE_SSE_PORT',
+  'OPENCODE_SESSION_ID',
+  'GEMINI_SESSION_ID',
+  'CURSOR_SESSION_ID',
+  'WINDSURF_SESSION_ID',
+  'TERM_SESSION_ID',
+  'WT_SESSION',
+  'TMUX_PANE',
+  'ZELLIJ_SESSION_NAME',
+]
 
 function fail(message) {
   throw new Error(message)
@@ -72,6 +86,17 @@ function writeText(path, content, { bom = false } = {}) {
   writeFileSync(path, `${bom ? '\uFEFF' : ''}${content}`, 'utf8')
 }
 
+function writeTextAtomic(path, content, { bom = false } = {}) {
+  mkdirSync(dirname(path), { recursive: true })
+  const temporary = join(dirname(path), `.${basename(path)}.${randomUUID()}.tmp`)
+  try {
+    writeFileSync(temporary, `${bom ? '\uFEFF' : ''}${content}`, 'utf8')
+    renameSync(temporary, path)
+  } finally {
+    if (pathExists(temporary)) rmSync(temporary, { force: true })
+  }
+}
+
 function pathStat(path) {
   try {
     return lstatSync(path)
@@ -82,6 +107,99 @@ function pathStat(path) {
 
 function pathExists(path) {
   return pathStat(path) !== null
+}
+
+function readLinkTarget(path) {
+  try {
+    return readlinkSync(path)
+  } catch {
+    return null
+  }
+}
+
+function isLink(path) {
+  const stat = pathStat(path)
+  return Boolean(stat?.isSymbolicLink() || readLinkTarget(path) != null)
+}
+
+function removeLinkOnly(path) {
+  if (!pathExists(path)) return
+  if (!isLink(path)) fail(`refusing to remove non-link planning route: ${path}`)
+  try {
+    unlinkSync(path)
+    return
+  } catch {
+    if (process.platform !== 'win32') fail(`failed to remove planning symlink: ${path}`)
+  }
+  rmSync(path, { recursive: false, force: true })
+}
+
+function sameFile(left, right) {
+  try {
+    const a = statSync(left)
+    const b = statSync(right)
+    if (a.dev === b.dev && a.ino === b.ino) return true
+    return readFileSync(left).equals(readFileSync(right))
+  } catch {
+    return false
+  }
+}
+
+function sleep(milliseconds) {
+  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, milliseconds)
+}
+
+function processIsAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+function removeStaleLock(lockPath) {
+  try {
+    const ownerPath = join(lockPath, 'owner.json')
+    const age = Date.now() - statSync(lockPath).mtimeMs
+    if (age < LOCK_TIMEOUT_MS) return false
+    let ownerPid = 0
+    try {
+      ownerPid = Number(JSON.parse(readText(ownerPath) || '{}').pid)
+    } catch {
+      // A process can die after mkdir and before owner.json is fully written.
+    }
+    if (processIsAlive(ownerPid)) return false
+    rmSync(lockPath, { recursive: true, force: true })
+    return true
+  } catch {
+    return false
+  }
+}
+
+function withGsdWriteLock(gsdRoot, operation) {
+  const gitRoot = join(gsdRoot, '.git')
+  if (!pathExists(gitRoot)) fail(`GSD local git missing: ${gsdRoot}`)
+  const lockPath = join(gitRoot, 'yiui-gsd-write.lock')
+  const deadline = Date.now() + LOCK_TIMEOUT_MS
+  while (true) {
+    try {
+      mkdirSync(lockPath)
+      writeText(join(lockPath, 'owner.json'), JSON.stringify({ pid: process.pid, at: new Date().toISOString() }))
+      break
+    } catch (error) {
+      if (error?.code !== 'EEXIST') throw error
+      if (removeStaleLock(lockPath)) continue
+      if (Date.now() >= deadline) fail(`timed out waiting for GSD write lock: ${lockPath}`)
+      sleep(LOCK_RETRY_MS)
+    }
+  }
+  try {
+    return operation()
+  } finally {
+    rmSync(lockPath, { recursive: true, force: true })
+  }
 }
 
 function resolveProjectRoot(options = {}) {
@@ -132,75 +250,65 @@ function normalizeSlug(value) {
   return slug
 }
 
+function defaultProjectContent(root) {
+  const name = basename(root)
+  return `# ${name}\n\n## What This Is\n\n这是 ${name} 的项目级共享 GSD 上下文。任务名称、范围、完成标准和执行游标分别保存在 .gsd/{task-slug}/TASK.md 与 .gsd/{task-slug}/.planning/STATE.md，不得写回本文件形成任务级双源。\n\n## Core Value\n\n在项目硬规则与验证门禁下持续交付可验证、可恢复的增量变更。\n\n## Requirements\n\n### Active\n\n- 允许多个不同 task_slug 同时处于运行中；当前会话选择不属于任务状态。\n- 所有任务共享项目源码和运行进程；修改范围重叠时串行执行或使用独立 Git worktree。\n- 项目硬规则以根指令文件为准，任务事实以代码、测试、Git、TASK 和 STATE 为准。\n- .gsd/TRACKER.md 只索引未完成任务；任务完成后保留目录与 Git 历史。\n\n### Out of Scope\n\n- 在共享 PROJECT 中记录单个任务的范围、阶段、执行游标或临时状态。\n- 通过任务切换隐式暂停其他任务。\n\n## Evolution\n\n只有跨任务成立且经过验证的项目级事实才更新本文件。任务专属决策保留在对应任务产物中。\n`
+}
+
+function ensureIgnoreLine(path, requiredLine) {
+  const lines = normalizeNewlines(readText(path)).split('\n').filter(Boolean)
+  if (!lines.includes(requiredLine)) lines.push(requiredLine)
+  writeText(path, `${lines.join('\n')}\n`)
+}
+
+function stagedFiles(gsdRoot) {
+  return runGit(['diff', '--cached', '--name-only'], gsdRoot).stdout.split(/\r?\n/).filter(Boolean)
+}
+
+function assertEmptyGsdIndex(gsdRoot, action = 'write') {
+  const staged = stagedFiles(gsdRoot)
+  if (staged.length) fail(`GSD index must be empty before ${action}: ${staged.join(', ')}`)
+}
+
+function assertCleanManagedFiles(gsdRoot, paths, action) {
+  const dirty = runGit(['status', '--porcelain', '--', ...paths], gsdRoot).stdout.trim()
+  if (dirty) fail(`GSD managed files must be clean before ${action}: ${dirty.replace(/\r?\n/g, ', ')}`)
+}
+
 export function initGsdRepo(options = {}) {
   const root = resolveProjectRoot(options)
   const gsdRoot = join(root, '.gsd')
   mkdirSync(gsdRoot, { recursive: true })
+  const gitWasPresent = pathExists(join(gsdRoot, '.git'))
+  if (!gitWasPresent) runGit(['init', '-q'], gsdRoot)
 
-  const gitignorePath = join(gsdRoot, '.gitignore')
-  if (!existsSync(gitignorePath)) {
-    writeText(gitignorePath, '# GSD sensitive config (may contain API keys)\n**/.planning/config.json\n')
-  }
+  const result = withGsdWriteLock(gsdRoot, () => {
+    assertEmptyGsdIndex(gsdRoot, 'init')
+    const managedPaths = ['.gitignore', 'PROJECT.md', 'TRACKER.md']
+    if (gitWasPresent) assertCleanManagedFiles(gsdRoot, managedPaths, 'init')
+    const gitignorePath = join(gsdRoot, '.gitignore')
+    ensureIgnoreLine(gitignorePath, '**/.planning/config.json')
+    const trackerPath = join(gsdRoot, 'TRACKER.md')
+    if (!existsSync(trackerPath)) writeText(trackerPath, DEFAULT_TRACKER)
+    const projectPath = join(gsdRoot, 'PROJECT.md')
+    if (!existsSync(projectPath)) writeText(projectPath, defaultProjectContent(root))
 
-  const trackerPath = join(gsdRoot, 'TRACKER.md')
-  if (!existsSync(trackerPath)) writeText(trackerPath, DEFAULT_TRACKER)
-
-  if (!pathExists(join(gsdRoot, '.git'))) {
-    runGit(['init', '-q'], gsdRoot)
-  }
-  runGit(['add', '.gitignore', 'TRACKER.md'], gsdRoot)
-  const status = runGit(['status', '--porcelain'], gsdRoot).stdout.trim()
-  if (status) runGit(['commit', '-m', 'init gsd task repo'], gsdRoot)
-
-  console.log(`GSD repo ready: ${gsdRoot}`)
-  return { root, gsdRoot, trackerPath }
-}
-
-export function switchActiveTask(options = {}) {
-  const root = resolveProjectRoot(options)
-  const slug = normalizeSlug(options['task-slug'] || options.taskSlug)
-  const taskDir = join(root, '.gsd', slug)
-  if (!pathExists(taskDir)) fail(`Task dir missing: .gsd/${slug}`)
-
-  const planningCanonical = join(taskDir, '.planning')
-  mkdirSync(planningCanonical, { recursive: true })
-  const planningLink = join(root, '.planning')
-  const existing = pathStat(planningLink)
-  if (existing) {
-    if (!existing.isSymbolicLink()) {
-      fail('.planning exists and is not a symlink/junction/link')
+    runGit(['add', '--', ...managedPaths], gsdRoot)
+    const diff = runGit(['diff', '--cached', '--quiet'], gsdRoot, { allowFailure: true })
+    if (diff.status === 1) {
+      const commit = runGit(['commit', '-m', 'init gsd task repo'], gsdRoot, { allowFailure: true })
+      if (commit.status !== 0) {
+        runGit(['reset', '-q', '--', ...managedPaths], gsdRoot, { allowFailure: true })
+        fail(`GSD init commit failed: ${commit.stderr.trim() || `exit ${commit.status}`}`)
+      }
+    } else if (diff.status !== 0) {
+      runGit(['reset', '-q', '--', ...managedPaths], gsdRoot, { allowFailure: true })
+      fail(`failed to inspect GSD init diff: exit ${diff.status}`)
     }
-    unlinkSync(planningLink)
-  }
-
-  if (process.platform === 'win32') {
-    symlinkSync(planningCanonical, planningLink, 'junction')
-  } else {
-    const target = relative(root, planningCanonical) || '.'
-    symlinkSync(target, planningLink, 'dir')
-  }
-
-  console.log(`Switched active task: ${slug}`)
-  return { root, slug, planningCanonical, planningLink }
-}
-
-export function gsdLocalCommit(options = {}) {
-  const root = resolveProjectRoot(options)
-  const message = String(options.message || '').trim()
-  if (!message) fail('commit message is required')
-  const gsdRoot = join(root, '.gsd')
-  if (!pathExists(gsdRoot)) fail('.gsd missing, run init-gsd-repo first')
-  if (!pathExists(join(gsdRoot, '.git'))) fail('.gsd git missing, run init-gsd-repo first')
-
-  runGit(['add', '-A'], gsdRoot)
-  const status = runGit(['status', '--porcelain'], gsdRoot).stdout.trim()
-  if (!status) {
-    console.log('No changes to commit')
-    return { committed: false }
-  }
-  runGit(['commit', '-m', message], gsdRoot)
-  console.log(`Committed: ${message}`)
-  return { committed: true }
+    return { root, gsdRoot, trackerPath, projectPath }
+  })
+  console.log(`GSD repo ready: ${gsdRoot}`)
+  return result
 }
 
 function parseTrackerField(content, field) {
@@ -208,83 +316,355 @@ function parseTrackerField(content, field) {
   return match ? match[1].trim() : ''
 }
 
-function updateIndexRow(content, slug, name, status, created, updated) {
-  const row = `| ${slug} | ${name} | ${status} | ${created} | ${updated} |`
-  const existing = new RegExp(`^\\| ${escapeRegExp(slug)} \\|.*$`, 'm')
-  if (existing.test(content)) return content.replace(existing, row)
-  const marker = '|-----------|------|------|----------|----------|'
-  if (content.includes(marker)) return content.replace(marker, `${marker}\n${row}`)
-  return `${content.trimEnd()}\n${row}\n`
+function replaceUnique(content, pattern, replacement, field, path) {
+  const matches = [...content.matchAll(new RegExp(pattern.source, pattern.flags.includes('g') ? pattern.flags : `${pattern.flags}g`))]
+  if (matches.length !== 1) fail(`${field} field count must be 1, got ${matches.length}: ${path}`)
+  return content.replace(pattern, replacement)
 }
 
-function updateIndexStatus(content, slug, status, updated) {
-  const pattern = new RegExp(
-    `^\\| ${escapeRegExp(slug)} \\| ([^|]+) \\| [^|]+ \\| ([^|]+) \\| [^|]+ \\|$`,
-    'm',
-  )
-  const match = content.match(pattern)
-  if (!match) return content
-  return content.replace(pattern, `| ${slug} | ${match[1].trim()} | ${status} | ${match[2].trim()} | ${updated} |`)
+function escapeMarkdownCell(value) {
+  return String(value || '').trim().replace(/\s+/g, ' ').replaceAll('|', '\\|')
 }
 
-function pauseRunningTask(root, trackerContent, now) {
-  if (parseTrackerField(trackerContent, '状态') !== '运行中') return
-  const oldSlug = parseTrackerField(trackerContent, 'task_slug')
-  if (!oldSlug) return
-  const taskPath = join(root, '.gsd', oldSlug, 'TASK.md')
-  const content = normalizeNewlines(readText(taskPath))
-  if (!content) return
-  const normalized = content
-    .replace(/^- 状态: .*$/m, '- 状态: 已暂停')
-    .replace(/^- 最后更新: .*$/m, `- 最后更新: ${now}`)
-  writeText(taskPath, normalized, { bom: true })
+function readCurrentPhase(content) {
+  const match = content.match(/^-?\s*current_phase:\s*(.*?)\s*$/m)
+  return match?.[1]?.trim() || 'unknown'
 }
 
-function buildTracker(root, slug, name, now, oldContent) {
-  pauseRunningTask(root, oldContent, now)
-  let content = oldContent
-  const oldRunning = parseTrackerField(oldContent, '状态') === '运行中'
-  const oldSlug = oldRunning ? parseTrackerField(oldContent, 'task_slug') : ''
-  if (oldSlug && oldSlug !== slug) content = updateIndexStatus(content, oldSlug, '已暂停', now)
-  content = updateIndexRow(content, slug, name, '运行中', now, now)
+function readCommittedFile(gsdRoot, relativePath) {
+  const result = runGit(['show', `HEAD:${relativePath}`], gsdRoot, { allowFailure: true })
+  return result.status === 0 ? result.stdout : null
+}
 
-  const active = `## 当前活跃任务\n\n- 状态：运行中\n- task_slug：${slug}\n- 任务名称：${name}\n- 任务类型：autoui\n- 当前阶段：discuss\n- 最后更新：${now}\n- planning_path：.gsd/${slug}/.planning/\n- 备注：autoui\n`
-  const activePattern = /## 当前活跃任务\n\n[\s\S]*?(?=\n##\s+|$)/
-  if (activePattern.test(content)) return content.replace(activePattern, active.trimEnd()) + '\n'
-  return `${content.trimEnd()}\n\n${active}`
+function readTaskRecord(root, slug, { committed = false } = {}) {
+  const gsdRoot = join(root, '.gsd')
+  const taskRelative = `${slug}/TASK.md`
+  const taskPath = join(gsdRoot, taskRelative)
+  const content = committed ? readCommittedFile(gsdRoot, taskRelative) : readText(taskPath)
+  if (content == null || !content) return null
+  const declaredSlug = parseTrackerField(content, 'task_slug')
+  if (declaredSlug !== slug) fail(`TASK.md task_slug mismatch, directory=${slug}, value=${declaredSlug || '(missing)'}`)
+  const status = parseTrackerField(content, '状态')
+  if (!['运行中', '已暂停', '已完成'].includes(status)) fail(`invalid task status for ${slug}: ${status || '(missing)'}`)
+  const heading = content.match(/^#\s+(.+?)\s*$/m)
+  const stateRelative = `${slug}/.planning/STATE.md`
+  const stateContent = committed ? readCommittedFile(gsdRoot, stateRelative) : readText(join(gsdRoot, stateRelative))
+  return {
+    slug,
+    name: heading?.[1]?.trim() || slug,
+    type: parseTrackerField(content, '任务类型') || 'generic',
+    status,
+    phase: stateContent ? readCurrentPhase(stateContent) : 'unknown',
+    created: parseTrackerField(content, '创建时间'),
+    updated: parseTrackerField(content, '最后更新'),
+    summary: parseTrackerField(content, '简述'),
+    content,
+  }
+}
+
+function listTaskRecords(root, options = {}) {
+  const gsdRoot = join(root, '.gsd')
+  if (!existsSync(gsdRoot)) return []
+  const workingSlug = String(options.workingTaskSlug || '')
+  const slugs = new Set()
+  for (const entry of readdirSync(gsdRoot, { withFileTypes: true })) {
+    if (entry.isDirectory() && entry.name !== '.git' && entry.name !== '.locks') slugs.add(entry.name)
+  }
+  if (options.committedOthers) {
+    const tree = runGit(['ls-tree', '-r', '--name-only', 'HEAD'], gsdRoot, { allowFailure: true })
+    if (tree.status === 0) {
+      for (const path of tree.stdout.split(/\r?\n/)) {
+        const match = path.match(/^([^/]+)\/TASK\.md$/)
+        if (match) slugs.add(match[1])
+      }
+    }
+  }
+  const records = []
+  for (const slug of slugs) {
+    const committed = Boolean(options.committedOthers && slug !== workingSlug)
+    const record = readTaskRecord(root, slug, { committed })
+    if (record && record.status !== '已完成') records.push(record)
+  }
+  return records.sort((left, right) => {
+    const rank = (value) => value === '运行中' ? 0 : 1
+    return rank(left.status) - rank(right.status) || right.updated.localeCompare(left.updated) || left.slug.localeCompare(right.slug)
+  })
+}
+
+function trackerContent(records) {
+  const rows = records.map(task => `| ${task.slug} | ${escapeMarkdownCell(task.name)} | ${escapeMarkdownCell(task.type)} | ${task.status} | ${escapeMarkdownCell(task.phase)} | ${escapeMarkdownCell(task.created)} | ${escapeMarkdownCell(task.updated)} | ${escapeMarkdownCell(task.summary)} |`)
+  return `${DEFAULT_TRACKER.trimEnd()}${rows.length ? `\n${rows.join('\n')}` : ''}\n`
+}
+
+export function updateGsdTracker(options = {}) {
+  const root = resolveProjectRoot(options)
+  const gsdRoot = join(root, '.gsd')
+  if (!pathExists(join(gsdRoot, '.git'))) fail(`GSD local git missing: ${gsdRoot}`)
+  const operation = () => {
+    assertEmptyGsdIndex(gsdRoot, 'tracker update')
+    const records = listTaskRecords(root, {
+      workingTaskSlug: options['working-task-slug'] || options.workingTaskSlug,
+      committedOthers: Boolean(options['committed-others'] || options.committedOthers),
+    })
+    writeTextAtomic(join(gsdRoot, 'TRACKER.md'), trackerContent(records))
+    if (!options.quiet) console.log(`Rebuilt GSD tracker: ${records.length} unfinished task(s)`)
+    return records
+  }
+  const lockAlreadyHeld = Boolean(options['lock-already-held'] || options.lockAlreadyHeld)
+  return lockAlreadyHeld ? operation() : withGsdWriteLock(gsdRoot, operation)
+}
+
+function updateTaskStatusFile(root, slug, status) {
+  const path = join(root, '.gsd', slug, 'TASK.md')
+  let content = readText(path)
+  if (!content) fail(`TASK.md missing for ${slug}`)
+  const now = nowIso()
+  content = replaceUnique(content, /^\-\s*状态[：:]\s*.*?\s*$/m, `- 状态: ${status}`, '状态', path)
+  content = replaceUnique(content, /^\-\s*最后更新[：:]\s*.*?\s*$/m, `- 最后更新: ${now}`, '最后更新', path)
+  writeText(path, content, { bom: readFileSync(path).subarray(0, 3).equals(Buffer.from([0xef, 0xbb, 0xbf])) })
+  return now
+}
+
+function updateStateStatus(root, slug, status) {
+  const path = join(root, '.gsd', slug, '.planning', 'STATE.md')
+  if (!existsSync(path)) return
+  let content = readText(path)
+  content = replaceUnique(content, /^status:\s*.*?\s*$/m, `status: ${status}`, 'status', path)
+  content = replaceUnique(content, /^last_updated:\s*.*?\s*$/m, `last_updated: "${nowIso()}"`, 'last_updated', path)
+  writeText(path, content)
+}
+
+function ensurePlanningRouter(root, slug) {
+  const canonical = join(root, '.gsd', slug, '.planning')
+  const sharedCanonical = join(root, '.gsd', 'PROJECT.md')
+  if (!existsSync(sharedCanonical)) fail(`shared GSD PROJECT.md missing: ${sharedCanonical}`)
+  mkdirSync(canonical, { recursive: true })
+  const planningRoot = join(root, '.planning')
+  const rootStat = pathStat(planningRoot)
+  if (rootStat && isLink(planningRoot)) removeLinkOnly(planningRoot)
+  else if (rootStat && !rootStat.isDirectory()) fail(`.planning exists and is not a directory: ${planningRoot}`)
+  mkdirSync(join(planningRoot, 'workstreams'), { recursive: true })
+
+  const sharedRoute = join(planningRoot, 'PROJECT.md')
+  if (pathExists(sharedRoute)) {
+    if (!sameFile(sharedRoute, sharedCanonical)) fail(`shared PROJECT.md differs from canonical: ${sharedRoute}`)
+    const a = statSync(sharedRoute)
+    const b = statSync(sharedCanonical)
+    if (!(a.dev === b.dev && a.ino === b.ino)) {
+      unlinkSync(sharedRoute)
+      linkSync(sharedCanonical, sharedRoute)
+    }
+  } else linkSync(sharedCanonical, sharedRoute)
+
+  const route = join(planningRoot, 'workstreams', slug)
+  if (pathExists(route)) {
+    if (!isLink(route)) fail(`workstream route exists and is not a link: ${route}`)
+    let actual = ''
+    try { actual = realpathSync(route) } catch { /* replace broken link */ }
+    let expected = resolve(canonical)
+    try { expected = realpathSync(canonical) } catch { /* canonical was just created */ }
+    if (actual === expected) return { root, slug, canonical, route }
+    removeLinkOnly(route)
+  }
+  if (process.platform === 'win32') symlinkSync(canonical, route, 'junction')
+  else symlinkSync(relative(dirname(route), canonical) || canonical, route, 'dir')
+  return { root, slug, canonical, route }
+}
+
+function resolveGsdTools(options = {}) {
+  return resolve(options['gsd-tools-path'] || options.gsdToolsPath || join(resolveCodexHome(options), 'gsd-core', 'bin', 'gsd-tools.cjs'))
+}
+
+function runGsdTools(options, args, { allowFailure = false } = {}) {
+  const tool = resolveGsdTools(options)
+  if (!existsSync(tool)) {
+    if (allowFailure) return { status: 1, stdout: '', stderr: `missing ${tool}` }
+    fail(`GSD Core CLI missing: ${tool}`)
+  }
+  const result = spawnSync(process.execPath, [tool, ...args], {
+    encoding: 'utf8',
+    env: { ...process.env, ...(options.env || {}) },
+  })
+  if (result.error) fail(`GSD Core CLI failed: ${result.error.message}`)
+  if (result.status !== 0 && !allowFailure) fail((result.stderr || result.stdout || `GSD Core exit ${result.status}`).trim())
+  return { status: result.status ?? 1, stdout: result.stdout || '', stderr: result.stderr || '' }
+}
+
+function activeWorkstream(options, root) {
+  const result = runGsdTools(options, ['query', 'workstream.get', '--cwd', root], { allowFailure: true })
+  if (result.status !== 0) return ''
+  try {
+    return String(JSON.parse(result.stdout).active || '').trim()
+  } catch {
+    return ''
+  }
+}
+
+function setActiveWorkstream(options, root, slug) {
+  runGsdTools(options, ['query', 'workstream.set', slug, '--raw', '--cwd', root])
+}
+
+export function switchActiveTask(options = {}) {
+  const root = resolveProjectRoot(options)
+  const slug = normalizeSlug(options['task-slug'] || options.taskSlug)
+  const gsdRoot = join(root, '.gsd')
+  const taskPath = join(gsdRoot, slug, 'TASK.md')
+  if (!existsSync(taskPath)) fail(`TASK.md missing: .gsd/${slug}/TASK.md`)
+  let resumed = false
+  const route = withGsdWriteLock(gsdRoot, () => {
+    assertEmptyGsdIndex(gsdRoot, 'task switch')
+    const task = readTaskRecord(root, slug)
+    if (task.status === '已完成') fail(`completed task cannot be implicitly reopened: ${slug}`)
+    if (task.status === '已暂停') {
+      updateTaskStatusFile(root, slug, '运行中')
+      updateStateStatus(root, slug, 'in_progress')
+      resumed = true
+    }
+    const result = ensurePlanningRouter(root, slug)
+    updateGsdTracker({ projectRoot: root, lockAlreadyHeld: true, quiet: true })
+    setActiveWorkstream(options, root, slug)
+    return result
+  })
+  if (!options.deferCommit) {
+    gsdLocalCommit({ ...options, projectRoot: root, taskSlug: slug, message: resumed ? `gsd(${slug}): 恢复任务` : `gsd(${slug}): 同步任务索引` })
+  }
+  if (!SESSION_KEY_NAMES.some(name => String((options.env || process.env)[name] || '').trim())) {
+    console.warn('warning: no stable GSD session key; workstream selection may use the shared fallback pointer')
+  }
+  console.log(`Selected GSD workstream: ${slug}`)
+  return route
+}
+
+export function gsdLocalCommit(options = {}) {
+  const root = resolveProjectRoot(options)
+  const slug = normalizeSlug(options['task-slug'] || options.taskSlug)
+  const message = String(options.message || '').trim()
+  if (!message) fail('commit message is required')
+  const gsdRoot = join(root, '.gsd')
+  if (!pathExists(join(gsdRoot, '.git'))) fail('.gsd git missing, run init-gsd-repo first')
+  return withGsdWriteLock(gsdRoot, () => {
+    assertEmptyGsdIndex(gsdRoot, 'commit')
+    updateGsdTracker({
+      projectRoot: root,
+      workingTaskSlug: slug,
+      committedOthers: true,
+      lockAlreadyHeld: true,
+      quiet: true,
+    })
+    const paths = ['TRACKER.md', slug]
+    if (options['include-shared-project'] || options.includeSharedProject) paths.unshift('PROJECT.md')
+    runGit(['add', '--', ...paths], gsdRoot)
+    const staged = stagedFiles(gsdRoot)
+    const allowedShared = new Set(options['include-shared-project'] || options.includeSharedProject ? ['PROJECT.md', 'TRACKER.md'] : ['TRACKER.md'])
+    const unexpected = staged.filter(path => !allowedShared.has(path) && !path.startsWith(`${slug}/`))
+    if (unexpected.length) {
+      runGit(['reset', '-q', '--', ...paths], gsdRoot, { allowFailure: true })
+      fail(`scoped GSD commit includes unexpected files: ${unexpected.join(', ')}`)
+    }
+    const diff = runGit(['diff', '--cached', '--quiet'], gsdRoot, { allowFailure: true })
+    if (diff.status === 0) {
+      console.log(`No GSD changes to commit for ${slug}`)
+      return { committed: false }
+    }
+    if (diff.status !== 1) {
+      runGit(['reset', '-q', '--', ...paths], gsdRoot, { allowFailure: true })
+      fail(`failed to inspect staged GSD diff: exit ${diff.status}`)
+    }
+    const commit = runGit(['commit', '-m', message], gsdRoot, { allowFailure: true })
+    if (commit.status !== 0) {
+      runGit(['reset', '-q', '--', ...paths], gsdRoot, { allowFailure: true })
+      fail(`GSD commit failed: ${commit.stderr.trim() || `exit ${commit.status}`}`)
+    }
+    console.log(`Committed GSD task ${slug}: ${message}`)
+    return { committed: true }
+  })
+}
+
+function taskMarkdown({ slug, name, type, summary, now, note }) {
+  const details = String(note || '').trim()
+  return `# ${name}\n\n- task_slug: ${slug}\n- 任务类型: ${type}\n- 状态: 运行中\n- 创建时间: ${now}\n- 最后更新: ${now}\n- 简述: ${summary}\n\n${details ? `${details}\n\n` : ''}## 备注\n`
+}
+
+export function newGsdTask(options = {}) {
+  const root = resolveProjectRoot(options)
+  const slug = normalizeSlug(options['task-slug'] || options.taskSlug)
+  const name = String(options['task-name'] || options.taskName || '').trim()
+  const summary = String(options.summary || '').trim()
+  if (!name || !summary || /[\r\n]/.test(name) || /[\r\n]/.test(summary)) fail('task name and summary must be non-empty single-line text')
+  initGsdRepo({ projectRoot: root })
+  const gsdRoot = join(root, '.gsd')
+  withGsdWriteLock(gsdRoot, () => {
+    assertEmptyGsdIndex(gsdRoot, 'task creation')
+    const directory = join(gsdRoot, slug)
+    if (pathExists(directory)) fail(`Task already exists: .gsd/${slug}`)
+    mkdirSync(join(directory, '.planning'), { recursive: true })
+    const now = nowIso()
+    writeText(join(directory, 'TASK.md'), taskMarkdown({ slug, name, type: 'generic', summary, now, note: '' }))
+  })
+  switchActiveTask({ ...options, projectRoot: root, taskSlug: slug, deferCommit: true })
+  gsdLocalCommit({ ...options, projectRoot: root, taskSlug: slug, message: `gsd(${slug}): 创建任务` })
+  console.log(`Created GSD task: ${slug}`)
+  return { root, slug }
+}
+
+export function setGsdTaskStatus(options = {}) {
+  const root = resolveProjectRoot(options)
+  const slug = normalizeSlug(options['task-slug'] || options.taskSlug)
+  const status = String(options.status || '').trim()
+  if (!['已暂停', '已完成'].includes(status)) fail(`invalid target status: ${status || '(empty)'}`)
+  const gsdRoot = join(root, '.gsd')
+  if (status === '已完成') assertFinalizationGate({ ...options, projectRoot: root, taskSlug: slug, requireCompleted: true, emit: false })
+  let changed = false
+  withGsdWriteLock(gsdRoot, () => {
+    assertEmptyGsdIndex(gsdRoot, 'task status update')
+    const task = readTaskRecord(root, slug)
+    if (!task) fail(`TASK.md missing for ${slug}`)
+    if (task.status === status) return
+    if (task.status === '已完成') fail(`completed task cannot be reopened: ${slug}`)
+    updateTaskStatusFile(root, slug, status)
+    updateStateStatus(root, slug, status === '已暂停' ? 'paused' : 'completed')
+    changed = true
+  })
+  if (changed) gsdLocalCommit({ ...options, projectRoot: root, taskSlug: slug, message: `gsd(${slug}): ${status === '已暂停' ? '暂停任务' : '完成任务'}` })
+  if (status === '已完成' && activeWorkstream(options, root) === slug) {
+    runGsdTools(options, ['query', 'workstream.set', '--clear', '--raw', '--cwd', root])
+  }
+  console.log(`GSD task status: ${slug} -> ${status}`)
+  return { root, slug, status, changed }
 }
 
 export function bootstrapAutouiTask(options = {}) {
   const root = resolveProjectRoot(options)
   const slug = normalizeSlug(options['task-slug'] || options.taskSlug)
   const name = String(options['task-name'] || options.taskName || '').trim()
-  if (!name) fail('task name is required')
-  const brief = String(options['user-brief'] || options.userBrief || '').trim() || '待 discuss 阶段补充'
+  if (!name || /[\r\n]/.test(name)) fail('task name must be non-empty single-line text')
+  const brief = String(options['user-brief'] || options.userBrief || '').trim().replace(/\s+/g, ' ') || '待 discuss 阶段补充'
+  initGsdRepo({ projectRoot: root })
   const gsdRoot = join(root, '.gsd')
-  if (!pathExists(gsdRoot)) initGsdRepo({ projectRoot: root })
-
   const taskDir = join(gsdRoot, slug)
-  if (pathExists(taskDir)) fail(`Task already exists: .gsd/${slug}`)
   const planningDir = join(taskDir, '.planning')
   const now = nowIso()
   const screenshotDir = join(gsdRoot, slug, 'evidence', 'screenshots')
-  mkdirSync(planningDir, { recursive: true })
-
-  const taskMd = `# ${name}\n\n- task_slug: ${slug}\n- 任务类型: autoui\n- 状态: 运行中\n- 创建时间: ${now}\n- 最后更新: ${now}\n- 简述: ${brief}\n\n## 备注\n\n本任务由 bootstrap-autoui-task 创建。编排与恢复走 GSD；UI 规范见 yiui-auto-ui。\n`
-  const pathsMd = `# 证据路径约定\n\n- task_slug: ${slug}\n- 项目根: ${root}\n\n## evidence（AI 证据，按需建子目录）\n\n- logs: .gsd/${slug}/evidence/logs/\n- uivision: .gsd/${slug}/evidence/uivision/\n- tool-results: .gsd/${slug}/evidence/tool-results/\n- screenshots: .gsd/${slug}/evidence/screenshots/\n\n## milestones（用户向里程碑，非 AI 恢复源）\n\n- MILESTONES.md: .gsd/${slug}/milestones/MILESTONES.md\n- AUTOUI-RECORD.md: .gsd/${slug}/milestones/AUTOUI-RECORD.md\n- images: .gsd/${slug}/milestones/images/\n\n## notes\n\n- RUNTIME-ENTRY.md: 主界面/OpenYIUI 跑通后填写\n- SERVER-GAPS.md: 上游协议/字段缺失时填写\n- AI-LIMITATIONS.md: 需人工验收项\n\n## 截图工具默认 outputDirectory\n\n${screenshotDir}\n\n## git 约定\n\n- markdown 与证据路径索引提交到 .gsd 本地 git\n- 大二进制截图默认只 commit 路径引用\n`
-  const milestonesMd = `# ${name} — 里程碑记录\n\n> 用户向回顾文档；**不作为 AI 恢复入口**。\n> 进度真相源：.planning/STATE.md、phase PLAN/SUMMARY。\n\n## 基本信息\n\n| 项目 | 内容 |\n|---|---|\n| task_slug | ${slug} |\n| 进度源 | ../TASK.md、.planning/STATE.md |\n| 图片目录 | images/ |\n| 当前状态 | 进行中 |\n\n## 关键节点总览\n\n| 时间 | 阶段 | 用户向说明 | 做了什么 | 当前效果 | 图片/素材 | 下一步 |\n|---|---|---|---|---|---|---|\n`
-  const projectMd = `# ${name}\n\n## What This Is\n\nAutoUI 长任务：${brief}\n\n任务类型：autoui。编排与恢复走 GSD；UI 闸门、证据与验收规范见 yiui-auto-ui。\n\n## Core Value\n\n在 AutoUI 规范下完成可运行、可验证、可恢复的 UI 交付闭环。\n\n## Requirements\n\n### Active\n\n- [ ] discuss：明确任务模式、ROADMAP、需求边界\n- [ ] plan：可执行准备闸门、验收用例、VERIFICATION 骨架\n- [ ] execute：按 phase PLAN 实现 UI / 逻辑 / 编译\n- [ ] verify：验证矩阵、经验写入 extra-ui-learnings（如适用）\n- [ ] ship：Done 总闸门与用户向 MILESTONES\n\n### Out of Scope\n\n- 未在 discuss 确认的协议/服务端改动\n- 未在 plan 写入边界的文件范围外修改\n\n## Context\n\n- 用户简述：${brief}\n- 证据目录：.gsd/${slug}/evidence/\n- 里程碑记录：.gsd/${slug}/milestones/MILESTONES.md\n\n## Constraints\n\n- **Git**: .gsd/ 不进 projectx 主仓库\n- **并发**: 同时仅 1 个运行中 GSD 任务\n- **AutoUI**: 须遵循 yiui-auto-ui（extra-ui-strategies.md + 任务经验写入 extra-ui-learnings.md）\n\n---\n*Created: ${now} by bootstrap-autoui-task*\n`
-
-  writeText(join(taskDir, 'TASK.md'), taskMd, { bom: true })
-  writeText(join(taskDir, 'notes', 'PATHS.md'), pathsMd, { bom: true })
-  writeText(join(taskDir, 'milestones', 'MILESTONES.md'), milestonesMd, { bom: true })
-  writeText(join(planningDir, 'PROJECT.md'), projectMd, { bom: true })
-
-  const trackerPath = join(gsdRoot, 'TRACKER.md')
-  const oldTracker = normalizeNewlines(readText(trackerPath) || DEFAULT_TRACKER)
-  writeText(trackerPath, buildTracker(root, slug, name, now, oldTracker), { bom: true })
-  switchActiveTask({ projectRoot: root, taskSlug: slug })
-  gsdLocalCommit({ projectRoot: root, message: `gsd(${slug}): 创建 autoui 任务` })
+  withGsdWriteLock(gsdRoot, () => {
+    assertEmptyGsdIndex(gsdRoot, 'AutoUI task creation')
+    if (pathExists(taskDir)) fail(`Task already exists: .gsd/${slug}`)
+    mkdirSync(planningDir, { recursive: true })
+    const taskMd = taskMarkdown({
+      slug,
+      name,
+      type: 'autoui',
+      summary: brief,
+      now,
+      note: `## AutoUI 初始范围\n\n- 核心价值：在 AutoUI 规范下完成可运行、可验证、可恢复的 UI 交付闭环。\n- 证据目录：.gsd/${slug}/evidence/\n- 里程碑记录：.gsd/${slug}/milestones/MILESTONES.md\n\n### 初始边界\n\n- 未在 discuss 确认的协议或服务端改动不在范围内。\n- 未在 plan 写入边界的文件范围外修改不在范围内。\n\n### 约束\n\n- \`.gsd/\` 不进入项目主仓库。\n- 允许多个不同 task_slug 为运行中；同一 task_slug 只允许一个写入者。\n- 共享源码范围重叠时必须串行执行或使用独立 Git worktree。\n- UI 闸门、证据与验收规范以 yiui-auto-ui 为准。`,
+    })
+    const pathsMd = `# 证据路径约定\n\n- task_slug: ${slug}\n- 项目根: ${root}\n\n## evidence（AI 证据，按需建子目录）\n\n- logs: .gsd/${slug}/evidence/logs/\n- uivision: .gsd/${slug}/evidence/uivision/\n- tool-results: .gsd/${slug}/evidence/tool-results/\n- screenshots: .gsd/${slug}/evidence/screenshots/\n\n## milestones（用户向里程碑，非 AI 恢复源）\n\n- MILESTONES.md: .gsd/${slug}/milestones/MILESTONES.md\n- AUTOUI-RECORD.md: .gsd/${slug}/milestones/AUTOUI-RECORD.md\n- images: .gsd/${slug}/milestones/images/\n\n## notes\n\n- RUNTIME-ENTRY.md: 主界面/OpenYIUI 跑通后填写\n- SERVER-GAPS.md: 上游协议/字段缺失时填写\n- AI-LIMITATIONS.md: 需人工验收项\n\n## 截图工具默认 outputDirectory\n\n${screenshotDir}\n\n## git 约定\n\n- markdown 与证据路径索引提交到 .gsd 本地 git\n- 大二进制截图默认只 commit 路径引用\n`
+    const milestonesMd = `# ${name} — 里程碑记录\n\n> 用户向回顾文档；**不作为 AI 恢复入口**。\n> 进度真相源：对应 workstream 的 STATE.md、phase PLAN/SUMMARY。\n\n## 基本信息\n\n| 项目 | 内容 |\n|---|---|\n| task_slug | ${slug} |\n| 进度源 | ../TASK.md、.planning/STATE.md |\n| 图片目录 | images/ |\n| 当前状态 | 进行中 |\n\n## 关键节点总览\n\n| 时间 | 阶段 | 用户向说明 | 做了什么 | 当前效果 | 图片/素材 | 下一步 |\n|---|---|---|---|---|---|---|\n`
+    writeText(join(taskDir, 'TASK.md'), taskMd, { bom: true })
+    writeText(join(taskDir, 'notes', 'PATHS.md'), pathsMd, { bom: true })
+    writeText(join(taskDir, 'milestones', 'MILESTONES.md'), milestonesMd, { bom: true })
+  })
+  switchActiveTask({ ...options, projectRoot: root, taskSlug: slug, deferCommit: true })
+  gsdLocalCommit({ ...options, projectRoot: root, taskSlug: slug, message: `gsd(${slug}): 创建 autoui 任务` })
   console.log(`Bootstrapped autoui task: ${slug}`)
   return { root, slug, taskDir, planningDir }
 }
@@ -381,35 +761,37 @@ export function renderCodexPlan(options = {}) {
   const trackerPath = join(root, '.gsd', 'TRACKER.md')
   if (!existsSync(trackerPath)) fail(`TRACKER.md 不存在，路径=${trackerPath}。`)
   const trackerContent = readText(trackerPath)
-  let taskStatus = parseTrackerField(trackerContent, '状态')
-  let activeTaskSlug = parseTrackerField(trackerContent, 'task_slug')
-  let taskName = parseTrackerField(trackerContent, '任务名称')
-  let currentPhase = parseTrackerField(trackerContent, '当前阶段')
   const requestedSlug = String(options['task-slug'] || options.taskSlug || '').trim()
-
-  if (requestedSlug) {
-    activeTaskSlug = normalizeSlug(requestedSlug)
-    const taskPath = join(root, '.gsd', activeTaskSlug, 'TASK.md')
-    if (!existsSync(taskPath)) fail(`指定任务缺少 TASK.md，task_slug=${activeTaskSlug}，路径=${taskPath}。`)
-    const taskContent = readText(taskPath)
-    taskStatus = parseTrackerField(taskContent, '状态')
-    const heading = taskContent.match(/^#\s+(.+?)\s*$/m)
-    taskName = heading ? heading[1].trim() : activeTaskSlug
+  let activeTaskSlug = requestedSlug ? normalizeSlug(requestedSlug) : activeWorkstream(options, root)
+  let legacyTrackerSelection = false
+  if (!activeTaskSlug) {
+    // Migration fallback only. New TRACKER files deliberately have no active block.
+    activeTaskSlug = parseTrackerField(trackerContent, 'task_slug')
+    legacyTrackerSelection = Boolean(activeTaskSlug)
   }
 
-  if (!activeTaskSlug || taskStatus === '无任务') {
+  if (!activeTaskSlug) {
     return {
       schema_version: 1,
       active: false,
       task_slug: '',
       task_name: '',
-      task_status: taskStatus,
+      task_status: '',
       source: trackerPath,
-      explanation: '当前没有活跃 GSD 任务。',
+      explanation: '当前会话没有选择 GSD 任务。',
       plan: [],
       diagnostics: [],
     }
   }
+
+  activeTaskSlug = normalizeSlug(activeTaskSlug)
+  const taskPath = join(root, '.gsd', activeTaskSlug, 'TASK.md')
+  if (!existsSync(taskPath)) fail(`指定任务缺少 TASK.md，task_slug=${activeTaskSlug}，路径=${taskPath}。`)
+  const taskContent = readText(taskPath)
+  const taskStatus = parseTrackerField(taskContent, '状态') || (legacyTrackerSelection ? parseTrackerField(trackerContent, '状态') : '')
+  const heading = taskContent.match(/^#\s+(.+?)\s*$/m)
+  const taskName = heading?.[1]?.trim() || (legacyTrackerSelection ? parseTrackerField(trackerContent, '任务名称') : '') || activeTaskSlug
+  let currentPhase = legacyTrackerSelection ? parseTrackerField(trackerContent, '当前阶段') : ''
 
   const planningPath = join(root, '.gsd', activeTaskSlug, '.planning')
   const statePath = join(planningPath, 'STATE.md')
@@ -654,7 +1036,12 @@ function readIntegerField(fields, name, minimum) {
 
 export function assertFinalizationGate(options = {}) {
   const root = resolveProjectRoot(options)
-  const statePath = resolve(options['state-path'] || options.statePath || join(root, '.planning', 'STATE.md'))
+  const explicitStatePath = String(options['state-path'] || options.statePath || '').trim()
+  let taskSlug = String(options['task-slug'] || options.taskSlug || '').trim()
+  if (!explicitStatePath && !taskSlug) taskSlug = activeWorkstream(options, root)
+  if (taskSlug) taskSlug = normalizeSlug(taskSlug)
+  if (!explicitStatePath && !taskSlug) fail('未指定 task_slug，且当前会话没有选择 GSD 任务。')
+  const statePath = resolve(explicitStatePath || join(root, '.gsd', taskSlug, '.planning', 'STATE.md'))
   if (!existsSync(statePath)) fail(`STATE.md 不存在，路径=${statePath}。`)
   const fields = parseFinalizationState(statePath)
   const changeGeneration = readIntegerField(fields, 'change_generation', 0)
@@ -674,7 +1061,9 @@ export function assertFinalizationGate(options = {}) {
     if (finalVerificationRuns < 1) fail(`尚无形成有效结果的最终验收，final_verification_runs=${finalVerificationRuns}。`)
   }
   const mode = requireCompleted ? '完成门禁' : '终验前门禁'
-  console.log(`${mode} 通过：STATE=${statePath}，change_generation=${changeGeneration}，scope_frozen=true，blocking_findings=0。`)
+  if (options.emit !== false) {
+    console.log(`${mode} 通过：STATE=${statePath}，change_generation=${changeGeneration}，scope_frozen=true，blocking_findings=0。`)
+  }
   return { statePath, changeGeneration, requireCompleted }
 }
 
@@ -694,8 +1083,35 @@ export function verifyInstall(options = {}) {
   const root = resolveProjectRoot(options)
   const state = { fail: false }
   const skillPath = join(root, '.agents', 'skills', 'yiui-gsd', 'SKILL.md')
+  const skillRoot = dirname(skillPath)
   console.log(`verify yiui-gsd @ ${root}`)
   verifyLine(existsSync(skillPath), 'project skill .agents/skills/yiui-gsd/SKILL.md', state)
+  for (const name of [
+    'extra-codex-agent-policy.md',
+    'extra-finalization-gate.md',
+    'extra-junction-bridge.md',
+    'extra-phrase-map.md',
+    'extra-planning-efficiency.md',
+    'extra-tracker-schema.md',
+  ]) {
+    verifyLine(existsSync(join(skillRoot, name)), `skill reference ${name}`, state)
+  }
+  for (const name of [
+    'apply-codex-agent-policy.ps1',
+    'assert-finalization-gate.ps1',
+    'bootstrap-autoui-task.ps1',
+    'gsd-local-commit.ps1',
+    'init-gsd-repo.ps1',
+    'new-gsd-task.ps1',
+    'render-codex-plan.ps1',
+    'set-gsd-task-status.ps1',
+    'switch-active-task.ps1',
+    'update-gsd-tracker.ps1',
+    'yiui-gsd.mjs',
+  ]) {
+    verifyLine(existsSync(join(skillRoot, 'scripts', name)), `skill script ${name}`, state)
+  }
+  verifyLine(!existsSync(join(skillRoot, 'scripts', 'bootstrap_autoui_task.py')), 'AutoUI bootstrap has no Python dependency', state)
 
   const claudeSkill = join(root, '.claude', 'skills', 'yiui-gsd')
   verifyLine(pathExists(claudeSkill) && existsSync(join(claudeSkill, 'SKILL.md')), 'claude skill entry resolves: .claude/skills/yiui-gsd', state)
@@ -764,6 +1180,12 @@ export function main(argv = process.argv.slice(2)) {
       return initGsdRepo(options)
     case 'switch-active-task':
       return switchActiveTask(options)
+    case 'new-gsd-task':
+      return newGsdTask(options)
+    case 'set-gsd-task-status':
+      return setGsdTaskStatus(options)
+    case 'update-gsd-tracker':
+      return updateGsdTracker(options)
     case 'gsd-local-commit':
       return gsdLocalCommit(options)
     case 'render-codex-plan':

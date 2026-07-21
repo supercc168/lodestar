@@ -14,6 +14,7 @@ function snap(partial: Partial<GsdSnapshot> = {}): GsdSnapshot {
     planningPath: '.gsd/demo-task/.planning/',
     note: '',
     bridge: { ok: true, kind: 'symlink', target: '.gsd/demo-task/.planning' },
+    unfinishedTasks: [],
     ...partial,
   }
 }
@@ -68,6 +69,50 @@ describe('gsd panel card rendering', () => {
     expect(json).toContain('等待任务名')
     expect(json).toContain('无任务')
     expect(json).toContain('gsd_new_prompt')
+  })
+
+  test('renders unfinished task list with single-character select buttons', () => {
+    const card = gsdPanelCard({
+      snapshot: snap({
+        status: '无任务',
+        taskSlug: '',
+        taskName: '',
+        unfinishedTasks: [
+          {
+            taskSlug: 'alpha',
+            taskName: 'Alpha',
+            taskType: 'generic',
+            status: '运行中',
+            phase: 'execute',
+            createdAt: 'a',
+            updatedAt: 'b',
+            summary: 'first task',
+          },
+          {
+            taskSlug: 'beta',
+            taskName: 'Beta',
+            taskType: 'generic',
+            status: '已暂停',
+            phase: 'plan',
+            createdAt: 'a',
+            updatedAt: 'c',
+            summary: '',
+          },
+        ],
+      }),
+      providerLabel: 'codex',
+      panelGen: 'gen-list',
+    }) as any
+
+    const json = JSON.stringify(card)
+    expect(json).toContain('当前会话：未选择任务')
+    expect(json).toContain('Alpha')
+    expect(json).toContain('Beta')
+    expect(json).toContain('gsd_select')
+    expect(json.match(/"content":"选"/g)).toHaveLength(2)
+    expect(json).not.toContain('gsd_continue')
+    expect(json).not.toContain('gsd_pause')
+    expect(json).not.toContain('gsd_complete')
   })
 
   test('reports bridge unhealthy', () => {

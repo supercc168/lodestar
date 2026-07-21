@@ -79,7 +79,7 @@ lodestar-setup
 | `clear` / `cl` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
 | `compact` / `cm` | 主动触发当前 thread 的上下文压缩,完成后状态卡收束 |
 | `model` / `md` | 展示四个固定档位(Claude·Fable 5 / Opus 4.8 / GLM · Codex·GPT-5.5),一键生效,按群持久化 |
-| `gsd` | 打开 GSD 状态卡(进度/继续/暂停/完成/新任务);跟随当前 model,规划只走 yiui-gsd |
+| `gsd` | 打开 GSD 状态卡(未完成任务/选/进度/继续/暂停/完成/新任务);选择只绑定当前会话,跟随当前 model,规划只走 yiui-gsd |
 | `task` | 打开项目任务清单面板,启用飞书任务清单自动化（预览版） |
 
 **GSD / yiui-gsd(其它设备 checkout 后)**
@@ -94,6 +94,8 @@ bash install/yiui-gsd/verify.sh           # 装完校验
 ```
 
 安装器默认用 Node.js >= 18 重放并校验 Codex 子 agent 策略，不依赖 macOS 的 `pwsh`；`pwsh` 入口仅保留给 Windows 或旧脚本调用。
+
+任务真相源是 `.gsd/TRACKER.md` 与 `.gsd/<slug>/.planning/STATE.md`。允许多个 slug 同时为运行中；根 `.planning/` 只提供稳定的 `workstreams/<slug>` 路由和共享 `PROJECT.md`，不再指向单个任务。
 
 说明与参数见 [`install/yiui-gsd/README.md`](install/yiui-gsd/README.md)。Lodestar daemon 仍需 `bun run build` + 重启;飞书侧发 `gsd` 开状态卡。
 

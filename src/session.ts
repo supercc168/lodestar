@@ -556,6 +556,8 @@ export class Session {
   gsdPanelGen = ''
   /** Until-ms for “new task name” capture; 0 = off. */
   gsdAwaitingNameUntil = 0
+  /** Session-local selected GSD workstream; task status remains disk-backed. */
+  gsdSelectedTaskSlug = ''
   /**
    * Session-local: this chat is currently executing GSD for `taskSlug`.
    * Set on GSD inject / `[Lodestar GSD]` user text; cleared on pause/complete/
@@ -2379,6 +2381,10 @@ export class Session {
 
   onGsdRefresh(taskSlug: string, panelGen: string | null = null): Promise<GsdActionResult> {
     return sessionGsd.onGsdRefresh(this, taskSlug, panelGen)
+  }
+
+  onGsdSelect(taskSlug: string, panelGen: string | null = null): Promise<GsdActionResult> {
+    return sessionGsd.onGsdSelect(this, taskSlug, panelGen)
   }
 
   onGsdContinue(taskSlug: string, panelGen: string | null = null): Promise<GsdActionResult> {

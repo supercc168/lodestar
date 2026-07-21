@@ -20,7 +20,7 @@
 - 网络可访问 npm
 - macOS / Linux：`bash` + Node.js ≥ 18
 - Windows：Node.js ≥ 18；若使用 `.ps1` 安装入口还需要 PowerShell 5+ 或 `pwsh`
-- agent policy、计划投影和任务 bridge 的实际逻辑由 `scripts/yiui-gsd.mjs` 提供，不依赖 PowerShell
+- agent policy、任务生命周期、TRACKER 聚合、计划投影和 workstream 路由的实际逻辑由 `scripts/yiui-gsd.mjs` 提供，不依赖 PowerShell
 
 ## 用法
 
@@ -79,6 +79,8 @@ bash install/yiui-gsd/install.sh --skip-core --project ~/work/foo
 - 项目存在 `.agents/skills/yiui-gsd/SKILL.md`
 - `.claude/skills/yiui-gsd` 可解析到该 skill
 - 项目 `.agents/skills` **没有**官方 `gsd-*` 副本
+- `extra-planning-efficiency.md`、三个新任务命令包装层和 Node helper 均存在
+- AutoUI bootstrap 不依赖 Python，所有 `.ps1` 只转发到 Node helper
 
 ## 与文档关系
 
@@ -94,6 +96,9 @@ bash install/yiui-gsd/install.sh --skip-core --project ~/work/foo
 node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs <command> [options]
 ```
 
-支持 `init-gsd-repo`、`switch-active-task`、`gsd-local-commit`、`render-codex-plan`、
-`apply-agent-policy`、`assert-finalization-gate`、`bootstrap-autoui-task` 和 `verify-install`。
+支持 `init-gsd-repo`、`new-gsd-task`、`switch-active-task`、`set-gsd-task-status`、
+`update-gsd-tracker`、`gsd-local-commit`、`render-codex-plan`、`apply-agent-policy`、
+`assert-finalization-gate`、`bootstrap-autoui-task` 和 `verify-install`。
 同名 `.ps1` 文件保留为 Windows/旧提示词的转发包装层。这样 macOS 上即使 PowerShell 启动缓存损坏，也不影响安装、策略校验或 GSD 状态操作。
+
+初始化后的根 `.planning/` 是稳定目录；每个 `.planning/workstreams/<slug>` 在 Unix 使用 symlink、Windows 使用 junction 指向 `.gsd/<slug>/.planning/`，共享 `.planning/PROJECT.md` 与 `.gsd/PROJECT.md` 是同一硬链接文件。TRACKER 只列未完成任务，不保存当前会话选择。
