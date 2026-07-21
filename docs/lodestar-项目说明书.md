@@ -309,7 +309,7 @@ effort     = "xhigh"           # GLM-5.2 最高思维强度
 [claude]
 bin = "~/.local/bin/reclaude"
 ```
-重启 daemon,日志出现 `executable=config:…/reclaude` 即生效。
+重启 daemon,日志出现 `executable=config-reclaude-sdk-native:…/reclaude` 即生效。
 
 ### 外部项目隔离接入(高级)
 让一个不在项目根目录下的外部项目,以受限工具集和自己的 MCP 干净运行:

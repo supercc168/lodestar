@@ -7,7 +7,7 @@
 import { SERVICE_LABEL, type SysInfo } from '../sysinfo'
 import type { UsageSnapshot } from '../usage'
 import type { GlmUsageSnapshot } from '../glm-usage'
-import type { AgentProvider } from '../agent-process'
+import { usageSourceForAgent, type AgentProvider, type AgentUsageSource } from '../agent-process'
 import { ELEMENTS } from './elements'
 
 export interface ConsoleOpts {
@@ -16,6 +16,9 @@ export interface ConsoleOpts {
   provider?: AgentProvider
   model?: string
   effort?: string
+  /** Quota source for the runtime model/profile. Explicitly distinguishes
+   * Claude login/relay models from the GLM Coding Plan route. */
+  usageSource?: AgentUsageSource
   worktreeInstructionNotice?: string | null
   /** All sessions currently running Codex across every Feishu group
    * this daemon owns. Each entry is a sibling project. Empty/undefined
@@ -244,6 +247,11 @@ export function consoleGlmUsageContent(glmUsage: GlmUsageSnapshot | undefined): 
   return lines.length === 1 ? '**📊 GLM 额度**　_无数据_' : lines.join('\n')
 }
 
+export function consoleUsageNotApplicableContent(model?: string): string {
+  const detail = model ? ` — \`${model}\` 无可查询额度源` : ''
+  return `**📊 额度**　不适用${detail}`
+}
+
 function fmtUsagePercent(percent: number | null | undefined): string {
   return typeof percent === 'number' && Number.isFinite(percent) ? `${Math.round(percent)}%` : 'MISS'
 }
@@ -397,13 +405,14 @@ export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.conso
   }
 }
 
-/** 订阅额度行 —— 按当前 provider 渲染 Codex(src/usage.ts)或 GLM
- * (src/glm-usage.ts)那一行,始终一行(方案 C)。复用同一个 element_id,
- * content 随 provider 分流;patch 时也只补当前后端那一个数据源。 */
+/** 订阅额度行 —— 按实际 runtime profile 渲染 Codex、GLM 或明确不适用。 */
 export function consoleUsageElement(opts: ConsoleOpts): object {
-  const content = opts.provider === 'claude'
+  const usageSource = opts.usageSource ?? usageSourceForAgent(opts.provider ?? 'codex', opts.model)
+  const content = usageSource === 'glm'
     ? consoleGlmUsageContent(opts.glmUsage)
-    : consoleUsageContent(opts.usage)
+    : usageSource === 'codex'
+      ? consoleUsageContent(opts.usage)
+      : consoleUsageNotApplicableContent(opts.model)
   return {
     tag: 'markdown',
     element_id: ELEMENTS.consoleUsage,

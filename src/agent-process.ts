@@ -16,6 +16,7 @@ import type {
 export type AgentProvider = 'codex' | 'claude'
 export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort
+export type AgentUsageSource = 'codex' | 'glm' | 'not_applicable'
 export type CollabAgentStates = Record<string, { status?: string }>
 
 export type CodexUserTextSettlement =
@@ -56,6 +57,17 @@ export function isClaudeReasoningEffort(value: unknown): value is ClaudeReasonin
 
 export function providerFromModel(model: string | null | undefined): AgentProvider {
   return model?.startsWith('claude:') ? 'claude' : 'codex'
+}
+
+/** Quota source for the actual runtime profile. Claude login models and
+ * non-GLM relays do not share GLM Coding Plan quota, so they must not inherit
+ * the daemon-wide GLM snapshot merely because they use the Claude backend. */
+export function usageSourceForAgent(
+  provider: AgentProvider,
+  model: string | null | undefined,
+): AgentUsageSource {
+  if (provider === 'codex') return 'codex'
+  return /^claude:glm(?:$|[-_])/i.test(model ?? '') ? 'glm' : 'not_applicable'
 }
 
 export function agentProviderLabel(provider: AgentProvider): string {

@@ -698,6 +698,22 @@ describe('codex process compaction notifications', () => {
   })
 })
 
+describe('codex model settings boundary', () => {
+  test('rejects live model updates without sending thread/settings/update', async () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const requests: string[] = []
+    proc.opts = { workDir: '/tmp', model: 'old-model', effort: 'high' }
+    proc.sessionId = 'thread-model-settings'
+    proc.readyPromise = Promise.resolve()
+    proc.request = async (method: string) => { requests.push(method) }
+
+    await expect(proc.setModelSettings('gpt-5.6-sol', 'max'))
+      .rejects.toThrow('does not support live model settings')
+    expect(requests).toEqual([])
+    expect(proc.opts).toMatchObject({ model: 'old-model', effort: 'high' })
+  })
+})
+
 describe('codex structured progress notifications', () => {
   test('preserves dynamic tool input and camelCase completion content from stdin notifications', () => {
     const { proc, events } = notificationHarness()

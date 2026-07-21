@@ -36,6 +36,7 @@ import {
   CLAUDE_EFFORT,
   agentProviderLabel,
   isClaudeReasoningEffort,
+  usageSourceForAgent,
   type AgentProcess,
   type AgentProvider,
   type AgentReasoningEffort,
@@ -672,6 +673,36 @@ export class Session {
   isRunning(): boolean { return !!this.proc && this.proc.isAlive() }
   currentProvider(): AgentProvider { return this.selectedProvider }
 
+  /** Work that makes replacing an otherwise idle process destructive. Keep
+   * this as the single predicate for both the model picker and the final stop
+   * boundary so newly-added queue/input states cannot drift between them. */
+  private hasProcessMutationBlockingWork(): boolean {
+    return this.status === 'starting' ||
+      this.currentTurn !== null ||
+      this.openingTurn ||
+      this.pendingHumanDelivery !== null ||
+      this.ackedHumanDelivery !== null ||
+      this.restoredHumanDelivery !== null ||
+      this.pendingUserMessageCount > 0 ||
+      this.hasQueuedHumanWork() ||
+      this.pendingPermissions.size > 0 ||
+      this.pendingAsks.size > 0 ||
+      this.pendingHostAsks.size > 0 ||
+      this.manualContextCompactionPending ||
+      this.backgroundTasks.some(task => !cards.isBgTerminal(task)) ||
+      this.pendingBgTasks.some(task => !cards.isBgTerminal(task)) ||
+      this.activeCodexSubagentActivities.size > 0 ||
+      this.codexCollabAgentStates.size > 0 ||
+      this.watchdogActionInFlight ||
+      this.hasPreservedWatchdogRecovery() ||
+      this.startingAgy ||
+      this.runningAgy !== null
+  }
+
+  isModelSwitchBusy(): boolean {
+    return this.modelSwitchPending || this.hasProcessMutationBlockingWork()
+  }
+
   beginLifecycle(kind: LifecycleKind): LifecycleLease {
     const lease = Object.freeze({ epoch: ++this.lifecycleEpoch, kind })
     this.lifecycleOwner = lease
@@ -1204,14 +1235,47 @@ export class Session {
       ?? (this.selectedProvider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
   }
 
-  private modelEffortLabel(): string {
-    const model = this.currentModelLabel()
-    const effort = this.currentEffortLabel()
-    return model ? `${model}/${effort}` : effort
+  /** Actual process selection for cards and status text. selected* is the
+   * persisted target; a still-running old process remains authoritative until
+   * it is replaced. Profile keys win when they identify that same process so
+   * source-specific routing (codex:<slug>/claude:glm) is not lost. */
+  private runtimeModelSelection(): Pick<TurnState, 'provider' | 'model' | 'effort' | 'usageSource'> {
+    const proc = this.proc?.isAlive() ? this.proc : null
+    const provider = proc?.provider ?? this.selectedProvider
+    const selectedMatchesProc = !proc || proc.provider === this.selectedProvider
+    const model = selectedMatchesProc
+      ? this.selectedModel ?? proc?.lastModel ?? null
+      : proc?.lastModel ?? null
+    const effort = selectedMatchesProc
+      ? this.selectedEffort
+        ?? proc?.lastEffort
+        ?? (provider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
+      : proc?.lastEffort ?? (provider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
+    return {
+      provider,
+      model,
+      effort,
+      usageSource: usageSourceForAgent(provider, model),
+    }
   }
 
-  withModel(text: string): string {
-    const label = this.modelEffortLabel()
+  private modelEffortLabel(
+    selection: Pick<TurnState, 'provider' | 'model' | 'effort'> = this.currentTurn ?? this.runtimeModelSelection(),
+  ): string {
+    const shownModel = selection.provider === 'claude'
+      ? selection.model?.replace(/^claude:/i, '')
+      : selection.model
+    const label = shownModel ? `${shownModel}/${selection.effort}` : selection.effort
+    return selection.provider === 'claude'
+      ? `${agentProviderLabel(selection.provider)} · ${label}`
+      : label
+  }
+
+  withModel(
+    text: string,
+    selection?: Pick<TurnState, 'provider' | 'model' | 'effort'>,
+  ): string {
+    const label = this.modelEffortLabel(selection)
     return text.includes(label) ? text : `${text} · ${label}`
   }
 
@@ -1223,16 +1287,10 @@ export class Session {
     })
   }
 
-  private modelLine(): string {
-    const model = this.currentModelLabel()
-    const effort = this.currentEffortLabel()
-    // claude 路径:provider 已显示 "Claude",model 去掉 "claude:" 前缀,
-    // 否则 footer 会变成 "Claude · claude:GLM-5.2[1m]/max" 两个 claude。
-    const shownModel = this.selectedProvider === 'claude'
-      ? model?.replace(/^claude:/i, '')
-      : model
-    const label = shownModel ? `${shownModel}/${effort}` : effort
-    return this.selectedProvider === 'claude' ? `${agentProviderLabel(this.selectedProvider)} · ${label}` : label
+  private modelLine(
+    selection?: Pick<TurnState, 'provider' | 'model' | 'effort'>,
+  ): string {
+    return this.modelEffortLabel(selection)
   }
 
   backendLabel(provider: AgentProvider = this.selectedProvider): string {
@@ -1294,11 +1352,14 @@ export class Session {
     lease?: LifecycleLease,
   ): Promise<boolean> {
     if (lease && !this.ownsLifecycle(lease)) return false
+    const previousProvider = this.selectedProvider
     this.selectedProvider = provider
     this.selectedModel = model
     this.selectedEffort = effort
     this.lastSessionId = feishu.getSessionResume(this.sessionName, provider)
-    feishu.clearTurnAnchors(this.sessionName)  // provider 切换 → 旧 provider 的 assistant uuid 配不上新 sid,清锚点
+    if (previousProvider !== provider) {
+      feishu.clearTurnAnchors(this.sessionName)
+    }
     feishu.bindSessionModel(this.sessionName, provider, model, effort)
     await this.stopIdleMismatchedProcess(lease)
     return !lease || this.ownsLifecycle(lease)
@@ -1308,7 +1369,7 @@ export class Session {
     if (lease && !this.ownsLifecycle(lease)) return
     if (!this.proc?.isAlive()) return
     if (this.proc.provider === this.selectedProvider) return
-    if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return
+    if (this.hasProcessMutationBlockingWork()) return
     const proc = this.proc
     this.cancelTurnInterrupt('idle provider switch')
     log(`session "${this.sessionName}": stop idle ${proc.provider} process after switching to ${this.selectedProvider}`)
@@ -1331,7 +1392,7 @@ export class Session {
   async stopIdleCurrentProcess(reason: string, lease?: LifecycleLease): Promise<boolean> {
     if (lease && !this.ownsLifecycle(lease)) return false
     if (!this.proc?.isAlive()) return false
-    if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return false
+    if (this.hasProcessMutationBlockingWork()) return false
     const proc = this.proc
     this.cancelTurnInterrupt(`idle process stop: ${reason}`)
     log(`session "${this.sessionName}": stop idle ${proc.provider} process: ${reason}`)
@@ -1347,7 +1408,11 @@ export class Session {
     this.status = 'stopped'
     this.opts.onLifecycleChange?.()
     await proc.kill(1000)
-    return true
+    if (lease && !this.ownsLifecycle(lease)) return false
+    // A multi-message marker or another host-side interaction can arrive
+    // while kill awaits without acquiring a lifecycle lease. Preserve it and
+    // make the caller abort instead of following with a destructive restart.
+    return !this.hasProcessMutationBlockingWork()
   }
 
   private startFooterTimer(
@@ -2385,13 +2450,15 @@ export class Session {
     usage: UsageSnapshot | undefined,
     glmUsage?: GlmUsageSnapshot,
   ): Promise<cards.ConsoleOpts> {
+    const runtime = this.runtimeModelSelection()
     const sysinfo = await readSysInfo()
     return {
       sessionName: this.sessionName,
       status: this.status,
-      provider: this.selectedProvider,
-      model: this.currentModelLabel() ?? undefined,
-      effort: this.currentEffortLabel(),
+      provider: runtime.provider,
+      model: runtime.model ?? undefined,
+      effort: runtime.effort,
+      usageSource: runtime.usageSource,
       worktreeInstructionNotice: this.worktreeInstructionLoadedNotice(),
       peers: [...Session.all]
         .filter(s => s.isRunning())
@@ -2409,23 +2476,23 @@ export class Session {
     return cards.consoleCard(await this.buildConsoleOpts(usage))
   }
 
-  private async patchConsoleUsage(cardId: string): Promise<void> {
-    // 按当前 provider 只拉对应后端那一个数据源(方案 C,始终一行):
-    //   claude/GLM → src/glm-usage.ts(open.bigmodel.cn / z.ai quota/limit)
-    //   codex      → src/usage.ts(codex app-server rate-limit)
-    const opts = await this.buildConsoleOpts(undefined)
-    if (this.currentProvider() === 'claude') {
+  private async patchConsoleUsage(cardId: string, snapshot: cards.ConsoleOpts): Promise<void> {
+    // The card header and this quota row must come from the same runtime
+    // selection. Clone the creation-time snapshot instead of re-reading the
+    // mutable session after send/id-convert/network awaits.
+    const opts: cards.ConsoleOpts = { ...snapshot, usage: undefined, glmUsage: undefined }
+    if (opts.usageSource === 'glm') {
       opts.glmUsage = await readGlmUsage()
-    } else {
-      opts.usage = await readUsage(this.currentModelLabel() ?? undefined)
+    } else if (opts.usageSource === 'codex') {
+      opts.usage = await readUsage(opts.model)
     }
     await cardkit.replaceElement(cardId, cards.ELEMENTS.consoleUsage, cards.consoleUsageElement(opts))
   }
 
-  private patchConsoleUsageLater(cardId: string): void {
+  private patchConsoleUsageLater(cardId: string, snapshot: cards.ConsoleOpts): void {
     void (async () => {
       try {
-        await this.patchConsoleUsage(cardId)
+        await this.patchConsoleUsage(cardId, snapshot)
       } catch (e) {
         log(`session "${this.sessionName}": consoleUsage patch failed: ${e}`)
       } finally {
@@ -2465,7 +2532,7 @@ export class Session {
       durationSec: elapsed,
       suffix: finalStatus,
     }))
-    this.patchConsoleUsageLater(handle.cardId)
+    this.patchConsoleUsageLater(handle.cardId, consoleOpts)
   }
 
   async showConsole(): Promise<void> {
@@ -2473,7 +2540,8 @@ export class Session {
     // `_加载中…_` placeholder in the consoleUsage element. We patch
     // it in below once readUsage() resolves; not worth blocking the
     // panel on the Codex account/rate-limit round trip.
-    const card = await this.buildConsoleCard(undefined)
+    const consoleOpts = await this.buildConsoleOpts(undefined)
+    const card = cards.consoleCard(consoleOpts)
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) return
     // Patch the usage element asynchronously so the rest of the panel
@@ -2483,7 +2551,7 @@ export class Session {
       let cardId = ''
       try {
         cardId = await cardkit.convertMessageToCard(messageId)
-        await this.patchConsoleUsage(cardId)
+        await this.patchConsoleUsage(cardId, consoleOpts)
       } catch (e) {
         log(`session "${this.sessionName}": consoleUsage patch failed: ${e}`)
       } finally {
@@ -4483,7 +4551,7 @@ export class Session {
       try {
         await this.replaceFooterContent(
           ctx.turn.cardId,
-          this.withModel(ctx.turn.footerStatusOverride),
+          this.withModel(ctx.turn.footerStatusOverride, ctx.turn),
         )
       } catch (e) {
         log(`session "${this.sessionName}": watchdog footer patch failed: ${messageOf(e)}`)
@@ -4693,7 +4761,7 @@ export class Session {
       try {
         await this.replaceFooterContent(
           ctx.turn.cardId,
-          this.withModel(ctx.turn.footerStatusOverride),
+          this.withModel(ctx.turn.footerStatusOverride, ctx.turn),
         )
       } catch (e) {
         log(`session "${this.sessionName}": watchdog exhausted footer patch failed: ${messageOf(e)}`)
@@ -4965,6 +5033,7 @@ export class Session {
     } = {},
   ): Promise<TurnCardOpenResult> {
     if (opts.expectedProc && this.proc !== opts.expectedProc) return { kind: 'stale' }
+    const turnSelection = this.runtimeModelSelection()
     const watchdogOpeningTurnCounter = this.turnCounter + 1
     const watchdogOpeningProc = opts.expectedProc ?? this.proc
     const openingTurn = this.currentTurn
@@ -5014,13 +5083,13 @@ export class Session {
     this.pendingTurnInputs = []
     this.lastTurnUserPreview = userInputs[0]?.slice(0, 80) ?? this.lastTurnUserPreview
     log(`session "${this.sessionName}": openTurnCard turn=${turn} trigger=${trigger} inputs=${userInputs.length}`)
-    const initialFooter = this.withModel(opts.initialFooter ?? 'Waiting...(0s)')
+    const initialFooter = this.withModel(opts.initialFooter ?? 'Waiting...(0s)', turnSelection)
     const card = cards.mainConversationCard({
       sessionName: this.sessionName,
       turn,
-      provider: this.proc?.provider ?? this.selectedProvider,
-      model: this.currentModelLabel() ?? undefined,
-      effort: this.currentEffortLabel(),
+      provider: turnSelection.provider,
+      model: turnSelection.model ?? undefined,
+      effort: turnSelection.effort,
       kind: trigger,
       userInputs,
       initialFooter,
@@ -5137,6 +5206,7 @@ export class Session {
     cardkit.recordCardCreated(cardId, initialElementCount, (code) => this.onCardWriteFailure(cardId, code))
     const turnState: TurnState = {
       cardId,
+      ...turnSelection,
       messageId,
       userOpenId,
       trigger,
@@ -5277,9 +5347,9 @@ export class Session {
         const card = cards.mainConversationCard({
           sessionName: this.sessionName,
           turn: this.turnCounter,
-          provider: this.proc?.provider ?? this.selectedProvider,
-          model: this.currentModelLabel() ?? undefined,
-          effort: this.currentEffortLabel(),
+          provider: turn.provider,
+          model: turn.model ?? undefined,
+          effort: turn.effort,
           kind: 'card_full',
           userInputs: [],
         })
@@ -5372,7 +5442,7 @@ export class Session {
           const compactNote = turn.contextCompactCount > 0
             ? ` · 🚨 压缩×${turn.contextCompactCount}`
             : ''
-          await this.replaceFooterContent(oldCardId, this.withModel(`📨 已续至下一张卡 ↓${compactNote}`))
+          await this.replaceFooterContent(oldCardId, this.withModel(`📨 已续至下一张卡 ↓${compactNote}`, turn))
           cardkit.cancelSummary(oldCardId)
           await cardkit.patchSettings(oldCardId, cards.streamingOffSettings({ suffix: '📨 转下一张' }))
           await cardkit.dispose(oldCardId)
@@ -5753,7 +5823,7 @@ export class Session {
     if (!turn?.footerStatusHandle || !turn.footerStatusLabel) return
     const elapsedS = Math.max(0, Math.floor((now - turn.footerStatusStartedAt) / 1000))
     const content = turn.footerStatusOverride ?? `${turn.footerStatusLabel}(${elapsedS}s)`
-    void this.replaceFooterContent(turn.cardId, this.withModel(content)).catch(e => {
+    void this.replaceFooterContent(turn.cardId, this.withModel(content, turn)).catch(e => {
       log(`session "${this.sessionName}": footer status patch failed: ${messageOf(e)}`)
     })
   }
@@ -5794,22 +5864,23 @@ export class Session {
     turn.footerStatusLabel = null
   }
 
-  /** turn footer 末尾的 5h 额度后缀(`  |  5h·N%·[Xh]`),按当前 provider:
-   *   claude/GLM → readGlmUsage(轻量 HTTP,主动拉当前 5h 窗口)
-   *   codex      → peekUsage(turn 中 updateUsageFromRateLimits 已更新 cache,
-   *                纯读不 fetch,避免每轮为一个百分比 spawn codex app-server)
+  /** turn footer 末尾的 5h 额度后缀(`  |  5h·N%·[Xh]`),按本 turn
+   * 冻结的 usage source 路由。Claude 登录/非 GLM relay 明确不适用；
+   * codex:<slug> 第三方档位不复用可能属于 ChatGPT 的全局缓存。
    * 拿不到百分比就返回空串;resetsAt 在未来时追加剩余重置时长
    * (`·[2.3h]`),缺数据不硬凑 —— footer 不假数据 (no_fallbacks)。 */
-  private async footerFiveHourSuffix(): Promise<string> {
+  private async footerFiveHourSuffix(
+    turn: Pick<TurnState, 'usageSource' | 'model'>,
+  ): Promise<string> {
     let pct: number | null = null
     let resetsAt: Date | null = null
-    if (this.proc?.provider === 'claude') {
+    if (turn.usageSource === 'glm') {
       const g = await readGlmUsage()
       if (g.state === 'ok') {
         pct = g.fiveHour?.percent ?? null
         resetsAt = g.fiveHour?.resetsAt ?? null
       }
-    } else {
+    } else if (turn.usageSource === 'codex' && !turn.model?.startsWith('codex:')) {
       const u = peekUsage()
       if (u?.state === 'ok') {
         pct = u.fiveHour?.percent ?? null
@@ -5886,7 +5957,7 @@ export class Session {
       const ctxMax = this.contextLimitForDisplay()
       // Claude 路径分母已是 SDK 实测窗口、分子是输入侧占用,走纯除法(baseline=0);
       // Codex 路径保留 12K baseline 扣减。
-      const isClaude = this.proc?.provider === 'claude'
+      const isClaude = turn.provider === 'claude'
       const ctxPercent = cards.footerContextPercentLabel(ctxTokens, ctxMax, isClaude ? 0 : undefined)
       if (ctxPercent) line1Parts.push(`🧠 ${ctxPercent}`)
       const cost = this.lastTurnDelta?.costUsd ?? 0
@@ -5894,11 +5965,11 @@ export class Session {
     }
     if (turn.contextCompactCount > 0) line1Parts.push(`🚨 压缩×${turn.contextCompactCount}`)
     if (turn.outboundSentPaths.size > 0) line1Parts.push(`📎 ${turn.outboundSentPaths.size}`)
-    const modelLabel = this.modelLine()
+    const modelLabel = this.modelLine(turn)
     if (modelLabel) line1Parts.push(modelLabel)
     const footerLine1 = line1Parts.join(' ｜ ')
     const footerLine2 = opts.hasFreshResult
-      ? cards.footerTokenDetailLine(this.lastTurnUsage) + (turn.rotateGivenUp ? '' : await this.footerFiveHourSuffix())
+      ? cards.footerTokenDetailLine(this.lastTurnUsage) + (turn.rotateGivenUp ? '' : await this.footerFiveHourSuffix(turn))
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
     await this.replaceFooterContent(cardId, footer)

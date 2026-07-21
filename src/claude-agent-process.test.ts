@@ -1,5 +1,5 @@
 import { homedir, tmpdir } from 'node:os'
-import { mkdtempSync, mkdirSync, writeFileSync, unlinkSync, rmSync } from 'node:fs'
+import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, unlinkSync, rmSync } from 'node:fs'
 import { delimiter, join, win32 } from 'node:path'
 import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 
@@ -230,12 +230,18 @@ describe('Claude model profiles', () => {
     }
   })
 
-  test('buildSpawnEnv: GLM 档位注入 per-档位 env 别名映射(ANTHROPIC_DEFAULT_*);官方档位不注入', () => {
+  test('buildSpawnEnv: scrubs every inherited model alias, then reinjects only the selected API profile', () => {
     const prevModels = config.claude.models
-    // 清掉宿主 process.env 里残留的全局别名映射(模拟 Task5 删 [claude.env] 污染后),
-    // 否则官方档位会继承宿主的 DEFAULT_OPUS=claude-fable-5,干扰"零注入"断言。
-    const prevDefaultOpus = process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
-    delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
+    const prevEnv = config.claude.env
+    const aliasKeys = [
+      'ANTHROPIC_DEFAULT_FABLE_MODEL',
+      'ANTHROPIC_DEFAULT_OPUS_MODEL',
+      'ANTHROPIC_DEFAULT_SONNET_MODEL',
+      'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    ] as const
+    const previousAliases = Object.fromEntries(aliasKeys.map(key => [key, process.env[key]]))
+    for (const key of aliasKeys) process.env[key] = `shell-stale-${key}`
+    ;(config.claude as any).env = Object.fromEntries(aliasKeys.map(key => [key, `config-stale-${key}`]))
     ;(config.claude as any).models = {
       glm: {
         model: 'glm-5.2[1m]',
@@ -252,24 +258,30 @@ describe('Claude model profiles', () => {
       const glm = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:glm' })
       const glmEnv = (glm as any).buildSpawnEnv()
       expect(glmEnv.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic')
+      expect(glmEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.2[1m]')
       expect(glmEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.2[1m]')
       expect(glmEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5-turbo')
+      expect(glmEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5-turbo')
 
-      // 官方登录档位:不注入任何 per-档位 env,opus/sonnet 别名走 CC 默认解析。
+      // 官方登录档位:宿主和 [claude.env] 的四种别名都不能泄漏进子进程。
       const opus = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:opus' })
       const opusEnv = (opus as any).buildSpawnEnv()
-      expect(opusEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBeUndefined()
+      for (const key of aliasKeys) expect(opusEnv[key]).toBeUndefined()
       expect(opusEnv.ANTHROPIC_BASE_URL).toBeUndefined()
     } finally {
       ;(config.claude as any).models = prevModels
-      if (prevDefaultOpus === undefined) delete process.env.ANTHROPIC_DEFAULT_OPUS_MODEL
-      else process.env.ANTHROPIC_DEFAULT_OPUS_MODEL = prevDefaultOpus
+      ;(config.claude as any).env = prevEnv
+      for (const key of aliasKeys) {
+        const previous = previousAliases[key]
+        if (previous === undefined) delete process.env[key]
+        else process.env[key] = previous
+      }
     }
   })
 })
 
 describe('Claude configured executable ([claude] bin)', () => {
-  test('uses configured bin as the SDK executable', () => {
+  test('wraps configured reclaude around the SDK-native custom spawn', () => {
     const bin = '/home/me/.local/bin/reclaude'
     const executable = resolveClaudeExecutableConfig({
       platform: 'linux',
@@ -277,83 +289,42 @@ describe('Claude configured executable ([claude] bin)', () => {
       exists: path => path === bin,
     })
 
-    expect(executable.pathToClaudeCodeExecutable).toBe(bin)
-    expect(executable.spawnClaudeCodeProcess).toBeUndefined()
-    expect(executable.description).toBe(`config:${bin}`)
-  })
-
-  test('throws instead of silently falling back when configured bin is missing', () => {
-    expect(() => resolveClaudeExecutableConfig({
-      platform: 'linux',
-      configuredBin: '/nope/reclaude',
-      exists: () => false,
-    })).toThrow('/nope/reclaude')
-  })
-
-  test('runs configured Windows .cmd bin through the shell shim spawn hook', () => {
-    const bin = win32.join('C:\\Users\\me\\bin', 'reclaude.cmd')
-    const executable = resolveClaudeExecutableConfig({
-      platform: 'win32',
-      configuredBin: bin,
-      exists: path => path === bin,
-    })
-
-    expect(executable.pathToClaudeCodeExecutable).toBe(bin)
+    expect(executable.pathToClaudeCodeExecutable).toBeUndefined()
     expect(typeof executable.spawnClaudeCodeProcess).toBe('function')
-    expect(executable.description).toBe(`windows-shell-shim:${bin}`)
+    expect(executable.description).toBe(`config-reclaude-sdk-native:${bin}`)
   })
 
-  test('explicit null configuredBin falls back to auto discovery', () => {
-    const executable = resolveClaudeExecutableConfig({
-      platform: 'win32',
-      pathEnv: '',
-      configuredBin: null,
-      exists: () => false,
-    })
-
-    expect(executable).toEqual({ description: 'sdk-default' })
-  })
-
-  test('sendInitialize 配错 bin 路径时走 error/exit 事件而非同步抛出', () => {
-    // [claude].bin 指向不存在的路径 → resolveClaudeExecutableConfig 同步抛出;
-    // 修复确保该抛出在 sendInitialize 的 try/catch 内被捕获,转为事件输出,
-    // 调用方不会收到同步异常,session 层可通过 error/exit 事件做正常清理。
-    ;(config.claude as any).bin = '/nope/reclaude'
+  test('reclaude custom spawn resolves claude from PATH to the SDK command', async () => {
+    if (process.platform === 'win32') return
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-reclaude-test-'))
+    const wrapper = join(dir, 'reclaude')
+    writeFileSync(wrapper, '#!/bin/sh\nreadlink "$(command -v claude)"\n')
+    chmodSync(wrapper, 0o755)
     try {
-      const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' })
-      const errors: Error[] = []
-      const exits: any[] = []
-      proc.on('error', (err: Error) => errors.push(err))
-      proc.on('exit', (ev: any) => exits.push(ev))
+      const executable = resolveClaudeExecutableConfig({
+        platform: process.platform,
+        configuredBin: wrapper,
+        exists: path => path === wrapper,
+      })
+      const child = executable.spawnClaudeCodeProcess!({
+        command: '/bin/echo',
+        args: [],
+        cwd: dir,
+        env: { PATH: '/usr/bin:/bin' },
+        signal: new AbortController().signal,
+      } as any) as any
+      let stdout = ''
+      child.stdout.on('data', (chunk: Buffer) => { stdout += String(chunk) })
+      const code = await new Promise<number | null>((resolve, reject) => {
+        child.once('error', reject)
+        child.once('exit', (exitCode: number | null) => resolve(exitCode))
+      })
 
-      // 不能同步抛出
-      expect(() => proc.sendInitialize()).not.toThrow()
-
-      // error 事件携带路径信息
-      expect(errors).toHaveLength(1)
-      expect(errors[0].message).toContain('/nope/reclaude')
-
-      // exit 事件 code=1
-      expect(exits).toHaveLength(1)
-      expect(exits[0].code).toBe(1)
+      expect(code).toBe(0)
+      expect(stdout.trim()).toBe('/bin/echo')
     } finally {
-      delete (config.claude as any).bin
+      rmSync(dir, { recursive: true, force: true })
     }
-  })
-})
-
-describe('Claude configured executable ([claude] bin)', () => {
-  test('uses configured bin as the SDK executable', () => {
-    const bin = '/home/me/.local/bin/reclaude'
-    const executable = resolveClaudeExecutableConfig({
-      platform: 'linux',
-      configuredBin: bin,
-      exists: path => path === bin,
-    })
-
-    expect(executable.pathToClaudeCodeExecutable).toBe(bin)
-    expect(executable.spawnClaudeCodeProcess).toBeUndefined()
-    expect(executable.description).toBe(`config:${bin}`)
   })
 
   test('throws instead of silently falling back when configured bin is missing', () => {
@@ -1314,8 +1285,9 @@ describe('Claude executable: third-party API routes bypass the wrapper bin', () 
       exists: path => path === wrapper || path === plain,
     })
 
-    expect(executable.pathToClaudeCodeExecutable).toBe(wrapper)
-    expect(executable.description).toBe(`config:${wrapper}`)
+    expect(executable.pathToClaudeCodeExecutable).toBeUndefined()
+    expect(typeof executable.spawnClaudeCodeProcess).toBe('function')
+    expect(executable.description).toBe(`config-reclaude-sdk-native:${wrapper}`)
   })
 })
 

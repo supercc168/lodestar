@@ -7,7 +7,7 @@ import {
 } from './turn-watchdog'
 import type { CodexUserTextSettlement, UserTextDispatch } from './agent-process'
 import {
-  addedReactions, boundResumes, deletedReactions, feishuMockState, projectProfiles, resetFeishuMock,
+  addedReactions, boundResumes, clearedTurnAnchors, deletedReactions, feishuMockState, projectProfiles, resetFeishuMock,
   sentCards, sentRawTexts, sentTexts, updatedCards, urgentPushes,
 } from './feishu-test-mock'
 
@@ -150,9 +150,16 @@ afterEach(() => {
   globalThis.fetch = originalFetch
 })
 
-function turnState(cardId = 'card_session_turn'): any {
+function turnState(
+  cardId = 'card_session_turn',
+  selection: Partial<{ provider: 'codex' | 'claude'; model: string | null; effort: string; usageSource: 'codex' | 'glm' | 'not_applicable' }> = {},
+): any {
   return {
     cardId,
+    provider: selection.provider ?? 'codex',
+    model: selection.model === undefined ? 'gpt-5.6-sol' : selection.model,
+    effort: selection.effort ?? 'max',
+    usageSource: selection.usageSource ?? 'codex',
     messageId: 'om_session_turn',
     userOpenId: 'ou_user',
     trigger: 'user_message',
@@ -6127,49 +6134,171 @@ describe('Session Codex watchdog warning and model guard', () => {
     }
   })
 
-  test('sets modelSwitchPending during async settings and clears it after success', async () => {
-    projectProfiles.set('watchdog-model-success', { watchdogMode: 'warn' })
-    const session = new Session('watchdog-model-success', 'chat_id') as any
+  test('rejects model selection while a turn is active before starting a rebuild', async () => {
+    const session = new Session('watchdog-model-busy', 'chat_id') as any
     const proc = new FakeAgentProc('codex', 'codex-thread-model')
-    const turn = turnState('card_watchdog_model_success')
-    const settingsEntered = deferred<void>()
-    let release: () => void = () => {}
-    const gate = new Promise<void>(resolve => { release = resolve })
-    proc.setModelSettings = async () => {
-      settingsEntered.resolve()
-      await gate
-    }
     session.selectedProvider = 'codex'
+    session.selectedModel = 'gpt-5.5'
     session.proc = proc
-    session.currentTurn = turn
-    session.turnCounter = 1
-    session.beginWatchdogTurn(turn, proc, 0)
-
-    const resultPromise = session.onModelEffortSelect('gpt-5.6-sol', 'max', '', 'ou_user', 'codex')
-    await settingsEntered.promise
-    expect(session.watchdogSafetySnapshot(session.watchdogContext).modelSwitchPending).toBe(true)
-
-    release()
-    const result = await resultPromise
-    expect(result.ok).toBe(true)
-    expect(session.modelSwitchPending).toBe(false)
-  })
-
-  test('clears modelSwitchPending when model settings throw', async () => {
-    const session = new Session('watchdog-model-failure', 'chat_id') as any
-    const proc = new FakeAgentProc('codex', 'codex-thread-model')
-    let sawPending = false
-    proc.setModelSettings = async () => {
-      sawPending = session.modelSwitchPending
-      throw new Error('settings failed')
-    }
-    session.selectedProvider = 'codex'
-    session.proc = proc
+    session.currentTurn = turnState('card_watchdog_model_busy')
 
     const result = await session.onModelEffortSelect('gpt-5.6-sol', 'max', '', 'ou_user', 'codex')
 
     expect(result.ok).toBe(false)
-    expect(sawPending).toBe(true)
+    expect(result.message).toContain('正在执行、启动或排队')
+    expect(proc.setModelSettingsCalls).toEqual([])
+    expect(session.modelSwitchPending).toBe(false)
+  })
+
+  test('uses one complete safety predicate for model selection and idle process stop', async () => {
+    const blockers: Array<[string, (session: any) => void]> = [
+      ['pending turn input', session => { session.pendingTurnInputs = ['queued input'] }],
+      ['multi-message buffer', session => { session.multiMsgBuffer = [] }],
+      ['SDK ask', session => { session.pendingAsks.set('ask-1', {}) }],
+      ['host ask', session => { session.pendingHostAsks.set('host-ask-1', {}) }],
+      ['permission', session => { session.pendingPermissions.set('permission-1', {}) }],
+      ['manual compaction', session => { session.manualContextCompactionPending = true }],
+      ['background task', session => { session.backgroundTasks = [{ status: 'running' }] }],
+      ['active subagent', session => { session.activeCodexSubagentActivities.add('subagent-1') }],
+    ]
+
+    for (const [label, applyBlocker] of blockers) {
+      const session = new Session(`model-busy-${label.replaceAll(' ', '-')}`, 'chat_id') as any
+      const proc = new FakeAgentProc('codex', `thread-${label}`)
+      session.selectedProvider = 'codex'
+      session.selectedModel = 'gpt-5.5'
+      session.proc = proc
+      applyBlocker(session)
+
+      expect(session.isModelSwitchBusy(), label).toBe(true)
+      expect(await session.stopIdleCurrentProcess(`test ${label}`), label).toBe(false)
+      const result = await session.onModelEffortSelect(
+        'gpt-5.6-sol', 'max', '', 'ou_user', 'codex',
+      )
+
+      expect(result.ok, label).toBe(false)
+      expect(proc.killCalls, label).toBe(0)
+      expect(session.selectedModel, label).toBe('gpt-5.5')
+    }
+  })
+
+  test('does not restart or persist a target selection when the final idle stop refuses', async () => {
+    const session = new Session('model-stop-refused', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-model-stop-refused')
+    let restartCalls = 0
+    session.selectedProvider = 'codex'
+    session.selectedModel = 'gpt-5.5'
+    session.proc = proc
+    session.stopIdleCurrentProcess = async () => {
+      session.pendingTurnInputs.push('human work won the race')
+      return false
+    }
+    session.restart = async () => {
+      restartCalls++
+      return true
+    }
+
+    const result = await session.onModelEffortSelect(
+      'gpt-5.6-sol', 'max', '', 'ou_user', 'codex',
+    )
+
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('停止过程中发生变化')
+    expect(restartCalls).toBe(0)
+    expect(session.selectedModel).toBe('gpt-5.5')
+    expect(session.pendingTurnInputs).toEqual(['human work won the race'])
+  })
+
+  test('a newer lifecycle that arrives while idle kill awaits prevents model persistence and restart', async () => {
+    const session = new Session('model-stop-lifecycle-race', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-model-stop-lifecycle-race')
+    const killEntered = deferred<void>()
+    const releaseKill = deferred<void>()
+    let restartCalls = 0
+    session.selectedProvider = 'codex'
+    session.selectedModel = 'gpt-5.5'
+    session.status = 'idle'
+    session.proc = proc
+    proc.kill = async () => {
+      proc.killCalls++
+      killEntered.resolve()
+      await releaseKill.promise
+      proc.alive = false
+    }
+    session.restart = async () => {
+      restartCalls++
+      return true
+    }
+
+    const switching = session.onModelEffortSelect(
+      'gpt-5.6-sol', 'max', '', 'ou_user', 'codex',
+    )
+    await killEntered.promise
+    session.beginLifecycle('start')
+    releaseKill.resolve()
+    const result = await switching
+
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('较新的会话操作')
+    expect(restartCalls).toBe(0)
+    expect(session.selectedModel).toBe('gpt-5.5')
+  })
+
+  test('holds modelSwitchPending across an idle process rebuild and resumes the same thread', async () => {
+    const session = new Session('watchdog-model-success', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-model')
+    const stopEntered = deferred<void>()
+    const releaseStop = deferred<void>()
+    let restartArgs: any = null
+    session.selectedProvider = 'codex'
+    session.selectedModel = 'gpt-5.5'
+    session.proc = proc
+    session.stopIdleCurrentProcess = async () => {
+      stopEntered.resolve()
+      await releaseStop.promise
+      proc.alive = false
+      session.proc = null
+      return true
+    }
+    session.restart = async (resume: boolean, opts: any) => {
+      restartArgs = { resume, opts }
+      return true
+    }
+
+    const resultPromise = session.onModelEffortSelect('gpt-5.6-sol', 'max', '', 'ou_user', 'codex')
+    await stopEntered.promise
+    expect(session.modelSwitchPending).toBe(true)
+    expect(session.isModelSwitchBusy()).toBe(true)
+
+    releaseStop.resolve()
+    const result = await resultPromise
+    expect(result.ok).toBe(true)
+    expect(restartArgs).toMatchObject({
+      resume: true,
+      opts: { resumeIdentity: { provider: 'codex', threadId: 'codex-thread-model' } },
+    })
+    expect(proc.setModelSettingsCalls).toEqual([])
+    expect(session.modelSwitchPending).toBe(false)
+  })
+
+  test('reports a saved selection when idle process rebuild fails', async () => {
+    const session = new Session('watchdog-model-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-model')
+    session.selectedProvider = 'codex'
+    session.selectedModel = 'gpt-5.5'
+    session.proc = proc
+    session.stopIdleCurrentProcess = async () => {
+      proc.alive = false
+      session.proc = null
+      return true
+    }
+    session.restart = async () => false
+
+    const result = await session.onModelEffortSelect('gpt-5.6-sol', 'max', '', 'ou_user', 'codex')
+
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('后端重建失败')
+    expect(session.selectedModel).toBe('gpt-5.6-sol')
     expect(session.modelSwitchPending).toBe(false)
   })
 
@@ -6194,80 +6323,35 @@ describe('Session Codex watchdog warning and model guard', () => {
     expect(session.selectedModel).toBeNull()
   })
 
-  test('model selection rechecks preserved recovery after awaited settings', async () => {
-    const session = new Session('watchdog-model-preserved-after', 'chat_id') as any
-    const proc = new FakeAgentProc('codex', 'thread-model-preserved-after')
-    const settingsEntered = deferred<void>()
-    const settingsRelease = deferred<void>()
-    let applyCalls = 0
-    session.selectedProvider = 'codex'
-    session.proc = proc
-    proc.setModelSettings = async () => {
-      settingsEntered.resolve()
-      await settingsRelease.promise
-    }
-    session.applyModelSelection = async () => { applyCalls++ }
-
-    const selecting = session.onModelEffortSelect(
-      'gpt-5.6-sol', 'max', '', 'ou_user', 'codex',
-    )
-    await settingsEntered.promise
-    installFailedWatchdogRecovery(session, {
-      proc,
-      threadId: 'thread-model-preserved-after',
-    })
-    settingsRelease.resolve()
-    const result = await selecting
-
-    expect(result.ok).toBe(false)
-    expect(result.message).toContain('自动恢复')
-    expect(applyCalls).toBe(0)
-  })
-
-  test('a stale model selection cannot apply or clear a newer pending token', async () => {
+  test('rejects a second model selection while the first idle rebuild is pending', async () => {
     const session = new Session('watchdog-model-token-race', 'chat_id') as any
     const proc = new FakeAgentProc('codex', 'thread-model-token-race')
-    const firstEntered = deferred<void>()
-    const firstRelease = deferred<void>()
-    const secondEntered = deferred<void>()
-    const secondRelease = deferred<void>()
-    const applied: string[] = []
-    let settingsCalls = 0
+    const stopEntered = deferred<void>()
+    const releaseStop = deferred<void>()
     session.selectedProvider = 'codex'
+    session.selectedModel = 'gpt-5.5'
     session.proc = proc
-    proc.setModelSettings = async () => {
-      settingsCalls++
-      if (settingsCalls === 1) {
-        firstEntered.resolve()
-        await firstRelease.promise
-      } else {
-        secondEntered.resolve()
-        await secondRelease.promise
-      }
+    session.stopIdleCurrentProcess = async () => {
+      stopEntered.resolve()
+      await releaseStop.promise
+      proc.alive = false
+      session.proc = null
+      return true
     }
-    session.applyModelSelection = async (_provider: string, model: string) => {
-      applied.push(model)
-    }
+    session.restart = async () => true
 
     const first = session.onModelEffortSelect(
       'gpt-5.6-sol', 'max', '', 'ou_first', 'codex',
     )
-    await firstEntered.promise
-    const second = session.onModelEffortSelect(
+    await stopEntered.promise
+    const second = await session.onModelEffortSelect(
       'gpt-5.6-sol', 'max', '', 'ou_second', 'codex',
     )
-    await secondEntered.promise
-    firstRelease.resolve()
-    const firstResult = await first
+    expect(second.ok).toBe(false)
+    expect(second.message).toContain('正在执行、启动或排队')
 
-    expect(firstResult.ok).toBe(false)
-    expect(applied).toEqual([])
-    expect(session.modelSwitchPending).toBe(true)
-
-    secondRelease.resolve()
-    const secondResult = await second
-    expect(secondResult.ok).toBe(true)
-    expect(applied).toEqual(['gpt-5.6-sol'])
+    releaseStop.resolve()
+    expect((await first).ok).toBe(true)
     expect(session.modelSwitchPending).toBe(false)
   })
 
@@ -6809,6 +6893,19 @@ describe('Fixed model selection normalization', () => {
 })
 
 describe('Session provider switching', () => {
+  function installSuccessfulIdleRebuild(session: any): any[] {
+    const restartCalls: any[] = []
+    session.restart = async (resume: boolean, opts: any) => {
+      restartCalls.push({ resume, opts })
+      session.proc = new FakeAgentProc(
+        session.selectedProvider,
+        opts?.resumeIdentity?.threadId ?? null,
+      )
+      return true
+    }
+    return restartCalls
+  }
+
   test('uses provider-specific ask instructions', () => {
     const session = new Session('probe', 'chat_id') as any
 
@@ -6860,6 +6957,86 @@ describe('Session provider switching', () => {
     expect(session.lastSessionId).toBe('claude-session-result')
   })
 
+  test('clears turn anchors only when the provider actually changes', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedModel = 'claude:fable'
+
+    await session.applyModelSelection('claude', 'claude:opus', 'max')
+    expect(clearedTurnAnchors).toEqual([])
+
+    await session.applyModelSelection('codex', 'gpt-5.6-sol', 'max')
+    expect(clearedTurnAnchors).toEqual(['probe'])
+  })
+
+  test('freezes provider, model, effort, and usage source on an opened turn', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-turn-snapshot')
+    proc.lastModel = 'claude:glm'
+    proc.lastEffort = 'xhigh'
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedModel = 'claude:glm'
+    session.selectedEffort = 'xhigh'
+
+    const opened = await session.openTurnCard('ou_user', 'user_message', {
+      expectedProc: proc,
+      startThinking: false,
+    })
+    expect(opened.kind).toBe('opened')
+    if (opened.kind !== 'opened') return
+    const turn = opened.turn
+    expect(turn).toMatchObject({
+      provider: 'claude',
+      model: 'claude:glm',
+      effort: 'xhigh',
+      usageSource: 'glm',
+    })
+
+    session.selectedProvider = 'codex'
+    session.selectedModel = 'gpt-5.6-sol'
+    session.selectedEffort = 'max'
+    session.proc = new FakeAgentProc('codex', 'codex-thread-new')
+    cardkit.recordCardCreated(turn.cardId, 1)
+    setDeterministicFooterStatus(turn, 'Thinking...')
+    session.renderFooterStatus(turn, turn.footerStatusStartedAt + 1_000)
+    await cardkit.flush(turn.cardId)
+
+    const footer = calls
+      .filter(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+      .map(call => JSON.parse(call.body.element).content as string)
+      .at(-1)
+    expect(footer).toContain('Claude · glm/xhigh')
+    expect(footer).not.toContain('gpt-5.6-sol')
+
+    session.stopFooterStatus(turn)
+    await cardkit.dispose(turn.cardId)
+  })
+
+  test('patches a console quota row from the card creation snapshot after selection changes', async () => {
+    const session = new Session('console-usage-snapshot', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedModel = 'claude:fable'
+    session.selectedEffort = 'max'
+    const snapshot = await session.buildConsoleOpts(undefined)
+
+    session.selectedModel = 'claude:glm'
+    session.selectedEffort = 'xhigh'
+    const cardId = 'card_console_usage_snapshot'
+    cardkit.recordCardCreated(cardId, 4)
+    await session.patchConsoleUsage(cardId, snapshot)
+    await cardkit.flush(cardId)
+
+    const content = calls
+      .filter(call => call.method === 'PUT' && call.path === `/cards/${cardId}/elements/console_usage`)
+      .map(call => JSON.parse(call.body.element).content as string)
+      .at(-1)
+    expect(content).toContain('不适用')
+    expect(content).toContain('claude:fable')
+    expect(content).not.toContain('GLM 额度')
+    await cardkit.dispose(cardId)
+  })
+
   test('rejects cross-provider model switch while a turn is active', async () => {
     const session = new Session('probe', 'chat_id') as any
     session.proc = new FakeAgentProc('codex', 'codex-thread-1')
@@ -6869,7 +7046,7 @@ describe('Session provider switching', () => {
     const result = await session.onModelEffortSelect('claude:opus', 'max', '', 'ou_user', 'claude')
 
     expect(result.ok).toBe(false)
-    expect(result.message).toContain('正在执行或排队')
+    expect(result.message).toContain('正在执行、启动或排队')
     expect(boundResumes).toEqual([])
     expect(session.selectedProvider).toBe('codex')
   })
@@ -6880,15 +7057,39 @@ describe('Session provider switching', () => {
     session.proc = proc
     session.selectedProvider = 'claude'
     session.selectedModel = 'claude:default'
+    const restartCalls = installSuccessfulIdleRebuild(session)
 
     const result = await session.onModelEffortSelect('claude:opus', 'max', '', 'ou_user', 'claude')
 
     expect(result.ok).toBe(true)
     expect(session.selectedModel).toBe('claude:opus')
     expect(proc.killCalls).toBe(1)
-    expect(session.proc).toBeNull()
+    expect(session.proc).not.toBe(proc)
     expect(proc.setModelSettingsCalls).toEqual([])
-    expect(result.card ? JSON.stringify(result.card) : '').toContain('下次启动 Claude')
+    expect(restartCalls).toHaveLength(1)
+    expect(restartCalls[0]).toMatchObject({
+      resume: true,
+      opts: { resumeIdentity: { provider: 'claude', threadId: 'claude-session-1' } },
+    })
+    expect(result.card ? JSON.stringify(result.card) : '').toContain('下一轮开始使用')
+  })
+
+  test('fresh-rebuilds a same-provider process with no current id even when disk has an old resume id', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', null)
+    session.proc = proc
+    session.selectedProvider = 'codex'
+    session.selectedModel = 'gpt-5.5'
+    session.lastSessionId = 'stale-codex-session-on-disk'
+    const restartCalls = installSuccessfulIdleRebuild(session)
+
+    const result = await session.onModelEffortSelect('gpt-5.6-sol', 'max', '', 'ou_user', 'codex')
+
+    expect(result.ok).toBe(true)
+    expect(proc.killCalls).toBe(1)
+    expect(restartCalls).toHaveLength(1)
+    expect(restartCalls[0].resume).toBe(false)
+    expect(restartCalls[0].opts.resumeIdentity).toBeUndefined()
   })
 
   test('rejects non-fixed Claude model outside the fixed choices', async () => {
@@ -6913,13 +7114,15 @@ describe('Session provider switching', () => {
       session.proc = proc
       session.selectedProvider = 'claude'
       session.selectedModel = 'claude:default'
+      const restartCalls = installSuccessfulIdleRebuild(session)
 
       const result = await session.onModelEffortSelect(model, 'max', '', 'ou_user', 'claude')
 
       expect(result.ok).toBe(true)
       expect(session.selectedModel).toBe(model)
       expect(proc.killCalls).toBe(1) // model 变更 → 空闲 Claude 进程重生,新 env 下轮生效
-      expect(session.proc).toBeNull()
+      expect(restartCalls).toHaveLength(1)
+      expect(session.proc).not.toBe(proc)
     }
   })
 
@@ -7002,6 +7205,7 @@ describe('Session provider switching', () => {
         s.proc = new FakeAgentProc('claude', 'claude-session-1')
         s.selectedProvider = 'claude'
         s.selectedModel = 'claude:fable'
+        installSuccessfulIdleRebuild(s)
         return s
       }
       const ok = await mk().onModelEffortSelect('claude:glm', 'xhigh', '', 'ou_user', 'claude')
@@ -7100,7 +7304,7 @@ describe('Session provider switching', () => {
 
     expect(ok).toBe(true)
     expect(initializeCalls).toBe(1)
-    expect(statuses).toContain('✅ Claude 已就绪 · max')
+    expect(statuses).toContain('✅ Claude 已就绪 · Claude · max')
     expect(proc.killCalls).toBe(0)
     expect(session.proc).toBe(proc)
     expect(session.status).toBe('idle')

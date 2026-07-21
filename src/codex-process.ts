@@ -1089,18 +1089,7 @@ export class CodexProcess extends EventEmitter {
   async setModelSettings(model: string, effort: AgentReasoningEffort): Promise<void> {
     if (!model.trim()) throw new Error('empty model')
     if (!isCodexReasoningEffort(effort)) throw new Error(`invalid reasoning effort: ${String(effort)}`)
-    if (!this.readyPromise) throw new Error('codex thread not initialized')
-    await this.readyPromise
-    if (!this.sessionId) throw new Error('codex thread not initialized')
-    await this.request('thread/settings/update', {
-      threadId: this.sessionId,
-      model,
-      effort,
-    })
-    this.opts.model = model
-    this.opts.effort = effort
-    this.lastModel = model
-    this.lastEffort = effort
+    throw new Error('codex app-server does not support live model settings; restart the process with new spawn options')
   }
 
   async setModel(model: string): Promise<void> {

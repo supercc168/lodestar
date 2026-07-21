@@ -1,5 +1,5 @@
-import { existsSync, readFileSync } from 'node:fs'
-import { homedir } from 'node:os'
+import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { spawn } from 'node:child_process'
 import { delimiter, join, posix, win32 } from 'node:path'
 import { EventEmitter } from 'node:events'
@@ -149,6 +149,56 @@ function spawnWindowsShellShim(options: ClaudeSdkSpawnOptions): SpawnedProcess {
   return child as unknown as SpawnedProcess
 }
 
+function configuredBinIsReclaude(path: string, platform: NodeJS.Platform): boolean {
+  const name = joinForPlatform(platform, path).split(platform === 'win32' ? '\\' : '/').at(-1)?.toLowerCase()
+  return name === 'reclaude' || name === 'reclaude.exe'
+}
+
+/** reclaude injects its proxy/CA environment and then resolves `claude` from
+ * PATH. Pin that lookup to the SDK-selected executable so the wrapper stays in
+ * the route while dialog/control protocol support comes from the bundled SDK
+ * native binary. This was verified against the configured reclaude binary on macOS. */
+function spawnReclaudeWithSdkNative(wrapper: string): (options: ClaudeSdkSpawnOptions) => SpawnedProcess {
+  return (options) => {
+    const shimDir = mkdtempSync(join(tmpdir(), 'lodestar-claude-sdk-'))
+    const cleanup = (): void => {
+      try { rmSync(shimDir, { recursive: true, force: true }) }
+      catch {}
+    }
+    try {
+      const sdkCommand = options.command.includes('/') || options.command.includes('\\')
+        ? options.command
+        : process.execPath
+      symlinkSync(sdkCommand, join(shimDir, 'claude'))
+      const child = spawn(wrapper, options.args, {
+        cwd: options.cwd,
+        env: {
+          ...(options.env as NodeJS.ProcessEnv),
+          PATH: [shimDir, options.env.PATH].filter(Boolean).join(delimiter),
+        },
+        signal: options.signal,
+        stdio: ['pipe', 'pipe', 'pipe'],
+        windowsHide: true,
+      })
+      child.stderr?.on('data', chunk => {
+        const text = String(chunk).trim()
+        if (text) log(`claude-agent-process[stderr]: ${text}`)
+      })
+      child.once('exit', cleanup)
+      child.once('error', cleanup)
+      if (!child.stdin || !child.stdout) {
+        child.kill()
+        cleanup()
+        throw new Error('failed to open stdio for reclaude SDK-native wrapper')
+      }
+      return child as unknown as SpawnedProcess
+    } catch (error) {
+      cleanup()
+      throw error
+    }
+  }
+}
+
 export function resolveClaudeBin(): string {
   const found = findClaudeBin()
   if (found) return found
@@ -197,6 +247,12 @@ export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): Cl
     if (!exists(configured)) {
       throw new Error(`lodestar: [claude].bin not found: ${configured} (config.toml)`)
     }
+    if (platform !== 'win32' && configuredBinIsReclaude(configured, platform)) {
+      return {
+        spawnClaudeCodeProcess: spawnReclaudeWithSdkNative(configured),
+        description: `config-reclaude-sdk-native:${configured}`,
+      }
+    }
     if (platform === 'win32' && windowsShellShim(configured)) {
       return {
         pathToClaudeCodeExecutable: configured,
@@ -215,9 +271,8 @@ export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): Cl
       description: `windows-shell-shim:${bin}`,
     }
   }
-  // 非 windows 且未配 [claude].bin:不设 pathToClaudeCodeExecutable。显式指定会让
-  // claude 走 CLI 二进制的 stream-json 模式,该模式不下发 AskUserQuestion 等 dialog
-  // 工具;SDK 默认入口才会下发。需要显式指定时用 [claude].bin(走 configured 分支)。
+  // 非 windows 且未配 [claude].bin:不设 pathToClaudeCodeExecutable,让 SDK 选择
+  // bundled native binary。reclaude 配置也走 SDK native,但通过 custom spawn 包一层。
   return { description: 'sdk-default' }
 }
 
@@ -740,10 +795,17 @@ export class ClaudeAgentProcess extends EventEmitter {
       PATH: buildClaudeSpawnPath(),
       ...config.claude.env,
     }
-    // 干净基线:无条件抹掉三个路由 key。
-    delete env.ANTHROPIC_BASE_URL
-    delete env.ANTHROPIC_AUTH_TOKEN
-    delete env.ANTHROPIC_API_KEY
+    // 干净基线:路由凭据和所有默认模型别名都必须抹掉。否则 shell 或
+    // [claude.env] 遗留的 GLM alias 会把 Fable/Opus 官方档位悄悄改路由。
+    for (const key of [
+      'ANTHROPIC_BASE_URL',
+      'ANTHROPIC_AUTH_TOKEN',
+      'ANTHROPIC_API_KEY',
+      'ANTHROPIC_DEFAULT_FABLE_MODEL',
+      'ANTHROPIC_DEFAULT_OPUS_MODEL',
+      'ANTHROPIC_DEFAULT_SONNET_MODEL',
+      'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+    ]) delete env[key]
     // 第三方路由才注入该档位声明的接入 env;登录档位保持干净基线。
     if (claudeModelIsApiRoute(this.opts.model)) {
       Object.assign(env, claudeModelEnv(this.opts.model))
@@ -771,7 +833,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       // 必须在 try 内调用,确保错误走 error/exit 事件而非穿透到调用方。
       const isApiRoute = claudeModelIsApiRoute(this.opts.model)
       // 第三方 API 路由(GLM)绕开 reclaude 包装器,直连第三方端点;官方登录
-      // 档位仍走包装器回收登录态额度。见 resolveClaudeExecutableConfig。
+      // 档位由 reclaude custom spawn 包住 SDK native binary,兼顾代理与 dialog。
       const executable = resolveClaudeExecutableConfig({ apiRoute: isApiRoute })
       const spawnEnv = this.buildSpawnEnv()
       const routeLabel = isApiRoute ? 'api' : 'login'

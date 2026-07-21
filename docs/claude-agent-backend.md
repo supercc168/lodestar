@@ -55,9 +55,9 @@ effort     = "xhigh"
 
 模型路由的真相源是 `config.toml` 的 `[claude.models.*]`(第三方 per-model token 路由):`ClaudeAgentProcess.buildSpawnEnv` 只在 GLM/Grok 一类 API 档位 spawn 时注入 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`(+ 档位默认 env),官方 Fable 5 / Opus 登录档位保持干净基线(无条件抹掉环境里的 `ANTHROPIC_*`)。`[claude.models.*]` 的字段仅认 `display_name / description / model / base_url / auth_token / api_key / route / effort` 以及扁平 `env_<NAME>` —— 早期文档里的 `opus= / sonnet= / haiku=` 已不再解析。**别把第三方 env 写进 `~/.claude/settings.json`**:SDK 经 `settingSources:['user']` 会加载它、污染登录档位;`[claude.env]` 仅作可选 escape hatch。
 
-可执行文件解析:`resolveClaudeExecutableConfig({ apiRoute })` 默认自动查找 `claude`(`~/.local/npm-global/bin` → `~/.local/bin` → PATH → SDK 自带)。`config.toml` 设 `[claude].bin`(支持 `~`)可显式覆盖,用于 reclaude 这类参数透传包装器;路径不存在时 `sendInitialize` 直接抛错,不静默回退。**关键:第三方 API 路由(GLM/Grok,`route:api`)会强制绕开 `[claude].bin`、改用裸 `claude`** —— reclaude 是网关代理,会把注入的 `ANTHROPIC_BASE_URL` 劫持回官方 Anthropic,`glm-5.2` / `grok-4.5` 这类第三方 id 在官方 deployment 上不存在、Claude Code 客户端直接报 `There's an issue with the selected model`(智谱/中转端点本身正常,`--model …` 直接喂裸 `claude` 可正常回包)。故只有官方登录档位(Fable 5/Opus)走包装器回收登录态额度,日志 `executable=config:<路径>`;第三方走裸 claude,日志 `executable=<claude 路径>`。
+可执行文件解析:`resolveClaudeExecutableConfig({ apiRoute })` 默认自动查找 `claude`(`~/.local/npm-global/bin` → `~/.local/bin` → PATH → SDK 自带)。`config.toml` 设 `[claude].bin`(支持 `~`)可显式覆盖,路径不存在时 `sendInitialize` 直接抛错,不静默回退。若配置的是 Unix `reclaude`,Lodestar 不把它直接传给 SDK(直接传会退回 CLI stream-json,丢失 dialog/control 协议),而是给 SDK 提供的 native command 建一个临时 PATH shim,再由 reclaude 注入 proxy/CA 后查找这个 `claude`;日志为 `executable=config-reclaude-sdk-native:<路径>`。**关键:第三方 API 路由(GLM/Grok,`route:api`)会强制绕开 `[claude].bin`、使用 SDK 自带 native 入口** —— reclaude 的 gateway 会把注入的 `ANTHROPIC_BASE_URL` 劫持回官方 Anthropic,第三方 model id 在官方 deployment 上不存在。官方登录档位走 reclaude + SDK native shim,第三方走 SDK native 直连端点。
 
-SDK `model`:官方档位直传 `claude-fable-5` / `claude-opus-4-8`(reclaude 透传 `--model`,走用户登录态);第三方档位把该 profile `model` 字段声明的上游 id 交给**裸 `claude`**(GLM 走 `glm-5.2[1m]`,Grok 走 `grok-4.5`),配套 `[claude.models.*]` 注入的 `ANTHROPIC_BASE_URL` 打到对应 Anthropic 兼容端点。GLM 的 `[1m]` 后缀开满 1M 上下文;Grok 没有 `[1m]` 后缀,改由 `CLAUDE_CODE_MAX_CONTEXT_TOKENS=500000` 把 Claude Code 默认 200K 抬到上游 500K 硬限,并配 `CLAUDE_CODE_AUTO_COMPACT_WINDOW=450000` 提前压缩,避免长会话撞 `maximum prompt length is 500000`。**上游 id 必须交给裸 claude、不能经 reclaude**(见上一段:reclaude 劫持 base_url 回官方)。早期走 settings.json `ANTHROPIC_DEFAULT_*_MODEL` alias 的做法已随 per-model 路由废弃。
+SDK `model`:官方档位直传 `claude-fable-5` / `claude-opus-4-8`;第三方档位把 profile 的上游 id 交给 SDK native 入口,配套 `[claude.models.*]` 注入的 `ANTHROPIC_BASE_URL` 打到对应 Anthropic 兼容端点。reclaude 只负责官方登录档位的代理/证书注入,不再替代 SDK transport。早期把 `ANTHROPIC_DEFAULT_*_MODEL` 写入全局 settings/env 的做法已废弃:启动 env 会先清掉 Fable/Opus/Sonnet/Haiku 四个 alias,随后只为当前 API profile 重新注入声明的映射。
 
 ## Claude Event Mapping
 `ClaudeAgentProcess` 把 SDK message 映射为现有 Session 已会处理的事件：
@@ -69,11 +69,11 @@ SDK `model`:官方档位直传 `claude-fable-5` / `claude-opus-4-8`(reclaude 透
 - `result` -> `token_usage` + `result`
 - `system/compact_boundary` -> `context_compacted`
 
-权限：Codex 侧走 SDK `canUseTool` callback，callback 挂起并 emit `can_use_tool` 给 Session，飞书按钮回调再通过 `sendPermissionResponse()` resolve。Claude 侧 `bypassPermissions` 全自动，`canUseTool` 不触发（无审批 UI 死代码）；其 `askUserQuestion` 走 `onUserDialog`，同样 emit `can_use_tool` 给 Session 处理。
+权限:Claude SDK 使用 `permissionMode: default`,让 `AskUserQuestion` 能进入 `canUseTool`;其它工具在 callback 内立即 allow,保持原来的全自动行为。Ask callback 挂起并 emit `can_use_tool` 给 Session,飞书按钮回调再通过 `sendPermissionResponse()` resolve。
 
-Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
+Claude 自带 ask 工具接到 SDK `canUseTool`：
 
-- 声明 `supportedDialogKinds = ask_user_question | askUserQuestion | AskUserQuestion`。
+- query 配置 `toolConfig.askUserQuestion.previewFormat = markdown`,由 SDK native transport 下发 `AskUserQuestion`。
 - 将 dialog payload 规范化成现有 `AskUserQuestion` 卡片的 `questions` 结构。
 - 先登记 pending control，再 emit `tool_use` / `can_use_tool`，避免同步回包 race。
 - 用户点击选项或群里回复后，仍通过 `updatedInput.answers` 回填给 SDK。
@@ -100,7 +100,7 @@ Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
 这些差异来自 Claude Agent SDK 能力边界或本机模型路由，不能伪装成 Codex 完全同构：
 
 - 启动时机：Claude SDK 在没有第一条 user input 前不会发 `system/init`，所以 `hi` 启动 Claude 后不会强等 init；首条消息触发 init 和真实 session id。
-- 模型项：Claude 暴露 `claude:default`、`claude:glm`、`claude:deepseek`。GLM/DeepSeek profile 通过 env 做档位映射，SDK 主模型默认请求 `opus` alias。
+- 模型项:Claude 暴露 Fable 5、Opus 4.8 和已配置的 GLM/Grok API 档位;登录档位与第三方 profile 各自解析明确的 SDK model id 和环境。
 - resume id：Claude `session_id` 与 Codex thread id 分开保存；切换 provider 不共享上下文。
 - compact：Claude SDK 没有 Lodestar 所用的 Codex `thread/compact/start` 等价接口，`compact` 会明确失败并说明不支持。
 - ask：Codex 的 `[[askusr: ...]]` host marker 不给 Claude 使用；Claude 的 ask 来自 SDK `AskUserQuestion` / user-dialog，仍渲染成同一套飞书问答卡。
@@ -112,13 +112,15 @@ Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
 - 旧后端的迟到 `session_id` / exit 事件不会覆盖当前已选择后端的 `lastSessionId` 或新进程状态。
 - Claude 启动前会显式检查 `claude` 可执行文件；找不到时直接启动失败并提示，不让 session 先进入 ready 再异步报错。
 - Claude streaming-input 后端在首条用户输入前不会发 `init`；Lodestar 启动 Claude 时只等待短暂同步/早期错误，不再把“无输入所以没 init”当启动失败。
-- Claude 使用 `bypassPermissions` 全自动;`canUseTool` 在该模式下被 SDK override(旧飞书审批 UI 已清),不再走权限卡。
+- Claude 使用 `permissionMode: default` 以保留 `canUseTool`;非 Ask 工具由 callback 秒放,`AskUserQuestion` 才进入飞书问答卡。
 - Codex 控制台和启动消息恢复原显示，不新增 `Codex ·` / `(Codex)` 这类额外标记。
-- `claude:default` 运行中重新选择时只更新 effort，不再尝试给 SDK 设置空模型名。
-- Claude profile 变化需要 env 生效；空闲切换时停止当前 Claude 子进程，下轮按新 env 启动；忙碌时拒绝，避免声称当前进程已切换。
-- `claude:glm` 的主线程 SDK model 为 `opus` alias;具体 GLM 代码通过 settings.json 的 env 路由(`claude:deepseek` 已随二元化下线)。
+- Codex 不再调用不存在的 `thread/settings/update`;模型选择保存后只在空闲边界停止并重建进程,有 thread id 时沿用原 thread,无 id 时 fresh start。
+- Claude/Codex 的模型选择在当前 turn、启动、排队或另一项重建进行时统一拒绝;空闲切换成功后才允许下一轮使用新 profile。
+- 每个 turn 冻结 provider/model/effort 与 usage source;后续 model 点击不会改写旧卡片的 footer、续卡或额度路由。provider 真变化时才清理 turn anchors。
+- Claude 的 quota 只对 `claude:glm` 查询 GLM;Fable/Opus/Grok 明确显示不适用,Codex 第三方档位不复用 ChatGPT 全局缓存。
+- Claude `buildSpawnEnv` 会清理继承环境和 `[claude.env]` 中的 `ANTHROPIC_DEFAULT_FABLE_MODEL`、`OPUS`、`SONNET`、`HAIKU` alias,再按当前 API profile 注入。
 - `[[askusr: ...]]` 处理链路加 provider 守卫，Claude 输出同名 marker 不会触发 Codex host ask 卡或续跑。
-- Claude `onUserDialog` 接入现有 `AskUserQuestion` 卡片和 `updatedInput.answers` 回填协议，并修复同步权限回包 race。
+- Claude `canUseTool` 接入现有 `AskUserQuestion` 卡片和 `updatedInput.answers` 回填协议，并修复同步权限回包 race。
 - spawn prompt 按 provider 分开：Codex 继续收到 `[[askusr: ...]]` 说明，Claude 收到 “使用 AskUserQuestion，不要输出 askusr marker”。
 - `agy` 转发按钮在 Codex 下保持 `转 Codex`，在 Claude 下显示 `转 Claude`，实际仍进入同一 session 用户消息路径。
 - 对话卡续卡 banner 在 Codex 下保持 `Codex turn` 原文，在 Claude 下显示 `Claude turn`。
@@ -133,7 +135,7 @@ Claude 自带 ask 工具额外接了 SDK `onUserDialog`：
 - `bun test`: 112 pass。
 - `bun run build`: daemon / setup / stop / update / version 全部 bundle 成功。
 - Claude init probe: `sendInitialize()` 后无首条输入时 8 秒内没有 stream `init`；`start()` 已改为短暂等待早期错误后 ready，冷启动首条用户消息会先发 input 再由 SDK 触发 init。
-- Claude SDK smoke: 临时目录中连续发送“只回复数字 1”和“只回复数字 2”，中途执行 `setModelSettings("claude:default", "low")` 成功；收到两次 `result subtype=success`，且两次 `session_id` 均为 `1e18c8b5-90f8-452f-a39a-e485e3ec4734`。
+- Claude 模型切换不再依赖 `setModelSettings`:空闲切换会重建 SDK query,忙碌时明确拒绝,避免把未验证的热更新协议当成成功。
 - Claude ask smoke: `claude:glm` 启动时 SDK 日志显示 `model=opus`；实际触发 `AskUserQuestion`，自动回答后 assistant 输出 `DONE`，`result subtype=success` 且 `is_error=false`。
 - smoke 结束时本机 Claude 插件的 `SessionEnd` hook 在 stderr 报 `/bin/sh` ENOENT；`/bin/sh` 本机存在，turn 已成功完成。该警告来自外部 Claude 插件 hook，不属于 Lodestar ask/model 路径失败。
 

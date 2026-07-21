@@ -22,7 +22,6 @@ import {
 import { log } from './log'
 import {
   messageOf,
-  withTimeout,
   type LifecycleLease,
   type ModelActionResult,
 } from './session-util'
@@ -252,7 +251,6 @@ export async function onModelSelect(
   actionValue: any = null,
 ): Promise<ModelActionResult> {
   if (s.hasPreservedWatchdogRecovery()) return interruptedModelSelection(s)
-  const lease = s.beginLifecycle('model')
   const model = modelRaw.trim()
   if (!model) {
     const message = '模型为空'
@@ -269,7 +267,7 @@ export async function onModelSelect(
   // 二元选择:effort 锁死,选了直接应用,跳过 effort 二级面板。
   const effort = choice.efforts[0]?.effort
   if (!effort) return { ok: false, message: '模型未返回 effort' }
-  return onModelEffortSelect(s, model, effort, panelIdRaw, _userOpenId, provider, lease)
+  return onModelEffortSelect(s, model, effort, panelIdRaw, _userOpenId, provider)
 }
 
 function interruptedModelSelection(s: Session): ModelActionResult {
@@ -288,10 +286,6 @@ export async function onModelEffortSelect(
   lifecycleLease?: LifecycleLease,
 ): Promise<ModelActionResult> {
   if (s.hasPreservedWatchdogRecovery()) return interruptedModelSelection(s)
-  const lease = lifecycleLease ?? s.beginLifecycle('model')
-  if (!s.ownsLifecycle(lease)) {
-    return interruptedModelSelection(s)
-  }
   const model = modelRaw.trim()
   const effortValue = effortRaw.trim()
   if (!model) return { ok: false, message: '模型为空' }
@@ -333,54 +327,80 @@ export async function onModelEffortSelect(
   if (choice && !choice.efforts.some(item => item.effort === effort)) {
     return { ok: false, message: 'reasoning effort 不属于该模型' }
   }
-  if (
-    s.proc?.isAlive() &&
-    s.proc.provider !== provider &&
-    (s.currentTurn || s.openingTurn || s.pendingUserMessageCount > 0 || s.pendingMidTurnMsgs.length > 0)
-  ) {
+  // A pending rebuild has already persisted its target selection. Check the
+  // transaction before the idempotent branch so a second click cannot report
+  // "already active" while the old process is still stopping or resume fails.
+  if (s.modelSwitchPending) {
+    const runningProvider = s.proc?.provider ?? s.currentProvider()
     return {
       ok: false,
-      message: `当前 ${s.backendLabel(s.proc.provider)} turn 正在执行或排队；请等结束或 stop 后再切换到 ${agentProviderLabel(provider)}`,
+      message: `当前 ${s.backendLabel(runningProvider)} turn 正在执行、启动或排队；请等结束或 stop 后再切换`,
     }
   }
-  const modelChanged = s.currentModelLabel() !== model
-  const procBusy = !!(s.currentTurn || s.openingTurn || s.pendingUserMessageCount > 0 || s.pendingMidTurnMsgs.length > 0)
-  if (
-    provider === 'claude' &&
-    s.proc?.isAlive() &&
-    s.proc.provider === 'claude' &&
-    modelChanged &&
-    procBusy
-  ) {
+  const selectionUnchanged = s.currentProvider() === provider &&
+    s.currentModelLabel() === model &&
+    s.currentEffortLabel() === effort
+  const runningProviderMatchesSelection = !s.proc?.isAlive() || s.proc.provider === provider
+  if (selectionUnchanged && runningProviderMatchesSelection) {
+    s.modelPanels.delete(panelId)
+    return {
+      ok: true,
+      message: `当前已是 ${agentProviderLabel(provider)} · ${model} / ${effort}`,
+      card: cards.modelResultCard({
+        sessionName: s.sessionName,
+        provider,
+        model,
+        effort,
+        scope: '当前已是此设置，无需变更。',
+      }),
+    }
+  }
+  if (s.isModelSwitchBusy()) {
+    const runningProvider = s.proc?.provider ?? s.currentProvider()
     return {
       ok: false,
-      message: '当前 Claude turn 正在执行或排队；Claude 模型 profile 通过 env 生效，请等结束或 stop 后再切换',
+      message: `当前 ${s.backendLabel(runningProvider)} turn 正在执行、启动或排队；请等结束或 stop 后再切换`,
     }
   }
-  const shouldRespawnIdleClaude = provider === 'claude' &&
-    s.proc?.isAlive() &&
-    s.proc.provider === 'claude' &&
-    modelChanged
+  const lease = lifecycleLease ?? s.beginLifecycle('model')
+  if (!s.ownsLifecycle(lease)) return interruptedModelSelection(s)
+  const previousProc = s.proc
+  const shouldStopIdleProcess = !!previousProc?.isAlive()
+  const shouldRespawnIdleProcess = shouldStopIdleProcess && previousProc?.provider === provider
   const operation = s.beginModelSwitch(lease)
   if (!operation) return interruptedModelSelection(s)
-  const settingsProc = s.proc
+  const resumeIdentity = shouldRespawnIdleProcess && previousProc?.sessionId
+    ? { provider, threadId: previousProc.sessionId }
+    : null
+  let selectionApplied = false
   try {
-    if (settingsProc?.isAlive() && settingsProc.provider === provider) {
-      if (!shouldRespawnIdleClaude) {
-        await withTimeout(settingsProc.setModelSettings(model, effort), 20_000, 'thread/settings/update')
+    // Stop before persisting the target selection. If the supposedly-idle
+    // boundary changes while kill awaits, the old selection remains truthful
+    // and the newer human/session operation wins without a follow-up restart.
+    if (shouldStopIdleProcess) {
+      const stopped = await s.stopIdleCurrentProcess(`${agentProviderLabel(provider)} model settings changed`, lease)
+      if (!s.ownsModelSwitch(operation) || s.hasPreservedWatchdogRecovery()) {
+        return interruptedModelSelection(s)
+      }
+      if (!stopped) {
+        return {
+          ok: false,
+          message: '模型切换已取消：会话状态在停止过程中发生变化，请等当前工作结束后重试',
+        }
       }
     }
-    if (
-      !s.ownsModelSwitch(operation) ||
-      s.hasPreservedWatchdogRecovery() ||
-      (settingsProc && s.proc !== settingsProc)
-    ) return interruptedModelSelection(s)
     const applied = await s.applyModelSelection(provider, model, effort, lease)
     if (applied === false || !s.ownsModelSwitch(operation) || s.hasPreservedWatchdogRecovery()) {
       return interruptedModelSelection(s)
     }
-    if (shouldRespawnIdleClaude) {
-      await s.stopIdleCurrentProcess('Claude model profile changed; env will apply on next spawn', lease)
+    selectionApplied = true
+    if (shouldRespawnIdleProcess) {
+      const resumed = await s.restart(resumeIdentity !== null, {
+        announce: false,
+        lifecycleLease: lease,
+        ...(resumeIdentity ? { resumeIdentity } : {}),
+      })
+      if (!resumed) throw new Error(`${agentProviderLabel(provider)} process rebuild failed`)
       if (!s.ownsModelSwitch(operation) || s.hasPreservedWatchdogRecovery()) {
         return interruptedModelSelection(s)
       }
@@ -402,7 +422,9 @@ export async function onModelEffortSelect(
     if (!s.ownsModelSwitch(operation) || s.hasPreservedWatchdogRecovery()) {
       return interruptedModelSelection(s)
     }
-    const message = `模型切换失败: ${messageOf(e)}`
+    const message = selectionApplied
+      ? `模型选择已保存，但后端重建失败: ${messageOf(e)}`
+      : `模型切换失败: ${messageOf(e)}`
     log(`session "${s.sessionName}": set model settings failed: ${messageOf(e)}`)
     await feishu.sendText(s.chatId, `❌ ${message}`)
     return { ok: false, message }

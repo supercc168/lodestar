@@ -5,12 +5,19 @@
  * session-ask.ts, session-permission.ts.
  */
 
+import type { AgentProvider, AgentReasoningEffort, AgentUsageSource } from './agent-process'
 import type { SessionModelSelection } from './feishu'
 
 export type TurnTrigger = 'user_message' | 'bg_task_resume' | 'watchdog_resume'
 
 export interface TurnState {
   cardId: string
+  /** Runtime model snapshot captured when this turn opens. Persistent model
+   * selection may change for a later turn, but must not rewrite this card. */
+  provider: AgentProvider
+  model: string | null
+  effort: AgentReasoningEffort
+  usageSource: AgentUsageSource
   /** Feishu message_id of the card — needed for urgent_app push on clean
    * turn close. Kept separate from cardId because cardkit's stream APIs
    * operate on card_id but the urgent_app endpoint takes message_id. */

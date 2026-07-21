@@ -203,7 +203,7 @@ watchdog_mode = 'off'              # 单项目覆盖(off / warn / recover_once)
 
 ### 🔀 接入 reclaude(自定义 Claude Code 可执行文件)
 
-[reclaude](https://docs.reclaude.ai) 用本地 daemon 代理 Claude Code 流量、换成官方分配账号。它的 CLI 会把所有非管理参数**原样透传**给 `claude`、自身输出只走 stderr,且每次启动自动确保 daemon 存活 —— 正好可以作为 lodestar 的 Claude 可执行文件。
+[reclaude](https://docs.reclaude.ai) 用本地 daemon 代理 Claude Code 流量、换成官方分配账号。Lodestar 会让 SDK 继续使用 bundled native Claude,再通过临时 PATH shim 让 reclaude 注入 proxy/CA；这样既保留 reclaude 路由,也保留 SDK 的 AskUserQuestion/dialog 协议。
 
 **接入步骤:**
 
@@ -217,13 +217,13 @@ watchdog_mode = 'off'              # 单项目覆盖(off / warn / recover_once)
    ```
 
 4. 重启 daemon:裸跑时 `lodestar-stop` 后再 `lodestar-daemon`;已由 launchd / systemd 托管时改用 `launchctl kickstart -k gui/$(id -u)/<label>` / `systemctl --user restart <unit>`,**不要**手动再起实例(托管器 KeepAlive 会拉起自己的实例并与手动实例互杀)
-5. 验证:群里发条消息,daemon 日志出现 `executable=config:…/reclaude` 即生效(stderr 里 reclaude 的 `同步配置…` 属正常输出)
+5. 验证:群里发条消息,daemon 日志出现 `executable=config-reclaude-sdk-native:…/reclaude` 即生效(stderr 里 reclaude 的 `同步配置…` 属正常输出)
 
 **没配就发消息的典型症状**:群里报 `Failed to authenticate. API Error: 401 Invalid bearer token` —— 裸 `claude` 拿着 reclaude 的本地凭据直连官方 API 必然 401,补上第 3、4 步即可。
 
-**通用说明**:`[claude].bin` 不限于 reclaude,任何"参数透传给 claude"的包装器都能配。设置后跳过自动查找(默认顺序 `~/.local/npm-global/bin` → `~/.local/bin` → PATH → SDK 自带二进制);路径不存在会在会话启动时直接报错,不会静默回退。
+**通用说明**:`[claude].bin` 设置后跳过自动查找(默认顺序 `~/.local/npm-global/bin` → `~/.local/bin` → PATH → SDK 自带二进制);路径不存在会在会话启动时直接报错,不会静默回退。Unix 下只有 basename 为 `reclaude` 的包装器会走 SDK-native PATH shim;其它自定义可执行文件会按 SDK 的显式 executable 语义运行,如需 AskUserQuestion/dialog 请优先使用 reclaude 或不配置 `bin`。
 
-**从 GLM 迁移过来时**:`~/.claude/settings.json` 或 `[claude.env]` 里遗留的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` 必须清掉 —— base URL 指向 GLM 时流量不经官方域名,reclaude 的拦截不会生效,烧的还是 GLM 额度。同时把 `[claude] default_model` 改回官方档位(或删掉,默认即 Fable 5);`[claude.models.glm]` 档位可保留但别设成默认。
+**从 GLM 迁移过来时**:`~/.claude/settings.json` 或 `[claude.env]` 里遗留的 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN` / `ANTHROPIC_DEFAULT_FABLE_MODEL` / `ANTHROPIC_DEFAULT_OPUS_MODEL` / `ANTHROPIC_DEFAULT_SONNET_MODEL` / `ANTHROPIC_DEFAULT_HAIKU_MODEL` 必须清掉。Lodestar spawn 会再次做进程级 scrub,官方档位只走登录态,GLM 只从 `[claude.models.glm]` 注入自己的映射。
 
 ### 🔔 HTTP 通知端点
 

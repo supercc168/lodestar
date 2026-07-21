@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, modelResultCard, modelResultPanelElement, modelSelectionCard, statusCard, streamingOffSettings } from './console'
+import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, consoleUsageElement, modelResultCard, modelResultPanelElement, modelSelectionCard, statusCard, streamingOffSettings } from './console'
 import {
   askUserQuestionElement,
   contextCompactionElement,
@@ -390,6 +390,37 @@ describe('main conversation card rendering', () => {
     expect(content).toContain('Codex · Wuhen')
     expect(content).toContain('渠道余额')
     expect(content).toContain('12.34 USD')
+  })
+
+  test('usage panel routes only the claude:glm profile to GLM quota', () => {
+    const glm = consoleUsageElement({
+      sessionName: 'probe',
+      status: 'idle',
+      provider: 'claude',
+      model: 'claude:glm',
+      glmUsage: {
+        state: 'ok',
+        level: 'max',
+        fiveHour: { percent: 23, resetsAt: null },
+        monthly: null,
+        fetchedAt: Date.now(),
+      },
+    } as any) as any
+    expect(glm.content).toContain('GLM 额度')
+    expect(glm.content).toContain('23%')
+
+    for (const model of ['claude:fable', 'claude:opus', 'claude:grok']) {
+      const element = consoleUsageElement({
+        sessionName: 'probe',
+        status: 'idle',
+        provider: 'claude',
+        model,
+        glmUsage: { state: 'rate_limited' },
+      } as any) as any
+      expect(element.content).toContain('不适用')
+      expect(element.content).toContain(model)
+      expect(element.content).not.toContain('GLM 额度')
+    }
   })
 })
 

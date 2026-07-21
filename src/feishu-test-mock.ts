@@ -20,6 +20,7 @@ export const updatedCards: Array<[string, object]> = []
 export const addedReactions: Array<[string, string]> = []
 export const deletedReactions: Array<[string, string]> = []
 export const boundResumes: Array<[string, string, string | undefined]> = []
+export const clearedTurnAnchors: string[] = []
 export const urgentPushes: Array<[string, string[]]> = []
 /** [projects.<name>] 项目 profile 替身,测试往里 set 后 Session 构造时可查到。 */
 export const projectProfiles = new Map<string, { cwd?: string; watchdogMode?: WatchdogMode }>()
@@ -30,7 +31,7 @@ export const feishuMockState = {
 }
 
 export function resetFeishuMock(): void {
-  for (const arr of [sentCards, sentTexts, sentRawTexts, updatedCards, addedReactions, deletedReactions, boundResumes, urgentPushes]) {
+  for (const arr of [sentCards, sentTexts, sentRawTexts, updatedCards, addedReactions, deletedReactions, boundResumes, clearedTurnAnchors, urgentPushes]) {
     arr.length = 0
   }
   projectProfiles.clear()
@@ -84,7 +85,7 @@ mock.module('./feishu', () => ({
   getTurnAnchors: () => [],
   truncateTurnAnchors: () => {},
   seedTurnAnchors: () => {},
-  clearTurnAnchors: () => {},
+  clearTurnAnchors: (sessionName: string) => { clearedTurnAnchors.push(sessionName) },
   ensureChatForSession: async (chatName: string) => ({ chatId: `oc_${chatName}`, created: true, joined: true }),
   disbandChatForSession: async () => ({ chatId: null, disbanded: true }),
 }))
