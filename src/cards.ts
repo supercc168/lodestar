@@ -131,6 +131,7 @@ export {
   isBgTerminal,
   hasActiveBgTask,
   summarizeBackground,
+  backgroundLiveSummary,
   backgroundTaskPanel,
   backgroundLiveCard,
   backgroundHistoryCard,

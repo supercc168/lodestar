@@ -3483,6 +3483,7 @@ export class Session {
         void cardkit.replaceElement(handle.cardId, cards.BG_ELEMENTS.panel(t.id), cards.backgroundTaskPanel(t, now))
       }
     }
+    cardkit.patchSummaryThrottled(handle.cardId, cards.backgroundLiveSummary(this.backgroundTasks))
   }
 
   /** kill / restart 时强制结算后台任务状态。SDK 子进程一死就不再发 task_settled,

@@ -18,7 +18,6 @@ mock.module('./config', () => ({
 
 const {
   buildClaudeSpawnPath,
-  CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS,
   CLAUDE_PERMISSION_MODE,
   ClaudeAgentProcess,
   claudeTranscriptPath,
@@ -67,7 +66,7 @@ describe('Claude model profiles', () => {
     expect(executable.description).toBe(`windows-shell-shim:${shim}`)
   })
 
-  test('passes Windows native executables directly to the SDK', () => {
+  test('win32 native exe falls through to SDK default entry (not passed directly, so dialog tools work)', () => {
     const binDir = 'C:\\Program Files\\ClaudeCode'
     const exe = win32.join(binDir, 'claude.exe')
     const shim = win32.join(binDir, 'claude.cmd')
@@ -77,9 +76,12 @@ describe('Claude model profiles', () => {
       exists: path => path === exe || path === shim,
     })
 
-    expect(executable.pathToClaudeCodeExecutable).toBe(exe)
+    // 走 SDK 默认入口(不显式传 pathToClaudeCodeExecutable):显式传会让 claude 走
+    // CLI stream-json 模式,不下发 AskUserQuestion 等 dialog 工具。SDK 默认入口
+    // 自己解析平台 native binary。见 resolveClaudeExecutableConfig 201-204 注释。
+    expect(executable.pathToClaudeCodeExecutable).toBeUndefined()
     expect(executable.spawnClaudeCodeProcess).toBeUndefined()
-    expect(executable.description).toBe(exe)
+    expect(executable.description).toBe('sdk-default')
   })
 
   test('keeps npm-global, local bins, and existing PATH in Claude spawn PATH', () => {
@@ -432,9 +434,10 @@ describe('Claude configured executable ([claude] bin)', () => {
 })
 
 describe('Claude permission mode', () => {
-  test('runs Claude Code in bypass permission mode', () => {
-    expect(CLAUDE_PERMISSION_MODE).toBe('bypassPermissions')
-    expect(CLAUDE_ALLOW_DANGEROUSLY_SKIP_PERMISSIONS).toBe(true)
+  test('runs Claude Code in default mode so canUseTool can intercept AskUserQuestion', () => {
+    // bypassPermissions 会 shadow canUseTool(SDK CLAUDE_SDK_CAN_USE_TOOL_SHADOWED),
+    // AskUserQuestion 被秒批空答案;改 default 后 canUseTool 才能拦下渲染卡片。
+    expect(CLAUDE_PERMISSION_MODE).toBe('default')
   })
 })
 
@@ -507,7 +510,7 @@ describe('Claude user dialog bridge', () => {
     ])
   })
 
-  test('routes askUserQuestion dialog through AskUserQuestion permission flow', async () => {
+  test('routes AskUserQuestion through canUseTool permission flow', async () => {
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
       effort: 'high',
@@ -526,14 +529,11 @@ describe('Claude user dialog bridge', () => {
     })
 
     const abortController = new AbortController()
-    const resultPromise = proc.onUserDialog({
-      dialogKind: 'askUserQuestion',
-      toolUseID: 'tool_dialog_1',
-      payload: {
-        question: 'Pick one?',
-        options: ['A', 'B'],
-      },
-    }, { signal: abortController.signal })
+    const resultPromise = proc.canUseTool(
+      'AskUserQuestion',
+      { question: 'Pick one?', options: ['A', 'B'] },
+      { signal: abortController.signal, toolUseID: 'tool_dialog_1' },
+    )
 
     expect(toolUses).toEqual([{
       id: 'tool_dialog_1',
@@ -553,9 +553,36 @@ describe('Claude user dialog bridge', () => {
     expect(permissions[0].tool_use_id).toBe('tool_dialog_1')
 
     await expect(resultPromise).resolves.toEqual({
-      behavior: 'completed',
-      result: { 'Pick one?': 'A' },
+      behavior: 'allow',
+      updatedInput: {
+        question: 'Pick one?',
+        options: ['A', 'B'],
+        questions: [{
+          question: 'Pick one?',
+          options: [{ label: 'A' }, { label: 'B' }],
+        }],
+        answers: { 'Pick one?': 'A' },
+      },
     })
+  })
+
+  test('canUseTool auto-allows non-AskUserQuestion tools (replicates bypass)', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const toolUses: any[] = []
+    const permissions: any[] = []
+    proc.on('tool_use', (event: any) => toolUses.push(event))
+    proc.on('can_use_tool', (event: any) => permissions.push(event))
+    const ac = new AbortController()
+    const result = await proc.canUseTool(
+      'Bash',
+      { command: 'echo hi' },
+      { signal: ac.signal, toolUseID: 'call_bash_1' },
+    )
+    // allow 分支 updatedInput 运行时必填(SDK Zod),回传原 input=不改
+    expect(result).toEqual({ behavior: 'allow', updatedInput: { command: 'echo hi' } })
+    // 非 AskUserQuestion 不走卡片机器:不发 tool_use、不发 can_use_tool
+    expect(toolUses).toEqual([])
+    expect(permissions).toEqual([])
   })
 
   test('bridges provider server tools and suppresses scaffold text', () => {
@@ -1247,12 +1274,12 @@ describe('Claude executable: third-party API routes bypass the wrapper bin', () 
   // 回归:GLM(route:api)绝不能走 reclaude 包装器 —— reclaude 的 gateway 会
   // 把注入的 ANTHROPIC_BASE_URL 劫持回官方 Anthropic,glm-5.2 这类第三方 id
   // 被官方 deployment 判为"模型不存在",客户端直接报
-  // "There's an issue with the selected model"。apiRoute:true 强制解析裸
-  // claude 直连第三方端点。
+  // "There's an issue with the selected model"。apiRoute:true 强制绕开 wrapper，
+  // 交给 SDK native 入口直连第三方端点并保留 dialog 工具。
   const wrapper = '/home/me/.local/bin/reclaude'
   const plain = '/home/me/.local/bin/claude'
 
-  test('apiRoute:true ignores the configured wrapper bin and resolves plain claude', () => {
+  test('apiRoute:true ignores the configured wrapper bin and uses the SDK native entry', () => {
     const executable = resolveClaudeExecutableConfig({
       platform: 'linux',
       homeDir: '/home/me',
@@ -1261,8 +1288,8 @@ describe('Claude executable: third-party API routes bypass the wrapper bin', () 
       exists: path => path === wrapper || path === plain,
     })
 
-    expect(executable.pathToClaudeCodeExecutable).toBe(plain)
-    expect(executable.description).toBe(plain)
+    expect(executable.pathToClaudeCodeExecutable).toBeUndefined()
+    expect(executable.description).toBe('sdk-default')
   })
 
   test('apiRoute:true still bypasses the wrapper even when no plain claude exists (sdk-default)', () => {

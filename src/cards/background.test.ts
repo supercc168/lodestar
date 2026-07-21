@@ -14,6 +14,7 @@ import {
   isBgTerminal,
   hasActiveBgTask,
   summarizeBackground,
+  backgroundLiveSummary,
   backgroundTaskPanel,
   backgroundLiveCard,
   backgroundHistoryCard,
@@ -304,6 +305,14 @@ describe('summarizeBackground', () => {
   })
 })
 
+describe('backgroundLiveSummary — 聊天列表预览全文(建卡与刷新共用)', () => {
+  test('带 🧭 前缀 + 实时计数', () => {
+    expect(backgroundLiveSummary([mk({ id: 'a', status: 'running' })])).toBe('🧭 子agent · 1 进行中')
+    expect(backgroundLiveSummary([mk({ id: 'a', status: 'running' }), mk({ id: 'b', status: 'running' }), mk({ id: 'c', status: 'completed' })])).toBe('🧭 子agent · 2 进行中 · 1 已结束')
+    expect(backgroundLiveSummary([])).toBe('🧭 子agent · 空')
+  })
+})
+
 describe('任务 panel —— 标题状态+时长,展开详情', () => {
   test('running:header 写「责任人·描述 — 运行中 Ns」,时长随 now', () => {
     const t = mk({ id: 't1', type: 'subagent', description: '搜索认证', status: 'running', startedAt: 0, subagentType: 'Explore' })
@@ -362,6 +371,7 @@ describe('整卡三态', () => {
     const card = backgroundLiveCard(tasks, 1000) as any
     expect(card.schema).toBe('2.0')
     expect(card.config.streaming_mode).toBe(true)
+    expect(card.config.summary.content).toBe('🧭 子agent · 1 进行中 · 1 已结束')
     const els = card.body.elements
     expect(els[0].tag).toBe('collapsible_panel')
     expect(els[0].element_id).toBe('bg_t1')
