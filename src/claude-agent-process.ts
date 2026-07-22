@@ -27,6 +27,7 @@ import {
   claudeModelKey,
   claudeModelEnv,
   claudeModelIsApiRoute,
+  claudeModelTierEnv,
   resolveClaudeSdkModel,
 } from './claude-models'
 import type {
@@ -786,6 +787,8 @@ export class ClaudeAgentProcess extends EventEmitter {
    *     ANTHROPIC_API_KEY 打到第三方端点(反之亦然)。
    * 关键:scrub 放在 `...config.claude.env` 叠加之后 —— 所以即使误把 token
    * 放进全局 [claude.env] 也会被抹掉;GLM token 必须放 [claude.models.glm]。
+   * GSD_RUNTIME 和四个 Claude tier alias 在最后一步锁定为当前 Lodestar
+   * 选中的 provider/model，避免 GSD/Task 子 agent 脱离当前飞书模型。
    * 注意:此 scrub 只作用于 spawn 进程的 env;若 ~/.claude/settings.json 的
    * env 块里配了 ANTHROPIC_BASE_URL/AUTH_TOKEN,Claude Code 仍会加载它 ——
    * 故第三方路由请一律走 [claude.models.*],不要写进 settings.json。 */
@@ -810,6 +813,10 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (claudeModelIsApiRoute(this.opts.model)) {
       Object.assign(env, claudeModelEnv(this.opts.model))
     }
+    // Claude Code/GSD 的 tier agent 可能选择 Fable/Opus/Sonnet/Haiku
+    // alias。全部绑定当前 SDK model，防止 GLM/Grok 或 Claude 官方档位在
+    // 同一轮里出现第二个模型。GSD_RUNTIME 放最后，不能被 shell/config 覆盖。
+    Object.assign(env, claudeModelTierEnv(this.opts.model), { GSD_RUNTIME: 'claude' })
     return env
   }
 

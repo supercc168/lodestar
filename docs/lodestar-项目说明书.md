@@ -241,17 +241,18 @@ projects_root = "~/"     # 项目根目录,可选,默认主目录
 > 📷 **待补图 7.2** ｜ 截图内容:群里发 `hi` 弹出的控制台卡片(展示项目状态、当前模型、用量、主机信息等)。
 
 ### 7.3 切换 AI 模型(`model`)
-群里发 `model`,弹出 **4 个固定档位**,点一下即切换,**按群记住**:
+群里发 `model`,弹出固定档位,点一下即切换,**按群记住**:
 
 | 档位 | 说明 |
 | --- | --- |
 | **Claude · Fable 5** | 走你的 Anthropic 登录态 |
 | **Claude · Opus 4.8** | 走你的 Anthropic 登录态,能力最强 |
 | **Claude · GLM** | GLM-5.2,**1M 超长上下文、中文友好**(需配 GLM key) |
-| **Codex · GPT-5.5** | OpenAI Codex(需登录 ChatGPT) |
+| **Claude · Grok** | Grok 第三方 Anthropic 兼容路由(需配置对应 token) |
+| **Codex · GPT-5.6 Sol** | OpenAI Codex(需登录 ChatGPT),`max` 推理强度 |
 
 ![图 7.3 model 模型切换面板](images/feishu/7.3-model-panel.png)
-> 📷 **待补图 7.3** ｜ 截图内容:群里发 `model` 弹出的模型选择卡片,展示 Fable 5 / Opus 4.8 / GLM / GPT-5.5 四个档位和"选"按钮。
+> 📷 **待补图 7.3** ｜ 截图内容:群里发 `model` 弹出的模型选择卡片,展示 Fable 5 / Opus 4.8 / GLM / Grok / GPT-5.6 Sol 档位和"选"按钮。
 
 > 订阅了 GLM Coding Plan 的话强烈推荐 **Claude·GLM** 档位:长会话不易丢前文,在 GLM 档位上 `hi` 控制台还会显示套餐额度和用量。
 

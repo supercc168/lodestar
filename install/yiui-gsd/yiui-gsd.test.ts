@@ -561,4 +561,174 @@ describe('yiui-gsd cross-platform helper', () => {
     expect(result.status).not.toBe(0)
     expect(result.stderr).toContain('PROJECT.md differs')
   })
+
+  test('Codex agent policy keeps every GSD role on Sol with tiered effort', () => {
+    const codexHome = join(root, 'codex-home')
+    const defaultsPath = join(root, 'gsd-defaults.json')
+    mkdirSync(join(codexHome, 'gsd-core', 'bin', 'shared'), { recursive: true })
+    mkdirSync(join(codexHome, 'agents'), { recursive: true })
+    writeFileSync(join(codexHome, 'gsd-core', 'bin', 'shared', 'model-catalog.json'), JSON.stringify({
+      agents: {
+        'gsd-planner': { routingTier: 'heavy' },
+        'gsd-doc-classifier': { routingTier: 'light' },
+      },
+    }))
+    writeFileSync(defaultsPath, JSON.stringify({
+      preserved: 'keep-me',
+      workflow: {
+        subagent_timeout: 300_000,
+        pattern_mapper: true,
+        post_planning_gaps: true,
+        plan_bounce: true,
+        plan_review_convergence: true,
+        cross_ai_execution: true,
+        code_review_command: 'external-review',
+        inline_plan_threshold: 0,
+        unrelated: 'keep-me-too',
+      },
+      claude_orchestration: {
+        enabled: true,
+        execution_backend: 'workflow',
+        min_agent_sdk_version: '0.3.149',
+      },
+    }))
+    for (const name of ['gsd-planner', 'gsd-doc-classifier']) {
+      writeFileSync(join(codexHome, 'agents', `${name}.toml`), [
+        'model = "stale-model"',
+        'model_reasoning_effort = "low"',
+        'service_tier = "flex"',
+        'developer_instructions = "test"',
+        '',
+      ].join('\n'))
+    }
+
+    const apply = runHelper([
+      'apply-agent-policy',
+      '--runtime', 'codex',
+      '--codex-home', codexHome,
+      '--gsd-defaults-path', defaultsPath,
+    ])
+    expectOk(apply)
+    expect(readFileSync(join(codexHome, 'agents', 'gsd-planner.toml'), 'utf8')).toContain('model_reasoning_effort = "high"')
+    expect(readFileSync(join(codexHome, 'agents', 'gsd-doc-classifier.toml'), 'utf8')).toContain('model_reasoning_effort = "medium"')
+    for (const name of ['gsd-planner', 'gsd-doc-classifier']) {
+      const content = readFileSync(join(codexHome, 'agents', `${name}.toml`), 'utf8')
+      expect(content).toContain('model = "gpt-5.6-sol"')
+      expect(content).not.toContain('service_tier = "flex"')
+    }
+    expect(JSON.parse(readFileSync(defaultsPath, 'utf8'))).toMatchObject({
+      preserved: 'keep-me',
+      runtime: 'codex',
+      subagent_timeout: 1_800_000,
+      workflow: {
+        subagent_timeout: 1_800_000,
+        pattern_mapper: false,
+        post_planning_gaps: false,
+        plan_bounce: false,
+        plan_review_convergence: false,
+        cross_ai_execution: false,
+        code_review_command: null,
+        inline_plan_threshold: 2,
+        unrelated: 'keep-me-too',
+      },
+      claude_orchestration: {
+        enabled: false,
+        execution_backend: 'inline',
+        min_agent_sdk_version: '0.3.149',
+      },
+    })
+
+    const defaultsMtime = statSync(defaultsPath).mtimeMs
+    for (const name of ['gsd-planner', 'gsd-doc-classifier']) {
+      expect(statSync(join(codexHome, 'agents', `${name}.toml`)).mtimeMs).toBeGreaterThanOrEqual(defaultsMtime)
+    }
+
+    expectOk(runHelper([
+      'apply-agent-policy',
+      '--runtime', 'codex',
+      '--codex-home', codexHome,
+      '--gsd-defaults-path', defaultsPath,
+      '--verify-only',
+    ]))
+
+    // GSD 1.8 warns whenever defaults are newer than the oldest static Codex
+    // agent TOML. Verify-only must expose that drift without mutating files;
+    // apply mode then acknowledges the already-verified bake atomically.
+    const old = new Date(Date.now() - 10_000)
+    const fresh = new Date()
+    for (const name of ['gsd-planner', 'gsd-doc-classifier']) {
+      utimesSync(join(codexHome, 'agents', `${name}.toml`), old, old)
+    }
+    utimesSync(defaultsPath, fresh, fresh)
+    const plannerMtimeBeforeVerify = statSync(join(codexHome, 'agents', 'gsd-planner.toml')).mtimeMs
+    const staleVerify = runHelper([
+      'apply-agent-policy',
+      '--runtime', 'codex',
+      '--codex-home', codexHome,
+      '--gsd-defaults-path', defaultsPath,
+      '--verify-only',
+    ])
+    expect(staleVerify.status).not.toBe(0)
+    expect(JSON.parse(staleVerify.stdout).violations).toContain('agent bake timestamp')
+    expect(statSync(join(codexHome, 'agents', 'gsd-planner.toml')).mtimeMs).toBe(plannerMtimeBeforeVerify)
+
+    const rebake = runHelper([
+      'apply-agent-policy',
+      '--runtime', 'codex',
+      '--codex-home', codexHome,
+      '--gsd-defaults-path', defaultsPath,
+    ])
+    expectOk(rebake)
+    expect(JSON.parse(rebake.stdout).bake_timestamps_synced).toBe(2)
+    for (const name of ['gsd-planner', 'gsd-doc-classifier']) {
+      expect(statSync(join(codexHome, 'agents', `${name}.toml`)).mtimeMs).toBeGreaterThanOrEqual(statSync(defaultsPath).mtimeMs)
+    }
+  })
+
+  test('Claude agent policy forces every GSD role to inherit the selected Feishu model', () => {
+    const claudeHome = join(root, 'claude-home')
+    mkdirSync(join(claudeHome, 'gsd-core', 'bin', 'shared'), { recursive: true })
+    mkdirSync(join(claudeHome, 'agents'), { recursive: true })
+    writeFileSync(join(claudeHome, 'gsd-core', 'bin', 'shared', 'model-catalog.json'), '{"agents":{}}\n')
+    writeFileSync(join(claudeHome, 'agents', 'gsd-planner.md'), [
+      '---',
+      'name: gsd-planner',
+      'effort: high',
+      '---',
+      '',
+      '# Planner',
+      '',
+    ].join('\n'))
+    writeFileSync(join(claudeHome, 'agents', 'gsd-mempalace-curator.md'), [
+      '---',
+      'name: gsd-mempalace-curator',
+      'model: sonnet',
+      '---',
+      '',
+      '# Curator',
+      '',
+    ].join('\n'))
+
+    const apply = spawnSync('node', [
+      helper,
+      'apply-agent-policy',
+      '--claude-home', claudeHome,
+    ], {
+      cwd: root,
+      encoding: 'utf8',
+      env: { ...process.env, GSD_RUNTIME: 'claude' },
+    })
+    expectOk(apply)
+    for (const name of ['gsd-planner', 'gsd-mempalace-curator']) {
+      const content = readFileSync(join(claudeHome, 'agents', `${name}.md`), 'utf8')
+      expect(content.match(/^model:\s*inherit\s*$/gm)).toHaveLength(1)
+    }
+    expectOk(runHelper([
+      'apply-agent-policy',
+      '--runtime', 'claude',
+      '--claude-home', claudeHome,
+      '--verify-only',
+    ]))
+    expect(existsSync(join(claudeHome, 'gsd-user-files-backup'))).toBe(true)
+  })
 })

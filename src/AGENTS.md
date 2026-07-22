@@ -33,7 +33,7 @@
 | `codex-usage.ts` | 解析 app-server token usage payload，并计算 per-turn absolute total 差值与有效 token。 |
 | `codex-compaction.ts` | 解析多种 app-server / raw response context compaction 事件，并输出统一 `ContextCompactedNotification`。 |
 | `claude-agent-process.ts` | 实现 `AgentProcess` 的 Claude 后端：用 `@anthropic-ai/claude-agent-sdk` 的 `query({ prompt: AsyncIterable })` streaming-input 长驻进程，把 SDK message（`system/init`、assistant text/tool_use、`tool_result`、`result`、`compact_boundary`）映射为统一 Session 事件；`permissionMode: default` + `canUseTool` 回调：`AskUserQuestion` 经 canUseTool 下发、host 拦下渲染卡片并回填 answers，其余工具秒放（复刻旧 bypassPermissions「不弹审批」语义；bypassPermissions 会 shadow canUseTool，AskUserQuestion 就废了）；启动前 `assertClaudeCodeAvailable` 检查 `claude` 可执行文件。 |
-| `claude-models.ts` | Claude model profile：内置 `glm`（GLM-5.2）一项，可被 `config.toml` 的 `[claude.models.*]` 覆盖/新增；`resolveClaudeSdkModel` 把 `claude:glm` 映射为 SDK 主模型 `opus` alias，真实上游模型（GLM-5.2/4.7）由 `~/.claude/settings.json` 的 `ANTHROPIC_DEFAULT_*_MODEL` 路由。 |
+| `claude-models.ts` | Claude model profile：内置 Fable/Opus 登录档与 `glm` API 档，可由 `config.toml` 的 `[claude.models.*]` 覆盖/新增（含 Grok）；`resolveClaudeSdkModel` 返回当前档位的真实 SDK model id，spawn 时把 Fable/Opus/Sonnet/Haiku 四个 alias 全部锁到该 id，禁止 GSD/Task 子 agent 换模型。 |
 | `card-action.ts` | Card action 回调响应辅助；生产 WS 路径用 `{ card: { type: "raw", data: newCard } }` 立即替换 JSON 卡片，避免 200672、裸卡片或提前 patch 导致模型/effort 面板闪退。 |
 | `cardkit.ts` | Feishu Card Kit v1 封装；维护 per-card sequence、Promise queue、流式限流、元素计数和写失败回调。 |
 | `cards.ts` | 卡片模板 barrel；统一导出 `src/cards/` 下的 turn、console、worktree、agy、task 和元素 ID 工具。 |

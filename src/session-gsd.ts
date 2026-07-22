@@ -2,11 +2,14 @@ import type { Session } from './session'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { agentProviderLabel } from './agent-process'
+import { resolveClaudeSdkModel } from './claude-models'
+import { resolveCodexModelId } from './codex-models'
 import { log } from './log'
 import { messageOf } from './session-util'
 import {
   completeGsdTask,
   createAndActivateTask,
+  enforceGsdProviderIsolation,
   pauseGsdTask,
   readGsdSnapshot,
   resumeGsdTask,
@@ -23,6 +26,18 @@ import {
 export const GSD_AWAITING_NAME_MS = 300_000
 export const GSD_PANEL_STALE_MSG = '面板已过期，请发 gsd 刷新'
 export const GSD_BUSY_MSG = '会话忙碌，稍后再继续 GSD'
+
+/** Resolve the model named in the injected GSD contract through the same
+ * profile mapping used at the child-process boundary. */
+export function gsdPromptModelLabel(
+  provider: 'codex' | 'claude',
+  selectedModel: string | null | undefined,
+): string {
+  if (provider === 'claude') {
+    return resolveClaudeSdkModel(selectedModel) ?? selectedModel ?? 'claude-fable-5'
+  }
+  return resolveCodexModelId(selectedModel) ?? selectedModel ?? 'gpt-5.6-sol'
+}
 
 export type GsdActionResult = {
   ok: boolean
@@ -391,6 +406,13 @@ export async function onGsdContinue(
       return resultWithCard(s, false, GSD_BUSY_MSG)
     }
 
+    const provider = s.currentProvider()
+    // Validate and apply all non-status prerequisites before resuming a paused
+    // task. A malformed workstream config must not turn 已暂停 into 运行中 on
+    // a failed continue attempt.
+    ensureBridge(s.workDir, snapBefore.taskSlug)
+    enforceGsdProviderIsolation(s.workDir, snapBefore.taskSlug, provider)
+
     let snap = snapBefore
     if (snap.status === '已暂停') {
       snap = resumeGsdTask(s.workDir, selectedSlug)
@@ -398,8 +420,6 @@ export async function onGsdContinue(
     if (!snap.taskSlug) {
       return resultWithCard(s, false, '没有活跃 task_slug')
     }
-
-    ensureBridge(s.workDir, snap.taskSlug)
     s.gsdSelectedTaskSlug = snap.taskSlug
 
     // Invalidate panel gen before inject so a second click with the old
@@ -414,7 +434,9 @@ export async function onGsdContinue(
       action: 'continue',
       taskSlug: snap.taskSlug,
       taskName: snap.taskName || snap.taskSlug,
-      provider: s.currentProvider(),
+      provider,
+      model: gsdPromptModelLabel(provider, s.currentModelLabel()),
+      effort: s.currentEffortLabel(),
     })
     // Non-blocking inject: after validation / busy / resume / bridge, fire
     // onUserMessage and return the card immediately so Feishu ACK is not
@@ -530,7 +552,9 @@ export async function startNamedGsdTask(
     const snap: GsdSnapshot = createAndActivateTask(s.workDir, taskName)
     createdSlug = snap.taskSlug
     s.gsdSelectedTaskSlug = snap.taskSlug
+    const provider = s.currentProvider()
     ensureBridge(s.workDir, snap.taskSlug)
+    enforceGsdProviderIsolation(s.workDir, snap.taskSlug, provider)
 
     // Invalidate panel gen before await inject (anti double-create / double-inject).
     bumpGsdPanelGen(s)
@@ -541,7 +565,9 @@ export async function startNamedGsdTask(
       action: 'new-task-discuss',
       taskSlug: snap.taskSlug,
       taskName: snap.taskName || taskName,
-      provider: s.currentProvider(),
+      provider,
+      model: gsdPromptModelLabel(provider, s.currentModelLabel()),
+      effort: s.currentEffortLabel(),
     })
 
     const card = buildCard(s, {

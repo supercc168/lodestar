@@ -162,11 +162,11 @@ describe('Claude model profiles', () => {
       expect(claudeModelEnv('claude:glm')).toEqual({
         ANTHROPIC_BASE_URL: 'https://open.bigmodel.cn/api/anthropic',
         ANTHROPIC_AUTH_TOKEN: 'glm-secret-token',
-        // 内置默认别名映射(智谱最强组合):config 未配 env_* 时自动注入
-        ANTHROPIC_DEFAULT_FABLE_MODEL: 'glm-5.2[1m]',
-        ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2[1m]',
-        ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5-turbo',
-        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5-turbo',
+        // 所有 GSD/Task tier alias 都锁到当前选择的同一个真实模型。
+        ANTHROPIC_DEFAULT_FABLE_MODEL: 'glm-4.6',
+        ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-4.6',
+        ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.6',
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.6',
       })
       // 官方模型仍然干净,GLM 的 token 不外泄到登录态档位。
       expect(claudeModelEnv('claude:opus')).toEqual({})
@@ -215,6 +215,11 @@ describe('Claude model profiles', () => {
       expect(loginEnv.ANTHROPIC_API_KEY).toBeUndefined()
       expect(loginEnv.ANTHROPIC_BASE_URL).toBeUndefined()
       expect(loginEnv.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+      expect(loginEnv.GSD_RUNTIME).toBe('claude')
+      expect(loginEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-opus-4-8')
+      expect(loginEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-4-8')
+      expect(loginEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-opus-4-8')
+      expect(loginEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-opus-4-8')
 
       // GLM 第三方路由:注入自己的 base_url + auth_token,但残留的官方 key
       // 被先抹掉,不会夹带打到第三方端点。
@@ -223,6 +228,7 @@ describe('Claude model profiles', () => {
       expect(glmEnv.ANTHROPIC_BASE_URL).toBe('https://glm.example/anthropic')
       expect(glmEnv.ANTHROPIC_AUTH_TOKEN).toBe('glm-tok')
       expect(glmEnv.ANTHROPIC_API_KEY).toBeUndefined()
+      expect(glmEnv.GSD_RUNTIME).toBe('claude')
     } finally {
       if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY
       else process.env.ANTHROPIC_API_KEY = prevKey
@@ -260,14 +266,24 @@ describe('Claude model profiles', () => {
       expect(glmEnv.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic')
       expect(glmEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.2[1m]')
       expect(glmEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.2[1m]')
-      expect(glmEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5-turbo')
-      expect(glmEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5-turbo')
+      expect(glmEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.2[1m]')
+      expect(glmEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.2[1m]')
+      expect(glmEnv.GSD_RUNTIME).toBe('claude')
 
-      // 官方登录档位:宿主和 [claude.env] 的四种别名都不能泄漏进子进程。
+      // 官方登录档位:宿主和 [claude.env] 的四种别名不能泄漏;所有
+      // alias 改为当前选择的 Opus,确保子 agent 不切换模型。
       const opus = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:opus' })
       const opusEnv = (opus as any).buildSpawnEnv()
-      for (const key of aliasKeys) expect(opusEnv[key]).toBeUndefined()
+      for (const key of aliasKeys) expect(opusEnv[key]).toBe('claude-opus-4-8')
       expect(opusEnv.ANTHROPIC_BASE_URL).toBeUndefined()
+      expect(opusEnv.GSD_RUNTIME).toBe('claude')
+
+      // 新群尚未显式选择模型时，SDK 主模型回落 Fable 5；tier alias 必须
+      // 使用同一回落，不能让 GSD 子 agent 再按角色切到其它 Claude 模型。
+      const defaultLogin = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max' })
+      const defaultEnv = (defaultLogin as any).buildSpawnEnv()
+      for (const key of aliasKeys) expect(defaultEnv[key]).toBe('claude-fable-5')
+      expect(defaultEnv.GSD_RUNTIME).toBe('claude')
     } finally {
       ;(config.claude as any).models = prevModels
       ;(config.claude as any).env = prevEnv

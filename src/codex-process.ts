@@ -96,6 +96,20 @@ export function buildSpawnPath(inherited: string = process.env.PATH ?? ''): stri
   return [...userBins, inherited, ...systemFallback].filter(Boolean).join(delimiter)
 }
 
+/** Environment passed to the Codex app-server. GSD Core resolves its runtime
+ * from this child environment before persisted defaults; keep the lock last
+ * so a stale Claude value cannot route a GPT Feishu session elsewhere. */
+export function buildCodexSpawnEnv(providerEnv: Record<string, string> = {}): Record<string, string> {
+  return {
+    ...(process.env as Record<string, string>),
+    NPM_CONFIG_LOGLEVEL: 'error',
+    PATH: buildSpawnPath(),
+    ...config.codex.env,
+    ...providerEnv,
+    GSD_RUNTIME: 'codex',
+  }
+}
+
 const CODEX_SESSIONS_DIR = join(homedir(), '.codex', 'sessions')
 const CODEX_GENERATED_IMAGES_DIR = join(homedir(), '.codex', 'generated_images')
 
@@ -319,13 +333,7 @@ export class CodexProcess extends EventEmitter {
       cwd: opts.workDir,
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: process.platform === 'win32',
-      env: {
-        ...(process.env as Record<string, string>),
-        NPM_CONFIG_LOGLEVEL: 'error',
-        PATH: buildSpawnPath(),
-        ...config.codex.env,
-        ...(opts.providerEnv ?? {}),
-      },
+      env: buildCodexSpawnEnv(opts.providerEnv),
     }) as ChildProcessByStdio<Writable, Readable, Readable>
 
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))

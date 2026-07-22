@@ -14,6 +14,7 @@ if (-not (Get-Command node -ErrorAction SilentlyContinue)) {
 $nodeArgs = @(
     $helper,
     'apply-agent-policy',
+    '--runtime', 'codex',
     '--codex-home', $CodexHome,
     '--gsd-defaults-path', $GsdDefaultsPath
 )

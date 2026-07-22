@@ -15,6 +15,7 @@ import {
   assertGsdFinalizationComplete,
   completeGsdTask,
   createAndActivateTask,
+  enforceGsdProviderIsolation,
   parseStateProgress,
   pauseGsdTask,
   readGsdSnapshot,
@@ -127,6 +128,106 @@ test('selection rejects an invalid client-supplied slug before store writes', ()
   expect(() => selectGsdTask(root, '../outside')).toThrow(/invalid GSD task slug/)
   expect(existsSync(join(root, '.gsd', 'TRACKER.md'))).toBe(false)
   expect(existsSync(join(root, 'outside'))).toBe(false)
+})
+
+test('provider isolation disables external routes while preserving other workstream config', () => {
+  const task = createAndActivateTask(root, 'Provider Isolation')
+  const configPath = join(root, '.gsd', task.taskSlug, '.planning', 'config.json')
+  writeFileSync(configPath, JSON.stringify({
+    runtime: 'gemini',
+    model_profile: 'adaptive',
+    model_overrides: { 'gsd-planner': 'google/gemini-pro' },
+    models: { planning: 'opus' },
+    dynamic_routing: { enabled: true },
+    model_profile_overrides: { claude: { opus: 'claude-opus-stale' } },
+    model_policy: { provider: 'openai' },
+    claude_orchestration: {
+      enabled: true,
+      execution_backend: 'workflow',
+      min_agent_sdk_version: '0.3.149',
+    },
+    features: {
+      thinking_partner: true,
+      global_learnings: true,
+    },
+    workflow: {
+      research: true,
+      pattern_mapper: true,
+      post_planning_gaps: true,
+      plan_bounce: true,
+      plan_bounce_script: 'external-plan-review',
+      plan_review_convergence: true,
+      cross_ai_execution: true,
+      code_review_command: 'external-review',
+      subagent_timeout: 300_000,
+      inline_plan_threshold: 0,
+    },
+  }))
+
+  expect(enforceGsdProviderIsolation(root, task.taskSlug, 'claude')).toEqual({
+    path: configPath,
+    changed: true,
+  })
+  expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual({
+    runtime: 'claude',
+    model_profile: 'inherit',
+    model_overrides: null,
+    models: null,
+    dynamic_routing: null,
+    model_profile_overrides: null,
+    model_policy: null,
+    workflow: {
+      research: true,
+      pattern_mapper: false,
+      post_planning_gaps: false,
+      plan_bounce: false,
+      plan_bounce_script: null,
+      plan_review_convergence: false,
+      cross_ai_execution: false,
+      code_review_command: null,
+      subagent_timeout: 1_800_000,
+      inline_plan_threshold: 2,
+    },
+    features: {
+      thinking_partner: false,
+      global_learnings: true,
+    },
+    claude_orchestration: {
+      enabled: false,
+      execution_backend: 'inline',
+      min_agent_sdk_version: '0.3.149',
+    },
+  })
+  expect(enforceGsdProviderIsolation(root, task.taskSlug, 'claude').changed).toBe(false)
+  expect(enforceGsdProviderIsolation(root, task.taskSlug, 'codex').changed).toBe(true)
+  expect(JSON.parse(readFileSync(configPath, 'utf8')).runtime).toBe('codex')
+  expect(git(['status', '--short'])).toBe('')
+})
+
+test('provider isolation fails closed without overwriting malformed workstream config', () => {
+  const task = createAndActivateTask(root, 'Bad Provider Config')
+  const configPath = join(root, '.gsd', task.taskSlug, '.planning', 'config.json')
+  writeFileSync(configPath, '{bad json\n')
+
+  expect(() => enforceGsdProviderIsolation(root, task.taskSlug, 'codex')).toThrow(/invalid JSON/)
+  expect(readFileSync(configPath, 'utf8')).toBe('{bad json\n')
+})
+
+test('provider isolation rejects malformed workflow feature sections', () => {
+  const task = createAndActivateTask(root, 'Bad Provider Sections')
+  const configPath = join(root, '.gsd', task.taskSlug, '.planning', 'config.json')
+
+  writeFileSync(configPath, '{"workflow":[]}\n')
+  expect(() => enforceGsdProviderIsolation(root, task.taskSlug, 'codex')).toThrow(/workflow must be an object/)
+  expect(readFileSync(configPath, 'utf8')).toBe('{"workflow":[]}\n')
+
+  writeFileSync(configPath, '{"features":"on"}\n')
+  expect(() => enforceGsdProviderIsolation(root, task.taskSlug, 'claude')).toThrow(/features must be an object/)
+  expect(readFileSync(configPath, 'utf8')).toBe('{"features":"on"}\n')
+
+  writeFileSync(configPath, '{"claude_orchestration":true}\n')
+  expect(() => enforceGsdProviderIsolation(root, task.taskSlug, 'claude')).toThrow(/claude_orchestration must be an object/)
+  expect(readFileSync(configPath, 'utf8')).toBe('{"claude_orchestration":true}\n')
 })
 
 test('pause and resume mutate only the requested task', () => {

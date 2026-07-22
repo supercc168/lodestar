@@ -115,8 +115,8 @@ function Install-Core {
     if (-not (Get-Command npx -ErrorAction SilentlyContinue)) {
         Die 'missing command: npx (Node.js >= 18 required)'
     }
-    Write-Log "installing @opengsd/gsd-core@$Channel --codex --global"
-    & npx --yes "@opengsd/gsd-core@$Channel" --codex --global
+    Write-Log "installing @opengsd/gsd-core@$Channel --codex --claude --global"
+    & npx --yes "@opengsd/gsd-core@$Channel" --codex --claude --global
     if ($LASTEXITCODE -ne 0) {
         Die "npx gsd-core install failed with exit $LASTEXITCODE"
     }
@@ -132,13 +132,17 @@ if ($Project) {
 }
 
 if (-not $SkipCore) {
-    $versionPath = Join-Path $HOME '.codex/gsd-core/VERSION'
+    $codexVersionPath = Join-Path $HOME '.codex/gsd-core/VERSION'
+    $claudeVersionPath = Join-Path $HOME '.claude/gsd-core/VERSION'
     $shouldInstall = $true
-    if ((Test-Path $versionPath) -and -not $Yes) {
-        $cur = (Get-Content $versionPath -Raw).Trim()
-        Write-Log "existing GSD core VERSION=$cur (channel=$Channel)"
+    if ((Test-Path $codexVersionPath) -and (Test-Path $claudeVersionPath) -and -not $Yes) {
+        $codexCur = (Get-Content $codexVersionPath -Raw).Trim()
+        $claudeCur = (Get-Content $claudeVersionPath -Raw).Trim()
+        Write-Log "existing GSD core codex=$codexCur claude=$claudeCur (channel=$Channel)"
         $ans = Read-Host "Re-run installer for channel $Channel? [Y/n]"
         if ($ans -match '^[nN]') { $shouldInstall = $false }
+    } elseif (-not $Yes) {
+        Write-Log 'one or both GSD runtime roots are missing; installing Codex + Claude'
     }
     if ($shouldInstall) {
         Install-Core
@@ -155,12 +159,16 @@ if ($InitGsd) {
 }
 
 if (-not $SkipAgentPolicy) {
-    & node $Helper 'apply-agent-policy'
+    & node $Helper 'apply-agent-policy' '--runtime' 'codex'
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    & node $Helper 'apply-agent-policy' '--verify-only'
+    & node $Helper 'apply-agent-policy' '--runtime' 'codex' '--verify-only'
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & node $Helper 'apply-agent-policy' '--runtime' 'claude'
+    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+    & node $Helper 'apply-agent-policy' '--runtime' 'claude' '--verify-only'
     if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 } else {
-    Write-Log 'SkipAgentPolicy: not applying Codex agent policy'
+    Write-Log 'SkipAgentPolicy: not applying Codex/Claude agent policies'
 }
 
 Write-Log 'running verify'

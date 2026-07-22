@@ -123,9 +123,10 @@ EOF
 install_core() {
   need_cmd npx
   local tag="$CHANNEL"
-  log "installing @opengsd/gsd-core@$tag --codex --global"
-  # Installer writes ~/.codex/gsd-core, ~/.agents/skills/gsd-*, ~/.codex/agents/gsd-*
-  npx --yes "@opengsd/gsd-core@${tag}" --codex --global
+  log "installing @opengsd/gsd-core@$tag --codex --claude --global"
+  # Installer writes both runtime roots: ~/.codex + ~/.claude, shared
+  # ~/.agents/skills (Codex) and ~/.claude/skills (Claude).
+  npx --yes "@opengsd/gsd-core@${tag}" --codex --claude --global
 }
 
 init_gsd_repo() {
@@ -137,8 +138,10 @@ init_gsd_repo() {
 apply_policy() {
   local helper="$SKILL_SRC/scripts/yiui-gsd.mjs"
   [[ -f "$helper" ]] || die "missing $helper"
-  node "$helper" apply-agent-policy
-  node "$helper" apply-agent-policy --verify-only
+  node "$helper" apply-agent-policy --runtime codex
+  node "$helper" apply-agent-policy --runtime codex --verify-only
+  node "$helper" apply-agent-policy --runtime claude
+  node "$helper" apply-agent-policy --runtime claude --verify-only
 }
 
 [[ -f "$SKILL_SRC/SKILL.md" ]] || die "not a lodestar checkout? missing $SKILL_SRC/SKILL.md"
@@ -154,9 +157,10 @@ if [[ -n "$EXTRA_PROJECT" ]]; then
 fi
 
 if [[ "$SKIP_CORE" -eq 0 ]]; then
-  if [[ -f "$HOME/.codex/gsd-core/VERSION" && "$YES" -eq 0 ]]; then
-    cur="$(tr -d '[:space:]' <"$HOME/.codex/gsd-core/VERSION" || true)"
-    log "existing GSD core VERSION=$cur (channel=$CHANNEL)"
+  if [[ -f "$HOME/.codex/gsd-core/VERSION" && -f "$HOME/.claude/gsd-core/VERSION" && "$YES" -eq 0 ]]; then
+    codex_cur="$(tr -d '[:space:]' <"$HOME/.codex/gsd-core/VERSION" || true)"
+    claude_cur="$(tr -d '[:space:]' <"$HOME/.claude/gsd-core/VERSION" || true)"
+    log "existing GSD core codex=$codex_cur claude=$claude_cur (channel=$CHANNEL)"
     printf 'Re-run installer for channel %s? [Y/n] ' "$CHANNEL"
     read -r ans || ans=Y
     case "${ans:-Y}" in
@@ -164,6 +168,9 @@ if [[ "$SKIP_CORE" -eq 0 ]]; then
       *) install_core ;;
     esac
   else
+    if [[ "$YES" -eq 0 ]]; then
+      log "one or both GSD runtime roots are missing; installing Codex + Claude"
+    fi
     install_core
   fi
 else
@@ -177,7 +184,7 @@ fi
 if [[ "$SKIP_AGENT_POLICY" -eq 0 ]]; then
   apply_policy
 else
-  log "skip-agent-policy: not applying Codex agent policy"
+  log "skip-agent-policy: not applying Codex/Claude agent policies"
 fi
 
 log "running verify"

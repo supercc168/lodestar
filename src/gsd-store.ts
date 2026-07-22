@@ -191,6 +191,10 @@ function writeFileAtomic(path: string, content: string): void {
   }
 }
 
+function isPlainRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
 function trackerPath(projectRoot: string): string {
   return join(projectRoot, '.gsd', TRACKER_FILE)
 }
@@ -205,6 +209,88 @@ function taskPath(projectRoot: string, slug: string): string {
 
 function planningPathFor(slug: string): string {
   return slug ? `.gsd/${slug}/.planning/` : ''
+}
+
+/** Keep a workstream on Lodestar's current Feishu provider/model by disabling
+ * every automatic external-AI route at the project-config layer. The file is
+ * intentionally ignored by the local .gsd repository. */
+export function enforceGsdProviderIsolation(
+  projectRoot: string,
+  taskSlug: string,
+  runtime: 'codex' | 'claude',
+): { path: string; changed: boolean } {
+  if (runtime !== 'codex' && runtime !== 'claude') {
+    throw new Error(`unsupported GSD runtime isolation target: ${runtime}`)
+  }
+  const slug = normalizeTaskSlug(taskSlug)
+  const gsdRoot = join(projectRoot, '.gsd')
+  if (!existsSync(join(gsdRoot, '.git'))) {
+    throw new Error(`GSD local git missing: ${gsdRoot}`)
+  }
+  const path = join(gsdRoot, slug, '.planning', 'config.json')
+  return withGsdWriteLock(projectRoot, () => {
+    const current = existsSync(path) ? readFileSync(path, 'utf8') : ''
+    let parsed: Record<string, unknown> = {}
+    if (current.trim()) {
+      try {
+        const value: unknown = JSON.parse(current)
+        if (!isPlainRecord(value)) throw new Error('top level must be an object')
+        parsed = value
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error)
+        throw new Error(`GSD workstream config is invalid JSON (${path}): ${detail}`)
+      }
+    }
+    const rawWorkflow = parsed.workflow
+    if (rawWorkflow != null && !isPlainRecord(rawWorkflow)) {
+      throw new Error(`GSD workstream config workflow must be an object: ${path}`)
+    }
+    const rawFeatures = parsed.features
+    if (rawFeatures != null && !isPlainRecord(rawFeatures)) {
+      throw new Error(`GSD workstream config features must be an object: ${path}`)
+    }
+    const rawClaudeOrchestration = parsed.claude_orchestration
+    if (rawClaudeOrchestration != null && !isPlainRecord(rawClaudeOrchestration)) {
+      throw new Error(`GSD workstream config claude_orchestration must be an object: ${path}`)
+    }
+    const workflow = {
+      ...(rawWorkflow ?? {}),
+      pattern_mapper: false,
+      post_planning_gaps: false,
+      plan_bounce: false,
+      plan_bounce_script: null,
+      plan_review_convergence: false,
+      cross_ai_execution: false,
+      code_review_command: null,
+      subagent_timeout: 1_800_000,
+      inline_plan_threshold: 2,
+    }
+    const features = {
+      ...(rawFeatures ?? {}),
+      thinking_partner: false,
+    }
+    const claudeOrchestration = {
+      ...(rawClaudeOrchestration ?? {}),
+      enabled: false,
+      execution_backend: 'inline',
+    }
+    const expected = `${JSON.stringify({
+      ...parsed,
+      runtime,
+      model_profile: 'inherit',
+      model_overrides: null,
+      models: null,
+      dynamic_routing: null,
+      model_profile_overrides: null,
+      model_policy: null,
+      workflow,
+      features,
+      claude_orchestration: claudeOrchestration,
+    }, null, 2)}\n`
+    if (current === expected) return { path, changed: false }
+    writeFileAtomic(path, expected)
+    return { path, changed: true }
+  })
 }
 
 function emptyActive(): ActiveBlock {

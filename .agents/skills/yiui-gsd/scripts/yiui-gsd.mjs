@@ -24,6 +24,7 @@ import {
   statSync,
   symlinkSync,
   unlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs'
 import { spawnSync } from 'node:child_process'
@@ -208,6 +209,37 @@ function resolveProjectRoot(options = {}) {
 
 function resolveCodexHome(options = {}) {
   return resolve(options['codex-home'] || options.codexHome || process.env.CODEX_HOME || join(homedir(), '.codex'))
+}
+
+function resolveClaudeHome(options = {}) {
+  return resolve(
+    options['claude-home'] ||
+      options.claudeHome ||
+      process.env.CLAUDE_CONFIG_DIR ||
+      join(homedir(), '.claude'),
+  )
+}
+
+function resolveGsdRuntime(options = {}) {
+  const value = String(
+    options.runtime ||
+      options['runtime'] ||
+      process.env.GSD_RUNTIME ||
+      'codex',
+  ).trim().toLowerCase()
+  if (value !== 'codex' && value !== 'claude') {
+    fail(`unsupported GSD runtime: ${value || '(empty)'} (expected codex or claude)`)
+  }
+  return value
+}
+
+function resolveRuntimeHome(runtime, options = {}) {
+  return runtime === 'claude' ? resolveClaudeHome(options) : resolveCodexHome(options)
+}
+
+function resolveRuntimeCore(runtime, options = {}) {
+  const explicit = options['gsd-core-path'] || options.gsdCorePath
+  return resolve(explicit || join(resolveRuntimeHome(runtime, options), 'gsd-core'))
 }
 
 function resolveDefaultsPath(options = {}) {
@@ -472,7 +504,12 @@ function ensurePlanningRouter(root, slug) {
 }
 
 function resolveGsdTools(options = {}) {
-  return resolve(options['gsd-tools-path'] || options.gsdToolsPath || join(resolveCodexHome(options), 'gsd-core', 'bin', 'gsd-tools.cjs'))
+  const runtime = resolveGsdRuntime(options)
+  return resolve(
+    options['gsd-tools-path'] ||
+      options.gsdToolsPath ||
+      join(resolveRuntimeCore(runtime, options), 'bin', 'gsd-tools.cjs'),
+  )
 }
 
 function runGsdTools(options, args, { allowFailure = false } = {}) {
@@ -892,14 +929,48 @@ function formatBackupTimestamp() {
   return `${value.getFullYear()}${pad(value.getMonth() + 1)}${pad(value.getDate())}-${pad(value.getHours())}${pad(value.getMinutes())}${pad(value.getSeconds())}${pad(value.getMilliseconds(), 3)}`
 }
 
-export function applyAgentPolicy(options = {}) {
+function setMarkdownFrontmatterString(content, key, value, eol) {
+  const marker = /^---\r?\n([\s\S]*?)\r?\n---/
+  const match = content.match(marker)
+  if (!match) fail(`Agent Markdown missing YAML frontmatter: ${basename(content)}`)
+  const keyPattern = new RegExp(`^${escapeRegExp(key)}\\s*:.*$`, 'm')
+  const current = match[1]
+  const next = keyPattern.test(current)
+    ? current.replace(keyPattern, `${key}: ${value}`)
+    : `${current}${current ? eol : ''}${key}: ${value}`
+  const replacement = `---${eol}${next}${eol}---`
+  return `${replacement}${content.slice(match[0].length)}`
+}
+
+function markdownFrontmatter(content) {
+  return content.match(/^---\r?\n([\s\S]*?)\r?\n---/)?.[1] ?? null
+}
+
+function codexAgentBakeIsStale(defaultsPath, agentFiles) {
+  if (!existsSync(defaultsPath)) return false
+  const defaultsMtime = statSync(defaultsPath).mtimeMs
+  return agentFiles.some(path => statSync(path).mtimeMs < defaultsMtime)
+}
+
+function syncCodexAgentBakeTimestamps(defaultsPath, agentFiles) {
+  if (!existsSync(defaultsPath)) return 0
+  // GSD 1.8's stale-bake guard compares the newest model config with the
+  // oldest static Codex agent TOML. The policy helper has already verified
+  // every TOML's baked model, so mark the whole verified set after defaults
+  // are written. This changes metadata only; generated content stays intact.
+  const bakedAt = new Date(Math.max(Date.now(), statSync(defaultsPath).mtimeMs))
+  for (const path of agentFiles) utimesSync(path, bakedAt, bakedAt)
+  return agentFiles.length
+}
+
+function applyCodexAgentPolicy(options = {}) {
   const codexHome = resolveCodexHome(options)
   const defaultsPath = resolveDefaultsPath(options)
   const verifyOnly = Boolean(options['verify-only'] || options.verifyOnly)
   const defaultsDirectory = dirname(defaultsPath)
   const agentsDirectory = join(codexHome, 'agents')
-  const catalogPath = join(codexHome, 'gsd-core', 'bin', 'shared', 'model-catalog.json')
-  if (!existsSync(catalogPath)) fail(`GSD model catalog not found: ${catalogPath}`)
+  const catalogPath = join(resolveRuntimeCore('codex', options), 'bin', 'shared', 'model-catalog.json')
+  if (!existsSync(catalogPath)) fail(`GSD Codex model catalog not found: ${catalogPath}`)
   if (!existsSync(agentsDirectory)) fail(`Codex GSD agents directory not found: ${agentsDirectory}`)
 
   let defaults = {}
@@ -916,6 +987,20 @@ export function applyAgentPolicy(options = {}) {
   defaults.runtime = 'codex'
   defaults.model_profile = 'adaptive'
   defaults.subagent_timeout = 1800000
+  const workflow = isObject(defaults.workflow) ? defaults.workflow : {}
+  workflow.subagent_timeout = 1800000
+  workflow.pattern_mapper = false
+  workflow.post_planning_gaps = false
+  workflow.plan_bounce = false
+  workflow.plan_review_convergence = false
+  workflow.cross_ai_execution = false
+  workflow.code_review_command = null
+  workflow.inline_plan_threshold = 2
+  defaults.workflow = workflow
+  const claudeOrchestration = isObject(defaults.claude_orchestration) ? defaults.claude_orchestration : {}
+  claudeOrchestration.enabled = false
+  claudeOrchestration.execution_backend = 'inline'
+  defaults.claude_orchestration = claudeOrchestration
   const profileOverrides = isObject(defaults.model_profile_overrides) ? defaults.model_profile_overrides : {}
   profileOverrides.codex = { opus: 'gpt-5.6-sol', sonnet: 'gpt-5.6-sol', haiku: 'gpt-5.6-sol' }
   defaults.model_profile_overrides = profileOverrides
@@ -988,18 +1073,104 @@ export function applyAgentPolicy(options = {}) {
     writeText(defaultsPath, expectedDefaults)
   }
 
+  let bakeTimestampsSynced = 0
+  if (codexAgentBakeIsStale(defaultsPath, agentFiles)) {
+    if (verifyOnly) {
+      violations.push('agent bake timestamp')
+    } else {
+      bakeTimestampsSynced = syncCodexAgentBakeTimestamps(defaultsPath, agentFiles)
+    }
+  }
+
   const result = {
     mode: verifyOnly ? 'verify' : 'apply',
+    runtime: 'codex',
     defaults_path: defaultsPath,
     defaults_changed: defaultsChanged,
     agents_checked: agentFiles.length,
     agents_changed: agentChanges.length,
+    bake_timestamps_synced: bakeTimestampsSynced,
     flex_removed: flexRemoved,
     backup_path: !verifyOnly && pathExists(backupRoot) ? backupRoot : null,
     violations,
   }
   if (options.emit !== false) console.log(JSON.stringify(result, null, 2))
   return result
+}
+
+function applyClaudeAgentPolicy(options = {}) {
+  const claudeHome = resolveClaudeHome(options)
+  const verifyOnly = Boolean(options['verify-only'] || options.verifyOnly)
+  const agentsDirectory = join(claudeHome, 'agents')
+  const catalogPath = join(resolveRuntimeCore('claude', options), 'bin', 'shared', 'model-catalog.json')
+  if (!existsSync(catalogPath)) fail(`GSD Claude model catalog not found: ${catalogPath}`)
+  if (!existsSync(agentsDirectory)) fail(`Claude GSD agents directory not found: ${agentsDirectory}`)
+  try {
+    JSON.parse(readText(catalogPath))
+  } catch (error) {
+    fail(`invalid GSD model catalog JSON: ${error instanceof Error ? error.message : String(error)}`)
+  }
+
+  const agentFiles = readdirSync(agentsDirectory)
+    .filter((name) => /^gsd-.*\.md$/.test(name))
+    .sort()
+    .map((name) => join(agentsDirectory, name))
+  if (!agentFiles.length) fail(`No GSD Claude agent Markdown files found in: ${agentsDirectory}`)
+
+  const timestamp = formatBackupTimestamp()
+  const backupRoot = join(claudeHome, 'gsd-user-files-backup', `agent-policy-${timestamp}`)
+  const agentChanges = []
+  const violations = []
+
+  for (const path of agentFiles) {
+    const fileName = basename(path)
+    const agentName = fileName.slice(0, -'.md'.length)
+    const content = readText(path)
+    const eol = content.includes('\r\n') ? '\r\n' : '\n'
+    let updated = content
+    try {
+      updated = setMarkdownFrontmatterString(content, 'model', 'inherit', eol)
+    } catch {
+      violations.push(`${agentName} frontmatter`)
+    }
+
+    if (updated !== content) {
+      agentChanges.push({ agent: agentName, model: 'inherit' })
+      if (!verifyOnly) {
+        const agentBackupDirectory = join(backupRoot, 'agents')
+        mkdirSync(agentBackupDirectory, { recursive: true })
+        copyFileSync(path, join(agentBackupDirectory, fileName))
+        writeText(path, updated)
+      }
+    }
+
+    const verificationContent = verifyOnly ? content : updated
+    const frontmatter = markdownFrontmatter(verificationContent)
+    if (!frontmatter || !/^model\s*:\s*inherit\s*$/m.test(frontmatter)) {
+      if (!violations.includes(`${agentName} frontmatter`)) violations.push(`${agentName} model`)
+    }
+  }
+
+  const result = {
+    mode: verifyOnly ? 'verify' : 'apply',
+    runtime: 'claude',
+    defaults_path: null,
+    defaults_changed: false,
+    agents_checked: agentFiles.length,
+    agents_changed: agentChanges.length,
+    flex_removed: 0,
+    backup_path: !verifyOnly && pathExists(backupRoot) ? backupRoot : null,
+    violations,
+  }
+  if (options.emit !== false) console.log(JSON.stringify(result, null, 2))
+  return result
+}
+
+export function applyAgentPolicy(options = {}) {
+  const runtime = resolveGsdRuntime(options)
+  return runtime === 'claude'
+    ? applyClaudeAgentPolicy(options)
+    : applyCodexAgentPolicy(options)
 }
 
 function parseFinalizationState(statePath) {
@@ -1079,6 +1250,40 @@ function verifyLine(ok, message, state) {
   if (!ok) state.fail = true
 }
 
+function verifyRuntimeInstall(runtime, options, state) {
+  const runtimeHome = resolveRuntimeHome(runtime, options)
+  const coreRoot = resolveRuntimeCore(runtime, options)
+  const versionPath = join(coreRoot, 'VERSION')
+  verifyLine(
+    existsSync(versionPath),
+    existsSync(versionPath)
+      ? `${runtime} GSD core VERSION=${readText(versionPath).trim()} (${coreRoot})`
+      : `missing ${versionPath} (run install.sh)`,
+    state,
+  )
+
+  const skillsRoot = runtime === 'claude'
+    ? join(runtimeHome, 'skills')
+    : join(homedir(), '.agents', 'skills')
+  const globalSkills = listMatchingEntries(skillsRoot, /^gsd-/)
+  verifyLine(globalSkills.length >= 5, `${runtime} global gsd-* skills count=${globalSkills.length}`, state)
+
+  const agentPattern = runtime === 'claude' ? /^gsd-.*\.md$/ : /^gsd-.*\.toml$/
+  const agentEntries = listMatchingEntries(join(runtimeHome, 'agents'), agentPattern)
+  verifyLine(agentEntries.length >= 5, `${runtime} gsd-* agents count=${agentEntries.length}`, state)
+
+  try {
+    const policy = applyAgentPolicy({ ...options, runtime, verifyOnly: true, emit: false })
+    const policyOk = !policy.defaults_changed && policy.agents_changed === 0 && policy.violations.length === 0
+    const detail = policyOk
+      ? `${runtime} agent policy clean (${policy.agents_checked} files)`
+      : `${runtime} agent policy drift: defaults_changed=${policy.defaults_changed}, agents_changed=${policy.agents_changed}, violations=${policy.violations.join(', ') || 'none'}`
+    verifyLine(policyOk, detail, state)
+  } catch (error) {
+    verifyLine(false, `${runtime} agent policy check failed: ${error instanceof Error ? error.message : String(error)}`, state)
+  }
+}
+
 export function verifyInstall(options = {}) {
   const root = resolveProjectRoot(options)
   const state = { fail: false }
@@ -1122,21 +1327,10 @@ export function verifyInstall(options = {}) {
   const vendored = listMatchingEntries(projectSkillDir, /^gsd-/)
   verifyLine(!vendored.length, 'no official gsd-* under project .agents/skills', state)
 
-  const codexHome = resolveCodexHome(options)
-  const versionPath = join(codexHome, 'gsd-core', 'VERSION')
-  verifyLine(existsSync(versionPath), existsSync(versionPath) ? `GSD core VERSION=${readText(versionPath).trim()} (${join(codexHome, 'gsd-core')})` : `missing ${versionPath} (run install.sh)`, state)
-  const globalSkills = listMatchingEntries(join(homedir(), '.agents', 'skills'), /^gsd-/)
-  verifyLine(globalSkills.length >= 5, `global gsd-* skills count=${globalSkills.length}`, state)
-  const agentEntries = listMatchingEntries(join(codexHome, 'agents'), /^gsd-.*\.(toml|md)$/)
-  verifyLine(agentEntries.length >= 5, `codex gsd-* agents count=${agentEntries.length}`, state)
-
-  try {
-    const policy = applyAgentPolicy({ ...options, codexHome, verifyOnly: true, emit: false })
-    const policyOk = !policy.defaults_changed && policy.agents_changed === 0 && policy.violations.length === 0
-    verifyLine(policyOk, policyOk ? `agent policy clean (${policy.agents_checked} TOML files)` : `agent policy drift: defaults_changed=${policy.defaults_changed}, agents_changed=${policy.agents_changed}, violations=${policy.violations.join(', ') || 'none'}`, state)
-  } catch (error) {
-    verifyLine(false, `agent policy check failed: ${error instanceof Error ? error.message : String(error)}`, state)
-  }
+  const runtimes = options.runtime || options['runtime']
+    ? [resolveGsdRuntime(options)]
+    : ['codex', 'claude']
+  for (const runtime of runtimes) verifyRuntimeInstall(runtime, options, state)
 
   const gsdRoot = join(root, '.gsd')
   if (pathExists(join(gsdRoot, '.git'))) console.log('  [ok] .gsd local git present')

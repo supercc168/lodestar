@@ -43,23 +43,23 @@
 | 扫描代码库 / 了解项目结构 | 确认目标 workstream 路由存在 | `$gsd-map-codebase --ws <slug>` |
 | 把已有代码库接入 GSD / onboard | 确认目标 planning workspace 后执行已有项目接入 | `$gsd-onboard` |
 | 下一步做什么 / 自动判断下一步 | 先解析当前会话 task_slug，再核对 TRACKER 与对应路由 | `$gsd-next --ws <slug>` |
-| 更新 GSD / 升级 1.7 最新版 / 更新 RC | 读取 VERSION 与 npm next；未安装时用 `npx --yes @opengsd/gsd-core@next --codex --global`，已安装时走更新 skill；之后核对全局 skills、engine、agents、hooks，并同步本映射 | `$gsd-update --next` |
+| 更新 GSD / 升级最新版 / 更新 RC | 读取 Codex/Claude 两套 VERSION 与 npm dist-tag；未安装时用 `npx --yes @opengsd/gsd-core@next --codex --claude --global`，已安装时走更新 skill；之后核对两套 core、skills、agents、hooks，并同步本映射 | `$gsd-update --next` |
 | 更新 GSD 稳定版 | 读取 VERSION 与 npm latest；更新后执行同样验证 | `$gsd-update` |
 | gsd 帮助 / gsd 有哪些命令 | 用中文概述主循环，不 dump 全部命令 | 可选 `$gsd-help --brief` |
 
 ## 重型规划入口
 
-下列入口不得因“更稳妥”“多想一步”或模型能力强而自动叠加；只有用户明确要求，或当前 `TASK.md` / 阶段证据写明需要时才允许内部触发：
+下列同 provider 入口不得因“更稳妥”“多想一步”或模型能力强而自动叠加；只有用户明确要求，或当前 `TASK.md` / 阶段证据写明需要时才允许内部触发：
 
 - 需求规格深挖：`$gsd-spec-phase`
 - 强力讨论：`$gsd-discuss-phase --power`
-- 跨 AI 计划收敛：`$gsd-plan-review-convergence`
-- 云端重型规划：`$gsd-ultraplan-phase`
 - 全阶段无人值守链：`$gsd-autonomous`
-- 分块/外部反弹规划：`$gsd-plan-phase --chunked`、`$gsd-plan-phase --bounce`
+- 分块规划：`$gsd-plan-phase --chunked`
 - Quick 全质量链：`$gsd-quick --full`
 
 普通“继续”“下一步”“做计划”不构成上述入口的授权。完整判定规则见同目录 `extra-planning-efficiency.md`。
+
+跨 AI 计划收敛、Ultraplan、Cross-AI Review 和 Plan Bounce 会离开飞书当前选择的 provider/model，在 Lodestar 场景中一律不路由；继续使用当前模型的标准 planner → checker → 定向修订链。
 
 ## 意图不明时
 

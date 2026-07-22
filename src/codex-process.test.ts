@@ -6,6 +6,7 @@ import { Writable } from 'node:stream'
 
 import {
   buildCodexAppServerArgs,
+  buildCodexSpawnEnv,
   buildSpawnPath,
   codexLoginStatusAuthenticated,
   diffUsageTotals,
@@ -975,6 +976,15 @@ describe('buildCodexAppServerArgs', () => {
 })
 
 describe('buildSpawnPath', () => {
+  test('Codex child environment locks GSD runtime after provider overrides', () => {
+    const env = buildCodexSpawnEnv({
+      GSD_RUNTIME: 'claude',
+      LODESTAR_TEST_PROVIDER_KEY: 'set',
+    })
+    expect(env.GSD_RUNTIME).toBe('codex')
+    expect(env.LODESTAR_TEST_PROVIDER_KEY).toBe('set')
+  })
+
   test('user-level bins stay ahead of inherited PATH (deterministic codex/tool resolution)', () => {
     // codex 常是 `#!/usr/bin/env node` 的 npm shim,node 可能只存在于继承 PATH 的某个目录
     // (如 Apple Silicon 的 /opt/homebrew/bin)。替换式 PATH 会丢掉它 → shim 退出 127。

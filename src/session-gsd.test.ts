@@ -9,6 +9,7 @@ import {
   bumpGsdPanelGen,
   clearGsdAwaitingName,
   clearGsdExecution,
+  gsdPromptModelLabel,
   gsdContinueMayMutateStore,
   isGsdBareword,
   markGsdExecution,
@@ -75,6 +76,17 @@ describe('isGsdBareword / parseGsdTextCommand', () => {
     })
     expect(parseGsdTextCommand('gsd help')).toEqual({ kind: 'help' })
     expect(parseGsdTextCommand('gsd unknown')).toBeNull()
+  })
+})
+
+describe('gsdPromptModelLabel', () => {
+  test('uses the real default model when a new session has no persisted choice', () => {
+    expect(gsdPromptModelLabel('codex', null)).toBe('gpt-5.6-sol')
+    expect(gsdPromptModelLabel('claude', null)).toBe('claude-fable-5')
+  })
+
+  test('resolves a selected Claude profile to the SDK model id', () => {
+    expect(gsdPromptModelLabel('claude', 'claude:opus')).toBe('claude-opus-4-8')
   })
 })
 
@@ -193,6 +205,8 @@ describe('session GSD execution detection', () => {
       taskSlug: 'wire-panel',
       taskName: 'Wire',
       provider: 'claude',
+      model: 'claude:opus',
+      effort: 'max',
     })
     noteGsdUserMessage(s, inject, { startsOwnTurn: true })
     expect(s.gsdExecution?.taskSlug).toBe('wire-panel')
@@ -306,6 +320,45 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
     expect(readGsdSnapshot(root, created.taskSlug).status).toBe('已暂停')
   })
 
+  test('invalid workstream config fails before resuming 已暂停', async () => {
+    const created = createAndActivateTask(root, 'Invalid Config Resume Guard')
+    expect(pauseGsdTask(root, created.taskSlug).status).toBe('已暂停')
+    writeFileSync(
+      join(root, '.gsd', created.taskSlug, '.planning', 'config.json'),
+      '{bad json\n',
+    )
+
+    const injectCalls: string[] = []
+    const s = {
+      workDir: root,
+      sessionName: 't',
+      gsdPanelGen: 'gen-1',
+      gsdAwaitingNameUntil: 0,
+      gsdPanelMessageId: '',
+      gsdExecution: null,
+      gsdSelectedTaskSlug: created.taskSlug,
+      currentTurn: null,
+      openingTurn: null,
+      pendingUserMessageCount: 0,
+      pendingMidTurnMsgs: [],
+      isRunning: () => true,
+      currentProvider: () => 'codex' as const,
+      currentModelLabel: () => 'gpt-5.6-sol',
+      currentEffortLabel: () => 'max' as const,
+      clearStaleIdleQueueState() {},
+      async onUserMessage(text: string) {
+        injectCalls.push(text)
+      },
+    } as unknown as Session
+
+    const result = await onGsdContinue(s, '', 'gen-1')
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('invalid JSON')
+    expect(readGsdSnapshot(root, created.taskSlug).status).toBe('已暂停')
+    expect(injectCalls).toEqual([])
+    expect(s.gsdExecution).toBeNull()
+  })
+
   test('idle inject bumps panel gen so second click with old gen is stale', async () => {
     const created = createAndActivateTask(root, 'Double Click Guard')
     const injectCalls: string[] = []
@@ -323,6 +376,8 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
       pendingMidTurnMsgs: [],
       isRunning: () => true,
       currentProvider: () => 'claude' as const,
+      currentModelLabel: () => 'claude:opus',
+      currentEffortLabel: () => 'xhigh' as const,
       clearStaleIdleQueueState() {},
       async onUserMessage(text: string) {
         injectCalls.push(text)
@@ -333,6 +388,26 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
     const first = await onGsdContinue(s, created.taskSlug, 'gen-1')
     expect(first.ok).toBe(true)
     expect(injectCalls.length).toBe(1)
+    expect(injectCalls[0]).toContain('provider=claude')
+    expect(injectCalls[0]).toContain('model=claude-opus-4-8')
+    expect(injectCalls[0]).toContain('effort=xhigh')
+    const workstreamConfig = JSON.parse(
+      await Bun.file(join(root, '.gsd', created.taskSlug, '.planning', 'config.json')).text(),
+    )
+    expect(workstreamConfig.workflow).toMatchObject({
+      pattern_mapper: false,
+      post_planning_gaps: false,
+      plan_bounce: false,
+      plan_review_convergence: false,
+      cross_ai_execution: false,
+      code_review_command: null,
+      subagent_timeout: 1_800_000,
+      inline_plan_threshold: 2,
+    })
+    expect(workstreamConfig.claude_orchestration).toEqual({
+      enabled: false,
+      execution_backend: 'inline',
+    })
     // Old gen must no longer validate (bumped before inject and again in resultWithCard).
     expect(validatePanelGen(s, 'gen-1')).toEqual({
       ok: false,
@@ -388,6 +463,8 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
       pendingMidTurnMsgs: [],
       isRunning: () => true,
       currentProvider: () => 'claude' as const,
+      currentModelLabel: () => 'claude:opus',
+      currentEffortLabel: () => 'max' as const,
       clearStaleIdleQueueState() {},
       async onUserMessage(text: string) {
         injectCalls.push(text)
@@ -417,6 +494,8 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
       pendingMidTurnMsgs: [],
       isRunning: () => true,
       currentProvider: () => 'claude' as const,
+      currentModelLabel: () => 'claude:opus',
+      currentEffortLabel: () => 'max' as const,
       clearStaleIdleQueueState() {},
       async onUserMessage() {
         throw new Error('open turn failed')

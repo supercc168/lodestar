@@ -18,7 +18,7 @@
 2. 若已有 `RESEARCH.md`，先判断它是否覆盖当前 Phase 的完成标准、依赖和代码事实；覆盖且没有失效证据时直接复用。
 3. 没有可复用研究时，按“轻量计划判定”决定是否在内部调用标准计划的 `--skip-research`。
 4. 不满足全部轻量条件时走标准计划，让原生 GSD 按配置/交互决定研究；高风险条件命中时必须研究。
-5. 除非命中“重型入口授权”，禁止额外叠加 Spec、Power Discuss、Convergence、Ultraplan、Chunked、Bounce 或 Autonomous。
+5. 禁止 Convergence、Ultraplan、Cross-AI Review 和 Bounce；它们会离开当前飞书 provider/model。除非命中“重型入口授权”，也不得额外叠加 Spec、Power Discuss、Chunked 或 Autonomous。
 
 ## 轻量计划判定
 
@@ -51,19 +51,21 @@
 |------|--------------|
 | Spec Phase | 用户明确要求先锁定规格，或需求无法形成可验证完成标准 |
 | Power Discuss | 用户明确要求深挖全部灰区，普通讨论不足以消除关键歧义 |
-| Plan Review Convergence | 用户明确要求跨 AI 复审/收敛，或 TASK 明确把它列为交付门禁 |
-| Ultraplan | 用户明确要求使用该 Beta/云端规划能力 |
 | Autonomous | 用户明确授权连续推进多个阶段 |
 | Chunked Plan | 单次 planner 已有可复现的规模/截断失败，或用户明确要求分块 |
-| Plan Bounce | 已配置外部 refinement 脚本且用户或 TASK 明确要求 |
 | Quick Full | 用户明确要求官方 Quick 全链，且已确认不会违反项目 Git 与 `.gsd` 边界 |
 
 “更全面”“保险起见”“GPT-5.6 能多想”不是授权依据。一次明确授权只适用于用户指定的当前范围，不得自动延续到后续 Phase。
+
+`gsd-plan-review-convergence`、`gsd-ultraplan-phase`、`gsd-review` 与 plan `--bounce` 不属于可授权重型入口；Lodestar 的飞书模型选择要求全链只使用当前 provider/model，因此即使 TASK 提及或用户要求“多模型复审”，也应说明冲突并继续使用同模型 planner/checker/代码审查链。
 
 ## 主编排去重
 
 - 主编排 agent 在调用 planner 前只整理事实、边界、完成标准和必要文件，不先自行写一份详细实现方案再让 planner 重写。
 - planner 返回后以 `gsd-plan-checker` 结论为准；主编排只处理阻断、持久化状态和用户检查点，不额外启动第二套泛化审查。
+- 飞书默认关闭 `pattern_mapper`、`post_planning_gaps` 与 `thinking_partner`：planner 自行读取当前代码事实，checker 负责阻断级覆盖检查，不再在前后各串行增加一轮相似扫描。
+- GSD 1.8 的 `workflow.inline_plan_threshold` 固定为 `2`：只有单个 PLAN 内不超过两个任务时原地执行，直接省去 executor 子 agent 的启动、等待和报告回传；超过阈值仍按原生隔离执行，不能为了速度手工拆小任务规避质量边界。
+- GSD 1.8 新增的 Claude orchestration / Workflow 后端在 Lodestar workstream 中固定关闭并锁为 `inline`。它会引入额外嵌套编排与恢复语义，不适合“飞书选定一个 provider/model 后全链只走该模型”的稳定路径。
 - checker 要求修订时只传递当前发现，遵循原生最多三轮的定向修订；禁止无新发现地重新研究或重跑完整规划链。
 - 已有新鲜产物优先复用。只有代码、依赖、需求或完成标准发生实质变化，才能宣告产物失效，并写明失效依据。
 

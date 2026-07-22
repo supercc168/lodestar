@@ -139,7 +139,7 @@ function canonicalRealPath(path: string): string {
 }
 
 /**
- * Ensure GSD 1.7 workstream routing for one task.
+ * Ensure GSD workstream routing for one task.
  *
  * Legacy layout migration is deliberately narrow: a root `.planning` link is
  * removed, but a real root directory is preserved because it may contain

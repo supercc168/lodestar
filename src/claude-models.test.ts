@@ -5,6 +5,7 @@ import {
   claudeModelEffort,
   claudeModelEnv,
   claudeModelIsApiRoute,
+  claudeModelTierEnv,
 } from './claude-models'
 
 // 固定的 GLM 测试档位(不依赖宿主 config.toml,保证测试确定性)。
@@ -43,9 +44,9 @@ describe('claudeModelEnv per-档位 env 注入', () => {
     expect(env.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic')
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('glm-tok')
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.2[1m]')
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5-turbo')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.2[1m]')
     expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.2[1m]')
-    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5-turbo')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.2[1m]')
   })
 
   test('官方登录档位不注入任何 env(零污染)', () => {
@@ -53,6 +54,24 @@ describe('claudeModelEnv per-档位 env 注入', () => {
     expect(claudeModelEnv('claude:fable')).toEqual({})
     expect(claudeModelIsApiRoute('claude:opus')).toBe(false)
     expect(claudeModelIsApiRoute('claude:glm')).toBe(true)
+  })
+
+  test('未显式选模型的默认登录档位也把所有 tier alias 锁到 Fable 5', () => {
+    expect(claudeModelTierEnv(null)).toEqual({
+      ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-fable-5',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-fable-5',
+      ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-fable-5',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-fable-5',
+    })
+  })
+
+  test('Claude 与 GLM 的四个 tier alias 都锁到当前真实模型', () => {
+    for (const value of Object.values(claudeModelTierEnv('claude:opus'))) {
+      expect(value).toBe('claude-opus-4-8')
+    }
+    for (const value of Object.values(claudeModelTierEnv('claude:glm'))) {
+      expect(value).toBe('glm-5.2[1m]')
+    }
   })
 
   test('glm 档位 config 未配 env_* → 用内置默认最强组合', () => {
@@ -67,11 +86,11 @@ describe('claudeModelEnv per-档位 env 注入', () => {
     expect(env.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic')
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.2[1m]')
     expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.2[1m]')
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5-turbo')
-    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5-turbo')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.2[1m]')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.2[1m]')
   })
 
-  test('glm 档位 config 显式配某 env_* → 仅覆盖该 key,其余用默认', () => {
+  test('glm 档位忽略分裂的 tier alias,统一锁到当前 model', () => {
     ;(config.claude as any).models.glm = {
       model: 'glm-5.2[1m]',
       base_url: 'https://open.bigmodel.cn/api/anthropic',
@@ -79,9 +98,9 @@ describe('claudeModelEnv per-档位 env 注入', () => {
       env: { ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-4.6' }, // 只覆盖 opus
     }
     const env = claudeModelEnv('claude:glm')
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-4.6') // config 覆盖
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5-turbo') // 默认
-    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.2[1m]') // 默认
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.2[1m]')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.2[1m]')
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.2[1m]')
   })
 })
 
@@ -123,9 +142,12 @@ describe('grok 档位(wuhen-ai 第三方 Anthropic 兼容路由)', () => {
     // 关掉非必要流量与 attribution 头(第三方端点不需要)
     expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1')
     expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
+    for (const value of Object.values(claudeModelTierEnv('claude:grok'))) {
+      expect(value).toBe('grok-4.5')
+    }
   })
 
-  test('grok 档位 config 显式配某 env_* → 仅覆盖该 key,其余用默认', () => {
+  test('grok 档位保留上下文覆盖,但 tier alias 统一锁到当前 model', () => {
     ;(config.claude as any).models.grok = {
       model: 'grok-4.5',
       base_url: 'https://api.wuhen-ai.com',
@@ -139,8 +161,8 @@ describe('grok 档位(wuhen-ai 第三方 Anthropic 兼容路由)', () => {
     const env = claudeModelEnv('claude:grok')
     expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('400000') // 显式覆盖
     expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('450000') // 默认
-    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('grok-fast') // 显式覆盖
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('grok-4.5') // 默认回落 model
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('grok-4.5')
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('grok-4.5')
   })
 
   test('grok 未配 token → 未配置、env 为空(route 仍为 api,被 picker 拦截)', () => {

@@ -69,15 +69,19 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
   },
 }
 
-// GLM 档位内置默认别名映射(智谱端点最强组合)。glm 档位 config 未显式配某 env_*
-// 时用这套默认;config 显式配的逐 key 覆盖。让其他机器装新版后 config.toml 只配
-// token 即开箱用,无需手写 env_*。智谱出新模型时改这里 + 发新版即可。
-const DEFAULT_GLM_ENV: Record<string, string> = {
-  ANTHROPIC_DEFAULT_FABLE_MODEL: 'glm-5.2[1m]',
-  ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2[1m]',
-  ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5-turbo',
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5-turbo',
-}
+// Claude Code/GSD 会按角色选择模型 alias。Lodestar 将四个 alias 都绑定到
+// 飞书当前选择的真实模型，避免同一 GLM/Grok/Claude 任务按 tier 混用模型。
+/** Claude Code can use these aliases when GSD/Task tools create a child
+ * agent.  They are deliberately kept as one selected model; tier-specific
+ * aliases would silently route a GLM/Grok session to a different model. */
+export const CLAUDE_MODEL_ALIAS_KEYS = [
+  'ANTHROPIC_DEFAULT_FABLE_MODEL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL',
+  'ANTHROPIC_DEFAULT_SONNET_MODEL',
+  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+] as const
+
+const DEFAULT_GLM_MODEL = 'glm-5.2[1m]'
 
 // Grok 第三方路由(无痕 / CatCodex)上下文默认。
 // Claude Code 对非 claude-* 模型默认 context window = 200K($$t);wuhen/catcodex
@@ -95,12 +99,7 @@ const DEFAULT_GROK_ENV: Record<string, string> = {
 }
 
 const GROK_ROUTE_NAMES = new Set(['grok', 'grokcc'])
-const GROK_TIER_ENV_KEYS = [
-  'ANTHROPIC_DEFAULT_FABLE_MODEL',
-  'ANTHROPIC_DEFAULT_OPUS_MODEL',
-  'ANTHROPIC_DEFAULT_SONNET_MODEL',
-  'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-] as const
+const GROK_TIER_ENV_KEYS = CLAUDE_MODEL_ALIAS_KEYS
 
 function mergedConfig(name: string): ClaudeModelConfig {
   return {
@@ -132,13 +131,11 @@ function toProfile(name: string): ClaudeModelProfile | null {
   const raw = mergedConfig(name)
   const key = `claude:${name}`
   const env = envFromConfig(raw)
-  // glm 档位内置默认别名映射(智谱最强组合):仅在 glm 实际配了接入(token)时注入,
-  // config 未配的 key 用默认、显式配的逐 key 覆盖;未配置(token 缺)时不注入(保持
-  // env 空,configured=false 由 picker 拦截)。装新版即开箱用,config.toml 只配 token 即可。
+  // GLM 仅在实际配置接入 token 时注入路由；四个模型 alias 无条件收敛到
+  // profile.model。未配置 token 时保持 env 空，由 picker 拦截该档位。
   if (name === 'glm' && (env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY)) {
-    for (const [k, v] of Object.entries(DEFAULT_GLM_ENV)) {
-      if (!(k in env)) env[k] = v
-    }
+    const selectedModel = raw.model?.trim() || DEFAULT_GLM_MODEL
+    for (const key of CLAUDE_MODEL_ALIAS_KEYS) env[key] = selectedModel
   }
   // grok / grokcc:同 glm 的"配好 token 才注入默认"语义。上下文窗口 + auto-compact
   // 阈值对齐上游 500K 硬限;tier 别名回落 profile.model,防止辅助调用打到官方 id。
@@ -147,11 +144,7 @@ function toProfile(name: string): ClaudeModelProfile | null {
       if (!(k in env)) env[k] = v
     }
     const tierModel = raw.model?.trim()
-    if (tierModel) {
-      for (const k of GROK_TIER_ENV_KEYS) {
-        if (!(k in env)) env[k] = tierModel
-      }
-    }
+    if (tierModel) for (const key of GROK_TIER_ENV_KEYS) env[key] = tierModel
   }
   // route:显式 config > 内建默认 > 由是否配了接入信息推断。
   const route: 'login' | 'api' =
@@ -212,6 +205,16 @@ export function resolveClaudeSdkModel(model: string | null | undefined): string 
  * 只有配好 token 的第三方路由(GLM)才返回非空。 */
 export function claudeModelEnv(model: string | null | undefined): Record<string, string> {
   return claudeModelProfile(model)?.env ?? {}
+}
+
+/** Lock every Claude Code tier alias to the model selected by Lodestar.  This
+ * is applied at the child-process boundary, after profile-specific routing
+ * env, so an inherited shell/settings alias cannot create a mixed-model GSD
+ * graph.  An omitted model resolves to Lodestar's explicit login default. */
+export function claudeModelTierEnv(model: string | null | undefined): Record<string, string> {
+  const selected = resolveClaudeSdkModel(model)
+  if (!selected) return {}
+  return Object.fromEntries(CLAUDE_MODEL_ALIAS_KEYS.map(key => [key, selected]))
 }
 
 /** 该档位是否为第三方 API 路由(GLM 一类)。true = 需要 token 且 spawn 时
