@@ -80,6 +80,7 @@
 - `task` 面板按钮由 `session-tasklist.ts` 处理，持久状态集中在 `tasklist.ts`，后台自动化集中在 `tasklist-worker.ts`；不要把轮询、进程状态或 Git 产物逻辑塞进卡片模板。
 - `model` 命令为固定选项(codex 内建=gpt-5.6-sol/max、claude 第一方=Fable 5/Opus 4.8 均 max、glm=effort 随 config),effort 锁死一键生效,不动态拉取 `model/list`。
 - Claude/Codex spawn 凭据与 model 注入经 `token-source.ts` 单入口；新增档位仍写 `[claude.models.*]`/`[codex.models.*]` 与 `claude-models`/`codex-models` profile，不要平行再加一套 `[token_source.*]` 配置。
+- TokenSource **长期只做适配层**：禁止引入 `[token_source.*]` 注册表、`registerTokenSource` 插件 API、双层 model 面板、source 级 `refreshModels`。额度实现仍分 `usage.ts`/`glm-usage.ts`，展示选型走 `resolveUsageSource`。上游只吸收行为补丁，不吸收产品/配置形态。
 - `rs`/`restart` 空闲态：仅 **claude** 列 `~/.claude/projects` 会话列表；**codex** 空闲直接 `restart(true)`（resume list 无 codex 数据源，避免空列表误导）。
 - Codex 子进程协议集中在 `codex-process.ts`；新增 app-server 方法或通知映射时要同时考虑 `Session` 事件处理和卡片展示。
 - Card Kit 写操作必须经过 `cardkit.ts` 的队列和 sequence 逻辑；不要从 session 或脚本直接 `fetch` 修改同一张生产卡。
