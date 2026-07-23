@@ -25,11 +25,9 @@ import {
 } from './agent-process'
 import {
   claudeModelKey,
-  claudeModelEnv,
-  claudeModelIsApiRoute,
-  claudeModelTierEnv,
   resolveClaudeSdkModel,
 } from './claude-models'
+import { resolveClaudeSpawnEnv, resolveTokenSource } from './token-source'
 import type {
   CanUseToolRequest,
   CodexModel,
@@ -778,46 +776,19 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.lastModel = opts.model ? claudeModelKey(opts.model) : null
   }
 
-  /** spawn 用的 env。先建一个"无任何 ANTHROPIC_* 路由痕迹"的干净基线,再
-   * 按档位类型决定是否注入,两条路径对称,精确对应用户诉求:
-   *   - 官方登录档位(Fable 5/Opus,route:'login'):抹掉后不再注入 →
-   *     Claude Code 只用用户的登录态,绝不被残留 API key 悄悄改路由。
-   *   - 第三方 API 路由(GLM,route:'api'):抹掉后只注入该档位 config 声明
-   *     的 ANTHROPIC_* env(base_url + auth_token)→ 不会夹带残留的官方
-   *     ANTHROPIC_API_KEY 打到第三方端点(反之亦然)。
-   * 关键:scrub 放在 `...config.claude.env` 叠加之后 —— 所以即使误把 token
-   * 放进全局 [claude.env] 也会被抹掉;GLM token 必须放 [claude.models.glm]。
-   * GSD_RUNTIME 和四个 Claude tier alias 在最后一步锁定为当前 Lodestar
-   * 选中的 provider/model，避免 GSD/Task 子 agent 脱离当前飞书模型。
+  /** spawn 用的 env。基线 = process.env + PATH + [claude.env],再经 TokenSource
+   * 适配层(token-source.ts)做 scrub →(api 才)注入 → tier alias + GSD_RUNTIME。
+   * 行为与历史手写 scrub/inject 一致,入口统一便于后续挂更多自定义路由。
    * 注意:此 scrub 只作用于 spawn 进程的 env;若 ~/.claude/settings.json 的
    * env 块里配了 ANTHROPIC_BASE_URL/AUTH_TOKEN,Claude Code 仍会加载它 ——
    * 故第三方路由请一律走 [claude.models.*],不要写进 settings.json。 */
   private buildSpawnEnv(): Record<string, string> {
-    const env: Record<string, string> = {
+    const base: Record<string, string> = {
       ...(process.env as Record<string, string>),
       PATH: buildClaudeSpawnPath(),
       ...config.claude.env,
     }
-    // 干净基线:路由凭据和所有默认模型别名都必须抹掉。否则 shell 或
-    // [claude.env] 遗留的 GLM alias 会把 Fable/Opus 官方档位悄悄改路由。
-    for (const key of [
-      'ANTHROPIC_BASE_URL',
-      'ANTHROPIC_AUTH_TOKEN',
-      'ANTHROPIC_API_KEY',
-      'ANTHROPIC_DEFAULT_FABLE_MODEL',
-      'ANTHROPIC_DEFAULT_OPUS_MODEL',
-      'ANTHROPIC_DEFAULT_SONNET_MODEL',
-      'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-    ]) delete env[key]
-    // 第三方路由才注入该档位声明的接入 env;登录档位保持干净基线。
-    if (claudeModelIsApiRoute(this.opts.model)) {
-      Object.assign(env, claudeModelEnv(this.opts.model))
-    }
-    // Claude Code/GSD 的 tier agent 可能选择 Fable/Opus/Sonnet/Haiku
-    // alias。全部绑定当前 SDK model，防止 GLM/Grok 或 Claude 官方档位在
-    // 同一轮里出现第二个模型。GSD_RUNTIME 放最后，不能被 shell/config 覆盖。
-    Object.assign(env, claudeModelTierEnv(this.opts.model), { GSD_RUNTIME: 'claude' })
-    return env
+    return resolveClaudeSpawnEnv(this.opts.model, base)
   }
 
   sendInitialize(): void {
@@ -838,7 +809,8 @@ export class ClaudeAgentProcess extends EventEmitter {
     try {
       // resolveClaudeExecutableConfig 在 [claude].bin 配错路径时同步抛出;
       // 必须在 try 内调用,确保错误走 error/exit 事件而非穿透到调用方。
-      const isApiRoute = claudeModelIsApiRoute(this.opts.model)
+      // api 判定走 TokenSource(与 claudeModelIsApiRoute 同源 profile)。
+      const isApiRoute = resolveTokenSource('claude', this.opts.model).isApiRoute()
       // 第三方 API 路由(GLM)绕开 reclaude 包装器,直连第三方端点;官方登录
       // 档位由 reclaude custom spawn 包住 SDK native binary,兼顾代理与 dialog。
       const executable = resolveClaudeExecutableConfig({ apiRoute: isApiRoute })

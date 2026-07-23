@@ -8066,6 +8066,42 @@ describe('rs (restart) — 双模式列表分支', () => {
     expect(listCalled).toBe(true)
     expect(restartCalled).toBe(false)
   })
+
+  test('codex 空闲态应直接 restart(true),不走 claude-only showResumeList', async () => {
+    // port of upstream d9341b6: codex 无 transcript 列表;list/onResumeSelect 是
+    // claude-only。空闲判定仍用本地「无 turn」语义(非 !isRunning())。
+    const session = new Session('probe', 'chat_id') as any
+    session.proc = { isAlive: () => true, provider: 'codex' }
+    session.currentTurn = null
+    session.pendingUserMessageCount = 0
+    session.pendingMidTurnMsgs = []
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'codexsid12345678'
+    session.runningAgy = false
+
+    let listCalled = false
+    let restartCalled = false
+    let restartResume: boolean | undefined
+    session.showResumeList = async () => { listCalled = true }
+    session.restart = async (resume?: boolean) => {
+      restartCalled = true
+      restartResume = resume
+      return true
+    }
+    session.openStatusCard = async () => null
+    session.closeStatusCard = async () => {}
+    session.setStatusCard = () => {}
+    session.withModel = (s: string) => s
+    session.withWorktreeInstructionNotice = (s: string) => s
+    session.backendLabel = () => 'codex'
+    session.currentProvider = () => 'codex'
+
+    await session.runCommand('rs')
+
+    expect(listCalled).toBe(false)
+    expect(restartCalled).toBe(true)
+    expect(restartResume).toBe(true)
+  })
 })
 
 describe('Session warm-resume 工程师续跑感知(已结算 agent 档案复活)', () => {

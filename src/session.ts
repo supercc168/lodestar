@@ -31,12 +31,12 @@ import {
   type ThreadGoal,
   type TurnPlanUpdated,
 } from './codex-process'
-import { codexModelIsApiRoute, codexModelRequiresOpenaiAuth, codexSpawnOverrides } from './codex-models'
+import { codexModelIsApiRoute, codexModelRequiresOpenaiAuth } from './codex-models'
+import { resolveCodexSpawnOverrides, resolveUsageSource } from './token-source'
 import {
   CLAUDE_EFFORT,
   agentProviderLabel,
   isClaudeReasoningEffort,
-  usageSourceForAgent,
   type AgentProcess,
   type AgentProvider,
   type AgentReasoningEffort,
@@ -1257,7 +1257,8 @@ export class Session {
       provider,
       model,
       effort,
-      usageSource: usageSourceForAgent(provider, model),
+      // 额度数据源走 TokenSource 适配层(内部仍委托 usageSourceForAgent)。
+      usageSource: resolveUsageSource(provider, model),
     }
   }
 
@@ -1335,7 +1336,8 @@ export class Session {
       })
     }
     // Codex 不支持 resumeSessionAt/forkSession —— fork 退化成普通 resume(Codex 路径暂不做分叉/回滚)。
-    const overrides = codexSpawnOverrides(this.modelForSpawn(provider))
+    // spawn 覆盖走 TokenSource 适配层(内部仍委托 codexSpawnOverrides)。
+    const overrides = resolveCodexSpawnOverrides(this.modelForSpawn(provider))
     return new CodexProcess({
       workDir: this.workDir,
       model: overrides.modelId,

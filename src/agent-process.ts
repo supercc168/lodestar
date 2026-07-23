@@ -61,7 +61,9 @@ export function providerFromModel(model: string | null | undefined): AgentProvid
 
 /** Quota source for the actual runtime profile. Claude login models and
  * non-GLM relays do not share GLM Coding Plan quota, so they must not inherit
- * the daemon-wide GLM snapshot merely because they use the Claude backend. */
+ * the daemon-wide GLM snapshot merely because they use the Claude backend.
+ * TokenSource 适配层 resolveUsageSource 与此同规则(token-source.ts 委托本函数,
+ * 避免 agent-process ↔ token-source 循环依赖)。 */
 export function usageSourceForAgent(
   provider: AgentProvider,
   model: string | null | undefined,

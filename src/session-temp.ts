@@ -123,6 +123,15 @@ export async function showBackList(s: Session): Promise<void> {
 }
 
 export async function showResumeList(s: Session): Promise<void> {
+  // 双保险:列表数据源是 Claude transcript;codex 空闲 rs 应在 session-commands
+  // 直接 fall-through restart(true)。此处再拦一次,避免其它入口误调。
+  if (s.selectedProvider !== 'claude') {
+    await feishu.sendText(
+      s.chatId,
+      '❌ 历史会话列表仅支持 Claude 后端(transcript 是 Claude 的)。Codex 请直接 rs 恢复上一会话,或发 model 切到 Claude。',
+    )
+    return
+  }
   const entries = listClaudeSessions(s.workDir, DAY_MS, 10)
   const card = cards.resumeListCard({ projectName: projectName(s), entries })
   const messageId = await feishu.sendCard(s.chatId, card)

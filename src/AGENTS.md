@@ -1,5 +1,5 @@
 <!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-31 | Updated: 2026-07-08 -->
+<!-- Generated: 2026-05-31 | Updated: 2026-07-23 -->
 
 # src
 
@@ -34,6 +34,7 @@
 | `codex-compaction.ts` | 解析多种 app-server / raw response context compaction 事件，并输出统一 `ContextCompactedNotification`。 |
 | `claude-agent-process.ts` | 实现 `AgentProcess` 的 Claude 后端：用 `@anthropic-ai/claude-agent-sdk` 的 `query({ prompt: AsyncIterable })` streaming-input 长驻进程，把 SDK message（`system/init`、assistant text/tool_use、`tool_result`、`result`、`compact_boundary`）映射为统一 Session 事件；`permissionMode: default` + `canUseTool` 回调：`AskUserQuestion` 经 canUseTool 下发、host 拦下渲染卡片并回填 answers，其余工具秒放（复刻旧 bypassPermissions「不弹审批」语义；bypassPermissions 会 shadow canUseTool，AskUserQuestion 就废了）；启动前 `assertClaudeCodeAvailable` 检查 `claude` 可执行文件。 |
 | `claude-models.ts` | Claude model profile：内置 Fable/Opus 登录档与 `glm` API 档，可由 `config.toml` 的 `[claude.models.*]` 覆盖/新增（含 Grok）；`resolveClaudeSdkModel` 返回当前档位的真实 SDK model id，spawn 时把 Fable/Opus/Sonnet/Haiku 四个 alias 全部锁到该 id，禁止 GSD/Task 子 agent 换模型。 |
+| `token-source.ts` | TokenSource **适配层**（非上游全量 registry）：把 `claude-models` / `codex-models` 与内建 login 档收敛为统一 `resolveTokenSource(provider, model)`；提供 `resolveClaudeSpawnEnv`（scrub ANTHROPIC_* → api 才注入 → tier lock + `GSD_RUNTIME`）、`resolveCodexSpawnOverrides`、`resolveUsageSource`。真相源仍是 `[claude.models.*]`/`[codex.models.*]`，**不**引入 `[token_source.*]` TOML，**不**改 `model` 面板 UX。reclaude 等包装器仍走 `[claude] bin`；API 路由用 `isApiRoute()` 绕开。 |
 | `card-action.ts` | Card action 回调响应辅助；生产 WS 路径用 `{ card: { type: "raw", data: newCard } }` 立即替换 JSON 卡片，避免 200672、裸卡片或提前 patch 导致模型/effort 面板闪退。 |
 | `cardkit.ts` | Feishu Card Kit v1 封装；维护 per-card sequence、Promise queue、流式限流、元素计数和写失败回调。 |
 | `cards.ts` | 卡片模板 barrel；统一导出 `src/cards/` 下的 turn、console、worktree、agy、task 和元素 ID 工具。 |
@@ -78,6 +79,8 @@
 - `agy <prompt>` 的 CLI 参数、PATH 和 Git 快照集中在 `agy-task.ts`；session 侧进程生命周期、输出收集、状态刷新和卡片接线集中在 `session-agy.ts`。
 - `task` 面板按钮由 `session-tasklist.ts` 处理，持久状态集中在 `tasklist.ts`，后台自动化集中在 `tasklist-worker.ts`；不要把轮询、进程状态或 Git 产物逻辑塞进卡片模板。
 - `model` 命令为固定选项(codex 内建=gpt-5.6-sol/max、claude 第一方=Fable 5/Opus 4.8 均 max、glm=effort 随 config),effort 锁死一键生效,不动态拉取 `model/list`。
+- Claude/Codex spawn 凭据与 model 注入经 `token-source.ts` 单入口；新增档位仍写 `[claude.models.*]`/`[codex.models.*]` 与 `claude-models`/`codex-models` profile，不要平行再加一套 `[token_source.*]` 配置。
+- `rs`/`restart` 空闲态：仅 **claude** 列 `~/.claude/projects` 会话列表；**codex** 空闲直接 `restart(true)`（resume list 无 codex 数据源，避免空列表误导）。
 - Codex 子进程协议集中在 `codex-process.ts`；新增 app-server 方法或通知映射时要同时考虑 `Session` 事件处理和卡片展示。
 - Card Kit 写操作必须经过 `cardkit.ts` 的队列和 sequence 逻辑；不要从 session 或脚本直接 `fetch` 修改同一张生产卡。
 - 处理附件、文件返回和项目目录时使用 `feishu.ts` 里的 sanitizer、upload/download/provision helper。
@@ -117,7 +120,8 @@
 
 ### Internal
 - `session.ts` 经 `AgentProcess` 接口（`agent-process.ts`）持有当前 `proc`，按 `selectedProvider` 在 `ClaudeAgentProcess`（默认）和 `CodexProcess` 之间 spawn；并依赖 `cardkit.ts`、`cards.ts`、`feishu.ts` 和 `session-*` helper；业务面板/命令 helper 再依赖 `worktree.ts`、`tasklist.ts`、`agy-task.ts` 等领域模块。
-- `claude-agent-process.ts` 依赖 `@anthropic-ai/claude-agent-sdk`、`agent-process.ts`、`claude-models.ts`、`codex-usage.ts`（token usage 解析复用）和 `config.ts`；`glm-usage.ts` 被 `session.ts`（console opts）和 `cards/console.ts` 消费。
+- `claude-agent-process.ts` 依赖 `@anthropic-ai/claude-agent-sdk`、`agent-process.ts`、`token-source.ts`（spawn env / apiRoute 单入口，内部委托 `claude-models.ts`）、`codex-usage.ts`（token usage 解析复用）和 `config.ts`；`glm-usage.ts` 被 `session.ts`（console opts）和 `cards/console.ts` 消费。
+- `token-source.ts` 适配 `claude-models.ts` / `codex-models.ts` 与 `agent-process.usageSourceForAgent`；`session.ts` Codex spawn 走 `resolveCodexSpawnOverrides`，console 额度源走 `resolveUsageSource`。
 - `tasklist-worker.ts` 依赖 `tasklist.ts`、`feishu.ts`、`agy-task.ts`、`codex-process.ts` 和 `tasklist-worker-git.ts`；本地 Git worktree、tag 与审查 diff 约定集中在 `tasklist-worker-git.ts`。
 - 后台任务卡 `cards/background.ts` 由 `claude-agent-process.ts` 的 SDK `task_*` 事件(started/progress/updated/settled)经 `session.ts`/`session-tools.ts` 驱动;`session-temp.ts` 依赖 `cards/temp.ts` + turn-map,`session-multimsg.ts` 依赖 `inbound-markers.ts`。
 - `cardkit.ts` 依赖 `feishu.getTenantToken()` 获取 Card Kit API token。
