@@ -135,6 +135,7 @@ test('provider isolation disables external routes while preserving other workstr
   const configPath = join(root, '.gsd', task.taskSlug, '.planning', 'config.json')
   writeFileSync(configPath, JSON.stringify({
     runtime: 'gemini',
+    resolve_model_ids: true,
     model_profile: 'adaptive',
     model_overrides: { 'gsd-planner': 'google/gemini-pro' },
     models: { planning: 'opus' },
@@ -170,7 +171,8 @@ test('provider isolation disables external routes while preserving other workstr
   })
   expect(JSON.parse(readFileSync(configPath, 'utf8'))).toEqual({
     runtime: 'claude',
-    model_profile: 'inherit',
+    resolve_model_ids: false,
+    model_profile: 'adaptive',
     model_overrides: null,
     models: null,
     dynamic_routing: null,
@@ -200,7 +202,11 @@ test('provider isolation disables external routes while preserving other workstr
   })
   expect(enforceGsdProviderIsolation(root, task.taskSlug, 'claude').changed).toBe(false)
   expect(enforceGsdProviderIsolation(root, task.taskSlug, 'codex').changed).toBe(true)
-  expect(JSON.parse(readFileSync(configPath, 'utf8')).runtime).toBe('codex')
+  expect(JSON.parse(readFileSync(configPath, 'utf8'))).toMatchObject({
+    runtime: 'codex',
+    resolve_model_ids: 'omit',
+    model_profile: 'inherit',
+  })
   expect(git(['status', '--short'])).toBe('')
 })
 

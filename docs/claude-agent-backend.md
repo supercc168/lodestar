@@ -16,7 +16,7 @@
 - `CodexProcess` 继续负责 GPT / Codex app-server。
 - `ClaudeAgentProcess` 负责 Claude Agent SDK streaming input。
 - `model` 命令展示固定档位（现状，见 `src/session-model.ts` 的 `FIXED_MODEL_CHOICES`）：
-  - `claude:fable`（Fable 5）/ `claude:opus`（Opus 4.8）：官方登录档位，直传 `claude-fable-5` / `claude-opus-4-8`，走用户 Anthropic 登录态，绝不注入 API key，effort 锁 max。
+  - `claude:fable`（Fable 5）/ `claude:opus`（Opus 5）：官方登录档位，直传 `claude-fable-5` / `claude-opus-5`，走用户 Anthropic 登录态，绝不注入 API key，effort 锁 max。
   - `claude:glm`：第三方 API 路由，token 配在 `[claude.models.glm]`，spawn 时注入 `ANTHROPIC_*` env，effort 跟随 config（如 xhigh）；未配 token 时 picker 可见但选择被拦截。
   - `claude:grok` / `claude:grokcc`：Grok 第三方 API 路由，按各自 profile 注入端点、token、模型和 effort。
   - `codex`（GPT-5.6 Sol）：Codex app-server 后端，内建档 effort 锁 `max`。
@@ -26,7 +26,7 @@
 - `[[askusr: ...]]` 是 Codex 专属 host marker；Claude 不消费这个 marker，Claude 需要问用户时走 SDK 自己的 `AskUserQuestion` / `request_user_dialog` 路径。
 
 ## Claude Model Profiles
-内置档位位于 `src/claude-models.ts`:官方 `fable`(Fable 5)/ `opus`(Opus 4.8)走用户的 Anthropic 登录态、绝不注入 API key;`glm` 是第三方 API 路由,token 在 `config.toml` 的 `[claude.models.glm]` 配置。也可在 `config.toml` 覆盖档位或加新档位:
+内置档位位于 `src/claude-models.ts`:官方 `fable`(Fable 5)/ `opus`(Opus 5)走用户的 Anthropic 登录态、绝不注入 API key;`glm` 是第三方 API 路由,token 在 `config.toml` 的 `[claude.models.glm]` 配置。也可在 `config.toml` 覆盖档位或加新档位:
 
 ```toml
 # 新群默认档位(可选;不写则默认 fable 登录档位)
@@ -54,11 +54,11 @@ model      = "grok-4.5"
 effort     = "xhigh"
 ```
 
-模型路由的真相源是 `config.toml` 的 `[claude.models.*]`(第三方 per-model token 路由):`ClaudeAgentProcess.buildSpawnEnv` 只在 GLM/Grok 一类 API 档位 spawn 时注入 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`(+ 档位默认 env),官方 Fable 5 / Opus 登录档位保持干净凭据基线。随后两类档位都会设置 `GSD_RUNTIME=claude`,并把 `ANTHROPIC_DEFAULT_{FABLE,OPUS,SONNET,HAIKU}_MODEL` 全部锁到飞书当前选择的同一个真实模型；这覆盖 GSD/Task 子 agent 的 tier 选择,避免同一任务混用模型。`[claude.models.*]` 的字段仅认 `display_name / description / model / base_url / auth_token / api_key / route / effort` 以及扁平 `env_<NAME>`；四种 tier alias 即使在 config 中分开声明也会在 spawn 边界收敛为当前 model。**别把第三方 env 写进 `~/.claude/settings.json`**:SDK 经 `settingSources:['user']` 会加载它、污染登录档位;`[claude.env]` 仅作可选 escape hatch。
+模型路由的真相源是 `config.toml` 的 `[claude.models.*]`(第三方 per-model token 路由):`ClaudeAgentProcess.buildSpawnEnv` 只在 GLM/Grok 一类 API 档位 spawn 时注入 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`(+ 档位默认 env),官方 Fable 5 / Opus 登录档位保持干净凭据基线。随后两类档位都会设置 `GSD_RUNTIME=claude`。第一方登录档把 `ANTHROPIC_DEFAULT_{OPUS,SONNET,HAIKU}_MODEL` 分别映射为 Opus 5 / Fable 5 / Sonnet 5(`FABLE` 同为 Fable 5),供 GSD catalog 的 heavy / standard / light tier 使用；第三方 API 档则把四个 alias 全部锁到当前 profile.model,避免官方 Claude id 泄漏到兼容端点。`[claude.models.*]` 的字段仅认 `display_name / description / model / base_url / auth_token / api_key / route / effort` 以及扁平 `env_<NAME>`；第三方档即使在 config 中分开声明四种 alias,也会在 spawn 边界收敛为当前 model。**别把第三方 env 写进 `~/.claude/settings.json`**:SDK 经 `settingSources:['user']` 会加载它、污染登录档位;`[claude.env]` 仅作可选 escape hatch。
 
 可执行文件解析:`resolveClaudeExecutableConfig({ apiRoute })` 默认自动查找 `claude`(`~/.local/npm-global/bin` → `~/.local/bin` → PATH → SDK 自带)。`config.toml` 设 `[claude].bin`(支持 `~`)可显式覆盖,路径不存在时 `sendInitialize` 直接抛错,不静默回退。若配置的是 Unix `reclaude`,Lodestar 不把它直接传给 SDK(直接传会退回 CLI stream-json,丢失 dialog/control 协议),而是给 SDK 提供的 native command 建一个临时 PATH shim,再由 reclaude 注入 proxy/CA 后查找这个 `claude`;日志为 `executable=config-reclaude-sdk-native:<路径>`。**关键:第三方 API 路由(GLM/Grok,`route:api`)会强制绕开 `[claude].bin`、使用 SDK 自带 native 入口** —— reclaude 的 gateway 会把注入的 `ANTHROPIC_BASE_URL` 劫持回官方 Anthropic,第三方 model id 在官方 deployment 上不存在。官方登录档位走 reclaude + SDK native shim,第三方走 SDK native 直连端点。
 
-SDK `model`:官方档位直传 `claude-fable-5` / `claude-opus-4-8`;第三方档位把 profile 的上游 id 交给 SDK native 入口,配套 `[claude.models.*]` 注入的 `ANTHROPIC_BASE_URL` 打到对应 Anthropic 兼容端点。reclaude 只负责官方登录档位的代理/证书注入,不再替代 SDK transport。早期把 `ANTHROPIC_DEFAULT_*_MODEL` 写入全局 settings/env 的做法已废弃:启动 env 会先清掉 Fable/Opus/Sonnet/Haiku 四个 alias,随后只为当前 API profile 重新注入声明的映射。
+SDK `model`:官方档位直传 `claude-fable-5` / `claude-opus-5`;第三方档位把 profile 的上游 id 交给 SDK native 入口,配套 `[claude.models.*]` 注入的 `ANTHROPIC_BASE_URL` 打到对应 Anthropic 兼容端点。reclaude 只负责官方登录档位的代理/证书注入,不再替代 SDK transport。早期把 `ANTHROPIC_DEFAULT_*_MODEL` 写入全局 settings/env 的做法已废弃:启动 env 会先清掉 Fable/Opus/Sonnet/Haiku 四个 alias,随后按第一方 tier 组合或当前第三方 profile 重新注入。
 
 ## Claude Event Mapping
 `ClaudeAgentProcess` 把 SDK message 映射为现有 Session 已会处理的事件：
@@ -101,7 +101,7 @@ Claude 自带 ask 工具接到 SDK `canUseTool`：
 这些差异来自 Claude Agent SDK 能力边界或本机模型路由，不能伪装成 Codex 完全同构：
 
 - 启动时机：Claude SDK 在没有第一条 user input 前不会发 `system/init`，所以 `hi` 启动 Claude 后不会强等 init；首条消息触发 init 和真实 session id。
-- 模型项:Claude 暴露 Fable 5、Opus 4.8 和已配置的 GLM/Grok API 档位;登录档位与第三方 profile 各自解析明确的 SDK model id 和环境。
+- 模型项:Claude 暴露 Fable 5、Opus 5 和已配置的 GLM/Grok API 档位;登录档位与第三方 profile 各自解析明确的 SDK model id 和环境。
 - resume id：Claude `session_id` 与 Codex thread id 分开保存；切换 provider 不共享上下文。
 - compact：Claude SDK 没有 Lodestar 所用的 Codex `thread/compact/start` 等价接口，`compact` 会明确失败并说明不支持。
 - ask：Codex 的 `[[askusr: ...]]` host marker 不给 Claude 使用；Claude 的 ask 来自 SDK `AskUserQuestion` / user-dialog，仍渲染成同一套飞书问答卡。
@@ -119,7 +119,7 @@ Claude 自带 ask 工具接到 SDK `canUseTool`：
 - Claude/Codex 的模型选择在当前 turn、启动、排队或另一项重建进行时统一拒绝;空闲切换成功后才允许下一轮使用新 profile。
 - 每个 turn 冻结 provider/model/effort 与 usage source;后续 model 点击不会改写旧卡片的 footer、续卡或额度路由。provider 真变化时才清理 turn anchors。
 - Claude 的 quota 只对 `claude:glm` 查询 GLM;Fable/Opus/Grok 明确显示不适用,Codex 第三方档位不复用 ChatGPT 全局缓存。
-- Claude `buildSpawnEnv` 会清理继承环境和 `[claude.env]` 中的 `ANTHROPIC_DEFAULT_FABLE_MODEL`、`OPUS`、`SONNET`、`HAIKU` alias,再按当前 API profile 注入。
+- Claude `buildSpawnEnv` 会清理继承环境和 `[claude.env]` 中的 `ANTHROPIC_DEFAULT_FABLE_MODEL`、`OPUS`、`SONNET`、`HAIKU` alias,再按第一方最新 tier 组合或当前第三方 API profile 注入。
 - `[[askusr: ...]]` 处理链路加 provider 守卫，Claude 输出同名 marker 不会触发 Codex host ask 卡或续跑。
 - Claude `canUseTool` 接入现有 `AskUserQuestion` 卡片和 `updatedInput.answers` 回填协议，并修复同步权限回包 race。
 - spawn prompt 按 provider 分开：Codex 继续收到 `[[askusr: ...]]` 说明，Claude 收到 “使用 AskUserQuestion，不要输出 askusr marker”。

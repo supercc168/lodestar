@@ -685,11 +685,18 @@ describe('yiui-gsd cross-platform helper', () => {
     }
   })
 
-  test('Claude agent policy forces every GSD role to inherit the selected Feishu model', () => {
+  test('Claude agent policy maps every GSD role through the catalog adaptive tiers', () => {
     const claudeHome = join(root, 'claude-home')
     mkdirSync(join(claudeHome, 'gsd-core', 'bin', 'shared'), { recursive: true })
     mkdirSync(join(claudeHome, 'agents'), { recursive: true })
-    writeFileSync(join(claudeHome, 'gsd-core', 'bin', 'shared', 'model-catalog.json'), '{"agents":{}}\n')
+    writeFileSync(join(claudeHome, 'gsd-core', 'bin', 'shared', 'model-catalog.json'), JSON.stringify({
+      adaptiveTierMap: { heavy: 'opus', standard: 'sonnet', light: 'haiku' },
+      agents: {
+        'gsd-planner': { routingTier: 'heavy' },
+        'gsd-executor': { routingTier: 'standard' },
+        'gsd-mempalace-curator': { routingTier: 'light' },
+      },
+    }))
     writeFileSync(join(claudeHome, 'agents', 'gsd-planner.md'), [
       '---',
       'name: gsd-planner',
@@ -708,6 +715,15 @@ describe('yiui-gsd cross-platform helper', () => {
       '# Curator',
       '',
     ].join('\n'))
+    writeFileSync(join(claudeHome, 'agents', 'gsd-executor.md'), [
+      '---',
+      'name: gsd-executor',
+      'model: inherit',
+      '---',
+      '',
+      '# Executor',
+      '',
+    ].join('\n'))
 
     const apply = spawnSync('node', [
       helper,
@@ -719,10 +735,9 @@ describe('yiui-gsd cross-platform helper', () => {
       env: { ...process.env, GSD_RUNTIME: 'claude' },
     })
     expectOk(apply)
-    for (const name of ['gsd-planner', 'gsd-mempalace-curator']) {
-      const content = readFileSync(join(claudeHome, 'agents', `${name}.md`), 'utf8')
-      expect(content.match(/^model:\s*inherit\s*$/gm)).toHaveLength(1)
-    }
+    expect(readFileSync(join(claudeHome, 'agents', 'gsd-planner.md'), 'utf8')).toMatch(/^model:\s*opus\s*$/m)
+    expect(readFileSync(join(claudeHome, 'agents', 'gsd-executor.md'), 'utf8')).toMatch(/^model:\s*sonnet\s*$/m)
+    expect(readFileSync(join(claudeHome, 'agents', 'gsd-mempalace-curator.md'), 'utf8')).toMatch(/^model:\s*haiku\s*$/m)
     expectOk(runHelper([
       'apply-agent-policy',
       '--runtime', 'claude',

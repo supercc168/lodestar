@@ -1105,11 +1105,15 @@ function applyClaudeAgentPolicy(options = {}) {
   const catalogPath = join(resolveRuntimeCore('claude', options), 'bin', 'shared', 'model-catalog.json')
   if (!existsSync(catalogPath)) fail(`GSD Claude model catalog not found: ${catalogPath}`)
   if (!existsSync(agentsDirectory)) fail(`Claude GSD agents directory not found: ${agentsDirectory}`)
+  let catalog
   try {
-    JSON.parse(readText(catalogPath))
+    catalog = JSON.parse(readText(catalogPath))
   } catch (error) {
     fail(`invalid GSD model catalog JSON: ${error instanceof Error ? error.message : String(error)}`)
   }
+  const fallbackTierMap = { heavy: 'opus', standard: 'sonnet', light: 'haiku' }
+  const catalogTierMap = isObject(catalog?.adaptiveTierMap) ? catalog.adaptiveTierMap : {}
+  const adaptiveTierMap = { ...fallbackTierMap, ...catalogTierMap }
 
   const agentFiles = readdirSync(agentsDirectory)
     .filter((name) => /^gsd-.*\.md$/.test(name))
@@ -1125,17 +1129,23 @@ function applyClaudeAgentPolicy(options = {}) {
   for (const path of agentFiles) {
     const fileName = basename(path)
     const agentName = fileName.slice(0, -'.md'.length)
+    const catalogAgent = catalog?.agents?.[agentName]
+    const routingTier = catalogAgent ? String(catalogAgent.routingTier || 'standard') : 'standard'
+    const configuredModel = adaptiveTierMap[routingTier]
+    const expectedModel = typeof configuredModel === 'string' && configuredModel.trim()
+      ? configuredModel.trim()
+      : fallbackTierMap.standard
     const content = readText(path)
     const eol = content.includes('\r\n') ? '\r\n' : '\n'
     let updated = content
     try {
-      updated = setMarkdownFrontmatterString(content, 'model', 'inherit', eol)
+      updated = setMarkdownFrontmatterString(content, 'model', expectedModel, eol)
     } catch {
       violations.push(`${agentName} frontmatter`)
     }
 
     if (updated !== content) {
-      agentChanges.push({ agent: agentName, model: 'inherit' })
+      agentChanges.push({ agent: agentName, tier: routingTier, model: expectedModel })
       if (!verifyOnly) {
         const agentBackupDirectory = join(backupRoot, 'agents')
         mkdirSync(agentBackupDirectory, { recursive: true })
@@ -1146,7 +1156,7 @@ function applyClaudeAgentPolicy(options = {}) {
 
     const verificationContent = verifyOnly ? content : updated
     const frontmatter = markdownFrontmatter(verificationContent)
-    if (!frontmatter || !/^model\s*:\s*inherit\s*$/m.test(frontmatter)) {
+    if (!frontmatter || !new RegExp(`^model\\s*:\\s*${escapeRegExp(expectedModel)}\\s*$`, 'm').test(frontmatter)) {
       if (!violations.includes(`${agentName} frontmatter`)) violations.push(`${agentName} model`)
     }
   }

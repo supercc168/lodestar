@@ -16,7 +16,7 @@ AI 不是帮手,是倍率。它放大的不是体力,是你 —— 你的直觉�
 
 ### 🧠 双后端:Claude Code + Codex
 
-夜航星同时接入 Claude Code 和 Codex 两个 agent 后端,**默认 Claude Code**。群里发 `model` 弹出固定档位、一键切换、按群持久化:**Claude·Fable 5**、**Claude·Opus 4.8**、**Claude·GLM**、**Claude·Grok**、**Codex·GPT-5.6 Sol**。Fable 5 / Opus 走你的 Anthropic 登录态;GLM/Grok 是第三方路由,配好各自 token 后即插即用。默认档位是 Fable 5;配了 GLM 的话向导会把默认设成 GLM。
+夜航星同时接入 Claude Code 和 Codex 两个 agent 后端,**默认 Claude Code**。群里发 `model` 弹出固定档位、一键切换、按群持久化:**Claude·Fable 5**、**Claude·Opus 5**、**Claude·GLM**、**Claude·Grok**、**Codex·GPT-5.6 Sol**。Fable 5 / Opus 走你的 Anthropic 登录态;GLM/Grok 是第三方路由,配好各自 token 后即插即用。默认档位是 Fable 5;配了 GLM 的话向导会把默认设成 GLM。
 
 订阅了 GLM Coding Plan 的话强烈推荐 **Claude·GLM** 档位 —— GLM-5.2 开放 1M token 上下文窗口,长会话不易丢前文、中文友好。在 GLM 档位上,`hi` 控制台会展示套餐档位、5 小时滚动窗口与月度用量;每条回复的 footer 也会带上当前 5h 窗口的已用百分比(`5h·N%`),额度消耗随时可见。
 
@@ -78,7 +78,7 @@ lodestar-setup
 | `restart` / `rs` | 进行中:打断 + 放弃后台进程 + 恢复;空闲:列出项目最近 24h 会话(不足 10 条补更早),选一个在本群接续恢复 |
 | `clear` / `cl` | 用状态卡展示杀进程并开新 thread(等价 `/clear`)|
 | `compact` / `cm` | 主动触发当前 thread 的上下文压缩,完成后状态卡收束 |
-| `model` / `md` | 展示固定档位(Claude·Fable 5 / Opus 4.8 / GLM / Grok · Codex·GPT-5.6 Sol),一键生效,按群持久化 |
+| `model` / `md` | 展示固定档位(Claude·Fable 5 / Opus 5 / GLM / Grok · Codex·GPT-5.6 Sol),一键生效,按群持久化 |
 | `gsd` | 打开 GSD 状态卡(未完成任务/选/进度/继续/暂停/完成/新任务);选择只绑定当前会话,跟随当前 model,规划只走 yiui-gsd |
 | `task` | 打开项目任务清单面板,启用飞书任务清单自动化（预览版） |
 
@@ -93,7 +93,7 @@ pwsh -NoProfile -File install/yiui-gsd/install.ps1
 bash install/yiui-gsd/verify.sh           # 装完校验
 ```
 
-安装器默认用 Node.js >= 18 重放并校验 Codex 子 agent 策略，不依赖 macOS 的 `pwsh`；`pwsh` 入口仅保留给 Windows 或旧脚本调用。
+安装器默认用 Node.js >= 18 重放并校验 Codex / Claude 子 agent 策略，不依赖 macOS 的 `pwsh`；Codex 全部使用 GPT-5.6 Sol，Claude 第一方按任务层级使用 Opus 5 / Fable 5 / Sonnet 5，第三方 Claude API 档始终锁当前模型。`pwsh` 入口仅保留给 Windows 或旧脚本调用。
 
 任务真相源是 `.gsd/TRACKER.md` 与 `.gsd/<slug>/.planning/STATE.md`。允许多个 slug 同时为运行中；根 `.planning/` 只提供稳定的 `workstreams/<slug>` 路由和共享 `PROJECT.md`，不再指向单个任务。
 

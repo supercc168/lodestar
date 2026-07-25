@@ -86,7 +86,7 @@ describe('gsdPromptModelLabel', () => {
   })
 
   test('resolves a selected Claude profile to the SDK model id', () => {
-    expect(gsdPromptModelLabel('claude', 'claude:opus')).toBe('claude-opus-4-8')
+    expect(gsdPromptModelLabel('claude', 'claude:opus')).toBe('claude-opus-5')
   })
 })
 
@@ -389,11 +389,16 @@ describe('onGsdContinue busy path (no resume side-effect)', () => {
     expect(first.ok).toBe(true)
     expect(injectCalls.length).toBe(1)
     expect(injectCalls[0]).toContain('provider=claude')
-    expect(injectCalls[0]).toContain('model=claude-opus-4-8')
+    expect(injectCalls[0]).toContain('model=claude-opus-5')
     expect(injectCalls[0]).toContain('effort=xhigh')
     const workstreamConfig = JSON.parse(
       await Bun.file(join(root, '.gsd', created.taskSlug, '.planning', 'config.json')).text(),
     )
+    expect(workstreamConfig).toMatchObject({
+      runtime: 'claude',
+      resolve_model_ids: false,
+      model_profile: 'adaptive',
+    })
     expect(workstreamConfig.workflow).toMatchObject({
       pattern_mapper: false,
       post_planning_gaps: false,

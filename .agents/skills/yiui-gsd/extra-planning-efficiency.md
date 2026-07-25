@@ -6,7 +6,7 @@
 
 - `TRACKER.md`、`TASK.md`、`STATE.md`、跨平台 workstream 路由、单调游标和 `.gsd` 本地提交规则保持不变。
 - 标准 Phase 计划必须由 `gsd-planner` 产出，并由 `gsd-plan-checker` 独立检查；禁止默认传入 `--skip-verify`。
-- 子 agent 继续执行 `extra-codex-agent-policy.md`：planner / researcher 等标准或重型职责使用 `high`，plan-checker 按官方 routing tier 使用 `medium`。
+- 子 agent 继续执行 `extra-codex-agent-policy.md`：Codex planner / researcher 等标准或重型职责使用 `high`，plan-checker 按官方 routing tier 使用 `medium`；Claude 按 catalog tier 使用 Opus 5 / Fable 5 / Sonnet 5 组合。
 - 实现后的代码审查、测试、验证和 `extra-finalization-gate.md` 终验代际门禁不因本策略减少。
 - 主 Codex 的模型和推理强度由用户当前会话决定，本 skill 不修改用户级 `config.toml`。
 

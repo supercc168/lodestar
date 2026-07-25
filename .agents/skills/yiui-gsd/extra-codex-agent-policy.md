@@ -1,13 +1,14 @@
-# GSD 子 agent 同模型策略
+# GSD 子 agent 分层模型策略
 
 ## 固定质量策略
 
 - 主任务模型与推理强度继承用户当前飞书会话，禁止修改用户全局 Codex/Claude 主模型设置。
 - 飞书选择 GPT/Codex 时，所有 GSD 子 agent 固定使用 `gpt-5.6-sol`；`GSD_RUNTIME=codex`。
-- 飞书选择 Claude、GLM 或 Grok 时，所有 GSD 子 agent 继承当前选中的同一个真实模型；`GSD_RUNTIME=claude`，Fable/Opus/Sonnet/Haiku 四个 alias 必须全部锁到该模型。
-- 禁止跨 provider、跨模型、外部 AI CLI 或跨 AI review；用户选 Claude 只走 Claude，选 GLM 只走 GLM，选 Grok 只走 Grok。
+- 飞书选择 Claude 第一方登录档时，GSD 按官方 catalog tier 使用最新组合：heavy/`opus`=`claude-opus-5`，standard/`sonnet`=`claude-fable-5`，light/`haiku`=`claude-sonnet-5`，`fable` alias=`claude-fable-5`。
+- 飞书选择 GLM、Grok 或其它第三方 API 路由时，Fable/Opus/Sonnet/Haiku 四个 alias 必须全部锁回当前选中的真实模型，禁止官方 Claude id 泄漏到第三方端点。
+- 禁止跨 provider、外部 AI CLI 或跨 AI review；用户选 Claude 只走 Anthropic 登录态，选 GLM 只走 GLM，选 Grok 只走 Grok。
 - 官方 `model-catalog.json` 中 `routingTier=light` 的 agent 使用 `medium`；`standard`、`heavy` 与无法识别的 GSD agent 使用 `high`。
-- Codex GSD 流程内临时创建的 generic `explorer` / `worker` 也必须显式采用同一策略；纯读取、机械扫描可用 `medium`，代码修改、规划、调试、审查、验证或不确定场景使用 `high`。Claude runtime 的 agent frontmatter 统一 `model: inherit`。
+- Codex GSD 流程内临时创建的 generic `explorer` / `worker` 也必须显式采用同一策略；纯读取、机械扫描可用 `medium`，代码修改、规划、调试、审查、验证或不确定场景使用 `high`。Claude runtime 的 agent frontmatter 必须按 catalog `adaptiveTierMap` 写入 `opus` / `sonnet` / `haiku`。
 - 禁止使用 `low`、`xhigh`、`ultra`，禁止把子 agent 降为 Terra 或 Luna。
 
 ## 应用与验证
@@ -28,10 +29,10 @@ node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs apply-agent-policy --runtime c
 - 固定 `light=medium`、`standard/heavy=high`，并同时设置兼容投影与 GSD 1.8 canonical 路径的 `subagent_timeout=1800000`；飞书 continue/new 还会在当前 workstream 写入 `workflow.subagent_timeout=1800000`，避免项目配置遮住全局值。
 - 固定 `workflow.inline_plan_threshold=2`：单个 PLAN 不超过两个任务时由当前 agent 原地执行，省去 executor 子 agent 的启动和报告往返；更复杂计划仍走隔离 agent。
 - 强制关闭自动外部链路：`workflow.plan_bounce=false`、`workflow.plan_review_convergence=false`、`workflow.cross_ai_execution=false`、`workflow.code_review_command=null`；同时关闭非核心顺序开销：`workflow.pattern_mapper=false`、`workflow.post_planning_gaps=false`；GSD 1.8 的 `claude_orchestration.enabled=false` 且 `execution_backend=inline`；保留其它无关键。
-- 飞书 workstream 额外锁定 `runtime` 与 `model_profile=inherit`，清空 `model_overrides`、`models`、`dynamic_routing`、`model_profile_overrides`、`model_policy`，关闭 `features.thinking_partner`，并再次锁闭 `claude_orchestration`。这样可防止旧项目配置绕过当前模型，也不会在 planner 前额外派 pattern mapper、在 checker 后追加非阻断 gap 扫描与架构分析，或启用 1.8 的嵌套 Workflow 编排。
+- 飞书 workstream 额外锁定 `runtime`；Claude 使用 `model_profile=adaptive` + `resolve_model_ids=false`，确保 resolver 返回 alias 而不是 catalog 内可能过期的完整 ID；Codex 使用 `model_profile=inherit` + `resolve_model_ids=omit`。同时清空 `model_overrides`、`models`、`dynamic_routing`、`model_profile_overrides`、`model_policy`，关闭 `features.thinking_partner`，并再次锁闭 `claude_orchestration`。这样可防止旧项目配置绕过当前策略，也不会在 planner 前额外派 pattern mapper、在 checker 后追加非阻断 gap 扫描与架构分析，或启用 1.8 的嵌套 Workflow 编排。
 - 按官方 catalog 重放 `~/.codex/agents/gsd-*.toml`，移除 `service_tier="flex"`。
 - GSD 1.8 会用 defaults 与静态 Codex agent TOML 的 mtime 判断模型是否重新 bake；策略重放在验证全部 TOML 后统一同步其时间戳，`--verify-only` 只报告漂移、不修改文件，避免已正确锁定 Sol 时反复出现无效重装告警。
-- 把 `~/.claude/agents/gsd-*.md` 的模型 frontmatter 统一为 `model: inherit`。
+- 按官方 catalog 的 `routingTier` + `adaptiveTierMap` 重放 `~/.claude/agents/gsd-*.md` 的模型 frontmatter；当前 GSD 1.8 对应 heavy=`opus`、standard=`sonnet`、light=`haiku`。
 - 修改前备份 defaults 与发生变化的 Codex TOML / Claude Markdown。
 
 首次启用、GSD 安装/更新后、或 `--verify-only` 报告漂移时执行应用模式。不要逐个手改生成文件。旧的 `.ps1` 入口会转发到同一个 Node helper。

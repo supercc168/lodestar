@@ -7107,7 +7107,7 @@ describe('Session provider switching', () => {
     expect(proc.killCalls).toBe(0)
   })
 
-  test('accepts the first-party Claude Code choices (Opus 4.8 / Fable 5, max)', async () => {
+  test('accepts the first-party Claude Code choices (Opus 5 / Fable 5, max)', async () => {
     for (const model of ['claude:opus', 'claude:fable']) {
       const session = new Session('probe', 'chat_id') as any
       const proc = new FakeAgentProc('claude', 'claude-session-1')
@@ -7126,7 +7126,7 @@ describe('Session provider switching', () => {
     }
   })
 
-  test('model 选择器展示 Opus 4.8 / Fable 5 官方档位 + GLM / Grok(无痕·CatCodex)第三方档位', () => {
+  test('model 选择器展示 Opus 5 / Fable 5 官方档位 + GLM / Grok(无痕·CatCodex)第三方档位', () => {
     // 隔离 config:第三方档位 description 的「未配置」提示只在 config 无该档位时
     // 出现,测试机可能已配 GLM/Grok,强制未配置态。
     const prev = config.claude.models

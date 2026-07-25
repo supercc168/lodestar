@@ -33,7 +33,7 @@
 | `codex-usage.ts` | 解析 app-server token usage payload，并计算 per-turn absolute total 差值与有效 token。 |
 | `codex-compaction.ts` | 解析多种 app-server / raw response context compaction 事件，并输出统一 `ContextCompactedNotification`。 |
 | `claude-agent-process.ts` | 实现 `AgentProcess` 的 Claude 后端：用 `@anthropic-ai/claude-agent-sdk` 的 `query({ prompt: AsyncIterable })` streaming-input 长驻进程，把 SDK message（`system/init`、assistant text/tool_use、`tool_result`、`result`、`compact_boundary`）映射为统一 Session 事件；`permissionMode: default` + `canUseTool` 回调：`AskUserQuestion` 经 canUseTool 下发、host 拦下渲染卡片并回填 answers，其余工具秒放（复刻旧 bypassPermissions「不弹审批」语义；bypassPermissions 会 shadow canUseTool，AskUserQuestion 就废了）；启动前 `assertClaudeCodeAvailable` 检查 `claude` 可执行文件。 |
-| `claude-models.ts` | Claude model profile：内置 Fable/Opus 登录档与 `glm` API 档，可由 `config.toml` 的 `[claude.models.*]` 覆盖/新增（含 Grok）；`resolveClaudeSdkModel` 返回当前档位的真实 SDK model id，spawn 时把 Fable/Opus/Sonnet/Haiku 四个 alias 全部锁到该 id，禁止 GSD/Task 子 agent 换模型。 |
+| `claude-models.ts` | Claude model profile：内置 Fable/Opus 登录档与 `glm` API 档，可由 `config.toml` 的 `[claude.models.*]` 覆盖/新增（含 Grok）；`resolveClaudeSdkModel` 返回当前档位的真实 SDK model id。spawn 时第一方 alias 使用 Opus 5 / Fable 5 / Sonnet 5 分层组合，第三方 API 档的四个 alias 全部锁回当前 model。 |
 | `token-source.ts` | TokenSource **适配层**（非上游全量 registry）：把 `claude-models` / `codex-models` 与内建 login 档收敛为统一 `resolveTokenSource(provider, model)`；提供 `resolveClaudeSpawnEnv`（scrub ANTHROPIC_* → api 才注入 → tier lock + `GSD_RUNTIME`）、`resolveCodexSpawnOverrides`、`resolveUsageSource`。真相源仍是 `[claude.models.*]`/`[codex.models.*]`，**不**引入 `[token_source.*]` TOML，**不**改 `model` 面板 UX。reclaude 等包装器仍走 `[claude] bin`；API 路由用 `isApiRoute()` 绕开。 |
 | `card-action.ts` | Card action 回调响应辅助；生产 WS 路径用 `{ card: { type: "raw", data: newCard } }` 立即替换 JSON 卡片，避免 200672、裸卡片或提前 patch 导致模型/effort 面板闪退。 |
 | `cardkit.ts` | Feishu Card Kit v1 封装；维护 per-card sequence、Promise queue、流式限流、元素计数和写失败回调。 |
@@ -78,7 +78,7 @@
 - `wt` 命令的 Git 操作集中在 `worktree.ts`；不要在 `session.ts` 里散写 `git` shell 命令。
 - `agy <prompt>` 的 CLI 参数、PATH 和 Git 快照集中在 `agy-task.ts`；session 侧进程生命周期、输出收集、状态刷新和卡片接线集中在 `session-agy.ts`。
 - `task` 面板按钮由 `session-tasklist.ts` 处理，持久状态集中在 `tasklist.ts`，后台自动化集中在 `tasklist-worker.ts`；不要把轮询、进程状态或 Git 产物逻辑塞进卡片模板。
-- `model` 命令为固定选项(codex 内建=gpt-5.6-sol/max、claude 第一方=Fable 5/Opus 4.8 均 max、glm=effort 随 config),effort 锁死一键生效,不动态拉取 `model/list`。
+- `model` 命令为固定选项(codex 内建=gpt-5.6-sol/max、claude 第一方=Fable 5/Opus 5 均 max、glm=effort 随 config),effort 锁死一键生效,不动态拉取 `model/list`。
 - Claude/Codex spawn 凭据与 model 注入经 `token-source.ts` 单入口；新增档位仍写 `[claude.models.*]`/`[codex.models.*]` 与 `claude-models`/`codex-models` profile，不要平行再加一套 `[token_source.*]` 配置。
 - TokenSource **长期只做适配层**：禁止引入 `[token_source.*]` 注册表、`registerTokenSource` 插件 API、双层 model 面板、source 级 `refreshModels`。额度实现仍分 `usage.ts`/`glm-usage.ts`，展示选型走 `resolveUsageSource`。上游只吸收行为补丁，不吸收产品/配置形态。
 - `rs`/`restart` 空闲态：仅 **claude** 列 `~/.claude/projects` 会话列表；**codex** 空闲直接 `restart(true)`（resume list 无 codex 数据源，避免空列表误导）。

@@ -27,7 +27,9 @@ test('prompt forces yiui-gsd and bans old planners', () => {
   expect(p).toContain('provider=claude')
   expect(p).toContain('model=claude:glm')
   expect(p).toContain('effort=xhigh')
-  expect(p).toContain('继承同一 provider/model')
+  expect(p).toContain('禁止切换 provider')
+  expect(p).toContain('第一方 heavy=Opus 5、standard=Fable 5、light=Sonnet 5')
+  expect(p).toContain('第三方 API 路由的所有 alias 锁回当前 model=claude:glm')
   expect(p).toContain('外部 AI CLI')
   expect(p).toContain('不要在收到 research/planner/checker 报告后完整重做')
   expect(p).toContain('不启动 executor 子 agent')
@@ -58,6 +60,7 @@ test('new-task-discuss action line differs from continue', () => {
   expect(neu).toContain('effort: max')
   expect(neu).toContain('task_slug: b')
   expect(neu).toContain('任务名: B')
+  expect(neu).toContain('Codex 子 agent 全部锁到当前 model=gpt-5.6-sol')
 })
 
 test('isGsdInjectPrompt / parseGsdInjectTaskSlug', () => {

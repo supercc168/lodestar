@@ -32,11 +32,11 @@ export interface ModelPanelState {
 
 /** model 命令的固定选项:每项 effort 锁死,选了即生效(无 effort 二级面板)。
  * codex = gpt-5.6-sol / max(2026-07-20 起所有 GPT 档统一 max);
- * claude 第一方档位 = Fable 5 / Opus 4.8,均 max(ultracode 最高思考强度)。
+ * claude 第一方档位 = Fable 5 / Opus 5,均 max(ultracode 最高思考强度)。
  * claude 的 max 由 ClaudeAgentProcess.setModelSettings 强制 applyFlagSettings,
  * 不依赖 ~/.claude/settings.json 的 effortLevel。
  * 各 claude:<key> 的实际 SDK model id 由 claude-models.ts 的 profile 决定
- * (claude:fable→claude-fable-5,claude:opus→claude-opus-4-8),reclaude 透传
+ * (claude:fable→claude-fable-5,claude:opus→claude-opus-5),reclaude 透传
  * --model 到 Claude Code,走用户的 Anthropic 登录态。 */
 const FIXED_MODEL_CHOICES = [
   {
@@ -56,8 +56,8 @@ const FIXED_MODEL_CHOICES = [
   {
     provider: 'claude' as const,
     model: 'claude:opus',
-    displayName: 'Claude · Opus 4.8',
-    description: 'Opus 4.8 · max (ultracode) · 1M 上下文,擅长架构与深度分析。',
+    displayName: 'Claude · Opus 5',
+    description: 'Opus 5 · max (ultracode) · 擅长架构与深度分析。',
     effort: 'max' as AgentReasoningEffort,
   },
   {

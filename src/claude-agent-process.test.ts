@@ -106,7 +106,7 @@ describe('Claude model profiles', () => {
   })
 
   test('maps first-party Claude Code profiles to their SDK model ids', () => {
-    expect(resolveClaudeSdkModel('claude:opus')).toBe('claude-opus-4-8')
+    expect(resolveClaudeSdkModel('claude:opus')).toBe('claude-opus-5')
     expect(resolveClaudeSdkModel('claude:fable')).toBe('claude-fable-5')
   })
 
@@ -216,10 +216,10 @@ describe('Claude model profiles', () => {
       expect(loginEnv.ANTHROPIC_BASE_URL).toBeUndefined()
       expect(loginEnv.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
       expect(loginEnv.GSD_RUNTIME).toBe('claude')
-      expect(loginEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-opus-4-8')
-      expect(loginEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-4-8')
-      expect(loginEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-opus-4-8')
-      expect(loginEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-opus-4-8')
+      expect(loginEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-fable-5')
+      expect(loginEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5')
+      expect(loginEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-fable-5')
+      expect(loginEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-sonnet-5')
 
       // GLM 第三方路由:注入自己的 base_url + auth_token,但残留的官方 key
       // 被先抹掉,不会夹带打到第三方端点。
@@ -270,19 +270,25 @@ describe('Claude model profiles', () => {
       expect(glmEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.2[1m]')
       expect(glmEnv.GSD_RUNTIME).toBe('claude')
 
-      // 官方登录档位:宿主和 [claude.env] 的四种别名不能泄漏;所有
-      // alias 改为当前选择的 Opus,确保子 agent 不切换模型。
+      // 官方登录档位:宿主和 [claude.env] 的四种别名不能泄漏；改用
+      // GSD adaptive tier 对应的最新第一方模型组合。
       const opus = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:opus' })
       const opusEnv = (opus as any).buildSpawnEnv()
-      for (const key of aliasKeys) expect(opusEnv[key]).toBe('claude-opus-4-8')
+      expect(opusEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-fable-5')
+      expect(opusEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5')
+      expect(opusEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-fable-5')
+      expect(opusEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-sonnet-5')
       expect(opusEnv.ANTHROPIC_BASE_URL).toBeUndefined()
       expect(opusEnv.GSD_RUNTIME).toBe('claude')
 
-      // 新群尚未显式选择模型时，SDK 主模型回落 Fable 5；tier alias 必须
-      // 使用同一回落，不能让 GSD 子 agent 再按角色切到其它 Claude 模型。
+      // 新群尚未显式选择模型时，SDK 主模型回落 Fable 5；子 agent 仍按
+      // 同一套第一方 adaptive tier 组合分配。
       const defaultLogin = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max' })
       const defaultEnv = (defaultLogin as any).buildSpawnEnv()
-      for (const key of aliasKeys) expect(defaultEnv[key]).toBe('claude-fable-5')
+      expect(defaultEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-fable-5')
+      expect(defaultEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5')
+      expect(defaultEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-fable-5')
+      expect(defaultEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-sonnet-5')
       expect(defaultEnv.GSD_RUNTIME).toBe('claude')
     } finally {
       ;(config.claude as any).models = prevModels

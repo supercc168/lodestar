@@ -50,7 +50,7 @@ describe('token-source Claude login vs api', () => {
     ;(config.claude as any).models.glm = prevGlm
   })
 
-  test('fable login:scrub 后不注入凭据,锁 tier 到 claude-fable-5', () => {
+  test('fable login:scrub 后不注入凭据,并注入第一方最新 tier 组合', () => {
     const source = resolveTokenSource('claude', 'claude:fable')
     expect(source.kind).toBe('login')
     expect(source.provider).toBe('claude')
@@ -67,18 +67,22 @@ describe('token-source Claude login vs api', () => {
     })
     expect(env.ANTHROPIC_BASE_URL).toBeUndefined()
     expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-fable-5')
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5')
     expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-fable-5')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-fable-5')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-sonnet-5')
     expect(env.GSD_RUNTIME).toBe('claude')
     expect(env.PATH).toBe('/bin')
   })
 
-  test('opus login:resolveSpawnModel = claude-opus-4-8', () => {
+  test('opus login:resolveSpawnModel = claude-opus-5', () => {
     const source = resolveTokenSource('claude', 'claude:opus')
     expect(source.kind).toBe('login')
-    expect(source.resolveSpawnModel()).toBe('claude-opus-4-8')
+    expect(source.resolveSpawnModel()).toBe('claude-opus-5')
     const env = source.spawnEnv({})
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-4-8')
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-fable-5')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-sonnet-5')
     expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
   })
 

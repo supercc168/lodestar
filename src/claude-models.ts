@@ -37,9 +37,9 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
     model: 'claude-fable-5',
   },
   opus: {
-    display_name: 'Claude Code · Opus 4.8',
-    description: 'Anthropic Opus 4.8,1M 上下文,擅长架构与深度分析。',
-    model: 'claude-opus-4-8',
+    display_name: 'Claude Code · Opus 5',
+    description: 'Anthropic Opus 5,擅长架构与深度分析。',
+    model: 'claude-opus-5',
   },
   glm: {
     display_name: 'Claude Code · GLM',
@@ -69,17 +69,22 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
   },
 }
 
-// Claude Code/GSD 会按角色选择模型 alias。Lodestar 将四个 alias 都绑定到
-// 飞书当前选择的真实模型，避免同一 GLM/Grok/Claude 任务按 tier 混用模型。
-/** Claude Code can use these aliases when GSD/Task tools create a child
- * agent.  They are deliberately kept as one selected model; tier-specific
- * aliases would silently route a GLM/Grok session to a different model. */
+// Claude Code/GSD 会按角色选择模型 alias。第一方登录档使用当前最新组合；
+// 第三方 API 路由仍把四个 alias 全部锁回飞书当前模型，避免官方 model id
+// 泄漏到 GLM/Grok 等兼容端点。
 export const CLAUDE_MODEL_ALIAS_KEYS = [
   'ANTHROPIC_DEFAULT_FABLE_MODEL',
   'ANTHROPIC_DEFAULT_OPUS_MODEL',
   'ANTHROPIC_DEFAULT_SONNET_MODEL',
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
 ] as const
+
+const FIRST_PARTY_CLAUDE_TIER_ENV: Record<(typeof CLAUDE_MODEL_ALIAS_KEYS)[number], string> = {
+  ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-fable-5',
+  ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-5',
+  ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-fable-5',
+  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-sonnet-5',
+}
 
 const DEFAULT_GLM_MODEL = 'glm-5.2[1m]'
 
@@ -207,11 +212,12 @@ export function claudeModelEnv(model: string | null | undefined): Record<string,
   return claudeModelProfile(model)?.env ?? {}
 }
 
-/** Lock every Claude Code tier alias to the model selected by Lodestar.  This
- * is applied at the child-process boundary, after profile-specific routing
- * env, so an inherited shell/settings alias cannot create a mixed-model GSD
- * graph.  An omitted model resolves to Lodestar's explicit login default. */
+/** Resolve Claude Code child-agent aliases at the process boundary. Official
+ * login routes use the latest first-party tier combination; API routes keep
+ * every alias on the selected upstream model so no Anthropic id reaches a
+ * third-party endpoint. */
 export function claudeModelTierEnv(model: string | null | undefined): Record<string, string> {
+  if (!claudeModelIsApiRoute(model)) return { ...FIRST_PARTY_CLAUDE_TIER_ENV }
   const selected = resolveClaudeSdkModel(model)
   if (!selected) return {}
   return Object.fromEntries(CLAUDE_MODEL_ALIAS_KEYS.map(key => [key, selected]))

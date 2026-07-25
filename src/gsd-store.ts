@@ -277,7 +277,8 @@ export function enforceGsdProviderIsolation(
     const expected = `${JSON.stringify({
       ...parsed,
       runtime,
-      model_profile: 'inherit',
+      resolve_model_ids: runtime === 'claude' ? false : 'omit',
+      model_profile: runtime === 'claude' ? 'adaptive' : 'inherit',
       model_overrides: null,
       models: null,
       dynamic_routing: null,

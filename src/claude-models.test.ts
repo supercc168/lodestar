@@ -56,19 +56,18 @@ describe('claudeModelEnv per-档位 env 注入', () => {
     expect(claudeModelIsApiRoute('claude:glm')).toBe(true)
   })
 
-  test('未显式选模型的默认登录档位也把所有 tier alias 锁到 Fable 5', () => {
+  test('第一方登录档位使用最新 Claude tier 组合', () => {
     expect(claudeModelTierEnv(null)).toEqual({
       ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-fable-5',
-      ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-fable-5',
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-5',
       ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-fable-5',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-fable-5',
+      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-sonnet-5',
     })
+    expect(claudeModelTierEnv('claude:opus')).toEqual(claudeModelTierEnv(null))
+    expect(claudeModelTierEnv('claude:fable')).toEqual(claudeModelTierEnv(null))
   })
 
-  test('Claude 与 GLM 的四个 tier alias 都锁到当前真实模型', () => {
-    for (const value of Object.values(claudeModelTierEnv('claude:opus'))) {
-      expect(value).toBe('claude-opus-4-8')
-    }
+  test('GLM 的四个 tier alias 仍锁到当前第三方真实模型', () => {
     for (const value of Object.values(claudeModelTierEnv('claude:glm'))) {
       expect(value).toBe('glm-5.2[1m]')
     }
