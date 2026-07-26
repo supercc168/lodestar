@@ -120,15 +120,19 @@ export interface TurnState {
    * Reset per turn (a fresh TurnState starts at 0). */
   rotateCount: number
   /** Rotations triggered by the reactive failure path only
-   * (onCardWriteFailure). This is the counter MAX_MIDTURN_ROTATES caps —
-   * the failure path is the only one that can run away (Feishu outage, or
-   * a poisoned element that fails on every card). The proactive path
-   * (maybeMidTurnRotate) deliberately does NOT consume this budget: it
-   * needs ~50 genuinely-successful elements per card to fire again, so
-   * it's naturally throttled by real output. Sharing one counter was the
-   * 2026-07-04 bug — a long turn's 5 legitimate full-card rotations
-   * exhausted the cap, and the next transient 300308 flipped the turn to
-   * log-only. */
+   * (onCardWriteFailure, capacity / true unwritable API codes). This is
+   * the counter MAX_MIDTURN_ROTATES caps — the failure path is the only
+   * one that can run away (Feishu outage, or a poisoned element that
+   * fails on every card). The proactive path (maybeMidTurnRotate)
+   * deliberately does NOT consume this budget: it needs ~50 genuinely-
+   * successful elements per card to fire again, so it's naturally
+   * throttled by real output. Network transport failures and footer
+   * ticker misses also do NOT consume it (cardkit classifies/degrades
+   * those before they reach here). Sharing one counter with proactive
+   * rotates was the 2026-07-04 bug — a long turn's 5 legitimate
+   * full-card rotations exhausted the cap, and the next transient
+   * 300308 flipped the turn to log-only. Cleared on successful
+   * addElement so a recovered card doesn't carry a stale streak. */
   failureRotateCount: number
   /** Latched once we hit the rotate cap and emit the "giving up" notice,
    * so the notice isn't repeated on every later failed write this turn. */

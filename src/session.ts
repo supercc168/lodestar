@@ -318,12 +318,14 @@ const RESUME_INIT_TIMEOUT_MS = 120_000
  * Session.onCardWriteFailure), so a wrong guess here still self-heals. */
 const CARD_ELEMENT_SOFT_LIMIT = 50
 
-/** Max mid-turn card rotations per turn. Past this we stop opening fresh
- * cards and fall back to log-only for the rest of the turn. Guards the
- * "rotate on any write failure" path against a runaway loop where every
- * card keeps failing (Feishu outage, or an element whose own content
- * Feishu rejects on every card) — without a cap that would spray an
- * endless trail of empty cards into the chat. */
+/** Max mid-turn card rotations per turn driven by capacity / true
+ * unwritable API failures. Past this we stop opening fresh cards and
+ * fall back to log-only for the rest of the turn. Guards the reactive
+ * rotate path against a runaway loop where every card keeps failing
+ * (Feishu outage, or an element whose own content Feishu rejects on
+ * every card) — without a cap that would spray an endless trail of
+ * empty cards into the chat. Network transport blips and footer ticks
+ * do not consume this budget (see onCardWriteFailure). */
 const MAX_MIDTURN_ROTATES = 5
 /** Claude Agent SDK does not emit stream `init` until the first user input.
  * Still give synchronous/early startup failures a chance to surface before
@@ -5211,7 +5213,12 @@ export class Session {
       (trigger === 'bg_task_resume' || trigger === 'watchdog_resume' ? 1 : 0) +
       (userInputs.length > 0 ? 1 : 0) +
       1
-    cardkit.recordCardCreated(cardId, initialElementCount, (code) => this.onCardWriteFailure(cardId, code))
+    cardkit.recordCardCreated(
+      cardId,
+      initialElementCount,
+      (code, meta) => this.onCardWriteFailure(cardId, code, meta),
+      () => this.onCardWriteSuccess(cardId),
+    )
     const turnState: TurnState = {
       cardId,
       ...turnSelection,
@@ -5290,22 +5297,36 @@ export class Session {
     this.startMidTurnRotate(turn)
   }
 
-  /** Reactive rotation trigger: cardkit calls this (via the addElement
-   * onFailure path) whenever a write to the card was rejected by Feishu —
-   * ANY code, not just 300305/300315. The element limit was the symptom
-   * that surfaced this, but the same response ("the card is unwritable,
-   * move to a fresh one") applies to a schema/rule change, or a transient
-   * server reject that survived the reopen-retry. Deliberately does NOT
-   * consult getElementCount: a failed add never bumps the counter, so the
-   * count is stuck below the soft cap exactly when a rotate is most needed
-   * (the bug that froze the 2026-05-23 turn at ~76 elements). Idempotent
-   * (a rotation already in flight is left alone) and capped
-   * (MAX_MIDTURN_ROTATES) so a persistent failure can't spin forever. */
-  onCardWriteFailure(failedCardId: string, code?: number): void {
+  /** Reactive rotation trigger: cardkit elevates non-footer write failures
+   * here after local network / streaming-closed retries. Capacity codes
+   * (element / size limit) force a mid-turn rotate; other Feishu API
+   * rejections also rotate (card may be poisoned). Pure network failures
+   * do NOT rotate and do NOT consume the failure-rotate cap — swapping
+   * cards cannot fix transport, and counting footer `fetch failed` blips
+   * toward the cap is what flipped etmmo turns to log-only (2026-07-25/26).
+   * Idempotent (a rotation already in flight is left alone) and capped
+   * (MAX_MIDTURN_ROTATES) so a persistent capacity failure can't spin
+   * forever. Successful addElement clears the streak via onCardWriteSuccess. */
+  onCardWriteFailure(
+    failedCardId: string,
+    code?: number,
+    meta?: cardkit.CardWriteFailureMeta,
+  ): void {
     const turn = this.currentTurn
     if (!turn || turn.cardId !== failedCardId) return
     if (turn.rotating) return
     if (turn.rotateGivenUp) return
+
+    const kind = meta?.kind
+      ?? (typeof code === 'number' ? 'api' : 'network')
+    if (kind === 'network') {
+      // Transport blip already retried inside cardkit. Stay on this card;
+      // the next real content write either lands (onCardWriteSuccess) or
+      // surfaces a true API code that can rotate.
+      log(`session "${this.sessionName}": network write failure on card=${turn.cardId.slice(0, 8)}… — skip rotate (streak=${turn.failureRotateCount})`)
+      return
+    }
+
     if (turn.failureRotateCount >= MAX_MIDTURN_ROTATES) {
       turn.rotateGivenUp = true
       // log-only 要名副其实:停掉每秒 footer 计时器,并把当前卡整卡标记
@@ -5313,8 +5334,8 @@ export class Session {
       // (2026-07-04:11 分钟 663 条 300308)。
       this.stopFooterStatus(turn)
       cardkit.markCardWriteDead(turn.cardId)
-      log(`session "${this.sessionName}": failure-rotate cap (${MAX_MIDTURN_ROTATES}) hit — giving up, rest of turn is log-only`)
-      void feishu.sendTextRaw(this.chatId, `⚠️ 卡片写入失败已触发 ${MAX_MIDTURN_ROTATES} 次换卡仍未恢复(疑似飞书故障、元素超限或卡片体积超限),本轮后续输出仅日志可见。`)
+      log(`session "${this.sessionName}": failure-rotate cap (${MAX_MIDTURN_ROTATES}) hit — giving up, rest of turn is log-only code=${code ?? 'n/a'}`)
+      void feishu.sendTextRaw(this.chatId, this.failureRotateGiveUpText(code))
       return
     }
     const why = cardkit.isElementLimitCode(code)
@@ -5325,6 +5346,33 @@ export class Session {
     log(`session "${this.sessionName}": ${why} on card=${turn.cardId.slice(0, 8)}… — rotating to fresh card`)
     turn.failureRotateCount++
     this.startMidTurnRotate(turn)
+  }
+
+  /** Real content write landed on the active card — clear the failure-
+   * rotate streak so a recovered card isn't one blip away from log-only.
+   * Footer ticks deliberately do not call this (they fire every second). */
+  onCardWriteSuccess(cardId: string): void {
+    const turn = this.currentTurn
+    if (!turn || turn.cardId !== cardId) return
+    if (turn.rotateGivenUp || turn.rotating) return
+    if (turn.failureRotateCount === 0) return
+    log(`session "${this.sessionName}": card write recovered card=${cardId.slice(0, 8)}… — reset failureRotateCount ${turn.failureRotateCount}→0`)
+    turn.failureRotateCount = 0
+  }
+
+  /** User-facing give-up copy, branched by the last observed Feishu code. */
+  private failureRotateGiveUpText(code?: number): string {
+    const n = MAX_MIDTURN_ROTATES
+    if (cardkit.isElementLimitCode(code)) {
+      return `⚠️ 卡片写入失败已触发 ${n} 次换卡仍未恢复(飞书元素超限 code=${code}),本轮后续输出仅日志可见。`
+    }
+    if (cardkit.isCardSizeLimitCode(code)) {
+      return `⚠️ 卡片写入失败已触发 ${n} 次换卡仍未恢复(飞书卡片体积超限 code=${code}),本轮后续输出仅日志可见。`
+    }
+    if (typeof code === 'number') {
+      return `⚠️ 卡片写入失败已触发 ${n} 次换卡仍未恢复(飞书 API 拒绝 code=${code}),本轮后续输出仅日志可见。`
+    }
+    return `⚠️ 卡片写入失败已触发 ${n} 次换卡仍未恢复(疑似飞书故障),本轮后续输出仅日志可见。`
   }
 
   /** Open a fresh card under the **same** SDK turn number to dodge
@@ -5377,7 +5425,12 @@ export class Session {
           return
         }
         // card_full body has banner(1) + footer(1) = 2 elements.
-        cardkit.recordCardCreated(newCardId, 2, (code) => this.onCardWriteFailure(newCardId, code))
+        cardkit.recordCardCreated(
+          newCardId,
+          2,
+          (code, meta) => this.onCardWriteFailure(newCardId, code, meta),
+          () => this.onCardWriteSuccess(newCardId),
+        )
         // 同步 swap：从这一行起,后续 stream handler 看到的 turn.cardId
         // 是新卡。reset 所有 element-id 引用 (toolCount / assistantSegmentCount
         // 等),旧卡上的 element_id 在新卡里查不到,继续 PUT 会 300313。

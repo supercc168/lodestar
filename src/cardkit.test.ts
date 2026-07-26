@@ -190,4 +190,139 @@ describe('cardkit capacity codes', () => {
     expect(cardkit.isCardCapacityCode(200860)).toBe(true)
     expect(cardkit.isCardCapacityCode(300308)).toBe(false)
   })
+
+  test('classifies pure transport failures as network', () => {
+    expect(cardkit.isNetworkError(new TypeError('fetch failed'))).toBe(true)
+    expect(cardkit.isNetworkError(new Error('socket hang up'))).toBe(true)
+    const apiErr = new Error('cardkit PUT: code=300308') as Error & { code: number }
+    apiErr.code = 300308
+    expect(cardkit.isNetworkError(apiErr)).toBe(false)
+    expect(cardkit.isNetworkError(null)).toBe(true)
+  })
+})
+
+describe('cardkit network retry and footer isolation', () => {
+  test('retries network transport failures then succeeds without elevating card failure', async () => {
+    const failures: Array<{ code?: number; kind?: string }> = []
+    let attempt = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      calls.push({
+        method: String(init?.method ?? 'GET'),
+        path: url.pathname.replace('/open-apis/cardkit/v1', ''),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      })
+      attempt++
+      if (attempt === 1) throw new TypeError('fetch failed')
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    cardkit.recordCardCreated('card_net_retry', 1, (code, meta) => {
+      failures.push({ code, kind: meta?.kind })
+    })
+    await cardkit.addElement('card_net_retry', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'recovered',
+    }, { type: 'insert_before', targetElementId: 'footer' })
+
+    expect(attempt).toBe(2)
+    expect(failures).toEqual([])
+    expect(cardkit.getElementCount('card_net_retry')).toBe(2)
+    await cardkit.dispose('card_net_retry')
+  })
+
+  test('exhausted network retries report kind=network without rotating content path', async () => {
+    const failures: Array<{ code?: number; kind?: string }> = []
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      calls.push({
+        method: String(init?.method ?? 'GET'),
+        path: url.pathname.replace('/open-apis/cardkit/v1', ''),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      })
+      throw new TypeError('fetch failed')
+    }) as typeof fetch
+
+    cardkit.recordCardCreated('card_net_exhaust', 1, (code, meta) => {
+      failures.push({ code, kind: meta?.kind })
+    })
+    await cardkit.addElement('card_net_exhaust', {
+      tag: 'markdown', element_id: 'assistant_net', content: 'x',
+    })
+
+    // 1 initial + 2 retries = 3 attempts
+    expect(calls.filter(c => c.path === '/cards/card_net_exhaust/elements')).toHaveLength(3)
+    expect(failures).toEqual([{ code: undefined, kind: 'network' }])
+    expect(cardkit.getElementCount('card_net_exhaust')).toBe(1)
+    await cardkit.dispose('card_net_exhaust')
+  })
+
+  test('footer replaceElement failures do not elevate to card-level onFailure', async () => {
+    const cardFailures: Array<number | undefined> = []
+    const callFailures: Array<{ code?: number; kind?: string }> = []
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      calls.push({
+        method: String(init?.method ?? 'GET'),
+        path: url.pathname.replace('/open-apis/cardkit/v1', ''),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      })
+      return new Response(JSON.stringify({ code: 300308, msg: 'footer reject' }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    cardkit.recordCardCreated('card_footer_iso', 2, code => cardFailures.push(code))
+    await cardkit.replaceElement(
+      'card_footer_iso',
+      'footer',
+      { tag: 'markdown', element_id: 'footer', content: 'Writing(1s)' },
+      (code, meta) => callFailures.push({ code, kind: meta?.kind }),
+    )
+
+    expect(cardFailures).toEqual([])
+    expect(callFailures).toEqual([{ code: 300308, kind: 'api' }])
+    await cardkit.dispose('card_footer_iso')
+  })
+
+  test('non-footer replaceElement failures still elevate to card-level onFailure', async () => {
+    const cardFailures: Array<{ code?: number; kind?: string }> = []
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      calls.push({
+        method: String(init?.method ?? 'GET'),
+        path: url.pathname.replace('/open-apis/cardkit/v1', ''),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      })
+      return new Response(JSON.stringify({ code: 300308, msg: 'assistant reject' }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    cardkit.recordCardCreated('card_assistant_fail', 2, (code, meta) => {
+      cardFailures.push({ code, kind: meta?.kind })
+    })
+    await cardkit.replaceElement('card_assistant_fail', 'assistant_0', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'x',
+    })
+
+    expect(cardFailures).toEqual([{ code: 300308, kind: 'api' }])
+    await cardkit.dispose('card_assistant_fail')
+  })
+
+  test('successful addElement invokes onSuccess after recovery', async () => {
+    let successes = 0
+    cardkit.recordCardCreated('card_onsuccess', 1, undefined, () => { successes++ })
+    await cardkit.addElement('card_onsuccess', {
+      tag: 'markdown', element_id: 'assistant_ok', content: 'ok',
+    })
+    expect(successes).toBe(1)
+    // footer replace must not fire onSuccess
+    await cardkit.replaceElement('card_onsuccess', 'footer', {
+      tag: 'markdown', element_id: 'footer', content: 'tick',
+    })
+    expect(successes).toBe(1)
+    await cardkit.dispose('card_onsuccess')
+  })
 })

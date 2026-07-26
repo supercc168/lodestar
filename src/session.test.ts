@@ -7458,7 +7458,8 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
     globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = new URL(String(input))
       const path = url.pathname.replace('/open-apis/cardkit/v1', '')
-      if (init?.method === 'PUT' && path === `/cards/${failedCardId}/elements/footer`) {
+      // Non-footer element: footer failures no longer elevate to card-level rotate.
+      if (init?.method === 'PUT' && path === `/cards/${failedCardId}/elements/assistant_0`) {
         return new Response(JSON.stringify({ code: 300308, msg: 'current card rejected' }), {
           headers: { 'Content-Type': 'application/json' },
         })
@@ -7467,8 +7468,8 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
     }) as typeof fetch
 
     try {
-      await cardkit.replaceElement(failedCardId, 'footer', {
-        tag: 'markdown', element_id: 'footer', content: 'trigger current failure',
+      await cardkit.replaceElement(failedCardId, 'assistant_0', {
+        tag: 'markdown', element_id: 'assistant_0', content: 'trigger current failure',
       })
       const rotation = turn.rotating
 
@@ -7480,6 +7481,97 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
       globalThis.fetch = healthyFetch
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  // 2026-07-25/26 etmmo:footer 每秒 ticker 的 TypeError: fetch failed 被当成
+  // 写失败换卡,5 次后 log-only。footer 失败必须降级,绝不换卡。
+  test('footer replaceElement failure does not mid-turn rotate', async () => {
+    const session = new Session('footer-no-rotate', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-footer-no-rotate')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.pendingTurnInputs = ['footer input']
+    session.wireProc(proc)
+    const openResult = await session.openTurnCard('ou_footer', 'user_message', { startThinking: false })
+    if (openResult.kind !== 'opened') throw new Error('footer turn card did not open')
+    const turn = openResult.turn
+    const cardId = turn.cardId
+    const healthyFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      if (init?.method === 'PUT' && path === `/cards/${cardId}/elements/footer`) {
+        return new Response(JSON.stringify({ code: 300308, msg: 'footer reject' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return await healthyFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      await cardkit.replaceElement(cardId, 'footer', {
+        tag: 'markdown', element_id: 'footer', content: 'Writing(1s)',
+      })
+      expect(turn.failureRotateCount).toBe(0)
+      expect(turn.rotating).toBeNull()
+      expect(turn.cardId).toBe(cardId)
+      expect(turn.rotateGivenUp).toBe(false)
+    } finally {
+      globalThis.fetch = healthyFetch
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  // 网络 fetch failed 重试耗尽后也不换卡、不烧 cap。
+  test('network write failure does not rotate or consume the failure cap', async () => {
+    const session = new Session('network-no-rotate', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-session-net')
+    const turn = turnState('card_net')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(
+      'card_net',
+      1,
+      (code, meta) => session.onCardWriteFailure('card_net', code, meta),
+    )
+
+    try {
+      session.onCardWriteFailure('card_net', undefined, { kind: 'network' })
+      expect(turn.failureRotateCount).toBe(0)
+      expect(turn.rotating).toBeNull()
+      expect(turn.rotateGivenUp).toBe(false)
+      expect(turn.cardId).toBe('card_net')
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose('card_net')
+    }
+  })
+
+  // 成功写入后清掉 failure 计数,避免一次抖动 burst 让整轮永久 log-only。
+  test('successful content write resets failureRotateCount', async () => {
+    const session = new Session('reset-failure-count', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-session-reset')
+    const turn = turnState('card_reset')
+    turn.userOpenId = ''
+    turn.failureRotateCount = 3
+    session.currentTurn = turn
+    cardkit.recordCardCreated(
+      'card_reset',
+      1,
+      (code, meta) => session.onCardWriteFailure('card_reset', code, meta),
+      () => session.onCardWriteSuccess('card_reset'),
+    )
+
+    try {
+      await cardkit.addElement('card_reset', {
+        tag: 'markdown', element_id: 'assistant_recover', content: 'ok',
+      })
+      expect(turn.failureRotateCount).toBe(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose('card_reset')
     }
   })
 
@@ -7497,7 +7589,7 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
     turn.rotateCount = 5 // 5 次主动满卡轮转已发生,但从未因写失败换过卡
 
     try {
-      session.onCardWriteFailure('card_old', 300308)
+      session.onCardWriteFailure('card_old', 300308, { kind: 'api' })
 
       expect(turn.rotateGivenUp).toBe(false)
       expect(turn.rotating).not.toBeNull()
@@ -7522,7 +7614,7 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
       session.startWritingFooter(turn)
       expect(turn.footerStatusHandle).not.toBeNull()
 
-      session.onCardWriteFailure('card_dead', 300308)
+      session.onCardWriteFailure('card_dead', 300305, { kind: 'api' })
 
       expect(turn.rotateGivenUp).toBe(true)
       expect(turn.rotating).toBeNull() // 不再尝试换卡
@@ -7536,14 +7628,37 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
       await cardkit.replaceElement('card_dead', 'footer', { tag: 'markdown', element_id: 'footer', content: 'x' })
       await cardkit.addElement('card_dead', { tag: 'markdown', element_id: 'e_new', content: 'x' })
       expect(calls.length).toBe(before)
-      // 告警文案说的是真实语义(换卡耗尽),不是「连续 N 次写入失败」
+      // 告警文案按真实原因分支(元素超限)
       expect(sentRawTexts.length).toBe(1)
       expect(sentRawTexts[0]).toContain('换卡')
       expect(sentRawTexts[0]).toContain('仅日志可见')
+      expect(sentRawTexts[0]).toContain('元素超限')
+      expect(sentRawTexts[0]).toContain('300305')
       expect(sentRawTexts[0]).not.toContain('连续 5 次写入失败')
     } finally {
       session.stopFooterStatus(turn)
       await cardkit.dispose('card_dead')
+    }
+  })
+
+  test('give-up warning text branches for card size limit', async () => {
+    const session = new Session('probe-size', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-session-size')
+    const turn = turnState('card_size')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated('card_size', 1)
+    turn.failureRotateCount = 5
+
+    try {
+      session.onCardWriteFailure('card_size', 200860, { kind: 'api' })
+      expect(turn.rotateGivenUp).toBe(true)
+      expect(sentRawTexts.length).toBe(1)
+      expect(sentRawTexts[0]).toContain('卡片体积超限')
+      expect(sentRawTexts[0]).toContain('200860')
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose('card_size')
     }
   })
 })

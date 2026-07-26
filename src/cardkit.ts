@@ -20,6 +20,16 @@ import { log } from './log'
 const BASE = 'https://open.feishu.cn/open-apis/cardkit/v1'
 
 const ID_CONVERT_RETRY_DELAYS_MS = [0, 250, 750, 1500]
+/** Transient transport failures (TypeError: fetch failed / ECONNRESET / …)
+ * get a short retry burst inside the per-card queue before we surface them.
+ * These are NOT Feishu capacity signals — rotating cards cannot fix them,
+ * and counting them toward the mid-turn failure-rotate cap is what turned
+ * etmmo footer ticker blips into log-only turns (2026-07-25/26). */
+const NETWORK_RETRY_DELAYS_MS = [200, 500]
+/** Footer is a single stable element rewritten every second for the phase
+ * ticker. A failed footer tick must skip/degrade — never escalate to the
+ * card-level onFailure → mid-turn rotate path. */
+const FOOTER_ELEMENT_ID = 'footer'
 
 interface CardState {
   sequence: number
@@ -50,11 +60,31 @@ interface CardState {
   writeDead?: boolean
   /** Card-level write-failure callback, set by recordCardCreated. Invoked
    * by any cardkit write op that fails even after the streaming-closed
-   * reopen+retry; the session uses it to rotate onto a fresh card (see
-   * Session.onCardWriteFailure). Not fired for deletes (a failed delete is
-   * harmless — it doesn't block new content). */
-  onFailure?: (code?: number) => void
+   * reopen+retry (and network retries); the session uses it to decide
+   * whether to rotate (see Session.onCardWriteFailure). Not fired for
+   * deletes (a failed delete is harmless — it doesn't block new content)
+   * or for footer replaceElement (phase ticker must degrade in place, not
+   * burn mid-turn rotate budget). */
+  onFailure?: CardWriteFailureHandler
+  /** Fired after a successful addElement only. Session uses this to clear
+   * the failure-rotate streak once real content lands on the live card
+   * (footer ticks must not reset the streak — they run every second). */
+  onSuccess?: () => void
 }
+
+/** Why a cardkit write failed after local retries. `network` means no Feishu
+ * business code (fetch/TCP/DNS); session must not mid-turn-rotate on it.
+ * `api` is any Feishu cardkit business rejection (capacity, sequence, etc.). */
+export type CardWriteFailureKind = 'network' | 'api'
+
+export interface CardWriteFailureMeta {
+  kind: CardWriteFailureKind
+}
+
+/** Card-level / per-call failure callback. `code` is the Feishu business
+ * code when kind=api; undefined for pure network failures and short-circuits.
+ * Second arg is optional so older call sites (`code => ...`) keep working. */
+export type CardWriteFailureHandler = (code?: number, meta?: CardWriteFailureMeta) => void
 
 /** Feishu's element-ceiling rejection. `300315` wraps the inner
  * `300305 [element exceeds the limit]`; treat both as "card is full".
@@ -76,6 +106,15 @@ export function isCardSizeLimitCode(code?: number): boolean {
 /** Any "this card can't take more content" signal — element count or bytes. */
 export function isCardCapacityCode(code?: number): boolean {
   return isElementLimitCode(code) || isCardSizeLimitCode(code)
+}
+
+/** True when the failure has no Feishu business `code` — pure transport
+ * (TypeError: fetch failed, ECONNRESET, undici connect timeout, DNS, …).
+ * Feishu API rejections always attach a numeric `code` on the Error. */
+export function isNetworkError(e: unknown): boolean {
+  if (typeof e !== 'object' || e === null) return true
+  const code = (e as { code?: unknown }).code
+  return typeof code !== 'number'
 }
 
 const cards = new Map<string, CardState>()
@@ -108,15 +147,20 @@ function state(cardId: string): CardState {
  * kind). Without this, the element-count tracker only sees adds/deletes
  * that happen *after* card creation, and session can't reliably decide
  * "is this card close to the limit?" — that's the data point that
- * triggers a mid-turn rotate to dodge `code=300305/300315`. */
+ * triggers a mid-turn rotate to dodge `code=300305/300315`.
+ *
+ * `onSuccess` is optional: only real content writes (addElement) fire it;
+ * session uses it to clear the failure-rotate streak after recovery. */
 export function recordCardCreated(
   cardId: string,
   initialElementCount: number,
-  onFailure?: (code?: number) => void,
+  onFailure?: CardWriteFailureHandler,
+  onSuccess?: () => void,
 ): void {
   const s = state(cardId)
   s.elementCount = initialElementCount
   s.onFailure = onFailure
+  s.onSuccess = onSuccess
 }
 
 /** Read the live element count maintained by addElement/deleteElement.
@@ -195,51 +239,93 @@ async function reopenStreaming(cardId: string): Promise<void> {
   })
 }
 
-/** Run `op` inside the per-card queue. If it fails with code=300309
- * or 200850 (Feishu auto-closed / timed-out streaming after the 10-
- * minute TTL), reopen streaming inline and retry `op` exactly once.
- * Anything else — other failure, reopen failure, retry failure — is
- * logged and swallowed, matching the fire-and-forget contract every
- * cardkit op already has at the call sites. */
+function failureMetaFromError(e: unknown): CardWriteFailureMeta {
+  return { kind: isNetworkError(e) ? 'network' : 'api' }
+}
+
+function failureCodeFromError(e: unknown): number | undefined {
+  const code = (e as { code?: unknown } | null)?.code
+  return typeof code === 'number' ? code : undefined
+}
+
+/** Run `op`, retrying briefly on pure network transport failures. Returns
+ * only after success or a non-network error / exhausted retries. */
+async function withNetworkRetry(
+  cardId: string,
+  label: string,
+  op: () => Promise<void>,
+): Promise<void> {
+  let lastErr: unknown = null
+  for (let attempt = 0; attempt <= NETWORK_RETRY_DELAYS_MS.length; attempt++) {
+    try {
+      await op()
+      return
+    } catch (e) {
+      lastErr = e
+      if (!isNetworkError(e) || attempt === NETWORK_RETRY_DELAYS_MS.length) throw e
+      const delay = NETWORK_RETRY_DELAYS_MS[attempt] ?? 0
+      log(`cardkit ${label} ${cardId}: network error, retry ${attempt + 1}/${NETWORK_RETRY_DELAYS_MS.length} in ${delay}ms: ${e}`)
+      if (delay > 0) await sleep(delay)
+    }
+  }
+  throw lastErr
+}
+
+/** Run `op` inside the per-card queue. Network transport failures retry
+ * briefly first. If it then fails with code=300309 or 200850 (Feishu
+ * auto-closed / timed-out streaming after the 10-minute TTL), reopen
+ * streaming inline and retry `op` once more (with its own network
+ * retries). Anything else — other failure, reopen failure, retry
+ * failure — is logged and swallowed, matching the fire-and-forget
+ * contract every cardkit op already has at the call sites.
+ *
+ * `elevateCardFailure` false skips the card-level onFailure (footer
+ * ticks / deletes). Per-call onFailure still fires so callers can
+ * observe the miss. */
 async function withReopenOnStreamingClosed(
   cardId: string,
   label: string,
   op: () => Promise<void>,
-  onFailure?: (code?: number) => void,
-  silent = false,
+  onFailure?: CardWriteFailureHandler,
+  opts: { silent?: boolean; elevateCardFailure?: boolean } = {},
 ): Promise<void> {
+  const silent = opts.silent === true
+  const elevateCardFailure = opts.elevateCardFailure !== false
   // 失败统一出口:card-level handler 先(它同步快照当前段/tool 后再异步
   // 换卡),per-call onFailure 后(addElement 的 deadElements.add + session
   // 段游标 reset)。顺序要紧 —— 换卡的同步快照必须在 reset 把
-  // currentAssistant* 清空之前跑。silent(deleteElement)跳过 card-level:
-  // 删不掉一个元素不影响新内容,不值得为它换卡。
-  const fail = (code?: number): void => {
-    if (!silent) state(cardId).onFailure?.(code)
-    onFailure?.(code)
+  // currentAssistant* 清空之前跑。silent(deleteElement) 与
+  // elevateCardFailure=false(footer) 跳过 card-level:删不掉/tick 丢一次
+  // 都不该烧换卡额度。
+  const fail = (e: unknown): void => {
+    const code = failureCodeFromError(e)
+    const meta = failureMetaFromError(e)
+    if (!silent && elevateCardFailure) state(cardId).onFailure?.(code, meta)
+    onFailure?.(code, meta)
   }
   try {
-    await op()
+    await withNetworkRetry(cardId, label, op)
     return
   } catch (e) {
     if (!isStreamingClosed(e)) {
       log(`cardkit ${label} ${cardId}: ${e}`)
-      fail((e as any)?.code)
+      fail(e)
       return
     }
     log(`cardkit ${label} ${cardId}: streaming closed (code=${(e as any).code}) — reopening`)
   }
   try {
-    await reopenStreaming(cardId)
+    await withNetworkRetry(cardId, `${label} reopenStreaming`, () => reopenStreaming(cardId))
   } catch (re) {
     log(`cardkit STREAMING_REOPEN_FAILED ${cardId}: ${re}`)
-    fail((re as any)?.code)
+    fail(re)
     return
   }
   try {
-    await op()
+    await withNetworkRetry(cardId, `${label} retry-after-reopen`, op)
   } catch (e2) {
     log(`cardkit ${label} ${cardId} retry-after-reopen: ${e2}`)
-    fail((e2 as any)?.code)
+    fail(e2)
   }
 }
 
@@ -306,7 +392,7 @@ export function addElement(
   cardId: string,
   element: object,
   opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
-  onFailure?: (code?: number) => void,
+  onFailure?: CardWriteFailureHandler,
 ): Promise<void> {
   const s = state(cardId)
   if (s.writeDead) return Promise.resolve()
@@ -327,8 +413,10 @@ export function addElement(
       // bypass this line, so the count tracks "elements Feishu actually
       // accepted" not "elements we tried to push".
       s.elementCount += 1
+      // Real content landed — clear any prior failure-rotate streak.
+      s.onSuccess?.()
     },
-    (code) => {
+    (code, meta) => {
       // Add rejected ⇒ this element_id does not exist on Feishu's side.
       // Mark it dead so subsequent replace/delete aimed at it
       // short-circuit instead of spraying 300313/300121. Then forward the
@@ -337,7 +425,7 @@ export function addElement(
       // doesn't bump it, so it never reaches the rotate threshold on its
       // own).
       if (elementId) markElementDead(s, elementId)
-      onFailure?.(code)
+      onFailure?.(code, meta)
     },
   ))
   return s.queue
@@ -355,9 +443,13 @@ export function replaceElement(
   cardId: string,
   elementId: string,
   element: object,
-  onFailure?: (code?: number) => void,
+  onFailure?: CardWriteFailureHandler,
 ): Promise<void> {
   const s = state(cardId)
+  // Footer ticks must never escalate to card-level rotate. write-dead /
+  // dead-element short-circuits still report to per-call onFailure so
+  // terminal footer writers can fall back to raw text.
+  const elevateCardFailure = elementId !== FOOTER_ELEMENT_ID
   if (s.writeDead || s.deadElements.has(elementId)) {
     onFailure?.()
     return Promise.resolve()
@@ -377,6 +469,7 @@ export function replaceElement(
       })
     },
     onFailure,
+    { elevateCardFailure },
   ))
   return s.queue
 }
@@ -398,7 +491,7 @@ export function deleteElement(cardId: string, elementId: string): Promise<void> 
       markElementDead(s, elementId)
     },
     undefined,
-    true,
+    { silent: true },
   ))
   return s.queue
 }
@@ -455,7 +548,7 @@ export function cancelSummary(cardId: string): void {
 export function patchSettings(
   cardId: string,
   settings: object,
-  onFailure?: (code?: number) => void,
+  onFailure?: CardWriteFailureHandler,
 ): Promise<void> {
   const s = state(cardId)
   if (s.writeDead) {
@@ -468,14 +561,18 @@ export function patchSettings(
       return
     }
     try {
-      const seq = nextSeq(cardId)
-      await call('PATCH', `/cards/${cardId}/settings`, {
-        settings: JSON.stringify(settings),
-        sequence: seq,
+      // Settings patches still get network retries; they do not elevate to
+      // card-level rotate (streaming_off / summary are not capacity signals).
+      await withNetworkRetry(cardId, 'patchSettings', async () => {
+        const seq = nextSeq(cardId)
+        await call('PATCH', `/cards/${cardId}/settings`, {
+          settings: JSON.stringify(settings),
+          sequence: seq,
+        })
       })
     } catch (e) {
       log(`cardkit patchSettings ${cardId}: ${e}`)
-      onFailure?.((e as any)?.code)
+      onFailure?.(failureCodeFromError(e), failureMetaFromError(e))
     }
   })
   return s.queue
