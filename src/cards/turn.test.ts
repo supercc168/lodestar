@@ -29,7 +29,7 @@ describe('main conversation card rendering', () => {
 
     const ids = card.body.elements.map((el: any) => el.element_id).filter(Boolean)
     expect(ids).toEqual(['footer'])
-    expect(card.body.elements[0].content).toBe('Waiting...(0s)')
+    expect(card.body.elements[0].content).toBe('Waiting... (<30s)')
     expect(card.header).toBeUndefined()
     expect(JSON.stringify(card)).not.toContain('ticker')
   })

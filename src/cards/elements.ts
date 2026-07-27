@@ -10,11 +10,10 @@
  *   context_compact_<i> — collapsible context-compaction lifecycle panel.
  *                       item/started creates it; item/completed replaces it.
  *   assistant         — completed assistant answer segment
- *   footer            — runtime footer. While the model is silent it
- *                       shows `Thinking...(Ns)` while the model is silent,
- *                       `Writing...(Ns)` while assistant text is buffered,
- *                       `Working...(Ns)` while tools/non-text work run; at
- *                       turn close it becomes the terminal status line.
+ *   footer            — runtime footer. While active it shows a coarse
+ *                       elapsed bucket: `Thinking... (<30s)`,
+ *                       `Writing... (<1m)`, or `Working... (10m+)`; at turn
+ *                       close it becomes the terminal status line.
  */
 export const ELEMENTS = {
   userInput: 'user_input',

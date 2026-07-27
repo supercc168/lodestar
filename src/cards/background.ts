@@ -10,7 +10,7 @@
  * 卡片结构(每任务合一个 panel —— 标题写状态+时长,展开看详情):
  *   ┌ config.summary: "🧭 后台任务 · N 进行中·M 已结束"   ← 聊天列表预览
  *   │ [bg_<id> collapsible_panel]                          ← 每任务一个 panel
- *   │   header: "🟢 Explore · 搜索 — 🟡 运行中 47s"        ← 状态+时长 标题
+ *   │   header: "🟢 Explore · 搜索 — 🟡 运行中 (<1m)"      ← 状态+时长 标题
  *   │   └ [bg_body_<id>] 耗时/用量/任务/执行过程(steps)
  *   │ ...
  *
@@ -45,7 +45,7 @@ import type {
   BgTaskSettledEvent,
   BgTaskStatus,
 } from '../claude-agent-process'
-import { fmtElapsed } from './format'
+import { elapsedBucket, fmtElapsed } from './format'
 import { sanitizeMarkdownForCardKit } from './elements'
 
 export type { BgTaskStatus }
@@ -480,11 +480,11 @@ function terminalElapsed(t: BgTaskEntry): number {
   return 0
 }
 
-/** 标题里的状态+时长标签(折叠时常驻可见)。running 显示「已运行 Ns」,终态「用时/失败 Ns」。 */
+/** 标题里的状态+时长标签(折叠时常驻可见)。活跃态用粗粒度档位,终态保留精确耗时。 */
 function statusLabel(t: BgTaskEntry, now: number): string {
   switch (t.status) {
-    case 'running': return `🟡 运行中 ${fmtElapsed(now - t.startedAt)}`
-    case 'paused': return `⏸️ 已暂停 ${fmtElapsed(now - t.startedAt)}`
+    case 'running': return `🟡 运行中 (${elapsedBucket(now - t.startedAt).label})`
+    case 'paused': return `⏸️ 已暂停 (${elapsedBucket(now - t.startedAt).label})`
     case 'pending': return `⚪ 等待中`
     case 'completed': return `✅ 用时 ${fmtElapsed(terminalElapsed(t))}`
     case 'failed': return `❌ 失败 ${fmtElapsed(terminalElapsed(t))}`

@@ -1,5 +1,5 @@
 import { EventEmitter } from 'node:events'
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import {
   DEFAULT_CODEX_WATCHDOG,
   TurnWatchdog,
@@ -204,7 +204,7 @@ function strictExecResult(literal = 'ready'): string {
 
 let watchdogFixtureCount = 0
 
-const DETERMINISTIC_FOOTER_HANDLE = -1 as unknown as ReturnType<typeof setInterval>
+const DETERMINISTIC_FOOTER_HANDLE = -1 as unknown as ReturnType<typeof setTimeout>
 
 function setDeterministicFooterStatus(turn: any, label: string): void {
   turn.footerStatusHandle = DETERMINISTIC_FOOTER_HANDLE
@@ -5998,6 +5998,50 @@ describe('Session Codex watchdog structured activity and safety', () => {
 })
 
 describe('Session Codex watchdog warning and model guard', () => {
+  test('schedules footer and background refreshes at elapsed-bucket boundaries', () => {
+    const session = new Session('bucket-scheduling', 'chat_id') as any
+    const turn = turnState('card_bucket_scheduling')
+    const delays: number[] = []
+    const renderFooterStatus = session.renderFooterStatus
+    session.renderFooterStatus = () => {}
+    const timeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation((
+      (_callback: (...args: any[]) => void, delay?: number) => {
+        delays.push(Number(delay ?? 0))
+        return DETERMINISTIC_FOOTER_HANDLE
+      }
+    ) as typeof setTimeout)
+
+    try {
+      session.startThinkingFooter(turn)
+      expect(delays).toHaveLength(1)
+      expect(delays[0]).toBeGreaterThanOrEqual(29_900)
+      expect(delays[0]).toBeLessThanOrEqual(30_000)
+      session.stopFooterStatus(turn)
+
+      const now = Date.now()
+      session.backgroundCard = { messageId: 'msg_bucket', cardId: 'card_bucket' }
+      session.backgroundTasks = [{
+        id: 'old', type: 'shell', description: 'old', status: 'running',
+        startedAt: now - 300_001, steps: [],
+      }]
+      session.startBackgroundRefreshTick()
+      expect(delays.at(-1)).toBeGreaterThanOrEqual(299_000)
+
+      session.backgroundTasks.push({
+        id: 'new', type: 'shell', description: 'new', status: 'running',
+        startedAt: Date.now(), steps: [],
+      })
+      session.rescheduleBackgroundRefreshTick()
+      expect(delays.at(-1)).toBeGreaterThanOrEqual(29_900)
+      expect(delays.at(-1)).toBeLessThanOrEqual(30_000)
+    } finally {
+      session.stopFooterStatus(turn)
+      session.stopBackgroundRefreshTick()
+      session.renderFooterStatus = renderFooterStatus
+      timeoutSpy.mockRestore()
+    }
+  })
+
   test('renders footer status only while both its timer and label are active', async () => {
     const { session, turn } = wiredWatchdogSession()
     cardkit.recordCardCreated(turn.cardId, 1)
@@ -6052,7 +6096,7 @@ describe('Session Codex watchdog warning and model guard', () => {
         .filter(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
         .map(call => JSON.parse(call.body.element).content as string)
       expect(turn.footerStatusOverride).toBeNull()
-      expect(footerWrites.at(-1)).toContain('Writing...(0s)')
+      expect(footerWrites.at(-1)).toContain('Writing... (<30s)')
       expect(footerWrites.at(-1)).not.toContain('长时间无可见进展')
     } finally {
       session.stopFooterStatus(turn)
@@ -6592,8 +6636,8 @@ describe('Session assistant rendering', () => {
       const footerWrites = calls
         .filter(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
         .map(call => JSON.parse(call.body.element).content as string)
-      expect(footerWrites.some(content => content.startsWith('Writing...(0s)'))).toBe(true)
-      expect(footerWrites.some(content => content.startsWith('Working...(0s)'))).toBe(true)
+      expect(footerWrites.some(content => content.startsWith('Writing... (<30s)'))).toBe(true)
+      expect(footerWrites.some(content => content.startsWith('Working... (<30s)'))).toBe(true)
       expect(calls.some(call => call.path.endsWith('/content'))).toBe(false)
     } finally {
       session.stopFooterStatus(turn)
@@ -7929,8 +7973,8 @@ describe('Session usage cache cross-backend isolation', () => {
 
 describe('Session resetBackgroundTasks on kill/restart', () => {
   // 复现:SDK 子进程一死就不再发 task_settled,活跃 entry 永远卡 running,
-  // backgroundRefreshTick(setInterval,不归 SDK 管)还在每 tick 把「🟡 运行中
-  // Ns」时长往上推 —— 卡片永不沉降,伪造「还在跑」。kill(stop)/restart 必须
+  // backgroundRefreshTick(不归 SDK 管)还会继续跨档刷新「🟡 运行中」—— 卡片
+  // 永不沉降,伪造「还在跑」。kill(stop)/restart 必须
   // 主动结算。回归:2026-07-06。
   function makeRunningTask(id: string): any {
     return { id, type: 'shell', description: `bg ${id}`, status: 'running', startedAt: Date.now() - 5000, steps: [] }

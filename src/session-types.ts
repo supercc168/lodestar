@@ -101,7 +101,7 @@ export interface TurnState {
   startedAt: number
   /** Footer phase timer. `Thinking` is model silence, `Writing` is buffered
    * assistant text, and `Working` is tool execution / visible non-text work. */
-  footerStatusHandle: ReturnType<typeof setInterval> | null
+  footerStatusHandle: ReturnType<typeof setTimeout> | null
   footerStatusStartedAt: number
   footerStatusLabel: string | null
   /** Sticky watchdog footer copy. While set, ordinary phase timers must not

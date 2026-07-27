@@ -330,13 +330,14 @@ export function mainConversationCard(opts: MainCardOpts): object {
       // Initial body: [handoff banner?] + [userInput panel?] + footer.
       // Assistant segments and tool panels insert_before footer during
       // Codex events. The footer itself is the only live status element:
-      // `Thinking...(Ns)` while the model is silent, `Writing...(Ns)` while
-      // assistant text is buffered, `Working...(Ns)` while tools/non-text
-      // work are visible, and the terminal line when the turn ends.
+      // `Thinking... (<bucket>)` while the model is silent,
+      // `Writing... (<bucket>)` while assistant text is buffered,
+      // `Working... (<bucket>)` while tools/non-text work are visible, and
+      // the terminal line when the turn ends.
       elements: [
         ...banner,
         ...userInputPanel,
-        { tag: 'markdown', element_id: ELEMENTS.footer, content: opts.initialFooter ?? 'Waiting...(0s)' },
+        { tag: 'markdown', element_id: ELEMENTS.footer, content: opts.initialFooter ?? 'Waiting... (<30s)' },
       ],
     },
   }

@@ -25,6 +25,7 @@ import {
   type BgTaskEntry,
   type BgStore,
 } from './background'
+import { elapsedBucket } from './format'
 
 const mk = (over: Partial<BgTaskEntry> & Pick<BgTaskEntry, 'id' | 'status'>): BgTaskEntry => ({
   type: 'subagent',
@@ -32,6 +33,27 @@ const mk = (over: Partial<BgTaskEntry> & Pick<BgTaskEntry, 'id' | 'status'>): Bg
   startedAt: 0,
   steps: [],
   ...over,
+})
+
+describe('elapsedBucket', () => {
+  test('maps live elapsed time to stable labels and exact next boundaries', () => {
+    expect(elapsedBucket(-1)).toEqual({ label: '<30s', nextDelayMs: 30_000 })
+    expect(elapsedBucket(0)).toEqual({ label: '<30s', nextDelayMs: 30_000 })
+    expect(elapsedBucket(29_999)).toEqual({ label: '<30s', nextDelayMs: 1 })
+    expect(elapsedBucket(30_000)).toEqual({ label: '<1m', nextDelayMs: 30_000 })
+    expect(elapsedBucket(59_999)).toEqual({ label: '<1m', nextDelayMs: 1 })
+    expect(elapsedBucket(60_000)).toEqual({ label: '<3m', nextDelayMs: 120_000 })
+    expect(elapsedBucket(180_000)).toEqual({ label: '<5m', nextDelayMs: 120_000 })
+    expect(elapsedBucket(300_000)).toEqual({ label: '<10m', nextDelayMs: 300_000 })
+    expect(elapsedBucket(600_000)).toEqual({ label: '10m+', nextDelayMs: 600_000 })
+    expect(elapsedBucket(1_199_999)).toEqual({ label: '10m+', nextDelayMs: 1 })
+    expect(elapsedBucket(1_200_000)).toEqual({ label: '20m+', nextDelayMs: 600_000 })
+  })
+
+  test('normalizes non-finite input instead of producing a zero-delay timer loop', () => {
+    expect(elapsedBucket(Number.NaN)).toEqual({ label: '<30s', nextDelayMs: 30_000 })
+    expect(elapsedBucket(Number.POSITIVE_INFINITY)).toEqual({ label: '<30s', nextDelayMs: 30_000 })
+  })
 })
 
 describe('applyBgTaskStarted — 白名单直入 active / 前台落 pending', () => {
@@ -314,7 +336,7 @@ describe('backgroundLiveSummary — 聊天列表预览全文(建卡与刷新共�
 })
 
 describe('任务 panel —— 标题状态+时长,展开详情', () => {
-  test('running:header 写「责任人·描述 — 运行中 Ns」,时长随 now', () => {
+  test('running:header 写「责任人·描述 — 运行中 <档位>」,时长随 now', () => {
     const t = mk({ id: 't1', type: 'subagent', description: '搜索认证', status: 'running', startedAt: 0, subagentType: 'Explore' })
     const panel = backgroundTaskPanel(t, 45000) as any
     expect(panel.tag).toBe('collapsible_panel')
@@ -323,7 +345,7 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     expect(panel.header.title.content).toContain('Explore')
     expect(panel.header.title.content).toContain('搜索认证')
     expect(panel.header.title.content).toContain('运行中')
-    expect(panel.header.title.content).toContain('45s')
+    expect(panel.header.title.content).toContain('(<1m)')
   })
 
   test('completed:header 写「用时 Ns」(用 usage.duration_ms)', () => {

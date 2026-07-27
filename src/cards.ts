@@ -11,6 +11,7 @@
  */
 
 export { ELEMENTS, sanitizeMarkdownForCardKit } from './cards/elements'
+export { elapsedBucket } from './cards/format'
 export {
   type ThreadGoal,
   type TurnPlanStep,
