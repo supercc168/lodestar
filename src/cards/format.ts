@@ -10,6 +10,11 @@ export function fmtElapsed(ms: number): string {
   return `${h}h${m % 60}m`
 }
 
+/** 活跃 footer / 后台卡 header 的耗时展示模式。
+ *  - `bucket`: 粗档位 (`<30s`/`<1m`/…)，只在档位边界 push（默认，省飞书配额）
+ *  - `second`: 旧行为，按秒显示并每秒/每 2s push */
+export type LiveElapsedMode = 'bucket' | 'second'
+
 const LIVE_ELAPSED_BUCKETS = [
   { limitMs: 30_000, label: '<30s' },
   { limitMs: 60_000, label: '<1m' },
@@ -19,6 +24,11 @@ const LIVE_ELAPSED_BUCKETS = [
 ] as const
 
 const TEN_MINUTES_MS = 600_000
+
+/** second 模式下 footer 固定 1s tick；后台卡固定 2s（对齐旧 FOOTER_STATUS_TICK_MS /
+ *  BACKGROUND_REFRESH_TICK_MS，后台稍慢以少打一点 cardkit）。 */
+export const LIVE_ELAPSED_SECOND_FOOTER_TICK_MS = 1000
+export const LIVE_ELAPSED_SECOND_BACKGROUND_TICK_MS = 2000
 
 /**
  * Coarse elapsed label for live card status plus the delay until it changes.
@@ -38,4 +48,23 @@ export function elapsedBucket(elapsedMs: number): { label: string; nextDelayMs: 
     label: `${(completedSteps + 1) * 10}m+`,
     nextDelayMs: nextBoundary - ms,
   }
+}
+
+/**
+ * Live elapsed for footer / background headers.
+ * `bucket` → coarse label + delay to next boundary;
+ * `second` → `Ns` label + fixed 1s delay (callers may override for background).
+ */
+export function liveElapsed(
+  elapsedMs: number,
+  mode: LiveElapsedMode = 'bucket',
+): { label: string; nextDelayMs: number } {
+  if (mode === 'second') {
+    const ms = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs) : 0
+    return {
+      label: `${Math.floor(ms / 1000)}s`,
+      nextDelayMs: LIVE_ELAPSED_SECOND_FOOTER_TICK_MS,
+    }
+  }
+  return elapsedBucket(elapsedMs)
 }

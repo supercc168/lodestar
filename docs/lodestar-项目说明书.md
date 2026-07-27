@@ -206,6 +206,7 @@ app_secret = "xxxxxxxx"
 
 [runtime]
 projects_root = "~/"     # 项目根目录,可选,默认主目录
+# live_elapsed = "bucket"  # 活跃卡耗时: bucket(默认粗档位) | second(按秒,配额更费)
 ```
 写好后运行 `lodestar-daemon` 启动。(GLM / 其它配置见第八章。)
 
@@ -284,7 +285,7 @@ projects_root = "~/"     # 项目根目录,可选,默认主目录
 | 配置节 | 作用 |
 | --- | --- |
 | `[feishu]` | `app_id`、`app_secret`(**必填**) |
-| `[runtime]` | `projects_root` 项目根目录(默认主目录) |
+| `[runtime]` | `projects_root` 项目根目录(默认主目录);`live_elapsed` 活跃卡耗时展示(`bucket` 默认 / `second` 按秒) |
 | `[notify]` | HTTP 通知端点:`bind`(默认 `127.0.0.1`)、`port`(默认 `9876`) |
 | `[claude]` | `default_model` 新群默认档位、`bin` 自定义 claude 可执行文件等 |
 | `[claude.models.<名>]` | 第三方模型路由(如 GLM) |

@@ -329,7 +329,7 @@ const MAX_MIDTURN_ROTATES = 5
 const CLAUDE_STARTUP_GRACE_MS = 250
 
 function timedStatus(status: string, startedAt: number): string {
-  return `${status} (${cards.elapsedBucket(Date.now() - startedAt).label})`
+  return `${status} (${cards.liveElapsed(Date.now() - startedAt, config.runtime.live_elapsed).label})`
 }
 
 export class Session {
@@ -1431,7 +1431,7 @@ export class Session {
     let handle: ReturnType<typeof setTimeout> | null = null
     const scheduleNext = (): void => {
       if (stopped) return
-      const { nextDelayMs } = cards.elapsedBucket(Date.now() - startedAt)
+      const { nextDelayMs } = cards.liveElapsed(Date.now() - startedAt, config.runtime.live_elapsed)
       handle = setTimeout(() => {
         render()
         scheduleNext()
@@ -3503,7 +3503,7 @@ export class Session {
 
   private async openBackgroundCard(): Promise<void> {
     if (this.backgroundCard) return
-    const card = cards.backgroundLiveCard(this.backgroundTasks)
+    const card = cards.backgroundLiveCard(this.backgroundTasks, Date.now(), config.runtime.live_elapsed)
     const messageId = await feishu.sendCard(this.chatId, card)
     if (!messageId) {
       log(`session "${this.sessionName}": background card send failed`)
@@ -3524,20 +3524,22 @@ export class Session {
     this.startBackgroundRefreshTick()
   }
 
-  /** 在所有活跃任务最近的耗时档位边界刷新一次 header,然后继续调度下一档。
-   *  事件触发的节流刷新负责详情 diff;这个 timer 只补无 progress 事件时的档位变化。 */
+  /** 在所有活跃任务最近的耗时边界刷新一次 header,然后继续调度下一档。
+   *  bucket 模式:档位边界;second 模式:固定 2s。
+   *  事件触发的节流刷新负责详情 diff;这个 timer 只补无 progress 事件时的耗时变化。 */
   private startBackgroundRefreshTick(): void {
     if (this.backgroundRefreshTick) return
     const card = this.backgroundCard
     if (!card) return
+    const mode = config.runtime.live_elapsed
     const now = Date.now()
     let nextDelayMs = Infinity
     for (const task of this.backgroundTasks) {
       if (cards.isBgTerminal(task)) continue
-      nextDelayMs = Math.min(
-        nextDelayMs,
-        cards.elapsedBucket(now - task.startedAt).nextDelayMs,
-      )
+      const delay = mode === 'second'
+        ? cards.LIVE_ELAPSED_SECOND_BACKGROUND_TICK_MS
+        : cards.liveElapsed(now - task.startedAt, mode).nextDelayMs
+      nextDelayMs = Math.min(nextDelayMs, delay)
     }
     if (!Number.isFinite(nextDelayMs)) return
     this.backgroundRefreshTick = setTimeout(() => {
@@ -3577,12 +3579,13 @@ export class Session {
     const handle = this.backgroundCard
     if (!handle) return
     const now = Date.now()
+    const mode = config.runtime.live_elapsed
     for (const t of this.backgroundTasks) {
       if (!this.backgroundDetailAdded.has(t.id)) {
         this.backgroundDetailAdded.add(t.id)
-        void cardkit.addElement(handle.cardId, cards.backgroundTaskPanel(t, now))
+        void cardkit.addElement(handle.cardId, cards.backgroundTaskPanel(t, now, mode))
       } else {
-        void cardkit.replaceElement(handle.cardId, cards.BG_ELEMENTS.panel(t.id), cards.backgroundTaskPanel(t, now))
+        void cardkit.replaceElement(handle.cardId, cards.BG_ELEMENTS.panel(t.id), cards.backgroundTaskPanel(t, now, mode))
       }
     }
     cardkit.patchSummaryThrottled(handle.cardId, cards.backgroundLiveSummary(this.backgroundTasks))
@@ -5906,7 +5909,7 @@ export class Session {
    * instead of invoking Feishu's typewriter. */
   renderFooterStatus(turn: TurnState | null, now: number = Date.now()): void {
     if (!turn?.footerStatusHandle || !turn.footerStatusLabel) return
-    const elapsed = cards.elapsedBucket(now - turn.footerStatusStartedAt).label
+    const elapsed = cards.liveElapsed(now - turn.footerStatusStartedAt, config.runtime.live_elapsed).label
     const content = turn.footerStatusOverride ?? `${turn.footerStatusLabel} (${elapsed})`
     void this.replaceFooterContent(turn.cardId, this.withModel(content, turn)).catch(e => {
       log(`session "${this.sessionName}": footer status patch failed: ${messageOf(e)}`)
@@ -5926,7 +5929,7 @@ export class Session {
       turn.footerStatusLabel === status && turn.footerStatusStartedAt === startedAt
     const scheduleNext = (): void => {
       if (!isCurrent()) return
-      const { nextDelayMs } = cards.elapsedBucket(Date.now() - startedAt)
+      const { nextDelayMs } = cards.liveElapsed(Date.now() - startedAt, config.runtime.live_elapsed)
       turn.footerStatusHandle = setTimeout(() => {
         if (!isCurrent()) return
         this.renderFooterStatus(turn)

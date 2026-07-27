@@ -6042,6 +6042,56 @@ describe('Session Codex watchdog warning and model guard', () => {
     }
   })
 
+  test('second live_elapsed mode uses 1s footer and 2s background ticks', async () => {
+    const previous = config.runtime.live_elapsed
+    config.runtime.live_elapsed = 'second'
+    const session = new Session('second-scheduling', 'chat_id') as any
+    const turn = turnState('card_second_scheduling')
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const delays: number[] = []
+    const renderFooterStatus = session.renderFooterStatus
+    session.renderFooterStatus = () => {}
+    const timeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation((
+      (_callback: (...args: any[]) => void, delay?: number) => {
+        delays.push(Number(delay ?? 0))
+        return DETERMINISTIC_FOOTER_HANDLE
+      }
+    ) as typeof setTimeout)
+
+    try {
+      session.startThinkingFooter(turn)
+      expect(delays).toHaveLength(1)
+      expect(delays[0]).toBe(1000)
+      session.stopFooterStatus(turn)
+
+      session.backgroundCard = { messageId: 'msg_second', cardId: 'card_second' }
+      session.backgroundTasks = [{
+        id: 'bg', type: 'shell', description: 'bg', status: 'running',
+        startedAt: Date.now() - 300_001, steps: [],
+      }]
+      session.startBackgroundRefreshTick()
+      expect(delays.at(-1)).toBe(2000)
+
+      session.renderFooterStatus = renderFooterStatus
+      turn.footerStatusHandle = DETERMINISTIC_FOOTER_HANDLE
+      turn.footerStatusLabel = 'Writing...'
+      turn.footerStatusStartedAt = Date.now() - 45_000
+      session.renderFooterStatus(turn, turn.footerStatusStartedAt + 45_000)
+      await cardkit.flush(turn.cardId)
+      const footerWrites = calls
+        .filter(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+        .map(call => JSON.parse(call.body.element).content as string)
+      expect(footerWrites.at(-1)).toContain('Writing... (45s)')
+    } finally {
+      session.stopFooterStatus(turn)
+      session.stopBackgroundRefreshTick()
+      session.renderFooterStatus = renderFooterStatus
+      timeoutSpy.mockRestore()
+      config.runtime.live_elapsed = previous
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
   test('renders footer status only while both its timer and label are active', async () => {
     const { session, turn } = wiredWatchdogSession()
     cardkit.recordCardCreated(turn.cardId, 1)

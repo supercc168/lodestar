@@ -11,7 +11,13 @@
  */
 
 export { ELEMENTS, sanitizeMarkdownForCardKit } from './cards/elements'
-export { elapsedBucket } from './cards/format'
+export {
+  elapsedBucket,
+  liveElapsed,
+  LIVE_ELAPSED_SECOND_BACKGROUND_TICK_MS,
+  LIVE_ELAPSED_SECOND_FOOTER_TICK_MS,
+  type LiveElapsedMode,
+} from './cards/format'
 export {
   type ThreadGoal,
   type TurnPlanStep,

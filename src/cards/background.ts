@@ -45,7 +45,7 @@ import type {
   BgTaskSettledEvent,
   BgTaskStatus,
 } from '../claude-agent-process'
-import { elapsedBucket, fmtElapsed } from './format'
+import { fmtElapsed, liveElapsed, type LiveElapsedMode } from './format'
 import { sanitizeMarkdownForCardKit } from './elements'
 
 export type { BgTaskStatus }
@@ -480,11 +480,18 @@ function terminalElapsed(t: BgTaskEntry): number {
   return 0
 }
 
-/** 标题里的状态+时长标签(折叠时常驻可见)。活跃态用粗粒度档位,终态保留精确耗时。 */
-function statusLabel(t: BgTaskEntry, now: number): string {
+/** 标题里的状态+时长标签(折叠时常驻可见)。
+ *  活跃态按 liveElapsedMode 显示档位或秒数;终态保留精确耗时。 */
+function statusLabel(
+  t: BgTaskEntry,
+  now: number,
+  liveElapsedMode: LiveElapsedMode = 'bucket',
+): string {
+  const liveLabel = (elapsedMs: number): string =>
+    liveElapsed(elapsedMs, liveElapsedMode).label
   switch (t.status) {
-    case 'running': return `🟡 运行中 (${elapsedBucket(now - t.startedAt).label})`
-    case 'paused': return `⏸️ 已暂停 (${elapsedBucket(now - t.startedAt).label})`
+    case 'running': return `🟡 运行中 (${liveLabel(now - t.startedAt)})`
+    case 'paused': return `⏸️ 已暂停 (${liveLabel(now - t.startedAt)})`
     case 'pending': return `⚪ 等待中`
     case 'completed': return `✅ 用时 ${fmtElapsed(terminalElapsed(t))}`
     case 'failed': return `❌ 失败 ${fmtElapsed(terminalElapsed(t))}`
@@ -519,12 +526,22 @@ function renderDetailBody(t: BgTaskEntry): string {
 }
 
 /** 单任务的整 panel —— 标题写「图标 责任人·描述 — 状态·时长」,展开看详情 body。
- *  session 据此 addElement(新任务)/replaceElement(刷新,整个 panel)。 */
-export function backgroundTaskPanel(t: BgTaskEntry, now: number = Date.now()): object {
+ *  session 据此 addElement(新任务)/replaceElement(刷新,整个 panel)。
+ *  liveElapsedMode 只影响活跃态 header 时长文案;终态仍用精确 fmtElapsed。 */
+export function backgroundTaskPanel(
+  t: BgTaskEntry,
+  now: number = Date.now(),
+  liveElapsedMode: LiveElapsedMode = 'bucket',
+): object {
   return {
     tag: 'collapsible_panel',
     element_id: BG_ELEMENTS.panel(t.id),
-    header: { title: { tag: 'plain_text', content: `${TYPE_ICON[t.type]} ${ownerOf(t)}${t.resumed ? '(续跑)' : ''} · ${t.description || '(无描述)'} — ${statusLabel(t, now)}` } },
+    header: {
+      title: {
+        tag: 'plain_text',
+        content: `${TYPE_ICON[t.type]} ${ownerOf(t)}${t.resumed ? '(续跑)' : ''} · ${t.description || '(无描述)'} — ${statusLabel(t, now, liveElapsedMode)}`,
+      },
+    },
     expanded: false,
     elements: [{ tag: 'markdown', element_id: BG_ELEMENTS.body(t.id), content: renderDetailBody(t) }],
   }
@@ -532,7 +549,11 @@ export function backgroundTaskPanel(t: BgTaskEntry, now: number = Date.now()): o
 
 /** 活卡整张 JSON —— 首个后台任务到来时 sendCard 用。streaming 开。
  *  初始 body = 每任务一个 panel。 */
-export function backgroundLiveCard(tasks: BgTaskEntry[], now: number = Date.now()): object {
+export function backgroundLiveCard(
+  tasks: BgTaskEntry[],
+  now: number = Date.now(),
+  liveElapsedMode: LiveElapsedMode = 'bucket',
+): object {
   return {
     schema: '2.0',
     config: {
@@ -540,14 +561,18 @@ export function backgroundLiveCard(tasks: BgTaskEntry[], now: number = Date.now(
       summary: { content: backgroundLiveSummary(tasks) },
     },
     body: {
-      elements: tasks.map(t => backgroundTaskPanel(t, now)),
+      elements: tasks.map(t => backgroundTaskPanel(t, now, liveElapsedMode)),
     },
   }
 }
 
 /** 历史沉降卡 —— 用户发新消息且仍有活跃任务时,把旧卡 updateCard 成这个。
  *  只渲染终态任务,streaming 关。留在原地不再跟随。 */
-export function backgroundHistoryCard(tasks: BgTaskEntry[], now: number = Date.now()): object {
+export function backgroundHistoryCard(
+  tasks: BgTaskEntry[],
+  now: number = Date.now(),
+  liveElapsedMode: LiveElapsedMode = 'bucket',
+): object {
   const terminal = tasks.filter(isBgTerminal)
   return {
     schema: '2.0',
@@ -556,7 +581,7 @@ export function backgroundHistoryCard(tasks: BgTaskEntry[], now: number = Date.n
       summary: { content: `🧭 子agent(历史) · ${terminal.length} 已结束` },
     },
     body: {
-      elements: terminal.map(t => backgroundTaskPanel(t, now)),
+      elements: terminal.map(t => backgroundTaskPanel(t, now, liveElapsedMode)),
     },
   }
 }

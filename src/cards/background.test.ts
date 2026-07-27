@@ -25,7 +25,7 @@ import {
   type BgTaskEntry,
   type BgStore,
 } from './background'
-import { elapsedBucket } from './format'
+import { elapsedBucket, liveElapsed, LIVE_ELAPSED_SECOND_FOOTER_TICK_MS } from './format'
 
 const mk = (over: Partial<BgTaskEntry> & Pick<BgTaskEntry, 'id' | 'status'>): BgTaskEntry => ({
   type: 'subagent',
@@ -53,6 +53,20 @@ describe('elapsedBucket', () => {
   test('normalizes non-finite input instead of producing a zero-delay timer loop', () => {
     expect(elapsedBucket(Number.NaN)).toEqual({ label: '<30s', nextDelayMs: 30_000 })
     expect(elapsedBucket(Number.POSITIVE_INFINITY)).toEqual({ label: '<30s', nextDelayMs: 30_000 })
+  })
+})
+
+describe('liveElapsed', () => {
+  test('bucket mode delegates to elapsedBucket', () => {
+    expect(liveElapsed(45_000, 'bucket')).toEqual(elapsedBucket(45_000))
+    expect(liveElapsed(45_000)).toEqual(elapsedBucket(45_000))
+  })
+
+  test('second mode returns whole-second labels and a 1s tick', () => {
+    expect(liveElapsed(0, 'second')).toEqual({ label: '0s', nextDelayMs: LIVE_ELAPSED_SECOND_FOOTER_TICK_MS })
+    expect(liveElapsed(999, 'second')).toEqual({ label: '0s', nextDelayMs: 1000 })
+    expect(liveElapsed(1_500, 'second')).toEqual({ label: '1s', nextDelayMs: 1000 })
+    expect(liveElapsed(45_000, 'second')).toEqual({ label: '45s', nextDelayMs: 1000 })
   })
 })
 
@@ -346,6 +360,13 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     expect(panel.header.title.content).toContain('搜索认证')
     expect(panel.header.title.content).toContain('运行中')
     expect(panel.header.title.content).toContain('(<1m)')
+  })
+
+  test('running + second 模式:header 写精确秒数', () => {
+    const t = mk({ id: 't1', type: 'subagent', description: '搜索认证', status: 'running', startedAt: 0, subagentType: 'Explore' })
+    const panel = backgroundTaskPanel(t, 45000, 'second') as any
+    expect(panel.header.title.content).toContain('(45s)')
+    expect(panel.header.title.content).not.toContain('<1m')
   })
 
   test('completed:header 写「用时 Ns」(用 usage.duration_ms)', () => {

@@ -189,6 +189,41 @@ describe('Codex watchdog configuration', () => {
   })
 })
 
+describe('runtime live_elapsed', () => {
+  test('defaults to bucket when omitted', () => {
+    const result = loadFreshConfig()
+    expect(result.exitCode).toBe(0)
+    expect(result.stderr).toBe('')
+    expect(JSON.parse(result.stdout).runtime.live_elapsed).toBe('bucket')
+  })
+
+  test('accepts bucket and second values case-insensitively', () => {
+    const bucket = loadFreshConfig(`
+      [runtime]
+      live_elapsed = "Bucket"
+    `)
+    expect(bucket.exitCode).toBe(0)
+    expect(JSON.parse(bucket.stdout).runtime.live_elapsed).toBe('bucket')
+
+    const second = loadFreshConfig(`
+      [runtime]
+      live_elapsed = "SECOND"
+    `)
+    expect(second.exitCode).toBe(0)
+    expect(JSON.parse(second.stdout).runtime.live_elapsed).toBe('second')
+  })
+
+  test('rejects unknown live_elapsed values', () => {
+    const result = loadFreshConfig(`
+      [runtime]
+      live_elapsed = "realtime"
+    `)
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('[runtime].live_elapsed')
+    expect(result.stderr).toContain('realtime')
+  })
+})
+
 describe('configured project paths', () => {
   test('resolves relative projects_root and project cwd values to absolute paths', () => {
     const root = mkdtempSync(join(tmpdir(), 'lodestar-config-paths-'))

@@ -14,7 +14,7 @@
 | `tool.ts` | 工具折叠面板、权限按钮、Read 批次面板，以及 Bash/FileChange/WebSearch/MCP/Image/Agent 等工具输入/输出摘要。 |
 | `task-board.ts` | Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板。codex 的 TodoWrite 一次就带完整列表,但 Claude Code 拆成 4 个单点工具,这里维护一份以 task id 为 key 的 board(`applyTaskTool` 跨调用累积),`taskBoardElement` 渲染整个板产出与 codex 一致的列表效果。board 由 `session-tools.ts` 在 Session 级持有。 |
 | `agy.ts` | `agy <prompt>` 任务卡片，渲染 prompt、状态统计、执行结果、仓库变更和转发 Codex 按钮。 |
-| `format.ts` | 共享时长格式化：终态用 `fmtElapsed`(ms → `45s`/`2m13s`/`1h5m`)；活跃卡用 `elapsedBucket` 返回粗粒度档位及下一边界延迟，避免秒级 push。 |
+| `format.ts` | 共享时长格式化：终态用 `fmtElapsed`(ms → `45s`/`2m13s`/`1h5m`)；活跃卡用 `liveElapsed(ms, mode)` / `elapsedBucket` 返回标签与下一刷新延迟。`mode` 来自 config `[runtime].live_elapsed`：`bucket`(默认粗档位) 或 `second`(按秒)。 |
 | `automation.ts` | 任务清单自动化「工作室成员」运行的累积视图(`AutomationBurst`)+ 状态卡渲染(每运行一个折叠 panel),纯层;I/O 生命周期在 `src/tasklist-cards.ts`。 |
 | `console.ts` | `hi` 控制台、状态卡、菜单卡、模型/effort 选择卡、额度/主机信息格式化和关闭 streaming 设置。 |
 | `worktree.ts` | `wt` 列表卡和创建/加入提示卡，展示 `work/*` 分支状态、归档摘要并提供常驻删除按钮。 |
@@ -47,7 +47,7 @@
 - `agy.ts` 卡片风格要和既有卡片一致：prompt 折叠标题固定为 `📥 agy收到`，状态保持单行，结果正文不折叠，转发按钮放在结果后，按钮文案尽量短。
 - `task.ts` 只渲染清单绑定状态和按钮 action，不读取飞书任务内容，也不发起 API；分组状态缺失必须显示 `MISS`，不要用静默成功文案遮盖问题。
 - Feishu 对空 markdown、元素数量和 streaming TTL 都比较敏感；模板变更要和 `cardkit.ts` 的空内容过滤、元素计数和关闭 streaming 设置配合。
-- 活跃 footer / 后台任务 header 的耗时必须使用 `elapsedBucket`，只在档位边界调度更新；终态总耗时才使用 `fmtElapsed`，不要恢复每秒 `setInterval`。
+- 活跃 footer / 后台任务 header 的耗时经 `liveElapsed`/`elapsedBucket` 与 config `[runtime].live_elapsed` 决定：默认 `bucket` 只在档位边界调度；`second` 可恢复按秒展示(footer 1s / 后台 2s)。终态总耗时才使用 `fmtElapsed`。不要在默认路径恢复无开关的每秒 `setInterval`。
 
 ### Testing Requirements
 - 修改 `turn.ts` 或 `console.ts` 后运行 `bun test src/cards/turn.test.ts`。
