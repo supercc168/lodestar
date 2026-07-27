@@ -98,4 +98,45 @@ describe('host askusr markers', () => {
     expect(stripAskUsrMarkers(text, '_ASK_')).toContain('_ASK_')
     expect(stripAskUsrMarkers(text, '_ASK_')).not.toContain('[[askusr:')
   })
+
+  test('tolerates an extra root closing brace before marker brackets', () => {
+    // 模型常输出 `[[askusr: {...}}]`（root 后再多一个 }），旧扫描会在合法
+    // object 结束后看到 `}` 而不是 `]`，整段匹配失败 → 飞书不弹选项卡。
+    const good = 'before [[askusr: {"questions":[{"question":"Pick?","options":["A","B"]}]}]] after'
+    const extraBraceOne = 'before [[askusr: {"questions":[{"question":"Pick?","options":["A","B"]}]}}] after'
+    const extraBraceTwo = 'before [[askusr: {"questions":[{"question":"Pick?","options":["A","B"]}]}}]] after'
+
+    for (const text of [good, extraBraceOne, extraBraceTwo]) {
+      const markers = extractAskUsrMarkers(text)
+      expect(markers).toHaveLength(1)
+      expect(markers[0]?.payload).toBe('{"questions":[{"question":"Pick?","options":["A","B"]}]}')
+      expect(JSON.parse(markers[0]!.payload)).toEqual({
+        questions: [{ question: 'Pick?', options: ['A', 'B'] }],
+      })
+      expect(stripAskUsrMarkers(text, '[ASK]')).toBe('before [ASK] after')
+    }
+  })
+
+  test('accepts the real-world extra-brace single-question payload', () => {
+    // 用户在飞书里贴出的真实坏 marker：root 多一个 }，且只关一层 ]
+    const text = '[[askusr: {"questions":[{"question":"当前 main 已与 origin/main 一致；upstream/main 有 8 个独有提交（0.12.5 升至 0.12.9），合并预检有 13 处冲突，且当前工作树有 3 处本地改动。请选择下一步：","options":["仅保留当前 origin/main，并输出完整上游变更报告","在独立 worktree 合并 upstream/main 并验证，当前工作树不动","直接在当前工程合并并处理冲突，先妥善保留本地改动"]}]}}]'
+
+    const markers = extractAskUsrMarkers(text)
+    expect(markers).toHaveLength(1)
+    const payload = JSON.parse(markers[0]!.payload) as {
+      questions: Array<{ question: string; options: string[] }>
+    }
+    expect(payload.questions).toHaveLength(1)
+    expect(payload.questions[0]?.options).toHaveLength(3)
+    expect(stripAskUsrMarkers(text, '_ASK_')).toBe('_ASK_')
+  })
+
+  test('does not swallow a following send marker when extra braces appear', () => {
+    const text = '[[askusr: {"questions":[{"question":"Pick?","options":["A","B"]}]}}]] [[send: /tmp/x.png]]'
+    const markers = extractAskUsrMarkers(text)
+    expect(markers).toHaveLength(1)
+    expect(markers[0]?.payload).toBe('{"questions":[{"question":"Pick?","options":["A","B"]}]}')
+    expect(extractSendMarkerPaths(text)).toEqual(['/tmp/x.png'])
+    expect(stripAskUsrMarkers(text, '')).toBe(' [[send: /tmp/x.png]]')
+  })
 })

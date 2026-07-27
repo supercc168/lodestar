@@ -1,6 +1,6 @@
 const SEND_MARKER_RE = /\[\[send:[ \t]*([^\n]*?)[ \t]*\]\]/g
 /** 只锚定 askusr 前缀；payload 用括号平衡扫描，避免选项文本里的 `]`/`]]`
- *  或模型少写一个闭合 `]` 时整段匹配失败。 */
+ *  或模型少写一个闭合 `]`、多写一个 `}` 时整段匹配失败。 */
 const ASKUSR_OPEN_RE = /\[\[askusr:[ \t]*/g
 
 export function extractSendMarkerPaths(text: string): string[] {
@@ -61,6 +61,22 @@ function scanJsonObjectEnd(text: string, start: number): number {
   return -1
 }
 
+function skipSpaces(text: string, start: number): number {
+  let i = start
+  while (i < text.length && (text[i] === ' ' || text[i] === '\t')) i++
+  return i
+}
+
+/** 模型常在 root object 后再多写一个 `}`（如 `...}}]`）。合法 JSON 已在
+ *  `jsonEnd` 闭合，这里只吞掉其后多余的 `}`，payload 仍取平衡扫描结果。 */
+function skipExtraRootClosers(text: string, start: number): number {
+  let i = skipSpaces(text, start)
+  while (i < text.length && text[i] === '}') {
+    i = skipSpaces(text, i + 1)
+  }
+  return i
+}
+
 function extractAskUsrMarkerSpans(text: string): AskUsrMarkerSpan[] {
   const markers: AskUsrMarkerSpan[] = []
   ASKUSR_OPEN_RE.lastIndex = 0
@@ -68,7 +84,7 @@ function extractAskUsrMarkerSpans(text: string): AskUsrMarkerSpan[] {
   while ((match = ASKUSR_OPEN_RE.exec(text)) !== null) {
     const openStart = match.index
     let i = openStart + match[0].length
-    while (i < text.length && (text[i] === ' ' || text[i] === '\t')) i++
+    i = skipSpaces(text, i)
     if (text[i] !== '{') {
       // 让下一次搜索从当前前缀之后继续，避免零宽死循环
       ASKUSR_OPEN_RE.lastIndex = openStart + 2
@@ -79,10 +95,9 @@ function extractAskUsrMarkerSpans(text: string): AskUsrMarkerSpan[] {
       ASKUSR_OPEN_RE.lastIndex = openStart + 2
       continue
     }
-    let j = jsonEnd
-    while (j < text.length && (text[j] === ' ' || text[j] === '\t')) j++
-    // 规范是 `]]`；模型偶尔少写一个 `]`。至少吃掉一个 `]` 才认定完整，
-    // 避免 JSON 刚闭合、`]` 还在后续 delta 时过早触发。
+    // 规范是 `]]`；模型偶尔少写一个 `]`，或 root 后再多一个 `}`。
+    // 至少吃掉一个 `]` 才认定完整，避免 JSON 刚闭合、`]` 还在后续 delta 时过早触发。
+    let j = skipExtraRootClosers(text, jsonEnd)
     let brackets = 0
     while (brackets < 2 && j < text.length && text[j] === ']') {
       j++

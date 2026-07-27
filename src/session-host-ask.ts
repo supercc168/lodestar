@@ -77,18 +77,58 @@ function formatHostAskInput(questions: cards.AskQuestion[]): string {
   })
 }
 
-function parseHostAskPayload(payloadText: string): { questions: cards.AskQuestion[]; inputJson: string } | null {
-  let raw: unknown
+/** 模型偶发尾逗号（`{"a":1,}` / `["x",]`）。先严格 parse，失败再剥尾逗号重试。 */
+function tryParseAskUsrJson(payloadText: string): { value: unknown } | { error: unknown } {
   try {
-    raw = JSON.parse(payloadText)
-  } catch (e) {
-    log(`host ask: invalid askusr JSON: ${e}`)
+    return { value: JSON.parse(payloadText) }
+  } catch (firstError) {
+    const repaired = payloadText.replace(/,\s*([}\]])/g, '$1')
+    if (repaired !== payloadText) {
+      try {
+        return { value: JSON.parse(repaired) }
+      } catch (secondError) {
+        return { error: secondError }
+      }
+    }
+    return { error: firstError }
+  }
+}
+
+function collectHostAskQuestions(raw: unknown): cards.AskQuestion[] {
+  if (!raw || typeof raw !== 'object') return []
+  const obj = raw as {
+    questions?: unknown
+    question?: unknown
+  }
+  // 规范：{ questions: [ {question, options}, ... ] }
+  if (Array.isArray(obj.questions)) {
+    return obj.questions
+      .map(normalizeAskQuestion)
+      .filter((q): q is cards.AskQuestion => q != null)
+  }
+  // 兼容：questions 误写成单个对象
+  if (obj.questions && typeof obj.questions === 'object') {
+    const one = normalizeAskQuestion(obj.questions)
+    return one ? [one] : []
+  }
+  // 兼容：顶层就是单题 { question, options }（无 questions 包装）
+  if (typeof obj.question === 'string') {
+    const one = normalizeAskQuestion(obj)
+    return one ? [one] : []
+  }
+  return []
+}
+
+/** 解析 askusr payload；导出供单测覆盖兼容形态。 */
+export function parseHostAskPayload(payloadText: string): { questions: cards.AskQuestion[]; inputJson: string } | null {
+  const parsed = tryParseAskUsrJson(payloadText)
+  if ('error' in parsed) {
+    log(`host ask: invalid askusr JSON: ${parsed.error}`)
     return null
   }
+  const raw = parsed.value
   if (!raw || typeof raw !== 'object') return null
-  const questions = Array.isArray((raw as { questions?: unknown[] }).questions)
-    ? (raw as { questions: unknown[] }).questions.map(normalizeAskQuestion).filter((q): q is cards.AskQuestion => q != null)
-    : []
+  const questions = collectHostAskQuestions(raw)
   if (questions.length === 0) return null
   return { questions, inputJson: formatHostAskInput(questions) }
 }
