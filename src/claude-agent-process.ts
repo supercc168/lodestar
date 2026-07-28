@@ -27,7 +27,7 @@ import {
   claudeModelKey,
   resolveClaudeSdkModel,
 } from './claude-models'
-import { resolveClaudeSpawnEnv, resolveTokenSource } from './token-source'
+import { resolveTokenSource } from './token-source'
 import type {
   CanUseToolRequest,
   CodexModel,
@@ -782,19 +782,26 @@ export class ClaudeAgentProcess extends EventEmitter {
    * 注意:此 scrub 只作用于 spawn 进程的 env;若 ~/.claude/settings.json 的
    * env 块里配了 ANTHROPIC_BASE_URL/AUTH_TOKEN,Claude Code 仍会加载它 ——
    * 故第三方路由请一律走 [claude.models.*],不要写进 settings.json。 */
-  private buildSpawnEnv(): Record<string, string> {
-    const base: Record<string, string> = {
+  private buildSpawnBaseEnv(): Record<string, string> {
+    return {
       ...(process.env as Record<string, string>),
       PATH: buildClaudeSpawnPath(),
       ...config.claude.env,
     }
-    return resolveClaudeSpawnEnv(this.opts.model, base)
+  }
+
+  private buildSpawnEnv(): Record<string, string> {
+    return resolveTokenSource('claude', this.opts.model).spawnEnv(this.buildSpawnBaseEnv())
   }
 
   sendInitialize(): void {
     if (this.started) return
     this.started = true
-    const model = resolveClaudeSdkModel(this.opts.model)
+    // Resolve model, route, credentials, and aliases from the same Feishu
+    // selection. This prevents a future profile change from sending one model
+    // id while injecting another profile's route or tier aliases.
+    const tokenSource = resolveTokenSource('claude', this.opts.model)
+    const model = tokenSource.resolveSpawnModel()
     const profile = this.opts.profile
     if (profile) {
       log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? true}`)
@@ -810,13 +817,13 @@ export class ClaudeAgentProcess extends EventEmitter {
       // resolveClaudeExecutableConfig 在 [claude].bin 配错路径时同步抛出;
       // 必须在 try 内调用,确保错误走 error/exit 事件而非穿透到调用方。
       // api 判定走 TokenSource(与 claudeModelIsApiRoute 同源 profile)。
-      const isApiRoute = resolveTokenSource('claude', this.opts.model).isApiRoute()
+      const isApiRoute = tokenSource.isApiRoute()
       // 第三方 API 路由(GLM)绕开 reclaude 包装器,直连第三方端点;官方登录
       // 档位由 reclaude custom spawn 包住 SDK native binary,兼顾代理与 dialog。
       const executable = resolveClaudeExecutableConfig({ apiRoute: isApiRoute })
-      const spawnEnv = this.buildSpawnEnv()
+      const spawnEnv = tokenSource.spawnEnv(this.buildSpawnBaseEnv())
       const routeLabel = isApiRoute ? 'api' : 'login'
-      log(`claude-agent-process: spawn SDK query model=${model ?? 'default'} effort=${this.opts.effort} route=${routeLabel} cwd=${this.opts.workDir} settingSources=${settingSources.join('+')} executable=${executable.description}`)
+      log(`claude-agent-process: spawn SDK query selection=${tokenSource.selectionModel} model=${model ?? 'default'} effort=${this.opts.effort} route=${routeLabel} cwd=${this.opts.workDir} settingSources=${settingSources.join('+')} executable=${executable.description}`)
       this.query = query({
         prompt: this.input,
         options: {

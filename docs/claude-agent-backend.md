@@ -60,6 +60,8 @@ effort     = "xhigh"
 
 SDK `model`:官方档位直传 `claude-fable-5` / `claude-opus-5`;第三方档位把 profile 的上游 id 交给 SDK native 入口,配套 `[claude.models.*]` 注入的 `ANTHROPIC_BASE_URL` 打到对应 Anthropic 兼容端点。reclaude 只负责官方登录档位的代理/证书注入,不再替代 SDK transport。早期把 `ANTHROPIC_DEFAULT_*_MODEL` 写入全局 settings/env 的做法已废弃:启动 env 会先清掉 Fable/Opus/Sonnet/Haiku 四个 alias,随后按飞书选定主力(第一方)或当前第三方 profile 重新注入。
 
+第三方 Claude API 档位可用 `bun scripts/claude-stream-probe.ts claude:<slug>` 做隔离兼容性检查。探针不会发送飞书消息或复用生产 session；它核对飞书选择对应的 profile model 是否原样进入 SDK init，并验证原始 SSE content-block 顺序、强制 tool choice、thinking/text/tool-use/tool-result 全链路。探针非零退出表示端点不满足 Claude Agent 工作流，Lodestar 不得静默改用其它模型。
+
 ## Claude Event Mapping
 `ClaudeAgentProcess` 把 SDK message 映射为现有 Session 已会处理的事件：
 

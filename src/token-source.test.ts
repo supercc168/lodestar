@@ -121,6 +121,40 @@ describe('token-source Claude login vs api', () => {
   })
 })
 
+describe('token-source Feishu selected Claude API model', () => {
+  let prevGrokcc: unknown
+
+  beforeEach(() => {
+    prevGrokcc = config.claude.models.grokcc
+    ;(config.claude as any).models.grokcc = {
+      model: 'grok-selected-by-feishu',
+      base_url: 'https://grokcc.example',
+      auth_token: 'grokcc-token',
+      effort: 'xhigh',
+    }
+  })
+
+  afterEach(() => {
+    ;(config.claude as any).models.grokcc = prevGrokcc
+  })
+
+  test('grokcc selection keeps the profile model for SDK and every child-model alias', () => {
+    const source = resolveTokenSource('claude', 'claude:grokcc')
+    expect(source.selectionModel).toBe('claude:grokcc')
+    expect(source.resolveSpawnModel()).toBe('grok-selected-by-feishu')
+
+    const env = source.spawnEnv({
+      ANTHROPIC_DEFAULT_OPUS_MODEL: 'stale-model',
+    })
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://grokcc.example')
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('grokcc-token')
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('grok-selected-by-feishu')
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('grok-selected-by-feishu')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('grok-selected-by-feishu')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('grok-selected-by-feishu')
+  })
+})
+
 describe('token-source Codex login vs api', () => {
   let prevModels: unknown
 
