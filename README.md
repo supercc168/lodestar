@@ -35,6 +35,22 @@ effort     = "xhigh"           # 复刻 GLM-5.2 最高思维
 
 `base_url` + `auth_token` 只注入 GLM 档位,Fable 5 / Opus 登录档位保持干净、绝不带 token。其它第三方路由照 `[claude.models.<名>]` 加即可。
 
+**Grok 档位怎么配**:Grok 只走 Claude Agent SDK，不走 Codex。无痕与 CatCodex 分别配置成两个 Claude API 档位：
+
+```toml
+[claude.models.grok]
+base_url   = "https://api.wuhen-ai.com"
+auth_token = "<你的 Wuhen token>"
+model      = "grok-4.5"
+
+[claude.models.grokcc]
+base_url   = "https://catcodexapi.com" # Claude SDK 使用根地址，不追加 /v1
+auth_token = "<你的 CatCodex token>"
+model      = "grok-4.5"
+```
+
+Grok 兼容档会省略 SDK `effort` 并禁用 thinking，降低 Anthropic Messages 兼容层的 content-block/tool-call 波动；上游若仍返回 `Content block not found`，错误会原样显示，不会静默切到其它模型。旧 `[codex.models.grok*]` 不再进入模型面板，启动边界也会拒绝。
+
 **1. 装包**
 
 ```bash

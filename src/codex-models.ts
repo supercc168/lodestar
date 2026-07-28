@@ -37,10 +37,6 @@ export function codexEnvKeyName(slug: string): string {
 }
 
 function wireApiOf(raw: CodexModelConfig): string {
-  // Grok 的 Chat Completions/Anthropic 兼容层实测不会可靠执行 Codex 工具；
-  // Responses 才能返回 function_call。与 effort=max 一样在 profile 边界锁死，
-  // 避免手改 config 后重新出现 Content block/tool call 故障。
-  if (/^grok(?:[-_.]|$)/i.test(raw.model?.trim() ?? '')) return 'responses'
   const w = raw.wire_api?.trim()
   return w === 'responses' || w === 'chat' ? w : DEFAULT_WIRE_API
 }
@@ -142,15 +138,20 @@ export function codexModelConfigured(model: string | null | undefined): boolean 
   return p ? p.configured : true
 }
 
+/** Grok is a Claude Agent SDK-only route in Lodestar. Match the configured
+ * upstream model id first and the selection/slug second so legacy
+ * `codex:grok*` values are caught even after their config section is removed. */
+export function codexModelIsGrok(model: string | null | undefined): boolean {
+  if (!model) return false
+  const profile = codexModelProfile(model)
+  const candidate = profile?.modelId || model.replace(/^codex:/i, '')
+  return /^grok(?:cc)?(?:[-_.]|$)/i.test(candidate.trim())
+}
+
 /** 该档位 config 声明的 effort(仅 API 路由);非法/未配 → undefined。 */
 export function codexModelEffort(model: string | null | undefined): CodexReasoningEffort | undefined {
   const p = codexModelProfile(model)
   if (!p || p.route !== 'api') return undefined
-  // Wuhen grok-4.5 在 Codex Responses 下用 xhigh 会把 function arguments
-  // 拼成 `{}{...}`，app-server 因 trailing characters 无法执行工具；max 实测
-  // 能稳定产出合法 JSON。Grok coding 档位因此在路由边界锁 max，避免配置漂移
-  // 重新引入“只回复、不执行工具”。
-  if (/^grok(?:[-_.]|$)/i.test(p.modelId)) return 'max'
   const raw = config.codex.models[p.name]?.effort?.trim()
   return raw && isCodexReasoningEffort(raw) ? raw : undefined
 }
@@ -170,6 +171,9 @@ export function codexSpawnOverrides(model: string | null | undefined): {
   configArgs: string[]
   env: Record<string, string>
 } {
+  if (codexModelIsGrok(model)) {
+    throw new Error(`Grok 模型 ${model ?? ''} 只允许通过 [claude.models.*] 和 Claude Agent SDK 启动`)
+  }
   const p = codexModelProfile(model)
   if (!p || p.route === 'login') {
     return { modelId: resolveCodexModelId(model), configArgs: [], env: {} }
@@ -186,7 +190,7 @@ export function codexModelChoices(): Array<{
   effort: CodexReasoningEffort
 }> {
   return codexModelProfiles()
-    .filter(p => p.route === 'api')
+    .filter(p => p.route === 'api' && !codexModelIsGrok(p.key))
     .map(p => ({
       provider: 'codex' as const,
       model: p.key,

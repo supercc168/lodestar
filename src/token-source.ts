@@ -32,6 +32,7 @@ import {
 } from './claude-models'
 import {
   codexModelConfigured,
+  codexModelIsGrok,
   codexModelProfile,
   codexModelProfiles,
   codexSpawnOverrides,
@@ -197,6 +198,9 @@ export function resolveTokenSource(
     if (profile) return claudeSourceFromProfile(profile)
     return claudeFallbackSource(model)
   }
+  if (codexModelIsGrok(model)) {
+    throw new Error(`Grok 模型 ${model ?? ''} 必须使用 Claude provider`)
+  }
   const profile = codexModelProfile(model)
   if (profile) return codexSourceFromProfile(profile)
   return codexLoginSource(model)
@@ -205,7 +209,9 @@ export function resolveTokenSource(
 /** 当前配置下全部已知 source(claude 全 profiles + codex api profiles + 内建 login sol)。 */
 export function listTokenSources(): TokenSource[] {
   const claude = claudeModelProfiles().map(claudeSourceFromProfile)
-  const codexApi = codexModelProfiles().map(codexSourceFromProfile)
+  const codexApi = codexModelProfiles()
+    .filter(profile => !codexModelIsGrok(profile.key))
+    .map(codexSourceFromProfile)
   const sol = codexLoginSource('gpt-5.6-sol')
   // sol 与可能的 codex:gpt-5.6-sol 去重
   const seen = new Set<string>()

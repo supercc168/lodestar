@@ -249,11 +249,12 @@ projects_root = "~/"     # 项目根目录,可选,默认主目录
 | **Claude · Fable 5** | 走你的 Anthropic 登录态 |
 | **Claude · Opus 5** | 走你的 Anthropic 登录态,能力最强 |
 | **Claude · GLM** | GLM-5.2,**1M 超长上下文、中文友好**(需配 GLM key) |
-| **Codex · Grok 4.5** | Grok 第三方 Responses 路由(需配置 Wuhen token),工具调用锁 `max` |
+| **Claude · Grok 4.5 · 无痕** | Wuhen Anthropic Messages 路由(需配置 token),由 Claude Agent SDK 调用 |
+| **Claude · Grok 4.5 · CatCodex** | CatCodex Anthropic Messages 路由(需配置 token),由 Claude Agent SDK 调用 |
 | **Codex · GPT-5.6 Sol** | OpenAI Codex(需登录 ChatGPT),`max` 推理强度 |
 
 ![图 7.3 model 模型切换面板](images/feishu/7.3-model-panel.png)
-> 📷 **待补图 7.3** ｜ 截图内容:群里发 `model` 弹出的模型选择卡片,展示 Fable 5 / Opus 5 / GLM / Codex Grok / GPT-5.6 Sol 档位和"选"按钮。
+> 📷 **待补图 7.3** ｜ 截图内容:群里发 `model` 弹出的模型选择卡片,展示 Fable 5 / Opus 5 / GLM / Claude Grok 无痕 / Claude Grok CatCodex / GPT-5.6 Sol 档位和"选"按钮。
 
 > 订阅了 GLM Coding Plan 的话强烈推荐 **Claude·GLM** 档位:长会话不易丢前文,在 GLM 档位上 `hi` 控制台还会显示套餐额度和用量。
 

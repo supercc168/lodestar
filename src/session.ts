@@ -616,8 +616,8 @@ export class Session {
     this.selectedProvider = selection?.provider ?? 'claude'
     this.selectedModel = selection?.model ?? null
     this.selectedEffort = selection?.effort ?? null
-    // 历史持久化的选择归一到当前固定选项集；旧 Claude Grok 在显式配置了
-    // codex:grok 时迁到 Responses 后端。仅在有持久化选择时归一；无选择
+    // 历史持久化的选择归一到当前固定选项集；旧 codex:grok/grokcc 迁到
+    // 对应 Claude Agent SDK 档位。仅在有持久化选择时归一；无选择
     // (默认)保持 null,交给 spawn 默认逻辑。
     if (selection) {
       const norm = sessionModel.normalizePersistedModelSelection(

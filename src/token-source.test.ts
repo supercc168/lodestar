@@ -212,15 +212,42 @@ describe('token-source Codex login vs api', () => {
     expect(Object.values(o.env)).toContain('wu-key')
   })
 
-  test('飞书 Grok 选择保持 codex:grok → grok-4.5 + Responses,不改成 GPT', () => {
-    const source = resolveTokenSource('codex', 'codex:grok')
-    expect(source.selectionModel).toBe('codex:grok')
-    expect(source.provider).toBe('codex')
-    expect(source.resolveSpawnModel()).toBe('grok-4.5')
-    const o = source.spawnOverrides()
-    expect(o.modelId).toBe('grok-4.5')
-    expect(o.configArgs).toContain('model_providers.lodestar_grok.wire_api="responses"')
-    expect(Object.values(o.env)).toContain('grok-key')
+  test('Codex TokenSource 拒绝 Grok，避免绕过飞书选择器直接启动', () => {
+    expect(() => resolveTokenSource('codex', 'codex:grok')).toThrow('必须使用 Claude provider')
+    expect(() => resolveCodexSpawnOverrides('codex:grok')).toThrow('必须使用 Claude provider')
+  })
+})
+
+describe('token-source Claude Grok channels', () => {
+  let prevModels: unknown
+
+  beforeEach(() => {
+    prevModels = config.claude.models
+    ;(config.claude as any).models = {
+      grok: { model: 'grok-4.5', base_url: 'https://api.wuhen-ai.com', auth_token: 'grok-token', effort: 'xhigh' },
+      grokcc: { model: 'grok-4.5', base_url: 'https://catcodexapi.com', auth_token: 'grokcc-token', effort: 'xhigh' },
+    }
+  })
+
+  afterEach(() => {
+    ;(config.claude as any).models = prevModels
+  })
+
+  test('两个 Grok 档位都由 Claude source 注入各自端点和 token', () => {
+    for (const [name, baseUrl, token] of [
+      ['grok', 'https://api.wuhen-ai.com', 'grok-token'],
+      ['grokcc', 'https://catcodexapi.com', 'grokcc-token'],
+    ] as const) {
+      const source = resolveTokenSource('claude', `claude:${name}`)
+      expect(source.provider).toBe('claude')
+      expect(source.kind).toBe('api')
+      expect(source.enabled()).toBe(true)
+      expect(source.resolveSpawnModel()).toBe('grok-4.5')
+      const env = source.spawnEnv({})
+      expect(env.ANTHROPIC_BASE_URL).toBe(baseUrl)
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBe(token)
+      expect(env.GSD_RUNTIME).toBe('claude')
+    }
   })
 })
 
@@ -229,6 +256,9 @@ describe('token-source list + usage helpers', () => {
     const ids = listTokenSources().map(s => s.id)
     expect(ids).toContain('claude:fable')
     expect(ids).toContain('claude:opus')
+    expect(ids).toContain('claude:grok')
+    expect(ids).toContain('claude:grokcc')
+    expect(ids).not.toContain('codex:grok')
     expect(ids.some(id => id.includes('gpt-5.6-sol') || id === 'codex-login:gpt-5.6-sol')).toBe(true)
   })
 

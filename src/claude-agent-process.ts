@@ -25,6 +25,7 @@ import {
 } from './agent-process'
 import {
   claudeModelKey,
+  claudeModelIsGrok,
   resolveClaudeSdkModel,
 } from './claude-models'
 import { resolveTokenSource } from './token-source'
@@ -73,6 +74,17 @@ type PendingUserDialog = {
   resolve: (value: PermissionResult) => void
   request: CanUseToolRequest
   cleanup?: () => void
+}
+
+/** CatCodex/Wuhen 的 Anthropic 兼容层对显式 effort/adaptive thinking 不稳定。
+ * Grok 固定不下发 effort 并禁用 thinking；其它 Claude 档位保持原语义。 */
+export function claudeSdkReasoningOptions(
+  model: string | null | undefined,
+  effort: ClaudeReasoningEffort,
+): { effort?: EffortLevel; thinking?: { type: 'disabled' } } {
+  return claudeModelIsGrok(model)
+    ? { thinking: { type: 'disabled' } }
+    : { effort: effort as EffortLevel }
 }
 
 type PendingControl = PendingUserDialog
@@ -823,13 +835,15 @@ export class ClaudeAgentProcess extends EventEmitter {
       const executable = resolveClaudeExecutableConfig({ apiRoute: isApiRoute })
       const spawnEnv = tokenSource.spawnEnv(this.buildSpawnBaseEnv())
       const routeLabel = isApiRoute ? 'api' : 'login'
-      log(`claude-agent-process: spawn SDK query selection=${tokenSource.selectionModel} model=${model ?? 'default'} effort=${this.opts.effort} route=${routeLabel} cwd=${this.opts.workDir} settingSources=${settingSources.join('+')} executable=${executable.description}`)
+      const reasoningOptions = claudeSdkReasoningOptions(this.opts.model, this.opts.effort)
+      const reasoningLabel = reasoningOptions.thinking ? 'grok-compat' : this.opts.effort
+      log(`claude-agent-process: spawn SDK query selection=${tokenSource.selectionModel} model=${model ?? 'default'} effort=${reasoningLabel} route=${routeLabel} cwd=${this.opts.workDir} settingSources=${settingSources.join('+')} executable=${executable.description}`)
       this.query = query({
         prompt: this.input,
         options: {
           cwd: this.opts.workDir,
           ...(model ? { model } : {}),
-          effort: this.opts.effort as EffortLevel,
+          ...reasoningOptions,
           resume: this.opts.resumeSessionId,
           ...(this.opts.resumeSessionAt ? { resumeSessionAt: this.opts.resumeSessionAt } : {}),
           ...(this.opts.forkSession ? { forkSession: true } : {}),

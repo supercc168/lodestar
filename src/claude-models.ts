@@ -8,7 +8,7 @@ export interface ClaudeModelProfile {
   description: string
   sdkModel: string
   /** 'login' = 走用户的 Anthropic Claude 登录态,绝不注入 API key(官方
-   * Fable 5/Opus);'api' = 第三方路由(GLM),需 base_url + auth_token。 */
+   * Fable 5/Opus);'api' = 第三方路由(GLM/Grok 等),需 base_url + token。 */
   route: 'login' | 'api'
   /** spawn 时注入的 ANTHROPIC_* env 覆盖。login 档位恒为空;api 档位配好
    * 后为 { ANTHROPIC_BASE_URL, ANTHROPIC_AUTH_TOKEN[, ANTHROPIC_API_KEY] }。 */
@@ -18,7 +18,7 @@ export interface ClaudeModelProfile {
 }
 
 // 内建默认档位:display_name/description 必填,model/route 可选。
-// login 档位(缺省 route)走登录态;api 档位(route:'api',如 glm)需配 token。
+// login 档位(缺省 route)走登录态;api 档位(route:'api',如 GLM/Grok)需配 token。
 type DefaultClaudeModelConfig = Required<
   Pick<ClaudeModelConfig, 'display_name' | 'description'>
 > & Pick<ClaudeModelConfig, 'model' | 'route'>
@@ -48,6 +48,16 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
     // GLM 的 base_url / auth_token / model 由 [claude.models.glm] 提供,
     // 不写死在代码里(避免 GLM 版本过期 + token 入库)。未配置时该档位
     // 在 picker 里可见但选择被拦截,提示去 config.toml 设置。
+  },
+  grok: {
+    display_name: 'Claude Code · Grok 4.5(无痕)',
+    description: 'Grok 4.5 第三方路由 · 无痕 Anthropic Messages。需在 config.toml 配置 token。',
+    route: 'api',
+  },
+  grokcc: {
+    display_name: 'Claude Code · Grok 4.5(CatCodex)',
+    description: 'Grok 4.5 第三方路由 · CatCodex Anthropic Messages。需在 config.toml 配置 token。',
+    route: 'api',
   },
 }
 
@@ -171,9 +181,15 @@ export function resolveClaudeSdkModel(model: string | null | undefined): string 
   return stripped === 'default' ? DEFAULT_CLAUDE_SDK_MODEL : stripped
 }
 
+/** Grok 档位统一走 Claude Agent SDK 的兼容启动参数。按真实上游 model id
+ * 判断，而不是写死 profile slug，确保新增 [claude.models.*] Grok 渠道也生效。 */
+export function claudeModelIsGrok(model: string | null | undefined): boolean {
+  return /^grok(?:[-_.]|$)/i.test(resolveClaudeSdkModel(model)?.trim() ?? '')
+}
+
 /** spawn 时要为该档位注入的 ANTHROPIC_* env 覆盖。官方登录档位(Fable 5/
  * Opus)恒返回空对象 —— 它们绝不走 API key,只用用户的 Claude 登录态。
- * 只有配好 token 的第三方路由(GLM)才返回非空。 */
+ * 只有配好 token 的第三方 API 路由才返回非空。 */
 export function claudeModelEnv(model: string | null | undefined): Record<string, string> {
   return claudeModelProfile(model)?.env ?? {}
 }
@@ -208,10 +224,11 @@ export function claudeModelConfigured(model: string | null | undefined): boolean
 
 /** 该档位在 config 里声明的思考强度(仅第三方 API 路由有意义,官方登录档位
  * 不配)。非法/未配返回 undefined,由调用方回落到 FIXED_MODEL_CHOICES 的锁死
- * 值。让 GLM 能复刻各自最优 effort(如 GLM-5.2 直连智谱走 xhigh)。 */
+ * 值。Grok 的 Anthropic 兼容端点必须省略 effort,因此即使旧配置写了也忽略。 */
 export function claudeModelEffort(model: string | null | undefined): ClaudeReasoningEffort | undefined {
   const profile = claudeModelProfile(model)
   if (!profile || profile.route !== 'api') return undefined
+  if (claudeModelIsGrok(model)) return undefined
   const raw = mergedConfig(profile.name).effort?.trim()
   return raw && isClaudeReasoningEffort(raw) ? raw : undefined
 }

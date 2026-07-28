@@ -6869,9 +6869,14 @@ describe('normalizeFixedModelSelection ([codex.models.*] api 档位)', () => {
   })
 })
 
-describe('legacy Claude Grok selection migration', () => {
-  test('已配置 codex:grok 时把 claude:grok/grokcc 恢复为 Grok Responses + max', () => {
-    const prev = config.codex.models
+describe('Grok routes through Claude', () => {
+  test('旧 codex:grok/grokcc 持久选择迁到同名 Claude API 档位', () => {
+    const prevClaude = config.claude.models
+    const prevCodex = config.codex.models
+    ;(config.claude as any).models = {
+      grok: { model: 'grok-4.5', base_url: 'https://api.wuhen-ai.com', auth_token: 'w', effort: 'xhigh' },
+      grokcc: { model: 'grok-4.5', base_url: 'https://catcodexapi.com', auth_token: 'c', effort: 'xhigh' },
+    }
     ;(config.codex as any).models = {
       grok: {
         model: 'grok-4.5',
@@ -6882,29 +6887,40 @@ describe('legacy Claude Grok selection migration', () => {
       },
     }
     try {
-      for (const legacy of ['claude:grok', 'claude:grokcc']) {
-        expect(normalizePersistedModelSelection('claude', legacy, 'xhigh')).toEqual({
-          provider: 'codex',
-          model: 'codex:grok',
+      for (const name of ['grok', 'grokcc']) {
+        expect(normalizePersistedModelSelection('codex', `codex:${name}`, 'max')).toEqual({
+          provider: 'claude',
+          model: `claude:${name}`,
+          effort: 'max',
+        })
+        expect(normalizePersistedModelSelection('claude', `claude:${name}`, 'max')).toEqual({
+          provider: 'claude',
+          model: `claude:${name}`,
           effort: 'max',
         })
       }
     } finally {
-      ;(config.codex as any).models = prev
+      ;(config.claude as any).models = prevClaude
+      ;(config.codex as any).models = prevCodex
     }
   })
 
-  test('没有显式 Codex Grok 档位时不跨 provider 借用 Claude 凭据', () => {
-    const prev = config.codex.models
-    ;(config.codex as any).models = {}
+  test('没有 Claude Grok 凭据时旧 Codex Grok 回落 Claude Fable 而非继续启 Codex', () => {
+    const prevClaude = config.claude.models
+    const prevCodex = config.codex.models
+    ;(config.claude as any).models = {}
+    ;(config.codex as any).models = {
+      grok: { model: 'grok-4.5', base_url: 'https://api.wuhen-ai.com', api_key: 't' },
+    }
     try {
-      expect(normalizePersistedModelSelection('claude', 'claude:grokcc', 'xhigh')).toEqual({
+      expect(normalizePersistedModelSelection('codex', 'codex:grok', 'max')).toEqual({
         provider: 'claude',
         model: 'claude:fable',
         effort: 'max',
       })
     } finally {
-      ;(config.codex as any).models = prev
+      ;(config.claude as any).models = prevClaude
+      ;(config.codex as any).models = prevCodex
     }
   })
 })
@@ -6937,9 +6953,14 @@ describe('configuredDefaultSelection ([codex] api 档位)', () => {
     }
   })
 
-  test('legacy default_model=grokcc 在显式 codex:grok 存在时迁到 Responses', () => {
+  test('default_model=codex:grok 迁到 Claude，无前缀 grokcc 直接选 Claude', () => {
+    const prevClaudeModels = config.claude.models
     const prevModels = config.codex.models
     const prevDefault = config.claude.defaultModel
+    ;(config.claude as any).models = {
+      grok: { model: 'grok-4.5', base_url: 'https://api.wuhen-ai.com', auth_token: 'w', effort: 'xhigh' },
+      grokcc: { model: 'grok-4.5', base_url: 'https://catcodexapi.com', auth_token: 'c', effort: 'xhigh' },
+    }
     ;(config.codex as any).models = {
       grok: {
         model: 'grok-4.5',
@@ -6949,14 +6970,21 @@ describe('configuredDefaultSelection ([codex] api 档位)', () => {
         effort: 'xhigh',
       },
     }
-    ;(config.claude as any).defaultModel = 'grokcc'
     try {
+      ;(config.claude as any).defaultModel = 'codex:grok'
       expect(configuredDefaultSelection()).toEqual({
-        provider: 'codex',
-        model: 'codex:grok',
+        provider: 'claude',
+        model: 'claude:grok',
+        effort: 'max',
+      })
+      ;(config.claude as any).defaultModel = 'grokcc'
+      expect(configuredDefaultSelection()).toEqual({
+        provider: 'claude',
+        model: 'claude:grokcc',
         effort: 'max',
       })
     } finally {
+      ;(config.claude as any).models = prevClaudeModels
       ;(config.codex as any).models = prevModels
       ;(config.claude as any).defaultModel = prevDefault
     }
@@ -7290,10 +7318,13 @@ describe('Session provider switching', () => {
     }
   })
 
-  test('model 选择器只通过 Codex Responses 展示 Grok,不再暴露 Claude Grok 路由', () => {
+  test('model 选择器只通过 Claude 展示无痕与 CatCodex Grok', () => {
     const prevClaude = config.claude.models
     const prevCodex = config.codex.models
-    ;(config.claude as any).models = {}
+    ;(config.claude as any).models = {
+      grok: { model: 'grok-4.5', base_url: 'https://api.wuhen-ai.com', auth_token: 'w', effort: 'xhigh' },
+      grokcc: { model: 'grok-4.5', base_url: 'https://catcodexapi.com', auth_token: 'c', effort: 'xhigh' },
+    }
     ;(config.codex as any).models = {
       grok: {
         display_name: 'Codex · Grok 4.5 · 无痕',
@@ -7313,20 +7344,22 @@ describe('Session provider switching', () => {
       expect(claudeModels).toContain('claude:opus')
       expect(claudeModels).toContain('claude:fable')
       expect(claudeModels).toContain('claude:glm')
-      expect(claudeModels).not.toContain('claude:grok')
-      expect(claudeModels).not.toContain('claude:grokcc')
-      // 每个 Claude 档位锁死 max 最高思考强度(第三方档位未配 effort 时回落 max)
-      for (const c of choices.filter((c: any) => c.provider === 'claude')) {
+      expect(claudeModels).toContain('claude:grok')
+      expect(claudeModels).toContain('claude:grokcc')
+      for (const c of choices.filter((c: any) => c.provider === 'claude' && !c.model.includes('grok'))) {
         expect(c.efforts.map((e: any) => e.effort)).toEqual(['max'])
       }
       const glm = choices.find((c: any) => c.model === 'claude:glm')
       expect(glm.description).toContain('[claude.models.glm]')
-      const grok = choices.find((c: any) => c.model === 'codex:grok')
-      expect(grok).toMatchObject({
-        provider: 'codex',
-        displayName: 'Codex · Grok 4.5 · 无痕',
+      expect(choices.some((c: any) => c.provider === 'codex' && c.model.includes('grok'))).toBe(false)
+      expect(choices.find((c: any) => c.model === 'claude:grok')).toMatchObject({
+        provider: 'claude', displayName: 'Claude · Grok 4.5 · 无痕',
+        efforts: [{ effort: 'max' }],
       })
-      expect(grok.efforts.map((e: any) => e.effort)).toEqual(['max'])
+      expect(choices.find((c: any) => c.model === 'claude:grokcc')).toMatchObject({
+        provider: 'claude', displayName: 'Claude · Grok 4.5 · CatCodex',
+        efforts: [{ effort: 'max' }],
+      })
     } finally {
       ;(config.claude as any).models = prevClaude
       ;(config.codex as any).models = prevCodex
@@ -7351,7 +7384,7 @@ describe('Session provider switching', () => {
     }
   })
 
-  test('Codex Grok 档位把不兼容的 config xhigh 锁到 max', () => {
+  test('Codex Grok 配置不会出现在模型选择器', () => {
     const prev = config.codex.models
     ;(config.codex as any).models = {
       grok: {
@@ -7366,8 +7399,7 @@ describe('Session provider switching', () => {
       const session = new Session('probe', 'chat_id') as any
       session.selectedProvider = 'codex'
       const choices = fixedModelChoices(session)
-      const grok = choices.find((c: any) => c.model === 'codex:grok')
-      expect(grok.efforts.map((e: any) => e.effort)).toEqual(['max'])
+      expect(choices.find((c: any) => c.model === 'codex:grok')).toBeUndefined()
       const sol = choices.find((c: any) => c.model === 'gpt-5.6-sol')
       expect(sol.efforts.map((e: any) => e.effort)).toEqual(['max'])
     } finally {
@@ -7375,39 +7407,27 @@ describe('Session provider switching', () => {
     }
   })
 
-  test('飞书点击 Grok 后持久目标保持 provider=codex/model=codex:grok', async () => {
-    const prev = config.codex.models
-    ;(config.codex as any).models = {
-      grok: {
-        model: 'grok-4.5',
-        base_url: 'https://api.wuhen-ai.com',
-        wire_api: 'responses',
-        api_key: 't',
-        effort: 'xhigh',
-      },
+  test('飞书点击两个 Grok 档位都持久为 provider=claude', async () => {
+    const prev = config.claude.models
+    ;(config.claude as any).models = {
+      grok: { model: 'grok-4.5', base_url: 'https://api.wuhen-ai.com', auth_token: 'w', effort: 'xhigh' },
+      grokcc: { model: 'grok-4.5', base_url: 'https://catcodexapi.com', auth_token: 'c', effort: 'xhigh' },
     }
     try {
-      const session = new Session('probe', 'chat_id') as any
-      session.selectedProvider = 'claude'
-      session.selectedModel = 'claude:fable'
-      session.selectedEffort = 'max'
-      const panelId = 'grok-panel'
-      session.modelPanels.set(panelId, { models: fixedModelChoices(session) })
-
-      const result = await session.onModelSelect(
-        'codex:grok',
-        panelId,
-        'ou_user',
-        { provider: 'codex' },
-      )
-
-      expect(result.ok).toBe(true)
-      expect(session.selectedProvider).toBe('codex')
-      expect(session.selectedModel).toBe('codex:grok')
-      expect(session.selectedEffort).toBe('max')
-      expect(result.message).toContain('Codex · codex:grok / max')
+      for (const model of ['claude:grok', 'claude:grokcc']) {
+        const session = new Session('probe', 'chat_id') as any
+        session.selectedProvider = 'claude'
+        session.selectedModel = 'claude:fable'
+        session.selectedEffort = 'max'
+        installSuccessfulIdleRebuild(session)
+        const result = await session.onModelEffortSelect(model, 'max', '', 'ou_user', 'claude')
+        expect(result.ok).toBe(true)
+        expect(session.selectedProvider).toBe('claude')
+        expect(session.selectedModel).toBe(model)
+        expect(session.selectedEffort).toBe('max')
+      }
     } finally {
-      ;(config.codex as any).models = prev
+      ;(config.claude as any).models = prev
     }
   })
 
@@ -7458,32 +7478,24 @@ describe('Session provider switching', () => {
     }
   })
 
-  test('Codex Grok 未配置 token 时被拦截,不切回其它模型', async () => {
-    const prev = config.codex.models
-    ;(config.codex as any).models = {
-      grok: {
-        model: 'grok-4.5',
-        base_url: 'https://api.wuhen-ai.com',
-        wire_api: 'responses',
-        effort: 'xhigh',
-      },
-    }
+  test('未配置 Claude Grok token 时两个档位都被拦截', async () => {
+    const prev = config.claude.models
+    ;(config.claude as any).models = {}
     try {
-      const session = new Session('probe', 'chat_id') as any
-      const proc = new FakeAgentProc('claude', 'claude-session-1')
-      session.proc = proc
-      session.selectedProvider = 'claude'
-      session.selectedModel = 'claude:fable'
-
-      const result = await session.onModelEffortSelect('codex:grok', 'max', '', 'ou_user', 'codex')
-
-      expect(result.ok).toBe(false)
-      expect(result.message).toContain('Codex API 档位(codex:grok)未配置')
-      expect(result.message).toContain('[codex.models.<slug>]')
-      expect(session.selectedModel).toBe('claude:fable') // 未切换
-      expect(proc.killCalls).toBe(0)
+      for (const model of ['claude:grok', 'claude:grokcc']) {
+        const session = new Session('probe', 'chat_id') as any
+        const proc = new FakeAgentProc('claude', 'claude-session-1')
+        session.proc = proc
+        session.selectedProvider = 'claude'
+        session.selectedModel = 'claude:fable'
+        const result = await session.onModelEffortSelect(model, 'max', '', 'ou_user', 'claude')
+        expect(result.ok).toBe(false)
+        expect(result.message).toContain(`[claude.models.${model.slice('claude:'.length)}]`)
+        expect(session.selectedModel).toBe('claude:fable')
+        expect(proc.killCalls).toBe(0)
+      }
     } finally {
-      ;(config.codex as any).models = prev
+      ;(config.claude as any).models = prev
     }
   })
 

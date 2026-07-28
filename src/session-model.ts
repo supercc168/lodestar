@@ -12,13 +12,18 @@ import {
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { config } from './config'
-import { claudeModelConfigured, claudeModelEffort, claudeModelIsApiRoute } from './claude-models'
+import {
+  claudeModelConfigured,
+  claudeModelEffort,
+  claudeModelIsApiRoute,
+  claudeModelIsGrok,
+} from './claude-models'
 import {
   codexModelChoices,
   codexModelConfigured,
   codexModelEffort,
+  codexModelIsGrok,
   codexModelIsApiRoute,
-  resolveCodexModelId,
 } from './codex-models'
 import { log } from './log'
 import {
@@ -71,6 +76,20 @@ const FIXED_MODEL_CHOICES = [
     description: 'GLM 第三方路由 · max。',
     effort: 'max' as AgentReasoningEffort,
   },
+  {
+    provider: 'claude' as const,
+    model: 'claude:grok',
+    displayName: 'Claude · Grok 4.5 · 无痕',
+    description: 'Grok 4.5 · 无痕 Anthropic Messages 兼容路由。',
+    effort: 'max' as AgentReasoningEffort,
+  },
+  {
+    provider: 'claude' as const,
+    model: 'claude:grokcc',
+    displayName: 'Claude · Grok 4.5 · CatCodex',
+    description: 'Grok 4.5 · CatCodex Anthropic Messages 兼容路由。',
+    effort: 'max' as AgentReasoningEffort,
+  },
 ]
 
 /** provider 的默认固定档位(该 provider 的第一个固定项)。归一化未知/退役
@@ -79,8 +98,8 @@ function defaultFixedChoiceFor(provider: AgentProvider): typeof FIXED_MODEL_CHOI
   return FIXED_MODEL_CHOICES.find(c => c.provider === provider) ?? FIXED_MODEL_CHOICES[0]
 }
 
-/** 档位实际锁死的 effort:第三方路由(GLM)优先用 config 声明的 effort
- * (如 xhigh 复刻智谱最高思维),否则回落到 FIXED_MODEL_CHOICES 的默认值。
+/** 档位实际锁死的 effort:第三方路由优先用 config 声明的 effort；Grok
+ * 由 claudeModelEffort 忽略配置并回落兼容档 max。其它未配置时也回落默认值。
  * picker 渲染、选择校验、归一化都走这里,保持三处一致。 */
 function resolvedEffort(item: typeof FIXED_MODEL_CHOICES[number]): AgentReasoningEffort {
   if (item.provider === 'claude') {
@@ -94,17 +113,28 @@ function resolvedEffort(item: typeof FIXED_MODEL_CHOICES[number]): AgentReasonin
   return item.effort
 }
 
-function configuredCodexGrokChoice(legacyModel: string | null | undefined) {
-  if (!/^claude:grok(?:cc)?$/i.test(legacyModel ?? '')) return null
-  const legacySlug = legacyModel!.slice('claude:'.length)
-  const choices = codexModelChoices()
-  const candidates = [`codex:${legacySlug}`, 'codex:grok']
+function selectableCodexModelChoices() {
+  return codexModelChoices()
+}
+
+function selectableModelChoices() {
+  return [...FIXED_MODEL_CHOICES, ...selectableCodexModelChoices()]
+}
+
+function configuredClaudeGrokChoice(legacyModel: string | null | undefined) {
+  const slug = legacyModel?.replace(/^(?:claude|codex):/i, '') ?? ''
+  const candidates = [`claude:${slug}`, 'claude:grok', 'claude:grokcc']
   return candidates
-    .map(model => choices.find(choice => choice.model === model))
+    .map(model => FIXED_MODEL_CHOICES.find(choice => choice.provider === 'claude' && choice.model === model))
     .find(choice => choice
-      && codexModelConfigured(choice.model)
-      && /^grok(?:[-_.]|$)/i.test(resolveCodexModelId(choice.model) ?? ''))
+      && claudeModelConfigured(choice.model)
+      && claudeModelIsGrok(choice.model))
     ?? null
+}
+
+function isPersistedCodexGrok(model: string | null | undefined): boolean {
+  if (!model) return false
+  return codexModelIsGrok(model)
 }
 
 /** 把持久化的 (provider, model, effort) 归一到当前固定选项集。
@@ -119,7 +149,7 @@ export function normalizeFixedModelSelection(
   model: string | null | undefined,
   _effort: AgentReasoningEffort | null | undefined,
 ): { model: string; effort: AgentReasoningEffort } {
-  const all = [...FIXED_MODEL_CHOICES, ...codexModelChoices()]
+  const all = selectableModelChoices()
   const hit = all.find(c => c.provider === provider && c.model === model)
   // 第三方 API 路由(claude GLM / codex 自定义 provider)持久化了但当前未配置 →
   // 回落到该 provider 的登录默认档(claude→claude:fable,codex→gpt-5.6-sol)。否则
@@ -135,18 +165,19 @@ export function normalizeFixedModelSelection(
   return { model: choice.model, effort: resolvedEffort(choice) }
 }
 
-/** 旧版飞书曾把 Grok 暴露成 claude:grok/grokcc。若用户已显式配置同名
- * 或 canonical [codex.models.grok] Responses 档位，恢复时迁到 Codex 后端，
- * 保留用户选择的 Grok 语义；凭据仍只读取 [codex.models.*]，不跨 provider
- * 偷拿 token。其它选择继续走固定项归一化。 */
+/** Grok 统一归 Claude Agent SDK。旧 codex:grok* 持久选择优先迁到同名
+ * [claude.models.*] 档位；未配置时回落 Claude 登录默认档，绝不继续启 Codex
+ * Grok 或跨 provider 借用凭据。 */
 export function normalizePersistedModelSelection(
   provider: AgentProvider,
   model: string | null | undefined,
   effort: AgentReasoningEffort | null | undefined,
 ): { provider: AgentProvider; model: string; effort: AgentReasoningEffort } {
-  if (provider === 'claude') {
-    const grok = configuredCodexGrokChoice(model)
-    if (grok) return { provider: 'codex', model: grok.model, effort: resolvedEffort(grok) }
+  if (provider === 'codex' && isPersistedCodexGrok(model)) {
+    const grok = configuredClaudeGrokChoice(model)
+    if (grok) return { provider: 'claude', model: grok.model, effort: resolvedEffort(grok) }
+    const fallback = defaultFixedChoiceFor('claude')
+    return { provider: 'claude', model: fallback.model, effort: resolvedEffort(fallback) }
   }
   return { provider, ...normalizeFixedModelSelection(provider, model, effort) }
 }
@@ -168,15 +199,14 @@ export function configuredDefaultSelection(): {
   // legacy:内建 codex 档从 gpt-5.5 升级到 gpt-5.6-sol(2026-07-09),旧 config
   // 写的裸 "gpt-5.5" 迁移到新内建档,不让老配置静默退回 Fable 5。
   const bare = raw === 'gpt-5.5' ? 'gpt-5.6-sol' : raw
-  if (/^(?:claude:)?grok(?:cc)?$/i.test(bare)) {
-    const legacy = bare.startsWith('claude:') ? bare : `claude:${bare}`
-    const grok = configuredCodexGrokChoice(legacy)
-    if (grok) return { provider: 'codex', model: grok.model, effort: resolvedEffort(grok) }
+  if (isPersistedCodexGrok(bare)) {
+    const grok = configuredClaudeGrokChoice(bare)
+    if (grok) return { provider: 'claude', model: grok.model, effort: resolvedEffort(grok) }
   }
   const wanted = bare.startsWith('claude:') || bare.startsWith('codex:') || bare === 'gpt-5.6-sol'
     ? bare
     : `claude:${bare}`
-  const hit = [...FIXED_MODEL_CHOICES, ...codexModelChoices()].find(c => c.model === wanted)
+  const hit = selectableModelChoices().find(c => c.model === wanted)
   if (!hit) return null
   return { provider: hit.provider, model: hit.model, effort: resolvedEffort(hit) }
 }
@@ -198,7 +228,7 @@ export function fixedModelChoices(s: Session): cards.ModelChoice[] {
   const currentProvider = s.currentProvider()
   const currentModel = s.currentModelLabel()
   const currentEffort = s.currentEffortLabel()
-  return [...FIXED_MODEL_CHOICES, ...codexModelChoices()].map(item => {
+  return selectableModelChoices().map(item => {
     const selected = currentProvider === item.provider && currentModel === item.model
     const effort = resolvedEffort(item)
     return {
@@ -317,7 +347,7 @@ export async function onModelEffortSelect(
   const effort = effortValue as AgentReasoningEffort
   // 二元锁死:只放行 FIXED_MODEL_CHOICES 的 (provider, model, effort) 组合,
   // 拒绝旧 effort 回调/伪造把 session 切到非固定项或非锁死 effort。
-  const fixed = [...FIXED_MODEL_CHOICES, ...codexModelChoices()]
+  const fixed = selectableModelChoices()
     .find(c => c.provider === provider && c.model === model)
   if (!fixed || resolvedEffort(fixed) !== effort) {
     return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在固定选项中` }

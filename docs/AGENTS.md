@@ -9,7 +9,7 @@
 ## Key Files
 | File | Description |
 |------|-------------|
-| `claude-agent-backend.md` | Claude Agent SDK 后端 memo：目标、已确认事实、`AgentProcess` 接口与 `CodexProcess`/`ClaudeAgentProcess` 双后端设计、Claude model profile（`claude:glm`）、SDK 事件到 Session 事件的映射、与 Codex 行为的逐项 parity audit、差异说明和本机 smoke 验证结果。修改 `src/agent-process.ts`、`src/claude-agent-process.ts`、`src/claude-models.ts` 或 `src/glm-usage.ts` 时先读它。 |
+| `claude-agent-backend.md` | Claude Agent SDK 后端 memo：目标、已确认事实、`AgentProcess` 接口与 `CodexProcess`/`ClaudeAgentProcess` 双后端设计、Claude model profile（GLM / Grok）、SDK 事件到 Session 事件的映射、与 Codex 行为的逐项 parity audit、差异说明和本机 smoke 验证结果。修改 `src/agent-process.ts`、`src/claude-agent-process.ts`、`src/claude-models.ts` 或 `src/glm-usage.ts` 时先读它。 |
 
 ## Subdirectories
 | Directory | Purpose |

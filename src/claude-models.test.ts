@@ -5,6 +5,7 @@ import {
   claudeModelEffort,
   claudeModelEnv,
   claudeModelIsApiRoute,
+  claudeModelIsGrok,
   claudeModelTierEnv,
 } from './claude-models'
 
@@ -24,6 +25,21 @@ const GLM_FULL = {
     ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5-turbo',
     ANTHROPIC_DEFAULT_FABLE_MODEL: 'glm-5.2[1m]',
     ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5-turbo',
+  },
+}
+
+const GROK_FULL = {
+  grok: {
+    model: 'grok-4.5',
+    base_url: 'https://api.wuhen-ai.com',
+    auth_token: 'grok-token',
+    effort: 'xhigh',
+  },
+  grokcc: {
+    model: 'grok-4.5',
+    base_url: 'https://catcodexapi.com',
+    auth_token: 'grokcc-token',
+    effort: 'xhigh',
   },
 }
 
@@ -105,5 +121,42 @@ describe('claudeModelEnv per-档位 env 注入', () => {
     expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.2[1m]')
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.2[1m]')
     expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.2[1m]')
+  })
+})
+
+describe('Claude Grok API profiles', () => {
+  let prevModels: unknown
+
+  beforeEach(() => {
+    prevModels = config.claude.models
+    ;(config.claude as any).models = structuredClone(GROK_FULL)
+  })
+
+  afterEach(() => {
+    ;(config.claude as any).models = prevModels
+  })
+
+  test('无痕与 CatCodex 都解析为 Claude API Grok 档位', () => {
+    for (const [name, baseUrl] of [
+      ['grok', 'https://api.wuhen-ai.com'],
+      ['grokcc', 'https://catcodexapi.com'],
+    ] as const) {
+      const model = `claude:${name}`
+      expect(claudeModelIsApiRoute(model)).toBe(true)
+      expect(claudeModelConfigured(model)).toBe(true)
+      expect(claudeModelIsGrok(model)).toBe(true)
+      expect(claudeModelEffort(model)).toBeUndefined()
+      expect(claudeModelEnv(model).ANTHROPIC_BASE_URL).toBe(baseUrl)
+      for (const value of Object.values(claudeModelTierEnv(model))) expect(value).toBe('grok-4.5')
+    }
+  })
+
+  test('未配置时两个内建 Grok 档位保持 API route 且不可选择', () => {
+    ;(config.claude as any).models = {}
+    for (const model of ['claude:grok', 'claude:grokcc']) {
+      expect(claudeModelIsApiRoute(model)).toBe(true)
+      expect(claudeModelConfigured(model)).toBe(false)
+      expect(claudeModelIsGrok(model)).toBe(false)
+    }
   })
 })

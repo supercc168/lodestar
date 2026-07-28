@@ -25,6 +25,7 @@ const {
   buildClaudeSpawnPath,
   CLAUDE_PERMISSION_MODE,
   ClaudeAgentProcess,
+  claudeSdkReasoningOptions,
   claudeTranscriptPath,
   readLastCallUsageFromTranscript,
   readProjectMcpServers,
@@ -124,6 +125,21 @@ describe('Claude model profiles', () => {
     expect(claudeModelEnv('claude:opus')).toEqual({})
     expect(claudeModelIsApiRoute('claude:fable')).toBe(false)
     expect(claudeModelIsApiRoute('claude:opus')).toBe(false)
+  })
+
+  test('Grok omits effort and disables thinking while other Claude models keep effort', () => {
+    const prev = config.claude.models
+    ;(config.claude as any).models = {
+      grok: { model: 'grok-4.5', base_url: 'https://grok.example', auth_token: 't' },
+    }
+    try {
+      expect(claudeSdkReasoningOptions('claude:grok', 'xhigh')).toEqual({
+        thinking: { type: 'disabled' },
+      })
+      expect(claudeSdkReasoningOptions('claude:fable', 'max')).toEqual({ effort: 'max' })
+    } finally {
+      ;(config.claude as any).models = prev
+    }
   })
 
   test('GLM is an API route that stays unconfigured until a token is set in lodestar config', () => {

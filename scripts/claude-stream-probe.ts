@@ -5,9 +5,9 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   query,
-  type EffortLevel,
   type SDKMessage,
 } from '@anthropic-ai/claude-agent-sdk'
+import { claudeSdkReasoningOptions } from '../src/claude-agent-process'
 import { claudeModelEffort } from '../src/claude-models'
 import { resolveTokenSource } from '../src/token-source'
 
@@ -15,6 +15,8 @@ const rawSelection = process.argv[2]?.trim() || 'claude:glm'
 const selection = rawSelection.startsWith('claude:') ? rawSelection : `claude:${rawSelection}`
 const source = resolveTokenSource('claude', selection)
 const requestedModel = source.resolveSpawnModel()
+const reasoningOptions = claudeSdkReasoningOptions(selection, claudeModelEffort(selection) ?? 'max')
+const grokCompatibility = reasoningOptions.thinking?.type === 'disabled'
 
 if (!source.isApiRoute()) {
   throw new Error(`${selection} is not a Claude API route`)
@@ -265,8 +267,8 @@ try {
     options: {
       cwd: workDir,
       model: requestedModel,
-      effort: claudeModelEffort(selection) as EffortLevel,
-      thinking: { type: 'adaptive' },
+      ...reasoningOptions,
+      ...(grokCompatibility ? {} : { thinking: { type: 'adaptive' as const } }),
       env,
       abortController,
       settingSources: [],
@@ -298,11 +300,14 @@ try {
     && summary.rawToolChoiceHonored
     && summary.rawProtocolErrors.length === 0
     && summary.rawRuntimeError === null
-    && summary.sawThinking
+    && (grokCompatibility || summary.sawThinking)
     && summary.sawText
     && summary.sawToolUse
     && summary.sawToolResult
-    && summary.sawStartMarker
+    // Some Grok Anthropic gateways invoke the requested tool before emitting
+    // ordinary text. That ordering is valid as long as the tool/result chain
+    // and terminal marker are complete.
+    && (grokCompatibility || summary.sawStartMarker)
     && summary.sawDoneMarker
     && summary.resultSubtype === 'success'
     && summary.resultIsError === false

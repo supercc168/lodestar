@@ -4,12 +4,18 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentResultEvent } from '../src/agent-process'
-import { codexModelEffort, codexModelProfile } from '../src/codex-models'
+import { codexModelEffort, codexModelIsGrok, codexModelProfile } from '../src/codex-models'
 import { CODEX_EFFORT, CodexProcess } from '../src/codex-process'
 import { resolveTokenSource } from '../src/token-source'
 
-const rawSelection = process.argv[2]?.trim() || 'codex:grok'
+const rawSelection = process.argv[2]?.trim()
+if (!rawSelection) {
+  throw new Error('usage: bun scripts/codex-responses-probe.ts codex:<non-grok-responses-profile>')
+}
 const selection = rawSelection.startsWith('codex:') ? rawSelection : `codex:${rawSelection}`
+if (codexModelIsGrok(selection)) {
+  throw new Error('Grok profiles must use claude-stream-probe.ts through Claude Agent SDK')
+}
 const source = resolveTokenSource('codex', selection)
 const profile = codexModelProfile(selection)
 const overrides = source.spawnOverrides()
@@ -88,7 +94,7 @@ try {
 
   const dispatch = proc.sendUserText([
     'This is a transport compatibility probe.',
-    'Use the shell exactly once to run: printf GROK_CODEX_TOOL_OK',
+    'Use the shell exactly once to run: printf CODEX_RESPONSES_TOOL_OK',
     'After the command succeeds, report its output in one sentence and stop.',
   ].join('\n'))
   if (dispatch.kind === 'rejected') throw dispatch.error
