@@ -27,6 +27,9 @@ type DefaultClaudeModelConfig = Required<
 // Fable 5 是 Anthropic 当前最强模型(1M ctx / 128K out),官方 API 路由可用;
 // GLM 等第三方路由不认这个 id,需在 profile 里显式配 model 覆盖。
 export const DEFAULT_CLAUDE_SDK_MODEL = 'claude-fable-5'
+/** Grok 4.5 在 Anthropic Messages 兼容路由上的最高可用 effort。
+ * `max` 实测会在工具轮报 Content block not found 或直接挂起。 */
+export const GROK_COMPAT_EFFORT = 'xhigh' as const
 
 const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
   // 第一方 Anthropic 档位:model id 直传 Claude Code(reclaude → --model),
@@ -224,11 +227,11 @@ export function claudeModelConfigured(model: string | null | undefined): boolean
 
 /** 该档位在 config 里声明的思考强度(仅第三方 API 路由有意义,官方登录档位
  * 不配)。非法/未配返回 undefined,由调用方回落到 FIXED_MODEL_CHOICES 的锁死
- * 值。Grok 的 Anthropic 兼容端点必须省略 effort,因此即使旧配置写了也忽略。 */
+ * 值。Grok 强制 xhigh：这是实测能完成工具链的最高兼容档，配置不能改成 max。 */
 export function claudeModelEffort(model: string | null | undefined): ClaudeReasoningEffort | undefined {
   const profile = claudeModelProfile(model)
   if (!profile || profile.route !== 'api') return undefined
-  if (claudeModelIsGrok(model)) return undefined
+  if (claudeModelIsGrok(model)) return GROK_COMPAT_EFFORT
   const raw = mergedConfig(profile.name).effort?.trim()
   return raw && isClaudeReasoningEffort(raw) ? raw : undefined
 }

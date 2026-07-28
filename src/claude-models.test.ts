@@ -145,7 +145,7 @@ describe('Claude Grok API profiles', () => {
       expect(claudeModelIsApiRoute(model)).toBe(true)
       expect(claudeModelConfigured(model)).toBe(true)
       expect(claudeModelIsGrok(model)).toBe(true)
-      expect(claudeModelEffort(model)).toBeUndefined()
+      expect(claudeModelEffort(model)).toBe('xhigh')
       expect(claudeModelEnv(model).ANTHROPIC_BASE_URL).toBe(baseUrl)
       for (const value of Object.values(claudeModelTierEnv(model))) expect(value).toBe('grok-4.5')
     }

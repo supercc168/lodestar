@@ -26,6 +26,7 @@ import {
 import {
   claudeModelKey,
   claudeModelIsGrok,
+  GROK_COMPAT_EFFORT,
   resolveClaudeSdkModel,
 } from './claude-models'
 import { resolveTokenSource } from './token-source'
@@ -76,14 +77,14 @@ type PendingUserDialog = {
   cleanup?: () => void
 }
 
-/** CatCodex/Wuhen 的 Anthropic 兼容层对显式 effort/adaptive thinking 不稳定。
- * Grok 固定不下发 effort 并禁用 thinking；其它 Claude 档位保持原语义。 */
+/** CatCodex/Wuhen 的 Anthropic 兼容层不适配 Claude 的 max/adaptive thinking。
+ * Grok 固定 xhigh + disabled thinking；其它 Claude 档位保持原语义。 */
 export function claudeSdkReasoningOptions(
   model: string | null | undefined,
   effort: ClaudeReasoningEffort,
 ): { effort?: EffortLevel; thinking?: { type: 'disabled' } } {
   return claudeModelIsGrok(model)
-    ? { thinking: { type: 'disabled' } }
+    ? { effort: GROK_COMPAT_EFFORT, thinking: { type: 'disabled' } }
     : { effort: effort as EffortLevel }
 }
 
@@ -836,7 +837,9 @@ export class ClaudeAgentProcess extends EventEmitter {
       const spawnEnv = tokenSource.spawnEnv(this.buildSpawnBaseEnv())
       const routeLabel = isApiRoute ? 'api' : 'login'
       const reasoningOptions = claudeSdkReasoningOptions(this.opts.model, this.opts.effort)
-      const reasoningLabel = reasoningOptions.thinking ? 'grok-compat' : this.opts.effort
+      const reasoningLabel = reasoningOptions.thinking
+        ? `grok-compat:${reasoningOptions.effort ?? '-'}`
+        : this.opts.effort
       log(`claude-agent-process: spawn SDK query selection=${tokenSource.selectionModel} model=${model ?? 'default'} effort=${reasoningLabel} route=${routeLabel} cwd=${this.opts.workDir} settingSources=${settingSources.join('+')} executable=${executable.description}`)
       this.query = query({
         prompt: this.input,

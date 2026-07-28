@@ -178,7 +178,7 @@ describe('token-source Codex login vs api', () => {
         wire_api: 'responses',
         api_key: 'grok-key',
         route: 'api',
-        effort: 'xhigh', // session picker resolves Grok to the compatibility max.
+        effort: 'xhigh', // Codex Grok remains blocked; Claude locks Grok to xhigh.
       },
     }
   })

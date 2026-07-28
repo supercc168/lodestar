@@ -17,6 +17,7 @@ import {
   claudeModelEffort,
   claudeModelIsApiRoute,
   claudeModelIsGrok,
+  GROK_COMPAT_EFFORT,
 } from './claude-models'
 import {
   codexModelChoices,
@@ -80,15 +81,15 @@ const FIXED_MODEL_CHOICES = [
     provider: 'claude' as const,
     model: 'claude:grok',
     displayName: 'Claude · Grok 4.5 · 无痕',
-    description: 'Grok 4.5 · 无痕 Anthropic Messages 兼容路由。',
-    effort: 'max' as AgentReasoningEffort,
+    description: 'Grok 4.5 · 无痕 Anthropic Messages · 最高兼容 xhigh。',
+    effort: GROK_COMPAT_EFFORT as AgentReasoningEffort,
   },
   {
     provider: 'claude' as const,
     model: 'claude:grokcc',
     displayName: 'Claude · Grok 4.5 · CatCodex',
-    description: 'Grok 4.5 · CatCodex Anthropic Messages 兼容路由。',
-    effort: 'max' as AgentReasoningEffort,
+    description: 'Grok 4.5 · CatCodex Anthropic Messages · 最高兼容 xhigh。',
+    effort: GROK_COMPAT_EFFORT as AgentReasoningEffort,
   },
 ]
 
@@ -99,7 +100,7 @@ function defaultFixedChoiceFor(provider: AgentProvider): typeof FIXED_MODEL_CHOI
 }
 
 /** 档位实际锁死的 effort:第三方路由优先用 config 声明的 effort；Grok
- * 由 claudeModelEffort 忽略配置并回落兼容档 max。其它未配置时也回落默认值。
+ * 由 claudeModelEffort 强制最高兼容 xhigh。其它未配置时回落默认值。
  * picker 渲染、选择校验、归一化都走这里,保持三处一致。 */
 function resolvedEffort(item: typeof FIXED_MODEL_CHOICES[number]): AgentReasoningEffort {
   if (item.provider === 'claude') {

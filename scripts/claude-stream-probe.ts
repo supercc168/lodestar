@@ -5,6 +5,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   query,
+  type EffortLevel,
   type SDKMessage,
 } from '@anthropic-ai/claude-agent-sdk'
 import { claudeSdkReasoningOptions } from '../src/claude-agent-process'
@@ -16,7 +17,30 @@ const selection = rawSelection.startsWith('claude:') ? rawSelection : `claude:${
 const source = resolveTokenSource('claude', selection)
 const requestedModel = source.resolveSpawnModel()
 const reasoningOptions = claudeSdkReasoningOptions(selection, claudeModelEffort(selection) ?? 'max')
+const reasoningMode = process.argv[3]?.trim() || 'production'
 const grokCompatibility = reasoningOptions.thinking?.type === 'disabled'
+
+function probeReasoningOptions(): {
+  effort?: EffortLevel
+  thinking?: { type: 'disabled' | 'adaptive' }
+} {
+  if (!grokCompatibility || reasoningMode === 'production') return reasoningOptions
+  switch (reasoningMode) {
+    case 'xhigh':
+      return { effort: 'xhigh', thinking: { type: 'disabled' } }
+    case 'max':
+      return { effort: 'max', thinking: { type: 'disabled' } }
+    case 'xhigh-adaptive':
+      return { effort: 'xhigh', thinking: { type: 'adaptive' } }
+    case 'max-adaptive':
+      return { effort: 'max', thinking: { type: 'adaptive' } }
+    default:
+      throw new Error('reasoning mode must be production, xhigh, max, xhigh-adaptive, or max-adaptive')
+  }
+}
+
+const queryReasoningOptions = probeReasoningOptions()
+const allowsNoThinking = queryReasoningOptions.thinking?.type === 'disabled'
 
 if (!source.isApiRoute()) {
   throw new Error(`${selection} is not a Claude API route`)
@@ -40,6 +64,9 @@ const timeout = setTimeout(() => abortController.abort(new Error('probe timed ou
 type StreamSummary = {
   selection: string
   requestedModel: string
+  reasoningMode: string
+  queryEffort: string | null
+  queryThinking: string | null
   initModel: string | null
   initModelMatchesRequested: boolean
   assistantModels: string[]
@@ -55,16 +82,22 @@ type StreamSummary = {
   sawToolResult: boolean
   sawStartMarker: boolean
   sawDoneMarker: boolean
+  observedEffort: string | null
   resultSubtype: string | null
   resultIsError: boolean | null
   protocolErrors: string[]
   runtimeError: string | null
+  rawPassed: boolean
+  sdkPassed: boolean
   passed: boolean
 }
 
 const summary: StreamSummary = {
   selection: source.selectionModel,
   requestedModel,
+  reasoningMode,
+  queryEffort: queryReasoningOptions.effort ?? null,
+  queryThinking: queryReasoningOptions.thinking?.type ?? null,
   initModel: null,
   initModelMatchesRequested: false,
   assistantModels: [],
@@ -80,10 +113,13 @@ const summary: StreamSummary = {
   sawToolResult: false,
   sawStartMarker: false,
   sawDoneMarker: false,
+  observedEffort: null,
   resultSubtype: null,
   resultIsError: null,
   protocolErrors: [],
   runtimeError: null,
+  rawPassed: false,
+  sdkPassed: false,
   passed: false,
 }
 
@@ -237,7 +273,15 @@ function inspectMessage(message: SDKMessage): void {
   }
   if (message.type === 'user') {
     const content = Array.isArray(message.message.content) ? message.message.content : []
-    if (content.some((block: any) => block?.type === 'tool_result')) summary.sawToolResult = true
+    for (const block of content as any[]) {
+      if (block?.type !== 'tool_result') continue
+      summary.sawToolResult = true
+      const resultText = typeof block.content === 'string'
+        ? block.content
+        : JSON.stringify(block.content ?? '')
+      const effort = resultText.match(/GROK_TOOL_OK:([a-z]+)/i)?.[1]
+      if (effort) summary.observedEffort = effort.toLowerCase()
+    }
     return
   }
   if (message.type === 'result') {
@@ -260,15 +304,15 @@ try {
     prompt: [
       'This is a transport compatibility probe.',
       'First output exactly PROBE_START as ordinary assistant text.',
-      'Then call Bash exactly once with: printf GROK_TOOL_OK',
+      'Then call Bash exactly once with: printf \'GROK_TOOL_OK:%s\' "$CLAUDE_EFFORT"',
       'After reading the tool result, output exactly PROBE_DONE and stop.',
       'Do not call any other tool.',
     ].join('\n'),
     options: {
       cwd: workDir,
       model: requestedModel,
-      ...reasoningOptions,
-      ...(grokCompatibility ? {} : { thinking: { type: 'adaptive' as const } }),
+      ...queryReasoningOptions,
+      ...(queryReasoningOptions.thinking ? {} : { thinking: { type: 'adaptive' as const } }),
       env,
       abortController,
       settingSources: [],
@@ -295,12 +339,12 @@ try {
   summary.assistantModels = [...assistantModels]
   summary.initModelMatchesRequested = summary.initModel === requestedModel
   summary.assistantModelRemapped = summary.assistantModels.some(model => model !== requestedModel)
-  summary.passed = summary.initModelMatchesRequested
-    && summary.rawHttpStatus === 200
+  summary.rawPassed = summary.rawHttpStatus === 200
     && summary.rawToolChoiceHonored
     && summary.rawProtocolErrors.length === 0
     && summary.rawRuntimeError === null
-    && (grokCompatibility || summary.sawThinking)
+  summary.sdkPassed = summary.initModelMatchesRequested
+    && (allowsNoThinking || summary.sawThinking)
     && summary.sawText
     && summary.sawToolUse
     && summary.sawToolResult
@@ -313,6 +357,7 @@ try {
     && summary.resultIsError === false
     && summary.protocolErrors.length === 0
     && summary.runtimeError === null
+  summary.passed = summary.rawPassed && summary.sdkPassed
   process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`)
   rmSync(root, { recursive: true, force: true })
 }

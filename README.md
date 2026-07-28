@@ -42,14 +42,16 @@ effort     = "xhigh"           # 复刻 GLM-5.2 最高思维
 base_url   = "https://api.wuhen-ai.com"
 auth_token = "<你的 Wuhen token>"
 model      = "grok-4.5"
+effort     = "xhigh"
 
 [claude.models.grokcc]
 base_url   = "https://catcodexapi.com" # Claude SDK 使用根地址，不追加 /v1
 auth_token = "<你的 CatCodex token>"
 model      = "grok-4.5"
+effort     = "xhigh"
 ```
 
-Grok 兼容档会省略 SDK `effort` 并禁用 thinking，降低 Anthropic Messages 兼容层的 content-block/tool-call 波动；上游若仍返回 `Content block not found`，错误会原样显示，不会静默切到其它模型。旧 `[codex.models.grok*]` 不再进入模型面板，启动边界也会拒绝。
+Grok 兼容档固定使用 SDK `effort: xhigh`（Grok 4.5 当前可完成工具链的最高兼容强度）并禁用 adaptive thinking。即使配置里遗留 `max`，Lodestar 也会在选择和 spawn 边界归一化为 `xhigh`；实测 `max` 会触发 `Content block not found` 或挂起。上游若仍失败，错误会原样显示，不会静默切到其它模型。旧 `[codex.models.grok*]` 不再进入模型面板，启动边界也会拒绝。
 
 **1. 装包**
 
