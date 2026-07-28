@@ -11,7 +11,7 @@ import {
 import { claudeModelEffort } from '../src/claude-models'
 import { resolveTokenSource } from '../src/token-source'
 
-const rawSelection = process.argv[2]?.trim() || 'claude:grokcc'
+const rawSelection = process.argv[2]?.trim() || 'claude:glm'
 const selection = rawSelection.startsWith('claude:') ? rawSelection : `claude:${rawSelection}`
 const source = resolveTokenSource('claude', selection)
 const requestedModel = source.resolveSpawnModel()

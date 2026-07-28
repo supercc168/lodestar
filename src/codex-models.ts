@@ -37,6 +37,10 @@ export function codexEnvKeyName(slug: string): string {
 }
 
 function wireApiOf(raw: CodexModelConfig): string {
+  // Grok 的 Chat Completions/Anthropic 兼容层实测不会可靠执行 Codex 工具；
+  // Responses 才能返回 function_call。与 effort=max 一样在 profile 边界锁死，
+  // 避免手改 config 后重新出现 Content block/tool call 故障。
+  if (/^grok(?:[-_.]|$)/i.test(raw.model?.trim() ?? '')) return 'responses'
   const w = raw.wire_api?.trim()
   return w === 'responses' || w === 'chat' ? w : DEFAULT_WIRE_API
 }
@@ -142,6 +146,11 @@ export function codexModelConfigured(model: string | null | undefined): boolean 
 export function codexModelEffort(model: string | null | undefined): CodexReasoningEffort | undefined {
   const p = codexModelProfile(model)
   if (!p || p.route !== 'api') return undefined
+  // Wuhen grok-4.5 在 Codex Responses 下用 xhigh 会把 function arguments
+  // 拼成 `{}{...}`，app-server 因 trailing characters 无法执行工具；max 实测
+  // 能稳定产出合法 JSON。Grok coding 档位因此在路由边界锁 max，避免配置漂移
+  // 重新引入“只回复、不执行工具”。
+  if (/^grok(?:[-_.]|$)/i.test(p.modelId)) return 'max'
   const raw = config.codex.models[p.name]?.effort?.trim()
   return raw && isCodexReasoningEffort(raw) ? raw : undefined
 }

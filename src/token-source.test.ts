@@ -121,37 +121,37 @@ describe('token-source Claude login vs api', () => {
   })
 })
 
-describe('token-source Feishu selected Claude API model', () => {
-  let prevGrokcc: unknown
+describe('token-source selected Claude API model', () => {
+  let prevRelay: unknown
 
   beforeEach(() => {
-    prevGrokcc = config.claude.models.grokcc
-    ;(config.claude as any).models.grokcc = {
-      model: 'grok-selected-by-feishu',
-      base_url: 'https://grokcc.example',
-      auth_token: 'grokcc-token',
+    prevRelay = config.claude.models.relay
+    ;(config.claude as any).models.relay = {
+      model: 'relay-selected-by-feishu',
+      base_url: 'https://relay.example',
+      auth_token: 'relay-token',
       effort: 'xhigh',
     }
   })
 
   afterEach(() => {
-    ;(config.claude as any).models.grokcc = prevGrokcc
+    ;(config.claude as any).models.relay = prevRelay
   })
 
-  test('grokcc selection keeps the profile model for SDK and every child-model alias', () => {
-    const source = resolveTokenSource('claude', 'claude:grokcc')
-    expect(source.selectionModel).toBe('claude:grokcc')
-    expect(source.resolveSpawnModel()).toBe('grok-selected-by-feishu')
+  test('selection keeps the profile model for SDK and every child-model alias', () => {
+    const source = resolveTokenSource('claude', 'claude:relay')
+    expect(source.selectionModel).toBe('claude:relay')
+    expect(source.resolveSpawnModel()).toBe('relay-selected-by-feishu')
 
     const env = source.spawnEnv({
       ANTHROPIC_DEFAULT_OPUS_MODEL: 'stale-model',
     })
-    expect(env.ANTHROPIC_BASE_URL).toBe('https://grokcc.example')
-    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('grokcc-token')
-    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('grok-selected-by-feishu')
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('grok-selected-by-feishu')
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('grok-selected-by-feishu')
-    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('grok-selected-by-feishu')
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://relay.example')
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('relay-token')
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('relay-selected-by-feishu')
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('relay-selected-by-feishu')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('relay-selected-by-feishu')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('relay-selected-by-feishu')
   })
 })
 
@@ -169,6 +169,16 @@ describe('token-source Codex login vs api', () => {
         api_key: 'wu-key',
         route: 'api',
         effort: 'max',
+      },
+      grok: {
+        display_name: 'Codex · Grok 4.5 · 无痕',
+        description: 'test',
+        model: 'grok-4.5',
+        base_url: 'https://wuhen.example',
+        wire_api: 'responses',
+        api_key: 'grok-key',
+        route: 'api',
+        effort: 'xhigh', // session picker resolves Grok to the compatibility max.
       },
     }
   })
@@ -201,6 +211,17 @@ describe('token-source Codex login vs api', () => {
     expect(Object.keys(o.env).length).toBeGreaterThan(0)
     expect(Object.values(o.env)).toContain('wu-key')
   })
+
+  test('飞书 Grok 选择保持 codex:grok → grok-4.5 + Responses,不改成 GPT', () => {
+    const source = resolveTokenSource('codex', 'codex:grok')
+    expect(source.selectionModel).toBe('codex:grok')
+    expect(source.provider).toBe('codex')
+    expect(source.resolveSpawnModel()).toBe('grok-4.5')
+    const o = source.spawnOverrides()
+    expect(o.modelId).toBe('grok-4.5')
+    expect(o.configArgs).toContain('model_providers.lodestar_grok.wire_api="responses"')
+    expect(Object.values(o.env)).toContain('grok-key')
+  })
 })
 
 describe('token-source list + usage helpers', () => {
@@ -215,6 +236,6 @@ describe('token-source list + usage helpers', () => {
     expect(resolveUsageSource('codex', 'gpt-5.6-sol')).toBe('codex')
     expect(resolveUsageSource('claude', 'claude:fable')).toBe('not_applicable')
     expect(resolveUsageSource('claude', 'claude:glm')).toBe('glm')
-    expect(resolveUsageSource('claude', 'claude:grok')).toBe('not_applicable')
+    expect(resolveUsageSource('claude', 'claude:relay')).toBe('not_applicable')
   })
 })

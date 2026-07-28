@@ -18,6 +18,7 @@ import {
   codexModelConfigured,
   codexModelEffort,
   codexModelIsApiRoute,
+  resolveCodexModelId,
 } from './codex-models'
 import { log } from './log'
 import {
@@ -70,26 +71,6 @@ const FIXED_MODEL_CHOICES = [
     description: 'GLM 第三方路由 · max。',
     effort: 'max' as AgentReasoningEffort,
   },
-  {
-    // Grok 第三方路由 · 无痕(wuhen-ai,Anthropic 兼容端点):与 GLM 同构,走
-    // config.toml [claude.models.grok] 的 base_url + auth_token + model。
-    // effort 锁死值由 config 的 effort 覆盖(第三方中转惯例 xhigh,见
-    // resolvedEffort);未配置时 picker 仍显示,选择被 onModelEffortSelect 拦截。
-    provider: 'claude' as const,
-    model: 'claude:grok',
-    displayName: 'Claude · Grok 4.5 · 无痕',
-    description: 'Grok 4.5 · 无痕(wuhen-ai,Anthropic 兼容端点)。',
-    effort: 'max' as AgentReasoningEffort,
-  },
-  {
-    // Grok 第三方路由 · CatCodex(catcodexapi):第二个 grok 渠道,走
-    // [claude.models.grokcc]。与 grok(无痕)同构;displayName 带渠道名以便区分。
-    provider: 'claude' as const,
-    model: 'claude:grokcc',
-    displayName: 'Claude · Grok 4.5 · CatCodex',
-    description: 'Grok 4.5 · CatCodex(catcodexapi,Anthropic 兼容端点)。',
-    effort: 'max' as AgentReasoningEffort,
-  },
 ]
 
 /** provider 的默认固定档位(该 provider 的第一个固定项)。归一化未知/退役
@@ -111,6 +92,19 @@ function resolvedEffort(item: typeof FIXED_MODEL_CHOICES[number]): AgentReasonin
     if (configured) return configured
   }
   return item.effort
+}
+
+function configuredCodexGrokChoice(legacyModel: string | null | undefined) {
+  if (!/^claude:grok(?:cc)?$/i.test(legacyModel ?? '')) return null
+  const legacySlug = legacyModel!.slice('claude:'.length)
+  const choices = codexModelChoices()
+  const candidates = [`codex:${legacySlug}`, 'codex:grok']
+  return candidates
+    .map(model => choices.find(choice => choice.model === model))
+    .find(choice => choice
+      && codexModelConfigured(choice.model)
+      && /^grok(?:[-_.]|$)/i.test(resolveCodexModelId(choice.model) ?? ''))
+    ?? null
 }
 
 /** 把持久化的 (provider, model, effort) 归一到当前固定选项集。
@@ -141,6 +135,22 @@ export function normalizeFixedModelSelection(
   return { model: choice.model, effort: resolvedEffort(choice) }
 }
 
+/** 旧版飞书曾把 Grok 暴露成 claude:grok/grokcc。若用户已显式配置同名
+ * 或 canonical [codex.models.grok] Responses 档位，恢复时迁到 Codex 后端，
+ * 保留用户选择的 Grok 语义；凭据仍只读取 [codex.models.*]，不跨 provider
+ * 偷拿 token。其它选择继续走固定项归一化。 */
+export function normalizePersistedModelSelection(
+  provider: AgentProvider,
+  model: string | null | undefined,
+  effort: AgentReasoningEffort | null | undefined,
+): { provider: AgentProvider; model: string; effort: AgentReasoningEffort } {
+  if (provider === 'claude') {
+    const grok = configuredCodexGrokChoice(model)
+    if (grok) return { provider: 'codex', model: grok.model, effort: resolvedEffort(grok) }
+  }
+  return { provider, ...normalizeFixedModelSelection(provider, model, effort) }
+}
+
 /** 新 session(无持久化 model 选择)的默认档位,取自 config.toml 的
  * [claude] default_model。接受档位 key("glm")或固定项 model("claude:glm" /
  * "gpt-5.6-sol";legacy 裸 "gpt-5.5" 自动迁移到 gpt-5.6-sol)。未配置 / 无法
@@ -158,6 +168,11 @@ export function configuredDefaultSelection(): {
   // legacy:内建 codex 档从 gpt-5.5 升级到 gpt-5.6-sol(2026-07-09),旧 config
   // 写的裸 "gpt-5.5" 迁移到新内建档,不让老配置静默退回 Fable 5。
   const bare = raw === 'gpt-5.5' ? 'gpt-5.6-sol' : raw
+  if (/^(?:claude:)?grok(?:cc)?$/i.test(bare)) {
+    const legacy = bare.startsWith('claude:') ? bare : `claude:${bare}`
+    const grok = configuredCodexGrokChoice(legacy)
+    if (grok) return { provider: 'codex', model: grok.model, effort: resolvedEffort(grok) }
+  }
   const wanted = bare.startsWith('claude:') || bare.startsWith('codex:') || bare === 'gpt-5.6-sol'
     ? bare
     : `claude:${bare}`
@@ -166,7 +181,7 @@ export function configuredDefaultSelection(): {
   return { provider: hit.provider, model: hit.model, effort: resolvedEffort(hit) }
 }
 
-/** 第三方 API 路由(GLM/Grok)未配 token 时的描述后缀,提示去 config.toml 设置。
+/** 第三方 API 路由未配 token 时的描述后缀,提示去 config.toml 设置。
  * section 名按 model 推导(claude:glm → [claude.models.glm]),不再写死 glm。 */
 function choiceDescription(item: typeof FIXED_MODEL_CHOICES[number]): string {
   if (item.provider === 'claude' && claudeModelIsApiRoute(item.model) && !claudeModelConfigured(item.model)) {
@@ -307,7 +322,7 @@ export async function onModelEffortSelect(
   if (!fixed || resolvedEffort(fixed) !== effort) {
     return { ok: false, message: `${agentProviderLabel(provider)} · ${model}/${effort} 不在固定选项中` }
   }
-  // 第三方 API 路由(GLM/Grok)必须先在 lodestar config 配好 token 才能切换 ——
+  // 第三方 API 路由必须先在 lodestar config 配好 token 才能切换 ——
   // 官方登录档位(Fable 5/Opus)无需配置。拦截未配置的第三方档位,给出清晰指引。
   // label/section 按 model 推导(claude:glm → GLM / [claude.models.glm]),不再写死 GLM。
   if (provider === 'claude' && claudeModelIsApiRoute(model) && !claudeModelConfigured(model)) {

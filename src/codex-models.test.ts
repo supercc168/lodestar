@@ -28,6 +28,15 @@ mock.module('./config', () => ({
           requires_openai_auth: 'true',
           model: 'gpt-5.6-sol',
         },
+        grok: {
+          display_name: 'Codex · Grok 4.5 · 无痕',
+          description: 'Grok 4.5 via Codex Responses',
+          base_url: 'https://api.wuhen-ai.com',
+          wire_api: 'responses',
+          api_key: 'sk-grok',
+          model: 'grok-4.5',
+          effort: 'xhigh', // Grok compatibility lock overrides this to max.
+        },
       },
     },
     claude: { env: {}, models: {} },
@@ -91,6 +100,11 @@ describe('codexConfigArgs', () => {
   test('defaults wire_api to chat', () => {
     const args = codexConfigArgs({ base_url: 'https://x' }, 'x')
     expect(args).toContain('model_providers.lodestar_x.wire_api="chat"')
+  })
+  test('Grok model locks wire_api to responses even if config says chat', () => {
+    const args = codexConfigArgs({ base_url: 'https://x', model: 'grok-4.5', wire_api: 'chat' }, 'grok')
+    expect(args).toContain('model_providers.lodestar_grok.wire_api="responses"')
+    expect(args).not.toContain('model_providers.lodestar_grok.wire_api="chat"')
   })
 })
 
@@ -157,11 +171,23 @@ describe('config-driven lookups', () => {
     const login = codexSpawnOverrides('gpt-5.5')
     expect(login).toEqual({ modelId: 'gpt-5.5', configArgs: [], env: {} })
   })
+  test('Grok slot keeps the selected model and Responses transport', () => {
+    const grok = codexSpawnOverrides('codex:grok')
+    expect(grok.modelId).toBe('grok-4.5')
+    expect(grok.configArgs).toContain('model_providers.lodestar_grok.wire_api="responses"')
+    expect(grok.env).toEqual({ LODESTAR_CODEX_GROK_KEY: 'sk-grok' })
+    expect(codexModelEffort('codex:grok')).toBe('max')
+  })
   test('codexModelChoices lists only api slots (incl unconfigured)', () => {
     const choices = codexModelChoices()
     const models = choices.map(c => c.model).sort()
-    expect(models).toEqual(['codex:broken', 'codex:kimi', 'codex:wuhen'])
+    expect(models).toEqual(['codex:broken', 'codex:grok', 'codex:kimi', 'codex:wuhen'])
     expect(choices.find(c => c.model === 'codex:kimi')!.effort).toBe('high')
+    expect(choices.find(c => c.model === 'codex:grok')).toMatchObject({
+      provider: 'codex',
+      displayName: 'Codex · Grok 4.5 · 无痕',
+      effort: 'max',
+    })
   })
   test('codexModelRequiresOpenaiAuth: only requires_openai_auth api slots keep the login precheck', () => {
     // 无痕:API 档但仍需 ChatGPT 登录态 → 保留预检

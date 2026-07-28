@@ -616,14 +616,14 @@ export class Session {
     this.selectedProvider = selection?.provider ?? 'claude'
     this.selectedModel = selection?.model ?? null
     this.selectedEffort = selection?.effort ?? null
-    // 历史持久化的选择归一到当前固定选项集,避免旧 session-model-map 把
-    // session 带到已下线的 profile(如 claude:deepseek)或把 legacy claude:glm
-    // 停在误导标签上(迁移到 claude:fable,底层同为 claude-fable-5)。仅在有
-    // 持久化选择时归一;无选择(默认)保持 null,交给 spawn 默认逻辑。
+    // 历史持久化的选择归一到当前固定选项集；旧 Claude Grok 在显式配置了
+    // codex:grok 时迁到 Responses 后端。仅在有持久化选择时归一；无选择
+    // (默认)保持 null,交给 spawn 默认逻辑。
     if (selection) {
-      const norm = sessionModel.normalizeFixedModelSelection(
+      const norm = sessionModel.normalizePersistedModelSelection(
         this.selectedProvider, this.selectedModel, this.selectedEffort,
       )
+      this.selectedProvider = norm.provider
       this.selectedModel = norm.model
       this.selectedEffort = norm.effort
     }

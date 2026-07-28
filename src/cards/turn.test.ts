@@ -409,7 +409,7 @@ describe('main conversation card rendering', () => {
     expect(glm.content).toContain('GLM 额度')
     expect(glm.content).toContain('23%')
 
-    for (const model of ['claude:fable', 'claude:opus', 'claude:grok']) {
+    for (const model of ['claude:fable', 'claude:opus', 'claude:relay']) {
       const element = consoleUsageElement({
         sessionName: 'probe',
         status: 'idle',

@@ -14,6 +14,7 @@
 | `test-inject.ts` | 通过 daemon debug unix socket 注入消息，复用真实 Feishu message id 和 `handleMessage` 路径。 |
 | `test-mid-turn-rotation.ts` | 复现中途换卡场景；注入消息后截取当天 `daemon-YYYY-MM-DD.log` 中的相关日志。 |
 | `claude-stream-probe.ts` | 隔离验证 Claude API 档位的所选 model、原始 SSE content-block 顺序和 thinking/text/tool-use 能力；不发送飞书消息。 |
+| `codex-responses-probe.ts` | 隔离验证 Codex API 档位是否使用 Responses transport，并真实完成一次 shell 工具调用；不发送飞书消息。 |
 | `cardkit-probe.ts` | 对 Card Kit 创建、`id_convert`、元素 PUT 等 API 组合做真实探针。 |
 | `seed-debug-ctx.ts` | 查询目标群成员并写入 `debug-context.json`，用于 debug socket 注入前的上下文种子。 |
 | `postinstall.cjs` | npm 安装后尝试在真实终端启动 `lodestar-setup`；Windows/macOS/Linux 分支各自处理终端继承。 |
