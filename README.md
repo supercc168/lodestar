@@ -109,7 +109,7 @@ pwsh -NoProfile -File install/yiui-gsd/install.ps1
 bash install/yiui-gsd/verify.sh           # 装完校验
 ```
 
-安装器默认用 Node.js >= 18 重放并校验 Codex / Claude 子 agent 策略，不依赖 macOS 的 `pwsh`；Codex 全部使用 GPT-5.6 Sol，Claude 第一方按任务层级使用 Opus 5 / Fable 5 / Sonnet 5，第三方 Claude API 档始终锁当前模型。`pwsh` 入口仅保留给 Windows 或旧脚本调用。
+安装器默认用 Node.js >= 18 重放并校验 Codex / Claude 子 agent 策略，不依赖 macOS 的 `pwsh`；Codex 全部使用 GPT-5.6 Sol，Claude 第一方以飞书当前主力填 fable/opus/sonnet alias、light/haiku 固定 Sonnet 5（选 Opus 不注入 Fable，选 Fable 不注入 Opus），第三方 Claude API 档四个 alias 始终锁当前模型。`pwsh` 入口仅保留给 Windows 或旧脚本调用。
 
 任务真相源是 `.gsd/TRACKER.md` 与 `.gsd/<slug>/.planning/STATE.md`。允许多个 slug 同时为运行中；根 `.planning/` 只提供稳定的 `workstreams/<slug>` 路由和共享 `PROJECT.md`，不再指向单个任务。
 
