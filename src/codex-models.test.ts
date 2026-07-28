@@ -2,6 +2,11 @@ import { describe, expect, mock, test } from 'bun:test'
 
 mock.module('./config', () => ({
   config: {
+    // mock.module 是进程级的；补齐共享 runtime，避免污染同批运行的 Session 测试。
+    runtime: {
+      projects_root: process.cwd(),
+      live_elapsed: 'bucket',
+    },
     codex: {
       env: {},
       models: {
@@ -47,6 +52,11 @@ const {
 } = await import('./codex-models')
 
 describe('codex model slug helpers', () => {
+  test('shared config mock includes runtime elapsed defaults', async () => {
+    const { config } = await import('./config')
+    expect(config.runtime).toMatchObject({ live_elapsed: 'bucket' })
+  })
+
   test('provider slug is lodestar-prefixed and sanitized', () => {
     expect(codexProviderSlug('wuhen-ai')).toBe('lodestar_wuhen_ai')
   })

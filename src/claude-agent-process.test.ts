@@ -5,6 +5,11 @@ import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test'
 
 mock.module('./config', () => ({
   config: {
+    // mock.module 是进程级的；补齐共享 runtime，避免污染同批运行的 Session 测试。
+    runtime: {
+      projects_root: homedir(),
+      live_elapsed: 'bucket',
+    },
     claude: {
       env: {},
       models: {},
@@ -42,6 +47,10 @@ const { config } = await import('./config')
 beforeEach(() => resetClaudeContextWindowMaxCache())
 
 describe('Claude model profiles', () => {
+  test('shared config mock includes runtime elapsed defaults', () => {
+    expect(config.runtime).toMatchObject({ live_elapsed: 'bucket' })
+  })
+
   test('uses SDK default executable when no global Claude command is found', () => {
     const executable = resolveClaudeExecutableConfig({
       platform: 'win32',
