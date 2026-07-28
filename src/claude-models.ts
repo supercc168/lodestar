@@ -27,9 +27,9 @@ type DefaultClaudeModelConfig = Required<
 // Fable 5 是 Anthropic 当前最强模型(1M ctx / 128K out),官方 API 路由可用;
 // GLM 等第三方路由不认这个 id,需在 profile 里显式配 model 覆盖。
 export const DEFAULT_CLAUDE_SDK_MODEL = 'claude-fable-5'
-/** Grok 4.5 在 Anthropic Messages 兼容路由上的最高可用 effort。
- * `max` 实测会在工具轮报 Content block not found 或直接挂起。 */
-export const GROK_COMPAT_EFFORT = 'xhigh' as const
+/** xAI 官方为 Grok 4.5 定义的最高 reasoning effort。
+ * Claude SDK 的 xhigh 只对指定 Claude 模型原生生效，Grok 应显式使用 high。 */
+export const GROK_OFFICIAL_MAX_EFFORT = 'high' as const
 
 const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
   // 第一方 Anthropic 档位:model id 直传 Claude Code(reclaude → --model),
@@ -227,11 +227,11 @@ export function claudeModelConfigured(model: string | null | undefined): boolean
 
 /** 该档位在 config 里声明的思考强度(仅第三方 API 路由有意义,官方登录档位
  * 不配)。非法/未配返回 undefined,由调用方回落到 FIXED_MODEL_CHOICES 的锁死
- * 值。Grok 强制 xhigh：这是实测能完成工具链的最高兼容档，配置不能改成 max。 */
+ * 值。Grok 强制 high：这是 xAI 官方最高档，也已通过两条 Claude SDK 路由实测。 */
 export function claudeModelEffort(model: string | null | undefined): ClaudeReasoningEffort | undefined {
   const profile = claudeModelProfile(model)
   if (!profile || profile.route !== 'api') return undefined
-  if (claudeModelIsGrok(model)) return GROK_COMPAT_EFFORT
+  if (claudeModelIsGrok(model)) return GROK_OFFICIAL_MAX_EFFORT
   const raw = mergedConfig(profile.name).effort?.trim()
   return raw && isClaudeReasoningEffort(raw) ? raw : undefined
 }

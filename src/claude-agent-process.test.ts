@@ -127,14 +127,14 @@ describe('Claude model profiles', () => {
     expect(claudeModelIsApiRoute('claude:opus')).toBe(false)
   })
 
-  test('Grok forces highest compatible xhigh and disables adaptive thinking', () => {
+  test('Grok forces official maximum high and disables Claude adaptive thinking', () => {
     const prev = config.claude.models
     ;(config.claude as any).models = {
       grok: { model: 'grok-4.5', base_url: 'https://grok.example', auth_token: 't' },
     }
     try {
       expect(claudeSdkReasoningOptions('claude:grok', 'max')).toEqual({
-        effort: 'xhigh',
+        effort: 'high',
         thinking: { type: 'disabled' },
       })
       expect(claudeSdkReasoningOptions('claude:fable', 'max')).toEqual({ effort: 'max' })

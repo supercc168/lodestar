@@ -249,8 +249,8 @@ projects_root = "~/"     # 项目根目录,可选,默认主目录
 | **Claude · Fable 5** | 走你的 Anthropic 登录态 |
 | **Claude · Opus 5** | 走你的 Anthropic 登录态,能力最强 |
 | **Claude · GLM** | GLM-5.2,**1M 超长上下文、中文友好**(需配 GLM key) |
-| **Claude · Grok 4.5 · 无痕** | Wuhen Anthropic Messages 路由(需配置 token),由 Claude Agent SDK 调用 |
-| **Claude · Grok 4.5 · CatCodex** | CatCodex Anthropic Messages 路由(需配置 token),由 Claude Agent SDK 调用 |
+| **Claude · Grok 4.5 · 无痕** | Wuhen Anthropic Messages 路由(需配置 token),由 Claude Agent SDK 以官方最高 `high` 调用 |
+| **Claude · Grok 4.5 · CatCodex** | CatCodex Anthropic Messages 路由(需配置 token),由 Claude Agent SDK 以官方最高 `high` 调用 |
 | **Codex · GPT-5.6 Sol** | OpenAI Codex(需登录 ChatGPT),`max` 推理强度 |
 
 ![图 7.3 model 模型切换面板](images/feishu/7.3-model-panel.png)

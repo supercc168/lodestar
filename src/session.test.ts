@@ -6891,12 +6891,12 @@ describe('Grok routes through Claude', () => {
         expect(normalizePersistedModelSelection('codex', `codex:${name}`, 'max')).toEqual({
           provider: 'claude',
           model: `claude:${name}`,
-          effort: 'xhigh',
+          effort: 'high',
         })
         expect(normalizePersistedModelSelection('claude', `claude:${name}`, 'max')).toEqual({
           provider: 'claude',
           model: `claude:${name}`,
-          effort: 'xhigh',
+          effort: 'high',
         })
       }
     } finally {
@@ -6967,7 +6967,7 @@ describe('configuredDefaultSelection ([codex] api 档位)', () => {
         base_url: 'https://api.wuhen-ai.com',
         wire_api: 'responses',
         api_key: 't',
-        effort: 'xhigh',
+        effort: 'high',
       },
     }
     try {
@@ -6975,13 +6975,13 @@ describe('configuredDefaultSelection ([codex] api 档位)', () => {
       expect(configuredDefaultSelection()).toEqual({
         provider: 'claude',
         model: 'claude:grok',
-        effort: 'xhigh',
+        effort: 'high',
       })
       ;(config.claude as any).defaultModel = 'grokcc'
       expect(configuredDefaultSelection()).toEqual({
         provider: 'claude',
         model: 'claude:grokcc',
-        effort: 'xhigh',
+        effort: 'high',
       })
     } finally {
       ;(config.claude as any).models = prevClaudeModels
@@ -7333,7 +7333,7 @@ describe('Session provider switching', () => {
         base_url: 'https://api.wuhen-ai.com',
         wire_api: 'responses',
         api_key: 'grok-token',
-        effort: 'xhigh', // Legacy Codex route is hidden; Claude locks Grok to xhigh.
+        effort: 'xhigh', // Legacy Codex route is hidden; Claude normalizes Grok to official high.
       },
     }
     try {
@@ -7354,11 +7354,11 @@ describe('Session provider switching', () => {
       expect(choices.some((c: any) => c.provider === 'codex' && c.model.includes('grok'))).toBe(false)
       expect(choices.find((c: any) => c.model === 'claude:grok')).toMatchObject({
         provider: 'claude', displayName: 'Claude · Grok 4.5 · 无痕',
-        efforts: [{ effort: 'xhigh' }],
+        efforts: [{ effort: 'high' }],
       })
       expect(choices.find((c: any) => c.model === 'claude:grokcc')).toMatchObject({
         provider: 'claude', displayName: 'Claude · Grok 4.5 · CatCodex',
-        efforts: [{ effort: 'xhigh' }],
+        efforts: [{ effort: 'high' }],
       })
     } finally {
       ;(config.claude as any).models = prevClaude
@@ -7422,11 +7422,11 @@ describe('Session provider switching', () => {
         installSuccessfulIdleRebuild(session)
         const incompatible = await session.onModelEffortSelect(model, 'max', '', 'ou_user', 'claude')
         expect(incompatible.ok).toBe(false)
-        const result = await session.onModelEffortSelect(model, 'xhigh', '', 'ou_user', 'claude')
+        const result = await session.onModelEffortSelect(model, 'high', '', 'ou_user', 'claude')
         expect(result.ok).toBe(true)
         expect(session.selectedProvider).toBe('claude')
         expect(session.selectedModel).toBe(model)
-        expect(session.selectedEffort).toBe('xhigh')
+        expect(session.selectedEffort).toBe('high')
       }
     } finally {
       ;(config.claude as any).models = prev
@@ -7490,7 +7490,7 @@ describe('Session provider switching', () => {
         session.proc = proc
         session.selectedProvider = 'claude'
         session.selectedModel = 'claude:fable'
-        const result = await session.onModelEffortSelect(model, 'xhigh', '', 'ou_user', 'claude')
+        const result = await session.onModelEffortSelect(model, 'high', '', 'ou_user', 'claude')
         expect(result.ok).toBe(false)
         expect(result.message).toContain(`[claude.models.${model.slice('claude:'.length)}]`)
         expect(session.selectedModel).toBe('claude:fable')

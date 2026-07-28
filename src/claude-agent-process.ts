@@ -26,7 +26,7 @@ import {
 import {
   claudeModelKey,
   claudeModelIsGrok,
-  GROK_COMPAT_EFFORT,
+  GROK_OFFICIAL_MAX_EFFORT,
   resolveClaudeSdkModel,
 } from './claude-models'
 import { resolveTokenSource } from './token-source'
@@ -77,14 +77,14 @@ type PendingUserDialog = {
   cleanup?: () => void
 }
 
-/** CatCodex/Wuhen 的 Anthropic 兼容层不适配 Claude 的 max/adaptive thinking。
- * Grok 固定 xhigh + disabled thinking；其它 Claude 档位保持原语义。 */
+/** Grok 固定使用 xAI 官方最高 high；disabled 只关闭 Claude 专属 adaptive
+ * thinking 控制，Grok 自身 reasoning 仍由模型执行。其它 Claude 档保持原语义。 */
 export function claudeSdkReasoningOptions(
   model: string | null | undefined,
   effort: ClaudeReasoningEffort,
 ): { effort?: EffortLevel; thinking?: { type: 'disabled' } } {
   return claudeModelIsGrok(model)
-    ? { effort: GROK_COMPAT_EFFORT, thinking: { type: 'disabled' } }
+    ? { effort: GROK_OFFICIAL_MAX_EFFORT, thinking: { type: 'disabled' } }
     : { effort: effort as EffortLevel }
 }
 

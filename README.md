@@ -42,16 +42,16 @@ effort     = "xhigh"           # 复刻 GLM-5.2 最高思维
 base_url   = "https://api.wuhen-ai.com"
 auth_token = "<你的 Wuhen token>"
 model      = "grok-4.5"
-effort     = "xhigh"
+effort     = "high"
 
 [claude.models.grokcc]
 base_url   = "https://catcodexapi.com" # Claude SDK 使用根地址，不追加 /v1
 auth_token = "<你的 CatCodex token>"
 model      = "grok-4.5"
-effort     = "xhigh"
+effort     = "high"
 ```
 
-Grok 兼容档固定使用 SDK `effort: xhigh`（Grok 4.5 当前可完成工具链的最高兼容强度）并禁用 adaptive thinking。即使配置里遗留 `max`，Lodestar 也会在选择和 spawn 边界归一化为 `xhigh`；实测 `max` 会触发 `Content block not found` 或挂起。上游若仍失败，错误会原样显示，不会静默切到其它模型。旧 `[codex.models.grok*]` 不再进入模型面板，启动边界也会拒绝。
+[xAI 官方 reasoning 文档](https://docs.x.ai/developers/model-capabilities/text/reasoning)为 Grok 4.5 定义的 effort 是 `low` / `medium` / `high`，最高且默认档为 `high`；直连 xAI Responses API 时对应 `reasoning: { "effort": "high" }`。Lodestar 经 Claude Agent SDK 使用 `effort: "high"`（实际转为 Claude Code `--effort high`），并用 `thinking: disabled` 避免附加 Claude 专属 adaptive-thinking 协议；这不会关闭 Grok 自身 reasoning，真实探针仍能看到 thinking。配置里遗留的 `xhigh` / `max` 会被归一化为官方 `high`。上游若失败，错误会原样显示，不会静默切到其它模型。旧 `[codex.models.grok*]` 不再进入模型面板，启动边界也会拒绝。
 
 **1. 装包**
 

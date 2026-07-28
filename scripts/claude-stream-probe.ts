@@ -26,16 +26,20 @@ function probeReasoningOptions(): {
 } {
   if (!grokCompatibility || reasoningMode === 'production') return reasoningOptions
   switch (reasoningMode) {
+    case 'high':
+      return { effort: 'high', thinking: { type: 'disabled' } }
     case 'xhigh':
       return { effort: 'xhigh', thinking: { type: 'disabled' } }
     case 'max':
       return { effort: 'max', thinking: { type: 'disabled' } }
+    case 'high-adaptive':
+      return { effort: 'high', thinking: { type: 'adaptive' } }
     case 'xhigh-adaptive':
       return { effort: 'xhigh', thinking: { type: 'adaptive' } }
     case 'max-adaptive':
       return { effort: 'max', thinking: { type: 'adaptive' } }
     default:
-      throw new Error('reasoning mode must be production, xhigh, max, xhigh-adaptive, or max-adaptive')
+      throw new Error('reasoning mode must be production, high, xhigh, max, high-adaptive, xhigh-adaptive, or max-adaptive')
   }
 }
 
