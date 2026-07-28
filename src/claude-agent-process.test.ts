@@ -225,9 +225,10 @@ describe('Claude model profiles', () => {
       expect(loginEnv.ANTHROPIC_BASE_URL).toBeUndefined()
       expect(loginEnv.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
       expect(loginEnv.GSD_RUNTIME).toBe('claude')
-      expect(loginEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-fable-5')
+      // opus 登录档：主力 Opus 5，light Sonnet 5，不注入 Fable
+      expect(loginEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-opus-5')
       expect(loginEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5')
-      expect(loginEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-fable-5')
+      expect(loginEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-opus-5')
       expect(loginEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-sonnet-5')
 
       // GLM 第三方路由:注入自己的 base_url + auth_token,但残留的官方 key
@@ -279,23 +280,22 @@ describe('Claude model profiles', () => {
       expect(glmEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.2[1m]')
       expect(glmEnv.GSD_RUNTIME).toBe('claude')
 
-      // 官方登录档位:宿主和 [claude.env] 的四种别名不能泄漏；改用
-      // GSD adaptive tier 对应的最新第一方模型组合。
+      // 官方登录档位:宿主和 [claude.env] 的四种别名不能泄漏；
+      // 按飞书选定主力注入（opus → 全主力 Opus 5 + light Sonnet 5）。
       const opus = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:opus' })
       const opusEnv = (opus as any).buildSpawnEnv()
-      expect(opusEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-fable-5')
+      expect(opusEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-opus-5')
       expect(opusEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5')
-      expect(opusEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-fable-5')
+      expect(opusEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-opus-5')
       expect(opusEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-sonnet-5')
       expect(opusEnv.ANTHROPIC_BASE_URL).toBeUndefined()
       expect(opusEnv.GSD_RUNTIME).toBe('claude')
 
-      // 新群尚未显式选择模型时，SDK 主模型回落 Fable 5；子 agent 仍按
-      // 同一套第一方 adaptive tier 组合分配。
+      // 新群尚未显式选择模型时，SDK 主模型回落 Fable 5；子 agent 主力=Fable 5、light=Sonnet 5。
       const defaultLogin = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max' })
       const defaultEnv = (defaultLogin as any).buildSpawnEnv()
       expect(defaultEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-fable-5')
-      expect(defaultEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5')
+      expect(defaultEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-fable-5')
       expect(defaultEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-fable-5')
       expect(defaultEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-sonnet-5')
       expect(defaultEnv.GSD_RUNTIME).toBe('claude')

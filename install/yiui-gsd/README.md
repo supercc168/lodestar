@@ -76,7 +76,7 @@ bash install/yiui-gsd/install.sh --skip-core --project ~/work/foo
 - `~/.codex/gsd-core/VERSION` 与 `~/.claude/gsd-core/VERSION` 都存在
 - Codex/Claude 两侧都有全局 `gsd-*` skills 和 agents
 - Codex agent TOML 与 catalog 对齐（Sol、tier effort、无 `service_tier="flex"`）
-- Claude agent Markdown 按 catalog tier 写 `model: opus|sonnet|haiku`，workstream 固定 `resolve_model_ids=false` 保留 alias；第一方解析为 Opus 5 / Fable 5 / Sonnet 5，第三方 API 路由仍全部锁回当前模型
+- Claude agent Markdown 按 catalog tier 写 `model: opus|sonnet|haiku`，workstream 固定 `resolve_model_ids=false` 保留 alias；第一方 heavy/standard 解析为飞书当前主力（Fable 5 或 Opus 5）、light=Sonnet 5（选 Opus 不注入 Fable），第三方 API 路由仍全部锁回当前模型
 - 全局 GSD 默认关闭 pattern mapper、非阻断 post-planning gap scan、plan bounce、plan convergence、cross-AI execution、外部 code-review command 和 GSD 1.8 Claude orchestration，减少重复分析、嵌套编排和旧配置绕过同 provider 策略
 - `workflow.inline_plan_threshold=2`：单个 PLAN 不超过两个任务时由当前 agent 原地执行，不再支付 executor 子 agent 的启动、等待和报告回传开销；更复杂计划保留隔离执行
 - 项目存在 `.agents/skills/yiui-gsd/SKILL.md`
@@ -104,6 +104,6 @@ node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs <command> [options]
 `assert-finalization-gate`、`bootstrap-autoui-task` 和 `verify-install`。
 同名 `.ps1` 文件保留为 Windows/旧提示词的转发包装层。这样 macOS 上即使 PowerShell 启动缓存损坏，也不影响安装、策略校验或 GSD 状态操作。
 
-Lodestar 会在子进程边界设置 `GSD_RUNTIME`：GPT/Codex=`codex`，Claude/GLM/Grok=`claude`。Claude 第一方登录档把 catalog tier 解析为 heavy=Opus 5、standard=Fable 5、light=Sonnet 5；GLM/Grok 等第三方 API 档则把 Fable/Opus/Sonnet/Haiku 四种 alias 全部锁回飞书当前模型，既保留分层质量，也不会把官方 Claude id 发到第三方端点。
+Lodestar 会在子进程边界设置 `GSD_RUNTIME`：GPT/Codex=`codex`，Claude/GLM/Grok=`claude`。Claude 第一方登录档把 catalog tier 解析为 heavy/standard=飞书当前主力（Fable 5 或 Opus 5）、light=Sonnet 5（选 Opus 不注入 Fable，选 Fable 不注入 Opus）；GLM/Grok 等第三方 API 档则把 Fable/Opus/Sonnet/Haiku 四种 alias 全部锁回飞书当前模型，既按选定主力分层，也不会把官方 Claude id 发到第三方端点。
 
 初始化后的根 `.planning/` 是稳定目录；每个 `.planning/workstreams/<slug>` 在 Unix 使用 symlink、Windows 使用 junction 指向 `.gsd/<slug>/.planning/`，共享 `.planning/PROJECT.md` 与 `.gsd/PROJECT.md` 是同一硬链接文件。TRACKER 只列未完成任务，不保存当前会话选择。

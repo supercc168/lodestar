@@ -69,7 +69,9 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
   },
 }
 
-// Claude Code/GSD 会按角色选择模型 alias。第一方登录档使用当前最新组合；
+// Claude Code/GSD 会按角色选择模型 alias。
+// 第一方登录档：飞书当前选定模型当主力（Fable 5 或 Opus 5），light/haiku 固定
+// Sonnet 5；选 Opus 时四个 alias 都不注入 Fable。
 // 第三方 API 路由仍把四个 alias 全部锁回飞书当前模型，避免官方 model id
 // 泄漏到 GLM/Grok 等兼容端点。
 export const CLAUDE_MODEL_ALIAS_KEYS = [
@@ -79,11 +81,20 @@ export const CLAUDE_MODEL_ALIAS_KEYS = [
   'ANTHROPIC_DEFAULT_HAIKU_MODEL',
 ] as const
 
-const FIRST_PARTY_CLAUDE_TIER_ENV: Record<(typeof CLAUDE_MODEL_ALIAS_KEYS)[number], string> = {
-  ANTHROPIC_DEFAULT_FABLE_MODEL: 'claude-fable-5',
-  ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-opus-5',
-  ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-fable-5',
-  ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-sonnet-5',
+/** 第一方 light/haiku 档固定 Sonnet 5（不随飞书主力切换）。 */
+export const FIRST_PARTY_LIGHT_MODEL = 'claude-sonnet-5'
+
+/** 飞书第一方主力 → 子 agent 四档 alias。主力占 fable/opus/sonnet；haiku=Sonnet 5。 */
+export function firstPartyClaudeTierEnvForMain(
+  mainModel: string,
+): Record<(typeof CLAUDE_MODEL_ALIAS_KEYS)[number], string> {
+  const main = mainModel.trim() || DEFAULT_CLAUDE_SDK_MODEL
+  return {
+    ANTHROPIC_DEFAULT_FABLE_MODEL: main,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: main,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: main,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: FIRST_PARTY_LIGHT_MODEL,
+  }
 }
 
 const DEFAULT_GLM_MODEL = 'glm-5.2[1m]'
@@ -212,12 +223,16 @@ export function claudeModelEnv(model: string | null | undefined): Record<string,
   return claudeModelProfile(model)?.env ?? {}
 }
 
-/** Resolve Claude Code child-agent aliases at the process boundary. Official
- * login routes use the latest first-party tier combination; API routes keep
- * every alias on the selected upstream model so no Anthropic id reaches a
- * third-party endpoint. */
+/** Resolve Claude Code child-agent aliases at the process boundary.
+ * - First-party login: Feishu selection is the main model (Fable 5 or Opus 5)
+ *   for fable/opus/sonnet aliases; haiku stays Sonnet 5. Selecting Opus never
+ *   injects Fable; selecting Fable never injects Opus.
+ * - API routes: every alias locks to the selected upstream model so no
+ *   Anthropic id reaches a third-party endpoint. */
 export function claudeModelTierEnv(model: string | null | undefined): Record<string, string> {
-  if (!claudeModelIsApiRoute(model)) return { ...FIRST_PARTY_CLAUDE_TIER_ENV }
+  if (!claudeModelIsApiRoute(model)) {
+    return firstPartyClaudeTierEnvForMain(resolveClaudeSdkModel(model) ?? DEFAULT_CLAUDE_SDK_MODEL)
+  }
   const selected = resolveClaudeSdkModel(model)
   if (!selected) return {}
   return Object.fromEntries(CLAUDE_MODEL_ALIAS_KEYS.map(key => [key, selected]))
