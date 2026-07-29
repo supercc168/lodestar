@@ -33,7 +33,7 @@
 | `codex-usage.ts` | 解析 app-server token usage payload，并计算 per-turn absolute total 差值与有效 token。 |
 | `codex-compaction.ts` | 解析多种 app-server / raw response context compaction 事件，并输出统一 `ContextCompactedNotification`。 |
 | `claude-agent-process.ts` | 实现 `AgentProcess` 的 Claude 后端：用 `@anthropic-ai/claude-agent-sdk` 的 `query({ prompt: AsyncIterable })` streaming-input 长驻进程，把 SDK message（`system/init`、assistant text/tool_use、`tool_result`、`result`、`compact_boundary`）映射为统一 Session 事件；`permissionMode: default` + `canUseTool` 回调：`AskUserQuestion` 经 canUseTool 下发、host 拦下渲染卡片并回填 answers，其余工具秒放（复刻旧 bypassPermissions「不弹审批」语义；bypassPermissions 会 shadow canUseTool，AskUserQuestion 就废了）；启动前 `assertClaudeCodeAvailable` 检查 `claude` 可执行文件。 |
-| `claude-models.ts` | Claude model profile：内置 Fable/Opus 登录档与 `glm` / `grok` / `grokcc` API 档，可由 `config.toml` 的 `[claude.models.*]` 覆盖/新增；`resolveClaudeSdkModel` 返回当前档位的真实 SDK model id。spawn 时第一方 alias 按飞书主力（Fable 或 Opus）+ light Sonnet 5 注入（选 Opus 不注入 Fable），第三方 API 档的四个 alias 全部锁回当前 model；真实 `grok-*` 强制使用 xAI 官方最高 `high` effort，并禁用 Claude adaptive thinking。 |
+| `claude-models.ts` | Claude model profile：内置 Fable/Opus 登录档与 `glm` / `grok` / `grokcc` API 档，可由 `config.toml` 的 `[claude.models.*]` 覆盖/新增；`resolveClaudeSdkModel` 返回当前档位的真实 SDK model id。spawn 时第一方 alias 按飞书主力（Fable 或 Opus）+ light Sonnet 5 注入（选 Opus 不注入 Fable），第三方 API 档的四个 alias 全部锁回当前 model；无痕 Grok 使用官方最高 `high`，CatCodex 使用工具兼容 `xhigh`，两者都禁用 Claude adaptive thinking。 |
 | `codex-models.ts` | Codex API model profile：解析 `[codex.models.*]`，生成隔离的 app-server provider、wire API、真实 model id 与 key env。真实 model id 为 `grok-*` 的旧 profile 只用于识别迁移，不进入 picker/TokenSource，Codex spawn 边界直接拒绝。 |
 | `token-source.ts` | TokenSource **适配层**（非上游全量 registry）：把 `claude-models` / `codex-models` 与内建 login 档收敛为统一 `resolveTokenSource(provider, model)`；提供 `resolveClaudeSpawnEnv`（scrub ANTHROPIC_* → api 才注入 → tier lock + `GSD_RUNTIME`）、`resolveCodexSpawnOverrides`、`resolveUsageSource`。真相源仍是 `[claude.models.*]`/`[codex.models.*]`，**不**引入 `[token_source.*]` TOML，**不**改 `model` 面板 UX。reclaude 等包装器仍走 `[claude] bin`；API 路由用 `isApiRoute()` 绕开。 |
 | `card-action.ts` | Card action 回调响应辅助；生产 WS 路径用 `{ card: { type: "raw", data: newCard } }` 立即替换 JSON 卡片，避免 200672、裸卡片或提前 patch 导致模型/effort 面板闪退。 |
@@ -56,6 +56,7 @@
 | `version-cli.ts` | `lodestar-version` 入口，输出 Lodestar 和 Codex CLI 版本。 |
 | `usage.ts` | 临时 app-server 请求 Codex/ChatGPT 使用额度；保留最新快照，只在收到新值时覆盖。 |
 | `glm-usage.ts` | GLM Coding Plan 用量快照（给 `hi` console 的 Claude/GLM 后端用）：直打 GLM 官方 `quota/limit` monitor API，凭据从 `~/.claude/settings.json` 的 env 读 `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_BASE_URL` 判平台（open.bigmodel.cn / api.z.ai）；无凭据/非 GLM/限流/网络各自显式 MISS，绝不假数据，与 `usage.ts` 的 snapshot 模式对齐。 |
+| `claude-provider-usage.ts` | Claude 第三方 API 渠道额度（`hi` console 的 Grok 档）：CatCodex/NewAPI 走 `GET /api/usage/token`，无痕等 CCSwitch 兼容走 `GET /v1/usage`；凭据与 spawn 同源自 `[claude.models.*]`；不限/余额/累计消耗按接口原样展示，不把 NewAPI quota 单位换算成美元。 |
 | `sysinfo.ts` | 读取主机 CPU、内存、磁盘和 AI 相关 systemd service 状态，供控制台卡片展示。 |
 | `pid-guard.ts` | PID 文件和进程 cmdline marker 校验，防止误认复用 PID。 |
 | `context-window.ts` | 根据模型和 token usage 估算 context window 占用。 |
@@ -79,9 +80,9 @@
 - `wt` 命令的 Git 操作集中在 `worktree.ts`；不要在 `session.ts` 里散写 `git` shell 命令。
 - `agy <prompt>` 的 CLI 参数、PATH 和 Git 快照集中在 `agy-task.ts`；session 侧进程生命周期、输出收集、状态刷新和卡片接线集中在 `session-agy.ts`。
 - `task` 面板按钮由 `session-tasklist.ts` 处理，持久状态集中在 `tasklist.ts`，后台自动化集中在 `tasklist-worker.ts`；不要把轮询、进程状态或 Git 产物逻辑塞进卡片模板。
-- `model` 命令为固定选项(codex 内建=gpt-5.6-sol/max、claude 第一方=Fable 5/Opus 5 均 max、glm=effort 随 config、Grok 无痕/CatCodex=xAI 官方最高 high),effort 锁死一键生效,不动态拉取 `model/list`；Grok 不得走 Codex。
+- `model` 命令为固定选项(codex 内建=gpt-5.6-sol/max、claude 第一方=Fable 5/Opus 5 均 max、glm=effort 随 config、Grok 无痕=官方 high、CatCodex=工具兼容 xhigh),effort 锁死一键生效,不动态拉取 `model/list`；Grok 不得走 Codex。
 - Claude/Codex spawn 凭据与 model 注入经 `token-source.ts` 单入口；新增档位仍写 `[claude.models.*]`/`[codex.models.*]` 与 `claude-models`/`codex-models` profile，不要平行再加一套 `[token_source.*]` 配置。
-- TokenSource **长期只做适配层**：禁止引入 `[token_source.*]` 注册表、`registerTokenSource` 插件 API、双层 model 面板、source 级 `refreshModels`。额度实现仍分 `usage.ts`/`glm-usage.ts`，展示选型走 `resolveUsageSource`。上游只吸收行为补丁，不吸收产品/配置形态。
+- TokenSource **长期只做适配层**：禁止引入 `[token_source.*]` 注册表、`registerTokenSource` 插件 API、双层 model 面板、source 级 `refreshModels`。额度实现仍分 `usage.ts`/`glm-usage.ts`/`claude-provider-usage.ts`，展示选型走 `resolveUsageSource`（`claude:grok*` → `provider`）。上游只吸收行为补丁，不吸收产品/配置形态。
 - `rs`/`restart` 空闲态：仅 **claude** 列 `~/.claude/projects` 会话列表；**codex** 空闲直接 `restart(true)`（resume list 无 codex 数据源，避免空列表误导）。
 - Codex 子进程协议集中在 `codex-process.ts`；新增 app-server 方法或通知映射时要同时考虑 `Session` 事件处理和卡片展示。
 - Card Kit 写操作必须经过 `cardkit.ts` 的队列和 sequence 逻辑；不要从 session 或脚本直接 `fetch` 修改同一张生产卡。
@@ -122,7 +123,7 @@
 
 ### Internal
 - `session.ts` 经 `AgentProcess` 接口（`agent-process.ts`）持有当前 `proc`，按 `selectedProvider` 在 `ClaudeAgentProcess`（默认）和 `CodexProcess` 之间 spawn；并依赖 `cardkit.ts`、`cards.ts`、`feishu.ts` 和 `session-*` helper；业务面板/命令 helper 再依赖 `worktree.ts`、`tasklist.ts`、`agy-task.ts` 等领域模块。
-- `claude-agent-process.ts` 依赖 `@anthropic-ai/claude-agent-sdk`、`agent-process.ts`、`token-source.ts`（spawn env / apiRoute 单入口，内部委托 `claude-models.ts`）、`codex-usage.ts`（token usage 解析复用）和 `config.ts`；`glm-usage.ts` 被 `session.ts`（console opts）和 `cards/console.ts` 消费。
+- `claude-agent-process.ts` 依赖 `@anthropic-ai/claude-agent-sdk`、`agent-process.ts`、`token-source.ts`（spawn env / apiRoute 单入口，内部委托 `claude-models.ts`）、`codex-usage.ts`（token usage 解析复用）和 `config.ts`；`glm-usage.ts` / `claude-provider-usage.ts` 被 `session.ts`（console opts）和 `cards/console.ts` 消费。
 - `token-source.ts` 适配 `claude-models.ts` / `codex-models.ts` 与 `agent-process.usageSourceForAgent`；`session.ts` Codex spawn 走 `resolveCodexSpawnOverrides`，console 额度源走 `resolveUsageSource`。
 - `tasklist-worker.ts` 依赖 `tasklist.ts`、`feishu.ts`、`agy-task.ts`、`codex-process.ts` 和 `tasklist-worker-git.ts`；本地 Git worktree、tag 与审查 diff 约定集中在 `tasklist-worker-git.ts`。
 - 后台任务卡 `cards/background.ts` 由 `claude-agent-process.ts` 的 SDK `task_*` 事件(started/progress/updated/settled)经 `session.ts`/`session-tools.ts` 驱动;`session-temp.ts` 依赖 `cards/temp.ts` + turn-map,`session-multimsg.ts` 依赖 `inbound-markers.ts`。

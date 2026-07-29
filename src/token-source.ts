@@ -72,7 +72,7 @@ export interface TokenSource {
   spawnEnv(base: Record<string, string>): Record<string, string>
   /** Codex 专用:configArgs + providerEnv + modelId。Claude 返回空覆盖。 */
   spawnOverrides(): TokenSourceCodexOverrides
-  /** 控制台额度数据源(codex / glm / not_applicable)。 */
+  /** 控制台额度数据源(codex / glm / provider / not_applicable)。 */
   usageSource(): AgentUsageSource
   /** Claude API 路由需绕开 reclaude 包装器;login 走 [claude] bin。 */
   isApiRoute(): boolean

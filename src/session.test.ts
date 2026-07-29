@@ -157,7 +157,7 @@ afterEach(() => {
 
 function turnState(
   cardId = 'card_session_turn',
-  selection: Partial<{ provider: 'codex' | 'claude'; model: string | null; effort: string; usageSource: 'codex' | 'glm' | 'not_applicable' }> = {},
+  selection: Partial<{ provider: 'codex' | 'claude'; model: string | null; effort: string; usageSource: 'codex' | 'glm' | 'provider' | 'not_applicable' }> = {},
 ): any {
   return {
     cardId,
@@ -6888,15 +6888,16 @@ describe('Grok routes through Claude', () => {
     }
     try {
       for (const name of ['grok', 'grokcc']) {
+        const effort = name === 'grokcc' ? 'xhigh' : 'high'
         expect(normalizePersistedModelSelection('codex', `codex:${name}`, 'max')).toEqual({
           provider: 'claude',
           model: `claude:${name}`,
-          effort: 'high',
+          effort,
         })
         expect(normalizePersistedModelSelection('claude', `claude:${name}`, 'max')).toEqual({
           provider: 'claude',
           model: `claude:${name}`,
-          effort: 'high',
+          effort,
         })
       }
     } finally {
@@ -6981,7 +6982,7 @@ describe('configuredDefaultSelection ([codex] api 档位)', () => {
       expect(configuredDefaultSelection()).toEqual({
         provider: 'claude',
         model: 'claude:grokcc',
-        effort: 'high',
+        effort: 'xhigh',
       })
     } finally {
       ;(config.claude as any).models = prevClaudeModels
@@ -7358,7 +7359,7 @@ describe('Session provider switching', () => {
       })
       expect(choices.find((c: any) => c.model === 'claude:grokcc')).toMatchObject({
         provider: 'claude', displayName: 'Claude · Grok 4.5 · CatCodex',
-        efforts: [{ effort: 'high' }],
+        efforts: [{ effort: 'xhigh' }],
       })
     } finally {
       ;(config.claude as any).models = prevClaude
@@ -7415,6 +7416,7 @@ describe('Session provider switching', () => {
     }
     try {
       for (const model of ['claude:grok', 'claude:grokcc']) {
+        const effort = model === 'claude:grokcc' ? 'xhigh' : 'high'
         const session = new Session('probe', 'chat_id') as any
         session.selectedProvider = 'claude'
         session.selectedModel = 'claude:fable'
@@ -7422,11 +7424,11 @@ describe('Session provider switching', () => {
         installSuccessfulIdleRebuild(session)
         const incompatible = await session.onModelEffortSelect(model, 'max', '', 'ou_user', 'claude')
         expect(incompatible.ok).toBe(false)
-        const result = await session.onModelEffortSelect(model, 'high', '', 'ou_user', 'claude')
+        const result = await session.onModelEffortSelect(model, effort, '', 'ou_user', 'claude')
         expect(result.ok).toBe(true)
         expect(session.selectedProvider).toBe('claude')
         expect(session.selectedModel).toBe(model)
-        expect(session.selectedEffort).toBe('high')
+        expect(session.selectedEffort).toBe(effort)
       }
     } finally {
       ;(config.claude as any).models = prev
@@ -7485,12 +7487,13 @@ describe('Session provider switching', () => {
     ;(config.claude as any).models = {}
     try {
       for (const model of ['claude:grok', 'claude:grokcc']) {
+        const effort = model === 'claude:grokcc' ? 'xhigh' : 'high'
         const session = new Session('probe', 'chat_id') as any
         const proc = new FakeAgentProc('claude', 'claude-session-1')
         session.proc = proc
         session.selectedProvider = 'claude'
         session.selectedModel = 'claude:fable'
-        const result = await session.onModelEffortSelect(model, 'high', '', 'ou_user', 'claude')
+        const result = await session.onModelEffortSelect(model, effort, '', 'ou_user', 'claude')
         expect(result.ok).toBe(false)
         expect(result.message).toContain(`[claude.models.${model.slice('claude:'.length)}]`)
         expect(session.selectedModel).toBe('claude:fable')

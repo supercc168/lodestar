@@ -16,7 +16,13 @@ import type {
 export type AgentProvider = 'codex' | 'claude'
 export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort
-export type AgentUsageSource = 'codex' | 'glm' | 'not_applicable'
+/** 控制台额度数据源。
+ * - codex: ChatGPT 登录窗口或 Codex 第三方 /v1/usage
+ * - glm: GLM Coding Plan quota/limit
+ * - provider: Claude 第三方 API 渠道余额(Grok 无痕 /v1/usage、CatCodex /api/usage/token)
+ * - not_applicable: 官方 Claude 登录档等无可查询源
+ */
+export type AgentUsageSource = 'codex' | 'glm' | 'provider' | 'not_applicable'
 export type CollabAgentStates = Record<string, { status?: string }>
 
 export type CodexUserTextSettlement =
@@ -62,6 +68,7 @@ export function providerFromModel(model: string | null | undefined): AgentProvid
 /** Quota source for the actual runtime profile. Claude login models and
  * non-GLM relays do not share GLM Coding Plan quota, so they must not inherit
  * the daemon-wide GLM snapshot merely because they use the Claude backend.
+ * Grok 无痕/CatCodex 等 `claude:grok*` 走 provider 渠道余额。
  * TokenSource 适配层 resolveUsageSource 与此同规则(token-source.ts 委托本函数,
  * 避免 agent-process ↔ token-source 循环依赖)。 */
 export function usageSourceForAgent(
@@ -69,7 +76,11 @@ export function usageSourceForAgent(
   model: string | null | undefined,
 ): AgentUsageSource {
   if (provider === 'codex') return 'codex'
-  return /^claude:glm(?:$|[-_])/i.test(model ?? '') ? 'glm' : 'not_applicable'
+  const m = model ?? ''
+  if (/^claude:glm(?:$|[-_])/i.test(m)) return 'glm'
+  // grok / grokcc / grok-*：Claude-only 第三方 Grok 路由，有独立余额接口。
+  if (/^claude:grok/i.test(m)) return 'provider'
+  return 'not_applicable'
 }
 
 export function agentProviderLabel(provider: AgentProvider): string {

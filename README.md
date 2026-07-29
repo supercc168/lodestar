@@ -48,10 +48,10 @@ effort     = "high"
 base_url   = "https://catcodexapi.com" # Claude SDK 使用根地址，不追加 /v1
 auth_token = "<你的 CatCodex token>"
 model      = "grok-4.5"
-effort     = "high"
+effort     = "xhigh" # CatCodex 网关工具调用兼容参数
 ```
 
-[xAI 官方 reasoning 文档](https://docs.x.ai/developers/model-capabilities/text/reasoning)为 Grok 4.5 定义的 effort 是 `low` / `medium` / `high`，最高且默认档为 `high`；直连 xAI Responses API 时对应 `reasoning: { "effort": "high" }`。Lodestar 经 Claude Agent SDK 使用 `effort: "high"`（实际转为 Claude Code `--effort high`），并用 `thinking: disabled` 避免附加 Claude 专属 adaptive-thinking 协议；这不会关闭 Grok 自身 reasoning，真实探针仍能看到 thinking。配置里遗留的 `xhigh` / `max` 会被归一化为官方 `high`。上游若失败，错误会原样显示，不会静默切到其它模型。旧 `[codex.models.grok*]` 不再进入模型面板，启动边界也会拒绝。
+[xAI 官方 reasoning 文档](https://docs.x.ai/developers/model-capabilities/text/reasoning)为 Grok 4.5 定义的 effort 是 `low` / `medium` / `high`，最高且默认档为 `high`；直连 xAI Responses API 时对应 `reasoning: { "effort": "high" }`。无痕路由经 Claude SDK 使用官方 `high`；CatCodex 的 Anthropic 网关在实测中只有 `xhigh` 能稳定兑现 Claude Code 工具调用，因此该档位锁为兼容参数 `xhigh`，这不表示 xAI 增加了官方 reasoning 档位。两路都设置 `thinking: disabled`，只避免附加 Claude 专属 adaptive-thinking 协议，不关闭 Grok 自身 reasoning。上游若失败，错误会原样显示，不会静默切到其它模型。旧 `[codex.models.grok*]` 不再进入模型面板，启动边界也会拒绝。
 
 **1. 装包**
 

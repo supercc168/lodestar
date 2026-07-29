@@ -422,6 +422,52 @@ describe('main conversation card rendering', () => {
       expect(element.content).not.toContain('GLM 额度')
     }
   })
+
+  test('usage panel routes claude:grok* to provider channel balance', () => {
+    const cat = consoleUsageElement({
+      sessionName: 'probe',
+      status: 'idle',
+      provider: 'claude',
+      model: 'claude:grokcc',
+      usageSource: 'provider',
+      providerUsage: {
+        state: 'ok',
+        providerName: 'Claude Code · Grok 4.5(CatCodex)',
+        tokenName: 'cc-grok',
+        unlimited: true,
+        totalUsed: 390_493_193,
+        isValid: true,
+        fetchedAt: Date.now(),
+      },
+    } as any) as any
+    expect(cat.content).toContain('渠道额度')
+    expect(cat.content).toContain('不限')
+    expect(cat.content).toContain('cc-grok')
+    expect(cat.content).toContain('390.5M')
+    expect(cat.content).not.toContain('GLM 额度')
+    expect(cat.content).not.toContain('不适用')
+
+    const wuhen = consoleUsageElement({
+      sessionName: 'probe',
+      status: 'idle',
+      provider: 'claude',
+      model: 'claude:grok',
+      usageSource: 'provider',
+      providerUsage: {
+        state: 'ok',
+        providerName: 'Claude Code · Grok 4.5(无痕)',
+        planName: '钱包余额',
+        unlimited: false,
+        remaining: 2544.33,
+        unit: 'USD',
+        isValid: true,
+        fetchedAt: Date.now(),
+      },
+    } as any) as any
+    expect(wuhen.content).toContain('渠道额度')
+    expect(wuhen.content).toContain('钱包余额')
+    expect(wuhen.content).toContain('2544.33 USD')
+  })
 })
 
 describe('watchdog footer rendering', () => {

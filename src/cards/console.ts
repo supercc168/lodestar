@@ -7,6 +7,7 @@
 import { SERVICE_LABEL, type SysInfo } from '../sysinfo'
 import type { UsageSnapshot } from '../usage'
 import type { GlmUsageSnapshot } from '../glm-usage'
+import type { ClaudeProviderUsageSnapshot } from '../claude-provider-usage'
 import { usageSourceForAgent, type AgentProvider, type AgentUsageSource } from '../agent-process'
 import { ELEMENTS } from './elements'
 
@@ -36,6 +37,8 @@ export interface ConsoleOpts {
   /** GLM Coding Plan 用量快照(claude/GLM 后端)。Undefined → loading 占位。
    * 仅 claude 后端渲染;codex 后端走 usage。按 provider 二选一(方案 C)。 */
   glmUsage?: GlmUsageSnapshot
+  /** Claude 第三方渠道余额(Grok 无痕 / CatCodex)。Undefined → loading。 */
+  providerUsage?: ClaudeProviderUsageSnapshot
   /** Host snapshot: CPU 负载、内存、AI-managed systemd 服务。
    * undefined 或字段缺失时明确渲染 `_n/a_`,不假数据。 */
   sysinfo?: SysInfo
@@ -252,6 +255,58 @@ export function consoleUsageNotApplicableContent(model?: string): string {
   return `**📊 额度**　不适用${detail}`
 }
 
+/** Claude 第三方渠道余额行（Grok 无痕 / CatCodex NewAPI）。
+ * `providerUsage === undefined` → loading 占位。 */
+export function consoleProviderUsageContent(
+  providerUsage: ClaudeProviderUsageSnapshot | undefined,
+): string {
+  if (providerUsage === undefined) return '**📊 渠道额度**　_加载中…_'
+  switch (providerUsage.state) {
+    case 'no_credentials':
+      return `**📊 渠道额度**${providerUsage.providerName ? ` · ${providerUsage.providerName}` : ''}　未配置 token — 在 \`config.toml\` 的对应 \`[claude.models.*]\` 填 \`base_url\` + \`auth_token\``
+    case 'rate_limited':
+      return `**📊 渠道额度**${providerUsage.providerName ? ` · ${providerUsage.providerName}` : ''}　API 限流,稍后重试`
+    case 'network':
+      return `**📊 渠道额度**${providerUsage.providerName ? ` · ${providerUsage.providerName}` : ''}　拉取失败${providerUsage.reason ? ' — `' + providerUsage.reason + '`' : ''}`
+    case 'unavailable':
+      return `**📊 渠道额度** · ${providerUsage.providerName}　不可用${providerUsage.reason ? ' · ' + providerUsage.reason : ''}`
+  }
+
+  const headParts = [`**📊 渠道额度** · ${providerUsage.providerName}`]
+  if (providerUsage.planName) headParts.push(providerUsage.planName)
+  if (providerUsage.tokenName) headParts.push(`\`${providerUsage.tokenName}\``)
+  const lines: string[] = [headParts.join(' · ')]
+
+  if (providerUsage.unlimited) {
+    lines.push('　· 额度　不限')
+  } else if (providerUsage.remaining !== undefined) {
+    lines.push(`　· 余额　${fmtProviderRemaining(providerUsage.remaining, providerUsage.unit ?? '')}`)
+  }
+
+  if (providerUsage.totalUsed !== undefined) {
+    // NewAPI total_used 是内部计数，只展示原值，不换算成 USD。
+    const used = typeof providerUsage.totalUsed === 'number'
+      ? fmtCompactNumber(providerUsage.totalUsed)
+      : String(providerUsage.totalUsed)
+    lines.push(`　· 累计消耗　${used}${providerUsage.unlimited ? ' (quota units)' : ''}`)
+  }
+
+  if (!providerUsage.isValid) lines.push('　· 状态　渠道已停用')
+
+  return lines.length === 1 ? `**📊 渠道额度** · ${providerUsage.providerName}　_无数据_` : lines.join('\n')
+}
+
+/** 紧凑数字：390493193 → 390.5M；2544.33 保持两位小数。 */
+function fmtCompactNumber(n: number): string {
+  if (!Number.isFinite(n)) return String(n)
+  const abs = Math.abs(n)
+  if (abs >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(2).replace(/\.?0+$/, '')}B`
+  if (abs >= 1_000_000) return `${(n / 1_000_000).toFixed(1).replace(/\.0$/, '')}M`
+  if (abs >= 10_000) return `${(n / 1_000).toFixed(1).replace(/\.0$/, '')}K`
+  if (Number.isInteger(n)) return String(n)
+  return String(Math.round(n * 100) / 100)
+}
+
 function fmtUsagePercent(percent: number | null | undefined): string {
   return typeof percent === 'number' && Number.isFinite(percent) ? `${Math.round(percent)}%` : 'MISS'
 }
@@ -405,14 +460,16 @@ export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.conso
   }
 }
 
-/** 订阅额度行 —— 按实际 runtime profile 渲染 Codex、GLM 或明确不适用。 */
+/** 订阅额度行 —— 按实际 runtime profile 渲染 Codex、GLM、渠道余额或明确不适用。 */
 export function consoleUsageElement(opts: ConsoleOpts): object {
   const usageSource = opts.usageSource ?? usageSourceForAgent(opts.provider ?? 'codex', opts.model)
   const content = usageSource === 'glm'
     ? consoleGlmUsageContent(opts.glmUsage)
     : usageSource === 'codex'
       ? consoleUsageContent(opts.usage)
-      : consoleUsageNotApplicableContent(opts.model)
+      : usageSource === 'provider'
+        ? consoleProviderUsageContent(opts.providerUsage)
+        : consoleUsageNotApplicableContent(opts.model)
   return {
     tag: 'markdown',
     element_id: ELEMENTS.consoleUsage,

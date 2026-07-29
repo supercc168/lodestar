@@ -30,6 +30,22 @@ export const DEFAULT_CLAUDE_SDK_MODEL = 'claude-fable-5'
 /** xAI 官方为 Grok 4.5 定义的最高 reasoning effort。
  * Claude SDK 的 xhigh 只对指定 Claude 模型原生生效，Grok 应显式使用 high。 */
 export const GROK_OFFICIAL_MAX_EFFORT = 'high' as const
+/** CatCodex 的 Anthropic 兼容层只有在 xhigh 下稳定兑现 Claude Code 工具调用。
+ * 这是网关兼容参数，不代表 xAI 新增了官方 xhigh reasoning 档位。 */
+export const GROKCC_TOOL_COMPAT_EFFORT = 'xhigh' as const
+
+/** Claude Code 在第三方 Grok Anthropic 路由上的稳定运行基线。档位显式
+ * env_* 配置优先；这里只补缺省值，且只在完整 API 凭据就绪后注入。 */
+const DEFAULT_GROK_ENV: Readonly<Record<string, string>> = {
+  CLAUDE_CODE_MAX_CONTEXT_TOKENS: '500000',
+  CLAUDE_CODE_AUTO_COMPACT_WINDOW: '450000',
+  CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+  CLAUDE_CODE_ATTRIBUTION_HEADER: '0',
+}
+
+function isGrokModelId(model: string | null | undefined): boolean {
+  return /^grok(?:[-_.]|$)/i.test(model?.trim() ?? '')
+}
 
 const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
   // 第一方 Anthropic 档位:model id 直传 Claude Code(reclaude → --model),
@@ -143,6 +159,11 @@ function toProfile(name: string): ClaudeModelProfile | null {
     (!!env.ANTHROPIC_BASE_URL &&
       (!!env.ANTHROPIC_AUTH_TOKEN || !!env.ANTHROPIC_API_KEY) &&
       !!raw.model?.trim())
+  if (configured && route === 'api' && isGrokModelId(raw.model)) {
+    for (const [key, value] of Object.entries(DEFAULT_GROK_ENV)) {
+      if (!(key in env)) env[key] = value
+    }
+  }
   return {
     key,
     name,
@@ -187,7 +208,7 @@ export function resolveClaudeSdkModel(model: string | null | undefined): string 
 /** Grok 档位统一走 Claude Agent SDK 的兼容启动参数。按真实上游 model id
  * 判断，而不是写死 profile slug，确保新增 [claude.models.*] Grok 渠道也生效。 */
 export function claudeModelIsGrok(model: string | null | undefined): boolean {
-  return /^grok(?:[-_.]|$)/i.test(resolveClaudeSdkModel(model)?.trim() ?? '')
+  return isGrokModelId(resolveClaudeSdkModel(model))
 }
 
 /** spawn 时要为该档位注入的 ANTHROPIC_* env 覆盖。官方登录档位(Fable 5/
@@ -227,11 +248,13 @@ export function claudeModelConfigured(model: string | null | undefined): boolean
 
 /** 该档位在 config 里声明的思考强度(仅第三方 API 路由有意义,官方登录档位
  * 不配)。非法/未配返回 undefined,由调用方回落到 FIXED_MODEL_CHOICES 的锁死
- * 值。Grok 强制 high：这是 xAI 官方最高档，也已通过两条 Claude SDK 路由实测。 */
+ * 值。无痕 Grok 使用 xAI 官方 high；CatCodex 因网关工具兼容要求锁 xhigh。 */
 export function claudeModelEffort(model: string | null | undefined): ClaudeReasoningEffort | undefined {
   const profile = claudeModelProfile(model)
   if (!profile || profile.route !== 'api') return undefined
-  if (claudeModelIsGrok(model)) return GROK_OFFICIAL_MAX_EFFORT
+  if (claudeModelIsGrok(model)) {
+    return profile.name === 'grokcc' ? GROKCC_TOOL_COMPAT_EFFORT : GROK_OFFICIAL_MAX_EFFORT
+  }
   const raw = mergedConfig(profile.name).effort?.trim()
   return raw && isClaudeReasoningEffort(raw) ? raw : undefined
 }

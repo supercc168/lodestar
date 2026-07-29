@@ -137,18 +137,38 @@ describe('Claude Grok API profiles', () => {
   })
 
   test('无痕与 CatCodex 都解析为 Claude API Grok 档位', () => {
-    for (const [name, baseUrl] of [
-      ['grok', 'https://api.wuhen-ai.com'],
-      ['grokcc', 'https://catcodexapi.com'],
+    for (const [name, baseUrl, effort] of [
+      ['grok', 'https://api.wuhen-ai.com', 'high'],
+      ['grokcc', 'https://catcodexapi.com', 'xhigh'],
     ] as const) {
       const model = `claude:${name}`
       expect(claudeModelIsApiRoute(model)).toBe(true)
       expect(claudeModelConfigured(model)).toBe(true)
       expect(claudeModelIsGrok(model)).toBe(true)
-      expect(claudeModelEffort(model)).toBe('high')
-      expect(claudeModelEnv(model).ANTHROPIC_BASE_URL).toBe(baseUrl)
+      expect(claudeModelEffort(model)).toBe(effort)
+      const env = claudeModelEnv(model)
+      expect(env.ANTHROPIC_BASE_URL).toBe(baseUrl)
+      expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('500000')
+      expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('450000')
+      expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1')
+      expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
       for (const value of Object.values(claudeModelTierEnv(model))) expect(value).toBe('grok-4.5')
     }
+  })
+
+  test('Grok 默认兼容环境允许档位 env 显式覆盖', () => {
+    ;(config.claude as any).models.grokcc = {
+      ...GROK_FULL.grokcc,
+      env: {
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: '256000',
+        CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '0',
+      },
+    }
+    const env = claudeModelEnv('claude:grokcc')
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('256000')
+    expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('450000')
+    expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('0')
+    expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
   })
 
   test('未配置时两个内建 Grok 档位保持 API route 且不可选择', () => {
@@ -157,6 +177,7 @@ describe('Claude Grok API profiles', () => {
       expect(claudeModelIsApiRoute(model)).toBe(true)
       expect(claudeModelConfigured(model)).toBe(false)
       expect(claudeModelIsGrok(model)).toBe(false)
+      expect(claudeModelEnv(model)).toEqual({})
     }
   })
 })

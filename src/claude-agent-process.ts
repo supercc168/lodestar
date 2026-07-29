@@ -24,6 +24,7 @@ import {
   type UserTextDispatch,
 } from './agent-process'
 import {
+  claudeModelEffort,
   claudeModelKey,
   claudeModelIsGrok,
   GROK_OFFICIAL_MAX_EFFORT,
@@ -77,15 +78,15 @@ type PendingUserDialog = {
   cleanup?: () => void
 }
 
-/** Grok 固定使用 xAI 官方最高 high；disabled 只关闭 Claude 专属 adaptive
+/** Grok 使用档位已验证的兼容 effort；disabled 只关闭 Claude 专属 adaptive
  * thinking 控制，Grok 自身 reasoning 仍由模型执行。其它 Claude 档保持原语义。 */
 export function claudeSdkReasoningOptions(
   model: string | null | undefined,
   effort: ClaudeReasoningEffort,
 ): { effort?: EffortLevel; thinking?: { type: 'disabled' } } {
-  return claudeModelIsGrok(model)
-    ? { effort: GROK_OFFICIAL_MAX_EFFORT, thinking: { type: 'disabled' } }
-    : { effort: effort as EffortLevel }
+  if (!claudeModelIsGrok(model)) return { effort: effort as EffortLevel }
+  const compatibleEffort = claudeModelEffort(model) ?? GROK_OFFICIAL_MAX_EFFORT
+  return { effort: compatibleEffort as EffortLevel, thinking: { type: 'disabled' } }
 }
 
 type PendingControl = PendingUserDialog

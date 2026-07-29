@@ -267,5 +267,7 @@ describe('token-source list + usage helpers', () => {
     expect(resolveUsageSource('claude', 'claude:fable')).toBe('not_applicable')
     expect(resolveUsageSource('claude', 'claude:glm')).toBe('glm')
     expect(resolveUsageSource('claude', 'claude:relay')).toBe('not_applicable')
+    expect(resolveUsageSource('claude', 'claude:grok')).toBe('provider')
+    expect(resolveUsageSource('claude', 'claude:grokcc')).toBe('provider')
   })
 })

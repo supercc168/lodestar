@@ -62,6 +62,7 @@ import { log } from './log'
 import { readSysInfo } from './sysinfo'
 import { readUsage, updateUsageFromRateLimits, peekUsage, type UsageSnapshot } from './usage'
 import { readGlmUsage, type GlmUsageSnapshot } from './glm-usage'
+import { readClaudeProviderUsage, type ClaudeProviderUsageSnapshot } from './claude-provider-usage'
 import {
   contextLimitFromAppServer,
   contextTokensFromUsage,
@@ -2464,6 +2465,7 @@ export class Session {
   async buildConsoleOpts(
     usage: UsageSnapshot | undefined,
     glmUsage?: GlmUsageSnapshot,
+    providerUsage?: ClaudeProviderUsageSnapshot,
   ): Promise<cards.ConsoleOpts> {
     const runtime = this.runtimeModelSelection()
     const sysinfo = await readSysInfo()
@@ -2483,6 +2485,7 @@ export class Session {
         })),
       usage,
       glmUsage,
+      providerUsage,
       sysinfo,
     }
   }
@@ -2495,11 +2498,18 @@ export class Session {
     // The card header and this quota row must come from the same runtime
     // selection. Clone the creation-time snapshot instead of re-reading the
     // mutable session after send/id-convert/network awaits.
-    const opts: cards.ConsoleOpts = { ...snapshot, usage: undefined, glmUsage: undefined }
+    const opts: cards.ConsoleOpts = {
+      ...snapshot,
+      usage: undefined,
+      glmUsage: undefined,
+      providerUsage: undefined,
+    }
     if (opts.usageSource === 'glm') {
       opts.glmUsage = await readGlmUsage()
     } else if (opts.usageSource === 'codex') {
       opts.usage = await readUsage(opts.model)
+    } else if (opts.usageSource === 'provider' && opts.model) {
+      opts.providerUsage = await readClaudeProviderUsage(opts.model)
     }
     await cardkit.replaceElement(cardId, cards.ELEMENTS.consoleUsage, cards.consoleUsageElement(opts))
   }

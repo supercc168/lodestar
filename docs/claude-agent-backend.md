@@ -18,7 +18,7 @@
 - `model` 命令展示固定档位（现状，见 `src/session-model.ts` 的 `FIXED_MODEL_CHOICES`）：
   - `claude:fable`（Fable 5）/ `claude:opus`（Opus 5）：官方登录档位，直传 `claude-fable-5` / `claude-opus-5`，走用户 Anthropic 登录态，绝不注入 API key，effort 锁 max。
   - `claude:glm`：第三方 API 路由，token 配在 `[claude.models.glm]`，spawn 时注入 `ANTHROPIC_*` env，effort 跟随 config（如 xhigh）；未配 token 时 picker 可见但选择被拦截。
-  - `claude:grok` / `claude:grokcc`：Wuhen / CatCodex 的 Grok Anthropic Messages 路由，统一由 Claude Agent SDK 启动；档位和真实 query 均锁 xAI 官方最高 `high`，并设置 `thinking: disabled` 以关闭 Claude 专属 adaptive 控制。
+  - `claude:grok` / `claude:grokcc`：Wuhen / CatCodex 的 Grok Anthropic Messages 路由，统一由 Claude Agent SDK 启动；无痕档锁官方 `high`，CatCodex 档锁已验证的工具兼容 `xhigh`，并都设置 `thinking: disabled` 以关闭 Claude 专属 adaptive 控制。
   - `codex`（GPT-5.6 Sol）：Codex app-server 后端，内建档 effort 锁 `max`；`[codex.models.*]` 可提供非 Grok 的第三方 API 档位。
   - （早期的 `claude:default` / `claude:deepseek` 已随二元化 / per-model 路由下线。）
 - 持久化模型选择扩展为 provider-aware，旧数据默认视为 Codex。
@@ -50,12 +50,12 @@ effort     = "high"
 base_url   = "https://catcodexapi.com" # Claude SDK 使用根地址，不追加 /v1
 auth_token = "<CatCodex token>"
 model      = "grok-4.5"
-effort     = "high"
+effort     = "xhigh"
 ```
 
 模型路由的真相源是 `config.toml` 的 `[claude.models.*]`(第三方 per-model token 路由):`ClaudeAgentProcess.buildSpawnEnv` 只在 GLM 一类 API 档位 spawn 时注入 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`,官方 Fable 5 / Opus 登录档位保持干净凭据基线。随后两类档位都会设置 `GSD_RUNTIME=claude`。第一方登录档按飞书当前选定主力注入子 agent alias：选 Fable 5 → fable/opus/sonnet 全为 `claude-fable-5`、haiku=`claude-sonnet-5`；选 Opus 5 → fable/opus/sonnet 全为 `claude-opus-5`、haiku=`claude-sonnet-5`（选 Opus 不注入 Fable，选 Fable 不注入 Opus）；第三方 API 档则把四个 alias 全部锁到当前 profile.model,避免官方 Claude id 泄漏到兼容端点。`[claude.models.*]` 的字段仅认 `display_name / description / model / base_url / auth_token / api_key / route / effort` 以及扁平 `env_<NAME>`；第三方档即使在 config 中分开声明四种 alias,也会在 spawn 边界收敛为当前 model。**别把第三方 env 写进 `~/.claude/settings.json`**:SDK 经 `settingSources:['user']` 会加载它、污染登录档位;`[claude.env]` 仅作可选 escape hatch。
 
-Grok 只属于 Claude backend。[xAI 官方 reasoning 文档](https://docs.x.ai/developers/model-capabilities/text/reasoning)规定 Grok 4.5 effort 只有 `low` / `medium` / `high`，最高且默认是 `high`；直连 xAI Responses API 对应 `reasoning: { "effort": "high" }`。Claude Agent SDK 的 `effort: "high"` 会原样转成 Claude Code `--effort high`；生产 query 同时设置 `thinking: { type: "disabled" }`，只为避免 Wuhen/CatCodex 接收 Claude 专属 adaptive-thinking 协议，并不关闭 Grok 自身 reasoning（真实流仍包含 thinking）。配置中的 Grok effort 会在选择和 spawn 边界归一化为 `high`。失败仍以原始错误暴露，不静默换模型/provider。任何 `[codex.models.*]` 中真实 model id 为 `grok-*` 的 profile 都不进入 picker/TokenSource，Codex spawn 边界也会直接拒绝；旧 `codex:grok*` 持久选择恢复时迁到同名 Claude 档位。
+Grok 只属于 Claude backend。[xAI 官方 reasoning 文档](https://docs.x.ai/developers/model-capabilities/text/reasoning)规定 Grok 4.5 effort 只有 `low` / `medium` / `high`，最高且默认是 `high`；直连 xAI Responses API 对应 `reasoning: { "effort": "high" }`。无痕路由按官方 `high` 启动；CatCodex 的 Anthropic 网关在 `high` 下可返回纯文本并忽略工具调用，而 `xhigh + thinking: disabled` 连续完成 raw 强制工具选择及 SDK `tool_use/tool_result`，因此 CatCodex 档位把 `xhigh` 作为网关兼容参数锁定。这不表示 xAI 增加了官方 reasoning 档位。两路的 `thinking: { type: "disabled" }` 都只为避免兼容端点接收 Claude 专属 adaptive-thinking 协议，不关闭 Grok 自身 reasoning。失败仍以原始错误暴露，不静默换模型/provider。任何 `[codex.models.*]` 中真实 model id 为 `grok-*` 的 profile 都不进入 picker/TokenSource，Codex spawn 边界也会直接拒绝；旧 `codex:grok*` 持久选择恢复时迁到同名 Claude 档位。
 
 可执行文件解析:`resolveClaudeExecutableConfig({ apiRoute })` 默认自动查找 `claude`(`~/.local/npm-global/bin` → `~/.local/bin` → PATH → SDK 自带)。`config.toml` 设 `[claude].bin`(支持 `~`)可显式覆盖,路径不存在时 `sendInitialize` 直接抛错,不静默回退。若配置的是 Unix `reclaude`,Lodestar 不把它直接传给 SDK(直接传会退回 CLI stream-json,丢失 dialog/control 协议),而是给 SDK 提供的 native command 建一个临时 PATH shim,再由 reclaude 注入 proxy/CA 后查找这个 `claude`;日志为 `executable=config-reclaude-sdk-native:<路径>`。**关键:第三方 API 路由(GLM/Grok 等,`route:api`)会强制绕开 `[claude].bin`、使用 SDK 自带 native 入口** —— reclaude 的 gateway 会把注入的 `ANTHROPIC_BASE_URL` 劫持回官方 Anthropic,第三方 model id 在官方 deployment 上不存在。官方登录档位走 reclaude + SDK native shim,第三方走 SDK native 直连端点。
 
@@ -129,7 +129,7 @@ Claude 自带 ask 工具接到 SDK `canUseTool`：
 - `agy` 转发按钮在 Codex 下保持 `转 Codex`，在 Claude 下显示 `转 Claude`，实际仍进入同一 session 用户消息路径。
 - 对话卡续卡 banner 在 Codex 下保持 `Codex turn` 原文，在 Claude 下显示 `Claude turn`。
 - Grok 选择、默认值和旧持久化值统一落到 Claude provider；Codex Grok profile 从 picker/TokenSource 过滤并在 spawn 边界拒绝。
-- Grok query 使用官方最高 `high` effort + disabled Claude adaptive thinking；这只改善兼容率，不掩盖上游 content-block 错误。
+- Grok query 使用路由专属 effort（无痕 `high` / CatCodex `xhigh`）+ disabled Claude adaptive thinking；这只改善兼容率，不掩盖上游 content-block 错误。
 
 ## Verification Plan
 - SDK 长驻探针：同一 `ClaudeAgentProcess` 处理两轮输入，返回同一 `session_id`。
@@ -149,10 +149,10 @@ Claude 自带 ask 工具接到 SDK `canUseTool`：
 
 - SDK 固定 `@anthropic-ai/claude-agent-sdk@0.3.220`（内置 Claude Code `2.1.220`），本机全局 Claude Code `2.1.201`。同一套已安装 SDK 对 CatCodex 既完成过完整 tool-use/tool-result，也出现过 `Content block not found`，故不能归因于一个确定的本机版本不兼容。
 - `claude:grok`（Wuhen）用官方 `high + disabled` 时，原始协议与 SDK 均完成 text/tool-use/tool-result，工具内观测到 `CLAUDE_EFFORT=high`，`rawPassed/sdkPassed/passed` 均为 true。
-- `claude:grokcc` 使用 `https://catcodexapi.com` 时原始端点可 HTTP 200 并遵守强制 tool choice；一次 SDK 轮完整看到 tool-use + tool-result + success，后续轮间歇报 `Content block not found`。`/v1` 使 SDK 报模型不存在/无权限，直接请求内部 `grok-4.5-build-free` 又得到 503，因此生产配置保留根地址 + `grok-4.5`。
-- Claude SDK 类型说明：`high` 是通用深度推理默认档；`xhigh` 只对指定 Claude 模型原生生效，其他模型回退到 `high`；`max` 也只支持部分 Claude 模型。CatCodex 的 `max` 对照曾失败或挂起，`xhigh` 成功实际依赖回退语义，因此生产改为显式官方 `high`。
-- Wuhen 与 CatCodex 的显式 `high + disabled` 探针均确认 `queryEffort=high`、`queryThinking=disabled`、`CLAUDE_EFFORT=high`，原始协议和 SDK 工具闭环全部通过；两条流仍看到 thinking，符合 Grok 4.5 reasoning 不能关闭的官方语义。
-- Grok/TokenSource/Session 定向测试 `380 pass / 0 fail`，全部发布产物构建成功；全量 `bun test` 为 `941 pass / 1 fail`，唯一失败是未修改的 `install/yiui-gsd/yiui-gsd.test.ts` mtime 亚毫秒精度断言（目标文件系统截断为整数毫秒），与既有基线一致。
+- `claude:grokcc` 使用 `https://catcodexapi.com` 根地址 + `grok-4.5`；`/v1` 会让 SDK 报模型不存在/无权限，直接请求内部 `grok-4.5-build-free` 又得到 503。`high + disabled` 连续两轮均只返回文本、没有 SDK tool-use，其中一轮连原始强制 tool choice 也未兑现。
+- Claude SDK 类型说明：`high` 是通用深度推理默认档；`xhigh` 官方只对指定 Claude 模型原生生效，其他模型通常回退到 `high`。但 CatCodex 网关对这两个入参产生了可观测的工具行为差异，因此该路由保留 `xhigh` 作为传输兼容参数，而不是把它解释为 xAI reasoning 档位。
+- CatCodex 的 `xhigh + disabled` 连续两轮均确认 `queryEffort=xhigh`、`queryThinking=disabled`，原始强制 tool choice 与 SDK text/tool-use/tool-result 全链路通过；Wuhen 的 `high + disabled` SDK 工具闭环也通过。两条流仍可看到 thinking，符合 Grok 4.5 reasoning 不能关闭的官方语义。
+- Grok/TokenSource/Session 定向测试 `13 pass / 0 fail`，全部发布产物构建成功；全量 `bun test` 为 `942 pass / 1 fail`，唯一失败是未修改的 `install/yiui-gsd/yiui-gsd.test.ts` mtime 亚毫秒精度断言（目标文件系统截断为整数毫秒），与既有基线一致。
 
 ## Codex API 档位（`[codex.models.*]`）
 
