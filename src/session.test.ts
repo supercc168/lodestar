@@ -240,7 +240,9 @@ function wiredWatchdogSession(
   projectProfiles.set(sessionName, { watchdogMode: mode })
   const session = new Session(sessionName, 'chat_id') as any
   const proc = new FakeAgentProc(provider, provider === 'codex' ? 'thread-1' : 'claude-thread-1')
-  const turn = turnState(`card_${provider}_watchdog_${fixtureId}`)
+  const turn = turnState(`card_${provider}_watchdog_${fixtureId}`, provider === 'claude'
+    ? { provider: 'claude', model: 'claude:grokcc', effort: 'xhigh', usageSource: 'provider' }
+    : { provider: 'codex' })
   session.selectedProvider = provider
   session.proc = proc
   session.currentTurn = turn
@@ -881,6 +883,202 @@ describe('Session shared turn interrupt', () => {
       reason: 'process exit no longer owns captured turn',
     })
     expect(session.proc).toBeNull()
+  })
+})
+
+describe('Session repeated tool failure circuit breaker', () => {
+  function emitFailedEdit(proc: FakeAgentProc, index: number): void {
+    const id = `failed-edit-${index}`
+    proc.emit('tool_use', {
+      id,
+      name: 'Edit',
+      input: { file_path: '/tmp/a.ts', old_string: 'same', new_string: 'same' },
+      parentToolUseId: null,
+    })
+    proc.emit('tool_result', {
+      tool_use_id: id,
+      content: 'No changes to make: old_string and new_string are exactly the same.',
+      is_error: true,
+      parentToolUseId: null,
+    })
+  }
+
+  for (const provider of ['claude', 'codex'] as const) {
+    test(`${provider} stops the turn on the third identical failure without replaying it`, async () => {
+      const { session, proc, turn } = wiredWatchdogSession(provider)
+      cardkit.recordCardCreated(turn.cardId, 1)
+      proc.onInterrupt = () => proc.emit('result', {
+        subtype: 'error_during_execution',
+        is_error: true,
+      })
+
+      emitFailedEdit(proc, 1)
+      emitFailedEdit(proc, 2)
+      expect(proc.interruptCalls).toBe(0)
+
+      emitFailedEdit(proc, 3)
+      await waitFor(() => session.toolFailureLoopAction === null && session.currentTurn === null)
+
+      expect(proc.interruptCalls).toBe(1)
+      expect(proc.sentTexts).toEqual([])
+      expect(session.status).toBe('idle')
+      expect(JSON.stringify(calls)).toContain('Edit 连续 3 次相同失败')
+    })
+  }
+
+  test('preserves and dispatches queued human input after stopping the failed turn', async () => {
+    const { session, proc, turn } = wiredWatchdogSession('claude')
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.pendingMidTurnMsgs = [{
+      text: 'use a different approach',
+      wireText: 'use a different approach',
+      userOpenId: 'ou_human',
+      msgId: 'om_human',
+    }]
+    session.pendingReactionIds.set('om_human', 'reaction_human')
+    proc.onInterrupt = () => proc.emit('result', {
+      subtype: 'error_during_execution',
+      is_error: true,
+    })
+
+    emitFailedEdit(proc, 1)
+    emitFailedEdit(proc, 2)
+    emitFailedEdit(proc, 3)
+    await waitFor(() => proc.sentTexts.includes('use a different approach'))
+
+    expect(proc.interruptCalls).toBe(1)
+    expect(proc.sentTexts).toEqual(['use a different approach'])
+    expect(proc.sentTexts).not.toContain(WATCHDOG_RECOVERY_PROMPT)
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(session.currentTurn).toMatchObject({ trigger: 'user_message', provider: 'claude' })
+  })
+
+  test('kills the captured process after the soft-interrupt grace timeout', async () => {
+    const { session, proc, turn } = wiredWatchdogSession('claude')
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.waitForTurnSettlement = async () => ({ type: 'timeout' })
+    session.pendingMidTurnMsgs = [{
+      text: 'preserved after timeout',
+      wireText: 'preserved after timeout',
+      userOpenId: 'ou_timeout',
+      msgId: 'om_timeout',
+    }]
+
+    emitFailedEdit(proc, 1)
+    emitFailedEdit(proc, 2)
+    emitFailedEdit(proc, 3)
+    await waitFor(() => session.toolFailureLoopAction === null)
+
+    expect(proc.interruptCalls).toBe(1)
+    expect(proc.killCalls).toBe(1)
+    expect(session.proc).toBeNull()
+    expect(session.currentTurn).toBeNull()
+    expect(session.status).toBe('stopped')
+    expect(session.pendingMidTurnMsgs.map((message: any) => message.text)).toEqual([
+      'preserved after timeout',
+    ])
+    expect(sentRawTexts).toContain(
+      '⚠️ 工具失败循环已停止；排队消息仍保留，下一条普通消息会与它们一起投递。',
+    )
+
+    let coldBatch: any[] = []
+    session.startColdUserTurn = async (...args: any[]) => { coldBatch = args[4] }
+    await session.onUserMessage('next human message', [], 'ou_next', 'om_next')
+    expect(coldBatch.map(message => message.text)).toEqual([
+      'preserved after timeout',
+      'next human message',
+    ])
+  })
+
+  test('restores queued input when opening its follow-up card throws', async () => {
+    const { session, proc, turn } = wiredWatchdogSession('claude')
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.pendingMidTurnMsgs = [{
+      text: 'keep this input',
+      wireText: 'keep this input',
+      userOpenId: 'ou_keep',
+      msgId: 'om_keep',
+    }]
+    proc.onInterrupt = () => proc.emit('result', {
+      subtype: 'error_during_execution',
+      is_error: true,
+    })
+    session.openTurnCard = async () => { throw new Error('card unavailable') }
+
+    emitFailedEdit(proc, 1)
+    emitFailedEdit(proc, 2)
+    emitFailedEdit(proc, 3)
+    await waitFor(() => session.toolFailureLoopAction === null)
+
+    expect(session.pendingMidTurnMsgs.map((message: any) => message.text)).toEqual([
+      'keep this input',
+    ])
+    expect(sentRawTexts).toContain(
+      '⚠️ 工具失败循环已停止；排队消息仍保留，下一条普通消息会与它们一起投递。',
+    )
+  })
+
+  test('queues human input that arrives after the failed card leaves the table', async () => {
+    const { session, proc, turn } = wiredWatchdogSession('claude')
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const closeEntered = deferred<void>()
+    const closeRelease = deferred<void>()
+    let coldStarts = 0
+    let drains = 0
+    session.closeTurnCard = async () => {
+      session.currentTurn = null
+      closeEntered.resolve()
+      await closeRelease.promise
+    }
+    session.startColdUserTurn = async () => { coldStarts++ }
+    session.drainMidTurnAndOpen = async () => {
+      drains++
+      session.pendingMidTurnMsgs = []
+      session.status = 'working'
+      return 'committed'
+    }
+    proc.onInterrupt = () => proc.emit('result', {
+      subtype: 'error_during_execution',
+      is_error: true,
+    })
+
+    emitFailedEdit(proc, 1)
+    emitFailedEdit(proc, 2)
+    emitFailedEdit(proc, 3)
+    await closeEntered.promise
+    await session.onUserMessage('arrived during close', [], 'ou_race', 'om_race')
+
+    expect(coldStarts).toBe(0)
+    expect(session.pendingMidTurnMsgs.map((message: any) => message.text)).toEqual([
+      'arrived during close',
+    ])
+    closeRelease.resolve()
+    await waitFor(() => session.toolFailureLoopAction === null)
+
+    expect(drains).toBe(1)
+    expect(session.status).toBe('working')
+  })
+
+  test('lets an explicit user stop take ownership without a second interrupt', async () => {
+    const { session, proc, turn } = wiredWatchdogSession('claude')
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    emitFailedEdit(proc, 1)
+    emitFailedEdit(proc, 2)
+    emitFailedEdit(proc, 3)
+    await waitFor(() => session.activeTurnInterrupt?.source === 'tool_failure_loop')
+
+    await session.runCommand('st')
+    expect(session.activeTurnInterrupt?.source).toBe('user')
+    expect(proc.interruptCalls).toBe(1)
+    expect(proc.killCalls).toBe(0)
+    expect(session.currentTurn).toBeNull()
+
+    proc.emit('result', { subtype: 'error_during_execution', is_error: true })
+    await waitFor(() => session.toolFailureLoopAction === null)
+
+    expect(session.status).toBe('idle')
+    expect(JSON.stringify(calls)).toContain('🛑 打断')
   })
 })
 

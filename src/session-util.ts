@@ -26,6 +26,7 @@ export type LifecycleKind =
   | 'fork'
   | 'watchdog-recovery'
   | 'watchdog-exhausted'
+  | 'tool-failure-loop'
 
 export type LifecycleLease = Readonly<{
   epoch: number

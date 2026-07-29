@@ -75,6 +75,8 @@ SDK `model`:官方档位直传 `claude-fable-5` / `claude-opus-5`;第三方档�
 
 权限:Claude SDK 使用 `permissionMode: default`,让 `AskUserQuestion` 能进入 `canUseTool`;其它工具在 callback 内立即 allow,保持原来的全自动行为。Ask callback 挂起并 emit `can_use_tool` 给 Session,飞书按钮回调再通过 `sendPermissionResponse()` resolve。
 
+失败工具保护:SDK 注册 `PostToolUse` / `PostToolUseFailure` 进程内 hooks。连续第 2 次完全相同的工具失败会向模型追加“不要原样重试、重新读状态并换参数/策略”的上下文；provider 通用的 `Session` 指纹检测在第 3 次软中断当前 turn、关闭卡片且不重放原任务。排队真人消息在进程健康时续投，进程退出或开卡失败时保留到下一条普通消息；一次失败、成功工具或不同 input/error 都会重置序列。
+
 Claude 自带 ask 工具接到 SDK `canUseTool`：
 
 - query 配置 `toolConfig.askUserQuestion.previewFormat = markdown`,由 SDK native transport 下发 `AskUserQuestion`。

@@ -105,6 +105,10 @@ import {
   type WatchdogSettings,
   type WatchdogVerdict,
 } from './turn-watchdog'
+import {
+  ToolFailureLoopGuard,
+  type ToolFailureLoopVerdict,
+} from './tool-failure-loop'
 
 export type { SessionOpts } from './session-types'
 
@@ -145,12 +149,22 @@ export interface WatchdogActionTransaction extends ResumeIdentity {
   readonly recoveryAttempt: number
 }
 
+interface ToolFailureLoopAction {
+  readonly lease: LifecycleLease
+  readonly proc: AgentProcess
+  readonly turn: TurnState
+  readonly verdict: Extract<ToolFailureLoopVerdict, { type: 'stop' }>
+}
+
+const TOOL_FAILURE_QUEUE_PRESERVED_NOTICE =
+  '⚠️ 工具失败循环已停止；排队消息仍保留，下一条普通消息会与它们一起投递。'
+
 export interface ModelSwitchTransaction {
   readonly token: object
   readonly lease: LifecycleLease
 }
 
-type TurnInterruptSource = 'user' | 'watchdog_recover' | 'watchdog_exhausted'
+type TurnInterruptSource = 'user' | 'watchdog_recover' | 'watchdog_exhausted' | 'tool_failure_loop'
 
 type TurnSettlement =
   | { type: 'result'; proc: AgentProcess; turn: TurnState | null }
@@ -589,6 +603,9 @@ export class Session {
   taskBoard: cards.TaskBoardEntry[] = []
   readonly watchdog: TurnWatchdog
   readonly watchdogSettings: WatchdogSettings
+  readonly toolFailureLoop = new ToolFailureLoopGuard()
+  toolFailureLoopTurn: TurnState | null = null
+  toolFailureLoopAction: ToolFailureLoopAction | null = null
   watchdogContext: WatchdogTurnContext | null = null
   watchdogAction: WatchdogActionTransaction | null = null
   preservedWatchdogRecovery: PreservedWatchdogRecovery | null = null
@@ -694,6 +711,7 @@ export class Session {
       this.activeCodexSubagentActivities.size > 0 ||
       this.codexCollabAgentStates.size > 0 ||
       this.watchdogActionInFlight ||
+      this.toolFailureLoopActionInFlight ||
       this.hasPreservedWatchdogRecovery() ||
       this.startingAgy ||
       this.runningAgy !== null
@@ -736,6 +754,10 @@ export class Session {
 
   get watchdogActionInFlight(): boolean {
     return !!this.watchdogAction && this.ownsLifecycle(this.watchdogAction.lease)
+  }
+
+  get toolFailureLoopActionInFlight(): boolean {
+    return !!this.toolFailureLoopAction && this.ownsLifecycle(this.toolFailureLoopAction.lease)
   }
 
   get watchdogActionProc(): AgentProcess | null {
@@ -1132,6 +1154,138 @@ export class Session {
     if (!context || context.proc !== source || this.proc !== source || !this.watchdogContextIsCurrent(context)) return
     if (this.watchdog.observeToolResult(id, content, isError, Date.now())) {
       this.clearWatchdogFooterWarning(context)
+    }
+  }
+
+  observeToolFailureLoop(
+    source: AgentProcess,
+    toolName: string,
+    input: unknown,
+    output: unknown,
+    isError: boolean,
+  ): void {
+    const turn = this.currentTurn
+    if (!turn || this.proc !== source || !source.isAlive()) return
+    if (this.toolFailureLoopTurn !== turn) {
+      this.toolFailureLoop.reset()
+      this.toolFailureLoopTurn = turn
+    }
+    if (!isError) {
+      this.toolFailureLoop.observeSuccess()
+      return
+    }
+
+    const verdict = this.toolFailureLoop.observeFailure(toolName, input, output)
+    if (verdict.type === 'correct') {
+      log(`session "${this.sessionName}": repeated tool failure correction tool=${toolName} count=${verdict.repeatCount} fingerprint=${verdict.fingerprintHash.slice(0, 12)}`)
+      return
+    }
+    if (verdict.type !== 'stop' || this.toolFailureLoopActionInFlight) return
+    if (this.toolFailureLoopAction && !this.toolFailureLoopActionInFlight) {
+      this.toolFailureLoopAction = null
+    }
+    void this.runToolFailureLoopStop(source, turn, verdict).catch(e => {
+      log(`session "${this.sessionName}": tool failure loop stop rejected: ${messageOf(e)}`)
+    })
+  }
+
+  clearToolFailureLoop(turn?: TurnState | null): void {
+    if (turn && this.toolFailureLoopTurn && this.toolFailureLoopTurn !== turn) return
+    this.toolFailureLoop.reset()
+    this.toolFailureLoopTurn = null
+  }
+
+  private toolFailureLoopStatus(verdict: Extract<ToolFailureLoopVerdict, { type: 'stop' }>): string {
+    const tool = verdict.toolName.replace(/\s+/g, ' ').trim().slice(0, 48) || '工具'
+    return `🛑 已停止：${tool} 连续 ${verdict.repeatCount} 次相同失败`
+  }
+
+  private ownsToolFailureLoopAction(action: ToolFailureLoopAction): boolean {
+    return this.toolFailureLoopAction === action && this.ownsLifecycle(action.lease)
+  }
+
+  async runToolFailureLoopStop(
+    source: AgentProcess,
+    turn: TurnState,
+    verdict: Extract<ToolFailureLoopVerdict, { type: 'stop' }>,
+  ): Promise<void> {
+    if (
+      this.toolFailureLoopActionInFlight ||
+      this.proc !== source ||
+      this.currentTurn !== turn ||
+      !source.isAlive()
+    ) return
+
+    const lease = this.beginLifecycle('tool-failure-loop')
+    const action: ToolFailureLoopAction = Object.freeze({ lease, proc: source, turn, verdict })
+    this.toolFailureLoopAction = action
+    const status = this.toolFailureLoopStatus(verdict)
+    this.stopFooterStatus(turn)
+    turn.footerStatusOverride = status
+    log(`session "${this.sessionName}": tool failure loop stop tool=${verdict.toolName} count=${verdict.repeatCount} fingerprint=${verdict.fingerprintHash.slice(0, 12)}`)
+
+    try {
+      const interrupt = this.beginTurnInterrupt('tool_failure_loop')
+      if (!interrupt) return
+      const footerPatch = this.replaceFooterContent(turn.cardId, this.withModel(status, turn)).catch(e => {
+        log(`session "${this.sessionName}": tool failure loop footer patch failed: ${messageOf(e)}`)
+      })
+      const outcome = await this.waitForTurnSettlement(
+        interrupt,
+        this.configuredWatchdogSettings().interruptGraceMs,
+      )
+      await footerPatch
+      if (!this.ownsToolFailureLoopAction(action) || outcome.type === 'cancelled') return
+
+      if (outcome.type === 'timeout') {
+        this.cancelTurnInterrupt('tool failure loop grace timeout')
+        if (this.proc === source) this.proc = null
+        if (source.isAlive()) {
+          await source.kill(1_000).catch(e => {
+            log(`session "${this.sessionName}": tool failure loop kill failed: ${messageOf(e)}`)
+          })
+        }
+        if (!this.ownsToolFailureLoopAction(action)) return
+      }
+
+      if (this.currentTurn === turn) {
+        try {
+          await this.closeTurnCard(status, {
+            forcePush: true,
+            preservePendingReactions: true,
+          })
+        } catch (e) {
+          log(`session "${this.sessionName}": tool failure loop card close failed: ${messageOf(e)}`)
+          await feishu.sendTextRaw(this.chatId, status).catch(() => {})
+        }
+      }
+      if (!this.ownsToolFailureLoopAction(action)) return
+      if (this.currentTurn && this.currentTurn !== turn) return
+
+      this.status = this.proc === source && source.isAlive() ? 'idle' : 'stopped'
+      this.opts.onLifecycleChange?.()
+      if (
+        this.pendingMidTurnMsgs.length > 0 &&
+        this.proc === source &&
+        source.isAlive() &&
+        !this.currentTurn
+      ) {
+        let drainOutcome: MidTurnDrainOutcome = 'preserved'
+        try {
+          drainOutcome = await this.drainMidTurnAndOpen()
+        } catch (e) {
+          log(`session "${this.sessionName}": tool failure loop human drain failed: ${messageOf(e)}`)
+        }
+        if (!this.ownsToolFailureLoopAction(action)) return
+        if (drainOutcome === 'preserved' && this.hasQueuedHumanWork()) {
+          await feishu.sendTextRaw(this.chatId, TOOL_FAILURE_QUEUE_PRESERVED_NOTICE).catch(() => {})
+        }
+      } else if (this.hasQueuedHumanWork() && this.status === 'stopped') {
+        await feishu.sendTextRaw(this.chatId, TOOL_FAILURE_QUEUE_PRESERVED_NOTICE).catch(() => {})
+      }
+    } finally {
+      if (this.toolFailureLoopAction === action) this.toolFailureLoopAction = null
+      if (this.toolFailureLoopTurn === turn) this.clearToolFailureLoop(turn)
     }
   }
 
@@ -1851,6 +2005,8 @@ export class Session {
     const report = opts.onStatus
     this.discardPreservedWatchdogRecovery(`stop: ${reason}`)
     this.clearWatchdogRuntime(`stop: ${reason}`)
+    this.toolFailureLoopAction = null
+    this.clearToolFailureLoop()
     this.discardQueuedHumanWork('stop')
     // stop ends any in-session GSD execution signal (panel fine-progress gate).
     sessionGsd.clearGsdExecution(this)
@@ -2299,6 +2455,8 @@ export class Session {
     if (this.proc === pendingProc) this.proc = null
     this.pendingSpawnOwnership = null
     this.clearWatchdogRuntime('dispose')
+    this.toolFailureLoopAction = null
+    this.clearToolFailureLoop()
     this.discardPreservedWatchdogRecovery('dispose')
     this.discardQueuedHumanWork('dispose')
     this.status = 'stopped'
@@ -2595,8 +2753,9 @@ export class Session {
     const proc = this.proc
     const turn = this.currentTurn
     if (!proc) return null
+    const watchdogSource = source === 'watchdog_recover' || source === 'watchdog_exhausted'
     if (
-      source !== 'user' &&
+      watchdogSource &&
       (!watchdogCtx || !turn || !watchdogCtx.threadId || !watchdogCtx.turnId || !this.watchdogContextIsCurrent(watchdogCtx))
     ) return null
     if (this.activeTurnInterrupt) {
@@ -2631,6 +2790,7 @@ export class Session {
   settleTurnInterrupt(proc: AgentProcess, type: 'result' | 'exit'): TurnInterruptContext | null {
     const context = this.activeTurnInterrupt
     if (!context || context.settled || context.proc !== proc) return null
+    const watchdogSource = context.source === 'watchdog_recover' || context.source === 'watchdog_exhausted'
     if (context.source === 'user') {
       if (this.proc !== proc || (this.currentTurn && this.currentTurn !== context.turn)) return null
     } else if (this.proc !== proc || this.currentTurn !== context.turn) {
@@ -2638,8 +2798,8 @@ export class Session {
     }
     if (context.threadId && proc.sessionId !== context.threadId) return null
     if (context.turn) {
-      if (context.source !== 'user' && context.threadId && context.turn.backendThreadId !== context.threadId) return null
-      if (context.source === 'user' && context.threadId && context.turn.backendThreadId && context.turn.backendThreadId !== context.threadId) return null
+      if (watchdogSource && context.threadId && context.turn.backendThreadId !== context.threadId) return null
+      if (!watchdogSource && context.threadId && context.turn.backendThreadId && context.turn.backendThreadId !== context.threadId) return null
       if (context.turnId && context.turn.backendTurnId !== context.turnId) return null
     }
     context.settled = true
@@ -3102,6 +3262,10 @@ export class Session {
     sessionGsd.noteGsdInjectIfAny(this, text)
     if (this.startingAgy || this.runningAgy) {
       await feishu.sendText(this.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再继续。')
+      return
+    }
+    if (this.toolFailureLoopActionInFlight) {
+      this.queueHumanMessage(text, wireText, userOpenId, msgId)
       return
     }
     if (this.watchdogActionInFlight || this.watchdogResumeFailed) {
@@ -4099,7 +4263,11 @@ export class Session {
         this.status = 'idle'
         return
       }
-      if (interrupted?.source === 'watchdog_recover' || interrupted?.source === 'watchdog_exhausted') return
+      if (
+        interrupted?.source === 'watchdog_recover' ||
+        interrupted?.source === 'watchdog_exhausted' ||
+        interrupted?.source === 'tool_failure_loop'
+      ) return
       if (pendingInterrupt?.proc === p) {
         if (this.activeTurnInterrupt === pendingInterrupt) {
           this.cancelTurnInterrupt('result no longer owns captured turn')
@@ -4230,7 +4398,11 @@ export class Session {
       }
       const pendingInterrupt = this.activeTurnInterrupt
       const interrupted = this.settleTurnInterrupt(p, 'exit')
-      if (interrupted?.source === 'watchdog_recover' || interrupted?.source === 'watchdog_exhausted') {
+      if (
+        interrupted?.source === 'watchdog_recover' ||
+        interrupted?.source === 'watchdog_exhausted' ||
+        interrupted?.source === 'tool_failure_loop'
+      ) {
         this.proc = null
         // 死进程的 ask/permission 定义上已死(见普通 exit 路径注释);
         // 恢复流程随后可能 restart,但 restart 可能失败或被测试 mock,
@@ -4472,6 +4644,9 @@ export class Session {
       }
       delivery.turn = openResult.turn
       return await this.dispatchHumanBatch(delivery)
+    } catch (e) {
+      this.restoreHumanDelivery(delivery)
+      throw e
     } finally {
       this.finishTurnOpening(openingToken)
     }
@@ -5296,6 +5471,7 @@ export class Session {
       outboundSentPaths: new Set(),
       hostAskMarkersSeen: new Set(),
     }
+    this.clearToolFailureLoop()
     this.currentTurn = turnState
     if (this.proc) this.beginWatchdogTurn(turnState, this.proc)
     this.finishWatchdogOpening(watchdogOpeningTurnCounter, false, watchdogOpeningProc, openingToken)
@@ -6015,6 +6191,7 @@ export class Session {
     const turn = this.currentTurn
     if (!turn) return
     this.currentTurn = null
+    this.clearToolFailureLoop(turn)
     this.endWatchdogTurn()
     this.stopFooterStatus(turn)
     // 竞态修复:mid-turn rotation 的 swap 阶段(sendCard / id_convert 的 await

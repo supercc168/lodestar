@@ -191,6 +191,7 @@ export function completeTool(s: Session, source: AgentProcess, toolUseId: string
     : Array.isArray(content)
       ? content.map((c: any) => c?.text ?? JSON.stringify(c)).join('\n')
       : JSON.stringify(content)
+  s.observeToolFailureLoop(source, meta.name, meta.input, output, isError)
   // Stash on the meta so rotation can rebuild unfinished or failed
   // panels after this result lands.
   meta.output = output

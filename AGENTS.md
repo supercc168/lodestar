@@ -33,6 +33,7 @@
 - 运行状态全部在 XDG 目录外置：配置默认在 `~/.config/lodestar/config.toml`，日志和 runtime map 默认在 `~/.local/share/lodestar/`。凭据只应存在于 `config.toml`，不要写入仓库。
 - Assistant 正文和 footer 状态不使用 Card Kit `/content` 打字流；正文按完整段 `addElement` 插入，footer 状态用 `replaceElement` 直接替换。
 - API 失败要记录并向用户暴露；不要静默切换传输、卡片或消息通道作为“兜底”。
+- Claude/Codex 共享连续失败工具熔断：同一工具+规范化 input+错误指纹连续命中时，Claude 第 2 次经 `PostToolUseFailure` 注入纠错上下文，第 3 次由 Session 软中断并终结卡片；不自动重放原任务，真人排队消息保留。该机制独立于 Codex-only 的 turn watchdog，禁止用 `maxTurns` 或修改 Grok effort 代替。
 - 不要主动重启正在运行的 daemon，除非用户在**当前用户消息**里明确要求 `restart` / `重启` / reload。代码变更后只报告需要重启。
 - 执行已授权的重启时**先确认托管方式**（`launchctl list | grep lodestar` / `systemctl --user list-units`），用托管器自己的重启命令一条完成（macOS launchd：`launchctl kickstart -k gui/$(id -u)/com.supercc168.lodestar`）。**严禁**用 `launchctl submit` 跑一次性重启脚本——submit 的 job 默认 keepalive，脚本退出后每 ~10s 被重新 spawn，变成无限 kill+kickstart 循环（2026-07-20 实测事故）；也不要在托管环境手动起第二个 daemon 实例（脱管野进程与托管实例互杀）。发现 daemon PID 每 ~10s 规律滚动，先查多余 launchd job 并 `launchctl bootout`。
 - 停止、重启、替换、shadow、切换或并行接管正在运行的 daemon / user service 的授权**只在当前 assistant 回合内一次性有效**，不得跨用户消息、跨中断恢复、跨上下文压缩或跨任务范围沿用；一旦用户发来新的消息，即使上一条消息要求过“重启”，后续也必须重新明确授权后才能再次操作 live service。

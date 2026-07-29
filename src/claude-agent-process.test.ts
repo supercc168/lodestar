@@ -465,6 +465,69 @@ describe('Claude permission mode', () => {
   })
 })
 
+describe('Claude repeated tool failure correction hook', () => {
+  test('injects corrective context on repeat two and resets after success', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const failureHook = proc.sdkToolFailureHooks.PostToolUseFailure[0].hooks[0]
+    const successHook = proc.sdkToolFailureHooks.PostToolUse[0].hooks[0]
+    const options = { signal: new AbortController().signal }
+    const failure = {
+      hook_event_name: 'PostToolUseFailure',
+      tool_name: 'Edit',
+      tool_input: { file_path: '/tmp/a.ts', old_string: 'x', new_string: 'x' },
+      tool_use_id: 'edit-1',
+      error: 'No changes to make',
+    }
+
+    expect(await failureHook(failure, 'edit-1', options)).toEqual({})
+    const correction = await failureHook({ ...failure, tool_use_id: 'edit-2' }, 'edit-2', options)
+    expect(correction.hookSpecificOutput).toMatchObject({
+      hookEventName: 'PostToolUseFailure',
+    })
+    expect(correction.hookSpecificOutput.additionalContext).toContain('Do not retry it unchanged')
+
+    await successHook({ hook_event_name: 'PostToolUse' }, 'bash-1', options)
+    expect(await failureHook({ ...failure, tool_use_id: 'edit-3' }, 'edit-3', options)).toEqual({})
+  })
+
+  test('marks the third identical failure as host-stopped context', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const failureHook = proc.sdkToolFailureHooks.PostToolUseFailure[0].hooks[0]
+    const options = { signal: new AbortController().signal }
+    const input = {
+      hook_event_name: 'PostToolUseFailure',
+      tool_name: 'Edit',
+      tool_input: { file_path: '/tmp/a.ts', old_string: 'x', new_string: 'x' },
+      error: 'No changes to make',
+    }
+
+    await failureHook({ ...input, tool_use_id: 'edit-1' }, 'edit-1', options)
+    await failureHook({ ...input, tool_use_id: 'edit-2' }, 'edit-2', options)
+    const stopped = await failureHook({ ...input, tool_use_id: 'edit-3' }, 'edit-3', options)
+    expect(stopped.hookSpecificOutput.additionalContext).toContain('circuit breaker is stopping this turn')
+  })
+
+  test('starts a fresh failure sequence when a new user turn is queued', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    proc.started = true
+    const failureHook = proc.sdkToolFailureHooks.PostToolUseFailure[0].hooks[0]
+    const options = { signal: new AbortController().signal }
+    const failure = {
+      hook_event_name: 'PostToolUseFailure',
+      tool_name: 'Edit',
+      tool_input: { file_path: '/tmp/a.ts', old_string: 'x', new_string: 'x' },
+      error: 'No changes to make',
+    }
+
+    await failureHook({ ...failure, tool_use_id: 'edit-1' }, 'edit-1', options)
+    const correction = await failureHook({ ...failure, tool_use_id: 'edit-2' }, 'edit-2', options)
+    expect(correction.hookSpecificOutput.additionalContext).toContain('Do not retry it unchanged')
+
+    expect(proc.sendUserText('next turn')).toEqual({ kind: 'queued', provider: 'claude' })
+    expect(await failureHook({ ...failure, tool_use_id: 'edit-3' }, 'edit-3', options)).toEqual({})
+  })
+})
+
 describe('Claude user dialog bridge', () => {
   test('uses session_state_changed running as turn start boundary', () => {
     const proc = new ClaudeAgentProcess({
@@ -1352,6 +1415,7 @@ describe('Claude sendUserText dispatch contract', () => {
     proc.started = true
     proc.sessionId = 'claude-session-1'
     proc.pendingInjectedContext = []
+    proc.sdkToolFailureLoop = { reset: () => {} }
     proc.input = {
       push: (message: unknown) => {
         pushed.push(message)

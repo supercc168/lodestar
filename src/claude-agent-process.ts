@@ -6,6 +6,10 @@ import { EventEmitter } from 'node:events'
 import {
   query,
   type EffortLevel,
+  type HookCallbackMatcher,
+  type HookEvent,
+  type HookInput,
+  type HookJSONOutput,
   type ModelInfo,
   type Query,
   type SDKMessage,
@@ -39,6 +43,7 @@ import type {
   SpawnOpts,
 } from './codex-process'
 import { usageFromTokenUsagePayload } from './codex-usage'
+import { ToolFailureLoopGuard } from './tool-failure-loop'
 
 type QueueWaiter<T> = (value: IteratorResult<T>) => void
 
@@ -95,6 +100,12 @@ type PendingServerToolInput = {
   name: string
   input: unknown
 }
+
+const TOOL_FAILURE_CORRECTION_CONTEXT = [
+  'The same tool call has failed twice with exactly the same input and error.',
+  'Do not retry it unchanged. Re-read the current state and change the arguments or strategy.',
+  'If no change is needed, stop calling the tool and explain that result to the user.',
+].join(' ')
 
 export interface ClaudeSpawnOpts extends SpawnOpts {
   model?: string
@@ -768,6 +779,18 @@ export class ClaudeAgentProcess extends EventEmitter {
   private emittedToolUseIds = new Set<string>()
   private emittedToolResultIds = new Set<string>()
   private pendingServerToolInputs: PendingServerToolInput[] = []
+  private readonly sdkToolFailureLoop = new ToolFailureLoopGuard()
+  private readonly sdkToolFailureHooks = {
+    PostToolUse: [{
+      hooks: [async (input: HookInput): Promise<HookJSONOutput> => {
+        if (input.hook_event_name === 'PostToolUse') this.sdkToolFailureLoop.observeSuccess()
+        return {}
+      }],
+    }],
+    PostToolUseFailure: [{
+      hooks: [async (input: HookInput): Promise<HookJSONOutput> => this.handleSdkToolFailure(input)],
+    }],
+  } satisfies Partial<Record<HookEvent, HookCallbackMatcher[]>>
 
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
@@ -867,6 +890,7 @@ export class ClaudeAgentProcess extends EventEmitter {
             askUserQuestion: { previewFormat: 'markdown' },
           },
           canUseTool: (toolName, input, opts) => this.canUseTool(toolName, input, opts),
+          hooks: this.sdkToolFailureHooks,
           includePartialMessages: false,
           systemPrompt: {
             type: 'preset',
@@ -908,6 +932,9 @@ export class ClaudeAgentProcess extends EventEmitter {
       ? this.pendingInjectedContext.splice(0).join('\n\n') + '\n\n'
       : ''
     try {
+      // A newly queued user frame is a new turn even if an abnormal prior
+      // interrupt never delivered its terminal result message.
+      this.sdkToolFailureLoop.reset()
       this.input.push({
         type: 'user',
         session_id: this.sessionId ?? '',
@@ -1065,6 +1092,25 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.emitToolUseOnce(toolUseId, 'AskUserQuestion', normalizedInput, null)
     this.emit('can_use_tool', req)
     return pending
+  }
+
+  private handleSdkToolFailure(input: HookInput): HookJSONOutput {
+    if (input.hook_event_name !== 'PostToolUseFailure') return {}
+    const verdict = this.sdkToolFailureLoop.observeFailure(
+      input.tool_name,
+      input.tool_input,
+      input.error,
+    )
+    if (verdict.type !== 'correct' && verdict.type !== 'stop') return {}
+    log(`claude-agent-process: repeated tool failure tool=${input.tool_name} count=${verdict.repeatCount} fingerprint=${verdict.fingerprintHash.slice(0, 12)} action=${verdict.type}`)
+    return {
+      hookSpecificOutput: {
+        hookEventName: 'PostToolUseFailure',
+        additionalContext: verdict.type === 'stop'
+          ? `${TOOL_FAILURE_CORRECTION_CONTEXT} The host safety circuit breaker is stopping this turn now.`
+          : TOOL_FAILURE_CORRECTION_CONTEXT,
+      },
+    }
   }
 
   private async readLoop(q: Query): Promise<void> {
@@ -1293,6 +1339,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   private handleResultMessage(raw: any): void {
+    this.sdkToolFailureLoop.reset()
     if (typeof raw.session_id === 'string' && raw.session_id) this.sessionId = raw.session_id
     this.turnActive = false
     const usage = usageFromSdk(raw.usage)
