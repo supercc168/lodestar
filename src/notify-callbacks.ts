@@ -37,6 +37,8 @@ export interface NotifyButton {
   id: string
   text: string
   type: 'default' | 'primary' | 'danger'
+  /** Optional open_url target; callback registration usually omits these. */
+  url?: string
 }
 
 /** A registered interactive `/notify` card. Persisted wholesale so the

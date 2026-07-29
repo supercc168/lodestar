@@ -16,11 +16,11 @@
  *       "title":   "build",                    // optional, default = project
  *       "level":   "info" | "warn" | "error"   // optional, default "info"
  *       "images":  ["/abs/a.png", ...],        // optional, uploaded + embedded
- *       "buttons": [                           // optional, max 5
+ *       "buttons": [                           // optional
  *         {"id":"approve","text":"✅ 通过","type":"primary"},
- *         {"id":"reject", "text":"❌ 拒绝","type":"danger"}
+ *         {"id":"gmgn","text":"GMGN","url":"https://gmgn.ai/..."}  // open_url
  *       ],
- *       "callback": "http://127.0.0.1:9999/hook"  // optional loopback URL (push)
+ *       "callback": "http://127.0.0.1:9999/hook"  // optional loopback URL (push; callback buttons only)
  *     }
  *   → 200 { ok: true, chat_id, message_id, notify_id? }
  *   → 400 bad/empty json or missing/invalid field
@@ -79,6 +79,12 @@ export interface ParsedButton {
   id: string
   text: string
   type: ButtonType
+  /**
+   * Optional https? URL. When set, the button uses Feishu `open_url`
+   * behavior (native browser open) instead of a notify callback.
+   * Pure open_url cards do not need `callback` / notify registration.
+   */
+  url?: string
 }
 
 /** Value payload baked into every notify button — routes the click back
@@ -134,7 +140,10 @@ export function buildNotifyCard(opts: {
   const emoji = opts.level === 'error' ? '❌'
     : opts.level === 'warn' ? '⚠️'
     : '🔔'
-  const interactive = !!(opts.buttons?.length && opts.notifyId)
+  const hasButtons = !!(opts.buttons?.length)
+  // Callback buttons need notifyId; pure open_url buttons do not.
+  const hasCallbackButtons = !!(opts.buttons?.some((b) => !b.url) && opts.notifyId)
+  const interactive = hasButtons
   const d = new Date()
   const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
   const elements: object[] = []
@@ -176,39 +185,59 @@ export function buildNotifyCard(opts: {
     }
   } else if (interactive) {
     // One full-width column whose elements stack vertically ⇒ each
-    // button gets its own row, however many there are. Avoids the
-    // side-by-side crush when labels are long or there are >3 options.
-    elements.push({
-      tag: 'column_set',
-      columns: [{
-        tag: 'column',
-        width: 'weighted',
-        weight: 1,
-        elements: opts.buttons!.map((btn) => ({
+    // button gets its own row. open_url buttons always render; callback
+    // buttons require notifyId (otherwise they'd ship a dead value —
+    // silently drop them, preserving pre-open_url safety).
+    const rendered = opts.buttons!.flatMap((btn) => {
+      if (btn.url) {
+        return [{
           tag: 'button',
           text: { tag: 'plain_text', content: btn.text },
           type: btn.type,
           behaviors: [{
-            type: 'callback',
-            value: {
-              kind: 'notify_callback',
-              notify_id: opts.notifyId,
-              button_id: btn.id,
-            } as NotifyActionValue,
+            type: 'open_url' as const,
+            default_url: btn.url,
+            android_url: btn.url,
+            ios_url: btn.url,
+            pc_url: btn.url,
           }],
-        })),
-      }],
+        }]
+      }
+      if (!opts.notifyId) return []
+      return [{
+        tag: 'button',
+        text: { tag: 'plain_text', content: btn.text },
+        type: btn.type,
+        behaviors: [{
+          type: 'callback' as const,
+          value: {
+            kind: 'notify_callback',
+            notify_id: opts.notifyId,
+            button_id: btn.id,
+          } as NotifyActionValue,
+        }],
+      }]
     })
+    if (rendered.length > 0) {
+      elements.push({
+        tag: 'column_set',
+        columns: [{
+          tag: 'column',
+          width: 'weighted',
+          weight: 1,
+          elements: rendered,
+        }],
+      })
+    }
   }
 
   elements.push({ tag: 'hr' })
   elements.push({ tag: 'markdown', content: `<font color='grey'>via notify · ${hhmm}</font>` })
   return {
     schema: '2.0',
-    // update_multi so the post-click resolved card propagates to every
-    // member of the group, not just the clicker. Set only when the card
-    // is actually interactive — plain one-shot cards keep the empty default.
-    config: interactive ? { update_multi: true } : {},
+    // update_multi only when callback buttons can freeze the card for the
+    // whole group. Pure open_url cards are one-shot navigation — no update.
+    config: hasCallbackButtons ? { update_multi: true } : {},
     header: {
       title: { tag: 'plain_text', content: `${emoji} ${opts.title}` },
       template,
@@ -247,7 +276,21 @@ export function parseButtons(raw: unknown): { buttons?: ParsedButton[]; error?: 
     const type: ButtonType = VALID_BUTTON_TYPES.has(typeRaw as ButtonType)
       ? (typeRaw as ButtonType)
       : 'default'
-    out.push({ id, text, type })
+    const urlRaw = (entry as any).url
+    let url: string | undefined
+    if (urlRaw !== undefined && urlRaw !== null && String(urlRaw).trim() !== '') {
+      const u = String(urlRaw).trim()
+      let parsed: URL
+      try { parsed = new URL(u) } catch {
+        return { error: `button "${id}" url is not a valid URL` }
+      }
+      if (parsed.protocol !== 'http:' && parsed.protocol !== 'https:') {
+        return { error: `button "${id}" url must be http(s), got "${parsed.protocol}"` }
+      }
+      if (u.length > 2000) return { error: `button "${id}" url too long` }
+      url = u
+    }
+    out.push(url ? { id, text, type, url } : { id, text, type })
   }
   return { buttons: out }
 }
@@ -361,8 +404,9 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
   // Buttons + callback is the push model (daemon POSTs the click).
   // Buttons without callback is the pull / display-only model: the
   // caller polls GET /notify/result/<id>, or just reads the frozen card.
-  // Either way the card must be registered so the click can freeze it.
+  // Pure open_url buttons (url set) need neither registration nor notify_id.
   const hasButtons = !!(buttons && buttons.length)
+  const hasCallbackButtons = !!(buttons && buttons.some((b) => !b.url))
   const callbackUrlOrDefault = callbackUrl ?? ''
 
   const level: Level = (VALID_LEVELS.has(levelRaw as Level) ? levelRaw : 'info') as Level
@@ -385,10 +429,8 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
     images.push({ key: key ?? '', src })
   }
 
-  // notify_id is generated up-front so it can be baked into every
-  // button's `value` payload BEFORE sendCard. The registration (which
-  // needs message_id) is filled in after the card is accepted.
-  const notifyId = hasButtons ? `nf_${randomUUID()}` : ''
+  // notify_id only when at least one callback-style button exists.
+  const notifyId = hasCallbackButtons ? `nf_${randomUUID()}` : ''
   const card = buildNotifyCard({ title, text, level, images, buttons, notifyId })
   const messageId = await feishu.sendCard(chatId, card)
   if (!messageId) {
@@ -396,7 +438,7 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
     return sendText(502, 'feishu sendCard failed (see daemon log)')
   }
 
-  if (hasButtons && notifyId) {
+  if (hasCallbackButtons && notifyId) {
     const reg: NotifyRegistration = {
       notifyId,
       callbackUrl: callbackUrlOrDefault,
@@ -407,13 +449,15 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
       text,
       level,
       imageKeys: images,
-      buttons: buttons as NotifyButton[],
+      // Persist callback buttons only (open_url need no freeze/rebuild).
+      buttons: (buttons as NotifyButton[]).filter((b) => !(b as ParsedButton).url),
       createdAt: Date.now(),
     }
     registerCallback(reg)
   }
 
-  log(`notify: → ${project} (${chatId.slice(0, 8)}…) level=${level} bytes=${text.length} images=${images.length} buttons=${buttons?.length ?? 0} push=${hasButtons && !!callbackUrlOrDefault ? 1 : 0} msg=${messageId}`)
+  const openUrlCount = buttons?.filter((b) => b.url).length ?? 0
+  log(`notify: → ${project} (${chatId.slice(0, 8)}…) level=${level} bytes=${text.length} images=${images.length} buttons=${buttons?.length ?? 0} open_url=${openUrlCount} push=${hasCallbackButtons && !!callbackUrlOrDefault ? 1 : 0} msg=${messageId}`)
   sendJson(200, {
     ok: true,
     chat_id: chatId,

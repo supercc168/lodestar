@@ -199,6 +199,55 @@ describe('parseButtons', () => {
     expect(parseButtons(Array.from({ length: 8 }, (_, i) => ({ id: `b${i}`, text: 'x' }))).error).toBeUndefined()
     expect(parseButtons([{ id: 'a', text: 'A', type: 'laser' }]).buttons?.[0].type).toBe('default')
   })
+
+  test('open_url: accepts http(s) url; rejects bad scheme / invalid URL', () => {
+    const ok = parseButtons([
+      { id: 'gmgn', text: 'GMGN', url: 'https://gmgn.ai/sol/token/x' },
+      { id: 'cb', text: 'OK' },
+    ])
+    expect(ok.error).toBeUndefined()
+    expect(ok.buttons?.[0]).toEqual({
+      id: 'gmgn', text: 'GMGN', type: 'default', url: 'https://gmgn.ai/sol/token/x',
+    })
+    expect(ok.buttons?.[1]).toEqual({ id: 'cb', text: 'OK', type: 'default' })
+    expect(parseButtons([{ id: 'a', text: 'A', url: 'ftp://x' }]).error).toMatch(/http/)
+    expect(parseButtons([{ id: 'a', text: 'A', url: 'not a url' }]).error).toMatch(/valid URL/)
+  })
+})
+
+describe('buildNotifyCard open_url', () => {
+  test('url buttons render open_url behaviors without update_multi', () => {
+    const card: any = buildNotifyCard({
+      title: 't',
+      text: 'body',
+      level: 'info',
+      buttons: [{ id: 'gmgn', text: 'GMGN', type: 'default', url: 'https://gmgn.ai/x' }],
+    })
+    expect(card.config).toEqual({})
+    const col = card.body.elements.find((e: any) => e.tag === 'column_set')
+    expect(col).toBeTruthy()
+    const btn = col.columns[0].elements[0]
+    expect(btn.behaviors[0].type).toBe('open_url')
+    expect(btn.behaviors[0].default_url).toBe('https://gmgn.ai/x')
+  })
+
+  test('mixed open_url + callback: callback uses notify_id; update_multi on', () => {
+    const card: any = buildNotifyCard({
+      title: 't',
+      text: 'body',
+      level: 'info',
+      notifyId: 'nf_test',
+      buttons: [
+        { id: 'gmgn', text: 'GMGN', type: 'default', url: 'https://gmgn.ai/x' },
+        { id: 'ack', text: 'ACK', type: 'primary' },
+      ],
+    })
+    expect(card.config).toEqual({ update_multi: true })
+    const btns = card.body.elements.find((e: any) => e.tag === 'column_set').columns[0].elements
+    expect(btns[0].behaviors[0].type).toBe('open_url')
+    expect(btns[1].behaviors[0].type).toBe('callback')
+    expect(btns[1].behaviors[0].value.notify_id).toBe('nf_test')
+  })
 })
 
 describe('parseCallbackUrl', () => {
