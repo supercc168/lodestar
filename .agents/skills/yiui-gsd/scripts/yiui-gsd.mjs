@@ -958,7 +958,9 @@ function syncCodexAgentBakeTimestamps(defaultsPath, agentFiles) {
   // oldest static Codex agent TOML. The policy helper has already verified
   // every TOML's baked model, so mark the whole verified set after defaults
   // are written. This changes metadata only; generated content stays intact.
-  const bakedAt = new Date(Math.max(Date.now(), statSync(defaultsPath).mtimeMs))
+  // Date stores integer milliseconds. Round the source mtime up so APFS
+  // sub-millisecond precision cannot make a freshly baked agent look stale.
+  const bakedAt = new Date(Math.max(Date.now(), Math.ceil(statSync(defaultsPath).mtimeMs)))
   for (const path of agentFiles) utimesSync(path, bakedAt, bakedAt)
   return agentFiles.length
 }
