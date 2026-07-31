@@ -384,8 +384,13 @@ export class Session {
    *  期间重复开卡(sendCard 未返回前 backgroundCard 仍 null,第二个事件会再开一张)。 */
   private openingBackground = false
   /** 已 addElement 到活卡的 task panel 的 task_id 集合。新任务 diff 出来才
-   *  addElement(避免重复 add);已有任务 replaceElement 整个 panel。 */
+   *  addElement(避免重复 add);已有任务 replaceElement 整个 panel。也承载 fold
+   *  汇总 panel 的固定 key(BG_ELEMENTS.fold)—— 它与 task_id(UUID)不冲突。 */
   private backgroundDetailAdded = new Set<string>()
+  /** bg_fold 汇总 panel 最近一次写入的成员签名(id 列表)。终态任务冻结,成员集
+   *  不变即内容不变;据此跳过 replaceElement,免得每个 tick / progress 风暴都
+   *  重发同一份折叠明细。开卡 / 沉降 / 迁移时与 backgroundDetailAdded 一同复位。 */
+  private backgroundFoldSig: string | null = null
   /** 最近一次主线程 Task tool_use 的 id —— SDK 若在 task_started 里没填 tool_use_id,
    *  用它兜底关联子 agent 消息的 parent_tool_use_id 到对应 task。 */
   private lastMainTaskToolUseId: string | null = null
@@ -3690,10 +3695,18 @@ export class Session {
       log(`session "${this.sessionName}": background card id_convert failed: ${e}`)
       return
     }
-    // 初始 body = 每任务一个 panel(无概要区)。
-    cardkit.recordCardCreated(cardId, this.backgroundTasks.length)
+    // 初始 body:running + 最近终态 = 独立 panel,更早终态 = 一个 fold 汇总 panel。
+    // recordCardCreated 的计数必须与 backgroundLiveCard 实际渲染的元素数一致。
+    const { recent, older } = cards.splitTerminal(this.backgroundTasks)
+    const seeded: string[] = [
+      ...this.backgroundTasks.filter(t => !cards.isBgTerminal(t)).map(t => t.id),
+      ...recent.map(t => t.id),
+    ]
+    if (older.length > 0) seeded.push(cards.BG_ELEMENTS.fold)
+    cardkit.recordCardCreated(cardId, seeded.length)
     this.backgroundCard = { messageId, cardId }
-    this.backgroundDetailAdded = new Set(this.backgroundTasks.map(t => t.id))
+    this.backgroundDetailAdded = new Set(seeded)
+    this.backgroundFoldSig = older.length > 0 ? cards.foldSignature(older) : null
     log(`session "${this.sessionName}": background card opened cardId=${cardId.slice(0, 12)} tasks=${this.backgroundTasks.length}`)
     this.startBackgroundRefreshTick()
   }
@@ -3747,21 +3760,68 @@ export class Session {
     }, 1500)
   }
 
-  /** 全量刷新:增量同步每任务的 panel。新任务 addElement panel;已有任务
-   *  replaceElement 整个 panel(header 状态/时长 + body 一起)。 */
+  /** 全量刷新:增量同步活卡 body。
+   *   ① running + 最近 BG_FOLD_KEEP 条终态 → 独立 panel(新 panel 在 fold 存在时
+   *      insert_before 它,保证折叠行恒居末位)。
+   *   ② 被挤出最近窗口 / 已离开的终态任务 → deleteElement 摘掉其独立 panel。
+   *   ③ 更早的终态任务 → 折进单个 bg_fold 汇总 panel;成员签名变才 replaceElement
+   *      (终态冻结,id 集即内容),不变则跳过。 */
   private refreshBackgroundCardFull(): void {
     const handle = this.backgroundCard
     if (!handle) return
     const now = Date.now()
     const mode = config.runtime.live_elapsed
+    const { recent, older } = cards.splitTerminal(this.backgroundTasks)
+    const recentIds = new Set(recent.map(t => t.id))
+    const foldKey = cards.BG_ELEMENTS.fold
+    const foldExists = this.backgroundDetailAdded.has(foldKey)
+
+    // 独立 panel 集合 = running + 最近终态。更早终态走 fold,不建独立 panel。
+    const individualIds = new Set<string>()
     for (const t of this.backgroundTasks) {
+      if (cards.isBgTerminal(t) && !recentIds.has(t.id)) continue
+      individualIds.add(t.id)
       if (!this.backgroundDetailAdded.has(t.id)) {
         this.backgroundDetailAdded.add(t.id)
-        void cardkit.addElement(handle.cardId, cards.backgroundTaskPanel(t, now, mode))
+        const panel = cards.backgroundTaskPanel(t, now, mode)
+        if (foldExists) {
+          void cardkit.addElement(handle.cardId, panel, { type: 'insert_before', targetElementId: foldKey })
+        } else {
+          void cardkit.addElement(handle.cardId, panel)
+        }
       } else {
         void cardkit.replaceElement(handle.cardId, cards.BG_ELEMENTS.panel(t.id), cards.backgroundTaskPanel(t, now, mode))
       }
     }
+
+    // 摘掉不再独立的旧 panel:被新完成者挤出最近窗口(进 older),或任务已离开。
+    for (const id of [...this.backgroundDetailAdded]) {
+      if (id === foldKey) continue
+      if (!individualIds.has(id)) {
+        void cardkit.deleteElement(handle.cardId, cards.BG_ELEMENTS.panel(id))
+        this.backgroundDetailAdded.delete(id)
+      }
+    }
+
+    // 折叠汇总 panel:older 非空则维护(成员变才 replace);缩到 0 则撤掉。
+    if (older.length > 0) {
+      const sig = cards.foldSignature(older)
+      if (this.backgroundDetailAdded.has(foldKey)) {
+        if (this.backgroundFoldSig !== sig) {
+          this.backgroundFoldSig = sig
+          void cardkit.replaceElement(handle.cardId, foldKey, cards.backgroundFoldPanel(older, now, mode))
+        }
+      } else {
+        this.backgroundDetailAdded.add(foldKey)
+        this.backgroundFoldSig = sig
+        void cardkit.addElement(handle.cardId, cards.backgroundFoldPanel(older, now, mode))
+      }
+    } else if (this.backgroundDetailAdded.has(foldKey)) {
+      void cardkit.deleteElement(handle.cardId, foldKey)
+      this.backgroundDetailAdded.delete(foldKey)
+      this.backgroundFoldSig = null
+    }
+
     cardkit.patchSummaryThrottled(handle.cardId, cards.backgroundLiveSummary(this.backgroundTasks))
   }
 
@@ -3805,6 +3865,7 @@ export class Session {
     }
     if (this.backgroundTasks === settledTasks) this.backgroundTasks = []
     if (this.backgroundDetailAdded === detailOwner) detailOwner.clear()
+    this.backgroundFoldSig = null
     this.openingBackground = false
   }
 
@@ -3854,6 +3915,7 @@ export class Session {
     this.bgArchive = cards.archiveTerminalAgents(archiveOwner, tasks)
     this.backgroundTasks = []
     detailOwner.clear()
+    this.backgroundFoldSig = null
     log(`session "${this.sessionName}": background card settled cardId=${handle.cardId.slice(0, 12)}`)
   }
 
@@ -3886,6 +3948,7 @@ export class Session {
     this.bgArchive = cards.archiveTerminalAgents(this.bgArchive, this.backgroundTasks)
     this.backgroundTasks = this.backgroundTasks.filter(t => !cards.isBgTerminal(t))
     this.backgroundDetailAdded.clear()
+    this.backgroundFoldSig = null
     log(`session "${this.sessionName}": background card migrated cardId=${handle.cardId.slice(0, 12)} terminal=${terminalCount} active=${this.backgroundTasks.length}`)
   }
 

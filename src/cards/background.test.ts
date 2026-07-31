@@ -13,14 +13,18 @@ import {
   resurrectSettled,
   isBgTerminal,
   hasActiveBgTask,
+  splitTerminal,
   summarizeBackground,
   backgroundLiveSummary,
   backgroundTaskPanel,
+  backgroundFoldPanel,
+  foldSignature,
   backgroundLiveCard,
   backgroundHistoryCard,
   backgroundMigratedMarker,
   emptyBgStore,
   BG_ELEMENTS,
+  BG_FOLD_KEEP,
   type BgArchiveEntry,
   type BgTaskEntry,
   type BgStore,
@@ -444,6 +448,124 @@ describe('整卡三态', () => {
   test('BG_ELEMENTS id 生成', () => {
     expect(BG_ELEMENTS.panel('t1')).toBe('bg_t1')
     expect(BG_ELEMENTS.body('t1')).toBe('bg_body_t1')
+    expect(BG_ELEMENTS.fold).toBe('bg_fold')
+    expect(BG_ELEMENTS.foldBody).toBe('bg_fold_body')
+  })
+})
+
+describe('折叠汇总 —— 更早已完成任务收进 bg_fold', () => {
+  test('splitTerminal:终态 ≤ keep 全留 recent,older 空(不建 fold)', () => {
+    const tasks = [
+      mk({ id: 'r', status: 'running' }),
+      mk({ id: 'a', status: 'completed', endTime: 1000 }),
+      mk({ id: 'b', status: 'completed', endTime: 2000 }),
+    ]
+    const { recent, older } = splitTerminal(tasks)
+    expect(older).toHaveLength(0)
+    expect(recent).toHaveLength(2)
+  })
+
+  test('splitTerminal:终态 > keep 留最近 keep 条,其余进 older', () => {
+    const tasks = [
+      mk({ id: 'a', status: 'completed', endTime: 1000 }),
+      mk({ id: 'b', status: 'completed', endTime: 2000 }),
+      mk({ id: 'c', status: 'completed', endTime: 3000 }),
+      mk({ id: 'd', status: 'completed', endTime: 4000 }),
+    ]
+    const { recent, older } = splitTerminal(tasks)
+    expect(recent.map(t => t.id)).toEqual(['d', 'c'])   // 最近两条(endTime 降序)
+    expect(older.map(t => t.id)).toEqual(['b', 'a'])
+  })
+
+  test('splitTerminal:endTime 缺失退回 startedAt', () => {
+    const tasks = [
+      mk({ id: 'a', status: 'completed', startedAt: 10, endTime: undefined }),
+      mk({ id: 'b', status: 'completed', startedAt: 50, endTime: undefined }),
+      mk({ id: 'c', status: 'completed', startedAt: 100, endTime: undefined }),
+    ]
+    const { recent } = splitTerminal(tasks)
+    expect(recent.map(t => t.id)).toEqual(['c', 'b'])
+  })
+
+  test('backgroundFoldPanel:header「另有 N 项已完成」+ 折叠 + element_id', () => {
+    const older = [
+      mk({ id: 'a', type: 'shell', description: 'build', status: 'completed', usage: { total_tokens: 1, tool_uses: 1, duration_ms: 33000 } }),
+      mk({ id: 'b', type: 'shell', description: 'test', status: 'completed', usage: { total_tokens: 1, tool_uses: 1, duration_ms: 12000 } }),
+    ]
+    const panel = backgroundFoldPanel(older, 999999) as any
+    expect(panel.tag).toBe('collapsible_panel')
+    expect(panel.expanded).toBe(false)
+    expect(panel.element_id).toBe('bg_fold')
+    expect(panel.header.title.content).toBe('📦 另有 2 项已完成')
+    const body = panel.elements[0]
+    expect(body.element_id).toBe('bg_fold_body')
+    expect(body.content).toContain('build')
+    expect(body.content).toContain('用时 33s')
+    expect(body.content).toContain('test')
+  })
+
+  test('backgroundFoldPanel:含失败 → header 追加「· ❌ M 失败」', () => {
+    const older = [
+      mk({ id: 'a', status: 'completed', usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } }),
+      mk({ id: 'b', status: 'failed', usage: { total_tokens: 1, tool_uses: 1, duration_ms: 2000 } }),
+    ]
+    const panel = backgroundFoldPanel(older, 999999) as any
+    expect(panel.header.title.content).toBe('📦 另有 2 项已完成 · ❌ 1 失败')
+    expect(panel.elements[0].content).toContain('失败')
+  })
+
+  test('backgroundLiveCard:1 running + 3 终态 → running + 最近2 独立 + fold 末位', () => {
+    const tasks = [
+      mk({ id: 'r', type: 'subagent', description: '跑着', status: 'running', subagentType: 'Explore' }),
+      mk({ id: 'a', type: 'shell', description: 'A', status: 'completed', endTime: 1000, usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } }),
+      mk({ id: 'b', type: 'shell', description: 'B', status: 'completed', endTime: 2000, usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } }),
+      mk({ id: 'c', type: 'shell', description: 'C', status: 'completed', endTime: 3000, usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } }),
+    ]
+    const card = backgroundLiveCard(tasks, 999999) as any
+    const els = card.body.elements
+    expect(els).toHaveLength(4)
+    expect(els[0].element_id).toBe('bg_r')          // running 在前
+    expect(els[1].element_id).toBe('bg_c')          // 最近终态 c
+    expect(els[2].element_id).toBe('bg_b')          // 次近 b
+    expect(els[3].element_id).toBe('bg_fold')       // fold 恒末位
+    expect(els[3].header.title.content).toBe('📦 另有 1 项已完成')   // 只剩 a 被折
+  })
+
+  test('backgroundHistoryCard:4 终态 → 最近2 独立 + fold,沉降不再铺开墓碑', () => {
+    const tasks = [
+      mk({ id: 'a', description: 'A', status: 'completed', endTime: 1000, usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } }),
+      mk({ id: 'b', description: 'B', status: 'completed', endTime: 2000, usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } }),
+      mk({ id: 'c', description: 'C', status: 'completed', endTime: 3000, usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } }),
+      mk({ id: 'd', description: 'D', status: 'completed', endTime: 4000, usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } }),
+    ]
+    const card = backgroundHistoryCard(tasks, 999999) as any
+    expect(card.config.streaming_mode).toBe(false)
+    expect(card.config.summary.content).toBe('🧭 子agent(历史) · 4 已结束')
+    const els = card.body.elements
+    expect(els).toHaveLength(3)
+    expect(els[0].element_id).toBe('bg_d')
+    expect(els[1].element_id).toBe('bg_c')
+    expect(els[2].element_id).toBe('bg_fold')
+    expect(els[2].header.title.content).toBe('📦 另有 2 项已完成')
+  })
+
+  test('backgroundHistoryCard:单条终态(续跑墓碑)不建 fold', () => {
+    const card = backgroundHistoryCard([mk({ id: 'a', status: 'completed', endTime: 1000 })], 999999) as any
+    const els = card.body.elements
+    expect(els).toHaveLength(1)
+    expect(els[0].element_id).toBe('bg_a')
+  })
+
+  test('foldSignature:id 列表;成员变才变', () => {
+    const a = mk({ id: 'a', status: 'completed' })
+    const b = mk({ id: 'b', status: 'completed' })
+    expect(foldSignature([a])).toBe('a')
+    expect(foldSignature([a, b])).toBe('a,b')
+    expect(foldSignature([a, b])).not.toBe(foldSignature([a]))
+  })
+
+  test('BG_FOLD_KEEP 默认 = 2', () => {
+    expect(BG_FOLD_KEEP).toBe(2)
   })
 })
 

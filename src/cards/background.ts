@@ -104,11 +104,20 @@ export function emptyBgStore(): BgStore {
 }
 
 /** 后台卡内部 element_id:每任务一个 panel(bg_<id>),其 body 是 bg_body_<id>。
- * 刷新任务时 replaceElement 整个 panel(header 状态/时长 + body 一起)。 */
+ * 刷新任务时 replaceElement 整个 panel(header 状态/时长 + body 一起)。
+ * fold / foldBody 是「更早已完成任务」的折叠汇总 panel —— 固定 id,活卡里恒为
+ * 最后一个元素(新独立 panel insert_before 它),避免 N 条墓碑把卡撑满。 */
 export const BG_ELEMENTS = {
   panel: (id: string) => `bg_${id}`,
   body: (id: string) => `bg_body_${id}`,
+  fold: 'bg_fold',
+  foldBody: 'bg_fold_body',
 } as const
+
+/** 活卡里保留为独立 panel 的最近终态任务条数(能看到命令名+状态);更早的终态
+ *  任务折进 bg_fold 汇总 panel。取 2:常见「跑完 A→跑 B→跑 C」串行后台命令时,
+ *  能瞥见刚跑完的两条,再老的收起来。 */
+export const BG_FOLD_KEEP = 2
 
 // ── 归一化 / 判定 ────────────────────────────────────────────────────
 
@@ -139,6 +148,24 @@ export function isBgTerminal(t: BgTaskEntry): boolean {
 /** 是否还有活跃任务(决定游标卡要不要继续跟随 / 重建)。 */
 export function hasActiveBgTask(tasks: BgTaskEntry[]): boolean {
   return tasks.some(t => !isBgTerminal(t))
+}
+
+/** 终态任务拆分:最近 keep 条留作独立 panel(命令名+状态常驻可见),更早的折进
+ *  bg_fold 汇总 panel。按 endTime 降序取最近 keep 条(endTime 缺失退回 startedAt,
+ *  再退回原顺序;sort 稳定)。终态任务已冻结,成员集合即决定一切,无竞态。
+ *  ≤ keep 条时 older 为空(不建 fold panel,行为同改动前)。 */
+export function splitTerminal(
+  tasks: BgTaskEntry[],
+  keep: number = BG_FOLD_KEEP,
+): { recent: BgTaskEntry[]; older: BgTaskEntry[] } {
+  const terminal = tasks.filter(isBgTerminal)
+  if (terminal.length <= keep) return { recent: terminal, older: [] }
+  const order = [...terminal].sort((a, b) => {
+    const ea = a.endTime ?? a.startedAt
+    const eb = b.endTime ?? b.startedAt
+    return eb - ea
+  })
+  return { recent: order.slice(0, keep), older: order.slice(keep) }
 }
 
 // ── 累积器(纯函数,不可变更新;now 默认 Date.now()) ────────────────────
@@ -547,42 +574,84 @@ export function backgroundTaskPanel(
   }
 }
 
+/** 折叠汇总 panel —— 更早的已完成任务收进这里。header 写「📦 另有 N 项已完成
+ *  [· ❌ M 失败]」,body 逐条列出(与 backgroundTaskPanel 的 header 同格式:图标
+ *  责任人·描述 — 状态耗时),默认折叠。点开才看明细,平时只占一行,治「N 条墓碑
+ *  撑满卡」。 */
+export function backgroundFoldPanel(
+  older: BgTaskEntry[],
+  now: number = Date.now(),
+  liveElapsedMode: LiveElapsedMode = 'bucket',
+): object {
+  const fail = older.filter(t => t.status !== 'completed').length
+  const header = fail > 0
+    ? `📦 另有 ${older.length} 项已完成 · ❌ ${fail} 失败`
+    : `📦 另有 ${older.length} 项已完成`
+  const lines = older.map((t, i) =>
+    `${i + 1}. ${TYPE_ICON[t.type]} ${ownerOf(t)}${t.resumed ? '(续跑)' : ''} · ${t.description || '(无描述)'} — ${statusLabel(t, now, liveElapsedMode)}`,
+  )
+  return {
+    tag: 'collapsible_panel',
+    element_id: BG_ELEMENTS.fold,
+    header: { title: { tag: 'plain_text', content: header } },
+    expanded: false,
+    elements: [{ tag: 'markdown', element_id: BG_ELEMENTS.foldBody, content: sanitizeMarkdownForCardKit(lines.length > 0 ? lines.join('\n') : '_(无)_') }],
+  }
+}
+
+/** 折叠汇总 panel 的变更签名:成员 id 列表。终态任务已冻结(状态/耗时不再变),
+ *  成员集合不变即整 panel 内容不变 —— session 据此跳过 replaceElement,避免每个
+ *  tick / 每次 progress 风暴都重发同一份折叠明细。 */
+export function foldSignature(older: BgTaskEntry[]): string {
+  return older.map(t => t.id).join(',')
+}
+
 /** 活卡整张 JSON —— 首个后台任务到来时 sendCard 用。streaming 开。
- *  初始 body = 每任务一个 panel。 */
+ *  body 顺序:running 独立 panel → 最近终态独立 panel → (更早终态)折叠汇总 panel。
+ *  fold 恒为末元素;增量刷新时新独立 panel insert_before 它。 */
 export function backgroundLiveCard(
   tasks: BgTaskEntry[],
   now: number = Date.now(),
   liveElapsedMode: LiveElapsedMode = 'bucket',
 ): object {
+  const { recent, older } = splitTerminal(tasks)
+  const elements: object[] = []
+  for (const t of tasks) {
+    if (isBgTerminal(t)) continue
+    elements.push(backgroundTaskPanel(t, now, liveElapsedMode))
+  }
+  for (const t of recent) elements.push(backgroundTaskPanel(t, now, liveElapsedMode))
+  if (older.length > 0) elements.push(backgroundFoldPanel(older, now, liveElapsedMode))
   return {
     schema: '2.0',
     config: {
       streaming_mode: true,
       summary: { content: backgroundLiveSummary(tasks) },
     },
-    body: {
-      elements: tasks.map(t => backgroundTaskPanel(t, now, liveElapsedMode)),
-    },
+    body: { elements },
   }
 }
 
 /** 历史沉降卡 —— 用户发新消息且仍有活跃任务时,把旧卡 updateCard 成这个。
- *  只渲染终态任务,streaming 关。留在原地不再跟随。 */
+ *  只渲染终态任务,streaming 关。留在原地不再跟随。终态同样保留最近 keep 条作
+ *  独立 panel、更早的折进 fold —— 沉降时不把已收起的墓碑再铺开。 */
 export function backgroundHistoryCard(
   tasks: BgTaskEntry[],
   now: number = Date.now(),
   liveElapsedMode: LiveElapsedMode = 'bucket',
 ): object {
-  const terminal = tasks.filter(isBgTerminal)
+  const { recent, older } = splitTerminal(tasks)
+  const terminalCount = recent.length + older.length
+  const elements: object[] = []
+  for (const t of recent) elements.push(backgroundTaskPanel(t, now, liveElapsedMode))
+  if (older.length > 0) elements.push(backgroundFoldPanel(older, now, liveElapsedMode))
   return {
     schema: '2.0',
     config: {
       streaming_mode: false,
-      summary: { content: `🧭 子agent(历史) · ${terminal.length} 已结束` },
+      summary: { content: `🧭 子agent(历史) · ${terminalCount} 已结束` },
     },
-    body: {
-      elements: terminal.map(t => backgroundTaskPanel(t, now, liveElapsedMode)),
-    },
+    body: { elements },
   }
 }
 
