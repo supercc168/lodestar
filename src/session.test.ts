@@ -11,7 +11,14 @@ import {
   sentCards, sentRawTexts, sentTexts, updatedCards, urgentPushes,
 } from './feishu-test-mock'
 
-const { Session, WATCHDOG_RECOVERY_PROMPT } = await import('./session')
+const {
+  Session,
+  WATCHDOG_RECOVERY_PROMPT,
+  CAPACITY_RETRY_PROMPT,
+  CAPACITY_RETRY_DELAY_MS,
+  CAPACITY_RETRY_MAX_ATTEMPTS,
+  isCodexCapacityError,
+} = await import('./session')
 const cardkit = await import('./cardkit')
 const sessionHostAsk = await import('./session-host-ask')
 const {
@@ -8742,5 +8749,173 @@ describe('Session warm-resume 工程师续跑感知(已结算 agent 档案复活
     expect(sentCards.length).toBe(cardsBefore + 1)
     // 再次清池后名片仍在档案里,支持同一工程师第二次续跑
     expect(session.bgArchive.some((a: any) => a.id === 'ag1')).toBe(true)
+  })
+})
+
+describe('isCodexCapacityError', () => {
+  test('matches serverOverloaded capacity messages', () => {
+    expect(isCodexCapacityError('Selected model is at capacity. Please try a different model.')).toBe(true)
+    expect(isCodexCapacityError('serverOverloaded')).toBe(true)
+    expect(isCodexCapacityError('model is at capacity')).toBe(true)
+  })
+
+  test('rejects unrelated errors', () => {
+    expect(isCodexCapacityError('success')).toBe(false)
+    expect(isCodexCapacityError('unexpected status 503')).toBe(false)
+    expect(isCodexCapacityError('')).toBe(false)
+    expect(isCodexCapacityError(null)).toBe(false)
+  })
+})
+
+describe('Session Codex capacity auto-retry', () => {
+  test('capacity error result schedules continue retry after delay', async () => {
+    const session = new Session('capacity-retry-continue', 'chat_capacity') as any
+    const proc = new FakeAgentProc('codex', 'thread-capacity')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.initCount = 1
+    session.status = 'working'
+    session.lastUserOpenId = 'ou_user'
+    useDeterministicFooterStatus(session)
+    session.wireProc(proc)
+
+    const turn = turnState('card_capacity_retry')
+    session.currentTurn = turn
+    session.turnCounter = 1
+
+    const scheduled: Array<{ delay: number; fn: () => void }> = []
+    const originalSetTimeout = globalThis.setTimeout
+    const originalClearTimeout = globalThis.clearTimeout
+    // Capture only our capacity timer (large delay); keep real timers for cardkit etc.
+    // @ts-expect-error test override
+    globalThis.setTimeout = ((fn: any, delay?: number, ...args: any[]) => {
+      if (delay === CAPACITY_RETRY_DELAY_MS) {
+        scheduled.push({ delay: delay ?? 0, fn: () => fn(...args) })
+        return 9991 as any
+      }
+      return originalSetTimeout(fn, delay as any, ...args)
+    }) as typeof setTimeout
+    globalThis.clearTimeout = ((handle: any) => {
+      if (handle === 9991) {
+        // drop captured timer
+        const idx = scheduled.findIndex(s => s.delay === CAPACITY_RETRY_DELAY_MS)
+        if (idx >= 0) scheduled.splice(idx, 1)
+        return
+      }
+      return originalClearTimeout(handle)
+    }) as typeof clearTimeout
+
+    try {
+      proc.lastResult = {
+        ...proc.lastResult,
+        subtype: 'Selected model is at capacity. Please try a different model.',
+        is_error: true,
+      }
+      proc.emit('result', {
+        subtype: 'Selected model is at capacity. Please try a different model.',
+        is_error: true,
+      })
+
+      expect(session.currentTurn).toBeNull()
+      expect(session.status).toBe('idle')
+      expect(scheduled).toHaveLength(1)
+      expect(scheduled[0]!.delay).toBe(CAPACITY_RETRY_DELAY_MS)
+
+      // Fire the delayed retry: should open a continue turn and send CAPACITY_RETRY_PROMPT.
+      scheduled[0]!.fn()
+      await waitFor(() => proc.sentTexts.includes(CAPACITY_RETRY_PROMPT))
+      expect(session.capacityRetryAttempts).toBe(1)
+      expect(session.currentTurn).not.toBeNull()
+      expect(session.status).toBe('working')
+    } finally {
+      globalThis.setTimeout = originalSetTimeout
+      globalThis.clearTimeout = originalClearTimeout
+      session.clearCapacityRetryState('test cleanup')
+    }
+  })
+
+  test('user message cancels a pending capacity retry', async () => {
+    const session = new Session('capacity-retry-cancel', 'chat_capacity2') as any
+    const proc = new FakeAgentProc('codex', 'thread-capacity-2')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.initCount = 1
+    session.status = 'working'
+    useDeterministicFooterStatus(session)
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_capacity_cancel')
+
+    let capacityTimerFn: (() => void) | null = null
+    const originalSetTimeout = globalThis.setTimeout
+    const originalClearTimeout = globalThis.clearTimeout
+    // @ts-expect-error test override
+    globalThis.setTimeout = ((fn: any, delay?: number, ...args: any[]) => {
+      if (delay === CAPACITY_RETRY_DELAY_MS) {
+        capacityTimerFn = () => fn(...args)
+        return 9992 as any
+      }
+      return originalSetTimeout(fn, delay as any, ...args)
+    }) as typeof setTimeout
+    let cleared = false
+    globalThis.clearTimeout = ((handle: any) => {
+      if (handle === 9992) {
+        cleared = true
+        capacityTimerFn = null
+        return
+      }
+      return originalClearTimeout(handle)
+    }) as typeof clearTimeout
+
+    try {
+      proc.lastResult = {
+        ...proc.lastResult,
+        subtype: 'Selected model is at capacity. Please try a different model.',
+        is_error: true,
+      }
+      proc.emit('result', {
+        subtype: 'Selected model is at capacity. Please try a different model.',
+        is_error: true,
+      })
+      expect(capacityTimerFn).not.toBeNull()
+
+      // Idle after capacity close; a fresh user message must cancel the timer.
+      await session.onUserMessage('人工重试', [], 'ou_user', 'om_manual')
+      expect(cleared).toBe(true)
+      expect(session.capacityRetryTimer).toBeNull()
+    } finally {
+      globalThis.setTimeout = originalSetTimeout
+      globalThis.clearTimeout = originalClearTimeout
+      session.clearCapacityRetryState('test cleanup')
+    }
+  })
+
+  test('success result clears capacity retry attempts', async () => {
+    const session = new Session('capacity-retry-clear', 'chat_capacity3') as any
+    const proc = new FakeAgentProc('codex', 'thread-capacity-3')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.initCount = 1
+    session.status = 'working'
+    session.capacityRetryAttempts = 2
+    useDeterministicFooterStatus(session)
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_capacity_clear')
+
+    proc.lastResult = {
+      ...proc.lastResult,
+      subtype: 'success',
+      is_error: false,
+    }
+    proc.emit('result', { subtype: 'success', is_error: false })
+    expect(session.capacityRetryAttempts).toBe(0)
+    expect(session.status).toBe('idle')
+  })
+
+  test('capacity retry respects max attempts', () => {
+    const session = new Session('capacity-retry-max', 'chat_capacity4') as any
+    session.capacityRetryAttempts = CAPACITY_RETRY_MAX_ATTEMPTS
+    session.scheduleCapacityRetry('test_max')
+    expect(session.capacityRetryTimer).toBeNull()
+    expect(session.capacityRetryAttempts).toBe(CAPACITY_RETRY_MAX_ATTEMPTS)
   })
 })

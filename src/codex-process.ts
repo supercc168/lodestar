@@ -601,7 +601,18 @@ export class CodexProcess extends EventEmitter {
       }
       case 'error': {
         log(`codex-process: server error: ${JSON.stringify(params).slice(0, 500)}`)
-        this.emit('error', new Error(params.message ?? params.summary ?? 'codex app-server error'))
+        // App-server may nest the human message under params.error.message
+        // (serverOverloaded / capacity). Prefer the nested string so session
+        // can classify capacity retries; fall back to top-level / summary.
+        const nested = params?.error
+        const nestedMessage = nested && typeof nested === 'object' && typeof nested.message === 'string'
+          ? nested.message
+          : null
+        const message = nestedMessage
+          ?? (typeof params?.message === 'string' ? params.message : null)
+          ?? (typeof params?.summary === 'string' ? params.summary : null)
+          ?? 'codex app-server error'
+        this.emit('error', new Error(message))
         return
       }
     }

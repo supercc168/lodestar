@@ -118,7 +118,31 @@ export const WATCHDOG_RECOVERY_PROMPT = `[Lodestar 自动恢复 1/1]
 不要用空的 text(...) 调用代替实际派发、等待或结果汇报。
 完成任务或遇到真实阻塞时直接给出明确结果。`
 
+/** Codex serverOverloaded / model capacity 时自动重试的 continue 文案。
+ *  不重放用户原输入(原 turn 可能已半途失败),只请模型从当前 thread 续跑。 */
+export const CAPACITY_RETRY_PROMPT = `[Lodestar 容量重试]
+上一轮因模型容量不足(Selected model is at capacity / serverOverloaded)中断。
+请基于当前 thread 和工作区继续未完成任务。先核对现状和上次有效动作,
+然后从中断处接着做;不要从头重做已完成部分。
+完成任务或遇到真实阻塞时直接给出明确结果。`
+
+/** Codex capacity / serverOverloaded 自动重试等待间隔(约一分钟)。 */
+export const CAPACITY_RETRY_DELAY_MS = 60_000
+
+/** 同一 session 连续 capacity 自动重试上限,防止无限排队。 */
+export const CAPACITY_RETRY_MAX_ATTEMPTS = 2
+
 export const WATCHDOG_TICK_MS = 15_000
+
+/** Classify Codex overload / model-capacity failures for automatic retry. */
+export function isCodexCapacityError(text: unknown): boolean {
+  if (typeof text !== 'string' || !text) return false
+  const lower = text.toLowerCase()
+  return lower.includes('selected model is at capacity')
+    || lower.includes('serveroverloaded')
+    || (lower.includes('at capacity') && lower.includes('model'))
+    || lower.includes('please try a different model')
+}
 
 export interface WatchdogTurnContext {
   proc: AgentProcess
@@ -518,6 +542,10 @@ export class Session {
    * one turn, and "the most recent sender" is a defensible default for
    * the single-user private-bot scenario this product targets. */
   lastUserOpenId = ''
+  /** Codex capacity / serverOverloaded 自动重试:延时 handle。null = 无待重试。 */
+  private capacityRetryTimer: ReturnType<typeof setTimeout> | null = null
+  /** 当前连续 capacity 自动重试次数(成功 result 后清零)。 */
+  private capacityRetryAttempts = 0
   /** Feishu message_ids of user messages that arrived while the daemon
    * was busy (turn in flight or mid-open), mapped to the `reaction_id`
    * of the `OneSecond` reaction placed at arrival. The reaction_id is
@@ -1966,6 +1994,7 @@ export class Session {
 
   discardQueuedHumanWork(reason: string): void {
     this.clearMultiMsgBuffer(reason)
+    this.cancelCapacityRetry(`discardQueuedHumanWork:${reason}`)
     const pendingDelivery = this.pendingHumanDelivery
     if (pendingDelivery) {
       pendingDelivery.state = 'restored'
@@ -1981,6 +2010,132 @@ export class Session {
     this.pendingTurnInputs = []
     this.lastUserOpenId = ''
     this.releaseAllReactions()
+  }
+
+  private cancelCapacityRetry(reason: string): void {
+    if (!this.capacityRetryTimer) return
+    clearTimeout(this.capacityRetryTimer)
+    this.capacityRetryTimer = null
+    log(`session "${this.sessionName}": cancel capacity retry (${reason})`)
+  }
+
+  private clearCapacityRetryState(reason: string): void {
+    this.cancelCapacityRetry(reason)
+    if (this.capacityRetryAttempts !== 0) {
+      log(`session "${this.sessionName}": clear capacity retry attempts=${this.capacityRetryAttempts} (${reason})`)
+    }
+    this.capacityRetryAttempts = 0
+  }
+
+  /** Schedule one delayed auto-retry after Codex capacity / serverOverloaded.
+   *  Prefers draining a preserved human batch; otherwise opens a continue turn. */
+  private scheduleCapacityRetry(reason: string): void {
+    if (this.capacityRetryTimer) {
+      log(`session "${this.sessionName}": capacity retry already scheduled — keep existing timer (${reason})`)
+      return
+    }
+    if (this.capacityRetryAttempts >= CAPACITY_RETRY_MAX_ATTEMPTS) {
+      log(`session "${this.sessionName}": capacity retry exhausted attempts=${this.capacityRetryAttempts} (${reason})`)
+      void feishu.sendTextRaw(
+        this.chatId,
+        `⚠️ Codex 模型容量不足,已自动重试 ${this.capacityRetryAttempts} 次仍失败。请稍后再发一条消息,或切换其他模型。`,
+      ).catch(() => {})
+      return
+    }
+    const attempt = this.capacityRetryAttempts + 1
+    const delayMs = CAPACITY_RETRY_DELAY_MS
+    log(`session "${this.sessionName}": schedule capacity retry #${attempt}/${CAPACITY_RETRY_MAX_ATTEMPTS} in ${delayMs}ms (${reason})`)
+    this.capacityRetryTimer = setTimeout(() => {
+      this.capacityRetryTimer = null
+      void this.runCapacityRetry(attempt, reason)
+    }, delayMs)
+  }
+
+  private async runCapacityRetry(attempt: number, reason: string): Promise<void> {
+    if (this.status === 'stopped') {
+      log(`session "${this.sessionName}": capacity retry aborted — session stopped`)
+      return
+    }
+    if (this.currentTurn || this.openingTurn || this.status === 'working' || this.status === 'starting') {
+      log(`session "${this.sessionName}": capacity retry deferred — session busy status=${this.status}`)
+      // 用户已介入或另有 turn:不再自动重试,留给真人消息路径。
+      this.capacityRetryAttempts = 0
+      return
+    }
+    const proc = this.proc
+    if (!proc?.isAlive() || proc.provider !== 'codex') {
+      log(`session "${this.sessionName}": capacity retry aborted — no live codex proc`)
+      this.capacityRetryAttempts = 0
+      return
+    }
+    this.capacityRetryAttempts = attempt
+    // 优先 drain 被 restore 保留的真人 batch(turn/start 被拒路径)。
+    if (this.pendingMidTurnMsgs.length > 0) {
+      log(`session "${this.sessionName}": capacity retry #${attempt} drain preserved human batch (${reason})`)
+      try {
+        const outcome = await this.drainMidTurnAndOpen()
+        if (outcome === 'committed') return
+        log(`session "${this.sessionName}": capacity retry drain outcome=${outcome}`)
+      } catch (e) {
+        log(`session "${this.sessionName}": capacity retry drain failed: ${messageOf(e)}`)
+      }
+      // drain 失败再走 continue 提示,避免消息静默丢失后再无动作。
+    }
+    log(`session "${this.sessionName}": capacity retry #${attempt} continue prompt (${reason})`)
+    try {
+      const started = await this.startCapacityContinueTurn(proc)
+      if (started === 'started') return
+      log(`session "${this.sessionName}": capacity retry continue result=${started}`)
+    } catch (e) {
+      log(`session "${this.sessionName}": capacity retry continue failed: ${messageOf(e)}`)
+    }
+  }
+
+  private async startCapacityContinueTurn(
+    expectedProc: AgentProcess,
+  ): Promise<'started' | 'stale' | 'failed'> {
+    if (this.proc !== expectedProc || !expectedProc.isAlive()) return 'stale'
+    if (expectedProc.provider !== 'codex') return 'failed'
+    if (this.currentTurn || this.openingTurn) return 'stale'
+    const openingToken = this.beginTurnOpening()
+    try {
+      const openResult = await this.openTurnCard(
+        this.lastUserOpenId,
+        'user_message',
+        { expectedProc },
+      )
+      if (openResult.kind === 'failed') return 'failed'
+      if (
+        openResult.kind !== 'opened' ||
+        this.currentTurn !== openResult.turn ||
+        this.proc !== expectedProc ||
+        !expectedProc.isAlive()
+      ) return 'stale'
+      const dispatch = await this.dispatchSystemUserText(
+        expectedProc,
+        CAPACITY_RETRY_PROMPT,
+        openResult.turn,
+        openingToken,
+      )
+      if (dispatch !== 'accepted') {
+        if (dispatch === 'rejected') {
+          await this.closeRejectedSystemTurn(
+            openResult.turn,
+            expectedProc,
+            '⚠️ Codex 未接受容量重试请求',
+          )
+          return 'failed'
+        }
+        return 'stale'
+      }
+      if (this.proc === expectedProc && this.currentTurn === openResult.turn) {
+        this.pendingUserMessageCount++
+        this.status = 'working'
+      }
+      return 'started'
+    } finally {
+      this.finishTurnOpening(openingToken)
+    }
   }
 
   clearStaleIdleQueueState(reason: string): void {
@@ -3256,6 +3411,8 @@ export class Session {
     // misclassified as queued and its card closes with `📨 转交新卡`
     // instead of `✅`.
     this.clearStaleIdleQueueState('user_message')
+    // 真人新消息优先:取消排队中的 capacity 自动重试,避免与用户输入抢 turn。
+    this.cancelCapacityRetry('user_message')
     // GSD “new task” name capture must run before agent forward when armed.
     // Only pure text (no files) is treated as a candidate name.
     if (!files.length && this.gsdAwaitingNameUntil > Date.now()) {
@@ -4306,13 +4463,25 @@ export class Session {
       if (rejectedHumanStart) {
         this.persistResumableSessionId(p)
         if (this.openingTurn) this.sawResultWhileOpening = true
-        log(`session "${this.sessionName}": Codex human turn/start rejected; preserve batch without automatic drain`)
-        void this.closeTurnCard('⚠️ Codex 未接受消息，已保留待重试', {
-          forcePush: true,
-          hasFreshResult: true,
-          preservePendingReactions: true,
-        })
+        const rejectDetail = [
+          event?.error,
+          event?.subtype,
+          p.lastResult?.subtype,
+        ].map(v => (typeof v === 'string' ? v : '')).join(' ')
+        const capacityReject = isCodexCapacityError(rejectDetail)
+        log(`session "${this.sessionName}": Codex human turn/start rejected; preserve batch without automatic drain capacity=${capacityReject}`)
+        void this.closeTurnCard(
+          capacityReject
+            ? `⚠️ Codex 模型容量不足，${Math.round(CAPACITY_RETRY_DELAY_MS / 1000)}s 后自动重试`
+            : '⚠️ Codex 未接受消息，已保留待重试',
+          {
+            forcePush: true,
+            hasFreshResult: true,
+            preservePendingReactions: true,
+          },
+        )
         this.status = 'idle'
+        if (capacityReject) this.scheduleCapacityRetry('turn_start_rejected')
         return
       }
       const pendingInterrupt = this.activeTurnInterrupt
@@ -4351,19 +4520,30 @@ export class Session {
       const isError = this.proc?.lastResult.is_error === true
       const subtype = this.proc?.lastResult.subtype ?? 'success'
       const hostAskFlowActive = this.pendingHostAsks.size > 0
+      const capacityError = isError && (
+        isCodexCapacityError(subtype)
+        || isCodexCapacityError(event?.error)
+        || isCodexCapacityError(event?.subtype)
+      )
 
       let suffix: string | undefined
       let forcePush = false
 
       const backend = this.proc ? this.backendLabel(this.proc.provider) : this.backendLabel()
       if (hasMidTurn && !hostAskFlowActive) {
-        suffix = isError ? `⚠️ ${backend} ${subtype},用户已介入` : '📨 转交新卡'
+        suffix = isError
+          ? (capacityError
+            ? `⚠️ ${backend} 模型容量不足,用户已介入`
+            : `⚠️ ${backend} ${subtype},用户已介入`)
+          : '📨 转交新卡'
       } else if (isError) {
-        suffix = `⚠️ ${backend} ${subtype}`
+        suffix = capacityError
+          ? `⚠️ ${backend} 模型容量不足，${Math.round(CAPACITY_RETRY_DELAY_MS / 1000)}s 后自动重试`
+          : `⚠️ ${backend} ${subtype}`
         forcePush = true
       }
 
-      log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} midBuffer=${this.pendingMidTurnMsgs.length} forcePush=${forcePush}`)
+      log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} capacity=${capacityError} midBuffer=${this.pendingMidTurnMsgs.length} forcePush=${forcePush}`)
       // 仅干净的、已完成的 result 记 turn 锚点(被用户打断的轮不记 ——
       // 它的 lastAssistantUuid 指向被取消/截断的 assistant,resumeSessionAt 到它可能异常)。
       this.recordTurnAnchor()
@@ -4371,8 +4551,17 @@ export class Session {
       this.status = 'idle'
       sessionHostAsk.resumeAnsweredHostAsks(this)
 
+      if (!isError) {
+        // 干净成功 result:清掉 capacity 连续重试计数。
+        this.clearCapacityRetryState('success_result')
+      }
+
       if (hasMidTurn && !hostAskFlowActive) {
+        // 用户已介入:取消 capacity 自动重试,真人消息优先。
+        if (capacityError) this.cancelCapacityRetry('user_midturn_priority')
         void this.drainMidTurnAndOpen()
+      } else if (capacityError) {
+        this.scheduleCapacityRetry('result_capacity')
       }
     })
     p.on('bg_task_started', (e: BgTaskStartedEvent) => {

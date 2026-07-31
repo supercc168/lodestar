@@ -1024,3 +1024,36 @@ describe('codexLoginStatusAuthenticated', () => {
     expect(codexLoginStatusAuthenticated('')).toBe(false)
   })
 })
+
+describe('codex app-server error notifications', () => {
+  test('nested error.message is surfaced on the Error (capacity / serverOverloaded)', () => {
+    const { proc, events } = notificationHarness()
+    // Match primary thread so isForeignThread does not drop the notification.
+    proc.sessionId = 'thread-capacity'
+    proc.handleNotification('error', {
+      error: {
+        message: 'Selected model is at capacity. Please try a different model.',
+        codexErrorInfo: 'serverOverloaded',
+        additionalDetails: null,
+      },
+      willRetry: false,
+      threadId: 'thread-capacity',
+      turnId: 'turn-capacity',
+    })
+    const errorEvents = events.filter(([name]) => name === 'error')
+    expect(errorEvents).toHaveLength(1)
+    const err = errorEvents[0]?.[1]
+    expect(err).toBeInstanceOf(Error)
+    expect(String((err as Error).message)).toContain('Selected model is at capacity')
+  })
+
+  test('top-level message still works when nested error is absent', () => {
+    const { proc, events } = notificationHarness()
+    proc.handleNotification('error', {
+      message: 'plain top-level failure',
+    })
+    const errorEvents = events.filter(([name]) => name === 'error')
+    expect(errorEvents).toHaveLength(1)
+    expect(String((errorEvents[0]?.[1] as Error).message)).toBe('plain top-level failure')
+  })
+})
