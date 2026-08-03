@@ -47,6 +47,7 @@ import type {
 } from '../claude-agent-process'
 import { fmtElapsed, liveElapsed, type LiveElapsedMode } from './format'
 import { sanitizeMarkdownForCardKit } from './elements'
+import { summarizeToolInput } from './tool'
 
 export type { BgTaskStatus }
 
@@ -501,6 +502,16 @@ function ownerOf(t: BgTaskEntry): string {
   return t.subagentType ?? t.workflowName ?? TYPE_LABEL[t.type]
 }
 
+function displayDescription(t: BgTaskEntry): string {
+  // SDK local_bash descriptions contain the full command. Reuse the regular
+  // Bash card parser so `# desc:` becomes the one-line title and the command
+  // itself never leaks into a plain_text header.
+  if (t.type === 'shell') {
+    return summarizeToolInput('Bash', { command: t.description }) || '(无描述)'
+  }
+  return t.description || '(无描述)'
+}
+
 function terminalElapsed(t: BgTaskEntry): number {
   if (t.usage?.duration_ms) return t.usage.duration_ms
   if (t.endTime && t.endTime > t.startedAt) return t.endTime - t.startedAt
@@ -566,7 +577,7 @@ export function backgroundTaskPanel(
     header: {
       title: {
         tag: 'plain_text',
-        content: `${TYPE_ICON[t.type]} ${ownerOf(t)}${t.resumed ? '(续跑)' : ''} · ${t.description || '(无描述)'} — ${statusLabel(t, now, liveElapsedMode)}`,
+        content: `${TYPE_ICON[t.type]} ${ownerOf(t)}${t.resumed ? '(续跑)' : ''} · ${displayDescription(t)} — ${statusLabel(t, now, liveElapsedMode)}`,
       },
     },
     expanded: false,
@@ -588,7 +599,7 @@ export function backgroundFoldPanel(
     ? `📦 另有 ${older.length} 项已完成 · ❌ ${fail} 失败`
     : `📦 另有 ${older.length} 项已完成`
   const lines = older.map((t, i) =>
-    `${i + 1}. ${TYPE_ICON[t.type]} ${ownerOf(t)}${t.resumed ? '(续跑)' : ''} · ${t.description || '(无描述)'} — ${statusLabel(t, now, liveElapsedMode)}`,
+    `${i + 1}. ${TYPE_ICON[t.type]} ${ownerOf(t)}${t.resumed ? '(续跑)' : ''} · ${displayDescription(t)} — ${statusLabel(t, now, liveElapsedMode)}`,
   )
   return {
     tag: 'collapsible_panel',

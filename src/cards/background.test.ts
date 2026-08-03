@@ -373,6 +373,40 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     expect(panel.header.title.content).not.toContain('<1m')
   })
 
+  test('shell:header 只显示 # desc 标题,不回显多行命令', () => {
+    const command = [
+      '# desc: 后台轮询READY后立即serialize Track C',
+      'cd /Users/doge/svn/etmmo/Client',
+      'for i in $(seq 1 28); do',
+      '  sleep 15',
+      'done',
+    ].join('\n')
+    const t = mk({ id: 't1', type: 'shell', description: command, status: 'running', startedAt: 0 })
+    const panel = backgroundTaskPanel(t, 53000) as any
+    const title = panel.header.title.content
+
+    expect(title).toBe('⚙️ shell · 后台轮询READY后立即serialize Track C — 🟡 运行中 (<1m)')
+    expect(title.split('\n')).toHaveLength(1)
+    expect(title).not.toContain('# desc:')
+    expect(title).not.toContain('cd /Users')
+    expect(title).not.toContain('for i in')
+  })
+
+  test('shell:无 # desc 时生成单行脚本摘要,折叠汇总也不回显命令', () => {
+    const command = 'cd /workspace\nset -e\nbun test src/cards/background.test.ts'
+    const running = mk({ id: 't1', type: 'shell', description: command, status: 'running', startedAt: 0 })
+    const title = (backgroundTaskPanel(running, 53000) as any).header.title.content
+    expect(title).toContain('Shell 脚本 · 3 行 · bun test src/cards/background.test.ts')
+    expect(title.split('\n')).toHaveLength(1)
+    expect(title).not.toContain('cd /workspace')
+
+    const completed = { ...running, status: 'completed' as const, endTime: 1000 }
+    const foldBody = (backgroundFoldPanel([completed], 1000) as any).elements[0].content
+    expect(foldBody).toContain('Shell 脚本 · 3 行 · bun test src/cards/background.test.ts')
+    expect(foldBody).not.toContain('cd /workspace')
+    expect(foldBody).not.toContain('set -e')
+  })
+
   test('completed:header 写「用时 Ns」(用 usage.duration_ms)', () => {
     const t = mk({ id: 't1', type: 'shell', description: 'build', status: 'completed', startedAt: 0, usage: { total_tokens: 10, tool_uses: 1, duration_ms: 23000 } })
     const panel = backgroundTaskPanel(t, 999999) as any
