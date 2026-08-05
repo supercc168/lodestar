@@ -72,6 +72,10 @@ SDK `model`:官方档位直传 `claude-fable-5` / `claude-opus-5`;第三方档�
 - user `tool_result` message -> `tool_result`
 - `result` -> `token_usage` + `result`
 - `system/compact_boundary` -> `context_compacted`
+- `system/model_refusal_fallback` -> `model_refusal_fallback`
+- `system/model_refusal_no_fallback` -> `model_refusal_no_fallback`
+
+模型拒答降级:主模型 `stop_reason='refusal'` 后,SDK 重试到备用模型(`model_refusal_fallback`)或无备用模型直接失败(`model_refusal_no_fallback`)。Session 收到后在运行中卡 footer 瞬时高亮提示(8s 后让 Thinking/Writing/Working 相位标签恢复),并在 `closeTurnCard` 把提示注入完成卡 footer 第一行持久留痕(与 `🚨 压缩×N`、`📎 发送文件` 同通道,✅ 状态标保留)。`scope` 区分语义:`session`=主线程换模型波及整个会话 → `🔄 模型降级 A→B`;`local`=子 agent / `/btw` 副问 / 后台 fork 局部降级,主会话模型不变 → `🔄 子任务降级 A→B`;无备用 → `⚠️ A 拒绝,未降级`。`scope` 缺省(老 CLI)归一 `session`,`direction` 非 `retry`(legacy revert/sticky)防御性丢弃,每 turn 只提示首次(幂等)。
 
 权限:Claude SDK 使用 `permissionMode: default`,让 `AskUserQuestion` 能进入 `canUseTool`;其它工具在 callback 内立即 allow,保持原来的全自动行为。Ask callback 挂起并 emit `can_use_tool` 给 Session,飞书按钮回调再通过 `sendPermissionResponse()` resolve。
 
