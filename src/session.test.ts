@@ -6989,6 +6989,86 @@ describe('Session compact command', () => {
   })
 })
 
+describe('Claude model refusal fallback', () => {
+  test('session-scope fallback sets 降级 notice + footer override', () => {
+    const { session, proc, turn } = wiredWatchdogSession('claude')
+    proc.emit('model_refusal_fallback', {
+      trigger: 'refusal',
+      direction: 'retry',
+      original_model: 'claude-sonnet-4-5',
+      fallback_model: 'claude-haiku-4-5',
+      scope: 'session',
+      request_id: 'r1',
+      content: '',
+      uuid: 'u1',
+      session_id: proc.sessionId!,
+    })
+    expect(turn.modelFallbackNotice).toContain('降级')
+    expect(turn.modelFallbackNotice).toContain('sonnet-4-5')
+    expect(turn.modelFallbackNotice).toContain('haiku-4-5')
+    expect(turn.footerStatusOverride).toBe(turn.modelFallbackNotice)
+    session.stopFooterStatus(turn)
+  })
+
+  test('local-scope fallback labels 子任务降级', () => {
+    const { session, proc, turn } = wiredWatchdogSession('claude')
+    proc.emit('model_refusal_fallback', {
+      trigger: 'refusal',
+      direction: 'retry',
+      original_model: 's',
+      fallback_model: 'h',
+      scope: 'local',
+      request_id: 'r1',
+      content: '',
+      uuid: 'u1',
+      session_id: proc.sessionId!,
+    })
+    expect(turn.modelFallbackNotice).toContain('子任务降级')
+    session.stopFooterStatus(turn)
+  })
+
+  test('no_fallback sets 拒绝 notice', () => {
+    const { session, proc, turn } = wiredWatchdogSession('claude')
+    proc.emit('model_refusal_no_fallback', {
+      original_model: 'claude-sonnet-4-5',
+      request_id: 'r1',
+      api_refusal_category: 'cyber',
+      content: '',
+      uuid: 'u1',
+      session_id: proc.sessionId!,
+    })
+    expect(turn.modelFallbackNotice).toContain('拒绝')
+    expect(turn.modelFallbackNotice).toContain('sonnet-4-5')
+    session.stopFooterStatus(turn)
+  })
+
+  test('second fallback on the same turn is ignored (idempotent)', () => {
+    const { session, proc, turn } = wiredWatchdogSession('claude')
+    proc.emit('model_refusal_fallback', {
+      trigger: 'refusal', direction: 'retry',
+      original_model: 's', fallback_model: 'h', scope: 'session',
+      request_id: 'r1', content: '', uuid: 'u1', session_id: proc.sessionId!,
+    })
+    const first = turn.modelFallbackNotice
+    proc.emit('model_refusal_no_fallback', {
+      original_model: 's', request_id: 'r2', content: '', uuid: 'u2', session_id: proc.sessionId!,
+    })
+    expect(turn.modelFallbackNotice).toBe(first)
+    expect(turn.modelFallbackNotice).toContain('降级')
+    session.stopFooterStatus(turn)
+  })
+
+  test('fallback with no active turn is ignored without throwing', () => {
+    const { session, proc } = wiredWatchdogSession('claude')
+    session.currentTurn = null
+    expect(() => proc.emit('model_refusal_fallback', {
+      trigger: 'refusal', direction: 'retry',
+      original_model: 's', fallback_model: 'h', scope: 'session',
+      request_id: 'r', content: '', uuid: 'u', session_id: 's',
+    })).not.toThrow()
+  })
+})
+
 describe('configuredDefaultSelection ([claude] default_model)', () => {
   test('未设 default_model → null(回落硬编码登录默认 Fable 5)', () => {
     const prev = config.claude.defaultModel

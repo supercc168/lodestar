@@ -762,6 +762,37 @@ export interface BgTaskSettledEvent {
   usage?: BgTaskUsage
 }
 
+// ── 模型拒绝 / 降级(system/model_refusal_*)─────────────────────────
+// 主模型 stop_reason='refusal' 后:fallback = 已重试到备用模型;
+// no_fallback = 未配 fallback,本轮直接失败。两者都 rare 但用户必须可见。
+// scope 仅 fallback 有:'session'=主线程换模型(波及整个会话);'local'=子 agent /
+// /btw 副问 / 后台 fork 用了 fallback,主会话模型不变。older CLI 缺省 → 'session'。
+// direction 仅 SDK 仅 emit 'retry';revert/sticky 保留为 legacy,不再 emit。
+
+export interface ModelRefusalFallbackEvent {
+  trigger: 'refusal'
+  direction: 'retry' | 'revert' | 'sticky'
+  original_model: string
+  fallback_model: string
+  scope: 'session' | 'local'
+  request_id: string | null
+  api_refusal_category?: string | null
+  api_refusal_explanation?: string | null
+  content: string
+  uuid: string
+  session_id: string
+}
+
+export interface ModelRefusalNoFallbackEvent {
+  original_model: string
+  request_id: string | null
+  api_refusal_category?: string | null
+  api_refusal_explanation?: string | null
+  content: string
+  uuid: string
+  session_id: string
+}
+
 export class ClaudeAgentProcess extends EventEmitter {
   readonly provider = 'claude' as const
 
@@ -1196,6 +1227,37 @@ export class ClaudeAgentProcess extends EventEmitter {
         return
       case 'permission_denied':
         log(`claude-agent-process: permission denied ${raw.tool_name} ${raw.tool_use_id}: ${raw.message}`)
+        return
+      // ── 模型拒绝 / 降级(SDK system/model_refusal_*)──────────────────
+      // 之前落 default 静默丢,模型拒答后用户在飞书卡上看不到任何降级信号。
+      case 'model_refusal_fallback': {
+        // SDK 仅 emit direction='retry';revert/sticky 是 legacy,防御性跳过避免噪音。
+        if (typeof raw.direction === 'string' && raw.direction !== 'retry' && raw.direction !== undefined) return
+        this.emit('model_refusal_fallback', {
+          trigger: 'refusal',
+          direction: typeof raw.direction === 'string' ? raw.direction : 'retry',
+          original_model: String(raw.original_model ?? ''),
+          fallback_model: String(raw.fallback_model ?? ''),
+          scope: raw.scope === 'local' ? 'local' : 'session',
+          request_id: raw.request_id ?? null,
+          api_refusal_category: raw.api_refusal_category,
+          api_refusal_explanation: raw.api_refusal_explanation,
+          content: String(raw.content ?? ''),
+          uuid: String(raw.uuid ?? ''),
+          session_id: String(raw.session_id ?? ''),
+        } satisfies ModelRefusalFallbackEvent)
+        return
+      }
+      case 'model_refusal_no_fallback':
+        this.emit('model_refusal_no_fallback', {
+          original_model: String(raw.original_model ?? ''),
+          request_id: raw.request_id ?? null,
+          api_refusal_category: raw.api_refusal_category,
+          api_refusal_explanation: raw.api_refusal_explanation,
+          content: String(raw.content ?? ''),
+          uuid: String(raw.uuid ?? ''),
+          session_id: String(raw.session_id ?? ''),
+        } satisfies ModelRefusalNoFallbackEvent)
         return
       // ── 后台任务 / 子 agent 生命周期(SDK 的 task_* 消息族,统一 type:'system')
       // 全部 emit 出去给 session 维护 backgroundTasks 状态 + 驱动后台游标卡。

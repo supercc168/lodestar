@@ -765,6 +765,109 @@ describe('Claude user dialog bridge', () => {
   })
 })
 
+describe('Claude model refusal message handling', () => {
+  test('emits model_refusal_fallback with scope passed through', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const events: any[] = []
+    proc.on('model_refusal_fallback', (e: any) => events.push(e))
+
+    proc.handleMessage({
+      type: 'system',
+      subtype: 'model_refusal_fallback',
+      trigger: 'refusal',
+      direction: 'retry',
+      original_model: 'claude-sonnet-4-5',
+      fallback_model: 'claude-haiku-4-5',
+      request_id: 'req-fb-1',
+      scope: 'session',
+      content: 'refused',
+      uuid: 'rfu-1',
+      session_id: 'claude-session-1',
+    })
+    expect(events).toHaveLength(1)
+    expect(events[0]).toMatchObject({
+      original_model: 'claude-sonnet-4-5',
+      fallback_model: 'claude-haiku-4-5',
+      direction: 'retry',
+      scope: 'session',
+    })
+
+    // scope 缺省(老 CLI)归一化为 'session'
+    proc.handleMessage({
+      type: 'system',
+      subtype: 'model_refusal_fallback',
+      trigger: 'refusal',
+      direction: 'retry',
+      original_model: 's',
+      fallback_model: 'h',
+      request_id: 'r2',
+      content: 'x',
+      uuid: 'u2',
+      session_id: 'claude-session-1',
+    })
+    expect(events[1].scope).toBe('session')
+
+    // local scope 透传
+    proc.handleMessage({
+      type: 'system',
+      subtype: 'model_refusal_fallback',
+      trigger: 'refusal',
+      direction: 'retry',
+      original_model: 's',
+      fallback_model: 'h',
+      request_id: 'r3',
+      scope: 'local',
+      content: 'x',
+      uuid: 'u3',
+      session_id: 'claude-session-1',
+    })
+    expect(events[2].scope).toBe('local')
+  })
+
+  test('drops legacy non-retry direction values', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const events: any[] = []
+    proc.on('model_refusal_fallback', (e: any) => events.push(e))
+
+    proc.handleMessage({
+      type: 'system',
+      subtype: 'model_refusal_fallback',
+      trigger: 'refusal',
+      direction: 'revert',
+      original_model: 's',
+      fallback_model: 'h',
+      request_id: 'r',
+      scope: 'session',
+      content: 'x',
+      uuid: 'u',
+      session_id: 'claude-session-1',
+    })
+    expect(events).toHaveLength(0)
+  })
+
+  test('emits model_refusal_no_fallback with category passed through', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const events: any[] = []
+    proc.on('model_refusal_no_fallback', (e: any) => events.push(e))
+
+    proc.handleMessage({
+      type: 'system',
+      subtype: 'model_refusal_no_fallback',
+      original_model: 'claude-sonnet-4-5',
+      request_id: 'req-nf-1',
+      api_refusal_category: 'cyber',
+      api_refusal_explanation: 'blocked',
+      content: 'refused',
+      uuid: 'rfu-nf-1',
+      session_id: 'claude-session-1',
+    })
+    expect(events).toHaveLength(1)
+    expect(events[0].original_model).toBe('claude-sonnet-4-5')
+    expect(events[0].api_refusal_category).toBe('cyber')
+    expect(events[0].api_refusal_explanation).toBe('blocked')
+  })
+})
+
 describe('Claude token accounting', () => {
   test('accumulates per-result usage when modelUsage totals are absent', () => {
     const proc = new ClaudeAgentProcess({

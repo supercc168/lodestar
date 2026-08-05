@@ -53,6 +53,8 @@ import {
   type BgTaskProgressEvent,
   type BgTaskUpdatedEvent,
   type BgTaskSettledEvent,
+  type ModelRefusalFallbackEvent,
+  type ModelRefusalNoFallbackEvent,
 } from './claude-agent-process'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
@@ -4619,6 +4621,36 @@ export class Session {
         this.bgResumePending = true
       }
     })
+    // ── 模型拒绝 / 降级(SDK system/model_refusal_*,仅 Claude 后端 emit)──────
+    // 主模型 refusal 后:session=主线程换模型(整个会话);local=子agent/副问/后台
+    // fork 局部降级,主会话模型不变。no_fallback=未配备用模型,本轮失败。
+    p.on('model_refusal_fallback', (e: ModelRefusalFallbackEvent) => {
+      if (this.proc !== p) return
+      const turn = this.currentTurn
+      if (!turn || turn.provider !== 'claude') {
+        log(`session "${this.sessionName}": model_refusal_fallback with no active claude turn (scope=${e.scope}) — ignored`)
+        return
+      }
+      // 幂等:每 turn 只 surfaced 第一次,避免重复/噪音。
+      if (turn.modelFallbackNotice) return
+      const orig = e.original_model || '?'
+      const fb = e.fallback_model || '?'
+      const notice = e.scope === 'local'
+        ? `🔄 子任务降级 ${orig}→${fb}`
+        : `🔄 模型降级 ${orig}→${fb}`
+      this.applyModelFallbackNotice(turn, notice)
+    })
+    p.on('model_refusal_no_fallback', (e: ModelRefusalNoFallbackEvent) => {
+      if (this.proc !== p) return
+      const turn = this.currentTurn
+      if (!turn || turn.provider !== 'claude') {
+        log(`session "${this.sessionName}": model_refusal_no_fallback with no active claude turn — ignored`)
+        return
+      }
+      if (turn.modelFallbackNotice) return
+      const orig = e.original_model || '?'
+      this.applyModelFallbackNotice(turn, `⚠️ ${orig} 拒绝,未降级`)
+    })
     p.on('exit', ({ code, signal, expected }: any) => {
       log(`session "${this.sessionName}": ${p.provider} exited code=${code} signal=${signal} expected=${expected}`)
       const pendingDelivery = this.pendingHumanDelivery?.proc === p
@@ -5715,6 +5747,8 @@ export class Session {
       footerStatusStartedAt: 0,
       footerStatusLabel: null,
       footerStatusOverride: null,
+      modelFallbackNotice: null,
+      modelFallbackOverrideTimer: null,
       rotating: null,
       rotateCount: 0,
       failureRotateCount: 0,
@@ -6393,9 +6427,33 @@ export class Session {
   stopFooterStatus(turn: TurnState | null): void {
     if (!turn) return
     if (turn.footerStatusHandle) clearTimeout(turn.footerStatusHandle)
+    if (turn.modelFallbackOverrideTimer) clearTimeout(turn.modelFallbackOverrideTimer)
     turn.footerStatusHandle = null
+    turn.modelFallbackOverrideTimer = null
     turn.footerStatusStartedAt = 0
     turn.footerStatusLabel = null
+  }
+
+  /** 模型降级/拒答瞬时通知显示时长,到期后让相位标签(Thinking/Writing/Working)恢复。 */
+  private static readonly MODEL_FALLBACK_NOTICE_MS = 8_000
+
+  /** 把模型降级/拒答提示同时落到:① 运行中卡的 footerStatusOverride(瞬时高亮,
+   *  MODEL_FALLBACK_NOTICE_MS 后自动清回 null,不抢后续 watchdog/tool-failure 的 override);
+   *  ② turn.modelFallbackNotice(持久,closeTurnCard 注入完成卡 footer line1)。 */
+  private applyModelFallbackNotice(turn: TurnState, notice: string): void {
+    turn.modelFallbackNotice = notice
+    turn.footerStatusOverride = notice
+    this.renderFooterStatus(turn)
+    if (turn.modelFallbackOverrideTimer) clearTimeout(turn.modelFallbackOverrideTimer)
+    turn.modelFallbackOverrideTimer = setTimeout(() => {
+      turn.modelFallbackOverrideTimer = null
+      // 只清自己设的 override;若期间 watchdog/tool-failure 设了别的 override,不抢。
+      if (this.currentTurn === turn && turn.footerStatusOverride === notice) {
+        turn.footerStatusOverride = null
+        this.renderFooterStatus(turn)
+      }
+    }, Session.MODEL_FALLBACK_NOTICE_MS)
+    log(`session "${this.sessionName}": model fallback surfaced notice="${notice}"`)
   }
 
   /** turn footer 末尾的 5h 额度后缀(`  |  5h·N%·[Xh]`),按本 turn
@@ -6500,6 +6558,7 @@ export class Session {
     }
     if (turn.contextCompactCount > 0) line1Parts.push(`🚨 压缩×${turn.contextCompactCount}`)
     if (turn.outboundSentPaths.size > 0) line1Parts.push(`📎 ${turn.outboundSentPaths.size}`)
+    if (turn.modelFallbackNotice) line1Parts.push(turn.modelFallbackNotice)
     const modelLabel = this.modelLine(turn)
     if (modelLabel) line1Parts.push(modelLabel)
     const footerLine1 = line1Parts.join(' ｜ ')

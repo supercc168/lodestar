@@ -107,6 +107,12 @@ export interface TurnState {
   /** Sticky watchdog footer copy. While set, ordinary phase timers must not
    * overwrite it; the lifecycle owner clears it at the intended boundary. */
   footerStatusOverride: string | null
+  /** 模型降级/拒答的持久标记。closeTurnCard 读它注入 footer line1
+   *  (✅ 保留,降级作为附加段)。null=本 turn 无降级。 */
+  modelFallbackNotice: string | null
+  /** 降级瞬时通知的自动清除 timer(~8s 后把 footerStatusOverride 恢复 null,
+   *  让 Thinking/Writing/Working 相位标签恢复)。stopFooterStatus / closeTurnCard 清它。 */
+  modelFallbackOverrideTimer: ReturnType<typeof setTimeout> | null
   /** Mid-turn card-rotation lock. Set when we've fire-and-forget kicked
    * off `startMidTurnRotate` to open a fresh card — either proactively
    * (element count crossed CARD_ELEMENT_SOFT_LIMIT) or reactively (an
