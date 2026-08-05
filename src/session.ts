@@ -130,7 +130,7 @@ export const CAPACITY_RETRY_PROMPT = `[Lodestar 容量重试]
 export const CAPACITY_RETRY_DELAY_MS = 60_000
 
 /** 同一 session 连续 capacity 自动重试上限,防止无限排队。 */
-export const CAPACITY_RETRY_MAX_ATTEMPTS = 2
+export const CAPACITY_RETRY_MAX_ATTEMPTS = 10
 
 export const WATCHDOG_TICK_MS = 15_000
 
