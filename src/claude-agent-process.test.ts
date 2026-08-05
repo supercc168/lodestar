@@ -868,6 +868,27 @@ describe('Claude model refusal message handling', () => {
   })
 })
 
+describe('Claude compactThread (/compact slash command)', () => {
+  test('pushes a /compact user message instead of throwing unsupported', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    proc.alive = true
+    proc.started = true
+    const pushed: any[] = []
+    proc.input = { push: (m: any) => { pushed.push(m) } }
+    await proc.compactThread()
+    expect(pushed).toHaveLength(1)
+    expect(pushed[0].type).toBe('user')
+    expect(pushed[0].message.content[0].text).toBe('/compact')
+    expect(pushed[0].priority).toBe('now')
+  })
+
+  test('rejects when the process is not running', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    proc.alive = false
+    await expect(proc.compactThread()).rejects.toThrow(/not running/)
+  })
+})
+
 describe('Claude token accounting', () => {
   test('accumulates per-result usage when modelUsage totals are absent', () => {
     const proc = new ClaudeAgentProcess({

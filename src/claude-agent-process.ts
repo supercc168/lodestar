@@ -1071,7 +1071,26 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   async compactThread(): Promise<void> {
-    throw new Error('Claude Agent SDK backend does not support Lodestar compact yet')
+    if (!this.alive) {
+      throw new Error('claude agent process is not running')
+    }
+    if (!this.started) this.sendInitialize()
+    if (!this.alive) {
+      throw new Error('claude agent process failed to initialize')
+    }
+    // Claude SDK 无 compact 触发接口(0.3.222 仍未暴露);借 CLI 内建 /compact slash
+    // command —— 其 supportsNonInteractive=true,streamInput 下作为 local command 执行。
+    // push 一条内容为 /compact 的 user 消息,CLI 本地压缩,完成后 emit system/
+    // compact_boundary → context_compacted,由 session-compact.ts 的 watch 收尾。
+    // 对话太短时 CLI 回 "Not enough messages to compact." 而不发 compact_boundary,
+    // watch 的 result 兜底以 no-op 提前收尾(见 session-compact.ts)。
+    this.input.push({
+      type: 'user',
+      session_id: this.sessionId ?? '',
+      message: { role: 'user', content: [{ type: 'text', text: '/compact' }] },
+      parent_tool_use_id: null,
+      priority: 'now',
+    } as SDKUserMessage)
   }
 
   async injectThreadItems(items: any[]): Promise<void> {

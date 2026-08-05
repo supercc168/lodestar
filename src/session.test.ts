@@ -6987,6 +6987,37 @@ describe('Session compact command', () => {
       content.includes('✅ 上下文已压缩') && content.includes('🧠 2% (5.4K/258K)')
     )).toBe(true)
   })
+
+  test('Claude /compact no-op (not enough messages) finishes 无需压缩 instead of timing out', async () => {
+    class ClaudeFakeProc extends EventEmitter {
+      readonly provider = 'claude' as const
+      sessionId = 'claude_thread_compact'
+      compactCalls = 0
+      isAlive(): boolean { return true }
+      async compactThread(): Promise<void> {
+        this.compactCalls++
+        // 模拟 CLI 对话太短:/compact 回 result,不发 context_compacted
+        queueMicrotask(() => {
+          this.emit('result', { subtype: 'success', is_error: false, thread_id: this.sessionId })
+        })
+      }
+    }
+
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new ClaudeFakeProc()
+    session.proc = proc
+    session.status = 'idle'
+    session.initCount = 1
+    session.pendingUserMessageCount = 0
+
+    await expect(session.runCommand('cm')).resolves.toBe(true)
+    expect(proc.compactCalls).toBe(1)
+    const footerWrites = calls
+      .filter(call => call.method === 'PUT' && call.path.endsWith('/elements/footer'))
+      .map(call => JSON.parse(call.body.element).content as string)
+    expect(footerWrites.some(content => content.includes('无需压缩'))).toBe(true)
+    expect(session.manualContextCompactionPending).toBe(false)
+  })
 })
 
 describe('Claude model refusal fallback', () => {

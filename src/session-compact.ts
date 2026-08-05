@@ -47,6 +47,7 @@ function watchManualCompaction(proc: AgentProcess, timeoutMs: number): ManualCom
       timer = null
     }
     proc.off('context_compacted', onCompacted)
+    proc.off('result', onResult)
     proc.off('exit', onExit)
     proc.off('error', onError)
   }
@@ -69,6 +70,13 @@ function watchManualCompaction(proc: AgentProcess, timeoutMs: number): ManualCom
   }
   const onExit = () => fail(new Error('codex app-server exited before context compaction completed'))
   const onError = (e: unknown) => fail(e instanceof Error ? e : new Error(String(e)))
+  // Claude /compact 兜底:若 result 到达而未先收到 compact_boundary,说明 CLI 跳过了压缩
+  // ("Not enough messages to compact.")。以 no-op 收尾,避免干等 120s 超时。
+  // 仅 Claude 后端注册:Codex 的 thread/compact/start 走 RPC,不会发 result,无需此兜底。
+  const onResult = () => {
+    if (settled) return
+    finish({ threadId: threadId ?? undefined, phase: 'event', sourceType: 'compact_noop', noop: true })
+  }
   const promise = new Promise<ContextCompactedNotification>((resolve, reject) => {
     resolvePromise = resolve
     rejectPromise = reject
@@ -77,6 +85,7 @@ function watchManualCompaction(proc: AgentProcess, timeoutMs: number): ManualCom
     }, timeoutMs)
   })
   proc.on('context_compacted', onCompacted)
+  if (proc.provider === 'claude') proc.on('result', onResult)
   proc.once('exit', onExit)
   proc.once('error', onError)
   return {
@@ -201,6 +210,10 @@ export async function runCompactCommand(s: Session): Promise<void> {
     await proc.compactThread()
     s.setStatusCard(statusCard, s.withModel('⏳ 等待压缩完成事件'))
     const notice = await watch.promise
+    if ((notice as ContextCompactedNotification & { noop?: boolean }).noop === true) {
+      await finishStatus(s.withModel(`⚪ 上下文太少,无需压缩${threadLabel ? ` thread=${threadLabel}…` : ''}`))
+      return
+    }
     const contextSnapshot = await usageWatch.waitFor(notice, CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS)
     const doneThread = notice.threadId ? ` thread=${notice.threadId.slice(0, 8)}…` : ''
     await finishStatus(s.withModel(`✅ 上下文已压缩${doneThread}${compactContextWindowLabel(contextSnapshot)}`))

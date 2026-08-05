@@ -92,7 +92,7 @@ Claude 自带 ask 工具接到 SDK `canUseTool`：
 - 支持 Claude backend 普通任务执行、工具展示、工具结果展示、打断、停止、重启、模型切换。
 - 支持 Claude usage / cost / context window 在 footer 展示。
 - 跨 Codex / Claude provider 切换只在空闲或下次启动边界生效；当前 turn 或排队消息存在时直接拒绝。
-- `compact` 只对 Codex app-server 生效；Claude backend 明确返回不支持，不做静默替代。
+- `compact`：Codex 走 app-server `thread/compact/start`；Claude backend 借 CLI 内建 `/compact` slash command(其 `supportsNonInteractive=true`,streamInput 下作为 local command 执行),`compactThread()` push 一条 `/compact` user 消息触发,完成后复用 `compact_boundary → context_compacted` 同一套收尾。
 - host-side `[[askusr: ...]]` 只对 Codex 生效；Claude 使用 SDK ask，不混用 Codex marker。
 - 不重启 live daemon；代码变更后只报告需要重启。
 
@@ -112,7 +112,7 @@ Claude 自带 ask 工具接到 SDK `canUseTool`：
 - 启动时机：Claude SDK 在没有第一条 user input 前不会发 `system/init`，所以 `hi` 启动 Claude 后不会强等 init；首条消息触发 init 和真实 session id。
 - 模型项:Claude 暴露 Fable 5、Opus 5、GLM，以及 Grok 无痕/CatCodex API 档位；登录档位与第三方 profile 各自解析明确的 SDK model id 和环境。Codex 不暴露或启动 Grok。
 - resume id：Claude `session_id` 与 Codex thread id 分开保存；切换 provider 不共享上下文。
-- compact：Claude SDK 没有 Lodestar 所用的 Codex `thread/compact/start` 等价接口，`compact` 会明确失败并说明不支持。
+- compact：Claude SDK 始终没有暴露 Codex `thread/compact/start` 的等价触发接口(0.3.222 仍未);但 CLI 内建 `/compact` slash command 支持 `supportsNonInteractive`,故 `compactThread()` 改为 push 一条 `/compact` user 消息、由 CLI 本地执行压缩,完成后 emit `compact_boundary → context_compacted`,与 Codex 走同一套 `session-compact.ts` 收尾。差异:对话太短时 CLI 回 "Not enough messages to compact." 而不发 `compact_boundary`,watch 的 result 兜底(claude-only)以 no-op 收尾,卡片显示「⚪ 上下文太少,无需压缩」,不干等 120s 超时。
 - ask：Codex 的 `[[askusr: ...]]` host marker 不给 Claude 使用；Claude 的 ask 来自 SDK `AskUserQuestion` / user-dialog，仍渲染成同一套飞书问答卡。
 
 ## Audit Fixes
