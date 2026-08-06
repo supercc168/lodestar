@@ -3649,7 +3649,6 @@ export class Session {
     expectedProc: AgentProcess,
   ): Promise<'started' | 'stale' | 'failed'> {
     if (this.proc !== expectedProc || !expectedProc.isAlive()) return 'stale'
-    if (expectedProc.provider !== 'codex') throw new Error('askusr host continuation is only supported by Codex')
     if (this.currentTurn || this.openingTurn) throw new Error(`${this.backendLabel()} turn still active`)
     const openingToken = this.beginTurnOpening()
     try {
@@ -3704,6 +3703,22 @@ export class Session {
     if (dispatch.kind === 'rejected') {
       log(`session "${this.sessionName}": system dispatch rejected: ${dispatch.error.message}`)
       return 'rejected'
+    }
+    if (dispatch.kind === 'queued') {
+      // Claude:sendUserText 是 fire-and-forget(push 到 SDK input 队列),无 settlement
+      // 同步点。校验所有权一致即视为 accepted;turn 卡已由 openTurnCard 开好,内容由后续
+      // turn_started / assistant_text 事件填充。
+      if (proc.provider !== 'claude') {
+        log(`session "${this.sessionName}": system dispatch unexpected queued from ${proc.provider}`)
+        return 'rejected'
+      }
+      if (
+        this.proc !== proc ||
+        !proc.isAlive() ||
+        this.currentTurn !== turn ||
+        this.openingTurnOwner !== openingOwner
+      ) return 'stale'
+      return 'accepted'
     }
     if (dispatch.kind !== 'turn_start_pending' || proc.provider !== 'codex') {
       log(`session "${this.sessionName}": system dispatch returned unexpected ${dispatch.kind} handle`)
@@ -6341,7 +6356,6 @@ export class Session {
   }
 
   private processHostAskMarkers(text: string, turn: TurnState): void {
-    if (this.proc?.provider !== 'codex') return
     for (const marker of extractAskUsrMarkers(text)) {
       if (turn.hostAskMarkersSeen.has(marker.raw)) continue
       turn.hostAskMarkersSeen.add(marker.raw)
@@ -6350,7 +6364,7 @@ export class Session {
   }
 
   private cleanAssistantTextForDisplay(text: string): string {
-    const replacement = this.proc?.provider === 'codex'
+    const replacement = this.proc?.provider === 'codex' || this.proc?.provider === 'claude'
       ? '\n\n_已发起澄清问题，请回答对应卡片。_'
       : ''
     // 只剥离 ask 标记;不做 HTML 转义/图片降级 —— 本函数同时服务纯文本

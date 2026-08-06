@@ -151,6 +151,23 @@ function answerPayload(ask: HostAskRecord): { answers: Array<{ question: string;
   return { answers: answers as Array<{ question: string; answer: string; user: string }> }
 }
 
+/** Claude 续跑 wireText:把澄清问答编进一条自包含 user message。Claude 无 Codex 的
+ *  thread 注入能力,靠这条消息(带原问题、抗 compaction)让模型承接答案继续原任务。 */
+function formatClaudeHostAskWireText(
+  result: { answers: Array<{ question: string; answer: string; user: string }> },
+): string {
+  const lines = [
+    '（以下是你在上一轮通过 [[askusr:...]] 协议向用户提出的澄清问题及用户回答。请据此继续执行此前被中断的任务，不要重复提问。）',
+    '',
+  ]
+  result.answers.forEach((a, i) => {
+    lines.push(`Q${i + 1}: ${a.question}`)
+    lines.push(`→ ${a.answer}${a.user ? ` （由 ${a.user} 回答）` : ''}`)
+    lines.push('')
+  })
+  return lines.join('\n')
+}
+
 async function createOrUpdateHostAskCard(s: Session, askId: string): Promise<void> {
   const ask = s.pendingHostAsks.get(askId)
   if (!ask) return
@@ -205,7 +222,7 @@ async function maybeContinueHostAsk(s: Session, askId: string): Promise<void> {
   const ask = s.pendingHostAsks.get(askId)
   if (!ask || ask.currentIdx !== undefined || ask.resumeStarted) return
   const proc = s.proc
-  if (proc?.provider !== 'codex') return
+  if (proc?.provider !== 'codex' && proc?.provider !== 'claude') return
   if (!s.isRunning() || s.currentTurn || s.status !== 'idle') return
   const result = answerPayload(ask)
   if (!result) return
@@ -214,26 +231,36 @@ async function maybeContinueHostAsk(s: Session, askId: string): Promise<void> {
     if (s.pendingHostAsks.get(askId) === ask) ask.resumeStarted = false
   }
   try {
-    await proc.injectThreadItems([
-      {
-        type: 'custom_tool_call',
-        call_id: ask.toolCallId,
-        name: 'askusr',
-        input: ask.inputJson,
-      },
-      {
-        type: 'custom_tool_call_output',
-        call_id: ask.toolCallId,
-        name: 'askusr',
-        output: JSON.stringify(result),
-      },
-    ])
-    if (s.proc !== proc || !proc.isAlive()) {
-      resetResume()
-      return
+    let wireText: string
+    if (proc.provider === 'codex') {
+      // Codex:伪造 askusr 工具调用+结果注入 thread,续跑时模型 sees 工具已返回。
+      await proc.injectThreadItems([
+        {
+          type: 'custom_tool_call',
+          call_id: ask.toolCallId,
+          name: 'askusr',
+          input: ask.inputJson,
+        },
+        {
+          type: 'custom_tool_call_output',
+          call_id: ask.toolCallId,
+          name: 'askusr',
+          output: JSON.stringify(result),
+        },
+      ])
+      if (s.proc !== proc || !proc.isAlive()) {
+        resetResume()
+        return
+      }
+      wireText = 'Continue using the askusr tool result above.'
+    } else {
+      // Claude 无真实 thread 注入(injectThreadItems 是假注入,会被 drain 成下一条
+      // user message 的文本前缀、污染上下文)。改为把答案编进续跑 wireText,作为新
+      // user frame 推给 SDK 触发新 turn(见 claude-agent-process sendUserText 语义)。
+      wireText = formatClaudeHostAskWireText(result)
     }
     const continuation = await s.startHostAskContinuation(
-      'Continue using the askusr tool result above.',
+      wireText,
       proc,
     )
     if (continuation !== 'started' || s.proc !== proc || !proc.isAlive()) {
@@ -298,8 +325,8 @@ export function hasPendingHostAsk(s: Session): boolean {
 }
 
 export function queueHostAskFromMarker(s: Session, payloadText: string, _rawMarker: string): void {
-  if (s.proc?.provider !== 'codex') {
-    log(`session "${s.sessionName}": ignore askusr marker from non-Codex backend`)
+  if (s.proc?.provider !== 'codex' && s.proc?.provider !== 'claude') {
+    log(`session "${s.sessionName}": ignore askusr marker from unsupported backend (${s.proc?.provider ?? 'none'})`)
     return
   }
   if (s.pendingHostAsks.size > 0) {

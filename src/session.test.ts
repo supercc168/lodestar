@@ -4348,6 +4348,43 @@ describe('Session system-owned Codex dispatch receipts', () => {
   })
 })
 
+describe('Session system-owned Claude host-ask continuation', () => {
+  test('claude host continuation accepts queued dispatch without awaiting settlement', async () => {
+    const session = new Session('claude-host-continuation-queued', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'thread-claude-host-continuation')
+    session.selectedProvider = 'claude'
+    session.proc = proc
+    session.status = 'idle'
+    session.wireProc(proc)
+
+    const outcome = await session.startHostAskContinuation('（用户回答）继续原任务', proc)
+    expect(outcome).toBe('started')
+    expect(proc.sentTexts).toContain('（用户回答）继续原任务')
+    expect(session.currentTurn).not.toBeNull()
+    expect(session.status).toBe('working')
+    expect(session.pendingUserMessageCount).toBe(1)
+  })
+
+  test('claude host continuation fails when sendUserText is rejected', async () => {
+    const session = new Session('claude-host-continuation-rejected', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'thread-claude-host-rejected')
+    session.selectedProvider = 'claude'
+    session.proc = proc
+    session.status = 'idle'
+    session.wireProc(proc)
+    proc.dispatchFactory = () => ({
+      kind: 'rejected',
+      provider: 'claude',
+      error: new Error('claude input closed'),
+    })
+
+    expect(await session.startHostAskContinuation('（用户回答）继续原任务', proc)).toBe('failed')
+    expect(session.currentTurn).toBeNull()
+    expect(session.status).toBe('idle')
+    expect(session.pendingUserMessageCount).toBe(0)
+  })
+})
+
 function deferCardSettingsPatch(cardId: string): {
   entered: Promise<void>
   release: () => void
@@ -6905,7 +6942,7 @@ describe('Session assistant rendering', () => {
     }
   })
 
-  test('treats askusr host markers as Codex-only', async () => {
+  test('routes askusr host markers to host-ask cards on Claude too', async () => {
     const session = new Session('probe', 'chat_id') as any
     const turn = turnState()
     const proc = new FakeAgentProc('claude', 'claude-session-1')
@@ -6919,15 +6956,16 @@ describe('Session assistant rendering', () => {
       session.finalizeCurrentAssistantSegment()
       await cardkit.flush(turn.cardId)
 
-      expect(session.pendingHostAsks.size).toBe(0)
-      expect(sentCards.length).toBe(0)
+      // Claude 现在也认 askusr 文本 marker:建 pendingHostAsks、弹 host_ask 卡。
+      expect(session.pendingHostAsks.size).toBe(1)
+      await waitFor(() => sentCards.length >= 1)
       const assistantAdd = calls.find(call =>
         call.method === 'POST' &&
         call.path === `/cards/${turn.cardId}/elements`
       )
       const elements = JSON.parse(assistantAdd?.body.elements ?? '[]')
       expect(elements[0]?.content).not.toContain('askusr')
-      expect(elements[0]?.content).not.toContain('已发起澄清问题')
+      expect(elements[0]?.content).toContain('已发起澄清问题')
     } finally {
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)
