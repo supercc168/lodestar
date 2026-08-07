@@ -27,7 +27,7 @@ description: 用白话驱动通用 GSD 多任务工作流；负责 .gsd 任务�
 - 允许多个任务同时为「运行中」；状态只描述任务是否允许推进，不记录由哪个 AI 执行
 - 本 skill 自建任务生命周期与 TRACKER；只复用 GSD 原生 workstream 的 `--ws` 路径隔离和 session-local 选择，不把 `$gsd-workstreams` 清单当作任务事实源
 - 当前会话选择与任务状态分离；切换只绑定当前会话，不暂停其他运行中任务
-- 主任务 provider/model/推理强度始终由用户当前飞书会话决定；GSD 子 agent 必须保持同 provider。Codex 锁当前模型；Claude 第一方按 catalog tier 使用最新组合，第三方 API 路由锁当前模型
+- 主任务 provider/model/推理强度始终由用户当前飞书会话决定；GSD 子 agent 必须保持同 provider。Codex 按分层 bake（深思 Sol+max / 外围 Terra+high / light Luna+medium）；Claude 第一方按 catalog tier 使用最新组合，第三方 API 路由锁当前模型
 
 ## 优先级
 
@@ -67,7 +67,7 @@ et-* / yiui-* 硬规则 > yiui-gsd 流程编排 > 原生 gsd-* 执行
 ## GSD 子 agent 质量与存活策略
 
 - 首次执行 GSD 子 agent 前，读取并执行 `extra-codex-agent-policy.md`。
-- GPT/Codex 会话的 GSD 子 agent 统一使用 `gpt-5.6-sol`：light 使用 `medium`，standard / heavy 使用 `high`。Claude 第一方按 GSD catalog tier 分配：heavy=`claude-opus-5`、standard=`claude-fable-5`、light=`claude-sonnet-5`；GLM/Grok 等 API 路由仍把所有 alias 锁到飞书当前选定模型。
+- GPT/Codex 会话：主任务与深思核/关键研究/写码验收用 `gpt-5.6-sol`+`max`；外围 standard 用 `gpt-5.6-terra`+`high`（Phase B）；light 用 `gpt-5.6-luna`+`medium`。Claude 第一方按 GSD catalog tier 分配：heavy=`claude-opus-5`、standard=`claude-fable-5`、light=`claude-sonnet-5`；GLM/Grok 等 API 路由仍把所有 alias 锁到飞书当前选定模型。
 - Lodestar spawn 必须按飞书 provider 设置 `GSD_RUNTIME=codex|claude`；Claude agent frontmatter 按 catalog `adaptiveTierMap` 写 `opus` / `sonnet` / `haiku`，真实模型由 spawn alias 解析，禁止向第三方端点泄漏官方 Claude id。
 - 飞书 continue/new 必须把目标 workstream 的 `runtime` 锁到当前 provider；Claude 使用 `model_profile=adaptive` + `resolve_model_ids=false` 保留 alias，Codex 使用 `model_profile=inherit` + `resolve_model_ids=omit`；清空所有显式/动态模型覆写，关闭 planner 前的 `pattern_mapper`、checker 后的非阻断 `post_planning_gaps` 与 `thinking_partner` 二次分析，显式关闭 GSD 1.8 的 `claude_orchestration`，并写入 30 分钟子 agent 诊断窗口；其它 workstream 配置保持不变。
 - 只派发当前阶段不可替代的 GSD 职责；单个 PLAN 不超过两个任务时按 GSD 1.8 原地执行，不启动 executor 子 agent。更大计划按真实依赖决定并行度，禁止为制造并行而拆小任务或重复派发同一范围；顺序子 agent 使用最小上下文并只返回紧凑结论。

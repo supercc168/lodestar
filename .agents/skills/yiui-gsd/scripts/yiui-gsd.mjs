@@ -965,6 +965,70 @@ function syncCodexAgentBakeTimestamps(defaultsPath, agentFiles) {
   return agentFiles.length
 }
 
+/** Phase B Codex GSD policy: deep paths Sol+max; outer standard Terra+high; light Luna+medium. */
+const CODEX_DEEP_STANDARD_AGENTS = new Set([
+  'gsd-executor',
+  'gsd-verifier',
+  'gsd-code-reviewer',
+  'gsd-code-fixer',
+  'gsd-phase-researcher',
+])
+
+const CODEX_OUTER_STANDARD_AGENTS = [
+  'gsd-advisor-researcher',
+  'gsd-ai-researcher',
+  'gsd-domain-researcher',
+  'gsd-project-researcher',
+  'gsd-ui-researcher',
+  'gsd-doc-writer',
+  'gsd-doc-synthesizer',
+  'gsd-eval-auditor',
+]
+
+function resolveCodexAgentAssignment(agentName, catalogAgent) {
+  const knownInCatalog = Boolean(catalogAgent)
+  const routingTier = catalogAgent
+    ? String(catalogAgent.routingTier || 'standard')
+    : 'standard'
+
+  if (routingTier === 'light') {
+    return {
+      band: 'D3',
+      model: 'gpt-5.6-luna',
+      effort: 'medium',
+      routingTier,
+    }
+  }
+
+  // Fail-safe: unknown agents stay on the deep path.
+  if (!knownInCatalog) {
+    return {
+      band: 'D0',
+      model: 'gpt-5.6-sol',
+      effort: 'max',
+      routingTier,
+    }
+  }
+
+  if (routingTier === 'standard' && !CODEX_DEEP_STANDARD_AGENTS.has(agentName)) {
+    // Phase B: outer standard → Terra+high. Deep standard stays Sol+max via whitelist.
+    return {
+      band: 'D2',
+      model: 'gpt-5.6-terra',
+      effort: 'high',
+      routingTier,
+    }
+  }
+
+  const band = agentName === 'gsd-phase-researcher' ? 'D1' : 'D0'
+  return {
+    band,
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    routingTier,
+  }
+}
+
 function applyCodexAgentPolicy(options = {}) {
   const codexHome = resolveCodexHome(options)
   const defaultsPath = resolveDefaultsPath(options)
@@ -1003,13 +1067,22 @@ function applyCodexAgentPolicy(options = {}) {
   claudeOrchestration.enabled = false
   claudeOrchestration.execution_backend = 'inline'
   defaults.claude_orchestration = claudeOrchestration
+  // Phase B: deep→Sol, outer standard→Terra, light→Luna.
   const profileOverrides = isObject(defaults.model_profile_overrides) ? defaults.model_profile_overrides : {}
-  profileOverrides.codex = { opus: 'gpt-5.6-sol', sonnet: 'gpt-5.6-sol', haiku: 'gpt-5.6-sol' }
+  profileOverrides.codex = {
+    opus: 'gpt-5.6-sol',
+    sonnet: 'gpt-5.6-terra',
+    haiku: 'gpt-5.6-luna',
+  }
   defaults.model_profile_overrides = profileOverrides
   const effort = isObject(defaults.effort) ? defaults.effort : {}
-  const agentOverrides = isObject(effort.agent_overrides) ? effort.agent_overrides : {}
-  effort.default = 'high'
-  effort.routing_tier_defaults = { light: 'medium', standard: 'high', heavy: 'high' }
+  // Deep default is max; outer standard agents override to high; light uses medium.
+  const agentOverrides = {}
+  for (const agentName of CODEX_OUTER_STANDARD_AGENTS) {
+    agentOverrides[agentName] = 'high'
+  }
+  effort.default = 'max'
+  effort.routing_tier_defaults = { light: 'medium', standard: 'max', heavy: 'max' }
   effort.agent_overrides = agentOverrides
   defaults.effort = effort
 
@@ -1033,22 +1106,29 @@ function applyCodexAgentPolicy(options = {}) {
   const agentChanges = []
   let flexRemoved = 0
   const violations = []
+  const bandCounts = { D0: 0, D1: 0, D2: 0, D3: 0 }
 
   for (const path of agentFiles) {
     const fileName = basename(path)
     const agentName = fileName.slice(0, -'.toml'.length)
     const catalogAgent = catalog?.agents?.[agentName]
-    const routingTier = catalogAgent ? String(catalogAgent.routingTier || 'standard') : 'standard'
-    const expectedEffort = routingTier === 'light' ? 'medium' : 'high'
+    const assignment = resolveCodexAgentAssignment(agentName, catalogAgent)
+    if (Object.hasOwn(bandCounts, assignment.band)) bandCounts[assignment.band] += 1
     const content = readText(path)
     const eol = content.includes('\r\n') ? '\r\n' : '\n'
     const hadFlex = /^service_tier\s*=\s*"flex"\s*$/m.test(content)
     let updated = content.replace(/^service_tier\s*=\s*"flex"\s*\r?\n?/gm, '')
-    updated = setTomlString(updated, 'model', 'gpt-5.6-sol', eol)
-    updated = setTomlString(updated, 'model_reasoning_effort', expectedEffort, eol)
+    updated = setTomlString(updated, 'model', assignment.model, eol)
+    updated = setTomlString(updated, 'model_reasoning_effort', assignment.effort, eol)
 
     if (updated !== content) {
-      agentChanges.push({ agent: agentName, tier: routingTier, effort: expectedEffort })
+      agentChanges.push({
+        agent: agentName,
+        band: assignment.band,
+        tier: assignment.routingTier,
+        model: assignment.model,
+        effort: assignment.effort,
+      })
       if (hadFlex) flexRemoved += 1
       if (!verifyOnly) {
         const agentBackupDirectory = join(backupRoot, 'agents')
@@ -1059,8 +1139,10 @@ function applyCodexAgentPolicy(options = {}) {
     }
 
     const verificationContent = verifyOnly ? content : updated
-    if (!/^model\s*=\s*"gpt-5\.6-sol"\s*$/m.test(verificationContent)) violations.push(`${agentName} model`)
-    if (!new RegExp(`^model_reasoning_effort\\s*=\\s*"${escapeRegExp(expectedEffort)}"\\s*$`, 'm').test(verificationContent)) {
+    if (!new RegExp(`^model\\s*=\\s*"${escapeRegExp(assignment.model)}"\\s*$`, 'm').test(verificationContent)) {
+      violations.push(`${agentName} model`)
+    }
+    if (!new RegExp(`^model_reasoning_effort\\s*=\\s*"${escapeRegExp(assignment.effort)}"\\s*$`, 'm').test(verificationContent)) {
       violations.push(`${agentName} effort`)
     }
     if (/^service_tier\s*=\s*"flex"\s*$/m.test(verificationContent)) violations.push(`${agentName} flex`)
@@ -1087,10 +1169,12 @@ function applyCodexAgentPolicy(options = {}) {
   const result = {
     mode: verifyOnly ? 'verify' : 'apply',
     runtime: 'codex',
+    phase: 'B',
     defaults_path: defaultsPath,
     defaults_changed: defaultsChanged,
     agents_checked: agentFiles.length,
     agents_changed: agentChanges.length,
+    band_counts: bandCounts,
     bake_timestamps_synced: bakeTimestampsSynced,
     flex_removed: flexRemoved,
     backup_path: !verifyOnly && pathExists(backupRoot) ? backupRoot : null,

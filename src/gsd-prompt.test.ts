@@ -62,7 +62,10 @@ test('new-task-discuss action line differs from continue', () => {
   expect(neu).toContain('effort: max')
   expect(neu).toContain('task_slug: b')
   expect(neu).toContain('任务名: B')
-  expect(neu).toContain('Codex 子 agent 全部锁到当前 model=gpt-5.6-sol')
+  expect(neu).toContain('Codex 子 agent 按 yiui-gsd 分层 bake')
+  expect(neu).toContain('gpt-5.6-sol+max')
+  expect(neu).toContain('gpt-5.6-terra+high')
+  expect(neu).toContain('gpt-5.6-luna+medium')
 })
 
 test('isGsdInjectPrompt / parseGsdInjectTaskSlug', () => {

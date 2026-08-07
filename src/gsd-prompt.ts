@@ -14,7 +14,7 @@ export function buildGsdInjectPrompt(input: {
     : `当前动作: new-task-discuss — 按 yiui-gsd 建立 planning 基线并进入 discuss/onboard，所有命令显式带 --ws ${input.taskSlug}`
   const childModelPolicy = input.provider === 'claude'
     ? `- Claude 子 agent 模型只由 Lodestar/GSD policy 解析：第一方 heavy/standard=飞书当前主力（Fable 5 或 Opus 5）、light=Sonnet 5（选 Opus 不注入 Fable，选 Fable 不注入 Opus）；第三方 API 路由的所有 alias 锁回当前 model=${input.model}；禁止自行覆写模型`
-    : `- Codex 子 agent 全部锁到当前 model=${input.model}，只按 routing tier 调整推理强度；禁止自行覆写模型`
+    : `- Codex 子 agent 按 yiui-gsd 分层 bake：深思核/关键研究/写码验收=gpt-5.6-sol+max，外围 standard=gpt-5.6-terra+high，light=gpt-5.6-luna+medium；主会话 model=${input.model}/effort=${input.effort}；禁止自行覆写模型`
   return [
     GSD_INJECT_PREFIX,
     '- 只用 yiui-gsd；禁止 superpowers / OMC / oh-my-claudecode / ralplan / ralph / ultrawork / “plan this” 旧规划入口',
