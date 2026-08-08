@@ -48,6 +48,7 @@
   "files": [
     "dist/",
     "skills/imagegen/",
+    "skills/imageread/",
     "scripts/postinstall.cjs",
     "README.md",
     "LICENSE"

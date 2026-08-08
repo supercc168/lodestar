@@ -38,6 +38,7 @@ import { buildNotifyCardFromReg } from './src/notify'
 import { startNotifyServer } from './src/notify'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
 import { ensureImagegenSkill } from './src/imagegen-skill'
+import { ensureImagereadSkill } from './src/imageread-skill'
 import { startTasklistWorker } from './src/tasklist-worker'
 import { config } from './src/config'
 import { log } from './src/log'
@@ -1046,6 +1047,12 @@ async function boot(): Promise<void> {
   // ~/.claude/skills + ~/.codex/skills, and write the credential wrapper
   // under DATA_DIR/bin/lodestar-imagegen. Orthogonal to chat model slots.
   ensureImagegenSkill()
+
+  // Sync imageread skill (read images via the user's codex CLI — gpt-5.6-sol
+  // vision) into ~/.claude/skills + ~/.codex/skills, and copy the bash
+  // wrapper to DATA_DIR/bin/lodestar-imageread. Unlike imagegen it manages
+  // NO credentials / venv: codex auth lives in ~/.codex/config.toml.
+  ensureImagereadSkill()
 
   // Auto-revive sessions that were running when we last went down.
   // Runs AFTER the WS is up so any 🔁 revive message lands in the
