@@ -28,6 +28,7 @@ import {
   type UserTextDispatch,
 } from './agent-process'
 import {
+  CLAUDE_MODEL_ALIAS_KEYS,
   claudeModelEffort,
   claudeModelKey,
   claudeModelIsGrok,
@@ -617,6 +618,72 @@ function parseSettingSources(raw: string | undefined, workDir?: string): string[
   return valid.length ? valid : null
 }
 
+/** 映射 settingSources → Claude Code 启动时实际加载的 settings.json 文件路径
+ * (user=~/.claude/settings.json, project/local=<cwd>/.claude/settings[.local].json)。
+ * CLAUDE_CONFIG_DIR 覆盖 user 目录,与 Claude Code 自身约定一致。 */
+export function claudeSettingsFilesForSources(
+  settingSources: readonly string[],
+  workDir?: string,
+): string[] {
+  const userDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+  const files: string[] = []
+  for (const src of settingSources) {
+    if (src === 'user') files.push(join(userDir, 'settings.json'))
+    else if (src === 'project' && workDir) files.push(join(workDir, '.claude', 'settings.json'))
+    else if (src === 'local' && workDir) files.push(join(workDir, '.claude', 'settings.local.json'))
+  }
+  return files
+}
+
+/** 只读检测:给定 settings 文件的 env 块里是否含 ANTHROPIC_DEFAULT_*_MODEL —— 这些
+ * key 会在 Claude Code 启动时覆盖 Lodestar 在 spawn 边界注入的 alias 锁回。纯函数,
+ * 返回每个命中文件及其冲突 key 列表(按 CLAUDE_MODEL_ALIAS_KEYS 固定顺序)。 */
+export function claudeSettingsAliasConflicts(
+  settingSources: readonly string[],
+  workDir?: string,
+): { path: string; keys: string[] }[] {
+  const out: { path: string; keys: string[] }[] = []
+  for (const path of claudeSettingsFilesForSources(settingSources, workDir)) {
+    if (!existsSync(path)) continue
+    let parsed: any
+    try {
+      parsed = JSON.parse(readFileSync(path, 'utf8'))
+    } catch {
+      continue // 解析不了就跳过,不打扰
+    }
+    const env = parsed?.env
+    if (!env || typeof env !== 'object') continue
+    const keys = CLAUDE_MODEL_ALIAS_KEYS.filter(k => typeof env[k] === 'string' && env[k].trim())
+    if (keys.length) out.push({ path, keys })
+  }
+  return out
+}
+
+/** 第三方 api 路由 spawn 时:settings.json 的 env 若含 ANTHROPIC_DEFAULT_*_MODEL,
+ * Claude Code 启动会覆盖 Lodestar 注入的 alias 锁回 → 官方 model id 泄漏到 GLM/Grok
+ * 端点,子 agent 报 "There's an issue with the selected model (claude-fable-5). It
+ * may not exist…"。best-effort 告警,绝不阻断 spawn;按 (path, keys) 签名去重避免
+ * daemon 长进程反复 spawn 刷屏,用户清理后自然停报。 */
+const reportedAliasConflictSigs = new Set<string>()
+export function warnClaudeSettingsAliasConflict(
+  settingSources: readonly string[],
+  workDir?: string,
+): void {
+  try {
+    const fresh = claudeSettingsAliasConflicts(settingSources, workDir).filter(c => {
+      const sig = `${c.path}::${c.keys.join('|')}`
+      if (reportedAliasConflictSigs.has(sig)) return false
+      reportedAliasConflictSigs.add(sig)
+      return true
+    })
+    if (!fresh.length) return
+    const detail = fresh.map(c => `  ${c.path}\n    ${c.keys.join(', ')}`).join('\n')
+    log(
+      `claude-agent-process: ⚠ 第三方 API 路由下 settings.json 的 env 块含 ANTHROPIC_DEFAULT_*_MODEL,会覆盖 Lodestar 注入的 alias 锁回 → 子 agent 可能用官方 model id 打第三方端点报错。建议从 env 块删掉这些 key,交 Lodestar 动态注入:\n${detail}`,
+    )
+  } catch { /* best-effort,绝不阻断 spawn */ }
+}
+
 /** Resolve SDK `tools` from a project profile's comma-separated built-in
  * tool allow-list (e.g. `"Read,Write,Edit,Bash,Glob,Grep"`), falling back
  * to the `claude_code` preset. MCP tools are NOT listed here — they are
@@ -896,6 +963,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         ? `grok-compat:${reasoningOptions.effort ?? '-'}`
         : this.opts.effort
       log(`claude-agent-process: spawn SDK query selection=${tokenSource.selectionModel} model=${model ?? 'default'} effort=${reasoningLabel} route=${routeLabel} cwd=${this.opts.workDir} settingSources=${settingSources.join('+')} executable=${executable.description}`)
+      if (isApiRoute) warnClaudeSettingsAliasConflict(settingSources, this.opts.workDir)
       this.query = query({
         prompt: this.input,
         options: {

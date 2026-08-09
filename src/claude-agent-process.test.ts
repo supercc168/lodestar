@@ -1,7 +1,7 @@
 import { homedir, tmpdir } from 'node:os'
 import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, unlinkSync, rmSync } from 'node:fs'
 import { delimiter, join, win32 } from 'node:path'
-import { afterAll, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
 
 mock.module('./config', () => ({
   config: {
@@ -32,6 +32,8 @@ const {
   resetClaudeContextWindowMaxCache,
   resolveClaudeExecutableConfig,
   settingSourcesFromProfile,
+  claudeSettingsFilesForSources,
+  claudeSettingsAliasConflicts,
   toolsFromProfile,
 } = await import('./claude-agent-process')
 const {
@@ -1528,6 +1530,74 @@ describe('Claude executable: third-party API routes bypass the wrapper bin', () 
     expect(executable.pathToClaudeCodeExecutable).toBeUndefined()
     expect(typeof executable.spawnClaudeCodeProcess).toBe('function')
     expect(executable.description).toBe(`config-reclaude-sdk-native:${wrapper}`)
+  })
+})
+
+describe('Claude settings.json alias conflict detection', () => {
+  // 第三方 api 路由下,Claude Code 启动加载的 settings.json env 块若含
+  // ANTHROPIC_DEFAULT_*_MODEL,会覆盖 Lodestar spawn 注入的 alias 锁回。
+  let prevConfigDir: string | undefined
+  beforeEach(() => {
+    prevConfigDir = process.env.CLAUDE_CONFIG_DIR
+    process.env.CLAUDE_CONFIG_DIR = mkdtempSync(join(tmpdir(), 'lodestar-cfg-'))
+  })
+  afterEach(() => {
+    if (prevConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = prevConfigDir
+  })
+
+  test('filesForSources: user/project/local path mapping respects CLAUDE_CONFIG_DIR', () => {
+    const files = claudeSettingsFilesForSources(['user', 'project', 'local'], '/work')
+    expect(files).toEqual([
+      join(process.env.CLAUDE_CONFIG_DIR!, 'settings.json'),
+      join('/work', '.claude', 'settings.json'),
+      join('/work', '.claude', 'settings.local.json'),
+    ])
+  })
+
+  test('filesForSources: drops project/local when no workDir given', () => {
+    expect(claudeSettingsFilesForSources(['user', 'project', 'local']))
+      .toEqual([join(process.env.CLAUDE_CONFIG_DIR!, 'settings.json')])
+  })
+
+  test('aliasConflicts: flags ANTHROPIC_DEFAULT_*_MODEL, filters blank values', () => {
+    writeFileSync(join(process.env.CLAUDE_CONFIG_DIR!, 'settings.json'), JSON.stringify({
+      env: { ANTHROPIC_DEFAULT_SONNET_MODEL: 'claude-fable-5', ANTHROPIC_DEFAULT_HAIKU_MODEL: '   ' },
+      model: 'claude-fable-5[1m]',
+    }))
+    const conflicts = claudeSettingsAliasConflicts(['user'])
+    expect(conflicts).toHaveLength(1)
+    expect(conflicts[0].keys).toContain('ANTHROPIC_DEFAULT_SONNET_MODEL')
+    expect(conflicts[0].keys).not.toContain('ANTHROPIC_DEFAULT_HAIKU_MODEL')
+  })
+
+  test('aliasConflicts: env without alias keys → no conflicts', () => {
+    writeFileSync(join(process.env.CLAUDE_CONFIG_DIR!, 'settings.json'), JSON.stringify({
+      env: { CLAUDE_CODE_EFFORT_LEVEL: 'max' },
+      model: 'claude-fable-5[1m]',
+    }))
+    expect(claudeSettingsAliasConflicts(['user'])).toEqual([])
+  })
+
+  test('aliasConflicts: project-level settings.json is also detected', () => {
+    const work = mkdtempSync(join(tmpdir(), 'lodestar-work-'))
+    try {
+      mkdirSync(join(work, '.claude'), { recursive: true })
+      writeFileSync(join(work, '.claude', 'settings.json'), JSON.stringify({
+        env: { ANTHROPIC_DEFAULT_OPUS_MODEL: 'claude-fable-5' },
+      }))
+      writeFileSync(join(process.env.CLAUDE_CONFIG_DIR!, 'settings.json'), JSON.stringify({ env: {} }))
+      const conflicts = claudeSettingsAliasConflicts(['user', 'project'], work)
+      expect(conflicts).toHaveLength(1)
+      expect(conflicts[0].path).toBe(join(work, '.claude', 'settings.json'))
+    } finally {
+      rmSync(work, { recursive: true, force: true })
+    }
+  })
+
+  test('aliasConflicts: malformed JSON is skipped, never throws', () => {
+    writeFileSync(join(process.env.CLAUDE_CONFIG_DIR!, 'settings.json'), '{ not json')
+    expect(claudeSettingsAliasConflicts(['user'])).toEqual([])
   })
 })
 
