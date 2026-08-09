@@ -46,6 +46,11 @@ const DEFAULT_TRACKER = `# GSD 任务跟踪
 
 const LOCK_TIMEOUT_MS = 30_000
 const LOCK_RETRY_MS = 100
+const PLAN_ID_PATTERN = '\\d+(?:-\\d+[A-Za-z]?)?'
+const PLAN_FILE_PATTERN = new RegExp(`^(${PLAN_ID_PATTERN})-PLAN\\.md$`)
+const PLAN_ID_COMPONENT_PATTERN = /^(\d+)(?:-(\d+)([A-Za-z]?))?$/
+const CURRENT_PLAN_FILE_PATTERN = new RegExp(`(${PLAN_ID_PATTERN})-PLAN\\.md`)
+const LEADING_PLAN_ID_PATTERN = new RegExp(`^(${PLAN_ID_PATTERN})\\b`)
 const SESSION_KEY_NAMES = [
   'GSD_SESSION_KEY',
   'CODEX_THREAD_ID',
@@ -777,16 +782,20 @@ function listPlanInfos(planningPath) {
   return walkFiles(planningPath)
     .map((path) => {
       const name = basename(path)
-      const match = name.match(/^(\d+(?:-\d+)?)-PLAN\.md$/)
+      const match = name.match(PLAN_FILE_PATTERN)
       if (!match) return null
       const id = match[1]
-      const parts = id.split('-').map((part) => Number(part))
-      const sortKey = parts.map((part) => String(part).padStart(8, '0')).join('-')
+      const idParts = id.match(PLAN_ID_COMPONENT_PATTERN)
+      if (!idParts) return null
+      const phase = String(Number(idParts[1])).padStart(8, '0')
+      const plan = String(Number(idParts[2] || 0)).padStart(8, '0')
+      const suffix = (idParts[3] || '0').toUpperCase()
+      const sortKey = `${phase}-${plan}-${suffix}`
       return {
         id,
         sortKey,
         path,
-        title: readPlanTitle(path, parts.at(-1)),
+        title: readPlanTitle(path, id),
       }
     })
     .filter(Boolean)
@@ -852,10 +861,10 @@ export function renderCodexPlan(options = {}) {
   if (statePhase) currentPhase = statePhase
   const currentCursor = readCurrentCursor(stateContent)
   let currentPlanId = ''
-  const currentPlanFile = currentPlan.match(/(\d+(?:-\d+)?)-PLAN\.md/)
+  const currentPlanFile = currentPlan.match(CURRENT_PLAN_FILE_PATTERN)
   if (currentPlanFile) currentPlanId = currentPlanFile[1]
   else {
-    const currentPlanNumber = currentPlan.match(/^(\d+(?:-\d+)?)\b/)
+    const currentPlanNumber = currentPlan.match(LEADING_PLAN_ID_PATTERN)
     if (currentPlanNumber) currentPlanId = currentPlanNumber[1]
   }
 
@@ -886,7 +895,7 @@ export function renderCodexPlan(options = {}) {
     let title = info?.title || `Plan ${planId}（计划文件缺失）`
     let labelId = planId
     if (index === activePlanIndex && currentCursor) {
-      const cursorTitle = currentCursor.item.replace(/^Plan\s*\d+(?:-\d+)?\s*[：:]?\s*/i, '').trim()
+      const cursorTitle = currentCursor.item.replace(/^Plan\s*\d+(?:-\d+[A-Za-z]?)?\s*[：:]?\s*/i, '').trim()
       if (cursorTitle) title = cursorTitle
       labelId = `${labelId}/${currentCursor.cursor}`
     }
