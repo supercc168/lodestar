@@ -10,11 +10,13 @@
 | File | Description |
 |------|-------------|
 | `claude-agent-backend.md` | Claude Agent SDK 后端 memo：目标、已确认事实、`AgentProcess` 接口与 `CodexProcess`/`ClaudeAgentProcess` 双后端设计、Claude model profile（GLM / Grok）、SDK 事件到 Session 事件的映射、与 Codex 行为的逐项 parity audit、差异说明和本机 smoke 验证结果。修改 `src/agent-process.ts`、`src/claude-agent-process.ts`、`src/claude-models.ts` 或 `src/glm-usage.ts` 时先读它。 |
+| `picoclaw-launchd-daemon.md` | PicoClaw 在 macOS 上用 LaunchAgent 守护的经验：进程职责、plist 关键字段、安装/重装步骤、运维速查与排障清单。 |
+| `picoclaw-long-job-notify.md` | PicoClaw 后台长任务「跑完不通知」的根因与修法 memo：`exec background=true` 无完成回调、gateway 无消息注入端点、自带 message/cron/spawn/heartbeat 四条主动通道各自的代价、脚本自推 + 留档 + 定时器补播的链路，以及哪些 picoclaw 操作会覆盖自制文件。配套 `examples/picoclaw-job-notify/`。 |
 
 ## Subdirectories
 | Directory | Purpose |
 |-----------|---------|
-| _None_ | 此目录没有非排除子目录。 |
+| `examples/` | memo 的可运行配套示例（脱敏、可直接安装）。目前只有 `picoclaw-job-notify/`：让 picoclaw 长任务跑完主动推回 IM 群的 shell 库 + 补播脚本 + 幂等安装器。 |
 
 ## For AI Agents
 
