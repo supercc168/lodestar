@@ -78,6 +78,14 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
     description: 'Grok 4.6 第三方路由 · CatCodex Anthropic Messages。需在 config.toml 配置 token。',
     route: 'api',
   },
+  deepseek: {
+    display_name: 'Claude Code · DeepSeek V4',
+    description: 'DeepSeek 第三方路由(官网 Anthropic 兼容端点,deepseek-chat 主力)。需在 config.toml 配置 token。',
+    route: 'api',
+    // base_url / auth_token / model 由 [claude.models.deepseek] 提供,不写死
+    // 在代码里(避免 token 入库 + 模型版本过期)。未配置时该档位在 picker 可见
+    // 但选择被拦截,提示去 config.toml 设置。与 GLM 同构。
+  },
 }
 
 // Claude Code/GSD 会按角色选择模型 alias。
@@ -109,6 +117,15 @@ export function firstPartyClaudeTierEnvForMain(
 }
 
 const DEFAULT_GLM_MODEL = 'glm-5.2[1m]'
+
+/** DeepSeek 官网 Anthropic 兼容端点(https://api.deepseek.com/anthropic)的
+ * 默认 model id。2026-08-13 实测(Anthropic /v1/messages 打真请求验证):
+ *   - deepseek-v4-pro  → V4 最强档,reasoning 模型(响应带 thinking,extended thinking),
+ *                        本档位默认主力,对齐用户「V4 Pro 为主」诉求
+ *   - deepseek-chat    → 当前解析为 deepseek-v4-flash(V4 快速档,非 thinking,更便宜)
+ *   - deepseek-reasoner→ 最新独立推理模型(兼容别名)
+ * 未在 [claude.models.deepseek] 显式配 model 时回落到这里。 */
+const DEFAULT_DEEPSEEK_MODEL = 'deepseek-v4-pro'
 
 function mergedConfig(name: string): ClaudeModelConfig {
   return {
@@ -144,6 +161,13 @@ function toProfile(name: string): ClaudeModelProfile | null {
   // profile.model。未配置 token 时保持 env 空，由 picker 拦截该档位。
   if (name === 'glm' && (env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY)) {
     const selectedModel = raw.model?.trim() || DEFAULT_GLM_MODEL
+    for (const key of CLAUDE_MODEL_ALIAS_KEYS) env[key] = selectedModel
+  }
+  // DeepSeek 同 GLM:实际配了 token 才注入路由,四个 alias 无条件收敛到
+  // profile.model,避免官方 model id 泄漏到 DeepSeek 兼容端点。(claudeModelTierEnv
+  // 的通用 api 路径也会兜底锁一遍,这里显式锁是 defense-in-depth,与 GLM 同构。)
+  if (name === 'deepseek' && (env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY)) {
+    const selectedModel = raw.model?.trim() || DEFAULT_DEEPSEEK_MODEL
     for (const key of CLAUDE_MODEL_ALIAS_KEYS) env[key] = selectedModel
   }
   // route:显式 config > 内建默认 > 由是否配了接入信息推断。

@@ -1,0 +1,26 @@
+# Lodestar config.toml 示例片段 —— DeepSeek V4 Pro 接入(Claude Code 后端)
+#
+# 把下面的 [claude.models.deepseek] 节合并进你的 ~/.config/lodestar/config.toml,
+# 替换 auth_token 为你自己的 DeepSeek API key(平台 https://platform.deepseek.com 申请)。
+# 与 GLM/Grok 同构:token 放档位节,不污染官方登录档位(Fable/Opus)。
+#
+# 2026-08-13 实测校验(对 https://api.deepseek.com/anthropic/v1/messages 打真请求):
+#   - base_url 必须带 /anthropic 后缀;不带会走 OpenAI 兼容协议,Claude Code 无法工作
+#   - model = "deepseek-v4-pro"  → V4 最强档,reasoning 模型(响应带 thinking),HTTP 200 ✓
+#   - model = "deepseek-chat"    → 解析为 deepseek-v4-flash(快速档,非 thinking,更便宜)
+#   - GET /v1/models 返回 404(Anthropic 兼容端点不列模型,正常)
+#
+# 接入后在飞书 model 面板会出现 "Claude · DeepSeek V4 Pro"(引用 id: claude:deepseek)。
+# spawn 时注入 ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN,四档子 agent alias
+# 全部锁回 deepseek-v4-pro,避免官方 model id 泄漏到 DeepSeek 端点。
+
+[claude.models.deepseek]
+display_name = "Claude · DeepSeek V4 Pro"
+model        = "deepseek-v4-pro"
+base_url     = "https://api.deepseek.com/anthropic"
+auth_token   = "sk-你的-deepseek-api-key"   # ← 替换成你的 key,勿提交真实 key 入库
+effort       = "xhigh"                        # 触发 extended thinking,与 GLM/grokcc 一致
+
+# 可选:设为新群默认档位(不写则默认 Fable 5 登录档)
+# [claude]
+# default_model = "deepseek"
