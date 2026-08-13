@@ -615,6 +615,22 @@ export class CodexProcess extends EventEmitter {
         this.emit('error', new Error(message))
         return
       }
+      // 高频无消费通知:静默不落日志(曾占 launchd.err.log 3.3GB 的 96%)。
+      // 事件流照常分发(raw 无监听时为零成本),仅不再逐条打 payload。
+      case 'item/commandExecution/outputDelta':
+      case 'hook/started':
+      case 'hook/completed':
+      case 'turn/diff/updated':
+      case 'item/commandExecution/terminalInteraction':
+      case 'thread/status/changed':
+      case 'turn/moderationMetadata':
+      case 'item/reasoning/summaryTextDelta':
+      case 'remoteControl/status/changed':
+      case 'skills/changed':
+      case 'item/reasoning/summaryPartAdded': {
+        this.emit('raw', { method, params })
+        return
+      }
     }
     logUnhandledAppServerPayload('NOTIFICATION', { method, params })
     this.emit('raw', { method, params })

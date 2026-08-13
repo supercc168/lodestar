@@ -92,7 +92,10 @@ function keyPaths(rawPayload: unknown): string[] {
   return paths
 }
 
-function safeJsonForCompactionLog(value: unknown): string {
+function safeJsonForCompactionLog(
+  value: unknown,
+  maxJsonChars: number = COMPACTION_LOG_JSON_CHARS,
+): string {
   const seen = new WeakSet<object>()
   let json: string
   try {
@@ -110,13 +113,23 @@ function safeJsonForCompactionLog(value: unknown): string {
   } catch (e) {
     json = `<unserializable: ${e}>`
   }
-  if (json.length > COMPACTION_LOG_JSON_CHARS) {
-    return `${json.slice(0, COMPACTION_LOG_JSON_CHARS)}...<truncated ${json.length - COMPACTION_LOG_JSON_CHARS} chars>`
+  if (json.length > maxJsonChars) {
+    return `${json.slice(0, maxJsonChars)}...<truncated ${json.length - maxJsonChars} chars>`
   }
   return json
 }
 
-export function logUnhandledAppServerPayload(reason: string, payload: unknown): void {
+// UNHANDLED_* 日志是"未知协议消息"的诊断兜底,与 compaction 调试共用
+// safeJsonForCompactionLog,但历史上按 200KB 上限打满导致 launchd.err.log
+// 40 天积到 3.3GB(93.9 万条 outputDelta/hook 通知)。这里收紧到 2KB,
+// 保留 method/keys 摘要即可定位;compaction 相关调用不受影响。
+const UNHANDLED_LOG_JSON_CHARS = 2_000
+
+export function logUnhandledAppServerPayload(
+  reason: string,
+  payload: unknown,
+  maxJsonChars: number = UNHANDLED_LOG_JSON_CHARS,
+): void {
   const root = objectOrNull(payload)
   const params = root ? objectOrNull(root.params) : null
   const item = root ? objectOrNull(root.item) ?? objectOrNull(params?.item) : null
@@ -126,7 +139,7 @@ export function logUnhandledAppServerPayload(reason: string, payload: unknown): 
     `method=${logValue(method)}`,
     `rootKeys=${formatKeyList(root)}`,
     `itemKeys=${formatKeyList(item)}`,
-    `payload=${safeJsonForCompactionLog(payload)}`,
+    `payload=${safeJsonForCompactionLog(payload, maxJsonChars)}`,
   ].join(' '))
 }
 
