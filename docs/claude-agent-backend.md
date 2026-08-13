@@ -20,7 +20,8 @@
   - `claude:glm`：第三方 API 路由，token 配在 `[claude.models.glm]`，spawn 时注入 `ANTHROPIC_*` env，effort 跟随 config（如 xhigh）；未配 token 时 picker 可见但选择被拦截。
   - `claude:grok` / `claude:grokcc`：Wuhen / CatCodex 的 Grok Anthropic Messages 路由，统一由 Claude Agent SDK 启动；无痕档锁官方最高 `xhigh`，CatCodex 档锁网关兼容 `xhigh`，并都设置 `thinking: disabled` 以关闭 Claude 专属 adaptive 控制。
   - `codex`（GPT-5.6 Sol）：Codex app-server 后端，内建档 effort 锁 `max`；`[codex.models.*]` 可提供非 Grok 的第三方 API 档位。
-  - （早期的 `claude:default` / `claude:deepseek` 已随二元化 / per-model 路由下线。）
+  - `claude:deepseek`（2026-08-13 复活）：DeepSeek 官网 Anthropic 兼容端点（`[claude.models.deepseek]`），主力 `deepseek-v4-pro[1m]`，haiku/子 agent 锁 `deepseek-v4-flash`，effort 锁 `max`；详见 `DEEPSEEK_V4_PRO_INTEGRATION.md`。
+  - （早期的 `claude:default` 已随二元化 / per-model 路由下线。）
 - 持久化模型选择扩展为 provider-aware，旧数据默认视为 Codex。
 - 会话 resume id 也按 provider 分开保存，避免 Claude session id 覆盖 Codex thread id。
 - `[[askusr: ...]]` 是 Codex 专属 host marker；Claude 不消费这个 marker，Claude 需要问用户时走 SDK 自己的 `AskUserQuestion` / `request_user_dialog` 路径。

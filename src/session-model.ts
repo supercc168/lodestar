@@ -99,7 +99,7 @@ const FIXED_MODEL_CHOICES = [
     provider: 'claude' as const,
     model: 'claude:deepseek',
     displayName: 'Claude · DeepSeek V4 Pro',
-    description: 'DeepSeek V4 Pro 第三方路由 · xhigh。',
+    description: 'DeepSeek V4 Pro 第三方路由 · max 思考强度,haiku/子 agent 走 V4 Flash。',
     effort: 'max' as AgentReasoningEffort,
   },
 ]

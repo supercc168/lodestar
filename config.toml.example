@@ -4,22 +4,26 @@
 # 替换 auth_token 为你自己的 DeepSeek API key(平台 https://platform.deepseek.com 申请)。
 # 与 GLM/Grok 同构:token 放档位节,不污染官方登录档位(Fable/Opus)。
 #
-# 2026-08-13 实测校验(对 https://api.deepseek.com/anthropic/v1/messages 打真请求):
+# 2026-08-14 对齐官方 8-13 Harness 开源 + V4 Pro 正式版更新,端点实测:
 #   - base_url 必须带 /anthropic 后缀;不带会走 OpenAI 兼容协议,Claude Code 无法工作
-#   - model = "deepseek-v4-pro"  → V4 最强档,reasoning 模型(响应带 thinking),HTTP 200 ✓
-#   - model = "deepseek-chat"    → 解析为 deepseek-v4-flash(快速档,非 thinking,更便宜)
-#   - GET /v1/models 返回 404(Anthropic 兼容端点不列模型,正常)
+#   - model = "deepseek-v4-pro[1m]" → V4 Pro 正式版 1M 上下文,[1m] 让 Claude Code 识别 1M ctx
+#                                     (端点接受并回显 deepseek-v4-pro),HTTP 200 ✓
+#   - 服务端模型映射已上线:claude-opus*→v4-pro,claude-sonnet*/haiku*→v4-flash
+#   - haiku alias + CLAUDE_CODE_SUBAGENT_MODEL 由代码内置锁 deepseek-v4-flash(便宜 ~1/3,
+#     0731 起 Flash 同样支持思考模式);AUTO_COMPACT_WINDOW=786432(768K 自动压缩)
+#   - count_tokens 端点支持(GET /v1/models 仍 404,Anthropic 兼容端点不列模型,正常)
 #
 # 接入后在飞书 model 面板会出现 "Claude · DeepSeek V4 Pro"(引用 id: claude:deepseek)。
-# spawn 时注入 ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN,四档子 agent alias
-# 全部锁回 deepseek-v4-pro,避免官方 model id 泄漏到 DeepSeek 端点。
+# spawn 时注入 ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN + 三档 alias 锁主力、
+# haiku 锁 Flash,避免官方 model id 泄漏到 DeepSeek 端点。
+# 注意:2026-08-17 起 V4 全系改为峰谷定价(闲时半价)。
 
 [claude.models.deepseek]
 display_name = "Claude · DeepSeek V4 Pro"
-model        = "deepseek-v4-pro"
+model        = "deepseek-v4-pro[1m]"
 base_url     = "https://api.deepseek.com/anthropic"
 auth_token   = "sk-你的-deepseek-api-key"   # ← 替换成你的 key,勿提交真实 key 入库
-effort       = "xhigh"                        # 触发 extended thinking,与 GLM/grokcc 一致
+effort       = "max"                        # 官方 Claude Code 接入文档同档(max 思考强度)
 
 # 可选:设为新群默认档位(不写则默认 Fable 5 登录档)
 # [claude]
