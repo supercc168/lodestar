@@ -7428,8 +7428,23 @@ describe('Fixed model selection normalization', () => {
     }
   })
 
+  test('keeps a CONFIGURED DeepSeek selection intact (deepseek 为活跃第三方档位)', () => {
+    // 2026-08-13 deepseek 复活:走 [claude.models.deepseek] 官网 /anthropic 端点,
+    // configured 时不再被当退役项回落(与 GLM 同构)。
+    const prev = config.claude.models
+    ;(config.claude as any).models = {
+      deepseek: { model: 'deepseek-v4-pro', base_url: 'https://api.deepseek.com/anthropic', auth_token: 'tok', effort: 'xhigh' },
+    }
+    try {
+      expect(normalizeFixedModelSelection('claude', 'claude:deepseek', 'high'))
+        .toEqual({ model: 'claude:deepseek', effort: 'xhigh' })
+    } finally {
+      ;(config.claude as any).models = prev
+    }
+  })
+
   test('resets an unknown/retired Claude model to the Claude default', () => {
-    expect(normalizeFixedModelSelection('claude', 'claude:deepseek', 'high'))
+    expect(normalizeFixedModelSelection('claude', 'claude:retired-legacy', 'high'))
       .toEqual({ model: 'claude:fable', effort: 'max' })
   })
 

@@ -92,6 +92,16 @@ const FIXED_MODEL_CHOICES = [
     description: 'Grok 4.6 · CatCodex Anthropic Messages · 网关兼容 xhigh。',
     effort: GROKCC_TOOL_COMPAT_EFFORT as AgentReasoningEffort,
   },
+  {
+    // DeepSeek 第三方路由:走 config.toml [claude.models.deepseek] 的 base_url +
+    // auth_token(官网 https://api.deepseek.com/anthropic Anthropic 兼容端点)。
+    // 未配置 token 时 picker 仍显示,但选择会被 onModelEffortSelect 拦截。与 GLM 同构。
+    provider: 'claude' as const,
+    model: 'claude:deepseek',
+    displayName: 'Claude · DeepSeek V4 Pro',
+    description: 'DeepSeek V4 Pro 第三方路由 · xhigh。',
+    effort: 'max' as AgentReasoningEffort,
+  },
 ]
 
 /** provider 的默认固定档位(该 provider 的第一个固定项)。归一化未知/退役
@@ -141,9 +151,9 @@ function isPersistedCodexGrok(model: string | null | undefined): boolean {
 
 /** 把持久化的 (provider, model, effort) 归一到当前固定选项集。
  *   - 命中固定项 → 原样保留(强制该项锁死的 effort)。
- *   - legacy/退役 model(如 claude:glm、claude:deepseek)→ 回落到该 provider
- *     的默认固定项(claude→claude:fable,底层同为 claude-fable-5,行为不变,
- *     只是把误导性的 GLM 标签迁移成准确的 Fable 5)。
+ *   - legacy/退役 model(如历史下线的档位)→ 回落到该 provider 的默认固定项
+ *     (claude→claude:fable,底层同为 claude-fable-5)。
+ *   注意:claude:glm / claude:deepseek 现为活跃第三方档位,不是退役项。
  * daemon 重启后 restoreModelSelection 用它,避免旧 map 把 session 带到已
  * 下线的档位或非锁死 effort。 */
 export function normalizeFixedModelSelection(
