@@ -19,7 +19,7 @@ describe('claude provider usage host detection', () => {
 
 describe('claude provider usage parsers', () => {
   test('parses CatCodex unlimited token usage without inventing USD', () => {
-    const snapshot = claudeProviderUsageFromNewApiTokenResponse('Claude Code · Grok 4.5(CatCodex)', {
+    const snapshot = claudeProviderUsageFromNewApiTokenResponse('Claude Code · Grok 4.6(CatCodex)', {
       code: true,
       data: {
         name: 'cc-grok',
@@ -59,7 +59,7 @@ describe('claude provider usage parsers', () => {
   })
 
   test('parses Wuhen / CCSwitch-compatible /v1/usage balance', () => {
-    const snapshot = claudeProviderUsageFromV1Response('Claude Code · Grok 4.5(无痕)', {
+    const snapshot = claudeProviderUsageFromV1Response('Claude Code · Grok 4.6(无痕)', {
       balance: 2544.33,
       remaining: 2544.33,
       unit: 'USD',
@@ -84,10 +84,10 @@ describe('readClaudeProviderUsage routing', () => {
     ;(config.claude as any).models = {
       ...config.claude.models,
       grokcc: {
-        display_name: 'Claude Code · Grok 4.5(CatCodex)',
+        display_name: 'Claude Code · Grok 4.6(CatCodex)',
         base_url: 'https://catcodexapi.com',
         auth_token: 'sk-cat',
-        model: 'grok-4.5',
+        model: 'grok-4.6',
         effort: 'xhigh',
       },
     }
@@ -125,10 +125,10 @@ describe('readClaudeProviderUsage routing', () => {
     ;(config.claude as any).models = {
       ...config.claude.models,
       grok: {
-        display_name: 'Claude Code · Grok 4.5(无痕)',
+        display_name: 'Claude Code · Grok 4.6(无痕)',
         base_url: 'https://api.wuhen-ai.com',
         auth_token: 'sk-wuhen',
-        model: 'grok-4.5',
+        model: 'grok-4.6',
         effort: 'high',
       },
     }
@@ -161,10 +161,10 @@ describe('readClaudeProviderUsage routing', () => {
     ;(config.claude as any).models = {
       ...config.claude.models,
       grok: {
-        display_name: 'Claude Code · Grok 4.5(无痕)',
+        display_name: 'Claude Code · Grok 4.6(无痕)',
         base_url: 'https://api.wuhen-ai.com',
         auth_token: 'sk-wuhen',
-        model: 'grok-4.5',
+        model: 'grok-4.6',
       },
     }
     globalThis.fetch = (async () => new Response('<!doctype html><html></html>', {

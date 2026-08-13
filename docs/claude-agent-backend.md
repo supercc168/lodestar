@@ -18,7 +18,7 @@
 - `model` 命令展示固定档位（现状，见 `src/session-model.ts` 的 `FIXED_MODEL_CHOICES`）：
   - `claude:fable`（Fable 5）/ `claude:opus`（Opus 5）：官方登录档位，直传 `claude-fable-5` / `claude-opus-5`，走用户 Anthropic 登录态，绝不注入 API key，effort 锁 max。
   - `claude:glm`：第三方 API 路由，token 配在 `[claude.models.glm]`，spawn 时注入 `ANTHROPIC_*` env，effort 跟随 config（如 xhigh）；未配 token 时 picker 可见但选择被拦截。
-  - `claude:grok` / `claude:grokcc`：Wuhen / CatCodex 的 Grok Anthropic Messages 路由，统一由 Claude Agent SDK 启动；无痕档锁官方 `high`，CatCodex 档锁已验证的工具兼容 `xhigh`，并都设置 `thinking: disabled` 以关闭 Claude 专属 adaptive 控制。
+  - `claude:grok` / `claude:grokcc`：Wuhen / CatCodex 的 Grok Anthropic Messages 路由，统一由 Claude Agent SDK 启动；无痕档锁官方最高 `xhigh`，CatCodex 档锁网关兼容 `xhigh`，并都设置 `thinking: disabled` 以关闭 Claude 专属 adaptive 控制。
   - `codex`（GPT-5.6 Sol）：Codex app-server 后端，内建档 effort 锁 `max`；`[codex.models.*]` 可提供非 Grok 的第三方 API 档位。
   - （早期的 `claude:default` / `claude:deepseek` 已随二元化 / per-model 路由下线。）
 - 持久化模型选择扩展为 provider-aware，旧数据默认视为 Codex。
@@ -43,19 +43,19 @@ effort     = "xhigh"          # 复刻 GLM-5.2 最高思维;官方登录档位�
 [claude.models.grok]
 base_url   = "https://api.wuhen-ai.com"
 auth_token = "<Wuhen token>"
-model      = "grok-4.5"
-effort     = "high"
+model      = "grok-4.6"
+effort     = "xhigh"
 
 [claude.models.grokcc]
 base_url   = "https://catcodexapi.com" # Claude SDK 使用根地址，不追加 /v1
 auth_token = "<CatCodex token>"
-model      = "grok-4.5"
+model      = "grok-4.6"
 effort     = "xhigh"
 ```
 
 模型路由的真相源是 `config.toml` 的 `[claude.models.*]`(第三方 per-model token 路由):`ClaudeAgentProcess.buildSpawnEnv` 只在 GLM 一类 API 档位 spawn 时注入 `ANTHROPIC_BASE_URL` / `ANTHROPIC_AUTH_TOKEN`,官方 Fable 5 / Opus 登录档位保持干净凭据基线。随后两类档位都会设置 `GSD_RUNTIME=claude`。第一方登录档按飞书当前选定主力注入子 agent alias：选 Fable 5 → fable/opus/sonnet 全为 `claude-fable-5`、haiku=`claude-sonnet-5`；选 Opus 5 → fable/opus/sonnet 全为 `claude-opus-5`、haiku=`claude-sonnet-5`（选 Opus 不注入 Fable，选 Fable 不注入 Opus）；第三方 API 档则把四个 alias 全部锁到当前 profile.model,避免官方 Claude id 泄漏到兼容端点。`[claude.models.*]` 的字段仅认 `display_name / description / model / base_url / auth_token / api_key / route / effort` 以及扁平 `env_<NAME>`；第三方档即使在 config 中分开声明四种 alias,也会在 spawn 边界收敛为当前 model。**别把第三方 env 写进 `~/.claude/settings.json`**:SDK 经 `settingSources:['user']` 会加载它、污染登录档位;`[claude.env]` 仅作可选 escape hatch。
 
-Grok 只属于 Claude backend。[xAI 官方 reasoning 文档](https://docs.x.ai/developers/model-capabilities/text/reasoning)规定 Grok 4.5 effort 只有 `low` / `medium` / `high`，最高且默认是 `high`；直连 xAI Responses API 对应 `reasoning: { "effort": "high" }`。无痕路由按官方 `high` 启动；CatCodex 的 Anthropic 网关在 `high` 下可返回纯文本并忽略工具调用，而 `xhigh + thinking: disabled` 连续完成 raw 强制工具选择及 SDK `tool_use/tool_result`，因此 CatCodex 档位把 `xhigh` 作为网关兼容参数锁定。这不表示 xAI 增加了官方 reasoning 档位。两路的 `thinking: { type: "disabled" }` 都只为避免兼容端点接收 Claude 专属 adaptive-thinking 协议，不关闭 Grok 自身 reasoning。失败仍以原始错误暴露，不静默换模型/provider。任何 `[codex.models.*]` 中真实 model id 为 `grok-*` 的 profile 都不进入 picker/TokenSource，Codex spawn 边界也会直接拒绝；旧 `codex:grok*` 持久选择恢复时迁到同名 Claude 档位。
+Grok 只属于 Claude backend。[xAI 官方 reasoning 文档](https://docs.x.ai/developers/model-capabilities/text/reasoning)规定 Grok 4.6 effort 为 `low` / `medium` / `high`(默认) / `xhigh`——`xhigh` 是 Grok 4.6 新增的官方最高档(4.5 只有 low/medium/high)。无痕路由按官方最高 `xhigh` 启动；CatCodex 的 Anthropic 网关在 `high` 下可返回纯文本并忽略工具调用，而 `xhigh + thinking: disabled` 连续完成 raw 强制工具选择及 SDK `tool_use/tool_result`，因此 CatCodex 档位锁定 `xhigh`(4.6 起与官方档恰好一致)。两路的 `thinking: { type: "disabled" }` 都只为避免兼容端点接收 Claude 专属 adaptive-thinking 协议，不关闭 Grok 自身 reasoning。失败仍以原始错误暴露，不静默换模型/provider。任何 `[codex.models.*]` 中真实 model id 为 `grok-*` 的 profile 都不进入 picker/TokenSource，Codex spawn 边界也会直接拒绝；旧 `codex:grok*` 持久选择恢复时迁到同名 Claude 档位。
 
 可执行文件解析:`resolveClaudeExecutableConfig({ apiRoute })` 默认自动查找 `claude`(`~/.local/npm-global/bin` → `~/.local/bin` → PATH → SDK 自带)。`config.toml` 设 `[claude].bin`(支持 `~`)可显式覆盖,路径不存在时 `sendInitialize` 直接抛错,不静默回退。若配置的是 Unix `reclaude`,Lodestar 不把它直接传给 SDK(直接传会退回 CLI stream-json,丢失 dialog/control 协议),而是给 SDK 提供的 native command 建一个临时 PATH shim,再由 reclaude 注入 proxy/CA 后查找这个 `claude`;日志为 `executable=config-reclaude-sdk-native:<路径>`。**关键:第三方 API 路由(GLM/Grok 等,`route:api`)会强制绕开 `[claude].bin`、使用 SDK 自带 native 入口** —— reclaude 的 gateway 会把注入的 `ANTHROPIC_BASE_URL` 劫持回官方 Anthropic,第三方 model id 在官方 deployment 上不存在。官方登录档位走 reclaude + SDK native shim,第三方走 SDK native 直连端点。
 

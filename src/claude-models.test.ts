@@ -30,13 +30,13 @@ const GLM_FULL = {
 
 const GROK_FULL = {
   grok: {
-    model: 'grok-4.5',
+    model: 'grok-4.6',
     base_url: 'https://api.wuhen-ai.com',
     auth_token: 'grok-token',
     effort: 'xhigh',
   },
   grokcc: {
-    model: 'grok-4.5',
+    model: 'grok-4.6',
     base_url: 'https://catcodexapi.com',
     auth_token: 'grokcc-token',
     effort: 'xhigh',
@@ -138,7 +138,7 @@ describe('Claude Grok API profiles', () => {
 
   test('无痕与 CatCodex 都解析为 Claude API Grok 档位', () => {
     for (const [name, baseUrl, effort] of [
-      ['grok', 'https://api.wuhen-ai.com', 'high'],
+      ['grok', 'https://api.wuhen-ai.com', 'xhigh'],
       ['grokcc', 'https://catcodexapi.com', 'xhigh'],
     ] as const) {
       const model = `claude:${name}`
@@ -152,7 +152,7 @@ describe('Claude Grok API profiles', () => {
       expect(env.CLAUDE_CODE_AUTO_COMPACT_WINDOW).toBe('450000')
       expect(env.CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC).toBe('1')
       expect(env.CLAUDE_CODE_ATTRIBUTION_HEADER).toBe('0')
-      for (const value of Object.values(claudeModelTierEnv(model))) expect(value).toBe('grok-4.5')
+      for (const value of Object.values(claudeModelTierEnv(model))) expect(value).toBe('grok-4.6')
     }
   })
 

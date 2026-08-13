@@ -27,11 +27,11 @@ type DefaultClaudeModelConfig = Required<
 // Fable 5 是 Anthropic 当前最强模型(1M ctx / 128K out),官方 API 路由可用;
 // GLM 等第三方路由不认这个 id,需在 profile 里显式配 model 覆盖。
 export const DEFAULT_CLAUDE_SDK_MODEL = 'claude-fable-5'
-/** xAI 官方为 Grok 4.5 定义的最高 reasoning effort。
- * Claude SDK 的 xhigh 只对指定 Claude 模型原生生效，Grok 应显式使用 high。 */
-export const GROK_OFFICIAL_MAX_EFFORT = 'high' as const
+/** xAI 官方为 Grok 4.6 定义的最高 reasoning effort。
+ * Grok 4.6 在 4.5 的 low/medium/high 之上新增官方 xhigh;无痕路由用官方最高 xhigh。 */
+export const GROK_OFFICIAL_MAX_EFFORT = 'xhigh' as const
 /** CatCodex 的 Anthropic 兼容层只有在 xhigh 下稳定兑现 Claude Code 工具调用。
- * 这是网关兼容参数，不代表 xAI 新增了官方 xhigh reasoning 档位。 */
+ * 该网关 high 下会吞工具调用,故锁 xhigh;Grok 4.6 起 xhigh 也是官方档,两路同值不同理。 */
 export const GROKCC_TOOL_COMPAT_EFFORT = 'xhigh' as const
 
 /** Claude Code 在第三方 Grok Anthropic 路由上的稳定运行基线。档位显式
@@ -69,13 +69,13 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
     // 在 picker 里可见但选择被拦截,提示去 config.toml 设置。
   },
   grok: {
-    display_name: 'Claude Code · Grok 4.5(无痕)',
-    description: 'Grok 4.5 第三方路由 · 无痕 Anthropic Messages。需在 config.toml 配置 token。',
+    display_name: 'Claude Code · Grok 4.6(无痕)',
+    description: 'Grok 4.6 第三方路由 · 无痕 Anthropic Messages。需在 config.toml 配置 token。',
     route: 'api',
   },
   grokcc: {
-    display_name: 'Claude Code · Grok 4.5(CatCodex)',
-    description: 'Grok 4.5 第三方路由 · CatCodex Anthropic Messages。需在 config.toml 配置 token。',
+    display_name: 'Claude Code · Grok 4.6(CatCodex)',
+    description: 'Grok 4.6 第三方路由 · CatCodex Anthropic Messages。需在 config.toml 配置 token。',
     route: 'api',
   },
 }
@@ -248,7 +248,7 @@ export function claudeModelConfigured(model: string | null | undefined): boolean
 
 /** 该档位在 config 里声明的思考强度(仅第三方 API 路由有意义,官方登录档位
  * 不配)。非法/未配返回 undefined,由调用方回落到 FIXED_MODEL_CHOICES 的锁死
- * 值。无痕 Grok 使用 xAI 官方 high；CatCodex 因网关工具兼容要求锁 xhigh。 */
+ * 值。无痕 Grok 用 xAI 官方最高 xhigh(Grok 4.6 新增)；CatCodex 因网关工具兼容同样锁 xhigh。 */
 export function claudeModelEffort(model: string | null | undefined): ClaudeReasoningEffort | undefined {
   const profile = claudeModelProfile(model)
   if (!profile || profile.route !== 'api') return undefined

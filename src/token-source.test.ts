@@ -171,14 +171,14 @@ describe('token-source Codex login vs api', () => {
         effort: 'max',
       },
       grok: {
-        display_name: 'Codex · Grok 4.5 · 无痕',
+        display_name: 'Codex · Grok 4.6 · 无痕',
         description: 'test',
-        model: 'grok-4.5',
+        model: 'grok-4.6',
         base_url: 'https://wuhen.example',
         wire_api: 'responses',
         api_key: 'grok-key',
         route: 'api',
-        effort: 'xhigh', // Codex Grok remains blocked; Claude normalizes Grok to official high.
+        effort: 'xhigh', // Codex Grok remains blocked; Claude normalizes Grok to official xhigh.
       },
     }
   })
@@ -224,8 +224,8 @@ describe('token-source Claude Grok channels', () => {
   beforeEach(() => {
     prevModels = config.claude.models
     ;(config.claude as any).models = {
-      grok: { model: 'grok-4.5', base_url: 'https://api.wuhen-ai.com', auth_token: 'grok-token', effort: 'xhigh' },
-      grokcc: { model: 'grok-4.5', base_url: 'https://catcodexapi.com', auth_token: 'grokcc-token', effort: 'xhigh' },
+      grok: { model: 'grok-4.6', base_url: 'https://api.wuhen-ai.com', auth_token: 'grok-token', effort: 'xhigh' },
+      grokcc: { model: 'grok-4.6', base_url: 'https://catcodexapi.com', auth_token: 'grokcc-token', effort: 'xhigh' },
     }
   })
 
@@ -242,7 +242,7 @@ describe('token-source Claude Grok channels', () => {
       expect(source.provider).toBe('claude')
       expect(source.kind).toBe('api')
       expect(source.enabled()).toBe(true)
-      expect(source.resolveSpawnModel()).toBe('grok-4.5')
+      expect(source.resolveSpawnModel()).toBe('grok-4.6')
       const env = source.spawnEnv({})
       expect(env.ANTHROPIC_BASE_URL).toBe(baseUrl)
       expect(env.ANTHROPIC_AUTH_TOKEN).toBe(token)

@@ -33,7 +33,7 @@ mock.module('./config', () => ({
           base_url: 'https://api.wuhen-ai.com',
           wire_api: 'responses',
           api_key: 'sk-grok',
-          model: 'grok-4.5',
+          model: 'grok-4.6',
           effort: 'xhigh',
         },
       },
@@ -173,7 +173,7 @@ describe('config-driven lookups', () => {
   test('Grok slots are recognized but rejected at the Codex spawn boundary', () => {
     expect(codexModelIsGrok('codex:grok')).toBe(true)
     expect(codexModelIsGrok('codex:grokcc')).toBe(true)
-    expect(codexModelIsGrok('grok-4.5')).toBe(true)
+    expect(codexModelIsGrok('grok-4.6')).toBe(true)
     expect(() => codexSpawnOverrides('codex:grok')).toThrow('只允许通过 [claude.models.*]')
   })
   test('codexModelChoices lists non-Grok api slots only (incl unconfigured)', () => {

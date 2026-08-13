@@ -7228,12 +7228,12 @@ describe('Grok routes through Claude', () => {
     const prevClaude = config.claude.models
     const prevCodex = config.codex.models
     ;(config.claude as any).models = {
-      grok: { model: 'grok-4.5', base_url: 'https://api.wuhen-ai.com', auth_token: 'w', effort: 'xhigh' },
-      grokcc: { model: 'grok-4.5', base_url: 'https://catcodexapi.com', auth_token: 'c', effort: 'xhigh' },
+      grok: { model: 'grok-4.6', base_url: 'https://api.wuhen-ai.com', auth_token: 'w', effort: 'xhigh' },
+      grokcc: { model: 'grok-4.6', base_url: 'https://catcodexapi.com', auth_token: 'c', effort: 'xhigh' },
     }
     ;(config.codex as any).models = {
       grok: {
-        model: 'grok-4.5',
+        model: 'grok-4.6',
         base_url: 'https://api.wuhen-ai.com',
         wire_api: 'responses',
         api_key: 't',
@@ -7242,7 +7242,7 @@ describe('Grok routes through Claude', () => {
     }
     try {
       for (const name of ['grok', 'grokcc']) {
-        const effort = name === 'grokcc' ? 'xhigh' : 'high'
+        const effort = 'xhigh'
         expect(normalizePersistedModelSelection('codex', `codex:${name}`, 'max')).toEqual({
           provider: 'claude',
           model: `claude:${name}`,
@@ -7265,7 +7265,7 @@ describe('Grok routes through Claude', () => {
     const prevCodex = config.codex.models
     ;(config.claude as any).models = {}
     ;(config.codex as any).models = {
-      grok: { model: 'grok-4.5', base_url: 'https://api.wuhen-ai.com', api_key: 't' },
+      grok: { model: 'grok-4.6', base_url: 'https://api.wuhen-ai.com', api_key: 't' },
     }
     try {
       expect(normalizePersistedModelSelection('codex', 'codex:grok', 'max')).toEqual({
@@ -7313,12 +7313,12 @@ describe('configuredDefaultSelection ([codex] api 档位)', () => {
     const prevModels = config.codex.models
     const prevDefault = config.claude.defaultModel
     ;(config.claude as any).models = {
-      grok: { model: 'grok-4.5', base_url: 'https://api.wuhen-ai.com', auth_token: 'w', effort: 'xhigh' },
-      grokcc: { model: 'grok-4.5', base_url: 'https://catcodexapi.com', auth_token: 'c', effort: 'xhigh' },
+      grok: { model: 'grok-4.6', base_url: 'https://api.wuhen-ai.com', auth_token: 'w', effort: 'xhigh' },
+      grokcc: { model: 'grok-4.6', base_url: 'https://catcodexapi.com', auth_token: 'c', effort: 'xhigh' },
     }
     ;(config.codex as any).models = {
       grok: {
-        model: 'grok-4.5',
+        model: 'grok-4.6',
         base_url: 'https://api.wuhen-ai.com',
         wire_api: 'responses',
         api_key: 't',
@@ -7330,7 +7330,7 @@ describe('configuredDefaultSelection ([codex] api 档位)', () => {
       expect(configuredDefaultSelection()).toEqual({
         provider: 'claude',
         model: 'claude:grok',
-        effort: 'high',
+        effort: 'xhigh',
       })
       ;(config.claude as any).defaultModel = 'grokcc'
       expect(configuredDefaultSelection()).toEqual({
@@ -7677,18 +7677,18 @@ describe('Session provider switching', () => {
     const prevClaude = config.claude.models
     const prevCodex = config.codex.models
     ;(config.claude as any).models = {
-      grok: { model: 'grok-4.5', base_url: 'https://api.wuhen-ai.com', auth_token: 'w', effort: 'xhigh' },
-      grokcc: { model: 'grok-4.5', base_url: 'https://catcodexapi.com', auth_token: 'c', effort: 'xhigh' },
+      grok: { model: 'grok-4.6', base_url: 'https://api.wuhen-ai.com', auth_token: 'w', effort: 'xhigh' },
+      grokcc: { model: 'grok-4.6', base_url: 'https://catcodexapi.com', auth_token: 'c', effort: 'xhigh' },
     }
     ;(config.codex as any).models = {
       grok: {
-        display_name: 'Codex · Grok 4.5 · 无痕',
-        description: 'Grok 4.5 · Codex Responses 工具链。',
-        model: 'grok-4.5',
+        display_name: 'Codex · Grok 4.6 · 无痕',
+        description: 'Grok 4.6 · Codex Responses 工具链。',
+        model: 'grok-4.6',
         base_url: 'https://api.wuhen-ai.com',
         wire_api: 'responses',
         api_key: 'grok-token',
-        effort: 'xhigh', // Legacy Codex route is hidden; Claude normalizes Grok to official high.
+        effort: 'xhigh', // Legacy Codex route is hidden; Claude normalizes Grok to official xhigh.
       },
     }
     try {
@@ -7708,11 +7708,11 @@ describe('Session provider switching', () => {
       expect(glm.description).toContain('[claude.models.glm]')
       expect(choices.some((c: any) => c.provider === 'codex' && c.model.includes('grok'))).toBe(false)
       expect(choices.find((c: any) => c.model === 'claude:grok')).toMatchObject({
-        provider: 'claude', displayName: 'Claude · Grok 4.5 · 无痕',
-        efforts: [{ effort: 'high' }],
+        provider: 'claude', displayName: 'Claude · Grok 4.6 · 无痕',
+        efforts: [{ effort: 'xhigh' }],
       })
       expect(choices.find((c: any) => c.model === 'claude:grokcc')).toMatchObject({
-        provider: 'claude', displayName: 'Claude · Grok 4.5 · CatCodex',
+        provider: 'claude', displayName: 'Claude · Grok 4.6 · CatCodex',
         efforts: [{ effort: 'xhigh' }],
       })
     } finally {
@@ -7743,7 +7743,7 @@ describe('Session provider switching', () => {
     const prev = config.codex.models
     ;(config.codex as any).models = {
       grok: {
-        model: 'grok-4.5',
+        model: 'grok-4.6',
         base_url: 'https://api.wuhen-ai.com',
         wire_api: 'responses',
         api_key: 't',
@@ -7765,12 +7765,12 @@ describe('Session provider switching', () => {
   test('飞书点击两个 Grok 档位都持久为 provider=claude', async () => {
     const prev = config.claude.models
     ;(config.claude as any).models = {
-      grok: { model: 'grok-4.5', base_url: 'https://api.wuhen-ai.com', auth_token: 'w', effort: 'xhigh' },
-      grokcc: { model: 'grok-4.5', base_url: 'https://catcodexapi.com', auth_token: 'c', effort: 'xhigh' },
+      grok: { model: 'grok-4.6', base_url: 'https://api.wuhen-ai.com', auth_token: 'w', effort: 'xhigh' },
+      grokcc: { model: 'grok-4.6', base_url: 'https://catcodexapi.com', auth_token: 'c', effort: 'xhigh' },
     }
     try {
       for (const model of ['claude:grok', 'claude:grokcc']) {
-        const effort = model === 'claude:grokcc' ? 'xhigh' : 'high'
+        const effort = 'xhigh'
         const session = new Session('probe', 'chat_id') as any
         session.selectedProvider = 'claude'
         session.selectedModel = 'claude:fable'
@@ -7841,7 +7841,7 @@ describe('Session provider switching', () => {
     ;(config.claude as any).models = {}
     try {
       for (const model of ['claude:grok', 'claude:grokcc']) {
-        const effort = model === 'claude:grokcc' ? 'xhigh' : 'high'
+        const effort = 'xhigh'
         const session = new Session('probe', 'chat_id') as any
         const proc = new FakeAgentProc('claude', 'claude-session-1')
         session.proc = proc

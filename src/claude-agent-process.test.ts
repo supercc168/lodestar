@@ -132,12 +132,12 @@ describe('Claude model profiles', () => {
   test('Grok uses route-specific compatible effort and disables Claude adaptive thinking', () => {
     const prev = config.claude.models
     ;(config.claude as any).models = {
-      grok: { model: 'grok-4.5', base_url: 'https://grok.example', auth_token: 't' },
-      grokcc: { model: 'grok-4.5', base_url: 'https://catcodexapi.com', auth_token: 't' },
+      grok: { model: 'grok-4.6', base_url: 'https://grok.example', auth_token: 't' },
+      grokcc: { model: 'grok-4.6', base_url: 'https://catcodexapi.com', auth_token: 't' },
     }
     try {
       expect(claudeSdkReasoningOptions('claude:grok', 'max')).toEqual({
-        effort: 'high',
+        effort: 'xhigh',
         thinking: { type: 'disabled' },
       })
       expect(claudeSdkReasoningOptions('claude:grokcc', 'max')).toEqual({

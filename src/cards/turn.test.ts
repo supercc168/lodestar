@@ -432,7 +432,7 @@ describe('main conversation card rendering', () => {
       usageSource: 'provider',
       providerUsage: {
         state: 'ok',
-        providerName: 'Claude Code · Grok 4.5(CatCodex)',
+        providerName: 'Claude Code · Grok 4.6(CatCodex)',
         tokenName: 'cc-grok',
         unlimited: true,
         totalUsed: 390_493_193,
@@ -455,7 +455,7 @@ describe('main conversation card rendering', () => {
       usageSource: 'provider',
       providerUsage: {
         state: 'ok',
-        providerName: 'Claude Code · Grok 4.5(无痕)',
+        providerName: 'Claude Code · Grok 4.6(无痕)',
         planName: '钱包余额',
         unlimited: false,
         remaining: 2544.33,
