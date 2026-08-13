@@ -2,8 +2,10 @@ import { describe, expect, test } from 'bun:test'
 
 import { config } from './config'
 import {
+  claudeProviderUsageFromDeepSeekResponse,
   claudeProviderUsageFromNewApiTokenResponse,
   claudeProviderUsageFromV1Response,
+  isDeepSeekUsageHost,
   isNewApiUsageHost,
   readClaudeProviderUsage,
 } from './claude-provider-usage'
@@ -14,6 +16,12 @@ describe('claude provider usage host detection', () => {
     expect(isNewApiUsageHost('https://catcodexapi.com/v1')).toBe(true)
     expect(isNewApiUsageHost('https://api.newapi.pro')).toBe(true)
     expect(isNewApiUsageHost('https://api.wuhen-ai.com')).toBe(false)
+  })
+
+  test('recognizes DeepSeek host for /user/balance', () => {
+    expect(isDeepSeekUsageHost('https://api.deepseek.com/anthropic')).toBe(true)
+    expect(isDeepSeekUsageHost('https://api.deepseek.com')).toBe(true)
+    expect(isDeepSeekUsageHost('https://api.wuhen-ai.com')).toBe(false)
   })
 })
 
@@ -73,6 +81,26 @@ describe('claude provider usage parsers', () => {
     expect(snapshot.unit).toBe('USD')
     expect(snapshot.planName).toBe('钱包余额')
     expect(snapshot.isValid).toBe(true)
+  })
+
+  test('parses DeepSeek /user/balance (CNY 余额)', () => {
+    const snapshot = claudeProviderUsageFromDeepSeekResponse('Claude · DeepSeek V4 Pro', {
+      is_available: true,
+      balance_infos: [
+        { currency: 'CNY', total_balance: '99.99', granted_balance: '0.00', topped_up_balance: '99.99' },
+      ],
+    })
+    expect(snapshot.state).toBe('ok')
+    if (snapshot.state !== 'ok') throw new Error('expected ok')
+    expect(snapshot.remaining).toBe('99.99')
+    expect(snapshot.unit).toBe('CNY')
+    expect(snapshot.isValid).toBe(true)
+    expect(snapshot.unlimited).toBe(false)
+  })
+
+  test('DeepSeek /user/balance unavailable when balance_infos missing', () => {
+    const snapshot = claudeProviderUsageFromDeepSeekResponse('DeepSeek', { is_available: true, balance_infos: [] })
+    expect(snapshot.state).toBe('unavailable')
   })
 })
 
@@ -181,6 +209,42 @@ describe('readClaudeProviderUsage routing', () => {
     } finally {
       globalThis.fetch = prevFetch
       ;(config.claude as any).models.grok = prev
+    }
+  })
+
+  test('DeepSeek profile hits /user/balance (strips /anthropic)', async () => {
+    const prev = config.claude.models.deepseek
+    const prevFetch = globalThis.fetch
+    const urls: string[] = []
+    ;(config.claude as any).models = {
+      ...config.claude.models,
+      deepseek: {
+        display_name: 'Claude · DeepSeek V4 Pro',
+        base_url: 'https://api.deepseek.com/anthropic',
+        auth_token: 'sk-ds',
+        model: 'deepseek-v4-pro',
+        effort: 'max',
+      },
+    }
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      urls.push(String(input))
+      expect(init?.headers && (init.headers as any).authorization).toBe('Bearer sk-ds')
+      return new Response(JSON.stringify({
+        is_available: true,
+        balance_infos: [{ currency: 'CNY', total_balance: '99.99', granted_balance: '0.00', topped_up_balance: '99.99' }],
+      }), { status: 200, headers: { 'content-type': 'application/json' } })
+    }) as typeof fetch
+
+    try {
+      const snapshot = await readClaudeProviderUsage('claude:deepseek')
+      expect(urls[0]).toBe('https://api.deepseek.com/user/balance')
+      expect(snapshot.state).toBe('ok')
+      if (snapshot.state !== 'ok') throw new Error('expected ok')
+      expect(snapshot.remaining).toBe('99.99')
+      expect(snapshot.unit).toBe('CNY')
+    } finally {
+      globalThis.fetch = prevFetch
+      ;(config.claude as any).models.deepseek = prev
     }
   })
 })

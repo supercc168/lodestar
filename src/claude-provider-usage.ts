@@ -4,11 +4,13 @@
  * 与 spawn 同源：凭据取自 config.toml `[claude.models.<slug>]`（经
  * claudeModelProfile），不读进程环境，避免被其它会话残留污染。
  *
- * 目前识别两类网关：
+ * 目前识别三类网关：
  *   1. CatCodex / New API：GET {root}/api/usage/token
  *      → unlimited_quota / total_used / name
  *   2. CCSwitch 兼容余额（无痕等）：GET {root}/v1/usage
  *      → remaining / balance / unit / isValid / planName
+ *   3. DeepSeek 官网：GET {root without /anthropic}/user/balance
+ *      → is_available / balance_infos[].total_balance / currency
  *
  * 失败可见 (no_fallbacks)：无凭据 / 接口不存在 / 鉴权失败 / 非 JSON /
  * 限流 / 网络各自显式 MISS，绝不把 quota 单位换算成臆测美元。
@@ -69,7 +71,22 @@ export function isNewApiUsageHost(baseUrl: string): boolean {
   }
 }
 
-function providerUsageEndpoint(baseUrl: string): { kind: 'newapi_token' | 'v1_usage'; url: string } {
+/** DeepSeek 官网 host(api.deepseek.com):走官方 /user/balance 余额接口。 */
+export function isDeepSeekUsageHost(baseUrl: string): boolean {
+  try {
+    return new URL(baseUrl).hostname.toLowerCase().includes('deepseek')
+  } catch {
+    return /deepseek/i.test(baseUrl)
+  }
+}
+
+function providerUsageEndpoint(baseUrl: string): { kind: 'newapi_token' | 'v1_usage' | 'deepseek_balance'; url: string } {
+  if (isDeepSeekUsageHost(baseUrl)) {
+    // base_url 形如 https://api.deepseek.com/anthropic —— 去掉 /anthropic(与 /v1)
+    // 后缀,拼官方余额端点 /user/balance(该接口不带 /anthropic 前缀)。
+    const root = baseUrl.trim().replace(/\/+$/, '').replace(/\/(?:anthropic|v1)$/i, '')
+    return { kind: 'deepseek_balance', url: `${root}/user/balance` }
+  }
   const root = rootFromBaseUrl(baseUrl)
   if (isNewApiUsageHost(baseUrl)) {
     return { kind: 'newapi_token', url: `${root}/api/usage/token` }
@@ -148,8 +165,29 @@ function snapshotFromNewApiToken(providerName: string, response: any): ClaudePro
   return ok
 }
 
+/** DeepSeek 官网 /user/balance 响应 → 余额快照。
+ * 响应形如 { is_available, balance_infos:[{currency, total_balance,
+ * granted_balance, topped_up_balance}] }(currency 一般 CNY)。 */
+function snapshotFromDeepSeekBalance(providerName: string, response: any): ClaudeProviderUsageSnapshot {
+  const infos = Array.isArray(response?.balance_infos) ? response.balance_infos : []
+  const info = infos[0]
+  if (!info || info.total_balance === undefined || info.total_balance === null) {
+    return { state: 'unavailable', providerName, reason: '余额接口未返回 balance_infos' }
+  }
+  const currency = typeof info.currency === 'string' && info.currency ? info.currency : undefined
+  return {
+    state: 'ok',
+    providerName,
+    unlimited: false,
+    remaining: typeof info.total_balance === 'number' ? info.total_balance : String(info.total_balance),
+    unit: currency,
+    isValid: response?.is_available !== false,
+    fetchedAt: Date.now(),
+  }
+}
+
 function snapshotFromBody(
-  kind: 'newapi_token' | 'v1_usage',
+  kind: 'newapi_token' | 'v1_usage' | 'deepseek_balance',
   providerName: string,
   body: string,
   contentType: string | null,
@@ -168,9 +206,9 @@ function snapshotFromBody(
   }
   try {
     const json = JSON.parse(text)
-    return kind === 'newapi_token'
-      ? snapshotFromNewApiToken(providerName, json)
-      : snapshotFromV1Usage(providerName, json)
+    if (kind === 'newapi_token') return snapshotFromNewApiToken(providerName, json)
+    if (kind === 'deepseek_balance') return snapshotFromDeepSeekBalance(providerName, json)
+    return snapshotFromV1Usage(providerName, json)
   } catch {
     return {
       state: 'unavailable',
@@ -216,7 +254,11 @@ async function fetchClaudeProviderUsage(model: string): Promise<ClaudeProviderUs
       return {
         state: 'unavailable',
         providerName,
-        reason: kind === 'newapi_token' ? '渠道未提供 /api/usage/token' : '渠道未提供 /v1/usage',
+        reason: kind === 'newapi_token'
+          ? '渠道未提供 /api/usage/token'
+          : kind === 'deepseek_balance'
+            ? '渠道未提供 /user/balance'
+            : '渠道未提供 /v1/usage',
       }
     }
     if (!res.ok) {
@@ -242,6 +284,13 @@ export function claudeProviderUsageFromNewApiTokenResponse(
   response: any,
 ): ClaudeProviderUsageSnapshot {
   return snapshotFromNewApiToken(providerName, response)
+}
+
+export function claudeProviderUsageFromDeepSeekResponse(
+  providerName: string,
+  response: any,
+): ClaudeProviderUsageSnapshot {
+  return snapshotFromDeepSeekBalance(providerName, response)
 }
 
 export async function readClaudeProviderUsage(model: string): Promise<ClaudeProviderUsageSnapshot> {

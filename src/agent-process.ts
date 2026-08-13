@@ -80,6 +80,8 @@ export function usageSourceForAgent(
   if (/^claude:glm(?:$|[-_])/i.test(m)) return 'glm'
   // grok / grokcc / grok-*：Claude-only 第三方 Grok 路由，有独立余额接口。
   if (/^claude:grok/i.test(m)) return 'provider'
+  // deepseek：官网 Anthropic 兼容端点,走官方 /user/balance 余额接口。
+  if (/^claude:deepseek/i.test(m)) return 'provider'
   return 'not_applicable'
 }
 
