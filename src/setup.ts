@@ -10,7 +10,7 @@
  *      特别提醒: 受 Claude 官方限制, Claude 订阅 (Pro/Max OAuth 登录)
  *      不支持本项目; 必须走 API 方式 —— GLM Coding Plan 或 Anthropic API key。
  *   2. GLM Coding Plan API key (推荐, 可选) —— 给了就写进 config.toml 的
- *      [claude.models.glm] 档位 (model=GLM-5.2[1m] 1M context, effort=xhigh)
+ *      [claude.models.glm] 档位 (model=GLM-5.3 1M context, effort=max)
  *      并设为 [claude] default_model; 不给就用 Anthropic 登录态跑
  *      Fable 5 / Opus。同一歩末尾可选顺带配置 Codex。
  *   3. Feishu 自建应用 —— 打开 https://open.feishu.cn/app, 列出每个
@@ -280,7 +280,7 @@ export async function runSetup(): Promise<void> {
 
   // ── Step 2/4 ──────────────────────────────────────────────────
   step(2, 4, 'GLM Coding Plan (推荐, 可选)')
-  console.log('GLM Coding Plan 给 Claude Code 接 GLM-5.2 (开放 1M token 上下文, 中文友好)。')
+  console.log('GLM Coding Plan 给 Claude Code 接 GLM-5.3 (开放 1M token 上下文, 中文友好)。')
   console.log('订阅后在智谱开放平台拿一个 API key, 粘到下面 —— 向导写进 config.toml 的')
   console.log(`${C.bold}[claude.models.glm]${C.reset} 档位并设为默认; 群里发 model 可在 Fable 5 / Opus / GLM 间切换。`)
   console.log(`  ${C.dim}拿 key: https://open.bigmodel.cn → 控制台 → API Keys${C.reset}`)
@@ -289,7 +289,7 @@ export async function runSetup(): Promise<void> {
 
   const glmKey = await ask('GLM API key (直接回车跳过)', {})
   if (glmKey) {
-    console.log(`${C.green}✓ 已记录 GLM key${C.reset} ${C.dim}(稍后写进 config.toml 的 [claude.models.glm]: model=GLM-5.2[1m] · effort=xhigh · 设为默认档位)${C.reset}`)
+    console.log(`${C.green}✓ 已记录 GLM key${C.reset} ${C.dim}(稍后写进 config.toml 的 [claude.models.glm]: model=GLM-5.3 · effort=max · 设为默认档位)${C.reset}`)
   } else {
     console.log(`${C.dim}已跳过 GLM, 用 Anthropic 登录态跑 Fable 5 / Opus。${C.reset}`)
   }
@@ -428,8 +428,8 @@ export async function runSetup(): Promise<void> {
   // GLM 走 [claude.models.glm] 档位路由(第三方 per-model token),SDK spawn 时
   // 注入 ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN,且只作用于 GLM 档位 —— 官方
   // Fable 5 / Opus 登录档位保持干净、绝不注入 key。[claude] default_model 让新群
-  // 首条消息直接走 GLM,不必先手动切一次。model=GLM-5.2[1m] 开放 1M 上下文,
-  // effort=xhigh 复刻 GLM-5.2 最高思维。
+  // 首条消息直接走 GLM,不必先手动切一次。model=GLM-5.3 开放 1M 上下文,
+  // effort=max 复刻 GLM-5.3 最高思维(实测 32K/49K thinking budget 兑现)。
   if (glmKey) {
     toml.push(
       '[claude]',
@@ -438,8 +438,8 @@ export async function runSetup(): Promise<void> {
       '[claude.models.glm]',
       'base_url = "https://open.bigmodel.cn/api/anthropic"',
       `auth_token = "${escapeTomlString(glmKey)}"`,
-      'model = "GLM-5.2[1m]"',
-      'effort = "xhigh"',
+      'model = "GLM-5.3"',
+      'effort = "max"',
       '',
     )
   }

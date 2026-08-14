@@ -248,7 +248,7 @@ projects_root = "~/"     # 项目根目录,可选,默认主目录
 | --- | --- |
 | **Claude · Fable 5** | 走你的 Anthropic 登录态 |
 | **Claude · Opus 5** | 走你的 Anthropic 登录态,能力最强 |
-| **Claude · GLM** | GLM-5.2,**1M 超长上下文、中文友好**(需配 GLM key) |
+| **Claude · GLM** | GLM-5.3,**1M 超长上下文、中文友好**(需配 GLM key) |
 | **Claude · Grok 4.6 · 无痕** | Wuhen Anthropic Messages 路由(需配置 token),由 Claude Agent SDK 以官方最高 `xhigh` 调用 |
 | **Claude · Grok 4.6 · CatCodex** | CatCodex Anthropic Messages 路由(需配置 token),由 Claude Agent SDK 以网关兼容 `xhigh` 调用 |
 | **Codex · GPT-5.6 Sol** | OpenAI Codex(需登录 ChatGPT),`max` 推理强度 |
@@ -302,8 +302,8 @@ default_model = "glm"          # 新群默认走 GLM(不写则默认 Fable 5)
 [claude.models.glm]
 base_url   = "https://open.bigmodel.cn/api/anthropic"
 auth_token = "<你的 GLM API key>"
-model      = "GLM-5.2[1m]"      # [1m] 开满 1M 上下文
-effort     = "xhigh"           # GLM-5.2 最高思维强度
+model      = "GLM-5.3"          # 1M 上下文(由 lodestar 注入 CLAUDE_CODE_MAX_CONTEXT_TOKENS=1000000)
+effort     = "max"              # GLM-5.3 最高思维强度
 ```
 
 ### 接入 reclaude(可选,自定义 Claude 可执行文件)

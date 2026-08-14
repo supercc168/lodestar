@@ -44,7 +44,7 @@ launchd (gui/$UID)
 | LaunchAgent | `~/Library/LaunchAgents/io.picoclaw.{gateway,launcher}.plist` |
 | 旧下载目录（勿再直接跑） | `~/Downloads/picoclaw_Darwin_arm64/` |
 | 实测版本 | PicoClaw **0.2.9**（git `2992eccb`，build 2026-05-29） |
-| 默认模型（本机 config） | `glm-5.2` |
+| 默认模型（本机 config） | `glm-5.3` |
 | 启用通道（本机 config） | `dingtalk` + `pico`（feishu 等未开） |
 
 签名：`Developer ID Application: Sipeed Co., Ltd (3WJC9H6YLM)`。

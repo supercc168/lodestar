@@ -75,7 +75,7 @@ const FIXED_MODEL_CHOICES = [
     provider: 'claude' as const,
     model: 'claude:glm',
     displayName: 'Claude · GLM',
-    description: 'GLM 第三方路由 · max。',
+    description: 'GLM-5.3 第三方路由 · max 最高思维 · 1M 上下文。',
     effort: 'max' as AgentReasoningEffort,
   },
   {

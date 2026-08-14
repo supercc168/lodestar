@@ -7153,7 +7153,7 @@ describe('configuredDefaultSelection ([claude] default_model)', () => {
     const prevModels = config.claude.models
     const prevDefault = config.claude.defaultModel
     ;(config.claude as any).models = {
-      glm: { model: 'glm-5.2', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
+      glm: { model: 'glm-5.3', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
     }
     ;(config.claude as any).defaultModel = 'glm'
     try {
@@ -7167,7 +7167,7 @@ describe('configuredDefaultSelection ([claude] default_model)', () => {
   test('接受完整形式 "claude:glm";effort 未配则回落固定 max', () => {
     const prevModels = config.claude.models
     const prevDefault = config.claude.defaultModel
-    ;(config.claude as any).models = { glm: { model: 'glm-5.2', base_url: 'https://x', auth_token: 't' } }
+    ;(config.claude as any).models = { glm: { model: 'glm-5.3', base_url: 'https://x', auth_token: 't' } }
     ;(config.claude as any).defaultModel = 'claude:glm'
     try {
       expect(configuredDefaultSelection()).toEqual({ provider: 'claude', model: 'claude:glm', effort: 'max' })
@@ -7351,7 +7351,7 @@ describe('新 session 默认档位来自 [claude] default_model', () => {
     const prevModels = config.claude.models
     const prevDefault = config.claude.defaultModel
     ;(config.claude as any).models = {
-      glm: { model: 'glm-5.2', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
+      glm: { model: 'glm-5.3', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
     }
     ;(config.claude as any).defaultModel = 'glm'
     try {
@@ -7739,7 +7739,7 @@ describe('Session provider switching', () => {
   test('GLM 档位的 effort 跟随 config(xhigh)而非写死 max;官方档位仍 max', () => {
     const prev = config.claude.models
     ;(config.claude as any).models = {
-      glm: { model: 'glm-5.2', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
+      glm: { model: 'glm-5.3', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
     }
     try {
       const session = new Session('probe', 'chat_id') as any
@@ -7807,7 +7807,7 @@ describe('Session provider switching', () => {
   test('配好 xhigh 的 GLM:选 xhigh 通过,选 max 因不匹配被拒', async () => {
     const prev = config.claude.models
     ;(config.claude as any).models = {
-      glm: { model: 'glm-5.2', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
+      glm: { model: 'glm-5.3', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
     }
     try {
       const mk = () => {

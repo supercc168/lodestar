@@ -8,7 +8,7 @@
 - Claude Agent SDK 的推荐长驻模式是 `query({ prompt: AsyncIterable<SDKUserMessage> })`，它会启动一个 Claude Code SDK transport 进程，并通过 `--input-format stream-json` / `--output-format stream-json` 做双向流。
 - 本机 SDK 长驻探针已验证：同一个 `query()` 后端可连续处理多轮 user message，并保持同一个 `session_id`。
 - SDK 在没有第一条用户输入时不会发 `init`；收到第一条 input 后才返回 `system/init`。
-- 本机 Claude Code 已可用，当前上游由用户侧配置路由到 GLM-5.2。SDK 需要 `settingSources: ['user']` 才会读取用户配置。
+- 本机 Claude Code 已可用，当前上游由用户侧配置路由到 GLM-5.3。SDK 需要 `settingSources: ['user']` 才会读取用户配置。
 
 ## Design
 新增一个 Lodestar 内部后端接口，让 `Session` 不直接依赖 `CodexProcess` 的具体类：
@@ -38,8 +38,8 @@ default_model = "glm"
 [claude.models.glm]
 base_url   = "https://open.bigmodel.cn/api/anthropic"
 auth_token = "<GLM API key>"
-model      = "glm-5.2[1m]"   # 直连智谱;[1m] 开满 1M 上下文
-effort     = "xhigh"          # 复刻 GLM-5.2 最高思维;官方登录档位锁 max
+model      = "glm-5.3"      # 直连智谱,1M 上下文(lodestar 注入 MAX_CONTEXT_TOKENS)
+effort     = "max"            # GLM-5.3 最高思维;官方登录档位锁 max
 
 [claude.models.grok]
 base_url   = "https://api.wuhen-ai.com"

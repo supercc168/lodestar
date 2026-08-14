@@ -133,7 +133,7 @@ type ClaudePathLookup = {
   configuredBin?: string | null
   /** 第三方 API 路由(GLM 一类)必须绕开 [claude].bin 包装器(如 reclaude):
    * reclaude 的 gateway 会把注入的 ANTHROPIC_BASE_URL 劫持回官方 Anthropic,
-   * 第三方 model id(如 glm-5.2)会被官方 deployment 判为"模型不存在"而客户端
+   * 第三方 model id(如 glm-5.3)会被官方 deployment 判为"模型不存在"而客户端
    * 直接报错。true 时忽略 configuredBin,解析裸 claude 二进制直连第三方端点;
    * 官方登录档位(Fable 5/Opus)仍走包装器以回收登录态额度。 */
   apiRoute?: boolean
@@ -257,7 +257,7 @@ export function assertClaudeCodeAvailable(): void {
 export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): ClaudeExecutableConfig {
   const platform = lookup.platform ?? process.platform
   // 第三方 API 路由(GLM 一类)强制绕开包装器 bin(见 ClaudePathLookup.apiRoute):
-  // reclaude 的 gateway 会劫持 ANTHROPIC_BASE_URL 打回官方 Anthropic,glm-5.2
+  // reclaude 的 gateway 会劫持 ANTHROPIC_BASE_URL 打回官方 Anthropic,glm-5.3
   // 这类第三方 id 会被判为"模型不存在"。其它档位读 config.claude.bin
   // (显式 configuredBin 覆盖,供测试隔离 config)。
   const configured = lookup.apiRoute
@@ -396,7 +396,7 @@ export function readLastCallUsageFromTranscript(path: string): CodexUsage | null
 
 /** SDK contextWindow 历史 max,按 claude 路由 key 在 daemon 进程内全局共享。
  * context window 是模型路由属性(与 session 无关):任一 session 探测到的真实
- * 窗口(GLM-5.2[1m] → 1M)锁定后,同路由所有 session 立即用作分母,不再各自
+ * 窗口(GLM-5.3 → 1M,由 CLAUDE_CODE_MAX_CONTEXT_TOKENS 注入)锁定后,同路由所有 session 立即用作分母,不再各自
  * 首轮回落默认 200K。daemon 重启后重新探测(不持久化,重启不常发生)。 */
 const contextWindowMaxByRoute = new Map<string, number>()
 
@@ -1509,7 +1509,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
     // 分母 = 该路由的 SDK contextWindow 历史 max(daemon 全局,按路由 key 共享)。
     // context window 是模型路由属性,与 session 无关:任一 session 探测到的真实
-    // 窗口(GLM-5.2[1m] → 1M)全局锁定,所有 session 立即用作分母,不再各自首轮
+    // 窗口(GLM-5.3 → 1M,由 CLAUDE_CODE_MAX_CONTEXT_TOKENS 注入)全局锁定,所有 session 立即用作分母,不再各自首轮
     // 回落默认 200K。取 max 且单调不降,避免忽高忽低。SDK 从未上报 → null(--)。
     if (total.contextWindow != null) {
       const routeKey = claudeRouteKey(this.opts.model)

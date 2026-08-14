@@ -10,14 +10,14 @@ import {
 } from './token-source'
 
 const GLM_FULL = {
-  model: 'glm-5.2[1m]',
+  model: 'glm-5.3',
   base_url: 'https://open.bigmodel.cn/api/anthropic',
   auth_token: 'glm-tok',
-  effort: 'xhigh',
+  effort: 'max',
   env: {
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2[1m]',
+    ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3',
     ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5-turbo',
-    ANTHROPIC_DEFAULT_FABLE_MODEL: 'glm-5.2[1m]',
+    ANTHROPIC_DEFAULT_FABLE_MODEL: 'glm-5.3',
     ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5-turbo',
   },
 }
@@ -92,7 +92,7 @@ describe('token-source Claude login vs api', () => {
     expect(source.kind).toBe('api')
     expect(source.enabled()).toBe(true)
     expect(source.isApiRoute()).toBe(true)
-    expect(source.resolveSpawnModel()).toBe('glm-5.2[1m]')
+    expect(source.resolveSpawnModel()).toBe('glm-5.3')
     expect(source.usageSource()).toBe('glm')
 
     const env = resolveClaudeSpawnEnv('claude:glm', {
@@ -103,9 +103,9 @@ describe('token-source Claude login vs api', () => {
     expect(env.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic')
     expect(env.ANTHROPIC_AUTH_TOKEN).toBe('glm-tok')
     // tier 最终由 claudeModelTierEnv 锁到 profile.model(覆盖 profile.env 里的 turbo 等)
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.2[1m]')
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.2[1m]')
-    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.2[1m]')
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.3')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.3')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.3')
     expect(env.GSD_RUNTIME).toBe('claude')
   })
 

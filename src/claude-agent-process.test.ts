@@ -200,6 +200,8 @@ describe('Claude model profiles', () => {
         ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-4.6',
         ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.6',
         ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.6',
+        // 裸 id 无 [1m] 后缀,内置默认注入 1M 窗口对齐上游。
+        CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000',
       })
       // 官方模型仍然干净,GLM 的 token 不外泄到登录态档位。
       expect(claudeModelEnv('claude:opus')).toEqual({})
@@ -211,7 +213,7 @@ describe('Claude model profiles', () => {
   test('claudeModelEffort: GLM 档位读 config 里的 effort;缺省/官方档位返回 undefined', () => {
     const prev = config.claude.models
     ;(config.claude as any).models = {
-      glm: { model: 'glm-5.2', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
+      glm: { model: 'glm-5.3', base_url: 'https://open.bigmodel.cn/api/anthropic', auth_token: 't', effort: 'xhigh' },
     }
     try {
       expect(claudeModelEffort('claude:glm')).toBe('xhigh')
@@ -224,7 +226,7 @@ describe('Claude model profiles', () => {
   test('claudeModelEffort: 非法 effort 值被忽略(返回 undefined,回落固定值)', () => {
     const prev = config.claude.models
     ;(config.claude as any).models = {
-      glm: { model: 'glm-5.2', base_url: 'https://x', auth_token: 't', effort: 'turbo' },
+      glm: { model: 'glm-5.3', base_url: 'https://x', auth_token: 't', effort: 'turbo' },
     }
     try {
       expect(claudeModelEffort('claude:glm')).toBeUndefined()
@@ -284,11 +286,11 @@ describe('Claude model profiles', () => {
     ;(config.claude as any).env = Object.fromEntries(aliasKeys.map(key => [key, `config-stale-${key}`]))
     ;(config.claude as any).models = {
       glm: {
-        model: 'glm-5.2[1m]',
+        model: 'glm-5.3',
         base_url: 'https://open.bigmodel.cn/api/anthropic',
         auth_token: 'glm-tok',
         env: {
-          ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.2[1m]',
+          ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3',
           ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5-turbo',
         },
       },
@@ -298,10 +300,10 @@ describe('Claude model profiles', () => {
       const glm = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:glm' })
       const glmEnv = (glm as any).buildSpawnEnv()
       expect(glmEnv.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic')
-      expect(glmEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.2[1m]')
-      expect(glmEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.2[1m]')
-      expect(glmEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.2[1m]')
-      expect(glmEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.2[1m]')
+      expect(glmEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.3')
+      expect(glmEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.3')
+      expect(glmEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.3')
+      expect(glmEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.3')
       expect(glmEnv.GSD_RUNTIME).toBe('claude')
 
       // 官方登录档位:宿主和 [claude.env] 的四种别名不能泄漏；
@@ -1135,7 +1137,7 @@ describe('Claude token accounting', () => {
 
   test('single SDK context-window report becomes the locked denominator', () => {
     // 分母取该路由 SDK contextWindow 的全局历史 max;单次上报 → max 即该值。
-    // 首轮 SDK 常回落默认 200K,真实窗口(GLM-5.2[1m] → 1M)跑几轮才上报,
+    // 首轮 SDK 常回落默认 200K,真实窗口(GLM-5.3 → 1M,由 CLAUDE_CODE_MAX_CONTEXT_TOKENS 注入)跑几轮才上报,
     // 见下方 lock-max 与跨 session 共享测试。
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
@@ -1485,7 +1487,7 @@ describe('Claude project profile overrides', () => {
 
 describe('Claude executable: third-party API routes bypass the wrapper bin', () => {
   // 回归:GLM(route:api)绝不能走 reclaude 包装器 —— reclaude 的 gateway 会
-  // 把注入的 ANTHROPIC_BASE_URL 劫持回官方 Anthropic,glm-5.2 这类第三方 id
+  // 把注入的 ANTHROPIC_BASE_URL 劫持回官方 Anthropic,glm-5.3 这类第三方 id
   // 被官方 deployment 判为"模型不存在",客户端直接报
   // "There's an issue with the selected model"。apiRoute:true 强制绕开 wrapper，
   // 交给 SDK native 入口直连第三方端点并保留 dialog 工具。
