@@ -562,7 +562,7 @@ describe('yiui-gsd cross-platform helper', () => {
     expect(result.stderr).toContain('PROJECT.md differs')
   })
 
-  test('Codex agent policy keeps every GSD role on Sol with tiered effort', () => {
+  test('Codex agent policy bakes Phase B tiers (deep Sol+max, light Luna+medium)', () => {
     const codexHome = join(root, 'codex-home')
     const defaultsPath = join(root, 'gsd-defaults.json')
     mkdirSync(join(codexHome, 'gsd-core', 'bin', 'shared'), { recursive: true })
@@ -570,6 +570,8 @@ describe('yiui-gsd cross-platform helper', () => {
     writeFileSync(join(codexHome, 'gsd-core', 'bin', 'shared', 'model-catalog.json'), JSON.stringify({
       agents: {
         'gsd-planner': { routingTier: 'heavy' },
+        // standard 但命中深思核白名单 → D0 sol+max(运行时 model_overrides 同源)。
+        'gsd-executor': { routingTier: 'standard' },
         'gsd-doc-classifier': { routingTier: 'light' },
       },
     }))
@@ -592,7 +594,7 @@ describe('yiui-gsd cross-platform helper', () => {
         min_agent_sdk_version: '0.3.149',
       },
     }))
-    for (const name of ['gsd-planner', 'gsd-doc-classifier']) {
+    for (const name of ['gsd-planner', 'gsd-executor', 'gsd-doc-classifier']) {
       writeFileSync(join(codexHome, 'agents', `${name}.toml`), [
         'model = "stale-model"',
         'model_reasoning_effort = "low"',
@@ -609,12 +611,15 @@ describe('yiui-gsd cross-platform helper', () => {
       '--gsd-defaults-path', defaultsPath,
     ])
     expectOk(apply)
-    expect(readFileSync(join(codexHome, 'agents', 'gsd-planner.toml'), 'utf8')).toContain('model_reasoning_effort = "high"')
+    // heavy + 深思核白名单 → sol+max;light → luna+medium。
+    expect(readFileSync(join(codexHome, 'agents', 'gsd-planner.toml'), 'utf8')).toContain('model_reasoning_effort = "max"')
+    expect(readFileSync(join(codexHome, 'agents', 'gsd-executor.toml'), 'utf8')).toContain('model_reasoning_effort = "max"')
     expect(readFileSync(join(codexHome, 'agents', 'gsd-doc-classifier.toml'), 'utf8')).toContain('model_reasoning_effort = "medium"')
-    for (const name of ['gsd-planner', 'gsd-doc-classifier']) {
-      const content = readFileSync(join(codexHome, 'agents', `${name}.toml`), 'utf8')
-      expect(content).toContain('model = "gpt-5.6-sol"')
-      expect(content).not.toContain('service_tier = "flex"')
+    expect(readFileSync(join(codexHome, 'agents', 'gsd-planner.toml'), 'utf8')).toContain('model = "gpt-5.6-sol"')
+    expect(readFileSync(join(codexHome, 'agents', 'gsd-executor.toml'), 'utf8')).toContain('model = "gpt-5.6-sol"')
+    expect(readFileSync(join(codexHome, 'agents', 'gsd-doc-classifier.toml'), 'utf8')).toContain('model = "gpt-5.6-luna"')
+    for (const name of ['gsd-planner', 'gsd-executor', 'gsd-doc-classifier']) {
+      expect(readFileSync(join(codexHome, 'agents', `${name}.toml`), 'utf8')).not.toContain('service_tier = "flex"')
     }
     expect(JSON.parse(readFileSync(defaultsPath, 'utf8'))).toMatchObject({
       preserved: 'keep-me',
@@ -635,6 +640,13 @@ describe('yiui-gsd cross-platform helper', () => {
         enabled: false,
         execution_backend: 'inline',
         min_agent_sdk_version: '0.3.149',
+      },
+      model_overrides: {
+        'gsd-executor': 'gpt-5.6-sol',
+        'gsd-verifier': 'gpt-5.6-sol',
+        'gsd-code-reviewer': 'gpt-5.6-sol',
+        'gsd-code-fixer': 'gpt-5.6-sol',
+        'gsd-phase-researcher': 'gpt-5.6-sol',
       },
     })
 
@@ -679,10 +691,74 @@ describe('yiui-gsd cross-platform helper', () => {
       '--gsd-defaults-path', defaultsPath,
     ])
     expectOk(rebake)
-    expect(JSON.parse(rebake.stdout).bake_timestamps_synced).toBe(2)
+    expect(JSON.parse(rebake.stdout).bake_timestamps_synced).toBe(3)
     for (const name of ['gsd-planner', 'gsd-doc-classifier']) {
       expect(statSync(join(codexHome, 'agents', `${name}.toml`)).mtimeMs).toBeGreaterThanOrEqual(statSync(defaultsPath).mtimeMs)
     }
+  })
+
+  test('check-policy reports drift read-only and apply self-heals', () => {
+    const codexHome = join(root, 'codex-home')
+    const defaultsPath = join(root, 'gsd-defaults.json')
+    mkdirSync(join(codexHome, 'gsd-core', 'bin', 'shared'), { recursive: true })
+    mkdirSync(join(codexHome, 'agents'), { recursive: true })
+    writeFileSync(join(codexHome, 'gsd-core', 'bin', 'shared', 'model-catalog.json'), JSON.stringify({
+      agents: {
+        'gsd-planner': { routingTier: 'heavy' },
+        'gsd-doc-classifier': { routingTier: 'light' },
+      },
+    }))
+    for (const name of ['gsd-planner', 'gsd-doc-classifier']) {
+      writeFileSync(join(codexHome, 'agents', `${name}.toml`), [
+        'model = "stale-model"',
+        'model_reasoning_effort = "low"',
+        '',
+      ].join('\n'))
+    }
+    const checkArgs = [
+      'check-policy',
+      '--runtime', 'codex',
+      '--codex-home', codexHome,
+      '--gsd-defaults-path', defaultsPath,
+    ]
+    expectOk(runHelper([
+      'apply-agent-policy',
+      '--runtime', 'codex',
+      '--codex-home', codexHome,
+      '--gsd-defaults-path', defaultsPath,
+    ]))
+
+    // 一致时 exit 0 且 ok:true。
+    const clean = runHelper(checkArgs)
+    expectOk(clean)
+    expect(JSON.parse(clean.stdout)).toMatchObject({ ok: true, runtime: 'codex', drift: [] })
+
+    // TOML 模型漂移 + defaults 受管键漂移 → exit 1,逐条列名。
+    writeFileSync(join(codexHome, 'agents', 'gsd-planner.toml'), 'model = "stale-model"\nmodel_reasoning_effort = "max"\n')
+    const defaults = JSON.parse(readFileSync(defaultsPath, 'utf8'))
+    defaults.workflow.inline_plan_threshold = 0
+    writeFileSync(defaultsPath, JSON.stringify(defaults))
+    const drifted = runHelper(checkArgs)
+    expect(drifted.status).not.toBe(0)
+    const driftOut = JSON.parse(drifted.stdout)
+    expect(driftOut.ok).toBe(false)
+    expect(driftOut.drift).toContain('defaults.workflow')
+    expect(driftOut.drift).toContain('gsd-planner model → 应为 gpt-5.6-sol')
+
+    // flex 残留同样被检出;check 本身不修改文件。
+    writeFileSync(join(codexHome, 'agents', 'gsd-doc-classifier.toml'), 'model = "gpt-5.6-luna"\nmodel_reasoning_effort = "medium"\nservice_tier = "flex"\n')
+    const flexed = runHelper(checkArgs)
+    expect(JSON.parse(flexed.stdout).drift).toContain('gsd-doc-classifier flex')
+    expect(readFileSync(join(codexHome, 'agents', 'gsd-doc-classifier.toml'), 'utf8')).toContain('service_tier = "flex"')
+
+    // apply 自愈后回到一致。
+    expectOk(runHelper([
+      'apply-agent-policy',
+      '--runtime', 'codex',
+      '--codex-home', codexHome,
+      '--gsd-defaults-path', defaultsPath,
+    ]))
+    expectOk(runHelper(checkArgs))
   })
 
   test('Claude agent policy maps every GSD role through the catalog adaptive tiers', () => {

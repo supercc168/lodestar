@@ -22,6 +22,7 @@ import {
   isGsdInjectPrompt,
   parseGsdInjectTaskSlug,
 } from './gsd-prompt'
+import { checkGsdCodexPolicy } from './gsd-policy-check'
 
 export const GSD_AWAITING_NAME_MS = 300_000
 export const GSD_PANEL_STALE_MSG = '面板已过期，请发 gsd 刷新'
@@ -37,6 +38,16 @@ export function gsdPromptModelLabel(
     return resolveClaudeSdkModel(selectedModel) ?? selectedModel ?? 'claude-fable-5'
   }
   return resolveCodexModelId(selectedModel) ?? selectedModel ?? 'gpt-5.6-sol'
+}
+
+/** Codex 会话的 GSD 分层策略漂移检查:命中漂移返回明细并记日志,
+ * 供注入提示渲染自愈告警;claude 会话 / 无漂移返回 undefined。 */
+function gsdCodexPolicyDrift(s: Session): string[] | undefined {
+  if (s.currentProvider() !== 'codex') return undefined
+  const check = checkGsdCodexPolicy()
+  if (check.ok || check.skipped) return undefined
+  log(`session "${s.sessionName}": gsd codex policy drift: ${check.drift.join('; ')}`)
+  return check.drift
 }
 
 export type GsdActionResult = {
@@ -437,6 +448,7 @@ export async function onGsdContinue(
       provider,
       model: gsdPromptModelLabel(provider, s.currentModelLabel()),
       effort: s.currentEffortLabel(),
+      policyDrift: gsdCodexPolicyDrift(s),
     })
     // Non-blocking inject: after validation / busy / resume / bridge, fire
     // onUserMessage and return the card immediately so Feishu ACK is not
@@ -568,6 +580,7 @@ export async function startNamedGsdTask(
       provider,
       model: gsdPromptModelLabel(provider, s.currentModelLabel()),
       effort: s.currentEffortLabel(),
+      policyDrift: gsdCodexPolicyDrift(s),
     })
 
     const card = buildCard(s, {

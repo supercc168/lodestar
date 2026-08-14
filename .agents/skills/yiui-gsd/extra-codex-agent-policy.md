@@ -22,6 +22,12 @@
 | **D3 轻量** | `gpt-5.6-luna` | **`medium`** | catalog `light` 全员（含 `gsd-plan-checker`、mapper、各类 checker） |
 | **未知 agent** | `gpt-5.6-sol` | **`max`** | 失败安全，偏质量 |
 
+D0/D1 白名单双写：除静态 TOML bake 外，还写入 `~/.gsd/defaults.json` 的
+`model_overrides`（executor/verifier/code-reviewer/code-fixer/phase-researcher
+→ `gpt-5.6-sol`）。GSD 1.9 运行时 adaptive 解析先于 tier 映射命中
+`model_overrides`，白名单不再只存在于静态文件（此前这五个 catalog
+routingTier 为 standard 的深思核 agent 在运行时被解析到 sonnet→terra）。
+
 ### 临时 generic explorer / worker
 
 - 纯读取、机械扫描 → Luna + `medium`
@@ -30,7 +36,10 @@
 ### 演进记录
 
 - Phase A：light → Luna+medium；深思核 → Sol+max；外围 standard 仍 Sol+high
-- Phase B（当前）：外围 standard → Terra+high；D0/D1/主会话仍 Sol+max
+- Phase B：外围 standard → Terra+high；D0/D1/主会话仍 Sol+max
+- Phase C（当前）：D0/D1 白名单双写到 `defaults.json.model_overrides`（运行时
+  adaptive 解析生效，不再只靠静态 TOML）；新增只读 `check-policy` 命令，daemon
+  在 codex 会话 GSD 注入前执行，漂移时在注入提示渲染自愈告警
 
 ## 应用与验证
 
@@ -39,6 +48,7 @@
 ```bash
 node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs apply-agent-policy --runtime codex
 node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs apply-agent-policy --runtime codex --verify-only
+node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs check-policy --runtime codex   # 只读一致性检查,漂移 exit 1
 node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs apply-agent-policy --runtime claude
 node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs apply-agent-policy --runtime claude --verify-only
 ```

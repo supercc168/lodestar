@@ -8,6 +8,8 @@ export function buildGsdInjectPrompt(input: {
   provider: 'codex' | 'claude'
   model: string
   effort: string
+  /** check-policy 检出的分层策略漂移项;非空时在注入头渲染自愈告警。 */
+  policyDrift?: string[]
 }): string {
   const actionLine = input.action === 'continue'
     ? `当前动作: continue — 从 STATE 单调游标推进唯一下一步（$gsd-progress --next --ws ${input.taskSlug}）`
@@ -15,8 +17,16 @@ export function buildGsdInjectPrompt(input: {
   const childModelPolicy = input.provider === 'claude'
     ? `- Claude 子 agent 模型只由 Lodestar/GSD policy 解析：第一方 heavy/standard=飞书当前主力（Fable 5 或 Opus 5）、light=Sonnet 5（选 Opus 不注入 Fable，选 Fable 不注入 Opus）；第三方 API 路由的所有 alias 锁回当前 model=${input.model}；禁止自行覆写模型`
     : `- Codex 子 agent 按 yiui-gsd 分层 bake：深思核/关键研究/写码验收=gpt-5.6-sol+max，外围 standard=gpt-5.6-terra+high，light=gpt-5.6-luna+medium；主会话 model=${input.model}/effort=${input.effort}；禁止自行覆写模型`
+  const driftLines = input.policyDrift?.length
+    ? [
+        '- ⚠️ GSD Codex 分层策略漂移（与 yiui-gsd bake 不一致）：',
+        `  ${input.policyDrift.join('；')}`,
+        '- 继续推进前先执行 `node .agents/skills/yiui-gsd/scripts/yiui-gsd.mjs apply-agent-policy --runtime codex` 自愈，再按分层策略派发子 agent',
+      ]
+    : []
   return [
     GSD_INJECT_PREFIX,
+    ...driftLines,
     '- 只用 yiui-gsd；禁止 superpowers / OMC / oh-my-claudecode / ralplan / ralph / ultrawork / “plan this” 旧规划入口',
     `- 当前飞书 provider 是唯一允许的 AI 路由：provider=${input.provider}，model=${input.model}，effort=${input.effort}；所有 GSD 子 agent 禁止切换 provider、调用外部 AI CLI 或跨 AI review`,
     childModelPolicy,

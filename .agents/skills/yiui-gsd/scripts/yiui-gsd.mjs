@@ -1038,6 +1038,59 @@ function resolveCodexAgentAssignment(agentName, catalogAgent) {
   }
 }
 
+/**
+ * Phase B 受管 defaults 构建(合并语义,保留非受管键)。
+ * 分层映射 + effort 之外,把 D0/D1 深思核白名单写成 agent 级 model_overrides —
+ * GSD 1.9 运行时 adaptive 解析先于 tier 映射命中 model_overrides,白名单不再
+ * 只存在于静态 TOML bake(此前 executor/code-reviewer 等 catalog routingTier
+ * 为 standard 的深思核 agent 在运行时被解析到 sonnet→terra)。
+ */
+function buildCodexExpectedDefaults(prev = {}) {
+  const defaults = { ...prev }
+  defaults.resolve_model_ids = 'omit'
+  defaults.runtime = 'codex'
+  defaults.model_profile = 'adaptive'
+  defaults.subagent_timeout = 1800000
+  const workflow = { ...(isObject(defaults.workflow) ? defaults.workflow : {}) }
+  workflow.subagent_timeout = 1800000
+  workflow.pattern_mapper = false
+  workflow.post_planning_gaps = false
+  workflow.plan_bounce = false
+  workflow.plan_review_convergence = false
+  workflow.cross_ai_execution = false
+  workflow.code_review_command = null
+  workflow.inline_plan_threshold = 2
+  defaults.workflow = workflow
+  const claudeOrchestration = { ...(isObject(defaults.claude_orchestration) ? defaults.claude_orchestration : {}) }
+  claudeOrchestration.enabled = false
+  claudeOrchestration.execution_backend = 'inline'
+  defaults.claude_orchestration = claudeOrchestration
+  // Phase B: deep→Sol, outer standard→Terra, light→Luna.
+  const profileOverrides = { ...(isObject(defaults.model_profile_overrides) ? defaults.model_profile_overrides : {}) }
+  profileOverrides.codex = {
+    opus: 'gpt-5.6-sol',
+    sonnet: 'gpt-5.6-terra',
+    haiku: 'gpt-5.6-luna',
+  }
+  defaults.model_profile_overrides = profileOverrides
+  const modelOverrides = { ...(isObject(defaults.model_overrides) ? defaults.model_overrides : {}) }
+  for (const agentName of CODEX_DEEP_STANDARD_AGENTS) {
+    modelOverrides[agentName] = 'gpt-5.6-sol'
+  }
+  defaults.model_overrides = modelOverrides
+  const effort = { ...(isObject(defaults.effort) ? defaults.effort : {}) }
+  // Deep default is max; outer standard agents override to high; light uses medium.
+  const agentOverrides = { ...(isObject(effort.agent_overrides) ? effort.agent_overrides : {}) }
+  for (const agentName of CODEX_OUTER_STANDARD_AGENTS) {
+    agentOverrides[agentName] = 'high'
+  }
+  effort.default = 'max'
+  effort.routing_tier_defaults = { light: 'medium', standard: 'max', heavy: 'max' }
+  effort.agent_overrides = agentOverrides
+  defaults.effort = effort
+  return defaults
+}
+
 function applyCodexAgentPolicy(options = {}) {
   const codexHome = resolveCodexHome(options)
   const defaultsPath = resolveDefaultsPath(options)
@@ -1058,44 +1111,7 @@ function applyCodexAgentPolicy(options = {}) {
     }
   }
   if (!isObject(defaults)) defaults = {}
-  defaults.resolve_model_ids = 'omit'
-  defaults.runtime = 'codex'
-  defaults.model_profile = 'adaptive'
-  defaults.subagent_timeout = 1800000
-  const workflow = isObject(defaults.workflow) ? defaults.workflow : {}
-  workflow.subagent_timeout = 1800000
-  workflow.pattern_mapper = false
-  workflow.post_planning_gaps = false
-  workflow.plan_bounce = false
-  workflow.plan_review_convergence = false
-  workflow.cross_ai_execution = false
-  workflow.code_review_command = null
-  workflow.inline_plan_threshold = 2
-  defaults.workflow = workflow
-  const claudeOrchestration = isObject(defaults.claude_orchestration) ? defaults.claude_orchestration : {}
-  claudeOrchestration.enabled = false
-  claudeOrchestration.execution_backend = 'inline'
-  defaults.claude_orchestration = claudeOrchestration
-  // Phase B: deep→Sol, outer standard→Terra, light→Luna.
-  const profileOverrides = isObject(defaults.model_profile_overrides) ? defaults.model_profile_overrides : {}
-  profileOverrides.codex = {
-    opus: 'gpt-5.6-sol',
-    sonnet: 'gpt-5.6-terra',
-    haiku: 'gpt-5.6-luna',
-  }
-  defaults.model_profile_overrides = profileOverrides
-  const effort = isObject(defaults.effort) ? defaults.effort : {}
-  // Deep default is max; outer standard agents override to high; light uses medium.
-  const agentOverrides = {}
-  for (const agentName of CODEX_OUTER_STANDARD_AGENTS) {
-    agentOverrides[agentName] = 'high'
-  }
-  effort.default = 'max'
-  effort.routing_tier_defaults = { light: 'medium', standard: 'max', heavy: 'max' }
-  effort.agent_overrides = agentOverrides
-  defaults.effort = effort
-
-  const expectedDefaults = `${JSON.stringify(defaults, null, 2)}\n`
+  const expectedDefaults = `${JSON.stringify(buildCodexExpectedDefaults(defaults), null, 2)}\n`
   const currentDefaults = existsSync(defaultsPath) ? readText(defaultsPath) : ''
   const defaultsChanged = currentDefaults !== expectedDefaults
   let catalog
@@ -1191,6 +1207,96 @@ function applyCodexAgentPolicy(options = {}) {
   }
   if (options.emit !== false) console.log(JSON.stringify(result, null, 2))
   return result
+}
+
+/** 只读策略一致性检查(harness 用):defaults 受管键 + 静态 TOML 分层 + flex +
+ * bake 时间戳。全一致 exit 0;任一漂移 exit 1 并输出 JSON 报告。 */
+function checkCodexAgentPolicy(options = {}) {
+  const codexHome = resolveCodexHome(options)
+  const defaultsPath = resolveDefaultsPath(options)
+  const agentsDirectory = join(codexHome, 'agents')
+  const catalogPath = join(resolveRuntimeCore('codex', options), 'bin', 'shared', 'model-catalog.json')
+  const drift = []
+  if (!existsSync(catalogPath)) {
+    drift.push(`catalog missing: ${catalogPath}`)
+    return emitPolicyCheckResult(drift)
+  }
+  if (!existsSync(defaultsPath)) {
+    drift.push(`defaults missing: ${defaultsPath}`)
+    return emitPolicyCheckResult(drift)
+  }
+  if (!existsSync(agentsDirectory)) {
+    drift.push(`agents dir missing: ${agentsDirectory}`)
+    return emitPolicyCheckResult(drift)
+  }
+
+  let catalog
+  let currentDefaults
+  try {
+    catalog = JSON.parse(readText(catalogPath))
+  } catch (error) {
+    drift.push(`catalog unparseable: ${error instanceof Error ? error.message : String(error)}`)
+    return emitPolicyCheckResult(drift)
+  }
+  try {
+    currentDefaults = JSON.parse(readText(defaultsPath))
+  } catch (error) {
+    drift.push(`defaults unparseable: ${error instanceof Error ? error.message : String(error)}`)
+    return emitPolicyCheckResult(drift)
+  }
+  if (!isObject(currentDefaults)) {
+    drift.push('defaults not an object')
+    return emitPolicyCheckResult(drift)
+  }
+
+  // 1. defaults 受管键对照(非受管键不参与,允许用户自有键共存)。
+  const expectedDefaults = buildCodexExpectedDefaults(currentDefaults)
+  const MANAGED_DEFAULTS_KEYS = [
+    'resolve_model_ids', 'runtime', 'model_profile', 'subagent_timeout',
+    'workflow', 'claude_orchestration', 'model_profile_overrides',
+    'model_overrides', 'effort',
+  ]
+  for (const key of MANAGED_DEFAULTS_KEYS) {
+    if (JSON.stringify(currentDefaults[key]) !== JSON.stringify(expectedDefaults[key])) {
+      drift.push(`defaults.${key}`)
+    }
+  }
+
+  // 2. 静态 TOML 分层对照(与 apply 的校验口径一致)。
+  const agentFiles = readdirSync(agentsDirectory)
+    .filter((name) => /^gsd-.*\.toml$/.test(name))
+    .sort()
+    .map((name) => join(agentsDirectory, name))
+  if (!agentFiles.length) {
+    drift.push('no gsd-*.toml found')
+    return emitPolicyCheckResult(drift)
+  }
+  for (const path of agentFiles) {
+    const agentName = basename(path).slice(0, -'.toml'.length)
+    const assignment = resolveCodexAgentAssignment(agentName, catalog?.agents?.[agentName])
+    const content = readText(path)
+    if (!new RegExp(`^model\\s*=\\s*"${escapeRegExp(assignment.model)}"\\s*$`, 'm').test(content)) {
+      drift.push(`${agentName} model → 应为 ${assignment.model}`)
+    }
+    if (!new RegExp(`^model_reasoning_effort\\s*=\\s*"${escapeRegExp(assignment.effort)}"\\s*$`, 'm').test(content)) {
+      drift.push(`${agentName} effort → 应为 ${assignment.effort}`)
+    }
+    if (/^service_tier\s*=\s*"flex"\s*$/m.test(content)) {
+      drift.push(`${agentName} flex`)
+    }
+  }
+
+  // 3. bake 时间戳(GSD 1.8 stale-bake guard 的判定源)。
+  if (codexAgentBakeIsStale(defaultsPath, agentFiles)) {
+    drift.push('agent bake timestamp')
+  }
+  return emitPolicyCheckResult(drift)
+}
+
+function emitPolicyCheckResult(drift) {
+  const ok = drift.length === 0
+  console.log(JSON.stringify({ ok, runtime: 'codex', drift }, null, 2))
+  return { ok, drift }
 }
 
 function applyClaudeAgentPolicy(options = {}) {
@@ -1499,6 +1605,11 @@ export function main(argv = process.argv.slice(2)) {
       if (options['verify-only'] && (result.defaults_changed || result.agents_changed || result.violations.length)) {
         process.exitCode = 1
       }
+      return result
+    }
+    case 'check-policy': {
+      const result = checkCodexAgentPolicy(options)
+      if (!result.ok) process.exitCode = 1
       return result
     }
     case 'assert-finalization-gate':

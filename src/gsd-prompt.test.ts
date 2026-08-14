@@ -38,6 +38,36 @@ test('prompt forces yiui-gsd and bans old planners', () => {
   expect(p).toContain('不得因超时重复派发')
 })
 
+test('prompt renders self-heal warning when codex policy drift is present', () => {
+  const p = buildGsdInjectPrompt({
+    action: 'continue',
+    taskSlug: 'demo',
+    taskName: 'Demo',
+    provider: 'codex',
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+    policyDrift: ['gsd-executor model → 应为 gpt-5.6-sol', 'defaults.workflow'],
+  })
+  expect(p).toContain('GSD Codex 分层策略漂移')
+  expect(p).toContain('gsd-executor model → 应为 gpt-5.6-sol')
+  expect(p).toContain('defaults.workflow')
+  expect(p).toContain('apply-agent-policy --runtime codex')
+  expect(p.indexOf('分层策略漂移')).toBeLessThan(p.indexOf('只用 yiui-gsd'))
+})
+
+test('prompt without policy drift carries no warning block', () => {
+  const p = buildGsdInjectPrompt({
+    action: 'continue',
+    taskSlug: 'demo',
+    taskName: 'Demo',
+    provider: 'codex',
+    model: 'gpt-5.6-sol',
+    effort: 'max',
+  })
+  expect(p).not.toContain('分层策略漂移')
+  expect(p).not.toContain('apply-agent-policy --runtime codex')
+})
+
 test('new-task-discuss action line differs from continue', () => {
   const cont = buildGsdInjectPrompt({
     action: 'continue',
