@@ -18,7 +18,7 @@
 | `session-tasklist.ts` | `task` 面板的 session 回调：启用项目任务清单、删除确认和面板重绘。 |
 | `session-model.ts` | `model` 面板流程：通过 Codex app-server 动态拉取模型列表、选择模型和 reasoning effort、持久化 session 选择。 |
 | `session-compact.ts` | 手动 `compact` 命令流程：发起 app-server 上下文压缩、监听完成事件和 token usage 快照、更新状态卡。 |
-| `session-tools.ts` | 工具调用面板、工具结果自动发文件和换卡后的工具面板重建逻辑。 |
+| `session-tools.ts` | 工具调用面板、工具结果自动发文件和换卡后的工具面板重建逻辑；连续 Read / 连续 Edit 系(Edit/MultiEdit/NotebookEdit)各自合并成单个批次面板。 |
 | `tool-failure-loop.ts` | Claude/Codex 共用的连续相同失败检测器：稳定序列化工具 input + 错误后生成指纹，第 2 次纠错、第 3 次熔断；纯状态逻辑，不做 I/O。 |
 | `session-ask.ts` | Codex `AskUserQuestion` 交互流程，处理按钮、自定义回答和权限 request 回填。 |
 | `session-host-ask.ts` | 解析 assistant 输出中的 `[[askusr: ...]]` 主机澄清标记，创建独立问答卡并把用户答案回填到 session。 |

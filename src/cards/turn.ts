@@ -383,6 +383,7 @@ export {
   summarizeToolInput,
   toolCallElement,
   readBatchElement,
+  editBatchElement,
   toolCallPermissionElement,
 } from './tool'
 
