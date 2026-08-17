@@ -39,7 +39,9 @@ export interface ModelPanelState {
 }
 
 /** model 命令的固定选项:每项 effort 锁死,选了即生效(无 effort 二级面板)。
- * codex = gpt-5.6-sol / max(2026-07-20 起所有 GPT 档统一 max);
+ * codex = gpt-5.6-sol / max(2026-07-20 起所有 GPT 档统一 max);上下文按 codex CLI
+ * 内置 catalog 钳制:0.144.1(钉住)372K 档×95% = 353.4K 有效,API 规格 1.05M 拿不到,
+ * 0.147.0 反而缩到 258.4K(2026-08-17 实测,钉版本原因见 ~/.codex/config.toml 注释);
  * claude 第一方档位 = Fable 5 / Opus 5,均 max(ultracode 最高思考强度)。
  * claude 的 max 由 ClaudeAgentProcess.setModelSettings 强制 applyFlagSettings,
  * 不依赖 ~/.claude/settings.json 的 effortLevel。
@@ -51,7 +53,7 @@ const FIXED_MODEL_CHOICES = [
     provider: 'codex' as const,
     model: 'gpt-5.6-sol',
     displayName: 'Codex · GPT-5.6 Sol',
-    description: 'GPT-5.6 Sol · max 推理强度 · 1.5M 上下文。',
+    description: 'GPT-5.6 Sol · max 推理强度 · 有效上下文 353K。',
     effort: 'max' as AgentReasoningEffort,
   },
   {

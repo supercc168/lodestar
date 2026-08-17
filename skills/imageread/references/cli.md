@@ -37,7 +37,7 @@ printf '%s' "$PROMPT" | perl -e 'alarm shift(@ARGV); exec @ARGV' 300 \
 
 ## 配置来源
 
-- 模型 / 供应商 / key:`~/.codex/config.toml`(当前 `model_provider = "custom"` → `api.wuhen-ai.com`,`model = "gpt-5.6-sol"`,1.5M 窗口,reasoning=max)。
+- 模型 / 供应商 / key:`~/.codex/config.toml`(当前 `model_provider = "custom"` → `api.wuhen-ai.com`,`model = "gpt-5.6-sol"`,有效窗口 353K(codex catalog 钳制,API 规格 1.05M),reasoning=max)。
 - 认证:`~/.codex/auth.json`。
 - 不需要在 shell 暴露任何 key;wrapper 也不读 key。
 

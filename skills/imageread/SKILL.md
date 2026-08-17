@@ -7,7 +7,7 @@ description: "Analyze or read images via Codex (gpt-5.6-sol vision) — a strong
 
 独立的图像**分析**能力,服务**任意**主会话模型(Claude / GLM / Codex)。主会话停在当前选定模型;只有本 skill 通过统一入口 `lodestar-imageread` 调用 `codex exec`,借 gpt-5.6-sol 的视觉 + 推理来读图。
 
-**与内置 `Read` 的区别**:`Read` 由当前会话模型自己看图;`imageread` 固定走 codex 背后的 gpt-5.6-sol(1.5M 窗口、reasoning 可调、附 visualize/computer-use 等视觉插件)。当当前模型视觉偏弱、或想要更强模型的第二意见时用它。与 `imagegen`(产图)正相反:本 skill **读图、产文本**。
+**与内置 `Read` 的区别**:`Read` 由当前会话模型自己看图;`imageread` 固定走 codex 背后的 gpt-5.6-sol(有效窗口 353K、reasoning 可调、附 visualize/computer-use 等视觉插件)。当当前模型视觉偏弱、或想要更强模型的第二意见时用它。与 `imagegen`(产图)正相反:本 skill **读图、产文本**。
 
 ## Entry point (always)
 
