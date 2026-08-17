@@ -7523,8 +7523,12 @@ describe('Session provider switching', () => {
   test('uses provider-specific ask instructions', () => {
     const session = new Session('probe', 'chat_id') as any
 
+    // codex 侧改走原生 request_user_input 工具指令(D3 三小件);
+    // askusr marker 指令退役,但 marker 解析栈保留作违规兜底(291c34a)。
     session.selectedProvider = 'codex'
-    expect(session.spawnDeveloperInstructions()).toContain('[[askusr:')
+    const codexInstructions = session.spawnDeveloperInstructions()
+    expect(codexInstructions).toContain('request_user_input')
+    expect(codexInstructions).not.toContain('[[askusr:')
 
     session.selectedProvider = 'claude'
     const instructions = session.spawnDeveloperInstructions()

@@ -615,7 +615,7 @@ describe('codex process compaction notifications', () => {
     expect(events).toEqual([])
     expect(responses).toEqual([{
       id: 1,
-      error: { message: 'server request belongs to a child thread' },
+      error: { code: -32601, message: 'server request belongs to a child thread' },
     }])
     expect(proc.serverRequests.size).toBe(0)
 
@@ -1055,5 +1055,24 @@ describe('codex app-server error notifications', () => {
     const errorEvents = events.filter(([name]) => name === 'error')
     expect(errorEvents).toHaveLength(1)
     expect(String((errorEvents[0]?.[1] as Error).message)).toBe('plain top-level failure')
+  })
+})
+
+describe('codex request_user_input 三小件(D3)', () => {
+  test('threadParams 下发 default_mode_request_user_input feature flag', () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    proc.opts = { workDir: '/tmp', effort: 'high' }
+    const params = proc.threadParams()
+    expect(params.config).toEqual({ 'features.default_mode_request_user_input': true })
+  })
+
+  test('respondError 带 code:-32601(缺 code 会让 app-server 反序列化失败悬挂)', () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const writes: any[] = []
+    proc.serverRequests = new Map()
+    proc.write = (msg: any) => writes.push(msg)
+    proc.respondError('req-1', 'denied by user')
+    expect(writes).toHaveLength(1)
+    expect(writes[0].error).toEqual({ code: -32601, message: 'denied by user' })
   })
 })
