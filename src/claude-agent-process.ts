@@ -359,9 +359,12 @@ function contextOccupancyFromUsage(usage: CodexUsage | null | undefined): number
 
 /** Claude Code transcript 目录:~/.claude/projects/<cwd 编码>/。同 cwd 的所有会话
  *  jsonl 都在此 —— rs 历史列表扫这个目录,得到同工作目录的全部 claude 会话
- *  (worktree 不同 cwd → 不同编码目录,自然不混进来)。cwd 编码 = 绝对路径 / 全替换成 -。 */
+ *  (worktree 不同 cwd → 不同编码目录,自然不混进来)。 */
 export function claudeTranscriptDir(workDir: string): string {
-  const encoded = workDir.replace(/\//g, '-')
+  // 编码对齐 Claude Code SDK:cwd 非字母数字字符全 → -(不只 /,[ ] . _ - 等也 → -)。
+  // 否则 workDir 含特殊字符(如 test[deepseek])时,SDK 实际 transcript dir 与本函数算出的
+  // 不一致,readLastCallUsageFromTranscript 读不到 → lastContextTokens 恒 null → footer 无 🧠。
+  const encoded = workDir.replace(/[^a-zA-Z0-9]/g, '-')
   const configDir = process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
   return join(configDir, 'projects', encoded)
 }
@@ -388,7 +391,12 @@ export function readLastCallUsageFromTranscript(path: string): CodexUsage | null
     if (!line) continue
     try {
       const m = JSON.parse(line)
-      if (m?.type === 'assistant' && m?.message?.usage) return m.message.usage as CodexUsage
+      if (m?.type === 'assistant' && m?.message?.usage) {
+        const u = m.message.usage as CodexUsage
+        // 跳过 synthetic 占位(SDK 对部分 turn 写 model='<synthetic>' usage 0/0,非真实 API call)
+        const occ = (u.input_tokens ?? 0) + (u.cache_read_input_tokens ?? 0) + (u.cache_creation_input_tokens ?? 0) + (u.output_tokens ?? 0)
+        if (occ > 0) return u
+      }
     } catch { /* skip malformed line */ }
   }
   return null
@@ -506,28 +514,15 @@ function serverToolName(name: string): string {
   return `server_tool:${name}`
 }
 
-function sanitizeServerToolInput(input: unknown): unknown {
-  if (typeof input === 'string') return input.replace(/https?:\/\/[^\s"'`<>]+/g, '<url-redacted>')
-  if (Array.isArray(input)) return input.map(item => sanitizeServerToolInput(item))
-  if (input && typeof input === 'object') {
-    const out: Record<string, unknown> = {}
-    for (const [key, value] of Object.entries(input as Record<string, unknown>)) {
-      out[key] = sanitizeServerToolInput(value)
-    }
-    return out
-  }
-  return input
-}
-
 function serverToolInputFromScaffoldText(text: string): PendingServerToolInput | null {
   const name = text.match(/Built-in Tool:\s*([A-Za-z0-9_.:-]+)/)?.[1]
   if (!name) return null
   const inputText = text.match(/\*\*Input:\*\*\s*```(?:json)?\s*([\s\S]*?)```/)?.[1]?.trim()
   if (!inputText) return { name, input: {} }
   try {
-    return { name, input: sanitizeServerToolInput(JSON.parse(inputText)) }
+    return { name, input: JSON.parse(inputText) }
   } catch {
-    return { name, input: { raw: sanitizeServerToolInput(inputText) } }
+    return { name, input: { raw: inputText } }
   }
 }
 
@@ -1437,7 +1432,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   private serverToolInput(name: string, rawInput: unknown): unknown {
-    const structuredInput = sanitizeServerToolInput(rawInput)
+    const structuredInput = rawInput
     if (
       structuredInput &&
       typeof structuredInput === 'object' &&
@@ -1527,9 +1522,12 @@ export class ClaudeAgentProcess extends EventEmitter {
     // 后的真实值;stream-json 的 assistant event 恒 0/0、result.usage 是 turn 聚合、
     // modelUsage 是 session 累计,都不能代表当前上下文)。与 Claude Code 底栏
     // context 占用同口径。transcript 不可读 → null → footer 显 MISS。
-    this.lastContextTokens = contextOccupancyFromUsage(
-      readLastCallUsageFromTranscript(claudeTranscriptPath(this.opts.workDir, this.sessionId ?? ''))
-    )
+    // transcript 读最后真实 assistant usage(跳 synthetic);文件存在但全 synthetic(DeepSeek 前 turn
+    // SDK 只写占位)→ fallback result.usage 单 turn input;文件不存在(test / 新 session 首次)→ null(MISS)。
+    const transcriptPath = claudeTranscriptPath(this.opts.workDir, this.sessionId ?? '')
+    const transcriptUsage = readLastCallUsageFromTranscript(transcriptPath)
+    this.lastContextTokens = contextOccupancyFromUsage(transcriptUsage)
+      ?? (existsSync(transcriptPath) ? contextOccupancyFromUsage(usage) : null)
     if (this.lastTotalUsage || this.lastUsage) {
       this.emit('token_usage', {
         usage: this.lastUsage,

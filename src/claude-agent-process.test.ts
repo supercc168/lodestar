@@ -753,7 +753,7 @@ describe('Claude user dialog bridge', () => {
         input: {
           tool: 'analyze_image',
           input: {
-            imageSource: '<url-redacted>',
+            imageSource: 'https://signed.example/img',
             prompt: '识别截图内容',
           },
         },
@@ -1290,6 +1290,36 @@ describe('Claude transcript context tokens', () => {
   test('claudeTranscriptPath encodes cwd slashes to dashes', () => {
     const p = claudeTranscriptPath('/home/leviyuan/feishu', 'sid-1')
     expect(p.endsWith('projects/-home-leviyuan-feishu/sid-1.jsonl')).toBe(true)
+  })
+
+  test('claudeTranscriptPath encodes all non-alphanumeric chars to dashes (对齐 SDK)', () => {
+    // SDK 编码不只替换 /:[ ] . _ 等非字母数字字符全部 → -。否则 cwd 含特殊字符
+    // (如 test[deepseek])时本函数算出的目录与 SDK 实际写入目录不一致 → 恒读不到。
+    const p = claudeTranscriptPath('/tmp/test[deepseek]_v0.14', 'sid-2')
+    expect(p.endsWith('projects/-tmp-test-deepseek--v0-14/sid-2.jsonl')).toBe(true)
+  })
+
+  test('readLastCallUsageFromTranscript skips synthetic placeholder rows', () => {
+    // SDK 对部分 turn 写 synthetic 占位(model='<synthetic>' usage 全 0,非真实 API
+    // call);跳过后取到最后一条真实 usage,修 DeepSeek 首轮 footer 无用量数据。
+    const tmp = join(tmpdir(), `lodestar-syn-${Date.now()}.jsonl`)
+    writeFileSync(tmp, [
+      JSON.stringify({ type: 'assistant', message: { usage: { input_tokens: 30, cache_read_input_tokens: 41728, cache_creation_input_tokens: 0 } } }),
+      JSON.stringify({ type: 'assistant', message: { model: '<synthetic>', usage: { input_tokens: 0, output_tokens: 0 } } }),
+      JSON.stringify({ type: 'assistant', message: { model: '<synthetic>', usage: { input_tokens: 0, output_tokens: 0 } } }),
+    ].join('\n'))
+    expect(readLastCallUsageFromTranscript(tmp)).toEqual({ input_tokens: 30, cache_read_input_tokens: 41728, cache_creation_input_tokens: 0 })
+    unlinkSync(tmp)
+  })
+
+  test('readLastCallUsageFromTranscript returns null when transcript is all synthetic', () => {
+    // 全 synthetic → null(调用点见文件存在才 fallback result.usage;不假数据)
+    const tmp = join(tmpdir(), `lodestar-syn-all-${Date.now()}.jsonl`)
+    writeFileSync(tmp, [
+      JSON.stringify({ type: 'assistant', message: { model: '<synthetic>', usage: { input_tokens: 0, output_tokens: 0 } } }),
+    ].join('\n'))
+    expect(readLastCallUsageFromTranscript(tmp)).toBeNull()
+    unlinkSync(tmp)
   })
 
   test('readLastCallUsageFromTranscript returns the last assistant per-call usage', () => {
