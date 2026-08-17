@@ -63,8 +63,25 @@ describe('claudeModelEnv per-档位 env 注入', () => {
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.3')
     expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.3')
     expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.3')
-    // 裸 glm-5.3 无 [1m] 后缀,SDK 默认判 200K;内置默认 env 显式注入 1M
-    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('1000000')
+    // 1M 记账走模型名 [1m] 钉法;显式配裸名 = 显式选择 200K,不再有 env 注入兜底
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBeUndefined()
+  })
+
+  // 注:api 档未显式配 model 时 configured=false(picker 拦截,防官方 id 误路由),
+  // 此用例钉的是 alias 兜底与 DEFAULT_GLM_MODEL 的一致性(半配置态不产生分裂 alias);
+  // [1m] 生效主路径 = config.toml 显式 model = "glm-5.3[1m]"。
+  test('glm 未显式配 model → alias 兜底跟随默认 glm-5.3[1m],无窗口 env 注入', () => {
+    ;(config.claude as any).models.glm = {
+      base_url: 'https://open.bigmodel.cn/api/anthropic',
+      auth_token: 'glm-tok',
+      effort: 'max',
+    }
+    const env = claudeModelEnv('claude:glm')
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.3[1m]')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.3[1m]')
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.3[1m]')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.3[1m]')
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBeUndefined()
   })
 
   test('官方登录档位不注入任何 env(零污染)', () => {
@@ -110,7 +127,8 @@ describe('claudeModelEnv per-档位 env 注入', () => {
     expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.3')
     expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.3')
     expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.3')
-    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBe('1000000')
+    // 1M 记账走模型名 [1m] 钉法;显式配裸名不再有 env 注入兜底
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBeUndefined()
   })
 
   test('glm 档位忽略分裂的 tier alias,统一锁到当前 model', () => {

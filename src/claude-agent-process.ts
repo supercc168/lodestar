@@ -405,9 +405,33 @@ export function readLastCallUsageFromTranscript(path: string): CodexUsage | null
 
 /** SDK contextWindow 历史 max,按 claude 路由 key 在 daemon 进程内全局共享。
  * context window 是模型路由属性(与 session 无关):任一 session 探测到的真实
- * 窗口(GLM-5.3 → 1M,由 CLAUDE_CODE_MAX_CONTEXT_TOKENS 注入)锁定后,同路由所有 session 立即用作分母,不再各自
+ * 窗口(GLM-5.3[1m] → 1M,模型名 [1m] 钉法记账)锁定后,同路由所有 session 立即用作分母,不再各自
  * 首轮回落默认 200K。daemon 重启后重新探测(不持久化,重启不常发生)。 */
 const contextWindowMaxByRoute = new Map<string, number>()
+
+/** 1214/爆窗降级路由集。result 错误文本命中 CONTEXT_WINDOW_DEGRADE_RE 后置位:
+ * 该路由分母强制 200K 且观测不再上调(防「下轮又见 1M 记账→升回→再爆」振荡),
+ * 后续 spawn 的模型名与 env 值剥 [1m] 后缀回退裸名,实现自愈。daemon 重启后重探。 */
+const degradedContextRoutes = new Set<string>()
+
+/** 爆窗/模型名降级触发正则:上游通用窗口错误文本(1b65dad 同款)+ bigmodel 1214
+ * 形态(2026-08-17 直连实测错误体 `[1214][modelCode：不存在][…]`,特征词 modelCode)。 */
+const CONTEXT_WINDOW_DEGRADE_RE =
+  /context.?window|prompt is too long|exceeds?.*(?:context|token)|too many (?:input )?tokens|modelCode|\[1214\]/i
+
+const ONE_M_SUFFIX_RE = /\[1m\]$/i
+const DEGRADED_CONTEXT_WINDOW = 200_000
+
+function stripOneMSuffix(value: string): string {
+  return value.replace(ONE_M_SUFFIX_RE, '')
+}
+
+function degradeContextWindowForRoute(routeKey: string, reason: string): void {
+  if (degradedContextRoutes.has(routeKey)) return
+  degradedContextRoutes.add(routeKey)
+  contextWindowMaxByRoute.set(routeKey, DEGRADED_CONTEXT_WINDOW)
+  log(`claude-agent-process: context window degraded to ${DEGRADED_CONTEXT_WINDOW} for ${routeKey}, future spawns strip [1m] (${reason.slice(0, 160)})`)
+}
 
 function claudeRouteKey(model: string | null | undefined): string {
   // opts.model 形如 'claude:glm' / 'claude:default';null 归一到 default。
@@ -417,6 +441,7 @@ function claudeRouteKey(model: string | null | undefined): string {
 /** 仅供测试重置全局缓存,保证用例隔离。 */
 export function resetClaudeContextWindowMaxCache(): void {
   contextWindowMaxByRoute.clear()
+  degradedContextRoutes.clear()
 }
 
 function totalUsageFromModelUsage(modelUsage: any): { usage: CodexUsage | null; contextWindow: number | null } {
@@ -932,7 +957,10 @@ export class ClaudeAgentProcess extends EventEmitter {
     // selection. This prevents a future profile change from sending one model
     // id while injecting another profile's route or tier aliases.
     const tokenSource = resolveTokenSource('claude', this.opts.model)
-    const model = tokenSource.resolveSpawnModel()
+    // 降级路由剥 [1m] 回退裸名(1214/爆窗自愈的 spawn 半边;正常路由零变化)。
+    const routeDegraded = degradedContextRoutes.has(claudeRouteKey(this.opts.model))
+    const resolvedModel = tokenSource.resolveSpawnModel()
+    const model = routeDegraded && resolvedModel ? stripOneMSuffix(resolvedModel) : resolvedModel
     const profile = this.opts.profile
     if (profile) {
       log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? true}`)
@@ -952,7 +980,12 @@ export class ClaudeAgentProcess extends EventEmitter {
       // 第三方 API 路由(GLM)绕开 reclaude 包装器,直连第三方端点;官方登录
       // 档位由 reclaude custom spawn 包住 SDK native binary,兼顾代理与 dialog。
       const executable = resolveClaudeExecutableConfig({ apiRoute: isApiRoute })
-      const spawnEnv = tokenSource.spawnEnv(this.buildSpawnBaseEnv())
+      let spawnEnv = tokenSource.spawnEnv(this.buildSpawnBaseEnv())
+      if (routeDegraded) {
+        spawnEnv = Object.fromEntries(
+          Object.entries(spawnEnv).map(([k, v]) => [k, ONE_M_SUFFIX_RE.test(v) ? stripOneMSuffix(v) : v]),
+        )
+      }
       const routeLabel = isApiRoute ? 'api' : 'login'
       const reasoningOptions = claudeSdkReasoningOptions(this.opts.model, this.opts.effort)
       const reasoningLabel = reasoningOptions.thinking
@@ -1557,18 +1590,32 @@ export class ClaudeAgentProcess extends EventEmitter {
     } else {
       this.lastTotalUsage = this.cumulativeUsageFromResults ? cloneUsage(this.cumulativeUsageFromResults) : null
     }
+    // 1214/爆窗自愈先行:错误 result 文本命中降级正则 → 该路由分母立即回 200K
+    // (本轮 lastContextWindow 就取降级值),后续 spawn 剥 [1m] 回退裸名。
+    const resultIsError = raw.is_error === true ||
+      (typeof raw.subtype === 'string' && raw.subtype !== 'success')
+    if (resultIsError) {
+      const resultText = typeof raw.result === 'string' ? raw.result : ''
+      if (resultText && CONTEXT_WINDOW_DEGRADE_RE.test(resultText)) {
+        degradeContextWindowForRoute(claudeRouteKey(this.opts.model), resultText)
+      }
+    }
     // 分母 = 该路由的 SDK contextWindow 历史 max(daemon 全局,按路由 key 共享)。
     // context window 是模型路由属性,与 session 无关:任一 session 探测到的真实
-    // 窗口(GLM-5.3 → 1M,由 CLAUDE_CODE_MAX_CONTEXT_TOKENS 注入)全局锁定,所有 session 立即用作分母,不再各自首轮
+    // 窗口(GLM-5.3[1m] → 1M,模型名 [1m] 钉法记账)全局锁定,所有 session 立即用作分母,不再各自首轮
     // 回落默认 200K。取 max 且单调不降,避免忽高忽低。SDK 从未上报 → null(--)。
     if (total.contextWindow != null) {
       const routeKey = claudeRouteKey(this.opts.model)
-      const prev = contextWindowMaxByRoute.get(routeKey) ?? 0
-      if (total.contextWindow > prev) {
-        contextWindowMaxByRoute.set(routeKey, total.contextWindow)
-        log(`claude-agent-process: SDK contextWindow ${total.contextWindow} (global max for ${routeKey}, prev ${prev || '-'})`)
-      } else if (total.contextWindow < (contextWindowMaxByRoute.get(routeKey) ?? 0)) {
-        log(`claude-agent-process: SDK contextWindow ${total.contextWindow} ignored (global max ${contextWindowMaxByRoute.get(routeKey)} locked for ${routeKey})`)
+      // 已降级路由锁死 200K,不再随观测上调 —— CLI 对 [1m] 名仍会按 1M 记账,
+      // 若这里放行会「升回 1M → 下轮再爆 → 再降」振荡;重启后重探。
+      if (!degradedContextRoutes.has(routeKey)) {
+        const prev = contextWindowMaxByRoute.get(routeKey) ?? 0
+        if (total.contextWindow > prev) {
+          contextWindowMaxByRoute.set(routeKey, total.contextWindow)
+          log(`claude-agent-process: SDK contextWindow ${total.contextWindow} (global max for ${routeKey}, prev ${prev || '-'})`)
+        } else if (total.contextWindow < (contextWindowMaxByRoute.get(routeKey) ?? 0)) {
+          log(`claude-agent-process: SDK contextWindow ${total.contextWindow} ignored (global max ${contextWindowMaxByRoute.get(routeKey)} locked for ${routeKey})`)
+        }
       }
     }
     this.lastContextWindow = contextWindowMaxByRoute.get(claudeRouteKey(this.opts.model)) ?? total.contextWindow ?? null

@@ -117,24 +117,17 @@ export function firstPartyClaudeTierEnvForMain(
   }
 }
 
-/** GLM 档位默认 model id。2026-08-14 实测(open.bigmodel.cn Anthropic 兼容
- * 端点 /v1/messages 真请求):
- *   - glm-5.3      → 端点接受并正常响应(带 thinking 块);32K/49K thinking
- *                     budget 均兑现 → max 最高思维可用;~800K token 单请求
- *                     接受 → 1M 档上下文(与 5.2 同级)
- *   - glm-5.3[1m]  → 报 1214 modelCode 不存在 —— 5.3 不再认 [1m] 后缀,
- *                     1M 窗口改由 DEFAULT_GLM_ENV 的 CLAUDE_CODE_MAX_CONTEXT_TOKENS
- *                     注入(否则 Claude Code 把裸 id 当 200K,浪费窗口)
+/** GLM 档位默认 model id。2026-08-17 CLI 路径实测(claude -p 经
+ * open.bigmodel.cn Anthropic 兼容端点,不带任何窗口 env 注入):
+ *   - glm-5.3[1m]  → CLI 剥 [1m] 后缀 + context-1m beta header,请求体为裸名;
+ *                     端点接受,result.modelUsage.contextWindow = 1000000(1M 记账)。
+ *                     [1m] 钉法与 DeepSeek 档(:148)同机制,替代旧 MAX_CONTEXT_TOKENS 注入
+ *   - glm-5.3      → 对照轮 contextWindow = 200000(未知模型默认,浪费窗口)
+ *   - 直连 /v1/messages 传 [1m] **字面量**仍报 1214 modelCode 不存在(2026-08-14
+ *     旧证据,当时据此走 env 注入)—— 1214 属直连形态,CLI 路径结构上不触发;
+ *     万一 CLI 语义变化,claude-agent-process 的 1214/爆窗降级会回退裸名自愈
  * 未在 [claude.models.glm] 显式配 model 时回落到这里。 */
-const DEFAULT_GLM_MODEL = 'glm-5.3'
-
-/** GLM Anthropic 路由的稳定运行基线。裸 glm-5.3(无 [1m] 后缀)被 Claude Code
- * 判定为 200K 窗口(未知模型默认),这里显式注入 1M 对齐上游真实窗口 —— 与 Grok
- * 档的 CLAUDE_CODE_MAX_CONTEXT_TOKENS 同机制。档位显式 env_* 配置优先;只在完整
- * API 凭据就绪后注入。 */
-const DEFAULT_GLM_ENV: Readonly<Record<string, string>> = {
-  CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000',
-}
+const DEFAULT_GLM_MODEL = 'glm-5.3[1m]'
 
 /** DeepSeek 官网 Anthropic 兼容端点(https://api.deepseek.com/anthropic)的
  * 默认 model id。2026-08-13/14 实测(Anthropic /v1/messages 打真请求验证):
@@ -229,12 +222,8 @@ function toProfile(name: string): ClaudeModelProfile | null {
       if (!(key in env)) env[key] = value
     }
   }
-  // GLM 同理补缺省:裸 glm-5.3 无 [1m] 后缀,显式注入 1M 窗口对齐上游。
-  if (configured && route === 'api' && name === 'glm') {
-    for (const [key, value] of Object.entries(DEFAULT_GLM_ENV)) {
-      if (!(key in env)) env[key] = value
-    }
-  }
+  // GLM 1M 记账走模型名 [1m] 钉法(DEFAULT_GLM_MODEL),不再有默认 env 需要补缺省;
+  // 显式配裸名 = 显式选择 200K 记账(迁移:config model 改 glm-5.3[1m])。
   return {
     key,
     name,

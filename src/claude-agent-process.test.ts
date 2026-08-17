@@ -201,8 +201,7 @@ describe('Claude model profiles', () => {
         ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-4.6',
         ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-4.6',
         ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-4.6',
-        // 裸 id 无 [1m] 后缀,内置默认注入 1M 窗口对齐上游。
-        CLAUDE_CODE_MAX_CONTEXT_TOKENS: '1000000',
+        // 1M 记账走模型名 [1m] 钉法,不再有默认窗口 env 注入。
       })
       // 官方模型仍然干净,GLM 的 token 不外泄到登录态档位。
       expect(claudeModelEnv('claude:opus')).toEqual({})
@@ -1185,7 +1184,7 @@ describe('Claude token accounting', () => {
 
   test('single SDK context-window report becomes the locked denominator', () => {
     // 分母取该路由 SDK contextWindow 的全局历史 max;单次上报 → max 即该值。
-    // 首轮 SDK 常回落默认 200K,真实窗口(GLM-5.3 → 1M,由 CLAUDE_CODE_MAX_CONTEXT_TOKENS 注入)跑几轮才上报,
+    // 首轮 SDK 常回落默认 200K,真实窗口(GLM-5.3[1m] → 1M,模型名 [1m] 钉法记账)跑几轮才上报,
     // 见下方 lock-max 与跨 session 共享测试。
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
@@ -1258,6 +1257,47 @@ describe('Claude token accounting', () => {
     expect(events[2].contextWindow).toBe(1_000_000)
     result(258_000)
     expect(proc.lastContextWindow).toBe(1_000_000) // 异常值也不覆盖
+  })
+
+  test('1214 错误触发路由降级:分母回 200K 并锁死不再上调', () => {
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp', effort: 'high', model: 'claude:glm',
+    }) as any
+    const okResult = (uuid: string) => proc.handleMessage({
+      type: 'result', subtype: 'success', uuid, session_id: 's-deg',
+      is_error: false, duration_ms: 1, num_turns: 1,
+      usage: { input_tokens: 1000, output_tokens: 10 },
+      modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 1_000_000 } },
+    })
+    okResult('r-deg-1') // 正常轮:1M 记账
+    expect(proc.lastContextWindow).toBe(1_000_000)
+    // bigmodel 1214 真实错误体(2026-08-17 直连实测原文):modelCode 特征词命中降级正则
+    proc.handleMessage({
+      type: 'result', subtype: 'error_during_execution', uuid: 'r-deg-2', session_id: 's-deg',
+      is_error: true, duration_ms: 1, num_turns: 1,
+      result: 'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","code":"1214","message":"[1214][modelCode：不存在][20260818022410ac860c924280487f]"},"request_id":"20260818022410ac860c924280487f"}',
+    })
+    expect(proc.lastContextWindow).toBe(200_000) // 降级立即生效
+    okResult('r-deg-3') // CLI 对 [1m] 名仍报 1M 记账也不再上调(防振荡)
+    expect(proc.lastContextWindow).toBe(200_000)
+  })
+
+  test('通用爆窗文本(prompt is too long)同样触发降级', () => {
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp', effort: 'high', model: 'claude:glm',
+    }) as any
+    proc.handleMessage({
+      type: 'result', subtype: 'error_during_execution', uuid: 'r-deg-g1', session_id: 's-g',
+      is_error: true, duration_ms: 1, num_turns: 1,
+      result: 'API Error: 400 prompt is too long: 1048576 tokens > 200000 maximum',
+    })
+    proc.handleMessage({
+      type: 'result', subtype: 'success', uuid: 'r-deg-g2', session_id: 's-g',
+      is_error: false, duration_ms: 1, num_turns: 1,
+      usage: { input_tokens: 1000, output_tokens: 10 },
+      modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 1_000_000 } },
+    })
+    expect(proc.lastContextWindow).toBe(200_000) // 降级先行,后续 1M 观测被锁
   })
 
   test('context window max is shared across sessions (daemon-global per route)', () => {
