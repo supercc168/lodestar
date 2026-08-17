@@ -6470,32 +6470,47 @@ export class Session {
     log(`session "${this.sessionName}": model fallback surfaced notice="${notice}"`)
   }
 
-  /** turn footer 末尾的 5h 额度后缀(`  |  5h·N%·[Xh]`),按本 turn
-   * 冻结的 usage source 路由。Claude 登录/非 GLM relay 明确不适用；
-   * codex:<slug> 第三方档位不复用可能属于 ChatGPT 的全局缓存。
-   * 拿不到百分比就返回空串;resetsAt 在未来时追加剩余重置时长
-   * (`·[2.3h]`),缺数据不硬凑 —— footer 不假数据 (no_fallbacks)。 */
-  private async footerFiveHourSuffix(
+  /** turn footer 末尾的额度后缀,按本 turn 冻结的 usage source 路由。
+   * Claude 登录/非 GLM relay 明确不适用;codex:<slug> 第三方档位不复用
+   * 可能属于 ChatGPT 的全局缓存。glm → readGlmUsage(轻量 HTTP)取 5h+周
+   * 双窗口;codex → peekUsage(turn 中 updateUsageFromRateLimits 已更新
+   * cache,纯读不 fetch,避免每轮为一个百分比 spawn codex app-server)。
+   * 拿不到数据返回空串,缺数据不硬凑 —— footer 不假数据 (no_fallbacks)。 */
+  private async footerUsageSuffix(
     turn: Pick<TurnState, 'usageSource' | 'model'>,
   ): Promise<string> {
-    let pct: number | null = null
-    let resetsAt: Date | null = null
     if (turn.usageSource === 'glm') {
       const g = await readGlmUsage()
-      if (g.state === 'ok') {
-        pct = g.fiveHour?.percent ?? null
-        resetsAt = g.fiveHour?.resetsAt ?? null
-      }
+      if (g.state === 'ok') return this.fmtDualWindowSuffix(g.fiveHour ?? null, g.weekly ?? null)
     } else if (turn.usageSource === 'codex' && !turn.model?.startsWith('codex:')) {
       const u = peekUsage()
-      if (u?.state === 'ok') {
-        pct = u.fiveHour?.percent ?? null
-        resetsAt = u.fiveHour?.resetsAt ?? null
-      }
+      if (u?.state === 'ok') return this.fmtDualWindowSuffix(u.fiveHour ?? null, u.weekly ?? null)
     }
-    if (pct == null) return ''
-    const resetIn = resetsAt && resetsAt.getTime() > Date.now() ? cards.fmtResetIn(resetsAt) : ''
-    return resetIn ? `  |  5h·${Math.round(pct)}%·[${resetIn}]` : `  |  5h·${Math.round(pct)}%`
+    return ''
+  }
+
+  /** 双窗口额度 footer 后缀,codex/GLM 共用,形如 `4.1h·7%·[6.9d·17%]`:
+   * 5h 窗口(重置倒计时·已用%)+ 方括号内周窗口(重置倒计时·已用%)。
+   * Prolite 等套餐只有周窗口(无 5h)→ 退化为裸周窗口段 `[6.9d·9%]`。
+   * 缺哪段就省哪段(no_fallbacks 不假数据):两窗口都缺 → 空串;
+   * 某窗口 resetsAt 缺/已过期 → 该窗口只剩百分比。 */
+  private fmtDualWindowSuffix(
+    fiveHour: { percent: number | null; resetsAt: Date | null } | null,
+    weekly: { percent: number | null; resetsAt: Date | null } | null,
+  ): string {
+    const resetIn = (w: { resetsAt: Date | null }): string =>
+      w.resetsAt && w.resetsAt.getTime() > Date.now() ? cards.fmtResetIn(w.resetsAt) : ''
+    const seg = (w: { percent: number | null; resetsAt: Date | null } | null): string | null => {
+      if (w?.percent == null) return null
+      const ri = resetIn(w)
+      return ri ? `${ri}·${Math.round(w.percent)}%` : `${Math.round(w.percent)}%`
+    }
+    const five = seg(fiveHour)
+    const week = seg(weekly)
+    if (five && week) return `  |  ${five}·[${week}]`
+    if (five) return `  |  ${five}`
+    if (week) return `  |  [${week}]`
+    return ''
   }
 
   async closeTurnCard(
@@ -6577,7 +6592,7 @@ export class Session {
     if (modelLabel) line1Parts.push(modelLabel)
     const footerLine1 = line1Parts.join(' ｜ ')
     const footerLine2 = opts.hasFreshResult
-      ? cards.footerTokenDetailLine(this.lastTurnUsage) + (turn.rotateGivenUp ? '' : await this.footerFiveHourSuffix(turn))
+      ? cards.footerTokenDetailLine(this.lastTurnUsage) + (turn.rotateGivenUp ? '' : await this.footerUsageSuffix(turn))
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
     await this.replaceFooterContent(cardId, footer)
