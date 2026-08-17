@@ -5753,6 +5753,7 @@ export class Session {
       taskUpdateI: null,
       taskBoardResetThisTurn: false,
       taskLiveInserted: false,
+      planLiveInserted: false,
       assistantSegmentCount: 0,
       currentAssistantSegmentId: null,
       currentAssistantText: '',
@@ -5977,6 +5978,13 @@ export class Session {
             type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
           })
         }
+        // 实时计划区同样重建(任务总览正上、顺序与首建一致)。planLiveInserted
+        // 同为 turn 级 flag,swap 不重置。
+        if (turn.planLiveInserted) {
+          void cardkit.addElement(turn.cardId, cards.planLiveElement(turn.planSteps, turn.planExplanation, cards.ELEMENTS.planLive), {
+            type: 'insert_before', targetElementId: turn.taskLiveInserted ? cards.ELEMENTS.taskBoardLive : cards.ELEMENTS.footer,
+          })
+        }
         // 已完成但在旧卡插入失败的 assistant 段也要搬到新卡。正文现在是
         // block 完成后一次性 addElement；如果这个 addElement 撞上元素上限,
         // cardkit 会把旧元素标 dead 并触发轮转,这里负责补显示。
@@ -6164,6 +6172,24 @@ export class Session {
       planExplanation: turn.planExplanation,
     })
     if (current !== previous) this.observeWatchdogMeaningful(source, 'turn_plan_updated')
+    // 实时计划区:首次 plan 更新建立(任务总览正上),之后 replace 成最新快照 ——
+    // codex 的 turn/plan/updated 每次都带完整计划,这里让卡片末尾永远是最新的,
+    // 与 claude 侧任务总览(taskBoardLive)常驻语义一致。timeline 快照仍照旧插入
+    // (过程变更记录)。空 plan(steps 为空/畸形数组)与 timeline 快照的守卫
+    // (addPlanSnapshotOnCurrentTurn 跳过空 steps)对齐:不建立也不刷掉已建立的
+    // —— 否则一次空更新会把 live 面板 replace 成 '--' 占位,刷掉上一次有效计划。
+    if (turn.planSteps.length > 0) {
+      if (!turn.planLiveInserted) {
+        // 目标锚点先于置位计算:置位后 taskLiveAnchor 会返回 plan_live 自身。
+        const target = turn.taskLiveInserted ? cards.ELEMENTS.taskBoardLive : cards.ELEMENTS.footer
+        turn.planLiveInserted = true
+        void cardkit.addElement(turn.cardId, cards.planLiveElement(turn.planSteps, turn.planExplanation, cards.ELEMENTS.planLive), {
+          type: 'insert_before', targetElementId: target,
+        })
+      } else {
+        void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.planLive, cards.planLiveElement(turn.planSteps, turn.planExplanation, cards.ELEMENTS.planLive))
+      }
+    }
     this.addPlanSnapshotOnCurrentTurn()
   }
 

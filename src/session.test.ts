@@ -188,6 +188,11 @@ function turnState(
     watchdogSeenCompactionPhases: new Set(),
     readBatches: new Map(),
     openReadBatchI: null,
+    taskCreateI: null,
+    taskUpdateI: null,
+    taskBoardResetThisTurn: false,
+    taskLiveInserted: false,
+    planLiveInserted: false,
     assistantSegmentCount: 0,
     currentAssistantSegmentId: null,
     currentAssistantText: '',
@@ -8820,6 +8825,174 @@ describe('Session resetBackgroundTasks on kill/restart', () => {
       expect(session.backgroundCard).toBe(newer.card)
     } finally {
       oldCardPatch.restore()
+    }
+  })
+})
+
+describe('Session codex plan live panel (plan_live)', () => {
+  test('turn/plan/updated 首次建立 plan_live(无任务总览 → footer 正前),后续原地 replace,最新计划始终在卡末', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_plan_live')
+    session.currentTurn.planLiveInserted = false
+    cardkit.recordCardCreated('card_plan_live', 1)
+
+    try {
+      const plan1 = { explanation: '第一版', plan: [{ step: '探查', status: 'inProgress' }] }
+      proc.emit('turn_plan_updated', plan1)
+      await cardkit.flush('card_plan_live')
+
+      // 首次:建立 plan_live(insert_before footer)+ timeline 快照 plan_update_0
+      const addLive = calls.find(c =>
+        c.method === 'POST' && c.path === '/cards/card_plan_live/elements' &&
+        String(c.body?.elements ?? '').includes('"plan_live"'))
+      expect(addLive).toBeDefined()
+      expect(addLive?.body.target_element_id).toBe('footer')
+      expect(session.currentTurn.planLiveInserted).toBe(true)
+
+      const plan2 = { explanation: '第二版', plan: [
+        { step: '探查', status: 'completed' },
+        { step: '接入', status: 'inProgress' },
+      ] }
+      proc.emit('turn_plan_updated', plan2)
+      await cardkit.flush('card_plan_live')
+
+      // 后续:PUT 原地 replace plan_live(元素数不增),内容是最新的第二版
+      const putLive = calls.filter(c =>
+        c.method === 'PUT' && c.path === '/cards/card_plan_live/elements/plan_live')
+      expect(putLive.length).toBe(1)
+      const addLiveAll = calls.filter(c =>
+        c.method === 'POST' && c.path === '/cards/card_plan_live/elements' &&
+        String(c.body?.elements ?? '').includes('"plan_live"'))
+      expect(addLiveAll).toHaveLength(1)
+      const replaced = JSON.parse(putLive[0].body.element)
+      expect(replaced.expanded).toBe(true)
+      expect(replaced.elements[0].content).toContain('- ✅ 探查')
+      expect(replaced.elements[0].content).toContain('- 🔄 接入')
+      expect(replaced.header.title.content).toBe('📋 当前计划 · 2 项 · 1 进行中 · 1 完成')
+
+      // timeline 快照照旧累积(过程记录),且 insert_before plan_live(不被顶走);
+      // header 带更新序号的是快照,live 面板 header 无序号
+      const snapshotAdds = calls.filter(c =>
+        c.method === 'POST' && c.path === '/cards/card_plan_live/elements' &&
+        String(c.body?.elements ?? '').includes('plan_update_'))
+      expect(snapshotAdds).toHaveLength(2)
+      expect(snapshotAdds.every(c => c.body.target_element_id === 'plan_live')).toBe(true)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose('card_plan_live')
+    }
+  })
+
+  test('已有任务总览时首插 insert_before task_board_live(任务总览仍紧贴 footer),快照锚点指向 plan_live', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    const turn = turnState('card_anchor')
+    turn.taskLiveInserted = true
+    session.currentTurn = turn
+    cardkit.recordCardCreated('card_anchor', 1)
+
+    try {
+      proc.emit('turn_plan_updated', { explanation: null, plan: [{ step: 'x', status: 'pending' }] })
+      await cardkit.flush('card_anchor')
+
+      // 首插落在任务总览正上,不占 footer 正前(锚点链 [plan_live][task_board_live][footer])
+      const addLive = calls.find(c =>
+        c.method === 'POST' && c.path === '/cards/card_anchor/elements' &&
+        String(c.body?.elements ?? '').includes('"plan_live"'))
+      expect(addLive?.body.target_element_id).toBe('task_board_live')
+      expect(turn.planLiveInserted).toBe(true)
+      // 建立后锚点指向 plan_live:timeline 快照 insert_before plan_live
+      const snapshotAdd = calls.find(c =>
+        c.method === 'POST' && c.path === '/cards/card_anchor/elements' &&
+        String(c.body?.elements ?? '').includes('plan_update_'))
+      expect(snapshotAdd?.body.target_element_id).toBe('plan_live')
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose('card_anchor')
+    }
+  })
+
+  test('空 plan 数组不建立 live 面板,也不把已建立的刷成占位', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_plan_empty')
+    cardkit.recordCardCreated('card_plan_empty', 1)
+
+    try {
+      // 首次就是空数组 → 不建立
+      proc.emit('turn_plan_updated', { explanation: null, plan: [] })
+      await cardkit.flush('card_plan_empty')
+      expect(session.currentTurn.planLiveInserted).toBe(false)
+      expect(calls.some(c =>
+        c.method === 'POST' && c.path === '/cards/card_plan_empty/elements' &&
+        String(c.body?.elements ?? '').includes('plan_live'))).toBe(false)
+
+      // 畸形(非数组)plan 同样零动作
+      proc.emit('turn_plan_updated', { explanation: null, plan: 'not-an-array' })
+      await cardkit.flush('card_plan_empty')
+      expect(session.currentTurn.planLiveInserted).toBe(false)
+
+      // 空数组首次 → 未建立;有效更新 → 此时才建立(POST add,内容含有效步骤)
+      proc.emit('turn_plan_updated', { explanation: '有效', plan: [{ step: '有效步骤', status: 'inProgress' }] })
+      await cardkit.flush('card_plan_empty')
+      expect(session.currentTurn.planLiveInserted).toBe(true)
+      const addLive = calls.filter(c =>
+        c.method === 'POST' && c.path === '/cards/card_plan_empty/elements' &&
+        String(c.body?.elements ?? '').includes('"plan_live"'))
+      expect(addLive).toHaveLength(1)
+      expect(addLive[0].body.elements).toContain('有效步骤')
+
+      // 建立后再来空更新 → 不 replace,上次有效计划保留(0 条 PUT)
+      proc.emit('turn_plan_updated', { explanation: null, plan: [] })
+      await cardkit.flush('card_plan_empty')
+      const putLive = calls.filter(c =>
+        c.method === 'PUT' && c.path === '/cards/card_plan_empty/elements/plan_live')
+      expect(putLive).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose('card_plan_empty')
+    }
+  })
+
+  test('startMidTurnRotate 换卡后按 planLiveInserted 在新卡重建 plan_live(任务总览正上)', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    const turn = turnState('card_rotate_live')
+    turn.planLiveInserted = true
+    turn.taskLiveInserted = true
+    turn.planSteps = [{ step: '重建后仍在', status: 'inProgress' }]
+    turn.planExplanation = '换卡重建'
+    session.currentTurn = turn
+    cardkit.recordCardCreated('card_rotate_live', 1)
+
+    try {
+      session.startMidTurnRotate(turn)
+      await turn.rotating
+      const newCardId = turn.cardId
+      expect(newCardId).not.toBe('card_rotate_live')
+      await cardkit.flush(newCardId)
+
+      // 新卡重建:plan_live insert_before task_board_live(任务总览正上、顺序与首建一致)
+      const rebuildLive = calls.filter(c =>
+        c.method === 'POST' && c.path === `/cards/${newCardId}/elements` &&
+        String(c.body?.elements ?? '').includes('"plan_live"'))
+      expect(rebuildLive).toHaveLength(1)
+      expect(rebuildLive[0].body.target_element_id).toBe('task_board_live')
+      expect(rebuildLive[0].body.elements).toContain('重建后仍在')
+      // flag 不因换卡重置,后续 plan 更新继续走 replace 路径
+      expect(turn.planLiveInserted).toBe(true)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
     }
   })
 })
