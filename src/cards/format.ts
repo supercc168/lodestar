@@ -25,10 +25,14 @@ const LIVE_ELAPSED_BUCKETS = [
 
 const TEN_MINUTES_MS = 600_000
 
-/** second 模式下 footer 固定 1s tick；后台卡固定 2s（对齐旧 FOOTER_STATUS_TICK_MS /
- *  BACKGROUND_REFRESH_TICK_MS，后台稍慢以少打一点 cardkit）。 */
+/** second 模式下 footer / 后台卡前 10m 都按 1s tick(对齐旧 FOOTER_STATUS_TICK_MS)。 */
 export const LIVE_ELAPSED_SECOND_FOOTER_TICK_MS = 1000
-export const LIVE_ELAPSED_SECOND_BACKGROUND_TICK_MS = 2000
+
+/** second 模式超 10m 后切粗档位,治「等用户答 AskUserQuestion 时 footer 无限按秒计到
+ *  隔夜 / 一两天」——前 10m 仍按秒,之后只在 5m 边界 push 一次(10m+ / 15m+ / 20m+…)。
+ *  颗粒度 5m(细于 bucket 的 10m):second 本就是「想看精确」,超 10m 后也不宜一下跳太粗。*/
+const SECOND_BUCKET_BASE_MS = 600_000
+const SECOND_BUCKET_STEP_MS = 300_000
 
 /**
  * Coarse elapsed label for live card status plus the delay until it changes.
@@ -53,7 +57,8 @@ export function elapsedBucket(elapsedMs: number): { label: string; nextDelayMs: 
 /**
  * Live elapsed for footer / background headers.
  * `bucket` → coarse label + delay to next boundary;
- * `second` → `Ns` label + fixed 1s delay (callers may override for background).
+ * `second` → `Ns` label + 1s delay for the first 10m, then 5m-granularity
+ * buckets (`10m+`/`15m+`/…) pushed only at boundaries (footer 与后台卡同源)。
  */
 export function liveElapsed(
   elapsedMs: number,
@@ -61,6 +66,12 @@ export function liveElapsed(
 ): { label: string; nextDelayMs: number } {
   if (mode === 'second') {
     const ms = Number.isFinite(elapsedMs) ? Math.max(0, elapsedMs) : 0
+    // 超 10m 不再按秒:改 5m 颗粒度档位 10m+ / 15m+ / 20m+…,只在 5m 边界 push。
+    if (ms >= SECOND_BUCKET_BASE_MS) {
+      const idx = Math.floor((ms - SECOND_BUCKET_BASE_MS) / SECOND_BUCKET_STEP_MS)
+      const nextBoundary = SECOND_BUCKET_BASE_MS + (idx + 1) * SECOND_BUCKET_STEP_MS
+      return { label: `${10 + idx * 5}m+`, nextDelayMs: nextBoundary - ms }
+    }
     return {
       label: `${Math.floor(ms / 1000)}s`,
       nextDelayMs: LIVE_ELAPSED_SECOND_FOOTER_TICK_MS,

@@ -6294,7 +6294,7 @@ describe('Session Codex watchdog warning and model guard', () => {
     }
   })
 
-  test('second live_elapsed mode uses 1s footer and 2s background ticks', async () => {
+  test('second live_elapsed mode uses 1s footer and 1s background ticks', async () => {
     const previous = config.runtime.live_elapsed
     config.runtime.live_elapsed = 'second'
     const session = new Session('second-scheduling', 'chat_id') as any
@@ -6322,7 +6322,7 @@ describe('Session Codex watchdog warning and model guard', () => {
         startedAt: Date.now() - 300_001, steps: [],
       }]
       session.startBackgroundRefreshTick()
-      expect(delays.at(-1)).toBe(2000)
+      expect(delays.at(-1)).toBe(1000)
 
       session.renderFooterStatus = renderFooterStatus
       turn.footerStatusHandle = DETERMINISTIC_FOOTER_HANDLE

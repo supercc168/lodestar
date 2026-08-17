@@ -3897,9 +3897,8 @@ export class Session {
     let nextDelayMs = Infinity
     for (const task of this.backgroundTasks) {
       if (cards.isBgTerminal(task)) continue
-      const delay = mode === 'second'
-        ? cards.LIVE_ELAPSED_SECOND_BACKGROUND_TICK_MS
-        : cards.liveElapsed(now - task.startedAt, mode).nextDelayMs
+      // second:前 10m 每 1s、超 10m 每 5m 边界(同 footer;后台卡不再单独 2s tick)。
+      const delay = cards.liveElapsed(now - task.startedAt, mode).nextDelayMs
       nextDelayMs = Math.min(nextDelayMs, delay)
     }
     if (!Number.isFinite(nextDelayMs)) return

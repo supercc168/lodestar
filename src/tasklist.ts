@@ -85,6 +85,10 @@ export interface TasklistWorkerState {
   lastScanAt?: string
   lastScanError?: string
   runningTaskGuid?: string
+  /** 上次 ensureTasklistSections(section 结构自愈)的时间戳。section guid 稳态不变,
+   *  没必要每个 worker tick 都 listTasklistSections + getTasklistSection 校验一遍 ——
+   *  worker 用这个字段做时间窗,默认 30min 才自愈一次(见 tasklist-worker.ts)。 */
+  lastSectionEnsureAt?: string
 }
 
 export interface TasklistBinding {
@@ -383,5 +387,6 @@ function readWorker(raw: unknown): TasklistWorkerState {
     lastScanAt: typeof obj.lastScanAt === 'string' ? obj.lastScanAt : undefined,
     lastScanError: typeof obj.lastScanError === 'string' ? obj.lastScanError : undefined,
     runningTaskGuid: typeof obj.runningTaskGuid === 'string' ? obj.runningTaskGuid : undefined,
+    lastSectionEnsureAt: typeof obj.lastSectionEnsureAt === 'string' ? obj.lastSectionEnsureAt : undefined,
   }
 }
