@@ -43,6 +43,7 @@ const {
   claudeModelConfigured,
   claudeModelEffort,
 } = await import('./claude-models')
+const { NothingToCompactError } = await import('./agent-process')
 const { config } = await import('./config')
 
 // context window max 是 daemon 全局缓存(按路由 key 跨 session 共享),
@@ -873,17 +874,64 @@ describe('Claude model refusal message handling', () => {
 })
 
 describe('Claude compactThread (/compact slash command)', () => {
-  test('pushes a /compact user message instead of throwing unsupported', async () => {
+  // 终态语义(上游 3e0468a→f8940bd→3b0ee26 叠加):push /compact 后死等四事件,无 timeout。
+  const makeCompactProc = () => {
     const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
     proc.alive = true
     proc.started = true
     const pushed: any[] = []
     proc.input = { push: (m: any) => { pushed.push(m) } }
-    await proc.compactThread()
+    return { proc, pushed }
+  }
+
+  // 场景③:boundary 先到 → resolve(同时钉住 /compact 消息形状)
+  test('pushes /compact and resolves when context_compacted arrives first', async () => {
+    const { proc, pushed } = makeCompactProc()
+    const p = proc.compactThread()
     expect(pushed).toHaveLength(1)
     expect(pushed[0].type).toBe('user')
     expect(pushed[0].message.content[0].text).toBe('/compact')
     expect(pushed[0].priority).toBe('now')
+    proc.emit('context_compacted', { phase: 'event', sourceType: 'compact_boundary' })
+    await expect(p).resolves.toBeUndefined()
+  })
+
+  // 场景①:"Not enough messages to compact"(claude code CLI 固定文案)→ NothingToCompactError
+  test('rejects NothingToCompactError on "Not enough messages to compact" assistant text', async () => {
+    const { proc } = makeCompactProc()
+    const p = proc.compactThread()
+    proc.emit('assistant_text', { uuid: 'u1', text: 'Not enough messages to compact.' })
+    await expect(p).rejects.toBeInstanceOf(NothingToCompactError)
+  })
+
+  // 场景②(本次移植的存在理由):大上下文慢压缩时 boundary 晚于 result 到达,
+  // 不得误判为"无需压缩"—— result 与普通 assistant 文本都不 settle,死等 boundary 后 resolve。
+  test('boundary arriving after result still resolves (no false NothingToCompact)', async () => {
+    const { proc } = makeCompactProc()
+    const p = proc.compactThread()
+    let settledEarly = false
+    p.then(() => { settledEarly = true }, () => { settledEarly = true })
+    proc.emit('result', { subtype: 'success', is_error: false })
+    proc.emit('assistant_text', { uuid: 'u2', text: '压缩进行中的普通总结文本' })
+    await new Promise(r => setTimeout(r, 20))
+    expect(settledEarly).toBe(false)
+    proc.emit('context_compacted', { phase: 'event', sourceType: 'compact_boundary' })
+    await expect(p).resolves.toBeUndefined()
+  })
+
+  // 场景④:proc exit → reject(死等的唯一硬兜底;error 同理)
+  test('rejects when the proc exits during /compact', async () => {
+    const { proc } = makeCompactProc()
+    const p = proc.compactThread()
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+    await expect(p).rejects.toThrow(/exited during \/compact/)
+  })
+
+  test('rejects when the proc errors during /compact', async () => {
+    const { proc } = makeCompactProc()
+    const p = proc.compactThread()
+    proc.emit('error', new Error('sdk boom'))
+    await expect(p).rejects.toThrow('sdk boom')
   })
 
   test('rejects when the process is not running', async () => {

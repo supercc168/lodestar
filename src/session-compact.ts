@@ -5,6 +5,7 @@ import {
   type TokenUsageUpdated,
 } from './codex-process'
 import type { AgentProcess } from './agent-process'
+import { NothingToCompactError } from './agent-process'
 import * as feishu from './feishu'
 import { log } from './log'
 import {
@@ -15,7 +16,6 @@ import {
 } from './context-window'
 import { messageOf } from './session-util'
 
-const CONTEXT_COMPACT_TIMEOUT_MS = 120_000
 const CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS = 1500
 
 type ManualCompactionWatch = {
@@ -35,19 +35,13 @@ type ManualCompactionUsageWatch = {
   cancel(): void
 }
 
-function watchManualCompaction(proc: AgentProcess, timeoutMs: number): ManualCompactionWatch {
+function watchManualCompaction(proc: AgentProcess): ManualCompactionWatch {
   let settled = false
-  let timer: ReturnType<typeof setTimeout> | null = null
   let resolvePromise: (notice: ContextCompactedNotification) => void = () => {}
   let rejectPromise: (e: Error) => void = () => {}
   const threadId = proc.sessionId
   const cleanup = () => {
-    if (timer) {
-      clearTimeout(timer)
-      timer = null
-    }
     proc.off('context_compacted', onCompacted)
-    proc.off('result', onResult)
     proc.off('exit', onExit)
     proc.off('error', onError)
   }
@@ -70,22 +64,18 @@ function watchManualCompaction(proc: AgentProcess, timeoutMs: number): ManualCom
   }
   const onExit = () => fail(new Error('codex app-server exited before context compaction completed'))
   const onError = (e: unknown) => fail(e instanceof Error ? e : new Error(String(e)))
-  // Claude /compact 兜底:若 result 到达而未先收到 compact_boundary,说明 CLI 跳过了压缩
-  // ("Not enough messages to compact.")。以 no-op 收尾,避免干等 120s 超时。
-  // 仅 Claude 后端注册:Codex 的 thread/compact/start 走 RPC,不会发 result,无需此兜底。
-  const onResult = () => {
-    if (settled) return
-    finish({ threadId: threadId ?? undefined, phase: 'event', sourceType: 'compact_noop', noop: true })
-  }
+  // ⚠️ 不再对 Claude 注册 result 兜底("result 到了没 boundary 就是无需压缩"是错的 ——
+  // 大上下文压缩极慢时 compact_boundary 会晚于 result 到达,曾被误判成"无需压缩")。
+  // 无需压缩的判定收敛到 compactThread 的 "Not enough messages to compact" 固定文案
+  // (→ NothingToCompactError),由 runCompactCommand catch 显示 ⓘ。
   const promise = new Promise<ContextCompactedNotification>((resolve, reject) => {
     resolvePromise = resolve
     rejectPromise = reject
-    timer = setTimeout(() => {
-      fail(new Error(`context compaction completion timed out after ${timeoutMs / 1000}s`))
-    }, timeoutMs)
+    // 不设 timeout(上游 3b0ee26 终态):大上下文压缩可能 >10min,固定 timeout 误杀。
+    // 死等 context_compacted;proc exit/error 兜底 fail(onExit/onError 已注册)。
+    // codex 手动压缩随之也无 timeout —— 死等 + proc exit 兜底,上游已接受的取舍。
   })
   proc.on('context_compacted', onCompacted)
-  if (proc.provider === 'claude') proc.on('result', onResult)
   proc.once('exit', onExit)
   proc.once('error', onError)
   return {
@@ -202,7 +192,7 @@ export async function runCompactCommand(s: Session): Promise<void> {
     if (statusCard) await s.closeStatusCard(statusCard, status)
     else await feishu.sendText(s.chatId, status)
   }
-  const watch = watchManualCompaction(proc, CONTEXT_COMPACT_TIMEOUT_MS)
+  const watch = watchManualCompaction(proc)
   const usageWatch = watchManualCompactionUsage(proc, proc.sessionId)
   s.manualContextCompactionPending = true
   try {
@@ -210,16 +200,16 @@ export async function runCompactCommand(s: Session): Promise<void> {
     await proc.compactThread()
     s.setStatusCard(statusCard, s.withModel('⏳ 等待压缩完成事件'))
     const notice = await watch.promise
-    if ((notice as ContextCompactedNotification & { noop?: boolean }).noop === true) {
-      await finishStatus(s.withModel(`⚪ 上下文太少,无需压缩${threadLabel ? ` thread=${threadLabel}…` : ''}`))
-      return
-    }
     const contextSnapshot = await usageWatch.waitFor(notice, CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS)
     const doneThread = notice.threadId ? ` thread=${notice.threadId.slice(0, 8)}…` : ''
     await finishStatus(s.withModel(`✅ 上下文已压缩${doneThread}${compactContextWindowLabel(contextSnapshot)}`))
   } catch (e) {
     watch.cancel()
-    await finishStatus(`❌ 上下文压缩失败: ${messageOf(e)}`)
+    if (e instanceof NothingToCompactError) {
+      await finishStatus(s.withModel(`ⓘ ${e.message}`))
+    } else {
+      await finishStatus(`❌ 上下文压缩失败: ${messageOf(e)}`)
+    }
   } finally {
     usageWatch.cancel()
     s.manualContextCompactionPending = false

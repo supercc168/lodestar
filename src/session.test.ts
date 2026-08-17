@@ -5,7 +5,7 @@ import {
   TurnWatchdog,
   type WatchdogSettings,
 } from './turn-watchdog'
-import type { CodexUserTextSettlement, UserTextDispatch } from './agent-process'
+import { NothingToCompactError, type CodexUserTextSettlement, type UserTextDispatch } from './agent-process'
 import {
   addedReactions, boundResumes, clearedTurnAnchors, deletedReactions, feishuMockState, projectProfiles, resetFeishuMock,
   sentCards, sentRawTexts, sentTexts, updatedCards, urgentPushes,
@@ -7026,7 +7026,9 @@ describe('Session compact command', () => {
     )).toBe(true)
   })
 
-  test('Claude /compact no-op (not enough messages) finishes 无需压缩 instead of timing out', async () => {
+  // 场景①(终态语义):transcript 不足时 compactThread 收到 "Not enough messages to compact"
+  // 固定文案后 reject NothingToCompactError,runCompactCommand 显示 ⓘ 而非 ❌ 失败/超时。
+  test('Claude /compact 上下文不足 → NothingToCompactError → ⓘ 无需压缩', async () => {
     class ClaudeFakeProc extends EventEmitter {
       readonly provider = 'claude' as const
       sessionId = 'claude_thread_compact'
@@ -7034,9 +7036,53 @@ describe('Session compact command', () => {
       isAlive(): boolean { return true }
       async compactThread(): Promise<void> {
         this.compactCalls++
-        // 模拟 CLI 对话太短:/compact 回 result,不发 context_compacted
-        queueMicrotask(() => {
-          this.emit('result', { subtype: 'success', is_error: false, thread_id: this.sessionId })
+        // 终态:CLI 回 "Not enough messages to compact." 文案,compactThread 自身 reject
+        throw new NothingToCompactError()
+      }
+    }
+
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new ClaudeFakeProc()
+    session.proc = proc
+    session.status = 'idle'
+    session.initCount = 1
+    session.pendingUserMessageCount = 0
+
+    await expect(session.runCommand('cm')).resolves.toBe(true)
+    expect(proc.compactCalls).toBe(1)
+    const footerWrites = calls
+      .filter(call => call.method === 'PUT' && call.path.endsWith('/elements/footer'))
+      .map(call => JSON.parse(call.body.element).content as string)
+    expect(footerWrites.some(content => content.includes('ⓘ 上下文窗口充足，无需压缩'))).toBe(true)
+    expect(footerWrites.some(content => content.includes('❌'))).toBe(false)
+    expect(session.manualContextCompactionPending).toBe(false)
+  })
+
+  // 场景②(f8940bd 修的核心 bug,集成层钉扎):大上下文慢压缩时 result 先到、
+  // compact_boundary 晚到 —— watch 不得再据 result 误报"无需压缩",必须等到 boundary 后 ✅。
+  test('Claude /compact boundary 晚于 result 到达 → ✅ 正常完成,不误报无需压缩', async () => {
+    class ClaudeFakeProc extends EventEmitter {
+      readonly provider = 'claude' as const
+      sessionId = 'claude_thread_slow_compact'
+      turnId = 'turn_slow_compact'
+      compactCalls = 0
+      isAlive(): boolean { return true }
+      async compactThread(): Promise<void> {
+        this.compactCalls++
+        // 慢压缩时序:result 先到(旧 onResult 兜底在此误报),boundary 迟到才是完成信号
+        this.emit('result', { subtype: 'success', is_error: false, thread_id: this.sessionId })
+        await new Promise(r => setTimeout(r, 30))
+        this.emit('token_usage', {
+          usage: { total_tokens: 12_000 },
+          totalUsage: { total_tokens: 12_000 },
+          contextWindow: 258_000,
+          threadId: this.sessionId,
+          turnId: this.turnId,
+        })
+        this.emit('context_compacted', {
+          phase: 'end',
+          threadId: this.sessionId,
+          turnId: this.turnId,
         })
       }
     }
@@ -7053,7 +7099,8 @@ describe('Session compact command', () => {
     const footerWrites = calls
       .filter(call => call.method === 'PUT' && call.path.endsWith('/elements/footer'))
       .map(call => JSON.parse(call.body.element).content as string)
-    expect(footerWrites.some(content => content.includes('无需压缩'))).toBe(true)
+    expect(footerWrites.some(content => content.includes('✅ 上下文已压缩'))).toBe(true)
+    expect(footerWrites.some(content => content.includes('无需压缩'))).toBe(false)
     expect(session.manualContextCompactionPending).toBe(false)
   })
 })

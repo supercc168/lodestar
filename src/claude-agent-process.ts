@@ -23,6 +23,7 @@ import { log } from './log'
 import {
   CLAUDE_EFFORT,
   isClaudeReasoningEffort,
+  NothingToCompactError,
   type AgentReasoningEffort,
   type ClaudeReasoningEffort,
   type UserTextDispatch,
@@ -1144,9 +1145,21 @@ export class ClaudeAgentProcess extends EventEmitter {
     // Claude SDK 无 compact 触发接口(0.3.222 仍未暴露);借 CLI 内建 /compact slash
     // command —— 其 supportsNonInteractive=true,streamInput 下作为 local command 执行。
     // push 一条内容为 /compact 的 user 消息,CLI 本地压缩,完成后 emit system/
-    // compact_boundary → context_compacted,由 session-compact.ts 的 watch 收尾。
-    // 对话太短时 CLI 回 "Not enough messages to compact." 而不发 compact_boundary,
-    // watch 的 result 兜底以 no-op 提前收尾(见 session-compact.ts)。
+    // compact_boundary → context_compacted(handleSystemMessage 接线)。
+    //
+    // 判定(上游 3e0468a→f8940bd→3b0ee26 终态,2026-08-04/05 实测确立):
+    //   1. context_compacted → 真压缩完成 resolve(大上下文可能 >10min,死等)。
+    //   2. assistant_text 含 "Not enough messages to compact" → transcript 不足,无需压缩。
+    //   3. proc exit/error → reject(proc 死了才 fail,不靠固定时长)。
+    // **不设 timeout** —— 大上下文压缩 >10min 正常,固定 timeout 会误杀(600s 超时报错);
+    // 真挂起靠 proc exit/error 兜底,或用户 stop 命令中断。
+    //
+    // ⚠️ 之前用 onResult 兜底("result 到了没 boundary 就是无需压缩")是错的 —— 大上下文压缩
+    // 极慢时 boundary 会晚于 result,被误判成"无需压缩"。只有 "Not enough" 这句固定文案才是
+    // 明确的无需压缩信号。
+    //
+    // ⚠️ 文案耦合:"Not enough messages to compact" 是 claude code CLI 的固定输出文案,
+    // CLI 升级若改了这句,transcript 不足时 watch 会永挂(仅 stop / proc exit 可解),升级需留意。
     this.input.push({
       type: 'user',
       session_id: this.sessionId ?? '',
@@ -1154,6 +1167,48 @@ export class ClaudeAgentProcess extends EventEmitter {
       parent_tool_use_id: null,
       priority: 'now',
     } as SDKUserMessage)
+    return new Promise<void>((resolve, reject) => {
+      let settled = false
+      const cleanup = () => {
+        this.off('context_compacted', onCompacted)
+        this.off('assistant_text', onAssistantText)
+        this.off('exit', onExit)
+        this.off('error', onError)
+      }
+      const onCompacted = () => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve()
+      }
+      const onAssistantText = (e: { text?: string } | undefined) => {
+        // 只认 claude code /compact 在 transcript 不足时的固定输出文案。真压缩不会 emit
+        // 这句(实测:真压缩 emit compact_boundary + 可选总结文本,无此句),所以不会误杀真压缩。
+        if (settled) return
+        const text = e?.text ?? ''
+        if (text.includes('Not enough messages to compact')) {
+          settled = true
+          cleanup()
+          reject(new NothingToCompactError())
+        }
+      }
+      const onExit = () => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(new Error('claude thread exited during /compact'))
+      }
+      const onError = (e: unknown) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        reject(e instanceof Error ? e : new Error(String(e)))
+      }
+      this.on('context_compacted', onCompacted)
+      this.on('assistant_text', onAssistantText)
+      this.once('exit', onExit)
+      this.once('error', onError)
+    })
   }
 
   async injectThreadItems(items: any[]): Promise<void> {
