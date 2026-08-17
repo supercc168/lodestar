@@ -91,6 +91,7 @@
 - 生产路径使用 `WSClient + EventDispatcher` 接收 `card.action.trigger`；需要 3 秒内立即更新 JSON 卡片时必须 return `{ card: { type: "raw", data: newCard } }`，不要 return 裸卡片 JSON 或 `{ card: newCard }`；不要在回调 ACK 前调用 `message.patch` / `feishu.updateCard()`，这会导致客户端闪烁或回滚。确需延时更新时先 ACK，再用回调 token 调 `/interactive/v1/card/update`。
 
 ## Runtime Operation Notes
+- 升级 claude CLI(SDK)前必须核验:`src/claude-agent-process.ts` compactThread 死等的 "Not enough messages to compact" 是 CLI 固定文案,CLI 改文案会让手动压缩 watch 永挂(仅 stop/proc exit 可解);升级后跑一次手动 `/compact` 冒烟确认两分支(compact_boundary / 无需压缩)都能落卡。
 - 从 Lodestar 自己承载的对话里执行 `systemctl --user restart feishu-daemon.service` / `lodestar-stop` / `restart` 这类会重启或停止当前 daemon 的命令时，工具调用显示 `aborted` 通常只是宿主进程被 SIGTERM 中断了，不代表操作失败。恢复后先用 `systemctl --user status feishu-daemon.service`、`journalctl --user -u feishu-daemon.service` 或 PID/日志确认结果，不要直接向用户汇报“重启未完成”。
 - “测试当前改动”“发交互卡片到本群”“先看看效果”默认都属于**非授权**的 live-service 变更理由。除非用户在当前用户消息中明确要求，否则禁止执行任何会影响 `feishu-daemon.service` 或当前 live daemon 的操作，包括但不限于 `stop`、`restart`、`systemd-run` 起替代 daemon、手工 `bun daemon.ts` 接管、修改 service 指向、覆盖 live repo 代码后重启。
 - live-service 操作授权不得跨 turn 生效：如果上一个 turn 同时要求“提交、重启”，后续新 turn 只说“提交”“继续”“再改一下”或提出新需求时，必须视为没有重启授权；需要重启时先停下来向用户要新的明确许可。

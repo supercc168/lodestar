@@ -4453,6 +4453,17 @@ export class Session {
       // No hooks registered → fail-safe ack.
       this.proc?.sendHookResponse(req.request_id, {})
     })
+    p.on('context_window_degraded', ({ routeKey, model, contextWindow }: {
+      routeKey: string; model: string; contextWindow: number
+    }) => {
+      if (this.proc !== p) return
+      // 爆窗/1214 自愈降级只发生一次(首次置位),用户可见告知回退语义;
+      // 恢复 [1m] 记账需重启 daemon 重探。
+      void feishu.sendTextRaw(
+        this.chatId,
+        `⚠️ ${routeKey} 触发爆窗/模型名降级:${model} 本轮报错,分母回 ${Math.round(contextWindow / 1000)}K,后续轮次自动回退裸名(重启 daemon 恢复 [1m] 记账)`,
+      ).catch(() => {})
+    })
     p.on('result', (event: AgentResultEvent) => {
       const deliveryContext = this.matchingHumanDeliveryResult(p, event ?? {})
       const ownsHumanTurn = this.resultOwnsCurrentHumanTurn(p, event ?? {}, deliveryContext)

@@ -1259,45 +1259,105 @@ describe('Claude token accounting', () => {
     expect(proc.lastContextWindow).toBe(1_000_000) // 异常值也不覆盖
   })
 
-  test('1214 错误触发路由降级:分母回 200K 并锁死不再上调', () => {
-    const proc = new ClaudeAgentProcess({
-      workDir: '/tmp', effort: 'high', model: 'claude:glm',
-    }) as any
-    const okResult = (uuid: string) => proc.handleMessage({
-      type: 'result', subtype: 'success', uuid, session_id: 's-deg',
-      is_error: false, duration_ms: 1, num_turns: 1,
-      usage: { input_tokens: 1000, output_tokens: 10 },
-      modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 1_000_000 } },
-    })
-    okResult('r-deg-1') // 正常轮:1M 记账
-    expect(proc.lastContextWindow).toBe(1_000_000)
-    // bigmodel 1214 真实错误体(2026-08-17 直连实测原文):modelCode 特征词命中降级正则
-    proc.handleMessage({
-      type: 'result', subtype: 'error_during_execution', uuid: 'r-deg-2', session_id: 's-deg',
-      is_error: true, duration_ms: 1, num_turns: 1,
-      result: 'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","code":"1214","message":"[1214][modelCode：不存在][20260818022410ac860c924280487f]"},"request_id":"20260818022410ac860c924280487f"}',
-    })
-    expect(proc.lastContextWindow).toBe(200_000) // 降级立即生效
-    okResult('r-deg-3') // CLI 对 [1m] 名仍报 1M 记账也不再上调(防振荡)
-    expect(proc.lastContextWindow).toBe(200_000)
+  test('1214 错误触发路由降级:仅 [1m] 路由生效,分母回 200K 锁死并发一次事件', () => {
+    // 降级只对 resolved model 带 [1m] 的路由生效 → 用例需配 [1m] 档。
+    const prevGlm = config.claude.models.glm
+    ;(config.claude as any).models.glm = {
+      model: 'glm-5.3[1m]',
+      base_url: 'https://open.bigmodel.cn/api/anthropic',
+      auth_token: 'glm-tok',
+    }
+    try {
+      const proc = new ClaudeAgentProcess({
+        workDir: '/tmp', effort: 'high', model: 'claude:glm',
+      }) as any
+      const degradedEvents: any[] = []
+      proc.on('context_window_degraded', (e: any) => degradedEvents.push(e))
+      const okResult = (uuid: string) => proc.handleMessage({
+        type: 'result', subtype: 'success', uuid, session_id: 's-deg',
+        is_error: false, duration_ms: 1, num_turns: 1,
+        usage: { input_tokens: 1000, output_tokens: 10 },
+        modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 1_000_000 } },
+      })
+      okResult('r-deg-1') // 正常轮:1M 记账
+      expect(proc.lastContextWindow).toBe(1_000_000)
+      // bigmodel 1214 真实错误体(2026-08-17 直连实测原文)命中降级正则([1214]/"code":"1214")
+      const err1214 = 'API Error: 400 {"type":"error","error":{"type":"invalid_request_error","code":"1214","message":"[1214][modelCode：不存在][20260818022410ac860c924280487f]"},"request_id":"20260818022410ac860c924280487f"}'
+      proc.handleMessage({
+        type: 'result', subtype: 'error_during_execution', uuid: 'r-deg-2', session_id: 's-deg',
+        is_error: true, duration_ms: 1, num_turns: 1, result: err1214,
+      })
+      expect(proc.lastContextWindow).toBe(200_000) // 降级立即生效
+      okResult('r-deg-3') // CLI 对 [1m] 名仍报 1M 记账也不再上调(防振荡)
+      expect(proc.lastContextWindow).toBe(200_000)
+      // 用户可见事件只发一次(首次置位)
+      proc.handleMessage({
+        type: 'result', subtype: 'error_during_execution', uuid: 'r-deg-4', session_id: 's-deg',
+        is_error: true, duration_ms: 1, num_turns: 1, result: err1214,
+      })
+      expect(degradedEvents).toHaveLength(1)
+      expect(degradedEvents[0]).toEqual({
+        routeKey: 'claude:glm', model: 'glm-5.3[1m]', contextWindow: 200_000,
+      })
+    } finally {
+      ;(config.claude as any).models.glm = prevGlm
+    }
   })
 
-  test('通用爆窗文本(prompt is too long)同样触发降级', () => {
-    const proc = new ClaudeAgentProcess({
-      workDir: '/tmp', effort: 'high', model: 'claude:glm',
-    }) as any
-    proc.handleMessage({
-      type: 'result', subtype: 'error_during_execution', uuid: 'r-deg-g1', session_id: 's-g',
-      is_error: true, duration_ms: 1, num_turns: 1,
-      result: 'API Error: 400 prompt is too long: 1048576 tokens > 200000 maximum',
-    })
-    proc.handleMessage({
-      type: 'result', subtype: 'success', uuid: 'r-deg-g2', session_id: 's-g',
-      is_error: false, duration_ms: 1, num_turns: 1,
-      usage: { input_tokens: 1000, output_tokens: 10 },
-      modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 1_000_000 } },
-    })
-    expect(proc.lastContextWindow).toBe(200_000) // 降级先行,后续 1M 观测被锁
+  test('通用爆窗文本(prompt is too long)同样触发 [1m] 路由降级', () => {
+    const prevGlm = config.claude.models.glm
+    ;(config.claude as any).models.glm = {
+      model: 'glm-5.3[1m]',
+      base_url: 'https://open.bigmodel.cn/api/anthropic',
+      auth_token: 'glm-tok',
+    }
+    try {
+      const proc = new ClaudeAgentProcess({
+        workDir: '/tmp', effort: 'high', model: 'claude:glm',
+      }) as any
+      proc.handleMessage({
+        type: 'result', subtype: 'error_during_execution', uuid: 'r-deg-g1', session_id: 's-g',
+        is_error: true, duration_ms: 1, num_turns: 1,
+        result: 'API Error: 400 prompt is too long: 1048576 tokens > 200000 maximum',
+      })
+      proc.handleMessage({
+        type: 'result', subtype: 'success', uuid: 'r-deg-g2', session_id: 's-g',
+        is_error: false, duration_ms: 1, num_turns: 1,
+        usage: { input_tokens: 1000, output_tokens: 10 },
+        modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 1_000_000 } },
+      })
+      expect(proc.lastContextWindow).toBe(200_000) // 降级先行,后续 1M 观测被锁
+    } finally {
+      ;(config.claude as any).models.glm = prevGlm
+    }
+  })
+
+  test('非 [1m] 路由不触发降级(裸名分母本就是端点真实窗口)', () => {
+    const prevGlm = config.claude.models.glm
+    ;(config.claude as any).models.glm = {
+      model: 'glm-5.3', // 显式裸名档
+      base_url: 'https://open.bigmodel.cn/api/anthropic',
+      auth_token: 'glm-tok',
+    }
+    try {
+      const proc = new ClaudeAgentProcess({
+        workDir: '/tmp', effort: 'high', model: 'claude:glm',
+      }) as any
+      proc.handleMessage({
+        type: 'result', subtype: 'success', uuid: 'r-nd-1', session_id: 's-nd',
+        is_error: false, duration_ms: 1, num_turns: 1,
+        usage: { input_tokens: 1000, output_tokens: 10 },
+        modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 1_000_000 } },
+      })
+      proc.handleMessage({
+        type: 'result', subtype: 'error_during_execution', uuid: 'r-nd-2', session_id: 's-nd',
+        is_error: true, duration_ms: 1, num_turns: 1,
+        result: 'API Error: 400 prompt is too long: 1048576 tokens > 200000 maximum',
+      })
+      expect(proc.lastContextWindow).toBe(1_000_000) // 未降级,观测 max 保持
+    } finally {
+      ;(config.claude as any).models.glm = prevGlm
+    }
   })
 
   test('context window max is shared across sessions (daemon-global per route)', () => {

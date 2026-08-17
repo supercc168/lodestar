@@ -151,9 +151,15 @@ function classifyWindows(limits: any): { fiveHour: UsageWindow | null; weekly: U
   }
   if (byDuration(primary, 300) || (!primary?.durationMins && primary)) {
     // 常规 Plus/Pro:primary=5h;或时长缺失按位置
+    if (primary && !primary.durationMins) {
+      log(`usage: classifyWindows fallback by position (primary durationMins missing) — codex 新窗口形态,归类需回访`)
+    }
     return { fiveHour: primary, weekly: secondary }
   }
   // primary 是其他时长(如自定义 individualLimit):按位置保守处理
+  if (primary) {
+    log(`usage: classifyWindows fallback by position (primary durationMins=${primary.durationMins}) — codex 新窗口形态,归类需回访`)
+  }
   return { fiveHour: primary, weekly: secondary }
 }
 

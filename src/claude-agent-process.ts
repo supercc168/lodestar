@@ -415,9 +415,10 @@ const contextWindowMaxByRoute = new Map<string, number>()
 const degradedContextRoutes = new Set<string>()
 
 /** 爆窗/模型名降级触发正则:上游通用窗口错误文本(1b65dad 同款)+ bigmodel 1214
- * 形态(2026-08-17 直连实测错误体 `[1214][modelCode：不存在][…]`,特征词 modelCode)。 */
+ * 形态(2026-08-17 直连实测错误体 `[1214][modelCode：不存在][…]` 与 JSON `"code":"1214"`)。
+ * 不用裸 modelCode 词(无边界易跨路由误伤),以 [1214]/"code":"1214" 精确钉。 */
 const CONTEXT_WINDOW_DEGRADE_RE =
-  /context.?window|prompt is too long|exceeds?.*(?:context|token)|too many (?:input )?tokens|modelCode|\[1214\]/i
+  /context.?window|prompt is too long|exceeds?.*(?:context|token)|too many (?:input )?tokens|\[1214\]|"code"\s*:\s*"?1214"?/i
 
 const ONE_M_SUFFIX_RE = /\[1m\]$/i
 const DEGRADED_CONTEXT_WINDOW = 200_000
@@ -426,11 +427,13 @@ function stripOneMSuffix(value: string): string {
   return value.replace(ONE_M_SUFFIX_RE, '')
 }
 
-function degradeContextWindowForRoute(routeKey: string, reason: string): void {
-  if (degradedContextRoutes.has(routeKey)) return
+/** 返回 true 表示本次为首次降级(调用方据此发一次用户可见通知)。 */
+function degradeContextWindowForRoute(routeKey: string, reason: string): boolean {
+  if (degradedContextRoutes.has(routeKey)) return false
   degradedContextRoutes.add(routeKey)
   contextWindowMaxByRoute.set(routeKey, DEGRADED_CONTEXT_WINDOW)
   log(`claude-agent-process: context window degraded to ${DEGRADED_CONTEXT_WINDOW} for ${routeKey}, future spawns strip [1m] (${reason.slice(0, 160)})`)
+  return true
 }
 
 function claudeRouteKey(model: string | null | undefined): string {
@@ -1592,12 +1595,23 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
     // 1214/爆窗自愈先行:错误 result 文本命中降级正则 → 该路由分母立即回 200K
     // (本轮 lastContextWindow 就取降级值),后续 spawn 剥 [1m] 回退裸名。
-    const resultIsError = raw.is_error === true ||
-      (typeof raw.subtype === 'string' && raw.subtype !== 'success')
-    if (resultIsError) {
+    // 触发门对齐上游最小面(仅 is_error===true);且只对 resolved model 带 [1m]
+    // 后缀的路由生效——不带 [1m] 的路由分母本就是端点真实窗口,降级无意义,
+    // 顺带把正则误伤面压缩到 [1m] 记账声明型路由。
+    if (raw.is_error === true) {
       const resultText = typeof raw.result === 'string' ? raw.result : ''
       if (resultText && CONTEXT_WINDOW_DEGRADE_RE.test(resultText)) {
-        degradeContextWindowForRoute(claudeRouteKey(this.opts.model), resultText)
+        const resolved = resolveTokenSource('claude', this.opts.model).resolveSpawnModel()
+        if (resolved && ONE_M_SUFFIX_RE.test(resolved)) {
+          const routeKey = claudeRouteKey(this.opts.model)
+          if (degradeContextWindowForRoute(routeKey, resultText)) {
+            this.emit('context_window_degraded', {
+              routeKey,
+              model: resolved,
+              contextWindow: DEGRADED_CONTEXT_WINDOW,
+            })
+          }
+        }
       }
     }
     // 分母 = 该路由的 SDK contextWindow 历史 max(daemon 全局,按路由 key 共享)。
