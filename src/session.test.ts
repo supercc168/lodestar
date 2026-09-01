@@ -8738,6 +8738,73 @@ describe('Session claude 子 agent 工具调用不上主卡(上游 89a04d7)', ()
   })
 })
 
+describe('Session codex 子 agent 后台游标卡接线(上游 cf41941)', () => {
+  function codexBgFixture(): { session: any; proc: FakeAgentProc } {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-session-1')
+    session.proc = proc
+    session.selectedProvider = 'codex'
+    session.wireProc(proc)
+    return { session, proc }
+  }
+
+  test('subagent_step 事件经 cards.applySubagentStep 更新 bg 池,步骤在游标卡可见', () => {
+    const { session, proc } = codexBgFixture()
+    // 预置活卡句柄:避免本测触发 openBackgroundCard 的 await 链在测试结束后
+    // 撞原始 fetch(挂账第 2 项已知模式);本测只锁 store 累积语义。
+    session.backgroundCard = { messageId: 'om_bg_steps', cardId: 'card_bg_steps' }
+    proc.emit('bg_task_started', { task_id: 'sub-1', task_type: 'local_agent', description: 'worker' })
+    proc.emit('bg_task_updated', { task_id: 'sub-1', patch: { is_backgrounded: true } })
+
+    proc.emit('subagent_step', { thread_id: 'sub-1', item_id: 'cmd-1', tool: 'Bash', phase: 'started', brief: 'Bash `bun test`' })
+    proc.emit('subagent_step', { thread_id: 'sub-1', item_id: 'cmd-1', tool: undefined, phase: 'completed', brief: '→ 12 pass' })
+
+    const t = session.backgroundTasks.find((x: any) => x.id === 'sub-1')
+    expect(t).toBeDefined()
+    expect(t.steps).toHaveLength(1)
+    expect(t.steps[0].brief).toBe('Bash `bun test` → 12 pass')
+
+    // 未知 thread(先于 started 到达的极早期)丢弃,不产生新 entry。
+    proc.emit('subagent_step', { thread_id: 'sub-nope', item_id: 'x-1', tool: 'Bash', phase: 'started', brief: 'x' })
+    expect(session.backgroundTasks.some((x: any) => x.id === 'sub-nope')).toBe(false)
+    expect(session.pendingBgTasks).toEqual([])
+  })
+
+  test('codex 子 agent bg_task_settled 不置位 bgResumePending(结果由主 turn 收编,不自发开轮)', () => {
+    const { session, proc } = codexBgFixture()
+    session.initCount = 1
+    expect(session.currentTurn).toBeNull()
+
+    proc.emit('bg_task_settled', { task_id: 'tx', status: 'completed' })
+
+    expect(session.bgResumePending).toBe(false)
+  })
+
+  test('claude 子 agent bg_task_settled 行为不变:仍置位 bgResumePending(SDK 自发恢复轮)', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    session.initCount = 1
+
+    proc.emit('bg_task_settled', { task_id: 'tx', status: 'completed' })
+
+    expect(session.bgResumePending).toBe(true)
+  })
+
+  test('开卡落地后复查:await 窗口内全部终态(短命 agent)→ 直接沉降,活卡不僵死(#9)', async () => {
+    const { session, proc } = codexBgFixture()
+    // start 与 settle 同批到达:settle 那刻 backgroundCard 还是 null(开卡在 await),
+    // 沉降空转 —— 落地后必须复查,否则活卡带终态快照永不 settle。
+    proc.emit('bg_task_started', { task_id: 'st-1', task_type: 'local_agent', description: 'short-lived' })
+    proc.emit('bg_task_settled', { task_id: 'st-1', status: 'completed', summary: 'done' })
+
+    await waitFor(() => session.backgroundCard === null && session.backgroundTasks.length === 0)
+    expect(session.openingBackground).toBe(false)
+  })
+})
+
 describe('Session usage cache cross-backend isolation', () => {
   test('claude 的 rate_limit_event payload 不得覆盖 codex 用量缓存', () => {
     // 先用一条 codex 形状的 payload 播种缓存(模块级单例)。
