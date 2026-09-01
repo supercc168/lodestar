@@ -327,6 +327,191 @@ describe('cardkit network retry and footer isolation', () => {
   })
 })
 
+describe('cardkit 错误码级写失败分类与 checked add (上游 4185808)', () => {
+  test('classifies only a real nested 300305 as component capacity', () => {
+    expect(cardkit.isElementLimitFailure(300305, { message: 'component limit' })).toBe(true)
+    expect(cardkit.isElementLimitFailure(300315, {
+      message: 'Failed to add element: inner code: 300305, element exceeds limit',
+    })).toBe(true)
+    expect(cardkit.isElementLimitFailure(300315, {
+      message: 'Duplicate ID, inner code: 300301',
+    })).toBe(false)
+    expect(cardkit.isElementLimitFailure(300315, {
+      message: 'elementID format error. Only alphabets, numbers, and underscores are allowed. It must start with an alphabet and not exceed 20 characters; code: 300301',
+    })).toBe(false)
+    expect(cardkit.isElementLimitFailure(300315, {
+      message: 'number of elements in a column exceeds the maximum; code: 300301',
+    })).toBe(false)
+    expect(cardkit.isElementLimitFailure(300315, {
+      message: 'number of card components exceeds the maximum limit',
+    })).toBe(true)
+    expect(cardkit.isElementLimitFailure(200570, { message: 'invalid image keys' })).toBe(false)
+    expect(cardkit.isElementLimitFailure(300308, { message: 'server internal error' })).toBe(false)
+    expect(cardkit.isDuplicateElementFailure(300315, { message: 'Duplicate ID; code: 300301' })).toBe(true)
+    expect(cardkit.isDuplicateElementFailure(300315, { message: 'elementID format error; code: 300301' })).toBe(false)
+    expect(cardkit.isDuplicateElementFailure(300305, { message: 'Duplicate ID' })).toBe(false)
+  })
+
+  test('reports the failing card, operation, element, target and Feishu log id via meta.failure', async () => {
+    const cardId = 'card_failure_context'
+    let capturedCode: number | undefined
+    let capturedKind: string | undefined
+    let captured: any = null
+    cardkit.recordCardCreated(cardId, 1, (code, meta) => {
+      capturedCode = code
+      capturedKind = meta?.kind
+      captured = meta?.failure ?? null
+    })
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      code: 300315,
+      msg: 'Duplicate ID; inner code: 300301',
+    }), {
+      headers: {
+        'Content-Type': 'application/json',
+        'x-tt-logid': 'log_card_failure_context',
+      },
+    })) as unknown as typeof fetch
+
+    await cardkit.addElement(cardId, {
+      tag: 'markdown', element_id: 'assistant_0', content: 'x',
+    }, {
+      type: 'insert_before', targetElementId: 'footer',
+    })
+
+    expect(capturedCode).toBe(300315)
+    expect(capturedKind).toBe('api')
+    expect(captured).toMatchObject({
+      cardId,
+      operation: 'addElement',
+      elementId: 'assistant_0',
+      targetElementId: 'footer',
+      code: 300315,
+      httpStatus: 200,
+      logId: 'log_card_failure_context',
+    })
+    expect(captured.message).toContain('Duplicate ID')
+    await cardkit.dispose(cardId)
+  })
+
+  test('serializes safe markdown while preserving structured image components (三挂点)', async () => {
+    const cardId = 'card_markdown_image_boundary'
+    cardkit.recordCardCreated(cardId, 1)
+    await cardkit.addElement(cardId, {
+      tag: 'column_set',
+      element_id: 'assistant_0',
+      columns: [{
+        tag: 'column',
+        elements: [
+          { tag: 'markdown', content: 'bad ![x](img_key)' },
+          { tag: 'img', img_key: 'img_v2_uploaded' },
+        ],
+      }],
+    })
+
+    const add = calls.find(call =>
+      call.method === 'POST' && call.path === `/cards/${cardId}/elements`
+    )
+    const sent = JSON.parse(add?.body.elements ?? '[]')[0]
+    expect(sent.columns[0].elements[0].content).not.toContain('![')
+    expect(sent.columns[0].elements[0].content).toContain('img_key')
+    expect(sent.columns[0].elements[1]).toEqual({ tag: 'img', img_key: 'img_v2_uploaded' })
+
+    // replaceElement 同款挂点
+    await cardkit.replaceElement(cardId, 'assistant_0', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'again ![y](img_v2_fake)',
+    })
+    const put = calls.find(call =>
+      call.method === 'PUT' && call.path === `/cards/${cardId}/elements/assistant_0`
+    )
+    expect(JSON.parse(put?.body.element ?? '{}').content).not.toContain('![')
+
+    // createCardEntity 同款挂点(卡片实体 JSON 序列化前)
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      calls.push({
+        method: String(init?.method ?? 'GET'),
+        path: url.pathname.replace('/open-apis/cardkit/v1', ''),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      })
+      return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_entity_safe' } }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+    await cardkit.createCardEntity({
+      schema: '2.0',
+      body: { elements: [{ tag: 'markdown', content: 'inject ![z](img_v2_bad)' }] },
+    })
+    const create = calls.find(call => call.method === 'POST' && call.path === '/cards')
+    expect(String(create?.body.data ?? '')).not.toContain('![')
+    await cardkit.dispose(cardId)
+  })
+
+  test('addElementResult returns structured failure and duplicate-id reconciles via clearDeadElementForReconcile', async () => {
+    const cardId = 'card_add_result'
+    cardkit.recordCardCreated(cardId, 1)
+
+    const ok = await cardkit.addElementResult(cardId, {
+      tag: 'markdown', element_id: 'ctx_0', content: 'first',
+    })
+    expect(ok).toEqual({ landed: true })
+    expect(cardkit.getElementCount(cardId)).toBe(2)
+
+    let failNext = true
+    const healthy = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (failNext) {
+        failNext = false
+        return new Response(JSON.stringify({
+          code: 300315, msg: 'Failed to add element; Duplicate ID; code: 300301',
+        }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return await healthy(input, init)
+    }) as typeof fetch
+
+    const dup = await cardkit.addElementResult(cardId, {
+      tag: 'markdown', element_id: 'ctx_dup', content: 'again',
+    })
+    expect(dup.landed).toBe(false)
+    expect(dup.failure?.code).toBe(300315)
+    expect(cardkit.isDuplicateElementFailure(dup.failure?.code, dup.failure)).toBe(true)
+    // 计数只在 API 返回 0 后自增:失败的 add 不动计数
+    expect(cardkit.getElementCount(cardId)).toBe(2)
+    expect(cardkit.isDeadElement(cardId, 'ctx_dup')).toBe(true)
+
+    // duplicate-id 可能是"落了但 ACK 丢":对账允许一次 checked PUT
+    cardkit.clearDeadElementForReconcile(cardId, 'ctx_dup')
+    expect(cardkit.isDeadElement(cardId, 'ctx_dup')).toBe(false)
+    const reconciled = await cardkit.replaceElementChecked(cardId, 'ctx_dup', {
+      tag: 'markdown', element_id: 'ctx_dup', content: 'again',
+    }, { notifyCardFailure: false })
+    expect(reconciled).toBe(true)
+    await cardkit.dispose(cardId)
+  })
+
+  test('landed addElement clears a stale dead marker for the same element id', async () => {
+    const cardId = 'card_dead_clear'
+    cardkit.recordCardCreated(cardId, 1)
+    let failNext = true
+    const healthy = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (failNext) {
+        failNext = false
+        return new Response(JSON.stringify({ code: 300308, msg: 'transient reject' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return await healthy(input, init)
+    }) as typeof fetch
+
+    await cardkit.addElement(cardId, { tag: 'markdown', element_id: 'seg_0', content: 'x' })
+    expect(cardkit.isDeadElement(cardId, 'seg_0')).toBe(true)
+    await cardkit.addElement(cardId, { tag: 'markdown', element_id: 'seg_0', content: 'x' })
+    expect(cardkit.isDeadElement(cardId, 'seg_0')).toBe(false)
+    expect(cardkit.getElementCount(cardId)).toBe(2)
+    await cardkit.dispose(cardId)
+  })
+})
+
 describe('cardkit checked settings PATCH and disposed-card guard (upstream ec149d7)', () => {
   test('patchSettingsChecked reports whether the terminal PATCH landed', async () => {
     const cardId = 'card_checked_settings'
