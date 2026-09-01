@@ -8837,8 +8837,11 @@ describe('Session 轮转预算收紧与一次性诊断 (上游 4185808 主题 B)
     turn.userOpenId = ''
     session.currentTurn = turn
     cardkit.recordCardCreated(turn.cardId, 1)
-    const previousSecret = config.feishu.app_secret
-    ;(config.feishu as any).app_secret = SENTINEL
+    // 全量跑时字母序更早的测试文件会 mock.module('./config') 成无 feishu 段的
+    // 形状(01-01 已知泄漏);哨兵注入对两种形状都成立,注入/还原走同一引用。
+    const feishuConfig = ((config as any).feishu ??= {}) as Record<string, unknown>
+    const previousSecret = feishuConfig.app_secret
+    feishuConfig.app_secret = SENTINEL
     const rawApiBody = `{"code":300315,"msg":"invalid payload; Authorization: Bearer ${SENTINEL}","data":{}}`
 
     try {
@@ -8873,7 +8876,8 @@ describe('Session 轮转预算收紧与一次性诊断 (上游 4185808 主题 B)
       const cardJson = JSON.stringify([...sentCards, ...updatedCards])
       expect(cardJson).not.toContain(SENTINEL)
     } finally {
-      ;(config.feishu as any).app_secret = previousSecret
+      if (previousSecret === undefined) delete feishuConfig.app_secret
+      else feishuConfig.app_secret = previousSecret
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)
     }
