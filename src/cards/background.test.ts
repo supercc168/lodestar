@@ -8,6 +8,9 @@ import {
   applyBgTaskSettled,
   applyBgToolUse,
   applyBgToolResult,
+  applySubagentStep,
+  subagentStepBrief,
+  shortIdHash,
   archiveTerminalAgents,
   resurrectRunning,
   resurrectSettled,
@@ -431,7 +434,7 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     const t = mk({ id: 't1', type: 'subagent', description: 'd', status: 'running', subagentType: 'Explore', usage: { total_tokens: 1200, tool_uses: 8, duration_ms: 1000 }, summary: '命中 3 处' })
     const panel = backgroundTaskPanel(t, 1000) as any
     const body = panel.elements[0]
-    expect(body.element_id).toBe('bg_body_t1')
+    expect(body.element_id).toBe('bgb_2alkgm') // bgb_ + shortIdHash('t1')
     expect(body.content).not.toContain('1.2K tok')
     expect(body.content).not.toContain('命中 3 处')
     expect(body.content).toContain('暂无执行记录')
@@ -462,8 +465,9 @@ describe('整卡三态', () => {
     expect(card.config.summary.content).toBe('🧭 子agent · 1 进行中 · 1 已结束')
     const els = card.body.elements
     expect(els[0].tag).toBe('collapsible_panel')
-    expect(els[0].element_id).toBe('bg_t1')
-    expect(els[1].element_id).toBe('bg_t2')
+    expect(els[0].element_id).toBe(BG_ELEMENTS.panel('t1'))
+    expect(els[1].element_id).toBe(BG_ELEMENTS.panel('t2'))
+    expect(els[0].element_id).not.toBe(els[1].element_id)
   })
 
   test('backgroundHistoryCard:streaming 关 + 只渲染终态任务 panel', () => {
@@ -476,7 +480,7 @@ describe('整卡三态', () => {
     const els = card.body.elements
     expect(els).toHaveLength(1)
     expect(els[0].tag).toBe('collapsible_panel')
-    expect(els[0].element_id).toBe('bg_t2')
+    expect(els[0].element_id).toBe(BG_ELEMENTS.panel('t2'))
     expect(els[0].header.title.content).toContain('完成的')
   })
 
@@ -486,11 +490,123 @@ describe('整卡三态', () => {
     expect(card.body.elements[0].content).toContain('迁至最新卡片')
   })
 
-  test('BG_ELEMENTS id 生成', () => {
-    expect(BG_ELEMENTS.panel('t1')).toBe('bg_t1')
-    expect(BG_ELEMENTS.body('t1')).toBe('bg_body_t1')
+  test('BG_ELEMENTS id 生成:panel/body 走短哈希,fold/foldBody 固定 id 不哈希', () => {
+    // shortIdHash('t1') = '2alkgm'(FNV-1a 32bit → base36,稳定映射)
+    expect(BG_ELEMENTS.panel('t1')).toBe('bg_2alkgm')
+    expect(BG_ELEMENTS.body('t1')).toBe('bgb_2alkgm')
+    // 本地折叠汇总 panel(dc55fa6)固定 id 保持原样 —— 天然合规,不参与哈希。
     expect(BG_ELEMENTS.fold).toBe('bg_fold')
     expect(BG_ELEMENTS.foldBody).toBe('bg_fold_body')
+  })
+})
+
+describe('shortIdHash —— codex UUID element_id 合规化(飞书:字母开头 ≤20 字符)', () => {
+  const uuid = '019904d6-9c37-7e73-b761-6bcfe222d2b9'
+
+  test('相同输入稳定映射,不同输入不同哈希', () => {
+    expect(shortIdHash(uuid)).toBe(shortIdHash(uuid))
+    expect(shortIdHash('t1')).toBe('2alkgm') // 算法锁定:FNV-1a 32bit → base36
+    expect(shortIdHash('t1')).not.toBe(shortIdHash('t2'))
+  })
+
+  test('输出 ≤7 字符 base36;UUID 拼前缀后整 id 字母开头且 ≤20 字符', () => {
+    expect(shortIdHash(uuid)).toMatch(/^[a-z0-9]{1,7}$/)
+    for (const el of [BG_ELEMENTS.panel(uuid), BG_ELEMENTS.body(uuid)]) {
+      expect(el).toMatch(/^[A-Za-z][A-Za-z0-9_]*$/)
+      expect(el.length).toBeLessThanOrEqual(20)
+    }
+  })
+})
+
+describe('applySubagentStep —— codex 子 agent 过程步骤(按 thread_id 归属)', () => {
+  const entry = (id: string) => mk({ id, type: 'subagent', description: 'd', status: 'running', isBackgrounded: true })
+
+  test('started 追加新 step(brief 前缀工具名)', () => {
+    let s: BgStore = { active: [entry('th-1')], pending: [] }
+    s = applySubagentStep(s, 'th-1', 'item_1', 'Bash', 'started', '`bun test`')
+    expect(s.active[0].steps).toHaveLength(1)
+    expect(s.active[0].steps[0]).toEqual({ toolUseId: 'item_1', tool: 'Bash', brief: 'Bash `bun test`' })
+  })
+
+  test('completed 按 item_id 回填结果段到同一 step', () => {
+    let s: BgStore = { active: [entry('th-1')], pending: [] }
+    s = applySubagentStep(s, 'th-1', 'item_1', 'Bash', 'started', '`bun test`')
+    s = applySubagentStep(s, 'th-1', 'item_1', 'Bash', 'completed', '→ 12 pass')
+    expect(s.active[0].steps).toHaveLength(1)
+    expect(s.active[0].steps[0].brief).toBe('Bash `bun test` → 12 pass')
+  })
+
+  test('completed 无对应 step(漏 started)且 brief 非空 → 补一步', () => {
+    let s: BgStore = { active: [entry('th-1')], pending: [] }
+    s = applySubagentStep(s, 'th-1', 'item_x', 'Bash', 'completed', '→ done')
+    expect(s.active[0].steps).toHaveLength(1)
+    expect(s.active[0].steps[0].brief).toBe('Bash → done')
+  })
+
+  test('completed 空 brief:既不改 step 也不补步', () => {
+    let s: BgStore = { active: [entry('th-1')], pending: [] }
+    s = applySubagentStep(s, 'th-1', 'item_1', 'FileChange', 'started', '改 2 个文件')
+    s = applySubagentStep(s, 'th-1', 'item_1', 'FileChange', 'completed', '')
+    expect(s.active[0].steps[0].brief).toBe('FileChange 改 2 个文件')
+    s = applySubagentStep(s, 'th-1', 'item_y', 'FileChange', 'completed', '')
+    expect(s.active[0].steps).toHaveLength(1)
+  })
+
+  test('双池同查:pending 池条目同样累积', () => {
+    let s: BgStore = { active: [], pending: [entry('th-p')] }
+    s = applySubagentStep(s, 'th-p', 'item_1', 'WebSearch', 'started', '"bun"')
+    expect(s.pending[0].steps).toHaveLength(1)
+  })
+
+  test('无归属 thread → 返回原 store 引用', () => {
+    const s: BgStore = { active: [entry('th-1')], pending: [] }
+    expect(applySubagentStep(s, 'th-nope', 'item_1', 'Bash', 'started', 'x')).toBe(s)
+  })
+})
+
+describe('subagentStepBrief —— 子 agent 步骤单行简报', () => {
+  test('Bash started 显示命令,completed 显示输出首段', () => {
+    expect(subagentStepBrief('Bash', { command: 'bun test' })).toBe('`bun test`')
+    expect(subagentStepBrief('Bash', { command: 'bun test' }, ' 12 pass\n0 fail ')).toBe('→ 12 pass 0 fail')
+    expect(subagentStepBrief('Bash', { command: 'x' }, '   ')).toBe('')
+  })
+
+  test('FileChange started 显示文件数,completed 归空(不重复 started 信息)', () => {
+    expect(subagentStepBrief('FileChange', { changes: [{}, {}] })).toBe('改 2 个文件')
+    expect(subagentStepBrief('FileChange', {})).toBe('文件变更')
+    expect(subagentStepBrief('FileChange', { changes: [{}] }, '[{"path":"a"}]')).toBe('')
+  })
+
+  test('MCP / WebSearch / default 形态', () => {
+    expect(subagentStepBrief('MCP', { server: 'srv', tool: 'do' })).toBe('srv/do')
+    expect(subagentStepBrief('WebSearch', { query: 'bun test' })).toBe('"bun test"')
+    expect(subagentStepBrief('Read', { file_path: '/a.ts' })).toBe('{"file_path":"/a.ts"}')
+    expect(subagentStepBrief('Read', { file_path: '/a.ts' }, 'ok')).toBe('→ ok')
+  })
+})
+
+describe('settle summary 墓碑 —— 终态 entry 的 summary 置顶渲染', () => {
+  test('终态 + summary:body 首行 📝 摘要(≤400 字),steps 完整跟在后面', () => {
+    let s: BgStore = { active: [mk({ id: 't1', type: 'subagent', toolUseId: 'p', description: 'd', status: 'running' })], pending: [] }
+    s = applyBgToolUse(s, 'p', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
+    const done: BgTaskEntry = { ...s.active[0], status: 'completed', summary: '结论:全部通过', endTime: 1000, usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } }
+    const body = (backgroundTaskPanel(done, 2000) as any).elements[0]
+    expect(body.content).toContain('📝 结论:全部通过')
+    expect(body.content.indexOf('📝')).toBeLessThan(body.content.indexOf('Grep'))
+  })
+
+  test('summary 超 400 字截断', () => {
+    const t = mk({ id: 't1', status: 'completed', summary: 'x'.repeat(500), usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } })
+    const body = (backgroundTaskPanel(t, 2000) as any).elements[0]
+    expect(body.content).toContain('x'.repeat(400))
+    expect(body.content).not.toContain('x'.repeat(401))
+  })
+
+  test('非终态 entry 的 summary 不渲染(running 时 body 仍精简)', () => {
+    const t = mk({ id: 't1', status: 'running', summary: '中途摘要' })
+    const body = (backgroundTaskPanel(t, 2000) as any).elements[0]
+    expect(body.content).not.toContain('中途摘要')
+    expect(body.content).not.toContain('📝')
   })
 })
 

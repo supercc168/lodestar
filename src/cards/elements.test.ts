@@ -72,6 +72,42 @@ describe('sanitizeMarkdownForCardKit', () => {
   })
 })
 
+describe('sanitizeMarkdownForCardKit —— LaTeX 定界符降级(飞书卡片不渲染数学)', () => {
+  test('\\[..\\] display math → 代码块', () => {
+    const out = sanitizeMarkdownForCardKit('推导:\\[ x^2 + y^2 = z^2 \\] 完毕')
+    expect(out).not.toContain('\\[')
+    expect(out).not.toContain('\\]')
+    expect(out).toContain('```\nx^2 + y^2 = z^2\n```')
+  })
+
+  test('$$..$$ display math → 代码块', () => {
+    const out = sanitizeMarkdownForCardKit('$$ E=mc^2 $$')
+    expect(out).not.toContain('$$')
+    expect(out).toContain('```\nE=mc^2\n```')
+  })
+
+  test('\\(..\\) inline math → 行内 code(定界符无歧义,直接降级)', () => {
+    const out = sanitizeMarkdownForCardKit('其中 \\( a+b \\) 为和')
+    expect(out).toBe('其中 `a+b` 为和')
+  })
+
+  test('$..$ 带数学特征(\\ 命令 / ^ / _ / =)才降级为行内 code', () => {
+    expect(sanitizeMarkdownForCardKit('设 $x^2$ 为平方')).toBe('设 `x^2` 为平方')
+    expect(sanitizeMarkdownForCardKit('令 $a=b$ 成立')).toBe('令 `a=b` 成立')
+    expect(sanitizeMarkdownForCardKit('分数 $\\frac{1}{2}$ 表示')).toBe('分数 `\\frac{1}{2}` 表示')
+  })
+
+  test('美元金额不误伤:「价格 $5 和 $10」原样保留', () => {
+    const src = '价格 $5 和 $10 之间'
+    expect(sanitizeMarkdownForCardKit(src)).toBe(src)
+  })
+
+  test('代码块内的 LaTeX 定界符字面保留(不降级)', () => {
+    const src = '```\n\\[ x^2 \\] $$y$$\n```'
+    expect(sanitizeMarkdownForCardKit(src)).toBe(src)
+  })
+})
+
 describe('downgradeExternalImagesForCardKit', () => {
   test('降级 prose 外链图片,代码块内图片原样保留', () => {
     const out = downgradeExternalImagesForCardKit('图 ![](https://x/y.png) 代码\n```\n![](https://c/d.png)\n```')
