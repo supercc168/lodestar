@@ -6947,6 +6947,32 @@ describe('Session assistant rendering', () => {
     }
   })
 
+  test('chat-list preview takes the head 40 chars of assistant text, not the tail (upstream 8de138c)', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const turn = turnState()
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const previews: string[] = []
+    const summarySpy = spyOn(cardkit, 'patchSummaryThrottled').mockImplementation(
+      (_cardId: string, content: string) => { previews.push(content) },
+    )
+
+    try {
+      // 100 字正文:头部 40 与尾部 60 无重叠,能区分新旧行为。
+      const body = '预览主题在开头这里' + 'x'.repeat(91)
+      session.appendAssistant(body)
+
+      expect(previews.length).toBeGreaterThan(0)
+      const preview = previews.at(-1)
+      expect(preview).toBe(body.slice(0, 40))
+      expect(preview).not.toBe(body.slice(-60))
+    } finally {
+      summarySpy.mockRestore()
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
   test('routes askusr host markers to host-ask cards on Claude too', async () => {
     const session = new Session('probe', 'chat_id') as any
     const turn = turnState()
