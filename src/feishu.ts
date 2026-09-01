@@ -31,6 +31,7 @@ import {
 } from './paths'
 import { log } from './log'
 import { writeJsonStateAtomic, writeStateFileAtomic } from './state-store'
+import { neutralizeMarkdownImagesInCard } from './cards/elements'
 
 const APP_ID = config.feishu.app_id
 const APP_SECRET = config.feishu.app_secret
@@ -669,13 +670,18 @@ export async function sendText(chatId: string, text: string): Promise<string | n
 }
 
 export async function sendCard(chatId: string, card: object): Promise<string | null> {
-  return sendViaSdkWithRetry('card', chatId, 'interactive', JSON.stringify(card))
+  return sendViaSdkWithRetry(
+    'card',
+    chatId,
+    'interactive',
+    JSON.stringify(neutralizeMarkdownImagesInCard(card)),
+  )
 }
 
 export async function updateCard(messageId: string, card: object): Promise<void> {
   const res: any = await client.im.v1.message.patch({
     path: { message_id: messageId },
-    data: { content: JSON.stringify(card) },
+    data: { content: JSON.stringify(neutralizeMarkdownImagesInCard(card)) },
   })
   if (res?.code && res.code !== 0) {
     throw new Error(`feishu message.patch failed code=${res.code} msg=${res.msg}`)
