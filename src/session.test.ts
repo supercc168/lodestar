@@ -8695,6 +8695,263 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
   })
 })
 
+describe('Session 轮转预算收紧与一次性诊断 (上游 4185808 主题 B)', () => {
+  test('confirmed 300305 capacity failure burns failureRotateCount and rotates', async () => {
+    const session = new Session('capacity-confirmed-rotate', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-capacity-confirmed')
+    const turn = turnState('card_capacity_confirmed')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.onCardWriteFailure(turn.cardId, 300305, {
+        kind: 'api',
+        failure: {
+          cardId: turn.cardId, operation: 'addElement', elementId: 'assistant_0',
+          code: 300305, message: 'element exceeds the limit',
+        },
+      })
+      expect(turn.failureRotateCount).toBe(1)
+      expect(turn.rotating).not.toBeNull()
+      await turn.rotating
+      expect(turn.cardId).not.toBe('card_capacity_confirmed')
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('300315 wrapping 300305 rotates; bare 300315 duplicate-id does not', async () => {
+    const session = new Session('capacity-wrapped-rotate', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-capacity-wrapped')
+    const wrapped = turnState('card_capacity_wrapped')
+    wrapped.userOpenId = ''
+    session.currentTurn = wrapped
+    cardkit.recordCardCreated(wrapped.cardId, 1)
+
+    try {
+      session.onCardWriteFailure(wrapped.cardId, 300315, {
+        kind: 'api',
+        failure: {
+          cardId: wrapped.cardId, operation: 'addElement',
+          code: 300315, message: 'Failed to add element: inner code: 300305, element exceeds limit',
+        },
+      })
+      expect(wrapped.failureRotateCount).toBe(1)
+      expect(wrapped.rotating).not.toBeNull()
+      await wrapped.rotating
+    } finally {
+      session.stopFooterStatus(wrapped)
+      await cardkit.dispose(wrapped.cardId)
+    }
+
+    const bare = turnState('card_bare_duplicate')
+    bare.userOpenId = ''
+    session.currentTurn = bare
+    cardkit.recordCardCreated(bare.cardId, 1)
+    try {
+      session.onCardWriteFailure(bare.cardId, 300315, {
+        kind: 'api',
+        failure: {
+          cardId: bare.cardId, operation: 'addElement', elementId: 'ctx_dup',
+          code: 300315, message: 'Duplicate ID; code: 300301',
+        },
+      })
+      expect(bare.failureRotateCount).toBe(0)
+      expect(bare.rotating).toBeNull()
+      expect(bare.cardId).toBe('card_bare_duplicate')
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('不是卡片元素上限')
+    } finally {
+      session.stopFooterStatus(bare)
+      await cardkit.dispose(bare.cardId)
+    }
+  })
+
+  test('repeated validation/content failures stay on the current card and warn once', async () => {
+    const session = new Session('validation-no-rotate', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-validation-no-rotate')
+    const turn = turnState('card_validation')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 2, (code, meta) => {
+      session.onCardWriteFailure(turn.cardId, code, meta)
+    })
+    let attempt = 0
+    const healthyFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      attempt++
+      return new Response(JSON.stringify(attempt === 1
+        ? {
+            code: 300315,
+            msg: 'elementID format error. It must start with an alphabet and not exceed 20 characters; code: 300301',
+          }
+        : { code: 200570, msg: 'invalid image keys; ErrorValue: image key img_key' }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      await cardkit.addElement(turn.cardId, {
+        tag: 'markdown', element_id: 'bad_element_1', content: 'x',
+      })
+      await cardkit.addElement(turn.cardId, {
+        tag: 'markdown', element_id: 'bad_element_2', content: 'x',
+      })
+
+      expect(attempt).toBe(2)
+      expect(turn.rotating).toBeNull()
+      expect(turn.rotateCount).toBe(0)
+      expect(turn.failureRotateCount).toBe(0)
+      expect(turn.rotateGivenUp).toBe(false)
+      expect(sentCards).toHaveLength(0)
+      expect(calls.some(call => call.path === '/cards/id_convert')).toBe(false)
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('不是卡片元素上限')
+    } finally {
+      globalThis.fetch = healthyFetch
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('non-capacity diagnostic redacts credentials and raw API payload (哨兵负向断言)', async () => {
+    const SENTINEL = 'SENTINEL_APP_SECRET_X'
+    const session = new Session('diagnostic-redaction', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-diagnostic-redaction')
+    const turn = turnState('card_redaction')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const previousSecret = config.feishu.app_secret
+    ;(config.feishu as any).app_secret = SENTINEL
+    const rawApiBody = `{"code":300315,"msg":"invalid payload; Authorization: Bearer ${SENTINEL}","data":{}}`
+
+    try {
+      session.onCardWriteFailure(turn.cardId, 300315, {
+        kind: 'api',
+        failure: {
+          cardId: turn.cardId, operation: 'addElement', elementId: 'seg_1',
+          code: 300315, httpStatus: 400, logId: 'log_redaction',
+          message: `cardkit POST /cards/${turn.cardId}/elements: HTTP 400 code=300315 msg=invalid payload; Authorization: Bearer ${SENTINEL}; raw=${rawApiBody}`,
+        },
+      })
+      // 第二次同 turn 非容量失败:不再重复通知
+      session.onCardWriteFailure(turn.cardId, 200570, {
+        kind: 'api',
+        failure: {
+          cardId: turn.cardId, operation: 'addElement', elementId: 'seg_2',
+          code: 200570, message: `invalid image keys; secret=${SENTINEL}`,
+        },
+      })
+
+      expect(turn.rotating).toBeNull()
+      expect(turn.failureRotateCount).toBe(0)
+      expect(sentRawTexts).toHaveLength(1)
+      const visible = sentRawTexts[0] ?? ''
+      // 可观测:错误码 + 操作类别在列
+      expect(visible).toContain('300315')
+      expect(visible).toContain('addElement')
+      // 凭据/raw payload 脱敏:哨兵串与完整 API 响应体不得出现
+      expect(visible).not.toContain(SENTINEL)
+      expect(visible).not.toContain(rawApiBody)
+      expect(visible).not.toContain('Authorization')
+      const cardJson = JSON.stringify([...sentCards, ...updatedCards])
+      expect(cardJson).not.toContain(SENTINEL)
+    } finally {
+      ;(config.feishu as any).app_secret = previousSecret
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('network failure keeps the local skip-rotate path without user diagnostic', async () => {
+    const session = new Session('network-silent-skip', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-network-silent')
+    const turn = turnState('card_network_silent')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.onCardWriteFailure(turn.cardId, undefined, {
+        kind: 'network',
+        failure: {
+          cardId: turn.cardId, operation: 'addElement', elementId: 'seg_net',
+          message: 'TypeError: fetch failed',
+        },
+      })
+      expect(turn.failureRotateCount).toBe(0)
+      expect(turn.rotating).toBeNull()
+      expect(turn.rotateGivenUp).toBe(false)
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('a late failure for a retired card cannot rotate or notify the current turn', async () => {
+    const session = new Session('stale-card-no-notify', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-stale-card')
+    const turn = turnState('card_current_owner')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.onCardWriteFailure('card_retired_owner', 300305, {
+        kind: 'api',
+        failure: {
+          cardId: 'card_retired_owner', operation: 'addElement',
+          code: 300305, message: 'component count exceeds limit',
+        },
+      })
+      expect(turn.cardId).toBe('card_current_owner')
+      expect(turn.rotateCount).toBe(0)
+      expect(turn.failureRotateCount).toBe(0)
+      expect(turn.rotating).toBeNull()
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('a replacement-card send failure latches log-only and cannot retry forever', async () => {
+    const session = new Session('rotate-send-failure', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-rotate-send-failure')
+    const turn = turnState('card_rotate_send_failure')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 50)
+    let sendCardAttempts = 0
+    feishuMockState.sendCard = async () => {
+      sendCardAttempts++
+      return null
+    }
+
+    try {
+      session.maybeMidTurnRotate()
+      await turn.rotating
+      expect(turn.rotateGivenUp).toBe(true)
+      expect(sentRawTexts).toHaveLength(1)
+      const attempts = sendCardAttempts
+      session.maybeMidTurnRotate()
+      expect(sendCardAttempts).toBe(attempts)
+    } finally {
+      feishuMockState.sendCard = null
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+})
+
 describe('Session SDK-initiated bg-task resume turns', () => {
   // 2026-07-04 事故:reviewer 后台 agent 完成 → SDK 自发恢复轮(init 无用户
   // 消息)合并出终报告,但 init handler 因 pendingUserMessageCount=0 不开卡,
