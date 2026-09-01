@@ -171,6 +171,9 @@ describe('codex turn/start delivery receipt', () => {
 
   test('a stdin write failure settles rejected instead of hanging', async () => {
     const { proc } = requestFailureTurnStartFixture('thread-write-failed', {
+      // writable:true 让写路径真正走到 write() 抛出(ec149d7 后 write 有
+      // 前置可写检查,裸 stub 缺 writable 字段会被前置检查短路)。
+      writable: true,
       write: () => {
         throw new Error('stdin closed')
       },
@@ -1182,6 +1185,55 @@ describe('codex JSON-RPC 控制面可靠性(上游 ec149d7 主题 H)', () => {
 
     await expect(proc.kill(2)).rejects.toThrow('did not exit after SIGTERM and SIGKILL')
     expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+  })
+
+  test('先注册 pending 再写,响应到达清 pending 与超时定时器', async () => {
+    let written = ''
+    const proc = makeCodexLifecycleHarness({
+      write: (chunk: string) => {
+        written = chunk
+        const id = JSON.parse(chunk).id
+        proc.handleMessage({ id, result: { ok: true } })
+        return true
+      },
+    })
+
+    await expect(proc.request('model/list', {}, 20)).resolves.toEqual({ ok: true })
+    expect(JSON.parse(written)).toMatchObject({ id: 1, method: 'model/list' })
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('异步 stdin 写失败以原始 error 拒绝(EPIPE 可分类),pending 不泄漏', async () => {
+    const epipe = Object.assign(new Error('EPIPE'), { code: 'EPIPE' })
+    const proc = makeCodexLifecycleHarness({
+      write: (_chunk: string, callback: (error?: Error) => void) => {
+        queueMicrotask(() => callback(epipe))
+        return true
+      },
+    })
+
+    const outcome = await settlementWithin(proc.request('initialize', {}, 200))
+    expect(outcome).toContain('EPIPE')
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('SIGTERM 未死升级 SIGKILL 并等真实 exit 才返回', async () => {
+    const proc = makeCodexLifecycleHarness()
+    const signals: string[] = []
+    proc.proc.kill = (signal: string) => {
+      signals.push(signal)
+      if (signal === 'SIGKILL') {
+        queueMicrotask(() => {
+          proc.alive = false
+          proc.resolveExit()
+        })
+      }
+      return true
+    }
+
+    await expect(proc.kill(5)).resolves.toBeUndefined()
+    expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(proc.alive).toBe(false)
   })
 })
 
