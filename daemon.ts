@@ -44,6 +44,8 @@ import { config } from './src/config'
 import { log } from './src/log'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
 import { checkPidGuard, writePidFile } from './src/pid-guard'
+import { isStaleAtReceipt } from './src/inbound-message'
+import { PerKeyActor, createPerChatAdmission } from './src/card-action-runtime'
 
 // ── PID guard ───────────────────────────────────────────────────────────
 // dev 路径 (`bun daemon.ts` 直接跑) 不经过 cli.ts, 所以这里也守一道。
@@ -93,6 +95,26 @@ process.on('uncaughtException',  e => log(`uncaughtException: ${e}`))
 // ── Session registry ────────────────────────────────────────────────────
 const sessions = new Map<string, Session>()  // key = chatId
 let pendingReviveSessionNames = new Set<string>()
+const chatActor = new PerKeyActor()
+const messageAdmission = createPerChatAdmission<any>({
+  actor: chatActor,
+  key: data => String(data?.message?.chat_id ?? ''),
+  execute: (data, acceptedAt) => handleMessage(data, acceptedAt),
+})
+
+/** Preserve Feishu delivery order per chat without delaying the WS ACK. Work
+ * in different groups remains concurrent; messages and lifecycle commands in
+ * one group cannot overtake an earlier attachment download/card open. */
+function enqueueMessage(data: any, source = 'ws'): boolean {
+  const chatId = String(data?.message?.chat_id ?? '')
+  const admitted = messageAdmission.accept(data)
+  if (!admitted.accepted) {
+    log(`${source}: reject inbound message${chatId ? '' : ' without chat_id'}: actor ${admitted.reason}`)
+    return false
+  }
+  void admitted.completion.catch(e => { log(`${source}: handleMessage rejected chat=${chatId.slice(0, 8)}…: ${e}`) })
+  return true
+}
 
 function currentAliveSessionNames(): string[] {
   const alive = new Set<string>()
@@ -300,7 +322,7 @@ function extractPostMarkdown(
 const STALE_THRESHOLD_MS = 30_000
 const seenMessageIds = new Set<string>()
 
-async function handleMessage(data: any): Promise<void> {
+async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> {
   const message = data?.message
   if (!message) return
 
@@ -324,9 +346,12 @@ async function handleMessage(data: any): Promise<void> {
   }
 
   // Drop replays of stale messages (Lark redelivers unacked events on reconnect).
+  // 过期判定用准入时刻 receivedAt(enqueueMessage 捕获),不是本函数开跑的处理
+  // 时刻 —— per-chat FIFO 化后同群排队几十秒是正常态,处理时刻口径会把排队久的
+  // 新消息误杀(上游 ec149d7 点名坑)。
   const createTime = Number(message.create_time ?? 0)
-  if (createTime > 0 && Date.now() - createTime > STALE_THRESHOLD_MS) {
-    log(`drop stale message ${msgId} age=${Math.round((Date.now() - createTime) / 1000)}s`)
+  if (isStaleAtReceipt(createTime, receivedAt, STALE_THRESHOLD_MS)) {
+    log(`drop stale message ${msgId} ageAtReceipt=${Math.round((receivedAt - createTime) / 1000)}s`)
     if (msgId) void feishu.addReaction(msgId, 'CrossMark')
     return
   }
@@ -792,8 +817,10 @@ function startDebugSocket(): void {
           },
         }
         log(`debug: inject text=${JSON.stringify(text).slice(0, 80)} msg_id=${realMsgId}`)
-        // Don't await — match real WS dispatcher behavior (fire-and-forget per event).
-        handleMessage(payload).catch(e => log(`debug: handleMessage rejected: ${e}`))
+        // Don't await — match real WS dispatcher behavior (per-chat FIFO admission).
+        if (!enqueueMessage(payload, 'debug')) {
+          return new Response('inbound message rejected at admission', { status: 503 })
+        }
         return new Response(JSON.stringify({ ok: true, msg_id: realMsgId }), {
           headers: { 'content-type': 'application/json' },
         })
@@ -921,9 +948,10 @@ async function boot(): Promise<void> {
       // 失败把事件直接丢弃(后台 event log 里这一类 errorInfo=timeout,
       // costMills≈3760ms,用户侧表现就是"发的消息 daemon 完全没收到")。
       // 这里立刻 return 让 dispatcher 回 ack,实际处理后台跑;handleMessage
-      // 入口已用 seenMessageIds 做了同 message_id 去重,fire-and-forget
-      // 不会引入重复处理。
-      handleMessage(d).catch(e => log(`handleMessage: ${e}`))
+      // 入口已用 seenMessageIds 做了同 message_id 去重。enqueueMessage 同步
+      // 入队(PerKeyActor 按 chat FIFO,receivedAt 在准入时刻捕获),ACK 不等
+      // 业务处理 —— 同群保序,异群仍并发。
+      if (!enqueueMessage(d)) throw new Error('inbound message rejected at admission')
     },
   })
   dispatcher.register({
