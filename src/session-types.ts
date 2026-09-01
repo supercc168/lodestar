@@ -57,7 +57,28 @@ export interface TurnState {
   planUpdateCount: number
   goalUpdateCount: number
   contextCompactCount: number
-  contextCompactionPending: Map<string, { i: number; cardId: string; notice: any }>
+  contextCompactionPending: Map<string, {
+    i: number
+    cardId: string
+    notice: any
+    created: boolean
+    createFailure?: import('./cardkit').CardWriteFailure
+    createPromise: Promise<boolean>
+  }>
+  /** Stable compaction identities already rendered to completion. Codex can
+   * report the same physical compaction through item/completed and another
+   * protocol surface; duplicates must not create a second timeline panel.
+   * (上游 4185808) */
+  contextCompactionCompleted: Set<string>
+  /** Completion mutations currently awaiting Card Kit confirmation. */
+  contextCompactionCompleting: Set<string>
+  /** Stable element indexes for end/event notices that had no start panel;
+   * retained across a failed add so a duplicate can retry the same element. */
+  contextCompactionEndOnly: Map<string, number>
+  /** Last successfully observed completion time, used only to coalesce an
+   * immediate anonymous duplicate from a second protocol surface. */
+  lastContextCompactionCompletedAt: number
+  lastContextCompactionWasAnonymous: boolean
   /** Compaction phases already observed by the watchdog, used to deduplicate
    * repeated phase notifications for the same active turn. */
   watchdogSeenCompactionPhases: Set<string>

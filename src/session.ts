@@ -253,6 +253,18 @@ function compactionKey(notice: ContextCompactedNotification): string {
   return notice.itemId || notice.turnId || '__latest__'
 }
 
+/** Cross-surface receipt aliases for one physical compaction: the same event
+ * can arrive as an item notification and a generic turn notification in
+ * either order (上游 4185808). */
+function compactionReceiptKeys(notice: ContextCompactedNotification): string[] {
+  const keys: string[] = []
+  if (notice.itemId) keys.push(`item:${notice.itemId}`)
+  if (notice.turnId) {
+    keys.push(`turn:${notice.threadId ?? notice.sessionId ?? '-'}:${notice.turnId}`)
+  }
+  return keys
+}
+
 function latestPendingCompactionKey(turn: TurnState): string | null {
   let key: string | null = null
   for (const k of turn.contextCompactionPending.keys()) key = k
@@ -364,6 +376,11 @@ const CARD_ELEMENT_SOFT_LIMIT = 50
  * that itself exceeds the capacity ceiling. Network transport blips and
  * footer ticks never consume this budget (see onCardWriteFailure). */
 const MAX_MIDTURN_ROTATES = 5
+/** Bounded tombstone map for compaction receipts (item/turn aliases). */
+const MAX_CONTEXT_COMPACTION_RECEIPTS = 256
+/** Coalescing window for an anonymous duplicate of a just-completed
+ * compaction arriving from a second protocol surface. */
+const ANONYMOUS_COMPACTION_DEDUPE_MS = 10_000
 /** Claude Agent SDK does not emit stream `init` until the first user input.
  * Still give synchronous/early startup failures a chance to surface before
  * presenting the session as ready. */
@@ -385,6 +402,21 @@ export class Session {
   // ── package-internal state (touched by session-*.ts helpers) ──
   proc: AgentProcess | null = null
   currentTurn: TurnState | null = null
+  /** Item-scoped compaction ownership survives a turn-card close so a late
+   * completion cannot attach itself to the next turn. Completed receipts keep
+   * no TurnState reference and are bounded as duplicate tombstones.
+   * (上游 4185808 主题 C) */
+  private contextCompactionReceipts = new Map<string, {
+    ownerId: number | null
+    completed: boolean
+    completedAt: number
+    completionKey?: string
+    hasItemAlias: boolean
+  }>()
+  private contextCompactionOwnerIds = new WeakMap<TurnState, number>()
+  private contextCompactionOwnerSequence = 0
+  private lastManualContextCompactionCompletedAt = 0
+  private lastManualContextCompactionWasAnonymous = false
   /** 已确认后台的任务(workflow/monitor 白名单,或收到 is_backgrounded:true 提升)。
    *  驱动后台游标卡渲染。以 task_id 为 key,跨 turn 累积 —— 后台任务生命周期
    *  不受 turn 边界约束。 */
@@ -5813,6 +5845,11 @@ export class Session {
       goalUpdateCount: 0,
       contextCompactCount: 0,
       contextCompactionPending: new Map(),
+      contextCompactionCompleted: new Set(),
+      contextCompactionCompleting: new Set(),
+      contextCompactionEndOnly: new Map(),
+      lastContextCompactionCompletedAt: 0,
+      lastContextCompactionWasAnonymous: false,
       watchdogSeenCompactionPhases: new Set(),
       toolBatches: new Map(),
       openBatchI: null,
@@ -6113,6 +6150,31 @@ export class Session {
             type: 'insert_before', targetElementId: turn.taskLiveInserted ? cards.ELEMENTS.taskBoardLive : cards.ELEMENTS.footer,
           })
         }
+        // A compaction can span the rotation window. Rebuild its in-progress
+        // panel on the fresh card and move the pending receipt before the end
+        // event arrives; otherwise completion would PUT the disposed old card
+        // and leave the visible panel stuck at "压缩中" (上游 4185808)。
+        for (const pending of turn.contextCompactionPending.values()) {
+          if (pending.cardId !== oldCardId) continue
+          pending.cardId = newCardId
+          pending.created = false
+          pending.createFailure = undefined
+          const compactElementId = cards.ELEMENTS.contextCompact(pending.i)
+          pending.createPromise = cardkit.addElementResult(
+            newCardId,
+            cards.contextCompactionElement(pending.i, pending.notice, compactElementId),
+            {
+              type: 'insert_before',
+              targetElementId: sessionTools.taskLiveAnchor(turn),
+            },
+          ).then(result => {
+            if (pending.cardId === newCardId) {
+              pending.created = result.landed
+              pending.createFailure = result.failure
+            }
+            return result.landed
+          })
+        }
         // 已完成但在旧卡插入失败的 assistant 段也要搬到新卡。正文现在是
         // block 完成后一次性 addElement；如果这个 addElement 撞上元素上限,
         // cardkit 会把旧元素标 dead 并触发轮转,这里负责补显示。
@@ -6218,21 +6280,79 @@ export class Session {
   }
 
   private handleContextCompacted(source: AgentProcess, notice: ContextCompactedNotification): void {
-    const turn = this.currentTurn
-    if (!turn) {
-      if (this.manualContextCompactionPending) {
-        log(`session "${this.sessionName}": manual context compaction ${notice.phase ?? 'event'} with no current turn`)
-        return
+    const receiptKeys = compactionReceiptKeys(notice)
+    // Standalone `cm` owns its own status card and watcher. Even if a user
+    // starts a new turn before that command finishes, its completion must not
+    // leak into the new conversation card (上游 4185808).
+    if (this.manualContextCompactionPending) {
+      if (receiptKeys.length > 0) {
+        this.rememberContextCompactionReceipt(
+          receiptKeys,
+          null,
+          notice.phase !== 'start',
+        )
       }
-      if (notice.phase === 'start') {
-        log(`session "${this.sessionName}": context compaction start with no current turn`)
-        return
+      if (notice.phase !== 'start') {
+        this.lastManualContextCompactionCompletedAt = Date.now()
+        this.lastManualContextCompactionWasAnonymous = receiptKeys.length === 0
       }
-      log(`session "${this.sessionName}": context compacted with no current turn`)
-      const backend = this.proc ? this.backendLabel(this.proc.provider) : this.backendLabel()
-      void feishu.sendTextRaw(this.chatId, `🚨🚨🚨 CONTEXT COMPACTED / 上下文已压缩 🚨🚨🚨\n\n${backend} 报告发生了上下文压缩,但当前没有可写的对话卡片。`)
+      log(`session "${this.sessionName}": manual context compaction ${notice.phase ?? 'event'} handled by command status card`)
       return
     }
+    if (notice.phase === 'start') {
+      this.lastManualContextCompactionWasAnonymous = false
+    } else if (
+      (receiptKeys.length === 0 || this.lastManualContextCompactionWasAnonymous) &&
+      Date.now() - this.lastManualContextCompactionCompletedAt < ANONYMOUS_COMPACTION_DEDUPE_MS
+    ) {
+      log(`session "${this.sessionName}": late anonymous manual compaction duplicate ignored`)
+      return
+    }
+
+    const turn = this.currentTurn
+    const itemReceiptKey = notice.itemId ? `item:${notice.itemId}` : undefined
+    const turnReceiptKey = receiptKeys.find(candidate => candidate.startsWith('turn:'))
+    let receiptLookupKey = itemReceiptKey ?? turnReceiptKey
+    let receipt = receiptLookupKey
+      ? this.contextCompactionReceipts.get(receiptLookupKey)
+      : undefined
+    // The generic turn notification and item notification may arrive in
+    // either order. A near-simultaneous completed turn alias closes the same
+    // physical event; a later explicit item remains eligible as a new one.
+    if (itemReceiptKey && !receipt && notice.phase !== 'start' && turnReceiptKey) {
+      const turnReceipt = this.contextCompactionReceipts.get(turnReceiptKey)
+      if (
+        (!turnReceipt?.hasItemAlias && turnReceipt?.completed &&
+          Date.now() - turnReceipt.completedAt < ANONYMOUS_COMPACTION_DEDUPE_MS) ||
+        (!turnReceipt?.hasItemAlias && turnReceipt?.completionKey &&
+          turn?.contextCompactionCompleting.has(turnReceipt.completionKey))
+      ) {
+        receiptLookupKey = turnReceiptKey
+        receipt = turnReceipt
+        // Claim this explicit item as the item-side alias of the generic
+        // receipt. Later distinct items in the same turn must remain new.
+        turnReceipt.hasItemAlias = true
+        this.contextCompactionReceipts.delete(itemReceiptKey)
+        this.contextCompactionReceipts.set(itemReceiptKey, turnReceipt)
+      }
+    }
+
+    if (!turn) {
+      // 本地适配:上游在此把开卡窗口事件缓冲进 TurnOpenOwner.pendingCompactions
+      // (仅 backendTurnStarted 才缓冲);本地 turn-open 机制是 opaque token,
+      // 无该结构 —— 缓冲子特性跳过,identified 事件按 receipts 记账后安静放行。
+      if (receiptKeys.length > 0) {
+        this.rememberContextCompactionReceipt(receiptKeys, null, notice.phase !== 'start')
+      }
+      // A terminal compaction notification may legally arrive after result.
+      // It carries no assistant content and needs no user action (上游
+      // 4185808:多协议面重复投递会让旧的 🚨 全群告警变成扰民误报)。
+      log(`session "${this.sessionName}": context compaction ${notice.phase ?? 'event'} with no current turn thread=${notice.threadId ?? '-'} turn=${notice.turnId ?? '-'} item=${notice.itemId ?? '-'}`)
+      return
+    }
+
+    // 本地独有:watchdog 有意义进展观测(每 key:phase 一次)。放在 dedupe
+    // 之前 —— 重复通知靠 watchdogSeenCompactionPhases 自身去重,不影响判定。
     const watchdogPhase = `${compactionKey(notice)}:${notice.phase ?? 'event'}`
     if (
       !turn.watchdogSeenCompactionPhases.has(watchdogPhase) &&
@@ -6240,42 +6360,286 @@ export class Session {
     ) {
       turn.watchdogSeenCompactionPhases.add(watchdogPhase)
     }
+
+    if (receiptLookupKey && receipt?.completed) {
+      log(`session "${this.sessionName}": duplicate context compaction ${notice.phase ?? 'event'} ignored receipt=${receiptLookupKey}`)
+      return
+    }
+    const ownerId = this.contextCompactionOwnerId(turn)
+    if (receiptLookupKey && receipt && receipt.ownerId !== ownerId) {
+      this.rememberContextCompactionReceipt(receiptKeys, null, true)
+      log(`session "${this.sessionName}": late context compaction ${notice.phase ?? 'event'} ignored receipt=${receiptLookupKey} (turn owner changed)`)
+      return
+    }
+    if (
+      receiptLookupKey &&
+      receipt?.completionKey &&
+      turn.contextCompactionCompleting.has(receipt.completionKey)
+    ) {
+      log(`session "${this.sessionName}": context compaction alias already writing receipt=${receiptLookupKey}`)
+      return
+    }
+    if (
+      notice.phase !== 'start' &&
+      receiptKeys.length > 0 &&
+      turn.contextCompactionPending.size === 0 &&
+      turn.contextCompactionCompleting.has('__anonymous__')
+    ) {
+      log(`session "${this.sessionName}": identified context compaction duplicate ignored while anonymous completion writes`)
+      return
+    }
+    if (
+      notice.phase !== 'start' &&
+      receiptKeys.length > 0 &&
+      turn.contextCompactionPending.size === 0 &&
+      turn.lastContextCompactionWasAnonymous &&
+      Date.now() - turn.lastContextCompactionCompletedAt < ANONYMOUS_COMPACTION_DEDUPE_MS
+    ) {
+      log(`session "${this.sessionName}": identified context compaction duplicate ignored after anonymous completion`)
+      return
+    }
+
+    if (notice.phase === 'start') {
+      const key = compactionKey(notice)
+      if (turn.contextCompactionPending.has(key) || turn.contextCompactionCompleted.has(key)) {
+        log(`session "${this.sessionName}": duplicate context compaction start ignored key=${key}`)
+        return
+      }
+      this.startWorkingFooter(turn)
+      if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
+      turn.openBatchI = null
+      this.maybeMidTurnRotate()
+      turn.lastContextCompactionWasAnonymous = false
+      if (receiptKeys.length > 0) {
+        this.rememberContextCompactionReceipt(receiptKeys, ownerId, false)
+      }
+      const i = turn.contextCompactCount++
+      const cardId = turn.cardId
+      const elementId = cards.ELEMENTS.contextCompact(i)
+      const pending = {
+        i,
+        cardId,
+        notice,
+        created: false,
+        createFailure: undefined as cardkit.CardWriteFailure | undefined,
+        createPromise: Promise.resolve(false),
+      }
+      pending.createPromise = cardkit.addElementResult(
+        cardId,
+        cards.contextCompactionElement(i, notice, elementId),
+        {
+          type: 'insert_before',
+          targetElementId: sessionTools.taskLiveAnchor(turn),
+        },
+      ).then(result => {
+        if (pending.cardId === cardId) {
+          pending.created = result.landed
+          pending.createFailure = result.failure
+        }
+        return result.landed
+      })
+      turn.contextCompactionPending.set(key, pending)
+      log(`session "${this.sessionName}": context compaction start #${i + 1} key=${key}`)
+      cardkit.patchSummaryThrottled(turn.cardId, `🚨 压缩×${turn.contextCompactCount}`)
+      return
+    }
+
+    if (
+      !notice.itemId &&
+      !notice.turnId &&
+      turn.contextCompactionCompleting.size > 0
+    ) {
+      log(`session "${this.sessionName}": anonymous context compaction duplicate ignored while completion writes`)
+      return
+    }
+    if (
+      !notice.itemId &&
+      !notice.turnId &&
+      turn.contextCompactionPending.size === 0 &&
+      Date.now() - turn.lastContextCompactionCompletedAt < ANONYMOUS_COMPACTION_DEDUPE_MS
+    ) {
+      log(`session "${this.sessionName}": immediate anonymous context compaction duplicate ignored`)
+      return
+    }
+    const explicitKey = notice.itemId || notice.turnId
+    if (explicitKey && turn.contextCompactionCompleted.has(explicitKey)) {
+      log(`session "${this.sessionName}": duplicate context compaction completion ignored key=${explicitKey}`)
+      return
+    }
+    const key = notice.itemId
+      ? (turn.contextCompactionPending.has(notice.itemId) ? notice.itemId : null)
+      : latestPendingCompactionKey(turn)
+    const pending = key ? turn.contextCompactionPending.get(key) : undefined
+    const completionKey = key ?? explicitKey ?? '__anonymous__'
+    if (turn.contextCompactionCompleting.has(completionKey)) {
+      log(`session "${this.sessionName}": context compaction completion already writing key=${completionKey}`)
+      return
+    }
+
     this.startWorkingFooter(turn)
     if (turn.currentAssistantSegmentId) this.finalizeCurrentAssistantSegment()
     turn.openBatchI = null
     this.maybeMidTurnRotate()
-    if (notice.phase === 'start') {
-      const i = turn.contextCompactCount++
-      const key = compactionKey(notice)
-      turn.contextCompactionPending.set(key, { i, cardId: turn.cardId, notice })
-      const elementId = cards.ELEMENTS.contextCompact(i)
-      log(`session "${this.sessionName}": context compaction start #${i + 1} key=${key}`)
-      void cardkit.addElement(turn.cardId, cards.contextCompactionElement(i, notice, elementId), {
-        type: 'insert_before',
-        targetElementId: sessionTools.taskLiveAnchor(turn),
-      })
-      cardkit.patchSummaryThrottled(turn.cardId, `🚨 压缩×${turn.contextCompactCount}`)
-      return
-    }
-    const key = notice.itemId && turn.contextCompactionPending.has(notice.itemId)
-      ? notice.itemId
-      : latestPendingCompactionKey(turn)
-    const pending = key ? turn.contextCompactionPending.get(key) : undefined
-    if (key) turn.contextCompactionPending.delete(key)
     const merged = mergeCompactionNotices(pending?.notice, notice)
-    const i = pending?.i ?? turn.contextCompactCount++
-    const cardId = pending?.cardId ?? turn.cardId
-    const elementId = cards.ELEMENTS.contextCompact(i)
-    log(`session "${this.sessionName}": context compaction completed #${i + 1}${key ? ` key=${key}` : ''}`)
-    if (pending) {
-      void cardkit.replaceElement(cardId, elementId, cards.contextCompactionElement(i, merged, elementId))
-    } else {
-      void cardkit.addElement(cardId, cards.contextCompactionElement(i, merged, elementId), {
-        type: 'insert_before',
-        targetElementId: sessionTools.taskLiveAnchor(turn),
-      })
+    const priorEndOnlyI = turn.contextCompactionEndOnly.get(completionKey)
+    const i = pending?.i ?? priorEndOnlyI ?? turn.contextCompactCount++
+    if (!pending && priorEndOnlyI === undefined) {
+      turn.contextCompactionEndOnly.set(completionKey, i)
     }
+    turn.contextCompactionCompleting.add(completionKey)
+    const completionReceiptKeys = [...new Set([
+      ...compactionReceiptKeys(pending?.notice ?? {}),
+      ...receiptKeys,
+    ])]
+    if (completionReceiptKeys.length > 0) {
+      this.rememberContextCompactionReceipt(
+        completionReceiptKeys,
+        ownerId,
+        false,
+        completionKey,
+      )
+    }
+    const elementId = cards.ELEMENTS.contextCompact(i)
+    const element = cards.contextCompactionElement(i, merged, elementId)
+    log(`session "${this.sessionName}": context compaction completion write #${i + 1} key=${completionKey}`)
+    void (async () => {
+      let landed = false
+      if (!pending) {
+        for (let attempt = 0; attempt < MAX_MIDTURN_ROTATES + 2; attempt++) {
+          const targetCardId = turn.cardId
+          landed = await cardkit.addElementChecked(targetCardId, element, {
+            type: 'insert_before',
+            targetElementId: sessionTools.taskLiveAnchor(turn),
+          })
+          if (landed) break
+          const rotation = turn.rotating
+          if (rotation) {
+            await rotation
+            continue
+          }
+          if (turn.cardId !== targetCardId) continue
+          break
+        }
+      } else {
+        // A start add and rotation copy may still be in flight. Always finish
+        // the latest authoritative card; a failed start is retried as an add
+        // of the terminal element, not a PUT to a phantom id.
+        for (let attempt = 0; attempt < MAX_MIDTURN_ROTATES + 2; attempt++) {
+          const targetCardId = pending.cardId
+          await pending.createPromise
+          if (pending.cardId !== targetCardId) continue
+          if (pending.created) {
+            landed = await cardkit.replaceElementChecked(targetCardId, elementId, element)
+          } else {
+            if (cardkit.isDuplicateElementFailure(
+              pending.createFailure?.code,
+              pending.createFailure,
+            )) {
+              cardkit.clearDeadElementForReconcile(targetCardId, elementId)
+              landed = await cardkit.replaceElementChecked(
+                targetCardId,
+                elementId,
+                element,
+                { notifyCardFailure: false },
+              )
+            }
+            if (!landed) {
+              landed = await cardkit.addElementChecked(targetCardId, element, {
+                type: 'insert_before',
+                targetElementId: sessionTools.taskLiveAnchor(turn),
+              })
+            }
+          }
+          if (pending.cardId !== targetCardId) continue
+          if (landed) {
+            pending.created = true
+            break
+          }
+          const rotation = turn.rotating
+          if (rotation) {
+            await rotation
+            continue
+          }
+          if (pending.cardId !== targetCardId) continue
+          break
+        }
+      }
+      turn.contextCompactionCompleting.delete(completionKey)
+      if (!landed) {
+        log(`session "${this.sessionName}": context compaction completion write MISS #${i + 1} key=${completionKey}`)
+        return
+      }
+      if (key && turn.contextCompactionPending.get(key) === pending) {
+        turn.contextCompactionPending.delete(key)
+      }
+      turn.contextCompactionEndOnly.delete(completionKey)
+      if (completionKey !== '__anonymous__') {
+        turn.contextCompactionCompleted.add(completionKey)
+      }
+      turn.lastContextCompactionCompletedAt = Date.now()
+      turn.lastContextCompactionWasAnonymous = completionKey === '__anonymous__'
+      if (completionReceiptKeys.length > 0) {
+        const claimedAliases = [...this.contextCompactionReceipts.entries()]
+          .filter(([, candidate]) => candidate.completionKey === completionKey)
+          .map(([alias]) => alias)
+        this.rememberContextCompactionReceipt(
+          [...new Set([...completionReceiptKeys, ...claimedAliases])],
+          null,
+          true,
+        )
+      }
+      log(`session "${this.sessionName}": context compaction completed #${i + 1} key=${completionKey}`)
+    })().catch(error => {
+      turn.contextCompactionCompleting.delete(completionKey)
+      log(`session "${this.sessionName}": context compaction completion transaction failed: ${messageOf(error)}`)
+    })
     cardkit.patchSummaryThrottled(turn.cardId, `🚨 压缩×${turn.contextCompactCount}`)
+  }
+
+  private contextCompactionOwnerId(turn: TurnState): number {
+    const current = this.contextCompactionOwnerIds.get(turn)
+    if (current !== undefined) return current
+    const id = ++this.contextCompactionOwnerSequence
+    this.contextCompactionOwnerIds.set(turn, id)
+    return id
+  }
+
+  private rememberContextCompactionReceipt(
+    keys: string[],
+    ownerId: number | null,
+    completed: boolean,
+    completionKey?: string,
+  ): void {
+    const receipt = {
+      ownerId: completed ? null : ownerId,
+      completed,
+      completedAt: completed ? Date.now() : 0,
+      ...(completed || !completionKey ? {} : { completionKey }),
+      hasItemAlias: keys.some(key => key.startsWith('item:')),
+    }
+    for (const key of keys) {
+      this.contextCompactionReceipts.delete(key)
+      this.contextCompactionReceipts.set(key, receipt)
+    }
+    while (this.contextCompactionReceipts.size > MAX_CONTEXT_COMPACTION_RECEIPTS) {
+      let victim: {
+        ownerId: number | null
+        completed: boolean
+        completedAt: number
+        completionKey?: string
+        hasItemAlias: boolean
+      } | undefined
+      for (const candidate of this.contextCompactionReceipts.values()) {
+        if (candidate.completed) { victim = candidate; break }
+        victim ??= candidate
+      }
+      if (!victim) break
+      // Aliases for one receipt are an atomic tombstone. Remove all together
+      // so eviction never leaves item-only or turn-only half-state behind.
+      for (const [key, candidate] of this.contextCompactionReceipts) {
+        if (candidate === victim) this.contextCompactionReceipts.delete(key)
+      }
+    }
   }
 
   private handleTurnPlanUpdated(source: AgentProcess, update: TurnPlanUpdated): void {
