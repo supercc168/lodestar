@@ -3882,6 +3882,14 @@ export class Session {
     this.backgroundDetailAdded = new Set(seeded)
     this.backgroundFoldSig = older.length > 0 ? cards.foldSignature(older) : null
     log(`session "${this.sessionName}": background card opened cardId=${cardId.slice(0, 12)} tasks=${this.backgroundTasks.length}`)
+    // 开卡 await 窗口内任务可能已全部终态(短命 agent:start/settle 同批到达,
+    // settle 那刻 backgroundCard 还是 null 空转了)—— 落地后复查,直接沉降,
+    // 否则活卡带着终态快照永不 settle(cf41941 #9;走本地无参 settle,
+    // identity-guard 兜竞态)。
+    if (!cards.hasActiveBgTask(this.backgroundTasks)) {
+      void this.settleBackgroundCard()
+      return
+    }
     this.startBackgroundRefreshTick()
   }
 
@@ -4644,11 +4652,20 @@ export class Session {
       if (before !== backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)) {
         this.observeWatchdogMeaningful(p, 'bg_task_settled')
       }
-      // turn 已收尾后才结算的任务:SDK 会自发开一轮恢复轮合并结果,
-      // 标记给下一个无用户批次的 init 开卡。
-      if (!this.currentTurn && !this.openingTurn && this.initCount >= 1) {
+      // turn 已收尾后才结算的任务:Claude SDK 会自发开一轮恢复轮合并结果,
+      // 标记给下一个无用户批次的 init 开卡。Codex 的 collab 子 agent 结果由
+      // 主 turn 内的 wait 收编,app-server 不会自发开轮 —— 不置位(cf41941 #11)。
+      if (p.provider === 'claude' && !this.currentTurn && !this.openingTurn && this.initCount >= 1) {
         this.bgResumePending = true
       }
+    })
+    p.on('subagent_step', (e: { thread_id: string; item_id: string; tool: string; phase: 'started' | 'completed'; brief: string }) => {
+      if (this.proc !== p) return
+      // Codex 子 agent 的过程步骤 → 后台卡 steps(主卡不承载,见 codex-process
+      // isForeignThread 分流)。未知 thread(先于 started 到达的极早期)丢弃
+      // (applySubagentStep 对无归属 thread 返回原 store 引用)。
+      this.applyBgStore(cards.applySubagentStep(this.bgStore(), e.thread_id, e.item_id, e.tool, e.phase, e.brief))
+      this.onBackgroundTaskChanged()
     })
     // ── 模型拒绝 / 降级(SDK system/model_refusal_*,仅 Claude 后端 emit)──────
     // 主模型 refusal 后:session=主线程换模型(整个会话);local=子agent/副问/后台

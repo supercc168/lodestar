@@ -8756,7 +8756,9 @@ describe('Session codex 子 agent 后台游标卡接线(上游 cf41941)', () => 
     proc.emit('bg_task_started', { task_id: 'sub-1', task_type: 'local_agent', description: 'worker' })
     proc.emit('bg_task_updated', { task_id: 'sub-1', patch: { is_backgrounded: true } })
 
-    proc.emit('subagent_step', { thread_id: 'sub-1', item_id: 'cmd-1', tool: 'Bash', phase: 'started', brief: 'Bash `bun test`' })
+    // wire 形态与 codex-process emitSubagentStep 一致:brief 不带工具名前缀
+    // (applySubagentStep 在 started 时自己拼 `${tool} ${brief}`)。
+    proc.emit('subagent_step', { thread_id: 'sub-1', item_id: 'cmd-1', tool: 'Bash', phase: 'started', brief: '`bun test`' })
     proc.emit('subagent_step', { thread_id: 'sub-1', item_id: 'cmd-1', tool: undefined, phase: 'completed', brief: '→ 12 pass' })
 
     const t = session.backgroundTasks.find((x: any) => x.id === 'sub-1')
@@ -8768,6 +8770,9 @@ describe('Session codex 子 agent 后台游标卡接线(上游 cf41941)', () => 
     proc.emit('subagent_step', { thread_id: 'sub-nope', item_id: 'x-1', tool: 'Bash', phase: 'started', brief: 'x' })
     expect(session.backgroundTasks.some((x: any) => x.id === 'sub-nope')).toBe(false)
     expect(session.pendingBgTasks).toEqual([])
+    // 收尾:卸下预置句柄走纯内存清理分支,防 afterEach dispose 的 settle
+    // continuation 在 fetch 复原后撞真实 API(挂账第 2 项既有模式,不新增)。
+    session.backgroundCard = null
   })
 
   test('codex 子 agent bg_task_settled 不置位 bgResumePending(结果由主 turn 收编,不自发开轮)', () => {
