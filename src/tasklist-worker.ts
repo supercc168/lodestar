@@ -7,6 +7,7 @@ import { resolveCodexBin } from './codex-process'
 import * as feishu from './feishu'
 import { log } from './log'
 import * as tasklist from './tasklist'
+import { withProjectWorktreeLock } from './worktree'
 import {
   AI_AUTO_BRANCH,
   AI_REVIEW_BRANCH,
@@ -51,7 +52,9 @@ const CODEX_REASONING_EFFORT = process.env.LODESTAR_TASK_CODEX_EFFORT ?? 'xhigh'
 
 let timer: ReturnType<typeof setInterval> | null = null
 let bootTimer: ReturnType<typeof setTimeout> | null = null
+let startupPromise: Promise<void> | null = null
 let running = false
+let stopping = false
 /** One long-running automation per project. A process in project A must not
  * hold the global scanner open and starve every other binding. */
 const activeProjectScans = new Map<string, Promise<void>>()
@@ -75,21 +78,47 @@ type AutomationRunHandle = SpawnedAutomationRunHandle | RecoveredAutomationRunHa
 const activeAutomationRuns = new Map<string, AutomationRunHandle>()
 let nextProjectScanIndex = 0
 
-export function startTasklistWorker(): void {
-  if (timer || bootTimer) return
+export interface TasklistWorkerStartOptions {
+  bootDelayMs?: number
+  /** Injectable only to exercise the pre-boot synchronous adoption boundary. */
+  adoptPersistedRuns?: () => void
+  /** Injectable for the bounded shutdown regression test. Production uses the
+   * durable tasklist tombstone reconciler. */
+  reconcileDeletions?: () => Promise<void>
+}
+
+export function startTasklistWorker(opts: TasklistWorkerStartOptions = {}): void {
+  if (timer || bootTimer || startupPromise) return
+  stopping = false
   // This must remain synchronous and precede the 15s boot delay: SIGTERM may
   // arrive during that window, and stopTasklistWorker must already know every
   // recovered PGID before it clears bootTimer.
-  registerPersistedAutomationRuns()
+  const adoptPersistedRuns = opts.adoptPersistedRuns ?? registerPersistedAutomationRuns
+  adoptPersistedRuns()
   bootTimer = setTimeout(() => {
     bootTimer = null
-    void runTasklistWorkerOnce()
-    timer = setInterval(() => { void runTasklistWorkerOnce() }, TASKLIST_WORKER_INTERVAL_MS)
-  }, TASKLIST_WORKER_BOOT_DELAY_MS)
+    startupPromise = initializeTasklistWorker(opts.reconcileDeletions ?? tasklist.reconcileTasklistDeletions)
+      .catch(e => log(`tasklist-worker: startup failed: ${messageOf(e)}`))
+      .finally(() => { startupPromise = null })
+  }, opts.bootDelayMs ?? TASKLIST_WORKER_BOOT_DELAY_MS)
   log(`tasklist-worker: scheduled every ${TASKLIST_WORKER_INTERVAL_MS / 1000}s`)
 }
 
+async function initializeTasklistWorker(reconcileDeletions: () => Promise<void>): Promise<void> {
+  try {
+    await reconcileDeletions()
+  } catch (e) {
+    // Tombstones remain durable and are excluded from normal scans. Surface
+    // the failure, but one broken remote deletion must not starve other projects.
+    log(`tasklist-worker: deletion reconcile failed: ${messageOf(e)}`)
+  }
+  if (stopping) return
+  await runTasklistWorkerOnce()
+  if (!stopping) timer = setInterval(() => { void runTasklistWorkerOnce() }, TASKLIST_WORKER_INTERVAL_MS)
+}
+
 export async function runTasklistWorkerOnce(): Promise<void> {
+  if (stopping) return
   if (running) {
     log('tasklist-worker: previous scan still running, skip')
     return
@@ -125,6 +154,44 @@ export function roundRobinEntries<T>(values: T[], start: number): Array<{ value:
     const index = (normalized + offset) % values.length
     return { value: values[index], index }
   })
+}
+
+export function tasklistWorkerActivityIsIdle(
+  activeRunCount: number,
+  activeScanCount: number,
+  startupActive: boolean,
+): boolean {
+  return activeRunCount === 0 && activeScanCount === 0 && !startupActive
+}
+
+/** Stop scheduling and terminate only the exact automation process groups
+ * created by this worker. Used by daemon staged shutdown so grandchildren do
+ * not keep modifying repositories after the parent has exited. */
+export async function stopTasklistWorker(timeoutMs = KILL_AFTER_MS): Promise<void> {
+  stopping = true
+  if (bootTimer) { clearTimeout(bootTimer); bootTimer = null }
+  if (timer) { clearInterval(timer); timer = null }
+  const drain = async (signal: NodeJS.Signals): Promise<boolean> => {
+    const signaled = new Set<AutomationRunHandle>()
+    const deadline = Date.now() + timeoutMs
+    while (Date.now() < deadline) {
+      pruneSettledAutomationRuns()
+      for (const run of activeAutomationRuns.values()) {
+        if (signaled.has(run)) continue
+        signaled.add(run)
+        signalAutomationRun(run, signal)
+      }
+      if (tasklistWorkerActivityIsIdle(activeAutomationRuns.size, activeProjectScans.size, !!startupPromise)) return true
+      await new Promise(resolve => setTimeout(resolve, 50))
+    }
+    pruneSettledAutomationRuns()
+    return tasklistWorkerActivityIsIdle(activeAutomationRuns.size, activeProjectScans.size, !!startupPromise)
+  }
+  if (await drain('SIGTERM')) return
+  if (await drain('SIGKILL')) return
+  throw new Error(
+    `${activeAutomationRuns.size} tasklist process group(s), ${activeProjectScans.size} project scan(s), startup=${startupPromise ? 'running' : 'idle'} did not settle during shutdown`,
+  )
 }
 
 async function processTasklist(projectName: string): Promise<void> {
@@ -444,7 +511,8 @@ async function processReadyTask(
   return true
 }
 
-async function processExecutingTask(
+/** Exported for focused crash-window tests (01-06/ec149d7). */
+export async function processExecutingTask(
   projectName: string,
   projectDir: string,
   binding: TasklistBinding,
@@ -456,9 +524,29 @@ async function processExecutingTask(
   if (state.codexExecution?.status === 'running') return true
   if (state.codexExecution?.status === 'failed') return true
   if (state.codexExecution?.status === 'exited') {
-    return hasLocalReviewRequest(state)
-      ? await reviewExecutedTask(projectName, projectDir, binding, task.guid)
-      : true
+    if (!hasLocalReviewRequest(state)) {
+      // Recover the narrow crash window after the artifact tag was created
+      // but before reviewRef reached the durable task state. The tagged
+      // commit's first parent is the exact execution base.
+      const artifactTag = taskArtifactTag(task.guid)
+      try {
+        const baseHead = git(projectDir, ['rev-parse', `${artifactTag}^`]).trim()
+        if (!baseHead) throw new Error(`cannot resolve parent of ${artifactTag}`)
+        safeUpdate(projectName, b => {
+          const current = tasklist.taskStateFor(b, task.guid)
+          current.executionBranch = AI_AUTO_BRANCH
+          current.executionTag = artifactTag
+          current.reviewBranch = AI_REVIEW_BRANCH
+          current.reviewRef = localReviewRef(baseHead, artifactTag)
+        })
+      } catch (e) {
+        const error = `Codex 执行进程已退出，但无法恢复本地审查请求：${messageOf(e)}`
+        markRunOnTask(projectName, task.guid, 'codexExecution', state.codexExecution.runId, undefined, 'failed', error)
+        await commentAndStoreError(projectName, task.guid, error)
+        return true
+      }
+    }
+    return await reviewExecutedTask(projectName, projectDir, binding, task.guid)
   }
 
   const run = await runCodexExecution(projectName, projectDir, binding, task.guid)
@@ -493,7 +581,8 @@ async function reviewExecutedTask(
   return true
 }
 
-async function processCompletedReviewTask(
+/** Exported for focused crash-window tests (01-06/ec149d7). */
+export async function processCompletedReviewTask(
   projectName: string,
   projectDir: string,
   binding: TasklistBinding,
@@ -503,7 +592,18 @@ async function processCompletedReviewTask(
     if (!isManualMergeSignal(task)) continue
     const state = getTaskState(projectName, task.guid)
     if (state.codexMerge?.status === 'running') return true
-    if (state.codexMerge?.status === 'exited') continue
+    if (state.codexMerge?.status === 'exited') {
+      if (!hasLocalReviewRequest(state)) {
+        const error = 'Codex 合并进程已退出，但本地状态缺少审查请求。'
+        markRunOnTask(projectName, task.guid, 'codexMerge', state.codexMerge.runId, undefined, 'failed', error)
+        await commentAndStoreError(projectName, task.guid, error)
+        return true
+      }
+      // A daemon crash may land after the Git merge process exits but before
+      // the task is moved to done. Reconcile from Git truth instead of treating
+      // `exited` as an absorbing state forever.
+      return await finalizeMergedReviewTask(projectName, projectDir, binding, task.guid, reviewRequestText(state))
+    }
     if (state.codexMerge?.status === 'failed') return true
     if (!hasLocalReviewRequest(state)) {
       await commentAndStoreError(projectName, task.guid, '审核完成后无法合并：本地状态里没有本地审查请求。')
@@ -516,21 +616,36 @@ async function processCompletedReviewTask(
       await commentAndStoreError(projectName, task.guid, 'Codex 合并进程未明确输出 `LODESTAR_MERGE_STATUS: MERGED`，任务保留在审核分组。')
       return true
     }
-    const merged = isReviewHeadMerged(projectDir, reviewRequest)
-    if (!merged.ok) {
-      await commentAndStoreError(projectName, task.guid, `Codex 合并进程输出 MERGED，但本地 Git 未确认合并：${merged.error}`)
-      return true
-    }
-    const doneGuid = binding.sections?.done
-    if (!doneGuid) throw new Error('missing 已完成 section guid')
-    await feishu.moveTaskToSection(task.guid, binding.guid, doneGuid)
-    safeUpdate(projectName, b => {
-      const state = tasklist.taskStateFor(b, task.guid)
-      state.sectionKey = 'done'
-    })
-    return true
+    return await finalizeMergedReviewTask(projectName, projectDir, binding, task.guid, reviewRequest)
   }
   return false
+}
+
+async function finalizeMergedReviewTask(
+  projectName: string,
+  projectDir: string,
+  binding: TasklistBinding,
+  taskGuid: string,
+  reviewRequest: string,
+): Promise<boolean> {
+  const merged = isReviewHeadMerged(projectDir, reviewRequest)
+  if (merged.ok === false) {
+    const state = getTaskState(projectName, taskGuid)
+    const error = `Codex 合并进程已退出，但本地 Git 未确认合并：${merged.error}`
+    if (state.codexMerge) {
+      markRunOnTask(projectName, taskGuid, 'codexMerge', state.codexMerge.runId, undefined, 'failed', error)
+    }
+    await commentAndStoreError(projectName, taskGuid, error)
+    return true
+  }
+  const doneGuid = binding.sections?.done
+  if (!doneGuid) throw new Error('missing 已完成 section guid')
+  await feishu.moveTaskToSection(taskGuid, binding.guid, doneGuid)
+  safeUpdate(projectName, b => {
+    const state = tasklist.taskStateFor(b, taskGuid)
+    state.sectionKey = 'done'
+  })
+  return true
 }
 
 export function isManualMergeSignal(task: feishu.TaskSummary): boolean {
@@ -664,7 +779,15 @@ async function runCodexExecution(
 ): Promise<AutomationProcessRecord> {
   const artifactTag = taskArtifactTag(taskGuid)
   assertTaskArtifactTagAvailable(projectDir, artifactTag)
-  const worktreePath = prepareAutomationWorktree(projectDir, projectName, AI_AUTO_BRANCH)
+  // Freeze the review base before the agent starts. Reading main HEAD after a
+  // multi-hour execution makes the displayed diff depend on unrelated commits
+  // that landed while the task was running.
+  const baseBranch = git(projectDir, ['branch', '--show-current']).trim()
+  if (!baseBranch) throw new Error('cannot determine base branch from project directory')
+  const baseHead = git(projectDir, ['rev-parse', 'HEAD']).trim()
+  const worktreePath = await withProjectWorktreeLock(projectDir, async () => {
+    return prepareAutomationWorktree(projectDir, projectName, AI_AUTO_BRANCH, baseHead)
+  })
   const structured = await loadStructuredTask(binding, 'aiDoing', taskGuid)
   const prompt = [
     '你是 Lodestar 自动执行 Agent。',
@@ -706,9 +829,6 @@ async function runCodexExecution(
       return markProcessFailed(projectName, result, 'Codex execution produced no repository changes')
     }
     const task = await feishu.getTask(taskGuid)
-    const baseBranch = git(projectDir, ['branch', '--show-current']).trim()
-    if (!baseBranch) throw new Error('cannot determine base branch from project directory')
-    const baseHead = git(projectDir, ['rev-parse', 'HEAD']).trim()
     const commitMsg = commitTitle(task?.summary || taskGuid)
     git(worktreePath, ['add', '-A'])
     git(worktreePath, ['commit', '-m', commitMsg])
@@ -756,7 +876,9 @@ async function runAgyReview(
   taskGuid: string,
   reviewRequest: string,
 ): Promise<AutomationProcessRecord> {
-  const worktreePath = prepareAutomationWorktree(projectDir, projectName, AI_REVIEW_BRANCH)
+  const worktreePath = await withProjectWorktreeLock(projectDir, async () => {
+    return prepareAutomationWorktree(projectDir, projectName, AI_REVIEW_BRANCH)
+  })
   const structured = await loadStructuredTask(binding, 'aiReview', taskGuid)
   const diffSpec = reviewDiffSpec(reviewRequest)
   const headRef = reviewHeadRef(reviewRequest)
@@ -856,6 +978,7 @@ async function runAgentProcess(opts: {
   refKey?: RunRefKey
   fingerprint?: string
 }): Promise<AutomationProcessRecord> {
+  if (stopping) throw new Error(`tasklist worker is stopping; refusing to spawn ${opts.kind}`)
   const runId = `${opts.kind}-${Date.now()}-${randomUUID().slice(0, 8)}`
   const startedAt = new Date().toISOString()
   let record: AutomationProcessRecord = {

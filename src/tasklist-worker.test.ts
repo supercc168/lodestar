@@ -1,18 +1,30 @@
-import { describe, expect, test, beforeEach } from 'bun:test'
-import { spawn as spawnChild } from 'node:child_process'
+import { describe, expect, test, beforeEach, afterEach } from 'bun:test'
+import { execFileSync, spawn as spawnChild } from 'node:child_process'
 import { once } from 'node:events'
-import { mkdirSync, rmSync } from 'node:fs'
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 
 import './feishu-test-mock'
 import {
   resetFeishuMock,
   feishuMockState,
+  addedTaskComments,
   listSectionTasksCalls,
   listTasklistSectionsCalls,
   listTasklistTasksCalls,
+  movedTasks,
 } from './feishu-test-mock'
-import { deleteTasklist, enableTasklist, updateTasklistBinding, type TasklistBinding } from './tasklist'
+import {
+  deleteTasklist,
+  enableTasklist,
+  getTasklistBinding,
+  taskStateFor,
+  updateTasklistBinding,
+  type TasklistBinding,
+} from './tasklist'
 import type { TaskComment, TasklistSection, TaskSummary } from './feishu'
+import { prepareAutomationWorktree } from './tasklist-worker-git'
 import {
   automationTreeSupportWarning,
   customSectionsForDesignSubtraction,
@@ -21,6 +33,8 @@ import {
   isManualMergeSignal,
   localReviewRef,
   parseSelectedTaskGuid,
+  processCompletedReviewTask,
+  processExecutingTask,
   registerRecoveredAutomationRun,
   reviewDiffSpec,
   reviewHeadRef,
@@ -29,7 +43,10 @@ import {
   sanitizeTaskCommentContent,
   scanTaskSections,
   shouldIncludeTaskComment,
+  startTasklistWorker,
+  stopTasklistWorker,
   taskArtifactTag,
+  tasklistWorkerActivityIsIdle,
   tasksOutsideCustomSections,
   terminateUnixProcessGroup,
   unixProcessGroupExists,
@@ -266,6 +283,310 @@ describe('tasklist worker process-tree supervision (upstream ec149d7)', () => {
       try { process.kill(-pid, 'SIGKILL') } catch {}
     }
   }, 10_000)
+})
+
+describe('tasklist worker bounded shutdown (upstream ec149d7)', () => {
+  beforeEach(() => resetFeishuMock())
+
+  test('shutdown drain remains busy while deletion startup reconciliation is active', () => {
+    expect(tasklistWorkerActivityIsIdle(0, 0, true)).toBe(false)
+    expect(tasklistWorkerActivityIsIdle(0, 0, false)).toBe(true)
+    expect(tasklistWorkerActivityIsIdle(1, 0, false)).toBe(false)
+    expect(tasklistWorkerActivityIsIdle(0, 1, false)).toBe(false)
+  })
+
+  test('stopTasklistWorker waits for an in-flight startup deletion reconcile', async () => {
+    let reconcileStarted!: () => void
+    const started = new Promise<void>(resolve => { reconcileStarted = resolve })
+    let releaseReconcile!: () => void
+    const gate = new Promise<void>(resolve => { releaseReconcile = resolve })
+    startTasklistWorker({
+      bootDelayMs: 0,
+      reconcileDeletions: async () => {
+        reconcileStarted()
+        await gate
+      },
+    })
+    await started
+    let stopped = false
+    const stopping = stopTasklistWorker(500).then(() => { stopped = true })
+    await new Promise(resolve => setTimeout(resolve, 30))
+    expect(stopped).toBe(false)
+    releaseReconcile()
+    await stopping
+    expect(stopped).toBe(true)
+  })
+
+  test('adopts a persisted run and stopTasklistWorker terminates its PGID within the bound', async () => {
+    if (process.platform === 'win32') return
+    const leader = spawnChild(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+      detached: true,
+      stdio: 'ignore',
+    })
+    const pid = leader.pid
+    if (!pid) throw new Error('test recovered leader has no pid')
+    const closed = once(leader, 'close')
+    const record = {
+      runId: `stop-recovered-${pid}`,
+      projectName: 'stop-p',
+      tasklistGuid: 'tl-stop',
+      kind: 'codex-plan' as const,
+      pid,
+      pgid: pid,
+      command: [process.execPath],
+      cwd: '/tmp',
+      status: 'running' as const,
+      startedAt: '2026-08-21T00:00:00Z',
+    }
+    try {
+      let adopted = false
+      for (let attempt = 0; attempt < 20 && !adopted; attempt++) {
+        adopted = registerRecoveredAutomationRun(record)
+        if (!adopted) await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      expect(adopted).toBe(true)
+      expect(isAutomationRunTracked(record.runId)).toBe(true)
+      await stopTasklistWorker(2000)
+      await closed
+      expect(isAutomationRunTracked(record.runId)).toBe(false)
+      expect(hasRecoveredAutomationRunForProject('stop-p')).toBe(false)
+      expect(unixProcessGroupExists(pid)).toBe(false)
+    } finally {
+      try { process.kill(-pid, 'SIGKILL') } catch {}
+    }
+  }, 10_000)
+
+  test('long boot delay still adopts recovered PGID synchronously before immediate stop', async () => {
+    if (process.platform === 'win32') return
+    const leader = spawnChild(process.execPath, ['-e', 'setTimeout(() => {}, 30000)'], {
+      detached: true,
+      stdio: 'ignore',
+    })
+    const pid = leader.pid
+    if (!pid) throw new Error('test pre-boot recovered leader has no pid')
+    const closed = once(leader, 'close')
+    const record = {
+      runId: `preboot-recovered-${pid}`,
+      projectName: 'preboot-project',
+      tasklistGuid: 'tl-preboot',
+      kind: 'codex-plan' as const,
+      pid,
+      pgid: pid,
+      command: [process.execPath],
+      cwd: '/tmp',
+      status: 'running' as const,
+      startedAt: '2026-08-21T00:00:00Z',
+    }
+    try {
+      let adopted = false
+      startTasklistWorker({
+        bootDelayMs: 60_000,
+        adoptPersistedRuns: () => { adopted = registerRecoveredAutomationRun(record) },
+        reconcileDeletions: async () => {},
+      })
+      expect(adopted).toBe(true)
+      expect(isAutomationRunTracked(record.runId)).toBe(true)
+      await stopTasklistWorker(2000)
+      await closed
+      expect(isAutomationRunTracked(record.runId)).toBe(false)
+      expect(unixProcessGroupExists(pid)).toBe(false)
+    } finally {
+      try { process.kill(-pid, 'SIGKILL') } catch {}
+    }
+  }, 10_000)
+
+  test('after stopTasklistWorker the scheduler no longer scans bindings', async () => {
+    const projectName = 'stop-sched'
+    mkdirSync(`/tmp/lodestar-projects/${projectName}`, { recursive: true })
+    const binding = await enableTasklist(projectName, 'oc_chat')
+    updateTasklistBinding(projectName, b => {
+      b.worker ??= {}
+      b.worker.lastSectionEnsureAt = new Date().toISOString()
+    })
+    try {
+      // 先 start 重置 stopping(前序关停用例留下的终态);boot 延迟拉长,tick 由测试手动驱动
+      startTasklistWorker({ bootDelayMs: 60_000, adoptPersistedRuns: () => {}, reconcileDeletions: async () => {} })
+      // 关停前:正常 tick 会扫到该 binding
+      resetFeishuMock()
+      await runTasklistWorkerOnce()
+      for (let attempt = 0; attempt < 100 && listTasklistTasksCalls.length === 0; attempt++) {
+        await new Promise(resolve => setTimeout(resolve, 10))
+      }
+      expect(listSectionTasksCalls.length).toBeGreaterThan(0)
+      // 关停后:调度短路,不再发起任何扫描
+      await stopTasklistWorker(1000)
+      resetFeishuMock()
+      await runTasklistWorkerOnce()
+      await new Promise(resolve => setTimeout(resolve, 30))
+      expect(listSectionTasksCalls.length).toBe(0)
+      expect(listTasklistTasksCalls.length).toBe(0)
+    } finally {
+      await deleteTasklist(projectName, binding.guid).catch(() => {})
+      rmSync(`/tmp/lodestar-projects/${projectName}`, { recursive: true, force: true })
+    }
+  }, 10_000)
+})
+
+describe('tasklist worker review crash-window recovery (upstream ec149d7)', () => {
+  let roots: string[] = []
+
+  beforeEach(() => resetFeishuMock())
+  afterEach(() => {
+    for (const root of roots) rmSync(root, { recursive: true, force: true })
+    roots = []
+  })
+
+  function gitCmd(cwd: string, args: string[]): string {
+    return execFileSync('git', args, { cwd, encoding: 'utf8' })
+  }
+
+  function initTaskRepo(): { root: string; repo: string } {
+    // realpathSync:macOS 的 /var → /private/var 符号链接会让 assertGitRepo 的
+    // 路径等值判断失败(git rev-parse 返回物理路径)。
+    const root = realpathSync(mkdtempSync(join(tmpdir(), 'lodestar-tlw-')))
+    roots.push(root)
+    const repo = join(root, 'proj')
+    mkdirSync(repo)
+    gitCmd(repo, ['init'])
+    gitCmd(repo, ['config', 'user.email', 'test@example.com'])
+    gitCmd(repo, ['config', 'user.name', 'Test User'])
+    writeFileSync(join(repo, 'README.md'), '# probe\n')
+    gitCmd(repo, ['add', 'README.md'])
+    gitCmd(repo, ['commit', '-m', 'init'])
+    gitCmd(repo, ['branch', '-M', 'main'])
+    return { root, repo }
+  }
+
+  test('prepareAutomationWorktree verifies the frozen base head before mounting', () => {
+    const { root, repo } = initTaskRepo()
+    const head = gitCmd(repo, ['rev-parse', 'HEAD']).trim()
+    expect(() => prepareAutomationWorktree(repo, 'proj', 'AI-AUTO', '0'.repeat(40)))
+      .toThrow('project HEAD changed before worktree prepare')
+    expect(prepareAutomationWorktree(repo, 'proj', 'AI-AUTO', head)).toBe(join(root, 'proj[AI-AUTO]'))
+  })
+
+  test('recovers the review request from the artifact tag after a crash window', async () => {
+    const projectName = 'rec-exec'
+    const binding = await enableTasklist(projectName, 'oc_chat')
+    const { repo } = initTaskRepo()
+    const taskGuid = 'task-rec'
+    const artifactTag = taskArtifactTag(taskGuid)
+    const baseHead = gitCmd(repo, ['rev-parse', 'HEAD']).trim()
+    writeFileSync(join(repo, 'work.txt'), 'automation output\n')
+    gitCmd(repo, ['add', '-A'])
+    gitCmd(repo, ['commit', '-m', 'AI-AUTO: work'])
+    gitCmd(repo, ['tag', artifactTag])
+    gitCmd(repo, ['reset', '--hard', baseHead])
+    try {
+      updateTasklistBinding(projectName, b => {
+        const state = taskStateFor(b, taskGuid)
+        // 崩溃窗:执行进程已退出、产物 tag 已创建,但 reviewRef 未落盘;
+        // agyReview 置 exited 让恢复后的推进不 spawn 真进程(聚焦恢复写本身)。
+        state.codexExecution = { runId: 'run-exec', status: 'exited' }
+        state.agyReview = { runId: 'run-review', status: 'exited' }
+      })
+      const fresh = getTasklistBinding(projectName)!
+      const handled = await processExecutingTask(projectName, repo, fresh, [{ guid: taskGuid, summary: 'crash recovery' }])
+      expect(handled).toBe(true)
+      const after = getTasklistBinding(projectName)!
+      expect(after.tasks?.[taskGuid]?.reviewRef).toBe(`local:${baseHead}..${artifactTag}`)
+      expect(after.tasks?.[taskGuid]?.executionTag).toBe(artifactTag)
+      expect(after.tasks?.[taskGuid]?.sectionKey).toBe('aiReview')
+      expect(movedTasks).toContainEqual([taskGuid, fresh.guid, fresh.sections!.aiReview!])
+    } finally {
+      await deleteTasklist(projectName, binding.guid).catch(() => {})
+    }
+  })
+
+  test('fails visibly when the artifact tag is gone instead of silently absorbing the task', async () => {
+    const projectName = 'rec-exec-miss'
+    const binding = await enableTasklist(projectName, 'oc_chat')
+    const { repo } = initTaskRepo()
+    const taskGuid = 'task-miss'
+    try {
+      updateTasklistBinding(projectName, b => {
+        const state = taskStateFor(b, taskGuid)
+        state.codexExecution = { runId: 'run-exec', status: 'exited' }
+      })
+      const fresh = getTasklistBinding(projectName)!
+      const handled = await processExecutingTask(projectName, repo, fresh, [{ guid: taskGuid, summary: 'missing tag' }])
+      expect(handled).toBe(true)
+      const after = getTasklistBinding(projectName)!
+      expect(after.tasks?.[taskGuid]?.codexExecution?.status).toBe('failed')
+      expect(after.tasks?.[taskGuid]?.codexExecution?.error).toContain('无法恢复本地审查请求')
+      expect(addedTaskComments.some(([, content]) => content.includes('无法恢复本地审查请求'))).toBe(true)
+      expect(movedTasks).toHaveLength(0)
+    } finally {
+      await deleteTasklist(projectName, binding.guid).catch(() => {})
+    }
+  })
+
+  test('reconciles an exited merge from Git truth and moves the task to done without respawning', async () => {
+    const projectName = 'rec-merge'
+    const binding = await enableTasklist(projectName, 'oc_chat')
+    const { repo } = initTaskRepo()
+    const taskGuid = 'task-m'
+    const artifactTag = taskArtifactTag(taskGuid)
+    const baseHead = gitCmd(repo, ['rev-parse', 'HEAD']).trim()
+    writeFileSync(join(repo, 'merged.txt'), 'merged output\n')
+    gitCmd(repo, ['add', '-A'])
+    gitCmd(repo, ['commit', '-m', 'AI-AUTO: merged work'])
+    gitCmd(repo, ['tag', artifactTag])
+    // HEAD 已包含 tag(合并已在崩溃前完成)
+    try {
+      updateTasklistBinding(projectName, b => {
+        const state = taskStateFor(b, taskGuid)
+        state.codexMerge = { runId: 'run-m', status: 'exited' }
+        state.reviewRef = `local:${baseHead}..${artifactTag}`
+      })
+      const fresh = getTasklistBinding(projectName)!
+      const handled = await processCompletedReviewTask(projectName, repo, fresh, [
+        { guid: taskGuid, summary: 'merge me', completedAt: '2026-09-01T00:00:00Z' },
+      ])
+      expect(handled).toBe(true)
+      const after = getTasklistBinding(projectName)!
+      expect(after.tasks?.[taskGuid]?.sectionKey).toBe('done')
+      expect(after.tasks?.[taskGuid]?.codexMerge?.status).toBe('exited')
+      expect(movedTasks).toContainEqual([taskGuid, fresh.guid, fresh.sections!.done!])
+      expect(addedTaskComments.some(([, content]) => content.includes('未确认合并'))).toBe(false)
+    } finally {
+      await deleteTasklist(projectName, binding.guid).catch(() => {})
+    }
+  })
+
+  test('marks an exited merge failed when Git truth does not confirm the merge', async () => {
+    const projectName = 'rec-merge-bad'
+    const binding = await enableTasklist(projectName, 'oc_chat')
+    const { repo } = initTaskRepo()
+    const taskGuid = 'task-bad'
+    const artifactTag = taskArtifactTag(taskGuid)
+    const baseHead = gitCmd(repo, ['rev-parse', 'HEAD']).trim()
+    gitCmd(repo, ['checkout', '-b', 'side'])
+    writeFileSync(join(repo, 'side.txt'), 'unmerged output\n')
+    gitCmd(repo, ['add', '-A'])
+    gitCmd(repo, ['commit', '-m', 'AI-AUTO: unmerged work'])
+    gitCmd(repo, ['tag', artifactTag])
+    gitCmd(repo, ['checkout', 'main'])
+    try {
+      updateTasklistBinding(projectName, b => {
+        const state = taskStateFor(b, taskGuid)
+        state.codexMerge = { runId: 'run-mb', status: 'exited' }
+        state.reviewRef = `local:${baseHead}..${artifactTag}`
+      })
+      const fresh = getTasklistBinding(projectName)!
+      const handled = await processCompletedReviewTask(projectName, repo, fresh, [
+        { guid: taskGuid, summary: 'not merged', completedAt: '2026-09-01T00:00:00Z' },
+      ])
+      expect(handled).toBe(true)
+      const after = getTasklistBinding(projectName)!
+      expect(after.tasks?.[taskGuid]?.codexMerge?.status).toBe('failed')
+      expect(after.tasks?.[taskGuid]?.codexMerge?.error).toContain('未确认合并')
+      expect(addedTaskComments.some(([, content]) => content.includes('未确认合并'))).toBe(true)
+      expect(movedTasks).toHaveLength(0)
+    } finally {
+      await deleteTasklist(projectName, binding.guid).catch(() => {})
+    }
+  })
 })
 
 describe('tasklist worker comments', () => {
