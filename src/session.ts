@@ -355,14 +355,14 @@ const RESUME_INIT_TIMEOUT_MS = 120_000
  * Session.onCardWriteFailure), so a wrong guess here still self-heals. */
 const CARD_ELEMENT_SOFT_LIMIT = 50
 
-/** Max mid-turn card rotations per turn driven by capacity / true
- * unwritable API failures. Past this we stop opening fresh cards and
- * fall back to log-only for the rest of the turn. Guards the reactive
- * rotate path against a runaway loop where every card keeps failing
- * (Feishu outage, or an element whose own content Feishu rejects on
- * every card) — without a cap that would spray an endless trail of
- * empty cards into the chat. Network transport blips and footer ticks
- * do not consume this budget (see onCardWriteFailure). */
+/** Max mid-turn card rotations per turn. Past this we stop opening fresh
+ * cards and fall back to log-only for the rest of the turn. Only confirmed
+ * card-capacity failures enter this path (确认 300305 组件数上限/本地
+ * 200860 体积上限); schema/content/network errors stay on the current card
+ * because replaying the same mutation cannot repair them (上游 4185808).
+ * The cap remains as a final guard against a malformed single element
+ * that itself exceeds the capacity ceiling. Network transport blips and
+ * footer ticks never consume this budget (see onCardWriteFailure). */
 const MAX_MIDTURN_ROTATES = 5
 /** Claude Agent SDK does not emit stream `init` until the first user input.
  * Still give synchronous/early startup failures a chance to surface before
@@ -5835,6 +5835,7 @@ export class Session {
       rotating: null,
       rotateCount: 0,
       failureRotateCount: 0,
+      cardWriteFailureNotified: false,
       rotateGivenUp: false,
       outboundSeenPaths: new Set(),
       outboundSentPaths: new Set(),
@@ -5874,21 +5875,26 @@ export class Session {
   maybeMidTurnRotate(): void {
     const turn = this.currentTurn
     if (!turn) return
+    if (turn.rotateGivenUp) return
     if (turn.rotating) return
     if (cardkit.getElementCount(turn.cardId) < CARD_ELEMENT_SOFT_LIMIT) return
     this.startMidTurnRotate(turn)
   }
 
-  /** Reactive rotation trigger: cardkit elevates non-footer write failures
-   * here after local network / streaming-closed retries. Capacity codes
-   * (element / size limit) force a mid-turn rotate; other Feishu API
-   * rejections also rotate (card may be poisoned). Pure network failures
-   * do NOT rotate and do NOT consume the failure-rotate cap — swapping
-   * cards cannot fix transport, and counting footer `fetch failed` blips
-   * toward the cap is what flipped etmmo turns to log-only (2026-07-25/26).
-   * Idempotent (a rotation already in flight is left alone) and capped
-   * (MAX_MIDTURN_ROTATES) so a persistent capacity failure can't spin
-   * forever. Successful addElement clears the streak via onCardWriteSuccess. */
+  /** Reactive rotation is reserved for confirmed card-capacity failures:
+   * a real 300305 component ceiling (possibly nested inside a generic
+   * 300315 add wrapper) or the local 200860 card-size ceiling. `300315`
+   * alone also carries duplicate-ID / invalid-schema failures — replaying
+   * those (or a timeout/5xx) on a new card deterministically poisons every
+   * replacement, so they stay on the current card and surface a once-per-
+   * turn user diagnostic instead (上游 4185808, FIX-02 可观测验收点).
+   * Pure network failures do NOT rotate, do NOT consume the cap and stay
+   * silent — swapping cards cannot fix transport, and counting footer
+   * `fetch failed` blips toward the cap is what flipped etmmo turns to
+   * log-only (2026-07-25/26). Idempotent (a rotation already in flight is
+   * left alone) and capped (MAX_MIDTURN_ROTATES) so a persistent capacity
+   * failure can't spin forever. Successful addElement clears the streak
+   * via onCardWriteSuccess. */
   onCardWriteFailure(
     failedCardId: string,
     code?: number,
@@ -5909,6 +5915,27 @@ export class Session {
       return
     }
 
+    const failure = meta?.failure
+    // 只有确认的容量失败才烧轮转预算:300305(或 300315 嵌套诊断点名容量)
+    // 走组件数上限;200860 体积上限是本地既有容量信号,保留轮转(机制保留)。
+    // 其余 API 失败(schema/内容/duplicate-id/5xx)重放到新卡也修不好——
+    // 留在当前卡,每 turn 一次用户可见诊断(FIX-02"投递失败路径可观测")。
+    // 诊断文案只用失败分类摘要(错误码+操作类别+元素),绝不内插
+    // failure.message/API 响应原文——那里可能回显凭据/raw payload。
+    if (!cardkit.isElementLimitFailure(code, failure) && !cardkit.isCardSizeLimitCode(code)) {
+      const operation = failure?.operation ?? 'unknown operation'
+      const element = failure?.elementId ? ` element=${failure.elementId}` : ''
+      log(`session "${this.sessionName}": non-capacity card write failure card=${failedCardId.slice(0, 12)} operation=${operation}${element} code=${code ?? 'n/a'} — not rotating`)
+      if (!turn.cardWriteFailureNotified) {
+        turn.cardWriteFailureNotified = true
+        void feishu.sendTextRaw(
+          this.chatId,
+          `⚠️ 对话卡片有一项写入失败(code=${code ?? 'MISS'}, ${operation})。该错误不是卡片元素上限，已停止无效换卡；其余输出继续处理。`,
+        )
+      }
+      return
+    }
+
     if (turn.failureRotateCount >= MAX_MIDTURN_ROTATES) {
       turn.rotateGivenUp = true
       // log-only 要名副其实:停掉 footer 档位计时器,并把当前卡整卡标记
@@ -5920,11 +5947,9 @@ export class Session {
       void feishu.sendTextRaw(this.chatId, this.failureRotateGiveUpText(code))
       return
     }
-    const why = cardkit.isElementLimitCode(code)
-      ? `element limit (${code})`
-      : cardkit.isCardSizeLimitCode(code)
-        ? `card size limit (${code})`
-        : `write failure (code=${code ?? 'n/a'})`
+    const why = cardkit.isCardSizeLimitCode(code)
+      ? `card size limit (${code})`
+      : `confirmed element limit (${code})`
     log(`session "${this.sessionName}": ${why} on card=${turn.cardId.slice(0, 8)}… — rotating to fresh card`)
     turn.failureRotateCount++
     this.startMidTurnRotate(turn)
@@ -5979,6 +6004,20 @@ export class Session {
     // rotating 期间不 reset,这段会一直累积到 swap,窗口期的字一个不丢。
     const oldToolByUseId = turn.toolByUseId
     const oldBatches = turn.toolBatches
+    // 新卡在 swap/rebuild 窗口里的写失败不能递归换卡;先记住第一个失败,
+    // 释放本轮锁后合并触发一次(上游 4185808:卡片写串行,首个失败是根因,
+    // 后续 target/duplicate 报错可能只是它的级联)。
+    const deferredWriteFailure: {
+      value: { code?: number; meta?: cardkit.CardWriteFailureMeta } | null
+    } = { value: null }
+    const rememberDeferredWriteFailure = (
+      code?: number,
+      meta?: cardkit.CardWriteFailureMeta,
+    ): void => {
+      if (!deferredWriteFailure.value) {
+        deferredWriteFailure.value = { code, meta }
+      }
+    }
     turn.rotating = (async () => {
       try {
         log(`session "${this.sessionName}": mid-turn rotate triggered card=${oldCardId.slice(0, 8)}… elementCount=${cardkit.getElementCount(oldCardId)}`)
@@ -5994,6 +6033,13 @@ export class Session {
         const newMessageId = await feishu.sendCard(this.chatId, card)
         if (!newMessageId) {
           log(`session "${this.sessionName}": mid-turn rotate sendCard EXHAUSTED — staying on old card,subsequent adds will drop`)
+          // 开新卡失败即闩锁 log-only:否则下一次写失败/满卡检查又发一轮
+          // sendCard,重试风暴 + 重复告警(上游 4185808)。
+          if (this.currentTurn === turn) {
+            turn.rotateGivenUp = true
+            this.stopFooterStatus(turn)
+            cardkit.markCardWriteDead(turn.cardId)
+          }
           await feishu.sendTextRaw(
             this.chatId,
             '⚠️ 卡片元素超出飞书上限,本轮后续输出仅日志可见(开新卡失败)。',
@@ -6004,13 +6050,28 @@ export class Session {
         try { newCardId = await cardkit.convertMessageToCard(newMessageId) }
         catch (e) {
           log(`session "${this.sessionName}": mid-turn rotate id_convert failed: ${e}`)
+          if (this.currentTurn === turn) {
+            turn.rotateGivenUp = true
+            this.stopFooterStatus(turn)
+            cardkit.markCardWriteDead(turn.cardId)
+            await feishu.sendTextRaw(
+              this.chatId,
+              '⚠️ 新对话卡已发送，但 Card Kit 初始化失败；已停止继续换卡，本轮后续输出仅日志可见。',
+            )
+          }
           return
         }
         // card_full body has banner(1) + footer(1) = 2 elements.
         cardkit.recordCardCreated(
           newCardId,
           2,
-          (code, meta) => this.onCardWriteFailure(newCardId, code, meta),
+          (code, meta) => {
+            if (turn.rotating) {
+              rememberDeferredWriteFailure(code, meta)
+              return
+            }
+            this.onCardWriteFailure(newCardId, code, meta)
+          },
           () => this.onCardWriteSuccess(newCardId),
         )
         // 同步 swap：从这一行起,后续 stream handler 看到的 turn.cardId
@@ -6102,6 +6163,12 @@ export class Session {
         log(`session "${this.sessionName}": mid-turn rotate done old=${oldCardId.slice(0, 8)}… new=${newCardId.slice(0, 8)}…`)
       } finally {
         turn.rotating = null
+        // 释放锁后补触发 swap/rebuild 窗口里记下的第一个新卡写失败;
+        // 若 close 已捕获 turn,则由 close 的正文保全处理。
+        const deferred = deferredWriteFailure.value
+        if (deferred && this.currentTurn === turn) {
+          this.onCardWriteFailure(turn.cardId, deferred.code, deferred.meta)
+        }
       }
     })()
   }

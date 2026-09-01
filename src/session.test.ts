@@ -206,6 +206,7 @@ function turnState(
     rotating: null,
     rotateCount: 0,
     failureRotateCount: 0,
+    cardWriteFailureNotified: false,
     rotateGivenUp: false,
     outboundSeenPaths: new Set(),
     outboundSentPaths: new Set(),
@@ -8491,8 +8492,9 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
       const url = new URL(String(input))
       const path = url.pathname.replace('/open-apis/cardkit/v1', '')
       // Non-footer element: footer failures no longer elevate to card-level rotate.
+      // 300305 = 确认容量失败(上游 4185808 收紧后唯一自动烧预算轮转的组件数信号)。
       if (init?.method === 'PUT' && path === `/cards/${failedCardId}/elements/assistant_0`) {
-        return new Response(JSON.stringify({ code: 300308, msg: 'current card rejected' }), {
+        return new Response(JSON.stringify({ code: 300305, msg: 'element exceeds the limit' }), {
           headers: { 'Content-Type': 'application/json' },
         })
       }
@@ -8621,7 +8623,9 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
     turn.rotateCount = 5 // 5 次主动满卡轮转已发生,但从未因写失败换过卡
 
     try {
-      session.onCardWriteFailure('card_old', 300308, { kind: 'api' })
+      // 4185808 收紧后只有确认容量失败(300305/200860)走失败轮转路径,
+      // 本测试意图不变:主动轮转不烧失败额度,容量失败仍可换卡。
+      session.onCardWriteFailure('card_old', 300305, { kind: 'api' })
 
       expect(turn.rotateGivenUp).toBe(false)
       expect(turn.rotating).not.toBeNull()

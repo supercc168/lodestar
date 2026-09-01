@@ -134,11 +134,12 @@ export interface TurnState {
    * reactive combined. Informational (logging) — NOT what the cap reads.
    * Reset per turn (a fresh TurnState starts at 0). */
   rotateCount: number
-  /** Rotations triggered by the reactive failure path only
-   * (onCardWriteFailure, capacity / true unwritable API codes). This is
-   * the counter MAX_MIDTURN_ROTATES caps — the failure path is the only
-   * one that can run away (Feishu outage, or a poisoned element that
-   * fails on every card). The proactive path (maybeMidTurnRotate)
+  /** Rotations triggered by confirmed card-capacity failures only
+   * (onCardWriteFailure: 确认的 300305 组件数上限,或本地 200860 体积上限).
+   * This is the counter MAX_MIDTURN_ROTATES caps. Deterministic
+   * payload/schema errors and network failures must not consume it
+   * because replaying the same mutation on a fresh card cannot repair
+   * them (上游 4185808). The proactive path (maybeMidTurnRotate)
    * deliberately does NOT consume this budget: it needs ~50 genuinely-
    * successful elements per card to fire again, so it's naturally
    * throttled by real output. Network transport failures and footer
@@ -149,6 +150,11 @@ export interface TurnState {
    * 300308 flipped the turn to log-only. Cleared on successful
    * addElement so a recovered card doesn't carry a stale streak. */
   failureRotateCount: number
+  /** A non-capacity write failure is surfaced once per turn while the exact
+   * failed element remains dead/checked-false. Prevents footer/tool refreshes
+   * from flooding the chat with duplicate diagnostics (上游 4185808,
+   * FIX-02 投递失败可观测验收点). */
+  cardWriteFailureNotified: boolean
   /** Latched once we hit the rotate cap and emit the "giving up" notice,
    * so the notice isn't repeated on every later failed write this turn. */
   rotateGivenUp: boolean
