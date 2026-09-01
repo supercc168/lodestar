@@ -85,6 +85,7 @@ export function addTool(s: Session, source: AgentProcess, toolUseId: string, nam
         ? cards.readBatchElement(batchI, batch.items)
         : cards.editBatchElement(batchI, batch.items)
       void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.tool(batchI), el)
+      toolSummaryToPreview(s.currentTurn, name, input)
       return
     }
   }
@@ -133,6 +134,7 @@ export function addTool(s: Session, source: AgentProcess, toolUseId: string, nam
     void (isFirst
       ? cardkit.addElement(turn.cardId, el, { type: 'insert_before', targetElementId: taskLiveAnchor(turn) })
       : cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(ti), el))
+    toolSummaryToPreview(turn, name, input)
     return
   }
   // 非 Task 工具:Task 面板合并窗口关闭(创建/进度面板各自定稿)
@@ -153,6 +155,7 @@ export function addTool(s: Session, source: AgentProcess, toolUseId: string, nam
     void cardkit.addElement(s.currentTurn.cardId, el, {
       type: 'insert_before', targetElementId: taskLiveAnchor(s.currentTurn),
     })
+    toolSummaryToPreview(s.currentTurn, name, input)
     return
   }
   s.currentTurn.toolByUseId.set(toolUseId, { i, name, input })
@@ -206,6 +209,21 @@ export function addTool(s: Session, source: AgentProcess, toolUseId: string, nam
     type: 'insert_before',
     targetElementId: taskLiveAnchor(s.currentTurn),
   })
+  // Chat-list preview: 工具运行阶段正文不出字,预览会冻结在旧文字 ——
+  // 同步当前工具面板同款标题(🔧 工具名: 摘要),列表里能看到 agent 在干嘛。
+  toolSummaryToPreview(s.currentTurn, name, input)
+}
+
+/** 与 toolCallElement 的面板 header 同构的预览行(⏳ 状态、不带 resolvedNote)。
+ * 只在主 turn 卡的工具渲染完成点调用;agy/gsd/bg 等非主 turn 卡路径不进这里。
+ * 导出仅为测试锁定(上游 8de138c 中为模块私有函数,行为一致)。 */
+export function toolSummaryToPreview(turn: TurnState | null, name: string, input: any): void {
+  if (!turn) return
+  const raw = cards.summarizeToolInput(name, input)
+  const summary = raw.length > 80 ? raw.slice(0, 80) + '…' : raw
+  const toolName = cards.displayToolName(name)
+  const line = summary ? `🔧 ${toolName}: ${summary}` : `🔧 ${toolName}`
+  cardkit.patchSummaryThrottled(turn.cardId, line)
 }
 
 export function completeTool(s: Session, source: AgentProcess, toolUseId: string, content: any, isError: boolean): void {
