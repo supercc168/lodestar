@@ -10,6 +10,7 @@ import {
   type HookEvent,
   type HookInput,
   type HookJSONOutput,
+  type McpServerConfig,
   type ModelInfo,
   type Query,
   type SDKMessage,
@@ -65,6 +66,13 @@ class AsyncQueue<T> implements AsyncIterableIterator<T> {
     if (this.closed) return
     this.closed = true
     while (this.waiters.length) this.waiters.shift()?.({ value: undefined, done: true })
+  }
+
+  /** 硬停:丢弃已排队项后关闭。被丢弃代的排队 turn 不得在 SDK abort 窗口内
+   * 被 drain 执行(上游 ec149d7 硬停语义)。 */
+  abort(): void {
+    this.items = []
+    this.close()
   }
 
   [Symbol.asyncIterator](): AsyncIterableIterator<T> {
@@ -725,7 +733,7 @@ export function toolsFromProfile(
  * the common case (most projects ship no .mcp.json, and loadProjectMcp
  * defaults to true so every spawn probes once); other failures are logged
  * so the project knows its MCP didn't load. */
-export function readProjectMcpServers(workDir: string): Record<string, unknown> | undefined {
+export function readProjectMcpServers(workDir: string): Record<string, McpServerConfig> | undefined {
   const mcpPath = join(workDir, '.mcp.json')
   let raw: string
   try {
@@ -741,7 +749,7 @@ export function readProjectMcpServers(workDir: string): Record<string, unknown> 
   try {
     const parsed = JSON.parse(raw)
     if (parsed && typeof parsed === 'object' && parsed.mcpServers && typeof parsed.mcpServers === 'object') {
-      return parsed.mcpServers as Record<string, unknown>
+      return parsed.mcpServers as Record<string, McpServerConfig>
     }
     log(`claude-agent-process: project .mcp.json has no mcpServers object at ${mcpPath}`)
     return undefined
@@ -890,8 +898,11 @@ export class ClaudeAgentProcess extends EventEmitter {
   private opts: ClaudeSpawnOpts
   private input = new AsyncQueue<SDKUserMessage>()
   private query: Query | null = null
+  private readonly abortController = new AbortController()
   private alive = true
   private expectedExit = false
+  private readonly exitPromise: Promise<void>
+  private resolveExit!: () => void
   private started = false
   private pendingPermissions = new Map<string, PendingControl>()
   private pendingInjectedContext: string[] = []
@@ -930,6 +941,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   constructor(opts: ClaudeSpawnOpts) {
     super()
     this.on('error', () => {})
+    this.exitPromise = new Promise(resolve => { this.resolveExit = resolve })
     this.opts = opts
     this.lastEffort = opts.effort
     this.lastModel = opts.model ? claudeModelKey(opts.model) : null
@@ -1000,6 +1012,7 @@ export class ClaudeAgentProcess extends EventEmitter {
         prompt: this.input,
         options: {
           cwd: this.opts.workDir,
+          abortController: this.abortController,
           ...(model ? { model } : {}),
           ...reasoningOptions,
           resume: this.opts.resumeSessionId,
@@ -1035,10 +1048,9 @@ export class ClaudeAgentProcess extends EventEmitter {
         },
       })
     } catch (e) {
-      this.alive = false
       const err = e instanceof Error ? e : new Error(String(e))
       this.emit('error', err)
-      this.emit('exit', { code: 1, signal: null, expected: this.expectedExit })
+      this.finishExit(1, null)
       return
     }
     void this.readLoop(this.query)
@@ -1129,16 +1141,39 @@ export class ClaudeAgentProcess extends EventEmitter {
   async kill(timeoutMs = 5000): Promise<void> {
     if (!this.alive) return
     this.expectedExit = true
-    this.input.close()
-    try { this.query?.close() }
-    catch {}
-    const start = Date.now()
-    while (this.alive && Date.now() - start < timeoutMs) {
-      await new Promise(r => setTimeout(r, 100))
+    this.denyPendingPermissions('claude process is stopping')
+    // Hard process stop: queued user turns belong to the discarded process
+    // generation and must never drain during the SDK abort window.
+    this.input.abort()
+    if (!this.started || !this.query) {
+      this.finishExit(null, null)
+      return
     }
-    if (this.alive) {
-      this.alive = false
-      this.emit('exit', { code: null, signal: 'SIGKILL', expected: this.expectedExit })
+
+    let closeError: Error | null = null
+    try {
+      this.query.close()
+    } catch (e) {
+      closeError = e instanceof Error ? e : new Error(String(e))
+    }
+    if (!this.abortController.signal.aborted) {
+      this.abortController.abort(closeError ?? new Error('claude process shutdown requested'))
+    }
+
+    // 上游 ec149d7:超时不再伪造 SIGKILL exit(SDK in-process query 本就杀不掉)——
+    // 如实抛出让调用方知道进程仍活。session 侧调用点对齐随主题 I(01-10)收。
+    if (!await this.waitForExit(timeoutMs)) {
+      const error = new Error(
+        `claude Agent SDK query did not exit within ${timeoutMs}ms after close/abort`,
+        closeError ? { cause: closeError } : undefined,
+      )
+      log(`claude-agent-process: kill failed: ${error.message}`)
+      throw error
+    }
+    if (closeError) {
+      const error = new Error(`claude Agent SDK close failed: ${closeError.message}`, { cause: closeError })
+      log(`claude-agent-process: kill failed: ${error.message}`)
+      throw error
     }
   }
 
@@ -1323,6 +1358,12 @@ export class ClaudeAgentProcess extends EventEmitter {
       this.finishExit(null, null)
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e))
+      if (this.expectedExit && this.abortController.signal.aborted) {
+        // 主动 kill 触发的 abort 会让 read loop 以异常收尾 —— 这是请求内的正常路径。
+        log(`claude-agent-process: read loop stopped after requested shutdown: ${err.message}`)
+        this.finishExit(null, null)
+        return
+      }
       log(`claude-agent-process: read loop failed: ${err.message}`)
       this.emit('error', err)
       this.finishExit(1, null)
@@ -1333,13 +1374,38 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (!this.alive) return
     this.alive = false
     this.turnActive = false
-    for (const [id, pending] of this.pendingPermissions) {
-      pending.cleanup?.()
-      pending.resolve({ behavior: 'cancelled' })
-      this.pendingPermissions.delete(id)
-    }
+    this.denyPendingPermissions('claude process exited')
+    this.resolveExit()
     log(`claude-agent-process: exited code=${code} signal=${signal} expected=${this.expectedExit}`)
     this.emit('exit', { code, signal, expected: this.expectedExit })
+  }
+
+  /** 悬挂的 SDK 权限请求(AskUserQuestion 等)立即以合法 deny 解决,不再悬挂
+   * 到超时。'cancelled' 不是 PermissionResult 的合法 behavior,SDK 侧会当
+   * 畸形响应处理 —— 统一 deny + 原因文案(上游 ec149d7)。 */
+  private denyPendingPermissions(message: string): void {
+    for (const [id, pending] of this.pendingPermissions) {
+      pending.cleanup?.()
+      pending.resolve({ behavior: 'deny', message })
+      this.pendingPermissions.delete(id)
+    }
+  }
+
+  /** stop 后在超时窗口内解析进程退出:exitPromise 由 finishExit resolve,
+   * 超时兜底按当时 alive 快照返回(01-13 exit-close-error 次序纪律的底座)。 */
+  private async waitForExit(timeoutMs: number): Promise<boolean> {
+    if (!this.alive) return true
+    return new Promise(resolve => {
+      let settled = false
+      const finish = (exited: boolean) => {
+        if (settled) return
+        settled = true
+        clearTimeout(timeout)
+        resolve(exited)
+      }
+      const timeout = setTimeout(() => finish(!this.alive), Math.max(0, timeoutMs))
+      void this.exitPromise.then(() => finish(true))
+    })
   }
 
   private handleMessage(message: SDKMessage): void {
@@ -1464,17 +1530,26 @@ export class ClaudeAgentProcess extends EventEmitter {
         return
       case 'task_notification':
         // task_notification 是任务结算的权威信号:带终态 status + 最终 usage。
+        // 协议校验(上游 ec149d7):缺 task_id / 未知终态不再强转 completed ——
+        // 伪造终态会让 session 把仍在跑的任务提前墓碑化。
+        if (typeof raw.task_id !== 'string' || !raw.task_id) {
+          log('claude-agent-process: task_notification missing task_id')
+          return
+        }
+        if (raw.status !== 'completed' && raw.status !== 'failed' && raw.status !== 'stopped') {
+          log(`claude-agent-process: task_notification unknown status=${String(raw.status)} task=${raw.task_id}`)
+          return
+        }
         this.emit('bg_task_settled', {
-          task_id: String(raw.task_id ?? ''),
+          task_id: raw.task_id,
           tool_use_id: typeof raw.tool_use_id === 'string' ? raw.tool_use_id : undefined,
-          status: raw.status === 'completed' || raw.status === 'failed' || raw.status === 'stopped'
-            ? raw.status
-            : 'completed',
+          status: raw.status,
           summary: typeof raw.summary === 'string' ? raw.summary : undefined,
           usage: raw.usage,
         })
         return
       default:
+        log(`claude-agent-process: unhandled system subtype=${String(raw.subtype ?? 'unknown')}`)
         return
     }
   }

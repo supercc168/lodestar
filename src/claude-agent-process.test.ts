@@ -574,6 +574,46 @@ describe('Claude background task protocol validation', () => {
   })
 })
 
+describe('AskUserQuestion options 畸形输入解析', () => {
+  // 上游 ec149d7 主题 G 的 firstString 多字段解析 —— 本地已在 post-state 行为
+  // (label/value/text/title、description/detail/preview 依序取首个 string),
+  // 此用例为行为锁定:畸形 option(数字/null/嵌套对象/缺 label)不炸、静默跳过。
+  test('label/description 多字段 firstString,畸形项跳过不炸', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const requests: any[] = []
+    proc.on('can_use_tool', (req: any) => requests.push(req))
+    const ac = new AbortController()
+
+    const permission = proc.canUseTool(
+      'AskUserQuestion',
+      {
+        question: 'Pick one',
+        options: [
+          'plain-string',
+          { value: 'from-value', detail: 'detail-as-description' },
+          { title: 'from-title' },
+          { label: 42, value: { nested: true } },
+          null,
+          7,
+          { description: 'no label at all' },
+        ],
+      },
+      { signal: ac.signal, toolUseID: 'dialog-parse-1' },
+    )
+
+    expect(requests).toHaveLength(1)
+    const options = (requests[0].input as any).questions[0].options
+    expect(options).toEqual([
+      { label: 'plain-string' },
+      { label: 'from-value', description: 'detail-as-description' },
+      { label: 'from-title' },
+    ])
+
+    proc.sendPermissionResponse(requests[0].request_id, 'deny', { denyMessage: 'test done' })
+    await expect(permission).resolves.toEqual({ behavior: 'deny', message: 'test done' })
+  })
+})
+
 describe('Claude repeated tool failure correction hook', () => {
   test('injects corrective context on repeat two and resets after success', async () => {
     const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
