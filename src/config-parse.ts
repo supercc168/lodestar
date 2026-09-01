@@ -36,6 +36,32 @@ export interface ClaudeModelConfig {
   env?: Record<string, string>
 }
 
+/** Remove a TOML comment marker only when it appears outside quoted strings.
+ * App secrets, tokens and URLs may legitimately contain `#`; the old regex
+ * truncated those values before credential validation.(上游 ec149d7;放本
+ * 模块而非 config.ts,同 parseClaudeModelProfile 的 mock 免疫理由。) */
+export function stripTomlComment(raw: string): string {
+  let quote: 'single' | 'double' | null = null
+  let escaped = false
+  for (let i = 0; i < raw.length; i++) {
+    const ch = raw[i]
+    if (quote === 'double') {
+      if (escaped) { escaped = false; continue }
+      if (ch === '\\') { escaped = true; continue }
+      if (ch === '"') quote = null
+      continue
+    }
+    if (quote === 'single') {
+      if (ch === "'") quote = null
+      continue
+    }
+    if (ch === '"') quote = 'double'
+    else if (ch === "'") quote = 'single'
+    else if (ch === '#') return raw.slice(0, i)
+  }
+  return raw
+}
+
 /** 从单个 [claude.models.<name>] section 组装 ClaudeModelConfig。
  *  env_<NAME> 扁平标量收进 profile.env(绕过手写解析器对嵌套 table 的不支持)。
  *  放在独立模块(而非 config.ts)便于单测解析逻辑,且不受测试里

@@ -31,7 +31,7 @@ import { CONFIG_FILE } from './paths'
 import { parseWatchdogMode, parseWatchdogSettings, type WatchdogMode } from './turn-watchdog'
 // 纯类型/纯解析从 ./config-parse 引入并对外再导出(保持 './config' 公开 API 不变)。
 // 拆分是为了让解析逻辑的单测可从 './config-parse' 导入,不受 mock.module('./config') 污染。
-import { parseClaudeModelProfile, type ClaudeModelConfig } from './config-parse'
+import { parseClaudeModelProfile, stripTomlComment, type ClaudeModelConfig } from './config-parse'
 export { parseClaudeModelProfile, type ClaudeModelConfig }
 
 /** 活跃 footer / 后台卡 header 耗时展示模式(config `[runtime].live_elapsed`)。 */
@@ -176,7 +176,8 @@ function parseToml(text: string): Record<string, Record<string, string>> {
   const out: Record<string, Record<string, string>> = { _: {} }
   let section = '_'
   for (const raw of text.split('\n')) {
-    const line = raw.replace(/(^|[^\\])#.*$/, '$1').trim()
+    // 引号感知剥注释(上游 ec149d7):字符串值内的 # 是数据,不是注释。
+    const line = stripTomlComment(raw).trim()
     if (!line) continue
     const sec = line.match(/^\[([^\]]+)\]$/)
     if (sec) {
@@ -231,6 +232,10 @@ function loadConfig(): LodestarConfig {
   const liveElapsed: LiveElapsedMode = liveElapsedRaw
   const notifyBind = t.notify?.bind ?? '127.0.0.1'
   const notifyPortRaw = t.notify?.port ?? '9876'
+  // parseInt 会静默吞掉 "9876abc" 的尾巴——先整型校验再解析(上游 ec149d7 同 hunk)。
+  if (!/^\d+$/.test(notifyPortRaw.trim())) {
+    throw new Error(`lodestar: [notify].port must be an integer, got "${notifyPortRaw}"`)
+  }
   const notifyPort = Number.parseInt(notifyPortRaw, 10)
   if (!Number.isFinite(notifyPort) || notifyPort <= 0 || notifyPort > 65535) {
     throw new Error(`lodestar: [notify].port must be 1..65535, got "${notifyPortRaw}"`)
