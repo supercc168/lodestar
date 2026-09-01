@@ -81,6 +81,16 @@ const FIXED_MODEL_CHOICES = [
     effort: 'max' as AgentReasoningEffort,
   },
   {
+    // GLM-5.3 Flash 快速档(2026-08-26 上线),与 glm 同构:走 config.toml
+    // [claude.models.glm-flash] 的 base_url + auth_token,未配置 token 时
+    // picker 仍显示但选择被 onModelEffortSelect 拦截。
+    provider: 'claude' as const,
+    model: 'claude:glm-flash',
+    displayName: 'Claude · GLM-5.3 Flash',
+    description: 'GLM-5.3 Flash 第三方路由 · max 最高思维 · 1M 上下文,价格约 1/10。',
+    effort: 'max' as AgentReasoningEffort,
+  },
+  {
     provider: 'claude' as const,
     model: 'claude:grok',
     displayName: 'Claude · Grok 4.6 · 无痕',

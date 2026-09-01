@@ -47,6 +47,12 @@ function isGrokModelId(model: string | null | undefined): boolean {
   return /^grok(?:[-_.]|$)/i.test(model?.trim() ?? '')
 }
 
+/** GLM 系档位(glm 主力 / glm-flash 快速档):共享智谱直连 alias 锁与
+ * usageSource 归类(agent-process 的 /^claude:glm(?:$|[-_])/ 同规则)。 */
+function isGlmProfile(name: string): boolean {
+  return name === 'glm' || name === 'glm-flash'
+}
+
 const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
   // 第一方 Anthropic 档位:model id 直传 Claude Code(reclaude → --model),
   // 走用户的 Claude 登录态。飞书 model 面板从这里取名。
@@ -67,6 +73,12 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
     // GLM 的 base_url / auth_token / model 由 [claude.models.glm] 提供,
     // 不写死在代码里(避免 GLM 版本过期 + token 入库)。未配置时该档位
     // 在 picker 里可见但选择被拦截,提示去 config.toml 设置。
+  },
+  'glm-flash': {
+    display_name: 'Claude Code · GLM-5.3 Flash',
+    description: 'GLM-5.3 Flash 第三方路由(智谱直连,2026-08-26 上线)。需在 config.toml 配置 token。',
+    route: 'api',
+    // 与 glm 档同构:base_url / auth_token / model 由 [claude.models.glm-flash] 提供。
   },
   grok: {
     display_name: 'Claude Code · Grok 4.6(无痕)',
@@ -129,6 +141,13 @@ export function firstPartyClaudeTierEnvForMain(
  * 未在 [claude.models.glm] 显式配 model 时回落到这里。 */
 const DEFAULT_GLM_MODEL = 'glm-5.3[1m]'
 
+/** GLM Flash 档位默认 model id。2026-08-26 智谱上线 GLM-5.3-Flash(前身
+ * 社区匿名「牛来」/Ox-Alpha,320B-A18B,价格约 GLM-5.3 的 1/10),官方文档
+ * 同款 1M 上下文;2026-08-27 直连实测 open.bigmodel.cn /v1/messages 接受裸名
+ * glm-5.3-flash,故与主档同走模型名 [1m] 钉法记账(CLI 剥后缀 + context-1m
+ * beta header;传 [1m] 字面量报 1214 属直连形态,CLI 路径结构上不触发)。 */
+const DEFAULT_GLM_FLASH_MODEL = 'glm-5.3-flash[1m]'
+
 /** DeepSeek 官网 Anthropic 兼容端点(https://api.deepseek.com/anthropic)的
  * 默认 model id。2026-08-13/14 实测(Anthropic /v1/messages 打真请求验证):
  *   - deepseek-v4-pro[1m] → V4 Pro 正式版(0813)1M 上下文;[1m] 后缀让 Claude Code
@@ -183,8 +202,9 @@ function toProfile(name: string): ClaudeModelProfile | null {
   const env = envFromConfig(raw)
   // GLM 仅在实际配置接入 token 时注入路由；四个模型 alias 无条件收敛到
   // profile.model。未配置 token 时保持 env 空，由 picker 拦截该档位。
-  if (name === 'glm' && (env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY)) {
-    const selectedModel = raw.model?.trim() || DEFAULT_GLM_MODEL
+  if (isGlmProfile(name) && (env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY)) {
+    const fallback = name === 'glm-flash' ? DEFAULT_GLM_FLASH_MODEL : DEFAULT_GLM_MODEL
+    const selectedModel = raw.model?.trim() || fallback
     for (const key of CLAUDE_MODEL_ALIAS_KEYS) env[key] = selectedModel
   }
   // DeepSeek 与 GLM 同构:实际配了 token 才注入路由。alias 按官方 Claude Code

@@ -16,9 +16,9 @@ AI 不是帮手,是倍率。它放大的不是体力,是你 —— 你的直觉�
 
 ### 🧠 双后端:Claude Code + Codex
 
-夜航星同时接入 Claude Code 和 Codex 两个 agent 后端,**默认 Claude Code**。群里发 `model` 弹出固定档位、一键切换、按群持久化:**Claude·Fable 5**、**Claude·Opus 5**、**Claude·GLM**、**Claude·Grok**、**Codex·GPT-5.6 Sol**。Fable 5 / Opus 走你的 Anthropic 登录态;GLM/Grok 是第三方路由,配好各自 token 后即插即用。默认档位是 Fable 5;配了 GLM 的话向导会把默认设成 GLM。
+夜航星同时接入 Claude Code 和 Codex 两个 agent 后端,**默认 Claude Code**。群里发 `model` 弹出固定档位、一键切换、按群持久化:**Claude·Fable 5**、**Claude·Opus 5**、**Claude·GLM**、**Claude·GLM-5.3 Flash**、**Claude·Grok**、**Codex·GPT-5.6 Sol**。Fable 5 / Opus 走你的 Anthropic 登录态;GLM/Grok 是第三方路由,配好各自 token 后即插即用。默认档位是 Fable 5;配了 GLM 的话向导会把默认设成 GLM。
 
-订阅了 GLM Coding Plan 的话强烈推荐 **Claude·GLM** 档位 —— GLM-5.3 开放 1M token 上下文窗口,长会话不易丢前文、中文友好。在 GLM 档位上,`hi` 控制台会展示套餐档位、5 小时滚动窗口与月度用量;每条回复的 footer 也会带上当前 5h 窗口的已用百分比(`5h·N%`),额度消耗随时可见。
+订阅了 GLM Coding Plan 的话强烈推荐 **Claude·GLM** 档位 —— GLM-5.3 开放 1M token 上下文窗口,长会话不易丢前文、中文友好。想省额度就切 **Claude·GLM-5.3 Flash**(智谱 2026-08-26 上线的快速档,价格约 GLM-5.3 的 1/10、同样 1M 上下文)。在 GLM 系档位上,`hi` 控制台会展示套餐档位、5 小时滚动窗口与月度用量;每条回复的 footer 也会带上当前 5h 窗口的已用百分比(`5h·N%`),额度消耗随时可见。
 
 **GLM 档位怎么配**:订阅后跑 `lodestar-setup`,第 2 步填入智谱 API key 就自动写好并设为默认;想手配或改模型,在 `~/.config/lodestar/config.toml` 加(**别写进 `~/.claude/settings.json`** —— 那会经 Claude Code 的 settingSources 污染 Fable 5 / Opus 登录档位,让它们也偷偷走 GLM):
 

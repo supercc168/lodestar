@@ -266,6 +266,8 @@ describe('token-source list + usage helpers', () => {
     expect(resolveUsageSource('codex', 'gpt-5.6-sol')).toBe('codex')
     expect(resolveUsageSource('claude', 'claude:fable')).toBe('not_applicable')
     expect(resolveUsageSource('claude', 'claude:glm')).toBe('glm')
+    // glm-* 变体(如 glm-flash 快速档)命中 /^claude:glm(?:$|[-_])/ 同归 GLM 额度
+    expect(resolveUsageSource('claude', 'claude:glm-flash')).toBe('glm')
     expect(resolveUsageSource('claude', 'claude:relay')).toBe('not_applicable')
     expect(resolveUsageSource('claude', 'claude:grok')).toBe('provider')
     expect(resolveUsageSource('claude', 'claude:grokcc')).toBe('provider')
