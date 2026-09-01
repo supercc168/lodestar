@@ -1,5 +1,5 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { mkdtempSync, rmSync } from 'node:fs'
+import { afterEach, beforeEach, describe, expect, setSystemTime, test } from 'bun:test'
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -12,7 +12,9 @@ import {
   isDispatching,
   loadCallbacks,
   markResolved,
+  markUnknown,
   prune,
+  recordCallbackSuccess,
   register,
   setDispatching,
   type NotifyRegistration,
@@ -116,6 +118,83 @@ describe('notify-callbacks store', () => {
     setDispatching('nf_dispatch')
     clearDispatching('nf_dispatch')
     expect(isDispatching('nf_dispatch')).toBe(false)
+  })
+})
+
+describe('durable resolved 墓碑 / markUnknown / 运行中修剪(上游 ec149d7)', () => {
+  /** 让持久化必然失败:store 指向一个"父路径是普通文件"的位置,
+   *  mkdirSync(parent) 必抛 ENOTDIR。clearMemory=false 保留内存态。 */
+  function breakStoreKeepMemory(): void {
+    const blocker = join(tempDir, 'blocker')
+    writeFileSync(blocker, 'not a dir')
+    __setStoreFileForTest(join(blocker, 'store.json'), false)
+  }
+
+  test('markResolved 找不到注册时抛出(不再静默吞)', () => {
+    expect(() => markResolved('nf_missing', 'approve', 'ou_u')).toThrow(/not found/)
+  })
+
+  test('markResolved 持久化失败时回滚内存态并抛出(墓碑必须 durable)', () => {
+    register(sampleReg({ notifyId: 'nf_rollback' }))
+    breakStoreKeepMemory()
+    expect(() => markResolved('nf_rollback', 'approve', 'ou_u')).toThrow()
+    const got = get('nf_rollback')!
+    expect(got.resolvedAt).toBeUndefined()
+    expect(got.resolvedBy).toBeUndefined()
+  })
+
+  test('recordCallbackSuccess 正常路径 → complete,resolved 墓碑落盘重启可见', () => {
+    register(sampleReg({ notifyId: 'nf_ok' }))
+    expect(recordCallbackSuccess('nf_ok', 'approve', 'ou_u')).toEqual({ state: 'complete' })
+    // 模拟重启:清内存 → 从盘重载,墓碑仍在 → 重复回调可拒
+    __setStoreFileForTest(tempFile)
+    loadCallbacks()
+    expect(get('nf_ok')?.resolvedAt).toBeGreaterThan(0)
+    expect(get('nf_ok')?.resolvedBy?.openId).toBe('ou_u')
+  })
+
+  test('外部成功但本地持久化失败 → markUnknown 冻结(不当可重试)', () => {
+    register(sampleReg({ notifyId: 'nf_unknown' }))
+    breakStoreKeepMemory()
+    const recorded = recordCallbackSuccess('nf_unknown', 'approve', 'ou_u')
+    expect(recorded.state).toBe('unknown')
+    if (recorded.state !== 'unknown') throw new Error('expected unknown record')
+    expect(recorded.detail).toContain('persistence failed')
+    // 内存 guard 保留:unknownAt 冻结、resolvedAt 不得存在(冻结≠已解决)
+    const got = get('nf_unknown')!
+    expect(got.unknownAt).toBeGreaterThan(0)
+    expect(got.unknownBy).toEqual({ buttonId: 'approve', openId: 'ou_u' })
+    expect(got.resolvedAt).toBeUndefined()
+    expect(typeof got.unknownReason).toBe('string')
+  })
+
+  test('markUnknown 可持久化时落盘,buildNotifyResult 暴露 unknown 分支', () => {
+    register(sampleReg({ notifyId: 'nf_bnr_unknown' }))
+    markUnknown('nf_bnr_unknown', 'approve', 'ou_op', 'test freeze reason')
+    const r = buildNotifyResult(get('nf_bnr_unknown')!) as any
+    expect(r.resolved).toBe(false)
+    expect(r.unknown).toBe(true)
+    expect(r.button).toEqual({ id: 'approve', text: '✅ 通过', type: 'primary' })
+    expect(r.unknown_by).toBe('ou_op')
+    expect(r.unknown_reason).toBe('test freeze reason')
+    // 落盘后重启仍冻结
+    __setStoreFileForTest(tempFile)
+    loadCallbacks()
+    expect(get('nf_bnr_unknown')?.unknownAt).toBeGreaterThan(0)
+  })
+
+  test('运行中修剪:register 超过修剪间隔时驱逐 7 天+ 记录(不只 boot 时)', () => {
+    register(sampleReg({ notifyId: 'nf_stale_run', createdAt: Date.now() - 8 * 24 * 3600_000 }))
+    expect(get('nf_stale_run')).toBeDefined()
+    // 快进 25h(> 24h 修剪间隔)再 register → 触发运行中 prune
+    setSystemTime(new Date(Date.now() + 25 * 3600_000))
+    try {
+      register(sampleReg({ notifyId: 'nf_fresh_run', createdAt: Date.now() }))
+      expect(get('nf_stale_run')).toBeUndefined()
+      expect(get('nf_fresh_run')).toBeDefined()
+    } finally {
+      setSystemTime()
+    }
   })
 })
 
