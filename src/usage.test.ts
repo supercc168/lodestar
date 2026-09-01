@@ -1,7 +1,58 @@
 import { describe, expect, test } from 'bun:test'
 
 import { config } from './config'
-import { providerUsageSnapshotFromResponse, readUsage, updateUsageFromRateLimits } from './usage'
+import { AppServerOnce, providerUsageSnapshotFromResponse, readUsage, updateUsageFromRateLimits } from './usage'
+
+describe('AppServerOnce 管道加固(上游 ec149d7)', () => {
+  // 用 bun -e 起假 app-server 测管道行为,不 spawn 真 codex(慢且依赖登录态)。
+  // 构造器 bin/args 形参默认仍是 resolveCodexBin() + app-server,生产路径不变。
+
+  /** 活着、读 stdin、永不回话——测 request 内建超时。 */
+  const MUTE_SERVER = 'process.stdin.on("data", () => {}); setInterval(() => {}, 1000)'
+  /** 忽略 SIGTERM 的 JSON-RPC echo——先握手确认 handler 已装好,再测 SIGKILL 升级。 */
+  const SIGTERM_PROOF_ECHO = [
+    'process.on("SIGTERM", () => {});',
+    'let buf = "";',
+    'process.stdin.on("data", d => {',
+    '  buf += d.toString();',
+    '  let nl;',
+    '  while ((nl = buf.indexOf("\\n")) >= 0) {',
+    '    const line = buf.slice(0, nl); buf = buf.slice(nl + 1);',
+    '    if (!line.trim()) continue;',
+    '    const m = JSON.parse(line);',
+    '    process.stdout.write(JSON.stringify({ id: m.id, result: { ok: true } }) + "\\n");',
+    '  }',
+    '});',
+    'setInterval(() => {}, 1000)',
+  ].join('\n')
+
+  test('request 内建超时:app-server 不回话时自拒(不再永久悬挂)', async () => {
+    const app = new AppServerOnce(process.execPath, ['-e', MUTE_SERVER])
+    try {
+      await expect(app.request('initialize', {}, 200)).rejects.toThrow(/timed out after 200ms/)
+    } finally {
+      await app.close(1000).catch(() => {})
+    }
+  })
+
+  test('spawn error 自 finish:pending 拒绝,后续请求直接拒 not alive', async () => {
+    const app = new AppServerOnce('/nonexistent/lodestar-test-no-such-bin')
+    await expect(app.request('initialize', {}, 3000)).rejects.toThrow()
+    // error 事件已 settle → alive=false,后续请求同步拒绝
+    await new Promise(resolve => setTimeout(resolve, 30))
+    await expect(app.request('account/read', {}, 3000)).rejects.toThrow(/not alive/)
+  })
+
+  test('close:SIGTERM 未死升级 SIGKILL 并确认退出', async () => {
+    const app = new AppServerOnce(process.execPath, ['-e', SIGTERM_PROOF_ECHO])
+    // 握手:回包即证明 SIGTERM handler 已装好(同脚本第一行先执行)
+    await expect(app.request('ping', {}, 5000)).resolves.toEqual({ ok: true })
+    const t0 = Date.now()
+    await app.close(300)  // SIGTERM 被忽略 → 300ms 后 SIGKILL;失败会 throw
+    expect(Date.now() - t0).toBeGreaterThanOrEqual(250)
+    await expect(app.request('account/read', {}, 1000)).rejects.toThrow(/not alive/)
+  }, 10_000)
+})
 
 describe('usage cache semantics', () => {
   test('keeps last live snapshot when a later live update payload is empty', () => {
