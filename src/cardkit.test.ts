@@ -326,3 +326,100 @@ describe('cardkit network retry and footer isolation', () => {
     await cardkit.dispose('card_onsuccess')
   })
 })
+
+describe('cardkit checked settings PATCH and disposed-card guard (upstream ec149d7)', () => {
+  test('patchSettingsChecked reports whether the terminal PATCH landed', async () => {
+    const cardId = 'card_checked_settings'
+    cardkit.recordCardCreated(cardId, 1)
+    expect(await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })).toBe(true)
+
+    const okFetch = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify({ code: 300308, msg: 'settings rejected' }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as typeof fetch
+    expect(await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })).toBe(false)
+    // 失败不得清 bookkeeping:元素计数仍在,恢复后同卡可继续落地
+    expect(cardkit.getElementCount(cardId)).toBe(1)
+    globalThis.fetch = okFetch
+    expect(await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })).toBe(true)
+    await cardkit.dispose(cardId)
+  })
+
+  test('patchSettingsChecked returns false when the PATCH times out unconfirmed', async () => {
+    const cardId = 'card_checked_settings_net'
+    cardkit.recordCardCreated(cardId, 1)
+    globalThis.fetch = (async () => { throw new TypeError('fetch failed') }) as typeof fetch
+    expect(await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })).toBe(false)
+    expect(cardkit.getElementCount(cardId)).toBe(1)
+    await cardkit.dispose(cardId)
+  }, 10_000)
+
+  test('patchSettingsChecked reopens an expired stream and retries once', async () => {
+    const cardId = 'card_checked_settings_reopen'
+    cardkit.recordCardCreated(cardId, 1)
+    let attempt = 0
+    globalThis.fetch = (async () => {
+      attempt++
+      return new Response(JSON.stringify(attempt === 1
+        ? { code: 300309, msg: 'streaming mode is closed' }
+        : { code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+    expect(await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })).toBe(true)
+    expect(attempt).toBe(3) // failed PATCH → reopen PATCH → terminal PATCH retry
+    await cardkit.dispose(cardId)
+  })
+
+  test('patchSummaryThrottled records lastSent only after the PATCH landed', async () => {
+    const cardId = 'card_summary_landed'
+    cardkit.recordCardCreated(cardId, 1)
+    let failSettings = true
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      calls.push({
+        method: String(init?.method ?? 'GET'),
+        path: url.pathname.replace('/open-apis/cardkit/v1', ''),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      })
+      return new Response(JSON.stringify(failSettings
+        ? { code: 300308, msg: 'settings rejected' }
+        : { code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    const wait = (ms: number) => new Promise(resolve => setTimeout(resolve, ms))
+    cardkit.patchSummaryThrottled(cardId, '预览内容')
+    await wait(1900) // SUMMARY_FLUSH_MS(1500) + margin
+    expect(calls.filter(c => c.path === `/cards/${cardId}/settings`)).toHaveLength(1)
+
+    // PATCH 未落地不得记 lastSent → 同 summary 重投必须再次发送
+    failSettings = false
+    cardkit.patchSummaryThrottled(cardId, '预览内容')
+    await wait(1900)
+    expect(calls.filter(c => c.path === `/cards/${cardId}/settings`)).toHaveLength(2)
+    await cardkit.dispose(cardId)
+  }, 15_000)
+
+  test('disposed card mutations do not recreate state or hit the wire', async () => {
+    const cardId = 'card_disposed_guard'
+    cardkit.recordCardCreated(cardId, 2)
+    await cardkit.dispose(cardId)
+
+    await cardkit.addElement(cardId, { tag: 'markdown', element_id: 'e1', content: 'x' })
+    await cardkit.replaceElement(cardId, 'footer', { tag: 'markdown', element_id: 'footer', content: 'x' })
+    await cardkit.deleteElement(cardId, 'e1')
+    await cardkit.patchSettings(cardId, { config: {} })
+    expect(await cardkit.patchSettingsChecked(cardId, { config: {} })).toBe(false)
+
+    expect(calls).toHaveLength(0)
+    expect(cardkit.getElementCount(cardId)).toBe(0)
+
+    // 同 id 重新开卡(recordCardCreated)清墓碑,恢复可写
+    cardkit.recordCardCreated(cardId, 1)
+    await cardkit.addElement(cardId, { tag: 'markdown', element_id: 'e2', content: 'y' })
+    expect(calls.filter(c => c.path === `/cards/${cardId}/elements`)).toHaveLength(1)
+    await cardkit.dispose(cardId)
+  })
+})
