@@ -9,7 +9,7 @@
 import * as lark from '@larksuiteoapi/node-sdk'
 import { execSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
-import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
 import { basename, extname, join } from 'node:path'
@@ -23,7 +23,6 @@ import {
 } from './agent-process'
 import {
   ALIVE_MARKER_FILE,
-  DATA_DIR,
   INBOX_DIR,
   SESSION_CHAT_MAP_FILE,
   SESSION_MODEL_MAP_FILE,
@@ -31,6 +30,7 @@ import {
   SESSION_TURNS_MAP_FILE,
 } from './paths'
 import { log } from './log'
+import { writeJsonStateAtomic, writeStateFileAtomic } from './state-store'
 
 const APP_ID = config.feishu.app_id
 const APP_SECRET = config.feishu.app_secret
@@ -44,24 +44,52 @@ export function projectProfile(sessionName: string): ProjectProfile | undefined 
   return config.projects[sessionName]
 }
 
+/** Canonical configured root for a project name. Session, worktree and task
+ * automation must share this resolver so a `[projects.<name>].cwd` profile
+ * cannot make the interactive agent operate one repository while automation
+ * mutates a same-named directory under PROJECTS_ROOT. */
+export function resolveProjectDir(projectName: string): string {
+  const override = projectProfile(projectName)?.cwd?.trim()
+  return override || join(PROJECTS_ROOT, projectName)
+}
+
 export const client = new lark.Client({
   appId: APP_ID, appSecret: APP_SECRET, disableTokenCache: false,
 })
 
+/** 全部 raw fetch 的 15s 兜底超时:无超时的挂死请求会连坐上层 drain
+ * (card review #5)。调用方显式传 signal 时以调用方为准。 */
+const RAW_FETCH_TIMEOUT_MS = 15_000
+
+function rawFetch(input: string | URL, init: RequestInit = {}): Promise<Response> {
+  return fetch(input, {
+    ...init,
+    signal: init.signal ?? AbortSignal.timeout(RAW_FETCH_TIMEOUT_MS),
+  })
+}
+
 // ── Tenant token (cached, used by raw fetch wrappers) ──────────────────
 let cachedToken = ''
 let tokenExpiry = 0
+/** 并发获取单飞:多个 raw 调用同时撞上过期 token 时只发一次请求,
+ * 其余等待同一个 in-flight promise(上游 ec149d7)。 */
+let tokenInFlight: Promise<string> | null = null
 export async function getTenantToken(): Promise<string> {
   if (cachedToken && Date.now() < tokenExpiry) return cachedToken
-  const res = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ app_id: APP_ID, app_secret: APP_SECRET }),
-  })
-  const data = await res.json() as { tenant_access_token?: string; expire?: number }
-  if (!data.tenant_access_token) throw new Error('feishu: failed to obtain tenant token')
-  cachedToken = data.tenant_access_token
-  tokenExpiry = Date.now() + ((data.expire ?? 7200) - 60) * 1000
-  return cachedToken
+  tokenInFlight ??= (async () => {
+    const res = await rawFetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ app_id: APP_ID, app_secret: APP_SECRET }),
+    })
+    const data = await res.json() as { code?: number; msg?: string; tenant_access_token?: string; expire?: number }
+    if (!res.ok || !data.tenant_access_token) {
+      throw new Error(`feishu: tenant token failed HTTP ${res.status} code=${data.code ?? 'MISS'} msg=${data.msg ?? 'MISS'}`)
+    }
+    cachedToken = data.tenant_access_token
+    tokenExpiry = Date.now() + Math.max(0, (data.expire ?? 7200) - 60) * 1000
+    return cachedToken
+  })().finally(() => { tokenInFlight = null })
+  return tokenInFlight
 }
 
 // ── Chat directory ─────────────────────────────────────────────────────
@@ -75,15 +103,17 @@ export function loadSessionChatMap(): void {
       if (typeof id === 'string') preferredChatForSession.set(name, id)
     }
     log(`feishu: loaded ${preferredChatForSession.size} session→chat bindings`)
-  } catch {}
+  } catch (e: any) {
+    // ENOENT(首次启动无文件)静默;其他(JSON 损坏等)要暴露,符合 no-fallbacks。
+    if (e?.code !== 'ENOENT') log(`feishu: load session-chat-map failed: ${e?.message ?? e}`)
+  }
 }
 
 function saveSessionChatMap(): void {
   try {
     const obj: Record<string, string> = {}
     for (const [k, v] of preferredChatForSession) obj[k] = v
-    mkdirSync(DATA_DIR, { recursive: true })
-    writeFileSync(SESSION_CHAT_MAP_FILE, JSON.stringify(obj, null, 2))
+    writeJsonStateAtomic(SESSION_CHAT_MAP_FILE, obj)
   } catch (e) { log(`feishu: save session-chat-map failed: ${e}`) }
 }
 
@@ -144,15 +174,16 @@ export function loadSessionResumeMap(): void {
       }
     }
     log(`feishu: loaded ${lastSessionIdByName.size} session→resume bindings`)
-  } catch {}
+  } catch (e: any) {
+    if (e?.code !== 'ENOENT') log(`feishu: load session-resume-map failed: ${e?.message ?? e}`)
+  }
 }
 
 function saveSessionResumeMap(): void {
   try {
     const obj: Record<string, Partial<Record<AgentProvider, string>>> = {}
     for (const [k, v] of lastSessionIdByName) obj[k] = { ...v }
-    mkdirSync(DATA_DIR, { recursive: true })
-    writeFileSync(SESSION_RESUME_MAP_FILE, JSON.stringify(obj, null, 2))
+    writeJsonStateAtomic(SESSION_RESUME_MAP_FILE, obj)
   } catch (e) { log(`feishu: save session-resume-map failed: ${e}`) }
 }
 
@@ -228,8 +259,7 @@ function saveSessionTurnsMap(): void {
   try {
     const obj: Record<string, TurnAnchor[]> = {}
     for (const [k, v] of turnsBySession) obj[k] = v
-    mkdirSync(DATA_DIR, { recursive: true })
-    writeFileSync(SESSION_TURNS_MAP_FILE, JSON.stringify(obj, null, 2))
+    writeJsonStateAtomic(SESSION_TURNS_MAP_FILE, obj)
   } catch (e) { log(`feishu: save session-turns-map failed: ${e}`) }
 }
 
@@ -331,15 +361,16 @@ export function loadSessionModelMap(): void {
       })
     }
     log(`feishu: loaded ${selectedModelByName.size} session→model bindings`)
-  } catch {}
+  } catch (e: any) {
+    if (e?.code !== 'ENOENT') log(`feishu: load session-model-map failed: ${e?.message ?? e}`)
+  }
 }
 
 function saveSessionModelMap(): void {
   try {
     const obj: Record<string, SessionModelSelection> = {}
     for (const [k, v] of selectedModelByName) obj[k] = v
-    mkdirSync(DATA_DIR, { recursive: true })
-    writeFileSync(SESSION_MODEL_MAP_FILE, JSON.stringify(obj, null, 2))
+    writeJsonStateAtomic(SESSION_MODEL_MAP_FILE, obj)
   } catch (e) { log(`feishu: save session-model-map failed: ${e}`) }
 }
 
@@ -380,7 +411,7 @@ export function getSessionModel(sessionName: string): string | null {
 
 export function writeAliveMarker(sessionNames: string[]): void {
   try {
-    writeFileSync(ALIVE_MARKER_FILE, JSON.stringify(sessionNames, null, 2))
+    writeJsonStateAtomic(ALIVE_MARKER_FILE, sessionNames)
   } catch (e) { log(`feishu: write alive marker failed: ${e}`) }
 }
 
@@ -553,7 +584,7 @@ async function ensureUserInChat(chatId: string, userOpenId: string): Promise<boo
 export async function fetchChatName(chatId: string): Promise<string | null> {
   try {
     const token = await getTenantToken()
-    const res = await fetch(`https://open.feishu.cn/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {
+    const res = await rawFetch(`https://open.feishu.cn/open-apis/im/v1/chats/${encodeURIComponent(chatId)}`, {
       headers: { Authorization: `Bearer ${token}` },
     })
     const json = await res.json() as any
@@ -662,7 +693,7 @@ export async function updateCard(messageId: string, card: object): Promise<void>
 export async function sendTextRaw(chatId: string, text: string): Promise<string | null> {
   try {
     const token = await getTenantToken()
-    const res = await fetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
+    const res = await rawFetch('https://open.feishu.cn/open-apis/im/v1/messages?receive_id_type=chat_id', {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({
@@ -742,7 +773,7 @@ export async function urgentApp(messageId: string, openIds: string[]): Promise<v
   const token = await getTenantToken()
   const url = `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/urgent_app?user_id_type=open_id`
   try {
-    const res = await fetch(url, {
+    const res = await rawFetch(url, {
       method: 'PATCH',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: JSON.stringify({ user_id_list: openIds }),
@@ -765,7 +796,7 @@ export async function downloadAttachment(
   try {
     const token = await getTenantToken()
     const url = `https://open.feishu.cn/open-apis/im/v1/messages/${messageId}/resources/${key}?type=${type}`
-    const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } })
+    const res = await rawFetch(url, { headers: { Authorization: `Bearer ${token}` } })
     if (!res.ok) {
       log(`feishu: download ${type} HTTP ${res.status}: ${(await res.text()).slice(0, 200)}`)
       return undefined
@@ -776,7 +807,7 @@ export async function downloadAttachment(
       ? name.replace(/[^a-zA-Z0-9._-]/g, '_')
       : `${key.replace(/[^a-zA-Z0-9_-]/g, '_')}.png`
     const path = join(INBOX_DIR, `${Date.now()}-${safeName}`)
-    writeFileSync(path, buf)
+    writeStateFileAtomic(path, buf)
     log(`feishu: downloaded ${type} ${path} (${buf.length}B)`)
     return path
   } catch (e) {
@@ -798,11 +829,15 @@ function looksLikeImage(filePath: string): boolean {
 
 async function uploadImageMultipart(filePath: string): Promise<string | null> {
   const token = await getTenantToken()
-  const file = new Blob([await readFile(filePath)])
+  // Copy into an ArrayBuffer-backed view. Node 18's BlobPart typing correctly
+  // rejects Buffer's wider ArrayBufferLike backing (which may be shared).
+  const file = new Blob([Uint8Array.from(await readFile(filePath))])
   const form = new FormData()
   form.append('image_type', 'message')
   form.append('image', file, basename(filePath))
-  const res = await fetch('https://open.feishu.cn/open-apis/im/v1/images', {
+  // async 渲染路径依赖此上传完成;无超时的挂死上传会连坐上层 drain,
+  // rawFetch 15s 上限后失败可见。
+  const res = await rawFetch('https://open.feishu.cn/open-apis/im/v1/images', {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
     body: form,
@@ -840,13 +875,13 @@ export async function uploadImageKey(filePath: string): Promise<string | null> {
 
 async function uploadFileMultipart(filePath: string): Promise<string | null> {
   const token = await getTenantToken()
-  const file = new Blob([await readFile(filePath)])
+  const file = new Blob([Uint8Array.from(await readFile(filePath))])
   const form = new FormData()
   // 'stream' is the catch-all type and works for arbitrary binaries.
   form.append('file_type', 'stream')
   form.append('file_name', basename(filePath))
   form.append('file', file, basename(filePath))
-  const res = await fetch('https://open.feishu.cn/open-apis/im/v1/files', {
+  const res = await rawFetch('https://open.feishu.cn/open-apis/im/v1/files', {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}` },
     body: form,
@@ -943,7 +978,8 @@ export function provisionProject(workDir: string): void {
     if (!text.includes(header)) {
       const prefix = text.trimEnd()
       text = `${prefix}${prefix ? '\n\n' : ''}${header}\ntrust_level = "trusted"\n`
-      writeFileSync(codexConfigPath, text)
+      // 读-改-写用户真实 ~/.codex/config.toml:原子替换,崩溃/满盘不毁原文件。
+      writeStateFileAtomic(codexConfigPath, text)
     }
   } catch (e) { log(`feishu: codex trust write failed for ${workDir}: ${e}`) }
   try { execSync('git init -q', { cwd: workDir, stdio: 'ignore' }) } catch {}
