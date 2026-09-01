@@ -24,6 +24,11 @@ function notificationHarness(): { proc: any; events: Array<[string, any]> } {
   proc.opts = { workDir: '/tmp' }
   proc.sessionId = 'thread-structured'
   proc.emittedImageGenerationIds = new Set()
+  // collab→bg 翻译状态机四表(cf41941):Object.create 不跑字段初始化器,手动补。
+  proc.collabAgentNames = new Map()
+  proc.collabAgentSettled = new Set()
+  proc.collabAgentWasActive = new Set()
+  proc.collabAgentSummaries = new Map()
   proc.emit = (event: string, payload: unknown) => {
     events.push([event, payload])
     return true
@@ -517,7 +522,9 @@ describe('codex process compaction notifications', () => {
       threadId: 'thread-4',
       turnId: 'turn-4',
     })).not.toThrow()
-    expect(raw).toHaveLength(1)
+    // thread/status/changed 已从高频静默 raw 名单改道 handleThreadStatusChanged
+    // (cf41941):未知线程 no-op,不再 emit raw。
+    expect(raw).toHaveLength(0)
     expect(compacted).toHaveLength(1)
   })
 
@@ -785,12 +792,23 @@ describe('codex structured progress notifications', () => {
       item: { ...shared, id: 'activity-stop', kind: 'interrupted' },
     })
 
+    // 双通路(RESEARCH #12):subagent_activity 观测 emit 保留(watchdog 喂养),
+    // collab 状态机同时翻译出 bg_task_*(游标卡)。
     expect(events).toEqual([
       ['subagent_activity', {
         activityId: 'activity-start',
         agentThreadId: 'agent-thread-1',
         agentPath: '/root/worker-1',
         kind: 'started',
+      }],
+      ['bg_task_started', {
+        task_id: 'agent-thread-1',
+        task_type: 'local_agent',
+        description: 'worker-1',
+      }],
+      ['bg_task_updated', {
+        task_id: 'agent-thread-1',
+        patch: { is_backgrounded: true },
       }],
       ['subagent_activity', {
         activityId: 'activity-interact',
@@ -804,10 +822,14 @@ describe('codex structured progress notifications', () => {
         agentPath: '/root/worker-1',
         kind: 'interrupted',
       }],
+      ['bg_task_updated', {
+        task_id: 'agent-thread-1',
+        patch: { status: 'paused' },
+      }],
     ])
   })
 
-  test('emits collab agent state before preserving the completed tool result', () => {
+  test('emits collab agent state and translates agentsStates to bg events without a tool result', () => {
     const { proc, events } = notificationHarness()
     const agentsStates = {
       'agent-thread-running': { status: 'running' },
@@ -827,20 +849,25 @@ describe('codex structured progress notifications', () => {
       },
     })
 
-    expect(events).toEqual([
-      ['collab_agent_state', { toolUseId: 'collab-1', agentsStates }],
-      ['tool_result', {
-        tool_use_id: 'collab-1',
-        content: JSON.stringify(agentsStates, null, 2),
-        is_error: false,
-      }],
+    // timeline 压缩(cf41941):collabAgentToolCall 不再产出 agentsStates JSON
+    // dump 的 tool_result;collab_agent_state 观测 emit(watchdog)保留,
+    // agentsStates 翻译为 bg_task_*(占位名入池 → running / settled)。
+    expect(events.filter(([event]) => event === 'tool_result')).toEqual([])
+    expect(events[0]).toEqual(['collab_agent_state', { toolUseId: 'collab-1', agentsStates }])
+    expect(events.slice(1)).toEqual([
+      ['bg_task_started', { task_id: 'agent-thread-running', task_type: 'local_agent', description: '子 agent', prompt: undefined }],
+      ['bg_task_updated', { task_id: 'agent-thread-running', patch: { is_backgrounded: true } }],
+      ['bg_task_updated', { task_id: 'agent-thread-running', patch: { status: 'running' } }],
+      ['bg_task_started', { task_id: 'agent-thread-completed', task_type: 'local_agent', description: '子 agent', prompt: undefined }],
+      ['bg_task_updated', { task_id: 'agent-thread-completed', patch: { is_backgrounded: true } }],
+      ['bg_task_settled', { task_id: 'agent-thread-completed', status: 'completed', summary: undefined }],
     ])
   })
 
   test.each([
     ['empty string', ''],
     ['number', 42],
-  ])('suppresses collab state but preserves the tool result for an invalid %s id', (_label, id) => {
+  ])('suppresses collab state for an invalid %s id but still translates agentsStates', (_label, id) => {
     const { proc, events } = notificationHarness()
     const agentsStates = { 'agent-thread-1': { status: 'running' } }
 
@@ -857,13 +884,9 @@ describe('codex structured progress notifications', () => {
     })
 
     expect(events.filter(([event]) => event === 'collab_agent_state')).toEqual([])
-    expect(events.filter(([event]) => event === 'tool_result')).toEqual([
-      ['tool_result', {
-        tool_use_id: id,
-        content: JSON.stringify(agentsStates, null, 2),
-        is_error: false,
-      }],
-    ])
+    // timeline 压缩后 collabAgentToolCall 不再出 tool_result;bg 翻译不依赖 item.id。
+    expect(events.filter(([event]) => event === 'tool_result')).toEqual([])
+    expect(events.filter(([event]) => event === 'bg_task_started')).toHaveLength(1)
   })
 
   test.each([
@@ -892,7 +915,220 @@ describe('codex structured progress notifications', () => {
     })
 
     expect(events.filter(([event]) => event === 'collab_agent_state')).toEqual([])
-    expect(events.filter(([event]) => event === 'tool_result')).toHaveLength(1)
+    // 恶意/畸形 agentsStates:观测 emit 拒收(既有防线),bg 翻译零事件,
+    // timeline 压缩后也不再有 tool_result。
+    expect(events.filter(([event]) => event === 'tool_result')).toEqual([])
+    expect(events.filter(([event]) => event.startsWith('bg_task_'))).toEqual([])
+  })
+})
+
+describe('codex 多 agent collab→bg 翻译状态机(上游 cf41941)', () => {
+  test('exec-cell 生命周期:spawn→创建 idle 不结算→active→agentMessage 采集→idle 结算 completed(summary 墓碑)→重复 idle 去重', () => {
+    const { proc, events } = notificationHarness()
+    proc.handleNotification('item/started', {
+      threadId: 'thread-structured',
+      item: { type: 'subAgentActivity', id: 'act-1', kind: 'started', agentThreadId: 'sub-1', agentPath: '/root/order/worker' },
+    })
+    expect(events).toEqual([
+      ['subagent_activity', { activityId: 'act-1', agentThreadId: 'sub-1', agentPath: '/root/order/worker', kind: 'started' }],
+      ['bg_task_started', { task_id: 'sub-1', task_type: 'local_agent', description: 'worker' }],
+      ['bg_task_updated', { task_id: 'sub-1', patch: { is_backgrounded: true } }],
+    ])
+    events.length = 0
+
+    // 首个 idle 是创建态(spawn 后未开跑):没见过 active 不结算。
+    proc.handleNotification('thread/status/changed', { threadId: 'sub-1', status: { type: 'idle' } })
+    expect(events).toEqual([])
+
+    proc.handleNotification('thread/status/changed', { threadId: 'sub-1', status: { type: 'active' } })
+    expect(events).toEqual([['bg_task_updated', { task_id: 'sub-1', patch: { status: 'running' } }]])
+    events.length = 0
+
+    // 外线程 agentMessage:捕获末段文本作 summary,不出 step、不进主卡。
+    proc.handleNotification('item/completed', {
+      threadId: 'sub-1',
+      item: { type: 'agentMessage', id: 'am-1', text: '结论:全部通过' },
+    })
+    expect(events).toEqual([])
+
+    proc.handleNotification('thread/status/changed', { threadId: 'sub-1', status: { type: 'idle' } })
+    expect(events).toEqual([['bg_task_settled', { task_id: 'sub-1', status: 'completed', summary: '结论:全部通过' }]])
+    events.length = 0
+
+    // 重复终态快照:settled 去重。
+    proc.handleNotification('thread/status/changed', { threadId: 'sub-1', status: { type: 'idle' } })
+    expect(events).toEqual([])
+  })
+
+  test('systemError 结算 failed;followup 复活(active 再临)清标记重新入池', () => {
+    const { proc, events } = notificationHarness()
+    proc.handleNotification('item/started', {
+      threadId: 'thread-structured',
+      item: { type: 'subAgentActivity', id: 'act-2', kind: 'started', agentThreadId: 'sub-2', agentPath: '/root/fixer' },
+    })
+    proc.handleNotification('thread/status/changed', { threadId: 'sub-2', status: { type: 'active' } })
+    events.length = 0
+
+    proc.handleNotification('thread/status/changed', { threadId: 'sub-2', status: { type: 'systemError' } })
+    expect(events).toEqual([['bg_task_settled', { task_id: 'sub-2', status: 'failed', summary: undefined }]])
+    events.length = 0
+
+    // 复活:closeAgent/终态后线程重新 active → 清 settled 标记 + 重新入池 + running。
+    proc.handleNotification('thread/status/changed', { threadId: 'sub-2', status: { type: 'active' } })
+    expect(events).toEqual([
+      ['bg_task_started', { task_id: 'sub-2', task_type: 'local_agent', description: 'fixer' }],
+      ['bg_task_updated', { task_id: 'sub-2', patch: { is_backgrounded: true } }],
+      ['bg_task_updated', { task_id: 'sub-2', patch: { status: 'running' } }],
+    ])
+    events.length = 0
+
+    proc.handleNotification('thread/status/changed', { threadId: 'sub-2', status: { type: 'idle' } })
+    expect(events).toEqual([['bg_task_settled', { task_id: 'sub-2', status: 'completed', summary: undefined }]])
+  })
+
+  test('未知线程的 thread/status/changed 不驱动后台卡(主线程/未 spawn 线程)', () => {
+    const { proc, events } = notificationHarness()
+    proc.handleNotification('thread/status/changed', { threadId: 'thread-structured', status: { type: 'active' } })
+    proc.handleNotification('thread/status/changed', { threadId: 'sub-unknown', status: { type: 'active' } })
+    expect(events).toEqual([])
+  })
+
+  test('spawn-first 占位名入卡(密文任务书归一)+ subAgentActivity 后到补名', () => {
+    const { proc, events } = notificationHarness()
+    const fernet = 'gAAAAB' + 'x'.repeat(60)
+    proc.handleNotification('item/started', {
+      threadId: 'thread-structured',
+      item: {
+        type: 'collabAgentToolCall',
+        id: 'collab-9',
+        tool: 'spawnAgent',
+        status: 'inProgress',
+        prompt: fernet,
+        model: 'gpt-5.6-sol',
+        receiverThreadIds: ['sub-9'],
+        agentsStates: { 'sub-9': { status: 'pendingInit' } },
+      },
+    })
+    expect(events).toEqual([
+      ['bg_task_started', { task_id: 'sub-9', task_type: 'local_agent', description: '子 agent', prompt: '(继承主线程历史的密文任务书)' }],
+      ['bg_task_updated', { task_id: 'sub-9', patch: { is_backgrounded: true } }],
+      ['bg_task_updated', { task_id: 'sub-9', patch: { status: 'pending' } }],
+      // spawn 在主卡留一行摘要面板 —— prompt 密文归一,description 写「派生 N 个子 agent」。
+      ['tool_use', {
+        id: 'collab-9',
+        name: 'Agent',
+        input: { tool: 'spawnAgent', prompt: '(继承主线程历史的密文任务书)', description: '派生 1 个子 agent', model: 'gpt-5.6-sol' },
+      }],
+    ])
+    events.length = 0
+
+    // agentPath 真名后到:已知 id 补名(仅 started patch,不重发 is_backgrounded)。
+    proc.handleNotification('item/started', {
+      threadId: 'thread-structured',
+      item: { type: 'subAgentActivity', id: 'act-9', kind: 'started', agentThreadId: 'sub-9', agentPath: '/root/order/writer' },
+    })
+    expect(events).toEqual([
+      ['subagent_activity', { activityId: 'act-9', agentThreadId: 'sub-9', agentPath: '/root/order/writer', kind: 'started' }],
+      ['bg_task_started', { task_id: 'sub-9', task_type: 'local_agent', description: 'writer' }],
+    ])
+  })
+
+  test('timeline 压缩:wait/sendInput 编排调用不出面板;spawn completed 出摘要 result;closeAgent 强制结算 receiver', () => {
+    const { proc, events } = notificationHarness()
+    proc.handleNotification('item/started', {
+      threadId: 'thread-structured',
+      item: { type: 'subAgentActivity', id: 'act-3', kind: 'started', agentThreadId: 'sub-3', agentPath: '/root/runner' },
+    })
+    events.length = 0
+
+    // wait:无独立信息量,不出 tool_use/tool_result;collab_agent_state 观测保留。
+    proc.handleNotification('item/completed', {
+      threadId: 'thread-structured',
+      item: { type: 'collabAgentToolCall', id: 'collab-w', tool: 'wait', status: 'completed', agentsStates: { 'sub-3': { status: 'running' } } },
+    })
+    expect(events).toEqual([
+      ['collab_agent_state', { toolUseId: 'collab-w', agentsStates: { 'sub-3': { status: 'running' } } }],
+      ['bg_task_updated', { task_id: 'sub-3', patch: { status: 'running' } }],
+    ])
+    events.length = 0
+
+    // spawnAgent completed:tool_result 是逐 agent「线程前8: 状态」摘要,不再 JSON dump。
+    proc.handleNotification('item/completed', {
+      threadId: 'thread-structured',
+      item: { type: 'collabAgentToolCall', id: 'collab-s', tool: 'spawnAgent', status: 'completed', receiverThreadIds: ['sub-3'], agentsStates: { 'sub-3': { status: 'running' } } },
+    })
+    expect(events).toEqual([
+      ['collab_agent_state', { toolUseId: 'collab-s', agentsStates: { 'sub-3': { status: 'running' } } }],
+      ['bg_task_updated', { task_id: 'sub-3', patch: { status: 'running' } }],
+      ['tool_result', { tool_use_id: 'collab-s', content: 'sub-3: running', is_error: false }],
+    ])
+    events.length = 0
+
+    // closeAgent completed:关闭前快照常见 running —— receiver 无条件结算 stopped。
+    proc.handleNotification('item/completed', {
+      threadId: 'thread-structured',
+      item: { type: 'collabAgentToolCall', id: 'collab-c', tool: 'closeAgent', status: 'completed', receiverThreadIds: ['sub-3'], agentsStates: { 'sub-3': { status: 'running' } } },
+    })
+    expect(events).toEqual([
+      ['collab_agent_state', { toolUseId: 'collab-c', agentsStates: { 'sub-3': { status: 'running' } } }],
+      ['bg_task_updated', { task_id: 'sub-3', patch: { status: 'running' } }],
+      ['bg_task_settled', { task_id: 'sub-3', status: 'stopped' }],
+    ])
+  })
+
+  test('外线程工具 item 改道 subagent_step:started 带命令 brief,completed 回填输出;reasoning 不占 steps 预算', () => {
+    const { proc, events } = notificationHarness()
+    proc.handleNotification('item/started', {
+      threadId: 'sub-x',
+      item: { type: 'commandExecution', id: 'cmd-1', command: 'bun test', cwd: '/tmp' },
+    })
+    expect(events).toEqual([
+      ['subagent_step', { thread_id: 'sub-x', item_id: 'cmd-1', tool: 'Bash', phase: 'started', brief: '`bun test`' }],
+    ])
+    events.length = 0
+
+    proc.handleNotification('item/completed', {
+      threadId: 'sub-x',
+      item: { type: 'commandExecution', id: 'cmd-1', aggregatedOutput: '12 pass\n0 fail\n', exitCode: 0 },
+    })
+    expect(events).toHaveLength(1)
+    expect(events[0][0]).toBe('subagent_step')
+    expect(events[0][1]).toMatchObject({ thread_id: 'sub-x', item_id: 'cmd-1', phase: 'completed', brief: '→ 12 pass 0 fail' })
+    events.length = 0
+
+    // reasoning 每轮上百条,转空 step 会刷满 ~1000 字符预算 —— 不出 step。
+    proc.handleNotification('item/started', {
+      threadId: 'sub-x',
+      item: { type: 'reasoning', id: 'rs-9', summary: [], content: [] },
+    })
+    expect(events).toEqual([])
+  })
+
+  test('外线程其余事件(turn/delta/usage)仍全吞掉,不冒充主轮信号', () => {
+    const { proc, events } = notificationHarness()
+    proc.handleNotification('turn/completed', { threadId: 'sub-y', turn: { id: 't-y', status: 'completed' } })
+    proc.handleNotification('item/agentMessage/delta', { threadId: 'sub-y', itemId: 'am-y', delta: '子 agent 正文' })
+    proc.handleNotification('thread/tokenUsage/updated', { threadId: 'sub-y', tokenUsage: { last: { totalTokens: 9 } } })
+    expect(events).toEqual([])
+  })
+})
+
+describe('codex onStdout 解析与分发分离(cf41941 事故防放大器)', () => {
+  test('坏 JSON 行与 listener 异常各只丢自己,不连坐后续消息分发', () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    proc.stdoutBuf = ''
+    const seen: any[] = []
+    let first = true
+    proc.handleMessage = (msg: any) => {
+      if (first) {
+        first = false
+        throw new TypeError('cards.applySubagentStep is not a function')
+      }
+      seen.push(msg)
+    }
+    expect(() => proc.onStdout(Buffer.from('not-json\n{"method":"a"}\n{"method":"b"}\n'))).not.toThrow()
+    // 坏 JSON 跳过;{"method":"a"} 的 handler 异常只丢自己;{"method":"b"} 照常分发。
+    expect(seen).toEqual([{ method: 'b' }])
   })
 })
 
