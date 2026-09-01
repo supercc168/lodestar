@@ -20,6 +20,7 @@ const {
   isCodexCapacityError,
 } = await import('./session')
 const cardkit = await import('./cardkit')
+const sessionTools = await import('./session-tools')
 const sessionHostAsk = await import('./session-host-ask')
 const {
   fixedModelChoices,
@@ -7000,6 +7001,86 @@ describe('Session assistant rendering', () => {
     } finally {
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)
+    }
+  })
+})
+
+describe('session-tools tool-stage chat-list preview (upstream 8de138c)', () => {
+  function toolPreviewFixture(cardId: string) {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'sess-tool-preview')
+    session.proc = proc
+    const turn = turnState(cardId)
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    return { session, proc, turn }
+  }
+
+  test('普通工具进入渲染完成点后,预览同步为 🔧 工具名: 摘要', async () => {
+    const { session, proc, turn } = toolPreviewFixture('card_tool_preview_1')
+    const previews: Array<{ cardId: string; content: string }> = []
+    const summarySpy = spyOn(cardkit, 'patchSummaryThrottled').mockImplementation(
+      (cardId: string, content: string) => { previews.push({ cardId, content }) },
+    )
+    try {
+      sessionTools.addTool(session, proc as any, 'tool-preview-1', 'Bash', { command: 'ls -la' })
+      expect(previews).toEqual([{ cardId: turn.cardId, content: '🔧 Bash: ls -la' }])
+    } finally {
+      summarySpy.mockRestore()
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('摘要超 80 字时截断到 80 字加省略号', async () => {
+    const { session, proc, turn } = toolPreviewFixture('card_tool_preview_2')
+    const previews: Array<{ cardId: string; content: string }> = []
+    const summarySpy = spyOn(cardkit, 'patchSummaryThrottled').mockImplementation(
+      (cardId: string, content: string) => { previews.push({ cardId, content }) },
+    )
+    try {
+      // write_stdin 的 session_id 在 summarizeToolInput 内部不截断 → raw 超 80 字,
+      // 由 toolSummaryToPreview 自身的 80 字防御截断兜住(照上游实现)。
+      const raw = `发送输入 ${'x'.repeat(100)}`
+      sessionTools.addTool(session, proc as any, 'tool-preview-2', 'write_stdin', {
+        session_id: 'x'.repeat(100), chars: 'abc',
+      })
+      expect(previews).toEqual([{ cardId: turn.cardId, content: `🔧 Bash: ${raw.slice(0, 80)}…` }])
+    } finally {
+      summarySpy.mockRestore()
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('非主 turn 卡路径不触发工具预览(无 currentTurn 直接丢弃;AskUserQuestion 保持专属 ❓ 预览)', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'sess-tool-preview-3')
+    session.proc = proc
+    const previews: string[] = []
+    const summarySpy = spyOn(cardkit, 'patchSummaryThrottled').mockImplementation(
+      (_cardId: string, content: string) => { previews.push(content) },
+    )
+    try {
+      // 无 currentTurn(主 turn 卡不存在,如轮外/bg 场景):addTool 直接 return,
+      // 不产生任何聊天列表预览。
+      sessionTools.addTool(session, proc as any, 'tool-preview-3', 'Bash', { command: 'echo bg' })
+      expect(previews).toEqual([])
+
+      // AskUserQuestion 分支有专属 ❓ 预览(cancelSummary + 直接 patchSettings +
+      // 加急推送),不得被 🔧 工具预览覆盖 —— 上游 4 个插入点同样不含该分支。
+      const turn = turnState('card_ask_preview')
+      session.currentTurn = turn
+      cardkit.recordCardCreated(turn.cardId, 1)
+      sessionTools.addTool(session, proc as any, 'ask-preview-1', 'AskUserQuestion', {
+        questions: [{ question: 'Pick?', options: ['A', 'B'] }],
+      })
+      expect(previews).toEqual([])
+      await waitFor(() => urgentPushes.length >= 1)
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    } finally {
+      summarySpy.mockRestore()
     }
   })
 })
