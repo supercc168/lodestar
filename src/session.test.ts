@@ -6858,6 +6858,86 @@ describe('Session preserved recovery guards for rollback and history selection',
   })
 })
 
+describe('Session stop/restart kill-unconfirmed alignment (upstream ec149d7 主题 I)', () => {
+  test('stop still settles background tasks and reports failure instead of success when kill throws', async () => {
+    const session = new Session('stop-kill-unconfirmed', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'thread-stop-unconfirmed')
+    session.selectedProvider = 'claude'
+    session.proc = proc
+    session.status = 'idle'
+    proc.kill = async () => {
+      proc.killCalls++
+      throw new Error('claude process kill timed out after 8000ms; SDK query may still be running')
+    }
+    let resetCalls = 0
+    const originalReset = session.resetBackgroundTasks.bind(session)
+    session.resetBackgroundTasks = async (lease?: unknown) => {
+      resetCalls++
+      return originalReset(lease)
+    }
+
+    await session.stop('已终止')
+
+    expect(proc.killCalls).toBe(1)
+    // kill 抛错不得跳过后续确定性清理(上游 stopUnlocked 的 allSettled 语义)。
+    expect(resetCalls).toBe(1)
+    // 进程在 kill 前已脱管:isRunning()=false → alive marker 不含它(revive 排除)。
+    expect(session.proc).toBeNull()
+    expect(session.isRunning()).toBe(false)
+    expect(session.status).toBe('stopped')
+    // 不伪造成功:❌ 回执替代 🔴 终止回执。
+    expect(sentTexts.some(text => text.includes('停止未确认'))).toBe(true)
+    expect(sentTexts.some(text => text.includes('🔴 已终止'))).toBe(false)
+  })
+
+  test('restart aborts without spawning a replacement when the old process stop is unconfirmed', async () => {
+    const session = new Session('restart-kill-unconfirmed', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-restart-unconfirmed')
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'thread-restart-unconfirmed'
+    session.proc = proc
+    session.status = 'idle'
+    proc.kill = async () => {
+      proc.killCalls++
+      throw new Error('codex process did not exit after SIGKILL')
+    }
+    let spawnCalls = 0
+    session.spawnAgent = () => {
+      spawnCalls++
+      return new FakeAgentProc('codex', 'thread-replacement')
+    }
+
+    const ok = await session.restart(true, { announce: false })
+
+    expect(ok).toBe(false)
+    // 上游同语义:stop 未确认不 spawn(同 thread resume 双写风险)。
+    expect(spawnCalls).toBe(0)
+    expect(session.proc).toBeNull()
+    expect(session.status).toBe('stopped')
+  })
+
+  test('restart with a confirmed kill still spawns the replacement (regression guard)', async () => {
+    const session = new Session('restart-kill-confirmed', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'thread-restart-confirmed')
+    session.selectedProvider = 'claude'
+    session.proc = proc
+    session.status = 'idle'
+    let spawnCalls = 0
+    const replacement = new FakeAgentProc('claude', 'thread-replacement-ok')
+    session.spawnAgent = () => {
+      spawnCalls++
+      return replacement
+    }
+
+    const ok = await session.restart(false, { announce: false })
+
+    expect(ok).toBe(true)
+    expect(proc.killCalls).toBe(1)
+    expect(spawnCalls).toBe(1)
+    expect(session.proc).toBe(replacement)
+  })
+})
+
 describe('Session token accounting', () => {
   test('uses Claude result usage when resumed totals baseline is unknown', () => {
     const session = new Session('probe', 'chat_id') as any

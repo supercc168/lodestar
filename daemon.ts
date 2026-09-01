@@ -290,7 +290,11 @@ async function disbandTempSession(chatName: string): Promise<{ ok: boolean; erro
     const cid = feishu.chatIdForSession(chatName)
     if (cid) {
       const s = sessions.get(cid)
-      if (s?.isRunning()) await s.stop('bye 解散', { announce: false })
+      // stop() 的清理义务(agy 打断/队列丢弃/后台任务作废)不依赖 isRunning():
+      // kill 超时脱管的进程 this.proc 已为 null → isRunning()=false,agy 任务
+      // 也可能在 agent 进程停后仍在跑。isRunning() 是 revive 语义,不是清理
+      // guard(上游 ec149d7 同 hunk)。
+      if (s) await s.stop('bye 解散', { announce: false })
       s?.dispose()
       sessions.delete(cid)
     }

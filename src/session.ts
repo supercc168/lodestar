@@ -2209,12 +2209,27 @@ export class Session {
     this.usageTotalsSeedUnknown = false
     this.status = 'stopped'
     this.opts.onLifecycleChange?.()
-    await proc.kill()
+    // ec149d7 主题 I 行为对齐:kill 超时/失败(01-09 起如实抛出)不得跳过后续
+    // 确定性清理(resetBackgroundTasks / 回执)。进程已在 kill 前脱管
+    // (this.proc=null → 事件被 stale guard 拦截、alive marker 不含它),这里
+    // 捕获错误、完成清理,用 ❌ 回执替代 ✅ —— 不伪造成功。不向调用方抛:
+    // 本地 stop() 契约为 resolve(bk/bye/runCommand 等调用方无 rejection 分支),
+    // 上游同 hunk 的 throw 依赖其调用方在同一提交内的配套改造,机制不搬。
+    let killError: unknown = null
+    try { await proc.kill() }
+    catch (e) { killError = e }
     if (!this.ownsLifecycle(lease)) return
     // 后台任务随轮作废:翻 killed 终态 + 活卡沉降历史墓碑,否则 SDK 一死 entry
     // 永远卡 running,refresh tick 还在伪造运行时长。
     await this.resetBackgroundTasks(lease)
     if (!this.ownsLifecycle(lease)) return
+    if (killError) {
+      const detail = messageOf(killError)
+      log(`session "${this.sessionName}": stop kill unconfirmed: ${detail}`)
+      report?.(`❌ 停止未确认: ${detail}`)
+      if (announce) await feishu.sendText(this.chatId, `❌ ${this.backendLabel(proc.provider)} 停止未确认: ${detail}(进程已脱管,不参与恢复)`)
+      return
+    }
     report?.(`✅ ${reason}`)
     if (announce) await feishu.sendText(this.chatId, `🔴 ${reason} (session: ${this.sessionName})`)
   }
@@ -2298,11 +2313,18 @@ export class Session {
     this.bgResumePending = false
     this.sawResultWhileOpening = false
     this.discardOrphanAssistant()
+    // ec149d7 主题 I 行为对齐:kill 如实抛出(01-09)不得跳过下方轮作废清理;
+    // 错误捕获后在清理收敛处统一判定 —— stop 未确认时不 spawn 新进程(上游
+    // 同语义:未确认死透的旧进程上叠 resume 重启,存在同 thread 双写风险)。
+    let killError: unknown = null
+    let killedProvider: AgentProvider | null = null
     if (this.proc) {
       report?.(`🛑 停止当前 ${this.backendLabel(this.proc.provider)}`)
       const proc = this.proc
+      killedProvider = proc.provider
       this.proc = null
-      await proc.kill()
+      try { await proc.kill() }
+      catch (e) { killError = e }
       if (!this.ownsLifecycle(lease)) return false
     }
     this.stopFooterStatus(this.currentTurn)
@@ -2331,6 +2353,20 @@ export class Session {
     // 到新卡)。翻 killed 终态 + 活卡沉降,在 spawn 新 proc 之前清干净。
     await this.resetBackgroundTasks(lease)
     if (!this.ownsLifecycle(lease)) return false
+    if (killError) {
+      const finalStatus = `❌ 旧 ${this.backendLabel(killedProvider ?? undefined)} 进程停止未确认: ${messageOf(killError)}`
+      log(`session "${this.sessionName}": restart aborted, kill unconfirmed: ${messageOf(killError)}`)
+      if (recovery) this.markPreservedWatchdogRecoveryFailed(recovery, lease)
+      this.status = 'stopped'
+      this.opts.onLifecycleChange?.()
+      report?.(finalStatus)
+      if (announceText) {
+        await feishu.sendText(this.chatId, finalStatus)
+        if (!this.ownsLifecycle(lease)) return false
+      }
+      await closeInternalStatusCard(finalStatus)
+      return false
+    }
     if (resume && prevSessionId) {
       if (recovery && !this.ownsPreservedWatchdogRecovery(recovery, lease)) return false
       this.status = 'starting'
