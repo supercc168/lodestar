@@ -1845,3 +1845,55 @@ describe('Claude sendUserText dispatch contract', () => {
     expect(dispatch.error.message).toBe('input stream closed')
   })
 })
+
+describe('Claude assistant 消息子 agent 隔离(上游 7c14677-B)', () => {
+  // 子 agent 的 assistant 消息(parent_tool_use_id 非空)属于另一份 transcript:
+  // 它的 uuid 不能污染 rs/fk 锚点(temp session 分叉/回滚以 lastAssistantUuid
+  // 为 checkpoint,D-02 保护线),正文事件必须像工具事件一样保留归属。
+  function assistantMessage(uuid: string, text: string, parentToolUseId?: string): any {
+    return {
+      type: 'assistant',
+      uuid,
+      session_id: 'claude-session-1',
+      ...(parentToolUseId ? { parent_tool_use_id: parentToolUseId } : {}),
+      message: { content: [{ type: 'text', text }] },
+    }
+  }
+
+  test('子 agent(parent_tool_use_id 非空)assistant 消息不更新 lastAssistantUuid', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    proc.handleMessage(assistantMessage('main-uuid-1', '主线程正文'))
+    proc.handleMessage(assistantMessage('sub-uuid-1', '子 agent 正文', 'task_tool_1'))
+
+    // 子 agent uuid 不覆盖主线程锚点
+    expect(proc.lastAssistantUuid).toBe('main-uuid-1')
+  })
+
+  test('主线程 assistant 消息正常更新 lastAssistantUuid', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    proc.handleMessage(assistantMessage('main-uuid-1', '第一段'))
+    expect(proc.lastAssistantUuid).toBe('main-uuid-1')
+    proc.handleMessage(assistantMessage('main-uuid-2', '第二段'))
+    expect(proc.lastAssistantUuid).toBe('main-uuid-2')
+  })
+
+  test('assistant_text/assistant_block_stop emit 携带 parentToolUseId(主线程 null,子 agent 归属 id)', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const texts: any[] = []
+    const stops: any[] = []
+    proc.on('assistant_text', (e: any) => texts.push(e))
+    proc.on('assistant_block_stop', (e: any) => stops.push(e))
+
+    proc.handleMessage(assistantMessage('main-uuid-1', '主线程正文'))
+    proc.handleMessage(assistantMessage('sub-uuid-1', '子 agent 正文', 'task_tool_1'))
+
+    expect(texts).toEqual([
+      { uuid: 'main-uuid-1', text: '主线程正文', parentToolUseId: null },
+      { uuid: 'sub-uuid-1', text: '子 agent 正文', parentToolUseId: 'task_tool_1' },
+    ])
+    expect(stops).toEqual([
+      { index: 'main-uuid-1', parentToolUseId: null },
+      { index: 'sub-uuid-1', parentToolUseId: 'task_tool_1' },
+    ])
+  })
+})

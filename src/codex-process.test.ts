@@ -1076,3 +1076,27 @@ describe('codex request_user_input 三小件(D3)', () => {
     expect(writes[0].error).toEqual({ code: -32601, message: 'denied by user' })
   })
 })
+
+describe('codex assistant emit 契约带 parentToolUseId(上游 7c14677-B)', () => {
+  // codex 主线程 assistant 事件按统一契约补 parentToolUseId: null —— 外线程
+  // (子 agent)通知在 handleNotification 入口即被 isForeignThread 拦截,
+  // 到达 emit 点的只有主线程,恒为 null。
+  test('agentMessage delta 与终态 emit 均携带 parentToolUseId: null', () => {
+    const { proc, events } = notificationHarness()
+
+    proc.handleNotification('item/agentMessage/delta', {
+      threadId: 'thread-structured',
+      itemId: 'msg-1',
+      delta: '主线程正文',
+    })
+    proc.handleNotification('item/completed', {
+      threadId: 'thread-structured',
+      item: { id: 'msg-1', type: 'agentMessage' },
+    })
+
+    const text = events.find(([name]) => name === 'assistant_text')
+    const stop = events.find(([name]) => name === 'assistant_block_stop')
+    expect(text?.[1]).toEqual({ uuid: 'msg-1', text: '主线程正文', parentToolUseId: null })
+    expect(stop?.[1]).toEqual({ index: 'msg-1', parentToolUseId: null })
+  })
+})
