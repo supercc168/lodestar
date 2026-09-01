@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test'
-import { mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { appendFileSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
+import { StringDecoder } from 'node:string_decoder'
 import { Writable } from 'node:stream'
 
 import {
@@ -1110,6 +1111,124 @@ describe('codex 多 agent collab→bg 翻译状态机(上游 cf41941)', () => {
     proc.handleNotification('item/agentMessage/delta', { threadId: 'sub-y', itemId: 'am-y', delta: '子 agent 正文' })
     proc.handleNotification('thread/tokenUsage/updated', { threadId: 'sub-y', tokenUsage: { last: { totalTokens: 9 } } })
     expect(events).toEqual([])
+  })
+})
+
+// ── 上游 ec149d7 主题 H:控制面加固 ─────────────────────────────────
+// 30s 控制请求超时 / write 前置可写检查 / rejectPendingRequests /
+// SIGTERM→SIGKILL waitForExit / rollout StringDecoder+remainder。
+function makeCodexLifecycleHarness(stdinOverrides: Record<string, unknown> = {}): any {
+  const proc = Object.create(CodexProcess.prototype) as any
+  proc.alive = true
+  proc.expectedExit = false
+  proc.requestCounter = 0
+  proc.pending = new Map()
+  proc.serverRequests = new Map()
+  proc.stdinErrorListenerAttached = true
+  proc.proc = {
+    stdin: {
+      destroyed: false,
+      writableEnded: false,
+      writable: true,
+      write: () => true,
+      ...stdinOverrides,
+    },
+    kill: () => true,
+  }
+  proc.exitPromise = new Promise<void>(resolve => { proc.resolveExit = resolve })
+  return proc
+}
+
+/** bun 1.3.5 对「await 永不 settle 的 promise + per-test timeout」会忙旋而非判超时
+ *  (本仓实测 88% CPU 挂死)—— 用 race 包住被测 promise,悬挂时测试自身仍快速失败。 */
+async function settlementWithin(promise: Promise<unknown>, timeoutMs = 500): Promise<string> {
+  let timer: ReturnType<typeof setTimeout> | null = null
+  try {
+    return await Promise.race([
+      promise.then(() => 'resolved', (e: Error) => `rejected: ${e.message}`),
+      new Promise<string>(resolve => {
+        timer = setTimeout(() => resolve('hung'), timeoutMs)
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
+describe('codex JSON-RPC 控制面可靠性(上游 ec149d7 主题 H)', () => {
+  test('未答控制请求按超时拒绝并从 pending 移除', async () => {
+    const proc = makeCodexLifecycleHarness()
+
+    const outcome = await settlementWithin(proc.request('thread/start', {}, 5))
+    expect(outcome).toContain('timed out after 5ms')
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('stdin 不可写时同步拒绝,不留悬挂 pending', async () => {
+    const proc = makeCodexLifecycleHarness({ writable: false })
+
+    const outcome = await settlementWithin(proc.request('initialize', {}, 20))
+    expect(outcome).toContain('stdin is not writable')
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('SIGTERM/SIGKILL 都杀不死时 kill 如实拒绝,不静默返回', async () => {
+    const proc = makeCodexLifecycleHarness()
+    const signals: string[] = []
+    proc.proc.kill = (signal: string) => {
+      signals.push(signal)
+      return true
+    }
+
+    await expect(proc.kill(2)).rejects.toThrow('did not exit after SIGTERM and SIGKILL')
+    expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+  })
+})
+
+describe('codex rollout 增量读取(StringDecoder+remainder)', () => {
+  test('只读追加字节,半行 JSON 保留 remainder 到下次拼接', () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-rollout-'))
+    const file = join(root, 'rollout.jsonl')
+    try {
+      const proc = Object.create(CodexProcess.prototype) as any
+      const seen: any[] = []
+      proc.sessionId = 'thread-1'
+      proc.rolloutFilePath = file
+      proc.rolloutReadOffset = 0
+      proc.rolloutLineRemainder = ''
+      proc.rolloutDecoder = new StringDecoder('utf8')
+      proc.emitRolloutImageGeneration = (payload: any) => { seen.push(payload) }
+
+      // 多字节 UTF-8(中文 prompt)故意让切点落在字符中间:分段读不裂字。
+      const line = JSON.stringify({ payload: { type: 'image_generation_end', call_id: 'img-1', revisedPrompt: '生成一只柴犬' } })
+      const bytes = Buffer.from(line, 'utf8')
+      const split = bytes.indexOf(Buffer.from('柴', 'utf8')[0]) + 1 // 柴 的首字节后切开
+      writeFileSync(file, bytes.subarray(0, split))
+      proc.flushRolloutImageGenerations()
+      expect(seen).toHaveLength(0)
+      expect(proc.rolloutReadOffset).toBe(split)
+
+      appendFileSync(file, Buffer.concat([bytes.subarray(split), Buffer.from('\n')]))
+      proc.flushRolloutImageGenerations()
+      expect(seen).toEqual([{ type: 'image_generation_end', call_id: 'img-1', revisedPrompt: '生成一只柴犬' }])
+      expect(proc.rolloutReadOffset).toBe(bytes.length + 1)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('codex subagent completed step 带工具名(mapCompletedItem 并入 started 映射)', () => {
+  test('completed 阶段 subagent_step 的 tool 不再是 undefined', () => {
+    const { proc, events } = notificationHarness()
+    proc.handleNotification('item/completed', {
+      threadId: 'sub-tool',
+      item: { type: 'commandExecution', id: 'cmd-9', command: 'bun test', cwd: '/tmp', aggregatedOutput: '3 passed\n', exitCode: 0 },
+    })
+    expect(events).toHaveLength(1)
+    expect(events[0][1]).toMatchObject({
+      thread_id: 'sub-tool', item_id: 'cmd-9', tool: 'Bash', phase: 'completed', brief: '→ 3 passed',
+    })
   })
 })
 
