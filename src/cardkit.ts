@@ -119,6 +119,31 @@ export function isNetworkError(e: unknown): boolean {
 
 const cards = new Map<string, CardState>()
 
+/** Card ids that were disposed (turn closed / rotated away). Mutation APIs
+ * on a disposed card must NOT silently re-create state via state() and fire
+ * real HTTP writes at a card whose stream is closed — that both pollutes
+ * the wire and resurrects leaked state (上游 ec149d7). Bounded tombstone
+ * set: oldest entries are evicted past the cap, so a long-lived daemon
+ * doesn't accumulate one entry per rotated card forever. */
+const disposedCards = new Set<string>()
+const MAX_DISPOSED_CARD_TOMBSTONES = 5000
+
+function rememberDisposedCard(cardId: string): void {
+  disposedCards.delete(cardId)
+  disposedCards.add(cardId)
+  while (disposedCards.size > MAX_DISPOSED_CARD_TOMBSTONES) {
+    const oldest = disposedCards.values().next().value
+    if (typeof oldest !== 'string') break
+    disposedCards.delete(oldest)
+  }
+}
+
+/** True if this card was disposed. Late async writers (promises landing
+ * after turn close) check this before scheduling writes. */
+export function isDisposed(cardId: string): boolean {
+  return disposedCards.has(cardId)
+}
+
 interface SummaryState {
   latest: string
   lastSent: string
@@ -157,6 +182,9 @@ export function recordCardCreated(
   onFailure?: CardWriteFailureHandler,
   onSuccess?: () => void,
 ): void {
+  // 新生命周期开始:同 id 重建(测试复用固定 card id / 飞书同 id 再开卡)
+  // 时清除 disposed 墓碑,恢复可写。
+  disposedCards.delete(cardId)
   const s = state(cardId)
   s.elementCount = initialElementCount
   s.onFailure = onFailure
@@ -352,6 +380,10 @@ export async function convertMessageToCard(
       if (typeof data?.card_id !== 'string' || !data.card_id) {
         throw new Error(`cardkit POST /cards/id_convert: missing card_id`)
       }
+      // convert 返回的 card_id 开启新生命周期:清掉旧墓碑,让中途失所有权
+      // 的 stale-open 终态写(recordCardCreated 之前)不被上一世的 dispose
+      // 挡住(测试复用固定 id 时同理)。
+      disposedCards.delete(data.card_id)
       return data.card_id
     } catch (e) {
       lastErr = e
@@ -369,6 +401,8 @@ export async function createCardEntity(card: object): Promise<string> {
     type: 'card_json',
     data: JSON.stringify(card),
   })
+  // 同 convertMessageToCard:新卡实体 = 新生命周期,清旧墓碑。
+  if (typeof data?.card_id === 'string') disposedCards.delete(data.card_id)
   return data.card_id
 }
 
@@ -394,6 +428,9 @@ export function addElement(
   opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
   onFailure?: CardWriteFailureHandler,
 ): Promise<void> {
+  // disposed 判断必须先于 state():否则 dispose 后的迟到写会经 state()
+  // 误建全新 bookkeeping(sequence 归零)并对已关流的卡发真实 HTTP。
+  if (disposedCards.has(cardId)) return Promise.resolve()
   const s = state(cardId)
   if (s.writeDead) return Promise.resolve()
   const elementId = (element as { element_id?: string }).element_id
@@ -445,6 +482,7 @@ export function replaceElement(
   element: object,
   onFailure?: CardWriteFailureHandler,
 ): Promise<void> {
+  if (disposedCards.has(cardId)) return Promise.resolve()
   const s = state(cardId)
   // Footer ticks must never escalate to card-level rotate. write-dead /
   // dead-element short-circuits still report to per-call onFailure so
@@ -476,6 +514,7 @@ export function replaceElement(
 
 /** Delete an element by id. */
 export function deleteElement(cardId: string, elementId: string): Promise<void> {
+  if (disposedCards.has(cardId)) return Promise.resolve()
   const s = state(cardId)
   if (s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
@@ -502,7 +541,7 @@ export function deleteElement(cardId: string, elementId: string): Promise<void> 
  * the settings-PATCH endpoint. Whitespace is collapsed and the input
  * is trimmed; empty content is ignored. */
 export function patchSummaryThrottled(cardId: string, content: string): void {
-  if (cards.get(cardId)?.writeDead) return
+  if (disposedCards.has(cardId) || cards.get(cardId)?.writeDead) return
   const trimmed = (content ?? '').replace(/\s+/g, ' ').trim()
   if (!trimmed) return
   let s = summaryStates.get(cardId)
@@ -516,11 +555,18 @@ export function patchSummaryThrottled(cardId: string, content: string): void {
   s.timer = setTimeout(() => {
     const st = summaryStates.get(cardId)
     if (!st) return
+    if (disposedCards.has(cardId)) { summaryStates.delete(cardId); return }
     st.timer = null
     if (st.latest === st.lastSent) return
     const toSend = st.latest
-    st.lastSent = toSend
-    void patchSettings(cardId, { config: { summary: { content: toSend } } })
+    // lastSent 只在 PATCH 确认落地后记录:超时/拒绝时保持原值,让同一
+    // summary 的下一次投递可以重发,而不是被 latest===lastSent 挡死
+    // (上游 ec149d7)。current === st 防 dispose→重开卡窗口里误写新状态。
+    void patchSettingsChecked(cardId, { config: { summary: { content: toSend } } })
+      .then(landed => {
+        const current = summaryStates.get(cardId)
+        if (landed && current === st) current.lastSent = toSend
+      })
   }, SUMMARY_FLUSH_MS)
 }
 
@@ -550,40 +596,66 @@ export function patchSettings(
   settings: object,
   onFailure?: CardWriteFailureHandler,
 ): Promise<void> {
+  return patchSettingsChecked(cardId, settings, onFailure).then(() => {})
+}
+
+/** Checked settings mutation for terminal/static-card transactions. Unlike
+ * the legacy fire-and-forget wrapper, callers can distinguish a landed PATCH
+ * from a timeout/rejection and must not dispose bookkeeping on false
+ * (上游 ec149d7). 本地适配:保留 elevateCardFailure=false —— settings
+ * PATCH(streaming_off / summary)不是容量信号,失败不得进 card-level
+ * onFailure 烧换卡额度(2026-07-25/26 网络抖动教训);per-call onFailure
+ * 契约照旧。300309/200850 过期流走 reopen+重试(上游同步引入)。 */
+export async function patchSettingsChecked(
+  cardId: string,
+  settings: object,
+  onFailure?: CardWriteFailureHandler,
+): Promise<boolean> {
+  if (disposedCards.has(cardId)) return false
   const s = state(cardId)
   if (s.writeDead) {
     onFailure?.()
-    return Promise.resolve()
+    return false
   }
-  s.queue = s.queue.then(async () => {
-    if (s.writeDead) {
-      onFailure?.()
-      return
-    }
-    try {
-      // Settings patches still get network retries; they do not elevate to
-      // card-level rotate (streaming_off / summary are not capacity signals).
-      await withNetworkRetry(cardId, 'patchSettings', async () => {
-        const seq = nextSeq(cardId)
-        await call('PATCH', `/cards/${cardId}/settings`, {
-          settings: JSON.stringify(settings),
-          sequence: seq,
-        })
+  let landed = false
+  let failed = false
+  s.queue = s.queue.then(() => withReopenOnStreamingClosed(
+    cardId,
+    'patchSettings',
+    async () => {
+      if (disposedCards.has(cardId) || s.writeDead) {
+        onFailure?.()
+        return
+      }
+      const seq = nextSeq(cardId)
+      await call('PATCH', `/cards/${cardId}/settings`, {
+        settings: JSON.stringify(settings),
+        sequence: seq,
       })
-    } catch (e) {
-      log(`cardkit patchSettings ${cardId}: ${e}`)
-      onFailure?.(failureCodeFromError(e), failureMetaFromError(e))
-    }
-  })
-  return s.queue
+      landed = true
+    },
+    (code, meta) => {
+      failed = true
+      onFailure?.(code, meta)
+    },
+    { elevateCardFailure: false },
+  ))
+  await s.queue
+  return landed && !failed && !disposedCards.has(cardId) && !s.writeDead
 }
 
-/** Drop in-memory bookkeeping for a finished card. */
+/** Drop in-memory bookkeeping for a finished card. Tombstones the id so
+ * late async writers can't re-create state and write to the closed card. */
 export async function dispose(cardId: string): Promise<void> {
   const s = cards.get(cardId)
-  if (!s) return
+  if (!s) {
+    rememberDisposedCard(cardId)
+    cancelSummary(cardId)
+    return
+  }
   await flush(cardId)
   await s.queue
   cards.delete(cardId)
+  rememberDisposedCard(cardId)
   cancelSummary(cardId)
 }
