@@ -25,7 +25,7 @@ import * as feishu from './src/feishu'
 import { actionCardResponse } from './src/card-action'
 import {
   get as getNotifyCallback,
-  markResolved as markNotifyCallbackResolved,
+  recordCallbackSuccess as recordNotifyCallbackSuccess,
   dispatchCallback,
   isDispatching,
   setDispatching,
@@ -630,6 +630,16 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
   // Idempotency: a finalized card refuses re-fire ("已处理过"); an
   // in-flight Phase-2 refuses concurrent double-click ("处理中"). Both
   // prevent two members / a double-click from firing the push twice.
+  // unknown 冻结:外部回调可能已成功但本地墓碑未确认——禁止自动重试,
+  // 否则重复副作用(上游 ec149d7)。
+  if (reg.unknownAt) {
+    return {
+      toast: {
+        type: 'error',
+        content: `外部回调可能已成功,但本地确认状态未知,已禁止自动重试${reg.unknownReason ? `: ${reg.unknownReason.slice(0, 80)}` : ''}`,
+      },
+    }
+  }
   if (reg.resolvedAt) {
     return { toast: { type: 'info', content: '已处理过' } }
   }
@@ -645,7 +655,12 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
   // Pull / display-only mode: no push to wait for — freeze on the
   // verdict now (single phase).
   if (!reg.callbackUrl) {
-    markNotifyCallbackResolved(reg.notifyId, button.id, userId)
+    // recordCallbackSuccess 永不抛:持久化失败转 unknown 冻结(内存 guard
+    // 保留),3s 内联回包窗口不被本地盘故障打断。
+    const recorded = recordNotifyCallbackSuccess(reg.notifyId, button.id, userId)
+    if (recorded.state === 'unknown') {
+      log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… verdict tombstone UNKNOWN (pull/display): ${recorded.detail}`)
+    }
     log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… resolved button="${buttonId}" by=${userId.slice(0, 8)}… (no callback, pull/display)`)
     return actionCardResponse(
       buildNotifyCardFromReg(reg, { status: 'done', buttonId: button.id, text: button.text, operatorOpenId: userId }),
@@ -694,7 +709,14 @@ async function pushNotifyCallbackPhase2(
     log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-2 (final) updateCard failed: ${e instanceof Error ? e.message : e}`)
   }
   if (result.ok) {
-    markNotifyCallbackResolved(reg.notifyId, button.id, userId)
+    // The external side effect has already happened. A local persistence
+    // failure is therefore UNKNOWN, never retryable. recordCallbackSuccess
+    // attempts to persist that unknown tombstone and retains an in-memory
+    // guard even when the store itself remains unavailable.
+    const recorded = recordNotifyCallbackSuccess(reg.notifyId, button.id, userId)
+    if (recorded.state === 'unknown') {
+      log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… callback succeeded but tombstone is UNKNOWN: ${recorded.detail}`)
+    }
   }
   clearDispatching(reg.notifyId)
   log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… button="${button.id}" ${result.ok ? 'delivered' : `failed: ${result.detail}`} by=${userId.slice(0, 8)}…`)
