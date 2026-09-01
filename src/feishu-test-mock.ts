@@ -27,12 +27,21 @@ export const urgentPushes: Array<[string, string[]]> = []
 export const listSectionTasksCalls: Array<[string, boolean | undefined]> = []
 export const listTasklistSectionsCalls: string[] = []
 export const listTasklistTasksCalls: Array<[string, boolean | undefined]> = []
+/** tasklist 生命周期调用捕获(01-06 / 上游 ec149d7:删除墓碑、幂等远端删除、
+ *  section 迁移与评论)。beforeEach 调 resetFeishuMock() 清空。 */
+export const deleteTasklistCalls: string[] = []
+export const movedTasks: Array<[string, string, string]> = []
+export const addedTaskComments: Array<[string, string]> = []
 /** [projects.<name>] 项目 profile 替身,测试往里 set 后 Session 构造时可查到。 */
 export const projectProfiles = new Map<string, { cwd?: string; watchdogMode?: WatchdogMode }>()
 /** chatIdForSession 替身返回值,测试可改。 */
 export const feishuMockState = {
   chatIdForSession: null as string | null,
   sendCard: null as null | ((chatId: string, card: object) => Promise<string | null>),
+  /** 远端删除替身覆盖:抛错模拟删除失败(如 code=1470404 already deleted)。 */
+  deleteTasklistByGuid: null as null | ((guid: string) => Promise<void>),
+  /** listSectionTasks 覆盖:测试可让扫描挂起(轮转上限用例)或返回定制任务。 */
+  listSectionTasks: null as null | ((guid: string, completed?: boolean) => Promise<unknown[]>),
 }
 
 export function resetFeishuMock(): void {
@@ -42,9 +51,14 @@ export function resetFeishuMock(): void {
   for (const arr of [listSectionTasksCalls, listTasklistSectionsCalls, listTasklistTasksCalls]) {
     arr.length = 0
   }
+  for (const arr of [deleteTasklistCalls, movedTasks, addedTaskComments]) {
+    arr.length = 0
+  }
   projectProfiles.clear()
   feishuMockState.chatIdForSession = null
   feishuMockState.sendCard = null
+  feishuMockState.deleteTasklistByGuid = null
+  feishuMockState.listSectionTasks = null
 }
 
 mock.module('./feishu', () => ({
@@ -78,6 +92,7 @@ mock.module('./feishu', () => ({
   },
   listSectionTasks: async (guid: string, completed?: boolean) => {
     listSectionTasksCalls.push([guid, completed])
+    if (feishuMockState.listSectionTasks) return await feishuMockState.listSectionTasks(guid, completed)
     return []
   },
   listTasklistSections: async (guid: string) => {
@@ -98,6 +113,31 @@ mock.module('./feishu', () => ({
     updatedCards.push([messageId, card])
   },
   chatIdForSession: (_sessionName: string) => feishuMockState.chatIdForSession,
+  // tasklist 生命周期(01-06 / ec149d7:enable/delete/reconcile 全流程可在测试内走真实 tasklist.ts)
+  resolveProjectDir: (projectName: string) => `/tmp/lodestar-projects/${projectName}`,
+  fetchChatOwnerOpenId: async (_chatId: string) => 'ou_owner',
+  createTasklistWithOwner: async (name: string, _ownerOpenId: string) => ({
+    guid: `tl_${name}`, name, url: '', createdAt: '2026-09-01T00:00:00Z',
+  }),
+  deleteTasklistByGuid: async (guid: string) => {
+    deleteTasklistCalls.push(guid)
+    if (feishuMockState.deleteTasklistByGuid) return await feishuMockState.deleteTasklistByGuid(guid)
+  },
+  discoverTasklistDefaultSectionGuid: async (tasklistGuid: string) => `sec_design_${tasklistGuid}`,
+  getTasklistSection: async (sectionGuid: string) => ({ guid: sectionGuid, name: '设计中', isDefault: true }),
+  patchTasklistSectionName: async (sectionGuid: string, name: string) => ({ guid: sectionGuid, name, isDefault: true }),
+  createTasklistSection: async (opts: { tasklistGuid: string; name: string; insertAfter?: string }) =>
+    `sec_${opts.name}_${opts.tasklistGuid}`,
+  deleteTasklistSection: async (_sectionGuid: string) => {},
+  moveTaskToSection: async (taskGuid: string, tasklistGuid: string, sectionGuid: string) => {
+    movedTasks.push([taskGuid, tasklistGuid, sectionGuid])
+  },
+  getTask: async (taskGuid: string) => ({ guid: taskGuid, summary: `task ${taskGuid}` }),
+  listTaskComments: async (_taskGuid: string) => [],
+  addTaskComment: async (taskGuid: string, content: string) => {
+    addedTaskComments.push([taskGuid, content])
+    return `comment_${addedTaskComments.length}`
+  },
   // 临时群 / fork / back / rs 恢复相关 stub(测试不验证这些路径,no-op / 空返回)
   tempProjectName: () => null,
   tempChatName: (project: string) => `${project}*0000-0000`,
