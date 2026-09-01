@@ -1,6 +1,10 @@
 import { describe, expect, test } from 'bun:test'
 
-import { sanitizeMarkdownForCardKit, downgradeExternalImagesForCardKit } from './elements'
+import {
+  sanitizeMarkdownForCardKit,
+  downgradeExternalImagesForCardKit,
+  neutralizeMarkdownImagesInCard,
+} from './elements'
 
 describe('sanitizeMarkdownForCardKit', () => {
   test('降级 prose 里的外链图片,保留 alt + url', () => {
@@ -14,6 +18,17 @@ describe('sanitizeMarkdownForCardKit', () => {
     const out = sanitizeMarkdownForCardKit('前置 ![](https://x/y.png) 后置')
     expect(out).not.toMatch(/!\[/)
     expect(out).toContain('https://x/y.png')
+  })
+
+  test('不按字符串外形信任图片 key,占位符和伪造 key 都降级', () => {
+    // 防回归锚(上游 4185808):按 `img_...` 外形放行不能证明来自飞书上传,
+    // 线上出现过占位符 `img_key` 被误放行触发 200570。Phase 3 落 TEX 公式图
+    // 时也不得为此重新引入外形白名单(公式图走结构化 tag:'img',不经此路径)。
+    for (const key of ['img_key', 'img_v2_fakeKey123']) {
+      const out = sanitizeMarkdownForCardKit(`评分公式:\n\n![formula](${key})\n\n完`)
+      expect(out).not.toContain('![formula]')
+      expect(out).toContain(key)
+    }
   })
 
   test('代码块内的图片语法原样保留(字面量,不解析也不转义)', () => {
@@ -69,6 +84,15 @@ describe('sanitizeMarkdownForCardKit', () => {
     const out = sanitizeMarkdownForCardKit('![diagram](https://example.com/my architecture.png)')
     expect(out).not.toMatch(/!\[/)
     expect(out).toContain('https://example.com/my architecture.png')
+  })
+
+  test('嵌套 alt/url 也不残留可解析的图片 opener', () => {
+    for (const src of [
+      '![](foo![x](img_key))',
+      '![a [b]](img_key)',
+    ]) {
+      expect(sanitizeMarkdownForCardKit(src)).not.toContain('![')
+    }
   })
 })
 
@@ -128,5 +152,74 @@ describe('downgradeExternalImagesForCardKit', () => {
   test('代码块内的图片语法与 HTML 标签原样保留(字面)', () => {
     const src = "```\n![](https://x/y.png)\n<font color='red'>x</font>\n```"
     expect(downgradeExternalImagesForCardKit(src)).toBe(src)
+  })
+})
+
+describe('neutralizeMarkdownImagesInCard(卡片 JSON 最终边界,上游 4185808)', () => {
+  test('顶层 markdown 元素中的 ![alt](key) 被中和,输入卡片零变异(深拷贝)', () => {
+    const input = {
+      body: {
+        elements: [
+          { tag: 'markdown', content: '结果 ![bad](img_key) 完' },
+          { tag: 'markdown', content: '![](https://evil.example/x.png)' },
+        ],
+      },
+    }
+    const card = neutralizeMarkdownImagesInCard(input) as any
+    for (const el of card.body.elements) expect(el.content).not.toContain('![')
+    expect(card.body.elements[0].content).toContain('img_key')
+    expect(card.body.elements[1].content).toContain('https://evil.example/x.png')
+    // 无副作用:调用方持有的原卡(session 会复用/重投)不被就地改写
+    expect(input.body.elements[0].content).toBe('结果 ![bad](img_key) 完')
+  })
+
+  test('递归覆盖嵌套容器(column_set/collapsible_panel)里的 markdown sink,保留结构化图片和 HTML', () => {
+    const card = neutralizeMarkdownImagesInCard({
+      body: {
+        elements: [
+          {
+            tag: 'collapsible_panel',
+            elements: [{ tag: 'markdown', content: "<font color='red'>x</font> ![bad](img_key)" }],
+          },
+          {
+            tag: 'column_set',
+            columns: [
+              { tag: 'column', elements: [{ tag: 'markdown', content: '嵌 ![n](img_v2_fake)' }] },
+            ],
+          },
+          { tag: 'img', img_key: 'img_v2_uploaded' },
+        ],
+      },
+    }) as any
+
+    const markdown = card.body.elements[0].elements[0].content
+    expect(markdown).toContain("<font color='red'>x</font>")
+    expect(markdown).not.toContain('![')
+    expect(markdown).toContain('img_key')
+    const columnMd = card.body.elements[1].columns[0].elements[0].content
+    expect(columnMd).not.toContain('![')
+    expect(columnMd).toContain('img_v2_fake')
+    expect(card.body.elements[2]).toEqual({ tag: 'img', img_key: 'img_v2_uploaded' })
+  })
+
+  test('无图片语法的卡片 JSON 深度相等(无副作用),各类型节点透传', () => {
+    const card = {
+      config: { wide_screen_mode: true, update_multi: true },
+      header: { title: { tag: 'plain_text', content: '标题' }, template: 'blue' },
+      body: {
+        elements: [
+          { tag: 'markdown', content: '**粗体** [文字](https://x) `code` 与 <font>色</font>' },
+          { tag: 'div', text: { tag: 'plain_text', content: '纯文本 ' } },
+          {
+            tag: 'action',
+            actions: [
+              { tag: 'button', text: { tag: 'plain_text', content: '选' }, value: { kind: 'ask', n: 1, ok: true, nil: null } },
+            ],
+          },
+        ],
+      },
+    }
+    const out = neutralizeMarkdownImagesInCard(card)
+    expect(out).toEqual(card)
   })
 })
