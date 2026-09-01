@@ -469,6 +469,111 @@ describe('Claude permission mode', () => {
   })
 })
 
+// ── 上游 ec149d7 主题 G:确定性退出路径 ─────────────────────────────
+// AbortController + exitPromise + waitForExit + denyPendingPermissions;
+// 硬停语义 = 被丢弃代的排队 turn 不得在 SDK abort 窗口内 drain。
+describe('Claude shutdown reliability', () => {
+  test('kill 丢弃排队 turn(硬停:被丢弃代的输入不 drain)', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    proc.input.push({ type: 'user', message: { role: 'user', content: [] } })
+
+    await proc.kill(20)
+
+    await expect(proc.input.next()).resolves.toEqual({ value: undefined, done: true })
+  })
+
+  test('exit 时悬挂权限请求以合法 deny 立即解决', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const ac = new AbortController()
+    const permission = proc.canUseTool(
+      'AskUserQuestion',
+      { question: 'Continue?', options: ['Yes', 'No'] },
+      { signal: ac.signal, toolUseID: 'dialog-stop-1' },
+    )
+
+    proc.finishExit(0, null)
+
+    await expect(permission).resolves.toEqual({ behavior: 'deny', message: 'claude process exited' })
+    expect(proc.pendingPermissions.size).toBe(0)
+  })
+
+  test('kill 走 SDK close+abort 并等待 read loop 真实退出', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const exits: any[] = []
+    let closeCalls = 0
+    proc.started = true
+    proc.query = {
+      close: () => {
+        closeCalls++
+        queueMicrotask(() => proc.finishExit(null, null))
+      },
+    }
+    proc.on('exit', (event: any) => exits.push(event))
+
+    await expect(proc.kill(20)).resolves.toBeUndefined()
+
+    expect(closeCalls).toBe(1)
+    expect(proc.abortController.signal.aborted).toBe(true)
+    expect(exits).toEqual([{ code: null, signal: null, expected: true }])
+  })
+
+  test('SDK close/abort 后仍不退出时不伪造 SIGKILL 成功', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const exits: any[] = []
+    proc.started = true
+    proc.query = { close: () => {} }
+    proc.on('exit', (event: any) => exits.push(event))
+
+    await expect(proc.kill(5)).rejects.toThrow('did not exit within 5ms')
+
+    expect(proc.abortController.signal.aborted).toBe(true)
+    expect(proc.alive).toBe(true)
+    expect(exits).toEqual([])
+  })
+
+  test('abort 完成关停时仍上报 SDK close 错误', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    proc.started = true
+    proc.query = {
+      close: () => {
+        queueMicrotask(() => proc.finishExit(null, null))
+        throw new Error('close exploded')
+      },
+    }
+
+    await expect(proc.kill(20)).rejects.toThrow('SDK close failed: close exploded')
+    expect(proc.alive).toBe(false)
+  })
+})
+
+describe('Claude background task protocol validation', () => {
+  test('未知终态 status 不被强转 completed', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const settled: any[] = []
+    proc.on('bg_task_settled', (event: any) => settled.push(event))
+
+    proc.handleMessage({
+      type: 'system', subtype: 'task_notification', task_id: 'task-1', status: 'future_status',
+    })
+    expect(settled).toEqual([])
+
+    proc.handleMessage({
+      type: 'system', subtype: 'task_notification', task_id: 'task-1', status: 'completed',
+    })
+    expect(settled).toEqual([{ task_id: 'task-1', status: 'completed', tool_use_id: undefined, summary: undefined, usage: undefined }])
+  })
+
+  test('缺 task_id 的 task_notification 不发 bg_task_settled', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const settled: any[] = []
+    proc.on('bg_task_settled', (event: any) => settled.push(event))
+
+    proc.handleMessage({ type: 'system', subtype: 'task_notification', status: 'completed' })
+
+    expect(settled).toEqual([])
+  })
+})
+
 describe('Claude repeated tool failure correction hook', () => {
   test('injects corrective context on repeat two and resets after success', async () => {
     const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
