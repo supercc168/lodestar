@@ -186,6 +186,11 @@ function turnState(
     goalUpdateCount: 0,
     contextCompactCount: 0,
     contextCompactionPending: new Map(),
+    contextCompactionCompleted: new Set(),
+    contextCompactionCompleting: new Set(),
+    contextCompactionEndOnly: new Map(),
+    lastContextCompactionCompletedAt: 0,
+    lastContextCompactionWasAnonymous: false,
     watchdogSeenCompactionPhases: new Set(),
     toolBatches: new Map(),
     openBatchI: null,
@@ -8950,6 +8955,482 @@ describe('Session 轮转预算收紧与一次性诊断 (上游 4185808 主题 B)
       expect(sendCardAttempts).toBe(attempts)
     } finally {
       feishuMockState.sendCard = null
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+})
+
+async function waitUntil(cond: () => boolean, timeoutMs = 3000): Promise<void> {
+  const start = Date.now()
+  while (!cond()) {
+    if (Date.now() - start > timeoutMs) throw new Error('waitUntil timeout')
+    await new Promise(resolve => setTimeout(resolve, 10))
+  }
+}
+
+describe('Session 压缩面板去重与失败追踪 (上游 4185808 主题 C)', () => {
+  function compactionSession(name: string, cardId: string): { session: any; proc: FakeAgentProc; turn: any } {
+    const session = new Session(name, 'chat_id') as any
+    const proc = new FakeAgentProc('codex', `codex-${name}`)
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    const turn = turnState(cardId)
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, meta) => {
+      session.onCardWriteFailure(turn.cardId, code, meta)
+    })
+    return { session, proc, turn }
+  }
+
+  test('deduplicates repeated completion for the same compaction item', async () => {
+    const { session, proc, turn } = compactionSession('compact-dedupe', 'card_compact_dedupe')
+    const start = {
+      phase: 'start', threadId: 'thread_1', turnId: 'turn_1', itemId: 'compact_1',
+    }
+    const end = {
+      phase: 'end', threadId: 'thread_1', turnId: 'turn_1', itemId: 'compact_1',
+    }
+
+    try {
+      session.handleContextCompacted(proc, start)
+      session.handleContextCompacted(proc, end)
+      session.handleContextCompacted(proc, { ...end, sourceMethod: 'rawResponseItem/completed' })
+      // 同一物理压缩经 turn-only 面 + 匿名遗留面到达,首次 Card Kit 写落地前
+      // 也必须合并。
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_1', turnId: 'turn_1',
+      })
+      session.handleContextCompacted(proc, { phase: 'event' })
+      await cardkit.flush(turn.cardId)
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_1'))
+
+      expect(turn.contextCompactCount).toBe(1)
+      expect(turn.contextCompactionPending.size).toBe(0)
+      const compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id === 'context_compact_0'
+      )
+      const compactReplaces = calls.filter(call =>
+        call.method === 'PUT' &&
+        call.path === `/cards/${turn.cardId}/elements/context_compact_0`
+      )
+      expect(compactAdds).toHaveLength(1)
+      expect(compactReplaces).toHaveLength(1)
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('treats a completion delivered after card close as a logged lifecycle event', () => {
+    const session = new Session('compact-after-close', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-compact-after-close')
+    session.proc = proc
+
+    session.handleContextCompacted(proc, {
+      phase: 'end', threadId: 'thread_closed', turnId: 'turn_closed', itemId: 'compact_closed',
+    })
+
+    expect(sentRawTexts).toHaveLength(0)
+    expect(calls).toHaveLength(0)
+  })
+
+  test('deduplicates generic-turn completion followed by an item completion', async () => {
+    const { session, proc, turn } = compactionSession('compact-alias-order', 'card_compact_alias_order')
+
+    try {
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_alias', turnId: 'turn_alias',
+      })
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_alias', turnId: 'turn_alias', itemId: 'compact_alias',
+      })
+      await cardkit.flush(turn.cardId)
+      await waitUntil(() => turn.contextCompactionCompleted.has('turn_alias'))
+
+      expect(turn.contextCompactCount).toBe(1)
+      let compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )
+      expect(compactAdds).toHaveLength(1)
+      // compact_alias 认领 turn 别名后,同 turn 的另一个显式 item 仍是新压缩。
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_alias', turnId: 'turn_alias', itemId: 'compact_alias_b',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_alias_b'))
+      compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )
+      expect(compactAdds).toHaveLength(2)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('deduplicates an anonymous completion followed by an identified alias', async () => {
+    const { session, proc, turn } = compactionSession('compact-anonymous-alias', 'card_compact_anonymous_alias')
+
+    try {
+      session.handleContextCompacted(proc, { phase: 'event' })
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_anon', turnId: 'turn_anon', itemId: 'compact_anon',
+      })
+      await cardkit.flush(turn.cardId)
+      await waitUntil(() => turn.lastContextCompactionWasAnonymous)
+
+      expect(turn.contextCompactCount).toBe(1)
+      const compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )
+      expect(compactAdds).toHaveLength(1)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('a distinct explicit item in the same backend turn is not swallowed by the turn alias', async () => {
+    const { session, proc, turn } = compactionSession('compact-distinct-items', 'card_compact_distinct_items')
+
+    try {
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_shared', turnId: 'turn_shared', itemId: 'compact_item_a',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_item_a'))
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_shared', turnId: 'turn_shared', itemId: 'compact_item_b',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_item_b'))
+
+      expect(turn.contextCompactCount).toBe(2)
+      const compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )
+      expect(compactAdds).toHaveLength(2)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('an explicit unmatched item completion does not consume another pending item', async () => {
+    const { session, proc, turn } = compactionSession('compact-item-owner', 'card_compact_item_owner')
+
+    try {
+      session.handleContextCompacted(proc, {
+        phase: 'start', threadId: 'thread_items', turnId: 'turn_items', itemId: 'compact_a',
+      })
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_items', turnId: 'turn_items', itemId: 'compact_b',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_b'))
+
+      expect(turn.contextCompactionPending.has('compact_a')).toBe(true)
+      expect(turn.contextCompactCount).toBe(2)
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_items', turnId: 'turn_items', itemId: 'compact_a',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_a'))
+      expect(turn.contextCompactionPending.size).toBe(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('does not attach an old turn compaction completion to a newer turn', async () => {
+    const session = new Session('compact-owner', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-compact-owner')
+    session.proc = proc
+    const oldTurn = turnState('card_compact_owner_old')
+    oldTurn.userOpenId = ''
+    session.currentTurn = oldTurn
+    cardkit.recordCardCreated(oldTurn.cardId, 1)
+    session.handleContextCompacted(proc, {
+      phase: 'start', threadId: 'thread_owner', turnId: 'turn_old', itemId: 'compact_owner',
+    })
+    await cardkit.flush(oldTurn.cardId)
+
+    const newTurn = turnState('card_compact_owner_new')
+    newTurn.userOpenId = ''
+    session.currentTurn = newTurn
+    cardkit.recordCardCreated(newTurn.cardId, 1)
+
+    try {
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_owner', turnId: 'turn_old', itemId: 'compact_owner',
+      })
+      await cardkit.flush(newTurn.cardId)
+
+      expect(newTurn.contextCompactCount).toBe(0)
+      expect(newTurn.contextCompactionPending.size).toBe(0)
+      expect(calls.some(call =>
+        call.path === `/cards/${newTurn.cardId}/elements` &&
+        call.method === 'POST' &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )).toBe(false)
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(oldTurn)
+      session.stopFooterStatus(newTurn)
+      await cardkit.dispose(oldTurn.cardId)
+      await cardkit.dispose(newTurn.cardId)
+    }
+  })
+
+  test('manual compact completion never leaks into a newly opened turn', async () => {
+    const session = new Session('compact-manual-owner', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-compact-manual-owner')
+    session.proc = proc
+    const turn = turnState('card_compact_manual_owner')
+    session.currentTurn = turn
+    session.manualContextCompactionPending = true
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_manual', turnId: 'turn_manual', itemId: 'compact_manual',
+      })
+      session.manualContextCompactionPending = false
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_manual', turnId: 'turn_manual',
+      })
+      session.handleContextCompacted(proc, { phase: 'event' })
+
+      expect(turn.contextCompactCount).toBe(0)
+      expect(turn.contextCompactionPending.size).toBe(0)
+      expect(calls).toHaveLength(0)
+    } finally {
+      session.manualContextCompactionPending = false
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('an anonymous manual completion tombstones an immediate identified alias', async () => {
+    const session = new Session('compact-manual-anonymous', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-compact-manual-anon')
+    session.proc = proc
+    const turn = turnState('card_compact_manual_anonymous')
+    session.currentTurn = turn
+    session.manualContextCompactionPending = true
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted(proc, { phase: 'event' })
+      session.manualContextCompactionPending = false
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_manual_alias', turnId: 'turn_manual_alias', itemId: 'compact_manual_alias',
+      })
+      expect(turn.contextCompactCount).toBe(0)
+      expect(calls).toHaveLength(0)
+    } finally {
+      session.manualContextCompactionPending = false
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('moves an in-progress compaction panel to the replacement card', async () => {
+    const { session, proc, turn } = compactionSession('compact-rotate', 'card_compact_old')
+    const healthyFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      const data = path === '/cards/id_convert' ? { card_id: 'card_compact_new' } : {}
+      return new Response(JSON.stringify({ code: 0, data }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.handleContextCompacted(proc, {
+        phase: 'start', threadId: 'thread_2', turnId: 'turn_2', itemId: 'compact_2',
+      })
+      await cardkit.flush(turn.cardId)
+      session.startMidTurnRotate(turn)
+      await turn.rotating
+
+      expect(turn.cardId).toBe('card_compact_new')
+      expect(turn.contextCompactionPending.get('compact_2')?.cardId).toBe('card_compact_new')
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_2', turnId: 'turn_2', itemId: 'compact_2',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_2'))
+      await cardkit.flush(turn.cardId)
+
+      expect(calls.some(call =>
+        call.method === 'POST' &&
+        call.path === '/cards/card_compact_new/elements' &&
+        JSON.parse(call.body.elements)[0]?.element_id === 'context_compact_0'
+      )).toBe(true)
+      expect(calls.some(call =>
+        call.method === 'PUT' &&
+        call.path === '/cards/card_compact_new/elements/context_compact_0'
+      )).toBe(true)
+    } finally {
+      globalThis.fetch = healthyFetch
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('commits completion receipts only after Card Kit lands and allows retry after MISS', async () => {
+    const { session, proc, turn } = compactionSession('compact-write-retry', 'card_compact_write_retry')
+    let rejectCompletion = true
+    const healthyFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (
+        rejectCompletion &&
+        method === 'PUT' &&
+        path === `/cards/${turn.cardId}/elements/context_compact_0`
+      ) {
+        return new Response(JSON.stringify({ code: 300308, msg: 'temporary replace reject' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+    const start = {
+      phase: 'start', threadId: 'thread_retry', turnId: 'turn_retry', itemId: 'compact_retry',
+    }
+    const end = {
+      phase: 'end', threadId: 'thread_retry', turnId: 'turn_retry', itemId: 'compact_retry',
+    }
+
+    try {
+      session.handleContextCompacted(proc, start)
+      session.handleContextCompacted(proc, end)
+      await waitUntil(() => !turn.contextCompactionCompleting.has('compact_retry'))
+      expect(turn.contextCompactionPending.has('compact_retry')).toBe(true)
+      expect(turn.contextCompactionCompleted.has('compact_retry')).toBe(false)
+
+      rejectCompletion = false
+      session.handleContextCompacted(proc, end)
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_retry'))
+      expect(turn.contextCompactionPending.size).toBe(0)
+      const completionPuts = calls.filter(call =>
+        call.method === 'PUT' &&
+        call.path === `/cards/${turn.cardId}/elements/context_compact_0`
+      )
+      expect(completionPuts).toHaveLength(2)
+    } finally {
+      globalThis.fetch = healthyFetch
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('a capacity failure while completing automatically retries on the replacement card', async () => {
+    const { session, proc, turn } = compactionSession('compact-capacity-rotate', 'card_compact_capacity_old')
+    let rejectOldCompletion = true
+    const healthyFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (path === '/cards/id_convert') {
+        return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_compact_capacity_new' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (
+        rejectOldCompletion &&
+        method === 'PUT' &&
+        path === '/cards/card_compact_capacity_old/elements/context_compact_0'
+      ) {
+        rejectOldCompletion = false
+        return new Response(JSON.stringify({ code: 300305, msg: 'number of card components exceeds 200' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.handleContextCompacted(proc, {
+        phase: 'start', threadId: 'thread_capacity', turnId: 'turn_capacity', itemId: 'compact_capacity',
+      })
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_capacity', turnId: 'turn_capacity', itemId: 'compact_capacity',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_capacity'))
+
+      expect(turn.cardId).toBe('card_compact_capacity_new')
+      expect(turn.rotateCount).toBe(1)
+      expect(turn.failureRotateCount).toBe(1)
+      expect(calls.some(call =>
+        call.method === 'PUT' &&
+        call.path === '/cards/card_compact_capacity_new/elements/context_compact_0'
+      )).toBe(true)
+    } finally {
+      globalThis.fetch = healthyFetch
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('a duplicate start-panel add reconciles with a terminal replace', async () => {
+    const { session, proc, turn } = compactionSession('compact-start-add-retry', 'card_compact_start_add_retry')
+    let compactAddAttempt = 0
+    const healthyFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      const addedElement = method === 'POST' && path === `/cards/${turn.cardId}/elements`
+        ? JSON.parse(calls.at(-1)?.body.elements ?? '[]')[0]
+        : null
+      if (addedElement?.element_id === 'context_compact_0' && ++compactAddAttempt === 1) {
+        return new Response(JSON.stringify({ code: 300315, msg: 'Duplicate ID; code: 300301' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.handleContextCompacted(proc, {
+        phase: 'start', threadId: 'thread_add_retry', turnId: 'turn_add_retry', itemId: 'compact_add_retry',
+      })
+      session.handleContextCompacted(proc, {
+        phase: 'end', threadId: 'thread_add_retry', turnId: 'turn_add_retry', itemId: 'compact_add_retry',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_add_retry'))
+
+      expect(compactAddAttempt).toBe(1)
+      expect(calls.some(call =>
+        call.method === 'PUT' &&
+        call.path.endsWith('/elements/context_compact_0')
+      )).toBe(true)
+      expect(turn.contextCompactionPending.size).toBe(0)
+    } finally {
+      globalThis.fetch = healthyFetch
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)
     }
