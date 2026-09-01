@@ -45,8 +45,13 @@ import { log } from './src/log'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
 import { checkPidGuard, writePidFile } from './src/pid-guard'
 import { isStaleAtReceipt } from './src/inbound-message'
-import { drainDynamicWork } from './src/inflight-work'
-import { PerKeyActor, createPerChatAdmission } from './src/card-action-runtime'
+import { drainDynamicWork, trackWork } from './src/inflight-work'
+import {
+  ActionDeduper,
+  PerKeyActor,
+  createCardActionAdmission,
+  createPerChatAdmission,
+} from './src/card-action-runtime'
 
 // ── PID guard ───────────────────────────────────────────────────────────
 // dev 路径 (`bun daemon.ts` 直接跑) 不经过 cli.ts, 所以这里也守一道。
@@ -184,9 +189,14 @@ process.on('uncaughtException', e => {
 const sessions = new Map<string, Session>()  // key = chatId
 let pendingReviveSessionNames = new Set<string>()
 const chatActor = new PerKeyActor()
+const cardActionDeduper = new ActionDeduper(30_000)
 // 动态在途工作集:卡片动作后台段(准入编排的 track 注入)登记于此,
 // requestShutdown 的 drain 会连同 chatActor.pending() 一起排空。
 const inflightCardActions = new Set<Promise<unknown>>()
+
+function trackCardActionWork<T>(work: Promise<T>): Promise<T> {
+  return trackWork(inflightCardActions, work)
+}
 const messageAdmission = createPerChatAdmission<any>({
   actor: chatActor,
   key: data => String(data?.message?.chat_id ?? ''),
@@ -570,6 +580,176 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
 }
 
 // ── Card action handler ────────────────────────────────────────────────
+// 准入三件套(上游 ec149d7):validateCardActionAdmission 白名单/缺字段校验在
+// cardActionAdmission.accept() 内同步执行,ActionDeduper 30s 幂等去重(双击/
+// 飞书回调重试),PerKeyActor 与消息共用同一 per-chat FIFO。ACK 红线不变:
+// accept() 同步返回 toast ACK(3s 窗口内),业务 handler 在 ACK 之后排队执行,
+// 卡片更新一律走 ACK 后 message.patch(publishCardActionResult)。
+function cardActionLabel(kind: string): string {
+  // 本地 21 kind 全集(01-03 白名单同源);上游的 provider_select/
+  // model_custom_prompt/model_panel_cancel/token_source_enable 本地无此形态不收。
+  const labels: Record<string, string> = {
+    permission: '权限决定', menu: '菜单选择', model_select: '模型选择',
+    model_effort_select: '模型 effort 选择', ask: '问题回答', host_ask: '宿主问题回答',
+    worktree_disband: 'worktree 解散', temp_fork_select: '会话分叉',
+    temp_back_select: '会话回滚', temp_resume_select: '会话恢复',
+    tasklist_enable: '启用任务清单', tasklist_delete_prompt: '删除任务清单',
+    tasklist_delete_confirm: '确认删除任务清单',
+    gsd_refresh: 'GSD 面板刷新', gsd_select: 'GSD 任务选择', gsd_continue: 'GSD 任务继续',
+    gsd_pause: 'GSD 任务暂停', gsd_complete: 'GSD 任务完成', gsd_new_prompt: 'GSD 新指令',
+    agy_forward_codex: 'agy 结果转交', notify_callback: '通知反馈',
+  }
+  return labels[kind] ?? kind
+}
+
+function rawCardFromActionResult(result: any): object | null {
+  return result?.card?.type === 'raw' && result.card.data && typeof result.card.data === 'object'
+    ? result.card.data
+    : null
+}
+
+/** Internal-only metadata consumed by CardActionAdmission. The wrapper is
+ * never returned as the callback ACK, and presentation ignores this field. */
+function withBusinessOutcome(response: any, ok: boolean): any {
+  return { ...response, __businessOk: ok }
+}
+
+function withNotifyContext(reg: NotifyRegistration, response: any): any {
+  return {
+    ...response,
+    __cardActionMessageId: reg.messageId,
+    __cardActionChatId: reg.chatId,
+  }
+}
+
+async function sendActionReceipt(chatId: string, text: string): Promise<void> {
+  if (!chatId) {
+    log(`card-action: cannot send receipt without chat_id: ${text}`)
+    return
+  }
+  const sent = await feishu.sendTextRaw(chatId, text)
+  if (!sent) log(`card-action: visible receipt MISS chat=${chatId.slice(0, 8)}… text=${text.slice(0, 120)}`)
+}
+
+async function publishCardActionResult(data: any, result: any): Promise<void> {
+  const kind = String(data?.action?.value?.kind ?? 'unknown')
+  const label = cardActionLabel(kind)
+  const chatId = String(
+    result?.__cardActionChatId
+    ?? data?.__cardActionChatId
+    ?? data?.context?.open_chat_id
+    ?? '',
+  )
+  // Notify registrations already persist the authoritative message id and may
+  // be clicked through callback payloads that omit open_message_id. Ordinary
+  // session actions are admission-validated and use the context id.
+  const messageId = String(result?.__cardActionMessageId ?? data?.context?.open_message_id ?? '')
+  const card = rawCardFromActionResult(result)
+  if (card && messageId) {
+    try {
+      await feishu.updateCard(messageId, card)
+      return
+    } catch (e) {
+      log(`card-action: ${kind} original-card update failed: ${e instanceof Error ? e.message : e}`)
+      await sendActionReceipt(chatId, `⚠️ ${label}已处理，但原卡更新失败。请重新打开操作面板。`)
+      return
+    }
+  }
+  if (card) {
+    await sendActionReceipt(chatId, `⚠️ ${label}已处理，但回调缺少原卡 message_id，无法更新。`)
+    return
+  }
+  // Push-mode notify callbacks own their two-phase visible card update. Other
+  // notify outcomes (missing/expired registration, unknown button, persisted
+  // unknown state) still need a post-ACK receipt through the generic path.
+  if (kind === 'notify_callback' && result?.__cardActionCompletion) return
+  const toast = result?.toast
+  const content = typeof toast?.content === 'string' && toast.content.trim()
+    ? toast.content.trim()
+    : `${label}已完成`
+  const permissionDenied = kind === 'permission' && String(data?.action?.value?.decision ?? '') === 'deny'
+  const failed = result?.__businessOk === false || (toast?.type === 'error' && !permissionDenied)
+  // 成功已自可见的 kind 不再发 ✅ 回执(权限/回答后 turn 继续、菜单/分叉/回滚/
+  // 恢复有可见会话动静、agy 转交开独立 turn);失败一律有 ❌ 回执。
+  // 适配:上游集合 {permission, ask, token_source_enable, agy_forward_codex},
+  // 本地按同原则重建(token_source_enable 不收 D-02;host_ask/menu/temp_* 本地补)。
+  const selfVisibleSuccess = new Set([
+    'permission', 'ask', 'host_ask', 'menu',
+    'temp_fork_select', 'temp_back_select', 'temp_resume_select',
+    'agy_forward_codex',
+  ])
+  if (!failed && selfVisibleSuccess.has(kind)) return
+  await sendActionReceipt(chatId, `${failed ? '❌' : '✅'} ${label}: ${content}`)
+}
+
+async function publishCardActionFailure(data: any, error: unknown): Promise<void> {
+  const kind = String(data?.action?.value?.kind ?? 'unknown')
+  const detail = error instanceof Error ? error.message : String(error)
+  await sendActionReceipt(
+    String(data?.__cardActionChatId ?? data?.context?.open_chat_id ?? ''),
+    `❌ ${cardActionLabel(kind)}失败: ${detail}`,
+  )
+}
+
+const cardActionAdmission = createCardActionAdmission<any, object>({
+  actor: chatActor,
+  deduper: cardActionDeduper,
+  scope: data => String(data?.context?.open_chat_id ?? '') || '__notify_global__',
+  execute: handleCardAction,
+  present: publishCardActionResult,
+  presentExecutionFailure: async (data, error) => {
+    const kind = String(data?.action?.value?.kind ?? 'unknown')
+    log(`handleCardAction ${kind}: ${error instanceof Error ? error.stack ?? error.message : error}`)
+    await publishCardActionFailure(data, error)
+  },
+  presentPresentationFailure: async (data, error) => {
+    const kind = String(data?.action?.value?.kind ?? 'unknown')
+    log(`card-action presentation ${kind}: ${error instanceof Error ? error.message : error}`)
+    await sendActionReceipt(
+      String(data?.context?.open_chat_id ?? ''),
+      `⚠️ ${cardActionLabel(kind)}已执行，但结果呈现失败。`,
+    )
+  },
+  businessSucceeded: (data, result) => {
+    // 兼容契约(01-08→01-10 显式声明):现阶段 session handler 不返回业务结果,
+    // result 无 __businessOk(甚至整体 undefined)一律视为成功;01-10 把
+    // session-ask/temp/model handler 升级为返回业务结果后,此判定自动收紧。
+    if (typeof result?.__businessOk === 'boolean') return result.__businessOk
+    const permissionDenied = data?.action?.value?.kind === 'permission'
+      && data?.action?.value?.decision === 'deny'
+    return permissionDenied || result?.toast?.type !== 'error'
+  },
+  completion: (_data, result) => {
+    const completion = (result as any)?.__cardActionCompletion
+    return completion && typeof completion.then === 'function' ? completion : null
+  },
+  track: work => { trackCardActionWork(work) },
+  onBackgroundError: error => {
+    log(`card-action background: ${error instanceof Error ? error.stack ?? error.message : error}`)
+  },
+  responses: {
+    accepted: data => ({
+      toast: {
+        type: 'info',
+        content: `⏳ ${cardActionLabel(String(data?.action?.value?.kind ?? 'unknown'))}已接收，后台处理中…`,
+      },
+    }),
+    inflight: () => ({ toast: { type: 'info', content: '相同操作正在处理…' } }),
+    completed: () => ({
+      toast: {
+        type: 'info',
+        content: '该操作近期已执行或尝试；为防重复暂不再次执行，请查看原卡或群消息',
+      },
+    }),
+    closed: () => ({ toast: { type: 'error', content: '服务正在重启，请稍后重试' } }),
+    invalid: (_data, message) => ({ toast: { type: 'error', content: message } }),
+  },
+})
+
+function acceptCardAction(data: any): object {
+  return cardActionAdmission.accept(data)
+}
+
 async function handleCardAction(data: any): Promise<any> {
   const action = data?.action
   const value = action?.value
@@ -717,8 +897,9 @@ async function handleCardAction(data: any): Promise<any> {
 // A group member tapped a button on a /notify card. Two visual phases
 // (push mode), both rendered via message.patch on the original card:
 //
-//   ACK: a toast ("⏳ 已选择:X · 推送中…") returned instantly. Deliberately
-//     NOT an inline card ACK, and NOT the callback-token endpoint:
+//   ACK: a toast returned instantly(准入层 accept() 的 accepted 文案;本
+//     handler 在 ACK 后排队执行,其返回 toast 仅携带 completion 元数据)。
+//     Deliberately NOT an inline card ACK, and NOT the callback-token endpoint:
 //       • Method 1 (inline card ACK) + a follow-up update silently fails
 //         to re-render.
 //       • The callback-token endpoint `/interactive/v1/card/update` is a
@@ -751,95 +932,146 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
   // in-flight Phase-2 refuses concurrent double-click ("处理中"). Both
   // prevent two members / a double-click from firing the push twice.
   // unknown 冻结:外部回调可能已成功但本地墓碑未确认——禁止自动重试,
-  // 否则重复副作用(上游 ec149d7)。
+  // 否则重复副作用(上游 ec149d7)。__businessOk=true 让 dedupe 也落墓碑,
+  // 30s 内连回执都不再刷。
   if (reg.unknownAt) {
-    return {
+    return withNotifyContext(reg, withBusinessOutcome({
       toast: {
         type: 'error',
         content: `外部回调可能已成功,但本地确认状态未知,已禁止自动重试${reg.unknownReason ? `: ${reg.unknownReason.slice(0, 80)}` : ''}`,
       },
-    }
+    }, true))
   }
   if (reg.resolvedAt) {
-    return { toast: { type: 'info', content: '已处理过' } }
+    return withNotifyContext(reg, { toast: { type: 'info', content: '已处理过' } })
   }
   if (isDispatching(notifyId)) {
-    return { toast: { type: 'info', content: '处理中…' } }
+    return withNotifyContext(reg, { toast: { type: 'info', content: '处理中…' } })
   }
   const button = reg.buttons.find((b) => b.id === buttonId)
   if (!button) {
     log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… unknown button_id="${buttonId}"`)
-    return { toast: { type: 'error', content: '未知按钮' } }
+    return withNotifyContext(reg, withBusinessOutcome(
+      { toast: { type: 'error', content: '未知按钮' } },
+      false,
+    ))
   }
 
   // Pull / display-only mode: no push to wait for — freeze on the
   // verdict now (single phase).
   if (!reg.callbackUrl) {
     // recordCallbackSuccess 永不抛:持久化失败转 unknown 冻结(内存 guard
-    // 保留),3s 内联回包窗口不被本地盘故障打断。
+    // 保留),verdict 卡照常回(准入层 ACK 后经 message.patch 落原卡)。
     const recorded = recordNotifyCallbackSuccess(reg.notifyId, button.id, userId)
     if (recorded.state === 'unknown') {
       log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… verdict tombstone UNKNOWN (pull/display): ${recorded.detail}`)
     }
     log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… resolved button="${buttonId}" by=${userId.slice(0, 8)}… (no callback, pull/display)`)
-    return actionCardResponse(
+    return withNotifyContext(reg, actionCardResponse(
       buildNotifyCardFromReg(reg, { status: 'done', buttonId: button.id, text: button.text, operatorOpenId: userId }),
-    )
+    ))
   }
 
-  // Push mode: ACK with a toast immediately, then async drive BOTH card
-  // states via message.patch on the original card (Phase 1 processing →
-  // push → Phase 2 final). The dispatching guard is set synchronously
-  // here so a fast second click is blocked before the async work starts.
+  // Push mode: drive BOTH card states via message.patch on the original card
+  // (Phase 1 processing → push → Phase 2 final). The dispatching guard is set
+  // synchronously so a fast second click is blocked before the async work
+  // starts. __cardActionCompletion 把 phase-2 结果接回 dedupe:push 失败
+  // (retry)立即释放业务 key 允许再点;成功/unknown 落 30s 墓碑。
   setDispatching(reg.notifyId)
-  void pushNotifyCallbackPhase2(reg, button, userId)
-  return { toast: { type: 'info', content: `⏳ 已选择:${button.text} · 推送中…` } }
+  const phase2 = trackCardActionWork(pushNotifyCallbackPhase2(reg, button, userId))
+  void phase2.catch(e => {
+    log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-2 rejected: ${e instanceof Error ? e.message : e}`)
+  })
+  const completion = phase2.then<'complete' | 'retry'>(outcome =>
+    outcome === 'retry' ? 'retry' : 'complete'
+  ).catch(() => 'retry' as const)
+  return withNotifyContext(reg, {
+    toast: { type: 'info', content: `⏳ 已选择:${button.text} · 推送中…` },
+    __cardActionCompletion: completion,
+  })
 }
 
-// Drive the two card states via message.patch, fire-and-forget from
-// {@link handleNotifyCallback} so the ACK toasts fast. Phase 1
-// (processing) must precede the push so the in-flight window shows
-// progress; Phase 2 (delivered/failed) lands once the push resolves.
-// On push failure resolvedAt is NOT set (the dispatching guard is
-// cleared) so the user can tap again to retry.
+// Drive the two card states via message.patch, queued behind the admission
+// ACK in {@link handleNotifyCallback}. Phase 1 (processing) must precede the
+// push so the in-flight window shows progress; Phase 2
+// (delivered/failed/unknown) lands once the push resolves. On push failure
+// resolvedAt is NOT set (the dispatching guard is cleared) so the user can
+// tap again to retry; 返回值供准入层 dedupe 结算(retry 释放业务 key)。
 async function pushNotifyCallbackPhase2(
   reg: NotifyRegistration,
   button: NotifyButton,
   userId: string,
-): Promise<void> {
-  // Phase 1: processing card via message.patch (after the toast ACK).
-  const processingCard = buildNotifyCardFromReg(reg, {
-    status: 'processing', buttonId: button.id, text: button.text, operatorOpenId: userId,
-  })
+): Promise<'complete' | 'retry' | 'unknown'> {
   try {
-    await feishu.updateCard(reg.messageId, processingCard)
-  } catch (e) {
-    log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-1 (processing) updateCard failed: ${e instanceof Error ? e.message : e}`)
-  }
-
-  // Push + Phase 2 final card.
-  const result = await dispatchCallback(reg, button, userId)
-  const resolution = result.ok
-    ? { status: 'delivered' as const, buttonId: button.id, text: button.text, operatorOpenId: userId, reply: result.reply }
-    : { status: 'failed' as const, buttonId: button.id, text: button.text, operatorOpenId: userId, detail: result.detail }
-  const finalCard = buildNotifyCardFromReg(reg, resolution)
-  try {
-    await feishu.updateCard(reg.messageId, finalCard)
-  } catch (e) {
-    log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-2 (final) updateCard failed: ${e instanceof Error ? e.message : e}`)
-  }
-  if (result.ok) {
-    // The external side effect has already happened. A local persistence
-    // failure is therefore UNKNOWN, never retryable. recordCallbackSuccess
-    // attempts to persist that unknown tombstone and retains an in-memory
-    // guard even when the store itself remains unavailable.
-    const recorded = recordNotifyCallbackSuccess(reg.notifyId, button.id, userId)
-    if (recorded.state === 'unknown') {
-      log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… callback succeeded but tombstone is UNKNOWN: ${recorded.detail}`)
+    // Phase 1: processing card via message.patch (after the toast ACK).
+    const processingCard = buildNotifyCardFromReg(reg, {
+      status: 'processing', buttonId: button.id, text: button.text, operatorOpenId: userId,
+    })
+    try {
+      await feishu.updateCard(reg.messageId, processingCard)
+    } catch (e) {
+      log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-1 (processing) updateCard failed: ${e instanceof Error ? e.message : e}`)
     }
+
+    // Push + Phase 2 final card.
+    const result = await dispatchCallback(reg, button, userId)
+    let outcome: 'complete' | 'retry' | 'unknown' = result.ok ? 'complete' : 'retry'
+    let resolution: Parameters<typeof buildNotifyCardFromReg>[1]
+    if (result.ok) {
+      // The external side effect has already happened. A local persistence
+      // failure is therefore UNKNOWN, never retryable. recordCallbackSuccess
+      // attempts to persist that unknown tombstone and retains an in-memory
+      // guard even when the store itself remains unavailable(01-05 契约,永不抛)。
+      const recorded = recordNotifyCallbackSuccess(reg.notifyId, button.id, userId)
+      if (recorded.state === 'complete') {
+        resolution = {
+          status: 'delivered', buttonId: button.id, text: button.text,
+          operatorOpenId: userId, reply: result.reply,
+        }
+      } else {
+        outcome = 'unknown'
+        resolution = {
+          status: 'unknown', buttonId: button.id, text: button.text,
+          operatorOpenId: userId, detail: recorded.detail,
+        }
+        log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… callback succeeded but tombstone is UNKNOWN: ${recorded.detail}`)
+        try {
+          await sendActionReceipt(
+            reg.chatId,
+            `⚠️ 通知反馈的外部回调已成功，但本地确认状态未知；为避免重复副作用，已禁止自动重试。${recorded.detail}`,
+          )
+        } catch (e) {
+          // Presentation failure after an external success must never turn the
+          // business outcome back into retry.
+          log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… UNKNOWN warning receipt failed: ${e instanceof Error ? e.message : e}`)
+        }
+      }
+    } else {
+      resolution = {
+        status: 'failed', buttonId: button.id, text: button.text,
+        operatorOpenId: userId, detail: result.detail,
+      }
+    }
+
+    try {
+      const finalCard = buildNotifyCardFromReg(reg, resolution)
+      await feishu.updateCard(reg.messageId, finalCard)
+    } catch (e) {
+      log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-2 (final) presentation failed: ${e instanceof Error ? e.message : e}`)
+      try {
+        await sendActionReceipt(
+          reg.chatId,
+          `⚠️ 通知反馈${outcome === 'retry' ? '失败且结果卡更新失败，可重新点击' : '已执行，但结果卡更新失败'}: ${e instanceof Error ? e.message : e}`,
+        )
+      } catch (receiptError) {
+        log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… final fallback receipt failed: ${receiptError instanceof Error ? receiptError.message : receiptError}`)
+      }
+    }
+    log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… button="${button.id}" ${outcome === 'complete' ? 'delivered' : outcome === 'unknown' ? 'unknown/non-retryable' : `failed: ${result.detail}`} by=${userId.slice(0, 8)}…`)
+    return outcome
+  } finally {
+    clearDispatching(reg.notifyId)
   }
-  clearDispatching(reg.notifyId)
-  log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… button="${button.id}" ${result.ok ? 'delivered' : `failed: ${result.detail}`} by=${userId.slice(0, 8)}…`)
 }
 
 // ── WebSocket boot ─────────────────────────────────────────────────────
@@ -1053,7 +1285,9 @@ async function boot(): Promise<void> {
   dispatcher.register({
     'card.action.trigger': async (d: any) => {
       markEvent()
-      try { return await handleCardAction(d) } catch (e) { log(`handleCardAction: ${e}`) }
+      // Synchronous acceptance only: reserve the per-chat actor and dedupe
+      // slots before returning, then let the queued handler start next task.
+      return acceptCardAction(d)
     },
   })
 

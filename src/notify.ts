@@ -100,10 +100,12 @@ interface NotifyActionValue {
  *   - `processing` (push mode only): click received, push in flight
  *   - `delivered`: push acked 2xx → final success marker
  *   - `failed`: push rejected/timeout → inline failure reason
+ *   - `unknown`: external callback succeeded but durable local confirmation
+ *                failed — freeze and forbid automatic retry
  *   - `done`: pull / display-only mode — no push, freeze on the verdict
  * `operatorOpenId` is carried in the callback payload for the caller's
  * audit; the card itself shows only the choice + status. */
-export type NotifyResolutionStatus = 'processing' | 'delivered' | 'failed' | 'done'
+export type NotifyResolutionStatus = 'processing' | 'delivered' | 'failed' | 'unknown' | 'done'
 export interface NotifyResolution {
   status: NotifyResolutionStatus
   buttonId: string
@@ -171,6 +173,10 @@ export function buildNotifyCard(opts: {
       marker = `<font color='red'>⚠️ 已选:${r.text} · 回调失败:${r.detail ?? '未知'} · ${hhmm}</font>`
     } else if (r.status === 'delivered') {
       marker = `<font color='green'>✅ 已选择:${r.text} · 反馈已送达 · ${hhmm}</font>`
+    } else if (r.status === 'unknown') {
+      // 外部回调已成功但本地墓碑未确认(ec149d7):冻结并禁止自动重试,
+      // 与 daemon 侧 unknownAt 准入冻结(01-05)同一语义的可见终态。
+      marker = `<font color='red'>⚠️ 已选择:${r.text} · 外部回调已成功，但本地确认状态未知，禁止自动重试 · ${hhmm}</font>`
     } else {
       // 'done' — pull / display-only mode (no push to acknowledge).
       marker = `<font color='green'>✅ 已选择:${r.text} · ${hhmm}</font>`
