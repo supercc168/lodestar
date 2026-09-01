@@ -3,7 +3,7 @@ import { mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from 'nod
 import { homedir, tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { parseClaudeModelProfile } from './config-parse'
+import { parseClaudeModelProfile, stripTomlComment } from './config-parse'
 import { DEFAULT_CODEX_WATCHDOG, parseWatchdogSettings } from './turn-watchdog'
 
 interface FreshConfigResult {
@@ -71,6 +71,35 @@ describe('parseClaudeModelProfile', () => {
     expect(profile.env).toBeUndefined()
     expect(profile.description).toBe('x')
     expect(profile.model).toBe('glm-5.3')
+  })
+})
+
+describe('stripTomlComment(引号感知注释剥离,上游 ec149d7)', () => {
+  test('字符串值内的 # 保留(secret/token/URL 合法含 #)', () => {
+    expect(stripTomlComment('app_secret = "se#cret"')).toBe('app_secret = "se#cret"')
+    expect(stripTomlComment("auth_token = 'ab#cd'")).toBe("auth_token = 'ab#cd'")
+    expect(stripTomlComment('base_url = "https://host/path#frag"')).toBe('base_url = "https://host/path#frag"')
+  })
+
+  test('引号外的行尾真注释被剥离', () => {
+    expect(stripTomlComment('port = 9876 # default').trim()).toBe('port = 9876')
+    expect(stripTomlComment('name = "x" # trailing').trim()).toBe('name = "x"')
+    expect(stripTomlComment('# whole line comment')).toBe('')
+    expect(stripTomlComment('plain = 1')).toBe('plain = 1')
+  })
+
+  test('双引号串内的转义引号不提前闭合字符串', () => {
+    expect(stripTomlComment('v = "a\\"b#c" # cut').trim()).toBe('v = "a\\"b#c"')
+  })
+
+  test('端到端:含 # 的 app_secret 经 loadConfig 完整保留', () => {
+    const result = loadFreshConfig([
+      '[feishu]',
+      'app_secret = "se#cret-with#hash"',
+    ].join('\n'))
+    expect(result.exitCode).toBe(0)
+    const parsed = JSON.parse(result.stdout)
+    expect(parsed.feishu.app_secret).toBe('se#cret-with#hash')
   })
 })
 
