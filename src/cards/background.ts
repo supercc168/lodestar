@@ -104,13 +104,30 @@ export function emptyBgStore(): BgStore {
   return { active: [], pending: [] }
 }
 
-/** 后台卡内部 element_id:每任务一个 panel(bg_<id>),其 body 是 bg_body_<id>。
- * 刷新任务时 replaceElement 整个 panel(header 状态/时长 + body 一起)。
- * fold / foldBody 是「更早已完成任务」的折叠汇总 panel —— 固定 id,活卡里恒为
- * 最后一个元素(新独立 panel insert_before 它),避免 N 条墓碑把卡撑满。 */
+/** 后台卡内部 element_id:每任务一个 panel(bg_<hash>),其 body 是 bgb_<hash>。
+ *  刷新任务时 replaceElement 整个 panel(header 状态/时长 + body 一起)。
+ *  飞书 element_id 规则(300315 报错原文):字母开头、只能字母数字下划线、
+ *  ≤20 字符。Claude 的 task id(bw0ez19dm)天然满足;Codex 的 agentThreadId 是
+ *  36 字符带 '-' 的 UUID —— 直接拼既含非法字符又超长,sanitize 连字符后仍 39+
+ *  字符照样被拒。改为对完整 id 做短哈希(FNV-1a 32bit → base36,≤7 字符),
+ *  前缀 bg_/bgb_ 后总长 10/11,同一 id 稳定映射,不同 id 碰撞率 ~2^-33
+ *  (每卡任务数 ≤ 十级,可忽略)。
+ *  fold / foldBody 是「更早已完成任务」的折叠汇总 panel —— 本地固定 id
+ *  (dc55fa6),天然合规不参与哈希;活卡里恒为最后一个元素(新独立 panel
+ *  insert_before 它),避免 N 条墓碑把卡撑满。
+ *  (导出 shortIdHash 仅为测试锁定算法,上游 cf41941 为私有函数。) */
+export function shortIdHash(id: string): string {
+  let h = 0x811c9dc5
+  for (let i = 0; i < id.length; i++) {
+    h ^= id.charCodeAt(i)
+    h = Math.imul(h, 0x01000193)
+  }
+  return (h >>> 0).toString(36)
+}
+
 export const BG_ELEMENTS = {
-  panel: (id: string) => `bg_${id}`,
-  body: (id: string) => `bg_body_${id}`,
+  panel: (id: string) => `bg_${shortIdHash(id)}`,
+  body: (id: string) => `bgb_${shortIdHash(id)}`,
   fold: 'bg_fold',
   foldBody: 'bg_fold_body',
 } as const
@@ -445,6 +462,74 @@ export function applyBgToolUse(
   }
 }
 
+/** Codex 子 agent 过程步骤(按 thread_id 直接归属,codex 无 parent_tool_use_id):
+ *  started 追加一步,completed 按 item_id 回填结果段。双池同查。 */
+export function applySubagentStep(
+  store: BgStore,
+  threadId: string,
+  itemId: string,
+  tool: string,
+  phase: 'started' | 'completed',
+  brief: string,
+): BgStore {
+  const inActive = store.active.some(t => t.id === threadId)
+  const inPending = store.pending.some(t => t.id === threadId)
+  if (!inActive && !inPending) return store
+  const acc = (tasks: BgTaskEntry[]): BgTaskEntry[] => tasks.map(t => {
+    if (t.id !== threadId) return t
+    if (phase === 'started') {
+      return { ...t, steps: trimSteps([...t.steps, { toolUseId: itemId, tool, brief: `${tool} ${brief}`.trim() }]) }
+    }
+    // completed:同 item 的 step 追加结果段;item 无对应 step(漏 started)则补一步。
+    let matched = false
+    const steps = t.steps.map(s => {
+      if (matched || s.toolUseId !== itemId) return s
+      matched = true
+      return { ...s, brief: brief ? `${s.brief} ${brief}` : s.brief }
+    })
+    if (!matched && brief) steps.push({ toolUseId: itemId, tool, brief: `${tool} ${brief}`.trim() })
+    return { ...t, steps: trimSteps(steps) }
+  })
+  return {
+    active: inActive ? acc(store.active) : store.active,
+    pending: inPending ? acc(store.pending) : store.pending,
+  }
+}
+
+/** 子 agent 过程步骤的单行简报(后台卡 steps 展示用)。codex 翻译层
+ *  emitSubagentStep 以 mapStartedItem/mapCompletedItem 的产出调用;放 cards 层
+ *  与 briefInput/briefResult 同族(纯展示函数,上游 cf41941 位于 codex-process)。 */
+export function subagentStepBrief(name: string, input: any, output?: string): string {
+  const s = (x: unknown): string => typeof x === 'string' ? x : ''
+  switch (name) {
+    case 'Bash': {
+      // completed 的 output 是命令输出,取首行;started 显示命令本身。
+      if (output != null) {
+        const c = output.replace(/\s+/g, ' ').trim()
+        return c ? `→ ${c.slice(0, 60)}` : ''
+      }
+      return `\`${s(input?.command).slice(0, 60)}\``
+    }
+    case 'FileChange': {
+      const changes = Array.isArray(input?.changes) ? input.changes.length : 0
+      if (output != null) {
+        // completed:output 是 changes JSON —— 重复 started 的信息,显示应用状态。
+        return ''
+      }
+      return changes > 0 ? `改 ${changes} 个文件` : '文件变更'
+    }
+    case 'MCP': return `${s(input?.server)}/${s(input?.tool)}`.slice(0, 60)
+    case 'WebSearch': return `"${s(input?.query).slice(0, 50)}"`
+    default: {
+      if (output != null) {
+        const c = output.replace(/\s+/g, ' ').trim()
+        return c ? `→ ${c.slice(0, 60)}` : ''
+      }
+      return JSON.stringify(input ?? {}).replace(/\s+/g, ' ').slice(0, 60)
+    }
+  }
+}
+
 /** tool_result 到达:按 tool_use_id 回填结果摘要到对应 step(同 task 内)。
  *  同 applyBgToolUse,active/pending 双池都处理;无归属 task 返回原 store 引用。 */
 export function applyBgToolResult(
@@ -552,11 +637,15 @@ export function backgroundLiveSummary(tasks: BgTaskEntry[]): string {
   return `🧭 子agent · ${summarizeBackground(tasks)}`
 }
 
-/** 详情 body —— 精简:仅 error(异常一行) + steps(执行过程,每步一行)。
- *  用量/摘要/prompt 等元信息不入 body(header 状态行已够,后面占行越少越好)。 */
+/** 详情 body —— 精简:error(异常一行) + 终态摘要墓碑 + steps(执行过程,
+ *  每步一行)。运行期的用量/prompt 等元信息不入 body(header 状态行已够,后面
+ *  占行越少越好)。 */
 function renderDetailBody(t: BgTaskEntry): string {
   const lines: string[] = []
   if (t.error) lines.push(`⚠ ${t.error}`)
+  // 终态摘要(子 agent 最终答复 / Claude task summary)置顶:墓碑展开第一眼
+  // 是结果,不是过程。有界预览,steps 仍然完整跟在后面。
+  if (isBgTerminal(t) && t.summary) lines.push(`📝 ${t.summary.slice(0, 400)}`, '')
   for (let i = 0; i < t.steps.length; i++) {
     lines.push(`${i + 1}. ${t.steps[i].brief}`)
   }

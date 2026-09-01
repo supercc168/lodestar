@@ -369,7 +369,7 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     const panel = backgroundTaskPanel(t, 45000) as any
     expect(panel.tag).toBe('collapsible_panel')
     expect(panel.expanded).toBe(false)
-    expect(panel.element_id).toBe('bg_t1')
+    expect(panel.element_id).toBe(BG_ELEMENTS.panel('t1'))
     expect(panel.header.title.content).toContain('Explore')
     expect(panel.header.title.content).toContain('搜索认证')
     expect(panel.header.title.content).toContain('运行中')
@@ -681,9 +681,9 @@ describe('折叠汇总 —— 更早已完成任务收进 bg_fold', () => {
     const card = backgroundLiveCard(tasks, 999999) as any
     const els = card.body.elements
     expect(els).toHaveLength(4)
-    expect(els[0].element_id).toBe('bg_r')          // running 在前
-    expect(els[1].element_id).toBe('bg_c')          // 最近终态 c
-    expect(els[2].element_id).toBe('bg_b')          // 次近 b
+    expect(els[0].element_id).toBe(BG_ELEMENTS.panel('r'))          // running 在前
+    expect(els[1].element_id).toBe(BG_ELEMENTS.panel('c'))          // 最近终态 c
+    expect(els[2].element_id).toBe(BG_ELEMENTS.panel('b'))          // 次近 b
     expect(els[3].element_id).toBe('bg_fold')       // fold 恒末位
     expect(els[3].header.title.content).toBe('📦 另有 1 项已完成')   // 只剩 a 被折
   })
@@ -700,8 +700,8 @@ describe('折叠汇总 —— 更早已完成任务收进 bg_fold', () => {
     expect(card.config.summary.content).toBe('🧭 子agent(历史) · 4 已结束')
     const els = card.body.elements
     expect(els).toHaveLength(3)
-    expect(els[0].element_id).toBe('bg_d')
-    expect(els[1].element_id).toBe('bg_c')
+    expect(els[0].element_id).toBe(BG_ELEMENTS.panel('d'))
+    expect(els[1].element_id).toBe(BG_ELEMENTS.panel('c'))
     expect(els[2].element_id).toBe('bg_fold')
     expect(els[2].header.title.content).toBe('📦 另有 2 项已完成')
   })
@@ -710,7 +710,7 @@ describe('折叠汇总 —— 更早已完成任务收进 bg_fold', () => {
     const card = backgroundHistoryCard([mk({ id: 'a', status: 'completed', endTime: 1000 })], 999999) as any
     const els = card.body.elements
     expect(els).toHaveLength(1)
-    expect(els[0].element_id).toBe('bg_a')
+    expect(els[0].element_id).toBe(BG_ELEMENTS.panel('a'))
   })
 
   test('foldSignature:id 列表;成员变才变', () => {
