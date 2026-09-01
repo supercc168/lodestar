@@ -39,12 +39,13 @@ import { startNotifyServer } from './src/notify'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
 import { ensureImagegenSkill } from './src/imagegen-skill'
 import { ensureImagereadSkill } from './src/imageread-skill'
-import { startTasklistWorker } from './src/tasklist-worker'
+import { startTasklistWorker, stopTasklistWorker } from './src/tasklist-worker'
 import { config } from './src/config'
 import { log } from './src/log'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
 import { checkPidGuard, writePidFile } from './src/pid-guard'
 import { isStaleAtReceipt } from './src/inbound-message'
+import { drainDynamicWork } from './src/inflight-work'
 import { PerKeyActor, createPerChatAdmission } from './src/card-action-runtime'
 
 // ── PID guard ───────────────────────────────────────────────────────────
@@ -64,6 +65,11 @@ mkdirSync(dirname(PID_FILE), { recursive: true })
 writePidFile(PID_FILE)
 
 let cleanupDone = false
+const SHUTDOWN_DEADLINE_MS = 15_000
+let shutdownRequested = false
+let shutdownPromise: Promise<void> | null = null
+let shutdownExitCode = 0
+let shutdownAliveSessionNames: string[] | null = null
 const cleanup = () => {
   if (cleanupDone) return
   cleanupDone = true
@@ -71,31 +77,116 @@ const cleanup = () => {
   // revive them — only the ones still running at shutdown, NOT
   // anything the user already `kill`-ed (those are absent from the
   // sessions Map filter below and stay stopped after restart).
+  // 分级关停路径下 Session.stop() 已把进程清掉,此刻现算必为空 ——
+  // 用 requestShutdown 在 stop 之前拍的快照。
   try {
-    const alive = currentAliveSessionNames()
+    const alive = shutdownAliveSessionNames ?? currentAliveSessionNames()
     feishu.writeAliveMarker(alive)
     if (alive.length > 0) log(`alive marker: [${alive.join(', ')}]`)
   } catch (e) { log(`alive marker write failed: ${e}`) }
   try { unlinkSync(PID_FILE) } catch {}
   try { unlinkSync(DEBUG_SOCK_FILE) } catch {}
 }
+
+/** 分级关停(上游 ec149d7):封准入 → 写 alive marker → drain 在途工作 →
+ * 并发 stop 全部 session + stopTasklistWorker → 15s deadline → exit。
+ * 只由 SIGTERM/SIGINT/SIGBREAK 与 boot fatal 触发 —— WS/Promise 层错误
+ * 不走这里(见下方 log-only 处理器的本地红线)。 */
+function requestShutdown(reason: string, exitCode: number): Promise<void> {
+  // 更严重的后继错误必须升级已在跑的优雅关停:复用同一 drain promise 没问题,
+  // 复用原退出码不行 —— 否则 SIGTERM 之后再叠加致命错误会以 0 退出。
+  shutdownExitCode = Math.max(shutdownExitCode, exitCode)
+  if (shutdownPromise) return shutdownPromise
+  shutdownRequested = true
+  // 同步封住准入(消息与卡片动作共用同一 per-key actor),再取动态工作快照;
+  // 已准入的队尾仍可被 drain。
+  chatActor.close()
+  // 在 Session.stop() 清进程并触发 lifecycle 回调之前先快照。这个 marker 的
+  // 语义是"daemon 重启后 revive",不是"优雅关停后仍存活"。
+  shutdownAliveSessionNames = currentAliveSessionNames()
+  try {
+    feishu.writeAliveMarker(shutdownAliveSessionNames)
+  } catch (e) {
+    log(`shutdown alive marker write failed: ${e}`)
+    shutdownExitCode = 1
+  }
+  shutdownPromise = (async () => {
+    log(`${reason}: staged shutdown begin sessions=${sessions.size}`)
+    try {
+      const stopping = (async () => {
+        await drainDynamicWork(() => [
+          ...chatActor.pending(),
+          ...inflightCardActions,
+        ])
+        return await Promise.allSettled([
+          ...[...sessions.values()].map(session =>
+            session.stop(`daemon ${reason}`, { announce: false })
+          ),
+          stopTasklistWorker(),
+        ])
+      })()
+      let deadlineTimer: ReturnType<typeof setTimeout> | null = null
+      const deadline = new Promise<'deadline'>(resolve => {
+        deadlineTimer = setTimeout(() => resolve('deadline'), SHUTDOWN_DEADLINE_MS)
+      })
+      const outcome = await Promise.race([
+        stopping.then(results => {
+          for (const result of results) {
+            if (result.status === 'rejected') {
+              shutdownExitCode = 1
+              log(`shutdown session stop failed: ${result.reason}`)
+            }
+          }
+          return 'stopped' as const
+        }),
+        deadline,
+      ])
+      if (deadlineTimer) clearTimeout(deadlineTimer)
+      if (outcome === 'deadline') {
+        shutdownExitCode = 1
+        log(`${reason}: shutdown deadline ${SHUTDOWN_DEADLINE_MS}ms reached; forcing exit`)
+      } else {
+        log(`${reason}: all sessions stopped`)
+      }
+    } catch (e) {
+      log(`${reason}: staged shutdown failed: ${e}`)
+      shutdownExitCode = 1
+    } finally {
+      cleanup()
+      process.exit(shutdownExitCode)
+    }
+  })()
+  return shutdownPromise
+}
+
 process.on('exit', cleanup)
-process.on('SIGTERM', () => { log('SIGTERM'); cleanup(); process.exit(0) })
-process.on('SIGINT',  () => { log('SIGINT');  cleanup(); process.exit(0) })
+process.on('SIGTERM', () => { void requestShutdown('SIGTERM', 0) })
+process.on('SIGINT',  () => { void requestShutdown('SIGINT', 0) })
 // Windows 没有 POSIX SIGTERM;NSSM/WinSW 这类 Windows service wrapper
 // 在停服务时通常发 SIGBREAK (Ctrl-Break 的内核映射),让进程优雅退出。
 // 仅在 Win32 上注册,避免 Linux/Mac 跑 listener-count 检查时多出一个
 // 无关的信号 handler。
 if (process.platform === 'win32') {
-  process.on('SIGBREAK', () => { log('SIGBREAK'); cleanup(); process.exit(0) })
+  process.on('SIGBREAK', () => { void requestShutdown('SIGBREAK', 0) })
 }
-process.on('unhandledRejection', e => log(`unhandledRejection: ${e}`))
-process.on('uncaughtException',  e => log(`uncaughtException: ${e}`))
+process.on('unhandledRejection', e => {
+  // 本地红线(存活哲学):只打日志,绝不退出进程 —— WS 自愈体系与 LaunchAgent
+  // keepalive 依赖 daemon 常驻。上游 ec149d7 在此挂 requestShutdown(…, 1) 的
+  // hunk 明确不采纳(01-CONTEXT 锁定决策;仅信号走分级关停)。
+  log(`unhandledRejection: ${e instanceof Error ? e.stack ?? e.message : e}`)
+})
+process.on('uncaughtException', e => {
+  // 同上:log-only,不退出进程。
+  log(`uncaughtException: ${e.stack ?? e.message}`)
+})
 
 // ── Session registry ────────────────────────────────────────────────────
 const sessions = new Map<string, Session>()  // key = chatId
 let pendingReviveSessionNames = new Set<string>()
 const chatActor = new PerKeyActor()
+// 动态在途工作集:卡片动作后台段(准入编排的 track 注入)登记于此,
+// requestShutdown 的 drain 会连同 chatActor.pending() 一起排空。
+const inflightCardActions = new Set<Promise<unknown>>()
 const messageAdmission = createPerChatAdmission<any>({
   actor: chatActor,
   key: data => String(data?.message?.chat_id ?? ''),
@@ -106,6 +197,10 @@ const messageAdmission = createPerChatAdmission<any>({
  * in different groups remains concurrent; messages and lifecycle commands in
  * one group cannot overtake an earlier attachment download/card open. */
 function enqueueMessage(data: any, source = 'ws'): boolean {
+  if (shutdownRequested) {
+    log(`${source}: reject inbound message: daemon shutdown in progress`)
+    return false
+  }
   const chatId = String(data?.message?.chat_id ?? '')
   const admitted = messageAdmission.accept(data)
   if (!admitted.accepted) {
@@ -780,6 +875,7 @@ function startDebugSocket(): void {
       unix: DEBUG_SOCK_FILE,
       fetch: async (req: Request) => {
         if (req.method !== 'POST') return new Response('use POST', { status: 405 })
+        if (shutdownRequested) return new Response('daemon shutdown in progress', { status: 503 })
         let body: any = {}
         try { body = await req.json() } catch { return new Response('bad json', { status: 400 }) }
         if (!existsSync(DEBUG_CTX_FILE)) {
@@ -1112,4 +1208,7 @@ async function boot(): Promise<void> {
   await reviveAliveSessions()
 }
 
-boot().catch(e => { log(`boot fatal: ${e}`); process.exit(1) })
+boot().catch(e => {
+  log(`boot fatal: ${e}`)
+  void requestShutdown('boot fatal', 1)
+})
