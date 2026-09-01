@@ -80,10 +80,12 @@ export {
   type ResumeListCardOpts,
   type WriteLogEntry,
   type WriteLogCardOpts,
+  type SelectionResultCardOpts,
   turnListCard,
   resumeListCard,
   writeLogCard,
   writeBodyFromToolInput,
+  selectionResultCard,
 } from './cards/temp'
 export {
   type AgyGitSnapshot,

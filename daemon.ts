@@ -23,6 +23,7 @@ import { dirname } from 'node:path'
 import { Session } from './src/session'
 import * as feishu from './src/feishu'
 import { actionCardResponse } from './src/card-action'
+import { selectionResultCard } from './src/cards'
 import {
   get as getNotifyCallback,
   recordCallbackSuccess as recordNotifyCallbackSuccess,
@@ -618,6 +619,17 @@ function withBusinessOutcome(response: any, ok: boolean): any {
   return { ...response, __businessOk: ok }
 }
 
+/** ModelActionResult 形结果({ok, message, card?})统一转带 __businessOk 的
+ *  ACK 响应(上游 ec149d7;model/host_ask 系 handler 共用)。 */
+function modelActionResponse(result: { ok: boolean; message: string; card?: object }): any {
+  return withBusinessOutcome(
+    result.card
+      ? actionCardResponse(result.card)
+      : { toast: { type: result.ok ? 'success' : 'error', content: result.message } },
+    result.ok,
+  )
+}
+
 function withNotifyContext(reg: NotifyRegistration, response: any): any {
   return {
     ...response,
@@ -773,17 +785,48 @@ async function handleCardAction(data: any): Promise<any> {
   if (!session) return { toast: { type: 'error', content: '会话不存在，请先发消息启动' } }
 
   switch (value.kind) {
-    case 'permission':
-      await session.onPermissionDecision(value.request_id, value.decision, userId)
-      return { toast: { type: value.decision === 'deny' ? 'error' : 'success', content: '已处理' } }
-    case 'menu':
-      await session.onUserMessage(`(menu choice ${value.choice + 1})`)
-      return { toast: { type: 'success', content: 'OK' } }
+    case 'permission': {
+      const decision = String(value.decision ?? '')
+      if (!['allow', 'allow_always', 'deny'].includes(decision)) {
+        return { toast: { type: 'error', content: '无效的权限决定' } }
+      }
+      const result = await session.onPermissionDecision(
+        value.request_id,
+        decision as 'allow' | 'allow_always' | 'deny',
+        userId,
+      )
+      return withBusinessOutcome(
+        {
+          toast: {
+            type: result.ok ? (decision === 'deny' ? 'error' : 'success') : 'error',
+            content: result.message,
+          },
+        },
+        result.ok,
+      )
+    }
+    case 'menu': {
+      const choice = Number(value.choice ?? -1)
+      try {
+        if (!Number.isInteger(choice) || choice < 0) throw new Error('无效的菜单选项')
+        await session.onUserMessage(`(menu choice ${choice + 1})`)
+        return withBusinessOutcome(actionCardResponse(selectionResultCard({
+          title: '📋 菜单选择',
+          message: `已选择第 ${choice + 1} 项`,
+          ok: true,
+        })), true)
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error)
+        return withBusinessOutcome(actionCardResponse(selectionResultCard({
+          title: '📋 菜单选择',
+          message,
+          ok: false,
+        })), false)
+      }
+    }
     case 'model_select': {
       const result = await session.onModelSelect(String(value.model ?? ''), String(value.panel_id ?? ''), userId, value)
-      return result.card
-        ? actionCardResponse(result.card)
-        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+      return modelActionResponse(result)
     }
     case 'model_effort_select': {
       const result = await session.onModelEffortSelect(
@@ -793,9 +836,7 @@ async function handleCardAction(data: any): Promise<any> {
         userId,
         String(value.provider ?? ''),
       )
-      return result.card
-        ? actionCardResponse(result.card)
-        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+      return modelActionResponse(result)
     }
     case 'ask': {
       // Custom-text branch: form submit packages the input under
@@ -805,41 +846,49 @@ async function handleCardAction(data: any): Promise<any> {
       if (value.custom) {
         const fv = action?.form_value ?? action?.input ?? {}
         const customText: string = fv?.custom_answer ?? action?.input_value ?? ''
-        await session.onAskCustomAnswer(value.tool_use_id, value.question_idx ?? 0, customText, userId)
-        return { toast: { type: customText.trim() ? 'success' : 'error', content: customText.trim() ? '已回答' : '请输入答案' } }
+        const answered = await session.onAskCustomAnswer(value.tool_use_id, value.question_idx ?? 0, customText, userId)
+        return withBusinessOutcome(
+          { toast: { type: answered ? 'success' : 'error', content: answered ? '已回答' : customText.trim() ? '问题已失效或答案未被接受' : '请输入答案' } },
+          answered,
+        )
       }
-      await session.onAskAnswer(value.tool_use_id, value.question_idx ?? 0, value.option_idx, userId)
-      return { toast: { type: 'success', content: '已回答' } }
+      const answered = await session.onAskAnswer(value.tool_use_id, value.question_idx ?? 0, value.option_idx, userId)
+      return withBusinessOutcome(
+        { toast: { type: answered ? 'success' : 'error', content: answered ? '已回答' : '问题已失效或选项无效' } },
+        answered,
+      )
     }
     case 'host_ask': {
       if (value.custom) {
         const fv = action?.form_value ?? action?.input ?? {}
         const customText: string = fv?.custom_answer ?? action?.input_value ?? ''
         const result = await session.onHostAskCustomAnswer(value.tool_use_id, value.question_idx ?? 0, customText, userId)
-        return result.card
-          ? actionCardResponse(result.card)
-          : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+        return modelActionResponse(result)
       }
       const result = await session.onHostAskAnswer(value.tool_use_id, value.question_idx ?? 0, value.option_idx, userId)
-      return result.card
-        ? actionCardResponse(result.card)
-        : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+      return modelActionResponse(result)
     }
     case 'worktree_disband': {
       const result = await session.onWorktreeDisband(String(value.slug ?? ''))
       return actionCardResponse(result.card)
     }
     case 'temp_fork_select': {
-      await session.onForkSelect(Number(value.anchorIdx ?? -1), userId)
-      return { toast: { type: 'success', content: '分叉中…' } }
+      const result = await session.onForkSelect(Number(value.anchorIdx ?? -1), userId)
+      return withBusinessOutcome(actionCardResponse(selectionResultCard({
+        title: '🔱 会话分叉', message: result.message, ok: result.ok,
+      })), result.ok)
     }
     case 'temp_back_select': {
-      await session.onBackSelect(Number(value.anchorIdx ?? -1))
-      return { toast: { type: 'success', content: '回滚中…' } }
+      const result = await session.onBackSelect(Number(value.anchorIdx ?? -1))
+      return withBusinessOutcome(actionCardResponse(selectionResultCard({
+        title: '⏪ 会话回滚', message: result.message, ok: result.ok,
+      })), result.ok)
     }
     case 'temp_resume_select': {
-      await session.onResumeSelect(String(value.sessionId ?? ''))
-      return { toast: { type: 'success', content: '恢复中…' } }
+      const result = await session.onResumeSelect(String(value.sessionId ?? ''))
+      return withBusinessOutcome(actionCardResponse(selectionResultCard({
+        title: '🔁 会话恢复', message: result.message, ok: result.ok,
+      })), result.ok)
     }
     case 'tasklist_enable': {
       const result = await session.onTasklistEnable()

@@ -2803,9 +2803,9 @@ export class Session {
   showResumeList(): Promise<void> { return sessionTemp.showResumeList(this) }
   runBtwCommand(userOpenId: string): Promise<void> { return sessionTemp.runBtwCommand(this, userOpenId) }
   runByeCommand(): Promise<void> { return sessionTemp.runByeCommand(this) }
-  onForkSelect(anchorIdx: number, userOpenId = ''): Promise<void> { return sessionTemp.onForkSelect(this, anchorIdx, userOpenId) }
-  onBackSelect(anchorIdx: number): Promise<void> { return sessionTemp.onBackSelect(this, anchorIdx) }
-  onResumeSelect(sessionId: string): Promise<void> { return sessionTemp.onResumeSelect(this, sessionId) }
+  onForkSelect(anchorIdx: number, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onForkSelect(this, anchorIdx, userOpenId) }
+  onBackSelect(anchorIdx: number): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onBackSelect(this, anchorIdx) }
+  onResumeSelect(sessionId: string): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onResumeSelect(this, sessionId) }
 
   /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
    * plus their two-letter aliases where applicable.
@@ -3660,7 +3660,7 @@ export class Session {
     return sessionHostAsk.onHostAskMessageAnswer(this, text, user, msgId)
   }
 
-  onAskAnswer(toolUseId: string, questionIdx: number, optionIdx: number, user: string): Promise<void> {
+  onAskAnswer(toolUseId: string, questionIdx: number, optionIdx: number, user: string): Promise<boolean> {
     return sessionAsk.onAskAnswer(this, toolUseId, questionIdx, optionIdx, user)
   }
 
@@ -3676,7 +3676,7 @@ export class Session {
     return sessionHostAsk.onHostAskCustomAnswer(this, toolUseId, questionIdx, customText, user)
   }
 
-  onPermissionDecision(requestId: string, decision: 'allow' | 'allow_always' | 'deny', user: string): Promise<void> {
+  onPermissionDecision(requestId: string, decision: 'allow' | 'allow_always' | 'deny', user: string): Promise<{ ok: boolean; message: string }> {
     return sessionPermission.onPermissionDecision(this, requestId, decision, user)
   }
 
