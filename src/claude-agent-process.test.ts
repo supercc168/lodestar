@@ -746,6 +746,7 @@ describe('Claude user dialog bridge', () => {
       ['assistant_text', {
         uuid: 'assistant-intro',
         text: '我用视觉分析工具来看这两张图。',
+        parentToolUseId: null,
       }],
       ['tool_use', {
         id: 'call_image_1',

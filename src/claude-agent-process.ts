@@ -1481,7 +1481,13 @@ export class ClaudeAgentProcess extends EventEmitter {
 
   private handleAssistantMessage(raw: any): void {
     const message = raw.message
-    if (typeof raw.uuid === 'string') this.lastAssistantUuid = raw.uuid
+    const parentToolUseId = typeof raw.parent_tool_use_id === 'string' && raw.parent_tool_use_id
+      ? raw.parent_tool_use_id
+      : null
+    // SDK/CLI 在开启子 Agent 文本转发或部分兼容路由上会把子 Agent assistant
+    // 消息送进主 query() stream。只有主线程 UUID 才是本会话可 fork 的
+    // checkpoint；子 Agent UUID 属于另一份 transcript，不能污染 rs/fk 锚点。
+    if (!parentToolUseId && typeof raw.uuid === 'string') this.lastAssistantUuid = raw.uuid
     if (typeof message?.model === 'string' && message.model) this.lastModel = claudeModelKey(message.model)
     const content = Array.isArray(message?.content) ? message.content : []
     for (const block of content) {
@@ -1494,21 +1500,21 @@ export class ClaudeAgentProcess extends EventEmitter {
         }
         if (isServerToolScaffoldText(block.text)) continue
         const uuid = raw.uuid ?? message?.id
-        this.emit('assistant_text', { uuid, text: block.text })
-        this.emit('assistant_block_stop', { index: uuid })
+        this.emit('assistant_text', { uuid, text: block.text, parentToolUseId })
+        this.emit('assistant_block_stop', { index: uuid, parentToolUseId })
       } else if (block.type === 'tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
-        this.emitToolUseOnce(block.id, block.name, block.input ?? {}, raw.parent_tool_use_id ?? null)
+        this.emitToolUseOnce(block.id, block.name, block.input ?? {}, parentToolUseId)
       } else if (block.type === 'server_tool_use' && typeof block.id === 'string' && typeof block.name === 'string') {
         this.emitToolUseOnce(block.id, serverToolName(block.name), {
           tool: block.name,
           input: this.serverToolInput(block.name, block.input ?? {}),
-        }, raw.parent_tool_use_id ?? null)
+        }, parentToolUseId)
       } else if (block.type === 'tool_result' && typeof block.tool_use_id === 'string') {
         this.emitToolResultOnce(
           block.tool_use_id,
           textFromServerToolResultContent(block.content),
           block.is_error === true,
-          raw.parent_tool_use_id ?? null,
+          parentToolUseId,
         )
       }
     }
