@@ -4,7 +4,20 @@ import {
   turnListCard,
   resumeListCard,
   writeLogCard,
+  selectionResultCard,
 } from './temp'
+
+/** 递归数元素树中 action 类元素(button / behaviors 回调):终态卡必须为 0。 */
+function countActionElements(node: unknown): number {
+  if (Array.isArray(node)) return node.reduce((sum: number, item) => sum + countActionElements(item), 0)
+  if (!node || typeof node !== 'object') return 0
+  const record = node as Record<string, unknown>
+  let count = 0
+  if (record.tag === 'button') count++
+  if (Array.isArray(record.behaviors) && record.behaviors.length > 0) count++
+  for (const value of Object.values(record)) count += countActionElements(value)
+  return count
+}
 
 test('writeBodyFromToolInput:Write 取 content', () => {
   expect(writeBodyFromToolInput('Write', { file_path: '/a', content: 'hello' })).toBe('hello')
@@ -75,4 +88,37 @@ test('writeLogCard:超长 body 截断', () => {
   const card = writeLogCard({ projectName: 'p', entries: [{ tool: 'Write', path: '/a', body: long }] }) as any
   const codeEl = card.body.elements.find((e: any) => String(e.content).includes('```'))!
   expect(codeEl.content).toContain('…(截断)')
+})
+
+// ── selectionResultCard 终态卡(上游 ec149d7 主题 I:一次性选择卡的终态替换) ──
+
+test('selectionResultCard:元素树中 action/button 类元素计数为 0(dedupe TTL 过期后不可再触发)', () => {
+  for (const ok of [true, false]) {
+    const card = selectionResultCard({ title: '🔱 会话分叉', message: '已分叉到 x*0000-0000', ok })
+    expect(countActionElements(card)).toBe(0)
+  }
+  // 对照:源选择卡本身是有按钮的(否则计数器空转,断言无意义)。
+  const source = turnListCard({
+    projectName: 'p', mode: 'fork', entries: [{ idx: 0, preview: 'x', ts: 1 }],
+  })
+  expect(countActionElements(source)).toBeGreaterThan(0)
+})
+
+test('selectionResultCard:ok=true 绿头 ✅,ok=false 红头 ❌', () => {
+  const okCard = selectionResultCard({ title: '⏪ 会话回滚', message: '已回滚到锚点 1', ok: true }) as any
+  expect(okCard.schema).toBe('2.0')
+  expect(okCard.header.template).toBe('green')
+  expect(okCard.header.title.content).toBe('⏪ 会话回滚')
+  expect(String(okCard.body.elements[0].content)).toStartWith('✅')
+
+  const failCard = selectionResultCard({ title: '🔁 会话恢复', message: '恢复失败', ok: false }) as any
+  expect(failCard.header.template).toBe('red')
+  expect(String(failCard.body.elements[0].content)).toStartWith('❌')
+})
+
+test('selectionResultCard:message 尖括号/& 转义(防 markdown 注入)', () => {
+  const card = selectionResultCard({ title: 't', message: 'a<b>&c', ok: true }) as any
+  const content = String(card.body.elements[0].content)
+  expect(content).toContain('a&lt;b&gt;&amp;c')
+  expect(content).not.toContain('<b>')
 })

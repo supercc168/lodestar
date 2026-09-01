@@ -8,7 +8,7 @@ import {
 import { NothingToCompactError, type CodexUserTextSettlement, type UserTextDispatch } from './agent-process'
 import {
   addedReactions, boundResumes, clearedTurnAnchors, deletedReactions, feishuMockState, projectProfiles, resetFeishuMock,
-  sentCards, sentRawTexts, sentTexts, updatedCards, urgentPushes,
+  sentCards, sentRawTexts, sentTexts, truncatedTurnAnchors, updatedCards, urgentPushes,
 } from './feishu-test-mock'
 
 const {
@@ -6935,6 +6935,186 @@ describe('Session stop/restart kill-unconfirmed alignment (upstream ec149d7 主�
     expect(proc.killCalls).toBe(1)
     expect(spawnCalls).toBe(1)
     expect(session.proc).toBe(replacement)
+  })
+})
+
+describe('Session handler business receipts (upstream ec149d7 主题 I)', () => {
+  const anchor = (uuid: string) => ({ uuid, sid: 'sid-1', preview: 'p', ts: 1, writes: [] })
+
+  test('onForkSelect returns failure result for an invalid anchor instead of chat-text error', async () => {
+    const session = new Session('receipt-fork-invalid', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.opts.onCreateTempSession = async () => ({ ok: true })
+
+    const result = await session.onForkSelect(5, 'ou_user')
+
+    expect(result).toMatchObject({ ok: false })
+    expect(String(result.message)).toContain('无效的分叉点')
+  })
+
+  test('onForkSelect origin success returns ok result and keeps anchor semantics unchanged', async () => {
+    const session = new Session('receipt-fork-origin', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'sid-current'
+    feishuMockState.turnAnchors = [anchor('u1')]
+    let created: any = null
+    session.opts.onCreateTempSession = async (opts: any) => { created = opts; return { ok: true } }
+
+    const result = await session.onForkSelect(0, 'ou_user')
+
+    expect(result.ok).toBe(true)
+    expect(String(result.message)).toContain('已分叉到')
+    // D-02 保护线:idx==0 = 会话起点,不 resume、不带锚点 —— 分叉锚点计算零变化。
+    expect(created.resumeSessionId).toBeUndefined()
+    expect(created.resumeSessionAt).toBeUndefined()
+    // 进度提示仍走群消息(上游保留 🔱 preliminary text)。
+    expect(sentTexts.some((text: string) => text.includes('分叉到'))).toBe(true)
+  })
+
+  test('onForkSelect create failure returns failure payload for the receipt path', async () => {
+    const session = new Session('receipt-fork-fail', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    feishuMockState.turnAnchors = [anchor('u1')]
+    session.opts.onCreateTempSession = async () => ({ ok: false, error: '建群超时' })
+
+    const result = await session.onForkSelect(0, 'ou_user')
+
+    expect(result.ok).toBe(false)
+    expect(String(result.message)).toContain('分叉失败')
+    expect(String(result.message)).toContain('建群超时')
+  })
+
+  test('onBackSelect success truncates anchors and returns ok result', async () => {
+    const session = new Session('receipt-back-ok', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'sid-current'
+    feishuMockState.turnAnchors = [anchor('u1'), anchor('u2')]
+    session.rollbackTo = async () => true
+
+    const result = await session.onBackSelect(1)
+
+    expect(result.ok).toBe(true)
+    // 成功才截断(reset 语义)—— 回滚行为零变化。
+    expect(truncatedTurnAnchors).toEqual([['receipt-back-ok', 1]])
+  })
+
+  test('onBackSelect rollback failure keeps anchors untouched and returns failure result', async () => {
+    const session = new Session('receipt-back-fail', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'sid-current'
+    feishuMockState.turnAnchors = [anchor('u1'), anchor('u2')]
+    session.rollbackTo = async () => false
+
+    const result = await session.onBackSelect(1)
+
+    expect(result.ok).toBe(false)
+    expect(String(result.message)).toContain('回滚失败')
+    // D-02 判据:失败不动锚点,用户可重试不丢历史。
+    expect(truncatedTurnAnchors).toEqual([])
+  })
+
+  test('onResumeSelect rejects a blank session id with a failure result', async () => {
+    const session = new Session('receipt-resume-blank', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    let rollbackCalls = 0
+    session.rollbackTo = async () => { rollbackCalls++; return true }
+
+    const result = await session.onResumeSelect('   ')
+
+    expect(result.ok).toBe(false)
+    expect(rollbackCalls).toBe(0)
+  })
+
+  test('onResumeSelect success clears anchors and returns ok; failure leaves them alone', async () => {
+    const session = new Session('receipt-resume-ok', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.rollbackTo = async () => true
+
+    const ok = await session.onResumeSelect('claude-history-thread')
+    expect(ok.ok).toBe(true)
+    expect(clearedTurnAnchors).toContain('receipt-resume-ok')
+
+    resetFeishuMock()
+    const failing = new Session('receipt-resume-fail', 'chat_id') as any
+    failing.selectedProvider = 'claude'
+    failing.rollbackTo = async () => false
+    const fail = await failing.onResumeSelect('claude-history-thread')
+    expect(fail.ok).toBe(false)
+    expect(clearedTurnAnchors).toEqual([])
+  })
+
+  test('onAskAnswer returns true for a live answer and false for stray/stale clicks', async () => {
+    const session = new Session('receipt-ask', 'chat_id') as any
+    session.pendingAsks.set('tool-1', {
+      questions: [{ question: '选哪个?', options: [{ label: 'A' }, { label: 'B' }] }],
+      i: 0,
+      answers: {},
+      answered: new Map(),
+      currentIdx: 0,
+    })
+
+    expect(await session.onAskAnswer('tool-404', 0, 0, 'ou_user')).toBe(false)
+    expect(await session.onAskAnswer('tool-1', 3, 0, 'ou_user')).toBe(false)
+    expect(await session.onAskAnswer('tool-1', 0, 0, 'ou_user')).toBe(true)
+    expect(session.pendingAsks.get('tool-1').answers['选哪个?']).toBe('A')
+  })
+
+  test('onAskCustomAnswer propagates advanceAsk outcome instead of unconditional true', async () => {
+    const session = new Session('receipt-ask-custom', 'chat_id') as any
+    session.pendingAsks.set('tool-1', {
+      questions: [{ question: 'q1', options: [] }],
+      i: 0,
+      answers: {},
+      answered: new Map(),
+      currentIdx: 0,
+    })
+
+    expect(await session.onAskCustomAnswer('tool-1', 0, '自定义答案', 'ou_user')).toBe(true)
+    expect(session.pendingAsks.has('tool-1')).toBe(true)
+    expect(await session.onAskCustomAnswer('tool-1', 0, '', 'ou_user')).toBe(false)
+
+    // 判别性用例:前置校验全过但 advanceAsk 记账失败(questions 越界)——
+    // 旧实现无条件 true(❌ 假回执),新实现透传 advanceAsk 结果 false。
+    const broken = new Session('receipt-ask-custom-broken', 'chat_id') as any
+    broken.pendingAsks.set('tool-x', {
+      questions: [],
+      i: 0,
+      answers: {},
+      answered: new Map(),
+      currentIdx: 0,
+    })
+    expect(await broken.onAskCustomAnswer('tool-x', 0, '答案', 'ou_user')).toBe(false)
+  })
+
+  test('onPermissionDecision commits only at protocol response (no proc / send failure keep pending)', async () => {
+    const session = new Session('receipt-permission-commit', 'chat_id') as any
+    session.pendingPermissions.set('req-1', { toolUseId: 'tu-1' })
+
+    // 无进程:决定未送达,pending 不消费(协议响应为提交点)。
+    session.proc = null
+    const noProc = await session.onPermissionDecision('req-1', 'allow', 'ou_user')
+    expect(noProc.ok).toBe(false)
+    expect(session.pendingPermissions.has('req-1')).toBe(true)
+
+    // 发送抛错:同样不消费,可重试。
+    const throwing = new FakeAgentProc('claude', 'thread-perm')
+    throwing.sendPermissionResponse = () => { throw new Error('stdin gone') }
+    session.proc = throwing
+    const sendFail = await session.onPermissionDecision('req-1', 'allow', 'ou_user')
+    expect(sendFail.ok).toBe(false)
+    expect(session.pendingPermissions.has('req-1')).toBe(true)
+
+    // 协议响应落地:才消费 pending 并返回业务成功。
+    const proc = new FakeAgentProc('claude', 'thread-perm-ok')
+    session.proc = proc
+    const done = await session.onPermissionDecision('req-1', 'deny', 'ou_user')
+    expect(done.ok).toBe(true)
+    expect(proc.permissionResponses).toEqual([['req-1', 'deny', undefined]])
+    expect(session.pendingPermissions.has('req-1')).toBe(false)
+
+    // 陈旧请求:失败结果而非静默。
+    const stray = await session.onPermissionDecision('req-404', 'allow', 'ou_user')
+    expect(stray.ok).toBe(false)
   })
 })
 

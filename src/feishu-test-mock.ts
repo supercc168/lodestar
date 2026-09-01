@@ -21,6 +21,9 @@ export const addedReactions: Array<[string, string]> = []
 export const deletedReactions: Array<[string, string]> = []
 export const boundResumes: Array<[string, string, string | undefined]> = []
 export const clearedTurnAnchors: string[] = []
+/** truncateTurnAnchors 调用捕获(01-10 / ec149d7 主题 I:bk 回滚成功才截断,
+ *  失败零截断是 D-02 保护线判据)。beforeEach 调 resetFeishuMock() 清空。 */
+export const truncatedTurnAnchors: Array<[string, number]> = []
 export const urgentPushes: Array<[string, string[]]> = []
 /** task v2 list 调用捕获(测 tasklist-worker 的 scanTaskSections 调用预算:每个 section
  *  只能拉一次,防双重拉取回归——上游 2026-07-30 配额审查)。beforeEach 调 resetFeishuMock() 清空。 */
@@ -42,10 +45,12 @@ export const feishuMockState = {
   deleteTasklistByGuid: null as null | ((guid: string) => Promise<void>),
   /** listSectionTasks 覆盖:测试可让扫描挂起(轮转上限用例)或返回定制任务。 */
   listSectionTasks: null as null | ((guid: string, completed?: boolean) => Promise<unknown[]>),
+  /** getTurnAnchors 替身返回值(01-10:fk/bk 选择处理需要非空锚点走成功路径)。 */
+  turnAnchors: [] as Array<{ uuid: string; sid: string; preview: string; ts: number; writes: unknown[] }>,
 }
 
 export function resetFeishuMock(): void {
-  for (const arr of [sentCards, sentTexts, sentRawTexts, updatedCards, addedReactions, deletedReactions, boundResumes, clearedTurnAnchors, urgentPushes]) {
+  for (const arr of [sentCards, sentTexts, sentRawTexts, updatedCards, addedReactions, deletedReactions, boundResumes, clearedTurnAnchors, truncatedTurnAnchors, urgentPushes]) {
     arr.length = 0
   }
   for (const arr of [listSectionTasksCalls, listTasklistSectionsCalls, listTasklistTasksCalls]) {
@@ -59,6 +64,7 @@ export function resetFeishuMock(): void {
   feishuMockState.sendCard = null
   feishuMockState.deleteTasklistByGuid = null
   feishuMockState.listSectionTasks = null
+  feishuMockState.turnAnchors = []
 }
 
 mock.module('./feishu', () => ({
@@ -142,8 +148,10 @@ mock.module('./feishu', () => ({
   tempProjectName: () => null,
   tempChatName: (project: string) => `${project}*0000-0000`,
   appendTurnAnchor: () => {},
-  getTurnAnchors: () => [],
-  truncateTurnAnchors: () => {},
+  getTurnAnchors: () => feishuMockState.turnAnchors,
+  truncateTurnAnchors: (sessionName: string, fromIdx: number) => {
+    truncatedTurnAnchors.push([sessionName, fromIdx])
+  },
   seedTurnAnchors: () => {},
   clearTurnAnchors: (sessionName: string) => { clearedTurnAnchors.push(sessionName) },
   ensureChatForSession: async (chatName: string) => ({ chatId: `oc_${chatName}`, created: true, joined: true }),
