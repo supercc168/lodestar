@@ -1,5 +1,10 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, setDefaultTimeout, test } from 'bun:test'
 import { execFileSync, spawnSync } from 'node:child_process'
+
+// 每个用例串行 spawn 多个 node 子进程,宿主高负载时 bun 默认 5s per-test 超时
+// 会无断言失败地轮换超时(deferred-items 第 3 项,干净 HEAD 可复现的负载 flaky)。
+// 上调本文件默认超时到 20s —— 真挂死仍会失败,只是不再被负载误伤。
+setDefaultTimeout(20_000)
 import {
   existsSync,
   lstatSync,
