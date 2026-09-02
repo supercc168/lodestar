@@ -8522,6 +8522,25 @@ describe('Session provider switching', () => {
 })
 
 describe('Session turn close vs mid-turn rotation race', () => {
+  const renderedFormula = {
+    blocks: [
+      { type: 'markdown' as const, text: '前文' },
+      {
+        type: 'image' as const,
+        tex: 'x^2',
+        index: 0,
+        element: {
+          tag: 'img', img_key: 'img_rotation_formula',
+          alt: { tag: 'plain_text', content: 'x^2' },
+          scale_type: 'crop_center', size: '48px 24px', preview: false,
+        },
+      },
+      { type: 'markdown' as const, text: '后文' },
+    ],
+    formulaCount: 1,
+    renderedImageCount: 1,
+  }
+
   test('closeTurnCard awaits in-flight rotation so the swap-restarted footer interval is cleared (no orphan timer)', async () => {
     const session = new Session('probe', 'chat_id') as any
     session.proc = new FakeAgentProc('claude', 'claude-session-1')
@@ -8561,6 +8580,166 @@ describe('Session turn close vs mid-turn rotation race', () => {
     } finally {
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('drains a pending old-card raw write before deciding which failed formula segment to migrate', async () => {
+    const session = new Session('rotate-raw-failure', 'chat_id') as any
+    const turn = turnState('card_rotate_raw_old')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    let signalOldPostStarted: () => void = () => {}
+    const oldPostStarted = new Promise<void>(resolve => { signalOldPostStarted = resolve })
+    let releaseOldPost: () => void = () => {}
+    const oldPostGate = new Promise<void>(resolve => { releaseOldPost = resolve })
+    const renderSpy = spyOn(mathRender, 'renderMathInText').mockResolvedValue(renderedFormula as any)
+    let rotation: Promise<void> | null = null
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (path === '/cards/id_convert') {
+        return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_rotate_raw_new' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (method === 'POST' && path === '/cards/card_rotate_raw_old/elements') {
+        signalOldPostStarted()
+        await oldPostGate
+        return new Response(JSON.stringify({ code: 300308, msg: 'old raw rejected' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.appendAssistant('前文 $$x^2$$ 后文')
+      session.finalizeCurrentAssistantSegment()
+      await oldPostStarted
+
+      session.startMidTurnRotate(turn)
+      rotation = turn.rotating
+      expect(rotation).not.toBeNull()
+      releaseOldPost()
+      await rotation
+
+      const newInflight = turn.mathRenderInflight?.get('card_rotate_raw_new')
+      if (newInflight?.size) await Promise.allSettled([...newInflight])
+      await cardkit.flush('card_rotate_raw_new')
+
+      const migratedAdd = calls.find(call =>
+        call.method === 'POST' && call.path === '/cards/card_rotate_raw_new/elements',
+      )
+      expect(migratedAdd).toBeDefined()
+      const migrated = JSON.parse(migratedAdd!.body.elements)[0]
+      expect(migrated.tag).toBe('column_set')
+      expect(JSON.stringify(migrated)).toContain('前文')
+      expect(JSON.stringify(migrated)).toContain('x^2')
+      expect(JSON.stringify(migrated)).toContain('后文')
+      expect(turn.cardId).toBe('card_rotate_raw_new')
+      expect(cardkit.isDeadElement('card_rotate_raw_new', 'assistant_0')).toBe(false)
+    } finally {
+      releaseOldPost()
+      if (rotation) await rotation.catch(() => {})
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+      renderSpy.mockRestore()
+    }
+  })
+
+  test('waits for formula rendering registered by a successful pending raw write before closing the old card', async () => {
+    const session = new Session('rotate-slow-formula', 'chat_id') as any
+    const turn = turnState('card_rotate_formula_old')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    let signalOldPostStarted: () => void = () => {}
+    const oldPostStarted = new Promise<void>(resolve => { signalOldPostStarted = resolve })
+    let releaseOldPost: () => void = () => {}
+    const oldPostGate = new Promise<void>(resolve => { releaseOldPost = resolve })
+    let signalRenderStarted: () => void = () => {}
+    const renderStarted = new Promise<void>(resolve => { signalRenderStarted = resolve })
+    let releaseRender: () => void = () => {}
+    const renderGate = new Promise<typeof renderedFormula>(resolve => {
+      releaseRender = () => resolve(renderedFormula)
+    })
+    const renderSpy = spyOn(mathRender, 'renderMathInText').mockImplementation(async () => {
+      signalRenderStarted()
+      return renderGate as any
+    })
+    let rotation: Promise<void> | null = null
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (path === '/cards/id_convert') {
+        return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_rotate_formula_new' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (method === 'POST' && path === '/cards/card_rotate_formula_old/elements') {
+        signalOldPostStarted()
+        await oldPostGate
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.appendAssistant('前文 $$x^2$$ 后文')
+      session.finalizeCurrentAssistantSegment()
+      await oldPostStarted
+
+      session.startMidTurnRotate(turn)
+      rotation = turn.rotating
+      expect(rotation).not.toBeNull()
+      let rotationDone = false
+      void rotation!.then(() => { rotationDone = true })
+      releaseOldPost()
+      await renderStarted
+      await new Promise(resolve => setTimeout(resolve, 10))
+
+      expect(rotationDone).toBe(false)
+      expect(cardkit.isDisposed('card_rotate_formula_old')).toBe(false)
+
+      releaseRender()
+      await rotation
+
+      const formulaPutIndex = calls.findIndex(call =>
+        call.method === 'PUT' && call.path === '/cards/card_rotate_formula_old/elements/assistant_0',
+      )
+      const closePatchIndex = calls.findIndex(call =>
+        call.method === 'PATCH' && call.path === '/cards/card_rotate_formula_old/settings',
+      )
+      expect(formulaPutIndex).toBeGreaterThanOrEqual(0)
+      expect(closePatchIndex).toBeGreaterThan(formulaPutIndex)
+      // 收尾 replace 跳过已渲染段(oldRendered):旧卡 assistant_0 只有渲染版这
+      // 一次 PUT,原文不覆盖回 $$…$$ 降级。
+      const oldSegPuts = calls.filter(call =>
+        call.method === 'PUT' && call.path === '/cards/card_rotate_formula_old/elements/assistant_0',
+      )
+      expect(oldSegPuts).toHaveLength(1)
+      expect(JSON.stringify(oldSegPuts[0]!.body)).toContain('img_rotation_formula')
+      expect(cardkit.isDisposed('card_rotate_formula_old')).toBe(true)
+      expect(turn.cardId).toBe('card_rotate_formula_new')
+    } finally {
+      releaseOldPost()
+      releaseRender()
+      if (rotation) await rotation.catch(() => {})
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+      renderSpy.mockRestore()
     }
   })
 })
