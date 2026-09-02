@@ -1,5 +1,9 @@
 import { EventEmitter } from 'node:events'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { writeJsonStateAtomic } from './state-store'
 import {
   DEFAULT_CODEX_WATCHDOG,
   TurnWatchdog,
@@ -86,12 +90,19 @@ class FakeAgentProc extends EventEmitter {
   alive = true
   dispatchFactory: ((text: string) => UserTextDispatch) | null = null
   dispatchCounter = 0
+  /** codex materialization 门控(4185808-D):默认 true = 已确认落盘的进程,
+   *  既有用例绑定行为不变;门控用例显式置 false 模拟未确认会话。 */
+  conversationResumableState = true
 
   constructor(
     readonly provider: 'codex' | 'claude',
     public sessionId: string | null = null,
   ) {
     super()
+  }
+
+  isConversationResumable(): boolean {
+    return this.conversationResumableState === true
   }
 
   sendInitialize(): void {}
@@ -10585,5 +10596,121 @@ describe('Session Codex capacity auto-retry', () => {
     session.scheduleCapacityRetry('test_max')
     expect(session.capacityRetryTimer).toBeNull()
     expect(session.capacityRetryAttempts).toBe(CAPACITY_RETRY_MAX_ATTEMPTS)
+  })
+})
+
+// ── 上游 4185808 主题 D:codex resume 绑定 materialization 门控 ──────────
+// 未确认落盘的 codex 会话不得写入恢复映射;conversation_materialized 确认后
+// 才推进绑定;失败路径可观测且脱敏(01-12 哨兵法);resume-state 原子写
+// (01-03 state-store)半写崩溃不污染旧快照。
+describe('Session codex resume 绑定 materialization 门控(上游 4185808 主题 D)', () => {
+  test('conversation_materialized 前不写恢复映射;确认后推进绑定;错配 session_id 不推进', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-mat')
+    proc.conversationResumableState = false // 未确认落盘的 fresh 线程
+    session.proc = proc
+    session.selectedProvider = 'codex'
+    session.wireProc(proc)
+
+    proc.emit('init', { session_id: 'codex-thread-mat' })
+    proc.emit('turn_started', { turn_id: 't1', thread_id: 'codex-thread-mat' })
+    proc.emit('token_usage', { usage: null, totalUsage: null, contextWindow: null })
+    expect(boundResumes).toEqual([]) // 门控:未确认会话不进恢复映射
+    expect(session.lastSessionId).toBeNull()
+
+    // CodexProcess 在 emit conversation_materialized 前已置 resumable=true
+    proc.conversationResumableState = true
+    proc.emit('conversation_materialized', { session_id: 'codex-thread-mat', source: 'turn/started notification' })
+    expect(boundResumes).toEqual([['probe', 'codex-thread-mat', 'codex']])
+    expect(session.lastSessionId).toBe('codex-thread-mat')
+
+    // 错配的迟到 materialized(旧代际线程)不得改写当前绑定
+    proc.emit('conversation_materialized', { session_id: 'other-thread', source: 'turn/completed notification' })
+    expect(boundResumes).toEqual([['probe', 'codex-thread-mat', 'codex']])
+    expect(session.lastSessionId).toBe('codex-thread-mat')
+  })
+
+  test('claude 进程不受门控影响:init 即持久化(行为零变化)', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-ungated')
+    ;(proc as any).isConversationResumable = undefined // claude 不实现该 hook
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+
+    proc.emit('init', { session_id: 'claude-session-ungated' })
+    expect(boundResumes).toEqual([['probe', 'claude-session-ungated', 'claude']])
+    expect(session.lastSessionId).toBe('claude-session-ungated')
+  })
+
+  test('conversation_materialization_failed:绑定不推进+同错误仅一次群内可观测,文案不含 cause/raw payload(哨兵)', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-fail')
+    proc.conversationResumableState = false
+    session.proc = proc
+    session.selectedProvider = 'codex'
+    session.wireProc(proc)
+
+    const SENTINEL = 'SENTINEL_RAW_ROLLOUT_PAYLOAD_X'
+    const failure = new Error(
+      'codex turn/started notification rollout is not readable at /tmp/rollouts/codex-thread-fail.jsonl: ENOENT',
+      { cause: new Error(`Authorization: Bearer ${SENTINEL}`) },
+    )
+    ;(failure as any).raw = `{"app_secret":"${SENTINEL}"}`
+
+    proc.emit('conversation_materialization_failed', {
+      session_id: 'codex-thread-fail',
+      path: '/tmp/rollouts/codex-thread-fail.jsonl',
+      source: 'turn/started notification',
+      error: failure,
+    })
+
+    expect(boundResumes).toEqual([]) // 失败不推进绑定
+    const visible = sentRawTexts.join('\n')
+    expect(visible).toContain('落盘确认失败')
+    expect(visible).toContain('rollout is not readable')
+    // 哨兵负向断言(01-12 惯例):cause 链/raw payload/凭据不进任何用户可见通道
+    expect(visible).not.toContain(SENTINEL)
+    expect(JSON.stringify(sentCards)).not.toContain(SENTINEL)
+    expect(JSON.stringify(updatedCards)).not.toContain(SENTINEL)
+
+    // 同一错误重复到达(重验循环)不刷屏
+    proc.emit('conversation_materialization_failed', {
+      session_id: 'codex-thread-fail',
+      path: '/tmp/rollouts/codex-thread-fail.jsonl',
+      source: 'turn/started notification',
+      error: failure,
+    })
+    expect(sentRawTexts).toHaveLength(1)
+
+    // 新错误(内容不同)是新一次可观测
+    proc.emit('conversation_materialization_failed', {
+      session_id: 'codex-thread-fail',
+      path: '/tmp/rollouts/codex-thread-fail.jsonl',
+      source: 'turn/completed notification',
+      error: new Error('codex turn/completed notification thread/read returned an invalid materialized thread'),
+    })
+    expect(sentRawTexts).toHaveLength(2)
+  })
+
+  test('resume-state 原子写:半写崩溃的 tmp 残留不污染旧完整快照(dead-man\'s switch 事务底座)', () => {
+    // 现状绿锚:writeJsonStateAtomic(01-03 state-store)已承载 resume map 持久化,
+    // 本用例锁定崩溃语义 + feishu 接线,防未来回退成裸 writeFileSync。
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-resume-state-'))
+    try {
+      const file = join(root, 'session-resume-map.json')
+      writeJsonStateAtomic(file, { probe: { codex: 'thread-old-complete' } })
+      // 模拟 writeStateFileAtomic 半写崩溃:tmp 兄弟文件写到一半、未 rename
+      writeFileSync(`${file}.99999.deadbeef.tmp`, '{"probe":{"codex":"thread-ne')
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ probe: { codex: 'thread-old-complete' } })
+      // 下一次完整事务照常原子替换
+      writeJsonStateAtomic(file, { probe: { codex: 'thread-new' } })
+      expect(JSON.parse(readFileSync(file, 'utf8'))).toEqual({ probe: { codex: 'thread-new' } })
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+    // 接线结构锚:真实 feishu.ts 的 resume map 落盘必须经 writeJsonStateAtomic
+    const feishuSource = readFileSync(join(import.meta.dir, 'feishu.ts'), 'utf8')
+    expect(feishuSource).toContain('writeJsonStateAtomic(SESSION_RESUME_MAP_FILE')
   })
 })
