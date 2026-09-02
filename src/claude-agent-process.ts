@@ -1633,7 +1633,23 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   private handleUserMessage(raw: any): void {
-    const content = Array.isArray(raw.message?.content) ? raw.message.content : []
+    const rawContent = raw.message?.content
+    // CronCreate 的 SDK 定时唤醒实测形状:user + isMeta=true +
+    // promptSource='sdk' + string content。手动输入是 text block 数组；图片
+    // 结果虽也是 meta string，但没有 promptSource=sdk；task-notification 则
+    // isMeta 为空。只认完整组合，避免普通 internal user 消息误开定时卡。
+    if (
+      raw.isMeta === true &&
+      raw.promptSource === 'sdk' &&
+      typeof rawContent === 'string' &&
+      rawContent.trim()
+    ) {
+      this.emit('scheduled_turn_input', {
+        text: rawContent,
+        promptId: typeof raw.promptId === 'string' && raw.promptId ? raw.promptId : null,
+      })
+    }
+    const content = Array.isArray(rawContent) ? rawContent : []
     for (const block of content) {
       if (!block || typeof block !== 'object') continue
       if (block.type !== 'tool_result' || typeof block.tool_use_id !== 'string') continue
