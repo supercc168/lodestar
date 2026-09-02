@@ -7430,16 +7430,51 @@ export class Session {
     // processOutboundMarkers(). closeTurnCard only finalizes text display.
     // 如果最后一个 assistant 段没有等到 block_stop,这里先把内存缓冲的完整
     // 文本作为静态 markdown 插入卡片。
+    const fallbackSegments = new Map<string, string>()
     if (turn.currentAssistantSegmentId && turn.currentAssistantText.trim()) {
-      await this.addCompletedAssistantSegment(turn, turn.currentAssistantSegmentId, turn.currentAssistantText)
+      const segId = turn.currentAssistantSegmentId
+      const text = turn.currentAssistantText
+      const added = await this.addCompletedAssistantSegment(turn, segId, text)
+      if (!added) fallbackSegments.set(segId, text)
       turn.currentAssistantSegmentId = null
       turn.currentAssistantText = ''
     }
 
+    // block_stop handler 是同步 fire-and-forget；先等 raw 容器 checked 写完，
+    // 才能完整看到随后登记的 mathRenderInflight，避免 close 抢先 dispose。
+    const assistantWrites = turn.assistantWriteInflight?.get(cardId)
+    if (assistantWrites?.size) {
+      await Promise.allSettled([...assistantWrites])
+    }
+
+    // 等本卡全部 in-flight 公式渲染落地(渲染+上传是秒级 async,且有超时
+    // 上限——math-render 上传 15s AbortController,不会无限挂)。不等的话
+    // 下面的原文 replace 会先赢,把还没落地的渲染版覆盖回 $$…$$ 原码降级;
+    // 渲染 promise 晚到再写就打在已 dispose 的卡上静默死 —— 这正是「公式
+    // 图永远不出现、只见代码块」的病根。只 drain 本卡:rotation 期间登记
+    // 的旧卡渲染由 rotation 自己 drain(review #2)。
+    const inflight = turn.mathRenderInflight?.get(cardId)
+    if (inflight?.size) {
+      await Promise.allSettled([...inflight])
+    }
+
     // 对每个 assistant 段 replaceElement 成最终内容。正文已经是静态 markdown,
-    // 这里只是收尾清洗 askusr 标记和兜住异常路径。
+    // 这里只是收尾清洗 askusr 标记和兜住异常路径 —— 但公式段例外:
+    // replaceSegmentWithMathImgs 已经把段替换成摘出文本 + 紧贴插入公式图,
+    // 这里再用原文重渲会把渲染版覆盖回 $$…$$ 原码降级(代码块占位),图也
+    // 失去归属段。已渲染标记按卡隔离:本卡的段才跳过(rotation 重编号后
+    // 新卡同名段不受旧卡标记影响)。
+    const renderedHere = turn.mathRendered?.get(cardId)
     for (const [segId, fullText] of segmentTexts) {
+      if (cardkit.isDeadElement(cardId, segId)) {
+        fallbackSegments.set(segId, fullText)
+        continue
+      }
+      if (renderedHere?.has(segId)) continue
       await cardkit.replaceElement(cardId, segId, this.completedAssistantElement(segId, fullText))
+    }
+    if (turn.rotateGivenUp) {
+      for (const [segId, fullText] of segmentTexts) fallbackSegments.set(segId, fullText)
     }
 
     // State marker leads the footer (✅ for natural completion, or the
@@ -7484,6 +7519,10 @@ export class Session {
       suffix,
     }))
     await cardkit.dispose(cardId)
+
+    for (const text of fallbackSegments.values()) {
+      await this.sendAssistantTextFallback(text, 'CardKit 元素未落地')
+    }
 
     // Phone push on clean turn close so the user knows Codex is done
     // even with the chat backgrounded. Skip on interrupts (no real
