@@ -1237,6 +1237,233 @@ describe('codex JSON-RPC 控制面可靠性(上游 ec149d7 主题 H)', () => {
   })
 })
 
+// ── 上游 4185808 主题 D:codex materialization 验证与事件次序纪律 ──────
+// conversationResumable/rollout 路径权威 + thread/read 5s 验证 +
+// conversation_materialized/_materialization_failed 事件 + CodexRpcResponseError
+// 分类 + exit-close drain 次序 + stdin EPIPE 不连坐 + spawn 失败终态化。
+function materializationHarness(workDir: string): {
+  proc: any
+  events: Array<[string, any]>
+  requests: Array<{ method: string; params: any; timeoutMs?: number }>
+} {
+  const proc = Object.create(CodexProcess.prototype) as any
+  const events: Array<[string, any]> = []
+  const requests: Array<{ method: string; params: any; timeoutMs?: number }> = []
+  proc.opts = { workDir, effort: 'high' }
+  proc.sessionId = 'thread-mat'
+  proc.alive = true
+  proc.expectedExit = false
+  proc.pendingTurnStart = null
+  proc.currentTurnId = null
+  proc.lastUsage = null
+  proc.conversationResumable = false
+  proc.conversationRolloutPath = null
+  proc.conversationMaterializationVerification = null
+  proc.conversationMaterializationRetrySource = null
+  proc.lastConversationMaterializationFailure = null
+  proc.emittedImageGenerationIds = new Set()
+  proc.flushRolloutImageGenerations = () => {}
+  proc.emit = (event: string, payload: unknown) => {
+    events.push([event, payload])
+    return true
+  }
+  proc.request = (method: string, params: any, timeoutMs?: number) => {
+    requests.push({ method, params, timeoutMs })
+    return Promise.resolve({
+      thread: { id: proc.sessionId, cwd: workDir, path: proc.conversationRolloutPath, turns: [] },
+    })
+  }
+  return { proc, events, requests }
+}
+
+/** 驱动 materialization 验证收敛:等 barrier(失败吞掉)+ 两拍微任务让
+ *  emit/finally 续体跑完。RED 阶段 barrier 方法不存在时为 no-op。 */
+async function drainMaterialization(proc: any): Promise<void> {
+  const barrier = proc.conversationMaterializationBarrier?.()
+  if (barrier) await barrier.catch(() => {})
+  await Promise.resolve()
+  await Promise.resolve()
+}
+
+describe('codex conversation materialization 验证(上游 4185808 主题 D)', () => {
+  test('turn/started 触发 thread/read(5s 超时)验证,rollout 在盘 → conversation_materialized + resumable', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-mat-'))
+    try {
+      const rollout = join(root, 'thread-mat.jsonl')
+      writeFileSync(rollout, '{"type":"turn_started"}\n')
+      const { proc, events, requests } = materializationHarness(root)
+      proc.conversationRolloutPath = rollout
+
+      proc.handleNotification('turn/started', { threadId: 'thread-mat', turn: { id: 'turn-1' } })
+      await drainMaterialization(proc)
+
+      expect(requests).toContainEqual({
+        method: 'thread/read',
+        params: { threadId: 'thread-mat', includeTurns: true },
+        timeoutMs: 5000,
+      })
+      expect(events).toContainEqual(['turn_started', { turn_id: 'turn-1', thread_id: 'thread-mat' }])
+      expect(events).toContainEqual([
+        'conversation_materialized',
+        { session_id: 'thread-mat', source: 'turn/started notification' },
+      ])
+      expect(proc.isConversationResumable()).toBe(true)
+      expect(proc.conversationMaterializationFailure()).toBeNull()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('rollout 不在盘 → conversation_materialization_failed 可观测且不置 resumable;下一信号重验成功补发 materialized', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-mat-fail-'))
+    try {
+      const rollout = join(root, 'thread-mat.jsonl')
+      const { proc, events } = materializationHarness(root)
+      proc.conversationRolloutPath = rollout // 文件不存在:statSync 失败
+
+      proc.handleNotification('turn/started', { threadId: 'thread-mat', turn: { id: 'turn-1' } })
+      await drainMaterialization(proc)
+
+      const failed = events.filter(([name]) => name === 'conversation_materialization_failed')
+      expect(failed).toHaveLength(1)
+      expect(failed[0][1]).toMatchObject({
+        session_id: 'thread-mat',
+        path: rollout,
+        source: 'turn/started notification',
+      })
+      expect(failed[0][1].error).toBeInstanceOf(Error)
+      expect(proc.isConversationResumable()).toBe(false)
+      expect(proc.conversationMaterializationFailure()).toBeInstanceOf(Error)
+
+      // 落盘后同 turn 的下一个 turn/started 重验成功 → materialized 补发。
+      writeFileSync(rollout, '{"type":"turn_started"}\n')
+      proc.handleNotification('turn/started', { threadId: 'thread-mat', turn: { id: 'turn-1' } })
+      await drainMaterialization(proc)
+
+      expect(events).toContainEqual([
+        'conversation_materialized',
+        { session_id: 'thread-mat', source: 'turn/started notification' },
+      ])
+      expect(proc.isConversationResumable()).toBe(true)
+      expect(proc.conversationMaterializationFailure()).toBeNull()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('RPC 响应错误分类为 CodexRpcResponseError(method/id/code/message);字符串错误 code=null', async () => {
+    const mod = (await import('./codex-process')) as any
+    const proc = makeCodexLifecycleHarness()
+
+    const first = proc.request('thread/resume', {}, 200)
+    proc.handleMessage({ id: 1, error: { code: -32600, message: 'no rollout found for thread id thread-mat' } })
+    const firstError = await first.then(() => null, (e: Error) => e)
+    expect(firstError).toBeInstanceOf(mod.CodexRpcResponseError)
+    expect(firstError).toMatchObject({
+      name: 'CodexRpcResponseError',
+      method: 'thread/resume',
+      requestId: 1,
+      serverCode: -32600,
+      serverMessage: 'no rollout found for thread id thread-mat',
+    })
+
+    const second = proc.request('thread/read', {}, 200)
+    proc.handleMessage({ id: 2, error: 'boom' })
+    const secondError = await second.then(() => null, (e: Error) => e)
+    expect(secondError).toBeInstanceOf(mod.CodexRpcResponseError)
+    expect(secondError).toMatchObject({ serverCode: null, serverMessage: 'boom' })
+
+    // 传输错误(写失败)保留原始 error 分类(01-09 契约),不得包成 RPC 响应错误。
+    const epipe = Object.assign(new Error('EPIPE'), { code: 'EPIPE' })
+    const transport = makeCodexLifecycleHarness({
+      write: (_chunk: string, callback: (error?: Error) => void) => {
+        queueMicrotask(() => callback(epipe))
+        return true
+      },
+    })
+    const third = transport.request('initialize', {}, 200)
+    const thirdError = await third.then(() => null, (e: Error) => e)
+    expect((thirdError as any).code).toBe('EPIPE')
+    expect(thirdError).not.toBeInstanceOf(mod.CodexRpcResponseError)
+  })
+})
+
+describe('codex exit-close-error 事件次序纪律(上游 4185808 主题 D)', () => {
+  function lifecycleEventHarness(): { proc: any; events: Array<[string, any]> } {
+    const proc = makeCodexLifecycleHarness()
+    const events: Array<[string, any]> = []
+    proc.stdoutBuf = ''
+    proc.stderrBuf = ''
+    proc.exitEventEmitted = false
+    proc.childExitCode = null
+    proc.childExitSignal = null
+    proc.conversationMaterializationVerification = null
+    proc.emit = (event: string, payload: unknown) => {
+      events.push([event, payload])
+      return true
+    }
+    return { proc, events }
+  }
+
+  test('exit 先到不拒未答请求;close 先 drain stdout tail(final response 不丢)再拒真正未答', async () => {
+    const { proc, events } = lifecycleEventHarness()
+    const answered = proc.request('turn/start', {}, 1000)
+    const unanswered = proc.request('model/list', {}, 1000)
+    expect(proc.pending.size).toBe(2)
+
+    proc.handleChildExit(0, null)
+    expect(proc.pending.size).toBe(2) // exit 不拒:final response 可能还在 stdout 缓冲
+    expect(proc.isAlive()).toBe(true) // 公开 exit 事件前所有权仍在
+    expect(events.filter(([name]) => name === 'exit')).toHaveLength(0)
+
+    proc.stdoutBuf = JSON.stringify({ id: 1, result: { turn: { id: 'turn-tail' } } }) // 无尾部换行
+    proc.handleChildClose(0, null)
+
+    expect(await settlementWithin(answered)).toBe('resolved')
+    expect(await settlementWithin(unanswered)).toBe('rejected: codex app-server closed before model/list response (id=2)')
+    expect(events.filter(([name]) => name === 'exit')).toEqual([
+      ['exit', { code: 0, signal: null, expected: false }],
+    ])
+    expect(proc.isAlive()).toBe(false)
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('stdin error 事件不连坐 pending 表(EPIPE 只由 per-write 回调拒自己的请求)', async () => {
+    const { proc, events } = lifecycleEventHarness()
+    const untouched = proc.request('turn/start', {}, 1000)
+    expect(proc.pending.size).toBe(1)
+
+    proc.handleStdinError(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
+
+    expect(proc.pending.size).toBe(1) // 不连坐:已注册请求保留(等响应/close/超时)
+    expect(await settlementWithin(untouched, 30)).toBe('hung')
+    expect(events.map(([name]) => name)).toEqual(['error'])
+  })
+
+  test('spawn 失败(无 pid)终态化:alive=false + 拒未答 + exit(null,null) 单次', async () => {
+    const { proc, events } = lifecycleEventHarness()
+    proc.proc.pid = undefined
+    const doomed = proc.request('initialize', {}, 1000)
+
+    proc.handleChildProcessError(new Error('spawn codex ENOENT'))
+
+    expect(proc.alive).toBe(false)
+    expect(proc.isAlive()).toBe(false)
+    expect(await settlementWithin(doomed)).toBe(
+      'rejected: codex app-server process failed before initialize response (id=1): spawn codex ENOENT',
+    )
+    expect(events.filter(([name]) => name === 'exit')).toEqual([
+      ['exit', { code: null, signal: null, expected: false }],
+    ])
+  })
+
+  test('OS exit 已见但 stdio 未 close 时,kill 等待 close、超时如实抛出', async () => {
+    const { proc } = lifecycleEventHarness()
+    proc.alive = false // handleChildExit 已跑,close 未到
+    await expect(proc.kill(5)).rejects.toThrow('exited but stdio did not close within 5ms')
+  })
+})
+
 describe('codex rollout 增量读取(StringDecoder+remainder)', () => {
   test('只读追加字节,半行 JSON 保留 remainder 到下次拼接', () => {
     const root = mkdtempSync(join(tmpdir(), 'lodestar-rollout-'))
