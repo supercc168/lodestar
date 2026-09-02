@@ -608,3 +608,138 @@ describe('cardkit checked settings PATCH and disposed-card guard (upstream ec149
     await cardkit.dispose(cardId)
   })
 })
+
+describe('checked card writes', () => {
+  test('replaceElementChecked reports a Feishu PUT rejection', async () => {
+    const cardId = 'card_checked_replace'
+    cardkit.recordCardCreated(cardId, 1)
+    globalThis.fetch = (async () => new Response(JSON.stringify({ code: 300308, msg: 'element rejected' }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as unknown as typeof fetch
+
+    expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'x',
+    })).toBe(false)
+    await cardkit.dispose(cardId)
+  })
+
+  // 上游原题为 'add/delete checked variants return false on rejected mutations';
+  // add 部分与本地 addElementResult 结构化失败例(card_add_result)意图重复,
+  // 裁剪为 delete 聚焦版锁定本 plan 新增的 deleteElementChecked。
+  test('deleteElementChecked returns false on a rejected delete mutation', async () => {
+    const deleteCard = 'card_checked_delete'
+    cardkit.recordCardCreated(deleteCard, 2)
+    globalThis.fetch = (async () => new Response(JSON.stringify({ code: 300313, msg: 'delete rejected' }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as unknown as typeof fetch
+    expect(await cardkit.deleteElementChecked(deleteCard, 'math_1')).toBe(false)
+    await cardkit.dispose(deleteCard)
+  })
+
+  test('HTTP errors and malformed success bodies never count as landed writes', async () => {
+    for (const [cardId, response] of [
+      ['card_http_502', new Response(JSON.stringify({ msg: 'gateway error' }), {
+        status: 502, headers: { 'Content-Type': 'application/json' },
+      })],
+      ['card_missing_code', new Response(JSON.stringify({ data: {} }), {
+        status: 200, headers: { 'Content-Type': 'application/json' },
+      })],
+    ] as const) {
+      cardkit.recordCardCreated(cardId, 1)
+      globalThis.fetch = (async () => response.clone()) as unknown as typeof fetch
+      expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
+        tag: 'markdown', element_id: 'assistant_0', content: 'x',
+      }, { notifyCardFailure: false })).toBe(false)
+      await cardkit.dispose(cardId)
+    }
+  })
+
+  test('a throwing card failure callback cannot poison the write queue', async () => {
+    const cardId = 'card_throwing_failure_callback'
+    cardkit.recordCardCreated(cardId, 1, () => { throw new Error('callback boom') })
+    let attempt = 0
+    globalThis.fetch = (async () => {
+      attempt++
+      return new Response(JSON.stringify(attempt === 1
+        ? { code: 300308, msg: 'first rejected' }
+        : { code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as unknown as typeof fetch
+
+    expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'first',
+    })).toBe(false)
+    expect(await cardkit.addElementChecked(cardId, {
+      tag: 'markdown', element_id: 'second', content: 'second',
+    })).toBe(true)
+    await cardkit.dispose(cardId)
+  })
+})
+
+describe('disposed card write guard (review #3)', () => {
+  test('recordCardCreated 复活同 id 卡(新 turn 复用 card id 场景)', async () => {
+    const cardId = 'card_revive'
+    cardkit.recordCardCreated(cardId, 1)
+    // 旧生命周期留下死元素 + write-dead(stale-open 换代时旧 state 未必
+    // 来得及 dispose)——复活必须整体丢弃旧 state,而不是在其上打补丁。
+    const healthy = globalThis.fetch
+    let failNext = true
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (failNext) {
+        failNext = false
+        return new Response(JSON.stringify({ code: 300308, msg: 'stale reject' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return await healthy(input, init)
+    }) as typeof fetch
+    await cardkit.addElement(cardId, { tag: 'markdown', element_id: 'rv1', content: 'stale' })
+    expect(cardkit.isDeadElement(cardId, 'rv1')).toBe(true)
+    cardkit.markCardWriteDead(cardId)
+
+    // 未经 dispose 直接同 id 再开卡:全新生命周期,旧 deadElements/writeDead/closing 不残留
+    cardkit.recordCardCreated(cardId, 1)
+    expect(cardkit.isDeadElement(cardId, 'rv1')).toBe(false)
+    await cardkit.addElement(cardId, { tag: 'markdown', element_id: 'rv1', content: 'ok' })
+    await cardkit.flush(cardId)
+    expect(calls.some(c => c.method === 'POST' && c.path === `/cards/${cardId}/elements` && JSON.parse(c.body.elements)[0]?.element_id === 'rv1')).toBe(true)
+
+    // dispose 后同 id 复活同样成立(上游原型场景)
+    await cardkit.dispose(cardId)
+    cardkit.recordCardCreated(cardId, 1)
+    await cardkit.addElement(cardId, { tag: 'markdown', element_id: 'rv2', content: 'ok2' })
+    await cardkit.flush(cardId)
+    expect(calls.some(c => c.method === 'POST' && c.path === `/cards/${cardId}/elements` && JSON.parse(c.body.elements)[0]?.element_id === 'rv2')).toBe(true)
+    await cardkit.dispose(cardId)
+  })
+
+  test('dispose synchronously closes the enqueue gate before draining', async () => {
+    const cardId = 'card_dispose_race'
+    cardkit.recordCardCreated(cardId, 1)
+    let releaseFetch: () => void = () => {}
+    const fetchStarted = new Promise<void>(resolve => {
+      globalThis.fetch = (async () => {
+        resolve()
+        await new Promise<void>(release => { releaseFetch = release })
+        return new Response(JSON.stringify({ code: 0, data: {} }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as unknown as typeof fetch
+    })
+
+    const first = cardkit.addElementChecked(cardId, {
+      tag: 'markdown', element_id: 'first', content: 'first',
+    })
+    await fetchStarted
+    const disposing = cardkit.dispose(cardId)
+    const second = await cardkit.addElementChecked(cardId, {
+      tag: 'markdown', element_id: 'second', content: 'second',
+    })
+    expect(second).toBe(false)
+    releaseFetch()
+    expect(await first).toBe(true)
+    await disposing
+    expect(cardkit.isDisposed(cardId)).toBe(true)
+  })
+})
