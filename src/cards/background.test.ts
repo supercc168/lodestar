@@ -259,6 +259,18 @@ describe('applyBgToolUse / applyBgToolResult — 双池 steps 累积', () => {
     expect(s.pending[0].steps[0].brief).toBe('Grep "auth" in src → 命中 3 处')
   })
 
+  test('Bash step 的 brief 走 shell-command 解析:PowerShell 包装显示 desc 说明', () => {
+    // Windows 子 agent 的命令被包进 powershell.exe -Command '...',steps 里
+    // 应显示中文说明,不显示 powershell.exe 路径 / # desc 注释。
+    let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
+    s = applyBgToolUse(s, 'p', 'tu', 'Bash', {
+      command: `'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -Command '# desc: 查看 xyq 项目模板状态\nGet-ChildItem "C:\\xyq" -Recurse'`,
+    })
+    expect(s.active[0].steps[0].brief).toBe('Bash 查看 xyq 项目模板状态')
+    expect(s.active[0].steps[0].brief).not.toContain('powershell')
+    expect(s.active[0].steps[0].brief).not.toContain('# desc')
+  })
+
   test('tool_result 错误加 ❌', () => {
     let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
     s = applyBgToolUse(s, 'p', 'tu', 'Bash', { command: 'npm test' })
@@ -523,17 +535,17 @@ describe('applySubagentStep —— codex 子 agent 过程步骤(按 thread_id �
 
   test('started 追加新 step(brief 前缀工具名)', () => {
     let s: BgStore = { active: [entry('th-1')], pending: [] }
-    s = applySubagentStep(s, 'th-1', 'item_1', 'Bash', 'started', '`bun test`')
+    s = applySubagentStep(s, 'th-1', 'item_1', 'Bash', 'started', 'bun test')
     expect(s.active[0].steps).toHaveLength(1)
-    expect(s.active[0].steps[0]).toEqual({ toolUseId: 'item_1', tool: 'Bash', brief: 'Bash `bun test`' })
+    expect(s.active[0].steps[0]).toEqual({ toolUseId: 'item_1', tool: 'Bash', brief: 'Bash bun test' })
   })
 
   test('completed 按 item_id 回填结果段到同一 step', () => {
     let s: BgStore = { active: [entry('th-1')], pending: [] }
-    s = applySubagentStep(s, 'th-1', 'item_1', 'Bash', 'started', '`bun test`')
+    s = applySubagentStep(s, 'th-1', 'item_1', 'Bash', 'started', 'bun test')
     s = applySubagentStep(s, 'th-1', 'item_1', 'Bash', 'completed', '→ 12 pass')
     expect(s.active[0].steps).toHaveLength(1)
-    expect(s.active[0].steps[0].brief).toBe('Bash `bun test` → 12 pass')
+    expect(s.active[0].steps[0].brief).toBe('Bash bun test → 12 pass')
   })
 
   test('completed 无对应 step(漏 started)且 brief 非空 → 补一步', () => {
@@ -566,7 +578,7 @@ describe('applySubagentStep —— codex 子 agent 过程步骤(按 thread_id �
 
 describe('subagentStepBrief —— 子 agent 步骤单行简报', () => {
   test('Bash started 显示命令,completed 显示输出首段', () => {
-    expect(subagentStepBrief('Bash', { command: 'bun test' })).toBe('`bun test`')
+    expect(subagentStepBrief('Bash', { command: 'bun test' })).toBe('bun test')
     expect(subagentStepBrief('Bash', { command: 'bun test' }, ' 12 pass\n0 fail ')).toBe('→ 12 pass 0 fail')
     expect(subagentStepBrief('Bash', { command: 'x' }, '   ')).toBe('')
   })

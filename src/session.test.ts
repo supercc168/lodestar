@@ -10009,13 +10009,13 @@ describe('Session codex 子 agent 后台游标卡接线(上游 cf41941)', () => 
 
     // wire 形态与 codex-process emitSubagentStep 一致:brief 不带工具名前缀
     // (applySubagentStep 在 started 时自己拼 `${tool} ${brief}`)。
-    proc.emit('subagent_step', { thread_id: 'sub-1', item_id: 'cmd-1', tool: 'Bash', phase: 'started', brief: '`bun test`' })
+    proc.emit('subagent_step', { thread_id: 'sub-1', item_id: 'cmd-1', tool: 'Bash', phase: 'started', brief: 'bun test' })
     proc.emit('subagent_step', { thread_id: 'sub-1', item_id: 'cmd-1', tool: undefined, phase: 'completed', brief: '→ 12 pass' })
 
     const t = session.backgroundTasks.find((x: any) => x.id === 'sub-1')
     expect(t).toBeDefined()
     expect(t.steps).toHaveLength(1)
-    expect(t.steps[0].brief).toBe('Bash `bun test` → 12 pass')
+    expect(t.steps[0].brief).toBe('Bash bun test → 12 pass')
 
     // 未知 thread(先于 started 到达的极早期)丢弃,不产生新 entry。
     proc.emit('subagent_step', { thread_id: 'sub-nope', item_id: 'x-1', tool: 'Bash', phase: 'started', brief: 'x' })

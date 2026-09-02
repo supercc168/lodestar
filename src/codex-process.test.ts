@@ -1089,7 +1089,7 @@ describe('codex 多 agent collab→bg 翻译状态机(上游 cf41941)', () => {
       item: { type: 'commandExecution', id: 'cmd-1', command: 'bun test', cwd: '/tmp' },
     })
     expect(events).toEqual([
-      ['subagent_step', { thread_id: 'sub-x', item_id: 'cmd-1', tool: 'Bash', phase: 'started', brief: '`bun test`' }],
+      ['subagent_step', { thread_id: 'sub-x', item_id: 'cmd-1', tool: 'Bash', phase: 'started', brief: 'bun test' }],
     ])
     events.length = 0
 
@@ -1108,6 +1108,23 @@ describe('codex 多 agent collab→bg 翻译状态机(上游 cf41941)', () => {
       item: { type: 'reasoning', id: 'rs-9', summary: [], content: [] },
     })
     expect(events).toEqual([])
+  })
+
+  test('subagent Bash step brief unwraps PowerShell-wrapped desc command', () => {
+    // Windows 上 Codex 把命令包进 powershell.exe 调用,子 agent 后台卡 steps
+    // 的 brief 也要显示中文说明,不显示 powershell.exe 路径。
+    const { proc, events } = notificationHarness()
+    proc.handleNotification('item/started', {
+      item: {
+        type: 'commandExecution', id: 'exec-ps', cwd: 'C:\\repo',
+        command: `'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -Command '# desc: 查看模板目录状态\nGet-ChildItem "C:\\repo\\templates" -Recurse'`,
+      },
+      threadId: 'sub-thread-1',
+      turnId: 'turn-1',
+    })
+    const steps = events.filter(([e]) => e === 'subagent_step')
+    expect(steps).toHaveLength(1)
+    expect((steps[0][1] as any).brief).toBe('查看模板目录状态')
   })
 
   test('外线程其余事件(turn/delta/usage)仍全吞掉,不冒充主轮信号', () => {
