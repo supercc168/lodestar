@@ -340,6 +340,7 @@ describe('codex turn/start delivery receipt', () => {
     const turnStart = deferred<unknown>()
     const requests: Array<{ method: string; params: any }> = []
     proc.opts = { workDir: '/tmp', effort: 'high' }
+    proc.launchKind = 'fresh'
     proc.sessionId = null
     proc.alive = true
     proc.deliveryCounter = 0
@@ -352,7 +353,8 @@ describe('codex turn/start delivery receipt', () => {
     proc.emit = () => true
     proc.request = (method: string, params: any) => {
       requests.push({ method, params })
-      if (method === 'thread/start') return Promise.resolve({ thread: { id: 'thread-late-init' } })
+      // 4185808:thread.path 成为 rollout 权威,init 响应必须带合法路径。
+      if (method === 'thread/start') return Promise.resolve({ thread: { id: 'thread-late-init', path: '/tmp/rollouts/thread-late-init.jsonl' } })
       if (method === 'turn/start') return turnStart.promise
       return Promise.resolve({})
     }
