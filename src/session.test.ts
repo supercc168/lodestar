@@ -24,6 +24,7 @@ const {
   isCodexCapacityError,
 } = await import('./session')
 const cardkit = await import('./cardkit')
+const mathRender = await import('./math-render')
 const sessionTools = await import('./session-tools')
 const sessionHostAsk = await import('./session-host-ask')
 const {
@@ -7282,6 +7283,142 @@ describe('Session assistant rendering', () => {
       expect(elements[0]?.content).toContain('已发起澄清问题')
     } finally {
       session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+})
+
+describe('Session ordered formula rendering across providers', () => {
+  const renderedBlocks = {
+    blocks: [
+      { type: 'markdown' as const, text: '前文' },
+      {
+        type: 'image' as const,
+        element: {
+          tag: 'img', img_key: 'img_v2_formula_x',
+          alt: { tag: 'plain_text', content: 'x' }, size: '40px 20px',
+        },
+      },
+      { type: 'markdown' as const, text: '中段' },
+      {
+        type: 'image' as const,
+        element: {
+          tag: 'img', img_key: 'img_v2_formula_y',
+          alt: { tag: 'plain_text', content: 'y' }, size: '42px 20px',
+        },
+      },
+      { type: 'markdown' as const, text: '后文' },
+    ],
+    formulaCount: 2,
+    renderedImageCount: 2,
+  }
+
+  test('raw and rendered states keep one column_set element on both backends', async () => {
+    const session = new Session('math-order', 'chat_id') as any
+    const renderSpy = spyOn(mathRender, 'renderMathInText').mockResolvedValue(renderedBlocks as any)
+    const replaceSpy = spyOn(cardkit, 'replaceElementChecked').mockResolvedValue(true)
+
+    try {
+      for (const provider of ['codex', 'claude'] as const) {
+        const turn = turnState(`card_math_${provider}`)
+        turn.provider = provider
+        const raw = session.completedAssistantElement('assistant_0', '前文 $$x$$ 后文') as any
+        expect(raw.tag).toBe('column_set')
+        expect(raw.element_id).toBe('assistant_0')
+
+        await session.replaceSegmentWithMathImgs(
+          turn, turn.cardId, 'assistant_0', '前文 $$x$$ 中段 $$y$$ 后文',
+        )
+        const replacement = replaceSpy.mock.calls.at(-1)?.[2] as any
+        expect(replacement.tag).toBe('column_set')
+        expect(replacement.element_id).toBe('assistant_0')
+        expect(replacement.columns[0].elements.map((element: any) => element.tag)).toEqual([
+          'markdown', 'img', 'markdown', 'img', 'markdown',
+        ])
+        expect(replaceSpy.mock.calls.at(-1)?.[3]).toEqual({ notifyCardFailure: false })
+        expect(turn.mathRendered.get(turn.cardId).has('assistant_0')).toBe(true)
+      }
+    } finally {
+      renderSpy.mockRestore()
+      replaceSpy.mockRestore()
+    }
+  })
+
+  test('keeps visible raw LaTeX when the atomic formula enhancement fails', async () => {
+    const session = new Session('math-raw', 'chat_id') as any
+    const turn = turnState('card_math_raw')
+    turn.provider = 'claude'
+    const renderSpy = spyOn(mathRender, 'renderMathInText').mockResolvedValue(renderedBlocks as any)
+    const replaceSpy = spyOn(cardkit, 'replaceElementChecked').mockResolvedValue(false)
+
+    try {
+      await session.replaceSegmentWithMathImgs(
+        turn, turn.cardId, 'assistant_0', '前文 $$x$$ 中段 $$y$$ 后文',
+      )
+      expect(replaceSpy).toHaveBeenCalledTimes(1)
+      expect(turn.mathRendered?.get(turn.cardId)?.has('assistant_0')).not.toBe(true)
+    } finally {
+      renderSpy.mockRestore()
+      replaceSpy.mockRestore()
+    }
+  })
+
+  test('preserves the complete reply if the final formula container was never created', async () => {
+    const session = new Session('math-close-fallback', 'chat_id') as any
+    const turn = turnState('card_math_close_fallback')
+    const rawReply = '前文\n\n$$x^2+y^2=z^2$$\n\n后文'
+    turn.provider = 'claude'
+    turn.userOpenId = ''
+    turn.currentAssistantSegmentId = 'assistant_0'
+    turn.currentAssistantText = rawReply
+    turn.segmentTexts.set('assistant_0', rawReply)
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      const failedBodyAdd = method === 'POST' && path === `/cards/${turn.cardId}/elements`
+      return new Response(JSON.stringify(failedBodyAdd
+        ? { code: 300308, msg: 'card element rejected' }
+        : { code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    await session.closeTurnCard(undefined, { hasFreshResult: false })
+
+    expect(sentTexts).toHaveLength(1)
+    expect(sentTexts[0]).toContain('对话卡片正文写入失败')
+    expect(sentTexts[0]).toContain(rawReply)
+    expect(sentRawTexts).toHaveLength(0)
+  })
+
+  test('超长含公式段整体退回普通截断路径,公式降级可见且不进渲染管线(12k 锁定,开放问题 1)', async () => {
+    const session = new Session('math-12k', 'chat_id') as any
+    const turn = turnState('card_math_12k')
+    turn.provider = 'claude'
+    // 公式置于文本头部,保证截断后仍在可见窗内;清洗后总长 > 12k 触发普通截断路径。
+    const longText = '$$x^2+y^2$$\n\n' + 'A'.repeat(13_000)
+
+    // 断言点 1/2/3:非 column_set + 截断标记在位(200860 防线)+ 公式经
+    // sanitize→downgradeMathBlocksInProse 降级为代码块可见,不静默消失。
+    const element = session.completedAssistantElement('assistant_0', longText) as any
+    expect(element.tag).toBe('markdown')
+    expect(element.element_id).toBe('assistant_0')
+    expect(element.content).toContain('正文已截断')
+    expect(element.content).toContain('```\nx^2+y^2\n```')
+
+    // 断言点 4:渲染准入与 completedAssistantElement 同源(mathSegmentEligible)
+    // ——超长段 raw 落地成功也不登记渲染 promise。
+    cardkit.recordCardCreated(turn.cardId, 1)
+    try {
+      const added = await session.addCompletedAssistantSegment(turn, 'assistant_0', longText)
+      expect(added).toBe(true)
+      expect(turn.mathRenderInflight?.get(turn.cardId)?.size ?? 0).toBe(0)
+    } finally {
       await cardkit.dispose(turn.cardId)
     }
   })
