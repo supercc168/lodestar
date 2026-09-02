@@ -3831,13 +3831,24 @@ export class Session {
   }
 
   // ── Wiring Codex → Feishu ──────────────────────────────────────────
+  /** materialization 失败诊断去重(4185808-D):同一错误文案只发一次群内
+   *  可观测消息;成功持久化后清零,下一轮新错误重新可见。 */
+  private resumePersistenceError: string | null = null
+
   private persistResumableSessionId(proc: AgentProcess): void {
     if (this.proc !== proc) return
     const sessionId = proc?.sessionId
     if (!proc || !sessionId) return
+    // codex materialization 门控(4185808-D):thread/start 先返回内存 id,
+    // rollout 落盘经 thread/read 权威确认前不得写入恢复映射 —— 错序即把
+    // 不可恢复的 id 绑进映射,重启后会话丢失。resume init 与
+    // conversation_materialized 信号都在确认后才置 resumable。fail-closed:
+    // 不实现该 hook 的 codex 进程一律视为未确认。
+    if (proc.provider === 'codex' && proc.isConversationResumable?.() !== true) return
     const recovery = this.preservedWatchdogRecovery
     if (recovery && (proc.provider !== recovery.provider || sessionId !== recovery.threadId)) return
     feishu.bindSessionResume(this.sessionName, sessionId, proc.provider)
+    this.resumePersistenceError = null
     if (proc.provider !== this.selectedProvider) return
     if (sessionId === this.lastSessionId) return
     this.lastSessionId = sessionId
@@ -4321,6 +4332,26 @@ export class Session {
           }
         }
       })()
+    })
+    p.on('conversation_materialized', ({ session_id: sessionId, source }: { session_id: string; source: string }) => {
+      if (this.proc !== p || p.provider !== 'codex') return
+      if (p.sessionId !== sessionId) {
+        log(`session "${this.sessionName}": ignore mismatched Codex materialization session=${sessionId} current=${p.sessionId ?? 'MISS'} source=${source}`)
+        return
+      }
+      log(`session "${this.sessionName}": Codex resume point materialized thread=${sessionId} source=${source}`)
+      this.persistResumableSessionId(p)
+    })
+    p.on('conversation_materialization_failed', ({ session_id: sessionId, source, error }: { session_id: string; source: string; error: Error }) => {
+      if (this.proc !== p || p.provider !== 'codex' || p.sessionId !== sessionId) return
+      // 失败可观测但脱敏(01-12 诊断惯例):只内插 error.message 单行,
+      // cause 链/raw payload/凭据不进任何用户可见通道;绑定不推进(门控
+      // 由 persistResumableSessionId 的 isConversationResumable 检查承担)。
+      const message = `Codex 会话落盘确认失败，未写恢复点: ${messageOf(error)}`
+      const firstReport = this.resumePersistenceError !== message
+      this.resumePersistenceError = message
+      log(`session "${this.sessionName}": ${message} thread=${sessionId} source=${source}`)
+      if (firstReport) void feishu.sendTextRaw(this.chatId, `⚠️ ${message}`)
     })
     p.on('turn_started', (identity: { turn_id?: string | null; thread_id?: string | null }) => {
       if (this.proc !== p) return
