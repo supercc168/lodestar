@@ -3841,6 +3841,9 @@ describe('Session pending human delivery', () => {
     const { session, batch, control } = pendingHumanDrainFixture('codex')
     const draining = session.drainMidTurnAndOpen()
     await control!.started
+    // 进程替换先作废旧 owner(生产为 exit/stop 路径 clearTurnOpening),
+    // 新生命周期才 begin —— 7c14677 单飞后 begin 不再静默顶替。
+    session.clearTurnOpening()
     const replacementOpening = session.beginTurnOpening()
     session.status = 'starting'
 
@@ -3971,6 +3974,7 @@ describe('Session pending human delivery', () => {
     const replacementTurn = turnState('card_cold_replacement')
     session.proc = replacement
     session.currentTurn = replacementTurn
+    session.clearTurnOpening() // 替换先作废旧 owner(单飞后 begin 不静默顶替)
     session.beginTurnOpening()
     session.status = 'starting'
 
@@ -3998,6 +4002,7 @@ describe('Session pending human delivery', () => {
     const replacementTurn = turnState('card_eager_replacement')
     session.proc = replacement
     session.currentTurn = replacementTurn
+    session.clearTurnOpening() // 替换先作废旧 owner(单飞后 begin 不静默顶替)
     session.beginTurnOpening()
     session.status = 'starting'
 
@@ -9756,6 +9761,154 @@ describe('Session Claude SDK Cron 定时唤醒巡检卡(上游 7c14677 主题 A)
 
     expect(sentCards.length).toBe(cardsBefore)
     expect(session.currentTurn).toBeNull()
+  })
+})
+
+describe('Session 开卡/迁移单飞与 SDK-input claims(上游 7c14677 主题 C)', () => {
+  async function waitFor(cond: () => boolean, ms = 2000): Promise<void> {
+    const t0 = Date.now()
+    while (!cond()) {
+      if (Date.now() - t0 > ms) throw new Error('waitFor timeout')
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+  }
+
+  function emitClaudeResult(proc: any): void {
+    proc.lastResult = {
+      cost_usd: null, cost_delta_usd: null, duration_ms: 1000,
+      num_turns: 1, usage: null, subtype: 'success', is_error: false,
+    }
+    proc.emit('result', {})
+  }
+
+  function wiredClaudeSession(): { session: any; proc: any } {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.lastUserOpenId = 'ou_user'
+    session.wireProc(proc)
+    proc.emit('init', { session_id: 'claude-session-1' }) // boot init,无批次不开卡
+    return { session, proc }
+  }
+
+  test('beginTurnOpening 单飞:owner 在位时第二次 begin 抛出而非静默顶替', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const token = session.beginTurnOpening()
+    expect(() => session.beginTurnOpening()).toThrow(/already owned/)
+    session.finishTurnOpening(token)
+    expect(session.openingTurn).toBe(false)
+    const token2 = session.beginTurnOpening() // 释放后可再获取
+    session.finishTurnOpening(token2)
+    expect(session.openingTurn).toBe(false)
+  })
+
+  test('result 驱动的 mid-turn drain 等待 bg-resume 开卡释放,用户批次开为独立轮', async () => {
+    const { session, proc } = wiredClaudeSession()
+
+    proc.emit('bg_task_settled', { task_id: 't-race', status: 'completed' })
+    proc.emit('init', { session_id: 'claude-session-1' }) // bg-resume 开卡(await 窗口)
+    expect(session.openingTurn).toBe(true)
+    // 开卡窗口内:用户消息 daemon 侧缓冲 + result 到达要求 drain
+    session.pendingMidTurnMsgs = [{ text: '排队消息', wireText: '排队消息', userOpenId: 'ou_user', msgId: '' }]
+    emitClaudeResult(proc)
+
+    // drain 必须等 bg-resume owner 释放,再把用户批次开成独立 user_message 轮
+    await waitFor(() => session.currentTurn?.trigger === 'user_message')
+    try {
+      expect(session.pendingMidTurnMsgs.length).toBe(0)
+      // 两张卡按序落地:bg-resume 卡 + 用户轮卡(无并发顶替丢卡)
+      expect(sentCards.length).toBe(2)
+      expect(session.status).toBe('working')
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose(session.currentTurn.cardId)
+    }
+  })
+
+  test('迁移窗口内新终态 entry 不未画先删:快照在 flush 后取,只移除已画入历史的终态', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    const now = Date.now()
+    session.backgroundTasks = [
+      { id: 'painted', type: 'shell', description: 'done early', status: 'completed', startedAt: now - 9000, endTime: now - 1000, steps: [] },
+      { id: 'late-terminal', type: 'shell', description: 'finishes mid-migration', status: 'running', startedAt: now - 5000, steps: [] },
+    ]
+    session.backgroundCard = { messageId: 'om_bg_migrate_race', cardId: 'card_bg_migrate_race' }
+    session.backgroundDetailAdded = new Set(['painted', 'late-terminal'])
+    cardkit.recordCardCreated('card_bg_migrate_race', 2)
+    // 历史快照 updateCard 的 await 窗口内:活跃任务转终态
+    feishuMockState.updateCard = async (messageId: string) => {
+      if (messageId !== 'om_bg_migrate_race') return
+      feishuMockState.updateCard = null
+      proc.emit('bg_task_settled', { task_id: 'late-terminal', status: 'completed' })
+    }
+
+    await session.migrateBackgroundCard()
+
+    // 已画入快照的 painted 被移除;窗口内新终态 late-terminal 保留(未画入,
+    // 由重建卡补墓碑)——旧代码在这里把它连同快照外状态一起删掉
+    expect(session.backgroundTasks.map((t: any) => t.id)).toEqual(['late-terminal'])
+    expect(session.backgroundTasks[0].status).toBe('completed')
+    // 迁移期冻结:settle 未对旧卡二次 updateCard(仅历史快照一次)
+    expect(updatedCards.filter(([id]) => id === 'om_bg_migrate_race')).toHaveLength(1)
+    // 冻结事件换来的重建收据在位(主卡落地/失败路径消费)
+    expect(session.pendingRebuildBackgroundCard).toBe(true)
+  })
+
+  test('SDK-input claim 被 init 边界认领:task-notification init 不再开 inputs=0 空卡', async () => {
+    const { session, proc } = wiredClaudeSession()
+    // eager-open 轮:卡已在位(currentTurn),daemon 写入的 claim=1
+    session.currentTurn = turnState('card_claims_eager', { provider: 'claude', model: 'claude:glm', usageSource: 'glm' })
+    session.pendingUserMessageCount = 1
+
+    proc.emit('init', { session_id: 'claude-session-1' }) // 该轮自己的边界
+    expect(session.pendingUserMessageCount).toBe(0) // claim 已认领
+
+    // 轮收尾后:后台任务通知伴随的 task-notification init(无用户消息、无 settle 置位)
+    session.stopFooterStatus(session.currentTurn)
+    session.currentTurn = null
+    const cardsBefore = sentCards.length
+    proc.emit('init', { session_id: 'claude-session-1' })
+    await new Promise(resolve => setTimeout(resolve, 30))
+
+    expect(sentCards.length).toBe(cardsBefore) // 不再开出 trigger=user_message inputs=0 空卡
+    expect(session.currentTurn).toBeNull()
+  })
+
+  test('turn_started 幂等认领 claim(codex 无每轮 init;claude 冷启动首轮靠它)', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-claims-1')
+    session.proc = proc
+    session.selectedProvider = 'codex'
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_claims_codex')
+    session.pendingUserMessageCount = 1
+
+    proc.emit('turn_started', { thread_id: 'thread-claims-1', turn_id: 'turn-claims-1' })
+
+    expect(session.pendingUserMessageCount).toBe(0)
+    session.stopFooterStatus(session.currentTurn)
+    session.currentTurn = null
+  })
+
+  test('无 turn 时 count>0 的 init 仍按 user batch 开卡(SDK 轮换分类路径保留)', async () => {
+    const { session, proc } = wiredClaudeSession()
+    session.pendingUserMessageCount = 1
+
+    proc.emit('init', { session_id: 'claude-session-1' })
+    await waitFor(() => session.currentTurn !== null)
+
+    try {
+      expect(session.currentTurn.trigger).toBe('user_message')
+      expect(session.pendingUserMessageCount).toBe(0)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose(session.currentTurn.cardId)
+    }
   })
 })
 

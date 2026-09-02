@@ -47,6 +47,9 @@ export const feishuMockState = {
   listSectionTasks: null as null | ((guid: string, completed?: boolean) => Promise<unknown[]>),
   /** getTurnAnchors 替身返回值(01-10:fk/bk 选择处理需要非空锚点走成功路径)。 */
   turnAnchors: [] as Array<{ uuid: string; sid: string; preview: string; ts: number; writes: unknown[] }>,
+  /** updateCard 替身钩子(01-14 / 上游 7c14677 setUpdateCardHandler:迁移快照
+   *  竞态用例在 updateCard await 窗口内注入 task 终态)。 */
+  updateCard: null as null | ((messageId: string, card: object) => Promise<void>),
 }
 
 export function resetFeishuMock(): void {
@@ -65,6 +68,7 @@ export function resetFeishuMock(): void {
   feishuMockState.deleteTasklistByGuid = null
   feishuMockState.listSectionTasks = null
   feishuMockState.turnAnchors = []
+  feishuMockState.updateCard = null
 }
 
 mock.module('./feishu', () => ({
@@ -117,6 +121,7 @@ mock.module('./feishu', () => ({
   projectProfile: (name: string) => projectProfiles.get(name),
   updateCard: async (messageId: string, card: object) => {
     updatedCards.push([messageId, card])
+    if (feishuMockState.updateCard) await feishuMockState.updateCard(messageId, card)
   },
   chatIdForSession: (_sessionName: string) => feishuMockState.chatIdForSession,
   // tasklist 生命周期(01-06 / ec149d7:enable/delete/reconcile 全流程可在测试内走真实 tasklist.ts)

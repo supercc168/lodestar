@@ -433,6 +433,10 @@ export class Session {
    *  streaming 开,replaceElement body 刷新任务行。卡吸附在对话末尾,被新消息
    *  超越时沉降(updateCard),只在全部终态时固化留在原地。 */
   backgroundCard: { messageId: string; cardId: string } | null = null
+  /** Single-flight transition that rewrites/disposes the live background card
+   * before a new main card. While non-null, no refresh/settle mutation may be
+   * queued against the old element tree.(上游 7c14677 迁移单飞) */
+  private migratingBackgroundCard: Promise<void> | null = null
   /** task_progress 风暴的刷新节流 timer。 */
   private backgroundRefreshTimer: ReturnType<typeof setTimeout> | null = null
   /** 后台卡档位 timer:在最近活跃任务的下一个耗时档位边界刷新 header。
@@ -615,6 +619,10 @@ export class Session {
    * claiming the slot, stand down". */
   openingTurn = false
   private openingTurnOwner: object | null = null
+  /** Resolves when the current turn-open transaction releases. Same-process
+   * follow-up opens await it instead of replacing openingTurnOwner.(上游
+   * 7c14677 TurnOpenOwner.done 的本地 opaque-token 适配) */
+  private openingTurnDone: { promise: Promise<void>; resolve: () => void } | null = null
   private turnCounter = 0
   private lifecycleEpoch = 0
   private lifecycleOwner: LifecycleLease | null = null
@@ -2009,9 +2017,15 @@ export class Session {
   }
 
   private beginTurnOpening(): object {
+    if (this.openingTurnOwner) {
+      throw new Error('turn card open already owned; same-process opens must wait for the current owner')
+    }
     const token = {}
     this.openingTurnOwner = token
     this.openingTurn = true
+    let resolve!: () => void
+    const promise = new Promise<void>(r => { resolve = r })
+    this.openingTurnDone = { promise, resolve }
     return token
   }
 
@@ -2019,11 +2033,32 @@ export class Session {
     if (this.openingTurnOwner !== token) return
     this.openingTurnOwner = null
     this.openingTurn = false
+    const done = this.openingTurnDone
+    this.openingTurnDone = null
+    done?.resolve()
   }
 
   private clearTurnOpening(): void {
     this.openingTurnOwner = null
     this.openingTurn = false
+    const done = this.openingTurnDone
+    this.openingTurnDone = null
+    done?.resolve()
+  }
+
+  /** Wait for a same-process card-open transaction to finish. Process
+   * replacement/death fails this wait, preserving the existing "new process
+   * supersedes old open" lifecycle while prohibiting two opens in one process
+   * generation from migrating/rendering concurrently.(上游 7c14677
+   * waitForTurnOpenSlot) */
+  private async waitForTurnOpenSlot(proc: AgentProcess): Promise<boolean> {
+    while (this.openingTurnOwner) {
+      const done = this.openingTurnDone
+      if (!done) return false
+      await done.promise
+      if (this.proc !== proc || !proc.isAlive()) return false
+    }
+    return this.proc === proc && proc.isAlive()
   }
 
   discardQueuedHumanWork(reason: string): void {
@@ -3915,6 +3950,13 @@ export class Session {
   }
 
   private onBackgroundTaskChanged(): void {
+    // task_* events remain accumulated in backgroundTasks while the old card is
+    // transitioning, but must not mutate that card. openTurnCard rebuilds the
+    // remaining snapshot behind the new main card once migration completes.
+    if (this.migratingBackgroundCard) {
+      this.pendingRebuildBackgroundCard = true
+      return
+    }
     const hasActive = cards.hasActiveBgTask(this.backgroundTasks)
     // 全部终态 → 活卡沉降成历史快照,关 streaming,清句柄
     if (!hasActive) {
@@ -3978,7 +4020,7 @@ export class Session {
   private startBackgroundRefreshTick(): void {
     if (this.backgroundRefreshTick) return
     const card = this.backgroundCard
-    if (!card) return
+    if (!card || this.migratingBackgroundCard) return
     const mode = config.runtime.live_elapsed
     const now = Date.now()
     let nextDelayMs = Infinity
@@ -4012,7 +4054,7 @@ export class Session {
   /** 节流刷新:合并 1.5s 窗口内的 task_progress 风暴,避免打爆 cardkit。
    *  事件触发的刷新走 full(summary + detail diff);档位 timer 只补耗时变化。 */
   private scheduleBackgroundRefresh(): void {
-    if (!this.backgroundCard) return
+    if (!this.backgroundCard || this.migratingBackgroundCard) return
     if (this.backgroundRefreshTimer) return
     this.backgroundRefreshTimer = setTimeout(() => {
       this.backgroundRefreshTimer = null
@@ -4027,6 +4069,7 @@ export class Session {
    *   ③ 更早的终态任务 → 折进单个 bg_fold 汇总 panel;成员签名变才 replaceElement
    *      (终态冻结,id 集即内容),不变则跳过。 */
   private refreshBackgroundCardFull(): void {
+    if (this.migratingBackgroundCard) return
     const handle = this.backgroundCard
     if (!handle) return
     const now = Date.now()
@@ -4139,6 +4182,16 @@ export class Session {
     detailOwner: Set<string>
     archiveOwner: cards.BgArchiveEntry[]
   }>): Promise<void> {
+    if (this.migratingBackgroundCard) {
+      try {
+        await this.migratingBackgroundCard
+      } catch (error) {
+        // stop/restart still owns the authoritative terminal cleanup. A failed
+        // migration must not poison that lifecycle; retry below against the
+        // retained handle and surface any final settle failure normally.
+        log(`session "${this.sessionName}": background migration failed before settle; retry terminal snapshot: ${messageOf(error)}`)
+      }
+    }
     const handle = snapshot?.handle ?? this.backgroundCard
     if (!handle || (snapshot?.lease && !this.ownsLifecycle(snapshot.lease))) return
     if (this.backgroundCard !== handle) return
@@ -4181,20 +4234,40 @@ export class Session {
 
   /** 游标迁移:发新主卡前调用。旧后台卡沉降 —— 有终态任务则成历史墓碑
    *  (backgroundHistoryCard),全活跃无终态则留固定标识(backgroundMigratedMarker)。
-   *  终态任务从 backgroundTasks 移除(已固化在旧卡),活跃任务保留待新卡重建。 */
-  private async migrateBackgroundCard(): Promise<void> {
+   *  终态任务从 backgroundTasks 移除(已固化在旧卡),活跃任务保留待新卡重建。
+   *  单飞:并发调用共享同一迁移 promise;迁移期间 refresh/settle 均不得对旧
+   *  元素树排队写入(上游 7c14677)。 */
+  private migrateBackgroundCard(): Promise<void> {
+    if (this.migratingBackgroundCard) return this.migratingBackgroundCard
     const handle = this.backgroundCard
-    if (!handle) return
+    if (!handle) return Promise.resolve()
+    const operation = this.performBackgroundCardMigration(handle)
+    let guarded!: Promise<void>
+    guarded = operation.finally(() => {
+      if (this.migratingBackgroundCard === guarded) this.migratingBackgroundCard = null
+    })
+    this.migratingBackgroundCard = guarded
+    return guarded
+  }
+
+  private async performBackgroundCardMigration(handle: { messageId: string; cardId: string }): Promise<void> {
+    if (this.backgroundCard !== handle) return
     if (this.backgroundRefreshTimer) {
       clearTimeout(this.backgroundRefreshTimer)
       this.backgroundRefreshTimer = null
     }
     this.stopBackgroundRefreshTick()
-    const terminalCount = this.backgroundTasks.filter(cards.isBgTerminal).length
     await cardkit.flush(handle.cardId)
+    if (this.backgroundCard !== handle) return
+    // Snapshot after queued panel writes drain. task_* events that arrive after
+    // this point stay in the live store and are rebuilt on the next card; only
+    // terminal entries actually painted into this history snapshot are removed.
+    const snapshot = [...this.backgroundTasks]
+    const terminalIds = new Set(snapshot.filter(cards.isBgTerminal).map(task => task.id))
+    const terminalCount = terminalIds.size
     if (terminalCount > 0) {
       // 有终态:旧卡成历史快照(backgroundHistoryCard 内部只渲染终态)。
-      await feishu.updateCard(handle.messageId, cards.backgroundHistoryCard(this.backgroundTasks))
+      await feishu.updateCard(handle.messageId, cards.backgroundHistoryCard(snapshot))
     } else {
       // 全活跃无终态:留固定标识。
       await feishu.updateCard(handle.messageId, cards.backgroundMigratedMarker())
@@ -4202,11 +4275,14 @@ export class Session {
     cardkit.cancelSummary(handle.cardId)
     await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({ suffix: '🧭 已迁移至新卡' }))
     await cardkit.dispose(handle.cardId)
-    this.backgroundCard = null
-    // 终态任务已固化在旧卡历史,从活跃跟踪移除;活跃任务保留(新卡重建时显示)。
-    // 移除前把 subagent 名片存档,供热续跑(不重发 task_started)复活。
-    this.bgArchive = cards.archiveTerminalAgents(this.bgArchive, this.backgroundTasks)
-    this.backgroundTasks = this.backgroundTasks.filter(t => !cards.isBgTerminal(t))
+    if (this.backgroundCard === handle) this.backgroundCard = null
+    // 只移除已画入历史快照的终态 entry;迁移窗口内新到的终态保留(新卡重建时
+    // 显示/沉降,不会未画先删)。移除前把 subagent 名片按快照存档,供热续跑
+    // (不重发 task_started)复活。
+    this.bgArchive = cards.archiveTerminalAgents(this.bgArchive, snapshot)
+    this.backgroundTasks = this.backgroundTasks.filter(t =>
+      !terminalIds.has(t.id) || !cards.isBgTerminal(t)
+    )
     this.backgroundDetailAdded.clear()
     this.backgroundFoldSig = null
     log(`session "${this.sessionName}": background card migrated cardId=${handle.cardId.slice(0, 12)} terminal=${terminalCount} active=${this.backgroundTasks.length}`)
@@ -4233,7 +4309,13 @@ export class Session {
       bootstrapDelivery
     ) return
 
-    const openingToken = this.beginTurnOpening()
+    let openingToken: object
+    try {
+      openingToken = this.beginTurnOpening()
+    } catch (error) {
+      log(`session "${this.sessionName}": scheduled turn-open ownership conflict: ${messageOf(error)}`)
+      return
+    }
     this.sawResultWhileOpening = false
     const preview = text.replace(/\s+/g, ' ').trim()
     this.lastTurnUserPreview = `⏰ ${preview.slice(0, 78)}`
@@ -4299,7 +4381,19 @@ export class Session {
       // open a fresh card whose top panel shows the queued messages.
       // currentTurn should be null at this point (result null'd it);
       // the openingTurn guard catches the eager-open vs init race.
-      if (this.currentTurn || this.openingTurn) return
+      // Eager/cold/drain paths open their card before feeding the SDK. Their
+      // init therefore arrives with currentTurn/openingTurn already set;
+      // consume the SDK-input claim here, but leave pending reactions alone
+      // because those belong to later daemon-buffered messages, not this open
+      // turn.(上游 7c14677:残留 claim 会让下一条 task-notification init 被
+      // 误判成 user batch,开出 trigger=user_message inputs=0 空卡)
+      if (this.currentTurn || this.openingTurn) {
+        if (this.pendingUserMessageCount > 0) {
+          log(`session "${this.sessionName}": SDK init claimed eager input pendingCount=${this.pendingUserMessageCount}`)
+          this.pendingUserMessageCount = 0
+        }
+        return
+      }
       const bootstrapDelivery = [this.pendingHumanDelivery, this.ackedHumanDelivery]
         .find(context => context?.proc === p && context.turn === null && context.state !== 'restored') ?? null
       const isUserBatch = this.pendingUserMessageCount > 0 || bootstrapDelivery !== null
@@ -4310,8 +4404,18 @@ export class Session {
       // 无关的空 init 不受影响。
       const isBgResume = !isUserBatch && this.bgResumePending
       if (!isUserBatch && !isBgResume) return
-      this.bgResumePending = false
       const userOpenId = this.lastUserOpenId
+      let openingToken: object
+      try {
+        openingToken = this.beginTurnOpening()
+      } catch (error) {
+        // Preserve pendingCount/bgResumePending/reactions so a later boundary
+        // can still claim this turn. An invariant violation is visible in logs
+        // but must not escape EventEmitter and tear down the whole SDK process.
+        log(`session "${this.sessionName}": init turn-open ownership conflict: ${messageOf(error)}`)
+        return
+      }
+      this.bgResumePending = false
       if (isUserBatch) {
         this.pendingUserMessageCount = 0
         // Inherit the queued reaction_ids — this turn is collectively
@@ -4322,7 +4426,6 @@ export class Session {
           this.pendingReactionIds = new Map()
         }
       }
-      const openingToken = this.beginTurnOpening()
       if (bootstrapDelivery) bootstrapDelivery.openingOwner = openingToken
       this.sawResultWhileOpening = false // 本次开卡的竞态标记,落地时判定
       void (async () => {
@@ -4421,6 +4524,15 @@ export class Session {
     })
     p.on('turn_started', (identity: { turn_id?: string | null; thread_id?: string | null }) => {
       if (this.proc !== p) return
+      // Codex app-server emits init only at process startup, not for every
+      // turn — turn_started is its authoritative claim for an input that was
+      // already given an eager-opened card。claude 冷启动首轮的 init 先于
+      // dispatch 到达(claim 当时还是 0),也靠这里认领。Claude 通常已在上面的
+      // init 边界消费;this is an idempotent second boundary.(上游 7c14677)
+      if ((this.currentTurn || this.openingTurn) && this.pendingUserMessageCount > 0) {
+        log(`session "${this.sessionName}": turn_started claimed eager input pendingCount=${this.pendingUserMessageCount}`)
+        this.pendingUserMessageCount = 0
+      }
       this.persistResumableSessionId(p)
       const threadId = typeof identity?.thread_id === 'string' ? identity.thread_id : p.sessionId
       const turnId = typeof identity?.turn_id === 'string' ? identity.turn_id : null
@@ -5101,23 +5213,39 @@ export class Session {
     lease: LifecycleLease
     recovery: PreservedWatchdogRecovery
   }): Promise<MidTurnDrainOutcome> {
-    if (
-      ownership &&
-      (
-        !this.ownsPreservedWatchdogRecovery(ownership.recovery, ownership.lease) ||
-        this.proc !== ownership.proc ||
-        ownership.proc.provider !== ownership.recovery.provider ||
-        ownership.proc.sessionId !== ownership.recovery.threadId
+    const validOwnership = (): boolean =>
+      !ownership || (
+        this.ownsPreservedWatchdogRecovery(ownership.recovery, ownership.lease) &&
+        this.proc === ownership.proc &&
+        ownership.proc.provider === ownership.recovery.provider &&
+        ownership.proc.sessionId === ownership.recovery.threadId
       )
-    ) return 'preserved'
+    if (!validOwnership()) return 'preserved'
     if (this.pendingMidTurnMsgs.length === 0) return 'no_batch'
     const proc = this.proc
     if (!proc?.isAlive()) return 'preserved'
+    // A result may arrive while a bg-resume/scheduled card is still opening
+    // and ask us to drain a user message buffered mid-window. Never replace
+    // that owner: wait until it has attached+closed its own orphan output,
+    // then open the user batch as a distinct turn.(上游 7c14677 单飞)
+    if (!await this.waitForTurnOpenSlot(proc)) return 'preserved'
+    if (!validOwnership()) return 'preserved'
+    if (this.currentTurn) return 'preserved'
+    if (this.pendingMidTurnMsgs.length === 0) return 'no_batch'
     const batch = this.pendingMidTurnMsgs
     this.pendingMidTurnMsgs = []
     const delivery = this.beginHumanDelivery(proc, batch, null)
     if (!delivery) return 'preserved'
-    const openingToken = this.beginTurnOpening()
+    let openingToken: object
+    try {
+      openingToken = this.beginTurnOpening()
+    } catch (error) {
+      // Should be unreachable after waitForTurnOpenSlot, but an invariant
+      // violation must never silently delete user input.
+      log(`session "${this.sessionName}": mid-turn open ownership conflict: ${messageOf(error)}`)
+      this.restoreHumanDelivery(delivery)
+      return 'preserved'
+    }
     delivery.openingOwner = openingToken
     try {
       // daemon-side panel state; wire delivery is one joined SDK input.
@@ -5194,6 +5322,9 @@ export class Session {
           !this.watchdogActionProcessMatches(transaction, proc)
         ) return 'stale'
         if (this.pendingMidTurnMsgs.length > 0) {
+          // 恢复卡已关闭,本次 open 事务在此结束 —— 先释放 owner 再 drain,
+          // 否则单飞 waitForTurnOpenSlot 会等在调用方自己身上(自锁)。
+          this.finishTurnOpening(openingToken)
           let drainOutcome: MidTurnDrainOutcome = 'preserved'
           try {
             recovery.phase = 'draining'
@@ -5739,6 +5870,19 @@ export class Session {
     }
   }
 
+  /** A successful background migration sets a rebuild receipt that is normally
+   * consumed after the new main card lands. If that main card cannot be sent or
+   * converted, rebuild immediately so active/late-terminal tasks do not remain
+   * cardless until some unrelated future event.(上游 7c14677) */
+  private rebuildBackgroundAfterTurnOpenFailure(): void {
+    if (!this.pendingRebuildBackgroundCard) return
+    this.pendingRebuildBackgroundCard = false
+    if (this.backgroundTasks.length === 0) return
+    void this.openBackgroundCard().catch(error => {
+      log(`session "${this.sessionName}": background rebuild after turn-open failure failed: ${messageOf(error)}`)
+    })
+  }
+
   private async openTurnCard(
     userOpenId: string,
     trigger: TurnState['trigger'],
@@ -5879,6 +6023,7 @@ export class Session {
         return { kind: 'stale' }
       }
       this.finishWatchdogOpening(watchdogOpeningTurnCounter, true, watchdogOpeningProc, openingToken)
+      this.rebuildBackgroundAfterTurnOpenFailure()
       // currentTurn left null as the failure signal. Caller decides
       // whether to sendInterrupt: onUserMessage's eager-open path
       // hasn't fed SDK yet so doesn't need to; the init handler has
@@ -5899,6 +6044,7 @@ export class Session {
         return { kind: 'stale' }
       }
       this.finishWatchdogOpening(watchdogOpeningTurnCounter, true, watchdogOpeningProc, openingToken)
+      this.rebuildBackgroundAfterTurnOpenFailure()
       log(`session "${this.sessionName}": id_convert failed: ${e}`)
       return { kind: 'failed' }
     }
@@ -5987,10 +6133,15 @@ export class Session {
       this.appendAssistant(orphan)
       this.finalizeCurrentAssistantSegment()
     }
-    // 主卡落地 → 若刚迁移过旧后台卡且仍有活跃任务,重建后台卡重回末尾。
+    // 主卡落地 → 若刚迁移过旧后台卡且仍有任务(含迁移窗口内新终态,须补墓碑),
+    // 重建后台卡重回末尾(重建卡全终态时 openBackgroundCard 落地后自沉降)。
     if (this.pendingRebuildBackgroundCard) {
       this.pendingRebuildBackgroundCard = false
-      if (cards.hasActiveBgTask(this.backgroundTasks)) void this.openBackgroundCard()
+      if (this.backgroundTasks.length > 0) {
+        void this.openBackgroundCard().catch(e => {
+          log(`session "${this.sessionName}": background rebuild failed: ${messageOf(e)}`)
+        })
+      }
     }
     return { kind: 'opened', turn: turnState }
   }
