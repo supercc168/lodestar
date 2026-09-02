@@ -9678,6 +9678,87 @@ describe('Session SDK-initiated bg-task resume turns', () => {
   })
 })
 
+describe('Session Claude SDK Cron 定时唤醒巡检卡(上游 7c14677 主题 A)', () => {
+  // cron prompt 由 SDK 自主注入,不走 daemon sendUserText:没有 pending input
+  // claim,也没有 daemon 开的卡。scheduled_turn_input 到达即认领开卡,否则整轮
+  // 巡检输出会被 appendAssistant 静默丢弃(与 bg-resume 恢复轮同型风险)。
+  async function waitFor(cond: () => boolean, ms = 2000): Promise<void> {
+    const t0 = Date.now()
+    while (!cond()) {
+      if (Date.now() - t0 > ms) throw new Error('waitFor timeout')
+      await new Promise(resolve => setTimeout(resolve, 5))
+    }
+  }
+
+  function wiredClaudeSession(): { session: any; proc: any } {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    proc.emit('init', { session_id: 'claude-session-1' }) // boot init,无用户批次不开卡
+    return { session, proc }
+  }
+
+  test('scheduled_turn_input 到达空闲 session → 开 scheduled_wakeup 巡检卡', async () => {
+    const { session, proc } = wiredClaudeSession()
+    expect(session.currentTurn).toBeNull()
+
+    proc.emit('scheduled_turn_input', { text: '巡检:扫描任务清单待办', promptId: 'cron-1' })
+    await waitFor(() => session.currentTurn !== null)
+
+    try {
+      expect(session.currentTurn.trigger).toBe('scheduled_wakeup')
+      expect(session.status).toBe('working')
+      expect(sentCards.some(card => JSON.stringify(card).includes('⏰ 定时任务触发'))).toBe(true)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose(session.currentTurn.cardId)
+    }
+  })
+
+  test('已有活跃 turn 时不开第二张卡(SDK 已把 prompt 并入该轮)', async () => {
+    const { session, proc } = wiredClaudeSession()
+    session.currentTurn = turnState('card_sched_guard', { provider: 'claude', model: 'claude:glm', usageSource: 'glm' })
+    const cardsBefore = sentCards.length
+
+    proc.emit('scheduled_turn_input', { text: '巡检 prompt', promptId: 'cron-2' })
+    await new Promise(resolve => setTimeout(resolve, 30))
+
+    expect(sentCards.length).toBe(cardsBefore)
+    expect(session.currentTurn.cardId).toBe('card_sched_guard')
+    expect(session.openingTurn).toBe(false)
+  })
+
+  test('pendingUserMessageCount>0(用户输入待认领)不开巡检卡', async () => {
+    const { session, proc } = wiredClaudeSession()
+    session.pendingUserMessageCount = 1
+    const cardsBefore = sentCards.length
+
+    proc.emit('scheduled_turn_input', { text: '巡检 prompt', promptId: null })
+    await new Promise(resolve => setTimeout(resolve, 30))
+
+    expect(sentCards.length).toBe(cardsBefore)
+    expect(session.currentTurn).toBeNull()
+    expect(session.openingTurn).toBe(false)
+  })
+
+  test('codex 进程的 scheduled_turn_input 不响应(Claude SDK 专属事件)', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-sched-1')
+    session.proc = proc
+    session.selectedProvider = 'codex'
+    session.wireProc(proc)
+    const cardsBefore = sentCards.length
+
+    proc.emit('scheduled_turn_input', { text: '不该响应', promptId: null })
+    await new Promise(resolve => setTimeout(resolve, 30))
+
+    expect(sentCards.length).toBe(cardsBefore)
+    expect(session.currentTurn).toBeNull()
+  })
+})
+
 describe('Session claude 子 agent 工具调用不上主卡(上游 89a04d7)', () => {
   // 对齐 codex 侧 isSubagentThread 分流(cf41941):claude 子 agent 的工具调用按
   // parentToolUseId 归属后台 task,只累积进 steps(后台卡展开可见),不上主卡
