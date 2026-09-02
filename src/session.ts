@@ -6364,6 +6364,13 @@ export class Session {
           },
           () => this.onCardWriteSuccess(newCardId),
         )
+        // 先让旧卡上已经登记的 assistant raw 写入定局，再读取 deadElements、
+        // 迁移失败段和 drain mathRenderInflight。rotating 期间 finalize 会早退，
+        // 不会再新增旧卡 completed write；这一轮 drain 足以封住 swap 竞态。
+        const oldAssistantWrites = turn.assistantWriteInflight?.get(oldCardId)
+        if (oldAssistantWrites?.size) {
+          await Promise.allSettled([...oldAssistantWrites])
+        }
         // 同步 swap：从这一行起,后续 stream handler 看到的 turn.cardId
         // 是新卡。reset 所有 element-id 引用 (toolCount / assistantSegmentCount
         // 等),旧卡上的 element_id 在新卡里查不到,继续 PUT 会 300313。
@@ -6437,10 +6444,9 @@ export class Session {
           const ri = turn.assistantSegmentCount++
           const reSegId = cards.ELEMENTS.assistant(ri)
           turn.segmentTexts.set(reSegId, fullText)
-          void cardkit.addElement(newCardId, this.completedAssistantElement(reSegId, fullText), {
-            type: 'insert_before',
-            targetElementId: sessionTools.taskLiveAnchor(turn),
-          })
+          // 与主路径共用 checked 原文写入 + 原子公式替换；保留 task board
+          // 和其他双后端轮转状态，不在这里复制一套公式事务。
+          await this.addCompletedAssistantSegment(turn, reSegId, fullText)
         }
         // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read/Edit 批次切开重建。
         sessionTools.rebuildToolsOnRotate(this, oldCardId, newCardId, oldToolByUseId, oldBatches)
@@ -6457,12 +6463,22 @@ export class Session {
         // 是因为这条链是 async,期间 cardkit 队列上还可能有 add/replace 等;
         // 让它们排在 footer 之前,视觉更连贯。
         try {
+          // 旧卡 inflight 公式渲染先 drain(渲染 promise 只写捕获的
+          // oldCardId,不会碰新卡)—— 不等的话下面原文 replace 会覆盖
+          // 还没落地的渲染版,渲染晚到再写已被 dispose 拒绝(review #2)。
+          const oldInflight = turn.mathRenderInflight?.get(oldCardId)
+          if (oldInflight?.size) {
+            await Promise.allSettled([...oldInflight])
+          }
           await cardkit.flush(oldCardId)
           // 旧卡上已完成的 assistant 段做最终替换。当前迁移中的半段尚未
-          // 插入旧卡,直接跳过,避免同一段同时出现在两张卡上。
+          // 插入旧卡,直接跳过,避免同一段同时出现在两张卡上。已渲染段
+          // 跳过 —— 原文重渲会把渲染版覆盖回 $$…$$ 降级(review #2)。
+          const oldRendered = turn.mathRendered?.get(oldCardId)
           for (const [segId, fullText] of oldSegmentTexts) {
             if (carrySegId && carryText && segId === carrySegId) continue
             if (cardkit.isDeadElement(oldCardId, segId)) continue
+            if (oldRendered?.has(segId)) continue
             await cardkit.replaceElement(oldCardId, segId, this.completedAssistantElement(segId, fullText))
           }
           const compactNote = turn.contextCompactCount > 0
