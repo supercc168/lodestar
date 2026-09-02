@@ -12,6 +12,7 @@
 | `elements.ts` | 集中定义卡片 `element_id` 命名约定，例如 `user_input`、`footer`、`model_panel`、`tasklist_panel`、`tool_<i>`、`assistant_<i>`。 |
 | `turn.ts` | 对话主卡、assistant 分段、计划/目标/上下文压缩元素和 AskUserQuestion 面板；工具相关导出从 `tool.ts` 兼容 re-export。 |
 | `tool.ts` | 工具折叠面板、权限按钮、Read / Edit 批次面板，以及 Bash/FileChange/WebSearch/MCP/Image/Agent 等工具输入/输出摘要。 |
+| `shell-command.ts` | 命令展示解析唯一实现：统一解析 Bash / PowerShell / 引号包装命令首行 `# desc`(desc 变体前缀提取 + sh -c/统一 exec 引号/PowerShell 包装剥离)，`tool.ts` 与 `background.ts` 共用；导出 `stripQuotes`/`shellCommandPresentation`/`shellCommandDescription`。 |
 | `task-board.ts` | Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板。codex 的 TodoWrite 一次就带完整列表,但 Claude Code 拆成 4 个单点工具,这里维护一份以 task id 为 key 的 board(`applyTaskTool` 跨调用累积),`taskBoardElement` 渲染整个板产出与 codex 一致的列表效果。board 由 `session-tools.ts` 在 Session 级持有。 |
 | `agy.ts` | `agy <prompt>` 任务卡片，渲染 prompt、状态统计、执行结果、仓库变更和转发 Codex 按钮。 |
 | `format.ts` | 共享时长格式化：终态用 `fmtElapsed`(ms → `45s`/`2m13s`/`1h5m`)；活跃卡用 `liveElapsed(ms, mode)` / `elapsedBucket` 返回标签与下一刷新延迟。`mode` 来自 config `[runtime].live_elapsed`：`bucket`(默认粗档位) 或 `second`(按秒)。 |
@@ -22,6 +23,7 @@
 | `background.ts` | SDK `task_*` 消息族(子 agent / 后台 bash / MCP / workflow)的状态累积 + 「后台游标卡」渲染:active/pending 双池(workflow/monitor 白名单 task_started 直入 active,其余前台 task 进 pending,对话推进时提升),吸附对话末尾,被新消息超越时沉降为历史快照,全终态固化留在原地。 |
 | `temp.ts` | 临时会话 `fk`/`bk`/`rs` 卡片:`fk`/`bk` 的用户输入(turn 锚点)列表卡、`rs` 空闲模式的项目最近会话列表卡、`bk` 回滚后的 Write 记录卡;按钮 `value.kind`(`temp_fork_select`/`temp_back_select`/`temp_resume_select`)在 `daemon.ts` `handleCardAction` 里 dispatch。 |
 | `turn.test.ts` | Bun 测试，覆盖 turn card、模型选择、工具摘要、权限元素和 console/status card 的关键渲染。 |
+| `shell-command.test.ts` | Bun 测试，穷举 shell-command 解析用例：desc 变体前缀/引号转义(`''` 还原)/PowerShell 旗标与正斜杠路径/非 PowerShell 不误剥/多行前置行回退取尾行(纯函数零宿主依赖)。 |
 | `agy.test.ts` | Bun 测试，覆盖 agy 卡片结构、状态行、输出清理、仓库摘要和转发按钮。 |
 | `worktree.test.ts` | Bun 测试，覆盖 `wt` 卡片的归档隐藏和状态排序。 |
 | `task.test.ts` | Bun 测试，覆盖 `task` 面板未启用、已启用和删除确认状态。 |
@@ -41,7 +43,7 @@
 - 保持 schema 2.0 JSON 结构清晰，所有共享 `element_id` 都从 `ELEMENTS` 取值，避免手写重复 ID。
 - 工具摘要和工具面板渲染集中在 `tool.ts`；新增工具类型时先更新摘要/正文渲染，再在 session 工具流程中接线。
 - 模型选择卡使用单个可替换的 `model_panel`，流程是模型列表面板 → effort 面板 → 成功结果面板。
-- Bash 工具摘要会解析第一行 shell 注释里的 `desc` / `说明`；修改这段逻辑会影响飞书卡片中 shell 命令的可读性。
+- Bash 工具摘要会解析第一行 shell 注释里的 `desc` / `说明`；解析唯一实现在 `shell-command.ts`(`tool.ts` 主卡面板与 `background.ts` 后台卡 steps/Codex 子 agent 简报共用)，修改解析逻辑去 `shell-command.ts` 而非 tool.ts 内联；变更会影响飞书卡片中 shell 命令的可读性。
 - 控制台卡片中的 usage、context window、host info 都是传入快照的格式化结果，不要在卡片模板里发起网络或系统调用。
 - `worktree.ts` 的列表卡要优先适配手机宽度，按钮文本保持短，避免把操作按钮藏进折叠面板；已合并且未挂载的分支只放入归档摘要。
 - `agy.ts` 卡片风格要和既有卡片一致：prompt 折叠标题固定为 `📥 agy收到`，状态保持单行，结果正文不折叠，转发按钮放在结果后，按钮文案尽量短。
