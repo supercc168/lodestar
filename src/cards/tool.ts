@@ -5,6 +5,7 @@
 
 import { isAbsolute, relative } from 'node:path'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
+import { shellCommandPresentation, shellCommandDescription } from './shell-command'
 
 function isBashCommandTool(name: string): boolean {
   return name === 'Bash' || name === 'exec_command' || name.endsWith('.exec_command')
@@ -145,14 +146,9 @@ function summarizeBashInput(input: any): string {
   const oneLine = command.replace(/\s+/g, ' ')
   const lines = command.split(/\r?\n/).map(line => line.trim()).filter(Boolean)
   if (lines.length <= 1) return truncate(oneLine, 80)
-  const firstMeaningful = lines.find(line =>
-    !line.startsWith('#') &&
-    !/^set\s+-/.test(line) &&
-    !/^cd\s+/.test(line) &&
-    !/^[A-Za-z_][A-Za-z0-9_]*=/.test(line) &&
-    !/^cat\s+<<['"]?\w+['"]?/.test(line)
-  ) ?? lines[0]
-  return `Shell 脚本 · ${lines.length} 行 · ${truncate(firstMeaningful, 46)}`
+  // 多行:Shell 脚本 + 首条有效命令(与后台卡/子 agent 的
+  // shellCommandDescription 回退同构,各 surface 格式一致)。
+  return `Shell 脚本 · ${lines.length} 行 · ${truncate(shellCommandDescription(command), 46)}`
 }
 
 function shellSessionAction(input: any): string {
@@ -169,49 +165,11 @@ function summarizeShellSessionInput(input: any): string {
 }
 
 function bashPresentation(input: any): { description: string; command: string } {
-  const rawCommand = unwrapShellCommand(String(input?.command ?? input?.cmd ?? input?.script ?? ''))
-  const firstLine = rawCommand.split('\n', 1)[0]?.trim() ?? ''
-  const comment = firstLine.startsWith('#') && !firstLine.startsWith('#!')
-    ? firstLine.replace(/^#\s*/, '').trim()
-    : ''
-  const commentDesc = comment.replace(/^(?:desc|dec|description|说明|目的|用途)\s*[:：]\s*/i, '').trim()
-  const command = commentDesc
-    ? rawCommand.split('\n').slice(1).join('\n').trimStart()
-    : rawCommand
+  const rawCommand = String(input?.command ?? input?.cmd ?? input?.script ?? '')
   const explicit = String(input?.description ?? input?.reason ?? '').trim()
-  return { description: commentDesc || explicit, command: command || rawCommand }
-}
-
-function unwrapShellCommand(command: string): string {
-  const normalized = command.replace(/\r\n/g, '\n').trim()
-  const shell = normalized.match(/^(?:\/usr\/bin\/env\s+)?(?:\/[\w./-]+\/)?(?:ba|z|fi)?sh\s+-[A-Za-z]*c[A-Za-z]*\s+([\s\S]+)$/)
-  if (!shell) return unwrapQuotedDescCommand(normalized)
-  const inner = stripShellArgQuotes(shell[1])
-  return unwrapQuotedDescCommand(inner || normalized)
-}
-
-function stripShellArgQuotes(arg: string): string {
-  const s = arg.trim()
-  if (s.length < 2) return s
-  const pairs: Record<string, string> = { '"': '"', "'": "'", '“': '”' }
-  const close = pairs[s[0]]
-  if (!close || !s.endsWith(close)) return s
-  const body = s.slice(1, -1)
-  if (s[0] === "'") return body.replace(/'\\''/g, "'")
-  return body.replace(/\\(["\\$`])/g, '$1').replace(/\\n/g, '\n')
-}
-
-function unwrapQuotedDescCommand(command: string): string {
-  const s = command.trim()
-  const quote = s[0]
-  if (quote !== '"' && quote !== "'" && quote !== '“') return s
-  const body = s.slice(1)
-  if (!/^#\s*(?:desc|dec|description|说明|目的|用途)\s*[:：]/i.test(body)) return s
-  if (quote !== '"') return body
-  return body
-    .replace(/\\(["\\$`])/g, '$1')
-    .replace(/\\n/g, '\n')
-    .replace(/\s*"\s*'\$\(([^)]*)\)'/g, (_m, inner) => ` $(${inner})`)
+  // desc 注释 / 包装剥离统一走 shell-command 模块,与后台卡、子 agent 简报共用一份解析。
+  const info = shellCommandPresentation(rawCommand)
+  return { description: info.description || explicit, command: info.command }
 }
 
 function fenceBlock(text: string, lang = ''): string {

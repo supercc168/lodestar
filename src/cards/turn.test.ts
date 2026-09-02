@@ -809,6 +809,77 @@ describe('bash-like tool card rendering', () => {
     expect(body).not.toContain('"\'$(git ls-files)\'')
   })
 
+  test('unwraps Windows PowerShell-wrapped desc commands', () => {
+    const input = {
+      command: '"C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe" -Command "# desc: 读取代码库索引技能的完整操作说明\nGet-Content -LiteralPath \'C:\\Users\\maoxiandao2\\.codex\\skills\\codebase-index\\SKILL.md\' -Raw"',
+      cwd: 'C:\\Users\\maoxiandao2\\repo',
+      source: 'unifiedExecStartup',
+    }
+
+    expect(summarizeToolInput('Bash', input)).toBe('读取代码库索引技能的完整操作说明')
+
+    const el = toolCallElement(0, 'Bash', input, null, '✅') as any
+    const body = el.elements[0].content
+
+    expect(el.header.title.content).toBe('✅ 🔧 Bash: 读取代码库索引技能的完整操作说明')
+    expect(body).toContain('**标题**: 读取代码库索引技能的完整操作说明')
+    expect(body).toContain('**状态**: 执行中')
+    expect(body).toContain('命令与输出已隐藏')
+    expect(body).not.toContain('Get-Content')
+    expect(body).not.toContain('powershell.exe')
+    expect(body).not.toContain('# desc:')
+  })
+
+  test('unwraps pwsh with profile-suppression flags', () => {
+    const input = {
+      command: '"C:\\Program Files\\PowerShell\\7\\pwsh.exe" -NoProfile -ExecutionPolicy Bypass -Command "# desc: 拉取远端最新提交\ngit fetch --all --prune"',
+      cwd: 'C:\\repo',
+    }
+
+    expect(summarizeToolInput('exec_command', input)).toBe('拉取远端最新提交')
+
+    const el = toolCallElement(1, 'exec_command', input, null, '✅') as any
+    const body = el.elements[0].content
+    expect(body).toContain('**状态**: 执行中')
+    expect(body).toContain('命令与输出已隐藏')
+    expect(body).not.toContain('git fetch --all --prune')
+    expect(body).not.toContain('pwsh.exe')
+  })
+
+  test('unwraps unquoted powershell.exe wrapper', () => {
+    const input = {
+      command: 'powershell.exe -Command "# desc: 查看端口占用\nnetstat -ano | findstr :8080"',
+      cwd: 'C:\\repo',
+    }
+
+    expect(summarizeToolInput('Bash', input)).toBe('查看端口占用')
+    const el = toolCallElement(2, 'Bash', input, null, '✅') as any
+    const body = el.elements[0].content
+    expect(body).toContain('**状态**: 执行中')
+    expect(body).toContain('命令与输出已隐藏')
+    expect(body).not.toContain('netstat -ano')
+  })
+
+  test('unwraps single-quoted PowerShell exe and command', () => {
+    const input = {
+      command: "'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -Command '# desc: 查看 xyq 项目里的鼠标模板、任务和当前数据目录状态\nGet-ChildItem \"C:\\Users\\maoxiandao2\\xyq\\templates\" -Recurse'",
+      cwd: 'C:\\Users\\maoxiandao2\\xyq',
+    }
+
+    expect(summarizeToolInput('Bash', input)).toBe('查看 xyq 项目里的鼠标模板、任务和当前数据目录状态')
+
+    const el = toolCallElement(0, 'Bash', input, null, '✅') as any
+    const body = el.elements[0].content
+
+    expect(el.header.title.content).toBe('✅ 🔧 Bash: 查看 xyq 项目里的鼠标模板、任务和当前数据目录状态')
+    expect(body).toContain('**标题**: 查看 xyq 项目里的鼠标模板、任务和当前数据目录状态')
+    expect(body).toContain('**状态**: 执行中')
+    expect(body).toContain('命令与输出已隐藏')
+    expect(body).not.toContain('Get-ChildItem')
+    expect(body).not.toContain('powershell.exe')
+    expect(body).not.toContain('# desc:')
+  })
+
   test('renders write_stdin shell session polling as Bash', () => {
     const input = {
       session_id: 97146,
