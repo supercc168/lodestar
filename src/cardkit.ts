@@ -19,6 +19,7 @@ import { log } from './log'
 import { neutralizeMarkdownImagesInCard } from './cards/elements'
 
 const BASE = 'https://open.feishu.cn/open-apis/cardkit/v1'
+const CARDKIT_FETCH_TIMEOUT_MS = 15_000
 
 const ID_CONVERT_RETRY_DELAYS_MS = [0, 250, 750, 1500]
 /** Transient transport failures (TypeError: fetch failed / ECONNRESET / …)
@@ -59,6 +60,8 @@ interface CardState {
    * keep hammering the unwritable card (2026-07-04: 663 × code=300308 in
    * 11 minutes against one dead card). */
   writeDead?: boolean
+  /** Synchronous enqueue gate set by dispose before draining the queue. */
+  closing?: boolean
   /** Card-level write-failure callback, set by recordCardCreated. Invoked
    * by any cardkit write op that fails even after the streaming-closed
    * reopen+retry (and network retries); the session uses it to decide
@@ -239,12 +242,16 @@ export function recordCardCreated(
   onSuccess?: () => void,
 ): void {
   // 新生命周期开始:同 id 重建(测试复用固定 card id / 飞书同 id 再开卡)
-  // 时清除 disposed 墓碑,恢复可写。
+  // 时清除 disposed 墓碑并整体丢弃旧 state(deadElements/writeDead/closing
+  // 不跨生命周期残留),恢复可写。
   disposedCards.delete(cardId)
+  cards.delete(cardId)
   const s = state(cardId)
   s.elementCount = initialElementCount
   s.onFailure = onFailure
   s.onSuccess = onSuccess
+  s.writeDead = false
+  s.closing = false
 }
 
 /** Read the live element count maintained by addElement/deleteElement.
@@ -274,7 +281,10 @@ export function clearDeadElementForReconcile(cardId: string, elementId: string):
  * enqueues and already-queued tasks that haven't reached the wire yet
  * (each op re-checks the flag when it runs). */
 export function markCardWriteDead(cardId: string): void {
-  state(cardId).writeDead = true
+  if (disposedCards.has(cardId)) return
+  const s = state(cardId)
+  if (s.closing) return
+  s.writeDead = true
   cancelSummary(cardId)
 }
 
@@ -294,6 +304,7 @@ async function call(method: string, path: string, body?: object): Promise<any> {
     method,
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     ...(body ? { body: JSON.stringify(body) } : {}),
+    signal: AbortSignal.timeout(CARDKIT_FETCH_TIMEOUT_MS),
   })
   const json = await res.json() as any
   if (!res.ok || json?.code !== 0) {
@@ -531,7 +542,7 @@ export function addElement(
   // 误建全新 bookkeeping(sequence 归零)并对已关流的卡发真实 HTTP。
   if (disposedCards.has(cardId)) return Promise.resolve()
   const s = state(cardId)
-  if (s.writeDead) return Promise.resolve()
+  if (s.closing || s.writeDead) return Promise.resolve()
   const safeElement = neutralizeMarkdownImagesInCard(element)
   const elementId = (safeElement as { element_id?: string }).element_id
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
@@ -593,7 +604,7 @@ export function replaceElement(
   // terminal footer writers can fall back to raw text. notifyCardFailure
   // false 让对账类 probe PUT(duplicate-id reconcile)也不上抬(上游 4185808)。
   const elevateCardFailure = elementId !== FOOTER_ELEMENT_ID && opts.notifyCardFailure !== false
-  if (s.writeDead || s.deadElements.has(elementId)) {
+  if (s.closing || s.writeDead || s.deadElements.has(elementId)) {
     onFailure?.()
     return Promise.resolve()
   }
@@ -630,7 +641,7 @@ export async function replaceElementChecked(
 ): Promise<boolean> {
   if (disposedCards.has(cardId)) return false
   const s = state(cardId)
-  if (s.writeDead || s.deadElements.has(elementId)) return false
+  if (s.closing || s.writeDead || s.deadElements.has(elementId)) return false
   let failed = false
   await replaceElement(
     cardId,
@@ -657,7 +668,7 @@ export async function addElementResult(
 ): Promise<CardWriteResult> {
   if (disposedCards.has(cardId)) return { landed: false }
   const s = state(cardId)
-  if (s.writeDead) return { landed: false }
+  if (s.closing || s.writeDead) return { landed: false }
   const elementId = (element as { element_id?: string }).element_id
   let failure: CardWriteFailure | undefined
   await addElement(cardId, element, opts, (_code, meta) => { failure = meta?.failure })
@@ -668,10 +679,14 @@ export async function addElementResult(
 }
 
 /** Delete an element by id. */
-export function deleteElement(cardId: string, elementId: string): Promise<void> {
+export function deleteElement(
+  cardId: string,
+  elementId: string,
+  onFailure?: CardWriteFailureHandler,
+): Promise<void> {
   if (disposedCards.has(cardId)) return Promise.resolve()
   const s = state(cardId)
-  if (s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
+  if (s.closing || s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `deleteElement ${elementId}`,
@@ -684,10 +699,20 @@ export function deleteElement(cardId: string, elementId: string): Promise<void> 
       s.elementCount = Math.max(0, s.elementCount - 1)
       markElementDead(s, elementId)
     },
-    undefined,
+    onFailure,
     { silent: true, meta: { elementId } },
   ))
   return s.queue
+}
+
+export async function deleteElementChecked(cardId: string, elementId: string): Promise<boolean> {
+  if (disposedCards.has(cardId)) return false
+  const s = state(cardId)
+  if (s.closing || s.writeDead) return false
+  if (s.deadElements.has(elementId)) return true
+  let failed = false
+  await deleteElement(cardId, elementId, () => { failed = true })
+  return !failed && s.deadElements.has(elementId)
 }
 
 /** Throttled card-summary update. The summary text is what Feishu shows
@@ -696,7 +721,7 @@ export function deleteElement(cardId: string, elementId: string): Promise<void> 
  * the settings-PATCH endpoint. Whitespace is collapsed and the input
  * is trimmed; empty content is ignored. */
 export function patchSummaryThrottled(cardId: string, content: string): void {
-  if (disposedCards.has(cardId) || cards.get(cardId)?.writeDead) return
+  if (disposedCards.has(cardId) || cards.get(cardId)?.closing || cards.get(cardId)?.writeDead) return
   const trimmed = (content ?? '').replace(/\s+/g, ' ').trim()
   if (!trimmed) return
   let s = summaryStates.get(cardId)
@@ -768,7 +793,7 @@ export async function patchSettingsChecked(
 ): Promise<boolean> {
   if (disposedCards.has(cardId)) return false
   const s = state(cardId)
-  if (s.writeDead) {
+  if (s.closing || s.writeDead) {
     onFailure?.()
     return false
   }
@@ -808,9 +833,15 @@ export async function dispose(cardId: string): Promise<void> {
     cancelSummary(cardId)
     return
   }
-  await flush(cardId)
-  await s.queue
-  cards.delete(cardId)
-  rememberDisposedCard(cardId)
+  if (s.closing) {
+    await s.queue
+    return
+  }
+  // Close the enqueue gate synchronously. Operations already in s.queue are
+  // allowed to finish; later callers observe closing and cannot extend it.
+  s.closing = true
   cancelSummary(cardId)
+  await s.queue
+  rememberDisposedCard(cardId)
+  cards.delete(cardId)
 }
