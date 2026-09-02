@@ -135,6 +135,23 @@ export interface TurnState {
   // [[send: /path]] markers and replace each segment with a cleaned
   // version, then post the files as separate Feishu messages.
   segmentTexts: Map<string, string>
+  /** Per-card assistant raw-write tasks. A stream handler registers the task
+   * synchronously before returning; turn close drains it before inspecting
+   * dead elements or math-render tasks, so a just-completed segment cannot
+   * start rendering after the card was disposed. */
+  assistantWriteInflight?: Map<string, Set<Promise<boolean>>>
+  /** Per-card: segments already replaced by math rendering (stripped text +
+   *  inserted formula imgs). Final re-render passes (turn close / rotation
+   *  old-card close) must skip these — re-replacing from raw text would
+   *  clobber the rendered version back to degraded $$…$$ source. Keyed by
+   *  cardId because rotation renumbers segments: old-card rendered state
+   *  must not leak onto the fresh card (review #2). */
+  mathRendered?: Map<string, Set<string>>
+  /** Per-card in-flight math render promises. Turn close / rotation each
+   *  drain only their own card's renders before the final raw-text pass —
+   *  otherwise the raw replace wins the race, clobbers the not-yet-landed
+   *  rendered version, and the late render writes hit a disposed card. */
+  mathRenderInflight?: Map<string, Set<Promise<void>>>
   startedAt: number
   /** Footer phase timer. `Thinking` is model silence, `Writing` is buffered
    * assistant text, and `Working` is tool execution / visible non-text work. */

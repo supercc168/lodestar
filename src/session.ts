@@ -71,6 +71,7 @@ import {
 } from './context-window'
 import { extractAskUsrMarkers, extractSendMarkerPaths, normalizeOutboundPath, stripAskUsrMarkers } from './outbound-markers'
 import * as sessionMultimsg from './session-multimsg'
+import * as mathRender from './math-render'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionAgy from './session-agy'
 import * as sessionTools from './session-tools'
@@ -376,6 +377,10 @@ const CARD_ELEMENT_SOFT_LIMIT = 50
  * that itself exceeds the capacity ceiling. Network transport blips and
  * footer ticks never consume this budget (see onCardWriteFailure). */
 const MAX_MIDTURN_ROTATES = 5
+// Cap a single assistant markdown element so one giant block can't alone
+// push the card over Feishu's total size ceiling (200860). Excess stays in
+// daemon logs / transcript; the card keeps a readable head.
+const ASSISTANT_CARD_CHARS = 12_000
 /** Bounded tombstone map for compaction receipts (item/turn aliases). */
 const MAX_CONTEXT_COMPACTION_RECEIPTS = 256
 /** Coalescing window for an anonymous duplicate of a just-completed
@@ -7070,11 +7075,22 @@ export class Session {
     void feishu.sendText(this.chatId, `📄 后台轮输出(未能建卡,纯文本兜底):\n\n${display}`)
   }
 
+  /** 渲染路径准入的唯一真相源(开放问题 1 落锁):含公式且清洗后长度不超
+   *  ASSISTANT_CARD_CHARS(12k 截断上限)的段才走 column_set 渲染路径。
+   *  超长含公式段整体退回普通截断路径 —— 公式经 sanitize→
+   *  downgradeMathBlocksInProse 降级为代码块可见,不吞正文;渲染路径永不
+   *  服务超长段,否则 replace 会把截断版换回全量 column_set,破 200860
+   *  卡体积防线。completedAssistantElement 与 addCompletedAssistantSegment
+   *  两个决策点必须共用本谓词,不得各自内联判定。 */
+  private mathSegmentEligible(text: string): boolean {
+    return mathRender.hasMathSpans(text)
+      && this.cleanAssistantTextForDisplay(text).trim().length <= ASSISTANT_CARD_CHARS
+  }
+
   private completedAssistantElement(segId: string, text: string): object {
-    // Cap a single assistant markdown element so one giant block can't alone
-    // push the card over Feishu's total size ceiling (200860). Excess stays in
-    // daemon logs / transcript; the card keeps a readable head.
-    const ASSISTANT_CARD_CHARS = 12_000
+    if (this.mathSegmentEligible(text)) {
+      return this.mathAssistantContainer(segId, [{ type: 'markdown', text }])
+    }
     const cleaned = this.cleanAssistantTextForDisplay(text).trim()
     const content = cleaned.length > ASSISTANT_CARD_CHARS
       ? `${cleaned.slice(0, ASSISTANT_CARD_CHARS).trimEnd()}\n\n_…正文已截断（卡片体积限制），完整内容见日志。_`
@@ -7086,12 +7102,98 @@ export class Session {
     }
   }
 
-  private addCompletedAssistantSegment(turn: TurnState, segId: string, text: string): Promise<void> {
-    return cardkit.addElement(
-      turn.cardId,
-      this.completedAssistantElement(segId, text),
-      { type: 'insert_before', targetElementId: sessionTools.taskLiveAnchor(turn) },
+  /** 公式段从 raw 到 rendered 始终保持同一个顶层 column_set tag；内部
+   *  children 严格按源码顺序交错 markdown/img。这样一次 checked PUT 就能
+   *  原子完成 A→公式→B→公式→C，不再把所有图片堆到整段末尾。 */
+  private mathAssistantContainer(segId: string, blocks: mathRender.RenderedMathBlock[]): object {
+    const elements = blocks.map(block => block.type === 'markdown'
+      ? {
+          tag: 'markdown',
+          // 本地适配:markdown 子块与本地普通段同款清洗链(sanitize 含
+          // downgradeMathBlocksInProse / 外链图片降级 / HTML 转义)——raw 态
+          // $$…$$ 在子块上同样降级可见,01-11/01-12 图片中和与转义边界在
+          // 子块上继续成立。结构化 img 子块不经此链(cardkit 注入点 sanitize
+          // 只处理 tag==='markdown' 的 content,天然放行 tag:'img' 组件)。
+          content: cards.sanitizeMarkdownForCardKit(this.cleanAssistantTextForDisplay(block.text).trim()) || ' ',
+        }
+      : { ...block.element })
+    return {
+      tag: 'column_set',
+      element_id: segId,
+      flex_mode: 'none',
+      columns: [{
+        tag: 'column',
+        width: 'weighted',
+        weight: 1,
+        elements: elements.length ? elements : [{ tag: 'markdown', content: ' ' }],
+      }],
+    }
+  }
+
+  /** 把 raw column_set 原子替换成严格原位交错的 markdown/image 子元素链。
+   *  cardId 是调度时捕获的快照，不能在异步渲染后读取 turn.cardId。公式增强
+   *  失败不触发整卡轮转：raw LaTeX 已经可见，保留它并暴露日志即可。 */
+  private async replaceSegmentWithMathImgs(turn: TurnState, cardId: string, segId: string, text: string): Promise<void> {
+    const rendered = await mathRender.renderMathInText(text)
+    const okReplace = await cardkit.replaceElementChecked(
+      cardId,
+      segId,
+      this.mathAssistantContainer(segId, rendered.blocks),
+      { notifyCardFailure: false },
     )
+    if (!okReplace) {
+      log(`session "${this.sessionName}": math render ${segId} write dropped (card closed/element dead) — raw text stays`)
+      return
+    }
+
+    turn.mathRendered ??= new Map()
+    turn.mathRendered.get(cardId) ?? (turn.mathRendered.set(cardId, new Set()), undefined)
+    turn.mathRendered.get(cardId)!.add(segId)
+    log(`session "${this.sessionName}": math rendered ${segId} (${rendered.renderedImageCount} img, ${rendered.blocks.length} blocks)`)
+  }
+
+  private addCompletedAssistantSegment(turn: TurnState, segId: string, text: string): Promise<boolean> {
+    // 先确认原文容器真实落地，再启动公式渲染。checked 写入与公式 promise
+    // 都按 cardId 分组登记，close 会依次 drain，避免幽灵元素和 dispose 竞态。
+    const cardId = turn.cardId
+    const targetElementId = sessionTools.taskLiveAnchor(turn)
+    const write = (async (): Promise<boolean> => {
+      const added = await cardkit.addElementChecked(
+        cardId,
+        this.completedAssistantElement(segId, text),
+        { type: 'insert_before', targetElementId },
+      )
+      if (!added) {
+        log(`session "${this.sessionName}": assistant segment ${segId} raw write failed on card=${cardId}`)
+        return false
+      }
+
+      if (this.mathSegmentEligible(text)) {
+        const rp = this.replaceSegmentWithMathImgs(turn, cardId, segId, text)
+          .catch(e => log(`session "${this.sessionName}": math render ${segId} failed: ${e}`))
+        turn.mathRenderInflight ??= new Map()
+        turn.mathRenderInflight.get(cardId) ?? (turn.mathRenderInflight.set(cardId, new Set()), undefined)
+        turn.mathRenderInflight.get(cardId)!.add(rp)
+        void rp.finally(() => turn.mathRenderInflight?.get(cardId)?.delete(rp))
+      }
+      return true
+    })()
+    turn.assistantWriteInflight ??= new Map()
+    turn.assistantWriteInflight.get(cardId) ?? (turn.assistantWriteInflight.set(cardId, new Set()), undefined)
+    turn.assistantWriteInflight.get(cardId)!.add(write)
+    void write.finally(() => turn.assistantWriteInflight?.get(cardId)?.delete(write))
+    return write
+  }
+
+  /** CardKit 正文写入失败时显式保全完整回复；不伪装卡片成功。 */
+  private async sendAssistantTextFallback(text: string, reason: string): Promise<void> {
+    const raw = text.trim()
+    if (!raw) return
+    const message = `⚠️ 对话卡片正文写入失败(${reason}),以下为 agent 原始回复:\n\n${raw}`
+    const sent = await feishu.sendText(this.chatId, message)
+    if (!sent) {
+      log(`session "${this.sessionName}": ASSISTANT_TEXT_PRESERVATION_FAILED (${reason}, ${raw.length} chars)`)
+    }
   }
 
   /** 收尾当前 assistant 段:正文不再逐字流式输出,只在完整段收到后
