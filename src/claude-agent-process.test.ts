@@ -2043,3 +2043,114 @@ describe('Claude assistant 消息子 agent 隔离(上游 7c14677-B)', () => {
     ])
   })
 })
+
+describe('Claude SDK Cron 定时唤醒识别(上游 7c14677 主题 A)', () => {
+  // A1(RESEARCH):本地 SDK 0.3.222 runtime 是否对 cron 唤醒附带 promptSource='sdk'
+  // 未实证——检测为防御式形状匹配,SDK 不发则功能休眠不误伤;此处注入上游实测
+  // 形状(isMeta=true + promptSource='sdk' + string content)锁定行为。
+  test('isMeta+promptSource=sdk+string content → emit scheduled_turn_input { text, promptId }', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const scheduled: any[] = []
+    proc.on('scheduled_turn_input', (e: any) => scheduled.push(e))
+
+    proc.handleMessage({
+      type: 'user',
+      isMeta: true,
+      promptSource: 'sdk',
+      promptId: 'cron-prompt-1',
+      message: { role: 'user', content: '巡检:检查任务清单待办' },
+    })
+
+    expect(scheduled).toEqual([{ text: '巡检:检查任务清单待办', promptId: 'cron-prompt-1' }])
+  })
+
+  test('promptId 缺失/非 string 归一为 null', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const scheduled: any[] = []
+    proc.on('scheduled_turn_input', (e: any) => scheduled.push(e))
+
+    proc.handleMessage({
+      type: 'user',
+      isMeta: true,
+      promptSource: 'sdk',
+      message: { role: 'user', content: 'cron text' },
+    })
+    proc.handleMessage({
+      type: 'user',
+      isMeta: true,
+      promptSource: 'sdk',
+      promptId: 42,
+      message: { role: 'user', content: 'cron text 2' },
+    })
+
+    expect(scheduled).toEqual([
+      { text: 'cron text', promptId: null },
+      { text: 'cron text 2', promptId: null },
+    ])
+  })
+
+  test('三条件缺一不发:普通 internal user 消息不被误判', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const scheduled: any[] = []
+    proc.on('scheduled_turn_input', (e: any) => scheduled.push(e))
+
+    // isMeta=true 但无 promptSource(图片结果 meta string 形态)
+    proc.handleMessage({
+      type: 'user',
+      isMeta: true,
+      message: { role: 'user', content: 'internal meta string' },
+    })
+    // promptSource 非 'sdk'
+    proc.handleMessage({
+      type: 'user',
+      isMeta: true,
+      promptSource: 'user',
+      message: { role: 'user', content: 'not sdk source' },
+    })
+    // isMeta 缺失(task-notification 邻族形态)
+    proc.handleMessage({
+      type: 'user',
+      promptSource: 'sdk',
+      message: { role: 'user', content: 'no isMeta' },
+    })
+    // content 为 text block 数组(手动输入形状)
+    proc.handleMessage({
+      type: 'user',
+      isMeta: true,
+      promptSource: 'sdk',
+      message: { role: 'user', content: [{ type: 'text', text: 'array content' }] },
+    })
+    // content 空白串(trim 后为空不认)
+    proc.handleMessage({
+      type: 'user',
+      isMeta: true,
+      promptSource: 'sdk',
+      message: { role: 'user', content: '   ' },
+    })
+
+    expect(scheduled).toEqual([])
+  })
+
+  test('畸形形状静默走原路径:message 缺失不炸,tool_result 数组照常处理', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const scheduled: any[] = []
+    const results: any[] = []
+    proc.on('scheduled_turn_input', (e: any) => scheduled.push(e))
+    proc.on('tool_result', (e: any) => results.push(e))
+
+    // message 整体缺失 → 不炸不 emit
+    proc.handleMessage({ type: 'user', isMeta: true, promptSource: 'sdk' })
+    // 既有 tool_result 数组路径零变化
+    proc.handleMessage({
+      type: 'user',
+      message: {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tool-sched-1', content: [{ type: 'text', text: 'ok' }] }],
+      },
+    })
+
+    expect(scheduled).toEqual([])
+    expect(results).toHaveLength(1)
+    expect(results[0].tool_use_id).toBe('tool-sched-1')
+  })
+})
