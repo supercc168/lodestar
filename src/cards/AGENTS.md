@@ -50,6 +50,7 @@
 - `task.ts` 只渲染清单绑定状态和按钮 action，不读取飞书任务内容，也不发起 API；分组状态缺失必须显示 `MISS`，不要用静默成功文案遮盖问题。
 - Feishu 对空 markdown、元素数量和 streaming TTL 都比较敏感；模板变更要和 `cardkit.ts` 的空内容过滤、元素计数和关闭 streaming 设置配合。
 - 活跃 footer / 后台任务 header 的耗时经 `liveElapsed`/`elapsedBucket` 与 config `[runtime].live_elapsed` 决定：默认 `bucket` 只在档位边界调度；`second` 可恢复按秒展示(footer 1s / 后台 2s)。终态总耗时才使用 `fmtElapsed`。不要在默认路径恢复无开关的每秒 `setInterval`。
+- 含公式的 assistant 段始终由固定 id 的单个顶层 `column_set` 承载，raw 与渲染态只替换内部 markdown/image 子元素链。保持源码顺序；小图可用 `crop_center` + 精确 `size`，超过手机安全宽度的图必须用 `fit_horizontal` 且不传 `size`，由卡片容器响应式缩小。不要拆成多个顶层元素或把公式集中到段尾。
 
 ### Testing Requirements
 - 修改 `turn.ts` 或 `console.ts` 后运行 `bun test src/cards/turn.test.ts`。
@@ -59,6 +60,7 @@
 - 修改 `background.ts` 后运行 `bun test src/cards/background.test.ts`;触及 session 事件接线时再跑全量 `bun test`。
 - 修改 `temp.ts` 后运行 `bun test src/cards/temp.test.ts`;触及 `session-temp.ts` 或 `daemon.ts` `handleCardAction` 的 `temp_*_select` dispatch 时再跑全量 `bun test`。
 - 如果变更影响 `contextPercent`、usage 或控制台展示，也运行 `bun test src/context-window.test.ts`。
+- 公式布局：`bun test src/math-render.test.ts src/cardkit.test.ts src/session.test.ts src/cards/elements.test.ts`。
 - 影响真实 Card Kit schema、按钮 action 或 streaming 设置时，需要在飞书群里做 smoke。
 
 ### Common Patterns
