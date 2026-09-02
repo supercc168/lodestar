@@ -8,7 +8,14 @@
 import type { AgentProvider, AgentReasoningEffort, AgentUsageSource } from './agent-process'
 import type { SessionModelSelection } from './feishu'
 
-export type TurnTrigger = 'user_message' | 'bg_task_resume' | 'watchdog_resume'
+/**
+ *   'user_message'   — 用户消息批次
+ *   'bg_task_resume' — 后台任务结算后 SDK 自发的恢复轮(无用户消息;
+ *                      不开卡的话整轮正文会被丢弃)
+ *   'watchdog_resume' — watchdog 自动恢复轮(本地独有)
+ *   'scheduled_wakeup' — Claude SDK Cron 定时唤醒轮(上游 7c14677)
+ */
+export type TurnTrigger = 'user_message' | 'bg_task_resume' | 'watchdog_resume' | 'scheduled_wakeup'
 
 export interface TurnState {
   cardId: string

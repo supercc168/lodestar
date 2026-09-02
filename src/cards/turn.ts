@@ -306,8 +306,10 @@ interface MainCardOpts {
    *   'bg_task_resume' — 后台任务结算后 SDK 自发的恢复轮(无用户消息,
    *                     banner `🔁 后台任务完成`,无 panel)
    *   'watchdog_resume' — watchdog 自动恢复轮(固定恢复 banner,无用户
-   *                       输入 panel) */
-  kind?: 'user_message' | 'card_full' | 'bg_task_resume' | 'watchdog_resume'
+   *                       输入 panel)
+   *   'scheduled_wakeup' — Claude SDK Cron 定时唤醒轮
+   *                        (banner `⏰ 定时任务触发`,无 prompt panel) */
+  kind?: 'user_message' | 'card_full' | 'bg_task_resume' | 'watchdog_resume' | 'scheduled_wakeup'
   /** 本轮 Codex 收到的 user wireText 列表。boot turn 通常是 1 条;mid-turn
    * 用户连发的 N 条会在下一 turn 一并塞进。空数组 / undefined 时不渲染
    * userInput panel。 */
@@ -331,7 +333,9 @@ export function mainConversationCard(opts: MainCardOpts): object {
       ? [{ tag: 'markdown', content: `📨 接续上一张（同一轮 ${providerLabel}，前卡写满或写入受限）` }]
       : opts.kind === 'bg_task_resume'
         ? [{ tag: 'markdown', content: `🔁 后台任务完成，${providerLabel} 继续处理结果 #${opts.turn}` }]
-        : []
+        : opts.kind === 'scheduled_wakeup'
+          ? [{ tag: 'markdown', content: `⏰ 定时任务触发，${providerLabel} 正在执行巡检 #${opts.turn}` }]
+          : []
   const inputs = opts.kind === 'watchdog_resume' ? [] : (opts.userInputs ?? [])
   const userInputHeader = `📥 收到 (${inputs.length}) ${opts.directStart ? '🚀' : `#${opts.turn}`}`
   const userInputPanel = inputs.length > 0

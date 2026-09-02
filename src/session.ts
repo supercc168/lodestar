@@ -4212,6 +4212,68 @@ export class Session {
     log(`session "${this.sessionName}": background card migrated cardId=${handle.cardId.slice(0, 12)} terminal=${terminalCount} active=${this.backgroundTasks.length}`)
   }
 
+  /** Claude SDK Cron prompts are injected outside Lodestar's sendUserText
+   * path, so they have neither a pending input claim nor a daemon-opened card.
+   * Claim the turn as soon as the SDK exposes its meta user message; this puts
+   * the open guard in place before assistant/tool events begin.(上游 7c14677;
+   * 开卡失败走 bg-resume 同款 cardless 兜底,巡检输出不丢) */
+  private startScheduledTurnCard(p: AgentProcess, text: string, promptId: string | null): void {
+    if (this.proc !== p || !p.isAlive()) return
+    // If another visible owner already exists, the SDK has folded this prompt
+    // into that turn and its output will render there. Never create a second
+    // card over a live/opening user or background turn.(bootstrapDelivery 是
+    // 本地 human-delivery 机制下 pendingCount 之外的另一种"已被认领"形态)
+    const bootstrapDelivery = [this.pendingHumanDelivery, this.ackedHumanDelivery]
+      .find(context => context?.proc === p && context.turn === null && context.state !== 'restored') ?? null
+    if (
+      this.currentTurn ||
+      this.openingTurn ||
+      this.pendingUserMessageCount > 0 ||
+      this.bgResumePending ||
+      bootstrapDelivery
+    ) return
+
+    const openingToken = this.beginTurnOpening()
+    this.sawResultWhileOpening = false
+    const preview = text.replace(/\s+/g, ' ').trim()
+    this.lastTurnUserPreview = `⏰ ${preview.slice(0, 78)}`
+    log(`session "${this.sessionName}": scheduled wakeup prompt=${promptId ?? 'MISS'}`)
+    void (async () => {
+      try {
+        const openResult = await this.openTurnCard('', 'scheduled_wakeup', { expectedProc: p })
+        if (this.proc !== p || openResult.kind === 'stale') return
+        if (openResult.kind === 'failed') {
+          // The scheduled turn is already executing inside the SDK. Preserve
+          // its report via the same cardless buffer used by background resume
+          // turns; result/exit will send an explicit raw-text fallback.
+          this.bgResumeCardless = true
+          if (this.sawResultWhileOpening) {
+            this.sawResultWhileOpening = false
+            log(`session "${this.sessionName}": scheduled open failed, result already arrived — flushing orphan now`)
+            this.flushOrphanAssistantToChat('scheduled open failed, result already arrived')
+          } else {
+            log(`session "${this.sessionName}": scheduled open failed — orphan text flush will cover the output`)
+          }
+        } else if (this.currentTurn !== openResult.turn) {
+          return
+        } else if (this.sawResultWhileOpening) {
+          const openedTurn = openResult.turn
+          this.sawResultWhileOpening = false
+          log(`session "${this.sessionName}": scheduled result raced card-open — closing freshly-opened card`)
+          await this.closeTurnCard(undefined, { hasFreshResult: true })
+          if (this.proc !== p || (this.currentTurn !== null && this.currentTurn !== openedTurn)) return
+          this.status = 'idle'
+        } else {
+          this.status = 'working'
+        }
+      } finally {
+        this.finishTurnOpening(openingToken)
+      }
+    })().catch(error => {
+      log(`session "${this.sessionName}": scheduled turn-open handler failed: ${messageOf(error)}`)
+    })
+  }
+
   private wireProc(p: AgentProcess): void {
     this.clearCodexProcessActivityState()
     p.on('error', err => {
@@ -4332,6 +4394,10 @@ export class Session {
           }
         }
       })()
+    })
+    p.on('scheduled_turn_input', ({ text, promptId }: { text: string; promptId: string | null }) => {
+      if (p.provider !== 'claude') return
+      this.startScheduledTurnCard(p, text, promptId)
     })
     p.on('conversation_materialized', ({ session_id: sessionId, source }: { session_id: string; source: string }) => {
       if (this.proc !== p || p.provider !== 'codex') return
@@ -5851,7 +5917,7 @@ export class Session {
     // its element-count tracker is correct from the first addElement
     // onwards (bg-resume banner + userInputPanel + footer).
     const initialElementCount =
-      (trigger === 'bg_task_resume' || trigger === 'watchdog_resume' ? 1 : 0) +
+      (trigger === 'bg_task_resume' || trigger === 'watchdog_resume' || trigger === 'scheduled_wakeup' ? 1 : 0) +
       (userInputs.length > 0 ? 1 : 0) +
       1
     cardkit.recordCardCreated(
