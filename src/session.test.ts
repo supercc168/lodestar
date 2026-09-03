@@ -11,9 +11,11 @@ import {
 } from './turn-watchdog'
 import { NothingToCompactError, type CodexUserTextSettlement, type UserTextDispatch } from './agent-process'
 import {
-  addedReactions, boundResumes, clearedTurnAnchors, deletedReactions, feishuMockState, projectProfiles, resetFeishuMock,
-  sentCards, sentRawTexts, sentTexts, truncatedTurnAnchors, updatedCards, urgentPushes,
+  addedReactions, boundResumes, branchBaseBySession, clearedResumes, clearedTurnAnchors, deletedReactions,
+  feishuMockState, projectProfiles, resetFeishuMock, resumeRefs, sentCards, sentRawTexts, sentTexts,
+  setResumeWriteError, setTurnAnchorWriteError, truncatedTurnAnchors, turnAnchorsBySession, updatedCards, urgentPushes,
 } from './feishu-test-mock'
+import type { ConversationCheckpoint, ConversationRef } from './conversation'
 
 const {
   Session,
@@ -94,10 +96,16 @@ class FakeAgentProc extends EventEmitter {
   /** codex materialization 门控(4185808-D):默认 true = 已确认落盘的进程,
    *  既有用例绑定行为不变;门控用例显式置 false 模拟未确认会话。 */
   conversationResumableState = true
+  /** ConversationLaunch 面(ff44afb/4185808):三态 launchKind(默认 null =
+   *  既有用例零行为差,init 分流只认显式 'fresh')+ codex checkpoint 采集字段。 */
+  launchKind: 'fresh' | 'resume' | 'fork' | null = null
+  lastCompletedTurnId: string | null = null
 
   constructor(
     readonly provider: 'codex' | 'claude',
     public sessionId: string | null = null,
+    /** spawn 捕获暴露(ff44afb):监听 spawnAgent 侧翻译产物的用例经第三参喂入。 */
+    readonly opts: { launch?: unknown } = {},
   ) {
     super()
   }
@@ -11262,5 +11270,208 @@ describe('Session codex resume 绑定 materialization 门控(上游 4185808 主�
     // 接线结构锚:真实 feishu.ts 的 resume map 落盘必须经 writeJsonStateAtomic
     const feishuSource = readFileSync(join(import.meta.dir, 'feishu.ts'), 'utf8')
     expect(feishuSource).toContain('writeJsonStateAtomic(SESSION_RESUME_MAP_FILE')
+  })
+})
+
+describe('Session conversation launch 数据流(上游 ff44afb 簇 1)', () => {
+  test('rollbackTo 派生 codex fork launch:restart 期间一次性 intent 四字段可见,收尾后清空', async () => {
+    const session = new Session('rollback-codex-launch', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'previous-thread'
+    let captured: any = 'not-captured'
+    session.restart = async () => {
+      captured = session.pendingConversationLaunch
+      return true
+    }
+
+    const ok = await session.rollbackTo('source-thread', 'turn-3')
+
+    expect(ok).toBe(true)
+    const source = { provider: 'codex', sessionId: 'source-thread', cwd: session.workDir }
+    expect(captured?.launch).toEqual({
+      kind: 'fork',
+      source,
+      through: { provider: 'codex', kind: 'turn', id: 'turn-3', source },
+    })
+    expect(captured?.previousSessionId).toBe('previous-thread')
+    expect(session.pendingConversationLaunch).toBeNull()
+  })
+
+  test('startForked 派生 claude fork launch 且 start 收尾后清空', async () => {
+    const session = new Session('forked-claude-launch', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    let captured: any = 'not-captured'
+    session.start = async () => {
+      captured = session.pendingConversationLaunch
+      return true
+    }
+
+    const ok = await session.startForked('history-session', 'uuid-7')
+
+    expect(ok).toBe(true)
+    const source = { provider: 'claude', sessionId: 'history-session', cwd: session.workDir }
+    expect(captured?.launch).toEqual({
+      kind: 'fork',
+      source,
+      through: { provider: 'claude', kind: 'assistant-message', id: 'uuid-7', source },
+    })
+    expect(session.pendingConversationLaunch).toBeNull()
+  })
+
+  test('spawnAgent 将 claude fork launch 翻译为 resumeSessionId/resumeSessionAt/forkSession 三参', () => {
+    const session = new Session('claude-fork-translate', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const source = { provider: 'claude', sessionId: 'source-session', cwd: session.workDir }
+    session.pendingConversationLaunch = {
+      lease: { kind: 'fork' },
+      launch: {
+        kind: 'fork',
+        source,
+        through: { provider: 'claude', kind: 'assistant-message', id: 'anchor-uuid', source },
+      },
+      previousSessionId: null,
+    }
+
+    const proc = session.spawnAgent(undefined, 'claude') as any
+
+    expect(proc.opts.resumeSessionId).toBe('source-session')
+    expect(proc.opts.resumeSessionAt).toBe('anchor-uuid')
+    expect(proc.opts.forkSession).toBe(true)
+  })
+
+  test('spawnAgent 无 pending intent 时 fresh;lease 不符的 intent 不消费(lease 归属检查)', () => {
+    const session = new Session('claude-launch-lease', 'chat_id') as any
+    session.selectedProvider = 'claude'
+
+    const fresh = session.spawnAgent(undefined, 'claude') as any
+    expect(fresh.opts.resumeSessionId).toBeUndefined()
+    expect(fresh.opts.forkSession).toBe(false)
+
+    const source = { provider: 'claude', sessionId: 'other-session', cwd: session.workDir }
+    session.pendingConversationLaunch = {
+      lease: { kind: 'fork' },
+      launch: { kind: 'fork', source },
+      previousSessionId: null,
+    }
+    const foreign = session.spawnAgent(undefined, 'claude', { kind: 'restart' }) as any
+    expect(foreign.opts.forkSession).toBe(false)
+    expect(foreign.opts.resumeSessionId).toBeUndefined()
+  })
+
+  test('spawnAgent 对 cwd 不匹配的 codex fork launch 在进程构造前拒绝', async () => {
+    const session = new Session('codex-launch-cwd', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const source = { provider: 'codex', sessionId: 'thread-x', cwd: '/elsewhere/dir' }
+    session.pendingConversationLaunch = {
+      lease: { kind: 'back' },
+      launch: { kind: 'fork', source },
+      previousSessionId: null,
+    }
+    let leaked: any = null
+    try {
+      expect(() => { leaked = session.spawnAgent(undefined, 'codex') }).toThrow('conversation launch cwd mismatch')
+    } finally {
+      // RED 态防泄漏:未按预期抛出时把误 spawn 的进程杀掉。
+      if (leaked?.kill) await leaked.kill(500).catch(() => {})
+    }
+  })
+
+  test('legacy resume(cwd:null)先经 resolveLegacyResumeRef 升级再 spawn', async () => {
+    const session = new Session('legacy-upgrade', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'legacy-thread'
+    session.lastSessionRef = { provider: 'codex', sessionId: 'legacy-thread', cwd: null }
+    const upgraded = { provider: 'codex', sessionId: 'legacy-thread', cwd: session.workDir }
+    session.resolveLegacyResumeRef = async () => upgraded
+    const spawnRefs: any[] = []
+    session.spawnAgent = (resumeRef?: any) => {
+      spawnRefs.push(resumeRef)
+      const proc = new FakeAgentProc('codex', 'legacy-thread')
+      proc.sendInitialize = () => proc.emit('init', { session_id: proc.sessionId })
+      return proc
+    }
+
+    const ok = await session.restart(true, { announce: false })
+
+    expect(ok).toBe(true)
+    expect(spawnRefs).toEqual([upgraded])
+    expect(session.lastSessionRef).toEqual(upgraded)
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('legacy 升级失败:restart 如实报错返回 false,不 spawn 不猜 cwd', async () => {
+    const session = new Session('legacy-upgrade-fail', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'legacy-thread'
+    session.lastSessionRef = { provider: 'codex', sessionId: 'legacy-thread', cwd: null }
+    session.resolveLegacyResumeRef = async () => { throw new Error('stored cwd mismatch') }
+    let spawnCalls = 0
+    session.spawnAgent = () => {
+      spawnCalls++
+      return new FakeAgentProc('codex', 'x')
+    }
+    const statuses: string[] = []
+
+    const ok = await session.restart(true, { announce: false, onStatus: (s: string) => statuses.push(s) })
+
+    expect(ok).toBe(false)
+    expect(spawnCalls).toBe(0)
+    expect(statuses.join('\n')).toContain('stored cwd mismatch')
+  })
+
+  test('resolveLegacyResumeRef:claude transcript 缺失如实拒绝,provider 不符拒绝', async () => {
+    const session = new Session('legacy-honest', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    await expect(session.resolveLegacyResumeRef({ provider: 'claude', sessionId: 'missing-session', cwd: null }))
+      .rejects.toThrow('旧 Claude 会话不属于当前 cwd')
+    await expect(session.resolveLegacyResumeRef({ provider: 'codex', sessionId: 'x', cwd: null }))
+      .rejects.toThrow('legacy resume provider mismatch')
+    expect(boundResumes).toEqual([])
+  })
+
+  test('listCodexConversations:一次性 catalog 进程 spawn→list→kill,查询失败也不泄漏进程', async () => {
+    const session = new Session('codex-history', 'chat_id') as any
+    await expect(session.listCodexConversations()).rejects.toThrow('Codex history requested for a non-Codex session')
+
+    session.selectedProvider = 'codex'
+    const summary = { provider: 'codex', sessionId: 't1', cwd: session.workDir, preview: 'hi', ts: 1 }
+    let killCalls = 0
+    session.spawnCodexCatalogProcess = () => ({
+      listConversations: async () => [summary],
+      kill: async () => { killCalls++ },
+    })
+    expect(await session.listCodexConversations()).toEqual([summary])
+    expect(killCalls).toBe(1)
+
+    session.spawnCodexCatalogProcess = () => ({
+      listConversations: async () => { throw new Error('thread/list exploded') },
+      kill: async () => { killCalls++ },
+    })
+    await expect(session.listCodexConversations()).rejects.toThrow('thread/list exploded')
+    expect(killCalls).toBe(2)
+  })
+
+  test('conversationRouting 快照与 applyConversationRouting:运行中拒绝,provider 切换清锚换基线', () => {
+    const session = new Session('routing-snapshot', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedModel = 'claude:glm'
+    session.selectedEffort = 'max'
+    expect(session.conversationRouting()).toEqual({ provider: 'claude', model: 'claude:glm', effort: 'max' })
+
+    session.proc = new FakeAgentProc('claude', 's1')
+    expect(() => session.applyConversationRouting({ provider: 'codex', model: null, effort: null }))
+      .toThrow('cannot change conversation routing while the session is running')
+    session.proc = null
+
+    expect(() => session.applyConversationRouting({ provider: 'gemini', model: null, effort: null }))
+      .toThrow('unknown conversation routing provider')
+
+    resumeRefs.set(`${session.sessionName}:codex`, { provider: 'codex', sessionId: 'codex-old', cwd: null })
+    session.applyConversationRouting({ provider: 'codex', model: null, effort: null })
+    expect(session.selectedProvider).toBe('codex')
+    expect(clearedTurnAnchors).toContain(session.sessionName)
+    expect(branchBaseBySession.get(session.sessionName)).toBeNull()
+    expect(session.lastSessionId).toBe('codex-old')
+    expect(session.lastSessionRef).toEqual({ provider: 'codex', sessionId: 'codex-old', cwd: null })
   })
 })

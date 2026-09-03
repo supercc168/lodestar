@@ -128,6 +128,8 @@ mock.module('./feishu', () => ({
     return ref ? { ...ref } : null
   },
   getSessionModelSelection: () => null,
+  /** listCodexConversations/start 的登录门替身:默认已登录(与真实导出同名同签名)。 */
+  isOpenAIChatGPTAuthenticated: () => true,
   getTenantToken: async () => 'tenant-token',
   preferredChatForSession: new Map(),
   sendCard: async (chatId: string, card: object) => {
