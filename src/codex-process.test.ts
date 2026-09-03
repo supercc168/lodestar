@@ -1987,3 +1987,113 @@ describe('validateConversationLaunch 五重校验(上游 ff44afb)', () => {
     ).not.toThrow()
   })
 })
+
+// ── 上游 ff44afb:codex checkpoint 采集与清空生命周期 ──────────────────
+// lastCompletedTurnId 仅在 status==='completed' && !error && turn.id 置位;
+// turn/started、sendUserText 建 delivery 处、failTurnStart、非 checkpointable
+// 终态四处清空(陷阱 3);result 事件带 codex checkpoint 载荷。
+function checkpointHarness(workDir = '/tmp'): { proc: any; events: Array<[string, any]> } {
+  const proc = Object.create(CodexProcess.prototype) as any
+  const events: Array<[string, any]> = []
+  proc.opts = { workDir, effort: 'high' }
+  proc.sessionId = 'thread-ckpt'
+  proc.currentTurnId = null
+  proc.pendingTurnStart = null
+  proc.lastUsage = null
+  // materialization 已确认(01-13 链早退),聚焦 checkpoint 生命周期。
+  proc.conversationResumable = true
+  proc.emittedImageGenerationIds = new Set()
+  proc.flushRolloutImageGenerations = () => {}
+  proc.emit = (event: string, payload: unknown) => {
+    events.push([event, payload])
+    return true
+  }
+  return { proc, events }
+}
+
+describe('codex checkpoint 采集与清空(上游 ff44afb)', () => {
+  test('records the canonical main-thread turn/completed id publicly', () => {
+    const { proc, events } = checkpointHarness('/work')
+
+    proc.handleNotification('turn/started', { threadId: 'thread-ckpt', turn: { id: 'turn-1' } })
+    proc.handleNotification('turn/completed', {
+      threadId: 'thread-ckpt',
+      turn: { id: 'turn-1', status: 'completed' },
+    })
+
+    expect(proc.lastCompletedTurnId).toBe('turn-1')
+    const result = events.find(([name]) => name === 'result')
+    expect(result?.[1].checkpoint).toEqual({
+      provider: 'codex',
+      kind: 'turn',
+      id: 'turn-1',
+      // source.cwd === workDir:fork through 锚归属校验的上游前提。
+      source: { provider: 'codex', sessionId: 'thread-ckpt', cwd: '/work' },
+    })
+  })
+
+  test('failed or malformed terminal turns cannot reuse an earlier checkpoint', () => {
+    const { proc, events } = checkpointHarness()
+
+    // 完成轮建立 checkpoint。
+    proc.handleNotification('turn/started', { threadId: 'thread-ckpt', turn: { id: 'turn-1' } })
+    proc.handleNotification('turn/completed', {
+      threadId: 'thread-ckpt',
+      turn: { id: 'turn-1', status: 'completed' },
+    })
+    expect(proc.lastCompletedTurnId).toBe('turn-1')
+
+    // 清空点 1:新 turn 开始即清空(上轮锚不得跨入进行中的新轮)。
+    proc.handleNotification('turn/started', { threadId: 'thread-ckpt', turn: { id: 'turn-2' } })
+    expect(proc.lastCompletedTurnId).toBeNull()
+
+    // 失败终态不置位:result checkpoint 载荷为 null。
+    proc.handleNotification('turn/completed', {
+      threadId: 'thread-ckpt',
+      turn: { id: 'turn-2', status: 'failed', error: { message: 'boom' } },
+    })
+    expect(proc.lastCompletedTurnId).toBeNull()
+    const failedResult = events.filter(([name]) => name === 'result').at(-1)
+    expect(failedResult?.[1].is_error).toBe(true)
+    expect(failedResult?.[1].checkpoint).toBeNull()
+
+    // 中断终态(非 completed 状态)同样不可锚定。
+    proc.handleNotification('turn/started', { threadId: 'thread-ckpt', turn: { id: 'turn-3' } })
+    proc.handleNotification('turn/completed', {
+      threadId: 'thread-ckpt',
+      turn: { id: 'turn-3', status: 'interrupted' },
+    })
+    expect(proc.lastCompletedTurnId).toBeNull()
+
+    // 畸形终态(无 turn.id)清空而非复用上轮:先完成一轮再喂畸形通知。
+    proc.handleNotification('turn/started', { threadId: 'thread-ckpt', turn: { id: 'turn-4' } })
+    proc.handleNotification('turn/completed', {
+      threadId: 'thread-ckpt',
+      turn: { id: 'turn-4', status: 'completed' },
+    })
+    expect(proc.lastCompletedTurnId).toBe('turn-4')
+    proc.handleNotification('turn/completed', { threadId: 'thread-ckpt', turn: { status: 'completed' } })
+    expect(proc.lastCompletedTurnId).toBeNull()
+    const malformedResult = events.filter(([name]) => name === 'result').at(-1)
+    expect(malformedResult?.[1].checkpoint).toBeNull()
+  })
+
+  test('sendUserText 建 delivery 处与 failTurnStart 均清空(清空点 2/3,陷阱 3 本地落点)', async () => {
+    const fixture = pendingTurnStartFixture('thread-ckpt')
+
+    // 清空点 2:建 delivery 即清(await 前)——turn/start 传输失败也会 emit result,
+    // 失败不得复用上轮锚。
+    fixture.proc.lastCompletedTurnId = 'stale-turn'
+    const dispatch = fixture.proc.sendUserText('hello')
+    expect(dispatch.kind).toBe('turn_start_pending')
+    expect(fixture.proc.lastCompletedTurnId).toBeNull()
+
+    // 清空点 3:failTurnStart 清空。
+    fixture.proc.lastCompletedTurnId = 'stale-turn'
+    fixture.rejectTurnStart(new Error('turn/start transport down'))
+    const receipt = await receiptWithin(dispatch)
+    expect(receipt.kind).toBe('rejected')
+    expect(fixture.proc.lastCompletedTurnId).toBeNull()
+    expect(fixture.resultEvents.at(-1)?.is_error).toBe(true)
+  })
+})
