@@ -11475,3 +11475,189 @@ describe('Session conversation launch 数据流(上游 ff44afb 簇 1)', () => {
     expect(session.lastSessionRef).toEqual({ provider: 'codex', sessionId: 'codex-old', cwd: null })
   })
 })
+
+describe('Session turn 锚数据流(4185808 终态,挂账 #3)', () => {
+  const codexCheckpoint = (session: any, id: string, sessionId = 'fresh-thread'): ConversationCheckpoint => ({
+    provider: 'codex',
+    kind: 'turn',
+    id,
+    source: { provider: 'codex', sessionId, cwd: session.workDir },
+  })
+
+  test('快 turn 锚延迟:未确认 resumable 入队不写盘,persist 成功路径 flush 落盘;persist 失败不 flush', () => {
+    const session = new Session('codex-fast-checkpoint', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumableState = false
+    session.proc = proc
+    session.wireProc(proc)
+    session.lastTurnUserPreview = 'fast input'
+    const checkpoint = codexCheckpoint(session, 'turn-fast')
+
+    proc.emit('result', { is_error: false, checkpoint })
+    expect(turnAnchorsBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingCodexTurnAnchors).toHaveLength(1)
+
+    // persist 失败路径不 flush(门与队列是同一窗口的两半:门没过队列必须原样保留)
+    proc.conversationResumableState = true
+    setResumeWriteError(new Error('resume-map fsync failed'))
+    proc.emit('conversation_materialized', { session_id: proc.sessionId, source: 'turn/started notification' })
+    expect(session.pendingCodexTurnAnchors).toHaveLength(1)
+    expect(turnAnchorsBySession.has(session.sessionName)).toBe(false)
+    setResumeWriteError(null)
+
+    // persist 成功后同一时刻排空延迟队列
+    proc.emit('conversation_materialized', { session_id: proc.sessionId, source: 'turn/started notification' })
+    expect(session.pendingCodexTurnAnchors).toHaveLength(0)
+    expect(turnAnchorsBySession.get(session.sessionName)).toEqual([{
+      checkpoint,
+      preview: 'fast input',
+      ts: expect.any(Number),
+      writes: [],
+    }])
+  })
+
+  test('队列上限 64/进程:溢出拒绝新锚保留旧锚(上游终态形)', () => {
+    const session = new Session('codex-anchor-cap', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.conversationResumableState = false
+    session.proc = proc
+    for (let i = 0; i < 64; i++) {
+      expect(session.recordTurnAnchor(codexCheckpoint(session, `turn-${i}`))).toBeNull()
+    }
+    expect(session.pendingCodexTurnAnchors).toHaveLength(64)
+
+    const overflow = session.recordTurnAnchor(codexCheckpoint(session, 'turn-64'))
+    expect(overflow).toContain('延迟 checkpoint 队列已满')
+    expect(session.pendingCodexTurnAnchors).toHaveLength(64)
+    expect(session.pendingCodexTurnAnchors[0].anchor.checkpoint.id).toBe('turn-0')
+  })
+
+  test('confirmed stop 收尾 discard:队列锚不落幽灵', async () => {
+    const session = new Session('codex-anchor-stop', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.conversationResumableState = false
+    session.proc = proc
+    session.wireProc(proc)
+    session.recordTurnAnchor(codexCheckpoint(session, 'turn-a'))
+    expect(session.pendingCodexTurnAnchors).toHaveLength(1)
+
+    await session.stop('测试终止', { announce: false })
+
+    expect(session.pendingCodexTurnAnchors).toHaveLength(0)
+    expect(turnAnchorsBySession.has(session.sessionName)).toBe(false)
+  })
+
+  test('unexpected exit 收尾 discard:崩溃进程的延迟锚不落幽灵', () => {
+    const session = new Session('codex-anchor-exit', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.conversationResumableState = false
+    session.proc = proc
+    session.wireProc(proc)
+    session.recordTurnAnchor(codexCheckpoint(session, 'turn-b'))
+    expect(session.pendingCodexTurnAnchors).toHaveLength(1)
+
+    proc.alive = false
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+
+    expect(session.pendingCodexTurnAnchors).toHaveLength(0)
+    expect(turnAnchorsBySession.has(session.sessionName)).toBe(false)
+  })
+
+  test('result still terminalizes the turn when resume-map persistence fails', async () => {
+    const session = new Session('resume-write-result', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-current')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.wireProc(proc)
+    const turn = turnState('card_resume_write_result')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    setResumeWriteError(new Error('resume-map fsync failed'))
+
+    proc.emit('result', {
+      subtype: 'success', is_error: false, duration_ms: 1, usage: null,
+      checkpoint: codexCheckpoint(session, 'turn-1', 'thread-current'),
+    })
+
+    await waitUntil(() => session.currentTurn === null)
+    expect(session.status).toBe('idle')
+    expect(session.lastSessionId).toBe('thread-current')
+    expect(sentRawTexts.some(text => text.includes('resume-map fsync failed'))).toBe(true)
+    setResumeWriteError(null)
+  })
+
+  test('锚写失败:turn 仍终态化,不留 in-memory-only 锚,错误可观测', async () => {
+    const session = new Session('anchor-write-result', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-current')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.wireProc(proc)
+    setTurnAnchorWriteError(new Error('turn-map fsync failed'))
+
+    proc.emit('result', {
+      subtype: 'success', is_error: false, duration_ms: 1, usage: null,
+      checkpoint: codexCheckpoint(session, 'turn-1', 'thread-current'),
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(session.status).toBe('idle')
+    expect(turnAnchorsBySession.has(session.sessionName)).toBe(false)
+    expect(sentRawTexts.some(text => text.includes('turn-map fsync failed'))).toBe(true)
+    setTurnAnchorWriteError(null)
+  })
+
+  test('checkpoint 归属校验:provider/sessionId/cwd 三不符各自拒绝', () => {
+    const session = new Session('anchor-ownership', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'thread-current')
+    session.proc = proc
+
+    const wrongProvider = session.recordTurnAnchor({
+      provider: 'claude', kind: 'assistant-message', id: 'uuid-1',
+      source: { provider: 'claude', sessionId: 'thread-current', cwd: session.workDir },
+    })
+    const wrongSession = session.recordTurnAnchor(codexCheckpoint(session, 'turn-1', 'other-thread'))
+    const wrongCwd = session.recordTurnAnchor({
+      provider: 'codex', kind: 'turn', id: 'turn-2',
+      source: { provider: 'codex', sessionId: 'thread-current', cwd: '/elsewhere' },
+    })
+
+    for (const rejection of [wrongProvider, wrongSession, wrongCwd]) {
+      expect(rejection).toContain('拒绝')
+    }
+    expect(turnAnchorsBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingCodexTurnAnchors ?? []).toHaveLength(0)
+  })
+
+  test('persistResumableSessionId pending 独立 id 校验:新 id===source 或===previous 报错', () => {
+    const session = new Session('persist-independent-id', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const lease = { kind: 'fork' }
+    const source = { provider: 'codex', sessionId: 'src-1', cwd: session.workDir }
+
+    const procSameAsSource = new FakeAgentProc('codex', 'src-1')
+    session.proc = procSameAsSource
+    session.pendingConversationLaunch = {
+      lease, launch: { kind: 'fork', source }, previousSessionId: 'prev-1',
+    }
+    const sameAsSource = session.persistResumableSessionId(procSameAsSource)
+    expect(sameAsSource).toContain('src-1')
+    expect(boundResumes).toEqual([])
+
+    const procSameAsPrevious = new FakeAgentProc('codex', 'prev-1')
+    session.proc = procSameAsPrevious
+    const sameAsPrevious = session.persistResumableSessionId(procSameAsPrevious)
+    expect(sameAsPrevious).toContain('prev-1')
+    expect(boundResumes).toEqual([])
+
+    const procIndependent = new FakeAgentProc('codex', 'forked-new')
+    session.proc = procIndependent
+    expect(session.persistResumableSessionId(procIndependent)).toBeNull()
+    expect(boundResumes).toEqual([['persist-independent-id', 'forked-new', 'codex']])
+  })
+})
