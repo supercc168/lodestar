@@ -234,6 +234,15 @@ type TurnCardOpenResult =
   | { kind: 'failed' }
   | { kind: 'stale' }
 
+/** 开卡窗口竞态的终态载荷(ff44afb TurnOpenOwner.terminalSuffix/terminalForcePush
+ * 的最小等效,04-05 甄别 #13):挂在 opaque owner token 上,随 token 生命周期作废
+ * (finishTurnOpening/clearTurnOpening 置 null 即弃)。不移植上游 owner 让位/
+ * terminalize 整套语义——01-14 token 冲突即抛机制保持不变。 */
+interface TurnOpenTerminalStash {
+  terminalSuffix?: string
+  terminalForcePush?: boolean
+}
+
 type MidTurnDrainOutcome = 'no_batch' | 'committed' | 'preserved'
 
 type HumanBatchMessage = {
@@ -484,6 +493,10 @@ export class Session {
   /** openBackgroundCard 进行中标记 —— 防止并发 bg_task 事件在 await sendCard
    *  期间重复开卡(sendCard 未返回前 backgroundCard 仍 null,第二个事件会再开一张)。 */
   private openingBackground = false
+  /** 后台开卡世代(ff44afb BackgroundOpenOwner 最小等效,04-05 甄别红例):
+   *  reset/换代后晚到的旧开卡凭世代号自弃——终态化作废卡、不安装为活卡、
+   *  不清新开卡的 openingBackground(完整 owner 结构不移植)。 */
+  private backgroundOpenGeneration = 0
   /** 已 addElement 到活卡的 task panel 的 task_id 集合。新任务 diff 出来才
    *  addElement(避免重复 add);已有任务 replaceElement 整个 panel。也承载 fold
    *  汇总 panel 的固定 key(BG_ELEMENTS.fold)—— 它与 task_id(UUID)不冲突。 */
@@ -657,11 +670,17 @@ export class Session {
    * tells the init handler "an eager open is already
    * claiming the slot, stand down". */
   openingTurn = false
-  private openingTurnOwner: object | null = null
+  private openingTurnOwner: TurnOpenTerminalStash | null = null
   /** Resolves when the current turn-open transaction releases. Same-process
    * follow-up opens await it instead of replacing openingTurnOwner.(上游
    * 7c14677 TurnOpenOwner.done 的本地 opaque-token 适配) */
   private openingTurnDone: { promise: Promise<void>; resolve: () => void } | null = null
+  /** 在途 turn close 集合(ff44afb turnCloseInflight 最小集,04-05 甄别红例):
+   * closeTurnCard 同步摘除 currentTurn 后其 flush/终态写仍在途;restart 在
+   * spawn 前 waitForTurnCloses 等全部落地,防旧卡终态写与新进程新卡交错。
+   * 哨兵 promise 只 resolve——close 自身错误已在其调用点捕获/记录。
+   * stop/exit 未接线(首跑无红例,04-05 处置清单记差集)。 */
+  private turnCloseInflight = new Set<Promise<void>>()
   private turnCounter = 0
   private lifecycleEpoch = 0
   private lifecycleOwner: LifecycleLease | null = null
@@ -2270,11 +2289,11 @@ export class Session {
     this.currentBatchReactionIds = new Map()
   }
 
-  private beginTurnOpening(): object {
+  private beginTurnOpening(): TurnOpenTerminalStash {
     if (this.openingTurnOwner) {
       throw new Error('turn card open already owned; same-process opens must wait for the current owner')
     }
-    const token = {}
+    const token: TurnOpenTerminalStash = {}
     this.openingTurnOwner = token
     this.openingTurn = true
     let resolve!: () => void
@@ -2313,6 +2332,15 @@ export class Session {
       if (this.proc !== proc || !proc.isAlive()) return false
     }
     return this.proc === proc && proc.isAlive()
+  }
+
+  /** 等全部在途 turn close 落地(ff44afb waitForTurnCloses 的哨兵化最小形,
+   * 04-05):while 循环兼收快照后新登记的 close;哨兵只 resolve,错误不在此
+   * 二次上抛(close 调用点已各自捕获/记录)。 */
+  private async waitForTurnCloses(): Promise<void> {
+    while (this.turnCloseInflight.size > 0) {
+      await Promise.allSettled([...this.turnCloseInflight])
+    }
   }
 
   discardQueuedHumanWork(reason: string): void {
@@ -2728,6 +2756,12 @@ export class Session {
     // 后台任务随轮作废:旧 proc 的活跃 entry 不能带进新会话(会跨会话「复活」
     // 到新卡)。翻 killed 终态 + 活卡沉降,在 spawn 新 proc 之前清干净。
     await this.resetBackgroundTasks(lease)
+    if (!this.ownsLifecycle(lease)) return false
+    // 在途 turn close 等待(ff44afb turnCloseInflight,04-05 甄别红例最小集):
+    // close 可能已同步摘除 currentTurn 但 flush/终态写仍在途——spawn 前等全部
+    // 落地,防旧卡终态写与新进程新卡交错(红例:restart waits for a close that
+    // already removed currentTurn before spawning)。
+    await this.waitForTurnCloses()
     if (!this.ownsLifecycle(lease)) return false
     if (killError) {
       // stop 失败恢复 pending(4185808 stopFailures 同位):进程没停成,头部取消的
@@ -4796,7 +4830,13 @@ export class Session {
     // 在 await sendCard 期间重复开卡(backgroundCard 此时仍 null)。
     if (!this.backgroundCard && !this.openingBackground) {
       this.openingBackground = true
-      void this.openBackgroundCard().finally(() => { this.openingBackground = false })
+      // BackgroundOpenOwner 世代化(ff44afb 簇 3,04-05 甄别红例最小集):开卡
+      // 捕获世代号;只有仍属当前世代的开卡才有权清标记——旧世代晚到的 finally
+      // 不得清掉新开卡的 openingBackground(红例:老开卡复活/清新 owner)。
+      const generation = ++this.backgroundOpenGeneration
+      void this.openBackgroundCard(generation).finally(() => {
+        if (this.backgroundOpenGeneration === generation) this.openingBackground = false
+      })
       return
     }
     // 有卡有活跃 → 新任务可能带来更早的档位边界,先重排 timer,再节流刷新 body。
@@ -4804,7 +4844,7 @@ export class Session {
     this.scheduleBackgroundRefresh()
   }
 
-  private async openBackgroundCard(): Promise<void> {
+  private async openBackgroundCard(generation?: number): Promise<void> {
     if (this.backgroundCard) return
     const card = cards.backgroundLiveCard(this.backgroundTasks, Date.now(), config.runtime.live_elapsed)
     const messageId = await feishu.sendCard(this.chatId, card)
@@ -4817,6 +4857,16 @@ export class Session {
       cardId = await cardkit.convertMessageToCard(messageId)
     } catch (e) {
       log(`session "${this.sessionName}": background card id_convert failed: ${e}`)
+      return
+    }
+    if (generation !== undefined && this.backgroundOpenGeneration !== generation) {
+      // 世代已切换(reset/新开卡已接管):本卡终态化作废——不安装为活卡、不动新
+      // owner 状态(cleanupStaleTurnOpen 同款终态三连;上游
+      // terminalizeSupersededCard hasFooter=false 位,文案逐字)。
+      log(`session "${this.sessionName}": superseded background open terminalized cardId=${cardId.slice(0, 12)}`)
+      cardkit.cancelSummary(cardId)
+      await cardkit.patchSettings(cardId, cards.streamingOffSettings({ suffix: '⚠️ 后台任务世代已切换，本卡已作废' }))
+      await cardkit.dispose(cardId)
       return
     }
     // 初始 body:running + 最近终态 = 独立 panel,更早终态 = 一个 fold 汇总 panel。
@@ -4998,6 +5048,9 @@ export class Session {
     if (this.backgroundTasks === settledTasks) this.backgroundTasks = []
     if (this.backgroundDetailAdded === detailOwner) detailOwner.clear()
     this.backgroundFoldSig = null
+    // 世代作废(ff44afb invalidateBackgroundOpen 等效位,04-05):在途旧开卡凭
+    // 世代号自弃,不得在 reset 后复活为活卡。
+    this.backgroundOpenGeneration++
     this.openingBackground = false
   }
 
@@ -5241,7 +5294,7 @@ export class Session {
       const isBgResume = !isUserBatch && this.bgResumePending
       if (!isUserBatch && !isBgResume) return
       const userOpenId = this.lastUserOpenId
-      let openingToken: object
+      let openingToken: TurnOpenTerminalStash
       try {
         openingToken = this.beginTurnOpening()
       } catch (error) {
@@ -5312,9 +5365,15 @@ export class Session {
             // 卡片开成了,但这一轮的 result 已在开卡 await 窗口内到达 ——
             // result 处理器当时 currentTurn 还是 null,closeTurnCard 空转了。
             // 这里补一次收尾,否则卡片 footer 永远计时、session 卡在 working。
+            // deferred close 消费挂在 owner token 上的终态载荷(ff44afb
+            // owner.terminalSuffix,04-05 甄别 #13):checkpoint 持久化失败等
+            // stateError 不因竞态丢失,forcePush 语义一并携带。
             this.sawResultWhileOpening = false
             log(`session "${this.sessionName}": result raced card-open — closing freshly-opened turn card now`)
-            await this.closeTurnCard(undefined, { hasFreshResult: true })
+            await this.closeTurnCard(openingToken.terminalSuffix, {
+              forcePush: openingToken.terminalForcePush ?? false,
+              hasFreshResult: true,
+            })
             if (
               this.proc !== p ||
               (this.currentTurn !== null && this.currentTurn !== openedTurn)
@@ -5712,6 +5771,15 @@ export class Session {
           ? `⚠️ ${backend} 模型容量不足，${Math.round(CAPACITY_RETRY_DELAY_MS / 1000)}s 后自动重试`
           : `⚠️ ${backend} ${subtype}`
         forcePush = true
+      }
+
+      // result 落在开卡 await 窗口:suffix/forcePush 挂 owner token,开卡 IIFE
+      // 的 deferred close 消费(ff44afb owner.terminalSuffix/terminalForcePush,
+      // 04-05 甄别 #13 最小集)——下方 closeTurnCard 此刻对 null turn 空转,
+      // 不挂载荷这份终态文案就随竞态丢失。
+      if (this.openingTurnOwner) {
+        this.openingTurnOwner.terminalSuffix = suffix
+        this.openingTurnOwner.terminalForcePush = forcePush
       }
 
       if (stateError && !this.currentTurn && !this.openingTurn) {
@@ -8280,6 +8348,25 @@ export class Session {
     this.clearToolFailureLoop(turn)
     this.endWatchdogTurn()
     this.stopFooterStatus(turn)
+    // ── 04-05 簇 3 甄别红例最小集(ff44afb):TurnCloseSnapshot + turnCloseInflight ──
+    // close 入口同步快照本轮终态数据并转移 reaction 所有权:flush/drain 的 await
+    // 窗口里 next turn 可能已把 live 字段换成新轮数据——终态 footer/settings 只准
+    // 读快照,释放的也只能是快照里的 reactions,不得清 next turn 的两 Map。
+    // 同时把余下收尾登记为在途 close(restart spawn 前 waitForTurnCloses 等待)。
+    // 刻意不拆 finishTurnCardClose、try 框内主体保持原文原缩进——陷阱 4:
+    // 03-03/03-04 drain 次序锚零触碰,diff 只含语义行。
+    const closeContextTokens = this.currentContextTokens()
+    const closeContextLimit = this.contextLimitForDisplay()
+    const closeLastTurnDelta = this.lastTurnDelta ? { ...this.lastTurnDelta } : null
+    const closeLastTurnUsage = this.lastTurnUsage ? { ...this.lastTurnUsage } : null
+    const closeBatchReactionIds = this.currentBatchReactionIds
+    const closePendingReactionIds = opts.preservePendingReactions ? null : this.pendingReactionIds
+    this.currentBatchReactionIds = new Map()
+    if (!opts.preservePendingReactions) this.pendingReactionIds = new Map()
+    let settleClose!: () => void
+    const closeSettled = new Promise<void>(resolve => { settleClose = resolve })
+    this.turnCloseInflight.add(closeSettled)
+    try {
     // 竞态修复:mid-turn rotation 的 swap 阶段(sendCard / id_convert 的 await
     // 之后,见 startMidTurnRotate)会切 turn.cardId 到新卡并 startWritingFooter
     // 重启一个 footer 计时 interval。若 result 在那个 await 窗口里抢先到达,
@@ -8357,14 +8444,15 @@ export class Session {
     // interrupts/boot failures would otherwise show stale prior-turn data.
     const line1Parts = [`${stateMark} ⏱ ${elapsed}s`]
     if (opts.hasFreshResult) {
-      const ctxTokens = this.currentContextTokens()
-      const ctxMax = this.contextLimitForDisplay()
+      // 读 close 入口快照,不读 live(next turn 可能已换数据——04-05 快照红例)。
+      const ctxTokens = closeContextTokens
+      const ctxMax = closeContextLimit
       // Claude 路径分母已是 SDK 实测窗口、分子是输入侧占用,走纯除法(baseline=0);
       // Codex 路径保留 12K baseline 扣减。
       const isClaude = turn.provider === 'claude'
       const ctxPercent = cards.footerContextPercentLabel(ctxTokens, ctxMax, isClaude ? 0 : undefined)
       if (ctxPercent) line1Parts.push(`🧠 ${ctxPercent}`)
-      const cost = this.lastTurnDelta?.costUsd ?? 0
+      const cost = closeLastTurnDelta?.costUsd ?? 0
       if (cost > 0) line1Parts.push(`💰 $${cost.toFixed(3)}`)
     }
     if (turn.contextCompactCount > 0) line1Parts.push(`🚨 压缩×${turn.contextCompactCount}`)
@@ -8374,7 +8462,7 @@ export class Session {
     if (modelLabel) line1Parts.push(modelLabel)
     const footerLine1 = line1Parts.join(' ｜ ')
     const footerLine2 = opts.hasFreshResult
-      ? cards.footerTokenDetailLine(this.lastTurnUsage) + (turn.rotateGivenUp ? '' : await this.footerUsageSuffix(turn))
+      ? cards.footerTokenDetailLine(closeLastTurnUsage) + (turn.rotateGivenUp ? '' : await this.footerUsageSuffix(turn))
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
     await this.replaceFooterContent(cardId, footer)
@@ -8385,7 +8473,7 @@ export class Session {
     cardkit.cancelSummary(cardId)
     await cardkit.patchSettings(cardId, cards.streamingOffSettings({
       durationSec: elapsed,
-      outputTokens: opts.hasFreshResult ? this.lastTurnUsage?.output_tokens : undefined,
+      outputTokens: opts.hasFreshResult ? closeLastTurnUsage?.output_tokens : undefined,
       suffix,
     }))
     await cardkit.dispose(cardId)
@@ -8432,14 +8520,18 @@ export class Session {
     //      For merged-batch follow-ups, this releases slightly early
     //      (before the merged turn actually runs), which is an
     //      acceptable trade vs. msgs stuck under OneSecond forever.
+    // 04-05 快照红例:只释放 close 入口快照里的 reactions——live 两 Map 已在
+    // 入口转移所有权(next turn 的新 reactions 不归本次 close 管)。
     const releaseEntries = [
-      ...this.currentBatchReactionIds.entries(),
-      ...(opts.preservePendingReactions ? [] : this.pendingReactionIds.entries()),
+      ...closeBatchReactionIds.entries(),
+      ...(closePendingReactionIds ? closePendingReactionIds.entries() : []),
     ]
     for (const [msgId, rid] of releaseEntries) {
       if (rid) void feishu.deleteReaction(msgId, rid)
     }
-    this.currentBatchReactionIds = new Map()
-    if (!opts.preservePendingReactions) this.pendingReactionIds = new Map()
+    } finally {
+      this.turnCloseInflight.delete(closeSettled)
+      settleClose()
+    }
   }
 }

@@ -12379,14 +12379,16 @@ describe('Session 簇 3 竞态甄别(上游 ff44afb 簇 3——五域代表例,0
   // 悬挂类 settlement 一律 settlementWithin race 包裹(01-09 patterns,bun 1.3.5
   // 悬挂 promise 忙旋 quirk)。
   //
-  // ── 首跑判决(2026-09-03,基线 1427 之上) ──────────────────────────────
-  // 1 TurnOpenOwner/#13    红 deferred close summary='✅ · ⏱ 0.0s',stateError 丢失
-  //                          (sawResultWhileOpening 布尔无 suffix 载荷)
-  // 2 TurnCloseSnapshot    红 旧 close 清空 next turn 的 reactions/读 live usage
-  // 3 turnCloseInflight    红 在途 close 未完成 restart 已 spawn(spawned=1)
-  // 4 BackgroundOpenOwner  红 旧 bg 开卡晚到复活为活卡(card_bg_old opened
-  //                          tasks=1),无终态化 PATCH
-  // 5 terminalizeSuperseded 绿 01-14 owner token + cleanupStaleTurnOpen 等效
+  // ── 首跑判决(2026-09-03,基线 1427 之上)与收账裁决 ────────────────────
+  // 1 TurnOpenOwner/#13    红→收 deferred close summary='✅ · ⏱ 0.0s',stateError
+  //                          丢失 → suffix/forcePush 挂 owner token(#13 最小改法)
+  // 2 TurnCloseSnapshot    红→收 旧 close 清 next turn reactions/读 live usage
+  //                          → close 入口快照,不拆 finishTurnCardClose
+  // 3 turnCloseInflight    红→收 在途 close 未完成 restart 已 spawn(spawned=1)
+  //                          → 哨兵登记 + restart spawn 前 waitForTurnCloses
+  // 4 BackgroundOpenOwner  红→收 旧 bg 开卡晚到复活为活卡,无终态化 PATCH
+  //                          → backgroundOpenGeneration 世代化
+  // 5 terminalizeSuperseded 绿→跳 01-14 owner token + cleanupStaleTurnOpen 等效
   //                          (⚪ 终态化 PATCH + 不清新 owner + currentTurn 落新卡)
 
   async function settlementWithin(promise: Promise<unknown>, timeoutMs = 3000): Promise<string> {
@@ -12409,8 +12411,10 @@ describe('Session 簇 3 竞态甄别(上游 ff44afb 簇 3——五域代表例,0
 
   // 红因(首跑):deferred close 走 closeTurnCard(undefined) — result handler 在
   // currentTurn=null 时算出的 '⚠️ 分叉 checkpoint 持久化失败' suffix/forcePush
-  // 被丢弃,终态 summary 只有 '✅ · ⏱ 0.0s'。Task 2 收翻译表 #13 最小 hunk 后转活。
-  test.todo('result racing card open carries checkpoint persistence failure into deferred close(甄别来源=ff44afb 簇 3:TurnOpenOwner/翻译表 #13)', async () => {
+  // 被丢弃,终态 summary 只有 '✅ · ⏱ 0.0s'。
+  // 收账(Task 2):翻译表 #13 最小改法——suffix/forcePush 挂 owner token
+  // (TurnOpenTerminalStash),deferred close 消费;转绿。
+  test('result racing card open carries checkpoint persistence failure into deferred close(甄别来源=ff44afb 簇 3:TurnOpenOwner/翻译表 #13)', async () => {
     // 上游断言核心:result 抢在开卡 await 窗口内到达且 checkpoint 持久化失败时,
     // stateError 必须携带进 deferred close(owner.sawResult/terminalSuffix/
     // terminalForcePush)。本地无 owner 对象——行为化断言:deferred close 的终态
@@ -12479,9 +12483,10 @@ describe('Session 簇 3 竞态甄别(上游 ff44afb 簇 3——五域代表例,0
 
   // 红因(首跑):closeTurnCard 收尾读 live 状态——flush 门后 footer/settings 读到
   // next turn 的 lastTurnDelta/lastTurnUsage,末段 release 清空的是 next turn 的
-  // reactions 两 Map(currentBatchReactionIds 变 [])。Task 2 收 close 入口快照
-  // 最小 hunk 后转活。
-  test.todo('an old close snapshots usage and reactions without clearing the next turn(甄别来源=ff44afb 簇 3:TurnCloseSnapshot)', async () => {
+  // reactions 两 Map(currentBatchReactionIds 变 [])。
+  // 收账(Task 2):close 入口同步快照(usage/context/reactions 所有权转移),终态
+  // 写只读快照——不拆 finishTurnCardClose(陷阱 4);转绿。
+  test('an old close snapshots usage and reactions without clearing the next turn(甄别来源=ff44afb 簇 3:TurnCloseSnapshot)', async () => {
     const session = new Session('close-snapshot', 'chat_id') as any
     const oldProc = new FakeAgentProc('codex', 'old-session')
     oldProc.lastUsage = { input_tokens: 100, output_tokens: 11, total_tokens: 111 } as any
@@ -12557,9 +12562,10 @@ describe('Session 簇 3 竞态甄别(上游 ff44afb 簇 3——五域代表例,0
   })
 
   // 红因(首跑):restart 对已摘除 currentTurn 的在途 close 无感知,kill 后直接
-  // spawn(50ms 调度窗内 spawned=1,旧卡 flush 仍被门控)。Task 2 收 turnClose
-  // 在途登记+等待最小 hunk 后转活。
-  test.todo('restart waits for a close that already removed currentTurn before spawning(甄别来源=ff44afb 簇 3:turnCloseInflight)', async () => {
+  // spawn(50ms 调度窗内 spawned=1,旧卡 flush 仍被门控)。
+  // 收账(Task 2):turnCloseInflight 哨兵登记 + restart spawn 前
+  // waitForTurnCloses(stop/exit 未接线——首跑无红例,处置清单记差集);转绿。
+  test('restart waits for a close that already removed currentTurn before spawning(甄别来源=ff44afb 簇 3:turnCloseInflight)', async () => {
     const session = new Session('restart-close-owner', 'chat_id') as any
     const oldProc = new FakeAgentProc('claude', 'old-session')
     const oldTurn = turnState('card_restart_close_owner', { provider: 'claude', model: null })
@@ -12618,8 +12624,10 @@ describe('Session 簇 3 竞态甄别(上游 ff44afb 簇 3——五域代表例,0
   // 红因(首跑):openBackgroundCard 落地无世代校验——reset 后晚到的旧 convert 把
   // card_bg_old 安装为活卡(日志 'background card opened cardId=card_bg_old
   // tasks=1'),其 finally 还清掉新开卡的 openingBackground 标记;旧卡永不终态化
-  // (PATCH settings 等待超时)。Task 2 收 BackgroundOpenOwner 世代化最小 hunk 后转活。
-  test.todo('an old background open cannot revive after reset or clear a newer opening owner(甄别来源=ff44afb 簇 3:BackgroundOpenOwner)', async () => {
+  // (PATCH settings 等待超时)。
+  // 收账(Task 2):backgroundOpenGeneration 世代化(开卡捕获/reset 作废/晚到自弃
+  // 终态化,完整 owner 结构不移植);转绿。
+  test('an old background open cannot revive after reset or clear a newer opening owner(甄别来源=ff44afb 簇 3:BackgroundOpenOwner)', async () => {
     const session = new Session('background-open-generation', 'chat_id') as any
     session.backgroundTasks = [makeRunningTask('old')]
 
