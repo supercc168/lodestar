@@ -12,6 +12,8 @@
  */
 import { mock } from 'bun:test'
 import type { WatchdogMode } from './turn-watchdog'
+import type { TurnAnchor, TurnWrite } from './feishu'
+import type { ConversationBranchBase, ConversationRef, PendingConversationLaunch } from './conversation'
 
 export const sentCards: object[] = []
 export const sentTexts: string[] = []
@@ -25,6 +27,22 @@ export const clearedTurnAnchors: string[] = []
  *  失败零截断是 D-02 保护线判据)。beforeEach 调 resetFeishuMock() 清空。 */
 export const truncatedTurnAnchors: Array<[string, number]> = []
 export const urgentPushes: Array<[string, string[]]> = []
+/** clearSessionResume(Checked) 调用捕获(上游 ff44afb fork 面)。 */
+export const clearedResumes: Array<[string, string | undefined]> = []
+/** session fork/back 测试用内存 turn-map V4 容器与 mutation 记录(上游 ff44afb)。 */
+export const turnAnchorsBySession = new Map<string, TurnAnchor[]>()
+export const seededTurnAnchors: Array<[string, TurnAnchor[]]> = []
+export const branchBaseBySession = new Map<string, ConversationBranchBase>()
+export const pendingConversationLaunchBySession = new Map<string, PendingConversationLaunch>()
+/** resume map ConversationRef 容器,key = `${sessionName}:${provider}`(上游 ff44afb)。 */
+export const resumeRefs = new Map<string, ConversationRef>()
+/** 写失败注入缝(挂账 #6,上游 ff44afb + 4185808 终态):checked stub 首行
+ *  `if (xxxWriteError) throw xxxWriteError`,供 'result still terminalizes…'
+ *  类用例驱动持久化失败路径。resetFeishuMock() 复位为 null。 */
+let resumeWriteError: Error | null = null
+export function setResumeWriteError(error: Error | null): void { resumeWriteError = error }
+let turnAnchorWriteError: Error | null = null
+export function setTurnAnchorWriteError(error: Error | null): void { turnAnchorWriteError = error }
 /** task v2 list 调用捕获(测 tasklist-worker 的 scanTaskSections 调用预算:每个 section
  *  只能拉一次,防双重拉取回归——上游 2026-07-30 配额审查)。beforeEach 调 resetFeishuMock() 清空。 */
 export const listSectionTasksCalls: Array<[string, boolean | undefined]> = []
@@ -62,7 +80,16 @@ export function resetFeishuMock(): void {
   for (const arr of [deleteTasklistCalls, movedTasks, addedTaskComments]) {
     arr.length = 0
   }
+  for (const arr of [clearedResumes, seededTurnAnchors]) {
+    arr.length = 0
+  }
   projectProfiles.clear()
+  resumeRefs.clear()
+  turnAnchorsBySession.clear()
+  branchBaseBySession.clear()
+  pendingConversationLaunchBySession.clear()
+  resumeWriteError = null
+  turnAnchorWriteError = null
   feishuMockState.chatIdForSession = null
   feishuMockState.sendCard = null
   feishuMockState.deleteTasklistByGuid = null
@@ -71,9 +98,35 @@ export function resetFeishuMock(): void {
   feishuMockState.updateCard = null
 }
 
+/** bindSessionResume(Checked) 双形态入参归一(与真实 sessionResumeRefFromArgs 同语义:
+ *  string 老签名缺 cwd → cwd:null;ref 对象原样)。 */
+function normalizeResumeArgs(
+  sessionIdOrRef: string | ConversationRef,
+  provider?: string,
+  cwd?: string,
+): ConversationRef {
+  if (typeof sessionIdOrRef !== 'string') return sessionIdOrRef
+  return {
+    provider: (provider ?? 'codex') as ConversationRef['provider'],
+    sessionId: sessionIdOrRef,
+    cwd: cwd ?? null,
+  }
+}
+
+/** getTurnAnchors 容器路径的 uuid/sid 读投影(与真实 feishu.ts PHASE4-TRANSITION
+ *  投影同形:uuid=checkpoint.id、sid=checkpoint.source.sessionId)。 */
+function projectAnchors(anchors: TurnAnchor[]): Array<TurnAnchor & { uuid: string; sid: string }> {
+  return anchors.map(a => ({ ...a, uuid: a.checkpoint.id, sid: a.checkpoint.source.sessionId }))
+}
+
 mock.module('./feishu', () => ({
   PROJECTS_ROOT: '/tmp/lodestar-projects',
-  getSessionResume: () => null,
+  getSessionResume: (sessionName: string, provider = 'codex') =>
+    resumeRefs.get(`${sessionName}:${provider}`)?.sessionId ?? null,
+  getSessionResumeRef: (sessionName: string, provider = 'codex') => {
+    const ref = resumeRefs.get(`${sessionName}:${provider}`)
+    return ref ? { ...ref } : null
+  },
   getSessionModelSelection: () => null,
   getTenantToken: async () => 'tenant-token',
   preferredChatForSession: new Map(),
@@ -113,10 +166,38 @@ mock.module('./feishu', () => ({
     listTasklistTasksCalls.push([guid, completed])
     return []
   },
-  bindSessionResume: (sessionName: string, sessionId: string, provider?: string) => {
-    boundResumes.push([sessionName, sessionId, provider])
+  bindSessionResume: (sessionName: string, sessionIdOrRef: string | ConversationRef, provider?: string, cwd?: string) => {
+    const normalized = normalizeResumeArgs(sessionIdOrRef, provider, cwd)
+    boundResumes.push([
+      sessionName,
+      normalized.sessionId,
+      typeof sessionIdOrRef === 'string' ? provider : normalized.provider,
+    ])
+    resumeRefs.set(`${sessionName}:${normalized.provider}`, normalized)
+  },
+  bindSessionResumeChecked: (sessionName: string, sessionIdOrRef: string | ConversationRef, provider?: string, cwd?: string) => {
+    if (resumeWriteError) throw resumeWriteError
+    const normalized = normalizeResumeArgs(sessionIdOrRef, provider, cwd)
+    boundResumes.push([
+      sessionName,
+      normalized.sessionId,
+      typeof sessionIdOrRef === 'string' ? provider : normalized.provider,
+    ])
+    resumeRefs.set(`${sessionName}:${normalized.provider}`, normalized)
+  },
+  clearSessionResume: (sessionName: string, provider?: string) => {
+    clearedResumes.push([sessionName, provider])
+    if (provider) resumeRefs.delete(`${sessionName}:${provider}`)
+    else for (const p of ['codex', 'claude']) resumeRefs.delete(`${sessionName}:${p}`)
+  },
+  clearSessionResumeChecked: (sessionName: string, provider?: string) => {
+    if (resumeWriteError) throw resumeWriteError
+    clearedResumes.push([sessionName, provider])
+    if (provider) resumeRefs.delete(`${sessionName}:${provider}`)
+    else for (const p of ['codex', 'claude']) resumeRefs.delete(`${sessionName}:${p}`)
   },
   bindSessionModel: () => {},
+  bindSessionModelChecked: () => {},
   provisionProject: () => {},
   projectProfile: (name: string) => projectProfiles.get(name),
   updateCard: async (messageId: string, card: object) => {
@@ -149,16 +230,84 @@ mock.module('./feishu', () => ({
     addedTaskComments.push([taskGuid, content])
     return `comment_${addedTaskComments.length}`
   },
-  // 临时群 / fork / back / rs 恢复相关 stub(测试不验证这些路径,no-op / 空返回)
+  // 临时群 / fork / back / rs 相关 stub(V4 容器 + checked 系列,上游 ff44afb/4185808;
+  // feishuMockState.turnAnchors 为既有 V1 显式替身,优先于容器返回——01-10 用例零改动)
   tempProjectName: () => null,
-  tempChatName: (project: string) => `${project}*0000-0000`,
-  appendTurnAnchor: () => {},
-  getTurnAnchors: () => feishuMockState.turnAnchors,
+  tempChatName: (project: string, additionallyUsed: Iterable<string> = []) => {
+    const used = new Set(additionallyUsed)
+    let name = `${project}*0000-0000`
+    for (let seq = 2; used.has(name); seq++) name = `${project}*0000-0000-${seq}`
+    return name
+  },
+  appendTurnAnchor: (
+    sessionName: string,
+    anchor: { uuid: string; sid: string; preview: string; ts: number; writes: TurnWrite[] },
+  ) => {
+    // 与真实 PHASE4-TRANSITION 壳同语义:V1 输入组装 claude checkpoint 后入容器
+    const current = turnAnchorsBySession.get(sessionName) ?? []
+    turnAnchorsBySession.set(sessionName, [...current, {
+      checkpoint: {
+        provider: 'claude',
+        kind: 'assistant-message',
+        id: anchor.uuid,
+        source: { provider: 'claude', sessionId: anchor.sid, cwd: null },
+      },
+      preview: anchor.preview,
+      ts: anchor.ts,
+      writes: anchor.writes,
+    }])
+  },
+  appendTurnAnchorChecked: (sessionName: string, anchor: TurnAnchor) => {
+    if (turnAnchorWriteError) throw turnAnchorWriteError
+    const current = turnAnchorsBySession.get(sessionName) ?? []
+    turnAnchorsBySession.set(sessionName, [...current, anchor])
+  },
+  getTurnAnchors: (sessionName: string) => feishuMockState.turnAnchors.length
+    ? feishuMockState.turnAnchors
+    : projectAnchors(turnAnchorsBySession.get(sessionName) ?? []),
+  getSessionBranchBase: (sessionName: string) => branchBaseBySession.get(sessionName) ?? null,
+  getPendingConversationLaunch: (sessionName: string) =>
+    pendingConversationLaunchBySession.get(sessionName) ?? null,
+  setPendingConversationLaunchChecked: (sessionName: string, pending: PendingConversationLaunch | null) => {
+    if (turnAnchorWriteError) throw turnAnchorWriteError
+    if (pending) pendingConversationLaunchBySession.set(sessionName, pending)
+    else pendingConversationLaunchBySession.delete(sessionName)
+  },
   truncateTurnAnchors: (sessionName: string, fromIdx: number) => {
     truncatedTurnAnchors.push([sessionName, fromIdx])
+    const current = turnAnchorsBySession.get(sessionName)
+    if (current && current.length > fromIdx) {
+      turnAnchorsBySession.set(sessionName, current.slice(0, fromIdx))
+    }
   },
-  seedTurnAnchors: () => {},
-  clearTurnAnchors: (sessionName: string) => { clearedTurnAnchors.push(sessionName) },
+  seedTurnAnchors: (sessionName: string, anchors: TurnAnchor[]) => {
+    const copied = anchors.slice()
+    seededTurnAnchors.push([sessionName, copied])
+    if (copied.length > 0) turnAnchorsBySession.set(sessionName, copied)
+  },
+  clearTurnAnchors: (sessionName: string) => {
+    clearedTurnAnchors.push(sessionName)
+    turnAnchorsBySession.delete(sessionName)
+    branchBaseBySession.delete(sessionName)
+    pendingConversationLaunchBySession.delete(sessionName)
+  },
+  replaceTurnAnchors: (
+    sessionName: string,
+    anchors: TurnAnchor[],
+    base: ConversationBranchBase,
+    pending?: PendingConversationLaunch | null,
+  ) => {
+    if (turnAnchorWriteError) throw turnAnchorWriteError
+    clearedTurnAnchors.push(sessionName)
+    const copied = anchors.slice()
+    seededTurnAnchors.push([sessionName, copied])
+    turnAnchorsBySession.set(sessionName, copied)
+    branchBaseBySession.set(sessionName, base)
+    if (pending !== undefined) {
+      if (pending) pendingConversationLaunchBySession.set(sessionName, pending)
+      else pendingConversationLaunchBySession.delete(sessionName)
+    }
+  },
   ensureChatForSession: async (chatName: string) => ({ chatId: `oc_${chatName}`, created: true, joined: true }),
   disbandChatForSession: async () => ({ chatId: null, disbanded: true }),
 }))
