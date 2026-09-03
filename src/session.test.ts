@@ -326,6 +326,21 @@ function dueWatchdogSession(opts: { recoveryAttempt?: 0 | 1 } = {}) {
   return fixture
 }
 
+/** 从 panel 选择卡里按 preview 提取 {panelId, choiceId}(ff44afb opaque 形态;
+ *  session-temp.test.ts pickerValue 同型)。 */
+function pickerValueFromCard(card: any, preview: string): { panelId: string; choiceId: string } {
+  for (const element of card?.body?.elements ?? []) {
+    if (element?.tag !== 'column_set') continue
+    const markdown = element.columns?.[0]?.elements?.[0]?.content
+    if (!String(markdown ?? '').includes(preview)) continue
+    const value = element.columns?.[1]?.elements?.[0]?.behaviors?.[0]?.value
+    if (typeof value?.panel_id === 'string' && typeof value?.choice_id === 'string') {
+      return { panelId: value.panel_id, choiceId: value.choice_id }
+    }
+  }
+  throw new Error(`picker choice not found for preview: ${preview}`)
+}
+
 function installFailedWatchdogRecovery(
   session: any,
   opts: {
@@ -6790,7 +6805,12 @@ describe('Session preserved recovery guards for rollback and history selection',
       return new FakeAgentProc('codex', 'forked-thread')
     }
 
-    const started = await session.startForked('history-thread', 'assistant-anchor')
+    const source = { provider: 'codex' as const, sessionId: 'history-thread', cwd: session.workDir }
+    const started = await session.startForked({
+      kind: 'fork',
+      source,
+      through: { provider: 'codex', kind: 'turn', id: 'assistant-anchor', source },
+    })
 
     expect(started).toBe(false)
     expect(spawnCalls).toBe(0)
@@ -6808,9 +6828,14 @@ describe('Session preserved recovery guards for rollback and history selection',
       await session.onModelSelect('gpt-5.6-sol', '', '', { provider: 'codex' })
     }],
     ['back command', async (session: any) => { await session.runCommand('bk') }],
-    ['back selection', async (session: any) => { await session.onBackSelect(0) }],
-    ['resume selection', async (session: any) => { await session.onResumeSelect('history-thread') }],
-    ['rollback', async (session: any) => { await session.rollbackTo('history-thread', undefined) }],
+    ['back selection', async (session: any) => { await session.onBackSelect('stale-panel', 'stale-choice', 'ou_user') }],
+    ['resume selection', async (session: any) => { await session.onResumeSelect('stale-panel', 'stale-choice', 'ou_user') }],
+    ['rollback', async (session: any) => {
+      await session.rollbackTo({
+        kind: 'fork',
+        source: { provider: 'codex', sessionId: 'history-thread', cwd: session.workDir },
+      })
+    }],
   ] as const) {
     test(`${label} rejection does not supersede an active preserved recovery`, async () => {
       const session = new Session(`preserved-guard-${label.replaceAll(' ', '-')}`, 'chat_id') as any
@@ -6835,7 +6860,10 @@ describe('Session preserved recovery guards for rollback and history selection',
     let restartCalls = 0
     session.restart = async () => { restartCalls++; return true }
 
-    const ok = await session.rollbackTo('claude-new-thread', 'assistant-anchor')
+    const ok = await session.rollbackTo({
+      kind: 'fork',
+      source: { provider: 'claude', sessionId: 'claude-new-thread', cwd: session.workDir },
+    })
 
     expect(ok).toBe(false)
     expect(restartCalls).toBe(0)
@@ -6854,7 +6882,10 @@ describe('Session preserved recovery guards for rollback and history selection',
       return true
     }
 
-    const rollingBack = session.rollbackTo('claude-new-thread', 'assistant-anchor')
+    const rollingBack = session.rollbackTo({
+      kind: 'fork',
+      source: { provider: 'claude', sessionId: 'claude-new-thread', cwd: session.workDir },
+    })
     await restartEntered.promise
     installFailedWatchdogRecovery(session)
     restartRelease.resolve()
@@ -6864,28 +6895,54 @@ describe('Session preserved recovery guards for rollback and history selection',
     expect(session.lastSessionId).toBe('claude-original-thread')
   })
 
-  test('back selection rejects preserved recovery before preliminary card work', async () => {
+  test('back selection rejects preserved recovery after claim(守卫叠加:claim 通过 ≠ lifecycle 可抢占)', async () => {
     const session = new Session('back-select-preserved', 'chat_id') as any
     session.selectedProvider = 'claude'
-    installFailedWatchdogRecovery(session)
+    session.lastSessionId = 'sid-current'
+    const a1 = {
+      checkpoint: {
+        provider: 'claude' as const, kind: 'assistant-message' as const, id: 'u1',
+        source: { provider: 'claude' as const, sessionId: 'sid-current', cwd: session.workDir },
+      },
+      preview: '保留输入', ts: 1, writes: [],
+    }
+    const a2 = { ...a1, checkpoint: { ...a1.checkpoint, id: 'u2' }, preview: '回退输入' }
+    turnAnchorsBySession.set('back-select-preserved', [a1, a2])
+    branchBaseBySession.set('back-select-preserved', { kind: 'fresh' })
     let rollbackCalls = 0
     session.rollbackTo = async () => { rollbackCalls++; return true }
 
-    await session.onBackSelect(0)
+    await session.showBackList('ou_user')
+    const value = pickerValueFromCard(sentCards[0], '回退输入')
+    installFailedWatchdogRecovery(session)
+    const result = await session.onBackSelect(value.panelId, value.choiceId, 'ou_user')
 
+    expect(result.ok).toBe(false)
     expect(rollbackCalls).toBe(0)
     expect(sentTexts.at(-1)).toContain('自动恢复')
   })
 
-  test('resume selection rejects preserved recovery before its preliminary message', async () => {
+  test('resume selection rejects preserved recovery after claim(守卫叠加)', async () => {
     const session = new Session('resume-select-preserved', 'chat_id') as any
-    session.selectedProvider = 'claude'
-    installFailedWatchdogRecovery(session)
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'codex-current'
+    session.listCodexConversations = async () => [{
+      provider: 'codex' as const,
+      sessionId: 'codex-history-thread',
+      cwd: session.workDir,
+      preview: '历史输入',
+      ts: 1,
+      status: 'idle',
+    }]
     let rollbackCalls = 0
     session.rollbackTo = async () => { rollbackCalls++; return true }
 
-    await session.onResumeSelect('claude-history-thread')
+    await session.showResumeList('ou_user')
+    const value = pickerValueFromCard(sentCards[0], '历史输入')
+    installFailedWatchdogRecovery(session)
+    const result = await session.onResumeSelect(value.panelId, value.choiceId, 'ou_user')
 
+    expect(result.ok).toBe(false)
     expect(rollbackCalls).toBe(0)
     expect(sentTexts.at(-1)).toContain('自动恢复')
     expect(sentTexts.some(text => text.includes('在本群恢复会话'))).toBe(false)
@@ -6972,35 +7029,45 @@ describe('Session stop/restart kill-unconfirmed alignment (upstream ec149d7 主�
   })
 })
 
-describe('Session handler business receipts (upstream ec149d7 主题 I)', () => {
-  const anchor = (uuid: string) => ({ uuid, sid: 'sid-1', preview: 'p', ts: 1, writes: [] })
+describe('Session handler business receipts (upstream ec149d7 主题 I → ff44afb panel 形态)', () => {
+  // V4 claude 锚(委托链走真实 session-temp panel 流程;cwd 必须匹配 session.workDir)
+  const claudeAnchor = (session: any, id: string, preview: string) => ({
+    checkpoint: {
+      provider: 'claude' as const, kind: 'assistant-message' as const, id,
+      source: { provider: 'claude' as const, sessionId: 'sid-current', cwd: session.workDir },
+    },
+    preview, ts: 1, writes: [],
+  })
 
-  test('onForkSelect returns failure result for an invalid anchor instead of chat-text error', async () => {
+  test('onForkSelect returns failure result for an invalid selection instead of chat-text error', async () => {
     const session = new Session('receipt-fork-invalid', 'chat_id') as any
     session.selectedProvider = 'claude'
     session.opts.onCreateTempSession = async () => ({ ok: true })
 
-    const result = await session.onForkSelect(5, 'ou_user')
+    const result = await session.onForkSelect('missing-panel', 'missing-choice', 'ou_user')
 
-    expect(result).toMatchObject({ ok: false })
-    expect(String(result.message)).toContain('无效的分叉点')
+    expect(result).toMatchObject({ ok: false, replaceCard: false })
+    expect(String(result.message)).toContain('已过期')
   })
 
-  test('onForkSelect origin success returns ok result and keeps anchor semantics unchanged', async () => {
+  test('onForkSelect origin success returns ok result and keeps origin semantics unchanged', async () => {
     const session = new Session('receipt-fork-origin', 'chat_id') as any
     session.selectedProvider = 'claude'
     session.lastSessionId = 'sid-current'
-    feishuMockState.turnAnchors = [anchor('u1')]
+    turnAnchorsBySession.set('receipt-fork-origin', [claudeAnchor(session, 'u1', '起点输入')])
+    branchBaseBySession.set('receipt-fork-origin', { kind: 'fresh' })
     let created: any = null
     session.opts.onCreateTempSession = async (opts: any) => { created = opts; return { ok: true } }
 
-    const result = await session.onForkSelect(0, 'ou_user')
+    await session.showForkList('ou_user')
+    const value = pickerValueFromCard(sentCards[0], '起点输入')
+    const result = await session.onForkSelect(value.panelId, value.choiceId, 'ou_user')
 
     expect(result.ok).toBe(true)
     expect(String(result.message)).toContain('已分叉到')
-    // D-02 保护线:idx==0 = 会话起点,不 resume、不带锚点 —— 分叉锚点计算零变化。
-    expect(created.resumeSessionId).toBeUndefined()
-    expect(created.resumeSessionAt).toBeUndefined()
+    // D-02 保护线:起点项 = 会话起点(fresh base),不带 resume 锚点 —— 语义零变化。
+    expect(created.launch).toEqual({ kind: 'fresh' })
+    expect(created.seedAnchors).toEqual([])
     // 进度提示仍走群消息(上游保留 🔱 preliminary text)。
     expect(sentTexts.some((text: string) => text.includes('分叉到'))).toBe(true)
   })
@@ -7008,72 +7075,111 @@ describe('Session handler business receipts (upstream ec149d7 主题 I)', () => 
   test('onForkSelect create failure returns failure payload for the receipt path', async () => {
     const session = new Session('receipt-fork-fail', 'chat_id') as any
     session.selectedProvider = 'claude'
-    feishuMockState.turnAnchors = [anchor('u1')]
+    session.lastSessionId = 'sid-current'
+    turnAnchorsBySession.set('receipt-fork-fail', [claudeAnchor(session, 'u1', '失败输入')])
+    branchBaseBySession.set('receipt-fork-fail', { kind: 'fresh' })
     session.opts.onCreateTempSession = async () => ({ ok: false, error: '建群超时' })
 
-    const result = await session.onForkSelect(0, 'ou_user')
+    await session.showForkList('ou_user')
+    const value = pickerValueFromCard(sentCards[0], '失败输入')
+    const result = await session.onForkSelect(value.panelId, value.choiceId, 'ou_user')
 
     expect(result.ok).toBe(false)
     expect(String(result.message)).toContain('分叉失败')
     expect(String(result.message)).toContain('建群超时')
   })
 
-  test('onBackSelect success truncates anchors and returns ok result', async () => {
+  test('onBackSelect success hands seed anchors to rollbackTo branchState(成功才换锚)', async () => {
     const session = new Session('receipt-back-ok', 'chat_id') as any
     session.selectedProvider = 'claude'
     session.lastSessionId = 'sid-current'
-    feishuMockState.turnAnchors = [anchor('u1'), anchor('u2')]
-    session.rollbackTo = async () => true
+    const a1 = claudeAnchor(session, 'u1', '保留输入')
+    const a2 = claudeAnchor(session, 'u2', '回退输入')
+    turnAnchorsBySession.set('receipt-back-ok', [a1, a2])
+    branchBaseBySession.set('receipt-back-ok', { kind: 'fresh' })
+    let captured: any = null
+    session.rollbackTo = async (launch: any, branchState: any) => { captured = { launch, branchState }; return true }
 
-    const result = await session.onBackSelect(1)
+    await session.showBackList('ou_user')
+    const value = pickerValueFromCard(sentCards[0], '回退输入')
+    const result = await session.onBackSelect(value.panelId, value.choiceId, 'ou_user')
 
     expect(result.ok).toBe(true)
-    // 成功才截断(reset 语义)—— 回滚行为零变化。
-    expect(truncatedTurnAnchors).toEqual([['receipt-back-ok', 1]])
+    // 截断语义换代:seedAnchors 经 rollbackTo branchState 原子换(不再走 truncate 壳)。
+    expect(captured.branchState).toMatchObject({ anchors: [a1], base: { kind: 'fresh' } })
+    expect(captured.launch).toEqual({ kind: 'fork', source: a1.checkpoint.source, through: a1.checkpoint })
+    expect(truncatedTurnAnchors).toEqual([])
   })
 
   test('onBackSelect rollback failure keeps anchors untouched and returns failure result', async () => {
     const session = new Session('receipt-back-fail', 'chat_id') as any
     session.selectedProvider = 'claude'
     session.lastSessionId = 'sid-current'
-    feishuMockState.turnAnchors = [anchor('u1'), anchor('u2')]
+    const a1 = claudeAnchor(session, 'u1', '保留输入')
+    const a2 = claudeAnchor(session, 'u2', '回退输入')
+    turnAnchorsBySession.set('receipt-back-fail', [a1, a2])
+    branchBaseBySession.set('receipt-back-fail', { kind: 'fresh' })
     session.rollbackTo = async () => false
 
-    const result = await session.onBackSelect(1)
+    await session.showBackList('ou_user')
+    const value = pickerValueFromCard(sentCards[0], '回退输入')
+    const result = await session.onBackSelect(value.panelId, value.choiceId, 'ou_user')
 
     expect(result.ok).toBe(false)
-    expect(String(result.message)).toContain('回滚失败')
+    expect(String(result.message)).toContain('回退失败')
     // D-02 判据:失败不动锚点,用户可重试不丢历史。
+    expect(turnAnchorsBySession.get('receipt-back-fail')).toEqual([a1, a2])
     expect(truncatedTurnAnchors).toEqual([])
   })
 
-  test('onResumeSelect rejects a blank session id with a failure result', async () => {
+  test('onResumeSelect rejects an invalid selection with a failure result', async () => {
     const session = new Session('receipt-resume-blank', 'chat_id') as any
     session.selectedProvider = 'claude'
     let rollbackCalls = 0
     session.rollbackTo = async () => { rollbackCalls++; return true }
 
-    const result = await session.onResumeSelect('   ')
+    const result = await session.onResumeSelect('missing-panel', 'missing-choice', 'ou_user')
 
-    expect(result.ok).toBe(false)
+    expect(result).toMatchObject({ ok: false, replaceCard: false })
     expect(rollbackCalls).toBe(0)
   })
 
-  test('onResumeSelect success clears anchors and returns ok; failure leaves them alone', async () => {
+  test('onResumeSelect success clears anchors via branchState; failure leaves them alone', async () => {
     const session = new Session('receipt-resume-ok', 'chat_id') as any
-    session.selectedProvider = 'claude'
-    session.rollbackTo = async () => true
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'current-thread'
+    session.listCodexConversations = async () => [{
+      provider: 'codex' as const, sessionId: 'hist-thread', cwd: session.workDir,
+      preview: '历史输入', ts: 1, status: 'idle',
+    }]
+    let captured: any = null
+    session.rollbackTo = async (launch: any, branchState: any) => {
+      captured = { launch, branchState }
+      session.lastSessionId = 'new-forked-thread'
+      return true
+    }
 
-    const ok = await session.onResumeSelect('claude-history-thread')
+    await session.showResumeList('ou_user')
+    const value = pickerValueFromCard(sentCards[0], '历史输入')
+    const ok = await session.onResumeSelect(value.panelId, value.choiceId, 'ou_user')
     expect(ok.ok).toBe(true)
-    expect(clearedTurnAnchors).toContain('receipt-resume-ok')
+    expect(ok.resumePresentation?.bindingState).toBe('changed')
+    expect(captured.branchState).toMatchObject({ anchors: [], base: captured.launch, pendingLaunch: null })
 
     resetFeishuMock()
     const failing = new Session('receipt-resume-fail', 'chat_id') as any
-    failing.selectedProvider = 'claude'
+    failing.selectedProvider = 'codex'
+    failing.lastSessionId = 'current-thread'
+    failing.listCodexConversations = async () => [{
+      provider: 'codex' as const, sessionId: 'hist-thread', cwd: failing.workDir,
+      preview: '历史输入', ts: 1, status: 'idle',
+    }]
     failing.rollbackTo = async () => false
-    const fail = await failing.onResumeSelect('claude-history-thread')
+    await failing.showResumeList('ou_user')
+    const failValue = pickerValueFromCard(sentCards[0], '历史输入')
+    const fail = await failing.onResumeSelect(failValue.panelId, failValue.choiceId, 'ou_user')
     expect(fail.ok).toBe(false)
+    expect(fail.resumePresentation?.bindingState).toBe('unchanged')
     expect(clearedTurnAnchors).toEqual([])
   })
 
@@ -10867,9 +10973,11 @@ describe('rs (restart) — 双模式列表分支', () => {
     expect(restartCalled).toBe(false)
   })
 
-  test('codex 空闲态应直接 restart(true),不走 claude-only showResumeList', async () => {
-    // port of upstream d9341b6: codex 无 transcript 列表;list/onResumeSelect 是
-    // claude-only。空闲判定仍用本地「无 turn」语义(非 !isRunning())。
+  test('codex 空闲态也走 showResumeList(上游 ff44afb 门控解除;空闲判定保本地 no-turn)', async () => {
+    // 上游 ff44afb 解除 rs 门的 codex 条件:双后端都列同 cwd 历史(Codex 走
+    // thread/list)并从所选会话创建独立分支。此前 codex 空闲 fall-through
+    // restart(true)(d9341b6 时代 claude-only 列表)。空闲判定仍保本地 no-turn
+    // 三条件(陷阱 1:非 !isRunning(),进程 turn 间常驻保活)。
     const session = new Session('probe', 'chat_id') as any
     session.proc = { isAlive: () => true, provider: 'codex' }
     session.currentTurn = null
@@ -10879,15 +10987,10 @@ describe('rs (restart) — 双模式列表分支', () => {
     session.lastSessionId = 'codexsid12345678'
     session.runningAgy = false
 
-    let listCalled = false
+    let listOpenId: string | null = null
     let restartCalled = false
-    let restartResume: boolean | undefined
-    session.showResumeList = async () => { listCalled = true }
-    session.restart = async (resume?: boolean) => {
-      restartCalled = true
-      restartResume = resume
-      return true
-    }
+    session.showResumeList = async (userOpenId: string) => { listOpenId = userOpenId }
+    session.restart = async () => { restartCalled = true; return true }
     session.openStatusCard = async () => null
     session.closeStatusCard = async () => {}
     session.setStatusCard = () => {}
@@ -10896,11 +10999,33 @@ describe('rs (restart) — 双模式列表分支', () => {
     session.backendLabel = () => 'codex'
     session.currentProvider = () => 'codex'
 
-    await session.runCommand('rs')
+    await session.runCommand('rs', 'ou_user')
 
-    expect(listCalled).toBe(false)
-    expect(restartCalled).toBe(true)
-    expect(restartResume).toBe(true)
+    expect(listOpenId).toBe('ou_user')
+    expect(restartCalled).toBe(false)
+  })
+})
+
+describe('bk (back) — 命令阶段不预停(上游 ff44afb)', () => {
+  test('bk 命令只弹列表不 stop 不取 lifecycle;点选校验后才 stop→fork', async () => {
+    const session = new Session('bk-no-prestop', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.proc = { isAlive: () => true, provider: 'claude' }
+    session.currentTurn = null
+    session.runningAgy = false
+    session.startingAgy = false
+    let stopCalls = 0
+    session.stop = async () => { stopCalls++; return true }
+    let listOpenId: string | null = null
+    session.showBackList = async (userOpenId: string) => { listOpenId = userOpenId }
+    const epochBefore = session.lifecycleEpoch
+
+    await session.runCommand('bk', 'ou_user')
+
+    // 「看完不点也被终止」修复:命令只展示列表,进程保持存活,不占 lifecycle。
+    expect(stopCalls).toBe(0)
+    expect(listOpenId).toBe('ou_user')
+    expect(session.lifecycleEpoch).toBe(epochBefore)
   })
 })
 
@@ -11287,10 +11412,14 @@ describe('Session conversation launch 数据流(上游 ff44afb 簇 1)', () => {
       return true
     }
 
-    const ok = await session.rollbackTo('source-thread', 'turn-3')
+    const source = { provider: 'codex' as const, sessionId: 'source-thread', cwd: session.workDir }
+    const ok = await session.rollbackTo({
+      kind: 'fork',
+      source,
+      through: { provider: 'codex', kind: 'turn', id: 'turn-3', source },
+    })
 
     expect(ok).toBe(true)
-    const source = { provider: 'codex', sessionId: 'source-thread', cwd: session.workDir }
     expect(captured?.launch).toEqual({
       kind: 'fork',
       source,
@@ -11309,10 +11438,14 @@ describe('Session conversation launch 数据流(上游 ff44afb 簇 1)', () => {
       return true
     }
 
-    const ok = await session.startForked('history-session', 'uuid-7')
+    const source = { provider: 'claude' as const, sessionId: 'history-session', cwd: session.workDir }
+    const ok = await session.startForked({
+      kind: 'fork',
+      source,
+      through: { provider: 'claude', kind: 'assistant-message', id: 'uuid-7', source },
+    })
 
     expect(ok).toBe(true)
-    const source = { provider: 'claude', sessionId: 'history-session', cwd: session.workDir }
     expect(captured?.launch).toEqual({
       kind: 'fork',
       source,

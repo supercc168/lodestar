@@ -9,19 +9,28 @@
  * 全路径覆盖(上游同款),并以「连续两用例同名不互撞 + 失败路径释放」测试锁定。
  */
 import { beforeEach, describe, expect, test } from 'bun:test'
-import type { ConversationLaunch, ConversationRouting } from './conversation'
+import type { ConversationLaunch, ConversationRouting, ConversationSummary } from './conversation'
 import type { TurnAnchor } from './feishu'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import {
   branchBaseBySession,
+  feishuMockState,
   resetFeishuMock,
   sentCards,
+  sentTexts,
   turnAnchorsBySession,
 } from './feishu-test-mock'
 import {
   onBackSelect,
   onForkSelect,
+  onResumeSelect,
+  runBtwCommand,
+  runByeCommand,
   showBackList,
   showForkList,
+  showResumeList,
 } from './session-temp'
 
 interface TempHarnessState {
@@ -29,6 +38,8 @@ interface TempHarnessState {
   rollbackResult: boolean
   preservedRecovery: boolean
   leaseStolen: boolean
+  running: boolean
+  history: ConversationSummary[]
 }
 
 interface TempHarness {
@@ -47,6 +58,8 @@ function makeHarness(sessionName = 'project', provider: 'claude' | 'codex' = 'co
     rollbackResult: true,
     preservedRecovery: false,
     leaseStolen: false,
+    running: false,
+    history: [],
   }
   const createCalls: any[] = []
   const rollbackCalls: ConversationLaunch[] = []
@@ -66,7 +79,7 @@ function makeHarness(sessionName = 'project', provider: 'claude' | 'codex' = 'co
     },
     backendLabel: () => (provider === 'codex' ? 'Codex' : 'Claude'),
     conversationRouting: () => ({ ...state.routing }),
-    isRunning: () => false,
+    isRunning: () => state.running,
     hasPreservedWatchdogRecovery: () => state.preservedRecovery,
     beginLifecycle: (kind: string) => {
       currentLease = Object.freeze({ kind })
@@ -74,7 +87,7 @@ function makeHarness(sessionName = 'project', provider: 'claude' | 'codex' = 'co
     },
     ownsLifecycle: (lease: object | null | undefined) =>
       !!lease && lease === currentLease && !state.leaseStolen,
-    listCodexConversations: async () => [],
+    listCodexConversations: async () => state.history.slice(),
     rollbackTo: async (launch: ConversationLaunch, branchState?: { anchors: TurnAnchor[]; base: any }) => {
       rollbackCalls.push(launch)
       rollbackStates.push(branchState)
@@ -375,5 +388,417 @@ describe('session-temp reserveTempChatName 保留集', () => {
     const ok = await onForkSelect(retry.session, retryValue.panelId, retryValue.choiceId, 'ou_owner')
     expect(ok.ok).toBe(true)
     expect(retry.createCalls[0].chatName).toBe('project*0000-0000')
+  })
+})
+
+// ═══ Task 3:五命令新语义(上游 ff44afb;门控解除后 Codex 三命令可达) ═══
+
+/** Claude transcript 临时目录(上游 'Claude rs 成功' 同型:CLAUDE_CONFIG_DIR 覆盖)。 */
+async function withClaudeHistory(
+  sessions: Record<string, string>,
+  run: () => Promise<void>,
+): Promise<void> {
+  const configDir = mkdtempSync(join(tmpdir(), 'lodestar-claude-rs-'))
+  const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+  const transcriptDir = join(configDir, 'projects', '/workspace/project'.replace(/[^a-zA-Z0-9]/g, '-'))
+  mkdirSync(transcriptDir, { recursive: true })
+  for (const [sessionId, firstInput] of Object.entries(sessions)) {
+    writeFileSync(join(transcriptDir, `${sessionId}.jsonl`), `${JSON.stringify({
+      type: 'queue-operation',
+      operation: 'enqueue',
+      content: firstInput,
+    })}\n`)
+  }
+  process.env.CLAUDE_CONFIG_DIR = configDir
+  try {
+    await run()
+  } finally {
+    if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+    else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+    rmSync(configDir, { recursive: true, force: true })
+  }
+}
+
+describe('session-temp Codex btw/fork(上游 ff44afb)', () => {
+  test('btw 以当前 routing 和原 workDir 创建 fresh 会话(双后端)', async () => {
+    const h = makeHarness()
+
+    await runBtwCommand(h.session, 'ou_owner')
+
+    expect(h.createCalls).toEqual([{
+      chatName: 'project*0000-0000',
+      userOpenId: 'ou_owner',
+      workDir: '/workspace/project',
+      routing: h.state.routing,
+      launch: { kind: 'fresh' },
+      branchBase: { kind: 'fresh' },
+      seedAnchors: [],
+    }])
+    expect(sentTexts.some(text => text.includes('Codex'))).toBe(true)
+    expect(sentTexts.at(-1)).toContain('已创建')
+  })
+
+  test('bye 不再要求先 stop:运行中也直接停止并解散,带 chatId 精确交给回调', async () => {
+    const h = makeHarness('project*0101-0101')
+    h.state.running = true
+    const disbandCalls: Array<[string, string]> = []
+    h.session.opts.onDisbandTempSession = async (name: string, chatId: string) => {
+      disbandCalls.push([name, chatId])
+      return { ok: true }
+    }
+
+    await runByeCommand(h.session)
+
+    expect(disbandCalls).toEqual([['project*0101-0101', 'oc_project*0101-0101']])
+    expect(sentTexts.some(text => text.includes('正在停止会话并解散'))).toBe(true)
+    expect(sentTexts.some(text => text.includes('还在跑'))).toBe(false)
+  })
+
+  test('fork 第 0 条输入从 fresh 启动且不 seed 历史', async () => {
+    const h = makeHarness()
+    const first = anchorFor('codex', 'first-input', 'original-thread', 'turn-1')
+    turnAnchorsBySession.set(h.session.sessionName, [first])
+    branchBaseBySession.set(h.session.sessionName, { kind: 'fresh' })
+
+    await showForkList(h.session, 'ou_owner')
+    const value = pickerValue(sentCards[0], 'first-input')
+    const result = await onForkSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+
+    expect(result.ok).toBe(true)
+    expect(h.createCalls[0].launch).toEqual({ kind: 'fresh' })
+    expect(h.createCalls[0].seedAnchors).toEqual([])
+  })
+
+  test('fork 后续输入使用前一 checkpoint 自带 source 并 seed 分叉前锚点', async () => {
+    const h = makeHarness()
+    const first = anchorFor('codex', 'first-input', 'root-thread', 'turn-root')
+    const second = anchorFor('codex', 'second-input', 'nested-thread', 'turn-nested')
+    const third = anchorFor('codex', 'third-input', 'current-thread', 'turn-current')
+    turnAnchorsBySession.set(h.session.sessionName, [first, second, third])
+    branchBaseBySession.set(h.session.sessionName, { kind: 'fresh' })
+
+    await showForkList(h.session, 'ou_owner')
+    const value = pickerValue(sentCards[0], 'third-input')
+    const result = await onForkSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+
+    expect(result.ok).toBe(true)
+    expect(h.createCalls[0].launch).toEqual({
+      kind: 'fork',
+      source: { provider: 'codex', sessionId: 'nested-thread', cwd: '/workspace/project' },
+      through: second.checkpoint,
+    })
+    expect(h.createCalls[0].launch.source.sessionId).not.toBe(h.session.lastSessionId)
+    expect(h.createCalls[0].seedAnchors).toEqual([first, second])
+  })
+
+  test('full-fork 历史后的第一条新输入沿用 branch base,不误退化成 fresh', async () => {
+    const h = makeHarness('history-branch')
+    const base: Extract<ConversationLaunch, { kind: 'fork' }> = {
+      kind: 'fork',
+      source: { provider: 'codex', sessionId: 'historical-root', cwd: '/workspace/project' },
+    }
+    const firstNew = anchorFor('codex', 'first-new-input', 'fork-result-thread', 'new-turn-1')
+    turnAnchorsBySession.set(h.session.sessionName, [firstNew])
+    branchBaseBySession.set(h.session.sessionName, base)
+
+    await showForkList(h.session, 'ou_owner')
+    const value = pickerValue(sentCards[0], 'first-new-input')
+    const result = await onForkSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+
+    expect(result.ok).toBe(true)
+    expect(h.createCalls[0].launch).toEqual(base)
+    expect(h.createCalls[0].branchBase).toEqual(base)
+  })
+
+  test('legacy unknown branch base 不暴露最老输入为伪 fresh 起点', async () => {
+    const h = makeHarness('legacy-unknown')
+    turnAnchorsBySession.set(h.session.sessionName, [
+      anchorFor('codex', 'unknown-origin-input', 'old-thread', 'old-turn'),
+    ])
+    branchBaseBySession.set(h.session.sessionName, null)
+
+    await showForkList(h.session, 'ou_owner')
+
+    expect(() => pickerValue(sentCards[0], 'unknown-origin-input')).toThrow('picker choice not found')
+  })
+})
+
+describe('session-temp Codex back(上游 ff44afb)', () => {
+  test('展示 bk 列表不触发 rollback,点击成功后才经 branchState 替换 anchors', async () => {
+    const h = makeHarness()
+    const first = anchorFor('codex', 'keep-input', 'root-thread', 'turn-keep')
+    const second = anchorFor('codex', 'rollback-input', 'current-thread', 'turn-rollback', [
+      { tool: 'FileChange', path: '/workspace/project/a.ts', body: '+changed' },
+    ])
+    turnAnchorsBySession.set(h.session.sessionName, [first, second])
+    branchBaseBySession.set(h.session.sessionName, { kind: 'fresh' })
+
+    await showBackList(h.session, 'ou_owner')
+
+    expect(h.rollbackCalls).toHaveLength(0)
+    expect(turnAnchorsBySession.get('project')).toEqual([first, second])
+    const value = pickerValue(sentCards[0], 'rollback-input')
+
+    const result = await onBackSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+
+    expect(result.ok).toBe(true)
+    expect(h.rollbackCalls).toEqual([{
+      kind: 'fork',
+      source: { provider: 'codex', sessionId: 'root-thread', cwd: '/workspace/project' },
+      through: first.checkpoint,
+    }])
+    expect(h.rollbackStates[0]).toMatchObject({ anchors: [first], base: { kind: 'fresh' } })
+    expect(turnAnchorsBySession.get('project')).toEqual([first])
+  })
+
+  test('rollback 失败时保留原 anchors,不执行 clear/seed', async () => {
+    const h = makeHarness('failed-back')
+    h.state.rollbackResult = false
+    const first = anchorFor('codex', 'first-input', 'root-thread', 'turn-1')
+    const second = anchorFor('codex', 'second-input', 'current-thread', 'turn-2')
+    turnAnchorsBySession.set(h.session.sessionName, [first, second])
+    branchBaseBySession.set(h.session.sessionName, { kind: 'fresh' })
+
+    await showBackList(h.session, 'ou_owner')
+    const value = pickerValue(sentCards[0], 'second-input')
+    const result = await onBackSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('原会话绑定未改')
+    expect(h.rollbackCalls).toHaveLength(1)
+    expect(turnAnchorsBySession.get('failed-back')).toEqual([first, second])
+  })
+
+  test('claim 通过后 lease 被并发抢占→动作拒绝不 rollback(本地守卫叠加锚)', async () => {
+    const h = makeHarness('lease-steal', 'claude')
+    const first = anchorFor('claude', 'steal-keep', 'root-session', 'uuid-keep')
+    const second = anchorFor('claude', 'steal-input', 'current-thread', 'uuid-rollback')
+    turnAnchorsBySession.set(h.session.sessionName, [first, second])
+    branchBaseBySession.set(h.session.sessionName, { kind: 'fresh' })
+
+    await showBackList(h.session, 'ou_owner')
+    const value = pickerValue(sentCards[0], 'steal-input')
+    // writeLog 卡发送窗口内并发 lifecycle 抢占(claim 通过 ≠ lifecycle 可抢占)
+    feishuMockState.sendCard = async () => {
+      h.state.leaseStolen = true
+      return 'om_writelog'
+    }
+    const result = await onBackSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('被更新的会话操作打断')
+    expect(h.rollbackCalls).toHaveLength(0)
+    expect(turnAnchorsBySession.get('lease-steal')).toEqual([first, second])
+  })
+})
+
+describe('session-temp Codex stopped-session history(上游 ff44afb rs=history fork)', () => {
+  test('rs 对所选历史 thread 创建不带 checkpoint 的 full fork', async () => {
+    const h = makeHarness()
+    const selectedTs = 1_787_350_000_000
+    h.state.history = [{
+      provider: 'codex',
+      sessionId: 'historical-thread',
+      cwd: '/workspace/project',
+      preview: 'historical-input',
+      ts: selectedTs,
+      status: 'idle',
+    }]
+    turnAnchorsBySession.set(h.session.sessionName, [
+      anchorFor('codex', 'old-local-input', 'current-thread', 'turn-old'),
+    ])
+
+    await showResumeList(h.session, 'ou_owner')
+    const value = pickerValue(sentCards[0], 'historical-input')
+    const result = await onResumeSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+
+    expect(result.ok).toBe(true)
+    expect(h.rollbackCalls).toEqual([{
+      kind: 'fork',
+      source: { provider: 'codex', sessionId: 'historical-thread', cwd: '/workspace/project' },
+    }])
+    expect(Object.prototype.hasOwnProperty.call(h.rollbackCalls[0], 'through')).toBe(false)
+    expect(turnAnchorsBySession.get('project')).toEqual([])
+    expect(branchBaseBySession.get('project')).toEqual(h.rollbackCalls[0])
+    expect(h.rollbackStates[0].pendingLaunch).toBeNull()
+    expect(result.resumePresentation).toEqual({
+      projectName: 'project',
+      provider: 'codex',
+      selectedPreview: 'historical-input',
+      selectedTs,
+      sourceSessionId: 'historical-thread',
+      sourceStatus: 'idle',
+      previousSessionId: 'current-thread',
+      newSessionId: 'fork-result-thread',
+      bindingState: 'changed',
+    })
+    expect(sentTexts.some(text => text.includes('正在从历史会话'))).toBe(false)
+  })
+
+  test('rs 所选 Codex 历史仍 active 时拒绝且不 rollback(源侧保护)', async () => {
+    const h = makeHarness('active-source')
+    h.state.history = [{
+      provider: 'codex',
+      sessionId: 'active-thread',
+      cwd: '/workspace/project',
+      preview: 'active-input',
+      ts: Date.now(),
+      status: 'active',
+    }]
+
+    await showResumeList(h.session, 'ou_owner')
+    const value = pickerValue(sentCards[0], 'active-input')
+    const result = await onResumeSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('仍在运行')
+    expect(result.resumePresentation?.bindingState).toBe('unchanged')
+    expect(h.rollbackCalls).toHaveLength(0)
+  })
+
+  test('rs 非 owner 只 toast 且不消费 panel,owner 随后仍可成功', async () => {
+    const h = makeHarness('resume-owner-guard')
+    h.state.history = [{
+      provider: 'codex',
+      sessionId: 'owner-source-thread',
+      cwd: '/workspace/project',
+      preview: 'owner-guard-input',
+      ts: Date.now(),
+      status: 'idle',
+    }]
+
+    await showResumeList(h.session, 'ou_owner')
+    const value = pickerValue(sentCards[0], 'owner-guard-input')
+    const rejected = await onResumeSelect(h.session, value.panelId, value.choiceId, 'ou_other')
+    expect(rejected).toMatchObject({ ok: false, replaceCard: false })
+    expect(rejected.resumePresentation).toBeUndefined()
+    expect(h.rollbackCalls).toHaveLength(0)
+
+    const accepted = await onResumeSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+    expect(accepted.ok).toBe(true)
+    expect(accepted.resumePresentation?.sourceSessionId).toBe('owner-source-thread')
+    expect(h.rollbackCalls).toHaveLength(1)
+  })
+
+  test('rs rollback 失败仍返回带所选快照的红色终态信息', async () => {
+    const h = makeHarness('resume-failure')
+    h.state.rollbackResult = false
+    h.state.history = [{
+      provider: 'codex',
+      sessionId: 'failed-source-thread',
+      cwd: '/workspace/project',
+      preview: 'failed-history-input',
+      ts: 1_787_351_000_000,
+      status: 'systemError',
+    }]
+
+    await showResumeList(h.session, 'ou_owner')
+    const value = pickerValue(sentCards[0], 'failed-history-input')
+    const result = await onResumeSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+
+    expect(result).toMatchObject({ ok: false })
+    expect(result.replaceCard).not.toBe(false)
+    expect(result.resumePresentation).toEqual({
+      projectName: 'resume-failure',
+      provider: 'codex',
+      selectedPreview: 'failed-history-input',
+      selectedTs: 1_787_351_000_000,
+      sourceSessionId: 'failed-source-thread',
+      sourceStatus: 'systemError',
+      previousSessionId: 'current-thread',
+      newSessionId: null,
+      bindingState: 'unchanged',
+    })
+    expect(result.message).toContain('原会话绑定未改')
+  })
+
+  test('rs 后端声称成功但缺少独立新 id 时显式失败', async () => {
+    const h = makeHarness('resume-missing-id')
+    h.state.history = [{
+      provider: 'codex',
+      sessionId: 'missing-id-source',
+      cwd: '/workspace/project',
+      preview: 'missing-id-input',
+      ts: Date.now(),
+      status: 'idle',
+    }]
+    h.session.rollbackTo = async (launch: ConversationLaunch) => {
+      h.rollbackCalls.push(launch)
+      h.session.lastSessionId = null
+      return true
+    }
+
+    await showResumeList(h.session, 'ou_owner')
+    const value = pickerValue(sentCards[0], 'missing-id-input')
+    const result = await onResumeSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+
+    expect(result.ok).toBe(false)
+    expect(result.message).toContain('没有返回新会话 id')
+    expect(result.resumePresentation?.newSessionId).toBeNull()
+    expect(result.resumePresentation?.previousSessionId).toBe('current-thread')
+    expect(result.resumePresentation?.bindingState).toBe('unknown')
+  })
+
+  test('Claude rs 成功走 prepared 终态契约(pendingLaunch 随 branchState 提交)', async () => {
+    const h = makeHarness('claude-project', 'claude')
+    h.session.lastSessionId = 'current-claude-session'
+    h.session.rollbackTo = async (launch: ConversationLaunch, branchState: any) => {
+      h.rollbackCalls.push(launch)
+      h.rollbackStates.push(branchState)
+      // Claude SDK 首条输入才 materialize 新 session id:成功也不推进 lastSessionId
+      return true
+    }
+    await withClaudeHistory({ 'historical-claude-session': 'claude-history-input' }, async () => {
+      await showResumeList(h.session, 'ou_owner')
+      const value = pickerValue(sentCards[0], 'claude-history-input')
+      const result = await onResumeSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+
+      expect(result.ok).toBe(true)
+      expect(h.rollbackCalls).toEqual([{
+        kind: 'fork',
+        source: {
+          provider: 'claude',
+          sessionId: 'historical-claude-session',
+          cwd: '/workspace/project',
+        },
+      }])
+      expect(result.resumePresentation).toMatchObject({
+        projectName: 'claude-project',
+        provider: 'claude',
+        selectedPreview: 'claude-history-input',
+        sourceSessionId: 'historical-claude-session',
+        previousSessionId: 'current-claude-session',
+        newSessionId: null,
+        bindingState: 'prepared',
+      })
+      expect(h.rollbackStates[0].pendingLaunch).toEqual({
+        launch: h.rollbackCalls[0],
+        previousSessionId: 'current-claude-session',
+      })
+      expect(result.message).toContain('首条消息时生成并接入')
+    })
+  })
+
+  test('claude idle(proc 存活)选历史成功——陷阱 1 选型锚(不采上游 isRunning 拒绝)', async () => {
+    // 本地 claude 进程 turn 间常驻保活(isRunning() 恒 true,d9341b6):照抄上游
+    // running 拒绝会让 claude 空闲选历史永拒。本地语义 = rollbackTo 内部 restart
+    // 作废当前 proc,选历史必须成功。
+    const h = makeHarness('claude-idle', 'claude')
+    h.state.running = true
+    h.session.lastSessionId = 'current-claude-session'
+    h.session.rollbackTo = async (launch: ConversationLaunch, branchState: any) => {
+      h.rollbackCalls.push(launch)
+      h.rollbackStates.push(branchState)
+      return true
+    }
+    await withClaudeHistory({ 'idle-history-session': 'idle-history-input' }, async () => {
+      await showResumeList(h.session, 'ou_owner')
+      const value = pickerValue(sentCards[0], 'idle-history-input')
+      const result = await onResumeSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+
+      expect(result.ok).toBe(true)
+      expect(result.resumePresentation?.bindingState).toBe('prepared')
+      expect(h.rollbackCalls).toHaveLength(1)
+    })
   })
 })
