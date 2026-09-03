@@ -2122,3 +2122,104 @@ describe('codex checkpoint 外线程隔离(本地 isForeignThread 叠加锚)', (
     expect(proc.lastCompletedTurnId).toBe('turn-1')
   })
 })
+
+// ── 上游 ff44afb:thread/list 历史目录与 thread/read legacy cwd 解析 ──────
+// app-server owns discovery(Don't Hand-Roll):不扫 rollout、不建第二索引;
+// cwd 参数精确过滤 + sortKey updated_at 分页 + 严格结构校验即 throw +
+// updatedAt 秒→毫秒。
+function catalogHarness(
+  workDir: string,
+  respond: (method: string, params: any) => any,
+): { proc: any; requests: Array<{ method: string; params: any }> } {
+  const proc = Object.create(CodexProcess.prototype) as any
+  const requests: Array<{ method: string; params: any }> = []
+  proc.opts = { workDir, effort: 'high' }
+  // 线程 handshake 已完成:catalog 前置(ensureCatalogReady)直接放行。
+  proc.readyPromise = Promise.resolve()
+  proc.request = (method: string, params: any) => {
+    requests.push({ method, params })
+    return Promise.resolve(respond(method, params))
+  }
+  return { proc, requests }
+}
+
+describe('codex thread/list 历史目录(上游 ff44afb)', () => {
+  test('cwd 参数过滤+sortKey updated_at 分页+updatedAt 秒→毫秒+status 归一', async () => {
+    const workDir = '/work'
+    const pages: Record<string, any> = {
+      first: {
+        data: [{ id: 't1', preview: 'p1', updatedAt: 1700000001, cwd: workDir, status: 'idle' }],
+        nextCursor: 'cur-2',
+      },
+      'cur-2': {
+        data: [{ id: 't2', preview: 'p2', updatedAt: 1700000002, cwd: workDir, status: { type: 'active' } }],
+        nextCursor: null,
+      },
+    }
+    const { proc, requests } = catalogHarness(workDir, (method, params) => {
+      if (method !== 'thread/list') throw new Error(`unexpected method ${method}`)
+      return pages[params.cursor ?? 'first']
+    })
+
+    const rows = await proc.listConversations()
+
+    const listRequests = requests.filter(r => r.method === 'thread/list')
+    expect(listRequests).toHaveLength(2)
+    for (const r of listRequests) {
+      expect(r.params.cwd).toBe(workDir)
+      expect(r.params.sortKey).toBe('updated_at')
+      expect(r.params.sortDirection).toBe('desc')
+      expect(r.params.limit).toBe(100)
+    }
+    expect(listRequests[0].params.cursor).toBeNull()
+    expect(listRequests[1].params.cursor).toBe('cur-2')
+    expect(rows).toEqual([
+      { provider: 'codex', sessionId: 't1', cwd: workDir, preview: 'p1', ts: 1700000001000, status: 'idle' },
+      { provider: 'codex', sessionId: 't2', cwd: workDir, preview: 'p2', ts: 1700000002000, status: 'active' },
+    ])
+  })
+
+  test('严格结构校验即 throw:cwd 不匹配 summary/invalid nextCursor/重复 cursor/无 data', async () => {
+    const workDir = '/work'
+    // cwd 不匹配条目 = invalid summary(请求已按 cwd 过滤,响应违约即 throw)。
+    const mismatched = catalogHarness(workDir, () => ({
+      data: [{ id: 't1', preview: 'p1', updatedAt: 1700000001, cwd: '/elsewhere' }],
+      nextCursor: null,
+    }))
+    await expect(mismatched.proc.listConversations()).rejects.toThrow(/invalid thread summary/)
+
+    const badCursor = catalogHarness(workDir, () => ({
+      data: [{ id: 't1', preview: 'p1', updatedAt: 1700000001, cwd: workDir }],
+      nextCursor: 42,
+    }))
+    await expect(badCursor.proc.listConversations()).rejects.toThrow(/invalid nextCursor/)
+
+    const repeated = catalogHarness(workDir, () => ({
+      data: [{ id: 't1', preview: 'p1', updatedAt: 1700000001, cwd: workDir }],
+      nextCursor: 'cur-x',
+    }))
+    await expect(repeated.proc.listConversations()).rejects.toThrow(/repeated pagination cursor cur-x/)
+
+    const noData = catalogHarness(workDir, () => ({}))
+    await expect(noData.proc.listConversations()).rejects.toThrow(/no data array/)
+  })
+
+  test('readConversationRef:thread/read {includeTurns:false} 以权威 cwd 组装 ConversationRef', async () => {
+    const { proc, requests } = catalogHarness('/work', () => ({
+      thread: { id: 'legacy-thread', cwd: '/authoritative' },
+    }))
+
+    const ref = await proc.readConversationRef('legacy-thread')
+
+    expect(requests).toContainEqual({
+      method: 'thread/read',
+      params: { threadId: 'legacy-thread', includeTurns: false },
+    })
+    expect(ref).toEqual({ provider: 'codex', sessionId: 'legacy-thread', cwd: '/authoritative' })
+
+    // id 不符 = invalid reference throw;空 id 直接拒绝。
+    const mismatch = catalogHarness('/work', () => ({ thread: { id: 'other-thread', cwd: '/x' } }))
+    await expect(mismatch.proc.readConversationRef('legacy-thread')).rejects.toThrow(/invalid conversation reference/)
+    await expect(proc.readConversationRef('  ')).rejects.toThrow(/requires a session id/)
+  })
+})

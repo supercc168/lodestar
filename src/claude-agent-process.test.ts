@@ -2154,3 +2154,54 @@ describe('Claude SDK Cron 定时唤醒识别(上游 7c14677 主题 A)', () => {
     expect(results[0].tool_use_id).toBe('tool-sched-1')
   })
 })
+
+// ── 上游 ff44afb:claude turn-local checkpoint 边界 ──────────────────────
+// A checkpoint belongs to exactly one clean turn:running 边界清 lastAssistantUuid,
+// result 载荷仅 !is_error && lastAssistantUuid && sessionId 时携带。
+describe('Claude turn-local checkpoint(上游 ff44afb)', () => {
+  test('emits a turn-local Claude checkpoint and clears it at the next turn boundary', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const results: any[] = []
+    proc.on('result', (event: any) => results.push(event))
+
+    proc.handleMessage({
+      type: 'system', subtype: 'init', uuid: 'init-1',
+      session_id: 'claude-session-ckpt', model: 'sonnet',
+    })
+    proc.handleMessage({
+      type: 'system', subtype: 'session_state_changed', state: 'running',
+      uuid: 'turn-1', session_id: 'claude-session-ckpt',
+    })
+    proc.handleMessage({
+      type: 'assistant', uuid: 'assistant-uuid-1', session_id: 'claude-session-ckpt',
+      message: { model: 'sonnet', content: [{ type: 'text', text: '第一轮答复' }] },
+    })
+    proc.handleMessage({
+      type: 'result', subtype: 'success', uuid: 'result-1', session_id: 'claude-session-ckpt',
+      is_error: false, duration_ms: 10, num_turns: 1,
+      usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {},
+    })
+
+    expect(results.at(-1)?.checkpoint).toEqual({
+      provider: 'claude',
+      kind: 'assistant-message',
+      id: 'assistant-uuid-1',
+      source: { provider: 'claude', sessionId: 'claude-session-ckpt', cwd: '/tmp' },
+    })
+
+    // 下一 turn 的 running 边界清空:上轮 uuid 不得作为新轮的锚。
+    proc.handleMessage({
+      type: 'system', subtype: 'session_state_changed', state: 'running',
+      uuid: 'turn-2', session_id: 'claude-session-ckpt',
+    })
+    expect(proc.lastAssistantUuid).toBeNull()
+
+    // 失败 result 不携带 checkpoint(is_error 判定逐字)。
+    proc.handleMessage({
+      type: 'result', subtype: 'error_during_execution', uuid: 'result-2',
+      session_id: 'claude-session-ckpt', is_error: true, duration_ms: 5, num_turns: 1,
+      usage: { input_tokens: 1, output_tokens: 1 }, modelUsage: {},
+    })
+    expect(results.at(-1)?.checkpoint).toBeNull()
+  })
+})
