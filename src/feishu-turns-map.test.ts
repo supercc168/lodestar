@@ -1,0 +1,550 @@
+/**
+ * turns map V4 状态层测试(上游 ff44afb feishu-turns-map.test.ts 按本地承接)。
+ *
+ * Harness 说明(开放问题 3 例外通道,理由入 04-02-SUMMARY):bunfig [test].preload
+ * 在任何测试文件加载前注册 feishu-test-mock 的 mock.module('./feishu'),进程内
+ * 一切 './feishu' import 都拿到 mock —— 锚模式无法在本进程触达真实模块级 map。
+ * 故采用上游同款子进程 fresh-state harness:Bun.spawnSync(bun --eval) + 临时
+ * LODESTAR_DATA_DIR/LODESTAR_CONFIG(bun run 不加载 [test].preload,子进程拿到
+ * 真实 feishu.ts;config 模板与 01-02 test-preload 本地 schema 一致)。
+ */
+import { describe, expect, test } from 'bun:test'
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { pathToFileURL } from 'node:url'
+import { validateConversationLaunch } from './conversation'
+
+interface FreshResult { exitCode: number; stdout: string; stderr: string }
+
+function runFreshState(
+  work: string,
+  initialFiles: Record<string, unknown> = {},
+): FreshResult {
+  const root = mkdtempSync(join(tmpdir(), 'lodestar-turns-map-'))
+  const dataDir = join(root, 'data')
+  mkdirSync(dataDir, { recursive: true })
+  for (const [name, value] of Object.entries(initialFiles)) {
+    writeFileSync(join(dataDir, name), JSON.stringify(value, null, 2) + '\n')
+  }
+  const configFile = join(root, 'config.toml')
+  writeFileSync(configFile, [
+    '[feishu]',
+    'app_id = "t"',
+    'app_secret = "t"',
+    '',
+    '[runtime]',
+    `projects_root = "${root.replace(/\\/g, '\\\\')}"`,
+    '',
+  ].join('\n'))
+  const feishuModule = pathToFileURL(join(import.meta.dir, 'feishu.ts')).href
+  const script = `
+    import * as feishu from ${JSON.stringify(feishuModule)}
+    import { mkdirSync, readFileSync, rmSync } from 'node:fs'
+    import { join } from 'node:path'
+    const __dataDir = ${JSON.stringify(dataDir)}
+    const __read = name => JSON.parse(readFileSync(join(__dataDir, name), 'utf8'))
+    const __out = value => process.stdout.write('@@@' + JSON.stringify(value) + '@@@')
+    ${work}
+  `
+  try {
+    const result = Bun.spawnSync({
+      cmd: [process.execPath, '--eval', script],
+      env: { ...process.env, LODESTAR_DATA_DIR: dataDir, LODESTAR_CONFIG: configFile },
+    })
+    return { exitCode: result.exitCode, stdout: result.stdout.toString(), stderr: result.stderr.toString() }
+  } finally {
+    rmSync(root, { recursive: true, force: true })
+  }
+}
+
+function extract(result: FreshResult): any {
+  const marker = result.stdout.match(/@@@([\s\S]*?)@@@/)
+  if (!marker) {
+    throw new Error(
+      `no @@@ marker (exitCode=${result.exitCode})\nstdout: ${result.stdout}\nstderr: ${result.stderr}`,
+    )
+  }
+  return JSON.parse(marker[1])
+}
+
+/** 剥 getTurnAnchors 的 V1 读投影字段(PHASE4-TRANSITION),得到纯 V4 形态 —— 用于
+ *  断言磁盘持久化不被投影污染(uuid/sid 只存在于返回值,不落盘)。 */
+function pure(anchor: any): any {
+  const { uuid, sid, ...rest } = anchor
+  return rest
+}
+
+describe('session turn checkpoint persistence', () => {
+  test('loads V2 checkpoints with an unknown base and null legacy cwd', () => {
+    const result = runFreshState(`
+      feishu.loadSessionTurnsMap()
+      __out({ base: feishu.getSessionBranchBase('project'), anchors: feishu.getTurnAnchors('project') })
+    `, {
+      'session-turns-map.json': {
+        project: [
+          {
+            checkpoint: {
+              provider: 'claude',
+              kind: 'assistant-message',
+              id: 'assistant-1',
+              source: { provider: 'claude', sessionId: 'claude-session' },
+            },
+            preview: 'claude input',
+            ts: 100,
+            writes: [{ tool: 'Edit', path: '/tmp/a.ts', body: 'after' }],
+          },
+          {
+            checkpoint: {
+              provider: 'codex',
+              kind: 'turn',
+              id: 'turn-2',
+              source: { provider: 'codex', sessionId: 'codex-thread' },
+            },
+            preview: 'codex input',
+            ts: 200,
+            writes: [],
+          },
+        ],
+      },
+    })
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(extract(result)).toEqual({
+      base: null,
+      anchors: [
+        {
+          checkpoint: {
+            provider: 'claude',
+            kind: 'assistant-message',
+            id: 'assistant-1',
+            source: { provider: 'claude', sessionId: 'claude-session', cwd: null },
+          },
+          preview: 'claude input',
+          ts: 100,
+          writes: [{ tool: 'Edit', path: '/tmp/a.ts', body: 'after' }],
+          uuid: 'assistant-1',
+          sid: 'claude-session',
+        },
+        {
+          checkpoint: {
+            provider: 'codex',
+            kind: 'turn',
+            id: 'turn-2',
+            source: { provider: 'codex', sessionId: 'codex-thread', cwd: null },
+          },
+          preview: 'codex input',
+          ts: 200,
+          writes: [],
+          uuid: 'turn-2',
+          sid: 'codex-thread',
+        },
+      ],
+    })
+  })
+
+  test('migrates a whole legacy chain only for an unambiguous Claude-only resume key', () => {
+    const result = runFreshState(`
+      feishu.loadSessionResumeMap()
+      feishu.loadSessionTurnsMap()
+      __out({
+        claude: feishu.getTurnAnchors('legacy-claude'),
+        codex: feishu.getTurnAnchors('legacy-codex'),
+        ambiguous: feishu.getTurnAnchors('legacy-ambiguous'),
+      })
+    `, {
+      'session-resume-map.json': {
+        'legacy-claude': { claude: 'different-current-session' },
+        'legacy-codex': { codex: 'codex-current' },
+        'legacy-ambiguous': { claude: 'shared-current', codex: 'shared-current' },
+      },
+      'session-turns-map.json': {
+        'legacy-claude': [
+          {
+            uuid: 'assistant-old',
+            sid: 'claude-ancestor',
+            preview: 'old input',
+            ts: 300,
+            writes: [{ path: '/tmp/old.ts' }],
+          },
+          { uuid: 'assistant-older', sid: 'claude-other-ancestor', preview: 'older', ts: 301 },
+          { uuid: 'missing-source', sid: '', preview: 'unsafe', ts: 301 },
+          {
+            checkpoint: {
+              provider: 'codex',
+              kind: 'assistant-message',
+              id: 'not-a-turn',
+              source: { provider: 'codex', sessionId: 'thread' },
+            },
+            uuid: 'must-not-fallback',
+            sid: 'claude-session',
+            ts: 302,
+          },
+        ],
+        'legacy-codex': [{ uuid: 'agent-message-item', sid: 'codex-current', preview: 'unsafe', ts: 400 }],
+        'legacy-ambiguous': [{ uuid: 'unknown-item', sid: 'shared-current', preview: 'unsafe', ts: 500 }],
+      },
+    })
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(extract(result)).toEqual({
+      claude: [
+        {
+          checkpoint: {
+            provider: 'claude',
+            kind: 'assistant-message',
+            id: 'assistant-old',
+            source: { provider: 'claude', sessionId: 'claude-ancestor', cwd: null },
+          },
+          preview: 'old input',
+          ts: 300,
+          writes: [{ tool: 'Write', path: '/tmp/old.ts', body: '' }],
+          uuid: 'assistant-old',
+          sid: 'claude-ancestor',
+        },
+        {
+          checkpoint: {
+            provider: 'claude', kind: 'assistant-message', id: 'assistant-older',
+            source: { provider: 'claude', sessionId: 'claude-other-ancestor', cwd: null },
+          },
+          preview: 'older', ts: 301, writes: [],
+          uuid: 'assistant-older',
+          sid: 'claude-other-ancestor',
+        },
+      ],
+      codex: [],
+      ambiguous: [],
+    })
+    // rejected 路径真实驱动:codex 键在场/双键歧义/坏 checkpoint/缺 sid 共 4 条被丢弃且计数可观测
+    expect(result.stderr).toContain('rejected 4 malformed turn anchors')
+  })
+
+  test('round-trips explicit fresh and full-fork bases with absolute cwd', () => {
+    const result = runFreshState(`
+      const cwd = '/srv/lodestar/project'
+      const first = {
+        checkpoint: {
+          provider: 'codex', kind: 'turn', id: 'turn-1',
+          source: { provider: 'codex', sessionId: 'forked-thread', cwd },
+        },
+        preview: 'first', ts: 1, writes: [],
+      }
+      feishu.setSessionBranchBase('fresh', { kind: 'fresh' })
+      feishu.replaceTurnAnchors('forked', [first], {
+        kind: 'fork',
+        source: { provider: 'codex', sessionId: 'source-thread', cwd },
+      })
+      feishu.replaceTurnAnchors('cleared', [first], { kind: 'fresh' })
+      feishu.clearTurnAnchors('cleared')
+      feishu.loadSessionTurnsMap()
+      __out({
+        fresh: feishu.getSessionBranchBase('fresh'),
+        fullFork: feishu.getSessionBranchBase('forked'),
+        anchors: feishu.getTurnAnchors('forked'),
+        cleared: {
+          base: feishu.getSessionBranchBase('cleared'),
+          anchors: feishu.getTurnAnchors('cleared'),
+        },
+        persisted: __read('session-turns-map.json'),
+      })
+    `)
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    const output = extract(result)
+    expect(output.fresh).toEqual({ kind: 'fresh' })
+    expect(output.fullFork).toEqual({
+      kind: 'fork',
+      source: { provider: 'codex', sessionId: 'source-thread', cwd: '/srv/lodestar/project' },
+    })
+    expect(output.anchors[0].checkpoint.source.cwd).toBe('/srv/lodestar/project')
+    expect(output.cleared).toEqual({ base: null, anchors: [] })
+    // base=null(cleared 会话已整体删除)与 {kind:'fresh'} 显式基线是两种语义:
+    // null 绝不当 fresh,fresh 必须显式持久化。
+    expect(output.persisted).toEqual({
+      fresh: { base: { kind: 'fresh' }, anchors: [] },
+      forked: { base: output.fullFork, anchors: output.anchors.map(pure) },
+    })
+  })
+
+  test('advances the branch base through the discarded checkpoint at 201 anchors', () => {
+    const result = runFreshState(`
+      const cwd = '/srv/lodestar/project'
+      feishu.setSessionBranchBase('project', { kind: 'fresh' })
+      for (let i = 1; i <= 201; i++) {
+        feishu.appendTurnAnchorChecked('project', {
+          checkpoint: {
+            provider: 'codex', kind: 'turn', id: 'turn-' + i,
+            source: { provider: 'codex', sessionId: 'thread-1', cwd },
+          },
+          preview: 'input-' + i,
+          ts: i,
+          writes: [],
+        })
+      }
+      __out({
+        base: feishu.getSessionBranchBase('project'),
+        anchors: feishu.getTurnAnchors('project'),
+        persisted: __read('session-turns-map.json').project,
+      })
+    `)
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    const output = extract(result)
+    expect(output.anchors).toHaveLength(200)
+    expect(output.anchors[0].checkpoint.id).toBe('turn-2')
+    expect(output.anchors[199].checkpoint.id).toBe('turn-201')
+    expect(output.base).toEqual({
+      kind: 'fork',
+      source: {
+        provider: 'codex', sessionId: 'thread-1', cwd: '/srv/lodestar/project',
+      },
+      through: {
+        provider: 'codex', kind: 'turn', id: 'turn-1',
+        source: {
+          provider: 'codex', sessionId: 'thread-1', cwd: '/srv/lodestar/project',
+        },
+      },
+    })
+    expect(output.persisted).toEqual({ base: output.base, anchors: output.anchors.map(pure) })
+  })
+
+  test('round-trips and clears a durable pending Claude fork without losing branch state', () => {
+    const result = runFreshState(`
+      const launch = {
+        kind: 'fork',
+        source: {
+          provider: 'claude', sessionId: 'source-session', cwd: '/srv/lodestar/project',
+        },
+      }
+      const pending = { launch, previousSessionId: 'previous-session' }
+      feishu.replaceTurnAnchors('project', [], launch, pending)
+      feishu.loadSessionTurnsMap()
+      const loaded = feishu.getPendingConversationLaunch('project')
+      feishu.setPendingConversationLaunchChecked('project', null)
+      __out({
+        loaded,
+        base: feishu.getSessionBranchBase('project'),
+        anchors: feishu.getTurnAnchors('project'),
+        persisted: __read('session-turns-map.json').project,
+      })
+    `)
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(extract(result)).toEqual({
+      loaded: {
+        launch: {
+          kind: 'fork',
+          source: {
+            provider: 'claude', sessionId: 'source-session', cwd: '/srv/lodestar/project',
+          },
+        },
+        previousSessionId: 'previous-session',
+      },
+      base: {
+        kind: 'fork',
+        source: {
+          provider: 'claude', sessionId: 'source-session', cwd: '/srv/lodestar/project',
+        },
+      },
+      anchors: [],
+      persisted: {
+        base: {
+          kind: 'fork',
+          source: {
+            provider: 'claude', sessionId: 'source-session', cwd: '/srv/lodestar/project',
+          },
+        },
+        anchors: [],
+      },
+    })
+  })
+
+  test('rejects a persisted pending fork without an authoritative cwd', () => {
+    const result = runFreshState(`
+      feishu.loadSessionTurnsMap()
+      __out({ pending: feishu.getPendingConversationLaunch('unsafe'), anchors: feishu.getTurnAnchors('unsafe') })
+    `, {
+      'session-turns-map.json': {
+        unsafe: {
+          base: null,
+          anchors: [],
+          pendingLaunch: {
+            launch: {
+              kind: 'fork',
+              source: { provider: 'claude', sessionId: 'source-session', cwd: null },
+            },
+            previousSessionId: null,
+          },
+        },
+      },
+    })
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(extract(result)).toEqual({ pending: null, anchors: [] })
+    expect(result.stderr).toContain('rejected 1 malformed turn anchors')
+  })
+
+  test('append and ordinary replace preserve pending; explicit null consumes it', () => {
+    const result = runFreshState(`
+      const launch = {
+        kind: 'fork',
+        source: {
+          provider: 'claude', sessionId: 'source-session', cwd: '/srv/lodestar/project',
+        },
+      }
+      const pending = { launch, previousSessionId: 'previous-session' }
+      feishu.replaceTurnAnchors('project', [], launch, pending)
+      feishu.appendTurnAnchorChecked('project', {
+        checkpoint: {
+          provider: 'claude', kind: 'assistant-message', id: 'assistant-1',
+          source: {
+            provider: 'claude', sessionId: 'materialized-session', cwd: '/srv/lodestar/project',
+          },
+        },
+        preview: 'first input', ts: 1, writes: [],
+      })
+      const afterAppend = feishu.getPendingConversationLaunch('project')
+      feishu.replaceTurnAnchors('project', feishu.getTurnAnchors('project'), launch)
+      const afterReplace = feishu.getPendingConversationLaunch('project')
+      feishu.replaceTurnAnchors('project', feishu.getTurnAnchors('project'), launch, null)
+      __out({
+        afterAppend,
+        afterReplace,
+        afterExplicitClear: feishu.getPendingConversationLaunch('project'),
+      })
+    `)
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    const output = extract(result)
+    expect(output.afterAppend).toEqual(output.afterReplace)
+    expect(output.afterAppend.previousSessionId).toBe('previous-session')
+    expect(output.afterExplicitClear).toBeNull()
+  })
+
+  test('checked pending write failure restores the prior in-memory marker', () => {
+    const result = runFreshState(`
+      const launch = {
+        kind: 'fork',
+        source: {
+          provider: 'claude', sessionId: 'source-session', cwd: '/srv/lodestar/project',
+        },
+      }
+      const pending = { launch, previousSessionId: 'previous-session' }
+      feishu.setPendingConversationLaunchChecked('project', pending)
+      const statePath = join(__dataDir, 'session-turns-map.json')
+      rmSync(statePath)
+      mkdirSync(statePath)
+      let error = ''
+      try { feishu.setPendingConversationLaunchChecked('project', null) }
+      catch (cause) { error = String(cause?.message ?? cause) }
+      __out({ error, pending: feishu.getPendingConversationLaunch('project') })
+    `)
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    const output = extract(result)
+    expect(output.error).not.toBe('')
+    expect(output.pending.previousSessionId).toBe('previous-session')
+    expect(output.pending.launch.source.sessionId).toBe('source-session')
+  })
+
+  test('checked append/replace write failure rolls back memory to the pre-write snapshot', () => {
+    const result = runFreshState(`
+      const cwd = '/srv/lodestar/project'
+      const anchor = id => ({
+        checkpoint: {
+          provider: 'codex', kind: 'turn', id,
+          source: { provider: 'codex', sessionId: 'thread-1', cwd },
+        },
+        preview: 'input-' + id, ts: 1, writes: [],
+      })
+      feishu.appendTurnAnchorChecked('project', anchor('turn-1'))
+      const statePath = join(__dataDir, 'session-turns-map.json')
+      rmSync(statePath)
+      mkdirSync(statePath)
+      let appendError = ''
+      try { feishu.appendTurnAnchorChecked('project', anchor('turn-2')) }
+      catch (cause) { appendError = String(cause?.message ?? cause) }
+      const afterAppendFailure = feishu.getTurnAnchors('project')
+      let replaceError = ''
+      try { feishu.replaceTurnAnchors('project', [], null, null) }
+      catch (cause) { replaceError = String(cause?.message ?? cause) }
+      __out({
+        appendError,
+        replaceError,
+        anchors: feishu.getTurnAnchors('project'),
+        afterAppendFailure,
+        base: feishu.getSessionBranchBase('project'),
+      })
+    `)
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    const output = extract(result)
+    expect(output.appendError).not.toBe('')
+    expect(output.replaceError).not.toBe('')
+    // 内存 === 写前快照(非仅断言 throw):失败的 append/replace 不残留、不丢失
+    expect(output.afterAppendFailure.map((a: any) => a.checkpoint.id)).toEqual(['turn-1'])
+    expect(output.anchors.map((a: any) => a.checkpoint.id)).toEqual(['turn-1'])
+    expect(output.base).toBeNull()
+  })
+
+  test('V1 input shim appends a claude checkpoint; projection stays out of the persisted V4 state', () => {
+    // PHASE4-TRANSITION 过渡壳等价性(04-03 迁 session.ts 调用方后删):
+    // appendTurnAnchor(uuid/sid 老签名)写入 claude checkpoint 形态;
+    // getTurnAnchors 返回值投影 uuid/sid 供 V1 消费方;磁盘保持纯 V4。
+    const result = runFreshState(`
+      feishu.appendTurnAnchor('project', {
+        uuid: 'assistant-1', sid: 'claude-sid', preview: 'first', ts: 1, writes: [],
+      })
+      feishu.appendTurnAnchor('project', {
+        uuid: 'assistant-2', sid: 'claude-sid', preview: 'second', ts: 2,
+        writes: [{ tool: 'Edit', path: '/tmp/x.ts', body: 'b' }],
+      })
+      feishu.truncateTurnAnchors('project', 1)
+      __out({
+        anchors: feishu.getTurnAnchors('project'),
+        base: feishu.getSessionBranchBase('project'),
+        persisted: __read('session-turns-map.json').project,
+      })
+    `)
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    const output = extract(result)
+    expect(output.anchors).toEqual([
+      {
+        checkpoint: {
+          provider: 'claude', kind: 'assistant-message', id: 'assistant-1',
+          source: { provider: 'claude', sessionId: 'claude-sid', cwd: null },
+        },
+        preview: 'first', ts: 1, writes: [],
+        uuid: 'assistant-1',
+        sid: 'claude-sid',
+      },
+    ])
+    expect(output.base).toBeNull()
+    expect(output.persisted.anchors).toHaveLength(1)
+    expect(output.persisted.anchors[0]).not.toHaveProperty('uuid')
+    expect(output.persisted.anchors[0]).not.toHaveProperty('sid')
+    expect(output.persisted.anchors[0].checkpoint.id).toBe('assistant-1')
+  })
+})
+
+describe('conversation cwd validation', () => {
+  test('fails closed for missing or mismatched source cwd when a target cwd is expected', () => {
+    const legacy = {
+      kind: 'resume' as const,
+      source: { provider: 'codex' as const, sessionId: 'thread', cwd: null },
+    }
+    expect(() => validateConversationLaunch(legacy, 'codex', '/srv/project')).toThrow('source cwd is missing')
+
+    const mismatched = {
+      kind: 'resume' as const,
+      source: { provider: 'codex' as const, sessionId: 'thread', cwd: '/srv/other' },
+    }
+    expect(() => validateConversationLaunch(mismatched, 'codex', '/srv/project')).toThrow('cwd mismatch')
+
+    expect(() => validateConversationLaunch({
+      kind: 'resume',
+      source: { provider: 'codex', sessionId: 'thread', cwd: '/srv/project' },
+    }, 'codex', '/srv/project')).not.toThrow()
+  })
+})
