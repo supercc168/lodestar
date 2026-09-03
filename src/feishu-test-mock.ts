@@ -12,7 +12,7 @@
  */
 import { mock } from 'bun:test'
 import type { WatchdogMode } from './turn-watchdog'
-import type { TurnAnchor, TurnWrite } from './feishu'
+import type { TurnAnchor } from './feishu'
 import type { ConversationBranchBase, ConversationRef, PendingConversationLaunch } from './conversation'
 
 export const sentCards: object[] = []
@@ -240,24 +240,6 @@ mock.module('./feishu', () => ({
     let name = `${project}*0000-0000`
     for (let seq = 2; used.has(name); seq++) name = `${project}*0000-0000-${seq}`
     return name
-  },
-  appendTurnAnchor: (
-    sessionName: string,
-    anchor: { uuid: string; sid: string; preview: string; ts: number; writes: TurnWrite[] },
-  ) => {
-    // 与真实 PHASE4-TRANSITION 壳同语义:V1 输入组装 claude checkpoint 后入容器
-    const current = turnAnchorsBySession.get(sessionName) ?? []
-    turnAnchorsBySession.set(sessionName, [...current, {
-      checkpoint: {
-        provider: 'claude',
-        kind: 'assistant-message',
-        id: anchor.uuid,
-        source: { provider: 'claude', sessionId: anchor.sid, cwd: null },
-      },
-      preview: anchor.preview,
-      ts: anchor.ts,
-      writes: anchor.writes,
-    }])
   },
   appendTurnAnchorChecked: (sessionName: string, anchor: TurnAnchor) => {
     if (turnAnchorWriteError) throw turnAnchorWriteError

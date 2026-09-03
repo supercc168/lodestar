@@ -1675,6 +1675,13 @@ export class Session {
   } | null = null
   /** 最近一个 turn 的用户输入预览(首条文本,recordTurnAnchor 用;openTurnCard 时设)。 */
   private lastTurnUserPreview = ''
+  /** A very fast Codex turn can complete before the asynchronous authoritative
+   * materialization read returns. Retain its fully captured anchor until the
+   * exact owning process becomes resumable instead of losing fk/bk history. */
+  private pendingCodexTurnAnchors: Array<{
+    proc: AgentProcess
+    anchor: feishu.TurnAnchor
+  }> = []
 
   private spawnAgent(
     resumeRef?: ConversationRef,
@@ -2431,6 +2438,9 @@ export class Session {
     let killError: unknown = null
     try { await proc.kill() }
     catch (e) { killError = e }
+    // confirmed stop 收尾:延迟锚随停止作废(4185808 finishProcStop 等效位;
+    // kill 未确认时进程已脱管无法 flush,丢弃同样安全)。
+    this.discardPendingCodexTurnAnchors(proc, 'confirmed process stop')
     if (!this.ownsLifecycle(lease)) return
     // 后台任务随轮作废:翻 killed 终态 + 活卡沉降历史墓碑,否则 SDK 一死 entry
     // 永远卡 running,refresh tick 还在伪造运行时长。
@@ -2538,6 +2548,8 @@ export class Session {
       this.proc = null
       try { await proc.kill() }
       catch (e) { killError = e }
+      // restart 作废旧进程:其延迟锚一并作废(挂账 #3 收尾口)。
+      this.discardPendingCodexTurnAnchors(proc, 'restart discarded process')
       if (!this.ownsLifecycle(lease)) return false
     }
     this.stopFooterStatus(this.currentTurn)
@@ -2919,22 +2931,77 @@ export class Session {
     if (pendingProc?.isAlive()) void pendingProc.kill(1_000).catch(() => {})
   }
 
-  /** result 时记一个 turn 锚点:本 turn 最后 assistant uuid + 用户输入预览 + Write 记录。
-   *  fk/bk 靠它列"用户输入前的分界点";bk 回滚说明靠其中的 writes。 */
-  private recordTurnAnchor(): void {
+  /** Clean result 时记 backend-native checkpoint + 用户输入预览 + 文件变更记录。
+   *  fk/bk 靠它列"用户输入前的分界点";bk 回滚说明靠其中的 writes。(4185808 终态:
+   *  三重归属校验 + materialization 未确认入延迟队列 —— 挂账 #3/陷阱 6) */
+  private recordTurnAnchor(checkpoint: ConversationCheckpoint | null | undefined): string | null {
     const proc = this.proc
-    if (!proc) return
-    const uuid = proc.lastAssistantUuid
-    if (!uuid) return  // 纯系统轮(无 assistant)不记
-    const writes = this.collectTurnWrites()
-    feishu.appendTurnAnchor(this.sessionName, {
-      uuid,
-      sid: proc.sessionId ?? '',
+    if (!proc?.sessionId || !checkpoint) return null
+    if (
+      checkpoint.provider !== proc.provider
+      || checkpoint.source.sessionId !== proc.sessionId
+      || checkpoint.source.cwd !== this.workDir
+    ) {
+      const message = `拒绝了与当前会话不匹配的 checkpoint provider=${checkpoint.provider} source=${checkpoint.source.sessionId}`
+      log(`session "${this.sessionName}": ${message}`)
+      this.lastTurnUserPreview = ''
+      return message
+    }
+    const anchor: feishu.TurnAnchor = {
+      checkpoint,
       preview: this.lastTurnUserPreview.slice(0, 80),
       ts: Date.now(),
-      writes,
-    })
+      writes: this.collectTurnWrites(),
+    }
     this.lastTurnUserPreview = ''
+    if (proc.provider === 'codex' && proc.isConversationResumable?.() !== true) {
+      const pendingForProc = this.pendingCodexTurnAnchors.filter(pending => pending.proc === proc).length
+      if (pendingForProc >= 64) {
+        const message = 'Codex rollout 长期未确认，延迟 checkpoint 队列已满'
+        log(`session "${this.sessionName}": ${message} thread=${proc.sessionId}`)
+        return message
+      }
+      this.pendingCodexTurnAnchors.push({ proc, anchor })
+      log(`session "${this.sessionName}": defer Codex turn checkpoint until rollout confirmation thread=${proc.sessionId} checkpoint=${checkpoint.id}`)
+      return null
+    }
+    return this.appendTurnAnchor(anchor)
+  }
+
+  private appendTurnAnchor(anchor: feishu.TurnAnchor): string | null {
+    try {
+      feishu.appendTurnAnchorChecked(this.sessionName, anchor)
+      return null
+    } catch (error) {
+      const message = `分叉 checkpoint 持久化失败: ${messageOf(error)}`
+      log(`session "${this.sessionName}": ${message}`)
+      return message
+    }
+  }
+
+  private flushPendingCodexTurnAnchors(proc: AgentProcess): string | null {
+    let failure: string | null = null
+    const remaining: typeof this.pendingCodexTurnAnchors = []
+    for (const pending of this.pendingCodexTurnAnchors) {
+      if (pending.proc !== proc || failure) {
+        remaining.push(pending)
+        continue
+      }
+      failure = this.appendTurnAnchor(pending.anchor)
+      if (failure) remaining.push(pending)
+    }
+    this.pendingCodexTurnAnchors = remaining
+    return failure
+  }
+
+  private discardPendingCodexTurnAnchors(proc: AgentProcess, reason: string): void {
+    if (proc.provider !== 'codex') return
+    const before = this.pendingCodexTurnAnchors.length
+    this.pendingCodexTurnAnchors = this.pendingCodexTurnAnchors.filter(pending => pending.proc !== proc)
+    const dropped = before - this.pendingCodexTurnAnchors.length
+    if (dropped > 0) {
+      log(`session "${this.sessionName}": dropped ${dropped} unmaterialized Codex checkpoint(s): ${reason}`)
+    }
   }
 
   private collectTurnWrites(): feishu.TurnWrite[] {
@@ -4060,23 +4127,70 @@ export class Session {
    *  可观测消息;成功持久化后清零,下一轮新错误重新可见。 */
   private resumePersistenceError: string | null = null
 
-  private persistResumableSessionId(proc: AgentProcess): void {
-    if (this.proc !== proc) return
+  private persistResumableSessionId(proc: AgentProcess): string | null {
+    if (this.proc !== proc) return null
     const sessionId = proc?.sessionId
-    if (!proc || !sessionId) return
+    if (!proc || !sessionId) return null
     // codex materialization 门控(4185808-D):thread/start 先返回内存 id,
     // rollout 落盘经 thread/read 权威确认前不得写入恢复映射 —— 错序即把
     // 不可恢复的 id 绑进映射,重启后会话丢失。resume init 与
     // conversation_materialized 信号都在确认后才置 resumable。fail-closed:
     // 不实现该 hook 的 codex 进程一律视为未确认。
-    if (proc.provider === 'codex' && proc.isConversationResumable?.() !== true) return
+    if (proc.provider === 'codex' && proc.isConversationResumable?.() !== true) return null
     const recovery = this.preservedWatchdogRecovery
-    if (recovery && (proc.provider !== recovery.provider || sessionId !== recovery.threadId)) return
-    feishu.bindSessionResume(this.sessionName, sessionId, proc.provider)
+    if (recovery && (proc.provider !== recovery.provider || sessionId !== recovery.threadId)) return null
+    // pending 独立 id 校验(4185808):fork 必须派生新 id —— 新 id 撞 fork 源或
+    // intent 建立时的旧绑定,说明 fork 未真正派生,拒绝推进恢复绑定。
+    const pendingFork = this.pendingConversationLaunch
+    if (
+      pendingFork
+      && pendingFork.launch.kind === 'fork'
+      && pendingFork.launch.source.provider === proc.provider
+      && (
+        sessionId === pendingFork.launch.source.sessionId
+        || (pendingFork.previousSessionId !== null && sessionId === pendingFork.previousSessionId)
+      )
+    ) {
+      const message = `fork 未派生独立 session id (${sessionId})`
+      log(`session "${this.sessionName}": ${message}`)
+      return message
+    }
+    const ref: ConversationRef = { provider: proc.provider, sessionId, cwd: this.workDir }
+    try {
+      feishu.bindSessionResumeChecked(this.sessionName, ref)
+    } catch (error) {
+      const message = `会话恢复点持久化失败: ${messageOf(error)}`
+      const firstReport = this.resumePersistenceError !== message
+      this.resumePersistenceError = message
+      // 进程本身仍可用:内存目标照常推进,只有 durable 绑定失败(daemon 重启前
+      // 修不了本机状态目录的话会丢恢复点 —— 群内可观测,去重只报一次)。
+      if (proc.provider === this.selectedProvider) {
+        this.lastSessionRef = ref
+        this.lastSessionId = sessionId
+      }
+      log(`session "${this.sessionName}": ${message}`)
+      if (firstReport) {
+        void feishu.sendTextRaw(this.chatId, `⚠️ ${message}；当前进程可继续，但 daemon 重启前请先解决本机状态目录写入问题。`)
+      }
+      return message
+    }
+    if (proc.provider === this.selectedProvider) {
+      this.lastSessionRef = ref
+      this.lastSessionId = sessionId
+    }
+    // 门通过的同一时刻排空延迟队列(挂账 #3):门与队列是同一 materialization
+    // 窗口的两半 —— 只有绑定推进成功,延迟锚才有资格落盘。
+    const anchorError = proc.provider === 'codex'
+      ? this.flushPendingCodexTurnAnchors(proc)
+      : null
+    if (anchorError) {
+      const firstReport = this.resumePersistenceError !== anchorError
+      this.resumePersistenceError = anchorError
+      if (firstReport) void feishu.sendTextRaw(this.chatId, `⚠️ ${anchorError}`)
+      return anchorError
+    }
     this.resumePersistenceError = null
-    if (proc.provider !== this.selectedProvider) return
-    if (sessionId === this.lastSessionId) return
-    this.lastSessionId = sessionId
+    return null
   }
 
   // ── 后台游标卡(子 agent / 后台 bash / MCP / workflow 的后台执行) ──────
@@ -5013,8 +5127,15 @@ export class Session {
         log(`session "${this.sessionName}": ignore unmatched ${p.provider} result during turn interrupt`)
         return
       }
-      this.persistResumableSessionId(p)
+      const persistenceError = this.persistResumableSessionId(p)
       this.accumulateResultStats()
+      // 仅后端显式给出本轮 clean checkpoint 时记锚点;失败/中断/畸形 result
+      // 不得复用上一轮 checkpoint(4185808:A checkpoint belongs to exactly
+      // one clean turn)。
+      const checkpointError = event?.is_error !== true
+        ? this.recordTurnAnchor(event?.checkpoint as ConversationCheckpoint | null | undefined)
+        : null
+      if (event?.is_error === true) this.lastTurnUserPreview = ''
       // result 抢在 openTurnCard 的 await 窗口内到达:标记给开卡 IIFE,
       // 它落地后据此立即收尾(否则卡片悬挂、session 卡在 working)。
       if (this.openingTurn) this.sawResultWhileOpening = true
@@ -5036,7 +5157,13 @@ export class Session {
       let forcePush = false
 
       const backend = this.proc ? this.backendLabel(this.proc.provider) : this.backendLabel()
-      if (hasMidTurn && !hostAskFlowActive) {
+      // 恢复绑定/锚持久化失败优先于常规收尾文案(4185808):状态没落盘对用户
+      // 是数据风险,必须在卡面可见并强推。
+      const stateError = [persistenceError, checkpointError].filter(Boolean).join('；') || null
+      if (stateError) {
+        suffix = `⚠️ ${stateError}`
+        forcePush = true
+      } else if (hasMidTurn && !hostAskFlowActive) {
         suffix = isError
           ? (capacityError
             ? `⚠️ ${backend} 模型容量不足,用户已介入`
@@ -5049,10 +5176,11 @@ export class Session {
         forcePush = true
       }
 
+      if (stateError && !this.currentTurn && !this.openingTurn) {
+        void feishu.sendTextRaw(this.chatId, `⚠️ ${stateError}`)
+      }
+
       log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} capacity=${capacityError} midBuffer=${this.pendingMidTurnMsgs.length} forcePush=${forcePush}`)
-      // 仅干净的、已完成的 result 记 turn 锚点(被用户打断的轮不记 ——
-      // 它的 lastAssistantUuid 指向被取消/截断的 assistant,resumeSessionAt 到它可能异常)。
-      this.recordTurnAnchor()
       void this.closeTurnCard(suffix, { forcePush, hasFreshResult: true })
       this.status = 'idle'
       sessionHostAsk.resumeAnsweredHostAsks(this)
@@ -5166,6 +5294,9 @@ export class Session {
     })
     p.on('exit', ({ code, signal, expected }: any) => {
       log(`session "${this.sessionName}": ${p.provider} exited code=${code} signal=${signal} expected=${expected}`)
+      // 进程已死:它的延迟锚永远无法经 persist→flush 落盘,立即丢弃防幽灵锚
+      // (挂账 #3 收尾口;stop/restart 的 kill 路径亦有兜底 discard)。
+      this.discardPendingCodexTurnAnchors(p, expected ? 'confirmed process exit' : 'unexpected process exit')
       const pendingDelivery = this.pendingHumanDelivery?.proc === p
         ? this.pendingHumanDelivery
         : null

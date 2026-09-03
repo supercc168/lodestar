@@ -487,16 +487,25 @@ describe('session turn checkpoint persistence', () => {
     expect(output.base).toBeNull()
   })
 
-  test('V1 input shim appends a claude checkpoint; projection stays out of the persisted V4 state', () => {
-    // PHASE4-TRANSITION 过渡壳等价性(04-03 迁 session.ts 调用方后删):
-    // appendTurnAnchor(uuid/sid 老签名)写入 claude checkpoint 形态;
-    // getTurnAnchors 返回值投影 uuid/sid 供 V1 消费方;磁盘保持纯 V4。
+  test('getTurnAnchors projects uuid/sid for V1 consumers; projection stays out of the persisted V4 state', () => {
+    // PHASE4-TRANSITION 读投影(删除责任 04-06——panel 状态机改读 checkpoint 后删):
+    // getTurnAnchors 返回值投影 uuid/sid 供 V1 消费方(session-temp resumeAt 读
+    // .uuid);磁盘保持纯 V4。appendTurnAnchor V1 输入壳已随 04-03 recordTurnAnchor
+    // checked 化删除,写入一律 appendTurnAnchorChecked。
     const result = runFreshState(`
-      feishu.appendTurnAnchor('project', {
-        uuid: 'assistant-1', sid: 'claude-sid', preview: 'first', ts: 1, writes: [],
+      feishu.appendTurnAnchorChecked('project', {
+        checkpoint: {
+          provider: 'claude', kind: 'assistant-message', id: 'assistant-1',
+          source: { provider: 'claude', sessionId: 'claude-sid', cwd: null },
+        },
+        preview: 'first', ts: 1, writes: [],
       })
-      feishu.appendTurnAnchor('project', {
-        uuid: 'assistant-2', sid: 'claude-sid', preview: 'second', ts: 2,
+      feishu.appendTurnAnchorChecked('project', {
+        checkpoint: {
+          provider: 'claude', kind: 'assistant-message', id: 'assistant-2',
+          source: { provider: 'claude', sessionId: 'claude-sid', cwd: null },
+        },
+        preview: 'second', ts: 2,
         writes: [{ tool: 'Edit', path: '/tmp/x.ts', body: 'b' }],
       })
       feishu.truncateTurnAnchors('project', 1)

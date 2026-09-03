@@ -732,29 +732,6 @@ function saveSessionTurnsMapChecked(): void {
   writeJsonStateAtomic(SESSION_TURNS_MAP_FILE, obj)
 }
 
-// PHASE4-TRANSITION: V1 输入过渡壳(删除责任 04-03——session.ts recordTurnAnchor
-// 改传 ConversationCheckpoint + appendTurnAnchorChecked 后删)。老签名 uuid/sid
-// 组装为 claude assistant-message checkpoint(cwd:null legacy 形态),等价判据 =
-// 既有 session.test 零修改全过 + feishu-turns-map.test 壳用例。
-export function appendTurnAnchor(
-  sessionName: string,
-  anchor: { uuid: string; sid: string; preview: string; ts: number; writes: TurnWrite[] },
-): void {
-  try {
-    appendTurnAnchorChecked(sessionName, {
-      checkpoint: {
-        provider: 'claude',
-        kind: 'assistant-message',
-        id: anchor.uuid,
-        source: { provider: 'claude', sessionId: anchor.sid, cwd: null },
-      },
-      preview: anchor.preview,
-      ts: anchor.ts,
-      writes: anchor.writes,
-    })
-  } catch (error) { log(`feishu: append turn anchor failed: ${error}`) }
-}
-
 export function appendTurnAnchorChecked(sessionName: string, anchor: TurnAnchor): void {
   const current = turnsBySession.get(sessionName)
   const anchors = [...(current?.anchors ?? []), canonicalTurnAnchor(anchor)]
