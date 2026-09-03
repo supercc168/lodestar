@@ -105,7 +105,7 @@ test('turnListCard:back 模式按钮用 danger + temp_back_select', () => {
 })
 
 test('turnListCard:无 entries 显示提示,不崩', () => {
-  const card = turnListCard({ projectName: 'p', mode: 'fork', entries: [] }) as any
+  const card = turnListCard({ projectName: 'p', panelId: 'panel-empty', mode: 'fork', entries: [] }) as any
   expect(card.body.elements.some((e: any) => e.tag === 'markdown')).toBe(true)
 })
 
@@ -157,7 +157,7 @@ test('selectionResultCard:元素树中 action/button 类元素计数为 0(dedupe
   }
   // 对照:源选择卡本身是有按钮的(否则计数器空转,断言无意义)。
   const source = turnListCard({
-    projectName: 'p', mode: 'fork', entries: [{ idx: 0, preview: 'x', ts: 1 }],
+    projectName: 'p', panelId: 'panel-src', mode: 'fork', entries: [{ choiceId: 'choice-0', preview: 'x', ts: 1 }],
   })
   expect(countActionElements(source)).toBeGreaterThan(0)
 })
