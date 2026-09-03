@@ -13,8 +13,8 @@ import { NothingToCompactError, type CodexUserTextSettlement, type UserTextDispa
 import { CodexRpcResponseError } from './codex-process'
 import {
   addedReactions, boundResumes, branchBaseBySession, clearedResumes, clearedTurnAnchors, deletedReactions,
-  feishuMockState, pendingConversationLaunchBySession, projectProfiles, resetFeishuMock, resumeRefs,
-  seededTurnAnchors, sentCards, sentRawTexts, sentTexts,
+  feishuMockState, modelSelections, pendingConversationLaunchBySession, projectProfiles, resetFeishuMock,
+  resumeRefs, seededTurnAnchors, sentCards, sentRawTexts, sentTexts,
   setResumeWriteError, setTurnAnchorWriteError, truncatedTurnAnchors, turnAnchorsBySession, updatedCards, urgentPushes,
 } from './feishu-test-mock'
 import type { ConversationCheckpoint, ConversationRef } from './conversation'
@@ -11749,6 +11749,217 @@ describe('Session rollbackTo/startForked 补偿事务(4185808 终态,挂账 #5/�
     expect(seededTurnAnchors).toEqual([])
     expect(turnAnchorsBySession.get(session.sessionName)).toEqual([oldAnchor])
     expect(session.lastSessionId).toBe('old-thread')
+  })
+})
+
+// ── 上游 4185808 簇 2 后半:restart 前置三件 + constructor pendingLaunch 恢复区
+// (挂账 #2)+ materialization 消费。显式 clear/fresh restart 先持久清 pendingLaunch
+// 再停进程,stop 失败恢复;legacy(cwd:null)升级前置——校验失败不 kill 现有进程;
+// daemon 崩溃后 Claude fork intent 从磁盘复活(provider 已切→清/stillPending→复活/
+// materialized→resume 新 id/皆非→fail-loud throw);首个 claude result 消费 marker。
+describe('Session restart 前置三件 + constructor 恢复区 + materialization 消费(4185808,挂账 #2)', () => {
+  const claudeForkLaunch = (session: any, sourceId = 'source-session') => ({
+    kind: 'fork' as const,
+    source: { provider: 'claude' as const, sessionId: sourceId, cwd: session.workDir },
+  })
+
+  test('explicit fresh restart cancels the prepared Claude fork before any stop or reset', async () => {
+    const session = new Session('cancel-pending', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const pending = { launch: claudeForkLaunch(session), previousSessionId: null }
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    let pendingAtReset: boolean | null = null
+    const origReset = session.resetFreshConversationState.bind(session)
+    session.resetFreshConversationState = () => {
+      pendingAtReset = pendingConversationLaunchBySession.has(session.sessionName)
+      origReset()
+    }
+    session.start = async () => true
+
+    expect(await session.restart(false, { announce: false })).toBe(true)
+
+    // 取消发生在 restart 头部(fresh reset/停进程之前),持久态与内存 marker 双清
+    expect(pendingAtReset).toBe(false)
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingConversationMaterialization).toBeNull()
+  })
+
+  test('stop 失败恢复 pending:磁盘 pending 仍在,不留半取消态', async () => {
+    const session = new Session('cancel-pending-stop-fail', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const proc = new FakeAgentProc('claude', 'live-session')
+    let pendingAtKill: boolean | null = null
+    proc.kill = async () => {
+      proc.killCalls++
+      pendingAtKill = pendingConversationLaunchBySession.has(session.sessionName)
+      throw new Error('kill timeout')
+    }
+    session.proc = proc
+    const pending = { launch: claudeForkLaunch(session), previousSessionId: null }
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+
+    expect(await session.restart(false, { announce: false })).toBe(false)
+
+    // 先持久清再停进程;停失败(kill 抛出)→ 恢复 pending 原值
+    expect(pendingAtKill).toBe(false)
+    expect(pendingConversationLaunchBySession.get(session.sessionName)).toEqual(pending)
+    expect(session.pendingConversationMaterialization).toEqual(pending)
+  })
+
+  test('legacy resume cwd verification fails before an existing process is killed', async () => {
+    const session = new Session('legacy-resume-cwd', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'running-thread')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'idle'
+    session.lastSessionId = 'legacy-thread'
+    session.lastSessionRef = { provider: 'codex', sessionId: 'legacy-thread', cwd: null }
+    session.resolveLegacyResumeRef = async () => { throw new Error('stored cwd mismatch') }
+    const statuses: string[] = []
+
+    expect(await session.restart(true, { announce: false, onStatus: (s: string) => statuses.push(s) })).toBe(false)
+
+    // 校验失败拒绝 restart 且现有进程未被 kill(前置于停进程)
+    expect(proc.killCalls).toBe(0)
+    expect(session.proc).toBe(proc)
+    expect(proc.isAlive()).toBe(true)
+    expect(session.status).toBe('idle')
+    expect(statuses.join('\n')).toContain('stored cwd mismatch')
+  })
+
+  test('constructor restores pending fork or materialized resume without silent fresh start', () => {
+    const pendingName = 'pending-reload'
+    const pendingCwd = `/tmp/lodestar-projects/${pendingName}`
+    const pending = {
+      launch: {
+        kind: 'fork' as const,
+        source: { provider: 'claude' as const, sessionId: 'source-session', cwd: pendingCwd },
+      },
+      previousSessionId: 'previous-session',
+    }
+    resumeRefs.set(`${pendingName}:claude`, { provider: 'claude', sessionId: 'previous-session', cwd: pendingCwd })
+    pendingConversationLaunchBySession.set(pendingName, pending)
+    const beforeInit = new Session(pendingName, 'chat_pending') as any
+    // stillPending:lastSessionId === previousSessionId → fork intent 复活
+    expect(beforeInit.pendingConversationMaterialization).toEqual(pending)
+    expect(beforeInit.pendingMaterializationLaunch()).toEqual(pending.launch)
+
+    const materializedName = 'pending-materialized-reload'
+    const materializedCwd = `/tmp/lodestar-projects/${materializedName}`
+    const materializedPending = {
+      launch: {
+        kind: 'fork' as const,
+        source: { provider: 'claude' as const, sessionId: 'source-session', cwd: materializedCwd },
+      },
+      previousSessionId: 'previous-session',
+    }
+    resumeRefs.set(`${materializedName}:claude`, { provider: 'claude', sessionId: 'new-materialized-session', cwd: materializedCwd })
+    pendingConversationLaunchBySession.set(materializedName, materializedPending)
+    const afterInit = new Session(materializedName, 'chat_materialized') as any
+    // materialized:绑定已推进到独立新 id → 以 resume 新 id 为安全 launch
+    expect(afterInit.pendingMaterializationLaunch()).toEqual({
+      kind: 'resume',
+      source: { provider: 'claude', sessionId: 'new-materialized-session', cwd: materializedCwd },
+    })
+  })
+
+  test('Codex constructor clears stale Claude pending before validating its old cwd', () => {
+    const sessionName = 'codex-clears-stale-claude-pending'
+    modelSelections.set(sessionName, { provider: 'codex', model: 'gpt-5.6-sol', effort: 'high' })
+    pendingConversationLaunchBySession.set(sessionName, {
+      launch: {
+        kind: 'fork',
+        source: { provider: 'claude', sessionId: 'source-session', cwd: '/srv/old-claude-project' },
+      },
+      previousSessionId: null,
+    })
+
+    expect(() => new Session(sessionName, 'chat_id')).not.toThrow()
+    expect(pendingConversationLaunchBySession.has(sessionName)).toBe(false)
+  })
+
+  test('constructor throws on a pending Claude fork with inconsistent resume binding(fail-loud)', () => {
+    const brokenName = 'pending-inconsistent'
+    const brokenCwd = `/tmp/lodestar-projects/${brokenName}`
+    // 畸形持久态:绑定 id === fork 源 id(既非 stillPending 也非 materialized)
+    resumeRefs.set(`${brokenName}:claude`, { provider: 'claude', sessionId: 'source-session', cwd: brokenCwd })
+    pendingConversationLaunchBySession.set(brokenName, {
+      launch: {
+        kind: 'fork',
+        source: { provider: 'claude', sessionId: 'source-session', cwd: brokenCwd },
+      },
+      previousSessionId: 'previous-session',
+    })
+
+    expect(() => new Session(brokenName, 'chat_broken')).toThrow('inconsistent resume binding')
+  })
+
+  test('Claude init binds the new id and first result consumes the durable pending marker', () => {
+    const session = new Session('pending-materialize', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const launch = claudeForkLaunch(session)
+    const pending = { launch, previousSessionId: 'previous-session' }
+    session.lastSessionId = 'previous-session'
+    session.lastSessionRef = { provider: 'claude', sessionId: 'previous-session', cwd: session.workDir }
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    const proc = new FakeAgentProc('claude', 'new-session')
+    session.proc = proc
+
+    // persist 推进绑定但不清 durable marker(marker 归首个 result 消费)
+    expect(session.persistResumableSessionId(proc)).toBeNull()
+    expect(resumeRefs.get(`${session.sessionName}:claude`)?.sessionId).toBe('new-session')
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
+    expect(session.pendingMaterializationLaunch()).toEqual({
+      kind: 'resume',
+      source: { provider: 'claude', sessionId: 'new-session', cwd: session.workDir },
+    })
+
+    expect(session.consumePendingConversationMaterialization()).toBeNull()
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingConversationMaterialization).toBeNull()
+  })
+
+  test('首个 claude result 经 wireProc 接线消费 durable marker(materialize 成功证据)', () => {
+    const session = new Session('pending-consume-result', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const launch = claudeForkLaunch(session)
+    const pending = { launch, previousSessionId: 'previous-session' }
+    session.lastSessionId = 'previous-session'
+    session.lastSessionRef = { provider: 'claude', sessionId: 'previous-session', cwd: session.workDir }
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    const proc = new FakeAgentProc('claude', 'new-session')
+    session.proc = proc
+    session.wireProc(proc)
+
+    proc.emit('result', { subtype: 'success', is_error: false })
+
+    expect(resumeRefs.get(`${session.sessionName}:claude`)?.sessionId).toBe('new-session')
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingConversationMaterialization).toBeNull()
+  })
+
+  test('Claude fork 未派生独立 id / 无 id:persist 拒绝推进,durable marker 保留', () => {
+    const session = new Session('pending-same-id', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const launch = claudeForkLaunch(session)
+    const pending = { launch, previousSessionId: 'source-session' }
+    session.lastSessionId = 'source-session'
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    const sameId = new FakeAgentProc('claude', 'source-session')
+    session.proc = sameId
+    expect(session.persistResumableSessionId(sameId)).toContain('did not materialize an independent session id')
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
+
+    const noId = new FakeAgentProc('claude', null)
+    session.proc = noId
+    expect(session.persistResumableSessionId(noId)).toContain('did not provide a materialized session id')
+    expect(session.consumePendingConversationMaterialization()).toContain('保留 pending marker')
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
   })
 })
 

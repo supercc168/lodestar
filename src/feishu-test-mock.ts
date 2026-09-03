@@ -55,6 +55,9 @@ export const movedTasks: Array<[string, string, string]> = []
 export const addedTaskComments: Array<[string, string]> = []
 /** [projects.<name>] 项目 profile 替身,测试往里 set 后 Session 构造时可查到。 */
 export const projectProfiles = new Map<string, { cwd?: string; watchdogMode?: WatchdogMode }>()
+/** 持久化 model selection 替身(4185808 constructor 恢复区用例:构造期 provider
+ *  由此决定;既有用例不 set → null,行为零变化)。 */
+export const modelSelections = new Map<string, { provider: string; model: string | null; effort: string | null }>()
 /** chatIdForSession 替身返回值,测试可改。 */
 export const feishuMockState = {
   chatIdForSession: null as string | null,
@@ -84,6 +87,7 @@ export function resetFeishuMock(): void {
     arr.length = 0
   }
   projectProfiles.clear()
+  modelSelections.clear()
   resumeRefs.clear()
   turnAnchorsBySession.clear()
   branchBaseBySession.clear()
@@ -127,7 +131,7 @@ mock.module('./feishu', () => ({
     const ref = resumeRefs.get(`${sessionName}:${provider}`)
     return ref ? { ...ref } : null
   },
-  getSessionModelSelection: () => null,
+  getSessionModelSelection: (sessionName: string) => modelSelections.get(sessionName) ?? null,
   /** listCodexConversations/start 的登录门替身:默认已登录(与真实导出同名同签名)。 */
   isOpenAIChatGPTAuthenticated: () => true,
   getTenantToken: async () => 'tenant-token',
