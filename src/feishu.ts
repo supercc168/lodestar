@@ -32,6 +32,14 @@ import {
 import { log } from './log'
 import { writeJsonStateAtomic, writeStateFileAtomic } from './state-store'
 import { neutralizeMarkdownImagesInCard } from './cards/elements'
+import {
+  validateConversationLaunch,
+  type ConversationBranchBase,
+  type ConversationCheckpoint,
+  type ConversationLaunch,
+  type ConversationRef,
+  type PendingConversationLaunch,
+} from './conversation'
 
 const APP_ID = config.feishu.app_id
 const APP_SECRET = config.feishu.app_secret
@@ -199,11 +207,12 @@ export function getSessionResume(sessionName: string, provider: AgentProvider = 
   return lastSessionIdByName.get(sessionName)?.[provider] ?? null
 }
 
-// ── Session turns map (fk/bk anchors + rs recent) ───────────────────
-// `sessionName → TurnAnchor[]`。每 turn 结束记一条:本 turn 最后一条 assistant
-// 消息的 uuid(SDK resumeSessionAt 锚点)+ 用户输入预览 + 时间。fk/bk 列"用户
-// 输入前的分界点";rs 空闲模式列项目最近 24h 会话。fork/back 派生新会话时用
-// seedTurnAnchors 给新群继承分叉点之前的历史锚点。
+// ── Session turns map (fk/bk checkpoints) ──────────────────────────
+// V4 persists `sessionName → { base, anchors, pendingLaunch? }`. base describes
+// the exact backend-native history immediately before the first retained
+// anchor. pendingLaunch keeps a Claude fork durable until its first input
+// materializes a new session id. null base is legacy/unknown and must never be
+// interpreted as a fresh conversation.
 export interface TurnWrite {
   tool: string
   path: string
@@ -211,11 +220,8 @@ export interface TurnWrite {
 }
 
 export interface TurnAnchor {
-  /** 本 turn 最后一条 assistant 消息 uuid — SDK resumeSessionAt 锚点 */
-  uuid: string
-  /** 该 uuid 所属的 Claude session_id。sid 漂移(provider切/clear/fork 后)校验用:
-   *  旧 sid 的 uuid 不能配新 sid 的 transcript → 锚点失效,不展示/不可选。 */
-  sid: string
+  /** Provider-native completed-turn checkpoint, including its source conversation. */
+  checkpoint: ConversationCheckpoint
   /** 本 turn 用户输入预览(首条文本,截断) */
   preview: string
   /** 时间戳 ms */
@@ -224,32 +230,266 @@ export interface TurnAnchor {
   writes: TurnWrite[]
 }
 
-const turnsBySession = new Map<string, TurnAnchor[]>()
+interface SessionTurnsState {
+  base: ConversationBranchBase
+  anchors: TurnAnchor[]
+  pendingLaunch?: PendingConversationLaunch
+}
+
+const turnsBySession = new Map<string, SessionTurnsState>()
 const TURN_ANCHOR_MAX = 200
+
+function parseConversationRef(value: unknown): ConversationRef | null {
+  if (!value || typeof value !== 'object') return null
+  const ref = value as Record<string, unknown>
+  if (ref.provider !== 'claude' && ref.provider !== 'codex') return null
+  const sessionId = typeof ref.sessionId === 'string' ? ref.sessionId.trim() : ''
+  if (!sessionId) return null
+  let cwd: string | null
+  if (ref.cwd === undefined || ref.cwd === null) cwd = null
+  else if (typeof ref.cwd === 'string' && ref.cwd.trim()) cwd = ref.cwd
+  else return null
+  return { provider: ref.provider, sessionId, cwd }
+}
+
+function parseCheckpoint(value: unknown): ConversationCheckpoint | null {
+  if (!value || typeof value !== 'object') return null
+  const checkpoint = value as Record<string, unknown>
+  const source = checkpoint.source
+  if (!source || typeof source !== 'object') return null
+  const parsedSource = parseConversationRef(source)
+  const id = typeof checkpoint.id === 'string' ? checkpoint.id.trim() : ''
+  if (!id || !parsedSource) return null
+
+  if (
+    checkpoint.provider === 'claude'
+    && checkpoint.kind === 'assistant-message'
+    && parsedSource.provider === 'claude'
+  ) {
+    return {
+      provider: 'claude',
+      kind: 'assistant-message',
+      id,
+      source: { ...parsedSource, provider: 'claude' },
+    }
+  }
+  if (
+    checkpoint.provider === 'codex'
+    && checkpoint.kind === 'turn'
+    && parsedSource.provider === 'codex'
+  ) {
+    return {
+      provider: 'codex',
+      kind: 'turn',
+      id,
+      source: { ...parsedSource, provider: 'codex' },
+    }
+  }
+  return null
+}
+
+function parseConversationLaunch(value: unknown): ConversationLaunch | null {
+  if (!value || typeof value !== 'object') return null
+  const launch = value as Record<string, unknown>
+  if (launch.kind === 'fresh') return { kind: 'fresh' }
+  if (launch.kind !== 'resume' && launch.kind !== 'fork') return null
+  const source = parseConversationRef(launch.source)
+  if (!source) return null
+  const parsed: ConversationLaunch | null = launch.kind === 'resume'
+    ? { kind: 'resume', source }
+    : (() => {
+        if (!Object.prototype.hasOwnProperty.call(launch, 'through')) return { kind: 'fork', source }
+        const through = parseCheckpoint(launch.through)
+        return through ? { kind: 'fork', source, through } : null
+      })()
+  if (!parsed) return null
+  try {
+    validateConversationLaunch(parsed, source.provider)
+  } catch {
+    return null
+  }
+  return parsed
+}
+
+function parseTurnWrites(value: unknown): TurnWrite[] {
+  if (!Array.isArray(value)) return []
+  return value
+    .filter((w: any) => w && typeof w.path === 'string')
+    .map((w: any) => ({
+      tool: String(w.tool ?? 'Write'),
+      path: String(w.path),
+      body: String(w.body ?? ''),
+    }))
+    .filter((w: TurnWrite) => w.path !== '' || w.body !== '')
+}
+
+function parseTurnAnchor(value: unknown, legacyProvider: 'claude' | null): TurnAnchor | null {
+  if (!value || typeof value !== 'object') return null
+  const anchor = value as Record<string, unknown>
+  if (typeof anchor.ts !== 'number' || !Number.isFinite(anchor.ts)) return null
+
+  const hasCheckpoint = Object.prototype.hasOwnProperty.call(anchor, 'checkpoint')
+  let checkpoint = parseCheckpoint(anchor.checkpoint)
+  if (hasCheckpoint && !checkpoint) return null
+  if (!checkpoint) {
+    // V1 did not persist provider. Older builds also wrote Codex agentMessage
+    // item ids into this shape, so only migrate when the provider-aware resume
+    // map proves that this whole anchor chain belongs to Claude.
+    if (legacyProvider !== 'claude') return null
+    const uuid = typeof anchor.uuid === 'string' ? anchor.uuid.trim() : ''
+    const sid = typeof anchor.sid === 'string' ? anchor.sid.trim() : ''
+    if (!uuid || !sid) return null
+    checkpoint = {
+      provider: 'claude',
+      kind: 'assistant-message',
+      id: uuid,
+      source: { provider: 'claude', sessionId: sid, cwd: null },
+    }
+  }
+
+  return {
+    checkpoint,
+    preview: String(anchor.preview ?? ''),
+    ts: anchor.ts,
+    writes: parseTurnWrites(anchor.writes),
+  }
+}
+
+function parsePendingConversationLaunch(value: unknown): PendingConversationLaunch | null {
+  if (!value || typeof value !== 'object') return null
+  const pending = value as Record<string, unknown>
+  const launch = parseConversationLaunch(pending.launch)
+  if (
+    launch?.kind !== 'fork'
+    || launch.source.provider !== 'claude'
+    || launch.source.cwd === null
+  ) return null
+  const previousRaw = pending.previousSessionId
+  const previousSessionId = previousRaw === null
+    ? null
+    : typeof previousRaw === 'string' && previousRaw.trim()
+      ? previousRaw.trim()
+      : undefined
+  if (previousSessionId === undefined) return null
+  return { launch: { ...launch, source: { ...launch.source, provider: 'claude' } }, previousSessionId }
+}
+
+function clonePendingConversationLaunch(pending: PendingConversationLaunch): PendingConversationLaunch {
+  const through = pending.launch.through
+  if (
+    pending.launch.source.provider !== 'claude'
+    || (
+      through
+      && (
+        through.provider !== 'claude'
+        || through.kind !== 'assistant-message'
+        || through.source.provider !== 'claude'
+      )
+    )
+  ) {
+    throw new Error('pending conversation launch is not a Claude fork')
+  }
+  return {
+    launch: {
+      kind: 'fork',
+      source: { ...pending.launch.source, provider: 'claude' },
+      ...(through
+        ? {
+            through: {
+              ...through,
+              provider: 'claude',
+              kind: 'assistant-message',
+              source: { ...through.source, provider: 'claude' },
+            },
+          }
+        : {}),
+    },
+    previousSessionId: pending.previousSessionId,
+  }
+}
+
+/** 入库前归一到纯 V4 形态:getTurnAnchors 的 uuid/sid 读投影(PHASE4-TRANSITION)
+ *  可能被调用方原样喂回(replace/seed),此处剥掉多余字段,保证内存 store 与磁盘
+ *  持久化永远只有 {checkpoint, preview, ts, writes}。 */
+function canonicalTurnAnchor(anchor: TurnAnchor): TurnAnchor {
+  return {
+    checkpoint: anchor.checkpoint,
+    preview: anchor.preview,
+    ts: anchor.ts,
+    writes: anchor.writes,
+  }
+}
 
 export function loadSessionTurnsMap(): void {
   try {
     const obj = JSON.parse(readFileSync(SESSION_TURNS_MAP_FILE, 'utf8'))
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      throw new Error('turns map must contain an object')
+    }
+    turnsBySession.clear()
     let n = 0
-    for (const [name, arr] of Object.entries(obj)) {
-      if (!Array.isArray(arr)) continue
-      const clean = arr
-        .filter((a: any) => a && typeof a.uuid === 'string' && typeof a.ts === 'number')
-        .map((a: any) => ({
-          uuid: String(a.uuid),
-          sid: String(a.sid ?? ''),
-          preview: String(a.preview ?? ''),
-          ts: Number(a.ts),
-          writes: Array.isArray(a.writes)
-            ? a.writes
-              .filter((w: any) => w && typeof w.path === 'string')
-              .map((w: any) => ({ tool: String(w.tool ?? 'Write'), path: String(w.path), body: String(w.body ?? '') }))
-              .filter((w: TurnWrite) => w.path !== '' || w.body !== '')
-            : [],
-        }))
-      if (clean.length) { turnsBySession.set(name, clean); n += clean.length }
+    let rejected = 0
+    for (const [name, value] of Object.entries(obj)) {
+      let arr: unknown[]
+      let base: ConversationBranchBase
+      let pendingLaunch: PendingConversationLaunch | null = null
+      if (Array.isArray(value)) {
+        // V1/V2 stored only the anchor array, so its preceding branch baseline
+        // is unknowable even when every individual checkpoint is usable.
+        arr = value
+        base = null
+      } else if (value && typeof value === 'object' && !Array.isArray(value)) {
+        const state = value as Record<string, unknown>
+        if (!Array.isArray(state.anchors) || !Object.prototype.hasOwnProperty.call(state, 'base')) {
+          rejected++
+          continue
+        }
+        arr = state.anchors
+        if (state.base === null) base = null
+        else {
+          const parsedBase = parseConversationLaunch(state.base)
+          if (!parsedBase) {
+            rejected++
+            continue
+          }
+          base = parsedBase
+        }
+        if (Object.prototype.hasOwnProperty.call(state, 'pendingLaunch')) {
+          const parsedPending = parsePendingConversationLaunch(state.pendingLaunch)
+          if (!parsedPending) {
+            rejected++
+            continue
+          }
+          pendingLaunch = parsedPending
+        }
+      } else {
+        rejected++
+        continue
+      }
+      const resumes = lastSessionIdByName.get(name)
+      // A V1 chain can contain ancestor Claude session ids, so equality with
+      // the current resume id proves nothing. Only an unambiguous Claude-only
+      // resume binding lets us interpret its provider-less UUID checkpoints.
+      const legacyProvider: 'claude' | null = resumes?.claude !== undefined && resumes.codex === undefined
+        ? 'claude'
+        : null
+      const clean: TurnAnchor[] = []
+      for (const value of arr) {
+        const anchor = parseTurnAnchor(value, legacyProvider)
+        if (anchor) clean.push(anchor)
+        else rejected++
+      }
+      if (clean.length || base !== null || pendingLaunch) {
+        turnsBySession.set(name, {
+          base,
+          anchors: clean,
+          ...(pendingLaunch ? { pendingLaunch } : {}),
+        })
+        n += clean.length
+      }
     }
     log(`feishu: loaded ${n} turn anchors across ${turnsBySession.size} sessions`)
+    if (rejected > 0) log(`feishu: rejected ${rejected} malformed turn anchors while loading`)
   } catch (e: any) {
     // ENOENT(首次启动无文件)静默;其他(JSON 损坏等)要暴露,符合 no-fallbacks。
     if (e?.code !== 'ENOENT') log(`feishu: load session-turns-map failed: ${e?.message ?? e}`)
@@ -258,39 +498,164 @@ export function loadSessionTurnsMap(): void {
 
 function saveSessionTurnsMap(): void {
   try {
-    const obj: Record<string, TurnAnchor[]> = {}
-    for (const [k, v] of turnsBySession) obj[k] = v
-    writeJsonStateAtomic(SESSION_TURNS_MAP_FILE, obj)
+    saveSessionTurnsMapChecked()
   } catch (e) { log(`feishu: save session-turns-map failed: ${e}`) }
 }
 
-export function appendTurnAnchor(sessionName: string, anchor: TurnAnchor): void {
-  const arr = turnsBySession.get(sessionName) ?? []
-  arr.push(anchor)
-  if (arr.length > TURN_ANCHOR_MAX) arr.splice(0, arr.length - TURN_ANCHOR_MAX)
-  turnsBySession.set(sessionName, arr)
-  saveSessionTurnsMap()
+function saveSessionTurnsMapChecked(): void {
+  const obj: Record<string, SessionTurnsState> = {}
+  for (const [k, v] of turnsBySession) obj[k] = v
+  writeJsonStateAtomic(SESSION_TURNS_MAP_FILE, obj)
 }
 
-export function getTurnAnchors(sessionName: string): TurnAnchor[] {
-  return turnsBySession.get(sessionName) ?? []
+// PHASE4-TRANSITION: V1 输入过渡壳(删除责任 04-03——session.ts recordTurnAnchor
+// 改传 ConversationCheckpoint + appendTurnAnchorChecked 后删)。老签名 uuid/sid
+// 组装为 claude assistant-message checkpoint(cwd:null legacy 形态),等价判据 =
+// 既有 session.test 零修改全过 + feishu-turns-map.test 壳用例。
+export function appendTurnAnchor(
+  sessionName: string,
+  anchor: { uuid: string; sid: string; preview: string; ts: number; writes: TurnWrite[] },
+): void {
+  try {
+    appendTurnAnchorChecked(sessionName, {
+      checkpoint: {
+        provider: 'claude',
+        kind: 'assistant-message',
+        id: anchor.uuid,
+        source: { provider: 'claude', sessionId: anchor.sid, cwd: null },
+      },
+      preview: anchor.preview,
+      ts: anchor.ts,
+      writes: anchor.writes,
+    })
+  } catch (error) { log(`feishu: append turn anchor failed: ${error}`) }
 }
 
+export function appendTurnAnchorChecked(sessionName: string, anchor: TurnAnchor): void {
+  const current = turnsBySession.get(sessionName)
+  const anchors = [...(current?.anchors ?? []), canonicalTurnAnchor(anchor)]
+  let base = current?.base ?? null
+  if (anchors.length > TURN_ANCHOR_MAX) {
+    const discarded = anchors.splice(0, anchors.length - TURN_ANCHOR_MAX)
+    const checkpoint = discarded[discarded.length - 1]!.checkpoint
+    base = { kind: 'fork', source: checkpoint.source, through: checkpoint }
+  }
+  turnsBySession.set(sessionName, {
+    base,
+    anchors,
+    ...(current?.pendingLaunch ? { pendingLaunch: current.pendingLaunch } : {}),
+  })
+  try { saveSessionTurnsMapChecked() } catch (error) {
+    if (current) turnsBySession.set(sessionName, current)
+    else turnsBySession.delete(sessionName)
+    throw error
+  }
+}
+
+// PHASE4-TRANSITION: 返回值 uuid/sid 读投影(删除责任 04-06——session-temp panel
+// 状态机改读 checkpoint 后删投影,恢复上游纯 V4 返回形)。投影只存在于返回的副本,
+// 内存 store 与磁盘保持纯 V4(canonicalTurnAnchor 在写入口剥除回流字段)。
+export function getTurnAnchors(sessionName: string): Array<TurnAnchor & { uuid: string; sid: string }> {
+  return (turnsBySession.get(sessionName)?.anchors ?? []).map(a => ({
+    ...a,
+    uuid: a.checkpoint.id,
+    sid: a.checkpoint.source.sessionId,
+  }))
+}
+
+export function getSessionBranchBase(sessionName: string): ConversationBranchBase {
+  return turnsBySession.get(sessionName)?.base ?? null
+}
+
+export function getPendingConversationLaunch(sessionName: string): PendingConversationLaunch | null {
+  const pending = turnsBySession.get(sessionName)?.pendingLaunch
+  return pending ? clonePendingConversationLaunch(pending) : null
+}
+
+export function setPendingConversationLaunchChecked(
+  sessionName: string,
+  pendingLaunch: PendingConversationLaunch | null,
+): void {
+  if (pendingLaunch) {
+    if (pendingLaunch.launch.source.cwd === null) {
+      throw new Error('pending conversation launch source cwd is missing')
+    }
+    validateConversationLaunch(
+      pendingLaunch.launch,
+      'claude',
+      pendingLaunch.launch.source.cwd,
+    )
+  }
+  const previous = turnsBySession.get(sessionName)
+  const base = previous?.base ?? null
+  const anchors = previous?.anchors.slice() ?? []
+  if (!pendingLaunch && anchors.length === 0 && base === null) turnsBySession.delete(sessionName)
+  else {
+    turnsBySession.set(sessionName, {
+      base,
+      anchors,
+      ...(pendingLaunch ? { pendingLaunch: clonePendingConversationLaunch(pendingLaunch) } : {}),
+    })
+  }
+  try { saveSessionTurnsMapChecked() } catch (error) {
+    if (previous) turnsBySession.set(sessionName, previous)
+    else turnsBySession.delete(sessionName)
+    throw error
+  }
+}
+
+// PHASE4-TRANSITION: 过渡壳(删除责任 04-06——bk 选择流程改 replaceTurnAnchors
+// 原子换 base+anchors 后删)。V4 store 上的等价截断:只截 anchors,base/pending 保持。
 /** back 回滚后:截断该 session 锚点到 keepCount 条(回滚点之后作废,reset 语义)。 */
 export function truncateTurnAnchors(sessionName: string, keepCount: number): void {
-  const arr = turnsBySession.get(sessionName)
-  if (!arr || arr.length <= keepCount) return
-  turnsBySession.set(sessionName, arr.slice(0, keepCount))
+  const state = turnsBySession.get(sessionName)
+  if (!state || state.anchors.length <= keepCount) return
+  turnsBySession.set(sessionName, { ...state, anchors: state.anchors.slice(0, keepCount) })
   saveSessionTurnsMap()
 }
 
 /** fork/back 派生新会话时,把分叉点之前的锚点继承给新群(不含分叉点本身)。 */
 export function seedTurnAnchors(sessionName: string, from: TurnAnchor[]): void {
   if (from.length === 0) return
-  turnsBySession.set(sessionName, from.slice())
+  turnsBySession.set(sessionName, { base: null, anchors: from.map(canonicalTurnAnchor) })
   saveSessionTurnsMap()
 }
 
+/** Atomically replace a branch's baseline and anchors with one checked state write. */
+export function replaceTurnAnchors(
+  sessionName: string,
+  anchors: TurnAnchor[],
+  base: ConversationBranchBase,
+  pendingLaunch?: PendingConversationLaunch | null,
+): void {
+  const previous = turnsBySession.get(sessionName)
+  const nextPendingRaw = pendingLaunch === undefined ? previous?.pendingLaunch : pendingLaunch ?? undefined
+  const nextPending = nextPendingRaw ? clonePendingConversationLaunch(nextPendingRaw) : undefined
+  if (anchors.length === 0 && base === null && !nextPending) turnsBySession.delete(sessionName)
+  else {
+    turnsBySession.set(sessionName, {
+      base,
+      anchors: anchors.map(canonicalTurnAnchor),
+      ...(nextPending ? { pendingLaunch: nextPending } : {}),
+    })
+  }
+  try {
+    saveSessionTurnsMapChecked()
+  } catch (error) {
+    if (previous) turnsBySession.set(sessionName, previous)
+    else turnsBySession.delete(sessionName)
+    throw error
+  }
+}
+
+/** Persist an explicit baseline; fresh must be set explicitly rather than inferred from empty anchors. */
+export function setSessionBranchBase(sessionName: string, base: ConversationBranchBase): void {
+  replaceTurnAnchors(sessionName, getTurnAnchors(sessionName), base)
+}
+
+// PHASE4-TRANSITION: 过渡壳(删除责任 04-04——provider 切换/清理调用方改
+// replaceTurnAnchors(name, [], null, null) checked 形态后删)。整体删除该 session
+// 的 base+anchors+pendingLaunch(与上游 clearTurnAnchors 终态行为一致)。
 export function clearTurnAnchors(sessionName: string): void {
   if (!turnsBySession.has(sessionName)) return
   turnsBySession.delete(sessionName)
