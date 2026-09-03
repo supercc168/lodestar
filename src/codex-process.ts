@@ -371,6 +371,8 @@ export class CodexProcess extends EventEmitter {
 
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
+  /** Canonical app-server turn id from the latest main-thread turn/completed notification. */
+  lastCompletedTurnId: string | null = null
   lastModel: string | null = null
   lastEffort: CodexReasoningEffort | null = null
   lastUsage: CodexUsage | null = null
@@ -692,6 +694,8 @@ export class CodexProcess extends EventEmitter {
           if (!this.ackTurnStart(delivery, turnId)) return
         }
         this.currentTurnId = turnId
+        // 清空点(ff44afb):新 turn 开始,上一轮 checkpoint 不得跨入进行中的新轮。
+        this.lastCompletedTurnId = null
         // fresh 线程只有内存 id:persisted turn/started 是 rollout 可能已
         // 落盘的首个信号,触发权威验证(4185808 主题 D)。
         this.markConversationMaterialized('turn/started notification')
@@ -723,6 +727,11 @@ export class CodexProcess extends EventEmitter {
         this.markConversationMaterialized('turn/completed notification')
         const status = turn.status
         const isError = status === 'failed' || !!turn.error
+        const completedTurnId = turnId
+        const isCheckpointable = status === 'completed' && !isError && !!completedTurnId
+        // Never leave a previous turn's checkpoint visible on a failed,
+        // interrupted, or malformed terminal notification.
+        this.lastCompletedTurnId = isCheckpointable ? completedTurnId : null
         const subtype = isError ? (turn.error?.type ?? turn.error?.message ?? 'failed') : 'success'
         this.lastResult = {
           cost_usd: null,
@@ -746,6 +755,14 @@ export class CodexProcess extends EventEmitter {
                 turn_id: turnId ?? delivery.turnId,
               }
             : {}),
+          checkpoint: isCheckpointable && this.sessionId
+            ? {
+                provider: 'codex',
+                kind: 'turn',
+                id: completedTurnId,
+                source: { provider: 'codex', sessionId: this.sessionId, cwd: this.opts.workDir },
+              }
+            : null,
         })
         if (delivery && this.pendingTurnStart === delivery) this.pendingTurnStart = null
         return
@@ -1769,6 +1786,9 @@ export class CodexProcess extends EventEmitter {
       settle,
     }
     this.pendingTurnStart = delivery
+    // 清空点(ff44afb):turn/start 传输失败也会 emit result;建 delivery 即清
+    // (任何 await 之前),失败不得复用上一轮 checkpoint 作锚。
+    this.lastCompletedTurnId = null
     void this.launchTurnStart(delivery, fileHints + text)
     return {
       kind: 'turn_start_pending',
@@ -1933,6 +1953,8 @@ export class CodexProcess extends EventEmitter {
       is_error: true,
     }
     this.currentTurnId = null
+    // 清空点(ff44afb):turn 启动失败,上一轮 checkpoint 不可再作锚。
+    this.lastCompletedTurnId = null
     this.emit('result', {
       subtype: this.lastResult.subtype,
       is_error: true,

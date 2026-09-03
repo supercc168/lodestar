@@ -20,6 +20,8 @@ import type {
   BgTaskUpdatedEvent,
   BgTaskSettledEvent,
 } from './claude-agent-process'
+// type-only:conversation.ts 亦仅类型引用本模块,无运行时环。
+import type { ConversationCheckpoint } from './conversation'
 
 export type AgentProvider = 'codex' | 'claude'
 export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
@@ -59,6 +61,10 @@ export type AgentResultEvent = {
   delivery_id?: string
   thread_id?: string
   turn_id?: string | null
+  /** Backend-native fork anchor for the just-completed turn. null on failed,
+   * interrupted, or malformed terminals(ff44afb:A checkpoint belongs to
+   * exactly one clean turn)。 */
+  checkpoint?: ConversationCheckpoint | null
   [key: string]: unknown
 }
 

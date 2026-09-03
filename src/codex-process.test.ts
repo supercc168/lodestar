@@ -2097,3 +2097,28 @@ describe('codex checkpoint 采集与清空(上游 ff44afb)', () => {
     expect(fixture.resultEvents.at(-1)?.is_error).toBe(true)
   })
 })
+
+// GREEN 后叠加锚(本地独有):外线程事件不产生 checkpoint 副作用——
+// isForeignThread 前置过滤(98bb01d)在 checkpoint 采集之前,子线程
+// turn/completed 既不清空也不覆写主线程锚。
+describe('codex checkpoint 外线程隔离(本地 isForeignThread 叠加锚)', () => {
+  test('isForeignThread 的 turn/started|completed 不碰 lastCompletedTurnId', () => {
+    const { proc } = checkpointHarness()
+
+    proc.handleNotification('turn/started', { threadId: 'thread-ckpt', turn: { id: 'turn-1' } })
+    proc.handleNotification('turn/completed', {
+      threadId: 'thread-ckpt',
+      turn: { id: 'turn-1', status: 'completed' },
+    })
+    expect(proc.lastCompletedTurnId).toBe('turn-1')
+
+    proc.handleNotification('turn/completed', {
+      threadId: 'child-thread',
+      turn: { id: 'child-turn', status: 'completed' },
+    })
+    expect(proc.lastCompletedTurnId).toBe('turn-1')
+
+    proc.handleNotification('turn/started', { threadId: 'child-thread', turn: { id: 'child-turn-2' } })
+    expect(proc.lastCompletedTurnId).toBe('turn-1')
+  })
+})
