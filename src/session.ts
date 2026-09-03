@@ -785,6 +785,31 @@ export class Session {
     if (this.lastSessionId) {
       log(`session "${sessionName}": restored ${this.selectedProvider} lastSessionId=${this.lastSessionId.slice(0, 8)}…`)
     }
+    // pendingLaunch 恢复区(4185808 终态,挂账 #2):daemon 在 Claude fork 的
+    // startup grace 内崩溃时,磁盘 intent 在下次构造复活。provider 已切 → 先清
+    // (不 validate 异地 cwd);Claude → stillPending/materialized 判定,二者皆非
+    // = 不一致绑定 fail-loud throw(不得静默 fresh 丢掉用户的分叉意图)。
+    const pendingLaunch = feishu.getPendingConversationLaunch(sessionName)
+    if (pendingLaunch) {
+      if (this.selectedProvider !== 'claude') {
+        feishu.replaceTurnAnchors(sessionName, [], null, null)
+        log(`session "${sessionName}": cleared pending Claude fork after provider changed`)
+      } else {
+        validateConversationLaunch(pendingLaunch.launch, 'claude', this.workDir)
+        const stillPending = this.lastSessionId === pendingLaunch.previousSessionId
+        const materializedRef = this.lastSessionRef
+        const materialized = !stillPending
+          && materializedRef?.provider === 'claude'
+          && materializedRef.cwd === this.workDir
+          && materializedRef.sessionId !== pendingLaunch.launch.source.sessionId
+          && materializedRef.sessionId !== pendingLaunch.previousSessionId
+        if (!stillPending && !materialized) {
+          throw new Error(`pending Claude fork has inconsistent resume binding for session "${sessionName}"`)
+        }
+        this.pendingConversationMaterialization = pendingLaunch
+        log(`session "${sessionName}": restored ${materialized ? 'materialized' : 'pending'} Claude fork source=${pendingLaunch.launch.source.sessionId}`)
+      }
+    }
   }
 
   /** Minimal cross-chat snapshot for the `hi` peer-list section.
@@ -1597,8 +1622,10 @@ export class Session {
       }
     }
     if (this.selectedProvider !== routing.provider) {
-      // Checked first: a failed state write must not leave the in-memory provider changed.
+      // Checked first: a failed state write must not leave the in-memory provider
+      // changed while a durable Claude fork marker survives(4185808)。
       feishu.replaceTurnAnchors(this.sessionName, [], null, null)
+      this.pendingConversationMaterialization = null
     }
     this.selectedProvider = routing.provider
     this.selectedModel = routing.model
@@ -1712,6 +1739,30 @@ export class Session {
     anchor: feishu.TurnAnchor
   }> = []
 
+  /** 从 durable Claude fork intent 派生安全 launch(4185808,挂账 #2)。
+   *  stillPending(绑定仍指 fork 前)→ 重放 fork intent;materialized(绑定已
+   *  推进到独立新 id)→ resume 新 id;二者皆非/provider 不符 → fail-loud throw
+   *  (inconsistent state 不得静默 fresh)。 */
+  private pendingMaterializationLaunch(): ConversationLaunch | null {
+    const pending = this.pendingConversationMaterialization
+    if (!pending) return null
+    validateConversationLaunch(pending.launch, 'claude', this.workDir)
+    if (this.selectedProvider !== 'claude') {
+      throw new Error('pending Claude fork cannot launch under a non-Claude provider')
+    }
+    if (this.lastSessionId === pending.previousSessionId) return pending.launch
+    const materializedRef = this.lastSessionRef
+    if (
+      materializedRef?.provider === 'claude'
+      && materializedRef.cwd === this.workDir
+      && materializedRef.sessionId !== pending.launch.source.sessionId
+      && materializedRef.sessionId !== pending.previousSessionId
+    ) {
+      return { kind: 'resume', source: materializedRef }
+    }
+    throw new Error('pending Claude fork has no safe launch target')
+  }
+
   private spawnAgent(
     resumeRef?: ConversationRef,
     provider: AgentProvider = this.selectedProvider,
@@ -1720,7 +1771,10 @@ export class Session {
     const pending = this.pendingConversationLaunch && (!lease || this.pendingConversationLaunch.lease === lease)
       ? this.pendingConversationLaunch
       : null
+    // durable marker 优先于 plain resume(4185808):daemon 崩溃后复活的 Claude
+    // fork intent 在下一次 spawn 兑现,而不是被旧绑定的 resume 悄悄顶掉。
     const launch: ConversationLaunch = pending?.launch
+      ?? this.pendingMaterializationLaunch()
       ?? (resumeRef
         ? { kind: 'resume', source: resumeRef }
         : { kind: 'fresh' })
@@ -2555,6 +2609,50 @@ export class Session {
     }
     const announce = opts.announce ?? true
     let report = opts.onStatus
+    // ── restart 前置三件(4185808 restartUnlocked 同位次序,簇 2) ──────────
+    const statusBeforeResumeValidation = this.status
+    // ① 显式 clear/fresh restart 取消 prepared fork:先持久清 pendingLaunch 再停
+    //    进程;持久化失败(setPendingConversationLaunchChecked throw)直接上抛,
+    //    routing 与现有进程均保持原样。rollbackTo 驱动的 fresh 带一次性 intent,
+    //    不落此分支(其 pendingLaunch 归 rollback 事务 restore 管辖)。
+    let cancelledPending: PendingConversationLaunch | null = null
+    if (!resume && !this.pendingConversationLaunch && this.pendingConversationMaterialization) {
+      cancelledPending = this.pendingConversationMaterialization
+      feishu.setPendingConversationLaunchChecked(this.sessionName, null)
+      this.pendingConversationMaterialization = null
+    }
+    // ② explicitLaunch:一次性 intent 或 durable Claude fork intent 在位时 resume
+    //    语义由 launch 决定,legacy 升级不适用。
+    const explicitLaunch = this.pendingConversationLaunch?.launch ?? this.pendingMaterializationLaunch()
+    // ③ legacy(cwd:null)记录在停进程前升级——校验失败拒绝 restart 且现有进程
+    //    不被 kill(上游「前置不 kill」次序,04-03 接线差异 #1 收账)。
+    if (
+      resume && !explicitLaunch && prevSessionId
+      && this.lastSessionRef?.provider === provider
+      && this.lastSessionRef.sessionId === prevSessionId
+      && this.lastSessionRef.cwd === null
+    ) {
+      try {
+        const upgraded = await this.resolveLegacyResumeRef(this.lastSessionRef)
+        if (!this.ownsLifecycle(lease)) return false
+        this.lastSessionRef = upgraded
+        this.lastSessionId = upgraded.sessionId
+      } catch (error) {
+        // legacy 升级(thread/read)确认无 rollout 时同样作废 ghost 绑定(挂账 #4)。
+        const invalidation = this.invalidateMissingCodexResume(prevSessionId, error, opts.onResumeInvalidated)
+        const status = invalidation
+          ? `❌ 旧会话不可恢复: ${messageOf(error)}；${invalidation}`
+          : `❌ 旧会话 cwd 校验失败: ${messageOf(error)}；请在进程已停时发送 rs 重新选择历史会话`
+        log(`session "${this.sessionName}": ${provider} legacy resume upgrade failed before stop: ${messageOf(error)}`)
+        if (!this.ownsLifecycle(lease)) return false
+        this.status = this.proc?.isAlive() ? statusBeforeResumeValidation : 'stopped'
+        report?.(status)
+        if (announce) {
+          await feishu.sendText(this.chatId, status)
+        }
+        return false
+      }
+    }
     const prevThreadLabel = prevSessionId ? prevSessionId.slice(0, 8) : ''
     let statusCard: StatusCardHandle | null = null
     if (!report && announce && resume && prevSessionId) {
@@ -2619,7 +2717,18 @@ export class Session {
     await this.resetBackgroundTasks(lease)
     if (!this.ownsLifecycle(lease)) return false
     if (killError) {
-      const finalStatus = `❌ 旧 ${this.backendLabel(killedProvider ?? undefined)} 进程停止未确认: ${messageOf(killError)}`
+      // stop 失败恢复 pending(4185808 stopFailures 同位):进程没停成,头部取消的
+      // prepared fork 恢复原值——不留「磁盘已清、进程还活」的半取消态。
+      let pendingRestoreFailure: string | null = null
+      if (cancelledPending && this.ownsLifecycle(lease)) {
+        try {
+          feishu.setPendingConversationLaunchChecked(this.sessionName, cancelledPending)
+          this.pendingConversationMaterialization = cancelledPending
+        } catch (error) {
+          pendingRestoreFailure = `pendingRestore=${messageOf(error)}`
+        }
+      }
+      const finalStatus = `❌ 旧 ${this.backendLabel(killedProvider ?? undefined)} 进程停止未确认: ${messageOf(killError)}${pendingRestoreFailure ? `; ${pendingRestoreFailure}` : ''}`
       log(`session "${this.sessionName}": restart aborted, kill unconfirmed: ${messageOf(killError)}`)
       if (recovery) this.markPreservedWatchdogRecoveryFailed(recovery, lease)
       this.status = 'stopped'
@@ -2639,18 +2748,12 @@ export class Session {
       report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}…`))
       let proc: AgentProcess
       try {
-        let resumeRef: ConversationRef =
+        // legacy(cwd:null)已在前置 ③ 升级(前置不 kill);此处 lastSessionRef
+        // 命中即非 null cwd,否则以当前 workDir 合成(resumeIdentity 显式指定)。
+        const resumeRef: ConversationRef =
           this.lastSessionRef?.provider === provider && this.lastSessionRef.sessionId === prevSessionId
             ? this.lastSessionRef
             : { provider, sessionId: prevSessionId, cwd: this.workDir }
-        if (!this.pendingConversationLaunch && resumeRef.cwd === null) {
-          // legacy 记录(pre-cwd):由后端权威元数据升级后才 spawn;升级失败如实
-          // 抛出走下方恢复失败路径,绝不猜 cwd(fail-closed,ff44afb)。
-          resumeRef = await this.resolveLegacyResumeRef(resumeRef)
-          if (!this.ownsLifecycle(lease)) return false
-          this.lastSessionRef = resumeRef
-          this.lastSessionId = resumeRef.sessionId
-        }
         proc = this.spawnAgent(resumeRef, provider, lease)
         this.pendingSpawnOwnership = { lease, proc }
       } catch (e) {
@@ -3115,9 +3218,9 @@ export class Session {
       this.pendingConversationMaterialization = nextBranchState.pendingLaunch
       pendingPrecommitted = true
     }
-    const forkLaunch = launch.kind === 'fresh'
-      ? null
-      : { lease, launch, previousSessionId: previousLastSessionId }
+    // fresh 也带 intent(上游同款):restart 的 cancelledPending 只取消「无 intent
+    // 的显式 clear/fresh」,rollback 驱动的 fresh 由本事务的 restore 管辖 pending。
+    const forkLaunch = { lease, launch, previousSessionId: previousLastSessionId }
     this.pendingConversationLaunch = forkLaunch
     const onResumeInvalidated = (sessionId: string): void => {
       invalidatedPreviousResume = previousLastSessionRef?.provider === 'codex'
@@ -4485,8 +4588,16 @@ export class Session {
 
   private persistResumableSessionId(proc: AgentProcess): string | null {
     if (this.proc !== proc) return null
+    // durable Claude fork marker(4185808,挂账 #2):materialize 前的 persist
+    // 判定要同时看它——fork 撞 id/缺 id 都不得推进绑定。
+    const pendingMaterialization = proc.provider === 'claude' ? this.pendingConversationMaterialization : null
     const sessionId = proc?.sessionId
-    if (!proc || !sessionId) return null
+    if (!proc || !sessionId) {
+      if (!pendingMaterialization) return null
+      const message = 'Claude pending fork did not provide a materialized session id'
+      log(`session "${this.sessionName}": ${message}`)
+      return message
+    }
     // codex materialization 门控(4185808-D):thread/start 先返回内存 id,
     // rollout 落盘经 thread/read 权威确认前不得写入恢复映射 —— 错序即把
     // 不可恢复的 id 绑进映射,重启后会话丢失。resume init 与
@@ -4496,7 +4607,8 @@ export class Session {
     const recovery = this.preservedWatchdogRecovery
     if (recovery && (proc.provider !== recovery.provider || sessionId !== recovery.threadId)) return null
     // pending 独立 id 校验(4185808):fork 必须派生新 id —— 新 id 撞 fork 源或
-    // intent 建立时的旧绑定,说明 fork 未真正派生,拒绝推进恢复绑定。
+    // intent 建立时的旧绑定,说明 fork 未真正派生,拒绝推进恢复绑定。一次性
+    // intent(pendingConversationLaunch)与 durable marker 双通道。
     const pendingFork = this.pendingConversationLaunch
     if (
       pendingFork
@@ -4508,6 +4620,20 @@ export class Session {
       )
     ) {
       const message = `fork 未派生独立 session id (${sessionId})`
+      log(`session "${this.sessionName}": ${message}`)
+      return message
+    }
+    if (
+      pendingMaterialization
+      && (
+        sessionId === pendingMaterialization.launch.source.sessionId
+        || (
+          pendingMaterialization.previousSessionId !== null
+          && sessionId === pendingMaterialization.previousSessionId
+        )
+      )
+    ) {
+      const message = `Claude fork did not materialize an independent session id (${sessionId})`
       log(`session "${this.sessionName}": ${message}`)
       return message
     }
@@ -4547,6 +4673,35 @@ export class Session {
     }
     this.resumePersistenceError = null
     return null
+  }
+
+  /** The first Claude result proves the prepared fork has materialized and
+   * completed its first turn. Until then the durable marker lets process exit
+   * or daemon restart resume the new id (if init arrived) or retry the fork.
+   * (4185808,挂账 #2 消费口) */
+  private consumePendingConversationMaterialization(): string | null {
+    const pending = this.pendingConversationMaterialization
+    if (!pending) return null
+    const ref = this.lastSessionRef
+    if (
+      ref?.provider !== 'claude'
+      || ref.cwd !== this.workDir
+      || ref.sessionId === pending.launch.source.sessionId
+      || ref.sessionId === pending.previousSessionId
+    ) {
+      const message = 'Claude 待生成分支没有可验证的新会话恢复点，保留 pending marker'
+      log(`session "${this.sessionName}": ${message}`)
+      return message
+    }
+    try {
+      feishu.setPendingConversationLaunchChecked(this.sessionName, null)
+      this.pendingConversationMaterialization = null
+      return null
+    } catch (error) {
+      const message = `Claude 待生成分支标记清除失败: ${messageOf(error)}`
+      log(`session "${this.sessionName}": ${message}`)
+      return message
+    }
   }
 
   // ── 后台游标卡(子 agent / 后台 bash / MCP / workflow 的后台执行) ──────
@@ -5490,7 +5645,13 @@ export class Session {
         log(`session "${this.sessionName}": ignore unmatched ${p.provider} result during turn interrupt`)
         return
       }
-      const persistenceError = this.persistResumableSessionId(p)
+      const resumePersistenceError = this.persistResumableSessionId(p)
+      // 首个 claude result = fork materialize 成功证据(4185808,挂账 #2):绑定
+      // 推进成功才消费 durable marker;推进失败保留 marker 供重启恢复。
+      const pendingPersistenceError = resumePersistenceError || p.provider !== 'claude'
+        ? null
+        : this.consumePendingConversationMaterialization()
+      const persistenceError = [resumePersistenceError, pendingPersistenceError].filter(Boolean).join('；') || null
       this.accumulateResultStats()
       // 仅后端显式给出本轮 clean checkpoint 时记锚点;失败/中断/畸形 result
       // 不得复用上一轮 checkpoint(4185808:A checkpoint belongs to exactly
