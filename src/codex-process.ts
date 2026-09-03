@@ -37,6 +37,7 @@ import type {
   BgTaskStartedEvent,
   BgTaskUpdatedEvent,
 } from './claude-agent-process'
+import { validateConversationLaunch, type ConversationLaunch } from './conversation'
 import { subagentStepBrief } from './cards/background'
 
 /** 拼 `codex app-server` 命令行:把 provider 覆盖 `-c` 对插在 `--listen` 之前。 */
@@ -127,6 +128,8 @@ const CODEX_MATERIALIZATION_VERIFY_TIMEOUT_MS = 5_000
 
 export interface SpawnOpts {
   workDir: string
+  /** Explicit backend conversation lifecycle. */
+  launch?: ConversationLaunch
   resumeSessionId?: string
   model?: string
   effort: CodexReasoningEffort
@@ -316,8 +319,7 @@ type ServerRequestState = {
 
 export class CodexProcess extends EventEmitter {
   readonly provider = 'codex' as const
-  /** 本地 launch 形态只有 fresh/resume(fork 归 Phase 4 FORK-01)。 */
-  readonly launchKind: 'fresh' | 'resume'
+  readonly launchKind: ConversationLaunch['kind']
   private proc: ChildProcessByStdio<Writable, Readable, Readable>
   private stdoutBuf = ''
   private stderrBuf = ''
@@ -388,7 +390,7 @@ export class CodexProcess extends EventEmitter {
     this.on('error', () => {})
     this.exitPromise = new Promise(resolve => { this.resolveExit = resolve })
     this.opts = opts
-    this.launchKind = opts.resumeSessionId ? 'resume' : 'fresh'
+    this.launchKind = opts.launch?.kind ?? (opts.resumeSessionId ? 'resume' : 'fresh')
     const codexBin = resolveCodexBin()
     const args = buildCodexAppServerArgs(opts.configArgs)
     log(`codex-process: spawn ${codexBin} app-server (cwd=${opts.workDir})`)
@@ -844,7 +846,11 @@ export class CodexProcess extends EventEmitter {
   }
 
   private knownPrimaryThreadId(): string | null {
-    return this.sessionId ?? this.opts.resumeSessionId ?? null
+    if (this.sessionId) return this.sessionId
+    // resume 的源 thread 就是主线程;fork 的新 thread id 直到 init 返回才存在,
+    // source id 不是本进程主线程 —— 维持 null(与 fresh 同,init 前不过滤)。
+    if (this.opts.launch?.kind === 'resume') return this.opts.launch.source.sessionId
+    return this.opts.resumeSessionId ?? null
   }
 
   private isForeignThread(threadId: unknown): threadId is string {
@@ -1555,28 +1561,45 @@ export class CodexProcess extends EventEmitter {
   }
 
   private async initializeAndStartThread(): Promise<void> {
+    const launch = this.conversationLaunch()
     await this.request('initialize', this.initializeParams())
 
     const params = this.threadParams()
-    const res = this.opts.resumeSessionId
-      ? await this.request('thread/resume', {
-          threadId: this.opts.resumeSessionId,
-          ...params,
-          excludeTurns: true,
-          persistExtendedHistory: false,
-        })
-      : await this.request('thread/start', {
-          ...params,
-          experimentalRawEvents: false,
-          persistExtendedHistory: false,
-        })
-    const method = this.launchKind === 'resume' ? 'thread/resume' : 'thread/start'
+    let method: 'thread/start' | 'thread/resume' | 'thread/fork'
+    let res: any
+    if (launch.kind === 'resume') {
+      method = 'thread/resume'
+      res = await this.request(method, {
+        threadId: launch.source.sessionId,
+        ...params,
+        excludeTurns: true,
+        persistExtendedHistory: false,
+      })
+    } else if (launch.kind === 'fork') {
+      method = 'thread/fork'
+      res = await this.request(method, {
+        threadId: launch.source.sessionId,
+        ...(launch.through ? { lastTurnId: launch.through.id } : {}),
+        ...params,
+        excludeTurns: true,
+      })
+    } else {
+      method = 'thread/start'
+      res = await this.request(method, {
+        ...params,
+        experimentalRawEvents: false,
+        persistExtendedHistory: false,
+      })
+    }
     const thread = res?.thread
     if (typeof thread?.id !== 'string' || !thread.id) {
       throw new Error(`codex app-server ${method} returned no thread.id`)
     }
-    if (this.launchKind === 'resume' && thread.id !== this.opts.resumeSessionId) {
-      throw new Error(`codex app-server thread/resume returned thread id ${thread.id}, expected ${this.opts.resumeSessionId}`)
+    if (launch.kind === 'fork' && thread.id === launch.source.sessionId) {
+      throw new Error(`codex app-server thread/fork returned source thread id ${thread.id}`)
+    }
+    if (launch.kind === 'resume' && thread.id !== launch.source.sessionId) {
+      throw new Error(`codex app-server thread/resume returned thread id ${thread.id}, expected ${launch.source.sessionId}`)
     }
     // rollout 路径权威(4185808):app-server 返回的 thread.path 是持久化检查
     // 的唯一真相源,恢复安全性判定不扫第二索引。
@@ -1586,10 +1609,10 @@ export class CodexProcess extends EventEmitter {
     }
     this.sessionId = thread.id
     this.conversationRolloutPath = rolloutPath
-    // Resume requires an existing rollout. Only fresh thread/start is still an
-    // in-memory id(fork 归 Phase 4 FORK-01)。
+    // Resume requires an existing rollout and fork materializes its own rollout
+    // before the RPC returns. Only fresh thread/start is still an in-memory id.
     this.conversationResumable = false
-    if (this.launchKind !== 'fresh') {
+    if (launch.kind !== 'fresh') {
       await this.verifyConversationMaterialized(`${method} response`)
       this.conversationResumable = true
     }
@@ -1682,6 +1705,27 @@ export class CodexProcess extends EventEmitter {
       })
     }
     if (!stat.isFile()) throw new Error(`codex ${source} rollout path is not a file: ${path}`)
+  }
+
+  private conversationLaunch(): ConversationLaunch {
+    const launch: ConversationLaunch = this.opts.launch
+      // PHASE4-TRANSITION: 旧调用方仍传 resumeSessionId(session.ts 04-03 才翻转为 launch),兼容派生 resume;构造器 launchKind 三态派生与此同源,04-03 Task 1 一并删除。
+      ?? (this.opts.resumeSessionId
+        ? { kind: 'resume', source: { provider: 'codex', sessionId: this.opts.resumeSessionId, cwd: this.opts.workDir } }
+        : { kind: 'fresh' })
+    validateConversationLaunch(launch, 'codex', this.opts.workDir)
+    if (launch.kind !== 'fresh' && (typeof launch.source.sessionId !== 'string' || !launch.source.sessionId)) {
+      throw new Error(`codex ${launch.kind} launch requires a source session id`)
+    }
+    if (launch.kind === 'fork' && launch.through) {
+      if (launch.through.provider !== 'codex' || launch.through.kind !== 'turn') {
+        throw new Error('codex fork through checkpoint must be a codex turn checkpoint')
+      }
+      if (typeof launch.through.id !== 'string' || !launch.through.id) {
+        throw new Error('codex fork through checkpoint requires a turn id')
+      }
+    }
+    return launch
   }
 
   private threadParams(): Record<string, unknown> {
