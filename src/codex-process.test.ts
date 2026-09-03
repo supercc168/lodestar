@@ -18,6 +18,7 @@ import {
   imageGenerationOutput,
   usageFromTokenUsagePayload,
 } from './codex-process'
+import { validateConversationLaunch } from './conversation'
 
 function notificationHarness(): { proc: any; events: Array<[string, any]> } {
   const proc = Object.create(CodexProcess.prototype) as any
@@ -1751,5 +1752,238 @@ describe('codex assistant emit 契约带 parentToolUseId(上游 7c14677-B)', () 
     const stop = events.find(([name]) => name === 'assistant_block_stop')
     expect(text?.[1]).toEqual({ uuid: 'msg-1', text: '主线程正文', parentToolUseId: null })
     expect(stop?.[1]).toEqual({ index: 'msg-1', parentToolUseId: null })
+  })
+})
+
+// ── 上游 ff44afb/4185808:ConversationLaunch 三分支映射与 thread/fork 原语 ──
+// launch{fresh|resume|fork} → thread/start|resume|fork RPC 形状;fork 源 id
+// guard(挂账 #7);fork 过 materialization 门 → resumable(launchKind!=='fresh'
+// 门天然覆盖);旧 resumeSessionId 兼容派生(PHASE4-TRANSITION)。
+function launchHarness(
+  workDir: string,
+  optsExtra: Record<string, unknown>,
+  respond: (method: string, params: any) => any,
+): {
+  proc: any
+  events: Array<[string, any]>
+  requests: Array<{ method: string; params: any }>
+} {
+  const proc = Object.create(CodexProcess.prototype) as any
+  const events: Array<[string, any]> = []
+  const requests: Array<{ method: string; params: any }> = []
+  proc.opts = { workDir, effort: 'high', ...optsExtra }
+  // 构造器派生的只读字段:Object.create 不跑构造器,按同源三态派生补齐。
+  proc.launchKind = (optsExtra as any).launch?.kind
+    ?? ((optsExtra as any).resumeSessionId ? 'resume' : 'fresh')
+  proc.sessionId = null
+  proc.pendingTurnStart = null
+  proc.currentTurnId = null
+  proc.lastUsage = null
+  proc.conversationResumable = false
+  proc.conversationRolloutPath = null
+  proc.conversationMaterializationVerification = null
+  proc.conversationMaterializationRetrySource = null
+  proc.lastConversationMaterializationFailure = null
+  proc.emittedImageGenerationIds = new Set()
+  proc.primeRolloutImageGenerationScan = () => {}
+  proc.emit = (event: string, payload: unknown) => {
+    events.push([event, payload])
+    return true
+  }
+  proc.request = (method: string, params: any) => {
+    requests.push({ method, params })
+    return Promise.resolve(respond(method, params))
+  }
+  return { proc, events, requests }
+}
+
+describe('codex ConversationLaunch 三分支映射(上游 ff44afb/4185808)', () => {
+  const codexRef = (sessionId: string, cwd: string) =>
+    ({ provider: 'codex', sessionId, cwd }) as const
+
+  test('launch{kind:fresh} → thread/start(experimentalRawEvents/persistExtendedHistory 关)', async () => {
+    const workDir = '/tmp'
+    const { proc, requests } = launchHarness(workDir, { launch: { kind: 'fresh' } }, method => {
+      if (method === 'initialize') return {}
+      return { thread: { id: 'thread-new', cwd: workDir, path: `/rollouts/thread-new.jsonl` } }
+    })
+
+    await proc.initializeAndStartThread()
+
+    const start = requests.find(r => r.method === 'thread/start')
+    expect(start).toBeDefined()
+    expect(start!.params.experimentalRawEvents).toBe(false)
+    expect(start!.params.persistExtendedHistory).toBe(false)
+    expect(start!.params.threadId).toBeUndefined()
+    expect(requests.some(r => r.method === 'thread/resume' || r.method === 'thread/fork')).toBe(false)
+    expect(proc.sessionId).toBe('thread-new')
+    // fresh 线程仍是内存 id:materialization 确认前不可恢复(01-13 门控)。
+    expect(proc.conversationResumable).toBe(false)
+  })
+
+  test('launch{kind:resume} → thread/resume {threadId=source.sessionId, excludeTurns:true}', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-launch-resume-'))
+    try {
+      const rollout = join(root, 'thread-src.jsonl')
+      writeFileSync(rollout, '{"type":"turn_started"}\n')
+      const { proc, requests } = launchHarness(
+        root,
+        { launch: { kind: 'resume', source: codexRef('thread-src', root) } },
+        method => {
+          if (method === 'initialize') return {}
+          return { thread: { id: 'thread-src', cwd: root, path: rollout, turns: [] } }
+        },
+      )
+
+      await proc.initializeAndStartThread()
+
+      const resume = requests.find(r => r.method === 'thread/resume')
+      expect(resume).toBeDefined()
+      expect(resume!.params.threadId).toBe('thread-src')
+      expect(resume!.params.excludeTurns).toBe(true)
+      expect(resume!.params.persistExtendedHistory).toBe(false)
+      expect(requests.some(r => r.method === 'thread/start' || r.method === 'thread/fork')).toBe(false)
+      expect(proc.conversationResumable).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('launch{kind:fork,through} → thread/fork {threadId, lastTurnId, excludeTurns:true};无 through 不带 lastTurnId', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-launch-fork-'))
+    try {
+      const rollout = join(root, 'thread-forked.jsonl')
+      writeFileSync(rollout, '{"type":"turn_started"}\n')
+      const respond = (method: string) => {
+        if (method === 'initialize') return {}
+        return { thread: { id: 'thread-forked', cwd: root, path: rollout, turns: [] } }
+      }
+      const source = codexRef('thread-src', root)
+      const through = { provider: 'codex', kind: 'turn', id: 'turn-9', source } as const
+
+      const withThrough = launchHarness(root, { launch: { kind: 'fork', source, through } }, respond)
+      await withThrough.proc.initializeAndStartThread()
+      const fork = withThrough.requests.find(r => r.method === 'thread/fork')
+      expect(fork).toBeDefined()
+      expect(fork!.params.threadId).toBe('thread-src')
+      expect(fork!.params.lastTurnId).toBe('turn-9')
+      expect(fork!.params.excludeTurns).toBe(true)
+
+      const fullFork = launchHarness(root, { launch: { kind: 'fork', source } }, respond)
+      await fullFork.proc.initializeAndStartThread()
+      const full = fullFork.requests.find(r => r.method === 'thread/fork')
+      expect(full).toBeDefined()
+      expect('lastTurnId' in full!.params).toBe(false)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('fork 返回 source thread id 时 throw(挂账 #7 源 id guard,错误文案含返回 id)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-fork-guard-'))
+    try {
+      const rollout = join(root, 'thread-src.jsonl')
+      writeFileSync(rollout, '{"type":"turn_started"}\n')
+      const source = codexRef('thread-src', root)
+      const { proc } = launchHarness(root, { launch: { kind: 'fork', source } }, method => {
+        if (method === 'initialize') return {}
+        // app-server 违约:fork 未派生新 thread,返回了源 id。
+        return { thread: { id: 'thread-src', cwd: root, path: rollout, turns: [] } }
+      })
+
+      await expect(proc.initializeAndStartThread()).rejects.toThrow(/thread-src/)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('fork 过 materialization 验证门 → conversationResumable=true(launchKind!==fresh 门天然覆盖)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-fork-mat-'))
+    try {
+      const rollout = join(root, 'thread-forked.jsonl')
+      writeFileSync(rollout, '{"type":"turn_started"}\n')
+      const source = codexRef('thread-src', root)
+      const { proc, requests } = launchHarness(root, { launch: { kind: 'fork', source } }, method => {
+        if (method === 'initialize') return {}
+        return { thread: { id: 'thread-forked', cwd: root, path: rollout, turns: [] } }
+      })
+
+      await proc.initializeAndStartThread()
+
+      // fork materializes its own rollout before the RPC returns(上游注释):
+      // verify(thread/read)后 resumable=true,可立即 persist 恢复绑定。
+      expect(requests.some(r => r.method === 'thread/fork')).toBe(true)
+      expect(requests.some(r => r.method === 'thread/read')).toBe(true)
+      expect(proc.sessionId).toBe('thread-forked')
+      expect(proc.conversationResumable).toBe(true)
+      expect(proc.conversationRolloutPath).toBe(rollout)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('旧 resumeSessionId 入参仍派生 resume(PHASE4-TRANSITION 兼容分支,04-03 翻转调用方)', async () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-legacy-resume-'))
+    try {
+      const rollout = join(root, 'thread-legacy.jsonl')
+      writeFileSync(rollout, '{"type":"turn_started"}\n')
+      const { proc, requests } = launchHarness(root, { resumeSessionId: 'thread-legacy' }, method => {
+        if (method === 'initialize') return {}
+        return { thread: { id: 'thread-legacy', cwd: root, path: rollout, turns: [] } }
+      })
+
+      await proc.initializeAndStartThread()
+
+      const resume = requests.find(r => r.method === 'thread/resume')
+      expect(resume).toBeDefined()
+      expect(resume!.params.threadId).toBe('thread-legacy')
+      expect(proc.conversationResumable).toBe(true)
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('validateConversationLaunch 五重校验(上游 ff44afb)', () => {
+  const source = { provider: 'codex', sessionId: 'thread-src', cwd: '/work' } as const
+
+  test('provider 不符 throw', () => {
+    expect(() =>
+      validateConversationLaunch({ kind: 'resume', source: { ...source, provider: 'claude' } as any }, 'codex'),
+    ).toThrow(/provider mismatch/)
+  })
+
+  test('空 source id throw', () => {
+    expect(() =>
+      validateConversationLaunch({ kind: 'resume', source: { ...source, sessionId: '  ' } }, 'codex'),
+    ).toThrow(/session id is empty/)
+  })
+
+  test('cwd 非绝对 throw', () => {
+    expect(() =>
+      validateConversationLaunch({ kind: 'resume', source: { ...source, cwd: 'relative/dir' } }, 'codex'),
+    ).toThrow(/not absolute/)
+  })
+
+  test('cwd 与 expectedCwd 不一致 throw;legacy null cwd 缺失 throw', () => {
+    expect(() =>
+      validateConversationLaunch({ kind: 'resume', source }, 'codex', '/elsewhere'),
+    ).toThrow(/cwd mismatch/)
+    expect(() =>
+      validateConversationLaunch({ kind: 'resume', source: { ...source, cwd: null } }, 'codex', '/work'),
+    ).toThrow(/cwd is missing/)
+  })
+
+  test('through 归属错 throw;合法 fork launch 通过', () => {
+    const through = { provider: 'codex', kind: 'turn', id: 'turn-1', source } as const
+    expect(() =>
+      validateConversationLaunch(
+        { kind: 'fork', source: { ...source, sessionId: 'thread-other' }, through: through as any },
+        'codex',
+      ),
+    ).toThrow(/does not match fork source/)
+    expect(() =>
+      validateConversationLaunch({ kind: 'fork', source, through: through as any }, 'codex', '/work'),
+    ).not.toThrow()
   })
 })
