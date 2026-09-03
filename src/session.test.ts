@@ -10,6 +10,7 @@ import {
   type WatchdogSettings,
 } from './turn-watchdog'
 import { NothingToCompactError, type CodexUserTextSettlement, type UserTextDispatch } from './agent-process'
+import { CodexRpcResponseError } from './codex-process'
 import {
   addedReactions, boundResumes, branchBaseBySession, clearedResumes, clearedTurnAnchors, deletedReactions,
   feishuMockState, projectProfiles, resetFeishuMock, resumeRefs, sentCards, sentRawTexts, sentTexts,
@@ -11659,5 +11660,139 @@ describe('Session turn 锚数据流(4185808 终态,挂账 #3)', () => {
     session.proc = procIndependent
     expect(session.persistResumableSessionId(procIndependent)).toBeNull()
     expect(boundResumes).toEqual([['persist-independent-id', 'forked-new', 'codex']])
+  })
+})
+
+describe('Session resume 绑定失效清理(4185808,挂账 #1/#4)', () => {
+  const noRolloutError = (sessionId: string, method = 'thread/resume', code: number | null = -32600) =>
+    new CodexRpcResponseError(method, 'req-1', code, `no rollout found for thread id ${sessionId}`)
+
+  test('invalidateMissingCodexResume:直接实例/cause 链深处/AggregateError 内/循环 cause 四形态判定', () => {
+    const session = new Session('invalidate-shapes', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const seed = () => {
+      resumeRefs.set(`${session.sessionName}:codex`, { provider: 'codex', sessionId: 'ghost-1', cwd: null })
+    }
+
+    // 直接实例
+    seed()
+    expect(session.invalidateMissingCodexResume('ghost-1', noRolloutError('ghost-1')))
+      .toContain('已作废无 rollout 的恢复点')
+    expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+
+    // cause 链深处
+    seed()
+    const nested = new Error('outer', { cause: new Error('mid', { cause: noRolloutError('ghost-1', 'thread/read') }) })
+    expect(session.invalidateMissingCodexResume('ghost-1', nested)).toContain('已作废')
+    expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+
+    // AggregateError errors 数组内
+    seed()
+    const aggregate = new AggregateError([new Error('other'), noRolloutError('ghost-1', 'thread/fork')], 'combo')
+    expect(session.invalidateMissingCodexResume('ghost-1', aggregate)).toContain('已作废')
+    expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+
+    // 循环 cause 不死循环:无 rpc error → 保留绑定
+    seed()
+    const a = new Error('a') as any
+    const b = new Error('b') as any
+    a.cause = b
+    b.cause = a
+    expect(session.invalidateMissingCodexResume('ghost-1', a)).toBeNull()
+    expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(true)
+  })
+
+  test('invalidateMissingCodexResume 负例:message 差一字/其他 method/其他 code/绑定不匹配均保留', () => {
+    const session = new Session('invalidate-negatives', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    resumeRefs.set(`${session.sessionName}:codex`, { provider: 'codex', sessionId: 'ghost-1', cwd: null })
+
+    // message 差一字(别的 thread id)
+    expect(session.invalidateMissingCodexResume('ghost-1', noRolloutError('ghost-other'))).toBeNull()
+    // 三列表之外的 method
+    const wrongMethod = new CodexRpcResponseError('thread/start', 'req-2', -32600, 'no rollout found for thread id ghost-1')
+    expect(session.invalidateMissingCodexResume('ghost-1', wrongMethod)).toBeNull()
+    // 其他 serverCode
+    expect(session.invalidateMissingCodexResume('ghost-1', noRolloutError('ghost-1', 'thread/resume', -32000))).toBeNull()
+    // 绑定的 id 与失败 id 不匹配
+    expect(session.invalidateMissingCodexResume('other-thread', noRolloutError('other-thread'))).toBeNull()
+    expect(resumeRefs.get(`${session.sessionName}:codex`)?.sessionId).toBe('ghost-1')
+    expect(clearedResumes).toEqual([])
+  })
+
+  test('codex resume 失败路径接线:确认无 rollout 的 ghost 绑定被作废且群内可观测', async () => {
+    const session = new Session('invalidate-wiring', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'ghost-thread'
+    session.lastSessionRef = { provider: 'codex', sessionId: 'ghost-thread', cwd: session.workDir }
+    resumeRefs.set(`${session.sessionName}:codex`, { provider: 'codex', sessionId: 'ghost-thread', cwd: session.workDir })
+    session.spawnAgent = () => {
+      const proc = new FakeAgentProc('codex', null)
+      proc.launchKind = 'resume'
+      proc.sendInitialize = () => proc.emit('error', noRolloutError('ghost-thread'))
+      return proc
+    }
+    const statuses: string[] = []
+
+    const ok = await session.restart(true, { announce: false, onStatus: (s: string) => statuses.push(s) })
+
+    expect(ok).toBe(false)
+    expect(statuses.join('\n')).toContain('已作废无 rollout 的恢复点')
+    expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+    expect(session.lastSessionRef).toBeNull()
+    expect(session.lastSessionId).toBeNull()
+  })
+
+  test('fresh Codex init 清 ghost 绑定:非 resumable 断言下经 checked 清理,resumable 即抛', () => {
+    const session = new Session('codex-fresh-init', 'chat_id') as any
+    const oldRef = { provider: 'codex' as const, sessionId: 'old-thread', cwd: session.workDir }
+    resumeRefs.set(`${session.sessionName}:codex`, oldRef)
+    session.selectedProvider = 'codex'
+    session.lastSessionRef = oldRef
+    session.lastSessionId = oldRef.sessionId
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumableState = false
+    session.proc = proc
+    session.wireProc(proc)
+
+    proc.emit('init', { session_id: proc.sessionId })
+
+    expect(boundResumes).toEqual([])
+    expect(clearedResumes).toContainEqual([session.sessionName, 'codex'])
+    expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+    expect(session.lastSessionRef).toBeNull()
+    expect(session.lastSessionId).toBeNull()
+
+    // resumable 的进程走 fresh 清理断言即抛(init 事务不含带 rollout 的进程)
+    const resumable = new FakeAgentProc('codex', 'resumable-thread')
+    resumable.launchKind = 'fresh'
+    resumable.conversationResumableState = true
+    session.proc = resumable
+    expect(() => session.clearResumeBindingForFreshCodex(resumable))
+      .toThrow('fresh Codex thread was unexpectedly marked resumable during init')
+  })
+
+  test('fresh 清理写失败可见:checked 清理抛出且绑定保留(04-02 回滚语义)', () => {
+    const session = new Session('codex-fresh-clear-fails', 'chat_id') as any
+    const oldRef = { provider: 'codex' as const, sessionId: 'old-thread', cwd: session.workDir }
+    resumeRefs.set(`${session.sessionName}:codex`, oldRef)
+    session.selectedProvider = 'codex'
+    session.lastSessionRef = oldRef
+    session.lastSessionId = oldRef.sessionId
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumableState = false
+    session.proc = proc
+    session.wireProc(proc)
+    setResumeWriteError(new Error('resume-map clear fsync failed'))
+
+    try {
+      expect(() => proc.emit('init', { session_id: proc.sessionId })).toThrow('resume-map clear fsync failed')
+      expect(resumeRefs.get(`${session.sessionName}:codex`)).toEqual(oldRef)
+      expect(session.lastSessionId).toBe('old-thread')
+    } finally {
+      setResumeWriteError(null)
+    }
   })
 })
