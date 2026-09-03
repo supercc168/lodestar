@@ -3036,51 +3036,16 @@ export class Session {
     return true
   }
 
-  /** V1 参数(sid, uuid/turnId)→ ConversationLaunch fork 的过渡组装:through 的
-   *  checkpoint kind 按当前 provider 判别(claude=assistant-message,codex=turn)。
-   *  04-06 panel 状态机改传完整 launch 后本壳随调用方换代收敛。 */
-  private buildForkLaunch(resumeSessionId: string, resumeSessionAt: string | undefined): ConversationLaunch {
-    if (this.selectedProvider === 'claude') {
-      const source = { provider: 'claude' as const, sessionId: resumeSessionId, cwd: this.workDir }
-      return {
-        kind: 'fork',
-        source,
-        ...(resumeSessionAt
-          ? { through: { provider: 'claude' as const, kind: 'assistant-message' as const, id: resumeSessionAt, source } }
-          : {}),
-      }
-    }
-    const source = { provider: 'codex' as const, sessionId: resumeSessionId, cwd: this.workDir }
-    return {
-      kind: 'fork',
-      source,
-      ...(resumeSessionAt
-        ? { through: { provider: 'codex' as const, kind: 'turn' as const, id: resumeSessionAt, source } }
-        : {}),
-    }
-  }
-
   /** Start a new Session process from a backend-native fork source(4185808 终态)。
    *  Claude fork 先 precommit pendingLaunch 再 spawn——startup grace 内 daemon
    *  崩溃仍可从磁盘 intent 恢复;失败恢复原 pending,恢复也失败 AggregateError
    *  上抛。复用 start 的 spawn+wire+init。本地守卫叠加(保护线):
    *  hasPreservedWatchdogRecovery 前置拒绝 + lease 归属,await 后复查。 */
-  async startForked(launch: Extract<ConversationLaunch, { kind: 'fork' }>, opts?: LifecycleProgressOpts): Promise<boolean>
-  /** PHASE4-TRANSITION 旧 (sid, uuid) 签名(删除责任 04-06——panel 状态机改传 launch 后删)。 */
-  async startForked(resumeSessionId: string, resumeSessionAt: string | undefined, opts?: LifecycleProgressOpts): Promise<boolean>
   async startForked(
-    launchOrLegacySid: Extract<ConversationLaunch, { kind: 'fork' }> | string,
-    atOrOpts?: string | LifecycleProgressOpts,
-    legacyOpts: LifecycleProgressOpts = {},
+    launch: Extract<ConversationLaunch, { kind: 'fork' }>,
+    opts: LifecycleProgressOpts = {},
   ): Promise<boolean> {
-    if (typeof launchOrLegacySid === 'string') {
-      const resumeSessionAt = typeof atOrOpts === 'string' ? atOrOpts : undefined
-      const opts = atOrOpts !== undefined && typeof atOrOpts !== 'string' ? atOrOpts : legacyOpts
-      const legacyLaunch = this.buildForkLaunch(launchOrLegacySid, resumeSessionAt)
-      return await this.startForkedLaunch(legacyLaunch, opts)
-    }
-    const opts = atOrOpts !== undefined && typeof atOrOpts !== 'string' ? atOrOpts : legacyOpts
-    return await this.startForkedLaunch(launchOrLegacySid, opts)
+    return await this.startForkedLaunch(launch, opts)
   }
 
   private async startForkedLaunch(
@@ -3142,42 +3107,9 @@ export class Session {
       base: ConversationBranchBase
       pendingLaunch?: PendingConversationLaunch | null
     },
-    opts?: LifecycleProgressOpts,
-  ): Promise<boolean>
-  /** PHASE4-TRANSITION 旧 (sid, uuid) 签名(删除责任 04-06——panel 状态机改传 launch+branchState 后删)。 */
-  async rollbackTo(resumeSessionId: string | undefined, resumeSessionAt?: string | undefined, opts?: LifecycleProgressOpts): Promise<boolean>
-  async rollbackTo(
-    launchOrLegacySid: ConversationLaunch | string | undefined,
-    branchStateOrLegacyAt?: {
-      anchors: feishu.TurnAnchor[]
-      base: ConversationBranchBase
-      pendingLaunch?: PendingConversationLaunch | null
-    } | string,
     opts: LifecycleProgressOpts = {},
   ): Promise<boolean> {
-    if (launchOrLegacySid === undefined || typeof launchOrLegacySid === 'string') {
-      // 旧形态:sid=undefined → fresh(等价 clear);否则 fork 到 (sid, uuid)。
-      // 成功后 lastSessionId 未被推进时指向 fork 源——既有行为逐字保留(Claude
-      // fork materialize 前 daemon 重启的 resume 近似目标;04-06 branchState/
-      // pendingLaunch 接管后随本壳删除)。
-      const resumeSessionAt = typeof branchStateOrLegacyAt === 'string' ? branchStateOrLegacyAt : undefined
-      const prevLast = this.lastSessionId
-      const legacyLaunch: ConversationLaunch = launchOrLegacySid
-        ? this.buildForkLaunch(launchOrLegacySid, resumeSessionAt)
-        : { kind: 'fresh' }
-      const ok = await this.rollbackToLaunch(legacyLaunch, undefined, opts)
-      if (ok && this.lastSessionId === prevLast) this.lastSessionId = launchOrLegacySid ?? null
-      return ok
-    }
-    return await this.rollbackToLaunch(
-      launchOrLegacySid,
-      branchStateOrLegacyAt as {
-        anchors: feishu.TurnAnchor[]
-        base: ConversationBranchBase
-        pendingLaunch?: PendingConversationLaunch | null
-      } | undefined,
-      opts,
-    )
+    return await this.rollbackToLaunch(launch, branchState, opts)
   }
 
   private async rollbackToLaunch(
@@ -3460,10 +3392,7 @@ export class Session {
     if (!turn) return []
     const out: feishu.TurnWrite[] = []
     for (const t of turn.toolByUseId.values()) {
-      if (!['Write', 'Edit', 'NotebookEdit', 'MultiEdit'].includes(t.name)) continue
-      const path = t.input?.file_path ?? t.input?.path ?? '?'
-      const body = cards.writeBodyFromToolInput(t.name, t.input)
-      out.push({ tool: t.name, path, body })
+      out.push(...cards.writeLogEntriesFromToolInput(t.name, t.input))
     }
     return out
   }
@@ -3573,14 +3502,14 @@ export class Session {
   }
 
   // ── 临时会话 / fork / back / rs 恢复(委托 session-temp)──
-  showForkList(): Promise<void> { return sessionTemp.showForkList(this) }
-  showBackList(): Promise<void> { return sessionTemp.showBackList(this) }
-  showResumeList(): Promise<void> { return sessionTemp.showResumeList(this) }
+  showForkList(userOpenId = ''): Promise<void> { return sessionTemp.showForkList(this, userOpenId) }
+  showBackList(userOpenId = ''): Promise<void> { return sessionTemp.showBackList(this, userOpenId) }
+  showResumeList(userOpenId = ''): Promise<void> { return sessionTemp.showResumeList(this, userOpenId) }
   runBtwCommand(userOpenId: string): Promise<void> { return sessionTemp.runBtwCommand(this, userOpenId) }
   runByeCommand(): Promise<void> { return sessionTemp.runByeCommand(this) }
-  onForkSelect(anchorIdx: number, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onForkSelect(this, anchorIdx, userOpenId) }
-  onBackSelect(anchorIdx: number): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onBackSelect(this, anchorIdx) }
-  onResumeSelect(sessionId: string): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onResumeSelect(this, sessionId) }
+  onForkSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onForkSelect(this, panelId, choiceId, userOpenId) }
+  onBackSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onBackSelect(this, panelId, choiceId, userOpenId) }
+  onResumeSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onResumeSelect(this, panelId, choiceId, userOpenId) }
 
   /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
    * plus their two-letter aliases where applicable.

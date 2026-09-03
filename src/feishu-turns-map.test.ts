@@ -490,10 +490,11 @@ describe('session turn checkpoint persistence', () => {
   })
 
   test('getTurnAnchors projects uuid/sid for V1 consumers; projection stays out of the persisted V4 state', () => {
-    // PHASE4-TRANSITION 读投影(删除责任 04-06——panel 状态机改读 checkpoint 后删):
-    // getTurnAnchors 返回值投影 uuid/sid 供 V1 消费方(session-temp resumeAt 读
-    // .uuid);磁盘保持纯 V4。appendTurnAnchor V1 输入壳已随 04-03 recordTurnAnchor
-    // checked 化删除,写入一律 appendTurnAnchorChecked。
+    // PHASE4-TRANSITION 读投影(删除责任 04-07——panel 状态机(04-06)已改读
+    // checkpoint,剩余 V1 消费面只在 daemon 旧调用侧,daemon 翻转收口后随之删):
+    // getTurnAnchors 返回值投影 uuid/sid;磁盘保持纯 V4。truncateTurnAnchors 过渡
+    // 壳已随 04-06 bk branchState 换代删除,截断经 replaceTurnAnchors 原子换——
+    // 投影副本回流写入口时被 canonicalTurnAnchor 剥除,正是本测试锁定的语义。
     const result = runFreshState(`
       feishu.appendTurnAnchorChecked('project', {
         checkpoint: {
@@ -510,7 +511,11 @@ describe('session turn checkpoint persistence', () => {
         preview: 'second', ts: 2,
         writes: [{ tool: 'Edit', path: '/tmp/x.ts', body: 'b' }],
       })
-      feishu.truncateTurnAnchors('project', 1)
+      feishu.replaceTurnAnchors(
+        'project',
+        feishu.getTurnAnchors('project').slice(0, 1),
+        feishu.getSessionBranchBase('project'),
+      )
       __out({
         anchors: feishu.getTurnAnchors('project'),
         base: feishu.getSessionBranchBase('project'),

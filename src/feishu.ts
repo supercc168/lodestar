@@ -805,16 +805,6 @@ export function setPendingConversationLaunchChecked(
   }
 }
 
-// PHASE4-TRANSITION: 过渡壳(删除责任 04-06——bk 选择流程改 replaceTurnAnchors
-// 原子换 base+anchors 后删)。V4 store 上的等价截断:只截 anchors,base/pending 保持。
-/** back 回滚后:截断该 session 锚点到 keepCount 条(回滚点之后作废,reset 语义)。 */
-export function truncateTurnAnchors(sessionName: string, keepCount: number): void {
-  const state = turnsBySession.get(sessionName)
-  if (!state || state.anchors.length <= keepCount) return
-  turnsBySession.set(sessionName, { ...state, anchors: state.anchors.slice(0, keepCount) })
-  saveSessionTurnsMap()
-}
-
 /** fork/back 派生新会话时,把分叉点之前的锚点继承给新群(不含分叉点本身)。 */
 export function seedTurnAnchors(sessionName: string, from: TurnAnchor[]): void {
   if (from.length === 0) return

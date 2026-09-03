@@ -65,7 +65,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     return true
   }
   // btw = 开临时会话(同目录,自动启动);bye = 散临时群;fk/fork = 列当前会话 turn 分叉;
-  // bk/back = 立刻终止当前 + 列 turn 回滚(选后回滚 + 发 Write 记录卡)。
+  // bk/back = 列 turn;点选并通过 owner/stale 校验后才终止并切到新分支(上游 ff44afb)。
   if (raw.trim().match(/^btw$/i)) {
     if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 btw。'); return true }
     await s.runBtwCommand(userOpenId)
@@ -77,20 +77,19 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
   }
   if (raw.trim().match(/^(?:fk|fork)$/i)) {
     if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 fk。'); return true }
-    await s.showForkList()
+    await s.showForkList(userOpenId)
     return true
   }
   if (raw.trim().match(/^(?:bk|back)$/i)) {
+    // 本地守卫保留:watchdog 保留恢复期与 agy 独占期拒绝 bk(叠加在上游语义之上)。
     if (s.hasPreservedWatchdogRecovery()) {
       await feishu.sendText(s.chatId, '⚠️ thread 自动恢复尚未完成，暂不能回滚。请先发送 restart 恢复，或 clear/kill 丢弃。')
       return true
     }
-    const lease = s.beginLifecycle('back')
     if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 bk。'); return true }
-    // 立刻终止当前会话(保留 lastSessionId 供选后回滚),再弹回滚列表
-    if (s.isRunning()) await s.stop('回滚前终止', { announce: false, lifecycleLease: lease })
-    if (!s.ownsLifecycle(lease)) return true
-    await s.showBackList()
+    // 只展示选择卡,不取 lifecycle;真正的 stop→fork 在点击具体锚点并通过
+    // owner/provider/cwd 校验之后发生,避免用户看完不点也被提前终止(上游 ff44afb)。
+    await s.showBackList(userOpenId)
     return true
   }
   const agy = raw.trim().match(/^agy(?:\s+([\s\S]+))?$/i)
@@ -264,15 +263,14 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     case 'restart':
       {
       const lease = s.beginLifecycle(s.watchdogResumeFailed ? 'strict-retry' : 'restart')
-      // rs 双模式:会话进行中 = 打断 + 弃后台 + 恢复(走下面 restart(true));claude 空闲 =
-      // 列项目最近 24h 会话选恢复(比"只恢复上一会话"实用)。空闲判定用「无进行中
-      // turn」语义,与上面 stop 命令对齐 —— 不能用 !isRunning():isRunning() 判的是
-      // 进程存活,而 claude 进程 turn 间常驻保活(stop 故意 "Subprocess stays alive"),
-      // stop 后仍为 true,会让列表分支永远不可达(实测踩中,见 session.test.ts)。
-      // codex 空闲:showResumeList→listClaudeSessions/onResumeSelect 是 claude-only
-      // (列不出 codex 会话、点任何项也被 provider 拦死),fall-through 走 restart(true)
-      // resume 已按 provider 持久化的 lastSessionId(getSessionResume)。port of upstream
-      // d9341b6,适配本地 idle 语义(非 !isRunning())。
+      // rs 双模式:会话进行中 = 打断 + 弃后台 + 恢复(走下面 restart(true));空闲 =
+      // 双后端列同 cwd 历史并从所选会话创建独立分支(上游 ff44afb 门控解除:
+      // Claude 扫 transcript,Codex 走 thread/list;plain resume→history fork)。
+      // 空闲判定用「无进行中 turn」语义,与上面 stop 命令对齐 —— 不能用
+      // !isRunning():isRunning() 判的是进程存活,而 claude 进程 turn 间常驻保活
+      // (stop 故意 "Subprocess stays alive"),stop 后仍为 true,会让列表分支永远
+      // 不可达(实测踩中,见 session.test.ts)。port of upstream d9341b6 idle 语义
+      // (非 !isRunning(),陷阱 1)+ ff44afb 双后端列表。
       if (s.watchdogResumeFailed) {
         const initialStatus = '🔁 恢复失败 thread 并发送已保留消息'
         const statusCard = await s.openStatusCard('restart', initialStatus)
@@ -299,12 +297,11 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
         !s.currentTurn
         && s.pendingUserMessageCount === 0
         && s.pendingMidTurnMsgs.length === 0
-        && s.selectedProvider !== 'codex'
       ) {
-        await s.showResumeList()
+        await s.showResumeList(userOpenId)
         return true
       }
-      // 进行中 / codex 空闲:resume the prior conversation — kills the current proc and
+      // 进行中:resume the prior conversation — kills the current proc and
       // spawns a new one with `--resume <lastSessionId>`(放弃后台进程)。
       {
         const resumeThreadLabel = s.lastSessionId ? s.lastSessionId.slice(0, 8) : ''

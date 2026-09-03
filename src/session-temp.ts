@@ -199,10 +199,12 @@ function forkLaunch(checkpoint: feishu.TurnAnchor['checkpoint']): Extract<Conver
 }
 
 /** fk/bk 锚列表:只列当前 provider + cwd 匹配的 checkpoint(跨后端/跨目录的
- *  锚不可用作当前会话的分叉点)。 */
+ *  锚不可用作当前会话的分叉点)。剥 getTurnAnchors 的 uuid/sid 读投影
+ *  (PHASE4-TRANSITION,daemon 旧调用面独占;panel choice 载荷保持纯 V4)。 */
 function eligibleAnchors(s: Session): feishu.TurnAnchor[] {
   return feishu.getTurnAnchors(s.sessionName)
     .filter(anchor => anchor.checkpoint.provider === s.selectedProvider && anchor.checkpoint.source.cwd === s.workDir)
+    .map(({ checkpoint, preview, ts, writes }) => ({ checkpoint, preview, ts, writes }))
 }
 
 function usableBranchBase(s: Session): ConversationBranchBase {
@@ -214,21 +216,6 @@ function usableBranchBase(s: Session): ConversationBranchBase {
   } catch {
     return null
   }
-}
-
-// ── PHASE4-TRANSITION 旧 btw 需要的两个 helper(T3 随 btw 换代删除) ───
-
-/** 当前群对应的项目名(剥 *ts 临时后缀 / [slug] worktree 后缀)。 */
-function projectName(s: Session): string {
-  return feishu.tempProjectName(s.sessionName) ?? s.worktreeProjectName() ?? s.sessionName
-}
-
-/** 主群当前 model 选择,供 btw/fk 创建的临时群继承。selectedModel 为空(主群未显式选过
- *  档位、走默认)时返回 undefined —— 此时临时群也走自己的默认,结果一致,无需特判。 */
-function inheritSelection(s: Session): feishu.SessionModelSelection | undefined {
-  return s.selectedModel
-    ? { provider: s.selectedProvider, model: s.selectedModel, effort: s.selectedEffort }
-    : undefined
 }
 
 // ── Claude stopped-session history catalog ───────────────────────────
@@ -375,14 +362,6 @@ export async function showResumeList(s: Session, userOpenId: string): Promise<vo
     await feishu.sendText(s.chatId, '❌ 找不到发起人，无法创建安全选择卡。')
     return
   }
-  // PHASE4-TRANSITION(T3 删,门控表第 2 处):双后端历史目录接通前保留 Claude 硬门。
-  if (s.selectedProvider !== 'claude') {
-    await feishu.sendText(
-      s.chatId,
-      '❌ 历史会话列表仅支持 Claude 后端(transcript 是 Claude 的)。Codex 请直接 rs 恢复上一会话,或发 model 切到 Claude。',
-    )
-    return
-  }
   let history: ConversationSummary[]
   try {
     history = s.selectedProvider === 'codex'
@@ -417,33 +396,43 @@ export async function showResumeList(s: Session, userOpenId: string): Promise<vo
   }
 }
 
-// ── btw / bye ─────────────────────────────────────────────────────────
-// PHASE4-TRANSITION(T3 换代):btw 双后端 launch{fresh}+reserveTempChatName、
-// bye 先 stop 再解散归 Task 3;此处保持旧体,门控表第 1 处(btw Claude 硬门)随换代删。
+// ── btw / bye ────────────────────────────────────────────────────────
 
 export async function runBtwCommand(s: Session, userOpenId: string): Promise<void> {
-  if (!userOpenId) { await feishu.sendText(s.chatId, '❌ 找不到发起人,无法建临时群。'); return }
-  if (!s.opts.onCreateTempSession) { await feishu.sendText(s.chatId, '❌ 临时群能力未就绪(daemon 未注入回调)。'); return }
-  if (s.selectedProvider !== 'claude') {
-    await feishu.sendText(s.chatId, '❌ 临时会话/fork/back 暂只支持 Claude 后端(Codex 无 resumeSessionAt 能力)。群里发 model 切到 Claude 再试。')
+  if (!userOpenId) { await feishu.sendText(s.chatId, '❌ 找不到发起人，无法建临时群。'); return }
+  if (!s.opts.onCreateTempSession) { await feishu.sendText(s.chatId, '❌ 临时群能力未就绪（daemon 未注入回调）。'); return }
+  const chatName = reserveTempChatName(baseSessionName(s))
+  await feishu.sendText(s.chatId, `🚀 正在创建 ${chatName} · ${s.backendLabel()} 新会话。它与当前群共享工作目录；当前会话不受影响。`)
+  let result
+  try {
+    result = await s.opts.onCreateTempSession({
+      chatName,
+      userOpenId,
+      workDir: s.workDir,
+      routing: s.conversationRouting(),
+      launch: { kind: 'fresh' },
+      branchBase: { kind: 'fresh' },
+      seedAnchors: [],
+    })
+  } finally {
+    releaseTempChatName(chatName)
+  }
+  if (!result.ok) {
+    await feishu.sendText(s.chatId, `❌ 建临时会话失败: ${result.error ?? '未知'}`)
     return
   }
-  const chatName = feishu.tempChatName(projectName(s))
-  await feishu.sendText(s.chatId, `🚀 开临时会话 ${chatName}(同目录,自动启动)…`)
-  const r = await s.opts.onCreateTempSession({ chatName, userOpenId, inheritModel: inheritSelection(s) })
-  if (!r.ok) await feishu.sendText(s.chatId, `❌ 建临时会话失败: ${r.error ?? '未知'}`)
+  await feishu.sendText(s.chatId, `✅ 已创建 ${chatName}。临时群不会自动删除；在该群发送 bye 可停止并解散。`)
 }
 
 export async function runByeCommand(s: Session): Promise<void> {
   if (!feishu.tempProjectName(s.sessionName)) {
-    await feishu.sendText(s.chatId, '❌ bye 只能在临时会话群(*开头的群)里用。')
+    await feishu.sendText(s.chatId, '❌ bye 只能在带 *MMDD-HHMM 后缀的临时会话群里使用。')
     return
   }
-  if (!s.opts.onDisbandTempSession) { await feishu.sendText(s.chatId, '❌ 解散能力未就绪(daemon 未注入回调)。'); return }
-  if (s.isRunning()) { await feishu.sendText(s.chatId, '⏳ 当前会话还在跑,先 stop/kill 再 bye。'); return }
-  await feishu.sendText(s.chatId, `👋 解散临时会话 ${s.sessionName}…`)
-  const r = await s.opts.onDisbandTempSession(s.sessionName)
-  if (!r.ok) await feishu.sendText(s.chatId, `❌ 解散失败: ${r.error ?? '未知'}`)
+  if (!s.opts.onDisbandTempSession) { await feishu.sendText(s.chatId, '❌ 解散能力未就绪（daemon 未注入回调）。'); return }
+  await feishu.sendText(s.chatId, `👋 正在停止会话并解散 ${s.sessionName}…`)
+  const result = await s.opts.onDisbandTempSession(s.sessionName, s.chatId)
+  if (!result.ok) await feishu.sendText(s.chatId, `❌ 解散失败: ${result.error ?? '未知'}`)
 }
 
 // ── Picker actions(claim 校验最前;本地 watchdog/lease 守卫叠加其后) ──
@@ -454,8 +443,6 @@ export async function onForkSelect(s: Session, panelId: string, choiceId: string
   const { panel, choice } = claimed
   try {
     if (choice.kind !== 'fork') return { ok: false, message: '选择项类型不匹配' }
-    // PHASE4-TRANSITION(T3 删,门控表第 3 处):双后端门控解除前保留 Claude 硬门。
-    if (s.selectedProvider !== 'claude') return { ok: false, message: 'fork 暂只支持 Claude 后端，请先在 model 面板切换' }
     if (!s.opts.onCreateTempSession) return { ok: false, message: '临时群能力未就绪' }
     const chatName = reserveTempChatName(panel.baseName)
     log(`session-temp: fork ${s.sessionName} → ${chatName} (${choice.launch.kind})`)
@@ -496,8 +483,6 @@ export async function onBackSelect(s: Session, panelId: string, choiceId: string
       return { ok: false, message: 'thread 自动恢复尚未完成，暂不能回退' }
     }
     const lease = s.beginLifecycle('back')
-    // PHASE4-TRANSITION(T3 删,门控表第 4 处):双后端门控解除前保留 Claude 硬门。
-    if (s.selectedProvider !== 'claude') return { ok: false, message: 'back 暂只支持 Claude 后端，请先在 model 面板切换' }
     let writeLogWarning = ''
     try {
       const messageId = await feishu.sendCard(s.chatId, cards.writeLogCard({ projectName: panel.baseName, entries: choice.writes }))
@@ -580,10 +565,6 @@ export async function onResumeSelect(s: Session, panelId: string, choiceId: stri
       return finish(false, 'thread 自动恢复尚未完成，暂不能选择历史会话', 'unchanged')
     }
     const lease = s.beginLifecycle('resume')
-    // PHASE4-TRANSITION(T3 删,门控表第 5 处):双后端门控解除前保留 Claude 硬门。
-    if (s.selectedProvider !== 'claude') {
-      return finish(false, '历史会话恢复只支持 Claude 后端，请先在 model 面板切换', 'unchanged')
-    }
     if (!s.ownsLifecycle(lease) || s.hasPreservedWatchdogRecovery()) {
       return finish(false, '历史分支被更新的会话操作打断，未执行', 'unchanged')
     }

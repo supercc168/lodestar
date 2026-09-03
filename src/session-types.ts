@@ -6,7 +6,8 @@
  */
 
 import type { AgentProvider, AgentReasoningEffort, AgentUsageSource } from './agent-process'
-import type { SessionModelSelection } from './feishu'
+import type { ConversationBranchBase, ConversationLaunch, ConversationRouting } from './conversation'
+import type { TurnAnchor } from './feishu'
 
 /**
  *   'user_message'   — 用户消息批次
@@ -220,20 +221,19 @@ export interface SessionOpts {
    * session starts, stops, exits, or changes process lifecycle. Scripts
    * that construct Session directly can omit it. */
   onLifecycleChange?: () => void
-  /** Daemon hook:建临时群并在其中启动一个 session(btw 干净新会话 / fk 从锚点 fork)。
-   *  resumeSessionId+resumeSessionAt 都给 fk(从历史点派生);btw 都不传 = 全新。
-   *  返回 {ok, chatId};失败 ok=false 由调用方提示用户。*/
+  /** Daemon hook:建临时群并按显式 launch/routing 启动一个 session(上游 ff44afb:
+   *  panel choice 预计算 launch/branchBase/seedAnchors,不再传 resume 参数对)。 */
   onCreateTempSession?: (opts: {
     chatName: string
     userOpenId: string
-    resumeSessionId?: string
-    resumeSessionAt?: string
-    /** 继承触发群(主群)当前的 model 选择,预绑到新临时群名下,让临时群首启就用主群档位
-     *  而非 config 默认。undefined = 主群未显式选过档位,让临时群走默认。*/
-    inheritModel?: SessionModelSelection
+    workDir: string
+    routing: ConversationRouting
+    launch: ConversationLaunch
+    branchBase: ConversationBranchBase
+    seedAnchors?: TurnAnchor[]
   }) => Promise<{ ok: boolean; chatId?: string; error?: string }>
-  /** Daemon hook:解散临时群 + 清掉它的 Session 对象(bye 用)。*/
-  onDisbandTempSession?: (chatName: string) => Promise<{ ok: boolean; error?: string }>
+  /** Daemon hook:解散临时群 + 清掉它的 Session 对象(bye 用;chatId 供精确匹配解散)。*/
+  onDisbandTempSession?: (chatName: string, chatId: string) => Promise<{ ok: boolean; error?: string }>
 }
 
 /** Per-turn delta extracted from the SDK `result` message — feeds the
