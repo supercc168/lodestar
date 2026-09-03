@@ -1428,8 +1428,8 @@ describe('Session watchdog recover-once action', () => {
     session.pendingReactionIds = new Map([['om_queued', 'reaction_queued']])
     session.currentBatchReactionIds = new Map([['om_old_batch', 'reaction_old_batch']])
     session.lastUserOpenId = 'ou_human'
-    session.spawnAgent = (resumeSessionId?: string) => {
-      expect(resumeSessionId).toBe('thread-1')
+    session.spawnAgent = (resumeRef?: ConversationRef) => {
+      expect(resumeRef?.sessionId).toBe('thread-1')
       return resumed
     }
     resumed.sendInitialize = () => resumed.emit('init', { session_id: 'thread-1' })
@@ -2014,8 +2014,8 @@ describe('Session watchdog human-priority races', () => {
     const footerEntered = deferred<void>()
     const footerRelease = deferred<void>()
     session.lastSessionId = 'thread-1'
-    session.spawnAgent = (resumeSessionId?: string) => {
-      expect(resumeSessionId).toBe('thread-1')
+    session.spawnAgent = (resumeRef?: ConversationRef) => {
+      expect(resumeRef?.sessionId).toBe('thread-1')
       return resumed
     }
     resumed.sendInitialize = () => resumed.emit('init', { session_id: 'thread-1' })
@@ -2100,8 +2100,8 @@ describe('Session watchdog human-priority races', () => {
     const footerEntered = deferred<void>()
     const footerRelease = deferred<void>()
     session.lastSessionId = 'thread-1'
-    session.spawnAgent = (resumeSessionId?: string) => {
-      expect(resumeSessionId).toBe('thread-1')
+    session.spawnAgent = (resumeRef?: ConversationRef) => {
+      expect(resumeRef?.sessionId).toBe('thread-1')
       return resumed
     }
     resumed.sendInitialize = () => resumed.emit('init', { session_id: 'thread-1' })
@@ -2193,8 +2193,8 @@ describe('Session watchdog human-priority races', () => {
     const footerEntered = deferred<void>()
     const footerRelease = deferred<void>()
     session.lastSessionId = 'thread-1'
-    session.spawnAgent = (resumeSessionId?: string) => {
-      expect(resumeSessionId).toBe('thread-1')
+    session.spawnAgent = (resumeRef?: ConversationRef) => {
+      expect(resumeRef?.sessionId).toBe('thread-1')
       return resumed
     }
     resumed.sendInitialize = () => resumed.emit('init', { session_id: 'thread-1' })
@@ -3291,8 +3291,8 @@ describe('Session watchdog runtime cleanup', () => {
     const spawnArgs: Array<[string | undefined, string | undefined]> = []
     session.selectedProvider = 'claude'
     session.lastSessionId = 'mutable-wrong-thread'
-    session.spawnAgent = (resumeSessionId?: string, provider?: string) => {
-      spawnArgs.push([resumeSessionId, provider])
+    session.spawnAgent = (resumeRef?: ConversationRef, provider?: string) => {
+      spawnArgs.push([resumeRef?.sessionId, provider])
       return replacement
     }
     replacement.sendInitialize = () => replacement.emit('init', { session_id: recovery.threadId })
@@ -3319,8 +3319,8 @@ describe('Session watchdog runtime cleanup', () => {
     session.selectedProvider = 'claude'
     session.lastSessionId = 'mutable-wrong-thread'
     session.pendingMidTurnMsgs = []
-    session.spawnAgent = (resumeSessionId?: string, provider?: string) => {
-      spawnArgs.push([resumeSessionId, provider])
+    session.spawnAgent = (resumeRef?: ConversationRef, provider?: string) => {
+      spawnArgs.push([resumeRef?.sessionId, provider])
       return replacement
     }
     replacement.sendInitialize = () => replacement.emit('init', { session_id: 'thread-1' })

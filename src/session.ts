@@ -34,6 +34,14 @@ import {
 import { codexModelIsApiRoute, codexModelRequiresOpenaiAuth } from './codex-models'
 import { resolveCodexSpawnOverrides, resolveUsageSource } from './token-source'
 import {
+  validateConversationLaunch,
+  type ConversationCheckpoint,
+  type ConversationLaunch,
+  type ConversationRef,
+  type ConversationRouting,
+  type ConversationSummary,
+} from './conversation'
+import {
   CLAUDE_EFFORT,
   agentProviderLabel,
   isClaudeReasoningEffort,
@@ -49,6 +57,7 @@ import {
 import {
   ClaudeAgentProcess,
   assertClaudeCodeAvailable,
+  claudeTranscriptPath,
   type BgTaskStartedEvent,
   type BgTaskProgressEvent,
   type BgTaskUpdatedEvent,
@@ -638,6 +647,9 @@ export class Session {
   // `restart` can resume an in-flight conversation even if the daemon
   // exits before the turn finishes.
   lastSessionId: string | null = null
+  /** ConversationRef 形态的恢复目标(ff44afb):lastSessionId 的带 cwd 版。
+   *  cwd:null = legacy 旧记录,resume 前须经 resolveLegacyResumeRef 权威升级。 */
+  lastSessionRef: ConversationRef | null = null
   selectedProvider: AgentProvider = 'claude'
   selectedModel: string | null = null
   selectedEffort: AgentReasoningEffort | null = null
@@ -743,7 +755,8 @@ export class Session {
     // disk so a daemon restart (systemctl, crash, watchdog) doesn't
     // strand the user with a fresh conversation when they next type
     // `restart`.
-    this.lastSessionId = feishu.getSessionResume(sessionName, this.selectedProvider)
+    this.lastSessionRef = feishu.getSessionResumeRef(sessionName, this.selectedProvider)
+    this.lastSessionId = this.lastSessionRef?.sessionId ?? null
     if (this.lastSessionId) {
       log(`session "${sessionName}": restored ${this.selectedProvider} lastSessionId=${this.lastSessionId.slice(0, 8)}…`)
     }
@@ -1532,49 +1545,176 @@ export class Session {
     return agentProviderLabel(provider)
   }
 
-  /** fork/back 期间非空:让 spawnAgent 派生新 sid(resume 到 resumeSessionAt)。
-   *  startForked/rollbackTo 在调 start/restart 前设、finally 清空 —— 复用现有
-   *  spawn+wire+init 流程,只在 spawn 注入 fork 参数(Claude SDK resumeSessionAt+forkSession)。 */
-  private _forkSpawn: {
+  /** 当前会话路由快照(D-02 slim:无 token source registry,故无 tokenSourceId)。 */
+  conversationRouting(): ConversationRouting {
+    return {
+      provider: this.selectedProvider,
+      model: this.selectedModel,
+      effort: this.selectedEffort,
+    }
+  }
+
+  /** Apply an inherited routing snapshot before a temporary Session starts. */
+  applyConversationRouting(routing: ConversationRouting): void {
+    if (this.isRunning() || this.currentTurn || this.openingTurn) {
+      throw new Error('cannot change conversation routing while the session is running')
+    }
+    // D-02 slim 层:上游 token source registry 归属校验换写为本地 provider/model
+    // 合法性检查(固定档位目录:归一化把 model 判给别的 provider = 路由不成立,
+    // 如 codex:grok 迁 claude)。
+    if (routing.provider !== 'claude' && routing.provider !== 'codex') {
+      throw new Error(`unknown conversation routing provider: ${String(routing.provider)}`)
+    }
+    if (routing.model !== null) {
+      const norm = sessionModel.normalizePersistedModelSelection(routing.provider, routing.model, routing.effort)
+      if (norm.provider !== routing.provider) {
+        throw new Error(`conversation routing model "${routing.model}" belongs to ${norm.provider}, not ${routing.provider}`)
+      }
+    }
+    if (this.selectedProvider !== routing.provider) {
+      // Checked first: a failed state write must not leave the in-memory provider changed.
+      feishu.replaceTurnAnchors(this.sessionName, [], null, null)
+    }
+    this.selectedProvider = routing.provider
+    this.selectedModel = routing.model
+    this.selectedEffort = routing.effort
+    this.lastSessionRef = feishu.getSessionResumeRef(this.sessionName, routing.provider)
+    this.lastSessionId = this.lastSessionRef?.sessionId ?? null
+    // model=null(codex 默认档)无可持久化选择:bindSessionModelChecked 本地签名
+    // 为 string(04-02 D-02 裁剪),null 跳过 —— in-memory 路由已生效,持久化
+    // 属 04-06/04-07 temp 创建流属权。
+    if (routing.model !== null) {
+      feishu.bindSessionModelChecked(this.sessionName, routing.provider, routing.model, routing.effort)
+    }
+  }
+
+  /** Codex 目录/历史访问的登录门(D-02 slim:上游 token source 可用性检查换写为
+   *  本地 API 档位/ChatGPT 登录判定,与 start() 同一条件)。 */
+  private assertCodexHistoryAuth(): void {
+    if (
+      (!codexModelIsApiRoute(this.selectedModel) || codexModelRequiresOpenaiAuth(this.selectedModel))
+      && !feishu.isOpenAIChatGPTAuthenticated()
+    ) {
+      throw new Error('Codex 未登录 ChatGPT 账号')
+    }
+  }
+
+  /** 一次性 catalog 连接(不 attach Session):listCodexConversations 与 legacy ref
+   *  升级共用。构造参数与 spawnAgent codex 分支同型 overrides(翻译表 #11)。 */
+  private spawnCodexCatalogProcess(): CodexProcess {
+    const overrides = resolveCodexSpawnOverrides(this.modelForSpawn('codex'))
+    return new CodexProcess({
+      workDir: this.workDir,
+      model: overrides.modelId,
+      effort: this.effortForSpawn('codex'),
+      launch: { kind: 'fresh' },
+      configArgs: overrides.configArgs,
+      providerEnv: overrides.env,
+    })
+  }
+
+  /** Query Codex history without attaching the catalog process to this Session. */
+  async listCodexConversations(): Promise<ConversationSummary[]> {
+    if (this.selectedProvider !== 'codex') throw new Error('Codex history requested for a non-Codex session')
+    this.assertCodexHistoryAuth()
+    const proc = this.spawnCodexCatalogProcess()
+    let conversations: ConversationSummary[] | null = null
+    let queryError: unknown = null
+    try {
+      conversations = await proc.listConversations()
+    } catch (error) {
+      queryError = error
+    }
+    let closeError: unknown = null
+    try { await proc.kill(2000) } catch (error) { closeError = error }
+    if (queryError && closeError) {
+      throw new AggregateError([queryError, closeError], `Codex history query and cleanup failed: ${messageOf(queryError)}; ${messageOf(closeError)}`)
+    }
+    if (queryError) throw queryError
+    if (closeError) throw closeError
+    return conversations ?? []
+  }
+
+  /** Upgrade a pre-cwd resume record from backend-authoritative metadata. */
+  private async resolveLegacyResumeRef(ref: ConversationRef): Promise<ConversationRef> {
+    if (ref.cwd !== null) return ref
+    if (ref.provider !== this.selectedProvider) {
+      throw new Error(`legacy resume provider mismatch: ${ref.provider} != ${this.selectedProvider}`)
+    }
+    let resolved: ConversationRef
+    if (ref.provider === 'claude') {
+      const transcript = claudeTranscriptPath(this.workDir, ref.sessionId)
+      if (!existsSync(transcript)) {
+        throw new Error(`旧 Claude 会话不属于当前 cwd，或 transcript 不存在: ${ref.sessionId.slice(0, 8)}…`)
+      }
+      resolved = { ...ref, cwd: this.workDir }
+    } else {
+      this.assertCodexHistoryAuth()
+      const proc = this.spawnCodexCatalogProcess()
+      let readError: unknown = null
+      try { resolved = await proc.readConversationRef(ref.sessionId) }
+      catch (error) { readError = error; resolved = ref }
+      let closeError: unknown = null
+      try { await proc.kill(2000) } catch (error) { closeError = error }
+      if (readError && closeError) throw new AggregateError([readError, closeError], 'Codex legacy resume lookup and cleanup failed')
+      if (readError) throw readError
+      if (closeError) throw closeError
+    }
+    validateConversationLaunch({ kind: 'resume', source: resolved }, this.selectedProvider, this.workDir)
+    feishu.bindSessionResumeChecked(this.sessionName, resolved)
+    return resolved
+  }
+
+  /** 一次性 launch intent(startForked/rollbackTo 设、spawnAgent 消费;上游
+   *  pendingConversationLaunch 的本地 lease 化形态 —— lease 归属检查逐字保留。
+   *  previousSessionId = intent 建立时的恢复绑定,persist 独立 id 校验用。 */
+  private pendingConversationLaunch: {
     lease: LifecycleLease
-    resumeSessionId?: string
-    resumeSessionAt?: string
+    launch: ConversationLaunch
+    previousSessionId: string | null
   } | null = null
   /** 最近一个 turn 的用户输入预览(首条文本,recordTurnAnchor 用;openTurnCard 时设)。 */
   private lastTurnUserPreview = ''
 
   private spawnAgent(
-    resumeSessionId?: string,
+    resumeRef?: ConversationRef,
     provider: AgentProvider = this.selectedProvider,
     lease?: LifecycleLease,
   ): AgentProcess {
-    const fs = this._forkSpawn && (!lease || this._forkSpawn.lease === lease)
-      ? this._forkSpawn
+    const pending = this.pendingConversationLaunch && (!lease || this.pendingConversationLaunch.lease === lease)
+      ? this.pendingConversationLaunch
       : null
-    const sid = fs?.resumeSessionId ?? resumeSessionId
-    const resumeSessionAt = fs?.resumeSessionAt
-    const forkSession = !!fs
+    const launch: ConversationLaunch = pending?.launch
+      ?? (resumeRef
+        ? { kind: 'resume', source: resumeRef }
+        : { kind: 'fresh' })
+    validateConversationLaunch(launch, provider, this.workDir)
     if (provider === 'claude') {
       assertClaudeCodeAvailable()
+      const sourceId = launch.kind === 'fresh' ? undefined : launch.source.sessionId
+      const through = launch.kind === 'fork' ? launch.through : undefined
+      if (through && (through.provider !== 'claude' || through.kind !== 'assistant-message')) {
+        throw new Error(`Claude cannot fork from ${through.provider}/${through.kind} checkpoint`)
+      }
       return new ClaudeAgentProcess({
         workDir: this.workDir,
         model: this.modelForSpawn(provider),
         effort: this.claudeEffortForSpawn(provider),
-        resumeSessionId: sid,
-        resumeSessionAt,
-        forkSession,
+        resumeSessionId: sourceId,
+        resumeSessionAt: through?.id,
+        forkSession: launch.kind === 'fork',
         appendSystemPrompt: this.spawnDeveloperInstructions(),
         profile: feishu.projectProfile(feishu.tempProjectName(this.sessionName) ?? this.sessionName),
       })
     }
-    // Codex 不支持 resumeSessionAt/forkSession —— fork 退化成普通 resume(Codex 路径暂不做分叉/回滚)。
-    // spawn 覆盖走 TokenSource 适配层(内部仍委托 codexSpawnOverrides)。
+    // spawn 覆盖走 TokenSource 适配层(D-02 slim:上游 registry 段换写,注入形态零变);
+    // launch 透传给 CodexProcess(thread/start|resume|fork 三分支在进程层,04-01)。
     const overrides = resolveCodexSpawnOverrides(this.modelForSpawn(provider))
     return new CodexProcess({
       workDir: this.workDir,
       model: overrides.modelId,
       effort: this.effortForSpawn(provider),
-      resumeSessionId: sid,
+      launch,
       appendSystemPrompt: this.spawnDeveloperInstructions(),
       configArgs: overrides.configArgs,
       providerEnv: overrides.env,
@@ -1592,7 +1732,8 @@ export class Session {
     this.selectedProvider = provider
     this.selectedModel = model
     this.selectedEffort = effort
-    this.lastSessionId = feishu.getSessionResume(this.sessionName, provider)
+    this.lastSessionRef = feishu.getSessionResumeRef(this.sessionName, provider)
+    this.lastSessionId = this.lastSessionRef?.sessionId ?? null
     if (previousProvider !== provider) {
       feishu.clearTurnAnchors(this.sessionName)
     }
@@ -2446,7 +2587,19 @@ export class Session {
       report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}…`))
       let proc: AgentProcess
       try {
-        proc = this.spawnAgent(prevSessionId, provider, lease)
+        let resumeRef: ConversationRef =
+          this.lastSessionRef?.provider === provider && this.lastSessionRef.sessionId === prevSessionId
+            ? this.lastSessionRef
+            : { provider, sessionId: prevSessionId, cwd: this.workDir }
+        if (!this.pendingConversationLaunch && resumeRef.cwd === null) {
+          // legacy 记录(pre-cwd):由后端权威元数据升级后才 spawn;升级失败如实
+          // 抛出走下方恢复失败路径,绝不猜 cwd(fail-closed,ff44afb)。
+          resumeRef = await this.resolveLegacyResumeRef(resumeRef)
+          if (!this.ownsLifecycle(lease)) return false
+          this.lastSessionRef = resumeRef
+          this.lastSessionId = resumeRef.sessionId
+        }
+        proc = this.spawnAgent(resumeRef, provider, lease)
         this.pendingSpawnOwnership = { lease, proc }
       } catch (e) {
         const finalStatus = `❌ ${this.backendLabel(provider)} 恢复失败: ${messageOf(e)}`
@@ -2666,18 +2819,46 @@ export class Session {
     return true
   }
 
-  /** 以 fork 模式启动:resume resumeSessionId 到 resumeSessionAt 锚点,派生新 sid。
+  /** V1 参数(sid, uuid/turnId)→ ConversationLaunch fork 的过渡组装:through 的
+   *  checkpoint kind 按当前 provider 判别(claude=assistant-message,codex=turn)。
+   *  04-06 panel 状态机改传完整 launch 后本壳随调用方换代收敛。 */
+  private buildForkLaunch(resumeSessionId: string, resumeSessionAt: string | undefined): ConversationLaunch {
+    if (this.selectedProvider === 'claude') {
+      const source = { provider: 'claude' as const, sessionId: resumeSessionId, cwd: this.workDir }
+      return {
+        kind: 'fork',
+        source,
+        ...(resumeSessionAt
+          ? { through: { provider: 'claude' as const, kind: 'assistant-message' as const, id: resumeSessionAt, source } }
+          : {}),
+      }
+    }
+    const source = { provider: 'codex' as const, sessionId: resumeSessionId, cwd: this.workDir }
+    return {
+      kind: 'fork',
+      source,
+      ...(resumeSessionAt
+        ? { through: { provider: 'codex' as const, kind: 'turn' as const, id: resumeSessionAt, source } }
+        : {}),
+    }
+  }
+
+  /** 以 fork 模式启动:从 (resumeSessionId, resumeSessionAt) 派生新会话分支。
    *  用于 btw/fk 的临时群首启、rs 的跨会话恢复。复用 start 的 spawn+wire+init。 */
   async startForked(resumeSessionId: string, resumeSessionAt: string | undefined, opts: LifecycleProgressOpts = {}): Promise<boolean> {
     if (this.hasPreservedWatchdogRecovery()) return false
     const lease = this.lifecycleLease('fork', opts)
     if (!this.ownsLifecycle(lease) || this.hasPreservedWatchdogRecovery()) return false
-    const forkSpawn = { lease, resumeSessionId, resumeSessionAt }
-    this._forkSpawn = forkSpawn
+    const forkLaunch = {
+      lease,
+      launch: this.buildForkLaunch(resumeSessionId, resumeSessionAt),
+      previousSessionId: this.lastSessionId,
+    }
+    this.pendingConversationLaunch = forkLaunch
     try {
       return await this.start({ ...opts, lifecycleLease: lease })
     } finally {
-      if (this._forkSpawn === forkSpawn) this._forkSpawn = null
+      if (this.pendingConversationLaunch === forkLaunch) this.pendingConversationLaunch = null
     }
   }
 
@@ -2691,10 +2872,14 @@ export class Session {
     const lease = this.lifecycleLease('back', opts)
     if (!this.ownsLifecycle(lease) || this.hasPreservedWatchdogRecovery()) return false
     const prevLast = this.lastSessionId
-    const forkSpawn = resumeSessionId
-      ? { lease, resumeSessionId, resumeSessionAt }
+    const forkLaunch = resumeSessionId
+      ? {
+          lease,
+          launch: this.buildForkLaunch(resumeSessionId, resumeSessionAt),
+          previousSessionId: prevLast,
+        }
       : null
-    this._forkSpawn = forkSpawn
+    this.pendingConversationLaunch = forkLaunch
     try {
       const ok = resumeSessionId
         ? await this.restart(true, {
@@ -2711,7 +2896,7 @@ export class Session {
       else if (this.lastSessionId === prevLast) this.lastSessionId = resumeSessionId ?? null
       return ok
     } finally {
-      if (this._forkSpawn === forkSpawn) this._forkSpawn = null
+      if (this.pendingConversationLaunch === forkLaunch) this.pendingConversationLaunch = null
     }
   }
 

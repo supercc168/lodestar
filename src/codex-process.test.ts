@@ -589,7 +589,10 @@ describe('codex process compaction notifications', () => {
 
   test('uses the requested resume thread as the primary filter before init completes', () => {
     const proc = Object.create(CodexProcess.prototype) as any
-    proc.opts = { workDir: '/tmp', resumeSessionId: 'resume-thread' }
+    proc.opts = {
+      workDir: '/tmp',
+      launch: { kind: 'resume', source: { provider: 'codex', sessionId: 'resume-thread', cwd: '/tmp' } },
+    }
     proc.sessionId = null
 
     proc.handleNotification('thread/started', {
@@ -1758,7 +1761,7 @@ describe('codex assistant emit 契约带 parentToolUseId(上游 7c14677-B)', () 
 // ── 上游 ff44afb/4185808:ConversationLaunch 三分支映射与 thread/fork 原语 ──
 // launch{fresh|resume|fork} → thread/start|resume|fork RPC 形状;fork 源 id
 // guard(挂账 #7);fork 过 materialization 门 → resumable(launchKind!=='fresh'
-// 门天然覆盖);旧 resumeSessionId 兼容派生(PHASE4-TRANSITION)。
+// 门天然覆盖)。resumeSessionId 兼容分支已随 04-03 spawnAgent 翻转删除。
 function launchHarness(
   workDir: string,
   optsExtra: Record<string, unknown>,
@@ -1772,9 +1775,8 @@ function launchHarness(
   const events: Array<[string, any]> = []
   const requests: Array<{ method: string; params: any }> = []
   proc.opts = { workDir, effort: 'high', ...optsExtra }
-  // 构造器派生的只读字段:Object.create 不跑构造器,按同源三态派生补齐。
-  proc.launchKind = (optsExtra as any).launch?.kind
-    ?? ((optsExtra as any).resumeSessionId ? 'resume' : 'fresh')
+  // 构造器派生的只读字段:Object.create 不跑构造器,按同源派生补齐。
+  proc.launchKind = (optsExtra as any).launch?.kind ?? 'fresh'
   proc.sessionId = null
   proc.pendingTurnStart = null
   proc.currentTurnId = null
@@ -1922,26 +1924,6 @@ describe('codex ConversationLaunch 三分支映射(上游 ff44afb/4185808)', () 
     }
   })
 
-  test('旧 resumeSessionId 入参仍派生 resume(PHASE4-TRANSITION 兼容分支,04-03 翻转调用方)', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'lodestar-legacy-resume-'))
-    try {
-      const rollout = join(root, 'thread-legacy.jsonl')
-      writeFileSync(rollout, '{"type":"turn_started"}\n')
-      const { proc, requests } = launchHarness(root, { resumeSessionId: 'thread-legacy' }, method => {
-        if (method === 'initialize') return {}
-        return { thread: { id: 'thread-legacy', cwd: root, path: rollout, turns: [] } }
-      })
-
-      await proc.initializeAndStartThread()
-
-      const resume = requests.find(r => r.method === 'thread/resume')
-      expect(resume).toBeDefined()
-      expect(resume!.params.threadId).toBe('thread-legacy')
-      expect(proc.conversationResumable).toBe(true)
-    } finally {
-      rmSync(root, { recursive: true, force: true })
-    }
-  })
 })
 
 describe('validateConversationLaunch 五重校验(上游 ff44afb)', () => {

@@ -120,8 +120,12 @@ const TOOL_FAILURE_CORRECTION_CONTEXT = [
 export interface ClaudeSpawnOpts extends SpawnOpts {
   model?: string
   effort: ClaudeReasoningEffort
+  /** SDK resume:源 session id。基类 SpawnOpts 已换 launch 形态(ff44afb),
+   *  Claude wrapper 仍以三参(resumeSessionId/resumeSessionAt/forkSession)喂
+   *  SDK —— 字段随上游同款从基类移入 Claude 层。 */
+  resumeSessionId?: string
   /** SDK resumeSessionAt:只 resume 到该 assistant 消息 uuid 为止(回到历史某点)。
-   *  用于 fk/bk —— 不传则 resume 完整历史。Claude 专属(Codex 无此能力)。 */
+   *  用于 fk/bk —— 不传则 resume 完整历史。 */
   resumeSessionAt?: string
   /** SDK forkSession:true = resume 时派生新 session id,原 transcript 不动。
    *  fk/bk 都用它(避免破坏/污染原会话)。 */

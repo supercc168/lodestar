@@ -135,7 +135,6 @@ export interface SpawnOpts {
   workDir: string
   /** Explicit backend conversation lifecycle. */
   launch?: ConversationLaunch
-  resumeSessionId?: string
   model?: string
   effort: CodexReasoningEffort
   appendSystemPrompt?: string
@@ -397,7 +396,7 @@ export class CodexProcess extends EventEmitter {
     this.on('error', () => {})
     this.exitPromise = new Promise(resolve => { this.resolveExit = resolve })
     this.opts = opts
-    this.launchKind = opts.launch?.kind ?? (opts.resumeSessionId ? 'resume' : 'fresh')
+    this.launchKind = opts.launch?.kind ?? 'fresh'
     const codexBin = resolveCodexBin()
     const args = buildCodexAppServerArgs(opts.configArgs)
     log(`codex-process: spawn ${codexBin} app-server (cwd=${opts.workDir})`)
@@ -872,7 +871,7 @@ export class CodexProcess extends EventEmitter {
     // resume 的源 thread 就是主线程;fork 的新 thread id 直到 init 返回才存在,
     // source id 不是本进程主线程 —— 维持 null(与 fresh 同,init 前不过滤)。
     if (this.opts.launch?.kind === 'resume') return this.opts.launch.source.sessionId
-    return this.opts.resumeSessionId ?? null
+    return null
   }
 
   private isForeignThread(threadId: unknown): threadId is string {
@@ -1730,11 +1729,7 @@ export class CodexProcess extends EventEmitter {
   }
 
   private conversationLaunch(): ConversationLaunch {
-    const launch: ConversationLaunch = this.opts.launch
-      // PHASE4-TRANSITION: 旧调用方仍传 resumeSessionId(session.ts 04-03 才翻转为 launch),兼容派生 resume;构造器 launchKind 三态派生与此同源,04-03 Task 1 一并删除。
-      ?? (this.opts.resumeSessionId
-        ? { kind: 'resume', source: { provider: 'codex', sessionId: this.opts.resumeSessionId, cwd: this.opts.workDir } }
-        : { kind: 'fresh' })
+    const launch: ConversationLaunch = this.opts.launch ?? { kind: 'fresh' }
     validateConversationLaunch(launch, 'codex', this.opts.workDir)
     if (launch.kind !== 'fresh' && (typeof launch.source.sessionId !== 'string' || !launch.source.sessionId)) {
       throw new Error(`codex ${launch.kind} launch requires a source session id`)
