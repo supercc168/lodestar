@@ -37,7 +37,12 @@ import type {
   BgTaskStartedEvent,
   BgTaskUpdatedEvent,
 } from './claude-agent-process'
-import { validateConversationLaunch, type ConversationLaunch } from './conversation'
+import {
+  validateConversationLaunch,
+  type ConversationLaunch,
+  type ConversationRef,
+  type ConversationSummary,
+} from './conversation'
 import { subagentStepBrief } from './cards/background'
 
 /** 拼 `codex app-server` 命令行:把 provider 覆盖 `-c` 对插在 `--listen` 之前。 */
@@ -1860,6 +1865,77 @@ export class CodexProcess extends EventEmitter {
       cursor = typeof res?.nextCursor === 'string' && res.nextCursor ? res.nextCursor : null
     } while (cursor)
     return models
+  }
+
+  /** List persisted Codex interactive conversations for this exact cwd.
+   * App-server owns discovery and pagination; Lodestar does not scan rollouts
+   * or substitute a second session index. `sourceKinds` is intentionally
+   * omitted: current app-server can persist Lodestar-created threads as `vscode`,
+   * and the protocol-defined default already selects interactive sources while
+   * excluding sub-agent-only histories. */
+  async listConversations(): Promise<ConversationSummary[]> {
+    await this.ensureCatalogReady()
+    const conversations: ConversationSummary[] = []
+    const seenCursors = new Set<string>()
+    let cursor: string | null = null
+    do {
+      const res = await this.request('thread/list', {
+        cursor,
+        limit: 100,
+        sortKey: 'updated_at',
+        sortDirection: 'desc',
+        cwd: this.opts.workDir,
+      })
+      if (!Array.isArray(res?.data)) {
+        throw new Error('thread/list returned no data array')
+      }
+      for (const raw of res.data) {
+        if (
+          typeof raw?.id !== 'string' || !raw.id
+          || typeof raw.preview !== 'string'
+          || typeof raw.updatedAt !== 'number' || !Number.isFinite(raw.updatedAt)
+          || typeof raw.cwd !== 'string' || raw.cwd !== this.opts.workDir
+        ) {
+          throw new Error('thread/list returned an invalid thread summary')
+        }
+        const status = typeof raw.status === 'string'
+          ? raw.status
+          : typeof raw.status?.type === 'string'
+            ? raw.status.type
+            : undefined
+        conversations.push({
+          provider: 'codex',
+          sessionId: raw.id,
+          cwd: raw.cwd,
+          preview: raw.preview,
+          // app-server timestamps are Unix seconds; card/history callers use ms.
+          ts: raw.updatedAt * 1000,
+          ...(status ? { status } : {}),
+        })
+      }
+      const nextCursor = res?.nextCursor
+      if (nextCursor !== null && typeof nextCursor !== 'string') {
+        throw new Error('thread/list returned an invalid nextCursor')
+      }
+      if (nextCursor && seenCursors.has(nextCursor)) {
+        throw new Error(`thread/list repeated pagination cursor ${nextCursor}`)
+      }
+      if (nextCursor) seenCursors.add(nextCursor)
+      cursor = nextCursor
+    } while (cursor)
+    return conversations
+  }
+
+  /** Resolve one legacy resume id to its authoritative stored cwd without loading it. */
+  async readConversationRef(sessionId: string): Promise<ConversationRef> {
+    if (!sessionId.trim()) throw new Error('thread/read requires a session id')
+    await this.ensureCatalogReady()
+    const res = await this.request('thread/read', { threadId: sessionId, includeTurns: false })
+    const thread = res?.thread
+    if (thread?.id !== sessionId || typeof thread.cwd !== 'string') {
+      throw new Error('thread/read returned an invalid conversation reference')
+    }
+    return { provider: 'codex', sessionId, cwd: thread.cwd }
   }
 
   async injectThreadItems(items: any[]): Promise<void> {
