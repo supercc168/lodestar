@@ -18,6 +18,7 @@ import { isAbsolute, join } from 'node:path'
 import {
   CODEX_EFFORT,
   CodexProcess,
+  CodexRpcResponseError,
   diffUsageTotals,
   effectiveTurnTokens,
   isCodexReasoningEffort,
@@ -348,6 +349,28 @@ function removeCollabAgentsFromAllPools(
     for (const agentThreadId of terminalAgents) pool.delete(agentThreadId)
     if (pool.size === 0) pools.delete(toolUseId)
   }
+}
+
+/** 从任意错误结构里挖出 CodexRpcResponseError(4185808,挂账 #1):cause 链
+ *  逐层下钻、AggregateError.errors 递归、seen 防循环引用死循环。唯一消费方
+ *  是 invalidateMissingCodexResume 的 no-rollout 严判。 */
+function findCodexRpcResponseError(
+  error: unknown,
+  seen = new Set<unknown>(),
+): CodexRpcResponseError | null {
+  if (error instanceof CodexRpcResponseError) return error
+  if (!error || (typeof error !== 'object' && typeof error !== 'function') || seen.has(error)) return null
+  seen.add(error)
+  if (error instanceof AggregateError) {
+    for (const nested of error.errors) {
+      const found = findCodexRpcResponseError(nested, seen)
+      if (found) return found
+    }
+  }
+  if (error instanceof Error && error.cause !== undefined) {
+    return findCodexRpcResponseError(error.cause, seen)
+  }
+  return null
 }
 
 const TERMINAL_COLLAB_AGENT_STATES = new Set([
@@ -2009,7 +2032,10 @@ export class Session {
     report?.(provider === 'claude'
       ? `⏳ 检查 ${backend} 启动`
       : `⏳ 等待 ${backend} init`)
-    proc.sendInitialize()
+    // init handler 内的 checked 清理(clearResumeBindingForFreshCodex)可同步
+    // 抛出:捕获后走标准启动失败路径,不让状态写失败逃逸成未处理异常(4185808)。
+    let initializeThrown: unknown = null
+    try { proc.sendInitialize() } catch (error) { initializeThrown = error }
     // Codex: 等 `system/init` 落地再认定 ready —— sendInitialize 只把 RPC
     // 写进 app-server 之前 proc.sessionId 还是 null,这时候 showConsole()
     // 看到 null 会 fallback 到磁盘上**上一次**会话的 lastSessionId,
@@ -2020,7 +2046,9 @@ export class Session {
     // 都会超时;只短暂等待同步/早期 error 或 exit,首条输入触发的 init
     // 仍由 wireProc 正常处理。监听必须先于 sendInitialize 注册,否则
     // Claude wrapper 内同步暴露的启动失败会被错过。
-    const init = await initWait
+    const init = initializeThrown
+      ? { state: 'error' as const, error: initializeThrown }
+      : await initWait
     if (!this.ownsLifecycle(lease) || this.proc !== proc) {
       await this.discardLocalProcess(lease, proc)
       return false
@@ -2614,7 +2642,11 @@ export class Session {
         proc = this.spawnAgent(resumeRef, provider, lease)
         this.pendingSpawnOwnership = { lease, proc }
       } catch (e) {
-        const finalStatus = `❌ ${this.backendLabel(provider)} 恢复失败: ${messageOf(e)}`
+        // legacy 升级(thread/read)确认无 rollout 时同样作废 ghost 绑定(挂账 #4)。
+        const invalidation = this.invalidateMissingCodexResume(prevSessionId, e)
+        const finalStatus = invalidation
+          ? `❌ ${this.backendLabel(provider)} 恢复失败: ${messageOf(e)}；${invalidation}`
+          : `❌ ${this.backendLabel(provider)} 恢复失败: ${messageOf(e)}`
         log(`session "${this.sessionName}": ${provider} resume failed before spawn: ${messageOf(e)}`)
         if (!this.ownsLifecycle(lease)) return false
         report?.(finalStatus)
@@ -2662,8 +2694,11 @@ export class Session {
       report?.(provider === 'claude'
         ? `⏳ 检查 ${backend} 恢复启动`
         : `⏳ 等待 ${backend} init 确认`)
-      proc.sendInitialize()
-      const init = await initWait
+      let initializeThrown: unknown = null
+      try { proc.sendInitialize() } catch (error) { initializeThrown = error }
+      const init = initializeThrown
+        ? { state: 'error' as const, error: initializeThrown }
+        : await initWait
       if (!this.ownsLifecycle(lease)) {
         await this.discardLocalProcess(lease, proc)
         return false
@@ -2673,7 +2708,15 @@ export class Session {
         return false
       }
       if (init.state === 'error' || init.state === 'exit' || init.state === 'timeout') {
-        const detail = init.error ? messageOf(init.error) : init.state
+        // app-server 确认 exact 绑定 id 无 rollout → checked 作废 ghost 绑定
+        // (挂账 #4);其余失败保留绑定供诊断/重试。本地失败面 = waitForProcInit/
+        // waitForProcResumeInit 与 sendInitialize catch 汇入的 init.error。
+        const invalidation = init.state === 'error'
+          ? this.invalidateMissingCodexResume(prevSessionId, init.error)
+          : null
+        const detail = [init.error ? messageOf(init.error) : init.state, invalidation]
+          .filter(Boolean)
+          .join('；')
         log(`session "${this.sessionName}": ${provider} resume failed: ${detail}`)
         const finalStatus = init.state === 'timeout'
           ? `❌ ${backend} 恢复超时`
@@ -4127,6 +4170,61 @@ export class Session {
    *  可观测消息;成功持久化后清零,下一轮新错误重新可见。 */
   private resumePersistenceError: string | null = null
 
+  /** A fresh Codex init only owns an in-memory thread id. Remove any older
+   * selected Codex binding after the new process is ready so an idle stop or
+   * daemon restart cannot revive either that ghost id or the pre-fresh
+   * conversation. The checked write is part of the init transaction.(4185808,挂账 #4) */
+  private clearResumeBindingForFreshCodex(proc: AgentProcess): void {
+    if (proc.isConversationResumable?.()) {
+      throw new Error('fresh Codex thread was unexpectedly marked resumable during init')
+    }
+    const previous = feishu.getSessionResumeRef(this.sessionName, 'codex')
+    feishu.clearSessionResumeChecked(this.sessionName, 'codex')
+    if (this.selectedProvider === 'codex') {
+      this.lastSessionRef = null
+      this.lastSessionId = null
+    }
+    if (previous) {
+      log(`session "${this.sessionName}": cleared pre-fresh Codex resume binding thread=${previous.sessionId}`)
+    }
+  }
+
+  /** Migrate a ghost binding created by older Lodestar versions, but only
+   * when the app-server explicitly confirms the exact bound Codex id has no
+   * rollout. Other resume failures keep the binding for diagnosis/retry.
+   * (4185808,挂账 #4;onInvalidated 回调供 04-04 rollbackTo restore 消费) */
+  private invalidateMissingCodexResume(
+    sessionId: string | null,
+    error: unknown,
+    onInvalidated?: (sessionId: string) => void,
+  ): string | null {
+    if (!sessionId || this.selectedProvider !== 'codex') return null
+    const rpcError = findCodexRpcResponseError(error)
+    if (
+      !rpcError
+      || !['thread/read', 'thread/resume', 'thread/fork'].includes(rpcError.method)
+      || rpcError.serverCode !== -32600
+      || rpcError.serverMessage !== `no rollout found for thread id ${sessionId}`
+    ) return null
+    const bound = feishu.getSessionResumeRef(this.sessionName, 'codex')
+    if (!bound || bound.sessionId !== sessionId) return null
+    try {
+      feishu.clearSessionResumeChecked(this.sessionName, 'codex')
+    } catch (clearError) {
+      const failure = `已确认恢复点无 rollout，但作废失败: ${messageOf(clearError)}`
+      log(`session "${this.sessionName}": ${failure} thread=${sessionId}`)
+      return failure
+    }
+    if (this.lastSessionRef?.provider === 'codex' && this.lastSessionRef.sessionId === sessionId) {
+      this.lastSessionRef = null
+      this.lastSessionId = null
+    }
+    onInvalidated?.(sessionId)
+    const receipt = `已作废无 rollout 的恢复点 thread=${sessionId.slice(0, 8)}…`
+    log(`session "${this.sessionName}": ${receipt} fullThread=${sessionId}`)
+    return receipt
+  }
+
   private persistResumableSessionId(proc: AgentProcess): string | null {
     if (this.proc !== proc) return null
     const sessionId = proc?.sessionId
@@ -4667,7 +4765,14 @@ export class Session {
     })
     p.on('init', () => {
       if (this.proc !== p) return
-      this.persistResumableSessionId(p)
+      if (p.provider === 'codex' && p.launchKind === 'fresh') {
+        // fresh init 只有内存 thread id:清 pre-fresh ghost 绑定(4185808 init
+        // 事务一部分,挂账 #4);写失败向上抛,由 start 的 sendInitialize 捕获
+        // 转启动失败 —— 不得静默留下新旧绑定并存。
+        this.clearResumeBindingForFreshCodex(p)
+      } else {
+        this.persistResumableSessionId(p)
+      }
       this.initCount++
       log(`session "${this.sessionName}": SDK init#${this.initCount} pendingCount=${this.pendingUserMessageCount} midBuffer=${this.pendingMidTurnMsgs.length} currentTurn=${this.currentTurn ? 'yes' : 'no'} openingTurn=${this.openingTurn}`)
 
