@@ -238,7 +238,12 @@ mock.module('./feishu', () => ({
   },
   // 临时群 / fork / back / rs 相关 stub(V4 容器 + checked 系列,上游 ff44afb/4185808;
   // feishuMockState.turnAnchors 为既有 V1 显式替身,优先于容器返回——01-10 用例零改动)
-  tempProjectName: () => null,
+  // 与真实实现同一正则(ff44afb 簇 4 workDir 三形态用例依赖真实剥后缀语义;
+  // 既有用例全部使用普通群名 → 恒 null,行为零变化)。
+  tempProjectName: (sessionName: string) =>
+    /\*[0-9]{4}-[0-9]{4}(-[0-9]+)?$/.test(sessionName)
+      ? sessionName.replace(/\*[0-9]{4}-[0-9]{4}(-[0-9]+)?$/, '')
+      : null,
   tempChatName: (project: string, additionallyUsed: Iterable<string> = []) => {
     const used = new Set(additionallyUsed)
     let name = `${project}*0000-0000`

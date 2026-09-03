@@ -28,6 +28,7 @@ const {
   isCodexCapacityError,
 } = await import('./session')
 const cardkit = await import('./cardkit')
+const sessionWorktree = await import('./session-worktree')
 const mathRender = await import('./math-render')
 const sessionTools = await import('./session-tools')
 const sessionHostAsk = await import('./session-host-ask')
@@ -11960,6 +11961,94 @@ describe('Session restart 前置三件 + constructor 恢复区 + materialization
     expect(session.persistResumableSessionId(noId)).toContain('did not provide a materialized session id')
     expect(session.consumePendingConversationMaterialization()).toContain('保留 pending marker')
     expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
+  })
+})
+
+// ── 上游 ff44afb 簇 4 清理:锚清空 checked 化(replaceTurnAnchors 换代)、fresh
+// 显式 base、workDir 经 worktreeSessionDir(temp-of-worktree 修复)且本地
+// projectProfile override 分支保留(翻译表 #15,语义等价三形态证明)。
+describe('Session 簇 4 清理:checked 锚清空/显式 fresh base/workDir 委托(ff44afb)', () => {
+  test('applyModelSelection provider 切换:锚清空经 checked replaceTurnAnchors,写失败 throw 且内存 provider 不变', async () => {
+    const session = new Session('model-switch-checked', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    session.pendingConversationMaterialization = { launch, previousSessionId: null }
+    turnAnchorsBySession.set(session.sessionName, [{
+      checkpoint: {
+        provider: 'claude' as const, kind: 'assistant-message' as const, id: 'a1',
+        source: { provider: 'claude' as const, sessionId: 's1', cwd: session.workDir },
+      },
+      preview: 'x', ts: 1, writes: [],
+    }])
+
+    setTurnAnchorWriteError(new Error('turn state fsync failed'))
+    try {
+      await expect(session.applyModelSelection('codex', 'gpt-5.6-sol', null))
+        .rejects.toThrow('turn state fsync failed')
+    } finally {
+      setTurnAnchorWriteError(null)
+    }
+    // checked first:写失败不得留下「内存 provider 已切、磁盘 Claude fork marker 仍在」
+    expect(session.selectedProvider).toBe('claude')
+    expect((turnAnchorsBySession.get(session.sessionName) ?? []).length).toBe(1)
+
+    await session.applyModelSelection('codex', 'gpt-5.6-sol', null)
+    expect(session.selectedProvider).toBe('codex')
+    expect(turnAnchorsBySession.get(session.sessionName) ?? []).toHaveLength(0)
+    expect(session.pendingConversationMaterialization).toBeNull()
+  })
+
+  test('resetFreshConversationState 写显式 base {kind:\'fresh\'}(与 legacy null 判别)', () => {
+    const session = new Session('fresh-base', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.resetFreshConversationState()
+    expect(branchBaseBySession.get(session.sessionName)).toEqual({ kind: 'fresh' })
+    expect(turnAnchorsBySession.get(session.sessionName) ?? []).toHaveLength(0)
+  })
+
+  test('start 的 fresh reset 让位于 durable fork marker(precommit 不被冲掉)', async () => {
+    const session = new Session('fresh-guard', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const pending = {
+      launch: {
+        kind: 'fork' as const,
+        source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+      },
+      previousSessionId: null,
+    }
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    let resetCalls = 0
+    const origReset = session.resetFreshConversationState.bind(session)
+    session.resetFreshConversationState = () => { resetCalls++; origReset() }
+    session.spawnAgent = () => { throw new Error('stop before spawn') }
+
+    expect(await session.start({ announce: false })).toBe(false)
+
+    expect(resetCalls).toBe(0)
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
+  })
+
+  test('workDir 三形态等价:temp-of-worktree 留 worktree cwd;普通 temp 群与 profile override 群零变化', () => {
+    // ① temp-of-worktree(修复目标):proj[wt]*0102-0304 剥 * 后缀后按 worktree 群名解析
+    const wtTemp = new Session('proj[wt]*0102-0304', 'chat_wt_temp') as any
+    expect(sessionWorktree.worktreeProjectName(wtTemp)).toBe('proj')
+    expect(sessionWorktree.worktreeSessionDir(wtTemp)).toBe('/tmp/lodestar-projects/proj[wt]')
+    expect(wtTemp.workDir).toBe('/tmp/lodestar-projects/proj[wt]')
+
+    // ② 普通 temp 群:剥后缀回原项目目录(零变化)
+    const plainTemp = new Session('proj*0102-0304', 'chat_plain_temp') as any
+    expect(plainTemp.workDir).toBe('/tmp/lodestar-projects/proj')
+
+    // ③ profile override 群:override 分支保留(删除即红——worktreeSessionDir 不查 profile)
+    projectProfiles.set('evolving', { cwd: '/srv/custom/evolving' })
+    const override = new Session('evolving', 'chat_override') as any
+    expect(override.workDir).toBe('/srv/custom/evolving')
+    const overrideTemp = new Session('evolving*0102-0304', 'chat_override_temp') as any
+    expect(overrideTemp.workDir).toBe('/srv/custom/evolving')
   })
 })
 
