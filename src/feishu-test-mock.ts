@@ -278,12 +278,6 @@ mock.module('./feishu', () => ({
     seededTurnAnchors.push([sessionName, copied])
     if (copied.length > 0) turnAnchorsBySession.set(sessionName, copied)
   },
-  clearTurnAnchors: (sessionName: string) => {
-    clearedTurnAnchors.push(sessionName)
-    turnAnchorsBySession.delete(sessionName)
-    branchBaseBySession.delete(sessionName)
-    pendingConversationLaunchBySession.delete(sessionName)
-  },
   replaceTurnAnchors: (
     sessionName: string,
     anchors: TurnAnchor[],

@@ -254,7 +254,9 @@ export async function onResumeSelect(s: Session, sessionId: string): Promise<Tem
       return { ok: false, message: '恢复流程被更新的会话操作接管' }
     }
     if (!ok) return { ok: false, message: '恢复失败，请检查日志后重试' }
-    feishu.clearTurnAnchors(s.sessionName)
+    // 锚清空经 checked 原语(04-04 壳收账,clearTurnAnchors 同语义机械换代;
+    // rs 选择流程改 history-fork branchState 形态归 04-06)。
+    feishu.replaceTurnAnchors(s.sessionName, [], null, null)
     return { ok: true, message: `已恢复会话 ${normalizedSessionId.slice(0, 8)}…` }
   } catch (error) {
     return { ok: false, message: `恢复失败: ${error instanceof Error ? error.message : error}` }

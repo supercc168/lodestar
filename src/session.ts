@@ -823,12 +823,15 @@ export class Session {
   }
 
   get workDir(): string {
-    // 临时群(*MMDD-HHMM)剥后缀回原项目目录(同目录多会话)。
-    // worktree 群([slug])不剥 —— sessionName 直接拼出 worktree 路径(~/project[slug]),
-    // 与 worktree.expectedWorktreePath 殊途同归(保持原有路径巧合)。
+    // 临时群先剥 * 后缀,再按普通/工作树群名解析(经 worktreeSessionDir,上游
+    // ff44afb):从 worktree 发起 btw/fk 仍落在原 worktree,而不是悄悄回主项目
+    // 目录。本地 projectProfile override 分支保留(翻译表 #15):按剥后缀的完整
+    // 群名(含 worktree 括号)查 [projects.<name>].cwd,命中即覆盖——普通群/
+    // temp 子群的 override 解析零变化。
     const baseName = feishu.tempProjectName(this.sessionName) ?? this.sessionName
     const override = feishu.projectProfile(baseName)?.cwd
-    return override && override.trim() ? override : join(feishu.PROJECTS_ROOT, baseName)
+    if (override && override.trim()) return override
+    return sessionWorktree.worktreeSessionDir(this)
   }
   isRunning(): boolean { return !!this.proc && this.proc.isAlive() }
   currentProvider(): AgentProvider { return this.selectedProvider }
@@ -1819,14 +1822,17 @@ export class Session {
   ): Promise<boolean> {
     if (lease && !this.ownsLifecycle(lease)) return false
     const previousProvider = this.selectedProvider
+    if (previousProvider !== provider) {
+      // Checked first(ff44afb 簇 4):写失败必须 throw,不得留下「内存 provider
+      // 已切、durable Claude fork marker 仍在磁盘」的分叉态。
+      feishu.replaceTurnAnchors(this.sessionName, [], null, null)
+      this.pendingConversationMaterialization = null
+    }
     this.selectedProvider = provider
     this.selectedModel = model
     this.selectedEffort = effort
     this.lastSessionRef = feishu.getSessionResumeRef(this.sessionName, provider)
     this.lastSessionId = this.lastSessionRef?.sessionId ?? null
-    if (previousProvider !== provider) {
-      feishu.clearTurnAnchors(this.sessionName)
-    }
     feishu.bindSessionModel(this.sessionName, provider, model, effort)
     await this.stopIdleMismatchedProcess(lease)
     return !lease || this.ownsLifecycle(lease)
@@ -1993,7 +1999,10 @@ export class Session {
   // ── Lifecycle ──────────────────────────────────────────────────────
   private resetFreshConversationState(): void {
     this.turnCounter = 0
-    feishu.clearTurnAnchors(this.sessionName)  // clear/全新会话 → 旧 uuid 配不上新 sid,清锚点
+    this.pendingConversationMaterialization = null
+    // clear/全新会话 → 旧锚配不上新会话,清空;base 写显式 {kind:'fresh'}
+    // (ff44afb:fresh 不再依赖空数组推断,与 legacy null 判别)。
+    feishu.replaceTurnAnchors(this.sessionName, [], { kind: 'fresh' }, null)
     this.currentGoal = null
     this.cumStats = { tokens: 0, costUsd: 0, turns: 0 }
     this.lastTurnDelta = null
@@ -2057,7 +2066,11 @@ export class Session {
       }
     }
 
-    if (!opts.freshConversationStateAlreadyReset) this.resetFreshConversationState()
+    // durable Claude fork marker 在位时跳过 fresh reset(4185808 startUnlocked 同位
+    // guard):startForked 刚 precommit 的 pendingLaunch 不得被 reset 冲掉。
+    if (!opts.freshConversationStateAlreadyReset && !this.pendingConversationMaterialization) {
+      this.resetFreshConversationState()
+    }
     this.status = 'starting'
     report?.(this.withModel(`🚀 启动 ${this.backendLabel()}`))
     let proc: AgentProcess
@@ -4044,7 +4057,8 @@ export class Session {
     let startedProc: AgentProcess | null = null
     let batchTransferred = false
     const openingToken = this.beginTurnOpening()
-    this.resetFreshConversationState()
+    // 冷启动首轮同样让位于 durable fork marker(4185808 startColdUserTurn 同位 guard)。
+    if (!this.pendingConversationMaterialization) this.resetFreshConversationState()
     this.pendingTurnInputs.push(...batch.map(message => message.text))
     try {
       const openResult = await this.openTurnCard(userOpenId, 'user_message', {

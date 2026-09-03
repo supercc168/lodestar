@@ -9,11 +9,26 @@ import * as worktree from './worktree'
 import { messageOf, type WorktreeActionResult } from './session-util'
 
 export function worktreeProjectName(s: Session): string {
-  return worktree.projectNameFromSessionName(s.sessionName)
+  // 临时群(*MMDD-HHMM)先剥后缀再解析 worktree 群名(上游 ff44afb):从
+  // worktree 群发起 btw/fk 的临时子群,wt 约定与说明书解析回归 worktree 本体。
+  return worktree.projectNameFromSessionName(feishu.tempProjectName(s.sessionName) ?? s.sessionName)
 }
 
 export function worktreeProjectDir(s: Session): string {
   return join(feishu.PROJECTS_ROOT, worktreeProjectName(s))
+}
+
+/** session 的实际工作目录(上游 ff44afb 同名函数):临时群先剥 * 后缀,再按
+ *  普通/worktree 群名解析——temp-of-worktree 留在 worktree cwd。projectDir
+ *  取本地 worktreeProjectDir(与 wt 建目录机制同一解析,不查 profile——
+ *  profile override 分支保留在 session.workDir getter,翻译表 #15)。 */
+export function worktreeSessionDir(s: Session): string {
+  const sessionName = feishu.tempProjectName(s.sessionName) ?? s.sessionName
+  const projectName = worktreeProjectName(s)
+  const projectDir = worktreeProjectDir(s)
+  if (projectName === sessionName) return projectDir
+  const slug = sessionName.slice(projectName.length + 1, -1)
+  return worktree.expectedWorktreePath(projectDir, projectName, slug)
 }
 
 export function spawnDeveloperInstructions(s: Session): string {

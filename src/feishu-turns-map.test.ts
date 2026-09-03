@@ -235,7 +235,9 @@ describe('session turn checkpoint persistence', () => {
         source: { provider: 'codex', sessionId: 'source-thread', cwd },
       })
       feishu.replaceTurnAnchors('cleared', [first], { kind: 'fresh' })
-      feishu.clearTurnAnchors('cleared')
+      // 04-04 壳收账:clearTurnAnchors → replaceTurnAnchors 空表(断言意图零变:
+      // 清空后 base 回 null、anchors 空、round-trip 不残留)。
+      feishu.replaceTurnAnchors('cleared', [], null, null)
       feishu.loadSessionTurnsMap()
       __out({
         fresh: feishu.getSessionBranchBase('fresh'),

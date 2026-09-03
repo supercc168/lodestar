@@ -300,7 +300,9 @@ async function disbandTempSession(chatName: string): Promise<{ ok: boolean; erro
       sessions.delete(cid)
     }
     await feishu.disbandChatForSession(chatName)
-    feishu.clearTurnAnchors(chatName)
+    // 锚清空经 checked 原语(04-04 壳收账,clearTurnAnchors 同语义机械换代;
+    // 解散事务整体改 temp-session-runtime/clearSessionConversationState 归 04-07)。
+    feishu.replaceTurnAnchors(chatName, [], null, null)
     feishu.unbindSessionModel(chatName)
     return { ok: true }
   } catch (e) {

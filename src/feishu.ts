@@ -854,14 +854,6 @@ export function setSessionBranchBase(sessionName: string, base: ConversationBran
   replaceTurnAnchors(sessionName, getTurnAnchors(sessionName), base)
 }
 
-// PHASE4-TRANSITION: 过渡壳(删除责任 04-04——provider 切换/清理调用方改
-// replaceTurnAnchors(name, [], null, null) checked 形态后删)。整体删除该 session
-// 的 base+anchors+pendingLaunch(与上游 clearTurnAnchors 终态行为一致)。
-export function clearTurnAnchors(sessionName: string): void {
-  if (!turnsBySession.has(sessionName)) return
-  turnsBySession.delete(sessionName)
-  saveSessionTurnsMap()
-}
 
 // ── 临时群名(*MMDD-HHMM 后缀,同目录多会话) ─────────────────────────
 // 与 worktree 的 [slug](独立目录 + git 分支)区分:*后缀 = 同一项目目录、新群、
