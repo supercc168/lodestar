@@ -12371,3 +12371,374 @@ describe('Session resume 绑定失效清理(4185808,挂账 #1/#4)', () => {
     }
   })
 })
+
+describe('Session 簇 3 竞态甄别(上游 ff44afb 簇 3——五域代表例,04-05 首跑判决)', () => {
+  // 甄别纪律(开放问题 1 锁定):五条上游竞态用例紧凑体适配本地 harness 首跑——
+  // 绿=本地 01-14 opaque token / 03-03/03-04 close drain / cleanupStaleTurnOpen
+  // 已等效覆盖,保留为防回归锚;红=只收使该用例转绿的最小 hunk。
+  // 悬挂类 settlement 一律 settlementWithin race 包裹(01-09 patterns,bun 1.3.5
+  // 悬挂 promise 忙旋 quirk)。
+  //
+  // ── 首跑判决(2026-09-03,基线 1427 之上) ──────────────────────────────
+  // 1 TurnOpenOwner/#13    红 deferred close summary='✅ · ⏱ 0.0s',stateError 丢失
+  //                          (sawResultWhileOpening 布尔无 suffix 载荷)
+  // 2 TurnCloseSnapshot    红 旧 close 清空 next turn 的 reactions/读 live usage
+  // 3 turnCloseInflight    红 在途 close 未完成 restart 已 spawn(spawned=1)
+  // 4 BackgroundOpenOwner  红 旧 bg 开卡晚到复活为活卡(card_bg_old opened
+  //                          tasks=1),无终态化 PATCH
+  // 5 terminalizeSuperseded 绿 01-14 owner token + cleanupStaleTurnOpen 等效
+  //                          (⚪ 终态化 PATCH + 不清新 owner + currentTurn 落新卡)
+
+  async function settlementWithin(promise: Promise<unknown>, timeoutMs = 3000): Promise<string> {
+    let timer: ReturnType<typeof setTimeout> | null = null
+    try {
+      return await Promise.race([
+        promise.then(() => 'resolved', (e: Error) => `rejected: ${e.message}`),
+        new Promise<string>(resolve => {
+          timer = setTimeout(() => resolve('hung'), timeoutMs)
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  function makeRunningTask(id: string): any {
+    return { id, type: 'shell', description: `bg ${id}`, status: 'running', startedAt: Date.now() - 5000, steps: [] }
+  }
+
+  // 红因(首跑):deferred close 走 closeTurnCard(undefined) — result handler 在
+  // currentTurn=null 时算出的 '⚠️ 分叉 checkpoint 持久化失败' suffix/forcePush
+  // 被丢弃,终态 summary 只有 '✅ · ⏱ 0.0s'。Task 2 收翻译表 #13 最小 hunk 后转活。
+  test.todo('result racing card open carries checkpoint persistence failure into deferred close(甄别来源=ff44afb 簇 3:TurnOpenOwner/翻译表 #13)', async () => {
+    // 上游断言核心:result 抢在开卡 await 窗口内到达且 checkpoint 持久化失败时,
+    // stateError 必须携带进 deferred close(owner.sawResult/terminalSuffix/
+    // terminalForcePush)。本地无 owner 对象——行为化断言:deferred close 的终态
+    // settings(streamingOff summary)携带持久化失败文案 + 强推仍发生。
+    const session = new Session('anchor-write-open-race', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-current')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.wireProc(proc)
+    proc.lastResult = {
+      cost_usd: null, cost_delta_usd: null, duration_ms: 1, num_turns: 1,
+      usage: null, subtype: 'success', is_error: false,
+    }
+
+    let releaseConvert: () => void = () => {}
+    const convertGate = new Promise<void>(resolve => { releaseConvert = resolve })
+    let convertCount = 0
+    const baseFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.pathname.endsWith('/cards/id_convert')) {
+        convertCount++
+        await convertGate
+        return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_open_race' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      session.lastUserOpenId = 'ou_race_user'
+      session.pendingUserMessageCount = 1
+      session.pendingTurnInputs = ['race input']
+      proc.emit('init', { session_id: 'thread-current' })
+      await waitUntil(() => convertCount === 1)
+      expect(session.openingTurn).toBe(true)
+
+      setTurnAnchorWriteError(new Error('turn-map race failed'))
+      proc.emit('result', {
+        subtype: 'success', is_error: false, duration_ms: 1, usage: null,
+        checkpoint: {
+          provider: 'codex', kind: 'turn', id: 'turn-race',
+          source: { provider: 'codex', sessionId: 'thread-current', cwd: session.workDir },
+        },
+      })
+      // 上游 owner.sawResult 的本地等效:开卡窗口竞态标记已置。
+      expect(session.sawResultWhileOpening).toBe(true)
+
+      releaseConvert()
+      // deferred close 收尾:终态 settings 必须携带持久化失败文案(上游
+      // owner.terminalSuffix 等效),否则 ⚠️ 状态错误对用户不可见。
+      await waitUntil(() => calls.some(c => c.method === 'PATCH' && c.path === '/cards/card_open_race/settings'))
+      const settingsCall = calls.find(c => c.method === 'PATCH' && c.path === '/cards/card_open_race/settings')
+      const summary = JSON.parse(settingsCall?.body.settings ?? '{}').config?.summary?.content ?? ''
+      expect(summary).toContain('turn-map race failed')
+      // 上游 owner.terminalForcePush 等效:带 ⚠️ suffix 的 deferred close 仍强推。
+      expect(urgentPushes.length).toBeGreaterThan(0)
+    } finally {
+      setTurnAnchorWriteError(null)
+      releaseConvert()
+      globalThis.fetch = baseFetch
+      if (session.currentTurn) await session.closeTurnCard('测试收尾')
+    }
+  })
+
+  // 红因(首跑):closeTurnCard 收尾读 live 状态——flush 门后 footer/settings 读到
+  // next turn 的 lastTurnDelta/lastTurnUsage,末段 release 清空的是 next turn 的
+  // reactions 两 Map(currentBatchReactionIds 变 [])。Task 2 收 close 入口快照
+  // 最小 hunk 后转活。
+  test.todo('an old close snapshots usage and reactions without clearing the next turn(甄别来源=ff44afb 簇 3:TurnCloseSnapshot)', async () => {
+    const session = new Session('close-snapshot', 'chat_id') as any
+    const oldProc = new FakeAgentProc('codex', 'old-session')
+    oldProc.lastUsage = { input_tokens: 100, output_tokens: 11, total_tokens: 111 } as any
+    ;(oldProc as any).lastContextWindow = 1000
+    session.proc = oldProc
+    session.selectedProvider = 'codex'
+    const oldTurn = turnState('card_close_snapshot_old')
+    oldTurn.userOpenId = ''
+    session.currentTurn = oldTurn
+    session.lastTurnUsage = { input_tokens: 100, output_tokens: 11, total_tokens: 111 }
+    session.lastTurnDelta = { tokens: 111, costUsd: 1.234, durationMs: 1000 }
+    session.currentBatchReactionIds = new Map([['om_old_batch', 'rid_old_batch']])
+    session.pendingReactionIds = new Map([['om_old_pending', 'rid_old_pending']])
+    cardkit.recordCardCreated(oldTurn.cardId, 1)
+
+    let signalFlushStarted: () => void = () => {}
+    const flushStarted = new Promise<void>(resolve => { signalFlushStarted = resolve })
+    let releaseFlush: () => void = () => {}
+    const flushGate = new Promise<void>(resolve => { releaseFlush = resolve })
+    const realFlush = cardkit.flush
+    const flushSpy = spyOn(cardkit, 'flush').mockImplementation(async (cardId: string) => {
+      if (cardId === oldTurn.cardId) {
+        signalFlushStarted()
+        await flushGate
+      }
+      await realFlush(cardId)
+    })
+
+    try {
+      const closing = session.closeTurnCard(undefined, { hasFreshResult: true })
+      await flushStarted
+
+      // 本地 attachProc 等效:换 proc(无在途 open,无需 clearTurnOpening)。
+      const newProc = new FakeAgentProc('codex', 'new-session')
+      newProc.lastUsage = { input_tokens: 9000, output_tokens: 999, total_tokens: 9999 } as any
+      session.proc = newProc
+      const newTurn = turnState('card_close_snapshot_new')
+      session.currentTurn = newTurn
+      session.lastTurnUsage = { input_tokens: 9000, output_tokens: 999, total_tokens: 9999 }
+      session.lastTurnDelta = { tokens: 9999, costUsd: 9.999, durationMs: 9000 }
+      session.currentBatchReactionIds = new Map([['om_new_batch', 'rid_new_batch']])
+      session.pendingReactionIds = new Map([['om_new_pending', 'rid_new_pending']])
+
+      releaseFlush()
+      expect(await settlementWithin(closing)).toBe('resolved')
+
+      expect(session.currentTurn).toBe(newTurn)
+      expect([...session.currentBatchReactionIds.entries()]).toEqual([['om_new_batch', 'rid_new_batch']])
+      expect([...session.pendingReactionIds.entries()]).toEqual([['om_new_pending', 'rid_new_pending']])
+      expect(deletedReactions).toContainEqual(['om_old_batch', 'rid_old_batch'])
+      expect(deletedReactions).toContainEqual(['om_old_pending', 'rid_old_pending'])
+      expect(deletedReactions).not.toContainEqual(['om_new_batch', 'rid_new_batch'])
+
+      const footer = calls.find(call =>
+        call.method === 'PUT' && call.path === `/cards/${oldTurn.cardId}/elements/footer`
+      )
+      const footerContent = JSON.parse(footer?.body.element ?? '{}').content as string
+      expect(footerContent).toContain('$1.234')
+      expect(footerContent).not.toContain('$9.999')
+      const settingsCall = calls.find(call =>
+        call.method === 'PATCH' && call.path === `/cards/${oldTurn.cardId}/settings`
+      )
+      const settings = JSON.parse(settingsCall?.body.settings ?? '{}')
+      expect(settings.config.summary.content).toContain('📶 11')
+      expect(settings.config.summary.content).not.toContain('999')
+    } finally {
+      releaseFlush()
+      flushSpy.mockRestore()
+      if (session.currentTurn) session.stopFooterStatus(session.currentTurn)
+      session.currentTurn = null
+      await cardkit.dispose(oldTurn.cardId)
+    }
+  })
+
+  // 红因(首跑):restart 对已摘除 currentTurn 的在途 close 无感知,kill 后直接
+  // spawn(50ms 调度窗内 spawned=1,旧卡 flush 仍被门控)。Task 2 收 turnClose
+  // 在途登记+等待最小 hunk 后转活。
+  test.todo('restart waits for a close that already removed currentTurn before spawning(甄别来源=ff44afb 簇 3:turnCloseInflight)', async () => {
+    const session = new Session('restart-close-owner', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-session')
+    const oldTurn = turnState('card_restart_close_owner', { provider: 'claude', model: null })
+    oldTurn.userOpenId = ''
+    session.proc = oldProc
+    session.selectedProvider = 'claude'
+    session.currentTurn = oldTurn
+    cardkit.recordCardCreated(oldTurn.cardId, 1)
+
+    let signalFlushStarted: () => void = () => {}
+    const flushStarted = new Promise<void>(resolve => { signalFlushStarted = resolve })
+    let releaseFlush: () => void = () => {}
+    const flushGate = new Promise<void>(resolve => { releaseFlush = resolve })
+    const realFlush = cardkit.flush
+    const flushSpy = spyOn(cardkit, 'flush').mockImplementation(async (cardId: string) => {
+      if (cardId === oldTurn.cardId) {
+        signalFlushStarted()
+        await flushGate
+      }
+      await realFlush(cardId)
+    })
+    const spawned: FakeAgentProc[] = []
+    session.spawnAgent = () => {
+      const proc = new FakeAgentProc('claude', `new-session-${spawned.length + 1}`)
+      spawned.push(proc)
+      return proc
+    }
+    session.waitForProcEarlyFailure = async () => ({ state: 'ready' })
+
+    try {
+      const oldClose = session.closeTurnCard('旧轮收尾')
+      await flushStarted
+      expect(session.currentTurn).toBeNull()
+
+      const restarting = session.restart(false, { announce: false })
+      await waitUntil(() => oldProc.killCalls === 1)
+      // 上游 waitUntil 在 killCalls 置位前有真实 sleep 轮;本地 kill 同步完成,
+      // 补一个有界调度窗:真等 close 的实现停在 flush 门上,不等的实现会在
+      // 窗内 spawn——恢复上游断言的有效语义(spawn 不得先于在途 close 完成)。
+      await new Promise(resolve => setTimeout(resolve, 50))
+      expect(spawned).toHaveLength(0)
+
+      releaseFlush()
+      expect(await settlementWithin(oldClose)).toBe('resolved')
+      expect(await restarting).toBe(true)
+      expect(spawned).toHaveLength(1)
+      expect(session.proc).toBe(spawned[0])
+    } finally {
+      releaseFlush()
+      flushSpy.mockRestore()
+      if (session.proc?.isAlive?.()) await session.stop('测试收尾', { announce: false })
+      await cardkit.dispose(oldTurn.cardId)
+    }
+  })
+
+  // 红因(首跑):openBackgroundCard 落地无世代校验——reset 后晚到的旧 convert 把
+  // card_bg_old 安装为活卡(日志 'background card opened cardId=card_bg_old
+  // tasks=1'),其 finally 还清掉新开卡的 openingBackground 标记;旧卡永不终态化
+  // (PATCH settings 等待超时)。Task 2 收 BackgroundOpenOwner 世代化最小 hunk 后转活。
+  test.todo('an old background open cannot revive after reset or clear a newer opening owner(甄别来源=ff44afb 簇 3:BackgroundOpenOwner)', async () => {
+    const session = new Session('background-open-generation', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('old')]
+
+    let releaseOldConvert: () => void = () => {}
+    const oldConvertGate = new Promise<void>(resolve => { releaseOldConvert = resolve })
+    let releaseNewConvert: () => void = () => {}
+    const newConvertGate = new Promise<void>(resolve => { releaseNewConvert = resolve })
+    let convertCount = 0
+    const baseFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.pathname.endsWith('/cards/id_convert')) {
+        const n = ++convertCount
+        if (n === 1) await oldConvertGate
+        if (n === 2) await newConvertGate
+        return new Response(JSON.stringify({ code: 0, data: { card_id: n === 1 ? 'card_bg_old' : 'card_bg_new' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      session.onBackgroundTaskChanged()
+      await waitUntil(() => convertCount === 1)
+
+      await session.resetBackgroundTasks()
+      expect(session.backgroundCard).toBeNull()
+      expect(session.openingBackground).toBe(false)
+
+      session.backgroundTasks = [makeRunningTask('new')]
+      session.onBackgroundTaskChanged()
+      await waitUntil(() => convertCount === 2)
+
+      releaseOldConvert()
+      // 旧开卡晚到落地必须被终态化(streamingOff PATCH),不得复活为活卡。
+      await waitUntil(() => calls.some(call =>
+        call.method === 'PATCH' && call.path === '/cards/card_bg_old/settings'
+      ))
+      expect(session.backgroundCard).toBeNull()
+      expect(session.openingBackground).toBe(true)
+
+      releaseNewConvert()
+      await waitUntil(() => session.backgroundCard?.cardId === 'card_bg_new' && !session.openingBackground)
+      expect(session.backgroundTasks.map((task: any) => task.id)).toEqual(['new'])
+    } finally {
+      releaseOldConvert()
+      releaseNewConvert()
+      session.stopBackgroundRefreshTick()
+      if (session.backgroundRefreshTimer) clearTimeout(session.backgroundRefreshTimer)
+      session.backgroundRefreshTimer = null
+      const cardId = session.backgroundCard?.cardId
+      session.backgroundCard = null
+      session.backgroundTasks = []
+      if (cardId) await cardkit.dispose(cardId)
+      globalThis.fetch = baseFetch
+    }
+  })
+
+  test('an obsolete main-card open cannot replace a newer process turn or clear its opening owner(甄别来源=ff44afb 簇 3:terminalizeSupersededCard)', async () => {
+    const session = new Session('stale-main-open', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-session')
+    const newProc = new FakeAgentProc('claude', 'new-session')
+    session.selectedProvider = 'claude'
+
+    let releaseOldConvert: () => void = () => {}
+    const oldConvertGate = new Promise<void>(resolve => { releaseOldConvert = resolve })
+    let releaseNewConvert: () => void = () => {}
+    const newConvertGate = new Promise<void>(resolve => { releaseNewConvert = resolve })
+    let convertCount = 0
+    const baseFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.pathname.endsWith('/cards/id_convert')) {
+        const n = ++convertCount
+        if (n === 1) await oldConvertGate
+        if (n === 2) await newConvertGate
+        return new Response(JSON.stringify({ code: 0, data: { card_id: n === 1 ? 'card_old_open' : 'card_new_open' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      session.proc = oldProc
+      session.wireProc(oldProc)
+      session.lastUserOpenId = 'ou_user'
+      session.pendingUserMessageCount = 1
+      session.pendingTurnInputs = ['old input']
+      oldProc.emit('init', { session_id: 'old-session' })
+      await waitUntil(() => convertCount === 1)
+
+      // 本地 attachProc 等效(上游 attachProc = invalidateTurnOpen + 换 proc +
+      // wire;本地生产换代路径 stop/restart 均 clearTurnOpening 后再 spawn/wire):
+      session.proc = newProc
+      session.clearTurnOpening()
+      session.wireProc(newProc)
+      session.pendingUserMessageCount = 1
+      session.pendingTurnInputs = ['new input']
+      newProc.emit('init', { session_id: 'new-session' })
+      await waitUntil(() => convertCount === 2)
+
+      releaseOldConvert()
+      await waitUntil(() => calls.some(call =>
+        call.method === 'PATCH' && call.path === '/cards/card_old_open/settings'
+      ))
+      expect(session.currentTurn).toBeNull()
+      expect(session.openingTurn).toBe(true)
+
+      releaseNewConvert()
+      await waitUntil(() => session.currentTurn?.cardId === 'card_new_open' && !session.openingTurn)
+      expect(session.currentTurn.cardId).toBe('card_new_open')
+      expect(session.proc).toBe(newProc)
+    } finally {
+      releaseOldConvert()
+      releaseNewConvert()
+      globalThis.fetch = baseFetch
+      if (session.currentTurn) await session.closeTurnCard('测试收尾')
+    }
+  })
+})
