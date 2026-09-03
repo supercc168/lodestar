@@ -36,11 +36,13 @@ import { codexModelIsApiRoute, codexModelRequiresOpenaiAuth } from './codex-mode
 import { resolveCodexSpawnOverrides, resolveUsageSource } from './token-source'
 import {
   validateConversationLaunch,
+  type ConversationBranchBase,
   type ConversationCheckpoint,
   type ConversationLaunch,
   type ConversationRef,
   type ConversationRouting,
   type ConversationSummary,
+  type PendingConversationLaunch,
 } from './conversation'
 import {
   CLAUDE_EFFORT,
@@ -1696,6 +1698,10 @@ export class Session {
     launch: ConversationLaunch
     previousSessionId: string | null
   } | null = null
+  /** Durable Claude fork intent until first SDK init returns a new session id
+   *  (4185808:precommit before spawn,daemon 崩溃窗口可恢复;首个 claude result
+   *  经 consumePendingConversationMaterialization 消费——挂账 #2 归 Task 2 接线)。 */
+  private pendingConversationMaterialization: PendingConversationLaunch | null = null
   /** 最近一个 turn 的用户输入预览(首条文本,recordTurnAnchor 用;openTurnCard 时设)。 */
   private lastTurnUserPreview = ''
   /** A very fast Codex turn can complete before the asynchronous authoritative
@@ -2485,7 +2491,13 @@ export class Session {
     if (announce) await feishu.sendText(this.chatId, `🔴 ${reason} (session: ${this.sessionName})`)
   }
 
-  async restart(resume = false, opts: LifecycleProgressOpts = {}): Promise<boolean> {
+  async restart(
+    resume = false,
+    // onResumeInvalidated:上游 restartUnlocked 第三参的本地 opts 字段承接(挂账 #5
+    // 接线)——restart 内 invalidateMissingCodexResume 确认旧 id 无 rollout 时回调,
+    // rollbackTo restore 据此走清空分支不绑回幽灵 id。
+    opts: LifecycleProgressOpts & { onResumeInvalidated?: (sessionId: string) => void } = {},
+  ): Promise<boolean> {
     const strictResume = resume && opts.requireResumeSession === true
     const wantsPreservation = !!(opts.preserveCurrentTurn || opts.preserveQueuedHumanWork)
     const existingRecovery = strictResume ? this.preservedWatchdogRecovery : null
@@ -2643,7 +2655,7 @@ export class Session {
         this.pendingSpawnOwnership = { lease, proc }
       } catch (e) {
         // legacy 升级(thread/read)确认无 rollout 时同样作废 ghost 绑定(挂账 #4)。
-        const invalidation = this.invalidateMissingCodexResume(prevSessionId, e)
+        const invalidation = this.invalidateMissingCodexResume(prevSessionId, e, opts.onResumeInvalidated)
         const finalStatus = invalidation
           ? `❌ ${this.backendLabel(provider)} 恢复失败: ${messageOf(e)}；${invalidation}`
           : `❌ ${this.backendLabel(provider)} 恢复失败: ${messageOf(e)}`
@@ -2712,7 +2724,7 @@ export class Session {
         // (挂账 #4);其余失败保留绑定供诊断/重试。本地失败面 = waitForProcInit/
         // waitForProcResumeInit 与 sendInitialize catch 汇入的 init.error。
         const invalidation = init.state === 'error'
-          ? this.invalidateMissingCodexResume(prevSessionId, init.error)
+          ? this.invalidateMissingCodexResume(prevSessionId, init.error, opts.onResumeInvalidated)
           : null
         const detail = [init.error ? messageOf(init.error) : init.state, invalidation]
           .filter(Boolean)
@@ -2898,57 +2910,303 @@ export class Session {
     }
   }
 
-  /** 以 fork 模式启动:从 (resumeSessionId, resumeSessionAt) 派生新会话分支。
-   *  用于 btw/fk 的临时群首启、rs 的跨会话恢复。复用 start 的 spawn+wire+init。 */
-  async startForked(resumeSessionId: string, resumeSessionAt: string | undefined, opts: LifecycleProgressOpts = {}): Promise<boolean> {
+  /** Start a new Session process from a backend-native fork source(4185808 终态)。
+   *  Claude fork 先 precommit pendingLaunch 再 spawn——startup grace 内 daemon
+   *  崩溃仍可从磁盘 intent 恢复;失败恢复原 pending,恢复也失败 AggregateError
+   *  上抛。复用 start 的 spawn+wire+init。本地守卫叠加(保护线):
+   *  hasPreservedWatchdogRecovery 前置拒绝 + lease 归属,await 后复查。 */
+  async startForked(launch: Extract<ConversationLaunch, { kind: 'fork' }>, opts?: LifecycleProgressOpts): Promise<boolean>
+  /** PHASE4-TRANSITION 旧 (sid, uuid) 签名(删除责任 04-06——panel 状态机改传 launch 后删)。 */
+  async startForked(resumeSessionId: string, resumeSessionAt: string | undefined, opts?: LifecycleProgressOpts): Promise<boolean>
+  async startForked(
+    launchOrLegacySid: Extract<ConversationLaunch, { kind: 'fork' }> | string,
+    atOrOpts?: string | LifecycleProgressOpts,
+    legacyOpts: LifecycleProgressOpts = {},
+  ): Promise<boolean> {
+    if (typeof launchOrLegacySid === 'string') {
+      const resumeSessionAt = typeof atOrOpts === 'string' ? atOrOpts : undefined
+      const opts = atOrOpts !== undefined && typeof atOrOpts !== 'string' ? atOrOpts : legacyOpts
+      const legacyLaunch = this.buildForkLaunch(launchOrLegacySid, resumeSessionAt)
+      return await this.startForkedLaunch(legacyLaunch, opts)
+    }
+    const opts = atOrOpts !== undefined && typeof atOrOpts !== 'string' ? atOrOpts : legacyOpts
+    return await this.startForkedLaunch(launchOrLegacySid, opts)
+  }
+
+  private async startForkedLaunch(
+    launch: Extract<ConversationLaunch, { kind: 'fork' }>,
+    opts: LifecycleProgressOpts = {},
+  ): Promise<boolean> {
     if (this.hasPreservedWatchdogRecovery()) return false
     const lease = this.lifecycleLease('fork', opts)
     if (!this.ownsLifecycle(lease) || this.hasPreservedWatchdogRecovery()) return false
-    const forkLaunch = {
-      lease,
-      launch: this.buildForkLaunch(resumeSessionId, resumeSessionAt),
-      previousSessionId: this.lastSessionId,
+    validateConversationLaunch(launch, this.selectedProvider, this.workDir)
+    const previousPending = feishu.getPendingConversationLaunch(this.sessionName)
+    const pendingMaterialization: PendingConversationLaunch | null = this.selectedProvider === 'claude'
+      ? { launch, previousSessionId: this.lastSessionId }
+      : null
+    if (pendingMaterialization) {
+      // Persist before spawning. A daemon crash during Claude's startup grace
+      // must still leave enough intent for the next boot/message to fork the
+      // selected source rather than silently starting fresh.
+      feishu.setPendingConversationLaunchChecked(this.sessionName, pendingMaterialization)
+      this.pendingConversationMaterialization = pendingMaterialization
     }
+    const forkLaunch = { lease, launch, previousSessionId: this.lastSessionId }
     this.pendingConversationLaunch = forkLaunch
     try {
-      return await this.start({ ...opts, lifecycleLease: lease })
+      const ok = await this.start({ ...opts, lifecycleLease: lease })
+      if (!ok && pendingMaterialization && this.ownsLifecycle(lease)) {
+        // 失败恢复原 pending(不留半提交态);失去 lease 时状态归新 owner,不写。
+        feishu.setPendingConversationLaunchChecked(this.sessionName, previousPending)
+        this.pendingConversationMaterialization = previousPending
+      }
+      return ok
+    } catch (error) {
+      if (!pendingMaterialization || !this.ownsLifecycle(lease)) throw error
+      try {
+        feishu.setPendingConversationLaunchChecked(this.sessionName, previousPending)
+        this.pendingConversationMaterialization = previousPending
+      } catch (restoreError) {
+        throw new AggregateError(
+          [error, restoreError],
+          `fork start and pending-intent restore failed: ${messageOf(error)}; ${messageOf(restoreError)}`,
+        )
+      }
+      throw error
     } finally {
       if (this.pendingConversationLaunch === forkLaunch) this.pendingConversationLaunch = null
     }
   }
 
-  /** 回滚当前会话:kill 当前 proc,fork 到 (resumeSessionId, resumeSessionAt) 重启。
-   *  当前时间线作废。用于 bk 回滚 + rs 跨会话恢复(把当前群的 resume 目标换掉)。 */
-  async rollbackTo(resumeSessionId: string | undefined, resumeSessionAt: string | undefined, opts: LifecycleProgressOpts = {}): Promise<boolean> {
-    // resumeSessionId=undefined → 回到会话起点(fresh,等价 clear),不 fork、不 resume。
-    // 否则 fork 到 (sid, resumeSessionAt) 派生新 sid。失败时恢复原 lastSessionId,避免
-    // 脏状态(rs 恢复外部会话失败后,当前群 lastSessionId 仍指向原会话)。
+  /** 回滚当前会话:停当前 proc,绑定到显式新 launch 重启(4185808 终态补偿事务)。
+   *  分支元数据只在替换后端就绪后 commit;checked 写失败则停替换进程并 restore
+   *  旧 resume/分支快照后才上抛。次序红线(陷阱 9):restart 抛出后先停已 attach
+   *  的替换进程,**停不掉绝不 restore**——旧 resume id 指回而新 fork 还活着
+   *  = 两会话并存冲突。本地守卫叠加(保护线):lease 失效/preserved recovery
+   *  出现时事务中止不写状态。 */
+  async rollbackTo(
+    launch: ConversationLaunch,
+    branchState?: {
+      anchors: feishu.TurnAnchor[]
+      base: ConversationBranchBase
+      pendingLaunch?: PendingConversationLaunch | null
+    },
+    opts?: LifecycleProgressOpts,
+  ): Promise<boolean>
+  /** PHASE4-TRANSITION 旧 (sid, uuid) 签名(删除责任 04-06——panel 状态机改传 launch+branchState 后删)。 */
+  async rollbackTo(resumeSessionId: string | undefined, resumeSessionAt?: string | undefined, opts?: LifecycleProgressOpts): Promise<boolean>
+  async rollbackTo(
+    launchOrLegacySid: ConversationLaunch | string | undefined,
+    branchStateOrLegacyAt?: {
+      anchors: feishu.TurnAnchor[]
+      base: ConversationBranchBase
+      pendingLaunch?: PendingConversationLaunch | null
+    } | string,
+    opts: LifecycleProgressOpts = {},
+  ): Promise<boolean> {
+    if (launchOrLegacySid === undefined || typeof launchOrLegacySid === 'string') {
+      // 旧形态:sid=undefined → fresh(等价 clear);否则 fork 到 (sid, uuid)。
+      // 成功后 lastSessionId 未被推进时指向 fork 源——既有行为逐字保留(Claude
+      // fork materialize 前 daemon 重启的 resume 近似目标;04-06 branchState/
+      // pendingLaunch 接管后随本壳删除)。
+      const resumeSessionAt = typeof branchStateOrLegacyAt === 'string' ? branchStateOrLegacyAt : undefined
+      const prevLast = this.lastSessionId
+      const legacyLaunch: ConversationLaunch = launchOrLegacySid
+        ? this.buildForkLaunch(launchOrLegacySid, resumeSessionAt)
+        : { kind: 'fresh' }
+      const ok = await this.rollbackToLaunch(legacyLaunch, undefined, opts)
+      if (ok && this.lastSessionId === prevLast) this.lastSessionId = launchOrLegacySid ?? null
+      return ok
+    }
+    return await this.rollbackToLaunch(
+      launchOrLegacySid,
+      branchStateOrLegacyAt as {
+        anchors: feishu.TurnAnchor[]
+        base: ConversationBranchBase
+        pendingLaunch?: PendingConversationLaunch | null
+      } | undefined,
+      opts,
+    )
+  }
+
+  private async rollbackToLaunch(
+    launch: ConversationLaunch,
+    branchState: {
+      anchors: feishu.TurnAnchor[]
+      base: ConversationBranchBase
+      pendingLaunch?: PendingConversationLaunch | null
+    } | undefined,
+    opts: LifecycleProgressOpts = {},
+  ): Promise<boolean> {
     if (this.hasPreservedWatchdogRecovery()) return false
     const lease = this.lifecycleLease('back', opts)
     if (!this.ownsLifecycle(lease) || this.hasPreservedWatchdogRecovery()) return false
-    const prevLast = this.lastSessionId
-    const forkLaunch = resumeSessionId
+    validateConversationLaunch(launch, this.selectedProvider, this.workDir)
+    const nextBranchState = branchState
       ? {
-          lease,
-          launch: this.buildForkLaunch(resumeSessionId, resumeSessionAt),
-          previousSessionId: prevLast,
+          anchors: branchState.anchors.slice(),
+          base: branchState.base,
+          pendingLaunch: branchState.pendingLaunch !== undefined
+            ? branchState.pendingLaunch
+            : this.selectedProvider === 'claude' && launch.kind === 'fork'
+              ? { launch, previousSessionId: this.lastSessionId }
+              : null,
         }
       : null
+    // 八项快照:proc/lastSessionId/lastSessionRef/anchors/base/pendingLaunch/
+    // turnCounter+goal/stats+usage 基线——restore 的完整素材。
+    const previousProc = this.proc
+    const previousLastSessionId = this.lastSessionId
+    const previousLastSessionRef = this.lastSessionRef
+    const previousAnchors = feishu.getTurnAnchors(this.sessionName).slice()
+    const previousBranchBase: ConversationBranchBase = feishu.getSessionBranchBase(this.sessionName)
+    const previousPendingLaunch = feishu.getPendingConversationLaunch(this.sessionName)
+    const previousState = {
+      turnCounter: this.turnCounter,
+      currentGoal: this.currentGoal,
+      cumStats: { ...this.cumStats },
+      lastTurnDelta: this.lastTurnDelta ? { ...this.lastTurnDelta } : null,
+      currentTurnUsageBaseline: this.currentTurnUsageBaseline ? { ...this.currentTurnUsageBaseline } : null,
+      currentTurnUsageBaselineKnown: this.currentTurnUsageBaselineKnown,
+      lastTurnUsage: this.lastTurnUsage ? { ...this.lastTurnUsage } : null,
+      usageTotalsSeedUnknown: this.usageTotalsSeedUnknown,
+    }
+    let invalidatedPreviousResume = false
+    const restore = (): void => {
+      if (invalidatedPreviousResume) {
+        // 挂账 #5:restart 过程已确认旧 id 无 rollout——清空绑定,不绑回幽灵 id。
+        this.lastSessionId = null
+        this.lastSessionRef = null
+        feishu.clearSessionResumeChecked(this.sessionName, 'codex')
+      } else {
+        this.lastSessionId = previousLastSessionId
+        this.lastSessionRef = previousLastSessionRef
+        if (previousLastSessionRef) feishu.bindSessionResumeChecked(this.sessionName, previousLastSessionRef)
+        else feishu.clearSessionResumeChecked(this.sessionName, this.selectedProvider)
+      }
+      feishu.replaceTurnAnchors(
+        this.sessionName,
+        previousAnchors,
+        previousBranchBase,
+        previousPendingLaunch,
+      )
+      this.pendingConversationMaterialization = previousPendingLaunch
+      this.turnCounter = previousState.turnCounter
+      this.currentGoal = previousState.currentGoal
+      this.cumStats = previousState.cumStats
+      this.lastTurnDelta = previousState.lastTurnDelta
+      this.currentTurnUsageBaseline = previousState.currentTurnUsageBaseline
+      this.currentTurnUsageBaselineKnown = previousState.currentTurnUsageBaselineKnown
+      this.lastTurnUsage = previousState.lastTurnUsage
+      this.usageTotalsSeedUnknown = previousState.usageTotalsSeedUnknown
+    }
+    let pendingPrecommitted = false
+    if (nextBranchState?.pendingLaunch) {
+      // Claude does not emit the forked session id until first input. Commit
+      // its launch intent before touching the process so a crash inside the
+      // startup grace can be recovered on the next daemon boot.
+      feishu.replaceTurnAnchors(
+        this.sessionName,
+        nextBranchState.anchors,
+        nextBranchState.base,
+        nextBranchState.pendingLaunch,
+      )
+      this.pendingConversationMaterialization = nextBranchState.pendingLaunch
+      pendingPrecommitted = true
+    }
+    const forkLaunch = launch.kind === 'fresh'
+      ? null
+      : { lease, launch, previousSessionId: previousLastSessionId }
     this.pendingConversationLaunch = forkLaunch
+    const onResumeInvalidated = (sessionId: string): void => {
+      invalidatedPreviousResume = previousLastSessionRef?.provider === 'codex'
+        && previousLastSessionRef.sessionId === sessionId
+    }
     try {
-      const ok = resumeSessionId
-        ? await this.restart(true, {
-            ...opts,
-            lifecycleLease: lease,
-            resumeIdentity: {
-              provider: this.selectedProvider,
-              threadId: resumeSessionId,
-            },
-          })
-        : await this.restart(false, { ...opts, lifecycleLease: lease })
+      let ok: boolean
+      try {
+        ok = launch.kind === 'fresh'
+          ? await this.restart(false, { ...opts, lifecycleLease: lease, onResumeInvalidated })
+          : await this.restart(true, {
+              ...opts,
+              lifecycleLease: lease,
+              onResumeInvalidated,
+              resumeIdentity: {
+                provider: this.selectedProvider,
+                threadId: launch.source.sessionId,
+              },
+            })
+      } catch (error) {
+        // restart can throw after a replacement has already been attached (for
+        // example a ready/status callback failure). Never put the old resume id
+        // back while that new fork is still alive(陷阱 9 candidate 判定序逐字)。
+        let stopError: unknown = null
+        const candidate = this.proc && this.proc !== previousProc ? this.proc : null
+        if (candidate) {
+          try {
+            await this.stop('回滚启动事务失败', { announce: false, lifecycleLease: lease })
+          } catch (candidateStopError) {
+            stopError = candidateStopError
+          }
+        }
+        const candidateStopped = !candidate || (this.proc !== candidate && !candidate.isAlive())
+        if (!candidateStopped && !stopError) {
+          stopError = new Error('replacement process stop was not confirmed')
+        }
+        let restoreError: unknown = null
+        // 停成功才 restore;失去 lease/preserved recovery 出现同样不写(守卫叠加)。
+        if (candidateStopped && this.ownsLifecycle(lease) && !this.hasPreservedWatchdogRecovery()) {
+          try { restore() } catch (stateRestoreError) { restoreError = stateRestoreError }
+        }
+        const failures = [error, ...(stopError ? [stopError] : []), ...(restoreError ? [restoreError] : [])]
+        if (failures.length === 1) throw error
+        throw new AggregateError(
+          failures,
+          `rollback launch and cleanup failed: ${failures.map(messageOf).join('; ')}`,
+        )
+      }
       if (!this.ownsLifecycle(lease) || this.hasPreservedWatchdogRecovery()) return false
-      if (!ok) this.lastSessionId = prevLast
-      else if (this.lastSessionId === prevLast) this.lastSessionId = resumeSessionId ?? null
+      if (!ok) {
+        restore()
+        return false
+      }
+      if (nextBranchState) {
+        try {
+          if (!pendingPrecommitted) {
+            feishu.replaceTurnAnchors(
+              this.sessionName,
+              nextBranchState.anchors,
+              nextBranchState.base,
+              nextBranchState.pendingLaunch,
+            )
+          }
+          this.pendingConversationMaterialization = nextBranchState.pendingLaunch
+        } catch (commitError) {
+          // commit 失败 = 分支元数据没换成:停替换进程 + restore,同型判定序。
+          let stopError: unknown = null
+          const candidate = this.proc
+          try {
+            await this.stop('回滚分支状态持久化失败', { announce: false, lifecycleLease: lease })
+          } catch (error) {
+            stopError = error
+          }
+          const candidateStopped = !candidate || (this.proc !== candidate && !candidate.isAlive())
+          if (!candidateStopped && !stopError) {
+            stopError = new Error('replacement process stop was not confirmed')
+          }
+          let restoreError: unknown = null
+          if (candidateStopped && this.ownsLifecycle(lease) && !this.hasPreservedWatchdogRecovery()) {
+            try { restore() } catch (error) { restoreError = error }
+          }
+          const failures = [commitError, ...(stopError ? [stopError] : []), ...(restoreError ? [restoreError] : [])]
+          if (failures.length === 1) throw commitError
+          throw new AggregateError(
+            failures,
+            `rollback branch commit failed: ${failures.map(messageOf).join('; ')}`,
+          )
+        }
+      }
       return ok
     } finally {
       if (this.pendingConversationLaunch === forkLaunch) this.pendingConversationLaunch = null

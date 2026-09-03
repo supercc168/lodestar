@@ -283,7 +283,9 @@ mock.module('./feishu', () => ({
   ) => {
     if (turnAnchorWriteError) throw turnAnchorWriteError
     clearedTurnAnchors.push(sessionName)
-    const copied = anchors.slice()
+    // 写入口剥回流字段(与真实 canonicalTurnAnchor 同语义):getTurnAnchors 投影
+    // (uuid/sid)round-trip 回写时不得污染容器——rollbackTo restore 快照依赖。
+    const copied = anchors.map(a => ({ checkpoint: a.checkpoint, preview: a.preview, ts: a.ts, writes: a.writes }))
     seededTurnAnchors.push([sessionName, copied])
     turnAnchorsBySession.set(sessionName, copied)
     branchBaseBySession.set(sessionName, base)
