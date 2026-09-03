@@ -12,7 +12,7 @@ import { randomUUID } from 'node:crypto'
 import { existsSync, mkdirSync, readFileSync, statSync, unlinkSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
 import { homedir } from 'node:os'
-import { basename, extname, join } from 'node:path'
+import { basename, extname, isAbsolute, join } from 'node:path'
 import { config, type ProjectProfile } from './config'
 import { codexLoginStatusAuthenticated, isCodexReasoningEffort, resolveCodexBin } from './codex-process'
 import {
@@ -28,6 +28,7 @@ import {
   SESSION_MODEL_MAP_FILE,
   SESSION_RESUME_MAP_FILE,
   SESSION_TURNS_MAP_FILE,
+  TEMP_SESSION_LEASES_FILE,
 } from './paths'
 import { log } from './log'
 import { writeJsonStateAtomic, writeStateFileAtomic } from './state-store'
@@ -44,6 +45,85 @@ import {
 const APP_ID = config.feishu.app_id
 const APP_SECRET = config.feishu.app_secret
 export const PROJECTS_ROOT = config.runtime.projects_root
+
+// ── Temporary-session leases ──────────────────────────────────────────
+// `chatId → {sessionName, chatId, createdAt}`。临时群运行时建群成功即登记,
+// bye 解散前必须通过 hasTempSessionLease 守卫(只删自己建的那一个群)。
+export interface TempSessionLease {
+  sessionName: string
+  chatId: string
+  createdAt: number
+}
+
+const tempSessionLeaseByChat = new Map<string, TempSessionLease>()
+
+function saveTempSessionLeases(): void {
+  const value: Record<string, TempSessionLease> = {}
+  for (const [chatId, lease] of tempSessionLeaseByChat) value[chatId] = lease
+  writeJsonStateAtomic(TEMP_SESSION_LEASES_FILE, value)
+}
+
+export function loadTempSessionLeases(): void {
+  tempSessionLeaseByChat.clear()
+  try {
+    const value = JSON.parse(readFileSync(TEMP_SESSION_LEASES_FILE, 'utf8'))
+    if (!value || typeof value !== 'object' || Array.isArray(value)) throw new Error('lease file must contain an object')
+    for (const [chatId, raw] of Object.entries(value)) {
+      const lease = raw as Partial<TempSessionLease>
+      if (
+        typeof chatId !== 'string' || !chatId
+        || lease.chatId !== chatId
+        || typeof lease.sessionName !== 'string' || !tempProjectName(lease.sessionName)
+        || typeof lease.createdAt !== 'number' || !Number.isFinite(lease.createdAt)
+      ) {
+        log(`feishu: rejected malformed temp-session lease chat=${chatId}`)
+        continue
+      }
+      tempSessionLeaseByChat.set(chatId, {
+        chatId,
+        sessionName: lease.sessionName,
+        createdAt: lease.createdAt,
+      })
+    }
+    log(`feishu: loaded ${tempSessionLeaseByChat.size} temporary-session leases`)
+  } catch (error: any) {
+    if (error?.code !== 'ENOENT') log(`feishu: load temp-session leases failed: ${error?.message ?? error}`)
+  }
+}
+
+export function registerTempSessionLease(sessionName: string, chatId: string): void {
+  if (!tempProjectName(sessionName)) throw new Error(`refusing to lease non-temporary session name "${sessionName}"`)
+  if (!chatId) throw new Error('cannot lease a temporary session without chat_id')
+  for (const lease of tempSessionLeaseByChat.values()) {
+    if (lease.sessionName === sessionName && lease.chatId !== chatId) {
+      throw new Error(`temporary session name "${sessionName}" is already leased to ${lease.chatId}`)
+    }
+  }
+  const previous = tempSessionLeaseByChat.get(chatId)
+  const lease = { sessionName, chatId, createdAt: Date.now() }
+  tempSessionLeaseByChat.set(chatId, lease)
+  try { saveTempSessionLeases() } catch (error) {
+    if (previous) tempSessionLeaseByChat.set(chatId, previous)
+    else tempSessionLeaseByChat.delete(chatId)
+    throw error
+  }
+}
+
+export function hasTempSessionLease(sessionName: string, chatId: string): boolean {
+  const lease = tempSessionLeaseByChat.get(chatId)
+  return lease?.sessionName === sessionName && lease.chatId === chatId
+}
+
+export function clearTempSessionLease(sessionName: string, chatId?: string): void {
+  const matches = [...tempSessionLeaseByChat.entries()]
+    .filter(([id, lease]) => lease.sessionName === sessionName && (!chatId || id === chatId))
+  if (!matches.length) return
+  for (const [id] of matches) tempSessionLeaseByChat.delete(id)
+  try { saveTempSessionLeases() } catch (error) {
+    for (const [id, lease] of matches) tempSessionLeaseByChat.set(id, lease)
+    throw error
+  }
+}
 
 /** Per-project launch profile for `sessionName`, or undefined when the
  * project runs with Lodestar defaults. Sourced from `[projects.<name>].*`
@@ -119,11 +199,14 @@ export function loadSessionChatMap(): void {
 }
 
 function saveSessionChatMap(): void {
-  try {
-    const obj: Record<string, string> = {}
-    for (const [k, v] of preferredChatForSession) obj[k] = v
-    writeJsonStateAtomic(SESSION_CHAT_MAP_FILE, obj)
-  } catch (e) { log(`feishu: save session-chat-map failed: ${e}`) }
+  try { saveSessionChatMapChecked() }
+  catch (e) { log(`feishu: save session-chat-map failed: ${e}`) }
+}
+
+function saveSessionChatMapChecked(): void {
+  const obj: Record<string, string> = {}
+  for (const [k, v] of preferredChatForSession) obj[k] = v
+  writeJsonStateAtomic(SESSION_CHAT_MAP_FILE, obj)
 }
 
 export function bindSessionToChat(sessionName: string, chatId: string): void {
@@ -143,68 +226,209 @@ export function unbindSessionChat(sessionName: string): void {
 }
 
 // ── Session resume map ────────────────────────────────────────────────
-// `sessionName → provider → last-known thread/session id`. Persisted so
+// `sessionName → provider → last-known backend conversation`. Persisted so
 // daemon restarts don't strand the user with a fresh conversation when
 // they next type `restart`. Updated when a turn starts, not when it
 // finishes, so in-flight turns are resumable after daemon exit.
-const lastSessionIdByName = new Map<string, Partial<Record<AgentProvider, string>>>()
+const lastSessionRefByName = new Map<string, Partial<Record<AgentProvider, ConversationRef>>>()
 
-function setSessionResumeInMemory(sessionName: string, provider: AgentProvider, sessionId: string): void {
-  const entry = lastSessionIdByName.get(sessionName) ?? {}
-  entry[provider] = sessionId
-  lastSessionIdByName.set(sessionName, entry)
+function setSessionResumeInMemory(sessionName: string, ref: ConversationRef): void {
+  const entry = lastSessionRefByName.get(sessionName) ?? {}
+  entry[ref.provider] = ref
+  lastSessionRefByName.set(sessionName, entry)
+}
+
+function parsePersistedResumeRef(value: unknown, expectedProvider?: AgentProvider): ConversationRef | null {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return null
+  const record = value as Record<string, unknown>
+  const provider = record.provider === 'claude' || record.provider === 'codex'
+    ? record.provider
+    : expectedProvider ?? null
+  if (!provider || (expectedProvider && provider !== expectedProvider)) return null
+  const sessionId = typeof record.sessionId === 'string'
+    ? record.sessionId.trim()
+    : typeof record.session_id === 'string'
+      ? record.session_id.trim()
+      : ''
+  if (!sessionId) return null
+
+  // Missing cwd belongs to a pre-ConversationRef state shape. Preserve it as
+  // null so callers can fail closed instead of resuming it in today's cwd.
+  if (record.cwd === undefined || record.cwd === null) return { provider, sessionId, cwd: null }
+  if (typeof record.cwd !== 'string' || !isAbsolute(record.cwd)) return null
+  return { provider, sessionId, cwd: record.cwd }
+}
+
+function validateSessionResumeWrite(ref: ConversationRef): ConversationRef {
+  const sessionId = ref.sessionId.trim()
+  if (!sessionId) throw new Error('cannot bind an empty conversation session id')
+  if (ref.provider !== 'codex' && ref.provider !== 'claude') {
+    throw new Error(`cannot bind an unknown conversation provider: ${String(ref.provider)}`)
+  }
+  if (typeof ref.cwd !== 'string' || !isAbsolute(ref.cwd)) {
+    throw new Error(`cannot bind a conversation without an absolute cwd: ${String(ref.cwd)}`)
+  }
+  return { provider: ref.provider, sessionId, cwd: ref.cwd }
+}
+
+function sessionResumeRefFromArgs(
+  sessionIdOrRef: string | ConversationRef,
+  provider?: AgentProvider,
+  cwd?: string,
+): ConversationRef {
+  if (typeof sessionIdOrRef !== 'string') return validateSessionResumeWrite(sessionIdOrRef)
+  if (!provider) throw new Error('cannot bind a conversation without a provider')
+  // 本地兼容通道(翻译表 #7):string 老签名缺 cwd → cwd:null(legacy 形态,
+  // 后端权威元数据升级前 fail-closed 读取),既有全仓调用点
+  // bindSessionResume(name, id, provider) 零改动。显式传 cwd 则按上游
+  // fail-closed 校验绝对性。ConversationRef 对象形态始终要求绝对 cwd。
+  if (cwd === undefined) {
+    const sessionId = sessionIdOrRef.trim()
+    if (!sessionId) throw new Error('cannot bind an empty conversation session id')
+    return { provider, sessionId, cwd: null }
+  }
+  return validateSessionResumeWrite({ provider, sessionId: sessionIdOrRef, cwd })
 }
 
 export function loadSessionResumeMap(): void {
   try {
     const obj = JSON.parse(readFileSync(SESSION_RESUME_MAP_FILE, 'utf8'))
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      throw new Error('resume map must contain an object')
+    }
+    lastSessionRefByName.clear()
     for (const [name, value] of Object.entries(obj)) {
       if (typeof value === 'string' && value.trim()) {
-        setSessionResumeInMemory(name, 'codex', value)
+        setSessionResumeInMemory(name, { provider: 'codex', sessionId: value.trim(), cwd: null })
         continue
       }
-      if (!value || typeof value !== 'object') continue
+      if (!value || typeof value !== 'object' || Array.isArray(value)) continue
       const record = value as Record<string, unknown>
-      const provider = record.provider === 'claude' || record.provider === 'codex'
-        ? record.provider
-        : null
-      const sessionId = typeof record.sessionId === 'string'
-        ? record.sessionId
-        : typeof record.session_id === 'string'
-          ? record.session_id
-          : null
-      if (provider && sessionId?.trim()) {
-        setSessionResumeInMemory(name, provider, sessionId)
+      const singleRef = parsePersistedResumeRef(record)
+      if (singleRef) {
+        setSessionResumeInMemory(name, singleRef)
         continue
       }
       for (const p of ['codex', 'claude'] as const) {
-        const id = record[p]
-        if (typeof id === 'string' && id.trim()) setSessionResumeInMemory(name, p, id)
+        const persisted = record[p]
+        if (typeof persisted === 'string' && persisted.trim()) {
+          setSessionResumeInMemory(name, { provider: p, sessionId: persisted.trim(), cwd: null })
+          continue
+        }
+        const ref = parsePersistedResumeRef(persisted, p)
+        if (ref) setSessionResumeInMemory(name, ref)
       }
     }
-    log(`feishu: loaded ${lastSessionIdByName.size} session→resume bindings`)
+    log(`feishu: loaded ${lastSessionRefByName.size} session→resume bindings`)
   } catch (e: any) {
     if (e?.code !== 'ENOENT') log(`feishu: load session-resume-map failed: ${e?.message ?? e}`)
   }
 }
 
 function saveSessionResumeMap(): void {
-  try {
-    const obj: Record<string, Partial<Record<AgentProvider, string>>> = {}
-    for (const [k, v] of lastSessionIdByName) obj[k] = { ...v }
-    writeJsonStateAtomic(SESSION_RESUME_MAP_FILE, obj)
-  } catch (e) { log(`feishu: save session-resume-map failed: ${e}`) }
+  try { saveSessionResumeMapChecked() }
+  catch (e) { log(`feishu: save session-resume-map failed: ${e}`) }
 }
 
-export function bindSessionResume(sessionName: string, sessionId: string, provider: AgentProvider = 'codex'): void {
-  const prev = lastSessionIdByName.get(sessionName)?.[provider]
-  if (prev === sessionId) return
-  setSessionResumeInMemory(sessionName, provider, sessionId)
+function saveSessionResumeMapChecked(): void {
+  const obj: Record<string, Partial<Record<AgentProvider, ConversationRef>>> = {}
+  for (const [sessionName, refs] of lastSessionRefByName) {
+    const persisted: Partial<Record<AgentProvider, ConversationRef>> = {}
+    if (refs.codex) persisted.codex = { ...refs.codex }
+    if (refs.claude) persisted.claude = { ...refs.claude }
+    obj[sessionName] = persisted
+  }
+  writeJsonStateAtomic(SESSION_RESUME_MAP_FILE, obj)
+}
+
+export function bindSessionResume(sessionName: string, ref: ConversationRef): void
+export function bindSessionResume(
+  sessionName: string,
+  sessionId: string,
+  provider?: AgentProvider,
+  cwd?: string,
+): void
+export function bindSessionResume(
+  sessionName: string,
+  sessionIdOrRef: string | ConversationRef,
+  provider: AgentProvider = 'codex',
+  cwd?: string,
+): void {
+  const ref = sessionResumeRefFromArgs(sessionIdOrRef, provider, cwd)
+  const prev = lastSessionRefByName.get(sessionName)?.[ref.provider]
+  if (prev?.sessionId === ref.sessionId && prev.cwd === ref.cwd) return
+  setSessionResumeInMemory(sessionName, ref)
   saveSessionResumeMap()
 }
 
+export function bindSessionResumeChecked(sessionName: string, ref: ConversationRef): void
+export function bindSessionResumeChecked(
+  sessionName: string,
+  sessionId: string,
+  provider?: AgentProvider,
+  cwd?: string,
+): void
+export function bindSessionResumeChecked(
+  sessionName: string,
+  sessionIdOrRef: string | ConversationRef,
+  provider: AgentProvider = 'codex',
+  cwd?: string,
+): void {
+  const ref = sessionResumeRefFromArgs(sessionIdOrRef, provider, cwd)
+  const previous = lastSessionRefByName.get(sessionName)
+  const previousCopy = previous ? { ...previous } : undefined
+  const previousRef = previous?.[ref.provider]
+  if (previousRef?.sessionId === ref.sessionId && previousRef.cwd === ref.cwd) return
+  setSessionResumeInMemory(sessionName, ref)
+  try { saveSessionResumeMapChecked() } catch (error) {
+    if (previousCopy) lastSessionRefByName.set(sessionName, previousCopy)
+    else lastSessionRefByName.delete(sessionName)
+    throw error
+  }
+}
+
 export function getSessionResume(sessionName: string, provider: AgentProvider = 'codex'): string | null {
-  return lastSessionIdByName.get(sessionName)?.[provider] ?? null
+  return lastSessionRefByName.get(sessionName)?.[provider]?.sessionId ?? null
+}
+
+export function getSessionResumeRef(
+  sessionName: string,
+  provider: AgentProvider = 'codex',
+): ConversationRef | null {
+  const ref = lastSessionRefByName.get(sessionName)?.[provider]
+  return ref ? { ...ref } : null
+}
+
+/** Remove one provider's resume id, or every provider id when omitted. */
+export function clearSessionResume(sessionName: string, provider?: AgentProvider): void {
+  const entry = lastSessionRefByName.get(sessionName)
+  if (!entry) return
+  if (!provider) {
+    lastSessionRefByName.delete(sessionName)
+    saveSessionResumeMap()
+    return
+  }
+  if (entry[provider] === undefined) return
+  delete entry[provider]
+  if (!entry.codex && !entry.claude) lastSessionRefByName.delete(sessionName)
+  saveSessionResumeMap()
+}
+
+export function clearSessionResumeChecked(sessionName: string, provider?: AgentProvider): void {
+  const previous = lastSessionRefByName.get(sessionName)
+  if (!previous || (provider && previous[provider] === undefined)) return
+  const previousCopy = { ...previous }
+  if (!provider) lastSessionRefByName.delete(sessionName)
+  else {
+    const next = { ...previous }
+    delete next[provider]
+    if (!next.codex && !next.claude) lastSessionRefByName.delete(sessionName)
+    else lastSessionRefByName.set(sessionName, next)
+  }
+  try { saveSessionResumeMapChecked() } catch (error) {
+    lastSessionRefByName.set(sessionName, previousCopy)
+    throw error
+  }
 }
 
 // ── Session turns map (fk/bk checkpoints) ──────────────────────────
@@ -466,7 +690,7 @@ export function loadSessionTurnsMap(): void {
         rejected++
         continue
       }
-      const resumes = lastSessionIdByName.get(name)
+      const resumes = lastSessionRefByName.get(name)
       // A V1 chain can contain ancestor Claude session ids, so equality with
       // the current resume id proves nothing. Only an unambiguous Claude-only
       // resume binding lets us interpret its provider-less UUID checkpoints.
@@ -672,12 +896,14 @@ export function tempProjectName(sessionName: string): string | null {
   return TEMP_SUFFIX_RE.test(sessionName) ? sessionName.replace(TEMP_SUFFIX_RE, '') : null
 }
 
-/** 拼临时群名:projectName*MMDD-HHMM。同分钟已有同名则加 -2、-3… 去重。 */
-export function tempChatName(projectName: string): string {
+/** 拼临时群名:projectName*MMDD-HHMM。同分钟已有同名则加 -2、-3… 去重。
+ *  additionallyUsed:调用方额外占用的名字集(reserveTempChatName in-flight
+ *  保留集,防同分钟并发建群撞名——上游 ff44afb 第二参)。 */
+export function tempChatName(projectName: string, additionallyUsed: Iterable<string> = []): string {
   const d = new Date()
   const pad = (n: number) => String(n).padStart(2, '0')
   const stamp = `${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`
-  const used = new Set<string>([...chatNameCache.values(), ...turnsBySession.keys()])
+  const used = new Set<string>([...chatNameCache.values(), ...turnsBySession.keys(), ...additionallyUsed])
   let name = `${projectName}*${stamp}`
   for (let seq = 2; used.has(name); seq++) name = `${projectName}*${stamp}-${seq}`
   return name
@@ -733,11 +959,14 @@ export function loadSessionModelMap(): void {
 }
 
 function saveSessionModelMap(): void {
-  try {
-    const obj: Record<string, SessionModelSelection> = {}
-    for (const [k, v] of selectedModelByName) obj[k] = v
-    writeJsonStateAtomic(SESSION_MODEL_MAP_FILE, obj)
-  } catch (e) { log(`feishu: save session-model-map failed: ${e}`) }
+  try { saveSessionModelMapChecked() }
+  catch (e) { log(`feishu: save session-model-map failed: ${e}`) }
+}
+
+function saveSessionModelMapChecked(): void {
+  const obj: Record<string, SessionModelSelection> = {}
+  for (const [k, v] of selectedModelByName) obj[k] = v
+  writeJsonStateAtomic(SESSION_MODEL_MAP_FILE, obj)
 }
 
 export function bindSessionModel(
@@ -752,16 +981,83 @@ export function bindSessionModel(
   saveSessionModelMap()
 }
 
+/** 临时群创建事务写 direct 档位快照用(checked 统一模式:写失败回滚内存)。
+ *  签名对齐本地 bindSessionModel(D-02 slim 层:无 tokenSourceId、model 不为
+ *  null——本地固定档位目录自始只存 string model,上游 null-model 旧记录形态
+ *  本地不存在)。 */
+export function bindSessionModelChecked(
+  sessionName: string,
+  provider: AgentProvider,
+  model: string,
+  effort: AgentReasoningEffort | null,
+): void {
+  const previous = selectedModelByName.get(sessionName)
+  if (previous?.provider === provider && previous.model === model && previous.effort === effort) return
+  selectedModelByName.set(sessionName, { provider, model, effort })
+  try { saveSessionModelMapChecked() } catch (error) {
+    if (previous) selectedModelByName.set(sessionName, previous)
+    else selectedModelByName.delete(sessionName)
+    throw error
+  }
+}
+
 export function getSessionModelSelection(sessionName: string): SessionModelSelection | null {
   return selectedModelByName.get(sessionName) ?? null
 }
 
 /** 删除某 session 的 model 绑定。临时群 bye 解散、或首启失败回滚时调,
- *  避免 `*MMDD-HHMM` 废记录在 model map 里堆积。不存在则 no-op。 */
+ *  避免 `*MMDD-HHMM` 废记录在 model map 里堆积。不存在则 no-op。
+ *  (等价于上游 clearSessionModelSelection,本地既有命名保留。) */
 export function unbindSessionModel(sessionName: string): void {
   if (!selectedModelByName.has(sessionName)) return
   selectedModelByName.delete(sessionName)
   saveSessionModelMap()
+}
+
+/**
+ * Remove conversation-scoped state after a session has been permanently
+ * deleted. Callers must not use this for ordinary provider switches/restarts.
+ */
+export function clearSessionConversationState(sessionName: string): void {
+  const previousChat = preferredChatForSession.get(sessionName)
+  const previousResume = lastSessionRefByName.get(sessionName)
+  const previousModel = selectedModelByName.get(sessionName)
+  const previousTurns = turnsBySession.get(sessionName)
+  const previousLeases = [...tempSessionLeaseByChat.entries()]
+    .filter(([, lease]) => lease.sessionName === sessionName)
+
+  preferredChatForSession.delete(sessionName)
+  lastSessionRefByName.delete(sessionName)
+  selectedModelByName.delete(sessionName)
+  turnsBySession.delete(sessionName)
+  for (const [chatId] of previousLeases) tempSessionLeaseByChat.delete(chatId)
+
+  try {
+    saveSessionChatMapChecked()
+    saveSessionResumeMapChecked()
+    saveSessionModelMapChecked()
+    saveSessionTurnsMapChecked()
+    saveTempSessionLeases()
+  } catch (error) {
+    if (previousChat) preferredChatForSession.set(sessionName, previousChat)
+    if (previousResume) lastSessionRefByName.set(sessionName, previousResume)
+    if (previousModel) selectedModelByName.set(sessionName, previousModel)
+    if (previousTurns) turnsBySession.set(sessionName, previousTurns)
+    for (const [chatId, lease] of previousLeases) tempSessionLeaseByChat.set(chatId, lease)
+    const failures: unknown[] = [error]
+    for (const save of [
+      saveSessionChatMapChecked,
+      saveSessionResumeMapChecked,
+      saveSessionModelMapChecked,
+      saveSessionTurnsMapChecked,
+      saveTempSessionLeases,
+    ]) {
+      try { save() } catch (restoreError) { failures.push(restoreError) }
+    }
+    throw failures.length === 1
+      ? failures[0]
+      : new AggregateError(failures, `failed to clear and restore conversation state for ${sessionName}`)
+  }
 }
 
 export function getSessionModel(sessionName: string): string | null {
@@ -895,6 +1191,32 @@ export async function ensureChatForSession(sessionName: string, userOpenId: stri
   return { chatId, created: true, joined: true }
 }
 
+/** Create a brand-new temporary chat; never join/reuse an existing same-name chat. */
+export async function createTempChatForSession(
+  sessionName: string,
+  userOpenId: string,
+): Promise<{ chatId: string; created: true; joined: true }> {
+  if (!userOpenId) throw new Error('missing sender open_id; cannot create temporary group')
+  const existing = await findNormalChatIdByName(sessionName)
+  if (existing) throw new Error(`temporary group name already exists: ${sessionName}`)
+  const res = await client.im.chat.create({
+    params: { user_id_type: 'open_id', uuid: randomUUID() },
+    data: {
+      name: sessionName,
+      user_id_list: [userOpenId],
+      group_message_type: 'chat',
+    },
+  })
+  if (res.code && res.code !== 0) {
+    throw new Error(`feishu chat.create failed code=${res.code} msg=${res.msg}`)
+  }
+  const chatId = res.data?.chat_id
+  if (!chatId) throw new Error('feishu chat.create returned no chat_id')
+  chatNameCache.set(chatId, sessionName)
+  bindSessionToChat(sessionName, chatId)
+  return { chatId, created: true, joined: true }
+}
+
 export async function disbandChatForSession(sessionName: string): Promise<{ chatId: string | null; disbanded: boolean }> {
   const chatId = await findNormalChatIdByName(sessionName)
   if (!chatId) {
@@ -906,7 +1228,28 @@ export async function disbandChatForSession(sessionName: string): Promise<{ chat
     throw new Error(`feishu chat.delete failed code=${res.code} msg=${res.msg}`)
   }
   chatNameCache.delete(chatId)
-  unbindSessionChat(sessionName)
+  if (preferredChatForSession.get(sessionName) === chatId) unbindSessionChat(sessionName)
+  return { chatId, disbanded: true }
+}
+
+/** Delete one already-resolved chat only after confirming its current name. */
+export async function disbandChatForSessionExact(
+  sessionName: string,
+  chatId: string,
+): Promise<{ chatId: string; disbanded: boolean }> {
+  if (!chatId) throw new Error('cannot disband a temporary session without an exact chat_id')
+  const status = await fetchChatStatus(chatId)
+  if (status.name !== sessionName) {
+    throw new Error(`refusing to delete chat ${chatId}: expected name "${sessionName}", got "${status.name ?? ''}"`)
+  }
+  if (!isNormalChatStatus(status.status)) {
+    throw new Error(`refusing to delete chat ${chatId}: status=${status.status ?? 'unknown'}`)
+  }
+  const res = await client.im.chat.delete({ path: { chat_id: chatId } })
+  if (res.code && res.code !== 0) {
+    throw new Error(`feishu chat.delete failed code=${res.code} msg=${res.msg}`)
+  }
+  chatNameCache.delete(chatId)
   return { chatId, disbanded: true }
 }
 

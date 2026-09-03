@@ -72,6 +72,8 @@ export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
  *  key = sessionName(主群名或 <project>*MMDD-HHMM 临时群名)。 */
 export const SESSION_TURNS_MAP_FILE = join(DATA_DIR, 'session-turns-map.json')
 export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
+/** Exact chats created by the temporary-session runtime; required before `bye` may delete. */
+export const TEMP_SESSION_LEASES_FILE = join(DATA_DIR, 'temp-session-leases.json')
 export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
 /** Persisted registrations for `/notify` cards that carry interactive
  * buttons. Each entry binds a `notify_id` → caller-supplied loopback
