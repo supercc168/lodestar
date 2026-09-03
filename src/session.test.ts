@@ -13,7 +13,8 @@ import { NothingToCompactError, type CodexUserTextSettlement, type UserTextDispa
 import { CodexRpcResponseError } from './codex-process'
 import {
   addedReactions, boundResumes, branchBaseBySession, clearedResumes, clearedTurnAnchors, deletedReactions,
-  feishuMockState, projectProfiles, resetFeishuMock, resumeRefs, sentCards, sentRawTexts, sentTexts,
+  feishuMockState, pendingConversationLaunchBySession, projectProfiles, resetFeishuMock, resumeRefs,
+  seededTurnAnchors, sentCards, sentRawTexts, sentTexts,
   setResumeWriteError, setTurnAnchorWriteError, truncatedTurnAnchors, turnAnchorsBySession, updatedCards, urgentPushes,
 } from './feishu-test-mock'
 import type { ConversationCheckpoint, ConversationRef } from './conversation'
@@ -11474,6 +11475,280 @@ describe('Session conversation launch 数据流(上游 ff44afb 簇 1)', () => {
     expect(branchBaseBySession.get(session.sessionName)).toBeNull()
     expect(session.lastSessionId).toBe('codex-old')
     expect(session.lastSessionRef).toEqual({ provider: 'codex', sessionId: 'codex-old', cwd: null })
+  })
+})
+
+// ── 上游 ff44afb/4185808 簇 2:rollbackTo/startForked 补偿事务 ──────────────
+// 八项快照 → (Claude fork)precommit pendingLaunch → restart/start 经本地 lease
+// 通道 → candidate/candidateStopped 判定序逐字(陷阱 9:停不掉绝不 restore)→
+// 成功 commit branchState / 失败 restore(含挂账 #5 invalidatedPreviousResume
+// 分支)。本地守卫叠加:lease 失效时事务中止不写状态。
+describe('Session rollbackTo/startForked 补偿事务(4185808 终态,挂账 #5/陷阱 9)', () => {
+  const claudeAnchor = (session: any, id: string, sessionId: string) => ({
+    checkpoint: {
+      provider: 'claude' as const, kind: 'assistant-message' as const, id,
+      source: { provider: 'claude' as const, sessionId, cwd: session.workDir },
+    },
+    preview: 'old input', ts: 1, writes: [],
+  })
+  const codexAnchor = (session: any, id: string, sessionId: string) => ({
+    checkpoint: {
+      provider: 'codex' as const, kind: 'turn' as const, id,
+      source: { provider: 'codex' as const, sessionId, cwd: session.workDir },
+    },
+    preview: 'old input', ts: 1, writes: [],
+  })
+
+  test('rollback stops an attached replacement when restart throws after it became ready', async () => {
+    const session = new Session('rollback-ready-throw', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'old-session'
+    session.lastSessionRef = { provider: 'claude', sessionId: 'old-session', cwd: session.workDir }
+    resumeRefs.set(`${session.sessionName}:claude`, { provider: 'claude', sessionId: 'old-session', cwd: session.workDir })
+    const oldAnchor = claudeAnchor(session, 'assistant-old', 'old-session')
+    turnAnchorsBySession.set(session.sessionName, [oldAnchor])
+    branchBaseBySession.set(session.sessionName, { kind: 'fresh' })
+    const replacement = new FakeAgentProc('claude', 'replacement-session')
+    session.restart = async () => {
+      session.proc = replacement
+      session.lastSessionId = 'replacement-session'
+      session.lastSessionRef = { provider: 'claude', sessionId: 'replacement-session', cwd: session.workDir }
+      session.status = 'idle'
+      throw new Error('ready callback failed')
+    }
+
+    await expect(session.rollbackTo({
+      kind: 'resume',
+      source: { provider: 'claude', sessionId: 'source-session', cwd: session.workDir },
+    })).rejects.toThrow('ready callback failed')
+
+    // 替换进程被停,停成功才 restore 旧快照(resume 绑定/锚/base 全部回滚)
+    expect(replacement.killCalls).toBe(1)
+    expect(session.proc).toBeNull()
+    expect(session.status).toBe('stopped')
+    expect(session.lastSessionId).toBe('old-session')
+    expect(session.lastSessionRef?.sessionId).toBe('old-session')
+    expect(resumeRefs.get(`${session.sessionName}:claude`)?.sessionId).toBe('old-session')
+    expect(turnAnchorsBySession.get(session.sessionName)).toEqual([oldAnchor])
+    expect(branchBaseBySession.get(session.sessionName)).toEqual({ kind: 'fresh' })
+  })
+
+  test('rollback keeps replacement binding when the replacement cannot be stopped(停不掉绝不 restore,陷阱 9)', async () => {
+    const session = new Session('rollback-stop-fail', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'old-session'
+    session.lastSessionRef = { provider: 'claude', sessionId: 'old-session', cwd: session.workDir }
+    resumeRefs.set(`${session.sessionName}:claude`, { provider: 'claude', sessionId: 'old-session', cwd: session.workDir })
+    turnAnchorsBySession.set(session.sessionName, [claudeAnchor(session, 'assistant-old', 'old-session')])
+    const replacement = new FakeAgentProc('claude', 'replacement-session')
+    replacement.kill = async () => {
+      replacement.killCalls++
+      throw new Error('kill timeout') // alive 保持 true:停止未确认
+    }
+    session.restart = async () => {
+      session.proc = replacement
+      session.lastSessionId = 'replacement-session'
+      session.lastSessionRef = { provider: 'claude', sessionId: 'replacement-session', cwd: session.workDir }
+      throw new Error('ready callback failed')
+    }
+
+    await expect(session.rollbackTo({
+      kind: 'resume',
+      source: { provider: 'claude', sessionId: 'source-session', cwd: session.workDir },
+    })).rejects.toThrow('rollback launch and cleanup failed')
+
+    // 真失败路径:替换进程停不掉 → lastSessionRef/lastSessionId 未被改写回旧值,
+    // 不发生任何 restore 写(旧 resume id 绝不指回,防两会话并存冲突)
+    expect(replacement.isAlive()).toBe(true)
+    expect(session.lastSessionId).toBe('replacement-session')
+    expect(session.lastSessionRef?.sessionId).toBe('replacement-session')
+    expect(boundResumes).toEqual([])
+    expect(seededTurnAnchors).toEqual([])
+  })
+
+  test('rollback commits branch state atomically after the replacement is ready(成功才换)', async () => {
+    const session = new Session('rollback-commit', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'previous-thread'
+    const oldAnchor = codexAnchor(session, 'turn-old', 'previous-thread')
+    turnAnchorsBySession.set(session.sessionName, [oldAnchor])
+    session.restart = async () => true
+    const source = { provider: 'codex' as const, sessionId: 'source-thread', cwd: session.workDir }
+    const launch = {
+      kind: 'fork' as const, source,
+      through: { provider: 'codex' as const, kind: 'turn' as const, id: 'turn-3', source },
+    }
+    const seedAnchor = codexAnchor(session, 'turn-2', 'source-thread')
+
+    const ok = await session.rollbackTo(launch, { anchors: [seedAnchor], base: launch })
+
+    expect(ok).toBe(true)
+    expect(turnAnchorsBySession.get(session.sessionName)).toEqual([seedAnchor])
+    expect(branchBaseBySession.get(session.sessionName)).toEqual(launch)
+    // codex fork 无 Claude pendingLaunch
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(false)
+  })
+
+  test('rollback branch commit failure stops the replacement and restores the resume snapshot', async () => {
+    const session = new Session('rollback-commit-fail', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'old-thread'
+    session.lastSessionRef = { provider: 'codex', sessionId: 'old-thread', cwd: session.workDir }
+    resumeRefs.set(`${session.sessionName}:codex`, { provider: 'codex', sessionId: 'old-thread', cwd: session.workDir })
+    const replacement = new FakeAgentProc('codex', 'forked-thread')
+    session.restart = async () => {
+      session.proc = replacement
+      session.lastSessionId = 'forked-thread'
+      session.lastSessionRef = { provider: 'codex', sessionId: 'forked-thread', cwd: session.workDir }
+      // commit 阶段的 replaceTurnAnchors 写失败(restart 成功后才注入)
+      setTurnAnchorWriteError(new Error('turn state fsync failed'))
+      return true
+    }
+    const source = { provider: 'codex' as const, sessionId: 'source-thread', cwd: session.workDir }
+    const launch = { kind: 'fork' as const, source }
+
+    try {
+      await expect(session.rollbackTo(launch, { anchors: [], base: launch }))
+        .rejects.toThrow('rollback branch commit failed')
+    } finally {
+      setTurnAnchorWriteError(null)
+    }
+
+    // commit 失败 → 停替换进程 + restore(resume 绑定回滚;锚写通道已坏属 restoreError 上抛)
+    expect(replacement.killCalls).toBe(1)
+    expect(session.proc).toBeNull()
+    expect(session.lastSessionId).toBe('old-thread')
+    expect(session.lastSessionRef?.sessionId).toBe('old-thread')
+    expect(resumeRefs.get(`${session.sessionName}:codex`)?.sessionId).toBe('old-thread')
+  })
+
+  test('Claude rs precommits pending fork intent before restart and restores it on failure', async () => {
+    const session = new Session('pending-rollback', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'previous-session'
+    session.lastSessionRef = { provider: 'claude', sessionId: 'previous-session', cwd: session.workDir }
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    let sawPrecommit = false
+    session.restart = async () => {
+      sawPrecommit = pendingConversationLaunchBySession.get(session.sessionName)?.launch.source.sessionId === 'source-session'
+      return false
+    }
+
+    const ok = await session.rollbackTo(launch, { anchors: [], base: launch })
+
+    expect(ok).toBe(false)
+    expect(sawPrecommit).toBe(true)
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingConversationMaterialization).toBeNull()
+  })
+
+  test('Claude startForked persists pending intent before startup grace,成功后 durable marker 保留', async () => {
+    const session = new Session('pending-start-forked', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.lastSessionId = null
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    let sawPrecommit = false
+    session.start = async () => {
+      sawPrecommit = pendingConversationLaunchBySession.has(session.sessionName)
+      return true
+    }
+
+    expect(await session.startForked(launch)).toBe(true)
+    // precommit 先于 spawn(start);成功后 durable marker 保留到首个 result 消费
+    expect(sawPrecommit).toBe(true)
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
+    expect(session.pendingConversationMaterialization?.launch).toEqual(launch)
+    expect(session.pendingConversationLaunch).toBeNull()
+  })
+
+  test('Claude startForked start 失败恢复 pending intent 原值(不留半提交态)', async () => {
+    const session = new Session('pending-start-forked-fail', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    session.start = async () => false
+
+    expect(await session.startForked(launch)).toBe(false)
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingConversationMaterialization).toBeNull()
+  })
+
+  test('restore clears an invalidated ghost binding instead of rebinding it(挂账 #5)', async () => {
+    const session = new Session('rollback-ghost', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'ghost-thread'
+    session.lastSessionRef = { provider: 'codex', sessionId: 'ghost-thread', cwd: session.workDir }
+    resumeRefs.set(`${session.sessionName}:codex`, { provider: 'codex', sessionId: 'ghost-thread', cwd: session.workDir })
+    session.restart = async (_resume: boolean, opts: any) => {
+      // 模拟 restart 内 invalidateMissingCodexResume:app-server 确认 ghost 无 rollout
+      resumeRefs.delete(`${session.sessionName}:codex`)
+      session.lastSessionRef = null
+      session.lastSessionId = null
+      opts.onResumeInvalidated?.('ghost-thread')
+      return false
+    }
+    const source = { provider: 'codex' as const, sessionId: 'ghost-thread', cwd: session.workDir }
+
+    const ok = await session.rollbackTo({ kind: 'fork', source })
+
+    expect(ok).toBe(false)
+    // 幽灵 id 不得绑回:restore 走清空分支
+    expect(session.lastSessionId).toBeNull()
+    expect(session.lastSessionRef).toBeNull()
+    expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+    expect(clearedResumes).toContainEqual([session.sessionName, 'codex'])
+  })
+
+  test('restore rebinds the previous resume when invalidation targeted a different id(挂账 #5 负例)', async () => {
+    const session = new Session('rollback-ghost-mismatch', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'old-thread'
+    session.lastSessionRef = { provider: 'codex', sessionId: 'old-thread', cwd: session.workDir }
+    resumeRefs.set(`${session.sessionName}:codex`, { provider: 'codex', sessionId: 'old-thread', cwd: session.workDir })
+    session.restart = async (_resume: boolean, opts: any) => {
+      opts.onResumeInvalidated?.('some-other-thread') // 与 previous 不匹配:不置位
+      return false
+    }
+    const source = { provider: 'codex' as const, sessionId: 'source-thread', cwd: session.workDir }
+
+    const ok = await session.rollbackTo({ kind: 'fork', source })
+
+    expect(ok).toBe(false)
+    expect(session.lastSessionId).toBe('old-thread')
+    expect(session.lastSessionRef?.sessionId).toBe('old-thread')
+    expect(resumeRefs.get(`${session.sessionName}:codex`)?.sessionId).toBe('old-thread')
+  })
+
+  test('rollback aborts without state writes when the lifecycle lease is lost during restart(本地守卫叠加)', async () => {
+    const session = new Session('rollback-lease-lost', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.lastSessionId = 'old-thread'
+    session.lastSessionRef = { provider: 'codex', sessionId: 'old-thread', cwd: session.workDir }
+    resumeRefs.set(`${session.sessionName}:codex`, { provider: 'codex', sessionId: 'old-thread', cwd: session.workDir })
+    const oldAnchor = codexAnchor(session, 'turn-old', 'old-thread')
+    turnAnchorsBySession.set(session.sessionName, [oldAnchor])
+    session.restart = async () => {
+      session.beginLifecycle('stop') // 并发 lifecycle 抢占
+      return false
+    }
+    const source = { provider: 'codex' as const, sessionId: 'source-thread', cwd: session.workDir }
+
+    const ok = await session.rollbackTo({ kind: 'fork', source }, { anchors: [], base: { kind: 'fresh' } })
+
+    expect(ok).toBe(false)
+    // 事务中止不写状态:无 restore 绑定写、无锚 replace 写、内存目标不回滚
+    expect(boundResumes).toEqual([])
+    expect(seededTurnAnchors).toEqual([])
+    expect(turnAnchorsBySession.get(session.sessionName)).toEqual([oldAnchor])
+    expect(session.lastSessionId).toBe('old-thread')
   })
 })
 
