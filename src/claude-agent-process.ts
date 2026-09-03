@@ -1444,6 +1444,9 @@ export class ClaudeAgentProcess extends EventEmitter {
       case 'session_state_changed':
         if (raw.state === 'running' && !this.turnActive) {
           this.turnActive = true
+          // A checkpoint belongs to exactly one clean turn. Clear the prior
+          // assistant UUID at the authoritative SDK turn boundary.
+          this.lastAssistantUuid = null
           this.emit('turn_started', { turn_id: raw.uuid, thread_id: this.sessionId })
         } else if (raw.state === 'idle') {
           this.turnActive = false
@@ -1765,6 +1768,15 @@ export class ClaudeAgentProcess extends EventEmitter {
       is_error: this.lastResult.is_error,
       duration_ms: this.lastResult.duration_ms,
       usage: this.lastUsage,
+      // turn-local Claude checkpoint(ff44afb):仅干净完成轮携带分叉锚。
+      checkpoint: !this.lastResult.is_error && this.lastAssistantUuid && this.sessionId
+        ? {
+            provider: 'claude',
+            kind: 'assistant-message',
+            id: this.lastAssistantUuid,
+            source: { provider: 'claude', sessionId: this.sessionId, cwd: this.opts.workDir },
+          }
+        : null,
     })
   }
 
