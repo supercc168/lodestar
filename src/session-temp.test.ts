@@ -321,7 +321,9 @@ describe('session-temp panel TTL 与 consumed 状态', () => {
 describe('session-temp reserveTempChatName 保留集', () => {
   test('并发创建同步预留临时群名,同分钟避让为 -2', async () => {
     const first = makeHarness('project', 'claude')
-    const second = makeHarness('project', 'claude')
+    // 第二个会话用临时后缀名(baseName 同解析为 project):撞名面相同,
+    // 而锚点容器 key(sessionName)互不覆盖。
+    const second = makeHarness('project*0101-0101', 'claude')
     seedAnchors(first, 'claude', ['first-concurrent'])
     seedAnchors(second, 'claude', ['second-concurrent'])
     let release!: () => void
