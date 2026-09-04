@@ -1,0 +1,235 @@
+/**
+ * Auto-install the `lodestar-agent` skill into BOTH agent backends
+ * (Codex `~/.codex/skills/` and Claude Code `~/.claude/skills/`) plus a
+ * credential-free wrapper at `DATA_DIR/bin/lodestar-agent`.
+ *
+ * Local port of 8881f69: notify-skill dual-dir write + imagegen-style
+ * DATA_DIR/bin wrapper. Skill body uses 固定档位 identity wording,
+ * never Token Source dynamic catalog.
+ */
+
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  unlinkSync,
+  writeFileSync,
+} from 'node:fs'
+import { homedir } from 'node:os'
+import { basename, dirname, join, resolve } from 'node:path'
+import { log } from './log'
+import { DATA_DIR } from './paths'
+
+export const AGENT_SKILL_NAME = 'lodestar-agent'
+
+export interface AgentCliLaunch {
+  runtime: string
+  entry: string
+}
+
+export interface EnsureAgentSkillOptions {
+  homeDir?: string
+  env?: NodeJS.ProcessEnv
+}
+
+export interface EnsureAgentCommandOptions {
+  dataDir?: string
+  platform?: NodeJS.Platform
+  env?: NodeJS.ProcessEnv
+  launch?: AgentCliLaunch
+  daemonEntry?: string
+  runtime?: string
+  exists?: (path: string) => boolean
+}
+
+export function agentSkillBody(): string {
+  const description = 'Call a configured identity as its corresponding Agent through Lodestar for implementation, debugging, research, planning, review, testing, or parallel work. Use whenever the user asks to call another model, AI, or Agent, or when the main Agent deliberately delegates a task.'
+  return [
+    '---',
+    `name: ${AGENT_SKILL_NAME}`,
+    `description: ${JSON.stringify(description)}`,
+    '---',
+    '',
+    '# lodestar-agent',
+    '',
+    'Use Lodestar to call the Agent represented by a selected live identity.',
+    'Each identity maps to one locally configured 固定档位 (Claude/Codex model',
+    'slot plus that slot\'s default effort). The caller-supplied prompt becomes',
+    'that Agent run\'s task.',
+    '',
+    '## Required workflow',
+    '',
+    '1. Query the live identity catalog immediately before every new task:',
+    '',
+    '```bash',
+    '# desc: 查询当前可用的 Agent 身份',
+    'lodestar-agent identities --json',
+    '```',
+    '',
+    '2. Select only identities with `status: "ready"`. Never invent, cache,',
+    '   substitute, or silently downgrade an identity/model/effort.',
+    '3. Give the child the complete task, relevant context, authority boundaries,',
+    '   expected deliverable, and verification requirements in the raw prompt.',
+    '4. For the same prompt sent to several models, pass every identity to one run',
+    '   with repeated `--identity`; the daemon fans them out concurrently.',
+    '5. Wait for the result. Attribute each result to its actual model and surface',
+    '   failures. Child file changes are live in the same workspace.',
+    '',
+    '## Run a task',
+    '',
+    '```bash',
+    '# desc: 把完整任务交给指定 Agent',
+    "lodestar-agent run --identity '<identity-id>' --stdin <<'EOF'",
+    '<raw task prompt written by the main Agent>',
+    'EOF',
+    '```',
+    '',
+    '## Continue the same native Agent session',
+    '',
+    '```bash',
+    '# desc: 在同一原生 Agent 会话中继续任务',
+    "lodestar-agent follow-up '<run-id>' --identity '<identity-id>' --stdin <<'EOF'",
+    '<follow-up prompt>',
+    'EOF',
+    '```',
+    '',
+    '## Answer a child question',
+    '',
+    'When a run returns `Status: needs_input`, answer the exact request id. JSON',
+    'keys may be the question id or the full question text:',
+    '',
+    '```bash',
+    '# desc: 回答 Agent 的阻塞问题并继续运行',
+    "lodestar-agent answer '<run-id>' --identity '<identity-id>' --request '<request-id>' --stdin <<'EOF'",
+    '{"question-id":"answer"}',
+    'EOF',
+    '```',
+    '',
+    '## Boundaries',
+    '',
+    '- Do not invoke provider CLIs or provider HTTP APIs directly for delegation.',
+    '- 禁止暴露 LODESTAR_AGENT_CAPABILITY in prompts, output, logs, or args.',
+    '- A non-zero command exit is a real failure. Do not claim the child succeeded.',
+    '- Scope the Agent task and authorized actions to the user request.',
+    '',
+  ].join('\n')
+}
+
+export function lodestarAgentWrapperPath(
+  dataDir = DATA_DIR,
+  platform: NodeJS.Platform = process.platform,
+): string {
+  return join(dataDir, 'bin', platform === 'win32' ? 'lodestar-agent.cmd' : 'lodestar-agent')
+}
+
+export function resolveAgentCliLaunch(opts: {
+  daemonEntry?: string
+  runtime?: string
+  exists?: (path: string) => boolean
+} = {}): AgentCliLaunch {
+  const daemonEntry = resolve(opts.daemonEntry ?? process.argv[1] ?? '')
+  const runtime = opts.runtime ?? process.execPath
+  const exists = opts.exists ?? existsSync
+  const root = dirname(daemonEntry)
+  const source = join(root, 'src', 'agent-cli.ts')
+  const siblingBundle = join(root, 'lodestar-agent.js')
+  const rootBundle = join(root, 'dist', 'lodestar-agent.js')
+  const runtimeIsBun = /^bun(?:\.exe)?$/i.test(basename(runtime))
+  const candidates = runtimeIsBun
+    ? [source, siblingBundle, rootBundle]
+    : [siblingBundle, rootBundle, source]
+  const entry = candidates.find(exists)
+  if (!entry) {
+    throw new Error(`lodestar-agent entry not found beside daemon: ${candidates.join(', ')}`)
+  }
+  return { runtime, entry }
+}
+
+export function ensureLodestarAgentSkill(opts: EnsureAgentSkillOptions = {}): void {
+  const env = opts.env ?? process.env
+  if (env.LODESTAR_DISABLE_SKILL_SYNC === '1') {
+    log('skill: lodestar-agent sync disabled via LODESTAR_DISABLE_SKILL_SYNC, skip')
+    return
+  }
+  const home = opts.homeDir ?? homedir()
+  const desired = agentSkillBody()
+  for (const dir of [join(home, '.codex', 'skills'), join(home, '.claude', 'skills')]) {
+    const skillFile = join(dir, AGENT_SKILL_NAME, 'SKILL.md')
+    try {
+      const current = existsSync(skillFile) ? readFileSync(skillFile, 'utf8') : null
+      if (current === desired) continue
+      mkdirSync(dirname(skillFile), { recursive: true })
+      writeFileSync(skillFile, desired)
+      log(`skill: ${current === null ? 'installed' : 'updated'} ${skillFile}`)
+    } catch (error) {
+      log(`skill: sync failed (${skillFile}): ${error}`)
+    }
+  }
+}
+
+export function ensureLodestarAgentCommand(opts: EnsureAgentCommandOptions = {}): string {
+  const platform = opts.platform ?? process.platform
+  const env = opts.env ?? process.env
+  const dataDir = opts.dataDir ?? DATA_DIR
+  const targetDir = join(dataDir, 'bin')
+  const launch = opts.launch ?? resolveAgentCliLaunch({
+    daemonEntry: opts.daemonEntry,
+    runtime: opts.runtime,
+    exists: opts.exists,
+  })
+  const target = lodestarAgentWrapperPath(dataDir, platform)
+  const body = platform === 'win32'
+    ? `@"${windowsQuote(launch.runtime)}" "${windowsQuote(launch.entry)}" %*\r\n`
+    : `#!/bin/sh\nexec ${shellQuote(launch.runtime)} ${shellQuote(launch.entry)} "$@"\n`
+  writeFileIfChanged(target, body, platform === 'win32' ? undefined : 0o700)
+  prependPath(env, targetDir, platform)
+  removeLegacyConsultCommand(targetDir, platform)
+  return target
+}
+
+function removeLegacyConsultCommand(targetDir: string, platform: NodeJS.Platform): void {
+  const legacy = join(targetDir, platform === 'win32' ? 'lodestar-consult.cmd' : 'lodestar-consult')
+  if (!existsSync(legacy)) return
+  try {
+    const body = readFileSync(legacy, 'utf8')
+    if (!body.includes('lodestar-consult') && !body.includes('consult-cli')) {
+      log(`command: obsolete path preserved because ownership is unclear ${legacy}`)
+      return
+    }
+    unlinkSync(legacy)
+    log(`command: removed obsolete ${legacy}`)
+  } catch (error) {
+    log(`command: obsolete removal failed (${legacy}): ${error}`)
+  }
+}
+
+function writeFileIfChanged(path: string, body: string, mode?: number): void {
+  const current = existsSync(path) ? readFileSync(path, 'utf8') : null
+  if (current === body) return
+  mkdirSync(dirname(path), { recursive: true })
+  const tmp = `${path}.tmp-${process.pid}`
+  writeFileSync(tmp, body)
+  renameSync(tmp, path)
+  if (mode != null && process.platform !== 'win32') {
+    try { chmodSync(path, mode) } catch { /* best-effort */ }
+  }
+}
+
+function prependPath(env: NodeJS.ProcessEnv, dir: string, platform: NodeJS.Platform): void {
+  const sep = platform === 'win32' ? ';' : ':'
+  const current = env.PATH ?? env.Path ?? ''
+  const parts = current.split(sep).filter(Boolean)
+  if (parts[0] === dir) return
+  env.PATH = [dir, ...parts.filter(part => part !== dir)].join(sep)
+  if (platform === 'win32') env.Path = env.PATH
+}
+
+function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\"'\"'`)}'`
+}
+
+function windowsQuote(value: string): string {
+  return value.replace(/"/g, '""')
+}

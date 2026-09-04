@@ -40,6 +40,7 @@ import { startNotifyServer } from './src/notify'
 import { AgentService } from './src/agent-service'
 import { handleAgentRequest } from './src/agent-api'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
+import { ensureLodestarAgentSkill, ensureLodestarAgentCommand } from './src/agent-skill'
 import { ensureImagegenSkill } from './src/imagegen-skill'
 import { ensureImagereadSkill } from './src/imageread-skill'
 import { startTasklistWorker, stopTasklistWorker } from './src/tasklist-worker'
@@ -1490,6 +1491,12 @@ async function boot(): Promise<void> {
   // notify server starts serving, so a card tapped right after a daemon
   // restart still routes to its caller. Prunes entries older than 7 days.
   loadCallbacks()
+  // Install the bare delegated-agent command first so Skill bash can find
+  // `lodestar-agent` on PATH. Wrapper lives in DATA_DIR/bin and contains
+  // paths only — never capability or provider credentials. The installer
+  // prepends that bin dir onto process.env.PATH.
+  ensureLodestarAgentCommand()
+
   startNotifyServer({
     bind: config.notify.bind,
     port: config.notify.port,
@@ -1521,6 +1528,10 @@ async function boot(): Promise<void> {
   // wrapper to DATA_DIR/bin/lodestar-imageread. Unlike imagegen it manages
   // NO credentials / venv: codex auth lives in ~/.codex/config.toml.
   ensureImagereadSkill()
+
+  // Dual-dir lodestar-agent Skill (notify-skill pattern). Wrapper already
+  // installed above so Skill bash can find the bare command.
+  ensureLodestarAgentSkill()
 
   // Auto-revive sessions that were running when we last went down.
   // Runs AFTER the WS is up so any 🔁 revive message lands in the
