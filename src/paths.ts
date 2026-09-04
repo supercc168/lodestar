@@ -15,6 +15,8 @@
  *   session-resume-map.json — last-known Codex thread_id  (in DATA_DIR)
  *   session-model-map.json  — per-session selected Codex model (in DATA_DIR)
  *   tasklist-map.json       — project tasklist bindings     (in DATA_DIR)
+ *   agent-runs/             — durable delegated-agent runs    (in DATA_DIR)
+ *   agent-session-ids.json  — delegated native session ids    (in DATA_DIR)
  *   notify-callbacks.json   — /notify button→callback map   (in DATA_DIR)
  *   inbox/                  — downloaded attachments        (in DATA_DIR)
  */
@@ -75,6 +77,12 @@ export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
 /** Exact chats created by the temporary-session runtime; required before `bye` may delete. */
 export const TEMP_SESSION_LEASES_FILE = join(DATA_DIR, 'temp-session-leases.json')
 export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
+/** Durable delegated-agent runs. Every state transition is written so completed
+ *  runs survive daemon restart and can be inspected from CLI/HTTP. */
+export const AGENT_RUNS_DIR = join(DATA_DIR, 'agent-runs')
+/** Provider-native session ids created by delegated agents. Main-session
+ *  rs/fk history must skip these ids. */
+export const AGENT_SESSION_IDS_FILE = join(DATA_DIR, 'agent-session-ids.json')
 /** Persisted registrations for `/notify` cards that carry interactive
  * buttons. Each entry binds a `notify_id` → caller-supplied loopback
  * callback URL + the original card params (so a click can rebuild the
