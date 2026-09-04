@@ -176,9 +176,11 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       const lease = s.beginLifecycle('soft_stop')
       const preserveRecovery = s.hasPreservedWatchdogRecovery()
       if (s.runningAgy) {
+        await s.cancelAgentRuns('stop command')
         await s.stopAgyTask('🛑 agy 已打断')
         return true
       }
+      await s.cancelAgentRuns('stop command')
       // Soft barge-out: interrupt the current turn (if any) AND drop
       // the pending-message count so a stack of type-ahead doesn't
       // refire after the interrupt. Subprocess stays alive. Note: the
@@ -318,6 +320,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
             : s.withModel(`🔁 启动 ${backend}`)
         const statusCard = await s.openStatusCard('restart', initialStatus)
         if (!s.ownsLifecycle(lease)) return true
+        await s.cancelAgentRuns('restart command')
         if (s.runningAgy) {
           s.setStatusCard(statusCard, '🛑 restart 前终止 agy')
           await s.stopAgyTask('🛑 restart 前已终止 agy')

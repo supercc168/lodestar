@@ -325,6 +325,21 @@ export function parseCallbackUrl(raw: unknown): { url?: string; error?: string }
 export interface NotifyOptions {
   bind: string
   port: number
+  extraHandler?: (req: IncomingMessage, res: ServerResponse, url: URL) => Promise<boolean>
+}
+
+/** Test/daemon seam: extraHandler true = already handled, skip /notify. */
+export async function dispatchNotifyRequest(
+  opts: NotifyOptions,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+  if (opts.extraHandler) {
+    const handled = await opts.extraHandler(req, res, url)
+    if (handled) return
+  }
+  await handleNotifyRequest(req, res)
 }
 
 export function startNotifyServer(opts: NotifyOptions): void {
@@ -333,7 +348,7 @@ export function startNotifyServer(opts: NotifyOptions): void {
   // Bun has full node:http compat so dev behavior is byte-for-byte preserved.
   try {
     const server = createServer((req, res) => {
-      handleNotifyRequest(req, res).catch((err: any) => {
+      dispatchNotifyRequest(opts, req, res).catch((err: any) => {
         log(`notify: handler crash: ${err?.message ?? err}`)
         if (!res.headersSent) {
           res.statusCode = 500
@@ -374,6 +389,7 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
       'lodestar notify\n' +
       'POST /notify        body={project,text,title?,level?,images?,buttons?,callback?}  → push card to group\n' +
       'GET  /notify/result/<notify_id>  → poll a button card\'s resolution (pull mode, no callback server)\n' +
+      'GET  /agents/identities; POST/GET/DELETE /agents/runs[/<id>]  → capability-protected delegated Agents\n' +
       'levels: info|warn|error (default info); images=[/abs/*.png] uploaded + embedded\n' +
       'buttons:[{id,text,type?}] (any count, one per row); callback=http://127.0.0.1:PORT/path optional (push) — omit to poll\n')
   }

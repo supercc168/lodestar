@@ -13,8 +13,10 @@
  * only the session-*.ts helpers should touch it."
  */
 
+import { randomBytes, timingSafeEqual } from 'node:crypto'
 import { existsSync } from 'node:fs'
 import { isAbsolute, join } from 'node:path'
+import { agentApiUrl } from './agent-runtime'
 import {
   CODEX_EFFORT,
   CodexProcess,
@@ -730,6 +732,7 @@ export class Session {
   manualContextCompactionPending = false
   runningAgy: sessionAgy.AgyTaskState | null = null
   startingAgy = false
+  agentCapability: string | null = null
   agyForwardPrompts = new Map<string, sessionAgy.AgyForwardRecord>()
   /** Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板。codex
    * 的 TodoWrite 一次就带完整列表,直接渲染即可;但 Claude Code 把它拆成 4
@@ -1802,6 +1805,12 @@ export class Session {
         ? { kind: 'resume', source: resumeRef }
         : { kind: 'fresh' })
     validateConversationLaunch(launch, provider, this.workDir)
+    this.agentCapability = randomBytes(32).toString('base64url')
+    const hostEnv = {
+      LODESTAR_AGENT_URL: agentApiUrl(config.notify.bind, config.notify.port),
+      LODESTAR_AGENT_CAPABILITY: this.agentCapability,
+      LODESTAR_AGENT_SESSION: this.sessionName,
+    }
     if (provider === 'claude') {
       assertClaudeCodeAvailable()
       const sourceId = launch.kind === 'fresh' ? undefined : launch.source.sessionId
@@ -1818,6 +1827,7 @@ export class Session {
         forkSession: launch.kind === 'fork',
         appendSystemPrompt: this.spawnDeveloperInstructions(),
         profile: feishu.projectProfile(feishu.tempProjectName(this.sessionName) ?? this.sessionName),
+        hostEnv,
       })
     }
     // spawn 覆盖走 TokenSource 适配层(D-02 slim:上游 registry 段换写,注入形态零变);
@@ -1831,6 +1841,7 @@ export class Session {
       appendSystemPrompt: this.spawnDeveloperInstructions(),
       configArgs: overrides.configArgs,
       providerEnv: overrides.env,
+      hostEnv,
     })
   }
 
@@ -2022,6 +2033,18 @@ export class Session {
 
   stopAgyTask(status = '🛑 agy 已打断'): Promise<boolean> {
     return sessionAgy.stopAgyTask(this, status)
+  }
+
+  acceptsAgentCapability(value: string): boolean {
+    const expected = this.agentCapability
+    if (!expected || !value || !this.proc?.isAlive()) return false
+    const a = Buffer.from(expected)
+    const b = Buffer.from(value)
+    return a.length === b.length && timingSafeEqual(a, b)
+  }
+
+  async cancelAgentRuns(reason = '用户取消'): Promise<void> {
+    await this.opts.onCancelAgentRuns?.(this.sessionName, this.chatId, reason)
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────
@@ -2531,6 +2554,7 @@ export class Session {
     // stop ends any in-session GSD execution signal (panel fine-progress gate).
     sessionGsd.clearGsdExecution(this)
     const stoppedAgy = await this.stopAgyTask(`🛑 ${reason}`)
+    await this.cancelAgentRuns(reason)
     if (!this.ownsLifecycle(lease)) return
     this.discardQueuedHumanWork('stop')
     if (!this.proc) {
@@ -2551,6 +2575,7 @@ export class Session {
     log(`session "${this.sessionName}": stop (${reason})`)
     const proc = this.proc
     this.proc = null
+    this.agentCapability = null
     this.stopFooterStatus(this.currentTurn)
     this.currentTurn = null
     this.initCount = 0
@@ -5841,6 +5866,9 @@ export class Session {
       // 进程已死:它的延迟锚永远无法经 persist→flush 落盘,立即丢弃防幽灵锚
       // (挂账 #3 收尾口;stop/restart 的 kill 路径亦有兜底 discard)。
       this.discardPendingCodexTurnAnchors(p, expected ? 'confirmed process exit' : 'unexpected process exit')
+      void this.cancelAgentRuns(`${p.provider} process exited`).catch(error => {
+        log(`session "${this.sessionName}": cancel Agent runs after process exit failed: ${messageOf(error)}`)
+      })
       const pendingDelivery = this.pendingHumanDelivery?.proc === p
         ? this.pendingHumanDelivery
         : null
