@@ -4,7 +4,7 @@
 # src
 
 ## Purpose
-`src/` 是 Lodestar daemon 的核心实现层，封装飞书 API、统一 `AgentProcess` 后端接口及其 Codex / Claude 两类实现、每个群的 session 状态机、Card Kit 流式更新、模型/effort 持久选择、`wt` worktree 群编排、`agy <prompt>` 外部任务、`task` 飞书任务清单自动化、入站多条消息合并(`>>>`/`<<<`)、临时会话 `fk`/`bk`/`rs`/`btw`/`bye` 分叉回滚与临时群、安装/停止/升级 CLI，以及 runtime state 路径和配置读取。session 默认 provider 为 Claude/GLM，可经 `model` 切到 Codex。
+`src/` 是 Lodestar daemon 的核心实现层，封装飞书 API、统一 `AgentProcess` 后端接口及其 Codex / Claude 两类实现、每个群的 session 状态机、Card Kit 流式更新、模型/effort 持久选择、`wt` worktree 群编排、`agents`/`lodestar-agent` 完整委派（固定档位 identity）、`agy <prompt>` 外部任务、`task` 飞书任务清单自动化、入站多条消息合并(`>>>`/`<<<`)、临时会话 `fk`/`bk`/`rs`/`btw`/`bye` 分叉回滚与临时群、安装/停止/升级 CLI，以及 runtime state 路径和配置读取。session 默认 provider 为 Claude/GLM，可经 `model` 切到 Codex。
 
 ## Key Files
 | File | Description |
@@ -12,8 +12,16 @@
 | `session.ts` | 一个飞书群对应一个 `Session`；保留核心状态、Codex 生命周期、Feishu 入站消息、app-server 事件接线和 turn/card 流式状态机；具体命令和业务面板下沉到 `session-*` helper。 |
 | `session-types.ts` | `TurnState`、`Status`、累计统计和 session option 类型定义。 |
 | `session-util.ts` | session helper 共享的状态卡、生命周期选项、action result 类型和错误/超时小工具。 |
-| `session-commands.ts` | 群内裸词控制命令路由：`hi`、`stop`、`kill`、`restart`/`rs`、`clear`、`compact`、`model`、`task`、`wt`、`agy`，以及 `fk`/`bk`/`btw`/`bye`。 |
+| `session-commands.ts` | 群内裸词控制命令路由：`hi`、`stop`、`kill`、`restart`/`rs`、`clear`、`compact`、`model`、`task`、`agents`/`agent`、`wt`、`agy`，以及 `fk`/`bk`/`btw`/`bye`。 |
+| `session-agent-identities.ts` | `agents`/`agent` 只读身份目录卡：`listTokenSources()` 一档一位，翻页 `agent_identity_page`；人不在卡上点选开跑。 |
 | `session-agy.ts` | `agy <prompt>` 外部任务生命周期：进程启动/停止、stdout/stderr 捕获、状态卡更新、仓库快照和转发 Codex。 |
+| `agent-identities.ts` | slim 身份目录：每个 TokenSource 一条 identity，`identity.model=selectionModel`；凭据不在此层解析。 |
+| `agent-service.ts` | 委派 run 生命周期 / DAG / 并发 / 独立 run 卡 / 递归取消；与 agy 并列，不替换。 |
+| `agent-launch.ts` | worker 进程工厂：Claude/Codex 本地构造器 + `resolveTokenSource*`，不走上游 registry 查找。 |
+| `agent-cli.ts` | `lodestar-agent` CLI：identities/run/follow-up/answer/status/cancel。 |
+| `agent-api.ts` | `/agents/*` HTTP；挂 notify extraHandler 同端口。 |
+| `agent-skill.ts` | 双目录 SKILL.md + `DATA_DIR/bin/lodestar-agent` wrapper；措辞为固定档位 identity。 |
+| `inbound-message.ts` | 入站 freshness + native image/file/media 资源映射（视频走 `file_key`，失败可见回执）。 |
 | `session-worktree.ts` | `wt` session 侧编排：项目名/目录约定、额外 worktree instructions 注入、列表卡、建群/入群和解散回调。 |
 | `session-tasklist.ts` | `task` 面板的 session 回调：启用项目任务清单、删除确认和面板重绘。 |
 | `session-model.ts` | `model` 面板流程：通过 Codex app-server 动态拉取模型列表、选择模型和 reasoning effort、持久化 session 选择。 |
@@ -39,7 +47,7 @@
 | `token-source.ts` | TokenSource **适配层**（非上游全量 registry）：把 `claude-models` / `codex-models` 与内建 login 档收敛为统一 `resolveTokenSource(provider, model)`；提供 `resolveClaudeSpawnEnv`（scrub ANTHROPIC_* → api 才注入 → tier lock + `GSD_RUNTIME`）、`resolveCodexSpawnOverrides`、`resolveUsageSource`。真相源仍是 `[claude.models.*]`/`[codex.models.*]`，**不**引入 `[token_source.*]` TOML，**不**改 `model` 面板 UX。reclaude 等包装器仍走 `[claude] bin`；API 路由用 `isApiRoute()` 绕开。 |
 | `card-action.ts` | Card action 回调响应辅助；生产 WS 路径用 `{ card: { type: "raw", data: newCard } }` 立即替换 JSON 卡片，避免 200672、裸卡片或提前 patch 导致模型/effort 面板闪退。 |
 | `cardkit.ts` | Feishu Card Kit v1 封装；维护 per-card sequence、Promise queue、流式限流、元素计数和写失败回调。 |
-| `cards.ts` | 卡片模板 barrel；统一导出 `src/cards/` 下的 turn、console、worktree、agy、task 和元素 ID 工具。 |
+| `cards.ts` | 卡片模板 barrel；统一导出 `src/cards/` 下的 turn、console、worktree、agy、agents、task 和元素 ID 工具。 |
 | `feishu.ts` | Lark client、tenant token 缓存、群名/会话映射、alive session 和模型选择持久 map、群创建/解散/成员拉取、消息发送、reaction、附件下载、文件上传和项目目录初始化；Task v2 API 由 `feishu-task.ts` re-export。 |
 | `feishu-task.ts` | 飞书 Task v2 清单/分组/任务/评论 API 包装，以及 Task API 错误格式化。 |
 | `worktree.ts` | `wt` 的 Git worktree 逻辑：按 `work/*` 分支扫描、创建同级 `<project>[name]` worktree、归档已合并分支、重新激活时更新到主线、干净检查和删除目录。 |
@@ -83,7 +91,8 @@
 - `task` 面板按钮由 `session-tasklist.ts` 处理，持久状态集中在 `tasklist.ts`，后台自动化集中在 `tasklist-worker.ts`；不要把轮询、进程状态或 Git 产物逻辑塞进卡片模板。
 - `model` 命令为固定选项(codex 内建=gpt-5.6-sol/max、claude 第一方=Fable 5/Opus 5 均 max、glm=effort 随 config、Grok 无痕=官方最高 xhigh、CatCodex=网关兼容 xhigh),effort 锁死一键生效,不动态拉取 `model/list`；Grok 不得走 Codex。
 - 连续失败工具熔断在 `tool-failure-loop.ts` 保持纯检测，在 `Session` 统一执行第三次软中断/卡片终态/真人队列续投；Claude 的第二次纠错提示留在 SDK `PostToolUseFailure` hook。不要把它并入 Codex-only turn watchdog，也不要自动重放失败任务。
-- Claude/Codex spawn 凭据与 model 注入经 `token-source.ts` 单入口；新增档位仍写 `[claude.models.*]`/`[codex.models.*]` 与 `claude-models`/`codex-models` profile，不要平行再加一套 `[token_source.*]` 配置。
+- Claude/Codex spawn 凭据与 model 注入经 `token-source.ts` 单入口；新增档位仍写 `[claude.models.*]`/`[codex.models.*]` 与 `claude-models`/`codex-models` profile，不要平行再加一套 `[token_source.*]` 配置。委派 worker 同样只走 `resolveTokenSource*`。
+- `agent-*` 是主 Agent 委派任意普通任务的闭环：身份=本地固定档位，不是动态 Token Source 目录；一 prompt 多 `--identity` 同一 run。不要恢复 reviewers 命令、consult CLI 或 consult 卡。`agy` 三文件（`session-agy.ts` / `agy-task.ts` / `cards/agy.ts`）保持独立任务语义。
 - TokenSource **长期只做适配层**：禁止引入 `[token_source.*]` 注册表、`registerTokenSource` 插件 API、双层 model 面板、source 级 `refreshModels`。额度实现仍分 `usage.ts`/`glm-usage.ts`/`claude-provider-usage.ts`，展示选型走 `resolveUsageSource`（`claude:grok*` → `provider`）。上游只吸收行为补丁，不吸收产品/配置形态。
 - `fk`/`bk`/进程已停时的 `rs` 使用 backend-native 会话能力：Claude 以 transcript + `forkSession/resumeSessionAt` 实现，Codex 以 app-server `thread/list` + `thread/fork(lastTurnId)` 实现。共享 checkpoint 必须携带 provider、源会话 id 与原生锚点；Claude fork 在首条输入前必须持久化 pending launch，materialize 新 session id 后才能清除。禁止扫描/复制 Codex rollout、重建旁路索引或把 fork 失败静默退化成 resume。
 - 临时会话选择卡只携带 `panel_id` + opaque `choice_id`，provider/cwd/source/owner/launch 留在 Session 的短期 panel state；禁止把可执行的 thread id、anchor 数组下标或本机路径直接信任为回调真相源。

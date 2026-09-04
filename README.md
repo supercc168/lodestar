@@ -62,7 +62,7 @@ bun install && bun run build
 npm i -g .
 ```
 
-装完得到 5 个命令:
+装完得到 6 个命令:
 
 | 命令 | 作用 |
 | --- | --- |
@@ -71,6 +71,7 @@ npm i -g .
 | `lodestar-stop` | 停止 daemon |
 | `lodestar-update` | 升级到最新版(含 Codex CLI、Claude Code 和 Claude SDK)|
 | `lodestar-version` | 查看 Lodestar 和 Codex CLI 版本 |
+| `lodestar-agent` | 供主 Agent 把完整任务委派给其他模型并续跑原生会话 |
 
 **2. 跑向导**
 
@@ -99,6 +100,7 @@ lodestar-setup
 | `model` / `md` | 展示固定档位(Claude·Fable 5 / Opus 5 / GLM / Grok · Codex·GPT-5.6 Sol),一键生效,按群持久化 |
 | `gsd` | 打开 GSD 状态卡(未完成任务/选/进度/继续/暂停/完成/新任务);选择只绑定当前会话,跟随当前 model,规划只走 yiui-gsd |
 | `task` | 打开项目任务清单面板,启用飞书任务清单自动化（预览版） |
+| `agents` / `agent` | 打开只读身份目录卡(本地已配置固定档位、默认 effort、MISS 如实);人不在卡上点选开跑 |
 
 **GSD / yiui-gsd(其它设备 checkout 后)**
 
@@ -179,6 +181,18 @@ requires_openai_auth = "true"
 ---
 
 ## 🎁 附加能力
+
+### 🧠 完整多模型 Agent 委派
+
+daemon 为本地已配置的固定档位各生成一条 Agent 身份（`listTokenSources()`：`[claude.models.*]` / `[codex.models.*]` + login 档），effort 用该档默认。身份**不是**动态 Token Source 模型目录，也不会去官方拉列表。项目群发 `agents` / `agent` 可查看身份、模型、默认 effort 与当前 MISS；身份只负责模型路由，目录卡上不能点选开跑。真正委派只由主 Agent 调 `lodestar-agent`。
+
+本地 `agy <prompt>` 原样保留（独占外部 agy CLI、独立 agy 卡、转 Codex）。委派是另一条线，不是 agy 别名，也不删除 agy。
+
+主 Agent 每次委派前通过 `lodestar-agent identities --json` 获取身份，再把完整原始 prompt 交给 `lodestar-agent run`。同一 prompt 选择多个身份时用重复 `--identity` 合并为一个 run，由 daemon 并发 fan-out；禁止按身份拆成多个后台 run。Delegated Agent 使用完整能力（Codex `danger-full-access`，Claude `claude_code` preset）；凭据/模型注入一律走 `resolveTokenSource*`，不引入 `[token_source.*]`。委派产生的原生 session 不会混入主会话 `rs` / `fk` 列表；群里 `stop` / `kill` / `restart` 会递归取消该 Session 的委派 run。
+
+`lodestar-agent` 只能在 Lodestar 管理的 Agent 进程内使用。本机 API 为 `GET /agents/identities`、`POST /agents/runs`、`GET|DELETE /agents/runs/<id>`、`POST /agents/runs/<id>/answer` 与 `POST /agents/runs/<id>/follow-up`，挂在既有 notify loopback 端口。
+
+**本 fork 相对上游 v0.16.2 的移植范围与排除项：** 收了完整 Agent 委派（经 slim 适配层）、入站视频转发当前群 agent、版本号对齐 0.16.2。明确不收 / 不恢复：上游 `[token_source.*]` registry、动态模型目录、`reviewers` / `lodestar-consult` / 只读 reviewer、effort/GPT-5.6 档位调整、codex 额度归属架构、GitHub Release 中文约束。本 phase 也不收 CI/typecheck/deps/`--packages=external` 发布链路改造、init-wait/stop barrier 回补、cardkit 测试期真实出网拦截；SDK 仍钉 `@anthropic-ai/claude-agent-sdk` 0.3.222。
 
 ### 📋 飞书任务清单自动化（预览版）
 

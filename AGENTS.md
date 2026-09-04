@@ -5,7 +5,7 @@
 > 🧭 **接手开发/维护本项目先读**:[`docs/开发与调试指南.md`](docs/开发与调试指南.md) —— 面向 AI 的心智模型、代码地图、开发红线、调试(含免飞书 debug 注入)与发布流程。本文件(`AGENTS.md`)是权威规则源,那份是上手导航。
 
 ## Purpose
-本仓库实现一个 Bun daemon，把飞书群消息桥接到无头 agent 后端进程——按 session 选择 `codex app-server`（GPT）或 `@anthropic-ai/claude-agent-sdk` 的 `query()` streaming-input 长驻进程（Claude/GLM，默认 provider）。运行时关系是一个飞书群对应一个 Lodestar session、一个选定 provider 的 agent 进程（Codex thread 或 Claude session），以及每轮对话中的一张流式 Feishu Card Kit 卡片；项目主群还可用 `model` 管理模型/effort，用 `wt` 自动创建/加入同级 Git worktree 群，用 `agy <prompt>` 启动一次性外部 agy 任务，用 `task` 启用飞书任务清单自动化；用户还可用 `>>>`/`<<<` 把一条长消息拆多条合并发送，用 `fk`/`bk`/`btw`/`bye` 做临时会话分叉、回退、开群与解散。
+本仓库实现一个 Bun daemon，把飞书群消息桥接到无头 agent 后端进程——按 session 选择 `codex app-server`（GPT）或 `@anthropic-ai/claude-agent-sdk` 的 `query()` streaming-input 长驻进程（Claude/GLM，默认 provider）。运行时关系是一个飞书群对应一个 Lodestar session、一个选定 provider 的 agent 进程（Codex thread 或 Claude session），以及每轮对话中的一张流式 Feishu Card Kit 卡片；项目主群还可用 `model` 管理模型/effort，用 `wt` 自动创建/加入同级 Git worktree 群，用 `agents`/`agent` 查看本地固定档位身份目录、由主 Agent 经 `lodestar-agent` 委派完整任务，用 `agy <prompt>` 启动一次性外部 agy 任务（与委派正交、不得改成委派别名），用 `task` 启用飞书任务清单自动化；用户还可用 `>>>`/`<<<` 把一条长消息拆多条合并发送，用 `fk`/`bk`/`btw`/`bye` 做临时会话分叉、回退、开群与解散。
 
 ## Key Files
 | File | Description |
@@ -13,7 +13,7 @@
 | `daemon.ts` | daemon 主入口；负责 PID guard、Lark `WSClient`、事件分发、裸词控制命令和 debug socket。 |
 | `cli.ts` | npm 分发入口；在缺少 `config.toml` 时触发安装向导，否则延迟导入 `daemon.ts`。 |
 | `package.json` | Bun/Node 打包脚本、发布元数据、二进制入口和依赖声明。 |
-| `README.md` | 用户安装、首次配置、群控裸词、`model` 选择、`wt` worktree 群、`task` 任务清单自动化和 HTTP 通知端点说明。 |
+| `README.md` | 用户安装、首次配置、群控裸词、`model` 选择、`wt` worktree 群、`agents`/`lodestar-agent` 委派、`task` 任务清单自动化和 HTTP 通知端点说明。 |
 | `bun.lock` | Bun 依赖锁文件；更新依赖后同步提交。 |
 | `LICENSE` | MIT 许可证。 |
 | `promo.jpg` | README 顶部展示图。 |
@@ -38,10 +38,11 @@
 - 执行已授权的重启时**先确认托管方式**（`launchctl list | grep lodestar` / `systemctl --user list-units`），用托管器自己的重启命令一条完成（macOS launchd：`launchctl kickstart -k gui/$(id -u)/com.supercc168.lodestar`）。**严禁**用 `launchctl submit` 跑一次性重启脚本——submit 的 job 默认 keepalive，脚本退出后每 ~10s 被重新 spawn，变成无限 kill+kickstart 循环（2026-07-20 实测事故）；也不要在托管环境手动起第二个 daemon 实例（脱管野进程与托管实例互杀）。发现 daemon PID 每 ~10s 规律滚动，先查多余 launchd job 并 `launchctl bootout`。
 - 停止、重启、替换、shadow、切换或并行接管正在运行的 daemon / user service 的授权**只在当前 assistant 回合内一次性有效**，不得跨用户消息、跨中断恢复、跨上下文压缩或跨任务范围沿用；一旦用户发来新的消息，即使上一条消息要求过“重启”，后续也必须重新明确授权后才能再次操作 live service。
 - **禁止**为了“测试”“预览”“发一张看看”“先验证一下”这类目的而停止、重启、替换、shadow、切换或并行接管正在运行的 daemon / user service。只有用户在当前用户消息中**明确点名**要执行对应操作（例如 `systemctl --user restart feishu-daemon.service`、停止当前 daemon、切换到某个 worktree daemon）时才可动手；任何泛化的“测一下”“发测试卡”都**不构成授权**。
-- 群内裸词控制是 `hi`、`stop`/`st`、`kill`/`kl`、`restart`/`rs`、`clear`/`cl`、`compact`/`cm`、`model`/`md`、`task`、`wt`/`worktree`、`wt <name>`/`worktree <name>`、`btw`(开临时群启动干净会话)、`bye`(散临时群)、`fk`/`fork`(从 turn 锚点分叉到临时群)、`bk`/`back`(列 turn 锚点,点选并通过校验后才终止当前并切到新分支)；`agy <prompt>` 启动外部一次性 agy 任务。`rs` 是 `restart` 别名:进程存活 = 打断 + 弃后台 + 恢复当前会话;空闲/进程已停 = 列同一 cwd 的历史会话,选一个在本群创建独立分支(源会话不动)。这些词在 `Session.runCommand` 中作为保留字处理。
+- 群内裸词控制是 `hi`、`stop`/`st`、`kill`/`kl`、`restart`/`rs`、`clear`/`cl`、`compact`/`cm`、`model`/`md`、`task`、`agents`/`agent`(只读身份目录，身份=本地固定档位)、`wt`/`worktree`、`wt <name>`/`worktree <name>`、`btw`(开临时群启动干净会话)、`bye`(散临时群)、`fk`/`fork`(从 turn 锚点分叉到临时群)、`bk`/`back`(列 turn 锚点,点选并通过校验后才终止当前并切到新分支)；`agy <prompt>` 启动外部一次性 agy 任务（与 `lodestar-agent` 委派正交）。`rs` 是 `restart` 别名:进程存活 = 打断 + 弃后台 + 恢复当前会话;空闲/进程已停 = 列同一 cwd 的历史会话,选一个在本群创建独立分支(源会话不动)。这些词在 `Session.runCommand` 中作为保留字处理。
 - `model` 是固定选项：Codex 内建（`gpt-5.6-sol`/`max`）、Claude 第一方（Fable 5 / Opus 5，均 `max`）、GLM 第三方路由（glm 主力 / glm-flash 快速档，effort 随 config，当前 `max`）、Claude Grok（无痕固定官方最高 `xhigh`；CatCodex 固定网关兼容 `xhigh`），外加非 Grok 的 `[codex.models.<slug>]` API 档位；effort 锁死、选了即生效，不再动态拉取模型列表；选择按 session+provider 持久化到 XDG data，跨 provider 切换只在空闲或下次启动边界生效，turn 进行中或排队时直接拒绝。
 - Grok coding 档位必须走 `[claude.models.grok]` / `[claude.models.grokcc]` 的 Claude Agent SDK 后端，禁止从 `[codex.models.*]` 暴露或启动；旧 `codex:grok*` 持久选择恢复时迁到 Claude，任何真实 model id 为 `grok-*` 的 Codex profile 都会被过滤并在 spawn 边界拒绝。Grok 4.6 官方 effort 为 `low`/`medium`/`high`(默认)/`xhigh`(`xhigh` 为 4.6 新增官方最高档；4.5 只有 low/medium/high)；无痕路由按官方最高 `xhigh` 启动，CatCodex 因其 Anthropic 网关只在 `xhigh` 下稳定兑现工具调用同样使用 `xhigh`。两路都固定 `thinking: disabled`，只关闭 Claude 专属 adaptive 控制，不关闭 Grok 自身 reasoning。API 失败仍需记录并暴露，不能静默换模型或 provider。
-- Agent spawn 凭据/model 注入走 `src/token-source.ts` **适配层**：统一 `resolveTokenSource` / `resolveClaudeSpawnEnv` / `resolveCodexSpawnOverrides` / `resolveUsageSource`，底层真相源仍是 `claude-models` / `codex-models` 与 config 的 `[claude.models.*]`/`[codex.models.*]`。**不**采用上游式 `[token_source.*]` TOML 或双层面板；第三方包装器（如 reclaude）继续用 `[claude] bin`，API 档经 `isApiRoute()` 绕开包装器。
+- Agent spawn 凭据/model 注入走 `src/token-source.ts` **适配层**：统一 `resolveTokenSource` / `resolveClaudeSpawnEnv` / `resolveCodexSpawnOverrides` / `resolveUsageSource`，底层真相源仍是 `claude-models` / `codex-models` 与 config 的 `[claude.models.*]`/`[codex.models.*]`。**不**采用上游式 `[token_source.*]` TOML 或双层面板；第三方包装器（如 reclaude）继续用 `[claude] bin`，API 档经 `isApiRoute()` 绕开包装器。委派 worker 与主 Session 同样只经 `resolveTokenSource*`。
+- `agents`/`agent` 打开只读身份目录卡（`listTokenSources()` 一档一位）；主 Agent 经 `lodestar-agent` CLI / `/agents/*` 委派完整任务。`AgentService` 管理一 run 多 identity fan-out、独立 run 卡、递归取消；不要恢复 `reviewers` / `lodestar-consult` / 只读 reviewer。`agy <prompt>` 仍是独立外部任务，不得改成委派别名。
 - **TokenSource 长期形态锁定为 slim 适配层**（2026-07-23）：不整包靠拢上游 registry / factory / 固定 source id / source.`readUsage`·`refreshModels` / 双层面板。上游再进化时只 cherry-pick **行为修复**（如 d9341b6 codex idle `rs`），不为对齐代码形状迁配置真相源。概念对照（文档用，runtime id 不改）：`claude:glm` ≈ glm-coding-plan，`gpt-5.6-sol` ≈ codex-subscription，login 档 ≈ subscription/login，api 档 ≈ 第三方路由。新代码禁止旁路直接拼 ANTHROPIC_*/codex provider env，须经 `resolveTokenSource*`。
 - `rs` 空闲：双后端都列同一 cwd 的历史会话并做 history fork 独立分支（Claude 读 transcript，Codex 调 `thread/list(cwd=...)`），不再把 Codex 空闲直接重启当前 thread，也不再是 Claude-only 列表。
 - `wt <name>` 约定创建同级目录 `<project>[<name>]` 和本地分支 `work/<name>`，并自动创建/加入同名飞书群；解散按钮会先拒绝仍在运行的对应 session，只在 worktree 干净时删除目录和解散群，保留分支；重新激活已合并归档分支时会更新到主线。
