@@ -12,7 +12,7 @@
 | `session.ts` | 一个飞书群对应一个 `Session`；保留核心状态、Codex 生命周期、Feishu 入站消息、app-server 事件接线和 turn/card 流式状态机；具体命令和业务面板下沉到 `session-*` helper。 |
 | `session-types.ts` | `TurnState`、`Status`、累计统计和 session option 类型定义。 |
 | `session-util.ts` | session helper 共享的状态卡、生命周期选项、action result 类型和错误/超时小工具。 |
-| `session-commands.ts` | 群内裸词控制命令路由：`hi`、`stop`、`kill`、`restart`、`clear`、`compact`、`model`、`task`、`wt` 和 `agy`。 |
+| `session-commands.ts` | 群内裸词控制命令路由：`hi`、`stop`、`kill`、`restart`/`rs`、`clear`、`compact`、`model`、`task`、`wt`、`agy`，以及 `fk`/`bk`/`btw`/`bye`。 |
 | `session-agy.ts` | `agy <prompt>` 外部任务生命周期：进程启动/停止、stdout/stderr 捕获、状态卡更新、仓库快照和转发 Codex。 |
 | `session-worktree.ts` | `wt` session 侧编排：项目名/目录约定、额外 worktree instructions 注入、列表卡、建群/入群和解散回调。 |
 | `session-tasklist.ts` | `task` 面板的 session 回调：启用项目任务清单、删除确认和面板重绘。 |
@@ -24,7 +24,7 @@
 | `session-host-ask.ts` | 解析 assistant 输出中的 `[[askusr: ...]]` 主机澄清标记，创建独立问答卡并把用户答案回填到 session。 |
 | `session-permission.ts` | 工具权限请求的卡片渲染与用户决策回传。 |
 | `session-multimsg.ts` | 入站多条消息缓冲状态机:`>>>`(≥3) 开缓冲、`<<<`(≥3) 合并 flush 成一条发给 agent、缓冲中的普通消息原样追加;缓冲期间每条打 📌,flush 释放,`stop`/`kill`/`restart`/`clear` 经 `clearMultiMsgBuffer` 丢弃并打 ❌;永不超时,只活在内存(daemon 重启会丢并打 ❌ 让失败可见)。 |
-| `session-temp.ts` | 临时会话 / fork / back / rs 恢复:`fk` 列 turn 锚点 fork、`bk` 终止当前 + 列 turn 回滚(选后回滚 + 发 Write 记录卡)、`rs` 空闲态列项目最近 24h 会话、`btw` 建临时群启动干净会话、`bye` 散临时群;`rs` 历史数据源是 claude code 自己的 transcript 目录(`~/.claude/projects/<encoded-cwd>/*.jsonl`,同 cwd 天然同目录,worktree 不混入),不维护自有会话索引(旧 resume-map + 后缀归属判断是错的)。 |
+| `session-temp.ts` | 临时会话 / fork / back / rs 历史分支:`fk` 列当前 provider+cwd 匹配锚 fork 到临时群、`bk` 列锚点选后才 stop→rollbackTo、`rs` 双后端同 cwd 历史 fork 独立分支、`btw` 建临时群启动干净会话、`bye` 散临时群(lease 守卫);选择卡只带 `{kind,panel_id,choice_id}`。 |
 | `agy-task.ts` | 外部 agy CLI 辅助：解析可执行文件、构造 `agy --print` 参数、补 PATH、采集执行前后 Git 快照和 diff 摘要。 |
 | `tasklist.ts` | `task` 项目清单绑定和状态存储；创建 `<project>[lodestar]` 清单、维护分组 GUID、记录自动化进程和每个任务的运行状态。 |
 | `tasklist-worker.ts` | 任务清单轮询 worker；按 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成` 分组驱动 Codex/agy 规划、选择、执行、审核和本地合并。 |
@@ -85,7 +85,9 @@
 - 连续失败工具熔断在 `tool-failure-loop.ts` 保持纯检测，在 `Session` 统一执行第三次软中断/卡片终态/真人队列续投；Claude 的第二次纠错提示留在 SDK `PostToolUseFailure` hook。不要把它并入 Codex-only turn watchdog，也不要自动重放失败任务。
 - Claude/Codex spawn 凭据与 model 注入经 `token-source.ts` 单入口；新增档位仍写 `[claude.models.*]`/`[codex.models.*]` 与 `claude-models`/`codex-models` profile，不要平行再加一套 `[token_source.*]` 配置。
 - TokenSource **长期只做适配层**：禁止引入 `[token_source.*]` 注册表、`registerTokenSource` 插件 API、双层 model 面板、source 级 `refreshModels`。额度实现仍分 `usage.ts`/`glm-usage.ts`/`claude-provider-usage.ts`，展示选型走 `resolveUsageSource`（`claude:grok*` → `provider`）。上游只吸收行为补丁，不吸收产品/配置形态。
-- `rs`/`restart` 空闲态：仅 **claude** 列 `~/.claude/projects` 会话列表；**codex** 空闲直接 `restart(true)`（resume list 无 codex 数据源，避免空列表误导）。
+- `fk`/`bk`/进程已停时的 `rs` 使用 backend-native 会话能力：Claude 以 transcript + `forkSession/resumeSessionAt` 实现，Codex 以 app-server `thread/list` + `thread/fork(lastTurnId)` 实现。共享 checkpoint 必须携带 provider、源会话 id 与原生锚点；Claude fork 在首条输入前必须持久化 pending launch，materialize 新 session id 后才能清除。禁止扫描/复制 Codex rollout、重建旁路索引或把 fork 失败静默退化成 resume。
+- 临时会话选择卡只携带 `panel_id` + opaque `choice_id`，provider/cwd/source/owner/launch 留在 Session 的短期 panel state；禁止把可执行的 thread id、anchor 数组下标或本机路径直接信任为回调真相源。
+- `rs`/`restart` 空闲态：双后端都列同一 cwd 历史并做 history fork 独立分支（Claude 读 transcript，Codex 调 `thread/list(cwd=...)`）；进程存活时仍打断 + 弃后台 + 恢复当前会话。
 - Codex 子进程协议集中在 `codex-process.ts`；新增 app-server 方法或通知映射时要同时考虑 `Session` 事件处理和卡片展示。
 - Card Kit 写操作必须经过 `cardkit.ts` 的队列和 sequence 逻辑；不要从 session 或脚本直接 `fetch` 修改同一张生产卡。
 - 处理附件、文件返回和项目目录时使用 `feishu.ts` 里的 sanitizer、upload/download/provision helper。
@@ -112,8 +114,8 @@
 - `tasklist-worker` 启动后延迟 15 秒首次扫描，此后每 30 秒扫描一次；同一时间只跑一个 scan，运行记录写入 `tasklist-map.json` 并在进程丢失时向任务评论暴露错误。
 - 任务自动执行使用 `AI-AUTO`/`AI-REVIEW` 本地 worktree 和 `AI-AUTO/<task-guid>` tag 作为审查产物；人工在 `[AI]待审核` 中勾选完成是触发本地合并的信号。
 - 入站多条消息合并走 `session-multimsg.ts` 状态机 + `inbound-markers.ts` 解析;`>>>`/`<<<` 阈值 ≥3,缓冲只活在内存(daemon 重启会丢并打 ❌ 让失败可见,符合 no_fallbacks)。
-- 临时会话 `fk`/`bk` 的 turn 锚点用 daemon 记的 turn-map(每 turn 的 assistant uuid + Write 记录,是 transcript 的预存索引,同源);`rs` 空闲态的历史列表直接读 claude code transcript 目录(`~/.claude/projects/<encoded-cwd>/*.jsonl`),不维护自有会话索引——之前的 resume-map + 后缀归属判断会漏会话并把 worktree 群误归项目。
-- `rs` 是 `restart` 的别名,但行为分两种:会话进行中 = 打断 + 弃后台 + `--resume` 恢复上一会话;空闲态 = 列项目最近 24h 会话供选择恢复(比"只恢复上一会话"实用)。
+- 临时会话 `fk`/`bk` 的 turn 锚点用 daemon 记的 V4 turn-map(checkpoint + preview + writes);`rs` 空闲态的历史发现由后端自己负责(Claude transcript / Codex `thread/list`),不维护自有会话索引——之前的 resume-map + 后缀归属判断会漏会话并把 worktree 群误归项目。
+- `rs` 是 `restart` 的别名,但行为分两种:进程存活 = 打断 + 弃后台 + 恢复当前会话;空闲/进程已停 = 列同一 cwd 历史,选一个创建独立分支(源会话不动)。
 - Assistant 正文和 footer 状态不再走 Card Kit `/content` 打字流；正文在完整 `agentMessage` 到达后一次性 `addElement`，footer 状态用 `replaceElement` 直接替换。`cardkit.flush` 仅等待同卡片已排队写操作完成。
 - `card.action.trigger` 需要 3 秒内替换原 JSON 卡片时 return `{ card: { type: "raw", data: newCard } }`；不要 return 裸卡片 JSON 或 `{ card: newCard }`，也不要在回调 ACK 前调用 `message.patch`（会和 ACK 响应竞态）。延时更新：ACK 用 toast（不带卡），再用 `feishu.updateCard`（message.patch）改原卡——`/notify` 按钮的两段式反馈(processing→delivered/failed)走这条路径。⚠️ 不要用 `/interactive/v1/card/update` 回调 token 端点:它是 legacy,对 schema-2.0 卡返回 code=0 但渲染空白(2026-07-05 实测)。内联带卡 ACK(Method 1)+ 任何后续更新也不兼容(后续不重绘)。
 - `handleCardAction` 里 `kind:'notify_callback'` 必须在 session 存在性检查**之前**短路(`/notify` 卡片所在的群不一定有 Session);分发走 `notify-callbacks.ts`,点击 → POST 调用方 loopback URL → 2xx 后冻结成已选卡片,失败显式 toast 不兜底。
