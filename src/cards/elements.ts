@@ -58,6 +58,10 @@ export const ELEMENTS = {
   agyResult: 'agy_result',
   agyForward: 'agy_forward',
   agyRepo: 'agy_repo',
+  /** Read-only delegated-agent identity directory panel. */
+  agentIdentityPanel: 'agent_identity_panel',
+  /** Footer on an independent agent-run card. */
+  agentRunFooter: 'agent_run_footer',
   /** Tasklist automation panel. */
   tasklistPanel: 'tasklist_panel',
   /** GSD status panel (TRACKER / active task / bridge). */

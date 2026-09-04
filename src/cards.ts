@@ -104,6 +104,10 @@ export {
   cleanAgyOutputText,
 } from './cards/agy'
 export {
+  type AgentIdentityListCardOpts,
+  agentIdentityListCard,
+} from './cards/agents'
+export {
   type TasklistPanelNotice,
   type TasklistPanelOpts,
   tasklistPanelCard,

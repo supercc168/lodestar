@@ -29,6 +29,7 @@ function isControlCommandText(raw: string): boolean {
   if (/^(?:fk|fork)$/i.test(t)) return true
   if (/^(?:bk|back)$/i.test(t)) return true
   if (/^agy(?:\s+[\s\S]*)?$/i.test(t)) return true
+  if (/^(?:agents|agent)$/i.test(t)) return true
   if (t.toLowerCase() === 'task') return true
   if (isGsdBareword(t)) return true
   return CONTROL_COMMAND_ALIASES.has(t.toLowerCase())
@@ -95,6 +96,10 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
   const agy = raw.trim().match(/^agy(?:\s+([\s\S]+))?$/i)
   if (agy) {
     await s.runAgyCommand((agy[1] ?? '').trim())
+    return true
+  }
+  if (raw.trim().match(/^(?:agents|agent)$/i)) {
+    await s.showAgentIdentityPanel(userOpenId)
     return true
   }
   if (raw.trim().toLowerCase() === 'task') {

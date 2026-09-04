@@ -86,6 +86,7 @@ import * as sessionMultimsg from './session-multimsg'
 import * as mathRender from './math-render'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionAgy from './session-agy'
+import * as sessionAgentIdentities from './session-agent-identities'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
 import * as sessionHostAsk from './session-host-ask'
@@ -2009,6 +2010,14 @@ export class Session {
 
   runAgyCommand(prompt: string): Promise<void> {
     return sessionAgy.runAgyCommand(this, prompt)
+  }
+
+  showAgentIdentityPanel(userOpenId: string): Promise<void> {
+    return sessionAgentIdentities.showAgentIdentityPanel(this, userOpenId)
+  }
+
+  onAgentIdentityPage(panelId: string, pageRaw: unknown, userOpenId: string): ModelActionResult {
+    return sessionAgentIdentities.onAgentIdentityPage(panelId, pageRaw, userOpenId)
   }
 
   stopAgyTask(status = '🛑 agy 已打断'): Promise<boolean> {

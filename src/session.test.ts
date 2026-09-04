@@ -12883,3 +12883,16 @@ describe('Session 簇 3 竞态甄别(上游 ff44afb 簇 3——五域代表例,0
     }
   })
 })
+
+describe('agents command routing', () => {
+  test('agents and agent route to showAgentIdentityPanel with userOpenId', async () => {
+    const session = new Session('agents-panel-route', 'chat_id') as any
+    const seen: string[] = []
+    session.showAgentIdentityPanel = async (openId: string) => { seen.push(openId) }
+
+    expect(await session.runCommand('agents', 'ou_op')).toBe(true)
+    expect(await session.runCommand('agent', 'ou_op2')).toBe(true)
+    expect(seen).toEqual(['ou_op', 'ou_op2'])
+  })
+})
+
