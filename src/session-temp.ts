@@ -20,6 +20,7 @@ import * as feishu from './feishu'
 import * as cards from './cards'
 import { log } from './log'
 import { claudeTranscriptDir } from './claude-agent-process'
+import { isAgentSession } from './agent-session-registry'
 import {
   validateConversationLaunch,
   type ConversationBranchBase,
@@ -218,7 +219,7 @@ function usableBranchBase(s: Session): ConversationBranchBase {
 
 // ── Claude stopped-session history catalog ───────────────────────────
 
-function listClaudeSessions(workDir: string): ConversationSummary[] {
+export function listClaudeSessions(workDir: string): ConversationSummary[] {
   const dir = claudeTranscriptDir(workDir)
   let names: string[]
   try {
@@ -230,6 +231,8 @@ function listClaudeSessions(workDir: string): ConversationSummary[] {
   const all: ConversationSummary[] = []
   for (const name of names) {
     if (!name.endsWith('.jsonl')) continue
+    const sessionId = name.slice(0, -6)
+    if (isAgentSession('claude', sessionId)) continue
     const full = join(dir, name)
     let mtime: number
     try { mtime = statSync(full).mtimeMs } catch (error: any) {
@@ -237,7 +240,7 @@ function listClaudeSessions(workDir: string): ConversationSummary[] {
     }
     all.push({
       provider: 'claude',
-      sessionId: name.slice(0, -6),
+      sessionId,
       cwd: workDir,
       preview: firstUserSummary(full),
       ts: mtime,

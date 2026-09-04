@@ -43,6 +43,7 @@ import {
   type ConversationRef,
   type ConversationSummary,
 } from './conversation'
+import { isAgentSession } from './agent-session-registry'
 import { subagentStepBrief } from './cards/background'
 
 /** 拼 `codex app-server` 命令行:把 provider 覆盖 `-c` 对插在 `--listen` 之前。 */
@@ -1912,6 +1913,7 @@ export class CodexProcess extends EventEmitter {
           : typeof raw.status?.type === 'string'
             ? raw.status.type
             : undefined
+        if (isAgentSession('codex', raw.id)) continue
         conversations.push({
           provider: 'codex',
           sessionId: raw.id,

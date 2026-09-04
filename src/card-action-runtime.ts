@@ -17,7 +17,8 @@ export const SUPPORTED_CARD_ACTION_KINDS = new Set([
   'worktree_disband', 'temp_fork_select', 'temp_back_select', 'temp_resume_select',
   'tasklist_enable', 'tasklist_delete_prompt', 'tasklist_delete_confirm',
   'gsd_refresh', 'gsd_select', 'gsd_continue', 'gsd_pause', 'gsd_complete',
-  'gsd_new_prompt', 'agy_forward_codex', 'notify_callback',
+  'gsd_new_prompt', 'agy_forward_codex', 'agent_identity_page', 'agent_run_cancel',
+  'notify_callback',
 ])
 
 /** Admission validation runs synchronously before actor/dedupe reservation;
@@ -225,6 +226,8 @@ function cardActionSemanticKey(data: any): string {
     case 'gsd_complete':
     case 'gsd_new_prompt': resource = { task_slug: value.task_slug, panel_gen: value.panel_gen }; break
     case 'agy_forward_codex': resource = { result_id: value.result_id }; break
+    case 'agent_identity_page': resource = { panel_id: value.panel_id }; break
+    case 'agent_run_cancel': resource = { run_id: value.run_id }; break
     case 'notify_callback': resource = { notify_id: value.notify_id }; break
     case 'model_select':
     case 'model_effort_select': resource = { panel_id: value.panel_id }; break

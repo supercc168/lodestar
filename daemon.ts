@@ -37,6 +37,8 @@ import {
 } from './src/notify-callbacks'
 import { buildNotifyCardFromReg } from './src/notify'
 import { startNotifyServer } from './src/notify'
+import { AgentService } from './src/agent-service'
+import { handleAgentRequest } from './src/agent-api'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
 import { ensureImagegenSkill } from './src/imagegen-skill'
 import { ensureImagereadSkill } from './src/imageread-skill'
@@ -130,12 +132,16 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
           ...chatActor.pending(),
           ...inflightCardActions,
         ])
-        return await Promise.allSettled([
+        const agentResults = await Promise.allSettled([
+          agentService.shutdown(`daemon ${reason}`),
+        ])
+        const sessionResults = await Promise.allSettled([
           ...[...sessions.values()].map(session =>
             session.stop(`daemon ${reason}`, { announce: false })
           ),
           stopTasklistWorker(),
         ])
+        return [...agentResults, ...sessionResults]
       })()
       let deadlineTimer: ReturnType<typeof setTimeout> | null = null
       const deadline = new Promise<'deadline'>(resolve => {
@@ -194,6 +200,7 @@ process.on('uncaughtException', e => {
 
 // ── Session registry ────────────────────────────────────────────────────
 const sessions = new Map<string, Session>()  // key = chatId
+const agentService = new AgentService()
 let pendingReviveSessionNames = new Set<string>()
 const chatActor = new PerKeyActor()
 const cardActionDeduper = new ActionDeduper(30_000)
@@ -245,6 +252,8 @@ const tempSessionRuntime = createTempSessionRuntime<Session>({
     onLifecycleChange: writeCurrentAliveMarker,
     onCreateTempSession: createTempSession,
     onDisbandTempSession: disbandTempSession,
+    onCancelAgentRuns: (name, chatIdForCancel, reason) =>
+      agentService.cancelSessionRuns(name, chatIdForCancel, reason),
   }),
   ensureChatForSession: feishu.createTempChatForSession,
   disbandChatForSessionExact: feishu.disbandChatForSessionExact,
@@ -550,8 +559,9 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
 // accept() 同步返回 toast ACK(3s 窗口内),业务 handler 在 ACK 之后排队执行,
 // 卡片更新一律走 ACK 后 message.patch(publishCardActionResult)。
 function cardActionLabel(kind: string): string {
-  // 本地 21 kind 全集(01-03 白名单同源);上游的 provider_select/
-  // model_custom_prompt/model_panel_cancel/token_source_enable 本地无此形态不收。
+  // 本地 23 kind 全集(01-03 白名单 + agent_identity_page / agent_run_cancel);
+  // 上游的 provider_select/model_custom_prompt/model_panel_cancel/token_source_enable
+  // 本地无此形态不收。
   const labels: Record<string, string> = {
     permission: '权限决定', menu: '菜单选择', model_select: '模型选择',
     model_effort_select: '模型 effort 选择', ask: '问题回答', host_ask: '宿主问题回答',
@@ -561,7 +571,10 @@ function cardActionLabel(kind: string): string {
     tasklist_delete_confirm: '确认删除任务清单',
     gsd_refresh: 'GSD 面板刷新', gsd_select: 'GSD 任务选择', gsd_continue: 'GSD 任务继续',
     gsd_pause: 'GSD 任务暂停', gsd_complete: 'GSD 任务完成', gsd_new_prompt: 'GSD 新指令',
-    agy_forward_codex: 'agy 结果转交', notify_callback: '通知反馈',
+    agy_forward_codex: 'agy 结果转交',
+    agent_identity_page: 'Agent 身份翻页',
+    agent_run_cancel: '取消 Agent 委派',
+    notify_callback: '通知反馈',
   }
   return labels[kind] ?? kind
 }
@@ -663,6 +676,7 @@ async function publishCardActionResult(data: any, result: any): Promise<void> {
     'permission', 'ask', 'host_ask', 'menu',
     'temp_fork_select', 'temp_back_select', 'temp_resume_select',
     'agy_forward_codex',
+    'agent_identity_page',
   ])
   if (!failed && selfVisibleSuccess.has(kind)) return
   await sendActionReceipt(chatId, `${failed ? '❌' : '✅'} ${label}: ${content}`)
@@ -919,6 +933,34 @@ async function handleCardAction(data: any): Promise<any> {
     case 'agy_forward_codex': {
       const result = session.beginAgyForwardToCodex(String(value.result_id ?? ''), userId)
       return { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
+    }
+    case 'agent_identity_page': {
+      return modelActionResponse(session.onAgentIdentityPage(
+        String(value.panel_id ?? ''), value.page, userId,
+      ))
+    }
+    case 'agent_run_cancel': {
+      const runId = String(value.run_id ?? '')
+      if (!runId) {
+        return withBusinessOutcome(
+          { toast: { type: 'error', content: '缺少 run_id' } },
+          false,
+        )
+      }
+      const cancelled = await agentService.cancelRun(
+        agentService.rootPrincipal(session),
+        runId,
+        'cancelled from Feishu card',
+      )
+      return withBusinessOutcome(
+        {
+          toast: {
+            type: cancelled ? 'success' : 'info',
+            content: cancelled ? '已取消委派' : '该委派已结束',
+          },
+        },
+        true,
+      )
     }
   }
   return { toast: { type: 'info', content: 'unknown action' } }
@@ -1448,7 +1490,19 @@ async function boot(): Promise<void> {
   // notify server starts serving, so a card tapped right after a daemon
   // restart still routes to its caller. Prunes entries older than 7 days.
   loadCallbacks()
-  startNotifyServer({ bind: config.notify.bind, port: config.notify.port })
+  startNotifyServer({
+    bind: config.notify.bind,
+    port: config.notify.port,
+    extraHandler: (req, res, url) => handleAgentRequest(req, res, url, {
+      service: agentService,
+      authorizeSession: capability => {
+        for (const session of sessions.values()) {
+          if (session.acceptsAgentCapability(capability)) return session
+        }
+        return null
+      },
+    }),
+  })
 
   // Sync the feishu-notify skill into ~/.codex/skills (idempotent).
   // Lets the user's main Codex session push to bound groups via
