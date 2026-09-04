@@ -12896,3 +12896,133 @@ describe('agents command routing', () => {
   })
 })
 
+describe('Session delegated-agent capability and cancel', () => {
+  test('accepts only the live process capability and delegates cancellation', async () => {
+    const cancellations: Array<[string, string, string]> = []
+    const session = new Session('agent-capability', 'chat_id', {
+      onCancelAgentRuns: async (name: string, chatId: string, reason: string) => {
+        cancellations.push([name, chatId, reason])
+      },
+    }) as any
+    session.proc = { isAlive: () => true }
+    session.agentCapability = 'secret-capability'
+
+    expect(session.acceptsAgentCapability('secret-capability')).toBe(true)
+    expect(session.acceptsAgentCapability('wrong')).toBe(false)
+    expect(session.acceptsAgentCapability('secret-capabilitx')).toBe(false)
+    session.proc = { isAlive: () => false }
+    expect(session.acceptsAgentCapability('secret-capability')).toBe(false)
+
+    await session.cancelAgentRuns('stop')
+    expect(cancellations).toEqual([['agent-capability', 'chat_id', 'stop']])
+  })
+
+  test('spawnAgent injects LODESTAR_AGENT_* hostEnv into Claude process', () => {
+    const session = new Session('spawn-hostenv', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const proc = session.spawnAgent()
+    expect(proc.opts.hostEnv.LODESTAR_AGENT_URL).toMatch(/^http:\/\//)
+    expect(typeof proc.opts.hostEnv.LODESTAR_AGENT_CAPABILITY).toBe('string')
+    expect(proc.opts.hostEnv.LODESTAR_AGENT_CAPABILITY.length).toBeGreaterThan(20)
+    expect(proc.opts.hostEnv.LODESTAR_AGENT_SESSION).toBe('spawn-hostenv')
+    expect(session.agentCapability).toBe(proc.opts.hostEnv.LODESTAR_AGENT_CAPABILITY)
+  })
+
+  test('stop with runningAgy still calls onCancelAgentRuns before stopAgyTask and does not kill the main process', async () => {
+    const order: string[] = []
+    let killed = false
+    const session = new Session('stop-agy-cancel', 'chat_id', {
+      onCancelAgentRuns: async () => { order.push('cancel') },
+    }) as any
+    session.runningAgy = { id: 'agy1' }
+    session.proc = {
+      provider: 'claude',
+      isAlive: () => true,
+      kill: async () => { killed = true },
+    }
+    session.stopAgyTask = async () => {
+      order.push('agy')
+      return true
+    }
+    session.openStatusCard = async () => null
+    session.closeStatusCard = async () => {}
+    session.closeTurnCard = async () => {}
+
+    expect(await session.runCommand('stop')).toBe(true)
+    expect(order[0]).toBe('cancel')
+    expect(order).toContain('agy')
+    expect(killed).toBe(false)
+  })
+
+  test('idle rs lists history and does not cancel delegated agent runs', async () => {
+    let cancelCalls = 0
+    let listCalled = false
+    const session = new Session('idle-rs-no-cancel', 'chat_id', {
+      onCancelAgentRuns: async () => { cancelCalls++ },
+    }) as any
+    session.proc = { isAlive: () => true, provider: 'claude' }
+    session.currentTurn = null
+    session.pendingUserMessageCount = 0
+    session.pendingMidTurnMsgs = []
+    session.runningAgy = false
+    session.showResumeList = async () => { listCalled = true }
+    session.restart = async () => { throw new Error('idle rs must not restart') }
+
+    await session.runCommand('rs')
+    expect(listCalled).toBe(true)
+    expect(cancelCalls).toBe(0)
+  })
+
+  test('Session.stop cancels agent runs even when idle with no proc', async () => {
+    const reasons: string[] = []
+    const session = new Session('idle-stop-cancel', 'chat_id', {
+      onCancelAgentRuns: async (_name: string, _chatId: string, reason: string) => {
+        reasons.push(reason)
+      },
+    }) as any
+    session.proc = null
+    await session.stop('idle stop', { announce: false })
+    expect(reasons).toEqual(['idle stop'])
+  })
+
+  test('in-progress restart cancels agent runs beside stopAgyTask', async () => {
+    const order: string[] = []
+    const session = new Session('restart-cancel', 'chat_id', {
+      onCancelAgentRuns: async () => { order.push('cancel') },
+    }) as any
+    session.currentTurn = turnState('card-restart-cancel')
+    session.pendingUserMessageCount = 1
+    session.pendingMidTurnMsgs = []
+    session.runningAgy = { id: 'agy' }
+    session.proc = { isAlive: () => true, provider: 'claude' }
+    session.stopAgyTask = async () => { order.push('agy'); return true }
+    session.restart = async () => { order.push('restart'); return true }
+    session.openStatusCard = async () => null
+    session.closeStatusCard = async () => {}
+    session.setStatusCard = () => {}
+    session.withModel = (s: string) => s
+    session.backendLabel = () => 'claude'
+    session.currentProvider = () => 'claude'
+
+    await session.runCommand('rs')
+    expect(order[0]).toBe('cancel')
+    expect(order).toContain('agy')
+    expect(order).toContain('restart')
+  })
+
+  test('unexpected proc exit cancels agent runs', async () => {
+    const reasons: string[] = []
+    const session = new Session('exit-cancel', 'chat_id', {
+      onCancelAgentRuns: async (_name: string, _chatId: string, reason: string) => {
+        reasons.push(reason)
+      },
+    }) as any
+    const proc = new FakeAgentProc('codex', 'thread-exit')
+    session.proc = proc
+    session.wireProc(proc)
+    proc.emit('exit', { code: 1, signal: null, expected: false })
+    await waitFor(() => reasons.length > 0)
+    expect(reasons[0]).toMatch(/codex process exited/)
+  })
+})
+

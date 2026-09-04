@@ -3,7 +3,7 @@ import { describe, expect, test } from 'bun:test'
 // in real config.toml / tenant-token code (keeps this test hermetic).
 import './feishu-test-mock'
 
-import { buildNotifyCard, parseButtons, parseCallbackUrl } from './notify'
+import { buildNotifyCard, dispatchNotifyRequest, parseButtons, parseCallbackUrl } from './notify'
 
 function cardBody(card: any): any[] {
   return (card as any).body.elements as any[]
@@ -273,5 +273,85 @@ describe('parseCallbackUrl', () => {
     expect(parseCallbackUrl('http://example.com/h').error).toMatch(/loopback/)
     expect(parseCallbackUrl('https://127.0.0.1:9999/h').error).toMatch(/http/)
     expect(parseCallbackUrl('not a url').error).toMatch(/bad URL/)
+  })
+})
+
+function fakeRes(): { res: any; body: () => string } {
+  let body = ''
+  const res = {
+    statusCode: 0,
+    headersSent: false,
+    headers: {} as Record<string, string>,
+    setHeader(name: string, value: string) { this.headers[name.toLowerCase()] = value },
+    end(chunk?: string) {
+      if (chunk != null) body += String(chunk)
+      this.headersSent = true
+    },
+  }
+  return { res, body: () => body }
+}
+
+async function* jsonChunks(json: string): AsyncGenerator<Buffer> {
+  yield Buffer.from(json)
+}
+
+describe('notify extraHandler', () => {
+  test('extraHandler returning true skips /notify', async () => {
+    let extraCalls = 0
+    const { res, body } = fakeRes()
+    const req = {
+      method: 'POST',
+      url: '/notify',
+      headers: { host: '127.0.0.1' },
+      async *[Symbol.asyncIterator]() { yield Buffer.from('{"project":"x","text":"hi"}') },
+    } as any
+    await dispatchNotifyRequest({
+      bind: '127.0.0.1',
+      port: 0,
+      extraHandler: async (_req, handlerRes) => {
+        extraCalls++
+        handlerRes.statusCode = 200
+        handlerRes.setHeader('content-type', 'text/plain')
+        handlerRes.end('agents-handled')
+        return true
+      },
+    }, req, res)
+    expect(extraCalls).toBe(1)
+    expect(body()).toBe('agents-handled')
+    expect(res.statusCode).toBe(200)
+  })
+
+  test('extraHandler returning false keeps original notify 400 for missing project', async () => {
+    let extraCalls = 0
+    const { res, body } = fakeRes()
+    const req = {
+      method: 'POST',
+      url: '/notify',
+      headers: { host: '127.0.0.1' },
+      [Symbol.asyncIterator]: () => jsonChunks('{}'),
+    } as any
+    await dispatchNotifyRequest({
+      bind: '127.0.0.1',
+      port: 0,
+      extraHandler: async () => {
+        extraCalls++
+        return false
+      },
+    }, req, res)
+    expect(extraCalls).toBe(1)
+    expect(res.statusCode).toBe(400)
+    expect(body()).toMatch(/missing "project"/)
+  })
+
+  test('GET / help includes /agents/identities', async () => {
+    const { res, body } = fakeRes()
+    const req = {
+      method: 'GET',
+      url: '/',
+      headers: { host: '127.0.0.1' },
+    } as any
+    await dispatchNotifyRequest({ bind: '127.0.0.1', port: 0 }, req, res)
+    expect(res.statusCode).toBe(200)
+    expect(body()).toContain('/agents/identities')
   })
 })
