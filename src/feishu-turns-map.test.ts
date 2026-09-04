@@ -68,13 +68,6 @@ function extract(result: FreshResult): any {
   return JSON.parse(marker[1])
 }
 
-/** 剥 getTurnAnchors 的 V1 读投影字段(PHASE4-TRANSITION),得到纯 V4 形态 —— 用于
- *  断言磁盘持久化不被投影污染(uuid/sid 只存在于返回值,不落盘)。 */
-function pure(anchor: any): any {
-  const { uuid, sid, ...rest } = anchor
-  return rest
-}
-
 describe('session turn checkpoint persistence', () => {
   test('loads V2 checkpoints with an unknown base and null legacy cwd', () => {
     const result = runFreshState(`
@@ -123,8 +116,6 @@ describe('session turn checkpoint persistence', () => {
           preview: 'claude input',
           ts: 100,
           writes: [{ tool: 'Edit', path: '/tmp/a.ts', body: 'after' }],
-          uuid: 'assistant-1',
-          sid: 'claude-session',
         },
         {
           checkpoint: {
@@ -136,8 +127,6 @@ describe('session turn checkpoint persistence', () => {
           preview: 'codex input',
           ts: 200,
           writes: [],
-          uuid: 'turn-2',
-          sid: 'codex-thread',
         },
       ],
     })
@@ -199,8 +188,6 @@ describe('session turn checkpoint persistence', () => {
           preview: 'old input',
           ts: 300,
           writes: [{ tool: 'Write', path: '/tmp/old.ts', body: '' }],
-          uuid: 'assistant-old',
-          sid: 'claude-ancestor',
         },
         {
           checkpoint: {
@@ -208,8 +195,6 @@ describe('session turn checkpoint persistence', () => {
             source: { provider: 'claude', sessionId: 'claude-other-ancestor', cwd: null },
           },
           preview: 'older', ts: 301, writes: [],
-          uuid: 'assistant-older',
-          sid: 'claude-other-ancestor',
         },
       ],
       codex: [],
@@ -264,7 +249,7 @@ describe('session turn checkpoint persistence', () => {
     // null 绝不当 fresh,fresh 必须显式持久化。
     expect(output.persisted).toEqual({
       fresh: { base: { kind: 'fresh' }, anchors: [] },
-      forked: { base: output.fullFork, anchors: output.anchors.map(pure) },
+      forked: { base: output.fullFork, anchors: output.anchors },
     })
   })
 
@@ -307,7 +292,7 @@ describe('session turn checkpoint persistence', () => {
         },
       },
     })
-    expect(output.persisted).toEqual({ base: output.base, anchors: output.anchors.map(pure) })
+    expect(output.persisted).toEqual({ base: output.base, anchors: output.anchors })
   })
 
   test('round-trips and clears a durable pending Claude fork without losing branch state', () => {
@@ -489,12 +474,10 @@ describe('session turn checkpoint persistence', () => {
     expect(output.base).toBeNull()
   })
 
-  test('getTurnAnchors projects uuid/sid for V1 consumers; projection stays out of the persisted V4 state', () => {
-    // PHASE4-TRANSITION 读投影(删除责任 04-07——panel 状态机(04-06)已改读
-    // checkpoint,剩余 V1 消费面只在 daemon 旧调用侧,daemon 翻转收口后随之删):
-    // getTurnAnchors 返回值投影 uuid/sid;磁盘保持纯 V4。truncateTurnAnchors 过渡
-    // 壳已随 04-06 bk branchState 换代删除,截断经 replaceTurnAnchors 原子换——
-    // 投影副本回流写入口时被 canonicalTurnAnchor 剥除,正是本测试锁定的语义。
+  test('getTurnAnchors returns pure V4; extra uuid/sid stay out of the persisted state', () => {
+    // 04-07 删读投影:getTurnAnchors 返回纯 {checkpoint,preview,ts,writes}。
+    // truncateTurnAnchors 过渡壳已随 04-06 删除,截断经 replaceTurnAnchors 原子换——
+    // 回流写入口仍被 canonicalTurnAnchor 剥除额外字段。
     const result = runFreshState(`
       feishu.appendTurnAnchorChecked('project', {
         checkpoint: {
@@ -532,8 +515,6 @@ describe('session turn checkpoint persistence', () => {
           source: { provider: 'claude', sessionId: 'claude-sid', cwd: null },
         },
         preview: 'first', ts: 1, writes: [],
-        uuid: 'assistant-1',
-        sid: 'claude-sid',
       },
     ])
     expect(output.base).toBeNull()
@@ -790,7 +771,7 @@ describe('session conversation state cleanup', () => {
       keep: { provider: 'codex', model: 'gpt-5.5', effort: 'medium' },
     })
     expect(output.persisted.turns).toEqual({
-      keep: { base: null, anchors: output.keep.turns.map(pure) },
+      keep: { base: null, anchors: output.keep.turns },
     })
   })
 

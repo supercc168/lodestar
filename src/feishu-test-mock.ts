@@ -67,7 +67,7 @@ export const feishuMockState = {
   /** listSectionTasks 覆盖:测试可让扫描挂起(轮转上限用例)或返回定制任务。 */
   listSectionTasks: null as null | ((guid: string, completed?: boolean) => Promise<unknown[]>),
   /** getTurnAnchors 替身返回值(01-10:fk/bk 选择处理需要非空锚点走成功路径)。 */
-  turnAnchors: [] as Array<{ uuid: string; sid: string; preview: string; ts: number; writes: unknown[] }>,
+  turnAnchors: [] as TurnAnchor[],
   /** updateCard 替身钩子(01-14 / 上游 7c14677 setUpdateCardHandler:迁移快照
    *  竞态用例在 updateCard await 窗口内注入 task 终态)。 */
   updateCard: null as null | ((messageId: string, card: object) => Promise<void>),
@@ -115,12 +115,6 @@ function normalizeResumeArgs(
     sessionId: sessionIdOrRef,
     cwd: cwd ?? null,
   }
-}
-
-/** getTurnAnchors 容器路径的 uuid/sid 读投影(与真实 feishu.ts PHASE4-TRANSITION
- *  投影同形:uuid=checkpoint.id、sid=checkpoint.source.sessionId)。 */
-function projectAnchors(anchors: TurnAnchor[]): Array<TurnAnchor & { uuid: string; sid: string }> {
-  return anchors.map(a => ({ ...a, uuid: a.checkpoint.id, sid: a.checkpoint.source.sessionId }))
 }
 
 mock.module('./feishu', () => ({
@@ -237,7 +231,7 @@ mock.module('./feishu', () => ({
     return `comment_${addedTaskComments.length}`
   },
   // 临时群 / fork / back / rs 相关 stub(V4 容器 + checked 系列,上游 ff44afb/4185808;
-  // feishuMockState.turnAnchors 为既有 V1 显式替身,优先于容器返回——01-10 用例零改动)
+  // feishuMockState.turnAnchors 为显式替身,优先于容器返回——01-10 用例零改动)
   // 与真实实现同一正则(ff44afb 簇 4 workDir 三形态用例依赖真实剥后缀语义;
   // 既有用例全部使用普通群名 → 恒 null,行为零变化)。
   tempProjectName: (sessionName: string) =>
@@ -257,7 +251,9 @@ mock.module('./feishu', () => ({
   },
   getTurnAnchors: (sessionName: string) => feishuMockState.turnAnchors.length
     ? feishuMockState.turnAnchors
-    : projectAnchors(turnAnchorsBySession.get(sessionName) ?? []),
+    : (turnAnchorsBySession.get(sessionName) ?? []).map(a => ({
+      checkpoint: a.checkpoint, preview: a.preview, ts: a.ts, writes: a.writes,
+    })),
   getSessionBranchBase: (sessionName: string) => branchBaseBySession.get(sessionName) ?? null,
   getPendingConversationLaunch: (sessionName: string) =>
     pendingConversationLaunchBySession.get(sessionName) ?? null,
@@ -286,8 +282,8 @@ mock.module('./feishu', () => ({
   ) => {
     if (turnAnchorWriteError) throw turnAnchorWriteError
     clearedTurnAnchors.push(sessionName)
-    // 写入口剥回流字段(与真实 canonicalTurnAnchor 同语义):getTurnAnchors 投影
-    // (uuid/sid)round-trip 回写时不得污染容器——rollbackTo restore 快照依赖。
+    // 写入口剥回流字段(与真实 canonicalTurnAnchor 同语义):uuid/sid 等额外字段
+    // round-trip 回写时不得污染容器——rollbackTo restore 快照依赖。
     const copied = anchors.map(a => ({ checkpoint: a.checkpoint, preview: a.preview, ts: a.ts, writes: a.writes }))
     seededTurnAnchors.push([sessionName, copied])
     turnAnchorsBySession.set(sessionName, copied)

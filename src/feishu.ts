@@ -632,8 +632,7 @@ function clonePendingConversationLaunch(pending: PendingConversationLaunch): Pen
   }
 }
 
-/** 入库前归一到纯 V4 形态:getTurnAnchors 的 uuid/sid 读投影(PHASE4-TRANSITION)
- *  可能被调用方原样喂回(replace/seed),此处剥掉多余字段,保证内存 store 与磁盘
+/** 入库前归一到纯 V4 形态:剥掉 uuid/sid 等回流字段,保证内存 store 与磁盘
  *  持久化永远只有 {checkpoint, preview, ts, writes}。 */
 function canonicalTurnAnchor(anchor: TurnAnchor): TurnAnchor {
   return {
@@ -753,14 +752,12 @@ export function appendTurnAnchorChecked(sessionName: string, anchor: TurnAnchor)
   }
 }
 
-// PHASE4-TRANSITION: 返回值 uuid/sid 读投影(删除责任 04-06——session-temp panel
-// 状态机改读 checkpoint 后删投影,恢复上游纯 V4 返回形)。投影只存在于返回的副本,
-// 内存 store 与磁盘保持纯 V4(canonicalTurnAnchor 在写入口剥除回流字段)。
-export function getTurnAnchors(sessionName: string): Array<TurnAnchor & { uuid: string; sid: string }> {
+export function getTurnAnchors(sessionName: string): TurnAnchor[] {
   return (turnsBySession.get(sessionName)?.anchors ?? []).map(a => ({
-    ...a,
-    uuid: a.checkpoint.id,
-    sid: a.checkpoint.source.sessionId,
+    checkpoint: a.checkpoint,
+    preview: a.preview,
+    ts: a.ts,
+    writes: a.writes,
   }))
 }
 

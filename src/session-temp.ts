@@ -199,12 +199,10 @@ function forkLaunch(checkpoint: feishu.TurnAnchor['checkpoint']): Extract<Conver
 }
 
 /** fk/bk 锚列表:只列当前 provider + cwd 匹配的 checkpoint(跨后端/跨目录的
- *  锚不可用作当前会话的分叉点)。剥 getTurnAnchors 的 uuid/sid 读投影
- *  (PHASE4-TRANSITION,daemon 旧调用面独占;panel choice 载荷保持纯 V4)。 */
+ *  锚不可用作当前会话的分叉点)。getTurnAnchors 已是纯 V4。 */
 function eligibleAnchors(s: Session): feishu.TurnAnchor[] {
   return feishu.getTurnAnchors(s.sessionName)
     .filter(anchor => anchor.checkpoint.provider === s.selectedProvider && anchor.checkpoint.source.cwd === s.workDir)
-    .map(({ checkpoint, preview, ts, writes }) => ({ checkpoint, preview, ts, writes }))
 }
 
 function usableBranchBase(s: Session): ConversationBranchBase {
