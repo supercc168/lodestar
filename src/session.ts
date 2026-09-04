@@ -1807,7 +1807,9 @@ export class Session {
     validateConversationLaunch(launch, provider, this.workDir)
     this.agentCapability = randomBytes(32).toString('base64url')
     const hostEnv = {
-      LODESTAR_AGENT_URL: agentApiUrl(config.notify.bind, config.notify.port),
+      // 全量 bun test 时字母序更早的 mock.module('./config') 可能不含 notify
+      // 段(claude-agent-process/codex-models)；缺省与 config.ts 默认一致。
+      LODESTAR_AGENT_URL: agentApiUrl(config.notify?.bind ?? '127.0.0.1', config.notify?.port ?? 9876),
       LODESTAR_AGENT_CAPABILITY: this.agentCapability,
       LODESTAR_AGENT_SESSION: this.sessionName,
     }

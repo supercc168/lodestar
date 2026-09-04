@@ -364,7 +364,8 @@ export class AgentService {
           run.session ? worktreeProjectName(run.session) : run.snapshot.sessionName,
         )),
         hostEnv: {
-          LODESTAR_AGENT_URL: agentApiUrl(config.notify.bind, config.notify.port),
+          // 同 session.spawnAgent：全量测试泄漏的残缺 config mock 不含 notify。
+          LODESTAR_AGENT_URL: agentApiUrl(config.notify?.bind ?? '127.0.0.1', config.notify?.port ?? 9876),
           LODESTAR_AGENT_CAPABILITY: capability,
           LODESTAR_AGENT_SESSION: run.snapshot.sessionName,
         },
