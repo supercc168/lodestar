@@ -2186,6 +2186,25 @@ describe('codex thread/list 历史目录(上游 ff44afb)', () => {
     await expect(noData.proc.listConversations()).rejects.toThrow(/no data array/)
   })
 
+  test('thread/list skips delegated Agent native sessions', async () => {
+    const { resetAgentSessionRegistryForTest } = await import('./agent-session-registry')
+    resetAgentSessionRegistryForTest(['codex:delegated-thread'])
+    try {
+      const workDir = '/work'
+      const { proc } = catalogHarness(workDir, () => ({
+        data: [
+          { id: 'delegated-thread', preview: 'agent work', updatedAt: 1700000001, cwd: workDir, status: 'idle' },
+          { id: 'main-thread', preview: 'main work', updatedAt: 1700000002, cwd: workDir, status: 'idle' },
+        ],
+        nextCursor: null,
+      }))
+      const rows = await proc.listConversations()
+      expect(rows.map((row: { sessionId: string }) => row.sessionId)).toEqual(['main-thread'])
+    } finally {
+      resetAgentSessionRegistryForTest()
+    }
+  })
+
   test('readConversationRef:thread/read {includeTurns:false} 以权威 cwd 组装 ConversationRef', async () => {
     const { proc, requests } = catalogHarness('/work', () => ({
       thread: { id: 'legacy-thread', cwd: '/authoritative' },

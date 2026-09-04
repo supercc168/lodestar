@@ -183,6 +183,22 @@ describe('card action identity', () => {
     expect(validateCardActionAdmission(data({ kind: 'gsd_refresh', task_slug: 'a', panel_gen: 'g1' }))).toBeNull()
     expect(validateCardActionAdmission(data({ kind: 'host_ask', tool_use_id: 't', question_idx: 0 }))).toBeNull()
     expect(validateCardActionAdmission(data({ kind: 'agy_forward_codex', result_id: 'r' }))).toBeNull()
+    expect(validateCardActionAdmission(data({ kind: 'agent_identity_page', panel_id: 'p', page: 1 }))).toBeNull()
+    expect(validateCardActionAdmission(data({ kind: 'agent_run_cancel', run_id: 'run_1' }))).toBeNull()
+  })
+
+  test('agent_identity_page keys by panel_id so different pages of the same panel collapse', () => {
+    expect(cardActionDedupeKey(data({ kind: 'agent_identity_page', panel_id: 'panel-a', page: 0 })))
+      .toBe(cardActionDedupeKey(data({ kind: 'agent_identity_page', panel_id: 'panel-a', page: 1 })))
+    expect(cardActionDedupeKey(data({ kind: 'agent_identity_page', panel_id: 'panel-a', page: 0 })))
+      .not.toBe(cardActionDedupeKey(data({ kind: 'agent_identity_page', panel_id: 'panel-b', page: 0 })))
+  })
+
+  test('agent_run_cancel keys by run_id so same-run replay hits the tombstone', () => {
+    expect(cardActionDedupeKey(data({ kind: 'agent_run_cancel', run_id: 'run_1' })))
+      .toBe(cardActionDedupeKey(data({ kind: 'agent_run_cancel', run_id: 'run_1' })))
+    expect(cardActionDedupeKey(data({ kind: 'agent_run_cancel', run_id: 'run_1' })))
+      .not.toBe(cardActionDedupeKey(data({ kind: 'agent_run_cancel', run_id: 'run_2' })))
   })
 
   test('defers work beyond the current microtask checkpoint', async () => {

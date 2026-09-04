@@ -23,6 +23,7 @@ import {
   turnAnchorsBySession,
 } from './feishu-test-mock'
 import {
+  listClaudeSessions,
   onBackSelect,
   onForkSelect,
   onResumeSelect,
@@ -32,6 +33,7 @@ import {
   showForkList,
   showResumeList,
 } from './session-temp'
+import { resetAgentSessionRegistryForTest } from './agent-session-registry'
 
 interface TempHarnessState {
   routing: ConversationRouting
@@ -418,6 +420,29 @@ async function withClaudeHistory(
     rmSync(configDir, { recursive: true, force: true })
   }
 }
+
+describe('Claude history excludes delegated Agent native sessions', () => {
+  test('registered claude session ids do not appear in listClaudeSessions', () => {
+    const configDir = mkdtempSync(join(tmpdir(), 'lodestar-claude-agent-history-'))
+    const previousConfigDir = process.env.CLAUDE_CONFIG_DIR
+    const workDir = '/workspace/project'
+    const transcriptDir = join(configDir, 'projects', workDir.replace(/[^a-zA-Z0-9]/g, '-'))
+    mkdirSync(transcriptDir, { recursive: true })
+    const line = (content: string) => `${JSON.stringify({ type: 'queue-operation', operation: 'enqueue', content })}\n`
+    writeFileSync(join(transcriptDir, 'delegated.jsonl'), line('child work'))
+    writeFileSync(join(transcriptDir, 'main.jsonl'), line('main work'))
+    process.env.CLAUDE_CONFIG_DIR = configDir
+    resetAgentSessionRegistryForTest(['claude:delegated'])
+    try {
+      expect(listClaudeSessions(workDir).map(item => item.sessionId)).toEqual(['main'])
+    } finally {
+      resetAgentSessionRegistryForTest()
+      if (previousConfigDir === undefined) delete process.env.CLAUDE_CONFIG_DIR
+      else process.env.CLAUDE_CONFIG_DIR = previousConfigDir
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+})
 
 describe('session-temp Codex btw/fork(上游 ff44afb)', () => {
   test('btw 以当前 routing 和原 workDir 创建 fresh 会话(双后端)', async () => {
