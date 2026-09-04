@@ -1,10 +1,8 @@
-import { afterEach, describe, expect, mock, test } from 'bun:test'
+import { describe, expect, mock, spyOn, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
-
-let worktreeExtra: { path: string; content: string; slug: string } | null = null
 
 mock.module('node:child_process', () => {
   const actual = require('node:child_process') as typeof import('node:child_process')
@@ -15,21 +13,9 @@ mock.module('node:child_process', () => {
       child.stdout = new PassThrough()
       child.stderr = new PassThrough()
       child.stdin = new PassThrough()
+      child.pid = 4242
       child.kill = () => true
       return child
-    },
-  }
-})
-
-mock.module('./worktree', () => {
-  const actual = require('./worktree') as typeof import('./worktree')
-  return {
-    ...actual,
-    readWorktreeInstructionsForManagedBranch: (
-      ...args: Parameters<typeof actual.readWorktreeInstructionsForManagedBranch>
-    ) => {
-      if (worktreeExtra) return worktreeExtra
-      return actual.readWorktreeInstructionsForManagedBranch(...args)
     },
   }
 })
@@ -46,10 +32,7 @@ const {
 } = await import('./session-worktree')
 const { CHANNEL_INSTRUCTIONS, CLAUDE_CHANNEL_INSTRUCTIONS } = await import('./instructions')
 const { config } = await import('./config')
-
-afterEach(() => {
-  worktreeExtra = null
-})
+const worktree = await import('./worktree')
 
 describe('createAgentProcess slim factory', () => {
   test('Claude constructor keeps selectionModel and never the SDK bare name', () => {
@@ -188,25 +171,29 @@ describe('delegatedAgentDeveloperInstructions', () => {
   })
 
   test('can include worktree extra without channel markers', () => {
-    worktreeExtra = {
+    const spy = spyOn(worktree, 'readWorktreeInstructionsForManagedBranch').mockReturnValue({
       path: '/tmp/wt.md',
       content: 'keep the feature branch',
       slug: 'feat',
+    })
+    try {
+      const s = {
+        sessionName: 'demo',
+        workDir: '/tmp/demo',
+        currentProvider: () => 'codex' as const,
+      } as any
+      const text = delegatedAgentDeveloperInstructions(s, 'codex')
+      expect(text).toContain('keep the feature branch')
+      expect(text).not.toContain('AskUserQuestion')
+      expect(text).not.toContain('request_user_input')
+    } finally {
+      spy.mockRestore()
     }
-    const s = {
-      sessionName: 'demo',
-      workDir: '/tmp/demo',
-      currentProvider: () => 'codex' as const,
-    } as any
-    const text = delegatedAgentDeveloperInstructions(s, 'codex')
-    expect(text).toContain('keep the feature branch')
-    expect(text).not.toContain('AskUserQuestion')
-    expect(text).not.toContain('request_user_input')
   })
 })
 
 describe('agent-launch port discipline', () => {
-  test('source calls resolveTokenSource and never getTokenSource', () => {
+  test('source calls resolveTokenSource and never the upstream registry lookup', () => {
     const src = readFileSync(join(import.meta.dir, 'agent-launch.ts'), 'utf8')
     const code = src
       .split('\n')

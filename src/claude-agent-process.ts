@@ -135,6 +135,8 @@ export interface ClaudeSpawnOpts extends SpawnOpts {
    * strict-mcp / project-mcp loading for an isolated session. Absent ⇒
    * Lodestar defaults (user sources, claude_code preset, no project MCP). */
   profile?: ProjectProfile
+  /** Host-owned env (capability / agent URL) merged last so scrub cannot drop it. */
+  hostEnv?: Record<string, string | undefined>
 }
 
 type ClaudePathLookup = {
@@ -257,6 +259,18 @@ function findClaudeBin(lookup: ClaudePathLookup = {}): string | null {
   const found = whichClaude(lookup)
   if (found) return found
   return null
+}
+
+function mergeHostEnv(
+  env: Record<string, string>,
+  hostEnv?: Record<string, string | undefined>,
+): Record<string, string> {
+  if (!hostEnv) return env
+  const merged = { ...env }
+  for (const [key, value] of Object.entries(hostEnv)) {
+    if (value !== undefined) merged[key] = value
+  }
+  return merged
 }
 
 export function assertClaudeCodeAvailable(): void {
@@ -966,7 +980,10 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   private buildSpawnEnv(): Record<string, string> {
-    return resolveTokenSource('claude', this.opts.model).spawnEnv(this.buildSpawnBaseEnv())
+    return mergeHostEnv(
+      resolveTokenSource('claude', this.opts.model).spawnEnv(this.buildSpawnBaseEnv()),
+      this.opts.hostEnv,
+    )
   }
 
   sendInitialize(): void {
@@ -1005,6 +1022,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           Object.entries(spawnEnv).map(([k, v]) => [k, ONE_M_SUFFIX_RE.test(v) ? stripOneMSuffix(v) : v]),
         )
       }
+      spawnEnv = mergeHostEnv(spawnEnv, this.opts.hostEnv)
       const routeLabel = isApiRoute ? 'api' : 'login'
       const reasoningOptions = claudeSdkReasoningOptions(this.opts.model, this.opts.effort)
       const reasoningLabel = reasoningOptions.thinking

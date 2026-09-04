@@ -112,8 +112,11 @@ export function buildSpawnPath(inherited: string = process.env.PATH ?? ''): stri
 /** Environment passed to the Codex app-server. GSD Core resolves its runtime
  * from this child environment before persisted defaults; keep the lock last
  * so a stale Claude value cannot route a GPT Feishu session elsewhere. */
-export function buildCodexSpawnEnv(providerEnv: Record<string, string> = {}): Record<string, string> {
-  return {
+export function buildCodexSpawnEnv(
+  providerEnv: Record<string, string> = {},
+  hostEnv?: Record<string, string | undefined>,
+): Record<string, string> {
+  const env: Record<string, string> = {
     ...(process.env as Record<string, string>),
     NPM_CONFIG_LOGLEVEL: 'error',
     PATH: buildSpawnPath(),
@@ -121,6 +124,12 @@ export function buildCodexSpawnEnv(providerEnv: Record<string, string> = {}): Re
     ...providerEnv,
     GSD_RUNTIME: 'codex',
   }
+  if (hostEnv) {
+    for (const [key, value] of Object.entries(hostEnv)) {
+      if (value !== undefined) env[key] = value
+    }
+  }
+  return env
 }
 
 const CODEX_SESSIONS_DIR = join(homedir(), '.codex', 'sessions')
@@ -143,6 +152,11 @@ export interface SpawnOpts {
   configArgs?: string[]
   /** 叠加进 spawn env 的 provider 接入变量(装 api_key)。缺省 = 无注入。 */
   providerEnv?: Record<string, string>
+  /** Host-owned env (capability / agent URL) merged last so scrub cannot drop it. */
+  hostEnv?: Record<string, string | undefined>
+  /** App-server conversation source label. Delegated agents use lodestar-agent
+   * so their threads can be excluded from main rs/fk history. */
+  serviceName?: string
 }
 
 /** max / ultra 是 GPT-5.6 系新增的两档(高于 xhigh):max 延长思维链预算,
@@ -404,7 +418,7 @@ export class CodexProcess extends EventEmitter {
       cwd: opts.workDir,
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: process.platform === 'win32',
-      env: buildCodexSpawnEnv(opts.providerEnv),
+      env: buildCodexSpawnEnv(opts.providerEnv, opts.hostEnv),
     }) as ChildProcessByStdio<Writable, Readable, Readable>
 
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))
@@ -1758,7 +1772,7 @@ export class CodexProcess extends EventEmitter {
       ...(this.opts.model ? { model: this.opts.model } : {}),
       effort: this.opts.effort,
       ...(this.opts.appendSystemPrompt ? { developerInstructions: this.opts.appendSystemPrompt } : {}),
-      serviceName: 'lodestar',
+      serviceName: this.opts.serviceName ?? 'lodestar',
     }
   }
 
