@@ -1,3 +1,4 @@
+import { realpathSync } from 'node:fs'
 import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -297,7 +298,14 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {
+function isMainModule(argv1: string | undefined): boolean {
+  if (!argv1) return false
+  let entry = resolve(argv1)
+  try { entry = realpathSync(argv1) } catch { /* dangling symlink / missing file */ }
+  return entry === fileURLToPath(import.meta.url)
+}
+
+if (isMainModule(process.argv[1])) {
   main().catch(error => {
     process.stderr.write(`lodestar-agent: ${messageOf(error)}\n`)
     process.exitCode = 1
