@@ -48,7 +48,34 @@ describe('delegated Agent cards', () => {
     expect(card).toContain(agentWorkerElementId(identity.id))
     expect(card).toContain('agent_run_cancel')
     expect(card).toContain('"run_id":"agent_r"')
+    expect(card).toContain('取消委派')
+    expect(card).toContain('column_set')
+    expect(card).not.toMatch(/"tag":"action"/)
     expect(card).not.toContain('评审角色')
+    const cancelValue = JSON.parse(card).body.elements.at(-1).columns[0].elements[0].behaviors[0].value
+    expect(cancelValue).toEqual({ kind: 'agent_run_cancel', run_id: 'agent_r' })
+  })
+
+  test('queued dual-worker cancel is a schema 2.0 column_set at elements[4]', () => {
+    const run: AgentRunSnapshot = {
+      runId: 'agent_q', sessionName: 'project', chatId: 'chat', workDir: '/repo', prompt: 'pong',
+      depth: 1, status: 'queued', createdAt: new Date().toISOString(),
+      workers: [
+        {
+          identityId: identity.id, identityName: identity.displayName, tokenSourceId: 'claude:glm', provider: 'claude',
+          model: identity.model, effort: 'max', status: 'queued', output: '', steps: [],
+        },
+        {
+          identityId: 'agent:b', identityName: 'Claude · GLM-5.3 Flash', tokenSourceId: 'claude:glm-flash', provider: 'claude',
+          model: 'claude:glm-flash', effort: 'max', status: 'queued', output: '', steps: [],
+        },
+      ],
+    }
+    const parsed = JSON.parse(JSON.stringify(agentRunCard(run)))
+    expect(parsed.body.elements).toHaveLength(5)
+    expect(parsed.body.elements[4].tag).toBe('column_set')
+    expect(JSON.stringify(parsed)).not.toMatch(/"tag":"action"/)
+    expect(JSON.stringify(parsed)).toContain('agent_run_cancel')
   })
 
   test('omits the cancel button on a terminal run', () => {
