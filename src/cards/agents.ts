@@ -170,23 +170,20 @@ function pager(opts: AgentIdentityListCardOpts): object {
 
 function agentRunCancelElement(runId: string): object {
   return {
-    tag: 'action',
-    actions: [{
-      tag: 'button',
-      text: { tag: 'plain_text', content: '取消委派' },
-      type: 'danger',
-      behaviors: [{ type: 'callback', value: { kind: 'agent_run_cancel', run_id: runId } }],
-    }],
+    tag: 'column_set',
+    columns: [
+      buttonColumn('取消委派', { kind: 'agent_run_cancel', run_id: runId }, 'danger'),
+    ],
   }
 }
 
-function buttonColumn(text: string, value: Record<string, unknown>): object {
+function buttonColumn(text: string, value: Record<string, unknown>, type = 'default'): object {
   return {
     tag: 'column', width: 'weighted', weight: 1,
     elements: [{
       tag: 'button',
       text: { tag: 'plain_text', content: text },
-      type: 'default',
+      type,
       behaviors: [{ type: 'callback', value }],
     }],
   }
