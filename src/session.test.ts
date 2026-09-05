@@ -9012,6 +9012,25 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
     }
   })
 
+  // 上游 f7a4859：实时 footer 单次失败不升群告警。本地 cardkit 已按
+  // elementId===footer 跳过 elevate；session 再显式传 notifyCardFailure:false，
+  // 终态 footer 仍走 checked / 显式 onFailure。
+  test('live footer ticks pass notifyCardFailure: false', async () => {
+    const session = new Session('footer-notify-opt', 'chat_id') as any
+    const replaceSpy = spyOn(cardkit, 'replaceElement').mockResolvedValue(undefined)
+    try {
+      await session.replaceFooterContent('card_footer_opt', 'Writing(1s)')
+      expect(replaceSpy).toHaveBeenCalledTimes(1)
+      const args = replaceSpy.mock.calls[0]
+      expect(args[0]).toBe('card_footer_opt')
+      expect(args[1]).toBe('footer')
+      expect(args[3]).toBeUndefined()
+      expect(args[4]).toEqual({ notifyCardFailure: false })
+    } finally {
+      replaceSpy.mockRestore()
+    }
+  })
+
   // 网络 fetch failed 重试耗尽后也不换卡、不烧 cap。
   test('network write failure does not rotate or consume the failure cap', async () => {
     const session = new Session('network-no-rotate', 'chat_id') as any
