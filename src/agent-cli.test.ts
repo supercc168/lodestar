@@ -1,5 +1,14 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, rmSync, symlinkSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { spawnSync } from 'node:child_process'
 import { parsePromptArgs } from './agent-cli'
+
+const temps: string[] = []
+afterEach(() => {
+  for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true })
+})
 
 describe('lodestar-agent CLI args', () => {
   test('parses a parallel full-Agent run', () => {
@@ -36,5 +45,25 @@ describe('lodestar-agent host env', () => {
       if (prevCap === undefined) delete process.env.LODESTAR_AGENT_CAPABILITY
       else process.env.LODESTAR_AGENT_CAPABILITY = prevCap
     }
+  })
+})
+
+describe('lodestar-agent main-module guard', () => {
+  test('follows an npm-style symlink to the bundle for --help', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-agent-cli-'))
+    temps.push(dir)
+    const bundle = join(dir, 'lodestar-agent.js')
+    const built = spawnSync('bun', [
+      'build', 'src/agent-cli.ts', '--target=node', '--outfile', bundle,
+    ], { cwd: join(import.meta.dir, '..'), encoding: 'utf8' })
+    expect(built.status).toBe(0)
+    const shim = join(dir, 'lodestar-agent')
+    symlinkSync(bundle, shim)
+    const viaShim = spawnSync('node', [shim, '--help'], { encoding: 'utf8' })
+    expect(viaShim.status).toBe(0)
+    expect(viaShim.stdout).toContain('Usage:')
+    const viaBundle = spawnSync('node', [bundle, '--help'], { encoding: 'utf8' })
+    expect(viaBundle.status).toBe(0)
+    expect(viaBundle.stdout).toContain('Usage:')
   })
 })
