@@ -192,7 +192,7 @@ daemon 为本地已配置的固定档位各生成一条 Agent 身份（`listToke
 
 `lodestar-agent` 只能在 Lodestar 管理的 Agent 进程内使用。本机 API 为 `GET /agents/identities`、`POST /agents/runs`、`GET|DELETE /agents/runs/<id>`、`POST /agents/runs/<id>/answer` 与 `POST /agents/runs/<id>/follow-up`，挂在既有 notify loopback 端口。
 
-**本 fork 相对上游 v0.16.2 的移植范围与排除项：** 收了完整 Agent 委派（经 slim 适配层）、入站视频转发当前群 agent、版本号对齐 0.16.2。明确不收 / 不恢复：上游 `[token_source.*]` registry、动态模型目录、`reviewers` / `lodestar-consult` / 只读 reviewer、effort/GPT-5.6 档位调整、codex 额度归属架构、GitHub Release 中文约束。本 phase 也不收 CI/typecheck/deps/`--packages=external` 发布链路改造、init-wait/stop barrier 回补、cardkit 测试期真实出网拦截；SDK 仍钉 `@anthropic-ai/claude-agent-sdk` 0.3.222。
+**本 fork 相对上游 v0.16.3 的移植范围与排除项：** 收了完整 Agent 委派（经 slim 适配层）、入站视频转发当前群 agent、委派 Skill 禁止自调用、实时 footer 单次失败不升群告警、`mathjax-full` bundleDependencies、版本号对齐 0.16.3。明确不收 / 不恢复：上游 `[token_source.*]` registry、动态模型目录 / `waitForTokenSourceModelRefresh`、`reviewers` / `lodestar-consult` / 只读 reviewer、effort/GPT-5.6 档位调整、codex 额度归属架构、GitHub Release 中文约束。也不收 CI/typecheck/deps/`--packages=external` 发布链路改造、init-wait/stop barrier 回补、cardkit 测试期真实出网拦截、SDK 升到 0.3.251；SDK 仍钉 `@anthropic-ai/claude-agent-sdk` 0.3.222。
 
 ### 📋 飞书任务清单自动化（预览版）
 
