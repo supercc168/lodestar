@@ -34,6 +34,14 @@ describe('lodestar-agent skill body', () => {
     expect(body).not.toMatch(/question\/review\/critique/)
     expect(body).not.toContain('managed-skills')
   })
+
+  test('forbids routing a self-call through lodestar-agent', () => {
+    const body = agentSkillBody()
+    expect(body).toContain('MUST NOT use this Skill')
+    expect(body).toContain('native Agent')
+    expect(body).toContain('Self-calls MUST use')
+    expect(body).not.toMatch(/Token Source/)
+  })
 })
 
 describe('ensureLodestarAgentSkill', () => {
