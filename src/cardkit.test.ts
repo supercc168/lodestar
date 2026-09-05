@@ -347,6 +347,20 @@ describe('cardkit 错误码级写失败分类与 checked add (上游 4185808)', 
     })).toBe(true)
     expect(cardkit.isElementLimitFailure(200570, { message: 'invalid image keys' })).toBe(false)
     expect(cardkit.isElementLimitFailure(300308, { message: 'server internal error' })).toBe(false)
+    // 上游 9493684：300315 也可能包一层 200860 体积上限，须当容量失败。
+    // 本地保留 isElementLimitFailure / isCardSizeLimitCode 拆分，不引入
+    // isCardCapacityFailure 重命名。
+    expect(cardkit.isCardSizeLimitCode(200860)).toBe(true)
+    expect(cardkit.isCardSizeLimitFailure(200860, { message: 'ErrMsg: card over max size;' })).toBe(true)
+    expect(cardkit.isCardSizeLimitFailure(300315, {
+      message: 'Failed to add element: inner code: 200860, card over max size',
+    })).toBe(true)
+    expect(cardkit.isCardSizeLimitFailure(300315, {
+      message: 'Failed to add element: ErrMsg: card over max size;',
+    })).toBe(true)
+    expect(cardkit.isCardSizeLimitFailure(300315, {
+      message: 'Duplicate ID, inner code: 300301',
+    })).toBe(false)
     expect(cardkit.isDuplicateElementFailure(300315, { message: 'Duplicate ID; code: 300301' })).toBe(true)
     expect(cardkit.isDuplicateElementFailure(300315, { message: 'elementID format error; code: 300301' })).toBe(false)
     expect(cardkit.isDuplicateElementFailure(300305, { message: 'Duplicate ID' })).toBe(false)
@@ -650,6 +664,33 @@ describe('checked card writes', () => {
       expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
         tag: 'markdown', element_id: 'assistant_0', content: 'x',
       }, { notifyCardFailure: false })).toBe(false)
+      await cardkit.dispose(cardId)
+    }
+  })
+
+  test('a size rejection in an isolated replacement leaves the original element writable', async () => {
+    const cardId = 'card_local_size_failure'
+    let notifications = 0
+    let attempts = 0
+    cardkit.recordCardCreated(cardId, 1, () => { notifications++ })
+    globalThis.fetch = (async () => new Response(JSON.stringify(++attempts === 1
+      ? { code: 200860, msg: 'ErrMsg: card over max size;' }
+      : { code: 0, data: {} }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as unknown as typeof fetch
+
+    try {
+      expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
+        tag: 'column_set', element_id: 'assistant_0',
+        columns: [{ tag: 'column', elements: [{ tag: 'img', img_key: 'uploaded_formula' }] }],
+      }, { notifyCardFailure: false })).toBe(false)
+      expect(notifications).toBe(0)
+      expect(cardkit.isDeadElement(cardId, 'assistant_0')).toBe(false)
+      expect(await cardkit.replaceElementChecked(cardId, 'assistant_0', {
+        tag: 'markdown', element_id: 'assistant_0', content: '原始公式 $$x^2$$',
+      })).toBe(true)
+      expect(attempts).toBe(2)
+    } finally {
       await cardkit.dispose(cardId)
     }
   })

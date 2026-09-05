@@ -9247,6 +9247,81 @@ describe('Session 轮转预算收紧与一次性诊断 (上游 4185808 主题 B)
     }
   })
 
+  test('300315 wrapping 200860 rotates as card-size capacity', async () => {
+    const session = new Session('capacity-wrapped-size', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-capacity-wrapped-size')
+    const turn = turnState('card_capacity_wrapped_size')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.onCardWriteFailure(turn.cardId, 300315, {
+        kind: 'api',
+        failure: {
+          cardId: turn.cardId, operation: 'addElement',
+          code: 300315, message: 'Failed to add element: inner code: 200860, card over max size',
+        },
+      })
+      expect(turn.failureRotateCount).toBe(1)
+      expect(turn.rotating).not.toBeNull()
+      await turn.rotating
+      expect(turn.cardId).not.toBe('card_capacity_wrapped_size')
+      expect(sentRawTexts.join('\n')).not.toContain('不是卡片元素上限')
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('replaceElement 200860 marks the tool dead so rotate rebuilds the latest result', async () => {
+    const session = new Session('card-size-tool-replace', 'chat_id') as any
+    session.proc = new FakeAgentProc('codex', 'codex-card-size-tool')
+    const oldCardId = 'card_size_tool_old'
+    const newCardId = 'card_size_tool_new'
+    const turn = turnState(oldCardId)
+    turn.userOpenId = ''
+    turn.toolCount = 1
+    turn.toolByUseId.set('tool_use_size', {
+      i: 0, name: 'Bash', input: { command: '# desc: 查看结果\nprintf result' },
+    })
+    session.currentTurn = turn
+    cardkit.recordCardCreated(oldCardId, 2, (code, meta) => {
+      session.onCardWriteFailure(oldCardId, code, meta)
+    })
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      const rejected = method === 'PUT' && path === `/cards/${oldCardId}/elements/tool_0`
+      return new Response(JSON.stringify(rejected
+        ? { code: 200860, msg: 'ErrMsg: card over max size;' }
+        : { code: 0, data: path === '/cards/id_convert' ? { card_id: newCardId } : {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      sessionTools.completeTool(session, session.proc, 'tool_use_size', 'retained tool result', false)
+      await cardkit.flush(oldCardId)
+      const rotation = turn.rotating
+      if (rotation) await rotation
+      await cardkit.flush(newCardId)
+
+      expect(turn.cardId).toBe(newCardId)
+      expect(turn.failureRotateCount).toBe(1)
+      expect(JSON.stringify(calls.filter(call => call.path.startsWith(`/cards/${newCardId}/elements`))))
+        .toContain('retained tool result')
+      expect(turn.toolByUseId.has('tool_use_size')).toBe(true)
+      expect(sentRawTexts.join('\n')).not.toContain('不是卡片元素上限')
+    } finally {
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(oldCardId)
+      await cardkit.dispose(newCardId)
+    }
+  })
+
   test('repeated validation/content failures stay on the current card and warn once', async () => {
     const session = new Session('validation-no-rotate', 'chat_id') as any
     session.proc = new FakeAgentProc('claude', 'claude-validation-no-rotate')
