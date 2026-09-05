@@ -1604,11 +1604,15 @@ export class Session {
   }
 
   private replaceFooterContent(cardId: string, content: string): Promise<void> {
+    // 活跃 footer 是可丢的实时状态：second 模式下一秒就会再次刷新，单次
+    // replace MISS 不影响正文或 turn 状态。cardkit 已对 footer elementId
+    // 跳过 card-level elevate；这里再显式关掉 notifyCardFailure，与上游
+    // f7a4859 对齐。终态 footer 仍走 checked / 显式 onFailure。
     return cardkit.replaceElement(cardId, cards.ELEMENTS.footer, {
       tag: 'markdown',
       element_id: cards.ELEMENTS.footer,
       content: content.trim() || ' ',
-    })
+    }, undefined, { notifyCardFailure: false })
   }
 
   private modelLine(
