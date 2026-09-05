@@ -162,6 +162,31 @@ export function isCardSizeLimitCode(code?: number): boolean {
   return code === 200860
 }
 
+/** `200860` is the total-card payload ceiling. `300315` is a generic add
+ * wrapper and may nest `200860` / `card over max size` the same way it
+ * nests `300305`. Direct 200860 plus that nested diagnostic are capacity;
+ * schema/content wrappers (300301 duplicate-id, elementID format, …) are not.
+ * 本地保留与 isElementLimitFailure 并列的拆分，不引入上游 isCardCapacityFailure
+ * 重命名（9493684 只摘行为）。 */
+export function isCardSizeLimitFailure(
+  code?: number,
+  failure?: Pick<CardWriteFailure, 'message'>,
+): boolean {
+  if (code === 200860) return true
+  if (code !== 300315) return false
+  const message = failure?.message ?? ''
+  return /(?:code\s*[:=]\s*200860\b|\bcard over max size\b)/i.test(message)
+}
+
+/** Confirmed card-full: component ceiling or payload ceiling, including
+ * those codes nested inside a 300315 add wrapper. */
+export function isCardCapacityFailure(
+  code?: number,
+  failure?: Pick<CardWriteFailure, 'message'>,
+): boolean {
+  return isElementLimitFailure(code, failure) || isCardSizeLimitFailure(code, failure)
+}
+
 /** Any "this card can't take more content" signal — element count or bytes. */
 export function isCardCapacityCode(code?: number): boolean {
   return isElementLimitCode(code) || isCardSizeLimitCode(code)
@@ -623,7 +648,15 @@ export function replaceElement(
         sequence: seq,
       })
     },
-    onFailure,
+    (code, meta) => {
+      // 工具已完成不代表结果已写入。升群告警的容量失败要标 dead，换卡时把
+      // 最新结果搬到新卡。公式增强等隔离 PUT(notifyCardFailure:false) 保留
+      // 原元素可写，raw LaTeX 继续可见（上游 9493684）。
+      if (elevateCardFailure && isCardCapacityFailure(code, meta?.failure)) {
+        markElementDead(s, elementId)
+      }
+      onFailure?.(code, meta)
+    },
     { elevateCardFailure, meta: { elementId } },
   ))
   return s.queue

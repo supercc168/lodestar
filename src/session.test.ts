@@ -9310,8 +9310,12 @@ describe('Session 轮转预算收紧与一次性诊断 (上游 4185808 主题 B)
 
       expect(turn.cardId).toBe(newCardId)
       expect(turn.failureRotateCount).toBe(1)
-      expect(JSON.stringify(calls.filter(call => call.path.startsWith(`/cards/${newCardId}/elements`))))
-        .toContain('retained tool result')
+      const migrated = JSON.stringify(calls.filter(call =>
+        call.method === 'POST' && call.path === `/cards/${newCardId}/elements`,
+      ))
+      // 本地 toolCallElement 隐藏命令/输出，只迁面板本身；重建即证明 dead 标记生效。
+      expect(migrated).toContain('tool_0')
+      expect(migrated).toContain('Bash')
       expect(turn.toolByUseId.has('tool_use_size')).toBe(true)
       expect(sentRawTexts.join('\n')).not.toContain('不是卡片元素上限')
     } finally {

@@ -7101,12 +7101,12 @@ export class Session {
 
     const failure = meta?.failure
     // 只有确认的容量失败才烧轮转预算:300305(或 300315 嵌套诊断点名容量)
-    // 走组件数上限;200860 体积上限是本地既有容量信号,保留轮转(机制保留)。
+    // 走组件数上限;200860 体积上限(含 300315 内嵌)是容量信号,保留轮转。
     // 其余 API 失败(schema/内容/duplicate-id/5xx)重放到新卡也修不好——
     // 留在当前卡,每 turn 一次用户可见诊断(FIX-02"投递失败路径可观测")。
     // 诊断文案只用失败分类摘要(错误码+操作类别+元素),绝不内插
     // failure.message/API 响应原文——那里可能回显凭据/raw payload。
-    if (!cardkit.isElementLimitFailure(code, failure) && !cardkit.isCardSizeLimitCode(code)) {
+    if (!cardkit.isCardCapacityFailure(code, failure)) {
       const operation = failure?.operation ?? 'unknown operation'
       const element = failure?.elementId ? ` element=${failure.elementId}` : ''
       log(`session "${this.sessionName}": non-capacity card write failure card=${failedCardId.slice(0, 12)} operation=${operation}${element} code=${code ?? 'n/a'} — not rotating`)
@@ -7128,10 +7128,10 @@ export class Session {
       this.stopFooterStatus(turn)
       cardkit.markCardWriteDead(turn.cardId)
       log(`session "${this.sessionName}": failure-rotate cap (${MAX_MIDTURN_ROTATES}) hit — giving up, rest of turn is log-only code=${code ?? 'n/a'}`)
-      void feishu.sendTextRaw(this.chatId, this.failureRotateGiveUpText(code))
+      void feishu.sendTextRaw(this.chatId, this.failureRotateGiveUpText(code, failure))
       return
     }
-    const why = cardkit.isCardSizeLimitCode(code)
+    const why = cardkit.isCardSizeLimitFailure(code, failure)
       ? `card size limit (${code})`
       : `confirmed element limit (${code})`
     log(`session "${this.sessionName}": ${why} on card=${turn.cardId.slice(0, 8)}… — rotating to fresh card`)
@@ -7152,13 +7152,13 @@ export class Session {
   }
 
   /** User-facing give-up copy, branched by the last observed Feishu code. */
-  private failureRotateGiveUpText(code?: number): string {
+  private failureRotateGiveUpText(code?: number, failure?: cardkit.CardWriteFailure): string {
     const n = MAX_MIDTURN_ROTATES
+    if (cardkit.isCardSizeLimitFailure(code, failure)) {
+      return `⚠️ 卡片写入失败已触发 ${n} 次换卡仍未恢复(飞书卡片体积超限 code=${code}),本轮后续输出仅日志可见。`
+    }
     if (cardkit.isElementLimitCode(code)) {
       return `⚠️ 卡片写入失败已触发 ${n} 次换卡仍未恢复(飞书元素超限 code=${code}),本轮后续输出仅日志可见。`
-    }
-    if (cardkit.isCardSizeLimitCode(code)) {
-      return `⚠️ 卡片写入失败已触发 ${n} 次换卡仍未恢复(飞书卡片体积超限 code=${code}),本轮后续输出仅日志可见。`
     }
     if (typeof code === 'number') {
       return `⚠️ 卡片写入失败已触发 ${n} 次换卡仍未恢复(飞书 API 拒绝 code=${code}),本轮后续输出仅日志可见。`
