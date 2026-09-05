@@ -1,5 +1,5 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -7,6 +7,7 @@ import {
   ensureLodestarAgentCommand,
   ensureLodestarAgentSkill,
   lodestarAgentWrapperPath,
+  resolveAgentCliLaunch,
 } from './agent-skill'
 
 const temps: string[] = []
@@ -101,6 +102,34 @@ describe('lodestar-agent wrapper', () => {
     expect(body).toContain('C:\\node.exe')
     expect(body).not.toMatch(/LODESTAR_AGENT_CAPABILITY/)
     expect(body).not.toMatch(/token/i)
+  })
+
+  test('follows npm global bin symlink to dist/lodestar-agent.js', () => {
+    const pkg = tempDir('lodestar-agent-pkg-')
+    const dist = join(pkg, 'dist')
+    mkdirSync(dist)
+    writeFileSync(join(dist, 'lodestar.js'), 'export {}\n')
+    writeFileSync(join(dist, 'lodestar-agent.js'), 'export {}\n')
+    const binDir = tempDir('lodestar-agent-npmbin-')
+    const shim = join(binDir, 'lodestar-daemon')
+    symlinkSync(join(dist, 'lodestar.js'), shim)
+    const launch = resolveAgentCliLaunch({
+      daemonEntry: shim,
+      runtime: '/usr/bin/node',
+    })
+    expect(launch.entry).toBe(join(realpathSync(dist), 'lodestar-agent.js'))
+  })
+
+  test('bun daemon.ts still resolves src/agent-cli.ts beside the repo root', () => {
+    const repo = tempDir('lodestar-agent-repo-')
+    mkdirSync(join(repo, 'src'))
+    writeFileSync(join(repo, 'daemon.ts'), 'export {}\n')
+    writeFileSync(join(repo, 'src', 'agent-cli.ts'), 'export {}\n')
+    const launch = resolveAgentCliLaunch({
+      daemonEntry: join(repo, 'daemon.ts'),
+      runtime: '/usr/bin/bun',
+    })
+    expect(launch.entry).toBe(join(realpathSync(repo), 'src', 'agent-cli.ts'))
   })
 
   test('legacy lodestar-consult unlink is a no-op when absent and removes an owned leftover', () => {

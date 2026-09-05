@@ -13,6 +13,7 @@ import {
   existsSync,
   mkdirSync,
   readFileSync,
+  realpathSync,
   renameSync,
   unlinkSync,
   writeFileSync,
@@ -132,17 +133,31 @@ export function resolveAgentCliLaunch(opts: {
   const daemonEntry = resolve(opts.daemonEntry ?? process.argv[1] ?? '')
   const runtime = opts.runtime ?? process.execPath
   const exists = opts.exists ?? existsSync
-  const root = dirname(daemonEntry)
-  const source = join(root, 'src', 'agent-cli.ts')
-  const siblingBundle = join(root, 'lodestar-agent.js')
-  const rootBundle = join(root, 'dist', 'lodestar-agent.js')
+  // npm/pnpm global bins are shims/symlinks in ~/.local/bin (or prefix/bin).
+  // path.resolve() does not follow them, so launchd
+  //   node ~/.local/bin/lodestar-daemon
+  // would look for lodestar-agent.js next to the shim and boot-fatal.
+  // Prefer the real dist/ sibling; keep the unresolved dirname as fallback
+  // for bun daemon.ts (repo root → src/agent-cli.ts).
+  const roots: string[] = []
+  try {
+    roots.push(dirname(realpathSync(daemonEntry)))
+  } catch { /* dangling symlink / missing file */ }
+  const unresolvedRoot = dirname(daemonEntry)
+  if (!roots.includes(unresolvedRoot)) roots.push(unresolvedRoot)
   const runtimeIsBun = /^bun(?:\.exe)?$/i.test(basename(runtime))
-  const candidates = runtimeIsBun
-    ? [source, siblingBundle, rootBundle]
-    : [siblingBundle, rootBundle, source]
-  const entry = candidates.find(exists)
+  const candidates: string[] = []
+  for (const root of roots) {
+    const source = join(root, 'src', 'agent-cli.ts')
+    const siblingBundle = join(root, 'lodestar-agent.js')
+    const rootBundle = join(root, 'dist', 'lodestar-agent.js')
+    if (runtimeIsBun) candidates.push(source, siblingBundle, rootBundle)
+    else candidates.push(siblingBundle, rootBundle, source)
+  }
+  const unique = [...new Set(candidates)]
+  const entry = unique.find(exists)
   if (!entry) {
-    throw new Error(`lodestar-agent entry not found beside daemon: ${candidates.join(', ')}`)
+    throw new Error(`lodestar-agent entry not found beside daemon: ${unique.join(', ')}`)
   }
   return { runtime, entry }
 }
