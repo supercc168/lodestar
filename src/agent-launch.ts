@@ -4,9 +4,10 @@ import type {
   AgentProvider,
   AgentReasoningEffort,
 } from './agent-process'
-import { isClaudeReasoningEffort } from './agent-process'
+import { isClaudeReasoningEffort, isDshReasoningEffort } from './agent-process'
 import { ClaudeAgentProcess, assertClaudeCodeAvailable } from './claude-agent-process'
 import { CodexProcess, CODEX_EFFORT, isCodexReasoningEffort } from './codex-process'
+import { DshProcess } from './dsh-process'
 import type { ConversationLaunch } from './conversation'
 import { listTokenSources, resolveTokenSource } from './token-source'
 
@@ -44,6 +45,33 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
   }
   const selectionModel = opts.model ?? source?.selectionModel
   const resolved = resolveTokenSource(opts.provider, selectionModel)
+
+  if (opts.provider === 'dsh') {
+    // DSH 单档后端:模型与凭据同来自 [deepseek-harness],选择键就是该段派生的
+    // source id。effort 词表来自子进程上报的 native 档位(off/low/high/max),
+    // 与 Codex/Claude 档位不互通 —— 不合法即抛错,不静默换档。
+    if (!source || !selectionModel || !isDshReasoningEffort(opts.effort)) {
+      throw new Error('DSH requires a configured source, model and valid effort')
+    }
+    const dshSource = source
+    return {
+      process: new DshProcess({
+        workDir: opts.workDir,
+        tokenSourceId: dshSource.id,
+        model: selectionModel,
+        effort: opts.effort,
+        launch: opts.launch,
+        developerInstructions: opts.developerInstructions,
+        profile: opts.profile,
+        hostEnv: opts.hostEnv,
+        // 凭据单入口(D-08 双轨隔离的本地点):先 scrub ANTHROPIC_* 与旧
+        // DSH_*/DEEPSEEK_*,再注入本档 DEEPSEEK_*。TokenSource.spawnEnv 的入参
+        // 收窄为 string 值,DshSpawnOptions.transformEnv 允许 undefined,
+        // 故只在这一个边界做窄化,不引入第二套清洗逻辑。
+        transformEnv: base => dshSource.spawnEnv(base as Record<string, string>),
+      }),
+    }
+  }
 
   if (opts.provider === 'claude') {
     assertClaudeCodeAvailable()

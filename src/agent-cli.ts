@@ -199,6 +199,21 @@ async function waitAndPrintRun(context: CliContext, runId: string): Promise<void
 }
 
 export function cliContext(): CliContext {
+  const delegation = process.env.DSH_LODESTAR_AGENT_CONTEXT
+  if (delegation !== undefined) {
+    // DSH 子进程自带的委派上下文(DSH 侧 lodestar-agent 回连同一 daemon)。它优先
+    // 于宿主遗留的 LODESTAR_AGENT_*;但只接受合法 shape —— 非法即抛错,不回落到
+    // 旧 env(半可信调用不得被静默接受)。JSON.parse 的报错会把原始串回显出来
+    // (串里含 capability),故解析失败一律折叠为不含上下文的固定错误。
+    let parsed: any
+    try { parsed = JSON.parse(delegation) } catch { parsed = undefined }
+    const rawBaseUrl = typeof parsed?.baseUrl === 'string' ? parsed.baseUrl : ''
+    const capability = typeof parsed?.capability === 'string' ? parsed.capability : ''
+    if (!rawBaseUrl.trim() || !capability.trim()) {
+      throw new Error('invalid DSH Lodestar delegation context')
+    }
+    return { baseUrl: rawBaseUrl.trim().replace(/\/+$/, ''), capability }
+  }
   const baseUrl = String(process.env.LODESTAR_AGENT_URL ?? '').replace(/\/+$/, '')
   const capability = String(process.env.LODESTAR_AGENT_CAPABILITY ?? '')
   if (!baseUrl || !capability) {
