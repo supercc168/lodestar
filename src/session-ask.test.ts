@@ -1,10 +1,10 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
-import { resetFeishuMock, sentTexts } from './feishu-test-mock'
+import { resetFeishuMock, sentTexts, urgentPushes } from './feishu-test-mock'
 import * as cardkit from './cardkit'
 import { ELEMENTS } from './cards'
 import { addTool } from './session-tools'
 import { renderPermission } from './session-permission'
-import { askBlockReason, askRenderState, onAskAnswer, onAskMessageAnswer } from './session-ask'
+import { askBlockReason, askRenderState, onAskAnswer, onAskMessageAnswer, refreshPendingAsks } from './session-ask'
 import { __setPendingReplyForTest } from './notify-callbacks'
 import type { Session } from './session'
 
@@ -126,5 +126,58 @@ describe('AskUserQuestion 输入优先级(ae411a6 拆摘)', () => {
     await onAskMessageAnswer(h.s, 'hello', 'ou_owner', 'om_z')
     expect(h.s.pendingAsks.has('parked')).toBe(true)
     expect(h.userMessages).toHaveLength(0)
+  })
+
+  test('通知回复进行中提问整体等待且不推送(先置回复中、再加提问)', async () => {
+    const h = harness()
+    __setPendingReplyForTest('oc_ask', true)
+    h.add('first', '继续吗')
+    await flush()
+    refreshPendingAsks(h.s)
+    await flush()
+    expect(panels.get(ELEMENTS.tool(0)).header.title.content).toBe('⏳ 等待通知回复完成')
+    expect(JSON.stringify([...panels.values()])).not.toContain('interactive_container')
+    expect(urgentPushes).toHaveLength(0)
+  })
+
+  test('回复结束后恢复可交互并恰好推送一次', async () => {
+    const h = harness()
+    __setPendingReplyForTest('oc_ask', true)
+    h.add('first', '继续吗')
+    await flush()
+    __setPendingReplyForTest('oc_ask', false)
+    refreshPendingAsks(h.s)
+    await flush()
+    expect(JSON.stringify(panels.get(ELEMENTS.tool(0)))).toContain('interactive_container')
+    expect(urgentPushes).toHaveLength(1)
+  })
+
+  test('延迟推送不越过回复、不重复推(announcementVersion 作废在途)', async () => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    spyOn(cardkit, 'patchSettings').mockImplementation(async () => { await gate })
+    const h = harness()
+    h.add('first', '继续吗')
+    __setPendingReplyForTest('oc_ask', true)
+    refreshPendingAsks(h.s)
+    __setPendingReplyForTest('oc_ask', false)
+    refreshPendingAsks(h.s)
+    release()
+    await flush()
+    expect(urgentPushes).toHaveLength(1)
+  })
+
+  test('每题只在成为可答时推送一次,重复刷新不重复推', async () => {
+    const h = harness()
+    h.add('first', '先选择区域')
+    h.add('second', '再选择环境')
+    await flush()
+    expect(urgentPushes).toHaveLength(1)
+    refreshPendingAsks(h.s)
+    await flush()
+    expect(urgentPushes).toHaveLength(1)
+    expect(await onAskAnswer(h.s, 'first', 0, 0, 'ou_owner')).toBe(true)
+    await flush()
+    expect(urgentPushes).toHaveLength(2)
   })
 })
