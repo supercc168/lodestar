@@ -18,6 +18,7 @@
  *   agent-runs/             — durable delegated-agent runs    (in DATA_DIR)
  *   agent-session-ids.json  — delegated native session ids    (in DATA_DIR)
  *   notify-callbacks.json   — /notify button→callback map   (in DATA_DIR)
+ *   agent-runtimes/         — opt-in installed Agent runtimes (in DATA_DIR)
  *   inbox/                  — downloaded attachments        (in DATA_DIR)
  */
 
@@ -80,6 +81,10 @@ export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
 /** Durable delegated-agent runs. Every state transition is written so completed
  *  runs survive daemon restart and can be inspected from CLI/HTTP. */
 export const AGENT_RUNS_DIR = join(DATA_DIR, 'agent-runs')
+/** Opt-in Agent 运行时安装根(上游 9a6209b)。每个 agent 一个目录,内含
+ *  fingerprint 版本目录与 `current.json` 选择文件。只有 `[runtime.agent_auto_update]`
+ *  显式开启或手动更新才会写入 —— daemon 启动不检查、不安装(D-06)。 */
+export const AGENT_RUNTIMES_DIR = join(DATA_DIR, 'agent-runtimes')
 /** Provider-native session ids created by delegated agents. Main-session
  *  rs/fk history must skip these ids. */
 export const AGENT_SESSION_IDS_FILE = join(DATA_DIR, 'agent-session-ids.json')
