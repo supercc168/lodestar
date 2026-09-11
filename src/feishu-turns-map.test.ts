@@ -734,6 +734,37 @@ describe('session conversation state cleanup', () => {
     })
   })
 
+  test('clearing one provider keeps a co-bound dsh ref (清 codex/claude 不连带删除 dsh)', () => {
+    const result = runFreshState(`
+      const cwd = '/srv/dsh-project'
+      feishu.bindSessionResume('checked', { provider: 'codex', sessionId: 'codex-thread', cwd })
+      feishu.bindSessionResume('checked', { provider: 'dsh', sessionId: 'dsh-session-1', cwd })
+      feishu.clearSessionResumeChecked('checked', 'codex')
+      feishu.bindSessionResume('plain', { provider: 'dsh', sessionId: 'dsh-session-2', cwd })
+      feishu.bindSessionResume('plain', 'claude-session', 'claude', cwd)
+      feishu.clearSessionResume('plain', 'claude')
+      __out({
+        checkedDsh: feishu.getSessionResumeRef('checked', 'dsh'),
+        checkedCodex: feishu.getSessionResumeRef('checked', 'codex'),
+        plainDsh: feishu.getSessionResumeRef('plain', 'dsh'),
+        plainClaude: feishu.getSessionResumeRef('plain', 'claude'),
+        persisted: __read('session-resume-map.json'),
+      })
+    `)
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(extract(result)).toEqual({
+      checkedDsh: { provider: 'dsh', sessionId: 'dsh-session-1', cwd: '/srv/dsh-project' },
+      checkedCodex: null,
+      plainDsh: { provider: 'dsh', sessionId: 'dsh-session-2', cwd: '/srv/dsh-project' },
+      plainClaude: null,
+      persisted: {
+        checked: { dsh: { provider: 'dsh', sessionId: 'dsh-session-1', cwd: '/srv/dsh-project' } },
+        plain: { dsh: { provider: 'dsh', sessionId: 'dsh-session-2', cwd: '/srv/dsh-project' } },
+      },
+    })
+  })
+
   test('checked resume cleanup restores the full ref when persistence fails', () => {
     const result = runFreshState(`
       feishu.loadSessionResumeMap()

@@ -414,7 +414,9 @@ export function clearSessionResume(sessionName: string, provider?: AgentProvider
   }
   if (entry[provider] === undefined) return
   delete entry[provider]
-  if (!entry.codex && !entry.claude) lastSessionRefByName.delete(sessionName)
+  // dsh 与 codex/claude 同为 map 一等公民(saveSessionResumeMapChecked 三分支):
+  // 空判定漏 dsh 会在清 codex/claude 时连带删除仍存活的 dsh 绑定并落盘。
+  if (!entry.codex && !entry.claude && !entry.dsh) lastSessionRefByName.delete(sessionName)
   saveSessionResumeMap()
 }
 
@@ -426,7 +428,8 @@ export function clearSessionResumeChecked(sessionName: string, provider?: AgentP
   else {
     const next = { ...previous }
     delete next[provider]
-    if (!next.codex && !next.claude) lastSessionRefByName.delete(sessionName)
+    // 同上:清 codex/claude 不得连带删除仍存活的 dsh 绑定。
+    if (!next.codex && !next.claude && !next.dsh) lastSessionRefByName.delete(sessionName)
     else lastSessionRefByName.set(sessionName, next)
   }
   try { saveSessionResumeMapChecked() } catch (error) {
