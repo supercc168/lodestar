@@ -561,6 +561,10 @@ export class Session {
      * —— 这时若 requestId 已就位则 finalize；否则等 renderPermission
      * 一来立即 finalize。 */
     currentIdx?: number
+    /** 仅在成为可答时推送一次手机通知;等待/排队期间回到 false 以便恢复后重推。 */
+    announced?: boolean
+    /** 推送代际计数,作废在途推送(等待/排队期间自增)。 */
+    announcementVersion?: number
   }>()
   /** Host-side askusr cards triggered by assistant marker protocol.
    * Kept separate from SDK AskUserQuestion because there is no
@@ -4380,6 +4384,14 @@ export class Session {
 
   hasPendingAsk(): boolean {
     return sessionAsk.hasPendingAsk(this)
+  }
+
+  refreshPendingAsks(): void {
+    sessionAsk.refreshPendingAsks(this)
+  }
+
+  askBlockReason(toolUseId: string): string | null {
+    return sessionAsk.askBlockReason(this, toolUseId)
   }
 
   hasPendingHostAsk(): boolean {

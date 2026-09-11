@@ -45,8 +45,33 @@ export function askRenderState(s: Session, toolUseId: string): cards.AskState {
   return { currentIdx: pending.currentIdx, answered: pending.answered, waitingFor }
 }
 
+/** 只在「这条提问成为当前可答的那一条」时推送一次手机加急通知(summary 改
+ * 成题面预览 + urgentApp)。等待/排队期间不推;announcementVersion 作废在途推送。 */
+export function announceAsk(s: Session, toolUseId: string): void {
+  const pending = s.pendingAsks.get(toolUseId)
+  const turn = s.currentTurn
+  if (!pending || pending.currentIdx === undefined || pending.announced || askBlockReason(s, toolUseId)
+    || !turn?.userOpenId || !turn.messageId) return
+  pending.announced = true
+  const announcementVersion = (pending.announcementVersion ?? 0) + 1
+  pending.announcementVersion = announcementVersion
+  const question = pending.questions[pending.currentIdx]?.question.trim() ?? ''
+  const preview = question.length > 40 ? question.slice(0, 40) + '…' : question
+  const summary = pending.questions.length > 1
+    ? `❓ 待回答 ${pending.questions.length} 题${preview ? `: ${preview}` : ''}`
+    : preview ? `❓ ${preview}` : '❓ 等你回答问题'
+  void (async () => {
+    cardkit.cancelSummary(turn.cardId)
+    await cardkit.patchSettings(turn.cardId, { config: { summary: { content: summary } } })
+    if (s.currentTurn !== turn || s.pendingAsks.get(toolUseId) !== pending
+      || pending.announcementVersion !== announcementVersion || pending.currentIdx === undefined
+      || askBlockReason(s, toolUseId)) return
+    await feishu.urgentApp(turn.messageId, [turn.userOpenId])
+  })().catch(error => log(`session "${s.sessionName}": question notification failed: ${error}`))
+}
+
 /** 回复打开/关闭或当前题答完后重绘所有提问面板。pending tool call 继续
- * park 在原后端握手上。 */
+ * park 在原后端握手上。等待/排队期间作废在途推送并允许恢复后重推一次。 */
 export function refreshPendingAsks(s: Session): void {
   const turn = s.currentTurn
   if (!turn) return
@@ -54,8 +79,13 @@ export function refreshPendingAsks(s: Session): void {
     const meta = turn.toolByUseId.get(toolUseId)
     if (!meta || pending.currentIdx === undefined) continue
     const state = askRenderState(s, toolUseId)
+    if (state.waitingFor) {
+      pending.announced = false
+      pending.announcementVersion = (pending.announcementVersion ?? 0) + 1
+    }
     void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i),
       cards.askUserQuestionElement(meta.i, toolUseId, pending.questions, '🤔', state))
+    announceAsk(s, toolUseId)
   }
 }
 

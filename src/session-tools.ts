@@ -12,8 +12,7 @@ import { isAbsolute } from 'node:path'
 import { normalizeOutboundPath } from './outbound-markers'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
-import * as feishu from './feishu'
-import { askRenderState } from './session-ask'
+import { announceAsk, askRenderState } from './session-ask'
 
 /** 过程元素(tool/assistant/plan/goal/context_compact)的插入锚点:实时任务总览区
  * 建立后,新元素 insert_before 它(让实时区永远压在 footer 正前,过程记录堆在它
@@ -182,24 +181,9 @@ export function addTool(s: Session, source: AgentProcess, toolUseId: string, nam
       type: 'insert_before',
       targetElementId: taskLiveAnchor(s.currentTurn),
     })
-    // Phone push — user has to come back and answer before Codex can
-    // continue. Set summary to the question text so the lock-screen
-    // notification preview shows what the user needs to answer.
-    if (s.currentTurn.userOpenId && s.currentTurn.messageId) {
-      const turn = s.currentTurn
-      const q0 = questions[0]?.question?.trim() ?? ''
-      const truncated = q0.length > 40 ? q0.slice(0, 40) + '…' : q0
-      const summary = questions.length > 1
-        ? `❓ 待回答 ${questions.length} 题${truncated ? `: ${truncated}` : ''}`
-        : truncated
-          ? `❓ ${truncated}`
-          : '❓ 等你回答问题'
-      void (async () => {
-        cardkit.cancelSummary(turn.cardId)
-        await cardkit.patchSettings(turn.cardId, { config: { summary: { content: summary } } })
-        await feishu.urgentApp(turn.messageId, [turn.userOpenId])
-      })()
-    }
+    // Phone push 已下沉到 session-ask.announceAsk —— 只在成为可答时推一次,
+    // 等待/排队期间不推(ae411a6 拆摘)。
+    announceAsk(s, toolUseId)
     return
   }
   const el = cards.toolCallElement(i, name, input, null, '⏳')
