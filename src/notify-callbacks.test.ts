@@ -4,19 +4,24 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
 import {
+  __setPendingReplyForTest,
   __setStoreFileForTest,
   buildNotifyResult,
   clearDispatching,
   dispatchCallback,
+  findPendingReply,
   get,
+  hasReplyMessage,
   isDispatching,
   loadCallbacks,
   markResolved,
   markUnknown,
+  pendingRepliesForChat,
   prune,
   recordCallbackSuccess,
   register,
   setDispatching,
+  setReplyState,
   type NotifyRegistration,
 } from './notify-callbacks'
 
@@ -301,5 +306,179 @@ describe('dispatchCallback', () => {
     globalThis.fetch = (async () => new Response(long, { status: 200 })) as unknown as typeof fetch
     r = await dispatchCallback(sampleReg(), { id: 'a', text: 'x', type: 'default' }, 'ou_u')
     expect(r.reply?.length).toBe(500)
+  })
+})
+
+describe('notify text reply store (上游 ae411a6)', () => {
+  /** 让持久化必然失败:store 指向"父路径是普通文件"的位置,clearMemory=false 保留内存态。 */
+  function breakStoreKeepMemory(): void {
+    const blocker = join(tempDir, 'blocker-reply')
+    writeFileSync(blocker, 'not a dir')
+    __setStoreFileForTest(join(blocker, 'store.json'), false)
+  }
+
+  test('setReplyState 落盘 → loadCallbacks 恢复真实回复态(allowReply 一并持久化)', () => {
+    register(sampleReg({ notifyId: 'nf_reply_wait', allowReply: true }))
+    setReplyState('nf_reply_wait', {
+      id: 'reply_wait', openId: 'ou_owner', promptMessageId: 'om_prompt',
+      openedAt: Date.now(), status: 'waiting',
+    })
+    // 模拟 daemon 重启:清内存 → 从盘重载
+    __setStoreFileForTest(tempFile)
+    expect(loadCallbacks()).toEqual([])
+    expect(get('nf_reply_wait')?.allowReply).toBe(true)
+    expect(get('nf_reply_wait')?.replyState).toEqual({
+      id: 'reply_wait', openId: 'ou_owner', promptMessageId: 'om_prompt',
+      openedAt: expect.any(Number), status: 'waiting',
+    })
+  })
+
+  test('中断的 sending 回复在 loadCallbacks 时标 UNKNOWN,且返回数组只含该中断条目', () => {
+    register(sampleReg({ notifyId: 'nf_sending' }))
+    register(sampleReg({ notifyId: 'nf_still_waiting' }))
+    setReplyState('nf_sending', {
+      id: 'reply_s', openId: 'ou_s', promptMessageId: 'om_p',
+      openedAt: Date.now(), status: 'sending',
+      response: { text: '回传中', message_id: 'om_user_s', prompt_message_id: 'om_p' },
+    })
+    setReplyState('nf_still_waiting', {
+      id: 'reply_w', openId: 'ou_w', promptMessageId: 'om_p',
+      openedAt: Date.now(), status: 'waiting',
+    })
+    __setStoreFileForTest(tempFile)
+    const interrupted = loadCallbacks()
+    // 02-02 的 boot 恢复逐条消费这个数组 —— 不能把全部登记混进来
+    expect(interrupted.map(r => r.notifyId)).toEqual(['nf_sending'])
+    const frozen = get('nf_sending')!
+    expect(frozen.unknownAt).toBeGreaterThan(0)
+    expect(frozen.unknownBy).toEqual({ openId: 'ou_s' })
+    expect(frozen.unknownReason).toBe('服务在文字回复回传期间中断，无法确认是否送达，禁止自动重试')
+    expect(get('nf_still_waiting')?.unknownAt).toBeUndefined()
+    expect(get('nf_still_waiting')?.replyState?.status).toBe('waiting')
+    // 冻结落盘:再次重启仍是 UNKNOWN,永不自动重放
+    __setStoreFileForTest(tempFile)
+    loadCallbacks()
+    expect(get('nf_sending')?.unknownAt).toBeGreaterThan(0)
+  })
+
+  test('setReplyState 写盘失败 → 内存回滚(不留不可见的输入预约)', () => {
+    register(sampleReg({ notifyId: 'nf_reply_rb', allowReply: true }))
+    breakStoreKeepMemory()
+    expect(() => setReplyState('nf_reply_rb', {
+      id: 'reply_rb', openId: 'ou_u', promptMessageId: 'om_p',
+      openedAt: Date.now(), status: 'sending',
+      response: { text: 'x', message_id: 'om_user_rb', prompt_message_id: 'om_p' },
+    })).toThrow()
+    expect(get('nf_reply_rb')?.replyState).toBeUndefined()
+    expect(get('nf_reply_rb')?.replyMessageIds).toBeUndefined()
+  })
+
+  test('findPendingReply 由真实回复态驱动(不再依赖测试钩子)', () => {
+    expect(findPendingReply('oc_chat')).toBe(false)
+    register(sampleReg({ notifyId: 'nf_pending_real', allowReply: true }))
+    setReplyState('nf_pending_real', {
+      id: 'reply_p', openId: 'ou_u', promptMessageId: 'om_p',
+      openedAt: Date.now(), status: 'waiting',
+    })
+    expect(findPendingReply('oc_chat')).toBe(true)
+    expect(findPendingReply('oc_other')).toBe(false)
+    expect(pendingRepliesForChat('oc_chat').map(r => r.notifyId)).toEqual(['nf_pending_real'])
+    // 终态(cancelled)不再占用该群输入
+    setReplyState('nf_pending_real', {
+      id: 'reply_p', openId: 'ou_u', promptMessageId: 'om_p',
+      openedAt: Date.now(), status: 'cancelled', cancelReason: 'switched',
+    })
+    expect(findPendingReply('oc_chat')).toBe(false)
+    expect(pendingRepliesForChat('oc_chat')).toEqual([])
+  })
+
+  test('已 resolved 的记录即使还带 replyState 也不再占用输入', () => {
+    register(sampleReg({ notifyId: 'nf_pending_resolved', allowReply: true }))
+    setReplyState('nf_pending_resolved', {
+      id: 'reply_pr', openId: 'ou_u', promptMessageId: 'om_p',
+      openedAt: Date.now(), status: 'sending',
+    })
+    markResolved('nf_pending_resolved', undefined, 'ou_u')
+    expect(findPendingReply('oc_chat')).toBe(false)
+  })
+
+  test('__setPendingReplyForTest(chatId,false) 清空整集合与该 chat 的真实回复态', () => {
+    __setPendingReplyForTest('oc_chat', true)
+    expect(findPendingReply('oc_chat')).toBe(true)
+    __setPendingReplyForTest('oc_chat', false)
+    expect(findPendingReply('oc_chat')).toBe(false)
+    // 真实回复态同样被清,连续用例不互相污染
+    register(sampleReg({ notifyId: 'nf_hook_clear', allowReply: true }))
+    setReplyState('nf_hook_clear', {
+      id: 'reply_hc', openId: 'ou_u', promptMessageId: 'om_p',
+      openedAt: Date.now(), status: 'waiting',
+    })
+    expect(findPendingReply('oc_chat')).toBe(true)
+    __setPendingReplyForTest('oc_chat', false)
+    expect(findPendingReply('oc_chat')).toBe(false)
+    expect(get('nf_hook_clear')?.replyState).toBeUndefined()
+  })
+
+  test('hasReplyMessage 以 message_id 去重(response 与 replyMessageIds 双通道)', () => {
+    register(sampleReg({ notifyId: 'nf_dedupe', allowReply: true }))
+    expect(hasReplyMessage('oc_chat', 'om_user_1')).toBe(false)
+    setReplyState('nf_dedupe', {
+      id: 'reply_d', openId: 'ou_u', promptMessageId: 'om_p',
+      openedAt: Date.now(), status: 'sending',
+      response: { text: 'hi', message_id: 'om_user_1', prompt_message_id: 'om_p' },
+    })
+    expect(hasReplyMessage('oc_chat', 'om_user_1')).toBe(true)
+    expect(get('nf_dedupe')?.replyMessageIds).toEqual(['om_user_1'])
+    // 跨群不串号;重复写入同一 message_id 不膨胀
+    expect(hasReplyMessage('oc_other', 'om_user_1')).toBe(false)
+    setReplyState('nf_dedupe', {
+      id: 'reply_d', openId: 'ou_u', promptMessageId: 'om_p',
+      openedAt: Date.now(), status: 'failed',
+      response: { text: 'hi', message_id: 'om_user_1', prompt_message_id: 'om_p' },
+    })
+    expect(get('nf_dedupe')?.replyMessageIds).toEqual(['om_user_1'])
+  })
+
+  test('文本回复载荷形状:dispatchCallback 发 response 对象(an invention-free button 缺席)', async () => {
+    const originalFetch = globalThis.fetch
+    try {
+      let captured: any = null
+      globalThis.fetch = (async (_input: any, init?: RequestInit) => {
+        captured = JSON.parse(String(init?.body))
+        return new Response('ok', { status: 200 })
+      }) as unknown as typeof fetch
+      await dispatchCallback(sampleReg({ notifyId: 'nf_text' }), {
+        text: '好的', message_id: 'om_user_9', prompt_message_id: 'om_prompt_1',
+      }, 'ou_op')
+      expect(captured.notify_id).toBe('nf_text')
+      expect(captured.response).toEqual({
+        type: 'text', text: '好的', message_id: 'om_user_9', prompt_message_id: 'om_prompt_1',
+      })
+      expect('button' in captured).toBe(false)
+      expect(captured.operator).toEqual({ open_id: 'ou_op' })
+    } finally {
+      globalThis.fetch = originalFetch
+    }
+  })
+
+  test('markResolved(undefined) 后 buildNotifyResult 输出 response 文本 + reply.status=resolved(无 button)', () => {
+    register(sampleReg({ notifyId: 'nf_text_done', allowReply: true }))
+    setReplyState('nf_text_done', {
+      id: 'reply_t', openId: 'ou_owner', promptMessageId: 'om_prompt',
+      openedAt: Date.now(), status: 'sending',
+      response: { text: '已确认', message_id: 'om_user', prompt_message_id: 'om_prompt' },
+    })
+    markResolved('nf_text_done', undefined, 'ou_owner')
+    const r = buildNotifyResult(get('nf_text_done')!) as any
+    expect(r.resolved).toBe(true)
+    expect(r.unknown).toBe(false)
+    expect(r.button).toBeUndefined()
+    expect(r.response).toEqual({
+      type: 'text', text: '已确认', message_id: 'om_user', prompt_message_id: 'om_prompt',
+    })
+    expect(r.reply).toEqual({
+      status: 'resolved', prompt_message_id: 'om_prompt', operator: { open_id: 'ou_owner' },
+    })
+    expect(get('nf_text_done')?.resolvedBy).toEqual({ openId: 'ou_owner' })
   })
 })

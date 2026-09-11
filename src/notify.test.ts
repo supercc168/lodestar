@@ -3,7 +3,15 @@ import { describe, expect, test } from 'bun:test'
 // in real config.toml / tenant-token code (keeps this test hermetic).
 import './feishu-test-mock'
 
-import { buildNotifyCard, dispatchNotifyRequest, parseButtons, parseCallbackUrl } from './notify'
+import {
+  buildNotifyCard,
+  buildNotifyReplyCard,
+  dispatchNotifyRequest,
+  handleNotifyRequest,
+  parseButtons,
+  parseCallbackUrl,
+} from './notify'
+import { get as getNotifyCallback } from './notify-callbacks'
 
 function cardBody(card: any): any[] {
   return (card as any).body.elements as any[]
@@ -353,5 +361,137 @@ describe('notify extraHandler', () => {
     await dispatchNotifyRequest({ bind: '127.0.0.1', port: 0 }, req, res)
     expect(res.statusCode).toBe(200)
     expect(body()).toContain('/agents/identities')
+  })
+})
+
+describe('notify allow_reply 文本回复卡(上游 ae411a6)', () => {
+  /** 注入 transport,绕开模块级 feishu 单例,让断言落在卡片/调用次数上。 */
+  function transport(sent: any[]) {
+    return {
+      sanitizeSessionName: (name: string) => name,
+      chatIdForSession: () => 'oc_reply',
+      uploadImageKey: async () => '',
+      sendCard: async (_chatId: string, card: any) => { sent.push(card); return 'om_reply_1' },
+    }
+  }
+  function postReq(payload: unknown): any {
+    const json = JSON.stringify(payload)
+    return {
+      method: 'POST',
+      url: '/notify',
+      headers: { host: '127.0.0.1' },
+      [Symbol.asyncIterator]: () => jsonChunks(json),
+    }
+  }
+
+  test('allow_reply 卡片:footer 之后渲染固定「回复」按钮,interactive(update_multi)为真', () => {
+    const card: any = buildNotifyCard({
+      title: 'ops', text: '请回复', level: 'info', notifyId: 'nf_reply_1', allowReply: true,
+    })
+    expect(card.config).toEqual({ update_multi: true })
+    const btns = findButtonValues(card)
+    expect(btns).toHaveLength(1)
+    expect(btns[0].text.content).toBe('回复')
+    expect(btns[0].behaviors[0].value).toEqual({ kind: 'notify_reply', notify_id: 'nf_reply_1' })
+    // 固定按钮在 footer(hr + via notify)之后
+    const els = cardBody(card)
+    expect(els.findIndex((e: any) => e.tag === 'column_set'))
+      .toBeGreaterThan(els.findIndex((e: any) => e.tag === 'hr'))
+    expect(els[els.length - 1].tag).toBe('column_set')
+  })
+
+  test('默认(不带 allow_reply)不渲染回复按钮,卡片保持一次性', () => {
+    const card: any = buildNotifyCard({ title: 'ops', text: 'hi', level: 'info', notifyId: 'nf_plain' })
+    expect(card.config).toEqual({})
+    expect(findButtonValues(card)).toHaveLength(0)
+  })
+
+  test('buttons 与 allow_reply 混用 → buildNotifyCard 抛互斥错误', () => {
+    expect(() => buildNotifyCard({
+      title: 'ops', text: 'hi', level: 'info', notifyId: 'nf_mix', allowReply: true,
+      buttons: [{ id: 'a', text: 'A', type: 'default' }],
+    })).toThrow(/mutually exclusive/)
+  })
+
+  test('HTTP:allow_reply:true → 注册回填 allowReply 并产出带回复按钮的卡片', async () => {
+    const sent: any[] = []
+    const { res, body } = fakeRes()
+    await handleNotifyRequest(postReq({ project: 'feishu', text: '请回复', allow_reply: true }), res, transport(sent) as any)
+    expect(res.statusCode).toBe(200)
+    const payload = JSON.parse(body())
+    expect(payload.ok).toBe(true)
+    expect(payload.notify_id).toBeTruthy()
+    const reg = getNotifyCallback(payload.notify_id)!
+    expect(reg.allowReply).toBe(true)
+    expect(reg.chatId).toBe('oc_reply')
+    const replyBtn = findButtonValues(sent[0])[0]
+    expect(replyBtn.behaviors[0].value).toEqual({ kind: 'notify_reply', notify_id: payload.notify_id })
+  })
+
+  test('HTTP:混用 buttons + allow_reply → 400 且不产出卡片(未调用 sendCard)', async () => {
+    const sent: any[] = []
+    const { res, body } = fakeRes()
+    await handleNotifyRequest(postReq({
+      project: 'feishu', text: 'hi', allow_reply: true, buttons: [{ id: 'a', text: 'A' }],
+    }), res, transport(sent) as any)
+    expect(res.statusCode).toBe(400)
+    expect(body()).toMatch(/mutually exclusive/)
+    expect(sent).toHaveLength(0)
+  })
+
+  test('HTTP:allow_reply 非布尔 → 400', async () => {
+    const sent: any[] = []
+    const { res, body } = fakeRes()
+    await handleNotifyRequest(postReq({ project: 'feishu', text: 'hi', allow_reply: 'yes' }), res, transport(sent) as any)
+    expect(res.statusCode).toBe(400)
+    expect(body()).toContain('must be a boolean')
+    expect(sent).toHaveLength(0)
+  })
+
+  test('resolution.kind === "text" 的标记渲染为「已回复」,按钮态仍为「已选择:」', () => {
+    const asText: any = buildNotifyCard({
+      title: 'ops', text: 'body', level: 'info', notifyId: 'nf_text',
+      resolution: { status: 'delivered', kind: 'text', text: '用户原话', operatorOpenId: 'ou_x' },
+    })
+    const textMarker = cardBody(asText).find(
+      (e: any) => e.tag === 'markdown' && typeof e.content === 'string' && e.content.includes('已回复'),
+    )
+    expect(textMarker).toBeTruthy()
+    expect(textMarker.content).not.toContain('已选择')
+
+    const asButton: any = buildNotifyCard({
+      title: 'ops', text: 'body', level: 'info', notifyId: 'nf_btn',
+      buttons: [{ id: 'a', text: '✅ 通过', type: 'primary' }],
+      resolution: { status: 'delivered', buttonId: 'a', text: '✅ 通过', operatorOpenId: 'ou_x' },
+    })
+    const buttonMarker = cardBody(asButton).find(
+      (e: any) => e.tag === 'markdown' && typeof e.content === 'string' && e.content.includes('已选择'),
+    )
+    expect(buttonMarker.content).toContain('已选择:✅ 通过')
+  })
+
+  test('buildNotifyReplyCard:等待态标题 + 取消按钮;送达态渲染回复原文', () => {
+    const reg: any = { notifyId: 'nf_reply_card', title: '构建完成' }
+    const waiting: any = buildNotifyReplyCard(reg, {
+      id: 'reply_1', openId: 'ou_user', promptMessageId: 'om_prompt',
+      openedAt: 1_700_000_000_000, status: 'waiting',
+    })
+    expect(waiting.config).toEqual({ update_multi: true })
+    expect(waiting.header.title.content).toBe('等待用户输入')
+    const cancel = waiting.body.elements.find((e: any) => e.tag === 'button')
+    expect(cancel.behaviors[0].value).toEqual({
+      kind: 'notify_reply_cancel', notify_id: 'nf_reply_card', reply_id: 'reply_1',
+    })
+
+    const delivered: any = buildNotifyReplyCard({
+      notifyId: 'nf_reply_card', title: '构建完成',
+    }, {
+      id: 'reply_1', openId: 'ou_user', promptMessageId: 'om_prompt',
+      openedAt: 1_700_000_000_000, status: 'sending',
+      response: { text: '已重跑', message_id: 'om_user', prompt_message_id: 'om_prompt' },
+    }, { status: 'delivered' })
+    expect(delivered.header.title.content).toBe('回复已送达')
+    expect(delivered.body.elements.some((e: any) => e.content === '已重跑')).toBe(true)
+    expect(delivered.body.elements.some((e: any) => e.tag === 'button')).toBe(false)
   })
 })
