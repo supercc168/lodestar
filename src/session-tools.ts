@@ -13,6 +13,7 @@ import { normalizeOutboundPath } from './outbound-markers'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
+import { askRenderState } from './session-ask'
 
 /** 过程元素(tool/assistant/plan/goal/context_compact)的插入锚点:实时任务总览区
  * 建立后,新元素 insert_before 它(让实时区永远压在 footer 正前,过程记录堆在它
@@ -176,10 +177,7 @@ export function addTool(s: Session, source: AgentProcess, toolUseId: string, nam
       answered,
       currentIdx: startIdx,
     })
-    const el = cards.askUserQuestionElement(i, toolUseId, questions, '🤔', {
-      currentIdx: startIdx,
-      answered,
-    })
+    const el = cards.askUserQuestionElement(i, toolUseId, questions, '🤔', askRenderState(s, toolUseId))
     void cardkit.addElement(s.currentTurn.cardId, el, {
       type: 'insert_before',
       targetElementId: taskLiveAnchor(s.currentTurn),

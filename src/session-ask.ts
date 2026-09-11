@@ -10,6 +10,7 @@ import type { Session } from './session'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
+import { findPendingReply } from './notify-callbacks'
 import { log } from './log'
 
 /** True iff there's at least one open AskUserQuestion awaiting an
@@ -18,6 +19,44 @@ import { log } from './log'
  * (routed to onAskMessageAnswer) instead of opening a new turn. */
 export function hasPendingAsk(s: Session): boolean {
   return s.pendingAsks.size > 0
+}
+
+/** 队首(最早插入且未答完)的提问。模块私有 —— 队列判定只在本文件内用。 */
+function currentAsk(s: Session) {
+  return [...s.pendingAsks.entries()].find(([, pending]) => pending.currentIdx !== undefined)
+}
+
+/** 该提问当前为何不可作答,可作答时返回 null。 */
+export function askBlockReason(s: Session, toolUseId: string): string | null {
+  const pending = s.pendingAsks.get(toolUseId)
+  if (!pending || pending.currentIdx === undefined) return null
+  if (findPendingReply(s.chatId)) return '请先完成或取消通知回复，再回答 Agent 的提问'
+  if (currentAsk(s)?.[0] !== toolUseId) return '请先回答当前问题，再回答排队中的提问'
+  return null
+}
+
+/** 面板渲染态:含等待分支(通知回复中 / 排队中)。 */
+export function askRenderState(s: Session, toolUseId: string): cards.AskState {
+  const pending = s.pendingAsks.get(toolUseId)
+  if (!pending) throw new Error(`missing pending ask: ${toolUseId}`)
+  const waitingFor = pending.currentIdx === undefined ? undefined
+    : findPendingReply(s.chatId) ? 'notification' as const
+    : currentAsk(s)?.[0] !== toolUseId ? 'question' as const : undefined
+  return { currentIdx: pending.currentIdx, answered: pending.answered, waitingFor }
+}
+
+/** 回复打开/关闭或当前题答完后重绘所有提问面板。pending tool call 继续
+ * park 在原后端握手上。 */
+export function refreshPendingAsks(s: Session): void {
+  const turn = s.currentTurn
+  if (!turn) return
+  for (const [toolUseId, pending] of s.pendingAsks) {
+    const meta = turn.toolByUseId.get(toolUseId)
+    if (!meta || pending.currentIdx === undefined) continue
+    const state = askRenderState(s, toolUseId)
+    void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.tool(meta.i),
+      cards.askUserQuestionElement(meta.i, toolUseId, pending.questions, '🤔', state))
+  }
 }
 
 /** Funnel an arbitrary chat message into the *current* question
@@ -54,12 +93,28 @@ export async function onAskMessageAnswer(s: Session, text: string, user: string,
     await s.onUserMessage(text, [], user, msgId)
     return
   }
+  // 僵尸段之后接新阻塞流(D-01):文本只作用于 currentAsk 判定的当前题。
+  const active = currentAsk(s)
+  if (!active) {
+    log(`session "${s.sessionName}": no unanswered question; routing text to Agent`)
+    await s.onUserMessage(text, [], user, msgId)
+    return
+  }
+  const [activeToolUseId, activePending] = active
+  const blocked = askBlockReason(s, activeToolUseId)
+  if (blocked) {
+    // 文本路径 toolUseId 恒为队首,排队分支在文本路径结构上不可达,
+    // 唯一可达的阻塞是通知回复分支(排队阻断由 advanceAsk 点击门控覆盖)。
+    const notice = `${blocked}。这条文字未提交，请稍后重新发送。`
+    if (!await feishu.sendText(s.chatId, notice)) throw new Error(`提问等待提示发送失败: ${notice}`)
+    return
+  }
   // 这条文本确实落在一个 live 问题上 —— 当 ask 答案消费。只有真记账成功
   // (非空、非 stale)才回 ✅;否则这条消息没被收下,不该留"答案已收到"
   // 标记。✅ 原先在 daemon 路由层 hasPendingAsk() 为真就无条件抢打,僵尸
   // 自愈 / 兜底分支会残留一个语义错误的 ✅(消息其实被当普通新轮处理)——
   // 下沉到这里按真实消费结果打。
-  const consumed = await onAskCustomAnswer(s, toolUseId, pending.currentIdx, text, user)
+  const consumed = await onAskCustomAnswer(s, activeToolUseId, activePending.currentIdx!, text, user)
   if (consumed && msgId) void feishu.addReaction(msgId, 'CheckMark')
 }
 
@@ -120,6 +175,8 @@ export function advanceAsk(
 ): boolean {
   const pending = s.pendingAsks.get(toolUseId)
   if (!pending || pending.currentIdx === undefined) return false
+  const blocked = askBlockReason(s, toolUseId)
+  if (blocked) { log(`session "${s.sessionName}": ask ${toolUseId} waiting: ${blocked}`); return false }
   const cur = pending.currentIdx
   const q = pending.questions[cur]
   if (!q) { log(`session "${s.sessionName}": advanceAsk currentIdx=${cur} out of range`); return false }
@@ -166,7 +223,10 @@ export function advanceAsk(
     // All done. Finalize iff we have the permission request id;
     // otherwise renderPermission will pick it up when it arrives.
     if (pending.requestId) finalizeAsk(s, toolUseId)
-    else log(`session "${s.sessionName}": ask ${toolUseId} all answered, waiting for can_use_tool`)
+    else {
+      log(`session "${s.sessionName}": ask ${toolUseId} all answered, waiting for can_use_tool`)
+      refreshPendingAsks(s)
+    }
   }
   return true
 }
@@ -189,6 +249,7 @@ export function finalizeAsk(s: Session, toolUseId: string): void {
     meta.isError = false
   }
   s.pendingAsks.delete(toolUseId)
+  refreshPendingAsks(s)
   if (s.pendingPermissions.size === 0 && s.status === 'awaiting_permission') {
     s.status = 'working'
   }

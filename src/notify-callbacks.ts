@@ -362,6 +362,22 @@ export function __setStoreFileForTest(file: string, clearMemory = true): void {
   }
 }
 
+/** 待回复通知的 chatId 集合。P2-02 接线点:Phase 1 尚未移植 notify-replies
+ * 的回复注册表,生产路径恒 false(该 Set 只有测试钩子写入);P2-02 移植后
+ * findPendingReply 改查真实回复状态。 */
+const pendingReplyChats = new Set<string>()
+
+/** 是否有进行中的通知回复占用该群的文本输入。 */
+export function findPendingReply(chatId: string): boolean {
+  return pendingReplyChats.has(chatId)
+}
+
+/** Test-only: 驱动 findPendingReply 的回复态。仅测试使用,生产路径无人调用。 */
+export function __setPendingReplyForTest(chatId: string, active: boolean): void {
+  if (active) pendingReplyChats.add(chatId)
+  else pendingReplyChats.delete(chatId)
+}
+
 /** Build the pull-result payload for `GET /notify/result/<id>`. Pure
  * function over a registration — extracted so the HTTP handler stays
  * thin and the shape is unit-testable. `resolved:false` while pending;

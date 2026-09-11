@@ -415,6 +415,8 @@ export interface AskAnswered {
 export interface AskState {
   currentIdx?: number
   answered: Map<number, AskAnswered>
+  /** 面板被更高优先级交互挂起:通知回复进行中 / 排队等其他提问。 */
+  waitingFor?: 'notification' | 'question'
 }
 
 function askQuestionTitle(q: AskQuestion, questionIdx: number, total: number): string {
@@ -527,7 +529,12 @@ export function askUserQuestionElement(
   const bodyElements: any[] = []
   let headerText: string
 
-  if (isTerminal) {
+  if (state?.waitingFor) {
+    headerText = state.waitingFor === 'notification' ? '⏳ 等待通知回复完成' : '⏳ 提问排队中'
+    bodyElements.push({ tag: 'markdown', content: state.waitingFor === 'notification'
+      ? '请先完成或取消通知回复，再回答这个问题。'
+      : '先回答当前问题，再显示这个提问。' })
+  } else if (isTerminal) {
     headerText = `${status} 已回答 · ${total}/${total}`
     bodyElements.push(...(renderAskTimeline(questions, toolUseId, currentIdx, answered, callbackKind) ?? []))
     const lastUser = [...answered.values()].reverse().find(a => a.user)?.user
@@ -552,7 +559,7 @@ export function askUserQuestionElement(
     tag: 'collapsible_panel',
     element_id: ELEMENTS.tool(i),
     header: { title: { tag: 'plain_text', content: headerText } },
-    expanded: !isTerminal,
+    expanded: !isTerminal && !state?.waitingFor,
     elements: bodyElements,
   }
 }
