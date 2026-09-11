@@ -328,6 +328,22 @@ test('concurrent updater calls serialize and do not install the same release twi
   expect(one.directory).toBe(two.directory)
 })
 
+test('锁目录已建但 pid 尚未落盘的窗口不被误判为损坏锁', async () => {
+  const root = await scratch()
+  const directory = join(root, 'codex')
+  // 复刻 mkdir 与 pid 落盘之间的真实窗口:进程已建锁目录,pid 还没写完。
+  await mkdir(join(directory, 'update.lock'), { recursive: true })
+  await writeFile(join(directory, 'update.lock', 'pid'), '')
+  let settled: unknown
+  const pending = updateAgentRuntime('codex', { root, metadata: fakeUpdate(), install })
+    .then(state => state, error => { settled = error; return undefined })
+  await Bun.sleep(300)
+  // 仍在按节拍等锁,而不是毫秒级炸成 Invalid runtime update lock(并发更新会因此凭空失败)。
+  expect(settled).toBeUndefined()
+  await rm(join(directory, 'update.lock'), { recursive: true })
+  expect((await pending)?.directory).toBeTruthy()
+})
+
 test('one Agent update failure does not prevent other Agents from getting their latest runtime', async () => {
   const root = await scratch()
   await expect(updateAgentRuntimes({ root, install, metadata: async name => {
