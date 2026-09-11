@@ -125,5 +125,14 @@ describe('delegated Agent cards', () => {
     expect(json.match(/卡片输出已截断/g)).toHaveLength(workers.length)
     expect(run.workers.every(worker => worker.output.length > 20_000)).toBe(true)
   })
+
+  test('identityRow 在 defaultEffort 缺失时渲染 MISS 兜底(9020e11 展示层摘录)', () => {
+    // 本地 defaultEffortFor 恒非空,此兜底为防御性摘录;用 null 走渲染路径锁定行为
+    const noEffort = { ...identity, defaultEffort: null as any }
+    const card = JSON.stringify(agentIdentityListCard({
+      panelId: 'p', page: 0, totalPages: 1, catalog: [noEffort], failures: [],
+    }))
+    expect(card).toContain('默认 MISS')
+  })
 })
 

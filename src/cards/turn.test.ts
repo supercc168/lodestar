@@ -6,6 +6,7 @@ import {
   contextCompactionElement,
   editBatchElement,
   footerContextPercentLabel,
+  footerModelLabel,
   footerTokenDetailLine,
   goalElement,
   goalDisplaySignature,
@@ -1209,5 +1210,19 @@ describe('file-tool batch rendering', () => {
     expect(body).not.toContain('old_string')
     expect(body).not.toContain('new_string')
     expect(body).not.toContain('done')
+  })
+
+  test('footerModelLabel 全参拼合与 MISS 兜底', () => {
+    expect(footerModelLabel('claude', 'claude-opus-5', 'max')).toBe('claude · claude-opus-5/max')
+    expect(footerModelLabel('codex', undefined, 'ultra')).toBe('codex · MISS/ultra')
+    expect(footerModelLabel('codex', 'gpt-5.6-sol', undefined)).toBe('codex · gpt-5.6-sol/MISS')
+    expect(footerModelLabel('codex')).toBe('codex · MISS/MISS')
+    expect(footerModelLabel('glm', null, null)).toBe('glm · MISS/MISS')
+  })
+
+  test('footerModelLabel 剥离 claude: 前缀与 [1m] 后缀', () => {
+    expect(footerModelLabel('claude', 'claude:glm-5.3', 'max')).toBe('claude · glm-5.3/max')
+    expect(footerModelLabel('claude', 'claude:opus[1m]', 'high')).toBe('claude · claude:opus/high')
+    expect(footerModelLabel('claude', 'sonnet[1m]', undefined)).toBe('claude · sonnet/MISS')
   })
 })
