@@ -52,6 +52,8 @@ export const ELEMENTS = {
   /** Model command card — one replaceable panel for model → effort
    * multi-step selection inside a single card. */
   modelPanel: 'model_panel',
+  /** 模型面板 agent 分组元素 key(上游 9020e11,D-05 修正:只摘不接线)。 */
+  modelAgentGroup: (agent: string) => `model_agent_${agent}`,
   /** One-shot agy task card. */
   agyPrompt: 'agy_prompt',
   agyStats: 'agy_stats',
