@@ -209,6 +209,43 @@ describe('D-11 口径 3:单层委派(策略 + 原生工具两层拒绝)', () => 
     await service.shutdown('test cleanup')
   })
 
+  test('⑦ worker 身份:指令文案、ROLE 环境与原生工具开关同帧下发,主 Agent 不附加', async () => {
+    const { DELEGATED_AGENT_INSTRUCTIONS } = await import('./agent-skill')
+    const { spawnDeveloperInstructions } = await import('./session-worktree')
+    const seen: Array<{ developerInstructions?: string; hostEnv: Record<string, string | undefined>; allowDelegation?: boolean }> = []
+    const { service, root } = harness(opts => {
+      seen.push({ developerInstructions: opts.developerInstructions, hostEnv: opts.hostEnv, allowDelegation: opts.allowDelegation })
+      return {
+        done: Promise.resolve(result(`sid-${opts.identity.id}`)),
+        pendingInput: () => null,
+        answer: () => {},
+        cancel: async () => {},
+      }
+    })
+    const started = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'worker identity' })
+    await waitForStatus(service, root, started.runId, 'completed')
+    await service.shutdown('test cleanup')
+
+    expect(seen).toHaveLength(1)
+    expect(seen[0].developerInstructions).toContain(DELEGATED_AGENT_INSTRUCTIONS)
+    expect(seen[0].developerInstructions).toContain('You are a delegated Agent working on a task assigned by the main Agent.')
+    expect(seen[0].developerInstructions).toContain('must not create or invoke any further Agents or subagents')
+    expect(seen[0].hostEnv.LODESTAR_AGENT_ROLE).toBe('worker')
+    expect(seen[0].hostEnv.LODESTAR_AGENT_CAPABILITY).toBeTruthy()
+    expect(seen[0].allowDelegation).toBe(false)
+
+    // 主 Agent 不附加该文案:主 Agent 指令由 session-worktree 构造,不含 worker 文案。
+    expect(spawnDeveloperInstructions(session, 'claude')).not.toContain(DELEGATED_AGENT_INSTRUCTIONS)
+    // 主 Agent 环境不含 worker role(主 Agent 走 session.ts 自有 hostEnv)。
+    const sessionSource = readFileSync(join(import.meta.dir, 'session.ts'), 'utf8')
+    const mainEnvBlock = sessionSource.slice(
+      sessionSource.indexOf('const hostEnv = {'),
+      sessionSource.indexOf("if (provider === 'claude')"),
+    )
+    expect(mainEnvBlock).toContain('LODESTAR_AGENT_CAPABILITY')
+    expect(mainEnvBlock).not.toContain('LODESTAR_AGENT_ROLE')
+  })
+
   test('⑥ 贯通:worker 真实启动链路(AgentService → runner → launch → SDK)禁用委派', async () => {
     const prevModels = config.claude.models
     ;(config.claude as any).models = {

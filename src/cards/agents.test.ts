@@ -1,7 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 import type { AgentIdentity } from '../agent-identities'
 import type { AgentRunSnapshot } from '../agent-run-types'
-import { agentIdentityListCard, agentRunCard, agentWorkerElementId } from './agents'
+import { agentIdentityListCard, agentRunCard, agentRunSummary, agentWorkerElementId } from './agents'
 
 const identity: AgentIdentity = {
   id: 'agent:a',
@@ -124,6 +124,80 @@ describe('delegated Agent cards', () => {
     expect(Buffer.byteLength(json, 'utf8')).toBeLessThan(96_000)
     expect(json.match(/卡片输出已截断/g)).toHaveLength(workers.length)
     expect(run.workers.every(worker => worker.output.length > 20_000)).toBe(true)
+  })
+
+  test('运行卡标题与摘要按 parentKind 与运行状态呈现,不再出现 depth', () => {
+    const run: AgentRunSnapshot = {
+      runId: 'agent_title', sessionName: 'project', chatId: 'chat', workDir: '/repo', prompt: 'go',
+      parentKind: 'follow_up', depth: 2, status: 'running', createdAt: new Date().toISOString(),
+      workers: [
+        {
+          identityId: identity.id, identityName: identity.displayName, tokenSourceId: 'claude:glm', provider: 'claude',
+          model: identity.model, effort: 'max', status: 'running', output: '', steps: [],
+        },
+        {
+          identityId: 'agent:b', identityName: 'B', tokenSourceId: 'claude:glm-flash', provider: 'claude',
+          model: 'claude:glm-flash', effort: 'max', status: 'queued', output: '', steps: [],
+        },
+      ],
+    }
+    const card = JSON.stringify(agentRunCard(run))
+    expect(card).toContain('继续委派任务')
+    expect(card).toContain('2 位 Agent')
+    expect(card).not.toContain('depth')
+    expect(JSON.stringify(agentRunCard({ ...run, parentKind: 'delegate' }))).toContain('委派任务')
+
+    expect(agentRunSummary(run)).toBe('⏳ 正在执行 · 0/2')
+    expect(agentRunSummary({ ...run, status: 'queued' })).toBe('⏳ 等待执行 · 0/2')
+    expect(agentRunSummary({ ...run, status: 'cancelled' })).toBe('🛑 委派已取消 · 0/2')
+    expect(agentRunSummary({ ...run, status: 'completed' })).toBe('✅ 委派完成 · 0/2')
+    expect(agentRunSummary(run)).not.toContain('depth')
+  })
+
+  test('worker 元素:失败/停止显示原因与已生成内容,排队显示原因,单 worker 完成默认展开', () => {
+    const worker = (patch: Partial<AgentRunSnapshot['workers'][number]>): AgentRunSnapshot['workers'][number] => ({
+      identityId: identity.id, identityName: identity.displayName, tokenSourceId: 'claude:glm', provider: 'claude',
+      model: identity.model, effort: 'max', status: 'failed', output: '', steps: [], ...patch,
+    })
+    const base = {
+      runId: 'agent_w', sessionName: 'project', chatId: 'chat', workDir: '/repo', prompt: 'go',
+      depth: 1, createdAt: new Date(0).toISOString(),
+    }
+
+    const failed = JSON.stringify(agentRunCard({
+      ...base, status: 'failed',
+      workers: [worker({ status: 'failed', error: 'agent exited before result', output: '已完成一半的正文', durationMs: 65_000 })],
+    }))
+    expect(failed).toContain('失败原因')
+    expect(failed).toContain('agent exited before result')
+    expect(failed).toContain('已生成的内容')
+    expect(failed).toContain('已完成一半的正文')
+    expect(failed).toContain('用时 1 分 5 秒')
+    expect(failed.indexOf('失败原因')).toBeLessThan(failed.indexOf('已生成的内容'))
+
+    const cancelled = JSON.stringify(agentRunCard({
+      ...base, status: 'cancelled',
+      workers: [worker({ status: 'cancelled', error: 'stop tree', output: '部分结果' })],
+    }))
+    expect(cancelled).toContain('停止原因')
+    expect(cancelled).toContain('已生成的内容')
+
+    const queued = JSON.stringify(agentRunCard({
+      ...base, status: 'queued',
+      workers: [worker({ status: 'queued', queuedReason: '等待全局并发槽位 (8)' })],
+    }))
+    expect(queued).toContain('等待全局并发槽位 (8)')
+
+    const single = JSON.parse(JSON.stringify(agentRunCard({
+      ...base, status: 'completed', workers: [worker({ status: 'completed', output: 'done' })],
+    })))
+    expect(single.body.elements.find((el: any) => el.element_id === agentWorkerElementId(identity.id)).expanded).toBe(true)
+
+    const dual = JSON.parse(JSON.stringify(agentRunCard({
+      ...base, status: 'completed',
+      workers: [worker({ status: 'completed', output: 'done' }), worker({ identityId: 'agent:b', status: 'completed', output: 'done too' })],
+    })))
+    expect(dual.body.elements.find((el: any) => el.element_id === agentWorkerElementId(identity.id)).expanded).toBe(false)
   })
 
   test('identityRow 在 defaultEffort 缺失时渲染 MISS 兜底(9020e11 展示层摘录)', () => {

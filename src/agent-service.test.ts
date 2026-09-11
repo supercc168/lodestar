@@ -110,7 +110,7 @@ describe('AgentService', () => {
     expect(settings.at(-1)).toEqual({
       config: {
         streaming_mode: false,
-        summary: { content: '✅ agent · 1/1 · depth 0' },
+        summary: { content: '✅ 委派完成 · 1/1' },
       },
     })
   })
