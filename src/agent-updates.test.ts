@@ -344,6 +344,26 @@ test('锁目录已建但 pid 尚未落盘的窗口不被误判为损坏锁', asy
   expect((await pending)?.directory).toBeTruthy()
 })
 
+test('pid 落盘失败时回滚锁目录:同一 agent 的后续更新不会被锁楔死(WR-02)', async () => {
+  const root = await scratch()
+  const directory = join(root, 'codex')
+  await mkdir(directory, { recursive: true, mode: 0o700 })
+  // 复刻"mkdir 成功、pid 落盘失败"的失败路径:umask 0o222 让新建锁目录可读可进入、
+  // 但没有写权限(writeFile EACCES),且不阻碍回滚 rm(它只依赖父目录写权限)。
+  const previousUmask = process.umask(0o222)
+  try {
+    await expect(updateAgentRuntime('codex', { root, metadata: fakeUpdate(), install }))
+      .rejects.toMatchObject({ code: 'EACCES' })
+  } finally {
+    process.umask(previousUmask)
+  }
+  // 缺陷下空锁目录残留:后续每次尝试都 EEXIST → 读不到 pid → 5s 宽限后抛
+  // Invalid runtime update lock,人工删目录前该 agent 的更新永久失败。
+  expect(await readdir(directory)).not.toContain('update.lock')
+  const state = await updateAgentRuntime('codex', { root, metadata: fakeUpdate(), install })
+  expect(state.directory).toBeTruthy()
+})
+
 test('one Agent update failure does not prevent other Agents from getting their latest runtime', async () => {
   const root = await scratch()
   await expect(updateAgentRuntimes({ root, install, metadata: async name => {

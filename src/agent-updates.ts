@@ -146,7 +146,14 @@ async function lock(directory: string, signal?: AbortSignal): Promise<() => Prom
     signal?.throwIfAborted()
     try {
       await mkdir(path)
-      await writeFile(join(path, 'pid'), String(process.pid))
+      try { await writeFile(join(path, 'pid'), String(process.pid)) }
+      catch (error) {
+        // 自己刚建出的锁没写全(ENOSPC / EACCES / Windows 扫描器占用等)必须回滚:
+        // 空锁目录留在原地会让后续每次尝试都 EEXIST → 读不到 pid → 5s 宽限后抛
+        // Invalid runtime update lock,人工删目录前该 agent 的更新永久失败(WR-02)。
+        await retryAgentFileOperation(() => rm(path, { recursive: true })).catch(() => {})
+        throw error
+      }
       return () => retryAgentFileOperation(() => rm(path, { recursive: true }))
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
