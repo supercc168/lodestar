@@ -55,7 +55,7 @@ export function agentRunCard(run: AgentRunSnapshot): object {
       expanded: false,
       elements: [{ tag: 'markdown', content: promptPreview(run.prompt) }],
     },
-    ...run.workers.map(worker => agentWorkerElement(worker, previewChars)),
+    ...run.workers.map(worker => agentWorkerElement(worker, previewChars, run.workers.length === 1)),
     agentRunFooterElement(run),
   ]
   if (!isTerminal(run.status)) elements.push(agentRunCancelElement(run.runId))
@@ -67,16 +67,27 @@ export function agentRunCard(run: AgentRunSnapshot): object {
       summary: { content: agentRunSummary(run) },
     },
     header: {
-      title: { tag: 'plain_text', content: `🧠 agent · depth ${run.depth}` },
+      // 标题按 parentKind 区分任务类型并直接给出 worker 数:内部调度层级不再
+      // 出现在面向用户的标题里(快照字段本身保留,不删数据结构)。
+      title: {
+        tag: 'plain_text',
+        content: `🧠 ${run.parentKind === 'follow_up' ? '继续委派任务' : '委派任务'} · ${run.workers.length} 位 Agent`,
+      },
       template: run.status === 'failed' ? 'red' : run.status === 'completed' ? 'green' : run.status === 'needs_input' ? 'orange' : 'purple',
     },
     body: { elements },
   }
 }
 
-export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars = WORKER_MAX_PREVIEW_CHARS): object {
+export function agentWorkerElement(
+  worker: AgentWorkerResult,
+  outputPreviewChars = WORKER_MAX_PREVIEW_CHARS,
+  expandResult = false,
+): object {
   const status = workerStatusLabel(worker)
   const body: string[] = [`**${escapeMarkdown(status)}**`]
+  if (worker.durationMs != null) body.push(`用时 ${durationLabel(worker.durationMs)}`)
+  if (worker.status === 'queued' && worker.queuedReason) body.push('', escapeMarkdown(worker.queuedReason))
   if (worker.pendingInput) {
     body.push('', '**等待主 Agent 回答**')
     for (const question of worker.pendingInput.questions) {
@@ -85,8 +96,18 @@ export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars
     }
     body.push(`request: ${inlineCode(worker.pendingInput.requestId)}`)
   }
-  if (worker.output) body.push('', truncate(sanitizeMarkdownForCardKit(worker.output), outputPreviewChars))
-  if (worker.error) body.push('', `<font color='red'>${sanitizeMarkdownForCardKit(worker.error)}</font>`)
+  // 失败与取消都要给出"为什么停"以及"停之前生成了什么":先原因、后内容,
+  // 保证 worker 失败不再吞掉已完成的正文。
+  if (worker.error) {
+    body.push('', worker.status === 'cancelled' ? '**停止原因**' : '**失败原因**', sanitizeMarkdownForCardKit(worker.error))
+  }
+  if (worker.output) {
+    body.push(
+      '',
+      worker.status === 'failed' || worker.status === 'cancelled' ? '**已生成的内容**' : '**结果**',
+      truncate(sanitizeMarkdownForCardKit(worker.output), outputPreviewChars),
+    )
+  }
   if (!worker.output && !worker.error && !worker.pendingInput) {
     body.push('', worker.status === 'completed' ? '_Agent 已完成，没有正文输出。_' : '_等待结果…_')
   }
@@ -103,7 +124,11 @@ export function agentWorkerElement(worker: AgentWorkerResult, outputPreviewChars
     tag: 'collapsible_panel',
     element_id: agentWorkerElementId(worker.identityId),
     header: { title: { tag: 'plain_text', content: `${status} · ${shortText(worker.identityName, 48)}` } },
-    expanded: worker.status === 'failed' || worker.status === 'needs_input',
+    // 单 worker 且已完成且有正文时默认展开(结果就是这张卡的正文);多 worker
+    // 保持折叠,避免一次性铺开所有结果。
+    expanded: worker.status === 'failed'
+      || worker.status === 'needs_input'
+      || (expandResult && worker.status === 'completed' && !!worker.output),
     elements: [{ tag: 'markdown', content: body.join('\n') }],
   }
 }
@@ -112,21 +137,27 @@ export function agentRunFooterElement(run: AgentRunSnapshot): object {
   const completed = run.workers.filter(item => item.status === 'completed').length
   const failed = run.workers.filter(item => item.status === 'failed').length
   const waiting = run.workers.filter(item => item.status === 'needs_input').length
-  const label = run.status === 'completed'
-    ? '✅ Agent 完成'
-    : run.status === 'failed'
-      ? '❌ Agent 失败'
-      : run.status === 'cancelled'
-        ? '🛑 Agent 已取消'
-        : run.status === 'needs_input'
-          ? '❓ 等待主 Agent 输入'
-          : run.status === 'queued'
-            ? '⏳ Agent 排队中'
-            : '⏳ Agent 运行中'
+  const running = run.workers.filter(item => item.status === 'running').length
+  const queued = run.workers.filter(item => item.status === 'queued').length
+  const cancelled = run.workers.filter(item => item.status === 'cancelled').length
+  const counts = [
+    running ? `执行中 ${running}` : '',
+    queued ? `排队 ${queued}` : '',
+    waiting ? `待答 ${waiting}` : '',
+    failed ? `失败 ${failed}` : '',
+    cancelled ? `已取消 ${cancelled}` : '',
+  ].filter(Boolean)
+  const duration = run.finishedAt ? Date.parse(run.finishedAt) - Date.parse(run.createdAt) : null
+  const lines = [
+    `**${runStatusLabel(run)}** · 完成 ${completed}/${run.workers.length}`,
+    ...(counts.length ? [counts.join(' · ')] : []),
+    ...(duration != null && Number.isFinite(duration) ? [`⏱ 用时 ${durationLabel(duration)}`] : []),
+    ...(run.error ? [escapeMarkdown(run.error)] : []),
+  ]
   return {
     tag: 'markdown',
     element_id: ELEMENTS.agentRunFooter,
-    content: `${label} · 完成 ${completed}/${run.workers.length} · 等待 ${waiting} · 失败 ${failed}`,
+    content: lines.join('\n'),
   }
 }
 
@@ -141,8 +172,7 @@ export function agentWorkerPreviewChars(workerCount: number): number {
 
 export function agentRunSummary(run: AgentRunSnapshot): string {
   const done = run.workers.filter(item => item.status === 'completed').length
-  const icon = run.status === 'completed' ? '✅' : run.status === 'failed' ? '❌' : run.status === 'cancelled' ? '🛑' : run.status === 'needs_input' ? '❓' : '⏳'
-  return `${icon} agent · ${done}/${run.workers.length} · depth ${run.depth}`
+  return `${runStatusLabel(run)} · ${done}/${run.workers.length}`
 }
 
 function identityRow(identity: AgentIdentity): object {
@@ -202,6 +232,29 @@ function workerStatusLabel(worker: AgentWorkerResult): string {
 
 function isTerminal(status: AgentRunSnapshot['status']): boolean {
   return status === 'completed' || status === 'failed' || status === 'cancelled'
+}
+
+/** 面向用户的运行状态文案(标题摘要/页脚共用)。running 且全部 worker 已终结
+ *  时是"正在收尾":子任务都停了,run 还在落盘/收尾。 */
+function runStatusLabel(run: AgentRunSnapshot): string {
+  switch (run.status) {
+    case 'completed': return '✅ 委派完成'
+    case 'failed': return '❌ 委派失败'
+    case 'cancelled': return '🛑 委派已取消'
+    case 'needs_input': return '❓ 等待主 Agent 回复'
+    case 'queued': return '⏳ 等待执行'
+    case 'running': return run.workers.length > 0 && run.workers.every(worker => isTerminal(worker.status))
+      ? '⏳ 正在收尾' : '⏳ 正在执行'
+  }
+}
+
+function durationLabel(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return '—'
+  const seconds = Math.floor(ms / 1000)
+  if (seconds < 60) return `${seconds} 秒`
+  const minutes = Math.floor(seconds / 60)
+  if (minutes < 60) return `${minutes} 分 ${seconds % 60} 秒`
+  return `${Math.floor(minutes / 60)} 小时 ${minutes % 60} 分`
 }
 
 function promptPreview(value: string): string {

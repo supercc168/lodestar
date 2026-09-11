@@ -235,7 +235,8 @@ describe('D-11 口径 3:单层委派(策略 + 原生工具两层拒绝)', () => 
     expect(seen[0].allowDelegation).toBe(false)
 
     // 主 Agent 不附加该文案:主 Agent 指令由 session-worktree 构造,不含 worker 文案。
-    expect(spawnDeveloperInstructions(session, 'claude')).not.toContain(DELEGATED_AGENT_INSTRUCTIONS)
+    const mainSession = { sessionName: 'project', workDir: '/repo', currentProvider: () => 'claude' as const } as any
+    expect(spawnDeveloperInstructions(mainSession)).not.toContain(DELEGATED_AGENT_INSTRUCTIONS)
     // 主 Agent 环境不含 worker role(主 Agent 走 session.ts 自有 hostEnv)。
     const sessionSource = readFileSync(join(import.meta.dir, 'session.ts'), 'utf8')
     const mainEnvBlock = sessionSource.slice(

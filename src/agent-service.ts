@@ -8,6 +8,7 @@ import { config } from './config'
 import { getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
 import { startAgentWorker, type AgentWorkerHandle } from './agent-runner'
 import { agentApiUrl } from './agent-runtime'
+import { DELEGATED_AGENT_INSTRUCTIONS } from './agent-skill'
 import type {
   AgentAnswerRequest,
   AgentFollowUpRequest,
@@ -369,9 +370,11 @@ export class AgentService {
         workDir: run.snapshot.workDir,
         prompt,
         resumeSessionId,
-        developerInstructions: run.session
-          ? delegatedAgentDeveloperInstructions(run.session, identity.provider)
-          : '',
+        // 指令层(D-11 口径 3):worker 文案与工作树约定按序拼接,主 Agent 不含该文案。
+        developerInstructions: [
+          run.session ? delegatedAgentDeveloperInstructions(run.session, identity.provider) : '',
+          DELEGATED_AGENT_INSTRUCTIONS,
+        ].filter(Boolean).join('\n\n'),
         profile: fullAgentProfile(feishu.projectProfile(
           run.session ? worktreeProjectName(run.session) : run.snapshot.sessionName,
         )),
@@ -380,7 +383,11 @@ export class AgentService {
           LODESTAR_AGENT_URL: agentApiUrl(config.notify?.bind ?? '127.0.0.1', config.notify?.port ?? 9876),
           LODESTAR_AGENT_CAPABILITY: capability,
           LODESTAR_AGENT_SESSION: run.snapshot.sessionName,
+          // worker 身份标记(仅被委派进程可见;主 Agent 的 hostEnv 不含该变量)。
+          LODESTAR_AGENT_ROLE: 'worker',
         },
+        // 原生工具层:worker 一律关闭再委派(claude disallowedTools / codex --disable multi_agent)。
+        allowDelegation: false,
         callbacks: {
           onNeedsInput: request => {
             if (run.cancelled) return
