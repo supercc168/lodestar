@@ -196,11 +196,19 @@ export interface TurnState {
    * 300308 flipped the turn to log-only. Cleared on successful
    * addElement so a recovered card doesn't carry a stale streak. */
   failureRotateCount: number
-  /** A non-capacity write failure is surfaced once per turn while the exact
-   * failed element remains dead/checked-false. Prevents footer/tool refreshes
-   * from flooding the chat with duplicate diagnostics (上游 4185808,
-   * FIX-02 投递失败可观测验收点). */
-  cardWriteFailureNotified: boolean
+  /** 被拒载荷的容量去重表(上游 378f4a4):key = CardWriteFailure.capacityFingerprint
+   * (仅容量类失败携带,跨卡/跨编号稳定),value = 这条载荷是否已发过用户诊断。
+   * 同一载荷再次被拒 → 不再烧换卡预算;换卡确有内容留在旧卡时整表清空
+   * (新一轮容量预算)。 */
+  cardCapacityFailures: Map<string, boolean>
+  /** 非容量写失败的通知去重(上游 378f4a4):key = 卡/元素/操作/错误码四段。
+   * 旧的布尔标记会吞掉同一 turn 里后出现的**不同**失败,按键集合才能
+   * 「同一失败不刷屏、新故障仍可见」(上游 4185808, FIX-02 投递失败可观测验收点)。 */
+  cardWriteFailureNotices: Set<string>
+  /** 开新卡失败(上游 378f4a4):暂停 footer 刷新与推送,后续内容事件重试开卡,
+   * 但**不**把仍可写的旧卡标记死卡。重试再失败才落到 rotateGivenUp 止损 ——
+   * 两级阶梯,不得合并为一级。 */
+  cardRotationFailed: boolean
   /** Latched once we hit the rotate cap and emit the "giving up" notice,
    * so the notice isn't repeated on every later failed write this turn. */
   rotateGivenUp: boolean

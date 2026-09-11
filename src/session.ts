@@ -7033,7 +7033,9 @@ export class Session {
       rotating: null,
       rotateCount: 0,
       failureRotateCount: 0,
-      cardWriteFailureNotified: false,
+      cardCapacityFailures: new Map(),
+      cardWriteFailureNotices: new Set(),
+      cardRotationFailed: false,
       rotateGivenUp: false,
       outboundSeenPaths: new Set(),
       outboundSentPaths: new Set(),
@@ -7129,8 +7131,11 @@ export class Session {
       const operation = failure?.operation ?? 'unknown operation'
       const element = failure?.elementId ? ` element=${failure.elementId}` : ''
       log(`session "${this.sessionName}": non-capacity card write failure card=${failedCardId.slice(0, 12)} operation=${operation}${element} code=${code ?? 'n/a'} — not rotating`)
-      if (!turn.cardWriteFailureNotified) {
-        turn.cardWriteFailureNotified = true
+      // 按键去重(上游 378f4a4):卡/元素/操作/错误码四段。任何一段不同就是一个
+      // 新故障,必须各自通知 —— 旧的布尔标记会把后一条吞掉。
+      const noticeKey = [failedCardId, failure?.elementId ?? '-', operation, code ?? 'n/a'].join('|')
+      if (!turn.cardWriteFailureNotices.has(noticeKey)) {
+        turn.cardWriteFailureNotices.add(noticeKey)
         void feishu.sendTextRaw(
           this.chatId,
           `⚠️ 对话卡片有一项写入失败(code=${code ?? 'MISS'}, ${operation})。该错误不是卡片元素上限，已停止无效换卡；其余输出继续处理。`,
