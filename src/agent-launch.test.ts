@@ -127,6 +127,11 @@ describe('createAgentProcess dsh 分支(D-08 双轨:与 claude:deepseek 互不�
     return () => { (config as any).deepseek_harness = prev }
   }
 
+  test('DshProcess 已由替身顶掉:构造期不 spawn 真实子进程', async () => {
+    const { DshProcess } = await import('./dsh-process')
+    expect(DshProcess.name).toBe('FakeDshProcess')
+  })
+
   test('凭据齐备时构造 dsh 进程,tokenSourceId 与 env 清洗都来自 DSH 源', () => {
     const restore = withDshConfig({ api_key: 'dsh-key', model: 'deepseek-v4-pro' })
     try {
