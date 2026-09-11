@@ -223,6 +223,39 @@ describe('AgentService', () => {
     expect(card.indexOf('失败原因')).toBeLessThan(card.indexOf('已生成的内容'))
   })
 
+  test('cancelled run keeps the output produced before the kill', async () => {
+    let capability = ''
+    const { service, root } = harness({
+      startWorker: opts => {
+        capability = String(opts.hostEnv.LODESTAR_AGENT_CAPABILITY)
+        let reject!: (error: Error) => void
+        const done = new Promise<AgentWorkerResult>((_ok, fail) => { reject = fail })
+        return {
+          done,
+          isAlive: () => true,
+          pendingInput: () => null,
+          answer: () => {},
+          async cancel(reason = 'cancelled') {
+            reject(new AgentWorkerFailure(new Error(reason), '取消前生成的正文', 'sid-cancel'))
+            await done.catch(() => {})
+          },
+        }
+      },
+    })
+    const started = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'cancel with output' })
+    for (let i = 0; i < 50 && !capability; i++) await new Promise(resolve => setTimeout(resolve, 1))
+    await service.cancelRun(root, started.runId, 'stop tree')
+    const run = service.getRun(root, started.runId)
+    expect(run.status).toBe('cancelled')
+    expect(run.workers[0].status).toBe('cancelled')
+    expect(run.workers[0].output).toBe('取消前生成的正文')
+    expect(run.workers[0].error).toBe('stop tree')
+    const card = JSON.stringify(agentRunCard(run))
+    expect(card).toContain('停止原因')
+    expect(card).toContain('已生成的内容')
+    expect(card).toContain('取消前生成的正文')
+  })
+
   test('marks interrupted durable runs failed on daemon restart', () => {
     const active = {
       runId: 'agent_old', sessionName: 'project', chatId: 'chat-1', workDir: '/repo', prompt: 'old', depth: 0,
