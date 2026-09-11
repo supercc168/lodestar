@@ -41,6 +41,9 @@ export function startAgentWorker(opts: {
   developerInstructions?: string
   profile?: ProjectProfile
   hostEnv: Record<string, string | undefined>
+  /** 原生工具层委派开关(D-11 口径 3)。worker 一律禁再委派,故缺省即 false;
+   *  仅显式 true 才放开(当前无调用方)。 */
+  allowDelegation?: boolean
   callbacks?: AgentWorkerCallbacks
 }): AgentWorkerHandle {
   if (!opts.identity.supportedEfforts.includes(opts.effort)) {
@@ -60,6 +63,7 @@ export function startAgentWorker(opts: {
     profile: opts.profile,
     hostEnv: opts.hostEnv,
     serviceName: 'lodestar-agent',
+    allowDelegation: opts.allowDelegation ?? false,
   })
   return collectAgentTurn(proc, opts.prompt, opts.callbacks)
 }

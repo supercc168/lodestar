@@ -22,6 +22,10 @@ export interface AgentLaunchOptions {
   profile?: ProjectProfile
   hostEnv?: Record<string, string | undefined>
   serviceName?: string
+  /** 原生工具层的委派开关:D-11 口径 3 的「单层委派」不靠提示词自觉。
+   *  缺省(undefined)= 不限制;只有显式 false 才关闭后端的委派工具
+   *  (claude disallowedTools / codex `--disable multi_agent`),主 Agent 不受影响。 */
+  allowDelegation?: boolean
 }
 
 export interface CreatedAgentProcess {
@@ -29,8 +33,10 @@ export interface CreatedAgentProcess {
 }
 
 /** Single source of truth for both the Feishu main Session and delegated
- * agents. Capability differences are expressed only by the caller's prompt;
- * this factory always launches the backend's full coding-agent surface.
+ * agents. Capability differences are expressed by the caller's prompt and by
+ * the explicit `allowDelegation: false` opt-out (delegated Agents get the
+ * backend's native delegation tools disabled — D-11 口径 3); every other
+ * surface is the same full coding-agent launch for both callers.
  *
  * Local slim port of 8881f69: lookup via listTokenSources, spawn via
  * resolveTokenSource(provider, selectionModel). No upstream registry lookup. */
@@ -92,6 +98,7 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
             }),
         ...(opts.developerInstructions ? { appendSystemPrompt: opts.developerInstructions } : {}),
         ...(opts.profile ? { profile: opts.profile } : {}),
+        ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
         hostEnv: opts.hostEnv,
       }),
     }
@@ -112,6 +119,7 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
       providerEnv: overrides.env,
       hostEnv: opts.hostEnv,
       serviceName: opts.serviceName ?? 'lodestar-agent',
+      ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
     }),
   }
 }

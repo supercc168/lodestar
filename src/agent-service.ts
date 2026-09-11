@@ -31,6 +31,11 @@ const MAX_WORKER_STEPS = 50
 const MAX_SESSION_ACTIVE_RUNS = 64
 const MAX_SUBTREE_ACTIVE_RUNS = 32
 const MAX_GLOBAL_INFLIGHT_WORKERS = 128
+/** 单层委派(D-11 口径 3):被委派的 Agent 不得再委派 —— worker principal 的
+ *  startRun/followUp 首行即拒。深度/子树闸门保留为源码级兜底(策略先拒后
+ *  执行不可达),三层齐备的另两层见 agent-launch(claude disallowedTools /
+ *  codex --disable multi_agent)与 agent-skill(指令层)。 */
+const NESTED_DELEGATION_ERROR = 'Delegated Agents cannot delegate again; ask the main Agent to assign additional work.'
 
 export type AgentPrincipal =
   | { kind: 'session'; session: Session; depth: -1 }
@@ -117,7 +122,12 @@ export class AgentService {
   }
 
   async startRun(principal: AgentPrincipal, request: AgentRunRequest): Promise<AgentRunSnapshot> {
+    // 派生字段先取好,再做策略拒绝:拒绝必须发生在任何副作用(占容量/建 run/落盘)之前。
     const depth = principal.kind === 'session' ? 0 : principal.depth + 1
+    const delegation = principal.kind === 'worker'
+      ? { parentRunId: principal.runId, parentKind: 'delegate' as const }
+      : {}
+    if (principal.kind === 'worker') throw new Error(NESTED_DELEGATION_ERROR)
     if (depth > MAX_DELEGATION_DEPTH) {
       throw new Error(`delegation depth ${depth} exceeds ${MAX_DELEGATION_DEPTH}`)
     }
@@ -126,7 +136,7 @@ export class AgentService {
       return await this.createRun(principal.session, request, {
         depth,
         cancellationEpoch: this.currentCancellationEpoch(principal.session),
-        ...(principal.kind === 'worker' ? { parentRunId: principal.runId, parentKind: 'delegate' as const } : {}),
+        ...delegation,
       })
     } finally {
       release()
@@ -138,6 +148,8 @@ export class AgentService {
     runId: string,
     request: AgentFollowUpRequest,
   ): Promise<AgentRunSnapshot> {
+    // follow-up 同样是一次委派动作:worker principal 不得借它曲线再委派。
+    if (principal.kind === 'worker') throw new Error(NESTED_DELEGATION_ERROR)
     const source = this.requireMutableDescendant(principal, runId)
     if (!isTerminal(source.snapshot.status)) throw new Error('agent follow-up requires a terminal source run')
     const worker = selectWorker(source.snapshot, request.identityId)

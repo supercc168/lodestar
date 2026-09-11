@@ -47,9 +47,18 @@ import {
 import { isAgentSession } from './agent-session-registry'
 import { subagentStepBrief } from './cards/background'
 
-/** 拼 `codex app-server` 命令行:把 provider 覆盖 `-c` 对插在 `--listen` 之前。 */
-export function buildCodexAppServerArgs(configArgs: string[] = []): string[] {
-  return ['app-server', ...configArgs, '--listen', 'stdio://']
+/** 拼 `codex app-server` 命令行:把 provider 覆盖 `-c` 对插在 `--listen` 之前。
+ *  `allowDelegation === false` 时额外插 `--disable multi_agent`(等价
+ *  `-c features.multi_agent=false`,codex-cli 0.144.1 `codex features list`
+ *  有该 flag):被委派的 Agent 在原生层就拿不到多智能体/委派工具(D-11 口径 3)。 */
+export function buildCodexAppServerArgs(configArgs: string[] = [], allowDelegation?: boolean): string[] {
+  return [
+    'app-server',
+    ...configArgs,
+    ...(allowDelegation === false ? ['--disable', 'multi_agent'] : []),
+    '--listen',
+    'stdio://',
+  ]
 }
 
 export function resolveCodexBin(): string {
@@ -178,6 +187,10 @@ export interface SpawnOpts {
   /** App-server conversation source label. Delegated agents use lodestar-agent
    * so their threads can be excluded from main rs/fk history. */
   serviceName?: string
+  /** 原生工具层委派开关(D-11 口径 3):false 时 spawn 参数加 `--disable
+   *  multi_agent`,threadParams 关 `features.multi_agent` —— 与 claude 的
+   *  disallowedTools 同为「不靠提示词自觉」的硬约束。缺省 = 不限制。 */
+  allowDelegation?: boolean
 }
 
 /** max / ultra 是 GPT-5.6 系新增的两档(高于 xhigh):max 延长思维链预算,
@@ -450,7 +463,7 @@ export class CodexProcess extends EventEmitter {
     this.opts = opts
     this.launchKind = opts.launch?.kind ?? 'fresh'
     const codexBin = resolveCodexBin()
-    const args = buildCodexAppServerArgs(opts.configArgs)
+    const args = buildCodexAppServerArgs(opts.configArgs, opts.allowDelegation)
     log(`codex-process: spawn ${codexBin} app-server (cwd=${opts.workDir})`)
     this.proc = spawn(codexBin, args, {
       cwd: opts.workDir,
@@ -1861,7 +1874,12 @@ export class CodexProcess extends EventEmitter {
       runtimeWorkspaceRoots: [this.opts.workDir],
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
-      config: { 'features.default_mode_request_user_input': true },
+      config: {
+        'features.default_mode_request_user_input': true,
+        // 单层委派(D-11 口径 3):与被委派 worker 的 `--disable multi_agent`
+        // 双保险 —— app-server 每次 thread 创建/恢复/分叉都带上关闭位。
+        ...(this.opts.allowDelegation === false ? { 'features.multi_agent': false } : {}),
+      },
       ...(this.opts.model ? { model: this.opts.model } : {}),
       effort: this.opts.effort,
       ...(this.opts.appendSystemPrompt ? { developerInstructions: this.opts.appendSystemPrompt } : {}),

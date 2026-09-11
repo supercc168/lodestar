@@ -1050,6 +1050,7 @@ export class ClaudeAgentProcess extends EventEmitter {
           env: spawnEnv,
           settingSources,
           tools: toolsOption,
+          ...(this.opts.allowDelegation === false ? { disallowedTools: ['Agent', 'Task'] } : {}),
           ...(strictMcpConfig ? { strictMcpConfig: true } : {}),
           ...(mcpServers ? { mcpServers } : {}),
           toolConfig: {

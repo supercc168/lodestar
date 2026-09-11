@@ -171,7 +171,9 @@ describe('AgentService', () => {
     expect(calls).toEqual([{ prompt: 'first', resume: undefined }, { prompt: 'second', resume: 'sid-first' }])
   })
 
-  test('scopes child capabilities to a run subtree and recursively cancels descendants', async () => {
+  // D-11 口径 3 后,后代 run 只能由主 Agent 的 follow-up 产生(worker principal
+  // 首行即拒),故子树/自取消语义改用 follow-up 子 run 验证。
+  test('scopes follow-up child runs to the parent subtree and recursively cancels descendants', async () => {
     const controls: ReturnType<typeof controlledHandle>[] = []
     const capabilities: string[] = []
     const { service, root } = harness({
@@ -184,13 +186,16 @@ describe('AgentService', () => {
     })
     const parent = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'parent' })
     for (let i = 0; i < 50 && !capabilities[0]; i++) await new Promise(resolve => setTimeout(resolve, 1))
-    const childPrincipal = service.principalForCapability(capabilities[0])!
-    await expect(service.cancelRun(childPrincipal, parent.runId, 'self-cancel')).rejects.toThrow('containing run')
-    const child = await service.startRun(childPrincipal, { identityIds: ['agent:a'], prompt: 'child' })
+    const workerPrincipal = service.principalForCapability(capabilities[0])!
+    await expect(service.cancelRun(workerPrincipal, parent.runId, 'self-cancel')).rejects.toThrow('containing run')
+    controls[0].resolve(result('sid-parent'))
+    await waitFor(service, root, parent.runId, 'completed')
+    const child = await service.followUp(root, parent.runId, { prompt: 'child' })
     expect(child.parentRunId).toBe(parent.runId)
-    expect(child.depth).toBe(1)
+    expect(child.parentKind).toBe('follow_up')
+    for (let i = 0; i < 50 && !capabilities[1]; i++) await new Promise(resolve => setTimeout(resolve, 1))
     await service.cancelRun(root, parent.runId, 'stop tree')
-    expect(service.getRun(root, parent.runId).status).toBe('cancelled')
+    expect(service.getRun(root, parent.runId).status).toBe('completed')
     expect(service.getRun(root, child.runId).status).toBe('cancelled')
   })
 
@@ -225,40 +230,35 @@ describe('AgentService', () => {
     expect(starts).toBe(0)
   })
 
-  test('seals a parent capability before awaiting kill and cancels an in-flight child creation', async () => {
-    const parentControl = controlledHandle()
+  // 原用例构造的是「worker 创建子 run 与父取消竞态」——D-11 口径 3 后该入口
+  // 不可达(策略层首行即拒),保留真正的不变式:capability 必须在 await kill
+  // 之前封死,不给任何后代创建留窗口。
+  test('seals a cancelled run capability before awaiting the worker kill', async () => {
     let capability = ''
-    let starts = 0
-    let childCardEntered!: () => void
-    let releaseChildCard!: () => void
-    const childEntered = new Promise<void>(resolve => { childCardEntered = resolve })
-    const childReleased = new Promise<void>(resolve => { releaseChildCard = resolve })
-    let cards = 0
+    let killEntered!: () => void
+    let releaseKill!: () => void
+    const entered = new Promise<void>(resolve => { killEntered = resolve })
+    const released = new Promise<void>(resolve => { releaseKill = resolve })
     const { service, root } = harness({
-      sendCard: async () => {
-        cards++
-        if (cards === 1) return 'message-parent'
-        childCardEntered()
-        await childReleased
-        return 'message-child'
-      },
       startWorker: opts => {
-        starts++
         capability = String(opts.hostEnv.LODESTAR_AGENT_CAPABILITY)
-        return parentControl.handle
+        return {
+          done: new Promise(() => {}),
+          pendingInput: () => null,
+          answer: () => {},
+          async cancel() { killEntered(); await released },
+        }
       },
     })
     const parent = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'parent' })
     for (let i = 0; i < 50 && !capability; i++) await new Promise(resolve => setTimeout(resolve, 1))
-    const childPrincipal = service.principalForCapability(capability)!
-    const creatingChild = service.startRun(childPrincipal, { identityIds: ['agent:a'], prompt: 'racing child' })
-    await childEntered
-    await service.cancelRun(root, parent.runId, 'stop parent')
+    expect(service.principalForCapability(capability)).not.toBeNull()
+    const cancelling = service.cancelRun(root, parent.runId, 'stop parent')
+    await entered
     expect(service.principalForCapability(capability)).toBeNull()
-    releaseChildCard()
-    const child = await creatingChild
-    expect(child.status).toBe('cancelled')
-    expect(starts).toBe(1)
+    releaseKill()
+    await cancelling
+    expect(service.getRun(root, parent.runId).status).toBe('cancelled')
   })
 
   test('rejects unbounded queued workers before sending another card', async () => {
