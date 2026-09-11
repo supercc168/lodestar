@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  ELEMENTS,
   sanitizeMarkdownForCardKit,
   downgradeExternalImagesForCardKit,
   neutralizeMarkdownImagesInCard,
@@ -226,5 +227,13 @@ describe('neutralizeMarkdownImagesInCard(卡片 JSON 最终边界,上游 4185808
     }
     const out = neutralizeMarkdownImagesInCard(card)
     expect(out).toEqual(card)
+  })
+})
+
+describe('ELEMENTS 注册表(上游 9020e11 展示层摘录)', () => {
+  test('modelAgentGroup 元素注册存在且可序列化', () => {
+    expect(ELEMENTS.modelAgentGroup('sol')).toBe('model_agent_sol')
+    expect(ELEMENTS.modelAgentGroup('opus')).toBe('model_agent_opus')
+    expect(JSON.stringify({ key: ELEMENTS.modelAgentGroup('glm') })).toBe('{"key":"model_agent_glm"}')
   })
 })
