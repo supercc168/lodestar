@@ -24,8 +24,14 @@ import type {
 import type { ConversationCheckpoint } from './conversation'
 
 export type AgentProvider = 'codex' | 'claude'
+/** DSH(DeepSeek Harness)原生档位(上游 722e45a)。与 Codex/Claude 档位不互通:
+ *  它是子进程 `model/list` 上报的 reasoning effort 词表(off/low/high/max)。 */
+export type DshReasoningEffort = 'off' | 'low' | 'high' | 'max'
+export function isDshReasoningEffort(value: unknown): value is DshReasoningEffort {
+  return value === 'off' || value === 'low' || value === 'high' || value === 'max'
+}
 export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
-export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort
+export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort | DshReasoningEffort
 
 /** A Codex capacity failure keeps the logical task open while retrying. */
 export interface AgentTurnRetry {
@@ -165,11 +171,18 @@ export interface AgentProcess extends EventEmitter {
   isAlive(): boolean
   kill(timeoutMs?: number): Promise<void>
 
-  listModels(): Promise<CodexModel[]>
+  listModels(): Promise<AgentModel[]>
   setModelSettings(model: string, effort: AgentReasoningEffort): Promise<void>
   setModel(model: string): Promise<void>
   compactThread(): Promise<void>
   injectThreadItems(items: any[]): Promise<void>
+}
+
+/** 跨后端模型目录条目:档位词表按后端放宽(Codex 的 none..ultra 与 DSH 的
+ *  off/low/high/max 不共享),其余字段沿用 Codex 目录形状(上游 722e45a)。 */
+export interface AgentModel extends Omit<CodexModel, 'supportedReasoningEfforts' | 'defaultReasoningEffort'> {
+  supportedReasoningEfforts: Array<{ reasoningEffort: AgentReasoningEffort; description: string }>
+  defaultReasoningEffort: AgentReasoningEffort | null
 }
 
 export type AgentProcessEventMap = {
