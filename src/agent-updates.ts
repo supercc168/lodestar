@@ -134,10 +134,14 @@ async function writeState(agentDirectory: string, state: AgentRuntimeState): Pro
   }
 }
 
+/** mkdir 与 pid 落盘之间对手进程必然看到空文件;超过这段时间仍读不到 pid 才按损坏锁处理。 */
+const LOCK_ACQUISITION_GRACE_MS = 5_000
+
 /** Directory lock also serializes a manual CLI update with the daemon timer. */
 async function lock(directory: string, signal?: AbortSignal): Promise<() => Promise<void>> {
   const path = join(directory, 'update.lock')
   const deadline = Date.now() + 360_000
+  let incompleteSince: number | undefined
   for (;;) {
     signal?.throwIfAborted()
     try {
@@ -146,17 +150,27 @@ async function lock(directory: string, signal?: AbortSignal): Promise<() => Prom
       return () => retryAgentFileOperation(() => rm(path, { recursive: true }))
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== 'EEXIST') throw error
+      // 锁目录存在,但持有者可能刚 mkdir 完、pid 还没写完 —— 这个窗口里读到的是空文件
+      // (Number('') === 0)。它不是损坏锁,继续按节拍等待即可;只有持续读不到才报错。
+      let holding = false
       try {
         const pid = Number(await readFile(join(path, 'pid'), 'utf8'))
-        if (!Number.isSafeInteger(pid) || pid <= 0) throw new Error(`Invalid runtime update lock: ${path}`)
-        try { process.kill(pid, 0) }
-        catch (cause) {
-          if ((cause as NodeJS.ErrnoException).code !== 'ESRCH') throw cause
-          await retryAgentFileOperation(() => rm(path, { recursive: true }))
-          continue
+        if (Number.isSafeInteger(pid) && pid > 0) {
+          holding = true
+          try { process.kill(pid, 0) }
+          catch (cause) {
+            if ((cause as NodeJS.ErrnoException).code !== 'ESRCH') throw cause
+            await retryAgentFileOperation(() => rm(path, { recursive: true }))
+            continue
+          }
         }
       } catch (cause) {
         if ((cause as NodeJS.ErrnoException).code !== 'ENOENT') throw cause
+      }
+      if (holding) incompleteSince = undefined
+      else {
+        incompleteSince ??= Date.now()
+        if (Date.now() - incompleteSince > LOCK_ACQUISITION_GRACE_MS) throw new Error(`Invalid runtime update lock: ${path}`)
       }
       if (Date.now() >= deadline) throw new Error(`Timed out waiting for runtime update lock: ${path}`)
       await new Promise(resolve => setTimeout(resolve, 200))
