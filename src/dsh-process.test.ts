@@ -196,6 +196,13 @@ describe('DshProcess 契约', () => {
     await expect(proc.compactThread()).rejects.toThrow('无需压缩')
   })
 
+  test('AgentProcess 不支持的三个成员显式抛错而不是缺席', async () => {
+    const proc = processFor()
+    expect(() => proc.sendToolResult('call-1', 'content')).toThrow('DSH does not support sendToolResult')
+    await expect(proc.setModel('deepseek-v4-pro')).rejects.toThrow('DSH does not support setModel')
+    await expect(proc.injectThreadItems([])).rejects.toThrow('DSH does not support injectThreadItems')
+  })
+
   test('sendInterrupt 走 session/cancel', async () => {
     const proc = processFor()
     const runtime = FakeDshRuntime.latest()

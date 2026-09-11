@@ -190,6 +190,18 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     }).catch(error => this.fail(error))
   }
   sendHookResponse(): void { throw new Error('DSH does not issue hook callback requests') }
+  /** AgentProcess 契约中的这三个成员 DSH 原生协议没有对应能力:显式抛「不支持」
+   *  而不是缺席 —— 缺席在泛化调用下是运行期 `is not a function`(build 走
+   *  bun build 不做类型检查,implements 违规本地不报错)。 */
+  sendToolResult(_toolUseId: string, _content: string, _isError?: boolean): void {
+    throw new Error('DSH does not support sendToolResult')
+  }
+  setModel(_model: string): Promise<void> {
+    return Promise.reject(new Error('DSH does not support setModel'))
+  }
+  async injectThreadItems(_items: any[]): Promise<void> {
+    throw new Error('DSH does not support injectThreadItems')
+  }
   async listModels(): Promise<AgentModel[]> {
     await this.runtime.initialize()
     this.models = await this.runtime.request('model/list')
