@@ -484,6 +484,246 @@ describe('cardkit 失败元素三态语义 (上游 378f4a4)', () => {
   })
 })
 
+describe('cardkit 测试矩阵收口:上游五意图 + 本地止损回归 (上游 378f4a4)', () => {
+  const CAPACITY_REJECTION = 'Failed to add element: number of card components exceeds the maximum limit; code: 300305'
+
+  function failNextCardKitCall(code: number, msg = `injected failure ${code}`): void {
+    const previousFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      globalThis.fetch = previousFetch
+      const url = new URL(String(input))
+      calls.push({
+        method: String(init?.method ?? 'GET'),
+        path: url.pathname.replace('/open-apis/cardkit/v1', ''),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      })
+      return new Response(JSON.stringify({ code, msg }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+  }
+
+  /** 走真实写路径制造一次容量失败,取回本次被拒载荷的 capacityFingerprint。 */
+  async function rejectedPayloadFingerprint(
+    cardId: string,
+    elementId: string,
+    element: object,
+  ): Promise<string | undefined> {
+    const healthy = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      code: 300315, msg: CAPACITY_REJECTION,
+    }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as unknown as typeof fetch
+    let fingerprint: string | undefined
+    try {
+      await cardkit.replaceElement(cardId, elementId, element, (_code, meta) => {
+        fingerprint = meta?.failure?.capacityFingerprint
+      })
+    } finally {
+      globalThis.fetch = healthy
+    }
+    return fingerprint
+  }
+
+  test('同一内容跨重新编号/更新/删除保持指纹一致 (上游 378f4a4)', async () => {
+    // 卡 A:同内容经「新增 → 更新」两步,元素编号是 assistant_0 / tool_0
+    cardkit.recordCardCreated('card_matrix_renumber_a', 2)
+    await cardkit.addElementChecked('card_matrix_renumber_a', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'final answer',
+    })
+    await cardkit.addElementChecked('card_matrix_renumber_a', {
+      tag: 'markdown', element_id: 'tool_0', content: 'tool result v1',
+    })
+    await cardkit.replaceElementChecked('card_matrix_renumber_a', 'tool_0', {
+      tag: 'markdown', element_id: 'tool_0', content: 'tool result v2',
+    })
+
+    // 卡 B:同样的最终内容,元素编号完全不同(assistant_12 / tool_5),一步到位
+    cardkit.recordCardCreated('card_matrix_renumber_b', 2)
+    await cardkit.addElementChecked('card_matrix_renumber_b', {
+      tag: 'markdown', element_id: 'assistant_12', content: 'final answer',
+    })
+    await cardkit.addElementChecked('card_matrix_renumber_b', {
+      tag: 'markdown', element_id: 'tool_5', content: 'tool result v2',
+    })
+
+    const cardA = await rejectedPayloadFingerprint('card_matrix_renumber_a', 'tool_0', {
+      tag: 'markdown', element_id: 'tool_0', content: 'oversized result',
+    })
+    const cardB = await rejectedPayloadFingerprint('card_matrix_renumber_b', 'tool_5', {
+      tag: 'markdown', element_id: 'tool_5', content: 'oversized result',
+    })
+    expect(cardA).toBeString()
+    expect(cardA).toBe(cardB)
+
+    // 删除卡 A 上的 assistant_0:已写入内容变了,指纹必须跟着变(删除如实反映)
+    expect(await cardkit.deleteElementChecked('card_matrix_renumber_a', 'assistant_0')).toBe(true)
+    const afterDelete = await rejectedPayloadFingerprint('card_matrix_renumber_a', 'tool_0', {
+      tag: 'markdown', element_id: 'tool_0', content: 'oversized result',
+    })
+    expect(afterDelete).not.toBe(cardA)
+
+    await cardkit.dispose('card_matrix_renumber_a')
+    await cardkit.dispose('card_matrix_renumber_b')
+  })
+
+  test('队列中的工具结果用最新内容与原始 placement 重建失败占位 (上游 378f4a4)', async () => {
+    const id = 'card_matrix_queued_rebuild'
+    cardkit.recordCardCreated(id, 1)
+    failNextCardKitCall(300308)
+
+    // 不 await:两次写按队列顺序执行 —— 占位 add 失败(dead + failedAdds 记
+    // placement),随后到达的工具结果必须在原 placement 用最新内容重建。
+    const placeholder = cardkit.addElement(id, {
+      tag: 'markdown', element_id: 'tool_0', content: 'running',
+    }, { type: 'insert_before', targetElementId: 'footer' })
+    const toolResult = cardkit.replaceElement(id, 'tool_0', {
+      tag: 'markdown', element_id: 'tool_0', content: 'tool result',
+    })
+    await Promise.all([placeholder, toolResult])
+
+    expect(calls.map(call => call.method)).toEqual(['POST', 'POST'])
+    expect(calls[1]!.body.target_element_id).toBe('footer')
+    expect(calls[1]!.body.elements).toContain('tool result')
+    expect(cardkit.isDeadElement(id, 'tool_0')).toBe(false)
+    expect(cardkit.getElementCount(id)).toBe(2)
+    await cardkit.dispose(id)
+  })
+
+  test('被拒更新可恢复与显式删除保持删除并存 (上游 378f4a4)', async () => {
+    const id = 'card_matrix_recover_and_delete'
+    cardkit.recordCardCreated(id, 2)
+    await cardkit.addElementChecked(id, {
+      tag: 'markdown', element_id: 'assistant_0', content: 'draft',
+    })
+    await cardkit.addElementChecked(id, {
+      tag: 'markdown', element_id: 'math_1', content: 'formula',
+    })
+    expect(await cardkit.deleteElementChecked(id, 'math_1')).toBe(true)
+
+    failNextCardKitCall(300315, CAPACITY_REJECTION)
+    expect(await cardkit.replaceElementChecked(id, 'assistant_0', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'oversized final',
+    })).toBe(false)
+    expect(await cardkit.replaceElementChecked(id, 'assistant_0', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'final',
+    })).toBe(true)
+
+    // 两条结论同时成立:可恢复的元素回到「已写入」,删除的元素不在其中
+    expect(cardkit.getWrittenContentElementIds(id)).toEqual(['assistant_0'])
+    expect(cardkit.isDeadElement(id, 'math_1')).toBe(true)
+    const before = calls.length
+    expect(await cardkit.replaceElementChecked(id, 'math_1', {
+      tag: 'markdown', element_id: 'math_1', content: 'late late',
+    })).toBe(false)
+    expect(calls).toHaveLength(before)
+    await cardkit.dispose(id)
+  })
+
+  test('失败更新之后再删除,远端元素确实被移除 (上游 378f4a4)', async () => {
+    const id = 'card_matrix_delete_after_failure'
+    cardkit.recordCardCreated(id, 1)
+    await cardkit.addElementChecked(id, {
+      tag: 'markdown', element_id: 'assistant_0', content: 'v1',
+    })
+    expect(cardkit.getElementCount(id)).toBe(2)
+
+    failNextCardKitCall(300308)
+    expect(await cardkit.replaceElementChecked(id, 'assistant_0', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'v2',
+    })).toBe(false)
+
+    expect(await cardkit.deleteElementChecked(id, 'assistant_0')).toBe(true)
+    expect(calls.at(-1)?.method).toBe('DELETE')
+    expect(calls.at(-1)?.path).toBe(`/cards/${id}/elements/assistant_0`)
+    expect(cardkit.getElementCount(id)).toBe(1)
+    expect(cardkit.getWrittenContentElementIds(id)).toEqual([])
+
+    const before = calls.length
+    expect(await cardkit.replaceElementChecked(id, 'assistant_0', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'late v3',
+    })).toBe(false)
+    expect(calls).toHaveLength(before)
+    await cardkit.dispose(id)
+  })
+
+  test('数千张新卡之后关闭的卡仍不可写,未知卡无状态可写 (上游 378f4a4)', async () => {
+    const closed = 'card_matrix_closed'
+    cardkit.recordCardCreated(closed, 1)
+    await cardkit.addElementChecked(closed, {
+      tag: 'markdown', element_id: 'assistant_0', content: 'x',
+    })
+    await cardkit.dispose(closed)
+    expect(cardkit.isDisposed(closed)).toBe(true)
+
+    for (let i = 0; i < 4999; i += 1) {
+      const filler = `card_matrix_filler_${i}`
+      cardkit.recordCardCreated(filler, 1)
+      await cardkit.dispose(filler)
+    }
+
+    // 墓碑仍有界在 MAX_DISPOSED_CARD_TOMBSTONES = 5000 之内:迟到写一律短路
+    expect(cardkit.isDisposed(closed)).toBe(true)
+    const before = calls.length
+    expect(await cardkit.addElementChecked(closed, {
+      tag: 'markdown', element_id: 'late', content: 'y',
+    })).toBe(false)
+    expect(await cardkit.replaceElementChecked(closed, 'assistant_0', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'z',
+    })).toBe(false)
+    await cardkit.addElement(closed, { tag: 'markdown', element_id: 'late2', content: 'w' })
+    await cardkit.deleteElement(closed, 'assistant_0')
+    expect(calls).toHaveLength(before)
+
+    // 没见过的卡:读操作不凭空创建状态(本地沿用 lazy state + 墓碑语义)
+    expect(cardkit.isDisposed('card_matrix_never_seen')).toBe(false)
+    expect(cardkit.getElementCount('card_matrix_never_seen')).toBe(0)
+    expect(cardkit.getWrittenContentElementIds('card_matrix_never_seen')).toEqual([])
+    expect(cardkit.isDeadElement('card_matrix_never_seen', 'assistant_0')).toBe(false)
+  })
+
+  test('writeDead 之后所有写入短路 —— 本地止损回归门', async () => {
+    const id = 'card_matrix_write_dead'
+    cardkit.recordCardCreated(id, 2)
+    await cardkit.addElementChecked(id, {
+      tag: 'markdown', element_id: 'assistant_0', content: 'x',
+    })
+    const countBefore = cardkit.getElementCount(id)
+    cardkit.markCardWriteDead(id)
+    cardkit.markCardWriteDead(id) // 幂等
+
+    const before = calls.length
+    for (let i = 0; i < 20; i += 1) {
+      await cardkit.addElement(id, { tag: 'markdown', element_id: `late_${i}`, content: 'y' })
+      await cardkit.replaceElement(id, 'assistant_0', {
+        tag: 'markdown', element_id: 'assistant_0', content: 'z',
+      })
+    }
+    await cardkit.deleteElement(id, 'assistant_0')
+    await cardkit.patchSettings(id, { config: { streaming_mode: false } })
+    expect(await cardkit.addElementChecked(id, {
+      tag: 'markdown', element_id: 'late_checked', content: 'y',
+    })).toBe(false)
+    expect(await cardkit.replaceElementChecked(id, 'assistant_0', {
+      tag: 'markdown', element_id: 'assistant_0', content: 'z',
+    })).toBe(false)
+    expect(await cardkit.patchSettingsChecked(id, { config: { streaming_mode: false } })).toBe(false)
+
+    expect(calls).toHaveLength(before)
+    expect(cardkit.getElementCount(id)).toBe(countBefore)
+
+    // 止损不跨生命周期残留:dispose 后同 id 重建恢复可写
+    await cardkit.dispose(id)
+    cardkit.recordCardCreated(id, 1)
+    await cardkit.addElementChecked(id, {
+      tag: 'markdown', element_id: 'assistant_0', content: 'fresh',
+    })
+    expect(calls).toHaveLength(before + 1)
+    await cardkit.dispose(id)
+  })
+})
+
 describe('cardkit network retry and footer isolation', () => {
   test('retries network transport failures then succeeds without elevating card failure', async () => {
     const failures: Array<{ code?: number; kind?: string }> = []
