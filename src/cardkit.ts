@@ -14,6 +14,7 @@
  *   - all writes for a card are serialized through a Promise queue
  */
 
+import { createHash } from 'node:crypto'
 import { getTenantToken } from './feishu'
 import { log } from './log'
 import { neutralizeMarkdownImagesInCard } from './cards/elements'
@@ -33,6 +34,13 @@ const NETWORK_RETRY_DELAYS_MS = [200, 500]
  * card-level onFailure → mid-turn rotate path. */
 const FOOTER_ELEMENT_ID = 'footer'
 
+/** 元素插入位置(上游 378f4a4)。失败的 add 必须记住原始 placement,后续同
+ * id 的更新才能在原位重建最新内容,而不是 PUT 一个远端不存在的幽灵元素。 */
+export interface ElementPlacement {
+  type?: 'append' | 'insert_before' | 'insert_after'
+  targetElementId?: string
+}
+
 interface CardState {
   sequence: number
   queue: Promise<void>
@@ -47,12 +55,27 @@ interface CardState {
    * addElement won't bump it, so the count tracks "elements Feishu
    * believes exist" not "elements we tried to create"). */
   elementCount: number
+  /** Hashes of successfully written body elements, without card-local IDs
+   * (上游 378f4a4). Used to recognize an unchanged rejected payload across
+   * replacement cards: footer timing/status changes do not count as content
+   * progress, so the footer element never registers here. Per-card and
+   * dropped on `dispose`. */
+  contentFingerprints: Map<string, string>
   /** element_ids that must no longer receive writes. Usually this means
    * `addElement` was rejected by Feishu, so the element does NOT exist on Feishu's
    * side and every subsequent `replaceElement`/`deleteElement`
    * would 300313/300121. Per-card and dropped on `dispose`, so a rotated-to
-   * fresh card starts clean. */
+   * fresh card starts clean.
+   * 三态(上游 378f4a4):dead 只是「最新内容未落地或已删除」的一半 —— 失败
+   * 但可恢复的元素(见 failedAdds/failedReplacements)仍允许后续写入;
+   * 只有「显式删除」才彻底短路。 */
   deadElements: Set<string>
+  /** Missing adds retain their original placement so a later tool/result
+   * update can create the latest element instead of PUTting a phantom ID.
+   * Failed PUTs still have a remote element and may be retried; explicitly
+   * deleted elements must remain unwritable. (上游 378f4a4) */
+  failedAdds: Map<string, ElementPlacement>
+  failedReplacements: Set<string>
   /** Card-level write kill-switch (see markCardWriteDead). Once set, every
    * write op short-circuits to a resolved promise — no HTTP, no onFailure.
    * Session flips this when it hits the failure-rotate cap and goes
@@ -95,6 +118,11 @@ export interface CardWriteFailure {
   httpStatus?: number
   logId?: string
   message: string
+  /** Attempted body content, including the rejected element, independent of
+   * card IDs, element renumbering and footer timers. Capacity failures only
+   * (上游 378f4a4) — session 层用它识别「同一个载荷又被拒了一次」,非容量
+   * 失败带这个字段会吞掉诊断。 */
+  capacityFingerprint?: string
 }
 
 export interface CardWriteResult {
@@ -243,7 +271,10 @@ function state(cardId: string): CardState {
       sequence: 0,
       queue: Promise.resolve(),
       elementCount: 0,
+      contentFingerprints: new Map(),
       deadElements: new Set(),
+      failedAdds: new Map(),
+      failedReplacements: new Set(),
     }
     cards.set(cardId, s)
   }
@@ -286,6 +317,15 @@ export function getElementCount(cardId: string): number {
   return cards.get(cardId)?.elementCount ?? 0
 }
 
+/** Body elements whose latest content actually landed (上游 378f4a4). Session
+ * uses these ids to distinguish completed output left on an old page from live
+ * content that has to be rebuilt on every replacement card. Unknown cards
+ * return an empty list. */
+export function getWrittenContentElementIds(cardId: string): string[] {
+  const s = cards.get(cardId)
+  return s ? [...s.contentFingerprints.keys()].filter(id => !s.deadElements.has(id)) : []
+}
+
 /** True if `elementId` was recorded dead on this card (its addElement was
  * rejected, so the element doesn't exist on Feishu). Mid-turn rotation reads
  * this for tool panels: dead ⇒ rebuild on the fresh card, alive ⇒ leave it on
@@ -321,6 +361,27 @@ function nextSeq(cardId: string): number {
 
 function markElementDead(s: CardState, elementId: string): void {
   s.deadElements.add(elementId)
+}
+
+/** 对元素 payload 做稳定序列化后取哈希(上游 378f4a4):剥掉所有层级的
+ * `element_id`,所以同一内容的元素重新编号不改变指纹;不含 card_id、不含卡内
+ * 序号 —— 同一内容在不同卡上得到同一指纹。仅哈希进内存/日志,正文不落日志。 */
+function contentFingerprint(element: object): string {
+  return createHash('sha256').update(JSON.stringify(element, (key, value) =>
+    key === 'element_id' ? undefined : value,
+  )).digest('hex')
+}
+
+/** 把该卡已登记的内容指纹 + 本次尝试的指纹合并排序后再哈希(上游 378f4a4):
+ * 指纹描述「整张卡尝试写入的正文」,而不是单个元素,所以换卡重建同一批内容
+ * 时得到同一结果。排除本次尝试的元素 id(覆盖写不得把旧版本算进来),
+ * footer 不参与(footer 每秒重写,参与了「同一内容」就永不稳定)。 */
+function attemptedContentFingerprint(s: CardState, elementId?: string, fingerprint?: string): string {
+  const contents = [...s.contentFingerprints]
+    .filter(([id]) => id !== elementId)
+    .map(([, hash]) => hash)
+  if (fingerprint && elementId !== FOOTER_ELEMENT_ID) contents.push(fingerprint)
+  return createHash('sha256').update(contents.sort().join('\n')).digest('hex')
 }
 
 async function call(method: string, path: string, body?: object): Promise<any> {
@@ -379,18 +440,29 @@ function failureMetaFromError(
   e: unknown,
   cardId: string,
   operation: string,
-  context: Pick<CardWriteFailure, 'elementId' | 'targetElementId'> = {},
+  context: Pick<CardWriteFailure, 'elementId' | 'targetElementId'> & { contentFingerprint?: string } = {},
 ): CardWriteFailureMeta {
   const requestError = typeof e === 'object' && e !== null ? e as CardKitRequestError : null
   const code = typeof requestError?.code === 'number' ? requestError.code : undefined
   const failure: CardWriteFailure = {
     cardId,
     operation,
-    ...context,
+    elementId: context.elementId,
+    targetElementId: context.targetElementId,
     code,
     httpStatus: requestError?.httpStatus,
     logId: requestError?.logId,
     message: e instanceof Error ? e.message : String(e),
+  }
+  // 只有确认的容量类失败(300305/200860 及其 300315 内嵌形态)才填载荷指纹
+  // (上游 378f4a4):网络/schema/重复 id 失败带它会吞掉 session 的非容量诊断。
+  if (isCardCapacityFailure(failure.code, failure)) {
+    const s = cards.get(cardId)
+    if (s) {
+      failure.capacityFingerprint = attemptedContentFingerprint(
+        s, context.elementId, context.contentFingerprint,
+      )
+    }
   }
   return { kind: isNetworkError(e) ? 'network' : 'api', failure }
 }
@@ -437,7 +509,7 @@ async function withReopenOnStreamingClosed(
   opts: {
     silent?: boolean
     elevateCardFailure?: boolean
-    meta?: Pick<CardWriteFailure, 'elementId' | 'targetElementId'>
+    meta?: Pick<CardWriteFailure, 'elementId' | 'targetElementId'> & { contentFingerprint?: string }
   } = {},
 ): Promise<void> {
   const silent = opts.silent === true
@@ -560,7 +632,7 @@ export async function flush(cardId: string): Promise<void> {
 export function addElement(
   cardId: string,
   element: object,
-  opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
+  opts: ElementPlacement = {},
   onFailure?: CardWriteFailureHandler,
 ): Promise<void> {
   // disposed 判断必须先于 state():否则 dispose 后的迟到写会经 state()
@@ -570,6 +642,7 @@ export function addElement(
   if (s.closing || s.writeDead) return Promise.resolve()
   const safeElement = neutralizeMarkdownImagesInCard(element)
   const elementId = (safeElement as { element_id?: string }).element_id
+  const fingerprint = contentFingerprint(safeElement)
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `addElement`,
@@ -586,6 +659,9 @@ export function addElement(
       // bypass this line, so the count tracks "elements Feishu actually
       // accepted" not "elements we tried to push".
       s.elementCount += 1
+      // 正文指纹只登记真正落地的 body 元素(键=元素 id,不含卡内序号);
+      // footer 每秒重写,登记进去「同一内容」就永不稳定(上游 378f4a4)。
+      if (elementId !== FOOTER_ELEMENT_ID) s.contentFingerprints.set(elementId ?? `#${seq}`, fingerprint)
       // 落地即清 stale dead 标记:同 id 重投成功后,后续 replace/delete
       // 不再被上一次失败的墓碑短路(上游 4185808)。
       if (elementId) s.deadElements.delete(elementId)
@@ -602,7 +678,7 @@ export function addElement(
       if (elementId) markElementDead(s, elementId)
       onFailure?.(code, meta)
     },
-    { meta: { elementId, targetElementId: opts.targetElementId } },
+    { meta: { elementId, targetElementId: opts.targetElementId, contentFingerprint: fingerprint } },
   ))
   return s.queue
 }
@@ -634,6 +710,7 @@ export function replaceElement(
     return Promise.resolve()
   }
   const safeElement = neutralizeMarkdownImagesInCard(element)
+  const fingerprint = contentFingerprint(safeElement)
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `replaceElement ${elementId}`,
@@ -647,6 +724,8 @@ export function replaceElement(
         element: JSON.stringify(safeElement),
         sequence: seq,
       })
+      // 覆盖成功即刷新指纹(同一元素的最新正文才是「已写入内容」)。
+      if (elementId !== FOOTER_ELEMENT_ID) s.contentFingerprints.set(elementId, fingerprint)
     },
     (code, meta) => {
       // 工具已完成不代表结果已写入。升群告警的容量失败要标 dead，换卡时把
@@ -657,7 +736,7 @@ export function replaceElement(
       }
       onFailure?.(code, meta)
     },
-    { elevateCardFailure, meta: { elementId } },
+    { elevateCardFailure, meta: { elementId, contentFingerprint: fingerprint } },
   ))
   return s.queue
 }
@@ -697,7 +776,7 @@ export async function addElementChecked(
 export async function addElementResult(
   cardId: string,
   element: object,
-  opts: { type?: 'append' | 'insert_before' | 'insert_after'; targetElementId?: string } = {},
+  opts: ElementPlacement = {},
 ): Promise<CardWriteResult> {
   if (disposedCards.has(cardId)) return { landed: false }
   const s = state(cardId)
@@ -730,6 +809,8 @@ export function deleteElement(
         sequence: seq,
       })
       s.elementCount = Math.max(0, s.elementCount - 1)
+      // 删除即退出「已写入正文」:换卡/指纹不得再把远端已删元素算进来。
+      s.contentFingerprints.delete(elementId)
       markElementDead(s, elementId)
     },
     onFailure,
