@@ -13401,3 +13401,130 @@ describe('Session DSH backend wiring (upstream 722e45a)', () => {
   })
 })
 
+describe('Session DSH model panel and console (upstream 722e45a)', () => {
+  function withDshSection(section: any): () => void {
+    const prev = (config as any).deepseek_harness
+    ;(config as any).deepseek_harness = section
+    return () => { (config as any).deepseek_harness = prev }
+  }
+
+  test('DSH 档位进固定选项:off 可选中(effort 非 Codex 常量),medium/xhigh 被拒', async () => {
+    const restore = withDshSection({ api_key: 'dsh-key', model: 'deepseek-v4-pro', effort: 'off' })
+    try {
+      const session = new Session('dsh-panel-off', 'chat_id') as any
+      const dsh = fixedModelChoices(session).find(choice => choice.provider === 'dsh')
+
+      expect(dsh).toBeDefined()
+      expect(dsh!.model).toBe('deepseek-v4-pro')
+      expect(dsh!.efforts[0]!.effort).toBe('off')
+
+      const medium = await session.onModelEffortSelect('deepseek-v4-pro', 'medium', '', 'ou_user', 'dsh')
+      expect(medium.ok).toBe(false)
+      expect(medium.message).toBe('DSH reasoning effort 无效')
+      const xhigh = await session.onModelEffortSelect('deepseek-v4-pro', 'xhigh', '', 'ou_user', 'dsh')
+      expect(xhigh.ok).toBe(false)
+      expect(xhigh.message).toBe('DSH reasoning effort 无效')
+
+      const result = await session.onModelEffortSelect('deepseek-v4-pro', 'off', '', 'ou_user', 'dsh')
+
+      expect(result.ok).toBe(true)
+      expect(session.selectedProvider).toBe('dsh')
+      expect(session.selectedModel).toBe('deepseek-v4-pro')
+      expect(session.selectedEffort).toBe('off')
+      expect(session.currentEffortLabel()).toBe('off')
+      expect(JSON.stringify(result.card)).toContain('DeepSeek Harness')
+    } finally { restore() }
+  })
+
+  test('未配置 DSH 时档位仍可见,选择被拦截且提示指向 [deepseek-harness]', async () => {
+    const restore = withDshSection(undefined)
+    try {
+      const session = new Session('dsh-panel-unconfigured', 'chat_id') as any
+      const dsh = fixedModelChoices(session).find(choice => choice.provider === 'dsh')
+
+      expect(dsh).toBeDefined()
+      expect(dsh!.model).toBe('deepseek-v4-pro')
+      expect(String(dsh!.description)).toContain('[deepseek-harness]')
+
+      const result = await session.onModelEffortSelect(
+        'deepseek-v4-pro', dsh!.efforts[0]!.effort, '', 'ou_user', 'dsh',
+      )
+
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('[deepseek-harness]')
+      expect(session.selectedProvider).not.toBe('dsh')
+    } finally { restore() }
+  })
+
+  test('currentEffortLabel 对 DSH 会话取 DSH 语义值,而不是 Codex 回落常量', () => {
+    const restore = withDshSection({ api_key: 'dsh-key', model: 'deepseek-v4-pro', effort: 'low' })
+    try {
+      const session = new Session('dsh-effort-label', 'chat_id') as any
+      session.selectedProvider = 'dsh'
+      session.selectedModel = 'deepseek-v4-pro'
+      session.selectedEffort = null
+
+      expect(session.currentEffortLabel()).toBe('low')
+
+      session.selectedEffort = 'off'
+      expect(session.currentEffortLabel()).toBe('off')
+    } finally { restore() }
+  })
+
+  test('控制台:DSH 余额占位、DeepSeek Harness 分组与 provider 标签', async () => {
+    const cards = await import('./cards')
+
+    const placeholder = cards.consoleUsageElement({ provider: 'dsh', usageSource: 'provider' }) as any
+    expect(placeholder.content).toContain('📊 余额')
+    expect(placeholder.content).toContain('加载中')
+
+    const panel = JSON.stringify(cards.modelSelectionPanelElement({
+      sessionName: 'dsh-console',
+      panelId: 'panel-dsh-console',
+      currentModel: 'deepseek-v4-pro',
+      currentEffort: 'off',
+      models: [
+        {
+          provider: 'codex',
+          model: 'gpt-5.6-sol',
+          displayName: 'Codex · GPT-5.6 Sol',
+          efforts: [{ effort: 'max', isDefault: true }],
+        },
+        {
+          provider: 'dsh',
+          model: 'deepseek-v4-pro',
+          displayName: 'DeepSeek Harness · deepseek-v4-pro',
+          efforts: [{ effort: 'off', isDefault: true }],
+          isDefault: true,
+        },
+      ],
+    }))
+    expect(panel).toContain('DeepSeek Harness')
+    expect(panel).toContain('DeepSeek Harness 默认')
+
+    const result = JSON.stringify(cards.modelResultPanelElement({
+      sessionName: 'dsh-console',
+      provider: 'dsh',
+      model: 'deepseek-v4-pro',
+      effort: 'off',
+      scope: '下一轮开始使用。',
+    }))
+    expect(result).toContain('DeepSeek Harness · deepseek-v4-pro/off')
+
+    // 既有分组语义不变:两组仍按 provider 过滤渲染
+    const claudeOnly = JSON.stringify(cards.modelSelectionPanelElement({
+      sessionName: 'claude-console',
+      panelId: 'panel-claude-console',
+      currentModel: 'claude:fable',
+      currentEffort: 'max',
+      models: [{
+        provider: 'claude',
+        model: 'claude:fable',
+        displayName: 'Claude · Fable 5',
+        efforts: [{ effort: 'max', isDefault: true }],
+      }],
+    }))
+    expect(claudeOnly).not.toContain('DeepSeek Harness')
+  })
+})
+
