@@ -20,6 +20,16 @@ mock.module('node:child_process', () => {
   }
 })
 
+// DSH 后端在构造期就拉起子进程(dsh-runtime 的构造函数即 spawn node):用例只验
+// 接线面,故像 dsh-process.test.ts 的假 runtime 一样用替身顶掉 DshProcess。
+mock.module('./dsh-process', () => ({
+  DshProcess: class FakeDshProcess {
+    readonly provider = 'dsh'
+    readonly opts: any
+    constructor(opts: any) { this.opts = opts }
+  },
+}))
+
 const { createAgentProcess } = await import('./agent-launch')
 const { ClaudeAgentProcess } = await import('./claude-agent-process')
 const {
@@ -107,6 +117,119 @@ describe('createAgentProcess slim factory', () => {
     expect(Array.isArray(opts.configArgs)).toBe(true)
     expect(opts.providerEnv).toBeDefined()
     expect(opts.model).not.toBe('claude:glm')
+  })
+})
+
+describe('createAgentProcess dsh 分支(D-08 双轨:与 claude:deepseek 互不相读)', () => {
+  function withDshConfig(section: { api_key?: string; model?: string; base_url?: string } | undefined): () => void {
+    const prev = (config as any).deepseek_harness
+    ;(config as any).deepseek_harness = section
+    return () => { (config as any).deepseek_harness = prev }
+  }
+
+  test('凭据齐备时构造 dsh 进程,tokenSourceId 与 env 清洗都来自 DSH 源', () => {
+    const restore = withDshConfig({ api_key: 'dsh-key', model: 'deepseek-v4-pro' })
+    try {
+      const { process: proc } = createAgentProcess({
+        provider: 'dsh',
+        workDir: '/tmp/dsh-work',
+        tokenSourceId: 'deepseek-harness',
+        model: 'deepseek-v4-pro',
+        effort: 'high',
+        hostEnv: { LODESTAR_AGENT_CAPABILITY: 'cap-dsh' },
+      })
+      expect(proc.provider).toBe('dsh')
+      const opts = (proc as any).opts
+      expect(opts.tokenSourceId).toBe('deepseek-harness')
+      expect(opts.model).toBe('deepseek-v4-pro')
+      expect(opts.effort).toBe('high')
+      expect(opts.workDir).toBe('/tmp/dsh-work')
+      expect(typeof opts.transformEnv).toBe('function')
+
+      const env = opts.transformEnv({
+        ANTHROPIC_API_KEY: 'stray-key',
+        ANTHROPIC_BASE_URL: 'https://stray.example',
+        LODESTAR_AGENT_CAPABILITY: 'cap-dsh',
+      })
+      expect(Object.keys(env).filter((key: string) => key.startsWith('ANTHROPIC_'))).toEqual([])
+      expect(env.DEEPSEEK_API_KEY).toBe('dsh-key')
+      expect(env.DEEPSEEK_BASE_URL).toBe('https://api.deepseek.com')
+      expect(env.LODESTAR_AGENT_CAPABILITY).toBe('cap-dsh')
+    } finally {
+      restore()
+    }
+  })
+
+  test('effort 非法(medium)或缺省时抛错,不静默回落', () => {
+    const restore = withDshConfig({ api_key: 'dsh-key', model: 'deepseek-v4-pro' })
+    try {
+      const base = {
+        provider: 'dsh' as const,
+        workDir: '/tmp/dsh-work',
+        tokenSourceId: 'deepseek-harness',
+        model: 'deepseek-v4-pro',
+      }
+      expect(() => createAgentProcess({ ...base, effort: 'medium' }))
+        .toThrow('DSH requires a configured source, model and valid effort')
+      expect(() => createAgentProcess({ ...base }))
+        .toThrow('DSH requires a configured source, model and valid effort')
+    } finally {
+      restore()
+    }
+  })
+
+  test('源未启用或模型缺失时抛错', () => {
+    const unconfigured = withDshConfig(undefined)
+    try {
+      expect(() => createAgentProcess({
+        provider: 'dsh',
+        workDir: '/tmp/dsh-work',
+        tokenSourceId: 'deepseek-harness',
+        model: 'deepseek-v4-pro',
+        effort: 'high',
+      })).toThrow(/token source disabled: deepseek-harness/)
+    } finally {
+      unconfigured()
+    }
+    const configured = withDshConfig({ api_key: 'dsh-key' })
+    try {
+      expect(() => createAgentProcess({
+        provider: 'dsh',
+        workDir: '/tmp/dsh-work',
+        tokenSourceId: 'deepseek-harness',
+        model: '',
+        effort: 'high',
+      })).toThrow('DSH requires a configured source, model and valid effort')
+    } finally {
+      configured()
+    }
+  })
+
+  test('双轨不冲突:provider claude + claude:deepseek 仍走 ClaudeAgentProcess', () => {
+    const prevModels = config.claude.models
+    const restoreDsh = withDshConfig({ api_key: 'dsh-key', model: 'deepseek-v4-pro' })
+    ;(config.claude as any).models = {
+      deepseek: {
+        model: 'deepseek-v4-pro[1m]',
+        base_url: 'https://api.deepseek.com/anthropic',
+        auth_token: 'claude-compat-token',
+      },
+    }
+    try {
+      const { process: proc } = createAgentProcess({
+        provider: 'claude',
+        workDir: '/tmp/claude-work',
+        tokenSourceId: 'claude:deepseek',
+        model: 'claude:deepseek',
+        effort: 'max',
+      })
+      expect(proc).toBeInstanceOf(ClaudeAgentProcess)
+      expect(proc.provider).toBe('claude')
+      expect((proc as any).opts.model).toBe('claude:deepseek')
+    } finally {
+      ;(config.claude as any).models = prevModels
+      restoreDsh()
+    }
   })
 })
 
@@ -201,7 +324,10 @@ describe('agent-launch port discipline', () => {
       .join('\n')
     expect(code).toContain('resolveTokenSource')
     expect(code).not.toContain('getTokenSource')
-    expect(code).not.toContain('transformEnv')
+    // dsh 分支经 TokenSource.spawnEnv 注入凭据(本地 slim 形态);上游的
+    // sourceRevision 概念本地不存在,不得臆造。
+    expect(code).toContain('isDshReasoningEffort')
+    expect(code).not.toContain('sourceRevision')
     expect(code).not.toContain('settingSources')
     expect(code).not.toContain('managedSkillPluginPath')
   })
