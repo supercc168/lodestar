@@ -5398,7 +5398,12 @@ export class Session {
       log(`session "${this.sessionName}": ${message} thread=${sessionId} source=${source}`)
       if (firstReport) void feishu.sendTextRaw(this.chatId, `⚠️ ${message}`)
     })
-    p.on('turn_started', (identity: { turn_id?: string | null; thread_id?: string | null }) => {
+    p.on('turn_retry', () => {
+      // 模型满载退避(上游 2e6e1e0):同一逻辑任务保持未终结,footer 换成
+      // ⏳ 进度文案(actual 文案由 startFooterStatus 读 proc.turnRetry 覆盖)。
+      if (this.proc === p && this.currentTurn) this.startThinkingFooter(this.currentTurn)
+    })
+    p.on('turn_started', (identity: { turn_id?: string | null; thread_id?: string | null; retry?: boolean }) => {
       if (this.proc !== p) return
       // Codex app-server emits init only at process startup, not for every
       // turn — turn_started is its authoritative claim for an input that was
@@ -5410,6 +5415,12 @@ export class Session {
         this.pendingUserMessageCount = 0
       }
       this.persistResumableSessionId(p)
+      if (identity?.retry) {
+        // 满载重试轮属于同一可见任务:保留原 usage 基线(容量错误之前已完成的
+        // 工作仍计入),不重设 watchdog 身份/用量基准(上游 2e6e1e0)。
+        if (this.currentTurn) this.startThinkingFooter(this.currentTurn)
+        return
+      }
       const threadId = typeof identity?.thread_id === 'string' ? identity.thread_id : p.sessionId
       const turnId = typeof identity?.turn_id === 'string' ? identity.turn_id : null
       const context = this.watchdogContext
@@ -8205,6 +8216,13 @@ export class Session {
     // log-only 之后 phase 切换(Thinking/Writing/Working)不再启动档位 timer ——
     // 卡已标记拒写,继续调度只会空转。
     if (turn.rotateGivenUp) return
+    // 模型满载退避进度(上游 2e6e1e0):进程层持有唯一重试节奏,footer 如实反映。
+    const retry = turn.provider === 'codex' ? this.proc?.turnRetry : null
+    if (retry) {
+      status = retry.phase === 'waiting'
+        ? `⏳ 模型满载 · ${Math.round(retry.delayMs / 1000)}s 后重试 #${retry.attempt}`
+        : `⏳ 模型满载 · 正在重试 #${retry.attempt}`
+    }
     if (turn.footerStatusHandle && turn.footerStatusLabel === status) return
     this.stopFooterStatus(turn)
     turn.footerStatusLabel = status

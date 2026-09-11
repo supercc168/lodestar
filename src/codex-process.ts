@@ -28,6 +28,7 @@ import {
 import { diffUsageTotals, effectiveTurnTokens, usageFromTokenUsagePayload } from './codex-usage'
 import type {
   AgentReasoningEffort,
+  AgentTurnRetry,
   CodexUserTextSettlement,
   CollabAgentStates,
   UserTextDispatch,
@@ -140,6 +141,19 @@ const CODEX_GENERATED_IMAGES_DIR = join(homedir(), '.codex', 'generated_images')
 const CODEX_REQUEST_TIMEOUT_MS = 30_000
 // materialization 验证(4185808):thread/read 确认 rollout 落盘的专用短超时。
 const CODEX_MATERIALIZATION_VERIFY_TIMEOUT_MS = 10 * 60_000
+
+// ── 模型满载自动重试(上游 2e6e1e0,进程层主导)────────────────────────
+const CAPACITY_RETRY_BASE_MS = 5_000
+const CAPACITY_RETRY_MAX_MS = 60_000
+// 失败的那一轮已包含用户输入与已完成工作;续作沿用它,不重放原始任务与文件提示。
+const CAPACITY_CONTINUATION = '上一轮因模型暂时满载而中断。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。'
+
+/** 上游正则(严格窄口径):只认显式 "selected model is at capacity"。
+ *  与 session.ts 的 isCodexCapacityError(分类面,含 serverOverloaded)分层互补,
+ *  两者不合并、不互相替换。 */
+function isModelCapacityError(message: unknown): message is string {
+  return typeof message === 'string' && /\bselected\s+model\s+is\s+at\s+capacity\b/i.test(message)
+}
 
 export interface SpawnOpts {
   workDir: string
@@ -328,6 +342,10 @@ type PendingTurnStart = {
   turnId: string | null
   settled: boolean
   settle: (value: CodexUserTextSettlement) => void
+  /** 本轮实际投递文本(含文件提示)。满载拒绝时按上游语义复用原始 input 重试。 */
+  inputText?: string
+  /** 中断已抢先于本轮的 turn/start 确认:迟到响应不得再 ACK/开轮。 */
+  interrupted?: boolean
 }
 
 type ServerRequestState = {
@@ -370,6 +388,17 @@ export class CodexProcess extends EventEmitter {
   private currentTurnId: string | null = null
   private deliveryCounter = 0
   private pendingTurnStart: PendingTurnStart | null = null
+  /** 轮流投递代际:每次 beginTurnStart 自增。旧代际的退避计时器不得触发新轮。 */
+  private turnStartGeneration = 0
+  /** 已终结 turn 的有界记忆:迟到的重复 turn/completed 不得改写已定的终态
+   *  (上游 2e6e1e0;本地 Object.create 探针不跑字段初始化器,按上游取懒初始化)。 */
+  private finishedTurnIds = new Set<string>()
+  // ── 模型满载退避状态(上游 2e6e1e0)──────────────────────────────
+  private capacityRetryTimer: ReturnType<typeof setTimeout> | null = null
+  private capacityRetryCount = 0
+  private capacityRetryHasStarted = false
+  private capacityRetryEnabled = true
+  private turnError: { turnId: string; error: any } | null = null
   private rolloutFilePath: string | null = null
   private rolloutReadOffset = 0
   private rolloutLineRemainder = ''
@@ -402,6 +431,8 @@ export class CodexProcess extends EventEmitter {
   }
   lastContextWindow: number | null = null
   lastContextTokens: number | null = null
+  /** 模型满载退避快照(session/footer 拉取;无重试时为 null)。 */
+  turnRetry: AgentTurnRetry | null = null
 
   constructor(opts: SpawnOpts) {
     super()
@@ -445,6 +476,7 @@ export class CodexProcess extends EventEmitter {
       return
     }
     this.alive = false
+    this.cancelCapacityRetry()
     this.childExitCode = code
     this.childExitSignal = signal
     // Do not reject pending RPCs here: Node's `exit` precedes stdio `close`,
@@ -455,6 +487,7 @@ export class CodexProcess extends EventEmitter {
 
   private handleChildClose(code: number | null, signal: NodeJS.Signals | null): void {
     this.alive = false
+    this.cancelCapacityRetry()
     this.flushStdoutTail()
     this.flushStderrTail()
     const finalCode = code ?? this.childExitCode
@@ -499,6 +532,7 @@ export class CodexProcess extends EventEmitter {
     let terminalized = false
     if (spawnFailed && this.alive) {
       this.alive = false
+      this.cancelCapacityRetry()
       this.serverRequests.clear()
       terminalized = true
     }
@@ -709,18 +743,36 @@ export class CodexProcess extends EventEmitter {
           log(`codex-process: ignore conflicting turn/started thread=${threadId ?? '-'} turn=${turnId} current=${this.currentTurnId}`)
           return
         }
+        // 中断抢在确认之前:本轮不得开轮/结算,只把迟到 turn 就地掐断
+        //(上游 recordTurnStarted 的 owner.interrupted 分支)。delivery 留在
+        // pendingTurnStart 上,由随后的 turn/completed 吞掉,避免重试被重启。
+        if (delivery?.interrupted) {
+          this.interruptTurn(turnId)
+          return
+        }
         if (delivery && threadId === delivery.threadId) {
           if (!this.ackTurnStart(delivery, turnId)) return
         }
         this.currentTurnId = turnId
         // 清空点(ff44afb):新 turn 开始,上一轮 checkpoint 不得跨入进行中的新轮。
         this.lastCompletedTurnId = null
+        // 满载重试轮:本轮是同一逻辑任务的续作(上游 2e6e1e0 的 retry 标志);
+        // 计时器若还在(native continuation 抢先)就地转为 retrying 并收口。
+        const retrying = this.capacityRetryHasStarted && this.capacityRetryCount > 0
+        this.capacityRetryHasStarted = true
+        if (this.capacityRetryTimer && this.turnRetry) {
+          const retry = { ...this.turnRetry, phase: 'retrying' as const, delayMs: 0 }
+          this.cancelCapacityRetry()
+          this.emit('turn_retry', retry)
+        }
+        this.turnRetry = null
         // fresh 线程只有内存 id:persisted turn/started 是 rollout 可能已
         // 落盘的首个信号,触发权威验证(4185808 主题 D)。
         this.markConversationMaterialized('turn/started notification')
         this.emit('turn_started', {
           turn_id: turnId,
           thread_id: params.threadId ?? this.sessionId,
+          ...(retrying ? { retry: true } : {}),
         })
         return
       }
@@ -731,6 +783,11 @@ export class CodexProcess extends EventEmitter {
         const delivery = this.pendingTurnStart && this.pendingTurnStart.threadId === threadId
           ? this.pendingTurnStart
           : null
+        if (turnId && this.finishedTurnIds?.has(turnId)) {
+          // 重复终止通知:不得再走一遍结算/退避(上游 2e6e1e0)。
+          log(`codex-process: duplicate turn/completed ignored turn=${turnId}`)
+          return
+        }
         if (
           turnId &&
           (
@@ -739,19 +796,40 @@ export class CodexProcess extends EventEmitter {
           )
         ) {
           log(`codex-process: ignore conflicting turn/completed thread=${threadId ?? '-'} turn=${turnId} current=${this.currentTurnId ?? '-'} deliveryTurn=${delivery?.turnId ?? '-'}`)
+          this.rememberFinishedTurn(turnId)
           return
         }
-        if (delivery) this.ackTurnStart(delivery, turnId)
+        // 中断抢先的轮:迟到终止不得结算交付(等价上游 finishedTurnIds 的单轮口径)。
+        if (delivery && !delivery.interrupted) this.ackTurnStart(delivery, turnId)
+        if (turnId) this.rememberFinishedTurn(turnId)
         this.flushRolloutImageGenerations()
         this.markConversationMaterialized('turn/completed notification')
         const status = turn.status
-        const isError = status === 'failed' || !!turn.error
         const completedTurnId = turnId
+        const error = turn.error ?? (status === 'failed' && this.turnError && this.turnError.turnId === completedTurnId
+          ? this.turnError.error : null)
+        this.turnError = null
+        const isError = status === 'failed' || !!error
         const isCheckpointable = status === 'completed' && !isError && !!completedTurnId
         // Never leave a previous turn's checkpoint visible on a failed,
         // interrupted, or malformed terminal notification.
         this.lastCompletedTurnId = isCheckpointable ? completedTurnId : null
-        const subtype = isError ? (turn.error?.type ?? turn.error?.message ?? 'failed') : 'success'
+        this.currentTurnId = null
+        if (delivery?.interrupted) {
+          if (this.pendingTurnStart === delivery) this.pendingTurnStart = null
+          return
+        }
+        // 模型满载:本轮保持未终结 —— 不写 lastResult、不发 result,转入进程层退避。
+        // delivery 已在上面按 ack 结算(交付契约不悬挂);重试轮自带新 delivery。
+        if (status === 'failed' && completedTurnId && isModelCapacityError(error?.message)
+          && this.scheduleCapacityRetry(error.message, CAPACITY_CONTINUATION)) {
+          if (delivery && this.pendingTurnStart === delivery) this.pendingTurnStart = null
+          return
+        }
+        this.cancelCapacityRetry()
+        this.capacityRetryCount = 0
+        this.capacityRetryHasStarted = false
+        const subtype = isError ? (error?.type ?? error?.message ?? 'failed') : 'success'
         this.lastResult = {
           cost_usd: null,
           cost_delta_usd: null,
@@ -761,7 +839,6 @@ export class CodexProcess extends EventEmitter {
           subtype,
           is_error: isError,
         }
-        this.currentTurnId = null
         this.emit('result', {
           subtype,
           is_error: isError,
@@ -846,6 +923,15 @@ export class CodexProcess extends EventEmitter {
         const nestedMessage = nested && typeof nested === 'object' && typeof nested.message === 'string'
           ? nested.message
           : null
+        // 记下本轮的原始 error:turn/completed 可能只带 status=failed 而不重复
+        // error 文本(上游 2e6e1e0)。仅认本进程主线程、当前或待确认的 turn。
+        const errorOwner = typeof params?.turnId === 'string'
+          && params.threadId === this.sessionId
+          && (!this.pendingTurnStart?.turnId || this.pendingTurnStart.turnId === params.turnId)
+          && (!this.currentTurnId || this.currentTurnId === params.turnId)
+        if (errorOwner) this.turnError = { turnId: params.turnId, error: nested ?? params }
+        // Even willRetry=false precedes turn/completed. Never start a competing
+        // turn here, particularly while app-server is doing its own retries.
         const message = nestedMessage
           ?? (typeof params?.message === 'string' ? params.message : null)
           ?? (typeof params?.summary === 'string' ? params.summary : null)
@@ -1785,8 +1871,33 @@ export class CodexProcess extends EventEmitter {
         error: new Error(`codex turn delivery ${this.pendingTurnStart.deliveryId} is still active`),
       }
     }
+    // 真人输入接管:撤销退避与计数,满载重试序列从头开始(上游 2e6e1e0)。
+    this.cancelCapacityRetry()
+    this.capacityRetryCount = 0
+    this.capacityRetryHasStarted = false
+    this.capacityRetryEnabled = true
+    this.turnError = null
     const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
+    const { delivery, settlement } = this.beginTurnStart(fileHints + text)
+    void this.launchTurnStart(delivery, fileHints + text)
+    return {
+      kind: 'turn_start_pending',
+      provider: 'codex',
+      deliveryId: delivery.deliveryId,
+      get threadId() {
+        return delivery.threadId
+      },
+      settlement,
+    }
+  }
+
+  /** 建立本轮交付并推进投递代际。inputText 供满载拒绝路径原样重试使用。 */
+  private beginTurnStart(inputText?: string): {
+    delivery: PendingTurnStart
+    settlement: Promise<CodexUserTextSettlement>
+  } {
     const deliveryId = String(++this.deliveryCounter)
+    this.turnStartGeneration = (this.turnStartGeneration ?? 0) + 1
     let settle!: (value: CodexUserTextSettlement) => void
     const settlement = new Promise<CodexUserTextSettlement>(resolve => {
       settle = resolve
@@ -1799,25 +1910,23 @@ export class CodexProcess extends EventEmitter {
       turnId: null,
       settled: false,
       settle,
+      ...(inputText !== undefined ? { inputText } : {}),
     }
     this.pendingTurnStart = delivery
     // 清空点(ff44afb):turn/start 传输失败也会 emit result;建 delivery 即清
     // (任何 await 之前),失败不得复用上一轮 checkpoint 作锚。
     this.lastCompletedTurnId = null
-    void this.launchTurnStart(delivery, fileHints + text)
-    return {
-      kind: 'turn_start_pending',
-      provider: 'codex',
-      deliveryId,
-      get threadId() {
-        return delivery.threadId
-      },
-      settlement,
-    }
+    return { delivery, settlement }
   }
 
   private async launchTurnStart(delivery: PendingTurnStart, text: string): Promise<void> {
     try {
+      // 中断已抢先:不再发出 turn/start(上游 2e6e1e0 的 attempt.interrupted 早退),
+      // 交付已在 sendInterrupt 就地结算,这里不再重复。
+      if (delivery.interrupted) return
+      if (!this.alive || this.expectedExit) {
+        throw new Error(`codex app-server is not alive before turn/start (alive=${this.alive})`)
+      }
       // 只有 pre-init 投递需要先等线程建立;已绑定线程的投递直接走
       // startTurn(其内部本就会等待 readyPromise)。
       if (delivery.threadId === null) {
@@ -1838,7 +1947,14 @@ export class CodexProcess extends EventEmitter {
         ))
         return
       }
-      this.ackTurnStart(delivery, this.stringId(result?.turn?.id ?? result?.turnId))
+      const turnId = this.stringId(result?.turn?.id ?? result?.turnId)
+      // 等待响应期间被中断:本轮不得开轮,迟到 turn 就地掐断;delivery 留在
+      // pendingTurnStart 上,由随后的 turn/completed 吞掉。
+      if (delivery.interrupted) {
+        if (turnId) this.interruptTurn(turnId)
+        return
+      }
+      this.ackTurnStart(delivery, turnId)
     } catch (error) {
       this.rejectTurnStart(delivery, error)
     }
@@ -2015,6 +2131,21 @@ export class CodexProcess extends EventEmitter {
       return false
     }
     const error = cause instanceof Error ? cause : new Error(String(cause))
+    // 模型满载拒绝:本轮不终结 —— 先按 ack(turnId=null)结算交付,再排进程层
+    // 退避重试。严禁把 delivery 挂起到重试结果(session 的 await dispatch.settlement
+    // 会因此悬挂,T-02-13)。settle 必须先于 turn_retry 事件/计时器排定。
+    if (
+      this.isCapacityTurnStartRejection(cause) &&
+      delivery.inputText !== undefined &&
+      delivery.threadId !== null &&
+      this.canScheduleCapacityRetry()
+    ) {
+      const threadId = delivery.threadId
+      delivery.settled = true
+      delivery.settle({ kind: 'ack', deliveryId: delivery.deliveryId, threadId, turnId: null })
+      this.pendingTurnStart = null
+      if (this.scheduleCapacityRetry(error.serverMessage ?? error.message, delivery.inputText)) return true
+    }
     delivery.settled = true
     delivery.settle({
       kind: 'rejected',
@@ -2027,9 +2158,19 @@ export class CodexProcess extends EventEmitter {
     return true
   }
 
+  /** 上游 failTurnStart 的容量判定:仅认 turn/start 的显式响应式拒绝。 */
+  private isCapacityTurnStartRejection(cause: unknown): cause is CodexRpcResponseError {
+    return cause instanceof CodexRpcResponseError
+      && cause.method === 'turn/start'
+      && isModelCapacityError(cause.serverMessage)
+  }
+
   private failTurnStart(e: unknown, delivery: PendingTurnStart): void {
     const message = e instanceof Error ? e.message : String(e)
     log(`codex-process: turn/start failed: ${message}`)
+    this.cancelCapacityRetry()
+    this.capacityRetryCount = 0
+    this.capacityRetryHasStarted = false
     this.lastResult = {
       cost_usd: null,
       cost_delta_usd: null,
@@ -2072,9 +2213,97 @@ export class CodexProcess extends EventEmitter {
   }
 
   sendInterrupt(): void {
-    if (!this.sessionId || !this.currentTurnId) return
-    void this.request('turn/interrupt', { threadId: this.sessionId, turnId: this.currentTurnId })
+    // 用户中断即放弃自动重试(上游 2e6e1e0)。
+    this.capacityRetryEnabled = false
+    const wasWaiting = !!this.turnRetry && !this.currentTurnId
+    this.cancelCapacityRetry()
+    const pendingStart = this.pendingTurnStart
+    const interruptPendingStart = !!pendingStart && !pendingStart.settled
+    if (interruptPendingStart) {
+      pendingStart.interrupted = true
+      // 交付模型适配:中断抢在 ACK 之前时,Session 的 await dispatch.settlement
+      // 不得悬挂 —— 就地按 rejected 结算(不再 emit result,避免与下面的
+      // interrupted result 重复)。delivery 留在 pendingTurnStart 上,由迟到
+      // 的 turn/completed 吞掉(等价上游 finishedTurnIds 的单轮口径)。
+      pendingStart.settled = true
+      pendingStart.settle({
+        kind: 'rejected',
+        deliveryId: pendingStart.deliveryId,
+        threadId: pendingStart.threadId,
+        error: new Error('codex turn start interrupted'),
+      })
+    }
+    if (this.currentTurnId) this.interruptTurn(this.currentTurnId)
+    else if (wasWaiting || interruptPendingStart) {
+      this.lastCompletedTurnId = null
+      this.lastResult = {
+        cost_usd: null,
+        cost_delta_usd: null,
+        duration_ms: null,
+        num_turns: null,
+        usage: this.lastUsage,
+        subtype: 'interrupted',
+        is_error: false,
+      }
+      this.emit('result', { ...this.lastResult, checkpoint: null })
+    }
+  }
+
+  private interruptTurn(turnId: string): void {
+    if (!this.sessionId) return
+    void this.request('turn/interrupt', { threadId: this.sessionId, turnId })
       .catch(e => log(`codex-process: interrupt failed: ${e}`))
+  }
+
+  private canScheduleCapacityRetry(): boolean {
+    return this.alive && !this.expectedExit && this.capacityRetryEnabled
+  }
+
+  /** 记住已终结 turn(有界,防止长会话无限增长)。 */
+  private rememberFinishedTurn(turnId: string): void {
+    if (!this.finishedTurnIds) this.finishedTurnIds = new Set<string>()
+    if (this.finishedTurnIds.size > 64) {
+      const oldest = this.finishedTurnIds.values().next().value
+      if (oldest !== undefined) this.finishedTurnIds.delete(oldest)
+    }
+    this.finishedTurnIds.add(turnId)
+  }
+
+  private cancelCapacityRetry(): void {
+    if (this.capacityRetryTimer) clearTimeout(this.capacityRetryTimer)
+    this.capacityRetryTimer = null
+    this.turnRetry = null
+  }
+
+  /** 指数退避(5s 起、60s 封顶)排一次续作。返回 true = 本轮已被退避接管,
+   *  调用方不得写出 result/终结本轮。 */
+  private scheduleCapacityRetry(message: string, inputText: string): boolean {
+    if (!this.canScheduleCapacityRetry()) return false
+    if (this.capacityRetryTimer) return true
+    const attempt = this.capacityRetryCount + 1
+    this.capacityRetryCount = attempt
+    const delayMs = Math.min(CAPACITY_RETRY_BASE_MS * 2 ** Math.min(attempt - 1, 4), CAPACITY_RETRY_MAX_MS)
+    const generation = this.turnStartGeneration ?? 0
+    const notice: AgentTurnRetry = { phase: 'waiting', attempt, delayMs, message }
+    this.turnRetry = notice
+    log(`codex-process: model capacity retry #${attempt} in ${delayMs}ms: ${message}`)
+    // Deliberately keep retrying this specific capacity error until cancelled;
+    // delays are capped, and every failure stays visible in the log and UI.
+    const timer = setTimeout(() => {
+      if (this.capacityRetryTimer !== timer) return
+      this.capacityRetryTimer = null
+      if (!this.canScheduleCapacityRetry() || this.currentTurnId
+        || generation !== (this.turnStartGeneration ?? 0)) return
+      this.turnRetry = { ...notice, phase: 'retrying', delayMs: 0 }
+      this.emit('turn_retry', this.turnRetry)
+      // 事件消费方可能同步停机或改写状态;重启前再校验一次代际。
+      if (!this.canScheduleCapacityRetry() || generation !== (this.turnStartGeneration ?? 0)) return
+      const { delivery } = this.beginTurnStart(inputText)
+      void this.launchTurnStart(delivery, inputText)
+    }, delayMs)
+    this.capacityRetryTimer = timer
+    this.emit('turn_retry', notice)
+    return true
   }
 
   sendPermissionResponse(
@@ -2144,6 +2373,8 @@ export class CodexProcess extends EventEmitter {
   isAlive(): boolean { return !this.exitEventEmitted }
 
   async kill(timeoutMs = 5000): Promise<void> {
+    this.capacityRetryEnabled = false
+    this.cancelCapacityRetry()
     if (!this.alive) {
       // OS exit 已见但公开 exit(stdio close)未发:等 drain 完成,超时如实抛。
       if (await this.waitForExit(timeoutMs)) return

@@ -26,6 +26,15 @@ import type { ConversationCheckpoint } from './conversation'
 export type AgentProvider = 'codex' | 'claude'
 export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort
+
+/** A Codex capacity failure keeps the logical task open while retrying. */
+export interface AgentTurnRetry {
+  phase: 'waiting' | 'retrying'
+  attempt: number
+  delayMs: number
+  message: string
+}
+
 /** 控制台额度数据源。
  * - codex: ChatGPT 登录窗口或 Codex 第三方 /v1/usage
  * - glm: GLM Coding Plan quota/limit
@@ -130,6 +139,8 @@ export interface AgentProcess extends EventEmitter {
    * cache_creation,不含 output),直接取自 SDK modelUsage。Codex 路径不用,
    * 恒 null(继续走 lastUsage.total_tokens)。 */
   lastContextTokens: number | null
+  /** Codex-only transient status; absent for other backends. */
+  turnRetry?: AgentTurnRetry | null
 
   /** Start backend initialization. */
   sendInitialize(): void
@@ -173,7 +184,8 @@ export type AgentProcessEventMap = {
     source: string
     error: Error
   }
-  turn_started: { turn_id?: string | null; thread_id?: string | null }
+  turn_started: { turn_id?: string | null; thread_id?: string | null; retry?: boolean }
+  turn_retry: AgentTurnRetry
   token_usage: TokenUsageUpdated
   turn_plan_updated: TurnPlanUpdated
   plan_delta: PlanDelta
