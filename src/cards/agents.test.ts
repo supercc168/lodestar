@@ -132,7 +132,7 @@ describe('delegated Agent cards', () => {
     const card = JSON.stringify(agentIdentityListCard({
       panelId: 'p', page: 0, totalPages: 1, catalog: [noEffort], failures: [],
     }))
-    expect(card).toContain('默认 MISS')
+    expect(card).toContain('默认 `MISS`')
   })
 })
 

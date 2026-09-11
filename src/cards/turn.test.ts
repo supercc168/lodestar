@@ -1217,12 +1217,12 @@ describe('file-tool batch rendering', () => {
     expect(footerModelLabel('codex', undefined, 'ultra')).toBe('codex · MISS/ultra')
     expect(footerModelLabel('codex', 'gpt-5.6-sol', undefined)).toBe('codex · gpt-5.6-sol/MISS')
     expect(footerModelLabel('codex')).toBe('codex · MISS/MISS')
-    expect(footerModelLabel('glm', null, null)).toBe('glm · MISS/MISS')
+    expect(footerModelLabel('claude', null, null)).toBe('claude · MISS/MISS')
   })
 
   test('footerModelLabel 剥离 claude: 前缀与 [1m] 后缀', () => {
     expect(footerModelLabel('claude', 'claude:glm-5.3', 'max')).toBe('claude · glm-5.3/max')
-    expect(footerModelLabel('claude', 'claude:opus[1m]', 'high')).toBe('claude · claude:opus/high')
+    expect(footerModelLabel('claude', 'claude:opus[1m]', 'high')).toBe('claude · opus/high')
     expect(footerModelLabel('claude', 'sonnet[1m]', undefined)).toBe('claude · sonnet/MISS')
   })
 })

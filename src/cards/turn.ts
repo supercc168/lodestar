@@ -11,6 +11,13 @@ import type { AgentProvider } from '../agent-process'
 import { contextPercentSummary, contextTokenRatioLabel } from '../context-window'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 
+/** 模型标签口径(上游 9020e11)。D-05 修正:只摘函数不接线,无生产调用者;
+ * 若将来接到 footer,[1m] 剥离与本地 [1m] 记账展示的关系需另议(挂账)。 */
+export function footerModelLabel(provider: AgentProvider, model?: string | null, effort?: string | null): string {
+  const label = model?.replace(/^claude:/i, '').replace(/\[1m\]$/i, '')
+  return `${provider} · ${label || 'MISS'}/${effort || 'MISS'}`
+}
+
 export interface TurnPlanStep {
   step: string
   status: 'pending' | 'inProgress' | 'completed' | string
