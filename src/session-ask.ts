@@ -95,6 +95,30 @@ export function refreshPendingAsks(s: Session): void {
  * input always answers whatever question is on screen right now
  * (`pending.currentIdx`), and a new question slides in after. */
 export async function onAskMessageAnswer(s: Session, text: string, user: string, msgId: string): Promise<void> {
+  // 新阻塞流(D-01):文本只作用于 currentAsk 判定的当前题。
+  const active = currentAsk(s)
+  if (active) {
+    const [toolUseId, pending] = active
+    const blocked = askBlockReason(s, toolUseId)
+    if (blocked) {
+      // 文本路径 toolUseId 恒为队首,排队分支在文本路径结构上不可达,
+      // 唯一可达的阻塞是通知回复分支(排队阻断由 advanceAsk 点击门控覆盖)。
+      const notice = `${blocked}。这条文字未提交，请稍后重新发送。`
+      if (!await feishu.sendText(s.chatId, notice)) throw new Error(`提问等待提示发送失败: ${notice}`)
+      return
+    }
+    // 这条文本确实落在一个 live 问题上 —— 当 ask 答案消费。只有真记账成功
+    // (非空、非 stale)才回 ✅;否则这条消息没被收下,不该留"答案已收到"
+    // 标记。✅ 原先在 daemon 路由层 hasPendingAsk() 为真就无条件抢打,僵尸
+    // 自愈 / 兜底分支会残留一个语义错误的 ✅(消息其实被当普通新轮处理)——
+    // 下沉到这里按真实消费结果打。
+    const consumed = await onAskCustomAnswer(s, toolUseId, pending.currentIdx!, text, user)
+    if (consumed && msgId) void feishu.addReaction(msgId, 'CheckMark')
+    return
+  }
+  // 无可答提问 —— 本地僵尸自愈协议(D-02,不随上游删除):只可能是僵尸 ask
+  // (或瞬态)。注意必须等「没有任何可答提问」才判僵尸,否则队首已答完未
+  // finalize、后方还有活提问时会把队首误删并把文本重处理成新轮(WR-01)。
   const firstEntry = s.pendingAsks.entries().next()
   if (firstEntry.done) {
     log(`session "${s.sessionName}": onAskMessageAnswer with no pending — falling back to onUserMessage`)
@@ -102,50 +126,24 @@ export async function onAskMessageAnswer(s: Session, text: string, user: string,
     return
   }
   const [toolUseId, pending] = firstEntry.value
-  if (pending.currentIdx === undefined) {
-    // currentIdx undefined = 所有问题已答完。正常路径下 can_use_tool 一到,
-    // finalizeAsk 立刻把这条 ask 从 pendingAsks 删掉;还能在这里读到它只有
-    // 两种可能:
-    //   1. requestId 已 park,正等 finalize 落地(亚秒级窗口)—— 真·瞬态,
-    //      照旧忽略,别和 fast-clicker race 抢答。
-    //   2. requestId 始终没来 —— can_use_tool 永不会到(SDK 在 ask 握手中途
-    //      静默挂死,turn 既无 result 也不 exit)。这条 ask 是僵尸,会把整个
-    //      session 焊死:hasPendingAsk() 恒 true,后续每条消息都被吞,连
-    //      onUserMessage 都到不了,子进程也没机会重启。识破即逃生 —— 丢弃
-    //      僵尸,把这条消息当普通 user message 重新处理(interrupt + 开新
-    //      turn / 重启子进程),用户随手发一条就能自愈,不必去 stop+重启 daemon。
-    if (pending.requestId) {
-      log(`session "${s.sessionName}": pending ask ${toolUseId} awaiting finalize — ignoring message`)
-      return
-    }
-    log(`session "${s.sessionName}": pending ask ${toolUseId} orphaned (no can_use_tool) — dropping zombie, reprocessing as user message`)
-    s.pendingAsks.delete(toolUseId)
-    await s.onUserMessage(text, [], user, msgId)
+  // currentIdx undefined = 所有问题已答完。正常路径下 can_use_tool 一到,
+  // finalizeAsk 立刻把这条 ask 从 pendingAsks 删掉;还能在这里读到它只有
+  // 两种可能:
+  //   1. requestId 已 park,正等 finalize 落地(亚秒级窗口)—— 真·瞬态,
+  //      照旧忽略,别和 fast-clicker race 抢答。
+  //   2. requestId 始终没来 —— can_use_tool 永不会到(SDK 在 ask 握手中途
+  //      静默挂死,turn 既无 result 也不 exit)。这条 ask 是僵尸,会把整个
+  //      session 焊死:hasPendingAsk() 恒 true,后续每条消息都被吞,连
+  //      onUserMessage 都到不了,子进程也没机会重启。识破即逃生 —— 丢弃
+  //      僵尸,把这条消息当普通 user message 重新处理(interrupt + 开新
+  //      turn / 重启子进程),用户随手发一条就能自愈,不必去 stop+重启 daemon。
+  if (pending.requestId) {
+    log(`session "${s.sessionName}": pending ask ${toolUseId} awaiting finalize — ignoring message`)
     return
   }
-  // 僵尸段之后接新阻塞流(D-01):文本只作用于 currentAsk 判定的当前题。
-  const active = currentAsk(s)
-  if (!active) {
-    log(`session "${s.sessionName}": no unanswered question; routing text to Agent`)
-    await s.onUserMessage(text, [], user, msgId)
-    return
-  }
-  const [activeToolUseId, activePending] = active
-  const blocked = askBlockReason(s, activeToolUseId)
-  if (blocked) {
-    // 文本路径 toolUseId 恒为队首,排队分支在文本路径结构上不可达,
-    // 唯一可达的阻塞是通知回复分支(排队阻断由 advanceAsk 点击门控覆盖)。
-    const notice = `${blocked}。这条文字未提交，请稍后重新发送。`
-    if (!await feishu.sendText(s.chatId, notice)) throw new Error(`提问等待提示发送失败: ${notice}`)
-    return
-  }
-  // 这条文本确实落在一个 live 问题上 —— 当 ask 答案消费。只有真记账成功
-  // (非空、非 stale)才回 ✅;否则这条消息没被收下,不该留"答案已收到"
-  // 标记。✅ 原先在 daemon 路由层 hasPendingAsk() 为真就无条件抢打,僵尸
-  // 自愈 / 兜底分支会残留一个语义错误的 ✅(消息其实被当普通新轮处理)——
-  // 下沉到这里按真实消费结果打。
-  const consumed = await onAskCustomAnswer(s, activeToolUseId, activePending.currentIdx!, text, user)
-  if (consumed && msgId) void feishu.addReaction(msgId, 'CheckMark')
+  log(`session "${s.sessionName}": pending ask ${toolUseId} orphaned (no can_use_tool) — dropping zombie, reprocessing as user message`)
+  s.pendingAsks.delete(toolUseId)
+  await s.onUserMessage(text, [], user, msgId)
 }
 
 /** Click handler for an option button. The click must target the

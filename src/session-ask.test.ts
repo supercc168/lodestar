@@ -128,6 +128,25 @@ describe('AskUserQuestion 输入优先级(ae411a6 拆摘)', () => {
     expect(h.userMessages).toHaveLength(0)
   })
 
+  test('队首已答完未 finalize、后方有活提问时,文本落活提问而非误判僵尸(WR-01)', async () => {
+    const h = harness()
+    // 先加 first,不走 renderPermission —— 模拟快点击窗口:can_use_tool 还没来
+    const input1 = { questions: [{ question: '先选择区域', options: [{ label: 'A' }, { label: 'B' }] }] }
+    addTool(h.s, {} as any, 'first', 'AskUserQuestion', input1)
+    await flush()
+    expect(await onAskAnswer(h.s, 'first', 0, 0, 'ou_owner')).toBe(true)
+    // 后方再来一条活提问
+    const input2 = { questions: [{ question: '再选择环境', options: [{ label: 'A' }, { label: 'B' }] }] }
+    addTool(h.s, {} as any, 'second', 'AskUserQuestion', input2)
+    await flush()
+    // 文本应落到 second,而不是把队首当僵尸删掉重处理
+    await onAskMessageAnswer(h.s, 'hello', 'ou_owner', 'om_x')
+    expect(h.s.pendingAsks.has('first')).toBe(true)
+    expect(h.userMessages).toHaveLength(0)
+    const second = h.s.pendingAsks.get('second') as any
+    expect(second.answers['再选择环境']).toBe('hello')
+  })
+
   test('通知回复进行中提问整体等待且不推送(先置回复中、再加提问)', async () => {
     const h = harness()
     __setPendingReplyForTest('oc_ask', true)
