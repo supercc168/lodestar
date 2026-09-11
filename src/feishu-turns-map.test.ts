@@ -565,6 +565,64 @@ describe('session conversation state cleanup', () => {
     })
   })
 
+  test('round-trips a dsh resume ref and a numeric-event dsh checkpoint (上游 722e45a)', () => {
+    const result = runFreshState(`
+      const cwd = '/srv/dsh-project'
+      feishu.bindSessionResume('project', {
+        provider: 'dsh', sessionId: 'dsh-session-1', cwd,
+      })
+      feishu.replaceTurnAnchors('project', [{
+        checkpoint: {
+          provider: 'dsh', kind: 'event', id: '42',
+          source: { provider: 'dsh', sessionId: 'dsh-session-1', cwd },
+        },
+        preview: 'native turn', ts: 1, writes: [],
+      }], { kind: 'fresh' })
+      feishu.loadSessionResumeMap()
+      feishu.loadSessionTurnsMap()
+      __out({
+        dshId: feishu.getSessionResume('project', 'dsh'),
+        dshRef: feishu.getSessionResumeRef('project', 'dsh'),
+        anchors: feishu.getTurnAnchors('project'),
+        resumeMap: __read('session-resume-map.json'),
+        turnsMap: __read('session-turns-map.json'),
+      })
+    `)
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    const output = extract(result)
+    expect(output.dshId).toBe('dsh-session-1')
+    expect(output.dshRef).toEqual({
+      provider: 'dsh', sessionId: 'dsh-session-1', cwd: '/srv/dsh-project',
+    })
+    expect(output.anchors).toHaveLength(1)
+    expect(output.anchors[0].checkpoint).toEqual({
+      provider: 'dsh', kind: 'event', id: '42',
+      source: { provider: 'dsh', sessionId: 'dsh-session-1', cwd: '/srv/dsh-project' },
+    })
+    expect(output.resumeMap.project.dsh).toEqual({
+      provider: 'dsh', sessionId: 'dsh-session-1', cwd: '/srv/dsh-project',
+    })
+    expect(output.turnsMap.project.anchors).toHaveLength(1)
+  })
+
+  test('rejects dsh checkpoints with a non-numeric event id (T-03-14)', () => {
+    const result = runFreshState(`
+      feishu.replaceTurnAnchors('project', [{
+        checkpoint: {
+          provider: 'dsh', kind: 'event', id: 'evt-1',
+          source: { provider: 'dsh', sessionId: 'dsh-session-1', cwd: '/srv/dsh-project' },
+        },
+        preview: 'bad', ts: 1, writes: [],
+      }])
+      feishu.loadSessionTurnsMap()
+      __out({ anchors: feishu.getTurnAnchors('project') })
+    `)
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(extract(result).anchors).toEqual([])
+  })
+
   test('rejects new resume bindings without an absolute cwd', () => {
     const result = runFreshState(`
       const errors = []
@@ -773,6 +831,30 @@ describe('session conversation state cleanup', () => {
     expect(output.persisted.turns).toEqual({
       keep: { base: null, anchors: output.keep.turns },
     })
+  })
+
+  test('normalizes a dsh model-map entry with isDshReasoningEffort (上游 722e45a)', () => {
+    const result = runFreshState(`
+      feishu.loadSessionModelMap()
+      __out({
+        valid: feishu.getSessionModelSelection('valid-dsh'),
+        invalid: feishu.getSessionModelSelection('invalid-dsh'),
+        claudeRouted: feishu.getSessionModelSelection('claude-route'),
+      })
+    `, {
+      'session-model-map.json': {
+        'valid-dsh': { provider: 'dsh', model: 'deepseek-v4-pro', effort: 'off' },
+        'invalid-dsh': { provider: 'dsh', model: 'deepseek-v4-pro', effort: 'medium' },
+        'claude-route': { provider: 'claude', model: 'claude:glm-4.6', effort: 'max' },
+      },
+    })
+
+    expect(result.exitCode, result.stderr).toBe(0)
+    const output = extract(result)
+    expect(output.valid).toEqual({ provider: 'dsh', model: 'deepseek-v4-pro', effort: 'off' })
+    // dsh 非法档位落 null,不静默借用 Codex/Claude 的枚举
+    expect(output.invalid).toEqual({ provider: 'dsh', model: 'deepseek-v4-pro', effort: null })
+    expect(output.claudeRouted).toEqual({ provider: 'claude', model: 'claude:glm-4.6', effort: 'max' })
   })
 
   test('mid-transaction persistence failure restores every map and raises an AggregateError', () => {

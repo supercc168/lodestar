@@ -830,3 +830,42 @@ describe('已结算 agent 档案 — warm-resume 复活(SendMessage 续跑不重
     expect(panel.header.title.content).toContain('client-engineer(续跑)')
   })
 })
+
+describe('briefResult 内容块归一(上游 722e45a:后台工具返回内容块不再 .replace 崩)', () => {
+  test('字符串仍按空白归一(既有语义)', () => {
+    let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
+    s = applyBgToolUse(s, 'p', 'tu', 'Bash', { command: 'ls' })
+    s = applyBgToolResult(s, 'p', 'tu', '  命中\n\t3   处  ', false)
+    expect(s.active[0].steps[0].brief).toContain('→ 命中 3 处')
+  })
+
+  test('内容块数组:文本块拼接,非文本块退化为 JSON 摘要,不抛', () => {
+    let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
+    s = applyBgToolUse(s, 'p', 'tu', 'Read', { file_path: '/x' })
+    s = applyBgToolResult(s, 'p', 'tu', [
+      { type: 'text', text: 'DSH 内容块第一段' },
+      { type: 'text', text: '第二段' },
+    ], false)
+    expect(s.active[0].steps[0].brief).toContain('DSH 内容块第一段 第二段')
+  })
+
+  test('非法形状(undefined/null/数字/对象)不抛且摘要非空', () => {
+    const cases: unknown[] = [undefined, null, 42, { nested: { a: 1 } }, [{ type: 'image', source: { data: 'x' } }]]
+    for (const content of cases) {
+      let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
+      s = applyBgToolUse(s, 'p', 'tu', 'Bash', { command: 'ls' })
+      s = applyBgToolResult(s, 'p', 'tu', content as any, false)
+      const brief = s.active[0].steps[0].brief
+      expect(brief).toContain('→')
+      expect(brief.split('→')[1]!.trim().length).toBeGreaterThan(0)
+    }
+  })
+
+  test('错误态:内容块输入仍带 ❌ 前缀', () => {
+    let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
+    s = applyBgToolUse(s, 'p', 'tu', 'Bash', { command: 'ls' })
+    s = applyBgToolResult(s, 'p', 'tu', [{ type: 'text', text: 'blocked by sandbox' }], true)
+    expect(s.active[0].steps[0].brief).toContain('❌')
+    expect(s.active[0].steps[0].brief).toContain('blocked by sandbox')
+  })
+})

@@ -8213,6 +8213,15 @@ describe('Session provider switching', () => {
     const instructions = session.spawnDeveloperInstructions()
     expect(instructions).toContain('AskUserQuestion')
     expect(instructions).not.toContain('[[askusr:')
+
+    // DSH 原生后端走自带 ask_user_question 工具(上游 722e45a DSH_CHANNEL_INSTRUCTIONS),
+    // 不复用 Codex 的 request_user_input 文案。
+    session.selectedProvider = 'dsh'
+    const dshInstructions = session.spawnDeveloperInstructions()
+    expect(dshInstructions).toContain('ask_user_question')
+    expect(dshInstructions).not.toContain('request_user_input')
+    expect(dshInstructions).not.toContain('AskUserQuestion')
+    expect(dshInstructions).not.toContain('[[askusr:')
   })
 
   test('keeps selected provider resume id from being overwritten by stale backend events', () => {
@@ -11732,6 +11741,45 @@ describe('Session conversation launch 数据流(上游 ff44afb 簇 1)', () => {
     await expect(session.resolveLegacyResumeRef({ provider: 'codex', sessionId: 'x', cwd: null }))
       .rejects.toThrow('legacy resume provider mismatch')
     expect(boundResumes).toEqual([])
+  })
+
+  test('resolveLegacyResumeRef:dsh legacy ref(cwd:null)显式拒绝,不进 Codex catalog', async () => {
+    // DSH 无「pre-cwd 时代」记录,legacy 形态是坏数据:fail closed 拒绝,
+    // 不得把 DSH sessionId 拿去向 Codex catalog 查(上游 722e45a @@-686)。
+    const session = new Session('legacy-dsh-reject', 'chat_id') as any
+    session.selectedProvider = 'dsh'
+    let catalogSpawns = 0
+    session.spawnCodexCatalogProcess = () => {
+      catalogSpawns++
+      throw new Error('Codex catalog must not be consulted for dsh')
+    }
+
+    await expect(session.resolveLegacyResumeRef({ provider: 'dsh', sessionId: 'dsh-legacy-1', cwd: null }))
+      .rejects.toThrow('DSH resume reference requires its original cwd')
+    expect(catalogSpawns).toBe(0)
+    expect(boundResumes).toEqual([])
+  })
+
+  test('rs 历史列表:DSH 会话走 listDshConversations,不落 Claude 本地目录(上游 722e45a)', async () => {
+    const session = new Session('resume-dsh-history', 'chat_id') as any
+    session.selectedProvider = 'dsh'
+    let dshListCalls = 0
+    session.listDshConversations = async () => {
+      dshListCalls++
+      return [{
+        provider: 'dsh' as const,
+        sessionId: 'dsh-history-session',
+        cwd: session.workDir,
+        preview: '原生历史输入',
+        ts: 1,
+        status: 'idle',
+      }]
+    }
+
+    await session.showResumeList('ou_user')
+
+    expect(dshListCalls).toBe(1)
+    expect(JSON.stringify(sentCards.at(-1))).toContain('原生历史输入')
   })
 
   test('listCodexConversations:一次性 catalog 进程 spawn→list→kill,查询失败也不泄漏进程', async () => {
