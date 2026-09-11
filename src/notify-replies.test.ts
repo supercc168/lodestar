@@ -9,6 +9,7 @@ import {
   loadCallbacks,
   pendingRepliesForChat,
   register,
+  setReplyState,
   type DispatchResult,
   type NotifyRegistration,
   type NotifyTextResponse,
@@ -50,6 +51,7 @@ function harness() {
   const logs: string[] = []
   const controls = {
     send: async (): Promise<boolean> => true,
+    sendText: async (): Promise<boolean> => true,
     update: async (): Promise<void> => {},
     dispatch: async (): Promise<DispatchResult> => ({ ok: true, detail: '200', reply: '已安排部署' }),
   }
@@ -64,7 +66,10 @@ function harness() {
       updated.push({ messageId, card })
       await controls.update()
     },
-    sendText: async (_chatId: string, text: string): Promise<string | null> => { notices.push(text); return 'om_error' },
+    sendText: async (_chatId: string, text: string): Promise<string | null> => {
+      notices.push(text)
+      return await controls.sendText() ? 'om_error' : null
+    },
     dispatch: async (reg: NotifyRegistration, response: NotifyTextResponse, openId: string) => {
       delivered.push({ notifyId: reg.notifyId, response, openId })
       return controls.dispatch()
@@ -320,5 +325,60 @@ describe('notification text reply runtime (上游 ae411a6)', () => {
     expect(h.notices.some(text => text.includes('回复保存失败，尚未回传'))).toBe(true)
     expect(get('nf_reply')!.replyState!.status).toBe('waiting')
     expect(h.delivered).toHaveLength(0)
+  })
+
+  // ── 02-REVIEW WR-01:错误通道不得抛出,切换取消逐条 best-effort ──────────────
+  test('错误提示本身发送失败时不再抛出:失败仍被消费,只留日志(WR-01)', async () => {
+    register(registration())
+    const h = harness()
+    await h.open()
+    __setStoreFileForTest(join(file, 'bad.json'), false)
+    h.controls.sendText = async () => false
+    // 修复前 report() 抛错会穿出 consume(),daemon 侧后续处理(host_ask / 缓冲 /
+    // onUserMessage)整段被跳过 —— 这里锁定"提示发不出去"不等于"消费失败"。
+    expect(await h.runtime.consume(incoming())).toBe(true)
+    expect(h.logs.some(text => text.includes('错误提示发送失败'))).toBe(true)
+    expect(get('nf_reply')!.replyState!.status).toBe('waiting')
+    expect(h.delivered).toHaveLength(0)
+  })
+
+  test('切换时单条取消失败不中断循环:其余通知照常处理,新等待卡照发(WR-01)', async () => {
+    register(registration())
+    register(registration({ notifyId: 'nf_other' }))
+    register(registration({ notifyId: 'nf_second' }))
+    const h = harness()
+    await h.open()
+    // 同群两条等待态正是"半取消"缺陷留下的形态;落盘失败复刻单条取消失败。
+    setReplyState('nf_other', {
+      id: 'reply_other', openId: 'ou_owner', promptMessageId: 'om_other',
+      openedAt: Date.now(), status: 'waiting',
+    })
+    __setStoreFileForTest(join(file, 'bad.json'), false)
+    const result = await h.open('nf_second')
+    // 取消两条都失败(各自日志一次,证明循环没在第一条就中断),新等待卡仍然发出。
+    expect(h.logs.filter(text => text.includes('取消 nf_reply 失败'))).toHaveLength(1)
+    expect(h.logs.filter(text => text.includes('取消 nf_other 失败'))).toHaveLength(1)
+    expect(h.sent).toHaveLength(2)
+    // 取消失败的通知保留等待态(内存回滚),不会静默变成半取消。
+    expect(get('nf_reply')!.replyState!.status).toBe('waiting')
+    expect(get('nf_other')!.replyState!.status).toBe('waiting')
+    expect(result).toEqual({
+      ok: false, presented: true,
+      message: expect.stringContaining('等待输入状态保存失败，未开始接收回复'),
+    })
+  })
+
+  test('卡片更新失败且错误提示也发不出去时,open 仍完成切换(WR-01)', async () => {
+    register(registration())
+    register(registration({ notifyId: 'nf_other' }))
+    const h = harness()
+    await h.open()
+    h.controls.update = async () => { throw new Error('card update failed') }
+    h.controls.sendText = async () => false
+    expect(await h.open('nf_other')).toEqual({
+      ok: true, message: '等待输入卡片已发送，请在群里回复一条文字', presented: true,
+    })
+    expect(h.sent).toHaveLength(2)
+    expect(h.logs.some(text => text.includes('错误提示发送失败'))).toBe(true)
   })
 })

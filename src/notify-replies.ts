@@ -46,9 +46,16 @@ export function createNotifyReplyRuntime(deps: {
     if (isDispatching(reg.notifyId)) return '通知正在处理中'
     return null
   }
+  // 错误提示是尽力而为的旁路:飞书拒绝(非 0 code)或 SDK 重试耗尽时 sendText 返回
+  // null,这既不该变成新的异常,也不该让调用方把这条消息当成"消费失败"重走一遍
+  // (02-REVIEW WR-01)。
   const report = async (chatId: string, message: string) => {
     deps.log(`notify-reply: ${message}`)
-    if (!await deps.sendText(chatId, `❌ ${message}`)) throw new Error(`通知回复错误提示发送失败: ${message}`)
+    try {
+      if (!await deps.sendText(chatId, `❌ ${message}`)) deps.log(`notify-reply: 错误提示发送失败: ${message}`)
+    } catch (error) {
+      deps.log(`notify-reply: 错误提示发送异常: ${detailOf(error)}`)
+    }
   }
   const update = async (reg: NotifyRegistration, messageId: string, card: object, context: string) => {
     try { await deps.updateCard(messageId, card) }
@@ -85,8 +92,15 @@ export function createNotifyReplyRuntime(deps: {
         // opening the new prompt fails.
         for (const previous of previousReplies) {
           const cancelled: NotifyReplyState = { ...previous.replyState!, status: 'cancelled', cancelReason: 'switched' }
-          setReplyState(previous.notifyId, cancelled)
-          await update(previous, cancelled.promptMessageId, buildNotifyReplyCard(previous, cancelled), '已放弃上一条回复并切换通知')
+          // 逐条 best-effort:单条取消失败(落盘/更新异常)不得中断整轮切换,更不得
+          // 把 open() 掀翻 —— 否则会留下"部分 cancelled、部分 waiting"且无新提示卡
+          // 的半取消状态,用户只能看到一条错误回执(02-REVIEW WR-01)。
+          try {
+            setReplyState(previous.notifyId, cancelled)
+            await update(previous, cancelled.promptMessageId, buildNotifyReplyCard(previous, cancelled), '已放弃上一条回复并切换通知')
+          } catch (error) {
+            deps.log(`notify-reply: 取消 ${previous.notifyId} 失败，保留其等待态: ${detailOf(error)}`)
+          }
         }
         const state: NotifyReplyState = {
           id: randomUUID(), openId, promptMessageId: '', openedAt: Date.now(), status: 'waiting',
