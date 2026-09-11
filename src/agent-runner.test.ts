@@ -126,6 +126,17 @@ describe('full delegated Agent runner', () => {
     await expect(handle.done).rejects.toThrow(/without a native session id/)
   })
 
+  test('dsh 会话与 codex 同样用 lastCompletedTurnId 作 fork 锚点', async () => {
+    const proc = new FakeProcess() as any
+    proc.provider = 'dsh'
+    proc.sessionId = 'dsh-session-1'
+    proc.lastAssistantUuid = null
+    proc.lastCompletedTurnId = 'dsh-event-7'
+    const handle = collectAgentTurn(proc, 'do work', {}, () => {})
+    proc.emit('result', { is_error: false })
+    await expect(handle.done).resolves.toMatchObject({ checkpointId: 'dsh-event-7' })
+  })
+
   test('rejects unsupported effort before launch', () => {
     expect(() => startAgentWorker({
       identity: {
