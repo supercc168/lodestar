@@ -270,7 +270,9 @@ function turnState(
     rotating: null,
     rotateCount: 0,
     failureRotateCount: 0,
-    cardWriteFailureNotified: false,
+    cardCapacityFailures: new Map(),
+    cardWriteFailureNotices: new Set(),
+    cardRotationFailed: false,
     rotateGivenUp: false,
     outboundSeenPaths: new Set(),
     outboundSentPaths: new Set(),
@@ -9371,7 +9373,7 @@ describe('Session 轮转预算收紧与一次性诊断 (上游 4185808 主题 B)
     }
   })
 
-  test('repeated validation/content failures stay on the current card and warn once', async () => {
+  test('repeated validation/content failures stay on the current card, each distinct failure warns once', async () => {
     const session = new Session('validation-no-rotate', 'chat_id') as any
     session.proc = new FakeAgentProc('claude', 'claude-validation-no-rotate')
     const turn = turnState('card_validation')
@@ -9413,8 +9415,11 @@ describe('Session 轮转预算收紧与一次性诊断 (上游 4185808 主题 B)
       expect(turn.rotateGivenUp).toBe(false)
       expect(sentCards).toHaveLength(0)
       expect(calls.some(call => call.path === '/cards/id_convert')).toBe(false)
-      expect(sentRawTexts).toHaveLength(1)
+      // 按键去重(上游 378f4a4):两个不同的失败(元素/错误码各不同)各自通知一次;
+      // 旧的布尔模型只发第一条,会把后一条新故障吞掉。
+      expect(sentRawTexts).toHaveLength(2)
       expect(sentRawTexts[0]).toContain('不是卡片元素上限')
+      expect(sentRawTexts[1]).toContain('不是卡片元素上限')
     } finally {
       globalThis.fetch = healthyFetch
       await cardkit.dispose(turn.cardId)
@@ -9445,7 +9450,7 @@ describe('Session 轮转预算收紧与一次性诊断 (上游 4185808 主题 B)
           message: `cardkit POST /cards/${turn.cardId}/elements: HTTP 400 code=300315 msg=invalid payload; Authorization: Bearer ${SENTINEL}; raw=${rawApiBody}`,
         },
       })
-      // 第二次同 turn 非容量失败:不再重复通知
+      // 第二次同 turn 非容量失败:元素/错误码不同 → 是新故障,按新键再通知一次
       session.onCardWriteFailure(turn.cardId, 200570, {
         kind: 'api',
         failure: {
@@ -9453,18 +9458,29 @@ describe('Session 轮转预算收紧与一次性诊断 (上游 4185808 主题 B)
           code: 200570, message: `invalid image keys; secret=${SENTINEL}`,
         },
       })
+      // 第三次:与第一条完全同键 → 不再重复
+      session.onCardWriteFailure(turn.cardId, 300315, {
+        kind: 'api',
+        failure: {
+          cardId: turn.cardId, operation: 'addElement', elementId: 'seg_1',
+          code: 300315, httpStatus: 400, logId: 'log_redaction',
+          message: `cardkit POST /cards/${turn.cardId}/elements: HTTP 400 code=300315 msg=invalid payload; Authorization: Bearer ${SENTINEL}; raw=${rawApiBody}`,
+        },
+      })
 
       expect(turn.rotating).toBeNull()
       expect(turn.failureRotateCount).toBe(0)
-      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts).toHaveLength(2)
       const visible = sentRawTexts[0] ?? ''
       // 可观测:错误码 + 操作类别在列
       expect(visible).toContain('300315')
       expect(visible).toContain('addElement')
-      // 凭据/raw payload 脱敏:哨兵串与完整 API 响应体不得出现
-      expect(visible).not.toContain(SENTINEL)
-      expect(visible).not.toContain(rawApiBody)
-      expect(visible).not.toContain('Authorization')
+      // 凭据/raw payload 脱敏:哨兵串与完整 API 响应体不得出现(两条通知都不例外)
+      for (const text of sentRawTexts) {
+        expect(text).not.toContain(SENTINEL)
+        expect(text).not.toContain(rawApiBody)
+        expect(text).not.toContain('Authorization')
+      }
       const cardJson = JSON.stringify([...sentCards, ...updatedCards])
       expect(cardJson).not.toContain(SENTINEL)
     } finally {
@@ -13576,3 +13592,73 @@ describe('Session DSH model panel and console (upstream 722e45a)', () => {
   })
 })
 
+
+describe('Session 非容量失败通知按键去重 (上游 378f4a4)', () => {
+  const nonCapacityMeta = (
+    cardId: string,
+    elementId: string,
+    operation = 'addElement',
+    code = 300315,
+  ): any => ({
+    kind: 'api',
+    failure: {
+      cardId, operation, elementId, code,
+      message: 'elementID format error; code: 300301',
+    },
+  })
+
+  test('同一非容量失败重复到达只通知一次', async () => {
+    const session = new Session('notice-dedupe-same', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-notice-dedupe-same')
+    const turn = turnState('card_notice_same')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      const meta = nonCapacityMeta(turn.cardId, 'ctx_dup')
+      session.onCardWriteFailure(turn.cardId, 300315, meta)
+      session.onCardWriteFailure(turn.cardId, 300315, meta)
+      // 新对象、同四段键 —— 仍算同一个失败
+      session.onCardWriteFailure(turn.cardId, 300315, nonCapacityMeta(turn.cardId, 'ctx_dup'))
+
+      expect(sentRawTexts).toHaveLength(1)
+      expect(turn.cardWriteFailureNotices.size).toBe(1)
+      expect(turn.rotating).toBeNull()
+      expect(turn.failureRotateCount).toBe(0)
+      expect(turn.cardId).toBe('card_notice_same')
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('元素/操作/错误码任一不同即各自通知 —— 旧的布尔模型会吞掉后一个', async () => {
+    const session = new Session('notice-dedupe-distinct', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-notice-dedupe-distinct')
+    const turn = turnState('card_notice_distinct')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.onCardWriteFailure(turn.cardId, 300315, nonCapacityMeta(turn.cardId, 'seg_a'))
+      session.onCardWriteFailure(turn.cardId, 300315, nonCapacityMeta(turn.cardId, 'seg_b'))
+      session.onCardWriteFailure(turn.cardId, 300315, nonCapacityMeta(turn.cardId, 'seg_a', 'replaceElement'))
+      session.onCardWriteFailure(turn.cardId, 200570, nonCapacityMeta(turn.cardId, 'seg_a', 'addElement', 200570))
+
+      expect(sentRawTexts).toHaveLength(4)
+      expect(turn.cardWriteFailureNotices.size).toBe(4)
+      expect(turn.rotating).toBeNull()
+      expect(turn.failureRotateCount).toBe(0)
+      // 每次通知仍只用本地口径(错误码 + 操作类别),不内插 API 原文
+      for (const text of sentRawTexts) {
+        expect(text).toContain('不是卡片元素上限')
+        expect(text).not.toContain('elementID format error')
+      }
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+})
