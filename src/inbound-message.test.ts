@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import {
+  consumePendingTextInput,
   inboundMessageResource,
   inboundResourceDownloadFailureText,
   isStaleAtReceipt,
@@ -75,5 +76,53 @@ describe('inbound native message resources', () => {
     expect(inboundResourceDownloadFailureText('media')).toBe(
       '❌ 收到的视频下载失败，未转交给 Agent。备注：可能是视频超过飞书消息资源 100 MB 下载上限。',
     )
+  })
+})
+
+describe('pending text input priority(上游 ae411a6)', () => {
+  test('a hit on the pending reply consumes the text:question path never runs', async () => {
+    const calls: string[] = []
+    const consumed = await consumePendingTextInput({
+      reply: async () => { calls.push('reply'); return true },
+      hasQuestion: () => { calls.push('hasQuestion'); return true },
+      answerQuestion: async () => { calls.push('answerQuestion') },
+    })
+
+    expect(consumed).toBe(true)
+    expect(calls).toEqual(['reply'])
+  })
+
+  test('a miss on reply falls back to the pending question', async () => {
+    const calls: string[] = []
+    const consumed = await consumePendingTextInput({
+      reply: async () => { calls.push('reply'); return false },
+      hasQuestion: () => { calls.push('hasQuestion'); return true },
+      answerQuestion: async () => { calls.push('answerQuestion') },
+    })
+
+    expect(consumed).toBe(true)
+    expect(calls).toEqual(['reply', 'hasQuestion', 'answerQuestion'])
+  })
+
+  test('neither pending reply nor pending question leaves the text to Agent routing', async () => {
+    const calls: string[] = []
+    const consumed = await consumePendingTextInput({
+      reply: async () => { calls.push('reply'); return false },
+      hasQuestion: () => { calls.push('hasQuestion'); return false },
+      answerQuestion: async () => { calls.push('answerQuestion') },
+    })
+
+    expect(consumed).toBe(false)
+    expect(calls).toEqual(['reply', 'hasQuestion'])
+  })
+
+  test('a throwing reply propagates instead of silently falling through', async () => {
+    let answered = false
+    await expect(consumePendingTextInput({
+      reply: async () => { throw new Error('store unavailable') },
+      hasQuestion: () => true,
+      answerQuestion: async () => { answered = true },
+    })).rejects.toThrow('store unavailable')
+    expect(answered).toBe(false)
   })
 })
