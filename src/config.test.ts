@@ -323,6 +323,51 @@ describe('runtime agent_auto_update(上游 659dddb)', () => {
   })
 })
 
+describe('[deepseek-harness] 账号段(D-08 双轨:与 [claude.models.deepseek] 互不相读)', () => {
+  test('缺段为 undefined,不写任何默认凭据', () => {
+    const result = loadFreshConfig()
+    expect(result.exitCode).toBe(0)
+    const parsed = JSON.parse(result.stdout)
+    expect(parsed.deepseek_harness).toBeUndefined()
+  })
+
+  test('有段时逐字段解析为标量(display/api_key/base_url/model/effort/bin)', () => {
+    const result = loadFreshConfig(`
+      [deepseek-harness]
+      display = "DSH 账号"
+      api_key = "sk-dsh"
+      base_url = "https://api.deepseek.com"
+      model = "deepseek-v4-pro"
+      effort = "high"
+      bin = "/opt/node/bin/node"
+    `)
+    expect(result.exitCode).toBe(0)
+    expect(result.stderr).toBe('')
+    const parsed = JSON.parse(result.stdout)
+    expect(parsed.deepseek_harness).toEqual({
+      display: 'DSH 账号',
+      api_key: 'sk-dsh',
+      base_url: 'https://api.deepseek.com',
+      model: 'deepseek-v4-pro',
+      effort: 'high',
+      bin: '/opt/node/bin/node',
+    })
+    // 双轨:DSH 段不渗进 claude 兼容 deepseek 档的读取面
+    expect(parsed.claude.models.deepseek).toBeUndefined()
+  })
+
+  test('段内空标量被忽略,不产生空字符串字段', () => {
+    const result = loadFreshConfig(`
+      [deepseek-harness]
+      api_key = "sk-dsh"
+      model = "   "
+    `)
+    expect(result.exitCode).toBe(0)
+    const parsed = JSON.parse(result.stdout)
+    expect(parsed.deepseek_harness).toEqual({ api_key: 'sk-dsh' })
+  })
+})
+
 describe('configured project paths', () => {
   test('resolves relative projects_root and project cwd values to absolute paths', () => {
     const root = mkdtempSync(join(tmpdir(), 'lodestar-config-paths-'))

@@ -272,4 +272,25 @@ describe('token-source list + usage helpers', () => {
     expect(resolveUsageSource('claude', 'claude:grok')).toBe('provider')
     expect(resolveUsageSource('claude', 'claude:grokcc')).toBe('provider')
   })
+
+  test('resolveTokenSource("dsh") 落在 deepseek-harness 源上', () => {
+    const source = resolveTokenSource('dsh', 'dsh:deepseek-v4-pro')
+    expect(source.id).toBe('deepseek-harness')
+    expect(source.provider).toBe('dsh')
+    expect(source.kind).toBe('api')
+    expect(source.isApiRoute()).toBe(true)
+  })
+
+  test('resolveUsageSource("dsh") = provider(D-09 接线点经 slim 层同规则)', () => {
+    // 与 usageSourceForAgent('dsh', …) 同结果 —— token-source 只是委托方。
+    expect(resolveUsageSource('dsh', 'dsh:deepseek-v4-pro')).toBe('provider')
+    expect(resolveUsageSource('dsh', null)).toBe('provider')
+  })
+
+  test('listTokenSources 收进 DSH 源且不改其它档位的 id 语义', () => {
+    const ids = listTokenSources().map(s => s.id)
+    expect(ids).toContain('deepseek-harness')
+    // 一档一位:DSH 只出现一次
+    expect(ids.filter(id => id === 'deepseek-harness')).toHaveLength(1)
+  })
 })
