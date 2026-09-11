@@ -157,18 +157,36 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     this.pendingInputs++
     void this.initializationPromise().then(async () => {
       const content: object[] = [{ type: 'text', text: [text, ...files.map(file => `[file: ${file}]`)].join('\n') }]
-      const referenced = new Set([...files, ...Array.from(text.matchAll(/\[file: ([^\]\r\n]+)\]/g), match => match[1])])
+      // 文本里的 [file: …] 是尽力而为的引用(instructions 正是这样教给 agent 的):
+      // 先过绝对路径闸门 —— 相对路径会按 daemon 进程 cwd 解析,与显式 files 的
+      // 「must use absolute paths」契约自相矛盾。
+      const referenced = new Set(
+        [...files, ...Array.from(text.matchAll(/\[file: ([^\]\r\n]+)\]/g), match => match[1])]
+          .filter(path => isAbsolute(path)),
+      )
       const imageExtensions = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif'])
       for (const path of referenced) {
         if (!imageExtensions.has(extname(path).toLowerCase())) continue
-        const bytes = await readFile(path)
+        let bytes: Buffer
+        try {
+          bytes = await readFile(path)
+        } catch (error) {
+          // 显式 files 保持 fail loud;文本推导出的引用读不到就跳过(附 error
+          // 事件)—— 否则一条含失效 [file: …] 标记的普通文本会经 fail() 终态
+          // 杀掉整个会话,用户只能 restart。
+          if (files.includes(path)) throw error
+          this.emit('error', new Error(`DSH image reference skipped: ${path}`))
+          continue
+        }
         content.push({ type: 'image', mediaType: imageMediaType(bytes), name: basename(path), data: bytes.toString('base64') })
       }
       await this.runtime.request('session/prompt', {
         mode: 'auto', content,
       })
+    }).catch(error => this.fail(error)).finally(() => {
+      // reject 路径此前不减计数(fail() 终态后无可见影响,但对称性要靠 finally)。
       this.pendingInputs--
-    }).catch(error => this.fail(error))
+    })
     return dshDispatch({ kind: 'queued', provider: 'dsh' })
   }
   sendInterrupt(): void { void this.runtime.request('session/cancel').catch(error => this.fail(error)) }

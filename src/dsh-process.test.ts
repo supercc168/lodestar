@@ -167,6 +167,48 @@ describe('DshProcess 契约', () => {
     expect(dispatch).toMatchObject({ kind: 'rejected', provider: 'dsh' })
   })
 
+  test('文本 [file: …] 先过绝对路径闸门:相对引用不按 daemon cwd 读取', async () => {
+    const proc = processFor()
+    const runtime = FakeDshRuntime.latest()
+    await proc.initializationPromise()
+    // repo 根的 promo.jpg 真实存在:相对引用若被读取会落进 content。
+    proc.sendUserText('看看 [file: promo.jpg] 这张图')
+    await waitFor(() => prompts(runtime).length === 1)
+    expect(prompts(runtime)[0].params.content).toEqual([{ type: 'text', text: '看看 [file: promo.jpg] 这张图' }])
+    expect(proc.isAlive()).toBe(true)
+    expect((proc as any).pendingInputs).toBe(0)
+  })
+
+  test('文本 [file: …] 读失败降级为 skip/error,不杀会话', async () => {
+    const proc = processFor()
+    const runtime = FakeDshRuntime.latest()
+    await proc.initializationPromise()
+    const errors: Error[] = []
+    proc.on('error', error => errors.push(error))
+    const missing = join(scratch, 'missing-text-ref.png')
+    const dispatch = proc.sendUserText(`引用已失效 [file: ${missing}]`)
+    expect(dispatch.kind).toBe('queued')
+    await waitFor(() => prompts(runtime).length === 1)
+    expect(prompts(runtime)[0].params.content).toEqual([{ type: 'text', text: `引用已失效 [file: ${missing}]` }])
+    expect(errors.map(error => error.message)).toEqual([`DSH image reference skipped: ${missing}`])
+    expect(proc.isAlive()).toBe(true)
+    expect((proc as any).pendingInputs).toBe(0)
+    expect(proc.sendUserText('still here').kind).toBe('queued')
+  })
+
+  test('显式 files 读失败仍 fail loud,计数在 finally 归零', async () => {
+    const proc = processFor()
+    await proc.initializationPromise()
+    const errors: Error[] = []
+    proc.on('error', error => errors.push(error))
+    proc.sendUserText('附件', [join(scratch, 'missing-explicit.png')])
+    await waitFor(() => errors.length > 0)
+    expect(errors[0].message).toContain('ENOENT')
+    await waitFor(() => !proc.isAlive())
+    expect((proc as any).pendingInputs).toBe(0)
+    expect(proc.sendUserText('again').kind).toBe('rejected')
+  })
+
   test('listModels 返回 AgentModel 形状(原生窗口与档位)', async () => {
     const proc = processFor()
     const models = await proc.listModels()
