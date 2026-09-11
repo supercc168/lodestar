@@ -1,5 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 import { agentIdentityId, buildAgentIdentityCatalog } from './agent-identities'
+import { config } from './config'
 import type { TokenSource } from './token-source'
 
 function source(overrides: {
@@ -83,6 +84,35 @@ describe('Agent identity catalog (slim TokenSource)', () => {
     ])
     expect(catalog.identities[0].defaultEffort).toBe('xhigh')
     expect(catalog.identities[0].supportedEfforts).toEqual(['xhigh'])
+  })
+
+  test('dsh 身份取 [deepseek-harness].effort,缺省复用 bootstrap high,绝不回落 Codex 的 max', () => {
+    const prev = (config as any).deepseek_harness
+    const dsh = {
+      id: 'deepseek-harness',
+      provider: 'dsh' as const,
+      selectionModel: 'deepseek-v4-pro',
+      spawnModel: 'deepseek-v4-pro',
+      displayName: 'DeepSeek Harness · deepseek-v4-pro',
+    }
+    try {
+      ;(config as any).deepseek_harness = undefined
+      let catalog = buildAgentIdentityCatalog([source(dsh)])
+      expect(catalog.identities[0].defaultEffort).toBe('high')
+      expect(catalog.identities[0].supportedEfforts).toEqual(['high'])
+      expect(catalog.identities[0].defaultEffort).not.toBe('max')
+
+      ;(config as any).deepseek_harness = { api_key: 'dsh-key', effort: 'low' }
+      catalog = buildAgentIdentityCatalog([source(dsh)])
+      expect(catalog.identities[0].defaultEffort).toBe('low')
+
+      // 非 DSH 词表(medium)不生效,回落 bootstrap 而不是 Codex 的 max。
+      ;(config as any).deepseek_harness = { api_key: 'dsh-key', effort: 'medium' }
+      catalog = buildAgentIdentityCatalog([source(dsh)])
+      expect(catalog.identities[0].defaultEffort).toBe('high')
+    } finally {
+      ;(config as any).deepseek_harness = prev
+    }
   })
 
   test('agentIdentityId encodes tokenSourceId NUL model as base64url', () => {

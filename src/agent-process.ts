@@ -36,6 +36,10 @@ export type DshReasoningEffort = 'off' | 'low' | 'high' | 'max'
 export function isDshReasoningEffort(value: unknown): value is DshReasoningEffort {
   return value === 'off' || value === 'low' || value === 'high' || value === 'max'
 }
+/** DSH 配置段未声明 `[deepseek-harness].effort` 时的 bootstrap 档位(03-01 冒烟:
+ *  deepseek-v4-* 均上报 off/low/high/max,defaultEffort = high)。主会话档位目录
+ *  与委派身份目录共用这一个常量 —— 两侧都不回落 Codex 的 max。 */
+export const DSH_BOOTSTRAP_EFFORT: DshReasoningEffort = 'high'
 export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort | DshReasoningEffort
 

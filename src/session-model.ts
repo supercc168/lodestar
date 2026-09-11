@@ -3,6 +3,7 @@ import { randomUUID } from 'node:crypto'
 import type { Session } from './session'
 import { isCodexReasoningEffort } from './codex-process'
 import {
+  DSH_BOOTSTRAP_EFFORT,
   agentProviderLabel,
   isAgentProvider,
   isClaudeReasoningEffort,
@@ -10,7 +11,6 @@ import {
   providerFromModel,
   type AgentProvider,
   type AgentReasoningEffort,
-  type DshReasoningEffort,
 } from './agent-process'
 import * as cards from './cards'
 import * as feishu from './feishu'
@@ -129,11 +129,6 @@ interface SelectableModelChoice {
   description: string
   effort: AgentReasoningEffort
 }
-
-/** DSH 目录默认档(03-01 冒烟:deepseek-v4-* 均上报 off/low/high/max,
- *  defaultEffort = high)。配置段未声明 effort 时的 bootstrap 值:选中即把该值
- *  写进 selectedEffort,spawn 侧 dshEffortForSpawn 直接取到 —— 不回落 Codex 的 max。 */
-const DSH_BOOTSTRAP_EFFORT: DshReasoningEffort = 'high'
 
 /** provider 的默认固定档位(该 provider 的第一个可选项)。归一化未知/退役
  *  选择时回落到它。走 selectableModelChoices() 而不是静态表:否则 dsh 会错误
