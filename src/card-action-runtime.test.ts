@@ -6,6 +6,7 @@ import {
   createCardActionAdmission,
   createPerChatAdmission,
   afterCardActionAck,
+  cardActionDedupeIdentity,
   cardActionDedupeKey,
   cardActionDedupeKeys,
   completeAfterPresentation,
@@ -598,5 +599,83 @@ describe('CardActionAdmission integration', () => {
     })).toEqual({ accepted: false, reason: 'invalid-key' })
     expect(ran).toBe(false)
     expect([...h.actor.pending()]).toHaveLength(0)
+  })
+})
+
+describe('notify reply 卡动作(上游 ae411a6)', () => {
+  const bare = (value: object) => ({ action: { value } })
+  const notifyEvent = (eventId: string, value: object, chatId = '') => ({
+    event_id: eventId,
+    context: { open_chat_id: chatId, open_message_id: chatId ? `message-${chatId}` : '' },
+    operator: { open_id: 'user-1' },
+    action: { value },
+  })
+
+  test('三类 notify kind 缺 chat/message context 仍准入;其它 kind 保持原有校验', () => {
+    expect(validateCardActionAdmission(bare({ kind: 'notify_callback', notify_id: 'nf_1' }))).toBeNull()
+    expect(validateCardActionAdmission(bare({ kind: 'notify_reply', notify_id: 'nf_1' }))).toBeNull()
+    expect(validateCardActionAdmission(bare({ kind: 'notify_reply_cancel', notify_id: 'nf_1', reply_id: 'r_1' }))).toBeNull()
+    // 对照:非 notify kind 缺 context 仍被拒(chat_id 与 open_message_id 两道)
+    expect(validateCardActionAdmission(bare({ kind: 'menu', choice: 0 }))).toContain('chat_id')
+    expect(validateCardActionAdmission({
+      context: { open_chat_id: 'chat' },
+      action: { value: { kind: 'menu', choice: 0 } },
+    })).toContain('message_id')
+  })
+
+  test('notify_reply_cancel 的语义 key 含 reply_id:回复与取消不互相去重', () => {
+    const replyKey = cardActionDedupeKey(bare({ kind: 'notify_reply', notify_id: 'nf_1' }))
+    const cancelKey = cardActionDedupeKey(bare({ kind: 'notify_reply_cancel', notify_id: 'nf_1', reply_id: 'r_1' }))
+    expect(replyKey).not.toBe(cancelKey)
+    expect(cancelKey).not.toBe(
+      cardActionDedupeKey(bare({ kind: 'notify_reply_cancel', notify_id: 'nf_1', reply_id: 'r_2' })),
+    )
+    // notify_reply 自身仍按 notify_id 收敛
+    expect(cardActionDedupeKey(bare({ kind: 'notify_reply', notify_id: 'nf_1' })))
+      .toBe(cardActionDedupeKey(bare({ kind: 'notify_reply', notify_id: 'nf_1' })))
+    expect(cardActionDedupeKey(bare({ kind: 'notify_reply', notify_id: 'nf_1' })))
+      .not.toBe(cardActionDedupeKey(bare({ kind: 'notify_reply', notify_id: 'nf_2' })))
+    expect(cardActionDedupeIdentity(bare({ kind: 'notify_reply', notify_id: 'nf_1' })).repeatable).toBe(true)
+  })
+
+  test('notify_reply 标 repeatable:完成后不写墓碑,第二次击键仍可派发', async () => {
+    let executeCalls = 0
+    const h = admissionHarness({
+      execute: async () => { executeCalls++; return { __businessOk: true } },
+    })
+    const value = { kind: 'notify_reply', notify_id: 'nf_reply_1' }
+
+    expect(h.admission.accept(notifyEvent('reply-ev-1', value))).toEqual({ state: 'accepted' })
+    await h.drain()
+    // 30s 墓碑不写 → 用户点「回复」→ 取消 → 再点「回复」不会被静默吞掉
+    expect(h.admission.accept(notifyEvent('reply-ev-2', value))).toEqual({ state: 'accepted' })
+    await h.drain()
+    expect(executeCalls).toBe(2)
+  })
+
+  test('repeatable 仍受 event_id 投递去重与并发窗口去重(inflight 不放行)', async () => {
+    const h = admissionHarness()
+    const value = { kind: 'notify_reply', notify_id: 'nf_reply_2' }
+    const first = notifyEvent('reply-ev-dup', value)
+
+    expect(h.admission.accept(first)).toEqual({ state: 'accepted' })
+    expect(h.admission.accept(first)).toEqual({ state: 'inflight' })
+    await h.drain()
+    // deliveryKey 仍落墓碑:同 event_id 的重放不得二次执行
+    expect(h.admission.accept(first)).toEqual({ state: 'completed' })
+    // 但语义 key 已释放 → 新事件可以重新派发
+    expect(h.admission.accept(notifyEvent('reply-ev-next', value))).toEqual({ state: 'accepted' })
+  })
+
+  test('未标记 repeatable 的动作保持既有墓碑去重(逐字节同现状)', async () => {
+    let executeCalls = 0
+    const h = admissionHarness({
+      execute: async () => { executeCalls++; return { __businessOk: true } },
+    })
+    const value = { kind: 'menu', choice: 0 }
+    expect(h.admission.accept(notifyEvent('menu-ev-1', value, 'chat-a'))).toEqual({ state: 'accepted' })
+    await h.drain()
+    expect(h.admission.accept(notifyEvent('menu-ev-2', value, 'chat-a'))).toEqual({ state: 'completed' })
+    expect(executeCalls).toBe(1)
   })
 })
