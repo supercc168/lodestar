@@ -24,7 +24,8 @@ export interface AgentLaunchOptions {
   serviceName?: string
   /** 原生工具层的委派开关:D-11 口径 3 的「单层委派」不靠提示词自觉。
    *  缺省(undefined)= 不限制;只有显式 false 才关闭后端的委派工具
-   *  (claude disallowedTools / codex `--disable multi_agent`),主 Agent 不受影响。 */
+   *  (claude disallowedTools / codex `--disable multi_agent` /
+   *  dsh bridge 的 tools.restrict),主 Agent 不受影响。 */
   allowDelegation?: boolean
 }
 
@@ -70,6 +71,10 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
         developerInstructions: opts.developerInstructions,
         profile: opts.profile,
         hostEnv: opts.hostEnv,
+        // D-11 口径 3 的原生工具层:与 claude(:101)/codex(:122)同形的 spread。
+        // 不透传会让 DshProcess 按「未指定即放开」构造 session/open,dsh-bridge
+        // 的 tools.restrict(DELEGATION_TOOLS)永不触发 —— 三层里唯一的硬闸失效。
+        ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
         // 凭据单入口(D-08 双轨隔离的本地点):先 scrub ANTHROPIC_* 与旧
         // DSH_*/DEEPSEEK_*,再注入本档 DEEPSEEK_*。TokenSource.spawnEnv 的入参
         // 收窄为 string 值,DshSpawnOptions.transformEnv 允许 undefined,

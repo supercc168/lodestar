@@ -165,6 +165,26 @@ describe('createAgentProcess dsh 分支(D-08 双轨:与 claude:deepseek 互不�
     }
   })
 
+  test('allowDelegation:false 透传 DshProcess 构造(D-11 口径 3,与 claude/codex 同形)', () => {
+    const restore = withDshConfig({ api_key: 'dsh-key', model: 'deepseek-v4-pro' })
+    try {
+      const base = {
+        provider: 'dsh' as const,
+        workDir: '/tmp/dsh-work',
+        tokenSourceId: 'deepseek-harness',
+        model: 'deepseek-v4-pro',
+        effort: 'high' as const,
+      }
+      const restricted = createAgentProcess({ ...base, allowDelegation: false })
+      expect((restricted.process as any).opts.allowDelegation).toBe(false)
+      // 缺省(undefined)不限制:主 Agent 走同一构造入口,不得被误关。
+      const main = createAgentProcess({ ...base })
+      expect((main.process as any).opts.allowDelegation).toBeUndefined()
+    } finally {
+      restore()
+    }
+  })
+
   test('effort 非法(medium)或缺省时抛错,不静默回落', () => {
     const restore = withDshConfig({ api_key: 'dsh-key', model: 'deepseek-v4-pro' })
     try {

@@ -148,6 +148,18 @@ describe('DshProcess 契约', () => {
     expect((dispatch as any).error).toBeInstanceOf(Error)
   })
 
+  test('allowDelegation 透传 session/open:显式 false 关闭,缺省放开', async () => {
+    const restricted = processFor()
+    await restricted.initializationPromise()
+    const restrictedOpen = FakeDshRuntime.latest().requests.find(request => request.method === 'session/open')
+    expect(restrictedOpen?.params.allowDelegation).toBe(false)
+
+    const main = processFor({ allowDelegation: undefined })
+    await main.initializationPromise()
+    const mainOpen = FakeDshRuntime.latest().requests.find(request => request.method === 'session/open')
+    expect(mainOpen?.params.allowDelegation).toBe(true)
+  })
+
   test('相对路径文件输入被拒且不抛', async () => {
     const proc = processFor()
     await proc.initializationPromise()
