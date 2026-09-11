@@ -18,7 +18,7 @@ export const SUPPORTED_CARD_ACTION_KINDS = new Set([
   'tasklist_enable', 'tasklist_delete_prompt', 'tasklist_delete_confirm',
   'gsd_refresh', 'gsd_select', 'gsd_continue', 'gsd_pause', 'gsd_complete',
   'gsd_new_prompt', 'agy_forward_codex', 'agent_identity_page', 'agent_run_cancel',
-  'notify_callback',
+  'notify_callback', 'notify_reply', 'notify_reply_cancel',
 ])
 
 /** Admission validation runs synchronously before actor/dedupe reservation;
@@ -28,10 +28,11 @@ export function validateCardActionAdmission(data: any): string | null {
   const kind = String(value.kind ?? '')
   if (!kind) return '无效操作'
   if (!SUPPORTED_CARD_ACTION_KINDS.has(kind)) return `不支持的操作: ${kind}`
-  if (kind !== 'notify_callback' && !String(data?.context?.open_chat_id ?? '')) {
+  const notification = kind === 'notify_callback' || kind === 'notify_reply' || kind === 'notify_reply_cancel'
+  if (!notification && !String(data?.context?.open_chat_id ?? '')) {
     return '回调缺少 chat_id，操作未执行'
   }
-  if (kind !== 'notify_callback' && !String(data?.context?.open_message_id ?? '')) {
+  if (!notification && !String(data?.context?.open_message_id ?? '')) {
     return '回调缺少原卡 message_id，操作未执行'
   }
   if (kind === 'permission' && !['allow', 'allow_always', 'deny'].includes(String(value.decision ?? ''))) {
@@ -229,6 +230,8 @@ function cardActionSemanticKey(data: any): string {
     case 'agent_identity_page': resource = { panel_id: value.panel_id }; break
     case 'agent_run_cancel': resource = { run_id: value.run_id }; break
     case 'notify_callback': resource = { notify_id: value.notify_id }; break
+    case 'notify_reply': resource = { notify_id: value.notify_id }; break
+    case 'notify_reply_cancel': resource = { notify_id: value.notify_id, reply_id: value.reply_id }; break
     case 'model_select':
     case 'model_effort_select': resource = { panel_id: value.panel_id }; break
     default: resource = value
@@ -239,6 +242,7 @@ function cardActionSemanticKey(data: any): string {
 export interface CardActionDedupeIdentity {
   deliveryKey?: string
   businessKey: string
+  repeatable?: boolean
 }
 
 export function cardActionDedupeIdentity(data: any): CardActionDedupeIdentity {
@@ -251,6 +255,7 @@ export function cardActionDedupeIdentity(data: any): CardActionDedupeIdentity {
   return {
     ...(eventId ? { deliveryKey: `event\u0000${eventId}` } : {}),
     businessKey: `semantic\u0000${cardActionSemanticKey(data)}`,
+    ...(['agent_identity_page', 'notify_reply'].includes(data?.action?.value?.kind) ? { repeatable: true } : {}),
   }
 }
 
@@ -309,7 +314,7 @@ function settleAction(
   businessCompleted: boolean,
 ): void {
   if (identity.deliveryKey) deduper.complete(identity.deliveryKey)
-  if (businessCompleted) deduper.complete(identity.businessKey)
+  if (businessCompleted && !identity.repeatable) deduper.complete(identity.businessKey)
   else deduper.fail(identity.businessKey)
 }
 
@@ -355,8 +360,9 @@ export function createCardActionAdmission<TResult, TResponse>(
           result = await deps.execute(data)
         } catch (error) {
           // The handler may have thrown after an external side effect. Keep a
-          // short tombstone for both keys rather than risking destructive replay.
-          deps.deduper.completeAll(keys)
+          // short tombstone for both keys rather than risking destructive replay;
+          // repeatable actions release the business key so the user can re-click.
+          settleAction(deps.deduper, identity, true)
           await bestEffort(() => deps.presentExecutionFailure(data, error))
           return
         }
