@@ -148,11 +148,17 @@ const CAPACITY_RETRY_MAX_MS = 60_000
 // 失败的那一轮已包含用户输入与已完成工作;续作沿用它,不重放原始任务与文件提示。
 const CAPACITY_CONTINUATION = '上一轮因模型暂时满载而中断。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。'
 
-/** 上游正则(严格窄口径):只认显式 "selected model is at capacity"。
- *  与 session.ts 的 isCodexCapacityError(分类面,含 serverOverloaded)分层互补,
- *  两者不合并、不互相替换。 */
+/** 进程层容量判定(上游 2e6e1e0)。口径与 session.ts 的 isCodexCapacityError(分类面)
+ *  对齐:严格正则之外还认 serverOverloaded / "at capacity"+"model" /
+ *  please try a different model(02-REVIEW WR-03)—— session 自主重试环已删除,D-07 后
+ *  进程层是唯一调度者,窄口径会让这些变体没有任何自动重试路径(相对基线是功能回退)。 */
 function isModelCapacityError(message: unknown): message is string {
-  return typeof message === 'string' && /\bselected\s+model\s+is\s+at\s+capacity\b/i.test(message)
+  if (typeof message !== 'string' || !message) return false
+  const lower = message.toLowerCase()
+  return /\bselected\s+model\s+is\s+at\s+capacity\b/.test(lower)
+    || lower.includes('serveroverloaded')
+    || (lower.includes('at capacity') && lower.includes('model'))
+    || lower.includes('please try a different model')
 }
 
 export interface SpawnOpts {

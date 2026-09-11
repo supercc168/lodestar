@@ -2438,6 +2438,48 @@ describe('codex model capacity recovery', () => {
     })
   })
 
+  // 02-REVIEW WR-03:session 自主重试环删除后进程层是唯一调度者 —— 宽口径容量失败
+  // (serverOverloaded / "at capacity"+"model" / please try a different model)必须和
+  // 严格正则一样进入进程层退避,否则相对 phase 前的 60s 自动重试是功能回退。
+  test('宽口径容量失败同样进入进程层退避重试', async () => {
+    await withCapacityClock(async clock => {
+      for (const message of [
+        'serverOverloaded',
+        'Upstream model is at capacity, please retry later',
+        'Please try a different model',
+      ]) {
+        const { proc, events } = capacityHarness()
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        completeCapacityTurn(proc, { message })
+        expect(events.filter(([event]) => event === 'result')).toEqual([])
+        expect(proc.turnRetry).toMatchObject({ phase: 'waiting', attempt: 1, delayMs: 5_000, message })
+        proc.sendInterrupt()
+        await flushCapacityMicrotasks()
+        expect(clock.timers.size).toBe(0)
+      }
+    })
+  })
+
+  test('turn/start 的宽口径容量拒绝也按原输入重试', async () => {
+    await withCapacityClock(async clock => {
+      let starts = 0
+      const serverMessage = 'serverOverloaded'
+      const { proc, calls, events } = capacityHarness(method => {
+        if (method !== 'turn/start') throw new Error(`unexpected request ${method}`)
+        if (++starts === 1) throw new CodexRpcResponseError(method, 1, -32000, serverMessage)
+        return { turn: { id: 'accepted-wide-retry' } }
+      })
+      proc.sendUserText('unaccepted task')
+      await flushCapacityMicrotasks()
+      expect(events.filter(([event]) => event === 'result')).toEqual([])
+      await clock.tick()
+      expect(calls[1]).toEqual(calls[0])
+      completeCapacityTurn(proc, null)
+      expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+    })
+  })
+
   test('interrupt during backoff cancels even an already-queued timer callback', async () => {
     await withCapacityClock(async clock => {
       const { proc, calls, events } = capacityHarness()
