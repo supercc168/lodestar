@@ -8,7 +8,7 @@ import { SERVICE_LABEL, type SysInfo } from '../sysinfo'
 import type { UsageSnapshot } from '../usage'
 import type { GlmUsageSnapshot } from '../glm-usage'
 import type { ClaudeProviderUsageSnapshot } from '../claude-provider-usage'
-import { usageSourceForAgent, type AgentProvider, type AgentUsageSource } from '../agent-process'
+import { agentProviderLabel, usageSourceForAgent, type AgentProvider, type AgentUsageSource } from '../agent-process'
 import { ELEMENTS } from './elements'
 
 export interface ConsoleOpts {
@@ -301,6 +301,33 @@ export function consoleProviderUsageContent(
   return lines.length === 1 ? `**📊 渠道额度** · ${providerUsage.providerName}　_无数据_` : lines.join('\n')
 }
 
+/** DSH(DeepSeek Harness)余额行(03-03)。快照形状与渠道余额同源(官方
+ * `/user/balance`),但语义是「余额」而非渠道额度,未配置时指引指向
+ * `[deepseek-harness]` 段本身。`providerUsage === undefined` → loading 占位
+ * (与控制台其余额度行同规,不臆造数值)。 */
+export function consoleDshBalanceContent(providerUsage?: ClaudeProviderUsageSnapshot): string {
+  if (providerUsage === undefined) return '**📊 余额**　_加载中…_'
+  const head = `**📊 余额**${providerUsage.providerName ? ` · ${providerUsage.providerName}` : ''}`
+  switch (providerUsage.state) {
+    case 'no_credentials':
+      return `${head}　未配置凭据 — 在 \`config.toml\` 的 \`[deepseek-harness]\` 填 \`api_key\``
+    case 'rate_limited':
+      return `${head}　API 限流,稍后重试`
+    case 'network':
+      return `${head}　拉取失败${providerUsage.reason ? ' — `' + providerUsage.reason + '`' : ''}`
+    case 'unavailable':
+      return `${head}　不可用${providerUsage.reason ? ' · ' + providerUsage.reason : ''}`
+  }
+  const lines = [head]
+  if (providerUsage.unlimited) {
+    lines.push('　· 额度　不限')
+  } else if (providerUsage.remaining !== undefined) {
+    lines.push(`　· 余额　${fmtProviderRemaining(providerUsage.remaining, providerUsage.unit ?? '')}`)
+  }
+  if (!providerUsage.isValid) lines.push('　· 状态　已停用')
+  return lines.length === 1 ? `${head}　_无数据_` : lines.join('\n')
+}
+
 /** 紧凑数字：390493193 → 390.5M；2544.33 保持两位小数。 */
 function fmtCompactNumber(n: number): string {
   if (!Number.isFinite(n)) return String(n)
@@ -473,7 +500,9 @@ export function consoleUsageElement(opts: ConsoleOpts): object {
     : usageSource === 'codex'
       ? consoleUsageContent(opts.usage)
       : usageSource === 'provider'
-        ? consoleProviderUsageContent(opts.providerUsage)
+        ? opts.provider === 'dsh'
+          ? consoleDshBalanceContent(opts.providerUsage)
+          : consoleProviderUsageContent(opts.providerUsage)
         : consoleUsageNotApplicableContent(opts.model)
   return {
     tag: 'markdown',
@@ -646,6 +675,7 @@ function modelChoiceElements(models: ModelChoice[], panelId: string, currentEffo
   const groups = [
     { title: 'Codex', models: models.filter(m => (m.provider ?? 'codex') === 'codex') },
     { title: 'Claude Code 后端', models: models.filter(m => m.provider === 'claude') },
+    { title: 'DeepSeek Harness', models: models.filter(m => m.provider === 'dsh') },
   ].filter(group => group.models.length > 0)
   if (groups.length <= 1) return models.map(model => modelChoiceElement(model, panelId, currentEffort))
   const elements: object[] = []
@@ -691,7 +721,7 @@ function settingsText(model?: string | null, effort?: string | null, provider?: 
 }
 
 function providerLabel(provider?: AgentProvider): string {
-  return provider === 'claude' ? 'Claude' : 'Codex'
+  return agentProviderLabel(provider ?? 'codex')
 }
 
 function truncate(s: string, max: number): string {

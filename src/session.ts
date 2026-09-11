@@ -1570,6 +1570,10 @@ export class Session {
 
   currentEffortLabel(): AgentReasoningEffort {
     return this.selectedEffort
+      // DSH 档位与 Codex/Claude 枚举不同(off/low/high/max):未显式选时按 DSH
+      // 语义解析(取不到即抛,不静默回落 CODEX_EFFORT),否则面板选中标记 /
+      // 当前档位展示 / selectionUnchanged 会把 DSH 会话当 Codex 渲染(03-03)。
+      ?? (this.selectedProvider === 'dsh' ? this.dshEffortForSpawn() : undefined)
       ?? this.proc?.lastEffort
       ?? (this.selectedProvider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
   }

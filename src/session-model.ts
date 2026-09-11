@@ -4,14 +4,18 @@ import type { Session } from './session'
 import { isCodexReasoningEffort } from './codex-process'
 import {
   agentProviderLabel,
+  isAgentProvider,
   isClaudeReasoningEffort,
+  isDshReasoningEffort,
   providerFromModel,
   type AgentProvider,
   type AgentReasoningEffort,
+  type DshReasoningEffort,
 } from './agent-process'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { config } from './config'
+import { DSH_DEFAULT_MODEL } from './token-source-dsh'
 import {
   claudeModelConfigured,
   claudeModelEffort,
@@ -116,16 +120,32 @@ const FIXED_MODEL_CHOICES = [
   },
 ]
 
-/** provider 的默认固定档位(该 provider 的第一个固定项)。归一化未知/退役
- * 选择时回落到它。 */
-function defaultFixedChoiceFor(provider: AgentProvider): typeof FIXED_MODEL_CHOICES[number] {
-  return FIXED_MODEL_CHOICES.find(c => c.provider === provider) ?? FIXED_MODEL_CHOICES[0]
+/** 可选档位的公共形状(FIXED_MODEL_CHOICES / codexModelChoices / DSH 档同形)。
+ *  provider 取全量联合:DSH 档也要走同一套锁死与归一化,不另开旁路。 */
+interface SelectableModelChoice {
+  provider: AgentProvider
+  model: string
+  displayName: string
+  description: string
+  effort: AgentReasoningEffort
+}
+
+/** DSH 目录默认档(03-01 冒烟:deepseek-v4-* 均上报 off/low/high/max,
+ *  defaultEffort = high)。配置段未声明 effort 时的 bootstrap 值:选中即把该值
+ *  写进 selectedEffort,spawn 侧 dshEffortForSpawn 直接取到 —— 不回落 Codex 的 max。 */
+const DSH_BOOTSTRAP_EFFORT: DshReasoningEffort = 'high'
+
+/** provider 的默认固定档位(该 provider 的第一个可选项)。归一化未知/退役
+ *  选择时回落到它。走 selectableModelChoices() 而不是静态表:否则 dsh 会错误
+ *  回落到 Codex 的 FIXED_MODEL_CHOICES[0](跨 provider)。 */
+function defaultFixedChoiceFor(provider: AgentProvider): SelectableModelChoice {
+  return selectableModelChoices().find(c => c.provider === provider) ?? FIXED_MODEL_CHOICES[0]
 }
 
 /** 档位实际锁死的 effort:第三方路由优先用 config 声明的 effort；无痕 Grok
  * 锁 xAI 官方最高 xhigh(Grok 4.6)，CatCodex 锁网关兼容 xhigh。其它未配置时回落默认值。
  * picker 渲染、选择校验、归一化都走这里,保持三处一致。 */
-function resolvedEffort(item: typeof FIXED_MODEL_CHOICES[number]): AgentReasoningEffort {
+function resolvedEffort(item: SelectableModelChoice): AgentReasoningEffort {
   if (item.provider === 'claude') {
     const configured = claudeModelEffort(item.model)
     if (configured) return configured
@@ -141,8 +161,32 @@ function selectableCodexModelChoices() {
   return codexModelChoices()
 }
 
+/** DSH 档位(provider 'dsh'):**同步、配置派生、不 spawn 子进程**(项目铁律:
+ *  model 命令为固定选项,不动态拉 model/list)。档位名用 DSH **原生模型名**
+ *  (如 deepseek-v4-pro,不带 `dsh:` 前缀)——子进程 model/list 按原生名路由,
+ *  面板值与 spawn 值必须是同一个字符串。
+ *  未配置 `[deepseek-harness].api_key` 时仍返回该档(可见但不可选,与 GLM 档
+ *  同一约定):档位在场,`defaultFixedChoiceFor('dsh')` 才不会回落到 Codex 档,
+ *  选择则由 onModelEffortSelect 的配置门拦截并给出指向配置的提示。 */
+function selectableDshModelChoices(): SelectableModelChoice[] {
+  const section = config.deepseek_harness
+  const model = section?.model?.trim() || DSH_DEFAULT_MODEL
+  const configuredEffort = section?.effort
+  const effort = isDshReasoningEffort(configuredEffort) ? configuredEffort : DSH_BOOTSTRAP_EFFORT
+  const configured = (section?.api_key?.trim() ?? '').length > 0
+  return [{
+    provider: 'dsh',
+    model,
+    displayName: `DeepSeek Harness · ${model}`,
+    description: configured
+      ? `DSH 原生后端 · effort ${effort} · 凭据走 [deepseek-harness]。`
+      : `DSH 原生后端(未配置 · 需在 config.toml 的 [deepseek-harness] 填 api_key,可选 base_url/model/effort)`,
+    effort,
+  }]
+}
+
 function selectableModelChoices() {
-  return [...FIXED_MODEL_CHOICES, ...selectableCodexModelChoices()]
+  return [...FIXED_MODEL_CHOICES, ...selectableCodexModelChoices(), ...selectableDshModelChoices()]
 }
 
 function configuredClaudeGrokChoice(legacyModel: string | null | undefined) {
@@ -237,7 +281,7 @@ export function configuredDefaultSelection(): {
 
 /** 第三方 API 路由未配 token 时的描述后缀,提示去 config.toml 设置。
  * section 名按 model 推导(claude:glm → [claude.models.glm]),不再写死 glm。 */
-function choiceDescription(item: typeof FIXED_MODEL_CHOICES[number]): string {
+function choiceDescription(item: SelectableModelChoice): string {
   if (item.provider === 'claude' && claudeModelIsApiRoute(item.model) && !claudeModelConfigured(item.model)) {
     const section = item.model.startsWith('claude:') ? item.model.slice('claude:'.length) : item.model
     return `${item.description}(未配置 · 需在 config.toml 的 [claude.models.${section}] 填 base_url + auth_token + model)`
@@ -301,7 +345,7 @@ export async function showModelPanel(s: Session): Promise<void> {
 }
 
 function actionProvider(model: string, raw: any): AgentProvider {
-  return raw?.provider === 'claude' || raw?.provider === 'codex'
+  return isAgentProvider(raw?.provider)
     ? raw.provider
     : providerFromModel(model)
 }
@@ -360,10 +404,12 @@ export async function onModelEffortSelect(
   if (!model) return { ok: false, message: '模型为空' }
   const panelId = panelIdRaw.trim()
   const panel = s.modelPanels.get(panelId)
-  const provider: AgentProvider = providerRaw === 'claude' || providerRaw === 'codex'
+  const provider: AgentProvider = isAgentProvider(providerRaw)
     ? providerRaw
     : panel?.models.find(m => m.model === model)?.provider ?? providerFromModel(model)
-  if (provider === 'claude') {
+  if (provider === 'dsh') {
+    if (!isDshReasoningEffort(effortValue)) return { ok: false, message: 'DSH reasoning effort 无效' }
+  } else if (provider === 'claude') {
     if (!isClaudeReasoningEffort(effortValue)) return { ok: false, message: 'Claude reasoning effort 无效' }
   } else if (!isCodexReasoningEffort(effortValue)) {
     return { ok: false, message: 'Codex reasoning effort 无效' }
@@ -390,6 +436,14 @@ export async function onModelEffortSelect(
     return {
       ok: false,
       message: `Codex API 档位(${model})未配置:请在 ~/.config/lodestar/config.toml 的 [codex.models.<slug>] 填写 base_url、api_key(或 requires_openai_auth)和 model 后重试(内建 gpt-5.6-sol 走全局 codex 配置,无需配置)`,
+    }
+  }
+  // DSH 的唯一凭据入口是 `[deepseek-harness].api_key`(03-02):段缺/空即不可选
+  // ——与 GLM 档位同一约定(档位可见、选择被拦),提示指向配置而不是「不在固定选项中」。
+  if (provider === 'dsh' && !(config.deepseek_harness?.api_key?.trim() ?? '').length) {
+    return {
+      ok: false,
+      message: `DeepSeek Harness(${model})未配置:请在 ~/.config/lodestar/config.toml 的 [deepseek-harness] 填写 api_key(可选 base_url/model/effort)后重试`,
     }
   }
   const choice = panel?.models.find(m => m.model === model && (m.provider ?? 'codex') === provider)
