@@ -2,7 +2,7 @@ import { join } from 'node:path'
 
 import type { Session } from './session'
 import type { AgentProvider } from './agent-process'
-import { CHANNEL_INSTRUCTIONS, CLAUDE_CHANNEL_INSTRUCTIONS } from './instructions'
+import { CHANNEL_INSTRUCTIONS, CLAUDE_CHANNEL_INSTRUCTIONS, DSH_CHANNEL_INSTRUCTIONS } from './instructions'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { log } from './log'
@@ -33,7 +33,10 @@ export function worktreeSessionDir(s: Session): string {
 }
 
 export function spawnDeveloperInstructions(s: Session): string {
-  const base = s.currentProvider() === 'claude' ? CLAUDE_CHANNEL_INSTRUCTIONS : CHANNEL_INSTRUCTIONS
+  const provider = s.currentProvider()
+  const base = provider === 'dsh'
+    ? DSH_CHANNEL_INSTRUCTIONS
+    : provider === 'claude' ? CLAUDE_CHANNEL_INSTRUCTIONS : CHANNEL_INSTRUCTIONS
   const extra = worktreeExtraInstruction(s)
   return extra ? `${base}\n${extra}` : base
 }

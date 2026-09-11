@@ -1758,6 +1758,8 @@ export class Session {
     if (ref.provider !== this.selectedProvider) {
       throw new Error(`legacy resume provider mismatch: ${ref.provider} != ${this.selectedProvider}`)
     }
+    // DSH 无 pre-cwd 时代 legacy 记录:fail closed,不进 Codex catalog(上游 722e45a)。
+    if (ref.provider === 'dsh') throw new Error('DSH resume reference requires its original cwd')
     let resolved: ConversationRef
     if (ref.provider === 'claude') {
       const transcript = claudeTranscriptPath(this.workDir, ref.sessionId)

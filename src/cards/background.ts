@@ -436,8 +436,16 @@ function briefInput(name: string, input: any): string {
   }
 }
 
-function briefResult(content: string, isError: boolean): string {
-  const c = (content ?? '').replace(/\s+/g, ' ').trim()
+function briefResult(content: unknown, isError: boolean): string {
+  // DSH 与 MCP 的后台工具返回内容块;共享进程契约也允许纯文本与结构化值。
+  // 与主工具卡路径同规:文本块拼接,其它形状退化为 JSON 摘要,任何输入不抛
+  // (上游 722e45a:后台工具返回内容块不再 .replace 崩)。
+  const output = typeof content === 'string'
+    ? content
+    : Array.isArray(content)
+      ? content.map((block: any) => typeof block?.text === 'string' ? block.text : JSON.stringify(block)).join('\n')
+      : JSON.stringify(content)
+  const c = (output ?? 'MISS').replace(/\s+/g, ' ').trim()
   return isError ? `❌ ${c.slice(0, 80)}` : c.slice(0, 80)
 }
 
@@ -541,7 +549,7 @@ export function applyBgToolResult(
   store: BgStore,
   parentToolUseId: string | null | undefined,
   toolUseId: string,
-  content: string,
+  content: unknown,
   isError: boolean,
 ): BgStore {
   if (!parentToolUseId) return store
