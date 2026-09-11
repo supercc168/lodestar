@@ -88,6 +88,9 @@ export const AGENT_RUNTIMES_DIR = join(DATA_DIR, 'agent-runtimes')
 /** Provider-native session ids created by delegated agents. Main-session
  *  rs/fk history must skip these ids. */
 export const AGENT_SESSION_IDS_FILE = join(DATA_DIR, 'agent-session-ids.json')
+/** DSH(DeepSeek Harness)私有目录:Harness profile、skills 与原生会话持久化
+ *  (上游 722e45a)。运行期状态落 DATA_DIR,不落回仓库。 */
+export const DSH_HOME_DIR = join(DATA_DIR, 'dsh')
 /** Persisted registrations for `/notify` cards that carry interactive
  * buttons. Each entry binds a `notify_id` → caller-supplied loopback
  * callback URL + the original card params (so a click can rebuild the
