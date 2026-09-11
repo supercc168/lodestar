@@ -9544,7 +9544,7 @@ describe('Session 轮转预算收紧与一次性诊断 (上游 4185808 主题 B)
     }
   })
 
-  test('a replacement-card send failure latches log-only and cannot retry forever', async () => {
+  test('a replacement-card send failure only latches log-only after a second consecutive failure (上游 378f4a4 两级阶梯)', async () => {
     const session = new Session('rotate-send-failure', 'chat_id') as any
     session.proc = new FakeAgentProc('claude', 'claude-rotate-send-failure')
     const turn = turnState('card_rotate_send_failure')
@@ -9558,10 +9558,21 @@ describe('Session 轮转预算收紧与一次性诊断 (上游 4185808 主题 B)
     }
 
     try {
+      // 一级:暂停 footer 刷新与推送,等下一个内容事件再试 —— 还不 give-up
+      session.maybeMidTurnRotate()
+      await turn.rotating
+      expect(turn.cardRotationFailed).toBe(true)
+      expect(turn.rotateGivenUp).toBe(false)
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('续卡发送失败，后续内容到达时会再次尝试')
+
+      // 二级:重试再失败才落本地止损(旧卡此时才标死)
       session.maybeMidTurnRotate()
       await turn.rotating
       expect(turn.rotateGivenUp).toBe(true)
-      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts).toHaveLength(2)
+      expect(sentRawTexts[1]).toContain('续卡连续发送失败，本轮后续输出仅日志可见')
+
       const attempts = sendCardAttempts
       session.maybeMidTurnRotate()
       expect(sendCardAttempts).toBe(attempts)
@@ -13659,6 +13670,302 @@ describe('Session 非容量失败通知按键去重 (上游 378f4a4)', () => {
     } finally {
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)
+    }
+  })
+})
+
+describe('Session 容量指纹换卡与开卡失败两级阶梯 (上游 378f4a4)', () => {
+  const jsonRes = (body: object): Response => new Response(JSON.stringify(body), {
+    headers: { 'Content-Type': 'application/json' },
+  })
+
+  const capacityMeta = (cardId: string, fingerprint?: string, code = 300305): any => ({
+    kind: 'api',
+    failure: {
+      cardId,
+      operation: 'addElement',
+      elementId: 'assistant_0',
+      code,
+      message: 'number of card components exceeds the limit',
+      ...(fingerprint === undefined ? {} : { capacityFingerprint: fingerprint }),
+    },
+  })
+
+  function capacitySession(name: string, cardId: string): { session: any; turn: any } {
+    const session = new Session(name, 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', `claude-${name}`)
+    const turn = turnState(cardId)
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(cardId, 1)
+    return { session, turn }
+  }
+
+  test('首次容量失败登记指纹并换卡;同一指纹再次到达不再烧预算', async () => {
+    const { session, turn } = capacitySession('fp-dedupe', 'card_fp_old')
+    try {
+      session.onCardWriteFailure(turn.cardId, 300305, capacityMeta(turn.cardId, 'fp-same-payload'))
+      expect(turn.cardCapacityFailures.get('fp-same-payload')).toBe(false)
+      expect(turn.failureRotateCount).toBe(1)
+      await turn.rotating
+      const newCardId = turn.cardId
+      expect(newCardId).not.toBe('card_fp_old')
+      expect(sentRawTexts).toHaveLength(0)
+
+      // 同一载荷在新卡上又被拒:不换卡、不递增预算,补一次用户通知
+      session.onCardWriteFailure(newCardId, 300305, capacityMeta(newCardId, 'fp-same-payload'))
+      expect(turn.failureRotateCount).toBe(1)
+      expect(turn.rotating).toBeNull()
+      expect(turn.cardId).toBe(newCardId)
+      expect(turn.cardCapacityFailures.get('fp-same-payload')).toBe(true)
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('仍超出飞书容量')
+      expect(sentRawTexts[0]).toContain('300305')
+      expect(sentRawTexts[0]).not.toContain('number of card components')
+      // 第三次同指纹:已经报过,不再重复通知
+      session.onCardWriteFailure(newCardId, 300305, capacityMeta(newCardId, 'fp-same-payload'))
+      expect(sentRawTexts).toHaveLength(1)
+      expect(turn.failureRotateCount).toBe(1)
+    } finally {
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('指纹未见的容量失败照旧换卡,不写容量记账', async () => {
+    const { session, turn } = capacitySession('fp-absent', 'card_fp_absent')
+    try {
+      session.onCardWriteFailure(turn.cardId, 300305, capacityMeta(turn.cardId))
+      expect(turn.cardCapacityFailures.size).toBe(0)
+      expect(turn.failureRotateCount).toBe(1)
+      await turn.rotating
+      expect(turn.cardId).not.toBe('card_fp_absent')
+    } finally {
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('换卡后旧卡留有非携带内容则清空容量记账', async () => {
+    const { session, turn } = capacitySession('retired-clear', 'card_retired_old')
+    try {
+      // 旧卡上已有定稿正文(非携带段):换卡后它留在旧卡 = 真实分页进度
+      session.appendAssistant('早已写好的段落')
+      session.finalizeCurrentAssistantSegment()
+      await cardkit.flush('card_retired_old')
+      expect(cardkit.getWrittenContentElementIds('card_retired_old')).toContain('assistant_0')
+
+      turn.cardCapacityFailures.set('fp-stale', false)
+      session.startMidTurnRotate(turn)
+      await turn.rotating
+
+      expect(turn.cardId).not.toBe('card_retired_old')
+      expect(turn.cardCapacityFailures.size).toBe(0)
+    } finally {
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('开新卡失败先暂停重试(旧卡仍可写);重试再失败才 give-up 止损', async () => {
+    const { session, turn } = capacitySession('rotate-open-fail', 'card_open_fail')
+    feishuMockState.sendCard = async () => null
+    try {
+      session.onCardWriteFailure(turn.cardId, 300305, capacityMeta(turn.cardId, 'fp-open-fail'))
+      await turn.rotating
+
+      // 一级:暂停 footer + 用户提示,旧卡不写死、不进入最终 give-up
+      expect(turn.cardRotationFailed).toBe(true)
+      expect(turn.rotateGivenUp).toBe(false)
+      expect(turn.footerStatusHandle).toBeNull()
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('再次尝试')
+      expect(sentRawTexts[0]).not.toContain('仅日志可见')
+      const before = calls.length
+      await cardkit.addElement('card_open_fail', {
+        tag: 'markdown', element_id: 'probe_still_writable', content: 'x',
+      })
+      expect(calls.length).toBeGreaterThan(before)
+
+      // 二级:重试仍失败 → 本地 give-up 止损(rotateGivenUp + markCardWriteDead)
+      session.startMidTurnRotate(turn)
+      await turn.rotating
+      expect(turn.rotateGivenUp).toBe(true)
+      expect(sentRawTexts).toHaveLength(2)
+      expect(sentRawTexts[1]).toContain('仅日志可见')
+      const after = calls.length
+      await cardkit.addElement('card_open_fail', {
+        tag: 'markdown', element_id: 'probe_dead', content: 'x',
+      })
+      expect(calls.length).toBe(after)
+    } finally {
+      feishuMockState.sendCard = null
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('cardRotationFailed 时无视元素软上限触发重试,成功后复位并可恢复 footer', async () => {
+    const { session, turn } = capacitySession('retry-soft-limit', 'card_retry_soft')
+    try {
+      // 元素数远低于软上限(1 < 50):只有 cardRotationFailed 分支能放行
+      expect(cardkit.getElementCount(turn.cardId)).toBeLessThan(50)
+      turn.cardRotationFailed = true
+      session.maybeMidTurnRotate()
+
+      expect(turn.rotating).not.toBeNull()
+      expect(turn.rotateCount).toBe(1)
+      await turn.rotating
+
+      expect(turn.cardId).not.toBe('card_retry_soft')
+      expect(turn.cardRotationFailed).toBe(false)
+      session.startThinkingFooter(turn)
+      expect(turn.footerStatusHandle).not.toBeNull()
+    } finally {
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('swap 同步点恢复 live buffer 并复位 cardRotationFailed;迁移窗口 delta 追加不丢', async () => {
+    const session = new Session('rotate-sync-carry', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-rotate-sync-carry')
+    const oldCardId = 'card_sync_old'
+    const newCardId = 'card_sync_new'
+    const turn = turnState(oldCardId)
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(oldCardId, 1)
+    turn.cardRotationFailed = true
+
+    let signalMigration: () => void = () => {}
+    const migrationStarted = new Promise<void>(resolve => { signalMigration = resolve })
+    let releaseMigration: () => void = () => {}
+    const migrationGate = new Promise<void>(resolve => { releaseMigration = resolve })
+    let migrationGated = false
+    // POST /elements 的元素体在 body.elements(JSON 字符串)里,不是顶层字段
+    const postedIds = (body: any): string[] => {
+      try {
+        return (JSON.parse(String(body?.elements ?? '[]')) as any[]).map(el => String(el?.element_id ?? ''))
+      } catch { return [] }
+    }
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      const body = init?.body ? JSON.parse(String(init.body)) : null
+      calls.push({ method, path, body })
+      if (path === '/cards/id_convert') return jsonRes({ code: 0, data: { card_id: newCardId } })
+      // 旧卡上先放一个"创建失败"的段 → 迁移循环会 await 重建它 = 迁移窗口
+      if (method === 'POST' && path === `/cards/${oldCardId}/elements` && postedIds(body).includes('assistant_0')) {
+        return jsonRes({ code: 300315, msg: 'elementID format error; code: 300301' })
+      }
+      if (
+        method === 'POST' && path === `/cards/${newCardId}/elements` &&
+        postedIds(body).some(id => id.startsWith('assistant_')) && !migrationGated
+      ) {
+        migrationGated = true
+        signalMigration()
+        await migrationGate
+      }
+      return jsonRes({ code: 0, data: {} })
+    }) as typeof fetch
+
+    try {
+      await cardkit.addElement(oldCardId, { tag: 'markdown', element_id: 'assistant_0', content: '旧卡坏段' })
+      expect(cardkit.isDeadElement(oldCardId, 'assistant_0')).toBe(true)
+      // 死段要有正文才进旧卡迁移循环(它是 swap 的 await 点 = 迁移窗口;
+      // 携带段本身会被循环跳过,所以必须另有一段)
+      turn.segmentTexts.set('assistant_0', '旧卡坏段')
+      turn.assistantSegmentCount = 1
+
+      session.appendAssistant('  前缀  ')
+      expect(turn.currentAssistantSegmentId).toBe('assistant_1')
+
+      session.startMidTurnRotate(turn)
+      await migrationStarted
+
+      // swap 已完成、迁移仍在 await:live buffer 必须已在同步区恢复(不是空),且未被 trim
+      expect(turn.cardId).toBe(newCardId)
+      expect(turn.currentAssistantSegmentId).not.toBeNull()
+      expect(turn.currentAssistantText).toBe('  前缀  ')
+      expect(turn.cardRotationFailed).toBe(false)
+
+      session.appendAssistant('增量')
+      releaseMigration()
+      await turn.rotating
+
+      expect(turn.currentAssistantText).toBe('  前缀  增量')
+      expect(turn.segmentTexts.get(turn.currentAssistantSegmentId)).toBe('  前缀  增量')
+    } finally {
+      releaseMigration()
+      if (turn.rotating) await turn.rotating.catch(() => {})
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(oldCardId)
+      await cardkit.dispose(newCardId)
+    }
+  })
+
+  test('finalizeCurrentAssistantSegment 与 closeTurnCard 无 suffix 路径各触发一次换卡重试', async () => {
+    const { session, turn } = capacitySession('retry-triggers', 'card_retry_finalize')
+    try {
+      turn.cardRotationFailed = true
+      session.finalizeCurrentAssistantSegment()
+      expect(turn.rotating).not.toBeNull()
+      expect(turn.rotateCount).toBe(1)
+      await turn.rotating
+      expect(turn.cardId).not.toBe('card_retry_finalize')
+    } finally {
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+
+    const { session: session2, turn: turn2 } = capacitySession('retry-triggers-close', 'card_retry_close')
+    try {
+      turn2.cardRotationFailed = true
+      const closing = session2.closeTurnCard()
+      expect(turn2.rotating).not.toBeNull()
+      await closing
+      expect(turn2.cardId).not.toBe('card_retry_close')
+    } finally {
+      if (turn2.rotating) await turn2.rotating
+      session2.stopFooterStatus(turn2)
+      await cardkit.dispose(turn2.cardId)
+    }
+  })
+
+  test('cardRotationFailed 暂停 footer 档位刷新与完成推送', async () => {
+    const { session, turn } = capacitySession('rotate-failed-guards', 'card_guard_failed')
+    try {
+      // 把 userOpenId 填上,否则推送被"没有发起人"这条无关理由挡住 —— 就测不出守卫
+      turn.userOpenId = 'ou_user'
+      turn.cardRotationFailed = true
+      session.startThinkingFooter(turn)
+      session.startWritingFooter(turn)
+      expect(turn.footerStatusHandle).toBeNull()
+
+      await session.closeTurnCard('done', { forcePush: true })
+      expect(urgentPushes).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+
+    // 正对照:同一路径在 cardRotationFailed 为假时仍然推送
+    const { session: session2, turn: turn2 } = capacitySession('rotate-guard-control', 'card_guard_ok')
+    try {
+      turn2.userOpenId = 'ou_user'
+      await session2.closeTurnCard('done', { forcePush: true })
+      expect(urgentPushes).toHaveLength(1)
+    } finally {
+      session2.stopFooterStatus(turn2)
+      await cardkit.dispose(turn2.cardId)
     }
   })
 })
