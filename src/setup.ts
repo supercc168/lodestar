@@ -424,6 +424,11 @@ export async function runSetup(): Promise<void> {
     '[runtime]',
     `projects_root = "${escapeTomlString(projectsRoot)}"`,
     '',
+    '[runtime.agent_auto_update]',
+    'codex = false',
+    'claude = false',
+    'dsh = false',
+    '',
   ]
   // GLM 走 [claude.models.glm] 档位路由(第三方 per-model token),SDK spawn 时
   // 注入 ANTHROPIC_BASE_URL + ANTHROPIC_AUTH_TOKEN,且只作用于 GLM 档位 —— 官方

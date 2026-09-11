@@ -47,6 +47,7 @@ import { ensureImagereadSkill } from './src/imageread-skill'
 import { startTasklistWorker, stopTasklistWorker } from './src/tasklist-worker'
 import { config } from './src/config'
 import { log } from './src/log'
+import { startAgentAutoUpdates } from './src/agent-updates'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
 import { checkPidGuard, writePidFile } from './src/pid-guard'
 import {
@@ -91,6 +92,8 @@ let shutdownRequested = false
 let shutdownPromise: Promise<void> | null = null
 let shutdownExitCode = 0
 let shutdownAliveSessionNames: string[] | null = null
+/** Agent 自动更新停止函数(上游 c55bb44 / D-06)。默认配置下是零定时器的 no-op。 */
+let stopAgentAutoUpdates: (() => void) | undefined
 const cleanup = () => {
   if (cleanupDone) return
   cleanupDone = true
@@ -119,6 +122,8 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
   shutdownExitCode = Math.max(shutdownExitCode, exitCode)
   if (shutdownPromise) return shutdownPromise
   shutdownRequested = true
+  // 清 Agent 自动更新定时器(幂等、不阻塞关停);默认关时是 no-op。
+  stopAgentAutoUpdates?.()
   // 同步封住准入(消息与卡片动作共用同一 per-key actor),再取动态工作快照;
   // 已准入的队尾仍可被 drain。
   chatActor.close()
@@ -1617,6 +1622,10 @@ async function boot(): Promise<void> {
   // Runs AFTER the WS is up so any 🔁 revive message lands in the
   // right chat instead of disappearing into the void.
   await reviveAliveSessions()
+
+  // Agent 自动更新(上游 c55bb44 / D-06):只挂定时器,不做任何主动检查或安装 ——
+  // 默认三开关全 false → 零定时器严格 no-op;只有显式 `true` 的 agent 才按 6h 节拍更新。
+  stopAgentAutoUpdates = startAgentAutoUpdates(log, { enabled: config.runtime.agent_auto_update })
 }
 
 boot().catch(e => {
