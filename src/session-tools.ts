@@ -223,6 +223,9 @@ export function completeTool(s: Session, source: AgentProcess, toolUseId: string
   // panels after this result lands.
   meta.output = output
   meta.isError = isError
+  // 开新卡失败(上游 378f4a4)时本轮会停在旧卡上等重试 —— 工具结果落地是
+  // 最稠密的内容事件,借它把重试推进一格,别干等模型吐新正文。
+  if (s.currentTurn.cardRotationFailed) s.maybeMidTurnRotate()
   const autoSendPath = autoSendPathFromToolResult(meta.name, output, isError)
   if (autoSendPath) s.sendOutboundPath(autoSendPath, meta.name)
   // AskUserQuestion already had its final panel painted by resolveAsk
@@ -306,8 +309,9 @@ export function rebuildToolsOnRotate(
   newCardId: string,
   oldToolByUseId: TurnState['toolByUseId'],
   oldBatches: TurnState['toolBatches'],
+  owner: TurnState | null = s.currentTurn,
 ): void {
-  const turn = s.currentTurn
+  const turn = owner
   if (!turn) return
   // 实时任务总览区的重建在 startMidTurnRotate 里(swap 后、assistant 重建前)
   // 已先于本函数完成 —— 这里搬过来的 tool insert_before taskLiveAnchor(turn)
