@@ -1,7 +1,8 @@
 import { describe, expect, test } from 'bun:test'
+import { agentRunCard } from './cards/agents'
 import { AgentService, type AgentServiceDeps } from './agent-service'
 import type { AgentIdentity, AgentIdentityCatalog } from './agent-identities'
-import type { AgentWorkerHandle, AgentWorkerResult } from './agent-runner'
+import { AgentWorkerFailure, type AgentWorkerHandle, type AgentWorkerResult } from './agent-runner'
 
 function identity(id: string, name = id): AgentIdentity {
   return {
@@ -197,6 +198,29 @@ describe('AgentService', () => {
     await service.cancelRun(root, parent.runId, 'stop tree')
     expect(service.getRun(root, parent.runId).status).toBe('completed')
     expect(service.getRun(root, child.runId).status).toBe('cancelled')
+  })
+
+  test('lands AgentWorkerFailure output as reason plus generated content on the card', async () => {
+    let reject!: (error: Error) => void
+    const { service, root } = harness({
+      startWorker: () => {
+        const done = new Promise<AgentWorkerResult>((_ok, fail) => { reject = fail })
+        queueMicrotask(() => reject(new AgentWorkerFailure(
+          new Error('delegated agent exited before result (code=1 signal=null)'), '已完成一半的正文', 'sid-partial',
+        )))
+        return { done, pendingInput: () => null, answer: () => {}, cancel: async () => {} }
+      },
+    })
+    const started = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'fail with output' })
+    const terminal = await waitFor(service, root, started.runId, 'failed')
+    expect(terminal.workers[0].status).toBe('failed')
+    expect(terminal.workers[0].output).toBe('已完成一半的正文')
+    expect(terminal.workers[0].error).toContain('exited before result')
+    const card = JSON.stringify(agentRunCard(terminal))
+    expect(card).toContain('失败原因')
+    expect(card).toContain('已生成的内容')
+    expect(card).toContain('已完成一半的正文')
+    expect(card.indexOf('失败原因')).toBeLessThan(card.indexOf('已生成的内容'))
   })
 
   test('marks interrupted durable runs failed on daemon restart', () => {

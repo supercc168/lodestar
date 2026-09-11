@@ -1,6 +1,6 @@
-import { describe, expect, spyOn, test } from 'bun:test'
+import { describe, expect, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
-import { collectAgentTurn, startAgentWorker } from './agent-runner'
+import { AgentWorkerFailure, collectAgentTurn, startAgentWorker } from './agent-runner'
 import { rememberAgentSession, isAgentSession, resetAgentSessionRegistryForTest } from './agent-session-registry'
 
 class FakeProcess extends EventEmitter {
@@ -29,39 +29,68 @@ class FakeProcess extends EventEmitter {
 }
 
 describe('full delegated Agent runner', () => {
-  test('capacity backoff pauses the watchdog, reports progress and stays out of the agent output', async () => {
-    const timers = new Map<number, number>()
-    let nextId = 100_000
-    const timeout = spyOn(globalThis, 'setTimeout').mockImplementation(((_callback: () => void, delay: number) => {
-      const id = nextId++
-      timers.set(id, delay)
-      return id as unknown as ReturnType<typeof setTimeout>
-    }) as typeof setTimeout)
-    const clear = spyOn(globalThis, 'clearTimeout').mockImplementation(((id: number) => { timers.delete(id) }) as typeof clearTimeout)
+  // D-14:30 分钟会话超时与 2M 输出上限已删,容量退避只报进度、不布防看门狗。
+  test('capacity backoff reports progress and stays out of the agent output', async () => {
     const proc = new FakeProcess() as any
     proc.provider = 'codex'
     const progress: any[] = []
     const handle = collectAgentTurn(proc, 'do work', { onProgress: step => progress.push(step) }, () => {})
-    try {
-      expect([...timers.values()]).toEqual([30 * 60 * 1000])
-      const retry = { phase: 'waiting', attempt: 1, delayMs: 60_000, message: 'Selected model is at capacity' }
-      proc.emit('turn_retry', retry)
-      expect(timers.size).toBe(0)
-      expect(proc.alive).toBe(true)
-      expect(progress.at(-1).detail).toContain(retry.message)
-      expect(progress.at(-1).detail).toContain('60s 后重试 #1')
-      proc.emit('turn_retry', { ...retry, phase: 'retrying', delayMs: 0 })
-      expect([...timers.values()]).toEqual([30 * 60 * 1000])
-      proc.emit('assistant_text', { text: 'finished', parentToolUseId: null })
-      proc.emit('result', { is_error: false })
-      await expect(handle.done).resolves.toMatchObject({ output: 'finished' })
-      expect(timers.size).toBe(0)
-      expect(proc.listenerCount('turn_retry')).toBe(0)
-    } finally {
-      await handle.cancel()
-      timeout.mockRestore()
-      clear.mockRestore()
-    }
+    const retry = { phase: 'waiting', attempt: 1, delayMs: 60_000, message: 'Selected model is at capacity' }
+    proc.emit('turn_retry', retry)
+    expect(progress.at(-1).detail).toContain(retry.message)
+    expect(progress.at(-1).detail).toContain('60s 后重试 #1')
+    proc.emit('turn_retry', { ...retry, phase: 'retrying', delayMs: 0 })
+    expect(progress.at(-1).detail).toBe('正在重试 #1')
+    proc.emit('assistant_text', { text: 'finished', parentToolUseId: null })
+    proc.emit('result', { is_error: false })
+    await expect(handle.done).resolves.toMatchObject({ output: 'finished', outputTruncated: false })
+    expect(proc.listenerCount('turn_retry')).toBe(0)
+  })
+
+  test('no longer truncates output at a fixed cap', async () => {
+    const proc = new FakeProcess() as any
+    const handle = collectAgentTurn(proc, 'long', {}, () => {})
+    const chunk = 'x'.repeat(700_000)
+    for (let i = 0; i < 3; i++) proc.emit('assistant_text', { text: chunk, parentToolUseId: null })
+    proc.emit('result', { is_error: false })
+    const result = await handle.done
+    expect(result.output.length).toBe(2_100_000)
+    expect(result.outputTruncated).toBe(false)
+    expect(result.output).not.toContain('truncated at')
+  })
+
+  test('failure preserves output produced before the error', async () => {
+    const proc = new FakeProcess() as any
+    const handle = collectAgentTurn(proc, 'fail late', {}, () => {})
+    proc.emit('assistant_text', { text: '已完成一半的正文', parentToolUseId: null })
+    proc.emit('result', { is_error: true, error: 'exit code=1' })
+    const failure = await handle.done.then(() => null, error => error)
+    expect(failure).toBeInstanceOf(AgentWorkerFailure)
+    expect(failure.name).toBe('AgentWorkerFailure')
+    expect(failure.message).toContain('exit code=1')
+    expect(failure.output).toBe('已完成一半的正文')
+    expect(failure.sessionId).toBe('sid-1')
+  })
+
+  test('cancel preserves output produced before cancellation', async () => {
+    const proc = new FakeProcess() as any
+    const handle = collectAgentTurn(proc, 'cancel late', {}, () => {})
+    proc.emit('assistant_text', { text: '部分结果', parentToolUseId: null })
+    const cancelling = handle.cancel('stop now')
+    const failure = await handle.done.then(() => null, error => error)
+    expect(failure).toBeInstanceOf(AgentWorkerFailure)
+    expect(failure.message).toBe('stop now')
+    expect(failure.output).toBe('部分结果')
+    await cancelling
+  })
+
+  test('handle exposes isAlive for cancel-after-settle decisions', async () => {
+    const proc = new FakeProcess() as any
+    const handle = collectAgentTurn(proc, 'alive', {}, () => {})
+    expect(handle.isAlive?.()).toBe(true)
+    proc.emit('result', { is_error: false })
+    await handle.done
+    expect(handle.isAlive?.()).toBe(false)
   })
 
   test('auto-allows ordinary permissions but pauses and resumes exact input requests', async () => {
@@ -122,8 +151,13 @@ describe('full delegated Agent runner', () => {
     const proc = new FakeProcess() as any
     proc.sessionId = null
     const handle = collectAgentTurn(proc, 'no id', {}, () => {})
+    proc.emit('assistant_text', { text: '有正文但无会话号', parentToolUseId: null })
     proc.emit('result', { is_error: false })
-    await expect(handle.done).rejects.toThrow(/without a native session id/)
+    const failure = await handle.done.then(() => null, error => error)
+    expect(failure).toBeInstanceOf(AgentWorkerFailure)
+    expect(failure.message).toMatch(/without a native session id/)
+    expect(failure.output).toBe('有正文但无会话号')
+    expect(failure.sessionId).toBeNull()
   })
 
   test('dsh 会话与 codex 同样用 lastCompletedTurnId 作 fork 锚点', async () => {
