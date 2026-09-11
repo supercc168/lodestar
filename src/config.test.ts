@@ -253,6 +253,76 @@ describe('runtime live_elapsed', () => {
   })
 })
 
+describe('runtime agent_auto_update(上游 659dddb)', () => {
+  test('缺省三开关全 false(默认关,D-06)', () => {
+    const result = loadFreshConfig()
+    expect(result.exitCode).toBe(0)
+    expect(result.stderr).toBe('')
+    expect(JSON.parse(result.stdout).runtime.agent_auto_update).toEqual({ codex: false, claude: false, dsh: false })
+  })
+
+  test('[runtime.agent_auto_update] 按 codex/claude/dsh 独立解析', () => {
+    const result = loadFreshConfig(`
+      [runtime.agent_auto_update]
+      codex = true
+      claude = false
+      dsh = true
+    `)
+    expect(result.exitCode).toBe(0)
+    expect(result.stderr).toBe('')
+    expect(JSON.parse(result.stdout).runtime.agent_auto_update).toEqual({ codex: true, claude: false, dsh: true })
+  })
+
+  test('旧标量形态按原值迁移为三个开关并提示改用节形态', () => {
+    const on = loadFreshConfig(`
+      [runtime]
+      agent_auto_update = true
+    `)
+    expect(on.exitCode).toBe(0)
+    expect(JSON.parse(on.stdout).runtime.agent_auto_update).toEqual({ codex: true, claude: true, dsh: true })
+    expect(on.stderr).toContain('agent_auto_update')
+
+    const off = loadFreshConfig(`
+      [runtime]
+      agent_auto_update = false
+    `)
+    expect(off.exitCode).toBe(0)
+    expect(JSON.parse(off.stdout).runtime.agent_auto_update).toEqual({ codex: false, claude: false, dsh: false })
+  })
+
+  test('未知 agent 名报错,不静默忽略', () => {
+    const result = loadFreshConfig(`
+      [runtime.agent_auto_update]
+      codex = true
+      gemini = true
+    `)
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('unknown [runtime.agent_auto_update] Agent')
+    expect(result.stderr).toContain('gemini')
+  })
+
+  test('节形态与旧标量同时出现即互斥报错', () => {
+    const result = loadFreshConfig(`
+      [runtime]
+      agent_auto_update = true
+
+      [runtime.agent_auto_update]
+      codex = true
+    `)
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('cannot be combined')
+  })
+
+  test('非法布尔值报错', () => {
+    const result = loadFreshConfig(`
+      [runtime.agent_auto_update]
+      codex = yes
+    `)
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('[runtime.agent_auto_update].codex must be true or false')
+  })
+})
+
 describe('configured project paths', () => {
   test('resolves relative projects_root and project cwd values to absolute paths', () => {
     const root = mkdtempSync(join(tmpdir(), 'lodestar-config-paths-'))
