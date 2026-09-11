@@ -338,7 +338,12 @@ export function isDeadElement(cardId: string, elementId: string): boolean {
  * was lost/raced. Allow one checked PUT reconciliation against that id.
  * (上游 4185808) */
 export function clearDeadElementForReconcile(cardId: string, elementId: string): void {
-  cards.get(cardId)?.deadElements.delete(elementId)
+  const s = cards.get(cardId)
+  s?.deadElements.delete(elementId)
+  // 对账 = 「可能其实落了」:失败可恢复标记同样清掉,否则三态里仍被判为
+  // 失败元素(上游 378f4a4)。
+  s?.failedAdds.delete(elementId)
+  s?.failedReplacements.delete(elementId)
 }
 
 /** Stop all future writes to this card. Idempotent; cleared only by
@@ -361,6 +366,15 @@ function nextSeq(cardId: string): number {
 
 function markElementDead(s: CardState, elementId: string): void {
   s.deadElements.add(elementId)
+}
+
+/** 三态判定(上游 378f4a4):显式删除/永久失效 = 已标 dead 且不在「失败可
+ * 恢复」的两个集合里。失败的 add(有 placement 可重建)与失败的 PUT(可重试)
+ * 都不算删除,后续写入必须放行;只有真正删除过的元素才彻底短路。 */
+function isElementDeleted(s: CardState, elementId: string): boolean {
+  return s.deadElements.has(elementId)
+    && !s.failedAdds.has(elementId)
+    && !s.failedReplacements.has(elementId)
 }
 
 /** 对元素 payload 做稳定序列化后取哈希(上游 378f4a4):剥掉所有层级的
@@ -643,6 +657,13 @@ export function addElement(
   const safeElement = neutralizeMarkdownImagesInCard(element)
   const elementId = (safeElement as { element_id?: string }).element_id
   const fingerprint = contentFingerprint(safeElement)
+  // 失败可恢复(上游 378f4a4):保留原始 placement,后续同 id 的更新才能用
+  // 最新内容在原位重建,而不是 PUT 一个远端不存在的幽灵元素。
+  const missing = () => {
+    if (!elementId) return
+    markElementDead(s, elementId)
+    s.failedAdds.set(elementId, opts)
+  }
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `addElement`,
@@ -663,19 +684,24 @@ export function addElement(
       // footer 每秒重写,登记进去「同一内容」就永不稳定(上游 378f4a4)。
       if (elementId !== FOOTER_ELEMENT_ID) s.contentFingerprints.set(elementId ?? `#${seq}`, fingerprint)
       // 落地即清 stale dead 标记:同 id 重投成功后,后续 replace/delete
-      // 不再被上一次失败的墓碑短路(上游 4185808)。
-      if (elementId) s.deadElements.delete(elementId)
+      // 不再被上一次失败的墓碑短路(上游 4185808);失败可恢复标记同步清掉。
+      if (elementId) {
+        s.deadElements.delete(elementId)
+        s.failedAdds.delete(elementId)
+        s.failedReplacements.delete(elementId)
+      }
       // Real content landed — clear any prior failure-rotate streak.
       s.onSuccess?.()
     },
     (code, meta) => {
       // Add rejected ⇒ this element_id does not exist on Feishu's side.
       // Mark it dead so subsequent replace/delete aimed at it
-      // short-circuit instead of spraying 300313/300121. Then forward the
-      // structured failure: session rotates only a confirmed capacity
-      // error; validation/content failures keep the current card and
-      // preserve this element as dead (上游 4185808).
-      if (elementId) markElementDead(s, elementId)
+      // short-circuit instead of spraying 300313/300121, but keep its
+      // placement so a later update can rebuild it (上游 378f4a4 三态).
+      // Then forward the structured failure: session rotates only a
+      // confirmed capacity error; validation/content failures keep the
+      // current card (上游 4185808).
+      missing()
       onFailure?.(code, meta)
     },
     { meta: { elementId, targetElementId: opts.targetElementId, contentFingerprint: fingerprint } },
@@ -705,34 +731,60 @@ export function replaceElement(
   // terminal footer writers can fall back to raw text. notifyCardFailure
   // false 让对账类 probe PUT(duplicate-id reconcile)也不上抬(上游 4185808)。
   const elevateCardFailure = elementId !== FOOTER_ELEMENT_ID && opts.notifyCardFailure !== false
-  if (s.closing || s.writeDead || s.deadElements.has(elementId)) {
+  if (s.closing || s.writeDead || isElementDeleted(s, elementId)) {
     onFailure?.()
     return Promise.resolve()
   }
   const safeElement = neutralizeMarkdownImagesInCard(element)
   const fingerprint = contentFingerprint(safeElement)
+  // 失败可恢复(上游 378f4a4 三态):记 failedReplacements,同 id 的后续写入
+  // 可重试;被显式删除的元素不会被这条误放行(isElementDeleted 仍为真)。
+  const rejected = () => {
+    markElementDead(s, elementId)
+    s.failedReplacements.add(elementId)
+  }
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `replaceElement ${elementId}`,
     async () => {
-      if (s.writeDead || s.deadElements.has(elementId)) {
+      if (s.writeDead) {
+        onFailure?.()
+        return
+      }
+      // 失败过的 add 用最新内容在原 placement 重建(POST),其余走 PUT;
+      // 显式删除过的元素到这里短路。
+      const missing = s.failedAdds.get(elementId)
+      if (isElementDeleted(s, elementId)) {
         onFailure?.()
         return
       }
       const seq = nextSeq(cardId)
-      await call('PUT', `/cards/${cardId}/elements/${elementId}`, {
-        element: JSON.stringify(safeElement),
-        sequence: seq,
-      })
-      // 覆盖成功即刷新指纹(同一元素的最新正文才是「已写入内容」)。
+      if (missing) {
+        await call('POST', `/cards/${cardId}/elements`, {
+          type: missing.type ?? 'append',
+          ...(missing.targetElementId ? { target_element_id: missing.targetElementId } : {}),
+          elements: JSON.stringify([safeElement]),
+          sequence: seq,
+        })
+        s.elementCount += 1
+      } else {
+        await call('PUT', `/cards/${cardId}/elements/${elementId}`, {
+          element: JSON.stringify(safeElement),
+          sequence: seq,
+        })
+      }
+      s.deadElements.delete(elementId)
+      s.failedAdds.delete(elementId)
+      s.failedReplacements.delete(elementId)
       if (elementId !== FOOTER_ELEMENT_ID) s.contentFingerprints.set(elementId, fingerprint)
     },
     (code, meta) => {
       // 工具已完成不代表结果已写入。升群告警的容量失败要标 dead，换卡时把
-      // 最新结果搬到新卡。公式增强等隔离 PUT(notifyCardFailure:false) 保留
-      // 原元素可写，raw LaTeX 继续可见（上游 9493684）。
+      // 最新结果搬到新卡；同时记失败可恢复,允许同 id 重试。公式增强等隔离
+      // PUT(notifyCardFailure:false) 保留原元素可写，raw LaTeX 继续可见
+      // （上游 9493684 判定拆分 + 378f4a4 三态）。
       if (elevateCardFailure && isCardCapacityFailure(code, meta?.failure)) {
-        markElementDead(s, elementId)
+        rejected()
       }
       onFailure?.(code, meta)
     },
@@ -753,7 +805,9 @@ export async function replaceElementChecked(
 ): Promise<boolean> {
   if (disposedCards.has(cardId)) return false
   const s = state(cardId)
-  if (s.closing || s.writeDead || s.deadElements.has(elementId)) return false
+  // 三态(上游 378f4a4):只有显式删除/永久失效才短路;失败可恢复的元素
+  // 仍走真实写入,由返回值反映最新成功态。
+  if (s.closing || s.writeDead || isElementDeleted(s, elementId)) return false
   let failed = false
   await replaceElement(
     cardId,
@@ -762,7 +816,7 @@ export async function replaceElementChecked(
     () => { failed = true },
     { notifyCardFailure: opts.notifyCardFailure !== false },
   )
-  return !failed && !s.writeDead && !s.deadElements.has(elementId)
+  return !failed && !s.writeDead && !isElementDeleted(s, elementId)
 }
 
 export async function addElementChecked(
@@ -785,7 +839,9 @@ export async function addElementResult(
   let failure: CardWriteFailure | undefined
   await addElement(cardId, element, opts, (_code, meta) => { failure = meta?.failure })
   return {
-    landed: !failure && !s.writeDead && !(elementId && s.deadElements.has(elementId)),
+    // 失败可恢复的元素不算永久 false:真实结果由 failure / 三态决定
+    // (上游 378f4a4)。
+    landed: !failure && !s.writeDead && !(elementId && isElementDeleted(s, elementId)),
     ...(failure ? { failure } : {}),
   }
 }
@@ -798,19 +854,25 @@ export function deleteElement(
 ): Promise<void> {
   if (disposedCards.has(cardId)) return Promise.resolve()
   const s = state(cardId)
-  if (s.closing || s.writeDead || s.deadElements.has(elementId)) return Promise.resolve()
+  if (s.closing || s.writeDead) return Promise.resolve()
+  // 三态(上游 378f4a4):失败过的元素仍要真实 DELETE,否则远端旧内容
+  // 永远留在卡上;只有真正删除过的元素才短路。
+  if (isElementDeleted(s, elementId)) return Promise.resolve()
   s.queue = s.queue.then(() => withReopenOnStreamingClosed(
     cardId,
     `deleteElement ${elementId}`,
     async () => {
-      if (s.writeDead || s.deadElements.has(elementId)) return
+      if (s.writeDead || isElementDeleted(s, elementId)) return
       const seq = nextSeq(cardId)
       await call('DELETE', `/cards/${cardId}/elements/${elementId}`, {
         sequence: seq,
       })
       s.elementCount = Math.max(0, s.elementCount - 1)
-      // 删除即退出「已写入正文」:换卡/指纹不得再把远端已删元素算进来。
+      // 删除 = 与指纹/失败标记彻底脱钩:迟到的 replace/add 不得复活该元素
+      // (上游 378f4a4)。
       s.contentFingerprints.delete(elementId)
+      s.failedAdds.delete(elementId)
+      s.failedReplacements.delete(elementId)
       markElementDead(s, elementId)
     },
     onFailure,
@@ -823,10 +885,10 @@ export async function deleteElementChecked(cardId: string, elementId: string): P
   if (disposedCards.has(cardId)) return false
   const s = state(cardId)
   if (s.closing || s.writeDead) return false
-  if (s.deadElements.has(elementId)) return true
+  if (isElementDeleted(s, elementId)) return true
   let failed = false
   await deleteElement(cardId, elementId, () => { failed = true })
-  return !failed && s.deadElements.has(elementId)
+  return !failed && isElementDeleted(s, elementId)
 }
 
 /** Throttled card-summary update. The summary text is what Feishu shows
