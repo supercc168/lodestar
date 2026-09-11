@@ -71,7 +71,11 @@ function defaultReply(method: string): any {
   }
 }
 
-mock.module('./dsh-runtime', () => ({ DshRuntime: FakeDshRuntime }))
+// 替身只换 DshRuntime 类,须保留模块的其余导出:mock.module 在 bun test 的
+// 单进程里跨文件生效,而 session.ts(03-03 起)会 import 同模块的 queryDshRuntime,
+// 少一个导出会让 session.test.ts 在整包跑时以 SyntaxError 崩掉。
+const actualDshRuntime = await import('./dsh-runtime')
+mock.module('./dsh-runtime', () => ({ ...actualDshRuntime, DshRuntime: FakeDshRuntime }))
 const { DshProcess } = await import('./dsh-process')
 
 type DshSpawnOptions = ConstructorParameters<typeof DshProcess>[0]

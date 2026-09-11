@@ -37,16 +37,14 @@ mock.module('./dsh-process', () => ({
     constructor(opts: any) { this.opts = opts }
   },
 }))
-mock.module('./dsh-runtime', () => {
-  const actual = require('./dsh-runtime') as typeof import('./dsh-runtime')
-  return {
-    ...actual,
-    queryDshRuntime: async (_opts: any, method: string, params: any = {}) => {
-      dshCatalogQueries.push({ method, params })
-      return dshCatalogRows
-    },
-  }
-})
+const actualDshRuntime = await import('./dsh-runtime')
+mock.module('./dsh-runtime', () => ({
+  DshRuntime: actualDshRuntime.DshRuntime,
+  queryDshRuntime: async (_opts: any, method: string, params: any = {}) => {
+    dshCatalogQueries.push({ method, params })
+    return dshCatalogRows
+  },
+}))
 
 const {
   Session,

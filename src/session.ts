@@ -35,7 +35,11 @@ import {
   type TurnPlanUpdated,
 } from './codex-process'
 import { codexModelIsApiRoute, codexModelRequiresOpenaiAuth } from './codex-models'
-import { resolveCodexSpawnOverrides, resolveUsageSource } from './token-source'
+import { resolveCodexSpawnOverrides, resolveTokenSource, resolveUsageSource } from './token-source'
+import { DSH_DEFAULT_BASE_URL, DSH_DISPLAY_NAME } from './token-source-dsh'
+import { queryDshRuntime } from './dsh-runtime'
+import { DshProcess } from './dsh-process'
+import { isAgentSession } from './agent-session-registry'
 import {
   validateConversationLaunch,
   type ConversationBranchBase,
@@ -50,6 +54,7 @@ import {
   CLAUDE_EFFORT,
   agentProviderLabel,
   isClaudeReasoningEffort,
+  isDshReasoningEffort,
   type AgentProcess,
   type AgentProvider,
   type AgentReasoningEffort,
@@ -58,6 +63,7 @@ import {
   type ClaudeReasoningEffort,
   type CodexUserTextSettlement,
   type CollabAgentStates,
+  type DshReasoningEffort,
   type UserTextDispatch,
 } from './agent-process'
 import {
@@ -79,7 +85,7 @@ import { log } from './log'
 import { readSysInfo } from './sysinfo'
 import { readUsage, updateUsageFromRateLimits, peekUsage, type UsageSnapshot } from './usage'
 import { readGlmUsage, type GlmUsageSnapshot } from './glm-usage'
-import { readClaudeProviderUsage, type ClaudeProviderUsageSnapshot } from './claude-provider-usage'
+import { readClaudeProviderUsage, readDeepseekBalance, type ClaudeProviderUsageSnapshot } from './claude-provider-usage'
 import {
   contextLimitFromAppServer,
   contextTokensFromUsage,
@@ -1545,6 +1551,19 @@ export class Session {
       : CLAUDE_EFFORT
   }
 
+  /** DSH 档位解析(上游 dshEffortForSpawn 的本地形态):词表是 DSH 自己的
+   *  off/low/high/max,数据源是 `[deepseek-harness]` 配置段(本地无上游的
+   *  token source `models[]` 目录,不在这里查询子进程目录)。两处都取不到即
+   *  **抛错**:绝不静默回落到 Codex 的 max(那会让 DSH 子进程拿到非法档位)。 */
+  dshEffortForSpawn(provider: AgentProvider = this.selectedProvider): DshReasoningEffort {
+    if (provider === 'dsh' && this.selectedProvider === provider && isDshReasoningEffort(this.selectedEffort)) {
+      return this.selectedEffort
+    }
+    const configured = config.deepseek_harness?.effort
+    if (isDshReasoningEffort(configured)) return configured
+    throw new Error('DSH model reasoning effort is unavailable')
+  }
+
   currentModelLabel(): string | null {
     return this.selectedModel ?? this.proc?.lastModel ?? null
   }
@@ -1692,6 +1711,21 @@ export class Session {
     })
   }
 
+  /** Query DSH history without attaching the catalog process to this Session.
+   *  只读目录查询每次自行 spawn 并 reap(slim 层无常驻 runtime);lodestar 自己
+   *  派发的委派会话不进用户的 rs 历史列表。 */
+  async listDshConversations(): Promise<ConversationSummary[]> {
+    if (this.selectedProvider !== 'dsh') throw new Error('DSH history requested under a different provider')
+    const source = resolveTokenSource('dsh', this.modelForSpawn('dsh'))
+    if (!source.enabled()) throw new Error('DSH token source is unavailable')
+    const rows: ConversationSummary[] = await queryDshRuntime({
+      cwd: this.workDir,
+      env: source.spawnEnv(process.env),
+      profile: { loadProjectMcp: false },
+    }, 'session/list', { cwd: this.workDir })
+    return rows.filter(row => !isAgentSession('dsh', row.sessionId))
+  }
+
   /** Query Codex history without attaching the catalog process to this Session. */
   async listCodexConversations(): Promise<ConversationSummary[]> {
     if (this.selectedProvider !== 'codex') throw new Error('Codex history requested for a non-Codex session')
@@ -1831,6 +1865,25 @@ export class Session {
         appendSystemPrompt: this.spawnDeveloperInstructions(),
         profile: feishu.projectProfile(feishu.tempProjectName(this.sessionName) ?? this.sessionName),
         hostEnv,
+      })
+    }
+    // DSH 原生后端(上游 722e45a 的构造分支本地形态):凭据与档位同出
+    // `[deepseek-harness]` 段,经 TokenSource.spawnEnv 注入子进程。源缺失/未启用
+    // 即 fail closed —— 绝不落到下面的 codex fallthrough(那会把 dsh 档位当作
+    // Codex 跑,错误后端且凭据语义不符)。claude 分支与 codex fallthrough 逐字不动。
+    if (provider === 'dsh') {
+      const source = resolveTokenSource('dsh', this.modelForSpawn(provider))
+      if (!source.enabled()) throw new Error('DSH token source is unavailable')
+      return new DshProcess({
+        workDir: this.workDir,
+        tokenSourceId: source.id,
+        model: this.modelForSpawn(provider) ?? source.selectionModel,
+        effort: this.dshEffortForSpawn(provider),
+        launch,
+        developerInstructions: this.spawnDeveloperInstructions(),
+        profile: feishu.projectProfile(feishu.tempProjectName(this.sessionName) ?? this.sessionName),
+        hostEnv,
+        transformEnv: base => source.spawnEnv(base),
       })
     }
     // spawn 覆盖走 TokenSource 适配层(D-02 slim:上游 registry 段换写,注入形态零变);
@@ -3520,7 +3573,22 @@ export class Session {
     } else if (opts.usageSource === 'codex') {
       opts.usage = await readUsage(opts.model)
     } else if (opts.usageSource === 'provider' && opts.model) {
-      opts.providerUsage = await readClaudeProviderUsage(opts.model)
+      // DSH 与 claude 的 provider 余额是两个互不相读的凭据面(D-08 双轨):
+      // dsh 读 `[deepseek-harness]` 并打 DeepSeek /user/balance,绝不落到
+      // claude profile 查询(那会拿 claude:<key> 的 token 去问别的渠道)。
+      if (opts.provider === 'dsh') {
+        const section = config.deepseek_harness
+        const displayName = section?.display?.trim() || DSH_DISPLAY_NAME
+        opts.providerUsage = section?.api_key?.trim()
+          ? await readDeepseekBalance(
+            section.base_url?.trim() || DSH_DEFAULT_BASE_URL,
+            section.api_key.trim(),
+            displayName,
+          )
+          : { state: 'no_credentials', providerName: displayName }
+      } else {
+        opts.providerUsage = await readClaudeProviderUsage(opts.model)
+      }
     }
     await cardkit.replaceElement(cardId, cards.ELEMENTS.consoleUsage, cards.consoleUsageElement(opts))
   }
@@ -3808,7 +3876,9 @@ export class Session {
       return await this.rejectHumanDelivery(context)
     }
     if (dispatch.kind === 'queued') {
-      if (context.proc.provider !== 'claude') {
+      // claude 与 dsh 都是 fire-and-forget 投递(无 settlement):
+      // 所有权/存活校验后即 commit。
+      if (context.proc.provider !== 'claude' && context.proc.provider !== 'dsh') {
         log(`session "${this.sessionName}": reject mismatched queued dispatch from ${context.proc.provider}`)
         return await this.rejectHumanDelivery(context)
       } else if (!this.humanDeliveryStillOwnsTurn(context)) {
@@ -4406,10 +4476,10 @@ export class Session {
       return 'rejected'
     }
     if (dispatch.kind === 'queued') {
-      // Claude:sendUserText 是 fire-and-forget(push 到 SDK input 队列),无 settlement
-      // 同步点。校验所有权一致即视为 accepted;turn 卡已由 openTurnCard 开好,内容由后续
-      // turn_started / assistant_text 事件填充。
-      if (proc.provider !== 'claude') {
+      // Claude / DSH:sendUserText 是 fire-and-forget(push 到 SDK / JSON-RPC 输入
+      // 队列),无 settlement 同步点。校验所有权一致即视为 accepted;turn 卡已由
+      // openTurnCard 开好,内容由后续 turn_started / assistant_text 事件填充。
+      if (proc.provider !== 'claude' && proc.provider !== 'dsh') {
         log(`session "${this.sessionName}": system dispatch unexpected queued from ${proc.provider}`)
         return 'rejected'
       }
@@ -5283,7 +5353,8 @@ export class Session {
       })()
     })
     p.on('scheduled_turn_input', ({ text, promptId }: { text: string; promptId: string | null }) => {
-      if (p.provider !== 'claude') return
+      // claude 与 dsh 都上报调度轮输入;codex 走自己的 receipt 路径。
+      if (p.provider !== 'claude' && p.provider !== 'dsh') return
       this.startScheduledTurnCard(p, text, promptId)
     })
     p.on('conversation_materialized', ({ session_id: sessionId, source }: { session_id: string; source: string }) => {
@@ -6013,9 +6084,10 @@ export class Session {
 
   /** Current context-window occupancy. Claude 路径直接读 SDK modelUsage 算好
    * 的输入侧占用(proc.lastContextTokens = input+cache_read+cache_creation,
-   * 不含 output);Codex 路径继续用 lastUsage.total_tokens。 */
+   * 不含 output);DSH 同语义(原生 usage 的输入侧占用)。Codex 路径继续用
+   *  lastUsage.total_tokens。 */
   private currentContextTokens(): number | null {
-    if (this.proc?.provider === 'claude') {
+    if (this.proc?.provider === 'claude' || this.proc?.provider === 'dsh') {
       return this.proc?.lastContextTokens ?? null
     }
     const u = this.proc?.lastUsage as CodexUsage | null | undefined
