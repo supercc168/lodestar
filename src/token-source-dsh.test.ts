@@ -1,9 +1,9 @@
 /**
  * DeepSeek Harness 凭据层单测(03-02 Task 2,上游 722e45a 的本地 slim 重写)。
  *
- * 上游同名文件断言的是 registry 工厂形态(`tokenSourceFactories()` / `refreshModels()`)。
- * 本地 token-source 是函数式 slim 适配层(项目铁律:不得引入 [token_source.*] 注册表),
- * 故本文件断言的是 `dshSourceFromConfig()` 这一个纯工厂的凭据面:
+ * 上游同名文件断言的是工厂注册与目录拉取形态。本地 token-source 是函数式 slim
+ * 适配层(项目铁律:不得引入 [token_source.*] 注册表、双层 model 面板、source 级
+ * 目录刷新),故本文件断言的是 `dshSourceFromConfig()` 这一个纯工厂的凭据面:
  * env 清洗顺序 → 注入 → 门控 → 余额通道。不 spawn 任何子进程、不打真实网络。
  */
 import { afterEach, describe, expect, test } from 'bun:test'

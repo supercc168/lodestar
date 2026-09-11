@@ -109,6 +109,29 @@ export interface LodestarConfig {
    * skill/wrapper when they need a bitmap. See `src/imagegen-skill.ts`.
    */
   imagegen: ImagegenConfig
+  /** `[deepseek-harness]` —— DSH 原生后端(provider 'dsh')自己的账号段。
+   *  与 `[claude.models.deepseek]`(双轨过渡 D-08 的 Claude 兼容 deepseek 档)
+   *  是两条互不相读的路径:本段只被 provider === 'dsh' 的代码读取
+   *  (src/token-source-dsh.ts),claude 兼容档的读路径(src/claude-models.ts)
+   *  不读本段;反之 dsh 也不读 `[claude.models.*]`。缺段为 undefined,
+   *  不写任何默认凭据。 */
+  deepseek_harness?: DeepseekHarnessConfig
+}
+
+/** `[deepseek-harness]` 账号段(ND-03 本地定形,全标量,parseToml 语义内)。 */
+export interface DeepseekHarnessConfig {
+  /** 飞书展示名;缺省 'DeepSeek Harness'。 */
+  display?: string
+  /** 唯一启用凭据:缺失即 enabled() 为假,spawn 前置门拒绝。 */
+  api_key?: string
+  /** DSH 官方端点;缺省 https://api.deepseek.com。 */
+  base_url?: string
+  /** DSH 原生模型名(如 deepseek-v4-pro,不带 [1m] 后缀语义)。 */
+  model?: string
+  /** DSH 档位词表 off/low/high/max 之一;缺省由目录默认档兜底。 */
+  effort?: string
+  /** 逃生阀:DSH 子进程用的 node 可执行文件 → LODESTAR_DSH_NODE。 */
+  bin?: string
 }
 
 /** `[imagegen]` — optional independent Images API channel. */
@@ -362,6 +385,19 @@ function loadConfig(): LodestarConfig {
     }
     return out
   }
+  // [deepseek-harness] 可选 —— DSH 原生后端自己的账号段(与 [claude.models.deepseek]
+  // 互不相读,见 DeepseekHarnessConfig)。缺段返回 undefined;段内空标量忽略。
+  const deepseekHarnessSection = (): DeepseekHarnessConfig | undefined => {
+    const section = t['deepseek-harness']
+    if (!section) return undefined
+    const out: DeepseekHarnessConfig = {}
+    for (const field of ['display', 'api_key', 'base_url', 'model', 'effort', 'bin'] as const) {
+      const value = section[field]
+      if (typeof value !== 'string' || !value.trim()) continue
+      out[field] = field === 'bin' ? expandTilde(value.trim()) : value.trim()
+    }
+    return out
+  }
   // [codex.env] / [claude.env] 节可选 —— 空 record 就维持各 CLI 自己的登录态。
   const codexEnv = envSection('codex.env')
   const claudeEnv = envSection('claude.env')
@@ -409,6 +445,7 @@ function loadConfig(): LodestarConfig {
     },
     projects: projectSections(),
     imagegen,
+    deepseek_harness: deepseekHarnessSection(),
   }
 }
 

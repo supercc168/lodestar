@@ -30,6 +30,7 @@ import {
   resolveClaudeSdkModel,
   type ClaudeModelProfile,
 } from './claude-models'
+import { dshSourceFromConfig } from './token-source-dsh'
 import {
   codexModelConfigured,
   codexModelIsGrok,
@@ -193,6 +194,8 @@ export function resolveTokenSource(
   provider: AgentProvider,
   model: string | null | undefined,
 ): TokenSource {
+  // dsh 是单档后端:模型名与凭据同来自 [deepseek-harness],不看 model 前缀。
+  if (provider === 'dsh') return dshSourceFromConfig()
   if (provider === 'claude') {
     const profile = claudeModelProfile(model)
     if (profile) return claudeSourceFromProfile(profile)
@@ -213,10 +216,13 @@ export function listTokenSources(): TokenSource[] {
     .filter(profile => !codexModelIsGrok(profile.key))
     .map(codexSourceFromProfile)
   const sol = codexLoginSource('gpt-5.6-sol')
+  // DSH 是独立后端:一档一位,未配置 `[deepseek-harness].api_key` 时 enabled() 为假
+  // (身份目录只显示不生效),不改 claude/codex 既有档位的 id 与顺序。
+  const dsh = dshSourceFromConfig()
   // sol 与可能的 codex:gpt-5.6-sol 去重
   const seen = new Set<string>()
   const out: TokenSource[] = []
-  for (const s of [...claude, sol, ...codexApi]) {
+  for (const s of [...claude, sol, ...codexApi, dsh]) {
     if (seen.has(s.id)) continue
     seen.add(s.id)
     out.push(s)

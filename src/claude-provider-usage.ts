@@ -274,6 +274,53 @@ async function fetchClaudeProviderUsage(model: string): Promise<ClaudeProviderUs
   }
 }
 
+/** DeepSeek 官方 `/user/balance` 余额读取(03-02 加法导出，供 DSH 档复用)。
+ *
+ * 与 `fetchClaudeProviderUsage` 的差别只有一个:凭据不是从 `[claude.models.*]`
+ * 的 profile 里取,而是由调用方直接传入(DSH 走 `[deepseek-harness]`,两条路径
+ * 互不相读)。其余纪律完全复用:同一个 `providerUsageEndpoint` 拼端点(去掉
+ * `/anthropic` / `/v1` 后缀后拼 `/user/balance`)、同一个 `snapshotFromBody`
+ * 多态解析、同一个超时与 no_fallbacks 错误分类。
+ *
+ * 非 DeepSeek 主机不落该分支(直接 unavailable,不发请求) —— DSH 段配了非官方
+ * 中转时余额如实 MISS,不臆造。 */
+export async function readDeepseekBalance(
+  baseUrl: string,
+  apiKey: string,
+  providerName: string,
+): Promise<ClaudeProviderUsageSnapshot> {
+  if (!isDeepSeekUsageHost(baseUrl)) {
+    return { state: 'unavailable', providerName, reason: '非 DeepSeek 余额主机' }
+  }
+  const { kind, url } = providerUsageEndpoint(baseUrl)
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS)
+  try {
+    const res = await fetch(url, {
+      method: 'GET',
+      headers: {
+        authorization: `Bearer ${apiKey}`,
+        accept: 'application/json',
+        'content-type': 'application/json',
+      },
+      signal: controller.signal,
+    })
+    if (res.status === 429) return { state: 'rate_limited', providerName }
+    if (res.status === 401 || res.status === 403) {
+      return { state: 'unavailable', providerName, reason: 'DSH 余额接口鉴权失败' }
+    }
+    if (res.status === 404) return { state: 'unavailable', providerName, reason: '渠道未提供 /user/balance' }
+    if (!res.ok) return { state: 'unavailable', providerName, reason: `DSH 余额接口 HTTP ${res.status}` }
+    return snapshotFromBody(kind, providerName, await res.text(), res.headers.get('content-type'))
+  } catch (e: any) {
+    const reason = e?.name === 'AbortError' ? `timeout after ${API_TIMEOUT_MS}ms` : (e?.message ?? String(e))
+    log(`claude-provider-usage: DSH balance fetch failed for ${providerName}: ${reason}`)
+    return { state: 'network', providerName, reason }
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
 /** 解析器导出，供单测直接喂 JSON，不打网络。 */
 export function claudeProviderUsageFromV1Response(providerName: string, response: any): ClaudeProviderUsageSnapshot {
   return snapshotFromV1Usage(providerName, response)
