@@ -11846,6 +11846,13 @@ describe('Session conversation launch 数据流(上游 ff44afb 簇 1)', () => {
     expect(() => session.applyConversationRouting({ provider: 'gemini', model: null, effort: null }))
       .toThrow('unknown conversation routing provider')
 
+    // WR-01:dsh 路由必须放行(归一化走 session-model 的固定档位目录),否则
+    // btw/fk 的临时群会走到「先建群再散群」。
+    session.applyConversationRouting({ provider: 'dsh', model: 'deepseek-v4-pro', effort: 'high' })
+    expect(session.selectedProvider).toBe('dsh')
+    expect(session.selectedModel).toBe('deepseek-v4-pro')
+    expect(session.selectedEffort).toBe('high')
+
     resumeRefs.set(`${session.sessionName}:codex`, { provider: 'codex', sessionId: 'codex-old', cwd: null })
     session.applyConversationRouting({ provider: 'codex', model: null, effort: null })
     expect(session.selectedProvider).toBe('codex')

@@ -1661,8 +1661,9 @@ export class Session {
     }
     // D-02 slim 层:上游 token source registry 归属校验换写为本地 provider/model
     // 合法性检查(固定档位目录:归一化把 model 判给别的 provider = 路由不成立,
-    // 如 codex:grok 迁 claude)。
-    if (routing.provider !== 'claude' && routing.provider !== 'codex') {
+    // 如 codex:grok 迁 claude)。dsh 与 claude/codex 同为三元联合的一员
+    // (session-temp 的面板/选择结构已扩),遗漏会让 btw/fk 临时群先建后散。
+    if (routing.provider !== 'claude' && routing.provider !== 'codex' && routing.provider !== 'dsh') {
       throw new Error(`unknown conversation routing provider: ${String(routing.provider)}`)
     }
     if (routing.model !== null) {
