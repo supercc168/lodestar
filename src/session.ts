@@ -7082,7 +7082,9 @@ export class Session {
     if (!turn) return
     if (turn.rotateGivenUp) return
     if (turn.rotating) return
-    if (cardkit.getElementCount(turn.cardId) < CARD_ELEMENT_SOFT_LIMIT) return
+    // 开卡失败的重试不被元素软上限挡住(上游 378f4a4):这一轮的卡可能还很空,
+    // 但上一张续卡没发出去,必须再试一次 —— 与"满卡主动换卡"是两个判据。
+    if (!turn.cardRotationFailed && cardkit.getElementCount(turn.cardId) < CARD_ELEMENT_SOFT_LIMIT) return
     this.startMidTurnRotate(turn)
   }
 
@@ -7144,6 +7146,25 @@ export class Session {
       return
     }
 
+    // 指纹去重(上游 378f4a4):同一个被拒载荷换个卡也还是被拒 —— 不再烧换卡
+    // 预算,只在第一次补一条用户通知。指纹缺失(网络类/老路径)时整段跳过,
+    // 行为与今日完全一致。位置在 cap 比较之前:去重命中不该让预算继续涨。
+    const fingerprint = failure?.capacityFingerprint
+    if (fingerprint) {
+      const notified = turn.cardCapacityFailures.get(fingerprint)
+      if (notified !== undefined) {
+        log(`session "${this.sessionName}": unchanged content still exceeds card capacity card=${failedCardId.slice(0, 12)} operation=${failure.operation} element=${failure.elementId ?? 'MISS'} code=${code ?? 'MISS'} — not rotating`)
+        if (!notified) {
+          turn.cardCapacityFailures.set(fingerprint, true)
+          void feishu.sendTextRaw(
+            this.chatId,
+            `⚠️ 有一项内容换卡后仍超出飞书容量，写入失败(code=${code ?? 'MISS'}, ${failure.operation}, element=${failure.elementId ?? 'MISS'})；其余输出继续处理。`,
+          )
+        }
+        return
+      }
+      turn.cardCapacityFailures.set(fingerprint, false)
+    }
     if (turn.failureRotateCount >= MAX_MIDTURN_ROTATES) {
       turn.rotateGivenUp = true
       // log-only 要名副其实:停掉 footer 档位计时器,并把当前卡整卡标记
@@ -7240,18 +7261,29 @@ export class Session {
         })
         const newMessageId = await feishu.sendCard(this.chatId, card)
         if (!newMessageId) {
-          log(`session "${this.sessionName}": mid-turn rotate sendCard EXHAUSTED — staying on old card,subsequent adds will drop`)
-          // 开新卡失败即闩锁 log-only:否则下一次写失败/满卡检查又发一轮
-          // sendCard,重试风暴 + 重复告警(上游 4185808)。
+          // 两级阶梯(上游 378f4a4 + 本地 D-13 止损):首次开卡失败只暂停 + 等下一次
+          // 内容事件重试,**不**把仍可写的旧卡标记死卡;重试再失败才回落到本地
+          // give-up 阶梯(rotateGivenUp + markCardWriteDead + log-only)。
           if (this.currentTurn === turn) {
-            turn.rotateGivenUp = true
-            this.stopFooterStatus(turn)
-            cardkit.markCardWriteDead(turn.cardId)
+            if (turn.cardRotationFailed) {
+              log(`session "${this.sessionName}": mid-turn rotate sendCard failed twice — giving up, rest of turn is log-only`)
+              turn.rotateGivenUp = true
+              this.stopFooterStatus(turn)
+              cardkit.markCardWriteDead(turn.cardId)
+              await feishu.sendTextRaw(
+                this.chatId,
+                '⚠️ 续卡连续发送失败，本轮后续输出仅日志可见。',
+              )
+            } else {
+              log(`session "${this.sessionName}": mid-turn rotate sendCard failed — retry on the next content event`)
+              turn.cardRotationFailed = true
+              this.stopFooterStatus(turn)
+              await feishu.sendTextRaw(
+                this.chatId,
+                '⚠️ 续卡发送失败，后续内容到达时会再次尝试。',
+              )
+            }
           }
-          await feishu.sendTextRaw(
-            this.chatId,
-            '⚠️ 卡片元素超出飞书上限,本轮后续输出仅日志可见(开新卡失败)。',
-          )
           return
         }
         let newCardId: string
@@ -7259,13 +7291,24 @@ export class Session {
         catch (e) {
           log(`session "${this.sessionName}": mid-turn rotate id_convert failed: ${e}`)
           if (this.currentTurn === turn) {
-            turn.rotateGivenUp = true
-            this.stopFooterStatus(turn)
-            cardkit.markCardWriteDead(turn.cardId)
-            await feishu.sendTextRaw(
-              this.chatId,
-              '⚠️ 新对话卡已发送，但 Card Kit 初始化失败；已停止继续换卡，本轮后续输出仅日志可见。',
-            )
+            // 与 sendCard 分支同一两级阶梯:首次暂停重试、二次才 give-up。
+            if (turn.cardRotationFailed) {
+              log(`session "${this.sessionName}": mid-turn rotate id_convert failed twice — giving up, rest of turn is log-only`)
+              turn.rotateGivenUp = true
+              this.stopFooterStatus(turn)
+              cardkit.markCardWriteDead(turn.cardId)
+              await feishu.sendTextRaw(
+                this.chatId,
+                '⚠️ 续卡初始化连续失败，本轮后续输出仅日志可见。',
+              )
+            } else {
+              turn.cardRotationFailed = true
+              this.stopFooterStatus(turn)
+              await feishu.sendTextRaw(
+                this.chatId,
+                '⚠️ 续卡已发送，但 Card Kit 初始化失败；后续内容到达时会再次尝试。',
+              )
+            }
           }
           return
         }
@@ -7294,6 +7337,8 @@ export class Session {
         // 等),旧卡上的 element_id 在新卡里查不到,继续 PUT 会 300313。
         this.stopFooterStatus(turn)
         turn.cardId = newCardId
+        // 同步复位开卡失败闩锁(上游 @@-4489):新卡已就位,footer 与推送恢复。
+        turn.cardRotationFailed = false
         turn.messageId = newMessageId
         turn.toolCount = 0
         turn.toolByUseId = new Map()
@@ -7304,12 +7349,22 @@ export class Session {
         // swap 那一刻读当前正在写的段(含切卡 async 窗口里到达的全部 delta ——
         // onFailure 在 rotating 期间不 reset,所以这段一直累积到这里)。先读后清。
         const carrySegId = turn.currentAssistantSegmentId
-        const carryText = (turn.currentAssistantText ?? '').trim()
+        // 不 trim(上游 @@-4499):正文首尾空白是用户可见内容的一部分。
+        const carryText = turn.currentAssistantText ?? ''
         const oldSegmentTexts = turn.segmentTexts
         turn.assistantSegmentCount = 0
         turn.currentAssistantSegmentId = null
         turn.currentAssistantText = ''
         turn.segmentTexts = new Map()
+        // swap 同步点就地恢复 live buffer(上游 @@-4499):下面的迁移段有 await,
+        // 窗口内到达的 delta 必须**追加**到这个 buffer,而不是被这份前置快照整体
+        // 覆盖 —— 旧形态「等迁移跑完再恢复」会丢掉窗口里的字。
+        if (carrySegId && carryText) {
+          const reSegId = cards.ELEMENTS.assistant(turn.assistantSegmentCount++)
+          turn.currentAssistantSegmentId = reSegId
+          turn.currentAssistantText = carryText
+          turn.segmentTexts.set(reSegId, carryText)
+        }
         if (carryText) this.startWritingFooter(turn)
         else this.startThinkingFooter(turn)
         // 先在新卡重建实时任务总览区(紧贴 footer)。必须在 assistant/tool 重建
@@ -7367,16 +7422,32 @@ export class Session {
           await this.addCompletedAssistantSegment(turn, reSegId, fullText)
         }
         // 把"还在跑 / 建失败"的 tool 搬到新卡(已完成的留旧卡),Read/Edit 批次切开重建。
-        sessionTools.rebuildToolsOnRotate(this, oldCardId, newCardId, oldToolByUseId, oldBatches)
-        // 当前 assistant 段还没收尾就换卡时,整段只迁移内存缓冲到新卡继续收。
-        // 正文要等 block_stop / turn close 后一次性插入,不在新旧卡上打字。
-        if (carrySegId && carryText) {
-          const ri = turn.assistantSegmentCount++
-          const reSegId = cards.ELEMENTS.assistant(ri)
-          turn.currentAssistantSegmentId = reSegId
-          turn.currentAssistantText = carryText
-          turn.segmentTexts.set(reSegId, carryText)
+        sessionTools.rebuildToolsOnRotate(this, oldCardId, newCardId, oldToolByUseId, oldBatches, turn)
+        // A completed tool's old-card add may still be queued at swap time.
+        // Once the card id/map have switched, no new handler can enqueue to
+        // the old card; drain it, then run the idempotent rebuild pass again
+        // so a late rejected add is not lost from both cards.(上游 @@-4565)
+        await cardkit.flush(oldCardId)
+        sessionTools.rebuildToolsOnRotate(this, oldCardId, newCardId, oldToolByUseId, oldBatches, turn)
+        // Finished output left on the old page is real pagination progress,
+        // even when later tools/paragraphs happen to contain identical text —
+        // 旧卡留有非携带内容 = 换卡真的推进了,容量记账作废(新一轮预算)。
+        const carriedIds = new Set<string>([
+          cards.ELEMENTS.taskBoardLive,
+          cards.ELEMENTS.planLive,
+          ...[...turn.contextCompactionPending.values()].map(pending => cards.ELEMENTS.contextCompact(pending.i)),
+        ])
+        if (carrySegId) carriedIds.add(carrySegId)
+        for (const meta of oldToolByUseId.values()) {
+          if (meta.output == null) carriedIds.add(cards.ELEMENTS.tool(meta.i))
         }
+        const retiredContent = cardkit.getWrittenContentElementIds(oldCardId)
+          .some(id => !carriedIds.has(id))
+        if (retiredContent) turn.cardCapacityFailures.clear()
+        // Include queued tool/live-panel migration failures before releasing
+        // the rotation lock(上游 @@-4565):释放锁之后再落地,失败会漏给新 card
+        // 的 handler —— 先 flush 掉排队中的迁移写入。
+        await cardkit.flush(newCardId)
         // 旧卡收尾:footer 红字 + streaming_off + dispose。放到 swap 后
         // 是因为这条链是 async,期间 cardkit 队列上还可能有 add/replace 等;
         // 让它们排在 footer 之前,视觉更连贯。
@@ -8144,6 +8215,9 @@ export class Session {
     // 到新卡续写。这里若定稿/reset,过渡窗口里的当前段文字会被清空、carry 落空
     // (跟 appendAssistant onFailure 在 rotating 期间不 reset 同一个道理)。代价是
     // 切卡窗口恰好跨 block 边界时两段可能并作一段 —— 不丢内容,可接受。
+    // 续卡失败挂起时,段边界就是一个天然的重试时机(上游 @@-5327):代价同上,
+    // 收益是失败的开卡能被下一次内容事件收敛掉。守卫全在 maybeMidTurnRotate 内。
+    if (turn.cardRotationFailed) this.maybeMidTurnRotate()
     if (turn.rotating) return
     const segId = turn.currentAssistantSegmentId
     const text = turn.currentAssistantText ?? ''
@@ -8215,8 +8289,8 @@ export class Session {
 
   private startFooterStatus(turn: TurnState, status: string): void {
     // log-only 之后 phase 切换(Thinking/Writing/Working)不再启动档位 timer ——
-    // 卡已标记拒写,继续调度只会空转。
-    if (turn.rotateGivenUp) return
+    // 卡已标记拒写,继续调度只会空转;续卡失败(停表等重试)同理。
+    if (turn.rotateGivenUp || turn.cardRotationFailed) return
     // 模型满载退避进度(上游 2e6e1e0):进程层持有唯一重试节奏,footer 如实反映。
     const retry = turn.provider === 'codex' ? this.proc?.turnRetry : null
     if (retry) {
@@ -8347,6 +8421,9 @@ export class Session {
     // off the table BEFORE their first await.
     const turn = this.currentTurn
     if (!turn) return
+    // 无 suffix = 自然收尾;续卡失败挂起时在这里补一次重试(上游 @@-5517),
+    // 插在 null-out 之前的同步块里 —— 后面 `await turn.rotating` 会等它落定。
+    if (!suffix && turn.cardRotationFailed) this.maybeMidTurnRotate()
     this.currentTurn = null
     this.clearToolFailureLoop(turn)
     this.endWatchdogTurn()
@@ -8433,7 +8510,7 @@ export class Session {
       if (renderedHere?.has(segId)) continue
       await cardkit.replaceElement(cardId, segId, this.completedAssistantElement(segId, fullText))
     }
-    if (turn.rotateGivenUp) {
+    if (turn.rotateGivenUp || turn.cardRotationFailed) {
       for (const [segId, fullText] of segmentTexts) fallbackSegments.set(segId, fullText)
     }
 
@@ -8465,7 +8542,7 @@ export class Session {
     if (modelLabel) line1Parts.push(modelLabel)
     const footerLine1 = line1Parts.join(' ｜ ')
     const footerLine2 = opts.hasFreshResult
-      ? cards.footerTokenDetailLine(closeLastTurnUsage) + (turn.rotateGivenUp ? '' : await this.footerUsageSuffix(turn))
+      ? cards.footerTokenDetailLine(closeLastTurnUsage) + (turn.rotateGivenUp || turn.cardRotationFailed ? '' : await this.footerUsageSuffix(turn))
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
     await this.replaceFooterContent(cardId, footer)
@@ -8495,8 +8572,10 @@ export class Session {
     // Fire-and-forget; urgent_app failures are non-fatal and already
     // logged in feishu.ts.
     // log-only 的 turn 已发过"仅日志可见"告警,用户知晓 —— 不再为
-    // 一张写死的卡响手机推送(2026-07-04 review follow-up)。
-    if ((opts.forcePush || !suffix) && turn.userOpenId && turn.messageId && !turn.rotateGivenUp) {
+    // 一张写死的卡响手机推送(2026-07-04 review follow-up)。续卡仍失败时
+    // 也已有失败提示,不推送旧卡的完成通知(上游 378f4a4)。
+    if ((opts.forcePush || !suffix) && turn.userOpenId && turn.messageId
+      && !turn.rotateGivenUp && !turn.cardRotationFailed) {
       void feishu.urgentApp(turn.messageId, [turn.userOpenId])
     }
 
