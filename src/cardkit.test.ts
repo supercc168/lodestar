@@ -201,6 +201,114 @@ describe('cardkit capacity codes', () => {
   })
 })
 
+describe('cardkit 容量指纹数据模型 (上游 378f4a4)', () => {
+  /** 只让「内容里带 oversized 的 payload」被拒,其余写成功 —— 失败响应是
+   * 300315 内嵌 300305 的真容量形态,必须走真实写路径拿到指纹。 */
+  function mockCapacityOnOversized(): void {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      calls.push({
+        method: String(init?.method ?? 'GET'),
+        path: url.pathname.replace('/open-apis/cardkit/v1', ''),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      })
+      const body = String(init?.body ?? '')
+      return new Response(JSON.stringify(body.includes('oversized')
+        ? {
+            code: 300315,
+            msg: 'Failed to add element: number of card components exceeds the maximum limit; code: 300305',
+          }
+        : { code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+  }
+
+  /** 元素自带的 element_id 不进指纹:同一内容换编号/换卡必须同指纹。 */
+  const contentElement = (id: string, content: string) => ({
+    tag: 'column_set',
+    element_id: id,
+    columns: [{ tag: 'column', elements: [{ tag: 'markdown', element_id: `${id}_text`, content }] }],
+  })
+
+  test('capacity fingerprint is stable across cards for the same rejected payload', async () => {
+    const ids = ['card_fingerprint_old', 'card_fingerprint_new']
+    mockCapacityOnOversized()
+    const rejected = async (cardId: string, id: string): Promise<string> => {
+      const result = await cardkit.addElementResult(cardId, contentElement(id, 'oversized'))
+      expect(result.landed).toBe(false)
+      expect(result.failure?.code).toBe(300315)
+      expect(cardkit.isElementLimitFailure(result.failure?.code, result.failure)).toBe(true)
+      expect(result.failure?.capacityFingerprint).toMatch(/^[a-f0-9]{64}$/)
+      return result.failure!.capacityFingerprint!
+    }
+    try {
+      for (const id of ids) cardkit.recordCardCreated(id, 2)
+      // 两张卡写入「同一正文,不同元素编号」+ 换卡后 footer 定时刷新;
+      // 指纹只看正文内容,三者都不得改变结果。
+      await cardkit.addElement(ids[0]!, contentElement('tool_0', 'previous'))
+      await cardkit.addElement(ids[1]!, contentElement('tool_7', 'previous'))
+      await cardkit.replaceElement(ids[1]!, 'footer', {
+        tag: 'markdown', element_id: 'footer', content: 'Thinking(17s)',
+      })
+      const old = await rejected(ids[0]!, 'assistant_5')
+      expect(await rejected(ids[1]!, 'assistant_0')).toBe(old)
+      // 内容变了 → 指纹必须变(否则 session 层会把新载荷当重复拒掉)
+      await cardkit.replaceElement(ids[1]!, 'tool_7', contentElement('tool_7', 'new output'))
+      expect(await rejected(ids[1]!, 'assistant_1')).not.toBe(old)
+      // 换卡要重建的正文元素被显式删除后,指纹回到「只有被拒载荷」形态
+      await cardkit.deleteElement(ids[0]!, 'tool_0')
+      await cardkit.deleteElement(ids[1]!, 'tool_7')
+      const empty = await rejected(ids[0]!, 'assistant_6')
+      expect(empty).not.toBe(old)
+      expect(await rejected(ids[1]!, 'assistant_2')).toBe(empty)
+    } finally {
+      for (const id of ids) await cardkit.dispose(id)
+    }
+  })
+
+  test('non-capacity failures never carry a capacity fingerprint', async () => {
+    const cardId = 'card_fingerprint_non_capacity'
+    cardkit.recordCardCreated(cardId, 1)
+    // schema 类:300315 内嵌 300301 duplicate id —— 不是容量,不得带指纹
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      code: 300315, msg: 'Failed to add element; Duplicate ID; code: 300301',
+    }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as unknown as typeof fetch
+    const schema = await cardkit.addElementResult(cardId, {
+      tag: 'markdown', element_id: 'dup_0', content: 'dup',
+    })
+    expect(schema.landed).toBe(false)
+    expect(schema.failure?.code).toBe(300315)
+    expect(schema.failure && 'capacityFingerprint' in schema.failure).toBe(false)
+
+    // 网络类:kind=network 且无业务 code,同样不得带指纹
+    globalThis.fetch = (async () => { throw new TypeError('fetch failed') }) as unknown as typeof fetch
+    const net = await cardkit.addElementResult(cardId, {
+      tag: 'markdown', element_id: 'net_0', content: 'net',
+    })
+    expect(net.landed).toBe(false)
+    expect(net.failure?.code).toBeUndefined()
+    expect(net.failure && 'capacityFingerprint' in net.failure).toBe(false)
+    await cardkit.dispose(cardId)
+  })
+
+  test('footer writes stay out of the written-content fingerprints', async () => {
+    const cardId = 'card_fingerprint_footer'
+    cardkit.recordCardCreated(cardId, 2)
+    await cardkit.addElement(cardId, { tag: 'markdown', element_id: 'assistant_0', content: 'body' })
+    expect(cardkit.getWrittenContentElementIds(cardId)).toEqual(['assistant_0'])
+    await cardkit.replaceElement(cardId, 'footer', {
+      tag: 'markdown', element_id: 'footer', content: 'Writing(1s)',
+    })
+    await cardkit.addElement(cardId, { tag: 'markdown', element_id: 'footer', content: 'Writing(2s)' })
+    expect(cardkit.getWrittenContentElementIds(cardId)).toEqual(['assistant_0'])
+    expect(cardkit.getWrittenContentElementIds('card_fingerprint_never_created')).toEqual([])
+    await cardkit.dispose(cardId)
+  })
+})
+
 describe('cardkit network retry and footer isolation', () => {
   test('retries network transport failures then succeeds without elevating card failure', async () => {
     const failures: Array<{ code?: number; kind?: string }> = []
