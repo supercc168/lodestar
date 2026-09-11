@@ -2,7 +2,7 @@ import { EventEmitter } from 'node:events'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { writeJsonStateAtomic } from './state-store'
 import {
   DEFAULT_CODEX_WATCHDOG,
@@ -23,6 +23,30 @@ import {
   setResumeWriteError, setTurnAnchorWriteError, truncatedTurnAnchors, turnAnchorsBySession, updatedCards, urgentPushes,
 } from './feishu-test-mock'
 import type { ConversationCheckpoint, ConversationRef } from './conversation'
+import { resetAgentSessionRegistryForTest } from './agent-session-registry'
+
+// 主 Session 现在也会构造 DshProcess(上游 722e45a),而 DSH 后端在构造期就 spawn
+// 子进程(03-01):用例只验接线面,故像 agent-launch.test.ts 一样用替身顶掉,并让
+// 历史列表的只读目录查询走假实现(每次查询自行 spawn/reap 的语义不变)。
+const dshCatalogQueries: Array<{ method: string; params: any }> = []
+let dshCatalogRows: any[] = []
+mock.module('./dsh-process', () => ({
+  DshProcess: class FakeDshProcess {
+    readonly provider = 'dsh'
+    readonly opts: any
+    constructor(opts: any) { this.opts = opts }
+  },
+}))
+mock.module('./dsh-runtime', () => {
+  const actual = require('./dsh-runtime') as typeof import('./dsh-runtime')
+  return {
+    ...actual,
+    queryDshRuntime: async (_opts: any, method: string, params: any = {}) => {
+      dshCatalogQueries.push({ method, params })
+      return dshCatalogRows
+    },
+  }
+})
 
 const {
   Session,
@@ -112,7 +136,7 @@ class FakeAgentProc extends EventEmitter {
   turnRetry: AgentTurnRetry | null = null
 
   constructor(
-    readonly provider: 'codex' | 'claude',
+    readonly provider: 'codex' | 'claude' | 'dsh',
     public sessionId: string | null = null,
     /** spawn 捕获暴露(ff44afb):监听 spawnAgent 侧翻译产物的用例经第三参喂入。 */
     readonly opts: { launch?: unknown } = {},
@@ -130,6 +154,8 @@ class FakeAgentProc extends EventEmitter {
     this.sentTexts.push(text)
     if (this.dispatchFactory) return this.dispatchFactory(text)
     if (this.provider === 'claude') return { kind: 'queued', provider: 'claude' }
+    // DSH 与 claude 同属 fire-and-forget 投递:成功回执是 queued/dsh(03-01)。
+    if (this.provider === 'dsh') return { kind: 'queued', provider: 'dsh' }
     const deliveryId = String(++this.dispatchCounter)
     const threadId = this.sessionId ?? 'fake-codex-thread'
     return {
@@ -3549,7 +3575,7 @@ function controlCodexDispatch(
   }
 }
 
-function pendingHumanDrainFixture(provider: 'codex' | 'claude' = 'codex') {
+function pendingHumanDrainFixture(provider: 'codex' | 'claude' | 'dsh' = 'codex') {
   const id = ++humanDeliveryFixtureCount
   const session = new Session(`pending-human-delivery-${provider}-${id}`, 'chat_id') as any
   const proc = new FakeAgentProc(provider, `${provider}-thread-${id}`)
@@ -13168,6 +13194,212 @@ describe('Session delegated-agent capability and cancel', () => {
     proc.emit('exit', { code: 1, signal: null, expected: false })
     await waitFor(() => reasons.length > 0)
     expect(reasons[0]).toMatch(/codex process exited/)
+  })
+})
+
+describe('Session DSH backend wiring (upstream 722e45a)', () => {
+  function withDshSection(section: any): () => void {
+    const prev = (config as any).deepseek_harness
+    ;(config as any).deepseek_harness = section
+    return () => { (config as any).deepseek_harness = prev }
+  }
+
+  test('DSH human dispatch 走 queued/dsh 的 commit 路径而不是被判 mismatched 拒收', async () => {
+    const { session, proc, batch } = pendingHumanDrainFixture('dsh')
+
+    expect(await session.drainMidTurnAndOpen()).toBe('committed')
+    expect(proc.sentTexts).toEqual([`${batch[0]!.wireText}\n\n${batch[1]!.wireText}`])
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(session.pendingUserMessageCount).toBe(1)
+    expect(session.ackedHumanDelivery?.turn).toBe(session.currentTurn)
+  })
+
+  test('DSH system dispatch 接受 queued/dsh;codex 的 queued 仍被拒,所有者校验保持', async () => {
+    const session = new Session('dsh-system-dispatch', 'chat_id') as any
+    const proc = new FakeAgentProc('dsh', 'dsh-session')
+    session.selectedProvider = 'dsh'
+    session.proc = proc
+    session.status = 'idle'
+    session.wireProc(proc)
+
+    expect(await session.startHostAskContinuation('（用户回答）继续原任务', proc)).toBe('started')
+    expect(proc.sentTexts).toContain('（用户回答）继续原任务')
+    expect(session.status).toBe('working')
+    expect(session.pendingUserMessageCount).toBe(1)
+
+    // 所有权校验保持:非当前进程 → stale,且不投递
+    const foreign = new FakeAgentProc('dsh', 'dsh-session')
+    expect(await session.startHostAskContinuation('（用户回答）继续原任务', foreign)).toBe('stale')
+    expect(foreign.sentTexts).toEqual([])
+
+    // 其它 provider 的 queued 分支逐字不变:codex 伪造 queued 仍被拒
+    const codexSession = new Session('codex-queued-still-rejected', 'chat_id') as any
+    const codexProc = new FakeAgentProc('codex', 'thread-codex-queued')
+    codexSession.selectedProvider = 'codex'
+    codexSession.proc = codexProc
+    codexSession.status = 'idle'
+    codexSession.wireProc(codexProc)
+    codexProc.dispatchFactory = () => ({ kind: 'queued', provider: 'codex' })
+    expect(await codexSession.startHostAskContinuation('system input', codexProc)).toBe('failed')
+  })
+
+  test('DSH 不能替换忙碌中的 Claude 进程(上游同名用例意图)', async () => {
+    const restore = withDshSection({ api_key: 'dsh-key', model: 'deepseek-v4-pro', effort: 'max' })
+    try {
+      const session = new Session('dsh-busy-claude', 'chat_id') as any
+      const proc = new FakeAgentProc('claude', 'claude-session')
+      session.proc = proc
+      session.selectedProvider = 'claude'
+      session.selectedModel = 'claude:fable'
+      session.currentTurn = turnState('card-busy-claude', { provider: 'claude' })
+
+      const result = await session.onModelEffortSelect('deepseek-v4-pro', 'max', '', 'ou_user', 'dsh')
+
+      expect(result.ok).toBe(false)
+      expect(proc.killCalls).toBe(0)
+      expect(session.selectedProvider).toBe('claude')
+      expect(session.selectedModel).not.toBe('deepseek-v4-pro')
+    } finally { restore() }
+  })
+
+  test('dshEffortForSpawn 取 DSH 合法值;两处都取不到时抛错而不是回落 Codex effort', () => {
+    const restore = withDshSection({ api_key: 'dsh-key', model: 'deepseek-v4-pro' })
+    try {
+      const session = new Session('dsh-effort', 'chat_id') as any
+      session.selectedProvider = 'dsh'
+
+      session.selectedEffort = 'off'
+      expect(session.dshEffortForSpawn()).toBe('off')
+
+      // xhigh 是 claude/codex 词表的值,对 DSH 非法 → 不吞、不回落
+      session.selectedEffort = 'xhigh'
+      expect(() => session.dshEffortForSpawn()).toThrow('DSH model reasoning effort is unavailable')
+
+      ;(config as any).deepseek_harness = { api_key: 'dsh-key', model: 'deepseek-v4-pro', effort: 'high' }
+      expect(session.dshEffortForSpawn()).toBe('high')
+    } finally { restore() }
+  })
+
+  test('currentContextTokens 对 dsh 读 input 侧占用,不落到 Codex 的 total_tokens', () => {
+    const session = new Session('dsh-context-tokens', 'chat_id') as any
+    session.proc = { provider: 'dsh', lastContextTokens: 12345, lastUsage: { total_tokens: 99999 } }
+    expect(session.currentContextTokens()).toBe(12345)
+
+    // codex 路径逐字不变:仍只认 lastUsage.total_tokens,不读 lastContextTokens
+    session.proc = { provider: 'codex', lastContextTokens: 12345, lastUsage: null }
+    expect(session.currentContextTokens()).toBeNull()
+  })
+
+  test('spawnAgent(undefined, "dsh") 构造 DshProcess;源缺失时 fail closed 不回落 codex', () => {
+    const restore = withDshSection({ api_key: 'dsh-key', model: 'deepseek-v4-pro', effort: 'high' })
+    try {
+      const session = new Session('dsh-spawn-construct', 'chat_id') as any
+      session.selectedProvider = 'dsh'
+      session.selectedModel = 'deepseek-v4-pro'
+      session.selectedEffort = 'high'
+
+      const proc = session.spawnAgent(undefined, 'dsh') as any
+
+      expect(proc.provider).toBe('dsh')
+      expect(proc.opts.tokenSourceId).toBe('deepseek-harness')
+      expect(proc.opts.model).toBe('deepseek-v4-pro')
+      expect(proc.opts.effort).toBe('high')
+      expect(proc.opts.workDir).toBe(session.workDir)
+      expect(typeof proc.opts.transformEnv).toBe('function')
+      const env = proc.opts.transformEnv({ ANTHROPIC_API_KEY: 'stray', DEEPSEEK_API_KEY: 'old' })
+      expect(Object.keys(env).filter((key: string) => key.startsWith('ANTHROPIC_'))).toEqual([])
+      expect(env.DEEPSEEK_API_KEY).toBe('dsh-key')
+    } finally { restore() }
+
+    const unconfigured = withDshSection(undefined)
+    try {
+      const session = new Session('dsh-spawn-unconfigured', 'chat_id') as any
+      session.selectedProvider = 'dsh'
+      session.selectedModel = 'deepseek-v4-pro'
+      session.selectedEffort = 'high'
+      expect(() => session.spawnAgent(undefined, 'dsh'))
+        .toThrow('DSH token source is unavailable')
+    } finally { unconfigured() }
+  })
+
+  test('listDshConversations 只在 dsh 会话下工作,并过滤 lodestar 自己的委派会话', async () => {
+    const restore = withDshSection({ api_key: 'dsh-key', model: 'deepseek-v4-pro', effort: 'high' })
+    dshCatalogRows = []
+    dshCatalogQueries.length = 0
+    try {
+      const session = new Session('dsh-history', 'chat_id') as any
+      session.selectedProvider = 'claude'
+      await expect(session.listDshConversations())
+        .rejects.toThrow('DSH history requested under a different provider')
+
+      session.selectedProvider = 'dsh'
+      session.selectedModel = 'deepseek-v4-pro'
+      resetAgentSessionRegistryForTest(['dsh:delegated-1'])
+      dshCatalogRows = [
+        { provider: 'dsh', sessionId: 'delegated-1', cwd: session.workDir, preview: '委派会话', ts: 2 },
+        { provider: 'dsh', sessionId: 'user-1', cwd: session.workDir, preview: '用户会话', ts: 1 },
+      ]
+
+      const rows = await session.listDshConversations()
+
+      expect(rows.map((row: any) => row.sessionId)).toEqual(['user-1'])
+      expect(dshCatalogQueries).toEqual([{ method: 'session/list', params: { cwd: session.workDir } }])
+    } finally {
+      resetAgentSessionRegistryForTest([])
+      dshCatalogRows = []
+      dshCatalogQueries.length = 0
+      restore()
+    }
+  })
+
+  test('dsh 控制台余额走 provider 通道的 DeepSeek /user/balance,不查 Claude profile', async () => {
+    const restore = withDshSection({
+      api_key: 'dsh-balance-key',
+      base_url: 'https://api.deepseek.com',
+      model: 'deepseek-v4-pro',
+      effort: 'high',
+    })
+    const passthrough = globalThis.fetch
+    const balanceRequests: string[] = []
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.host === 'api.deepseek.com') {
+        balanceRequests.push(url.toString())
+        return new Response(JSON.stringify({
+          is_available: true,
+          balance_infos: [{
+            currency: 'CNY',
+            total_balance: '66.88',
+            granted_balance: '0.00',
+            topped_up_balance: '66.88',
+          }],
+        }), { status: 200, headers: { 'content-type': 'application/json' } })
+      }
+      return await passthrough(input, init)
+    }) as typeof fetch
+    try {
+      const session = new Session('console-usage-dsh', 'chat_id') as any
+      session.selectedProvider = 'dsh'
+      session.selectedModel = 'deepseek-v4-pro'
+      session.selectedEffort = 'high'
+      const snapshot = await session.buildConsoleOpts(undefined)
+      const cardId = 'card_console_usage_dsh'
+      cardkit.recordCardCreated(cardId, 4)
+
+      await session.patchConsoleUsage(cardId, snapshot)
+      await cardkit.flush(cardId)
+
+      expect(balanceRequests).toEqual(['https://api.deepseek.com/user/balance'])
+      const content = calls
+        .filter(call => call.method === 'PUT' && call.path === `/cards/${cardId}/elements/console_usage`)
+        .map(call => JSON.parse(call.body.element).content as string)
+        .at(-1)
+      expect(content).toContain('66.88')
+      await cardkit.dispose(cardId)
+    } finally {
+      globalThis.fetch = passthrough
+      restore()
+    }
   })
 })
 
