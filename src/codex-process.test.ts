@@ -1309,7 +1309,7 @@ async function drainMaterialization(proc: any): Promise<void> {
 }
 
 describe('codex conversation materialization 验证(上游 4185808 主题 D)', () => {
-  test('turn/started 触发 thread/read(5s 超时)验证,rollout 在盘 → conversation_materialized + resumable', async () => {
+  test('turn/started 触发 thread/read(10min 超时)验证,rollout 在盘 → conversation_materialized + resumable', async () => {
     const root = mkdtempSync(join(tmpdir(), 'lodestar-mat-'))
     try {
       const rollout = join(root, 'thread-mat.jsonl')
@@ -1323,7 +1323,7 @@ describe('codex conversation materialization 验证(上游 4185808 主题 D)', (
       expect(requests).toContainEqual({
         method: 'thread/read',
         params: { threadId: 'thread-mat', includeTurns: true },
-        timeoutMs: 5000,
+        timeoutMs: 600000,
       })
       expect(events).toContainEqual(['turn_started', { turn_id: 'turn-1', thread_id: 'thread-mat' }])
       expect(events).toContainEqual([

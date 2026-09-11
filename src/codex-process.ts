@@ -139,7 +139,7 @@ const CODEX_GENERATED_IMAGES_DIR = join(homedir(), '.codex', 'generated_images')
 // turn. Bound them so a live PID with a dead transport cannot leak promises.
 const CODEX_REQUEST_TIMEOUT_MS = 30_000
 // materialization 验证(4185808):thread/read 确认 rollout 落盘的专用短超时。
-const CODEX_MATERIALIZATION_VERIFY_TIMEOUT_MS = 5_000
+const CODEX_MATERIALIZATION_VERIFY_TIMEOUT_MS = 10 * 60_000
 
 export interface SpawnOpts {
   workDir: string
