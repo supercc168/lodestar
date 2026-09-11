@@ -51,6 +51,8 @@ import { startAgentAutoUpdates } from './src/agent-updates'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
 import { checkPidGuard, writePidFile } from './src/pid-guard'
 import {
+  acceptsPendingQuestionText,
+  acceptsPendingReplyText,
   inboundMessageResource,
   consumePendingTextInput,
   inboundResourceDownloadFailureText,
@@ -540,7 +542,9 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   // Only then can it reach model-entry or ordinary Agent input below.
   // 插在既有 :519-536 路由**之前**:reply 与 question 命中即 return,host_ask
   // 与普通新轮落到下方原样保留的两段(02-CONTEXT Deferred→P2-02 / D-02)。
-  if ((msgType === 'text' || msgType === 'post') && text && !postHasAttachments
+  // 两条门控拆开(02-REVIEW WR-04):通知回复可收 post 富文本,提问回答仍严格
+  // text-only —— 与下方保留注释一致,post / 附件消息一律按一次新轮处理。
+  if (acceptsPendingReplyText(msgType, text, postHasAttachments)
     && await consumePendingTextInput({
       reply: () => notifyReplies.consume({
         chatId, openId: userOpenId, messageId: msgId ?? '', text, createTime,
@@ -555,7 +559,7 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   // work in this version — Feishu schema 2.0 doesn't support form/
   // input elements, so the chat box itself is the input. Only applies
   // to text-only messages (post / 图片 / 文件 / 视频附件都按一次新轮处理)。
-  if (msgType === 'text' && text && session.hasPendingAsk()) {
+  if (acceptsPendingQuestionText(msgType, text) && session.hasPendingAsk()) {
     // ✅ 不在这里抢打 —— 只有 onAskMessageAnswer 真把这条文本记成 ask
     // 答案时才回 ✅。撞上僵尸 ask(can_use_tool 没来)时这条消息会被当
     // 普通新轮重处理,不该留"答案已收到"标记。msgId 透传下去:成功消费

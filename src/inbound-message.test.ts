@@ -1,5 +1,9 @@
 import { describe, expect, test } from 'bun:test'
+import { readFile } from 'node:fs/promises'
+import { join } from 'node:path'
 import {
+  acceptsPendingQuestionText,
+  acceptsPendingReplyText,
   consumePendingTextInput,
   inboundMessageResource,
   inboundResourceDownloadFailureText,
@@ -124,5 +128,40 @@ describe('pending text input priority(上游 ae411a6)', () => {
       answerQuestion: async () => { answered = true },
     })).rejects.toThrow('store unavailable')
     expect(answered).toBe(false)
+  })
+})
+
+// 02-REVIEW WR-04:新消费点曾把 post 纳入提问分支,与紧邻的保留注释
+// 「post / 图片 / 文件 / 视频附件都按一次新轮处理」相互矛盾。门控拆成纯函数后,
+// post 只走通知回复,提问回答仍严格 text-only。
+describe('pending text routing gates(上游 ae411a6 / 02-REVIEW WR-04)', () => {
+  test('post 富文本可消费通知回复,但永不作为提问答案被消费', () => {
+    expect(acceptsPendingReplyText('post', '明天十点', false)).toBe(true)
+    expect(acceptsPendingQuestionText('post', '明天十点')).toBe(false)
+  })
+
+  test('text 两条通道都是候选:回复优先由 consumePendingTextInput 的调用顺序保证', () => {
+    expect(acceptsPendingReplyText('text', '明天十点', false)).toBe(true)
+    expect(acceptsPendingQuestionText('text', '明天十点')).toBe(true)
+  })
+
+  test('带附件 post / 非文本消息 / 空文本都不进任何消费通道', () => {
+    expect(acceptsPendingReplyText('post', '看这张图', true)).toBe(false)
+    for (const type of ['image', 'file', 'media', 'audio', 'sticker']) {
+      expect(acceptsPendingReplyText(type, 'x', false)).toBe(false)
+      expect(acceptsPendingQuestionText(type, 'x')).toBe(false)
+    }
+    expect(acceptsPendingReplyText('text', '', false)).toBe(false)
+    expect(acceptsPendingReplyText('text', undefined, false)).toBe(false)
+    expect(acceptsPendingQuestionText('text', '')).toBe(false)
+    expect(acceptsPendingQuestionText('text', undefined)).toBe(false)
+  })
+
+  test('daemon 接线:提问分支走 text-only 门控,不再内联 text||post 条件(WR-04)', async () => {
+    const source = await readFile(join(import.meta.dir, '..', 'daemon.ts'), 'utf8')
+    expect(source).toMatch(/if \(acceptsPendingQuestionText\(msgType, text\) && session\.hasPendingAsk\(\)\)/)
+    expect(source).toContain('acceptsPendingReplyText(msgType, text, postHasAttachments)')
+    // 回归形态:提问分支曾被 (msgType === 'text' || msgType === 'post') 覆盖。
+    expect(source).not.toMatch(/\|\| msgType === 'post'\)[^\n]*\n[^\n]*await consumePendingTextInput/)
   })
 })

@@ -21,6 +21,22 @@ export async function consumePendingTextInput(handlers: {
   return true
 }
 
+/** 通知回复消费门控:text 与 post 都可能承载"一条文字"(post 已按 markdown 解码),
+ *  带附件的 post 另有普通新轮路径。 */
+export function acceptsPendingReplyText(
+  messageType: unknown,
+  text: unknown,
+  postHasAttachments: boolean,
+): boolean {
+  return (messageType === 'text' || messageType === 'post') && !!text && !postHasAttachments
+}
+
+/** 提问回答只认 text-only 消息 —— 与本文件下方 daemon 的保留注释一致:post / 图片 /
+ *  文件 / 视频附件都按一次新轮处理(02-REVIEW WR-04)。 */
+export function acceptsPendingQuestionText(messageType: unknown, text: unknown): boolean {
+  return messageType === 'text' && !!text
+}
+
 export interface InboundMessageResource {
   key: string
   type: 'image' | 'file'
