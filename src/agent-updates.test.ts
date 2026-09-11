@@ -355,3 +355,31 @@ test('AGENT_RUNTIMES_DIR 与 AGENT_RUNS_DIR 同源(均在 LODESTAR_DATA_DIR 下)
   expect(paths.AGENT_RUNTIMES_DIR).toBe(join(paths.DATA_DIR, 'agent-runtimes'))
   expect(paths.AGENT_RUNTIMES_DIR.startsWith(process.env.LODESTAR_DATA_DIR ?? paths.DATA_DIR)).toBe(true)
 })
+
+// ── 接线回归锁(daemon 无单测宿主,用源码断言钉住 HEAD 语义与保护线)──────────────
+test('daemon 接线 HEAD 语义:只挂定时器(默认关=零定时器),启动不主动更新', async () => {
+  const source = await readFile(join(import.meta.dir, '..', 'daemon.ts'), 'utf8')
+  // 导入 + boot 赋值 ≥2;关停清定时器(声明 + 调用 + 赋值)≥3。
+  expect(source.match(/startAgentAutoUpdates/g)?.length ?? 0).toBeGreaterThanOrEqual(2)
+  expect(source.match(/stopAgentAutoUpdates/g)?.length ?? 0).toBeGreaterThanOrEqual(3)
+  // HEAD 语义:启动不调用主动更新(D-06 / T-02-18)。
+  expect(source.includes('updateAgentRuntimes')).toBe(false)
+  // 开关来自配置三开关对象,而不是硬编码 true。
+  expect(source).toContain('startAgentAutoUpdates(log, { enabled: config.runtime.agent_auto_update })')
+})
+
+test('setup 模板与 postinstall 提示随上游 c55bb44,且不写本地不存在的旗标', async () => {
+  const setup = await readFile(join(import.meta.dir, 'setup.ts'), 'utf8')
+  expect(setup).toContain('[runtime.agent_auto_update]')
+  expect(setup).toContain('codex = false')
+  expect(setup).toContain('claude = false')
+  expect(setup).toContain('dsh = false')
+
+  const postinstall = await readFile(join(import.meta.dir, '..', 'scripts', 'postinstall.cjs'), 'utf8')
+  expect(postinstall).toContain('启动时不检查或更新 Agent，自动更新默认关闭。')
+  expect(postinstall).toContain('lodestar-update')
+  // 本地 lodestar-update 无该旗标(全仓零命中),提示文案不得照抄上游。
+  expect(postinstall.includes('agents-only')).toBe(false)
+  // 本地自愈块保留(native binary 补装)。
+  expect(postinstall.match(/ensureNativeBinary/g)?.length ?? 0).toBe(1)
+})
