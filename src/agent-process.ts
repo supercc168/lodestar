@@ -23,7 +23,13 @@ import type {
 // type-only:conversation.ts 亦仅类型引用本模块,无运行时环。
 import type { ConversationCheckpoint } from './conversation'
 
-export type AgentProvider = 'codex' | 'claude'
+/** 后端协议联合(上游 722e45a):codex / claude / dsh 三元。联合由本数组派生,
+ *  新后端只在数组上加一项;`isAgentProvider` 是会话/面板判定 provider 的唯一守卫。 */
+export const AGENT_PROVIDERS = ['codex', 'claude', 'dsh'] as const
+export type AgentProvider = typeof AGENT_PROVIDERS[number]
+export function isAgentProvider(value: unknown): value is AgentProvider {
+  return typeof value === 'string' && (AGENT_PROVIDERS as readonly string[]).includes(value)
+}
 /** DSH(DeepSeek Harness)原生档位(上游 722e45a)。与 Codex/Claude 档位不互通:
  *  它是子进程 `model/list` 上报的 reasoning effort 词表(off/low/high/max)。 */
 export type DshReasoningEffort = 'off' | 'low' | 'high' | 'max'
@@ -55,7 +61,8 @@ export type CodexUserTextSettlement =
   | { kind: 'rejected'; deliveryId: string; threadId: string | null; error: Error }
 
 export type UserTextDispatch =
-  | { kind: 'queued'; provider: 'claude' }
+  // dsh 与 claude 同形:fire-and-forget 投递,无 settlement 同步点。
+  | { kind: 'queued'; provider: 'claude' | 'dsh' }
   | { kind: 'rejected'; provider: AgentProvider; error: Error }
   | {
       // threadId 为 null 表示 pre-init 投递:线程尚未创建,init 成功后
@@ -91,6 +98,7 @@ export function isClaudeReasoningEffort(value: unknown): value is ClaudeReasonin
 }
 
 export function providerFromModel(model: string | null | undefined): AgentProvider {
+  if (model?.startsWith('dsh:')) return 'dsh'
   return model?.startsWith('claude:') ? 'claude' : 'codex'
 }
 
@@ -105,6 +113,10 @@ export function usageSourceForAgent(
   model: string | null | undefined,
 ): AgentUsageSource {
   if (provider === 'codex') return 'codex'
+  // D-09:DSH 是本地 deepseek 余额通道在本函数的**唯一接线点** —— 它复用官方
+  // /user/balance 快照;[1m] 路由记账(路由级最大窗口 / 爆窗降级闩锁)与其无共享
+  // 状态,那套记账仍只活在 claude-agent-process.ts,本 plan 不迁移、不搬运。
+  if (provider === 'dsh') return 'provider'
   const m = model ?? ''
   if (/^claude:glm(?:$|[-_])/i.test(m)) return 'glm'
   // grok / grokcc / grok-*：Claude-only 第三方 Grok 路由，有独立余额接口。
@@ -115,7 +127,7 @@ export function usageSourceForAgent(
 }
 
 export function agentProviderLabel(provider: AgentProvider): string {
-  return provider === 'claude' ? 'Claude' : 'Codex'
+  return { claude: 'Claude', codex: 'Codex', dsh: 'DeepSeek Harness' }[provider]
 }
 
 /** 主动 compact 时上下文不足、后端未触发压缩。这不是错误 —— 是"无需压缩"的正常

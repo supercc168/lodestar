@@ -17,6 +17,14 @@ export interface ConversationRef {
  * checkpoint makes checkpoints remain valid across nested forks/backtracks.
  */
 export type ConversationCheckpoint =
+  // DSH forks at the native session event sequence(上游 722e45a):id 为数字事件序号,
+  // 校验见 validateConversationLaunch 的 /^\d+$/ 分支。
+  | {
+      provider: 'dsh'
+      kind: 'event'
+      id: string
+      source: ConversationRef & { provider: 'dsh' }
+    }
   | {
       provider: 'claude'
       kind: 'assistant-message'
@@ -112,4 +120,9 @@ export function validateConversationLaunch(
     throw new Error('conversation checkpoint cwd does not match fork source')
   }
   if (!launch.through.id.trim()) throw new Error('conversation checkpoint id is empty')
+  // DSH 恢复参考必须带原始 cwd(上游 722e45a),checkpoint 也只接受事件序号:
+  // 非数字 / 负数 / 超出安全整数范围都显式抛错,不静默退化成从头开始。
+  if (provider === 'dsh' && (!/^\d+$/.test(launch.through.id) || !Number.isSafeInteger(Number(launch.through.id)))) {
+    throw new Error('DSH checkpoint must be a non-negative event sequence')
+  }
 }

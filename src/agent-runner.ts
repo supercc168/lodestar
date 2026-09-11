@@ -301,7 +301,9 @@ function normalizeQuestion(raw: unknown, index: number): AgentInputQuestion {
 
 function checkpointIdFrom(checkpoint: any, proc: AgentProcess): string | undefined {
   if (typeof checkpoint?.id === 'string' && checkpoint.id) return checkpoint.id
-  if (proc.provider === 'codex' && typeof proc.lastCompletedTurnId === 'string' && proc.lastCompletedTurnId) return proc.lastCompletedTurnId
+  // dsh 的 checkpoint 形如 { provider:'dsh', kind:'event', id:'<seq>' };事件序号由
+  // DshProcess 从原生事件流取,与 codex 的 turn id 同属"后端原生锚点"语义。
+  if ((proc.provider === 'codex' || proc.provider === 'dsh') && typeof proc.lastCompletedTurnId === 'string' && proc.lastCompletedTurnId) return proc.lastCompletedTurnId
   if (proc.provider === 'claude' && proc.lastAssistantUuid) return proc.lastAssistantUuid
   return undefined
 }
