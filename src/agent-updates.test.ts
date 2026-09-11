@@ -206,13 +206,15 @@ test('unconfirmed installer termination preserves occupied staging files and rec
 
 test('updating while an old native executable is running never overwrites, moves, or deletes its runtime', async () => {
   const root = await scratch()
-  const node = Bun.which('node')
-  if (!node) throw new Error('Node is required for the occupied-executable update test')
+  // 上游用 node 二进制当"正在运行的 native 可执行体";本地 node 是 homebrew 动态链接
+  // 版(@rpath/libnode.*.dylib),拷走后无法起。改用当前运行时自身的二进制(自包含)。
+  const binary = process.execPath
+  if (!binary) throw new Error('a self-contained runtime binary is required for the occupied-executable update test')
   let version = '1.0.0'
   const options = { root, metadata: async (name: string) => ({ name, version }),
     install: async (directory: string) => {
       await install(directory)
-      await copyFile(node, join(directory, 'agent.exe'))
+      await copyFile(binary, join(directory, 'agent.exe'))
       await chmod(join(directory, 'agent.exe'), 0o700)
     },
   }
