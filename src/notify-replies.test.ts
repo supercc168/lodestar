@@ -74,8 +74,10 @@ function harness() {
   }
   const runtime = createNotifyReplyRuntime(io)
   const open = (notifyId = 'nf_reply', openId = 'ou_owner', chatId = 'oc_group') => runtime.open(notifyId, chatId, openId)
+  // 等待卡是独立消息,标题即状态;通知原卡保留自己的 header,状态只进 body。
   const titleOf = (index: number) => updated[index]?.card?.header?.title?.content
-  return { ...io, runtime, open, sent, updated, notices, delivered, waitingChanged, logs, controls, titleOf }
+  const bodyOf = (index: number) => JSON.stringify(updated[index]?.card?.body ?? {})
+  return { ...io, runtime, open, sent, updated, notices, delivered, waitingChanged, logs, controls, titleOf, bodyOf }
 }
 
 describe('notification text reply runtime (上游 ae411a6)', () => {
@@ -99,7 +101,8 @@ describe('notification text reply runtime (上游 ae411a6)', () => {
     expect(h.titleOf(1)).toBe('回复已送达')
     expect(JSON.stringify(h.updated[1].card)).toContain('已安排部署')
     expect(h.updated[2].messageId).toBe('om_notification')
-    expect(h.titleOf(2)).toBe('回复已送达')
+    expect(h.bodyOf(2)).toContain('反馈已送达')
+    expect(h.bodyOf(2)).not.toContain('notify_reply"')
     expect(get('nf_reply')!.resolvedAt).toBeDefined()
     expect(pendingRepliesForChat('oc_group')).toHaveLength(0)
   })
@@ -158,8 +161,9 @@ describe('notification text reply runtime (上游 ae411a6)', () => {
     h.controls.dispatch = async () => { throw new Error('loopback 回调连接被拒') }
     expect(await h.runtime.consume(incoming())).toBe(true)
     expect(h.delivered).toHaveLength(1)
-    expect(h.titleOf(h.updated.length - 1)).toBe('回复发送失败')
-    expect(JSON.stringify(h.updated.map(entry => entry.card))).toContain('loopback 回调连接被拒')
+    expect(h.titleOf(1)).toBe('回复发送失败')
+    expect(h.bodyOf(1)).toContain('loopback 回调连接被拒')
+    expect(h.bodyOf(2)).toContain('回调失败')
     expect(get('nf_reply')!.replyState!.status).toBe('failed')
     expect(pendingRepliesForChat('oc_group')).toHaveLength(0)
     // 同一条输入不会因为重放而被二次 POST,也不会自动重发。
@@ -180,7 +184,8 @@ describe('notification text reply runtime (上游 ae411a6)', () => {
     expect(await h.runtime.consume(incoming())).toBe(true)
     expect(h.delivered).toHaveLength(1)
     expect(get('nf_reply')!.unknownAt).toBeDefined()
-    expect(h.titleOf(h.updated.length - 1)).toBe('回复送达状态未知')
+    expect(h.titleOf(1)).toBe('回复送达状态未知')
+    expect(h.bodyOf(2)).toContain('送达状态未知，禁止自动重试')
     expect(h.logs.some(line => line.includes('status=unknown'))).toBe(true)
     // 冻结后既不重开等待卡,也不重发。
     expect((await h.open()).ok).toBe(false)
@@ -204,7 +209,7 @@ describe('notification text reply runtime (上游 ae411a6)', () => {
     await h.runtime.recover(interrupted[0])
     expect(h.updated.length).toBe(before + 2)
     expect(h.titleOf(before)).toBe('回复送达状态未知')
-    expect(h.titleOf(before + 1)).toBe('回复送达状态未知')
+    expect(h.bodyOf(before + 1)).toContain('送达状态未知，禁止自动重试')
     expect(h.delivered).toHaveLength(1)
   })
 
@@ -214,15 +219,34 @@ describe('notification text reply runtime (上游 ae411a6)', () => {
     const h = harness()
     expect((await h.open()).ok).toBe(true)
     expect(await h.open()).toEqual({ ok: false, message: '此通知正在等待回复，请先在群里输入或由回复人取消' })
-    expect(await h.open('nf_other')).toEqual({ ok: false, message: '上一条通知回复正在发送，请稍后切换' })
+    // 另一条通知的「回复」放弃上一条(switched),同一个群里不并存两个等待态。
     expect((await h.open('nf_other', 'ou_other')).ok).toBe(true)
     expect(get('nf_reply')!.replyState!.status).toBe('cancelled')
     expect(get('nf_reply')!.replyState!.cancelReason).toBe('switched')
+    expect(h.bodyOf(0)).toContain('本次回复已放弃')
     expect(pendingRepliesForChat('oc_group').map(reg => reg.notifyId)).toEqual(['nf_other'])
     // 被放弃的输入永远不被提交,也不再被捕获。
     expect(await h.runtime.consume(incoming())).toBe(false)
     expect(await h.runtime.consume(incoming({ openId: 'ou_other' }))).toBe(true)
     expect(h.delivered.map(entry => entry.notifyId)).toEqual(['nf_other'])
+  })
+
+  test('switching is refused while the previous reply is mid-dispatch', async () => {
+    register(registration())
+    register(registration({ notifyId: 'nf_other' }))
+    const h = harness()
+    await h.open()
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    h.controls.dispatch = async () => { await gate; return { ok: true, detail: '200' } }
+    const inFlight = h.runtime.consume(incoming())
+    // consume 在首个 await 之前已把 sending 落盘并置 dispatching。
+    expect(get('nf_reply')!.replyState!.status).toBe('sending')
+    expect(await h.open('nf_other')).toEqual({ ok: false, message: '上一条通知回复正在发送，请稍后切换' })
+    expect(h.sent).toHaveLength(1)
+    release()
+    expect(await inFlight).toBe(true)
+    expect(h.delivered).toHaveLength(1)
   })
 
   test('pull mode (no callback URL) records the text without any dispatch', async () => {
