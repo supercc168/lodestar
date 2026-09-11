@@ -10,6 +10,11 @@
  *   projects_root = "~/"      # optional, defaults to $HOME
  *   live_elapsed = "bucket"   # optional: "bucket"(default) | "second"
  *
+ *   [runtime.agent_auto_update] # opt in per Agent; never checks at boot
+ *   codex = false
+ *   claude = false
+ *   dsh = false
+ *
  *   [notify]                  # all optional
  *   bind = "127.0.0.1"        # default 127.0.0.1 (loopback only)
  *   port = 9876               # default 9876
@@ -50,6 +55,9 @@ export interface LodestarConfig {
      * - `second`:按秒显示,footer 每 1s / 后台卡每 2s push(旧行为,配额更费)
      */
     live_elapsed: LiveElapsedMode
+    /** Opt-in periodic Agent updates (上游 659dddb)。三个开关独立;默认全 false —
+     *  启动时不检查、不安装,只有显式 `true` 才注册 6 小时节拍。 */
+    agent_auto_update: Record<'codex' | 'claude' | 'dsh', boolean>
   }
   notify: {
     bind: string
@@ -223,6 +231,33 @@ function loadConfig(): LodestarConfig {
     throw new Error(`lodestar: ${CONFIG_FILE} is missing [feishu].app_id / [feishu].app_secret`)
   }
   const projectsRoot = resolveProjectPath(t.runtime?.projects_root ?? homedir())
+  // [runtime.agent_auto_update] 三开关(上游 659dddb / D-06):默认全 false —— 不给
+  // 任何 agent 注册定时器即为"启动时不检查不更新"。旧标量形态按原值迁移,但节与标量
+  // 互斥、未知 agent 名与非法布尔值都明确报错,不静默忽略(T-02-20)。
+  const agentAutoUpdate: LodestarConfig['runtime']['agent_auto_update'] = { codex: false, claude: false, dsh: false }
+  const agentAutoUpdateSection = t['runtime.agent_auto_update']
+  const legacyAgentAutoUpdate = t.runtime?.agent_auto_update
+  if (legacyAgentAutoUpdate !== undefined) {
+    if (agentAutoUpdateSection) {
+      throw new Error('lodestar: legacy [runtime].agent_auto_update cannot be combined with [runtime.agent_auto_update]')
+    }
+    if (legacyAgentAutoUpdate !== 'true' && legacyAgentAutoUpdate !== 'false') {
+      throw new Error(`lodestar: [runtime].agent_auto_update must be true or false, got "${legacyAgentAutoUpdate}"`)
+    }
+    // Migrate the previous boolean without changing an explicit update choice.
+    for (const agent of ['codex', 'claude', 'dsh'] as const) agentAutoUpdate[agent] = legacyAgentAutoUpdate === 'true'
+    process.stderr.write('lodestar: 旧 agent_auto_update 总开关已按原值映射为三个开关;请改用 [runtime.agent_auto_update] 的 codex、claude、dsh 配置。\n')
+  } else if (agentAutoUpdateSection) {
+    for (const [agent, value] of Object.entries(agentAutoUpdateSection)) {
+      if (agent !== 'codex' && agent !== 'claude' && agent !== 'dsh') {
+        throw new Error(`lodestar: unknown [runtime.agent_auto_update] Agent "${agent}"`)
+      }
+      if (value !== 'true' && value !== 'false') {
+        throw new Error(`lodestar: [runtime.agent_auto_update].${agent} must be true or false, got "${value}"`)
+      }
+      agentAutoUpdate[agent] = value === 'true'
+    }
+  }
   const liveElapsedRaw = (t.runtime?.live_elapsed ?? 'bucket').trim().toLowerCase()
   if (liveElapsedRaw !== 'bucket' && liveElapsedRaw !== 'second') {
     throw new Error(
@@ -355,7 +390,7 @@ function loadConfig(): LodestarConfig {
   }
   return {
     feishu: { app_id: appId, app_secret: appSecret },
-    runtime: { projects_root: projectsRoot, live_elapsed: liveElapsed },
+    runtime: { projects_root: projectsRoot, live_elapsed: liveElapsed, agent_auto_update: agentAutoUpdate },
     notify: { bind: notifyBind, port: notifyPort },
     watchdog: {
       codexMode: configWatchdog.mode,

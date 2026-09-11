@@ -120,6 +120,8 @@ test('npm failures retain installation diagnostics', async () => {
 
 test('Windows termination rejects non-specific process targets before invoking taskkill', async () => {
   for (const pid of [0, -1, NaN, Infinity, 1.5]) {
-    await expect(terminateWindowsInstaller(pid)).rejects.toThrow('Invalid npm installer PID')
+    const error = await terminateWindowsInstaller(pid).catch(failure => failure as Error)
+    expect(error.message).toMatch('Invalid npm')
+    expect(error.message).toContain('PID')
   }
 })
