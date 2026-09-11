@@ -40,6 +40,7 @@ import { startNotifyServer } from './src/notify'
 import { AgentService } from './src/agent-service'
 import { handleAgentRequest } from './src/agent-api'
 import { ensureFeishuNotifySkill } from './src/notify-skill'
+import { createNotifyReplyRuntime } from './src/notify-replies'
 import { ensureLodestarAgentSkill, ensureLodestarAgentCommand } from './src/agent-skill'
 import { ensureImagegenSkill } from './src/imagegen-skill'
 import { ensureImagereadSkill } from './src/imageread-skill'
@@ -50,6 +51,7 @@ import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
 import { checkPidGuard, writePidFile } from './src/pid-guard'
 import {
   inboundMessageResource,
+  consumePendingTextInput,
   inboundResourceDownloadFailureText,
   isStaleAtReceipt,
 } from './src/inbound-message'
@@ -404,6 +406,17 @@ function extractPostMarkdown(
 // ── Inbound message handler ─────────────────────────────────────────────
 const STALE_THRESHOLD_MS = 30_000
 const seenMessageIds = new Set<string>()
+// 通知文字回复 runtime(上游 ae411a6)。全部副作用依赖注入 —— 这里接的是
+// daemon 自己的发送面与卡动作 dispatch;`onWaitingChanged` 是
+// `Session.refreshPendingAsks()` 的生产调用点(01-REVIEW IN-01)。
+const notifyReplies = createNotifyReplyRuntime({
+  sendCard: feishu.sendCard,
+  updateCard: feishu.updateCard,
+  sendText: feishu.sendText,
+  dispatch: dispatchCallback,
+  onWaitingChanged: chatId => sessions.get(chatId)?.refreshPendingAsks(),
+  log,
+})
 
 async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> {
   const message = data?.message
@@ -488,6 +501,7 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   try { contentObj = JSON.parse(message.content ?? '{}') } catch {}
   const msgType = message.message_type as string
   let text = ''
+  let postHasAttachments = false
   const filePaths: string[] = []
   if (msgType === 'text') {
     text = (contentObj.text ?? '').trim()
@@ -496,6 +510,7 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
     // markdown 给 Codex,内嵌图片/文件 key 走跟原生 image/file 一样的
     // downloadAttachment 路径。
     const post = extractPostMarkdown(contentObj)
+    postHasAttachments = post.imageKeys.length > 0 || post.fileKeys.length > 0
     text = post.markdown.trim()
     for (const key of post.imageKeys) {
       const p = await feishu.downloadAttachment(message.message_id, key, 'image')
@@ -515,6 +530,20 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   if (msgType === 'text' && text) {
     if (await session.runCommand(text, userOpenId)) return
   }
+
+  // Pending text is consumed once: notification reply → Agent question.
+  // Only then can it reach model-entry or ordinary Agent input below.
+  // 插在既有 :519-536 路由**之前**:reply 与 question 命中即 return,host_ask
+  // 与普通新轮落到下方原样保留的两段(02-CONTEXT Deferred→P2-02 / D-02)。
+  if ((msgType === 'text' || msgType === 'post') && text && !postHasAttachments
+    && await consumePendingTextInput({
+      reply: () => notifyReplies.consume({
+        chatId, openId: userOpenId, messageId: msgId ?? '', text, createTime,
+        parentId: message.parent_id,
+      }),
+      hasQuestion: () => session.hasPendingAsk(),
+      answerQuestion: () => session.onAskMessageAnswer(text, userOpenId, msgId ?? ''),
+    })) return
 
   // Pending AskUserQuestion: route the message as a custom answer
   // instead of opening a new turn. This is how custom-text answers
@@ -586,7 +615,7 @@ function cardActionLabel(kind: string): string {
     agy_forward_codex: 'agy 结果转交',
     agent_identity_page: 'Agent 身份翻页',
     agent_run_cancel: '取消 Agent 委派',
-    notify_callback: '通知反馈',
+    notify_callback: '通知反馈', notify_reply: '通知回复', notify_reply_cancel: '取消通知回复',
   }
   return labels[kind] ?? kind
 }
@@ -636,6 +665,9 @@ async function sendActionReceipt(chatId: string, text: string): Promise<void> {
 }
 
 async function publishCardActionResult(data: any, result: any): Promise<void> {
+  // 通知回复的等待卡由 runtime 自己维护(与 __cardActionCompletion 并列,
+  // 不改后者:push 模式 notify_callback 仍靠它驱动 dedupe)。
+  if (result?.__cardActionPresented) return
   const kind = String(data?.action?.value?.kind ?? 'unknown')
   const label = cardActionLabel(kind)
   const chatId = String(
@@ -706,7 +738,17 @@ async function publishCardActionFailure(data: any, error: unknown): Promise<void
 const cardActionAdmission = createCardActionAdmission<any, object>({
   actor: chatActor,
   deduper: cardActionDeduper,
-  scope: data => String(data?.context?.open_chat_id ?? '') || '__notify_global__',
+  scope: data => {
+    // 三类 notify 动作按注册记录归属群串行(上游 ae411a6):卡片可能经
+    // 转发/回调载荷丢失 context,注册表是权威来源;未知 notify_id 仍回落
+    // 到 context,不在这里做准入判断(准入在 handleCardAction 内)。
+    const kind = String(data?.action?.value?.kind ?? '')
+    if (kind === 'notify_callback' || kind === 'notify_reply' || kind === 'notify_reply_cancel') {
+      const reg = getNotifyCallback(String(data?.action?.value?.notify_id ?? ''))
+      if (reg) return reg.chatId
+    }
+    return String(data?.context?.open_chat_id ?? '') || '__notify_global__'
+  },
   execute: handleCardAction,
   present: publishCardActionResult,
   presentExecutionFailure: async (data, error) => {
@@ -773,8 +815,19 @@ async function handleCardAction(data: any): Promise<any> {
   // this chat — a notify push doesn't start a session, and the click's
   // job is to ping the local caller, not drive a turn. Short-circuit
   // before the session guard below.
-  if (value.kind === 'notify_callback') {
-    return await handleNotifyCallback(value, chatId, userId)
+  if (value.kind === 'notify_callback' || value.kind === 'notify_reply' || value.kind === 'notify_reply_cancel') {
+    const notifyId = String(value.notify_id ?? '')
+    const reg = getNotifyCallback(notifyId)
+    if (reg) data.__cardActionChatId = reg.chatId
+    if (value.kind === 'notify_callback') return await handleNotifyCallback(value, chatId, userId)
+    const result = value.kind === 'notify_reply'
+      ? await notifyReplies.open(notifyId, chatId, userId)
+      : await notifyReplies.cancel(notifyId, String(value.reply_id ?? ''), chatId, userId)
+    const response = withBusinessOutcome({
+      toast: { type: result.ok ? 'success' : 'error', content: result.message },
+      __cardActionPresented: result.presented === true,
+    }, result.ok)
+    return reg ? withNotifyContext(reg, response) : response
   }
 
   const session = sessions.get(chatId)
@@ -835,6 +888,10 @@ async function handleCardAction(data: any): Promise<any> {
       return modelActionResponse(result)
     }
     case 'ask': {
+      // WR-02(上游 ae411a6 配套):被通知回复挡住的点击要说出真实原因,
+      // 而不是落到「问题已失效或选项无效」的误诊。既有分支保持不变。
+      const blocked = session.askBlockReason(String(value.tool_use_id ?? ''))
+      if (blocked) return withBusinessOutcome({ toast: { type: 'error', content: blocked } }, false)
       // Custom-text branch: form submit packages the input under
       // `form_value`. Try a couple of plausible keys since the exact
       // shape can drift between Feishu schema versions; fall back to
@@ -1032,6 +1089,13 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
   }
   if (isDispatching(notifyId)) {
     return withNotifyContext(reg, { toast: { type: 'info', content: '处理中…' } })
+  }
+  // 互斥门:等待文字回复期间,按钮选择会让位于群输入 —— 拒绝了才不会
+  // 出现「点了按钮却没走上/回复文本也没进」的双丢(T-02-11)。
+  if (reg.replyState?.status === 'waiting' || reg.replyState?.status === 'sending') {
+    return withNotifyContext(reg, withBusinessOutcome({
+      toast: { type: 'error', content: '正在等待文字回复，请先发送或取消回复，再选择按钮' },
+    }, false))
   }
   const button = reg.buttons.find((b) => b.id === buttonId)
   if (!button) {
@@ -1501,7 +1565,12 @@ async function boot(): Promise<void> {
   // Reload persisted /notify button→callback registrations before the
   // notify server starts serving, so a card tapped right after a daemon
   // restart still routes to its caller. Prunes entries older than 7 days.
-  loadCallbacks()
+  for (const reg of loadCallbacks()) {
+    // Restore visible UNKNOWN receipts for interrupted text deliveries. Use
+    // the same actor and shutdown tracking as live notification actions.
+    void trackCardActionWork(chatActor.enqueue(reg.chatId, () => notifyReplies.recover(reg)))
+      .catch(error => log(`notify-reply recovery failed: ${error instanceof Error ? error.message : error}`))
+  }
   // Install the bare delegated-agent command first so Skill bash can find
   // `lodestar-agent` on PATH. Wrapper lives in DATA_DIR/bin and contains
   // paths only — never capability or provider credentials. The installer
