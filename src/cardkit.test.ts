@@ -136,12 +136,27 @@ describe('cardkit terminal write failure observation', () => {
     cardkit.markCardWriteDead('card_replace_dead')
     await cardkit.replaceElement('card_replace_dead', 'footer', footer(), code => failures.push(code))
 
+    // 短路只针对「显式删除」的元素(三态语义,上游 378f4a4):失败可恢复的元素
+    // 与 footer 仍然放行,所以这里先用一次真实删除把元素置为不可复活。
     cardkit.recordCardCreated('card_replace_element_dead', 1)
-    failNextCardKitCall(300305)
-    await cardkit.addElement('card_replace_element_dead', footer(), {}, () => {})
-    await cardkit.replaceElement('card_replace_element_dead', 'footer', footer(), code => failures.push(code))
+    await cardkit.addElement(
+      'card_replace_element_dead',
+      { tag: 'markdown', element_id: 'assistant_0', content: 'assistant content' },
+      {},
+      () => {},
+    )
+    await cardkit.deleteElement('card_replace_element_dead', 'assistant_0')
+    const callsBeforeShortCircuit = calls.length
+    await cardkit.replaceElement(
+      'card_replace_element_dead',
+      'assistant_0',
+      { tag: 'markdown', element_id: 'assistant_0', content: 'late content' },
+      code => failures.push(code),
+    )
 
     expect(failures).toEqual([300313, undefined, undefined])
+    expect(failures).toHaveLength(3)
+    expect(calls).toHaveLength(callsBeforeShortCircuit)
     await cardkit.dispose('card_replace_fail')
     await cardkit.dispose('card_replace_dead')
     await cardkit.dispose('card_replace_element_dead')
@@ -306,6 +321,166 @@ describe('cardkit 容量指纹数据模型 (上游 378f4a4)', () => {
     expect(cardkit.getWrittenContentElementIds(cardId)).toEqual(['assistant_0'])
     expect(cardkit.getWrittenContentElementIds('card_fingerprint_never_created')).toEqual([])
     await cardkit.dispose(cardId)
+  })
+})
+
+describe('cardkit 失败元素三态语义 (上游 378f4a4)', () => {
+  /** 只让下一次 Card Kit 调用失败(返回指定 code),之后恢复默认 mock。 */
+  function failNextCardKitCall(code: number): void {
+    const previousFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      globalThis.fetch = previousFetch
+      const url = new URL(String(input))
+      calls.push({
+        method: String(init?.method ?? 'GET'),
+        path: url.pathname.replace('/open-apis/cardkit/v1', ''),
+        body: init?.body ? JSON.parse(String(init.body)) : null,
+      })
+      return new Response(JSON.stringify({ code, msg: `injected failure ${code}` }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+  }
+
+  test('a rejected add keeps its placement so a later update rebuilds it (上游 378f4a4)', async () => {
+    const id = 'card_three_state_placement'
+    cardkit.recordCardCreated(id, 1)
+    failNextCardKitCall(300308)
+    try {
+      const added = cardkit.addElementChecked(id, {
+        tag: 'markdown', element_id: 'tool_0', content: 'working',
+      }, { type: 'insert_before', targetElementId: 'footer' })
+      const completed = cardkit.replaceElementChecked(id, 'tool_0', {
+        tag: 'markdown', element_id: 'tool_0', content: 'complete result',
+      })
+      expect(await added).toBe(false)
+      // 失败可恢复:同 id 的更新用最新内容在原 placement 重建
+      expect(await completed).toBe(true)
+      expect(calls.map(call => call.method)).toEqual(['POST', 'POST'])
+      expect(calls[1]!.body.target_element_id).toBe('footer')
+      expect(calls[1]!.body.elements).toContain('complete result')
+      expect(cardkit.isDeadElement(id, 'tool_0')).toBe(false)
+      expect(cardkit.getElementCount(id)).toBe(2)
+    } finally {
+      await cardkit.dispose(id)
+    }
+  })
+
+  test('a rejected update stays retryable and never revives after an explicit delete (上游 378f4a4)', async () => {
+    const id = 'card_three_state_retry'
+    cardkit.recordCardCreated(id, 1)
+    await cardkit.addElementChecked(id, { tag: 'markdown', element_id: 'tool_0', content: 'working' })
+    const healthy = globalThis.fetch
+    globalThis.fetch = (async () => new Response(JSON.stringify({
+      code: 200860, msg: 'ErrMsg: card over max size;',
+    }), {
+      headers: { 'Content-Type': 'application/json' },
+    })) as unknown as typeof fetch
+    try {
+      expect(await cardkit.replaceElementChecked(id, 'tool_0', {
+        tag: 'markdown', element_id: 'tool_0', content: 'oversized result',
+      })).toBe(false)
+      // 容量拒绝仍标 dead(保本地 300315/200860 判定),但不再是永久死元素
+      expect(cardkit.isDeadElement(id, 'tool_0')).toBe(true)
+      globalThis.fetch = healthy
+      expect(await cardkit.replaceElementChecked(id, 'tool_0', {
+        tag: 'markdown', element_id: 'tool_0', content: 'updated result',
+      })).toBe(true)
+      // 删除成功:指纹与失败标记一并清除,迟到的更新立即短路且不发 HTTP
+      expect(await cardkit.deleteElementChecked(id, 'tool_0')).toBe(true)
+      expect(cardkit.getWrittenContentElementIds(id)).toEqual([])
+      const before = calls.length
+      expect(await cardkit.replaceElementChecked(id, 'tool_0', {
+        tag: 'markdown', element_id: 'tool_0', content: 'late result',
+      })).toBe(false)
+      expect(calls).toHaveLength(before)
+    } finally {
+      await cardkit.dispose(id)
+    }
+  })
+
+  test('deleting after a rejected capacity update removes the remote element (上游 378f4a4)', async () => {
+    const id = 'card_three_state_delete'
+    cardkit.recordCardCreated(id, 1)
+    await cardkit.addElementChecked(id, { tag: 'markdown', element_id: 'tool_0', content: 'old content' })
+    failNextCardKitCall(200860)
+    try {
+      expect(await cardkit.replaceElementChecked(id, 'tool_0', {
+        tag: 'markdown', element_id: 'tool_0', content: 'new content',
+      })).toBe(false)
+      expect(cardkit.isDeadElement(id, 'tool_0')).toBe(true)
+      expect(await cardkit.deleteElementChecked(id, 'tool_0')).toBe(true)
+      expect(calls.at(-1)?.method).toBe('DELETE')
+      expect(calls.at(-1)?.path).toBe(`/cards/${id}/elements/tool_0`)
+      expect(cardkit.getElementCount(id)).toBe(1)
+    } finally {
+      await cardkit.dispose(id)
+    }
+  })
+
+  test('writeDead short-circuits every write path ahead of the recovery semantics', async () => {
+    const id = 'card_three_state_write_dead'
+    cardkit.recordCardCreated(id, 1)
+    await cardkit.addElement(id, { tag: 'markdown', element_id: 'tool_0', content: 'x' })
+    cardkit.markCardWriteDead(id)
+    const before = calls.length
+
+    await cardkit.addElement(id, { tag: 'markdown', element_id: 'tool_1', content: 'y' })
+    await cardkit.replaceElement(id, 'tool_0', { tag: 'markdown', element_id: 'tool_0', content: 'z' })
+    await cardkit.deleteElement(id, 'tool_0')
+    expect(await cardkit.replaceElementChecked(id, 'tool_0', {
+      tag: 'markdown', element_id: 'tool_0', content: 'z2',
+    })).toBe(false)
+    expect(await cardkit.addElementChecked(id, {
+      tag: 'markdown', element_id: 'tool_2', content: 'w',
+    })).toBe(false)
+
+    expect(calls).toHaveLength(before)
+    expect(cardkit.getElementCount(id)).toBe(2)
+    await cardkit.dispose(id)
+  })
+
+  test('dispose drops the three-state bookkeeping together with the card', async () => {
+    const id = 'card_three_state_dispose'
+    cardkit.recordCardCreated(id, 1)
+    failNextCardKitCall(300308)
+    await cardkit.addElement(id, {
+      tag: 'markdown', element_id: 'tool_0', content: 'x',
+    }, { type: 'insert_before', targetElementId: 'footer' })
+    expect(cardkit.isDeadElement(id, 'tool_0')).toBe(true)
+
+    await cardkit.dispose(id)
+    expect(cardkit.isDisposed(id)).toBe(true)
+    // 状态整体随卡丢弃:dead/placement/指纹都不残留(墓碑语义不变)
+    expect(cardkit.isDeadElement(id, 'tool_0')).toBe(false)
+    expect(cardkit.getWrittenContentElementIds(id)).toEqual([])
+    const before = calls.length
+    await cardkit.addElement(id, { tag: 'markdown', element_id: 'tool_0', content: 'late' })
+    expect(calls).toHaveLength(before)
+  })
+
+  test('a retried add reports its real landed state with the latest content (上游 378f4a4)', async () => {
+    const id = 'card_three_state_landed'
+    cardkit.recordCardCreated(id, 1)
+    failNextCardKitCall(300308)
+    try {
+      const failed = await cardkit.addElementResult(id, {
+        tag: 'markdown', element_id: 'tool_0', content: 'working',
+      }, { type: 'insert_before', targetElementId: 'footer' })
+      expect(failed.landed).toBe(false)
+      expect(failed.failure?.code).toBe(300308)
+
+      const retried = await cardkit.addElementResult(id, {
+        tag: 'markdown', element_id: 'tool_0', content: 'latest',
+      }, { type: 'insert_before', targetElementId: 'footer' })
+      expect(retried).toEqual({ landed: true })
+      expect(calls.at(-1)?.body.target_element_id).toBe('footer')
+      expect(String(calls.at(-1)?.body.elements)).toContain('latest')
+      expect(cardkit.getElementCount(id)).toBe(2)
+      expect(cardkit.getWrittenContentElementIds(id)).toEqual(['tool_0'])
+    } finally {
+      await cardkit.dispose(id)
+    }
   })
 })
 
