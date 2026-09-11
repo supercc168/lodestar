@@ -22,6 +22,8 @@
  *       ],
  *       "callback": "http://127.0.0.1:9999/hook"  // optional loopback URL (push; callback buttons only)
  *     }
+ *   For a text-reply card, omit buttons and set "allow_reply": true.
+ *   For a plain notification, omit both. All three types support text/images.
  *   → 200 { ok: true, chat_id, message_id, notify_id? }
  *   → 400 bad/empty json or missing/invalid field
  *   → 404 project not bound to any Feishu group
@@ -53,13 +55,14 @@ import { createServer, type IncomingMessage, type ServerResponse } from 'node:ht
 import { randomUUID } from 'node:crypto'
 import { log } from './log'
 import * as feishu from './feishu'
-import { downgradeExternalImagesForCardKit } from './cards/elements'
+import { downgradeExternalImagesForCardKit, sanitizeMarkdownForCardKit } from './cards/elements'
 import {
   buildNotifyResult,
   get as getCallback,
   register as registerCallback,
   type NotifyButton,
   type NotifyRegistration,
+  type NotifyReplyState,
 } from './notify-callbacks'
 
 export type Level = 'info' | 'warn' | 'error'
@@ -74,6 +77,7 @@ const BUTTON_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
  * owns its full-width row and may carry a short phrase; a paragraph-long
  * label is a caller mistake worth rejecting rather than rendering. */
 const BUTTON_TEXT_MAX = 64
+const MIXED_INTERACTION_ERROR = '"buttons" and "allow_reply":true are mutually exclusive; choose button selection or text reply'
 
 export interface ParsedButton {
   id: string
@@ -108,7 +112,8 @@ interface NotifyActionValue {
 export type NotifyResolutionStatus = 'processing' | 'delivered' | 'failed' | 'unknown' | 'done'
 export interface NotifyResolution {
   status: NotifyResolutionStatus
-  buttonId: string
+  buttonId?: string
+  kind?: 'text'
   text: string
   operatorOpenId: string
   /** Failure reason — only when `status === 'failed'`. */
@@ -131,11 +136,14 @@ export function buildNotifyCard(opts: {
    * Requires `notifyId` so each button's `value` carries the routing
    * payload back to the click handler. */
   buttons?: ParsedButton[]
+  /** Text-reply mode. Mutually exclusive with nonempty buttons. */
+  allowReply?: boolean
   notifyId?: string
   /** Post-click status marker — replaces the button row. See
    * {@link NotifyResolutionStatus} for the transitions. */
   resolution?: NotifyResolution
 }): object {
+  if (opts.allowReply && opts.buttons?.length) throw new Error(MIXED_INTERACTION_ERROR)
   const template = opts.level === 'error' ? 'red'
     : opts.level === 'warn' ? 'yellow'
     : 'blue'
@@ -145,7 +153,7 @@ export function buildNotifyCard(opts: {
   const hasButtons = !!(opts.buttons?.length)
   // Callback buttons need notifyId; pure open_url buttons do not.
   const hasCallbackButtons = !!(opts.buttons?.some((b) => !b.url) && opts.notifyId)
-  const interactive = hasButtons
+  const interactive = hasButtons || (!!opts.allowReply && !!opts.notifyId)
   const d = new Date()
   const hhmm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
   const elements: object[] = []
@@ -166,20 +174,21 @@ export function buildNotifyCard(opts: {
     // rides in the callback payload for the caller's audit; the card
     // shows only choice + status + time.
     const r = opts.resolution
+    const choice = r.kind === 'text' ? '已回复' : `已选择:${r.text}`
     let marker: string
     if (r.status === 'processing') {
-      marker = `<font color='blue'>⏳ 已选择:${r.text} · 推送中…</font>`
+      marker = `<font color='blue'>⏳ ${choice} · 推送中…</font>`
     } else if (r.status === 'failed') {
-      marker = `<font color='red'>⚠️ 已选:${r.text} · 回调失败:${r.detail ?? '未知'} · ${hhmm}</font>`
+      marker = `<font color='red'>⚠️ ${r.kind === 'text' ? choice : `已选:${r.text}`} · 回调失败:${r.detail ?? '未知'} · ${hhmm}</font>`
     } else if (r.status === 'delivered') {
-      marker = `<font color='green'>✅ 已选择:${r.text} · 反馈已送达 · ${hhmm}</font>`
+      marker = `<font color='green'>✅ ${choice} · 反馈已送达 · ${hhmm}</font>`
     } else if (r.status === 'unknown') {
       // 外部回调已成功但本地墓碑未确认(ec149d7):冻结并禁止自动重试,
       // 与 daemon 侧 unknownAt 准入冻结(01-05)同一语义的可见终态。
-      marker = `<font color='red'>⚠️ 已选择:${r.text} · 外部回调已成功，但本地确认状态未知，禁止自动重试 · ${hhmm}</font>`
+      marker = `<font color='red'>⚠️ ${choice} · ${r.kind === 'text' ? '送达状态未知，禁止自动重试' : '外部回调已成功，但本地确认状态未知，禁止自动重试'} · ${hhmm}</font>`
     } else {
       // 'done' — pull / display-only mode (no push to acknowledge).
-      marker = `<font color='green'>✅ 已选择:${r.text} · ${hhmm}</font>`
+      marker = `<font color='green'>✅ ${choice} · ${hhmm}</font>`
     }
     elements.push({ tag: 'markdown', content: marker })
     // Caller's reply (push mode, delivered) — its own line below the
@@ -189,7 +198,11 @@ export function buildNotifyCard(opts: {
     if (r.status === 'delivered' && r.reply) {
       elements.push({ tag: 'markdown', content: downgradeExternalImagesForCardKit(r.reply) })
     }
-  } else if (interactive) {
+  }
+  // 明确回调失败是唯一可重试的终态(上游 ae411a6):回复按钮据此保留,
+  // 其余终态(processing/delivered/done/unknown)不再可答。
+  const canAnswer = interactive && (!opts.resolution || opts.resolution.status === 'failed')
+  if (!opts.resolution && hasButtons) {
     // One full-width column whose elements stack vertically ⇒ each
     // button gets its own row. open_url buttons always render; callback
     // buttons require notifyId (otherwise they'd ship a dead value —
@@ -239,14 +252,66 @@ export function buildNotifyCard(opts: {
 
   elements.push({ tag: 'hr' })
   elements.push({ tag: 'markdown', content: `<font color='grey'>via notify · ${hhmm}</font>` })
+  if (canAnswer && opts.allowReply) {
+    // Text-reply cards have one fixed control at the bottom, after the footer.
+    elements.push({ tag: 'column_set', columns: [{
+      tag: 'column', width: 'weighted', weight: 1,
+      elements: [{
+        tag: 'button', text: { tag: 'plain_text', content: '回复' }, type: 'primary',
+        behaviors: [{ type: 'callback', value: { kind: 'notify_reply', notify_id: opts.notifyId } }],
+      }],
+    }] })
+  }
+  // update_multi only when the card can freeze for the whole group: callback
+  // buttons or a text-reply reservation. Pure open_url cards are one-shot
+  // navigation — no update.
+  const groupUpdatable = hasCallbackButtons || (!!opts.allowReply && !!opts.notifyId)
   return {
     schema: '2.0',
-    // update_multi only when callback buttons can freeze the card for the
-    // whole group. Pure open_url cards are one-shot navigation — no update.
-    config: hasCallbackButtons ? { update_multi: true } : {},
+    config: groupUpdatable ? { update_multi: true } : {},
     header: {
       title: { tag: 'plain_text', content: `${emoji} ${opts.title}` },
       template,
+    },
+    body: { elements },
+  }
+}
+
+/** A separate message owns the input conversation; the notification itself
+ * remains recognizable while this card changes from waiting to a receipt. */
+export function buildNotifyReplyCard(
+  reg: NotifyRegistration,
+  state: NotifyReplyState,
+  resolution?: { status: NotifyResolutionStatus; detail?: string; reply?: string },
+): object {
+  const status = resolution?.status ?? state.status
+  const labels: Record<string, string> = {
+    waiting: '等待用户输入', sending: '正在发送回复', processing: '正在发送回复',
+    delivered: '回复已送达', done: '回复已记录', failed: '回复发送失败',
+    cancelled: '已取消回复', unknown: '回复送达状态未知',
+  }
+  const elements: object[] = [{ tag: 'markdown', content: `通知：${sanitizeMarkdownForCardKit(reg.title)}` }]
+  if (state.response) elements.push({ tag: 'markdown', content: sanitizeMarkdownForCardKit(state.response.text) })
+  if (status === 'waiting') {
+    elements.push({ tag: 'markdown', content: `<at id=${state.openId}></at> 请在群里发送一条文字消息作为回复。\n你的下一条文字优先用于这条通知，完成后再回答 Agent 的提问。点击其他通知的「回复」会放弃本次回复；群控制命令仍然优先。` })
+    elements.push({ tag: 'button', text: { tag: 'plain_text', content: '取消回复' }, type: 'default',
+      behaviors: [{ type: 'callback', value: { kind: 'notify_reply_cancel', notify_id: reg.notifyId, reply_id: state.id } }],
+    })
+  }
+  if (status === 'cancelled' && state.cancelReason === 'switched') {
+    elements.push({ tag: 'markdown', content: '已切换到另一条通知，本次回复已放弃。' })
+  }
+  const detail = resolution?.detail ?? state.error
+  if (detail) elements.push({ tag: 'markdown', content: `<font color='red'>${sanitizeMarkdownForCardKit(detail)}</font>` })
+  if (status === 'failed') elements.push({ tag: 'markdown', content: '请点击原通知的「回复」按钮后重新输入。' })
+  if (status === 'unknown') elements.push({ tag: 'markdown', content: '无法确认是否已送达，请联系通知发起方核实；已禁止自动重试。' })
+  if (resolution?.reply) elements.push({ tag: 'markdown', content: sanitizeMarkdownForCardKit(resolution.reply) })
+  return {
+    schema: '2.0', config: { update_multi: true },
+    header: {
+      title: { tag: 'plain_text', content: labels[status] },
+      template: status === 'failed' || status === 'unknown' ? 'red'
+        : status === 'delivered' || status === 'done' ? 'green' : 'blue',
     },
     body: { elements },
   }
@@ -370,7 +435,11 @@ export function startNotifyServer(opts: NotifyOptions): void {
   }
 }
 
-async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): Promise<void> {
+export async function handleNotifyRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  transport: Pick<typeof feishu, 'sanitizeSessionName' | 'chatIdForSession' | 'uploadImageKey' | 'sendCard'> = feishu,
+): Promise<void> {
   const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
 
   const sendText = (status: number, body: string): void => {
@@ -387,11 +456,12 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
   if (req.method === 'GET' && url.pathname === '/') {
     return sendText(200,
       'lodestar notify\n' +
-      'POST /notify        body={project,text,title?,level?,images?,buttons?,callback?}  → push card to group\n' +
-      'GET  /notify/result/<notify_id>  → poll a button card\'s resolution (pull mode, no callback server)\n' +
+      'POST /notify        body={project,text,title?,level?,images?,buttons?,allow_reply?,callback?}  → push card to group\n' +
+      'GET  /notify/result/<notify_id>  → poll a button choice or text reply (pull mode, no callback server)\n' +
       'GET  /agents/identities; POST/GET/DELETE /agents/runs[/<id>]  → capability-protected delegated Agents\n' +
       'levels: info|warn|error (default info); images=[/abs/*.png] uploaded + embedded\n' +
-      'buttons:[{id,text,type?}] (any count, one per row); callback=http://127.0.0.1:PORT/path optional (push) — omit to poll\n')
+      'card types: plain (neither field), selection (buttons), text reply (allow_reply:true); do not combine buttons and allow_reply:true\n' +
+      'all types support text + images; callback=http://127.0.0.1:PORT/path optional for selection/reply (push) — omit to poll\n')
   }
   // Pull mode: stateless callers retrieve a button card's verdict
   // without running a callback server. Returns resolved:false while
@@ -411,6 +481,11 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
   for await (const chunk of req) raw += chunk.toString()
   let body: any = {}
   try { body = JSON.parse(raw) } catch { return sendText(400, 'bad json') }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return sendText(400, 'body must be an object')
+  if (body.allow_reply !== undefined && typeof body.allow_reply !== 'boolean') {
+    return sendText(400, '"allow_reply" must be a boolean')
+  }
+  const allowReply = body.allow_reply === true
 
   const project = String(body.project ?? '').trim()
   const text = String(body.text ?? '')
@@ -428,14 +503,19 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
   // caller polls GET /notify/result/<id>, or just reads the frozen card.
   // Pure open_url buttons (url set) need neither registration nor notify_id.
   const hasButtons = !!(buttons && buttons.length)
+  if (hasButtons && allowReply) return sendText(400, MIXED_INTERACTION_ERROR)
+  const interactive = hasButtons || allowReply
   const hasCallbackButtons = !!(buttons && buttons.some((b) => !b.url))
+  // 本地:纯 open_url 卡没有回调面,不申请 notify_id、不落注册(上游此处
+  // 无 open_url 概念);文本回复卡必须注册,否则回复态无处落盘。
+  const notifiable = hasCallbackButtons || allowReply
   const callbackUrlOrDefault = callbackUrl ?? ''
 
   const level: Level = (VALID_LEVELS.has(levelRaw as Level) ? levelRaw : 'info') as Level
   const title = titleRaw || project
 
-  const sessionName = feishu.sanitizeSessionName(project)
-  const chatId = feishu.chatIdForSession(sessionName)
+  const sessionName = transport.sanitizeSessionName(project)
+  const chatId = transport.chatIdForSession(sessionName)
   if (!chatId) {
     log(`notify: project "${project}" (sanitized "${sessionName}") has no chat binding → 404`)
     return sendText(404,
@@ -447,20 +527,21 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
   for (const entry of imageInputs) {
     const src = String(entry ?? '').trim()
     if (!src) continue
-    const key = await feishu.uploadImageKey(src)
+    const key = await transport.uploadImageKey(src)
     images.push({ key: key ?? '', src })
   }
 
-  // notify_id only when at least one callback-style button exists.
-  const notifyId = hasCallbackButtons ? `nf_${randomUUID()}` : ''
-  const card = buildNotifyCard({ title, text, level, images, buttons, notifyId })
-  const messageId = await feishu.sendCard(chatId, card)
+  // notify_id is generated up-front so it can be baked into every button's
+  // `value` payload (and the fixed reply button) BEFORE sendCard.
+  const notifyId = notifiable ? `nf_${randomUUID()}` : ''
+  const card = buildNotifyCard({ title, text, level, images, buttons, allowReply, notifyId })
+  const messageId = await transport.sendCard(chatId, card)
   if (!messageId) {
     log(`notify: sendCard failed → 502 (project="${project}" chat=${chatId.slice(0, 8)}…)`)
     return sendText(502, 'feishu sendCard failed (see daemon log)')
   }
 
-  if (hasCallbackButtons && notifyId) {
+  if (notifiable && notifyId) {
     const reg: NotifyRegistration = {
       notifyId,
       callbackUrl: callbackUrlOrDefault,
@@ -473,13 +554,14 @@ async function handleNotifyRequest(req: IncomingMessage, res: ServerResponse): P
       imageKeys: images,
       // Persist callback buttons only (open_url need no freeze/rebuild).
       buttons: (buttons as NotifyButton[]).filter((b) => !(b as ParsedButton).url),
+      allowReply,
       createdAt: Date.now(),
     }
     registerCallback(reg)
   }
 
   const openUrlCount = buttons?.filter((b) => b.url).length ?? 0
-  log(`notify: → ${project} (${chatId.slice(0, 8)}…) level=${level} bytes=${text.length} images=${images.length} buttons=${buttons?.length ?? 0} open_url=${openUrlCount} push=${hasCallbackButtons && !!callbackUrlOrDefault ? 1 : 0} msg=${messageId}`)
+  log(`notify: → ${project} (${chatId.slice(0, 8)}…) level=${level} bytes=${text.length} images=${images.length} buttons=${buttons?.length ?? 0} open_url=${openUrlCount} allowReply=${allowReply} interactive=${interactive} push=${notifiable && !!callbackUrlOrDefault ? 1 : 0} msg=${messageId}`)
   sendJson(200, {
     ok: true,
     chat_id: chatId,
@@ -500,6 +582,7 @@ export function buildNotifyCardFromReg(
     level: reg.level,
     images: reg.imageKeys,
     buttons: reg.buttons,
+    allowReply: reg.allowReply,
     notifyId: reg.notifyId,
     resolution,
   })
