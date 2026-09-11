@@ -6,7 +6,7 @@ import * as cards from './cards'
 import * as feishu from './feishu'
 import { config } from './config'
 import { getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
-import { startAgentWorker, type AgentWorkerHandle } from './agent-runner'
+import { AgentWorkerFailure, startAgentWorker, type AgentWorkerHandle } from './agent-runner'
 import { agentApiUrl } from './agent-runtime'
 import { DELEGATED_AGENT_INSTRUCTIONS } from './agent-skill'
 import type {
@@ -421,6 +421,9 @@ export class AgentService {
       this.persist(run)
       await this.updateWorkerCard(run, worker)
     } catch (error) {
+      // D-14:失败或取消都不丢已生成输出(AgentWorkerFailure 携带 output);
+      // 取消路径的 status/error 仍由 cancelTree 统一落「停止原因」。
+      if (error instanceof AgentWorkerFailure) worker.output = error.output
       if (!run.cancelled) {
         this.clearProgressTimer(run, identity.id)
         worker.status = 'failed'

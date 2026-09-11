@@ -6,8 +6,6 @@ import type { AgentInputQuestion, AgentInputRequest, AgentStep } from './agent-r
 import type { ConversationLaunch } from './conversation'
 import type { ProjectProfile } from './config'
 
-const AGENT_TURN_TIMEOUT_MS = 30 * 60 * 1000
-const MAX_AGENT_OUTPUT_CHARS = 2_000_000
 const INPUT_TOOLS = new Set(['AskUserQuestion', 'request_user_input'])
 
 export interface AgentWorkerResult {
@@ -19,6 +17,15 @@ export interface AgentWorkerResult {
   usage: Record<string, number | undefined> | null
 }
 
+/** D-14:失败或取消时连同此前已生成的输出一起抛出 —— 失败不再吞掉正文。
+ *  调用方(agent-service)据此把 output 落回 worker.output。 */
+export class AgentWorkerFailure extends Error {
+  constructor(cause: Error, readonly output: string, readonly sessionId: string | null) {
+    super(cause.message, { cause })
+    this.name = 'AgentWorkerFailure'
+  }
+}
+
 export interface AgentWorkerCallbacks {
   onNeedsInput?(request: AgentInputRequest): void
   onProgress?(step: AgentStep): void
@@ -27,6 +34,8 @@ export interface AgentWorkerCallbacks {
 
 export interface AgentWorkerHandle {
   done: Promise<AgentWorkerResult>
+  /** 进程是否仍在:供「取消后进程是否真的退出」与并发槽位判定使用。 */
+  isAlive?(): boolean
   pendingInput(): AgentInputRequest | null
   answer(requestId: string, answers: Record<string, string>): void
   cancel(reason?: string): Promise<void>
@@ -74,12 +83,10 @@ export function collectAgentTurn(
   callbacks: AgentWorkerCallbacks = {},
   remember: typeof rememberAgentSession = rememberAgentSession,
 ): AgentWorkerHandle {
-  let output = ''
-  let outputTruncated = false
+  const output: string[] = []
   let lastError: Error | null = null
   let settled = false
   let waiting: { request: AgentInputRequest; originalInput: Record<string, unknown> } | null = null
-  let timeout: ReturnType<typeof setTimeout> | null = null
   let resolveDone!: (value: AgentWorkerResult) => void
   let rejectDone!: (error: Error) => void
   const startedAt = Date.now()
@@ -88,16 +95,6 @@ export function collectAgentTurn(
     rejectDone = reject
   })
 
-  const clearWatchdog = () => {
-    if (timeout) clearTimeout(timeout)
-    timeout = null
-  }
-  const armWatchdog = () => {
-    clearWatchdog()
-    timeout = setTimeout(() => {
-      void finish(new Error(`delegated agent timed out after ${AGENT_TURN_TIMEOUT_MS / 1000}s`))
-    }, AGENT_TURN_TIMEOUT_MS)
-  }
   const rememberSession = (sessionId: string | null | undefined): Error | null => {
     if (!sessionId) return null
     try {
@@ -124,27 +121,31 @@ export function collectAgentTurn(
   const finish = async (error?: Error, result?: { checkpoint?: any }): Promise<void> => {
     if (settled) return
     settled = true
-    clearWatchdog()
     cleanupListeners()
     const registryError = rememberSession(proc.sessionId)
     let closeError: Error | null = null
     try { await proc.kill(3000) }
     catch (cause) { closeError = cause instanceof Error ? cause : new Error(String(cause)) }
     const failure = error ?? registryError ?? closeError
+    const text = output.join('').trim()
     if (failure) {
-      rejectDone(failure)
+      rejectDone(new AgentWorkerFailure(failure, text, proc.sessionId))
       return
     }
     const sessionId = proc.sessionId
     if (!sessionId) {
-      rejectDone(new Error('delegated agent completed without a native session id'))
+      rejectDone(new AgentWorkerFailure(
+        new Error('delegated agent completed without a native session id'), text, null,
+      ))
       return
     }
-    const text = output.trim()
     const checkpointId = checkpointIdFrom(result?.checkpoint, proc)
     resolveDone({
-      output: outputTruncated ? `${text}\n\n[delegated agent output truncated at ${MAX_AGENT_OUTPUT_CHARS} chars]` : text,
-      outputTruncated,
+      output: text,
+      // D-14:截断退场。上游把输出体量保护交给卡片连续输出(本仓 03-04/03-05 已
+      // 落地换卡与指纹去重),runner 不再按固定上限截断;字段保留但恒为 false,
+      // 避免卡片层与既有调用方连锁改动。
+      outputTruncated: false,
       sessionId,
       ...(checkpointId ? { checkpointId } : {}),
       durationMs: Date.now() - startedAt,
@@ -152,14 +153,8 @@ export function collectAgentTurn(
     })
   }
   const onText = (event: { text?: string; parentToolUseId?: string | null }) => {
-    if (event?.parentToolUseId || typeof event?.text !== 'string' || outputTruncated) return
-    const remaining = MAX_AGENT_OUTPUT_CHARS - output.length
-    if (event.text.length > remaining) {
-      output += event.text.slice(0, Math.max(0, remaining))
-      outputTruncated = true
-      return
-    }
-    output += event.text
+    if (settled || event?.parentToolUseId || typeof event?.text !== 'string') return
+    output.push(event.text)
   }
   const emitProgress = (step: AgentStep) => {
     try { callbacks.onProgress?.(step) }
@@ -196,7 +191,6 @@ export function collectAgentTurn(
       return
     }
     waiting = { request: normalized, originalInput: request.input ?? {} }
-    clearWatchdog()
     try { callbacks.onNeedsInput?.(normalized) }
     catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
   }
@@ -210,10 +204,8 @@ export function collectAgentTurn(
   }
   const onError = (error: unknown) => { lastError = error instanceof Error ? error : new Error(String(error)) }
   const onRetry = (retry: AgentTurnRetry) => {
-    // 进程层满载退避期:等待阶段清 watchdog(退避不算无进展,不得判死委托轮),
-    // 重试阶段重新布防;进度文案随事件携带的 delayMs/attempt(上游 2e6e1e0)。
-    if (retry.phase === 'waiting') clearWatchdog()
-    else if (!waiting) armWatchdog()
+    // 进程层满载退避只报进度(D-14 后无看门狗可布防);文案随事件携带的
+    // delayMs/attempt(上游 2e6e1e0)。
     emitProgress({
       at: new Date().toISOString(), phase: 'info', tool: 'Codex 容量重试',
       detail: retry.phase === 'waiting'
@@ -244,7 +236,6 @@ export function collectAgentTurn(
   proc.on('turn_retry', onRetry)
   proc.on('result', onResult)
   proc.on('exit', onExit)
-  armWatchdog()
   try {
     proc.sendInitialize()
     proc.sendUserText(prompt)
@@ -254,6 +245,7 @@ export function collectAgentTurn(
 
   return {
     done,
+    isAlive: () => proc.isAlive(),
     pendingInput: () => waiting?.request ?? null,
     answer(requestId: string, answers: Record<string, string>): void {
       if (!waiting) throw new Error('delegated agent is not waiting for input')
@@ -263,7 +255,6 @@ export function collectAgentTurn(
       const pending = waiting
       proc.sendPermissionResponse(requestId, 'allow', { updatedInput: { ...pending.originalInput, answers } })
       waiting = null
-      armWatchdog()
     },
     async cancel(reason = 'delegated agent cancelled'): Promise<void> {
       await finish(new Error(reason))
