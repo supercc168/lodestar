@@ -13969,3 +13969,155 @@ describe('Session 容量指纹换卡与开卡失败两级阶梯 (上游 378f4a4)
     }
   })
 })
+
+describe('Session 换卡支撑接线 (上游 378f4a4)', () => {
+  function stubCardkitFetch(cardIdForConvert = 'card_stub_new'): void {
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      return new Response(JSON.stringify({
+        code: 0,
+        data: path === '/cards/id_convert' ? { card_id: cardIdForConvert } : {},
+      }), { headers: { 'Content-Type': 'application/json' } })
+    }) as typeof fetch
+  }
+
+  test('rebuildToolsOnRotate 以显式 owner 重建,不误用已换代的 currentTurn (上游 378f4a4)', async () => {
+    const session = new Session('rotate-owner', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-rotate-owner')
+    const owner = turnState('card_owner_target')
+    const other = turnState('card_other_current')
+    session.currentTurn = other
+    const oldCardId = 'card_owner_old'
+    cardkit.recordCardCreated(owner.cardId, 2)
+    cardkit.recordCardCreated(other.cardId, 2)
+    cardkit.recordCardCreated(oldCardId, 2)
+    const oldToolByUseId = new Map<string, any>([
+      ['tool_use_pending', { i: 0, name: 'Bash', input: { command: 'echo hi' } }],
+    ])
+    stubCardkitFetch()
+
+    try {
+      sessionTools.rebuildToolsOnRotate(session, oldCardId, owner.cardId, oldToolByUseId, new Map(), owner)
+      await cardkit.flush(owner.cardId)
+
+      // 重建必须落在 owner 上;函数体若读 s.currentTurn,这些会全落到 other
+      expect([...owner.toolByUseId.keys()]).toEqual(['tool_use_pending'])
+      expect(owner.toolCount).toBe(1)
+      expect(other.toolByUseId.size).toBe(0)
+      expect(other.toolCount).toBe(0)
+      const posted = calls.filter(call => call.method === 'POST').map(call => call.path)
+      expect(posted).toContain(`/cards/${owner.cardId}/elements`)
+      expect(posted).not.toContain(`/cards/${other.cardId}/elements`)
+    } finally {
+      await cardkit.dispose(owner.cardId)
+      await cardkit.dispose(other.cardId)
+      await cardkit.dispose(oldCardId)
+    }
+  })
+
+  test('rebuildToolsOnRotate 显式 owner=null 直接返回,不回退到 currentTurn (上游 378f4a4)', async () => {
+    const session = new Session('rotate-owner-null', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-rotate-owner-null')
+    const current = turnState('card_null_owner_current')
+    session.currentTurn = current
+    cardkit.recordCardCreated(current.cardId, 2)
+    stubCardkitFetch()
+
+    try {
+      sessionTools.rebuildToolsOnRotate(
+        session, 'card_null_owner_old', current.cardId,
+        new Map<string, any>([['tool_use_x', { i: 0, name: 'Bash', input: {} }]]),
+        new Map(), null,
+      )
+      await cardkit.flush(current.cardId)
+
+      expect(current.toolByUseId.size).toBe(0)
+      expect(current.toolCount).toBe(0)
+      expect(calls.filter(call => call.method === 'POST')).toHaveLength(0)
+    } finally {
+      await cardkit.dispose(current.cardId)
+    }
+  })
+
+  test('completeTool 落地时 cardRotationFailed 为真 → 触发换卡重试并复位 (上游 378f4a4)', async () => {
+    const session = new Session('complete-tool-retry', 'chat_id') as any
+    session.proc = new FakeAgentProc('codex', 'codex-complete-tool-retry')
+    const oldCardId = 'card_ctr_old'
+    const newCardId = 'card_ctr_new'
+    const turn = turnState(oldCardId)
+    turn.userOpenId = ''
+    turn.cardRotationFailed = true
+    turn.toolCount = 1
+    turn.toolByUseId.set('tool_use_retry', { i: 0, name: 'Bash', input: { command: 'echo hi' } })
+    session.currentTurn = turn
+    // 元素数远低于软上限:重试必须靠 cardRotationFailed 放行
+    cardkit.recordCardCreated(oldCardId, 2)
+    stubCardkitFetch(newCardId)
+
+    try {
+      expect(turn.rotating).toBeNull()
+      sessionTools.completeTool(session, session.proc, 'tool_use_retry', 'ok', false)
+
+      const rotation = turn.rotating
+      expect(rotation).not.toBeNull()
+      if (rotation) await rotation
+      await cardkit.flush(newCardId)
+
+      expect(turn.cardId).toBe(newCardId)
+      expect(turn.cardRotationFailed).toBe(false)
+    } finally {
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(oldCardId)
+      await cardkit.dispose(newCardId)
+    }
+  })
+
+  test('completeTool 在 cardRotationFailed 为假时不触发换卡 (上游 378f4a4)', async () => {
+    const session = new Session('complete-tool-no-retry', 'chat_id') as any
+    session.proc = new FakeAgentProc('codex', 'codex-complete-tool-no-retry')
+    const cardId = 'card_ctnr'
+    const turn = turnState(cardId)
+    turn.userOpenId = ''
+    turn.toolCount = 1
+    turn.toolByUseId.set('tool_use_keep', { i: 0, name: 'Bash', input: { command: 'echo hi' } })
+    session.currentTurn = turn
+    cardkit.recordCardCreated(cardId, 2)
+    stubCardkitFetch()
+
+    try {
+      sessionTools.completeTool(session, session.proc, 'tool_use_keep', 'ok', false)
+      expect(turn.rotating).toBeNull()
+      expect(turn.cardId).toBe(cardId)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(cardId)
+    }
+  })
+
+  test('completeTool 的换卡重试服从 rotateGivenUp 止损(D-13 优先) (上游 378f4a4)', async () => {
+    const session = new Session('complete-tool-given-up', 'chat_id') as any
+    session.proc = new FakeAgentProc('codex', 'codex-complete-tool-given-up')
+    const cardId = 'card_ctgu'
+    const turn = turnState(cardId)
+    turn.userOpenId = ''
+    turn.cardRotationFailed = true
+    turn.rotateGivenUp = true
+    turn.toolCount = 1
+    turn.toolByUseId.set('tool_use_given_up', { i: 0, name: 'Bash', input: { command: 'echo hi' } })
+    session.currentTurn = turn
+    cardkit.recordCardCreated(cardId, 2)
+    stubCardkitFetch()
+
+    try {
+      sessionTools.completeTool(session, session.proc, 'tool_use_given_up', 'ok', false)
+      expect(turn.rotating).toBeNull()
+      expect(turn.cardId).toBe(cardId)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(cardId)
+    }
+  })
+})
