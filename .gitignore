@@ -30,6 +30,9 @@ dist/
 # GSD multi-task local repo (independent git; not part of project history)
 .gsd/
 
+# GSD stable routing dir (symlink target lives under .gsd/; local only)
+.planning/
+
 # Legacy superpowers local runtime/artifacts
 .superpowers/
 
