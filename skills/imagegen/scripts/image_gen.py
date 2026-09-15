@@ -4,7 +4,7 @@
 Used only when the user explicitly opts into CLI fallback mode, or when explicit
 transparent output requires the `gpt-image-1.5` fallback path.
 
-Defaults to gpt-image-2 and a structured prompt augmentation workflow.
+Defaults to gpt-image-2.5-flare and a structured prompt augmentation workflow.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 from io import BytesIO
 
-DEFAULT_MODEL = "gpt-image-2"
+DEFAULT_MODEL = "gpt-image-2.5-flare"
 DEFAULT_SIZE = "auto"
 DEFAULT_QUALITY = "medium"
 DEFAULT_OUTPUT_FORMAT = "png"
@@ -144,7 +144,12 @@ def _validate_gpt_image_2_size(size: str) -> None:
 
 
 def _validate_size(size: str, model: str) -> None:
-    if model == GPT_IMAGE_2_MODEL:
+    # Lodestar 本地补丁:`gpt-image-2` 家族(含 2.5:gpt-image-2.5 / -flare /
+    # -sunburst 等)共用同一套弹性尺寸约束。上游原判定为 `== GPT_IMAGE_2_MODEL`,
+    # 会使默认档 gpt-image-2.5-flare 落进 legacy 分支,只允许 1024x1024 /
+    # 1536x1024 / 1024x1536 / auto,错误拒掉 2048x1152、3840x2160 等尺寸。
+    # 2026-09-15 对 wuhen 2.5 渠道实测:gpt-image-2.5-flare + 2048x1152 → HTTP 200。
+    if model.startswith(GPT_IMAGE_2_MODEL):
         _validate_gpt_image_2_size(size)
         return
 

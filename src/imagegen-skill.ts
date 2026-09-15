@@ -157,7 +157,9 @@ ${wrapperPath} generate --prompt "Test" --out /tmp/imagegen-dry.png --dry-run
 \`\`\`
 
 Defaults: model \`${defaultModel}\`, size \`auto\`, quality \`medium\`, format \`png\`.
-Override model with \`--model gpt-image-1.5\` (etc.) only when needed.
+Model tiers: \`gpt-image-2.5-flare\` (fast, default) / \`gpt-image-2.5-sunburst\` (quality, commercial polish) / \`gpt-image-2.5\` (balanced) / \`gpt-image-2\` (previous gen, fallback only).
+Override with \`--model <tier>\` only when the task needs a different tier — the configured default already applies to both \`generate\` and \`edit\`.
+Note: with a 2.5 model the CLI accepts only \`1024x1024\` / \`1536x1024\` / \`1024x1536\` / \`auto\` for \`--size\`.
 
 ## Feishu / Lodestar delivery
 
@@ -427,7 +429,7 @@ function installWrapper(scriptPathForWrapper: string): string | null {
       'echo "  [imagegen]" >&2',
       'echo "  api_key  = \\"sk-...\\"" >&2',
       'echo "  base_url = \\"https://api.example.com\\"   # optional" >&2',
-      'echo "  model    = \\"gpt-image-2\\"               # optional" >&2',
+      'echo "  model    = \\"gpt-image-2.5-flare\\"       # optional" >&2',
       'echo "Then restart the lodestar daemon." >&2',
       'exit 2',
       '',

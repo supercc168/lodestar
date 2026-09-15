@@ -13,13 +13,13 @@ describe('imagegen skill body', () => {
   test('CLI-first skill points at the wrapper and feishu send marker', () => {
     const body = buildImagegenSkillBodyForTest({
       wrapperPath: '/tmp/lodestar-imagegen',
-      defaultModel: 'gpt-image-2',
+      defaultModel: 'gpt-image-2.5-flare',
       configured: true,
     })
     expect(body).toContain('name: imagegen')
     expect(body).toContain('/tmp/lodestar-imagegen generate')
     expect(body).toContain('[[send:')
-    expect(body).toContain('gpt-image-2')
+    expect(body).toContain('gpt-image-2.5-flare')
     expect(body).toContain('Configured channel is ready')
     // Must NOT prefer Codex built-in image_gen as default path for Lodestar.
     expect(body).not.toMatch(/built-in `image_gen` tool for normal/i)
@@ -28,7 +28,7 @@ describe('imagegen skill body', () => {
   test('unconfigured skill tells the agent to ask for [imagegen] config', () => {
     const body = buildImagegenSkillBodyForTest({
       wrapperPath: '/tmp/lodestar-imagegen',
-      defaultModel: 'gpt-image-2',
+      defaultModel: 'gpt-image-2.5-flare',
       configured: false,
     })
     expect(body).toContain('NOT configured yet')
@@ -42,13 +42,13 @@ describe('imagegen wrapper body', () => {
       scriptPath: '/skills/imagegen/scripts/image_gen.py',
       apiKey: 'sk-test-key',
       baseUrl: 'https://api.wuhen-ai.com',
-      defaultModel: 'gpt-image-2',
+      defaultModel: 'gpt-image-2.5-flare',
     })
     expect(body.startsWith('#!/usr/bin/env bash')).toBe(true)
     expect(body).toContain("export OPENAI_API_KEY='sk-test-key'")
     expect(body).toContain("export OPENAI_BASE_URL='https://api.wuhen-ai.com'")
     expect(body).toContain('--model')
-    expect(body).toContain('gpt-image-2')
+    expect(body).toContain('gpt-image-2.5-flare')
     expect(body).toContain('VENV_PY=')
     expect(body).toContain('/tmp/imagegen-venv/bin/python')
   })
@@ -57,7 +57,7 @@ describe('imagegen wrapper body', () => {
     const body = buildImagegenWrapperBodyForTest({
       scriptPath: '/s.py',
       apiKey: "sk-foo'bar",
-      defaultModel: 'gpt-image-2',
+      defaultModel: 'gpt-image-2.5-flare',
     })
     // POSIX: 'foo'"'"'bar'
     expect(body).toContain(`export OPENAI_API_KEY='sk-foo'\"'\"'bar'`)
@@ -162,7 +162,7 @@ describe('imagegen config parse', () => {
       const parsed = JSON.parse(result.stdout.toString())
       expect(parsed.enabled).toBe(false)
       expect(parsed.apiKey).toBe('sk-from-test')
-      expect(parsed.model).toBe('gpt-image-2')
+      expect(parsed.model).toBe('gpt-image-2.5-flare')
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
@@ -189,7 +189,7 @@ describe('imagegen config parse', () => {
       expect(result.exitCode).toBe(0)
       expect(JSON.parse(result.stdout.toString())).toEqual({
         enabled: false,
-        model: 'gpt-image-2',
+        model: 'gpt-image-2.5-flare',
       })
     } finally {
       rmSync(root, { recursive: true, force: true })

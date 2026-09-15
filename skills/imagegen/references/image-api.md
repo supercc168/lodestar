@@ -4,6 +4,8 @@ This file is for the fallback CLI mode only. Use it when the user explicitly ask
 
 These parameters describe the Image API and bundled CLI fallback surface. Do not assume they are normal arguments on the built-in `image_gen` tool.
 
+> **Lodestar note (2026-09-15).** Lodestar ships `[imagegen].model = "gpt-image-2.5-flare"` as the default. `gpt-image-2.5` / `-flare` / `-sunburst` belong to the `gpt-image-2` family and use the same flexible-size rules in the table below (verified against the wuhen relay: `gpt-image-2.5-flare` + `2048x1152` → HTTP 200).
+
 ## Scope
 - This fallback CLI is intended for GPT Image models (`gpt-image-2`, `gpt-image-1.5`, `gpt-image-1`, and `gpt-image-1-mini`).
 - The built-in `image_gen` tool and the fallback CLI do not expose the same controls.

@@ -273,11 +273,15 @@ watchdog_mode = 'off'              # 单项目覆盖(off / warn / recover_once)
 
 ```toml
 [imagegen]
-api_key  = "sk-..."                       # 必填才启用
-base_url = "https://api.wuhen-ai.com"     # 可选;OpenAI 兼容中转
-model    = "gpt-image-2"                  # 可选;默认 gpt-image-2
-# enabled = "false"                       # 可选;有 key 时默认 true
+api_key  = "sk-..."                            # 必填才启用
+base_url = "https://long-api.wuhen-ai.com/v1"  # 可选;OpenAI 兼容中转(注意走 long-api)
+model    = "gpt-image-2.5-flare"               # 可选;默认 gpt-image-2.5-flare
+# enabled = "false"                            # 可选;有 key 时默认 true
 ```
+
+模型档位:`gpt-image-2.5-flare`(速度优先,默认)/ `gpt-image-2.5-sunburst`(质量优先,商业级精修)/ `gpt-image-2.5`(均衡)/ `gpt-image-2`(上一代,仅作回退)。`model` 是**单点配置** —— wrapper 在 `generate` 与 `edit` 两条路径都注入同一个 `--model`,不会出现「生图走新模型、改图还走老模型」的错配。2.5 档下 CLI 的 `--size` 只接受 `1024x1024` / `1536x1024` / `1024x1536` / `auto`。
+
+**端点坑**:wuhen 的 `/v1/images/*` 必须走 `long-api.wuhen-ai.com`;主域名 `api.wuhen-ai.com` 的 images 路径会 307 跳转并剥掉 `Authorization` 头,导致鉴权失败。反过来说,查模型列表 `GET /v1/models` 要用 `api.wuhen-ai.com`(用 long-api 会反向跳到 api)。两个路径重定向方向相反,不要互相推断。若返回 `503 No available compatible accounts`,说明模型条目已建好、上游账号待接入,隔几分钟复测即可。
 
 改完后按文档重启 daemon。群里任意主模型下说「生成一张…图」即可;agent 应跑 `lodestar-imagegen generate ...`,成功后用 `[[send: /abs/path.png]]` 发到飞书。daemon 会在 `~/.local/share/lodestar/imagegen-venv` 自动建 venv 并安装 `openai`(只需系统有 `python3 -m venv`)。手改 skill 目录会被覆盖;设 `LODESTAR_DISABLE_SKILL_SYNC=1` 可跳过同步。实现见 [`src/imagegen-skill.ts`](src/imagegen-skill.ts),脚本源自 `skills/imagegen/`(Apache-2.0)。
 
