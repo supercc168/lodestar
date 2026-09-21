@@ -47,10 +47,11 @@ function isGrokModelId(model: string | null | undefined): boolean {
   return /^grok(?:[-_.]|$)/i.test(model?.trim() ?? '')
 }
 
-/** GLM 系档位(glm 主力 / glm-flash 快速档):共享智谱直连 alias 锁与
- * usageSource 归类(agent-process 的 /^claude:glm(?:$|[-_])/ 同规则)。 */
+/** GLM 系档位(glm 主力 / glm-flash 快速档 / glm-flashx 高速档):共享智谱
+ * 直连 alias 锁与 usageSource 归类(agent-process 的 /^claude:glm(?:$|[-_])/
+ * 同规则)。 */
 function isGlmProfile(name: string): boolean {
-  return name === 'glm' || name === 'glm-flash'
+  return name === 'glm' || name === 'glm-flash' || name === 'glm-flashx'
 }
 
 const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
@@ -79,6 +80,14 @@ const DEFAULT_CLAUDE_MODELS: Record<string, DefaultClaudeModelConfig> = {
     description: 'GLM-5.3 Flash 第三方路由(智谱直连,2026-08-26 上线)。需在 config.toml 配置 token。',
     route: 'api',
     // 与 glm 档同构:base_url / auth_token / model 由 [claude.models.glm-flash] 提供。
+  },
+  'glm-flashx': {
+    display_name: 'Claude Code · GLM-5.3 FlashX',
+    description: 'GLM-5.3 FlashX 第三方路由(智谱直连,2026-09-18 上线,200 tokens/s)。需在 config.toml 配置 token。',
+    route: 'api',
+    // 与 glm 档同构:base_url / auth_token / model 由 [claude.models.glm-flashx] 提供。
+    // 2026-09-21 实测 Anthropic 端点报 1311「当前订阅套餐暂未开放GLM-5.3-FlashX
+    // 权限」(原生接口可用)—— 档位先上架,端点放权后即用。
   },
   grok: {
     display_name: 'Claude Code · Grok 4.6(无痕)',
@@ -148,6 +157,13 @@ const DEFAULT_GLM_MODEL = 'glm-5.3[1m]'
  * beta header;传 [1m] 字面量报 1214 属直连形态,CLI 路径结构上不触发)。 */
 const DEFAULT_GLM_FLASH_MODEL = 'glm-5.3-flash[1m]'
 
+/** GLM FlashX 档位默认 model id。2026-09-18 智谱上线 GLM-5.3-FlashX(Flash
+ * 提速版,200 tokens/s,定价约 Flash 的 2.5 倍),官方文档同款 1M 上下文,
+ * model code glm-5.3-flashx。[1m] 钉法同主档(CLI 剥后缀 + context-1m beta
+ * header)。2026-09-21 实测 Anthropic 端点报 1311 未放权(原生接口可用),
+ * 放权前该档调用必败,放权后即用。 */
+const DEFAULT_GLM_FLASHX_MODEL = 'glm-5.3-flashx[1m]'
+
 /** DeepSeek 官网 Anthropic 兼容端点(https://api.deepseek.com/anthropic)的
  * 默认 model id。2026-08-13/14 实测(Anthropic /v1/messages 打真请求验证):
  *   - deepseek-v4-pro[1m] → V4 Pro 正式版(0813)1M 上下文;[1m] 后缀让 Claude Code
@@ -203,7 +219,12 @@ function toProfile(name: string): ClaudeModelProfile | null {
   // GLM 仅在实际配置接入 token 时注入路由；四个模型 alias 无条件收敛到
   // profile.model。未配置 token 时保持 env 空，由 picker 拦截该档位。
   if (isGlmProfile(name) && (env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY)) {
-    const fallback = name === 'glm-flash' ? DEFAULT_GLM_FLASH_MODEL : DEFAULT_GLM_MODEL
+    const fallback =
+      name === 'glm-flash'
+        ? DEFAULT_GLM_FLASH_MODEL
+        : name === 'glm-flashx'
+          ? DEFAULT_GLM_FLASHX_MODEL
+          : DEFAULT_GLM_MODEL
     const selectedModel = raw.model?.trim() || fallback
     for (const key of CLAUDE_MODEL_ALIAS_KEYS) env[key] = selectedModel
   }

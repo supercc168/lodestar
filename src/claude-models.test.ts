@@ -206,6 +206,67 @@ describe('Claude GLM-5.3 Flash profile', () => {
   })
 })
 
+describe('Claude GLM-5.3 FlashX profile', () => {
+  let prevModels: unknown
+
+  beforeEach(() => {
+    prevModels = config.claude.models
+    ;(config.claude as any).models = {}
+  })
+
+  afterEach(() => {
+    ;(config.claude as any).models = prevModels
+  })
+
+  test('未配 token 时可见但未就绪,与 glm 同构拦截', () => {
+    expect(claudeModelIsApiRoute('claude:glm-flashx')).toBe(true)
+    expect(claudeModelConfigured('claude:glm-flashx')).toBe(false)
+    expect(claudeModelEnv('claude:glm-flashx')).toEqual({})
+  })
+
+  test('配好 token + 显式 model → 四档 alias 锁 glm-5.3-flashx', () => {
+    ;(config.claude as any).models['glm-flashx'] = {
+      model: 'glm-5.3-flashx[1m]',
+      base_url: 'https://open.bigmodel.cn/api/anthropic',
+      auth_token: 'glm-tok',
+      effort: 'max',
+    }
+    expect(claudeModelConfigured('claude:glm-flashx')).toBe(true)
+    const env = claudeModelEnv('claude:glm-flashx')
+    expect(env.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic')
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('glm-tok')
+    for (const value of Object.values(claudeModelTierEnv('claude:glm-flashx'))) {
+      expect(value).toBe('glm-5.3-flashx[1m]')
+    }
+    // 1M 记账走模型名 [1m] 钉法,无窗口 env 注入
+    expect(env.CLAUDE_CODE_MAX_CONTEXT_TOKENS).toBeUndefined()
+  })
+
+  test('未显式配 model → alias 兜底跟随默认 glm-5.3-flashx[1m]', () => {
+    ;(config.claude as any).models['glm-flashx'] = {
+      base_url: 'https://open.bigmodel.cn/api/anthropic',
+      auth_token: 'glm-tok',
+      effort: 'max',
+    }
+    const env = claudeModelEnv('claude:glm-flashx')
+    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.3-flashx[1m]')
+    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.3-flashx[1m]')
+    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.3-flashx[1m]')
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.3-flashx[1m]')
+  })
+
+  test('config effort 经 claudeModelEffort 透出(非 Grok 走档位声明)', () => {
+    ;(config.claude as any).models['glm-flashx'] = {
+      model: 'glm-5.3-flashx[1m]',
+      base_url: 'https://open.bigmodel.cn/api/anthropic',
+      auth_token: 'glm-tok',
+      effort: 'max',
+    }
+    expect(claudeModelEffort('claude:glm-flashx')).toBe('max')
+    expect(claudeModelIsGrok('claude:glm-flashx')).toBe(false)
+  })
+})
+
 describe('Claude Grok API profiles', () => {
   let prevModels: unknown
 

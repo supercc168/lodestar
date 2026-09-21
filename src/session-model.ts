@@ -95,6 +95,16 @@ const FIXED_MODEL_CHOICES = [
     effort: 'max' as AgentReasoningEffort,
   },
   {
+    // GLM-5.3 FlashX 高速档(2026-09-18 上线,200 tokens/s),与 glm-flash 同构:
+    // 走 config.toml [claude.models.glm-flashx] 的 base_url + auth_token。
+    // ⚠️ 2026-09-21 实测 Anthropic 端点 1311 未放权(原生接口可用),放权前调用必败。
+    provider: 'claude' as const,
+    model: 'claude:glm-flashx',
+    displayName: 'Claude · GLM-5.3 FlashX',
+    description: 'GLM-5.3 FlashX 第三方路由 · max · 200 tokens/s · 1M 上下文(端点未放权,当前调用报 1311)。',
+    effort: 'max' as AgentReasoningEffort,
+  },
+  {
     provider: 'claude' as const,
     model: 'claude:grok',
     displayName: 'Claude · Grok 4.6 · 无痕',
