@@ -33,6 +33,9 @@ dist/
 # GSD stable routing dir (symlink target lives under .gsd/; local only)
 .planning/
 
+# fpd 跨模型编排任务目录(fable-plan-dsh-exec skill;local only)
+.fpd/
+
 # Legacy superpowers local runtime/artifacts
 .superpowers/
 

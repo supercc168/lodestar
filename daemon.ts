@@ -44,6 +44,7 @@ import { createNotifyReplyRuntime } from './src/notify-replies'
 import { ensureLodestarAgentSkill, ensureLodestarAgentCommand } from './src/agent-skill'
 import { ensureImagegenSkill } from './src/imagegen-skill'
 import { ensureImagereadSkill } from './src/imageread-skill'
+import { ensureFpdSkill } from './src/fpd-skill'
 import { startTasklistWorker, stopTasklistWorker } from './src/tasklist-worker'
 import { config } from './src/config'
 import { log } from './src/log'
@@ -1621,6 +1622,11 @@ async function boot(): Promise<void> {
   // Dual-dir lodestar-agent Skill (notify-skill pattern). Wrapper already
   // installed above so Skill bash can find the bare command.
   ensureLodestarAgentSkill()
+
+  // Sync the fable-plan-dsh-exec skill (跨模型编排) into both backends and
+  // install the bare `fpd` helper command under DATA_DIR/bin (imageread-skill
+  // pattern: vendored from the repo .agents tree, registry installs skip).
+  ensureFpdSkill()
 
   // Auto-revive sessions that were running when we last went down.
   // Runs AFTER the WS is up so any 🔁 revive message lands in the
