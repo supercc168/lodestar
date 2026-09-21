@@ -256,13 +256,34 @@ function resolveDefaultsPath(options = {}) {
   )
 }
 
-function runGit(args, cwd, { allowFailure = false } = {}) {
+// Node spawnSync 默认 maxBuffer 为 1MB；git 输出超限时 Node 杀掉子进程并报
+// ENOBUFS。.gsd 仓长期积累未跟踪大目录（builds/dll 等），一旦 index 被膨胀
+// （如误 add 大目录后 diff --cached --name-only 展开全部文件），输出极易超 1MB。
+// 这里把上限提到 256MB 根治该缓冲溢出；真正的 spawn 层失败（ENOBUFS/EAGAIN/
+// ENOENT 等）仍会以 GitSpawnError 分类抛出，供 gsd-local-commit 走降级提交路径。
+const GIT_MAX_OUTPUT_BYTES = 256 * 1024 * 1024
+
+class GitSpawnError extends Error {
+  constructor(message, cause) {
+    super(message)
+    this.name = 'GitSpawnError'
+    this.cause = cause
+  }
+}
+
+function runGit(args, cwd, { allowFailure = false, maxBuffer = GIT_MAX_OUTPUT_BYTES } = {}) {
   const result = spawnSync('git', args, {
     cwd,
     encoding: 'utf8',
     stdio: ['ignore', 'pipe', 'pipe'],
+    maxBuffer,
   })
-  if (result.error) fail(`git ${args.join(' ')} failed: ${result.error.message}`)
+  if (result.error) {
+    throw new GitSpawnError(
+      `git spawn failed (${result.error.code || result.error.message}): ${args.join(' ')}`,
+      result.error,
+    )
+  }
   if (result.status !== 0 && !allowFailure) {
     const detail = (result.stderr || result.stdout || '').trim()
     fail(`git ${args.join(' ')} failed with exit ${result.status}${detail ? `: ${detail}` : ''}`)
@@ -428,9 +449,14 @@ function listTaskRecords(root, options = {}) {
   })
 }
 
-function trackerContent(records) {
+function trackerContent(records, existingContent = '') {
   const rows = records.map(task => `| ${task.slug} | ${escapeMarkdownCell(task.name)} | ${escapeMarkdownCell(task.type)} | ${task.status} | ${escapeMarkdownCell(task.phase)} | ${escapeMarkdownCell(task.created)} | ${escapeMarkdownCell(task.updated)} | ${escapeMarkdownCell(task.summary)} |`)
-  return `${DEFAULT_TRACKER.trimEnd()}${rows.length ? `\n${rows.join('\n')}` : ''}\n`
+  const body = `${DEFAULT_TRACKER.trimEnd()}${rows.length ? `\n${rows.join('\n')}` : ''}\n`
+  // 已完成区是归档记录，helper 只负责生成未完成表；重建时透传磁盘现有已完成区，
+  // 防止 gsd-local-commit 内部重建 TRACKER 时抹掉归档。
+  const completed = existingContent.match(/\n## 已完成\s*[\s\S]*$/)
+  if (!completed) return body
+  return `${body}${completed[0]}`
 }
 
 export function updateGsdTracker(options = {}) {
@@ -443,7 +469,7 @@ export function updateGsdTracker(options = {}) {
       workingTaskSlug: options['working-task-slug'] || options.workingTaskSlug,
       committedOthers: Boolean(options['committed-others'] || options.committedOthers),
     })
-    writeTextAtomic(join(gsdRoot, 'TRACKER.md'), trackerContent(records))
+    writeTextAtomic(join(gsdRoot, 'TRACKER.md'), trackerContent(records, readText(join(gsdRoot, 'TRACKER.md'))))
     if (!options.quiet) console.log(`Rebuilt GSD tracker: ${records.length} unfinished task(s)`)
     return records
   }
@@ -577,6 +603,92 @@ export function switchActiveTask(options = {}) {
   return route
 }
 
+function commitPaths(slug, options) {
+  const paths = ['TRACKER.md', slug]
+  if (options['include-shared-project'] || options.includeSharedProject) paths.unshift('PROJECT.md')
+  return paths
+}
+
+function scopedCommit(root, gsdRoot, slug, message, options) {
+  assertEmptyGsdIndex(gsdRoot, 'commit')
+  updateGsdTracker({
+    projectRoot: root,
+    workingTaskSlug: slug,
+    committedOthers: true,
+    lockAlreadyHeld: true,
+    quiet: true,
+  })
+  const paths = commitPaths(slug, options)
+  runGit(['add', '--', ...paths], gsdRoot)
+  const staged = stagedFiles(gsdRoot)
+  const allowedShared = new Set(options['include-shared-project'] || options.includeSharedProject ? ['PROJECT.md', 'TRACKER.md'] : ['TRACKER.md'])
+  const unexpected = staged.filter(path => !allowedShared.has(path) && !path.startsWith(`${slug}/`))
+  if (unexpected.length) {
+    runGit(['reset', '-q', '--', ...paths], gsdRoot, { allowFailure: true })
+    fail(`scoped GSD commit includes unexpected files: ${unexpected.join(', ')}`)
+  }
+  const diff = runGit(['diff', '--cached', '--quiet'], gsdRoot, { allowFailure: true })
+  if (diff.status === 0) {
+    console.log(`No GSD changes to commit for ${slug}`)
+    return { committed: false }
+  }
+  if (diff.status !== 1) {
+    runGit(['reset', '-q', '--', ...paths], gsdRoot, { allowFailure: true })
+    fail(`failed to inspect staged GSD diff: exit ${diff.status}`)
+  }
+  const commit = runGit(['commit', '-m', message], gsdRoot, { allowFailure: true })
+  if (commit.status !== 0) {
+    runGit(['reset', '-q', '--', ...paths], gsdRoot, { allowFailure: true })
+    fail(`GSD commit failed: ${commit.stderr.trim() || `exit ${commit.status}`}`)
+  }
+  console.log(`Committed GSD task ${slug}: ${message}`)
+  return { committed: true }
+}
+
+/**
+ * 等价限域降级提交：git spawn 不可用（ENOBUFS/EAGAIN 等 GitSpawnError）时的后备路径，
+ * 也是 YIUI_GSD_FORCE_FALLBACK_COMMIT=1 强制自证/应急时使用的路径。
+ *
+ * 与正常路径的实质差异：不使用可能产生大输出的全仓遍历命令
+ * （git diff --cached --name-only / git status），改用 --quiet 系列小输出命令。
+ * 限域校验不放松：staged 清单必须 ⊆ {TRACKER.md, task_slug 目录（及可选 PROJECT.md）}，
+ * 越域即 reset 并拒绝；校验通过才允许 commit。
+ */
+function fallbackScopedCommit(gsdRoot, slug, message, options) {
+  const paths = commitPaths(slug, options)
+  runGit(['add', '--', ...paths], gsdRoot)
+  const excludes = paths
+    .flatMap(path => [`:(exclude,glob)${path}`, `:(exclude,glob)${path}/**`])
+  const check = runGit(['diff', '--cached', '--quiet', '--', '.', ...excludes], gsdRoot, { allowFailure: true })
+  if (check.status === 1) {
+    const offenders = runGit(['diff', '--cached', '--name-only', '--', '.', ...excludes], gsdRoot, { allowFailure: true })
+    const lines = (offenders.stdout || '').trim().split(/\r?\n/).filter(Boolean)
+    const list = lines.slice(0, 10).join(', ')
+    runGit(['reset', '-q', '--', ...paths], gsdRoot, { allowFailure: true })
+    fail(`fallback scoped commit rejected: staged files outside allowed set {${paths.join(', ')}}${list ? ` — ${list}${lines.length > 10 ? ` (+${lines.length - 10} more)` : ''}` : ''}`)
+  }
+  if (check.status > 1) {
+    runGit(['reset', '-q', '--', ...paths], gsdRoot, { allowFailure: true })
+    fail(`fallback scoped commit failed to inspect index: exit ${check.status}`)
+  }
+  const diff = runGit(['diff', '--cached', '--quiet'], gsdRoot, { allowFailure: true })
+  if (diff.status === 0) {
+    console.log(`No GSD changes to commit for ${slug} (fallback)`)
+    return { committed: false }
+  }
+  if (diff.status !== 1) {
+    runGit(['reset', '-q', '--', ...paths], gsdRoot, { allowFailure: true })
+    fail(`fallback failed to inspect staged GSD diff: exit ${diff.status}`)
+  }
+  const commit = runGit(['commit', '--quiet', '-m', message], gsdRoot, { allowFailure: true })
+  if (commit.status !== 0) {
+    runGit(['reset', '-q', '--', ...paths], gsdRoot, { allowFailure: true })
+    fail(`fallback GSD commit failed: ${commit.stderr.trim() || `exit ${commit.status}`}`)
+  }
+  console.log(`Committed GSD task ${slug} (fallback): ${message}`)
+  return { committed: true }
+}
+
 export function gsdLocalCommit(options = {}) {
   const root = resolveProjectRoot(options)
   const slug = normalizeSlug(options['task-slug'] || options.taskSlug)
@@ -584,41 +696,19 @@ export function gsdLocalCommit(options = {}) {
   if (!message) fail('commit message is required')
   const gsdRoot = join(root, '.gsd')
   if (!pathExists(join(gsdRoot, '.git'))) fail('.gsd git missing, run init-gsd-repo first')
+  const forceFallback = process.env.YIUI_GSD_FORCE_FALLBACK_COMMIT === '1'
   return withGsdWriteLock(gsdRoot, () => {
-    assertEmptyGsdIndex(gsdRoot, 'commit')
-    updateGsdTracker({
-      projectRoot: root,
-      workingTaskSlug: slug,
-      committedOthers: true,
-      lockAlreadyHeld: true,
-      quiet: true,
-    })
-    const paths = ['TRACKER.md', slug]
-    if (options['include-shared-project'] || options.includeSharedProject) paths.unshift('PROJECT.md')
-    runGit(['add', '--', ...paths], gsdRoot)
-    const staged = stagedFiles(gsdRoot)
-    const allowedShared = new Set(options['include-shared-project'] || options.includeSharedProject ? ['PROJECT.md', 'TRACKER.md'] : ['TRACKER.md'])
-    const unexpected = staged.filter(path => !allowedShared.has(path) && !path.startsWith(`${slug}/`))
-    if (unexpected.length) {
-      runGit(['reset', '-q', '--', ...paths], gsdRoot, { allowFailure: true })
-      fail(`scoped GSD commit includes unexpected files: ${unexpected.join(', ')}`)
+    if (!forceFallback) {
+      try {
+        return scopedCommit(root, gsdRoot, slug, message, options)
+      } catch (error) {
+        if (!(error instanceof GitSpawnError)) throw error
+        console.warn(`git spawn failed, falling back to scoped commit path: ${error.message}`)
+        return fallbackScopedCommit(gsdRoot, slug, message, options)
+      }
     }
-    const diff = runGit(['diff', '--cached', '--quiet'], gsdRoot, { allowFailure: true })
-    if (diff.status === 0) {
-      console.log(`No GSD changes to commit for ${slug}`)
-      return { committed: false }
-    }
-    if (diff.status !== 1) {
-      runGit(['reset', '-q', '--', ...paths], gsdRoot, { allowFailure: true })
-      fail(`failed to inspect staged GSD diff: exit ${diff.status}`)
-    }
-    const commit = runGit(['commit', '-m', message], gsdRoot, { allowFailure: true })
-    if (commit.status !== 0) {
-      runGit(['reset', '-q', '--', ...paths], gsdRoot, { allowFailure: true })
-      fail(`GSD commit failed: ${commit.stderr.trim() || `exit ${commit.status}`}`)
-    }
-    console.log(`Committed GSD task ${slug}: ${message}`)
-    return { committed: true }
+    console.warn('YIUI_GSD_FORCE_FALLBACK_COMMIT=1: using fallback scoped commit path')
+    return fallbackScopedCommit(gsdRoot, slug, message, options)
   })
 }
 

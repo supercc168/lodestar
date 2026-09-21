@@ -67,6 +67,7 @@ et-* / yiui-* 硬规则 > yiui-gsd 流程编排 > 原生 gsd-* 执行
 ## GSD 子 agent 质量与存活策略
 
 - 首次执行 GSD 子 agent 前，读取并执行 `extra-codex-agent-policy.md`。
+- 任务开局第一波与 planner / executor / checker 派发前，读取并执行 `extra-post-task-handoff.md`（底噪清单波、EXECUTOR-HANDBOOK 引用、verify 实测、偏差 kind、checker 续轮、ENOBUFS 降级提交）。
 - GPT/Codex 会话：主任务与深思核/关键研究/写码验收用 `gpt-5.6-sol`+`max`；外围 standard 用 `gpt-5.6-terra`+`high`（Phase B）；light 用 `gpt-5.6-luna`+`medium`。Claude 第一方按 GSD catalog tier 分配：heavy=`claude-opus-5`、standard=`claude-fable-5`、light=`claude-sonnet-5`；GLM/Grok 等 API 路由仍把所有 alias 锁到飞书当前选定模型。
 - Lodestar spawn 必须按飞书 provider 设置 `GSD_RUNTIME=codex|claude`；Claude agent frontmatter 按 catalog `adaptiveTierMap` 写 `opus` / `sonnet` / `haiku`，真实模型由 spawn alias 解析，禁止向第三方端点泄漏官方 Claude id。
 - 飞书 continue/new 必须把目标 workstream 的 `runtime` 锁到当前 provider；Claude 使用 `model_profile=adaptive` + `resolve_model_ids=false` 保留 alias，Codex 使用 `model_profile=inherit` + `resolve_model_ids=omit`；清空所有显式/动态模型覆写，关闭 planner 前的 `pattern_mapper`、checker 后的非阻断 `post_planning_gaps` 与 `thinking_partner` 二次分析，显式关闭 GSD 1.8 的 `claude_orchestration`，并写入 30 分钟子 agent 诊断窗口；其它 workstream 配置保持不变。
@@ -180,6 +181,7 @@ Codex App 的计划栏是 GSD 状态的**只读镜像**，不属于 GSD canonica
 - 终验字段、代际推进和收口门禁：读取本 skill 同目录下的 `extra-finalization-gate.md`
 - 跨平台 workstream 路由步骤：读取本 skill 同目录下的 `extra-junction-bridge.md`
 - Codex 子 agent 模型、等待、上下文边界与更新重放：读取本 skill 同目录下的 `extra-codex-agent-policy.md`
+- 任务派发与收口流程约定（开局底噪清单波／EXECUTOR-HANDBOOK／planner verify 实测／偏差 kind／checker 续轮／ENOBUFS 降级提交）：读取本 skill 同目录下的 `extra-post-task-handoff.md`
 
 ## 禁止事项
 
