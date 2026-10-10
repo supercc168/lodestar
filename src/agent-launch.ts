@@ -5,21 +5,31 @@ import type {
   AgentReasoningEffort,
 } from './agent-process'
 import { isClaudeReasoningEffort, isDshReasoningEffort } from './agent-process'
-import { ClaudeAgentProcess, assertClaudeCodeAvailable } from './claude-agent-process'
-import { CodexProcess, CODEX_EFFORT, isCodexReasoningEffort } from './codex-process'
 import { DshProcess } from './dsh-process'
+import { ClaudeAgentProcess, assertClaudeCodeAvailable } from './claude-agent-process'
+import { CODEX_EFFORT, CodexProcess, isCodexReasoningEffort } from './codex-process'
 import type { ConversationLaunch } from './conversation'
-import { listTokenSources, resolveTokenSource } from './token-source'
+import { getTokenSourceForAccount, tokenSourceProcessRevision, tokenSourceRuntimeModel } from './token-source'
+import { bindProcessCodexAccount, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
+import { CodexAccountProcess } from './codex-account-process'
 
 export interface AgentLaunchOptions {
   provider: AgentProvider
   workDir: string
   tokenSourceId: string | null
+  codexAccountId?: string
+  /** null = automatic; an id = explicit first choice. Undefined is a raw control/test launch. */
+  codexAccountPreference?: string | null
+  /** Internal raw launch: user explicitly chose this account; let native Codex validate it. */
+  codexManualAccount?: boolean
   model?: string
   effort?: AgentReasoningEffort
   launch?: ConversationLaunch
   developerInstructions?: string
+  /** Service/application calls cannot wait for a human or another Agent to answer. */
+  allowUserInput?: boolean
   profile?: ProjectProfile
+  managedSkillPluginPath?: string
   hostEnv?: Record<string, string | undefined>
   serviceName?: string
   /** 原生工具层的委派开关:D-11 口径 3 的「单层委派」不靠提示词自觉。
@@ -31,57 +41,71 @@ export interface AgentLaunchOptions {
 
 export interface CreatedAgentProcess {
   process: AgentProcess
+  sourceRevision: string | null
 }
 
-/** Single source of truth for both the Feishu main Session and delegated
- * agents. Capability differences are expressed by the caller's prompt and by
- * the explicit `allowDelegation: false` opt-out (delegated Agents get the
- * backend's native delegation tools disabled — D-11 口径 3); every other
- * surface is the same full coding-agent launch for both callers.
- *
- * Local slim port of 8881f69: lookup via listTokenSources, spawn via
- * resolveTokenSource(provider, selectionModel). No upstream registry lookup. */
+/** Single source of truth for main Sessions and delegated agents, including
+ * their native delegation capabilities. Capability differences are expressed
+ * by the caller's prompt and by the explicit `allowDelegation: false` opt-out
+ * (delegated Agents get the backend's native delegation tools disabled —
+ * D-11 口径 3); every other surface is the same full coding-agent launch for
+ * both callers. */
 export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProcess {
-  const source = opts.tokenSourceId
-    ? listTokenSources().find(entry => entry.id === opts.tokenSourceId)
-    : undefined
-  if (opts.tokenSourceId && !source) throw new Error(`token source not found: ${opts.tokenSourceId}`)
-  if (source && !source.enabled()) throw new Error(`token source disabled: ${source.id}`)
-  if (source && source.provider !== opts.provider) {
-    throw new Error(`token source ${source.id} belongs to ${source.provider}, not ${opts.provider}`)
+  if (opts.provider === 'codex' && opts.tokenSourceId === 'codex-sub' && opts.codexAccountPreference !== undefined) {
+    if (!opts.model && !opts.codexAccountPreference) throw new Error('Codex 自动选号需要明确模型')
+    const process = new CodexAccountProcess({
+      model: opts.model ?? '', effort: opts.effort, preferred: opts.codexAccountPreference,
+      workDir: opts.workDir, launch: opts.launch ?? { kind: 'fresh' },
+      create: (accountId, launch, manual, model, effort) => createAgentProcess({ ...opts, model, effort,
+        codexAccountPreference: undefined, codexManualAccount: manual, codexAccountId: accountId, launch }),
+    })
+    return { process, sourceRevision: null }
   }
-  const selectionModel = opts.model ?? source?.selectionModel
-  const resolved = resolveTokenSource(opts.provider, selectionModel)
+  const accountId = opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT
+  const source = getTokenSourceForAccount(opts.tokenSourceId, accountId)
+  const manual = opts.provider === 'codex' && opts.tokenSourceId === 'codex-sub' && opts.codexManualAccount === true
+  if (opts.tokenSourceId && !source) throw new Error(`token source not found: ${opts.tokenSourceId}`)
+  if (source && !source.enabled && !manual) throw new Error(`token source disabled: ${source.id}`)
+  if (source && source.agent !== opts.provider) {
+    throw new Error(`token source ${source.id} belongs to ${source.agent}, not ${opts.provider}`)
+  }
+  if (!manual && source?.modelCatalogState?.status === 'failed') {
+    throw new Error(`model catalog refresh failed for ${source.id}: ${source.modelCatalogState.error ?? 'MISS'}`)
+  }
+  if (!manual && (source?.modelCatalogState?.status === 'idle' || source?.modelCatalogState?.status === 'loading')) {
+    throw new Error(`model catalog is not ready for ${source.id}: ${source.modelCatalogState.status}`)
+  }
+  const requestedModel = opts.model || source?.defaultModel || undefined
+  const sourceRevision = tokenSourceProcessRevision(source, requestedModel)
+  const entry = !manual && source && tokenSourceRuntimeModel(source, requestedModel)
+  if (!manual && source && requestedModel && !entry) {
+    throw new Error(`model is not present in token source ${source.id}: ${requestedModel}`)
+  }
+  if (!manual && entry && (entry.unavailableReason || !entry.efforts.length || (opts.effort !== undefined && !entry.efforts.includes(opts.effort)))) {
+    throw new Error(`model effort unavailable: ${source!.id}/${requestedModel}/${opts.effort ?? 'MISS'}`)
+  }
+  const model = !manual && source && requestedModel
+    ? source.resolveSpawnModel(requestedModel)
+    : requestedModel
+  if (requestedModel && !model) throw new Error(`model did not resolve: ${opts.tokenSourceId ?? 'default'}/${requestedModel}`)
+  const transformEnv = source ? (base: Record<string, string | undefined>) => source.spawnEnv(base, model) : undefined
 
   if (opts.provider === 'dsh') {
     // DSH 单档后端:模型与凭据同来自 [deepseek-harness],选择键就是该段派生的
     // source id。effort 词表来自子进程上报的 native 档位(off/low/high/max),
     // 与 Codex/Claude 档位不互通 —— 不合法即抛错,不静默换档。
-    if (!source || !selectionModel || !isDshReasoningEffort(opts.effort)) {
-      throw new Error('DSH requires a configured source, model and valid effort')
-    }
-    const dshSource = source
-    return {
-      process: new DshProcess({
-        workDir: opts.workDir,
-        tokenSourceId: dshSource.id,
-        model: selectionModel,
-        effort: opts.effort,
-        launch: opts.launch,
-        developerInstructions: opts.developerInstructions,
-        profile: opts.profile,
-        hostEnv: opts.hostEnv,
-        // D-11 口径 3 的原生工具层:与 claude(:101)/codex(:122)同形的 spread。
-        // 不透传会让 DshProcess 按「未指定即放开」构造 session/open,dsh-bridge
-        // 的 tools.restrict(DELEGATION_TOOLS)永不触发 —— 三层里唯一的硬闸失效。
-        ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
-        // 凭据单入口(D-08 双轨隔离的本地点):先 scrub ANTHROPIC_* 与旧
-        // DSH_*/DEEPSEEK_*,再注入本档 DEEPSEEK_*。TokenSource.spawnEnv 的入参
-        // 收窄为 string 值,DshSpawnOptions.transformEnv 允许 undefined,
-        // 故只在这一个边界做窄化,不引入第二套清洗逻辑。
-        transformEnv: base => dshSource.spawnEnv(base as Record<string, string>),
-      }),
-    }
+    if (!source || !model || !isDshReasoningEffort(opts.effort)) throw new Error('DSH requires a configured source, model and valid effort')
+    return { process: new DshProcess({
+      ...opts, model, effort: opts.effort,
+      tokenSourceId: source.id,
+      // 凭据单入口(D-08 双轨隔离的本地点):transformEnv 走本档 spawnEnv,
+      // 先 scrub ANTHROPIC_* 与旧 DSH_*/DEEPSEEK_*,再注入本档 DEEPSEEK_*。
+      transformEnv,
+      // D-11 口径 3 的原生工具层:与 claude/codex 分支同形的 spread。
+      // 不透传会让 DshProcess 按「未指定即放开」构造 session/open,dsh-bridge
+      // 的 tools.restrict(DELEGATION_TOOLS)永不触发 —— 三层里唯一的硬闸失效。
+      ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
+    }), sourceRevision }
   }
 
   if (opts.provider === 'claude') {
@@ -90,7 +114,7 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
     return {
       process: new ClaudeAgentProcess({
         workDir: opts.workDir,
-        model: selectionModel,
+        model,
         effort: opts.effort,
         ...(opts.launch?.kind === 'fresh' || !opts.launch
           ? {}
@@ -102,29 +126,39 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
                 : {}),
             }),
         ...(opts.developerInstructions ? { appendSystemPrompt: opts.developerInstructions } : {}),
+        ...(opts.allowUserInput === false ? { allowUserInput: false } : {}),
         ...(opts.profile ? { profile: opts.profile } : {}),
+        // D-11 口径 3:委派 Agent 的原生工具层关掉 Agent/Task。
         ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
+        ...(source ? { settingSources: source.settingSources ?? ['project', 'local'] } : {}),
+        ...(source?.claudeSettings ? { settings: source.claudeSettings } : {}),
+        ...(source?.validateClaudeAccount ? { validateAccount: source.validateClaudeAccount } : {}),
+        ...(opts.managedSkillPluginPath ? { managedSkillPluginPath: opts.managedSkillPluginPath } : {}),
+        tokenSourceId: source?.id ?? null,
+        transformEnv,
         hostEnv: opts.hostEnv,
       }),
+      sourceRevision,
     }
   }
 
-  if (opts.effort !== undefined && !isCodexReasoningEffort(opts.effort)) {
-    throw new Error(`invalid Codex effort: ${opts.effort}`)
-  }
-  const overrides = resolved.spawnOverrides()
-  return {
-    process: new CodexProcess({
-      workDir: opts.workDir,
-      model: overrides.modelId,
-      effort: opts.effort ?? CODEX_EFFORT,
-      launch: opts.launch,
-      ...(opts.developerInstructions ? { appendSystemPrompt: opts.developerInstructions } : {}),
-      configArgs: overrides.configArgs,
-      providerEnv: overrides.env,
-      hostEnv: opts.hostEnv,
-      serviceName: opts.serviceName ?? 'lodestar-agent',
-      ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
-    }),
-  }
+  if (opts.effort !== undefined && !isCodexReasoningEffort(opts.effort)) throw new Error(`invalid Codex effort: ${opts.effort}`)
+  const process = new CodexProcess({
+    workDir: opts.workDir,
+    model,
+    effort: opts.effort ?? CODEX_EFFORT,
+    launch: opts.launch,
+    ...(opts.developerInstructions ? { appendSystemPrompt: opts.developerInstructions } : {}),
+    ...(opts.allowUserInput === false ? { allowUserInput: false } : {}),
+    // D-11 口径 3:委派 Agent 的原生工具层 `--disable multi_agent`。
+    ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
+    tokenSourceId: source?.id ?? null,
+    transformEnv,
+    hostEnv: opts.hostEnv,
+    serviceName: opts.serviceName,
+    codexAccountId: accountId,
+    ...(source?.codexApiProvider ? { apiProvider: source.codexApiProvider } : {}),
+  })
+  if (!source?.codexApiProvider) bindProcessCodexAccount(process, accountId)
+  return { process, sourceRevision }
 }

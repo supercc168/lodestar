@@ -1,6 +1,9 @@
 <!-- Generated: 2026-05-15 | Updated: 2026-07-23 -->
+# Lodestar 项目指引
 
-# Lodestar 2.0
+Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个群对应一个 `Session`，通过 Codex app-server、Claude Agent SDK 或 DeepSeek Harness 执行任务，以 Feishu Card Kit schema 2.0 展示结果。
+
+维护说明以 `AGENTS.md` 为入口。Codex、Claude、GLM、DeepSeek、OpenRouter 和 Claude native 都是受支持能力；文档清理、缺少本机凭据或维护工具选择不构成删除后端的理由。
 
 > 🧭 **接手开发/维护本项目先读**:[`docs/开发与调试指南.md`](docs/开发与调试指南.md) —— 面向 AI 的心智模型、代码地图、开发红线、调试(含免飞书 debug 注入)与发布流程。本文件(`AGENTS.md`)是权威规则源,那份是上手导航。
 
@@ -18,21 +21,24 @@
 | `LICENSE` | MIT 许可证。 |
 | `promo.jpg` | README 顶部展示图。 |
 
-## Subdirectories
-| Directory | Purpose |
-|-----------|---------|
-| `src/` | daemon 的核心 TypeScript 模块，包括 session、Codex 子进程、飞书 API、Card Kit、任务清单 worker 和 CLI 辅助逻辑（见 `src/AGENTS.md`）。 |
-| `scripts/` | 面向真实飞书环境的 smoke、调试注入、Card Kit 探针和安装后向导脚本（见 `scripts/AGENTS.md`）。 |
-| `docs/` | 设计备忘录，目前只有 Claude Agent SDK 后端的架构 memo（见 `docs/AGENTS.md`）。 |
+## 目录
 
-## For AI Agents
+| 路径 | 职责 | 修改前阅读 |
+| --- | --- | --- |
+| `cli.ts`、`daemon.ts` | 首次配置、PID guard；WS、Session registry、Card action、本机通知 | 本文件 |
+| `src/` | 会话、后端进程、账号、飞书 API、持久化、worktree | `src/AGENTS.md` |
+| `src/cards/` | 卡片模板与展示文本 | `src/AGENTS.md`、`src/cards/AGENTS.md` |
+| `scripts/` | 安装脚本、真实飞书探针和人工 smoke | `scripts/AGENTS.md` |
+| `docs/` | 安装、群内用法、账号模型及后端说明 | `docs/AGENTS.md` |
+
+## 开发规则
 
 ### Working In This Directory
-- Runtime 是 **Bun**；源码开发通常用 `bun daemon.ts` 或 `bun run start`，发布包通过 `bun build --target=node` 生成 Node 可执行文件。
+- Runtime 是 **Bun**；源码开发通常用 `bun daemon.ts` 或 `bun run start`，发布包通过 `bun build --target=node` 生成 Node.js ≥ 18.15 的发布入口。
 - daemon 通过统一 `AgentProcess` 接口（`src/agent-process.ts`）驱动两类后端：Codex 走 `codex app-server --listen stdio://` JSON-RPC，Claude 走 `@anthropic-ai/claude-agent-sdk` 的 `query()` streaming-input 长驻进程；session 默认 provider 是 Claude/GLM，可用 `model` 切到 Codex。不要恢复 tmux、JSONL 队列或 1.x 传输机制。
-- 运行状态全部在 XDG 目录外置：配置默认在 `~/.config/lodestar/config.toml`，日志和 runtime map 默认在 `~/.local/share/lodestar/`。凭据只应存在于 `config.toml`，不要写入仓库。
+- 运行状态全部在 XDG 目录外置：配置默认在 `~/.config/lodestar/config.toml`，日志和 runtime map 默认在 `~/.local/share/lodestar/`。凭据只应存在于 `config.toml`，不要写入仓库；新增持久状态通过 `src/paths.ts` 定义，遵循 XDG 和 Windows 路径约定。
 - Assistant 正文和 footer 状态不使用 Card Kit `/content` 打字流；正文按完整段 `addElement` 插入，footer 状态用 `replaceElement` 直接替换。
-- API 失败要记录并向用户暴露；不要静默切换传输、卡片或消息通道作为“兜底”。
+- API 失败要记录并向用户暴露；不要静默切换传输、卡片或消息通道作为“兜底”。缺失数据用 `MISS`，不能伪造成功或偷偷更换来源；仅允许对已知瞬态错误有限重试。Codex 自动选号成功时，其他账号的缓存过期、模型不支持、查询或认证失败等诊断仅保留在日志和主动查询面板，不单独推送警告；无法启动或继续任务的失败仍须明确提示。
 - Claude/Codex 共享连续失败工具熔断：同一工具+规范化 input+错误指纹连续命中时，Claude 第 2 次经 `PostToolUseFailure` 注入纠错上下文，第 3 次由 Session 软中断并终结卡片；不自动重放原任务，真人排队消息保留。该机制独立于 Codex-only 的 turn watchdog，禁止用 `maxTurns` 或修改 Grok effort 代替。
 - 不要主动重启正在运行的 daemon，除非用户在**当前用户消息**里明确要求 `restart` / `重启` / reload。代码变更后只报告需要重启。
 - 执行已授权的重启时**先确认托管方式**（`launchctl list | grep lodestar` / `systemctl --user list-units`），用托管器自己的重启命令一条完成（macOS launchd：`launchctl kickstart -k gui/$(id -u)/com.supercc168.lodestar`）。**严禁**用 `launchctl submit` 跑一次性重启脚本——submit 的 job 默认 keepalive，脚本退出后每 ~10s 被重新 spawn，变成无限 kill+kickstart 循环（2026-07-20 实测事故）；也不要在托管环境手动起第二个 daemon 实例（脱管野进程与托管实例互杀）。发现 daemon PID 每 ~10s 规律滚动，先查多余 launchd job 并 `launchctl bootout`。
@@ -49,35 +55,53 @@
 - `agy <prompt>` 在当前 session 工作目录内独占运行 `agy --print`，用独立 Card Kit 卡片展示 prompt、状态、输出、仓库变更和“转 Codex”按钮；不要把它混入普通 Codex turn 卡片。
 - `task` 打开项目任务清单面板；启用后创建/绑定 `<project>[lodestar]` 飞书任务清单，daemon 内置 worker 会扫描 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成` 分组并驱动规划、执行、审核和本地合并。
 - 本地脚本可通过 `POST http://127.0.0.1:9876/notify` 发送 `{project, text, level}` 到绑定群。
+- 保留已有改动。依赖变化用 Bun 同步 `bun.lock`，不手改锁文件。
+- 凭据、本机配置、聊天成员、debug context 和 `~/.codex`、`~/.claude` 内容不得写入跟踪文件。
+- `config.ts` 在 import 时同步读取配置，缺失时报错。首次安装的延迟导入只放在 `cli.ts`。
+- 禁止在 daemon 启动时检查、安装或更新 Agent，自动更新默认关闭。手动或显式开启的定期更新选择上游 `latest`，不等待 Lodestar 发版，不设置兼容版本白名单或旧版本上限。用户接受新版可能不兼容；发生不兼容时明确报错，由后续 Lodestar 更新适配，不能为规避适配而锁旧、降级、回退或恢复“先兼容验收才更新”的门槛。开发锁文件只记录测试依赖快照，不限制生产 Agent 更新。
+- 工具卡片中的 shell 命令首行写 `# desc: <中文摘要>`，供 `src/cards/shell-command.ts` 提取标题。
+- Card action `kind`、共享 `element_id`、群命令、持久化格式和 Token Source id 是协议。改名时同步分发、迁移与测试。
 
-### Testing Requirements
-- 常规校验使用 `bun test` 和 `bun run build`。
-- 涉及真实飞书、Codex 登录、卡片流式行为或 `wt` 建群/解散时，用 debug 注入、`bun scripts/smoke.ts "<group name>"` 或 `bun scripts/test-all.ts "<group name>"` 做人工 smoke。
-- 需要验证 live 群里的卡片外观或交互时，优先使用**不影响正在运行 daemon** 的路径；如果做不到，先向用户说明会影响哪些服务，并等待明确许可。不得把“为了验证”当成默认可以碰 live daemon 的理由。
-- 发布前按项目惯例运行 `bun test`、`bun run build`，再执行版本 bump、tag、npm/GitHub Packages 发布和 GitHub Release 流程。
+## 模块边界
 
-### Common Patterns
-- 根入口保持很薄：`cli.ts` 处理首次配置和 PID guard，`daemon.ts` 负责 WS/event loop，核心业务下沉到 `src/`。
-- `Session` 是一个群的状态机；跨群状态只通过 session registry、持久 map、Feishu chat 绑定、模型选择 map 和 `work/*` 分支约定协调。
-- `cardkit` 负责每张卡的 sequence、队列、限流和写失败检测；session 负责什么时候开卡、换卡、关闭卡。
-- `agy` 任务由 session 管理生命周期，`src/agy-task.ts` 负责 CLI/Git 快照，`src/cards/agy.ts` 负责卡片结构和输出清理，Card action 再把结果转发给 Codex。
-- `task` 自动化由 `src/tasklist.ts` 持久化绑定和状态，`src/tasklist-worker.ts` 调度 Codex/agy 子进程，`src/cards/task.ts` 只渲染启用/删除面板。
-- 所有 shell 命令卡片展示依赖第一行 `# desc:` 风格说明，修改相关展示逻辑时同步看 `src/cards/turn.ts`。
+- 一个群只有一个 Session 和一个当前主进程。Codex 使用 app-server JSON-RPC，Claude/GLM/DeepSeek/native 使用 Agent SDK streaming input，DSH 使用独立 Node 子进程和 Cordis stdio 桥接；不引入 tmux、JSONL 队列或旁路进程控制。
+- DSH 的 `deepseek-harness` 与 Claude 兼容的 `deepseek` 共用 DeepSeek 凭据和平台地址；`dsh-glm` 与 `glm` 共用 GLM Coding Plan 账号，前者通过原生 pi-ai 适配器接入。共享凭据只存一份，模型、effort 和可见性按 Agent 保留；旧配置冲突必须明确报错，任一 setup 入口均更新共享账号。运行时经更新器选择 latest，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。
+- `agent-updates.ts` 按 `[runtime.agent_auto_update]` 的 `codex`、`claude`、`dsh` 三个独立开关每 6 小时更新对应 Agent，首次检查也在 6 小时后；三项默认关闭，各自防止重叠执行，失败互不阻塞。旧布尔总开关按原值兼容转换并提示迁移，不与新表混用。`lodestar-update --agents-only` 可立即安装/更新。实际程序和 SDK 从独立版本目录加载；安装成功直接启用，新进程使用新版，已有进程保留其运行目录。Windows 不覆盖或删除使用中的 EXE/DLL；安装取消按精确 PID 终止安装器进程树，未确认退出不得清理其临时目录。文件占用有限重试，最终错误必须显示。安装或查询失败只记录更新日志并向手动更新调用方返回失败，不修改当前安装记录，不影响已有安装的启动和 `lodestar-version`；已开启自动更新的 Agent 在下一个 6 小时周期再试。旧状态中的更新错误不参与启动判断或版本展示。首次未安装、安装损坏或旧版已清掉选择记录时按实际安装状态报错，不扫描目录猜测版本。自动更新 Agent 不重启 daemon。
+- Token Source 统一管理账号、凭据、模型目录、启动环境和额度。Claude Code 订阅（`claude-sub`）独立复用本机原生登录态，可与第三方来源共存。模型与 Agent 身份动态读取该目录，沿用目录声明的 effort；来源禁用或刷新失败显示 `MISS`。新增来源通过 factory 注册。
+- MD 首页按 Claude Code、Codex、DeepSeek Harness 分组，底层 Agent id 仍为 `claude`、`codex`、`dsh`。模型行右侧窄按钮用单字（选、显、隐、删），补录模型、显示模型、返回和翻页等宽按钮保留完整文案；模型行之间加分隔线，文字和按钮垂直居中；只有一个 effort 档位（含原生 default）时直接应用，多个档位才进入选择；两个 DeepSeek 来源都显示为 DeepSeek。OpenRouter 默认从账号目录按腾讯 Hy、Gemini Flash、Meta Muse Spark、MiMo Pro、字节 Seed Turbo、美团 LongCat 六个家族筛选最新数字版本；Hy 沿用 preview 候选，同版本优先正式版；其他家族不自动纳入 preview，均排除 free、thinking、Flash Lite、ultraspeed 等变体；Packy Claude 入口默认从兼容目录按 MiniMax M、Claude Opus（含 5.5）、Claude Fable、Qwen Max 家族筛选最新数字版本，Codex 入口按 Kimi K、Grok 家族筛选，不自动纳入 preview/thinking 等变体。两来源均不猜测目录外 ID，默认精选随每 5 分钟目录刷新，显隐增量保存为 shown_models 与 hidden_models，自动精选项隐藏同时记录 family: 家族键与当前 ID，显式旧版仍按 ID 管理；已有 models 固定列表（含空串）、model 和 custom_models 保持显式配置，不自动切换运行模型。其他来源默认展示接口列表。Packy 主令牌为 `packy`，第二令牌为 `packy-secondary`，`packy-codex` 复用主令牌和平台地址；按接口协议筛选各 Agent 模型；已确认兼容但目录未声明该协议的模型可通过 custom_models 显式补录，不改写上游协议声明。Codex API 来源不参与订阅登录、自动选号或订阅额度查询。Packy 真实余额用独立系统访问令牌和用户 ID 查询管理端 `/api/user/self`，按站点单位换算；Codex 共用主账号余额，第二令牌可显式引用同一余额账号，推理 Key 保持独立。系统令牌不传入 Agent；hi 合并同一余额账号，footer 共用缓存，失败显示 MISS。接口项用隐藏/显示，列表外记录用补录/删除；所有来源支持 `custom_models`，补录后可选请求档位并直接使用，不能因目录未收录而清空 effort 或禁止选择。隐藏不改运行模型，删除补录项须保护正在选用的会话并清理悬空配置。footer 固定为 `agent · 模型名/effort`；所有来源的交互只读缓存，模型目录每 5 分钟、额度每 60 秒在后台刷新，启动首次预热可等待；额度按账号和平台共享缓存及并发请求；Codex 额度查询的瞬态连接错误先在同一共享请求内最多尝试 3 次（间隔 1s、4s），真实限频与认证失败不立即重试；最终失败冷却依次为 1、2、4、5 分钟，遵守上游更长 Retry-After；回复 footer 最终刷新失败可按原格式直接展示同账号成功缓存，不加缓存或刷新失败标注，无缓存或认证失败仍 MISS；主动额度面板同样只读缓存，诊断保留在后台日志和账号状态；窗口额度保留原紧凑倒计时格式 `4.1h·7%·[6.9d·17%]`，Codex 有消费积分时追加 `积分 62.5k`，积分未知显示 MISS、确认没有则省略；订阅窗口耗尽且没有积分才判定额度用光。仅剩积分的账号排在有订阅余量的账号后，按积分余额降序；有积分的 Pro 不受 Ultra 的 0.5 份周余量门槛限制，`ordinaryUsageAllowed=false` 与 `rate_limit_reached` 仅表示套餐内额度不可用，有本计量桶积分时仍可选；工作区积分/用量限制、消费限制和真实请求耗尽仍有效。余额显示 `余额 $…` / `余额 ¥…`。OpenRouter 用 `/credits` 查账户余额，以实际响应判断权限。
+- `AgentService` 的委派进程与主会话共用启动入口。主 Agent、委派 Agent 和原生子 Agent 均可继续派工，不设置 Lodestar 委派层数上限，保留原生委派工具；独立服务/软件的项目调用不提供提问或回答接口，新建和续跑均须自主执行、验证直至完整完成目标，不能以索取输入、计划或部分工作结束；真实阻断和故障须如实报告；后续委派继承项目、群和交互约定，并纳入父任务的取消树。会话委派与 `--project` 项目调用都只返回结果和本地文件路径，由调用方处理交付；不注入主会话交付提示词，不执行结果中的交付标记，新建与续跑一致。具体生命周期约束见 `src/AGENTS.md`。
+- Agent 执行任务中的调用必须绑定会话，不得通过 `--project`、清除环境或借用项目凭据脱离会话；独立服务/软件调用必须显式 `--project`，每次在绑定群显示独立卡。原生 session_id 是会话唯一 ID，run_id 仅标识一次调用。恢复限同一项目、同一群，允许会话/项目两种绑定之间续跑；未知归属、跨项目和跨群均报错。会话委派与项目调用均不设置本地并发或任务数量上限，上游限制与启动失败按实际错误报告。
+- `managed-skills.ts` 同源生成 Codex/Claude standalone Skill 和 Claude 本地插件。GLM/DeepSeek 通过插件加载 Skill，不为此重新引入 user settings 和凭据。
+- 同 provider/source 调用 `setModelSettings`；Claude 后续 turn 生效，Codex 持久设置在重启后生效。跨 provider/source 只在空闲时换进程，resume id 按 provider 隔离。
+- 保留 Claude 的原生 resume/fork、提问、project profile、MCP/Skill、主动压缩和 SDK 后台任务；保留 Codex 的权限、提问、plan/goal、compaction、usage 和 collab 事件。共享接口须表达后端差异。
+- `cardkit.ts` 独占生产卡的队列、sequence、TTL 重开、元素计数和写入失败状态。正文按完整 block 插入静态元素，footer 用 replace；模板和 Session 不直调 Card Kit HTTP。
+- `workspace.ts` 统一按实际工作目录（含软链接归一化）解析目录配置；BTW/FK 与来源共享目录，WT 是独立目录。文件交付开关、项目工具/MCP 配置按目录共享；任务清单属于项目级，主群、所有 WT 及其 BTW/FK 临时群共用同一清单。模型/账号仅创建临时会话时继承快照，后续各会话独立。配置别名冲突必须报错。
+- `worktree.ts` 管理 `work/*` 分支和同级 `<project>[name]` 工作区。飞书任务清单按主项目名绑定，所有 worktree 共用；只提供绑定与删除，不启动自动规划、执行、审核或合并 worker。
+- `[[send: /abs/path]]` 默认走原生聊天附件及其 30 MB 上限；`files on/off` 按工作目录开启/关闭云空间（BTW/FK 共享，WT 独立），`files` 查看设置。主 Agent 启动时按工作目录设置动态注入交付标记，只有附件模式附加大小约束；文件交付不提供独立 Skill，不让 Agent 查接口或配置。`group-file-delivery.ts` 将目录开关与群文件夹绑定分开保存；v1 旧开关按已知群目录迁移，冲突需用户用 files on/off 明确统一，未解析的旧群保留。云端文件夹仍按 chat_id 持久绑定唯一目录，继承云空间模式的新群在首次交付时建自己的文件夹，目录名与实时群名一致，跨轮次和重启复用；关闭保留目录与文件。同名群不能混用目录，失效绑定不得自动重建空目录。云空间卡只列本轮文件，管理按钮打开本群全部历史交付文件的原生飞书目录；开启者和交付发起人获 full_access、群获 view，不转移所有权或开放公网分享。超过 20 MB 分片上传，限额由上游判断，失败不自动切换通道。原附件/图片通道保留，旧聊天附件不删除、不自动迁移。交付方式在本轮输入交给 Agent 时固定，开关改变从下一轮用户任务更新提示词，不重复普通输入或重启进程；记录由 paths.ts 定义，远端文件不自动清理，模板不读取文件。
+- Codex 生图的提示词和图片默认放在同一个折叠面板，提示词包含完成事件补回的内容，不在折叠标题中展开。图片成功嵌入后不再单发；无法嵌入时按用户要求单独发图。关闭或换卡前等待所属图片上传和写入完成。
+- `hi` 展示 Codex 账号可用的重置卡次数，来源为 `account/rateLimits/read` 的 `rateLimitResetCredits.availableCount`；hi 展示全部已配置账号，一账号一行；DeepSeek、GLM 不按 Agent 重复展示。Codex 只显示主额度，不显示 Spark/gpt-reserve；重置卡简写为“重置”，GLM 月工具只显示百分比，无底部说明。这不是飞书换卡计数，也不加入回复 footer。
+- `codex-reset [备注]` 显式使用一次账号重置卡；省略备注只取当前运行账号，账号未知时要求指定。调用原生 `account/rateLimitResetCredit/consume`，同一消息及其网络重试复用幂等标识；按四种原生 outcome 展示结果，之后重新读额度，不能推算卡数或掩盖已扣卡后的刷新/关闭失败。
 
-## Dependencies
+## 运行中的 daemon
 
-### Internal
-- `daemon.ts` 依赖 `src/session.ts`、`src/feishu.ts`、`src/config.ts`、`src/paths.ts`、`src/notify.ts` 和 `src/tasklist-worker.ts` 完成启动、事件路由、本机通知和任务清单轮询。
-- `src/cards.ts` 是卡片模板 barrel，`src/session.ts`、`src/session-*` 辅助模块和 agy 卡片流程都通过它访问 Card Kit schema。
-- `scripts/` 直接导入 `src/` 模块执行真实环境测试，运行前需要有效 `config.toml`。
+- 启动的第一次 await 前加载恢复名单；开放 WS/调试入口前，按群把恢复任务排入消息与卡片共用的 actor。停机先关闭入口并排空已接收命令，再冻结恢复名单；停止进程时的生命周期回调不得覆盖该名单。恢复失败保留恢复意图和错误，普通消息不得隐式新建会话。
+- 接收时已晚到超过 30 秒的消息应丢弃，避免用户重发后重复执行；排队耗时不参与该判断。这是明确的产品规则。
+- WebSocket 恢复必须彻底关闭旧 client 并创建新的 `WSClient`，该方式已在实际环境反复验证；不能仅凭 SDK 显示 connected 就取消完整重建。
+- 修改代码不授权 stop、restart、reload、切换服务或接管。只有当前用户消息明确要求对应操作时才能执行；授权不跨消息、中断恢复或上下文压缩继承。
+- “测试”“预览”“发张卡看看”不授权停止、重启、shadow、并行启动 daemon 或改 service 指向。不能无扰验证时说明影响，等待明确许可。
+- 重启前只读确认实际 unit，比较 `systemctl --user show <unit> -p ActiveEnterTimestamp` 与源码 mtime。运行代码不落后则不重启，不用 commit 时间代替启动时间。
+- 终止进程前列出 PID 和完整命令，只操作精确 PID 或 unit；禁止 `pkill -f`、`killall` 和宽泛 systemd、Docker、tmux 目标。
+- restart 会终止当前对话宿主。命令只执行一次重启，不在同一命令中 sleep 后验证；恢复后用新 PID、启动时间和 journal 核实。同一用户消息最多重启一次。
+- 常驻进程交给 user systemd；不使用裸 `&`、`nohup` 或临时工具 session 代替服务管理。
 
-### External
-- `@larksuiteoapi/node-sdk`：飞书/Lark `Client`、`WSClient` 和事件分发。
-- Bun：源码运行、测试和构建。
-- Node.js >= 18：发布包运行环境。
-- `codex` CLI：需要已通过 ChatGPT 登录，daemon 会启动 `codex app-server`。
-- Feishu Open Platform：IM、群创建/解散、群成员读写、reaction、附件、Card Kit v1、Task v2、tenant token API。
-- systemd user service：长期运行部署时常用，但只有用户明确要求时才操作。
+## 验证与发布
+
+- Agent 功能的真实调用、续跑和 smoke 测试默认选 GLM Flash；每次先查询实时身份目录，选择 `ready` 项并沿用目录默认 effort。用户明确指定其他模型时按该次要求；GLM Flash 不可用时报告问题，不自动换模型。
+- 源码变更运行 `bun run typecheck` 和 `bun test`。构建入口、CLI、依赖或发布路径变更再运行 `bun run build`。
+- 共享 Session、Card Kit、飞书协议和持久状态变更最终跑全量测试。双后端接口变更覆盖 Codex、Claude、provider/source 切换和共享卡片。
+- 真实飞书、Agent 登录、Card action、建群/解散和 worktree smoke 需要明确目标群、账号及副作用；涉及 live daemon 仍按上节授权。
+- `mathjax-full` 随包附带修复后的传递依赖。发布前实际安装 tarball 并运行 `npm audit --omit=dev`，不能只检查源码目录的 overrides 和 Bun 锁文件。
+- Agent 包仅为开发和类型测试依赖，发布运行时由自动更新器安装。DSH 根据每次获取的 latest 递归解析同版本包族，安装快照中的精确版本用于避免包族混装，不构成兼容限制。普通安全依赖用 `bun scripts/sync-security-deps.ts` 同步，Agent 运行目录也应用这些安全修复。tarball 验收实际安装 Agent 并查询原生目录，不断言其版本等于 Lodestar 构建时版本。
 
 <!-- MANUAL: Add manually maintained notes below this line. -->
 
@@ -102,7 +126,7 @@
 - 发布前用 `bun test` 和 `bun run build` 验证。
 - 提交 release bump，创建 `vX.Y.Z` tag，push `main`，再 push tag。
 - 用 `npm publish --access public` 发布 npm 包。
-- 同一个版本也必须发布到 GitHub Packages。临时写入项目 `.npmrc`，内容包括 `@leviyuan:registry=https://npm.pkg.github.com` 和 `//npm.pkg.github.com/:_authToken=$GH_TOKEN`；运行 `npm publish --registry=https://npm.pkg.github.com --tag latest --access public` 后删除 `.npmrc`。不要跳过 GitHub Packages。
-- 始终为 tag 创建对应的 GitHub Release。本机没有安装 `gh`；使用 GitHub REST API，从 `~/.git-credentials` 读取 token，并用 `jq -n --rawfile body /tmp/notes.md ...` 构造 JSON body。
-- 写 release notes 前先读取最近的 GitHub Releases，并匹配现有风格：使用中文、优先写“用户能感受到什么”，只保留必要的兼容提示；能用平铺短要点说清时不要再按实现拆成 `修复` / `改进`；非首个版本结尾保留 `**Full Changelog**: https://github.com/leviyuan/lodestar/compare/vA...vB`，首个版本改用源码快照链接。
+- 同一个版本也必须发布到 GitHub Packages。临时写入项目 `.npmrc`，内容包括 `@supercc168:registry=https://npm.pkg.github.com` 和 `//npm.pkg.github.com/:_authToken=$GH_TOKEN`；运行 `npm publish --registry=https://npm.pkg.github.com --tag latest --access public` 后删除 `.npmrc`。不要跳过 GitHub Packages。
+- 始终为 tag 创建对应的 GitHub Release。本机没有安装 `gh`；使用 GitHub REST API，从 `~/.git-credentials` 读取 token，并用 `jq -n --rawfile body /tmp/notes.md ...` 构造 JSON body；临时认证文件用后删除。
+- 写 release notes 前先读取最近的 GitHub Releases，并匹配现有风格：使用中文、优先写“用户能感受到什么”，只保留必要的兼容提示；能用平铺短要点说清时不要再按实现拆成 `修复` / `改进`；非首个版本结尾保留 `**Full Changelog**: https://github.com/supercc168/lodestar/compare/vA...vB`，首个版本改用源码快照链接。Release 标题、功能说明和验证结果使用中文，模型名与代码标识符可保留原文；发布前检查没有整段英文说明。
 - 只有用户在当前用户消息中明确要求时才重启正在运行的 user service；重启前先用 `systemctl --user list-units --all` 确认实际 unit，且该授权不得跨 turn 复用。

@@ -1,3 +1,4 @@
+import { networkFetch } from './network'
 /**
  * GLM Coding Plan 用量快照 —— 给 `hi` console 面板的 claude/GLM 后端用。
  *
@@ -7,19 +8,25 @@
  *
  *   GET {baseDomain}/api/monitor/usage/quota/limit
  *
- * 鉴权凭据从 config.toml 的 [claude.models.glm] 档位拿 —— 经 claude-models.ts
+ * 鉴权凭据两条路径:token-source 路径(glm-coding-plan/dsh-glm)显式传
+ * (baseUrlOverride, tokenOverride);无 override(hi 面板全局读取)回退
+ * config.toml 的 [claude.models.glm] 档位 —— 经 claude-models.ts
  * 的 claudeModelProfile('claude:glm') 读出,与 spawn 子进程时注入的 env 同源
  * (base_url/auth_token → ANTHROPIC_BASE_URL/ANTHROPIC_AUTH_TOKEN),额度查询看
  * 到的就是实际跑会话用的那套配置:
  *   ANTHROPIC_AUTH_TOKEN → 裸 token,直接作 Authorization header(不带 Bearer)
  *   ANTHROPIC_BASE_URL   → 判定平台 host(open.bigmodel.cn=ZHIPU / api.z.ai=ZAI)
  *
- * 失败可见 (no_fallbacks):无凭据 / 非 GLM 后端 / 限流 / 网络各自显式标 MISS,
- * 绝不假数据。与 src/usage.ts(Codex 侧)的 snapshot 模式对齐。
+ * 瞬态限流/网络失败沿用同一凭据的最近成功快照；无凭据或非 GLM 后端仍显式标 MISS。
+ * 与 src/usage.ts(Codex 侧)的 snapshot 模式对齐。
  */
 
+import { readFileSync } from 'node:fs'
+import { homedir } from 'node:os'
+import { join } from 'node:path'
 import { claudeModelProfile } from './claude-models'
 import { log } from './log'
+import { UsageReadCache, usageCredentialKey, usageRetryAfter } from './usage-cache'
 
 const API_TIMEOUT_MS = 10_000
 
@@ -40,25 +47,58 @@ export interface GlmMonthlyWindow extends GlmUsageWindow {
 export type GlmUsageSnapshot =
   | { state: 'no_credentials' }
   | { state: 'not_glm'; baseUrl?: string }
-  | { state: 'rate_limited' }
-  | { state: 'network'; reason?: string }
+  | { state: 'rate_limited'; retryAfterMs?: number }
+  | { state: 'network'; reason?: string; retryAfterMs?: number }
   | {
       state: 'ok'
       /** 套餐档位(open.bigmodel.cn 的 level 字段:max / standard / …) */
       level?: string
-      /** 5 小时 token 滚动窗口(TOKENS_LIMIT unit=3 number=5) */
+      /** 5 小时滚动窗口(TOKENS_LIMIT / CREDIT_LIMIT unit=3 number=5) */
       fiveHour: GlmUsageWindow | null
-      /** 周额度窗口(TOKENS_LIMIT unit=6 number=1);无周限额套餐为 null */
+      /** 周额度窗口(TOKENS_LIMIT / CREDIT_LIMIT unit=6 number=1);无周限额套餐为 null */
       weekly: GlmUsageWindow | null
       /** 月度工具/MCP 用量(TIME_LIMIT) */
       monthly: GlmMonthlyWindow | null
       fetchedAt: number
     }
 
-type GlmUsageSnapshotOk = Extract<GlmUsageSnapshot, { state: 'ok' }>
+const usageReads = new UsageReadCache<GlmUsageSnapshot>()
 
-let cache: GlmUsageSnapshot | null = null
-let inFlight: Promise<GlmUsageSnapshot> | null = null
+/** Claude Code settings 目录:优先 CLAUDE_CONFIG_DIR,否则 ~/.claude。 */
+function claudeConfigDir(): string {
+  return process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
+}
+
+/**
+ * 读 ~/.claude/settings.json 的 env 段。daemon 进程默认 env 里没有
+ * ANTHROPIC_* —— 那是 Claude CLI 注入给子进程的;这里从文件读才是真相源。
+ * 读不到(文件缺失/解析失败)返回空 record,调用方按 no_credentials 处理。
+ * token-source 的 detect(fromSettingsEnv)与 scripts/test-dsh-glm.ts 用它。
+ */
+export function readClaudeSettingsEnv(): Record<string, string> {
+  try {
+    const raw = readFileSync(join(claudeConfigDir(), 'settings.json'), 'utf8')
+    const env = JSON.parse(raw)?.env
+    return env && typeof env === 'object' ? env as Record<string, string> : {}
+  } catch (e) {
+    log(`glm-usage: read settings.json env failed: ${e}`)
+    return {}
+  }
+}
+
+/** 判定一个 base_url 是否指向 GLM 官方平台 —— GLM source 的 detect(本机 settings.json 探测)
+ *  与 build enabled + 额度查询(glmDomain)共用同一套 host,避免「探测说是 GLM、额度说不是」的认知割裂。
+ *  只有官方端点(open./dev.bigmodel.cn、api.z.ai)才算 GLM source;第三方中转不匹配 → 不自动启用。 */
+export function isGlmBaseUrl(baseUrl: string): boolean {
+  // 严格 hostname 比较(非子串):解析 URL 取 hostname —— 避免 `open.bigmodel.cn.evil.example`
+  // 或 URL 查询参数里含该文本被误判;hostname 大小写归一化。解析失败(无协议等)→ false。
+  try {
+    const host = new URL(baseUrl).hostname.toLowerCase()
+    return host === 'open.bigmodel.cn' || host === 'dev.bigmodel.cn' || host === 'api.z.ai'
+  } catch {
+    return false
+  }
+}
 
 /** 从 ANTHROPIC_BASE_URL 取 protocol//host;非法返回 null。 */
 function baseDomain(baseUrl: string): string | null {
@@ -70,14 +110,10 @@ function baseDomain(baseUrl: string): string | null {
   }
 }
 
-/** 判定是否 GLM 平台host,返回 domain 或 null(非 GLM)。 */
+/** 判定是否 GLM 平台 host,返回 domain 或 null(非 GLM)。与 isGlmBaseUrl 共用判定。 */
 function glmDomain(baseUrl: string): string | null {
-  if (!baseUrl) return null
   const domain = baseDomain(baseUrl)
-  if (!domain) return null
-  if (baseUrl.includes('open.bigmodel.cn') || baseUrl.includes('dev.bigmodel.cn')) return domain
-  if (baseUrl.includes('api.z.ai')) return domain
-  return null
+  return domain && isGlmBaseUrl(baseUrl) ? domain : null
 }
 
 function clampPct(v: unknown): number | null {
@@ -88,14 +124,15 @@ function resetDate(ms: unknown): Date | null {
   return typeof ms === 'number' && isFinite(ms) && ms > 0 ? new Date(ms) : null
 }
 
-/** 解析 quota/limit 响应 → ok 快照;limits 缺字段按 null(MISS)渲染。
- * TOKENS_LIMIT 有两条:5h 窗口(unit=3 number=5)和周窗口(unit=6 number=1)
+/** 解析 quota/limit 响应；窗口中的缺失数值按 null(MISS)渲染。
+ * TOKENS_LIMIT / CREDIT_LIMIT 的 5h 窗口(unit=3 number=5)和周窗口(unit=6 number=1)
  * —— 靠 unit/number 区分,不能只 find 第一条(有周限额的账号会丢窗口或错配;
  * 无周限额的账号响应里只有 5h 那条,weekly 落 null)。字段语义来自
  * opencode-glm-quota / pi-glm-usage 对同一 API 的解析,2026-08-17 核实。 */
-function parseQuotaLimit(data: any): GlmUsageSnapshotOk {
-  const limits: any[] = Array.isArray(data?.limits) ? data.limits : []
-  const tokens = limits.filter(l => l?.type === 'TOKENS_LIMIT')
+function parseQuotaLimit(data: any): GlmUsageSnapshot {
+  const limits: any[] | undefined = Array.isArray(data) ? data : Array.isArray(data?.limits) ? data.limits : undefined
+  if (!limits) return { state: 'network', reason: 'GLM 额度响应缺少 limits 数组' }
+  const tokens = limits.filter(l => l?.type === 'TOKENS_LIMIT' || l?.type === 'CREDIT_LIMIT')
   const fiveHourLimit = tokens.find(l => l?.unit === 3 && l?.number === 5)
   const weeklyLimit = tokens.find(l => l?.unit === 6 && l?.number === 1)
   const time = limits.find(l => l?.type === 'TIME_LIMIT')
@@ -111,6 +148,7 @@ function parseQuotaLimit(data: any): GlmUsageSnapshotOk {
         ...(typeof time.usage === 'number' ? { total: time.usage } : {}),
       }
     : null
+  if (!fiveHour && !weekly && !monthly) return { state: 'network', reason: 'GLM 额度响应没有可识别的额度窗口' }
   return {
     state: 'ok',
     level: typeof data?.level === 'string' && data.level ? data.level : undefined,
@@ -121,10 +159,14 @@ function parseQuotaLimit(data: any): GlmUsageSnapshotOk {
   }
 }
 
-async function fetchGlmUsage(): Promise<GlmUsageSnapshot> {
-  // 与 spawn 子进程同源:从 config.toml [claude.models.glm] 档位拿注入用的
-  // ANTHROPIC_* env。读不到 token = 该档位未配置 → no_credentials。
-  const env = claudeModelProfile('claude:glm')?.env ?? {}
+export async function fetchGlmUsage(baseUrlOverride?: string, tokenOverride?: string): Promise<GlmUsageSnapshot> {
+  // 上游 token-source 路径(glm-coding-plan/dsh-glm)显式传 base/token override
+  // (任一提供即用 override,避免全局凭据与 source 配置不一致);无 override
+  // 回退本地 config.toml [claude.models.glm] 档位 —— 与 spawn 子进程同源,
+  // 读不到 token = 该档位未配置 → no_credentials。
+  const env = (baseUrlOverride !== undefined || tokenOverride !== undefined)
+    ? { ANTHROPIC_BASE_URL: baseUrlOverride, ANTHROPIC_AUTH_TOKEN: tokenOverride }
+    : claudeModelProfile('claude:glm')?.env ?? {}
   const token = env.ANTHROPIC_AUTH_TOKEN
   const baseUrl = env.ANTHROPIC_BASE_URL || ''
   if (!token) return { state: 'no_credentials' }
@@ -132,11 +174,15 @@ async function fetchGlmUsage(): Promise<GlmUsageSnapshot> {
   const domain = glmDomain(baseUrl)
   if (!domain) return { state: 'not_glm', baseUrl: baseUrl || undefined }
 
+  return usageReads.readStale(usageCredentialKey('glm', domain, token), () => requestGlmUsage(domain, token))
+}
+
+async function requestGlmUsage(domain: string, token: string): Promise<GlmUsageSnapshot> {
   const url = `${domain}/api/monitor/usage/quota/limit`
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS)
   try {
-    const res = await fetch(url, {
+    const res = await networkFetch(url, {
       headers: {
         Authorization: token,
         'Content-Type': 'application/json',
@@ -144,16 +190,26 @@ async function fetchGlmUsage(): Promise<GlmUsageSnapshot> {
       },
       signal: controller.signal,
     })
-    if (res.status === 429) return { state: 'rate_limited' }
-    if (!res.ok) return { state: 'network', reason: `HTTP ${res.status}` }
+    if (!res.ok) {
+      log(`glm-usage: quota/limit HTTP ${res.status}`)
+      return { state: res.status === 429 ? 'rate_limited' : 'network', reason: `HTTP ${res.status}`,
+        retryAfterMs: usageRetryAfter(res.headers) }
+    }
     const json = await res.json()
-    if (json?.success === false || (typeof json?.code === 'number' && json.code !== 200)) {
-      return { state: 'network', reason: json?.msg ? String(json.msg) : `code ${json?.code}` }
+    const code = json?.error?.code ?? json?.code
+    if (json?.success === false || json?.error != null || (code !== undefined && String(code) !== '200')) {
+      const message = json?.error?.message ?? json?.msg ?? json?.message ?? (typeof json?.error === 'string' ? json.error : undefined)
+      const reason = [code === undefined ? '' : `code ${code}`, message === undefined ? '' : String(message)]
+        .filter(Boolean).join(': ').replaceAll(token, '[redacted]') || 'GLM 额度接口返回失败'
+      log(`glm-usage: quota/limit MISS: ${reason}`)
+      return { state: String(code) === '429' ? 'rate_limited' : 'network', reason, retryAfterMs: usageRetryAfter(res.headers) }
     }
     const data = json?.data ?? json
-    return parseQuotaLimit(data)
+    const snapshot = parseQuotaLimit(data)
+    if (snapshot.state === 'network') log(`glm-usage: quota/limit MISS: ${snapshot.reason}`)
+    return snapshot
   } catch (e: any) {
-    const reason = e?.name === 'AbortError' ? `timeout ${API_TIMEOUT_MS}ms` : (e?.message ?? String(e))
+    const reason = (e?.name === 'AbortError' ? `timeout ${API_TIMEOUT_MS}ms` : (e?.message ?? String(e))).replaceAll(token, '[redacted]')
     log(`glm-usage: quota/limit fetch failed: ${reason}`)
     return { state: 'network', reason }
   } finally {
@@ -161,21 +217,4 @@ async function fetchGlmUsage(): Promise<GlmUsageSnapshot> {
   }
 }
 
-export async function readGlmUsage(): Promise<GlmUsageSnapshot> {
-  if (inFlight) return inFlight
-  inFlight = fetchGlmUsage()
-    .then(d => {
-      inFlight = null
-      // 网络态保留上次成功的 cache(若有),否则如实返回失败态 ——
-      // 与 usage.ts 一致:绝不假数据。
-      if (d.state === 'network') return cache ?? d
-      cache = d
-      return d
-    })
-    .catch(e => {
-      log(`glm-usage: fetchGlmUsage threw: ${e}`)
-      inFlight = null
-      return cache ?? { state: 'network', reason: String(e) }
-    })
-  return inFlight
-}
+export const readGlmUsage = fetchGlmUsage

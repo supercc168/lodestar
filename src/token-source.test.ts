@@ -1,297 +1,112 @@
-import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
-import { config } from './config'
+import { describe, expect, test } from 'bun:test'
 import {
-  listTokenSources,
-  resolveClaudeSpawnEnv,
-  resolveCodexSpawnOverrides,
-  resolveTokenSource,
-  resolveUsageSource,
-  scrubAnthropicEnv,
+  refreshAllTokenSourceModels,
+  registerTokenSource,
+  resetTokenSourceRegistry,
+  waitForTokenSourceModelRefresh,
+  type TokenSource,
 } from './token-source'
+import { tokenSourceSpawnRevision } from './token-source-builtins'
 
-const GLM_FULL = {
-  model: 'glm-5.3',
-  base_url: 'https://open.bigmodel.cn/api/anthropic',
-  auth_token: 'glm-tok',
-  effort: 'max',
-  env: {
-    ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3',
-    ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5-turbo',
-    ANTHROPIC_DEFAULT_FABLE_MODEL: 'glm-5.3',
-    ANTHROPIC_DEFAULT_HAIKU_MODEL: 'glm-5-turbo',
-  },
+function source(id: string, refresh: () => Promise<void>): TokenSource {
+  return {
+    id,
+    kind: 'test',
+    agent: 'claude',
+    display: id,
+    enabled: true,
+    models: [],
+    defaultModel: '',
+    refreshModels: refresh,
+    spawnEnv: env => env,
+    resolveSpawnModel: model => model,
+    readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+  }
 }
 
-describe('token-source scrubAnthropicEnv', () => {
-  test('抹掉 base_url/token/api_key 与四档 tier alias', () => {
-    const cleaned = scrubAnthropicEnv({
-      KEEP: '1',
-      ANTHROPIC_BASE_URL: 'https://evil.example',
-      ANTHROPIC_AUTH_TOKEN: 'tok',
-      ANTHROPIC_API_KEY: 'key',
-      ANTHROPIC_DEFAULT_FABLE_MODEL: 'x',
-      ANTHROPIC_DEFAULT_OPUS_MODEL: 'x',
-      ANTHROPIC_DEFAULT_SONNET_MODEL: 'x',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'x',
-    })
-    expect(cleaned).toEqual({ KEEP: '1' })
-  })
-})
+describe('token source model refresh', () => {
+  test('coalesces concurrent refreshes for one registry generation', async () => {
+    resetTokenSourceRegistry()
+    let calls = 0
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    registerTokenSource(source('one', async () => { calls++; await gate }))
 
-describe('token-source Claude login vs api', () => {
-  let prevGlm: unknown
-
-  beforeEach(() => {
-    prevGlm = config.claude.models.glm
-    ;(config.claude as any).models.glm = { ...GLM_FULL, env: { ...GLM_FULL.env } }
+    const first = refreshAllTokenSourceModels()
+    const second = refreshAllTokenSourceModels()
+    expect(first).toBe(second)
+    expect(calls).toBe(1)
+    release()
+    await first
   })
 
-  afterEach(() => {
-    ;(config.claude as any).models.glm = prevGlm
+  test('does not reuse an in-flight refresh after registry rebuild', async () => {
+    resetTokenSourceRegistry()
+    let releaseOld!: () => void
+    const oldGate = new Promise<void>(resolve => { releaseOld = resolve })
+    registerTokenSource(source('old', async () => { await oldGate }))
+    const oldRefresh = refreshAllTokenSourceModels()
+
+    resetTokenSourceRegistry()
+    let freshCalls = 0
+    registerTokenSource(source('fresh', async () => { freshCalls++ }))
+    await refreshAllTokenSourceModels()
+    expect(freshCalls).toBe(1)
+    releaseOld()
+    await oldRefresh
   })
 
-  test('fable login:scrub 后不注入凭据,主力 Fable 5 + light Sonnet 5', () => {
-    const source = resolveTokenSource('claude', 'claude:fable')
-    expect(source.kind).toBe('login')
-    expect(source.provider).toBe('claude')
-    expect(source.enabled()).toBe(true)
-    expect(source.isApiRoute()).toBe(false)
-    expect(source.resolveSpawnModel()).toBe('claude-fable-5')
-    expect(source.usageSource()).toBe('not_applicable')
+  test('a startup waiter follows a registry rebuild without starting another refresh', async () => {
+    resetTokenSourceRegistry()
+    let releaseOld!: () => void
+    const oldGate = new Promise<void>(resolve => { releaseOld = resolve })
+    registerTokenSource(source('old', () => oldGate))
+    const oldRefresh = refreshAllTokenSourceModels()
+    let ready = false
+    const waiting = waitForTokenSourceModelRefresh().then(() => { ready = true })
 
-    const env = source.spawnEnv({
-      PATH: '/bin',
-      ANTHROPIC_BASE_URL: 'https://should-be-scrubbed',
-      ANTHROPIC_AUTH_TOKEN: 'leak',
-      ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-leak',
-    })
-    expect(env.ANTHROPIC_BASE_URL).toBeUndefined()
-    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-fable-5')
-    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-fable-5')
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-fable-5')
-    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-sonnet-5')
-    expect(env.GSD_RUNTIME).toBe('claude')
-    expect(env.PATH).toBe('/bin')
-  })
-
-  test('opus login:主力 Opus 5 + light Sonnet 5,不注入 Fable', () => {
-    const source = resolveTokenSource('claude', 'claude:opus')
-    expect(source.kind).toBe('login')
-    expect(source.resolveSpawnModel()).toBe('claude-opus-5')
-    const env = source.spawnEnv({})
-    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-opus-5')
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5')
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-opus-5')
-    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-sonnet-5')
-    expect(env.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
-  })
-
-  test('glm api:注入 base_url/token 且 tier 收敛到 profile.model', () => {
-    const source = resolveTokenSource('claude', 'claude:glm')
-    expect(source.kind).toBe('api')
-    expect(source.enabled()).toBe(true)
-    expect(source.isApiRoute()).toBe(true)
-    expect(source.resolveSpawnModel()).toBe('glm-5.3')
-    expect(source.usageSource()).toBe('glm')
-
-    const env = resolveClaudeSpawnEnv('claude:glm', {
-      ANTHROPIC_API_KEY: 'official-leak',
-      ANTHROPIC_DEFAULT_HAIKU_MODEL: 'claude-haiku-4-5',
-    })
-    expect(env.ANTHROPIC_API_KEY).toBeUndefined()
-    expect(env.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic')
-    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('glm-tok')
-    // tier 最终由 claudeModelTierEnv 锁到 profile.model(覆盖 profile.env 里的 turbo 等)
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.3')
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.3')
-    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.3')
-    expect(env.GSD_RUNTIME).toBe('claude')
-  })
-
-  test('未配置 glm:enabled=false,但仍可解析 source(选择时由 session-model 拦截)', () => {
-    ;(config.claude as any).models.glm = {
-      model: '',
-      base_url: '',
-      auth_token: '',
-    }
-    const source = resolveTokenSource('claude', 'claude:glm')
-    expect(source.kind).toBe('api')
-    expect(source.enabled()).toBe(false)
-  })
-})
-
-describe('token-source selected Claude API model', () => {
-  let prevRelay: unknown
-
-  beforeEach(() => {
-    prevRelay = config.claude.models.relay
-    ;(config.claude as any).models.relay = {
-      model: 'relay-selected-by-feishu',
-      base_url: 'https://relay.example',
-      auth_token: 'relay-token',
-      effort: 'xhigh',
-    }
-  })
-
-  afterEach(() => {
-    ;(config.claude as any).models.relay = prevRelay
-  })
-
-  test('selection keeps the profile model for SDK and every child-model alias', () => {
-    const source = resolveTokenSource('claude', 'claude:relay')
-    expect(source.selectionModel).toBe('claude:relay')
-    expect(source.resolveSpawnModel()).toBe('relay-selected-by-feishu')
-
-    const env = source.spawnEnv({
-      ANTHROPIC_DEFAULT_OPUS_MODEL: 'stale-model',
-    })
-    expect(env.ANTHROPIC_BASE_URL).toBe('https://relay.example')
-    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('relay-token')
-    expect(env.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('relay-selected-by-feishu')
-    expect(env.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('relay-selected-by-feishu')
-    expect(env.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('relay-selected-by-feishu')
-    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('relay-selected-by-feishu')
-  })
-})
-
-describe('token-source Codex login vs api', () => {
-  let prevModels: unknown
-
-  beforeEach(() => {
-    prevModels = config.codex.models
-    ;(config.codex as any).models = {
-      wuhen: {
-        display_name: 'Codex · Wuhen',
-        description: 'test',
-        model: 'gpt-5.6-sol',
-        base_url: 'https://wuhen.example/v1',
-        api_key: 'wu-key',
-        route: 'api',
-        effort: 'max',
-      },
-      grok: {
-        display_name: 'Codex · Grok 4.6 · 无痕',
-        description: 'test',
-        model: 'grok-4.6',
-        base_url: 'https://wuhen.example',
-        wire_api: 'responses',
-        api_key: 'grok-key',
-        route: 'api',
-        effort: 'xhigh', // Codex Grok remains blocked; Claude normalizes Grok to official xhigh.
-      },
-    }
-  })
-
-  afterEach(() => {
-    ;(config.codex as any).models = prevModels
-  })
-
-  test('gpt-5.6-sol login:空 configArgs/env', () => {
-    const source = resolveTokenSource('codex', 'gpt-5.6-sol')
-    expect(source.kind).toBe('login')
-    expect(source.provider).toBe('codex')
-    expect(source.enabled()).toBe(true)
-    expect(source.isApiRoute()).toBe(false)
-    expect(source.usageSource()).toBe('codex')
-    const o = source.spawnOverrides()
-    expect(o.configArgs).toEqual([])
-    expect(o.env).toEqual({})
-    expect(o.modelId).toBe('gpt-5.6-sol')
-  })
-
-  test('codex api 档:注入 provider configArgs + key env', () => {
-    const source = resolveTokenSource('codex', 'codex:wuhen')
-    expect(source.kind).toBe('api')
-    expect(source.enabled()).toBe(true)
-    expect(source.isApiRoute()).toBe(true)
-    const o = resolveCodexSpawnOverrides('codex:wuhen')
-    expect(o.modelId).toBe('gpt-5.6-sol')
-    expect(o.configArgs.some(a => a.includes('model_provider='))).toBe(true)
-    expect(Object.keys(o.env).length).toBeGreaterThan(0)
-    expect(Object.values(o.env)).toContain('wu-key')
-  })
-
-  test('Codex TokenSource 拒绝 Grok，避免绕过飞书选择器直接启动', () => {
-    expect(() => resolveTokenSource('codex', 'codex:grok')).toThrow('必须使用 Claude provider')
-    expect(() => resolveCodexSpawnOverrides('codex:grok')).toThrow('必须使用 Claude provider')
-  })
-})
-
-describe('token-source Claude Grok channels', () => {
-  let prevModels: unknown
-
-  beforeEach(() => {
-    prevModels = config.claude.models
-    ;(config.claude as any).models = {
-      grok: { model: 'grok-4.6', base_url: 'https://api.wuhen-ai.com', auth_token: 'grok-token', effort: 'xhigh' },
-      grokcc: { model: 'grok-4.6', base_url: 'https://catcodexapi.com', auth_token: 'grokcc-token', effort: 'xhigh' },
-    }
-  })
-
-  afterEach(() => {
-    ;(config.claude as any).models = prevModels
-  })
-
-  test('两个 Grok 档位都由 Claude source 注入各自端点和 token', () => {
-    for (const [name, baseUrl, token] of [
-      ['grok', 'https://api.wuhen-ai.com', 'grok-token'],
-      ['grokcc', 'https://catcodexapi.com', 'grokcc-token'],
-    ] as const) {
-      const source = resolveTokenSource('claude', `claude:${name}`)
-      expect(source.provider).toBe('claude')
-      expect(source.kind).toBe('api')
-      expect(source.enabled()).toBe(true)
-      expect(source.resolveSpawnModel()).toBe('grok-4.6')
-      const env = source.spawnEnv({})
-      expect(env.ANTHROPIC_BASE_URL).toBe(baseUrl)
-      expect(env.ANTHROPIC_AUTH_TOKEN).toBe(token)
-      expect(env.GSD_RUNTIME).toBe('claude')
+    resetTokenSourceRegistry()
+    let releaseNew!: () => void
+    const newGate = new Promise<void>(resolve => { releaseNew = resolve })
+    let refreshes = 0
+    registerTokenSource(source('new', async () => { refreshes++; await newGate }))
+    const newRefresh = refreshAllTokenSourceModels()
+    try {
+      releaseOld()
+      await oldRefresh
+      await Promise.resolve()
+      expect(ready).toBe(false)
+      releaseNew()
+      await waiting
+      expect(ready).toBe(true)
+      expect(refreshes).toBe(1)
+    } finally {
+      releaseOld()
+      releaseNew()
+      await Promise.all([oldRefresh, newRefresh, waiting])
+      resetTokenSourceRegistry()
     }
   })
 })
 
-describe('token-source list + usage helpers', () => {
-  test('listTokenSources 含 claude login 档与 sol', () => {
-    const ids = listTokenSources().map(s => s.id)
-    expect(ids).toContain('claude:fable')
-    expect(ids).toContain('claude:opus')
-    expect(ids).toContain('claude:grok')
-    expect(ids).toContain('claude:grokcc')
-    expect(ids).not.toContain('codex:grok')
-    expect(ids.some(id => id.includes('gpt-5.6-sol') || id === 'codex-login:gpt-5.6-sol')).toBe(true)
+describe('token source spawn revision', () => {
+  test('API key changes replace model processes', () => {
+    expect(tokenSourceSpawnRevision('openrouter', {
+      api_key: 'key-one',
+    }, null)).not.toBe(tokenSourceSpawnRevision('openrouter', {
+      api_key: 'key-two',
+    }, null))
   })
 
-  test('resolveUsageSource 与历史 usageSourceForAgent 对齐', () => {
-    expect(resolveUsageSource('codex', 'gpt-5.6-sol')).toBe('codex')
-    expect(resolveUsageSource('claude', 'claude:fable')).toBe('not_applicable')
-    expect(resolveUsageSource('claude', 'claude:glm')).toBe('glm')
-    // glm-* 变体(如 glm-flash 快速档 / glm-flashx 高速档)命中 /^claude:glm(?:$|[-_])/ 同归 GLM 额度
-    expect(resolveUsageSource('claude', 'claude:glm-flash')).toBe('glm')
-    expect(resolveUsageSource('claude', 'claude:glm-flashx')).toBe('glm')
-    expect(resolveUsageSource('claude', 'claude:relay')).toBe('not_applicable')
-    expect(resolveUsageSource('claude', 'claude:grok')).toBe('provider')
-    expect(resolveUsageSource('claude', 'claude:grokcc')).toBe('provider')
-  })
-
-  test('resolveTokenSource("dsh") 落在 deepseek-harness 源上', () => {
-    const source = resolveTokenSource('dsh', 'dsh:deepseek-v4-pro')
-    expect(source.id).toBe('deepseek-harness')
-    expect(source.provider).toBe('dsh')
-    expect(source.kind).toBe('api')
-    expect(source.isApiRoute()).toBe(true)
-  })
-
-  test('resolveUsageSource("dsh") = provider(D-09 接线点经 slim 层同规则)', () => {
-    // 与 usageSourceForAgent('dsh', …) 同结果 —— token-source 只是委托方。
-    expect(resolveUsageSource('dsh', 'dsh:deepseek-v4-pro')).toBe('provider')
-    expect(resolveUsageSource('dsh', null)).toBe('provider')
-  })
-
-  test('listTokenSources 收进 DSH 源且不改其它档位的 id 语义', () => {
-    const ids = listTokenSources().map(s => s.id)
-    expect(ids).toContain('deepseek-harness')
-    // 一档一位:DSH 只出现一次
-    expect(ids.filter(id => id === 'deepseek-harness')).toHaveLength(1)
+  test('changes for routing credentials but not catalog-only fields', () => {
+    const base = tokenSourceSpawnRevision('glm-coding-plan', {
+      base_url: 'https://example.test/anthropic', auth_token: 'one', models: 'A', display: 'Account A',
+    }, null)
+    expect(tokenSourceSpawnRevision('glm-coding-plan', {
+      base_url: 'https://example.test/anthropic', auth_token: 'one', models: 'B', display: 'Renamed',
+    }, null)).toBe(base)
+    expect(tokenSourceSpawnRevision('glm-coding-plan', {
+      base_url: 'https://example.test/anthropic', auth_token: 'two', models: 'A', display: 'Account A',
+    }, null)).not.toBe(base)
   })
 })

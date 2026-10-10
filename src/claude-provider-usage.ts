@@ -352,7 +352,7 @@ export async function readClaudeProviderUsage(model: string): Promise<ClaudeProv
       cacheByModel.set(key, d)
       return d
     })
-    .catch(e => {
+    .catch((e): ClaudeProviderUsageSnapshot => {
       log(`claude-provider-usage: fetch threw for ${key}: ${e}`)
       inFlightByModel.delete(key)
       return cacheByModel.get(key) ?? { state: 'network', reason: String(e) }

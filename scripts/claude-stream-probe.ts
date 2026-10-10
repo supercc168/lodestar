@@ -9,13 +9,16 @@ import {
   type SDKMessage,
 } from '@anthropic-ai/claude-agent-sdk'
 import { claudeSdkReasoningOptions } from '../src/claude-agent-process'
-import { claudeModelEffort } from '../src/claude-models'
-import { resolveTokenSource } from '../src/token-source'
+import { claudeModelEffort, claudeModelIsApiRoute } from '../src/claude-models'
+import { getTokenSource } from '../src/token-source'
+import { buildTokenSourcesFromConfig } from '../src/token-source-builtins'
 
+buildTokenSourcesFromConfig()
 const rawSelection = process.argv[2]?.trim() || 'claude:glm'
 const selection = rawSelection.startsWith('claude:') ? rawSelection : `claude:${rawSelection}`
-const source = resolveTokenSource('claude', selection)
-const requestedModel = source.resolveSpawnModel()
+const source = getTokenSource(selection.slice('claude:'.length))
+if (!source) throw new Error(`${selection} is not configured`)
+const requestedModel = source.resolveSpawnModel(source.defaultModel) ?? ''
 const reasoningOptions = claudeSdkReasoningOptions(selection, claudeModelEffort(selection) ?? 'max')
 const reasoningMode = process.argv[3]?.trim() || 'production'
 const grokCompatibility = reasoningOptions.thinking?.type === 'disabled'
@@ -46,10 +49,10 @@ function probeReasoningOptions(): {
 const queryReasoningOptions = probeReasoningOptions()
 const allowsNoThinking = queryReasoningOptions.thinking?.type === 'disabled'
 
-if (!source.isApiRoute()) {
+if (!claudeModelIsApiRoute(selection)) {
   throw new Error(`${selection} is not a Claude API route`)
 }
-if (!source.enabled()) {
+if (!source.enabled) {
   throw new Error(`${selection} is not configured`)
 }
 if (!requestedModel) {
@@ -97,7 +100,7 @@ type StreamSummary = {
 }
 
 const summary: StreamSummary = {
-  selection: source.selectionModel,
+  selection,
   requestedModel,
   reasoningMode,
   queryEffort: queryReasoningOptions.effort ?? null,
@@ -136,7 +139,7 @@ function messagesEndpoint(baseUrl: string): string {
   return base.endsWith('/v1') ? `${base}/messages` : `${base}/v1/messages`
 }
 
-async function runRawToolProbe(env: Record<string, string>): Promise<void> {
+async function runRawToolProbe(env: Record<string, string | undefined>): Promise<void> {
   const baseUrl = env.ANTHROPIC_BASE_URL
   const token = env.ANTHROPIC_AUTH_TOKEN || env.ANTHROPIC_API_KEY
   if (!baseUrl || !token) throw new Error('raw probe has no base URL or token')
@@ -298,7 +301,7 @@ try {
   const env = source.spawnEnv({
     ...(process.env as Record<string, string>),
     CLAUDE_CONFIG_DIR: claudeConfigDir,
-  })
+  }, requestedModel)
   try {
     await runRawToolProbe(env)
   } catch (error) {

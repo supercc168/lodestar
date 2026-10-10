@@ -59,8 +59,8 @@ export interface AgyForwardRecord {
   used: boolean
 }
 
-function agyElapsedSec(task: AgyTaskState, now = Date.now()): string {
-  return ((now - task.startedAt) / 1000).toFixed(1)
+function agyElapsedSec(task: AgyTaskState, now = Date.now()): number {
+  return (now - task.startedAt) / 1000
 }
 
 function agyProcessUsage(task: AgyTaskState): { cpuPercent: number | null; memBytes: number | null } {
@@ -106,7 +106,7 @@ function agyStats(
     cwd: s.workDir,
     command: agyDisplayCommand(),
     startedAtMs: task.startedAt,
-    elapsedSec: agyElapsedSec(task, endedAt ?? Date.now()),
+    elapsedSec: agyElapsedSec(task, endedAt ?? Date.now()).toFixed(1),
     cpuPercent: usage.cpuPercent,
     memBytes: usage.memBytes,
     ...(endedAt ? { endedAtMs: endedAt } : {}),

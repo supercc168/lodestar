@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto'
 import { client } from './feishu'
+import { formatFeishuError } from './feishu-errors'
 
 export async function fetchChatOwnerOpenId(chatId: string): Promise<string> {
   const res = await callFeishuApi('feishu chat.get', () => client.im.chat.get({
@@ -229,7 +230,7 @@ export async function discoverTasklistDefaultSectionGuid(tasklistGuid: string): 
     if (res.code && res.code !== 0) throwFeishuApiError('feishu task.create', res)
     const task = res.data?.task
     taskGuid = task?.guid ?? ''
-    if (!taskGuid) throw new Error('feishu task.create returned no guid during default section discovery')
+    if (!task?.guid) throw new Error('feishu task.create returned no guid during default section discovery')
     const sectionGuid = task.tasklists
       ?.find(item => item.tasklist_guid === tasklistGuid)
       ?.section_guid
@@ -325,8 +326,8 @@ export function formatFeishuApiError(api: string, raw: unknown): string {
     : data.data && typeof data.data === 'object'
       ? data.data as Record<string, any>
       : data
-  const code = responseData.code ?? data.code
-  const msg = responseData.msg ?? responseData.message ?? data.msg ?? data.message ?? 'unknown error'
+  // 上游形态:code=… message=… log_id=…(feishu-errors 统一诊断,SDK 头 log id 一并带出);
+  // 本地增量:missing_scopes 追加在尾部(tasklist 权限违规可见性)。
   const violations = responseData.error?.permission_violations
     ?? responseData.permission_violations
     ?? data.error?.permission_violations
@@ -336,7 +337,7 @@ export function formatFeishuApiError(api: string, raw: unknown): string {
         .filter(Boolean)
         .join(', ')
     : ''
-  return `${api} failed code=${code ?? 'unknown'} msg=${msg}${scopes ? ` missing_scopes=${scopes}` : ''}`
+  return `${api} failed ${formatFeishuError(raw)}${scopes ? ` missing_scopes=${scopes}` : ''}`
 }
 
 async function callFeishuApi<T>(api: string, fn: () => Promise<T>): Promise<T> {

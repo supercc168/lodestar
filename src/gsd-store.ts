@@ -11,6 +11,7 @@ import {
 import { dirname, join } from 'node:path'
 import { spawnSync } from 'node:child_process'
 import { createHash, randomUUID } from 'node:crypto'
+import type { AgentProvider } from './agent-process'
 import {
   type BridgeHealth,
   ensureWorkstreamRoute,
@@ -211,6 +212,15 @@ function planningPathFor(slug: string): string {
   return slug ? `.gsd/${slug}/.planning/` : ''
 }
 
+/** GSD toolchain runs only on codex/claude; dsh (and any unknown runtime) is
+ * rejected here, so validated callers get a narrowed type back. */
+export function requireGsdRuntime(runtime: AgentProvider): 'codex' | 'claude' {
+  if (runtime !== 'codex' && runtime !== 'claude') {
+    throw new Error(`unsupported GSD runtime isolation target: ${runtime}`)
+  }
+  return runtime
+}
+
 /** Keep a workstream on Lodestar's current Feishu provider/model by disabling
  * every automatic external-AI route at the project-config layer. The file is
  * intentionally ignored by the local .gsd repository. */
@@ -219,9 +229,7 @@ export function enforceGsdProviderIsolation(
   taskSlug: string,
   runtime: 'codex' | 'claude',
 ): { path: string; changed: boolean } {
-  if (runtime !== 'codex' && runtime !== 'claude') {
-    throw new Error(`unsupported GSD runtime isolation target: ${runtime}`)
-  }
+  requireGsdRuntime(runtime)
   const slug = normalizeTaskSlug(taskSlug)
   const gsdRoot = join(projectRoot, '.gsd')
   if (!existsSync(join(gsdRoot, '.git'))) {

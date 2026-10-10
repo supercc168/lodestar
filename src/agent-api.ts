@@ -1,8 +1,11 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Session } from './session'
 import type { AgentService, AgentPrincipal } from './agent-service'
-import { getAgentIdentityCatalog } from './agent-identities'
+import { agentPrincipalContext } from './agent-context'
+import { getAgentIdentityCatalog, type AgentIdentityCatalog } from './agent-identities'
 import {
+  agentRunOwner,
+  PROJECT_AGENT_INPUT_ERROR,
   parseAgentAnswerRequest,
   parseAgentFollowUpRequest,
   parseAgentRunRequest,
@@ -14,6 +17,7 @@ const MAX_BODY_BYTES = 4 * 1024 * 1024
 export interface AgentApiContext {
   service: AgentService
   authorizeSession(capability: string): Session | null
+  authorizeProject?(capability: string, project: string): AgentPrincipal | null
 }
 
 export async function handleAgentRequest(
@@ -31,11 +35,18 @@ export async function handleAgentRequest(
   }
   const capability = bearerToken(req.headers.authorization)
   if (!capability) return send(401, { error: 'missing bearer capability' })
-  const principal = authorizePrincipal(context, capability)
+  let principal: AgentPrincipal | null
+  try {
+    const projects = url.searchParams.getAll('project')
+    if (projects.length > 1 || (projects.length && !projects[0].trim())) return send(400, { error: 'invalid project selector' })
+    principal = projects.length
+      ? context.authorizeProject?.(capability, projects[0]) ?? null
+      : authorizePrincipal(context, capability)
+  } catch (error) { return send(409, { error: messageOf(error) }) }
   if (!principal) return send(403, { error: 'invalid or stale agent capability' })
 
   if (req.method === 'GET' && url.pathname === '/agents/identities') {
-    return send(200, serializeCatalog(getAgentIdentityCatalog()))
+    return send(200, serializeCatalog(getAgentIdentityCatalog(agentPrincipalContext(principal).codexAccountId)))
   }
   if (req.method === 'POST' && url.pathname === '/agents/runs') {
     try {
@@ -65,6 +76,7 @@ export async function handleAgentRequest(
       return send(202, serializeRun(run))
     }
     if (action === 'answer' && req.method === 'POST') {
+      if (agentPrincipalContext(principal).owner.kind === 'project') return send(409, { error: PROJECT_AGENT_INPUT_ERROR })
       const run = await context.service.answer(principal, runId, parseAgentAnswerRequest(await readJsonBody(req)))
       return send(200, serializeRun(run))
     }
@@ -91,15 +103,16 @@ function bearerToken(header: string | undefined): string {
 
 async function readJsonBody(req: IncomingMessage): Promise<unknown> {
   let raw = ''
+  req.setEncoding('utf8')
   for await (const chunk of req) {
-    raw += chunk.toString()
+    raw += chunk
     if (Buffer.byteLength(raw) > MAX_BODY_BYTES) throw new Error(`request body exceeds ${MAX_BODY_BYTES} bytes`)
   }
   try { return JSON.parse(raw || '{}') }
   catch { throw new Error('bad json') }
 }
 
-function serializeCatalog(catalog: ReturnType<typeof getAgentIdentityCatalog>): object {
+function serializeCatalog(catalog: AgentIdentityCatalog): object {
   return {
     catalog_generation: catalog.catalogGeneration,
     identities: catalog.identities.map(identity => ({
@@ -132,9 +145,14 @@ export function serializeAgentRun(run: AgentRunSnapshot): object {
 function serializeRun(run: AgentRunSnapshot): object {
   return {
     run_id: run.runId,
-    session_name: run.sessionName,
+    binding: agentRunOwner(run).kind,
+    ...(agentRunOwner(run).kind === 'project' ? { project: agentRunOwner(run).name } : { session_name: run.sessionName }),
+    ...(run.requestId ? { request_id: run.requestId } : {}),
+    work_dir: run.workDir,
     prompt: run.prompt,
+    description: run.description,
     parent_run_id: run.parentRunId,
+    resumed_from_run_id: run.resumedFromRunId,
     parent_kind: run.parentKind,
     depth: run.depth,
     status: run.status,

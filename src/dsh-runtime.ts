@@ -1,15 +1,17 @@
 import { EventEmitter } from 'node:events'
 import { createRequire } from 'node:module'
+import { createHash, randomUUID } from 'node:crypto'
 import { createInterface } from 'node:readline'
 import { dirname, join, isAbsolute } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { tmpdir } from 'node:os'
-import { mkdirSync, mkdtempSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, renameSync, writeFileSync, rmSync } from 'node:fs'
 import spawn from 'cross-spawn'
 import type { ChildProcess } from 'node:child_process'
 import type { ProjectProfile } from './config'
 import { DSH_HOME_DIR } from './paths'
 import { DSH_PROTOCOL_VERSION, DSH_VERSION, type DshNotification } from './dsh-protocol'
+import { agentRuntimeRoot } from './agent-updates'
 import { log } from './log'
 
 export interface DshRuntimeOptions {
@@ -20,6 +22,27 @@ export interface DshRuntimeOptions {
   managedSkillDir?: string
   /** Explicit overlays used by isolated runtime integration tests as well as deployments. */
   patches?: string[]
+}
+
+export function dshProviderPatches(env: Record<string, string | undefined>): object[] {
+  const provider = env.LODESTAR_DSH_PROVIDER ?? 'deepseek-official'
+  if (provider === 'deepseek-official') return []
+  if (provider !== 'zai-coding-cn' && provider !== 'zai') throw new Error(`Unsupported DSH provider: ${provider}`)
+  const modelIds: unknown = env.LODESTAR_DSH_MODELS === undefined ? undefined : JSON.parse(env.LODESTAR_DSH_MODELS)
+  if (modelIds !== undefined && (!Array.isArray(modelIds) || !modelIds.every(id => typeof id === 'string' && id))) {
+    throw new Error('Invalid DSH GLM model catalog')
+  }
+  return [
+    { id: 'llm-deepseek', disabled: true },
+    { id: 'llm-pi-ai', disabled: false, config: { providers: { [provider]: {
+      apiKeyEnv: 'LODESTAR_DSH_GLM_API_KEY', baseURL: env.LODESTAR_DSH_BASE_URL,
+      compat: { supportsReasoningEffort: true },
+      reasoning: 'high', ...(Array.isArray(modelIds) ? { models: modelIds.map(id => ({ id,
+        reasoningEfforts: { off: null, minimal: 'minimal', low: 'low', medium: 'medium', high: 'high', xhigh: 'xhigh', max: 'max' },
+      })) } : {}),
+    } } } },
+    { id: 'agent-default-model', config: { provider, model: env.LODESTAR_DSH_DEFAULT_MODEL ?? '' } },
+  ]
 }
 
 function projectMcpRows(cwd: string, profile?: ProjectProfile): object[] {
@@ -61,15 +84,40 @@ export class DshRuntime extends EventEmitter {
   constructor(opts: DshRuntimeOptions) {
     super()
     if (!isAbsolute(opts.cwd)) throw new Error('DSH requires an absolute workspace')
-    const require = createRequire(import.meta.url)
+    const runtimeRoot = agentRuntimeRoot('dsh')
+    // 依赖解析以托管运行时为锚:桥接目录必须与 DSH 子进程共用同一棵依赖树。
+    const require = createRequire(join(runtimeRoot, 'package.json'))
     const manifestPath = require.resolve('@deepseek-ai/dsh/package.json')
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
+    // 本地协议版本钉:运行的 DSH 运行时 manifest 必须精确匹配(见 dsh-protocol)。
     if (manifest.version !== DSH_VERSION) throw new Error(`DSH runtime version mismatch: expected ${DSH_VERSION}, got ${manifest.version}`)
+    log(`dsh runtime: ${manifest.version} (${runtimeRoot})`)
+    const providerPatches = dshProviderPatches(opts.env)
     const home = opts.home ?? DSH_HOME_DIR
     mkdirSync(home, { recursive: true, mode: 0o700 })
     const mcp = projectMcpRows(opts.cwd, opts.profile)
     this.launchDir = mkdtempSync(join(tmpdir(), 'lodestar-dsh-'))
-    const bridge = fileURLToPath(new URL(import.meta.url.endsWith('.ts') ? './dsh-bridge.ts' : './dsh-bridge.js', import.meta.url))
+    const sourceMode = import.meta.url.endsWith('.ts')
+    const bridgeName = sourceMode ? 'dsh-bridge.ts' : 'dsh-bridge.js'
+    // 桥接源码按 import.meta.url 相对路径读取(dev=src/*.ts,dist=打包后的 .js)。
+    const source = readFileSync(fileURLToPath(new URL(`./${bridgeName}`, import.meta.url)))
+    const protocol = sourceMode ? readFileSync(fileURLToPath(new URL('./dsh-protocol.ts', import.meta.url))) : Buffer.alloc(0)
+    const application = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+    const identity = Buffer.from(JSON.stringify({ name: application.name, version: application.version, type: 'module', private: true }))
+    const hash = createHash('sha256').update(source).update(protocol).update(identity).digest('hex').slice(0, 20)
+    // Imports in the bridge must resolve against the same runtime as the DSH child.
+    const bridgeDir = join(runtimeRoot, '.lodestar-bridges', hash)
+    mkdirSync(bridgeDir, { recursive: true })
+    const bridge = join(bridgeDir, bridgeName)
+    const publish = (path: string, bytes: Buffer): void => {
+      if (existsSync(path)) return
+      const temporary = `${path}.${randomUUID()}.tmp`
+      try { writeFileSync(temporary, bytes); renameSync(temporary, path) }
+      finally { if (existsSync(temporary)) rmSync(temporary) }
+    }
+    publish(join(bridgeDir, 'package.json'), identity)
+    if (sourceMode) publish(join(bridgeDir, 'dsh-protocol.ts'), protocol)
+    publish(bridge, source)
     const patch = [
       ...['sdk-jsonrpc-server', 'session-title-llm', 'session-telemetry-otel', 'settings', 'credentials', 'llm-pi-ai'].map(id => ({ id, disabled: true })),
       { id: 'approval', config: { policy: 'ask' } },
@@ -78,6 +126,7 @@ export class DshRuntime extends EventEmitter {
       { id: 'skill-filesystem', config: { includeDefaultRoots: true, ...(opts.managedSkillDir ? { customSkillDirs: [opts.managedSkillDir] } : {}) } },
       { insert: [{ id: 'lodestar-bridge', name: bridge },
         { id: 'lodestar-ask-user', name: '@deepseek-ai/dsh-tool-ask-user' }, ...mcp] },
+      ...providerPatches,
     ]
     const patchPath = join(this.launchDir, 'bridge.patch.yml')
     writeFileSync(patchPath, JSON.stringify(patch), { mode: 0o600 })
@@ -125,6 +174,7 @@ export class DshRuntime extends EventEmitter {
   isAlive(): boolean { return !this.exited }
   initialize(): Promise<void> {
     return this.initTask ??= this.request('initialize', {}, 30_000).then(result => {
+      // 本地严格握手:协议版本与运行时版本都要精确匹配(非仅存在性检查)。
       if (result.protocolVersion !== DSH_PROTOCOL_VERSION || result.runtimeVersion !== DSH_VERSION) {
         throw new Error(`DSH handshake version mismatch: ${JSON.stringify(result)}`)
       }

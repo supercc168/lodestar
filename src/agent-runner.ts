@@ -3,8 +3,12 @@ import type { AgentIdentity } from './agent-identities'
 import { createAgentProcess } from './agent-launch'
 import { rememberAgentSession } from './agent-session-registry'
 import type { AgentInputQuestion, AgentInputRequest, AgentStep } from './agent-run-types'
+import { PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
 import type { ConversationLaunch } from './conversation'
 import type { ProjectProfile } from './config'
+import { getTokenSourceForAccount } from './token-source'
+import { DELEGATED_AGENT_INSTRUCTIONS, PROJECT_AGENT_INSTRUCTIONS } from './agent-skill'
+import { log } from './log'
 
 const INPUT_TOOLS = new Set(['AskUserQuestion', 'request_user_input'])
 
@@ -30,6 +34,7 @@ export interface AgentWorkerCallbacks {
   onNeedsInput?(request: AgentInputRequest): void
   onProgress?(step: AgentStep): void
   onSession?(sessionId: string): void
+  onCodexAccount?(accountId: string): void
 }
 
 export interface AgentWorkerHandle {
@@ -42,19 +47,28 @@ export interface AgentWorkerHandle {
 }
 
 export function startAgentWorker(opts: {
+  projectBound?: boolean
   identity: AgentIdentity
+  codexAccountId?: string
   effort: AgentReasoningEffort
   workDir: string
   prompt: string
   resumeSessionId?: string
   developerInstructions?: string
   profile?: ProjectProfile
+  managedSkillPluginPath?: string
   hostEnv: Record<string, string | undefined>
-  /** 原生工具层委派开关(D-11 口径 3)。worker 一律禁再委派,故缺省即 false;
-   *  仅显式 true 才放开(当前无调用方)。 */
+  /** 原生工具层委派开关(D-11 口径 3)。缺省判定:会话归属的 worker
+   *  (projectBound 未设)一律关闸(false);项目归属延续上游多层语义,
+   *  不设闸。仅显式传值才覆盖该判定。 */
   allowDelegation?: boolean
   callbacks?: AgentWorkerCallbacks
 }): AgentWorkerHandle {
+  const source = getTokenSourceForAccount(opts.identity.tokenSourceId, opts.codexAccountId)
+  if (!source) throw new Error(`agent token source not found: ${opts.identity.tokenSourceId}`)
+  if (opts.identity.spawnRevision && source.spawnRevision !== opts.identity.spawnRevision) {
+    throw new Error(`agent token source changed after identity discovery: ${source.id}`)
+  }
   if (!opts.identity.supportedEfforts.includes(opts.effort)) {
     throw new Error(`${opts.identity.displayName} does not support effort ${opts.effort}`)
   }
@@ -65,16 +79,23 @@ export function startAgentWorker(opts: {
     provider: opts.identity.provider,
     workDir: opts.workDir,
     tokenSourceId: opts.identity.tokenSourceId,
+    codexAccountId: opts.codexAccountId,
+    ...(opts.identity.provider === 'codex' && opts.identity.tokenSourceId === 'codex-sub'
+      ? { codexAccountPreference: null } : {}),
     model: opts.identity.model,
     effort: opts.effort,
     launch,
-    developerInstructions: opts.developerInstructions,
+    developerInstructions: [opts.developerInstructions, opts.projectBound ? PROJECT_AGENT_INSTRUCTIONS : DELEGATED_AGENT_INSTRUCTIONS].filter(Boolean).join('\n\n'),
+    allowUserInput: !opts.projectBound,
     profile: opts.profile,
-    hostEnv: opts.hostEnv,
+    managedSkillPluginPath: opts.managedSkillPluginPath,
+    hostEnv: { ...opts.hostEnv, LODESTAR_AGENT_ROLE: 'worker' },
     serviceName: 'lodestar-agent',
-    allowDelegation: opts.allowDelegation ?? false,
+    // D-11 口径 3 缺省:会话归属(false)关闸;项目归属(true)不设闸 —— true 与
+    // 不传等效(agent-launch 只在显式 false 时关闭原生委派工具)。
+    allowDelegation: opts.allowDelegation ?? !!opts.projectBound,
   })
-  return collectAgentTurn(proc, opts.prompt, opts.callbacks)
+  return collectAgentTurn(proc, opts.prompt, opts.callbacks, undefined, opts.resumeSessionId, !opts.projectBound)
 }
 
 export function collectAgentTurn(
@@ -82,11 +103,15 @@ export function collectAgentTurn(
   prompt: string,
   callbacks: AgentWorkerCallbacks = {},
   remember: typeof rememberAgentSession = rememberAgentSession,
+  expectedSessionId?: string,
+  allowUserInput = true,
 ): AgentWorkerHandle {
   const output: string[] = []
   let lastError: Error | null = null
   let settled = false
-  let waiting: { request: AgentInputRequest; originalInput: Record<string, unknown> } | null = null
+  let finishing: Promise<void> | null = null
+  let closeError: Error | null = null
+  const waiting: Array<{ request: AgentInputRequest; originalInput: Record<string, unknown> }> = []
   let resolveDone!: (value: AgentWorkerResult) => void
   let rejectDone!: (error: Error) => void
   const startedAt = Date.now()
@@ -98,7 +123,12 @@ export function collectAgentTurn(
   const rememberSession = (sessionId: string | null | undefined): Error | null => {
     if (!sessionId) return null
     try {
-      remember(proc.provider, sessionId)
+      // Resuming an existing conversation does not make it a newly delegated one.
+      // Preserve its original visibility in the main rs/fk history.
+      if (!expectedSessionId || sessionId !== expectedSessionId) remember(proc.provider, sessionId)
+      if (expectedSessionId && sessionId !== expectedSessionId) {
+        throw new Error(`native resume returned session ${sessionId}, expected ${expectedSessionId}; refusing to treat it as a resumed conversation`)
+      }
       callbacks.onSession?.(sessionId)
       return null
     } catch (error) {
@@ -113,50 +143,60 @@ export function collectAgentTurn(
     proc.off('can_use_tool', onPermission)
     proc.off('hook_callback', onHook)
     proc.off('init', onInit)
-    proc.off('error', onError)
+    // Node throws on an unhandled 'error' event: keep the sink attached while
+    // the process may still emit after a failed kill.
+    if (!proc.isAlive()) proc.off('error', onError)
     proc.off('turn_retry', onRetry)
+    proc.off('codex_account_changed', onAccount)
     proc.off('result', onResult)
     proc.off('exit', onExit)
   }
-  const finish = async (error?: Error, result?: { checkpoint?: any }): Promise<void> => {
-    if (settled) return
+  const finish = (error?: Error, result?: { checkpoint?: any }): Promise<void> => {
+    if (finishing) return finishing
     settled = true
-    cleanupListeners()
-    const registryError = rememberSession(proc.sessionId)
-    let closeError: Error | null = null
-    try { await proc.kill(3000) }
-    catch (cause) { closeError = cause instanceof Error ? cause : new Error(String(cause)) }
-    const failure = error ?? registryError ?? closeError
-    const text = output.join('').trim()
-    if (failure) {
-      rejectDone(new AgentWorkerFailure(failure, text, proc.sessionId))
-      return
-    }
-    const sessionId = proc.sessionId
-    if (!sessionId) {
-      rejectDone(new AgentWorkerFailure(
-        new Error('delegated agent completed without a native session id'), text, null,
-      ))
-      return
-    }
-    const checkpointId = checkpointIdFrom(result?.checkpoint, proc)
-    resolveDone({
-      output: text,
-      // D-14:截断退场。上游把输出体量保护交给卡片连续输出(本仓 03-04/03-05 已
-      // 落地换卡与指纹去重),runner 不再按固定上限截断;字段保留但恒为 false,
-      // 避免卡片层与既有调用方连锁改动。
-      outputTruncated: false,
-      sessionId,
-      ...(checkpointId ? { checkpointId } : {}),
-      durationMs: Date.now() - startedAt,
-      usage: proc.lastUsage ? { ...proc.lastUsage } : null,
+    waiting.length = 0
+    finishing = Promise.resolve().then(async () => {
+      const registryError = rememberSession(proc.sessionId)
+      try { await proc.kill(3000) }
+      catch (cause) { closeError = cause instanceof Error ? cause : new Error(String(cause)) }
+      cleanupListeners()
+      const failures = [error, registryError, closeError].filter((value): value is Error => !!value)
+      const failure = failures.length > 1
+        ? new AggregateError(failures, failures.map(value => value.message).join('; '))
+        : failures[0]
+      if (failure) {
+        rejectDone(new AgentWorkerFailure(failure, output.join('').trim(), proc.sessionId))
+        return
+      }
+      const sessionId = proc.sessionId
+      if (!sessionId) {
+        rejectDone(new AgentWorkerFailure(
+          new Error('delegated agent completed without a native session id'), output.join('').trim(), null,
+        ))
+        return
+      }
+      const text = output.join('').trim()
+      const checkpointId = checkpointIdFrom(result?.checkpoint, proc)
+      resolveDone({
+        output: text,
+        // D-14:截断退场。上游把输出体量保护交给卡片连续输出(本仓 03-04/03-05 已
+        // 落地换卡与指纹去重),runner 不再按固定上限截断;字段保留但恒为 false,
+        // 避免卡片层与既有调用方连锁改动。
+        outputTruncated: false,
+        sessionId,
+        ...(checkpointId ? { checkpointId } : {}),
+        durationMs: Date.now() - startedAt,
+        usage: proc.lastUsage ? { ...proc.lastUsage } : null,
+      })
     })
+    return finishing
   }
   const onText = (event: { text?: string; parentToolUseId?: string | null }) => {
     if (settled || event?.parentToolUseId || typeof event?.text !== 'string') return
     output.push(event.text)
   }
   const emitProgress = (step: AgentStep) => {
+    if (settled) return
     try { callbacks.onProgress?.(step) }
     catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
   }
@@ -175,26 +215,32 @@ export function collectAgentTurn(
     tool_use_id?: string
     input?: Record<string, unknown>
   }) => {
+    if (settled) return
+    // request_user_input(Codex 工具名)与 AskUserQuestion(Claude)同为需要
+    // 人工/父 Agent 作答的工具;其余工具一律放行。
     if (!INPUT_TOOLS.has(String(request.tool_name ?? ''))) {
       try { proc.sendPermissionResponse(request.request_id, 'allow', { updatedInput: request.input ?? {} }) }
       catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
       return
     }
-    if (waiting) {
-      void finish(new Error('delegated agent emitted multiple simultaneous input requests'))
-      return
-    }
     let normalized: AgentInputRequest
-    try { normalized = normalizeInputRequest(request) }
+    try {
+      normalized = normalizeInputRequest(request)
+      if (!allowUserInput) {
+        throw new Error(`${PROJECT_AGENT_INPUT_ERROR}: ${normalized.questions.map(question => question.question).join('; ')}`)
+      }
+    }
     catch (error) {
       void finish(error instanceof Error ? error : new Error(String(error)))
       return
     }
-    waiting = { request: normalized, originalInput: request.input ?? {} }
-    try { callbacks.onNeedsInput?.(normalized) }
+    if (waiting.some(pending => pending.request.requestId === normalized.requestId)) return
+    waiting.push({ request: normalized, originalInput: request.input ?? {} })
+    try { if (waiting.length === 1) callbacks.onNeedsInput?.(normalized) }
     catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
   }
   const onHook = (request: { request_id: string | number }) => {
+    if (settled) return
     try { proc.sendHookResponse(String(request.request_id), {}) }
     catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
   }
@@ -203,11 +249,22 @@ export function collectAgentTurn(
     if (error) void finish(error)
   }
   const onError = (error: unknown) => { lastError = error instanceof Error ? error : new Error(String(error)) }
+  const onAccount = (event: { accountId: string; diagnostics: string[] }) => {
+    if (settled) return
+    try { callbacks.onCodexAccount?.(event.accountId) }
+    catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
+    if (event.diagnostics.length) log(`agent-runner: selected Codex account=${event.accountId}; diagnostics: ${event.diagnostics.join('；')}`)
+  }
   const onRetry = (retry: AgentTurnRetry) => {
-    // 进程层满载退避只报进度(D-14 后无看门狗可布防);文案随事件携带的
-    // delayMs/attempt(上游 2e6e1e0)。
+    // 进程层重试只报进度(D-14 后无看门狗可布防);文案按事件携带的
+    // reason 区分(quota/stream_disconnected/compact_connection_failed/
+    // transient_error),delayMs/attempt 随事件。
+    const tool = retry.reason === 'quota' ? 'Codex 额度换号'
+      : retry.reason === 'stream_disconnected' ? 'Codex 连接中断重试'
+      : retry.reason === 'compact_connection_failed' ? 'Codex 压缩连接中断重试'
+      : retry.reason === 'transient_error' ? 'Codex 临时故障重试' : 'Codex 容量重试'
     emitProgress({
-      at: new Date().toISOString(), phase: 'info', tool: 'Codex 容量重试',
+      at: new Date().toISOString(), phase: 'info', tool,
       detail: retry.phase === 'waiting'
         ? `${retry.message} · ${retry.delayMs / 1000}s 后重试 #${retry.attempt}`
         : `正在重试 #${retry.attempt}`,
@@ -234,6 +291,7 @@ export function collectAgentTurn(
   proc.on('init', onInit)
   proc.on('error', onError)
   proc.on('turn_retry', onRetry)
+  proc.on('codex_account_changed', onAccount)
   proc.on('result', onResult)
   proc.on('exit', onExit)
   try {
@@ -246,19 +304,27 @@ export function collectAgentTurn(
   return {
     done,
     isAlive: () => proc.isAlive(),
-    pendingInput: () => waiting?.request ?? null,
+    pendingInput: () => waiting[0]?.request ?? null,
     answer(requestId: string, answers: Record<string, string>): void {
-      if (!waiting) throw new Error('delegated agent is not waiting for input')
-      if (waiting.request.requestId !== requestId) {
-        throw new Error(`delegated agent input request mismatch: expected ${waiting.request.requestId}`)
+      const pending = waiting[0]
+      if (!pending) throw new Error('delegated agent is not waiting for input')
+      if (pending.request.requestId !== requestId) {
+        throw new Error(`delegated agent input request mismatch: expected ${pending.request.requestId}`)
       }
-      const pending = waiting
       proc.sendPermissionResponse(requestId, 'allow', { updatedInput: { ...pending.originalInput, answers } })
-      waiting = null
+      waiting.shift()
+      if (waiting[0]) callbacks.onNeedsInput?.(waiting[0].request)
     },
     async cancel(reason = 'delegated agent cancelled'): Promise<void> {
+      const wasSettled = settled
       await finish(new Error(reason))
       await done.catch(() => {})
+      if (wasSettled) {
+        if (proc.isAlive()) await proc.kill(3000)
+        closeError = null
+        cleanupListeners()
+      }
+      if (closeError) throw closeError
     },
   }
 }

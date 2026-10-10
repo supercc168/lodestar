@@ -67,7 +67,7 @@ export function spawnAgyPrint(prompt: string, cwd: string): { proc: AgyProcess; 
       ...(process.env as Record<string, string>),
       PATH: buildAgySpawnPath(),
     },
-  }) as AgyProcess
+  }) as unknown as AgyProcess
   return { proc, bin, args }
 }
 

@@ -1,11 +1,12 @@
 {
   "name": "@supercc168/lodestar",
-  "version": "0.17.3",
+  "version": "0.20.5",
   "publishConfig": {
     "access": "public"
   },
-  "description": "Lodestar (夜航星) — IM-native frontend for Codex via Feishu Card Kit streaming",
+  "description": "Lodestar (夜航星) — IM-native frontend for Codex, Claude Agent SDK and DeepSeek Harness via Feishu Card Kit",
   "type": "module",
+  "packageManager": "bun@1.3.11",
   "license": "MIT",
   "author": "leviyuan",
   "homepage": "https://github.com/supercc168/lodestar#readme",
@@ -29,14 +30,19 @@
   ],
   "scripts": {
     "start": "bun daemon.ts",
-    "build:daemon": "bun build cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar.js",
+    "test": "bun test",
+    "test:randomized": "bun test --randomize --seed=17",
+    "typecheck": "tsc -p tsconfig.json",
+    "ci": "bun run audit:production && bun run typecheck && bun run test && bun run test:randomized && bun run build",
+    "audit:production": "bun audit --production",
+    "build:daemon": "bun build cli.ts --target=node --packages=external --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar.js",
     "build:setup": "bun build src/setup-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-setup.js",
     "build:stop": "bun build src/stop-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-stop.js",
     "build:update": "bun build src/update-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-update.js",
     "build:version": "bun build src/version-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-version.js",
     "build:agent": "bun build src/agent-cli.ts --target=node --minify --banner='#!/usr/bin/env node' --outfile=dist/lodestar-agent.js",
     "build": "bun run build:daemon && bun run build:setup && bun run build:stop && bun run build:update && bun run build:version && bun run build:agent && bun run build:dsh",
-    "prepublishOnly": "bun run build",
+    "prepublishOnly": "bun run ci",
     "postinstall": "node scripts/postinstall.cjs",
     "build:dsh": "bun build src/dsh-bridge.ts --target=node --packages=external --outfile=dist/dsh-bridge.js"
   },
@@ -52,12 +58,15 @@
     "dist/",
     "skills/imagegen/",
     "skills/imageread/",
+    "docs/",
     "scripts/postinstall.cjs",
+    "src/data-dir.cjs",
+    "src/managed-skill-cleanup.cjs",
     "README.md",
     "LICENSE"
   ],
   "engines": {
-    "node": ">=18"
+    "node": ">=18.15"
   },
   "dependencies": {
     "@anthropic-ai/claude-agent-sdk": "0.3.222",
@@ -68,11 +77,25 @@
     "@deepseek-ai/dsh-llm": "0.1.5-alpha.2",
     "@deepseek-ai/dsh-scope": "0.1.5-alpha.2",
     "@deepseek-ai/dsh-session": "0.1.5-alpha.2",
-    "@larksuiteoapi/node-sdk": "^1.64.0",
-    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@hono/node-server": "1.19.15",
+    "@larksuiteoapi/node-sdk": "^1.73.0",
+    "@modelcontextprotocol/sdk": "1.32.1",
     "@resvg/resvg-js": "^2.6.2",
+    "@xmldom/xmldom": "0.9.12",
+    "axios": "1.20.0",
     "cross-spawn": "^7.0.6",
+    "fast-uri": "3.1.8",
+    "fflate": "0.8.3",
+    "hono": "4.13.12",
+    "http-proxy-agent": "^7.0.2",
+    "https-proxy-agent": "^7.0.6",
+    "ip-address": "10.7.2",
     "mathjax-full": "^3.2.2",
+    "node-fetch": "^3.3.2",
+    "protobufjs": "7.6.5",
+    "proxy-addr": "2.0.8",
+    "qs": "6.16.0",
+    "ws": "8.21.3",
     "zod": "^4.4.3"
   },
   "bundleDependencies": [
@@ -86,15 +109,56 @@
     "@anthropic-ai/claude-agent-sdk-linux-x64": "0.3.222",
     "@anthropic-ai/claude-agent-sdk-linux-x64-musl": "0.3.222",
     "@anthropic-ai/claude-agent-sdk-win32-arm64": "0.3.222",
-    "@anthropic-ai/claude-agent-sdk-win32-x64": "0.3.222"
+    "@anthropic-ai/claude-agent-sdk-win32-x64": "0.3.222",
+    "undici": "^6.28.1"
+  },
+  "overrides": {
+    "@hono/node-server": "1.19.15",
+    "@modelcontextprotocol/sdk": "1.32.1",
+    "@xmldom/xmldom": "0.9.12",
+    "axios": "1.20.0",
+    "fast-uri": "3.1.8",
+    "fflate": "0.8.3",
+    "hono": "4.13.12",
+    "ip-address": "10.7.2",
+    "protobufjs": "7.6.5",
+    "proxy-addr": "2.0.8",
+    "qs": "6.16.0",
+    "ws": "8.21.3",
+    "@deepseek-ai/dsh-win32-process": "0.1.5-rc.2",
+    "@deepseek-ai/dsh-base": {
+      "@deepseek-ai/dsh-win32-process": "$@deepseek-ai/dsh-win32-process"
+    },
+    "@deepseek-ai/dsh-sdk-minimal": {
+      "@deepseek-ai/dsh-win32-process": "$@deepseek-ai/dsh-win32-process"
+    },
+    "@deepseek-ai/dsh-subprocess-local": {
+      "@deepseek-ai/dsh-win32-process": "$@deepseek-ai/dsh-win32-process"
+    },
+    "@deepseek-ai/dsh-sandbox-windows-acl": {
+      "@deepseek-ai/dsh-win32-process": "$@deepseek-ai/dsh-win32-process"
+    }
   },
   "devDependencies": {
-    "@types/bun": "latest",
+    "@anthropic-ai/claude-code": "latest",
+    "@openai/codex": "latest",
+    "@types/bun": "1.3.14",
     "@types/cross-spawn": "6.0.6",
-    "typescript": "^5.5.0"
+    "@types/node": "18",
+    "typescript": "5.9.3"
   },
   "trustedDependencies": [
+    "@anthropic-ai/claude-code",
     "@deepseek-ai/dsh-subprocess-local",
-    "koffi"
-  ]
+    "@google/genai",
+    "koffi",
+    "node-pty",
+    "protobufjs"
+  ],
+  "agentRuntimeOverrides": {
+    "dsh": {
+      "@modelcontextprotocol/client": "2.3.1",
+      "@modelcontextprotocol/core": "2.3.1"
+    }
+  }
 }

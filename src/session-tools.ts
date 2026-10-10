@@ -12,7 +12,10 @@ import { isAbsolute } from 'node:path'
 import { normalizeOutboundPath } from './outbound-markers'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
+import * as feishu from './feishu'
+import { log } from './log'
 import { announceAsk, askRenderState } from './session-ask'
+import { formatFeishuError } from './feishu-errors'
 
 /** 过程元素(tool/assistant/plan/goal/context_compact)的插入锚点:实时任务总览区
  * 建立后,新元素 insert_before 它(让实时区永远压在 footer 正前,过程记录堆在它
@@ -115,7 +118,9 @@ export function addTool(s: Session, source: AgentProcess, toolUseId: string, nam
         type: 'insert_before', targetElementId: cards.ELEMENTS.footer,
       })
     } else {
-      void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.taskBoardLive, cards.taskBoardLiveElement(s.taskBoard))
+      // The timeline retains the task result; this existing overview is only a mirror.
+      void cardkit.replaceElementChecked(turn.cardId, cards.ELEMENTS.taskBoardLive,
+        cards.taskBoardLiveElement(s.taskBoard), { notifyCardFailure: false })
     }
     // 连续同类合并:TaskCreate→创建面板,TaskUpdate/List/Get→进度快照面板。
     // 切到另一类则前一类面板定稿(不再更新);board 始终累积。timeline 效果:
@@ -154,7 +159,7 @@ export function addTool(s: Session, source: AgentProcess, toolUseId: string, nam
       : cards.editBatchElement(i, items)
     void cardkit.addElement(s.currentTurn.cardId, el, {
       type: 'insert_before', targetElementId: taskLiveAnchor(s.currentTurn),
-    })
+    }, undefined, 'capacity')
     toolSummaryToPreview(s.currentTurn, name, input)
     return
   }
@@ -187,11 +192,13 @@ export function addTool(s: Session, source: AgentProcess, toolUseId: string, nam
     return
   }
   const el = cards.toolCallElement(i, name, input, null, '⏳')
+  // A running placeholder is optional. Keep failed-add bookkeeping so the
+  // actual tool result can recreate it and report any delivery failure.
   void cardkit.addElement(s.currentTurn.cardId, el, {
     type: 'insert_before',
     targetElementId: taskLiveAnchor(s.currentTurn),
-  })
-  // Chat-list preview: 工具运行阶段正文不出字,预览会冻结在旧文字 ——
+  }, undefined, 'capacity')
+  // Chat-list preview: 工具运行阶段正文不出字,预览会冻结在旧文字尾部 ——
   // 同步当前工具面板同款标题(🔧 工具名: 摘要),列表里能看到 agent 在干嘛。
   toolSummaryToPreview(s.currentTurn, name, input)
 }
@@ -208,11 +215,14 @@ export function toolSummaryToPreview(turn: TurnState | null, name: string, input
   cardkit.patchSummaryThrottled(turn.cardId, line)
 }
 
-export function completeTool(s: Session, source: AgentProcess, toolUseId: string, content: any, isError: boolean): void {
+export function completeTool(s: Session, source: AgentProcess, toolUseId: string, content: any, isError: boolean, finalInput?: any): void {
   s.observeWatchdogToolResult(source, toolUseId, content, isError)
   if (!s.currentTurn) return
   const meta = s.currentTurn.toolByUseId.get(toolUseId)
   if (!meta) return
+  if (finalInput && typeof finalInput === 'object') {
+    meta.input = { ...meta.input, ...Object.fromEntries(Object.entries(finalInput).filter(([, value]) => value !== undefined)) }
+  }
   const output = typeof content === 'string'
     ? content
     : Array.isArray(content)
@@ -227,7 +237,11 @@ export function completeTool(s: Session, source: AgentProcess, toolUseId: string
   // 最稠密的内容事件,借它把重试推进一格,别干等模型吐新正文。
   if (s.currentTurn.cardRotationFailed) s.maybeMidTurnRotate()
   const autoSendPath = autoSendPathFromToolResult(meta.name, output, isError)
-  if (autoSendPath) s.sendOutboundPath(autoSendPath, meta.name)
+  if (autoSendPath) {
+    deliverGeneratedImage(s, s.currentTurn, meta, autoSendPath)
+    startThinkingIfNoToolsRunning(s)
+    return
+  }
   // AskUserQuestion already had its final panel painted by resolveAsk
   // (✅ + the chosen option marked, others dimmed). The tool_result
   // arriving here is just the SDK's synthesised echo — re-rendering
@@ -264,6 +278,85 @@ export function completeTool(s: Session, source: AgentProcess, toolUseId: string
   startThinkingIfNoToolsRunning(s)
 }
 
+/** Keep generated artwork and its prompt on the card that owns this tool. */
+function deliverGeneratedImage(s: Session, turn: TurnState, meta: TurnState['toolByUseId'] extends Map<string, infer M> ? M : never, path: string): void {
+  if (turn.outboundSeenPaths.has(path)) return
+  turn.outboundSeenPaths.add(path)
+  const cardId = turn.cardId
+  const elementId = cards.ELEMENTS.tool(meta.i)
+  const byCard = turn.imageDeliveryInflight ??= new Map()
+  const tasks = byCard.get(cardId) ?? new Set<Promise<void>>()
+  byCard.set(cardId, tasks)
+  const failures: string[] = []
+  const task = (async () => {
+    let imageKey: string | null = null
+    try {
+      imageKey = await feishu.uploadImageKey(path, error => { failures.push(`图片上传：${formatFeishuError(error)}`) })
+    }
+    catch (error) {
+      failures.push(`图片上传：${formatFeishuError(error)}`)
+      log(`generated image upload failed: ${error}`)
+    }
+    if (imageKey) {
+      let landed = false
+      try {
+        landed = await cardkit.replaceElementChecked(cardId, elementId,
+          cards.toolCallElement(meta.i, meta.name, meta.input, meta.output ?? null, '✅', meta.resolvedNote, imageKey),
+          { notifyCardFailure: false, onFailure: failure => { failures.push(`图片嵌入：${formatFeishuError(failure)}`) } })
+      } catch (error) {
+        failures.push(`图片嵌入：${formatFeishuError(error)}`)
+        log(`generated image embed failed: ${error}`)
+      }
+      if (landed) {
+        meta.imageKey = imageKey
+        turn.outboundSentPaths.add(path)
+        return
+      }
+      log(`generated image could not be embedded in card ${cardId}; sending it as a separate message`)
+    }
+    // The user explicitly prefers a separate image when embedding is unavailable.
+    let sendFailure: unknown
+    const sent = imageKey
+      ? await feishu.sendImage(s.chatId, imageKey, error => { sendFailure = error }) !== null
+      : await feishu.uploadAndSend(s.chatId, path)
+    if (sent) turn.outboundSentPaths.add(path)
+    else log(`generated image delivery failed: ${path}`)
+    if (!sent && imageKey) failures.push(`图片发送：${formatFeishuError(sendFailure)}`)
+    meta.resolvedNote = [sent ? '图片已单独发送。' : '图片发送失败。', ...failures].join('\n')
+    let noteFailure: unknown
+    let noteLanded = false
+    try {
+      noteLanded = await cardkit.replaceElementChecked(cardId, elementId,
+        cards.toolCallElement(meta.i, meta.name, meta.input, meta.output ?? null, sent ? '✅' : '❌', meta.resolvedNote),
+        { notifyCardFailure: false, onFailure: failure => { noteFailure = failure } })
+    } catch (error) {
+      noteFailure = error
+    }
+    if (!noteLanded) {
+      log(`generated image status write failed card=${cardId} path=${path}: ${formatFeishuError(noteFailure)}\n${meta.resolvedNote}`)
+    }
+    // Delivery failures remain visible even when the auxiliary status cannot
+    // be updated; uploadAndSend already reports its own failure to the chat.
+    if (!sent && imageKey) {
+      await feishu.sendText(s.chatId, `❌ 生成图片发送失败：${failures.join('\n')}`)
+    }
+  })().catch(async error => {
+    log(`generated image delivery failed: ${error}`)
+    await feishu.sendText(s.chatId, `❌ 生成图片发送失败：${[...new Set([...failures, formatFeishuError(error)])].join('\n')}`)
+  })
+  tasks.add(task)
+  void task.finally(() => {
+    tasks.delete(task)
+    if (!tasks.size) byCard.delete(cardId)
+  }).catch(error => log(`generated image failure notice failed: ${error}`))
+}
+
+export async function waitForImageDeliveries(turn: TurnState, cardId?: string): Promise<void> {
+  const tasks = cardId ? [...(turn.imageDeliveryInflight?.get(cardId) ?? [])]
+    : [...(turn.imageDeliveryInflight?.values() ?? [])].flatMap(tasks => [...tasks])
+  await Promise.allSettled(tasks)
+}
+
 /** Task 工具完成:用单次调用的 input/output 累积进 session board,再渲染整个
  * board(而非孤立的当次结果)。TaskCreate 抓 output 里的 id、TaskUpdate 按 id
  * 改 status、TaskList 全量替换、TaskGet 补全。出错时 ❌ 但不动 board(避免
@@ -278,14 +371,15 @@ function completeTaskTool(s: Session, meta: { i: number; name: string }, taskNam
   // 实时任务总览区同步刷新:applyTaskTool 已把 board 更新到最新,这里 replace
   // 让总览跟上(isError 不动 board,总览维持上次有效态,不显示坏结果)。
   if (s.currentTurn.taskLiveInserted) {
-    void cardkit.replaceElement(s.currentTurn.cardId, cards.ELEMENTS.taskBoardLive, cards.taskBoardLiveElement(s.taskBoard))
+    void cardkit.replaceElementChecked(s.currentTurn.cardId, cards.ELEMENTS.taskBoardLive,
+      cards.taskBoardLiveElement(s.taskBoard), { notifyCardFailure: false })
   }
   startThinkingIfNoToolsRunning(s)
 }
 
-function startThinkingIfNoToolsRunning(s: Session): void {
+export function startThinkingIfNoToolsRunning(s: Session): void {
   const turn = s.currentTurn
-  if (!turn) return
+  if (!turn || s.hasPendingAgentTool()) return
   for (const tool of turn.toolByUseId.values()) {
     if (tool.output == null) return
   }
@@ -317,6 +411,11 @@ export function rebuildToolsOnRotate(
   // 已先于本函数完成 —— 这里搬过来的 tool insert_before taskLiveAnchor(turn)
   // 时 live 区已在新卡就位。board 是 session 级累积快照,这里直接用。
   for (const [useId, meta] of oldToolByUseId) {
+    // Rotation performs an immediate pass for running tools, then a second
+    // pass after the old-card queue settles. Entries already rebuilt in the
+    // first pass must be idempotent; the second pass only picks up completed
+    // tools whose old add was rejected late.
+    if (turn.toolByUseId.has(useId)) continue
     const batchSlot = meta.batchSlot ?? null
     let input = meta.input
     let output: string | null
@@ -371,7 +470,7 @@ export function rebuildToolsOnRotate(
     const ni = turn.toolCount++
     turn.toolByUseId.set(useId, { ...meta, i: ni })
     const status: '⏳' | '✅' | '❌' = !done ? '⏳' : (isError ? '❌' : '✅')
-    void cardkit.addElement(newCardId, cards.toolCallElement(ni, meta.name, meta.input, output, status, meta.resolvedNote), {
+    void cardkit.addElement(newCardId, cards.toolCallElement(ni, meta.name, meta.input, output, status, meta.resolvedNote, meta.imageKey), {
       type: 'insert_before', targetElementId: taskLiveAnchor(turn),
     })
   }

@@ -1,14 +1,15 @@
 import { createHash, randomBytes, randomUUID } from 'node:crypto'
-import { existsSync, readdirSync, readFileSync } from 'node:fs'
-import { join } from 'node:path'
-import * as cardkit from './cardkit'
-import * as cards from './cards'
+import { existsSync, readdirSync, readFileSync, realpathSync, statSync } from 'node:fs'
+import { isAbsolute, join, relative, resolve, sep } from 'node:path'
+import { AgentCards, type AgentCardsDeps } from './agent-cards'
+import { agentCardsDeps } from './agent-cards-runtime'
+import { agentOwnerKey, agentRunOwner, requireAgentDescription, requireAgentWorkDir, PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
 import * as feishu from './feishu'
 import { config } from './config'
 import { getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
 import { AgentWorkerFailure, startAgentWorker, type AgentWorkerHandle } from './agent-runner'
 import { agentApiUrl } from './agent-runtime'
-import { DELEGATED_AGENT_INSTRUCTIONS } from './agent-skill'
+import { workspaceKey } from './workspace'
 import type {
   AgentAnswerRequest,
   AgentFollowUpRequest,
@@ -18,159 +19,189 @@ import type {
   AgentStep,
   AgentWorkerResult,
 } from './agent-run-types'
-import { AGENT_RUNS_DIR } from './paths'
+import { AGENT_RUNS_DIR, MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { writeJsonStateAtomic, writeStateFileAtomic } from './state-store'
 import { log } from './log'
 import type { Session } from './session'
+import { agentPrincipalContext, type AgentExecutionContext, type AgentPrincipal } from './agent-context'
 import type { AgentReasoningEffort } from './agent-process'
-import { delegatedAgentDeveloperInstructions, worktreeProjectName } from './session-worktree'
 
-const GLOBAL_AGENT_CONCURRENCY = 8
-const MAX_DELEGATION_DEPTH = 8
-const MAX_RETAINED_RUNS = 512
+export type { AgentPrincipal } from './agent-context'
+
+const MAX_CACHED_RUN_ARTIFACTS = 512
 const MAX_WORKER_STEPS = 50
-const MAX_SESSION_ACTIVE_RUNS = 64
-const MAX_SUBTREE_ACTIVE_RUNS = 32
-const MAX_GLOBAL_INFLIGHT_WORKERS = 128
-/** 单层委派(D-11 口径 3):被委派的 Agent 不得再委派 —— worker principal 的
- *  startRun/followUp 首行即拒。深度/子树闸门保留为源码级兜底(策略先拒后
- *  执行不可达),三层齐备的另两层见 agent-launch(claude disallowedTools /
- *  codex --disable multi_agent)与 agent-skill(指令层)。 */
+/** 单层委派(D-11 口径 3):被委派的 Agent 不得再委派 —— 会话归属的 worker
+ *  principal 的 startRun/followUp 首行即拒(拒绝先于任何副作用);项目归属沿用
+ *  上游多层级语义,不设闸。三层齐备的另两层见 agent-launch(claude disallowedTools /
+ *  codex --disable multi_agent / dsh tools.restrict)与 agent-skill(指令层)。 */
 const NESTED_DELEGATION_ERROR = 'Delegated Agents cannot delegate again; ask the main Agent to assign additional work.'
-
-export type AgentPrincipal =
-  | { kind: 'session'; session: Session; depth: -1 }
-  | { kind: 'worker'; session: Session; runId: string; identityId: string; depth: number }
 
 interface AgentRunRecord {
   snapshot: AgentRunSnapshot
-  session: Session | null
-  cardId: string | null
+  context: AgentExecutionContext | null
   handles: Map<string, AgentWorkerHandle>
   capabilityByIdentity: Map<string, string>
   progressTimers: Map<string, ReturnType<typeof setTimeout>>
   children: Set<string>
+  pendingChildCreations: number
   cancelled: boolean
+  cancellationEpoch: number
   finalizing: boolean
   finalized: boolean
   persistedArtifacts: Set<string>
+  artifactsUnloaded: boolean
 }
+
+type RequestMetadata = { requestId?: string; requestHash?: string }
 
 interface CreateRunOptions {
   parentRunId?: string
   parentKind?: 'delegate' | 'follow_up'
   depth: number
   cancellationEpoch: number
-  resumeByIdentity?: Map<string, string>
+  resumeSessionId?: string
+  resumedFromRunId?: string
+  requestId?: string
+  requestHash?: string
 }
 
-export interface AgentServiceDeps {
+export interface AgentServiceDeps extends AgentCardsDeps {
   getCatalog: typeof getAgentIdentityCatalog
   startWorker: typeof startAgentWorker
-  sendCard(chatId: string, card: object): Promise<string | null>
   sendTextRaw(chatId: string, text: string): Promise<unknown>
-  convertMessageToCard(messageId: string): Promise<string>
-  recordCardCreated(cardId: string, elementCount: number, onFailure?: (code?: number) => void): void
-  replaceElementChecked(cardId: string, elementId: string, element: object): Promise<boolean>
-  patchSummaryThrottled(cardId: string, summary: string): void
-  flush(cardId: string): Promise<void>
-  cancelSummary(cardId: string): void
-  patchSettingsChecked(cardId: string, settings: object): Promise<boolean>
-  dispose(cardId: string): Promise<void>
   writeArtifact(path: string, value: unknown): void
   writeTextArtifact(path: string, value: string): void
+  readTextArtifact(name: string, label: string): string
   loadArtifacts(): AgentRunSnapshot[]
 }
 
 const DEFAULT_DEPS: AgentServiceDeps = {
+  ...agentCardsDeps,
   getCatalog: getAgentIdentityCatalog,
   startWorker: startAgentWorker,
-  sendCard: feishu.sendCard,
   sendTextRaw: feishu.sendTextRaw,
-  convertMessageToCard: cardkit.convertMessageToCard,
-  recordCardCreated: cardkit.recordCardCreated,
-  replaceElementChecked: cardkit.replaceElementChecked,
-  patchSummaryThrottled: cardkit.patchSummaryThrottled,
-  flush: cardkit.flush,
-  cancelSummary: cardkit.cancelSummary,
-  patchSettingsChecked: cardkit.patchSettingsChecked,
-  dispose: cardkit.dispose,
   writeArtifact: writeJsonStateAtomic,
   writeTextArtifact: writeStateFileAtomic,
+  readTextArtifact,
   loadArtifacts: loadAgentRunArtifacts,
 }
 
 export class AgentService {
+  readonly presentation: AgentCards
   private readonly runs = new Map<string, AgentRunRecord>()
   private readonly capabilities = new Map<string, AgentPrincipal>()
-  private activeTurns = 0
-  private readonly slotWaiters: Array<() => void> = []
   private readonly cancellationEpochBySession = new Map<string, number>()
-  private startingWorkers = 0
-  private readonly startingRunsBySession = new Map<string, number>()
-  private readonly startingRunsBySubtree = new Map<string, number>()
+  private readonly startingNativeSessions = new Set<string>()
+  private readonly pendingRunCreations = new Set<Promise<AgentRunSnapshot>>()
+  private readonly requests = new Map<string, { hash: string; promise: Promise<AgentRunSnapshot> }>()
+  private shuttingDown = false
 
   constructor(private readonly deps: AgentServiceDeps = DEFAULT_DEPS) {
+    this.presentation = new AgentCards(deps)
     this.loadDurableRuns()
   }
 
-  rootPrincipal(session: Session): AgentPrincipal {
+  rootPrincipal(session: Session): Extract<AgentPrincipal, { kind: 'session' }> {
     return { kind: 'session', session, depth: -1 }
+  }
+
+  projectPrincipal(context: AgentExecutionContext): AgentPrincipal {
+    if (context.owner.kind !== 'project') throw new Error('project principal requires project ownership')
+    return { kind: 'project', context, depth: -1 }
   }
 
   principalForCapability(capability: string): AgentPrincipal | null {
     return this.capabilities.get(capability) ?? null
   }
 
-  async startRun(principal: AgentPrincipal, request: AgentRunRequest): Promise<AgentRunSnapshot> {
-    // 派生字段先取好,再做策略拒绝:拒绝必须发生在任何副作用(占容量/建 run/落盘)之前。
-    const depth = principal.kind === 'session' ? 0 : principal.depth + 1
-    const delegation = principal.kind === 'worker'
-      ? { parentRunId: principal.runId, parentKind: 'delegate' as const }
-      : {}
-    if (principal.kind === 'worker') throw new Error(NESTED_DELEGATION_ERROR)
-    if (depth > MAX_DELEGATION_DEPTH) {
-      throw new Error(`delegation depth ${depth} exceeds ${MAX_DELEGATION_DEPTH}`)
-    }
-    const release = this.reserveCapacity(principal, request.identityIds.length)
-    try {
-      return await this.createRun(principal.session, request, {
-        depth,
-        cancellationEpoch: this.currentCancellationEpoch(principal.session),
-        ...delegation,
-      })
-    } finally {
-      release()
-    }
+  startRun(principal: AgentPrincipal, request: AgentRunRequest): Promise<AgentRunSnapshot> {
+    return this.withRequestId(principal, request, 'run', metadata => this.startRunOnce(principal, request, metadata))
   }
 
-  async followUp(
+  private async startRunOnce(principal: AgentPrincipal, request: AgentRunRequest, metadata: RequestMetadata): Promise<AgentRunSnapshot> {
+    // D-11 口径 1:策略层先拒 —— 拒绝必须发生在任何副作用(建 run/落盘/开卡/起进程)之前。
+    if (principal.kind === 'worker' && principal.context.owner.kind === 'session') throw new Error(NESTED_DELEGATION_ERROR)
+    this.assertAcceptingRuns()
+    requireAgentDescription(request.description)
+    if (request.sessionId !== undefined) {
+      if (!request.sessionId.trim()) throw new Error('agent session_id must be a non-empty string')
+      if (request.identityIds.length > 1) throw new Error('agent session continuation accepts at most one identity_id')
+      const history = this.findSessionHistory(principal, request.sessionId)
+      const selected = request.identityIds[0] ? this.requireIdentity(principal, request.identityIds[0]) : undefined
+      return this.resumeRun(principal, request, metadata, history, selected)
+    }
+    const context = agentPrincipalContext(principal)
+    return this.createRun(context, request, {
+      ...metadata,
+      ...this.delegationParent(principal),
+      depth: principal.depth + 1,
+      cancellationEpoch: this.currentCancellationEpoch(context),
+    })
+  }
+
+  followUp(principal: AgentPrincipal, runId: string, request: AgentFollowUpRequest): Promise<AgentRunSnapshot> {
+    return this.withRequestId(principal, request, `follow-up:${runId}`, metadata => this.followUpOnce(principal, runId, request, metadata))
+  }
+
+  private async followUpOnce(
     principal: AgentPrincipal,
     runId: string,
     request: AgentFollowUpRequest,
+    metadata: RequestMetadata,
   ): Promise<AgentRunSnapshot> {
-    // follow-up 同样是一次委派动作:worker principal 不得借它曲线再委派。
-    if (principal.kind === 'worker') throw new Error(NESTED_DELEGATION_ERROR)
-    const source = this.requireMutableDescendant(principal, runId)
-    if (!isTerminal(source.snapshot.status)) throw new Error('agent follow-up requires a terminal source run')
-    const worker = selectWorker(source.snapshot, request.identityId)
+    // follow-up 同样是一次委派动作:会话归属的 worker principal 不得借它曲线再委派。
+    if (principal.kind === 'worker' && principal.context.owner.kind === 'session') throw new Error(NESTED_DELEGATION_ERROR)
+    this.assertAcceptingRuns()
+    requireAgentDescription(request.description)
+    const source = this.runs.get(runId)
+    if (!source) throw new Error(`agent run not found: ${runId}`)
+    this.assertResumeProject(principal, source)
+    const worker = source.snapshot.workers.length === 1 ? source.snapshot.workers[0] : selectWorker(source.snapshot, request.identityId)
+    if (source.handles.get(worker.identityId)?.isAlive?.()) {
+      throw new Error('Agent process has not stopped; cannot start follow-up yet')
+    }
     if (!worker.sessionId) throw new Error(`${worker.identityName} has no resumable native session id`)
-    const effort = request.effort ?? worker.effort
-    const release = this.reserveCapacity(principal, 1)
+    this.findSessionHistory(principal, worker.sessionId)
+    const selected = request.identityId ? this.requireIdentity(principal, request.identityId) : undefined
+    return this.resumeRun(principal, {
+      ...request, identityIds: request.identityId ? [request.identityId] : [], sessionId: worker.sessionId,
+    }, metadata, { run: source, worker }, selected)
+  }
+
+  private requireIdentity(principal: AgentPrincipal, id: string): AgentIdentity {
+    const identity = this.deps.getCatalog(agentPrincipalContext(principal).codexAccountId).identities.find(item => item.id === id)
+    if (!identity) throw new Error(`agent identity not found: ${id}`)
+    if (identity.status !== 'ready') throw new Error(`${identity.displayName}: ${identity.reason ?? identity.status}`)
+    return identity
+  }
+
+  private async resumeRun(
+    principal: AgentPrincipal, request: AgentRunRequest, metadata: RequestMetadata,
+    history: { run: AgentRunRecord; worker: AgentWorkerResult }, selected?: AgentIdentity,
+  ): Promise<AgentRunSnapshot> {
+    const context = agentPrincipalContext(principal)
+    this.assertResumeProject(principal, history.run)
+    const identity = selected ?? this.requireIdentity(principal, history.worker.identityId)
+    if (identity.provider !== history.worker.provider) throw new Error('native session belongs to a different Agent backend')
+    const sameOwner = agentOwnerKey(agentRunOwner(history.run.snapshot)) === agentOwnerKey(context.owner)
+    const effort = request.effort ?? (history.worker.identityId === identity.id ? history.worker.effort : undefined)
+    const workDir = request.workDir ?? history.run.snapshot.workDir
+    const releaseSession = this.reserveNativeSession({ provider: identity.provider, sessionId: request.sessionId! })
     try {
-      return await this.createRun(principal.session, {
-        identityIds: [worker.identityId],
-        prompt: request.prompt,
-        effort,
+      return await this.createRun(context, {
+        identityIds: [identity.id], description: request.description, prompt: request.prompt, effort, workDir,
+        requesterOpenId: request.requesterOpenId ?? (sameOwner ? history.run.snapshot.requesterOpenId : undefined),
       }, {
-        parentRunId: source.snapshot.runId,
-        parentKind: 'follow_up',
-        depth: source.snapshot.depth,
-        cancellationEpoch: this.currentCancellationEpoch(principal.session),
-        resumeByIdentity: new Map([[worker.identityId, worker.sessionId]]),
+        ...metadata,
+        ...(principal.kind === 'worker' ? this.delegationParent(principal)
+          : sameOwner ? { parentRunId: history.run.snapshot.runId, parentKind: 'follow_up' as const } : {}),
+        depth: principal.depth + 1,
+        resumedFromRunId: history.run.snapshot.runId,
+        cancellationEpoch: this.currentCancellationEpoch(context),
+        resumeSessionId: request.sessionId!,
       })
     } finally {
-      release()
+      releaseSession()
     }
   }
 
@@ -179,6 +210,7 @@ export class AgentService {
     runId: string,
     request: AgentAnswerRequest,
   ): Promise<AgentRunSnapshot> {
+    if (agentPrincipalContext(principal).owner.kind === 'project') throw new Error(PROJECT_AGENT_INPUT_ERROR)
     const run = this.requireMutableDescendant(principal, runId)
     const worker = selectWorker(run.snapshot, request.identityId)
     if (worker.status !== 'needs_input' || !worker.pendingInput) {
@@ -190,17 +222,19 @@ export class AgentService {
     const handle = run.handles.get(worker.identityId)
     if (!handle) throw new Error('waiting agent process is no longer alive; start a follow-up run')
     handle.answer(request.requestId, request.answers)
-    worker.status = 'running'
-    delete worker.pendingInput
+    const nextInput = handle.pendingInput()
+    worker.status = nextInput ? 'needs_input' : 'running'
+    if (nextInput) worker.pendingInput = nextInput
+    else delete worker.pendingInput
     delete worker.queuedReason
     this.refreshNonterminalStatus(run)
     this.persist(run)
     await this.updateWorkerCard(run, worker)
-    return cloneSnapshot(run.snapshot)
+    return this.readSnapshot(run)
   }
 
   getRun(principal: AgentPrincipal, runId: string): AgentRunSnapshot {
-    return cloneSnapshot(this.requireAccessibleRun(principal, runId).snapshot)
+    return this.readSnapshot(this.requireAccessibleRun(principal, runId))
   }
 
   async cancelRun(principal: AgentPrincipal, runId: string, reason = 'agent run cancelled'): Promise<boolean> {
@@ -213,42 +247,131 @@ export class AgentService {
   async cancelSessionRuns(sessionName: string, chatId: string, reason: string): Promise<void> {
     this.bumpCancellationEpoch(sessionName, chatId)
     const roots = [...this.runs.values()].filter(run =>
-      run.snapshot.sessionName === sessionName
+      agentRunOwner(run.snapshot).kind === 'session'
+      && run.snapshot.sessionName === sessionName
       && run.snapshot.chatId === chatId
       && !run.snapshot.parentRunId
       && this.treeHasActiveRun(run))
-    await Promise.allSettled(roots.map(run => this.cancelTree(run, reason)))
+    const results = await Promise.allSettled(roots.map(run => this.cancelTree(run, reason)))
+    throwCancellationFailures(results)
+  }
+
+  async cancelProjectRunFromCard(runId: string, chatId: string, messageId: string, userId: string): Promise<boolean> {
+    const run = this.runs.get(runId)
+    if (!run || agentRunOwner(run.snapshot).kind !== 'project' || !userId || !messageId
+      || run.snapshot.chatId !== chatId || run.snapshot.cardMessageId !== messageId) {
+      throw new Error('项目任务卡片无效或不属于当前群')
+    }
+    return this.cancelRun(this.projectPrincipal({ owner: agentRunOwner(run.snapshot) }), runId, '用户通过项目任务卡取消')
+  }
+
+  private async withRequestId(
+    principal: AgentPrincipal, request: AgentRunRequest | AgentFollowUpRequest, operation: string,
+    action: (metadata: RequestMetadata) => Promise<AgentRunSnapshot>,
+  ): Promise<AgentRunSnapshot> {
+    if ((request.requestId || request.requesterOpenId) && principal.kind !== 'project') {
+      throw new Error('request_id and requester_open_id require explicit project mode')
+    }
+    if (!request.requestId) return action({})
+    const ownerKey = agentOwnerKey(agentPrincipalContext(principal).owner)
+    const key = JSON.stringify([ownerKey, request.requestId])
+    const hash = createHash('sha256').update(JSON.stringify({ operation,
+      prompt: request.prompt, description: request.description, effort: request.effort, workDir: request.workDir,
+      requesterOpenId: request.requesterOpenId, identityIds: 'identityIds' in request ? request.identityIds : undefined,
+      identityId: 'identityId' in request ? request.identityId : undefined,
+      sessionId: 'sessionId' in request ? request.sessionId : undefined,
+    })).digest('hex')
+    const previous = [...this.runs.values()].find(run => run.snapshot.requestId === request.requestId
+      && agentOwnerKey(agentRunOwner(run.snapshot)) === ownerKey)
+    if (previous) {
+      if (previous.snapshot.requestHash !== hash) throw new Error('request_id was already used with different input')
+      return this.readSnapshot(previous)
+    }
+    const pending = this.requests.get(key)
+    if (pending) {
+      if (pending.hash !== hash) throw new Error('request_id is in use with different input')
+      return pending.promise
+    }
+    const promise = Promise.resolve().then(() => action({ requestId: request.requestId, requestHash: hash }))
+    this.requests.set(key, { hash, promise })
+    try { return await promise }
+    finally { this.requests.delete(key) }
   }
 
   async shutdown(reason: string): Promise<void> {
+    // Close admission before the first await, including runs still opening a
+    // card that have not entered the durable run registry yet.
+    this.shuttingDown = true
     const sessions = new Set([...this.runs.values()].map(run => `${run.snapshot.sessionName}\u0000${run.snapshot.chatId}`))
     for (const key of sessions) {
       const [sessionName, chatId] = key.split('\u0000')
       this.bumpCancellationEpoch(sessionName, chatId)
     }
     const roots = [...this.runs.values()].filter(run => !run.snapshot.parentRunId && this.treeHasActiveRun(run))
-    await Promise.allSettled(roots.map(run => this.cancelTree(run, reason)))
+    const results = await Promise.allSettled([
+      ...roots.map(run => this.cancelTree(run, reason)),
+      ...[...this.pendingRunCreations].map(creation => creation.then(() => {})),
+    ])
     const remaining = [...this.runs.values()].flatMap(run => [...run.handles.values()])
-    await Promise.allSettled(remaining.map(handle => handle.cancel(reason)))
+    const remainingResults = results.some(result => result.status === 'rejected')
+      ? [] : await Promise.allSettled(remaining.map(handle => handle.cancel(reason)))
+    throwCancellationFailures([...results, ...remainingResults])
+    for (const chatId of new Set([...this.runs.values()].map(run => run.snapshot.chatId))) {
+      await this.presentation.closeChat(chatId)
+    }
   }
 
-  private async createRun(
-    session: Session,
+  private assertAcceptingRuns(): void {
+    if (this.shuttingDown) throw new Error('Agent service is shutting down; cannot start new runs')
+  }
+
+  private delegationParent(principal: AgentPrincipal): Pick<CreateRunOptions, 'parentRunId' | 'parentKind'> {
+    if (principal.kind !== 'worker') return {}
+    const parent = this.requireAccessibleRun(principal, principal.runId)
+    if (!parent.capabilityByIdentity.has(principal.identityId)) throw new Error('calling Agent capability is no longer active')
+    return { parentRunId: parent.snapshot.runId, parentKind: 'delegate' }
+  }
+
+  private createRun(
+    context: AgentExecutionContext,
     request: AgentRunRequest,
     options: CreateRunOptions,
   ): Promise<AgentRunSnapshot> {
-    this.pruneRuns()
+    const parent = options.parentRunId ? this.runs.get(options.parentRunId) : undefined
+    if (parent) parent.pendingChildCreations++
+    const creation = this.createRunInternal(context, request, options)
+    this.pendingRunCreations.add(creation)
+    const settled = () => {
+      this.pendingRunCreations.delete(creation)
+      if (parent) parent.pendingChildCreations--
+    }
+    void creation.then(settled, settled)
+    return creation
+  }
+
+  private async createRunInternal(
+    context: AgentExecutionContext,
+    request: AgentRunRequest,
+    options: CreateRunOptions,
+  ): Promise<AgentRunSnapshot> {
+    const { owner } = context
     let parent: AgentRunRecord | undefined
     if (options.parentRunId) {
       parent = this.runs.get(options.parentRunId)
       if (!parent) throw new Error(`parent agent run not found: ${options.parentRunId}`)
-      this.assertSameSession(parent, session)
-      if (
-        options.parentKind === 'delegate'
-        && (parent.cancelled || parent.finalizing || isTerminal(parent.snapshot.status))
-      ) throw new Error(`parent agent run is no longer accepting children: ${options.parentRunId}`)
+      this.assertSameOwner(parent, context)
     }
-    const catalog = this.deps.getCatalog()
+    const ancestorEpochs: Array<[AgentRunRecord, number]> = []
+    for (let ancestor = parent; ancestor; ancestor = ancestor.snapshot.parentRunId ? this.runs.get(ancestor.snapshot.parentRunId) : undefined) {
+      ancestorEpochs.push([ancestor, ancestor.cancellationEpoch])
+    }
+    const requestedWorkDir = request.workDir ?? (options.parentKind === 'delegate' ? parent?.snapshot.workDir : undefined)
+    const workDir = options.resumeSessionId
+      ? resolveAgentResumeWorkDir(owner.workDir, requestedWorkDir)
+      : resolveAgentWorkDir(owner.workDir, requestedWorkDir)
+    const admittedWorkDir = realpathSync(workDir)
+    const codexAccountId = context.codexAccountId
+    const catalog = this.deps.getCatalog(codexAccountId)
     const identities = request.identityIds.map(id => {
       const identity = catalog.identities.find(item => item.id === id)
       if (!identity) throw new Error(`agent identity not found: ${id}`)
@@ -258,100 +381,102 @@ export class AgentService {
     const workers = identities.map(identity => workerSnapshot(
       identity,
       resolveEffort(identity, request.effort),
-      options.resumeByIdentity?.get(identity.id),
+      options.resumeSessionId,
     ))
     const runId = `agent_${randomUUID()}`
     const snapshot: AgentRunSnapshot = {
       runId,
-      sessionName: session.sessionName,
-      chatId: session.chatId,
-      workDir: session.workDir,
+      codexAccountId,
+      owner: { ...owner },
+      sessionName: owner.name,
+      chatId: owner.chatId,
+      sessionWorkDir: owner.workDir,
+      ...(options.requestId ? { requestId: options.requestId, requestHash: options.requestHash } : {}),
+      ...(owner.kind === 'project' ? {
+        ...(request.requesterOpenId ? { requesterOpenId: request.requesterOpenId } : {}),
+      } : {}),
+      workDir,
       prompt: request.prompt,
+      description: requireAgentDescription(request.description),
       ...(options.parentRunId ? { parentRunId: options.parentRunId } : {}),
       ...(options.parentKind ? { parentKind: options.parentKind } : {}),
+      ...(options.resumedFromRunId ? { resumedFromRunId: options.resumedFromRunId } : {}),
       depth: options.depth,
       status: 'queued',
       workers,
       createdAt: new Date().toISOString(),
     }
-    const messageId = await this.deps.sendCard(session.chatId, cards.agentRunCard(snapshot))
-    if (!messageId) {
-      await this.deps.sendTextRaw(session.chatId, '❌ agent 卡片创建失败，Agent 未启动')
-      throw new Error('agent card creation failed; delegated agents were not started')
-    }
-    let cardId: string
-    try {
-      cardId = await this.deps.convertMessageToCard(messageId)
-    } catch (error) {
-      await this.deps.sendTextRaw(session.chatId, `❌ agent 卡片初始化失败，Agent 未启动: ${messageOf(error)}`)
-      throw error
-    }
-    snapshot.cardMessageId = messageId
-    this.deps.recordCardCreated(cardId, workers.length + 2, code => {
-      log(`agent: card write failed run=${runId} code=${code ?? 'MISS'}`)
-    })
     const run: AgentRunRecord = {
       snapshot,
-      session,
-      cardId,
+      context,
       handles: new Map(),
       capabilityByIdentity: new Map(),
       progressTimers: new Map(),
       children: new Set(),
+      pendingChildCreations: 0,
       cancelled: false,
+      cancellationEpoch: 0,
       finalizing: false,
       finalized: false,
       persistedArtifacts: new Set(),
+      artifactsUnloaded: false,
+    }
+    try {
+      await this.presentation.add(snapshot)
+    } catch (error) {
+      this.runs.set(runId, run)
+      if (options.parentRunId) parent?.children.add(runId)
+      const reason = `Agent 卡片初始化失败，Agent 未启动: ${messageOf(error)}`
+      for (const worker of workers) {
+        worker.status = 'failed'
+        worker.error = reason
+      }
+      await this.finalizeRun(run, 'failed', reason)
+      await this.deps.sendTextRaw(owner.chatId, `❌ ${reason}`)
+      throw error
     }
     this.runs.set(runId, run)
     if (options.parentRunId) parent?.children.add(runId)
-    const invalidated = this.currentCancellationEpoch(session) !== options.cancellationEpoch
-      || (options.parentKind === 'delegate' && !!parent
-        && (parent.cancelled || parent.finalizing || isTerminal(parent.snapshot.status)))
+    const invalidated = this.shuttingDown || this.currentCancellationEpoch(context) !== options.cancellationEpoch
+      || ancestorEpochs.some(([ancestor, epoch]) => ancestor.cancellationEpoch !== epoch)
     if (invalidated) {
       run.cancelled = true
-      const reason = 'Agent run was invalidated by parent or Session cancellation before launch'
+      const reason = '任务已在启动前取消'
       for (const worker of run.snapshot.workers) {
         worker.status = 'cancelled'
         worker.error = reason
         worker.finishedAt = new Date().toISOString()
       }
       this.persist(run)
+      await Promise.all(run.snapshot.workers.map(worker => this.updateWorkerCard(run, worker)))
       await this.finalizeRun(run, 'cancelled', reason)
-      return cloneSnapshot(run.snapshot)
+      return this.readSnapshot(run)
     }
     this.persist(run)
     for (const identity of identities) {
-      const resumeSessionId = options.resumeByIdentity?.get(identity.id)
-      void this.executeWorker(run, identity, request.prompt, resumeSessionId).catch(error => {
+      const resumeSessionId = options.resumeSessionId
+      void this.executeWorker(run, identity, request.prompt, admittedWorkDir, resumeSessionId).catch(error => {
         log(`agent: run=${runId} worker=${identity.id} crashed: ${messageOf(error)}`)
       })
     }
-    return cloneSnapshot(snapshot)
+    return this.readSnapshot(run)
   }
 
   private async executeWorker(
     run: AgentRunRecord,
     identity: AgentIdentity,
     prompt: string,
+    admittedWorkDir: string,
     resumeSessionId?: string,
   ): Promise<void> {
     const worker = run.snapshot.workers.find(item => item.identityId === identity.id)!
-    await this.acquireSlot(() => {
-      worker.queuedReason = `等待全局并发槽位 (${GLOBAL_AGENT_CONCURRENCY})`
-      this.persist(run)
-      void this.updateWorkerCard(run, worker)
-    })
-    if (run.cancelled) {
-      this.releaseSlot()
-      return
-    }
+    if (run.cancelled) return
     let capability = ''
     try {
       capability = randomBytes(32).toString('base64url')
       this.capabilities.set(capability, {
         kind: 'worker',
-        session: run.session!,
+        context: run.context!,
         runId: run.snapshot.runId,
         identityId: identity.id,
         depth: run.snapshot.depth,
@@ -364,33 +489,43 @@ export class AgentService {
       this.persist(run)
       await this.updateWorkerCard(run, worker)
       if (run.cancelled) return
+      this.assertSameOwner(run, run.context!)
+      // Card creation and updates may wait while directories are removed or replaced by symlinks.
+      const validatedWorkDir = resumeSessionId
+        ? resolveAgentResumeWorkDir(run.context!.owner.workDir, run.snapshot.workDir)
+        : resolveAgentWorkDir(run.context!.owner.workDir, run.snapshot.workDir)
+      if (validatedWorkDir !== run.snapshot.workDir || realpathSync(validatedWorkDir) !== admittedWorkDir) {
+        throw new Error('agent work_dir changed before the worker could start')
+      }
       const handle = this.deps.startWorker({
         identity,
+        codexAccountId: run.snapshot.codexAccountId,
         effort: worker.effort as AgentReasoningEffort,
         workDir: run.snapshot.workDir,
         prompt,
         resumeSessionId,
-        // 指令层(D-11 口径 3):worker 文案与工作树约定按序拼接,主 Agent 不含该文案。
-        developerInstructions: [
-          run.session ? delegatedAgentDeveloperInstructions(run.session, identity.provider) : '',
-          DELEGATED_AGENT_INSTRUCTIONS,
-        ].filter(Boolean).join('\n\n'),
-        profile: fullAgentProfile(feishu.projectProfile(
-          run.session ? worktreeProjectName(run.session) : run.snapshot.sessionName,
-        )),
+        projectBound: run.context!.owner.kind === 'project',
+        ...(run.context!.owner.kind === 'session'
+          ? { developerInstructions: run.context!.sessionInstructions!(identity.provider) } : {}),
+        profile: fullAgentProfile(feishu.projectProfileForDirectory(run.snapshot.workDir)),
+        ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1' ? {} : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
+        // 原生工具层(D-11 口径 3):会话归属 worker 一律关闭再委派(claude
+        // disallowedTools / codex --disable multi_agent / dsh tools.restrict);
+        // 项目归属延续上游多层语义,不设闸。
+        ...(run.context!.owner.kind === 'session' ? { allowDelegation: false } : {}),
         hostEnv: {
-          // 同 session.spawnAgent：全量测试泄漏的残缺 config mock 不含 notify。
+          // 同 session.spawnAgent:全量测试泄漏的残缺 config mock 不含 notify。
           LODESTAR_AGENT_URL: agentApiUrl(config.notify?.bind ?? '127.0.0.1', config.notify?.port ?? 9876),
           LODESTAR_AGENT_CAPABILITY: capability,
           LODESTAR_AGENT_SESSION: run.snapshot.sessionName,
-          // worker 身份标记(仅被委派进程可见;主 Agent 的 hostEnv 不含该变量)。
+          // worker 身份标记(runner 亦写同值兜底);主 Agent 侧由 session.ts 写
+          // 'main' —— agent-cli 见这些变量即拒绝 --project 的「伪装外部服务」调用。
           LODESTAR_AGENT_ROLE: 'worker',
         },
-        // 原生工具层:worker 一律关闭再委派(claude disallowedTools / codex --disable multi_agent)。
-        allowDelegation: false,
         callbacks: {
           onNeedsInput: request => {
             if (run.cancelled) return
+            if (run.context!.owner.kind === 'project') throw new Error(PROJECT_AGENT_INPUT_ERROR)
             worker.status = 'needs_input'
             worker.pendingInput = request
             this.refreshNonterminalStatus(run)
@@ -398,6 +533,11 @@ export class AgentService {
             void this.updateWorkerCard(run, worker)
           },
           onProgress: step => this.recordStep(run, worker, step),
+          onCodexAccount: accountId => {
+            if (run.cancelled) return
+            worker.codexAccountId = accountId
+            this.persist(run)
+          },
           onSession: sessionId => {
             if (worker.sessionId === sessionId) return
             worker.sessionId = sessionId
@@ -409,7 +549,6 @@ export class AgentService {
       const result = await handle.done
       if (run.cancelled) return
       this.clearProgressTimer(run, identity.id)
-      worker.status = 'completed'
       worker.output = result.output
       worker.outputTruncated = result.outputTruncated
       worker.sessionId = result.sessionId
@@ -418,12 +557,19 @@ export class AgentService {
       worker.usage = result.usage
       worker.finishedAt = new Date().toISOString()
       delete worker.pendingInput
+      if (run.cancelled) return
+      worker.status = 'completed'
       this.persist(run)
       await this.updateWorkerCard(run, worker)
     } catch (error) {
       // D-14:失败或取消都不丢已生成输出(AgentWorkerFailure 携带 output);
       // 取消路径的 status/error 仍由 cancelTree 统一落「停止原因」。
-      if (error instanceof AgentWorkerFailure) worker.output = error.output
+      if (error instanceof AgentWorkerFailure) {
+        worker.output = error.output
+        worker.outputTruncated = false
+        if (error.sessionId) worker.sessionId = error.sessionId
+        this.persist(run)
+      }
       if (!run.cancelled) {
         this.clearProgressTimer(run, identity.id)
         worker.status = 'failed'
@@ -435,10 +581,11 @@ export class AgentService {
         await this.updateWorkerCard(run, worker)
       }
     } finally {
-      run.handles.delete(identity.id)
+      if (!run.handles.get(identity.id)?.isAlive?.()) {
+        run.handles.delete(identity.id)
+      }
       if (capability) this.capabilities.delete(capability)
       run.capabilityByIdentity.delete(identity.id)
-      this.releaseSlot()
       this.recomputeRun(run)
     }
   }
@@ -450,7 +597,7 @@ export class AgentService {
     if (run.progressTimers.has(worker.identityId)) return
     const timer = setTimeout(() => {
       run.progressTimers.delete(worker.identityId)
-      void this.updateWorkerCard(run, worker)
+      void this.updateWorkerCard(run, worker, 'progress')
     }, 250)
     run.progressTimers.set(worker.identityId, timer)
   }
@@ -490,30 +637,53 @@ export class AgentService {
   }
 
   private async cancelTree(run: AgentRunRecord, reason: string): Promise<void> {
-    const activeSelf = !isTerminal(run.snapshot.status) && !run.cancelled
+    // Include children whose card creation has not yet joined the durable tree.
+    run.cancellationEpoch++
+    const activeSelf = (!isTerminal(run.snapshot.status) && !run.cancelled) || run.handles.size > 0
+    const failures: PromiseSettledResult<void>[] = []
     if (activeSelf) {
       run.cancelled = true
       for (const identityId of [...run.progressTimers.keys()]) this.clearProgressTimer(run, identityId)
       for (const capability of run.capabilityByIdentity.values()) this.capabilities.delete(capability)
       run.capabilityByIdentity.clear()
     }
+    const visited = new Set<string>()
     while (true) {
       const children = [...run.children]
         .map(childId => this.runs.get(childId))
-        .filter((child): child is AgentRunRecord => !!child && this.treeHasActiveRun(child))
+        .filter((child): child is AgentRunRecord => !!child && !visited.has(child.snapshot.runId) && this.treeHasActiveRun(child))
       if (children.length === 0) break
-      await Promise.allSettled(children.map(child => this.cancelTree(child, reason)))
+      for (const child of children) visited.add(child.snapshot.runId)
+      const results = await Promise.allSettled(children.map(child => this.cancelTree(child, reason)))
+      failures.push(...results)
+      if (results.some(result => result.status === 'rejected')) break
     }
-    if (!activeSelf) return
-    await Promise.allSettled([...run.handles.values()].map(handle => handle.cancel(reason)))
+    if (!activeSelf) { throwCancellationFailures(failures); return }
+    failures.push(...await Promise.allSettled([...run.handles].map(async ([identityId, handle]) => {
+      await handle.cancel(reason)
+      if (handle.isAlive?.()) throw new Error(`${identityId}: Agent process is still alive after cancellation`)
+      run.handles.delete(identityId)
+    })))
+    if (failures.some(result => result.status === 'rejected')) {
+      const error = cancellationError(failures)
+      run.snapshot.status = 'failed'
+      run.snapshot.error = error.message
+      this.persist(run)
+      await this.deps.sendTextRaw(run.snapshot.chatId, `❌ Agent 取消未完成: ${error.message}`)
+        .catch(deliveryError => log(`agent: cancellation failure notice failed: ${messageOf(deliveryError)}`))
+      throw error
+    }
+    const cancelledWorkers: AgentWorkerResult[] = []
     for (const worker of run.snapshot.workers) {
       if (!isWorkerTerminal(worker.status)) {
         worker.status = 'cancelled'
         worker.error = reason
         worker.finishedAt = new Date().toISOString()
         delete worker.pendingInput
+        cancelledWorkers.push(worker)
       }
     }
+    await Promise.all(cancelledWorkers.map(worker => this.updateWorkerCard(run, worker)))
     await this.finalizeRun(run, 'cancelled', reason)
   }
 
@@ -525,51 +695,37 @@ export class AgentService {
     run.snapshot.finishedAt = new Date().toISOString()
     if (error) run.snapshot.error = error
     try {
-      if (run.cardId) {
-        this.deps.cancelSummary(run.cardId)
-        await this.deps.flush(run.cardId)
-        const footerLanded = await this.deps.replaceElementChecked(
-          run.cardId,
-          cards.ELEMENTS.agentRunFooter,
-          cards.agentRunFooterElement(run.snapshot),
-        )
-        if (!footerLanded) this.recordPresentationError(run, 'agent footer update MISS')
-        const settingsLanded = await this.deps.patchSettingsChecked(run.cardId, {
-          config: {
-            streaming_mode: false,
-            summary: { content: cards.agentRunSummary(run.snapshot) },
-          },
-        })
-        if (!settingsLanded) this.recordPresentationError(run, 'agent terminal settings update MISS')
-        await this.deps.flush(run.cardId)
-        await this.deps.dispose(run.cardId)
-      }
+      await this.presentation.update(run.snapshot, true)
     } catch (presentationError) {
       this.recordPresentationError(run, `agent card finalization failed: ${messageOf(presentationError)}`)
     }
     run.finalizing = false
     this.persist(run)
     run.finalized = true
+    this.pruneRunArtifacts()
     if (run.snapshot.presentationErrors?.length) {
+      const details = run.snapshot.presentationErrors.map((detail, index) => `${index + 1}. ${detail}`).join('\n')
+      const preview = details.length > 3000 ? `${details.slice(0, 3000)}\n…完整错误已保存在任务记录中。` : details
       await this.deps.sendTextRaw(
         run.snapshot.chatId,
-        `⚠️ agent ${run.snapshot.runId} 结果已保存，但卡片有 ${run.snapshot.presentationErrors.length} 个呈现错误。`,
+        `⚠️ 委派卡片出现更新错误 · ${run.snapshot.description ?? run.snapshot.runId}\n结果已保存，卡片更新期间出现 ${run.snapshot.presentationErrors.length} 个错误：\n${preview}\n任务：${run.snapshot.runId}`,
       ).catch(error => log(`agent: warning delivery failed run=${run.snapshot.runId}: ${messageOf(error)}`))
     }
   }
 
-  private async updateWorkerCard(run: AgentRunRecord, worker: AgentWorkerResult): Promise<void> {
-    if (!run.cardId || run.finalized) return
+  private async updateWorkerCard(
+    run: AgentRunRecord,
+    worker: AgentWorkerResult,
+    purpose: 'state' | 'progress' = 'state',
+  ): Promise<void> {
+    if (run.finalized) return
+    const previousMessageId = run.snapshot.cardMessageId
     try {
-      const landed = await this.deps.replaceElementChecked(
-        run.cardId,
-        cards.agentWorkerElementId(worker.identityId),
-        cards.agentWorkerElement(worker, cards.agentWorkerPreviewChars(run.snapshot.workers.length)),
-      )
-      if (!landed) this.recordPresentationError(run, `agent worker card MISS: ${worker.identityName}`)
-      this.deps.patchSummaryThrottled(run.cardId, cards.agentRunSummary(run.snapshot))
+      await this.presentation.update(run.snapshot, false, purpose === 'progress')
     } catch (error) {
       this.recordPresentationError(run, `agent worker card update failed (${worker.identityName}): ${messageOf(error)}`)
+    } finally {
+      if (run.snapshot.cardMessageId !== previousMessageId) this.persist(run)
     }
   }
 
@@ -604,12 +760,60 @@ export class AgentService {
     run.persistedArtifacts.add(name)
   }
 
+  private readSnapshot(run: AgentRunRecord): AgentRunSnapshot {
+    const snapshot = cloneSnapshot(run.snapshot)
+    if (run.artifactsUnloaded) hydrateSnapshotArtifacts(snapshot, snapshot.runId, this.deps.readTextArtifact)
+    return snapshot
+  }
+
   private requireAccessibleRun(principal: AgentPrincipal, runId: string): AgentRunRecord {
     const run = this.runs.get(runId)
     if (!run || !this.canAccess(principal, run)) throw new Error(`agent run not found: ${runId}`)
-    this.assertSameSession(run, principal.session)
-    if (!run.session) run.session = principal.session
+    this.assertSameOwner(run, agentPrincipalContext(principal))
+    if (!run.context) run.context = agentPrincipalContext(principal)
     return run
+  }
+
+  private assertResumeProject(principal: AgentPrincipal, run: AgentRunRecord): void {
+    const caller = agentPrincipalContext(principal).owner
+    const origin = agentRunOwner(run.snapshot)
+    if (caller.chatId !== origin.chatId || workspaceKey(caller.workDir) !== workspaceKey(origin.workDir)) {
+      throw new Error('agent session belongs to a different project or group; cross-project and cross-group resume is not allowed')
+    }
+  }
+
+  private findSessionHistory(principal: AgentPrincipal, sessionId: string): {
+    run: AgentRunRecord; worker: AgentWorkerResult
+  } {
+    const matches = [...this.runs.values()].flatMap(run => run.snapshot.workers
+      .filter(worker => worker.sessionId === sessionId)
+      .map(worker => ({ run, worker })))
+    if (!matches.length) throw new Error('agent session project/group ownership is unknown; only registered sessions in this project and group can be resumed')
+    for (const { run } of matches) this.assertResumeProject(principal, run)
+    if (new Set(matches.map(({ worker }) => worker.provider)).size > 1) {
+      throw new Error('native session id has conflicting backend records; its unique identity cannot be established')
+    }
+    // Session/project bindings can share a native id within one project and group, without joining cancellation trees.
+    const parents = new Set(matches.flatMap(({ run }) => [run.snapshot.resumedFromRunId, run.snapshot.parentRunId]))
+    const latest = matches.filter(({ run }) => !parents.has(run.snapshot.runId))
+      .sort((a, b) => Date.parse(b.run.snapshot.createdAt) - Date.parse(a.run.snapshot.createdAt))[0]
+    if (!latest) throw new Error(`agent session history has no latest run: ${sessionId}`)
+    return latest
+  }
+
+  private reserveNativeSession(worker: Pick<AgentWorkerResult, 'provider' | 'sessionId'>): () => void {
+    const key = JSON.stringify([worker.provider, worker.sessionId])
+    const occupied = [...this.runs.values()].some(run => run.snapshot.workers.some(other => {
+      if (other.provider !== worker.provider || other.sessionId !== worker.sessionId) return false
+      const handle = run.handles.get(other.identityId)
+      return !isWorkerTerminal(other.status) || !!handle && handle.isAlive?.() !== false
+    }))
+    if (this.startingNativeSessions.has(key) || occupied) {
+      throw new Error('agent session is already running or starting; wait for the current turn to finish')
+    }
+    // Reserve before card creation's first await; queued runs keep the session occupied afterward.
+    this.startingNativeSessions.add(key)
+    return () => { this.startingNativeSessions.delete(key) }
   }
 
   private requireMutableDescendant(principal: AgentPrincipal, runId: string): AgentRunRecord {
@@ -621,8 +825,10 @@ export class AgentService {
   }
 
   private canAccess(principal: AgentPrincipal, target: AgentRunRecord): boolean {
-    if (target.snapshot.sessionName !== principal.session.sessionName || target.snapshot.chatId !== principal.session.chatId) return false
-    if (principal.kind === 'session') return true
+    const owner = agentRunOwner(target.snapshot)
+    const caller = agentPrincipalContext(principal).owner
+    if (owner.kind !== caller.kind || owner.name !== caller.name || owner.chatId !== caller.chatId) return false
+    if (principal.kind !== 'worker') return true
     let current: AgentRunRecord | undefined = target
     while (current) {
       if (current.snapshot.runId === principal.runId) return true
@@ -631,15 +837,15 @@ export class AgentService {
     return false
   }
 
-  private assertSameSession(run: AgentRunRecord, session: Session): void {
-    if (
-      run.snapshot.sessionName !== session.sessionName
-      || run.snapshot.chatId !== session.chatId
-      || run.snapshot.workDir !== session.workDir
-    ) throw new Error('agent run belongs to a different Session')
+  private assertSameOwner(run: AgentRunRecord, context: AgentExecutionContext): void {
+    if (agentOwnerKey(agentRunOwner(run.snapshot)) !== agentOwnerKey(context.owner)) {
+      throw new Error('agent run belongs to a different Session or project')
+    }
   }
 
   private treeHasActiveRun(run: AgentRunRecord): boolean {
+    if (run.pendingChildCreations > 0) return true
+    if (run.handles.size > 0) return true
     if (!isTerminal(run.snapshot.status)) return true
     for (const childId of run.children) {
       const child = this.runs.get(childId)
@@ -648,80 +854,18 @@ export class AgentService {
     return false
   }
 
-  private reserveCapacity(principal: AgentPrincipal, workerCount: number): () => void {
-    const sessionKey = this.sessionKey(principal.session.sessionName, principal.session.chatId)
-    const activeSessionRuns = [...this.runs.values()].filter(run =>
-      this.sessionKey(run.snapshot.sessionName, run.snapshot.chatId) === sessionKey
-      && !isTerminal(run.snapshot.status)).length
-    const startingSessionRuns = this.startingRunsBySession.get(sessionKey) ?? 0
-    if (activeSessionRuns + startingSessionRuns >= MAX_SESSION_ACTIVE_RUNS) {
-      throw new Error(`Session has reached ${MAX_SESSION_ACTIVE_RUNS} active Agent runs`)
-    }
-    const inflightWorkers = [...this.runs.values()].reduce((sum, run) =>
-      sum + run.snapshot.workers.filter(worker => !isWorkerTerminal(worker.status)).length, 0)
-    if (inflightWorkers + this.startingWorkers + workerCount > MAX_GLOBAL_INFLIGHT_WORKERS) {
-      throw new Error(`global Agent worker limit ${MAX_GLOBAL_INFLIGHT_WORKERS} would be exceeded`)
-    }
-    const subtreeKey = principal.kind === 'worker' ? principal.runId : null
-    if (subtreeKey) {
-      const activeSubtreeRuns = [...this.runs.values()].filter(run =>
-        !isTerminal(run.snapshot.status) && this.isRunInSubtree(run, subtreeKey)).length
-      const startingSubtreeRuns = this.startingRunsBySubtree.get(subtreeKey) ?? 0
-      if (activeSubtreeRuns + startingSubtreeRuns >= MAX_SUBTREE_ACTIVE_RUNS) {
-        throw new Error(`Agent subtree has reached ${MAX_SUBTREE_ACTIVE_RUNS} active runs`)
-      }
-    }
-    this.startingWorkers += workerCount
-    this.startingRunsBySession.set(sessionKey, startingSessionRuns + 1)
-    if (subtreeKey) this.startingRunsBySubtree.set(subtreeKey, (this.startingRunsBySubtree.get(subtreeKey) ?? 0) + 1)
-    let released = false
-    return () => {
-      if (released) return
-      released = true
-      this.startingWorkers = Math.max(0, this.startingWorkers - workerCount)
-      decrementMap(this.startingRunsBySession, sessionKey)
-      if (subtreeKey) decrementMap(this.startingRunsBySubtree, subtreeKey)
-    }
-  }
-
-  private isRunInSubtree(run: AgentRunRecord, rootRunId: string): boolean {
-    let current: AgentRunRecord | undefined = run
-    while (current) {
-      if (current.snapshot.runId === rootRunId) return true
-      current = current.snapshot.parentRunId ? this.runs.get(current.snapshot.parentRunId) : undefined
-    }
-    return false
-  }
-
   private sessionKey(sessionName: string, chatId: string): string {
     return `${sessionName}\u0000${chatId}`
   }
 
-  private currentCancellationEpoch(session: Session): number {
-    return this.cancellationEpochBySession.get(this.sessionKey(session.sessionName, session.chatId)) ?? 0
+  private currentCancellationEpoch(context: AgentExecutionContext): number {
+    if (context.owner.kind === 'project') return 0
+    return this.cancellationEpochBySession.get(this.sessionKey(context.owner.name, context.owner.chatId)) ?? 0
   }
 
   private bumpCancellationEpoch(sessionName: string, chatId: string): void {
     const key = this.sessionKey(sessionName, chatId)
     this.cancellationEpochBySession.set(key, (this.cancellationEpochBySession.get(key) ?? 0) + 1)
-  }
-
-  private acquireSlot(onQueued: () => void): Promise<void> {
-    if (this.activeTurns < GLOBAL_AGENT_CONCURRENCY) {
-      this.activeTurns++
-      return Promise.resolve()
-    }
-    onQueued()
-    return new Promise(resolve => this.slotWaiters.push(resolve))
-  }
-
-  private releaseSlot(): void {
-    const next = this.slotWaiters.shift()
-    if (next) {
-      next()
-      return
-    }
-    this.activeTurns = Math.max(0, this.activeTurns - 1)
   }
 
   private loadDurableRuns(): void {
@@ -741,15 +885,17 @@ export class AgentService {
       }
       const record: AgentRunRecord = {
         snapshot,
-        session: null,
-        cardId: null,
+        context: null,
         handles: new Map(),
         capabilityByIdentity: new Map(),
         progressTimers: new Map(),
         children: new Set(),
+        pendingChildCreations: 0,
         cancelled: snapshot.status === 'cancelled',
+        cancellationEpoch: 0,
         finalizing: false,
         finalized: true,
+        artifactsUnloaded: false,
         persistedArtifacts: new Set([
           ...(snapshot.promptArtifact ? [snapshot.promptArtifact] : []),
           ...snapshot.workers.flatMap(worker => worker.outputArtifact ? [worker.outputArtifact] : []),
@@ -761,20 +907,43 @@ export class AgentService {
     for (const run of this.runs.values()) {
       if (run.snapshot.parentRunId) this.runs.get(run.snapshot.parentRunId)?.children.add(run.snapshot.runId)
     }
-    this.pruneRuns()
+    this.pruneRunArtifacts()
   }
 
-  private pruneRuns(): void {
-    if (this.runs.size <= MAX_RETAINED_RUNS) return
+  private pruneRunArtifacts(): void {
+    if (this.runs.size <= MAX_CACHED_RUN_ARTIFACTS) return
     const terminal = [...this.runs.values()]
-      .filter(run => isTerminal(run.snapshot.status) && run.children.size === 0)
+      .filter(run => !run.artifactsUnloaded && run.finalized && !run.finalizing && isTerminal(run.snapshot.status)
+        && run.handles.size === 0)
       .sort((a, b) => Date.parse(a.snapshot.finishedAt ?? a.snapshot.createdAt) - Date.parse(b.snapshot.finishedAt ?? b.snapshot.createdAt))
-    for (const run of terminal) {
-      if (this.runs.size <= MAX_RETAINED_RUNS) break
-      this.runs.delete(run.snapshot.runId)
-      if (run.snapshot.parentRunId) this.runs.get(run.snapshot.parentRunId)?.children.delete(run.snapshot.runId)
+    // The run map is the continuation index and cancellation tree, not a cache.
+    // Keep every record and link; only evict text already saved in artifacts.
+    for (const run of terminal.slice(0, Math.max(0, terminal.length - MAX_CACHED_RUN_ARTIFACTS))) {
+      run.snapshot.prompt = ''
+      for (const worker of run.snapshot.workers) worker.output = ''
+      run.artifactsUnloaded = true
     }
   }
+}
+
+function resolveAgentWorkDir(sessionWorkDir: string, requestedWorkDir?: string): string {
+  const root = realpathSync(sessionWorkDir)
+  const workDir = realpathSync(resolve(sessionWorkDir, requestedWorkDir === undefined ? '.' : requireAgentWorkDir(requestedWorkDir)))
+  const fromRoot = relative(root, workDir)
+  if (fromRoot === '..' || fromRoot.startsWith(`..${sep}`) || isAbsolute(fromRoot)) {
+    throw new Error('agent work_dir must be the main Agent working directory or one of its subdirectories')
+  }
+  if (!statSync(workDir).isDirectory()) throw new Error(`agent work_dir is not a directory: ${workDir}`)
+  // Native session storage may be keyed by the original (possibly symlinked) project path.
+  return fromRoot === '' ? sessionWorkDir : workDir
+}
+
+/** Native resumes may change directories within their owning project, preserving native cwd spelling. */
+function resolveAgentResumeWorkDir(callerWorkDir: string, requestedWorkDir?: string): string {
+  const workDir = requestedWorkDir === undefined ? callerWorkDir : resolve(callerWorkDir, requireAgentWorkDir(requestedWorkDir))
+  resolveAgentWorkDir(callerWorkDir, workDir)
+  // Keep the spelling used by native persistence, including legacy symlinked cwd paths.
+  return workDir
 }
 
 function workerSnapshot(
@@ -797,11 +966,12 @@ function workerSnapshot(
 }
 
 function resolveEffort(identity: AgentIdentity, raw: string | undefined): AgentReasoningEffort {
-  const effort = (raw ?? identity.defaultEffort) as AgentReasoningEffort
-  if (!identity.supportedEfforts.includes(effort)) {
+  const effort = raw ?? identity.defaultEffort
+  if (!effort) throw new Error(`${identity.displayName} default effort MISS; specify effort explicitly`)
+  if (!identity.supportedEfforts.includes(effort as AgentReasoningEffort)) {
     throw new Error(`${identity.displayName} does not support effort ${effort}`)
   }
-  return effort
+  return effort as AgentReasoningEffort
 }
 
 function selectWorker(snapshot: AgentRunSnapshot, identityId?: string): AgentWorkerResult {
@@ -849,11 +1019,28 @@ function isAgentRunSnapshot(value: unknown): value is AgentRunSnapshot {
     && typeof run.sessionName === 'string'
     && typeof run.chatId === 'string'
     && typeof run.workDir === 'string'
+    && (run.owner === undefined || !!run.owner && ['session', 'project'].includes(run.owner.kind)
+      && run.owner.name === run.sessionName && run.owner.chatId === run.chatId
+      && typeof run.owner.workDir === 'string' && run.owner.workDir === run.sessionWorkDir)
+    && (run.resumedFromRunId === undefined || typeof run.resumedFromRunId === 'string')
+    && (run.requestId === undefined || typeof run.requestId === 'string' && typeof run.requestHash === 'string')
+    && (run.deliveryMode === undefined || run.deliveryMode === 'chat' || run.deliveryMode === 'drive')
+    && (run.sessionWorkDir === undefined || typeof run.sessionWorkDir === 'string')
     && typeof run.prompt === 'string'
+    && (run.description === undefined || typeof run.description === 'string')
     && typeof run.depth === 'number'
     && typeof run.status === 'string'
     && Array.isArray(run.workers)
     && typeof run.createdAt === 'string'
+}
+
+function cancellationError(results: PromiseSettledResult<void>[]): AggregateError {
+  const failures = results.flatMap(result => result.status === 'rejected' ? [result.reason] : [])
+  return new AggregateError(failures, `Agent cancellation failed: ${failures.map(messageOf).join('; ')}`)
+}
+
+function throwCancellationFailures(results: PromiseSettledResult<void>[]): void {
+  if (results.some(result => result.status === 'rejected')) throw cancellationError(results)
 }
 
 function messageOf(error: unknown): string {
@@ -866,10 +1053,14 @@ function fullAgentProfile(profile: ReturnType<typeof feishu.projectProfile>): Re
     : { strictMcp: false, loadProjectMcp: true }
 }
 
-function hydrateSnapshotArtifacts(snapshot: AgentRunSnapshot, snapshotPath: string): void {
-  if (snapshot.promptArtifact) snapshot.prompt = readTextArtifact(snapshot.promptArtifact, `prompt for ${snapshotPath}`)
+function hydrateSnapshotArtifacts(
+  snapshot: AgentRunSnapshot,
+  snapshotPath: string,
+  read: AgentServiceDeps['readTextArtifact'] = readTextArtifact,
+): void {
+  if (snapshot.promptArtifact) snapshot.prompt = read(snapshot.promptArtifact, `prompt for ${snapshotPath}`)
   for (const worker of snapshot.workers) {
-    if (worker.outputArtifact) worker.output = readTextArtifact(worker.outputArtifact, `output for ${snapshotPath}`)
+    if (worker.outputArtifact) worker.output = read(worker.outputArtifact, `output for ${snapshotPath}`)
   }
 }
 
@@ -881,10 +1072,4 @@ function readTextArtifact(name: string, label: string): string {
 
 function assertArtifactName(name: string): void {
   if (!/^[A-Za-z0-9._-]+$/.test(name)) throw new Error(`invalid Agent artifact name: ${name}`)
-}
-
-function decrementMap(map: Map<string, number>, key: string): void {
-  const next = (map.get(key) ?? 0) - 1
-  if (next > 0) map.set(key, next)
-  else map.delete(key)
 }

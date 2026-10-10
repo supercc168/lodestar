@@ -198,7 +198,7 @@ describe('readClaudeProviderUsage routing', () => {
     globalThis.fetch = (async () => new Response('<!doctype html><html></html>', {
       status: 200,
       headers: { 'content-type': 'text/html; charset=utf-8' },
-    })) as typeof fetch
+    })) as unknown as typeof fetch
 
     try {
       const snapshot = await readClaudeProviderUsage('claude:grok')

@@ -12,6 +12,7 @@ import {
   enforceGsdProviderIsolation,
   pauseGsdTask,
   readGsdSnapshot,
+  requireGsdRuntime,
   resumeGsdTask,
   selectGsdTask,
   type GsdSnapshot,
@@ -417,11 +418,13 @@ export async function onGsdContinue(
       return resultWithCard(s, false, GSD_BUSY_MSG)
     }
 
-    const provider = s.currentProvider()
     // Validate and apply all non-status prerequisites before resuming a paused
     // task. A malformed workstream config must not turn 已暂停 into 运行中 on
     // a failed continue attempt.
     ensureBridge(s.workDir, snapBefore.taskSlug)
+    // GSD runs only on codex/claude; dsh is rejected (same error as the
+    // gsd-store guard) before any inject prompt is built.
+    const provider = requireGsdRuntime(s.currentProvider())
     enforceGsdProviderIsolation(s.workDir, snapBefore.taskSlug, provider)
 
     let snap = snapBefore
@@ -447,7 +450,7 @@ export async function onGsdContinue(
       taskName: snap.taskName || snap.taskSlug,
       provider,
       model: gsdPromptModelLabel(provider, s.currentModelLabel()),
-      effort: s.currentEffortLabel(),
+      effort: s.currentEffortLabel() ?? 'MISS',
       policyDrift: gsdCodexPolicyDrift(s),
     })
     // Non-blocking inject: after validation / busy / resume / bridge, fire
@@ -564,8 +567,8 @@ export async function startNamedGsdTask(
     const snap: GsdSnapshot = createAndActivateTask(s.workDir, taskName)
     createdSlug = snap.taskSlug
     s.gsdSelectedTaskSlug = snap.taskSlug
-    const provider = s.currentProvider()
     ensureBridge(s.workDir, snap.taskSlug)
+    const provider = requireGsdRuntime(s.currentProvider())
     enforceGsdProviderIsolation(s.workDir, snap.taskSlug, provider)
 
     // Invalidate panel gen before await inject (anti double-create / double-inject).
@@ -579,7 +582,7 @@ export async function startNamedGsdTask(
       taskName: snap.taskName || taskName,
       provider,
       model: gsdPromptModelLabel(provider, s.currentModelLabel()),
-      effort: s.currentEffortLabel(),
+      effort: s.currentEffortLabel() ?? 'MISS',
       policyDrift: gsdCodexPolicyDrift(s),
     })
 

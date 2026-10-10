@@ -1,7 +1,9 @@
 import type { Session } from './session'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
 import { log } from './log'
 import { clearGsdAwaitingName, isGsdBareword, runGsdTextCommand } from './session-gsd'
+import { diagnosticIdLabel, messageOf } from './session-util'
 
 type ControlCommand = 'hi' | 'stop' | 'kill' | 'restart' | 'clear' | 'compact' | 'model'
 
@@ -35,7 +37,22 @@ function isControlCommandText(raw: string): boolean {
   return CONTROL_COMMAND_ALIASES.has(t.toLowerCase())
 }
 
-/** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
+const sourceCommandWork = new Set<Promise<void>>()
+
+function backgroundSourceCommand(s: Session, work: Promise<void>): void {
+  const tracked = work.catch(async error => {
+    const message = `账号操作或结果呈现失败：${messageOf(error)}`
+    log(message)
+    await feishu.sendTextRaw(s.chatId, `❌ ${message}`)
+    throw error
+  })
+  sourceCommandWork.add(tracked)
+  void tracked.finally(() => sourceCommandWork.delete(tracked)).catch(error => log(`账号操作结果发送失败：${messageOf(error)}`))
+}
+
+export function pendingSourceCommands(): Promise<void>[] { return [...sourceCommandWork] }
+
+/** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`, `files`)
  * plus their two-letter aliases where applicable.
  * Returns true if the command was consumed (don't forward to Codex).
  * Exact match, case-insensitive, ignores trailing whitespace.
@@ -48,7 +65,7 @@ function isControlCommandText(raw: string): boolean {
  * auto-interrupt on mid-turn user messages was removed (matching
  * Codex's native type-ahead behavior) — explicit barge-out
  * needed a knob and `kill` (full subprocess teardown) is too heavy. */
-export async function runCommand(s: Session, raw: string, userOpenId = ''): Promise<boolean> {
+export async function runCommand(s: Session, raw: string, userOpenId = '', messageId?: string): Promise<boolean> {
   // Spec: explicit non-task control commands cancel awaiting_name.
   // Daemon routes controls here before onUserMessage / maybeConsumeGsdTaskName,
   // so clear on every consumed control (including bare `gsd` panel open).
@@ -56,8 +73,30 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     clearGsdAwaitingName(s)
   }
 
+  const namedHi = raw.trim().match(/^hi[ \t]+([^\r\n]+)$/i)
+  if (namedHi) {
+    const { runCodexNamedHi } = await import('./session-codex-accounts')
+    await runCodexNamedHi(s, namedHi[1].trim())
+    return true
+  }
+  const accountCommand = raw.trim().match(/^codex-(login-cancel|login|accounts|account-delete|account|auto|reset)(?:[ \t]+([^\r\n]+))?$/i)
+  if (accountCommand) {
+    const { runCodexAccountCommand } = await import('./session-codex-accounts')
+    const command = accountCommand[1].toLowerCase()
+    const work = runCodexAccountCommand(s, command, (accountCommand[2] ?? '').trim(), userOpenId, messageId)
+    if (command === 'login' || command === 'reset') backgroundSourceCommand(s, work)
+    else await work
+    return true
+  }
+  const subscription = raw.trim().match(/^claude-sub(?:[ \t]+([^\r\n]+))?$/i)
+  if (subscription) {
+    const { runClaudeSubscriptionCommand } = await import('./token-source-setup')
+    await runClaudeSubscriptionCommand(s, (subscription[1] ?? '').trim().toLowerCase())
+    return true
+  }
   const wt = raw.trim().match(/^(?:wt|worktree)(?:\s+(.+))?$/i)
   if (wt) {
+    // 本地守卫保留(上游随 agy 系统移除而删,本地 agy 仍在):agy 独占期拒绝 wt。
     if (s.startingAgy || s.runningAgy) {
       await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 wt。')
       return true
@@ -68,6 +107,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
   // btw = 开临时会话(同目录,自动启动);bye = 散临时群;fk/fork = 列当前会话 turn 分叉;
   // bk/back = 列 turn;点选并通过 owner/stale 校验后才终止并切到新分支(上游 ff44afb)。
   if (raw.trim().match(/^btw$/i)) {
+    // 本地守卫保留(同 wt):agy 独占期拒绝 btw。
     if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 btw。'); return true }
     await s.runBtwCommand(userOpenId)
     return true
@@ -106,12 +146,26 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
     await s.showTasklistPanel()
     return true
   }
+  const files = raw.trim().match(/^files(?:[ \t]+([^\r\n]+))?$/i)
+  if (files) {
+    await s.runFileDeliveryCommand((files[1] ?? '').trim(), userOpenId)
+    return true
+  }
   if (isGsdBareword(raw)) {
     await runGsdTextCommand(s, raw)
     return true
   }
+  // <source>-setup <args> —— 启用某 token source(generic:路由到 source factory 的 setup.parseArgs,
+  // 加新 source 不改本文件 —— 在 token-source-<name>.ts 声明 setup 字段即自动接入)。
+  const tsSetup = raw.trim().match(/^([\w-]+)-setup(?:\s+([\s\S]+))?$/i)
+  if (tsSetup) {
+    const { runTokenSourceSetup } = await import('./token-source-setup')
+    backgroundSourceCommand(s, runTokenSourceSetup(s, tsSetup[1].trim().toLowerCase(), (tsSetup[2] ?? '').trim()))
+    return true
+  }
   const command = CONTROL_COMMAND_ALIASES.get(raw.trim().toLowerCase())
   if (!command) return false
+  // 本地守卫保留(上游随 agy 系统移除而删,本地 agy 仍在):agy 独占期只放行白名单控制命令。
   if ((s.startingAgy || s.runningAgy) && !['stop', 'kill', 'restart', 'hi', 'model'].includes(command)) {
     await feishu.sendText(s.chatId, `⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再执行 ${command}。`)
     return true
@@ -155,6 +209,18 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
           await s.closeStatusCard(statusCard, lastStatus.startsWith('❌') ? lastStatus : '❌ 启动失败')
           return true
         }
+        if (s.proc?.turnRetry?.reason === 'quota') {
+          const waiting = '⏳ 等待额度恢复 · 可用后自动启动，stop 可取消'
+          if (statusCard) await s.closeStatusCard(statusCard, waiting)
+          else {
+            const { codexAccountCard } = await import('./cards/codex-account')
+            let failure: unknown
+            if (!await feishu.sendCard(s.chatId, codexAccountCard({ phase: 'checking', title: '等待额度', message: waiting }), error => { failure = error })) {
+              throw new Error(`额度等待卡片发送失败\n${formatFeishuError(failure)}`)
+            }
+          }
+          return true
+        }
         if (statusCard) {
           await s.replaceStatusCardWithConsole(
             statusCard,
@@ -175,12 +241,21 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       {
       const lease = s.beginLifecycle('soft_stop')
       const preserveRecovery = s.hasPreservedWatchdogRecovery()
+      const cancelledFiles = s.cancelFileDeliveries('用户停止了任务')
       if (s.runningAgy) {
         await s.cancelAgentRuns('stop command')
         await s.stopAgyTask('🛑 agy 已打断')
         return true
       }
       await s.cancelAgentRuns('stop command')
+      if (s.proc?.turnRetry?.reason === 'quota') {
+        const card = await s.openStatusCard('stop', '🛑 停止额度等待')
+        try {
+          await s.stop('已取消额度恢复', { announce: !card, onStatus: value => s.setStatusCard(card, value) })
+          await s.closeStatusCard(card, '🛑 已取消额度恢复')
+        } catch (error) { await s.closeStatusCard(card, `❌ ${messageOf(error)}`); throw error }
+        return true
+      }
       // Soft barge-out: interrupt the current turn (if any) AND drop
       // the pending-message count so a stack of type-ahead doesn't
       // refire after the interrupt. Subprocess stays alive. Note: the
@@ -198,6 +273,11 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
         return true
       }
       if (!s.currentTurn && s.pendingUserMessageCount === 0 && s.pendingMidTurnMsgs.length === 0) {
+        if (cancelledFiles) {
+          await s.closeTurnCard('🛑 已取消未完成的文件上传')
+          await feishu.sendText(s.chatId, '🛑 已取消未完成的文件上传，已上传文件保留')
+          return true
+        }
         const statusCard = await s.openStatusCard('stop', '⚪ 当前没有正在执行的 turn', 'grey')
         if (!s.ownsLifecycle(lease)) return true
         if (statusCard) {
@@ -256,15 +336,33 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
         const initialStatus = wasRunning ? `🛑 停止 ${backend}` : '⚪ session 当前未运行'
         const statusCard = await s.openStatusCard('kill', initialStatus, wasRunning ? 'red' : 'grey')
         if (!s.ownsLifecycle(lease)) return true
-        await s.stop('已终止', {
-          announce: !statusCard,
-          lifecycleLease: lease,
-          onStatus: status => {
-            s.setStatusCard(statusCard, status)
-          },
-        })
+        let stopError: unknown = null
+        let finalStatus = wasRunning ? `✅ ${backend} 已终止` : `⚪ ${backend} 未运行`
+        try {
+          await s.stop('已终止', {
+            announce: !statusCard,
+            lifecycleLease: lease,
+            onStatus: status => {
+              s.setStatusCard(statusCard, status)
+            },
+          })
+        } catch (e) {
+          stopError = e
+          finalStatus = s.isRunning()
+            ? `❌ ${backend} 未确认终止: ${messageOf(e)}；会话已阻断，请重试 kill/restart 或等待旧进程退出`
+            : `❌ ${backend} 停止收尾失败: ${messageOf(e)}`
+        }
         if (!s.ownsLifecycle(lease)) return true
-        await s.closeStatusCard(statusCard, wasRunning ? `✅ ${backend} 已终止` : `⚪ ${backend} 未运行`)
+        try {
+          await s.closeStatusCard(statusCard, finalStatus)
+        } catch (e) {
+          log(`session "${s.sessionName}": kill status card close failed: ${messageOf(e)}`)
+          await feishu.sendTextRaw(s.chatId, `${finalStatus}\n⚠️ kill 状态卡片终态写入失败: ${messageOf(e)}`)
+        }
+        // openStatusCard already provides the visible failure when present. If
+        // card creation failed, stop() had no chance to announce after throwing,
+        // so preserve error transparency with a raw text receipt.
+        if (stopError && !statusCard) await feishu.sendTextRaw(s.chatId, finalStatus)
       }
       return true
     case 'restart':
@@ -311,12 +409,12 @@ export async function runCommand(s: Session, raw: string, userOpenId = ''): Prom
       // 进行中:resume the prior conversation — kills the current proc and
       // spawns a new one with `--resume <lastSessionId>`(放弃后台进程)。
       {
-        const resumeThreadLabel = s.lastSessionId ? s.lastSessionId.slice(0, 8) : ''
+        const resumeThreadLabel = s.lastSessionId ? diagnosticIdLabel(s.lastSessionId) : ''
         const backend = s.backendLabel(s.proc?.provider ?? s.currentProvider())
         const initialStatus = s.isRunning()
           ? s.withModel(`🔁 重启 ${backend}`)
           : resumeThreadLabel
-            ? s.withModel(`🔁 恢复上一会话 thread=${resumeThreadLabel}…`)
+            ? s.withModel(`🔁 恢复上一会话 thread=${resumeThreadLabel}`)
             : s.withModel(`🔁 启动 ${backend}`)
         const statusCard = await s.openStatusCard('restart', initialStatus)
         if (!s.ownsLifecycle(lease)) return true

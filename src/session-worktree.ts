@@ -1,10 +1,10 @@
-import { join } from 'node:path'
-
 import type { Session } from './session'
 import type { AgentProvider } from './agent-process'
-import { CHANNEL_INSTRUCTIONS, CLAUDE_CHANNEL_INSTRUCTIONS, DSH_CHANNEL_INSTRUCTIONS } from './instructions'
+import { channelInstructions } from './instructions'
+import type { FileDeliveryMode } from './file-delivery-types'
 import * as cards from './cards'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
 import { log } from './log'
 import * as worktree from './worktree'
 import { messageOf, type WorktreeActionResult } from './session-util'
@@ -16,13 +16,15 @@ export function worktreeProjectName(s: Session): string {
 }
 
 export function worktreeProjectDir(s: Session): string {
-  return join(feishu.PROJECTS_ROOT, worktreeProjectName(s))
+  return feishu.resolveProjectDir(worktreeProjectName(s))
 }
 
 /** session 的实际工作目录(上游 ff44afb 同名函数):临时群先剥 * 后缀,再按
- *  普通/worktree 群名解析——temp-of-worktree 留在 worktree cwd。projectDir
- *  取本地 worktreeProjectDir(与 wt 建目录机制同一解析,不查 profile——
- *  profile override 分支保留在 session.workDir getter,翻译表 #15)。 */
+ *  普通/worktree 群名解析——temp-of-worktree 留在 worktree cwd。projectDir 经
+ *  worktreeProjectDir→feishu.resolveProjectDir(profile 感知):worktree 子目录
+ *  跟随 [projects.<name>].cwd 落在 override 根旁(锚定用例 'derives a worktree
+ *  child session beside the profiled project root')。session.workDir getter 对
+ *  剥后缀完整群名的 override 分支先行(翻译表 #15),两者语义等价。 */
 export function worktreeSessionDir(s: Session): string {
   const sessionName = feishu.tempProjectName(s.sessionName) ?? s.sessionName
   const projectName = worktreeProjectName(s)
@@ -32,11 +34,11 @@ export function worktreeSessionDir(s: Session): string {
   return worktree.expectedWorktreePath(projectDir, projectName, slug)
 }
 
-export function spawnDeveloperInstructions(s: Session): string {
-  const provider = s.currentProvider()
-  const base = provider === 'dsh'
-    ? DSH_CHANNEL_INSTRUCTIONS
-    : provider === 'claude' ? CLAUDE_CHANNEL_INSTRUCTIONS : CHANNEL_INSTRUCTIONS
+/** 各后端的渠道指令由 instructions.channelInstructions(provider, mode) 统一生成
+ *  (上游,含 dsh 问询工具的 provider 分支);本地旧三常量形态由 channelInstructions
+ *  覆盖,agent-launch 断言只依赖返回值。 */
+export function spawnDeveloperInstructions(s: Session, mode: FileDeliveryMode, provider: AgentProvider = s.currentProvider()): string {
+  const base = channelInstructions(provider, mode)
   const extra = worktreeExtraInstruction(s)
   return extra ? `${base}\n${extra}` : base
 }
@@ -86,6 +88,8 @@ export async function runWorktreeCommand(s: Session, arg: string, userOpenId: st
     await feishu.sendText(s.chatId, '❌ 名称无效。用英文/数字/._-，最长 63。')
     return
   }
+  // AI- 前缀是自动化系统(tasklist-worker AI-AUTO)保留的 worktree 命名空间:
+  // wt 命令不参与(本地保留,与 worktree.ts listProjectWorktrees 跳过同口径)。
   if (worktree.isReservedWorktreeSlug(slug)) {
     await feishu.sendText(s.chatId, `❌ ${slug} 是 AI 自动化系统保留 worktree，不能用 wt 命令操作。`)
     return
@@ -112,19 +116,21 @@ export async function runWorktreeCommand(s: Session, arg: string, userOpenId: st
       try {
         const chat = await feishu.ensureChatForSession(ensured.chatName, userOpenId)
         const action = chat.created ? '已创建' : (chat.joined ? '已加入' : '已在群内')
+        let parentFailure: unknown
         const parentMsg = await feishu.sendCard(s.chatId, cards.worktreeNoticeCard({
           slug,
           branch: ensured.branch,
           status: action,
-        }))
-        if (!parentMsg) await feishu.sendTextRaw(s.chatId, `❌ wt 卡片失败: ${slug}`)
+        }), error => { parentFailure = error })
+        if (!parentMsg) await feishu.sendTextRaw(s.chatId, `❌ wt 卡片失败: ${slug}\n${formatFeishuError(parentFailure)}`)
+        let childFailure: unknown
         const childMsg = await feishu.sendCard(chat.chatId, cards.worktreeNoticeCard({
           slug,
           branch: ensured.branch,
           status: '就绪',
           body: '开始吧。',
-        }))
-        if (!childMsg) await feishu.sendTextRaw(chat.chatId, `❌ wt 卡片失败: ${slug}`)
+        }), error => { childFailure = error })
+        if (!childMsg) await feishu.sendTextRaw(chat.chatId, `❌ wt 卡片失败: ${slug}\n${formatFeishuError(childFailure)}`)
       } catch (e) {
         await feishu.sendText(s.chatId, `❌ wt 已建，拉群失败: ${messageOf(e)}`)
       }
@@ -138,12 +144,11 @@ async function buildWorktreeListCard(s: Session, notice?: { type: 'success' | 'e
   const projectName = worktreeProjectName(s)
   const projectDir = worktreeProjectDir(s)
   return await worktree.withProjectWorktreeLock(projectDir, async () => {
-    return await buildWorktreeListCardUnlocked(s, projectName, projectDir, notice)
+    return await buildWorktreeListCardUnlocked(projectName, projectDir, notice)
   })
 }
 
 async function buildWorktreeListCardUnlocked(
-  s: Session,
   projectName: string,
   projectDir: string,
   notice?: { type: 'success' | 'error' | 'info'; content: string },
@@ -179,6 +184,8 @@ async function buildWorktreeListCardUnlocked(
         error: entry.error,
         chatId,
         duplicateChatCount: ids.length,
+        // AI- 保留 worktree 标 protected(本地保留:卡片侧据此渲染「· 系统保留」
+        // 并禁用解散;上游随该特性整体移除而删,本地 wt/bye 守卫同口径)。
         protected: worktree.isReservedWorktreeSlug(entry.slug),
       }
     }),
@@ -188,8 +195,9 @@ async function buildWorktreeListCardUnlocked(
 export async function showWorktrees(s: Session): Promise<void> {
   try {
     const card = await buildWorktreeListCard(s)
-    const messageId = await feishu.sendCard(s.chatId, card)
-    if (!messageId) await feishu.sendTextRaw(s.chatId, '❌ wt 列表失败')
+    let failure: unknown
+    const messageId = await feishu.sendCard(s.chatId, card, error => { failure = error })
+    if (!messageId) await feishu.sendTextRaw(s.chatId, `❌ wt 列表失败\n${formatFeishuError(failure)}`)
   } catch (e) {
     await feishu.sendText(s.chatId, `❌ wt 列表失败: ${messageOf(e)}`)
   }
@@ -223,6 +231,7 @@ async function worktreeActionResult(
 export async function onWorktreeDisband(s: Session, slugRaw: string): Promise<WorktreeActionResult> {
   const slug = worktree.normalizeWorktreeSlug(slugRaw)
   if (!slug) return worktreeActionResult(s, false, '❌ 名称无效', 'error')
+  // AI- 保留命名空间不可解散(本地保留,护栏理由同 runWorktreeCommand)。
   if (worktree.isReservedWorktreeSlug(slug)) {
     return worktreeActionResult(s, false, `❌ ${slug} 是 AI 自动化系统保留 worktree，不能解散。`, 'error')
   }

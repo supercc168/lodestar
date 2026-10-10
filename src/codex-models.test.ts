@@ -48,7 +48,6 @@ const {
   codexEnvFromConfig,
   codexConfigArgs,
   toCodexProfile,
-  codexModelProfiles,
   codexModelProfile,
   codexModelIsApiRoute,
   codexModelRequiresOpenaiAuth,

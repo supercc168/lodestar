@@ -1,3 +1,4 @@
+import { localFetch } from './network'
 /**
  * Persistent registration store for `/notify` cards that carry
  * interactive buttons.
@@ -62,6 +63,24 @@ export interface NotifyReplyState {
   error?: string
 }
 
+export interface NotifyTextResponse {
+  text: string
+  /** User's message, distinct from the original notification message_id. */
+  message_id: string
+  prompt_message_id: string
+}
+
+export interface NotifyReplyState {
+  id: string
+  openId: string
+  promptMessageId: string
+  openedAt: number
+  status: 'waiting' | 'sending' | 'failed' | 'cancelled'
+  cancelReason?: 'switched'
+  response?: NotifyTextResponse
+  error?: string
+}
+
 /** A registered interactive `/notify` card. Persisted wholesale so the
  * resolved-card rebuild after a click can re-render the original
  * images/text/header without re-uploading. */
@@ -80,12 +99,15 @@ export interface NotifyRegistration {
   /** Uploaded image keys (already on Feishu's CDN — reuse, don't
    * re-upload, on the resolved rebuild). `key==''` marks an upload
    * failure rendered inline in red. */
-  imageKeys: Array<{ key: string; src: string }>
+  imageKeys: Array<{ key: string; src: string; error?: string }>
   buttons: NotifyButton[]
   allowReply?: boolean
   replyState?: NotifyReplyState
   /** Keep dedupe across explicit failed-attempt retries and different owners. */
   replyMessageIds?: string[]
+  /** Written before a button callback can run. An interrupted dispatch must
+   * not become retryable after restart because its external effect is unknown. */
+  dispatchState?: { buttonId: string; openId: string; startedAt: number }
   /** Unix-ms epoch. Used by {@link prune} (7-day TTL) and never
    * mutated after creation. */
   createdAt: number
@@ -95,9 +117,9 @@ export interface NotifyRegistration {
    * same card near-simultaneously. */
   resolvedAt?: number
   resolvedBy?: { buttonId?: string; openId: string }
-  /** External callback succeeded, but the durable resolved tombstone could
-   * not be confirmed. Never retry this state automatically: the external
-   * side effect may already have happened. */
+  /** Dispatch was interrupted or its durable completion could not be
+   * confirmed. Never retry automatically: the external side effect may
+   * already have happened. */
   unknownAt?: number
   unknownBy?: { buttonId?: string; openId: string }
   unknownReason?: string
@@ -118,13 +140,8 @@ const map = new Map<string, NotifyRegistration>()
 let lastRuntimePruneAt = Date.now()
 const RUNTIME_PRUNE_INTERVAL_MS = 24 * 60 * 60 * 1000
 
-/** In-flight push dispatches (transient, in-memory only — deliberately
- * NOT persisted). Guards double-click during the live two-phase update:
- * set when Phase 1 ACK returns, cleared when Phase 2 finishes. A daemon
- * crash mid-push loses this, which is correct — the click becomes
- * retryable on next boot instead of wedging on a phantom in-flight
- * guard. Survives across the store file because it lives here, off the
- * persisted registration. */
+/** Fast in-memory double-click guard. dispatchState separately preserves
+ * uncertainty across a process interruption. */
 const dispatching = new Set<string>()
 export function isDispatching(notifyId: string): boolean { return dispatching.has(notifyId) }
 export function setDispatching(notifyId: string): void { dispatching.add(notifyId) }
@@ -148,17 +165,21 @@ function saveCallbacks(): void {
 
 /** Load + prune on daemon boot. Stale entries (older than 7 days) and
  * any shape-mismatched record are dropped so a corrupted/partial file
- * never wedges the store. */
+ * never wedges the store. An unreadable or corrupt store is an error,
+ * since treating it as empty would lose callback deduplication records. */
 export function loadCallbacks(): NotifyRegistration[] {
-  const interruptedReplies: NotifyRegistration[] = []
+  const interruptedCallbacks: NotifyRegistration[] = []
   let raw: string
   try {
     raw = readFileSync(storeFile, 'utf8')
-  } catch {
-    return []  // first boot — file doesn't exist yet
+  } catch (error: any) {
+    if (error?.code === 'ENOENT') return []  // first boot — file doesn't exist yet
+    log(`notify-callbacks: read failed (${storeFile}): ${error}`)
+    throw error
   }
   try {
     const obj = JSON.parse(raw) as Record<string, any>
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) throw new Error('notify callback store must be an object')
     const cutoff = Date.now() - MAX_AGE_MS
     let dropped = 0
     let interrupted = 0
@@ -174,16 +195,23 @@ export function loadCallbacks(): NotifyRegistration[] {
         rec.unknownReason = '服务在文字回复回传期间中断，无法确认是否送达，禁止自动重试'
         interrupted++
       }
+      if (rec.dispatchState && !rec.resolvedAt && !rec.unknownAt) {
+        rec.unknownAt = Date.now()
+        rec.unknownBy = { buttonId: rec.dispatchState.buttonId, openId: rec.dispatchState.openId }
+        rec.unknownReason = '服务在按钮回调期间中断，无法确认是否送达，禁止自动重试'
+        interrupted++
+      }
       map.set(rec.notifyId, rec as NotifyRegistration)
-      if (rec.replyState?.status === 'sending' && rec.unknownAt) interruptedReplies.push(rec)
+      if ((rec.replyState?.status === 'sending' || rec.dispatchState) && rec.unknownAt) interruptedCallbacks.push(rec)
     }
     log(`notify-callbacks: loaded ${map.size} registration(s)${dropped ? `, dropped ${dropped} stale` : ''}`)
-    if (interrupted) log(`notify-callbacks: ${interrupted} interrupted text reply(s) marked UNKNOWN`)
+    if (interrupted) log(`notify-callbacks: ${interrupted} interrupted callback(s) marked UNKNOWN`)
     if (dropped > 0 || interrupted > 0) saveCallbacks()
   } catch (e) {
     log(`notify-callbacks: load failed (${storeFile}): ${e}`)
+    throw e
   }
-  return interruptedReplies
+  return interruptedCallbacks
 }
 
 export function register(reg: NotifyRegistration): void {
@@ -200,6 +228,35 @@ export function register(reg: NotifyRegistration): void {
 
 export function get(notifyId: string): NotifyRegistration | undefined {
   return map.get(notifyId)
+}
+
+/** Commit the uncertain interval before any external side effect is allowed. */
+export function beginCallbackDispatch(notifyId: string, buttonId: string, openId: string): void {
+  const rec = map.get(notifyId)
+  if (!rec) throw new Error(`notify registration not found: ${notifyId}`)
+  if (rec.resolvedAt || rec.unknownAt || rec.dispatchState) throw new Error('notify callback is already dispatched or finalized')
+  rec.dispatchState = { buttonId, openId, startedAt: Date.now() }
+  try { saveCallbacks() }
+  catch (error) { delete rec.dispatchState; throw error }
+}
+
+/** A failed POST becomes retryable only once removing its pending marker is
+ * durable. Retain UNKNOWN when that transition cannot be saved. */
+export function recordCallbackFailure(notifyId: string): { state: 'retry' } | { state: 'unknown'; detail: string } {
+  const rec = map.get(notifyId)
+  if (!rec?.dispatchState) throw new Error(`notify callback is not dispatching: ${notifyId}`)
+  const state = rec.dispatchState
+  delete rec.dispatchState
+  try { saveCallbacks(); return { state: 'retry' } }
+  catch (error) {
+    rec.dispatchState = state
+    const detail = `callback failure persistence failed: ${error instanceof Error ? error.message : error}`
+    try { markUnknown(notifyId, state.buttonId, state.openId, detail) }
+    catch (unknownError) {
+      rec.unknownReason = `${detail}; unknown tombstone persistence also failed: ${unknownError instanceof Error ? unknownError.message : unknownError}`
+    }
+    return { state: 'unknown', detail: rec.unknownReason ?? detail }
+  }
 }
 
 export function pendingRepliesForChat(chatId: string): NotifyRegistration[] {
@@ -242,12 +299,14 @@ export function markResolved(notifyId: string, buttonId: string | undefined, ope
     unknownAt: rec.unknownAt,
     unknownBy: rec.unknownBy,
     unknownReason: rec.unknownReason,
+    dispatchState: rec.dispatchState,
   }
   rec.resolvedAt = Date.now()
   rec.resolvedBy = { ...(buttonId !== undefined ? { buttonId } : {}), openId }
   delete rec.unknownAt
   delete rec.unknownBy
   delete rec.unknownReason
+  delete rec.dispatchState
   try {
     saveCallbacks()
   } catch (e) {
@@ -263,6 +322,7 @@ export function markResolved(notifyId: string, buttonId: string | undefined, ope
     else rec.unknownBy = previous.unknownBy
     if (previous.unknownReason === undefined) delete rec.unknownReason
     else rec.unknownReason = previous.unknownReason
+    if (previous.dispatchState !== undefined) rec.dispatchState = previous.dispatchState
     throw e
   }
 }
@@ -378,7 +438,7 @@ export async function dispatchCallback(
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), CALLBACK_TIMEOUT_MS)
   try {
-    const res = await fetch(reg.callbackUrl, {
+    const res = await localFetch(reg.callbackUrl, {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify(payload),
@@ -438,10 +498,18 @@ export function __setStoreFileForTest(file: string, clearMemory = true): void {
  * 该集合只是给单测一个不落盘的快捷开关(01-REVIEW IN-03)。 */
 const testPendingReplies = new Set<string>()
 
-/** 是否有进行中的通知回复占用该群的文本输入。真实现:查真实 replyState
- * (waiting/sending 且未 resolved/未 unknown);测试钩子仅作叠加。 */
-export function findPendingReply(chatId: string): boolean {
-  return pendingRepliesForChat(chatId).length > 0 || testPendingReplies.has(chatId)
+/** 是否有进行中的通知回复占用该群的文本输入。
+ * 1 参:boolean —— 查真实 replyState(waiting/sending 且未 resolved/未
+ * unknown),测试钩子仅作叠加;session-ask 输入优先级与 daemon 路由走此形态。
+ * 2 参(上游 ae411a6 形态):返回该 openId 名下的注册记录,供审计/上游单测使用。 */
+export function findPendingReply(chatId: string): boolean
+export function findPendingReply(chatId: string, openId: string): NotifyRegistration | undefined
+export function findPendingReply(chatId: string, openId?: string): boolean | NotifyRegistration | undefined {
+  if (!chatId) return openId === undefined ? false : undefined
+  const real = pendingRepliesForChat(chatId)
+    .find(rec => openId === undefined || rec.replyState?.openId === openId)
+  if (openId !== undefined) return real
+  return real !== undefined || testPendingReplies.has(chatId)
 }
 
 /** Test-only: 驱动 findPendingReply 的回复态,并做整集合复位 ——

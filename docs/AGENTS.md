@@ -1,10 +1,15 @@
-<!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-06-26 | Updated: 2026-06-26 -->
+# 文档维护
 
-# docs
+README 保留项目哲学、项目介绍、最短快速开始、常用指令表、附加能力的一句话说明及文档链接。精简时保留项目哲学原文；指令表分列完整指令与缩写/别名，每个指令独立一行，不把不同功能合并。附加能力逐项链接到具体用法。
 
-## Purpose
-`docs/` 存放 Lodestar 的设计备忘录（memo）：记录某个功能在实现前后的架构决策、已确认事实、与旧行为的对照和验证结果。这些 memo 是**叙述性参考**，不是规范文档；代码永远是事实源，memo 与代码冲突时以代码为准。
+项目介绍以“项目特色”为标题，用列表描述使用场景与体验，配上具体能力说明。首页指令只列 `hi`、`model`（`md`）、`kill`（`kl`），其余指令放在 `usage.md`。
+
+详细内容按主题维护，事实以源码和测试为准。文件大小限制、生图展示规则、更新机制、配置与开发步骤放在对应文档，不堆进首页。
+
+- `configuration.md`：安装、CLI、运行目录、配置、Agent 自动更新与源码开发。
+- `usage.md`：群内命令、会话、worktree、文件与生图、本机通知。
+- `models.md`：账号、模型与 effort、OpenRouter 默认列表、DSH 与 GLM 接入。
+- `claude-agent-backend.md`：后端实现、模型路由和会话行为。
 
 ## Key Files
 | File | Description |
@@ -18,26 +23,7 @@
 |-----------|---------|
 | `examples/` | memo 的可运行配套示例（脱敏、可直接安装）。目前只有 `picoclaw-job-notify/`：让 picoclaw 长任务跑完主动推回 IM 群的 shell 库 + 补播脚本 + 幂等安装器。 |
 
-## For AI Agents
-
-### Working In This Directory
-- memo 只描述**已落地**的架构；不要把这里当成待实现的 spec 或任务清单。
-- 新增 memo 时用 `X-agent-backend.md` 这类描述性文件名，保持「目标 / 已确认事实 / 设计 / 对照 / 验证结果」的结构。
-- 不要在 memo 之上再叠一层第三方 spec 文档；`docs/` 与 `AGENTS.md` 一起构成项目的事实层。
-
-### Testing Requirements
-- 纯文档目录，无测试。改 memo 不触发 `bun test`；但 memo 描述的代码改动仍按对应 `src/` 模块的测试要求执行。
-
-### Common Patterns
-- memo 会保留「验证结果」小节，记录 `bun test` 通过数、`bun run build` 产物和本机 smoke 的真实输出（如 SDK `session_id`、ask 回填路径）。
-- 与 Codex 旧行为的对照逐条列出，便于后续 reviewer 判断功能是否退化。
-
-## Dependencies
-
-### Internal
-- `claude-agent-backend.md` 对应 `src/agent-process.ts`、`src/claude-agent-process.ts`、`src/claude-models.ts`、`src/codex-process.ts`、`src/session-model.ts` 和 `src/glm-usage.ts` 的实际实现。
-
-### External
-- _None_
-
-<!-- MANUAL: Add manually maintained notes below this line. -->
+- 保留 Codex、Claude、GLM、DeepSeek、OpenRouter、DeepSeek Harness 和 Claude native 的支持说明。
+- 只写已实现的行为。删除失效接口、历史方案、重复规则和无法复现的验证结论；不另建产品规范或计划。
+- 不记录凭据、真实 session id、群成员或本机配置。临时测试报告、排障流水和某次测试通过数不作为长期文档；维护文档保留可复现的验证方法及适用边界。
+- 文字变更检查引用的路径、方法和命令；伴随实现变化时按对应目录指引运行测试。

@@ -1,26 +1,33 @@
 import { afterEach, describe, expect, test } from 'bun:test'
-import { createServer, type Server } from 'node:http'
+import { createServer, request, type Server } from 'node:http'
+import { Readable } from 'node:stream'
 import { handleAgentRequest } from './agent-api'
+import { buildAgentIdentityCatalog } from './agent-identities'
+import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type TokenSource, type UsageSnapshotUnified } from './token-source'
 
 let server: Server | null = null
 afterEach(() => { server?.close(); server = null })
 
-async function serve() {
-  const session = { sessionName: 'project', chatId: 'chat', workDir: '/repo' } as any
+async function serve(onStart?: (request: any) => void, projectMode = false) {
+  const session = { sessionName: 'project', chatId: 'chat', workDir: '/repo', codexAccountId: () => 'default' } as any
   let current: any = null
   const service = {
     rootPrincipal: () => ({ kind: 'session', session, depth: -1 }),
     principalForCapability: () => null,
-    async startRun(_principal: any, request: any) {
+    async startRun(principal: any, request: any) {
+      onStart?.(request)
       current = {
-        runId: 'agent_1', sessionName: 'project', chatId: 'chat', workDir: '/repo', prompt: request.prompt,
-        depth: 0, status: 'running', createdAt: new Date().toISOString(), workers: [],
+        ...(principal.kind === 'project' ? { owner: principal.context.owner } : {}),
+        runId: 'agent_1', sessionName: 'project', chatId: 'chat', workDir: request.workDir ?? '/repo', description: request.description, prompt: request.prompt,
+        depth: 0, status: 'running', createdAt: new Date().toISOString(), workers: [{
+          identityId: 'agent:a', status: 'running', sessionId: request.sessionId, output: request.prompt, steps: [],
+        }],
       }
       return current
     },
     getRun: () => current,
     async followUp(_principal: any, runId: string, request: any) {
-      return { ...current, runId: 'agent_2', parentRunId: runId, parentKind: 'follow_up', prompt: request.prompt }
+      return { ...current, runId: 'agent_2', parentRunId: runId, parentKind: 'follow_up', description: request.description, prompt: request.prompt }
     },
     async answer() { return { ...current, status: 'running' } },
     async cancelRun() { current.status = 'cancelled'; return true },
@@ -30,6 +37,12 @@ async function serve() {
     void handleAgentRequest(req, res, url, {
       service: service as any,
       authorizeSession: token => token === 'secret' ? session : null,
+      ...(projectMode ? { authorizeProject: (token: string, project: string) => {
+        if (token !== 'project-secret') return null
+        if (project !== 'project') throw new Error('unknown project')
+        return { kind: 'project' as const, depth: -1 as const,
+          context: { owner: { kind: 'project' as const, name: project, chatId: 'chat', workDir: '/repo' } } }
+      } } : {}),
     })
   })
   await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', resolve))
@@ -55,6 +68,107 @@ describe('delegated Agent HTTP API', () => {
     expect(handled).toBe(false)
   })
 
+  test.each(['session', 'project'] as const)('%s preserves inputs beyond the former character and HTTP body limits', async kind => {
+    const projectMode = kind === 'project'
+    const base = await serve(undefined, projectMode)
+    const query = projectMode ? '?project=project' : ''
+    const headers = { authorization: `Bearer ${projectMode ? 'project-secret' : 'secret'}`, 'content-type': 'application/json' }
+    const prompt = `  开始\n${'输入🎉'.repeat(419_000)}\n结束  `
+    expect(prompt.length).toBeGreaterThan(800_000)
+    for (const [path, fields] of [
+      ['/agents/runs', { identity_ids: ['agent:a'] }],
+      ['/agents/runs', { session_id: 'native-sid' }],
+      ['/agents/runs/agent_1/follow-up', {}],
+    ] as const) {
+      const body = JSON.stringify({ description: '完整传入大任务', prompt, ...fields })
+      // 本地 fork 给请求体加了 4 MiB 上限(见 src/agent-api.ts):贴近上限但不超限,内容必须逐字保留。
+      expect(Buffer.byteLength(body)).toBeGreaterThan(4_000_000)
+      expect(Buffer.byteLength(body)).toBeLessThan(4 * 1024 * 1024)
+      const response = await fetch(`${base}${path}${query}`, { method: 'POST', headers, body })
+      const value = await response.json() as any
+      expect(response.status, value.error).toBe(202)
+      expect(value.prompt === prompt).toBe(true)
+    }
+  })
+
+  test('accepts a request body exactly at the 4 MiB cap and rejects one byte more', async () => {
+    // 合成请求流:确定性验证「等于 4 MiB 放行、多一字节按实现文案拒绝」。
+    const cap = 4 * 1024 * 1024
+    const fields = { description: '边界请求体', identity_ids: ['agent:a'], prompt: '' }
+    const fill = cap - Buffer.byteLength(JSON.stringify(fields))
+    const payload = (prompt: string) => Buffer.from(JSON.stringify({ ...fields, prompt }))
+    expect(payload('x'.repeat(fill))).toHaveLength(cap)
+    expect(payload('x'.repeat(fill + 1))).toHaveLength(cap + 1)
+    const session = { sessionName: 'project', chatId: 'chat', workDir: '/repo', codexAccountId: () => 'default' } as any
+    const started: any[] = []
+    const service = {
+      rootPrincipal: () => ({ kind: 'session', session, depth: -1 }),
+      async startRun(_principal: any, request: any) {
+        started.push(request)
+        return {
+          runId: 'agent_1', sessionName: 'project', chatId: 'chat', workDir: request.workDir ?? '/repo',
+          description: request.description, prompt: request.prompt, depth: 0, status: 'running',
+          createdAt: new Date().toISOString(), workers: [],
+        }
+      },
+    }
+    const invoke = async (body: Buffer) => {
+      const req = Readable.from([body]) as any
+      req.method = 'POST'
+      req.url = '/agents/runs'
+      req.headers = { authorization: 'Bearer secret', 'content-type': 'application/json', host: '[' }
+      let text = ''
+      const res = { statusCode: 200, setHeader() {}, end(value: string) { text = value } } as any
+      const handled = await handleAgentRequest(req, res, new URL('http://127.0.0.1/agents/runs'), {
+        service: service as any,
+        authorizeSession: token => token === 'secret' ? session : null,
+      })
+      expect(handled).toBe(true)
+      return { status: res.statusCode, value: JSON.parse(text) as any }
+    }
+    const accepted = await invoke(payload('x'.repeat(fill)))
+    expect(accepted.status).toBe(202)
+    expect(started).toHaveLength(1)
+    expect(started[0].prompt).toBe('x'.repeat(fill))
+    const rejected = await invoke(payload('x'.repeat(fill + 1)))
+    expect(rejected.status).toBe(409)
+    expect(rejected.value.error).toBe('request body exceeds 4194304 bytes')
+    expect(started).toHaveLength(1)
+  })
+
+  test.each(['session', 'project'] as const)('%s accepts more than 64 identities in one request', async kind => {
+    const requests: any[] = []
+    const projectMode = kind === 'project'
+    const base = await serve(value => requests.push(value), projectMode)
+    const identityIds = Array.from({ length: 129 }, (_, index) => `agent:${index}`)
+    const response = await fetch(`${base}/agents/runs${projectMode ? '?project=project' : ''}`, {
+      method: 'POST',
+      headers: { authorization: `Bearer ${projectMode ? 'project-secret' : 'secret'}`, 'content-type': 'application/json' },
+      body: JSON.stringify({ description: '多身份并行调用', identity_ids: identityIds, prompt: 'work' }),
+    })
+    expect(response.status).toBe(202)
+    await response.json()
+    expect(requests).toHaveLength(1)
+    expect(requests[0].identityIds).toEqual(identityIds)
+  })
+
+  test('preserves Chinese task input split inside a UTF-8 character', async () => {
+    const requests: any[] = []
+    const base = await serve(value => requests.push(value))
+    const body = Buffer.from(JSON.stringify({ description: '任务说明', identity_ids: ['agent:a'], prompt: '处理中文 🎉' }))
+    const boundary = body.indexOf(Buffer.from('任务')) + 1
+    const status = await new Promise<number>((resolve, reject) => {
+      const req = request(`${base}/agents/runs`, { method: 'POST', headers: {
+        authorization: 'Bearer secret', 'content-type': 'application/json',
+      } }, res => { res.resume(); res.on('end', () => resolve(res.statusCode!)) })
+      req.on('error', reject)
+      req.write(body.subarray(0, boundary))
+      setTimeout(() => req.end(body.subarray(boundary)), 10)
+    })
+    expect(status).toBe(202)
+    expect(requests).toMatchObject([{ description: '任务说明', prompt: '处理中文 🎉' }])
+  })
+
   test('requires a live capability', async () => {
     const base = await serve()
     expect((await fetch(`${base}/agents/identities`)).status).toBe(401)
@@ -75,18 +189,80 @@ describe('delegated Agent HTTP API', () => {
     }
   })
 
+  test('passes work_dir to the service and reports the selected directory in run and status responses', async () => {
+    const requests: any[] = []
+    const base = await serve(request => requests.push(request))
+    const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' }
+    const response = await fetch(`${base}/agents/runs`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ description: '指定目录', identity_ids: ['agent:a'], prompt: 'work', work_dir: '/repo/packages/app' }),
+    })
+    expect(response.status).toBe(202)
+    expect(await response.json()).toMatchObject({ run_id: 'agent_1', work_dir: '/repo/packages/app' })
+    expect(requests[0]).toMatchObject({ workDir: '/repo/packages/app' })
+    const status = await fetch(`${base}/agents/runs/agent_1`, { headers })
+    expect(await status.json()).toMatchObject({ work_dir: '/repo/packages/app' })
+    const invalid = await fetch(`${base}/agents/runs`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ description: '目录非法', identity_ids: ['agent:a'], prompt: 'work', work_dir: '' }),
+    })
+    expect(invalid.status).toBe(409)
+    expect(await invalid.json()).toMatchObject({ error: expect.stringContaining('work_dir') })
+    expect(requests).toHaveLength(1)
+  })
+
+  test('identity listing serves the synchronous catalog without querying subscription usage', async () => {
+    // 定型实现:GET /agents/identities 走同步目录(getAgentIdentityCatalog),不再做订阅额度校验;
+    // 订阅可用性语义由 getAgentSkillIdentityCatalog 承担(见 src/agent-identities.test.ts)。
+    const previousSources = listTokenSources()
+    let checks = 0
+    let usage: UsageSnapshotUnified = { state: 'network', windows: [], reason: 'Claude 原生额度接口未返回 rate_limits 数据' }
+    const subscription: TokenSource = {
+      id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', display: 'Claude Code 订阅', enabled: true,
+      models: [{ model: 'sonnet', display: 'Sonnet', efforts: ['high'], defaultEffort: 'high' }],
+      defaultModel: 'sonnet', modelCatalogState: { status: 'ready', updatedAt: 1 },
+      refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+      readUsage: async () => { checks++; return usage },
+    }
+    resetTokenSourceRegistry()
+    registerTokenSource(subscription)
+    try {
+      const before = buildAgentIdentityCatalog([subscription])
+      const base = await serve()
+      const headers = { authorization: 'Bearer secret' }
+      const response = await fetch(`${base}/agents/identities`, { headers })
+      expect(response.status).toBe(200)
+      const catalog = await response.json() as any
+      expect(catalog.identities).toMatchObject([{
+        token_source_id: 'claude-sub', model: 'sonnet', default_effort: 'high', status: 'ready',
+      }])
+      expect(catalog.source_failures).toEqual([])
+      expect(buildAgentIdentityCatalog([subscription])).toEqual(before)
+      expect(checks).toBe(0)
+
+      usage = { state: 'no_credentials', windows: [], reason: '订阅额度接口不可用' }
+      const again = await fetch(`${base}/agents/identities`, { headers })
+      expect(again.status).toBe(200)
+      expect(await again.json() as any).toEqual(catalog)
+      expect(checks).toBe(0)
+    } finally {
+      resetTokenSourceRegistry()
+      for (const source of previousSources) registerTokenSource(source)
+    }
+  })
+
   test('creates, reads, follows up, answers, and cancels Agent runs', async () => {
     const base = await serve()
     const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' }
     const created = await fetch(`${base}/agents/runs`, {
-      method: 'POST', headers, body: JSON.stringify({ identity_ids: ['agent:a'], prompt: 'do it' }),
+      method: 'POST', headers, body: JSON.stringify({ description: '任务说明', identity_ids: ['agent:a'], prompt: 'do it' }),
     })
     expect(created.status).toBe(202)
     expect((await created.json() as any).run_id).toBe('agent_1')
     expect((await fetch(`${base}/agents/runs/agent_1`, { headers })).status).toBe(200)
 
     const follow = await fetch(`${base}/agents/runs/agent_1/follow-up`, {
-      method: 'POST', headers, body: JSON.stringify({ prompt: 'continue' }),
+      method: 'POST', headers, body: JSON.stringify({ description: '继续任务', prompt: 'continue' }),
     })
     expect(follow.status).toBe(202)
     expect((await follow.json() as any)).toMatchObject({ run_id: 'agent_2', parent_kind: 'follow_up' })
@@ -97,4 +273,50 @@ describe('delegated Agent HTTP API', () => {
     expect(answer.status).toBe(200)
     expect((await fetch(`${base}/agents/runs/agent_1`, { method: 'DELETE', headers })).status).toBe(200)
   })
+
+  test('accepts session_id plus new input and serializes the resumable session and content', async () => {
+    const requests: any[] = []
+    const base = await serve(request => requests.push(request))
+    const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' }
+    const response = await fetch(`${base}/agents/runs`, {
+      method: 'POST', headers, body: JSON.stringify({ description: '任务说明', session_id: 'native-sid', prompt: '  next\n' }),
+    })
+    expect(response.status).toBe(202)
+    expect(requests).toEqual([{ description: '任务说明', identityIds: [], sessionId: 'native-sid', prompt: '  next\n' }])
+    expect(await response.json()).toMatchObject({
+      description: '任务说明', workers: [{ session_id: 'native-sid', output: '  next\n' }],
+    })
+    const invalid = await fetch(`${base}/agents/runs`, {
+      method: 'POST', headers, body: JSON.stringify({ description: '任务说明', identity_ids: ['agent:a'], session_id: '', prompt: 'next' }),
+    })
+    expect(invalid.status).toBe(409)
+    expect(requests).toHaveLength(1)
+  })
+})
+
+test('project API authenticates independently and never upgrades session or worker credentials', async () => {
+  const base = await serve(undefined, true)
+  const request = { description: '独立项目任务', identity_ids: ['agent:a'], prompt: 'work' }
+  const headers = (token: string) => ({ authorization: `Bearer ${token}`, 'content-type': 'application/json' })
+  for (const token of ['secret', 'wrong']) {
+    expect((await fetch(`${base}/agents/runs?project=project`, { method: 'POST', headers: headers(token), body: JSON.stringify(request) })).status).toBe(403)
+  }
+  expect((await fetch(`${base}/agents/identities`, { headers: headers('project-secret') })).status).toBe(403)
+  expect((await fetch(`${base}/agents/identities?project=`, { headers: headers('project-secret') })).status).toBe(400)
+  expect((await fetch(`${base}/agents/identities?project=project&project=other`, { headers: headers('project-secret') })).status).toBe(400)
+  expect((await fetch(`${base}/agents/identities?project=unknown`, { headers: headers('project-secret') })).status).toBe(409)
+  const created = await fetch(`${base}/agents/runs?project=project`, { method: 'POST', headers: headers('project-secret'), body: JSON.stringify(request) })
+  expect(created.status).toBe(202)
+  const value = await created.json() as any
+  expect(value).toMatchObject({ binding: 'project', project: 'project', work_dir: '/repo' })
+  expect(value.session_name).toBeUndefined()
+  for (const action of ['follow-up', 'answer']) {
+    const response = await fetch(`${base}/agents/runs/agent_1/${action}?project=project`, {
+      method: 'POST', headers: headers('project-secret'),
+      body: JSON.stringify(action === 'follow-up' ? { description: '继续', prompt: 'next' } : { request_id: 'q', answers: { q: 'yes' } }),
+    })
+    expect(response.status).toBe(action === 'follow-up' ? 202 : 409)
+    if (action === 'answer') expect((await response.json() as any).error).toContain('non-interactive')
+  }
+  expect((await fetch(`${base}/agents/runs/agent_1?project=project`, { method: 'DELETE', headers: headers('project-secret') })).status).toBe(200)
 })

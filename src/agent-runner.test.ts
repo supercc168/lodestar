@@ -1,10 +1,12 @@
-import { describe, expect, test } from 'bun:test'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import { EventEmitter } from 'node:events'
 import { AgentWorkerFailure, collectAgentTurn, startAgentWorker } from './agent-runner'
 import { rememberAgentSession, isAgentSession, resetAgentSessionRegistryForTest } from './agent-session-registry'
+import { registerTokenSource, resetTokenSourceRegistry } from './token-source'
 
 class FakeProcess extends EventEmitter {
   provider = 'claude' as const
+  tokenSourceId = 'glm'
   sessionId: string | null = 'sid-1'
   lastAssistantUuid: string | null = 'checkpoint-1'
   lastCompletedTurnId = null
@@ -28,69 +30,88 @@ class FakeProcess extends EventEmitter {
   isAlive() { return this.alive }
 }
 
+afterEach(() => {
+  resetTokenSourceRegistry()
+})
+
 describe('full delegated Agent runner', () => {
-  // D-14:30 分钟会话超时与 2M 输出上限已删,容量退避只报进度、不布防看门狗。
-  test('capacity backoff reports progress and stays out of the agent output', async () => {
+  test('successful account selection keeps other-account diagnostics out of delegated progress', async () => {
+    const proc = new FakeProcess() as any
+    proc.provider = 'codex'
+    const progress: unknown[] = []
+    const accounts: string[] = []
+    const handle = collectAgentTurn(proc, 'do work', {
+      onProgress: step => progress.push(step), onCodexAccount: accountId => accounts.push(accountId),
+    }, () => {})
+    proc.emit('codex_account_changed', { accountId: 'available', diagnostics: ['other: catalog unavailable'] })
+    expect(accounts).toEqual(['available'])
+    expect(progress).toEqual([])
+    proc.emit('result', { is_error: false })
+    await handle.done
+  })
+
+  test.each([
+    [undefined, 'Selected model is at capacity', 'Codex 容量重试'],
+    ['capacity', 'Selected model is at capacity', 'Codex 容量重试'],
+    ['stream_disconnected', 'stream disconnected before completion: An error occurred while processing your request.', 'Codex 连接中断重试'],
+    ['compact_connection_failed', 'Error running remote compact task: Connection failed: error sending request', 'Codex 压缩连接中断重试'],
+    ['transient_error', 'Server overloaded, please try again later.', 'Codex 临时故障重试'],
+    ['quota', '正在等待 Codex 额度恢复', 'Codex 额度换号'],
+  ] as const)('%s backoff reports progress without imposing a turn deadline or changing output', async (reason, message, tool) => {
+    const timers = new Map<number, number>()
+    let nextId = 100_000
+    const timeout = spyOn(globalThis, 'setTimeout').mockImplementation(((_callback: () => void, delay: number) => {
+      const id = nextId++
+      timers.set(id, delay)
+      return id as unknown as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout)
+    const clear = spyOn(globalThis, 'clearTimeout').mockImplementation(((id: number) => { timers.delete(id) }) as typeof clearTimeout)
     const proc = new FakeProcess() as any
     proc.provider = 'codex'
     const progress: any[] = []
     const handle = collectAgentTurn(proc, 'do work', { onProgress: step => progress.push(step) }, () => {})
-    const retry = { phase: 'waiting', attempt: 1, delayMs: 60_000, message: 'Selected model is at capacity' }
-    proc.emit('turn_retry', retry)
-    expect(progress.at(-1).detail).toContain(retry.message)
-    expect(progress.at(-1).detail).toContain('60s 后重试 #1')
-    proc.emit('turn_retry', { ...retry, phase: 'retrying', delayMs: 0 })
-    expect(progress.at(-1).detail).toBe('正在重试 #1')
-    proc.emit('assistant_text', { text: 'finished', parentToolUseId: null })
-    proc.emit('result', { is_error: false })
-    await expect(handle.done).resolves.toMatchObject({ output: 'finished', outputTruncated: false })
-    expect(proc.listenerCount('turn_retry')).toBe(0)
+    try {
+      expect(timers.size).toBe(0)
+      const retry = { phase: 'waiting', attempt: 1, delayMs: 60_000, message, reason }
+      proc.emit('turn_retry', retry)
+      expect(timers.size).toBe(0)
+      expect(proc.alive).toBe(true)
+      expect(progress.at(-1)).toMatchObject({ tool, detail: `${message} · 60s 后重试 #1` })
+      proc.emit('turn_retry', { ...retry, phase: 'retrying', delayMs: 0 })
+      expect(timers.size).toBe(0)
+      expect(progress.at(-1)).toMatchObject({ tool, detail: '正在重试 #1' })
+      proc.emit('assistant_text', { text: 'finished', parentToolUseId: null })
+      proc.emit('result', { is_error: false })
+      await expect(handle.done).resolves.toMatchObject({ output: 'finished' })
+      expect(timers.size).toBe(0)
+      expect(proc.listenerCount('turn_retry')).toBe(0)
+    } finally {
+      await handle.cancel()
+      timeout.mockRestore()
+      clear.mockRestore()
+    }
   })
 
-  test('no longer truncates output at a fixed cap', async () => {
+  test('long-running work completes with its entire output beyond the old truncation threshold', async () => {
     const proc = new FakeProcess() as any
-    const handle = collectAgentTurn(proc, 'long', {}, () => {})
-    const chunk = 'x'.repeat(700_000)
-    for (let i = 0; i < 3; i++) proc.emit('assistant_text', { text: chunk, parentToolUseId: null })
-    proc.emit('result', { is_error: false })
-    const result = await handle.done
-    expect(result.output.length).toBe(2_100_000)
-    expect(result.outputTruncated).toBe(false)
-    expect(result.output).not.toContain('truncated at')
-  })
-
-  test('failure preserves output produced before the error', async () => {
-    const proc = new FakeProcess() as any
-    const handle = collectAgentTurn(proc, 'fail late', {}, () => {})
-    proc.emit('assistant_text', { text: '已完成一半的正文', parentToolUseId: null })
-    proc.emit('result', { is_error: true, error: 'exit code=1' })
-    const failure = await handle.done.then(() => null, error => error)
-    expect(failure).toBeInstanceOf(AgentWorkerFailure)
-    expect(failure.name).toBe('AgentWorkerFailure')
-    expect(failure.message).toContain('exit code=1')
-    expect(failure.output).toBe('已完成一半的正文')
-    expect(failure.sessionId).toBe('sid-1')
-  })
-
-  test('cancel preserves output produced before cancellation', async () => {
-    const proc = new FakeProcess() as any
-    const handle = collectAgentTurn(proc, 'cancel late', {}, () => {})
-    proc.emit('assistant_text', { text: '部分结果', parentToolUseId: null })
-    const cancelling = handle.cancel('stop now')
-    const failure = await handle.done.then(() => null, error => error)
-    expect(failure).toBeInstanceOf(AgentWorkerFailure)
-    expect(failure.message).toBe('stop now')
-    expect(failure.output).toBe('部分结果')
-    await cancelling
-  })
-
-  test('handle exposes isAlive for cancel-after-settle decisions', async () => {
-    const proc = new FakeProcess() as any
-    const handle = collectAgentTurn(proc, 'alive', {}, () => {})
-    expect(handle.isAlive?.()).toBe(true)
-    proc.emit('result', { is_error: false })
-    await handle.done
-    expect(handle.isAlive?.()).toBe(false)
+    const now = Date.now()
+    const time = spyOn(Date, 'now').mockReturnValue(now)
+    const handle = collectAgentTurn(proc, 'long work', {}, () => {})
+    try {
+      const body = '完整输出'.repeat(510_000)
+      proc.emit('assistant_text', { text: body })
+      time.mockReturnValue(now + 2 * 60 * 60 * 1000)
+      proc.emit('tool_use', { name: 'Bash' })
+      expect(proc.alive).toBe(true)
+      proc.emit('assistant_text', { text: '\n最终结论' })
+      proc.emit('result', { is_error: false })
+      await expect(handle.done).resolves.toMatchObject({
+        output: body + '\n最终结论', outputTruncated: false, durationMs: 2 * 60 * 60 * 1000,
+      })
+    } finally {
+      await handle.cancel()
+      time.mockRestore()
+    }
   })
 
   test('auto-allows ordinary permissions but pauses and resumes exact input requests', async () => {
@@ -147,31 +168,120 @@ describe('full delegated Agent runner', () => {
     await expect(handle.done).resolves.toMatchObject({ output: '', sessionId: 'sid-1' })
   })
 
-  test('fails closed when the native session id is missing', async () => {
+  for (const provider of ['codex', 'claude', 'dsh']) {
+    for (const resume of [false, true]) {
+      test(`non-interactive ${provider} calls fail on input without waiting or inventing answers (resume=${resume})`, async () => {
+        const proc = new FakeProcess() as any
+        proc.provider = provider
+        const waiting: unknown[] = []
+        const handle = collectAgentTurn(proc, 'execute task', {
+          onNeedsInput: request => waiting.push(request),
+        }, () => {}, resume ? 'sid-1' : undefined, false)
+        proc.emit('assistant_text', { text: 'work already performed' })
+        proc.emit('can_use_tool', { request_id: 'work', tool_name: 'Bash', input: { command: 'pwd' } })
+        proc.emit('can_use_tool', {
+          request_id: 'ask', tool_name: 'AskUserQuestion',
+          input: { questions: [{ id: 'q', question: 'Missing execution target?' }] },
+        })
+        const failure = await handle.done.catch(error => error)
+        expect(failure).toBeInstanceOf(AgentWorkerFailure)
+        expect(failure.message).toContain('non-interactive')
+        expect(failure.message).toContain('Missing execution target?')
+        expect(failure.output).toBe('work already performed')
+        expect(failure.sessionId).toBe('sid-1')
+        expect(waiting).toEqual([])
+        expect(handle.pendingInput()).toBeNull()
+        expect(proc.permissionResponses).toEqual([['work', 'allow', { updatedInput: { command: 'pwd' } }]])
+        expect(proc.isAlive()).toBe(false)
+      })
+    }
+  }
+
+  test('queues simultaneous questions without killing the task or losing answers', async () => {
     const proc = new FakeProcess() as any
-    proc.sessionId = null
-    const handle = collectAgentTurn(proc, 'no id', {}, () => {})
-    proc.emit('assistant_text', { text: '有正文但无会话号', parentToolUseId: null })
+    const questions: string[] = []
+    const handle = collectAgentTurn(proc, 'ask questions', {
+      onNeedsInput: request => questions.push(request.requestId),
+    }, () => {})
+    for (const id of ['first', 'second']) {
+      proc.emit('can_use_tool', {
+        request_id: id, tool_name: 'AskUserQuestion',
+        input: { questions: [{ id, question: `Question ${id}?` }] },
+      })
+    }
+    expect(questions).toEqual(['first'])
+    expect(proc.alive).toBe(true)
+    handle.answer('first', { first: 'one' })
+    expect(questions).toEqual(['first', 'second'])
+    expect(handle.pendingInput()?.requestId).toBe('second')
+    handle.answer('second', { second: 'two' })
+    expect(handle.pendingInput()).toBeNull()
+    expect(proc.permissionResponses.map((response: any[]) => response[0])).toEqual(['first', 'second'])
     proc.emit('result', { is_error: false })
-    const failure = await handle.done.then(() => null, error => error)
-    expect(failure).toBeInstanceOf(AgentWorkerFailure)
-    expect(failure.message).toMatch(/without a native session id/)
-    expect(failure.output).toBe('有正文但无会话号')
-    expect(failure.sessionId).toBeNull()
+    await handle.done
   })
 
-  test('dsh 会话与 codex 同样用 lastCompletedTurnId 作 fork 锚点', async () => {
+  test('cancellation exposes failed process termination and permits a later cleanup attempt', async () => {
     const proc = new FakeProcess() as any
-    proc.provider = 'dsh'
-    proc.sessionId = 'dsh-session-1'
-    proc.lastAssistantUuid = null
-    proc.lastCompletedTurnId = 'dsh-event-7'
-    const handle = collectAgentTurn(proc, 'do work', {}, () => {})
+    const kill = spyOn(proc, 'kill').mockRejectedValue(new Error('process termination not confirmed'))
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    const failure = handle.done.catch(error => error)
+    try {
+      await expect(handle.cancel('stop')).rejects.toThrow('process termination not confirmed')
+      expect((await failure).message).toContain('process termination not confirmed')
+      expect(handle.isAlive?.()).toBe(true)
+      expect(() => proc.emit('error', new Error('process remains alive'))).not.toThrow()
+    } finally {
+      kill.mockRestore()
+      await handle.cancel('retry stop')
+    }
+    expect(handle.isAlive?.()).toBe(false)
+    expect(proc.listenerCount('error')).toBe(0)
+  })
+
+  test('a failed task preserves the output produced before the error', async () => {
+    const proc = new FakeProcess() as any
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    proc.emit('assistant_text', { text: '已完成的调查结果' })
+    proc.emit('result', { is_error: true, error: 'upstream request failed' })
+    const error = await handle.done.catch(error => error)
+    expect(error).toBeInstanceOf(AgentWorkerFailure)
+    expect(error.name).toBe('AgentWorkerFailure')
+    expect(error.message).toBe('upstream request failed')
+    expect(error.output).toBe('已完成的调查结果')
+    expect(error.sessionId).toBe('sid-1')
+  })
+
+  test('cancel preserves output produced before cancellation', async () => {
+    const proc = new FakeProcess() as any
+    const handle = collectAgentTurn(proc, 'cancel late', {}, () => {})
+    proc.emit('assistant_text', { text: '部分结果', parentToolUseId: null })
+    const cancelling = handle.cancel('stop now')
+    const failure = await handle.done.then(() => null, error => error)
+    expect(failure).toBeInstanceOf(AgentWorkerFailure)
+    expect(failure.message).toBe('stop now')
+    expect(failure.output).toBe('部分结果')
+    await cancelling
+  })
+
+  test('handle exposes isAlive for cancel-after-settle decisions', async () => {
+    const proc = new FakeProcess() as any
+    const handle = collectAgentTurn(proc, 'alive', {}, () => {})
+    expect(handle.isAlive?.()).toBe(true)
     proc.emit('result', { is_error: false })
-    await expect(handle.done).resolves.toMatchObject({ checkpointId: 'dsh-event-7' })
+    await handle.done
+    expect(handle.isAlive?.()).toBe(false)
   })
 
   test('rejects unsupported effort before launch', () => {
+    registerTokenSource({
+      id: 'claude:fable', kind: 'api-test', agent: 'claude', display: 'A', enabled: true,
+      models: [], defaultModel: 'claude:fable',
+      refreshModels: async () => {},
+      spawnEnv: (env: Record<string, string | undefined>) => env,
+      resolveSpawnModel: (model: string) => model,
+      readUsage: async () => ({ state: 'ok', kind: 'balance', windows: [], balance: null, fetchedAt: 0 }),
+    } as any)
     expect(() => startAgentWorker({
       identity: {
         id: 'agent:a',
@@ -204,4 +314,27 @@ describe('agent session registry', () => {
     expect(isAgentSession('claude', 'sid-codex')).toBe(false)
     expect(() => rememberAgentSession('claude', '  ')).toThrow(/session id is empty/)
   })
+})
+
+test('native resume rejects a backend that silently creates a different conversation', async () => {
+  const proc = new FakeProcess() as any
+  proc.sessionId = 'unexpected-new-session'
+  const remembered: string[] = []
+  const handle = collectAgentTurn(proc, 'continue', {}, (_provider, id) => { remembered.push(id) }, 'original-session')
+  proc.emit('init', { session_id: proc.sessionId })
+  await expect(handle.done).rejects.toThrow('native resume returned session unexpected-new-session, expected original-session')
+  expect(proc.isAlive()).toBe(false)
+  expect(remembered).toContain('unexpected-new-session')
+})
+
+test('native resume preserves the original history classification of an external conversation', async () => {
+  const proc = new FakeProcess() as any
+  proc.sessionId = 'external-session'
+  const classified: string[] = []
+  const handle = collectAgentTurn(proc, 'continue', {}, (_provider, id) => { classified.push(id) }, 'external-session')
+  proc.emit('init', { session_id: proc.sessionId })
+  proc.emit('assistant_text', { text: 'restored' })
+  proc.emit('result', { is_error: false })
+  await expect(handle.done).resolves.toMatchObject({ sessionId: 'external-session', output: 'restored' })
+  expect(classified).toEqual([])
 })

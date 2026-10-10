@@ -4,13 +4,18 @@
 
 # 夜航星 (Lodestar)
 
-AI 不是帮手,是倍率。它放大的不是体力,是你 —— 你的直觉、判断和品味,每一样都被乘以一个你以前不敢想的系数。
+AI 不是帮手，是倍率。它放大的不是体力，是你 —— 你的直觉、判断和品味，每一样都被乘以一个你以前不敢想的系数。
 
-夜航星让这件事真正发生:在你思考的地方接住想法,在你转身之后继续推向终点。
+夜航星让这件事真正发生：在你思考的地方接住想法，在你转身之后继续推向终点。
 
 ---
 
-## 🚀 用起来
+## 项目特色
+
+- **发条消息，就能开工**：在飞书里把任务交给 Codex、Claude Code 或 DeepSeek Harness，让 Agent 在你的项目里读代码、改文件、跑命令。
+- **一个群，一个项目**：工作目录和对话跟着项目走；手头几个项目来回切换，回到群里就能接着上次的思路继续。
+- **进展看得见，问题直接答**：回复、工具调用、图片和后台进展都在卡片里，需要你补充信息时，就在群里回答。
+- **趁手的模型，自己选**：Codex 订阅、Claude Code 订阅、GLM Coding Plan、DeepSeek、OpenRouter 和 Claude native 都能接入；在群里切换[账号、模型与推理档位](docs/models.md)，每个项目记住自己的选择。
 
 跨平台 (Windows / macOS / Linux),从源码构建后全局安装、由 Node.js 运行,需要 Node.js ≥ 18;构建需要 Bun。
 
@@ -53,6 +58,8 @@ effort     = "xhigh" # CatCodex 网关工具调用兼容参数
 
 [xAI 官方 reasoning 文档](https://docs.x.ai/developers/model-capabilities/text/reasoning)为 Grok 4.6 定义的 effort 是 `low` / `medium` / `high`(默认) / `xhigh`——`xhigh` 是 Grok 4.6 新增的官方最高档(4.5 只有 low/medium/high)。无痕路由经 Claude SDK 使用官方最高 `xhigh`；CatCodex 的 Anthropic 网关在实测中 `high` 下会返回纯文本、忽略工具调用，只有 `xhigh` 能稳定兑现 Claude Code 工具调用，因此该档位锁 `xhigh`(4.6 起与官方档恰好一致)。两路都设置 `thinking: disabled`，只避免附加 Claude 专属 adaptive-thinking 协议，不关闭 Grok 自身 reasoning。上游若失败，错误会原样显示，不会静默切到其它模型。旧 `[codex.models.grok*]` 不再进入模型面板，启动边界也会拒绝。
 
+## 快速开始
+
 **1. 装包**
 
 ```bash
@@ -79,17 +86,40 @@ npm i -g .
 lodestar-setup
 ```
 
-手把手带你装 Claude Code、可选配 GLM Coding Plan(1M 上下文)、建飞书应用、启动 lodestar。Codex 是可选第二后端。
+按向导完成配置，把机器人拉进以项目目录命名的群，发消息即可开始工作。[安装要求与详细配置](docs/configuration.md)
 
-> Claude 订阅(Pro/Max OAuth 登录)不支持本项目,需走 API 方式(GLM Coding Plan 或自备 Anthropic API key)。
+## 常用指令
 
-**3. 拉机器人进群**
+在群内直接发送，不加斜杠，大小写不敏感。
 
-群名 = `projects_root` 下的目录名(没建会自动建)。发条消息,默认由 Claude 接管(配了 GLM 就是 Claude·GLM,否则 Fable 5);群里发 `model` 可在四个档位间切换。
+群名 = `projects_root` 下的目录名(没建会自动建)。发条消息,默认由 Claude 接管(配了 GLM 就是 Claude·GLM,否则 Fable 5);群里发 `model` 可在固定档位间切换(Claude·Fable 5 / Opus 5 / GLM / GLM-5.3 Flash / Grok · Codex·GPT-5.6 Sol),按群持久化。
 
-群里发这些**裸词**(不要斜杠,大小写不敏感)可以控 daemon:
+| 完整指令 | 缩写 / 别名 | 作用 |
+| --- | --- | --- |
+| `hi` | — | 打开控制台，查看会话与额度 |
+| `model` | `md` | 选择账号、模型和推理档位 |
+| `kill` | `kl` | 关闭当前 Agent 进程，保留会话记录 |
 
-| 指令 | 行为 |
+完整指令、参数与会话分支说明见[群内使用指南](docs/usage.md)。
+
+## 附加能力
+
+- [多模型协作](docs/usage.md#多模型任务)：将任务交给一个或多个模型执行，支持并发协作与后续追问。
+- [飞书任务清单](docs/usage.md#飞书任务清单)：在项目群创建、绑定和删除任务清单。
+- [脚本通知](docs/usage.md#本机通知)：让本机脚本向群里推送通知，支持图片、交互按钮和文字回复。
+
+## 详细文档
+
+| 文档 | 内容 |
+| --- | --- |
+| [安装与配置](docs/configuration.md) | 安装要求、CLI、配置、自动更新与源码开发 |
+| [群内使用指南](docs/usage.md) | 完整命令、会话恢复、worktree、多模型任务、文件及通知 |
+| [账号与模型](docs/models.md) | 账号接入、模型选择、推理档位与额度 |
+| [后端与路由](docs/claude-agent-backend.md) | 运行机制、接口差异和维护说明 |
+
+## 群内指令一览
+
+| 指令 | 作用 |
 | --- | --- |
 | `hi` | 未运行时同一张卡动态启动并收束为控制台;运行中弹控制台 |
 | `stop` / `st` | 软打断当前 turn,子进程保活,排队消息打 ❌ |
@@ -192,7 +222,7 @@ daemon 为本地已配置的固定档位各生成一条 Agent 身份（`listToke
 
 `lodestar-agent` 只能在 Lodestar 管理的 Agent 进程内使用。本机 API 为 `GET /agents/identities`、`POST /agents/runs`、`GET|DELETE /agents/runs/<id>`、`POST /agents/runs/<id>/answer` 与 `POST /agents/runs/<id>/follow-up`，挂在既有 notify loopback 端口。
 
-**本 fork 相对上游 v0.16.3 的移植范围与排除项：** 收了完整 Agent 委派（经 slim 适配层）、入站视频转发当前群 agent、委派 Skill 禁止自调用、实时 footer 单次失败不升群告警、300315 内嵌 200860 当容量换卡、容量失败 replace 标 dead 以便换卡带走最新结果、`mathjax-full` bundleDependencies、版本号对齐 0.16.3。明确不收 / 不恢复：上游 `[token_source.*]` registry、动态模型目录 / `waitForTokenSourceModelRefresh`、`reviewers` / `lodestar-consult` / 只读 reviewer、effort/GPT-5.6 档位调整、codex 额度归属架构、GitHub Release 中文约束。也不收 CI/typecheck/deps/`--packages=external` 发布链路改造、init-wait/stop barrier 回补、cardkit 测试期真实出网拦截、SDK 升到 0.3.251；SDK 仍钉 `@anthropic-ai/claude-agent-sdk` 0.3.222。
+**本 fork 相对上游 v0.20.5 的移植范围与排除项：** 收了完整 Agent 委派（经 slim 适配层）、入站视频转发当前群 agent、委派 Skill 禁止自调用、实时 footer 单次失败不升群告警、300315 内嵌 200860 当容量换卡、容量失败 replace 标 dead 以便换卡带走最新结果、`mathjax-full` bundleDependencies、版本号对齐 0.20.5。明确不收 / 不恢复：上游 `[token_source.*]` registry、动态模型目录 / `waitForTokenSourceModelRefresh`、`reviewers` / `lodestar-consult` / 只读 reviewer、effort/GPT-5.6 档位调整、codex 额度归属架构、GitHub Release 中文约束。也不收 CI/typecheck/deps/`--packages=external` 发布链路改造、init-wait/stop barrier 回补、cardkit 测试期真实出网拦截、SDK 升到 0.3.251；SDK 仍钉 `@anthropic-ai/claude-agent-sdk` 0.3.222。
 
 ### 📋 飞书任务清单自动化（预览版）
 

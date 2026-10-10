@@ -22,20 +22,20 @@ function countActionElements(node: unknown): number {
 }
 
 test('writeBodyFromToolInput:Write 取 content', () => {
-  expect(writeBodyFromToolInput('Write', { file_path: '/a', content: 'hello' })).toBe('hello')
+  expect(writeBodyFromToolInput({ file_path: '/a', content: 'hello' })).toBe('hello')
 })
 
 test('writeBodyFromToolInput:Edit 取 new_string', () => {
-  expect(writeBodyFromToolInput('Edit', { file_path: '/a', old_string: 'x', new_string: 'y' })).toBe('y')
+  expect(writeBodyFromToolInput({ file_path: '/a', old_string: 'x', new_string: 'y' })).toBe('y')
 })
 
 test('writeBodyFromToolInput:MultiEdit 拼接所有 new_string', () => {
-  expect(writeBodyFromToolInput('MultiEdit', { edits: [{ new_string: 'a' }, { new_string: 'b' }] })).toBe('a\n---\nb')
+  expect(writeBodyFromToolInput({ edits: [{ new_string: 'a' }, { new_string: 'b' }] })).toBe('a\n---\nb')
 })
 
 test('writeBodyFromToolInput:无可识别字段返回空串', () => {
-  expect(writeBodyFromToolInput('Write', { file_path: '/a' })).toBe('')
-  expect(writeBodyFromToolInput('Write', null as any)).toBe('')
+  expect(writeBodyFromToolInput({ file_path: '/a' })).toBe('')
+  expect(writeBodyFromToolInput(null as any)).toBe('')
 })
 
 // ── writeLogEntriesFromToolInput(上游 ff44afb:Claude 单条 + Codex FileChange 逐文件展开) ──
@@ -125,6 +125,14 @@ test('resumeListCard:按钮只带 panel/choice,并说明创建独立分支', () 
   expect(JSON.stringify(card)).toContain('创建独立对话分支')
   expect(JSON.stringify(card)).toContain('共享当前 cwd 和磁盘文件')
   expect(JSON.stringify(card)).not.toContain('sessionId')
+})
+
+test('selectionResultCard:终态卡不再包含 callback 按钮', () => {
+  const card = selectionResultCard({ title: '⏪ 会话回滚', message: '已回滚', ok: true }) as any
+  expect(card.config.update_multi).toBe(true)
+  expect(card.header.template).toBe('green')
+  expect(JSON.stringify(card)).toContain('已回滚')
+  expect(JSON.stringify(card)).not.toContain('callback')
 })
 
 test('writeLogCard:entries 拼成代码块,空则占位', () => {

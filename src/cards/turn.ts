@@ -10,6 +10,7 @@ import type { CodexUsage } from '../codex-process'
 import type { AgentProvider } from '../agent-process'
 import { contextPercentSummary, contextTokenRatioLabel } from '../context-window'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
+import { formatDuration } from './duration'
 
 /** 模型标签口径(上游 9020e11)。D-05 修正:只摘函数不接线,无生产调用者;
  * 若将来接到 footer,[1m] 剥离与本地 [1m] 记账展示的关系需另议(挂账)。 */
@@ -97,17 +98,6 @@ function planHeader(plan: TurnPlanStep[], draftText = ''): string {
   return `📋 计划更新 · ${planStats(plan)}`
 }
 
-function formatGoalTime(seconds: number): string {
-  if (!Number.isFinite(seconds) || seconds < 0) return 'MISS'
-  if (seconds < 60) return `${Math.round(seconds)}s`
-  const minutes = Math.floor(seconds / 60)
-  const rest = Math.round(seconds % 60)
-  if (minutes < 60) return rest ? `${minutes}m ${rest}s` : `${minutes}m`
-  const hours = Math.floor(minutes / 60)
-  const min = minutes % 60
-  return min ? `${hours}h ${min}m` : `${hours}h`
-}
-
 function numberValue(v: unknown): number | null {
   return typeof v === 'number' && Number.isFinite(v) ? v : null
 }
@@ -116,7 +106,7 @@ function compactionDurationLabel(data: Record<string, unknown>): string {
   const startedAt = numberValue(data.startedAtMs)
   const completedAt = numberValue(data.completedAtMs)
   if (startedAt == null || completedAt == null || completedAt < startedAt) return ''
-  return ` · 耗时 ${formatGoalTime((completedAt - startedAt) / 1000)}`
+  return ` · 耗时 ${formatDuration((completedAt - startedAt) / 1000)}`
 }
 
 function compactTokenLabel(value: unknown): string | null {
@@ -282,7 +272,7 @@ export function goalElement(goal: ThreadGoal, elementId: string): object {
     goal.objective,
     '',
     `- 用量: ${tokensUsed}${tokenBudget} tokens`,
-    `- 用时: ${formatGoalTime(goal.timeUsedSeconds)}`,
+    `- 用时: ${formatDuration(goal.timeUsedSeconds)}`,
   ]
   return {
     tag: 'collapsible_panel',
@@ -306,20 +296,20 @@ interface MainCardOpts {
   effort?: string
   /** What started this turn:
    *   'user_message'   — user input batch(panel "📥 收到 (N)" 渲染原文)
-   *   'card_full'      — 同一 Codex turn 的"续卡":前一张卡写满(element 数
-   *                     触顶 ~75)或写入被飞书拒,session rotate 出来的新卡
+   *   'card_full'      — 同一 turn 的续卡：前卡体积或组件数量超限后创建，
    *                     (banner `📨 接续上一张`,无 panel,turn 号跟旧卡
    *                     相同)
+   *   'user_steering'  — 同一任务收到补充消息后续卡，顶部显示补充内容
    *   'bg_task_resume' — 后台任务结算后 SDK 自发的恢复轮(无用户消息,
    *                     banner `🔁 后台任务完成`,无 panel)
    *   'watchdog_resume' — watchdog 自动恢复轮(固定恢复 banner,无用户
    *                       输入 panel)
    *   'scheduled_wakeup' — Claude SDK Cron 定时唤醒轮
    *                        (banner `⏰ 定时任务触发`,无 prompt panel) */
-  kind?: 'user_message' | 'card_full' | 'bg_task_resume' | 'watchdog_resume' | 'scheduled_wakeup'
+  kind?: 'user_message' | 'user_steering' | 'card_full' | 'bg_task_resume' | 'watchdog_resume' | 'scheduled_wakeup'
   /** 本轮 Codex 收到的 user wireText 列表。boot turn 通常是 1 条;mid-turn
-   * 用户连发的 N 条会在下一 turn 一并塞进。空数组 / undefined 时不渲染
-   * userInput panel。 */
+   * 用户连发的 N 条会在下一 turn 一并塞进。追加续卡(user_steering)只显示
+   * 本批补充消息。空数组 / undefined 时不渲染 userInput panel。 */
   userInputs?: string[]
   /** Initial stable footer text. Session replaces it with a live timer
    * after it has converted message_id → card_id, but this value is what
@@ -344,7 +334,7 @@ export function mainConversationCard(opts: MainCardOpts): object {
           ? [{ tag: 'markdown', content: `⏰ 定时任务触发，${providerLabel} 正在执行巡检 #${opts.turn}` }]
           : []
   const inputs = opts.kind === 'watchdog_resume' ? [] : (opts.userInputs ?? [])
-  const userInputHeader = `📥 收到 (${inputs.length}) ${opts.directStart ? '🚀' : `#${opts.turn}`}`
+  const userInputHeader = `📥 ${opts.kind === 'user_steering' ? '追加' : '收到'} (${inputs.length}) ${opts.directStart ? '🚀' : `#${opts.turn}`}`
   const userInputPanel = inputs.length > 0
     ? [{
         tag: 'collapsible_panel',
@@ -384,19 +374,6 @@ export function mainConversationCard(opts: MainCardOpts): object {
     },
   }
 }
-
-/** Empty assistant segment to be inserted just before the footer. */
-export function assistantSegmentElement(i: number): object {
-  return { tag: 'markdown', element_id: ELEMENTS.assistant(i), content: ' ' }
-}
-
-export {
-  summarizeToolInput,
-  toolCallElement,
-  readBatchElement,
-  editBatchElement,
-  toolCallPermissionElement,
-} from './tool'
 
 /** Schema of an AskUserQuestion question, projected to just the fields
  * the panel needs. Mirrors the SDK tool's input — kept loose since the

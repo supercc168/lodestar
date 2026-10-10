@@ -10,22 +10,26 @@
  * requests carry `{ id, method, params }` and expect a client response.
  */
 
-import { spawn, type ChildProcessByStdio } from 'node:child_process'
-import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync, writeFileSync } from 'node:fs'
+import type { ChildProcessByStdio } from 'node:child_process'
+import { closeSync, existsSync, mkdirSync, openSync, readdirSync, readSync, statSync, writeFileSync, type Dirent } from 'node:fs'
 import { homedir } from 'node:os'
 import { delimiter, isAbsolute, join } from 'node:path'
 import { StringDecoder } from 'node:string_decoder'
 import { EventEmitter } from 'node:events'
+import { randomUUID } from 'node:crypto'
 import type { Readable, Writable } from 'node:stream'
+import { spawn as crossSpawn } from 'cross-spawn'
 import { config } from './config'
 import { log } from './log'
+import { agentBin } from './agent-updates'
+import { prepareCodexInputPolicyCatalog, type CodexInputPolicyCatalog } from './codex-input-policy'
 import {
   contextCompactionNoticeFromMessage,
   contextCompactionNoticeFromNotification,
   logContextCompactionPayload,
   logUnhandledAppServerPayload,
 } from './codex-compaction'
-import { diffUsageTotals, effectiveTurnTokens, usageFromTokenUsagePayload } from './codex-usage'
+import { usageFromTokenUsagePayload } from './codex-usage'
 import type {
   AgentReasoningEffort,
   AgentTurnRetry,
@@ -33,6 +37,7 @@ import type {
   CollabAgentStates,
   UserTextDispatch,
 } from './agent-process'
+import { diagnosticIdLabel } from './session-util'
 import type {
   BgTaskSettledEvent,
   BgTaskStartedEvent,
@@ -46,6 +51,8 @@ import {
 } from './conversation'
 import { isAgentSession } from './agent-session-registry'
 import { subagentStepBrief } from './cards/background'
+import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
+import { isCodexQuotaError } from './codex-quota'
 
 /** 拼 `codex app-server` 命令行:把 provider 覆盖 `-c` 对插在 `--listen` 之前。
  *  `allowDelegation === false` 时额外插 `--disable multi_agent`(等价
@@ -61,7 +68,14 @@ export function buildCodexAppServerArgs(configArgs: string[] = [], allowDelegati
   ]
 }
 
+/** 上游托管运行时优先(agentBin,含版本校验);fork 的钉目录兜底 —— 本机没有
+ *  lodestar 托管 codex 时 agentBin 抛错(resolveCodexBin 不能再连带炸掉)。 */
 export function resolveCodexBin(): string {
+  try {
+    return agentBin('codex', 'codex')
+  } catch {
+    // fall through to the fork's pinned locations
+  }
   if (process.platform !== 'win32') {
     const pinned = join(homedir(), '.local', 'npm-global', 'bin', 'codex')
     if (existsSync(pinned)) return pinned
@@ -143,25 +157,40 @@ export function buildCodexSpawnEnv(
   return env
 }
 
-const CODEX_SESSIONS_DIR = join(homedir(), '.codex', 'sessions')
-const CODEX_GENERATED_IMAGES_DIR = join(homedir(), '.codex', 'generated_images')
+const CODEX_SESSIONS_DIR = join(codexAccounts.defaultHome, 'sessions')
+const CODEX_GENERATED_IMAGES_DIR = join(codexAccounts.defaultHome, 'generated_images')
 // app-server control requests return an acknowledgement, not the whole model
 // turn. Bound them so a live PID with a dead transport cannot leak promises.
 const CODEX_REQUEST_TIMEOUT_MS = 30_000
 // materialization 验证(4185808):thread/read 确认 rollout 落盘的专用短超时。
 const CODEX_MATERIALIZATION_VERIFY_TIMEOUT_MS = 10 * 60_000
+// ── 自动重试引擎(上游 2e6e1e0;fork 把容量变体并入 codexTurnRetryReason)──────
+const CODEX_TURN_RETRY_BASE_MS = 5_000
+const CODEX_TURN_RETRY_MAX_MS = 60_000
+const CODEX_TRANSIENT_RETRY_LIMIT = 3
+// The failed turn already contains the user's input and any completed work.
+// Continue that history instead of replaying the original task and file hints.
+const CODEX_TURN_CONTINUATIONS = {
+  capacity: '上一轮因模型暂时满载而中断。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。',
+  stream_disconnected: '上一轮因响应流连接中断而未完成。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。',
+  compact_connection_failed: '上一轮因远程压缩时连接失败而未完成。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。',
+  transient_error: '上一轮因临时连接或服务错误而未完成。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。',
+}
 
-// ── 模型满载自动重试(上游 2e6e1e0,进程层主导)────────────────────────
-const CAPACITY_RETRY_BASE_MS = 5_000
-const CAPACITY_RETRY_MAX_MS = 60_000
-// 失败的那一轮已包含用户输入与已完成工作;续作沿用它,不重放原始任务与文件提示。
-const CAPACITY_CONTINUATION = '上一轮因模型暂时满载而中断。请基于当前会话继续完成用户尚未完成的任务，沿用已有进度；执行操作前先确认结果，避免重复已完成的操作。'
+type CodexTurnRetryReason = keyof typeof CODEX_TURN_CONTINUATIONS
 
-/** 进程层容量判定(上游 2e6e1e0)。口径与 session.ts 的 isCodexCapacityError(分类面)
- *  对齐:严格正则之外还认 serverOverloaded / "at capacity"+"model" /
- *  please try a different model(02-REVIEW WR-03)—— session 自主重试环已删除,D-07 后
- *  进程层是唯一调度者,窄口径会让这些变体没有任何自动重试路径(相对基线是功能回退)。 */
-function isModelCapacityError(message: unknown): message is string {
+const CODEX_TRANSPORT_ERRORS = new Set([
+  'httpConnectionFailed', 'responseStreamConnectionFailed',
+  'responseStreamDisconnected', 'responseTooManyFailedAttempts',
+])
+const CODEX_TRANSIENT_HTTP_STATUSES = new Set([408, 500, 502, 503, 504])
+
+/** 进程层容量判定(上游 2e6e1e0 + fork WR-03 宽度)。口径与 session.ts 的
+ *  isCodexCapacityError(分类面)对齐:严格正则之外还认 serverOverloaded /
+ *  "at capacity"+"model" / please try a different model(02-REVIEW WR-03)——
+ *  session 自主重试环已删除,D-07 后进程层是唯一调度者,窄口径会让这些变体
+ *  没有任何自动重试路径(相对基线是功能回退)。 */
+function isModelCapacityError(message: unknown): boolean {
   if (typeof message !== 'string' || !message) return false
   const lower = message.toLowerCase()
   return /\bselected\s+model\s+is\s+at\s+capacity\b/.test(lower)
@@ -170,8 +199,64 @@ function isModelCapacityError(message: unknown): message is string {
     || lower.includes('please try a different model')
 }
 
+function codexTurnRetryReason(error: unknown, routingTimedOut = false): CodexTurnRetryReason | null {
+  if (!error || typeof error !== 'object') return null
+  const { message, codexErrorInfo, additionalDetails } = error as { message?: unknown; codexErrorInfo?: unknown; additionalDetails?: unknown }
+  if (typeof message !== 'string') return null
+  if (isCodexQuotaError(error)) return null
+  // fork 容量变体并轨(WR-03):上游原生只认 detail 层的 selected-model 文案;
+  // 这里把 fork 的宽口径容量判定整体前置为 capacity(serverOverloaded /
+  // "at capacity"+"model" / please try a different model 都由此接管)。
+  if (isModelCapacityError(message)) return 'capacity'
+
+  // Native network errors are tagged objects; tolerate legacy string tags,
+  // but never turn unknown future variants or malformed payloads into retries.
+  let kind: string | null = null
+  if (typeof codexErrorInfo === 'string') kind = codexErrorInfo
+  else if (codexErrorInfo != null) {
+    if (typeof codexErrorInfo !== 'object' || Array.isArray(codexErrorInfo)) return null
+    const entries = Object.entries(codexErrorInfo)
+    if (entries.length !== 1) return null
+    const [tag, details] = entries[0]!
+    kind = tag
+    if (!CODEX_TRANSPORT_ERRORS.has(kind) || !details || typeof details !== 'object' || Array.isArray(details)) return null
+    const status = (details as { httpStatusCode?: unknown }).httpStatusCode
+    if (status != null && (typeof status !== 'number' || !CODEX_TRANSIENT_HTTP_STATUSES.has(status))) return null
+  }
+  if (kind !== null && kind !== 'other' && kind !== 'serverOverloaded' && !CODEX_TRANSPORT_ERRORS.has(kind)) return null
+
+  const compact = /^(?:Codex\s+)?Error running remote compact task:\s*/i.test(message)
+  const detail = message.replace(/^(?:Codex\s+)?Error running remote compact task:\s*/i, '').replace(/^Codex\s+/i, '').trim()
+  // Details can veto retry but cannot on their own broaden the allowed errors.
+  // A generic transport tag must not override an explicit permanent diagnostic.
+  for (const diagnostic of [detail, additionalDetails]) {
+    if (typeof diagnostic !== 'string') continue
+    if (isCodexQuotaError({ message: diagnostic })
+      || /(?:^|:\s*)(?:unauthorized\b|forbidden\b|authentication failed\b|invalid (?:api key|request|argument)\b|(?:usage|rate|session budget) limit exceeded\b|context window exceeded\b)/i.test(diagnostic)) return null
+    const status = /(?:^|:\s*)unexpected status (\d{3})\b/i.exec(diagnostic)
+    if (status && !CODEX_TRANSIENT_HTTP_STATUSES.has(Number(status[1]))) return null
+  }
+  const renderedStatus = /(?:^|:\s*)unexpected status (\d{3})\b/i.exec(detail)
+  if (/\bselected\s+model\s+is\s+at\s+capacity\b/i.test(detail)) return 'capacity'
+
+  const knownConnectionFailure = /^Connection failed:\s*error sending request(?: for url \([^\r\n]+\))?\s*$/i.test(detail)
+    || /^(?:request timed out|workspace routing discovery timed out)$/i.test(detail)
+    // The generic discovery failure is ambiguous. Only a timeout observed in
+    // this same turn authorizes continuation; never borrow a prior turn's cause.
+    || (routingTimedOut && /^workspace routing discovery failed$/i.test(detail))
+  const streamDisconnected = /^stream disconnected before completion\s*:/i.test(detail)
+  if (CODEX_TRANSPORT_ERRORS.has(kind ?? '') || kind === 'serverOverloaded'
+    || knownConnectionFailure || streamDisconnected || renderedStatus) {
+    if (compact) return 'compact_connection_failed'
+    if (kind === 'responseStreamDisconnected' || streamDisconnected) return 'stream_disconnected'
+    return 'transient_error'
+  }
+  return null
+}
+
 export interface SpawnOpts {
   workDir: string
+  codexAccountId?: string
   /** Explicit backend conversation lifecycle. */
   launch?: ConversationLaunch
   model?: string
@@ -182,20 +267,66 @@ export interface SpawnOpts {
   configArgs?: string[]
   /** 叠加进 spawn env 的 provider 接入变量(装 api_key)。缺省 = 无注入。 */
   providerEnv?: Record<string, string>
-  /** Host-owned env (capability / agent URL) merged last so scrub cannot drop it. */
+  allowUserInput?: boolean
+  /** Host-owned environment injected before token-source credential routing. */
   hostEnv?: Record<string, string | undefined>
+  /** token source 注入:对 spawn env 做 scrub+inject(防 A 账号夹带 B 凭据)。未传 = 走 config 默认。 */
+  transformEnv?: (env: Record<string, string | undefined>) => Record<string, string | undefined>
+  /** 该进程 spawn 时绑定的 token source id;stopIdleMismatchedProcess 据此判跨 source 重启。 */
+  tokenSourceId?: string | null
   /** App-server conversation source label. Delegated agents use lodestar-agent
    * so their threads can be excluded from main rs/fk history. */
   serviceName?: string
+  /** API provider credentials are supplied through env; never bind a subscription account. */
+  apiProvider?: CodexApiProvider
   /** 原生工具层委派开关(D-11 口径 3):false 时 spawn 参数加 `--disable
    *  multi_agent`,threadParams 关 `features.multi_agent` —— 与 claude 的
    *  disallowedTools 同为「不靠提示词自觉」的硬约束。缺省 = 不限制。 */
   allowDelegation?: boolean
 }
 
-/** max / ultra 是 GPT-5.6 系新增的两档(高于 xhigh):max 延长思维链预算,
- * ultra 在模型内部做多智能体分解(Terminal-Bench 2.1 上 Sol ultra 91.9% vs
- * 标准 88.8%)。2026-07-09 在 codex-cli 0.142.5 + 无痕中转实测两档均跑通。 */
+export interface CodexApiProvider {
+  id: string
+  name: string
+  baseUrl: string
+  envKey: string
+}
+
+export function codexApiProviderArgs(provider: CodexApiProvider): string[] {
+  if (!/^[a-z][a-z0-9_-]*$/.test(provider.id) || ['openai', 'ollama', 'lmstudio'].includes(provider.id)) {
+    throw new Error('Codex API provider id 无效或属于保留名称')
+  }
+  if (!/^[A-Z][A-Z0-9_]*$/.test(provider.envKey)) throw new Error('Codex API key 环境变量名无效')
+  const prefix = `model_providers.${provider.id}`
+  const definition: Record<string, string | boolean> = {
+    name: provider.name, base_url: provider.baseUrl, env_key: provider.envKey,
+    wire_api: 'responses', requires_openai_auth: false, supports_websockets: false,
+  }
+  // Replace the provider definition as one value: local same-name auth/header settings must not leak in.
+  const table = `{${Object.entries(definition).map(([key, value]) => `${key}=${JSON.stringify(value)}`).join(',')}}`
+  return ['-c', `model_provider=${JSON.stringify(provider.id)}`, '-c', `${prefix}=${table}`,
+    // ChatGPT connectors require the subscription account; project MCP/skills remain native.
+    '-c', 'features.apps=false']
+}
+
+export function codexAppServerArgs(): string[] {
+  return ['app-server', '--listen', 'stdio://']
+}
+
+export function codexAppServerSpawnOptions(
+  workDir: string,
+  env: Record<string, string | undefined>,
+): {
+  cwd: string
+  stdio: ['pipe', 'pipe', 'pipe']
+  shell: false
+  env: Record<string, string | undefined>
+} {
+  return { cwd: workDir, stdio: ['pipe', 'pipe', 'pipe'], shell: false, env }
+}
+
+// gpt-5.6 起服务端新增 max(单 agent 最深推理)与 ultra(多 agent 并行编排,默认 4 agent);
+// per-model 实际支持集以 model/list 下发为准,这里只做全集枚举。
 export type CodexReasoningEffort = 'none' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'ultra'
 export interface CodexReasoningEffortOption {
   reasoningEffort: CodexReasoningEffort
@@ -345,6 +476,7 @@ export class CodexRpcResponseError extends Error {
     readonly requestId: string | number,
     readonly serverCode: number | null,
     readonly serverMessage: string,
+    readonly serverData?: unknown,
   ) {
     super(
       `codex app-server ${method} failed (id=${requestId}, code=${serverCode ?? 'MISS'}): ${serverMessage}`,
@@ -373,10 +505,15 @@ type ServerRequestState = {
   params: any
 }
 
+
 export class CodexProcess extends EventEmitter {
   readonly provider = 'codex' as const
+  readonly tokenSourceId: string | null
   readonly launchKind: ConversationLaunch['kind']
-  private proc: ChildProcessByStdio<Writable, Readable, Readable>
+  private proc: ChildProcessByStdio<Writable, Readable, Readable> | null = null
+  private startupPromise: Promise<void> | null = null
+  private inputPolicyAbort = new AbortController()
+  private inputPolicyCatalog: CodexInputPolicyCatalog | null = null
   private stdoutBuf = ''
   private stderrBuf = ''
   private requestCounter = 0
@@ -391,10 +528,11 @@ export class CodexProcess extends EventEmitter {
   private readonly exitPromise: Promise<void>
   private resolveExit!: () => void
   private opts: SpawnOpts
+  private usesCustomDefaultModeInstructions = false
   private readyPromise: Promise<void> | null = null
-  private catalogInitPromise: Promise<void> | null = null
+  private initializePromise: Promise<void> | null = null
   /** Fresh thread/start returns an id before Codex creates its rollout. A
-   * resume is already file-backed; a fresh thread becomes resumable only
+   * resume/fork is already file-backed; a fresh thread becomes resumable only
    * after the persisted turn/started notification arrives. */
   private conversationResumable = false
   /** Exact rollout path returned by app-server for this thread. This is the
@@ -412,12 +550,16 @@ export class CodexProcess extends EventEmitter {
   /** 已终结 turn 的有界记忆:迟到的重复 turn/completed 不得改写已定的终态
    *  (上游 2e6e1e0;本地 Object.create 探针不跑字段初始化器,按上游取懒初始化)。 */
   private finishedTurnIds = new Set<string>()
-  // ── 模型满载退避状态(上游 2e6e1e0)──────────────────────────────
-  private capacityRetryTimer: ReturnType<typeof setTimeout> | null = null
-  private capacityRetryCount = 0
-  private capacityRetryHasStarted = false
-  private capacityRetryEnabled = true
+  private steeringInputs = new Map<string, string>()
+  private inputConsumptionOpen = false
+  // ── 自动重试状态(上游 2e6e1e0 引擎;capacity 无限续作,transient 共享预算)──
+  private turnRetryTimer: ReturnType<typeof setTimeout> | null = null
+  private turnRetryCount = 0
+  private transientRetryCount = 0
+  private turnRetryHasStarted = false
+  private turnRetryEnabled = true
   private turnError: { turnId: string; error: any } | null = null
+  private routingTimeoutTurnId: string | null = null
   private rolloutFilePath: string | null = null
   private rolloutReadOffset = 0
   private rolloutLineRemainder = ''
@@ -461,19 +603,61 @@ export class CodexProcess extends EventEmitter {
     this.on('error', () => {})
     this.exitPromise = new Promise(resolve => { this.resolveExit = resolve })
     this.opts = opts
-    this.launchKind = opts.launch?.kind ?? 'fresh'
+    this.tokenSourceId = opts.tokenSourceId ?? null
+    this.launchKind = (opts.launch ?? { kind: 'fresh' }).kind
     const codexBin = resolveCodexBin()
-    const args = buildCodexAppServerArgs(opts.configArgs, opts.allowDelegation)
-    log(`codex-process: spawn ${codexBin} app-server (cwd=${opts.workDir})`)
-    this.proc = spawn(codexBin, args, {
-      cwd: opts.workDir,
-      stdio: ['pipe', 'pipe', 'pipe'],
-      shell: process.platform === 'win32',
-      env: buildCodexSpawnEnv(opts.providerEnv, opts.hostEnv),
-    }) as ChildProcessByStdio<Writable, Readable, Readable>
+    const providerArgs = opts.apiProvider ? codexApiProviderArgs(opts.apiProvider)
+      : [...(opts.tokenSourceId === 'codex-sub' ? ['-c', 'model_provider="openai"'] : []),
+        ...codexAccounts.cliArgs(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)]
+    const baseEnv = buildCodexSpawnEnv(opts.providerEnv, opts.hostEnv)
+    const routedEnv = opts.transformEnv ? opts.transformEnv(baseEnv) : baseEnv
+    const spawnEnv = opts.apiProvider
+      ? { ...routedEnv, CODEX_HOME: codexAccounts.defaultHome }
+      : codexAccounts.env(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT, routedEnv)
+    const start = (catalog?: CodexInputPolicyCatalog) => {
+      if (this.expectedExit) throw new Error('Codex startup cancelled')
+      this.inputPolicyCatalog = catalog ?? null
+      // fork 注入面(configArgs + D-11 --disable multi_agent)与上游 provider/
+      // catalog 覆盖合流:统一插在 --listen 之前。
+      const args = buildCodexAppServerArgs(opts.configArgs, opts.allowDelegation)
+      const listenAt = args.indexOf('--listen')
+      this.spawnNative(codexBin, [...args.slice(0, listenAt), ...providerArgs,
+        ...(catalog ? ['-c', `model_catalog_json=${JSON.stringify(catalog.path)}`,
+          ...catalog.disabledFeatures.flatMap(feature => ['--disable', feature])] : []),
+        ...args.slice(listenAt)], spawnEnv)
+    }
+    if (opts.allowUserInput === false) {
+      this.startupPromise = prepareCodexInputPolicyCatalog({ binary: codexBin, configArgs: providerArgs,
+        env: spawnEnv, workDir: opts.workDir, signal: this.inputPolicyAbort.signal,
+      }).then(async catalog => {
+        if (this.expectedExit) { await catalog.dispose(); throw new Error('Codex startup cancelled') }
+        start(catalog)
+      }).catch(error => {
+        this.alive = false
+        this.emit('error', error instanceof Error ? error : new Error(String(error)))
+        this.emitProcessExit(this.expectedExit ? null : 1, this.expectedExit ? 'SIGTERM' : null)
+        throw error
+      })
+      void this.startupPromise.catch(() => {}) // initialization observes the original failure
+    } else start()
+    if (!opts.apiProvider) bindProcessCodexAccount(this, opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)
+  }
+
+  private spawnNative(binary: string, args: string[], env: Record<string, string | undefined>): void {
+    log(`codex-process: spawn ${binary} app-server (cwd=${this.opts.workDir})`)
+    // cross-spawn resolves Windows .cmd shims without `shell:true`; keeping an
+    // argv vector preserves quoted TOML values passed through --config.
+    this.proc = crossSpawn(
+      binary,
+      args,
+      codexAppServerSpawnOptions(this.opts.workDir, env),
+    ) as ChildProcessByStdio<Writable, Readable, Readable>
 
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))
     this.proc.stderr.on('data', (chunk: Buffer) => this.onStderr(chunk))
+    // per-write 契约(4185808):stdin error 只经 ensureStdinErrorListener 挂一次,
+    // 幂等;write() 前的兜底挂载由该函数统一负责。
+    this.ensureStdinErrorListener()
     this.proc.on('exit', (code, signal) => this.handleChildExit(code, signal))
     this.proc.on('close', (code, signal) => this.handleChildClose(code, signal))
     this.proc.on('error', err => this.handleChildProcessError(err))
@@ -495,7 +679,7 @@ export class CodexProcess extends EventEmitter {
       return
     }
     this.alive = false
-    this.cancelCapacityRetry()
+    this.cancelTurnRetry()
     this.childExitCode = code
     this.childExitSignal = signal
     // Do not reject pending RPCs here: Node's `exit` precedes stdio `close`,
@@ -506,7 +690,7 @@ export class CodexProcess extends EventEmitter {
 
   private handleChildClose(code: number | null, signal: NodeJS.Signals | null): void {
     this.alive = false
-    this.cancelCapacityRetry()
+    this.cancelTurnRetry()
     this.flushStdoutTail()
     this.flushStderrTail()
     const finalCode = code ?? this.childExitCode
@@ -526,7 +710,7 @@ export class CodexProcess extends EventEmitter {
     if (materializationBarrier) {
       // A tail thread/read response resolves its Promise in flushStdoutTail,
       // but the verification/materialized continuations run as microtasks.
-      // Delay public exit so Session can commit deferred state before its
+      // Delay public exit so Session can commit deferred anchors before its
       // exit handler drops process-owned pending state.
       void materializationBarrier.then(
         () => this.emitProcessExit(finalCode, finalSignal),
@@ -547,11 +731,11 @@ export class CodexProcess extends EventEmitter {
     // would make Session's precise cleanup block forever on an OS process that
     // never existed. Other ChildProcess errors may still have a real PID and
     // must keep the ordinary exit/kill confirmation path.
-    const spawnFailed = typeof this.proc.pid !== 'number'
+    const spawnFailed = typeof this.proc?.pid !== 'number'
     let terminalized = false
     if (spawnFailed && this.alive) {
       this.alive = false
-      this.cancelCapacityRetry()
+      this.cancelTurnRetry()
       this.serverRequests.clear()
       terminalized = true
     }
@@ -647,6 +831,7 @@ export class CodexProcess extends EventEmitter {
           msg.id,
           serverCode,
           serverMessage,
+          msg.error?.data,
         ))
       } else {
         pending.resolve(msg.result)
@@ -725,6 +910,8 @@ export class CodexProcess extends EventEmitter {
         const settings = params.threadSettings
         if (typeof settings?.model === 'string') this.lastModel = settings.model
         if (isCodexReasoningEffort(settings?.effort)) this.lastEffort = settings.effort
+        if (settings?.collaborationMode) this.usesCustomDefaultModeInstructions = settings.collaborationMode.mode === 'default'
+          && typeof settings.collaborationMode.settings?.developer_instructions === 'string'
         return
       }
       case 'thread/tokenUsage/updated': {
@@ -758,6 +945,13 @@ export class CodexProcess extends EventEmitter {
           log(`codex-process: ignore turn/started with empty turn id thread=${threadId ?? '-'}`)
           return
         }
+        // 迟到/重复 turn/started(上游 recordTurnStarted 的 finishedTurnIds 守卫):
+        // 已终结的 turn id 不得再次夺取轮属主(否则下一轮真实 turn/started 会被
+        // 冲突守卫误拒,整个逻辑任务悬挂)。
+        if (this.finishedTurnIds?.has(turnId)) {
+          log(`codex-process: ignore turn/started for finished turn=${turnId}`)
+          return
+        }
         if (this.currentTurnId && this.currentTurnId !== turnId) {
           log(`codex-process: ignore conflicting turn/started thread=${threadId ?? '-'} turn=${turnId} current=${this.currentTurnId}`)
           return
@@ -775,13 +969,13 @@ export class CodexProcess extends EventEmitter {
         this.currentTurnId = turnId
         // 清空点(ff44afb):新 turn 开始,上一轮 checkpoint 不得跨入进行中的新轮。
         this.lastCompletedTurnId = null
-        // 满载重试轮:本轮是同一逻辑任务的续作(上游 2e6e1e0 的 retry 标志);
+        // 重试轮:本轮是同一逻辑任务的续作(上游 2e6e1e0 的 retry 标志);
         // 计时器若还在(native continuation 抢先)就地转为 retrying 并收口。
-        const retrying = this.capacityRetryHasStarted && this.capacityRetryCount > 0
-        this.capacityRetryHasStarted = true
-        if (this.capacityRetryTimer && this.turnRetry) {
+        const retrying = this.turnRetryHasStarted && this.turnRetryCount > 0
+        this.turnRetryHasStarted = true
+        if (this.turnRetryTimer && this.turnRetry) {
           const retry = { ...this.turnRetry, phase: 'retrying' as const, delayMs: 0 }
-          this.cancelCapacityRetry()
+          this.cancelTurnRetry()
           this.emit('turn_retry', retry)
         }
         this.turnRetry = null
@@ -825,8 +1019,16 @@ export class CodexProcess extends EventEmitter {
         this.markConversationMaterialized('turn/completed notification')
         const status = turn.status
         const completedTurnId = turnId
-        const error = turn.error ?? (status === 'failed' && this.turnError && this.turnError.turnId === completedTurnId
-          ? this.turnError.error : null)
+        const notifiedError = status === 'failed' && this.turnError && this.turnError.turnId === completedTurnId
+          ? this.turnError.error : null
+        const error = turn.error && notifiedError && typeof turn.error.message === 'string'
+          && turn.error.message === notifiedError.message
+          ? {
+              ...notifiedError, ...turn.error,
+              codexErrorInfo: turn.error.codexErrorInfo ?? notifiedError.codexErrorInfo,
+              additionalDetails: turn.error.additionalDetails ?? notifiedError.additionalDetails,
+            }
+          : turn.error ?? notifiedError
         this.turnError = null
         const isError = status === 'failed' || !!error
         const isCheckpointable = status === 'completed' && !isError && !!completedTurnId
@@ -834,20 +1036,25 @@ export class CodexProcess extends EventEmitter {
         // interrupted, or malformed terminal notification.
         this.lastCompletedTurnId = isCheckpointable ? completedTurnId : null
         this.currentTurnId = null
+        this.inputConsumptionOpen = false
         if (delivery?.interrupted) {
           if (this.pendingTurnStart === delivery) this.pendingTurnStart = null
           return
         }
-        // 模型满载:本轮保持未终结 —— 不写 lastResult、不发 result,转入进程层退避。
-        // delivery 已在上面按 ack 结算(交付契约不悬挂);重试轮自带新 delivery。
-        if (status === 'failed' && completedTurnId && isModelCapacityError(error?.message)
-          && this.scheduleCapacityRetry(error.message, CAPACITY_CONTINUATION)) {
+        // 模型满载/瞬时故障:本轮保持未终结 —— 不写 lastResult、不发 result,转入
+        // 进程层统一退避(上游 2e6e1e0 引擎;容量变体并入 codexTurnRetryReason)。
+        // delivery 已按 ack 结算(交付契约不悬挂);重试轮自带新 delivery。
+        const retryReason = codexTurnRetryReason(error, !!completedTurnId && this.routingTimeoutTurnId === completedTurnId)
+        this.routingTimeoutTurnId = null
+        if (status === 'failed' && completedTurnId && retryReason
+          && this.scheduleTurnRetry(error.message, CODEX_TURN_CONTINUATIONS[retryReason], retryReason)) {
           if (delivery && this.pendingTurnStart === delivery) this.pendingTurnStart = null
           return
         }
-        this.cancelCapacityRetry()
-        this.capacityRetryCount = 0
-        this.capacityRetryHasStarted = false
+        this.cancelTurnRetry()
+        this.turnRetryCount = 0
+        this.transientRetryCount = 0
+        this.turnRetryHasStarted = false
         const subtype = isError ? (error?.type ?? error?.message ?? 'failed') : 'success'
         this.lastResult = {
           cost_usd: null,
@@ -858,9 +1065,15 @@ export class CodexProcess extends EventEmitter {
           subtype,
           is_error: isError,
         }
+        for (const [inputId, turnId] of this.steeringInputs ?? []) {
+          if (turnId === completedTurnId) this.steeringInputs.delete(inputId)
+        }
         this.emit('result', {
           subtype,
           is_error: isError,
+          ...(isError && typeof error?.message === 'string' ? { error: error.message } : {}),
+          ...(status === 'failed' && completedTurnId && isCodexQuotaError(error)
+            ? { codexQuotaFailure: { accepted: true } } : {}),
           duration_ms: this.lastResult.duration_ms,
           usage: this.lastUsage,
           ...(delivery
@@ -869,7 +1082,7 @@ export class CodexProcess extends EventEmitter {
                 thread_id: delivery.threadId,
                 turn_id: turnId ?? delivery.turnId,
               }
-            : {}),
+            : { turn_id: completedTurnId }),
           checkpoint: isCheckpointable && this.sessionId
             ? {
                 provider: 'codex',
@@ -900,6 +1113,10 @@ export class CodexProcess extends EventEmitter {
       }
       case 'thread/goal/cleared': {
         this.emit('thread_goal_cleared', params)
+        return
+      }
+      case 'thread/status/changed': {
+        this.handleThreadStatusChanged(params)
         return
       }
       case 'item/agentMessage/delta': {
@@ -942,32 +1159,38 @@ export class CodexProcess extends EventEmitter {
         const nestedMessage = nested && typeof nested === 'object' && typeof nested.message === 'string'
           ? nested.message
           : null
+        const error = nested ?? params
         // 记下本轮的原始 error:turn/completed 可能只带 status=failed 而不重复
-        // error 文本(上游 2e6e1e0)。仅认本进程主线程、当前或待确认的 turn。
+        // error 文本(上游 2e6e1e0);willRetry 且为 workspace routing 超时则登记
+        // routingTimeoutTurnId,仅放行同轮的 discovery 续作。
         const errorOwner = typeof params?.turnId === 'string'
           && params.threadId === this.sessionId
+          && !this.finishedTurnIds?.has(params.turnId)
           && (!this.pendingTurnStart?.turnId || this.pendingTurnStart.turnId === params.turnId)
           && (!this.currentTurnId || this.currentTurnId === params.turnId)
-        if (errorOwner) this.turnError = { turnId: params.turnId, error: nested ?? params }
+        if (errorOwner) {
+          this.turnError = { turnId: params.turnId, error }
+          if (params.willRetry === true && [error.message, error.additionalDetails]
+            .some(value => typeof value === 'string' && /^workspace routing discovery timed out$/i.test(value.trim())
+              && codexTurnRetryReason({ ...error, message: value,
+                additionalDetails: value === error.additionalDetails ? error.message : error.additionalDetails }) !== null)) {
+            this.routingTimeoutTurnId = params.turnId
+          }
+        }
         // Even willRetry=false precedes turn/completed. Never start a competing
         // turn here, particularly while app-server is doing its own retries.
         const message = nestedMessage
           ?? (typeof params?.message === 'string' ? params.message : null)
           ?? (typeof params?.summary === 'string' ? params.summary : null)
+          ?? (typeof error.message === 'string' ? error.message : null)
+          ?? (typeof error.summary === 'string' ? error.summary : null)
           ?? 'codex app-server error'
         this.emit('error', new Error(message))
         return
       }
-      // 子线程生命周期信号(cf41941):sessionId 未落地前(极早期)子线程不被
-      // isForeignThread 拦截,以及主线程自身的状态变化都会走到这里 —— 统一交
-      // handleThreadStatusChanged(只认已 spawn 的子 agent,其余 no-op)。
-      // 原在下方高频静默 raw 名单(9aa98cf),移出改道后不再 emit raw。
-      case 'thread/status/changed': {
-        this.handleThreadStatusChanged(params)
-        return
-      }
       // 高频无消费通知:静默不落日志(曾占 launchd.err.log 3.3GB 的 96%)。
       // 事件流照常分发(raw 无监听时为零成本),仅不再逐条打 payload。
+      // (thread/status/changed 已在上方改道 handleThreadStatusChanged。)
       case 'item/commandExecution/outputDelta':
       case 'hook/started':
       case 'hook/completed':
@@ -1007,15 +1230,29 @@ export class CodexProcess extends EventEmitter {
       // 状态机同时翻译出 bg_task_*(游标卡)。
       const activity = mapSubAgentActivity(item)
       if (activity) this.emit('subagent_activity', activity)
-      this.feedCollabItem(item, 'started', params)
+      this.feedCollabItem(item, 'started')
       return
     }
     if (!item?.id) {
       logUnhandledAppServerPayload('ITEM_STARTED_MISSING_ID', { method: 'item/started', params })
       return
     }
+    if (item.type === 'userMessage') {
+      const inputId = item.clientId
+      if (typeof inputId === 'string' && params.threadId === this.sessionId
+        && this.steeringInputs?.get(inputId) === params.turnId) {
+        this.steeringInputs.delete(inputId)
+        this.inputConsumptionOpen = true
+        this.emit('user_input_consumed', { inputId })
+      }
+      return
+    }
+    if (this.inputConsumptionOpen && params.turnId === this.currentTurnId) {
+      this.inputConsumptionOpen = false
+      this.emit('input_batch_end', { itemId: item.id })
+    }
     // 多 agent 编排 item 不走通用 tool_use 映射,先喂给 collab 状态机。
-    if (this.feedCollabItem(item, 'started', params)) return
+    if (this.feedCollabItem(item, 'started')) return
     const mapped = mapStartedItem(item, this.opts.workDir)
     if (!mapped) {
       logUnhandledAppServerPayload('ITEM_STARTED_UNMAPPED', { method: 'item/started', params })
@@ -1029,7 +1266,7 @@ export class CodexProcess extends EventEmitter {
   private handleSubagentItemStarted(params: any): void {
     const item = params?.item
     if (!item?.id) return
-    if (this.feedCollabItem(item, 'started', params)) return
+    if (this.feedCollabItem(item, 'started')) return
     this.emitSubagentStep(item, 'started', params)
   }
 
@@ -1047,7 +1284,7 @@ export class CodexProcess extends EventEmitter {
       }
       return
     }
-    if (this.feedCollabItem(item, 'completed', params)) return
+    if (this.feedCollabItem(item, 'completed')) return
     this.emitSubagentStep(item, 'completed', params)
   }
 
@@ -1057,7 +1294,7 @@ export class CodexProcess extends EventEmitter {
       // 双通路(RESEARCH #12):同 handleItemStarted —— 观测 emit + 状态机。
       const activity = mapSubAgentActivity(item)
       if (activity) this.emit('subagent_activity', activity)
-      this.feedCollabItem(item, 'completed', params)
+      this.feedCollabItem(item, 'completed')
       return
     }
     const isCollabAgentToolCall = item?.type === 'collabAgentToolCall'
@@ -1065,6 +1302,7 @@ export class CodexProcess extends EventEmitter {
       logUnhandledAppServerPayload('ITEM_COMPLETED_MISSING_ID', { method: 'item/completed', params })
       return
     }
+    if (item.type === 'userMessage') return
     if (item.type === 'agentMessage') {
       this.lastAssistantUuid = item.id
       this.emit('assistant_block_stop', { index: item.id, parentToolUseId: null })
@@ -1086,7 +1324,7 @@ export class CodexProcess extends EventEmitter {
     }
     // timeline 压缩(cf41941):collabAgentToolCall 由状态机消费,不再走
     // mapCompletedItem 炸 agentsStates JSON 面板(spawn 摘要面板在状态机内产出)。
-    if (this.feedCollabItem(item, 'completed', params)) return
+    if (this.feedCollabItem(item, 'completed')) return
     const mapped = mapCompletedItem(item, this.opts.workDir, this.sessionId ?? undefined)
     if (!mapped) {
       logUnhandledAppServerPayload('ITEM_COMPLETED_UNMAPPED', { method: 'item/completed', params })
@@ -1096,6 +1334,7 @@ export class CodexProcess extends EventEmitter {
       tool_use_id: item.id,
       content: mapped.output,
       is_error: mapped.isError,
+      ...(item.type === 'imageGeneration' ? { input: imageGenerationInput(item) } : {}),
     })
     if (item.type === 'imageGeneration') this.emittedImageGenerationIds.add(item.id)
   }
@@ -1134,7 +1373,7 @@ export class CodexProcess extends EventEmitter {
         this.emit('bg_task_started', {
           task_id: threadId,
           task_type: 'local_agent',
-          description: this.collabAgentNames.get(threadId) ?? threadId.slice(0, 8),
+          description: this.collabAgentNames.get(threadId) ?? diagnosticIdLabel(threadId),
         } satisfies BgTaskStartedEvent)
         this.emit('bg_task_updated', {
           task_id: threadId,
@@ -1182,7 +1421,7 @@ export class CodexProcess extends EventEmitter {
     })
   }
 
-  private feedCollabItem(item: any, phase: 'started' | 'completed', params?: any): boolean {
+  private feedCollabItem(item: any, phase: 'started' | 'completed'): boolean {
     if (item.type === 'subAgentActivity') {
       const threadId = typeof item.agentThreadId === 'string' ? item.agentThreadId : ''
       if (!threadId) return true // 吞掉,不进通用映射也不进 UNHANDLED 噪音
@@ -1448,10 +1687,7 @@ export class CodexProcess extends EventEmitter {
     this.emit('tool_use', {
       id: callId,
       name: 'ImageGeneration',
-      input: {
-        status,
-        revisedPrompt: imageGenerationRevisedPrompt(payload),
-      },
+      input: imageGenerationInput({ ...payload, status }),
     })
     this.emit('tool_result', {
       tool_use_id: callId,
@@ -1549,8 +1785,8 @@ export class CodexProcess extends EventEmitter {
 
   private ensureStdinErrorListener(): void {
     if (this.stdinErrorListenerAttached) return
-    const stdin = this.proc.stdin as Writable & { on?: Writable['on'] }
-    if (typeof stdin.on !== 'function') return
+    const stdin = this.proc?.stdin as (Writable & { on?: Writable['on'] }) | undefined
+    if (!stdin || typeof stdin.on !== 'function') return
     this.stdinErrorListenerAttached = true
     // 4185808 收紧:stdin error 不再连坐整张 pending 表 —— 各写各拒
     // (per-write 回调),已注册请求交给 close drain / 30s 超时兜底。
@@ -1563,7 +1799,7 @@ export class CodexProcess extends EventEmitter {
       log(`codex-process: write to dead process: ${JSON.stringify(obj).slice(0, 200)}`)
       return error
     }
-    if (this.proc.stdin.destroyed || this.proc.stdin.writableEnded || !this.proc.stdin.writable) {
+    if (!this.proc || this.proc.stdin.destroyed || this.proc.stdin.writableEnded || !this.proc.stdin.writable) {
       const error = new Error('stdin is not writable')
       log(`codex-process: stdin write failed: ${error.message}`)
       return error
@@ -1683,6 +1919,15 @@ export class CodexProcess extends EventEmitter {
     }
   }
 
+  /** 在本进程的 app-server 连接上读账号额度(read 端点,权威多桶视图)。
+   *  给 turn 收尾刷新 usage cache 用 —— rolling 通知 limitId 不可信
+   *  (2026-08-20 源码核实:上游缺 meter 名时 codex 解析器强补 "codex"),
+   *  额度状态只认 read。须在 initialize 之后调用。 */
+  async readRateLimits(): Promise<any> {
+    await this.ensureInitialized()
+    return this.request('account/rateLimits/read', {})
+  }
+
   private initializeParams(): Record<string, unknown> {
     return {
       clientInfo: { name: 'lodestar', version: '0.0.0' },
@@ -1690,20 +1935,23 @@ export class CodexProcess extends EventEmitter {
     }
   }
 
-  private async ensureCatalogReady(): Promise<void> {
-    if (this.readyPromise) {
-      await this.readyPromise
-      return
+  /** Initialize this app-server transport exactly once, then complete the
+   * JSON-RPC handshake before any catalog or thread request is sent. */
+  private async ensureInitialized(): Promise<void> {
+    if (this.startupPromise) await this.startupPromise
+    if (!this.initializePromise) {
+      this.initializePromise = this.request('initialize', this.initializeParams()).then(() => {
+        if (this.write({ method: 'initialized' })) {
+          throw new Error('codex app-server initialized notification write failed')
+        }
+      })
     }
-    if (!this.catalogInitPromise) {
-      this.catalogInitPromise = this.request('initialize', this.initializeParams()).then(() => {})
-    }
-    await this.catalogInitPromise
+    await this.initializePromise
   }
 
   private async initializeAndStartThread(): Promise<void> {
     const launch = this.conversationLaunch()
-    await this.request('initialize', this.initializeParams())
+    await this.ensureInitialized()
 
     const params = this.threadParams()
     let method: 'thread/start' | 'thread/resume' | 'thread/fork'
@@ -1736,6 +1984,14 @@ export class CodexProcess extends EventEmitter {
     if (typeof thread?.id !== 'string' || !thread.id) {
       throw new Error(`codex app-server ${method} returned no thread.id`)
     }
+    const returnedCwd = typeof thread.cwd === 'string'
+      ? thread.cwd
+      : typeof res?.cwd === 'string'
+        ? res.cwd
+        : null
+    if (returnedCwd !== this.opts.workDir) {
+      throw new Error(`codex app-server ${method} returned cwd=${returnedCwd ?? 'MISS'}, expected ${this.opts.workDir}`)
+    }
     if (launch.kind === 'fork' && thread.id === launch.source.sessionId) {
       throw new Error(`codex app-server thread/fork returned source thread id ${thread.id}`)
     }
@@ -1764,6 +2020,8 @@ export class CodexProcess extends EventEmitter {
       preInitDelivery.threadId = this.sessionId
     }
     if (res?.model) this.lastModel = res.model
+    this.usesCustomDefaultModeInstructions = res?.collaborationMode?.mode === 'default'
+      && typeof res.collaborationMode.settings?.developer_instructions === 'string'
     if (isCodexReasoningEffort(res?.reasoningEffort)) this.lastEffort = res.reasoningEffort
     else this.lastEffort = this.opts.effort
     log(`codex-process: thread=${this.sessionId}`)
@@ -1874,14 +2132,28 @@ export class CodexProcess extends EventEmitter {
       runtimeWorkspaceRoots: [this.opts.workDir],
       approvalPolicy: 'never',
       sandbox: 'danger-full-access',
+      // config 键合并下发:request_user_input flag + 委派开关 + effort。effort 走
+      // config.model_reasoning_effort —— codex 0.147 顶层 effort 参数是摆设
+      // (下发任何值都被无视、回落 ~/.codex/config.toml),config 键才真生效
+      // (2026-08-18 探针:effort=ultra 顶层回包 xhigh,config 路径回包 ultra)。
       config: {
-        'features.default_mode_request_user_input': true,
+        // The feature flag only controls whether the handler may run in Default
+        // mode; the native tool switch controls exposure in the model's catalog.
+        'tools.experimental_request_user_input.enabled': this.opts.allowUserInput !== false,
+        'features.default_mode_request_user_input': this.opts.allowUserInput !== false,
         // 单层委派(D-11 口径 3):与被委派 worker 的 `--disable multi_agent`
         // 双保险 —— app-server 每次 thread 创建/恢复/分叉都带上关闭位。
+        // 仅在显式 false(会话归属 worker)时设键;true/undefined(项目归属、
+        // 主会话、直连)= 不设键,沿用原生配置。注意:codex-cli 0.162.1 实测
+        // multi_agent_version 在 thread 创建时烘焙、对 thread id 不可逆 ——
+        // 恢复/分叉已关闭线程时,显式 true 也无法还原(app-server 忽略),
+        // 故此处不做无效回写(acceptance:session_to_project 按线程创建口径断言)。
         ...(this.opts.allowDelegation === false ? { 'features.multi_agent': false } : {}),
+        ...(this.opts.effort ? { model_reasoning_effort: this.opts.effort } : {}),
       },
       ...(this.opts.model ? { model: this.opts.model } : {}),
-      effort: this.opts.effort,
+      ...(this.opts.apiProvider ? { modelProvider: this.opts.apiProvider.id }
+        : this.opts.tokenSourceId === 'codex-sub' ? { modelProvider: 'openai' } : {}),
       ...(this.opts.appendSystemPrompt ? { developerInstructions: this.opts.appendSystemPrompt } : {}),
       serviceName: this.opts.serviceName ?? 'lodestar',
     }
@@ -1896,10 +2168,10 @@ export class CodexProcess extends EventEmitter {
       }
     }
     // 真人输入接管:撤销退避与计数,满载重试序列从头开始(上游 2e6e1e0)。
-    this.cancelCapacityRetry()
-    this.capacityRetryCount = 0
-    this.capacityRetryHasStarted = false
-    this.capacityRetryEnabled = true
+    this.cancelTurnRetry()
+    this.turnRetryCount = 0
+    this.turnRetryHasStarted = false
+    this.turnRetryEnabled = true
     this.turnError = null
     const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
     const { delivery, settlement } = this.beginTurnStart(fileHints + text)
@@ -1984,9 +2256,35 @@ export class CodexProcess extends EventEmitter {
     }
   }
 
+  async steerUserText(text: string, files: string[] = [], inputId = randomUUID()): Promise<boolean> {
+    if (!this.alive || this.expectedExit) throw new Error('Codex 进程已关闭')
+    const turnId = this.currentTurnId
+    if (!turnId) return false
+    const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
+    this.steeringInputs ??= new Map()
+    this.steeringInputs.set(inputId, turnId)
+    let result: any
+    try {
+      result = await this.request('turn/steer', {
+        threadId: this.sessionId,
+        expectedTurnId: turnId,
+        clientUserMessageId: inputId,
+        input: [{ type: 'text', text: fileHints + text, text_elements: [] }],
+      })
+    } catch (error) {
+      // A definite RPC rejection did not admit this input. A transport error
+      // may still be followed by its authoritative item notification.
+      if (error instanceof CodexRpcResponseError) this.steeringInputs.delete(inputId)
+      throw error
+    }
+    if (result?.turnId !== turnId) throw new Error('Codex turn/steer 未确认目标回合，追加消息的接收状态未知')
+    return true
+  }
+
   async listModels(): Promise<CodexModel[]> {
-    await this.ensureCatalogReady()
+    await this.ensureInitialized()
     const models: CodexModel[] = []
+    const seenCursors = new Set<string>()
     let cursor: string | null = null
     do {
       const res = await this.request('model/list', {
@@ -2012,7 +2310,15 @@ export class CodexProcess extends EventEmitter {
             : null,
         })
       }
-      cursor = typeof res?.nextCursor === 'string' && res.nextCursor ? res.nextCursor : null
+      const nextCursor = res?.nextCursor
+      if (nextCursor !== null && typeof nextCursor !== 'string') {
+        throw new Error('model/list returned an invalid nextCursor')
+      }
+      cursor = nextCursor || null
+      if (cursor) {
+        if (seenCursors.has(cursor)) throw new Error('model/list returned a repeated nextCursor')
+        seenCursors.add(cursor)
+      }
     } while (cursor)
     return models
   }
@@ -2024,7 +2330,7 @@ export class CodexProcess extends EventEmitter {
    * and the protocol-defined default already selects interactive sources while
    * excluding sub-agent-only histories. */
   async listConversations(): Promise<ConversationSummary[]> {
-    await this.ensureCatalogReady()
+    await this.ensureInitialized()
     const conversations: ConversationSummary[] = []
     const seenCursors = new Set<string>()
     let cursor: string | null = null
@@ -2080,7 +2386,7 @@ export class CodexProcess extends EventEmitter {
   /** Resolve one legacy resume id to its authoritative stored cwd without loading it. */
   async readConversationRef(sessionId: string): Promise<ConversationRef> {
     if (!sessionId.trim()) throw new Error('thread/read requires a session id')
-    await this.ensureCatalogReady()
+    await this.ensureInitialized()
     const res = await this.request('thread/read', { threadId: sessionId, includeTurns: false })
     const thread = res?.thread
     if (thread?.id !== sessionId || typeof thread.cwd !== 'string') {
@@ -2114,6 +2420,12 @@ export class CodexProcess extends EventEmitter {
     if (!this.readyPromise) throw new Error('codex thread not initialized')
     await this.readyPromise
     if (!this.sessionId) throw new Error('codex thread not initialized')
+    if (this.currentTurnId || this.turnRetry) {
+      throw new Error('codex cannot manually compact while a task is active')
+    }
+    // Manual compaction has no unfinished user task to continue. A failed cm
+    // must report its own error, never resurrect the last completed task.
+    this.turnRetryEnabled = false
     await this.request('thread/compact/start', {
       threadId: this.sessionId,
     })
@@ -2155,20 +2467,31 @@ export class CodexProcess extends EventEmitter {
       return false
     }
     const error = cause instanceof Error ? cause : new Error(String(cause))
-    // 模型满载拒绝:本轮不终结 —— 先按 ack(turnId=null)结算交付,再排进程层
-    // 退避重试。严禁把 delivery 挂起到重试结果(session 的 await dispatch.settlement
-    // 会因此悬挂,T-02-13)。settle 必须先于 turn_retry 事件/计时器排定。
+    // 模型满载/瞬时故障拒绝:本轮不终结 —— 先按 ack(turnId=null)结算交付,再排
+    // 进程层统一退避(上游 2e6e1e0 引擎;容量变体并入 codexTurnRetryReason)。严禁把
+    // delivery 挂起到重试结果(session 的 await dispatch.settlement 会因此悬挂,
+    // T-02-13)。settle 必须先于 turn_retry 事件/计时器排定。
     if (
-      this.isCapacityTurnStartRejection(cause) &&
+      cause instanceof CodexRpcResponseError &&
+      cause.method === 'turn/start' &&
       delivery.inputText !== undefined &&
       delivery.threadId !== null &&
-      this.canScheduleCapacityRetry()
+      this.alive && !this.expectedExit && this.turnRetryEnabled && !this.turnRetryTimer && !this.currentTurnId
     ) {
-      const threadId = delivery.threadId
-      delivery.settled = true
-      delivery.settle({ kind: 'ack', deliveryId: delivery.deliveryId, threadId, turnId: null })
-      this.pendingTurnStart = null
-      if (this.scheduleCapacityRetry(error.serverMessage ?? error.message, delivery.inputText)) return true
+      const retryReason = codexTurnRetryReason({
+        ...(cause.serverData && typeof cause.serverData === 'object' ? cause.serverData : {}),
+        message: cause.serverMessage,
+      })
+      const retryBudgetAvailable = retryReason === 'capacity'
+        || (retryReason !== null && (this.transientRetryCount ?? 0) < CODEX_TRANSIENT_RETRY_LIMIT)
+      if (retryReason && retryBudgetAvailable) {
+        const threadId = delivery.threadId
+        delivery.settled = true
+        delivery.settle({ kind: 'ack', deliveryId: delivery.deliveryId, threadId, turnId: null })
+        this.pendingTurnStart = null
+        if (this.scheduleTurnRetry(cause.serverMessage, delivery.inputText, retryReason)) return true
+        // 竞态失败(理论上不会到这):delivery 已按 ack 结算,下面走显式失败收口。
+      }
     }
     delivery.settled = true
     delivery.settle({
@@ -2182,19 +2505,13 @@ export class CodexProcess extends EventEmitter {
     return true
   }
 
-  /** 上游 failTurnStart 的容量判定:仅认 turn/start 的显式响应式拒绝。 */
-  private isCapacityTurnStartRejection(cause: unknown): cause is CodexRpcResponseError {
-    return cause instanceof CodexRpcResponseError
-      && cause.method === 'turn/start'
-      && isModelCapacityError(cause.serverMessage)
-  }
-
   private failTurnStart(e: unknown, delivery: PendingTurnStart): void {
     const message = e instanceof Error ? e.message : String(e)
     log(`codex-process: turn/start failed: ${message}`)
-    this.cancelCapacityRetry()
-    this.capacityRetryCount = 0
-    this.capacityRetryHasStarted = false
+    this.cancelTurnRetry()
+    this.turnRetryCount = 0
+    this.transientRetryCount = 0
+    this.turnRetryHasStarted = false
     this.lastResult = {
       cost_usd: null,
       cost_delta_usd: null,
@@ -2216,31 +2533,68 @@ export class CodexProcess extends EventEmitter {
       delivery_id: delivery.deliveryId,
       thread_id: delivery.threadId ?? undefined,
       turn_id: delivery.turnId,
+      ...(e instanceof CodexRpcResponseError && e.method === 'turn/start' && delivery.inputText !== undefined
+        && (isCodexQuotaError(e.serverData) || isCodexQuotaError({ message: e.serverMessage }))
+        ? { codexQuotaFailure: { accepted: false, rejectedInput: delivery.inputText } } : {}),
     })
   }
 
-  private async startTurn(text: string, threadId: string): Promise<any> {
+  private async startTurn(text: string, threadId?: string): Promise<any> {
     if (!this.readyPromise) this.sendInitialize()
     await this.readyPromise
-    if (this.sessionId !== threadId) {
-      throw new Error(`codex thread owner changed before turn/start: expected ${threadId}, got ${this.sessionId ?? 'none'}`)
+    // 省略 threadId 时(直接调用/上游测试调用形态)按就绪后的属主线程落位。
+    const targetThreadId = threadId ?? this.sessionId ?? ''
+    if (this.sessionId !== targetThreadId) {
+      throw new Error(`codex thread owner changed before turn/start: expected ${targetThreadId}, got ${this.sessionId ?? 'none'}`)
+    }
+    const refreshMode = this.opts.allowUserInput === false
+      || (this.usesCustomDefaultModeInstructions && !!this.opts.appendSystemPrompt)
+    const modeModel = this.opts.model ?? this.lastModel
+    if (refreshMode && !modeModel) {
+      throw new Error('Codex model is missing while applying the current invocation policy')
     }
     return await this.request('turn/start', {
-      threadId,
+      threadId: targetThreadId,
       input: [{ type: 'text', text, text_elements: [] }],
       cwd: this.opts.workDir,
+      runtimeWorkspaceRoots: [this.opts.workDir],
       approvalPolicy: 'never',
       sandboxPolicy: { type: 'dangerFullAccess' },
+      // Services cannot inherit Plan mode. Returning to an interactive caller
+      // must also replace a previous service's custom Default-mode instructions.
+      // An interactive caller's existing Plan mode remains native.
+      ...(refreshMode ? {
+        collaborationMode: {
+          mode: 'default',
+          settings: {
+            model: modeModel,
+            reasoning_effort: this.opts.effort ?? this.lastEffort ?? null,
+            developer_instructions: this.opts.appendSystemPrompt ?? null,
+          },
+        },
+      } : {}),
       ...(this.opts.model ? { model: this.opts.model } : {}),
       effort: this.opts.effort,
     })
   }
 
+  private rememberFinishedTurn(turnId: string): void {
+    // Object.create(CodexProcess.prototype) test/probe harnesses do not run
+    // class field initializers, so retain lazy initialization here.
+    if (!this.finishedTurnIds) this.finishedTurnIds = new Set<string>()
+    this.finishedTurnIds.add(turnId)
+    if (this.finishedTurnIds.size <= 64) return
+    const oldest = this.finishedTurnIds.values().next().value
+    if (typeof oldest === 'string') this.finishedTurnIds.delete(oldest)
+  }
+
   sendInterrupt(): void {
+    this.inputConsumptionOpen = false
+    this.steeringInputs?.clear()
     // 用户中断即放弃自动重试(上游 2e6e1e0)。
-    this.capacityRetryEnabled = false
+    this.turnRetryEnabled = false
     const wasWaiting = !!this.turnRetry && !this.currentTurnId
-    this.cancelCapacityRetry()
+    this.cancelTurnRetry()
     const pendingStart = this.pendingTurnStart
     const interruptPendingStart = !!pendingStart && !pendingStart.settled
     if (interruptPendingStart) {
@@ -2261,13 +2615,8 @@ export class CodexProcess extends EventEmitter {
     else if (wasWaiting || interruptPendingStart) {
       this.lastCompletedTurnId = null
       this.lastResult = {
-        cost_usd: null,
-        cost_delta_usd: null,
-        duration_ms: null,
-        num_turns: null,
-        usage: this.lastUsage,
-        subtype: 'interrupted',
-        is_error: false,
+        cost_usd: null, cost_delta_usd: null, duration_ms: null, num_turns: null,
+        usage: this.lastUsage, subtype: 'interrupted', is_error: false,
       }
       this.emit('result', { ...this.lastResult, checkpoint: null })
     }
@@ -2279,53 +2628,47 @@ export class CodexProcess extends EventEmitter {
       .catch(e => log(`codex-process: interrupt failed: ${e}`))
   }
 
-  private canScheduleCapacityRetry(): boolean {
-    return this.alive && !this.expectedExit && this.capacityRetryEnabled
-  }
-
-  /** 记住已终结 turn(有界,防止长会话无限增长)。 */
-  private rememberFinishedTurn(turnId: string): void {
-    if (!this.finishedTurnIds) this.finishedTurnIds = new Set<string>()
-    if (this.finishedTurnIds.size > 64) {
-      const oldest = this.finishedTurnIds.values().next().value
-      if (oldest !== undefined) this.finishedTurnIds.delete(oldest)
-    }
-    this.finishedTurnIds.add(turnId)
-  }
-
-  private cancelCapacityRetry(): void {
-    if (this.capacityRetryTimer) clearTimeout(this.capacityRetryTimer)
-    this.capacityRetryTimer = null
+  private cancelTurnRetry(): void {
+    if (this.turnRetryTimer) clearTimeout(this.turnRetryTimer)
+    this.turnRetryTimer = null
     this.turnRetry = null
   }
 
-  /** 指数退避(5s 起、60s 封顶)排一次续作。返回 true = 本轮已被退避接管,
-   *  调用方不得写出 result/终结本轮。 */
-  private scheduleCapacityRetry(message: string, inputText: string): boolean {
-    if (!this.canScheduleCapacityRetry()) return false
-    if (this.capacityRetryTimer) return true
-    const attempt = this.capacityRetryCount + 1
-    this.capacityRetryCount = attempt
-    const delayMs = Math.min(CAPACITY_RETRY_BASE_MS * 2 ** Math.min(attempt - 1, 4), CAPACITY_RETRY_MAX_MS)
+  private scheduleTurnRetry(message: string, inputText: string, reason: CodexTurnRetryReason): boolean {
+    if (!this.alive || this.expectedExit || !this.turnRetryEnabled) return false
+    if (this.turnRetryTimer) return true
+    if (reason !== 'capacity') {
+      if ((this.transientRetryCount ?? 0) >= CODEX_TRANSIENT_RETRY_LIMIT) {
+        log(`codex-process: transient retry limit reached (${CODEX_TRANSIENT_RETRY_LIMIT}): ${message}`)
+        return false
+      }
+      this.transientRetryCount = (this.transientRetryCount ?? 0) + 1
+    }
+    const attempt = (this.turnRetryCount ?? 0) + 1
+    this.turnRetryCount = attempt
+    const backoffAttempt = reason === 'capacity' ? attempt : this.transientRetryCount
+    const delayMs = Math.min(CODEX_TURN_RETRY_BASE_MS * 2 ** Math.min(backoffAttempt - 1, 4), CODEX_TURN_RETRY_MAX_MS)
     const generation = this.turnStartGeneration ?? 0
-    const notice: AgentTurnRetry = { phase: 'waiting', attempt, delayMs, message }
+    const notice: AgentTurnRetry = { phase: 'waiting', attempt, delayMs, message, reason }
     this.turnRetry = notice
-    log(`codex-process: model capacity retry #${attempt} in ${delayMs}ms: ${message}`)
-    // Deliberately keep retrying this specific capacity error until cancelled;
-    // delays are capped, and every failure stays visible in the log and UI.
+    log(`codex-process: ${reason} retry #${attempt} in ${delayMs}ms: ${message}`)
+    // Capacity retries continue until cancelled; transient failures share a budget.
+    // Every failure stays visible in the log and UI.
     const timer = setTimeout(() => {
-      if (this.capacityRetryTimer !== timer) return
-      this.capacityRetryTimer = null
-      if (!this.canScheduleCapacityRetry() || this.currentTurnId
-        || generation !== (this.turnStartGeneration ?? 0)) return
+      if (this.turnRetryTimer !== timer) return
+      this.turnRetryTimer = null
+      if (!this.alive || this.expectedExit || !this.turnRetryEnabled
+        || this.currentTurnId || generation !== (this.turnStartGeneration ?? 0)) return
       this.turnRetry = { ...notice, phase: 'retrying', delayMs: 0 }
       this.emit('turn_retry', this.turnRetry)
-      // 事件消费方可能同步停机或改写状态;重启前再校验一次代际。
-      if (!this.canScheduleCapacityRetry() || generation !== (this.turnStartGeneration ?? 0)) return
+      // Event consumers can synchronously stop the worker or supply new input;
+      // 重启前再校验一次代际。
+      if (!this.alive || this.expectedExit || !this.turnRetryEnabled
+        || generation !== (this.turnStartGeneration ?? 0)) return
       const { delivery } = this.beginTurnStart(inputText)
       void this.launchTurnStart(delivery, inputText)
     }, delayMs)
-    this.capacityRetryTimer = timer
+    this.turnRetryTimer = timer
     this.emit('turn_retry', notice)
     return true
   }
@@ -2384,10 +2727,6 @@ export class CodexProcess extends EventEmitter {
     }
   }
 
-  sendToolResult(_toolUseId: string, _content: string, _isError = false): void {
-    log('codex-process: sendToolResult ignored; Codex app-server server requests are answered via sendPermissionResponse')
-  }
-
   sendHookResponse(requestId: string, output: object = {}): void {
     this.respond(requestId, output)
   }
@@ -2397,22 +2736,35 @@ export class CodexProcess extends EventEmitter {
   isAlive(): boolean { return !this.exitEventEmitted }
 
   async kill(timeoutMs = 5000): Promise<void> {
-    this.capacityRetryEnabled = false
-    this.cancelCapacityRetry()
+    this.turnRetryEnabled = false
+    this.cancelTurnRetry()
+    this.inputPolicyAbort?.abort(new Error('Codex process cancelled'))
+    if (this.startupPromise) {
+      this.expectedExit = true
+      let startupTimer: ReturnType<typeof setTimeout> | undefined
+      try {
+        await Promise.race([
+          this.startupPromise.catch(() => {}), // startup error is reported by initialization/exit
+          new Promise<never>((_resolve, reject) => {
+            startupTimer = setTimeout(() => reject(new Error(`Codex model catalog preparation did not exit within ${timeoutMs * 2}ms`)), timeoutMs * 2)
+          }),
+        ])
+      } finally { if (startupTimer) clearTimeout(startupTimer) }
+    }
+    // OS exit 已见但公开 exit(stdio close)未发:等 drain 完成,超时如实抛。
     if (!this.alive) {
-      // OS exit 已见但公开 exit(stdio close)未发:等 drain 完成,超时如实抛。
-      if (await this.waitForExit(timeoutMs)) return
+      if (await this.waitForExit(timeoutMs)) { await this.disposeInputPolicy(); return }
       throw new Error(`codex app-server exited but stdio did not close within ${timeoutMs}ms`)
     }
     this.expectedExit = true
     log(`codex-process: SIGTERM (timeout=${timeoutMs}ms)`)
     const signalErrors: string[] = []
     this.sendSignal('SIGTERM', signalErrors)
-    if (await this.waitForExit(timeoutMs)) return
+    if (await this.waitForExit(timeoutMs)) { await this.disposeInputPolicy(); return }
 
     log(`codex-process: SIGKILL (lifecycle not closed after ${timeoutMs}ms)`)
     if (this.alive) this.sendSignal('SIGKILL', signalErrors)
-    if (await this.waitForExit(timeoutMs)) return
+    if (await this.waitForExit(timeoutMs)) { await this.disposeInputPolicy(); return }
 
     // 双杀都没等到公开 exit:如实抛出(ec149d7),不再静默返回假装已停 ——
     // materialization 的 exit-close-error 次序纪律依赖真实退出信号。
@@ -2422,9 +2774,15 @@ export class CodexProcess extends EventEmitter {
     throw error
   }
 
+  private async disposeInputPolicy(): Promise<void> {
+    if (!this.inputPolicyCatalog) return
+    await this.inputPolicyCatalog.dispose()
+    this.inputPolicyCatalog = null
+  }
+
   private sendSignal(signal: NodeJS.Signals, errors: string[]): void {
     try {
-      if (!this.proc.kill(signal) && this.alive) errors.push(`${signal} was not delivered`)
+      if (!this.proc?.kill(signal) && this.alive) errors.push(`${signal} was not delivered`)
     } catch (e) {
       errors.push(`${signal} failed: ${e instanceof Error ? e.message : String(e)}`)
     }
@@ -2491,7 +2849,7 @@ function mapStartedItem(item: any, workDir: string): { name: string; input: any 
     case 'webSearch':
       return { name: 'WebSearch', input: { query: item.query, action: item.action } }
     case 'imageGeneration':
-      return { name: 'ImageGeneration', input: { status: item.status, revisedPrompt: imageGenerationRevisedPrompt(item) } }
+      return { name: 'ImageGeneration', input: imageGenerationInput(item) }
     // collabAgentToolCall 由 feedCollabItem 状态机消费(cf41941 timeline 压缩),
     // 不再映射成 Agent JSON 面板。
   }
@@ -2503,13 +2861,18 @@ function imageGenerationRevisedPrompt(item: any): string | undefined {
   return typeof prompt === 'string' && prompt ? prompt : undefined
 }
 
+function imageGenerationInput(item: any): object {
+  return { status: item.status, revisedPrompt: imageGenerationRevisedPrompt(item),
+    ...(typeof item?.prompt === 'string' && item.prompt ? { prompt: item.prompt } : {}) }
+}
+
 function findCodexRolloutFile(sessionId: string): string | null {
   if (!sessionId || !existsSync(CODEX_SESSIONS_DIR)) return null
   let best: { path: string; mtimeMs: number } | null = null
   const stack = [CODEX_SESSIONS_DIR]
   while (stack.length) {
     const dir = stack.pop()!
-    let entries: ReturnType<typeof readdirSync>
+    let entries: Dirent<string>[]
     try {
       entries = readdirSync(dir, { withFileTypes: true })
     } catch (e) {
@@ -2695,13 +3058,13 @@ function mapCompletedItem(
 // barrel 导出防上游「漏导出放大成整流中断」事故)。
 
 /** agentPath(如 "/root/order_schema/official_history_orders")末段作展示名;
- *  无 path 时退回 threadId 前 8 位。 */
+ *  无 path 时退回 threadId 的诊断前缀。 */
 function collabAgentDisplayName(agentPath: unknown, threadId: string): string {
   if (typeof agentPath === 'string' && agentPath) {
     const last = agentPath.split('/').filter(Boolean).pop()
     if (last) return last
   }
-  return threadId.slice(0, 8)
+  return diagnosticIdLabel(threadId)
 }
 
 /** spawn/followup 的 prompt 文本:fork_turns=all 时是服务端 Fernet 密文
@@ -2727,7 +3090,7 @@ function collabSpawnDescription(item: any): string {
 
 /** spawn 面板完成态输出:agentsStates 的可读摘要(每 agent 一行「线程:状态」),
  *  替代旧的 agentsStates JSON dump。真名由后台卡(subAgentActivity agentPath)
- *  承载,这里只有线程 id 前 8 位。 */
+ *  承载,这里只有线程 id 的诊断前缀。 */
 function collabSpawnResult(item: any): string {
   const states = item.agentsStates
   if (!states || typeof states !== 'object') return ''
@@ -2735,7 +3098,7 @@ function collabSpawnResult(item: any): string {
   for (const [threadId, state] of Object.entries(states)) {
     const s = state as any
     const status = typeof s?.status === 'string' ? s.status : 'unknown'
-    lines.push(`${threadId.slice(0, 8)}: ${status}`)
+    lines.push(`${diagnosticIdLabel(threadId)}: ${status}`)
   }
   return lines.join('\n')
 }

@@ -218,6 +218,20 @@ describe('Codex watchdog configuration', () => {
   })
 })
 
+describe('Claude subscription switch', () => {
+  test.each([true, false])('parses enabled = %s', enabled => {
+    const result = loadFreshConfig(`[token_source.claude-sub]\nenabled = ${enabled}`)
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).token_sources['claude-sub'].enabled).toBe(enabled)
+  })
+
+  test('rejects an invalid enabled value', () => {
+    const result = loadFreshConfig('[token_source.claude-sub]\nenabled = "off"')
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('[token_source.claude-sub].enabled 必须为 true 或 false')
+  })
+})
+
 describe('runtime live_elapsed', () => {
   test('defaults to bucket when omitted', () => {
     const result = loadFreshConfig()
@@ -424,5 +438,76 @@ describe('configured project paths', () => {
     } finally {
       rmSync(root, { recursive: true, force: true })
     }
+  })
+})
+
+describe('runtime agent_auto_update', () => {
+  test('existing configurations disable Agent auto-update by default', () => {
+    const result = loadFreshConfig()
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).runtime.agent_auto_update).toEqual({ codex: false, claude: false, dsh: false })
+  })
+
+  test.each(['codex', 'claude', 'dsh'] as const)('enabling %s leaves the other Agents disabled', agent => {
+    const result = loadFreshConfig(`[runtime.agent_auto_update]\n${agent} = true`)
+    expect(result.exitCode).toBe(0)
+    expect(result.stderr).toBe('')
+    expect(JSON.parse(result.stdout).runtime.agent_auto_update).toEqual({ codex: false, claude: false, dsh: false, [agent]: true })
+  })
+
+  test('accepts a mix of independent switches', () => {
+    const result = loadFreshConfig('[runtime.agent_auto_update]\ncodex = true\nclaude = false\ndsh = true')
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).runtime.agent_auto_update).toEqual({ codex: true, claude: false, dsh: true })
+  })
+
+  test('migrates the legacy boolean without changing the configured update choice', () => {
+    for (const value of ['true', 'false']) {
+      const result = loadFreshConfig(`[runtime]\nagent_auto_update = ${value}`)
+      expect(result.exitCode).toBe(0)
+      expect(JSON.parse(result.stdout).runtime.agent_auto_update).toEqual({ codex: value === 'true', claude: value === 'true', dsh: value === 'true' })
+      expect(result.stderr).toContain('旧 agent_auto_update 总开关已按原值映射为三个开关')
+    }
+  })
+
+  test('rejects an invalid update preference instead of silently changing it', () => {
+    const result = loadFreshConfig('[runtime]\nagent_auto_update = "yes"')
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('[runtime].agent_auto_update must be true or false')
+  })
+
+  test('rejects invalid per-Agent values and unknown Agent names', () => {
+    const invalid = loadFreshConfig('[runtime.agent_auto_update]\nclaude = "yes"')
+    expect(invalid.exitCode).not.toBe(0)
+    expect(invalid.stderr).toContain('[runtime.agent_auto_update].claude must be true or false')
+    const unknown = loadFreshConfig('[runtime.agent_auto_update]\nclaud = true')
+    expect(unknown.exitCode).not.toBe(0)
+    expect(unknown.stderr).toContain('unknown [runtime.agent_auto_update] Agent "claud"')
+  })
+
+  test('rejects combining the legacy scalar with independent switches', () => {
+    const result = loadFreshConfig('[runtime]\nagent_auto_update = true\n[runtime.agent_auto_update]\ncodex = false')
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('cannot be combined')
+  })
+})
+
+describe('TOML scalar parsing', () => {
+  test('keeps # inside quoted credentials while stripping a real comment', () => {
+    const result = loadFreshConfig(`
+      [feishu]
+      app_secret = "sec#ret" # operator note
+    `)
+    expect(result.exitCode).toBe(0)
+    expect(JSON.parse(result.stdout).feishu.app_secret).toBe('sec#ret')
+  })
+
+  test('rejects a notify port with trailing junk', () => {
+    const result = loadFreshConfig(`
+      [notify]
+      port = "9876junk"
+    `)
+    expect(result.exitCode).not.toBe(0)
+    expect(result.stderr).toContain('[notify].port must be an integer')
   })
 })

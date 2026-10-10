@@ -1,14 +1,15 @@
 /**
- * daemon 侧的 DSH 后端(上游 722e45a:src/dsh-process.ts 全文移植)。
+ * daemon 侧的 DSH 后端(上游 0.20.x 全文移植 + 本地投递回执契约)。
  *
- * 波 1 的本地适配只有两处,其余逐字随上游:
- * - `AgentProcess.sendUserText` 在本地是**强制返回契约**(`UserTextDispatch`;上游当期为
- *   void,本地是 session 层的投递回执)。成功投递返回 `{ kind:'queued', provider:'dsh' }`;
- *   投递失败(传输关闭 / 相对路径 / 终态错误)返回 `{ kind:'rejected', provider:'dsh',
- *   error }` 而不是抛出 —— 与本地 claude/codex 后端同构。
- * - `AgentProvider` 与 `UserTextDispatch` 的联合扩宽属 03-02 接入层(同一文件的另一处
- *   联合,避免两个 plan 同改)。波 1 用 `DSH_PROVIDER` / `dshDispatch()` 两个单点断言
- *   维持**值语义**正确,测试按放宽后的契约断言;类型面在 03-02 收敛。
+ * 本地保留:
+ * - `sendUserText` 强制返回 `UserTextDispatch` 回执:成功投递返回
+ *   `{ kind:'queued', provider:'dsh' }`;投递失败(传输关闭 / 相对路径 / 终态错误)
+ *   返回 `{ kind:'rejected', provider:'dsh', error }` 而不是抛出 —— 与本地
+ *   claude/codex 后端同构,session 层按回执分流。
+ * - 文本里的 `[file: …]` 引用先过绝对路径闸门;读不到的引用只 emit error 并跳过,
+ *   显式 files 保持 fail loud。
+ * - `sendToolResult` / `setModel` / `injectThreadItems` 显式抛「不支持」(缺席在
+ *   泛化调用下会变成运行期 is not a function)。
  */
 import { EventEmitter } from 'node:events'
 import { join, isAbsolute, extname, basename } from 'node:path'
@@ -16,7 +17,6 @@ import { readFile } from 'node:fs/promises'
 import type {
   AgentModel,
   AgentProcess,
-  AgentProvider,
   AgentReasoningEffort,
   DshReasoningEffort,
   UserTextDispatch,
@@ -30,17 +30,6 @@ import { DshRuntime, type DshRuntimeOptions } from './dsh-runtime'
 import type { DshModel, DshNotification } from './dsh-protocol'
 import { log } from './log'
 
-/** 本地 `AgentProvider` 联合的 dsh 分支由 03-02 落地(见文件头);波 1 先按目标语义实例。 */
-const DSH_PROVIDER = 'dsh' as unknown as AgentProvider
-
-/** DSH 侧投递回执(放宽后的 UserTextDispatch 形状,见文件头)。 */
-type DshUserTextDispatch =
-  | { kind: 'queued', provider: 'dsh' }
-  | { kind: 'rejected', provider: 'dsh', error: Error }
-
-const dshDispatch = (dispatch: DshUserTextDispatch): UserTextDispatch =>
-  dispatch as unknown as UserTextDispatch
-
 export interface DshSpawnOptions {
   workDir: string
   tokenSourceId: string | null
@@ -49,6 +38,7 @@ export interface DshSpawnOptions {
   launch?: ConversationLaunch
   developerInstructions?: string
   allowDelegation?: boolean
+  allowUserInput?: boolean
   profile?: ProjectProfile
   managedSkillPluginPath?: string
   hostEnv?: Record<string, string | undefined>
@@ -73,7 +63,7 @@ function imageMediaType(bytes: Buffer): string {
 
 /** Maps the native Harness events to Lodestar's existing session/card contract. */
 export class DshProcess extends EventEmitter implements AgentProcess {
-  readonly provider = DSH_PROVIDER
+  readonly provider = 'dsh' as const
   readonly tokenSourceId: string | null
   readonly launchKind: 'fresh' | 'resume' | 'fork'
   sessionId: string | null = null
@@ -109,7 +99,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     this.lastModel = opts.model
     this.lastEffort = opts.effort
     const launch = opts.launch ?? { kind: 'fresh' }
-    validateConversationLaunch(launch, DSH_PROVIDER, opts.workDir)
+    validateConversationLaunch(launch, 'dsh', opts.workDir)
     this.launchKind = launch.kind
     const base = { ...process.env, ...opts.hostEnv }
     this.runtime = new DshRuntime({ cwd: opts.workDir,
@@ -135,6 +125,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         launch: this.opts.launch ?? { kind: 'fresh' },
         developerInstructions: this.opts.developerInstructions ?? '',
         allowDelegation: this.opts.allowDelegation !== false,
+        allowUserInput: this.opts.allowUserInput !== false,
         ...(this.opts.profile?.tools ? { allowedTools: this.opts.profile.tools.split(',').map(t => {
           const name = t.trim(); return Object.keys(toolAliases).find(key => toolAliases[key] === name) ?? name
         }) } : {}),
@@ -151,9 +142,9 @@ export class DshProcess extends EventEmitter implements AgentProcess {
   isConversationResumable(): boolean { return this.sessionId !== null }
   kill(timeoutMs?: number): Promise<void> { this.closing = true; return this.runtime.close(timeoutMs) }
   sendUserText(text: string, files: string[] = []): UserTextDispatch {
-    if (!this.isAlive() || this.closing) return dshDispatch({ kind: 'rejected', provider: 'dsh', error: new Error('DSH process is closed') })
-    if (files.some(file => !isAbsolute(file))) return dshDispatch({ kind: 'rejected', provider: 'dsh', error: new Error('DSH file inputs must use absolute paths') })
-    if (this.terminalError) return dshDispatch({ kind: 'rejected', provider: 'dsh', error: this.terminalError })
+    if (!this.isAlive() || this.closing) return { kind: 'rejected', provider: 'dsh', error: new Error('DSH process is closed') }
+    if (files.some(file => !isAbsolute(file))) return { kind: 'rejected', provider: 'dsh', error: new Error('DSH file inputs must use absolute paths') }
+    if (this.terminalError) return { kind: 'rejected', provider: 'dsh', error: this.terminalError }
     this.pendingInputs++
     void this.initializationPromise().then(async () => {
       const content: object[] = [{ type: 'text', text: [text, ...files.map(file => `[file: ${file}]`)].join('\n') }]
@@ -187,7 +178,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
       // reject 路径此前不减计数(fail() 终态后无可见影响,但对称性要靠 finally)。
       this.pendingInputs--
     })
-    return dshDispatch({ kind: 'queued', provider: 'dsh' })
+    return { kind: 'queued', provider: 'dsh' }
   }
   sendInterrupt(): void { void this.runtime.request('session/cancel').catch(error => this.fail(error)) }
   sendPermissionResponse(requestId: string | number, decision: 'allow' | 'deny', payload?: { updatedInput?: Record<string, unknown>; denyMessage?: string }): void {
@@ -196,7 +187,9 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     if (!questions) throw new Error(`unknown DSH question: ${id}`)
     const values = payload?.updatedInput?.answers as Record<string, string> | undefined
     const answers = decision === 'allow' ? questions.map(q => {
-      const value = values?.[q.question]
+      // Session cards answer by displayed text; delegated workers expose the
+      // native question id. Both are explicit keys in the host protocol.
+      const value = values?.[q.question] ?? values?.[q.id]
       if (typeof value !== 'string') throw new Error(`missing answer to DSH question: ${q.question}`)
       const option = q.options?.find((entry: any) => entry.label === value)
       return { id: q.id, selected: option ? [value] : [], ...(option ? {} : { custom: value }) }
@@ -208,9 +201,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     }).catch(error => this.fail(error))
   }
   sendHookResponse(): void { throw new Error('DSH does not issue hook callback requests') }
-  /** AgentProcess 契约中的这三个成员 DSH 原生协议没有对应能力:显式抛「不支持」
-   *  而不是缺席 —— 缺席在泛化调用下是运行期 `is not a function`(build 走
-   *  bun build 不做类型检查,implements 违规本地不报错)。 */
+  /** 以下三个成员 DSH 原生协议没有对应能力:显式抛「不支持」而不是缺席。 */
   sendToolResult(_toolUseId: string, _content: string, _isError?: boolean): void {
     throw new Error('DSH does not support sendToolResult')
   }
@@ -222,7 +213,7 @@ export class DshProcess extends EventEmitter implements AgentProcess {
   }
   async listModels(): Promise<AgentModel[]> {
     await this.runtime.initialize()
-    this.models = await this.runtime.request('model/list')
+    this.models = await this.runtime.request('model/list', { models: [this.lastModel ?? this.opts.model] })
     return this.models.map(m => ({ id: m.model, model: m.model, displayName: m.display, description: 'DeepSeek Harness',
       hidden: false, isDefault: m.isDefault, defaultReasoningEffort: m.defaultEffort,
       supportedReasoningEfforts: m.efforts.map(reasoningEffort => ({ reasoningEffort, description: '' })) }))
@@ -230,7 +221,9 @@ export class DshProcess extends EventEmitter implements AgentProcess {
   async setModelSettings(model: string, effort: AgentReasoningEffort): Promise<void> {
     if (!isDshReasoningEffort(effort)) throw new Error(`invalid DSH effort: ${effort}`)
     await this.initializationPromise()
-    await this.runtime.request('session/model', { model, effort })
+    // This mutation cannot be cancelled by dropping its RPC response. Session
+    // presents a pending state while retaining the eventual acknowledgement.
+    await this.runtime.request('session/model', { model, effort }, null)
     if (!this.busy) { this.lastModel = model; this.lastEffort = effort }
   }
   async compactThread(): Promise<void> {
@@ -332,11 +325,20 @@ export class DshProcess extends EventEmitter implements AgentProcess {
           this.toolInputs.set(data.callId, { name, input })
           this.emit('tool_use', { id: data.callId, name, input, parentToolUseId: sub ? params.sessionId : null })
         } else if (e.type === 'tool/result') {
-          const block = data.message?.content?.[0]
-          if (block?.type !== 'tool-result' || typeof block.toolCallId !== 'string') throw new Error('invalid DSH tool result')
-          this.emit('tool_result', { tool_use_id: block.toolCallId, content: block.content,
-            is_error: block.isError === true, parentToolUseId: sub ? params.sessionId : null })
-          this.toolInputs.delete(block.toolCallId)
+          const message = data.message
+          // Native tool-role messages carry correlation directly; the earlier
+          // user-role protocol represents it in one tool-result content block.
+          const result = message?.role === 'tool' ? message
+            : message?.role === 'user' && message.content?.length === 1
+              && message.content[0]?.type === 'tool-result' ? message.content[0] : undefined
+          if (!result || typeof result.toolCallId !== 'string' || !result.toolCallId
+            || !Array.isArray(result.content)
+            || (result.isError !== undefined && typeof result.isError !== 'boolean')) {
+            throw new Error('invalid DSH tool result')
+          }
+          this.emit('tool_result', { tool_use_id: result.toolCallId, content: result.content,
+            is_error: result.isError === true, parentToolUseId: sub ? params.sessionId : null })
+          this.toolInputs.delete(result.toolCallId)
         } else if (e.type === 'todo/write' && !sub) {
           this.emit('turn_plan_updated', { threadId: this.sessionId, explanation: null,
             plan: data.todos.map((item: any) => ({ step: item.content, status: item.status === 'in_progress' ? 'inProgress' : item.status })) })

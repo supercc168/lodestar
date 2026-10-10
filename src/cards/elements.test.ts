@@ -179,7 +179,7 @@ describe('neutralizeMarkdownImagesInCard(卡片 JSON 最终边界,上游 4185808
     expect(input.body.elements[0].content).toBe('结果 ![bad](img_key) 完')
   })
 
-  test('递归覆盖嵌套容器(column_set/collapsible_panel)里的 markdown sink,保留结构化图片和 HTML', () => {
+  test('递归覆盖嵌套容器(column_set/collapsible_panel)与 plan/goal/task/Ask 等任意 markdown sink,保留结构化图片和 HTML', () => {
     const card = neutralizeMarkdownImagesInCard({
       body: {
         elements: [
@@ -235,5 +235,21 @@ describe('ELEMENTS 注册表(上游 9020e11 展示层摘录)', () => {
     expect(ELEMENTS.modelAgentGroup('sol')).toBe('model_agent_sol')
     expect(ELEMENTS.modelAgentGroup('opus')).toBe('model_agent_opus')
     expect(JSON.stringify({ key: ELEMENTS.modelAgentGroup('glm') })).toBe('{"key":"model_agent_glm"}')
+  })
+})
+
+describe('latex downgrade for cardkit markdown', () => {
+  test('display math \\[..\] and $$..$$ become code blocks', () => {
+    const out = sanitizeMarkdownForCardKit('公式:\n\\[\\text{IM} \\frac{a}{b}\\]\n结束')
+    expect(out).toContain('```\n\\text{IM} \\frac{a}{b}\n```')
+    const out2 = sanitizeMarkdownForCardKit('$$x^2 + y^2 = r^2$$')
+    expect(out2).toContain('```\nx^2 + y^2 = r^2\n```')
+  })
+  test('inline \\(..\\) becomes inline code; math-flavored $..$ downgraded', () => {
+    expect(sanitizeMarkdownForCardKit('\\(a_1 + b_2\\)')).toBe('`a_1 + b_2`')
+    expect(sanitizeMarkdownForCardKit('$x = 1$')).toBe('`x = 1`')
+  })
+  test('plain dollar amounts are not mangled', () => {
+    expect(sanitizeMarkdownForCardKit('价格 $5 和 $10')).toBe('价格 $5 和 $10')
   })
 })

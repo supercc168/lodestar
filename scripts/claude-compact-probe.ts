@@ -11,17 +11,19 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { query, type SDKMessage, type SDKUserMessage } from '@anthropic-ai/claude-agent-sdk'
 import { claudeSdkReasoningOptions } from '../src/claude-agent-process'
-import { claudeModelEffort } from '../src/claude-models'
-import { resolveTokenSource } from '../src/token-source'
+import { claudeModelEffort, claudeModelIsApiRoute } from '../src/claude-models'
+import { getTokenSource } from '../src/token-source'
+import { buildTokenSourcesFromConfig } from '../src/token-source-builtins'
 
+buildTokenSourcesFromConfig()
 const rawSelection = process.argv[2]?.trim() || 'claude:glm'
 const selection = rawSelection.startsWith('claude:') ? rawSelection : `claude:${rawSelection}`
-const source = resolveTokenSource('claude', selection)
-if (!source.enabled()) throw new Error(`${selection} 未配置/enabled`)
-if (!source.isApiRoute()) throw new Error(`${selection} 不是 API 路由(探针需第三方端点)`)
-const model = source.resolveSpawnModel()
+const source = getTokenSource(selection.slice('claude:'.length))
+if (!source || !source.enabled) throw new Error(`${selection} 未配置/enabled`)
+if (!claudeModelIsApiRoute(selection)) throw new Error(`${selection} 不是 API 路由(探针需第三方端点)`)
+const model = source.resolveSpawnModel(source.defaultModel)
 if (!model) throw new Error(`${selection} 无 model id`)
-const env = source.spawnEnv({ ...(process.env as Record<string, string>), PATH: process.env.PATH! })
+const env = source.spawnEnv({ ...(process.env as Record<string, string>), PATH: process.env.PATH! }, model)
 const reasoningOptions = claudeSdkReasoningOptions(selection, claudeModelEffort(selection) ?? 'max')
 
 // ── 最小可推送的 async 输入流(SDK 的 prompt 接受 AsyncIterable 即进入 streamInput 模式)

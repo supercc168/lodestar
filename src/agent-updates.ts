@@ -1,18 +1,27 @@
 /** Explicit/opt-in Agent updates follow latest independently of Lodestar releases.
  *
- *  上游 9a6209b / 91a8530 摘录,按 D-06 裁剪:
- *  - 不收 runtime-root 间接层(三个"按 agent 解析运行时路径/可执行体/SDK"的
- *    导出函数均不落地)—— 本地 spawn 入口([claude].bin / reclaude /
- *    resolveCodexBin)零改动,安装产物是 opt-in 储备,daemon 启动不读不检查。
+ *  上游 9a6209b / 91a8530 并线,按 D-06 反转纳入 runtime-root 间接层:
+ *  agentRuntimeState / agentRuntimeRoot / agentPackagePath / agentBin /
+ *  loadClaudeSdk 全部导出 —— 合并树 spawn 入口(claude-agent-process /
+ *  codex-process / dsh-runtime / version-cli)以它们为依赖锚,
+ *  测试期由 LODESTAR_TEST_AGENT_RUNTIME_ROOT 路由到隔离依赖树。
  *  - 安装根固定取 `AGENT_RUNTIMES_DIR`,`AgentUpdateOptions.root` 是唯一测试覆盖入口。
+ *  - 失败不写失败态(上游语义):current.json 只在成功提交时原子落盘。选中态是
+ *    活路径,把失败写回成 {checkedAt, error} 会让可用安装在瞬时 registry 故障后
+ *    变成"未安装";失败经抛错/timer report 可见,启用中的定时器下个周期重试。
+ *  - 本地保留:锁获取宽限窗口(mkdir 后空 pid 窗口不误判为损坏锁)、pid 落盘
+ *    失败回滚锁目录(WR-02)、retryAgentFileOperation。
  */
 import { createHash, randomUUID } from 'node:crypto'
+import { createRequire } from 'node:module'
 import { existsSync, readFileSync } from 'node:fs'
 import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from 'node:fs/promises'
 import { join, isAbsolute } from 'node:path'
-import { fileURLToPath } from 'node:url'
+import { fileURLToPath, pathToFileURL } from 'node:url'
 import { AGENT_RUNTIMES_DIR } from './paths'
 import { AgentInstallTerminationError, installAgentPackages } from './agent-install'
+import { networkFetch } from './network'
+import { writeStateFileAtomic } from './state-store'
 export { installAgentPackages } from './agent-install'
 
 export const AGENTS = ['codex', 'claude', 'dsh'] as const
@@ -36,6 +45,7 @@ export interface AgentRuntimeState {
   directory?: string
   versions?: Record<string, string>
   checkedAt: number
+  /** Legacy diagnostic only; ignored when selecting an installed runtime. */
   error?: string
 }
 export interface AgentUpdateOptions {
@@ -59,6 +69,34 @@ function readState(agent: UpdatedAgent, root = AGENT_RUNTIMES_DIR): AgentRuntime
   return state
 }
 
+export function agentRuntimeState(agent: UpdatedAgent): AgentRuntimeState | null { return readState(agent) }
+
+/** Constructors only read the selected local install; they never query the registry. */
+export function agentRuntimeRoot(agent: UpdatedAgent): string {
+  // Tests explicitly use their own dependency tree; production never substitutes it.
+  if (process.env.NODE_ENV === 'test' && process.env.LODESTAR_TEST_AGENT_RUNTIME_ROOT) {
+    return process.env.LODESTAR_TEST_AGENT_RUNTIME_ROOT
+  }
+  const state = readState(agent)
+  if (!state?.directory) throw new Error(`${agent} runtime 未安装，请运行 lodestar-update --agents-only`)
+  if (!existsSync(state.directory)) throw new Error(`${agent} runtime 安装目录不存在: ${state.directory}；请运行 lodestar-update --agents-only`)
+  return state.directory
+}
+
+export function agentPackagePath(agent: UpdatedAgent, name: string): string {
+  return createRequire(join(agentRuntimeRoot(agent), 'package.json')).resolve(name)
+}
+
+export function agentBin(agent: UpdatedAgent, command: string): string {
+  const bin = join(agentRuntimeRoot(agent), 'node_modules', '.bin', `${command}${process.platform === 'win32' ? '.cmd' : ''}`)
+  if (!existsSync(bin)) throw new Error(`${agent} executable missing: ${bin}`)
+  return bin
+}
+
+export async function loadClaudeSdk(): Promise<typeof import('@anthropic-ai/claude-agent-sdk')> {
+  return import(pathToFileURL(agentPackagePath('claude', '@anthropic-ai/claude-agent-sdk')).href)
+}
+
 async function metadata(name: string, version: string, signal?: AbortSignal): Promise<Manifest> {
   const abort = new AbortController()
   const cancel = () => abort.abort(signal?.reason)
@@ -66,7 +104,7 @@ async function metadata(name: string, version: string, signal?: AbortSignal): Pr
   if (signal?.aborted) cancel()
   const timer = setTimeout(() => abort.abort(new Error('npm registry request timed out')), 30_000)
   try {
-    const response = await fetch(`${REGISTRY}/${encodeURIComponent(name)}/${encodeURIComponent(version)}`, { signal: abort.signal })
+    const response = await networkFetch(`${REGISTRY}/${encodeURIComponent(name)}/${encodeURIComponent(version)}`, { signal: abort.signal })
     if (!response.ok) throw new Error(`${name}@${version}: npm HTTP ${response.status}`)
     const value = await response.json() as Manifest
     if (value.name !== name || typeof value.version !== 'string' || !value.version) throw new Error(`Invalid npm manifest: ${name}@${version}`)
@@ -134,6 +172,15 @@ async function writeState(agentDirectory: string, state: AgentRuntimeState): Pro
   }
 }
 
+async function validateInstalledPackages(directory: string, versions: Record<string, string>): Promise<void> {
+  for (const [name, version] of Object.entries(versions)) {
+    const installed = JSON.parse(await readFile(join(directory, 'node_modules', name, 'package.json'), 'utf8'))
+    if (installed.name !== name || installed.version !== version) {
+      throw new Error(`Invalid Agent runtime at ${directory}: expected ${name}@${version}, found ${installed.name}@${installed.version}`)
+    }
+  }
+}
+
 /** mkdir 与 pid 落盘之间对手进程必然看到空文件;超过这段时间仍读不到 pid 才按损坏锁处理。 */
 const LOCK_ACQUISITION_GRACE_MS = 5_000
 
@@ -146,8 +193,10 @@ async function lock(directory: string, signal?: AbortSignal): Promise<() => Prom
     signal?.throwIfAborted()
     try {
       await mkdir(path)
-      try { await writeFile(join(path, 'pid'), String(process.pid)) }
-      catch (error) {
+      try {
+        // 并发方在 mkdir 后立即读 pid;原子发布完整 PID,避免看到空文件。
+        await retryAgentFileOperation(async () => writeStateFileAtomic(join(path, 'pid'), String(process.pid)))
+      } catch (error) {
         // 自己刚建出的锁没写全(ENOSPC / EACCES / Windows 扫描器占用等)必须回滚:
         // 空锁目录留在原地会让后续每次尝试都 EEXIST → 读不到 pid → 5s 宽限后抛
         // Invalid runtime update lock,人工删目录前该 agent 的更新永久失败(WR-02)。
@@ -194,42 +243,46 @@ export async function updateAgentRuntime(agent: UpdatedAgent, options: AgentUpda
   let failure: unknown
   let preserveStaging = false
   try {
-    options.report?.(`${agent}: 检查 upstream latest`)
     const previous = readState(agent, root)
+    options.report?.(`${agent}: 检查 upstream latest`)
     const versions = await resolveAgentPackages(agent, options.metadata ?? ((name, version) => metadata(name, version, options.signal)))
     options.signal?.throwIfAborted()
-    const security = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8')).overrides ?? {}
-    const fingerprint = createHash('sha256').update(JSON.stringify({ installFormat: 2, versions: Object.entries(versions).sort(), security,
+    const manifest = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+    // Runtime-only fixes must not install a Node 20+ dependency into the
+    // Node 18-compatible daemon. DSH already owns a separate Node 22+ tree.
+    const security = { ...manifest.overrides, ...manifest.agentRuntimeOverrides?.[agent] }
+    const fingerprint = createHash('sha256').update(JSON.stringify({ installFormat: agent === 'dsh' ? 3 : 2, versions: Object.entries(versions).sort(), security,
       platform: process.platform, arch: process.arch })).digest('hex').slice(0, 20)
     const destination = join(directory, fingerprint)
     if (!existsSync(destination)) {
       staging = await mkdtemp(join(directory, '.install-'))
       // Resolved versions are an installation snapshot, never a compatibility whitelist.
+      // Keep internal DSH plugins transitive so npm can place their peers according
+      // to upstream dependencies; the overrides still keep its family on one release.
       await writeFile(join(staging, 'package.json'), JSON.stringify({ name: `lodestar-runtime-${agent}`, version: versions[PACKAGES[agent][0]], private: true, type: 'module',
-        dependencies: versions, overrides: { ...security, ...(agent === 'dsh' ? versions : {}) } }) + '\n', { mode: 0o600 })
+        dependencies: Object.fromEntries(PACKAGES[agent].map(name => [name, versions[name]])),
+        overrides: { ...security, ...(agent === 'dsh' ? versions : {}) } }) + '\n', { mode: 0o600 })
       await (options.install ?? installAgentPackages)(staging, options.signal)
-      for (const [name, version] of Object.entries(versions)) {
-        const installed = JSON.parse(await readFile(join(staging, 'node_modules', name, 'package.json'), 'utf8'))
-        if (installed.version !== version) throw new Error(`npm installed ${name}@${installed.version}, expected ${version}`)
-      }
+      await validateInstalledPackages(staging, versions)
       options.signal?.throwIfAborted()
       const completedInstall = staging
       await retryAgentFileOperation(() => rename(completedInstall, destination))
       staging = undefined
+    } else {
+      // An existing fingerprint is not proof that its installation is intact.
+      // Never activate a damaged directory or overwrite files a process may use.
+      await validateInstalledPackages(destination, versions)
     }
     const state = { directory: destination, versions, checkedAt: Date.now() }
+    const unchanged = previous?.directory === destination
     await writeState(directory, state)
-    options.report?.(`${agent}: ${PACKAGES[agent][0]}@${versions[PACKAGES[agent][0]]}${previous?.directory === destination ? ' 已是 latest' : ' 已更新，新进程使用新版'}`)
+    options.report?.(`${agent}: ${PACKAGES[agent][0]}@${versions[PACKAGES[agent][0]]}${unchanged ? ' 已是 latest' : ' 已更新，新进程使用新版'}`)
     return state
   } catch (error) {
-    // Old processes own immutable paths. A failed refresh is visible and blocks new starts.
+    // Failed updates leave the selected installation untouched. The updater
+    // reports the failure; an enabled timer tries again at its next interval.
     failure = error
     preserveStaging = error instanceof AgentInstallTerminationError
-    try { await writeState(directory, { checkedAt: Date.now(), error: errorMessage(error) }) }
-    catch (stateError) {
-      failure = new AggregateError([error, stateError], `${errorMessage(error)}; recording update failure also failed: ${errorMessage(stateError)}`)
-      throw failure
-    }
     throw error
   } finally {
     const cleanupErrors: unknown[] = []

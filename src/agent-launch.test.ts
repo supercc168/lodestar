@@ -4,6 +4,17 @@ import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 
+import * as codexProcess from './codex-process'
+import type { TokenSource } from './token-source'
+import './token-source-openrouter'
+
+// codex-process 在本文件被 mock.module 顶替(构造期替身,见下)。prototype 级单测
+// (threadParams 线格式)需要真实类,故在 mock 注册前捕获原始引用。
+const RealCodexProcess = codexProcess.CodexProcess
+
+// ── 子进程替身 ─────────────────────────────────────────────────────────
+// 各后端都在构造期真实 spawn(app-server / dsh runtime / reclaude):用例只验
+// agent-launch 的接线面,故用替身顶掉进程创建。spread 保留其余真实实现。
 mock.module('node:child_process', () => {
   const actual = require('node:child_process') as typeof import('node:child_process')
   return {
@@ -20,6 +31,22 @@ mock.module('node:child_process', () => {
   }
 })
 
+// CodexProcess 构造即拉起 app-server,且测试树内没有 codex runtime(resolveCodexBin
+// 会抛):同上游用例的子进程替身只顶掉构造函数,其余导出(CODEX_* 常量)保持真实。
+// 注意:bun 的 mock.module 在同 worker 内跨文件可见(session.test.ts 同 worker 时
+// 其 listCodexConversations 用例会 spy 原型),Fake 需带同名方法面供 spyOn 正常钉。
+mock.module('./codex-process', () => ({
+  ...codexProcess,
+  CodexProcess: class FakeCodexProcess extends EventEmitter {
+    readonly provider = 'codex'
+    readonly opts: any
+    constructor(opts: any) { super(); this.opts = opts }
+    isAlive() { return false }
+    async listConversations(): Promise<never> { throw new Error('listConversations not mocked in agent-launch tests') }
+    async kill(): Promise<void> {}
+  },
+}))
+
 // DSH 后端在构造期就拉起子进程(dsh-runtime 的构造函数即 spawn node):用例只验
 // 接线面,故像 dsh-process.test.ts 的假 runtime 一样用替身顶掉 DshProcess。
 mock.module('./dsh-process', () => ({
@@ -32,109 +59,270 @@ mock.module('./dsh-process', () => ({
 
 const { createAgentProcess } = await import('./agent-launch')
 const { ClaudeAgentProcess } = await import('./claude-agent-process')
-const {
-  buildCodexSpawnEnv,
-  CodexProcess,
-} = await import('./codex-process')
+const { CodexProcess } = await import('./codex-process')
 const {
   delegatedAgentDeveloperInstructions,
   spawnDeveloperInstructions,
 } = await import('./session-worktree')
 const { CHANNEL_INSTRUCTIONS, CLAUDE_CHANNEL_INSTRUCTIONS } = await import('./instructions')
-const { config } = await import('./config')
+const {
+  listTokenSources,
+  registerTokenSource,
+  resetTokenSourceRegistry,
+  scrubAnthropicEnv,
+  tokenSourceFactories,
+} = await import('./token-source')
+await import('./token-source-dsh')
 const worktree = await import('./worktree')
 
-describe('createAgentProcess slim factory', () => {
-  test('Claude constructor keeps selectionModel and never the SDK bare name', () => {
-    const prev = config.claude.models
-    ;(config.claude as any).models = {
-      glm: { model: 'glm-5.3', base_url: 'https://glm.example/anthropic', auth_token: 'glm-tok' },
+// session-worktree 的 spawnDeveloperInstructions 两侧签名不同(本地 1 参 / 上游
+// 3 参且后参有默认语义)。断言只依赖返回值,按上游调用形(带 mode)执行、兼容两侧。
+const spawnInstructions = spawnDeveloperInstructions as unknown as (s: unknown, mode?: unknown) => string
+
+test('API Codex launch does not consult or bind a subscription account', () => {
+  const script = `
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    import assert from 'node:assert/strict'
+    let child, captured
+    const spawn = (bin, args, options) => {
+      captured = { args, options }
+      child = new EventEmitter()
+      child.stdin = new EventEmitter(); child.stdout = new EventEmitter(); child.stderr = new EventEmitter()
+      child.stdin.write = () => true
+      return child
     }
+    mock.module('cross-spawn', () => ({ default: spawn, spawn }))
+    // 合并后的 codex-process 可能经 node spawn(本地侧)或 cross-spawn(上游侧):
+    // 两侧都接到同一个捕获点,断言不变。
+    mock.module('node:child_process', () => {
+      const actual = require('node:child_process')
+      return { ...actual, spawn }
+    })
+    const { registerTokenSource } = await import('./src/token-source')
+    const { createAgentProcess } = await import('./src/agent-launch')
+    const { codexAccountInUse } = await import('./src/codex-accounts')
+    registerTokenSource({ id: 'api-test', kind: 'api-test', agent: 'codex', enabled: true,
+      models: [{ model: 'kimi-k3', display: 'Kimi', efforts: ['high'], defaultEffort: 'high' }],
+      defaultModel: 'kimi-k3', modelCatalogState: { status: 'ready', updatedAt: 1 },
+      codexApiProvider: { id: 'packy', name: 'Packy', baseUrl: 'https://gateway.test/v1', envKey: 'TEST_PACKY_KEY' },
+      spawnEnv: env => ({ ...env, TEST_PACKY_KEY: 'private-test-key' }), resolveSpawnModel: model => model })
+    const { process: proc } = createAgentProcess({ provider: 'codex', tokenSourceId: 'api-test', workDir: '/repo',
+      model: 'kimi-k3', effort: 'high', codexAccountId: 'nonexistent-subscription-account' })
+    assert.ok(captured.args.includes('model_provider="packy"'))
+    assert.ok(!captured.args.join(' ').includes('private-test-key'))
+    assert.ok(!captured.args.join(' ').includes('forced_login_method'))
+    assert.equal(captured.options.env.TEST_PACKY_KEY, 'private-test-key')
+    assert.equal(codexAccountInUse('nonexistent-subscription-account'), false)
+    child.emit('exit', 0, null); child.emit('close', 0, null)
+  `
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+    cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+  })
+  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+})
+
+test('manual Codex launch bypasses failed catalogs and model restrictions while automatic launch still rejects them', () => {
+  const script = `
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    import assert from 'node:assert/strict'
+    const captured = []
+    mock.module('./src/codex-process', () => ({
+      CodexProcess: class extends EventEmitter { constructor(opts) { super(); captured.push(opts) } isAlive() { return false } },
+      isCodexReasoningEffort: value => value === 'ultra', resolveCodexBin: () => 'unused',
+      // 本地链(codex-models 经 token-source/agent-launch 闭包)还消费这两个导出;
+      // 上游三键 mock 在合并树上不完整,按合并实现默认值补齐。
+      CODEX_EFFORT: 'max', CODEX_REASONING_EFFORTS: ['none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max', 'ultra'],
+    }))
+    const { registerTokenSource } = await import('./src/token-source')
+    registerTokenSource({ id: 'codex-sub', kind: 'codex-subscription', agent: 'codex', enabled: false,
+      models: [], defaultModel: 'model', modelCatalogState: { status: 'failed', error: 'catalog unavailable' },
+      spawnEnv: env => env, resolveSpawnModel: () => { throw new Error('must not resolve unavailable catalog') } })
+    const { createAgentProcess } = await import('./src/agent-launch')
+    const opts = { provider: 'codex', tokenSourceId: 'codex-sub', workDir: '/repo', model: 'uncatalogued-model', effort: 'ultra' }
+    assert.throws(() => createAgentProcess(opts), /disabled/)
+    createAgentProcess({ ...opts, codexManualAccount: true, codexAccountId: 'explicit-account' })
+    assert.equal(captured.length, 1)
+    assert.equal(captured[0].model, 'uncatalogued-model')
+    assert.equal(captured[0].effort, 'ultra')
+    assert.equal(captured[0].codexAccountId, 'explicit-account')
+  `
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+    cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+  })
+  expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+})
+
+for (const status of ['idle', 'loading', 'failed', 'ready'] as const) {
+  test(`launch reports ${status} catalog state without substituting a model`, () => {
+    const previous = listTokenSources()
+    resetTokenSourceRegistry()
+    const source: TokenSource = {
+      id: 'launch-test', kind: 'test', agent: 'codex', display: 'Test Codex', enabled: true,
+      models: [], defaultModel: '', modelCatalogState: { status, updatedAt: null, error: 'catalog upstream unavailable' },
+      refreshModels: async () => {},
+      spawnEnv: env => env,
+      resolveSpawnModel: model => model,
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    }
+    registerTokenSource(source)
     try {
-      const { process: proc } = createAgentProcess({
-        provider: 'claude',
-        workDir: '/tmp/agent-work',
-        tokenSourceId: 'claude:glm',
-        model: 'claude:glm',
-        effort: 'max',
-        hostEnv: { LODESTAR_AGENT_CAPABILITY: 'cap-1' },
-      })
-      expect(proc).toBeInstanceOf(ClaudeAgentProcess)
-      expect((proc as any).opts.model).toBe('claude:glm')
-      expect((proc as any).opts.model).not.toBe('glm-5.3')
-      expect((proc as any).opts.workDir).toBe('/tmp/agent-work')
-      expect((proc as any).opts.hostEnv).toEqual({ LODESTAR_AGENT_CAPABILITY: 'cap-1' })
+      const expected = status === 'failed'
+        ? 'model catalog refresh failed for launch-test: catalog upstream unavailable'
+        : status === 'ready'
+          ? 'model is not present in token source launch-test: gpt-6-astra'
+          : `model catalog is not ready for launch-test: ${status}`
+      expect(() => createAgentProcess({
+        provider: 'codex', workDir: '/tmp', tokenSourceId: source.id, model: 'gpt-6-astra', effort: 'ultra',
+      })).toThrow(expected)
     } finally {
-      ;(config.claude as any).models = prev
+      resetTokenSourceRegistry()
+      for (const item of previous) registerTokenSource(item)
     }
   })
+}
 
+test('the shared Claude launch passes the selected OpenRouter slug to its role environment and rejects undeclared effort', () => {
+  const previous = listTokenSources()
+  const source = tokenSourceFactories().find(entry => entry.kind === 'openrouter')!.build({ api_key: 'launch-test-key' })
+  source.models = [{ model: 'vendor/test', display: 'Test', efforts: ['medium'], defaultEffort: 'medium' }]
+  source.modelCatalogState = { status: 'ready', updatedAt: 1 }
+  registerTokenSource(source)
+  try {
+    const opts = { provider: 'claude' as const, workDir: '/tmp', tokenSourceId: 'openrouter', model: 'vendor/test', effort: 'medium' as const }
+    const created = createAgentProcess(opts)
+    const env = (created.process as any).opts.transformEnv({ ANTHROPIC_AUTH_TOKEN: 'previous-key' })
+    expect(env.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('vendor/test')
+    expect(env.ANTHROPIC_AUTH_TOKEN).toBe('launch-test-key')
+    expect((created.process as any).opts.settingSources).toEqual(['project', 'local'])
+    expect(() => createAgentProcess({ ...opts, effort: 'max' })).toThrow('model effort unavailable')
+  } finally {
+    resetTokenSourceRegistry()
+    for (const item of previous) registerTokenSource(item)
+  }
+})
+
+// ── 本地 fork 用例(移植到上游 TokenSource 形状) ────────────────────────
+
+// registry 夹具:重置 → 注册 → 运行 → 还原。
+function withRegisteredSources(sources: TokenSource[], run: () => void): void {
+  const previous = listTokenSources()
+  resetTokenSourceRegistry()
+  for (const item of sources) registerTokenSource(item)
+  try {
+    run()
+  } finally {
+    resetTokenSourceRegistry()
+    for (const item of previous) registerTokenSource(item)
+  }
+}
+
+function codexSource(): TokenSource {
+  return {
+    id: 'codex-login:gpt-5.6-sol', kind: 'codex-login', agent: 'codex', display: 'Codex · GPT-5.6 Sol', enabled: true,
+    models: [{ model: 'gpt-5.6-sol', display: 'GPT-5.6 Sol', efforts: ['low', 'medium', 'high', 'xhigh'], defaultEffort: 'high' }],
+    defaultModel: 'gpt-5.6-sol',
+    refreshModels: async () => {},
+    spawnEnv: env => env,
+    resolveSpawnModel: model => model,
+    readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    modelCatalogState: { status: 'ready', updatedAt: Date.now() },
+  }
+}
+
+function claudeCompatSource(): TokenSource {
+  return {
+    id: 'claude:deepseek', kind: 'api', agent: 'claude', display: 'Claude · DeepSeek 兼容', enabled: true,
+    models: [{ model: 'claude:deepseek', display: 'deepseek-v4-pro[1m]', efforts: ['low', 'max'], defaultEffort: 'max' }],
+    defaultModel: 'claude:deepseek',
+    refreshModels: async () => {},
+    spawnEnv: env => {
+      const out = scrubAnthropicEnv(env)
+      out.ANTHROPIC_BASE_URL = 'https://api.deepseek.com/anthropic'
+      out.ANTHROPIC_AUTH_TOKEN = 'claude-compat-token'
+      return out
+    },
+    resolveSpawnModel: () => 'deepseek-v4-pro[1m]',
+    readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    modelCatalogState: { status: 'ready', updatedAt: Date.now() },
+  }
+}
+
+// 真实 dsh factory + 手工目录:凭据与 env 语义都走 token-source-dsh 的本体。
+function dshSource(apiKey: string): TokenSource {
+  const factory = tokenSourceFactories().find(entry => entry.kind === 'deepseek-harness')!
+  const source = factory.build({ api_key: apiKey, model: 'deepseek-v4-pro' })
+  source.models = [{ model: 'deepseek-v4-pro', display: 'deepseek-v4-pro', efforts: ['off', 'low', 'high', 'max'], defaultEffort: null }]
+  if (apiKey) source.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
+  return source
+}
+
+describe('createAgentProcess 源闸与选项透传', () => {
   test('unknown tokenSourceId throws', () => {
-    expect(() => createAgentProcess({
-      provider: 'claude',
-      workDir: '/tmp',
-      tokenSourceId: 'missing-source',
-      model: 'claude:fable',
-      effort: 'max',
-    })).toThrow(/token source not found: missing-source/)
+    withRegisteredSources([], () => {
+      expect(() => createAgentProcess({
+        provider: 'claude',
+        workDir: '/tmp',
+        tokenSourceId: 'missing-source',
+        model: 'claude:fable',
+        effort: 'max',
+      })).toThrow(/token source not found: missing-source/)
+    })
   })
 
   test('provider mismatch throws', () => {
-    expect(() => createAgentProcess({
-      provider: 'codex',
-      workDir: '/tmp',
-      tokenSourceId: 'claude:fable',
-      model: 'gpt-5.6-sol',
-      effort: 'max',
-    })).toThrow(/belongs to claude, not codex/)
+    withRegisteredSources([claudeCompatSource()], () => {
+      expect(() => createAgentProcess({
+        provider: 'codex',
+        workDir: '/tmp',
+        tokenSourceId: 'claude:deepseek',
+        model: 'gpt-5.6-sol',
+        effort: 'high',
+      })).toThrow(/belongs to claude, not codex/)
+    })
   })
 
   test('disabled token source throws', () => {
-    expect(() => createAgentProcess({
-      provider: 'claude',
-      workDir: '/tmp',
-      tokenSourceId: 'claude:glm',
-      model: 'claude:glm',
-      effort: 'max',
-    })).toThrow(/token source disabled: claude:glm/)
+    withRegisteredSources([dshSource('')], () => {
+      expect(() => createAgentProcess({
+        provider: 'dsh',
+        workDir: '/tmp',
+        tokenSourceId: 'deepseek-harness',
+        model: 'deepseek-v4-pro',
+        effort: 'high',
+      })).toThrow(/token source disabled: deepseek-harness/)
+    })
   })
 
-  test('Codex path carries configArgs/providerEnv and lodestar-agent serviceName', () => {
-    const { process: proc } = createAgentProcess({
-      provider: 'codex',
-      workDir: '/tmp/codex-work',
-      tokenSourceId: 'codex-login:gpt-5.6-sol',
-      model: 'gpt-5.6-sol',
-      effort: 'max',
-      hostEnv: { LODESTAR_AGENT_URL: 'http://127.0.0.1:9876' },
-      serviceName: 'lodestar-agent',
+  test('Codex path carries tokenSourceId/transformEnv and lodestar-agent serviceName', () => {
+    withRegisteredSources([codexSource()], () => {
+      const { process: proc } = createAgentProcess({
+        provider: 'codex',
+        workDir: '/tmp/codex-work',
+        tokenSourceId: 'codex-login:gpt-5.6-sol',
+        model: 'gpt-5.6-sol',
+        effort: 'high',
+        hostEnv: { LODESTAR_AGENT_URL: 'http://127.0.0.1:9876' },
+        serviceName: 'lodestar-agent',
+      })
+      expect(proc).toBeInstanceOf(CodexProcess)
+      const opts = (proc as any).opts
+      expect(opts.workDir).toBe('/tmp/codex-work')
+      expect(opts.serviceName).toBe('lodestar-agent')
+      expect(opts.hostEnv).toEqual({ LODESTAR_AGENT_URL: 'http://127.0.0.1:9876' })
+      expect(opts.tokenSourceId).toBe('codex-login:gpt-5.6-sol')
+      expect(opts.codexAccountId).toBe('default')
+      expect(opts.model).toBe('gpt-5.6-sol')
+      expect(opts.effort).toBe('high')
+      expect(typeof opts.transformEnv).toBe('function')
     })
-    expect(proc).toBeInstanceOf(CodexProcess)
-    const opts = (proc as any).opts
-    expect(opts.workDir).toBe('/tmp/codex-work')
-    expect(opts.serviceName).toBe('lodestar-agent')
-    expect(opts.hostEnv).toEqual({ LODESTAR_AGENT_URL: 'http://127.0.0.1:9876' })
-    expect(Array.isArray(opts.configArgs)).toBe(true)
-    expect(opts.providerEnv).toBeDefined()
-    expect(opts.model).not.toBe('claude:glm')
   })
 })
 
 describe('createAgentProcess dsh 分支(D-08 双轨:与 claude:deepseek 互不相读)', () => {
-  function withDshConfig(section: { api_key?: string; model?: string; base_url?: string } | undefined): () => void {
-    const prev = (config as any).deepseek_harness
-    ;(config as any).deepseek_harness = section
-    return () => { (config as any).deepseek_harness = prev }
-  }
-
-  test('DshProcess 已由替身顶掉:构造期不 spawn 真实子进程', async () => {
-    const { DshProcess } = await import('./dsh-process')
-    expect(DshProcess.name).toBe('FakeDshProcess')
-  })
-
-  test('凭据齐备时构造 dsh 进程,tokenSourceId 与 env 清洗都来自 DSH 源', () => {
-    const restore = withDshConfig({ api_key: 'dsh-key', model: 'deepseek-v4-pro' })
-    try {
+  test('凭据齐备时构造 dsh 进程,凭据只经 DSH 源 spawnEnv 接线(transformEnv)', () => {
+    withRegisteredSources([dshSource('dsh-key')], () => {
       const { process: proc } = createAgentProcess({
         provider: 'dsh',
         workDir: '/tmp/dsh-work',
@@ -149,6 +337,7 @@ describe('createAgentProcess dsh 分支(D-08 双轨:与 claude:deepseek 互不�
       expect(opts.model).toBe('deepseek-v4-pro')
       expect(opts.effort).toBe('high')
       expect(opts.workDir).toBe('/tmp/dsh-work')
+      expect(opts.hostEnv).toEqual({ LODESTAR_AGENT_CAPABILITY: 'cap-dsh' })
       expect(typeof opts.transformEnv).toBe('function')
 
       const env = opts.transformEnv({
@@ -159,35 +348,13 @@ describe('createAgentProcess dsh 分支(D-08 双轨:与 claude:deepseek 互不�
       expect(Object.keys(env).filter((key: string) => key.startsWith('ANTHROPIC_'))).toEqual([])
       expect(env.DEEPSEEK_API_KEY).toBe('dsh-key')
       expect(env.DEEPSEEK_BASE_URL).toBe('https://api.deepseek.com')
+      expect(env.LODESTAR_DSH_PROVIDER).toBe('deepseek-official')
       expect(env.LODESTAR_AGENT_CAPABILITY).toBe('cap-dsh')
-    } finally {
-      restore()
-    }
+    })
   })
 
-  test('allowDelegation:false 透传 DshProcess 构造(D-11 口径 3,与 claude/codex 同形)', () => {
-    const restore = withDshConfig({ api_key: 'dsh-key', model: 'deepseek-v4-pro' })
-    try {
-      const base = {
-        provider: 'dsh' as const,
-        workDir: '/tmp/dsh-work',
-        tokenSourceId: 'deepseek-harness',
-        model: 'deepseek-v4-pro',
-        effort: 'high' as const,
-      }
-      const restricted = createAgentProcess({ ...base, allowDelegation: false })
-      expect((restricted.process as any).opts.allowDelegation).toBe(false)
-      // 缺省(undefined)不限制:主 Agent 走同一构造入口,不得被误关。
-      const main = createAgentProcess({ ...base })
-      expect((main.process as any).opts.allowDelegation).toBeUndefined()
-    } finally {
-      restore()
-    }
-  })
-
-  test('effort 非法(medium)或缺省时抛错,不静默回落', () => {
-    const restore = withDshConfig({ api_key: 'dsh-key', model: 'deepseek-v4-pro' })
-    try {
+  test('effort 词表外先撞 effort 闸,effort 缺省撞 DSH 闸,不静默回落', () => {
+    withRegisteredSources([dshSource('dsh-key')], () => {
       const base = {
         provider: 'dsh' as const,
         workDir: '/tmp/dsh-work',
@@ -195,52 +362,14 @@ describe('createAgentProcess dsh 分支(D-08 双轨:与 claude:deepseek 互不�
         model: 'deepseek-v4-pro',
       }
       expect(() => createAgentProcess({ ...base, effort: 'medium' }))
-        .toThrow('DSH requires a configured source, model and valid effort')
+        .toThrow('model effort unavailable: deepseek-harness/deepseek-v4-pro/medium')
       expect(() => createAgentProcess({ ...base }))
         .toThrow('DSH requires a configured source, model and valid effort')
-    } finally {
-      restore()
-    }
+    })
   })
 
-  test('源未启用或模型缺失时抛错', () => {
-    const unconfigured = withDshConfig(undefined)
-    try {
-      expect(() => createAgentProcess({
-        provider: 'dsh',
-        workDir: '/tmp/dsh-work',
-        tokenSourceId: 'deepseek-harness',
-        model: 'deepseek-v4-pro',
-        effort: 'high',
-      })).toThrow(/token source disabled: deepseek-harness/)
-    } finally {
-      unconfigured()
-    }
-    const configured = withDshConfig({ api_key: 'dsh-key' })
-    try {
-      expect(() => createAgentProcess({
-        provider: 'dsh',
-        workDir: '/tmp/dsh-work',
-        tokenSourceId: 'deepseek-harness',
-        model: '',
-        effort: 'high',
-      })).toThrow('DSH requires a configured source, model and valid effort')
-    } finally {
-      configured()
-    }
-  })
-
-  test('双轨不冲突:provider claude + claude:deepseek 仍走 ClaudeAgentProcess', () => {
-    const prevModels = config.claude.models
-    const restoreDsh = withDshConfig({ api_key: 'dsh-key', model: 'deepseek-v4-pro' })
-    ;(config.claude as any).models = {
-      deepseek: {
-        model: 'deepseek-v4-pro[1m]',
-        base_url: 'https://api.deepseek.com/anthropic',
-        auth_token: 'claude-compat-token',
-      },
-    }
-    try {
+  test('双轨不冲突:provider claude + claude:deepseek 走 ClaudeAgentProcess,spawn 名与 env 来自本档源', () => {
+    withRegisteredSources([claudeCompatSource(), dshSource('dsh-key')], () => {
       const { process: proc } = createAgentProcess({
         provider: 'claude',
         workDir: '/tmp/claude-work',
@@ -250,11 +379,92 @@ describe('createAgentProcess dsh 分支(D-08 双轨:与 claude:deepseek 互不�
       })
       expect(proc).toBeInstanceOf(ClaudeAgentProcess)
       expect(proc.provider).toBe('claude')
-      expect((proc as any).opts.model).toBe('claude:deepseek')
-    } finally {
-      ;(config.claude as any).models = prevModels
-      restoreDsh()
-    }
+      const opts = (proc as any).opts
+      expect(opts.tokenSourceId).toBe('claude:deepseek')
+      // 选中键经本档 resolveSpawnModel 解析成真实的 [1m] 记账名。
+      expect(opts.model).toBe('deepseek-v4-pro[1m]')
+      const env = opts.transformEnv({ ANTHROPIC_API_KEY: 'stray-key', ANTHROPIC_AUTH_TOKEN: 'previous' })
+      expect(env.ANTHROPIC_API_KEY).toBeUndefined()
+      expect(env.ANTHROPIC_AUTH_TOKEN).toBe('claude-compat-token')
+      expect(env.ANTHROPIC_BASE_URL).toBe('https://api.deepseek.com/anthropic')
+
+      // 反向:DSH 档的 transformEnv 先 scrub ANTHROPIC_*,绝不夹带 claude:deepseek 凭据。
+      const dshProc = createAgentProcess({
+        provider: 'dsh',
+        workDir: '/tmp/dsh-work',
+        tokenSourceId: 'deepseek-harness',
+        model: 'deepseek-v4-pro',
+        effort: 'high',
+      })
+      const dshEnv = (dshProc.process as any).opts.transformEnv({ ANTHROPIC_AUTH_TOKEN: 'claude-compat-token' })
+      expect(dshEnv.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
+      expect(dshEnv.DEEPSEEK_API_KEY).toBe('dsh-key')
+    })
+  })
+})
+
+describe('createAgentProcess allowDelegation 闸(D-11 口径 3:显式 false 才关)', () => {
+  test('claude:allowDelegation:false 透传,缺省不限制', () => {
+    withRegisteredSources([claudeCompatSource()], () => {
+      const base = {
+        provider: 'claude' as const,
+        workDir: '/tmp/claude-work',
+        tokenSourceId: 'claude:deepseek',
+        model: 'claude:deepseek',
+        effort: 'max' as const,
+      }
+      const restricted = createAgentProcess({ ...base, allowDelegation: false })
+      expect((restricted.process as any).opts.allowDelegation).toBe(false)
+      // 缺省(undefined)不限制:主 Agent 走同一构造入口,不得被误关。
+      const main = createAgentProcess({ ...base })
+      expect((main.process as any).opts.allowDelegation).toBeUndefined()
+    })
+  })
+
+  test('codex:allowDelegation:false 透传,缺省不限制', () => {
+    withRegisteredSources([codexSource()], () => {
+      const base = {
+        provider: 'codex' as const,
+        workDir: '/tmp/codex-work',
+        tokenSourceId: 'codex-login:gpt-5.6-sol',
+        model: 'gpt-5.6-sol',
+        effort: 'high' as const,
+      }
+      const restricted = createAgentProcess({ ...base, allowDelegation: false })
+      expect((restricted.process as any).opts.allowDelegation).toBe(false)
+      const main = createAgentProcess({ ...base })
+      expect((main.process as any).opts.allowDelegation).toBeUndefined()
+    })
+  })
+
+  test('dsh:allowDelegation:false 透传,缺省不限制', () => {
+    withRegisteredSources([dshSource('dsh-key')], () => {
+      const base = {
+        provider: 'dsh' as const,
+        workDir: '/tmp/dsh-work',
+        tokenSourceId: 'deepseek-harness',
+        model: 'deepseek-v4-pro',
+        effort: 'high' as const,
+      }
+      const restricted = createAgentProcess({ ...base, allowDelegation: false })
+      expect((restricted.process as any).opts.allowDelegation).toBe(false)
+      const main = createAgentProcess({ ...base })
+      expect((main.process as any).opts.allowDelegation).toBeUndefined()
+    })
+  })
+
+  test('source 三后端同形显式 spread,本地 slim 接口不得复活', () => {
+    const src = readFileSync(join(import.meta.dir, 'agent-launch.ts'), 'utf8')
+    const code = src
+      .split('\n')
+      .filter(line => !/^\s*\/\//.test(line))
+      .join('\n')
+    const gates = code.match(/allowDelegation === false \? \{ allowDelegation: false \} : \{\}/g) ?? []
+    expect(gates).toHaveLength(3)
+    // dsh 分支经 TokenSource.spawnEnv 注入凭据;合并后走 registry 按 id 取源。
+    expect(code).toContain('getTokenSourceForAccount')
+    expect(code).toContain('isDshReasoningEffort')
+    expect(code).not.toContain('resolveTokenSource')
   })
 })
 
@@ -267,6 +477,16 @@ describe('hostEnv survives credential scrub', () => {
         workDir: '/tmp',
         effort: 'max',
         model: 'claude:fable',
+        // 合并架构:凭据清洗(ANTHROPIC_*)与 GSD_RUNTIME 基线在 launch 层注入的
+        // transformEnv(token-source.spawnEnv)执行;seam 只保证 hostEnv 合并在其后
+        // 且仅覆盖同名键 —— fake 里预置 'clobbered' 锁死这个顺序不变式。
+        transformEnv: env => {
+          const out = { ...env }
+          delete out.ANTHROPIC_API_KEY
+          out.GSD_RUNTIME = 'claude'
+          out.LODESTAR_AGENT_CAPABILITY = 'clobbered'
+          return out
+        },
         hostEnv: {
           LODESTAR_AGENT_CAPABILITY: 'cap-secret',
           LODESTAR_AGENT_URL: 'http://127.0.0.1:9876',
@@ -284,7 +504,7 @@ describe('hostEnv survives credential scrub', () => {
   })
 
   test('Codex spawn env merges hostEnv after provider env lock', () => {
-    const env = buildCodexSpawnEnv(
+    const env = codexProcess.buildCodexSpawnEnv(
       { GSD_RUNTIME: 'claude', LODESTAR_TEST_PROVIDER_KEY: 'set' },
       { LODESTAR_AGENT_CAPABILITY: 'cap-secret' },
     )
@@ -294,7 +514,7 @@ describe('hostEnv survives credential scrub', () => {
   })
 
   test('Codex threadParams uses opts.serviceName or lodestar', () => {
-    const proc = Object.create(CodexProcess.prototype) as any
+    const proc = Object.create(RealCodexProcess.prototype) as any
     proc.opts = { workDir: '/tmp', effort: 'high', serviceName: 'lodestar-agent' }
     expect(proc.threadParams().serviceName).toBe('lodestar-agent')
     proc.opts = { workDir: '/tmp', effort: 'high' }
@@ -315,7 +535,7 @@ describe('delegatedAgentDeveloperInstructions', () => {
     expect(text).not.toContain('[[send:')
     expect(CLAUDE_CHANNEL_INSTRUCTIONS).toContain('AskUserQuestion')
     expect(CHANNEL_INSTRUCTIONS).toContain('request_user_input')
-    expect(spawnDeveloperInstructions(s)).toContain('AskUserQuestion')
+    expect(spawnInstructions(s, 'chat')).toContain('AskUserQuestion')
   })
 
   test('can include worktree extra without channel markers', () => {
@@ -337,23 +557,5 @@ describe('delegatedAgentDeveloperInstructions', () => {
     } finally {
       spy.mockRestore()
     }
-  })
-})
-
-describe('agent-launch port discipline', () => {
-  test('source calls resolveTokenSource and never the upstream registry lookup', () => {
-    const src = readFileSync(join(import.meta.dir, 'agent-launch.ts'), 'utf8')
-    const code = src
-      .split('\n')
-      .filter(line => !/^\s*\/\//.test(line))
-      .join('\n')
-    expect(code).toContain('resolveTokenSource')
-    expect(code).not.toContain('getTokenSource')
-    // dsh 分支经 TokenSource.spawnEnv 注入凭据(本地 slim 形态);上游的
-    // sourceRevision 概念本地不存在,不得臆造。
-    expect(code).toContain('isDshReasoningEffort')
-    expect(code).not.toContain('sourceRevision')
-    expect(code).not.toContain('settingSources')
-    expect(code).not.toContain('managedSkillPluginPath')
   })
 })

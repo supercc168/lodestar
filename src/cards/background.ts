@@ -48,6 +48,7 @@ import type {
 import { fmtElapsed, liveElapsed, type LiveElapsedMode } from './format'
 import { sanitizeMarkdownForCardKit } from './elements'
 import { shellCommandDescription } from './shell-command'
+import { agentCardTaskKindLabel, type AgentCardTaskKind } from './task-kind'
 import { summarizeToolInput } from './tool'
 
 export type { BgTaskStatus }
@@ -58,6 +59,8 @@ export type BgTaskType = 'subagent' | 'shell' | 'monitor' | 'workflow' | 'unknow
 /** 一条后台任务的累积视图,session 以 task_id 为 key 维护一份数组。 */
 export interface BgTaskEntry {
   id: string
+  /** Stable presentation identity, retained when the SDK supplies its task/tool ids. */
+  displayId?: string
   toolUseId?: string
   type: BgTaskType
   description: string
@@ -92,8 +95,8 @@ export interface BgTaskStep {
 
 /** 后台任务累积库 —— 双池结构,session 以此为单一可变状态。
  *  - active:已确认后台(workflow/monitor 白名单,或收到 is_backgrounded:true 提升),
- *    驱动游标卡渲染。
- *  - pending:观察池。task_started 进来但还没后台化的前台 task(Bash 命令/前台子 agent),
+ *    驱动共享任务卡的任务行。
+ *  - pending:观察池。尚未确认后台化的普通命令,
  *    不渲染;等 task_updated.is_backgrounded=true 提升到 active,或 task_settled 时丢弃。 */
 export interface BgStore {
   active: BgTaskEntry[]
@@ -143,7 +146,7 @@ export const BG_FOLD_KEEP = 2
 function normalizeType(taskType?: string, subagentType?: string): BgTaskType {
   // SDK 实测 task_type 带 local_ 前缀:local_agent / local_bash / local_workflow。
   const t = taskType ?? ''
-  if (t === 'subagent' || t === 'local_agent') return 'subagent'
+  if (t === 'agent' || t === 'subagent' || t === 'local_agent') return 'subagent'
   if (t === 'shell' || t === 'local_bash' || t === 'local_shell') return 'shell'
   if (t === 'monitor' || t === 'local_monitor') return 'monitor'
   if (t === 'workflow' || t === 'local_workflow') return 'workflow'
@@ -164,7 +167,7 @@ export function isBgTerminal(t: BgTaskEntry): boolean {
   return t.status === 'completed' || t.status === 'failed' || t.status === 'killed'
 }
 
-/** 是否还有活跃任务(决定游标卡要不要继续跟随 / 重建)。 */
+/** 是否还有活跃任务。 */
 export function hasActiveBgTask(tasks: BgTaskEntry[]): boolean {
   return tasks.some(t => !isBgTerminal(t))
 }
@@ -195,27 +198,41 @@ export function applyBgTaskStarted(
   now: number = Date.now(),
 ): BgStore {
   const type = normalizeType(e.task_type, e.subagent_type)
-  const inActive = store.active.some(t => t.id === e.task_id)
-  const inPending = store.pending.some(t => t.id === e.task_id)
-  // 已知 task:补全字段,留在原池(不跨池迁移;提升只由 applyBgTaskUpdated 做)。
+  // A native Agent/Task tool can precede the SDK's task id. Its tool_use_id
+  // keeps that same panel and accumulated steps when the real id arrives.
+  const matches = (t: BgTaskEntry): boolean => t.id === e.task_id
+    || !!e.tool_use_id && t.toolUseId === e.tool_use_id
+  const inActive = store.active.some(matches)
+  const inPending = store.pending.some(matches)
+  // 已知 task 补全字段；新确认的子 Agent 直接展示。
   if (inActive || inPending) {
     const patchField = (t: BgTaskEntry): BgTaskEntry => ({
       ...t,
-      type,
+      ...(isBgTerminal(t) ? {
+        status: 'running' as const, startedAt: now, endTime: undefined,
+        summary: undefined, error: undefined, usage: undefined, steps: [],
+      } : {}),
+      id: e.task_id,
+      type: type === 'unknown' ? t.type : type,
       toolUseId: e.tool_use_id ?? t.toolUseId,
       description: e.description || t.description,
       subagentType: e.subagent_type ?? t.subagentType,
       workflowName: e.workflow_name ?? t.workflowName,
       prompt: e.prompt ?? t.prompt,
     })
+    if (inPending && type === 'subagent') return {
+      active: [...store.active, ...store.pending.filter(matches).map(patchField)],
+      pending: store.pending.filter(t => !matches(t)),
+    }
     return {
-      active: inActive ? store.active.map(t => t.id === e.task_id ? patchField(t) : t) : store.active,
-      pending: inPending ? store.pending.map(t => t.id === e.task_id ? patchField(t) : t) : store.pending,
+      active: inActive ? store.active.map(t => matches(t) ? patchField(t) : t) : store.active,
+      pending: inPending ? store.pending.map(t => matches(t) ? patchField(t) : t) : store.pending,
     }
   }
-  // 新 task:workflow/monitor 白名单天生后台 → 直入 active;其余前台 → pending 观察池。
+  // 子 Agent、workflow、monitor 直接展示；普通前台命令先观察。
   const entry: BgTaskEntry = {
     id: e.task_id,
+    displayId: e.tool_use_id ?? e.task_id,
     toolUseId: e.tool_use_id,
     type,
     description: e.description,
@@ -227,7 +244,7 @@ export function applyBgTaskStarted(
     steps: [],
     ...(isInherentlyBackground(type) ? { isBackgrounded: true } : {}),
   }
-  return isInherentlyBackground(type)
+  return type === 'subagent' || isInherentlyBackground(type)
     ? { active: [...store.active, entry], pending: store.pending }
     : { active: store.active, pending: [...store.pending, entry] }
 }
@@ -315,7 +332,7 @@ export function applyBgTaskSettled(
     : e.status === 'failed' ? 'failed'
     : 'killed'
   // 前台 task 结算,从未后台化 —— 不进卡,直接从观察池丢。这是治「随便跑个命令就
-  // 冒一项」的关键:前台 Bash/子 agent 从 pending 沉掉,不进 active 不渲染。
+  // 冒一项」的关键:前台命令从 pending 移除,不进 active 不渲染。
   if (store.pending.some(t => t.id === e.task_id)) {
     return { active: store.active, pending: store.pending.filter(t => t.id !== e.task_id) }
   }
@@ -451,8 +468,7 @@ function briefResult(content: unknown, isError: boolean): string {
 
 /** tool_use 到达:parent_tool_use_id 匹配的 task 追加一步(无结果)。主线程工具
  *  (parentToolUseId 为 null/undefined)或无归属 task 跳过 —— 返回原 store 引用。
- *  同时在 active 和 pending 累积:前台子 agent 跑时 steps 暂存 pending,
- *  is_backgrounded 提升后 entry 自带 steps 带到 active。 */
+ *  两池同时按归属累积；子 Agent 在 active，观察池中的任务提升时保留 steps。 */
 export function applyBgToolUse(
   store: BgStore,
   parentToolUseId: string | null | undefined,
@@ -590,10 +606,10 @@ const TYPE_LABEL: Record<BgTaskType, string> = {
   unknown: '任务',
 }
 
-function fmtTokens(n: number): string {
-  if (n < 1000) return `${n}`
-  if (n < 1_000_000) return `${(n / 1000).toFixed(1)}K`
-  return `${(n / 1_000_000).toFixed(1)}M`
+/** Native children and background processes share a card, but keep distinct
+ * user-facing categories so a child Agent is never presented as a process. */
+export function backgroundTaskKind(t: BgTaskEntry): AgentCardTaskKind {
+  return t.type === 'subagent' ? 'subagent' : 'background'
 }
 
 function ownerOf(t: BgTaskEntry): string {
@@ -663,6 +679,16 @@ function renderDetailBody(t: BgTaskEntry): string {
     lines.push(`${i + 1}. ${t.steps[i].brief}`)
   }
   return sanitizeMarkdownForCardKit(lines.length > 0 ? lines.join('\n') : '_(暂无执行记录)_')
+}
+
+export function backgroundTaskSummary(t: BgTaskEntry): string {
+  const kindLabel = agentCardTaskKindLabel(backgroundTaskKind(t))
+  const status = {
+    running: `⏳ ${kindLabel}正在执行`, pending: `⏳ ${kindLabel}等待执行`, paused: `⏸️ ${kindLabel}已暂停`,
+    completed: `✅ ${kindLabel}完成`, failed: `❌ ${kindLabel}失败`, killed: `🛑 ${kindLabel}已终止`,
+  }[t.status]
+  const description = t.description.replace(/\s+/g, ' ').trim() || '说明 MISS'
+  return `${status} · ${description.length <= 40 ? description : `${description.slice(0, 39)}…`}`
 }
 
 /** 单任务的整 panel —— 标题写「图标 责任人·描述 — 状态·时长」,展开看详情 body。

@@ -6,9 +6,10 @@
  * 即读 CONFIG_FILE(config.ts `export const config = loadConfig()`),
  * env 注入必须先于任何读 paths/config 的模块执行(feishu-test-mock 也在其后)。
  */
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { fileURLToPath } from 'node:url'
 
 const testRoot = mkdtempSync(join(tmpdir(), 'lodestar-test-'))
 const configFile = join(testRoot, 'config.toml')
@@ -19,11 +20,12 @@ const claudeConfigDir = join(testRoot, 'claude')
 mkdirSync(dataDir, { recursive: true })
 mkdirSync(codexHome, { recursive: true })
 mkdirSync(claudeConfigDir, { recursive: true })
-// config 模板用本地 schema(与上游模板的差异点,D-02 保护线):
-// - 本地必需键仅 [feishu].app_id/app_secret(src/config.ts 缺则 throw);
+// config 模板(并集合并,保留本地差异点 D-02 保护线):
+// - [feishu].app_id/app_secret 用本地哨兵值(src/config.ts 缺则 throw;
+//   test-preload.test.ts 按该值锁定隔离不变式);
 // - [runtime].projects_root 指向临时根,项目解析不落真实 homedir(上游同款行为);
-// - 不写上游 [token_source.*] 段 —— 本地凭据/模型注入走 slim 适配层
-//   (resolveTokenSource* 系列),该 TOML schema 本地无效。
+// - [token_source.glm] 随上游并入:合并后上游 token-source 注册表在树内,
+//   上游派生的测试依赖该确定性来源;本地 slim 适配层不受影响。
 writeFileSync(configFile, [
   '[feishu]',
   'app_id = "test_app_id"',
@@ -32,10 +34,24 @@ writeFileSync(configFile, [
   '[runtime]',
   `projects_root = "${testRoot.replace(/\\/g, '\\\\')}"`,
   '',
+  '[token_source.glm]',
+  'base_url = "https://open.bigmodel.cn/api/anthropic"',
+  'auth_token = "test-token"',
+  'model = "GLM-5.2"',
+  '',
+  '[deepseek-harness]',
+  'api_key = "test-dsh-key"',
+  'model = "deepseek-v4-pro"',
+  '',
 ].join('\n'))
 writeFileSync(join(claudeConfigDir, 'settings.json'), '{"env":{}}\n')
 
 process.env.NODE_ENV = 'test'
+const testRuntime = join(testRoot, 'agent-runtime')
+mkdirSync(testRuntime)
+writeFileSync(join(testRuntime, 'package.json'), '{"private":true,"type":"module"}\n')
+symlinkSync(fileURLToPath(new URL('../node_modules', import.meta.url)), join(testRuntime, 'node_modules'), 'junction')
+process.env.LODESTAR_TEST_AGENT_RUNTIME_ROOT = testRuntime
 process.env.LODESTAR_CONFIG = configFile
 process.env.LODESTAR_DATA_DIR = dataDir
 process.env.CODEX_HOME = codexHome

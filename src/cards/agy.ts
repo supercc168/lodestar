@@ -206,10 +206,6 @@ function gitDirty(snapshot: AgyGitSnapshot): boolean {
   return !!(snapshot.statusShort.trim() || snapshot.diffShortStat.trim() || snapshot.diffNameOnly.trim())
 }
 
-function iso(ms: number): string {
-  return new Date(ms).toISOString()
-}
-
 function statusLabel(status: string): string {
   if (/完成/.test(status)) return '✅ 完成'
   if (/运行中|等待|正在停止/.test(status)) return '⏳ 执行中'

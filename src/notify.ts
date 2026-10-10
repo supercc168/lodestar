@@ -16,7 +16,7 @@
  *       "title":   "build",                    // optional, default = project
  *       "level":   "info" | "warn" | "error"   // optional, default "info"
  *       "images":  ["/abs/a.png", ...],        // optional, uploaded + embedded
- *       "buttons": [                           // optional
+ *       "buttons": [                           // optional, one full-width row each
  *         {"id":"approve","text":"✅ 通过","type":"primary"},
  *         {"id":"gmgn","text":"GMGN","url":"https://gmgn.ai/..."}  // open_url
  *       ],
@@ -51,10 +51,12 @@
  * need to seed the binding without leaving the keyboard.
  */
 
-import { createServer, type IncomingMessage, type ServerResponse } from 'node:http'
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { log } from './log'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
+import { FeishuRequestError } from './feishu-retry'
 import { downgradeExternalImagesForCardKit, sanitizeMarkdownForCardKit } from './cards/elements'
 import {
   buildNotifyResult,
@@ -78,6 +80,7 @@ const BUTTON_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
  * label is a caller mistake worth rejecting rather than rendering. */
 const BUTTON_TEXT_MAX = 64
 const MIXED_INTERACTION_ERROR = '"buttons" and "allow_reply":true are mutually exclusive; choose button selection or text reply'
+const MAX_BODY_BYTES = 4 * 1024 * 1024
 
 export interface ParsedButton {
   id: string
@@ -131,7 +134,7 @@ export function buildNotifyCard(opts: {
   level: Level
   /** Uploaded images, in insertion order. `key==''` marks an upload
    * failure — rendered as an inline red error so the caller sees it. */
-  images?: Array<{ key: string; src: string }>
+  images?: Array<{ key: string; src: string; error?: string }>
   /** Interactive buttons. Rendered as an equal-weight column_set row.
    * Requires `notifyId` so each button's `value` carries the routing
    * payload back to the click handler. */
@@ -164,22 +167,24 @@ export function buildNotifyCard(opts: {
     } else {
       // No silent fallback: surface the failed upload inline so the caller
       // knows which local image never made it onto the card.
-      elements.push({ tag: 'markdown', content: `<font color='red'>📷 图片上传失败: ${img.src}</font>` })
+      const detail = img.error ? `\n${sanitizeMarkdownForCardKit(img.error)}` : ''
+      elements.push({ tag: 'markdown', content: `<font color='red'>📷 图片上传失败: ${img.src}${detail}</font>` })
     }
   }
   elements.push({ tag: 'markdown', content: downgradeExternalImagesForCardKit(opts.text ?? '') || '_（空消息）_' })
 
   if (opts.resolution) {
-    // Post-click status marker replaces the button row. operator open_id
-    // rides in the callback payload for the caller's audit; the card
-    // shows only choice + status + time.
+    // Post-click status marker normally replaces the button row: every
+    // resolution state drops the choose buttons. A definite callback failure
+    // is the one retryable terminal state, so an allowReply card keeps its
+    // 「回复」 control via canAnswer below.
     const r = opts.resolution
     const choice = r.kind === 'text' ? '已回复' : `已选择:${r.text}`
     let marker: string
     if (r.status === 'processing') {
       marker = `<font color='blue'>⏳ ${choice} · 推送中…</font>`
     } else if (r.status === 'failed') {
-      marker = `<font color='red'>⚠️ ${r.kind === 'text' ? choice : `已选:${r.text}`} · 回调失败:${r.detail ?? '未知'} · ${hhmm}</font>`
+      marker = `<font color='red'>⚠️ ${r.kind === 'text' ? choice : `已选:${r.text}`} · 回调失败:${sanitizeMarkdownForCardKit(r.detail ?? '未知')} · ${hhmm}</font>`
     } else if (r.status === 'delivered') {
       marker = `<font color='green'>✅ ${choice} · 反馈已送达 · ${hhmm}</font>`
     } else if (r.status === 'unknown') {
@@ -207,7 +212,7 @@ export function buildNotifyCard(opts: {
     // button gets its own row. open_url buttons always render; callback
     // buttons require notifyId (otherwise they'd ship a dead value —
     // silently drop them, preserving pre-open_url safety).
-    const rendered = opts.buttons!.flatMap((btn) => {
+    const rendered = opts.buttons!.flatMap((btn): object[] => {
       if (btn.url) {
         return [{
           tag: 'button',
@@ -399,7 +404,15 @@ export async function dispatchNotifyRequest(
   req: IncomingMessage,
   res: ServerResponse,
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+  // Routing only needs the request target. Never let an untrusted Host
+  // header escape the async error boundary and crash the HTTP listener.
+  let url: URL
+  try { url = new URL(req.url ?? '/', 'http://localhost') }
+  catch {
+    res.statusCode = 400
+    res.end('bad request URL')
+    return
+  }
   if (opts.extraHandler) {
     const handled = await opts.extraHandler(req, res, url)
     if (handled) return
@@ -407,7 +420,7 @@ export async function dispatchNotifyRequest(
   await handleNotifyRequest(req, res)
 }
 
-export function startNotifyServer(opts: NotifyOptions): void {
+export function startNotifyServer(opts: NotifyOptions): Server | undefined {
   // node:http instead of Bun.serve so the same source runs on both
   // Bun (dev: `bun daemon.ts`) and Node (prod: `源码构建后 npm i -g .`).
   // Bun has full node:http compat so dev behavior is byte-for-byte preserved.
@@ -418,7 +431,7 @@ export function startNotifyServer(opts: NotifyOptions): void {
         if (!res.headersSent) {
           res.statusCode = 500
           res.setHeader('content-type', 'text/plain; charset=utf-8')
-          res.end('internal error')
+          res.end(err instanceof FeishuRequestError ? formatFeishuError(err) : 'internal error')
         } else {
           try { res.end() } catch {}
         }
@@ -430,6 +443,7 @@ export function startNotifyServer(opts: NotifyOptions): void {
     server.listen(opts.port, opts.bind, () => {
       log(`notify: HTTP listening at http://${opts.bind}:${opts.port}/notify`)
     })
+    return server
   } catch (e) {
     log(`notify: server bind failed (${opts.bind}:${opts.port}): ${e}`)
   }
@@ -440,7 +454,7 @@ export async function handleNotifyRequest(
   res: ServerResponse,
   transport: Pick<typeof feishu, 'sanitizeSessionName' | 'chatIdForSession' | 'uploadImageKey' | 'sendCard'> = feishu,
 ): Promise<void> {
-  const url = new URL(req.url ?? '/', `http://${req.headers.host ?? 'localhost'}`)
+  const url = new URL(req.url ?? '/', 'http://localhost')
 
   const sendText = (status: number, body: string): void => {
     res.statusCode = status
@@ -467,7 +481,9 @@ export async function handleNotifyRequest(
   // without running a callback server. Returns resolved:false while
   // pending; the chosen button + operator once a click froze the card.
   if (req.method === 'GET' && url.pathname.startsWith('/notify/result/')) {
-    const id = decodeURIComponent(url.pathname.slice('/notify/result/'.length)).trim()
+    let id: string
+    try { id = decodeURIComponent(url.pathname.slice('/notify/result/'.length)).trim() }
+    catch { return sendText(400, 'invalid notify_id encoding') }
     if (!id) return sendText(400, 'missing notify_id in path')
     const reg = getCallback(id)
     if (!reg) return sendJson(404, { error: 'unknown notify_id', notify_id: id })
@@ -478,7 +494,15 @@ export async function handleNotifyRequest(
   }
 
   let raw = ''
-  for await (const chunk of req) raw += chunk.toString()
+  let bytes = 0
+  // IncomingMessage's decoder preserves multibyte characters across chunks.
+  req.setEncoding('utf8')
+  for await (const chunk of req) {
+    bytes += Buffer.byteLength(chunk)
+    if (bytes <= MAX_BODY_BYTES) raw += chunk
+    else raw = ''
+  }
+  if (bytes > MAX_BODY_BYTES) return sendText(413, `request body exceeds ${MAX_BODY_BYTES} bytes`)
   let body: any = {}
   try { body = JSON.parse(raw) } catch { return sendText(400, 'bad json') }
   if (!body || typeof body !== 'object' || Array.isArray(body)) return sendText(400, 'body must be an object')
@@ -523,22 +547,24 @@ export async function handleNotifyRequest(
   }
 
   const imageInputs = Array.isArray(body.images) ? body.images : []
-  const images: Array<{ key: string; src: string }> = []
+  const images: Array<{ key: string; src: string; error?: string }> = []
   for (const entry of imageInputs) {
     const src = String(entry ?? '').trim()
     if (!src) continue
-    const key = await transport.uploadImageKey(src)
-    images.push({ key: key ?? '', src })
+    let failure: unknown
+    const key = await transport.uploadImageKey(src, error => { failure = error })
+    images.push({ key: key ?? '', src, ...(failure === undefined ? {} : { error: formatFeishuError(failure) }) })
   }
 
   // notify_id is generated up-front so it can be baked into every button's
   // `value` payload (and the fixed reply button) BEFORE sendCard.
   const notifyId = notifiable ? `nf_${randomUUID()}` : ''
   const card = buildNotifyCard({ title, text, level, images, buttons, allowReply, notifyId })
-  const messageId = await transport.sendCard(chatId, card)
+  let sendFailure: unknown
+  const messageId = await transport.sendCard(chatId, card, error => { sendFailure = error })
   if (!messageId) {
     log(`notify: sendCard failed → 502 (project="${project}" chat=${chatId.slice(0, 8)}…)`)
-    return sendText(502, 'feishu sendCard failed (see daemon log)')
+    return sendText(502, `feishu sendCard failed: ${formatFeishuError(sendFailure)}`)
   }
 
   if (notifiable && notifyId) {

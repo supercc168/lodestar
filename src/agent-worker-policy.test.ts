@@ -1,39 +1,144 @@
 /**
- * D-11 口径 3「单层委派」回归网(上游 378f4a4 摘录自实现)。
+ * D-11 口径 3「单层委派」回归网(合并版:上游 runIsolated 子进程模式 + 本地策略/接线用例)。
  *
  * 三层齐备,拒绝面各验其一:
- *  ① 策略层 —— worker principal 的 startRun/followUp 首行即拒,绝不建 run;
- *  ② 原生工具层 —— claude `disallowedTools` / codex `--disable multi_agent` + thread config;
- *  ③ 指令层 —— 见 agent-skill.test.ts(DELEGATED_AGENT_INSTRUCTIONS 已并入 worker developerInstructions)。
- * 深度/子树闸门只作源码级兜底:策略拒绝先行后执行不可达,故仅断言源码仍在
- * (与 D-11 口径 3 的 truth 措辞一致,不做"可达性"表演性用例)。
+ *  ①②  策略层 —— 会话归属 worker principal 的 startRun/followUp 首行即拒,绝不建 run;
+ *  ③④⑥ 原生工具层 —— claude `disallowedTools` / codex `--disable multi_agent` + thread config;
+ *  ⑤⑦  接线层 —— 主 Agent(session principal)仍可委派并续跑;worker 的指令/ROLE/开关同帧下发。
+ * 指令注入点在 runner(agent-runner.ts 按 projectBound 拼接 DELEGATED_AGENT_INSTRUCTIONS /
+ * PROJECT_AGENT_INSTRUCTIONS),不在 service 边界 —— ⑦ 据此把捕获点定在 service→runner 的
+ * 传参面(只透传会话指令),注入后全文由第二组 12 连发用例逐 binding 校验。
+ * 深度/子树闸门(MAX_DELEGATION_DEPTH / MAX_SUBTREE_ACTIVE_RUNS)已随实现删除,
+ * 对应的源码常量断言一并移除(策略拒绝先行,闸门本就不可达)。
+ *
+ * SDK/真实启动链路用例一律走 runIsolated 子进程:同进程 mock.module 会漂到
+ * tasklist 等真实 spawn 用例上(历史实测 4+1 fail),真实 createAgentProcess 还会
+ * 拉起 claude-agent-process/codex-process 全依赖图 —— 子进程隔离是唯一稳定形态。
  */
-import { describe, expect, mock, test } from 'bun:test'
+import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
 import type { AgentIdentity, AgentIdentityCatalog } from './agent-identities'
-import type { AgentServiceDeps } from './agent-service'
+import { AgentService, type AgentServiceDeps } from './agent-service'
 import type { AgentWorkerHandle, AgentWorkerResult } from './agent-runner'
+import { DELEGATED_AGENT_INSTRUCTIONS } from './agent-skill'
+import { AGENT_RUNS_DIR } from './paths'
 
-const NESTED_DELEGATION_ERROR = 'Delegated Agents cannot delegate again; ask the main Agent to assign additional work.'
-
-// SDK 侧只记录 query options(claude 的进程内查询,不需要 spawn)。
-// 注意:本文件**不** mock `node:child_process` —— 同进程全量 `bun test` 下
-// 该 mock 会漂到 tasklist/executable 等真实 spawn 的用例上(实测 4+1 fail)。
-const claudeSdkOptions: any[] = []
-
-mock.module('@anthropic-ai/claude-agent-sdk', () => ({
-  query: (options: any) => {
-    claudeSdkOptions.push(options)
-    return { [Symbol.asyncIterator]: async function* () {}, close() {} }
-  },
-}))
-
-const { createAgentProcess } = await import('./agent-launch')
-const { AgentService } = await import('./agent-service')
-const { startAgentWorker } = await import('./agent-runner')
+// ③ 的 codex 构造接线依赖(沿用本地原版动态引入形态)。
 const { buildCodexAppServerArgs, CodexProcess } = await import('./codex-process')
-const { config } = await import('./config')
+
+/** 子进程 cwd 固定为仓库根:--preload ./src/test-preload.ts 与脚本内 import './src/...'
+ *  都以它解析,不受调用目录影响。 */
+const repoRoot = join(import.meta.dir, '..')
+
+function runIsolated(script: string): any {
+  const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+    cwd: repoRoot, env: { ...process.env, NODE_ENV: 'test' }, stdout: 'pipe', stderr: 'pipe',
+  })
+  if (result.exitCode !== 0) throw new Error(result.stderr.toString() || result.stdout.toString())
+  return JSON.parse(result.stdout.toString().trim().split('\n').at(-1)!)
+}
+
+test('the Claude SDK retains native delegation while enforcing the invocation input policy', () => {
+  const captured = runIsolated(`
+    import { mock } from 'bun:test'
+    const captured = []
+    mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+      query: ({ options }) => {
+        captured.push({ disallowedTools: options.disallowedTools ?? null, tools: options.tools, effort: options.effort,
+          systemPrompt: options.systemPrompt })
+        return { async *[Symbol.asyncIterator]() {}, close() {} }
+      },
+    }))
+    const { ClaudeAgentProcess } = await import('./src/claude-agent-process')
+    for (const policy of [{}, { allowUserInput: false }]) {
+      const proc = new ClaudeAgentProcess({ workDir: process.cwd(), effort: 'high', appendSystemPrompt: 'current invocation policy', ...policy })
+      const closed = new Promise(resolve => proc.once('exit', resolve))
+      proc.sendInitialize()
+      await closed
+    }
+    console.log(JSON.stringify(captured))
+  `)
+  expect(captured).toEqual([
+    { disallowedTools: null, tools: { type: 'preset', preset: 'claude_code' }, effort: 'high',
+      systemPrompt: { type: 'preset', preset: 'claude_code', append: 'current invocation policy', snapshot: false } },
+    { disallowedTools: ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'], tools: { type: 'preset', preset: 'claude_code' }, effort: 'high',
+      systemPrompt: { type: 'preset', preset: 'claude_code', append: 'current invocation policy', snapshot: false } },
+  ])
+})
+
+test('new and resumed workers use binding-specific delegation, caller-owned delivery and input policy across all backends', () => {
+  const captured = runIsolated(`
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    const captured = []
+    mock.module('./src/token-source', () => ({ getTokenSourceForAccount: () => ({ id: 'test-source' }) }))
+    mock.module('./src/agent-session-registry', () => ({ rememberAgentSession() {} }))
+    mock.module('./src/agent-launch', () => ({ createAgentProcess: options => {
+      captured.push({ allowUserInput: options.allowUserInput, allowDelegation: options.allowDelegation,
+        instructions: options.developerInstructions, role: options.hostEnv.LODESTAR_AGENT_ROLE, model: options.model,
+        effort: options.effort, codexAccountId: options.codexAccountId, launch: options.launch })
+      const proc = new EventEmitter()
+      Object.assign(proc, { provider: options.provider, sessionId: 'test-session', alive: true,
+        isAlive() { return this.alive }, sendInitialize() {},
+        sendUserText() { queueMicrotask(() => this.emit('result', { is_error: false })) },
+        async kill() { this.alive = false; this.emit('exit', { code: 0 }) },
+      })
+      return { process: proc }
+    } }))
+    const { startAgentWorker } = await import('./src/agent-runner')
+    for (const provider of ['codex', 'claude', 'dsh']) {
+      for (const projectBound of [false, true]) {
+        for (const resumeSessionId of [undefined, 'test-session']) {
+          await startAgentWorker({ identity: { tokenSourceId: 'test-source', provider, model: 'worker-model', supportedEfforts: ['high'] },
+            projectBound, resumeSessionId, effort: 'high', codexAccountId: 'named-work', workDir: process.cwd(),
+            prompt: 'task', developerInstructions: 'project rule', hostEnv: { LODESTAR_AGENT_ROLE: 'main' } }).done
+        }
+      }
+    }
+    console.log(JSON.stringify(captured))
+  `)
+  expect(captured).toHaveLength(12)
+  expect(captured.map((launch: any) => launch.allowUserInput)).toEqual([
+    true, true, false, false, true, true, false, false, true, true, false, false,
+  ])
+  expect(captured.filter((launch: any) => launch.launch.kind === 'resume')).toHaveLength(6)
+  for (const launch of captured) {
+    // 缺省判定(agent-runner):会话归属一律关闸,项目归属不设闸。
+    expect(launch.allowDelegation).toBe(!launch.allowUserInput)
+    expect(launch.role).toBe('worker')
+    expect(launch.model).toBe('worker-model')
+    expect(launch.effort).toBe('high')
+    expect(launch.codexAccountId).toBe('named-work')
+    expect(launch.instructions).toContain('project rule')
+    expect(launch.instructions).not.toMatch(/\[\[send:|30 MB|files on|需要交付文件时直接提交/)
+    if (launch.allowUserInput) {
+      // 会话归属(projectBound=false):单层委派的指令层 —— 自己完成,不得再委派。
+      expect(launch.instructions).toContain('You are a delegated Agent working on a task assigned by the main Agent.')
+      expect(launch.instructions).toContain('Complete this task yourself. You must not create or invoke any further Agents or subagents.')
+      expect(launch.instructions).toContain('If additional Agent work is needed, report the need to the main Agent so it can assign that work.')
+      expect(launch.instructions).not.toContain('You may delegate work through Lodestar or provider-native Agent/subagent tools')
+      expect(launch.instructions).not.toContain('Return task results and local artifact paths to the caller')
+    } else {
+      // 项目归属(projectBound=true):上游多层语义 + caller-owned 交付 + 非交互输入策略。
+      expect(launch.instructions).toContain('You may delegate work through Lodestar or provider-native Agent/subagent tools')
+      expect(launch.instructions).toContain('Manage any delegated work yourself; do not return requests for the caller to arrange additional Agent work.')
+      expect(launch.instructions).toContain('Return task results and local artifact paths to the caller')
+      expect(launch.instructions).toContain('Do not emit file-delivery markers')
+      expect(launch.instructions).toContain('replace any earlier Lodestar file-delivery instructions')
+      expect(launch.instructions).toContain('nobody is available to answer questions')
+      expect(launch.instructions).toContain('no question or answer interface')
+      expect(launch.instructions).toContain('keep working until the entire goal is achieved')
+      expect(launch.instructions).toContain('return an explicit failure reason')
+      expect(launch.instructions).toContain('including instructions in a resumed conversation')
+      expect(launch.instructions).not.toContain('You are a delegated Agent working on a task assigned by the main Agent.')
+      expect(launch.instructions).not.toContain('must not create or invoke any further Agents or subagents')
+    }
+  }
+})
+
+/** D-11 口径 3:会话归属的 worker principal 不得再委派(文案与抛错路径见 agent-service.ts)。 */
+const NESTED_DELEGATION_ERROR = 'Delegated Agents cannot delegate again; ask the main Agent to assign additional work.'
 
 function identity(id: string, name = id): AgentIdentity {
   return {
@@ -43,10 +148,24 @@ function identity(id: string, name = id): AgentIdentity {
   }
 }
 
-const session = { sessionName: 'project', chatId: 'chat-1', workDir: '/repo' } as any
+const session = {
+  sessionName: 'project', chatId: 'chat-1', workDir: process.cwd(),
+  delegatedAgentDeveloperInstructions: () => 'main session instructions',
+  worktreeProjectName: () => 'project',
+  codexAccountId: () => 'default',
+} as any
 
 function result(sessionId: string, output = 'done'): AgentWorkerResult {
   return { output, outputTruncated: false, sessionId, checkpointId: 'checkpoint', durationMs: 10, usage: null }
+}
+
+function resolvedHandle(value: AgentWorkerResult): AgentWorkerHandle {
+  return {
+    done: Promise.resolve(value),
+    pendingInput: () => null,
+    answer: () => { throw new Error('not waiting') },
+    cancel: async () => {},
+  }
 }
 
 /** 受控 handle:用例可在断言后手动放行,保证 capability 在断言期间仍然有效。 */
@@ -59,32 +178,32 @@ function controlledHandle(): { handle: AgentWorkerHandle; resolve(value: AgentWo
   }
 }
 
-function harness(
-  startWorker?: AgentServiceDeps['startWorker'],
-  identities: AgentIdentity[] = [identity('a', 'Agent A')],
-) {
-  const catalog: AgentIdentityCatalog = { catalogGeneration: 'g1', identities, sourceFailures: [] }
+function harness(opts: { startWorker?: AgentServiceDeps['startWorker'] } = {}) {
+  const catalog: AgentIdentityCatalog = { catalogGeneration: 'g1', identities: [identity('a', 'Agent A')], sourceFailures: [] }
   const artifacts: any[] = []
+  const textArtifacts = new Map<string, string>()
   const deps: AgentServiceDeps = {
     getCatalog: () => catalog,
-    startWorker: startWorker ?? (worker => ({
-      done: Promise.resolve(result(`sid-${worker.identity.id}`, `output-${worker.identity.id}`)),
-      pendingInput: () => null,
-      answer: () => {},
-      cancel: async () => {},
-    })),
+    startWorker: opts.startWorker ?? (worker => resolvedHandle(result(`sid-${worker.identity.id}`, `output-${worker.identity.id}`))),
     sendCard: async () => 'message-1',
     sendTextRaw: async () => true,
+    getChatTailMessageId: async () => null,
+    getElementCount: () => 1,
+    addElementResult: async () => ({ landed: true }),
+    deleteElementChecked: async () => true,
     convertMessageToCard: async () => 'card-1',
     recordCardCreated: () => {},
-    replaceElementChecked: async () => true,
-    patchSummaryThrottled: () => {},
-    flush: async () => {},
+    replaceElementResult: async () => ({ landed: true }),
     cancelSummary: () => {},
     patchSettingsChecked: async () => true,
     dispose: async () => {},
     writeArtifact: (_path, value) => { artifacts.push(JSON.parse(JSON.stringify(value))) },
-    writeTextArtifact: () => {},
+    writeTextArtifact: (path, value) => { textArtifacts.set(path, value) },
+    readTextArtifact: (name, label) => {
+      const text = textArtifacts.get(join(AGENT_RUNS_DIR, name))
+      if (text === undefined) throw new Error(`${label} is unreadable (${name})`)
+      return text
+    },
     loadArtifacts: () => [],
   }
   const service = new AgentService(deps)
@@ -108,43 +227,39 @@ async function waitForStatus(
 /** 借父 run 的委派能力取回 worker principal(真实链路:capability → principal)。 */
 async function delegatedWorker(makeHandle: () => AgentWorkerHandle) {
   let capability = ''
-  const { service, root, artifacts } = harness(opts => {
-    capability = String(opts.hostEnv.LODESTAR_AGENT_CAPABILITY)
-    return makeHandle()
+  const { service, root, artifacts } = harness({
+    startWorker: opts => {
+      capability = String(opts.hostEnv.LODESTAR_AGENT_CAPABILITY)
+      return makeHandle()
+    },
   })
-  const parent = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'parent' })
+  const parent = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'parent', description: 'parent run' })
   for (let i = 0; i < 200 && !capability; i++) await new Promise(resolve => setTimeout(resolve, 1))
   expect(capability).not.toBe('')
   const worker = service.principalForCapability(capability)
   expect(worker).not.toBeNull()
-  return { service, root, artifacts, parent, worker: worker!, capability }
+  return { service, root, artifacts, parent, worker: worker! }
 }
 
-describe('D-11 口径 3:单层委派(策略 + 原生工具两层拒绝)', () => {
-  test('① worker principal 再委派在策略层被拒,深度/子树闸门仅作源码兜底', async () => {
+describe('D-11 口径 3:单层委派(策略 + 原生工具 + 接线)', () => {
+  test('① worker principal 再委派在策略层被拒,拒绝先于任何副作用(无新 run 落盘)', async () => {
     const control = controlledHandle()
     const { service, root, artifacts, parent, worker } = await delegatedWorker(() => control.handle)
     expect(worker.kind).toBe('worker')
     const before = artifacts.map(item => item.runId).filter(Boolean)
-    await expect(service.startRun(worker, { identityIds: ['agent:a'], prompt: 'nested' }))
+    await expect(service.startRun(worker, { identityIds: ['agent:a'], prompt: 'nested', description: 'nested run' }))
       .rejects.toThrow(NESTED_DELEGATION_ERROR)
     // 拒绝先于建 run:无任何新 run 落盘。
     expect(artifacts.map(item => item.runId).filter(Boolean)).toEqual(before)
     control.resolve(result('sid-child'))
     await waitForStatus(service, root, parent.runId, 'completed')
     await service.shutdown('test cleanup')
-
-    const source = readFileSync(join(import.meta.dir, 'agent-service.ts'), 'utf8')
-    expect(source).toContain('const MAX_DELEGATION_DEPTH = 8')
-    expect(source).toContain('delegation depth ${depth} exceeds ${MAX_DELEGATION_DEPTH}')
-    expect(source).toContain('const MAX_SUBTREE_ACTIVE_RUNS = 32')
-    expect(source).toContain('Agent subtree has reached ${MAX_SUBTREE_ACTIVE_RUNS} active runs')
   })
 
   test('② worker principal 不能借 follow-up 曲线再委派', async () => {
     const control = controlledHandle()
     const { service, root, parent, worker } = await delegatedWorker(() => control.handle)
-    await expect(service.followUp(worker, parent.runId, { identityId: 'agent:a', prompt: 'nested follow-up' }))
+    await expect(service.followUp(worker, parent.runId, { identityId: 'agent:a', prompt: 'nested follow-up', description: 'nested follow-up' }))
       .rejects.toThrow(NESTED_DELEGATION_ERROR)
     control.resolve(result('sid-child'))
     await waitForStatus(service, root, parent.runId, 'completed')
@@ -172,95 +287,111 @@ describe('D-11 口径 3:单层委派(策略 + 原生工具两层拒绝)', () => 
   })
 
   test('④ claude worker 在 SDK 层禁用原生委派工具,主 Agent 不受影响', () => {
-    const prevModels = config.claude.models
-    ;(config.claude as any).models = {
-      glm: { model: 'glm-5.3', base_url: 'https://glm.example/anthropic', auth_token: 'glm-tok' },
-    }
-    try {
-      claudeSdkOptions.length = 0
-      const { process: restricted } = createAgentProcess({
-        provider: 'claude', workDir: '/tmp/claude-work', tokenSourceId: 'claude:glm',
-        model: 'claude:glm', effort: 'max', allowDelegation: false,
-      })
-      ;(restricted as any).sendInitialize()
-      expect(claudeSdkOptions.at(-1)?.options.disallowedTools).toEqual(['Agent', 'Task'])
-
-      claudeSdkOptions.length = 0
-      const { process: normal } = createAgentProcess({
-        provider: 'claude', workDir: '/tmp/claude-work', tokenSourceId: 'claude:glm',
-        model: 'claude:glm', effort: 'max',
-      })
-      ;(normal as any).sendInitialize()
-      expect(claudeSdkOptions.at(-1)?.options.disallowedTools).toBeUndefined()
-    } finally {
-      ;(config.claude as any).models = prevModels
-    }
+    const captured = runIsolated(`
+      import { mock } from 'bun:test'
+      const captured = []
+      mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+        query: ({ options }) => {
+          captured.push({ disallowedTools: options.disallowedTools ?? null })
+          return { async *[Symbol.asyncIterator]() {}, close() {} }
+        },
+      }))
+      const { registerTokenSource } = await import('./src/token-source')
+      registerTokenSource({ id: 'claude:fable', kind: 'api', agent: 'claude', display: 'Fable', enabled: true,
+        models: [{ model: 'claude:fable', display: 'Fable', efforts: ['max'], defaultEffort: 'max' }],
+        defaultModel: 'claude:fable', refreshModels: async () => {}, spawnEnv: env => env,
+        resolveSpawnModel: model => model, readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+        modelCatalogState: { status: 'ready', updatedAt: Date.now() } })
+      const { createAgentProcess } = await import('./src/agent-launch')
+      for (const policy of [{}, { allowDelegation: false }]) {
+        const { process: proc } = createAgentProcess({ provider: 'claude', workDir: process.cwd(),
+          tokenSourceId: 'claude:fable', model: 'claude:fable', effort: 'max', ...policy })
+        const closed = new Promise(resolve => proc.once('exit', resolve))
+        proc.sendInitialize()
+        await closed
+      }
+      console.log(JSON.stringify(captured))
+    `)
+    expect(captured).toEqual([{ disallowedTools: null }, { disallowedTools: ['Agent', 'Task'] }])
   })
 
   test('⑤ 主 Agent(session principal)仍可委派并审批 follow-up', async () => {
     const { service, root } = harness()
-    const started = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'main' })
+    const started = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'main', description: 'main run' })
     expect(started.depth).toBe(0)
     expect(started.parentRunId).toBeUndefined()
     await waitForStatus(service, root, started.runId, 'completed')
-    const followUp = await service.followUp(root, started.runId, { identityId: 'agent:a', prompt: 'continue' })
+    const followUp = await service.followUp(root, started.runId, { identityId: 'agent:a', prompt: 'continue', description: 'continue run' })
     expect(followUp).toMatchObject({ parentKind: 'follow_up', parentRunId: started.runId, depth: 0 })
     await waitForStatus(service, root, followUp.runId, 'completed')
     await service.shutdown('test cleanup')
   })
 
-  test('⑦ worker 身份:指令文案、ROLE 环境与原生工具开关同帧下发,主 Agent 不附加', async () => {
-    const { DELEGATED_AGENT_INSTRUCTIONS } = await import('./agent-skill')
-    const { spawnDeveloperInstructions } = await import('./session-worktree')
-    const seen: Array<{ developerInstructions?: string; hostEnv: Record<string, string | undefined>; allowDelegation?: boolean }> = []
-    const { service, root } = harness(opts => {
-      seen.push({ developerInstructions: opts.developerInstructions, hostEnv: opts.hostEnv, allowDelegation: opts.allowDelegation })
-      return {
-        done: Promise.resolve(result(`sid-${opts.identity.id}`)),
-        pendingInput: () => null,
-        answer: () => {},
-        cancel: async () => {},
+  test('⑥ 贯通:worker 真实启动链路禁用委派,并按 projectBound 选择原生输入策略', () => {
+    const captured = runIsolated(`
+      import { mock } from 'bun:test'
+      const captured = []
+      mock.module('@anthropic-ai/claude-agent-sdk', () => ({
+        query: ({ options }) => {
+          captured.push({ disallowedTools: options.disallowedTools ?? null })
+          return { async *[Symbol.asyncIterator]() {}, close() {} }
+        },
+      }))
+      const { registerTokenSource } = await import('./src/token-source')
+      registerTokenSource({ id: 'claude:fable', kind: 'api', agent: 'claude', display: 'Fable', enabled: true,
+        models: [{ model: 'claude:fable', display: 'Fable', efforts: ['max'], defaultEffort: 'max' }],
+        defaultModel: 'claude:fable', refreshModels: async () => {}, spawnEnv: env => env,
+        resolveSpawnModel: model => model, readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+        modelCatalogState: { status: 'ready', updatedAt: Date.now() } })
+      const { startAgentWorker } = await import('./src/agent-runner')
+      for (const projectBound of [false, true]) {
+        const handle = startAgentWorker({
+          identity: { tokenSourceId: 'claude:fable', provider: 'claude', model: 'claude:fable',
+            supportedEfforts: ['max'], displayName: 'Fable' },
+          projectBound, effort: 'max', codexAccountId: 'default', workDir: process.cwd(),
+          prompt: 'task', developerInstructions: 'project rule', hostEnv: {},
+        })
+        await handle.done.catch(() => {})
       }
+      console.log(JSON.stringify(captured))
+    `)
+    expect(captured).toEqual([
+      { disallowedTools: ['Agent', 'Task'] },
+      { disallowedTools: ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'] },
+    ])
+  })
+
+  test('⑦ worker 身份:ROLE/capability/委派开关在 service 边界下发,指令注入点归 runner', async () => {
+    const seen: Array<{
+      developerInstructions?: string
+      hostEnv: Record<string, string | undefined>
+      allowDelegation?: boolean
+      projectBound?: boolean
+    }> = []
+    const { service, root } = harness({
+      startWorker: opts => {
+        seen.push({ developerInstructions: opts.developerInstructions, hostEnv: opts.hostEnv, allowDelegation: opts.allowDelegation, projectBound: opts.projectBound })
+        return resolvedHandle(result(`sid-${opts.identity.id}`))
+      },
     })
-    const started = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'worker identity' })
+    const started = await service.startRun(root, { identityIds: ['agent:a'], prompt: 'worker identity', description: 'worker identity' })
     await waitForStatus(service, root, started.runId, 'completed')
     await service.shutdown('test cleanup')
 
     expect(seen).toHaveLength(1)
-    expect(seen[0].developerInstructions).toContain(DELEGATED_AGENT_INSTRUCTIONS)
-    expect(seen[0].developerInstructions).toContain('You are a delegated Agent working on a task assigned by the main Agent.')
-    expect(seen[0].developerInstructions).toContain('must not create or invoke any further Agents or subagents')
+    // service 边界只透传会话指令(worker 的 DELEGATED 文案由 runner 注入,见上文 12 连发用例
+    // 对 projectBound 两分支的全文断言);此处若注入提前发生,捕获值会被污染。
+    const instructions = seen[0].developerInstructions!
+    expect(instructions).toBe('main session instructions')
+    expect(instructions).not.toContain(DELEGATED_AGENT_INSTRUCTIONS)
     expect(seen[0].hostEnv.LODESTAR_AGENT_ROLE).toBe('worker')
     expect(seen[0].hostEnv.LODESTAR_AGENT_CAPABILITY).toBeTruthy()
     expect(seen[0].allowDelegation).toBe(false)
+    expect(seen[0].projectBound).toBe(false)
 
-    // 主 Agent 不附加该文案:主 Agent 指令由 session-worktree 构造,不含 worker 文案。
-    const mainSession = { sessionName: 'project', workDir: '/repo', currentProvider: () => 'claude' as const } as any
-    expect(spawnDeveloperInstructions(mainSession)).not.toContain(DELEGATED_AGENT_INSTRUCTIONS)
-    // 主 Agent 环境不含 worker role(主 Agent 走 session.ts 自有 hostEnv)。
+    // 主 Agent 环境由 session.ts 写 ROLE='main'(与 worker 'worker' 对置):源码级钉住。
     const sessionSource = readFileSync(join(import.meta.dir, 'session.ts'), 'utf8')
-    const mainEnvBlock = sessionSource.slice(
-      sessionSource.indexOf('const hostEnv = {'),
-      sessionSource.indexOf("if (provider === 'claude')"),
-    )
-    expect(mainEnvBlock).toContain('LODESTAR_AGENT_CAPABILITY')
-    expect(mainEnvBlock).not.toContain('LODESTAR_AGENT_ROLE')
-  })
-
-  test('⑥ 贯通:worker 真实启动链路(AgentService → runner → launch → SDK)禁用委派', async () => {
-    const prevModels = config.claude.models
-    ;(config.claude as any).models = {
-      glm: { model: 'glm-5.3', base_url: 'https://glm.example/anthropic', auth_token: 'glm-tok' },
-    }
-    try {
-      claudeSdkOptions.length = 0
-      const { service, root } = harness(startAgentWorker, [{ ...identity('glm'), tokenSourceId: 'claude:glm' }])
-      const started = await service.startRun(root, { identityIds: ['agent:glm'], prompt: 'delegate' })
-      await waitForStatus(service, root, started.runId, 'failed')
-      expect(claudeSdkOptions.at(-1)?.options.disallowedTools).toEqual(['Agent', 'Task'])
-      await service.shutdown('test cleanup')
-    } finally {
-      ;(config.claude as any).models = prevModels
-    }
+    expect(sessionSource).toContain("LODESTAR_AGENT_ROLE: 'main'")
+    expect(sessionSource).toContain('LODESTAR_AGENT_CAPABILITY')
   })
 })

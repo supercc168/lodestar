@@ -137,7 +137,9 @@ export function parseWatchdogSettings(
   }
 }
 
-export type WatchdogTrigger = 'user_message' | 'bg_task_resume' | 'watchdog_resume'
+/** Turn triggers the watchdog can be armed for. Mirrors TurnTrigger 1:1 —
+ *  scheduled_wakeup turns also open a codex turn and must be watched. */
+export type WatchdogTrigger = 'user_message' | 'bg_task_resume' | 'watchdog_resume' | 'scheduled_wakeup'
 
 export interface WatchdogSafetySnapshot {
   currentTurn: boolean
@@ -153,15 +155,18 @@ export interface WatchdogSafetySnapshot {
   recoveryActionInFlight: boolean
 }
 
+type WatchdogLoopVerdictFields = {
+  idleMs: number
+  repeatCount: number
+  fingerprintHash: string
+}
+
 export type WatchdogVerdict =
   | { type: 'none' }
   | { type: 'silent_warn'; idleMs: number }
-  | {
-    type: 'loop_warn' | 'recover' | 'stop_exhausted'
-    idleMs: number
-    repeatCount: number
-    fingerprintHash: string
-  }
+  | ({ type: 'loop_warn' } & WatchdogLoopVerdictFields)
+  | ({ type: 'recover' } & WatchdogLoopVerdictFields)
+  | ({ type: 'stop_exhausted' } & WatchdogLoopVerdictFields)
 
 export interface WatchdogSnapshot {
   turnKey: string | null
@@ -350,8 +355,16 @@ export class TurnWatchdog {
         }
       }
 
+      if (this.recoveryAttempt === 0) {
+        return {
+          type: 'recover',
+          idleMs,
+          repeatCount: this.repeatCount,
+          fingerprintHash: this.fingerprintHash!,
+        }
+      }
       return {
-        type: this.recoveryAttempt === 0 ? 'recover' : 'stop_exhausted',
+        type: 'stop_exhausted',
         idleMs,
         repeatCount: this.repeatCount,
         fingerprintHash: this.fingerprintHash!,

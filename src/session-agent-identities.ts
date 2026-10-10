@@ -2,6 +2,7 @@ import { randomUUID } from 'node:crypto'
 import type { Session } from './session'
 import * as cards from './cards'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
 import { getAgentIdentityCatalog } from './agent-identities'
 import type { ModelActionResult } from './session-util'
 
@@ -10,6 +11,7 @@ const PANEL_TTL_MS = 30 * 60 * 1000
 
 interface AgentIdentityPanelState {
   ownerOpenId: string
+  codexAccountId: string
   page: number
   createdAt: number
 }
@@ -23,9 +25,10 @@ export async function showAgentIdentityPanel(s: Session, userOpenId: string): Pr
   }
   prunePanels()
   const panelId = `agents_${randomUUID()}`
-  panels.set(panelId, { ownerOpenId: userOpenId, page: 0, createdAt: Date.now() })
-  const messageId = await feishu.sendCard(s.chatId, listCard(panelId))
-  if (!messageId) await feishu.sendTextRaw(s.chatId, '❌ agents 面板发送失败')
+  panels.set(panelId, { ownerOpenId: userOpenId, codexAccountId: s.codexAccountId(), page: 0, createdAt: Date.now() })
+  let failure: unknown
+  const messageId = await feishu.sendCard(s.chatId, listCard(panelId), error => { failure = error })
+  if (!messageId) await feishu.sendTextRaw(s.chatId, `❌ agents 面板发送失败\n${formatFeishuError(failure)}`)
 }
 
 export function onAgentIdentityPage(
@@ -36,7 +39,7 @@ export function onAgentIdentityPage(
   const panel = requirePanel(panelId, userOpenId)
   const page = Number(pageRaw)
   if (!Number.isInteger(page)) return failure('无效页码')
-  const totalPages = pageCount()
+  const totalPages = pageCount(panel.codexAccountId)
   panel.page = Math.max(0, Math.min(totalPages - 1, page))
   panel.createdAt = Date.now()
   return { ok: true, message: '已更新', card: listCard(panelId) }
@@ -45,7 +48,7 @@ export function onAgentIdentityPage(
 function listCard(panelId: string): object {
   const panel = panels.get(panelId)
   if (!panel) throw new Error('Agent 身份面板已过期')
-  const catalog = getAgentIdentityCatalog()
+  const catalog = getAgentIdentityCatalog(panel.codexAccountId)
   const totalPages = Math.max(1, Math.ceil(catalog.identities.length / PAGE_SIZE))
   panel.page = Math.min(panel.page, totalPages - 1)
   const start = panel.page * PAGE_SIZE
@@ -58,8 +61,8 @@ function listCard(panelId: string): object {
   })
 }
 
-function pageCount(): number {
-  return Math.max(1, Math.ceil(getAgentIdentityCatalog().identities.length / PAGE_SIZE))
+function pageCount(accountId: string): number {
+  return Math.max(1, Math.ceil(getAgentIdentityCatalog(accountId).identities.length / PAGE_SIZE))
 }
 
 function requirePanel(panelId: string, userOpenId: string): AgentIdentityPanelState {

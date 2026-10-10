@@ -23,6 +23,22 @@ afterEach(() => {
 })
 
 describe('lodestar-agent skill body', () => {
+  test('describes a selected identity as its corresponding Agent call', () => {
+    const body = agentSkillBody()
+    expect(body).toContain('selected live identity')
+    expect(body).toContain('provider Agent backend')
+    expect(body).toContain("caller-supplied prompt becomes that Agent run's task")
+    expect(body).toContain('Both session-bound and project-bound Agents return results and local artifact paths to the caller')
+    expect(body).toContain('Agent output markers do not upload files or grant sharing permissions')
+    expect(body).toContain('lodestar-agent follow-up')
+    expect(body).toContain("lodestar-agent run --session '<session-id>'")
+    expect(body).toContain('workers[].session_id')
+    expect(body).toContain('workers[].output')
+    expect(body).toContain('lodestar-agent answer')
+    expect(body.toLowerCase()).not.toContain('reviewer')
+    expect(body.toLowerCase()).not.toContain('read-only')
+  })
+
   test('uses fixed-slot identity wording and never Token Source / consult protocol names', () => {
     const body = agentSkillBody()
     expect(body).toContain('name: lodestar-agent')

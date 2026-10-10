@@ -1,13 +1,9 @@
-/**
- * Shared types split out of session.ts so the main file stays under
- * agent per-read token budgets. Pure type-only — no
- * runtime imports here. Companion modules: session-tools.ts,
- * session-ask.ts, session-permission.ts.
- */
+/** Session 与 session-*.ts helper 共用的类型定义，不包含运行时导入。 */
 
 import type { AgentProvider, AgentReasoningEffort, AgentUsageSource } from './agent-process'
 import type { ConversationBranchBase, ConversationLaunch, ConversationRouting } from './conversation'
 import type { TurnAnchor } from './feishu'
+import type { FileDeliveryHandle, FileDeliveryMode } from './file-delivery-types'
 
 /**
  *   'user_message'   — 用户消息批次
@@ -24,7 +20,10 @@ export interface TurnState {
    * selection may change for a later turn, but must not rewrite this card. */
   provider: AgentProvider
   model: string | null
-  effort: AgentReasoningEffort
+  /** 运行时档位快照(上游允许 null:provider 未确认 effort 时的默认态;
+   *  展示/日志读点一律 `?? 'MISS'` 兜底)。 */
+  effort: AgentReasoningEffort | null
+  /** Token 口径(本地):驱动「上一轮」/console 面板的用量来源分支。 */
   usageSource: AgentUsageSource
   /** Feishu message_id of the card — needed for urgent_app push on clean
    * turn close. Kept separate from cardId because cardkit's stream APIs
@@ -34,6 +33,9 @@ export interface TurnState {
    * urgent_app push so only the initiator gets pinged (in case there
    * are other members in the group). Empty string → skip the ping. */
   userOpenId: string
+  /** Input receipts and their card handoffs must settle before closing this turn.
+   *  (上游) */
+  steeringInflight?: Set<Promise<void>>
   /** What kicked off this turn. Kept explicit for turn lifecycle logic. */
   trigger: TurnTrigger
   /** TurnState object identity is the primary async-event fence; these
@@ -51,12 +53,15 @@ export interface TurnState {
     resolvedNote?: string
     output?: string
     isError?: boolean
+    imageKey?: string
     /** Set when this tool is part of a merged file-tool batch (Read run or
      * Edit run) — points to the batch's slot in `toolBatches[i].items`.
      * completeTool uses it to update the right row instead of rendering
      * a standalone panel. */
     batchSlot?: number
   }>
+  /** Generated images finish uploading/rendering before their owning card closes. */
+  imageDeliveryInflight?: Map<string, Set<Promise<void>>>
   /** Current turn plan as reported by Codex app-server
    * turn/plan/updated. Deltas are only for the pre-authoritative
    * planning draft shown before this structure lands. */
@@ -132,9 +137,8 @@ export interface TurnState {
   assistantSegmentCount: number
   currentAssistantSegmentId: string | null
   currentAssistantText: string
-  // Per-assistant-segment cumulative text — used at turn close to strip
-  // [[send: /path]] markers and replace each segment with a cleaned
-  // version, then post the files as separate Feishu messages.
+  // Per-segment raw text. File markers are admitted during delta handling;
+  // turn close finalizes the prose and publishes the independent file receipt.
   segmentTexts: Map<string, string>
   /** Per-card assistant raw-write tasks. A stream handler registers the task
    * synchronously before returning; turn close drains it before inspecting
@@ -168,6 +172,16 @@ export interface TurnState {
   /** 降级瞬时通知的自动清除 timer(~8s 后把 footerStatusOverride 恢复 null,
    *  让 Thinking/Writing/Working 相位标签恢复)。stopFooterStatus / closeTurnCard 清它。 */
   modelFallbackOverrideTimer: ReturnType<typeof setTimeout> | null
+  /** Coalesce clock ticks across phase changes while a write is pending.
+   * (上游) */
+  footerStatusWriteCardId?: string
+  /** Latest phase/clock snapshot to render when the current write finishes.
+   * (上游) */
+  footerStatusPendingRender?: () => void
+  /** Stop clock-only retries after their bounded request budget is exhausted.
+   * Real phase changes, content and terminal transactions remain writable.
+   * (上游) */
+  footerStatusFailedCardId?: string
   /** Mid-turn card-rotation lock. Set when we've fire-and-forget kicked
    * off `startMidTurnRotate` to open a fresh card — either proactively
    * (element count crossed CARD_ELEMENT_SOFT_LIMIT) or reactively (an
@@ -176,8 +190,8 @@ export interface TurnState {
    * don't all queue duplicate rotation attempts. null means "no rotation
    * in flight". */
   rotating: Promise<void> | null
-  /** How many times this turn has rotated to a fresh card, proactive and
-   * reactive combined. Informational (logging) — NOT what the cap reads.
+  /** How many times this turn has rotated for capacity or supplemental input.
+   * Informational only; pagination has no turn-wide cap.
    * Reset per turn (a fresh TurnState starts at 0). */
   rotateCount: number
   /** Rotations triggered by confirmed card-capacity failures only
@@ -215,16 +229,24 @@ export interface TurnState {
   /** 本 turn 已处理过的出站路径请求。包括合法绝对路径和被拒绝的非绝对路径,
    * 用来避免增量文本反复扫到同一个 [[send: ...]] 时重复上传或刷日志。 */
   outboundSeenPaths: Set<string>
-  /** 已实际排队上传的绝对路径。用于 footer 计数和跨 rotate 去重。 */
+  /** 原生附件沿用排队计数；云空间文件在独立卡成功发送后计入。 */
   outboundSentPaths: Set<string>
   /** 已识别过的宿主 askusr marker 原文。assistant 文本是累积增量，
    * 不去重会在每次 delta 上重复建 ask 卡。 */
   hostAskMarkersSeen: Set<string>
+  /** Cloud uploads survive conversation-card rotations and settle before the turn closes.
+   * (上游) */
+  fileDelivery?: FileDeliveryHandle
+  /** Freeze the transport when its input reaches the Agent, before it prepares files.
+   * (上游) */
+  fileDeliveryMode?: FileDeliveryMode
 }
 
 export type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
 
 export interface SessionOpts {
+  /** Shared with AgentService so native children and background jobs use the same cards. */
+  agentCards?: import('./agent-cards').AgentCards
   /** Daemon hook: persist its current alive-session snapshot whenever this
    * session starts, stops, exits, or changes process lifecycle. Scripts
    * that construct Session directly can omit it. */

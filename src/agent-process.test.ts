@@ -71,11 +71,12 @@ describe('usageSourceForAgent(D-09 唯一接线点)', () => {
 })
 
 describe('isDshReasoningEffort 守卫(复用 03-01 已落符号)', () => {
-  test('off/low/high/max 为真,其余为假', () => {
-    for (const effort of ['off', 'low', 'high', 'max'] as const) {
+  test('off/minimal/low/medium/high/xhigh/max 为真,其余为假', () => {
+    // 合并上游后词表扩到 7 档(子进程 model/list 上报集,见 agent-process.ts 文档)。
+    for (const effort of ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'] as const) {
       expect(isDshReasoningEffort(effort)).toBe(true)
     }
-    for (const value of ['medium', 'xhigh', 'ultra', 'none', 'minimal', '', null, undefined, 1, {}, []]) {
+    for (const value of ['ultra', 'none', '', null, undefined, 1, {}, []]) {
       expect(isDshReasoningEffort(value)).toBe(false)
     }
   })

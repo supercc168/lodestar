@@ -1,7 +1,7 @@
 import { homedir, tmpdir } from 'node:os'
 import { chmodSync, mkdtempSync, mkdirSync, writeFileSync, unlinkSync, rmSync } from 'node:fs'
 import { delimiter, join, win32 } from 'node:path'
-import { afterAll, afterEach, beforeEach, describe, expect, mock, test } from 'bun:test'
+import { afterAll, afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 
 mock.module('./config', () => ({
   config: {
@@ -29,12 +29,13 @@ const {
   claudeTranscriptPath,
   readLastCallUsageFromTranscript,
   readProjectMcpServers,
-  resetClaudeContextWindowMaxCache,
+  resetClaudeContextWindowCache,
   resolveClaudeExecutableConfig,
   settingSourcesFromProfile,
   claudeSettingsFilesForSources,
   claudeSettingsAliasConflicts,
   toolsFromProfile,
+  claudeManagedSkillOptions,
 } = await import('./claude-agent-process')
 const {
   resolveClaudeSdkModel,
@@ -45,38 +46,254 @@ const {
 } = await import('./claude-models')
 const { NothingToCompactError } = await import('./agent-process')
 const { config } = await import('./config')
+const agentUpdates = await import('./agent-updates')
 
-// context window max 是 daemon 全局缓存(按路由 key 跨 session 共享),
+// context window 是 daemon 全局缓存(按路由 key 跨 session 共享),
 // 每个用例前重置,避免互相污染。
-beforeEach(() => resetClaudeContextWindowMaxCache())
+beforeEach(() => resetClaudeContextWindowCache())
+
+describe('Claude native steering', () => {
+  function running() {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
+    proc.started = true
+    const events: any[] = []
+    proc.on('result', (result: any) => events.push(result))
+    proc.handleMessage({ type: 'system', subtype: 'session_state_changed', state: 'running', uuid: 'turn-1' })
+    return { proc, events }
+  }
+  function result(proc: any, ids: string[], extra = {}) {
+    proc.handleMessage({ type: 'result', subtype: 'success', uuid: 'result',
+      user_message_uuids: ids, queued_turn_count: 0,
+      usage: { input_tokens: 10, output_tokens: 2 }, duration_ms: 100, num_turns: 1, ...extra })
+  }
+
+  test('streams guidance at the next native input boundary, with an independent input id', async () => {
+    const { proc, events } = running()
+    const consumed: any[] = []
+    proc.on('user_input_consumed', (event: any) => consumed.push(event))
+    expect(await proc.steerUserText('extra context', ['/tmp/input.txt'], 'input-1')).toBe(true)
+    const { value } = await proc.input.next()
+    expect(value.priority).toBe('next')
+    expect(value.message.content).toEqual([{ type: 'text', text: '[file: /tmp/input.txt]\n\nextra context' }])
+    expect(value.uuid).toBeString()
+    expect(events).toEqual([])
+    expect(consumed).toEqual([])
+    proc.handleMessage({ type: 'command_lifecycle', command_uuid: value.uuid, state: 'queued' })
+    expect(consumed).toEqual([])
+    proc.handleMessage({ type: 'command_lifecycle', command_uuid: 'unknown-input', state: 'started' })
+    proc.handleMessage({ type: 'command_lifecycle', command_uuid: value.uuid, state: 'started' })
+    proc.handleMessage({ type: 'command_lifecycle', command_uuid: value.uuid, state: 'completed' })
+    expect(consumed).toEqual([{ inputId: 'input-1' }])
+    result(proc, [value.uuid])
+    expect(events).toHaveLength(1)
+    expect(proc.steeringInputs.size).toBe(0)
+  })
+
+  test('headless input can be steered without session_state_changed and lifecycle receipts consume every input', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
+    proc.started = true
+    const events: any[] = []
+    proc.on('result', (event: any) => events.push(event))
+    proc.sendUserText('original request')
+    await proc.input.next()
+    expect(proc.turnActive).toBe(false)
+    for (let i = 0; i < 65; i++) {
+      expect(await proc.steerUserText(`guidance ${i}`)).toBe(true)
+      const { value } = await proc.input.next()
+      proc.handleMessage({ type: 'command_lifecycle', command_uuid: value.uuid, state: 'started' })
+    }
+    // Native result uuid lists are capped; per-command receipts must suffice.
+    result(proc, [])
+    expect(events).toHaveLength(1)
+    expect(proc.steeringInputs.size).toBe(0)
+  })
+
+  test('a result preceding consumption keeps one logical task and aggregates native turns', async () => {
+    const { proc, events } = running()
+    const starts: any[] = []
+    proc.on('turn_started', (event: any) => starts.push(event))
+    await proc.steerUserText('arrived at boundary')
+    const { value } = await proc.input.next()
+    result(proc, ['original'], { queued_turn_count: 1 })
+    expect(events).toEqual([])
+    proc.handleMessage({ type: 'system', subtype: 'session_state_changed', state: 'running', uuid: 'turn-2' })
+    expect(starts[0].retry).toBe(true)
+    result(proc, [value.uuid])
+    expect(events).toHaveLength(1)
+    expect(events[0].duration_ms).toBe(200)
+    expect(proc.lastUsage.input_tokens).toBe(20)
+    expect(proc.lastResult.num_turns).toBe(2)
+    expect(proc.steeringResults).toEqual([])
+  })
+
+  test('intermediate failures remain visible and cannot become a successful aggregate', async () => {
+    const { proc, events } = running()
+    const failures: any[] = []
+    proc.on('turn_input_error', (event: any) => failures.push(event))
+    await proc.steerUserText('follow-up')
+    const { value } = await proc.input.next()
+    result(proc, [], { is_error: true, subtype: 'error_during_execution', errors: ['upstream failed'] })
+    expect(failures).toEqual([{ error: 'upstream failed' }])
+    result(proc, [value.uuid])
+    expect(events[0].is_error).toBe(true)
+    expect(events[0].error).toBe('upstream failed')
+  })
+
+  test('stop clears unwritten guidance and requests native cancellation of queued inputs', async () => {
+    const { proc, events } = running()
+    const interruptions: any[] = []
+    proc.query = { interrupt: async (options: any) => { interruptions.push(options); return { still_queued: [], cancelled: [] } } }
+    await proc.steerUserText('must be cancelled')
+    proc.sendInterrupt()
+    expect(interruptions).toEqual([{ cancelQueued: true }])
+    expect(proc.input.items).toEqual([])
+    expect(proc.steeringInputs.size).toBe(0)
+    result(proc, [], { is_error: true, subtype: 'interrupted' })
+    expect(events).toHaveLength(1)
+    expect(await proc.steerUserText('idle')).toBe(false)
+    proc.alive = false
+    await expect(proc.steerUserText('closed')).rejects.toThrow('已关闭')
+  })
+
+  test('an upstream cancellation after a deferred result fails visibly without waiting forever', async () => {
+    const { proc, events } = running()
+    const failures: any[] = []
+    proc.on('turn_input_error', (event: any) => failures.push(event))
+    await proc.steerUserText('cancelled upstream')
+    const { value } = await proc.input.next()
+    result(proc, [])
+    expect(events).toEqual([])
+    proc.handleMessage({ type: 'command_lifecycle', command_uuid: value.uuid, state: 'cancelled' })
+    expect(events).toHaveLength(1)
+    expect(events[0].is_error).toBe(true)
+    expect(events[0].error).toContain('取消')
+    expect(failures).toHaveLength(1)
+    expect(proc.steeringInputs.size).toBe(0)
+    expect(proc.steeringResults).toEqual([])
+  })
+})
 
 describe('Claude model profiles', () => {
   test('shared config mock includes runtime elapsed defaults', () => {
     expect(config.runtime).toMatchObject({ live_elapsed: 'bucket' })
   })
 
+  test('SDK launches opt into task tracking while preserving routing and project tool restrictions', async () => {
+    const captured: any[] = []
+    const sdk = spyOn(agentUpdates, 'loadClaudeSdk').mockResolvedValue({
+      query: ({ options }: any) => {
+        captured.push(options)
+        return (async function* () {})()
+      },
+    } as any)
+    try {
+      for (const resumed of [false, true]) {
+        const proc = new ClaudeAgentProcess({
+          workDir: tmpdir(), model: resumed ? 'GLM-5.3-Flash' : 'claude-opus-5', effort: 'max',
+          ...(resumed ? { resumeSessionId: 'task-session' } : {}),
+          profile: resumed ? { tools: 'Read,TaskCreate,TaskUpdate,TaskList', loadProjectMcp: false } : { loadProjectMcp: false },
+          settingSources: resumed ? ['project', 'local'] : ['user', 'project', 'local'],
+          transformEnv: env => ({ ...env, CLAUDE_CODE_ENABLE_TODO_TOOLS: '0',
+            ANTHROPIC_BASE_URL: 'https://provider.invalid', ANTHROPIC_AUTH_TOKEN: 'test-only' }),
+        }) as any
+        proc.sendInitialize()
+        await proc.queryStart
+        expect(captured).toHaveLength(resumed ? 2 : 1)
+        const options = captured.at(-1)
+        expect(options.env.CLAUDE_CODE_ENABLE_TODO_TOOLS).toBe('1')
+        expect(options.env.ANTHROPIC_BASE_URL).toBe('https://provider.invalid')
+        expect(options.env.ANTHROPIC_AUTH_TOKEN).toBe('test-only')
+        expect(options.resume).toBe(resumed ? 'task-session' : undefined)
+        expect(options.tools).toEqual(resumed
+          ? ['Read', 'TaskCreate', 'TaskUpdate', 'TaskList']
+          : { type: 'preset', preset: 'claude_code' })
+      }
+    } finally { sdk.mockRestore() }
+  })
+
+  test('thinking estimates update progress without changing billed usage', () => {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
+    const progress: unknown[] = []
+    proc.on('thinking_progress', (event: unknown) => progress.push(event))
+    proc.handleMessage({ type: 'system', subtype: 'thinking_tokens', estimated_tokens: 123, estimated_tokens_delta: 4 })
+    expect(proc.lastThinkingTokens).toBe(123)
+    expect(proc.lastUsage).toBeNull()
+    expect(progress).toEqual([{ estimatedTokens: 123 }])
+    proc.handleMessage({ type: 'system', subtype: 'thinking_tokens', estimated_tokens: -1 })
+    expect(proc.lastThinkingTokens).toBe(123)
+  })
+
+  test('an empty upstream tool name remains visible as MISS with its original tool id', () => {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
+    const uses: unknown[] = []
+    proc.on('tool_use', (event: unknown) => uses.push(event))
+    proc.handleMessage({ type: 'assistant', message: { content: [{ type: 'tool_use', id: 'invalid-tool', name: '', input: {} }] } })
+    expect(uses).toEqual([{ id: 'invalid-tool', name: 'MISS', input: {}, parentToolUseId: null }])
+  })
+  test('hot settings preserve explicit max and reject a change requiring a different process environment', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
+    const updates: unknown[] = []
+    proc.started = true
+    proc.query = { setModel: async () => {}, applyFlagSettings: async (settings: unknown) => { updates.push(settings) } }
+    await proc.setModelSettings('moonshotai/kimi-k3', 'max')
+    await expect(proc.setModelSettings('xiaomi/mimo-v2.5-pro', 'default')).rejects.toThrow('启动环境')
+    await proc.setModelSettings('google/gemini-3.8-flash', 'high')
+    expect(updates).toEqual([
+      { effortLevel: 'max', ultracode: null },
+      { effortLevel: 'high', ultracode: null },
+    ])
+    expect(proc.lastEffort).toBe('high')
+    const nativeDefault = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'default' }) as any
+    nativeDefault.started = true
+    nativeDefault.query = proc.query
+    await nativeDefault.setModelSettings('minimax/minimax-m3', 'default')
+    expect(updates.at(-1)).toEqual({ effortLevel: null, ultracode: null })
+  })
+  test('a rejected model control does not attempt effort or report the old settings as confirmed', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), model: 'old-model', effort: 'high' }) as any
+    proc.started = true
+    let flagCalls = 0
+    proc.query = {
+      setModel: async () => { throw new Error('model control transport closed') },
+      applyFlagSettings: async () => { flagCalls++ },
+    }
+    await expect(proc.setModelSettings('new-model', 'max')).rejects.toMatchObject({
+      confirmedModel: null, message: '模型设置未确认：model control transport closed',
+    })
+    expect(flagCalls).toBe(0)
+    expect(proc.lastModel).toBeNull()
+    expect(proc.lastEffort).toBeNull()
+  })
+
+  test('loads daemon-managed Skills as a plugin only when user settings are excluded', () => {
+    expect(claudeManagedSkillOptions(['project', 'local'], '/data/lodestar-plugin')).toEqual({
+      plugins: [{ type: 'local', path: '/data/lodestar-plugin', skipMcpDiscovery: true }],
+      skills: 'all',
+    })
+    expect(claudeManagedSkillOptions(['user', 'project'], '/data/lodestar-plugin')).toEqual({})
+  })
   test('uses SDK default executable when no global Claude command is found', () => {
     const executable = resolveClaudeExecutableConfig({
       platform: 'win32',
       pathEnv: '',
+      configuredBin: null,
       exists: () => false,
     })
 
     expect(executable).toEqual({ description: 'sdk-default' })
   })
 
-  test('runs Windows npm command shims through the SDK custom spawn hook', () => {
+  test('Windows default uses the managed SDK even when an unrelated global npm shim exists', () => {
     const binDir = 'C:\\Users\\me\\AppData\\Roaming\\npm'
     const shim = win32.join(binDir, 'claude.cmd')
     const executable = resolveClaudeExecutableConfig({
       platform: 'win32',
       pathEnv: binDir,
+      configuredBin: null,
       exists: path => path === shim,
     })
 
-    expect(executable.pathToClaudeCodeExecutable).toBe(shim)
-    expect(typeof executable.spawnClaudeCodeProcess).toBe('function')
-    expect(executable.description).toBe(`windows-shell-shim:${shim}`)
+    expect(executable).toEqual({ description: 'sdk-default' })
   })
 
   test('win32 native exe falls through to SDK default entry (not passed directly, so dialog tools work)', () => {
@@ -86,6 +303,7 @@ describe('Claude model profiles', () => {
     const executable = resolveClaudeExecutableConfig({
       platform: 'win32',
       pathEnv: binDir,
+      configuredBin: null,
       exists: path => path === exe || path === shim,
     })
 
@@ -97,8 +315,7 @@ describe('Claude model profiles', () => {
     expect(executable.description).toBe('sdk-default')
   })
 
-  test('keeps npm-global, local bins, and existing PATH in Claude spawn PATH', () => {
-    if (process.platform === 'win32') return
+  test.skipIf(process.platform === 'win32')('keeps npm-global, local bins, and existing PATH in Claude spawn PATH', () => {
     const originalPath = process.env.PATH
     try {
       process.env.PATH = ['/opt/custom/bin', '/usr/bin'].join(delimiter)
@@ -235,104 +452,27 @@ describe('Claude model profiles', () => {
     }
   })
 
-  test('buildSpawnEnv: 登录档位抹掉环境里的 ANTHROPIC_*;GLM 只注入自己的 key,不夹带残留官方 key', () => {
-    const prevKey = process.env.ANTHROPIC_API_KEY
-    const prevModels = config.claude.models
-    // 残留一个官方 API key 在环境里(模拟用户 shell / 全局注入)。
-    process.env.ANTHROPIC_API_KEY = 'stray-official-key'
-    ;(config.claude as any).models = {
-      glm: { model: 'glm-4.6', base_url: 'https://glm.example/anthropic', auth_token: 'glm-tok' },
+  test('maps claude profiles to SDK model alias', () => {
+    const previousModels = config.claude.models
+    config.claude.models = {
+      custom: { model: ' sonnet ' },
+      empty: {},
+      'real-model': { model: 'haiku' },
+      default: { model: 'haiku' },
     }
     try {
-      // 官方登录档位:三个路由 key 全被抹掉,保证纯登录态。
-      const login = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:opus' })
-      const loginEnv = (login as any).buildSpawnEnv()
-      expect(loginEnv.ANTHROPIC_API_KEY).toBeUndefined()
-      expect(loginEnv.ANTHROPIC_BASE_URL).toBeUndefined()
-      expect(loginEnv.ANTHROPIC_AUTH_TOKEN).toBeUndefined()
-      expect(loginEnv.GSD_RUNTIME).toBe('claude')
-      // opus 登录档：主力 Opus 5，light Sonnet 5，不注入 Fable
-      expect(loginEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-opus-5')
-      expect(loginEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5')
-      expect(loginEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-opus-5')
-      expect(loginEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-sonnet-5')
-
-      // GLM 第三方路由:注入自己的 base_url + auth_token,但残留的官方 key
-      // 被先抹掉,不会夹带打到第三方端点。
-      const glm = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:glm' })
-      const glmEnv = (glm as any).buildSpawnEnv()
-      expect(glmEnv.ANTHROPIC_BASE_URL).toBe('https://glm.example/anthropic')
-      expect(glmEnv.ANTHROPIC_AUTH_TOKEN).toBe('glm-tok')
-      expect(glmEnv.ANTHROPIC_API_KEY).toBeUndefined()
-      expect(glmEnv.GSD_RUNTIME).toBe('claude')
+      expect(resolveClaudeSdkModel(null)).toBe('claude-fable-5')
+      expect(resolveClaudeSdkModel('claude:default')).toBe('claude-fable-5')
+      expect(resolveClaudeSdkModel('claude:glm')).toBe('claude-fable-5')
+      expect(resolveClaudeSdkModel('claude:custom')).toBe('sonnet')
+      expect(resolveClaudeSdkModel('claude:empty')).toBe('claude-fable-5')
+      expect(resolveClaudeSdkModel('claude:unlisted')).toBe('unlisted')
+      expect(resolveClaudeSdkModel('real-model')).toBe('real-model')
+      expect(resolveClaudeSdkModel('GLM-5.2[1m]')).toBe('GLM-5.2[1m]')
+      config.claude.models.glm = { model: 'custom-glm' }
+      expect(resolveClaudeSdkModel('claude:glm')).toBe('custom-glm')
     } finally {
-      if (prevKey === undefined) delete process.env.ANTHROPIC_API_KEY
-      else process.env.ANTHROPIC_API_KEY = prevKey
-      ;(config.claude as any).models = prevModels
-    }
-  })
-
-  test('buildSpawnEnv: scrubs every inherited model alias, then reinjects only the selected API profile', () => {
-    const prevModels = config.claude.models
-    const prevEnv = config.claude.env
-    const aliasKeys = [
-      'ANTHROPIC_DEFAULT_FABLE_MODEL',
-      'ANTHROPIC_DEFAULT_OPUS_MODEL',
-      'ANTHROPIC_DEFAULT_SONNET_MODEL',
-      'ANTHROPIC_DEFAULT_HAIKU_MODEL',
-    ] as const
-    const previousAliases = Object.fromEntries(aliasKeys.map(key => [key, process.env[key]]))
-    for (const key of aliasKeys) process.env[key] = `shell-stale-${key}`
-    ;(config.claude as any).env = Object.fromEntries(aliasKeys.map(key => [key, `config-stale-${key}`]))
-    ;(config.claude as any).models = {
-      glm: {
-        model: 'glm-5.3',
-        base_url: 'https://open.bigmodel.cn/api/anthropic',
-        auth_token: 'glm-tok',
-        env: {
-          ANTHROPIC_DEFAULT_OPUS_MODEL: 'glm-5.3',
-          ANTHROPIC_DEFAULT_SONNET_MODEL: 'glm-5-turbo',
-        },
-      },
-    }
-    try {
-      // GLM 档位:别名映射随 base_url/token 一起注入子进程。
-      const glm = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:glm' })
-      const glmEnv = (glm as any).buildSpawnEnv()
-      expect(glmEnv.ANTHROPIC_BASE_URL).toBe('https://open.bigmodel.cn/api/anthropic')
-      expect(glmEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('glm-5.3')
-      expect(glmEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('glm-5.3')
-      expect(glmEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('glm-5.3')
-      expect(glmEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('glm-5.3')
-      expect(glmEnv.GSD_RUNTIME).toBe('claude')
-
-      // 官方登录档位:宿主和 [claude.env] 的四种别名不能泄漏；
-      // 按飞书选定主力注入（opus → 全主力 Opus 5 + light Sonnet 5）。
-      const opus = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', model: 'claude:opus' })
-      const opusEnv = (opus as any).buildSpawnEnv()
-      expect(opusEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-opus-5')
-      expect(opusEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-opus-5')
-      expect(opusEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-opus-5')
-      expect(opusEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-sonnet-5')
-      expect(opusEnv.ANTHROPIC_BASE_URL).toBeUndefined()
-      expect(opusEnv.GSD_RUNTIME).toBe('claude')
-
-      // 新群尚未显式选择模型时，SDK 主模型回落 Fable 5；子 agent 主力=Fable 5、light=Sonnet 5。
-      const defaultLogin = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max' })
-      const defaultEnv = (defaultLogin as any).buildSpawnEnv()
-      expect(defaultEnv.ANTHROPIC_DEFAULT_FABLE_MODEL).toBe('claude-fable-5')
-      expect(defaultEnv.ANTHROPIC_DEFAULT_OPUS_MODEL).toBe('claude-fable-5')
-      expect(defaultEnv.ANTHROPIC_DEFAULT_SONNET_MODEL).toBe('claude-fable-5')
-      expect(defaultEnv.ANTHROPIC_DEFAULT_HAIKU_MODEL).toBe('claude-sonnet-5')
-      expect(defaultEnv.GSD_RUNTIME).toBe('claude')
-    } finally {
-      ;(config.claude as any).models = prevModels
-      ;(config.claude as any).env = prevEnv
-      for (const key of aliasKeys) {
-        const previous = previousAliases[key]
-        if (previous === undefined) delete process.env[key]
-        else process.env[key] = previous
-      }
+      config.claude.models = previousModels
     }
   })
 })
@@ -387,13 +527,13 @@ describe('Claude configured executable ([claude] bin)', () => {
   test('throws instead of silently falling back when configured bin is missing', () => {
     expect(() => resolveClaudeExecutableConfig({
       platform: 'linux',
-      configuredBin: '/nope/reclaude',
+      configuredBin: '/nope/claude-wrapper',
       exists: () => false,
-    })).toThrow('/nope/reclaude')
+    })).toThrow('/nope/claude-wrapper')
   })
 
   test('runs configured Windows .cmd bin through the shell shim spawn hook', () => {
-    const bin = win32.join('C:\\Users\\me\\bin', 'reclaude.cmd')
+    const bin = win32.join('C:\\Users\\me\\bin', 'claude-wrapper.cmd')
     const executable = resolveClaudeExecutableConfig({
       platform: 'win32',
       configuredBin: bin,
@@ -420,7 +560,8 @@ describe('Claude configured executable ([claude] bin)', () => {
     // [claude].bin 指向不存在的路径 → resolveClaudeExecutableConfig 同步抛出;
     // 修复确保该抛出在 sendInitialize 的 try/catch 内被捕获,转为事件输出,
     // 调用方不会收到同步异常,session 层可通过 error/exit 事件做正常清理。
-    ;(config.claude as any).bin = '/nope/reclaude'
+    const previousBin = config.claude.bin
+    ;(config.claude as any).bin = '/nope/claude-wrapper'
     try {
       const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' })
       const errors: Error[] = []
@@ -433,30 +574,34 @@ describe('Claude configured executable ([claude] bin)', () => {
 
       // error 事件携带路径信息
       expect(errors).toHaveLength(1)
-      expect(errors[0].message).toContain('/nope/reclaude')
+      expect(errors[0].message).toContain('/nope/claude-wrapper')
 
       // exit 事件 code=1
       expect(exits).toHaveLength(1)
       expect(exits[0].code).toBe(1)
     } finally {
-      delete (config.claude as any).bin
+      if (previousBin === undefined) delete (config.claude as any).bin
+      else config.claude.bin = previousBin
     }
   })
 
-  test('listModels/setModelSettings 在 sendInitialize 失败后抛清晰错误', async () => {
+  test('原生目录、额度和设置查询保留初始化失败的原始错误', async () => {
     // sendInitialize 因配错 bin 走 catch → this.query 保持 undefined。
     // 旧实现此时调 listModels/setModelSettings 会抛模糊的
     // "Cannot read properties of undefined (reading 'supportedModels')";
-    // 守卫后改成可定位的清晰错误(2026-07-04 review follow-up)。
-    ;(config.claude as any).bin = '/nope/reclaude'
+    // 保留初始化的原始路径错误，不能用泛化的 SDK 错误掩盖原因。
+    const previousBin = config.claude.bin
+    ;(config.claude as any).bin = '/nope/claude-wrapper'
     try {
       const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' })
       proc.sendInitialize() // 走 catch,this.query 仍 undefined
 
-      await expect(proc.listModels()).rejects.toThrow('SDK query not initialized')
-      await expect(proc.setModelSettings('opus', 'high')).rejects.toThrow('SDK query not initialized')
+      await expect(proc.listModels()).rejects.toThrow('[claude].bin not found: /nope/claude-wrapper')
+      await expect(proc.readSubscriptionUsage()).rejects.toThrow('[claude].bin not found: /nope/claude-wrapper')
+      await expect(proc.setModelSettings('opus', 'high')).rejects.toThrow('[claude].bin not found: /nope/claude-wrapper')
     } finally {
-      delete (config.claude as any).bin
+      if (previousBin === undefined) delete (config.claude as any).bin
+      else config.claude.bin = previousBin
     }
   })
 })
@@ -473,16 +618,16 @@ describe('Claude permission mode', () => {
 // AbortController + exitPromise + waitForExit + denyPendingPermissions;
 // 硬停语义 = 被丢弃代的排队 turn 不得在 SDK abort 窗口内 drain。
 describe('Claude shutdown reliability', () => {
-  test('kill 丢弃排队 turn(硬停:被丢弃代的输入不 drain)', async () => {
+  test('drops queued user inputs when the process is killed', async () => {
     const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
     proc.input.push({ type: 'user', message: { role: 'user', content: [] } })
 
-    await proc.kill(20)
+    await proc.kill()
 
     await expect(proc.input.next()).resolves.toEqual({ value: undefined, done: true })
   })
 
-  test('exit 时悬挂权限请求以合法 deny 立即解决', async () => {
+  test('resolves pending SDK permissions with a legal deny on exit', async () => {
     const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
     const ac = new AbortController()
     const permission = proc.canUseTool(
@@ -497,7 +642,7 @@ describe('Claude shutdown reliability', () => {
     expect(proc.pendingPermissions.size).toBe(0)
   })
 
-  test('kill 走 SDK close+abort 并等待 read loop 真实退出', async () => {
+  test('uses SDK close and abort, then waits for the read loop exit', async () => {
     const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
     const exits: any[] = []
     let closeCalls = 0
@@ -517,7 +662,7 @@ describe('Claude shutdown reliability', () => {
     expect(exits).toEqual([{ code: null, signal: null, expected: true }])
   })
 
-  test('SDK close/abort 后仍不退出时不伪造 SIGKILL 成功', async () => {
+  test('does not fabricate SIGKILL success when SDK close/abort never exits', async () => {
     const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
     const exits: any[] = []
     proc.started = true
@@ -531,7 +676,7 @@ describe('Claude shutdown reliability', () => {
     expect(exits).toEqual([])
   })
 
-  test('abort 完成关停时仍上报 SDK close 错误', async () => {
+  test('surfaces SDK close errors even when abort completes shutdown', async () => {
     const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
     proc.started = true
     proc.query = {
@@ -547,7 +692,7 @@ describe('Claude shutdown reliability', () => {
 })
 
 describe('Claude background task protocol validation', () => {
-  test('未知终态 status 不被强转 completed', () => {
+  test('does not turn an unknown terminal status into completed', () => {
     const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
     const settled: any[] = []
     proc.on('bg_task_settled', (event: any) => settled.push(event))
@@ -678,6 +823,91 @@ describe('Claude repeated tool failure correction hook', () => {
 })
 
 describe('Claude user dialog bridge', () => {
+  test('emits only SDK meta string prompts as scheduled turn input', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const scheduled: any[] = []
+    proc.on('scheduled_turn_input', (event: any) => scheduled.push(event))
+
+    proc.handleMessage({
+      type: 'user',
+      isMeta: true,
+      promptSource: 'sdk',
+      promptId: 'cron-prompt-1',
+      permissionMode: 'default',
+      message: { role: 'user', content: '【CrossEX 半小时运行巡检】检查服务并汇报。' },
+    })
+    // 手动用户消息由 Lodestar 自己的 input claim/card 负责，不是 scheduled。
+    proc.handleMessage({
+      type: 'user',
+      isMeta: false,
+      promptSource: 'sdk',
+      promptId: 'manual-prompt',
+      permissionMode: 'default',
+      message: { role: 'user', content: [{ type: 'text', text: '手动检查一下' }] },
+    })
+    // Claude 图片结果也是 meta string，但不是 SDK prompt，不能误开定时卡。
+    proc.handleMessage({
+      type: 'user',
+      isMeta: true,
+      promptId: 'image-result',
+      message: { role: 'user', content: '[Image: original 1440x2400]' },
+    })
+
+    expect(scheduled).toEqual([{
+      text: '【CrossEX 半小时运行巡检】检查服务并汇报。',
+      promptId: 'cron-prompt-1',
+    }])
+  })
+
+  test('marks subagent assistant text with its parent and never promotes its UUID to the main checkpoint', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const texts: any[] = []
+    const stops: any[] = []
+    proc.on('assistant_text', (event: any) => texts.push(event))
+    proc.on('assistant_block_stop', (event: any) => stops.push(event))
+
+    proc.handleMessage({
+      type: 'assistant',
+      uuid: 'assistant-child',
+      parent_tool_use_id: 'task-main-1',
+      message: {
+        model: 'opus',
+        content: [{ type: 'text', text: '子 Agent 的阶段性独白' }],
+      },
+    })
+
+    expect(texts).toEqual([{
+      uuid: 'assistant-child',
+      text: '子 Agent 的阶段性独白',
+      parentToolUseId: 'task-main-1',
+    }])
+    expect(stops).toEqual([{
+      index: 'assistant-child',
+      parentToolUseId: 'task-main-1',
+    }])
+    expect(proc.lastAssistantUuid).toBeNull()
+
+    proc.handleMessage({
+      type: 'assistant',
+      uuid: 'assistant-main',
+      message: {
+        model: 'opus',
+        content: [{ type: 'text', text: '主 Agent 正文' }],
+      },
+    })
+
+    expect(texts.at(-1)).toEqual({
+      uuid: 'assistant-main',
+      text: '主 Agent 正文',
+      parentToolUseId: null,
+    })
+    expect(stops.at(-1)).toEqual({
+      index: 'assistant-main',
+      parentToolUseId: null,
+    })
+    expect(proc.lastAssistantUuid).toBe('assistant-main')
+  })
+
   test('uses session_state_changed running as turn start boundary', () => {
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
@@ -744,6 +974,39 @@ describe('Claude user dialog bridge', () => {
       { turn_id: 'turn-1', thread_id: 'claude-session-1' },
       { turn_id: 'turn-2', thread_id: 'claude-session-1' },
     ])
+  })
+
+  test('emits a turn-local Claude checkpoint and clears it at the next turn boundary', () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const results: any[] = []
+    proc.on('result', (event: any) => results.push(event))
+    proc.handleMessage({
+      type: 'system', subtype: 'session_state_changed', state: 'running',
+      uuid: 'turn-1', session_id: 'claude-session-1',
+    })
+    proc.handleMessage({
+      type: 'assistant', uuid: 'assistant-1',
+      message: { model: 'opus', content: [{ type: 'text', text: 'done' }] },
+    })
+    proc.handleMessage({
+      type: 'result', subtype: 'success', session_id: 'claude-session-1',
+      is_error: false, duration_ms: 1, usage: {}, modelUsage: {},
+    })
+    expect(results[0].checkpoint).toEqual({
+      provider: 'claude', kind: 'assistant-message', id: 'assistant-1',
+      source: { provider: 'claude', sessionId: 'claude-session-1', cwd: '/tmp' },
+    })
+
+    proc.handleMessage({
+      type: 'system', subtype: 'session_state_changed', state: 'running',
+      uuid: 'turn-2', session_id: 'claude-session-1',
+    })
+    expect(proc.lastAssistantUuid).toBeNull()
+    proc.handleMessage({
+      type: 'result', subtype: 'error', session_id: 'claude-session-1',
+      is_error: true, duration_ms: 1, usage: {}, modelUsage: {},
+    })
+    expect(results[1].checkpoint).toBeNull()
   })
 
   test('routes AskUserQuestion through canUseTool permission flow', async () => {
@@ -1329,9 +1592,7 @@ describe('Claude token accounting', () => {
   })
 
   test('single SDK context-window report becomes the locked denominator', () => {
-    // 分母取该路由 SDK contextWindow 的全局历史 max;单次上报 → max 即该值。
-    // 首轮 SDK 常回落默认 200K,真实窗口(GLM-5.3[1m] → 1M,模型名 [1m] 钉法记账)跑几轮才上报,
-    // 见下方 lock-max 与跨 session 共享测试。
+    // 优先采用 SDK 当前明确上报的窗口。
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
       effort: 'high',
@@ -1368,9 +1629,8 @@ describe('Claude token accounting', () => {
     expect(proc.lastContextTokens).toBeNull()
   })
 
-  test('context window locks to historical max and never decreases', () => {
-    // 分母锁定 SDK 历史 max(单调不降):首轮回落默认 200K,真实窗口 1M 上报
-    // 后升上去,再回 200K / 异常 258K 都不再覆盖 → 百分比不会忽高忽低。
+  test('context window follows fresh reports even when capacity decreases', () => {
+    // 新上报的窗口无论变大还是变小，都不能被历史缓存覆盖。
     const proc = new ClaudeAgentProcess({
       workDir: '/tmp',
       effort: 'high',
@@ -1399,10 +1659,10 @@ describe('Claude token accounting', () => {
     expect(proc.lastContextWindow).toBe(1_000_000) // 升到真实窗口
     expect(events[1].contextWindow).toBe(1_000_000)
     result(200_000)
-    expect(proc.lastContextWindow).toBe(1_000_000) // 不降
-    expect(events[2].contextWindow).toBe(1_000_000)
+    expect(proc.lastContextWindow).toBe(200_000)
+    expect(events[2].contextWindow).toBe(200_000)
     result(258_000)
-    expect(proc.lastContextWindow).toBe(1_000_000) // 异常值也不覆盖
+    expect(proc.lastContextWindow).toBe(258_000)
   })
 
   test('1214 错误触发路由降级:仅 [1m] 路由生效,分母回 200K 锁死并发一次事件', () => {
@@ -1442,8 +1702,9 @@ describe('Claude token accounting', () => {
         is_error: true, duration_ms: 1, num_turns: 1, result: err1214,
       })
       expect(degradedEvents).toHaveLength(1)
+      // 路由 key 带来源前缀:本用例未传 tokenSourceId → 'no-source:claude:glm'。
       expect(degradedEvents[0]).toEqual({
-        routeKey: 'claude:glm', model: 'glm-5.3[1m]', contextWindow: 200_000,
+        routeKey: 'no-source:claude:glm', model: 'glm-5.3[1m]', contextWindow: 200_000,
       })
     } finally {
       ;(config.claude as any).models.glm = prevGlm
@@ -1506,11 +1767,10 @@ describe('Claude token accounting', () => {
     }
   })
 
-  test('context window max is shared across sessions (daemon-global per route)', () => {
-    // 全局锁定:任一 session 探测到真实窗口后, 同路由的其它 session 立即用作
-    // 分母, 不各自首轮回落 200K。context window 是路由属性, 与 session 无关。
+  test('fresh context windows update their route without crossing sources', () => {
+    // 同路由新的 SDK 上报可更新缓存，不同来源与路由仍然隔离。
     const proc1 = new ClaudeAgentProcess({
-      workDir: '/tmp', effort: 'high', model: 'claude:glm',
+      workDir: '/tmp', effort: 'high', model: 'claude:glm', tokenSourceId: 'glm',
     }) as any
     proc1.handleMessage({
       type: 'result', subtype: 'success', uuid: 'r-global-1', session_id: 's1',
@@ -1520,9 +1780,9 @@ describe('Claude token accounting', () => {
     })
     expect(proc1.lastContextWindow).toBe(1_000_000)
 
-    // 全新 session/实例, 同路由; 即便 SDK 首轮报 200K 也立即取全局锁定的 1M
+    // 同路由的新实例收到更小的明确数值，应采用该值。
     const proc2 = new ClaudeAgentProcess({
-      workDir: '/tmp', effort: 'high', model: 'claude:glm',
+      workDir: '/tmp', effort: 'high', model: 'claude:glm', tokenSourceId: 'glm',
     }) as any
     proc2.handleMessage({
       type: 'result', subtype: 'success', uuid: 'r-global-2', session_id: 's2',
@@ -1530,7 +1790,7 @@ describe('Claude token accounting', () => {
       usage: { input_tokens: 1000, output_tokens: 10 },
       modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 200_000 } },
     })
-    expect(proc2.lastContextWindow).toBe(1_000_000) // 全局锁定, 不是首轮 200K
+    expect(proc2.lastContextWindow).toBe(200_000)
 
     // 不同路由不串扰:default 路由的探测独立于 glm 路由
     const proc3 = new ClaudeAgentProcess({
@@ -1543,6 +1803,40 @@ describe('Claude token accounting', () => {
       modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 200_000 } },
     })
     expect(proc3.lastContextWindow).toBe(200_000) // default 路由独立, 200K
+
+    const proc4 = new ClaudeAgentProcess({
+      workDir: '/tmp', effort: 'high', model: 'claude:glm', tokenSourceId: 'deepseek',
+    }) as any
+    proc4.handleMessage({
+      type: 'result', subtype: 'success', uuid: 'r-global-4', session_id: 's4',
+      is_error: false, duration_ms: 1, num_turns: 1,
+      usage: { input_tokens: 1000, output_tokens: 10 },
+      modelUsage: { opus: { inputTokens: 1000, outputTokens: 10, contextWindow: 200_000 } },
+    })
+    expect(proc4.lastContextWindow).toBe(200_000) // 同 model slug、不同 source 不串扰
+  })
+
+  test('context errors preserve the observed window and expose the actual SDK error list', async () => {
+    const { observedContextWindow } = await import('./context-window-observe')
+    const proc = new ClaudeAgentProcess({
+      workDir: '/tmp', effort: 'high', model: 'audit-window[1m]', tokenSourceId: 'audit-window-source',
+    }) as any
+    const results: any[] = []
+    proc.on('result', (result: any) => results.push(result))
+    proc.handleMessage({
+      type: 'result', subtype: 'success', session_id: 'window-session', is_error: false,
+      modelUsage: { 'audit-window[1m]': { inputTokens: 100, outputTokens: 10, contextWindow: 1_000_000 } },
+    })
+    proc.handleMessage({
+      type: 'result', subtype: 'error_during_execution', session_id: 'window-session', is_error: true,
+      result: 'prompt is too long', errors: ['Request exceeds the context window', 'Reduce this request'],
+      modelUsage: {},
+    })
+    expect(observedContextWindow('audit-window-source', 'audit-window')).toBe(1_000_000)
+    expect(proc.opts.model).toBe('audit-window[1m]')
+    expect(results.at(-1)).toMatchObject({
+      is_error: true, error: 'Request exceeds the context window\nReduce this request',
+    })
   })
 
   test('context window stays null when SDK does not report one', () => {
@@ -1796,16 +2090,50 @@ describe('Claude project profile overrides', () => {
     expect(readProjectMcpServers(dir)).toBeUndefined()
   })
 
-  test('readProjectMcpServers returns undefined for malformed json', () => {
+  test('readProjectMcpServers rejects malformed json', () => {
     const dir = mkdtempSync(join(tmpdir(), 'lodestar-mcp-'))
     writeFileSync(join(dir, '.mcp.json'), '{ not json')
-    expect(readProjectMcpServers(dir)).toBeUndefined()
+    try { expect(() => readProjectMcpServers(dir)).toThrow('project .mcp.json parse failed') }
+    finally { rmSync(dir, { recursive: true, force: true }) }
   })
 
-  test('readProjectMcpServers returns undefined when mcpServers absent', () => {
+  test('readProjectMcpServers rejects missing and non-object mcpServers', () => {
     const dir = mkdtempSync(join(tmpdir(), 'lodestar-mcp-'))
-    writeFileSync(join(dir, '.mcp.json'), JSON.stringify({ foo: 'bar' }))
-    expect(readProjectMcpServers(dir)).toBeUndefined()
+    try {
+      for (const value of [{ foo: 'bar' }, { mcpServers: [] }, { mcpServers: null }, null]) {
+        writeFileSync(join(dir, '.mcp.json'), JSON.stringify(value))
+        expect(() => readProjectMcpServers(dir)).toThrow('no valid mcpServers object')
+      }
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  test('readProjectMcpServers exposes filesystem errors instead of omitting configured tools', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-mcp-'))
+    mkdirSync(join(dir, '.mcp.json'))
+    try { expect(() => readProjectMcpServers(dir)).toThrow('project .mcp.json not readable') }
+    finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  test('invalid project MCP configuration fails initialization before the SDK starts', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-mcp-'))
+    writeFileSync(join(dir, '.mcp.json'), '{ not json')
+    const sdk = spyOn(agentUpdates, 'loadClaudeSdk')
+    const proc = new ClaudeAgentProcess({ workDir: dir, effort: 'high' })
+    const errors: Error[] = []
+    const exits: unknown[] = []
+    proc.on('error', error => errors.push(error))
+    proc.on('exit', event => exits.push(event))
+    try {
+      await expect(proc.listModels()).rejects.toThrow('project .mcp.json parse failed')
+      expect(sdk).not.toHaveBeenCalled()
+      expect(errors).toHaveLength(1)
+      expect(exits).toEqual([{ code: 1, signal: null, expected: false }])
+      expect(proc.isAlive()).toBe(false)
+    } finally {
+      sdk.mockRestore()
+      await proc.kill()
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })
 

@@ -45,13 +45,15 @@ export const ELEMENTS = {
    * own element so we can replace it after the initial card lands,
    * decoupling the slow Codex account fetch from the rest of the panel's
    * synchronous data. */
-  consoleCurrentModel: 'console_current_model',
+  consoleCurrentModel: 'console_model',
   consoleProjects: 'console_projects',
   consoleHost: 'console_host',
   consoleUsage: 'console_usage',
   /** Model command card — one replaceable panel for model → effort
    * multi-step selection inside a single card. */
   modelPanel: 'model_panel',
+  /** In-place status for codex-login/account/accounts command replies. */
+  codexAccountPanel: 'codex_account_panel',
   /** 模型面板 agent 分组元素 key(上游 9020e11,D-05 修正:只摘不接线)。 */
   modelAgentGroup: (agent: string) => `model_agent_${agent}`,
   /** One-shot agy task card. */
@@ -68,6 +70,8 @@ export const ELEMENTS = {
   tasklistPanel: 'tasklist_panel',
   /** GSD status panel (TRACKER / active task / bridge). */
   gsdPanel: 'gsd_panel',
+  /** Independent receipt for one turn's delivered cloud files. */
+  fileDeliveryList: 'file_delivery_list',
 } as const
 
 function escapeHtmlEntities(s: string): string {
@@ -79,12 +83,12 @@ function escapeHtmlEntities(s: string): string {
  *  URL 都会被服务端拒(ErrCode 200570),导致整张卡 create / 元素 update 失败;
  *  按 `img_...` 外形放行并不能证明它来自飞书上传,故不设外形白名单、一律
  *  降级——既不触发 image 解析,又保留原目标。url 捕获到 `)` 前(含空格也完整
- *  保留,trim 首尾空白)。本地结构化图片(notify 截图)由 uploader 生成并作为
- *  `tag: 'img'` 组件插入,不经过这条 Markdown 清洗路径,不受影响。 */
+ *  保留,trim 首尾空白)。本地结构化图片(公式/notify 截图)由 uploader 生成并
+ *  作为 `tag: 'img'` 组件插入,不经过这条 Markdown 清洗路径,不受影响。 */
 function downgradeExternalImagesInProse(s: string): string {
   const downgraded = s.replace(
     /!\[([^\]]*)\]\(([^)]*)\)/g,
-    (_m, alt: string, url: string) => {
+    (_, alt: string, url: string) => {
       const u = url.trim()
       return alt.trim() ? `🖼️ ${alt.trim()} (${u})` : `🖼️ ${u}`
     },
@@ -99,8 +103,8 @@ function downgradeExternalImagesInProse(s: string): string {
 /** Final Card JSON safety boundary. Templates have many Markdown sinks
  * (plan/goal/task/Ask/tool fields); recursively neutralize images in every
  * markdown element while preserving intentional Card Kit HTML such as
- * `<font>`. Notification images use structured `tag: 'img'` elements and
- * are untouched.(挂在 feishu.ts 卡片 create/update 序列化点,与注入点级
+ * `<font>`. Formula and notification images use structured `tag: 'img'` elements
+ * and are untouched.(挂在 feishu.ts 卡片 create/update 序列化点,与注入点级
  * sanitizeMarkdownForCardKit/downgradeExternalImagesForCardKit 为链上不同
  * 层——兜底叠加,不替换。) */
 export function neutralizeMarkdownImagesInCard<T>(value: T): T {

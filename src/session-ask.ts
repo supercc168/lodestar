@@ -10,23 +10,14 @@ import type { Session } from './session'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
-import { findPendingReply } from './notify-callbacks'
+import { formatFeishuError } from './feishu-errors'
 import { log } from './log'
+import { findPendingReply } from './notify-callbacks'
 
-/** True iff there's at least one open AskUserQuestion awaiting an
- * answer in this session. `daemon.handleMessage` uses this to
- * decide whether an inbound chat message should be a custom answer
- * (routed to onAskMessageAnswer) instead of opening a new turn. */
-export function hasPendingAsk(s: Session): boolean {
-  return s.pendingAsks.size > 0
-}
-
-/** 队首(最早插入且未答完)的提问。模块私有 —— 队列判定只在本文件内用。 */
 function currentAsk(s: Session) {
   return [...s.pendingAsks.entries()].find(([, pending]) => pending.currentIdx !== undefined)
 }
 
-/** 该提问当前为何不可作答,可作答时返回 null。 */
 export function askBlockReason(s: Session, toolUseId: string): string | null {
   const pending = s.pendingAsks.get(toolUseId)
   if (!pending || pending.currentIdx === undefined) return null
@@ -35,7 +26,6 @@ export function askBlockReason(s: Session, toolUseId: string): string | null {
   return null
 }
 
-/** 面板渲染态:含等待分支(通知回复中 / 排队中)。 */
 export function askRenderState(s: Session, toolUseId: string): cards.AskState {
   const pending = s.pendingAsks.get(toolUseId)
   if (!pending) throw new Error(`missing pending ask: ${toolUseId}`)
@@ -45,8 +35,7 @@ export function askRenderState(s: Session, toolUseId: string): cards.AskState {
   return { currentIdx: pending.currentIdx, answered: pending.answered, waitingFor }
 }
 
-/** 只在「这条提问成为当前可答的那一条」时推送一次手机加急通知(summary 改
- * 成题面预览 + urgentApp)。等待/排队期间不推;announcementVersion 作废在途推送。 */
+/** Alert only for the single question currently eligible for an answer. */
 export function announceAsk(s: Session, toolUseId: string): void {
   const pending = s.pendingAsks.get(toolUseId)
   const turn = s.currentTurn
@@ -70,8 +59,8 @@ export function announceAsk(s: Session, toolUseId: string): void {
   })().catch(error => log(`session "${s.sessionName}": question notification failed: ${error}`))
 }
 
-/** 回复打开/关闭或当前题答完后重绘所有提问面板。pending tool call 继续
- * park 在原后端握手上。等待/排队期间作废在途推送并允许恢复后重推一次。 */
+/** Repaint after a reply opens/closes or the current question completes.
+ * Pending tool calls remain parked for their original backend handshake. */
 export function refreshPendingAsks(s: Session): void {
   const turn = s.currentTurn
   if (!turn) return
@@ -89,6 +78,14 @@ export function refreshPendingAsks(s: Session): void {
   }
 }
 
+/** True iff there's at least one open AskUserQuestion awaiting an
+ * answer in this session. `daemon.handleMessage` uses this to
+ * decide whether an inbound chat message should be a custom answer
+ * (routed to onAskMessageAnswer) instead of opening a new turn. */
+export function hasPendingAsk(s: Session): boolean {
+  return currentAsk(s) !== undefined
+}
+
 /** Funnel an arbitrary chat message into the *current* question
  * of the oldest pending ask as a `customText` answer. Multi-
  * question semantics: from the user's perspective, the chat
@@ -104,7 +101,10 @@ export async function onAskMessageAnswer(s: Session, text: string, user: string,
       // 文本路径 toolUseId 恒为队首,排队分支在文本路径结构上不可达,
       // 唯一可达的阻塞是通知回复分支(排队阻断由 advanceAsk 点击门控覆盖)。
       const notice = `${blocked}。这条文字未提交，请稍后重新发送。`
-      if (!await feishu.sendText(s.chatId, notice)) throw new Error(`提问等待提示发送失败: ${notice}`)
+      let failure: unknown
+      if (!await feishu.sendText(s.chatId, notice, error => { failure = error })) {
+        throw new Error(`提问等待提示发送失败: ${notice}\n${formatFeishuError(failure)}`)
+      }
       return
     }
     // 这条文本确实落在一个 live 问题上 —— 当 ask 答案消费。只有真记账成功

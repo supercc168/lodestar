@@ -4,9 +4,15 @@ import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { AgentResultEvent } from '../src/agent-process'
-import { codexModelEffort, codexModelIsGrok, codexModelProfile } from '../src/codex-models'
+import {
+  codexModelConfigured,
+  codexModelEffort,
+  codexModelIsApiRoute,
+  codexModelIsGrok,
+  codexModelProfile,
+  codexSpawnOverrides,
+} from '../src/codex-models'
 import { CODEX_EFFORT, CodexProcess } from '../src/codex-process'
-import { resolveTokenSource } from '../src/token-source'
 
 const rawSelection = process.argv[2]?.trim()
 if (!rawSelection) {
@@ -16,21 +22,20 @@ const selection = rawSelection.startsWith('codex:') ? rawSelection : `codex:${ra
 if (codexModelIsGrok(selection)) {
   throw new Error('Grok profiles must use claude-stream-probe.ts through Claude Agent SDK')
 }
-const source = resolveTokenSource('codex', selection)
 const profile = codexModelProfile(selection)
-const overrides = source.spawnOverrides()
+const overrides = codexSpawnOverrides(selection)
 const effort = codexModelEffort(selection) ?? CODEX_EFFORT
 
-if (!profile || !source.isApiRoute()) {
+if (!profile || !codexModelIsApiRoute(selection)) {
   throw new Error(`${selection} is not a Codex API route`)
 }
-if (!source.enabled()) {
+if (!codexModelConfigured(selection)) {
   throw new Error(`${selection} is not configured`)
 }
 if (!overrides.modelId) {
   throw new Error(`${selection} has no configured model`)
 }
-const responsesConfig = overrides.configArgs.some(arg => arg.endsWith('.wire_api="responses"'))
+const responsesConfig = overrides.configArgs.some((arg: string) => arg.endsWith('.wire_api="responses"'))
 if (!responsesConfig) {
   throw new Error(`${selection} must use wire_api="responses" for this probe`)
 }

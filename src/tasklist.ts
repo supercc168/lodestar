@@ -100,6 +100,7 @@ export interface TasklistDeletionState {
   lastError?: string
 }
 
+/** 项目与飞书任务清单的绑定及未完成的删除请求。 */
 export interface TasklistBinding {
   guid: string
   name: string

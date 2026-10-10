@@ -1,6 +1,8 @@
 /** Cordis plugin loaded only in the Node DSH child, never in the daemon. */
 import { createInterface } from 'node:readline'
 import { randomUUID } from 'node:crypto'
+import { createRequire } from 'node:module'
+import { readFileSync } from 'node:fs'
 import { realpath } from 'node:fs/promises'
 import type { Context } from '@deepseek-ai/cordis'
 import type { Agent, AgentHandle } from '@deepseek-ai/dsh-agent'
@@ -18,11 +20,19 @@ import type {} from '@deepseek-ai/dsh-agent-default-model'
 import type {} from '@deepseek-ai/dsh-shell-env'
 import type {} from '@deepseek-ai/dsh-attachment'
 import type { DshOpenOptions } from './dsh-protocol.ts'
+import { DSH_PROTOCOL_VERSION } from './dsh-protocol.ts'
 
 export const name = 'lodestar-bridge'
 export const inject = ['agents', 'llm', 'agentDefaultModel', 'sessionPersistence', 'tools', 'systemPrompt', 'userQuestions', 'compaction', 'shellEnv', 'attachments', 'sdkAppStartup']
-const PROVIDER = 'deepseek-official'
+const PROVIDER = process.env.LODESTAR_DSH_PROVIDER ?? 'deepseek-official'
+if (!['deepseek-official', 'zai-coding-cn', 'zai'].includes(PROVIDER)) throw new Error(`Unsupported DSH provider: ${PROVIDER}`)
+// 本地硬闸:原生子 agent 永远不能再委派(三层防线见 agent/created 与 session/open)。
 const DELEGATION_TOOLS = ['subagent', 'subagent_fork', 'workflow', 'ralph', 'send_message']
+
+function nativeErrorMessage(error: unknown, depth = 0): string {
+  if (!(error instanceof Error)) return String(error)
+  return error.cause && depth < 4 ? `${error.message}: ${nativeErrorMessage(error.cause, depth + 1)}` : error.message
+}
 
 export function apply(ctx: Context): void {
   let root: AgentHandle | undefined
@@ -43,7 +53,7 @@ export function apply(ctx: Context): void {
     process.stdout.write(JSON.stringify({ jsonrpc: '2.0', method, params }) + '\n')
   }
   const fail = (error: unknown): void => {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = nativeErrorMessage(error)
     process.stderr.write(`lodestar-dsh: ${message}\n`)
     notify('failure', { message })
   }
@@ -54,8 +64,8 @@ export function apply(ctx: Context): void {
   const delegationContext = process.env.DSH_LODESTAR_AGENT_CONTEXT
   delete process.env.DSH_LODESTAR_AGENT_CONTEXT
   ctx.shellEnv.register({ name: 'lodestar-agent',
-    variables: { DSH_LODESTAR_AGENT_CONTEXT: { description: 'Lodestar delegation context for the current root agent only.' } },
-    resolve: execution => delegationContext && execution.agent === root?.agent
+    variables: { DSH_LODESTAR_AGENT_CONTEXT: { description: 'Inherited Lodestar task context for this agent and its native descendants.' } },
+    resolve: () => delegationContext
       ? { DSH_LODESTAR_AGENT_CONTEXT: delegationContext } : {},
   })
   const settle = (): void => {
@@ -93,7 +103,8 @@ export function apply(ctx: Context): void {
     if (agent.session.id === rootId && status === 'idle') settle()
   })
   ctx.on('agent/error', ({ agent, error }) => {
-    const message = error instanceof Error ? error.message : String(error)
+    const message = nativeErrorMessage(error)
+    process.stderr.write(`lodestar-dsh agent error: ${message}\n`)
     if (agent.session.id === rootId) turnFailure = message
     notify('agent.error', { sessionId: agent.session.id, message })
   })
@@ -126,8 +137,12 @@ export function apply(ctx: Context): void {
     })
   })
 
-  async function catalog() {
-    const models = await ctx.llm.listModels(PROVIDER)
+  async function catalog(extra: string[] = []) {
+    const models = [...await ctx.llm.listModels(PROVIDER)]
+    const listed = new Set(models.map(model => model.id))
+    for (const id of new Set(extra)) {
+      if (!listed.has(id)) models.push(await ctx.llm.resolveModelInfo(PROVIDER, id))
+    }
     if (!models.length) throw new Error('DSH model catalog is empty')
     return Promise.all(models.map(async model => {
       const info = await ctx.llm.resolveModelInfo(PROVIDER, model.id)
@@ -140,11 +155,13 @@ export function apply(ctx: Context): void {
         defaultEffort: info.reasoning.defaultEffort,
         contextWindow: info.context?.contextWindow ?? null,
         isDefault: ctx.agentDefaultModel.currentSelection().provider === PROVIDER && ctx.agentDefaultModel.currentSelection().model === model.id,
+        isCustom: !listed.has(model.id),
       }
     }))
   }
   async function route(model: string, effort: string): Promise<LlmCallConfig> {
-    const info = (await catalog()).find(entry => entry.model === model)
+    // 本地保留 fail-fast 校验;用 catalog([model]) 以兼容上游的目录外/自定义模型。
+    const info = (await catalog([model])).find(entry => entry.model === model)
     if (!info || !info.efforts.some(e => e === effort)) throw new Error(`DSH model/effort unavailable: ${model}/${effort}`)
     return ctx.llm.resolveCallConfig({ provider: PROVIDER, model, reasoningEffort: ReasoningEffortId(effort) })
   }
@@ -165,6 +182,7 @@ export function apply(ctx: Context): void {
         return payload.agent === agent ? { ...resolved, ...turnRoute } : resolved
       })
       if (!input.allowDelegation) agentCtx.tools.restrict({ deny: DELEGATION_TOOLS })
+      if (input.allowUserInput === false) agentCtx.tools.restrict({ deny: ['ask_user_question'] })
       if (input.allowedTools) agentCtx.tools.restrict({ allow: input.allowedTools })
       if (input.developerInstructions) {
         agentCtx.systemPrompt.section({ name: 'lodestar:instructions', order: 999, text: input.developerInstructions })
@@ -207,7 +225,7 @@ export function apply(ctx: Context): void {
       }
       await ctx.sessionPersistence.flush()
       lifecycle.signal.throwIfAborted()
-      return { sessionId: rootId, models: await catalog() }
+      return { sessionId: rootId, models: await catalog([input.model]) }
     } catch (error) {
       // Keep a successfully acquired handle available for shutdown after failure.
       if (!root) rootId = undefined
@@ -221,11 +239,14 @@ export function apply(ctx: Context): void {
       if (initialized) throw new Error('DSH already initialized')
       await ctx.get('loader')?.await()
       initialized = true
-      return { protocolVersion: 1, runtimeVersion: '0.1.5-alpha.2' }
+      // 运行时版本动态取自实际加载的 DSH manifest(dsh-runtime 侧有严格匹配闸)。
+      const require = createRequire(import.meta.url)
+      const manifest = JSON.parse(readFileSync(require.resolve('@deepseek-ai/dsh/package.json'), 'utf8'))
+      return { protocolVersion: DSH_PROTOCOL_VERSION, runtimeVersion: manifest.version }
     }
     if (!initialized) throw new Error('DSH not initialized')
     switch (method) {
-      case 'model/list': return catalog()
+      case 'model/list': return catalog(params.models ?? [])
       case 'session/open': {
         if (opening) throw new Error('DSH session initialization is already in progress')
         opening = open(params)

@@ -1,6 +1,7 @@
 import type { Session } from './session'
 import * as cards from './cards'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
 import { log } from './log'
 import * as tasklist from './tasklist'
 import { messageOf, type TasklistActionResult } from './session-util'
@@ -33,8 +34,9 @@ export async function showTasklistPanel(s: Session): Promise<void> {
       log(`session "${s.sessionName}": tasklist chatId self-heal failed: ${messageOf(e)}`)
     }
   }
-  const messageId = await feishu.sendCard(s.chatId, tasklistPanel(s))
-  if (!messageId) await feishu.sendTextRaw(s.chatId, '❌ task 面板发送失败')
+  let failure: unknown
+  const messageId = await feishu.sendCard(s.chatId, tasklistPanel(s), error => { failure = error })
+  if (!messageId) await feishu.sendTextRaw(s.chatId, `❌ task 面板发送失败\n${formatFeishuError(failure)}`)
 }
 
 export async function onTasklistEnable(s: Session): Promise<TasklistActionResult> {

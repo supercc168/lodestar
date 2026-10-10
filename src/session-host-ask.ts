@@ -291,15 +291,9 @@ function advanceHostAsk(
   if (!ask || ask.currentIdx === undefined) return { ok: false, message: '问题已结束' }
   const question = ask.questions[ask.currentIdx]
   if (!question) return { ok: false, message: '问题不存在' }
-  let value: string
-  if (answer.customText !== undefined) {
-    value = answer.customText
-  } else if (answer.optionIdx !== undefined) {
-    const opt = question.options[answer.optionIdx]
-    if (!opt) return { ok: false, message: '选项不存在' }
-    value = opt.label
-  } else {
-    return { ok: false, message: '无效答案' }
+  if (answer.customText === undefined) {
+    if (answer.optionIdx === undefined) return { ok: false, message: '无效答案' }
+    if (!question.options[answer.optionIdx]) return { ok: false, message: '选项不存在' }
   }
   ask.answered.set(ask.currentIdx, {
     optionIdx: answer.optionIdx,

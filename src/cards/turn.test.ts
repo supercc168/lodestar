@@ -1,10 +1,9 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, consoleUsageElement, modelResultCard, modelResultPanelElement, modelSelectionCard, statusCard, streamingOffSettings } from './console'
+import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, consoleUsageElement, modelChangeStatusCard, modelCustomPromptCard, modelEffortSelectionCard, modelResultCard, modelResultPanelElement, modelSelectionCard, providerSelectionCard, statusCard, streamingOffSettings } from './console'
 import {
   askUserQuestionElement,
   contextCompactionElement,
-  editBatchElement,
   footerContextPercentLabel,
   footerModelLabel,
   footerTokenDetailLine,
@@ -14,14 +13,87 @@ import {
   mainConversationCard,
   planElement,
   planLiveElement,
-  readBatchElement,
-  summarizeToolInput,
-  toolCallElement,
-  toolCallPermissionElement,
   watchdogFooterContent,
 } from './turn'
+import { editBatchElement, readBatchElement, summarizeToolInput, toolCallElement, toolCallPermissionElement } from './tool'
 
 describe('main conversation card rendering', () => {
+  test('narrow model row buttons use one character while wide actions keep full labels', () => {
+    const model = { provider: 'claude' as const, sourceId: 'glm', model: 'GLM-test', displayName: 'GLM-test',
+      efforts: [{ effort: 'high' as const, description: '', isDefault: true }] }
+    const opts = { sessionName: 'test', panelId: 'p', sourceId: 'glm', editable: true, allowCustom: true,
+      models: [model, { ...model, model: 'custom', origin: 'custom' as const }],
+      pagination: { sourceId: 'glm', page: 1, totalPages: 3 } }
+    const cards = [
+      providerSelectionCard({ sessionName: 'test', panelId: 'p', providers: [
+        { provider: 'claude', sourceId: 'glm', display: 'GLM', enabled: true, modelCount: 2 },
+        { provider: 'dsh', sourceId: 'deepseek-harness', display: 'DeepSeek', enabled: false, modelCount: 0 },
+      ] }),
+      modelSelectionCard(opts), modelSelectionCard({ ...opts, mode: 'add' }),
+      modelSelectionCard({ ...opts, editable: false }),
+      modelEffortSelectionCard({ sessionName: 'test', panelId: 'p', model }),
+      modelCustomPromptCard('test', 'GLM', 'p'),
+    ]
+    const labels: Record<string, string[]> = {}
+    const visit = (value: any): void => {
+      if (!value || typeof value !== 'object') return
+      if (value.tag === 'button') {
+        const kind = value.behaviors[0].value.kind
+        ;(labels[kind] ??= []).push(value.text.content)
+      }
+      for (const child of Object.values(value)) visit(child)
+    }
+    cards.forEach(visit)
+    for (const kind of ['provider_select', 'token_source_enable', 'model_select', 'model_add', 'model_remove', 'model_custom_remove', 'model_effort_select']) {
+      expect(labels[kind].every(label => /^\p{Script=Han}$/u.test(label))).toBe(true)
+    }
+    expect(labels.model_custom_prompt).toEqual(['补录模型', '补录模型', '补录模型'])
+    expect(labels.model_list_open).toEqual(['显示模型', '返回模型列表'])
+    expect(labels.model_page).toContain('上一页')
+    expect(labels.model_page).toContain('下一页')
+    expect(labels.model_panel_cancel).toEqual(['取消'])
+  })
+
+  test('upstream rows hide while custom rows delete, and every editable source offers registration', () => {
+    const card = modelSelectionCard({ sessionName: 'test', panelId: 'panel', sourceId: 'codex-sub', editable: true, allowCustom: true,
+      models: [
+        { provider: 'codex', sourceId: 'codex-sub', model: 'upstream', displayName: 'upstream', origin: 'upstream', efforts: [] },
+        { provider: 'codex', sourceId: 'codex-sub', model: 'custom', displayName: 'custom', origin: 'custom', efforts: [], unavailableReason: 'MISS' },
+      ] }) as any
+    const rows = card.body.elements[0].elements.filter((e: any) => e.tag === 'column_set')
+    expect(rows[0].columns[1].elements.at(-1).behaviors[0].value.kind).toBe('model_remove')
+    expect(rows[0].columns[1].elements.at(-1).text.content).toBe('隐')
+    expect(rows[1].columns[1].elements.at(-1).behaviors[0].value.kind).toBe('model_custom_remove')
+    expect(rows[1].columns[1].elements.at(-1).text.content).toBe('删')
+    const elements = card.body.elements[0].elements
+    expect(elements[elements.indexOf(rows[0]) + 1]).toEqual({ tag: 'hr' })
+    expect(rows[0].columns.every((column: any) => column.vertical_align === 'center')).toBe(true)
+    expect(rows[0].columns[0].elements[0].content).toBe('**`upstream`**')
+    expect(JSON.stringify(card)).toContain('model_custom_prompt')
+  })
+  test('every footer uses the same agent and model identity format', () => {
+    expect(footerModelLabel('claude', 'claude:GLM-5.3[1m]', 'max')).toBe('claude · GLM-5.3/max')
+    expect(footerModelLabel('codex', 'gpt-5.6-sol', 'xhigh')).toBe('codex · gpt-5.6-sol/xhigh')
+    expect(footerModelLabel('dsh', 'glm-5.3', 'high')).toBe('dsh · glm-5.3/high')
+    expect(footerModelLabel('claude', 'xiaomi/mimo-v2.5-pro', 'default')).toBe('claude · xiaomi/mimo-v2.5-pro/default')
+    expect(footerModelLabel('dsh', null, null)).toBe('dsh · MISS/MISS')
+  })
+
+  test('MD gives agent groups distinct headers and containers while preserving source actions', () => {
+    const card = providerSelectionCard({ sessionName: 'test', panelId: 'p', providers: [
+      { provider: 'dsh', sourceId: 'dsh-glm', display: 'GLM Coding Plan', enabled: true, modelCount: 10 },
+      { provider: 'claude', sourceId: 'openrouter', display: 'OpenRouter', enabled: true, modelCount: 9 },
+      { provider: 'codex', sourceId: 'codex-sub', display: 'Codex 订阅', enabled: true, modelCount: 3 },
+      { provider: 'claude', sourceId: 'glm', display: 'GLM Coding Plan', enabled: true, modelCount: 10 },
+    ] }) as any
+    const elements = card.body.elements[0].elements
+    const groups = elements.filter((e: any) => e.tag === 'collapsible_panel')
+    expect(groups.map((e: any) => e.header.title.content)).toEqual(['**Agent · Claude Code**', '**Agent · Codex**', '**Agent · DeepSeek Harness**'])
+    expect(groups.every((e: any) => e.expanded && e.header.background_color === 'blue-50' && e.border.color === 'blue-100')).toBe(true)
+    expect(groups.map((e: any) => e.element_id)).toEqual(['model_agent_claude', 'model_agent_codex', 'model_agent_dsh'])
+    expect(groups.flatMap((g: any) => g.elements).map((e: any) => e.columns[1].elements[0].behaviors[0].value.source_id))
+      .toEqual(['openrouter', 'glm', 'codex-sub', 'dsh-glm'])
+  })
   test('starts with a stable footer status element and no disposable ticker', () => {
     const card = mainConversationCard({
       sessionName: 'probe',
@@ -77,6 +149,15 @@ describe('main conversation card rendering', () => {
     expect(card.body.elements[0].content).toContain('⏰ 定时任务触发')
     expect(card.body.elements[0].content).toContain('Claude')
     expect(card.body.elements.map((element: any) => element.element_id).filter(Boolean)).toEqual(['footer'])
+  })
+
+  test('a supplemental card shows its new inputs without claiming a new task or capacity overflow', () => {
+    const card = mainConversationCard({ sessionName: 'probe', turn: 3, kind: 'user_steering',
+      userInputs: ['补充第一点', '补充第二点'] }) as any
+    expect(card.body.elements[0].header.title.content).toBe('📥 追加 (2) #3')
+    expect(card.body.elements[0].elements.map((element: any) => element.content)).toEqual(['补充第一点', '补充第二点'])
+    expect(card.body.elements.map((element: any) => element.element_id)).toEqual(['user_input', 'footer'])
+    expect(JSON.stringify(card)).not.toContain('前卡写满')
   })
 
   test('user input panel neutralizes markdown image syntax that would break card creation', () => {
@@ -157,6 +238,12 @@ describe('main conversation card rendering', () => {
     expect(card.body.elements[0].content).not.toContain('restart')
   })
 
+  test('standalone hi elements satisfy the Card Kit 20-character ID limit', () => {
+    const elements = consoleBodyElements({ sessionName: 'probe', status: 'idle' }) as any[]
+    for (const element of elements) expect(element.element_id).toMatch(/^[A-Za-z][A-Za-z0-9_]{0,19}$/)
+    expect(new Set(elements.map(element => element.element_id)).size).toBe(elements.length)
+  })
+
   test('console body can replace a status card footer in place', () => {
     const elements = consoleBodyElements({
       sessionName: 'probe',
@@ -169,6 +256,7 @@ describe('main conversation card rendering', () => {
         isCurrent: true,
         status: 'working',
         uptimeMs: 65_000,
+        codexAccountName: '工作订阅',
       }],
       sysinfo: {
         cpu: { cores: 8, load1: 0.42, load5: 0.37, load15: 0.29 },
@@ -203,6 +291,7 @@ describe('main conversation card rendering', () => {
     expect(elements[1].expanded).toBe(false)
     expect(elements[1].header.title.content).toBe('🗂 活跃项目 (1)')
     expect(elements[1].elements[0].content).toContain('`probe` · 工作中 · 1m · 当前')
+    expect(elements[1].elements[0].content).toContain(' · Codex：`工作订阅`')
     expect(elements[1].elements[0].content).not.toContain('gpt-5-codex')
 
     expect(elements[2].element_id).toBe('console_host')
@@ -242,7 +331,17 @@ describe('main conversation card rendering', () => {
     })).toContain('**🤖 当前模型 (Claude)**　`claude:default/high`')
   })
 
-  test('model command card keeps model and effort selection in one replaceable panel', () => {
+  test('model pagination carries the source and panel identity on navigation buttons', () => {
+    const card = modelSelectionCard({ sessionName: 'probe', panelId: 'page-panel', models: [],
+      pagination: { sourceId: 'openrouter', page: 1, totalPages: 3 } }) as any
+    const pager = card.body.elements[0].elements.find((element: any) => element.tag === 'column_set')
+    expect(pager.columns.map((column: any) => column.elements[0].behaviors[0].value)).toEqual([
+      { kind: 'model_page', source_id: 'openrouter', panel_id: 'page-panel', page: 0 },
+      { kind: 'model_page', source_id: 'openrouter', panel_id: 'page-panel', page: 2 },
+    ])
+  })
+
+  test('model command uses separate model and effort levels in one replaceable panel', () => {
     const currentModel = {
       model: 'gpt-5-codex',
       displayName: 'GPT-5 Codex',
@@ -295,6 +394,17 @@ describe('main conversation card rendering', () => {
     }) as any
     expect(savedCard.header.template).toBe('green')
     expect(savedCard.body.elements[0].header.title.content).toBe('选择已保存')
+  })
+
+  test('pending and incomplete model changes cannot look like saved selections', () => {
+    const pending = modelChangeStatusCard('probe', true, '正在等待确认') as any
+    expect(pending.header.template).toBe('orange')
+    expect(pending.body.elements[0].header.title.content).toBe('模型设置确认中')
+    expect(JSON.stringify(pending)).not.toContain('已保存')
+    const failed = modelChangeStatusCard('probe', false, '模型已切换，档位未确认：HTTP 503') as any
+    expect(failed.header.template).toBe('red')
+    expect(failed.body.elements[0].header.title.content).toBe('模型设置未完成')
+    expect(JSON.stringify(failed)).toContain('HTTP 503')
   })
 
   test('model command card carries provider only for Claude backend actions', () => {
@@ -356,13 +466,23 @@ describe('main conversation card rendering', () => {
     })
   })
 
-  test('chat-list summary uses a symbol for turn output', () => {
+  test.each([
+    [0, '0s'],
+    [12.34, '12.3s'],
+    [45, '45s'],
+    [60, '1m'],
+    [90, '1.5m'],
+    [3600, '1h'],
+    [10800, '3h'],
+    [11520, '3.2h'],
+    [90000, '25h'],
+  ])('chat-list summary formats %s seconds as %s with turn output', (durationSec, label) => {
     const settings = streamingOffSettings({
-      durationSec: '12.4',
+      durationSec,
       outputTokens: 420,
     }) as any
 
-    expect(settings.config.summary.content).toBe('✅ · ⏱ 12.4s · 📶 420')
+    expect(settings.config.summary.content).toBe(`✅ · ⏱ ${label} · 📶 420`)
   })
 
   test('usage panel shows MISS for missing percentages and no stale badge', () => {
@@ -554,7 +674,7 @@ describe('plan and goal rendering', () => {
       completedAtMs: 1780541433236,
     }, 'context_compact_0') as any
 
-    expect(el.header.title.content).toContain('✅ 🚨 上下文压缩 #1 · 耗时 1m 48s')
+    expect(el.header.title.content).toContain('✅ 🚨 上下文压缩 #1 · 耗时 1.8m')
     expect(el.header.title.content).not.toContain('结束压缩')
     expect(el.elements[0].content).toBe('**来源**: contextCompaction')
   })
@@ -662,7 +782,7 @@ describe('plan and goal rendering', () => {
     expect(body).toContain('**🎯 当前目标** · 进行中')
     expect(body).toContain('完成 Lodestar plan 展示迁移')
     expect(body).toContain('- 用量: 3456 / 12000 tokens')
-    expect(body).toContain('- 用时: 2m 5s')
+    expect(body).toContain('- 用时: 2.1m')
 
     const timelineEl = goalElement({
       objective: '目标更新位置可见',
@@ -1082,12 +1202,22 @@ describe('other tool card rendering', () => {
     const el = toolCallElement(7, 'ImageGeneration', input, '/tmp/dashboard.png', '✅') as any
     const body = el.elements[0].content
 
-    expect(el.header.title.content).toBe('✅ 🔧 图片生成: A clean product photo of a status dashboard on a laptop.')
+    expect(el.header.title.content).toBe('✅ 🔧 图片生成: completed')
     expect(body).toContain('**状态**: `completed`')
     expect(body).toContain('**提示词**')
     expect(body).toContain('A clean product photo of a status dashboard on a laptop.')
     expect(body).toContain('**输出**')
     expect(body).not.toContain('"revisedPrompt"')
+  })
+
+  test('generated image fold contains the complete prompt and a previewable image', () => {
+    const prompt = 'Full image prompt '.repeat(220)
+    const element = toolCallElement(7, 'ImageGeneration', { revisedPrompt: prompt }, '/tmp/image.png', '✅', undefined, 'img_test') as any
+    expect(element.expanded).toBe(false)
+    expect(element.header.title.content).not.toContain(prompt.slice(0, 20))
+    expect(element.elements[0].content).toContain(prompt)
+    expect(element.elements[0].content).not.toContain('/tmp/image.png')
+    expect(element.elements[1]).toMatchObject({ tag: 'img', img_key: 'img_test', scale_type: 'fit_horizontal', preview: true })
   })
 
   test('renders agent calls with prompt and model labels', () => {

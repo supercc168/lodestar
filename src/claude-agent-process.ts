@@ -1,10 +1,12 @@
 import { existsSync, mkdtempSync, readFileSync, rmSync, symlinkSync } from 'node:fs'
 import { homedir, tmpdir } from 'node:os'
 import { spawn } from 'node:child_process'
+import { spawn as crossSpawn } from 'cross-spawn'
 import { delimiter, join, posix, win32 } from 'node:path'
 import { EventEmitter } from 'node:events'
+import { randomUUID } from 'node:crypto'
 import {
-  query,
+  type AccountInfo,
   type EffortLevel,
   type HookCallbackMatcher,
   type HookEvent,
@@ -13,18 +15,23 @@ import {
   type McpServerConfig,
   type ModelInfo,
   type Query,
+  type SDKControlGetUsageResponse,
   type SDKMessage,
   type SDKUserMessage,
+  type SettingSource,
+  type Settings,
   type SpawnOptions as ClaudeSdkSpawnOptions,
   type SpawnedProcess,
   type PermissionResult,
 } from '@anthropic-ai/claude-agent-sdk'
+import { agentPackagePath, loadClaudeSdk } from './agent-updates'
 import { config, type ProjectProfile } from './config'
 import { log } from './log'
 import {
   CLAUDE_EFFORT,
   isClaudeReasoningEffort,
   NothingToCompactError,
+  ModelSettingsUpdateError,
   type AgentReasoningEffort,
   type ClaudeReasoningEffort,
   type UserTextDispatch,
@@ -34,10 +41,10 @@ import {
   claudeModelEffort,
   claudeModelKey,
   claudeModelIsGrok,
+  claudeModelIsApiRoute,
   GROK_OFFICIAL_MAX_EFFORT,
   resolveClaudeSdkModel,
 } from './claude-models'
-import { resolveTokenSource } from './token-source'
 import type {
   CanUseToolRequest,
   CodexModel,
@@ -47,6 +54,7 @@ import type {
 } from './codex-process'
 import { usageFromTokenUsagePayload } from './codex-usage'
 import { ToolFailureLoopGuard } from './tool-failure-loop'
+import { observeContextWindow } from './context-window-observe'
 
 type QueueWaiter<T> = (value: IteratorResult<T>) => void
 
@@ -71,9 +79,11 @@ class AsyncQueue<T> implements AsyncIterableIterator<T> {
   /** 硬停:丢弃已排队项后关闭。被丢弃代的排队 turn 不得在 SDK abort 窗口内
    * 被 drain 执行(上游 ec149d7 硬停语义)。 */
   abort(): void {
-    this.items = []
+    this.clear()
     this.close()
   }
+
+  clear(): void { this.items = [] }
 
   [Symbol.asyncIterator](): AsyncIterableIterator<T> {
     return this
@@ -117,7 +127,7 @@ const TOOL_FAILURE_CORRECTION_CONTEXT = [
   'If no change is needed, stop calling the tool and explain that result to the user.',
 ].join(' ')
 
-export interface ClaudeSpawnOpts extends SpawnOpts {
+export interface ClaudeSpawnOpts extends Omit<SpawnOpts, 'effort'> {
   model?: string
   effort: ClaudeReasoningEffort
   /** SDK resume:源 session id。基类 SpawnOpts 已换 launch 形态(ff44afb),
@@ -125,7 +135,8 @@ export interface ClaudeSpawnOpts extends SpawnOpts {
    *  SDK —— 字段随上游同款从基类移入 Claude 层。 */
   resumeSessionId?: string
   /** SDK resumeSessionAt:只 resume 到该 assistant 消息 uuid 为止(回到历史某点)。
-   *  用于 fk/bk —— 不传则 resume 完整历史。 */
+   *  用于 fk/bk —— 不传则 resume 完整历史。
+   *  这是 Claude 的 checkpoint 形态；Codex 对应使用 canonical turn id。 */
   resumeSessionAt?: string
   /** SDK forkSession:true = resume 时派生新 session id,原 transcript 不动。
    *  fk/bk 都用它(避免破坏/污染原会话)。 */
@@ -135,8 +146,32 @@ export interface ClaudeSpawnOpts extends SpawnOpts {
    * strict-mcp / project-mcp loading for an isolated session. Absent ⇒
    * Lodestar defaults (user sources, claude_code preset, no project MCP). */
   profile?: ProjectProfile
+  /** 覆盖 settingSources(优先于 profile / DEFAULT_SETTING_SOURCES)。
+   *  launch 层按 token source 显式传入:注入 env 的来源(glm/deepseek)得到
+   *  ['project','local'](不读 user settings env,spawnEnv 权威);
+   *  透传型 source(native)传 ['user','project','local'] → 读本机 Claude Code 配置
+   *  (settings.json env / .credentials)。 */
+  settingSources?: readonly string[]
+  settings?: Settings
+  validateAccount?: (account: AccountInfo) => void
+  /** 该进程 spawn 时绑定的 token source id;stopIdleMismatchedProcess 据此判跨 source 重启。 */
+  tokenSourceId?: string | null
+  /** Daemon-owned local plugin containing shared Skills. Loaded only when the
+   * effective settingSources omit `user`. */
+  managedSkillPluginPath?: string
   /** Host-owned env (capability / agent URL) merged last so scrub cannot drop it. */
   hostEnv?: Record<string, string | undefined>
+}
+
+export function claudeManagedSkillOptions(
+  settingSources: readonly string[],
+  pluginPath: string | undefined,
+): Record<string, unknown> {
+  if (!pluginPath || settingSources.includes('user')) return {}
+  return {
+    plugins: [{ type: 'local', path: pluginPath, skipMcpDiscovery: true }],
+    skills: 'all',
+  }
 }
 
 type ClaudePathLookup = {
@@ -160,24 +195,16 @@ type ClaudeExecutableConfig = {
   description: string
 }
 
-function pathDelimiterForPlatform(platform: NodeJS.Platform): string {
-  return platform === 'win32' ? ';' : ':'
-}
-
-function joinForPlatform(platform: NodeJS.Platform, ...parts: string[]): string {
-  return platform === 'win32' ? win32.join(...parts) : posix.join(...parts)
-}
-
 function windowsShellShim(path: string): boolean {
   const lower = path.toLowerCase()
   return lower.endsWith('.cmd') || lower.endsWith('.bat')
 }
 
 function spawnWindowsShellShim(options: ClaudeSdkSpawnOptions): SpawnedProcess {
-  const child = spawn(options.command, options.args, {
+  const child = crossSpawn(options.command, options.args, {
     cwd: options.cwd,
     env: options.env as NodeJS.ProcessEnv,
-    shell: true,
+    shell: false,
     signal: options.signal,
     stdio: ['pipe', 'pipe', 'ignore'],
     windowsHide: true,
@@ -187,6 +214,14 @@ function spawnWindowsShellShim(options: ClaudeSdkSpawnOptions): SpawnedProcess {
     throw new Error('failed to open stdio for Claude Code Windows shell shim')
   }
   return child as unknown as SpawnedProcess
+}
+
+function pathDelimiterForPlatform(platform: NodeJS.Platform): string {
+  return platform === 'win32' ? ';' : ':'
+}
+
+function joinForPlatform(platform: NodeJS.Platform, ...parts: string[]): string {
+  return platform === 'win32' ? win32.join(...parts) : posix.join(...parts)
 }
 
 function configuredBinIsReclaude(path: string, platform: NodeJS.Platform): boolean {
@@ -261,73 +296,6 @@ function findClaudeBin(lookup: ClaudePathLookup = {}): string | null {
   return null
 }
 
-function mergeHostEnv(
-  env: Record<string, string>,
-  hostEnv?: Record<string, string | undefined>,
-): Record<string, string> {
-  if (!hostEnv) return env
-  const merged = { ...env }
-  for (const [key, value] of Object.entries(hostEnv)) {
-    if (value !== undefined) merged[key] = value
-  }
-  return merged
-}
-
-export function assertClaudeCodeAvailable(): void {
-  // The Agent SDK ships platform-specific native Claude Code binaries as
-  // optional dependencies. Do not reject startup just because no global
-  // `claude` command is on PATH; if the SDK binary is missing, query() will
-  // surface that concrete failure.
-  findClaudeBin()
-}
-
-export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): ClaudeExecutableConfig {
-  const platform = lookup.platform ?? process.platform
-  // 第三方 API 路由(GLM 一类)强制绕开包装器 bin(见 ClaudePathLookup.apiRoute):
-  // reclaude 的 gateway 会劫持 ANTHROPIC_BASE_URL 打回官方 Anthropic,glm-5.3
-  // 这类第三方 id 会被判为"模型不存在"。其它档位读 config.claude.bin
-  // (显式 configuredBin 覆盖,供测试隔离 config)。
-  const configured = lookup.apiRoute
-    ? null
-    : lookup.configuredBin === undefined
-      ? config.claude.bin
-      : lookup.configuredBin
-  if (configured) {
-    const exists = lookup.exists ?? existsSync
-    // [claude].bin 配错时必须 fail fast:静默回退会让用户以为在烧包装器
-    // (如 reclaude)的额度,实际走了别的 key。
-    if (!exists(configured)) {
-      throw new Error(`lodestar: [claude].bin not found: ${configured} (config.toml)`)
-    }
-    if (platform !== 'win32' && configuredBinIsReclaude(configured, platform)) {
-      return {
-        spawnClaudeCodeProcess: spawnReclaudeWithSdkNative(configured),
-        description: `config-reclaude-sdk-native:${configured}`,
-      }
-    }
-    if (platform === 'win32' && windowsShellShim(configured)) {
-      return {
-        pathToClaudeCodeExecutable: configured,
-        spawnClaudeCodeProcess: spawnWindowsShellShim,
-        description: `windows-shell-shim:${configured}`,
-      }
-    }
-    return { pathToClaudeCodeExecutable: configured, description: `config:${configured}` }
-  }
-  const bin = findClaudeBin(lookup)
-  if (!bin) return { description: 'sdk-default' }
-  if (platform === 'win32' && windowsShellShim(bin)) {
-    return {
-      pathToClaudeCodeExecutable: bin,
-      spawnClaudeCodeProcess: spawnWindowsShellShim,
-      description: `windows-shell-shim:${bin}`,
-    }
-  }
-  // 非 windows 且未配 [claude].bin:不设 pathToClaudeCodeExecutable,让 SDK 选择
-  // bundled native binary。reclaude 配置也走 SDK native,但通过 custom spawn 包一层。
-  return { description: 'sdk-default' }
-}
-
 function whichClaude(lookup: ClaudePathLookup = {}): string | null {
   const platform = lookup.platform ?? process.platform
   const PATH = lookup.pathEnv ?? process.env.PATH ?? ''
@@ -346,6 +314,49 @@ function whichClaude(lookup: ClaudePathLookup = {}): string | null {
   return null
 }
 
+export function assertClaudeCodeAvailable(): void {
+  resolveClaudeExecutableConfig()
+  agentPackagePath('claude', '@anthropic-ai/claude-agent-sdk')
+}
+
+export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): ClaudeExecutableConfig {
+  const platform = lookup.platform ?? process.platform
+  // 第三方 API 路由(GLM 一类)强制绕开包装器 bin(见 ClaudePathLookup.apiRoute):
+  // reclaude 的 gateway 会劫持 ANTHROPIC_BASE_URL 打回官方 Anthropic,glm-5.3
+  // 这类第三方 id 会被判为"模型不存在"。其它档位读 config.claude.bin
+  // (显式 configuredBin 覆盖,供测试隔离 config)。
+  const configured = lookup.apiRoute
+    ? null
+    : lookup.configuredBin === undefined
+      ? config.claude.bin
+      : lookup.configuredBin
+  if (configured) {
+    const exists = lookup.exists ?? existsSync
+    // [claude].bin 配错时必须明确报错，避免改用其他入口或凭据。
+    if (!exists(configured)) {
+      throw new Error(`lodestar: [claude].bin not found: ${configured} (config.toml)`)
+    }
+    if (platform !== 'win32' && configuredBinIsReclaude(configured, platform)) {
+      return {
+        spawnClaudeCodeProcess: spawnReclaudeWithSdkNative(configured),
+        description: `config-reclaude-sdk-native:${configured}`,
+      }
+    }
+    if (platform === 'win32' && windowsShellShim(configured)) {
+      return {
+        pathToClaudeCodeExecutable: configured,
+        spawnClaudeCodeProcess: spawnWindowsShellShim,
+        description: `windows-shell-shim:${configured}`,
+      }
+    }
+    return { pathToClaudeCodeExecutable: configured, description: `config:${configured}` }
+  }
+  // 未配 [claude].bin:使用自动更新的 SDK 自带程序。显式指定会让
+  // claude 走 CLI 二进制的 stream-json 模式,该模式不下发 AskUserQuestion 等 dialog
+  // 工具;SDK 默认入口才会下发。需要显式指定时用 [claude].bin(走 configured 分支)。
+  return { description: 'sdk-default' }
+}
+
 export function buildClaudeSpawnPath(): string {
   if (process.platform === 'win32') return process.env.PATH ?? ''
   const entries = [
@@ -357,6 +368,7 @@ export function buildClaudeSpawnPath(): string {
   ]
   return [...new Set(entries.filter(Boolean))].join(delimiter)
 }
+
 
 function usageFromSdk(raw: any): CodexUsage | null {
   const out = usageFromTokenUsagePayload(raw)
@@ -429,11 +441,9 @@ export function readLastCallUsageFromTranscript(path: string): CodexUsage | null
   return null
 }
 
-/** SDK contextWindow 历史 max,按 claude 路由 key 在 daemon 进程内全局共享。
- * context window 是模型路由属性(与 session 无关):任一 session 探测到的真实
- * 窗口(GLM-5.3[1m] → 1M,模型名 [1m] 钉法记账)锁定后,同路由所有 session 立即用作分母,不再各自
- * 首轮回落默认 200K。daemon 重启后重新探测(不持久化,重启不常发生)。 */
-const contextWindowMaxByRoute = new Map<string, number>()
+/** Latest SDK contextWindow per source/model route. A fresh smaller value is
+ * authoritative too; smoothing the denominator must not hide a limit change. */
+const contextWindowByRoute = new Map<string, number>()
 
 /** 1214/爆窗降级路由集。result 错误文本命中 CONTEXT_WINDOW_DEGRADE_RE 后置位:
  * 该路由分母强制 200K 且观测不再上调(防「下轮又见 1M 记账→升回→再爆」振荡),
@@ -457,20 +467,27 @@ function stripOneMSuffix(value: string): string {
 function degradeContextWindowForRoute(routeKey: string, reason: string): boolean {
   if (degradedContextRoutes.has(routeKey)) return false
   degradedContextRoutes.add(routeKey)
-  contextWindowMaxByRoute.set(routeKey, DEGRADED_CONTEXT_WINDOW)
+  contextWindowByRoute.set(routeKey, DEGRADED_CONTEXT_WINDOW)
   log(`claude-agent-process: context window degraded to ${DEGRADED_CONTEXT_WINDOW} for ${routeKey}, future spawns strip [1m] (${reason.slice(0, 160)})`)
   return true
 }
 
-function claudeRouteKey(model: string | null | undefined): string {
+function claudeRouteKey(model: string | null | undefined, tokenSourceId?: string | null): string {
   // opts.model 形如 'claude:glm' / 'claude:default';null 归一到 default。
-  return model && model.trim() ? model : 'claude:default'
+  const source = tokenSourceId?.trim() || 'no-source'
+  const route = model && model.trim() ? model : 'claude:default'
+  return `${source}:${route}`
 }
 
 /** 仅供测试重置全局缓存,保证用例隔离。 */
-export function resetClaudeContextWindowMaxCache(): void {
-  contextWindowMaxByRoute.clear()
+export function resetClaudeContextWindowCache(): void {
+  contextWindowByRoute.clear()
   degradedContextRoutes.clear()
+}
+
+/** 兼容保留的旧名(早期 fork 测试使用)。 */
+export function resetClaudeContextWindowMaxCache(): void {
+  resetClaudeContextWindowCache()
 }
 
 function totalUsageFromModelUsage(modelUsage: any): { usage: CodexUsage | null; contextWindow: number | null } {
@@ -606,10 +623,7 @@ function mapModelInfo(info: ModelInfo): CodexModel {
   }
 }
 
-// default(非 bypassPermissions):AskUserQuestion 经 canUseTool 下发,host 才能
-// 拦下渲染卡片。bypassPermissions 会 shadow 掉 canUseTool(SDK 警告
-// CLAUDE_SDK_CAN_USE_TOOL_SHADOWED),AskUserQuestion 被秒批空答案、模型不等用户。
-// 普通工具的"不弹审批"语义改由 canUseTool 内部秒放复刻。
+// default 模式保留 canUseTool 回调，使 AskUserQuestion 能等待用户回答。
 export const CLAUDE_PERMISSION_MODE = 'default' as const
 
 /** Default setting sources when no project profile overrides them.
@@ -746,35 +760,30 @@ export function toolsFromProfile(
   return list.length ? list : { type: 'preset', preset: 'claude_code' }
 }
 
-/** Read `<workDir>/.mcp.json` and return its `mcpServers` map, or undefined
- * when missing / unreadable / malformed. Missing (ENOENT) is silent — it's
- * the common case (most projects ship no .mcp.json, and loadProjectMcp
- * defaults to true so every spawn probes once); other failures are logged
- * so the project knows its MCP didn't load. */
+/** Read `<workDir>/.mcp.json`, allowing an absent optional file. An existing
+ * configuration that cannot be loaded must fail startup instead of silently
+ * launching the Agent without the project's MCP tools. */
 export function readProjectMcpServers(workDir: string): Record<string, McpServerConfig> | undefined {
   const mcpPath = join(workDir, '.mcp.json')
   let raw: string
   try {
     raw = readFileSync(mcpPath, 'utf8')
   } catch (e) {
-    // 无 .mcp.json (ENOENT) 是常态 —— 多数项目没有,而 loadProjectMcp 默认 true
-    // 时每次 spawn 都会探一次,静默跳过避免日志噪音;只在文件存在却读不了时才报警。
-    if ((e as NodeJS.ErrnoException).code !== 'ENOENT') {
-      log(`claude-agent-process: project .mcp.json not readable at ${mcpPath}: ${e}`)
-    }
-    return undefined
+    if ((e as NodeJS.ErrnoException).code === 'ENOENT') return undefined
+    throw new Error(`project .mcp.json not readable at ${mcpPath}: ${e}`, { cause: e })
   }
+  let parsed: unknown
   try {
-    const parsed = JSON.parse(raw)
-    if (parsed && typeof parsed === 'object' && parsed.mcpServers && typeof parsed.mcpServers === 'object') {
-      return parsed.mcpServers as Record<string, McpServerConfig>
-    }
-    log(`claude-agent-process: project .mcp.json has no mcpServers object at ${mcpPath}`)
-    return undefined
+    parsed = JSON.parse(raw)
   } catch (e) {
-    log(`claude-agent-process: project .mcp.json parse failed at ${mcpPath}: ${e}`)
-    return undefined
+    throw new Error(`project .mcp.json parse failed at ${mcpPath}: ${e}`, { cause: e })
   }
+  const servers = parsed && typeof parsed === 'object' && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>).mcpServers : undefined
+  if (!servers || typeof servers !== 'object' || Array.isArray(servers)) {
+    throw new Error(`project .mcp.json has no valid mcpServers object at ${mcpPath}`)
+  }
+  return servers as Record<string, McpServerConfig>
 }
 
 function normalizeDialogQuestions(payload: Record<string, unknown>): Array<Record<string, unknown>> {
@@ -806,17 +815,20 @@ function normalizeDialogQuestion(raw: unknown): Record<string, unknown> | null {
 
 function normalizeDialogOptions(raw: unknown): Array<Record<string, string>> {
   if (!Array.isArray(raw)) return []
-  return raw
-    .map(item => {
-      if (typeof item === 'string') return { label: item }
-      if (!item || typeof item !== 'object') return null
-      const obj = item as Record<string, unknown>
-      const label = firstString(obj.label, obj.value, obj.text, obj.title)
-      if (!label?.trim()) return null
-      const description = firstString(obj.description, obj.detail, obj.preview)
-      return description ? { label, description } : { label }
-    })
-    .filter((item): item is Record<string, string> => item !== null)
+  const options: Array<Record<string, string>> = []
+  for (const item of raw) {
+    if (typeof item === 'string') {
+      options.push({ label: item })
+      continue
+    }
+    if (!item || typeof item !== 'object') continue
+    const obj = item as Record<string, unknown>
+    const label = firstString(obj.label, obj.value, obj.text, obj.title)
+    if (!label?.trim()) continue
+    const description = firstString(obj.description, obj.detail, obj.preview)
+    options.push(description ? { label, description } : { label })
+  }
+  return options
 }
 
 function firstString(...values: unknown[]): string | undefined {
@@ -922,11 +934,24 @@ export class ClaudeAgentProcess extends EventEmitter {
   private readonly exitPromise: Promise<void>
   private resolveExit!: () => void
   private started = false
+  private queryStart?: Promise<void>
+  private initializationError: Error | null = null
+  /** 该进程 spawn 时绑定的 token source id(launch 层解析,可为 null)。 */
+  readonly tokenSourceId: string | null
   private pendingPermissions = new Map<string, PendingControl>()
   private pendingInjectedContext: string[] = []
   private requestCounter = 0
   private cumulativeUsageFromResults: CodexUsage | null = null
   private turnActive = false
+  /** Headless SDK streams do not always emit session_state_changed. A
+   * submitted prompt also owns the task until its authoritative result. */
+  private inputTurnPending = false
+  private steeringInputs = new Set<string>()
+  /** A native result can beat a streaming-input write. Keep that native
+   * continuation in the same visible task, and retain all result metadata. */
+  private steeringResults: Array<{ usage: CodexUsage | null; duration: number | null; turns: number; error: string | null }> = []
+  private steeringFailures: string[] = []
+  private deferredSteeringResult: { raw: any; subtype: string; error: string | null } | null = null
   private emittedToolUseIds = new Set<string>()
   private emittedToolResultIds = new Set<string>()
   private pendingServerToolInputs: PendingServerToolInput[] = []
@@ -947,6 +972,7 @@ export class ClaudeAgentProcess extends EventEmitter {
   lastAssistantUuid: string | null = null
   lastModel: string | null = null
   lastEffort: ClaudeReasoningEffort | null = null
+  lastThinkingTokens: number | null = null
   lastUsage: CodexUsage | null = null
   lastTotalUsage: CodexUsage | null = null
   lastResult: CodexResultMeta = {
@@ -963,46 +989,71 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.opts = opts
     this.lastEffort = opts.effort
     this.lastModel = opts.model ? claudeModelKey(opts.model) : null
-  }
-
-  /** spawn 用的 env。基线 = process.env + PATH + [claude.env],再经 TokenSource
-   * 适配层(token-source.ts)做 scrub →(api 才)注入 → tier alias + GSD_RUNTIME。
-   * 行为与历史手写 scrub/inject 一致,入口统一便于后续挂更多自定义路由。
-   * 注意:此 scrub 只作用于 spawn 进程的 env;若 ~/.claude/settings.json 的
-   * env 块里配了 ANTHROPIC_BASE_URL/AUTH_TOKEN,Claude Code 仍会加载它 ——
-   * 故第三方路由请一律走 [claude.models.*],不要写进 settings.json。 */
-  private buildSpawnBaseEnv(): Record<string, string> {
-    return {
-      ...(process.env as Record<string, string>),
-      PATH: buildClaudeSpawnPath(),
-      ...config.claude.env,
-    }
-  }
-
-  private buildSpawnEnv(): Record<string, string> {
-    return mergeHostEnv(
-      resolveTokenSource('claude', this.opts.model).spawnEnv(this.buildSpawnBaseEnv()),
-      this.opts.hostEnv,
-    )
+    this.tokenSourceId = opts.tokenSourceId ?? null
   }
 
   sendInitialize(): void {
     if (this.started) return
     this.started = true
-    // Resolve model, route, credentials, and aliases from the same Feishu
-    // selection. This prevents a future profile change from sending one model
-    // id while injecting another profile's route or tier aliases.
-    const tokenSource = resolveTokenSource('claude', this.opts.model)
-    // 降级路由剥 [1m] 回退裸名(1214/爆窗自愈的 spawn 半边;正常路由零变化)。
-    const routeDegraded = degradedContextRoutes.has(claudeRouteKey(this.opts.model))
-    const resolvedModel = tokenSource.resolveSpawnModel()
+    this.queryStart = this.initializeQuery().catch(error => {
+      this.initializationError = error instanceof Error ? error : new Error(String(error))
+      this.emit('error', this.initializationError)
+      // 已启动的 query 由 readLoop 确认退出；清理失败时不能伪造进程已退出。
+      if (!this.query) this.finishExit(1, null)
+    })
+  }
+
+  private async *validatedInput(): AsyncIterableIterator<SDKUserMessage> {
+    await this.queryStart
+    if (this.initializationError || !this.alive) return
+    yield* this.input
+  }
+
+  /** spawn 环境的唯一组装点(合并后顺序:宿主 env → transformEnv(Token Source
+   * 键位/别名注入与 ANTHROPIC_* 清洗都在这一层) → 降级路由剥 [1m] → hostEnv
+   * 最后合并,仅覆盖出现键)。routeDegraded 由 initializeQuery 显式传入,保证与
+   * 模型剥 [1m] 同一次判定;测试接缝无参调用时自算当前路由降级态。 */
+  private buildSpawnEnv(routeDegraded = degradedContextRoutes.has(claudeRouteKey(this.opts.model, this.tokenSourceId))): Record<string, string | undefined> {
+    const baseEnv: Record<string, string | undefined> = { ...(process.env as Record<string, string>), PATH: buildClaudeSpawnPath(),
+      ...config.claude.env }
+    let env = this.opts.transformEnv ? this.opts.transformEnv(baseEnv) : baseEnv
+    // 1214/爆窗自愈的 spawn 半边:降级路由 env 值剥 [1m] 回退裸名(正常路由零变化)。
+    if (routeDegraded) {
+      env = Object.fromEntries(
+        Object.entries(env).map(([k, v]) => [k, typeof v === 'string' && ONE_M_SUFFIX_RE.test(v) ? stripOneMSuffix(v) : v]),
+      )
+    }
+    if (this.opts.hostEnv) {
+      env = { ...env }
+      for (const [key, value] of Object.entries(this.opts.hostEnv)) {
+        if (value !== undefined) env[key] = value
+      }
+    }
+    // Claude Code 2.1.268+ hides task tracking on newer/unknown models unless
+    // the host opts in. The session card consumes these Task tool events.
+    env.CLAUDE_CODE_ENABLE_TODO_TOOLS = '1'
+    if (this.opts.effort === 'default') env.CLAUDE_CODE_EFFORT_LEVEL = 'unset'
+    return env
+  }
+
+  private async initializeQuery(): Promise<void> {
+    const resolvedModel = resolveClaudeSdkModel(this.opts.model)
+    // 1214/爆窗自愈的 spawn 半边:降级路由剥 [1m] 回退裸名(正常路由零变化)。
+    const routeDegraded = degradedContextRoutes.has(claudeRouteKey(this.opts.model, this.tokenSourceId))
     const model = routeDegraded && resolvedModel ? stripOneMSuffix(resolvedModel) : resolvedModel
     const profile = this.opts.profile
     if (profile) {
       log(`claude-agent-process: project profile active — settingSources=${profile.settingSources ?? '-'} strictMcp=${profile.strictMcp ?? false} tools=${profile.tools ?? '-'} loadProjectMcp=${profile.loadProjectMcp ?? true}`)
     }
-    const settingSources = settingSourcesFromProfile(profile, this.opts.workDir)
+    const settingSources = this.opts.settingSources ?? settingSourcesFromProfile(profile, this.opts.workDir)
+    const managedSkillOptions = claudeManagedSkillOptions(
+      settingSources,
+      this.opts.managedSkillPluginPath,
+    )
     const toolsOption = toolsFromProfile(profile)
+    const disallowedTools = [
+      ...(this.opts.allowUserInput === false ? ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'] : []),
+    ]
     const strictMcpConfig = profile?.strictMcp === true
     // Default true (CLI parity): discover <cwd>/.mcp.json like bare `claude`.
     // readProjectMcpServers returns undefined when no .mcp.json is present, so
@@ -1011,32 +1062,34 @@ export class ClaudeAgentProcess extends EventEmitter {
     try {
       // resolveClaudeExecutableConfig 在 [claude].bin 配错路径时同步抛出;
       // 必须在 try 内调用,确保错误走 error/exit 事件而非穿透到调用方。
-      // api 判定走 TokenSource(与 claudeModelIsApiRoute 同源 profile)。
-      const isApiRoute = tokenSource.isApiRoute()
+      // api 路由判定走 claude-models profile(与 token-source 的 api 档同源)。
+      const isApiRoute = claudeModelIsApiRoute(this.opts.model)
       // 第三方 API 路由(GLM)绕开 reclaude 包装器,直连第三方端点;官方登录
       // 档位由 reclaude custom spawn 包住 SDK native binary,兼顾代理与 dialog。
       const executable = resolveClaudeExecutableConfig({ apiRoute: isApiRoute })
-      let spawnEnv = tokenSource.spawnEnv(this.buildSpawnBaseEnv())
-      if (routeDegraded) {
-        spawnEnv = Object.fromEntries(
-          Object.entries(spawnEnv).map(([k, v]) => [k, ONE_M_SUFFIX_RE.test(v) ? stripOneMSuffix(v) : v]),
-        )
-      }
-      spawnEnv = mergeHostEnv(spawnEnv, this.opts.hostEnv)
+      const { query } = await loadClaudeSdk()
+      if (!this.alive || this.abortController.signal.aborted) return
+      const env = this.buildSpawnEnv(routeDegraded)
       const routeLabel = isApiRoute ? 'api' : 'login'
       const reasoningOptions = claudeSdkReasoningOptions(this.opts.model, this.opts.effort)
       const reasoningLabel = reasoningOptions.thinking
         ? `grok-compat:${reasoningOptions.effort ?? '-'}`
         : this.opts.effort
-      log(`claude-agent-process: spawn SDK query selection=${tokenSource.selectionModel} model=${model ?? 'default'} effort=${reasoningLabel} route=${routeLabel} cwd=${this.opts.workDir} settingSources=${settingSources.join('+')} executable=${executable.description}`)
+      const selectionLabel = this.opts.model ? claudeModelKey(this.opts.model) : 'claude:default'
+      log(`claude-agent-process: spawn SDK query selection=${selectionLabel} model=${model ?? 'default'} effort=${reasoningLabel} route=${routeLabel} cwd=${this.opts.workDir} settingSources=${settingSources.join('+')} executable=${executable.description}`)
       if (isApiRoute) warnClaudeSettingsAliasConflict(settingSources, this.opts.workDir)
       this.query = query({
-        prompt: this.input,
+        prompt: this.opts.validateAccount ? this.validatedInput() : this.input,
         options: {
           cwd: this.opts.workDir,
           abortController: this.abortController,
           ...(model ? { model } : {}),
-          ...reasoningOptions,
+          // 显式启动档位解除 CLI 的 Fable alias 启动固定档位；default 模式由真实
+          // 子进程环境中的 unset 阻止发送 effort，不能只省略选项（CLI 会补 high）。
+          effort: reasoningOptions.thinking
+            ? reasoningOptions.effort as EffortLevel
+            : ((this.opts.effort === 'default' ? 'high' : this.opts.effort) as EffortLevel),
+          ...(reasoningOptions.thinking ? { thinking: reasoningOptions.thinking } : {}),
           resume: this.opts.resumeSessionId,
           ...(this.opts.resumeSessionAt ? { resumeSessionAt: this.opts.resumeSessionAt } : {}),
           ...(this.opts.forkSession ? { forkSession: true } : {}),
@@ -1047,10 +1100,14 @@ export class ClaudeAgentProcess extends EventEmitter {
             ? { spawnClaudeCodeProcess: executable.spawnClaudeCodeProcess }
             : {}),
           permissionMode: CLAUDE_PERMISSION_MODE,
-          env: spawnEnv,
-          settingSources,
+          env,
+          settingSources: [...settingSources] as SettingSource[],
+          ...(this.opts.settings ? { settings: this.opts.settings } : {}),
+          ...managedSkillOptions,
           tools: toolsOption,
-          ...(this.opts.allowDelegation === false ? { disallowedTools: ['Agent', 'Task'] } : {}),
+          ...(disallowedTools.length || this.opts.allowDelegation === false
+            ? { disallowedTools: [...disallowedTools, ...(this.opts.allowDelegation === false ? ['Agent', 'Task'] : [])] }
+            : {}),
           ...(strictMcpConfig ? { strictMcpConfig: true } : {}),
           ...(mcpServers ? { mcpServers } : {}),
           toolConfig: {
@@ -1062,7 +1119,9 @@ export class ClaudeAgentProcess extends EventEmitter {
           systemPrompt: {
             type: 'preset',
             preset: 'claude_code',
-            ...(this.opts.appendSystemPrompt ? { append: this.opts.appendSystemPrompt } : {}),
+            // Native prompt snapshots otherwise keep an earlier host's append
+            // verbatim on resume, including a different invocation's input policy.
+            ...(this.opts.appendSystemPrompt ? { append: this.opts.appendSystemPrompt, snapshot: false } : {}),
           },
           stderr: data => {
             const text = data.trim()
@@ -1072,11 +1131,21 @@ export class ClaudeAgentProcess extends EventEmitter {
       })
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e))
+      this.initializationError = err
       this.emit('error', err)
       this.finishExit(1, null)
       return
     }
     void this.readLoop(this.query)
+    if (this.opts.validateAccount) {
+      try {
+        this.opts.validateAccount(await this.query.accountInfo())
+      } catch (error) {
+        this.initializationError = error instanceof Error ? error : new Error(String(error))
+        this.emit('error', this.initializationError)
+        await this.kill()
+      }
+    }
   }
 
   sendUserText(text: string, files: string[] = []): UserTextDispatch {
@@ -1101,6 +1170,7 @@ export class ClaudeAgentProcess extends EventEmitter {
       // A newly queued user frame is a new turn even if an abnormal prior
       // interrupt never delivered its terminal result message.
       this.sdkToolFailureLoop.reset()
+      this.inputTurnPending = true
       this.input.push({
         type: 'user',
         session_id: this.sessionId ?? '',
@@ -1115,12 +1185,57 @@ export class ClaudeAgentProcess extends EventEmitter {
     } catch (e) {
       const err = e instanceof Error ? e : new Error(String(e))
       log(`claude-agent-process: sendUserText failed: ${err.message}`)
+      this.failTurnStart(err)
       return { kind: 'rejected', provider: 'claude', error: err }
     }
   }
 
+  async injectThreadItems(items: any[]): Promise<void> {
+    if (!Array.isArray(items) || items.length === 0) return
+    this.pendingInjectedContext.push([
+      'Host-injected prior tool context for this continuation:',
+      JSON.stringify(items, null, 2),
+    ].join('\n'))
+  }
+
+  async steerUserText(text: string, files: string[] = [], inputId = randomUUID()): Promise<boolean> {
+    if (!this.alive || this.expectedExit) throw new Error('Claude 进程已关闭')
+    if (!this.turnActive && !this.inputTurnPending && this.steeringResults.length === 0) return false
+    const uuid = inputId
+    const fileHints = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n\n' : ''
+    this.steeringInputs.add(uuid)
+    try {
+      this.input.push({ type: 'user', uuid, session_id: this.sessionId ?? '',
+        message: { role: 'user', content: [{ type: 'text', text: fileHints + text }] },
+        // `now` aborts the current native request. `next` is folded in at
+        // a tool boundary, or starts the next native turn if this one ended.
+        parent_tool_use_id: null, priority: 'next' })
+    } catch (error) {
+      this.steeringInputs.delete(uuid)
+      throw error
+    }
+    return true
+  }
+
   sendInterrupt(): void {
-    void this.query?.interrupt().catch(e => log(`claude-agent-process: interrupt failed: ${e}`))
+    this.input.clear()
+    this.inputTurnPending = false
+    this.steeringInputs.clear()
+    this.steeringResults = []
+    this.steeringFailures = []
+    this.deferredSteeringResult = null
+    // The runtime supports cancel_queued, while the SDK public declaration
+    // still omits the options argument. Cancel both already-written messages
+    // and the local stream backlog so stop cannot wake another user turn.
+    const query = this.query as (Query & { interrupt(options: { cancelQueued: true }): ReturnType<Query['interrupt']> }) | null
+    void query?.interrupt({ cancelQueued: true }).then(receipt => {
+      if (!receipt || !Array.isArray(receipt.still_queued) || receipt.still_queued.length > 0) {
+        throw new Error('停止请求未确认全部追加消息已取消')
+      }
+    }).catch(e => {
+      log(`claude-agent-process: interrupt failed: ${e}`)
+      this.emit('turn_input_error', { error: `停止请求失败：${e instanceof Error ? e.message : String(e)}` })
+    })
   }
 
   sendPermissionResponse(
@@ -1147,10 +1262,6 @@ export class ClaudeAgentProcess extends EventEmitter {
       // deny 的 message 同样必填;空字符串=无附加说明。
       pending.resolve({ behavior: 'deny', message: payload?.denyMessage ?? '' })
     }
-  }
-
-  sendToolResult(_toolUseId: string, _content: string, _isError = false): void {
-    log('claude-agent-process: sendToolResult ignored; Claude Agent SDK executes built-in tools internally')
   }
 
   sendHookResponse(_requestId: string, _output: object = {}): void {
@@ -1202,30 +1313,58 @@ export class ClaudeAgentProcess extends EventEmitter {
 
   async listModels(): Promise<CodexModel[]> {
     if (!this.started) this.sendInitialize()
+    await this.queryStart
+    if (this.initializationError) throw this.initializationError
     if (!this.query) throw new Error('claude-agent-process: SDK query not initialized (sendInitialize failed or not called)')
     const models = await this.query.supportedModels()
     return models.map(mapModelInfo)
   }
 
+  /** 原生 /usage 控制查询；不发送对话，也不扫描本机历史用量。 */
+  async readSubscriptionUsage(): Promise<SDKControlGetUsageResponse> {
+    if (!this.started) this.sendInitialize()
+    await this.queryStart
+    if (this.initializationError) throw this.initializationError
+    if (!this.query || !this.alive) throw new Error('Claude 订阅额度查询连接未就绪或已退出')
+    const readUsage = this.query.usage_EXPERIMENTAL_MAY_CHANGE_DO_NOT_RELY_ON_THIS_API_YET
+    if (typeof readUsage !== 'function') {
+      throw new Error('当前 Claude SDK 不支持原生订阅额度查询，需更新 Agent 或适配其接口')
+    }
+    // 上游增量(合并恢复):控制查询必须跳过 SDK 行为层(登录/引导流程),
+    // 否则额度读数会挂在交互行为上(acceptance:token-source-claude 记录 opts)。
+    // 本仓 anchor 的 SDK(0.3.222)d.ts 仍标注 0 参数,运行时按 options 读取
+    // (上游 latest 同形调用);窄化 cast 只是让类型面与运行时调用对齐。
+    const readUsageWithOptions = readUsage as (options?: { skipBehaviors?: boolean }) => Promise<SDKControlGetUsageResponse>
+    return readUsageWithOptions.call(this.query, { skipBehaviors: true })
+  }
+
   async setModelSettings(model: string, effort: AgentReasoningEffort): Promise<void> {
     const claudeModel = resolveClaudeSdkModel(model)
     if (!isClaudeReasoningEffort(effort)) throw new Error(`invalid Claude effort: ${String(effort)}`)
+    if ((this.opts.effort === 'default') !== (effort === 'default')) {
+      throw new Error('effort 参数模式改变，需要使用新的启动环境恢复会话')
+    }
     if (!this.started) this.sendInitialize()
+    await this.queryStart
+    if (this.initializationError) throw this.initializationError
     if (!this.query) throw new Error('claude-agent-process: SDK query not initialized (sendInitialize failed or not called)')
-    if (claudeModel) await this.query.setModel(claudeModel)
-    if (effort === 'max') {
-      await this.query.applyFlagSettings({ ultracode: true, effortLevel: null })
-    } else {
-      await this.query.applyFlagSettings({ effortLevel: effort, ultracode: null })
+    try {
+      await this.query.setModel(claudeModel)
+    } catch (cause) {
+      this.lastModel = null
+      this.lastEffort = null
+      throw new ModelSettingsUpdateError(`模型设置未确认：${cause instanceof Error ? cause.message : String(cause)}`, null, { cause })
     }
     this.opts.model = model
-    this.opts.effort = effort
     this.lastModel = claudeModel ? claudeModelKey(model) : 'claude:default'
+    this.lastEffort = null
+    try {
+      await this.query.applyFlagSettings({ effortLevel: effort === 'default' ? null : effort, ultracode: null })
+    } catch (cause) {
+      throw new ModelSettingsUpdateError(`模型已切换为 ${model}，但思考档位未确认：${cause instanceof Error ? cause.message : String(cause)}`, model, { cause })
+    }
+    this.opts.effort = effort
     this.lastEffort = effort
-  }
-
-  async setModel(model: string): Promise<void> {
-    await this.setModelSettings(model, this.opts.effort)
   }
 
   async compactThread(): Promise<void> {
@@ -1236,6 +1375,10 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (!this.alive) {
       throw new Error('claude agent process failed to initialize')
     }
+    // /compact 通过 streaming input 执行，以 compact_boundary 为完成信号。
+    // 不设固定时限；仅明确的 "Not enough messages to compact" 表示无需压缩。
+    // result 可能先于 boundary 到达，不能据此提前结束等待。
+    if (!this.input) throw new Error('claude thread not initialized')
     // Claude SDK 无 compact 触发接口(0.3.222 仍未暴露);借 CLI 内建 /compact slash
     // command —— 其 supportsNonInteractive=true,streamInput 下作为 local command 执行。
     // push 一条内容为 /compact 的 user 消息,CLI 本地压缩,完成后 emit system/
@@ -1303,14 +1446,6 @@ export class ClaudeAgentProcess extends EventEmitter {
       this.once('exit', onExit)
       this.once('error', onError)
     })
-  }
-
-  async injectThreadItems(items: any[]): Promise<void> {
-    if (!Array.isArray(items) || items.length === 0) return
-    this.pendingInjectedContext.push([
-      'Host-injected prior tool context for this continuation:',
-      JSON.stringify(items, null, 2),
-    ].join('\n'))
   }
 
   private canUseTool(
@@ -1397,6 +1532,11 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (!this.alive) return
     this.alive = false
     this.turnActive = false
+    this.inputTurnPending = false
+    this.steeringInputs.clear()
+    this.steeringResults = []
+    this.steeringFailures = []
+    this.deferredSteeringResult = null
     this.denyPendingPermissions('claude process exited')
     this.resolveExit()
     log(`claude-agent-process: exited code=${code} signal=${signal} expected=${this.expectedExit}`)
@@ -1447,6 +1587,29 @@ export class ClaudeAgentProcess extends EventEmitter {
       case 'result':
         this.handleResultMessage(raw)
         return
+      case 'command_lifecycle':
+        if (typeof raw.command_uuid !== 'string' || !['queued', 'started', 'completed', 'cancelled'].includes(raw.state)) {
+          log(`claude-agent-process: malformed command lifecycle ${JSON.stringify(raw)}`)
+          return
+        }
+        if (raw.state === 'started' || raw.state === 'completed') {
+          if (this.steeringInputs.delete(raw.command_uuid)) {
+            this.inputTurnPending = true
+            if (raw.state === 'started') this.emit('user_input_consumed', { inputId: raw.command_uuid })
+          }
+        }
+        if (raw.state === 'cancelled' && this.steeringInputs.delete(raw.command_uuid)) {
+          const error = '原生 Claude 取消了一条尚未处理的追加消息，请重新发送。'
+          this.steeringFailures.push(error)
+          this.emit('turn_input_error', { error })
+          // Cancellation outside our own stop path must not leave an already
+          // completed native turn waiting forever for the discarded input.
+          if (!this.steeringInputs.size && !this.inputTurnPending && !this.turnActive && this.deferredSteeringResult) {
+            const deferred = this.deferredSteeringResult
+            this.finishInputResult(deferred.raw, deferred.subtype, deferred.error)
+          }
+        }
+        return
       case 'rate_limit_event':
         this.emit('rate_limits_updated', raw.rate_limit_info)
         return
@@ -1467,10 +1630,12 @@ export class ClaudeAgentProcess extends EventEmitter {
       case 'session_state_changed':
         if (raw.state === 'running' && !this.turnActive) {
           this.turnActive = true
+          this.lastThinkingTokens = null
           // A checkpoint belongs to exactly one clean turn. Clear the prior
           // assistant UUID at the authoritative SDK turn boundary.
           this.lastAssistantUuid = null
-          this.emit('turn_started', { turn_id: raw.uuid, thread_id: this.sessionId })
+          this.emit('turn_started', { turn_id: raw.uuid, thread_id: this.sessionId,
+            ...(this.steeringResults.length ? { retry: true } : {}) })
         } else if (raw.state === 'idle') {
           this.turnActive = false
         }
@@ -1489,6 +1654,14 @@ export class ClaudeAgentProcess extends EventEmitter {
         return
       case 'api_retry':
         log(`claude-agent-process: api retry attempt=${raw.attempt}/${raw.max_retries} status=${raw.error_status} error=${raw.error}`)
+        return
+      case 'thinking_tokens':
+        if (typeof raw.estimated_tokens !== 'number' || !Number.isFinite(raw.estimated_tokens) || raw.estimated_tokens < 0) {
+          log('claude-agent-process: invalid thinking_tokens estimate')
+          return
+        }
+        this.lastThinkingTokens = raw.estimated_tokens
+        this.emit('thinking_progress', { estimatedTokens: raw.estimated_tokens })
         return
       case 'permission_denied':
         log(`claude-agent-process: permission denied ${raw.tool_name} ${raw.tool_use_id}: ${raw.message}`)
@@ -1581,6 +1754,8 @@ export class ClaudeAgentProcess extends EventEmitter {
   }
 
   private handleAssistantMessage(raw: any): void {
+    this.confirmSteeringInputs(raw)
+    if (!raw.parent_tool_use_id) this.lastThinkingTokens = null
     const message = raw.message
     const parentToolUseId = typeof raw.parent_tool_use_id === 'string' && raw.parent_tool_use_id
       ? raw.parent_tool_use_id
@@ -1624,6 +1799,10 @@ export class ClaudeAgentProcess extends EventEmitter {
   private emitToolUseOnce(id: string, name: string, input: any, parentToolUseId: string | null): void {
     if (this.emittedToolUseIds.has(id)) return
     this.emittedToolUseIds.add(id)
+    if (!name.trim()) {
+      log(`claude-agent-process: tool_use ${id} has an empty name`)
+      name = 'MISS'
+    }
     // parentToolUseId:子 agent 内的工具调用 = 触发它的 Task tool_use id;主线程为 null。
     // session 据此把子 agent 的逐步过程累积进对应后台 task 的 steps[]。
     this.emit('tool_use', { id, name, input, parentToolUseId })
@@ -1700,6 +1879,7 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.sdkToolFailureLoop.reset()
     if (typeof raw.session_id === 'string' && raw.session_id) this.sessionId = raw.session_id
     this.turnActive = false
+    this.inputTurnPending = false
     const usage = usageFromSdk(raw.usage)
     const modelUsageRaw = raw.modelUsage ?? raw.model_usage
     const total = totalUsageFromModelUsage(modelUsageRaw)
@@ -1724,9 +1904,9 @@ export class ClaudeAgentProcess extends EventEmitter {
     if (raw.is_error === true) {
       const resultText = typeof raw.result === 'string' ? raw.result : ''
       if (resultText && CONTEXT_WINDOW_DEGRADE_RE.test(resultText)) {
-        const resolved = resolveTokenSource('claude', this.opts.model).resolveSpawnModel()
+        const resolved = resolveClaudeSdkModel(this.opts.model)
         if (resolved && ONE_M_SUFFIX_RE.test(resolved)) {
-          const routeKey = claudeRouteKey(this.opts.model)
+          const routeKey = claudeRouteKey(this.opts.model, this.tokenSourceId)
           if (degradeContextWindowForRoute(routeKey, resultText)) {
             this.emit('context_window_degraded', {
               routeKey,
@@ -1737,25 +1917,28 @@ export class ClaudeAgentProcess extends EventEmitter {
         }
       }
     }
-    // 分母 = 该路由的 SDK contextWindow 历史 max(daemon 全局,按路由 key 共享)。
-    // context window 是模型路由属性,与 session 无关:任一 session 探测到的真实
-    // 窗口(GLM-5.3[1m] → 1M,模型名 [1m] 钉法记账)全局锁定,所有 session 立即用作分母,不再各自首轮
-    // 回落默认 200K。取 max 且单调不降,避免忽高忽低。SDK 从未上报 → null(--)。
+    // Use the current report, including decreases; a prior larger context
+    // window is not evidence that this turn has the same capacity.
     if (total.contextWindow != null) {
-      const routeKey = claudeRouteKey(this.opts.model)
+      const routeKey = claudeRouteKey(this.opts.model, this.tokenSourceId)
       // 已降级路由锁死 200K,不再随观测上调 —— CLI 对 [1m] 名仍会按 1M 记账,
       // 若这里放行会「升回 1M → 下轮再爆 → 再降」振荡;重启后重探。
       if (!degradedContextRoutes.has(routeKey)) {
-        const prev = contextWindowMaxByRoute.get(routeKey) ?? 0
-        if (total.contextWindow > prev) {
-          contextWindowMaxByRoute.set(routeKey, total.contextWindow)
-          log(`claude-agent-process: SDK contextWindow ${total.contextWindow} (global max for ${routeKey}, prev ${prev || '-'})`)
-        } else if (total.contextWindow < (contextWindowMaxByRoute.get(routeKey) ?? 0)) {
-          log(`claude-agent-process: SDK contextWindow ${total.contextWindow} ignored (global max ${contextWindowMaxByRoute.get(routeKey)} locked for ${routeKey})`)
+        contextWindowByRoute.set(routeKey, total.contextWindow)
+      }
+      // 真实窗口观测落盘(纯被动):token source 模型名 → contextWindow,spawn 侧
+      // resolveSpawnModel 据此决定 [1m] 后缀(观测 1M 加 / 200K 裸名)。per-model
+      // 粒度(modelUsage 的 key 即模型名),比 routeKey 聚合更准。
+      if (this.tokenSourceId) {
+        for (const [model, entry] of Object.entries(modelUsageRaw ?? {})) {
+          const ctx = (entry as any)?.contextWindow
+          if (typeof ctx === 'number' && ctx > 0) {
+            observeContextWindow(this.tokenSourceId, model, ctx)
+          }
         }
       }
     }
-    this.lastContextWindow = contextWindowMaxByRoute.get(claudeRouteKey(this.opts.model)) ?? total.contextWindow ?? null
+    this.lastContextWindow = contextWindowByRoute.get(claudeRouteKey(this.opts.model, this.tokenSourceId)) ?? total.contextWindow ?? null
     // 上下文占用 = session 当前上下文 = 最后一次 API call 的输入侧 token。从 claude
     // session transcript 读最后一条 assistant 的 per-call usage(transcript 带 finalize
     // 后的真实值;stream-json 的 assistant event 恒 0/0、result.usage 是 turn 聚合、
@@ -1777,18 +1960,54 @@ export class ClaudeAgentProcess extends EventEmitter {
       })
     }
     const subtype = typeof raw.subtype === 'string' ? raw.subtype : raw.is_error ? 'error' : 'success'
+    this.confirmSteeringInputs(raw)
+    const resultError = raw.is_error === true || subtype !== 'success'
+      ? Array.isArray(raw.errors) && raw.errors.length
+        ? raw.errors.map(String).join('\n')
+        : String(raw.result ?? raw.error ?? raw.api_error_message ?? subtype)
+      : null
+    if (this.steeringInputs.size || this.steeringResults.length) {
+      this.steeringResults.push({ usage, duration: typeof raw.duration_ms === 'number' ? raw.duration_ms : null,
+        turns: typeof raw.num_turns === 'number' ? raw.num_turns : 1, error: resultError })
+      if (this.steeringInputs.size) {
+        this.deferredSteeringResult = { raw, subtype, error: resultError }
+        if (resultError) this.emit('turn_input_error', { error: resultError })
+        log(`claude-agent-process: native result has ${this.steeringInputs.size} unconsumed steering inputs`)
+        return
+      }
+    }
+    this.finishInputResult(raw, subtype, resultError)
+  }
+
+  private finishInputResult(raw: any, subtype: string, resultError: string | null): void {
+    this.deferredSteeringResult = null
+    const continued = this.steeringResults.splice(0)
+    const errors = continued.length ? continued.flatMap(r => r.error ? [r.error] : []) : resultError ? [resultError] : []
+    errors.push(...this.steeringFailures.splice(0))
+    if (continued.length) {
+      this.lastUsage = continued.every(r => r.usage !== null)
+        ? continued.reduce<CodexUsage | null>((total, r) => addUsageTotals(total, r.usage!), null) : null
+    }
+    // A context-length error proves this request was too large, not that the
+    // endpoint has a 200K window. Keep the reported capacity and requested model.
     this.lastResult = {
       cost_usd: null,
       cost_delta_usd: null,
-      duration_ms: typeof raw.duration_ms === 'number' ? raw.duration_ms : null,
-      num_turns: typeof raw.num_turns === 'number' ? raw.num_turns : 1,
+      duration_ms: continued.length ? continued.every(r => r.duration !== null)
+        ? continued.reduce((total, r) => total + r.duration!, 0) : null
+        : typeof raw.duration_ms === 'number' ? raw.duration_ms : null,
+      num_turns: continued.length ? continued.reduce((total, r) => total + r.turns, 0)
+        : typeof raw.num_turns === 'number' ? raw.num_turns : 1,
       usage: this.lastUsage,
-      subtype,
-      is_error: raw.is_error === true || subtype !== 'success',
+      subtype: errors.length && subtype === 'success' ? 'claude_steering_failed' : subtype,
+      is_error: errors.length > 0,
     }
     this.emit('result', {
-      subtype,
+      subtype: this.lastResult.subtype,
       is_error: this.lastResult.is_error,
+      ...(this.lastResult.is_error ? {
+        error: errors.join('\n'),
+      } : {}),
       duration_ms: this.lastResult.duration_ms,
       usage: this.lastUsage,
       // turn-local Claude checkpoint(ff44afb):仅干净完成轮携带分叉锚。
@@ -1803,4 +2022,33 @@ export class ClaudeAgentProcess extends EventEmitter {
     })
   }
 
+  private confirmSteeringInputs(raw: any): void {
+    if (raw.parent_tool_use_id) return
+    const ids = Array.isArray(raw.user_message_uuids) ? raw.user_message_uuids : []
+    for (const id of [...ids, raw.user_message_uuid]) {
+      if (typeof id === 'string' && this.steeringInputs.delete(id) && raw.type !== 'result') this.inputTurnPending = true
+    }
+  }
+
+  private failTurnStart(e: Error): void {
+    this.turnActive = false
+    this.inputTurnPending = false
+    this.lastAssistantUuid = null
+    this.lastResult = {
+      cost_usd: null,
+      cost_delta_usd: null,
+      duration_ms: null,
+      num_turns: null,
+      usage: this.lastUsage,
+      subtype: 'claude_turn_start_failed',
+      is_error: true,
+    }
+    this.emit('result', {
+      subtype: this.lastResult.subtype,
+      is_error: true,
+      duration_ms: null,
+      usage: this.lastUsage,
+      error: e.message,
+    })
+  }
 }

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, setSystemTime, test } from 'bun:test'
-import { mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -7,6 +7,7 @@ import {
   __setPendingReplyForTest,
   __setStoreFileForTest,
   buildNotifyResult,
+  beginCallbackDispatch,
   clearDispatching,
   dispatchCallback,
   findPendingReply,
@@ -19,6 +20,7 @@ import {
   pendingRepliesForChat,
   prune,
   recordCallbackSuccess,
+  recordCallbackFailure,
   register,
   setDispatching,
   setReplyState,
@@ -86,6 +88,30 @@ describe('notify-callbacks store', () => {
     expect(get('nf_test1')?.resolvedBy?.openId).toBe('ou_user1')
   })
 
+  test('markResolved exposes persistence failure and rolls back the resolved flag', () => {
+    register(sampleReg())
+    // A regular file cannot be used as a parent directory, forcing the atomic
+    // writer to fail without relying on platform-specific chmod semantics.
+    __setStoreFileForTest(join(tempFile, 'child.json'), false)
+
+    expect(() => markResolved('nf_test1', 'approve', 'ou_user1')).toThrow()
+    expect(get('nf_test1')?.resolvedAt).toBeUndefined()
+    expect(get('nf_test1')?.resolvedBy).toBeUndefined()
+  })
+
+  test('successful external callback becomes non-retryable unknown when tombstone persistence fails', () => {
+    register(sampleReg())
+    __setStoreFileForTest(join(tempFile, 'child.json'), false)
+
+    const outcome = recordCallbackSuccess('nf_test1', 'approve', 'ou_user1')
+
+    expect(outcome.state).toBe('unknown')
+    expect(get('nf_test1')?.resolvedAt).toBeUndefined()
+    expect(get('nf_test1')?.unknownAt).toBeGreaterThan(0)
+    expect(get('nf_test1')?.unknownBy).toEqual({ buttonId: 'approve', openId: 'ou_user1' })
+    expect(get('nf_test1')?.unknownReason).toContain('tombstone persistence')
+  })
+
   test('prune(now) drops entries older than 7 days, keeps fresh', () => {
     const now = 1_700_000_000_000
     register(sampleReg({ notifyId: 'nf_old', createdAt: now - 8 * 24 * 3600_000 }))
@@ -96,12 +122,69 @@ describe('notify-callbacks store', () => {
     expect(get('nf_new')).toBeDefined()
   })
 
-  test('loadCallbacks silently ignores a corrupted file (no throw, empty map)', () => {
-    const { writeFileSync } = require('node:fs')
-    writeFileSync(tempFile, '{ not valid json')
+  test('only a missing store is treated as first boot; unreadable and malformed stores fail visibly', () => {
+    expect(loadCallbacks()).toEqual([])
+    for (const contents of ['{ not valid json', 'null', '[]']) {
+      writeFileSync(tempFile, contents)
+      __setStoreFileForTest(tempFile)
+      expect(() => loadCallbacks()).toThrow()
+      expect(readFileSync(tempFile, 'utf8')).toBe(contents)
+    }
+    __setStoreFileForTest(tempDir)
+    expect(() => loadCallbacks()).toThrow()
+  })
+
+  test('a button callback interrupted after durable dispatch becomes UNKNOWN on restart', () => {
+    register(sampleReg())
+    beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')
+    expect(() => beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')).toThrow()
     __setStoreFileForTest(tempFile)
-    expect(() => loadCallbacks()).not.toThrow()
-    expect(get('nf_anything')).toBeUndefined()
+    const recovered = loadCallbacks()
+    expect(recovered.map(reg => reg.notifyId)).toEqual(['nf_test1'])
+    expect(buildNotifyResult(get('nf_test1')!)).toMatchObject({
+      resolved: false, unknown: true, button: { id: 'approve' }, unknown_by: 'ou_operator',
+    })
+    expect(() => beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')).toThrow()
+    __setStoreFileForTest(tempFile)
+    loadCallbacks()
+    expect(get('nf_test1')?.unknownAt).toBeDefined()
+  })
+
+  test('dispatch cannot begin when its pending marker cannot be saved', () => {
+    register(sampleReg())
+    __setStoreFileForTest(join(tempFile, 'child.json'), false)
+    expect(() => beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')).toThrow()
+    expect(get('nf_test1')?.dispatchState).toBeUndefined()
+  })
+
+  test('confirmed success and failed dispatch clear the pending marker durably', () => {
+    register(sampleReg())
+    beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')
+    expect(recordCallbackFailure('nf_test1')).toEqual({ state: 'retry' })
+    __setStoreFileForTest(tempFile)
+    loadCallbacks()
+    expect(get('nf_test1')?.dispatchState).toBeUndefined()
+    expect(get('nf_test1')?.unknownAt).toBeUndefined()
+    beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')
+    expect(recordCallbackSuccess('nf_test1', 'approve', 'ou_operator')).toEqual({ state: 'complete' })
+    __setStoreFileForTest(tempFile)
+    loadCallbacks()
+    expect(get('nf_test1')?.dispatchState).toBeUndefined()
+    expect(get('nf_test1')?.resolvedAt).toBeDefined()
+  })
+
+  test.each(['success', 'failure'])('failed %s persistence keeps the original dispatch nonretryable after restart', outcome => {
+    register(sampleReg())
+    beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')
+    __setStoreFileForTest(join(tempFile, 'child.json'), false)
+    const recorded = outcome === 'success'
+      ? recordCallbackSuccess('nf_test1', 'approve', 'ou_operator') : recordCallbackFailure('nf_test1')
+    expect(recorded.state).toBe('unknown')
+    expect(get('nf_test1')?.unknownAt).toBeDefined()
+    __setStoreFileForTest(tempFile)
+    loadCallbacks()
+    expect(get('nf_test1')?.unknownAt).toBeDefined()
+    expect(get('nf_test1')?.unknownBy?.buttonId).toBe('approve')
   })
 
   test('callbackUrl may be empty (pull / display-only mode still registers)', () => {
@@ -208,6 +291,7 @@ describe('buildNotifyResult (pull payload)', () => {
     register(sampleReg({ notifyId: 'nf_pending' }))
     const r = buildNotifyResult(get('nf_pending')!) as any
     expect(r.resolved).toBe(false)
+    expect(r.unknown).toBe(false)
     expect(r.notify_id).toBe('nf_pending')
     expect(r.project).toBe('feishu')
     expect(r.message_id).toBe('om_msg')
@@ -223,6 +307,19 @@ describe('buildNotifyResult (pull payload)', () => {
     expect(r.button).toEqual({ id: 'approve', text: '✅ 通过', type: 'primary' })
     expect(typeof r.resolved_at).toBe('number')
     expect(r.resolved_by).toBe('ou_op')
+  })
+
+  test('unknown ⇒ non-retryable ambiguous outcome with operator and reason', () => {
+    register(sampleReg({ notifyId: 'nf_unknown' }))
+    __setStoreFileForTest(join(tempFile, 'child.json'), false)
+    expect(recordCallbackSuccess('nf_unknown', 'approve', 'ou_op').state).toBe('unknown')
+
+    const r = buildNotifyResult(get('nf_unknown')!) as any
+    expect(r.resolved).toBe(false)
+    expect(r.unknown).toBe(true)
+    expect(r.button).toEqual({ id: 'approve', text: '✅ 通过', type: 'primary' })
+    expect(r.unknown_by).toBe('ou_op')
+    expect(r.unknown_reason).toContain('tombstone persistence')
   })
 })
 
@@ -282,6 +379,21 @@ describe('dispatchCallback', () => {
     expect(captured.button).toEqual({ id: 'reject', text: '❌', type: 'danger' })
     expect(captured.operator).toEqual({ open_id: 'ou_op' })
     expect(typeof captured.timestamp).toBe('number')
+  })
+
+  test('text reply payload preserves user text and both message references without inventing a button', async () => {
+    let captured: any
+    globalThis.fetch = (async (_input: any, init?: RequestInit) => {
+      captured = JSON.parse(String(init?.body))
+      return new Response('{"text":"收到回复"}', { status: 200 })
+    }) as unknown as typeof fetch
+    const response = { text: '明天十点\n**保留原文**', message_id: 'om_user', prompt_message_id: 'om_waiting' }
+    const result = await dispatchCallback(sampleReg(), response, 'ou_author')
+    expect(captured.response).toEqual({ type: 'text', ...response })
+    expect(captured.message_id).toBe('om_msg')
+    expect(captured.operator).toEqual({ open_id: 'ou_author' })
+    expect(captured.button).toBeUndefined()
+    expect(result.reply).toBe('收到回复')
   })
 
   test('reply capture: JSON {text} / {reply} / plain text / empty', async () => {

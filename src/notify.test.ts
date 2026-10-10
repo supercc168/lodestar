@@ -1,4 +1,7 @@
 import { describe, expect, test } from 'bun:test'
+import { request, type IncomingMessage, type ServerResponse } from 'node:http'
+import { once } from 'node:events'
+import { Readable } from 'node:stream'
 // Register the shared ./feishu mock so importing ./notify doesn't drag
 // in real config.toml / tenant-token code (keeps this test hermetic).
 import './feishu-test-mock'
@@ -10,8 +13,130 @@ import {
   handleNotifyRequest,
   parseButtons,
   parseCallbackUrl,
+  startNotifyServer,
 } from './notify'
 import { get as getNotifyCallback } from './notify-callbacks'
+import { FeishuRequestError } from './feishu-retry'
+
+describe('notification HTTP input', () => {
+  async function invoke(chunks: Buffer[], path = '/notify', transport: Partial<NonNullable<Parameters<typeof handleNotifyRequest>[2]>> = {}) {
+    const req = Readable.from(chunks) as IncomingMessage
+    req.method = path === '/notify' ? 'POST' : 'GET'
+    req.url = path
+    req.headers = { host: '[' }
+    let body = ''
+    const sent: any[] = []
+    const res = { statusCode: 200, setHeader() {}, end(value: string) { body = value } } as unknown as ServerResponse
+    await handleNotifyRequest(req, res, {
+      sanitizeSessionName: name => name,
+      chatIdForSession: () => 'oc_test',
+      uploadImageKey: async () => 'img_test',
+      sendCard: async (_chatId, card) => { sent.push(card); return 'om_test' },
+      ...transport,
+    })
+    return { status: res.statusCode, body, sent }
+  }
+
+  test('preserves Chinese and emoji split across arbitrary request chunks', async () => {
+    const bytes = Buffer.from(JSON.stringify({ project: '通知', text: '构建完成 🎉' }))
+    const result = await invoke([...bytes].map(byte => Buffer.from([byte])))
+    expect(result.status).toBe(200)
+    expect(JSON.stringify(result.sent)).toContain('构建完成 🎉')
+    expect(JSON.stringify(result.sent)).not.toContain('\uFFFD')
+  })
+
+  test('rejects oversized input and malformed result IDs before sending cards', async () => {
+    const oversized = await invoke([Buffer.from(JSON.stringify({ project: 'ops', text: 'x'.repeat(4 * 1024 * 1024) }))])
+    expect(oversized.status).toBe(413)
+    expect(oversized.sent).toEqual([])
+    expect((await invoke([], '/notify/result/%ZZ')).status).toBe(400)
+  })
+
+  test('send rejection exposes Feishu diagnostics without serializing SDK request credentials', async () => {
+    const result = await invoke([Buffer.from(JSON.stringify({ project: 'ops', text: 'done' }))], '/notify', {
+      sendCard: async (_chatId, _card, onFailure) => {
+        onFailure?.({
+          message: 'Request failed with status code 400',
+          response: { data: { code: 300121, msg: 'Failed to replace element', error: { log_id: 'notify-log-123' } } },
+          config: { headers: { Authorization: 'Bearer secret-not-for-response' } },
+        })
+        return null
+      },
+    })
+    expect(result.status).toBe(502)
+    expect(result.body).toContain('code=300121 message=Failed to replace element log_id=notify-log-123')
+    expect(result.body).not.toContain('secret-not-for-response')
+    expect(result.body).not.toContain('see daemon log')
+  })
+
+  test('unreported send diagnostics remain explicitly missing', async () => {
+    const result = await invoke([Buffer.from(JSON.stringify({ project: 'ops', text: 'done' }))], '/notify', {
+      sendCard: async () => null,
+    })
+    expect(result.status).toBe(502)
+    expect(result.body).toContain('code=MISS message=MISS log_id=MISS')
+  })
+
+  test('upload diagnostics remain visible in the notification after an image upload fails', async () => {
+    const result = await invoke([Buffer.from(JSON.stringify({ project: 'ops', text: 'done', images: ['/abs/report.png'] }))], '/notify', {
+      uploadImageKey: async (_path, onFailure) => {
+        onFailure?.({ code: 234001, msg: 'invalid image <at id=all>all</at>', log_id: 'upload-log-123' })
+        return null
+      },
+    })
+    expect(result.status).toBe(200)
+    const content = JSON.stringify(result.sent)
+    expect(content).toContain('图片上传失败: /abs/report.png')
+    expect(content).toContain('code=234001 message=invalid image')
+    expect(content).toContain('log_id=upload-log-123')
+    expect(content).not.toContain('<at id=all>')
+  })
+
+  test('HTTP error boundary exposes known Feishu failures and keeps other internal errors private', async () => {
+    for (const [error, expected] of [
+      [new FeishuRequestError('upload failed', 400, 234001, undefined, 'boundary-log', 'invalid image'), 'code=234001 message=invalid image log_id=boundary-log'],
+      [new Error('internal secret'), 'internal error'],
+    ] as const) {
+      const server = startNotifyServer({ bind: '127.0.0.1', port: 0, extraHandler: async () => { throw error } })!
+      await once(server, 'listening')
+      const address = server.address() as import('node:net').AddressInfo
+      try {
+        const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+          const req = request({ host: '127.0.0.1', port: address.port, path: '/notify' }, res => {
+            let body = ''
+            res.setEncoding('utf8')
+            res.on('data', chunk => { body += chunk })
+            res.on('end', () => resolve({ status: res.statusCode!, body }))
+          })
+          req.on('error', reject)
+          req.end()
+        })
+        expect(result).toEqual({ status: 500, body: expected })
+      } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
+    }
+  })
+
+  test('a malformed Host cannot escape the listener error boundary', async () => {
+    const server = startNotifyServer({ bind: '127.0.0.1', port: 0,
+      extraHandler: async (_req, res, url) => { res.end(url.pathname); return true },
+    })!
+    await once(server, 'listening')
+    const address = server.address() as import('node:net').AddressInfo
+    try {
+      const result = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+        const req = request({ host: '127.0.0.1', port: address.port, path: '/health', headers: { host: '[' } }, res => {
+          let body = ''
+          res.setEncoding('utf8')
+          res.on('data', chunk => { body += chunk })
+          res.on('end', () => resolve({ status: res.statusCode!, body }))
+        })
+        req.on('error', reject)
+        req.end()
+      })
+      expect(result).toEqual({ status: 200, body: '/health' })
+    } finally { await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve())) }
+  })
+})
 
 function cardBody(card: any): any[] {
   return (card as any).body.elements as any[]
@@ -86,6 +211,27 @@ describe('buildNotifyCard', () => {
     })
     const cs = cardBody(card).filter((e: any) => e.tag === 'column_set')[0]
     expect(cs.columns[0].elements).toHaveLength(8)
+  })
+
+  test('text-reply cards have only a fixed reply control below the footer, removed on completion', () => {
+    const opts = {
+      title: 'ops', text: 'type your reply', level: 'info' as const, notifyId: 'nf_reply', allowReply: true,
+    }
+    const card: any = buildNotifyCard(opts)
+    expect(findButtonValues(card).map(button => button.text.content)).toEqual(['回复'])
+    expect(cardBody(card).at(-1).columns[0].elements[0].behaviors[0].value.kind).toBe('notify_reply')
+    const done = buildNotifyCard({ ...opts, resolution: {
+      status: 'delivered', kind: 'text', text: '晚点', operatorOpenId: 'ou_owner',
+    } })
+    expect(findButtonValues(done)).toHaveLength(0)
+    expect(JSON.stringify(done)).toContain('已回复')
+  })
+
+  test('renderer rejects mixed selection and text-reply cards', () => {
+    expect(() => buildNotifyCard({
+      title: 'ops', text: 'invalid', level: 'info', notifyId: 'nf_mixed', allowReply: true,
+      buttons: [{ id: 'yes', text: '可以', type: 'default' }],
+    })).toThrow('mutually exclusive')
   })
 
   test('buttons without notifyId are silently dropped (no dead value)', () => {
@@ -336,6 +482,8 @@ describe('notify extraHandler', () => {
       method: 'POST',
       url: '/notify',
       headers: { host: '127.0.0.1' },
+      // 同 postReq:上游 handleNotifyRequest 会调 IncomingMessage 口径的 setEncoding。
+      setEncoding() { return this },
       [Symbol.asyncIterator]: () => jsonChunks('{}'),
     } as any
     await dispatchNotifyRequest({
@@ -380,6 +528,9 @@ describe('notify allow_reply 文本回复卡(上游 ae411a6)', () => {
       method: 'POST',
       url: '/notify',
       headers: { host: '127.0.0.1' },
+      // handleNotifyRequest 按 IncomingMessage 口径调 setEncoding(上游 notify.ts),
+      // 纯对象假体重放需补 no-op;真实 Readable 天然具备。
+      setEncoding() { return this },
       [Symbol.asyncIterator]: () => jsonChunks(json),
     }
   }
@@ -485,6 +636,8 @@ describe('notify allow_reply 文本回复卡(上游 ae411a6)', () => {
 
     const delivered: any = buildNotifyReplyCard({
       notifyId: 'nf_reply_card', title: '构建完成',
+      callbackUrl: 'http://127.0.0.1:0/notify/callback', chatId: 'oc_reply_card', messageId: 'om_reply_card',
+      project: 'ops', text: 'body', level: 'info', imageKeys: [], buttons: [], createdAt: 1_700_000_000_000,
     }, {
       id: 'reply_1', openId: 'ou_user', promptMessageId: 'om_prompt',
       openedAt: 1_700_000_000_000, status: 'sending',

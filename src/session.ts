@@ -7,26 +7,27 @@
  * Codex turns.
  *
  * Tool tracking, AskUserQuestion flow, permission rendering, command
- * routing, model/task/wt/compact panels, and agy tasks live in sibling
+ * routing and model/task/wt/compact panels live in sibling
  * session-*.ts modules. Fields touched by those helpers carry no
  * `private` modifier — convention is "no modifier = package-internal,
  * only the session-*.ts helpers should touch it."
  */
 
-import { randomBytes, timingSafeEqual } from 'node:crypto'
+import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { existsSync } from 'node:fs'
-import { isAbsolute, join } from 'node:path'
+import { isAbsolute } from 'node:path'
 import { agentApiUrl } from './agent-runtime'
 import {
   CODEX_EFFORT,
-  CodexProcess,
   CodexRpcResponseError,
+  CodexProcess,
   diffUsageTotals,
   effectiveTurnTokens,
   isCodexReasoningEffort,
   type CanUseToolRequest,
   type CodexReasoningEffort,
   type CodexUsage,
+  type CodexResultMeta,
   type ContextCompactedNotification,
   type HookCallbackRequest,
   type PlanDelta,
@@ -35,10 +36,10 @@ import {
   type TurnPlanUpdated,
 } from './codex-process'
 import { codexModelIsApiRoute, codexModelRequiresOpenaiAuth } from './codex-models'
-import { resolveCodexSpawnOverrides, resolveTokenSource, resolveUsageSource } from './token-source'
-import { DSH_DEFAULT_BASE_URL, DSH_DISPLAY_NAME } from './token-source-dsh'
+import { DSH_DEFAULT_BASE_URL, DSH_DISPLAY_NAME, dshSourceFromConfig } from './token-source-dsh'
 import { queryDshRuntime } from './dsh-runtime'
 import { DshProcess } from './dsh-process'
+import { fetchDeepseekBalance } from './token-source-deepseek'
 import { isAgentSession } from './agent-session-registry'
 import {
   validateConversationLaunch,
@@ -56,6 +57,7 @@ import {
   isClaudeReasoningEffort,
   isDshReasoningEffort,
   type AgentProcess,
+  type AgentProcessEventMap,
   type AgentProvider,
   type AgentReasoningEffort,
   type AgentResultEvent,
@@ -65,10 +67,14 @@ import {
   type CollabAgentStates,
   type DshReasoningEffort,
   type UserTextDispatch,
+  usageSourceForAgent,
 } from './agent-process'
+import { liveElapsed, type LiveElapsedMode } from './cards/format'
+import { createAgentProcess } from './agent-launch'
+import { getTokenSource, getTokenSourceForAccount, listEnabledTokenSourcesByAgent, tokenSourceProcessRevision, tokenSourceRuntimeModel, type TokenSource } from './token-source'
+import { codexAccounts, DEFAULT_CODEX_ACCOUNT, processCodexAccount } from './codex-accounts'
+import { codexAccountCard } from './cards/codex-account'
 import {
-  ClaudeAgentProcess,
-  assertClaudeCodeAvailable,
   claudeTranscriptPath,
   type BgTaskStartedEvent,
   type BgTaskProgressEvent,
@@ -81,11 +87,16 @@ import * as cardkit from './cardkit'
 import * as cards from './cards'
 import { watchdogFooterContent } from './cards/turn'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
 import { log } from './log'
+import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { readSysInfo } from './sysinfo'
-import { readUsage, updateUsageFromRateLimits, peekUsage, type UsageSnapshot } from './usage'
+import { readUsage, observeRateLimitsNotification, captureCodexUsageCache, type UsageSnapshot } from './usage'
 import { readGlmUsage, type GlmUsageSnapshot } from './glm-usage'
 import { readClaudeProviderUsage, readDeepseekBalance, type ClaudeProviderUsageSnapshot } from './claude-provider-usage'
+import { codexCreditsSummary } from './cards/usage'
+import { readAllAccountUsage } from './account-usage'
+import { claudeWeeklyUsageWindow } from './claude-usage'
 import {
   contextLimitFromAppServer,
   contextTokensFromUsage,
@@ -95,12 +106,12 @@ import * as sessionMultimsg from './session-multimsg'
 import * as mathRender from './math-render'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
 import * as sessionAgy from './session-agy'
-import * as sessionAgentIdentities from './session-agent-identities'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
 import * as sessionHostAsk from './session-host-ask'
 import * as sessionPermission from './session-permission'
 import {
+  diagnosticIdLabel,
   messageOf,
   type FooterTimer,
   type LifecycleKind,
@@ -116,6 +127,7 @@ import type { GsdActionResult } from './session-gsd'
 import * as sessionCommands from './session-commands'
 import * as sessionCompact from './session-compact'
 import * as sessionModel from './session-model'
+import * as sessionAgentIdentities from './session-agent-identities'
 import * as sessionTasklist from './session-tasklist'
 import * as sessionGsd from './session-gsd'
 import * as sessionWorktree from './session-worktree'
@@ -134,6 +146,10 @@ import {
   ToolFailureLoopGuard,
   type ToolFailureLoopVerdict,
 } from './tool-failure-loop'
+import { createFileDelivery, groupFileDelivery } from './file-delivery-runtime'
+import type { FileDeliveryHandle, FileDeliveryMode } from './file-delivery-types'
+import { runFileDeliveryCommand } from './file-delivery-command'
+import { fileDeliveryAgentContext } from './instructions'
 
 export type { SessionOpts } from './session-types'
 
@@ -231,7 +247,11 @@ interface PendingWatchdogIdentity {
 
 type TurnCardOpenResult =
   | { kind: 'opened'; turn: TurnState }
-  | { kind: 'failed' }
+  /** stage 记录失败发生段(合并调和,取舍):'send'=卡片消息都没发出去
+   *  (sendCard null);'convert'=卡片消息已创建但 id_convert 失败。
+   *  drainMidTurnAndOpen 对两段取不同恢复策略 —— 'send' 沿本地 restore
+   *  (批次/回执保留待重试),'convert' 沿上游丢弃(提示重发)。 */
+  | { kind: 'failed'; stage?: 'send' | 'convert' }
   | { kind: 'stale' }
 
 /** 开卡窗口竞态的终态载荷(ff44afb TurnOpenOwner.terminalSuffix/terminalForcePush
@@ -241,6 +261,43 @@ type TurnCardOpenResult =
 interface TurnOpenTerminalStash {
   terminalSuffix?: string
   terminalForcePush?: boolean
+}
+
+/** 上游开卡窗口 owner(承载调度的 wakeup/init 抢占):同一进程内一次只允许
+ *  一个 open 事务,后续 open 等 done;进程换代(procEpoch 变化)即作废。
+ *  与 TurnOpenTerminalStash 并存:watchdog/终态路径用 stash,常规开卡用本 owner。 */
+interface TurnOpenOwner {
+  token: number
+  proc: AgentProcess | null
+  procEpoch: number
+  sawResult: boolean
+  terminalSuffix?: string
+  terminalForcePush: boolean
+  pendingCompactions: ContextCompactedNotification[]
+  /** True only when this card open was triggered by an SDK init for a turn
+   * that is already running. Eager user/drain opens happen before input is
+   * sent, so compaction events in that window belong to an older turn. */
+  backendTurnStarted: boolean
+  /** Resolves exactly once when this owner is released or invalidated. Same-
+   * process follow-up opens await it instead of replacing openingTurnOwner. */
+  done: Promise<void>
+  resolveDone: () => void
+}
+
+/** 关卡快照(重置/轮换期间跨 await 的 turn 冻结视图)。 */
+interface TurnCloseSnapshot {
+  turn: TurnState
+  proc: AgentProcess | null
+  procEpoch: number
+  contextTokens: number | null
+  contextLimit: number | null
+  lastTurnDelta: LastTurnDelta | null
+  lastTurnUsage: CodexUsage | null
+  tokenSourceId: string | null
+  tokenSource: TokenSource | undefined
+  codexUsage: ReturnType<typeof captureCodexUsageCache> | null
+  currentBatchReactionIds: Map<string, string>
+  pendingReactionIds: Map<string, string>
 }
 
 type MidTurnDrainOutcome = 'no_batch' | 'committed' | 'preserved'
@@ -260,15 +317,7 @@ type PendingHumanDelivery = {
   openingOwner: object | null
   turn: TurnState | null
   turnId: string | null
-  state: 'pending' | 'acked' | 'restored'
-}
-
-function formatProcessExitDetail(event: unknown): string {
-  const value = event && typeof event === 'object'
-    ? event as { code?: unknown; signal?: unknown; expected?: unknown }
-    : {}
-  const field = (input: unknown): string => input === undefined ? 'unknown' : String(input)
-  return `process exited (code=${field(value.code)}, signal=${field(value.signal)}, expected=${field(value.expected)})`
+  state: 'pending' | 'acked' | 'restored' | 'refused'
 }
 
 function compactionKey(notice: ContextCompactedNotification): string {
@@ -395,20 +444,17 @@ const TERMINAL_COLLAB_AGENT_STATES = new Set([
 const FOOTER_THINKING_PREFIX = 'Thinking...'
 const FOOTER_WRITING = 'Writing...'
 const FOOTER_WORKING = 'Working...'
-const RESUME_INIT_NOTICE_MS = 10_000
-const RESUME_INIT_TIMEOUT_MS = 120_000
-/** Soft cap on element count per Feishu card before we proactively
- * rotate to a fresh one. The hard ceiling is NOT ~100 as once assumed:
- * a 2026-05-23 dogfood turn hit `300305 [element exceeds the limit]` at
- * ~76 elements (tool_60 + assistant_13 + base). The old soft cap of 80
- * sat ABOVE the real ceiling, so `getElementCount() >= 80` never became
- * true before Feishu rejected the add — rotation never fired and the card
- * froze mid-turn. Keep this comfortably under the observed ~75; 50 leaves
- * headroom for in-flight stream handlers that already chose the old cardId
- * before this check fired, and for heavier element mixes that trip the
- * limit earlier. This number is no longer the only line of defense:
- * addElement's 300305/300315 now forces a rotate directly (see
- * Session.onCardWriteFailure), so a wrong guess here still self-heals. */
+/** Final transaction guard: two 30s control RPCs plus a materialization read
+ * of up to 10 minutes. Leave a minute for local lifecycle work so the exact
+ * method timeout can surface before this outer guard. */
+const CODEX_INIT_NOTICE_MS = 10_000
+const CODEX_INIT_TIMEOUT_MS = 12 * 60_000
+// 恢复路径 init 提示护栏原为独立常量 RESUME_INIT_NOTICE_MS(10s);上游会话
+// 恢复优化后恢复与 start 同走 waitForCodexInitialization(其 notice 计时用
+// CODEX_INIT_NOTICE_MS),常量已无引用,定点清理(TS6133)。语义不变:两侧
+// notice 仍为 10s,超时仍由 CODEX_INIT_TIMEOUT_MS 兜底。
+/** 提前换卡，为在途写入和复杂嵌套元素留出余量。
+ * Feishu 的容量按卡片结构计数；实际 300305 容量错误另触发换卡。 */
 const CARD_ELEMENT_SOFT_LIMIT = 50
 
 /** Max mid-turn card rotations per turn. Past this we stop opening fresh
@@ -438,6 +484,28 @@ function timedStatus(status: string, startedAt: number): string {
   return `${status} (${cards.liveElapsed(Date.now() - startedAt, config.runtime.live_elapsed).label})`
 }
 
+/** 本进程的后台/页脚耗时档位(bucket|second)。 */
+function liveElapsedMode(): LiveElapsedMode {
+  return config.runtime.live_elapsed
+}
+
+function cardFailureDetails(failures: cardkit.CardWriteFailure[]): string {
+  return failures.length
+    ? failures.map(failure => `${failure.operation}: ${formatFeishuError(failure)}`).join('\n')
+    : formatFeishuError(undefined)
+}
+
+/** 本地会话路由快照的运行时扩面:slim ConversationRouting(temp session 传输/
+ *  sameRouting 比对只用 provider/model/effort)+ 上游吸收的 token source /
+ *  codex 账号归属字段。session-codex-accounts 冻结测试对
+ *  conversationRouting()→applyConversationRouting 的运行时往返依赖这些字段
+ *  在位(账号继承/自动回落),故保留富行为、只收窄类型声明。 */
+type SessionConversationRouting = ConversationRouting & {
+  tokenSourceId?: string | null
+  codexAccountId?: string
+  codexAccountAutomatic?: boolean
+}
+
 export class Session {
   /** Process-wide registry of every Session ever constructed in this daemon.
    * Used by the `hi` console panel to enumerate sibling sessions across
@@ -449,6 +517,47 @@ export class Session {
 
   // ── package-internal state (touched by session-*.ts helpers) ──
   proc: AgentProcess | null = null
+  /** Lifecycle operations that can replace `proc` are serialized per Session.
+   * The daemon deliberately dispatches Feishu messages concurrently so two
+   * `restart` commands can overlap; without this gate both callers can observe
+   * `proc === null` while the first kill is pending and each spawn a process. */
+  private lifecycleTail: Promise<void> = Promise.resolve()
+  private lifecycleSequence = 0
+  /** Number of runLifecycle operations currently executing (queue depth
+   *  already drained by `await previous`). Used by onUserMessage's narrow
+   *  daemon-restore wait. */
+  private lifecycleActive = 0
+  /** user-message 操作当前是否在跑(含并发消息)。>0 时新的 onUserMessage 不经
+   *  runLifecycle 队列直接并发执行 —— 本地收据系统要求第二条消息立即进
+   *  pendingMidTurnMsgs,不能停在与第一条消息互等的队列尾巴上。 */
+  private userMessageActive = 0
+  /** 执行中的 stop()/stopUnlocked 事务计数。>0 时 onUserMessage 同样直进
+   *  (合并调和,取舍):本地 main 无 lifecycle 队列,stop 在途时到达的消息
+   *  在 stop 的 agy/kill 等待窗口内直接入队(随后被 stop 的 discard 清理
+   *  掉);上游队列语义会把消息停到队尾 —— 本地冻结用例 'full stop discards
+   *  human work that arrives while agy stop is awaiting completion' 的
+   *  agy 门(测试先等消息返回、再放行门)会因此死锁。restart/model-select
+   *  排队次序不变(上游 mutex 用例),仅 stop 窗口豁免。 */
+  private stopLifecycleActive = 0
+  /** Generation of the process currently owned by this Session. Event
+   * listeners capture it at wire time so a late event from a killed/replaced
+   * process cannot mutate the new process' turn, queue, usage, or cards. */
+  private procEpoch = 0
+  /** Process currently being stopped by a serialized lifecycle operation.
+   * While set, every event except `exit` is ignored. */
+  private stoppingProc: AgentProcess | null = null
+  /** A stop/kill timed out while this process still reports alive. Keep the
+   * handle attached and block all new input/spawns until a real exit arrives
+   * or a later explicit stop/restart successfully confirms termination. */
+  private blockedProc: AgentProcess | null = null
+  private blockedProcReason: string | null = null
+  agentCapability: string | null = null
+  /** Spawn-affecting token-source revision captured for each owned process.
+   * Same source id with rotated credentials/base URL must still replace the
+   * idle child after the registry is rebuilt. Weak keys avoid lifecycle leaks. */
+  private readonly procSourceRevisions = new WeakMap<AgentProcess, string | null>()
+  /** Delivery rules actually given to each process, including later group changes. */
+  private readonly procFileDeliveryModes = new WeakMap<AgentProcess, FileDeliveryMode>()
   currentTurn: TurnState | null = null
   /** Item-scoped compaction ownership survives a turn-card close so a late
    * completion cannot attach itself to the next turn. Completed receipts keep
@@ -469,9 +578,6 @@ export class Session {
    *  驱动后台游标卡渲染。以 task_id 为 key,跨 turn 累积 —— 后台任务生命周期
    *  不受 turn 边界约束。 */
   backgroundTasks: cards.BgTaskEntry[] = []
-  /** 观察池:task_started 进来但还没后台化的前台 task(Bash 命令/前台子 agent)。
-   *  不渲染;等 task_updated.is_backgrounded=true 提升到 backgroundTasks,或
-   *  task_settled 时丢弃。治「随便跑个命令就冒一项后台任务」的关键。 */
   pendingBgTasks: cards.BgTaskEntry[] = []
   /** 已结算 agent 任务档案:卡沉降/迁移清池时留下 subagent 的「名片」。SDK 热续跑
    *  (SendMessage 到刚完成的 agent)不重发 task_started,后续 unknown 事件命中
@@ -510,6 +616,7 @@ export class Session {
   private lastMainTaskToolUseId: string | null = null
   /** onUserMessage 沉降旧卡后置位;主卡落地后据此重建后台卡(游标重回末尾)。 */
   private pendingRebuildBackgroundCard = false
+  private nativeAgentTools = new Map<string, { confirmed: boolean; input: any }>()
   /** turn 收尾后有后台任务结算 → SDK 会自发开一轮恢复轮(task_notification
    *  合并结果),该轮 init 没有伴随用户消息。置位后,下一个无用户批次的 init
    *  据此开 bg_task_resume 卡承接输出;任何 turn 开卡即消费(结算通知会被
@@ -586,40 +693,38 @@ export class Session {
   status: Status = 'stopped'
 
   // ── strictly private state ──
-  /** Count of user messages we've sent to Codex since the last
-   * turn opened on our side. NOT a FIFO of individual messages — the SDK
-   * USUALLY batch-merges every mid-turn user message into a single
-   * combined turn once the in-flight turn finishes, so most of the time
-   * the daemon observes **one** init event per batch. Tracking a count +
-   * last-sender (rather than an Array<msg>) keeps the daemon's view
-   * loosely in sync with the SDK's dequeue semantics. Caveat verified
-   * 2026-05-17 (test1 accumulator, 8-message rapid-fire): when the first
-   * write lands in an idle SDK, that single msg gets its own turn and
-   * the rest merge into a second turn — i.e. 1+(N-1) split, not always
-   * one merge. To stay coherent with this, `drainMidTurnAndOpen` bumps
-   * the count by `batch.length` up front (covering both the first solo
-   * turn and the eventual merged tail), and the init handler resets to
-   * 0 on the first claim. If the SDK takes the merge path, the bail at
-   * `currentTurn=yes` in the init handler leaves pendingCount stale (>0)
-   * until the GC at the next `onUserMessage`; if it takes the split
-   * path, the second init sees pendingCount>0 and correctly classifies
-   * the trailing batch as user-batch. */
+  /** Number of daemon writes handed to the backend but not yet claimed by an
+   * authoritative backend turn boundary (`init`/`turn_started`). Next-turn
+   * batches use one `sendUserText`; native steering does not claim a new
+   * turn, so production keeps this at 0 or 1. A boundary belonging
+   * to an already eager-opened card must still consume the claim before the
+   * currentTurn/openingTurn guard returns; otherwise the next Claude
+   * task-notification init is misclassified as a user batch and opens an empty
+   * `trigger=user_message inputs=0` card. */
   pendingUserMessageCount = 0
-  /** Mid-turn user messages buffered DAEMON-SIDE (not yet sendUserText'd
-   * to the SDK). Drained in the `result` handler by writing each to SDK
-   * stdin, which doubles as the wake signal the Codex app-server needs
-   * to start the next batch turn (it won't auto-dequeue queued
-   * type-ahead msgs after `result` — confirmed in dogfood testing).
-   * Buffering also keeps mid-turn msgs out
-   * of any AskUserQuestion `QUEUE remove` storm, since they were never
-   * in the SDK queue to begin with. */
-  pendingMidTurnMsgs: HumanBatchMessage[] = []
+  /** Not yet submitted: drained into a native active turn when supported,
+   * otherwise submitted together at the next turn boundary. */
+  pendingMidTurnMsgs: Array<{ text: string; wireText: string; userOpenId: string; msgId: string }> = []
+  private steeringSend: Promise<void> | null = null
+  private steeringGeneration = 0
+  private submittedSteering = new Map<string, {
+    proc: AgentProcess; epoch: number; generation: number; turn: TurnState
+    consumed: boolean
+    batch: Array<{ text: string; wireText: string; userOpenId: string; msgId: string }>
+    reactions: Map<string, string>
+  }>()
+  private steeringBoundary: {
+    turn: TurnState; proc: AgentProcess; epoch: number; generation: number
+    inputs: string[]; inputIds: string[]; collecting: boolean; start: () => void
+    reactionOwners: Array<{ batch: Array<{ msgId: string }>; reactions: Map<string, string> }>
+    events: Array<() => void>
+  } | null = null
   /** 下一个 turn 的 user inputs 暂存区。所有 sendUserText 的 wireText 在
    * sendUserText 之前 push 这里;openTurnCard 创建 turn 时一次性取走 + clear。
    * mainConversationCard 把这些 wireText 渲染成顶部"📥 收到 (N)"折叠面板,
    * 让用户在卡片自己里就能看到这一轮触发了什么(不必滚群里找原消息)。
-   * mid-turn buffer 的消息不在这里 push —— 它们走 drainMidTurnAndOpen 那条
-   * 路径,drain 时统一 push。 */
+   * 已追加的消息触发续卡并显示在新卡顶部；仍待下一轮的消息由
+   * drainMidTurnAndOpen 在开卡前统一 push。 */
   pendingTurnInputs: string[] = []
   /** 用户用 `>>>`(≥3 个 >)主动开启的多条消息缓冲。null = 当前不在多条
    *  收集模式;非 null = 正在累积,直到 `<<<`(≥3 个 <)收尾合并成一条
@@ -645,9 +750,9 @@ export class Session {
   /** Feishu message_ids of user messages that arrived while the daemon
    * was busy (turn in flight or mid-open), mapped to the `reaction_id`
    * of the `OneSecond` reaction placed at arrival. The reaction_id is
-   * what `deleteReaction` needs to *remove* the OneSecond once the
-   * message has been absorbed by the SDK (either system-reminder
-   * injection mid-turn or a merged-batch dequeue on next turn).
+   * removed when the supplemental card is successfully sent. Native
+   * consumption and submit ACKs keep it visible while the card is pending.
+   * Stop/exit and terminal cleanup also release their owned reactions.
    * User feedback (2026-05-15): replacing OneSecond with a second
    * CheckMark stacked two emojis on the same row; cleaner UX is
    * "queued → released" via removal, not "queued → done" via
@@ -676,7 +781,11 @@ export class Session {
    * tells the init handler "an eager open is already
    * claiming the slot, stand down". */
   openingTurn = false
-  private openingTurnOwner: TurnOpenTerminalStash | null = null
+  /** 开卡事务 owner(统一两类凭据):上游 TurnOpenOwner(带 token/proc/
+   *  procEpoch/done,本文件 beginTurnOpen 装配),或本地轻量
+   *  TurnOpenTerminalStash(仅承载终态载荷)。两者互斥占用同一槽位 ——
+   *  同进程内只允许一个开卡事务。 */
+  private openingTurnOwner: TurnOpenOwner | TurnOpenTerminalStash | null = null
   /** Resolves when the current turn-open transaction releases. Same-process
    * follow-up opens await it instead of replacing openingTurnOwner.(上游
    * 7c14677 TurnOpenOwner.done 的本地 opaque-token 适配) */
@@ -687,7 +796,10 @@ export class Session {
    * 哨兵 promise 只 resolve——close 自身错误已在其调用点捕获/记录。
    * stop/exit 未接线(首跑无红例,04-05 处置清单记差集)。 */
   private turnCloseInflight = new Set<Promise<void>>()
+  private fileDeliveries = new Set<FileDeliveryHandle>()
   private turnCounter = 0
+  /** 开卡事务序号(beginTurnOpen 的 token 来源,并发探测用)。 */
+  private turnOpenSequence = 0
   private lifecycleEpoch = 0
   private lifecycleOwner: LifecycleLease | null = null
   private disposed = false
@@ -703,6 +815,9 @@ export class Session {
   selectedProvider: AgentProvider = 'claude'
   selectedModel: string | null = null
   selectedEffort: AgentReasoningEffort | null = null
+  /** 当前 token source id(账号)。token source 决定 agent + 凭据 + 模型 + 额度查询。
+   *  null = 未配 token source,走旧路径(provider/model 自治)。 */
+  selectedTokenSourceId: string | null = null
   modelPanels = new Map<string, sessionModel.ModelPanelState>()
   /** Feishu message id of the live GSD status panel (session-memory only). */
   gsdPanelMessageId: string | null = null
@@ -718,6 +833,13 @@ export class Session {
    * stop, or when a non-GSD message opens its own turn. Not persisted.
    */
   gsdExecution: { taskSlug: string; source: 'inject' | 'message'; at: number } | null = null
+  modelSettingsChange: sessionModel.ModelSettingsChange | null = null
+  modelSettingsChangesClosed = false
+  /** 补录应答态:点「➕ 补录模型」后置位,下一条群消息(裸词命令除外)作为
+   *  模型名消费(校验/补录)。一次性,消费或取消即清。cardMessageId 是补录
+   *  提示卡的消息 id —— 消费后原位更新它(通过→effort 卡;失败→红字),
+   *  不单发群消息(和正常消息流混淆会产生"下条是否还是模型名"的歧义)。 */
+  modelCustomPrompt: { sourceId: string, panelId: string, cardMessageId: string } | null = null
   private startedAt: number = 0
   private cumStats: CumStats = { tokens: 0, costUsd: 0, turns: 0 }
   private lastTurnDelta: LastTurnDelta | null = null
@@ -729,13 +851,19 @@ export class Session {
    * fresh absolute total snapshot, the next turn's baseline is unknown
    * and must not be guessed as zero. */
   private usageTotalsSeedUnknown = false
+  /** materialization 失败诊断去重(4185808-D):同一错误文案只发一次群内
+   *  可观测消息;成功持久化后清零,下一轮新错误重新可见。 */
+  private resumePersistenceError: string | null = null
+  /** A failed daemon recovery must not turn the next queued message into a
+   * fresh conversation. Retain this intent until an explicit lifecycle action
+   * or a successful recovery resolves it. */
+  private daemonRestoreRequired = false
   /** Set while the `compact` command owns a status card for a standalone
    * compaction. Suppresses the generic no-turn compaction text alert;
    * command feedback is rendered on that status card instead. */
   manualContextCompactionPending = false
   runningAgy: sessionAgy.AgyTaskState | null = null
   startingAgy = false
-  agentCapability: string | null = null
   agyForwardPrompts = new Map<string, sessionAgy.AgyForwardRecord>()
   /** Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板。codex
    * 的 TodoWrite 一次就带完整列表,直接渲染即可;但 Claude Code 把它拆成 4
@@ -772,21 +900,48 @@ export class Session {
     // 无持久化选择(全新群 / 从未切过 model)时,采用 config.toml [claude]
     // default_model 声明的默认档位 —— 让只订阅 GLM 的用户首条消息直接走 GLM,
     // 不必先手动切一次。未声明时保持 null,走下方 spawn 的硬编码登录默认(Fable 5)。
-    const selection = feishu.getSessionModelSelection(sessionName)
+    // 合并调和(取舍):默认档(config.toml [claude] default_model)不含 token
+    // source 信息,两个来源统一按 SessionModelSelection 收口 —— 下方
+    // selection.tokenSourceId 的旧数据回退推导对缺省成员同样成立。
+    const selection: feishu.SessionModelSelection | null = feishu.getSessionModelSelection(sessionName)
       ?? sessionModel.configuredDefaultSelection()
     this.selectedProvider = selection?.provider ?? 'claude'
     this.selectedModel = selection?.model ?? null
     this.selectedEffort = selection?.effort ?? null
-    // 历史持久化的选择归一到当前固定选项集；旧 codex:grok/grokcc 迁到
-    // 对应 Claude Agent SDK 档位。仅在有持久化选择时归一；无选择
-    // (默认)保持 null,交给 spawn 默认逻辑。
     if (selection) {
-      const norm = sessionModel.normalizePersistedModelSelection(
-        this.selectedProvider, this.selectedModel, this.selectedEffort,
-      )
-      this.selectedProvider = norm.provider
-      this.selectedModel = norm.model
-      this.selectedEffort = norm.effort
+      // 合并调和(取舍):持久化选择携带已注册 token source 时,模型 slug 归属
+      // 该 source 的模型目录(上游「token source 持久化真实模型 slug,不能把
+      // GLM-5.2 归一成 claude:glm」——反向同理:不得把面板选的 GLM-5.2/
+      // 自定义目录档改写成固定项 claude:fable)。固定选项归一(本地语义)只作用
+      // 于无 token source 的旧档位 key 持久化:codex:grok/grokcc 迁移、退役档位
+      // 回落、无选择的默认态。
+      const persistedSource = selection.tokenSourceId ? getTokenSource(selection.tokenSourceId) : undefined
+      if (!persistedSource) {
+        // 历史持久化的选择归一到当前固定选项集；旧 codex:grok/grokcc 迁到
+        // 对应 Claude Agent SDK 档位。仅在有持久化选择时归一；无选择
+        // (默认)保持 null,交给 spawn 默认逻辑。
+        const norm = sessionModel.normalizePersistedModelSelection(
+          this.selectedProvider, this.selectedModel, this.selectedEffort,
+        )
+        this.selectedProvider = norm.provider
+        this.selectedModel = norm.model
+        this.selectedEffort = norm.effort
+      }
+    }
+    // 推导 tokenSourceId(账号):优先持久化值,否则从 provider/model 映射 registry 的 source。
+    // 推导到 token source 后,以 ts.agent 校正 selectedProvider(token source 决定 agent)。
+    this.selectedTokenSourceId = this.deriveTokenSourceId(selection
+      ? { ...selection, provider: this.selectedProvider, model: this.selectedModel }
+      : null)
+    const derivedTs = getTokenSource(this.selectedTokenSourceId)
+    if (derivedTs) {
+      this.selectedProvider = derivedTs.agent
+      // 仅迁移旧版固定 profile 键。新版 token source 持久化真实模型 slug，
+      // 不能再把 GLM-5.2 归一成 claude:glm，否则重启会把错误模型名交给 SDK。
+      if (derivedTs.id === 'glm' && this.selectedModel === 'claude:glm') {
+        this.selectedModel = derivedTs.defaultModel
+        this.selectedEffort = 'max'
+      }
     }
     if (this.selectedModel) {
       log(`session "${sessionName}": restored selected provider=${this.selectedProvider} model=${this.selectedModel} effort=${this.selectedEffort ?? 'unset'}`)
@@ -809,7 +964,7 @@ export class Session {
     this.lastSessionRef = feishu.getSessionResumeRef(sessionName, this.selectedProvider)
     this.lastSessionId = this.lastSessionRef?.sessionId ?? null
     if (this.lastSessionId) {
-      log(`session "${sessionName}": restored ${this.selectedProvider} lastSessionId=${this.lastSessionId.slice(0, 8)}…`)
+      log(`session "${sessionName}": restored ${this.selectedProvider} lastSessionId=${this.lastSessionId}`)
     }
     // pendingLaunch 恢复区(4185808 终态,挂账 #2):daemon 在 Claude fork 的
     // startup grace 内崩溃时,磁盘 intent 在下次构造复活。provider 已切 → 先清
@@ -840,11 +995,16 @@ export class Session {
 
   /** Minimal cross-chat snapshot for the `hi` peer-list section.
    * `startedAt` stays private so this is the documented read path. */
-  peerSnapshot(): { name: string; status: Status; uptimeMs?: number } {
+  peerSnapshot(): { name: string; status: Status; uptimeMs?: number; codexAccountName?: string } {
     return {
       name: this.sessionName,
       status: this.status,
       uptimeMs: this.startedAt ? (Date.now() - this.startedAt) : undefined,
+      ...(this.proc?.isAlive() && this.proc.provider === 'codex'
+        && !this.currentTokenSource()?.codexApiProvider
+        && this.proc.codexAccountSelectionMode?.() !== null
+        && !(this.proc.turnRetry?.reason === 'quota' && this.proc.turnRetry.phase === 'waiting')
+        ? { codexAccountName: codexAccounts.get(processCodexAccount(this.proc)).name } : {}),
     }
   }
 
@@ -1337,7 +1497,9 @@ export class Session {
     isError: boolean,
   ): void {
     const turn = this.currentTurn
-    if (!turn || this.proc !== source || !source.isAlive()) return
+    // 合并加固:上游测试组经适配注入的 source 可为 null(上游 completeTool
+    // 原本无 source 参数,失败环观测是本地独有),null 即无从观测,直接返回。
+    if (!turn || !source || this.proc !== source || !source.isAlive()) return
     if (this.toolFailureLoopTurn !== turn) {
       this.toolFailureLoop.reset()
       this.toolFailureLoopTurn = turn
@@ -1531,211 +1693,128 @@ export class Session {
     }
   }
 
-  hasRunningPeerSession(sessionName: string): boolean {
-    return [...Session.all].some(s => s.sessionName === sessionName && s.isRunning())
+  /** Running sessions normally revive after daemon restart. A process kept
+   * only because the user's explicit stop could not yet be confirmed must not
+   * undo that stop intent on the next boot. */
+  shouldRevive(): boolean {
+    return this.daemonRestoreRequired || (this.isRunning()
+      && this.stoppingProc !== this.proc
+      && this.blockedProc !== this.proc)
+  }
+  /** 从持久化 selection 推导 tokenSourceId;无匹配返回 default 或 null(走旧路径)。 */
+  private deriveTokenSourceId(selection: { tokenSourceId?: string | null; provider?: string; model?: string | null } | null): string | null {
+    const explicit = selection?.tokenSourceId
+    // An explicit persisted account is part of the user's routing choice.
+    // Preserve it even when temporarily disabled/missing so start() can expose
+    // the concrete failure instead of silently billing/sending data through a
+    // different account of the same provider.
+    if (typeof explicit === 'string' && explicit.trim()) return explicit.trim()
+    const provider: AgentProvider = (selection?.provider as AgentProvider) ?? this.selectedProvider
+    // 只认 enabled source:disabled 的不参与 spawn,避免未配置凭据注入子进程把 claude 搞挂。
+    // claude 侧 native 与 GLM 严格互斥,恒有一个 enabled;codex 侧 codex-sub 未登录时为空(走 ~/.codex)。
+    const list = listEnabledTokenSourcesByAgent(provider)
+    // provider 侧无 enabled source → 返回 null(走旧路径:claude 透传 / codex 走 ~/.codex),
+    // 不跨界 fallback 到别的 provider 的 default —— 否则 codex-sub 未登录会把 provider 误切成 claude。
+    return list[0]?.id ?? null
   }
 
-  private modelForSpawn(provider: AgentProvider = this.selectedProvider): string | undefined {
-    return provider === this.selectedProvider ? this.selectedModel ?? undefined : undefined
+  /** 当前 token source(账号);未配返回 undefined → 调用方走旧路径 fallback。 */
+  currentTokenSource(): TokenSource | undefined {
+    return this.tokenSource(this.selectedTokenSourceId)
   }
 
-  effortForSpawn(provider: AgentProvider = this.selectedProvider): CodexReasoningEffort {
-    return provider === 'codex' && this.selectedProvider === provider && isCodexReasoningEffort(this.selectedEffort)
-      ? this.selectedEffort
-      : CODEX_EFFORT
+  /** Pending account selection takes effect only after the old process exits. */
+  private codexStartAccountOverride: string | undefined
+
+  codexAccountId(): string {
+    return this.proc?.isAlive() && this.proc.provider === 'codex'
+      ? processCodexAccount(this.proc) : this.codexStartAccountOverride ?? codexAccounts.selected(this.sessionName)
   }
 
-  claudeEffortForSpawn(provider: AgentProvider = this.selectedProvider): ClaudeReasoningEffort {
-    return provider === 'claude' && this.selectedProvider === provider && isClaudeReasoningEffort(this.selectedEffort)
-      ? this.selectedEffort
-      : CLAUDE_EFFORT
+  tokenSource(id: string | null | undefined): TokenSource | undefined {
+    const source = getTokenSource(id)
+    return source?.forAccount ? getTokenSourceForAccount(id, this.codexAccountId()) : source
   }
 
-  /** DSH 档位解析(上游 dshEffortForSpawn 的本地形态):词表是 DSH 自己的
-   *  off/low/high/max,数据源是 `[deepseek-harness]` 配置段(本地无上游的
-   *  token source `models[]` 目录,不在这里查询子进程目录)。两处都取不到即
-   *  **抛错**:绝不静默回落到 Codex 的 max(那会让 DSH 子进程拿到非法档位)。 */
-  dshEffortForSpawn(provider: AgentProvider = this.selectedProvider): DshReasoningEffort {
-    if (provider === 'dsh' && this.selectedProvider === provider && isDshReasoningEffort(this.selectedEffort)) {
-      return this.selectedEffort
-    }
-    const configured = config.deepseek_harness?.effort
-    if (isDshReasoningEffort(configured)) return configured
-    throw new Error('DSH model reasoning effort is unavailable')
-  }
-
-  currentModelLabel(): string | null {
-    return this.selectedModel ?? this.proc?.lastModel ?? null
-  }
-
-  currentEffortLabel(): AgentReasoningEffort {
-    return this.selectedEffort
-      // DSH 档位与 Codex/Claude 枚举不同(off/low/high/max):未显式选时按 DSH
-      // 语义解析(取不到即抛,不静默回落 CODEX_EFFORT),否则面板选中标记 /
-      // 当前档位展示 / selectionUnchanged 会把 DSH 会话当 Codex 渲染(03-03)。
-      ?? (this.selectedProvider === 'dsh' ? this.dshEffortForSpawn() : undefined)
-      ?? this.proc?.lastEffort
-      ?? (this.selectedProvider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
-  }
-
-  /** Actual process selection for cards and status text. selected* is the
-   * persisted target; a still-running old process remains authoritative until
-   * it is replaced. Profile keys win when they identify that same process so
-   * source-specific routing (codex:<slug>/claude:glm) is not lost. */
-  private runtimeModelSelection(): Pick<TurnState, 'provider' | 'model' | 'effort' | 'usageSource'> {
-    const proc = this.proc?.isAlive() ? this.proc : null
-    const provider = proc?.provider ?? this.selectedProvider
-    const selectedMatchesProc = !proc || proc.provider === this.selectedProvider
-    const model = selectedMatchesProc
-      ? this.selectedModel ?? proc?.lastModel ?? null
-      : proc?.lastModel ?? null
-    const effort = selectedMatchesProc
-      ? this.selectedEffort
-        ?? proc?.lastEffort
-        ?? (provider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
-      : proc?.lastEffort ?? (provider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
-    return {
-      provider,
-      model,
-      effort,
-      // 额度数据源走 TokenSource 适配层(内部仍委托 usageSourceForAgent)。
-      usageSource: resolveUsageSource(provider, model),
-    }
-  }
-
-  private modelEffortLabel(
-    selection: Pick<TurnState, 'provider' | 'model' | 'effort'> = this.currentTurn ?? this.runtimeModelSelection(),
-  ): string {
-    const shownModel = selection.provider === 'claude'
-      ? selection.model?.replace(/^claude:/i, '')
-      : selection.model
-    const label = shownModel ? `${shownModel}/${selection.effort}` : selection.effort
-    return selection.provider === 'claude'
-      ? `${agentProviderLabel(selection.provider)} · ${label}`
-      : label
-  }
-
-  withModel(
-    text: string,
-    selection?: Pick<TurnState, 'provider' | 'model' | 'effort'>,
-  ): string {
-    const label = this.modelEffortLabel(selection)
-    return text.includes(label) ? text : `${text} · ${label}`
-  }
-
-  private replaceFooterContent(cardId: string, content: string): Promise<void> {
-    // 活跃 footer 是可丢的实时状态：second 模式下一秒就会再次刷新，单次
-    // replace MISS 不影响正文或 turn 状态。cardkit 已对 footer elementId
-    // 跳过 card-level elevate；这里再显式关掉 notifyCardFailure，与上游
-    // f7a4859 对齐。终态 footer 仍走 checked / 显式 onFailure。
-    return cardkit.replaceElement(cardId, cards.ELEMENTS.footer, {
-      tag: 'markdown',
-      element_id: cards.ELEMENTS.footer,
-      content: content.trim() || ' ',
-    }, undefined, { notifyCardFailure: false })
-  }
-
-  private modelLine(
-    selection?: Pick<TurnState, 'provider' | 'model' | 'effort'>,
-  ): string {
-    return this.modelEffortLabel(selection)
-  }
-
-  backendLabel(provider: AgentProvider = this.selectedProvider): string {
-    return agentProviderLabel(provider)
-  }
-
-  /** 当前会话路由快照(D-02 slim:无 token source registry,故无 tokenSourceId)。 */
-  conversationRouting(): ConversationRouting {
+  conversationRouting(): SessionConversationRouting {
+    const apiCodex = !!this.currentTokenSource()?.codexApiProvider
     return {
       provider: this.selectedProvider,
+      tokenSourceId: this.selectedTokenSourceId,
       model: this.selectedModel,
       effort: this.selectedEffort,
+      ...(apiCodex || this.codexAccountId() === DEFAULT_CODEX_ACCOUNT ? {} : { codexAccountId: this.codexAccountId() }),
+      ...(!apiCodex && codexAccounts.preferred(this.sessionName) === null ? { codexAccountAutomatic: true } : {}),
     }
   }
 
   /** Apply an inherited routing snapshot before a temporary Session starts. */
-  applyConversationRouting(routing: ConversationRouting): void {
+  applyConversationRouting(routing: SessionConversationRouting): void {
     if (this.isRunning() || this.currentTurn || this.openingTurn) {
       throw new Error('cannot change conversation routing while the session is running')
     }
-    // D-02 slim 层:上游 token source registry 归属校验换写为本地 provider/model
-    // 合法性检查(固定档位目录:归一化把 model 判给别的 provider = 路由不成立,
-    // 如 codex:grok 迁 claude)。dsh 与 claude/codex 同为三元联合的一员
-    // (session-temp 的面板/选择结构已扩),遗漏会让 btw/fk 临时群先建后散。
-    if (routing.provider !== 'claude' && routing.provider !== 'codex' && routing.provider !== 'dsh') {
-      throw new Error(`unknown conversation routing provider: ${String(routing.provider)}`)
-    }
-    if (routing.model !== null) {
-      const norm = sessionModel.normalizePersistedModelSelection(routing.provider, routing.model, routing.effort)
-      if (norm.provider !== routing.provider) {
-        throw new Error(`conversation routing model "${routing.model}" belongs to ${norm.provider}, not ${routing.provider}`)
-      }
+    const source = getTokenSource(routing.tokenSourceId)
+    if (routing.codexAccountId && !source?.codexApiProvider) codexAccounts.get(routing.codexAccountId)
+    if (source && source.agent !== routing.provider) {
+      throw new Error(`token source "${source.id}" belongs to ${source.agent}, not ${routing.provider}`)
     }
     if (this.selectedProvider !== routing.provider) {
-      // Checked first: a failed state write must not leave the in-memory provider
-      // changed while a durable Claude fork marker survives(4185808)。
       feishu.replaceTurnAnchors(this.sessionName, [], null, null)
       this.pendingConversationMaterialization = null
     }
     this.selectedProvider = routing.provider
+    this.selectedTokenSourceId = routing.tokenSourceId ?? null
     this.selectedModel = routing.model
     this.selectedEffort = routing.effort
     this.lastSessionRef = feishu.getSessionResumeRef(this.sessionName, routing.provider)
     this.lastSessionId = this.lastSessionRef?.sessionId ?? null
-    // model=null(codex 默认档)无可持久化选择:bindSessionModelChecked 本地签名
-    // 为 string(04-02 D-02 裁剪),null 跳过 —— in-memory 路由已生效,持久化
-    // 属 04-06/04-07 temp 创建流属权。
-    if (routing.model !== null) {
-      feishu.bindSessionModelChecked(this.sessionName, routing.provider, routing.model, routing.effort)
+    feishu.bindSessionModelChecked(
+      this.sessionName,
+      routing.provider,
+      routing.model,
+      routing.effort,
+      routing.tokenSourceId,
+    )
+    if (!source?.codexApiProvider) {
+      const accountId = routing.codexAccountId ?? DEFAULT_CODEX_ACCOUNT
+      if (routing.codexAccountAutomatic) codexAccounts.selectAuto(this.sessionName)
+      else if (codexAccounts.selected(this.sessionName) !== accountId) codexAccounts.select(this.sessionName, accountId)
     }
   }
 
-  /** Codex 目录/历史访问的登录门(D-02 slim:上游 token source 可用性检查换写为
-   *  本地 API 档位/ChatGPT 登录判定,与 start() 同一条件)。 */
-  private assertCodexHistoryAuth(): void {
-    if (
-      (!codexModelIsApiRoute(this.selectedModel) || codexModelRequiresOpenaiAuth(this.selectedModel))
-      && !feishu.isOpenAIChatGPTAuthenticated()
-    ) {
-      throw new Error('Codex 未登录 ChatGPT 账号')
-    }
-  }
-
-  /** 一次性 catalog 连接(不 attach Session):listCodexConversations 与 legacy ref
-   *  升级共用。构造参数与 spawnAgent codex 分支同型 overrides(翻译表 #11)。 */
-  private spawnCodexCatalogProcess(): CodexProcess {
-    const overrides = resolveCodexSpawnOverrides(this.modelForSpawn('codex'))
-    return new CodexProcess({
-      workDir: this.workDir,
-      model: overrides.modelId,
-      effort: this.effortForSpawn('codex'),
-      launch: { kind: 'fresh' },
-      configArgs: overrides.configArgs,
-      providerEnv: overrides.env,
-    })
-  }
-
-  /** Query DSH history without attaching the catalog process to this Session.
-   *  只读目录查询每次自行 spawn 并 reap(slim 层无常驻 runtime);lodestar 自己
-   *  派发的委派会话不进用户的 rs 历史列表。 */
   async listDshConversations(): Promise<ConversationSummary[]> {
     if (this.selectedProvider !== 'dsh') throw new Error('DSH history requested under a different provider')
-    const source = resolveTokenSource('dsh', this.modelForSpawn('dsh'))
-    if (!source.enabled()) throw new Error('DSH token source is unavailable')
-    const rows: ConversationSummary[] = await queryDshRuntime({
-      cwd: this.workDir,
-      env: source.spawnEnv(process.env),
-      profile: { loadProjectMcp: false },
-    }, 'session/list', { cwd: this.workDir })
+    // 合并调和(取舍):本地 dsh 是单档后端,源即 `[deepseek-harness]` 配置段
+    // (上游形态经注册表 currentTokenSource;本地固定档位流程不绑定注册表)。
+    // 未配置/未启用即 fail loud,不放行空凭据查询。
+    const source = dshSourceFromConfig()
+    if (!source.enabled) throw new Error('DSH token source is unavailable')
+    const rows: ConversationSummary[] = await queryDshRuntime({ cwd: this.workDir,
+      env: source.spawnEnv(process.env), profile: { loadProjectMcp: false } }, 'session/list', { cwd: this.workDir })
     return rows.filter(row => !isAgentSession('dsh', row.sessionId))
   }
 
   /** Query Codex history without attaching the catalog process to this Session. */
   async listCodexConversations(): Promise<ConversationSummary[]> {
     if (this.selectedProvider !== 'codex') throw new Error('Codex history requested for a non-Codex session')
-    this.assertCodexHistoryAuth()
-    const proc = this.spawnCodexCatalogProcess()
+    const raw = this.currentTokenSource()
+    if (!raw?.codexApiProvider && !feishu.isOpenAIChatGPTAuthenticated(this.codexAccountId())) throw new Error('Codex 未登录 ChatGPT 账号')
+    if (this.selectedTokenSourceId && (!raw || !raw.enabled)) {
+      throw new Error(`token source "${this.selectedTokenSourceId}" 不可用，请重新配置或选择其他账号`)
+    }
+    const source = raw?.enabled ? raw : undefined
+    const transformEnv = source
+      ? (base: Record<string, string | undefined>) => source.spawnEnv(base)
+      : undefined
+    const proc = new CodexProcess({
+      workDir: this.workDir,
+      codexAccountId: this.codexAccountId(),
+      launch: { kind: 'fresh' },
+      tokenSourceId: source?.id ?? null,
+      transformEnv,
+      effort: this.effortForSpawn() ?? CODEX_EFFORT,
+      ...(source?.codexApiProvider ? { apiProvider: source.codexApiProvider } : {}),
+    })
     let conversations: ConversationSummary[] | null = null
     let queryError: unknown = null
     try {
@@ -1759,30 +1838,206 @@ export class Session {
     if (ref.provider !== this.selectedProvider) {
       throw new Error(`legacy resume provider mismatch: ${ref.provider} != ${this.selectedProvider}`)
     }
-    // DSH 无 pre-cwd 时代 legacy 记录:fail closed,不进 Codex catalog(上游 722e45a)。
-    if (ref.provider === 'dsh') throw new Error('DSH resume reference requires its original cwd')
     let resolved: ConversationRef
-    if (ref.provider === 'claude') {
+    if (ref.provider === 'dsh') {
+      throw new Error('DSH resume reference requires its original cwd')
+    } else if (ref.provider === 'claude') {
       const transcript = claudeTranscriptPath(this.workDir, ref.sessionId)
       if (!existsSync(transcript)) {
-        throw new Error(`旧 Claude 会话不属于当前 cwd，或 transcript 不存在: ${ref.sessionId.slice(0, 8)}…`)
+        throw new Error(`旧 Claude 会话不属于当前 cwd，或 transcript 不存在: ${diagnosticIdLabel(ref.sessionId)}`)
       }
       resolved = { ...ref, cwd: this.workDir }
     } else {
-      this.assertCodexHistoryAuth()
-      const proc = this.spawnCodexCatalogProcess()
+      const raw = this.currentTokenSource()
+      if (!raw?.codexApiProvider && !feishu.isOpenAIChatGPTAuthenticated(this.codexAccountId())) throw new Error('Codex 未登录 ChatGPT 账号')
+      if (this.selectedTokenSourceId && (!raw || !raw.enabled)) {
+        throw new Error(`token source "${this.selectedTokenSourceId}" 不可用，请重新配置或选择其他账号`)
+      }
+      const source = raw?.enabled ? raw : undefined
+      const proc = new CodexProcess({
+        workDir: this.workDir,
+        codexAccountId: this.codexAccountId(),
+        launch: { kind: 'fresh' },
+        tokenSourceId: source?.id ?? null,
+        transformEnv: source ? base => source.spawnEnv(base) : undefined,
+        effort: this.effortForSpawn() ?? CODEX_EFFORT,
+        ...(source?.codexApiProvider ? { apiProvider: source.codexApiProvider } : {}),
+      })
       let readError: unknown = null
       try { resolved = await proc.readConversationRef(ref.sessionId) }
       catch (error) { readError = error; resolved = ref }
       let closeError: unknown = null
       try { await proc.kill(2000) } catch (error) { closeError = error }
-      if (readError && closeError) throw new AggregateError([readError, closeError], 'Codex legacy resume lookup and cleanup failed')
+      if (readError && closeError) {
+        throw new AggregateError(
+          [readError, closeError],
+          `Codex legacy resume lookup and cleanup failed: read=${messageOf(readError)}; cleanup=${messageOf(closeError)}`,
+        )
+      }
       if (readError) throw readError
       if (closeError) throw closeError
     }
     validateConversationLaunch({ kind: 'resume', source: resolved }, this.selectedProvider, this.workDir)
     feishu.bindSessionResumeChecked(this.sessionName, resolved)
     return resolved
+  }
+
+  hasRunningPeerSession(sessionName: string): boolean {
+    return [...Session.all].some(s => s.sessionName === sessionName && s.isRunning())
+  }
+
+  private modelForSpawn(provider: AgentProvider = this.selectedProvider): string | undefined {
+    return provider === this.selectedProvider ? this.selectedModel ?? undefined : undefined
+  }
+
+  effortForSpawn(): CodexReasoningEffort | undefined {
+    // codex 有 token source(订阅):下发 effort(面板选,冷启动随面板,与 model 下发一致);
+    // 无 ts 旧路径:走 ~/.codex/config.toml。
+    // 热切换 setModelSettings 仍 no-op(thread/settings/update 踩坑避),需重启进程生效。
+    if (this.selectedProvider === 'codex') {
+      // 与 spawnAgent 一致只认 enabled source:disabled codex-sub(热重建后凭据失效)→ 不下发
+      // effort,让 codex 走 ~/.codex/config.toml,避免「model 不下发但 effort 覆盖」的不一致。
+      const ts = this.currentTokenSource()
+      if (!ts || (!ts.enabled && ts.id !== 'codex-sub')) return undefined
+      return isCodexReasoningEffort(this.selectedEffort) ? this.selectedEffort : CODEX_EFFORT
+    }
+    return CODEX_EFFORT
+  }
+
+  claudeEffortForSpawn(): ClaudeReasoningEffort {
+    if (this.selectedProvider === 'claude' && isClaudeReasoningEffort(this.selectedEffort)) return this.selectedEffort
+    const source = this.currentTokenSource()
+    if (this.selectedProvider === 'claude' && source?.agent === 'claude') {
+      const model = tokenSourceRuntimeModel(source, this.selectedModel ?? source.defaultModel)
+      if (!isClaudeReasoningEffort(model?.defaultEffort)) throw new Error('Claude 默认 effort MISS，请通过 model 面板明确选择')
+      return model.defaultEffort
+    }
+    return CLAUDE_EFFORT
+  }
+
+  /** DSH 档位解析(上游 dshEffortForSpawn 的本地形态):词表是 DSH 自己的
+   *  off/low/high/max,数据源是 `[deepseek-harness]` 配置段(本地无上游的
+   *  token source `models[]` 目录,不在这里查询子进程目录)。两处都取不到即
+   *  **抛错**:绝不静默回落到 Codex 的 max(那会让 DSH 子进程拿到非法档位)。 */
+  dshEffortForSpawn(provider: AgentProvider = this.selectedProvider): DshReasoningEffort {
+    if (provider === 'dsh' && this.selectedProvider === provider && isDshReasoningEffort(this.selectedEffort)) {
+      return this.selectedEffort
+    }
+    const configured = config.deepseek_harness?.effort
+    if (isDshReasoningEffort(configured)) return configured
+    throw new Error('DSH model reasoning effort is unavailable')
+  }
+
+  currentModelLabel(): string | null {
+    if (this.modelSettingsChange?.proc === this.proc && this.modelSettingsChange.phase === 'failed') {
+      return this.modelSettingsChange.confirmedModel
+    }
+    // 有 token source 时 fallback 到它声明的真实模型(ts.defaultModel 如 GLM-5.2[1m]),
+    // 而非 proc.lastModel —— 那是 SDK alias(如 'opus'),用户看着像切错了模型。
+    // 显示/比对统一出口:剥 claude: 前缀和 [1m] 记账后缀 —— 面板选中态比对
+    // (session-model)用裸模型名,内部后缀不参与。
+    const raw = this.selectedModel ?? this.currentTokenSource()?.defaultModel ?? this.proc?.lastModel ?? null
+    return raw?.replace(/^claude:/i, '').replace(/\[1m\]$/i, '') ?? null
+  }
+
+  currentEffortLabel(): AgentReasoningEffort | null {
+    if (this.modelSettingsChange?.proc === this.proc && this.modelSettingsChange.phase === 'failed') {
+      return this.modelSettingsChange.confirmedEffort
+    }
+    const source = this.currentTokenSource()
+    if (this.selectedProvider === 'claude' && source?.agent === 'claude') {
+      return this.selectedEffort ?? tokenSourceRuntimeModel(source, this.selectedModel ?? source.defaultModel)?.defaultEffort ?? null
+    }
+    return this.selectedEffort
+      // DSH 档位与 Codex/Claude 枚举不同(off/low/high/max):未显式选时按 DSH
+      // 语义解析(取不到即抛,不静默回落 CODEX_EFFORT),否则面板选中标记 /
+      // 当前档位展示 / selectionUnchanged 会把 DSH 会话当 Codex 渲染(03-03)。
+      ?? (this.selectedProvider === 'dsh' ? this.dshEffortForSpawn() : undefined)
+      ?? this.proc?.lastEffort
+      ?? (this.selectedProvider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
+  }
+
+  /** Actual process selection for cards and status text. selected* is the
+   * persisted target; a still-running old process remains authoritative until
+   * it is replaced. Profile keys win when they identify that same process so
+   * source-specific routing (codex:<slug>/claude:glm) is not lost. */
+  private runtimeModelSelection(): Pick<TurnState, 'provider' | 'model' | 'effort' | 'usageSource'> {
+    const proc = this.proc?.isAlive() ? this.proc : null
+    const provider = proc?.provider ?? this.selectedProvider
+    if (proc && this.modelSettingsChange?.proc === proc && this.modelSettingsChange.phase === 'failed') {
+      return {
+        provider,
+        model: this.modelSettingsChange.confirmedModel,
+        effort: this.modelSettingsChange.confirmedEffort,
+        usageSource: usageSourceForAgent(provider, this.modelSettingsChange.confirmedModel),
+      }
+    }
+    const selectedMatchesProc = !proc || proc.provider === this.selectedProvider
+    const model = selectedMatchesProc
+      ? this.selectedModel ?? proc?.lastModel ?? null
+      : proc?.lastModel ?? null
+    // 合并调和(取舍):claude 的档位回落须经 token source 的模型目录(上游
+    // 「source 默认 effort 权威;目录里缺省不得被 max 顶替」)——目录声明
+    // defaultEffort: null 时留 null(footer/快照显示 MISS),不再冒充
+    // CLAUDE_EFFORT;仅无 claude source(登录态)才回落常量。
+    const claudeSource = provider === 'claude' ? this.currentTokenSource() : null
+    const fallbackEffort: AgentReasoningEffort | null = provider === 'claude'
+      ? claudeSource?.agent === 'claude'
+        ? tokenSourceRuntimeModel(claudeSource, this.selectedModel ?? claudeSource.defaultModel)?.defaultEffort ?? null
+        : CLAUDE_EFFORT
+      : CODEX_EFFORT
+    const effort = selectedMatchesProc
+      ? this.selectedEffort
+        ?? proc?.lastEffort
+        ?? fallbackEffort
+      : proc?.lastEffort ?? fallbackEffort
+    return {
+      provider,
+      model,
+      effort,
+      // 额度数据源走 TokenSource 适配层(本地 resolveUsageSource 薄适配并入)。
+      usageSource: usageSourceForAgent(provider, model),
+    }
+  }
+
+  withModel(
+    text: string,
+    selection?: Pick<TurnState, 'provider' | 'model' | 'effort'>,
+  ): string {
+    const label = this.modelLine(selection)
+    return text.includes(label) ? text : `${text} · ${label}`
+  }
+
+  private async replaceFooterContent(cardId: string, content: string): Promise<cardkit.CardWriteResult> {
+    // Live timing is optional: Card Kit logs failures, and the timer pauses
+    // without a user notice. Never mark the footer missing or rotate its card.
+    // Terminal footer writes use their own checked transaction and still report.
+    let failure: cardkit.CardWriteFailure | undefined
+    const landed = await cardkit.replaceElementChecked(
+      cardId,
+      cards.ELEMENTS.footer,
+      this.footerElement(content),
+      { notifyCardFailure: false, onFailure: detail => { failure = detail } },
+    )
+    return { landed, failure }
+  }
+
+  private footerElement(content: string): object {
+    return {
+      tag: 'markdown',
+      element_id: cards.ELEMENTS.footer,
+      content: content.trim() || ' ',
+    }
+  }
+
+  private modelLine(
+    selection: Pick<TurnState, 'provider' | 'model' | 'effort'> = this.currentTurn ?? this.runtimeModelSelection(),
+  ): string {
+    return cards.footerModelLabel(selection.provider, selection.model, selection.effort)
+  }
+
+  backendLabel(provider: AgentProvider = this.selectedProvider): string {
+    return agentProviderLabel(provider)
   }
 
   /** 一次性 launch intent(startForked/rollbackTo 设、spawnAgent 消费;上游
@@ -1836,6 +2091,15 @@ export class Session {
     provider: AgentProvider = this.selectedProvider,
     lease?: LifecycleLease,
   ): AgentProcess {
+    this.agentCapability = randomBytes(32).toString('base64url')
+    const hostEnv = {
+      // 全量 bun test 时字母序更早的 mock.module('./config') 可能不含 notify
+      // 段(claude-agent-process/codex-models)；缺省与 config.ts 默认一致。
+      LODESTAR_AGENT_URL: agentApiUrl(config.notify?.bind ?? '127.0.0.1', config.notify?.port ?? 9876),
+      LODESTAR_AGENT_CAPABILITY: this.agentCapability,
+      LODESTAR_AGENT_SESSION: this.sessionName,
+      LODESTAR_AGENT_ROLE: 'main',
+    }
     const pending = this.pendingConversationLaunch && (!lease || this.pendingConversationLaunch.lease === lease)
       ? this.pendingConversationLaunch
       : null
@@ -1847,73 +2111,81 @@ export class Session {
         ? { kind: 'resume', source: resumeRef }
         : { kind: 'fresh' })
     validateConversationLaunch(launch, provider, this.workDir)
-    this.agentCapability = randomBytes(32).toString('base64url')
-    const hostEnv = {
-      // 全量 bun test 时字母序更早的 mock.module('./config') 可能不含 notify
-      // 段(claude-agent-process/codex-models)；缺省与 config.ts 默认一致。
-      LODESTAR_AGENT_URL: agentApiUrl(config.notify?.bind ?? '127.0.0.1', config.notify?.port ?? 9876),
-      LODESTAR_AGENT_CAPABILITY: this.agentCapability,
-      LODESTAR_AGENT_SESSION: this.sessionName,
+    // 只让 enabled source 参与 spawn。显式选择过但当前 disabled/missing 的
+    // source 必须 fail closed；只有从未绑定 source 的 legacy 路径才允许裸跑。
+    const raw = this.currentTokenSource()
+    const codexPool = provider === 'codex' && this.selectedTokenSourceId === 'codex-sub'
+    if (this.selectedTokenSourceId && (!raw || (!raw.enabled && !codexPool))) {
+      throw new Error(`token source "${this.selectedTokenSourceId}" 不可用，请重新配置或在 model 面板选择其他账号`)
     }
-    if (provider === 'claude') {
-      assertClaudeCodeAvailable()
-      const sourceId = launch.kind === 'fresh' ? undefined : launch.source.sessionId
-      const through = launch.kind === 'fork' ? launch.through : undefined
-      if (through && (through.provider !== 'claude' || through.kind !== 'assistant-message')) {
-        throw new Error(`Claude cannot fork from ${through.provider}/${through.kind} checkpoint`)
-      }
-      return new ClaudeAgentProcess({
-        workDir: this.workDir,
-        model: this.modelForSpawn(provider),
-        effort: this.claudeEffortForSpawn(provider),
-        resumeSessionId: sourceId,
-        resumeSessionAt: through?.id,
-        forkSession: launch.kind === 'fork',
-        appendSystemPrompt: this.spawnDeveloperInstructions(),
-        profile: feishu.projectProfile(feishu.tempProjectName(this.sessionName) ?? this.sessionName),
-        hostEnv,
-      })
-    }
-    // DSH 原生后端(上游 722e45a 的构造分支本地形态):凭据与档位同出
-    // `[deepseek-harness]` 段,经 TokenSource.spawnEnv 注入子进程。源缺失/未启用
-    // 即 fail closed —— 绝不落到下面的 codex fallthrough(那会把 dsh 档位当作
-    // Codex 跑,错误后端且凭据语义不符)。claude 分支与 codex fallthrough 逐字不动。
-    if (provider === 'dsh') {
-      const source = resolveTokenSource('dsh', this.modelForSpawn(provider))
-      if (!source.enabled()) throw new Error('DSH token source is unavailable')
-      return new DshProcess({
+    const ts = raw?.enabled || codexPool ? raw : undefined
+    const fileDeliveryMode = this.currentTurn?.fileDeliveryMode ?? this.getFileDeliveryMode()
+    // DSH 单档后端(上游 722e45a 构造分支的本地语义并入合并形态):本地固定档位
+    // 流程从不绑定注册表 source(选择键就是 `[deepseek-harness]` 段)—— 未绑定
+    // 时按配置段即时构建,与 session-model 的可见性门、dshEffortForSpawn 同源;
+    // 绑定过注册表 source 的上游面板流程继续走 createAgentProcess 的 registry 闸
+    // (ts 分支)。源缺失/未启用即 fail closed —— 绝不落到 codex fallthrough
+    // (那会把 dsh 档位当作 Codex 跑,错误后端且凭据语义不符)。
+    if (provider === 'dsh' && !ts) {
+      const source = dshSourceFromConfig()
+      if (!source.enabled) throw new Error('DSH token source is unavailable')
+      const model = this.modelForSpawn(provider) ?? source.defaultModel
+      const proc = new DshProcess({
         workDir: this.workDir,
         tokenSourceId: source.id,
-        model: this.modelForSpawn(provider) ?? source.selectionModel,
+        model,
         effort: this.dshEffortForSpawn(provider),
         launch,
-        developerInstructions: this.spawnDeveloperInstructions(),
-        profile: feishu.projectProfile(feishu.tempProjectName(this.sessionName) ?? this.sessionName),
+        developerInstructions: this.spawnDeveloperInstructions(fileDeliveryMode),
+        profile: feishu.projectProfileForDirectory(this.workDir),
+        ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1' ? {} : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
         hostEnv,
+        // 凭据单入口:先 scrub ANTHROPIC_*/DSH_* 再注入本档 DEEPSEEK_*(D-08 双轨),
+        // 与注册表 readUsage/spawnEnv 同一 factory 实现。
         transformEnv: base => source.spawnEnv(base),
       })
+      this.procSourceRevisions.set(proc, tokenSourceProcessRevision(source, model))
+      this.procFileDeliveryModes.set(proc, fileDeliveryMode)
+      return proc
     }
-    // spawn 覆盖走 TokenSource 适配层(D-02 slim:上游 registry 段换写,注入形态零变);
-    // launch 透传给 CodexProcess(thread/start|resume|fork 三分支在进程层,04-01)。
-    const overrides = resolveCodexSpawnOverrides(this.modelForSpawn(provider))
-    return new CodexProcess({
+    const created = createAgentProcess({
+      provider,
       workDir: this.workDir,
-      model: overrides.modelId,
-      effort: this.effortForSpawn(provider),
+      tokenSourceId: ts?.id ?? null,
+      ...(provider === 'codex' ? { codexAccountId: codexAccounts.selected(this.sessionName) } : {}),
+      ...(codexPool ? { codexAccountPreference: this.codexStartAccountOverride ?? codexAccounts.preferred(this.sessionName) } : {}),
+      model: ts ? (this.selectedModel ?? ts.defaultModel) : this.modelForSpawn(provider),
+      effort: provider === 'dsh'
+        ? this.dshEffortForSpawn(provider)
+        : provider === 'claude' ? this.claudeEffortForSpawn() : this.effortForSpawn(),
       launch,
-      appendSystemPrompt: this.spawnDeveloperInstructions(),
-      configArgs: overrides.configArgs,
-      providerEnv: overrides.env,
+      developerInstructions: this.spawnDeveloperInstructions(fileDeliveryMode),
+      profile: feishu.projectProfileForDirectory(this.workDir),
+      ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1' ? {} : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
       hostEnv,
     })
+    this.procSourceRevisions.set(created.process, created.sourceRevision)
+    this.procFileDeliveryModes.set(created.process, fileDeliveryMode)
+    return created.process
   }
 
   async applyModelSelection(
     provider: AgentProvider,
     model: string,
     effort: AgentReasoningEffort | null,
-    lease?: LifecycleLease,
-  ): Promise<boolean> {
+    leaseOrTokenSourceId?: LifecycleLease | string,
+  ): Promise<boolean | void> {
+    // 上游调用面(持久化选择/面板/测试直调:第 4 参 tokenSourceId 字符串或省略)
+    // 经 runLifecycle('apply-model-selection') 串行 —— 上游 17280「用户消息持锁
+    // 期间不得改写 Session 状态」;体走上游 applyModelSelectionUnlocked(checked
+    // 写,失败 throw;18614/11033 按 throw 断言)。
+    if (typeof leaseOrTokenSourceId === 'string' || leaseOrTokenSourceId === undefined) {
+      return await this.runLifecycle('apply-model-selection', () =>
+        this.applyModelSelectionUnlocked(provider, model, effort, leaseOrTokenSourceId))
+    }
+    // 本地调用面(session-model.ts 模型切换事务,第 4 参 lease):返回值表「是否
+    // 仍归属本事务」;事务已持 lease,不再进 runLifecycle 队列(防与外层互等)。
+    const lease = leaseOrTokenSourceId
     if (lease && !this.ownsLifecycle(lease)) return false
     const previousProvider = this.selectedProvider
     if (previousProvider !== provider) {
@@ -1932,54 +2204,167 @@ export class Session {
     return !lease || this.ownsLifecycle(lease)
   }
 
+  async applyModelSelectionUnlocked(
+    provider: AgentProvider,
+    model: string,
+    effort: AgentReasoningEffort | null,
+    tokenSourceId?: string,
+  ): Promise<void> {
+    const previousProvider = this.selectedProvider
+    const nextSourceId = tokenSourceId ?? this.selectedTokenSourceId
+    const ts = getTokenSource(nextSourceId)
+    const nextModel = ts ? model || null : provider === 'codex' ? null : model
+    const nextEffort = ts
+      ? effort ?? tokenSourceRuntimeModel(ts, model || ts.defaultModel)?.defaultEffort ?? null
+      : provider === 'codex' ? null : effort
+
+    // Keep both routing and its durable selection unchanged until the old
+    // process has actually stopped. A failed close must remain retryable.
+    await this.stopIdleMismatchedProcessUnlocked(provider, nextSourceId, nextModel, nextEffort)
+    const previousConversation = previousProvider !== provider ? {
+      anchors: feishu.getTurnAnchors(this.sessionName).slice(),
+      base: feishu.getSessionBranchBase(this.sessionName),
+      pending: feishu.getPendingConversationLaunch(this.sessionName),
+    } : null
+    if (previousConversation) feishu.replaceTurnAnchors(this.sessionName, [], null, null)
+    try {
+      feishu.bindSessionModelChecked(this.sessionName, provider, nextModel, nextEffort, nextSourceId)
+    } catch (error) {
+      if (previousConversation) {
+        try {
+          feishu.replaceTurnAnchors(this.sessionName, previousConversation.anchors,
+            previousConversation.base, previousConversation.pending)
+        } catch (restoreError) {
+          throw new AggregateError([error, restoreError],
+            `model selection write failed: ${messageOf(error)}; conversation state restore failed: ${messageOf(restoreError)}`)
+        }
+      }
+      throw error
+    }
+    if (previousConversation) this.pendingConversationMaterialization = null
+    this.selectedProvider = provider
+    this.selectedTokenSourceId = nextSourceId
+    this.selectedModel = nextModel
+    this.selectedEffort = nextEffort
+    this.lastSessionRef = feishu.getSessionResumeRef(this.sessionName, provider)
+    this.lastSessionId = this.lastSessionRef?.sessionId ?? null
+  }
+
+  processSourceMatches(source: TokenSource | undefined, model?: string | null): boolean {
+    if (this.proc?.quotaWaitPromise && !this.proc.sessionId && this.proc.turnRetry?.reason === 'quota') return true
+    if (this.proc?.sourceRevision) return this.proc.sourceRevision() === tokenSourceProcessRevision(source, model)
+    return !this.proc || !this.procSourceRevisions.has(this.proc)
+      || this.procSourceRevisions.get(this.proc) === tokenSourceProcessRevision(source, model)
+  }
+
+  modelSelectionNeedsProcessStop(
+    provider = this.selectedProvider,
+    tokenSourceId = this.selectedTokenSourceId,
+    model = this.selectedModel,
+    effort = this.selectedEffort,
+  ): boolean {
+    const proc = this.proc
+    return !!proc?.isAlive() && (
+      this.blockedProc === proc
+      || proc.provider !== provider
+      || proc.tokenSourceId !== tokenSourceId
+      || provider === 'claude' && proc.provider === 'claude' && effort !== null
+        && ((proc.lastEffort ?? this.selectedEffort) === 'default') !== (effort === 'default')
+      || !this.processSourceMatches(this.tokenSource(tokenSourceId), model)
+    )
+  }
+
   async stopIdleMismatchedProcess(lease?: LifecycleLease): Promise<void> {
     if (lease && !this.ownsLifecycle(lease)) return
-    if (!this.proc?.isAlive()) return
-    if (this.proc.provider === this.selectedProvider) return
-    if (this.hasProcessMutationBlockingWork()) return
+    await this.stopIdleMismatchedProcessUnlocked()
+  }
+
+  private async stopIdleMismatchedProcessUnlocked(
+    provider = this.selectedProvider,
+    tokenSourceId = this.selectedTokenSourceId,
+    model = this.selectedModel,
+    effort = this.selectedEffort,
+  ): Promise<void> {
+    // provider 或 token source 任一变化 = 进程 env 不再匹配 → idle 时杀掉,下轮重 spawn 换 env。
+    // 同 provider 跨 source(GLM↔DeepSeek↔native)env(base_url/凭据)不同也必须重启,
+    // 否则热切换只改 model 不换 env → 模型名打到上一个 source 的 base_url(silent divergence)。
+    if (!this.proc || !this.modelSelectionNeedsProcessStop(provider, tokenSourceId, model, effort)) return
+    if (this.currentTurn || this.openingTurn || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) return
     const proc = this.proc
+    // 合并收口(main 同款,current-process 变体亦如此):进程即将被换掉,
+    // 挂在其上的 turn interrupt 必须随之作废,cancel 在 kill 之前生效。
     this.cancelTurnInterrupt('idle provider switch')
-    log(`session "${this.sessionName}": stop idle ${proc.provider} process after switching to ${this.selectedProvider}`)
-    this.proc = null
-    this.clearCodexProcessActivityState()
+    log(`session "${this.sessionName}": stop idle ${proc.provider} process before switching to ${provider}`)
+    this.beginProcStop(proc)
     this.initCount = 0
     // 进程换掉:恢复轮标记 / 孤儿缓冲随旧进程作废,否则会泄漏到新进程的
     // boot init,把一次干净启动误判成 bg_task_resume 轮开出幽灵卡。
     this.bgResumePending = false
-    this.sawResultWhileOpening = false
     this.discardOrphanAssistant()
     this.currentTurnUsageBaseline = null
     this.currentTurnUsageBaselineKnown = false
     this.usageTotalsSeedUnknown = false
     this.status = 'stopped'
+    let resumableStateError = await this.settleProcResumableState(proc)
+    let killError: unknown = null
+    // Use the backend's shutdown deadline: Claude SDK alone allows about 2 s
+    // for graceful cleanup, so the former 1 s override reported false failures.
+    try { await proc.kill() }
+    catch (e) { killError = e }
+    resumableStateError = await this.settleProcResumableState(proc)
+    const confirmed = this.finishProcStop(proc, killError)
     this.opts.onLifecycleChange?.()
-    await proc.kill(1000)
+    const failures = [
+      ...(killError ? [killError] : !confirmed ? [new Error(this.blockedProcReason ?? 'process stop unconfirmed')] : []),
+      ...(resumableStateError ? [new Error(resumableStateError)] : []),
+    ]
+    if (failures.length === 1) throw failures[0]
+    if (failures.length > 1) {
+      throw new AggregateError(failures, `idle process stop failed: ${failures.map(messageOf).join('; ')}`)
+    }
   }
 
   async stopIdleCurrentProcess(reason: string, lease?: LifecycleLease): Promise<boolean> {
     if (lease && !this.ownsLifecycle(lease)) return false
+    return await this.stopIdleCurrentProcessUnlocked(reason, lease)
+  }
+
+  private async stopIdleCurrentProcessUnlocked(reason: string, lease?: LifecycleLease): Promise<boolean> {
     if (!this.proc?.isAlive()) return false
     if (this.hasProcessMutationBlockingWork()) return false
     const proc = this.proc
     this.cancelTurnInterrupt(`idle process stop: ${reason}`)
     log(`session "${this.sessionName}": stop idle ${proc.provider} process: ${reason}`)
-    this.proc = null
+    this.beginProcStop(proc)
     this.clearCodexProcessActivityState()
     this.initCount = 0
     this.bgResumePending = false
-    this.sawResultWhileOpening = false
     this.discardOrphanAssistant()
     this.currentTurnUsageBaseline = null
     this.currentTurnUsageBaselineKnown = false
     this.usageTotalsSeedUnknown = false
     this.status = 'stopped'
+    let resumableStateError = await this.settleProcResumableState(proc)
+    let killError: unknown = null
+    try { await proc.kill() }
+    catch (e) { killError = e }
+    resumableStateError = await this.settleProcResumableState(proc)
+    const confirmed = this.finishProcStop(proc, killError)
     this.opts.onLifecycleChange?.()
-    await proc.kill(1000)
     if (lease && !this.ownsLifecycle(lease)) return false
     // A multi-message marker or another host-side interaction can arrive
     // while kill awaits without acquiring a lifecycle lease. Preserve it and
     // make the caller abort instead of following with a destructive restart.
-    return !this.hasProcessMutationBlockingWork()
+    if (this.hasProcessMutationBlockingWork()) return false
+    const failures = [
+      ...(killError ? [killError] : !confirmed ? [new Error(this.blockedProcReason ?? 'process stop unconfirmed')] : []),
+      ...(resumableStateError ? [new Error(resumableStateError)] : []),
+    ]
+    if (failures.length > 0) {
+      log(`session "${this.sessionName}": idle process stop finished with failures: ${failures.map(messageOf).join('; ')}`)
+      return false
+    }
+    return true
   }
 
   private startFooterTimer(
@@ -1990,34 +2375,53 @@ export class Session {
     const startedAt = Date.now()
     let status = initialStatus
     let stopped = false
+    let pending = false
+    let paused = false
+    let dirty = false
+    let timer: ReturnType<typeof setTimeout> | null = null
     const render = (): void => {
       if (stopped) return
-      void this.replaceFooterContent(cardId, renderContent(timedStatus(status, startedAt)))
+      if (pending) { dirty = true; return }
+      pending = true
+      dirty = false
+      const writtenStatus = status
+      void this.replaceFooterContent(cardId, renderContent(timedStatus(status, startedAt))).then(result => {
+        pending = false
+        if (stopped) return
+        if (result.landed) {
+          if (dirty) render()
+          return
+        }
+        paused = true
+        if (timer) clearTimeout(timer)
+        timer = null
+        if (dirty && status !== writtenStatus) render()
+      })
     }
-    let handle: ReturnType<typeof setTimeout> | null = null
+    // footer 显示「状态词 + 耗时」(见 timedStatus)。bucket 只在档位边界 push;
+    // second 前 10m 固定 1s,之后按 5m 档位。setStatus 切换状态也立即 push。
+    // elapsedSec 仍基于 startedAt,供 closeStatusCard 结束时显示总耗时。
     const scheduleNext = (): void => {
-      if (stopped) return
-      const { nextDelayMs } = cards.liveElapsed(Date.now() - startedAt, config.runtime.live_elapsed)
-      handle = setTimeout(() => {
-        render()
-        scheduleNext()
-      }, Math.max(1, Math.ceil(nextDelayMs)))
+      if (stopped || paused) return
+      const { nextDelayMs } = liveElapsed(Date.now() - startedAt, liveElapsedMode())
+      timer = setTimeout(() => { render(); scheduleNext() }, Math.max(1, Math.ceil(nextDelayMs)))
     }
     render()
     scheduleNext()
     return {
       setStatus(next: string): void {
+        if (next === status) return
         status = next
         render()
       },
       stop(): void {
         if (stopped) return
         stopped = true
-        if (handle) clearTimeout(handle)
-        handle = null
+        if (timer) clearTimeout(timer)
+        timer = null
       },
-      elapsedSec(): string {
-        return ((Date.now() - startedAt) / 1000).toFixed(1)
+      elapsedSec(): number {
+        return (Date.now() - startedAt) / 1000
       },
     }
   }
@@ -2034,17 +2438,18 @@ export class Session {
       status: timedStatus(initialStatus, startedAt),
       template,
     })
-    const messageId = await feishu.sendCard(this.chatId, card)
+    let sendFailure: unknown
+    const messageId = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
     if (!messageId) {
       log(`session "${this.sessionName}": status card send failed title=${title}`)
-      await feishu.sendTextRaw(this.chatId, `❌ 创建状态卡片失败: ${title}`)
+      await feishu.sendTextRaw(this.chatId, `❌ 创建状态卡片失败: ${title}\n${formatFeishuError(sendFailure)}`)
       return null
     }
     let cardId: string
     try { cardId = await cardkit.convertMessageToCard(messageId) }
     catch (e) {
       log(`session "${this.sessionName}": status card id_convert failed title=${title}: ${e}`)
-      await feishu.sendTextRaw(this.chatId, `❌ 状态卡片初始化失败: ${title}`)
+      await feishu.sendTextRaw(this.chatId, `❌ 状态卡片初始化失败: ${title}\n${formatFeishuError(e)}`)
       return null
     }
     cardkit.recordCardCreated(cardId, 1)
@@ -2067,15 +2472,80 @@ export class Session {
     if (!handle) return
     handle.timer.stop()
     const elapsed = handle.timer.elapsedSec()
-    const content = cards.statusCardContent(handle.title, `${finalStatus} (${elapsed}s)`)
+    const content = cards.statusCardContent(handle.title, `${finalStatus} (${cards.formatDuration(elapsed)})`)
     await cardkit.flush(handle.cardId)
-    await this.replaceFooterContent(handle.cardId, content)
+    const failures: cardkit.CardWriteFailure[] = []
+    const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
+    const footerLanded = await cardkit.replaceElementChecked(
+      handle.cardId,
+      cards.ELEMENTS.footer,
+      this.footerElement(content),
+      { onFailure },
+    )
     cardkit.cancelSummary(handle.cardId)
-    await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({
+    const settingsLanded = await cardkit.patchSettingsChecked(handle.cardId, cards.streamingOffSettings({
       durationSec: elapsed,
       suffix: finalStatus,
-    }))
-    await cardkit.dispose(handle.cardId)
+    }), onFailure)
+    if (footerLanded && settingsLanded) {
+      await cardkit.dispose(handle.cardId)
+    } else {
+      const detail = `footer=${footerLanded ? 'ok' : 'MISS'}, settings=${settingsLanded ? 'ok' : 'MISS'}`
+      log(`session "${this.sessionName}": status card terminal transaction incomplete card=${handle.cardId.slice(0, 12)} ${detail}`)
+      await feishu.sendTextRaw(this.chatId, `⚠️ 状态卡片终态写入失败 (${detail})：${finalStatus}\n${cardFailureDetails(failures)}`)
+    }
+  }
+
+  private async runLifecycle<T>(label: string, operation: () => Promise<T>): Promise<T> {
+    const previous = this.lifecycleTail
+    let release!: () => void
+    this.lifecycleTail = new Promise<void>(resolve => { release = resolve })
+    await previous
+    const sequence = ++this.lifecycleSequence
+    this.lifecycleActive++
+    log(`session "${this.sessionName}": lifecycle#${sequence} ${label} begin`)
+    try {
+      return await operation()
+    } finally {
+      this.lifecycleActive--
+      release()
+      log(`session "${this.sessionName}": lifecycle#${sequence} ${label} end`)
+    }
+  }
+
+  /** 上游开卡事务装配(owner 协议,经 as-any 测试与转向迁移保留;生产装配
+   *  入口为本地 beginTurnOpening,两者共用 openingTurnOwner 槽位)。 */
+  beginTurnOpen(
+    proc: AgentProcess | null = this.proc,
+    procEpoch = this.procEpoch,
+    backendTurnStarted = false,
+  ): TurnOpenOwner {
+    if (this.openingTurnOwner) {
+      throw new Error(
+        `turn card open already owned by ${'token' in this.openingTurnOwner ? `token=${this.openingTurnOwner.token}` : 'terminal stash'}; ` +
+        'same-process opens must wait for the current owner',
+      )
+    }
+    let resolveDone!: () => void
+    const done = new Promise<void>(resolve => { resolveDone = resolve })
+    const owner: TurnOpenOwner = {
+      token: ++this.turnOpenSequence,
+      proc,
+      procEpoch,
+      sawResult: false,
+      terminalForcePush: false,
+      pendingCompactions: [],
+      backendTurnStarted,
+      done,
+      resolveDone,
+    }
+    this.openingTurnOwner = owner
+    this.openingTurn = true
+    return owner
+  }
+
+  stopAgyTask(status = '🛑 agy 已打断'): Promise<boolean> {
+    return sessionAgy.stopAgyTask(this, status)
   }
 
   beginAgyForwardToCodex(resultIdRaw: string, userOpenId = ''): ModelActionResult {
@@ -2086,16 +2556,142 @@ export class Session {
     return sessionAgy.runAgyCommand(this, prompt)
   }
 
-  showAgentIdentityPanel(userOpenId: string): Promise<void> {
-    return sessionAgentIdentities.showAgentIdentityPanel(this, userOpenId)
+  private ownsTurnOpen(owner: TurnOpenOwner | TurnOpenTerminalStash): boolean {
+    if (this.openingTurnOwner !== owner) return false
+    if (!('proc' in owner)) return true
+    return this.proc === owner.proc && this.procEpoch === owner.procEpoch
   }
 
-  onAgentIdentityPage(panelId: string, pageRaw: unknown, userOpenId: string): ModelActionResult {
-    return sessionAgentIdentities.onAgentIdentityPage(panelId, pageRaw, userOpenId)
+  releaseTurnOpen(owner: TurnOpenOwner): void {
+    if (this.openingTurnOwner !== owner) return
+    this.openingTurnOwner = null
+    this.openingTurn = false
+    owner.resolveDone()
+    this.steerPendingInputs()
   }
 
-  stopAgyTask(status = '🛑 agy 已打断'): Promise<boolean> {
-    return sessionAgy.stopAgyTask(this, status)
+  private invalidateTurnOpen(): void {
+    const owner = this.openingTurnOwner
+    if (owner && 'resolveDone' in owner) owner.resolveDone()
+    this.clearTurnOpening()
+  }
+
+  /** Wait for a same-process card-open transaction to finish(上游 7c14677 单飞:
+   * TurnOpenOwner 与本地 TurnOpenTerminalStash 共用 openingTurnOwner 槽位,
+   * 等待须覆盖两类凭据的唤醒 —— 本地轻量凭据的 done 在 openingTurnDone)。
+   * Process replacement invalidates the old owner and fails this wait,
+   * preserving the existing “new process supersedes old open” lifecycle while
+   * prohibiting two opens in one process generation from migrating/rendering
+   * concurrently. */
+  private async waitForTurnOpenSlot(proc: AgentProcess, epoch: number = this.procEpoch): Promise<boolean> {
+    while (this.openingTurnOwner) {
+      const owner = this.openingTurnOwner
+      const done = 'done' in owner ? owner.done : this.openingTurnDone?.promise
+      if (!done) return false
+      await done
+      if (this.proc !== proc || this.procEpoch !== epoch || !proc.isAlive()) return false
+    }
+    return this.proc === proc && this.procEpoch === epoch && proc.isAlive()
+  }
+
+  private attachProc(proc: AgentProcess): void {
+    this.submittedSteering.clear()
+    this.steeringBoundary?.start()
+    this.steeringBoundary = null
+    this.modelSettingsChange?.cancel('原进程已更换')
+    this.modelSettingsChange = null
+    this.invalidateTurnOpen()
+    this.stoppingProc = null
+    this.blockedProc = null
+    this.blockedProcReason = null
+    this.proc = proc
+    const epoch = ++this.procEpoch
+    this.wireProc(proc, epoch)
+  }
+
+  private detachProc(proc: AgentProcess): boolean {
+    if (this.proc !== proc) return false
+    this.submittedSteering.clear()
+    this.steeringBoundary?.start()
+    this.steeringBoundary = null
+    this.modelSettingsChange?.cancel('原进程已退出')
+    this.modelSettingsChange = null
+    this.invalidateTurnOpen()
+    this.proc = null
+    this.agentCapability = null
+    if (this.stoppingProc === proc) this.stoppingProc = null
+    if (this.blockedProc === proc) {
+      this.blockedProc = null
+      this.blockedProcReason = null
+    }
+    this.procEpoch++
+    return true
+  }
+
+  private beginProcStop(proc: AgentProcess): void {
+    this.steeringGeneration++
+    this.submittedSteering.clear()
+    this.steeringBoundary?.start()
+    this.steeringBoundary = null
+    if (this.modelSettingsChange?.proc === proc) {
+      this.modelSettingsChange.cancel('原进程正在停止')
+      this.modelSettingsChange = null
+    }
+    this.stoppingProc = proc
+    this.agentCapability = null
+  }
+
+  /** Returns true only when process termination is confirmed. */
+  private finishProcStop(proc: AgentProcess, error: unknown): boolean {
+    if (this.stoppingProc === proc) this.stoppingProc = null
+    if (!proc.isAlive()) {
+      this.discardPendingCodexTurnAnchors(proc, 'confirmed process stop')
+      this.detachProc(proc)
+      return true
+    }
+    this.blockedProc = proc
+    this.blockedProcReason = error ? messageOf(error) : 'kill returned while process still reports alive'
+    log(`session "${this.sessionName}": process stop unconfirmed; lifecycle blocked: ${this.blockedProcReason}`)
+    return false
+  }
+
+  private blockedProcessMessage(): string | null {
+    const proc = this.blockedProc
+    if (!proc) return null
+    if (!proc.isAlive()) {
+      this.detachProc(proc)
+      return null
+    }
+    return `旧 ${this.backendLabel(proc.provider)} 进程尚未确认退出，会话已阻断: ${this.blockedProcReason ?? '未知原因'}`
+  }
+
+  private async stopOwnedProc(proc: AgentProcess, timeoutMs: number): Promise<boolean> {
+    if (this.proc !== proc) return !proc.isAlive()
+    this.beginProcStop(proc)
+    let error: unknown = null
+    try { await proc.kill(timeoutMs) }
+    catch (e) { error = e }
+    return this.finishProcStop(proc, error)
+  }
+
+  /** Settle the exact process-owned Codex persistence transaction without
+   * consulting mutable Session routing. Safe both before kill (barrier can
+   * finish) and after close (late verified flag/failure is observable). */
+  private async settleProcResumableState(proc: AgentProcess): Promise<string | null> {
+    let materializationError: string | null = null
+    const barrier = proc.conversationMaterializationBarrier?.()
+    if (barrier) {
+      try { await barrier }
+      catch (error) {
+        materializationError = `Codex 会话落盘确认失败: ${messageOf(error)}`
+      }
+    }
+    const lateFailure = proc.conversationMaterializationFailure?.()
+    if (lateFailure && proc.isConversationResumable?.() !== true) {
+      materializationError = `Codex 会话落盘确认失败: ${messageOf(lateFailure)}`
+    }
+    const persistenceError = this.persistResumableSessionId(false, proc, false)
+    return [materializationError, persistenceError].filter(Boolean).join('；') || null
   }
 
   acceptsAgentCapability(value: string): boolean {
@@ -2112,6 +2708,7 @@ export class Session {
 
   // ── Lifecycle ──────────────────────────────────────────────────────
   private resetFreshConversationState(): void {
+    this.daemonRestoreRequired = false
     this.turnCounter = 0
     this.pendingConversationMaterialization = null
     // clear/全新会话 → 旧锚配不上新会话,清空;base 写显式 {kind:'fresh'}
@@ -2127,12 +2724,62 @@ export class Session {
   }
 
   async start(opts: LifecycleProgressOpts = {}): Promise<boolean> {
+    // 嵌套调用(调用方已持 lease,形如 startColdUserTurn 的冷启动首轮)不再进
+    // runLifecycle 串行队列:该队列会 await 外层 lifecycle 的释放,嵌套 await
+    // 即与外层互等死锁。带 lease 直进 startUnlocked = 本地 main 的嵌套语义。
+    if (opts.lifecycleLease) return await this.startUnlocked(opts)
+    return await this.runLifecycle('start', () => this.startUnlocked(opts))
+  }
+
+  /** hi <name> is an explicit, one-start account override. Native errors remain authoritative. */
+  async startWithCodexAccount(accountId: string, opts: LifecycleProgressOpts = {}): Promise<boolean> {
+    return this.runLifecycle('hi-account', async () => {
+      codexAccounts.get(accountId)
+      if (this.selectedProvider !== 'codex' || this.currentTokenSource()?.codexApiProvider) {
+        if (this.proc?.isAlive()) await this.stopUnlocked('切换到 Codex', { ...opts, announce: false })
+        const source = getTokenSourceForAccount('codex-sub', accountId)
+        const model = source?.defaultModel || null
+        feishu.replaceTurnAnchors(this.sessionName, [], null, null)
+        feishu.bindSessionModelChecked(this.sessionName, 'codex', model, null, 'codex-sub')
+        this.pendingConversationMaterialization = null
+        this.selectedProvider = 'codex'
+        this.selectedTokenSourceId = 'codex-sub'
+        this.selectedModel = model
+        this.selectedEffort = null
+        this.lastSessionRef = feishu.getSessionResumeRef(this.sessionName, 'codex')
+        this.lastSessionId = this.lastSessionRef?.sessionId ?? null
+      }
+      if (this.selectedTokenSourceId !== 'codex-sub') {
+        feishu.bindSessionModelChecked(this.sessionName, 'codex', this.selectedModel, this.selectedEffort, 'codex-sub')
+        this.selectedTokenSourceId = 'codex-sub'
+      }
+      this.codexStartAccountOverride = accountId
+      try {
+        if (this.proc?.isAlive() && this.proc.provider === 'codex' && processCodexAccount(this.proc) === accountId
+          && this.proc.turnRetry?.reason !== 'quota') {
+          opts.onStatus?.(`✅ 正在使用「${codexAccounts.get(accountId).name}」`)
+          return true
+        }
+        return this.proc?.isAlive() ? await this.restartUnlocked(true, opts) : await this.startUnlocked(opts)
+      } finally { this.codexStartAccountOverride = undefined }
+    })
+  }
+
+  private async startUnlocked(opts: LifecycleProgressOpts = {}): Promise<boolean> {
     const lease = this.lifecycleLease('start', opts)
     if (!this.ownsLifecycle(lease)) return false
     if (this.hasPreservedWatchdogRecovery()) return false
     const provider = this.selectedProvider
     const announce = opts.announce ?? true
     const report = opts.onStatus
+    const blocked = this.blockedProcessMessage()
+    if (blocked) {
+      this.status = 'stopped'
+      report?.(`❌ ${blocked}`)
+      if (announce) await feishu.sendText(this.chatId, `❌ ${blocked}。请重试 stop/restart，或等待旧进程退出。`)
+      return false
+    }
+    if (this.proc && !this.proc.isAlive()) this.detachProc(this.proc)
     if (this.isRunning()) {
       if (this.proc?.provider === provider) {
         report?.(this.withModel(`✅ ${this.backendLabel()} 已运行`))
@@ -2149,8 +2796,13 @@ export class Session {
     else report?.('🔎 检查 Claude Code')
     if (
       provider === 'codex' &&
+      // 合并调和(取舍):登录预检取两侧豁免并集 —— 本地目录判定(自配 key 的
+      // API 档位免登录、requires_openai_auth 档位保留)∧ 上游来源级豁免(API
+      // 来源自带凭据免登录;codex-sub 走账号机制,由 native 报错权威)。
+      this.selectedTokenSourceId !== 'codex-sub' &&
       (!codexModelIsApiRoute(this.selectedModel) || codexModelRequiresOpenaiAuth(this.selectedModel)) &&
-      !feishu.isOpenAIChatGPTAuthenticated()
+      !this.currentTokenSource()?.codexApiProvider &&
+      !feishu.isOpenAIChatGPTAuthenticated(this.codexAccountId())
     ) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
@@ -2210,19 +2862,28 @@ export class Session {
       await this.discardLocalProcess(lease, proc)
       return false
     }
-    this.proc = proc
-    this.wireProc(proc)
-    const backend = this.backendLabel(provider)
-    const initWait = provider === 'claude'
+    this.attachProc(proc)
+    const backend = this.backendLabel()
+    // Claude can emit a synchronous startup error, so install its event
+    // waiter before sendInitialize. Codex instead returns the exact readiness
+    // Promise for initialize + thread/start; awaiting that transaction avoids
+    // a shorter Session timer killing the process before its method-specific
+    // RPC error can surface.
+    const claudeInitWait = this.selectedProvider === 'claude'
       ? this.waitForProcEarlyFailure(proc, CLAUDE_STARTUP_GRACE_MS)
-      : this.waitForProcInit(proc, 5000)
-    report?.(provider === 'claude'
+      : null
+    report?.(this.selectedProvider === 'claude'
       ? `⏳ 检查 ${backend} 启动`
       : `⏳ 等待 ${backend} init`)
-    // init handler 内的 checked 清理(clearResumeBindingForFreshCodex)可同步
-    // 抛出:捕获后走标准启动失败路径,不让状态写失败逃逸成未处理异常(4185808)。
+    let initialization: Promise<void> | undefined
     let initializeThrown: unknown = null
-    try { proc.sendInitialize() } catch (error) { initializeThrown = error }
+    try {
+      proc.sendInitialize()
+      initialization = proc.initializationPromise?.()
+    } catch (error) {
+      initialization = undefined
+      initializeThrown = error
+    }
     // Codex: 等 `system/init` 落地再认定 ready —— sendInitialize 只把 RPC
     // 写进 app-server 之前 proc.sessionId 还是 null,这时候 showConsole()
     // 看到 null 会 fallback 到磁盘上**上一次**会话的 lastSessionId,
@@ -2235,7 +2896,15 @@ export class Session {
     // Claude wrapper 内同步暴露的启动失败会被错过。
     const init = initializeThrown
       ? { state: 'error' as const, error: initializeThrown }
-      : await initWait
+      : this.selectedProvider === 'claude'
+        ? await claudeInitWait!
+        : await this.waitForCodexInitialization(
+            this.requireCodexInitializationPromise(initialization),
+            () => {
+              log(`session "${this.sessionName}": codex init still pending after ${CODEX_INIT_NOTICE_MS / 1000}s`)
+              report?.(this.withModel(`⏳ 仍在等待 ${backend} init 确认`))
+            },
+          )
     if (!this.ownsLifecycle(lease) || this.proc !== proc) {
       await this.discardLocalProcess(lease, proc)
       return false
@@ -2243,15 +2912,13 @@ export class Session {
     if (init.state === 'error' || init.state === 'exit') {
       const detail = init.error ? messageOf(init.error) : init.state
       log(`session "${this.sessionName}": ${this.selectedProvider} init failed: ${detail}`)
-      report?.(`❌ ${backend} 启动失败: ${detail}`)
-      if (announce) {
-        await feishu.sendText(this.chatId, `❌ ${backend} 启动失败: ${detail}`)
-        if (!this.ownsLifecycle(lease) || this.proc !== proc) {
-          await this.discardLocalProcess(lease, proc)
-          return false
-        }
-      }
-      await this.discardLocalProcess(lease, proc)
+      const stopConfirmed = await this.stopOwnedProc(proc, 1000)
+      const cleanup = stopConfirmed
+        ? ''
+        : `；进程终止未确认: ${this.blockedProcReason ?? '未知原因'}`
+      const failure = `❌ ${backend} 启动失败: ${detail}${cleanup}`
+      report?.(failure)
+      if (announce) await feishu.sendText(this.chatId, failure)
       if (!this.ownsLifecycle(lease)) return false
       this.clearCodexProcessActivityState()
       this.status = 'stopped'
@@ -2259,10 +2926,38 @@ export class Session {
       return false
     }
     if (init.state === 'timeout') {
-      log(`session "${this.sessionName}": ${provider} init wait timeout (5s)`)
-      report?.(this.withModel(this.withWorktreeInstructionNotice(`⏳ ${backend} 已启动，init 确认超时`)))
+      log(`session "${this.sessionName}": ${this.selectedProvider} init wait timeout (${CODEX_INIT_TIMEOUT_MS / 1000}s)`)
+      const stopConfirmed = await this.stopOwnedProc(proc, 1000)
+      const cleanup = stopConfirmed
+        ? ''
+        : `；进程终止未确认: ${this.blockedProcReason ?? '未知原因'}`
+      const message = `❌ ${backend} 启动超时: ${CODEX_INIT_TIMEOUT_MS / 1000} 秒内初始化事务未完成${cleanup}`
+      report?.(message)
+      if (announce) await feishu.sendText(this.chatId, message)
+      this.status = 'stopped'
+      this.opts.onLifecycleChange?.()
+      return false
+    }
+    if (this.proc !== proc || !proc.isAlive()) {
+      const message = `${backend} 启动期间已退出`
+      log(`session "${this.sessionName}": ${message}`)
+      report?.(`❌ ${message}`)
+      if (announce) await feishu.sendText(this.chatId, `❌ ${message}`)
+      this.detachProc(proc)
+      this.status = 'stopped'
+      this.opts.onLifecycleChange?.()
+      return false
     }
 
+    if (init.state === 'waiting_quota') {
+      this.status = 'starting'
+      this.startedAt = Date.now()
+      this.opts.onLifecycleChange?.()
+      report?.('⏳ 账号额度用尽 · 自动等待恢复，可用后继续')
+      if (announce) await feishu.sendCard(this.chatId, codexAccountCard({ phase: 'checking', title: '等待额度恢复',
+        message: '额度恢复后自动继续', hint: 'stop 可取消等待' }))
+      return true
+    }
     if (announce) {
       const modelLine = this.modelLine()
       await feishu.sendText(this.chatId, [
@@ -2277,33 +2972,45 @@ export class Session {
     this.clearPendingSpawn(lease, proc)
     this.status = 'idle'
     this.startedAt = Date.now()
+    this.daemonRestoreRequired = false
     this.opts.onLifecycleChange?.()
     report?.(this.withModel(this.withWorktreeInstructionNotice(`✅ ${this.backendLabel()} 已就绪`)))
     return true
   }
 
-  private async waitForProcInit(
-    proc: AgentProcess,
-    timeoutMs: number,
-  ): Promise<{ state: 'init' | 'error' | 'exit' | 'timeout'; error?: unknown }> {
+  private requireCodexInitializationPromise(value: Promise<void> | undefined): Promise<void> {
+    if (!value || typeof value.then !== 'function') {
+      return Promise.reject(new Error('Codex process did not expose its initialization transaction'))
+    }
+    return Promise.resolve(value)
+  }
+
+  private async waitForCodexInitialization(
+    initialization: Promise<void>,
+    onStillWaiting?: () => void,
+  ): Promise<{ state: 'init' | 'error' | 'timeout' | 'waiting_quota'; error?: unknown }> {
     return await new Promise(resolve => {
       let settled = false
-      const finish = (state: 'init' | 'error' | 'exit' | 'timeout', error?: unknown) => {
+      const finish = (state: 'init' | 'error' | 'timeout' | 'waiting_quota', error?: unknown) => {
         if (settled) return
         settled = true
-        clearTimeout(timer)
-        proc.off('init', onInit)
-        proc.off('error', onError)
-        proc.off('exit', onExit)
+        clearTimeout(noticeTimer)
+        clearTimeout(timeoutTimer)
         resolve({ state, error })
       }
-      const timer = setTimeout(() => finish('timeout'), timeoutMs)
-      const onInit = () => finish('init')
-      const onError = (e: unknown) => finish('error', e)
-      const onExit = (e: unknown) => finish('exit', e)
-      proc.once('init', onInit)
-      proc.once('error', onError)
-      proc.once('exit', onExit)
+      const noticeTimer = setTimeout(() => {
+        if (settled) return
+        try { onStillWaiting?.() }
+        catch (error) { finish('error', error) }
+      }, CODEX_INIT_NOTICE_MS)
+      const timeoutTimer = setTimeout(() => {
+        finish('timeout', new Error(`codex init timed out after ${CODEX_INIT_TIMEOUT_MS / 1000}s`))
+      }, CODEX_INIT_TIMEOUT_MS)
+      void initialization.then(
+        () => finish('init'),
+        error => finish('error', error),
+      )
+      void this.proc?.quotaWaitPromise?.().then(() => finish('waiting_quota'), error => finish('error', error))
     })
   }
 
@@ -2332,36 +3039,6 @@ export class Session {
     })
   }
 
-  private async waitForProcResumeInit(
-    proc: AgentProcess,
-    onStillWaiting: () => void,
-  ): Promise<{ state: 'init' | 'error' | 'exit' | 'timeout'; error?: unknown }> {
-    return await new Promise(resolve => {
-      let settled = false
-      const finish = (state: 'init' | 'error' | 'exit' | 'timeout', error?: unknown) => {
-        if (settled) return
-        settled = true
-        clearTimeout(noticeTimer)
-        clearTimeout(timeoutTimer)
-        proc.off('init', onInit)
-        proc.off('error', onError)
-        proc.off('exit', onExit)
-        resolve({ state, error })
-      }
-      const noticeTimer = setTimeout(() => {
-        if (!settled) onStillWaiting()
-      }, RESUME_INIT_NOTICE_MS)
-      const timeoutTimer = setTimeout(() => {
-        finish('timeout', new Error(`resume init timed out after ${RESUME_INIT_TIMEOUT_MS / 1000}s`))
-      }, RESUME_INIT_TIMEOUT_MS)
-      const onInit = () => finish('init')
-      const onError = (e: unknown) => finish('error', e)
-      const onExit = (e: unknown) => finish('exit', new Error(formatProcessExitDetail(e)))
-      proc.once('init', onInit)
-      proc.once('error', onError)
-      proc.once('exit', onExit)
-    })
-  }
 
   /** Drop every ⏳ OneSecond reaction this session is currently holding
    * on user chat messages, then empty the two tracking maps. Used by
@@ -2412,30 +3089,6 @@ export class Session {
     const done = this.openingTurnDone
     this.openingTurnDone = null
     done?.resolve()
-  }
-
-  /** Wait for a same-process card-open transaction to finish. Process
-   * replacement/death fails this wait, preserving the existing "new process
-   * supersedes old open" lifecycle while prohibiting two opens in one process
-   * generation from migrating/rendering concurrently.(上游 7c14677
-   * waitForTurnOpenSlot) */
-  private async waitForTurnOpenSlot(proc: AgentProcess): Promise<boolean> {
-    while (this.openingTurnOwner) {
-      const done = this.openingTurnDone
-      if (!done) return false
-      await done.promise
-      if (this.proc !== proc || !proc.isAlive()) return false
-    }
-    return this.proc === proc && proc.isAlive()
-  }
-
-  /** 等全部在途 turn close 落地(ff44afb waitForTurnCloses 的哨兵化最小形,
-   * 04-05):while 循环兼收快照后新登记的 close;哨兵只 resolve,错误不在此
-   * 二次上抛(close 调用点已各自捕获/记录)。 */
-  private async waitForTurnCloses(): Promise<void> {
-    while (this.turnCloseInflight.size > 0) {
-      await Promise.allSettled([...this.turnCloseInflight])
-    }
   }
 
   discardQueuedHumanWork(reason: string): void {
@@ -2511,7 +3164,7 @@ export class Session {
     this.pendingUserMessageCount = 0
     // Release stale ⏳ reactions left on the abandoned batch's chat
     // messages. addReaction callbacks still in flight will fall through
-    // to the orphan path in onUserMessage's trackReaction helper.
+    // to the orphan path in onUserMessage's trackQueuedReaction helper.
     for (const [m, rid] of this.pendingReactionIds) {
       if (rid) void feishu.deleteReaction(m, rid)
     }
@@ -2521,8 +3174,6 @@ export class Session {
   async stop(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
     const lease = this.lifecycleLease('stop', opts)
     if (!this.ownsLifecycle(lease)) return
-    const announce = opts.announce ?? true
-    const report = opts.onStatus
     this.discardPreservedWatchdogRecovery(`stop: ${reason}`)
     this.clearWatchdogRuntime(`stop: ${reason}`)
     this.toolFailureLoopAction = null
@@ -2530,18 +3181,61 @@ export class Session {
     this.discardQueuedHumanWork('stop')
     // stop ends any in-session GSD execution signal (panel fine-progress gate).
     sessionGsd.clearGsdExecution(this)
-    const stoppedAgy = await this.stopAgyTask(`🛑 ${reason}`)
-    await this.cancelAgentRuns(reason)
+    // 同上:带 lease 的嵌套 stop(回滚事务)直进,避免与外层 lifecycle 互等。
+    // stopLifecycleActive 覆盖整个执行窗口(kill/agy 等待在内):在途消息直进
+    // (见字段注释 + onUserMessage 豁免),stop 自身的 discard 照常吞掉它们。
+    this.stopLifecycleActive++
+    try {
+      if (opts.lifecycleLease) {
+        await this.stopUnlocked(reason, { ...opts, lifecycleLease: lease })
+        return
+      }
+      await this.runLifecycle('stop', () => this.stopUnlocked(reason, { ...opts, lifecycleLease: lease }))
+    } finally {
+      this.stopLifecycleActive--
+    }
+  }
+
+  cancelFileDeliveries(reason: string): boolean {
+    let cancelled = false
+    for (const delivery of this.fileDeliveries) cancelled = delivery.cancel(reason) || cancelled
+    return cancelled
+  }
+
+  private async stopUnlocked(reason = '已终止', opts: LifecycleProgressOpts = {}): Promise<void> {
+    this.cancelFileDeliveries(reason)
+    const lease = this.lifecycleLease('stop', opts)
+    if (!this.ownsLifecycle(lease)) return
+    const announce = opts.announce ?? true
+    const report = opts.onStatus
+    this.daemonRestoreRequired = false
+    const proc = this.proc
+    // Close admission before delegated cancellation can await network/process
+    // cleanup. The old main process must not create replacements during it.
+    if (proc) this.beginProcStop(proc)
+    let stoppedAgy = false
+    let cancellationError: unknown = null
+    try {
+      stoppedAgy = await this.stopAgyTask(`🛑 ${reason}`)
+      if (stoppedAgy) report?.(`✅ ${reason}`)
+      await this.cancelAgentRuns(reason)
+    } catch (error) { cancellationError = error }
     if (!this.ownsLifecycle(lease)) return
     this.discardQueuedHumanWork('stop')
-    if (!this.proc) {
+    if (!proc) {
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
-      report?.(stoppedAgy ? `✅ ${reason}` : '⚪ session 当前未运行')
-      if (announce && !stoppedAgy) await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
+      if (cancellationError) throw cancellationError
+      report?.('⚪ session 当前未运行')
+      if (announce) await feishu.sendText(this.chatId, `⚪ session "${this.sessionName}" 当前未运行`)
       return
     }
-    report?.(`🛑 停止 ${this.backendLabel(this.proc.provider)}`)
+    // Close the tiny materialization→stop window: Codex sets its durable flag
+    // before emitting conversation_materialized, so an immediately following
+    // stop can still persist the exact process-owned resume point.
+    let stopResumeError = this.persistResumableSessionId(false, proc, false)
+    let stopMaterializationError: string | null = null
+    report?.(`🛑 停止 ${this.backendLabel(proc.provider)}`)
     // Flip lifecycle state SYNCHRONOUSLY before awaiting kill — daemon's
     // SIGTERM cleanup snapshots `isRunning()` and if we're still mid-
     // `proc.kill()` await it'll see proc!=null and write us into the
@@ -2550,15 +3244,43 @@ export class Session {
     // race (bug observed 2026-05-15: `kill` immediately followed by
     // `systemctl restart` revived the killed session on boot).
     log(`session "${this.sessionName}": stop (${reason})`)
-    const proc = this.proc
-    this.proc = null
-    this.agentCapability = null
+    this.invalidateTurnOpen()
     this.stopFooterStatus(this.currentTurn)
-    this.currentTurn = null
+    if (this.currentTurn) {
+      void this.closeTurnCard(`🛑 ${reason}`).catch(e => {
+        log(`session "${this.sessionName}": stop current main-card close failed: ${messageOf(e)}`)
+      })
+    }
+    const turnClose = this.waitForTurnCloses()
+      .catch(e => log(`session "${this.sessionName}": stop main-card close failed: ${messageOf(e)}`))
+    this.beginProcStop(proc)
+    this.status = 'stopped'
+    const lifecycleErrors: unknown[] = []
+    // Persist the user's stop intent before the first kill await. If the
+    // daemon is hard-killed while the backend exits, the alive marker must
+    // already exclude this Session.
+    try { this.opts.onLifecycleChange?.() }
+    catch (e) {
+      lifecycleErrors.push(e)
+      log(`session "${this.sessionName}": stop intent lifecycle write failed: ${messageOf(e)}`)
+    }
+    const materializationBarrier = proc.conversationMaterializationBarrier?.()
+    if (materializationBarrier) {
+      try { await materializationBarrier }
+      catch (error) {
+        stopMaterializationError = `Codex 会话落盘确认失败: ${messageOf(error)}`
+      }
+      stopResumeError = this.persistResumableSessionId(false, proc, false)
+    }
+    this.clearMultiMsgBuffer('stop')
+    this.pendingUserMessageCount = 0
+    this.pendingMidTurnMsgs = []
+    this.pendingTurnInputs = []
+    this.lastUserOpenId = ''
+    this.releaseAllReactions()
     this.initCount = 0
-    this.clearTurnOpening()
+    this.invalidateTurnOpen()
     this.bgResumePending = false
-    this.sawResultWhileOpening = false
     // 用户主动停止:孤儿缓冲随轮作废,不兜底推送。
     this.discardOrphanAssistant()
     this.pendingAsks.clear()
@@ -2567,31 +3289,58 @@ export class Session {
     this.currentTurnUsageBaseline = null
     this.currentTurnUsageBaselineKnown = false
     this.usageTotalsSeedUnknown = false
-    this.status = 'stopped'
-    this.opts.onLifecycleChange?.()
-    // ec149d7 主题 I 行为对齐:kill 超时/失败(01-09 起如实抛出)不得跳过后续
-    // 确定性清理(resetBackgroundTasks / 回执)。进程已在 kill 前脱管
-    // (this.proc=null → 事件被 stale guard 拦截、alive marker 不含它),这里
-    // 捕获错误、完成清理,用 ❌ 回执替代 ✅ —— 不伪造成功。不向调用方抛:
-    // 本地 stop() 契约为 resolve(bk/bye/runCommand 等调用方无 rejection 分支),
-    // 上游同 hunk 的 throw 依赖其调用方在同一提交内的配套改造,机制不搬。
     let killError: unknown = null
     try { await proc.kill() }
     catch (e) { killError = e }
-    // confirmed stop 收尾:延迟锚随停止作废(4185808 finishProcStop 等效位;
-    // kill 未确认时进程已脱管无法 flush,丢弃同样安全)。
-    this.discardPendingCodexTurnAnchors(proc, 'confirmed process stop')
+    const lateMaterializationFailure = proc.conversationMaterializationFailure?.()
+    if (lateMaterializationFailure && proc.isConversationResumable?.() !== true) {
+      stopMaterializationError = `Codex 会话落盘确认失败: ${messageOf(lateMaterializationFailure)}`
+    }
+    // A turn may materialize while SIGTERM is in flight. wireProc deliberately
+    // ignores ordinary events once stopping begins, but Codex flips its
+    // verified resumable flag before emitting the event; persist that exact
+    // owned process once more before detach.
+    stopResumeError = this.persistResumableSessionId(false, proc, false)
+    // Card cleanup is independent from process ownership. Never let a
+    // Feishu/CardKit failure skip finishProcStop: that would leave
+    // stoppingProc set without blockedProc and turn later inputs into a black
+    // hole whose backend events are deliberately ignored.
+    const cleanupResults = await Promise.allSettled([this.resetBackgroundTasks(lease), turnClose])
+    const cleanupErrors = cleanupResults
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map(result => result.reason)
+    for (const error of cleanupErrors) {
+      log(`session "${this.sessionName}": stop terminal cleanup failed: ${messageOf(error)}`)
+    }
+    const confirmed = this.finishProcStop(proc, killError)
+    try { this.opts.onLifecycleChange?.() }
+    catch (e) {
+      lifecycleErrors.push(e)
+      log(`session "${this.sessionName}": stop final lifecycle write failed: ${messageOf(e)}`)
+    }
     if (!this.ownsLifecycle(lease)) return
-    // 后台任务随轮作废:翻 killed 终态 + 活卡沉降历史墓碑,否则 SDK 一死 entry
-    // 永远卡 running,refresh tick 还在伪造运行时长。
-    await this.resetBackgroundTasks(lease)
-    if (!this.ownsLifecycle(lease)) return
-    if (killError) {
-      const detail = messageOf(killError)
-      log(`session "${this.sessionName}": stop kill unconfirmed: ${detail}`)
-      report?.(`❌ 停止未确认: ${detail}`)
-      if (announce) await feishu.sendText(this.chatId, `❌ ${this.backendLabel(proc.provider)} 停止未确认: ${detail}(进程已脱管,不参与恢复)`)
-      return
+    // 上游 stop 契约(合并吸收,替代本地旧「resolve + ❌ 回执」):失败必须 reject。
+    // 冻结调用方 session-commands.ts kill 命令 / temp-session-runtime.ts 均已按
+    // rejection 组装「未确认终止/会话已阻断/停止收尾失败」告警(上游 16923/16992/
+    // 17062/17085/17110 同断言),resolve 会把告警吞成成功回执。失败时进程保留为
+    // blockedProc(见 finishProcStop),shouldRevive() 据此排除 revive —— 本地
+    // 「停止后 alive marker 不含它」语义由 blockedProc 承担,不再靠 proc=null 伪造。
+    const failures: unknown[] = [
+      ...(cancellationError ? [cancellationError] : []),
+      ...(killError ? [killError] : []),
+      ...(!confirmed && !killError ? [new Error(this.blockedProcReason ?? 'process stop unconfirmed')] : []),
+      ...cleanupErrors,
+      ...lifecycleErrors,
+      ...(stopResumeError ? [new Error(stopResumeError)] : []),
+      ...(stopMaterializationError && proc.isConversationResumable?.() !== true
+        ? [new Error(stopMaterializationError)]
+        : []),
+    ]
+    if (failures.length > 0) {
+      const detail = failures.map(messageOf).join('; ')
+      log(`session "${this.sessionName}": stop finished with failures: ${detail}`)
+      if (failures.length === 1) throw failures[0]
+      throw new AggregateError(failures, `stop failed: ${detail}`)
     }
     report?.(`✅ ${reason}`)
     if (announce) await feishu.sendText(this.chatId, `🔴 ${reason} (session: ${this.sessionName})`)
@@ -2602,6 +3351,34 @@ export class Session {
     // onResumeInvalidated:上游 restartUnlocked 第三参的本地 opts 字段承接(挂账 #5
     // 接线)——restart 内 invalidateMissingCodexResume 确认旧 id 无 rollout 时回调,
     // rollbackTo restore 据此走清空分支不绑回幽灵 id。
+    opts: LifecycleProgressOpts & { onResumeInvalidated?: (sessionId: string) => void } = {},
+  ): Promise<boolean> {
+    // 同上:带 lease 的嵌套 restart(watchdog / 回滚事务)直进,避免
+    // runLifecycle 队列与外层 lifecycle 互等。
+    if (opts.lifecycleLease) return await this.restartUnlocked(resume, opts)
+    return await this.runLifecycle('restart', () => this.restartUnlocked(resume, opts))
+  }
+
+  requireDaemonRestore(): void {
+    this.daemonRestoreRequired = true
+  }
+
+  async restoreAfterDaemonRestart(): Promise<boolean> {
+    return await this.runLifecycle('daemon-restore', async () => {
+      this.requireDaemonRestore()
+      if (!this.lastSessionRef && !this.pendingMaterializationLaunch()) {
+        const message = '❌ daemon 重启后没有可用的恢复点。请发送 rs 选择历史会话，或 hi 明确启动新会话。'
+        this.status = 'stopped'
+        this.opts.onLifecycleChange?.()
+        await feishu.sendText(this.chatId, message)
+        return false
+      }
+      return await this.restartUnlocked(true)
+    })
+  }
+
+  private async restartUnlocked(
+    resume = false,
     opts: LifecycleProgressOpts & { onResumeInvalidated?: (sessionId: string) => void } = {},
   ): Promise<boolean> {
     const strictResume = resume && opts.requireResumeSession === true
@@ -2641,7 +3418,10 @@ export class Session {
               : null))
           : null)
     const provider = resumeIdentity?.provider ?? this.selectedProvider
-    const prevSessionId = resumeIdentity?.threadId ?? null
+    // let:上游 restart 前置密封的 refreshMaterializedCodexResume 在 kill 前/后
+    // 会以进程自证落盘的 resume 点刷新这两个值(kill 窗口内 materialize 的轮
+    // 仍以最新 thread 续卡/续起)。
+    let prevSessionId = resumeIdentity?.threadId ?? null
     if (strictResume && (!recovery || !prevSessionId)) {
       const message = '❌ 自动恢复失败:没有可恢复的 thread'
       opts.onStatus?.(message)
@@ -2705,12 +3485,12 @@ export class Session {
         return false
       }
     }
-    const prevThreadLabel = prevSessionId ? prevSessionId.slice(0, 8) : ''
+    let prevThreadLabel = prevSessionId ? prevSessionId.slice(0, 8) : ''
     let statusCard: StatusCardHandle | null = null
     if (!report && announce && resume && prevSessionId) {
       const initialStatus = this.proc
         ? this.withModel(`🔁 重启 ${this.backendLabel(this.proc.provider)}`)
-        : this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}…`)
+        : this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}`)
       statusCard = await this.openStatusCard('restart', initialStatus)
       if (!this.ownsLifecycle(lease)) return false
       if (statusCard) report = status => this.setStatusCard(statusCard, status)
@@ -2719,28 +3499,113 @@ export class Session {
     const closeInternalStatusCard = async (finalStatus: string): Promise<void> => {
       if (statusCard) await this.closeStatusCard(statusCard, finalStatus)
     }
+    // ── 上游 restart 前置密封(4185808/ec149d7 簇 4「会话生命周期可靠性」)──
+    // ① 旧进程是否仍有会话工作:决定「恢复点尚未落盘」时能否安全中止 kill
+    //    (有在途工作就没有保进程的原位语义,只能停掉)。必须在任何队列清理前快照。
+    const hadActiveConversationWork = Boolean(
+      this.currentTurn
+      || this.openingTurn
+      || this.pendingUserMessageCount > 0
+      || this.pendingMidTurnMsgs.length > 0
+      || this.pendingTurnInputs.length > 0
+      || cards.hasActiveBgTask(this.backgroundTasks)
+      || this.pendingBgTasks.length > 0,
+    )
+    // ② 恢复点密封:beginProcStop 关闭事件门后、SIGTERM 前后各刷新一次进程自证
+    //    落盘的 resume 点(Codex 先翻 durable flag 再 emit,而 wireProc 在
+    //    stopping 期间故意忽略普通事件 —— 只有这里能把窗口内 materialize 的
+    //    轮冻结成恢复点)。resumeRefreshError 非空 = 恢复点未安全落盘。
+    //    本地适配:仅当 lastSessionRef 与 resumeIdentity provider 一致才回填
+    //    prevSessionId(本地多 provider 路由下 lastSessionRef 可能是别的后端)。
+    let resumeRefreshError: string | null = null
+    const refreshMaterializedCodexResume = (current: AgentProcess | null = this.proc): void => {
+      if (
+        !resume
+        || explicitLaunch
+        || current?.provider !== 'codex'
+        || current.isConversationResumable?.() !== true
+      ) return
+      resumeRefreshError = this.persistResumableSessionId(false, current, false)
+      if (this.lastSessionRef?.provider === provider) {
+        prevSessionId = this.lastSessionRef.sessionId
+        prevThreadLabel = prevSessionId.slice(0, 8)
+      }
+    }
     // 主动重启:孤儿缓冲随轮作废,不兜底推送。必须在 kill 之前丢弃 ——
     // 否则 kill 触发的 exit 处理器会抢先把缓冲当作"进程崩溃残留"兜底推出去,
-    // 违背 restart 的作废语义。null this.proc 也放到 kill 之前,让 exit 走
-    // stale-proc 早退,不再重复兜底(与 stop() 同一模式)。
+    // 违背 restart 的作废语义。旧 proc 不再预置 null(上游形态):beginProcStop
+    // 的 stoppingProc 门让 killed 后的事件走「stopping exit」早退(stop() 同一
+    // 模式),脱管统一由 finishProcStop/detachProc 判定 —— kill 未确认时进程
+    // 保留为 blockedProc,而不是伪造成已脱管。
     this.bgResumePending = false
-    this.sawResultWhileOpening = false
+    this.invalidateTurnOpen()
     this.discardOrphanAssistant()
-    // ec149d7 主题 I 行为对齐:kill 如实抛出(01-09)不得跳过下方轮作废清理;
-    // 错误捕获后在清理收敛处统一判定 —— stop 未确认时不 spawn 新进程(上游
-    // 同语义:未确认死透的旧进程上叠 resume 重启,存在同 thread 双写风险)。
+    // ec149d7 主题 I 行为对齐:kill 与取消如实抛出(01-09)不得跳过下方轮作废
+    // 清理;错误捕获后在清理收敛处统一判定 —— stop 未确认时不 spawn 新进程
+    // (上游同语义:未确认死透的旧进程上叠 resume 重启,存在同 thread 双写风险)。
     let killError: unknown = null
-    let killedProvider: AgentProvider | null = null
+    let cancellationError: unknown = null
+    let stoppedProc: AgentProcess | null = null
+    let stoppedProvider: AgentProvider | null = null
     if (this.proc) {
-      report?.(`🛑 停止当前 ${this.backendLabel(this.proc.provider)}`)
       const proc = this.proc
-      killedProvider = proc.provider
-      this.proc = null
+      report?.(`🛑 停止当前 ${this.backendLabel(proc.provider)}`)
+      stoppedProc = proc
+      stoppedProvider = proc.provider
+      // Seal the old owner before awaiting materialization. Otherwise a result
+      // in this window can drain queued user input into the branch we are
+      // about to kill, then restart clears that queue as if it never ran.
+      const previousCapability = this.agentCapability
+      this.beginProcStop(proc)
+      try { await this.cancelAgentRuns('会话正在重启') }
+      catch (error) { cancellationError = error }
+      const materializationBarrier = proc.conversationMaterializationBarrier?.()
+      if (materializationBarrier) {
+        try { await materializationBarrier }
+        catch (error) {
+          resumeRefreshError = `Codex 会话落盘确认失败: ${messageOf(error)}`
+        }
+      }
+      // Freeze any verified materialization after the old owner's event gate
+      // has closed but before the process is signalled.
+      refreshMaterializedCodexResume(proc)
+      if (
+        resume
+        && !explicitLaunch
+        && resumeRefreshError
+        && !cancellationError
+        && !hadActiveConversationWork
+        && proc.isAlive()
+      ) {
+        // 恢复点未安全落盘 + 无在途工作:不 kill,旧进程原位保留(上游 15933
+        // 同款)—— 宁可留在旧会话,也不在无恢复点的情况下杀掉唯一进程。
+        if (this.proc === proc && this.stoppingProc === proc) {
+          this.stoppingProc = null
+          this.agentCapability = previousCapability
+        }
+        this.status = statusBeforeResumeValidation
+        const finalStatus = `❌ ${this.backendLabel(proc.provider)} 恢复点尚未安全落盘，已保留当前进程: ${resumeRefreshError}`
+        log(`session "${this.sessionName}": abort restart before kill: ${resumeRefreshError}`)
+        report?.(finalStatus)
+        if (announceText) await feishu.sendText(this.chatId, finalStatus)
+        await closeInternalStatusCard(finalStatus)
+        return false
+      }
       try { await proc.kill() }
       catch (e) { killError = e }
       // restart 作废旧进程:其延迟锚一并作废(挂账 #3 收尾口)。
       this.discardPendingCodexTurnAnchors(proc, 'restart discarded process')
-      if (!this.ownsLifecycle(lease)) return false
+      const lateMaterializationFailure = proc.conversationMaterializationFailure?.()
+      if (lateMaterializationFailure && proc.isConversationResumable?.() !== true) {
+        resumeRefreshError = `Codex 会话落盘确认失败: ${messageOf(lateMaterializationFailure)}`
+      }
+      // Also close the beginStop→process-exit window (see stopUnlocked).
+      refreshMaterializedCodexResume(proc)
+    } else {
+      // A prior stop can leave a delegated process whose exit was not yet
+      // confirmed. Do not launch a new owner until that cleanup succeeds.
+      try { await this.cancelAgentRuns('会话正在重启') }
+      catch (error) { cancellationError = error }
     }
     this.stopFooterStatus(this.currentTurn)
     if (!opts.preserveCurrentTurn) {
@@ -2766,29 +3631,47 @@ export class Session {
     this.currentTurnUsageBaselineKnown = false
     // 后台任务随轮作废:旧 proc 的活跃 entry 不能带进新会话(会跨会话「复活」
     // 到新卡)。翻 killed 终态 + 活卡沉降,在 spawn 新 proc 之前清干净。
-    await this.resetBackgroundTasks(lease)
-    if (!this.ownsLifecycle(lease)) return false
     // 在途 turn close 等待(ff44afb turnCloseInflight,04-05 甄别红例最小集):
     // close 可能已同步摘除 currentTurn 但 flush/终态写仍在途——spawn 前等全部
     // 落地,防旧卡终态写与新进程新卡交错(红例:restart waits for a close that
     // already removed currentTurn before spawning)。
-    await this.waitForTurnCloses()
-    if (!this.ownsLifecycle(lease)) return false
-    if (killError) {
-      // stop 失败恢复 pending(4185808 stopFailures 同位):进程没停成,头部取消的
-      // prepared fork 恢复原值——不留「磁盘已清、进程还活」的半取消态。
-      let pendingRestoreFailure: string | null = null
-      if (cancelledPending && this.ownsLifecycle(lease)) {
-        try {
-          feishu.setPendingConversationLaunchChecked(this.sessionName, cancelledPending)
-          this.pendingConversationMaterialization = cancelledPending
-        } catch (error) {
-          pendingRestoreFailure = `pendingRestore=${messageOf(error)}`
-        }
+    const turnClose = this.waitForTurnCloses()
+      .catch(e => log(`session "${this.sessionName}": restart main-card close failed: ${messageOf(e)}`))
+    const cleanupResults = await Promise.allSettled([this.resetBackgroundTasks(lease), turnClose])
+    const cleanupErrors = cleanupResults
+      .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+      .map(result => result.reason)
+    for (const error of cleanupErrors) {
+      log(`session "${this.sessionName}": restart terminal cleanup failed: ${messageOf(error)}`)
+    }
+    // 进程所有权收敛:cleanup/turnClose 失败不得跳过 finishProcStop,否则
+    // stoppingProc 悬挂把后续输入变成黑洞(上游 stopFailures 同位次序)。
+    const stopConfirmed = stoppedProc ? this.finishProcStop(stoppedProc, killError) : true
+    const stopFailures = [
+      ...(cancellationError ? [`agents=${messageOf(cancellationError)}`] : []),
+      ...(killError ? [`kill=${messageOf(killError)}`] : []),
+      ...(!stopConfirmed && !killError ? [`kill=${this.blockedProcReason ?? 'process stop unconfirmed'}`] : []),
+      ...cleanupErrors.map(error => `cleanup=${messageOf(error)}`),
+      ...(resumeRefreshError ? [`resume=${resumeRefreshError}`] : []),
+    ]
+    // stop 失败恢复 pending(4185808 stopFailures 同位):进程没停成,头部取消的
+    // prepared fork 恢复原值——不留「磁盘已清、进程还活」的半取消态。
+    if (stopFailures.length > 0 && cancelledPending) {
+      try {
+        feishu.setPendingConversationLaunchChecked(this.sessionName, cancelledPending)
+        this.pendingConversationMaterialization = cancelledPending
+      } catch (error) {
+        stopFailures.push(`pendingRestore=${messageOf(error)}`)
       }
-      const finalStatus = `❌ 旧 ${this.backendLabel(killedProvider ?? undefined)} 进程停止未确认: ${messageOf(killError)}${pendingRestoreFailure ? `; ${pendingRestoreFailure}` : ''}`
-      log(`session "${this.sessionName}": restart aborted, kill unconfirmed: ${messageOf(killError)}`)
-      if (recovery) this.markPreservedWatchdogRecoveryFailed(recovery, lease)
+    }
+    if (stopFailures.length > 0) {
+      const finalStatus = `❌ 旧 ${this.backendLabel(stoppedProvider ?? undefined)} 进程停止/清理失败: ${stopFailures.join('; ')}`
+      log(`session "${this.sessionName}": restart aborted, old process stop/cleanup failed: ${stopFailures.join('; ')}`)
+      // 旧分支只在旧进程收不口(kill 未确认/取消失败)时烧掉 watchdog 事务;
+      // cleanup-only 失败保留 recovery 供重试(本地语义收窄,防误判)。
+      if (recovery && (killError || cancellationError)) {
+        this.markPreservedWatchdogRecoveryFailed(recovery, lease)
+      }
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
       report?.(finalStatus)
@@ -2799,11 +3682,12 @@ export class Session {
       await closeInternalStatusCard(finalStatus)
       return false
     }
+    if (!this.ownsLifecycle(lease)) return false
     if (resume && prevSessionId) {
       if (recovery && !this.ownsPreservedWatchdogRecovery(recovery, lease)) return false
       this.status = 'starting'
       this.usageTotalsSeedUnknown = true
-      report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}…`))
+      report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}`))
       let proc: AgentProcess
       try {
         // legacy(cwd:null)已在前置 ③ 升级(前置不 kill);此处 lastSessionRef
@@ -2858,20 +3742,38 @@ export class Session {
         return ownedReplacement && this.ownsLifecycle(lease) && this.proc === null
       }
       const backend = this.backendLabel(provider)
-      const initWait = provider === 'claude'
+      const claudeInitWait = provider === 'claude'
         ? this.waitForProcEarlyFailure(proc, CLAUDE_STARTUP_GRACE_MS)
-        : this.waitForProcResumeInit(proc, () => {
-            log(`session "${this.sessionName}": ${provider} resume init still pending after ${RESUME_INIT_NOTICE_MS / 1000}s`)
-            report?.(this.withModel(`⏳ 仍在等待 ${backend} init 确认 thread=${prevThreadLabel}…`))
-          })
+        : null
       report?.(provider === 'claude'
         ? `⏳ 检查 ${backend} 恢复启动`
         : `⏳ 等待 ${backend} init 确认`)
+      let initialization: Promise<void> | undefined
       let initializeThrown: unknown = null
-      try { proc.sendInitialize() } catch (error) { initializeThrown = error }
+      try {
+        proc.sendInitialize()
+        initialization = proc.initializationPromise?.()
+      } catch (error) {
+        initialization = undefined
+        initializeThrown = error
+      }
+      // 合并吸收(上游 session 恢复优化,2162-2183 同位):codex/dsh 恢复路径改走
+      // waitForCodexInitialization —— 等 initialize+thread/start 事务 promise(含
+      // quotaWaitPromise 收口),与 start 路径同一求值入口。main 的事件版
+      // waitForProcResumeInit 退役:其 'exit' 快速失败面由「事务 promise reject →
+      // state 'error'」与随后的 isAlive/身份校验覆盖;上游用例通过覆写
+      // waitForCodexInitialization 模拟恢复传输失败,注册表链路才能一致收口。
       const init = initializeThrown
         ? { state: 'error' as const, error: initializeThrown }
-        : await initWait
+        : provider === 'claude'
+          ? await claudeInitWait!
+          : await this.waitForCodexInitialization(
+              this.requireCodexInitializationPromise(initialization),
+              () => {
+                log(`session "${this.sessionName}": ${provider} resume init still pending after ${CODEX_INIT_NOTICE_MS / 1000}s`)
+                report?.(this.withModel(`⏳ 仍在等待 ${backend} init 确认 thread=${prevThreadLabel}…`))
+              },
+            )
       if (!this.ownsLifecycle(lease)) {
         await this.discardLocalProcess(lease, proc)
         return false
@@ -2891,9 +3793,13 @@ export class Session {
           .filter(Boolean)
           .join('；')
         log(`session "${this.sessionName}": ${provider} resume failed: ${detail}`)
+        const stopConfirmed = await this.stopOwnedProc(proc, 1000)
+        const cleanup = stopConfirmed
+          ? ''
+          : `；进程终止未确认: ${this.blockedProcReason ?? '未知原因'}`
         const finalStatus = init.state === 'timeout'
-          ? `❌ ${backend} 恢复超时`
-          : `❌ ${backend} 恢复失败: ${detail}`
+          ? `❌ ${backend} 恢复超时${cleanup}`
+          : `❌ ${backend} 恢复失败: ${detail}${cleanup}`
         report?.(finalStatus)
         if (announceText) {
           await feishu.sendText(this.chatId, finalStatus)
@@ -2943,7 +3849,8 @@ export class Session {
         return false
       }
       const msg = this.withModel(this.withWorktreeInstructionNotice(
-        provider === 'claude' && init.state === 'ready'
+        init.state === 'waiting_quota' ? '⏳ 账号额度用尽 · 等待后自动恢复原会话'
+        : provider === 'claude' && init.state === 'ready'
           ? `✅ 已准备恢复上一会话 thread=${prevThreadLabel}…`
           : `✅ 已恢复上一会话 thread=${prevThreadLabel}…`,
       ))
@@ -2954,16 +3861,20 @@ export class Session {
         return false
       }
       this.clearPendingSpawn(lease, proc)
-      this.status = 'idle'
+      this.status = init.state === 'waiting_quota' ? 'starting' : 'idle'
       this.startedAt = Date.now()
+      if (init.state !== 'waiting_quota') this.daemonRestoreRequired = false
       this.opts.onLifecycleChange?.()
-      await closeInternalStatusCard(msg)
+      try { await closeInternalStatusCard(msg) } catch (error) {
+        log(`session "${this.sessionName}": restart succeeded but status-card close failed: ${messageOf(error)}`)
+        await feishu.sendTextRaw(this.chatId, `⚠️ ${msg}\n状态卡收尾失败: ${messageOf(error)}`)
+      }
       return true
     } else {
       // Resume requested but no prior session_id on file — surface it
       // explicitly rather than silently fresh-starting (the old behavior
       // hid the daemon-restart sessionId-loss bug for months).
-      if (resume) {
+      if (resume && !explicitLaunch) {
         report?.('⚠️ 没有可恢复的上一会话，将以新会话启动')
         if (announceText) {
           await feishu.sendText(this.chatId, '⚠️ 没有可恢复的上一会话，将以新会话启动')
@@ -3416,8 +4327,12 @@ export class Session {
     return sessionWorktree.worktreeProjectDir(this)
   }
 
-  private spawnDeveloperInstructions(): string {
-    return sessionWorktree.spawnDeveloperInstructions(this)
+  private spawnDeveloperInstructions(mode: FileDeliveryMode = this.getFileDeliveryMode()): string {
+    return sessionWorktree.spawnDeveloperInstructions(this, mode)
+  }
+
+  delegatedAgentDeveloperInstructions(provider: AgentProvider): string {
+    return sessionWorktree.delegatedAgentDeveloperInstructions(this, provider)
   }
 
   worktreeInstructionLoadedNotice(): string | null {
@@ -3442,6 +4357,14 @@ export class Session {
 
   showTasklistPanel(): Promise<void> {
     return sessionTasklist.showTasklistPanel(this)
+  }
+
+  showAgentIdentityPanel(userOpenId = ''): Promise<void> {
+    return sessionAgentIdentities.showAgentIdentityPanel(this, userOpenId)
+  }
+
+  onAgentIdentityPage(panelId: string, page: unknown, userOpenId: string): ModelActionResult {
+    return sessionAgentIdentities.onAgentIdentityPage(panelId, page, userOpenId)
   }
 
   onTasklistEnable(): Promise<TasklistActionResult> {
@@ -3500,12 +4423,72 @@ export class Session {
     return sessionModel.showModelPanel(this)
   }
 
+  finishModelSettingsChange(change: sessionModel.ModelSettingsChange, outcome: sessionModel.ModelSettingsOutcome): Promise<ModelActionResult> {
+    return this.runLifecycle('model-settings-complete', () => sessionModel.finishModelSettingsChange(this, change, outcome))
+  }
+
+  closeModelSettingsChanges(): void {
+    this.modelSettingsChangesClosed = true
+    this.modelSettingsChange?.cancel('daemon 正在停止')
+  }
+
+  private modelSettingsBlockReason(): string | null {
+    const change = this.modelSettingsChange
+    if (!change || change.proc !== this.proc || !change.proc.isAlive()) return null
+    return change.phase === 'pending'
+      ? '模型设置仍在等待后端确认，请等待结果；取消切换请发 kill 或 restart。'
+      : change.error ?? '模型设置未确认，请重新发送 md 选择模型。'
+  }
+
+  resumeInputAfterModelSettingsChange(): void {
+    void this.drainMidTurnAndOpen().catch(async error => {
+      const message = `模型设置已完成，但排队输入提交失败：${messageOf(error)}`
+      log(`session "${this.sessionName}": ${message}`)
+      await feishu.sendTextRaw(this.chatId, `❌ ${message}`)
+    })
+  }
+
   onModelSelect(modelRaw: string, panelIdRaw = '', userOpenId = '', actionValue: any = null): Promise<ModelActionResult> {
-    return sessionModel.onModelSelect(this, modelRaw, panelIdRaw, userOpenId, actionValue)
+    return this.runLifecycle('model-select', () =>
+      sessionModel.onModelSelect(this, modelRaw, panelIdRaw, userOpenId, actionValue)
+    )
   }
 
   onModelEffortSelect(modelRaw: string, effortRaw: string, panelIdRaw = '', userOpenId = '', providerRaw = ''): Promise<ModelActionResult> {
-    return sessionModel.onModelEffortSelect(this, modelRaw, effortRaw, panelIdRaw, userOpenId, providerRaw)
+    // 合并调和(取舍):上游把 model-effort-select 挂进 runLifecycle(与 stop/
+    // restart/user-message 串行);本地冻结用例 'rejects a second model selection
+    // while the first idle rebuild is pending' 要求首个 idle 重建在途时第二次
+    // 选择立即被拒 —— 排队到队尾会让第二次在第一个完成后照常执行(双提交本意
+    // 是拒绝),且该用例 await second 会卡在队尾死等。折中:已有在途 model
+    // switch 事务时绕过队列直入 session-model(其 modelSwitchPending 门 944 行
+    // 返回同一 busy 文案),其余情况照常排队(上游 mutex 次序不变)。
+    if (this.modelSwitchPending) {
+      return sessionModel.onModelEffortSelect(this, modelRaw, effortRaw, panelIdRaw, userOpenId, providerRaw)
+    }
+    return this.runLifecycle('model-effort-select', () =>
+      sessionModel.onModelEffortSelect(this, modelRaw, effortRaw, panelIdRaw, userOpenId, providerRaw)
+    )
+  }
+  onProviderSelect(sourceIdRaw: string, panelIdRaw = ''): Promise<ModelActionResult> {
+    return sessionModel.onProviderSelect(this, sourceIdRaw, panelIdRaw)
+  }
+  onModelPage(panelId: string, sourceId: string, page: number): Promise<ModelActionResult> {
+    return sessionModel.onModelPage(this, panelId, sourceId, page)
+  }
+  onModelAddOpen(panelId: string, sourceId: string): Promise<ModelActionResult> {
+    return sessionModel.onModelAddOpen(this, panelId, sourceId)
+  }
+  onModelListEdit(panelId: string, sourceId: string, model: string, action: 'add' | 'remove' | 'delete'): Promise<ModelActionResult> {
+    return this.runLifecycle('model-list-edit', () => sessionModel.onModelListEdit(this, panelId, sourceId, model, action))
+  }
+  onModelPanelCancel(panelIdRaw = ''): Promise<ModelActionResult> {
+    return sessionModel.onModelPanelCancel(this, panelIdRaw)
+  }
+  onModelCustomPrompt(sourceIdRaw: string, panelIdRaw: string, cardMessageId = ''): Promise<ModelActionResult> {
+    return sessionModel.onModelCustomPrompt(this, sourceIdRaw, panelIdRaw, cardMessageId)
+  }
+  consumeModelCustomMessage(text: string, user: string): Promise<boolean> {
+    return sessionModel.consumeModelCustomMessage(this, text, user)
   }
 
   onWorktreeDisband(slugRaw: string): Promise<WorktreeActionResult> {
@@ -3525,8 +4508,23 @@ export class Session {
   /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
    * plus their two-letter aliases where applicable.
    * Returns true if the command was consumed (don't forward to Codex). */
-  runCommand(raw: string, userOpenId = ''): Promise<boolean> {
-    return sessionCommands.runCommand(this, raw, userOpenId)
+  runCommand(raw: string, userOpenId = '', messageId?: string): Promise<boolean> {
+    return sessionCommands.runCommand(this, raw, userOpenId, messageId)
+  }
+
+  getFileDeliveryMode(): FileDeliveryMode { return groupFileDelivery.mode(this.chatId, this.workDir) }
+
+  runFileDeliveryCommand(argument: string, userOpenId: string): Promise<void> {
+    return runFileDeliveryCommand(this.chatId, this.sessionName, userOpenId, argument, {
+      get: chatId => groupFileDelivery.get(chatId, this.workDir),
+      enable: (chatId, managerOpenId) => groupFileDelivery.enable(chatId, this.workDir, managerOpenId),
+      disable: chatId => groupFileDelivery.disable(chatId, this.workDir),
+      sendCard: (card, onFailure) => feishu.sendCard(this.chatId, card, onFailure),
+      reportError: async message => {
+        log(`session "${this.sessionName}": ${message}`)
+        if (!await feishu.sendText(this.chatId, message)) throw new Error(message)
+      },
+    }, this.workDir)
   }
 
   /** Build the hi-panel data snapshot for this session.
@@ -3545,7 +4543,7 @@ export class Session {
       status: this.status,
       provider: runtime.provider,
       model: runtime.model ?? undefined,
-      effort: runtime.effort,
+      effort: runtime.effort ?? 'MISS',
       usageSource: runtime.usageSource,
       worktreeInstructionNotice: this.worktreeInstructionLoadedNotice(),
       peers: [...Session.all]
@@ -3557,6 +4555,7 @@ export class Session {
       usage,
       glmUsage,
       providerUsage,
+      accountUsages: await readAllAccountUsage(),
       sysinfo,
     }
   }
@@ -3575,6 +4574,17 @@ export class Session {
       glmUsage: undefined,
       providerUsage: undefined,
     }
+    // 合并调和(取舍):snapshot 缺席账户聚合数据时才即时补读(上游 patchConsoleUsage
+    // 无条件重读的形态;本地调用方经 buildConsoleOpts 冻结快照,已含 accountUsages,
+    // 不会走到这里)。失败按上游口径落一条 error 行,面板不落回 markdown。
+    if (opts.accountUsages === undefined) {
+      try { opts.accountUsages = await readAllAccountUsage() }
+      catch (error) {
+        const reason = messageOf(error)
+        log(`console usage MISS: ${reason}`)
+        opts.accountUsages = [{ id: 'error', label: '额度', usage: { state: 'network', windows: [], reason } }]
+      }
+    }
     if (opts.usageSource === 'glm') {
       opts.glmUsage = await readGlmUsage()
     } else if (opts.usageSource === 'codex') {
@@ -3586,18 +4596,78 @@ export class Session {
       if (opts.provider === 'dsh') {
         const section = config.deepseek_harness
         const displayName = section?.display?.trim() || DSH_DISPLAY_NAME
-        opts.providerUsage = section?.api_key?.trim()
-          ? await readDeepseekBalance(
-            section.base_url?.trim() || DSH_DEFAULT_BASE_URL,
-            section.api_key.trim(),
-            displayName,
-          )
-          : { state: 'no_credentials', providerName: displayName }
+        const apiKey = section?.api_key?.trim() ?? ''
+        const baseUrl = section?.base_url?.trim() || DSH_DEFAULT_BASE_URL
+        // 合并调和(取舍):聚合面板在场(上游「全部账号额度」路线,见
+        // cards/console.ts 双源注释)时 dsh 余额补进面板行 —— 本地
+        // `[deepseek-harness]` 段不进 token source 注册表,聚合读数看不到它;
+        // 面板行快照走 unified 同源查询(fetchDeepseekBalance 即注册表 readUsage
+        // 的实现,同端点同凭据)。markdown 兼容层(accountUsages 缺席的旧调用方)
+        // 保留本地 providerUsage 行。两条路线各自只查一次 /user/balance。
+        if (opts.accountUsages !== undefined) {
+          if (apiKey && !opts.accountUsages.some(row => row.id === 'deepseek-harness' || row.id === 'deepseek')) {
+            opts.accountUsages = [...opts.accountUsages, {
+              id: 'deepseek-harness', label: displayName,
+              usage: await fetchDeepseekBalance(baseUrl, apiKey),
+            }]
+          }
+        } else {
+          opts.providerUsage = apiKey
+            ? await readDeepseekBalance(baseUrl, apiKey, displayName)
+            : { state: 'no_credentials', providerName: displayName }
+        }
       } else {
         opts.providerUsage = await readClaudeProviderUsage(opts.model)
       }
     }
-    await cardkit.replaceElement(cardId, cards.ELEMENTS.consoleUsage, cards.consoleUsageElement(opts))
+    let failure: cardkit.CardWriteFailure | undefined
+    const landed = await cardkit.replaceElementChecked(
+      cardId,
+      cards.ELEMENTS.consoleUsage,
+      cards.consoleUsageElement(opts),
+      { notifyCardFailure: false, onFailure: detail => { failure = detail } },
+    )
+    if (!landed) throw new Error(`console usage element replace rejected: ${formatFeishuError(failure)}`)
+  }
+
+  /** Run a one-shot mutation on a static card, then close any streaming mode
+   * that a 300309 recovery may have reopened. Only tombstone local state once
+   * the close is confirmed; a failed close remains available for diagnosis or
+   * a later repair instead of becoming an unwritable streaming orphan. */
+  private async mutateStaticCard(
+    cardId: string,
+    label: string,
+    mutation: () => Promise<void>,
+  ): Promise<boolean> {
+    let mutationLanded = true
+    const failures: string[] = []
+    try {
+      await mutation()
+    } catch (e) {
+      mutationLanded = false
+      failures.push(messageOf(e))
+      log(`session "${this.sessionName}": ${label} mutation failed: ${messageOf(e)}`)
+    }
+    let closed = false
+    try {
+      closed = await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } }, failure => {
+        failures.push(formatFeishuError(failure))
+      })
+    } catch (e) {
+      failures.push(formatFeishuError(e))
+      log(`session "${this.sessionName}": ${label} streaming-off failed: ${messageOf(e)}`)
+    }
+    if (!mutationLanded || !closed) {
+      log(`session "${this.sessionName}": ${label} state retained after checked MISS mutation=${mutationLanded} streamingOff=${closed} card=${cardId.slice(0, 12)}`)
+      await feishu.sendTextRaw(this.chatId, `⚠️ 卡片更新失败 (${label})。\n${failures.join('\n') || formatFeishuError(undefined)}`)
+      return false
+    }
+    try { await cardkit.dispose(cardId) }
+    catch (e) {
+      log(`session "${this.sessionName}": ${label} dispose failed: ${messageOf(e)}`)
+      return false
+    }
+    return mutationLanded
   }
 
   private patchConsoleUsageLater(cardId: string, snapshot: cards.ConsoleOpts): void {
@@ -3618,31 +4688,40 @@ export class Session {
     const elapsed = handle.timer.elapsedSec()
     const consoleOpts = await this.buildConsoleOpts(undefined)
     await cardkit.flush(handle.cardId)
-    await cardkit.replaceElement(
+    const failures: cardkit.CardWriteFailure[] = []
+    const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
+    const currentModelLanded = await cardkit.replaceElementChecked(
       handle.cardId,
       cards.ELEMENTS.footer,
       cards.consoleCurrentModelElement(consoleOpts, cards.ELEMENTS.footer),
+      { onFailure },
     )
-    await cardkit.addElement(
+    const mainLanded = await cardkit.addElementChecked(
       handle.cardId,
       cards.consoleMainElement(consoleOpts),
-      { type: 'insert_after', targetElementId: cards.ELEMENTS.footer },
+      { type: 'insert_after', targetElementId: cards.ELEMENTS.footer, onFailure },
     )
-    await cardkit.addElement(
+    const hostLanded = await cardkit.addElementChecked(
       handle.cardId,
       cards.consoleHostElement(consoleOpts.sysinfo),
-      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleProjects },
+      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleProjects, onFailure },
     )
-    await cardkit.addElement(
+    const usageLanded = await cardkit.addElementChecked(
       handle.cardId,
       cards.consoleUsageElement(consoleOpts),
-      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleHost },
+      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleHost, onFailure },
     )
+    if (!currentModelLanded || !mainLanded || !hostLanded || !usageLanded) {
+      await feishu.sendTextRaw(this.chatId, `⚠️ 控制台卡片结构写入失败，请重新发送 hi。\n${cardFailureDetails(failures)}`)
+      await this.mutateStaticCard(handle.cardId, 'console structure', async () => {})
+      return
+    }
     cardkit.cancelSummary(handle.cardId)
-    await cardkit.patchSettings(handle.cardId, cards.streamingOffSettings({
+    const closed = await cardkit.patchSettingsChecked(handle.cardId, cards.streamingOffSettings({
       durationSec: elapsed,
       suffix: finalStatus,
-    }))
+    }), onFailure)
+    if (!closed) await feishu.sendTextRaw(this.chatId, `⚠️ 控制台卡片状态写入失败。\n${cardFailureDetails(failures)}`)
     this.patchConsoleUsageLater(handle.cardId, consoleOpts)
   }
 
@@ -3678,6 +4757,18 @@ export class Session {
     source: TurnInterruptSource,
     watchdogCtx: WatchdogTurnContext | null = null,
   ): TurnInterruptContext | null {
+    // 合并收口:上游 stop 命令经 interrupt() 作废 steering 世代 —— 在途
+    // steerUserText 回执(哪怕是 rejected)不得再复活已随 stop 丢弃的追加
+    // 消息(否则 finally 的 drainMidTurnAndOpen 会为它们重开新轮)。
+    // 合并后 stop 命令(frozen session-commands.ts)改走本地
+    // beginTurnInterrupt('user') 入口,'user' 即上游 interrupt() 的
+    // stop/用户中断语义位;在此补齐同一作废(upper interrupt() 同款四连)。
+    if (source === 'user') {
+      this.steeringGeneration++
+      this.submittedSteering.clear()
+      this.steeringBoundary?.start()
+      this.steeringBoundary = null
+    }
     const proc = this.proc
     const turn = this.currentTurn
     if (!proc) return null
@@ -3824,6 +4915,57 @@ export class Session {
     return true
   }
 
+  interrupt(): void {
+    this.steeringGeneration++
+    this.submittedSteering.clear()
+    this.steeringBoundary?.start()
+    this.steeringBoundary = null
+    if (!this.proc) return
+    log(`session "${this.sessionName}": interrupt`)
+    this.proc.sendInterrupt()
+  }
+
+  private disabledSubscriptionMessage(sourceId = this.selectedTokenSourceId): string | null {
+    const source = this.tokenSource(sourceId)
+    return source?.kind === 'claude-subscription' && !source.enabled
+      ? source.modelCatalogState?.error ?? 'Claude Code 订阅未启用，请发送 claude-sub 查看状态'
+      : null
+  }
+
+  /** Register the SDK-input claim before the write. AgentProcess implementations
+   * may emit init/turn_started synchronously in tests or immediately on their
+   * read loop, so incrementing after sendUserText leaves a boundary race. */
+  async sendClaimedUserText(proc: AgentProcess, text: string): Promise<boolean> {
+    const settingsBlocked = this.modelSettingsBlockReason()
+    if (settingsBlocked) throw new Error(settingsBlocked)
+    // 其他群可能在开卡期间关闭全局开关；真正送入进程前再检查一次。
+    const blocked = this.disabledSubscriptionMessage(proc.tokenSourceId)
+    if (blocked) {
+      const message = `❌ ${blocked}。消息未送给 Agent，请启用后重发或通过 md 切换来源。`
+      this.pendingTurnInputs = []
+      if (this.currentTurn) await this.closeTurnCard(message)
+      else await feishu.sendText(this.chatId, message)
+      this.status = 'idle'
+      return false
+    }
+    const turn = this.currentTurn
+    const mode = turn ? (turn.fileDeliveryMode ??= this.getFileDeliveryMode()) : this.getFileDeliveryMode()
+    const previousMode = this.procFileDeliveryModes.get(proc)
+    const context = previousMode === mode ? '' : `${fileDeliveryAgentContext(mode)}\n\n`
+    // Capture before the write: synchronous backend events can open a card or deliver a file.
+    this.procFileDeliveryModes.set(proc, mode)
+    this.pendingUserMessageCount++
+    try {
+      proc.sendUserText(context + text, [])
+    } catch (error) {
+      this.pendingUserMessageCount = Math.max(0, this.pendingUserMessageCount - 1)
+      if (previousMode === undefined) this.procFileDeliveryModes.delete(proc)
+      else this.procFileDeliveryModes.set(proc, previousMode)
+      throw error
+    }
+    return true
+  }
+
   private restoreHumanDelivery(context: PendingHumanDelivery): boolean {
     if (this.pendingHumanDelivery !== context || context.state !== 'pending') return false
     context.state = 'restored'
@@ -3866,11 +5008,46 @@ export class Session {
     if (this.pendingHumanDelivery !== context || context.state !== 'pending') {
       return this.humanDeliveryOutcome(context)
     }
+    // 上游 sendClaimedUserText「真正送入进程前再检查一次」的合并落点(本地投递
+    // 收据机为最终形态,开卡统一先于投递):开卡窗口里其他群可能关掉 Claude
+    // 订阅/全局开关,此时必须拒投 —— 关卡告知并清空本批,绝不让文本进进程。
+    // 不 restash 重投:消息未送达已在关卡文案里明示,等用户重发。
+    const subscriptionBlocked = this.disabledSubscriptionMessage(context.proc.tokenSourceId)
+    if (subscriptionBlocked) {
+      log(`session "${this.sessionName}": ${context.proc.provider} human dispatch blocked: ${subscriptionBlocked}`)
+      const message = `❌ ${subscriptionBlocked}。消息未送给 Agent，请启用后重发或通过 md 切换来源。`
+      this.pendingTurnInputs = []
+      context.state = 'refused'
+      if (this.pendingHumanDelivery === context) this.pendingHumanDelivery = null
+      if (this.ackedHumanDelivery === context) this.ackedHumanDelivery = null
+      for (const [msgId, reactionId] of context.reactions) {
+        if (reactionId) void feishu.deleteReaction(msgId, reactionId)
+      }
+      context.reactions.clear()
+      if (this.currentTurn) await this.closeTurnCard(message)
+      else await feishu.sendText(this.chatId, message)
+      this.status = 'idle'
+      return this.humanDeliveryOutcome(context)
+    }
     const merged = context.batch.map(message => message.wireText).join('\n\n')
+    // 合并调和(本地投递 pin):本地真人投递不承担「首投规则注入」——那是
+    // spawn 时 developerInstructions 的职责(proc 模式已在 spawn pre-seed,
+    // 2096),本地用例断言首投即用户原文。仅当活进程的模式自 spawn 后发生
+    // 变化时,下一条消息把上游的 fileDeliveryAgentContext 更新先带给进程
+    // (instructions.ts channel 指令承诺宿主会注入更新;已登记 undefined 的
+    // 进程视为「非 spawn 来源」,维持本地 raw 语义)。写入失败回滚记录重投再带。
+    const turn = context.turn
+    const mode = turn ? (turn.fileDeliveryMode ??= this.getFileDeliveryMode()) : this.getFileDeliveryMode()
+    const previousMode = this.procFileDeliveryModes.get(context.proc)
+    const modeContext = previousMode !== undefined && previousMode !== mode
+      ? `${fileDeliveryAgentContext(mode)}\n\n`
+      : ''
+    if (previousMode !== undefined) this.procFileDeliveryModes.set(context.proc, mode)
     let dispatch: UserTextDispatch
     try {
-      dispatch = context.proc.sendUserText(merged, [])
+      dispatch = context.proc.sendUserText(modeContext + merged, [])
     } catch (cause) {
+      if (previousMode !== undefined) this.procFileDeliveryModes.set(context.proc, previousMode)
       const error = cause instanceof Error ? cause : new Error(String(cause))
       log(`session "${this.sessionName}": ${context.proc.provider} human dispatch threw: ${error.message}`)
       return await this.rejectHumanDelivery(context)
@@ -4047,19 +5224,24 @@ export class Session {
     const lease = this.beginLifecycle('start')
     let startedProc: AgentProcess | null = null
     let batchTransferred = false
-    const openingToken = this.beginTurnOpening()
     // 冷启动首轮同样让位于 durable fork marker(4185808 startColdUserTurn 同位 guard)。
+    // 合并调和(取舍):上游顺序 reset 先于 beginTurnOpening —— reset 抛错时
+    // 不得遗留 opening owner(上游用例 'cold reset failure never leaves a
+    // main-card opening owner behind':openingTurn=false、openingTurnOwner=null;
+    // 本地旧序在 beginTurnOpening 之后 reset,异常会绕过 finally 的 finishTurnOpening)。
     if (!this.pendingConversationMaterialization) this.resetFreshConversationState()
+    const openingToken = this.beginTurnOpening()
     this.pendingTurnInputs.push(...batch.map(message => message.text))
     try {
-      const openResult = await this.openTurnCard(userOpenId, 'user_message', {
+      const openResult = await this.openTurnCard(openingToken, userOpenId, 'user_message', {
         initialFooter: 'Waiting... (<30s)',
         startThinking: false,
         directStart: true,
       })
       if (!this.ownsLifecycle(lease)) return
-      if (openResult.kind !== 'opened') return
-      const turn = openResult.turn
+      const opened = this.openedTurnOf(openResult)
+      if (!opened.ok || opened.turn === null) return
+      const turn = opened.turn
       if (this.currentTurn !== turn) return
       const bootTimer = this.startFooterTimer(
         turn.cardId,
@@ -4067,6 +5249,9 @@ export class Session {
         status => this.withModel(status),
       )
       let lastBootStatus = `🚀 启动 ${this.backendLabel()}`
+      // 走公共 start(本地 main 同位调用):测试经实例覆写 session.start
+      // 拦截冷启动的接缝必须保留;带 lease 时 start() 直进 startUnlocked,
+      // 既不再排队(user-message lifecycle 内嵌套)也不死锁。
       const ok = await this.start({
         announce: false,
         lifecycleLease: lease,
@@ -4154,20 +5339,84 @@ export class Session {
     this.trackQueuedReaction(msgId)
   }
 
-  /** Inbound user message. Starts a Codex turn immediately when idle —
-   * the SDK queues internally if a turn is in flight (FIFO, exactly the
-   * type-ahead semantics of the native Codex UI). Card opening:
-   *   - First msg of session OR no turn in flight  → open card eagerly here
-   *   - Mid-flight msg                              → defer; the `init`
-   *     handler opens its card when the SDK actually starts the turn
-   * This is what lets a single subprocess host both user-typed turns and
-   * cron-fired wakeups without the daemon ever calling `sendInterrupt` —
-   * `kill`/`stop` are the only paths that interrupt now. */
+  /** Idle input starts a turn. Running Codex/Claude tasks receive native
+   * steering input without interruption; opening/recovering processes and
+   * backends without steering retain the explicit pending batch. */
   async onUserMessage(text: string, files: string[] = [], userOpenId = '', msgId = ''): Promise<void> {
-    // File hints stay attached to their own message when a queued human
-    // batch is later merged into one SDK input.
+    // 合并吸收(上游 onUserMessage 串行化,4185808)+ 本地并发消息语义调和:
+    // ① 消息与 restart/model-select/gsd 等生命周期事务互斥排队(上游 17230
+    //    'a user message owns the lifecycle mutex before a subsequently queued
+    //    restart':重启不得在消息校验/开卡窗口里杀掉进程);
+    // ② 并发用户消息之间不互相排队 —— 本地收据系统让首条消息 handler await 到
+    //    回执结算才返回,第二条消息必须立即进 pendingMidTurnMsgs 而不是停在
+    //    lifecycle 队列尾巴(session.test 'a second pre-init Codex message
+    //    queues while the first receipt is pending'、'a message during a pending
+    //    bootstrap delivery queues instead of eager-opening')。已有消息持锁时
+    //    后续消息直进(并发执行);非消息操作在跑时消息照旧排队(上游次序)。
+    // userMessageActive 在拿到队列执行权后才自增:紧随其后的第二条消息仍会
+    // 排队(上游次序),而真实并发(前条已开始 await)才走直进。
+    // stopLifecycleActive 同位豁免:stop 事务在途时消息直进(见字段注释)。
+    if (this.userMessageActive > 0 || this.stopLifecycleActive > 0) {
+      this.userMessageActive++
+      try { await this.onUserMessageUnlocked(text, files, userOpenId, msgId) }
+      finally { this.userMessageActive-- }
+      return
+    }
+    await this.runLifecycle('user-message', async () => {
+      this.userMessageActive++
+      try { await this.onUserMessageUnlocked(text, files, userOpenId, msgId, true) }
+      finally { this.userMessageActive-- }
+    })
+  }
+
+  private async onUserMessageUnlocked(
+    text: string,
+    files: string[],
+    userOpenId: string,
+    msgId: string,
+    /** true = 经 runLifecycle('user-message') 排队执行(计入 lifecycleActive,
+     *  下方 daemon-restore 等待须扣除自身,防自等死锁);false = 并发直进路径。 */
+    queuedInLifecycle = false,
+  ): Promise<void> {
+    const settingsBlocked = this.modelSettingsBlockReason()
+    if (settingsBlocked) {
+      await feishu.sendText(this.chatId, `⚠️ ${settingsBlocked} 本条消息未送给 Agent，请确认设置后重发。`)
+      return
+    }
+    const subscriptionDisabled = this.disabledSubscriptionMessage()
+    if (subscriptionDisabled) {
+      await feishu.sendText(this.chatId, `❌ ${subscriptionDisabled}。消息未送给 Agent，请启用后重发或通过 md 切换来源。`)
+      return
+    }
+    const blocked = this.blockedProcessMessage()
+    if (blocked) {
+      await feishu.sendText(this.chatId, `❌ ${blocked}。请重试 stop/restart，或等待旧进程退出。`)
+      return
+    }
+    if (this.daemonRestoreRequired) {
+      // onUserMessage 已经过 runLifecycle('user-message') 串行(见 onUserMessage),
+      // daemon 恢复事务在跑时本消息天然排在它之后;此处窄口径等待兜底并发直进
+      // 场景(已有消息持锁时的直进路径不排队):恢复事务正在执行则等队列排空再判
+      // ——恢复成功时 init 处理已清 daemonRestoreRequired(上游用例 'daemon
+      // recovery finishes the saved thread initialization before delivering a
+      // queued message');恢复失败(事务已结束、标记仍在)则照旧走下面的拒绝。
+      while (this.daemonRestoreRequired && this.lifecycleActive > (queuedInLifecycle ? 1 : 0)) {
+        await this.lifecycleTail
+      }
+    }
+    if (this.daemonRestoreRequired) {
+      await feishu.sendText(this.chatId, '❌ daemon 重启后的会话恢复尚未成功，这条消息未送给 Agent。请发送 rs 选择历史会话，或 hi 明确启动新会话，然后重发消息。')
+      return
+    }
+
+    // File hint **inline 在 wireText 内部**,而不是依赖 sendUserText 把
+    // files 拼到 message 整体头部。原因:drainMidTurnAndOpen merge N 条
+    // wireText 时,若 files 还按整体拼接 → 所有 file hint 全堆在 long
+    // message 开头,模型分不清哪个文件配哪条。inline 后每条 sub-message
+    // 自带 file hint,SDK side 所有 sendUserText 调用 files 一律传空。
     const filePrefix = files.length ? files.map(f => `[file: ${f}]`).join(' ') + '\n' : ''
     const wireText = filePrefix + text
+
     // Garbage-collect leftover state from a batch the SDK abandoned —
     // most commonly an AskUserQuestion mid-turn, which makes the SDK
     // emit `QUEUE remove × N` and drop every msg we'd already
@@ -4214,13 +5463,13 @@ export class Session {
     }
     if (
       this.proc?.isAlive() &&
-      this.proc.provider !== this.selectedProvider &&
       !this.currentTurn &&
       !this.openingTurn &&
+      !this.steeringSend &&
       this.pendingUserMessageCount === 0 &&
       this.pendingMidTurnMsgs.length === 0
     ) {
-      await this.stopIdleMismatchedProcess()
+      await this.stopIdleMismatchedProcessUnlocked()
     }
     if (
       this.proc?.isAlive() &&
@@ -4267,7 +5516,7 @@ export class Session {
       return
     }
 
-    if (this.currentTurn !== null) {
+    if (this.currentTurn !== null || this.steeringSend) {
       // Mid-turn — BUFFER instead of immediate sendUserText. The SDK polling
       // loop will not auto-dequeue queued type-ahead msgs after `result`
       // (we explicitly write again to wake the Codex app-server),
@@ -4276,6 +5525,7 @@ export class Session {
       // the SDK and opens a fresh card for the new batch turn.
       // Do not clear gsdExecution: in-flight GSD may still be active.
       this.queueHumanMessage(text, wireText, userOpenId, msgId)
+      this.steerPendingInputs()
       return
     }
 
@@ -4302,10 +5552,12 @@ export class Session {
         const proc = this.proc
         if (!proc) return
         this.pendingTurnInputs.push(text)
-        const openResult = await this.openTurnCard(userOpenId, 'user_message', { expectedProc: proc })
+        const openResult = await this.openTurnCard(openingToken, userOpenId, 'user_message', { expectedProc: proc })
+        const opened = this.openedTurnOf(openResult)
         if (
-          openResult.kind !== 'opened' ||
-          this.currentTurn !== openResult.turn ||
+          !opened.ok ||
+          opened.turn === null ||
+          this.currentTurn !== opened.turn ||
           this.proc !== proc ||
           !proc.isAlive()
         ) return
@@ -4314,7 +5566,7 @@ export class Session {
           wireText,
           userOpenId,
           msgId,
-        }], openResult.turn)
+        }], opened.turn)
         if (delivery) await this.dispatchHumanBatch(delivery)
       } finally {
         this.finishTurnOpening(openingToken)
@@ -4430,24 +5682,26 @@ export class Session {
     if (this.currentTurn || this.openingTurn) throw new Error(`${this.backendLabel()} turn still active`)
     const openingToken = this.beginTurnOpening()
     try {
-      const openResult = await this.openTurnCard('', 'user_message', { expectedProc })
-      if (openResult.kind === 'failed') throw new Error('failed to open continuation turn card')
+      const openResult = await this.openTurnCard(openingToken, '', 'user_message', { expectedProc })
+      const opened = this.openedTurnOf(openResult)
+      if (opened.failed) throw new Error('failed to open continuation turn card')
       if (
-        openResult.kind !== 'opened' ||
-        this.currentTurn !== openResult.turn ||
+        !opened.ok ||
+        opened.turn === null ||
+        this.currentTurn !== opened.turn ||
         this.proc !== expectedProc ||
         !expectedProc.isAlive()
       ) return 'stale'
       const dispatch = await this.dispatchSystemUserText(
         expectedProc,
         wireText,
-        openResult.turn,
+        opened.turn,
         openingToken,
       )
       if (dispatch !== 'accepted') {
         if (dispatch === 'rejected') {
           await this.closeRejectedSystemTurn(
-            openResult.turn,
+            opened.turn,
             expectedProc,
             '⚠️ Codex 未接受继续请求',
           )
@@ -4455,7 +5709,7 @@ export class Session {
         }
         return 'stale'
       }
-      if (this.proc === expectedProc && this.currentTurn === openResult.turn) {
+      if (this.proc === expectedProc && this.currentTurn === opened.turn) {
         this.pendingUserMessageCount++
         this.status = 'working'
       }
@@ -4541,10 +5795,6 @@ export class Session {
   }
 
   // ── Wiring Codex → Feishu ──────────────────────────────────────────
-  /** materialization 失败诊断去重(4185808-D):同一错误文案只发一次群内
-   *  可观测消息;成功持久化后清零,下一轮新错误重新可见。 */
-  private resumePersistenceError: string | null = null
-
   /** A fresh Codex init only owns an in-memory thread id. Remove any older
    * selected Codex binding after the new process is ready so an idle stop or
    * daemon restart cannot revive either that ghost id or the pre-fresh
@@ -4600,24 +5850,30 @@ export class Session {
     return receipt
   }
 
-  private persistResumableSessionId(proc: AgentProcess): string | null {
-    if (this.proc !== proc) return null
+  private persistResumableSessionId(
+    fatal = false,
+    proc: AgentProcess | null = this.proc,
+    notify = true,
+  ): string | null {
     // durable Claude fork marker(4185808,挂账 #2):materialize 前的 persist
     // 判定要同时看它——fork 撞 id/缺 id 都不得推进绑定。
-    const pendingMaterialization = proc.provider === 'claude' ? this.pendingConversationMaterialization : null
+    const pendingMaterialization = proc?.provider === 'claude' ? this.pendingConversationMaterialization : null
     const sessionId = proc?.sessionId
-    if (!proc || !sessionId) {
-      if (!pendingMaterialization) return null
-      const message = 'Claude pending fork did not provide a materialized session id'
-      log(`session "${this.sessionName}": ${message}`)
-      return message
-    }
+    if (!proc) return null
     // codex materialization 门控(4185808-D):thread/start 先返回内存 id,
     // rollout 落盘经 thread/read 权威确认前不得写入恢复映射 —— 错序即把
     // 不可恢复的 id 绑进映射,重启后会话丢失。resume init 与
     // conversation_materialized 信号都在确认后才置 resumable。fail-closed:
     // 不实现该 hook 的 codex 进程一律视为未确认。
     if (proc.provider === 'codex' && proc.isConversationResumable?.() !== true) return null
+    if (!sessionId) {
+      if (!pendingMaterialization) return null
+      const error = new Error('Claude pending fork did not provide a materialized session id')
+      log(`session "${this.sessionName}": ${error.message}`)
+      if (fatal) throw error
+      return error.message
+    }
+    const ref: ConversationRef = { provider: proc.provider, sessionId, cwd: this.workDir }
     const recovery = this.preservedWatchdogRecovery
     if (recovery && (proc.provider !== recovery.provider || sessionId !== recovery.threadId)) return null
     // pending 独立 id 校验(4185808):fork 必须派生新 id —— 新 id 撞 fork 源或
@@ -4633,9 +5889,10 @@ export class Session {
         || (pendingFork.previousSessionId !== null && sessionId === pendingFork.previousSessionId)
       )
     ) {
-      const message = `fork 未派生独立 session id (${sessionId})`
-      log(`session "${this.sessionName}": ${message}`)
-      return message
+      const error = new Error(`fork 未派生独立 session id (${sessionId})`)
+      log(`session "${this.sessionName}": ${error.message}`)
+      if (fatal) throw error
+      return error.message
     }
     if (
       pendingMaterialization
@@ -4647,11 +5904,11 @@ export class Session {
         )
       )
     ) {
-      const message = `Claude fork did not materialize an independent session id (${sessionId})`
-      log(`session "${this.sessionName}": ${message}`)
-      return message
+      const error = new Error(`Claude fork did not materialize an independent session id (${sessionId})`)
+      log(`session "${this.sessionName}": ${error.message}`)
+      if (fatal) throw error
+      return error.message
     }
-    const ref: ConversationRef = { provider: proc.provider, sessionId, cwd: this.workDir }
     try {
       feishu.bindSessionResumeChecked(this.sessionName, ref)
     } catch (error) {
@@ -4665,7 +5922,8 @@ export class Session {
         this.lastSessionId = sessionId
       }
       log(`session "${this.sessionName}": ${message}`)
-      if (firstReport) {
+      if (fatal) throw error
+      if (firstReport && notify) {
         void feishu.sendTextRaw(this.chatId, `⚠️ ${message}；当前进程可继续，但 daemon 重启前请先解决本机状态目录写入问题。`)
       }
       return message
@@ -4682,7 +5940,8 @@ export class Session {
     if (anchorError) {
       const firstReport = this.resumePersistenceError !== anchorError
       this.resumePersistenceError = anchorError
-      if (firstReport) void feishu.sendTextRaw(this.chatId, `⚠️ ${anchorError}`)
+      if (fatal) throw new Error(anchorError)
+      if (firstReport && notify) void feishu.sendTextRaw(this.chatId, `⚠️ ${anchorError}`)
       return anchorError
     }
     this.resumePersistenceError = null
@@ -4718,11 +5977,7 @@ export class Session {
     }
   }
 
-  // ── 后台游标卡(子 agent / 后台 bash / MCP / workflow 的后台执行) ──────
-  // 由 claude-agent-process 的 bg_task_* 事件驱动。卡吸附在对话末尾,被新
-  // 消息超越时沉降为历史快照(updateCard),只在全部终态时固化留在原地。
-  // 阶段①:建卡 + 节流刷新 + 全终态沉降。游标迁移(onUserMessage 沉降+重建)
-  // 是阶段②(待 pendingRebuildBackgroundCard 接入)。
+  // ── 原生子 Agent / 后台任务 → 共享任务面板 ───────────────────────
 
   /** 当前双池快照 —— 喂给纯函数累积器的入参。 */
   private bgStore(): cards.BgStore {
@@ -4778,7 +6033,11 @@ export class Session {
     log(`session "${this.sessionName}": bg resurrect settled task=${e.task_id} subagent=${entry.subagentType ?? '-'} tombstone=${messageId ? 'sent' : 'FAILED'}`)
   }
 
-  private onBackgroundTaskChanged(): void {
+  hasPendingAgentTool(): boolean {
+    return this.nativeAgentTools.size > 0
+  }
+
+  private onBackgroundTaskChanged(immediate = false): void {
     // task_* events remain accumulated in backgroundTasks while the old card is
     // transitioning, but must not mutate that card. openTurnCard rebuilds the
     // remaining snapshot behind the new main card once migration completes.
@@ -4805,9 +6064,17 @@ export class Session {
       })
       return
     }
-    // 有卡有活跃 → 新任务可能带来更早的档位边界,先重排 timer,再节流刷新 body。
+    // 有卡有活跃 → 新任务可能带来更早的档位边界,先重排 timer,再刷新 body。
     this.rescheduleBackgroundRefreshTick()
-    this.scheduleBackgroundRefresh()
+    if (immediate) {
+      if (this.backgroundRefreshTimer) {
+        clearTimeout(this.backgroundRefreshTimer)
+        this.backgroundRefreshTimer = null
+      }
+      this.refreshBackgroundCardFull()
+    } else {
+      this.scheduleBackgroundRefresh()
+    }
   }
 
   private async openBackgroundCard(generation?: number): Promise<void> {
@@ -4830,6 +6097,11 @@ export class Session {
       // owner 状态(cleanupStaleTurnOpen 同款终态三连;上游
       // terminalizeSupersededCard hasFooter=false 位,文案逐字)。
       log(`session "${this.sessionName}": superseded background open terminalized cardId=${cardId.slice(0, 12)}`)
+      // 定型 cardkit 的所有权契约:未 recordCardCreated 的 cardId 视同 disposed,
+      // settings/dispose 写会静默短路(main 的旧 cardkit 会惰性建状态并真发写)。
+      // 这里先登记本卡(刚 id_convert 出来的自有消息),否则终态三连整段变空转 ——
+      // 作废卡会以 streaming 状态永驻会话(世代作废语义失效)。
+      cardkit.recordCardCreated(cardId, 0)
       cardkit.cancelSummary(cardId)
       await cardkit.patchSettings(cardId, cards.streamingOffSettings({ suffix: '⚠️ 后台任务世代已切换，本卡已作废' }))
       await cardkit.dispose(cardId)
@@ -5157,7 +6429,7 @@ export class Session {
       bootstrapDelivery
     ) return
 
-    let openingToken: object
+    let openingToken: TurnOpenTerminalStash
     try {
       openingToken = this.beginTurnOpening()
     } catch (error) {
@@ -5170,9 +6442,10 @@ export class Session {
     log(`session "${this.sessionName}": scheduled wakeup prompt=${promptId ?? 'MISS'}`)
     void (async () => {
       try {
-        const openResult = await this.openTurnCard('', 'scheduled_wakeup', { expectedProc: p })
-        if (this.proc !== p || openResult.kind === 'stale') return
-        if (openResult.kind === 'failed') {
+        const openResult = await this.openTurnCard(openingToken, '', 'scheduled_wakeup', { expectedProc: p })
+        const opened = this.openedTurnOf(openResult)
+        if (this.proc !== p || opened.stale) return
+        if (opened.failed) {
           // The scheduled turn is already executing inside the SDK. Preserve
           // its report via the same cardless buffer used by background resume
           // turns; result/exit will send an explicit raw-text fallback.
@@ -5184,10 +6457,10 @@ export class Session {
           } else {
             log(`session "${this.sessionName}": scheduled open failed — orphan text flush will cover the output`)
           }
-        } else if (this.currentTurn !== openResult.turn) {
+        } else if (!opened.ok || opened.turn === null || this.currentTurn !== opened.turn) {
           return
         } else if (this.sawResultWhileOpening) {
-          const openedTurn = openResult.turn
+          const openedTurn = opened.turn
           this.sawResultWhileOpening = false
           log(`session "${this.sessionName}": scheduled result raced card-open — closing freshly-opened card`)
           await this.closeTurnCard(undefined, { hasFreshResult: true })
@@ -5204,20 +6477,86 @@ export class Session {
     })
   }
 
-  private wireProc(p: AgentProcess): void {
+  private wireProc(p: AgentProcess, wiredEpoch?: number): void {
+    // Tests and a few package-internal probes historically call wireProc
+    // directly. Treat that form as an explicit attach; production uses
+    // attachProc() and passes the already-incremented generation.
+    if (wiredEpoch === undefined) {
+      this.invalidateTurnOpen()
+    }
+    const epoch = wiredEpoch ?? ++this.procEpoch
+    if (wiredEpoch === undefined && this.proc !== p) this.proc = p
+    const isCurrent = (): boolean => this.proc === p && this.procEpoch === epoch
+    let staleEventLogged = false
+    let stoppedEventLogged = false
+    const on = <K extends keyof AgentProcessEventMap>(
+      event: K,
+      handler: (payload: AgentProcessEventMap[K], snapshot: { result: CodexResultMeta; totalUsage: CodexUsage | null }) => void,
+    ): void => {
+      p.on(event, (payload: AgentProcessEventMap[K]) => {
+        const generation = this.steeringGeneration
+        const snapshot = { result: { ...p.lastResult }, totalUsage: p.lastTotalUsage ? { ...p.lastTotalUsage } : null }
+        const dispatch = (): void => {
+          if (!isCurrent()) {
+            if (!staleEventLogged) {
+              staleEventLogged = true
+              log(`session "${this.sessionName}": ignore stale ${p.provider} event=${String(event)} epoch=${epoch} currentEpoch=${this.procEpoch}`)
+            }
+            return
+          }
+          if (generation !== this.steeringGeneration && event !== 'exit' && event !== 'error') return
+          const boundary = this.steeringBoundary
+          if (boundary && boundary.proc === p && boundary.epoch === epoch
+            && event !== 'error' && !(event === 'exit' && (this.stoppingProc === p || this.blockedProc === p))) {
+            if (event === 'user_input_consumed' && boundary.collecting) {
+              handler(payload, snapshot)
+              return
+            }
+            boundary.events.push(dispatch)
+            // Native user items can span multiple stdio frames. Finish the
+            // input run on actual Agent activity, never an elapsed debounce
+            // interval, an RPC receipt, or a quota/usage notification.
+            const mainThread = !payload || typeof payload !== 'object'
+              || !('parentToolUseId' in payload) || !payload.parentToolUseId
+            if (mainThread && (event === 'input_batch_end' || event === 'assistant_text' || event === 'assistant_block_stop'
+              || event === 'tool_use' || event === 'tool_result' || event === 'can_use_tool'
+              || event === 'hook_callback' || event === 'turn_retry' || event === 'codex_account_changed'
+              || event === 'thinking_progress' || event === 'plan_delta' || event === 'turn_plan_updated'
+              || event === 'context_compacted' || event === 'turn_started' || event === 'result' || event === 'exit')) {
+              boundary.start()
+            }
+            return
+          }
+          if (event !== 'exit' && (this.stoppingProc === p || this.blockedProc === p)) {
+            if (!stoppedEventLogged) {
+              stoppedEventLogged = true
+              log(`session "${this.sessionName}": ignore ${p.provider} event=${String(event)} while process stop is pending`)
+            }
+            return
+          }
+          handler(payload, snapshot)
+        }
+        dispatch()
+      })
+    }
+
     this.clearCodexProcessActivityState()
-    p.on('error', err => {
+    on('error', err => {
       log(`session "${this.sessionName}": ${p.provider} process error: ${err}`)
     })
-    p.on('init', () => {
-      if (this.proc !== p) return
+    on('init', () => {
+      if (p.provider === 'codex' && p.quotaWaitPromise) {
+        this.daemonRestoreRequired = false
+        if (this.status === 'starting') this.status = this.currentTurn ? 'working' : 'idle'
+        this.opts.onLifecycleChange?.()
+      }
       if (p.provider === 'codex' && p.launchKind === 'fresh') {
         // fresh init 只有内存 thread id:清 pre-fresh ghost 绑定(4185808 init
         // 事务一部分,挂账 #4);写失败向上抛,由 start 的 sendInitialize 捕获
         // 转启动失败 —— 不得静默留下新旧绑定并存。
         this.clearResumeBindingForFreshCodex(p)
       } else {
-        this.persistResumableSessionId(p)
+        this.persistResumableSessionId(false, p)
       }
       this.initCount++
       log(`session "${this.sessionName}": SDK init#${this.initCount} pendingCount=${this.pendingUserMessageCount} midBuffer=${this.pendingMidTurnMsgs.length} currentTurn=${this.currentTurn ? 'yes' : 'no'} openingTurn=${this.openingTurn}`)
@@ -5247,6 +6586,7 @@ export class Session {
           log(`session "${this.sessionName}": SDK init claimed eager input pendingCount=${this.pendingUserMessageCount}`)
           this.pendingUserMessageCount = 0
         }
+        this.steerPendingInputs()
         return
       }
       const bootstrapDelivery = [this.pendingHumanDelivery, this.ackedHumanDelivery]
@@ -5286,13 +6626,15 @@ export class Session {
       void (async () => {
         try {
           const openResult = await this.openTurnCard(
+            openingToken,
             userOpenId,
             isUserBatch ? 'user_message' : 'bg_task_resume',
             { expectedProc: p },
           )
-          if (this.proc !== p || openResult.kind === 'stale') return
-          if (openResult.kind === 'opened') this.bindHumanDeliveryTurn(p, openResult.turn)
-          if (openResult.kind === 'failed') {
+          const opened = this.openedTurnOf(openResult)
+          if (this.proc !== p || opened.stale) return
+          if (opened.ok && opened.turn !== null) this.bindHumanDeliveryTurn(p, opened.turn)
+          if (opened.failed) {
             if (isUserBatch) {
               if (
                 bootstrapDelivery?.state === 'acked' &&
@@ -5324,10 +6666,10 @@ export class Session {
                 log(`session "${this.sessionName}": bg-resume openTurnCard failed — orphan text flush will cover the output`)
               }
             }
-          } else if (this.currentTurn !== openResult.turn) {
+          } else if (opened.turn === null || this.currentTurn !== opened.turn) {
             return
           } else if (this.sawResultWhileOpening) {
-            const openedTurn = openResult.turn
+            const openedTurn = opened.turn
             // 卡片开成了,但这一轮的 result 已在开卡 await 窗口内到达 ——
             // result 处理器当时 currentTurn 还是 null,closeTurnCard 空转了。
             // 这里补一次收尾,否则卡片 footer 永远计时、session 卡在 working。
@@ -5357,24 +6699,26 @@ export class Session {
             bootstrapDelivery.openingOwner = null
           }
         }
-      })()
+      })().catch(e => {
+        log(`session "${this.sessionName}": init turn-open handler failed: ${messageOf(e)}`)
+      })
     })
-    p.on('scheduled_turn_input', ({ text, promptId }: { text: string; promptId: string | null }) => {
+    on('scheduled_turn_input', ({ text, promptId }) => {
       // claude 与 dsh 都上报调度轮输入;codex 走自己的 receipt 路径。
       if (p.provider !== 'claude' && p.provider !== 'dsh') return
       this.startScheduledTurnCard(p, text, promptId)
     })
-    p.on('conversation_materialized', ({ session_id: sessionId, source }: { session_id: string; source: string }) => {
-      if (this.proc !== p || p.provider !== 'codex') return
+    on('conversation_materialized', ({ session_id: sessionId, source }) => {
+      if (p.provider !== 'codex') return
       if (p.sessionId !== sessionId) {
         log(`session "${this.sessionName}": ignore mismatched Codex materialization session=${sessionId} current=${p.sessionId ?? 'MISS'} source=${source}`)
         return
       }
       log(`session "${this.sessionName}": Codex resume point materialized thread=${sessionId} source=${source}`)
-      this.persistResumableSessionId(p)
+      this.persistResumableSessionId(false, p)
     })
-    p.on('conversation_materialization_failed', ({ session_id: sessionId, source, error }: { session_id: string; source: string; error: Error }) => {
-      if (this.proc !== p || p.provider !== 'codex' || p.sessionId !== sessionId) return
+    on('conversation_materialization_failed', ({ session_id: sessionId, source, error }) => {
+      if (p.provider !== 'codex' || p.sessionId !== sessionId) return
       // 失败可观测但脱敏(01-12 诊断惯例):只内插 error.message 单行,
       // cause 链/raw payload/凭据不进任何用户可见通道;绑定不推进(门控
       // 由 persistResumableSessionId 的 isConversationResumable 检查承担)。
@@ -5384,15 +6728,24 @@ export class Session {
       log(`session "${this.sessionName}": ${message} thread=${sessionId} source=${source}`)
       if (firstReport) void feishu.sendTextRaw(this.chatId, `⚠️ ${message}`)
     })
-    p.on('turn_retry', (retry: AgentTurnRetry) => {
+    on('turn_retry', (retry: AgentTurnRetry) => {
       // 模型满载退避(上游 2e6e1e0):同一逻辑任务保持未终结,footer 换成
       // ⏳ 进度文案(actual 文案由 startFooterStatus 读 proc.turnRetry 覆盖)。
       // 调度权在进程层:schema 见 noteCapacityRetry(D-07)。
-      if (this.proc !== p) return
+      if (this.currentTurn) this.startThinkingFooter(this.currentTurn)
       this.noteCapacityRetry(retry)
     })
-    p.on('turn_started', (identity: { turn_id?: string | null; thread_id?: string | null; retry?: boolean }) => {
-      if (this.proc !== p) return
+    on('codex_account_changed', ({ accountId, diagnostics }) => {
+      log(`session "${this.sessionName}": Codex account=${accountId}`)
+      this.pendingAsks.clear()
+      this.pendingPermissions.clear()
+      // Selection succeeded. Other accounts' diagnostics belong in logs and
+      // explicit account inspection; only blocking failures warrant a notice.
+      if (diagnostics.length) {
+        log(`session "${this.sessionName}": Codex 未参与选号的账号: ${diagnostics.join('；')}`)
+      }
+    })
+    on('turn_started', (identity: { turn_id?: string | null; thread_id?: string | null; retry?: boolean }, snapshot) => {
       // Codex app-server emits init only at process startup, not for every
       // turn — turn_started is its authoritative claim for an input that was
       // already given an eager-opened card。claude 冷启动首轮的 init 先于
@@ -5402,7 +6755,8 @@ export class Session {
         log(`session "${this.sessionName}": turn_started claimed eager input pendingCount=${this.pendingUserMessageCount}`)
         this.pendingUserMessageCount = 0
       }
-      this.persistResumableSessionId(p)
+      this.persistResumableSessionId(false, p)
+      this.steerPendingInputs()
       if (identity?.retry) {
         // 满载重试轮属于同一可见任务:保留原 usage 基线(容量错误之前已完成的
         // 工作仍计入),不重设 watchdog 身份/用量基准(上游 2e6e1e0)。
@@ -5447,7 +6801,7 @@ export class Session {
           }
         }
       }
-      const total = this.proc?.lastTotalUsage
+      const total = snapshot.totalUsage
       if (this.usageTotalsSeedUnknown && !total) {
         this.currentTurnUsageBaseline = null
         this.currentTurnUsageBaselineKnown = false
@@ -5456,45 +6810,50 @@ export class Session {
       this.currentTurnUsageBaseline = total ? { ...total } : null
       this.currentTurnUsageBaselineKnown = true
     })
-    p.on('token_usage', ({ totalUsage }: TokenUsageUpdated) => {
-      if (this.proc !== p) return
-      this.persistResumableSessionId(p)
+    on('turn_input_error', ({ error }) => {
+      log(`session "${this.sessionName}": native input processing failed: ${error}`)
+      void feishu.sendTextRaw(this.chatId, `⚠️ ${this.backendLabel(p.provider)} 输入处理错误：${error}`)
+    })
+    on('user_input_consumed', ({ inputId }) => this.onSteeringInputConsumed(p, epoch, inputId))
+    on('input_batch_end', () => {})
+    on('thinking_progress', () => {})
+    on('token_usage', ({ totalUsage }: TokenUsageUpdated) => {
+      this.persistResumableSessionId(false, p)
       if (totalUsage) this.usageTotalsSeedUnknown = false
     })
-    p.on('turn_plan_updated', (plan: TurnPlanUpdated) => {
-      if (this.proc !== p) return
+    on('turn_plan_updated', (plan: TurnPlanUpdated) => {
       this.handleTurnPlanUpdated(p, plan)
     })
-    p.on('plan_delta', (delta: PlanDelta) => {
-      if (this.proc !== p) return
+    on('plan_delta', (delta: PlanDelta) => {
       this.handlePlanDelta(p, delta)
     })
-    p.on('context_compacted', (notice: ContextCompactedNotification) => {
-      if (this.proc !== p) return
+    on('context_compacted', (notice: ContextCompactedNotification) => {
       this.handleContextCompacted(p, notice)
     })
-    p.on('rate_limits_updated', (rateLimits: any) => {
-      if (this.proc !== p) return
-      // usage.ts 的缓存是 codex 专属(planType/primary/secondary 形状)。claude
-      // 的 rate_limit_info 形状不同但同样 truthy,写入会把 codex 快照覆盖成
-      // 全 null 的假 ok 数据 —— 只放行 codex 进程的事件。
-      if (p.provider === 'codex') updateUsageFromRateLimits(rateLimits)
+    on('rate_limits_updated', (rateLimits: any) => {
+      // codex rolling 通知 limitId 不可信(2026-08-20 源码核实:上游 SSE/WS
+      // 事件缺 metered_limit_name 时,codex 解析器把 limitId 强补 "codex",
+      // Spark 桶内容会被贴上主桶标签)—— 通知不写 cache,只观察日志;
+      // 权威状态在 turn 收尾用现有连接 read 端点整体刷新(closeTurnCard)。
+      // claude 的 rate_limit_info 形状不同,同样不进 codex 快照。
+      if (p.provider === 'codex' && !getTokenSource(p.tokenSourceId)?.codexApiProvider) observeRateLimitsNotification(rateLimits, processCodexAccount(p))
     })
-    p.on('thread_goal_updated', (goal: ThreadGoal) => {
-      if (this.proc !== p) return
+    on('thread_goal_updated', (goal: ThreadGoal) => {
       this.handleThreadGoalUpdated(p, goal)
     })
-    p.on('thread_goal_cleared', () => {
-      if (this.proc !== p) return
+    on('thread_goal_cleared', () => {
       this.handleThreadGoalCleared(p)
     })
-    p.on('assistant_text', ({ text }: { text: string }) => {
-      if (this.proc !== p) return
+    on('assistant_text', ({ text, parentToolUseId }: { text: string; parentToolUseId: string | null }) => {
+      // SDK/CLI 若转发子 Agent assistant 正文，会在 parentToolUseId 上标归属；
+      // 其工具已进共享任务面板，正文同样不得泄漏进主对话卡。后台任务的可见进度/
+      // 终稿由 task_progress/task_notification 权威事件承载。
+      if (parentToolUseId) return
       if (text.trim()) this.observeWatchdogMeaningful(p, 'assistant_text')
       this.appendAssistant(text)
     })
-    p.on('assistant_block_stop', () => {
-      if (this.proc !== p) return
+    on('assistant_block_stop', ({ parentToolUseId }: { parentToolUseId: string | null }) => {
+      if (parentToolUseId) return
       // 一段 content block 收尾(SSE content_block_stop)→ 把当前 assistant 段
       // 静态化成完整 markdown,然后 reset 段游标让下一段开新元素。这条 emit 在该段最后一个
       // text_delta 之后同步到达(codex-process 按 stdout 行序 emit),所以
@@ -5503,8 +6862,7 @@ export class Session {
       // 主线程定稿一段 assistant = 主 agent 在继续说话、没在等 pending task → 提升后台入卡。
       this.onMainThreadAdvance()
     })
-    p.on('tool_use', ({ id, name, input, parentToolUseId }: { id: string; name: string; input: any; parentToolUseId: string | null }) => {
-      if (this.proc !== p) return
+    on('tool_use', ({ id, name, input, parentToolUseId }: { id: string; name: string; input: any; parentToolUseId: string | null }) => {
       // 子 agent 内的工具调用(parentToolUseId 非空)不上主卡 —— 只累积进对应后台
       // task 的 steps[](后台卡展开可见)。与 codex 侧 isSubagentThread 分流同构:
       // 主卡只承载主 agent,子 agent 过程不把主卡面板数刷爆。parentToolUseId 无
@@ -5517,15 +6875,38 @@ export class Session {
         this.onBackgroundTaskChanged()
         return
       }
+      if (!parentToolUseId && (name === 'Task' || name === 'Agent'
+        || p.provider === 'dsh' && (name === 'subagent' || name === 'subagent_fork'))) {
+        const turn = this.currentTurn
+        if (turn) {
+          this.startWorkingFooter(turn)
+          this.finalizeCurrentAssistantSegment()
+          turn.openBatchI = null
+          turn.taskCreateI = null
+          turn.taskUpdateI = null
+        }
+        this.onMainThreadAdvance()
+        this.nativeAgentTools.set(id, { confirmed: false, input })
+        // Codex exposes each child separately through collab lifecycle events.
+        // Claude's native tool is itself the initial task until task_started
+        // supplies its SDK id. Both paths keep launch details off the main card.
+        if (p.provider === 'claude') {
+          this.lastMainTaskToolUseId = id
+          this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), {
+            task_id: id, tool_use_id: id, task_type: 'subagent',
+            description: input?.description || input?.name || '子 Agent',
+            prompt: input?.prompt, subagent_type: input?.subagent_type,
+          }))
+          this.onBackgroundTaskChanged(true)
+        }
+        return
+      }
       sessionTools.addTool(this, p, id, name, input)
       // 主线程发起新 tool_use = 主 agent 没在等 pending 里的 task → 它们是后台,提升入卡。
       // 前台 task 的 settled 先于主线程下一个 tool_use 到达,pending 已空,不会误提。
       if (!parentToolUseId) this.onMainThreadAdvance()
-      // 主线程 Task tool_use(触发子 agent):记 id 供 task_started 缺 tool_use_id 时兜底关联
-      if (!parentToolUseId && (name === 'Task' || name === 'Agent')) this.lastMainTaskToolUseId = id
     })
-    p.on('tool_result', ({ tool_use_id, content, is_error, parentToolUseId }: any) => {
-      if (this.proc !== p) return
+    on('tool_result', ({ tool_use_id, content, is_error, parentToolUseId, input }: any) => {
       // 子 agent 内的工具结果同 tool_use:只回填后台 task steps,不上主卡面板。
       if (parentToolUseId && this.bgTaskOwns(parentToolUseId)) {
         this.applyBgStore(cards.applyBgToolResult(
@@ -5535,9 +6916,35 @@ export class Session {
         this.onBackgroundTaskChanged()
         return
       }
-      sessionTools.completeTool(this, p, tool_use_id, content, is_error)
+      const nativeTool = !parentToolUseId && this.nativeAgentTools.get(tool_use_id)
+      if (nativeTool) {
+        this.nativeAgentTools.delete(tool_use_id)
+        if (this.lastMainTaskToolUseId === tool_use_id) this.lastMainTaskToolUseId = null
+        // A background launch receipt is not the child's result. Only an
+        // unbound synchronous invocation or a failed launch settles here.
+        if (is_error || p.provider === 'claude' && !nativeTool.confirmed && nativeTool.input?.run_in_background !== true) {
+          const output = typeof content === 'string' ? content : Array.isArray(content)
+            ? content.map((block: any) => typeof block?.text === 'string' ? block.text : JSON.stringify(block)).join('\n')
+            : JSON.stringify(content) ?? 'MISS'
+          let task = this.backgroundTasks.find(entry => entry.toolUseId === tool_use_id)
+          if (!task) {
+            this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), {
+              task_id: tool_use_id, tool_use_id, task_type: 'subagent',
+              description: nativeTool.input?.description || '子 Agent', prompt: nativeTool.input?.prompt,
+            }))
+            task = this.backgroundTasks.find(entry => entry.toolUseId === tool_use_id)!
+          }
+          this.applyBgStore(cards.applyBgTaskSettled(this.bgStore(), {
+            task_id: task.id, status: is_error ? 'failed' : 'completed', summary: output,
+          }))
+          this.onBackgroundTaskChanged(true)
+        }
+        sessionTools.startThinkingIfNoToolsRunning(this)
+        return
+      }
+      sessionTools.completeTool(this, p, tool_use_id, content, is_error, input)
     })
-    p.on('subagent_activity', (activity: {
+    on('subagent_activity', (activity: {
       activityId: string
       agentThreadId: string
       agentPath: string | null
@@ -5560,7 +6967,7 @@ export class Session {
       }
       if (contextIsCurrent) this.observeWatchdogMeaningful(p, `subagent_activity:${activity.kind || 'unknown'}`)
     })
-    p.on('collab_agent_state', ({ toolUseId, agentsStates }: { toolUseId: string; agentsStates: CollabAgentStates }) => {
+    on('collab_agent_state', ({ toolUseId, agentsStates }: { toolUseId: string; agentsStates: CollabAgentStates }) => {
       if (this.proc !== p || typeof toolUseId !== 'string' || !toolUseId) return
       const context = this.watchdogContext
       const contextIsCurrent = !!context && context.proc === p && this.watchdogContextIsCurrent(context)
@@ -5608,12 +7015,10 @@ export class Session {
         this.observeWatchdogMeaningful(p, 'collab_agent_state')
       }
     })
-    p.on('can_use_tool', (req: CanUseToolRequest) => {
-      if (this.proc !== p) return
+    on('can_use_tool', (req: CanUseToolRequest) => {
       sessionPermission.renderPermission(this, req)
     })
-    p.on('hook_callback', (req: HookCallbackRequest) => {
-      if (this.proc !== p) return
+    on('hook_callback', (req: HookCallbackRequest) => {
       // No hooks registered → fail-safe ack.
       this.proc?.sendHookResponse(req.request_id, {})
     })
@@ -5628,7 +7033,9 @@ export class Session {
         `⚠️ ${routeKey} 触发爆窗/模型名降级:${model} 本轮报错,分母回 ${Math.round(contextWindow / 1000)}K,后续轮次自动回退裸名(重启 daemon 恢复 [1m] 记账)`,
       ).catch(() => {})
     })
-    p.on('result', (event: AgentResultEvent) => {
+    on('result', (result: any, snapshot) => {
+      const event: AgentResultEvent = (result ?? {}) as AgentResultEvent
+      this.releaseUnconsumedSteering(p)
       const deliveryContext = this.matchingHumanDeliveryResult(p, event ?? {})
       const ownsHumanTurn = this.resultOwnsCurrentHumanTurn(p, event ?? {}, deliveryContext)
       if (!ownsHumanTurn && this.activeTurnInterrupt?.proc !== p) {
@@ -5652,8 +7059,9 @@ export class Session {
         this.ackedHumanDelivery = null
       }
       if (rejectedHumanStart) {
-        this.persistResumableSessionId(p)
+        this.persistResumableSessionId(false, p)
         if (this.openingTurn) this.sawResultWhileOpening = true
+        if (this.openingTurnOwner && 'sawResult' in this.openingTurnOwner) this.openingTurnOwner.sawResult = true
         const rejectDetail = [
           event?.error,
           event?.subtype,
@@ -5703,14 +7111,14 @@ export class Session {
         log(`session "${this.sessionName}": ignore unmatched ${p.provider} result during turn interrupt`)
         return
       }
-      const resumePersistenceError = this.persistResumableSessionId(p)
+      const resumePersistenceError = this.persistResumableSessionId(false, p)
       // 首个 claude result = fork materialize 成功证据(4185808,挂账 #2):绑定
       // 推进成功才消费 durable marker;推进失败保留 marker 供重启恢复。
       const pendingPersistenceError = resumePersistenceError || p.provider !== 'claude'
         ? null
         : this.consumePendingConversationMaterialization()
       const persistenceError = [resumePersistenceError, pendingPersistenceError].filter(Boolean).join('；') || null
-      this.accumulateResultStats()
+      this.accumulateResultStats(snapshot)
       // 仅后端显式给出本轮 clean checkpoint 时记锚点;失败/中断/畸形 result
       // 不得复用上一轮 checkpoint(4185808:A checkpoint belongs to exactly
       // one clean turn)。
@@ -5721,13 +7129,18 @@ export class Session {
       // result 抢在 openTurnCard 的 await 窗口内到达:标记给开卡 IIFE,
       // 它落地后据此立即收尾(否则卡片悬挂、session 卡在 working)。
       if (this.openingTurn) this.sawResultWhileOpening = true
+      if (this.openingTurnOwner && 'sawResult' in this.openingTurnOwner) this.openingTurnOwner.sawResult = true
       // 整轮无卡且不在开卡中(恢复轮开卡失败):孤儿正文纯文本兜底。开卡
       // 窗口内(openingTurn)不 flush —— 让 openTurnCard 把缓冲并入卡片,
       // 避免又推一遍。有卡的轮次已在开卡时并入,这里 flush 为 no-op。
       if (!this.currentTurn && !this.openingTurn) this.flushOrphanAssistantToChat('result with no turn card')
       const hasMidTurn = this.pendingMidTurnMsgs.length > 0
-      const isError = this.proc?.lastResult.is_error === true
-      const subtype = this.proc?.lastResult.subtype ?? 'success'
+      const isError = snapshot.result.is_error === true
+      const subtype = snapshot.result.subtype ?? 'success'
+      // 上游吸收(fresh conversation state,上游 3960):非容量错误的终态文案
+      // 优先带后端的具体错误(result 事件 error 文本),无则回落 subtype ——
+      // 用户在卡面直接看到失败原因(如配额超限),不再只有错误类别。
+      const failureDetail = event.error?.trim() || subtype
       const hostAskFlowActive = this.pendingHostAsks.size > 0
       const capacityError = isError && (
         isCodexCapacityError(subtype)
@@ -5749,7 +7162,7 @@ export class Session {
         suffix = isError
           ? (capacityError
             ? `⚠️ ${backend} 模型容量不足,用户已介入`
-            : `⚠️ ${backend} ${subtype},用户已介入`)
+            : `⚠️ ${backend} ${failureDetail},用户已介入`)
           : '📨 转交新卡'
       } else if (isError) {
         // 容量文案只承诺进程层真实排定的节奏:能走到这条 result 说明进程层未接管
@@ -5759,7 +7172,7 @@ export class Session {
           ? (retryDelayMs === null
               ? `⚠️ ${backend} 模型容量不足`
               : `⚠️ ${backend} 模型容量不足，${Math.round(retryDelayMs / 1000)}s 后自动重试`)
-          : `⚠️ ${backend} ${subtype}`
+          : `⚠️ ${backend} ${failureDetail}`
         forcePush = true
       }
 
@@ -5777,7 +7190,9 @@ export class Session {
       }
 
       log(`session "${this.sessionName}": SDK result subtype=${subtype} isError=${isError} capacity=${capacityError} midBuffer=${this.pendingMidTurnMsgs.length} forcePush=${forcePush}`)
-      void this.closeTurnCard(suffix, { forcePush, hasFreshResult: true })
+      void this.closeTurnCard(suffix, { forcePush, hasFreshResult: true }).catch(e => {
+        log(`session "${this.sessionName}": result card close failed: ${messageOf(e)}`)
+      })
       this.status = 'idle'
       sessionHostAsk.resumeAnsweredHostAsks(this)
 
@@ -5789,7 +7204,9 @@ export class Session {
       if (hasMidTurn && !hostAskFlowActive) {
         // 用户已介入:真人消息优先;重试节奏归进程层(D-07),这里不再排任何计时器。
         if (capacityError) this.clearCapacityRetryState('user_midturn_priority')
-        void this.drainMidTurnAndOpen()
+        void this.drainMidTurnAndOpen().catch(e => {
+          log(`session "${this.sessionName}": mid-turn drain failed: ${messageOf(e)}`)
+        })
       }
     })
     p.on('bg_task_started', (e: BgTaskStartedEvent) => {
@@ -5797,7 +7214,9 @@ export class Session {
       const before = backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)
       // SDK 若没填 tool_use_id,用最近的主线程 Task tool_use id 兜底 —— 子 agent 消息
       //  的 parent_tool_use_id 等于它,据此才能把 steps 关联到 task。
-      const toolUseId = e.tool_use_id ?? this.lastMainTaskToolUseId ?? undefined
+      const toolUseId = e.tool_use_id ?? (p.provider === 'claude' ? this.lastMainTaskToolUseId : null) ?? undefined
+      const nativeTool = toolUseId ? this.nativeAgentTools.get(toolUseId) : undefined
+      if (nativeTool) nativeTool.confirmed = true
       log(`session "${this.sessionName}": bg_task_started task=${e.task_id} type=${e.task_type ?? '-'} subagent=${e.subagent_type ?? '-'} toolUseId=${toolUseId?.slice(0, 8) ?? '-'} desc=${(e.description ?? '').slice(0, 40)}`)
       this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), { ...e, tool_use_id: toolUseId }))
       if (before !== backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)) {
@@ -5888,6 +7307,41 @@ export class Session {
     })
     p.on('exit', ({ code, signal, expected }: any) => {
       log(`session "${this.sessionName}": ${p.provider} exited code=${code} signal=${signal} expected=${expected}`)
+      if (this.stoppingProc === p || this.blockedProc === p) {
+        if (this.blockedProc === p) {
+          const materializationFailure = p.conversationMaterializationFailure?.()
+          const persistenceFailure = this.persistResumableSessionId(false, p, false)
+          const lateStateFailure = [
+            materializationFailure && p.isConversationResumable?.() !== true
+              ? `Codex 会话落盘确认失败: ${messageOf(materializationFailure)}`
+              : null,
+            persistenceFailure,
+          ].filter(Boolean).join('；')
+          if (lateStateFailure) {
+            void feishu.sendTextRaw(this.chatId, `⚠️ 旧进程退出后的恢复状态收尾失败: ${lateStateFailure}`)
+          }
+          this.discardPendingCodexTurnAnchors(p, 'blocked process finally exited')
+        }
+        log(`session "${this.sessionName}": blocked/stopping ${p.provider} exit confirmed`)
+        // 合并调和(取舍):上游同位径直 status='stopped' + OLC。本地冻结语义
+        // (main kill 前预置 proc=null → exit stale 早退,不写不报)要求在途
+        // stop/restart 事务的 kill await 窗口内到达的 exit 不额外写状态/上报:
+        // 事务收口自身必然写状态并触发 OLC(stop 3140/3240 两次;restart 成功
+        // 3788 或失败 3600/3643/3745/3773),此处再报一次会让本地用例
+        // 'real strict restart init failure cannot mutate a newer process owner'
+        // / '...post-init ownership loss...' 的 lifecycleChanges===0 多计一次。
+        // 真正滞后的确认退出(无在途 kill,blockedProc 已在位 —— 上游
+        // 'stop clears visible state but keeps an unconfirmed process blocked
+        // until its real exit' 场景)仍是无人代报的独立状态迁移,按上游写状态
+        // 并上报。stoppingProc 在位 ⇔ beginProcStop 后 finishProcStop 未收口
+        // (kill await 在途),detachProc 会清它,故先取快照。
+        const killInFlight = this.stoppingProc === p
+        this.detachProc(p)
+        if (killInFlight) return
+        this.status = 'stopped'
+        this.opts.onLifecycleChange?.()
+        return
+      }
       // 进程已死:它的延迟锚永远无法经 persist→flush 落盘,立即丢弃防幽灵锚
       // (挂账 #3 收尾口;stop/restart 的 kill 路径亦有兜底 discard)。
       this.discardPendingCodexTurnAnchors(p, expected ? 'confirmed process exit' : 'unexpected process exit')
@@ -6006,6 +7460,26 @@ export class Session {
         }
         return
       }
+      // (上游 4065 同位)意外退出必须把在途主卡终结到终态 footer/关流,
+      // 不能停在 streaming 态。closeTurnCard 在首个 await 前同步摘掉
+      // currentTurn,所以先启动再 detach;expected 退出同样收口('🛑 …已退出')。
+      // 合并调和(取舍):本地旧路径只 stopFooterStatus + 摘 currentTurn,
+      // 依赖上游用例 'unexpected exit terminalizes the main card…(code=0
+      // SIGTERM)' 要求 footer/settings 落地,此处吸收上游收口。
+      if (this.currentTurn) {
+        const terminalSuffix = expected
+          ? `🛑 ${this.backendLabel(p.provider)} 已退出`
+          : `⚠️ ${this.backendLabel(p.provider)} 异常退出 (code=${code ?? 'null'}, signal=${signal ?? 'null'})`
+        void this.closeTurnCard(terminalSuffix).catch(e => {
+          log(`session "${this.sessionName}": process-exit current main-card close failed: ${messageOf(e)}`)
+        })
+      }
+      // 在途 turn close 先等落地再走终态清理(上游 4075 同位);失败只记日志,
+      // 不让 exit 清理被一张卡的收尾错误拖垮。
+      const turnClose = this.waitForTurnCloses()
+        .catch(e => {
+          log(`session "${this.sessionName}": process-exit main-card close failed: ${messageOf(e)}`)
+        })
       this.proc = null
       // 进程死了,残留的孤儿正文再不兜底就永远丢了(非用户主动停止的崩溃
       // 路径;stop/restart 已在 kill 前 null 掉 this.proc,走上面的 stale
@@ -6034,7 +7508,7 @@ export class Session {
         if (this.ackedHumanDelivery === ackedHumanDelivery) this.ackedHumanDelivery = null
       }
       this.initCount = 0
-      this.clearTurnOpening()
+      this.invalidateTurnOpen()
       // 进程没了 ⇒ 任何 pending ask 都不可能再收到 can_use_tool 或回传答案,
       // 定义上已死。不清的话 hasPendingAsk() 恒 true,后续每条消息都被
       // onAskMessageAnswer 当僵尸答案吞掉,session 焊死到下次 daemon 重启
@@ -6047,9 +7521,30 @@ export class Session {
       this.usageTotalsSeedUnknown = false
       this.status = 'stopped'
       this.opts.onLifecycleChange?.()
-      if (!expected && code !== 0 && signal !== 'SIGTERM') {
-        void feishu.sendText(this.chatId, `⚠️ ${this.backendLabel(p.provider)} 异常退出 (code=${code}, signal=${signal})。回复任意消息将重新启动。`)
-      }
+      void this.runLifecycle('process-exit-cleanup', async () => {
+        const backend = this.backendLabel(p.provider)
+        const exitDetail = `code=${code ?? 'null'}, signal=${signal ?? 'null'}`
+        const settled = await Promise.allSettled([
+          turnClose,
+          this.resetBackgroundTasks(),
+        ])
+        for (const outcome of settled) {
+          if (outcome.status === 'rejected') {
+            log(`session "${this.sessionName}": process-exit terminal cleanup failed: ${messageOf(outcome.reason)}`)
+          }
+        }
+        // `expected` is the process wrapper's explicit contract. Every exit
+        // it marks unexpected is user-visible, including code=0 or SIGTERM;
+        // filtering those values hid real upstream shutdowns in the past.
+        if (!expected) {
+          await feishu.sendText(
+            this.chatId,
+            `⚠️ ${backend} 异常退出 (${exitDetail})。回复任意消息将重新启动。`,
+          )
+        }
+      }).catch(e => {
+        log(`session "${this.sessionName}": process-exit cleanup rejected: ${messageOf(e)}`)
+      })
     })
   }
 
@@ -6060,14 +7555,14 @@ export class Session {
    * `turn_started`, so a multi-request turn is aggregated correctly
    * instead of inheriting only the final request's `last` snapshot.
    * Called exactly once per result event, right before closeTurnCard. */
-  private accumulateResultStats(): void {
-    const r = this.proc?.lastResult
+  private accumulateResultStats(snapshot?: { result: CodexResultMeta; totalUsage: CodexUsage | null }): void {
+    const r = snapshot?.result ?? this.proc?.lastResult
     if (!r) return
     // Claude result.usage is scoped to the just-finished SDK query; after a
     // resumed session starts with no local total baseline, this is the only
     // accurate per-turn figure we have.
     const u = this.currentTurnUsageBaselineKnown
-      ? diffUsageTotals(this.proc?.lastTotalUsage, this.currentTurnUsageBaseline)
+      ? diffUsageTotals(snapshot ? snapshot.totalUsage : this.proc?.lastTotalUsage, this.currentTurnUsageBaseline)
       : this.proc?.provider === 'claude' && r.usage
         ? { ...r.usage }
         : null
@@ -6092,19 +7587,160 @@ export class Session {
   /** Current context-window occupancy. Claude 路径直接读 SDK modelUsage 算好
    * 的输入侧占用(proc.lastContextTokens = input+cache_read+cache_creation,
    * 不含 output);DSH 同语义(原生 usage 的输入侧占用)。Codex 路径继续用
-   *  lastUsage.total_tokens。 */
-  private currentContextTokens(): number | null {
-    if (this.proc?.provider === 'claude' || this.proc?.provider === 'dsh') {
-      return this.proc?.lastContextTokens ?? null
+   * lastUsage.total_tokens。 */
+  private currentContextTokens(proc: AgentProcess | null = this.proc): number | null {
+    if (proc?.provider === 'claude' || proc?.provider === 'dsh') {
+      return proc.lastContextTokens ?? null
     }
-    const u = this.proc?.lastUsage as CodexUsage | null | undefined
+    const u = proc?.lastUsage as CodexUsage | null | undefined
     return contextTokensFromUsage(u)
   }
 
   /** Display denominator for context percentage. Codex: app-server's
    * effective modelContextWindow;Claude: SDK modelUsage.contextWindow。 */
-  private contextLimitForDisplay(): number | null {
-    return contextLimitFromAppServer(this.proc?.lastContextWindow)
+  private contextLimitForDisplay(proc: AgentProcess | null = this.proc): number | null {
+    return contextLimitFromAppServer(proc?.lastContextWindow)
+  }
+
+  /** Submit without holding the actor: stop and tool answers stay available
+   * while the backend acknowledges the write. A rejected/uncertain write is
+   * reported, never replayed as a new task. */
+  private steerPendingInputs(): void {
+    const proc = this.proc
+    const turn = this.currentTurn
+    if (!proc?.steerUserText || !turn || this.openingTurn
+      || this.steeringSend || this.pendingMidTurnMsgs.length === 0 || this.modelSettingsBlockReason()) return
+    const epoch = this.procEpoch
+    const generation = this.steeringGeneration
+    const batch = this.pendingMidTurnMsgs.splice(0)
+    const reactions = this.pendingReactionIds
+    const inputId = randomUUID()
+    const input = { proc, epoch, generation, turn, batch, reactions, consumed: false }
+    this.submittedSteering.set(inputId, input)
+    let retained = false
+    let accepted = false
+    const ownsInput = () => this.proc === proc && this.procEpoch === epoch
+      && this.steeringGeneration === generation && proc.isAlive()
+    const operation = Promise.resolve().then(async () => {
+      if (!ownsInput()) return
+      const blocked = this.disabledSubscriptionMessage(proc.tokenSourceId)
+      if (blocked) throw new Error(blocked)
+      accepted = await proc.steerUserText!(batch.map(msg => msg.wireText).join('\n\n'), [], inputId)
+      if (!ownsInput()) return
+      if (!accepted) {
+        // No request was sent (startup, quota recovery, or native turn ended
+        // before dispatch). Preserve FIFO order for the next ready boundary.
+        this.pendingMidTurnMsgs.unshift(...batch)
+        this.submittedSteering.delete(inputId)
+        retained = true
+        return
+      }
+      // Only user_input_consumed owns the rendering boundary. The backend
+      // can acknowledge a queued message well before the model sees it.
+    }).catch(async error => {
+      log(`session "${this.sessionName}": steering input failed: ${messageOf(error)}`)
+      await feishu.sendTextRaw(this.chatId, `❌ 追加消息${input.consumed ? '已确认进入执行流，但提交回执异常' : '提交未获确认，未自动重发'}：${messageOf(error)}`)
+    }).finally(() => {
+      turn.steeringInflight?.delete(operation)
+      if (this.steeringSend === operation) this.steeringSend = null
+      if (!ownsInput()) this.submittedSteering.delete(inputId)
+      // Consumption transfers reaction ownership to the supplemental card.
+      // A late submit ACK must not clear its waiting marker before that card.
+      if (!retained && !input.consumed && !this.submittedSteering.has(inputId)) {
+        this.releaseSteeringReactions(input)
+      }
+      if (!ownsInput()) return
+      if (!this.currentTurn && !this.openingTurn && this.pendingMidTurnMsgs.length) {
+        void this.drainMidTurnAndOpen().catch(error => log(`session "${this.sessionName}": input drain failed: ${messageOf(error)}`))
+      } else if (accepted) this.steerPendingInputs()
+    })
+    this.steeringSend = operation
+    ;(turn.steeringInflight ??= new Set()).add(operation)
+  }
+
+  private releaseSteeringReactions(input: { batch: Array<{ msgId: string }>; reactions: Map<string, string> }): void {
+    for (const msg of input.batch) {
+      const rid = input.reactions.get(msg.msgId)
+      input.reactions.delete(msg.msgId)
+      if (rid) void feishu.deleteReaction(msg.msgId, rid)
+    }
+  }
+
+  private releaseUnconsumedSteering(proc: AgentProcess): void {
+    let count = 0
+    for (const [id, input] of this.submittedSteering) {
+      if (input.proc !== proc) continue
+      this.submittedSteering.delete(id)
+      this.releaseSteeringReactions(input)
+      count += input.batch.length
+    }
+    if (count) {
+      const message = `本轮已结束，但 ${count} 条追加消息缺少原生处理位置确认，未据此换卡或自动重发。`
+      log(`session "${this.sessionName}": ${message}`)
+      void feishu.sendTextRaw(this.chatId, `⚠️ ${message}`)
+    }
+  }
+
+  /** Freeze the presentation at the native input item, not at request ACK.
+   * Events after this point retain FIFO order while Feishu creates the card. */
+  private onSteeringInputConsumed(proc: AgentProcess, epoch: number, inputId: string): void {
+    const input = this.submittedSteering.get(inputId)
+    if (!input || input.proc !== proc || input.epoch !== epoch) return
+    this.submittedSteering.delete(inputId)
+    input.consumed = true
+    const { turn, generation } = input
+    if (this.currentTurn !== turn || generation !== this.steeringGeneration) {
+      this.releaseSteeringReactions(input)
+      return
+    }
+    log(`session "${this.sessionName}": steering consumed input=${inputId} messages=${input.batch.length}`)
+    const pending = this.steeringBoundary
+    if (pending?.collecting && pending.turn === turn && pending.proc === proc && pending.epoch === epoch) {
+      pending.inputs.push(...input.batch.map(msg => msg.text))
+      pending.inputIds.push(inputId)
+      pending.reactionOwners.push(input)
+      return
+    }
+    let start!: () => void
+    const batchEnd = new Promise<void>(resolve => { start = resolve })
+    const boundary = { turn, proc, epoch, generation, events: [] as Array<() => void>,
+      inputs: input.batch.map(msg => msg.text), inputIds: [inputId], collecting: true,
+      reactionOwners: [input],
+      start: () => { boundary.collecting = false; start() },
+    }
+    this.steeringBoundary = boundary
+    const ownsBoundary = () => this.steeringBoundary === boundary && this.proc === proc
+      && this.procEpoch === epoch && this.steeringGeneration === generation && this.currentTurn === turn
+    // Finish the old segment before any following native delta can arrive.
+    // An existing capacity rotation is allowed to finish first; its incoming
+    // events are now fenced too, so this text still belongs before the input.
+    if (!turn.rotating) this.finalizeCurrentAssistantSegment()
+    const operation = Promise.resolve().then(async () => {
+      await batchEnd
+      if (turn.rotating) await turn.rotating
+      if (!ownsBoundary()) return
+      this.finalizeCurrentAssistantSegment()
+      log(`session "${this.sessionName}": steering input batch inputs=${boundary.inputs.length} receipts=${boundary.inputIds.length} — rotate at native boundary`)
+      this.startMidTurnRotate(turn, {
+        userInputs: boundary.inputs,
+        onCardSent: () => {
+          if (!ownsBoundary()) return
+          for (const owner of boundary.reactionOwners) this.releaseSteeringReactions(owner)
+        },
+      })
+      await turn.rotating
+    }).catch(async error => {
+      log(`session "${this.sessionName}": input-boundary card handoff failed: ${messageOf(error)}`)
+      await feishu.sendTextRaw(this.chatId, `⚠️ 追加消息已进入执行流，但换卡失败：${messageOf(error)}`)
+    }).finally(() => {
+      turn.steeringInflight?.delete(operation)
+      if (this.steeringBoundary !== boundary) return
+      this.steeringBoundary = null
+      // Dispatch checks ownership again and will enqueue behind a later
+      // boundary encountered in this same batch, preserving native order.
+      for (const dispatch of boundary.events) dispatch()
+    })
+    ;(turn.steeringInflight ??= new Set()).add(operation)
   }
 
   /** Drain `pendingMidTurnMsgs` to the SDK and open a fresh card for the
@@ -6132,6 +7768,7 @@ export class Session {
     lease: LifecycleLease
     recovery: PreservedWatchdogRecovery
   }): Promise<MidTurnDrainOutcome> {
+    if (this.steeringSend) await this.steeringSend
     const validOwnership = (): boolean =>
       !ownership || (
         this.ownsPreservedWatchdogRecovery(ownership.recovery, ownership.lease) &&
@@ -6141,15 +7778,17 @@ export class Session {
       )
     if (!validOwnership()) return 'preserved'
     if (this.pendingMidTurnMsgs.length === 0) return 'no_batch'
+    if (this.modelSettingsBlockReason()) return 'preserved'
     const proc = this.proc
+    const epoch = this.procEpoch
     if (!proc?.isAlive()) return 'preserved'
     // A result may arrive while a bg-resume/scheduled card is still opening
     // and ask us to drain a user message buffered mid-window. Never replace
     // that owner: wait until it has attached+closed its own orphan output,
     // then open the user batch as a distinct turn.(上游 7c14677 单飞)
-    if (!await this.waitForTurnOpenSlot(proc)) return 'preserved'
+    if (!await this.waitForTurnOpenSlot(proc, epoch)) return 'preserved'
     if (!validOwnership()) return 'preserved'
-    if (this.currentTurn) return 'preserved'
+    if (this.currentTurn || this.openingTurn) return 'preserved'
     if (this.pendingMidTurnMsgs.length === 0) return 'no_batch'
     const batch = this.pendingMidTurnMsgs
     this.pendingMidTurnMsgs = []
@@ -6173,24 +7812,72 @@ export class Session {
       }
       const last = batch[batch.length - 1]
       const userOpenId = last?.userOpenId ?? this.lastUserOpenId
-      const openResult = await this.openTurnCard(userOpenId, 'user_message', { expectedProc: proc })
+      const openResult = await this.openTurnCard(openingToken, userOpenId, 'user_message', { expectedProc: proc })
+      const opened = this.openedTurnOf(openResult)
       if (
-        openResult.kind !== 'opened' ||
-        this.currentTurn !== openResult.turn ||
+        !opened.ok ||
+        opened.turn === null ||
+        this.currentTurn !== opened.turn ||
         this.proc !== proc ||
         !proc.isAlive() ||
         (ownership && !this.ownsPreservedWatchdogRecovery(ownership.recovery, ownership.lease))
       ) {
+        // 合并调和(取舍):两套「开卡失败」语义按失败段拆分 ——
+        // ① stage='convert'(卡片消息已创建、id_convert 失败):沿上游
+        //    「丢弃本批」——批次不 restore、held 回执立即释放、status 复位
+        //    idle(上游用例 'opens a mid-turn card before feeding the
+        //    buffered batch…drops input on card init failure')。
+        // ② stage='send'(sendCard 连卡片消息都没发出)及其它非 opened:
+        //    沿本地 restore —— 批次回存 pendingMidTurnMsgs、回执保留
+        //    (本地用例 'does not send a drained prompt when its turn card
+        //    fails to open':status 不变、pendingReactionIds 回存、
+        //    deletedReactions 为空)。openTurnCard 抛异常(用例
+        //    'restores queued input when opening its follow-up card throws')
+        //    与投递被拒(dispatchHumanBatch → rejectHumanDelivery)同样走
+        //    restore。
+        if (opened.failed && !opened.stale && (openResult as { stage?: string } | null)?.stage === 'convert') {
+          for (const [msgId, rid] of delivery.reactions) {
+            if (rid) void feishu.deleteReaction(msgId, rid)
+          }
+          delivery.reactions.clear()
+          delivery.state = 'restored'
+          if (this.pendingHumanDelivery === delivery) this.pendingHumanDelivery = null
+          this.status = 'idle'
+          return 'preserved'
+        }
         this.restoreHumanDelivery(delivery)
         return 'preserved'
       }
-      delivery.turn = openResult.turn
+      delivery.turn = opened.turn
       return await this.dispatchHumanBatch(delivery)
     } catch (e) {
       this.restoreHumanDelivery(delivery)
       throw e
     } finally {
       this.finishTurnOpening(openingToken)
+      // Messages that arrived while this card was opening belong to a later
+      // batch. If this batch failed before creating a turn there will be no
+      // SDK `result` event to trigger their drain, so hand them off now.
+      // 合并调和:本地 restore 语义会把失败批次(同一批对象)回存
+      // pendingMidTurnMsgs —— 无论 restore 发生在 drain 自身还是
+      // dispatchHumanBatch→rejectHumanDelivery 内 —— 而上游这里只判 length>0。
+      // 两者叠加后 openTurnCard/dispatch 持续失败会在 finally 里把同一批反复
+      // 自旋 drain(session.test 'restores queued input when opening its
+      // follow-up card throws' 与 'Codex RPC rejection before ACK restores …'
+      // 的微任务死循环)。以对象身份判定:只有本批之外的新消息才交接,失败
+      // 批次保持 queued 等下一次触发。
+      const attempted = new Set(batch)
+      if (
+        !this.currentTurn &&
+        this.pendingMidTurnMsgs.some(msg => !attempted.has(msg)) &&
+        this.proc === proc &&
+        this.procEpoch === epoch &&
+        proc.isAlive()
+      ) {
+        void this.drainMidTurnAndOpen().catch(e => {
+          log(`session "${this.sessionName}": mid-turn drain failed: ${messageOf(e)}`)
+        })
+      }
     }
   }
 
@@ -6211,21 +7898,23 @@ export class Session {
     try {
       let openResult: TurnCardOpenResult
       try {
-        openResult = await this.openTurnCard(userOpenId, 'watchdog_resume', {
+        openResult = await this.openTurnCard(openingToken, userOpenId, 'watchdog_resume', {
           expectedProc: proc,
         })
       } catch (e) {
         log(`session "${this.sessionName}": watchdog recovery-card open failed: ${messageOf(e)}`)
         return 'failed'
       }
+      const opened = this.openedTurnOf(openResult)
       if (
         !this.ownsWatchdogAction(transaction) ||
         !this.ownsPreservedWatchdogRecovery(recovery, transaction.lease)
       ) return 'stale'
-      if (openResult.kind === 'stale') return 'stale'
-      if (openResult.kind === 'failed') return 'failed'
+      if (opened.stale) return 'stale'
+      if (opened.failed) return 'failed'
       if (
-        this.currentTurn !== openResult.turn ||
+        opened.turn === null ||
+        this.currentTurn !== opened.turn ||
         this.proc !== proc ||
         !proc.isAlive()
       ) return 'stale'
@@ -6263,13 +7952,13 @@ export class Session {
       const dispatch = await this.dispatchSystemUserText(
         proc,
         WATCHDOG_RECOVERY_PROMPT,
-        openResult.turn,
+        opened.turn,
         openingToken,
       )
       if (dispatch !== 'accepted') {
         if (dispatch === 'rejected') {
           await this.closeRejectedSystemTurn(
-            openResult.turn,
+            opened.turn,
             proc,
             '⚠️ Codex 未接受自动恢复请求',
           )
@@ -6277,7 +7966,7 @@ export class Session {
         }
         return 'stale'
       }
-      if (this.proc === proc && this.currentTurn === openResult.turn) this.status = 'working'
+      if (this.proc === proc && this.currentTurn === opened.turn) this.status = 'working'
       return 'started'
     } finally {
       this.finishTurnOpening(openingToken)
@@ -6802,7 +8491,57 @@ export class Session {
     })
   }
 
+  private async terminalizeSupersededCard(
+    cardId: string,
+    status: string,
+    hasFooter: boolean,
+  ): Promise<void> {
+    const failures: cardkit.CardWriteFailure[] = []
+    const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
+    const footerLanded = hasFooter
+      ? await cardkit.replaceElementChecked(cardId, cards.ELEMENTS.footer, this.footerElement(status), { onFailure })
+      : true
+    cardkit.cancelSummary(cardId)
+    const settingsLanded = await cardkit.patchSettingsChecked(
+      cardId,
+      cards.streamingOffSettings({ suffix: status }),
+      onFailure,
+    )
+    if (footerLanded && settingsLanded) {
+      await cardkit.dispose(cardId)
+      return
+    }
+    const detail = `footer=${footerLanded ? 'ok' : 'MISS'}, settings=${settingsLanded ? 'ok' : 'MISS'}`
+    log(`session "${this.sessionName}": superseded card terminal transaction incomplete card=${cardId.slice(0, 12)} ${detail}`)
+    await feishu.sendTextRaw(this.chatId, `⚠️ 已作废卡片未能正常关闭 (${detail})。\n${cardFailureDetails(failures)}`)
+  }
+
+  /**
+   * 合并返回面双消费归一。本地调用面按 TurnCardOpenResult
+   * ({kind:'opened',turn} | {kind:'failed'} | {kind:'stale'}) 消费;
+   * 上游调用面/测试覆写直接返回 raw TurnState(成功)或 null/undefined
+   * (放弃)。真实 openTurnCard 已把两者合并到同一活对象(kind='opened'、
+   * turn=自身),但测试覆写会替换该方法返回纯 raw —— 调用面必须两种形状
+   * 都接受。无 kind 字段即视为上游 raw 形态:成功,turn 为自身。
+   */
+  private openedTurnOf(openResult: TurnCardOpenResult | TurnState | null | undefined): {
+    ok: boolean
+    failed: boolean
+    stale: boolean
+    turn: TurnState | null
+  } {
+    if (!openResult) return { ok: false, failed: true, stale: false, turn: null }
+    const kind = (openResult as { kind?: string }).kind
+    if (kind === 'opened') {
+      return { ok: true, failed: false, stale: false, turn: (openResult as { turn: TurnState }).turn }
+    }
+    if (kind === 'failed') return { ok: false, failed: true, stale: false, turn: null }
+    if (kind !== undefined) return { ok: false, failed: false, stale: true, turn: null }
+    return { ok: true, failed: false, stale: false, turn: openResult as TurnState }
+  }
+
   private async openTurnCard(
+    owner: TurnOpenOwner | TurnOpenTerminalStash,
     userOpenId: string,
     trigger: TurnState['trigger'],
     opts: {
@@ -6812,7 +8551,22 @@ export class Session {
       expectedProc?: AgentProcess
     } = {},
   ): Promise<TurnCardOpenResult> {
+    // 调用形态归一:合并定稿签名取上游 owner 协议 (owner, userOpenId, trigger, opts);
+    // 本地(main)调用面为 (userOpenId, trigger, opts) —— 生产装配已统一为上游四参,
+    // 仅本地测试组经 as-any 直呼首参 string 的三参形态。首参 string 即按本地形态
+    // 平移:owner 取当前开卡槽位(经 beginTurnOpening 装配;测试未装配则就地补一个,
+    // 等价 main 无 owner 入口的整体语义 —— 入口门 ownsTurnOpen 与中途代际检查都以
+    // 此 owner 判定),第三参(trigger 位)整体当 opts。
+    if (typeof (owner as unknown as string) === 'string') {
+      const localOpts = (trigger as unknown as typeof opts) ?? {}
+      trigger = userOpenId as TurnState['trigger']
+      userOpenId = owner as unknown as string
+      owner = this.openingTurnOwner ?? this.beginTurnOpening()
+      opts = localOpts
+    }
     if (opts.expectedProc && this.proc !== opts.expectedProc) return { kind: 'stale' }
+    if (!this.ownsTurnOpen(owner)) return { kind: 'stale' }
+    const pendingCompactions = 'pendingCompactions' in owner ? owner.pendingCompactions : []
     const turnSelection = this.runtimeModelSelection()
     const watchdogOpeningTurnCounter = this.turnCounter + 1
     const watchdogOpeningProc = opts.expectedProc ?? this.proc
@@ -6869,15 +8623,16 @@ export class Session {
       turn,
       provider: turnSelection.provider,
       model: turnSelection.model ?? undefined,
-      effort: turnSelection.effort,
+      effort: turnSelection.effort ?? 'MISS',
       kind: trigger,
       userInputs,
       initialFooter,
       directStart: opts.directStart,
     })
     let messageId: string | null
+    let sendFailure: unknown
     try {
-      messageId = await feishu.sendCard(this.chatId, card)
+      messageId = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
     } catch (e) {
       if (!openingIsCurrent()) {
         await this.cleanupStaleTurnOpen({
@@ -6916,7 +8671,7 @@ export class Session {
         if (trigger === 'user_message') {
           await feishu.sendTextRaw(
             this.chatId,
-            '❌ 创建对话卡片失败 (Feishu SDK 重试 3 次后仍连不上)。你这条消息没能送到 Codex,请稍后重发。',
+            `❌ 创建对话卡片失败。你这条消息尚未送给 ${this.backendLabel()},请稍后重发。\n${formatFeishuError(sendFailure)}`,
           )
         }
       } catch (e) {
@@ -6947,7 +8702,7 @@ export class Session {
       // whether to sendInterrupt: onUserMessage's eager-open path
       // hasn't fed SDK yet so doesn't need to; the init handler has
       // (SDK started the turn itself) and must.
-      return { kind: 'failed' }
+      return { kind: 'failed', stage: 'send' }
     }
     let cardId: string
     try { cardId = await cardkit.convertMessageToCard(messageId) }
@@ -6965,9 +8720,30 @@ export class Session {
       this.finishWatchdogOpening(watchdogOpeningTurnCounter, true, watchdogOpeningProc, openingToken)
       this.rebuildBackgroundAfterTurnOpenFailure()
       log(`session "${this.sessionName}": id_convert failed: ${e}`)
-      return { kind: 'failed' }
+      if (trigger === 'user_message' && this.ownsTurnOpen(owner)) {
+        await feishu.sendTextRaw(
+          this.chatId,
+          `❌ 对话卡片初始化失败。你这条消息尚未送给 ${this.backendLabel()},请稍后重发。\n${formatFeishuError(e)}`,
+        )
+      }
+      return { kind: 'failed', stage: 'convert' }
     }
+    // Tell cardkit how many elements the initial body already has so
+    // its element-count tracker is correct from the first addElement
+    // onwards (bg-resume banner + userInputPanel + footer).
+    const initialElementCount =
+      (trigger === 'bg_task_resume' || trigger === 'watchdog_resume' || trigger === 'scheduled_wakeup' ? 1 : 0) +
+      (userInputs.length > 0 ? 1 : 0) +
+      1
     if (staleAfterSend || !openingIsCurrent()) {
+      // 合并调和(取舍):上游在同位(convert 后 !ownsTurnOpen)先
+      // recordCardCreated 再 terminalizeSupersededCard —— 经测试绕过的
+      // id_convert 返回时卡片不在 cardkit bookkeeping 里,patchSettingsChecked
+      // 的 isDisposed 短路会吞掉终态 PATCH。本地 cleanupStaleTurnOpen 的
+      // 终态写(footer『⚪ 本轮已取消』/settings/dispose)依赖同一注册,
+      // 这里补注册(上游用例 'an obsolete main-card open cannot replace a
+      // newer process turn…' 以 PATCH /cards/<old>/settings 判定)。
+      cardkit.recordCardCreated(cardId, initialElementCount)
       await this.cleanupStaleTurnOpen({
         openingTurnCounter: watchdogOpeningTurnCounter,
         openingProc: watchdogOpeningProc,
@@ -6978,13 +8754,11 @@ export class Session {
       })
       return { kind: 'stale' }
     }
-    // Tell cardkit how many elements the initial body already has so
-    // its element-count tracker is correct from the first addElement
-    // onwards (bg-resume banner + userInputPanel + footer).
-    const initialElementCount =
-      (trigger === 'bg_task_resume' || trigger === 'watchdog_resume' || trigger === 'scheduled_wakeup' ? 1 : 0) +
-      (userInputs.length > 0 ? 1 : 0) +
-      1
+    if (!this.ownsTurnOpen(owner)) {
+      cardkit.recordCardCreated(cardId, initialElementCount)
+      await this.terminalizeSupersededCard(cardId, '⚠️ 会话已切换，本卡已作废', true)
+      return { kind: 'stale' }
+    }
     cardkit.recordCardCreated(
       cardId,
       initialElementCount,
@@ -7041,12 +8815,28 @@ export class Session {
       outboundSeenPaths: new Set(),
       outboundSentPaths: new Set(),
       hostAskMarkersSeen: new Set(),
+      // Eager user cards get their policy when input is handed to the Agent.
+      // Backend-driven turns keep the policy the process has already received.
+      fileDeliveryMode: trigger === 'user_message' && this.pendingUserMessageCount === 0
+        ? undefined
+        : this.proc ? this.procFileDeliveryModes.get(this.proc) : undefined,
     }
     this.clearToolFailureLoop()
+    cardkit.recordCardCreated(
+      cardId,
+      initialElementCount,
+      (code, meta) => this.onCardWriteFailure(cardId, code, meta),
+      () => this.onCardWriteSuccess(cardId),
+    )
     this.currentTurn = turnState
     if (this.proc) this.beginWatchdogTurn(turnState, this.proc)
     this.finishWatchdogOpening(watchdogOpeningTurnCounter, false, watchdogOpeningProc, openingToken)
     if (opts.startThinking !== false) this.startThinkingFooter(turnState)
+    if (pendingCompactions.length > 0) {
+      const buffered = pendingCompactions.splice(0)
+      log(`session "${this.sessionName}": replay ${buffered.length} context compaction event(s) buffered during card open`)
+      for (const notice of buffered) this.handleContextCompacted(this.proc, notice)
+    }
     // 开卡 await 窗口期(sendCard/id_convert)先到的 assistant 正文攒在
     // 孤儿缓冲里,现在有卡了,作为首段并入 —— 后续 delta 接着正常追加。
     const orphan = this.takeOrphanAssistantText()
@@ -7064,7 +8854,16 @@ export class Session {
         })
       }
     }
-    return { kind: 'opened', turn: turnState }
+    // 合并返回面双消费:本地调用面按 TurnCardOpenResult({kind:'opened', turn})
+    // 判别;上游测试组直呼 openTurnCard 后按 TurnState 消费返回值(turn.cardId /
+    // turn.contextCompactionCompleted…)。把判别式字段挂回同一 turnState
+    // (kind='opened'、turn=自身),两种消费面共享同一活对象 —— 上游用例 await
+    // 之后继续驱动 turn 观察 replay 结果(replay 的完成写卡是异步的),副本
+    // (spread)会停在返回时点,故必须同体。
+    const opened = turnState as TurnState & { kind: 'opened'; turn: TurnState }
+    opened.kind = 'opened'
+    opened.turn = opened
+    return opened
   }
 
   /** Cheap synchronous check called from stream handlers right before
@@ -7157,9 +8956,14 @@ export class Session {
         log(`session "${this.sessionName}": unchanged content still exceeds card capacity card=${failedCardId.slice(0, 12)} operation=${failure.operation} element=${failure.elementId ?? 'MISS'} code=${code ?? 'MISS'} — not rotating`)
         if (!notified) {
           turn.cardCapacityFailures.set(fingerprint, true)
+          // 合并调和:本地前缀(code=/operation/element 摘要)保留,再拼上游
+          // 378f4a4 的 formatFeishuError 尾(上游测试组钉住 'message=…' 字段;
+          // 本地测试组只钉前缀与尾句,两者不冲突)。8529 体检分支的
+          // "不内插 API 原文"约束属该分支自身面向非容量失败的凭据安全口径,
+          // 本分支是容量拒写的已定型文案面。
           void feishu.sendTextRaw(
             this.chatId,
-            `⚠️ 有一项内容换卡后仍超出飞书容量，写入失败(code=${code ?? 'MISS'}, ${failure.operation}, element=${failure.elementId ?? 'MISS'})；其余输出继续处理。`,
+            `⚠️ 有一项内容换卡后仍超出飞书容量，写入失败(code=${code ?? 'MISS'}, ${failure.operation}, element=${failure.elementId ?? 'MISS'})；其余输出继续处理。\n${formatFeishuError({ ...failure, code })}`,
           )
         }
         return
@@ -7212,8 +9016,8 @@ export class Session {
     return `⚠️ 卡片写入失败已触发 ${n} 次换卡仍未恢复(疑似飞书故障),本轮后续输出仅日志可见。`
   }
 
-  /** Open a fresh card under the **same** SDK turn number to dodge
-   * Feishu's per-card element limit. The old card stays in the chat —
+  /** Open a fresh card under the **same** SDK turn number for additional
+   * user guidance or Feishu's per-card size/element limit. The old card stays in the chat —
    * we flip its footer to "📨 已续至下一张卡", turn streaming off, and
    * dispose its cardkit state — but it never becomes the writable one
    * again. Turn state is reset so subsequent stream handlers wire up
@@ -7222,8 +9026,9 @@ export class Session {
    * continued) and any unfinished / failed tools (rebuildToolsOnRotate
    * moves them, file-tool batches split out), while already-finished tools stay on
    * the old card. */
-  private startMidTurnRotate(turn: TurnState): void {
+  private startMidTurnRotate(turn: TurnState, opts: { userInputs?: string[]; onCardSent?: () => void } = {}): void {
     if (turn.rotating) return
+    const forSteering = opts.userInputs !== undefined
     turn.rotateCount++
     const oldCardId = turn.cardId
     // 同步快照 tool 簿子 —— swap 会把这俩 Map 换成新的空 Map,旧对象仍被这俩
@@ -7256,16 +9061,18 @@ export class Session {
           turn: this.turnCounter,
           provider: turn.provider,
           model: turn.model ?? undefined,
-          effort: turn.effort,
-          kind: 'card_full',
-          userInputs: [],
+          effort: turn.effort ?? 'MISS',
+          kind: forSteering ? 'user_steering' : 'card_full',
+          userInputs: opts.userInputs ?? [],
         })
-        const newMessageId = await feishu.sendCard(this.chatId, card)
+        let sendFailure: unknown
+        const newMessageId = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
         if (!newMessageId) {
           // 两级阶梯(上游 378f4a4 + 本地 D-13 止损):首次开卡失败只暂停 + 等下一次
           // 内容事件重试,**不**把仍可写的旧卡标记死卡;重试再失败才回落到本地
           // give-up 阶梯(rotateGivenUp + markCardWriteDead + log-only)。
-          if (this.currentTurn === turn) {
+          log(`session "${this.sessionName}": mid-turn rotate sendCard failed reason=${forSteering ? 'user_steering' : 'capacity'}`)
+          if (!forSteering && this.currentTurn === turn) {
             if (turn.cardRotationFailed) {
               log(`session "${this.sessionName}": mid-turn rotate sendCard failed twice — giving up, rest of turn is log-only`)
               turn.rotateGivenUp = true
@@ -7284,14 +9091,22 @@ export class Session {
                 '⚠️ 续卡发送失败，后续内容到达时会再次尝试。',
               )
             }
+          } else if (forSteering) {
+            await feishu.sendTextRaw(
+              this.chatId,
+              `⚠️ 追加消息已交给 Agent，但新卡片发送失败。\n${formatFeishuError(sendFailure)}`,
+            )
           }
           return
         }
+        // The new input panel is now visible in chat. Remove its waiting
+        // reactions here, without waiting for conversion/migration/old close.
+        opts.onCardSent?.()
         let newCardId: string
         try { newCardId = await cardkit.convertMessageToCard(newMessageId) }
         catch (e) {
           log(`session "${this.sessionName}": mid-turn rotate id_convert failed: ${e}`)
-          if (this.currentTurn === turn) {
+          if (!forSteering && this.currentTurn === turn) {
             // 与 sendCard 分支同一两级阶梯:首次暂停重试、二次才 give-up。
             if (turn.cardRotationFailed) {
               log(`session "${this.sessionName}": mid-turn rotate id_convert failed twice — giving up, rest of turn is log-only`)
@@ -7310,13 +9125,19 @@ export class Session {
                 '⚠️ 续卡已发送，但 Card Kit 初始化失败；后续内容到达时会再次尝试。',
               )
             }
+          } else if (forSteering) {
+            await feishu.sendTextRaw(
+              this.chatId,
+              `⚠️ 追加消息已交给 Agent，但新卡片初始化失败。\n${formatFeishuError(e)}`,
+            )
           }
           return
         }
-        // card_full body has banner(1) + footer(1) = 2 elements.
+        // Capacity pages have a banner; steering pages have the new inputs.
+        const initialElements = 1 + (forSteering ? (opts.userInputs!.length > 0 ? 1 : 0) : 1)
         cardkit.recordCardCreated(
           newCardId,
-          2,
+          initialElements,
           (code, meta) => {
             if (turn.rotating) {
               rememberDeferredWriteFailure(code, meta)
@@ -7366,6 +9187,9 @@ export class Session {
           turn.currentAssistantText = carryText
           turn.segmentTexts.set(reSegId, carryText)
         }
+        // 渲染状态按卡隔离(review #2):旧卡的 rendered/inflight 条目原样
+        // 保留(下面旧卡收尾要 drain + 跳过),新卡从零开始 —— 段 id 重编号
+        // 后同名段不会被旧卡标记误伤。
         if (carryText) this.startWritingFooter(turn)
         else this.startThinkingFooter(turn)
         // 先在新卡重建实时任务总览区(紧贴 footer)。必须在 assistant/tool 重建
@@ -7393,10 +9217,10 @@ export class Session {
           pending.cardId = newCardId
           pending.created = false
           pending.createFailure = undefined
-          const compactElementId = cards.ELEMENTS.contextCompact(pending.i)
+          const elementId = cards.ELEMENTS.contextCompact(pending.i)
           pending.createPromise = cardkit.addElementResult(
             newCardId,
-            cards.contextCompactionElement(pending.i, pending.notice, compactElementId),
+            cards.contextCompactionElement(pending.i, pending.notice, elementId),
             {
               type: 'insert_before',
               targetElementId: sessionTools.taskLiveAnchor(turn),
@@ -7447,7 +9271,8 @@ export class Session {
         if (retiredContent) turn.cardCapacityFailures.clear()
         // Include queued tool/live-panel migration failures before releasing
         // the rotation lock(上游 @@-4565):释放锁之后再落地,失败会漏给新 card
-        // 的 handler —— 先 flush 掉排队中的迁移写入。
+        // 的 handler —— 先 flush 掉排队中的迁移写入。未决失败保留到旧卡留下
+        // 内容为止:压缩完成只能在锁释放后重试,即使其起始面板已迁移成功。
         await cardkit.flush(newCardId)
         // 旧卡收尾:footer 红字 + streaming_off + dispose。放到 swap 后
         // 是因为这条链是 async,期间 cardkit 队列上还可能有 add/replace 等;
@@ -7456,6 +9281,7 @@ export class Session {
           // 旧卡 inflight 公式渲染先 drain(渲染 promise 只写捕获的
           // oldCardId,不会碰新卡)—— 不等的话下面原文 replace 会覆盖
           // 还没落地的渲染版,渲染晚到再写已被 dispose 拒绝(review #2)。
+          await sessionTools.waitForImageDeliveries(turn, oldCardId)
           const oldInflight = turn.mathRenderInflight?.get(oldCardId)
           if (oldInflight?.size) {
             await Promise.allSettled([...oldInflight])
@@ -7469,15 +9295,33 @@ export class Session {
             if (carrySegId && carryText && segId === carrySegId) continue
             if (cardkit.isDeadElement(oldCardId, segId)) continue
             if (oldRendered?.has(segId)) continue
-            await cardkit.replaceElement(oldCardId, segId, this.completedAssistantElement(segId, fullText))
+            await cardkit.replaceElement(
+              oldCardId,
+              segId,
+              this.completedAssistantElement(segId, fullText),
+            )
           }
           const compactNote = turn.contextCompactCount > 0
             ? ` · 🚨 压缩×${turn.contextCompactCount}`
             : ''
-          await this.replaceFooterContent(oldCardId, this.withModel(`📨 已续至下一张卡 ↓${compactNote}`, turn))
+          const failures: cardkit.CardWriteFailure[] = []
+          const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
+          const footerLanded = await cardkit.replaceElementChecked(
+            oldCardId,
+            cards.ELEMENTS.footer,
+            this.footerElement(this.withModel(`📨 已续至下一张卡 ↓${compactNote}`)),
+            { notifyCardFailure: false, onFailure },
+          )
           cardkit.cancelSummary(oldCardId)
-          await cardkit.patchSettings(oldCardId, cards.streamingOffSettings({ suffix: '📨 转下一张' }))
-          await cardkit.dispose(oldCardId)
+          const settingsLanded = await cardkit.patchSettingsChecked(oldCardId, cards.streamingOffSettings({ suffix: '📨 转下一张' }), onFailure)
+          if (footerLanded && settingsLanded) await cardkit.dispose(oldCardId)
+          else {
+            log(`session "${this.sessionName}": rotate old-card terminal MISS footer=${footerLanded} settings=${settingsLanded}`)
+            await feishu.sendTextRaw(
+              this.chatId,
+              `⚠️ 上一张对话卡未能正常关闭 (footer=${footerLanded ? 'ok' : 'MISS'}, settings=${settingsLanded ? 'ok' : 'MISS'})，本轮输出已续到新卡。\n${cardFailureDetails(failures)}`,
+            )
+          }
         } catch (e) {
           log(`session "${this.sessionName}": mid-turn rotate close-old failed: ${e}`)
         }
@@ -7538,7 +9382,19 @@ export class Session {
     })
   }
 
-  private handleContextCompacted(source: AgentProcess, notice: ContextCompactedNotification): void {
+  private handleContextCompacted(
+    source: AgentProcess | null,
+    notice?: ContextCompactedNotification,
+  ): void {
+    // 合并兼容:上游事件面与上游测试组按单参 handleContextCompacted(notice)
+    // 调用;本地(生产注册点 + 本地测试组)按两参 (source, notice)。定稿签名取
+    // 本地两参,单参调用在此归一 —— 首参整体当作 notice,source=null(仅影响
+    // watchdog 归属观察,单参面本就没有 source)。
+    if (notice === undefined) {
+      notice = source as unknown as ContextCompactedNotification
+      source = null
+    }
+    if (!notice) return
     const receiptKeys = compactionReceiptKeys(notice)
     // Standalone `cm` owns its own status card and watcher. Even if a user
     // starts a new turn before that command finishes, its completion must not
@@ -7597,9 +9453,12 @@ export class Session {
     }
 
     if (!turn) {
-      // 本地适配:上游在此把开卡窗口事件缓冲进 TurnOpenOwner.pendingCompactions
-      // (仅 backendTurnStarted 才缓冲);本地 turn-open 机制是 opaque token,
-      // 无该结构 —— 缓冲子特性跳过,identified 事件按 receipts 记账后安静放行。
+      const owner = this.openingTurnOwner
+      if (owner && 'pendingCompactions' in owner && owner.backendTurnStarted) {
+        owner.pendingCompactions.push(notice)
+        log(`session "${this.sessionName}": buffer context compaction ${notice.phase ?? 'event'} while turn card opens`)
+        return
+      }
       if (receiptKeys.length > 0) {
         this.rememberContextCompactionReceipt(receiptKeys, null, notice.phase !== 'start')
       }
@@ -7615,6 +9474,7 @@ export class Session {
     const watchdogPhase = `${compactionKey(notice)}:${notice.phase ?? 'event'}`
     if (
       !turn.watchdogSeenCompactionPhases.has(watchdogPhase) &&
+      source &&
       this.observeWatchdogMeaningful(source, `context_compaction:${notice.phase ?? 'event'}`)
     ) {
       turn.watchdogSeenCompactionPhases.add(watchdogPhase)
@@ -7944,7 +9804,10 @@ export class Session {
           type: 'insert_before', targetElementId: target,
         })
       } else {
-        void cardkit.replaceElement(turn.cardId, cards.ELEMENTS.planLive, cards.planLiveElement(turn.planSteps, turn.planExplanation, cards.ELEMENTS.planLive))
+        // The following timeline snapshot carries the plan; this is its live mirror.
+        void cardkit.replaceElementChecked(turn.cardId, cards.ELEMENTS.planLive,
+          cards.planLiveElement(turn.planSteps, turn.planExplanation, cards.ELEMENTS.planLive),
+          { notifyCardFailure: false })
       }
     }
     this.addPlanSnapshotOnCurrentTurn()
@@ -8028,7 +9891,8 @@ export class Session {
       // is now visually separated from future calls, so close the batch
       // window. Future file-tool calls will start a fresh batch at a new i.
       turn.openBatchI = null
-      // Pre-empt the "element exceeds the limit" 300305/300315 cliff —
+      // Pre-empt the 300305 component-count cliff (which Card Kit may wrap
+      // inside a generic 300315 add failure) —
       // if the card's element count is approaching Feishu's cap, fire-and-
       // forget kick off a mid-turn rotation onto a fresh card before this
       // buffered segment is eventually inserted. The rotation handler resets
@@ -8271,9 +10135,38 @@ export class Session {
       log(`session "${this.sessionName}": ignore non-absolute outbound path from ${source}: ${p}`)
       return
     }
-    turn?.outboundSentPaths.add(p)
     log(`session "${this.sessionName}": outbound send from ${source}: ${p}`)
-    void feishu.uploadAndSend(this.chatId, p)
+    try {
+      // Input can reach the backend before its card opens. Reuse its injected
+      // policy even if the group switch changed during that opening window.
+      const mode = turn?.fileDeliveryMode
+        ?? (this.proc ? this.procFileDeliveryModes.get(this.proc) : undefined)
+        ?? this.getFileDeliveryMode()
+      if (turn) turn.fileDeliveryMode = mode
+      if (mode === 'chat') {
+        turn?.outboundSentPaths.add(p)
+        void feishu.uploadAndSend(this.chatId, p)
+        return
+      }
+      if (!turn) throw new Error('当前没有可关联的交付轮次')
+      if (!turn.fileDelivery) {
+        turn.fileDelivery = this.createFileDeliveryForTurn(turn)
+        this.fileDeliveries.add(turn.fileDelivery)
+      }
+      turn.fileDelivery.add(p)
+    } catch (error) {
+      log(`session "${this.sessionName}": file delivery rejected: ${messageOf(error)}`)
+      void feishu.sendText(this.chatId, `❌ 文件交付失败：${messageOf(error)}`)
+    }
+  }
+
+  createFileDeliveryForTurn(turn: TurnState) {
+    return createFileDelivery({
+      chatId: this.chatId,
+      managerOpenId: turn.userOpenId,
+      projectName: this.sessionName,
+      createdAt: turn.startedAt,
+    })
   }
 
   /** Start or switch the turn footer phase. It lives in the stable footer
@@ -8291,32 +10184,70 @@ export class Session {
   private startFooterStatus(turn: TurnState, status: string): void {
     // log-only 之后 phase 切换(Thinking/Writing/Working)不再启动档位 timer ——
     // 卡已标记拒写,继续调度只会空转;续卡失败(停表等重试)同理。
+    // 续卡失败时暂停定时刷新；后续真实内容触发重试，成功后恢复。
     if (turn.rotateGivenUp || turn.cardRotationFailed) return
-    // 模型满载退避进度(上游 2e6e1e0):进程层持有唯一重试节奏,footer 如实反映。
+    // 模型满载/连接中断退避进度(上游 2e6e1e0):进程层持有唯一重试节奏,footer 如实反映。
     const retry = turn.provider === 'codex' ? this.proc?.turnRetry : null
     if (retry) {
-      status = retry.phase === 'waiting'
-        ? `⏳ 模型满载 · ${Math.round(retry.delayMs / 1000)}s 后重试 #${retry.attempt}`
-        : `⏳ 模型满载 · 正在重试 #${retry.attempt}`
+      const reason = retry.reason === 'stream_disconnected' ? '连接中断'
+        : retry.reason === 'compact_connection_failed' ? '压缩连接中断'
+        : retry.reason === 'transient_error' ? '服务暂时异常' : '模型满载'
+      status = retry.reason === 'quota' ? `⏳ ${retry.message}` : retry.phase === 'waiting'
+        ? `⏳ ${reason} · ${retry.delayMs / 1000}s 后重试 #${retry.attempt}`
+        : `⏳ ${reason} · 正在重试 #${retry.attempt}`
     }
-    if (turn.footerStatusHandle && turn.footerStatusLabel === status) return
+    // 合并调和(取舍):去重按 label 判定(上游)——不能带本地 handle 条件:卡
+    // 写失败后 handle 已清、label 保留,同相位重复进入必须停在 dedupe,否则
+    // 会把一次失败放大成多轮 checked 重试(上游用例要求失败后同相位零写入)。
+    if (turn.footerStatusLabel === status) return
     this.stopFooterStatus(turn)
     turn.footerStatusLabel = status
-    const startedAt = Date.now()
-    turn.footerStatusStartedAt = startedAt
-    const isCurrent = (): boolean =>
-      turn.footerStatusLabel === status && turn.footerStatusStartedAt === startedAt
-    const scheduleNext = (): void => {
-      if (!isCurrent()) return
-      const { nextDelayMs } = cards.liveElapsed(Date.now() - startedAt, config.runtime.live_elapsed)
-      turn.footerStatusHandle = setTimeout(() => {
-        if (!isCurrent()) return
-        this.renderFooterStatus(turn)
-        scheduleNext()
-      }, Math.max(1, Math.ceil(nextDelayMs)))
+    turn.footerStatusStartedAt = Date.now()
+    // footer 显示「状态词 + 耗时」(见 cards/background.ts liveElapsed)。
+    // bucket 只在档位边界 push;second 固定 1s。
+    const render = (): void => {
+      if (turn.footerStatusLabel !== status) return
+      const cardId = turn.cardId
+      // Slow requests/retries must not build a queue of obsolete clock ticks.
+      // Phase changes share this gate; terminal writes bypass it and stay checked.
+      if (turn.footerStatusWriteCardId === cardId) {
+        turn.footerStatusPendingRender = render
+        return
+      }
+      turn.footerStatusPendingRender = undefined
+      const { label } = liveElapsed(Date.now() - turn.footerStatusStartedAt, liveElapsedMode())
+      const thinking = status === FOOTER_THINKING_PREFIX ? this.proc?.lastThinkingTokens : null
+      const progress = typeof thinking === 'number' ? ` · 约 ${thinking} tokens` : ''
+      turn.footerStatusWriteCardId = cardId
+      void this.replaceFooterContent(cardId, this.withModel(`${status}${progress} (${label})`)).then(result => {
+        if (turn.footerStatusWriteCardId === cardId) turn.footerStatusWriteCardId = undefined
+        if (turn.cardId !== cardId || turn.footerStatusLabel === null) return
+        if (result.landed) {
+          const latest = turn.footerStatusPendingRender
+          turn.footerStatusPendingRender = undefined
+          latest?.()
+          return
+        }
+        turn.footerStatusFailedCardId = cardId
+        if (turn.footerStatusHandle) clearTimeout(turn.footerStatusHandle)
+        turn.footerStatusHandle = null
+        const latest = turn.footerStatusPendingRender
+        turn.footerStatusPendingRender = undefined
+        if (turn.footerStatusLabel !== status) latest?.()
+      })
     }
+    const scheduleNext = (): void => {
+      if (turn.footerStatusLabel !== status || turn.footerStatusFailedCardId === turn.cardId) return
+      const { nextDelayMs } = liveElapsed(Date.now() - turn.footerStatusStartedAt, liveElapsedMode())
+      turn.footerStatusHandle = setTimeout(() => { render(); scheduleNext() }, Math.max(1, Math.ceil(nextDelayMs)))
+    }
+    // 合并调和(取舍):相位切换的即时写也走 gated render(上游)——本地旧路径
+    // this.renderFooterStatus(turn) 是无门闩直写,开卡后慢写未归位时每个相位
+    // 切换都会新发一次请求,单飞合并失效(上游用例:20 轮相位切换只允许
+    // initial + 终态两次写)。override(降级/watchdog 提示)仍由专用入口
+    // renderFooterStatus/applyModelFallbackNotice 直写,不经此路径。
+    render()
     scheduleNext()
-    this.renderFooterStatus(turn)
   }
 
   startThinkingFooter(turn: TurnState): void {
@@ -8339,6 +10270,7 @@ export class Session {
     turn.modelFallbackOverrideTimer = null
     turn.footerStatusStartedAt = 0
     turn.footerStatusLabel = null
+    turn.footerStatusPendingRender = undefined
   }
 
   /** 模型降级/拒答瞬时通知显示时长,到期后让相位标签(Thinking/Writing/Working)恢复。 */
@@ -8363,50 +10295,85 @@ export class Session {
     log(`session "${this.sessionName}": model fallback surfaced notice="${notice}"`)
   }
 
-  /** turn footer 末尾的额度后缀,按本 turn 冻结的 usage source 路由。
-   * Claude 登录/非 GLM relay 明确不适用;codex:<slug> 第三方档位不复用
-   * 可能属于 ChatGPT 的全局缓存。glm → readGlmUsage(轻量 HTTP)取 5h+周
-   * 双窗口;codex → peekUsage(turn 中 updateUsageFromRateLimits 已更新
-   * cache,纯读不 fetch,避免每轮为一个百分比 spawn codex app-server)。
-   * 拿不到数据返回空串,缺数据不硬凑 —— footer 不假数据 (no_fallbacks)。 */
+  /** 页脚只显示当前来源额度；Codex 刷新失败时按原格式展示同账号缓存。 */
   private async footerUsageSuffix(
-    turn: Pick<TurnState, 'usageSource' | 'model'>,
+    provider: AgentProvider,
+    proc: AgentProcess | null,
+    selectedTokenSourceId: string | null,
+    ts: TokenSource | undefined,
+    cachedCodexUsage: ReturnType<typeof captureCodexUsageCache> | null,
+    model: string | null,
   ): Promise<string> {
-    if (turn.usageSource === 'glm') {
-      const g = await readGlmUsage()
-      if (g.state === 'ok') return this.fmtDualWindowSuffix(g.fiveHour ?? null, g.weekly ?? null)
-    } else if (turn.usageSource === 'codex' && !turn.model?.startsWith('codex:')) {
-      const u = peekUsage()
-      if (u?.state === 'ok') return this.fmtDualWindowSuffix(u.fiveHour ?? null, u.weekly ?? null)
+    if (selectedTokenSourceId && (!ts || !ts.enabled || ts.agent !== provider)) return '  |  额度 MISS'
+    if (ts?.agent === provider && ts.enabled && (provider === 'claude' || provider === 'dsh' || ts.codexApiProvider)) {
+      const snap = await ts.readUsage()
+      if (snap.state === 'ok' && snap.kind !== 'balance') {
+        const fiveHour = snap.windows.find(w => w.kind === 'fiveHour')
+        if (ts.kind === 'claude-subscription') {
+          const weekly = claudeWeeklyUsageWindow(snap, model)
+          const missing = { percent: null, resetsAt: null }
+          return this.fmtDualWindowSuffix(fiveHour ?? missing, weekly ?? missing)
+        }
+        const weekly = snap.windows.find(w => w.kind === 'weekly')
+        if (fiveHour || weekly) return this.fmtDualWindowSuffix(fiveHour ?? null, weekly ?? null)
+      }
+      return `  |  ${cards.unifiedUsageSummary(snap)}`
     }
-    return ''
+    if (provider === 'codex') {
+      const cache = cachedCodexUsage ?? (proc?.provider === 'codex' ? captureCodexUsageCache(processCodexAccount(proc)) : null)
+      if (!cache) return '  |  额度 MISS'
+      const u = cache.read()
+      if (!u) return '  |  额度 MISS'
+      const credits = codexCreditsSummary(u.credits)
+      return this.fmtDualWindowSuffix(u.fiveHour, u.weekly) + (credits ? ` · ${credits}` : '')
+    }
+    return '  |  额度 MISS'
   }
 
-  /** 双窗口额度 footer 后缀,codex/GLM 共用,形如 `4.1h·7%·[6.9d·17%]`:
-   * 5h 窗口(重置倒计时·已用%)+ 方括号内周窗口(重置倒计时·已用%)。
-   * Prolite 等套餐只有周窗口(无 5h)→ 退化为裸周窗口段 `[6.9d·9%]`。
-   * 缺哪段就省哪段(no_fallbacks 不假数据):两窗口都缺 → 空串;
-   * 某窗口 resetsAt 缺/已过期 → 该窗口只剩百分比。 */
+  /** 沿用原紧凑窗口格式：4.1h·7%·[6.9d·17%]；不添加周期标签或“已用”等文字。 */
   private fmtDualWindowSuffix(
     fiveHour: { percent: number | null; resetsAt: Date | null } | null,
     weekly: { percent: number | null; resetsAt: Date | null } | null,
   ): string {
-    const resetIn = (w: { resetsAt: Date | null }): string =>
-      w.resetsAt && w.resetsAt.getTime() > Date.now() ? cards.fmtResetIn(w.resetsAt) : ''
-    const seg = (w: { percent: number | null; resetsAt: Date | null } | null): string | null => {
-      if (w?.percent == null) return null
-      const ri = resetIn(w)
-      return ri ? `${ri}·${Math.round(w.percent)}%` : `${Math.round(w.percent)}%`
+    const segment = (window: { percent: number | null; resetsAt: Date | null } | null): string | null => {
+      if (!window) return null
+      if (window.percent == null) return 'MISS'
+      const reset = window.resetsAt && window.resetsAt.getTime() > Date.now() ? cards.fmtResetIn(window.resetsAt) : ''
+      const percent = `${Math.round(window.percent)}%`
+      return reset ? `${reset}·${percent}` : percent
     }
-    const five = seg(fiveHour)
-    const week = seg(weekly)
+    const five = segment(fiveHour)
+    const week = segment(weekly)
     if (five && week) return `  |  ${five}·[${week}]`
     if (five) return `  |  ${five}`
     if (week) return `  |  [${week}]`
-    return ''
+    return '  |  额度 MISS'
   }
 
-  async closeTurnCard(
+  private waitForTurnCloses(): Promise<void> {
+    const closes = [...this.turnCloseInflight]
+    if (closes.length === 0) return Promise.resolve()
+    return Promise.allSettled(closes).then(results => {
+      const errors = results
+        .filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+        .map(result => result.reason)
+      if (errors.length === 1) throw errors[0]
+      if (errors.length > 1) {
+        throw new AggregateError(errors, `turn close failed: ${errors.map(messageOf).join('; ')}`)
+      }
+    })
+  }
+
+  private releaseTurnCloseReactions(snapshot: TurnCloseSnapshot): void {
+    for (const [msgId, rid] of [
+      ...snapshot.currentBatchReactionIds.entries(),
+      ...snapshot.pendingReactionIds.entries(),
+    ]) {
+      if (rid) void feishu.deleteReaction(msgId, rid)
+    }
+  }
+
+  closeTurnCard(
     suffix?: string,
     opts: {
       forcePush?: boolean
@@ -8421,7 +10388,11 @@ export class Session {
     // sync-handler invariant only protects callers that take the turn
     // off the table BEFORE their first await.
     const turn = this.currentTurn
-    if (!turn) return
+    if (!turn) return this.waitForTurnCloses()
+    if (this.steeringBoundary?.turn === turn) this.steeringBoundary.start()
+    // A terminal label (including a queued-input handoff or Agent error) only
+    // describes the conversation card. Admitted uploads keep their turn owner
+    // and finish below; stop/restart cancel them through the session registry.
     // 无 suffix = 自然收尾;续卡失败挂起时在这里补一次重试(上游 @@-5517),
     // 插在 null-out 之前的同步块里 —— 后面 `await turn.rotating` 会等它落定。
     if (!suffix && turn.cardRotationFailed) this.maybeMidTurnRotate()
@@ -8429,25 +10400,45 @@ export class Session {
     this.clearToolFailureLoop(turn)
     this.endWatchdogTurn()
     this.stopFooterStatus(turn)
-    // ── 04-05 簇 3 甄别红例最小集(ff44afb):TurnCloseSnapshot + turnCloseInflight ──
-    // close 入口同步快照本轮终态数据并转移 reaction 所有权:flush/drain 的 await
-    // 窗口里 next turn 可能已把 live 字段换成新轮数据——终态 footer/settings 只准
-    // 读快照,释放的也只能是快照里的 reactions,不得清 next turn 的两 Map。
-    // 同时把余下收尾登记为在途 close(restart spawn 前 waitForTurnCloses 等待)。
-    // 刻意不拆 finishTurnCardClose、try 框内主体保持原文原缩进——陷阱 4:
-    // 03-03/03-04 drain 次序锚零触碰,diff 只含语义行。
-    const closeContextTokens = this.currentContextTokens()
-    const closeContextLimit = this.contextLimitForDisplay()
-    const closeLastTurnDelta = this.lastTurnDelta ? { ...this.lastTurnDelta } : null
-    const closeLastTurnUsage = this.lastTurnUsage ? { ...this.lastTurnUsage } : null
-    const closeBatchReactionIds = this.currentBatchReactionIds
-    const closePendingReactionIds = opts.preservePendingReactions ? null : this.pendingReactionIds
+    const proc = this.proc
+    const snapshot: TurnCloseSnapshot = {
+      turn,
+      proc,
+      procEpoch: this.procEpoch,
+      contextTokens: this.currentContextTokens(proc),
+      contextLimit: this.contextLimitForDisplay(proc),
+      lastTurnDelta: this.lastTurnDelta ? { ...this.lastTurnDelta } : null,
+      lastTurnUsage: this.lastTurnUsage ? { ...this.lastTurnUsage } : null,
+      tokenSourceId: this.selectedTokenSourceId,
+      tokenSource: proc?.provider === 'codex'
+        ? getTokenSourceForAccount(proc.tokenSourceId ?? this.selectedTokenSourceId, processCodexAccount(proc))
+        : this.currentTokenSource(),
+      codexUsage: proc?.provider === 'codex' && !getTokenSource(proc.tokenSourceId)?.codexApiProvider
+        ? captureCodexUsageCache(processCodexAccount(proc)) : null,
+      currentBatchReactionIds: this.currentBatchReactionIds,
+      pendingReactionIds: opts.preservePendingReactions ? new Map() : this.pendingReactionIds,
+    }
+    // Ownership of reactions transfers with the captured turn. New input can
+    // now populate fresh maps while this close awaits rotation/CardKit/usage.
     this.currentBatchReactionIds = new Map()
     if (!opts.preservePendingReactions) this.pendingReactionIds = new Map()
-    let settleClose!: () => void
-    const closeSettled = new Promise<void>(resolve => { settleClose = resolve })
-    this.turnCloseInflight.add(closeSettled)
-    try {
+    const close = this.finishTurnCardClose(snapshot, suffix, opts)
+      .finally(() => this.releaseTurnCloseReactions(snapshot))
+    this.turnCloseInflight.add(close)
+    void close.then(
+      () => { this.turnCloseInflight.delete(close) },
+      () => { this.turnCloseInflight.delete(close) },
+    )
+    return close
+  }
+
+  private async finishTurnCardClose(
+    snapshot: TurnCloseSnapshot,
+    suffix?: string,
+    opts: { forcePush?: boolean; hasFreshResult?: boolean; preservePendingReactions?: boolean } = {},
+  ): Promise<void> {
+    const { turn } = snapshot
+    if (turn.steeringInflight?.size) await Promise.all([...turn.steeringInflight])
     // 竞态修复:mid-turn rotation 的 swap 阶段(sendCard / id_convert 的 await
     // 之后,见 startMidTurnRotate)会切 turn.cardId 到新卡并 startWritingFooter
     // 重启一个 footer 计时 interval。若 result 在那个 await 窗口里抢先到达,
@@ -8458,14 +10449,25 @@ export class Session {
     // rotating 落定后再终态化:turn.cardId 此时是新卡,再 stop 一次清掉 swap
     // 重启的 interval,终态 footer 也写在新卡上。
     if (turn.rotating) await turn.rotating
+    await sessionTools.waitForImageDeliveries(turn)
+    if (turn.fileDelivery) {
+      try {
+        for (const path of await turn.fileDelivery.finish()) turn.outboundSentPaths.add(path)
+      } catch (error) {
+        log(`session "${this.sessionName}": file delivery close failed: ${messageOf(error)}`)
+        await feishu.sendTextRaw(this.chatId, `❌ 文件交付收尾失败：${messageOf(error)}`)
+      } finally {
+        this.fileDeliveries.delete(turn.fileDelivery)
+      }
+    }
     this.stopFooterStatus(turn)
-    const elapsed = ((Date.now() - turn.startedAt) / 1000).toFixed(1)
+    const elapsed = (Date.now() - turn.startedAt) / 1000
     const cardId = turn.cardId
     const segmentTexts = turn.segmentTexts
     await cardkit.flush(cardId)
 
-    // [[send: /abs/path]] markers are handled while deltas are received by
-    // processOutboundMarkers(). closeTurnCard only finalizes text display.
+    // Markers are admitted during deltas; their cloud uploads and separate
+    // receipt have settled above. The remaining work finalizes conversation prose.
     // 如果最后一个 assistant 段没有等到 block_stop,这里先把内存缓冲的完整
     // 文本作为静态 markdown 插入卡片。
     const fallbackSegments = new Map<string, string>()
@@ -8523,17 +10525,17 @@ export class Session {
     // Footer line 1 keeps the terminal status compact. Usage-derived
     // numbers only render when a fresh SDK result landed for THIS turn;
     // interrupts/boot failures would otherwise show stale prior-turn data.
-    const line1Parts = [`${stateMark} ⏱ ${elapsed}s`]
+    const line1Parts = [`${stateMark} ⏱ ${cards.formatDuration(elapsed)}`]
     if (opts.hasFreshResult) {
       // 读 close 入口快照,不读 live(next turn 可能已换数据——04-05 快照红例)。
-      const ctxTokens = closeContextTokens
-      const ctxMax = closeContextLimit
+      const ctxTokens = snapshot.contextTokens
+      const ctxMax = snapshot.contextLimit
       // Claude 路径分母已是 SDK 实测窗口、分子是输入侧占用,走纯除法(baseline=0);
       // Codex 路径保留 12K baseline 扣减。
       const isClaude = turn.provider === 'claude'
       const ctxPercent = cards.footerContextPercentLabel(ctxTokens, ctxMax, isClaude ? 0 : undefined)
       if (ctxPercent) line1Parts.push(`🧠 ${ctxPercent}`)
-      const cost = closeLastTurnDelta?.costUsd ?? 0
+      const cost = snapshot.lastTurnDelta?.costUsd ?? 0
       if (cost > 0) line1Parts.push(`💰 $${cost.toFixed(3)}`)
     }
     if (turn.contextCompactCount > 0) line1Parts.push(`🚨 压缩×${turn.contextCompactCount}`)
@@ -8543,21 +10545,49 @@ export class Session {
     if (modelLabel) line1Parts.push(modelLabel)
     const footerLine1 = line1Parts.join(' ｜ ')
     const footerLine2 = opts.hasFreshResult
-      ? cards.footerTokenDetailLine(closeLastTurnUsage) + (turn.rotateGivenUp || turn.cardRotationFailed ? '' : await this.footerUsageSuffix(turn))
+      ? cards.footerTokenDetailLine(snapshot.lastTurnUsage) + (turn.rotateGivenUp || turn.cardRotationFailed
+        ? ''
+        : await this.footerUsageSuffix(
+            turn.provider,
+            snapshot.proc,
+            snapshot.tokenSourceId,
+            snapshot.tokenSource,
+            snapshot.codexUsage,
+            turn.model,
+          ))
       : ''
     const footer = footerLine2 ? `${footerLine1}\n${footerLine2}` : footerLine1
-    await this.replaceFooterContent(cardId, footer)
-    // Final chat-list preview: clean finish shows "⏱ Xs · NK tokens";
+    const failures: cardkit.CardWriteFailure[] = []
+    const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
+    const footerLanded = await cardkit.replaceElementChecked(
+      cardId,
+      cards.ELEMENTS.footer,
+      this.footerElement(footer),
+      { onFailure },
+    )
+    // Final chat-list preview: clean finish shows "⏱ duration · NK tokens";
     // interrupted shows the suffix instead (no usage event landed).
     // cancelSummary kills any in-flight throttled write so a stale
     // in-flight summary update can't clobber this terminal summary.
     cardkit.cancelSummary(cardId)
-    await cardkit.patchSettings(cardId, cards.streamingOffSettings({
+    const settingsLanded = await cardkit.patchSettingsChecked(cardId, cards.streamingOffSettings({
       durationSec: elapsed,
-      outputTokens: opts.hasFreshResult ? closeLastTurnUsage?.output_tokens : undefined,
+      outputTokens: opts.hasFreshResult ? snapshot.lastTurnUsage?.output_tokens : undefined,
       suffix,
-    }))
-    await cardkit.dispose(cardId)
+    }), onFailure)
+    if (footerLanded && settingsLanded) {
+      await cardkit.dispose(cardId)
+    } else {
+      // Keep CardKit state alive: disposing after a rejected terminal write
+      // would make the in-memory state claim success while Feishu still shows
+      // a streaming/running card, and would prevent any later repair attempt.
+      const detail = `footer=${footerLanded ? 'ok' : 'MISS'}, settings=${settingsLanded ? 'ok' : 'MISS'}`
+      log(`session "${this.sessionName}": terminal card transaction incomplete card=${cardId.slice(0, 12)} ${detail}`)
+      await feishu.sendTextRaw(
+        this.chatId,
+        `⚠️ 对话卡片终态写入失败 (${detail})。本轮已结束: ${stateMark}\n${cardFailureDetails(failures)}`,
+      )
+    }
 
     for (const text of fallbackSegments.values()) {
       await this.sendAssistantTextFallback(text, 'CardKit 元素未落地')
@@ -8567,9 +10597,7 @@ export class Session {
     // even with the chat backgrounded. Skip on interrupts (no real
     // completion), when we don't know who to ping, and when the turn
     // wasn't kicked off by the user typing a message. `opts.forcePush`
-    // overrides the suffix-gate for the
-    // "consecutive SDK errors, giving up" case — that close has a non-
-    // empty suffix but the user still needs to know we bailed.
+    // overrides the suffix-gate when the backend reports a failed turn.
     // Fire-and-forget; urgent_app failures are non-fatal and already
     // logged in feishu.ts.
     // log-only 的 turn 已发过"仅日志可见"告警,用户知晓 —— 不再为
@@ -8603,18 +10631,13 @@ export class Session {
     //      For merged-batch follow-ups, this releases slightly early
     //      (before the merged turn actually runs), which is an
     //      acceptable trade vs. msgs stuck under OneSecond forever.
-    // 04-05 快照红例:只释放 close 入口快照里的 reactions——live 两 Map 已在
-    // 入口转移所有权(next turn 的新 reactions 不归本次 close 管)。
-    const releaseEntries = [
-      ...closeBatchReactionIds.entries(),
-      ...(closePendingReactionIds ? closePendingReactionIds.entries() : []),
-    ]
-    for (const [msgId, rid] of releaseEntries) {
-      if (rid) void feishu.deleteReaction(msgId, rid)
-    }
-    } finally {
-      this.turnCloseInflight.delete(closeSettled)
-      settleClose()
-    }
+    // Reaction ownership was transferred into `snapshot` synchronously at
+    // close entry and is released by the wrapper's finally. Never touch the
+    // fresh maps that may already belong to the next turn here.
   }
 }
+
+
+
+
+

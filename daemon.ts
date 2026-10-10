@@ -18,15 +18,23 @@
  */
 
 import * as lark from '@larksuiteoapi/node-sdk'
+import { startBackgroundRefresh, stopBackgroundRefresh } from './src/background-refresh'
+import { codexActivation } from './src/codex-activation'
+import { refreshTokenSourceUsage } from './src/token-source-cache'
+import { pendingSourceCommands } from './src/session-commands'
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { Session } from './src/session'
 import * as feishu from './src/feishu'
+import { formatFeishuError } from './src/feishu-errors'
+import * as cards from './src/cards'
 import { actionCardResponse } from './src/card-action'
-import { selectionResultCard, resumeSelectionResultCard } from './src/cards'
+import { debugModelActionEvent, debugModelState } from './src/debug-model'
 import {
   get as getNotifyCallback,
-  recordCallbackSuccess as recordNotifyCallbackSuccess,
+  recordCallbackSuccess,
+  recordCallbackFailure,
+  beginCallbackDispatch,
   dispatchCallback,
   isDispatching,
   setDispatching,
@@ -46,6 +54,13 @@ import { ensureImagegenSkill } from './src/imagegen-skill'
 import { ensureImagereadSkill } from './src/imageread-skill'
 import { ensureFpdSkill } from './src/fpd-skill'
 import { startTasklistWorker, stopTasklistWorker } from './src/tasklist-worker'
+import { acceptsProjectCapability, createAgentProjectClient } from './src/agent-project-client'
+import { resolveAgentProject } from './src/agent-project'
+import { agentApiUrl } from './src/agent-runtime'
+import { codexLogins } from './src/codex-login'
+import { settleCodexAccountCards } from './src/session-codex-accounts'
+import { removeManagedSkill } from './src/managed-skills'
+import { beginAgyForwardToCodex } from './src/session-agy'
 import { config } from './src/config'
 import { log } from './src/log'
 import { startAgentAutoUpdates } from './src/agent-updates'
@@ -60,6 +75,8 @@ import {
   isStaleAtReceipt,
 } from './src/inbound-message'
 import { drainDynamicWork, trackWork } from './src/inflight-work'
+import { modelActionCompletion, type ModelActionResult } from './src/session-util'
+import { DaemonSessionRecovery } from './src/daemon-session-recovery'
 import {
   ActionDeduper,
   PerKeyActor,
@@ -90,51 +107,52 @@ mkdirSync(dirname(PID_FILE), { recursive: true })
 writePidFile(PID_FILE)
 
 let cleanupDone = false
-const SHUTDOWN_DEADLINE_MS = 15_000
 let shutdownRequested = false
 let shutdownPromise: Promise<void> | null = null
 let shutdownExitCode = 0
-let shutdownAliveSessionNames: string[] | null = null
 /** Agent 自动更新停止函数(上游 c55bb44 / D-06)。默认配置下是零定时器的 no-op。 */
 let stopAgentAutoUpdates: (() => void) | undefined
+let stopFeishuWs: (() => void) | undefined
+const SHUTDOWN_DEADLINE_MS = 15_000
 const cleanup = () => {
   if (cleanupDone) return
   cleanupDone = true
-  // Snapshot which sessions are still alive so the next boot can
-  // revive them — only the ones still running at shutdown, NOT
-  // anything the user already `kill`-ed (those are absent from the
-  // sessions Map filter below and stay stopped after restart).
-  // 分级关停路径下 Session.stop() 已把进程清掉,此刻现算必为空 ——
-  // 用 requestShutdown 在 stop 之前拍的快照。
   try {
-    const alive = shutdownAliveSessionNames ?? currentAliveSessionNames()
-    feishu.writeAliveMarker(alive)
-    if (alive.length > 0) log(`alive marker: [${alive.join(', ')}]`)
+    sessionRecovery.persist()
   } catch (e) { log(`alive marker write failed: ${e}`) }
   try { unlinkSync(PID_FILE) } catch {}
   try { unlinkSync(DEBUG_SOCK_FILE) } catch {}
 }
 
-/** 分级关停(上游 ec149d7):封准入 → 写 alive marker → drain 在途工作 →
- * 并发 stop 全部 session + stopTasklistWorker → 15s deadline → exit。
- * 只由 SIGTERM/SIGINT/SIGBREAK 与 boot fatal 触发 —— WS/Promise 层错误
- * 不走这里(见下方 log-only 处理器的本地红线)。 */
+/** 分级关停(上游 ec149d7):封准入 → 冻结恢复状态 → drain 在途工作 →
+ * 并发 stop 全部 session(+ codexLogins/账号卡/stopTasklistWorker)→ 15s
+ * deadline → exit。只由 SIGTERM/SIGINT/SIGBREAK 与 boot fatal 触发 ——
+ * WS/Promise 层错误不走这里(见下方 log-only 处理器的本地红线)。 */
 function requestShutdown(reason: string, exitCode: number): Promise<void> {
   // 更严重的后继错误必须升级已在跑的优雅关停:复用同一 drain promise 没问题,
   // 复用原退出码不行 —— 否则 SIGTERM 之后再叠加致命错误会以 0 退出。
   shutdownExitCode = Math.max(shutdownExitCode, exitCode)
   if (shutdownPromise) return shutdownPromise
   shutdownRequested = true
+  stopBackgroundRefresh()
+  const activationStopped = codexActivation.stop().then(
+    value => ({ status: 'fulfilled' as const, value }), reason => ({ status: 'rejected' as const, reason }),
+  )
   // 清 Agent 自动更新定时器(幂等、不阻塞关停);默认关时是 no-op。
   stopAgentAutoUpdates?.()
   // 同步封住准入(消息与卡片动作共用同一 per-key actor),再取动态工作快照;
   // 已准入的队尾仍可被 drain。
   chatActor.close()
-  // 在 Session.stop() 清进程并触发 lifecycle 回调之前先快照。这个 marker 的
-  // 语义是"daemon 重启后 revive",不是"优雅关停后仍存活"。
-  shutdownAliveSessionNames = currentAliveSessionNames()
+  for (const session of sessions.values()) session.closeModelSettingsChanges()
+  try { stopFeishuWs?.() }
+  catch (error) {
+    shutdownExitCode = 1
+    log(`shutdown WebSocket close failed: ${error}`)
+  }
+  // Keep boot's not-yet-restored names while admitted commands drain. Freeze
+  // only after that drain, so an already-accepted user kill is respected.
   try {
-    feishu.writeAliveMarker(shutdownAliveSessionNames)
+    sessionRecovery.persist()
   } catch (e) {
     log(`shutdown alive marker write failed: ${e}`)
     shutdownExitCode = 1
@@ -146,17 +164,21 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
         await drainDynamicWork(() => [
           ...chatActor.pending(),
           ...inflightCardActions,
+          ...pendingSourceCommands(),
         ])
+        sessionRecovery.freezeForShutdown()
         const agentResults = await Promise.allSettled([
           agentService.shutdown(`daemon ${reason}`),
+          codexLogins.shutdown(),
         ])
+        const accountCardResults = await Promise.allSettled([settleCodexAccountCards()])
         const sessionResults = await Promise.allSettled([
           ...[...sessions.values()].map(session =>
             session.stop(`daemon ${reason}`, { announce: false })
           ),
           stopTasklistWorker(),
         ])
-        return [...agentResults, ...sessionResults]
+        return [await activationStopped, ...agentResults, ...accountCardResults, ...sessionResults]
       })()
       let deadlineTimer: ReturnType<typeof setTimeout> | null = null
       const deadline = new Promise<'deadline'>(resolve => {
@@ -216,21 +238,30 @@ process.on('uncaughtException', e => {
 // ── Session registry ────────────────────────────────────────────────────
 const sessions = new Map<string, Session>()  // key = chatId
 const agentService = new AgentService()
-let pendingReviveSessionNames = new Set<string>()
 const chatActor = new PerKeyActor()
+const sessionRecovery = new DaemonSessionRecovery({
+  readMarker: feishu.readAliveMarker,
+  writeMarker: feishu.writeAliveMarker,
+  sessions: () => sessions.values(),
+  chatIdForSession: feishu.chatIdForSession,
+  sessionFor,
+  actor: chatActor,
+  isShuttingDown: () => shutdownRequested,
+  log,
+})
 const cardActionDeduper = new ActionDeduper(30_000)
 // 动态在途工作集:卡片动作后台段(准入编排的 track 注入)登记于此,
 // requestShutdown 的 drain 会连同 chatActor.pending() 一起排空。
 const inflightCardActions = new Set<Promise<unknown>>()
-
-function trackCardActionWork<T>(work: Promise<T>): Promise<T> {
-  return trackWork(inflightCardActions, work)
-}
 const messageAdmission = createPerChatAdmission<any>({
   actor: chatActor,
   key: data => String(data?.message?.chat_id ?? ''),
   execute: (data, acceptedAt) => handleMessage(data, acceptedAt),
 })
+
+function trackCardActionWork<T>(work: Promise<T>): Promise<T> {
+  return trackWork(inflightCardActions, work)
+}
 
 /** Preserve Feishu delivery order per chat without delaying the WS ACK. Work
  * in different groups remains concurrent; messages and lifecycle commands in
@@ -250,26 +281,23 @@ function enqueueMessage(data: any, source = 'ws'): boolean {
   return true
 }
 
-function currentAliveSessionNames(): string[] {
-  const alive = new Set<string>()
-  for (const s of sessions.values()) if (s.isRunning()) alive.add(s.sessionName)
-  for (const name of pendingReviveSessionNames) alive.add(name)
-  return [...alive]
-}
-
 function writeCurrentAliveMarker(): void {
-  feishu.writeAliveMarker(currentAliveSessionNames())
+  sessionRecovery.persist()
 }
 
 const tempSessionRuntime = createTempSessionRuntime<Session>({
   registry: sessions,
-  createSession: (sessionName, chatId) => new Session(sessionName, chatId, {
-    onLifecycleChange: writeCurrentAliveMarker,
-    onCreateTempSession: createTempSession,
-    onDisbandTempSession: disbandTempSession,
-    onCancelAgentRuns: (name, chatIdForCancel, reason) =>
-      agentService.cancelSessionRuns(name, chatIdForCancel, reason),
-  }),
+  createSession: (sessionName, chatId) => {
+    const session = new Session(sessionName, chatId, {
+      agentCards: agentService.presentation,
+      onLifecycleChange: writeCurrentAliveMarker,
+      onCreateTempSession: createTempSession,
+      onDisbandTempSession: disbandTempSession,
+      onCancelAgentRuns: (name, chatId, reason) => agentService.cancelSessionRuns(name, chatId, reason),
+    })
+    sessionRecovery.transferPending(session)
+    return session
+  },
   ensureChatForSession: feishu.createTempChatForSession,
   disbandChatForSessionExact: feishu.disbandChatForSessionExact,
   chatIdForSession: feishu.chatIdForSession,
@@ -289,48 +317,8 @@ async function createTempSession(opts: CreateTempSessionOptions): Promise<Create
   return await tempSessionRuntime.createTempSession(opts)
 }
 
-async function disbandTempSession(chatName: string, chatId: string): Promise<DisbandTempSessionResult> {
-  return await tempSessionRuntime.disbandTempSession(chatName, chatId)
-}
-
-/** Auto-restart any session that was alive when the previous daemon
- * went down. Driven by the marker file written in `cleanup` — that
- * file ONLY lists sessions that were running, so anything the user
- * had explicitly `kill`-ed before shutdown is intentionally absent
- * and stays stopped. Each revived session is `restart(true)`-ed in
- * parallel so one slow Codex init does not block the rest; Codex resumes
- * the saved thread id and the in-flight conversation continues without
- * the user typing anything. */
-async function reviveAliveSessions(): Promise<void> {
-  const names = [...new Set(feishu.readAliveMarker())]
-  if (names.length === 0) return
-  pendingReviveSessionNames = new Set(names)
-  log(`revive: ${names.length} session(s) marked alive on shutdown: ${names.join(', ')}`)
-  try {
-    await Promise.all(names.map(async sessionName => {
-      const chatId = feishu.chatIdForSession(sessionName)
-      if (!chatId) {
-        log(`revive: no chatId binding for "${sessionName}", skip`)
-        pendingReviveSessionNames.delete(sessionName)
-        writeCurrentAliveMarker()
-        return
-      }
-      const session = sessionFor(chatId, sessionName)
-      try {
-        const ok = await session.restart(true)
-        if (ok) log(`revive: spawned "${sessionName}" (chat ${chatId.slice(0, 8)}…)`)
-        else log(`revive: "${sessionName}" did not start`)
-      } catch (e) {
-        log(`revive: restart "${sessionName}" failed: ${e}`)
-      } finally {
-        pendingReviveSessionNames.delete(sessionName)
-        writeCurrentAliveMarker()
-      }
-    }))
-  } finally {
-    pendingReviveSessionNames.clear()
-    writeCurrentAliveMarker()
-  }
+async function disbandTempSession(chatName: string, expectedChatId: string): Promise<DisbandTempSessionResult> {
+  return await tempSessionRuntime.disbandTempSession(chatName, expectedChatId)
 }
 
 // ── Feishu `post` (rich-text) → Markdown ────────────────────────────────
@@ -536,7 +524,7 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   // for project worktree/group orchestration. Post 富文本整段不可能正好
   // 等于这些 bare word,所以这里只对 text 触发。
   if (msgType === 'text' && text) {
-    if (await session.runCommand(text, userOpenId)) return
+    if (await session.runCommand(text, userOpenId, msgId)) return
   }
 
   // Pending text is consumed once: notification reply → Agent question.
@@ -554,7 +542,6 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
       hasQuestion: () => session.hasPendingAsk(),
       answerQuestion: () => session.onAskMessageAnswer(text, userOpenId, msgId ?? ''),
     })) return
-
   // Pending AskUserQuestion: route the message as a custom answer
   // instead of opening a new turn. This is how custom-text answers
   // work in this version — Feishu schema 2.0 doesn't support form/
@@ -571,6 +558,12 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
 
   if (msgType === 'text' && text && session.hasPendingHostAsk()) {
     await session.onHostAskMessageAnswer(text, userOpenId, msgId ?? '')
+    return
+  }
+
+  // 补录应答态:点「➕ 补录模型」后的下一条文本作为模型名消费(裸词命令
+  // 已在上面优先分流)。同 AskUserQuestion 的消息应答语义。
+  if (msgType === 'text' && text && await session.consumeModelCustomMessage(text, userOpenId)) {
     return
   }
 
@@ -610,21 +603,23 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
 // accept() 同步返回 toast ACK(3s 窗口内),业务 handler 在 ACK 之后排队执行,
 // 卡片更新一律走 ACK 后 message.patch(publishCardActionResult)。
 function cardActionLabel(kind: string): string {
-  // 本地 23 kind 全集(01-03 白名单 + agent_identity_page / agent_run_cancel);
-  // 上游的 provider_select/model_custom_prompt/model_panel_cancel/token_source_enable
-  // 本地无此形态不收。
+  // 本地全集 + 上游新增(model 面板系 / token_source_enable / agent_project_cancel)。
   const labels: Record<string, string> = {
-    permission: '权限决定', menu: '菜单选择', model_select: '模型选择',
-    model_effort_select: '模型 effort 选择', ask: '问题回答', host_ask: '宿主问题回答',
+    permission: '权限决定', menu: '菜单选择', provider_select: '账号选择', model_page: '模型翻页',
+    model_list_open: '模型列表', model_add: '显示模型', model_remove: '隐藏模型', model_custom_remove: '删除补录模型',
+    model_select: '模型选择', model_custom_prompt: '模型补录',
+    model_panel_cancel: '取消模型补录', model_effort_select: '模型 effort 选择',
+    ask: '问题回答', host_ask: '宿主问题回答',
     worktree_disband: 'worktree 解散', temp_fork_select: '会话分叉',
     temp_back_select: '会话回滚', temp_resume_select: '会话恢复',
     tasklist_enable: '启用任务清单', tasklist_delete_prompt: '删除任务清单',
-    tasklist_delete_confirm: '确认删除任务清单',
+    tasklist_delete_confirm: '确认删除任务清单', token_source_enable: '启用账号',
     gsd_refresh: 'GSD 面板刷新', gsd_select: 'GSD 任务选择', gsd_continue: 'GSD 任务继续',
     gsd_pause: 'GSD 任务暂停', gsd_complete: 'GSD 任务完成', gsd_new_prompt: 'GSD 新指令',
     agy_forward_codex: 'agy 结果转交',
     agent_identity_page: 'Agent 身份翻页',
     agent_run_cancel: '取消 Agent 委派',
+    agent_project_cancel: '停止项目任务',
     notify_callback: '通知反馈', notify_reply: '通知回复', notify_reply_cancel: '取消通知回复',
   }
   return labels[kind] ?? kind
@@ -646,23 +641,24 @@ function withBusinessOutcome(response: any, ok: boolean, message?: string): any 
   }
 }
 
-/** ModelActionResult 形结果({ok, message, card?})统一转带 __businessOk 的
- *  ACK 响应(上游 ec149d7;model/host_ask 系 handler 共用)。 */
-function modelActionResponse(result: { ok: boolean; message: string; card?: object }): any {
-  return withBusinessOutcome(
-    result.card
-      ? actionCardResponse(result.card)
-      : { toast: { type: result.ok ? 'success' : 'error', content: result.message } },
-    result.ok,
-  )
-}
-
 function withNotifyContext(reg: NotifyRegistration, response: any): any {
   return {
     ...response,
     __cardActionMessageId: reg.messageId,
     __cardActionChatId: reg.chatId,
   }
+}
+
+function modelActionResponse(result: ModelActionResult): any {
+  const response = withBusinessOutcome(
+    result.card
+      ? actionCardResponse(result.card)
+      : { toast: { type: result.ok ? 'success' : 'error', content: result.message } },
+    result.ok,
+    result.pending ? undefined : result.message,
+  )
+  if (result.completion) response.__modelActionCompletion = result.completion
+  return response
 }
 
 async function sendActionReceipt(chatId: string, text: string): Promise<void> {
@@ -753,13 +749,17 @@ const cardActionAdmission = createCardActionAdmission<any, object>({
     // 转发/回调载荷丢失 context,注册表是权威来源;未知 notify_id 仍回落
     // 到 context,不在这里做准入判断(准入在 handleCardAction 内)。
     const kind = String(data?.action?.value?.kind ?? '')
+    if (kind.startsWith('agent_identity_')) return '__agent_identities_global__'
     if (kind === 'notify_callback' || kind === 'notify_reply' || kind === 'notify_reply_cancel') {
       const reg = getNotifyCallback(String(data?.action?.value?.notify_id ?? ''))
       if (reg) return reg.chatId
     }
     return String(data?.context?.open_chat_id ?? '') || '__notify_global__'
   },
-  execute: handleCardAction,
+  execute: data => {
+    if (shutdownRequested) sessions.get(String(data?.context?.open_chat_id ?? ''))?.closeModelSettingsChanges()
+    return handleCardAction(data)
+  },
   present: publishCardActionResult,
   presentExecutionFailure: async (data, error) => {
     const kind = String(data?.action?.value?.kind ?? 'unknown')
@@ -775,16 +775,20 @@ const cardActionAdmission = createCardActionAdmission<any, object>({
     )
   },
   businessSucceeded: (data, result) => {
-    // 兼容契约(01-08→01-10 显式声明):现阶段 session handler 不返回业务结果,
-    // result 无 __businessOk(甚至整体 undefined)一律视为成功;01-10 把
-    // session-ask/temp/model handler 升级为返回业务结果后,此判定自动收紧。
     if (typeof result?.__businessOk === 'boolean') return result.__businessOk
     const permissionDenied = data?.action?.value?.kind === 'permission'
       && data?.action?.value?.decision === 'deny'
     return permissionDenied || result?.toast?.type !== 'error'
   },
-  completion: (_data, result) => {
-    const completion = (result as any)?.__cardActionCompletion
+  completion: (data, result) => {
+    const modelCompletion: Promise<ModelActionResult> | undefined = result?.__modelActionCompletion
+    if (modelCompletion) {
+      // Start presentation only after the pending card has landed. The actor
+      // is released while the backend works, so stop/questions stay usable.
+      return modelActionCompletion(modelCompletion,
+        final => publishCardActionResult(data, modelActionResponse(final)))
+    }
+    const completion = result?.__cardActionCompletion
     return completion && typeof completion.then === 'function' ? completion : null
   },
   track: work => { trackCardActionWork(work) },
@@ -821,6 +825,13 @@ async function handleCardAction(data: any): Promise<any> {
   const chatId = data?.context?.open_chat_id ?? ''
   const userId = data?.operator?.open_id ?? ''
 
+  if (value.kind === 'agent_project_cancel') {
+    const cancelled = await agentService.cancelProjectRunFromCard(
+      String(value.run_id ?? ''), chatId, String(data?.context?.open_message_id ?? ''), userId,
+    )
+    return withBusinessOutcome({ toast: { type: 'success', content: cancelled ? '项目任务已停止' : '项目任务已结束' } }, true)
+  }
+
   // Interactive /notify cards must route even when no Session exists for
   // this chat — a notify push doesn't start a session, and the click's
   // job is to ping the local caller, not drive a turn. Short-circuit
@@ -841,7 +852,12 @@ async function handleCardAction(data: any): Promise<any> {
   }
 
   const session = sessions.get(chatId)
-  if (!session) return { toast: { type: 'error', content: '会话不存在，请先发消息启动' } }
+  if (!session) {
+    return withBusinessOutcome(
+      { toast: { type: 'error', content: '会话不存在，请先发消息启动' } },
+      false,
+    )
+  }
 
   switch (value.kind) {
     case 'permission': {
@@ -869,22 +885,54 @@ async function handleCardAction(data: any): Promise<any> {
       try {
         if (!Number.isInteger(choice) || choice < 0) throw new Error('无效的菜单选项')
         await session.onUserMessage(`(menu choice ${choice + 1})`)
-        return withBusinessOutcome(actionCardResponse(selectionResultCard({
+        return withBusinessOutcome(actionCardResponse(cards.selectionResultCard({
           title: '📋 菜单选择',
           message: `已选择第 ${choice + 1} 项`,
           ok: true,
         })), true)
       } catch (error) {
         const message = error instanceof Error ? error.message : String(error)
-        return withBusinessOutcome(actionCardResponse(selectionResultCard({
-          title: '📋 菜单选择',
-          message,
-          ok: false,
+        return withBusinessOutcome(actionCardResponse(cards.selectionResultCard({
+          title: '📋 菜单选择', message, ok: false,
         })), false)
       }
     }
+    case 'provider_select': {
+      const result = await session.onProviderSelect(String(value.source_id ?? ''), String(value.panel_id ?? ''))
+      return modelActionResponse(result)
+    }
+    case 'model_page': {
+      const result = await session.onModelPage(String(value.panel_id ?? ''), String(value.source_id ?? ''), Number(value.page))
+      return modelActionResponse(result)
+    }
+    case 'model_list_open': {
+      const panel = String(value.panel_id ?? '')
+      const source = String(value.source_id ?? '')
+      if (value.mode !== 'add' && value.mode !== 'select') throw new Error('模型管理模式无效')
+      return modelActionResponse(await (value.mode === 'add'
+        ? session.onModelAddOpen(panel, source) : session.onProviderSelect(source, panel)))
+    }
+    case 'model_add':
+    case 'model_remove':
+    case 'model_custom_remove': {
+      return modelActionResponse(await session.onModelListEdit(String(value.panel_id ?? ''), String(value.source_id ?? ''),
+        String(value.model ?? ''), value.kind === 'model_add' ? 'add' : value.kind === 'model_remove' ? 'remove' : 'delete'))
+    }
     case 'model_select': {
       const result = await session.onModelSelect(String(value.model ?? ''), String(value.panel_id ?? ''), userId, value)
+      return modelActionResponse(result)
+    }
+    case 'model_custom_prompt': {
+      // context.open_message_id = 补录卡所在消息;等待态记住它,回复后原位更新。
+      const result = await session.onModelCustomPrompt(
+        String(value.source_id ?? ''),
+        String(value.panel_id ?? ''),
+        String(data?.context?.open_message_id ?? ''),
+      )
+      return modelActionResponse(result)
+    }
+    case 'model_panel_cancel': {
+      const result = await session.onModelPanelCancel(String(value.panel_id ?? ''))
       return modelActionResponse(result)
     }
     case 'model_effort_select': {
@@ -933,19 +981,19 @@ async function handleCardAction(data: any): Promise<any> {
     }
     case 'worktree_disband': {
       const result = await session.onWorktreeDisband(String(value.slug ?? ''))
-      return actionCardResponse(result.card)
+      return withBusinessOutcome(actionCardResponse(result.card), result.ok)
     }
     case 'temp_fork_select': {
       const result = await session.onForkSelect(String(value.panel_id ?? ''), String(value.choice_id ?? ''), userId)
       return withBusinessOutcome(result.replaceCard === false
         ? { toast: { type: 'error', content: result.message } }
-        : actionCardResponse(selectionResultCard({ title: '🔱 会话分叉', message: result.message, ok: result.ok })), result.ok)
+        : actionCardResponse(cards.selectionResultCard({ title: '🔱 会话分叉', message: result.message, ok: result.ok })), result.ok)
     }
     case 'temp_back_select': {
       const result = await session.onBackSelect(String(value.panel_id ?? ''), String(value.choice_id ?? ''), userId)
       return withBusinessOutcome(result.replaceCard === false
         ? { toast: { type: 'error', content: result.message } }
-        : actionCardResponse(selectionResultCard({ title: '⏪ 会话回滚', message: result.message, ok: result.ok })), result.ok)
+        : actionCardResponse(cards.selectionResultCard({ title: '⏪ 会话回滚', message: result.message, ok: result.ok })), result.ok)
     }
     case 'temp_resume_select': {
       const result = await session.onResumeSelect(String(value.panel_id ?? ''), String(value.choice_id ?? ''), userId)
@@ -955,7 +1003,7 @@ async function handleCardAction(data: any): Promise<any> {
       if (!result.resumePresentation) {
         throw new Error('rs selection result missing trusted presentation snapshot')
       }
-      return withBusinessOutcome(actionCardResponse(resumeSelectionResultCard({
+      return withBusinessOutcome(actionCardResponse(cards.resumeSelectionResultCard({
         ...result.resumePresentation,
         message: result.message,
         ok: result.ok,
@@ -963,15 +1011,15 @@ async function handleCardAction(data: any): Promise<any> {
     }
     case 'tasklist_enable': {
       const result = await session.onTasklistEnable()
-      return actionCardResponse(result.card)
+      return withBusinessOutcome(actionCardResponse(result.card), result.ok)
     }
     case 'tasklist_delete_prompt': {
       const result = session.onTasklistDeletePrompt(String(value.guid ?? ''))
-      return actionCardResponse(result.card)
+      return withBusinessOutcome(actionCardResponse(result.card), result.ok)
     }
     case 'tasklist_delete_confirm': {
       const result = await session.onTasklistDeleteConfirm(String(value.guid ?? ''))
-      return actionCardResponse(result.card)
+      return withBusinessOutcome(actionCardResponse(result.card), result.ok)
     }
     case 'gsd_refresh': {
       const result = await session.onGsdRefresh(String(value.task_slug ?? ''), String(value.panel_gen ?? ''))
@@ -1010,7 +1058,7 @@ async function handleCardAction(data: any): Promise<any> {
         : { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
     }
     case 'agy_forward_codex': {
-      const result = session.beginAgyForwardToCodex(String(value.result_id ?? ''), userId)
+      const result = beginAgyForwardToCodex(session, String(value.result_id ?? ''), userId)
       return { toast: { type: result.ok ? 'success' : 'error', content: result.message } }
     }
     case 'agent_identity_page': {
@@ -1121,7 +1169,7 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
   if (!reg.callbackUrl) {
     // recordCallbackSuccess 永不抛:持久化失败转 unknown 冻结(内存 guard
     // 保留),verdict 卡照常回(准入层 ACK 后经 message.patch 落原卡)。
-    const recorded = recordNotifyCallbackSuccess(reg.notifyId, button.id, userId)
+    const recorded = recordCallbackSuccess(reg.notifyId, button.id, userId)
     if (recorded.state === 'unknown') {
       log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… verdict tombstone UNKNOWN (pull/display): ${recorded.detail}`)
     }
@@ -1136,6 +1184,15 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
   // synchronously so a fast second click is blocked before the async work
   // starts. __cardActionCompletion 把 phase-2 结果接回 dedupe:push 失败
   // (retry)立即释放业务 key 允许再点;成功/unknown 落 30s 墓碑。
+  // beginCallbackDispatch 预写 dispatchState:进程若在回调期间崩溃,boot 时
+  // loadCallbacks 会把该回调冻结为 UNKNOWN,禁止自动重试。
+  try {
+    beginCallbackDispatch(reg.notifyId, button.id, userId)
+  } catch (error) {
+    return withNotifyContext(reg, withBusinessOutcome({
+      toast: { type: 'error', content: `保存回调发送状态失败，未发送: ${error instanceof Error ? error.message : error}` },
+    }, false))
+  }
   setDispatching(reg.notifyId)
   const phase2 = trackCardActionWork(pushNotifyCallbackPhase2(reg, button, userId))
   void phase2.catch(e => {
@@ -1181,7 +1238,7 @@ async function pushNotifyCallbackPhase2(
       // failure is therefore UNKNOWN, never retryable. recordCallbackSuccess
       // attempts to persist that unknown tombstone and retains an in-memory
       // guard even when the store itself remains unavailable(01-05 契约,永不抛)。
-      const recorded = recordNotifyCallbackSuccess(reg.notifyId, button.id, userId)
+      const recorded = recordCallbackSuccess(reg.notifyId, button.id, userId)
       if (recorded.state === 'complete') {
         resolution = {
           status: 'delivered', buttonId: button.id, text: button.text,
@@ -1206,9 +1263,11 @@ async function pushNotifyCallbackPhase2(
         }
       }
     } else {
+      const recorded = recordCallbackFailure(reg.notifyId)
+      outcome = recorded.state
       resolution = {
-        status: 'failed', buttonId: button.id, text: button.text,
-        operatorOpenId: userId, detail: result.detail,
+        status: recorded.state === 'retry' ? 'failed' : 'unknown', buttonId: button.id, text: button.text,
+        operatorOpenId: userId, detail: recorded.state === 'retry' ? result.detail : `${result.detail}; ${recorded.detail}`,
       }
     }
 
@@ -1220,7 +1279,7 @@ async function pushNotifyCallbackPhase2(
       try {
         await sendActionReceipt(
           reg.chatId,
-          `⚠️ 通知反馈${outcome === 'retry' ? '失败且结果卡更新失败，可重新点击' : '已执行，但结果卡更新失败'}: ${e instanceof Error ? e.message : e}`,
+          `⚠️ 通知反馈${outcome === 'retry' ? '失败且结果卡更新失败，可重新点击' : outcome === 'unknown' ? '送达状态未知且结果卡更新失败，禁止自动重试' : '已执行，但结果卡更新失败'}: ${e instanceof Error ? e.message : e}`,
         )
       } catch (receiptError) {
         log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… final fallback receipt failed: ${receiptError instanceof Error ? receiptError.message : receiptError}`)
@@ -1265,10 +1324,14 @@ function startDebugSocket(): void {
     Bun.serve({
       unix: DEBUG_SOCK_FILE,
       fetch: async (req: Request) => {
-        if (req.method !== 'POST') return new Response('use POST', { status: 405 })
+        const url = new URL(req.url)
+        const readModelState = req.method === 'GET' && url.pathname === '/model-state'
+        if (req.method !== 'POST' && !readModelState) return new Response('unsupported debug method', { status: 405 })
         if (shutdownRequested) return new Response('daemon shutdown in progress', { status: 503 })
         let body: any = {}
-        try { body = await req.json() } catch { return new Response('bad json', { status: 400 }) }
+        if (req.method === 'POST') {
+          try { body = await req.json() } catch { return new Response('bad json', { status: 400 }) }
+        }
         if (!existsSync(DEBUG_CTX_FILE)) {
           return new Response('no debug context yet — send `[DEBUG]hi` from Feishu first', { status: 412 })
         }
@@ -1276,6 +1339,35 @@ function startDebugSocket(): void {
         try { ctx = JSON.parse(readFileSync(DEBUG_CTX_FILE, 'utf8')) } catch (e) {
           return new Response(`ctx read failed: ${e}`, { status: 500 })
         }
+        const target = readModelState ? url.searchParams.get('chat_id') : body.chat_id
+        if ((target !== undefined && target !== ctx.chat_id) || (url.pathname !== '/' && !target)) {
+          return new Response('explicit debug chat_id must match the seeded context', { status: 409 })
+        }
+        if (readModelState) {
+          const session = sessions.get(ctx.chat_id)
+          return session ? Response.json(debugModelState(session)) : new Response('send md to open a model panel first', { status: 404 })
+        }
+        if (url.pathname === '/model-action') {
+          const session = sessions.get(ctx.chat_id)
+          if (!session) return new Response('debug session not found', { status: 404 })
+          try {
+            if (typeof body.message_id !== 'string' || !body.message_id.startsWith('om_')) throw new Error('message_id required')
+            const panelId = typeof body.value?.panel_id === 'string' ? body.value.panel_id.trim() : ''
+            const panel = session.modelPanels.get(panelId)
+            if (!panel?.messageId || panel.messageId !== body.message_id) throw new Error('stale or mismatched model panel')
+            const response = await feishu.client.im.v1.message.get({ path: { message_id: body.message_id } })
+            if (response.code !== 0) throw new Error(`message.get failed: ${formatFeishuError(response)}`)
+            const event = debugModelActionEvent(body, ctx, response.data?.items?.[0], config.feishu.app_id, panel.messageId)
+            log(`debug: model action ${body.value.kind} chat=${ctx.chat_id.slice(0, 8)}…`)
+            const admission = acceptCardAction(event)
+            // 排到相同群的 actor 尾部，等待正常业务处理与卡片呈现完成。
+            await chatActor.enqueue(ctx.chat_id, async () => {})
+            return Response.json({ admission, state: debugModelState(session) })
+          } catch (error) {
+            return new Response(error instanceof Error ? error.message : String(error), { status: 400 })
+          }
+        }
+        if (url.pathname !== '/') return new Response('unknown debug endpoint', { status: 404 })
         const text: string = String(body.text ?? '')
         if (!text) return new Response('text required', { status: 400 })
         // 把 inject 内容**真发到目标群**,带"【自动化测试】"前缀让群成员
@@ -1304,10 +1396,11 @@ function startDebugSocket(): void {
           },
         }
         log(`debug: inject text=${JSON.stringify(text).slice(0, 80)} msg_id=${realMsgId}`)
-        // Don't await — match real WS dispatcher behavior (per-chat FIFO admission).
+        // Don't await — match real WS dispatcher behavior (fire-and-forget per event).
         if (!enqueueMessage(payload, 'debug')) {
-          return new Response('inbound message rejected at admission', { status: 503 })
+          return new Response('daemon shutdown in progress', { status: 503 })
         }
+        if (body.wait_for_handling === true) await chatActor.enqueue(ctx.chat_id, async () => {})
         return new Response(JSON.stringify({ ok: true, msg_id: realMsgId }), {
           headers: { 'content-type': 'application/json' },
         })
@@ -1322,16 +1415,40 @@ function startDebugSocket(): void {
 
 async function boot(): Promise<void> {
   log(`lodestar-daemon: pid ${process.pid} starting`)
+  sessionRecovery.load()
+  // token source registry 先于 session 构建填充:session 构造会查 registry 推导 tokenSourceId。
+  // config.toml [token_source.*] 在此落地为可用的 TokenSource。
+  const { buildTokenSourcesFromConfig } = await import('./src/token-source-builtins')
+  if (shutdownRequested) return
+  buildTokenSourcesFromConfig()
+  // 先完成模型目录加载，再接受群消息和恢复会话。空的加载中目录不能用于
+  // 判断已保存的模型是否存在；刷新失败由对应 source 保留明确错误。
+  const { refreshAllTokenSourceModels, listTokenSourceAccounts } = await import('./src/token-source')
+  if (shutdownRequested) return
+  await refreshAllTokenSourceModels()
+  await Promise.allSettled(listTokenSourceAccounts().map(refreshTokenSourceUsage))
+  if (shutdownRequested) return
+  startBackgroundRefresh()
+  codexActivation.start()
   feishu.loadTempSessionLeases()
   feishu.loadSessionChatMap()
   feishu.loadSessionResumeMap()
   feishu.loadSessionTurnsMap()
   feishu.loadSessionModelMap()
   await feishu.refreshChatList()
+  if (shutdownRequested) return
   // 群名解析靠 chatNameCache,但新群/改名走 fetchChatName 点查,不依赖这里全量刷。
   // 5min 全量 chat.list 是纯空转(IM API 计入免费版配额),拉长到 30min 足够保持缓存新鲜。
   setInterval(() => { void feishu.refreshChatList() }, 30 * 60 * 1000)
   startTasklistWorker()
+  const { reconcileTasklistDeletions } = await import('./src/tasklist')
+  if (shutdownRequested) return
+  try {
+    await reconcileTasklistDeletions()
+  } catch (e) {
+    log(`tasklist deletion reconcile failed: ${e instanceof Error ? e.message : e}`)
+  }
+  if (shutdownRequested) return
 
   // Lark WSClient sends pings every ~120s but doesn't verify pongs by default.
   // On a half-open TCP (NAT idle-kill, network blip) the socket stays OPEN and
@@ -1360,6 +1477,7 @@ async function boot(): Promise<void> {
     log(`[ws] rebuild requested before WS init — ${reason}`)
   }
   const scheduleWsRebuild = (reason: string, delayMs = 0, verifyAfter = false) => {
+    if (shutdownRequested) return
     const dueAt = Date.now() + delayMs
     if (scheduledRebuildTimer) {
       scheduledRebuildVerifyAfter ||= verifyAfter
@@ -1436,10 +1554,9 @@ async function boot(): Promise<void> {
       // 失败把事件直接丢弃(后台 event log 里这一类 errorInfo=timeout,
       // costMills≈3760ms,用户侧表现就是"发的消息 daemon 完全没收到")。
       // 这里立刻 return 让 dispatcher 回 ack,实际处理后台跑;handleMessage
-      // 入口已用 seenMessageIds 做了同 message_id 去重。enqueueMessage 同步
-      // 入队(PerKeyActor 按 chat FIFO,receivedAt 在准入时刻捕获),ACK 不等
-      // 业务处理 —— 同群保序,异群仍并发。
-      if (!enqueueMessage(d)) throw new Error('inbound message rejected at admission')
+      // 入口已用 seenMessageIds 做了同 message_id 去重,fire-and-forget
+      // 不会引入重复处理。
+      if (!enqueueMessage(d)) throw new Error('daemon shutdown in progress')
     },
   })
   dispatcher.register({
@@ -1488,6 +1605,7 @@ async function boot(): Promise<void> {
   // removeAllListeners() before terminate(), so the old client fires no stray
   // reconnect. verifyAfter arms a post-rebuild check (only for active groups).
   rebuildWs = (reason: string, verifyAfter = false) => {
+    if (shutdownRequested) return
     if (rebuilding) { log(`[ws] rebuild skipped (already rebuilding) — ${reason}`); return }
     if (scheduledRebuildTimer) {
       clearTimeout(scheduledRebuildTimer)
@@ -1500,7 +1618,10 @@ async function boot(): Promise<void> {
     const old = ws
     try { old?.close({ force: true }) } catch (e) { log(`[ws] rebuild: old close failed: ${e}`) }
     ws = makeWs()
-    void ws.start({ eventDispatcher: dispatcher })
+    void ws.start({ eventDispatcher: dispatcher }).catch(e => {
+      log(`[ws] rebuild start failed: ${e}`)
+      scheduleWsRebuild(`fresh client start failed: ${e}`, SETTLE_MS, verifyAfter)
+    })
     rebuilding = false
     if (verifyAfter) armVerify()
   }
@@ -1519,7 +1640,7 @@ async function boot(): Promise<void> {
       if (lastEventAt >= armedAt) { consecRebuilds = 0; return }  // events resumed → healthy
       if (consecRebuilds >= MAX_CONSEC_REBUILDS) {
         log(`[ws] STILL deaf after ${MAX_CONSEC_REBUILDS} fresh rebuilds — auto-heal exhausted, ` +
-            `leaving last client up (no process exit). Escape hatch: systemctl --user restart feishu-daemon`)
+            `leaving last client up (no process exit). Restart the configured service or run lodestar-stop && lodestar-daemon`)
         consecRebuilds = 0
         return
       }
@@ -1542,8 +1663,6 @@ async function boot(): Promise<void> {
   }
 
   ws = makeWs()
-  void ws.start({ eventDispatcher: dispatcher })
-  log(`lodestar-daemon: WS started, watching ${feishu.chatNameCache.size} groups`)
 
   // Liveness watchdog for the OTHER failure mode the deaf-heal can't see: a
   // wedged handshake / zombie socket that leaves the client stuck OFF
@@ -1555,7 +1674,8 @@ async function boot(): Promise<void> {
   const WS_WATCHDOG_INTERVAL_MS = 15_000
   const WS_CONNECTING_GRACE_TICKS = 2
   let wsUnhealthyTicks = 0
-  setInterval(() => {
+  const wsWatchdog = setInterval(() => {
+    if (shutdownRequested) return
     const { state } = ws.getConnectionStatus()
     if (state === 'connected') { wsUnhealthyTicks = 0; return }
     if (state === 'failed' || state === 'idle') {
@@ -1570,28 +1690,21 @@ async function boot(): Promise<void> {
       rebuildWs(`watchdog: stuck in '${state}' ~${Math.round((WS_WATCHDOG_INTERVAL_MS * WS_CONNECTING_GRACE_TICKS) / 1000)}s`)
     }
   }, WS_WATCHDOG_INTERVAL_MS)
-
-  startDebugSocket()
-  // Reload persisted /notify button→callback registrations before the
-  // notify server starts serving, so a card tapped right after a daemon
-  // restart still routes to its caller. Prunes entries older than 7 days.
-  for (const reg of loadCallbacks()) {
-    // Restore visible UNKNOWN receipts for interrupted text deliveries. Use
-    // the same actor and shutdown tracking as live notification actions.
-    void trackCardActionWork(chatActor.enqueue(reg.chatId, () => notifyReplies.recover(reg)))
-      .catch(error => log(`notify-reply recovery failed: ${error instanceof Error ? error.message : error}`))
+  stopFeishuWs = () => {
+    clearInterval(wsWatchdog)
+    if (scheduledRebuildTimer) clearTimeout(scheduledRebuildTimer)
+    if (verifyTimer) clearTimeout(verifyTimer)
+    ws.close({ force: true })
   }
-  // Install the bare delegated-agent command first so Skill bash can find
-  // `lodestar-agent` on PATH. Wrapper lives in DATA_DIR/bin and contains
-  // paths only — never capability or provider credentials. The installer
-  // prepends that bin dir onto process.env.PATH.
-  ensureLodestarAgentCommand()
-
+  const recoveredCallbacks = loadCallbacks()
+  const projectClient = createAgentProjectClient(agentApiUrl(config.notify.bind, config.notify.port))
   startNotifyServer({
     bind: config.notify.bind,
     port: config.notify.port,
     extraHandler: (req, res, url) => handleAgentRequest(req, res, url, {
       service: agentService,
+      authorizeProject: (capability, project) => acceptsProjectCapability(projectClient, capability)
+        ? agentService.projectPrincipal(resolveAgentProject(project)) : null,
       authorizeSession: capability => {
         for (const session of sessions.values()) {
           if (session.acceptsAgentCapability(capability)) return session
@@ -1601,12 +1714,23 @@ async function boot(): Promise<void> {
     }),
   })
 
+  // Install the bare delegated-agent command first, then sync managed Skills.
+  // Source checkouts execute the TS entry through Bun; release installs execute
+  // the sibling Node bundle. Missing entries fail boot instead of shipping a
+  // Skill whose first command is guaranteed to fail. (本地实现来自
+  // './src/agent-skill':wrapper 落 DATA_DIR/bin 并把该目录前置进 PATH,
+  // launchd 下 daemon 子进程可达 —— 勿换回上游 managed-commands。)
+  ensureLodestarAgentCommand()
+
   // Sync the feishu-notify skill into ~/.codex/skills (idempotent).
   // Lets the user's main Codex session push to bound groups via
   // /notify without manually placing the skill file. Runs after
   // notify server is up so the port number we bake into the skill
   // body matches what's actually listening.
   ensureFeishuNotifySkill()
+  ensureLodestarAgentSkill()
+  // File delivery is injected into each hosted session, not exposed as a Skill.
+  removeManagedSkill('lodestar-files')
 
   // Sync imagegen skill (CLI-first, independent Images API channel) into
   // ~/.claude/skills + ~/.codex/skills, and write the credential wrapper
@@ -1619,23 +1743,28 @@ async function boot(): Promise<void> {
   // NO credentials / venv: codex auth lives in ~/.codex/config.toml.
   ensureImagereadSkill()
 
-  // Dual-dir lodestar-agent Skill (notify-skill pattern). Wrapper already
-  // installed above so Skill bash can find the bare command.
-  ensureLodestarAgentSkill()
-
   // Sync the fable-plan-dsh-exec skill (跨模型编排) into both backends and
   // install the bare `fpd` helper command under DATA_DIR/bin (imageread-skill
   // pattern: vendored from the repo .agents tree, registry installs skip).
   ensureFpdSkill()
 
-  // Auto-revive sessions that were running when we last went down.
-  // Runs AFTER the WS is up so any 🔁 revive message lands in the
-  // right chat instead of disappearing into the void.
-  await reviveAliveSessions()
-
+  // Reserve recovery ahead of both messages and card actions in each chat's
+  // FIFO before ingress opens. Feishu REST status cards do not require WS.
+  const revival = sessionRecovery.enqueue()
   // Agent 自动更新(上游 c55bb44 / D-06):只挂定时器,不做任何主动检查或安装 ——
   // 默认三开关全 false → 零定时器严格 no-op;只有显式 `true` 的 agent 才按 6h 节拍更新。
   stopAgentAutoUpdates = startAgentAutoUpdates(log, { enabled: config.runtime.agent_auto_update })
+  void ws.start({ eventDispatcher: dispatcher }).catch(e => {
+    log(`[ws] initial start failed: ${e}`)
+    scheduleWsRebuild(`initial start failed: ${e}`, SETTLE_MS, false)
+  })
+  log(`lodestar-daemon: WS start requested, watching ${feishu.chatNameCache.size} groups`)
+  startDebugSocket()
+  for (const reg of recoveredCallbacks) {
+    void trackCardActionWork(chatActor.enqueue(reg.chatId, () => notifyReplies.recover(reg)))
+      .catch(error => log(`notify-reply recovery failed: ${error instanceof Error ? error.message : error}`))
+  }
+  await revival
 }
 
 boot().catch(e => {

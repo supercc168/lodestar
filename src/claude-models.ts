@@ -298,6 +298,9 @@ export function claudeModelKey(model: string): string {
   return model.startsWith('claude:') ? model : `claude:${model}`
 }
 
+/** 解析旧 claude:<profile> 选择；Token Source 传入的真实模型名直接保留
+ * (非 claude: 前缀原样返回)。本地档位走 profile.sdkModel，未配 model 时回落
+ * DEFAULT_CLAUDE_SDK_MODEL(Fable 5)。 */
 export function resolveClaudeSdkModel(model: string | null | undefined): string | undefined {
   if (!model) return DEFAULT_CLAUDE_SDK_MODEL
   const profile = claudeModelProfile(model)

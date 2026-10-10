@@ -91,14 +91,6 @@ export function expectedWorktreePath(projectDir: string, projectName: string, sl
   return join(dirname(projectDir), worktreeChatName(projectName, slug))
 }
 
-export function worktreeInstructionsPathForManagedBranch(
-  workDir: string,
-  projectDir: string,
-  projectName: string,
-): string | null {
-  return managedWorktreeInstructionContext(workDir, projectDir, projectName)?.path ?? null
-}
-
 export function readWorktreeInstructionsForManagedBranch(
   workDir: string,
   projectDir: string,
@@ -128,7 +120,6 @@ export function listProjectWorktrees(projectDir: string, projectName: string): W
     const chatName = worktreeChatName(projectName, slug)
     const expectedPath = expectedWorktreePath(projectDir, projectName, slug)
     const mountedPath = mountedByBranch.get(branch) ?? null
-    const worktreePath = mountedPath ?? expectedPath
     const mounted = !!mountedPath && existsSync(mountedPath)
     const state = branchState(projectDir, branch, mounted)
     const entry: WorktreeEntry = {
@@ -173,7 +164,7 @@ export function ensureProjectWorktree(projectDir: string, projectName: string, s
     : null
 
   if (mountedPath) {
-    if (resolve(mountedPath) !== resolve(targetPath)) {
+    if (!sameWorktreePath(mountedPath, targetPath)) {
       throw new Error(`branch ${branch} is already mounted at ${mountedPath}`)
     }
     assertWorktreeBranch(targetPath, branch)
@@ -214,10 +205,16 @@ export function assertProjectWorktreeClean(projectDir: string, projectName: stri
   const chatName = worktreeChatName(projectName, cleanSlug)
   const targetPath = expectedWorktreePath(projectDir, projectName, cleanSlug)
   const mountedPath = parseWorktreeList(projectDir).get(branch) ?? null
+  if (mountedPath && !sameWorktreePath(mountedPath, targetPath)) {
+    throw new Error(`branch ${branch} is already mounted at ${mountedPath}, outside managed path ${targetPath}`)
+  }
   const worktreePath = mountedPath ?? targetPath
 
   if (!existsSync(worktreePath)) {
     return { slug: cleanSlug, chatName, branch, worktreePath, removedWorktree: false }
+  }
+  if (!mountedPath) {
+    throw new Error(`${worktreePath} is not a registered worktree of ${projectDir}`)
   }
   assertWorktreeBranch(worktreePath, branch)
   const dirty = git(worktreePath, ['status', '--porcelain=v1']).split('\n').filter(Boolean)
@@ -258,7 +255,7 @@ function managedWorktreeInstructionContext(
     throw new Error(`invalid worktree branch "${branch}"`)
   }
   const expectedPath = expectedWorktreePath(projectDir, projectName, slug)
-  if (resolve(workDir) !== resolve(expectedPath)) return null
+  if (!sameWorktreePath(workDir, expectedPath)) return null
   const instructionsPath = worktreeInstructionsPath(workDir, worktreeInstructionSlugKey(slug))
   return instructionsPath ? { path: instructionsPath, slug } : null
 }
@@ -278,7 +275,7 @@ function worktreeInstructionSlugKey(slug: string): string {
 }
 
 function worktreeInstructionsPath(workDir: string, slugKey: string): string | null {
-  const expectedName = `agents.${slugKey}.md`
+  const expectedName = `agents.${slugKey}.md`.toLowerCase()
   const matches = readdirSync(workDir)
     .filter(name => name.toLowerCase() === expectedName)
     .sort()
@@ -317,9 +314,10 @@ function isAncestor(projectDir: string, ancestor: string, descendant: string): b
 
 function parseWorktreeList(projectDir: string): Map<string, string> {
   const out = new Map<string, string>()
-  const text = git(projectDir, ['worktree', 'list', '--porcelain'])
+  const text = git(projectDir, ['worktree', 'list', '--porcelain', '-z'])
   let currentPath = ''
-  for (const line of text.split('\n')) {
+  for (const line of text.split('\0')) {
+    if (!line) currentPath = ''
     if (line.startsWith('worktree ')) {
       currentPath = line.slice('worktree '.length)
       continue
@@ -329,6 +327,14 @@ function parseWorktreeList(projectDir: string): Map<string, string> {
     }
   }
   return out
+}
+
+function sameWorktreePath(first: string, second: string): boolean {
+  const canonical = (path: string): string => {
+    const value = existsSync(path) ? realpathSync(path) : resolve(path)
+    return process.platform === 'win32' ? value.toLowerCase() : value
+  }
+  return canonical(first) === canonical(second)
 }
 
 function git(cwd: string, args: string[]): string {

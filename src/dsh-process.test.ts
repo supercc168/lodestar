@@ -1,377 +1,563 @@
-/**
- * DshProcess 单测:注入假 runtime,不 spawn 真实 DSH 子进程。
- *
- * 上游 722e45a 的同名文件是「真实 Node 子进程 + 本地 HTTP/SSE 模型服务」的集成形态。
- * 本地按 03-01 wave 1 的边界改写为单元形态:用 `mock.module` 替换 `./dsh-runtime`,
- * 覆盖 DshProcess 与本地 AgentProcess/UserTextDispatch 契约,以及上游在 722e45a 内
- * 修掉的五处缺陷对应行为(setup/cancel/内容块/意外退出/图片 MIME 中与 daemon 侧
- * 直接相关的三项)。真实子进程路径由 Task 2 的 model/list 冒烟证明;真实会话验证
- * 由用户在 daemon 重启后按 docs/dsh-testing-report.md 执行。
- */
-import { afterAll, afterEach, describe, expect, mock, test } from 'bun:test'
-import { EventEmitter } from 'node:events'
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { isDshReasoningEffort } from './agent-process'
-import { DSH_PROTOCOL_VERSION, DSH_VERSION } from './dsh-protocol'
+import { DshProcess } from './dsh-process'
+import type { DshSpawnOptions } from './dsh-process'
+import type { ConversationLaunch } from './conversation'
+import { queryDshRuntime } from './dsh-runtime'
+import { emptyBgStore, applyBgTaskStarted, applyBgTaskSettled, applyBgToolUse, applyBgToolResult, promotePendingOnAdvance } from './cards/background'
 
-const WORKDIR = process.cwd()
-const SESSION_ID = 'dsh-session-1'
-const MODEL_ID = 'deepseek-v4-flash'
-const MODELS = [{
-  model: MODEL_ID, display: 'DeepSeek-V4-Flash', efforts: ['off', 'low', 'high', 'max'],
-  defaultEffort: 'high', contextWindow: 1_000_000, isDefault: true,
-}]
-
-type NativeRequest = { method: string, params: any }
-
-/** 假 DSH runtime:记录 RPC 调用,并允许用例按方法脚本化返回/抛出。 */
-class FakeDshRuntime extends EventEmitter {
-  static created: FakeDshRuntime[] = []
-  readonly options: any
-  readonly requests: NativeRequest[] = []
-  readonly scripts = new Map<string, (params: any) => any>()
-  initialized = false
-  closed = false
-  private alive = true
-
-  constructor(options: any) {
-    super()
-    this.options = options
-    FakeDshRuntime.created.push(this)
+const cleanups: Array<() => Promise<void>> = []
+afterEach(async () => {
+  const failures = []
+  for (const cleanup of cleanups.splice(0).reverse()) {
+    try { await cleanup() } catch (error) { failures.push(error) }
   }
-  static latest(): FakeDshRuntime {
-    const runtime = FakeDshRuntime.created.at(-1)
-    if (!runtime) throw new Error('fake DSH runtime was never constructed')
-    return runtime
-  }
-  initialize(): Promise<void> { this.initialized = true; return Promise.resolve() }
-  request(method: string, params: any = {}): Promise<any> {
-    this.requests.push({ method, params })
-    const script = this.scripts.get(method)
-    if (script) return Promise.resolve(script(params))
-    return Promise.resolve(defaultReply(method))
-  }
-  isAlive(): boolean { return this.alive }
-  close(): Promise<void> { this.closed = true; this.alive = false; return Promise.resolve() }
-  emitExit(event: { code: number | null, signal: string | null, expected: boolean }): void {
-    this.alive = false
-    this.emit('exit', event)
-  }
-  notify(method: string, params: any): void { this.emit('notification', { method, params }) }
-}
-
-function defaultReply(method: string): any {
-  switch (method) {
-    case 'initialize': return { protocolVersion: DSH_PROTOCOL_VERSION, runtimeVersion: DSH_VERSION }
-    case 'session/open': return { sessionId: SESSION_ID, models: MODELS }
-    case 'model/list': return MODELS
-    default: return {}
-  }
-}
-
-// 替身只换 DshRuntime 类,须保留模块的其余导出:mock.module 在 bun test 的
-// 单进程里跨文件生效,而 session.ts(03-03 起)会 import 同模块的 queryDshRuntime,
-// 少一个导出会让 session.test.ts 在整包跑时以 SyntaxError 崩掉。
-const actualDshRuntime = await import('./dsh-runtime')
-mock.module('./dsh-runtime', () => ({ ...actualDshRuntime, DshRuntime: FakeDshRuntime }))
-const { DshProcess } = await import('./dsh-process')
-
-type DshSpawnOptions = ConstructorParameters<typeof DshProcess>[0]
-type DshProcessInstance = InstanceType<typeof DshProcess>
-
-const live: DshProcessInstance[] = []
-let scratch = ''
-
-function processFor(overrides: Partial<DshSpawnOptions> = {}): DshProcessInstance {
-  const proc = new DshProcess({
-    workDir: WORKDIR, tokenSourceId: 'deepseek-harness', model: MODEL_ID, effort: 'high',
-    allowDelegation: false, profile: { loadProjectMcp: false }, ...overrides,
-  })
-  proc.on('error', () => {})
-  live.push(proc)
-  expect(FakeDshRuntime.created.length).toBeGreaterThan(0)
-  return proc
-}
-
-function prompts(runtime: FakeDshRuntime): NativeRequest[] {
-  return runtime.requests.filter(request => request.method === 'session/prompt')
-}
-
-/** 复现 bridge 的正文帧序列:start → chunk…(revision/index 严格递增)。 */
-function emitChunk(runtime: FakeDshRuntime, chunk: any, attemptId = 'attempt-1'): void {
-  runtime.notify('assistant.frame', { sessionId: SESSION_ID, frame: { attemptId, type: 'start', revision: 0, index: 0 } })
-  runtime.notify('assistant.frame', { sessionId: SESSION_ID, frame: { attemptId, type: 'chunk', revision: 1, index: 0, chunk } })
-}
-
-function emitTurnStart(runtime: FakeDshRuntime, seq: number, turn: number): void {
-  runtime.notify('session.event', { sessionId: SESSION_ID, event: { type: 'turn/start', seq, data: { turn } } })
-}
-
-async function waitFor(predicate: () => boolean, timeoutMs = 3000): Promise<void> {
-  const deadline = Date.now() + timeoutMs
-  while (!predicate()) {
-    if (Date.now() > deadline) throw new Error('timed out waiting for condition')
-    await Bun.sleep(1)
-  }
-}
-
-test('beforeAll', async () => { scratch = await mkdtemp(join(tmpdir(), 'lodestar-dsh-unit-')) })
-afterEach(async () => { for (const proc of live.splice(0)) await proc.kill() })
-afterAll(async () => {
-  mock.restore()
-  await rm(scratch, { recursive: true, force: true })
+  if (failures.length) throw new AggregateError(failures, 'DSH test cleanup failed')
 })
 
-describe('DshProcess 契约', () => {
-  test('成功投递返回 queued/dsh 派发,而不是 void', async () => {
-    const proc = processFor()
-    const runtime = FakeDshRuntime.latest()
+type ModelProtocol = 'chat-completions' | 'messages'
+type FixtureResponse = Response | ((protocol: ModelProtocol) => Response)
+
+function completion(delta: { content?: string; tool_calls?: any[] }, finish = 'stop', model = 'deepseek-v4-flash'): FixtureResponse {
+  return protocol => {
+    if (protocol === 'chat-completions') return new Response([
+      `data: ${JSON.stringify({ id: 'test-completion', model, choices: [{ index: 0, delta, finish_reason: null }] })}\n\n`,
+      `data: ${JSON.stringify({ choices: [{ index: 0, delta: {}, finish_reason: finish }], usage: {
+        prompt_tokens: 100, completion_tokens: 10, total_tokens: 110, prompt_cache_hit_tokens: 40, prompt_cache_miss_tokens: 60,
+      } })}\n\n`,
+      'data: [DONE]\n\n',
+    ].join(''), { headers: { 'content-type': 'text/event-stream' } })
+    const events: any[] = [{ type: 'message_start', message: {
+      id: 'test-completion', type: 'message', role: 'assistant', model, content: [],
+      stop_reason: null, stop_sequence: null,
+      usage: { input_tokens: 60, output_tokens: 0, cache_read_input_tokens: 40 },
+    } }]
+    let index = 0
+    if (delta.content !== undefined) {
+      events.push({ type: 'content_block_start', index, content_block: { type: 'text', text: '' } },
+        { type: 'content_block_delta', index, delta: { type: 'text_delta', text: delta.content } },
+        { type: 'content_block_stop', index })
+      index++
+    }
+    for (const call of delta.tool_calls ?? []) {
+      events.push({ type: 'content_block_start', index, content_block: {
+        type: 'tool_use', id: call.id, name: call.function.name, input: {},
+      } }, { type: 'content_block_delta', index, delta: {
+        type: 'input_json_delta', partial_json: call.function.arguments,
+      } }, { type: 'content_block_stop', index })
+      index++
+    }
+    const stopReason = { stop: 'end_turn', tool_calls: 'tool_use', length: 'max_tokens' }[finish]
+    if (!stopReason) throw new Error(`Unsupported fixture finish reason: ${finish}`)
+    events.push({ type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: 10 } },
+      { type: 'message_stop' })
+    return new Response(events.map(event => `event: ${event.type}\ndata: ${JSON.stringify(event)}\n\n`).join(''),
+      { headers: { 'content-type': 'text/event-stream' } })
+  }
+}
+
+async function fixture(reply: (body: any, count: number) => FixtureResponse | Promise<FixtureResponse>) {
+  const dir = await mkdtemp(join(tmpdir(), 'lodestar-dsh-test-'))
+  cleanups.push(() => rm(dir, { recursive: true, force: true }))
+  const requests: any[] = []
+  const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(req) {
+    const path = new URL(req.url).pathname
+    const protocol = path.endsWith('/chat/completions') ? 'chat-completions' : path.endsWith('/messages') ? 'messages' : null
+    if (!protocol) return new Response('unexpected endpoint', { status: 404 })
+    const body = await req.json()
+    requests.push(body)
+    const response = await reply(body, requests.length)
+    return typeof response === 'function' ? response(protocol) : response
+  } })
+  cleanups.push(async () => { await server.stop(true) })
+  const opts: DshSpawnOptions = {
+    workDir: dir, tokenSourceId: 'deepseek-harness', model: 'deepseek-v4-flash', effort: 'high',
+    profile: { loadProjectMcp: false },
+    runtimeOptions: { home: join(dir, 'home') },
+    transformEnv: env => ({ ...env, DEEPSEEK_API_KEY: 'local-test-key', DEEPSEEK_BASE_URL: `http://127.0.0.1:${server.port}` }),
+  }
+  function processFor(launch?: ConversationLaunch, overrides: Partial<DshSpawnOptions> = {}) {
+    const proc = new DshProcess({ ...opts, ...overrides, launch })
+    proc.on('error', () => {})
+    cleanups.push(() => proc.kill())
+    return proc
+  }
+  return { dir, opts, requests, processFor, baseUrl: `http://127.0.0.1:${server.port}` }
+}
+
+function nextResult(proc: DshProcess): Promise<any> {
+  const promise = new Promise((resolve, reject) => {
+    const onExit = () => { cleanup(); reject(new Error('DSH exited before result')) }
+    const onResult = (result: any) => { cleanup(); resolve(result) }
+    const cleanup = () => { proc.off('exit', onExit); proc.off('result', onResult) }
+    proc.on('exit', onExit); proc.on('result', onResult)
+  })
+  void promise.catch(() => {})
+  return promise
+}
+
+describe('DSH native runtime through Lodestar bridge', () => {
+  test('a manually entered DeepSeek model outside the native list resolves effort and runs', async () => {
+    const model = 'deepseek-manual-catalog-probe'
+    const f = await fixture(() => completion({ content: 'custom model replied' }, 'stop', model))
+    const proc = f.processFor(undefined, { model, effort: 'max' })
     await proc.initializationPromise()
-    const dispatch = proc.sendUserText('hello native')
-    expect(dispatch).toEqual({ kind: 'queued', provider: 'dsh' })
-    await waitFor(() => prompts(runtime).length === 1)
-    expect(prompts(runtime)[0].params).toEqual({
-      mode: 'auto', content: [{ type: 'text', text: 'hello native' }],
+    const entry = (await proc.listModels()).find(entry => entry.model === model)
+    expect(entry?.supportedReasoningEfforts.map(entry => entry.reasoningEffort)).toContain('max')
+    const done = nextResult(proc)
+    proc.sendUserText('use the manually entered model')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(f.requests[0]).toMatchObject({ model, reasoning_effort: 'max' })
+    expect(f.requests[0].dsh_plugin_packages?.packages.some((entry: any) => entry.name === '@supercc168/lodestar' && entry.version)).toBe(true)
+  }, 30_000)
+
+  test('GLM Coding Plan models outside the installed pi-ai catalog accept the chosen effort', async () => {
+    const model = 'glm-manual-catalog-probe'
+    const f = await fixture(() => completion({ content: 'custom GLM replied' }, 'stop', model))
+    const proc = f.processFor(undefined, { tokenSourceId: 'dsh-glm', model, effort: 'high',
+      transformEnv: env => ({ ...env, LODESTAR_DSH_PROVIDER: 'zai-coding-cn', LODESTAR_DSH_GLM_API_KEY: 'local-test-key',
+        LODESTAR_DSH_BASE_URL: f.baseUrl, LODESTAR_DSH_MODELS: JSON.stringify([model]), LODESTAR_DSH_DEFAULT_MODEL: model }) })
+    await proc.initializationPromise()
+    const done = nextResult(proc)
+    proc.sendUserText('use the model missing from the installed catalog')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(f.requests[0]).toMatchObject({ model, reasoning_effort: 'high', thinking: { type: 'enabled' } })
+  }, 30_000)
+
+  test('GLM Coding Plan runs tools, changes effort and resumes through the native pi-ai adapter', async () => {
+    const f = await fixture((_body, count) => count === 1 ? completion({ tool_calls: [{ index: 0, id: 'glm-tool', type: 'function', function: {
+      name: 'bash', arguments: JSON.stringify({ command: '# desc: 验证 GLM 原生工具调用\nprintf glm-tool-proof', description: 'Return proof' }),
+    } }] }, 'tool_calls', 'glm-5.3') : completion({ content: `glm reply ${count}` }, 'stop', 'glm-5.3'))
+    const overrides: Partial<DshSpawnOptions> = { tokenSourceId: 'dsh-glm', model: 'glm-5.3', effort: 'low',
+      transformEnv: env => ({ ...env, LODESTAR_DSH_PROVIDER: 'zai-coding-cn', LODESTAR_DSH_GLM_API_KEY: 'glm-local-test-key',
+        LODESTAR_DSH_BASE_URL: f.baseUrl, LODESTAR_DSH_MODELS: '["glm-5.3"]', LODESTAR_DSH_DEFAULT_MODEL: 'glm-5.3' }) }
+    const proc = f.processFor(undefined, overrides)
+    await proc.initializationPromise()
+    expect((await proc.listModels()).map(m => m.model)).toEqual(['glm-5.3'])
+    let done = nextResult(proc)
+    proc.sendUserText('remember the GLM lighthouse and run the tool')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(JSON.stringify(f.requests[1].messages)).toContain('glm-tool-proof')
+    expect(f.requests[0]).toMatchObject({ model: 'glm-5.3', reasoning_effort: 'low', thinking: { type: 'enabled' } })
+    const requests = spyOn((proc as any).runtime, 'request')
+    try {
+      await proc.setModelSettings('glm-5.3', 'max')
+      expect(requests).toHaveBeenCalledWith('session/model', { model: 'glm-5.3', effort: 'max' }, null)
+    } finally { requests.mockRestore() }
+    done = nextResult(proc); proc.sendUserText('continue at max')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(f.requests[2].reasoning_effort).toBe('max')
+    const sessionId = proc.sessionId!
+    await proc.kill()
+    const resumed = f.processFor({ kind: 'resume', source: { provider: 'dsh', sessionId, cwd: f.dir } }, overrides)
+    await resumed.initializationPromise()
+    done = nextResult(resumed); resumed.sendUserText('recall the lighthouse')
+    expect(await done).toMatchObject({ is_error: false })
+    expect(JSON.stringify(f.requests[3].messages)).toContain('remember the GLM lighthouse')
+    expect(f.requests.every(body => body.model === 'glm-5.3')).toBe(true)
+  }, 30_000)
+
+  test('background child tool content reaches the shared card store after the parent finishes', async () => {
+    let parentRequests = 0
+    let childRequests = 0
+    const f = await fixture(async body => {
+      const child = body.messages.some((m: any) => m.role === 'user' && typeof m.content === 'string' && m.content.startsWith('background-child-probe'))
+      if (child) {
+        childRequests++
+        if (childRequests === 1) {
+          await Bun.sleep(100)
+          return completion({ tool_calls: [{ index: 0, id: 'bg-bash', type: 'function', function: {
+            name: 'bash', arguments: JSON.stringify({ command: '# desc: 验证后台结构化工具结果\nprintf background-proof', description: 'Return background tool proof' }),
+          } }] }, 'tool_calls')
+        }
+        return completion({ content: 'background-child-finished' })
+      }
+      parentRequests++
+      if (parentRequests === 1) return completion({ tool_calls: [{ index: 0, id: 'bg-spawn', type: 'function', function: {
+        name: 'subagent', arguments: JSON.stringify({ description: 'Background child probe', prompt: 'background-child-probe', run_in_background: true }),
+      } }] }, 'tool_calls')
+      return completion({ content: 'parent-released' })
     })
-  })
-
-  test('传输关闭后投递返回 rejected/dsh 且不抛', async () => {
-    const proc = processFor()
-    const runtime = FakeDshRuntime.latest()
-    await proc.initializationPromise()
-    runtime.emitExit({ code: 0, signal: null, expected: true })
-    const dispatch = proc.sendUserText('too late')
-    expect(dispatch.kind).toBe('rejected')
-    expect(dispatch).toMatchObject({ kind: 'rejected', provider: 'dsh' })
-    expect((dispatch as any).error).toBeInstanceOf(Error)
-  })
-
-  test('allowDelegation 透传 session/open:显式 false 关闭,缺省放开', async () => {
-    const restricted = processFor()
-    await restricted.initializationPromise()
-    const restrictedOpen = FakeDshRuntime.latest().requests.find(request => request.method === 'session/open')
-    expect(restrictedOpen?.params.allowDelegation).toBe(false)
-
-    const main = processFor({ allowDelegation: undefined })
-    await main.initializationPromise()
-    const mainOpen = FakeDshRuntime.latest().requests.find(request => request.method === 'session/open')
-    expect(mainOpen?.params.allowDelegation).toBe(true)
-  })
-
-  test('相对路径文件输入被拒且不抛', async () => {
-    const proc = processFor()
-    await proc.initializationPromise()
-    const dispatch = proc.sendUserText('with attachment', ['relative.png'])
-    expect(dispatch).toMatchObject({ kind: 'rejected', provider: 'dsh' })
-  })
-
-  test('文本 [file: …] 先过绝对路径闸门:相对引用不按 daemon cwd 读取', async () => {
-    const proc = processFor()
-    const runtime = FakeDshRuntime.latest()
-    await proc.initializationPromise()
-    // repo 根的 promo.jpg 真实存在:相对引用若被读取会落进 content。
-    proc.sendUserText('看看 [file: promo.jpg] 这张图')
-    await waitFor(() => prompts(runtime).length === 1)
-    expect(prompts(runtime)[0].params.content).toEqual([{ type: 'text', text: '看看 [file: promo.jpg] 这张图' }])
-    expect(proc.isAlive()).toBe(true)
-    expect((proc as any).pendingInputs).toBe(0)
-  })
-
-  test('文本 [file: …] 读失败降级为 skip/error,不杀会话', async () => {
-    const proc = processFor()
-    const runtime = FakeDshRuntime.latest()
-    await proc.initializationPromise()
-    const errors: Error[] = []
-    proc.on('error', error => errors.push(error))
-    const missing = join(scratch, 'missing-text-ref.png')
-    const dispatch = proc.sendUserText(`引用已失效 [file: ${missing}]`)
-    expect(dispatch.kind).toBe('queued')
-    await waitFor(() => prompts(runtime).length === 1)
-    expect(prompts(runtime)[0].params.content).toEqual([{ type: 'text', text: `引用已失效 [file: ${missing}]` }])
-    expect(errors.map(error => error.message)).toEqual([`DSH image reference skipped: ${missing}`])
-    expect(proc.isAlive()).toBe(true)
-    expect((proc as any).pendingInputs).toBe(0)
-    expect(proc.sendUserText('still here').kind).toBe('queued')
-  })
-
-  test('显式 files 读失败仍 fail loud,计数在 finally 归零', async () => {
-    const proc = processFor()
-    await proc.initializationPromise()
-    const errors: Error[] = []
-    proc.on('error', error => errors.push(error))
-    proc.sendUserText('附件', [join(scratch, 'missing-explicit.png')])
-    await waitFor(() => errors.length > 0)
-    expect(errors[0].message).toContain('ENOENT')
-    await waitFor(() => !proc.isAlive())
-    expect((proc as any).pendingInputs).toBe(0)
-    expect(proc.sendUserText('again').kind).toBe('rejected')
-  })
-
-  test('listModels 返回 AgentModel 形状(原生窗口与档位)', async () => {
-    const proc = processFor()
-    const models = await proc.listModels()
-    expect(models).toHaveLength(1)
-    expect(models[0]).toMatchObject({
-      id: MODEL_ID, model: MODEL_ID, displayName: 'DeepSeek-V4-Flash', description: 'DeepSeek Harness',
-      hidden: false, isDefault: true, defaultReasoningEffort: 'high',
+    const proc = f.processFor()
+    let store = emptyBgStore()
+    proc.on('bg_task_started', e => { store = applyBgTaskStarted(store, e) })
+    proc.on('assistant_block_stop', e => { if (!e.parentToolUseId) store = promotePendingOnAdvance(store) })
+    proc.on('tool_use', e => { if (e.parentToolUseId) store = applyBgToolUse(store, e.parentToolUseId, e.id, e.name, e.input) })
+    proc.on('tool_result', e => { if (e.parentToolUseId) store = applyBgToolResult(store, e.parentToolUseId, e.tool_use_id, e.content, e.is_error) })
+    const childDone = new Promise<any>((resolve, reject) => {
+      proc.once('bg_task_settled', e => { store = applyBgTaskSettled(store, e); resolve(e) })
+      proc.once('exit', () => reject(new Error('runtime exited before background child completed')))
     })
-    expect(models[0].supportedReasoningEfforts.map(option => option.reasoningEffort)).toEqual(['off', 'low', 'high', 'max'])
-  })
-
-  test('setModelSettings 校验 DSH 档位并在空闲时立即生效', async () => {
-    const proc = processFor()
-    const runtime = FakeDshRuntime.latest()
+    void childDone.catch(() => {})
     await proc.initializationPromise()
-    await expect(proc.setModelSettings('deepseek-v4-pro', 'medium' as any)).rejects.toThrow('invalid DSH effort')
-    await proc.setModelSettings('deepseek-v4-pro', 'off')
-    expect(runtime.requests.at(-1)).toEqual({ method: 'session/model', params: { model: 'deepseek-v4-pro', effort: 'off' } })
-    expect(proc.lastModel).toBe('deepseek-v4-pro')
-    expect(proc.lastEffort).toBe('off')
-  })
+    const parentDone = nextResult(proc)
+    proc.sendUserText('start the background child')
+    expect(await parentDone).toMatchObject({ is_error: false })
+    expect(await childDone).toMatchObject({ status: 'completed', summary: 'background-child-finished' })
+    expect(proc.isAlive()).toBe(true)
+    expect(store.active[0].status).toBe('completed')
+    expect(store.active[0].steps.some(step => step.brief.includes('background-proof'))).toBe(true)
+  }, 30_000)
 
-  test('原生压缩返回 null 时抛 NothingToCompactError', async () => {
-    const proc = processFor()
-    FakeDshRuntime.latest().scripts.set('session/compact', () => null)
+  test('a fatal bridge error reports an unexpected exit even when shutdown succeeds', async () => {
+    const f = await fixture(() => completion({ content: 'unused' }))
+    const proc = f.processFor()
+    await proc.initializationPromise()
+    const exit = new Promise<any>(resolve => proc.once('exit', resolve))
+    ;(proc as any).runtime.emit('notification', { method: 'failure', params: { message: 'native protocol failed' } })
+    expect(await exit).toMatchObject({ expected: false })
+    expect(proc.isAlive()).toBe(false)
+  }, 15_000)
+
+  test('streams multiple turns, persists and resumes exact history, and forks a checkpoint', async () => {
+    const f = await fixture((_body, count) => completion({ content: `native reply ${count}` }))
+    const proc = f.processFor()
+    const chunks: string[] = []
+    proc.on('assistant_text', ({ text }) => chunks.push(text))
+    await proc.initializationPromise()
+    expect(proc.sessionId).toBeTruthy()
+    let result = nextResult(proc)
+    proc.sendUserText('remember the blue lighthouse')
+    const first = await result
+    expect(first).toMatchObject({ is_error: false })
+    expect(chunks.join('')).toBe('native reply 1')
+    expect(proc.lastUsage).toMatchObject({ input_tokens: 60, cache_read_input_tokens: 40, output_tokens: 10 })
+    result = nextResult(proc)
+    proc.sendUserText('continue the same conversation')
+    expect(await result).toMatchObject({ is_error: false })
+    expect(JSON.stringify(f.requests[1].messages)).toContain('remember the blue lighthouse')
+    const sessionId = proc.sessionId!
+    await proc.kill()
+    expect(proc.isAlive()).toBe(false)
+    const resumed = f.processFor({ kind: 'resume', source: { provider: 'dsh', sessionId, cwd: f.dir } })
+    await resumed.initializationPromise()
+    result = nextResult(resumed)
+    resumed.sendUserText('after process restart')
+    expect(await result).toMatchObject({ is_error: false })
+    expect(JSON.stringify(f.requests[2].messages)).toContain('continue the same conversation')
+    await resumed.kill()
+    const fork = f.processFor({ kind: 'fork', source: { provider: 'dsh', sessionId, cwd: f.dir }, through: first.checkpoint })
+    await fork.initializationPromise()
+    expect(fork.sessionId).not.toBe(sessionId)
+    result = nextResult(fork)
+    fork.sendUserText('forked branch')
+    expect(await result).toMatchObject({ is_error: false })
+    expect(JSON.stringify(f.requests[3].messages)).toContain('remember the blue lighthouse')
+    expect(JSON.stringify(f.requests[3].messages)).not.toContain('continue the same conversation')
+    const history = await queryDshRuntime({ cwd: f.dir, home: f.opts.runtimeOptions!.home,
+      env: f.opts.transformEnv!(process.env), profile: { loadProjectMcp: false } }, 'session/list', { cwd: f.dir })
+    expect(history).toHaveLength(2)
+    expect(history.every((row: any) => row.provider === 'dsh' && row.cwd === f.dir)).toBe(true)
+    expect(history.find((row: any) => row.sessionId === sessionId).preview).toContain('blue lighthouse')
+  }, 30_000)
+
+  test('runs a real local shell tool and publishes its result', async () => {
+    const f = await fixture((_body, count) => count === 1
+      ? completion({ tool_calls: [{ index: 0, id: 'call-shell', type: 'function', function: {
+        name: 'bash', arguments: JSON.stringify({ command: "# desc: 写入隔离测试文件\nprintf native-tool > proof.txt", description: 'Write isolated proof file' }),
+      } }] }, 'tool_calls')
+      : completion({ content: 'tool finished' }))
+    const proc = f.processFor()
+    const results: any[] = []
+    proc.on('tool_result', result => results.push(result))
+    await proc.initializationPromise()
+    const result = nextResult(proc)
+    proc.sendUserText('write the proof file')
+    expect(await result).toMatchObject({ is_error: false })
+    expect(results).toHaveLength(1)
+    expect(results[0]).toMatchObject({ tool_use_id: 'call-shell', is_error: false })
+    expect(await readFile(join(f.dir, 'proof.txt'), 'utf8')).toBe('native-tool')
+  }, 30_000)
+
+  test('native tool-role results preserve call ids, all content blocks, errors and child ownership', async () => {
+    const f = await fixture(() => completion({ content: 'unused' }))
+    const proc = f.processFor()
+    const results: any[] = []
+    proc.on('tool_result', result => results.push(result))
+    await proc.initializationPromise()
+    const content = [{ type: 'text', text: 'read proof' }, { type: 'text', text: 'second block' }]
+    for (const isError of [false, true]) {
+      const sessionId = isError ? 'child-session' : proc.sessionId
+      ;(proc as any).runtime.emit('notification', { method: 'session.event', params: {
+        sessionId, event: { type: 'tool/result', data: { message: {
+          id: 'native-message', role: 'tool', source: { kind: 'tool', callId: 'native-read' },
+          toolCallId: 'native-read', content, isError,
+        } } },
+      } })
+      expect(results.at(-1)).toEqual({ tool_use_id: 'native-read', content, is_error: isError,
+        parentToolUseId: isError ? 'child-session' : null })
+    }
+    expect(results).toHaveLength(2)
+    expect(proc.isAlive()).toBe(true)
+  }, 15_000)
+
+  for (const message of [
+    { role: 'tool', content: [] },
+    { role: 'tool', toolCallId: 'call', content: 'invalid' },
+    { role: 'tool', toolCallId: 'call', content: [], isError: 'false' },
+    { role: 'assistant', toolCallId: 'call', content: [] },
+  ]) test(`malformed native tool result fails visibly: ${JSON.stringify(message)}`, async () => {
+    const f = await fixture(() => completion({ content: 'unused' }))
+    const proc = f.processFor()
+    const errors: string[] = []
+    const results: any[] = []
+    proc.on('error', error => errors.push(error.message))
+    proc.on('tool_result', result => results.push(result))
+    await proc.initializationPromise()
+    const exit = new Promise<any>(resolve => proc.once('exit', resolve))
+    ;(proc as any).runtime.emit('notification', { method: 'session.event', params: {
+      sessionId: proc.sessionId, event: { type: 'tool/result', data: { message } },
+    } })
+    expect(await exit).toMatchObject({ expected: false })
+    expect(errors).toContain('invalid DSH tool result')
+    expect(results).toHaveLength(0)
+  }, 15_000)
+
+  for (const answerKey of ['Which colour?', 'colour']) test(`answers a native user question by ${answerKey} and preserves the selected label`, async () => {
+    const f = await fixture((_body, count) => count === 1
+      ? completion({ tool_calls: [{ index: 0, id: 'call-question', type: 'function', function: {
+        name: 'ask_user_question', arguments: JSON.stringify({ questions: [{ id: 'colour', question: 'Which colour?', options: [{ label: 'Blue' }, { label: 'Red' }] }] }),
+      } }] }, 'tool_calls') : completion({ content: 'answer received' }))
+    const proc = f.processFor()
+    let asked = 0
+    proc.on('can_use_tool', request => {
+      asked++
+      proc.sendPermissionResponse(request.request_id, 'allow', { updatedInput: { answers: { [answerKey]: 'Blue' } } })
+    })
+    await proc.initializationPromise()
+    const result = nextResult(proc)
+    proc.sendUserText('ask for a colour')
+    expect(await result).toMatchObject({ is_error: false })
+    expect(asked).toBe(1)
+    expect(JSON.stringify(f.requests[1].messages)).toContain('Blue')
+  }, 30_000)
+
+  test('fresh and resumed DSH input tools follow the current invocation policy', async () => {
+    const f = await fixture(() => completion({ content: 'task finished' }))
+    let sessionId: string | undefined
+    for (const allowUserInput of [false, true, false]) {
+      const proc = f.processFor(sessionId ? {
+        kind: 'resume', source: { provider: 'dsh', sessionId, cwd: f.dir },
+      } : undefined, { allowUserInput })
+      await proc.initializationPromise()
+      const result = nextResult(proc)
+      proc.sendUserText('execute without further input')
+      expect(await result).toMatchObject({ is_error: false })
+      const tools = f.requests.at(-1).tools.map((tool: any) => tool.function.name)
+      expect(tools).toContain('bash')
+      expect(tools.includes('ask_user_question')).toBe(allowUserInput)
+      sessionId = proc.sessionId!
+      await proc.kill()
+    }
+  }, 60_000)
+
+  test('cancels a live model request without losing the process or conversation', async () => {
+    let seen!: () => void
+    const received = new Promise<void>(resolve => { seen = resolve })
+    const f = await fixture((_body, count) => {
+      if (count !== 1) return completion({ content: 'continued after cancel' })
+      seen()
+      return new Response(new ReadableStream({ start(controller) { controller.enqueue(new TextEncoder().encode(': waiting\n\n')) } }),
+        { headers: { 'content-type': 'text/event-stream' } })
+    })
+    const proc = f.processFor()
+    await proc.initializationPromise()
+    let result = nextResult(proc)
+    proc.sendUserText('wait for cancellation')
+    await received
+    proc.sendInterrupt()
+    expect(await result).toMatchObject({ is_error: true, subtype: 'aborted' })
+    expect(proc.isAlive()).toBe(true)
+    result = nextResult(proc)
+    proc.sendUserText('continue now')
+    expect(await result).toMatchObject({ is_error: false })
+  }, 30_000)
+
+  test('surfaces authentication failure and output limits instead of reporting success', async () => {
+    const f = await fixture((_body, count) => count === 1
+      ? Response.json({ error: { message: 'test credential rejected', type: 'authentication_error' } }, { status: 401 })
+      : completion({ content: 'truncated output' }, 'length'))
+    const proc = f.processFor()
+    await proc.initializationPromise()
+    let result = nextResult(proc)
+    proc.sendUserText('fail authentication')
+    expect(await result).toMatchObject({ is_error: true, subtype: 'error' })
+    result = nextResult(proc)
+    proc.sendUserText('hit output cap')
+    expect(await result).toMatchObject({ is_error: true, subtype: 'max-tokens' })
+  }, 30_000)
+
+  test('stages model changes for the next turn while retaining native delegation', async () => {
+    let proc!: DshProcess
+    const f = await fixture(async (body, count) => {
+      const names = body.tools.map((tool: any) => tool.function.name)
+      expect(names).toContain('subagent')
+      if (count === 1) {
+        await proc.setModelSettings('deepseek-v4-pro', 'off')
+        return completion({ tool_calls: [{ index: 0, id: 'route-call', type: 'function', function: {
+          name: 'bash', arguments: JSON.stringify({ command: '# desc: 验证当前模型轮次\ntrue', description: 'Check current turn' }),
+        } }] }, 'tool_calls')
+      }
+      return completion({ content: 'route checked' })
+    })
+    proc = f.processFor()
+    await proc.initializationPromise()
+    let result = nextResult(proc)
+    proc.sendUserText('change the next turn model')
+    expect(await result).toMatchObject({ is_error: false })
+    expect(f.requests[1].model).toBe('deepseek-v4-flash')
+    expect(f.requests[1].reasoning_effort).toBe('high')
+    result = nextResult(proc)
+    proc.sendUserText('now use the new selection')
+    expect(await result).toMatchObject({ is_error: false })
+    expect(f.requests[2].model).toBe('deepseek-v4-pro')
+    expect(f.requests[2].thinking).toEqual({ type: 'disabled' })
+  }, 30_000)
+
+  test('routes inherited Lodestar capability through the native shell environment', async () => {
+    const f = await fixture((_body, count) => count === 1
+      ? completion({ tool_calls: [{ index: 0, id: 'call-env', type: 'function', function: {
+        name: 'bash', arguments: JSON.stringify({
+          command: '# desc: 验证主会话凭据环境隔离\ntest -n "$DSH_LODESTAR_AGENT_CONTEXT" && test -z "$LODESTAR_AGENT_CAPABILITY" && printf scoped-context-ok',
+          description: 'Verify scoped root environment',
+        }),
+      } }] }, 'tool_calls') : completion({ content: 'environment checked' }))
+    const proc = f.processFor(undefined, { hostEnv: { LODESTAR_AGENT_URL: 'http://127.0.0.1:9876', LODESTAR_AGENT_CAPABILITY: 'test-task-context' } })
+    const results: any[] = []
+    proc.on('tool_result', value => results.push(value))
+    await proc.initializationPromise()
+    const result = nextResult(proc)
+    proc.sendUserText('inspect the scoped environment')
+    expect(await result).toMatchObject({ is_error: false })
+    expect(results[0]).toMatchObject({ is_error: false })
+    expect(JSON.stringify(results[0])).toContain('scoped-context-ok')
+  }, 30_000)
+
+  test('fails visibly when an attached image cannot be admitted', async () => {
+    const f = await fixture(() => completion({ content: 'must not reach model' }))
+    const badImage = join(f.dir, 'invalid.png')
+    await writeFile(badImage, 'not an image')
+    const proc = f.processFor()
+    await proc.initializationPromise()
+    const result = nextResult(proc)
+    proc.sendUserText('read the image', [badImage])
+    expect(await result).toMatchObject({ is_error: true })
+    expect(f.requests).toHaveLength(0)
+  }, 30_000)
+
+  test('admits a JPEG downloaded by Feishu under a .png filename', async () => {
+    const f = await fixture(() => completion({ content: 'image accepted' }))
+    const image = join(f.dir, 'feishu-download.png')
+    await writeFile(image, Buffer.from('/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAAYEBQYFBAYGBQYHBwYIChAKCgkJChQODwwQFxQYGBcUFhYaHSUfGhsjHBYWICwgIyYnKSopGR8tMC0oMCUoKSj/2wBDAQcHBwoIChMKChMoGhYaKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCgoKCj/wAARCAAEAAQDASIAAhEBAxEB/8QAFQABAQAAAAAAAAAAAAAAAAAAAAf/xAAUEAEAAAAAAAAAAAAAAAAAAAAA/8QAFQEBAQAAAAAAAAAAAAAAAAAABgf/xAAUEQEAAAAAAAAAAAAAAAAAAAAA/9oADAMBAAIRAxEAPwCaAK+Kv//Z', 'base64'))
+    const proc = f.processFor(undefined, { model: 'deepseek-v4-flash-vision-exp' })
+    await proc.initializationPromise()
+    const result = nextResult(proc)
+    proc.sendUserText('inspect the supplied image', [image])
+    expect(await result).toMatchObject({ is_error: false })
+    expect(f.requests).toHaveLength(1)
+  }, 30_000)
+
+  test('uses native manual compaction and keeps the compacted session resumable', async () => {
+    const f = await fixture(() => completion({ content: 'A concise summary of the earlier conversation.' }))
+    const proc = f.processFor()
+    const notices: any[] = []
+    proc.on('context_compacted', value => notices.push(value))
     await proc.initializationPromise()
     await expect(proc.compactThread()).rejects.toThrow('无需压缩')
-  })
+    for (let i = 0; i < 3; i++) {
+      const result = nextResult(proc)
+      proc.sendUserText(`history ${i}: ${'detailed information '.repeat(1000)}`)
+      expect(await result).toMatchObject({ is_error: false })
+    }
+    await proc.compactThread()
+    expect(notices.some(notice => notice.phase === 'end')).toBe(true)
+    const sessionId = proc.sessionId!
+    await proc.kill()
+    const resumed = f.processFor({ kind: 'resume', source: { provider: 'dsh', sessionId, cwd: f.dir } })
+    await resumed.initializationPromise()
+    const result = nextResult(resumed)
+    resumed.sendUserText('continue after compaction')
+    expect(await result).toMatchObject({ is_error: false })
+  }, 30_000)
 
-  test('AgentProcess 不支持的三个成员显式抛错而不是缺席', async () => {
-    const proc = processFor()
-    expect(() => proc.sendToolResult('call-1', 'content')).toThrow('DSH does not support sendToolResult')
-    await expect(proc.setModel('deepseek-v4-pro')).rejects.toThrow('DSH does not support setModel')
-    await expect(proc.injectThreadItems([])).rejects.toThrow('DSH does not support injectThreadItems')
-  })
-
-  test('sendInterrupt 走 session/cancel', async () => {
-    const proc = processFor()
-    const runtime = FakeDshRuntime.latest()
-    await proc.initializationPromise()
-    proc.sendInterrupt()
-    await waitFor(() => runtime.requests.some(request => request.method === 'session/cancel'))
-  })
-})
-
-describe('DSH 事件映射', () => {
-  test('settled 通知产出 id 为纯数字的 dsh checkpoint', async () => {
-    const proc = processFor()
-    const runtime = FakeDshRuntime.latest()
-    await proc.initializationPromise()
-    const results: any[] = []
-    proc.on('result', value => results.push(value))
-    emitTurnStart(runtime, 42, 1)
-    runtime.notify('settled', { sessionId: SESSION_ID, event: { seq: 42, type: 'turn/end', data: { reason: { kind: 'completed' } } } })
-    expect(results).toHaveLength(1)
-    expect(results[0]).toMatchObject({ is_error: false, subtype: 'completed' })
-    expect(results[0].checkpoint).toEqual({
-      provider: 'dsh', kind: 'event', id: '42',
-      source: { provider: 'dsh', sessionId: SESSION_ID, cwd: WORKDIR },
+  test('native children inherit the managed task context while the main Agent keeps delegation exclusive', async () => {
+    // 本地委派收口(dsh-bridge.ts agent/created):原生子孙保留编码工具但永不再
+    // 委派 —— 上游 0.20.x 版用例断言 children 保留 subagent/send_message 并可
+    // 再嵌套 spawn,与本地定型实现相斥,按定型实现改写:子 Agent 工具面须无
+    // 委派工具、保留 bash,且仍继承受管调用上下文(DSH_LODESTAR_AGENT_CONTEXT
+    // 有值、LODESTAR_AGENT_CAPABILITY 不进入原生 shell)。
+    let rootRequests = 0
+    let childRequests = 0
+    const f = await fixture(body => {
+      const child = body.messages.some((message: any) => message.role === 'user'
+        && typeof message.content === 'string' && message.content.startsWith('child-scope-check'))
+      if (child) {
+        childRequests++
+        const names = body.tools.map((tool: any) => tool.function.name)
+        expect(names).not.toContain('subagent')
+        expect(names).not.toContain('send_message')
+        expect(names).toContain('bash')
+        if (childRequests === 1) return completion({ tool_calls: [{ index: 0, id: 'child-shell', type: 'function', function: {
+          name: 'bash', arguments: JSON.stringify({
+            command: '# desc: 验证子 Agent 继承受管调用上下文\ntest -n "$DSH_LODESTAR_AGENT_CONTEXT" && test -z "$LODESTAR_AGENT_CAPABILITY" && printf child-context-inherited',
+            description: 'Verify inherited task context',
+          }),
+        } }] }, 'tool_calls')
+        return completion({ content: 'child-finished' })
+      }
+      rootRequests++
+      if (rootRequests === 1) return completion({ tool_calls: [{ index: 0, id: 'spawn-child', type: 'function', function: {
+        name: 'subagent', arguments: JSON.stringify({ description: 'Check scoped child', prompt: 'child-scope-check', run_in_background: false }),
+      } }] }, 'tool_calls')
+      return completion({ content: 'root-finished' })
     })
-    expect(/^\d+$/.test(results[0].checkpoint.id)).toBe(true)
-    expect(proc.lastCompletedTurnId).toBe('42')
-  })
-
-  test('usage 帧产出 CodexUsage 形状,contextWindow 取原生目录窗口', async () => {
-    const proc = processFor()
-    const runtime = FakeDshRuntime.latest()
+    const proc = f.processFor(undefined, {
+      hostEnv: { LODESTAR_AGENT_URL: 'http://127.0.0.1:9876', LODESTAR_AGENT_CAPABILITY: 'inherited-task-test' } })
+    const background: any[] = []
+    const toolResults: any[] = []
+    const rootText: string[] = []
+    proc.on('bg_task_started', value => background.push(value))
+    proc.on('tool_result', value => toolResults.push(value))
+    proc.on('assistant_text', value => { if (!value.parentToolUseId) rootText.push(value.text) })
     await proc.initializationPromise()
-    const usageEvents: any[] = []
-    proc.on('token_usage', value => usageEvents.push(value))
-    emitChunk(runtime, { type: 'usage', usage: {
-      inputTokens: 100, outputTokens: 20, totalTokens: 120,
-      cacheReadTokens: 30, cacheWriteTokens: 5, reasoningTokens: 7,
-    } })
-    expect(usageEvents).toHaveLength(1)
-    expect(usageEvents[0]).toMatchObject({
-      usage: {
-        input_tokens: 100, output_tokens: 20, total_tokens: 120,
-        cache_read_input_tokens: 30, cache_creation_input_tokens: 5, reasoning_output_tokens: 7,
-      },
-      contextWindow: 1_000_000, threadId: SESSION_ID,
-    })
-    expect(proc.lastContextTokens).toBe(135)
-    expect(proc.lastTotalUsage).toMatchObject({ input_tokens: 100, output_tokens: 20 })
-  })
+    const result = nextResult(proc)
+    proc.sendUserText('delegate a scoped task')
+    expect(await result).toMatchObject({ is_error: false })
+    expect(childRequests).toBe(2)
+    expect(background).toHaveLength(1)
+    expect(rootText.join('')).toBe('root-finished')
+    expect(toolResults.find(result => result.tool_use_id === 'child-shell')).toMatchObject({ is_error: false })
+    expect(JSON.stringify(toolResults)).toContain('child-context-inherited')
+  }, 30_000)
 
-  test('原生工具名映射到共享别名,read/write/edit 补 file_path', async () => {
-    const proc = processFor()
-    const runtime = FakeDshRuntime.latest()
-    await proc.initializationPromise()
-    const names = new Map<string, string>()
-    const inputs = new Map<string, any>()
-    proc.on('tool_use', value => { names.set(value.id, value.name); inputs.set(value.id, value.input) })
-    const aliases: Record<string, string> = { bash: 'Bash', read: 'Read', write: 'Write', edit: 'Edit', glob: 'Glob', grep: 'Grep' }
-    for (const native of Object.keys(aliases)) {
-      runtime.notify('session.event', { sessionId: SESSION_ID, event: { type: 'tool/call',
-        data: { callId: `call-${native}`, name: native, arguments: JSON.stringify({ path: `${native}.ts` }) } } })
-    }
-    runtime.notify('session.event', { sessionId: SESSION_ID, event: { type: 'tool/call',
-      data: { callId: 'call-native', name: 'job_output', arguments: '{}' } } })
-    for (const [native, alias] of Object.entries(aliases)) expect(names.get(`call-${native}`)).toBe(alias)
-    expect(names.get('call-native')).toBe('job_output')
-    expect(inputs.get('call-read')).toMatchObject({ path: 'read.ts', file_path: 'read.ts' })
-    expect(inputs.get('call-bash')).toEqual({ path: 'bash.ts' })
-  })
-
-  test('意外失败保留为非预期退出,不被干净的 exit/result 掩蔽', async () => {
-    const proc = processFor()
-    const runtime = FakeDshRuntime.latest()
-    await proc.initializationPromise()
-    const errors: Error[] = []
+  test('loads project MCP over stdio and executes its discovered tool', async () => {
+    const f = await fixture((_body, count) => count === 1
+      ? completion({ tool_calls: [{ index: 0, id: 'mcp-call', type: 'function', function: {
+        name: 'mcp__probe__echo', arguments: JSON.stringify({ text: 'native-mcp' }),
+      } }] }, 'tool_calls') : completion({ content: 'MCP worked' }))
+    const serverPath = join(f.dir, 'mcp-server.mjs')
+    await writeFile(serverPath, `import { createInterface } from 'node:readline';
+      createInterface({ input: process.stdin }).on('line', line => {
+        const request = JSON.parse(line);
+        if (request.id === undefined) return;
+        let result;
+        if (request.method === 'initialize') result = { protocolVersion: request.params.protocolVersion, capabilities: { tools: {} }, serverInfo: { name: 'probe', version: '1' } };
+        else if (request.method === 'tools/list') result = { tools: [{ name: 'echo', description: 'Echo the test value', inputSchema: { type: 'object', properties: { text: { type: 'string' } }, required: ['text'] } }] };
+        else if (request.method === 'tools/call') result = { content: [{ type: 'text', text: 'mcp echo: ' + request.params.arguments.text }] };
+        else throw new Error('unexpected MCP request ' + request.method);
+        process.stdout.write(JSON.stringify({ jsonrpc: '2.0', id: request.id, result }) + '\\n');
+      });`)
+    await writeFile(join(f.dir, '.mcp.json'), JSON.stringify({ mcpServers: { probe: { command: 'node', args: [serverPath] } } }))
+    const proc = f.processFor(undefined, { profile: { loadProjectMcp: true } })
     const results: any[] = []
-    const exits: any[] = []
-    proc.on('error', error => errors.push(error))
-    proc.on('result', value => results.push(value))
-    proc.on('exit', value => exits.push(value))
-    emitTurnStart(runtime, 1, 1)
-    runtime.notify('failure', { message: 'DSH exited code=0 signal=null\nstderr tail: native protocol failed' })
-    expect(errors).toHaveLength(1)
-    expect(errors[0].message).toContain('stderr tail: native protocol failed')
-    expect(results[0]).toMatchObject({ is_error: true, subtype: 'error' })
-    runtime.emitExit({ code: 0, signal: null, expected: true })
-    expect(exits).toEqual([{ code: 0, signal: null, expected: false }])
-  })
-
-  test('图片按字节嗅探 MIME,未知字节不臆断为图片', async () => {
-    const proc = processFor()
-    const runtime = FakeDshRuntime.latest()
+    proc.on('tool_result', value => results.push(value))
     await proc.initializationPromise()
-    const cases: Array<[string, Buffer, string]> = [
-      ['png-download.png', Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 0x00, 0x01]), 'image/png'],
-      ['jpeg-download.png', Buffer.from([0xff, 0xd8, 0xff, 0xe0, 0x00, 0x10]), 'image/jpeg'],
-      ['gif-download.png', Buffer.from('GIF87a-gif-payload', 'ascii'), 'image/gif'],
-      ['webp-download.png', Buffer.concat([Buffer.from('RIFF', 'ascii'), Buffer.from([0x1a, 0x00, 0x00, 0x00]), Buffer.from('WEBP', 'ascii')]), 'image/webp'],
-    ]
-    for (const [name, bytes, mediaType] of cases) {
-      const file = join(scratch, name)
-      await writeFile(file, bytes)
-      const expected = prompts(runtime).length + 1
-      proc.sendUserText('inspect the attachment', [file])
-      await waitFor(() => prompts(runtime).length === expected)
-      const content = prompts(runtime).at(-1)!.params.content
-      expect(content[0]).toMatchObject({ type: 'text' })
-      expect(content[1]).toMatchObject({ type: 'image', mediaType, name })
-    }
-    const bad = join(scratch, 'unknown-download.png')
-    await writeFile(bad, Buffer.from('definitely not an image'))
-    const errors: Error[] = []
-    proc.on('error', error => errors.push(error))
-    proc.sendUserText('inspect the attachment', [bad])
-    await waitFor(() => errors.length > 0)
-    expect(errors[0].message).toContain('unsupported or invalid raster bytes')
-    expect(prompts(runtime)).toHaveLength(cases.length)
-  })
-})
-
-describe('isDshReasoningEffort', () => {
-  test('接受 off/low/high/max', () => {
-    for (const value of ['off', 'low', 'high', 'max']) expect(isDshReasoningEffort(value)).toBe(true)
-  })
-  test('拒绝非 DSH 档位与非字符串值', () => {
-    for (const value of ['medium', 'xhigh', 'ultra', 'none', '', null, undefined, 1, {}, []]) {
-      expect(isDshReasoningEffort(value)).toBe(false)
-    }
-  })
+    const result = nextResult(proc)
+    proc.sendUserText('call the local MCP tool')
+    expect(await result).toMatchObject({ is_error: false })
+    expect(results[0]).toMatchObject({ tool_use_id: 'mcp-call', is_error: false })
+    expect(JSON.stringify(results[0])).toContain('mcp echo: native-mcp')
+  }, 30_000)
 })

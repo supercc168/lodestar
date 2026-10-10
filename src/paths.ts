@@ -1,6 +1,8 @@
 /**
  * Filesystem layout — XDG Base Directory spec on unix, Windows
  * standard dirs on Win32, with env-var overrides on every platform.
+ * LODESTAR_CONFIG_DIR、LODESTAR_DATA_DIR 优先于 XDG 和平台默认目录;
+ * LODESTAR_CONFIG 可单独指定配置文件。运行状态统一放在 DATA_DIR。
  *
  *   Unix config:    $LODESTAR_CONFIG_DIR | $XDG_CONFIG_HOME/lodestar | ~/.config/lodestar
  *   Unix data:      $LODESTAR_DATA_DIR   | $XDG_DATA_HOME/lodestar   | ~/.local/share/lodestar
@@ -24,6 +26,7 @@
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
+import { lodestarDataDir, managedClaudePluginDir } from './data-dir.cjs'
 
 const HOME = homedir()
 const IS_WIN = process.platform === 'win32'
@@ -42,25 +45,14 @@ function defaultConfigDir(): string {
   return join(HOME, '.config', 'lodestar')
 }
 
-/** Default data dir: %LOCALAPPDATA%\Lodestar on Windows (machine-
- * local, non-roaming; the standard place for app state/logs/cache),
- * XDG path on unix. */
-function defaultDataDir(): string {
-  if (IS_WIN) return join(process.env.LOCALAPPDATA ?? join(HOME, 'AppData', 'Local'), 'Lodestar')
-  return join(HOME, '.local', 'share', 'lodestar')
-}
-
 export const CONFIG_DIR = pickDir(
   process.env.LODESTAR_CONFIG_DIR,
   process.env.XDG_CONFIG_HOME,
   defaultConfigDir(),
 )
 
-export const DATA_DIR = pickDir(
-  process.env.LODESTAR_DATA_DIR,
-  process.env.XDG_DATA_HOME,
-  defaultDataDir(),
-)
+/** Shares platform/env resolution with npm's pre-build Skill cleanup. */
+export const DATA_DIR = lodestarDataDir()
 
 export const CONFIG_FILE = process.env.LODESTAR_CONFIG ?? join(CONFIG_DIR, 'config.toml')
 export const PID_FILE = join(DATA_DIR, 'daemon.pid')
@@ -70,8 +62,8 @@ export const PID_FILE = join(DATA_DIR, 'daemon.pid')
 export const LOG_FILE = join(DATA_DIR, 'daemon.log')
 export const SESSION_CHAT_MAP_FILE = join(DATA_DIR, 'session-chat-map.json')
 export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
-/** Per-session turn 锚点列表:每条 = {本 turn 最后 assistant uuid, 用户输入预览, 时间}。
- *  fk/bk 用它列"用户输入前的分界点";rs 空闲模式用它列项目最近 24h 会话。
+/** Per-session branch baseline + backend-native turn checkpoints + durable pending Claude fork。
+ *  fk/bk 用它列"用户输入前的分界点"；rs 历史由各 backend 自己发现。
  *  key = sessionName(主群名或 <project>*MMDD-HHMM 临时群名)。 */
 export const SESSION_TURNS_MAP_FILE = join(DATA_DIR, 'session-turns-map.json')
 export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
@@ -79,18 +71,32 @@ export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
 export const TEMP_SESSION_LEASES_FILE = join(DATA_DIR, 'temp-session-leases.json')
 export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
 /** Durable delegated-agent runs. Every state transition is written so completed
- *  runs survive daemon restart and can be inspected from CLI/HTTP. */
+ *  runs survive daemon restart, remain follow-up capable, and can be inspected
+ *  from CLI/HTTP. */
 export const AGENT_RUNS_DIR = join(DATA_DIR, 'agent-runs')
+/** Private local client credentials, rotated on daemon startup. Never injected into workers. */
+export const AGENT_PROJECT_CLIENT_FILE = join(DATA_DIR, 'agent-project-client.json')
+/** Provider-native session ids created by delegated agents. Main-session
+ *  rs/fk history must skip these ids so background work never pollutes it. */
+export const AGENT_SESSION_IDS_FILE = join(DATA_DIR, 'agent-session-ids.json')
+/** Daemon-owned Claude Agent SDK plugin. It mirrors every managed Skill so
+ * injected TokenSources can load them without enabling user settings/env. */
+export const MANAGED_CLAUDE_PLUGIN_DIR = managedClaudePluginDir()
+/** DSH(DeepSeek Harness)私有目录:Harness profile、skills 与原生会话持久化
+ *  (上游 722e45a)。运行期状态落 DATA_DIR,不落回仓库。 */
+export const DSH_HOME_DIR = join(DATA_DIR, 'dsh')
+/** Named Codex credentials and per-group selections; the default account stays in native CODEX_HOME. */
+export const CODEX_ACCOUNTS_DIR = join(DATA_DIR, 'codex-accounts')
+export const CODEX_ACCOUNTS_FILE = join(DATA_DIR, 'codex-accounts.json')
+export const CODEX_QUOTA_BLOCKS_FILE = join(DATA_DIR, 'codex-quota-blocks.json')
 /** Opt-in Agent 运行时安装根(上游 9a6209b)。每个 agent 一个目录,内含
  *  fingerprint 版本目录与 `current.json` 选择文件。只有 `[runtime.agent_auto_update]`
  *  显式开启或手动更新才会写入 —— daemon 启动不检查、不安装(D-06)。 */
 export const AGENT_RUNTIMES_DIR = join(DATA_DIR, 'agent-runtimes')
-/** Provider-native session ids created by delegated agents. Main-session
- *  rs/fk history must skip these ids. */
-export const AGENT_SESSION_IDS_FILE = join(DATA_DIR, 'agent-session-ids.json')
-/** DSH(DeepSeek Harness)私有目录:Harness profile、skills 与原生会话持久化
- *  (上游 722e45a)。运行期状态落 DATA_DIR,不落回仓库。 */
-export const DSH_HOME_DIR = join(DATA_DIR, 'dsh')
+/** 真实窗口观测缓存:key = `<sourceId>:<model>`(如 `glm:GLM-5.3`),value = 窗口
+ *  token 数(200000 / 1000000)。来源 = 每轮真实 turn 的 SDK modelUsage.contextWindow
+ *  (CLI 按 [1m] 后缀记 1M)。仅使用 SDK 明确上报的数值，错误文本不构成容量观测。 */
+export const CONTEXT_WINDOW_CACHE_FILE = join(DATA_DIR, 'context-window-cache.json')
 /** Persisted registrations for `/notify` cards that carry interactive
  * buttons. Each entry binds a `notify_id` → caller-supplied loopback
  * callback URL + the original card params (so a click can rebuild the
@@ -106,6 +112,10 @@ export const NOTIFY_CALLBACKS_FILE = join(DATA_DIR, 'notify-callbacks.json')
  * repeated restarts do not lose the revive list. */
 export const ALIVE_MARKER_FILE = join(DATA_DIR, 'alive-on-shutdown.json')
 export const INBOX_DIR = join(DATA_DIR, 'inbox')
+/** One private receipt per cloud-file delivery; remote files are managed in their Feishu folder. */
+export const FILE_DELIVERIES_DIR = join(DATA_DIR, 'file-deliveries')
+/** Workspace delivery preferences and per-chat Drive folder bindings; v1 chat preferences migrate on access. */
+export const FILE_DELIVERY_GROUPS_FILE = join(DATA_DIR, 'file-delivery-groups.json')
 /** Unix-socket endpoint the daemon listens on for debug message
  * injection (see scripts/test-inject.ts). A real Feishu user sends
  * a `[DEBUG]…` text once to seed `DEBUG_CTX_FILE` with chat_id +

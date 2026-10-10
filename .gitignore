@@ -8,7 +8,7 @@ node_modules/
 # Local IDE state
 .serena/
 
-# Legacy OMC operational state (if recreated)
+# Legacy OMC operational state (if recreated) / local agent runtime artifacts
 .omc/
 
 # Claude Code operational state (worktrees, local settings)

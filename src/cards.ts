@@ -11,6 +11,8 @@
  */
 
 export { ELEMENTS, sanitizeMarkdownForCardKit } from './cards/elements'
+export { formatDuration } from './cards/duration'
+export { fileDeliveryCard, fileDeliverySettingsCard, fileSizeLabel } from './cards/files'
 export {
   elapsedBucket,
   liveElapsed,
@@ -26,8 +28,8 @@ export {
   type AskState,
   footerContextPercentLabel,
   footerTokenDetailLine,
+  footerModelLabel,
   mainConversationCard,
-  assistantSegmentElement,
   contextCompactionElement,
   goalDisplaySignature,
   goalElement,
@@ -48,17 +50,27 @@ export {
   type ConsoleOpts,
   type ModelEffortChoice,
   type ModelChoice,
+  type ProviderChoice,
   consoleUsageContent,
+  unifiedUsageSummary,
   consoleUsageElement,
   consoleCurrentModelElement,
   consoleMainElement,
   consoleHostElement,
   consoleBodyElements,
   consoleCard,
+  providerSelectionCard,
   modelSelectionCard,
   modelSelectionPanelElement,
+  modelEffortSelectionCard,
+  modelEffortSelectionPanelElement,
   modelResultCard,
   modelResultPanelElement,
+  modelChangeStatusCard,
+  modelChangeStatusPanelElement,
+  modelCancelledCard,
+  modelCustomPromptCard,
+  modelCustomResultPanelElement,
   statusCard,
   statusCardContent,
   menuCard,
@@ -112,6 +124,10 @@ export {
   agentWorkerElement,
   agentWorkerElementId,
   agentWorkerPreviewChars,
+  agentRunElement,
+  agentRunElementId,
+  agentCardSummary,
+  delegationCardSummary,
 } from './cards/agents'
 export {
   type TasklistPanelNotice,
@@ -161,6 +177,8 @@ export {
   summarizeBackground,
   backgroundLiveSummary,
   backgroundTaskPanel,
+  backgroundTaskSummary,
+  backgroundTaskKind,
   backgroundFoldPanel,
   foldSignature,
   backgroundLiveCard,
@@ -187,3 +205,4 @@ export {
   automationLiveCard,
   automationHistoryCard,
 } from './cards/automation'
+export { type AgentCardTaskKind } from './cards/task-kind'

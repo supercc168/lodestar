@@ -14,6 +14,7 @@ import {
   type ActionCompletion,
 } from './card-action-runtime'
 import { drainDynamicWork, trackWork } from './inflight-work'
+import { modelActionCompletion, type ModelActionResult } from './session-util'
 
 describe('PerKeyActor', () => {
   test('serializes one chat while allowing another chat to progress', async () => {
@@ -148,6 +149,23 @@ describe('card action identity', () => {
       .not.toBe(cardActionDedupeKey(data({ kind: 'gsd_continue', task_slug: 'a', panel_gen: 'g1' })))
   })
 
+  test('admits global Agent identity pagination and collapses same-panel pages (本地语义)', () => {
+    expect(validateCardActionAdmission(data({ kind: 'agent_identity_page', panel_id: 'p', page: 1 }))).toBeNull()
+    // 本地保护线:agent_identity_page 按 panel_id 收敛为单一 businessKey ——
+    // 同面板翻页共用一个语义 key(快速连点第二下按 inflight 抑制,不重复派发),
+    // 上游「按 page 分键」的断言在此改为按 panel 收敛的形态。
+    const pageOne = data({ kind: 'agent_identity_page', panel_id: 'p', page: 1 })
+    const pageTwo = data({ kind: 'agent_identity_page', panel_id: 'p', page: 2 })
+    expect(cardActionDedupeKey(pageOne)).toBe(cardActionDedupeKey(pageTwo))
+    expect(cardActionDedupeIdentity(pageOne).businessKey).toBe(cardActionDedupeIdentity(pageTwo).businessKey)
+    const otherPanel = data({ kind: 'agent_identity_page', panel_id: 'q', page: 1 })
+    expect(cardActionDedupeKey(otherPanel)).not.toBe(cardActionDedupeKey(pageOne))
+    expect(cardActionDedupeIdentity(otherPanel).businessKey)
+      .not.toBe(cardActionDedupeIdentity(pageOne).businessKey)
+    // 翻页按钮属 repeatable:完成后不写语义墓碑,用户可连续翻阅
+    expect(cardActionDedupeIdentity(pageOne).repeatable).toBe(true)
+  })
+
   test('uses event_id and semantic keys together', () => {
     const event = { ...data({ kind: 'tasklist_enable' }), event_id: 'evt-1' }
     expect(cardActionDedupeKeys(event)).toHaveLength(2)
@@ -220,6 +238,7 @@ interface TestAck {
 interface TestResult {
   __businessOk?: boolean
   __cardActionCompletion?: Promise<ActionCompletion>
+  modelCompletion?: Promise<ModelActionResult>
 }
 
 function deferred<T>() {
@@ -270,6 +289,7 @@ function admissionHarness(overrides: Partial<{
   present: (data: any, result: TestResult) => Promise<void>
   presentExecutionFailure: (data: any, error: unknown) => Promise<void>
   presentPresentationFailure: (data: any, error: unknown) => Promise<void>
+  completion: (data: any, result: TestResult) => Promise<ActionCompletion> | null
 }> = {}) {
   const actor = new PerKeyActor()
   const deduper = new ActionDeduper(30_000)
@@ -301,7 +321,7 @@ function admissionHarness(overrides: Partial<{
     presentPresentationFailure: overrides.presentPresentationFailure
       ?? (async (_data, error) => { effects.push(`presentation-failure:${String(error)}`) }),
     businessSucceeded: (_data, result) => result.__businessOk !== false,
-    completion: (_data, result) => result.__cardActionCompletion ?? null,
+    completion: overrides.completion ?? ((_data, result) => result.__cardActionCompletion ?? null),
     track: promise => { trackWork(work, promise) },
     onBackgroundError: error => { errors.push(error) },
     responses: {
@@ -474,6 +494,43 @@ describe('CardActionAdmission integration', () => {
     expect(h.admission.accept(event)).toEqual({ state: 'completed' })
   })
 
+  test('paging back and refreshing again stay available while duplicate deliveries remain suppressed', async () => {
+    const h = admissionHarness()
+    for (const [index, page] of [1, 0, 1, 1].entries()) {
+      const event = actionEvent(`page-click-${index}`, 'chat-a', {
+        kind: 'agent_identity_page', panel_id: 'panel-1', page,
+      })
+      expect(h.admission.accept(event)).toEqual({ state: 'accepted' })
+      await h.drain()
+      expect(h.admission.accept(event)).toEqual({ state: 'completed' })
+    }
+    expect(h.executeCalls()).toBe(4)
+  })
+
+  test('model pagination can revisit pages without replaying a duplicate delivery', async () => {
+    const h = admissionHarness()
+    for (const [index, page] of [1, 0, 1].entries()) {
+      const event = actionEvent(`model-page-${index}`, 'chat-a', {
+        kind: 'model_page', source_id: 'openrouter', panel_id: 'panel-1', page,
+      })
+      expect(h.admission.accept(event)).toEqual({ state: 'accepted' })
+      await h.drain()
+      expect(h.admission.accept(event)).toEqual({ state: 'completed' })
+    }
+    expect(h.executeCalls()).toBe(3)
+  })
+
+  test('model list edits can repeat after a reverse edit while duplicate events stay suppressed', async () => {
+    const h = admissionHarness()
+    for (const [index, kind] of ['model_add', 'model_remove', 'model_add'].entries()) {
+      const event = actionEvent('edit-' + index, 'chat-a', { kind, panel_id: 'p', source_id: 'openrouter', model: 'qwen/test' })
+      expect(h.admission.accept(event)).toEqual({ state: 'accepted' })
+      await h.drain()
+      expect(h.admission.accept(event)).toEqual({ state: 'completed' })
+    }
+    expect(h.executeCalls()).toBe(3)
+  })
+
   test('presentation rejection cannot rerun successful business work', async () => {
     let executeCalls = 0
     let failureReceipts = 0
@@ -520,6 +577,43 @@ describe('CardActionAdmission integration', () => {
     expect(executeCalls).toBe(1)
   })
 
+  test.each([false, true])('model completion releases the chat actor and follows pending presentation (early result: %s)', async early => {
+    const backend = deferred<ModelActionResult>()
+    const presenting = deferred<void>()
+    const pendingCard = deferred<void>()
+    const events: string[] = []
+    const h = admissionHarness({
+      execute: async () => ({ __businessOk: false, modelCompletion: backend.promise }),
+      present: async () => {
+        events.push('pending-start')
+        presenting.resolve()
+        await pendingCard.promise
+        events.push('pending-end')
+      },
+      completion: (_data, result) => modelActionCompletion(result.modelCompletion, async final => {
+        events.push(final.ok ? 'confirmed' : 'failed')
+      }),
+    })
+    const value = { kind: 'model_effort_select', panel_id: 'model-panel', model: 'next', effort: 'high' }
+    expect(h.admission.accept(actionEvent('model-1', 'chat-a', value))).toEqual({ state: 'accepted' })
+    await presenting.promise
+    if (early) backend.resolve({ ok: true, message: 'confirmed' })
+    expect(h.admission.accept(actionEvent('model-duplicate', 'chat-a', value))).toEqual({ state: 'inflight' })
+    const answer = h.messages.accept({ chatId: 'chat-a', run: async () => { events.push('question-answer') } })
+    expect(answer.accepted).toBe(true)
+    pendingCard.resolve()
+    if (answer.accepted) await answer.completion
+    if (!early) {
+      expect(events).toEqual(['pending-start', 'pending-end', 'question-answer'])
+      backend.resolve({ ok: true, message: 'confirmed' })
+    }
+    await h.drain()
+    expect(events.indexOf('confirmed')).toBeGreaterThan(events.indexOf('pending-end'))
+    expect(events.filter(event => event === 'confirmed')).toHaveLength(1)
+    expect(h.admission.accept(actionEvent('model-done', 'chat-a', value))).toEqual({ state: 'completed' })
+    expect(h.errors).toEqual([])
+  })
+
   test('notify retry releases business key while completion retains it', async () => {
     const firstCompletion = deferred<ActionCompletion>()
     const secondCompletion = deferred<ActionCompletion>()
@@ -560,6 +654,22 @@ describe('CardActionAdmission integration', () => {
     await h.drain()
     expect(h.admission.accept(actionEvent('notify-event-3', '', value))).toEqual({ state: 'completed' })
     expect(executeCalls).toBe(2)
+  })
+
+  test('notification reply prompts can reopen immediately while replayed deliveries remain deduplicated', async () => {
+    let count = 0
+    const h = admissionHarness({ execute: async () => { count++; return { __businessOk: true } } })
+    const value = { kind: 'notify_reply', notify_id: 'nf_reply' }
+    const first = actionEvent('reply-event-1', '', value)
+    expect(validateCardActionAdmission(first)).toBeNull()
+    expect(h.admission.accept(first)).toEqual({ state: 'accepted' })
+    await h.drain()
+    expect(h.admission.accept(first)).toEqual({ state: 'completed' })
+    expect(h.admission.accept(actionEvent('reply-event-2', '', value))).toEqual({ state: 'accepted' })
+    await h.drain()
+    expect(count).toBe(2)
+    expect(cardActionDedupeKey(actionEvent('cancel-1', '', { kind: 'notify_reply_cancel', notify_id: 'nf_reply', reply_id: 'one' })))
+      .not.toBe(cardActionDedupeKey(actionEvent('cancel-2', '', { kind: 'notify_reply_cancel', notify_id: 'nf_reply', reply_id: 'two' })))
   })
 
   test('close rejects new work while accepted tails remain drainable', async () => {

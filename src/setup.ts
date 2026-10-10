@@ -1,3 +1,7 @@
+import { networkFetch } from './network'
+import { formatFeishuError } from './feishu-errors'
+import { readFeishuResponse } from './feishu-retry'
+import { fetchGlmAnthropicModelIds, GLM_ANTHROPIC_BASE_URL } from './glm-models'
 /**
  * Interactive setup wizard — runs after `源码构建后 npm i -g .`,
  * triggered either by the postinstall hook (via /dev/tty on unix,
@@ -7,11 +11,12 @@
  * (群里发 `model` 切换)。本向导依次做 4 件事:
  *
  *   1. 确保 Claude Code CLI 在 PATH (npm i -g @anthropic-ai/claude-code)。
- *      特别提醒: 受 Claude 官方限制, Claude 订阅 (Pro/Max OAuth 登录)
- *      不支持本项目; 必须走 API 方式 —— GLM Coding Plan 或 Anthropic API key。
+ *      本机已登录的 Claude 订阅 (Pro/Max OAuth, `claude auth login`) 即可用,
+ *      在 model 面板选 Claude Code 订阅; 也可走 API 方式 —— GLM Coding
+ *      Plan 或 Anthropic API key。
  *   2. GLM Coding Plan API key (推荐, 可选) —— 给了就写进 config.toml 的
  *      [claude.models.glm] 档位 (model=GLM-5.3 1M context, effort=max)
- *      并设为 [claude] default_model; 不给就用 Anthropic 登录态跑
+ *      并设为 [claude] default_model; 不给就用本机 Claude Code 现有配置跑
  *      Fable 5 / Opus。同一歩末尾可选顺带配置 Codex。
  *   3. Feishu 自建应用 —— 打开 https://open.feishu.cn/app, 列出每个
  *      权限 scope + 事件订阅步骤, 粘贴的 app_id / app_secret 先调
@@ -23,15 +28,20 @@
  * token 路由, spawn 时只给 GLM 档位注入 ANTHROPIC_* env; 官方 Fable 5 / Opus
  * 登录档位保持干净)。旧版把 GLM 写进 ~/.claude/settings.json 的做法已废弃 ——
  * 那会经 settingSources:['user'] 污染登录档位, 向导会检测残留并提示清理。
+ * writeClaudeGlmEnv 仅作兼容导出保留(供测试/外部工具), 向导主流程不调用。
  */
 
-import { execSync, spawn } from 'node:child_process'
+import { execFileSync, spawn } from 'node:child_process'
+import { spawn as spawnCommand } from 'cross-spawn'
 import { existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs'
 import { createInterface } from 'node:readline/promises'
-import { delimiter, dirname, join } from 'node:path'
+import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
 import { fileURLToPath } from 'node:url'
 import { CONFIG_DIR, CONFIG_FILE } from './paths'
+import { writeStateFileAtomic } from './state-store'
+import { agentBin, updateAgentRuntime } from './agent-updates'
+import feishuPermissions from '../docs/feishu-permissions.json'
 
 const C = {
   reset: '\x1b[0m',
@@ -76,55 +86,26 @@ function escapeTomlString(s: string): string {
   return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
 }
 
-// ── bin detection / install ────────────────────────────────────────
-function whichBin(name: string): string | null {
-  const PATH = process.env.PATH ?? ''
-  if (!PATH) return null
-  const candidates = process.platform === 'win32'
-    ? [`${name}.cmd`, `${name}.bat`, `${name}.exe`, name]
-    : [name]
-  for (const dir of PATH.split(delimiter)) {
-    if (!dir) continue
-    for (const cand of candidates) {
-      const p = join(dir, cand)
-      if (existsSync(p)) return p
-    }
-  }
-  return null
-}
-
-function npmInstallGlobal(pkg: string): Promise<boolean> {
-  const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-  return new Promise((resolve) => {
-    const child = spawn(npm, ['install', '-g', `${pkg}@latest`], {
-      stdio: 'inherit',
-      shell: process.platform === 'win32',
-    })
-    child.on('exit', (code) => resolve(code === 0))
-    child.on('error', () => resolve(false))
-  })
-}
-
 // ── Codex CLI (optional second backend) ────────────────────────────
 function isCodexChatGPTLoggedIn(codexBin: string): boolean {
   try {
-    const out = execSync(`"${codexBin}" login status 2>&1`, { timeout: 10_000 }).toString()
+    const out = execFileSync(codexBin, ['login', 'status'], { timeout: 10_000, shell: process.platform === 'win32' }).toString()
     return /Logged in using ChatGPT/i.test(out)
   } catch { return false }
 }
 
 async function runCodexLogin(codexBin: string): Promise<boolean> {
   return new Promise((resolve) => {
-    const child = spawn(codexBin, ['login'], {
+    const child = spawnCommand(codexBin, ['login'], {
       stdio: 'inherit',
-      shell: process.platform === 'win32',
+      shell: false,
     })
     child.on('exit', (code) => resolve(code === 0))
     child.on('error', () => resolve(false))
   })
 }
 
-// ── Claude Code settings.json (GLM 路由迁移检测) ────────────────────
+// ── Claude Code settings.json (GLM 残留检测 + 兼容导出) ────────────────────
 function claudeConfigDir(): string {
   return process.env.CLAUDE_CONFIG_DIR || join(homedir(), '.claude')
 }
@@ -161,41 +142,114 @@ function warnResidualGlmSettings(): void {
   } catch { /* 检测失败不影响向导 */ }
 }
 
-// ── browser launcher (best-effort, never throws) ───────────────────
-function openBrowser(url: string): void {
+/** 安装前校验模型目录；认证、网络和响应错误必须交给用户处理，不能保存后报成功。 */
+async function fetchGlmSetupSlots(glmKey: string): Promise<Record<string, string>> {
+  const ids = await fetchGlmAnthropicModelIds(GLM_ANTHROPIC_BASE_URL, glmKey)
+  // 版本号排序(取 "GLM-5.2" 的 5.2;无版本的排最后)。Turbo/Air 变体不进 slots。
+  const versionOf = (id: string): number => {
+    const m = id.match(/(\d+(?:\.\d+)?)/)
+    return m ? Number(m[1]) : -1
+  }
+  const plain = ids.filter(id => !/-Turbo|-Air/i.test(id))
+  const sorted = [...plain].sort((a, b) => versionOf(b) - versionOf(a))
+  const top = sorted[0]
+  const bottom = sorted[sorted.length - 1]
+  if (!top) throw new Error('GLM 模型目录中没有可用于 Claude Code slots 的模型')
+  const out: Record<string, string> = {
+    ANTHROPIC_DEFAULT_OPUS_MODEL: `${top}[1m]`,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: `${top}[1m]`,
+  }
+  if (bottom && bottom !== top) out.ANTHROPIC_DEFAULT_HAIKU_MODEL = bottom
+  return out
+}
+
+/** 把 GLM Coding Plan 路由 merge 进 ~/.claude/settings.json 的 env 段。
+ *  兼容保留: 向导主流程已改走 config.toml 的 [claude.models.glm](setup 头注释),
+ *  此函数仅供 setup-glm.test.ts / 外部工具直调, runSetup 不再调用它。
+ *  保留用户已有字段 (permissions / hooks / plugins …), 只覆盖 GLM 相关 env key。
+ *  settings.json 存在但 JSON 解析失败时绝不静默覆盖 —— surface 出来。 */
+export async function writeClaudeGlmEnv(glmKey: string): Promise<{ path: string } | { error: string }> {
   try {
-    if (process.platform === 'win32') {
-      spawn(process.env.ComSpec ?? 'cmd.exe', ['/c', 'start', '""', url], {
-        detached: true, stdio: 'ignore', windowsHide: true,
-      }).unref()
-    } else if (process.platform === 'darwin') {
-      spawn('open', [url], { detached: true, stdio: 'ignore' }).unref()
-    } else {
-      spawn('xdg-open', [url], { detached: true, stdio: 'ignore' }).unref()
+    const dir = claudeConfigDir()
+    mkdirSync(dir, { recursive: true })
+    const settingsPath = join(dir, 'settings.json')
+
+    let settings: Record<string, unknown> = {}
+    if (existsSync(settingsPath)) {
+      const raw = readFileSync(settingsPath, 'utf8')
+      try {
+        const parsed = JSON.parse(raw)
+        if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+          return { error: `${settingsPath} 内容不是 JSON 对象, 拒绝覆盖, 请手动检查` }
+        }
+        settings = parsed as Record<string, unknown>
+      } catch {
+        return { error: `${settingsPath} 解析失败 (JSON 语法错), 拒绝覆盖, 请手动修复后重跑` }
+      }
     }
-  } catch {
-    // 终端环境 / 无浏览器, 静默, 用户照着控制台 URL 手动开就行
+
+    const prevEnv = (settings.env && typeof settings.env === 'object' && !Array.isArray(settings.env))
+      ? settings.env as Record<string, string>
+      : {}
+    // 先确认凭据可读取有效目录，再写入路由；失败保留已有配置。
+    const slots = await fetchGlmSetupSlots(glmKey)
+    // ANTHROPIC_AUTH_TOKEN 裸 token, 不带 Bearer。
+    const glmEnv: Record<string, string> = {
+      ANTHROPIC_AUTH_TOKEN: glmKey,
+      ANTHROPIC_BASE_URL: GLM_ANTHROPIC_BASE_URL,
+      API_TIMEOUT_MS: '3000000',
+      CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC: '1',
+    }
+    Object.assign(glmEnv, slots)
+    settings.env = { ...prevEnv, ...glmEnv }
+
+    writeStateFileAtomic(settingsPath, JSON.stringify(settings, null, 2) + '\n')
+    return { path: settingsPath }
+  } catch (e: any) {
+    return { error: e?.message ?? String(e) }
+  }
+}
+
+// ── browser launcher ──────────────────────────────────────────────
+function openBrowser(url: string): void {
+  const report = (error: unknown) => console.error(`无法打开浏览器，请手动打开 ${url}: ${error instanceof Error ? error.message : String(error)}`)
+  try {
+    let child
+    if (process.platform === 'win32') {
+      child = spawn(process.env.ComSpec ?? 'cmd.exe', ['/c', 'start', '""', url], {
+        detached: true, stdio: 'ignore', windowsHide: true,
+      })
+    } else if (process.platform === 'darwin') {
+      child = spawn('open', [url], { detached: true, stdio: 'ignore' })
+    } else {
+      child = spawn('xdg-open', [url], { detached: true, stdio: 'ignore' })
+    }
+    child.once('error', report)
+    child.unref()
+  } catch (error) {
+    report(error)
   }
 }
 
 // ── Feishu credential check ────────────────────────────────────────
-async function testFeishuCreds(appId: string, appSecret: string): Promise<{ ok: true } | { ok: false; error: string }> {
+export async function testFeishuCreds(appId: string, appSecret: string): Promise<{ ok: true } | { ok: false; error: string }> {
   try {
-    const res = await fetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
+    const res = await networkFetch('https://open.feishu.cn/open-apis/auth/v3/tenant_access_token/internal', {
       method: 'POST',
       headers: { 'content-type': 'application/json' },
       body: JSON.stringify({ app_id: appId, app_secret: appSecret }),
+      signal: AbortSignal.timeout(15_000),
     })
-    const data = await res.json() as { code?: number; msg?: string; tenant_access_token?: string }
+    const data = await readFeishuResponse(res, '飞书凭据校验')
     if (data.tenant_access_token) return { ok: true }
-    return { ok: false, error: `飞书拒绝: code=${data.code} msg=${data.msg ?? '(no msg)'}` }
+    return { ok: false, error: `飞书凭据校验缺少 tenant_access_token：${formatFeishuError(data)}` }
   } catch (e: any) {
-    return { ok: false, error: `网络错误: ${e?.message ?? String(e)}` }
+    return { ok: false, error: `飞书凭据校验失败：${formatFeishuError(e)}` }
   }
 }
 
 // ── daemon auto-start ──────────────────────────────────────────────
-function spawnDaemonDetached(): { pid?: number; error?: string } {
+export async function spawnDaemonDetached(): Promise<{ pid: number } | { error: string }> {
   // 入口是 dist/lodestar-setup.js, daemon 是同目录的 dist/lodestar.js。
   // 用 process.execPath (= 当前 node) 跑那个 bundle, 避开 Windows .cmd
   // shim 的 spawn 引号坑 —— 这样 detached + stdio:'ignore' 行为在
@@ -211,8 +265,13 @@ function spawnDaemonDetached(): { pid?: number; error?: string } {
       stdio: 'ignore',
       windowsHide: true,
     })
-    child.unref()
-    return { pid: child.pid }
+    return await new Promise(resolve => {
+      child.once('error', error => resolve({ error: error.message }))
+      child.once('spawn', () => {
+        child.unref()
+        resolve(child.pid ? { pid: child.pid } : { error: 'daemon 启动后未返回 PID' })
+      })
+    })
   } catch (e: any) {
     return { error: e?.message ?? String(e) }
   }
@@ -241,9 +300,8 @@ export async function runSetup(): Promise<void> {
   console.log('默认后端是 Claude Code; Codex 是可选第二后端, 群里发 model 一键切换。')
   console.log('每个群对应一个项目目录, agent 在那里跑、能读写文件。')
   console.log()
-  console.log(`${C.yellow}⚠ Claude 官方限制:${C.reset}`)
-  console.log(`  ${C.bold}Claude 订阅 (Pro/Max OAuth 登录) 不支持本项目${C.reset},`)
-  console.log(`  必须走 API 方式 —— 推荐 GLM Coding Plan, 或自备 Anthropic API key。`)
+  console.log('支持本机已登录的 Claude Code 订阅，也可配置 GLM Coding Plan 或 Anthropic API key。')
+  console.log('Claude Code 订阅与第三方来源可在 model 面板中分别选择。')
   console.log()
   console.log('本向导依次做 4 件事:')
   console.log(`  ${C.dim}1) 确保 Claude Code CLI 已装好${C.reset}`)
@@ -255,28 +313,11 @@ export async function runSetup(): Promise<void> {
 
   // ── Step 1/4 ──────────────────────────────────────────────────
   step(1, 4, '准备 Claude Code CLI')
-  let claudeBin = whichBin('claude')
-  if (claudeBin) {
-    console.log(`${C.green}✓ claude CLI 已就位${C.reset}: ${C.dim}${claudeBin}${C.reset}`)
-  } else {
-    console.log(`${C.yellow}未在 PATH 找到 claude CLI, 自动安装...${C.reset}`)
-    console.log(`${C.dim}运行: npm install -g @anthropic-ai/claude-code@latest${C.reset}`)
-    console.log()
-    const ok = await npmInstallGlobal('@anthropic-ai/claude-code')
-    if (!ok) {
-      console.error(`\n${C.red}安装失败。${C.reset}`)
-      console.error('请手动运行后再开向导:')
-      console.error(`  ${C.cyan}npm install -g @anthropic-ai/claude-code@latest${C.reset}`)
-      console.error(`  ${C.cyan}lodestar-setup${C.reset}`)
-      rl.close()
-      process.exit(1)
-    }
-    claudeBin = whichBin('claude')
-    console.log(`${C.green}✓ 安装完成${C.reset}: ${C.dim}${claudeBin ?? '(应该装好了, 但 PATH 找不到 — 重开终端再试)'}${C.reset}`)
-  }
+  await updateAgentRuntime('claude', { report: message => console.log(message) })
+  console.log(`${C.green}✓ Claude Code / SDK 已更新${C.reset}: ${C.dim}${agentBin('claude', 'claude')}${C.reset}`)
   console.log()
   console.log(`${C.dim}下一步可选配 GLM Coding Plan 自动写入路由; 不配则用本机 Claude Code 现有配置。${C.reset}`)
-  console.log(`${C.dim}记住: 别用 \`claude\` 走订阅 OAuth 登录 —— 订阅不支持本项目, 要用 API key。${C.reset}`)
+  console.log(`${C.dim}使用 Claude 订阅时，在本机运行 \`claude auth login\`；完成后在 model 面板选择 Claude Code 订阅。${C.reset}`)
 
   // ── Step 2/4 ──────────────────────────────────────────────────
   step(2, 4, 'GLM Coding Plan (推荐, 可选)')
@@ -284,14 +325,27 @@ export async function runSetup(): Promise<void> {
   console.log('订阅后在智谱开放平台拿一个 API key, 粘到下面 —— 向导写进 config.toml 的')
   console.log(`${C.bold}[claude.models.glm]${C.reset} 档位并设为默认; 群里发 model 可在 Fable 5 / Opus / GLM 间切换。`)
   console.log(`  ${C.dim}拿 key: https://open.bigmodel.cn → 控制台 → API Keys${C.reset}`)
-  console.log(`  ${C.dim}不给也行: 用 Anthropic 登录态跑 Fable 5 / Opus (确保是 API key 方式, 非订阅 OAuth)。${C.reset}`)
+  console.log(`  ${C.dim}不给也行: 用本机 Claude Code 现有配置 (订阅登录或 API key) 跑 Fable 5 / Opus; 以后可在群内发 glm-setup <api_key> 补配。${C.reset}`)
   console.log()
 
-  const glmKey = await ask('GLM API key (直接回车跳过)', {})
-  if (glmKey) {
-    console.log(`${C.green}✓ 已记录 GLM key${C.reset} ${C.dim}(稍后写进 config.toml 的 [claude.models.glm]: model=GLM-5.3 · effort=max · 设为默认档位)${C.reset}`)
-  } else {
-    console.log(`${C.dim}已跳过 GLM, 用 Anthropic 登录态跑 Fable 5 / Opus。${C.reset}`)
+  let glmKey = ''
+  while (true) {
+    const input = await ask('GLM API key (直接回车跳过)', {})
+    if (!input) {
+      console.log(`${C.dim}已跳过 GLM, 用本机 Claude Code 现有配置。${C.reset}`)
+      break
+    }
+    // 先校验 key 真能拉通智谱 /api/anthropic 端点再收(与运行时 / glm-setup
+    // 共用同一校验); 失败重问, 直接回车可跳过 —— 绝不把未验证的 key 写盘。
+    try {
+      await fetchGlmAnthropicModelIds(GLM_ANTHROPIC_BASE_URL, input)
+      glmKey = input
+      console.log(`${C.green}✓ 已记录 GLM key${C.reset} ${C.dim}(稍后写进 config.toml 的 [claude.models.glm]: model=GLM-5.3 · effort=max · 设为默认档位)${C.reset}`)
+      break
+    } catch (e: any) {
+      console.log(`${C.red}✗ GLM 配置失败:${C.reset} ${e?.message ?? e}`)
+      console.log(`${C.dim}请按提示处理后重新输入; 直接回车可跳过, 之后用群命令 glm-setup 补配。${C.reset}`)
+    }
   }
   // 旧版本把 GLM 写进 ~/.claude/settings.json;检测残留并提示清理(只读, 不改写)。
   warnResidualGlmSettings()
@@ -302,15 +356,11 @@ export async function runSetup(): Promise<void> {
   console.log(`  ${C.dim}想用 Codex·GPT-5.5 的话, 登录 ChatGPT 订阅即可, 群里发 model 切换。${C.reset}`)
   const wantCodex = await ask('现在顺便配置 Codex 后端吗?', { default: 'n' })
   if (wantCodex.toLowerCase() === 'y') {
-    let codexBin = whichBin('codex')
-    if (!codexBin) {
-      console.log(`${C.dim}未找到 codex CLI, 安装 @openai/codex...${C.reset}`)
-      const ok = await npmInstallGlobal('@openai/codex')
-      if (ok) codexBin = whichBin('codex')
-    }
-    if (codexBin && isCodexChatGPTLoggedIn(codexBin)) {
+    await updateAgentRuntime('codex', { report: message => console.log(message) })
+    const codexBin = agentBin('codex', 'codex')
+    if (isCodexChatGPTLoggedIn(codexBin)) {
       console.log(`${C.green}✓ Codex 已登录 ChatGPT${C.reset}`)
-    } else if (codexBin) {
+    } else {
       console.log(`${C.dim}启动 \`codex login\`...${C.reset}`)
       const ok = await runCodexLogin(codexBin)
       if (ok && isCodexChatGPTLoggedIn(codexBin)) {
@@ -318,8 +368,6 @@ export async function runSetup(): Promise<void> {
       } else {
         console.log(`${C.yellow}Codex 登录未完成 — 不影响默认 Claude 后端; 需要时随时跑 codex login。${C.reset}`)
       }
-    } else {
-      console.log(`${C.yellow}Codex 安装失败 — 不影响默认 Claude 后端; 需要时手动 npm i -g @openai/codex。${C.reset}`)
     }
   } else {
     console.log(`${C.dim}已跳过 Codex (需要时随时跑 codex login, 群里发 model 切)。${C.reset}`)
@@ -341,8 +389,14 @@ export async function runSetup(): Promise<void> {
   console.log(`  ${C.bold}② 添加机器人能力${C.reset}`)
   console.log(`     左侧菜单 "${C.cyan}添加应用能力${C.reset}" → 找到 "机器人" → 点 "${C.bold}添加${C.reset}" 按钮。`)
   console.log()
-  console.log(`  ${C.bold}③ 申请权限 (左侧 "${C.cyan}权限管理${C.reset}" → "${C.bold}开通权限${C.reset}")${C.reset}`)
-  console.log(`     ${C.yellow}缺一个都会让 daemon 启动后默默丢消息, 一定要全开。${C.reset}`)
+  console.log(`  ${C.bold}③ 申请权限 (左侧 "${C.cyan}权限管理${C.reset}" → "${C.bold}批量导入/导出权限${C.reset}")${C.reset}`)
+  console.log(`     ${C.yellow}选择应用身份权限，复制下方完整 JSON 批量导入，一次开齐账号信息、消息、卡片和云空间能力。${C.reset}`)
+  console.log(JSON.stringify(feishuPermissions, null, 2))
+  console.log(`     ${C.dim}无需用户身份权限或飞书 CLI 登录。权限申请后须完成审批，并在步骤 ⑤ 发布飞书应用版本。${C.reset}`)
+  console.log(`     ${C.dim}清单包含以下用途；也可按名称逐项开通:${C.reset}`)
+  console.log(`     ${C.dim}账号与认证信息 (排障):${C.reset}`)
+  console.log(`       • ${C.bold}verification:verification_information:readonly${C.reset} ${C.dim}# 查看账号主体认证状态${C.reset}`)
+  console.log(`       • ${C.bold}tenant:tenant:readonly${C.reset}             ${C.dim}# 查看租户基本信息${C.reset}`)
   console.log(`     ${C.dim}消息类:${C.reset}`)
   console.log(`       • ${C.bold}im:message:send_as_bot${C.reset}            ${C.dim}# 以机器人身份发消息${C.reset}`)
   console.log(`       • ${C.bold}im:message${C.reset}                        ${C.dim}# 接收/操作消息 (核心)${C.reset}`)
@@ -360,6 +414,11 @@ export async function runSetup(): Promise<void> {
   console.log(`     ${C.dim}卡片类 (Card Kit):${C.reset}`)
   console.log(`       • ${C.bold}cardkit:card:read${C.reset}                 ${C.dim}# 读卡片状态${C.reset}`)
   console.log(`       • ${C.bold}cardkit:card:write${C.reset}                ${C.dim}# 创建/更新卡片 (流式渲染核心)${C.reset}`)
+  console.log(`     ${C.dim}云空间交付 (权限预先开通，功能仍按群开启):${C.reset}`)
+  console.log(`       • ${C.bold}drive:drive${C.reset}                       ${C.dim}# 上传、创建目录、协作者授权、关闭并核对文件链接分享${C.reset}`)
+  console.log(`       • ${C.bold}drive:file:upload${C.reset}                 ${C.dim}# 文件夹改名接口单独要求此权限${C.reset}`)
+  console.log(`     ${C.dim}默认仍直接发聊天附件；在指定群发送 files on 开启云空间，files off 恢复附件。${C.reset}`)
+  console.log(`     ${C.yellow}只取得 tenant_access_token 不代表以上权限已生效；缺少权限时群内命令会明确报错。${C.reset}`)
   console.log()
   console.log(`  ${C.bold}④ 订阅事件 (左侧 "${C.cyan}事件与回调${C.reset}", 拆两个子页:)${C.reset}`)
   console.log(`     ${C.dim}a)${C.reset} ${C.bold}事件配置${C.reset} 页:`)
@@ -448,8 +507,8 @@ export async function runSetup(): Promise<void> {
       '',
     )
   }
-  // 没配 GLM 就用 Anthropic 登录态跑 Fable 5 / Opus(默认档位),Codex 登录态由
-  // codex CLI 管。高级用户可手写 [codex.env] / [claude.env] 注入子进程环境
+  // 没配 GLM 就用本机 Claude Code 现有配置跑 Fable 5 / Opus(默认档位),Codex 登录态
+  // 由 codex CLI 管。高级用户可手写 [codex.env] / [claude.env] 注入子进程环境
   // (escape hatch, 通常不需要);GLM 之外的第三方路由照 [claude.models.<名>] 加。
   writeFileSync(CONFIG_FILE, toml.join('\n'), { mode: 0o600 })
 
@@ -458,25 +517,25 @@ export async function runSetup(): Promise<void> {
 
   // ── Auto-start daemon ─────────────────────────────────────────
   console.log(`\n${C.bold}启动 daemon...${C.reset}`)
-  const r = spawnDaemonDetached()
+  const r = await spawnDaemonDetached()
   const sep = process.platform === 'win32' ? '\\' : '/'
   const logPath = process.platform === 'win32'
     ? `${process.env.LOCALAPPDATA ?? '%LOCALAPPDATA%'}\\Lodestar\\daemon-YYYY-MM-DD.log`
     : `${process.env.HOME ?? '~'}/.local/share/lodestar/daemon-YYYY-MM-DD.log`
 
-  if (r.pid) {
+  if ('pid' in r) {
     console.log(`${C.green}✓ daemon 已在后台启动${C.reset} (pid ${r.pid})`)
     console.log()
     console.log(`${C.bold}最后一步: 在 Feishu 验证${C.reset}`)
     console.log(`  ① 把机器人拉进任意飞书群`)
     console.log(`  ② 群名 = ${C.cyan}${projectsRoot}${sep}<群名>${C.reset} 下的目录名 (新群第一条消息会自动建)`)
     console.log(`  ③ 在群里发任意一条消息, 默认由 Claude 接管`)
-    console.log(`     ${C.dim}(群里发 model 可切到 Codex·GPT-5.5)${C.reset}`)
+    console.log(`     ${C.dim}(群里发 model 可选择已配置账号、动态模型和 effort)${C.reset}`)
     console.log()
     console.log(`日志 (按日滚动, 保留近 7 天):`)
     console.log(`  ${C.cyan}${logPath}${C.reset}`)
     console.log()
-    console.log(`${C.dim}若长期跑后台, 参考 README "7×24 守护" 一节配 systemd / Windows 后台托管。${C.reset}`)
+    console.log(`${C.dim}若长期跑后台, Linux 配 systemd --user,macOS 配 launchd,Windows 配任务计划程序。${C.reset}`)
   } else {
     console.log(`${C.yellow}启动失败: ${r.error}${C.reset}`)
     console.log(`手动运行: ${C.cyan}lodestar-daemon${C.reset}`)

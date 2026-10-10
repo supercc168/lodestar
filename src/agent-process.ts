@@ -30,26 +30,20 @@ export type AgentProvider = typeof AGENT_PROVIDERS[number]
 export function isAgentProvider(value: unknown): value is AgentProvider {
   return typeof value === 'string' && (AGENT_PROVIDERS as readonly string[]).includes(value)
 }
-/** DSH(DeepSeek Harness)原生档位(上游 722e45a)。与 Codex/Claude 档位不互通:
- *  它是子进程 `model/list` 上报的 reasoning effort 词表(off/low/high/max)。 */
-export type DshReasoningEffort = 'off' | 'low' | 'high' | 'max'
+/** DSH(DeepSeek Harness)原生档位(上游 722e45a,7 档词表)。与 Codex/Claude 档位
+ *  不互通:它是子进程 `model/list` 上报的 reasoning effort 词表
+ *  (off/minimal/low/medium/high/xhigh/max)。token-source-dsh 的目录刷新按本表硬校验。 */
+export type DshReasoningEffort = 'off' | 'minimal' | 'low' | 'medium' | 'high' | 'xhigh' | 'max'
 export function isDshReasoningEffort(value: unknown): value is DshReasoningEffort {
-  return value === 'off' || value === 'low' || value === 'high' || value === 'max'
+  return typeof value === 'string' && ['off', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max'].includes(value)
 }
-/** DSH 配置段未声明 `[deepseek-harness].effort` 时的 bootstrap 档位(03-01 冒烟:
- *  deepseek-v4-* 均上报 off/low/high/max,defaultEffort = high)。主会话档位目录
- *  与委派身份目录共用这一个常量 —— 两侧都不回落 Codex 的 max。 */
+/** DSH 配置段未声明 `[deepseek-harness].effort` 时的 bootstrap 档位(03-01 冒烟
+ *  deepseek-v4-* 的默认档即 high)。主会话档位目录与委派身份目录共用这一个常量
+ *  —— 两侧都不回落 Codex 的 max。 */
 export const DSH_BOOTSTRAP_EFFORT: DshReasoningEffort = 'high'
-export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max'
+/** default 表示模型没有 effort 选择器，SDK 不发送 effort 参数。 */
+export type ClaudeReasoningEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max' | 'default'
 export type AgentReasoningEffort = CodexReasoningEffort | ClaudeReasoningEffort | DshReasoningEffort
-
-/** A Codex capacity failure keeps the logical task open while retrying. */
-export interface AgentTurnRetry {
-  phase: 'waiting' | 'retrying'
-  attempt: number
-  delayMs: number
-  message: string
-}
 
 /** 控制台额度数据源。
  * - codex: ChatGPT 登录窗口或 Codex 第三方 /v1/usage
@@ -94,7 +88,16 @@ export type AgentResultEvent = {
   [key: string]: unknown
 }
 
-export const CLAUDE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+/** A Codex retry keeps the logical task open while waiting or reconnecting. */
+export interface AgentTurnRetry {
+  phase: 'waiting' | 'retrying'
+  attempt: number
+  delayMs: number
+  message: string
+  reason?: 'capacity' | 'stream_disconnected' | 'compact_connection_failed' | 'transient_error' | 'quota'
+}
+
+export const CLAUDE_REASONING_EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max', 'default'] as const
 export const CLAUDE_EFFORT: ClaudeReasoningEffort = 'max'
 
 export function isClaudeReasoningEffort(value: unknown): value is ClaudeReasoningEffort {
@@ -145,14 +148,30 @@ export class NothingToCompactError extends Error {
   }
 }
 
+/** A multi-step backend update can acknowledge the model before effort fails.
+ * Null means unconfirmed, never an instruction to use a default value. */
+export class ModelSettingsUpdateError extends Error {
+  constructor(message: string, readonly confirmedModel: string | null, options?: ErrorOptions) {
+    super(message, options)
+    this.name = 'ModelSettingsUpdateError'
+  }
+}
+
 export interface AgentProcess extends EventEmitter {
   readonly provider: AgentProvider
+  /** 该进程 spawn 时绑定的 token source id(= spawnEnv 注入 env 的那个 source)。
+   *  GLM/DeepSeek/native 同为 provider='claude' 但 env(base_url/凭据)不同;
+   *  stopIdleMismatchedProcess 据此判定跨 source 切换要杀进程换 env(同 provider 也要杀)。
+   *  null = 无 source(透传型 native 在 spawn 时仍带 'claude-native' id;null 仅用于无 ts 的裸跑)。 */
+  readonly tokenSourceId: string | null
   sessionId: string | null
   lastAssistantUuid: string | null
   /** Canonical completed turn id when the backend exposes turn-granular forks (Codex). */
   lastCompletedTurnId?: string | null
   lastModel: string | null
   lastEffort: AgentReasoningEffort | null
+  /** 当前思考块的实时估计，不能用于计费或累计 token。 */
+  lastThinkingTokens?: number | null
   lastUsage: CodexUsage | null
   lastTotalUsage: CodexUsage | null
   lastResult: CodexResultMeta
@@ -163,6 +182,9 @@ export interface AgentProcess extends EventEmitter {
   lastContextTokens: number | null
   /** Codex-only transient status; absent for other backends. */
   turnRetry?: AgentTurnRetry | null
+  /** A managed Codex process can change account only after its native child has exited. */
+  sourceRevision?(): string | null
+  codexAccountSelectionMode?(): 'automatic' | 'manual' | null
 
   /** Start backend initialization. */
   sendInitialize(): void
@@ -170,32 +192,43 @@ export interface AgentProcess extends EventEmitter {
    * method-specific RPC failures before teardown. Claude stream init is
    * deferred until first input and therefore does not implement this hook. */
   initializationPromise?(): Promise<void>
+  /** Explicit waiting state releases the Session actor while quota resets; never claims native init. */
+  quotaWaitPromise?(): Promise<void>
   /** Codex launch/persistence metadata. Claude does not use these hooks. */
   readonly launchKind?: 'fresh' | 'resume' | 'fork'
   isConversationResumable?(): boolean
   conversationMaterializationBarrier?(): Promise<void> | null
   conversationMaterializationFailure?(): Error | null
   sendUserText(text: string, files?: string[]): UserTextDispatch
+  /** Append guidance without interrupting the running task. False means no
+   * native turn can accept it yet and nothing was submitted. Rejections must
+   * surface to the caller; an uncertain submission must never be replayed. */
+  steerUserText?(text: string, files?: string[], inputId?: string): Promise<boolean>
   sendInterrupt(): void
   sendPermissionResponse(
     requestId: string | number,
     decision: 'allow' | 'deny',
     payload?: { updatedInput?: Record<string, unknown>; updatedPermissions?: unknown; denyMessage?: string },
   ): void
-  sendToolResult(toolUseId: string, content: string, isError?: boolean): void
   sendHookResponse(requestId: string, output?: object): void
   isAlive(): boolean
+  /** Resolve only after the backend's real lifecycle has ended. Reject when
+   *  TERM/KILL (Codex) or SDK close/abort (Claude) cannot confirm exit. */
   kill(timeoutMs?: number): Promise<void>
 
   listModels(): Promise<AgentModel[]>
   setModelSettings(model: string, effort: AgentReasoningEffort): Promise<void>
-  setModel(model: string): Promise<void>
   compactThread(): Promise<void>
+  /** Host ask 续作:把 tool result 塞回原生 thread(codex custom_tool_call_output);
+   *  claude 侧为假注入(drain 成下一条 user frame 文本前缀)。 */
   injectThreadItems(items: any[]): Promise<void>
+  /** codex:在现有 app-server 连接上读账号额度(read 端点,权威多桶);
+   *  claude:无此通道,返回 null(session 的额度走 token source)。 */
+  readRateLimits?(): Promise<any>
 }
 
 /** 跨后端模型目录条目:档位词表按后端放宽(Codex 的 none..ultra 与 DSH 的
- *  off/low/high/max 不共享),其余字段沿用 Codex 目录形状(上游 722e45a)。 */
+ *  off..max 不共享),其余字段沿用 Codex 目录形状(上游 722e45a)。 */
 export interface AgentModel extends Omit<CodexModel, 'supportedReasoningEfforts' | 'defaultReasoningEffort'> {
   supportedReasoningEfforts: Array<{ reasoningEffort: AgentReasoningEffort; description: string }>
   defaultReasoningEffort: AgentReasoningEffort | null
@@ -215,6 +248,17 @@ export type AgentProcessEventMap = {
   }
   turn_started: { turn_id?: string | null; thread_id?: string | null; retry?: boolean }
   turn_retry: AgentTurnRetry
+  /** Native input consumption, continuation, or cancellation failed. */
+  turn_input_error: { error: string }
+  /** Native execution reached this submitted input. Emitted in output order;
+   * the transport acknowledgement alone is not a consumption boundary. */
+  user_input_consumed: { inputId: string }
+  /** The next native non-user item starts. Consecutive consumed inputs before
+   * this boundary share one card, even when delivered in separate RPC frames. */
+  input_batch_end: { itemId: string }
+  thinking_progress: { estimatedTokens: number }
+  /** Selection succeeded; diagnostics describe unused accounts and are for logs, not proactive alerts. */
+  codex_account_changed: { accountId: string; previousAccountId: string | null; diagnostics: string[] }
   token_usage: TokenUsageUpdated
   turn_plan_updated: TurnPlanUpdated
   plan_delta: PlanDelta
@@ -222,7 +266,7 @@ export type AgentProcessEventMap = {
   rate_limits_updated: any
   thread_goal_updated: ThreadGoal
   thread_goal_cleared: any
-  /** Claude SDK Cron dequeued an autonomous prompt. Unlike a daemon user
+  /** A backend dequeued autonomous work (Claude Cron or a DSH continuation). Unlike a daemon user
    * write, this has no pending input claim, so Session must open its own card. */
   scheduled_turn_input: { text: string; promptId: string | null }
   /** parentToolUseId 非空 = 子 agent 的正文块。它必须与子 agent 工具事件

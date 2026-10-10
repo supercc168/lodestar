@@ -1,58 +1,41 @@
-<!-- Parent: ../AGENTS.md -->
-<!-- Generated: 2026-05-31 | Updated: 2026-06-26 -->
+# 脚本使用
 
-# scripts
+这里包含安装脚本、真实飞书探针和人工 smoke。多数脚本会加载生产配置与 XDG 状态；`Session` 按群保存的选择启动后端。
 
-## Purpose
-`scripts/` 存放面向开发、调试、真实飞书群 smoke 和 npm 安装后的辅助脚本。这些脚本通常直接导入 `src/` 模块并复用生产配置，因此会触达真实 Feishu API、真实 Codex 登录和本机 Lodestar runtime state。
+| 脚本 | 副作用 |
+| --- | --- |
+| `smoke.ts`、`test-all.ts` | 在真实群发送文本、卡片、reaction 和文件，自行创建 Session |
+| `test-inject.ts` | 向 debug context 指定的群发送可见消息，再注入正在运行的 daemon |
+| `test-mid-turn-rotation.ts` | 通过 debug socket 发送 `kill` 和长任务，读取日志 |
+| `cardkit-probe.ts` | 发多张测试卡，直调 Card Kit API |
+| `test-codex-account-cards.ts --unsent` | 当前应用下创建一个未发送的 Card Kit 对象，验收账号卡片各状态，关闭流式状态；不发群消息 |
+| `test-codex-multi-account.ts` | 私有默认/额外账号目录与 localhost 模型，验证三种 SQLite 配置下原生跨账号 resume；不使用真实凭据 |
+| `test-codex-quota-recovery.ts` | 私有目录、模拟额度与 localhost 模型，真实 Codex 执行一次文件追加后连续两次额度耗尽，验证自动换号、同 thread 续跑和操作不重复；不接触真实账号或 daemon |
+| `seed-debug-ctx.ts` | 查询群成员，将指定成员写入本机 debug context |
+| `test-openrouter.ts` | 使用明确提供的私有 Key 和 `--agent-runtimes` 目录做付费 API/SDK Read 实测；不连接飞书或 daemon，支持请求参数核验与原生 resume 序列 |
+| `test-agent-input-boundary.ts` | 指定已安装运行时与新建私有输出目录，通过隔离项目 API → AgentService → 原生 Claude SDK 捕获实际 tools/system/messages，强制注入提问调用并检查原生拒绝、会话记录和五种新建/续跑/归属切换；仅用本地模拟模型，不调用真实模型、不读取生产凭据、不连接飞书或 live daemon |
+| `test-agent-steering.ts` | 指定已安装运行时与新建私有输出目录，用本地模拟模型验证原生 Claude 在工具间追加、回合边界续接和 stop 取消追加队列；检查模型实际收到的消息、工具结果与输入回执，不调用真实模型、不连接飞书或 live daemon |
+| `test-codex-steering.ts` | 指定已安装运行时与新建私有目录，用本地 Responses 模型验证原生 Codex 的“提交回执 → 旧输出 → 消息消费事件 → 新输出”顺序和消息 ID 对应；`--input-count 9` 验证九条独立消费事件在下一次 Agent 输出前构成同一批次，不连接飞书或 live daemon |
+| `test-codex-input-boundary.ts` | 用同样的隔离入口捕获 Codex 实际工具声明、当前指令和原生 thread/read 返回路径上的会话记录，注入同步/异步提问并实际执行文件读取；`--model`/`--effort`/`--code-mode` 检查代码模式，`--fresh-only` 只测外部新建与主 Agent 委派对照，省略时增加续跑和旧 Plan 恢复。只用本地 Responses 模拟端点，不使用真实凭据；验收失败退出非零并在报告明确标记 |
+| `test-dsh-glm.ts` | 使用已配置 GLM Coding Plan 做 DSH Read 与原生 resume 实测，只操作私有临时目录；不连接飞书或控制 daemon |
+| `test-model-panel-live.ts` | 使用现有 daemon，在明确目标群验证分组、隐藏/显示、补录/删除、无效补录拒绝及真实回复；等待最终 footer 后检查模型/effort 与余额/额度，恢复原设置。`--routes-only` 可单测指定模型路由；不自行创建 Session 或控制 daemon |
+| `postinstall.cjs` | 安装/更新时清理旧 `lodestar-files` 的三处受管副本，并提示安装步骤；不读凭据或启动 Agent/daemon，清理失败退出非零 |
+| `test-generated-image-card.ts` | 向明确的测试群发送一张图片折叠测试卡，使用指定的已有图片；检查提示词、卡内图片及预览。不会调用生图模型、单发图片或启动 Session |
+| `sync-security-deps.ts` | 同步普通安全依赖的发布版本声明，随后需用 Bun 同步锁文件；不锁定 Agent 版本 |
+| `check-installed-package.ts` | 在明确的 npm prefix 验收 tarball、自动安装的最新 Agent、命令链接及原生目录，使用私有临时目录，不连接飞书或模型 API |
 
-## Key Files
+## Key Files（本地专有脚本）
 | File | Description |
 |------|-------------|
-| `smoke.ts` | 最小 smoke 驱动；列出可见群，向目标群发送预告并直接调用 `Session.onUserMessage`。 |
-| `test-all.ts` | 全流程人工测试；覆盖 `kill`、`hi`、流式工具调用、`[[send: ...]]`、中途消息、入站图片、`restart` 和 `clear`。 |
-| `test-inject.ts` | 通过 daemon debug unix socket 注入消息，复用真实 Feishu message id 和 `handleMessage` 路径。 |
-| `test-mid-turn-rotation.ts` | 复现中途换卡场景；注入消息后截取当天 `daemon-YYYY-MM-DD.log` 中的相关日志。 |
 | `claude-stream-probe.ts` | 隔离验证 Claude API 档位的所选 model、原始 SSE content-block 顺序和 text/tool-use 能力；Grok 默认复用生产的官方最高 `effort: xhigh` + `thinking: disabled` 参数，也可显式探测 `high`/`xhigh`/`max` 与 adaptive 组合，并允许合法的 tool-first 顺序；不发送飞书消息。 |
 | `codex-responses-probe.ts` | 隔离验证非 Grok 的 Codex API 档位是否使用 Responses transport，并真实完成一次 shell 工具调用；Grok 输入会被拒绝，不发送飞书消息。 |
-| `cardkit-probe.ts` | 对 Card Kit 创建、`id_convert`、元素 PUT 等 API 组合做真实探针。 |
-| `seed-debug-ctx.ts` | 查询目标群成员并写入 `debug-context.json`，用于 debug socket 注入前的上下文种子。 |
-| `postinstall.cjs` | npm 安装后尝试在真实终端启动 `lodestar-setup`；Windows/macOS/Linux 分支各自处理终端继承。 |
 
-## Subdirectories
-| Directory | Purpose |
-|-----------|---------|
-| _None_ | 此目录没有非排除子目录。 |
+`smoke-session.ts` 共用账号、持久状态加载和完成检查；`debug-client.ts` 共用注入请求。它们不作为独立命令运行。
 
-## For AI Agents
-
-### Working In This Directory
-- 大多数 `.ts` 脚本以 `#!/usr/bin/env bun` 运行；`postinstall.cjs` 以 Node 执行，因为它是 npm lifecycle 脚本。
-- 脚本会读取与生产 daemon 相同的 `config.toml` 和 XDG runtime state；不要在脚本里硬编码凭据或写入仓库内状态。
-- 真实飞书群测试可能发送可见消息、reaction、卡片和文件；新增脚本前确认它是否会影响群成员。
-- `test-inject.ts` 和 `test-mid-turn-rotation.ts` 依赖 `DEBUG_SOCK_FILE`，需要 daemon 已运行且 debug context 已由 `[DEBUG]...` 或 `seed-debug-ctx.ts` 建好。
-
-### Testing Requirements
-- 修改普通脚本后至少运行 `bun test`，并按脚本用途执行对应 smoke，例如 `bun scripts/smoke.ts "<group name>"`。
-- 修改 `postinstall.cjs` 后要考虑 npm 生命周期 stdio 被捕获、Windows 新窗口、Unix `/dev/tty` 三条路径。
-- `test-all.ts` 会操作真实 session，运行前确保同一群没有另一个 daemon session 并发抢占。
-
-### Common Patterns
-- 脚本优先复用 `src/feishu.ts`、`src/session.ts`、`src/paths.ts` 的生产实现，而不是重写 API 调用。
-- 面向人工观测的测试会先向群里发送 `🧪` 预告，便于手机端和日志对应。
-- 用 `process.argv` / `Bun.argv` 读取目标群和参数；默认目标常见为 `test1`，但调用方可以覆盖。
-
-## Dependencies
-
-### Internal
-- `smoke.ts`、`test-all.ts` 直接依赖 `src/feishu.ts` 和 `src/session.ts`。
-- `test-inject.ts`、`test-mid-turn-rotation.ts` 依赖 `src/paths.ts` 中的 debug socket 和日志路径。
-- `postinstall.cjs` 依赖构建产物 `dist/lodestar-setup.js`，发布前必须先 `bun run build`。
-
-### External
-- Bun：运行 TypeScript 测试脚本。
-- Node.js：运行 `postinstall.cjs` 和发布包。
-- Feishu Open Platform：群列表、消息、Card Kit、成员查询等真实 API。
-- `codex` CLI：`Session` smoke 会启动真实 `codex app-server`。
-
-<!-- MANUAL: Add manually maintained notes below this line. -->
+- 真实 smoke 需要明确账号、目标群和副作用。自行创建 Session 的脚本要求目标群的 live daemon 已停止；停止 daemon 仍需当前消息单独授权。
+- 探针必须显式指定目标，不使用硬编码群或 `test1` 默认值。凭据、成员和 debug context 不写进仓库。
+- 复用 `src/feishu.ts`、`src/session.ts` 和 `src/paths.ts`，不复制生产 API、账号路由和状态路径。覆盖说明与实际 provider 一致。
+- 模型回调探针走 debug socket 的 `/model-state` 与 `/model-action`；显式 `chat_id` 必须匹配 debug context，动作还要绑定本应用的真实卡片和当前面板。它复用正常回调处理，不代表真实客户端手势已验证。测试记录写私有临时目录。
+- npm lifecycle 不启动交互向导；首次向导由 `cli.ts` 在 TTY 中触发。native binary 不可用时由启动路径明确报错。
+- Agent 更新跟随 latest，不以构建时版本或预先通过兼容测试作为用户更新的门槛；测试发现不兼容时修复适配，不能改回旧版本策略。
+- 修改后先运行相关单元测试。npm lifecycle、native 依赖、构建引用或跨平台入口有变动时运行 `bun run build`。真实 smoke 完成后报告发送内容和本地状态变化。

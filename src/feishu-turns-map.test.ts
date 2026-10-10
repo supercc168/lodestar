@@ -69,6 +69,87 @@ function extract(result: FreshResult): any {
 }
 
 describe('session turn checkpoint persistence', () => {
+  // ── Alive-on-shutdown marker(上游 alive marker 三例 + 本地写路径定型) ──
+  test('the alive marker survives repeated reads and atomic writes across boots', () => {
+    const result = runFreshState(`
+      const first = feishu.readAliveMarker()
+      const second = feishu.readAliveMarker()
+      feishu.writeAliveMarker(['b'])
+      __out({ first, second, saved: __read('alive-on-shutdown.json'), nextBoot: feishu.readAliveMarker() })
+    `, { 'alive-on-shutdown.json': ['a', 'b'] })
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(extract(result)).toEqual({ first: ['a', 'b'], second: ['a', 'b'], saved: ['b'], nextBoot: ['b'] })
+  })
+
+  test('an invalid alive marker fails visibly instead of being treated as an empty recovery list', () => {
+    for (const marker of [{ a: true }, ['a', 7], ['']]) {
+      const result = runFreshState(`
+        let error = null
+        try { feishu.readAliveMarker() } catch (cause) { error = cause.message }
+        __out({ error, saved: __read('alive-on-shutdown.json') })
+      `, { 'alive-on-shutdown.json': marker })
+      expect(result.exitCode, result.stderr).toBe(0)
+      expect(extract(result)).toEqual({
+        error: 'invalid alive session marker: expected non-empty session names', saved: marker,
+      })
+    }
+  })
+
+  test('alive marker read IO errors reach callers; shutdown writes stay best-effort (本地定型)', () => {
+    const result = runFreshState(`
+      mkdirSync(join(__dataDir, 'alive-on-shutdown.json'))
+      const errors = []
+      try { feishu.readAliveMarker() } catch (error) { errors.push(error.code) }
+      let writeError = null
+      try { feishu.writeAliveMarker(['a']) } catch (error) { writeError = String(error?.code ?? error) }
+      __out({ errors, writeError })
+    `)
+    expect(result.exitCode, result.stderr).toBe(0)
+    const output = extract(result)
+    // boot 读取路径照抛(IO 故障不得被当成空列表);shutdown 写路径本地定型为
+    // 尽力而为 —— 标记写失败只 log,不得让关机流程抛错(上游两路径都抛,已收窄)。
+    expect(output.errors).toHaveLength(1)
+    expect(typeof output.errors[0]).toBe('string')
+    expect(output.writeError).toBeNull()
+  })
+
+  test('preserves DSH resume, off effort and native event checkpoints across reload', () => {
+    const result = runFreshState(`
+      feishu.loadSessionResumeMap()
+      feishu.loadSessionModelMap()
+      feishu.bindSessionResumeChecked('project', { provider: 'dsh', sessionId: 'dsh-second', cwd: '/tmp/project' })
+      feishu.appendTurnAnchorChecked('project', {
+        checkpoint: { provider: 'dsh', kind: 'event', id: '42', source: { provider: 'dsh', sessionId: 'dsh-second', cwd: '/tmp/project' } },
+        preview: 'native input', ts: 100, writes: [],
+      })
+      feishu.loadSessionResumeMap()
+      feishu.loadSessionTurnsMap()
+      __out({ resume: feishu.getSessionResumeRef('project', 'dsh'), claude: feishu.getSessionResumeRef('project', 'claude'),
+        model: feishu.getSessionModelSelection('project'), anchors: feishu.getTurnAnchors('project'), saved: __read('session-resume-map.json') })
+    `, {
+      'session-resume-map.json': { project: {
+        dsh: { provider: 'dsh', sessionId: 'dsh-first', cwd: '/tmp/project' },
+        claude: { provider: 'claude', sessionId: 'claude-original', cwd: '/tmp/project' },
+      } },
+      'session-model-map.json': { project: { provider: 'dsh', model: 'deepseek-v4-flash', effort: 'off', tokenSourceId: 'deepseek-harness' } },
+    })
+    expect(result.exitCode, result.stderr).toBe(0)
+    const data = extract(result)
+    expect(data.resume.sessionId).toBe('dsh-second')
+    expect(data.claude.sessionId).toBe('claude-original')
+    // tokenSourceId 在 feishu 侧 model-map 保留(与 session-temp slim routing 无关:
+    // 那是 ConversationRouting 的字段裁剪,本表是持久化选择记录)。
+    expect(data.model).toMatchObject({ provider: 'dsh', effort: 'off', tokenSourceId: 'deepseek-harness' })
+    expect(data.anchors[0].checkpoint).toMatchObject({ provider: 'dsh', kind: 'event', id: '42' })
+    expect(data.saved.project.dsh.sessionId).toBe('dsh-second')
+  })
+
+  test('rejects invalid DSH fork anchors before touching a backend', () => {
+    const source = { provider: 'dsh' as const, sessionId: 'native', cwd: '/tmp/project' }
+    expect(() => validateConversationLaunch({ kind: 'fork', source,
+      through: { provider: 'dsh', kind: 'event', id: '-1', source } }, 'dsh', '/tmp/project')).toThrow('non-negative')
+  })
+
   test('loads V2 checkpoints with an unknown base and null legacy cwd', () => {
     const result = runFreshState(`
       feishu.loadSessionTurnsMap()
@@ -630,6 +711,9 @@ describe('session conversation state cleanup', () => {
         () => feishu.bindSessionResume('missing', {
           provider: 'codex', sessionId: 'thread', cwd: null,
         }),
+        () => feishu.bindSessionResumeChecked('missing-checked', {
+          provider: 'codex', sessionId: 'thread', cwd: null,
+        }),
         () => feishu.bindSessionResumeChecked('relative', 'session', 'claude', 'relative/project'),
       ]) {
         try { bind() } catch (error) { errors.push(String(error?.message ?? error)) }
@@ -637,17 +721,22 @@ describe('session conversation state cleanup', () => {
       __out({
         errors,
         missing: feishu.getSessionResumeRef('missing', 'codex'),
+        missingChecked: feishu.getSessionResumeRef('missing-checked', 'codex'),
         relative: feishu.getSessionResumeRef('relative', 'claude'),
       })
     `)
 
     expect(result.exitCode, result.stderr).toBe(0)
     expect(extract(result)).toEqual({
+      // 本地 legacy 通道(bindSessionResume ref 形态)与上游 checked 通道
+      // 同一个 fail-closed 文案;两边用例并集。
       errors: [
+        'cannot bind a conversation without an absolute cwd: null',
         'cannot bind a conversation without an absolute cwd: null',
         'cannot bind a conversation without an absolute cwd: relative/project',
       ],
       missing: null,
+      missingChecked: null,
       relative: null,
     })
   })
@@ -875,7 +964,7 @@ describe('session conversation state cleanup', () => {
     `, {
       'session-model-map.json': {
         'valid-dsh': { provider: 'dsh', model: 'deepseek-v4-pro', effort: 'off' },
-        'invalid-dsh': { provider: 'dsh', model: 'deepseek-v4-pro', effort: 'medium' },
+        'invalid-dsh': { provider: 'dsh', model: 'deepseek-v4-pro', effort: 'ultra' },
         'claude-route': { provider: 'claude', model: 'claude:glm-4.6', effort: 'max' },
       },
     })
@@ -883,7 +972,8 @@ describe('session conversation state cleanup', () => {
     expect(result.exitCode, result.stderr).toBe(0)
     const output = extract(result)
     expect(output.valid).toEqual({ provider: 'dsh', model: 'deepseek-v4-pro', effort: 'off' })
-    // dsh 非法档位落 null,不静默借用 Codex/Claude 的枚举
+    // dsh 档位按 7 档原生词表(off/minimal/low/medium/high/xhigh/max,上游 722e45a)
+    // 硬校验,词表外落 null,不静默借用 Codex/Claude 的枚举。
     expect(output.invalid).toEqual({ provider: 'dsh', model: 'deepseek-v4-pro', effort: null })
     expect(output.claudeRouted).toEqual({ provider: 'claude', model: 'claude:glm-4.6', effort: 'max' })
   })

@@ -7,14 +7,13 @@ import {
 import type { AgentProcess } from './agent-process'
 import { NothingToCompactError } from './agent-process'
 import * as feishu from './feishu'
-import { log } from './log'
 import {
   contextLimitFromAppServer,
   contextTokenRatioLabel,
   contextTokensFromUsage,
   rawContextPercentLabel,
 } from './context-window'
-import { messageOf } from './session-util'
+import { diagnosticIdLabel, messageOf } from './session-util'
 
 const CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS = 1500
 
@@ -62,7 +61,7 @@ function watchManualCompaction(proc: AgentProcess): ManualCompactionWatch {
     if (notice.threadId && threadId && notice.threadId !== threadId) return
     finish(notice)
   }
-  const onExit = () => fail(new Error('codex app-server exited before context compaction completed'))
+  const onExit = () => fail(new Error(`${proc.provider} process exited before context compaction completed`))
   const onError = (e: unknown) => fail(e instanceof Error ? e : new Error(String(e)))
   // ⚠️ 不再对 Claude 注册 result 兜底("result 到了没 boundary 就是无需压缩"是错的 ——
   // 大上下文压缩极慢时 compact_boundary 会晚于 result 到达,曾被误判成"无需压缩")。
@@ -75,6 +74,7 @@ function watchManualCompaction(proc: AgentProcess): ManualCompactionWatch {
     // 死等 context_compacted;proc exit/error 兜底 fail(onExit/onError 已注册)。
     // codex 手动压缩随之也无 timeout —— 死等 + proc exit 兜底,上游已接受的取舍。
   })
+  // 大上下文压缩不设固定时限；等待完成通知，进程退出或报错时失败。
   proc.on('context_compacted', onCompacted)
   proc.once('exit', onExit)
   proc.once('error', onError)
@@ -185,8 +185,8 @@ export async function runCompactCommand(s: Session): Promise<void> {
   }
 
   const proc = s.proc
-  const threadLabel = proc.sessionId ? proc.sessionId.slice(0, 8) : ''
-  const initialStatus = s.withModel(threadLabel ? `🧠 压缩上下文 thread=${threadLabel}…` : '🧠 压缩上下文…')
+  const threadLabel = proc.sessionId ? diagnosticIdLabel(proc.sessionId) : ''
+  const initialStatus = s.withModel(threadLabel ? `🧠 压缩上下文 thread=${threadLabel}` : '🧠 压缩上下文…')
   const statusCard = await s.openStatusCard('compact', initialStatus, 'orange')
   const finishStatus = async (status: string) => {
     if (statusCard) await s.closeStatusCard(statusCard, status)
@@ -201,7 +201,7 @@ export async function runCompactCommand(s: Session): Promise<void> {
     s.setStatusCard(statusCard, s.withModel('⏳ 等待压缩完成事件'))
     const notice = await watch.promise
     const contextSnapshot = await usageWatch.waitFor(notice, CONTEXT_USAGE_AFTER_COMPACT_WAIT_MS)
-    const doneThread = notice.threadId ? ` thread=${notice.threadId.slice(0, 8)}…` : ''
+    const doneThread = notice.threadId ? ` thread=${diagnosticIdLabel(notice.threadId)}` : ''
     await finishStatus(s.withModel(`✅ 上下文已压缩${doneThread}${compactContextWindowLabel(contextSnapshot)}`))
   } catch (e) {
     watch.cancel()

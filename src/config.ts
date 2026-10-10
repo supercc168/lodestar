@@ -49,15 +49,14 @@ export interface LodestarConfig {
   }
   runtime: {
     projects_root: string
+    /** Opt-in periodic Agent updates. Startup never checks or installs versions. */
+    agent_auto_update: Record<'codex' | 'claude' | 'dsh', boolean>
     /**
      * 活跃 footer / 后台卡 header 的耗时展示。
      * - `bucket`(默认):粗档位,只在档位边界 push,省飞书配额
-     * - `second`:按秒显示,footer 每 1s / 后台卡每 2s push(旧行为,配额更费)
+     * - `second`:按时长选择单位,每秒刷新；长时间运行后降低刷新频率
      */
     live_elapsed: LiveElapsedMode
-    /** Opt-in periodic Agent updates (上游 659dddb)。三个开关独立;默认全 false —
-     *  启动时不检查、不安装,只有显式 `true` 才注册 6 小时节拍。 */
-    agent_auto_update: Record<'codex' | 'claude' | 'dsh', boolean>
   }
   notify: {
     bind: string
@@ -82,8 +81,8 @@ export interface LodestarConfig {
    * `@anthropic-ai/claude-agent-sdk`. Empty record = inherit the user's
    * local Claude Code configuration. */
   claude: {
-    /** 显式指定 SDK spawn 的 Claude Code 可执行文件(如 reclaude 这类
-     * 参数透传包装器)。未设置 = 自动查找。 */
+    /** 显式指定 SDK spawn 的 Claude Code 可执行文件或参数透传包装器。
+     * 未设置时使用 SDK 默认入口。 */
     bin?: string
     /** 新 session(无持久化 model 选择)的默认档位,取 [claude.models.*] /
      * 内建档位的 key(如 "glm")或固定项 model(如 "claude:glm" / "gpt-5.6-sol")。
@@ -116,6 +115,8 @@ export interface LodestarConfig {
    *  不读本段;反之 dsh 也不读 `[claude.models.*]`。缺段为 undefined,
    *  不写任何默认凭据。 */
   deepseek_harness?: DeepseekHarnessConfig
+  /** [token_source.<id>] 账号配置；群内启用和补录会更新对应节。 */
+  token_sources: Record<string, TokenSourceConfig>
 }
 
 /** `[deepseek-harness]` 账号段(ND-03 本地定形,全标量,parseToml 语义内)。 */
@@ -168,12 +169,48 @@ export interface CodexModelConfig {
   effort?: string
 }
 
-/** Per-project agent launch profile, sourced from `[projects.<name>].*`
- * sections in config.toml. Absent section ⇒ no override (Lodestar defaults:
- * `settingSources:['user','project','local']`, `claude_code` tool preset, project MCP auto-discovered).
- * Lets an external project (e.g. evolving) run a clean, isolated Claude
- * session pointed at an arbitrary cwd with a restricted tool set and its
- * own `.mcp.json`, without touching any other project. */
+/** Token source 配置(一个账号)。parseToml 只支持标量,故 models/slots 用复合字符串。
+ *  agent       — 'codex' | 'claude' | 'dsh'(协议强制)
+ *  auth        — 'chatgpt-login'(codex 订阅)
+ *  base_url + auth_token / api_key — claude 第三方(GLM/DeepSeek/中转)
+ *  bin         — Claude 包装器，或 DeepSeek Harness 使用的 Node 可执行文件
+ *  model       — 默认模型 slug(codex 下发 gpt-5.6-sol;claude 真实模型走 slots)
+ *  effort      — 默认 effort
+ *  models      — OpenRouter/Packy 显式可选列表；GLM/DeepSeek 经验证的补录模型
+ *  hidden_models — 非 OpenRouter 来源从接口目录中隐藏的模型(逗号分隔)
+ *  shown_models — 自动精选列表之外显式显示的接口模型(逗号分隔)
+ *  custom_models — 所有来源的列表外补录记录(逗号分隔，不代表已验证可运行)
+ *  slots       — claude 槽位映射 'opus=X,sonnet=Y,haiku=Z'
+ *  usage       — 额度查询策略 'codex-rate-limit' | 'glm-coding-plan' | 'none' */
+export interface TokenSourceConfig {
+  agent?: string
+  /** Claude Code 订阅的 Lodestar 开关；省略时保持自动识别本机登录。 */
+  enabled?: boolean
+  display?: string
+  auth?: string
+  base_url?: string
+  auth_token?: string
+  api_key?: string
+  /** 独立的账户余额凭据，绝不传入模型进程。 */
+  management_token?: string
+  management_user_id?: string
+  management_url?: string
+  /** 只复用指定来源的余额账号，不复用它的模型 Key。 */
+  billing_source?: string
+  bin?: string
+  model?: string
+  effort?: string
+  models?: string
+  hidden_models?: string
+  shown_models?: string
+  custom_models?: string
+  slots?: string
+  usage?: string
+  default?: boolean
+}
+
+/** [projects.<name>] 主会话启动配置。cwd 用于两个后端，其余字段用于 Claude。
+ * Token Source 指定的 settingSources 优先于项目配置。 */
 export interface ProjectProfile {
   /** Absolute working directory. Falls back to `PROJECTS_ROOT/<name>`. */
   cwd?: string
@@ -234,7 +271,10 @@ function parseToml(text: string): Record<string, Record<string, string>> {
   return out
 }
 
-function loadConfig(): LodestarConfig {
+// stripTomlComment 从 ./config-parse 导入(见文件头 import;放独立模块便于
+// 单测解析逻辑,不受 mock.module('./config') 污染)。
+
+export function loadConfig(): LodestarConfig {
   let raw: string
   try {
     raw = readFileSync(CONFIG_FILE, 'utf8')
@@ -348,9 +388,6 @@ function loadConfig(): LodestarConfig {
     }
     return out
   }
-  // [projects.<name>] 节可选 —— 一个外部项目(如 evolving)想跑干净隔离的
-  // Claude session:指定 cwd、限定内置工具、只挂自己的 .mcp.json。未配置的
-  // 项目完全走 Lodestar 默认(settingSources:['user','project','local'] + claude_code 工具集 + 项目 .mcp.json 自动发现)。
   const projectSections = (): Record<string, ProjectProfile> => {
     const out: Record<string, ProjectProfile> = {}
     const prefix = 'projects.'
@@ -395,6 +432,37 @@ function loadConfig(): LodestarConfig {
       const value = section[field]
       if (typeof value !== 'string' || !value.trim()) continue
       out[field] = field === 'bin' ? expandTilde(value.trim()) : value.trim()
+    }
+    return out
+  }
+  // [token_source.<id>] 节 —— 每节一个账号(凭据 + 模型 + 额度查询)。
+  const tokenSourceSections = (): Record<string, TokenSourceConfig> => {
+    const out: Record<string, TokenSourceConfig> = {}
+    const prefix = 'token_source.'
+    for (const [sectionName, section] of Object.entries(t)) {
+      if (!sectionName.startsWith(prefix)) continue
+      const id = sectionName.slice(prefix.length).trim()
+      if (!id) continue
+      const cfg: TokenSourceConfig = {}
+      for (const [rawKey, value] of Object.entries(section)) {
+        if (typeof value !== 'string') continue
+        const field = rawKey.trim()
+        if (field === 'enabled') {
+          if (value !== 'true' && value !== 'false') throw new Error(`[${sectionName}].enabled 必须为 true 或 false`)
+          cfg.enabled = value === 'true'
+        } else if (field === 'default') {
+          cfg.default = value === 'true'
+        } else if (
+          field === 'agent' || field === 'display' || field === 'auth' ||
+          field === 'base_url' || field === 'auth_token' || field === 'api_key' ||
+          field === 'management_token' || field === 'management_user_id' || field === 'management_url' || field === 'billing_source' ||
+          field === 'bin' || field === 'model' || field === 'effort' ||
+          field === 'models' || field === 'hidden_models' || field === 'shown_models' || field === 'custom_models' || field === 'slots' || field === 'usage'
+        ) {
+          ;(cfg as Record<string, string>)[field] = value
+        }
+      }
+      out[id] = cfg
     }
     return out
   }
@@ -446,7 +514,13 @@ function loadConfig(): LodestarConfig {
     projects: projectSections(),
     imagegen,
     deepseek_harness: deepseekHarnessSection(),
+    token_sources: tokenSourceSections(),
   }
 }
 
 export const config = loadConfig()
+
+/** 账号配置写入后仅重载 token_sources，由调用方重建目录。 */
+export function reloadTokenSources(): void {
+  config.token_sources = loadConfig().token_sources
+}

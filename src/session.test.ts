@@ -2,25 +2,30 @@ import { EventEmitter } from 'node:events'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { afterEach, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, mock, spyOn, test } from 'bun:test'
 import { writeJsonStateAtomic } from './state-store'
 import {
   DEFAULT_CODEX_WATCHDOG,
   TurnWatchdog,
   type WatchdogSettings,
 } from './turn-watchdog'
+import { fileDeliveryAgentContext } from './instructions'
+import { FileDeliveryBatch } from './file-delivery'
+import { GroupFileDelivery } from './group-file-delivery'
+import type { FileDeliverySnapshot } from './file-delivery-types'
 import {
   NothingToCompactError,
   type AgentTurnRetry,
   type CodexUserTextSettlement,
   type UserTextDispatch,
 } from './agent-process'
-import { CodexRpcResponseError } from './codex-process'
+import { CodexProcess, CodexRpcResponseError } from './codex-process'
 import {
   addedReactions, boundResumes, branchBaseBySession, clearedResumes, clearedTurnAnchors, deletedReactions,
   feishuMockState, modelSelections, pendingConversationLaunchBySession, projectProfiles, resetFeishuMock,
   resumeRefs, seededTurnAnchors, sentCards, sentRawTexts, sentTexts,
   setResumeWriteError, setTurnAnchorWriteError, truncatedTurnAnchors, turnAnchorsBySession, updatedCards, urgentPushes,
+  sentImages, uploadedImages, sentLocalFiles, setImageUploadHandler,
 } from './feishu-test-mock'
 import type { ConversationCheckpoint, ConversationRef } from './conversation'
 import { resetAgentSessionRegistryForTest } from './agent-session-registry'
@@ -57,6 +62,12 @@ const sessionWorktree = await import('./session-worktree')
 const mathRender = await import('./math-render')
 const sessionTools = await import('./session-tools')
 const sessionHostAsk = await import('./session-host-ask')
+const { ClaudeAgentProcess } = await import('./claude-agent-process')
+const { FeishuRecoveryWindow } = await import('./feishu-retry')
+const feishu = await import('./feishu')
+const { groupFileDelivery } = await import('./file-delivery-runtime')
+const { getTokenSource, listTokenSources, registerTokenSource, refreshAllTokenSourceModels, resetTokenSourceRegistry, tokenSourceProcessRevision } = await import('./token-source')
+const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
 const {
   fixedModelChoices,
   normalizeFixedModelSelection,
@@ -64,7 +75,7 @@ const {
   configuredDefaultSelection,
 } = await import('./session-model')
 const { config } = await import('./config')
-const { peekUsage, updateUsageFromRateLimits } = await import('./usage')
+const { peekUsage, updateUsageFromRateLimits, refreshUsageFromConnection, invalidateCodexUsage } = await import('./usage')
 
 interface FetchCall {
   method: string
@@ -74,8 +85,12 @@ interface FetchCall {
 
 const originalFetch = globalThis.fetch
 let calls: FetchCall[] = []
+let failureNotificationWait: { mockRestore(): void }
 
 beforeEach(() => {
+  // These tests cover UI state and callbacks; the full recovery deadline is
+  // exercised with a virtual clock in cardkit-retry.test.ts.
+  failureNotificationWait = spyOn(FeishuRecoveryWindow.prototype, 'waitUntilDeadline').mockResolvedValue(undefined)
   calls = []
   resetFeishuMock()
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
@@ -95,13 +110,85 @@ beforeEach(() => {
   }) as typeof fetch
 })
 
+describe('Session delegated-agent capability', () => {
+  test('API Codex starts without ChatGPT login and uses its own quota in the footer', async () => {
+    const session = new Session('packy-api-start', 'chat_id') as any
+    const source = {
+      id: 'packy-api-test', kind: 'packy-api-test', agent: 'codex', display: 'Packy', enabled: true,
+      models: [{ model: 'kimi-k3', display: 'Kimi', efforts: ['medium'], defaultEffort: 'medium' }],
+      defaultModel: 'kimi-k3', modelCatalogState: { status: 'ready', updatedAt: 1 },
+      codexApiProvider: { id: 'packy', name: 'Packy', baseUrl: 'https://cf.api.fan/v1', envKey: 'PACKY_KEY' },
+      readUsage: async () => ({ state: 'ok', kind: 'quota', windows: [], quota: { remaining: 2, limit: 5, currency: 'USD' } }),
+    }
+    const proc = new FakeAgentProc('codex', 'packy-native-thread') as any
+    proc.tokenSourceId = source.id
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    proc.initializationPromise = () => Promise.resolve()
+    proc.sendInitialize = () => proc.emit('init', { session_id: proc.sessionId })
+    proc.readRateLimits = () => { throw new Error('must not read subscription limits') }
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = source.id
+    session.selectedModel = 'kimi-k3'
+    session.selectedEffort = 'medium'
+    session.currentTokenSource = () => source
+    session.spawnAgent = () => proc
+    Object.defineProperty(session, 'workDir', { value: process.cwd() })
+    const auth = spyOn(feishu, 'isOpenAIChatGPTAuthenticated').mockImplementation(() => { throw new Error('must not check ChatGPT auth') })
+    try {
+      expect(await session.start({ announce: false })).toBe(true)
+      expect(auth).not.toHaveBeenCalled()
+      expect(session.peerSnapshot().codexAccountName).toBeUndefined()
+      expect(await session.footerUsageSuffix('codex', proc, source.id, source, null, 'kimi-k3')).toBe('  |  额度 $2.00 / $5.00')
+      expect(session.conversationRouting().codexAccountId).toBeUndefined()
+      expect(session.conversationRouting().codexAccountAutomatic).toBeUndefined()
+    } finally {
+      auth.mockRestore()
+      await session.stop('API source test complete', { announce: false })
+    }
+  })
+
+  test('accepts only the live process capability and delegates cancellation', async () => {
+    const cancellations: Array<[string, string]> = []
+    const session = new Session('agent-capability', 'chat_id', {
+      onCancelAgentRuns: async (name: string, _chatId: string, reason: string) => { cancellations.push([name, reason]) },
+    }) as any
+    session.proc = { isAlive: () => true }
+    session.agentCapability = 'secret-capability'
+
+    expect(session.acceptsAgentCapability('secret-capability')).toBe(true)
+    expect(session.acceptsAgentCapability('wrong')).toBe(false)
+    session.proc = { isAlive: () => false }
+    expect(session.acceptsAgentCapability('secret-capability')).toBe(false)
+
+    await session.cancelAgentRuns('stop')
+    expect(cancellations).toEqual([['agent-capability', 'stop']])
+  })
+
+  test('routes the global agents command to the identity panel', async () => {
+    const session = new Session('agents-command', 'chat_id') as any
+    let owner = ''
+    session.showAgentIdentityPanel = async (userOpenId: string) => { owner = userOpenId }
+    expect(await session.runCommand('agents', 'ou_owner')).toBe(true)
+    expect(owner).toBe('ou_owner')
+  })
+
+  test('keeps the legacy no-source Codex effort delegated to config.toml', () => {
+    const session = new Session('legacy-codex-effort', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = null
+    session.currentTokenSource = () => undefined
+    expect(session.effortForSpawn()).toBeUndefined()
+  })
+})
+
 class FakeAgentProc extends EventEmitter {
   lastAssistantUuid = null
-  lastModel = null
-  lastEffort = null
-  lastUsage = null
-  lastTotalUsage = null
-  lastResult = {
+  lastModel: string | null = null
+  lastEffort: string | null = null
+  lastUsage: any = null
+  lastTotalUsage: any = null
+  lastResult: any = {
     cost_usd: null,
     cost_delta_usd: null,
     duration_ms: null,
@@ -126,27 +213,44 @@ class FakeAgentProc extends EventEmitter {
   conversationResumableState = true
   /** ConversationLaunch 面(ff44afb/4185808):三态 launchKind(默认 null =
    *  既有用例零行为差,init 分流只认显式 'fresh')+ codex checkpoint 采集字段。 */
-  launchKind: 'fresh' | 'resume' | 'fork' | null = null
+  launchKind: 'fresh' | 'resume' | 'fork' | null | undefined = null
   lastCompletedTurnId: string | null = null
   /** 进程层容量退避快照(startFooterStatus 读它覆盖 footer,D-07):忠实替身
    *  由 emitTurnRetry 先落快照再 emit,与真实 CodexProcess.scheduleCapacityRetry
    *  的「先设置 this.turnRetry 再 emit('turn_retry')」顺序一致。 */
   turnRetry: AgentTurnRetry | null = null
+  conversationResumable = true
+  initialization: Promise<void> = Promise.resolve()
+  materializationBarrier: Promise<void> | null = null
 
+  /** 上游用例第三参传 tokenSourceId 字符串;本地 spawn 捕获用例传 opts 对象。 */
+  readonly tokenSourceId: string | null
   constructor(
     readonly provider: 'codex' | 'claude' | 'dsh',
     public sessionId: string | null = null,
-    /** spawn 捕获暴露(ff44afb):监听 spawnAgent 侧翻译产物的用例经第三参喂入。 */
-    readonly opts: { launch?: unknown } = {},
+    /** 上游第三参 = tokenSourceId;本地 spawn 捕获暴露(ff44afb)第三参 = opts 对象。 */
+    optsOrTokenSourceId: { launch?: unknown } | string | null = {},
   ) {
     super()
+    this.opts = typeof optsOrTokenSourceId === 'string' || optsOrTokenSourceId === null ? {} : optsOrTokenSourceId
+    this.tokenSourceId = typeof optsOrTokenSourceId === 'string' ? optsOrTokenSourceId : null
   }
+  /** spawn 捕获暴露(ff44afb):监听 spawnAgent 侧翻译产物的用例经第三参喂入。 */
+  readonly opts: { launch?: unknown } = {}
 
   isConversationResumable(): boolean {
-    return this.conversationResumableState === true
+    return this.conversationResumableState === true && this.conversationResumable
   }
 
   sendInitialize(): void {}
+
+  initializationPromise(): Promise<void> {
+    return this.initialization
+  }
+
+  conversationMaterializationBarrier(): Promise<void> | null {
+    return this.materializationBarrier
+  }
 
   sendUserText(text: string): UserTextDispatch {
     this.sentTexts.push(text)
@@ -177,6 +281,7 @@ class FakeAgentProc extends EventEmitter {
     this.permissionResponses.push([requestId, decision, payload])
   }
   sendToolResult(): void {}
+  async injectThreadItems(): Promise<void> {}
   sendHookResponse(requestId: string, output?: object): void {
     this.hookResponses.push([requestId, output])
   }
@@ -203,9 +308,7 @@ class FakeAgentProc extends EventEmitter {
   async setModelSettings(model: string, effort: string): Promise<void> {
     this.setModelSettingsCalls.push([model, effort])
   }
-  async setModel(): Promise<void> {}
   async compactThread(): Promise<void> {}
-  async injectThreadItems(): Promise<void> {}
 }
 
 afterEach(() => {
@@ -220,6 +323,7 @@ afterEach(() => {
     session.dispose()
   }
   globalThis.fetch = originalFetch
+  failureNotificationWait.mockRestore()
 })
 
 function turnState(
@@ -392,7 +496,6 @@ function installFailedWatchdogRecovery(
   const provider = opts.provider ?? 'codex'
   const threadId = opts.threadId ?? 'thread-1'
   const turnId = opts.turnId ?? 'turn-1'
-  const proc = opts.proc ?? new FakeAgentProc(provider, threadId)
   const turn = opts.turn ?? turnState(`card_failed_recovery_${++watchdogFixtureCount}`)
   turn.backendThreadId = threadId
   turn.backendTurnId = turnId
@@ -1406,7 +1509,7 @@ describe('Session watchdog recover-once action', () => {
       msg: 'forced CardKit write failure',
     }), {
       headers: { 'Content-Type': 'application/json' },
-    })) as typeof fetch
+    })) as unknown as typeof fetch
 
     try {
       await session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
@@ -1794,7 +1897,11 @@ describe('Session watchdog recover-once action', () => {
       ['om_resume_failure', 'reaction_resume_failure'],
     ])
     session.spawnAgent = () => resumed
-    resumed.sendInitialize = () => resumed.emit('error', new Error('resume init failed'))
+    // 合并调和(取舍):main 的事件版恢复网关(waitForProcResumeInit)已随上游
+    // session 恢复优化退役,恢复失败改由 initialize 事务 promise 收口(与上游
+    // 'confirmed no-rollout resume failure...' 用例同型注入)。本例语义不变:
+    // init 失败 → 替换进程被杀,替换 exit 不得摧毁恢复捕获态。
+    resumed.initialization = Promise.reject(new Error('resume init failed'))
     let stateAfterReplacementExit: {
       turn: any
       context: any
@@ -1825,9 +1932,9 @@ describe('Session watchdog recover-once action', () => {
     expect(ok).toBe(false)
     expect(resumed.killCalls).toBe(1)
     expect(stateAfterReplacementExit).toMatchObject({ turn, context })
-    expect(stateAfterReplacementExit?.midTurn).toHaveLength(1)
-    expect(stateAfterReplacementExit?.inputs).toEqual(['queued input during resume'])
-    expect(stateAfterReplacementExit?.reactions).toEqual(new Map([
+    expect(stateAfterReplacementExit!.midTurn).toHaveLength(1)
+    expect(stateAfterReplacementExit!.inputs).toEqual(['queued input during resume'])
+    expect(stateAfterReplacementExit!.reactions).toEqual(new Map([
       ['om_resume_failure', 'reaction_resume_failure'],
     ]))
     expect(session.proc).toBeNull()
@@ -1855,6 +1962,13 @@ describe('Session watchdog recover-once action', () => {
     session.spawnAgent = () => resumed
     const statuses: string[] = []
     let stateAfterReplacementExit: { turn: any; context: any; midTurnCount: number } | null = null
+    // 合并调和(取舍):main 事件网关的时间文案 formatProcessExitDetail
+    // ('process exited (code=…, signal=…, expected=…)') 已随 waitForProcResumeInit
+    // 退役;恢复期 init 直接退出在真实进程层的形态 = 进程死亡 + initialize 事务
+    // reject(app-server close 报错,codex-process.handleChildClose 的
+    // 'codex app-server closed before thread/resume response')。用例语义不变:
+    // 直接退出不得触发普通破坏性清理,失败详情必须上屏且不得出现 '[object
+    // Object]';断言按新通道核对该 rejection 的 message。
     resumed.sendInitialize = () => {
       resumed.alive = false
       resumed.emit('exit', { code: 1, signal: null, expected: true })
@@ -1863,6 +1977,9 @@ describe('Session watchdog recover-once action', () => {
         context: session.watchdogContext,
         midTurnCount: session.pendingMidTurnMsgs.length,
       }
+      resumed.initialization = Promise.reject(
+        new Error('codex app-server closed before thread/resume response (id=2)'),
+      )
     }
 
     const ok = await session.restart(true, {
@@ -1870,20 +1987,18 @@ describe('Session watchdog recover-once action', () => {
       requireResumeSession: true,
       preserveCurrentTurn: true,
       preserveQueuedHumanWork: true,
-      onStatus: status => statuses.push(status),
+      onStatus: (status: string) => statuses.push(status),
     })
 
     expect(ok).toBe(false)
-    expect(stateAfterReplacementExit).toEqual({ turn, context, midTurnCount: 1 })
+    expect(stateAfterReplacementExit!).toEqual({ turn, context, midTurnCount: 1 })
     expect(session.currentTurn).toBe(turn)
     expect(session.watchdogContext).toBe(context)
     expect(session.pendingMidTurnMsgs).toHaveLength(1)
     expect(session.pendingReactionIds).toEqual(new Map([
       ['om_init_exit', 'reaction_init_exit'],
     ]))
-    expect(statuses.at(-1)).toContain('code=1')
-    expect(statuses.at(-1)).toContain('signal=null')
-    expect(statuses.at(-1)).toContain('expected=true')
+    expect(statuses.at(-1)).toContain('codex app-server closed before thread/resume response (id=2)')
     expect(statuses.at(-1)).not.toContain('[object Object]')
   })
 
@@ -1894,6 +2009,9 @@ describe('Session watchdog recover-once action', () => {
     session.spawnAgent = () => resumed
     cardkit.recordCardCreated(turn.cardId, 1)
     let queuedHuman = Promise.resolve()
+    // 合并调和(取舍):恢复失败通道由事件版网关切换为 initialize 事务 promise
+    // (上游 session 恢复优化)。保序语义不变:人类消息先入队,随后恢复失败经
+    // rejection 上报(真实进程同型:init 期间进程死亡 → readyPromise reject)。
     resumed.sendInitialize = () => {
       queuedHuman = session.onUserMessage(
         'human survives failed resume',
@@ -1902,8 +2020,8 @@ describe('Session watchdog recover-once action', () => {
         'om_human_survives',
       ).then(() => {
         session.pendingReactionIds.set('om_human_survives', 'reaction_human_survives')
-        resumed.emit('error', new Error('resume init failed'))
       })
+      resumed.initialization = queuedHuman.then(() => Promise.reject(new Error('resume init failed')))
     }
 
     await session.runWatchdogRecovery(session.watchdogContext, recoverVerdict)
@@ -3815,11 +3933,13 @@ describe('Session pending human delivery', () => {
       session.currentTurn.backendThreadId = control!.dispatch.threadId
       session.currentTurn.backendTurnId = 'turn-current'
 
+      // patch 故意覆盖同名身份字段(制造 stale 身份):spread 位于最后,运行时以
+      // patch 为准;联合字面量中显式属性与 spread 同名会触发 TS2783,宽化仅为过检。
       proc.emit('result', {
         delivery_id: control!.dispatch.deliveryId,
         thread_id: control!.dispatch.threadId,
         turn_id: 'turn-current',
-        ...eventPatch,
+        ...(eventPatch as Record<string, string>),
       })
 
       expect(session.pendingHumanDelivery?.state).toBe('pending')
@@ -4800,7 +4920,7 @@ describe('Session Codex watchdog turn identity', () => {
     const healthyFetch = globalThis.fetch
     globalThis.fetch = (async () => new Response(JSON.stringify({ code: 99, msg: 'boom' }), {
       headers: { 'Content-Type': 'application/json' },
-    })) as typeof fetch
+    })) as unknown as typeof fetch
     await session.openTurnCard('ou_user', 'user_message', { startThinking: false })
     expect(session.currentTurn).toBeNull()
     session.finishTurnOpening(openingToken)
@@ -6807,7 +6927,930 @@ describe('Session Codex watchdog warning and model guard', () => {
   })
 })
 
+describe('Session in-flight user guidance', () => {
+  function running(provider: 'codex' | 'claude' | 'dsh' = 'codex') {
+    const session = new Session('steering', 'chat_id') as any
+    const proc = new FakeAgentProc(provider, 'steering-session') as any
+    session.proc = proc
+    session.selectedProvider = provider
+    session.wireProc(proc)
+    session.initCount = 1
+    session.turnCounter = 1
+    session.status = 'working'
+    const turn = turnState('card_steering')
+    turn.provider = provider
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 2)
+    return { session, proc, turn }
+  }
+
+  for (const provider of ['codex', 'claude'] as const) {
+    test(`${provider} waits for native consumption before changing the presentation card`, async () => {
+      const { session, proc, turn } = running(provider)
+      const steered: any[] = []
+      proc.steerUserText = async (...args: any[]) => { steered.push(args); return true }
+      try {
+        await session.onUserMessage('请先检查这里', ['/tmp/context.txt'], 'ou_user', 'om_guidance')
+        await session.steeringSend
+        expect(steered).toEqual([['[file: /tmp/context.txt]\n请先检查这里', [], expect.any(String)]])
+        expect(proc.sentTexts).toEqual([])
+        expect(session.currentTurn).toBe(turn)
+        expect(session.pendingMidTurnMsgs).toEqual([])
+        expect(session.pendingUserMessageCount).toBe(0)
+        expect(session.pendingReactionIds.size).toBe(1)
+        expect(sentCards).toEqual([])
+        expect(turn.cardId).toBe('card_steering')
+        proc.emit('assistant_text', { text: '提交之后仍未消费的旧任务输出', parentToolUseId: null })
+        proc.emit('user_input_consumed', { inputId: steered[0][2] })
+        proc.emit('input_batch_end', { itemId: 'next-reasoning' })
+        await waitUntil(() => session.steeringBoundary === null)
+        expect(session.pendingReactionIds.size).toBe(0)
+        expect(sentCards).toHaveLength(1)
+        const nextCard = sentCards[0] as any
+        expect(nextCard.body.elements[0].header.title.content).toBe('📥 追加 (1) #1')
+        expect(JSON.stringify(nextCard)).toContain('请先检查这里')
+        expect(JSON.stringify(nextCard)).not.toContain('前卡写满')
+        expect(turn.cardId).not.toBe('card_steering')
+        expect(cardkit.isDisposed('card_steering')).toBe(true)
+        expect(session.turnCounter).toBe(1)
+        expect(calls.some(call => call.path === '/cards/card_steering/elements/footer'
+          && String(call.body.element).includes('已续至下一张'))).toBe(true)
+        proc.emit('assistant_text', { text: '已根据补充调整', parentToolUseId: null })
+        proc.emit('assistant_block_stop', { parentToolUseId: null })
+        await cardkit.flush(turn.cardId)
+        expect(calls.some(call => call.method === 'POST' && call.path === `/cards/${turn.cardId}/elements`
+          && String(call.body.elements).includes('已根据补充调整'))).toBe(true)
+        const oldWrites = JSON.stringify(calls.filter(call => call.path.startsWith('/cards/card_steering/elements')))
+        const newWrites = JSON.stringify(calls.filter(call => call.path.startsWith(`/cards/${turn.cardId}/elements`)))
+        expect(oldWrites).toContain('提交之后仍未消费的旧任务输出')
+        expect(newWrites).not.toContain('提交之后仍未消费的旧任务输出')
+      } finally { await session.closeTurnCard('测试收尾') }
+    })
+  }
+
+  test('consumption before RPC receipt fences trailing events and closes the replacement exactly once', async () => {
+    const { session, proc, turn } = running()
+    let acknowledge!: (accepted: boolean) => void
+    let inputId = ''
+    proc.steerUserText = (_text: string, _files: string[], id: string) => {
+      inputId = id
+      return new Promise<boolean>(resolve => { acknowledge = resolve })
+    }
+    await session.onUserMessage('arriving at completion')
+    await waitUntil(() => !!acknowledge)
+    proc.emit('user_input_consumed', { inputId })
+    proc.emit('assistant_text', { text: 'reply after the boundary', parentToolUseId: null })
+    proc.emit('assistant_block_stop', { parentToolUseId: null })
+    proc.emit('result', { is_error: false })
+    expect(session.currentTurn).toBe(turn)
+    acknowledge(true)
+    await waitUntil(() => session.currentTurn === null)
+    await session.waitForTurnCloses()
+    expect(sentCards).toHaveLength(1)
+    expect(JSON.stringify(sentCards[0])).toContain('arriving at completion')
+    expect(turn.cardId).not.toBe('card_steering')
+    expect(cardkit.isDisposed('card_steering')).toBe(true)
+    expect(cardkit.isDisposed(turn.cardId)).toBe(true)
+    expect(turn.footerStatusHandle).toBeNull()
+    expect(calls.some(call => call.method === 'POST' && call.path === `/cards/${turn.cardId}/elements`
+      && String(call.body.elements).includes('reply after the boundary'))).toBe(true)
+    expect(proc.sentTexts).toEqual([])
+    expect(session.pendingMidTurnMsgs).toEqual([])
+  })
+
+  test('supplemental waiting reactions clear together when the new card is sent, including consumption before ACK', async () => {
+    const { session, proc, turn } = running()
+    const ids: string[] = []
+    let acknowledge!: (accepted: boolean) => void
+    proc.steerUserText = (_text: string, _files: string[], inputId: string) => {
+      ids.push(inputId)
+      return ids.length === 1 ? new Promise<boolean>(resolve => { acknowledge = resolve }) : Promise.resolve(true)
+    }
+    let releaseSend!: () => void
+    const sendGate = new Promise<void>(resolve => { releaseSend = resolve })
+    let releaseConvert!: () => void
+    const convertGate = new Promise<void>(resolve => { releaseConvert = resolve })
+    let sending = false
+    let converting = false
+    const originalSend = feishu.sendCard
+    const originalConvert = cardkit.convertMessageToCard
+    const send = spyOn(feishu, 'sendCard').mockImplementation(async (...args: Parameters<typeof feishu.sendCard>) => {
+      sending = true
+      await sendGate
+      return originalSend(...args)
+    })
+    const convert = spyOn(cardkit, 'convertMessageToCard').mockImplementation(async (...args: Parameters<typeof cardkit.convertMessageToCard>) => {
+      converting = true
+      await convertGate
+      return originalConvert(...args)
+    })
+    try {
+      await session.onUserMessage('first', [], 'ou_user', 'om_first')
+      proc.emit('user_input_consumed', { inputId: ids[0] })
+      expect(deletedReactions).toEqual([])
+      acknowledge(true)
+      await session.steeringSend
+      expect(deletedReactions).toEqual([])
+      await session.onUserMessage('second', [], 'ou_user', 'om_second')
+      await session.steeringSend
+      proc.emit('user_input_consumed', { inputId: ids[1] })
+      expect([...session.pendingReactionIds.keys()]).toEqual(['om_first', 'om_second'])
+      proc.emit('input_batch_end', { itemId: 'next-reasoning' })
+      await waitUntil(() => sending)
+      expect(sentCards).toEqual([])
+      expect(deletedReactions).toEqual([])
+      await session.onUserMessage('later batch', [], 'ou_user', 'om_later')
+      await session.steeringSend
+      releaseSend()
+      await waitUntil(() => converting)
+      expect(sentCards).toHaveLength(1)
+      // 合并调和:上游替身 addReaction 返回计数式 'reaction_1/2';定型 mock
+      // (feishu-test-mock.ts)为本地形态 `reaction-${messageId}`,断言随定型替身。
+      expect(deletedReactions).toEqual([['om_first', 'reaction-om_first'], ['om_second', 'reaction-om_second']])
+      expect([...session.pendingReactionIds.keys()]).toEqual(['om_later'])
+      // Deletion does not wait for Card Kit setup or the old card's close.
+      expect(turn.cardId).toBe('card_steering')
+      releaseConvert()
+      await waitUntil(() => session.steeringBoundary === null)
+      expect(deletedReactions).toHaveLength(2)
+    } finally {
+      acknowledge?.(true)
+      releaseSend(); releaseConvert()
+      send.mockRestore(); convert.mockRestore()
+      await session.closeTurnCard('测试收尾')
+    }
+  })
+
+  test('late reaction creation stays waiting before card visibility and is removed if it arrives afterwards', async () => {
+    const { session, proc } = running()
+    const ids: string[] = []
+    const created = new Map<string, (reactionId: string) => void>()
+    proc.steerUserText = async (_text: string, _files: string[], inputId: string) => { ids.push(inputId); return true }
+    const reaction = spyOn(feishu, 'addReaction').mockImplementation((msgId: string) => new Promise<string>(resolve => { created.set(msgId, resolve) }))
+    let releaseSend!: () => void
+    const gate = new Promise<void>(resolve => { releaseSend = resolve })
+    const originalSend = feishu.sendCard
+    const send = spyOn(feishu, 'sendCard').mockImplementation(async (...args: Parameters<typeof feishu.sendCard>) => { await gate; return originalSend(...args) })
+    try {
+      for (const msgId of ['om_early', 'om_late']) { await session.onUserMessage(msgId, [], 'ou_user', msgId); await session.steeringSend }
+      for (const inputId of ids) proc.emit('user_input_consumed', { inputId })
+      created.get('om_early')!('rid_early')
+      await waitUntil(() => session.pendingReactionIds.get('om_early') === 'rid_early')
+      expect(deletedReactions).toEqual([])
+      proc.emit('input_batch_end', { itemId: 'next-reasoning' })
+      releaseSend()
+      await waitUntil(() => session.steeringBoundary === null)
+      expect(deletedReactions).toEqual([['om_early', 'rid_early']])
+      created.get('om_late')!('rid_late')
+      await waitUntil(() => deletedReactions.length === 2)
+      expect(deletedReactions).toEqual([['om_early', 'rid_early'], ['om_late', 'rid_late']])
+      expect(session.pendingReactionIds.size).toBe(0)
+    } finally { releaseSend(); send.mockRestore(); reaction.mockRestore(); await session.closeTurnCard('测试收尾') }
+  })
+
+  test('startup input stays pending until turn_started, then steers without waiting for result', async () => {
+    const { session, proc } = running()
+    const sent: string[] = []
+    let nativeActive = false
+    proc.steerUserText = async (text: string) => { if (!nativeActive) return false; sent.push(text); return true }
+    try {
+      await session.onUserMessage('during startup')
+      await session.steeringSend
+      expect(session.pendingMidTurnMsgs).toHaveLength(1)
+      nativeActive = true
+      proc.emit('turn_started', { turn_id: 'active' })
+      await session.steeringSend
+      expect(sent).toEqual(['during startup'])
+      expect(session.pendingMidTurnMsgs).toEqual([])
+      expect(proc.sentTexts).toEqual([])
+    } finally { await session.closeTurnCard('测试收尾') }
+  })
+
+  test('uncertain steering failures are visible and are never replayed after result', async () => {
+    const { session, proc } = running()
+    proc.steerUserText = async () => { throw new Error('turn/steer response lost') }
+    await session.onUserMessage('must execute once')
+    await session.steeringSend
+    expect(sentRawTexts.some(text => text.includes('turn/steer response lost') && text.includes('未自动重发'))).toBe(true)
+    proc.emit('result', { is_error: false })
+    await session.waitForTurnCloses()
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(proc.sentTexts).toEqual([])
+    expect(session.currentTurn).toBeNull()
+  })
+
+  test('messages arriving during a steering request remain ordered and are coalesced once', async () => {
+    const { session, proc } = running()
+    const sent: string[] = []
+    const ids: string[] = []
+    let acknowledge!: (accepted: boolean) => void
+    proc.steerUserText = (text: string, _files: string[], id: string) => {
+      sent.push(text)
+      ids.push(id)
+      return sent.length === 1 ? new Promise<boolean>(resolve => { acknowledge = resolve }) : Promise.resolve(true)
+    }
+    try {
+      await session.onUserMessage('first')
+      await session.onUserMessage('second', ['/tmp/second.txt'])
+      await session.onUserMessage('third')
+      expect(sent).toEqual(['first'])
+      acknowledge(true)
+      await waitUntil(() => session.steeringSend === null && sent.length === 2)
+      expect(sent).toEqual(['first', '[file: /tmp/second.txt]\nsecond\n\nthird'])
+      expect(sentCards).toEqual([])
+      proc.emit('user_input_consumed', { inputId: ids[0] })
+      proc.emit('assistant_text', { text: 'between the inputs', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
+      proc.emit('user_input_consumed', { inputId: ids[1] })
+      proc.emit('assistant_text', { text: 'after the second input', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
+      await waitUntil(() => session.steeringBoundary === null)
+      expect(sentCards).toHaveLength(2)
+      expect(JSON.stringify(sentCards[0])).toContain('first')
+      expect(JSON.stringify(sentCards[1])).toContain('second')
+      expect(JSON.stringify(sentCards[1])).toContain('third')
+      expect(JSON.stringify(sentCards[1])).not.toContain('first')
+    } finally { await session.closeTurnCard('测试收尾') }
+  })
+
+  for (const provider of ['codex', 'claude'] as const) {
+    test(`${provider} combines the consecutive consumed 2–10 messages into one supplemental card`, async () => {
+      const { session, proc, turn } = running(provider)
+      const ids: string[] = []
+      proc.steerUserText = async (_text: string, _files: string[], id: string) => { ids.push(id); return true }
+      try {
+        for (let n = 2; n <= 10; n++) {
+          await session.onUserMessage(String(n))
+          await session.steeringSend
+        }
+        expect(ids).toHaveLength(9)
+        proc.emit('assistant_text', { text: '原消息 1 的回复', parentToolUseId: null })
+        proc.emit('assistant_block_stop', { parentToolUseId: null })
+        for (const inputId of ids) {
+          proc.emit('user_input_consumed', { inputId })
+          // Consumption frames may arrive separately with bookkeeping in
+          // between; neither a timer nor usage traffic defines a new batch.
+          proc.emit('token_usage', { usage: { total_tokens: 1 }, totalUsage: { total_tokens: 1 } })
+          proc.emit('assistant_text', { text: '独立子任务输出', parentToolUseId: 'child-task' })
+          await new Promise(resolve => setTimeout(resolve, 2))
+          expect(sentCards).toEqual([])
+        }
+        if (provider === 'codex') proc.emit('input_batch_end', { itemId: 'reasoning-for-all-inputs' })
+        proc.emit('assistant_text', { text: '收到，测试消息 1–10 均已接收。', parentToolUseId: null })
+        proc.emit('assistant_block_stop', { parentToolUseId: null })
+        await waitUntil(() => session.steeringBoundary === null)
+        await cardkit.flush(turn.cardId)
+        expect(sentCards).toHaveLength(1)
+        const input = (sentCards[0] as any).body.elements[0]
+        expect(input.header.title.content).toBe('📥 追加 (9) #1')
+        expect(input.elements.map((item: any) => item.content)).toEqual(['2', '3', '4', '5', '6', '7', '8', '9', '10'])
+        expect(turn.rotateCount).toBe(1)
+        const newWrites = JSON.stringify(calls.filter(call => call.path.startsWith(`/cards/${turn.cardId}/elements`)))
+        expect(newWrites).toContain('测试消息 1–10 均已接收')
+        expect(newWrites).not.toContain('原消息 1 的回复')
+      } finally { await session.closeTurnCard('测试收尾') }
+    })
+  }
+
+  test('stop releases an input batch waiting for Agent activity without creating a card', async () => {
+    const { session, proc } = running()
+    proc.steerUserText = async () => true
+    await session.onUserMessage('waiting input', [], 'ou_user', 'om_cancelled')
+    await session.steeringSend
+    proc.emit('user_input_consumed', { inputId: [...session.submittedSteering.keys()][0] })
+    expect(session.steeringBoundary.collecting).toBe(true)
+    expect(deletedReactions).toEqual([])
+    await session.runCommand('stop')
+    expect(session.steeringBoundary).toBeNull()
+    expect(session.currentTurn).toBeNull()
+    expect(sentCards).toEqual([])
+    // 定型 mock 反应 id 为 `reaction-${messageId}` 形态(上游为计数式)。
+    expect(deletedReactions).toEqual([['om_cancelled', 'reaction-om_cancelled']])
+  })
+
+  test('consecutive input runs remain separate across native Agent work while a card is opening', async () => {
+    const { session, proc } = running()
+    const ids: string[] = []
+    proc.steerUserText = async (_text: string, _files: string[], inputId: string) => { ids.push(inputId); return true }
+    try {
+      for (let n = 2; n <= 7; n++) { await session.onUserMessage(String(n)); await session.steeringSend }
+      for (const inputId of ids.slice(0, 2)) proc.emit('user_input_consumed', { inputId })
+      proc.emit('input_batch_end', { itemId: 'reasoning-between-input-runs' })
+      for (const inputId of ids.slice(2)) proc.emit('user_input_consumed', { inputId })
+      proc.emit('assistant_text', { text: 'final output', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
+      await waitUntil(() => session.steeringBoundary === null)
+      expect(sentCards).toHaveLength(2)
+      expect(sentCards.map((card: any) => card.body.elements[0].header.title.content)).toEqual(['📥 追加 (2) #1', '📥 追加 (4) #1'])
+      expect(sentCards.map((card: any) => card.body.elements[0].elements.map((item: any) => item.content))).toEqual([['2', '3'], ['4', '5', '6', '7']])
+    } finally { await session.closeTurnCard('测试收尾') }
+  })
+
+  test('stop remains callable during an outstanding receipt and never requeues its message', async () => {
+    const { session, proc } = running()
+    let acknowledge!: (accepted: boolean) => void
+    let interrupted = false
+    proc.steerUserText = () => new Promise<boolean>(resolve => { acknowledge = resolve })
+    proc.sendInterrupt = () => { interrupted = true }
+    await session.onUserMessage('do not restart after stop')
+    const stop = session.runCommand('stop')
+    await waitUntil(() => interrupted)
+    acknowledge(false)
+    await stop
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(proc.sentTexts).toEqual([])
+    expect(session.currentTurn).toBeNull()
+  })
+
+  test('duplicate and unknown consumption events cannot create additional cards', async () => {
+    const { session, proc } = running()
+    proc.steerUserText = async () => true
+    try {
+      await session.onUserMessage('one boundary')
+      await session.steeringSend
+      const inputId = [...session.submittedSteering.keys()][0]
+      proc.emit('user_input_consumed', { inputId: 'unknown' })
+      expect(sentCards).toEqual([])
+      proc.emit('user_input_consumed', { inputId })
+      proc.emit('user_input_consumed', { inputId })
+      proc.emit('input_batch_end', { itemId: 'next-reasoning' })
+      await waitUntil(() => session.steeringBoundary === null)
+      expect(sentCards).toHaveLength(1)
+    } finally { await session.closeTurnCard('测试收尾') }
+  })
+
+  test('a stopped input cannot rotate on a late native consumption notification', async () => {
+    const { session, proc } = running()
+    proc.steerUserText = async () => true
+    await session.onUserMessage('cancel me')
+    await session.steeringSend
+    const inputId = [...session.submittedSteering.keys()][0]
+    await session.runCommand('stop')
+    proc.emit('user_input_consumed', { inputId })
+    expect(session.steeringBoundary).toBeNull()
+    expect(session.submittedSteering.size).toBe(0)
+    expect(sentCards).toEqual([])
+  })
+
+  test('a terminal result without a consumption boundary reports missing confirmation and does not guess a cut', async () => {
+    const { session, proc } = running()
+    proc.steerUserText = async () => true
+    await session.onUserMessage('no receipt')
+    await session.steeringSend
+    proc.emit('result', { is_error: false })
+    await session.waitForTurnCloses()
+    expect(sentCards).toEqual([])
+    expect(session.submittedSteering.size).toBe(0)
+    expect(sentRawTexts.some(text => text.includes('缺少原生处理位置确认'))).toBe(true)
+  })
+
+  test('backends without steering retain the existing next-turn input batch', async () => {
+    const { session, proc } = running('dsh')
+    try {
+      await session.onUserMessage('next task')
+      expect(session.pendingMidTurnMsgs.map((msg: any) => msg.text)).toEqual(['next task'])
+      expect(proc.sentTexts).toEqual([])
+    } finally { session.pendingMidTurnMsgs = []; await session.closeTurnCard('测试收尾') }
+  })
+
+  test('native consumption seals all earlier text and preserves later output across a slow card handoff', async () => {
+    const { session, proc, turn } = running()
+    proc.steerUserText = async () => true
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const originalSend = feishu.sendCard
+    const send = spyOn(feishu, 'sendCard').mockImplementation(async (...args: Parameters<typeof feishu.sendCard>) => {
+      await gate
+      return originalSend(...args)
+    })
+    try {
+      session.appendAssistant('已经完成的前文')
+      session.finalizeCurrentAssistantSegment()
+      await cardkit.flush(turn.cardId)
+      session.appendAssistant('仍在生成的正文')
+      turn.toolByUseId.set('ongoing-read', { i: 0, name: 'Read', input: { file_path: '/tmp/steering.txt' } })
+      turn.toolCount = 1
+      await session.onUserMessage('补充要求')
+      await session.steeringSend
+      expect(sentCards).toEqual([])
+      expect(turn.currentAssistantText).toBe('仍在生成的正文')
+      const inputId = [...session.submittedSteering.keys()][0]
+      proc.emit('user_input_consumed', { inputId })
+      proc.emit('tool_result', { tool_use_id: 'ongoing-read', content: '文件读取结果', is_error: false, parentToolUseId: null })
+      proc.emit('assistant_text', { text: '从补充位置继续', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
+      await Promise.resolve()
+      expect(turn.cardId).toBe('card_steering')
+      expect(turn.toolByUseId.get('ongoing-read').output).toBeUndefined()
+      release()
+      await waitUntil(() => session.steeringBoundary === null)
+      await cardkit.flush(turn.cardId)
+      const newWrites = JSON.stringify(calls.filter(call => call.path.startsWith(`/cards/${turn.cardId}/elements`)))
+      expect(newWrites).toContain('从补充位置继续')
+      expect(newWrites).not.toContain('仍在生成的正文')
+      const oldWrites = JSON.stringify(calls.filter(call => call.path.startsWith('/cards/card_steering/elements')))
+      expect(oldWrites).toContain('仍在生成的正文')
+      expect(oldWrites).not.toContain('从补充位置继续')
+      expect(turn.toolByUseId.get('ongoing-read').output).toBe('文件读取结果')
+      expect(calls.some(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/tool_0`
+        && String(call.body.element).includes('✅'))).toBe(true)
+      expect(newWrites).not.toContain('已经完成的前文')
+    } finally { release(); send.mockRestore(); await session.closeTurnCard('测试收尾') }
+  })
+
+  test('a supplemental card failure reports the accepted input without resending it or starting capacity recovery', async () => {
+    const { session, proc, turn } = running()
+    const steered: string[] = []
+    proc.steerUserText = async (text: string) => { steered.push(text); return true }
+    const sendCard = spyOn(feishu, 'sendCard').mockResolvedValue(null)
+    try {
+      await session.onUserMessage('送达一次即可', [], 'ou_user', 'om_card_failed')
+      await session.steeringSend
+      proc.emit('user_input_consumed', { inputId: [...session.submittedSteering.keys()][0] })
+      proc.emit('input_batch_end', { itemId: 'next-reasoning' })
+      await waitUntil(() => session.steeringBoundary === null)
+      expect(steered).toEqual(['送达一次即可'])
+      expect(turn.cardId).toBe('card_steering')
+      expect(turn.cardRotationFailed).toBe(false)
+      expect(session.pendingMidTurnMsgs).toEqual([])
+      expect(deletedReactions).toEqual([])
+      expect(session.pendingReactionIds.has('om_card_failed')).toBe(true)
+      expect(sentRawTexts.some(text => text.includes('追加消息已交给 Agent，但新卡片发送失败'))).toBe(true)
+    } finally { sendCard.mockRestore(); await session.closeTurnCard('测试收尾') }
+    // 定型 mock 反应 id 为 `reaction-${messageId}` 形态(上游为计数式)。
+    expect(deletedReactions).toEqual([['om_card_failed', 'reaction-om_card_failed']])
+  })
+})
+
+describe('Session cloud file receipts', () => {
+  for (const provider of ['codex', 'claude', 'dsh'] as const) {
+    test(`${provider} BTW uses its workspace mode and updates on the next input while WT stays separate`, async () => {
+      const registry = new GroupFileDelivery({
+        read: () => undefined, write: () => {}, workDirForChat: () => undefined,
+        getChatName: async id => id,
+        createFolder: async name => ({ token: name, url: `https://example.com/${name}` }),
+        getFolder: async folder => ({ ...folder, name: folder.token }),
+        renameFolder: async (folder, name) => ({ ...folder, name }),
+        grantFolderAccess: async () => {},
+      })
+      const mode = spyOn(groupFileDelivery, 'mode').mockImplementation((chatId, workDir) => registry.mode(chatId, workDir))
+      const main = new Session('workspace-modes', 'main')
+      const btw = new Session('workspace-modes*0917-1234', 'btw') as any
+      const wt = new Session('workspace-modes[feature]', 'wt')
+      try {
+        await registry.enable(main.chatId, main.workDir, 'user')
+        expect(btw.getFileDeliveryMode()).toBe('drive')
+        expect(wt.getFileDeliveryMode()).toBe('chat')
+        const proc = new FakeAgentProc(provider)
+        btw.procFileDeliveryModes.set(proc, 'drive')
+        btw.sendClaimedUserText(proc, 'first')
+        await registry.disable(main.chatId, main.workDir)
+        btw.sendClaimedUserText(proc, 'second')
+        btw.sendClaimedUserText(proc, 'third')
+        expect(proc.sentTexts).toEqual(['first', `${fileDeliveryAgentContext('chat')}\n\nsecond`, 'third'])
+      } finally { mode.mockRestore(); main.dispose(); btw.dispose(); wt.dispose() }
+    })
+  }
+
+  test('keeps ordinary file and image messages as the default with no cloud card or upload', () => {
+    const session = new Session('native-files', 'unconfigured-chat') as any
+    const turn = turnState()
+    session.currentTurn = turn
+    session.createFileDeliveryForTurn = () => { throw new Error('cloud delivery must not be used by default') }
+    expect(session.getFileDeliveryMode()).toBe('chat')
+    session.sendOutboundPath('/tmp/report.pdf', 'send marker')
+    session.sendOutboundPath('/tmp/image.png', 'send marker')
+    expect(sentLocalFiles).toEqual([['unconfigured-chat', '/tmp/report.pdf'], ['unconfigured-chat', '/tmp/image.png']])
+    expect(turn.fileDelivery).toBeUndefined()
+    expect(turn.fileDeliveryMode).toBe('chat')
+    expect(sentCards).toHaveLength(0)
+  })
+
+  test('switches only newly admitted batches, so one turn never mixes attachment and cloud delivery', () => {
+    const session = new Session('file-mode-switch', 'chat') as any
+    let mode = 'chat'
+    const cloudPaths: string[] = []
+    session.getFileDeliveryMode = () => mode
+    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
+    session.currentTurn = turnState()
+    session.sendOutboundPath('/tmp/first.pdf', 'send marker')
+    mode = 'drive'
+    session.sendOutboundPath('/tmp/second.pdf', 'send marker')
+    expect(sentLocalFiles.map(([, path]) => path)).toEqual(['/tmp/first.pdf', '/tmp/second.pdf'])
+    expect(cloudPaths).toEqual([])
+    session.currentTurn = turnState()
+    session.sendOutboundPath('/tmp/third.pdf', 'send marker')
+    expect(cloudPaths).toEqual(['/tmp/third.pdf'])
+  })
+
+  test('updates delivery rules only when the group mode changes, without repeating startup rules', () => {
+    const session = new Session('file-mode-context', 'chat') as any
+    const proc = new FakeAgentProc('codex')
+    let mode = 'drive'
+    session.getFileDeliveryMode = () => mode
+    session.procFileDeliveryModes.set(proc, mode)
+    session.sendClaimedUserText(proc, '生成大文件')
+    mode = 'chat'
+    session.sendClaimedUserText(proc, '继续交付')
+    session.sendClaimedUserText(proc, '生成报告')
+    mode = 'drive'
+    session.sendClaimedUserText(proc, '生成视频')
+    expect(proc.sentTexts).toEqual([
+      '生成大文件',
+      `${fileDeliveryAgentContext('chat')}\n\n继续交付`,
+      '生成报告',
+      `${fileDeliveryAgentContext('drive')}\n\n生成视频`,
+    ])
+    expect(proc.sentTexts[3]).not.toMatch(/30|大小|压缩|分卷/)
+  })
+
+  test('freezes delivery before file generation so changing the group switch cannot invalidate the prepared file', () => {
+    const session = new Session('file-mode-preparation', 'chat') as any
+    const proc = new FakeAgentProc('codex')
+    session.proc = proc
+    let mode = 'drive'
+    session.getFileDeliveryMode = () => mode
+    session.procFileDeliveryModes.set(proc, mode)
+    const cloudPaths: string[] = []
+    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
+    session.currentTurn = turnState()
+    session.sendClaimedUserText(proc, '生成视频')
+    mode = 'chat'
+    session.sendOutboundPath('/tmp/video.mp4', 'send marker')
+    expect(cloudPaths).toEqual(['/tmp/video.mp4'])
+    expect(sentLocalFiles).toEqual([])
+    session.currentTurn = turnState()
+    session.sendClaimedUserText(proc, '生成报告')
+    session.sendOutboundPath('/tmp/report.pdf', 'send marker')
+    expect(sentLocalFiles).toEqual([['chat', '/tmp/report.pdf']])
+    expect(proc.sentTexts).toEqual(['生成视频', `${fileDeliveryAgentContext('chat')}\n\n生成报告`])
+  })
+
+  test('keeps the injected delivery mode if the backend opens its card after the group switch changed', () => {
+    const session = new Session('file-mode-late-card', 'chat') as any
+    const proc = new FakeAgentProc('codex')
+    session.proc = proc
+    let mode = 'drive'
+    session.getFileDeliveryMode = () => mode
+    session.procFileDeliveryModes.set(proc, mode)
+    const cloudPaths: string[] = []
+    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
+    session.sendClaimedUserText(proc, '生成视频')
+    mode = 'chat'
+    session.currentTurn = turnState()
+    session.sendOutboundPath('/tmp/late-video.mp4', 'send marker')
+    expect(cloudPaths).toEqual(['/tmp/late-video.mp4'])
+    expect(sentLocalFiles).toEqual([])
+  })
+
+  test('retries a delivery-rule update after the backend rejects its input write', () => {
+    const session = new Session('file-mode-write-error', 'chat') as any
+    const proc = new FakeAgentProc('codex')
+    session.procFileDeliveryModes.set(proc, 'drive')
+    session.getFileDeliveryMode = () => 'chat'
+    const send = proc.sendUserText.bind(proc)
+    proc.sendUserText = () => { throw new Error('input closed') }
+    expect(() => session.sendClaimedUserText(proc, '生成报告')).toThrow('input closed')
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(session.procFileDeliveryModes.get(proc)).toBe('drive')
+    proc.sendUserText = send
+    session.sendClaimedUserText(proc, '生成报告')
+    expect(proc.sentTexts).toEqual([`${fileDeliveryAgentContext('chat')}\n\n生成报告`])
+  })
+
+  test('routes files commands to the current group settings without forwarding them to an Agent', async () => {
+    const session = new Session('file-commands', 'chat') as any
+    const calls: unknown[][] = []
+    session.runFileDeliveryCommand = async (...args: unknown[]) => { calls.push(args) }
+    for (const command of ['files', 'files on', 'FILES OFF']) expect(await session.runCommand(command, 'ou_user')).toBe(true)
+    expect(calls).toEqual([['', 'ou_user'], ['on', 'ou_user'], ['OFF', 'ou_user']])
+  })
+
+  test('keeps one delivery across rotations, deduplicates markers, and waits for final publication', async () => {
+    const session = new Session('files', 'chat_id') as any
+    const turn = turnState('card_file_receipt')
+    turn.fileDeliveryMode = 'drive'
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.currentTurn = turn
+    const admitted: string[] = []
+    let release!: (paths: string[]) => void
+    let finishStarted = false
+    const publication = new Promise<string[]>(resolve => { release = resolve })
+    let factories = 0
+    session.createFileDeliveryForTurn = (captured: any) => {
+      expect(captured.userOpenId).toBe('ou_user')
+      factories++
+      return { add: (path: string) => { admitted.push(path) }, finish: () => { finishStarted = true; return publication } }
+    }
+    session.sendOutboundPath('/tmp/large.mp4', 'send marker')
+    session.sendOutboundPath('/tmp/large.mp4', 'duplicate marker')
+    session.sendOutboundPath('/tmp/report.pdf', 'send marker after rotation')
+    expect(factories).toBe(1)
+    expect(admitted).toEqual(['/tmp/large.mp4', '/tmp/report.pdf'])
+    expect(turn.outboundSentPaths.size).toBe(0)
+    expect(sentLocalFiles).toHaveLength(0)
+    const closed = session.closeTurnCard()
+    await waitUntil(() => finishStarted)
+    expect(cardkit.isDisposed(turn.cardId)).toBe(false)
+    release(['/tmp/large.mp4'])
+    await closed
+    expect(turn.outboundSentPaths.has('/tmp/large.mp4')).toBe(true)
+    expect(turn.outboundSentPaths.has('/tmp/report.pdf')).toBe(false)
+    expect(cardkit.isDisposed(turn.cardId)).toBe(true)
+  })
+
+  test.each([
+    ['codex', 'success'], ['claude', 'success'], ['dsh', 'success'],
+    ['codex', 'error_during_execution'], ['claude', 'error_during_execution'], ['dsh', 'error_during_execution'],
+  ] as const)('%s keeps an upload running when a result hands queued input to a new card (result=%s)', async (provider, subtype) => {
+    const isError = subtype !== 'success'
+    const session = new Session('file-handoff', 'chat_id') as any
+    const proc = new FakeAgentProc(provider)
+    session.proc = proc
+    session.selectedProvider = provider
+    session.selectedEffort = 'high'
+    session.getFileDeliveryMode = () => 'drive'
+    session.procFileDeliveryModes.set(proc, 'drive')
+    session.wireProc(proc)
+    const turn = turnState(`card_file_handoff_${provider}_${isError}`)
+    turn.provider = provider
+    turn.fileDeliveryMode = 'drive'
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const receipts: FileDeliverySnapshot[] = []
+    const errors: string[] = []
+    let uploadSignal: AbortSignal | undefined
+    let release!: () => void
+    const delivery = new FileDeliveryBatch({
+      chatId: 'chat_id', managerOpenId: 'ou_user', projectName: 'file-handoff', createdAt: turn.startedAt,
+    }, {
+      resolveFolder: async () => ({ token: 'folder', url: 'https://example.feishu.cn/drive/folder/folder' }),
+      uploadFile: async (path, _folder, onUploaded, signal) => {
+        uploadSignal = signal
+        await new Promise<void>((resolve, reject) => {
+          release = resolve
+          signal.addEventListener('abort', () => reject(signal.reason), { once: true })
+        })
+        const file = { token: 'video', name: path, bytes: 40 * 1024 * 1024, url: 'https://example.feishu.cn/file/video' }
+        onUploaded(file)
+        return file
+      },
+      sendCard: async snapshot => { receipts.push(structuredClone(snapshot)); return 'om_receipt' },
+      persist: () => {},
+      reportError: async message => { errors.push(message) },
+    })
+    session.createFileDeliveryForTurn = () => delivery
+    session.sendOutboundPath('/tmp/preview.mp4', 'send marker')
+    await waitUntil(() => uploadSignal !== undefined)
+    try {
+      session.pendingMidTurnMsgs = [{
+        text: '继续下一步', wireText: '继续下一步', userOpenId: 'ou_user', msgId: 'om_followup',
+      }]
+      proc.lastResult = { ...proc.lastResult, subtype, is_error: isError }
+      proc.emit('result', { is_error: isError })
+      await waitUntil(() => proc.sentTexts.includes('继续下一步'))
+      const nextTurn = session.currentTurn
+      expect(nextTurn).not.toBeNull()
+      expect(nextTurn).not.toBe(turn)
+      expect(uploadSignal!.aborted).toBe(false)
+      expect(delivery.snapshot.files[0].status).toBe('pending')
+      expect(receipts).toHaveLength(0)
+      expect(cardkit.isDisposed(turn.cardId)).toBe(false)
+      expect(session.fileDeliveries.has(delivery)).toBe(true)
+
+      release()
+      await session.waitForTurnCloses()
+      expect(receipts).toHaveLength(1)
+      expect(receipts[0].files.map(file => file.status)).toEqual(['ready'])
+      expect(receipts[0].error).toBeUndefined()
+      expect(errors).toEqual([])
+      expect(turn.outboundSentPaths.has('/tmp/preview.mp4')).toBe(true)
+      expect(cardkit.isDisposed(turn.cardId)).toBe(true)
+      expect(session.fileDeliveries.size).toBe(0)
+      expect(session.currentTurn).toBe(nextTurn)
+      expect(nextTurn.outboundSentPaths.size).toBe(0)
+      const footer = calls.find(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+      expect(JSON.stringify(footer?.body)).toContain(isError ? '用户已介入' : '📨 转交新卡')
+    } finally {
+      release()
+      await session.waitForTurnCloses()
+      if (session.currentTurn) await session.closeTurnCard()
+    }
+  })
+
+  test.each(['hard', 'soft'])('%s stop cancels file delivery after the agent finished and its turn was captured', async mode => {
+    const session = new Session('closing-files', 'chat_id') as any
+    const turn = turnState('card_closing_files')
+    turn.fileDeliveryMode = 'drive'
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    let finishStarted = false
+    let cancelled = ''
+    let release!: (paths: string[]) => void
+    const published = new Promise<string[]>(resolve => { release = resolve })
+    session.createFileDeliveryForTurn = () => ({
+      add: () => {},
+      finish: () => { finishStarted = true; return published },
+      cancel: (reason: string) => { cancelled = reason; release([]); return true },
+    })
+    session.sendOutboundPath('/tmp/large.mp4', 'send marker')
+    const close = session.closeTurnCard()
+    await waitUntil(() => finishStarted)
+    expect(session.currentTurn).toBeNull()
+    if (mode === 'hard') await session.stop('取消尚未完成的交付', { announce: false })
+    else await session.runCommand('stop', 'ou_user')
+    await close
+    expect(cancelled).toBe(mode === 'hard' ? '取消尚未完成的交付' : '用户停止了任务')
+    expect(cardkit.isDisposed(turn.cardId)).toBe(true)
+    expect(session.fileDeliveries.size).toBe(0)
+  })
+})
+
+describe('generated image delivery', () => {
+  test('card rotation waits for the generated image on the old tool card', async () => {
+    const session = new Session('image-rotation', 'chat_id') as any
+    const oldCardId = 'card_image_rotation_old'
+    const turn = turnState(oldCardId)
+    session.currentTurn = turn
+    cardkit.recordCardCreated(oldCardId, 1)
+    let release!: (key: string) => void
+    setImageUploadHandler(() => new Promise(resolve => { release = resolve }))
+    try {
+      sessionTools.addTool(session, session.proc, 'image-call', 'ImageGeneration', { revisedPrompt: 'Prompt before rotation' })
+      sessionTools.completeTool(session, session.proc, 'image-call', '/tmp/rotated-image.png', false)
+      await cardkit.flush(oldCardId)
+      session.startMidTurnRotate(turn)
+      await waitUntil(() => turn.cardId !== oldCardId)
+      const rotating = turn.rotating
+      expect(rotating).not.toBeNull()
+      release('img_before_rotation')
+      await rotating
+      expect(calls.some(call => call.path === `/cards/${oldCardId}/elements/tool_0` && String(call.body?.element).includes('img_before_rotation'))).toBe(true)
+      expect(sentImages).toEqual([])
+      expect(turn.outboundSentPaths.has('/tmp/rotated-image.png')).toBe(true)
+    } finally {
+      release?.('img_before_rotation')
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(oldCardId); await cardkit.dispose(turn.cardId); session.dispose()
+    }
+  })
+
+  test('renders the completed prompt and picture in the tool fold without a separate image message', async () => {
+    const session = new Session('image-fold', 'chat_id') as any
+    const turn = turnState('card_image_fold')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    try {
+      sessionTools.addTool(session, session.proc, 'image-call', 'ImageGeneration', { status: 'inProgress', prompt: 'Original prompt' })
+      sessionTools.completeTool(session, session.proc, 'image-call', '/tmp/generated.png', false, { status: 'completed', revisedPrompt: 'Actual image prompt' })
+      await sessionTools.waitForImageDeliveries(turn)
+      await cardkit.flush(turn.cardId)
+      const update = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/elements/tool_0')).at(-1)!
+      const element = JSON.parse(update.body.element)
+      expect(element.expanded).toBe(false)
+      expect(element.header.title.content).not.toContain('Actual image prompt')
+      expect(element.elements[0].content).toContain('Original prompt')
+      expect(element.elements[0].content).toContain('Actual image prompt')
+      expect(element.elements[1]).toMatchObject({ tag: 'img', img_key: 'img_generated', preview: true })
+      expect(uploadedImages).toEqual(['/tmp/generated.png'])
+      expect(sentImages).toEqual([])
+      expect(turn.outboundSentPaths.has('/tmp/generated.png')).toBe(true)
+      session.sendOutboundPath('/tmp/generated.png', 'duplicate marker')
+      expect(sentLocalFiles).toEqual([])
+    } finally { session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+
+  test('a rejected inline image uses the already uploaded image as one standalone message', async () => {
+    const session = new Session('image-separate', 'chat_id') as any
+    const turn = turnState('card_image_separate')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const normalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'PUT' && String(init.body).includes('img_generated')) {
+        return Response.json({ code: 200570, msg: 'inline image rejected', error: { log_id: 'inline-image-log' } })
+      }
+      return normalFetch(input, init)
+    }) as typeof fetch
+    try {
+      sessionTools.addTool(session, session.proc, 'image-call', 'ImageGeneration', { revisedPrompt: 'Prompt stays folded' })
+      sessionTools.completeTool(session, session.proc, 'image-call', '/tmp/generated.png', false)
+      await sessionTools.waitForImageDeliveries(turn)
+      expect(sentImages).toEqual([['chat_id', 'img_generated']])
+      expect(uploadedImages).toHaveLength(1)
+      expect(sentLocalFiles).toEqual([])
+      const update = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/elements/tool_0')).at(-1)!
+      expect(JSON.parse(update.body.element).elements[0].content).toContain('图片已单独发送')
+      expect(JSON.parse(update.body.element).elements[0].content).toContain('code=200570 message=inline image rejected log_id=inline-image-log')
+    } finally { globalThis.fetch = normalFetch; session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+
+  test('turn close waits for image delivery before retiring its card', async () => {
+    const session = new Session('image-close', 'chat_id') as any
+    const turn = turnState('card_image_close')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    session.selectedProvider = 'codex'; session.selectedTokenSourceId = null
+    session.currentTokenSource = () => undefined
+    cardkit.recordCardCreated(turn.cardId, 1)
+    let release!: (key: string) => void
+    setImageUploadHandler(() => new Promise(resolve => { release = resolve }))
+    try {
+      sessionTools.addTool(session, session.proc, 'image-call', 'ImageGeneration', { revisedPrompt: 'Delayed image' })
+      sessionTools.completeTool(session, session.proc, 'image-call', '/tmp/delayed.png', false)
+      let closed = false
+      const close = session.closeTurnCard().then(() => { closed = true })
+      await Bun.sleep(10)
+      expect(closed).toBe(false)
+      release('img_delayed')
+      await close
+      expect(closed).toBe(true)
+      expect(turn.outboundSentPaths.has('/tmp/delayed.png')).toBe(true)
+      expect(calls.some(call => call.method === 'PUT' && String(call.body?.element).includes('img_delayed'))).toBe(true)
+      expect(sentImages).toEqual([])
+    } finally { release?.('img_delayed'); await sessionTools.waitForImageDeliveries(turn); session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+
+  test.each([true, false])('image status write failure only notifies when image delivery failed (sent: %s)', async sent => {
+    const session = new Session('image-note-failure', 'chat_id') as any
+    const turn = turnState('card_image_note_failure')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const send = sent ? null : spyOn(feishu, 'sendImage').mockImplementation(async (_chatId, _key, onFailure) => {
+      onFailure?.({ code: 230001, msg: 'image send rejected', error: { log_id: 'image-send-log' } })
+      return null
+    })
+    const normalFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'PUT' && String(input).endsWith('/elements/tool_0')) {
+        const isImage = String(init.body).includes('img_generated')
+        return Response.json({ code: 300121, msg: isImage ? 'image rejected' : 'note rejected',
+          error: { log_id: isImage ? 'image-rejection-log' : 'note-rejection-log' } })
+      }
+      return normalFetch(input, init)
+    }) as typeof fetch
+    try {
+      sessionTools.addTool(session, session.proc, 'image-call', 'ImageGeneration', { revisedPrompt: 'Prompt' })
+      sessionTools.completeTool(session, session.proc, 'image-call', '/tmp/generated.png', false)
+      await sessionTools.waitForImageDeliveries(turn)
+      expect(sentImages).toEqual(sent ? [['chat_id', 'img_generated']] : [])
+      expect(turn.outboundSentPaths.has('/tmp/generated.png')).toBe(sent)
+      expect(sentRawTexts).toHaveLength(0)
+      expect(sentTexts).toHaveLength(sent ? 0 : 1)
+      if (!sent) {
+        expect(sentTexts[0]).toContain('生成图片发送失败')
+        expect(sentTexts[0]).toContain('code=230001 message=image send rejected log_id=image-send-log')
+      }
+    } finally { send?.mockRestore(); globalThis.fetch = normalFetch; session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+
+  test('retains an upload rejection returned through the failure callback', async () => {
+    const session = new Session('image-upload-failure', 'chat_id') as any
+    const turn = turnState('card_image_upload_failure')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const upload = spyOn(feishu, 'uploadImageKey').mockImplementation(async (_path, onFailure) => {
+      onFailure?.({ code: 230001, msg: 'upload rejected', error: { log_id: 'upload-log' } })
+      return null
+    })
+    try {
+      sessionTools.addTool(session, session.proc, 'image-call', 'ImageGeneration', { revisedPrompt: 'Prompt' })
+      sessionTools.completeTool(session, session.proc, 'image-call', '/tmp/generated.png', false)
+      await sessionTools.waitForImageDeliveries(turn)
+      expect(sentLocalFiles).toEqual([['chat_id', '/tmp/generated.png']])
+      const update = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/elements/tool_0')).at(-1)!
+      expect(JSON.parse(update.body.element).elements[0].content).toContain('code=230001 message=upload rejected log_id=upload-log')
+    } finally { upload.mockRestore(); session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+})
+
 describe('Session fresh conversation state', () => {
+  for (const provider of ['codex', 'claude'] as const) {
+    test(`${provider} shows the backend's concrete error in the final card`, async () => {
+      const session = new Session('backend-error-detail', 'chat_id') as any
+      const proc = new FakeAgentProc(provider, 'error-session')
+      const turn = turnState(`card_error_detail_${provider}`)
+      turn.provider = provider
+      turn.userOpenId = ''
+      session.proc = proc
+      session.currentTurn = turn
+      session.footerUsageSuffix = async () => ''
+      session.wireProc(proc)
+      cardkit.recordCardCreated(turn.cardId, 1)
+      proc.lastResult = { ...proc.lastResult, is_error: true, subtype: 'error_during_execution' }
+      try {
+        proc.emit('result', { is_error: true, error: 'Account quota exceeded: request was rejected' })
+        await session.waitForTurnCloses()
+        const footer = calls.find(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+        expect(footer?.body.element).toContain('Account quota exceeded: request was rejected')
+      } finally {
+        session.stopFooterStatus(turn)
+        await cardkit.dispose(turn.cardId)
+      }
+    })
+  }
+
   test('resets visible turn numbering and per-conversation counters', () => {
     const session = new Session('probe', 'chat_id') as any
     session.turnCounter = 7
@@ -7005,17 +8048,25 @@ describe('Session stop/restart kill-unconfirmed alignment (upstream ec149d7 主�
       return originalReset(lease)
     }
 
-    await session.stop('已终止')
+    // 合并调和(取舍):本地旧契约「resolve + ❌ 回执」已并入上游 stop throw
+    // 契约 —— 冻结调用方 session-commands.ts kill 命令 / temp-session-runtime.ts
+    // 均按 rejection 组装「未确认终止/会话已阻断/停止收尾失败」告警(上游
+    // 16923/16992/17062/17110 同断言),resolve 会把告警吞成成功回执。
+    await expect(session.stop('已终止')).rejects.toThrow(
+      'claude process kill timed out after 8000ms',
+    )
 
     expect(proc.killCalls).toBe(1)
     // kill 抛错不得跳过后续确定性清理(上游 stopUnlocked 的 allSettled 语义)。
     expect(resetCalls).toBe(1)
-    // 进程在 kill 前已脱管:isRunning()=false → alive marker 不含它(revive 排除)。
-    expect(session.proc).toBeNull()
-    expect(session.isRunning()).toBe(false)
+    // 停不掉不脱管:进程保留为 blockedProc —— shouldRevive() 据此 false,
+    // alive marker 不含它「revive 排除」语义由 blockedProc 承担,不再经 proc=null
+    // 伪造脱管(上游 16923/17020 同断言)。
+    expect(session.proc).toBe(proc)
+    expect(session.blockedProc).toBe(proc)
+    expect(session.shouldRevive()).toBe(false)
     expect(session.status).toBe('stopped')
-    // 不伪造成功:❌ 回执替代 🔴 终止回执。
-    expect(sentTexts.some(text => text.includes('停止未确认'))).toBe(true)
+    // 不伪造成功:不再发 🔴 终止回执,失败经 rejection 上抛由调用方收口。
     expect(sentTexts.some(text => text.includes('🔴 已终止'))).toBe(false)
   })
 
@@ -7041,7 +8092,12 @@ describe('Session stop/restart kill-unconfirmed alignment (upstream ec149d7 主�
     expect(ok).toBe(false)
     // 上游同语义:stop 未确认不 spawn(同 thread resume 双写风险)。
     expect(spawnCalls).toBe(0)
-    expect(session.proc).toBeNull()
+    // 合并调和(取舍):停不掉不脱管 —— 旧 proc 保留为 blockedProc(上游 17020
+    // 同断言),替代本地旧的「kill 前预置 proc=null」伪脱管;shouldRevive() 据此
+    // 排除 revive,alive marker 语义不变。
+    expect(session.proc).toBe(proc)
+    expect(session.blockedProc).toBe(proc)
+    expect(session.shouldRevive()).toBe(false)
     expect(session.status).toBe('stopped')
   })
 
@@ -7347,7 +8403,81 @@ describe('Session token accounting', () => {
 })
 
 describe('Session assistant rendering', () => {
+  for (const { reason, label, message } of [
+    { reason: undefined, label: '模型满载', message: 'Selected model is at capacity' },
+    { reason: 'capacity', label: '模型满载', message: 'Selected model is at capacity' },
+    { reason: 'stream_disconnected', label: '连接中断', message: 'stream disconnected before completion: An error occurred while processing your request.' },
+    { reason: 'compact_connection_failed', label: '压缩连接中断', message: 'Error running remote compact task: Connection failed: error sending request' },
+    { reason: 'transient_error', label: '服务暂时异常', message: 'Server overloaded, please try again later.' },
+  ] as const) {
+    test(`${reason ?? 'legacy capacity'} backoff keeps the card open, renders retry phases and preserves usage before the retry`, async () => {
+      const session = new Session('retry-card', 'chat_id') as any
+      const proc = new FakeAgentProc('codex', 'retry-thread') as any
+      const turn = turnState('card_retry')
+      session.proc = proc
+      session.currentTurn = turn
+      session.status = 'working'
+      session.wireProc(proc)
+      cardkit.recordCardCreated(turn.cardId, 1)
+      try {
+        proc.lastTotalUsage = { total_tokens: 100, input_tokens: 80, output_tokens: 20 }
+        proc.emit('turn_started', { turn_id: 'original-turn' })
+        proc.lastTotalUsage = { total_tokens: 150, input_tokens: 110, output_tokens: 40 }
+        proc.turnRetry = { phase: 'waiting', attempt: 1, delayMs: 5_000, message, reason }
+        proc.emit('turn_retry', proc.turnRetry)
+        session.startWorkingFooter(turn)
+        await cardkit.flush(turn.cardId)
+        expect(session.status).toBe('working')
+        expect(session.currentTurn).toBe(turn)
+        expect(turn.footerStatusLabel).toBe(`⏳ ${label} · 5s 后重试 #1`)
+        expect(calls.some(call => call.method === 'PUT' && JSON.stringify(call.body).includes(`${label} · 5s 后重试 #1`))).toBe(true)
+
+        proc.turnRetry = { ...proc.turnRetry, phase: 'retrying', delayMs: 0 }
+        proc.emit('turn_retry', proc.turnRetry)
+        session.startWorkingFooter(turn)
+        await cardkit.flush(turn.cardId)
+        expect(turn.footerStatusLabel).toBe(`⏳ ${label} · 正在重试 #1`)
+        await waitUntil(() => calls.some(call => call.method === 'PUT' && JSON.stringify(call.body).includes(`${label} · 正在重试 #1`)))
+
+        proc.turnRetry = null
+        proc.emit('turn_started', { turn_id: 'retry-turn', retry: true })
+        expect(turn.footerStatusLabel).not.toContain(label)
+        expect(turn.footerStatusLabel).not.toContain('重试')
+        proc.lastTotalUsage = { total_tokens: 200, input_tokens: 140, output_tokens: 60 }
+        session.accumulateResultStats()
+        expect(session.lastTurnUsage).toMatchObject({ total_tokens: 100, input_tokens: 60, output_tokens: 40 })
+        expect(session.cumStats.turns).toBe(1)
+      } finally {
+        session.stopFooterStatus(turn)
+        await cardkit.dispose(turn.cardId)
+      }
+    })
+
+    test(`a card opened after ${reason ?? 'legacy capacity'} failure reads the current retry state`, async () => {
+      const session = new Session('retry-card-opening', 'chat_id') as any
+      const proc = new FakeAgentProc('codex', 'retry-thread') as any
+      session.proc = proc
+      session.wireProc(proc)
+      proc.turnRetry = { phase: 'waiting', attempt: 1, delayMs: 5_000, message, reason }
+      proc.emit('turn_retry', proc.turnRetry)
+      const turn = turnState('card_retry_opening')
+      session.currentTurn = turn
+      cardkit.recordCardCreated(turn.cardId, 1)
+      try {
+        session.startThinkingFooter(turn)
+        expect(turn.footerStatusLabel).toBe(`⏳ ${label} · 5s 后重试 #1`)
+      } finally {
+        session.stopFooterStatus(turn)
+        await cardkit.dispose(turn.cardId)
+      }
+    })
+  }
+
   test('buffers assistant deltas and inserts one completed markdown element without content streaming', async () => {
+    // 本测断言 bucket 档位文案；显式钉死模式，隔离本机配置差异。
+    const cfg = config as any
+    const previousRuntime = cfg.runtime
+    cfg.runtime = { ...(previousRuntime ?? {}), live_elapsed: 'bucket' }
     const session = new Session('probe', 'chat_id') as any
     const turn = turnState()
     session.currentTurn = turn
@@ -7363,6 +8493,7 @@ describe('Session assistant rendering', () => {
 
       session.finalizeCurrentAssistantSegment()
       await cardkit.flush(turn.cardId)
+      await waitUntil(() => !turn.footerStatusWriteCardId)
 
       const assistantAdd = calls.find(call =>
         call.method === 'POST' &&
@@ -7382,6 +8513,8 @@ describe('Session assistant rendering', () => {
       expect(calls.some(call => call.path.endsWith('/content'))).toBe(false)
     } finally {
       session.stopFooterStatus(turn)
+      if (previousRuntime === undefined) delete cfg.runtime
+      else cfg.runtime = previousRuntime
       await cardkit.dispose(turn.cardId)
     }
   })
@@ -8187,6 +9320,866 @@ describe('Fixed model selection normalization', () => {
   })
 })
 
+describe('Session automatic context compaction events', () => {
+  test('deduplicates repeated completion for the same compaction item', async () => {
+    const session = new Session('compact-dedupe', 'chat_id') as any
+    const turn = turnState('card_compact_dedupe')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const start = {
+      phase: 'start', threadId: 'thread_1', turnId: 'turn_1', itemId: 'compact_1',
+    }
+    const end = {
+      phase: 'end', threadId: 'thread_1', turnId: 'turn_1', itemId: 'compact_1',
+    }
+
+    try {
+      session.handleContextCompacted(start)
+      session.handleContextCompacted(end)
+      session.handleContextCompacted({ ...end, sourceMethod: 'rawResponseItem/completed' })
+      // Same physical completion through a turn-only surface, then an
+      // anonymous legacy surface, must both be coalesced even before the
+      // first Card Kit write has landed.
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_1', turnId: 'turn_1',
+      })
+      session.handleContextCompacted({ phase: 'event' })
+      await cardkit.flush(turn.cardId)
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_1'))
+
+      expect(turn.contextCompactCount).toBe(1)
+      expect(turn.contextCompactionPending.size).toBe(0)
+      expect(turn.contextCompactionCompleted.has('compact_1')).toBe(true)
+      const compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id === 'context_compact_0'
+      )
+      const compactReplaces = calls.filter(call =>
+        call.method === 'PUT' &&
+        call.path === `/cards/${turn.cardId}/elements/context_compact_0`
+      )
+      expect(compactAdds).toHaveLength(1)
+      expect(compactReplaces).toHaveLength(1)
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('treats a completion delivered after card close as a logged lifecycle event', () => {
+    const session = new Session('compact-after-close', 'chat_id') as any
+
+    session.handleContextCompacted({
+      phase: 'end', threadId: 'thread_closed', turnId: 'turn_closed', itemId: 'compact_closed',
+    })
+
+    expect(sentRawTexts).toHaveLength(0)
+    expect(calls).toHaveLength(0)
+  })
+
+  test('deduplicates generic-turn completion followed by an item completion', async () => {
+    const session = new Session('compact-alias-order', 'chat_id') as any
+    const turn = turnState('card_compact_alias_order')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_alias', turnId: 'turn_alias',
+      })
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_alias', turnId: 'turn_alias', itemId: 'compact_alias',
+      })
+      await cardkit.flush(turn.cardId)
+      await waitUntil(() => turn.contextCompactionCompleted.has('turn_alias'))
+
+      expect(turn.contextCompactCount).toBe(1)
+      let compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )
+      expect(compactAdds).toHaveLength(1)
+      // Once compact_alias claimed the generic turn receipt, a different
+      // explicit item in the same turn must remain a new compaction.
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_alias', turnId: 'turn_alias', itemId: 'compact_alias_b',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_alias_b'))
+      compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )
+      expect(compactAdds).toHaveLength(2)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('deduplicates an anonymous completion followed by an identified alias', async () => {
+    const session = new Session('compact-anonymous-alias', 'chat_id') as any
+    const turn = turnState('card_compact_anonymous_alias')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({ phase: 'event' })
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_anon', turnId: 'turn_anon', itemId: 'compact_anon',
+      })
+      await cardkit.flush(turn.cardId)
+      await waitUntil(() => turn.lastContextCompactionWasAnonymous)
+
+      expect(turn.contextCompactCount).toBe(1)
+      const compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )
+      expect(compactAdds).toHaveLength(1)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('a distinct explicit item in the same backend turn is not swallowed by the turn alias', async () => {
+    const session = new Session('compact-distinct-items', 'chat_id') as any
+    const turn = turnState('card_compact_distinct_items')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_shared', turnId: 'turn_shared', itemId: 'compact_item_a',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_item_a'))
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_shared', turnId: 'turn_shared', itemId: 'compact_item_b',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_item_b'))
+
+      expect(turn.contextCompactCount).toBe(2)
+      const compactAdds = calls.filter(call =>
+        call.method === 'POST' &&
+        call.path === `/cards/${turn.cardId}/elements` &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )
+      expect(compactAdds).toHaveLength(2)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('an explicit unmatched item completion does not consume another pending item', async () => {
+    const session = new Session('compact-item-owner', 'chat_id') as any
+    const turn = turnState('card_compact_item_owner')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({
+        phase: 'start', threadId: 'thread_items', turnId: 'turn_items', itemId: 'compact_a',
+      })
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_items', turnId: 'turn_items', itemId: 'compact_b',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_b'))
+
+      expect(turn.contextCompactionPending.has('compact_a')).toBe(true)
+      expect(turn.contextCompactCount).toBe(2)
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_items', turnId: 'turn_items', itemId: 'compact_a',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_a'))
+      expect(turn.contextCompactionPending.size).toBe(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('does not attach an old turn compaction completion to a newer turn', async () => {
+    const session = new Session('compact-owner', 'chat_id') as any
+    const oldTurn = turnState('card_compact_owner_old')
+    oldTurn.userOpenId = ''
+    session.currentTurn = oldTurn
+    cardkit.recordCardCreated(oldTurn.cardId, 1)
+    session.handleContextCompacted({
+      phase: 'start', threadId: 'thread_owner', turnId: 'turn_old', itemId: 'compact_owner',
+    })
+    await cardkit.flush(oldTurn.cardId)
+
+    const newTurn = turnState('card_compact_owner_new')
+    newTurn.userOpenId = ''
+    session.currentTurn = newTurn
+    cardkit.recordCardCreated(newTurn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_owner', turnId: 'turn_old', itemId: 'compact_owner',
+      })
+      await cardkit.flush(newTurn.cardId)
+
+      expect(newTurn.contextCompactCount).toBe(0)
+      expect(newTurn.contextCompactionPending.size).toBe(0)
+      expect(calls.some(call =>
+        call.path === `/cards/${newTurn.cardId}/elements` &&
+        call.method === 'POST' &&
+        JSON.parse(call.body.elements)[0]?.element_id?.startsWith('context_compact_')
+      )).toBe(false)
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(oldTurn)
+      session.stopFooterStatus(newTurn)
+      await cardkit.dispose(oldTurn.cardId)
+      await cardkit.dispose(newTurn.cardId)
+    }
+  })
+
+  test('buffers compaction events while the conversation card is opening', async () => {
+    const session = new Session('compact-open-window', 'chat_id') as any
+    session.pendingTurnInputs = ['hello']
+    const owner = session.beginTurnOpen(null, 0, true)
+    let signalConvertStarted: () => void = () => {}
+    const convertStarted = new Promise<void>(resolve => { signalConvertStarted = resolve })
+    let releaseConvert: () => void = () => {}
+    const convertGate = new Promise<void>(resolve => { releaseConvert = resolve })
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (path === '/cards/id_convert') {
+        signalConvertStarted()
+        await convertGate
+        return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_compact_opened' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    const opening = session.openTurnCard(owner, '', 'user_message')
+    await convertStarted
+    session.handleContextCompacted({
+      phase: 'start', threadId: 'thread_open', turnId: 'turn_open', itemId: 'compact_open',
+    })
+    session.handleContextCompacted({
+      phase: 'end', threadId: 'thread_open', turnId: 'turn_open', itemId: 'compact_open',
+    })
+    expect(owner.pendingCompactions).toHaveLength(2)
+
+    let turn: any = null
+    try {
+      releaseConvert()
+      turn = await opening
+      expect(turn?.cardId).toBe('card_compact_opened')
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_open'))
+      expect(turn.contextCompactCount).toBe(1)
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      releaseConvert()
+      session.releaseTurnOpen(owner)
+      if (turn) {
+        session.stopFooterStatus(turn)
+        await cardkit.dispose(turn.cardId)
+      }
+    }
+  })
+
+  test('an eager pre-input card open does not claim a late prior-turn compaction', () => {
+    const session = new Session('compact-eager-open', 'chat_id') as any
+    const owner = session.beginTurnOpen(null, 0, false)
+
+    session.handleContextCompacted({
+      phase: 'end', threadId: 'thread_prior', turnId: 'turn_prior', itemId: 'compact_prior',
+    })
+
+    expect(owner.pendingCompactions).toHaveLength(0)
+    expect(sentRawTexts).toHaveLength(0)
+    session.releaseTurnOpen(owner)
+  })
+
+  test('manual compact completion never leaks into a newly opened turn', async () => {
+    const session = new Session('compact-manual-owner', 'chat_id') as any
+    const turn = turnState('card_compact_manual_owner')
+    session.currentTurn = turn
+    session.manualContextCompactionPending = true
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_manual', turnId: 'turn_manual', itemId: 'compact_manual',
+      })
+      session.manualContextCompactionPending = false
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_manual', turnId: 'turn_manual',
+      })
+      session.handleContextCompacted({ phase: 'event' })
+
+      expect(turn.contextCompactCount).toBe(0)
+      expect(turn.contextCompactionPending.size).toBe(0)
+      expect(calls).toHaveLength(0)
+    } finally {
+      session.manualContextCompactionPending = false
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('an anonymous manual completion tombstones an immediate identified alias', async () => {
+    const session = new Session('compact-manual-anonymous', 'chat_id') as any
+    const turn = turnState('card_compact_manual_anonymous')
+    session.currentTurn = turn
+    session.manualContextCompactionPending = true
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    try {
+      session.handleContextCompacted({ phase: 'event' })
+      session.manualContextCompactionPending = false
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_manual_alias', turnId: 'turn_manual_alias', itemId: 'compact_manual_alias',
+      })
+      expect(turn.contextCompactCount).toBe(0)
+      expect(calls).toHaveLength(0)
+    } finally {
+      session.manualContextCompactionPending = false
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('moves an in-progress compaction panel to the replacement card', async () => {
+    const session = new Session('compact-rotate', 'chat_id') as any
+    const turn = turnState('card_compact_old')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      const data = path === '/cards/id_convert' ? { card_id: 'card_compact_new' } : {}
+      return new Response(JSON.stringify({ code: 0, data }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.handleContextCompacted({
+        phase: 'start', threadId: 'thread_2', turnId: 'turn_2', itemId: 'compact_2',
+      })
+      await cardkit.flush(turn.cardId)
+      session.startMidTurnRotate(turn)
+      await turn.rotating
+
+      expect(turn.cardId).toBe('card_compact_new')
+      expect(turn.contextCompactionPending.get('compact_2')?.cardId).toBe('card_compact_new')
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_2', turnId: 'turn_2', itemId: 'compact_2',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_2'))
+      await cardkit.flush(turn.cardId)
+
+      expect(calls.some(call =>
+        call.method === 'POST' &&
+        call.path === '/cards/card_compact_new/elements' &&
+        JSON.parse(call.body.elements)[0]?.element_id === 'context_compact_0'
+      )).toBe(true)
+      expect(calls.some(call =>
+        call.method === 'PUT' &&
+        call.path === '/cards/card_compact_new/elements/context_compact_0'
+      )).toBe(true)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('commits completion receipts only after Card Kit lands and allows retry after MISS', async () => {
+    const session = new Session('compact-write-retry', 'chat_id') as any
+    const turn = turnState('card_compact_write_retry')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure(turn.cardId, code, failure)
+    })
+    let rejectCompletion = true
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (
+        rejectCompletion &&
+        method === 'PUT' &&
+        path === `/cards/${turn.cardId}/elements/context_compact_0`
+      ) {
+        return new Response(JSON.stringify({ code: 300121, msg: 'temporary replace reject' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+    const start = {
+      phase: 'start', threadId: 'thread_retry', turnId: 'turn_retry', itemId: 'compact_retry',
+    }
+    const end = {
+      phase: 'end', threadId: 'thread_retry', turnId: 'turn_retry', itemId: 'compact_retry',
+    }
+
+    try {
+      session.handleContextCompacted(start)
+      session.handleContextCompacted(end)
+      await waitUntil(() => !turn.contextCompactionCompleting.has('compact_retry'))
+      expect(turn.contextCompactionPending.has('compact_retry')).toBe(true)
+      expect(turn.contextCompactionCompleted.has('compact_retry')).toBe(false)
+
+      rejectCompletion = false
+      session.handleContextCompacted(end)
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_retry'))
+      expect(turn.contextCompactionPending.size).toBe(0)
+      const completionPuts = calls.filter(call =>
+        call.method === 'PUT' &&
+        call.path === `/cards/${turn.cardId}/elements/context_compact_0`
+      )
+      expect(completionPuts).toHaveLength(2)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('a capacity failure while completing automatically retries on the replacement card', async () => {
+    const session = new Session('compact-capacity-rotate', 'chat_id') as any
+    const turn = turnState('card_compact_capacity_old')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure(turn.cardId, code, failure)
+    })
+    let rejectOldCompletion = true
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (path === '/cards/id_convert') {
+        return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_compact_capacity_new' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (
+        rejectOldCompletion &&
+        method === 'PUT' &&
+        path === '/cards/card_compact_capacity_old/elements/context_compact_0'
+      ) {
+        rejectOldCompletion = false
+        return new Response(JSON.stringify({ code: 300305, msg: 'number of card components exceeds 200' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.handleContextCompacted({
+        phase: 'start', threadId: 'thread_capacity', turnId: 'turn_capacity', itemId: 'compact_capacity',
+      })
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_capacity', turnId: 'turn_capacity', itemId: 'compact_capacity',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_capacity'))
+
+      expect(turn.cardId).toBe('card_compact_capacity_new')
+      expect(turn.rotateCount).toBe(1)
+      expect(turn.failureRotateCount).toBe(1)
+      expect(calls.some(call =>
+        call.method === 'PUT' &&
+        call.path === '/cards/card_compact_capacity_new/elements/context_compact_0'
+      )).toBe(true)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  for (const withStart of [false, true]) {
+    test(`an oversized compaction completion stops retrying unchanged content without blocking later output (start=${withStart})`, async () => {
+      const session = new Session('compact-oversized', 'chat_id') as any
+      const turn = turnState('card_compact_oversized_0')
+      turn.userOpenId = ''
+      session.currentTurn = turn
+      let replacementCount = 0
+      cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+        session.onCardWriteFailure('card_compact_oversized_0', code, failure)
+      })
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+        const body = init?.body ? JSON.parse(String(init.body)) : null
+        calls.push({ method: String(init?.method ?? 'GET'), path, body })
+        const response = path === '/cards/id_convert'
+          ? { code: 0, data: { card_id: `card_compact_oversized_${++replacementCount}` } }
+          : String(body?.element ?? body?.elements).includes('✅ 🚨 上下文压缩')
+            ? { code: 200860, msg: 'card over max size' }
+            : { code: 0, data: {} }
+        return new Response(JSON.stringify(response), { headers: { 'Content-Type': 'application/json' } })
+      }) as typeof fetch
+      const notice = { threadId: 'thread_oversized', turnId: 'turn_oversized', itemId: 'compact_oversized' }
+      try {
+        if (withStart) session.handleContextCompacted({ ...notice, phase: 'start' })
+        session.handleContextCompacted({ ...notice, phase: 'end' })
+        await waitUntil(() => !turn.contextCompactionCompleting.has('compact_oversized') && !turn.rotating)
+        expect(replacementCount).toBe(1)
+        expect(turn.contextCompactionCompleted.has('compact_oversized')).toBe(false)
+        expect(turn.cardRotationFailed).toBe(false)
+        expect(sentRawTexts).toHaveLength(1)
+        expect(sentRawTexts[0]).toContain('换卡后仍超出飞书容量，写入失败')
+        expect(sentRawTexts[0]).toContain('message=card over max size')
+        expect(sentRawTexts[0]).toContain('log_id=MISS')
+        expect(await cardkit.addElementChecked(turn.cardId, {
+          tag: 'markdown', element_id: 'later_output', content: '后续回复仍可写入',
+        })).toBe(true)
+      } finally {
+        if (turn.rotating) await turn.rotating
+        session.stopFooterStatus(turn)
+        for (let i = 0; i <= replacementCount; i++) await cardkit.dispose(`card_compact_oversized_${i}`)
+      }
+    })
+  }
+
+  test('a duplicate start-panel add reconciles with a terminal replace', async () => {
+    const session = new Session('compact-start-add-retry', 'chat_id') as any
+    const turn = turnState('card_compact_start_add_retry')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure(turn.cardId, code, failure)
+    })
+    let compactAddAttempt = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      const addedElement = method === 'POST' && path === `/cards/${turn.cardId}/elements`
+        ? JSON.parse(calls.at(-1)?.body.elements ?? '[]')[0]
+        : null
+      if (addedElement?.element_id === 'context_compact_0' && ++compactAddAttempt === 1) {
+        return new Response(JSON.stringify({ code: 300315, msg: 'Duplicate ID; code: 300301' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.handleContextCompacted({
+        phase: 'start', threadId: 'thread_add_retry', turnId: 'turn_add_retry', itemId: 'compact_add_retry',
+      })
+      session.handleContextCompacted({
+        phase: 'end', threadId: 'thread_add_retry', turnId: 'turn_add_retry', itemId: 'compact_add_retry',
+      })
+      await waitUntil(() => turn.contextCompactionCompleted.has('compact_add_retry'))
+
+      expect(compactAddAttempt).toBe(1)
+      expect(calls.some(call =>
+        call.method === 'PUT' &&
+        call.path.endsWith('/elements/context_compact_0')
+      )).toBe(true)
+      expect(turn.contextCompactionPending.size).toBe(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+})
+
+describe('Session model settings completion', () => {
+  let previousSources: ReturnType<typeof listTokenSources>
+  beforeEach(() => { previousSources = listTokenSources() })
+  afterEach(() => {
+    resetTokenSourceRegistry()
+    for (const source of previousSources) registerTokenSource(source)
+  })
+
+  function setup(provider: 'claude' | 'dsh' | 'codex' = 'claude') {
+    const sourceId = `settings-${provider}`
+    registerTokenSource({ id: sourceId, kind: 'test', agent: provider, display: sourceId, enabled: true,
+      models: ['review-before', 'review-after'].map(model => ({ model, display: model,
+        efforts: ['high', 'max'], defaultEffort: 'high' })),
+      defaultModel: 'review-before', modelCatalogState: { status: 'ready', updatedAt: 1 },
+      refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    })
+    const session = new Session(`settings-${provider}`, 'chat_id') as any
+    const proc = new FakeAgentProc(provider, 'settings-session', sourceId)
+    proc.lastModel = 'review-before'; proc.lastEffort = 'high'
+    Object.assign(session, { proc, selectedProvider: provider, selectedTokenSourceId: sourceId,
+      selectedModel: 'review-before', selectedEffort: 'high', initCount: 1 })
+    session.modelPanels.set('settings', { models: ['review-before', 'review-after'].map(model => ({
+      provider, sourceId, model, displayName: model, efforts: [{ effort: 'high' }, { effort: 'max' }],
+    })) })
+    return { session, proc, sourceId }
+  }
+
+  function deferUpdate(proc: FakeAgentProc) {
+    let release!: () => void
+    let reject!: (error: Error) => void
+    const gate = new Promise<void>((resolve, fail) => { release = resolve; reject = fail })
+    proc.setModelSettings = async (model, effort) => {
+      proc.setModelSettingsCalls.push([model, effort])
+      await gate
+      proc.lastModel = model; proc.lastEffort = effort
+    }
+    const original = globalThis.setTimeout
+    const timer = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: any, ms: number, ...args: any[]) =>
+      original(callback, ms === 20_000 ? 5 : ms, ...args)) as any)
+    return { release, reject, restore: () => { timer.mockRestore(); release() } }
+  }
+
+  test.each(['claude', 'dsh'] as const)('busy %s keeps the late acknowledgement and prevents overlapping selections', async provider => {
+    const { session, proc } = setup(provider)
+    session.currentTurn = { ...turnState(), provider }
+    const deferred = deferUpdate(proc)
+    const save = spyOn(feishu, 'bindSessionModelChecked')
+    const model = provider === 'claude' ? 'review-before' : 'review-after'
+    try {
+      const pending = await session.onModelEffortSelect(model, 'max', 'settings', '', provider)
+      expect(pending.pending).toBe(true)
+      expect(pending.message).toContain('尚不能判断')
+      expect(JSON.stringify(pending.card)).not.toContain('选择已保存')
+      expect(save).not.toHaveBeenCalled()
+      expect(session.selectedEffort).toBe('high')
+      expect((await session.onModelEffortSelect('review-before', 'high', 'settings', '', provider)).message).toContain('本次选择未执行')
+      await session.onUserMessage('new input while settings are unknown')
+      expect(proc.sentTexts).toEqual([])
+      expect(sentTexts.join('\n')).toContain('本条消息未送给 Agent')
+      deferred.release()
+      expect((await pending.completion).ok).toBe(true)
+      expect(session.selectedModel).toBe(model)
+      expect(session.selectedEffort).toBe('max')
+      expect(save).toHaveBeenCalledTimes(1)
+      expect(session.modelSettingsChange).toBeNull()
+      expect(proc.setModelSettingsCalls).toHaveLength(1)
+    } finally { deferred.restore(); save.mockRestore(); session.dispose() }
+  })
+
+  test('soft stop interrupts the task without claiming an uncancellable model update was cancelled', async () => {
+    const { session, proc } = setup('dsh')
+    session.currentTurn = { ...turnState(), provider: 'dsh' }
+    const interrupt = spyOn(proc, 'sendInterrupt')
+    const deferred = deferUpdate(proc)
+    try {
+      const pending = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'dsh')
+      expect(await session.runCommand('stop')).toBe(true)
+      expect(interrupt).toHaveBeenCalledTimes(1)
+      expect(proc.isAlive()).toBe(true)
+      expect(session.modelSettingsChange.phase).toBe('pending')
+      expect(session.selectedModel).toBe('review-before')
+      deferred.release()
+      expect((await pending.completion).ok).toBe(true)
+      expect(session.selectedModel).toBe('review-after')
+    } finally { deferred.restore(); interrupt.mockRestore(); session.dispose() }
+  })
+
+  test('process stop cancels the pending selection and ignores an old process acknowledgement', async () => {
+    const { session, proc } = setup()
+    const deferred = deferUpdate(proc)
+    const save = spyOn(feishu, 'bindSessionModelChecked')
+    try {
+      const pending = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      expect(pending.pending).toBe(true)
+      await session.stop('test stop', { announce: false })
+      const replacement = new FakeAgentProc('claude', 'new-session', proc.tokenSourceId)
+      session.proc = replacement
+      deferred.release()
+      const result = await pending.completion
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('原进程正在停止')
+      expect(save).not.toHaveBeenCalled()
+      expect(session.selectedModel).toBe('review-before')
+      expect(session.proc).toBe(replacement)
+    } finally { deferred.restore(); save.mockRestore(); session.dispose() }
+  })
+
+  test('shutdown settles an unanswered model update before draining card actions', async () => {
+    const { session, proc } = setup()
+    const deferred = deferUpdate(proc)
+    try {
+      const pending = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      session.closeModelSettingsChanges()
+      expect((await pending.completion).message).toContain('daemon 正在停止')
+      expect(session.selectedModel).toBe('review-before')
+      expect((await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')).message).toContain('本次模型选择未执行')
+      expect(proc.setModelSettingsCalls).toHaveLength(1)
+    } finally { deferred.restore(); session.dispose() }
+  })
+
+  test('a late rejection remains visible and reselecting the saved model actually reapplies it', async () => {
+    const { session, proc } = setup()
+    const deferred = deferUpdate(proc)
+    try {
+      const pending = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      deferred.reject(new Error('backend control rejected'))
+      const result = await pending.completion
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('backend control rejected')
+      expect(session.currentModelLabel()).toBeNull()
+      expect(session.currentEffortLabel()).toBeNull()
+      await session.onUserMessage('must not reach an unconfirmed model')
+      expect(proc.sentTexts).toEqual([])
+      proc.setModelSettings = FakeAgentProc.prototype.setModelSettings.bind(proc)
+      const retry = await session.onModelEffortSelect('review-before', 'high', 'settings', '', 'claude')
+      expect(retry.ok).toBe(true)
+      expect(retry.message).not.toContain('当前已是')
+      expect(proc.setModelSettingsCalls.at(-1)).toEqual(['review-before', 'high'])
+      expect(session.modelSettingsChange).toBeNull()
+    } finally { deferred.restore(); session.dispose() }
+  })
+
+  test('partial Claude success shows the confirmed model and MISS effort until a successful retry', async () => {
+    const { session, sourceId } = setup()
+    const proc = new ClaudeAgentProcess({ workDir: session.workDir, tokenSourceId: sourceId,
+      model: 'review-before', effort: 'high' }) as any
+    session.proc = proc
+    proc.started = true
+    let actualModel = 'review-before'
+    proc.query = { setModel: async (model: string) => { actualModel = model },
+      applyFlagSettings: async () => { throw new Error('flag settings rejected') } }
+    const save = spyOn(feishu, 'bindSessionModelChecked')
+    try {
+      const failed = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      expect(failed.ok).toBe(false)
+      expect(failed.message).toContain('模型已切换为 review-after')
+      expect(failed.message).toContain('思考档位未确认')
+      expect(failed.message).toContain('flag settings rejected')
+      expect(actualModel).toBe('review-after')
+      expect(session.currentModelLabel()).toBe('review-after')
+      expect(session.currentEffortLabel()).toBeNull()
+      // 合并调和(取舍):合并 runtimeModelSelection 为本地/上游合成形态,返回
+      // {provider, model, effort, usageSource} 四字段;官方 Claude 档无第三方
+      // 额度源 → usageSource 'not_applicable'(usageSourceForAgent 的既有口径)。
+      expect(session.runtimeModelSelection()).toEqual({ provider: 'claude', model: 'review-after', effort: null, usageSource: 'not_applicable' })
+      expect(save).not.toHaveBeenCalled()
+      expect(session.selectedModel).toBe('review-before')
+      proc.query.applyFlagSettings = async () => {}
+      const retry = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      expect(retry.ok).toBe(true)
+      expect(session.currentEffortLabel()).toBe('max')
+      expect(session.selectedModel).toBe('review-after')
+      expect(save).toHaveBeenCalledTimes(1)
+    } finally { save.mockRestore(); session.dispose() }
+  })
+
+  test('persistence failure after backend success preserves the confirmed runtime settings', async () => {
+    const { session, proc } = setup()
+    proc.setModelSettings = async (model, effort) => { proc.lastModel = model; proc.lastEffort = effort }
+    const save = spyOn(feishu, 'bindSessionModelChecked').mockImplementation(() => { throw new Error('model fsync failed') })
+    try {
+      const result = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('模型和思考档位已应用，但保存选择失败')
+      expect(result.message).toContain('model fsync failed')
+      expect(session.selectedModel).toBe('review-before')
+      // 合并调和(取舍):四字段形态(含 usageSource);官方 Claude 档 → 'not_applicable'。
+      expect(session.runtimeModelSelection()).toEqual({ provider: 'claude', model: 'review-after', effort: 'max', usageSource: 'not_applicable' })
+      save.mockImplementation(() => {})
+      expect((await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')).ok).toBe(true)
+      expect(session.selectedModel).toBe('review-after')
+      expect(session.modelSettingsChange).toBeNull()
+    } finally { save.mockRestore(); session.dispose() }
+  })
+
+  test('source configuration changes during confirmation cannot silently stop a process or save a stale selection', async () => {
+    const { session, proc, sourceId } = setup()
+    const source = getTokenSource(sourceId)!
+    source.spawnRevision = 'before'
+    session.procSourceRevisions.set(proc, tokenSourceProcessRevision(source, 'review-before'))
+    const deferred = deferUpdate(proc)
+    const save = spyOn(feishu, 'bindSessionModelChecked')
+    try {
+      const pending = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'claude')
+      source.spawnRevision = 'changed'
+      deferred.release()
+      const result = await pending.completion
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('进程账号配置已变化')
+      expect(proc.killCalls).toBe(0)
+      expect(save).not.toHaveBeenCalled()
+      expect(session.selectedModel).toBe('review-before')
+      expect(session.currentModelLabel()).toBe('review-after')
+    } finally { deferred.restore(); save.mockRestore(); session.dispose() }
+  })
+
+  test('queued input waits for model confirmation and resumes once using the selected model', async () => {
+    const { session, proc } = setup('dsh')
+    const deferred = deferUpdate(proc)
+    session.currentTurn = { ...turnState(), provider: 'dsh' }
+    session.pendingMidTurnMsgs.push({ text: 'queued request', wireText: 'queued request', userOpenId: 'ou_user', msgId: '' })
+    try {
+      const pending = await session.onModelEffortSelect('review-after', 'max', 'settings', '', 'dsh')
+      session.currentTurn = null
+      await session.drainMidTurnAndOpen()
+      expect(session.pendingMidTurnMsgs).toHaveLength(1)
+      expect(proc.sentTexts).toEqual([])
+      deferred.release()
+      expect((await pending.completion).ok).toBe(true)
+      await waitUntil(() => proc.sentTexts.length === 1)
+      expect(proc.sentTexts[0]).toContain('queued request')
+      expect(session.currentTurn.model).toBe('review-after')
+      expect(session.pendingMidTurnMsgs).toEqual([])
+    } finally {
+      deferred.restore()
+      if (session.currentTurn) await session.closeTurnCard()
+      session.dispose()
+    }
+  })
+
+  test('busy Codex selection accurately says restart is required', async () => {
+    const { session } = setup('codex')
+    session.currentTurn = turnState()
+    try {
+      const result = await session.onModelEffortSelect('review-after', 'high', 'settings', '', 'codex')
+      expect(result.ok).toBe(true)
+      expect(JSON.stringify(result.card)).toContain('需重启进程生效')
+      expect(JSON.stringify(result.card)).not.toContain('后续新 turn 使用')
+    } finally { session.dispose() }
+  })
+
+  test('Codex persistence failure cannot claim that the running model was already changed', async () => {
+    const { session } = setup('codex')
+    session.currentTurn = turnState()
+    const save = spyOn(feishu, 'bindSessionModelChecked').mockImplementation(() => { throw new Error('model fsync failed') })
+    try {
+      const result = await session.onModelEffortSelect('review-after', 'high', 'settings', '', 'codex')
+      expect(result).toMatchObject({ ok: false, message: '模型切换失败: model fsync failed' })
+      expect(session.selectedModel).toBe('review-before')
+      // 合并调和(取舍):四字段形态(含 usageSource);codex 恒 'codex'。
+      expect(session.runtimeModelSelection()).toEqual({ provider: 'codex', model: 'review-before', effort: 'high', usageSource: 'codex' })
+      expect(session.modelSettingsChange).toBeNull()
+    } finally { save.mockRestore(); session.dispose() }
+  })
+})
+
 describe('Session provider switching', () => {
   function installSuccessfulIdleRebuild(session: any): any[] {
     const restartCalls: any[] = []
@@ -8200,6 +10193,22 @@ describe('Session provider switching', () => {
     }
     return restartCalls
   }
+
+  beforeAll(() => {
+    buildTokenSourcesFromConfig()
+    // 切换用例从目录刷新成功后开始；只准备测试数据，不访问真实账号。
+    const glm = getTokenSource('glm')!
+    glm.enabled = true
+    glm.models = [{ model: 'GLM-5.2', display: 'GLM-5.2', efforts: ['max'], defaultEffort: 'max' }]
+    glm.defaultModel = 'GLM-5.2'
+    glm.modelCatalogState = { status: 'ready', updatedAt: 1 }
+    const deepseek = getTokenSource('deepseek')!
+    deepseek.enabled = true
+    deepseek.models = [{ model: 'deepseek-v4-pro', display: 'DeepSeek V4 Pro', efforts: ['high'], defaultEffort: 'high' }]
+    deepseek.defaultModel = 'deepseek-v4-pro'
+    deepseek.modelCatalogState = { status: 'ready', updatedAt: 1 }
+  })
+  afterAll(() => resetTokenSourceRegistry())
 
   test('uses provider-specific ask instructions', () => {
     const session = new Session('probe', 'chat_id') as any
@@ -8233,10 +10242,159 @@ describe('Session provider switching', () => {
     session.selectedProvider = 'claude'
     session.lastSessionId = 'claude-session-1'
 
-    session.persistResumableSessionId(proc)
+    // 合并调和(取舍):persist 签名为上游 (fatal, proc, notify),显式 proc 走第二参数。
+    session.persistResumableSessionId(false, proc)
 
     expect(boundResumes).toEqual([['probe', 'codex-thread-1', 'codex']])
     expect(session.lastSessionId).toBe('claude-session-1')
+  })
+
+  test('fresh Codex init clears the old binding but never persists its unmaterialized thread id', () => {
+    const session = new Session('codex-fresh-init', 'chat_id') as any
+    const oldRef = { provider: 'codex' as const, sessionId: 'old-thread', cwd: session.workDir }
+    resumeRefs.set(`${session.sessionName}:codex`, oldRef)
+    session.selectedProvider = 'codex'
+    session.lastSessionRef = oldRef
+    session.lastSessionId = oldRef.sessionId
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+
+    session.wireProc(proc)
+    proc.emit('init', { session_id: proc.sessionId })
+
+    expect(boundResumes).toEqual([])
+    expect(clearedResumes).toContainEqual([session.sessionName, 'codex'])
+    expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+    expect(session.lastSessionRef).toBeNull()
+    expect(session.lastSessionId).toBeNull()
+  })
+
+  test('fresh Codex response-level turn_started stays unbound until materialization is confirmed', () => {
+    const session = new Session('codex-materialized', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+    session.wireProc(proc)
+
+    proc.emit('init', { session_id: proc.sessionId })
+    proc.emit('turn_started', { turn_id: 'turn-1', thread_id: proc.sessionId })
+    expect(boundResumes).toEqual([])
+
+    proc.conversationResumable = true
+    proc.emit('conversation_materialized', {
+      session_id: proc.sessionId,
+      source: 'turn/started notification',
+    })
+    expect(boundResumes).toEqual([[session.sessionName, 'fresh-thread', 'codex']])
+    expect(session.lastSessionId).toBe('fresh-thread')
+  })
+
+  test('failed Codex materialization verification is visible and never writes a resume point', () => {
+    const session = new Session('codex-materialize-fails', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+    session.wireProc(proc)
+    proc.emit('init', { session_id: proc.sessionId })
+
+    proc.emit('conversation_materialization_failed', {
+      session_id: proc.sessionId,
+      path: '/rollouts/rollout-fresh-thread.jsonl',
+      source: 'turn/started notification',
+      error: new Error('thread/read says not materialized'),
+    })
+
+    expect(boundResumes).toEqual([])
+    expect(session.lastSessionId).toBeNull()
+    expect(sentRawTexts.join('\n')).toContain('Codex 会话落盘确认失败，未写恢复点')
+    expect(sentRawTexts.join('\n')).toContain('thread/read says not materialized')
+  })
+
+  test('a fast Codex result defers then commits its fork checkpoint after materialization', () => {
+    const session = new Session('codex-fast-checkpoint', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+    session.wireProc(proc)
+    session.lastTurnUserPreview = 'fast input'
+    const checkpoint = {
+      provider: 'codex' as const,
+      kind: 'turn' as const,
+      id: 'turn-fast',
+      source: { provider: 'codex' as const, sessionId: 'fresh-thread', cwd: session.workDir },
+    }
+
+    proc.emit('result', { is_error: false, checkpoint })
+    expect(turnAnchorsBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingCodexTurnAnchors).toHaveLength(1)
+
+    proc.conversationResumable = true
+    proc.emit('conversation_materialized', {
+      session_id: proc.sessionId,
+      source: 'turn/started notification',
+    })
+
+    expect(session.pendingCodexTurnAnchors).toHaveLength(0)
+    expect(turnAnchorsBySession.get(session.sessionName)).toEqual([{
+      checkpoint,
+      preview: 'fast input',
+      ts: expect.any(Number),
+      writes: [],
+    }])
+  })
+
+  test('resumed Codex init can persist because the source rollout already exists', () => {
+    const session = new Session('codex-resume-init', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'resumed-thread')
+    proc.launchKind = 'resume'
+    proc.conversationResumable = true
+    session.proc = proc
+    session.wireProc(proc)
+
+    proc.emit('init', { session_id: proc.sessionId })
+
+    expect(boundResumes).toEqual([[session.sessionName, 'resumed-thread', 'codex']])
+  })
+
+  test('fresh Codex init fails visibly when clearing the old resume binding cannot fsync', async () => {
+    const session = new Session('codex-fresh-clear-fails', 'chat_id') as any
+    const oldRef = { provider: 'codex' as const, sessionId: 'old-thread', cwd: session.workDir }
+    resumeRefs.set(`${session.sessionName}:codex`, oldRef)
+    session.selectedProvider = 'codex'
+    session.lastSessionRef = oldRef
+    session.lastSessionId = oldRef.sessionId
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    proc.sendInitialize = () => {
+      proc.emit('init', { session_id: proc.sessionId })
+    }
+    session.spawnAgent = () => proc
+    setResumeWriteError(new Error('resume-map clear fsync failed'))
+    const statuses: string[] = []
+
+    try {
+      const ok = await session.start({
+        announce: false,
+        onStatus: (status: string) => statuses.push(status),
+      })
+      expect(ok).toBe(false)
+      expect(proc.killCalls).toBe(1)
+      expect(statuses.join('\n')).toContain('resume-map clear fsync failed')
+      expect(resumeRefs.get(`${session.sessionName}:codex`)).toEqual(oldRef)
+      expect(session.lastSessionId).toBe('old-thread')
+    } finally {
+      setResumeWriteError(null)
+    }
   })
 
   test('persists selected Claude resume id from init before a turn boundary', () => {
@@ -8314,7 +10472,10 @@ describe('Session provider switching', () => {
       .filter(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
       .map(call => JSON.parse(call.body.element).content as string)
       .at(-1)
-    expect(footer).toContain('Claude · glm/xhigh')
+    // 合并调和(取舍):合并后模型行统一走上游 footerModelLabel(provider 小写 +
+    // MISS 口径),本地旧 modelEffortLabel('Claude · …')随合并退役。快照冻结
+    // 语义不变:行内是 turn 开启时的 glm/xhigh,不是之后选择的 gpt-5.6-sol。
+    expect(footer).toContain('claude · glm/xhigh')
     expect(footer).not.toContain('gpt-5.6-sol')
 
     session.stopFooterStatus(turn)
@@ -8322,27 +10483,377 @@ describe('Session provider switching', () => {
   })
 
   test('patches a console quota row from the card creation snapshot after selection changes', async () => {
+    const accountUsage = await import('./account-usage')
     const session = new Session('console-usage-snapshot', 'chat_id') as any
     session.selectedProvider = 'claude'
     session.selectedModel = 'claude:fable'
     session.selectedEffort = 'max'
-    const snapshot = await session.buildConsoleOpts(undefined)
-
-    session.selectedModel = 'claude:glm'
-    session.selectedEffort = 'xhigh'
+    // 合并调和(取舍):合并后 console 额度行走上游「全部账号额度」聚合面板
+    // (cards/console.ts 双源),元素从 markdown(content)变为 collapsible_panel。
+    // 用例语义不变:补丁必须渲染卡创建时快照的那份聚合读数 —— 选择漂移后
+    // 再读到的不同读数不得改写它。快照账户(创建期)vs 漂移账户(后读)差分。
+    const readAllSpy = spyOn(accountUsage, 'readAllAccountUsage')
+      .mockImplementation(async () => [{ id: 'claude-sub', label: '快照账户', usage: { state: 'ok', windows: [] } }] as any)
     const cardId = 'card_console_usage_snapshot'
-    cardkit.recordCardCreated(cardId, 4)
-    await session.patchConsoleUsage(cardId, snapshot)
-    await cardkit.flush(cardId)
+    try {
+      const snapshot = await session.buildConsoleOpts(undefined)
+      session.selectedModel = 'claude:glm'
+      session.selectedEffort = 'xhigh'
+      readAllSpy.mockImplementation(async () => [{ id: 'claude-sub', label: '漂移账户', usage: { state: 'ok', windows: [] } }] as any)
+      cardkit.recordCardCreated(cardId, 4)
+      await session.patchConsoleUsage(cardId, snapshot)
+      await cardkit.flush(cardId)
 
-    const content = calls
-      .filter(call => call.method === 'PUT' && call.path === `/cards/${cardId}/elements/console_usage`)
-      .map(call => JSON.parse(call.body.element).content as string)
-      .at(-1)
-    expect(content).toContain('不适用')
-    expect(content).toContain('claude:fable')
-    expect(content).not.toContain('GLM 额度')
-    await cardkit.dispose(cardId)
+      const panel = calls
+        .filter(call => call.method === 'PUT' && call.path === `/cards/${cardId}/elements/console_usage`)
+        .map(call => JSON.parse(call.body.element))
+        .at(-1)
+      expect(panel.tag).toBe('collapsible_panel')
+      expect(panel.element_id).toBe('console_usage')
+      const rendered = panel.elements.map((el: any) => el.content ?? '').join('\n')
+      expect(rendered).toContain('快照账户')
+      expect(rendered).not.toContain('漂移账户')
+    } finally {
+      readAllSpy.mockRestore()
+      await cardkit.dispose(cardId)
+    }
+  })
+
+  test('consumes hyphenated DSH setup commands before they can reach the model', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    expect(await session.runCommand('deepseek-harness-setup')).toBe(true)
+    expect(await session.runCommand('DEEPSEEK-HARNESS-SETUP one two three')).toBe(true)
+    expect(sentTexts.filter(text => text.includes('deepseek-harness-setup')).length).toBe(2)
+  })
+
+  test('OpenRouter setup is routed to the registered source without sending credentials to an Agent', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    expect(await session.runCommand('openrouter-setup')).toBe(true)
+    expect(sentTexts.some(text => text.includes('openrouter-setup <api_key>'))).toBe(true)
+    expect(session.isRunning()).toBe(false)
+  })
+
+  test.each(['stopped', 'idle', 'working'])('disabled Claude subscription rejects new input while %s without stopping the process', async state => {
+    const session = new Session('subscription-off', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'existing-conversation', 'claude-sub')
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedModel = 'sonnet'
+    session.selectedEffort = 'high'
+    session.proc = state === 'stopped' ? null : proc
+    session.currentTurn = state === 'working' ? turnState('running-subscription') : null
+    session.status = state
+    const turn = session.currentTurn
+    session.tokenSource = () => ({ id: 'claude-sub', kind: 'claude-subscription', enabled: false,
+      modelCatalogState: { status: 'disabled', error: 'Claude Code 订阅已禁用；发送 claude-sub on 启用' } })
+    try {
+      await session.onUserMessage('new task', [], 'ou_user', 'om_new')
+      expect(sentTexts.at(-1)).toContain('claude-sub on')
+      expect(sentTexts.at(-1)).toContain('消息未送给 Agent')
+      expect(proc.sentTexts).toEqual([])
+      expect(proc.killCalls).toBe(0)
+      expect(session.currentTurn).toBe(turn)
+      expect(session.pendingMidTurnMsgs).toEqual([])
+      expect(session.status).toBe(state)
+    } finally { session.currentTurn = null; session.dispose() }
+  })
+
+  test.each([false, true])('Claude subscription rechecks the switch after opening an input card (queued=%s)', async queued => {
+    const session = new Session('subscription-race', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'existing-conversation', 'claude-sub')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedModel = 'sonnet'
+    session.selectedEffort = 'high'
+    session.initCount = 1
+    const source = { id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', enabled: true,
+      modelCatalogState: { status: 'ready', error: 'Claude Code 订阅已禁用；发送 claude-sub on 启用' } }
+    session.tokenSource = () => source
+    const statuses: string[] = []
+    session.openTurnCard = async () => {
+      source.enabled = false
+      const turn = turnState('switch-during-card-open')
+      session.currentTurn = turn
+      session.pendingTurnInputs = []
+      return turn
+    }
+    session.closeTurnCard = async (status: string) => { statuses.push(status); session.currentTurn = null }
+    try {
+      if (queued) {
+        session.pendingMidTurnMsgs = [{ text: 'queued task', wireText: 'queued task', userOpenId: '', msgId: '' }]
+        await session.drainMidTurnAndOpen()
+      } else await session.onUserMessage('new task')
+      expect(proc.sentTexts).toEqual([])
+      expect(proc.killCalls).toBe(0)
+      expect(statuses.join('\n')).toContain('消息未送给 Agent')
+      expect(session.pendingUserMessageCount).toBe(0)
+      expect(session.pendingMidTurnMsgs).toEqual([])
+      expect(session.currentTurn).toBeNull()
+      expect(session.status).toBe('idle')
+      source.enabled = true
+      expect(await session.sendClaimedUserText(proc, 'enabled again')).toBe(true)
+      expect(proc.sentTexts).toHaveLength(1)
+      expect(proc.sentTexts[0]).toContain('enabled again')
+      expect(proc.killCalls).toBe(0)
+    } finally { session.dispose() }
+  })
+
+  test('MD uses cached models immediately and never waits for catalog I/O', async () => {
+    const previous = listTokenSources()
+    resetTokenSourceRegistry()
+    let release!: () => void
+    const pending = new Promise<void>(resolve => { release = resolve })
+    let refreshes = 0
+    const models = Array.from({ length: 9 }, (_, i) => ({ model: `vendor/model-${i}`, display: `Model ${i}`, efforts: ['high' as const], defaultEffort: 'high' as const }))
+    const source = { id: 'md-cache', kind: 'test', agent: 'codex' as const, display: 'Codex', enabled: true,
+      models, defaultModel: models[0].model,
+      modelCatalogState: { status: 'ready' as 'ready' | 'loading' | 'failed', updatedAt: 1, error: undefined as string | undefined },
+      async refreshModels() { refreshes++; await pending },
+      spawnEnv: (env: Record<string, string | undefined>) => env, resolveSpawnModel: (model: string) => model,
+      readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    }
+    registerTokenSource(source)
+    const session = new Session('md-cache-test', 'chat_id')
+    const background = refreshAllTokenSourceModels()
+    try {
+      expect(await session.runCommand('md')).toBe(true)
+      expect(JSON.stringify(sentCards[0])).toContain('9 个模型')
+      expect(refreshes).toBe(1)
+      const panelId = [...session.modelPanels.keys()][0]
+      expect(session.modelPanels.get(panelId)?.messageId).toBe('om_status_1')
+      expect((await session.onProviderSelect(source.id, panelId)).ok).toBe(true)
+      source.models = []
+      source.modelCatalogState.status = 'loading'
+      await session.showModelPanel()
+      expect(JSON.stringify(sentCards.at(-1))).toContain('模型目录加载中')
+      expect(JSON.stringify(sentCards.at(-1))).not.toContain('0 个模型')
+      const loadingId = [...session.modelPanels.keys()].at(-1)!
+      expect((await session.onProviderSelect(source.id, loadingId)).ok).toBe(false)
+      source.modelCatalogState.status = 'failed'; source.modelCatalogState.error = 'HTTP 503'
+      await session.showModelPanel()
+      expect(JSON.stringify(sentCards.at(-1))).toContain('模型目录 MISS')
+      expect(JSON.stringify(sentCards.at(-1))).toContain('HTTP 503')
+      expect(refreshes).toBe(1)
+    } finally {
+      release(); await background; session.dispose(); resetTokenSourceRegistry()
+      for (const entry of previous) registerTokenSource(entry)
+    }
+  })
+
+  test('large model catalogs page through a snapshot and reject stale or cross-page choices', async () => {
+    const previous = listTokenSources()
+    const source = {
+      id: 'openrouter', kind: 'openrouter', agent: 'claude' as const, display: 'OpenRouter', enabled: true,
+      models: Array.from({ length: 45 }, (_, i) => ({ model: `vendor/model-${i}`, display: `Model ${i}`,
+        efforts: ['high' as const], defaultEffort: 'high' as const })),
+      defaultModel: '', modelCatalogState: { status: 'ready' as const, updatedAt: Date.now() },
+      refreshModels: async () => {}, spawnEnv: (env: Record<string, string | undefined>) => env,
+      resolveSpawnModel: (model: string) => model,
+      readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    }
+    registerTokenSource(source)
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      session.modelPanels.set('openrouter-page', { models: [] })
+      const first = await session.onProviderSelect('openrouter', 'openrouter-page')
+      expect(first.ok).toBe(true)
+      expect(session.modelPanels.get('openrouter-page').models).toHaveLength(20)
+      expect(JSON.stringify(first.card)).toContain('第 1 / 3 页')
+      expect(JSON.stringify(first.card)).not.toContain('vendor/model-20')
+      // 刷新后仍按本面板快照翻页，避免数组下标指到另一模型。
+      source.models = []
+      const last = await session.onModelPage('openrouter-page', 'openrouter', 2)
+      expect(last.ok).toBe(true)
+      expect(session.modelPanels.get('openrouter-page').models).toHaveLength(5)
+      expect(JSON.stringify(last.card)).toContain('vendor/model-44')
+      expect(JSON.stringify(last.card)).not.toContain('vendor/model-0')
+      expect((await session.onModelSelect('vendor/model-0', 'openrouter-page', '', { provider: 'claude' })).ok).toBe(false)
+      // 单档位会直接应用，因此也必须检查刷新后的真实目录，不能应用旧快照。
+      expect((await session.onModelSelect('vendor/model-44', 'openrouter-page', '', { provider: 'claude' })).ok).toBe(false)
+      expect((await session.onModelEffortSelect('vendor/model-44', 'high', 'openrouter-page', '', 'claude')).ok).toBe(false)
+      for (const page of [-1, 3, 0.5, NaN]) expect((await session.onModelPage('openrouter-page', 'openrouter', page)).ok).toBe(false)
+      expect((await session.onModelPage('openrouter-page', 'glm', 0)).ok).toBe(false)
+      expect((await session.onModelPage('stale', 'openrouter', 0)).ok).toBe(false)
+      expect((await session.onProviderSelect('openrouter', 'stale')).ok).toBe(false)
+    } finally {
+      resetTokenSourceRegistry()
+      for (const item of previous) registerTokenSource(item)
+    }
+  })
+
+  test('Claude source default efforts are authoritative and missing defaults are not replaced by max', () => {
+    const previous = listTokenSources()
+    registerTokenSource({ id: 'openrouter', kind: 'openrouter', agent: 'claude', display: 'OpenRouter', enabled: true,
+      models: [{ model: 'vendor/known', display: 'Known', efforts: ['medium'], defaultEffort: 'medium' },
+        { model: 'vendor/missing', display: 'Missing', efforts: ['high'], defaultEffort: null }],
+      defaultModel: 'vendor/known', refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    })
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      session.selectedProvider = 'claude'
+      session.selectedTokenSourceId = 'openrouter'
+      session.selectedModel = 'vendor/known'
+      session.selectedEffort = null
+      expect(session.claudeEffortForSpawn()).toBe('medium')
+      expect(session.currentEffortLabel()).toBe('medium')
+      session.selectedModel = 'vendor/missing'
+      expect(session.currentEffortLabel()).toBeNull()
+      expect(session.withModel('ready')).toContain('claude · vendor/missing/MISS')
+      expect(() => session.claudeEffortForSpawn()).toThrow('MISS')
+    } finally {
+      resetTokenSourceRegistry()
+      for (const item of previous) registerTokenSource(item)
+    }
+  })
+
+  test('selecting a native-default model skips effort and replaces only the idle process while preserving its resume id', async () => {
+    const previous = listTokenSources()
+    const source = { id: 'openrouter-env', kind: 'openrouter', agent: 'claude' as const, display: 'OpenRouter', enabled: true,
+      spawnRevision: 'account', modelEnvironmentRevision: (model: string) => model === 'vendor/default' ? 'unset' : 'level',
+      models: [{ model: 'vendor/level', display: 'Level', efforts: ['high' as const], defaultEffort: 'high' as const },
+        { model: 'vendor/default', display: 'Default', efforts: ['default' as const], defaultEffort: 'default' as const }],
+      defaultModel: '', modelCatalogState: { status: 'ready' as const, updatedAt: 1 },
+      refreshModels: async () => {}, spawnEnv: (env: Record<string, string | undefined>) => env,
+      resolveSpawnModel: (model: string) => model, readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    }
+    registerTokenSource(source)
+    const session = new Session('openrouter-env-switch', 'chat_id') as any
+    try {
+      const proc = new FakeAgentProc('claude', 'preserved-session', source.id)
+      session.proc = proc
+      session.procSourceRevisions.set(proc, tokenSourceProcessRevision(source, 'vendor/level'))
+      session.selectedProvider = 'claude'; session.selectedTokenSourceId = source.id
+      session.selectedModel = 'vendor/level'; session.selectedEffort = 'high'
+      session.modelPanels.set('mode-panel', { models: [{ provider: 'claude', sourceId: source.id, model: 'vendor/default',
+        displayName: 'Default', efforts: [{ effort: 'default' }] }] })
+      const result = await session.onModelSelect('vendor/default', 'mode-panel', '', { provider: 'claude' })
+      expect(result.ok).toBe(true)
+      expect(JSON.stringify(result.card)).not.toContain('选择 effort')
+      expect(session.selectedModel).toBe('vendor/default')
+      expect(session.selectedTokenSourceId).toBe(source.id)
+      expect(session.modelPanels.has('mode-panel')).toBe(false)
+      expect(proc.setModelSettingsCalls).toEqual([])
+      expect(proc.killCalls).toBe(1)
+      expect(session.selectedEffort).toBe('default')
+      expect(boundResumes).toContainEqual([session.sessionName, 'preserved-session', 'claude'])
+    } finally {
+      session.dispose()
+      resetTokenSourceRegistry()
+      for (const entry of previous) registerTokenSource(entry)
+    }
+  })
+
+  test('selecting a newly registered DSH GLM model loads its new configuration and retains native history', async () => {
+    const previous = listTokenSources()
+    let catalogRevision = 'before-registration'
+    const source = { id: 'dsh-glm-new-model', kind: 'dsh-glm', agent: 'dsh' as const, display: 'GLM Coding Plan', enabled: true,
+      spawnRevision: 'account', modelEnvironmentRevision: () => catalogRevision,
+      models: ['glm-5.3', 'glm-manual'].map(model => ({ model, display: model, efforts: ['high' as const], defaultEffort: 'high' as const })),
+      defaultModel: 'glm-5.3', modelCatalogState: { status: 'ready' as const, updatedAt: 1 },
+      refreshModels: async () => {}, spawnEnv: (env: Record<string, string | undefined>) => env,
+      resolveSpawnModel: (model: string) => model, readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    }
+    registerTokenSource(source)
+    const session = new Session('dsh-glm-new-model', 'chat_id') as any
+    try {
+      const proc = new FakeAgentProc('dsh', 'preserved-dsh-session', source.id)
+      session.proc = proc
+      session.procSourceRevisions.set(proc, tokenSourceProcessRevision(source, 'glm-5.3'))
+      session.selectedProvider = 'dsh'; session.selectedTokenSourceId = source.id
+      session.selectedModel = 'glm-5.3'; session.selectedEffort = 'high'
+      catalogRevision = 'after-registration'
+      session.modelPanels.set('custom-model-panel', { models: [{ provider: 'dsh', sourceId: source.id, model: 'glm-manual',
+        displayName: 'Manual', efforts: [{ effort: 'high' }] }] })
+      const result = await session.onModelEffortSelect('glm-manual', 'high', 'custom-model-panel', '', 'dsh')
+      expect(result.ok).toBe(true)
+      expect(proc.setModelSettingsCalls).toEqual([])
+      expect(proc.killCalls).toBe(1)
+      expect(session.selectedModel).toBe('glm-manual')
+      expect(boundResumes).toContainEqual([session.sessionName, 'preserved-dsh-session', 'dsh'])
+    } finally {
+      session.dispose()
+      resetTokenSourceRegistry()
+      for (const entry of previous) registerTokenSource(entry)
+    }
+  })
+
+  test('the same Packy model can change default effort mode only by replacing its idle process', async () => {
+    const previous = listTokenSources()
+    const source = { id: 'packy-effort-test', kind: 'packy', agent: 'claude' as const, display: 'Packy', enabled: true,
+      models: [{ model: 'mimo-v2.5-pro', display: 'MiMo', efforts: ['default' as const, 'high' as const], defaultEffort: 'default' as const }],
+      defaultModel: 'mimo-v2.5-pro', modelCatalogState: { status: 'ready' as const, updatedAt: 1 },
+      refreshModels: async () => {}, spawnEnv: (env: Record<string, string | undefined>) => env,
+      resolveSpawnModel: (model: string) => model, readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    }
+    registerTokenSource(source)
+    const session = new Session('packy-effort-mode', 'chat_id') as any
+    try {
+      const proc = new FakeAgentProc('claude', 'packy-effort-session', source.id)
+      session.proc = proc
+      session.selectedProvider = 'claude'; session.selectedTokenSourceId = source.id
+      session.selectedModel = 'mimo-v2.5-pro'; session.selectedEffort = 'default'
+      proc.lastEffort = 'default'
+      session.modelPanels.set('packy-effort-panel', { models: [{ provider: 'claude', sourceId: source.id,
+        model: 'mimo-v2.5-pro', displayName: 'MiMo', efforts: [{ effort: 'default' }, { effort: 'high' }] }] })
+      const result = await session.onModelEffortSelect('mimo-v2.5-pro', 'high', 'packy-effort-panel', '', 'claude')
+      expect(result.ok).toBe(true)
+      expect(proc.setModelSettingsCalls).toEqual([])
+      expect(proc.killCalls).toBe(1)
+      expect(session.selectedEffort).toBe('high')
+      expect(boundResumes).toContainEqual([session.sessionName, 'packy-effort-session', 'claude'])
+    } finally {
+      session.dispose()
+      resetTokenSourceRegistry()
+      for (const entry of previous) registerTokenSource(entry)
+    }
+  })
+
+  test('DSH model panel accepts off effort and updates the same native process', async () => {
+    const previous = listTokenSources()
+    registerTokenSource({ id: 'deepseek-harness', kind: 'deepseek-harness', agent: 'dsh', display: 'DeepSeek Harness', enabled: true,
+      models: [{ model: 'deepseek-v4-flash', display: 'Flash', efforts: ['off', 'high'], defaultEffort: 'high' }],
+      defaultModel: 'deepseek-v4-flash', modelCatalogState: { status: 'ready', updatedAt: Date.now() },
+      refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    })
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      const proc = new FakeAgentProc('dsh', 'dsh-session', 'deepseek-harness')
+      session.proc = proc
+      session.selectedProvider = 'dsh'
+      session.selectedTokenSourceId = 'deepseek-harness'
+      session.selectedModel = 'deepseek-v4-flash'
+      session.selectedEffort = 'high'
+      session.modelPanels.set('panel-dsh', { models: [{ provider: 'dsh', sourceId: 'deepseek-harness', model: 'deepseek-v4-flash',
+        displayName: 'Flash', efforts: [{ effort: 'off', isDefault: false }, { effort: 'high', isDefault: true }] }] })
+      const result = await session.onModelEffortSelect('deepseek-v4-flash', 'off', 'panel-dsh', 'ou_user', 'dsh')
+      expect(result.ok).toBe(true)
+      expect(proc.setModelSettingsCalls).toEqual([['deepseek-v4-flash', 'off']])
+      expect(proc.killCalls).toBe(0)
+      expect(session.selectedProvider).toBe('dsh')
+      expect(session.selectedEffort).toBe('off')
+      expect(JSON.stringify(result.card)).toContain('DeepSeek Harness')
+    } finally {
+      resetTokenSourceRegistry()
+      for (const source of previous) registerTokenSource(source)
+    }
+  })
+
+  test('DSH cannot replace a busy Claude process', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session', 'glm')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'glm'
+    session.currentTurn = { ...turnState(), provider: 'claude' }
+    session.modelPanels.set('panel-dsh', { models: [{ provider: 'dsh', sourceId: 'deepseek-harness', model: 'deepseek-v4-flash',
+      displayName: 'Flash', efforts: [{ effort: 'off', isDefault: true }] }] })
+    const result = await session.onModelEffortSelect('deepseek-v4-flash', 'off', 'panel-dsh', 'ou_user', 'dsh')
+    expect(result.ok).toBe(false)
+    expect(proc.killCalls).toBe(0)
+    expect(session.selectedProvider).toBe('claude')
   })
 
   test('rejects cross-provider model switch while a turn is active', async () => {
@@ -8372,7 +10883,7 @@ describe('Session provider switching', () => {
     expect(result.ok).toBe(true)
     expect(session.selectedModel).toBe('claude:opus')
     expect(proc.killCalls).toBe(1)
-    expect(session.proc).not.toBe(proc)
+    expect(session.proc).not.toBe(proc)   // 旧进程已杀;下轮 start 用 deepseek 的 base_url 重 spawn
     expect(proc.setModelSettingsCalls).toEqual([])
     expect(restartCalls).toHaveLength(1)
     expect(restartCalls[0]).toMatchObject({
@@ -8380,6 +10891,221 @@ describe('Session provider switching', () => {
       opts: { resumeIdentity: { provider: 'claude', threadId: 'claude-session-1' } },
     })
     expect(result.card ? JSON.stringify(result.card) : '').toContain('下一轮开始使用')
+  })
+
+  test('model switching waits through Claude SDK cleanup before committing the new selection', async () => {
+    const session = new Session('model-sdk-cleanup', 'chat_id') as any
+    const previous = { provider: 'claude' as const, tokenSourceId: 'glm', model: 'GLM-5.2', effort: 'max' }
+    Object.assign(session, { selectedProvider: previous.provider, selectedTokenSourceId: previous.tokenSourceId,
+      selectedModel: previous.model, selectedEffort: previous.effort })
+    const proc = new ClaudeAgentProcess({ workDir: session.workDir, effort: 'max', tokenSourceId: 'glm' }) as any
+    proc.sessionId = 'claude-before-switch'
+    proc.started = true
+    let signalClose!: () => void
+    const closing = new Promise<void>(resolve => { signalClose = resolve })
+    proc.query = {
+      close: signalClose,
+      async *[Symbol.asyncIterator]() {
+        await closing
+        // SDK cleanup can spend about 2 s waiting for stdin EOF to finish.
+        await new Promise(resolve => setTimeout(resolve, 1200))
+      },
+    }
+    const readLoop = proc.readLoop(proc.query)
+    session.proc = proc
+    session.wireProc(proc)
+    session.modelPanels.set('switch', { models: [{ provider: 'claude', sourceId: 'deepseek',
+      model: 'deepseek-v4-pro', displayName: 'DeepSeek', efforts: [{ effort: 'high' }] }] })
+    const save = spyOn(feishu, 'bindSessionModelChecked')
+    try {
+      const switching = session.onModelEffortSelect('deepseek-v4-pro', 'high', 'switch', '', 'claude')
+      await closing
+      const duringClose = session.conversationRouting()
+      const writesDuringClose = save.mock.calls.length
+      const result = await switching
+
+      expect(duringClose).toMatchObject(previous)
+      expect(writesDuringClose).toBe(0)
+      expect(result.ok).toBe(true)
+      expect(proc.isAlive()).toBe(false)
+      expect(session.proc).toBeNull()
+      expect(save).toHaveBeenCalledWith(session.sessionName, 'claude', 'deepseek-v4-pro', 'high', 'deepseek')
+      expect(resumeRefs.get(`${session.sessionName}:claude`)?.sessionId).toBe('claude-before-switch')
+    } finally {
+      await readLoop
+      save.mockRestore()
+      session.dispose()
+    }
+  })
+
+  test.each([
+    { provider: 'codex' as const, sourceId: 'codex-sub', model: 'gpt-6-astra', effort: 'max' as const },
+    { provider: 'claude' as const, sourceId: 'deepseek', model: 'deepseek-v4-pro', effort: 'high' as const },
+  ])('failed switch to $sourceId keeps the old selection and retries without duplicate error messages', async target => {
+    const source = getTokenSource(target.sourceId)!
+    const sourceBefore = { enabled: source.enabled, models: source.models, modelCatalogState: source.modelCatalogState }
+    source.enabled = true
+    source.models = [{ model: target.model, display: target.model, efforts: [target.effort], defaultEffort: target.effort }]
+    source.modelCatalogState = { status: 'ready', updatedAt: 1 }
+    const session = new Session(`model-failed-${target.sourceId}`, 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-before-switch', 'glm')
+    session.proc = proc
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'; session.selectedEffort = 'max'
+    session.modelPanels.set('switch', { models: [{ ...target, displayName: target.model,
+      efforts: [{ effort: target.effort }] }] })
+    const save = spyOn(feishu, 'bindSessionModelChecked')
+    let attempts = 0
+    proc.kill = async () => { attempts++; throw new Error('SDK close timeout') }
+    try {
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const result = await session.onModelEffortSelect(target.model, target.effort, 'switch', '', target.provider)
+        expect(result).toMatchObject({ ok: false, message: '模型切换失败: SDK close timeout' })
+        expect(session.conversationRouting()).toMatchObject({ provider: 'claude', tokenSourceId: 'glm',
+          model: 'GLM-5.2', effort: 'max' })
+        expect(session.proc).toBe(proc)
+        expect(session.blockedProc).toBe(proc)
+        expect(session.modelPanels.has('switch')).toBe(true)
+      }
+      expect(attempts).toBe(2)
+      expect(save).not.toHaveBeenCalled()
+      expect(sentTexts).toEqual([]) // The card-action dispatcher owns the visible failure receipt.
+
+      proc.kill = FakeAgentProc.prototype.kill.bind(proc)
+      const retry = await session.onModelEffortSelect(target.model, target.effort, 'switch', '', target.provider)
+      expect(retry.ok).toBe(true)
+      expect(session.proc).toBeNull()
+      expect(save).toHaveBeenCalledTimes(1)
+    } finally {
+      Object.assign(source, sourceBefore)
+      save.mockRestore()
+      session.dispose()
+    }
+  })
+
+  test('reselecting a previously saved target still stops the mismatched process', async () => {
+    const session = new Session('model-stale-selection', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-before-switch', 'glm')
+    session.proc = proc
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'deepseek'
+    session.selectedModel = 'deepseek-v4-pro'; session.selectedEffort = 'high'
+    session.modelPanels.set('switch', { models: [{ provider: 'claude', sourceId: 'deepseek',
+      model: 'deepseek-v4-pro', displayName: 'DeepSeek', efforts: [{ effort: 'high' }] }] })
+    try {
+      const result = await session.onModelEffortSelect('deepseek-v4-pro', 'high', 'switch', '', 'claude')
+      expect(result.ok).toBe(true)
+      expect(result.message).not.toContain('当前已是')
+      expect(proc.killCalls).toBe(1)
+      expect(proc.setModelSettingsCalls).toEqual([])
+      expect(session.proc).toBeNull()
+    } finally { session.dispose() }
+  })
+
+  test('reselecting the old model after an unconfirmed stop cannot report an unchanged healthy process', async () => {
+    const session = new Session('model-blocked-selection', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-stopping', 'glm')
+    session.proc = proc
+    session.blockedProc = proc
+    session.blockedProcReason = 'SDK close timeout'
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'; session.selectedEffort = 'max'
+    session.modelPanels.set('switch', { models: [{ provider: 'claude', sourceId: 'glm',
+      model: 'GLM-5.2', displayName: 'GLM', efforts: [{ effort: 'max' }] }] })
+    proc.kill = async () => { throw new Error('SDK close timeout') }
+    try {
+      const result = await session.onModelEffortSelect('GLM-5.2', 'max', 'switch', '', 'claude')
+      expect(result).toMatchObject({ ok: false, message: '模型切换失败: SDK close timeout' })
+      expect(proc.setModelSettingsCalls).toEqual([])
+    } finally { session.dispose() }
+  })
+
+  test('model selection write failure remains visible and does not change in-memory routing', async () => {
+    const session = new Session('model-write-failure', 'chat_id') as any
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'; session.selectedEffort = 'max'
+    session.modelPanels.set('switch', { models: [{ provider: 'claude', sourceId: 'deepseek',
+      model: 'deepseek-v4-pro', displayName: 'DeepSeek', efforts: [{ effort: 'high' }] }] })
+    const save = spyOn(feishu, 'bindSessionModelChecked').mockImplementation(() => { throw new Error('model map fsync failed') })
+    try {
+      const result = await session.onModelEffortSelect('deepseek-v4-pro', 'high', 'switch', '', 'claude')
+      expect(result).toMatchObject({ ok: false, message: '模型切换失败: model map fsync failed' })
+      expect(session.conversationRouting()).toMatchObject({ provider: 'claude', tokenSourceId: 'glm',
+        model: 'GLM-5.2', effort: 'max' })
+      expect(session.modelPanels.has('switch')).toBe(true)
+    } finally {
+      save.mockRestore()
+      session.dispose()
+    }
+  })
+
+  test.each([false, true])('provider switch preserves pending conversation state on write failure (restore failure: %s)', async restoreFails => {
+    const session = new Session('model-pending-write-failure', 'chat_id') as any
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'; session.selectedEffort = 'max'
+    const pending = { launch: { kind: 'fork' as const, source: {
+      provider: 'claude' as const, sessionId: 'fork-source', cwd: session.workDir,
+    } }, previousSessionId: 'previous-session' }
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    branchBaseBySession.set(session.sessionName, { kind: 'fresh' })
+    const save = spyOn(feishu, 'bindSessionModelChecked').mockImplementation(() => {
+      if (restoreFails) setTurnAnchorWriteError(new Error('turn state restore failed'))
+      throw new Error('model map fsync failed')
+    })
+    try {
+      const switching = session.applyModelSelection('codex', 'gpt-6-astra', 'max', 'codex-sub')
+      await expect(switching).rejects.toThrow(restoreFails
+        ? 'model selection write failed: model map fsync failed; conversation state restore failed: turn state restore failed'
+        : 'model map fsync failed')
+      expect(session.selectedProvider).toBe('claude')
+      expect(session.pendingConversationMaterialization).toBe(pending)
+      if (!restoreFails) {
+        expect(pendingConversationLaunchBySession.get(session.sessionName)).toEqual(pending)
+        expect(branchBaseBySession.get(session.sessionName)).toEqual({ kind: 'fresh' })
+      }
+    } finally {
+      setTurnAnchorWriteError(null)
+      save.mockRestore()
+      session.dispose()
+    }
+  })
+
+  test('a confirmed process exit does not hide an SDK close error or commit the target model', async () => {
+    const session = new Session('model-close-error', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-before-switch', 'glm')
+    session.proc = proc
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'; session.selectedEffort = 'max'
+    proc.kill = async () => { proc.alive = false; throw new Error('SDK close failed') }
+    try {
+      await expect(session.applyModelSelection('claude', 'deepseek-v4-pro', 'high', 'deepseek'))
+        .rejects.toThrow('SDK close failed')
+      expect(session.proc).toBeNull()
+      expect(session.selectedTokenSourceId).toBe('glm')
+      expect(session.selectedModel).toBe('GLM-5.2')
+    } finally { session.dispose() }
+  })
+
+  test('reselecting the active GLM model and max effort is idempotent', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1', 'glm')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'
+    session.selectedEffort = 'max'
+    session.modelPanels.set('panel-glm', { models: [{
+      provider: 'claude', sourceId: 'glm', model: 'GLM-5.2', displayName: 'GLM-5.2',
+      efforts: [{ effort: 'max', isDefault: true, selected: true }],
+    }] })
+
+    const result = await session.onModelEffortSelect('GLM-5.2', 'max', 'panel-glm', 'ou_user', 'claude')
+
+    expect(result.ok).toBe(true)
+    expect(result.message).toContain('当前已是')
+    expect(proc.setModelSettingsCalls).toEqual([])
+    expect(proc.killCalls).toBe(0)
+    expect(session.proc).toBe(proc)
   })
 
   test('fresh-rebuilds a same-provider process with no current id even when disk has an old resume id', async () => {
@@ -8400,7 +11126,107 @@ describe('Session provider switching', () => {
     expect(restartCalls[0].opts.resumeIdentity).toBeUndefined()
   })
 
-  test('rejects non-fixed Claude model outside the fixed choices', async () => {
+  test('one real effort applies directly, while an empty effort catalog cannot change the selection', async () => {
+    const session = new Session('single-effort', 'chat_id') as any
+    try {
+      session.selectedProvider = 'codex'; session.selectedTokenSourceId = 'codex-sub'
+      session.selectedModel = 'gpt-6-astra'; session.selectedEffort = 'max'
+      session.modelPanels.set('single', { models: [{ provider: 'claude', sourceId: 'glm', model: 'GLM-5.2',
+        displayName: 'GLM-5.2', efforts: [{ effort: 'max' }] }] })
+      const selected = await session.onModelSelect('GLM-5.2', 'single', '', { provider: 'claude' })
+      expect(selected.ok).toBe(true)
+      expect(session.selectedEffort).toBe('max')
+      expect(JSON.stringify(selected.card)).not.toContain('选择 effort')
+      session.modelPanels.set('empty', { models: [{ provider: 'claude', sourceId: 'glm', model: 'GLM-unknown',
+        displayName: 'GLM-unknown', efforts: [] }] })
+      const missing = await session.onModelSelect('GLM-unknown', 'empty', '', { provider: 'claude' })
+      expect(missing).toMatchObject({ ok: false, message: '模型未返回 effort' })
+      expect(session.selectedModel).toBe('GLM-5.2')
+      expect(session.selectedEffort).toBe('max')
+    } finally { session.dispose() }
+  })
+
+  test('preserves a persisted GLM-5.2 slug instead of rewriting it to a legacy profile key', () => {
+    modelSelections.set('persisted-glm', {
+      provider: 'claude', model: 'GLM-5.2', effort: 'max', tokenSourceId: 'glm',
+    })
+
+    const session = new Session('persisted-glm', 'chat_id') as any
+
+    expect(session.selectedProvider).toBe('claude')
+    expect(session.selectedTokenSourceId).toBe('glm')
+    expect(session.selectedModel).toBe('GLM-5.2')
+    expect(session.selectedEffort).toBe('max')
+  })
+
+  test('keeps an explicit unavailable source and fails closed instead of switching accounts', () => {
+    modelSelections.set('missing-source', {
+      provider: 'claude', model: 'model-x', effort: 'high', tokenSourceId: 'removed-account',
+    })
+    const session = new Session('missing-source', 'chat_id') as any
+
+    expect(session.selectedTokenSourceId).toBe('removed-account')
+    expect(() => session.spawnAgent()).toThrow('token source "removed-account" 不可用')
+  })
+
+  test('replaces an idle process when the same source id gets new spawn credentials', async () => {
+    const source = getTokenSource('glm')!
+    const prevEnabled = source.enabled
+    const prevRevision = source.spawnRevision
+    source.enabled = true
+    source.spawnRevision = 'new-credentials'
+    try {
+      const session = new Session('probe', 'chat_id') as any
+      const proc = new FakeAgentProc('claude', 'claude-session-1', 'glm')
+      session.proc = proc
+      session.selectedProvider = 'claude'
+      session.selectedTokenSourceId = 'glm'
+      session.procSourceRevisions.set(proc, 'old-credentials')
+
+      await session.stopIdleMismatchedProcess()
+
+      expect(proc.killCalls).toBe(1)
+      expect(session.proc).toBeNull()
+    } finally {
+      source.enabled = prevEnabled
+      source.spawnRevision = prevRevision
+    }
+  })
+
+  test('idle provider switch settles Codex materialization and deferred checkpoint before kill', async () => {
+    const session = new Session('idle-switch-materialize', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.wireProc(proc)
+    const checkpoint = {
+      provider: 'codex' as const,
+      kind: 'turn' as const,
+      id: 'turn-fast',
+      source: { provider: 'codex' as const, sessionId: 'fresh-thread', cwd: session.workDir },
+    }
+    proc.emit('result', { is_error: false, checkpoint })
+    expect(session.pendingCodexTurnAnchors).toHaveLength(1)
+    let releaseVerification: () => void = () => {}
+    proc.materializationBarrier = new Promise<void>(resolve => { releaseVerification = resolve })
+    session.selectedProvider = 'claude'
+
+    const stopping = session.stopIdleMismatchedProcess()
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(proc.killCalls).toBe(0)
+    proc.conversationResumable = true
+    releaseVerification()
+    await stopping
+
+    expect(proc.killCalls).toBe(1)
+    expect(session.pendingCodexTurnAnchors).toHaveLength(0)
+    expect(resumeRefs.get(`${session.sessionName}:codex`)?.sessionId).toBe('fresh-thread')
+    expect(turnAnchorsBySession.get(session.sessionName)?.[0]?.checkpoint).toEqual(checkpoint)
+  })
+
+  test('rejects non-fixed Claude model outside the two fixed choices', async () => {
     const session = new Session('probe', 'chat_id') as any
     const proc = new FakeAgentProc('claude', 'claude-session-1')
     session.proc = proc
@@ -8466,7 +11292,7 @@ describe('Session provider switching', () => {
         expect(c.efforts.map((e: any) => e.effort)).toEqual(['max'])
       }
       const glm = choices.find((c: any) => c.model === 'claude:glm')
-      expect(glm.description).toContain('[claude.models.glm]')
+      expect(glm!.description).toContain('[claude.models.glm]')
       expect(choices.some((c: any) => c.provider === 'codex' && c.model.includes('grok'))).toBe(false)
       expect(choices.find((c: any) => c.model === 'claude:grok')).toMatchObject({
         provider: 'claude', displayName: 'Claude · Grok 4.6 · 无痕',
@@ -8492,9 +11318,9 @@ describe('Session provider switching', () => {
       session.selectedProvider = 'claude'
       const choices = fixedModelChoices(session)
       const glm = choices.find((c: any) => c.model === 'claude:glm')
-      expect(glm.efforts.map((e: any) => e.effort)).toEqual(['xhigh'])
+      expect(glm!.efforts.map((e: any) => e.effort)).toEqual(['xhigh'])
       const opus = choices.find((c: any) => c.model === 'claude:opus')
-      expect(opus.efforts.map((e: any) => e.effort)).toEqual(['max'])
+      expect(opus!.efforts.map((e: any) => e.effort)).toEqual(['max'])
     } finally {
       ;(config.claude as any).models = prev
     }
@@ -8517,7 +11343,7 @@ describe('Session provider switching', () => {
       const choices = fixedModelChoices(session)
       expect(choices.find((c: any) => c.model === 'codex:grok')).toBeUndefined()
       const sol = choices.find((c: any) => c.model === 'gpt-5.6-sol')
-      expect(sol.efforts.map((e: any) => e.effort)).toEqual(['max'])
+      expect(sol!.efforts.map((e: any) => e.effort)).toEqual(['max'])
     } finally {
       ;(config.codex as any).models = prev
     }
@@ -8631,7 +11457,7 @@ describe('Session provider switching', () => {
 
     const ok = await session.start({
       announce: false,
-      onStatus: status => statuses.push(status),
+      onStatus: (status: string) => statuses.push(status),
     })
 
     expect(ok).toBe(false)
@@ -8654,12 +11480,17 @@ describe('Session provider switching', () => {
 
     const ok = await session.start({
       announce: false,
-      onStatus: status => statuses.push(status),
+      onStatus: (status: string) => statuses.push(status),
     })
 
     expect(ok).toBe(true)
     expect(initializeCalls).toBe(1)
-    expect(statuses).toContain('✅ Claude 已就绪 · Claude · max')
+    // 合并调和(取舍):模型行统一走上游 footerModelLabel(provider 小写;
+    // 无模型显示 MISS),本地旧格式 '· Claude · max' 随合并退役。effort 部分
+    // 不做精确 pin:构造器会按环境推导 enabled claude source(如本机 glm),
+    // 档位取该 source 模型的 defaultEffort;无 source 时才回落 CLAUDE_EFFORT
+    // → max(上游「source 默认 effort 权威」语义)。
+    expect(statuses.some(s => s.includes('✅ Claude 已就绪 · claude · MISS/'))).toBe(true)
     expect(proc.killCalls).toBe(0)
     expect(session.proc).toBe(proc)
     expect(session.status).toBe('idle')
@@ -8674,6 +11505,9 @@ describe('Session provider switching', () => {
     try {
       await session.startColdUserTurn('hello', 'hello', 'ou_user')
 
+      // 合并调和(取舍):冷启动首发按本地语义直送用户原文;上游的
+      // fileDeliveryAgentContext 首投注入不适用于本地投递 pin(与 main 的
+      // ['hello'] 断言一致,spawn 时 developerInstructions 已给约定)。
       expect(proc.sentTexts).toEqual(['hello'])
       expect(session.currentTurn).not.toBeNull()
       expect(session.status).toBe('working')
@@ -8683,6 +11517,63 @@ describe('Session provider switching', () => {
     }
   })
 
+})
+
+describe('Session starts from cached model catalogs', () => {
+  for (const resume of [false, true]) {
+    test(`${resume ? 'resume' : 'fresh start'} uses cached models without waiting for unrelated refresh and keeps its selection`, async () => {
+      const previousSources = listTokenSources()
+      resetTokenSourceRegistry()
+      let releaseModels!: () => void
+      const modelsGate = new Promise<void>(resolve => { releaseModels = resolve })
+      const source: import('./token-source').TokenSource = {
+        id: 'catalog-test', kind: 'test', agent: 'codex', display: 'Test Codex', enabled: true,
+        models: [{ model: 'gpt-6-astra', display: 'Astra', efforts: ['max', 'ultra'], defaultEffort: 'max' }],
+        defaultModel: 'gpt-6-astra', modelCatalogState: { status: 'ready', updatedAt: 1 },
+        async refreshModels() {
+          await modelsGate
+          source.models = [{ model: 'gpt-6-astra', display: 'Astra', efforts: ['max', 'ultra'], defaultEffort: 'max' }]
+          source.defaultModel = 'gpt-6-astra'
+          source.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
+        },
+        spawnEnv: env => env,
+        resolveSpawnModel: model => model,
+        readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+      }
+      registerTokenSource(source)
+      const refresh = refreshAllTokenSourceModels()
+      const name = resume ? 'catalog-resume' : 'catalog-start'
+      modelSelections.set(name, { provider: 'codex', model: 'gpt-6-astra', effort: 'ultra', tokenSourceId: source.id })
+      const savedRef = { provider: 'codex' as const, sessionId: 'original-session', cwd: `/tmp/lodestar-projects/${name}` }
+      if (resume) resumeRefs.set(`${name}:codex`, savedRef)
+      const session = new Session(name, 'chat_id') as any
+      const proc = new FakeAgentProc('codex', resume ? savedRef.sessionId : 'new-session', source.id)
+      let spawns = 0
+      session.spawnAgent = (ref?: typeof savedRef) => {
+        spawns++
+        expect(source.modelCatalogState?.status).toBe('ready')
+        expect(session.selectedModel).toBe('gpt-6-astra')
+        expect(session.selectedEffort).toBe('ultra')
+        expect(ref).toEqual(resume ? savedRef : undefined)
+        return proc
+      }
+      const opts = { announce: false, onStatus: () => {} }
+      const starting = resume ? session.restart(true, opts) : session.start(opts)
+      try {
+        expect(await starting).toBe(true)
+        expect(spawns).toBe(1)
+        expect(session.proc).toBe(proc)
+        if (resume) expect(session.lastSessionId).toBe(savedRef.sessionId)
+      } finally {
+        releaseModels()
+        await refresh
+        await starting
+        await session.stop('test cleanup', { announce: false })
+        resetTokenSourceRegistry()
+        for (const item of previousSources) registerTokenSource(item)
+      }
+    })
+  }
 })
 
 describe('Session turn close vs mid-turn rotation race', () => {
@@ -8818,6 +11709,138 @@ describe('Session turn close vs mid-turn rotation race', () => {
     }
   })
 
+  test('rechecks completed tools after the old-card add queue settles', async () => {
+    const session = new Session('rotate-late-tool-add', 'chat_id') as any
+    const turn = turnState('card_tool_old')
+    turn.userOpenId = ''
+    turn.toolByUseId.set('tool_use_1', {
+      i: 0,
+      name: 'Read',
+      input: { file_path: '/tmp/a.txt' },
+      output: 'done',
+      isError: false,
+    })
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure('card_tool_old', code, failure)
+    })
+
+    let signalOldAddStarted: () => void = () => {}
+    const oldAddStarted = new Promise<void>(resolve => { signalOldAddStarted = resolve })
+    let releaseOldAdd: () => void = () => {}
+    const oldAddGate = new Promise<void>(resolve => { releaseOldAdd = resolve })
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (path === '/cards/id_convert') {
+        return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_tool_new' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (method === 'POST' && path === '/cards/card_tool_old/elements') {
+        signalOldAddStarted()
+        await oldAddGate
+        return new Response(JSON.stringify({ code: 300305, msg: 'component count exceeds limit' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    const oldAdd = cardkit.addElement(turn.cardId, {
+      tag: 'collapsible_panel',
+      element_id: 'tool_0',
+      header: { title: { tag: 'plain_text', content: 'done' } },
+      elements: [{ tag: 'markdown', content: 'done' }],
+    })
+    await oldAddStarted
+    let rotation: Promise<void> | null = null
+    try {
+      session.startMidTurnRotate(turn)
+      rotation = turn.rotating
+      await waitUntil(() => turn.cardId === 'card_tool_new')
+      expect(turn.toolByUseId.has('tool_use_1')).toBe(false)
+
+      releaseOldAdd()
+      await oldAdd
+      await rotation
+      await cardkit.flush('card_tool_new')
+
+      expect(turn.toolByUseId.has('tool_use_1')).toBe(true)
+      expect(calls.some(call =>
+        call.method === 'POST' &&
+        call.path === '/cards/card_tool_new/elements' &&
+        JSON.parse(call.body.elements)[0]?.element_id === 'tool_0'
+      )).toBe(true)
+      expect(turn.rotateCount).toBe(1)
+      expect(turn.failureRotateCount).toBe(0)
+    } finally {
+      releaseOldAdd()
+      if (rotation) await rotation.catch(() => {})
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('the second tool rebuild pass is idempotent for unfinished regular and batch tools', async () => {
+    for (const kind of ['regular', 'batch'] as const) {
+      calls = []
+      resetFeishuMock()
+      const session = new Session(`rotate-idempotent-${kind}`, 'chat_id') as any
+      const turn = turnState(`card_${kind}_old`)
+      turn.userOpenId = ''
+      const useId = `tool_${kind}_use`
+      const input = { file_path: `/tmp/${kind}.txt` }
+      turn.toolByUseId.set(useId, {
+        i: 0,
+        name: 'Read',
+        input,
+        ...(kind === 'batch' ? { batchSlot: 0 } : {}),
+      })
+      if (kind === 'batch') {
+        turn.toolBatches.set(0, {
+          kind: 'read',
+          items: [{ toolUseId: useId, input, output: null, isError: false }],
+        })
+      }
+      session.currentTurn = turn
+      cardkit.recordCardCreated(turn.cardId, 1)
+      const newCardId = `card_${kind}_new`
+      globalThis.fetch = (async (inputArg: RequestInfo | URL, init?: RequestInit) => {
+        const url = new URL(String(inputArg))
+        const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+        const method = String(init?.method ?? 'GET')
+        calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+        const data = path === '/cards/id_convert' ? { card_id: newCardId } : {}
+        return new Response(JSON.stringify({ code: 0, data }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }) as typeof fetch
+
+      try {
+        session.startMidTurnRotate(turn)
+        await turn.rotating
+        await cardkit.flush(newCardId)
+
+        const newToolAdds = calls.filter(call =>
+          call.method === 'POST' &&
+          call.path === `/cards/${newCardId}/elements` &&
+          JSON.parse(call.body.elements)[0]?.element_id?.startsWith('tool_')
+        )
+        expect(newToolAdds).toHaveLength(1)
+        expect(turn.toolByUseId.size).toBe(1)
+        expect(turn.toolCount).toBe(1)
+      } finally {
+        session.stopFooterStatus(turn)
+        await cardkit.dispose(turn.cardId)
+      }
+    }
+  })
+
   test('waits for formula rendering registered by a successful pending raw write before closing the old card', async () => {
     const session = new Session('rotate-slow-formula', 'chat_id') as any
     const turn = turnState('card_rotate_formula_old')
@@ -8906,6 +11929,402 @@ describe('Session turn close vs mid-turn rotation race', () => {
       renderSpy.mockRestore()
     }
   })
+
+  test('does not replay a deterministic migration failure onto a third card', async () => {
+    const session = new Session('rotate-deferred-retry', 'chat_id') as any
+    const turn = turnState('card_deferred_old')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure('card_deferred_old', code, failure)
+    })
+
+    let signalFirstConvert: () => void = () => {}
+    const firstConvertStarted = new Promise<void>(resolve => { signalFirstConvert = resolve })
+    let convertCount = 0
+    const renderSpy = spyOn(mathRender, 'renderMathInText').mockResolvedValue(renderedFormula as any)
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (path === '/cards/id_convert') {
+        convertCount++
+        if (convertCount === 1) {
+          signalFirstConvert()
+          return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_deferred_second' } }), {
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        throw new Error('a deterministic payload failure must not open a third card')
+      }
+      if (method === 'POST' && path === '/cards/card_deferred_old/elements') {
+        return new Response(JSON.stringify({
+          code: 300305,
+          msg: 'The number of card components exceeds 200',
+        }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      if (method === 'POST' && path === '/cards/card_deferred_second/elements') {
+        return new Response(JSON.stringify({
+          code: 300315,
+          msg: 'Duplicate ID; inner code: 300301',
+        }), { headers: { 'Content-Type': 'application/json' } })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    let firstRotation: Promise<void> | null = null
+    try {
+      session.appendAssistant('前文 $$x^2$$ 后文')
+      session.finalizeCurrentAssistantSegment()
+      await firstConvertStarted
+      firstRotation = turn.rotating
+      expect(firstRotation).not.toBeNull()
+      await firstRotation
+
+      expect(convertCount).toBe(1)
+      expect(turn.rotateCount).toBe(1)
+      expect(turn.failureRotateCount).toBe(1)
+      expect(turn.cardId).toBe('card_deferred_second')
+      expect(turn.rotating).toBeNull()
+      expect(sentRawTexts).toHaveLength(1)
+      // 合并调和(取舍):上游非容量写失败通知走 reportCardWriteFailure(附
+      // formatFeishuError 原文);本地冻结文案为凭据安全的分类摘要(main 原文
+      // "该错误不是卡片元素上限,已停止无效换卡")。按合并实现对齐。
+      expect(sentRawTexts[0]).toContain('不是卡片元素上限')
+      expect(sentRawTexts[0]).toContain('300315')
+      expect(sentTexts).toEqual([])
+    } finally {
+      if (firstRotation) await firstRotation.catch(() => {})
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+      renderSpy.mockRestore()
+    }
+  })
+
+  test('does not start a deferred retry when close captures the turn during migration failure', async () => {
+    const session = new Session('rotate-deferred-close', 'chat_id') as any
+    const turn = turnState('card_deferred_close_old')
+    const rawReply = '前文 $$x^2$$ 后文'
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure('card_deferred_close_old', code, failure)
+    })
+
+    let signalMigrationPost: () => void = () => {}
+    const migrationPostStarted = new Promise<void>(resolve => { signalMigrationPost = resolve })
+    let releaseMigrationPost: () => void = () => {}
+    const migrationPostGate = new Promise<void>(resolve => { releaseMigrationPost = resolve })
+    let convertCount = 0
+    const renderSpy = spyOn(mathRender, 'renderMathInText').mockResolvedValue(renderedFormula as any)
+
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (path === '/cards/id_convert') {
+        convertCount++
+        return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_deferred_close_new' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (method === 'POST' && path === '/cards/card_deferred_close_old/elements') {
+        return new Response(JSON.stringify({ code: 300305, msg: 'component count exceeds limit' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (method === 'POST' && path === '/cards/card_deferred_close_new/elements') {
+        signalMigrationPost()
+        await migrationPostGate
+        return new Response(JSON.stringify({ code: 300315, msg: 'Duplicate ID; inner code: 300301' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    let close: Promise<void> | null = null
+    try {
+      session.appendAssistant(rawReply)
+      session.finalizeCurrentAssistantSegment()
+      await migrationPostStarted
+      expect(turn.rotating).not.toBeNull()
+      expect(turn.cardId).toBe('card_deferred_close_new')
+
+      close = session.closeTurnCard(undefined, { hasFreshResult: false })
+      expect(session.currentTurn).toBeNull()
+      releaseMigrationPost()
+      await close
+
+      expect(convertCount).toBe(1)
+      expect(turn.rotateCount).toBe(1)
+      expect(turn.failureRotateCount).toBe(1)
+      expect(turn.rotating).toBeNull()
+      expect(session.currentTurn).toBeNull()
+      expect(renderSpy).not.toHaveBeenCalled()
+      expect(sentTexts).toHaveLength(1)
+      expect(sentTexts[0]).toContain(rawReply)
+    } finally {
+      releaseMigrationPost()
+      if (close) await close.catch(() => {})
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+      renderSpy.mockRestore()
+    }
+  })
+})
+
+describe('Session card size capacity', () => {
+  for (const provider of ['codex', 'claude'] as const) {
+    test(`${provider} preserves live deltas and whitespace while earlier paragraphs migrate`, async () => {
+      const session = new Session('rotate-live-buffer', 'chat_id') as any
+      const turn = turnState('card_live_buffer_old')
+      turn.provider = provider
+      turn.userOpenId = ''
+      session.proc = new FakeAgentProc(provider, 'buffer-session')
+      session.currentTurn = turn
+      let migrationStarted!: () => void
+      let releaseMigration!: () => void
+      const started = new Promise<void>(resolve => { migrationStarted = resolve })
+      const gate = new Promise<void>(resolve => { releaseMigration = resolve })
+      cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+        session.onCardWriteFailure('card_live_buffer_old', code, failure)
+      })
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+        const method = String(init?.method ?? 'GET')
+        const body = init?.body ? JSON.parse(String(init.body)) : null
+        calls.push({ method, path, body })
+        if (method === 'POST' && path === '/cards/card_live_buffer_new/elements'
+          && String(body.elements).includes('earlier paragraph')) {
+          migrationStarted()
+          await gate
+        }
+        const response = method === 'POST' && path === '/cards/card_live_buffer_old/elements'
+          ? { code: 200860, msg: 'card over max size' }
+          : { code: 0, data: path === '/cards/id_convert' ? { card_id: 'card_live_buffer_new' } : {} }
+        return new Response(JSON.stringify(response), { headers: { 'Content-Type': 'application/json' } })
+      }) as typeof fetch
+      try {
+        session.appendAssistant('earlier paragraph')
+        session.finalizeCurrentAssistantSegment()
+        session.appendAssistant('hello ')
+        await started
+        session.appendAssistant('world')
+        session.finalizeCurrentAssistantSegment()
+        releaseMigration()
+        await turn.rotating
+        await session.closeTurnCard(undefined, { hasFreshResult: false })
+        const paragraphs = calls.filter(call => call.method === 'POST' && call.path === '/cards/card_live_buffer_new/elements')
+          .map(call => JSON.parse(call.body.elements)[0].content)
+        expect(paragraphs).toEqual(['earlier paragraph', 'hello world'])
+        expect(sentTexts).toEqual([])
+      } finally {
+        releaseMigration()
+        if (turn.rotating) await turn.rotating
+        session.stopFooterStatus(turn)
+        await cardkit.dispose('card_live_buffer_old')
+        await cardkit.dispose(turn.cardId)
+      }
+    })
+  }
+
+  for (const provider of ['codex', 'claude'] as const) {
+    // 合并取舍:上游签名还覆盖 'footer'(footer 写失败也换卡);本地定型
+    // cardkit 语义是 footer 写入永不上升 card-level onFailure(cardkit.ts:
+    // tick 丢一次不烧换卡额度,src/cardkit.test.ts 'footer replaceElement
+    // failures do not elevate to card-level onFailure' 钉住),即 footer 变体
+    // 在上游语义下才有换卡路径,本地不存在该行为,故不再生成该变体。
+    for (const operation of ['addElement', 'replaceElement'] as const) {
+      test(`${provider} preserves tool output when ${operation} exceeds card size below the element count limit`, async () => {
+        const session = new Session('card-size', 'chat_id') as any
+        const oldCardId = `card_size_${provider}_${operation}_old`
+        const newCardId = `card_size_${provider}_${operation}_new`
+        const turn = turnState(oldCardId)
+        turn.provider = provider
+        turn.userOpenId = ''
+        turn.toolByUseId.set('tool_use_size', {
+          i: 0, name: 'Bash', input: { command: '# desc: 查看结果\nprintf result' },
+          // 合并取舍(见上方 loop 收窄注释):footer 变体不再生成,原
+          // `operation !== 'footer' ? {...} : {}` 分支已死,直接落 output。
+          output: 'retained tool result', isError: false,
+        })
+        session.proc = new FakeAgentProc(provider, 'native-session')
+        session.currentTurn = turn
+        let rotation: Promise<void> | null = null
+        cardkit.recordCardCreated(oldCardId, 2, (code, failure) => {
+          session.onCardWriteFailure(oldCardId, code, failure)
+          rotation = turn.rotating
+        })
+        globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+          const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+          const method = String(init?.method ?? 'GET')
+          calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+          const rejected = operation === 'addElement'
+            ? method === 'POST' && path === `/cards/${oldCardId}/elements`
+            : method === 'PUT' && path === `/cards/${oldCardId}/elements/tool_0`
+          return new Response(JSON.stringify(rejected
+            ? { code: 200860, msg: 'ErrMsg: card over max size;' }
+            : { code: 0, data: path === '/cards/id_convert' ? { card_id: newCardId } : {} }), {
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }) as typeof fetch
+
+        try {
+          const landed = operation === 'addElement'
+            ? await cardkit.addElementChecked(oldCardId, {
+                tag: 'markdown', element_id: 'tool_0', content: 'retained tool result',
+              }, { type: 'insert_before', targetElementId: 'footer' })
+            : await cardkit.replaceElementChecked(oldCardId, 'tool_0', {
+                tag: 'markdown', element_id: 'tool_0', content: 'retained tool result',
+              })
+          expect(landed).toBe(false)
+          expect(rotation).not.toBeNull()
+          await rotation
+          await cardkit.flush(newCardId)
+
+          expect(turn.cardId).toBe(newCardId)
+          expect(turn.rotateCount).toBe(1)
+          expect(turn.failureRotateCount).toBe(1)
+          expect(turn.cardRotationFailed).toBe(false)
+          expect(sentCards).toHaveLength(1)
+          const migrated = calls.filter(call => call.path.startsWith(`/cards/${newCardId}/elements`))
+          // 合并调和:上游断言工具结果原文进换后卡(上游 renderBashBody 全量渲染
+          // output);本地定型卡面(src/cards/tool.ts,控 200860 体积)隐藏命令与
+          // 输出。保留用例本意"迁移后工具面板在换后卡上仍在",改钉面板行本身
+          // (工具标题 + 完成态)已重建。
+          expect(JSON.stringify(migrated)).toContain('查看结果')
+          expect(JSON.stringify(migrated)).toContain('已完成')
+          expect(turn.toolByUseId.has('tool_use_size')).toBe(true)
+          expect(sentRawTexts.join('\n')).not.toContain('未识别为卡片容量超限')
+          expect(calls.filter(call => call.method === 'POST' && call.path === `/cards/${newCardId}/elements`)).toHaveLength(1)
+        } finally {
+          if (rotation) await rotation
+          session.stopFooterStatus(turn)
+          await cardkit.dispose(oldCardId)
+          await cardkit.dispose(newCardId)
+        }
+      })
+    }
+  }
+
+  test('an unchanged oversized tool reports its failure while later output stays writable', async () => {
+    const session = new Session('card-size-persistent', 'chat_id') as any
+    const turn = turnState('card_size_persistent_0')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    let replacementCount = 0
+    cardkit.recordCardCreated(turn.cardId, 2, (code, failure) => {
+      session.onCardWriteFailure('card_size_persistent_0', code, failure)
+    })
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      const response = path === '/cards/id_convert'
+        ? { code: 0, data: { card_id: `card_size_persistent_${++replacementCount}` } }
+        : method === 'POST' && path.endsWith('/elements') && String(init?.body).includes('超大工具结果')
+          ? { code: 200860, msg: 'ErrMsg: card over max size;' }
+          : { code: 0, data: {} }
+      return new Response(JSON.stringify(response), { headers: { 'Content-Type': 'application/json' } })
+    }) as typeof fetch
+
+    try {
+      sessionTools.addTool(session, session.proc, 'oversized-tool', 'Bash', { command: '# desc: 超大工具结果\nprintf result' })
+      await cardkit.flush('card_size_persistent_0')
+      await waitUntil(() => replacementCount > 0 && !turn.rotating)
+      expect(replacementCount).toBe(1)
+      expect(turn.cardRotationFailed).toBe(false)
+      expect(turn.failureRotateCount).toBe(1)
+      expect(turn.footerStatusHandle).not.toBeNull()
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('换卡后仍超出飞书容量，写入失败')
+      expect(sentRawTexts[0]).toContain('其余输出继续处理')
+      expect(await cardkit.addElementChecked(turn.cardId, {
+        tag: 'markdown', element_id: 'after_failure', content: '后续正文',
+      })).toBe(true)
+      sessionTools.addTool(session, session.proc, 'later-tool', 'Bash', { command: '# desc: 后续工具\nprintf ok' })
+      await cardkit.flush(turn.cardId)
+      sessionTools.completeTool(session, session.proc, 'later-tool', '后续工具结果', false)
+      await cardkit.flush(turn.cardId)
+      // 合并调和:同 describe 前例 —— 上游钉工具结果原文进卡,本地定型卡面
+      // 隐藏命令与输出;用例本意"容量失败后后续输出仍可写"由前述
+      // addElementChecked 断言承担,这里改钉后续工具面板完成态落地。
+      const laterPanel = JSON.stringify(calls.filter(call => call.path.startsWith(`/cards/${turn.cardId}/elements`)))
+      expect(laterPanel).toContain('后续工具')
+      expect(laterPanel).toContain('已完成')
+      expect(replacementCount).toBe(1)
+    } finally {
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      for (let i = 0; i <= replacementCount; i++) await cardkit.dispose(`card_size_persistent_${i}`)
+    }
+  })
+})
+
+describe('Session project tasklist', () => {
+  test('main, multiple worktrees and temporary groups share the project tasklist throughout its lifecycle', async () => {
+    const tasklist = await import('./tasklist')
+    const projectName = 'task-project'
+    const shared = {
+      projectName, guid: 'shared-tasklist', name: `${projectName}[lodestar]`,
+      url: 'https://example.com/tasks/shared', ownerOpenId: 'owner',
+    }
+    let enabled = false
+    let creations = 0
+    const reads: string[] = []
+    const enableCalls: Array<[string, string]> = []
+    const deleteCalls: Array<[string, string]> = []
+    const get = spyOn(tasklist, 'getTasklistBinding').mockImplementation(name => {
+      reads.push(name)
+      return name === projectName && enabled ? shared : null
+    })
+    const enable = spyOn(tasklist, 'enableTasklist').mockImplementation(async (name, chatId) => {
+      enableCalls.push([name, chatId])
+      if (name !== projectName) throw new Error('unexpected project')
+      if (!enabled) creations++
+      enabled = true
+      return shared
+    })
+    const remove = spyOn(tasklist, 'deleteTasklist').mockImplementation(async (name, guid) => {
+      deleteCalls.push([name, guid])
+      if (name !== projectName || guid !== shared.guid) throw new Error('unexpected tasklist')
+      enabled = false
+      return shared
+    })
+    const sessions = [
+      'task-project', 'task-project[feature-a]', 'task-project[feature-b]',
+      'task-project*0917-1234', 'task-project[feature-b]*0917-1234',
+    ].map((name, index) => new Session(name, `task-chat-${index}`))
+    try {
+      expect(new Set(sessions.map(session => session.workDir)).size).toBe(3)
+      // Creating from WT must attach to the project's shared list as well.
+      expect((await sessions[1].onTasklistEnable()).ok).toBe(true)
+      for (const session of sessions) {
+        expect((await session.onTasklistEnable()).ok).toBe(true)
+        await session.runCommand('task')
+        expect(session.onTasklistDeletePrompt(shared.guid).ok).toBe(true)
+      }
+      expect(creations).toBe(1)
+      expect(enableCalls.map(([name]) => name)).toEqual(Array(6).fill(projectName))
+      expect((await sessions[4].onTasklistDeleteConfirm(shared.guid)).ok).toBe(true)
+      expect(deleteCalls).toEqual([[projectName, shared.guid]])
+      for (const session of sessions) {
+        expect(session.onTasklistDeletePrompt(shared.guid).ok).toBe(false)
+      }
+      expect([...new Set(reads)]).toEqual([projectName])
+    } finally {
+      get.mockRestore(); enable.mockRestore(); remove.mockRestore()
+      for (const session of sessions) session.dispose()
+    }
+  })
 })
 
 describe('Session workDir project profile override', () => {
@@ -8913,6 +12332,29 @@ describe('Session workDir project profile override', () => {
     projectProfiles.set('withoverride', { cwd: '/abs/custom/dir' })
     const session = new Session('withoverride', 'oc_test_override')
     expect(session.workDir).toBe('/abs/custom/dir')
+  })
+
+  test('derives a worktree child session beside the profiled project root', () => {
+    projectProfiles.set('withoverride', { cwd: '/abs/custom/dir' })
+    const session = new Session('withoverride[feature-x]', 'oc_test_worktree_override')
+    expect(session.workDir).toBe('/abs/custom/withoverride[feature-x]')
+  })
+
+  test('keeps a temporary session created from a worktree in that worktree cwd', () => {
+    projectProfiles.set('withoverride', { cwd: '/abs/custom/dir' })
+    const session = new Session('withoverride[feature-x]*0821-1337', 'oc_test_temp_worktree')
+    expect(session.workDir).toBe('/abs/custom/withoverride[feature-x]')
+  })
+
+  test('refuses a persisted resume ref after the project profile cwd changes', () => {
+    modelSelections.set('moved-project', { provider: 'codex', model: null, effort: null })
+    resumeRefs.set('moved-project:codex', {
+      provider: 'codex', sessionId: 'thread-from-old-cwd', cwd: '/abs/old/project',
+    })
+    projectProfiles.set('moved-project', { cwd: '/abs/new/project' })
+    const session = new Session('moved-project', 'oc_moved_project') as any
+
+    expect(() => session.spawnAgent(session.lastSessionRef)).toThrow('conversation launch cwd mismatch')
   })
 
   test('falls back to PROJECTS_ROOT/<name> without profile', () => {
@@ -8925,6 +12367,92 @@ describe('Session workDir project profile override', () => {
     const session = new Session('blankcwd', 'oc_test_blank')
     expect(session.workDir).toBe('/tmp/lodestar-projects/blankcwd')
   })
+})
+
+describe('Session card pagination', () => {
+  for (const provider of ['codex', 'claude'] as const) {
+    for (const code of [200860, 300305]) {
+      test(`${provider} lands identical tool results on each fresh page until the failure-rotate cap turns the turn log-only (${code})`, async () => {
+        const session = new Session('unlimited-pagination', 'chat_id') as any
+        const turn = turnState('card_unlimited_0')
+        turn.provider = provider
+        turn.userOpenId = ''
+        session.proc = new FakeAgentProc(provider, 'native-session')
+        session.currentTurn = turn
+        let replacementCount = 0
+        const accepted = new Map<string, Set<string>>()
+        cardkit.recordCardCreated(turn.cardId, 1, (failureCode, failure) => {
+          session.onCardWriteFailure('card_unlimited_0', failureCode, failure)
+        })
+        globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+          const path = new URL(String(input)).pathname.replace('/open-apis/cardkit/v1', '')
+          const method = String(init?.method ?? 'GET')
+          const body = init?.body ? JSON.parse(String(init.body)) : null
+          calls.push({ method, path, body })
+          let response: any = { code: 0, data: {} }
+          if (path === '/cards/id_convert') {
+            response.data = { card_id: `card_unlimited_${++replacementCount}` }
+          } else if (method === 'POST' && path.endsWith('/elements')) {
+            const ids = accepted.get(path) ?? new Set<string>()
+            if (ids.size >= 1) response = { code, msg: 'card capacity exceeded' }
+            else {
+              ids.add(JSON.parse(body.elements)[0].element_id)
+              accepted.set(path, ids)
+            }
+          }
+          return new Response(JSON.stringify(response), { headers: { 'Content-Type': 'application/json' } })
+        }) as typeof fetch
+
+        try {
+          // Every page contains the same text; successful pagination must not
+          // mistake a later, distinct tool call for a failed migration loop.
+          // 合并调和(取舍):上游无 cap 分页设计下本用例驱动 10 页并要求末页仍见
+          // 最终回复;合并实现保留本地冻结语义 MAX_MIDTURN_ROTATES=5 失败轮转
+          // 上限(session.ts onCardWriteFailure give-up 阶梯,etmmo 2026-07-25/26
+          // 起 log-only 止损)。用例本意按合并语义改写为两段:1) 相同内容逐页
+          // 重放不被指纹去重误伤 —— 前 6 页(首卡 + 5 次失败换卡)每页工具面板
+          // 与完成态落在各自新卡;2) 第 7 页再拒时达上限,进入 give-up log-only,
+          // 后续输出不再写卡。
+          for (let i = 0; i < 10; i++) {
+            sessionTools.addTool(session, session.proc, `tool_use_${i}`, 'Bash', { command: '# desc: 查看结果\nprintf result' })
+            await cardkit.flush(turn.cardId)
+            await waitUntil(() => !turn.rotating)
+            sessionTools.completeTool(session, session.proc, `tool_use_${i}`, '相同的工具结果', false)
+            await cardkit.flush(turn.cardId)
+          }
+          expect(replacementCount).toBe(5)
+          expect(turn.failureRotateCount).toBe(5)
+          expect(turn.rotateCount).toBe(5)
+          expect(turn.rotateGivenUp).toBe(true)
+          expect(turn.cardRotationFailed).toBe(false)
+          expect(sentRawTexts).toHaveLength(1)
+          expect(sentRawTexts[0]).toContain('已触发 5 次换卡仍未恢复')
+          for (let i = 0; i <= 5; i++) {
+            const page = calls.filter(call => call.path.startsWith(`/cards/card_unlimited_${i}/elements`))
+            expect(JSON.stringify(page)).toContain('查看结果')
+            expect(page.filter(call => call.method === 'PUT' && call.path.endsWith('/tool_0'))).toHaveLength(1)
+          }
+          session.appendAssistant('完整的最终回复')
+          session.finalizeCurrentAssistantSegment()
+          await cardkit.flush(turn.cardId)
+          await waitUntil(() => !turn.rotating)
+          await session.closeTurnCard(undefined, { hasFreshResult: false })
+          // give-up 后本轮 log-only:最终回复不会写进任何卡。
+          expect(replacementCount).toBe(5)
+          expect(JSON.stringify(calls)).not.toContain('完整的最终回复')
+          const toolResults = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/tool_0'))
+          expect(toolResults).toHaveLength(6)
+          // 合并取舍:本地定型卡面(cards/tool.ts)隐藏命令与输出,结果原文不上卡,
+          // 面板完成态(工具标题 + 已完成)即"结果已落地"的可观测面。
+          expect(toolResults.every(call => call.body.element.includes('已完成'))).toBe(true)
+        } finally {
+          if (turn.rotating) await turn.rotating
+          session.stopFooterStatus(turn)
+          for (let i = 0; i <= replacementCount; i++) await cardkit.dispose(`card_unlimited_${i}`)
+        }
+      })
+    }
+  }
 })
 
 describe('Session rotate cap counts only failure-triggered rotations', () => {
@@ -9063,16 +12591,20 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
   // elementId===footer 跳过 elevate；session 再显式传 notifyCardFailure:false，
   // 终态 footer 仍走 checked / 显式 onFailure。
   test('live footer ticks pass notifyCardFailure: false', async () => {
+    // 合并调和(取舍):上游实时 footer 直调 replaceElement(通知开关在第五参);
+    // 本地冻结 cardkit 的实时 footer 走 replaceElementChecked(第三参 opts 携带
+    // notifyCardFailure/onFailure,内部再把开关传下去)。用例本意"实时 tick 不升
+    // 群告警"不变,改钉 checked 封装的开关。
     const session = new Session('footer-notify-opt', 'chat_id') as any
-    const replaceSpy = spyOn(cardkit, 'replaceElement').mockResolvedValue(undefined)
+    const replaceSpy = spyOn(cardkit, 'replaceElementChecked').mockResolvedValue(true)
     try {
       await session.replaceFooterContent('card_footer_opt', 'Writing(1s)')
       expect(replaceSpy).toHaveBeenCalledTimes(1)
       const args = replaceSpy.mock.calls[0]
       expect(args[0]).toBe('card_footer_opt')
       expect(args[1]).toBe('footer')
-      expect(args[3]).toBeUndefined()
-      expect(args[4]).toEqual({ notifyCardFailure: false })
+      expect((args[3] as any)?.notifyCardFailure).toBe(false)
+      expect(typeof (args[3] as any)?.onFailure).toBe('function')
     } finally {
       replaceSpy.mockRestore()
     }
@@ -9147,55 +12679,110 @@ describe('Session rotate cap counts only failure-triggered rotations', () => {
       // 本测试意图不变:主动轮转不烧失败额度,容量失败仍可换卡。
       session.onCardWriteFailure('card_old', 300305, { kind: 'api' })
 
-      expect(turn.rotateGivenUp).toBe(false)
+      expect(turn.cardRotationFailed).toBe(false)
       expect(turn.rotating).not.toBeNull()
       await turn.rotating
       expect(turn.cardId).not.toBe('card_old') // 真的换到了新卡
+      expect(turn.failureRotateCount).toBe(1)
     } finally {
       session.stopFooterStatus(turn)
       await cardkit.dispose(turn.cardId)
     }
   })
 
-  test('give-up stops the footer ticker, blocks its restart, and kills card writes', async () => {
+  test('replacement-card send failure pauses the footer without poisoning the current card', async () => {
     const session = new Session('probe', 'chat_id') as any
     session.proc = new FakeAgentProc('claude', 'claude-session-1')
     const turn = turnState('card_dead')
     turn.userOpenId = ''
     session.currentTurn = turn
-    cardkit.recordCardCreated('card_dead', 1)
-    turn.failureRotateCount = 5 // 失败额度已耗尽
+    cardkit.recordCardCreated('card_dead', 50)
+    const sendSpy = spyOn(feishu, 'sendCard').mockResolvedValue(null)
 
     try {
       session.startWritingFooter(turn)
       expect(turn.footerStatusHandle).not.toBeNull()
 
       session.onCardWriteFailure('card_dead', 300305, { kind: 'api' })
+      await turn.rotating
 
-      expect(turn.rotateGivenUp).toBe(true)
+      expect(turn.cardRotationFailed).toBe(true)
       expect(turn.rotating).toBeNull() // 不再尝试换卡
-      // 事故根因 1:log-only 后 footer 每秒 ticker 没停,对死卡刷了 11 分钟
-      // 663 条 300308。放弃时必须停表,且 phase 切换不能把它拉起来。
+      // 续卡失败时暂停 footer 定时刷新，真实输出到达后再恢复。
       expect(turn.footerStatusHandle).toBeNull()
       session.startWorkingFooter(turn)
       expect(turn.footerStatusHandle).toBeNull()
-      // log-only 语义:本轮剩余对该卡的写全部短路,不再打飞书。
+      // 续卡发送失败不证明旧卡全部不可写；新内容仍按实际写入结果处理。
+      // 网络路由解析是异步的，先等待 startWritingFooter 已排入的写入完成。
+      await cardkit.flush('card_dead')
       const before = calls.length
       await cardkit.replaceElement('card_dead', 'footer', { tag: 'markdown', element_id: 'footer', content: 'x' })
       await cardkit.addElement('card_dead', { tag: 'markdown', element_id: 'e_new', content: 'x' })
-      expect(calls.length).toBe(before)
-      // 告警文案按真实原因分支(元素超限)
+      expect(calls.length).toBe(before + 2)
       expect(sentRawTexts.length).toBe(1)
-      expect(sentRawTexts[0]).toContain('换卡')
-      expect(sentRawTexts[0]).toContain('仅日志可见')
-      expect(sentRawTexts[0]).toContain('元素超限')
-      expect(sentRawTexts[0]).toContain('300305')
+      expect(sentRawTexts[0]).toContain('续卡发送失败')
+      expect(sentRawTexts[0]).toContain('后续内容到达时会再次尝试')
       expect(sentRawTexts[0]).not.toContain('连续 5 次写入失败')
     } finally {
+      sendSpy.mockRestore()
       session.stopFooterStatus(turn)
       await cardkit.dispose('card_dead')
     }
   })
+
+  for (const provider of ['codex', 'claude'] as const) {
+    for (const trigger of ['tool_result', 'turn_close'] as const) {
+      test(`${provider} recovers a failed replacement card on ${trigger}`, async () => {
+        const session = new Session('rotate-send-retry', 'chat_id') as any
+        const turn = turnState('card_rotate_send_retry')
+        turn.provider = provider
+        turn.userOpenId = ''
+        session.proc = new FakeAgentProc(provider, 'native-session')
+        session.currentTurn = turn
+        turn.toolByUseId.set('running-tool', {
+          i: 0, name: 'Bash', input: { command: '# desc: 运行任务\nprintf work' },
+        })
+        cardkit.recordCardCreated(turn.cardId, 50)
+        const sendSpy = spyOn(feishu, 'sendCard').mockResolvedValueOnce(null).mockResolvedValue('om_retry')
+        try {
+          session.maybeMidTurnRotate()
+          await turn.rotating
+          expect(turn.cardRotationFailed).toBe(true)
+          expect(turn.footerStatusHandle).toBeNull()
+          expect(sentRawTexts).toHaveLength(1)
+          if (trigger === 'tool_result') {
+            sessionTools.completeTool(session, session.proc, 'running-tool', '恢复后完整的工具结果', false)
+            await turn.rotating
+            await cardkit.flush(turn.cardId)
+            expect(turn.cardRotationFailed).toBe(false)
+            // 合并调和:上游钉工具结果原文进卡(renderBashBody 全量渲染);本地
+            // 定型卡面(cards/tool.ts)隐藏命令与输出。保留用例本意"续卡恢复后
+            // 工具结果以完成态面板落地",改钉面板标题 + 完成态。
+            const recovered = JSON.stringify(calls)
+            expect(recovered).toContain('运行任务')
+            expect(recovered).toContain('已完成')
+          } else {
+            turn.currentAssistantSegmentId = 'assistant_0'
+            turn.currentAssistantText = '完整的最终回复'
+            turn.segmentTexts.set('assistant_0', '完整的最终回复')
+            await session.closeTurnCard(undefined, { hasFreshResult: false })
+            expect(turn.cardRotationFailed).toBe(false)
+            expect(JSON.stringify(calls.filter(call => call.path.startsWith(`/cards/${turn.cardId}/elements`))))
+              .toContain('完整的最终回复')
+            expect(sentTexts).toEqual([])
+          }
+          expect(sendSpy).toHaveBeenCalledTimes(2)
+          expect(sentRawTexts).toHaveLength(1)
+        } finally {
+          if (turn.rotating) await turn.rotating
+          sendSpy.mockRestore()
+          session.stopFooterStatus(turn)
+          await cardkit.dispose('card_rotate_send_retry')
+          await cardkit.dispose(turn.cardId)
+        }
+      })
+    }
+  }
 
   test('give-up warning text branches for card size limit', async () => {
     const session = new Session('probe-size', 'chat_id') as any
@@ -10097,6 +13684,77 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     return { session, proc }
   }
 
+  test('an init already owned by an eager-open card consumes its SDK input claim without creating a later empty user turn', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.lastUserOpenId = 'ou_user'
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_eager_user')
+    session.pendingUserMessageCount = 1
+    session.pendingReactionIds = new Map([['om_later_buffered', 'reaction_later']])
+
+    proc.emit('init', { session_id: 'claude-session-1' })
+
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(session.pendingReactionIds).toEqual(new Map([['om_later_buffered', 'reaction_later']]))
+    expect(session.currentBatchReactionIds.size).toBe(0)
+
+    session.currentTurn = null
+    proc.emit('bg_task_settled', { task_id: 't1', status: 'completed' })
+    proc.emit('init', { session_id: 'claude-session-1' })
+    await waitFor(() => session.currentTurn !== null)
+
+    try {
+      expect(session.currentTurn.trigger).toBe('bg_task_resume')
+      expect(session.currentTurn.trigger).not.toBe('user_message')
+    } finally {
+      if (session.currentTurn) await session.closeTurnCard('测试收尾')
+    }
+  })
+
+  test('defensive init owner conflict stays inside the Session and preserves the unclaimed input', () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    session.pendingUserMessageCount = 1
+    session.pendingTurnInputs = ['still pending']
+    // 合并调和(取舍):冲突注入点对齐合并实现 —— 上游开卡装配 beginTurnOpen
+    // 合并后仅保留 as-any 调用面,生产装配入口是本地 beginTurnOpening(两者共用
+    // openingTurnOwner 槽位);防御语义(冲突留在 Session 内、不吞未认领输入、
+    // 不发卡)不变,故在同一槽位的组装点上注入 owner 冲突。
+    session.beginTurnOpening = () => { throw new Error('forced owner conflict') }
+
+    expect(() => proc.emit('init', { session_id: 'claude-session-1' })).not.toThrow()
+    expect(proc.isAlive()).toBe(true)
+    expect(session.pendingUserMessageCount).toBe(1)
+    expect(session.pendingTurnInputs).toEqual(['still pending'])
+    expect(sentCards).toHaveLength(0)
+  })
+
+  test('defensive drain owner conflict leaves the user batch and reactions queued', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.pendingMidTurnMsgs = [{
+      text: 'must survive', wireText: 'must survive', userOpenId: 'ou_user', msgId: 'om_survive',
+    }]
+    session.pendingReactionIds = new Map([['om_survive', 'reaction_survive']])
+    // 合并调和(取舍):同上,冲突注入点改到生产装配入口 beginTurnOpening ——
+    // drain 的防御 catch 会 restoreHumanDelivery 回存批次与回执。
+    session.beginTurnOpening = () => { throw new Error('forced owner conflict') }
+
+    await session.drainMidTurnAndOpen()
+
+    expect(session.pendingMidTurnMsgs.map((msg: any) => msg.text)).toEqual(['must survive'])
+    expect(session.pendingReactionIds).toEqual(new Map([['om_survive', 'reaction_survive']]))
+    expect(proc.sentTexts).toEqual([])
+  })
+
   test('settle 后的自发 init 开 bg_task_resume 卡,终报告落卡、正常收尾并加急推送', async () => {
     const { session, proc } = wiredClaudeSession()
     expect(session.currentTurn).toBeNull()
@@ -10109,8 +13767,8 @@ describe('Session SDK-initiated bg-task resume turns', () => {
       expect(session.currentTurn.trigger).toBe('bg_task_resume')
       expect(session.status).toBe('working')
 
-      proc.emit('assistant_text', { text: '双盲 review 合并终报告' })
-      proc.emit('assistant_block_stop', {})
+      proc.emit('assistant_text', { text: '双盲 review 合并终报告', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
       emitClaudeResult(proc)
       await waitFor(() => session.currentTurn === null)
       // closeTurnCard 是 fire-and-forget:等终态 settings patch 落地再断言
@@ -10133,6 +13791,39 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     }
   })
 
+  test('Cron scheduled input arriving after an empty init opens its own card and renders the report', async () => {
+    const { session, proc } = wiredClaudeSession()
+
+    proc.emit('init', { session_id: 'claude-session-1' })
+    expect(session.currentTurn).toBeNull()
+    proc.emit('scheduled_turn_input', {
+      text: '【CrossEX 半小时运行巡检】检查服务并汇报。',
+      promptId: 'cron-prompt-1',
+    })
+    await waitFor(() => session.currentTurn !== null)
+
+    try {
+      expect(session.currentTurn.trigger).toBe('scheduled_wakeup')
+      expect(JSON.stringify(sentCards.at(-1))).toContain('定时任务触发')
+      expect(JSON.stringify(sentCards.at(-1))).not.toContain('CrossEX 半小时运行巡检')
+
+      proc.emit('assistant_text', { text: '**巡检 10:13**：服务正常，零异常。', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { index: 'assistant-cron-1', parentToolUseId: null })
+      emitClaudeResult(proc)
+      await waitFor(() => session.currentTurn === null)
+      await cardkit.flush('card_status_1')
+
+      expect(calls.some(call =>
+        call.method === 'POST' &&
+        /\/cards\/[^/]+\/elements$/.test(call.path) &&
+        String(call.body?.elements ?? '').includes('巡检 10:13')
+      )).toBe(true)
+      expect(sentTexts.some(text => text.includes('后台轮输出'))).toBe(false)
+    } finally {
+      if (session.currentTurn) await session.closeTurnCard('测试收尾')
+    }
+  })
+
   test('开卡窗口期先到的 assistant 文本并入新卡,不丢', async () => {
     const { session, proc } = wiredClaudeSession()
 
@@ -10140,8 +13831,8 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     proc.emit('init', { session_id: 'claude-session-1' })
     // openTurnCard 还在 await sendCard/id_convert,文本已经开始流 —— 事故里
     // 55ms 后模型就开写。这些字必须并入随后落地的卡。
-    proc.emit('assistant_text', { text: '窗口期先到的段落' })
-    proc.emit('assistant_block_stop', {})
+    proc.emit('assistant_text', { text: '窗口期先到的段落', parentToolUseId: null })
+    proc.emit('assistant_block_stop', { parentToolUseId: null })
     await waitFor(() => session.currentTurn !== null)
 
     try {
@@ -10191,8 +13882,8 @@ describe('Session SDK-initiated bg-task resume turns', () => {
       proc.emit('bg_task_settled', { task_id: 't1', status: 'completed' })
       proc.emit('init', { session_id: 'claude-session-1' })
       // 开卡在 await 中就会失败;这些字必须仍被兜住(开卡窗口 + cardless 续窗)。
-      proc.emit('assistant_text', { text: '孤儿终报告内容' })
-      proc.emit('assistant_block_stop', {})
+      proc.emit('assistant_text', { text: '孤儿终报告内容', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
       await waitFor(() => session.bgResumeCardless === true || session.currentTurn !== null)
       emitClaudeResult(proc)
       await waitFor(() => sentTexts.length > 0)
@@ -10223,8 +13914,8 @@ describe('Session SDK-initiated bg-task resume turns', () => {
 
       // interrupt 落地前 SDK 仍在流式:这些 delta 到达时已无卡。旧行为是
       // 静默丢弃 —— 修复后必须仍然丢弃,不能变成 📄 纯文本兜底。
-      proc.emit('assistant_text', { text: '被取消的轮次尾巴' })
-      proc.emit('assistant_block_stop', {})
+      proc.emit('assistant_text', { text: '被取消的轮次尾巴', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { parentToolUseId: null })
       emitClaudeResult(proc)
       await new Promise(resolve => setTimeout(resolve, 30))
 
@@ -10242,8 +13933,8 @@ describe('Session SDK-initiated bg-task resume turns', () => {
 
     proc.emit('bg_task_settled', { task_id: 't1', status: 'completed' })
     proc.emit('init', { session_id: 'claude-session-1' }) // 开始开卡(await sendCard/id_convert)
-    proc.emit('assistant_text', { text: '短恢复轮输出' })
-    proc.emit('assistant_block_stop', {})
+    proc.emit('assistant_text', { text: '短恢复轮输出', parentToolUseId: null })
+    proc.emit('assistant_block_stop', { parentToolUseId: null })
     // 开卡还没落地(openingTurn 仍 true)就来 result —— 竞态窗口。
     emitClaudeResult(proc)
 
@@ -10260,6 +13951,66 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     expect(inCard).toBe(true)
     // 卡片已收尾(有终态 settings patch),session 不卡在 working。
     expect(session.status).toBe('idle')
+  })
+
+  test('用户消息撞上 bg-resume 开卡时排队等待,不抢 owner、不重复开卡、不把后台正文塞进用户卡', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.lastUserOpenId = 'ou_user'
+    session.wireProc(proc)
+    proc.emit('init', { session_id: 'claude-session-1' })
+
+    let releaseOpen!: () => void
+    const gate = new Promise<void>(resolve => { releaseOpen = resolve })
+    const originalConvert = cardkit.convertMessageToCard
+    let openCalls = 0
+    const convert = spyOn(cardkit, 'convertMessageToCard').mockImplementation(async (messageId: string) => {
+      openCalls++
+      if (openCalls === 1) await gate
+      return originalConvert(messageId)
+    })
+
+    try {
+      session.bgResumePending = true
+      proc.emit('init', { session_id: 'claude-session-1' })
+      await waitFor(() => openCalls === 1 && session.openingTurn)
+
+      proc.emit('assistant_text', { text: '上一轮后台结果', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { index: 'assistant_bg', parentToolUseId: null })
+      await session.onUserMessage('请只讲直接结论', [], 'ou_user', '')
+      expect(session.pendingMidTurnMsgs.map((msg: any) => msg.text)).toEqual(['请只讲直接结论'])
+
+      emitClaudeResult(proc)
+      await new Promise(resolve => setTimeout(resolve, 10))
+      // result handler 只能等待既有 bg-resume owner；不能 beginTurnOpen 覆盖它，
+      // 更不能让两条 openTurnCard 协程同时创建主卡。
+      expect(openCalls).toBe(1)
+
+      releaseOpen()
+      await waitFor(() => session.currentTurn?.trigger === 'user_message' && !session.openingTurn)
+      const userCardId = session.currentTurn.cardId
+      await cardkit.flush(userCardId)
+
+      // 合并调和(取舍):本地投递 pin 不承担上游 sendClaimedUserText 的
+      // 「未登记 proc 首投」规则注入,断言用户原文(同 daemon-recovery 用例)。
+      expect(proc.sentTexts).toEqual(['请只讲直接结论'])
+      expect(sentTexts.some(text => text.includes('后台轮输出'))).toBe(false)
+      expect(calls.some(call =>
+        call.path === `/cards/${userCardId}/elements` &&
+        String(call.body?.elements ?? '').includes('上一轮后台结果')
+      )).toBe(false)
+      expect(calls.some(call =>
+        call.method === 'POST' &&
+        /\/cards\/[^/]+\/elements$/.test(call.path) &&
+        String(call.body?.elements ?? '').includes('上一轮后台结果')
+      )).toBe(true)
+    } finally {
+      releaseOpen()
+      if (session.currentTurn) await session.closeTurnCard('测试收尾')
+      convert.mockRestore()
+    }
   })
 
   test('切换 provider 停旧进程时清掉 bgResumePending,新进程 boot init 不误开恢复卡', async () => {
@@ -10547,12 +14298,82 @@ describe('Session claude 子 agent 工具调用不上主卡(上游 89a04d7)', ()
       expect(t1.steps[0].brief).toContain('→ file body')
       // 主卡 toolByUseId 不含子 agent 工具 —— 没走 addTool/completeTool
       expect(session.currentTurn.toolByUseId.has('sub_read_1')).toBe(false)
-      // 主线程 Task 本身照常上主卡
-      expect(session.currentTurn.toolByUseId.has('task_main_1')).toBe(true)
+      // 合并调和(取舍):合并实现并入上游 89a04d7 原生委派面板模型 —— 主线程
+      // Task/Agent tool_use 直接建立委派 task(启动工具也归入委派面板,不上
+      // 主卡),SDK task id 经 tool_use_id 回填合并后仍只有一项。本地旧接线
+      // (Task 照常 addTool 上主卡)是 89a04d7 落地前的形态,已被上游语义取代。
+      expect(session.currentTurn.toolByUseId.has('task_main_1')).toBe(false)
+      expect(session.backgroundTasks).toHaveLength(1)
       await cardkit.flush('card_subagent_iso')
     } finally {
       session.stopFooterStatus(session.currentTurn)
+      // 合并取舍:上游 closeChat 属 agentCards 共享卡子系统(未并入定型
+      // session.ts);本地 resetBackgroundTasks 已清后台句柄,无需 closeChat。
+      await session.resetBackgroundTasks()
       await cardkit.dispose('card_subagent_iso')
+    }
+  })
+
+  test('DSH 子工具返回内容块时不抛异常，也不写入主对话卡', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('dsh', 'dsh-session')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_dsh_child_blocks')
+    cardkit.recordCardCreated('card_dsh_child_blocks', 1)
+    try {
+      proc.emit('bg_task_started', { task_id: 'child', tool_use_id: 'child', description: 'DSH child', task_type: 'agent' })
+      proc.emit('tool_use', { id: 'child-bash', name: 'Bash', input: { command: 'echo child' }, parentToolUseId: 'child' })
+      expect(() => proc.emit('tool_result', { tool_use_id: 'child-bash', content: [{ type: 'text', text: 'started background job bash-1' }],
+        is_error: false, parentToolUseId: 'child' })).not.toThrow()
+      const child = [...session.backgroundTasks, ...session.pendingBgTasks].find((entry: any) => entry.id === 'child')
+      expect(child.steps[0].brief).toContain('started background job bash-1')
+      expect(session.currentTurn.toolByUseId.has('child-bash')).toBe(false)
+      expect(proc.isAlive()).toBe(true)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
+      // 合并取舍:上游 closeChat 属 agentCards 共享卡子系统(未并入定型
+      // session.ts);本地 resetBackgroundTasks 已清后台句柄,无需 closeChat。
+      await cardkit.dispose('card_dsh_child_blocks')
+    }
+  })
+
+  test('子 agent assistant text/block_stop 不进入主卡,主 agent 正文仍正常渲染', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_subagent_text_iso')
+    cardkit.recordCardCreated('card_subagent_text_iso', 1)
+
+    try {
+      proc.emit('assistant_text', {
+        text: '我将并行开展多轮搜索来收集证据。',
+        parentToolUseId: 'task_main_1',
+      })
+      proc.emit('assistant_block_stop', {
+        index: 'assistant_child_1',
+        parentToolUseId: 'task_main_1',
+      })
+
+      expect(session.currentTurn.assistantSegmentCount).toBe(0)
+      expect(session.currentTurn.segmentTexts.size).toBe(0)
+
+      proc.emit('assistant_text', { text: '这是主 Agent 的结论。', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { index: 'assistant_main_1', parentToolUseId: null })
+      await cardkit.flush('card_subagent_text_iso')
+
+      expect(session.currentTurn.assistantSegmentCount).toBe(1)
+      expect([...session.currentTurn.segmentTexts.values()]).toEqual(['这是主 Agent 的结论。'])
+      expect(calls.some(call =>
+        call.method === 'POST' &&
+        call.path === '/cards/card_subagent_text_iso/elements' &&
+        String(call.body?.elements ?? '').includes('我将并行开展多轮搜索')
+      )).toBe(false)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose('card_subagent_text_iso')
     }
   })
 
@@ -10581,12 +14402,18 @@ describe('Session claude 子 agent 工具调用不上主卡(上游 89a04d7)', ()
       // 主线程 Task tool_use 记录 lastMainTaskToolUseId(task_started 缺 tool_use_id 时兜底关联)
       proc.emit('tool_use', { id: 'main_task_1', name: 'Task', input: { description: 'spawn' }, parentToolUseId: null })
       expect(session.lastMainTaskToolUseId).toBe('main_task_1')
-      // 无 bg task 归属:双池不因主线程工具产生 steps 累积
-      expect(session.backgroundTasks).toEqual([])
+      // 合并调和(取舍):合并实现并入上游原生委派面板模型 —— 主线程 Task
+      // tool_use 即建立 subagent 委派项(toolUseId 关联,等 SDK task id 回填);
+      // 普通主线程工具(Bash)不产生任何 bg 项,addTool/completeTool 行为不变。
+      expect(session.backgroundTasks).toHaveLength(1)
+      expect(session.backgroundTasks[0]).toMatchObject({
+        id: 'main_task_1', toolUseId: 'main_task_1', type: 'subagent', isBackgrounded: true,
+      })
       expect(session.pendingBgTasks).toEqual([])
       await cardkit.flush('card_subagent_mainline')
     } finally {
       session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
       await cardkit.dispose('card_subagent_mainline')
     }
   })
@@ -10665,27 +14492,72 @@ describe('Session codex 子 agent 后台游标卡接线(上游 cf41941)', () => 
 })
 
 describe('Session usage cache cross-backend isolation', () => {
-  test('claude 的 rate_limit_event payload 不得覆盖 codex 用量缓存', () => {
-    // 先用一条 codex 形状的 payload 播种缓存(模块级单例)。
-    const seeded = updateUsageFromRateLimits({
-      planType: 'plus',
-      primary: { usedPercent: 42, resetsAt: 1_700_000_000, windowDurationMins: 300 },
-    })
-    expect(seeded.state).toBe('ok')
+  test('a completed card retains the successful account cache when the latest query failed and the process exited', async () => {
+    const { bindProcessCodexAccount } = await import('./codex-accounts')
+    const accountId = 'closed-footer-cache'
+    const session = new Session('closed-footer-cache', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'quota-session')
+    bindProcessCodexAccount(proc, accountId)
+    session.proc = proc
+    session.selectedTokenSourceId = null
+    const turn = { ...turnState('card_closed_footer_cache'), provider: 'codex', model: 'shared-model', effort: 'high', userOpenId: '' }
+    session.currentTurn = turn
+    session.lastTurnUsage = { input_tokens: 100, output_tokens: 10, total_tokens: 110 }
+    cardkit.recordCardCreated(turn.cardId, 1)
+    let quotaNow = Date.now()
+    const quotaClock = spyOn(Date, 'now').mockImplementation(() => quotaNow)
+    try {
+      await refreshUsageFromConnection(async () => ({ rateLimits: {
+        primary: { usedPercent: 12, windowDurationMins: 300 },
+        secondary: { usedPercent: 34, windowDurationMins: 10080 },
+        credits: { hasCredits: true, unlimited: false, balance: '62500' },
+      } }), accountId)
+      quotaNow += 60_000
+      await refreshUsageFromConnection(async () => { throw new Error('quota read failed') }, accountId)
+      expect(peekUsage(accountId)).toBeTruthy()
+      proc.alive = false
+      await session.closeTurnCard(undefined, { hasFreshResult: true })
+      const footer = calls.find(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+      const content = JSON.parse(footer?.body.element ?? '{}').content as string
+      expect(content).toContain('12%·[34%]')
+      expect(content).toContain('积分 62.5k')
+      expect(content).not.toContain('缓存')
+      expect(content).not.toContain('刷新失败')
+      expect(content).not.toContain('MISS')
+    } finally {
+      quotaClock.mockRestore()
+      invalidateCodexUsage(accountId)
+      proc.emit('exit')
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('claude 的 rate_limit_event payload 不触碰 codex 用量缓存', async () => {
+    // 用 read 端点形状经真实 cache 写入路径(refresh)播种缓存(模块级单例)。
+    const seeded = await refreshUsageFromConnection(async () => ({
+      rateLimits: {
+        limitId: 'codex', planType: 'plus',
+        primary: { usedPercent: 42, resetsAt: 1_700_000_000, windowDurationMins: 300 },
+        secondary: null,
+      },
+    }))
+    expect(seeded?.state).toBe('ok')
 
     const session = new Session('probe', 'chat_id') as any
     const claudeProc = new FakeAgentProc('claude')
     session.proc = claudeProc
     session.wireProc(claudeProc)
-    // claude 的 rate_limit_info 形状(无 planType/primary/secondary):
-    // truthy 但与 codex 完全不同,穿过共享 handler 会被包成空窗口 ok 快照。
+    // claude 的 rate_limit_info 形状(无 planType/primary/secondary):truthy 但
+    // 与 codex 完全不同。新架构下通知一律不写 cache(rolling limitId 不可信),
+    // claude 事件更不能。
     claudeProc.emit('rate_limits_updated', { status: 'allowed', unified_status: 'allowed' })
 
     // 缓存对象必须原封不动(恒等,而非结构相等)。
     expect(peekUsage()).toBe(seeded)
   })
 
-  test('codex 的 rate_limits_updated 照常更新用量缓存', () => {
+  test('codex 的 rate_limits_updated 只观察不写缓存(权威在 read 端点)', () => {
     const session = new Session('probe', 'chat_id') as any
     const codexProc = new FakeAgentProc('codex')
     session.proc = codexProc
@@ -10695,67 +14567,152 @@ describe('Session usage cache cross-backend isolation', () => {
       primary: { usedPercent: 7, resetsAt: 1_700_000_000, windowDurationMins: 300 },
     })
 
+    // rolling 通知不再驱动 cache —— 2026-08-20 源码核实 codex 解析器在
+    // 上游缺 metered_limit_name 时把 limitId 强补 "codex",通知归属不可信;
+    // turn 收尾由 closeTurnCard 在现有连接 read 端点整体刷新。
     const snap = peekUsage() as any
-    expect(snap?.state).toBe('ok')
-    expect(snap?.subscriptionType).toBe('pro')
-    expect(snap?.fiveHour?.percent).toBe(7)
+    expect(snap?.fiveHour?.percent).not.toBe(7)
   })
 
-  test('双窗口额度后缀(codex/GLM 共用):5h 倒计时·% + 方括号周窗口;缺周数据退回纯 5h 段', () => {
+  test('额度后缀保留原紧凑倒计时与百分比格式，缺失值显示 MISS', () => {
     const session = new Session('probe', 'chat_id') as any
     const h = (ms: number) => new Date(Date.now() + ms)
     // 4.1h 后重置 5h 额度、已用 7%;6.9d 后重置周额度、已用 17%。
     const fiveHour = { percent: 7, resetsAt: h(4.1 * 3600_000) }
     const weekly = { percent: 17, resetsAt: h(6.9 * 24 * 3600_000) }
     expect(session.fmtDualWindowSuffix(fiveHour, weekly)).toBe('  |  4.1h·7%·[6.9d·17%]')
-    // 周窗口缺 → 只剩 5h 段(倒计时仍在)。
     expect(session.fmtDualWindowSuffix(fiveHour, null)).toBe('  |  4.1h·7%')
-    // 5h percent 缺但周窗口在(Prolite 形态)→ 裸周窗口段。
-    expect(session.fmtDualWindowSuffix({ percent: null, resetsAt: h(3600_000) }, weekly)).toBe('  |  [6.9d·17%]')
+    expect(session.fmtDualWindowSuffix({ percent: null, resetsAt: h(3600_000) }, weekly)).toBe('  |  MISS·[6.9d·17%]')
     expect(session.fmtDualWindowSuffix(null, weekly)).toBe('  |  [6.9d·17%]')
-    // resetsAt 已过期 → 该窗口只剩百分比。
     expect(session.fmtDualWindowSuffix({ percent: 7, resetsAt: new Date(Date.now() - 1000) }, weekly)).toBe('  |  7%·[6.9d·17%]')
-    // 两窗口都缺 → 空串(不假数据)。
-    expect(session.fmtDualWindowSuffix(null, null)).toBe('')
+    expect(session.fmtDualWindowSuffix(null, null)).toBe('  |  额度 MISS')
+  })
+
+  test('Claude 的 hi 展示全部窗口，footer 按当前模型选择周额度并保留 5h', async () => {
+    const { claudeUsageSnapshot } = await import('./claude-usage')
+    const accountUsage = await import('./account-usage')
+    const session = new Session('claude-quota', 'chat_id') as any
+    let snapshot = claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
+      five_hour: { utilization: 7, resets_at: new Date(Date.now() + 4.1 * 3600_000).toISOString() },
+      seven_day: { utilization: 17, resets_at: new Date(Date.now() + 6.9 * 86400_000).toISOString() },
+      model_scoped: [{ display_name: 'Fable', utilization: 42, resets_at: null }],
+    } })
+    const source = { id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', enabled: true, readUsage: async () => snapshot }
+    session.selectedTokenSourceId = source.id
+    session.currentTokenSource = () => source
+    session.buildConsoleOpts = async () => ({ sessionName: 'claude-quota', status: 'idle', provider: 'claude' })
+    const replaceSpy = spyOn(cardkit, 'replaceElementChecked').mockResolvedValue(true)
+    const readAllSpy = spyOn(accountUsage, 'readAllAccountUsage').mockImplementation(async () => [
+      { id: source.id, label: 'Claude 订阅', usage: snapshot },
+    ])
+    try {
+      await session.patchConsoleUsage('quota-card')
+      const panel = replaceSpy.mock.calls.at(-1)?.[2] as any
+      expect(panel.element_id).toBe('console_usage')
+      expect(panel.elements).toHaveLength(1)
+      expect(panel.elements[0].content).toBe('**Claude 订阅**　5h 7%/4.1h · 周 17%/6.9d · Fable周 42%/MISS')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  4.1h·7%·[6.9d·17%]')
+      // 合并调和(取舍):合并保留本地 resolveClaudeSdkModel('default') →
+      // DEFAULT_CLAUDE_SDK_MODEL('claude-fable-5')映射(本地默认档),default
+      // 因而落 Fable 家族 → 周额度取 model_scoped:Fable(42%),与 'opus'(非
+      // Fable 家族)的双窗口径不同;上游该行的 'default'→opus 映射未吸收。
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'default')).toBe('  |  4.1h·7%·[42%]')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'claude-fable-5-1[1m]')).toBe('  |  4.1h·7%·[42%]')
+      snapshot.windows.find(window => window.kind === 'modelWeekly:Fable')!.percent = null
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'fable')).toBe('  |  4.1h·7%·[MISS]')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, null)).toBe('  |  4.1h·7%·[MISS]')
+      snapshot = { state: 'network', windows: [], reason: 'query failed' }
+      await session.patchConsoleUsage('quota-card')
+      expect((replaceSpy.mock.calls.at(-1)?.[2] as any).elements[0].content).toContain('MISS · query failed')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null)).toBe('  |  额度 MISS')
+      expect(await session.footerUsageSuffix('codex', null, source.id, source, null)).toBe('  |  额度 MISS')
+      expect(await session.footerUsageSuffix('claude', null, 'other-source', undefined, null)).toBe('  |  额度 MISS')
+    } finally { replaceSpy.mockRestore(); readAllSpy.mockRestore() }
+  })
+
+  test('Claude 收尾查询等待期间切换模型，不改变旧回复的专属周额度', async () => {
+    const { claudeUsageSnapshot } = await import('./claude-usage')
+    const snapshot = claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
+      five_hour: { utilization: 7, resets_at: null },
+      seven_day: { utilization: 17, resets_at: null },
+      model_scoped: [{ display_name: 'Fable', utilization: 42, resets_at: null }],
+    } })
+    const session = new Session('claude-quota-snapshot', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'quota-session', 'claude-sub')
+    proc.lastModel = 'claude:fable'
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedModel = 'fable'
+    const turn = { ...turnState('card_quota_snapshot'), provider: 'claude', model: 'fable', effort: 'high', userOpenId: '' }
+    session.currentTurn = turn
+    session.lastTurnUsage = { input_tokens: 100, output_tokens: 10, total_tokens: 110 }
+    let signalStarted!: () => void
+    const started = new Promise<void>(resolve => { signalStarted = resolve })
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const source = { id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', enabled: true,
+      readUsage: async () => { signalStarted(); await gate; return snapshot } }
+    session.currentTokenSource = () => source
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const closing = session.closeTurnCard(undefined, { hasFreshResult: true })
+    try {
+      await started
+      session.selectedModel = 'sonnet'
+      proc.lastModel = 'claude:sonnet'
+      release()
+      await closing
+      const footer = calls.find(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+      const content = JSON.parse(footer?.body.element ?? '{}').content as string
+      expect(content).toContain('claude · fable/high')
+      expect(content).toContain('7%·[42%]')
+      expect(content).not.toContain('17%')
+    } finally {
+      release()
+      await closing
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
   })
 })
+
+function makeRunningTask(id: string): any {
+  return { id, type: 'shell', description: `bg ${id}`, status: 'running', startedAt: Date.now() - 5000, steps: [] }
+}
+
+function installConcurrentBackgroundState(session: any, prefix: string): {
+  tasks: any[]
+  pending: any[]
+  card: { messageId: string; cardId: string }
+  details: Set<string>
+  archive: Array<{ id: string; description: string }>
+} {
+  const taskId = `${prefix}-completed`
+  const pendingId = `${prefix}-pending`
+  const tasks = [{
+    ...makeRunningTask(taskId),
+    type: 'subagent',
+    subagentType: 'verifier',
+    status: 'completed',
+    endTime: Date.now(),
+  }]
+  const pending = [makeRunningTask(pendingId)]
+  const card = { messageId: `om_bg_${prefix}`, cardId: `card_bg_${prefix}` }
+  const details = new Set([taskId])
+  const archive = [{ id: `${prefix}-archive`, description: `${prefix} archive` }]
+  session.backgroundTasks = tasks
+  session.pendingBgTasks = pending
+  session.backgroundCard = card
+  session.backgroundDetailAdded = details
+  session.bgArchive = archive
+  return { tasks, pending, card, details, archive }
+}
 
 describe('Session resetBackgroundTasks on kill/restart', () => {
   // 复现:SDK 子进程一死就不再发 task_settled,活跃 entry 永远卡 running,
   // backgroundRefreshTick(不归 SDK 管)还会继续跨档刷新「🟡 运行中」—— 卡片
   // 永不沉降,伪造「还在跑」。kill(stop)/restart 必须
   // 主动结算。回归:2026-07-06。
-  function makeRunningTask(id: string): any {
-    return { id, type: 'shell', description: `bg ${id}`, status: 'running', startedAt: Date.now() - 5000, steps: [] }
-  }
-
-  function installConcurrentBackgroundState(session: any, prefix: string): {
-    tasks: any[]
-    pending: any[]
-    card: { messageId: string; cardId: string }
-    details: Set<string>
-    archive: Array<{ id: string; description: string }>
-  } {
-    const taskId = `${prefix}-completed`
-    const pendingId = `${prefix}-pending`
-    const tasks = [{
-      ...makeRunningTask(taskId),
-      type: 'subagent',
-      subagentType: 'verifier',
-      status: 'completed',
-      endTime: Date.now(),
-    }]
-    const pending = [makeRunningTask(pendingId)]
-    const card = { messageId: `om_bg_${prefix}`, cardId: `card_bg_${prefix}` }
-    const details = new Set([taskId])
-    const archive = [{ id: `${prefix}-archive`, description: `${prefix} archive` }]
-    session.backgroundTasks = tasks
-    session.pendingBgTasks = pending
-    session.backgroundCard = card
-    session.backgroundDetailAdded = details
-    session.bgArchive = archive
-    return { tasks, pending, card, details, archive }
-  }
 
   test('stop() kills proc AND clears running background tasks (public kill path)', async () => {
     // 用户真实触发路径:kill 命令 → session.stop()。修复前 stop 只杀进程,
@@ -10764,58 +14721,314 @@ describe('Session resetBackgroundTasks on kill/restart', () => {
     const proc = new FakeAgentProc('claude', 'claude-session-1')
     session.proc = proc
     session.backgroundTasks = [makeRunningTask('t1'), makeRunningTask('t2')]
-    session.pendingBgTasks = [makeRunningTask('p1')]
-    session.backgroundCard = null // 无活卡 → 走纯内存清理分支(避开 feishu.updateCard)
-    session.openingBackground = true
+    session.pendingBgTasks = [makeRunningTask('foreground')]
+    // 合并调和:上游经 refreshBackgroundCardFull 自动开共享卡;定型 session.ts
+    // 开卡走本地 openBackgroundCard(refresh 只原地刷新既有卡)—— 显式 await
+    // 本地开卡,等价上游「先建卡,再 stop」的编排意图。
+    await session.openBackgroundCard()
+    session.scheduleBackgroundRefresh()
 
     await session.stop('已终止', { announce: false })
 
-    expect(proc.killCalls).toBe(1) // 进程被杀
-    expect(session.backgroundTasks).toEqual([]) // running entry 不再残留
-    expect(session.pendingBgTasks).toEqual([])
-    expect(session.openingBackground).toBe(false)
-  })
-
-  test('live card: flips running tasks to killed terminal BEFORE settling (so the tombstone shows 💀 已终止)', async () => {
-    // 有活卡路径:先翻 killed,再 settleBackgroundCard 用终态 entry 渲染墓碑
-    // (用户看到「💀 已终止 Ns」而非「🟡 运行中」)。settle 内部 feishu.updateCard
-    // 在测试 mock 里不存在,stub 掉以聚焦本次修复边界(settle 老逻辑另有覆盖)。
-    const session = new Session('probe', 'chat_id') as any
-    const completedTask = { id: 't0', type: 'subagent', description: 'done', status: 'completed', startedAt: 0, endTime: 1000, steps: [] }
-    session.backgroundTasks = [makeRunningTask('t1'), completedTask]
-    session.backgroundCard = { messageId: 'om_bg', cardId: 'card_bg' }
-    let settleCalls = 0
-    let statusesAtSettle = ''
-    session.settleBackgroundCard = async function () {
-      settleCalls++
-      statusesAtSettle = JSON.stringify(this.backgroundTasks.map((t: any) => t.status))
-    }
-
-    await session.resetBackgroundTasks()
-
-    expect(settleCalls).toBe(1) // 有卡 → 沉降被调
-    // 活跃 entry 在 settle 之前已翻 killed(供墓碑渲染);已终态的保持原状。
-    expect(statusesAtSettle).toBe('["killed","completed"]')
-    expect(session.pendingBgTasks).toEqual([])
-  })
-
-  test('no live card: clears tasks + pending pool + refresh timer + detail set', async () => {
-    const session = new Session('probe', 'chat_id') as any
-    session.backgroundTasks = [makeRunningTask('t1')]
-    session.pendingBgTasks = [makeRunningTask('p1')]
-    session.backgroundCard = null
-    const liveTimer = setTimeout(() => {}, 100000)
-    session.backgroundRefreshTimer = liveTimer
-    session.backgroundDetailAdded = new Set(['t1'])
-    session.openingBackground = true
-
-    await session.resetBackgroundTasks()
-
+    expect(proc.killCalls).toBe(1)
     expect(session.backgroundTasks).toEqual([])
     expect(session.pendingBgTasks).toEqual([])
-    expect(session.backgroundRefreshTimer).toBeNull() // timer 引用已清
-    expect(session.backgroundDetailAdded.size).toBe(0)
-    expect(session.openingBackground).toBe(false)
+    // 本地无上游 backgroundSync(共享卡写单飞);等价钉:句柄已随沉降清空。
+    expect(session.backgroundCard).toBeNull()
+    expect(session.backgroundRefreshTimer).toBeNull()
+    expect(sentCards).toHaveLength(1)
+    // 上游钉共享卡元素写(PUT body.element);本地终态经整卡墓碑
+    // feishu.updateCard(updatedCards)落地,断言随本地通道迁移 —— 意图不变:
+    // 墓碑含「已终止」、不泄漏 foreground 前台挂单。
+    expect(updatedCards).toHaveLength(1)
+    const tombstone = JSON.stringify(updatedCards[0]![1])
+    expect(tombstone).toContain('已终止')
+    expect(tombstone).not.toContain('foreground')
+    const settings = calls.filter(call => call.path.endsWith('/settings')).at(-1)!
+    expect(JSON.parse(settings.body.settings).config.streaming_mode).toBe(false)
+  })
+
+  test('a main message leaves running work in its original panel', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.backgroundTasks = [makeRunningTask('running')]
+    // 合并调和:上游 refresh 自动开卡、运行期 summary 上共享卡;定型 session.ts
+    // 显式 openBackgroundCard 开卡、refresh 原地 replaceElement(不重发、不整卡
+    // 更新)——意图一致:主消息提交后,运行中的工作留在原卡。变化点改用
+    // steps(本地运行期 panel 的可见通道;上游用 summary),元素写需 flush。
+    await session.openBackgroundCard()
+    await feishu.sendCard('chat_id', { schema: '2.0', body: { elements: [] } })
+    session.backgroundTasks = [{ ...session.backgroundTasks[0], steps: [{ brief: '检查中' }] }]
+    await session.refreshBackgroundCardFull()
+    await cardkit.flush(session.backgroundCard.cardId)
+    expect(sentCards).toHaveLength(2)
+    expect(updatedCards).toHaveLength(0)
+    expect(calls.some(call => call.method === 'PUT' && String(call.body.element).includes('检查中'))).toBe(true)
+    await session.resetBackgroundTasks()
+  })
+
+  test('stop waits for an admitted open, settles it, and namespaces a later process', async () => {
+    // 合并调和:上游为共享卡体系(reset await 在途 admitted open、同卡元素
+    // 世代命名空间,开卡等待由 backgroundSync 单飞)。定型 session.ts 保留本地
+    // 语义:开卡 fire-and-forget + 世代号作废 —— reset 不等开卡,在途旧开卡
+    // 落地后自弃为「世代已切换」墓碑;后续同 id 进程开全新卡(新 message)不
+    // 复用旧卡。意图保留:reset 与在途开卡互不污染、后到进程不撞旧卡状态。
+    const session = new Session('background-open-generation', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('same-id')]
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const baseFetch = globalThis.fetch
+    let converting = false
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (new URL(String(input)).pathname.endsWith('/cards/id_convert')) {
+        converting = true
+        await gate
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+    try {
+      // 生产同款接线(onBackgroundTaskChanged 开卡分支):世代化开卡不阻塞调用方。
+      session.openingBackground = true
+      const generation = ++session.backgroundOpenGeneration
+      const opening = session.openBackgroundCard(generation).finally(() => {
+        if (session.backgroundOpenGeneration === generation) session.openingBackground = false
+      })
+      await waitUntil(() => converting)
+      const resetting = session.resetBackgroundTasks()
+      release()
+      await Promise.all([opening, resetting])
+      expect(session.backgroundTasks).toEqual([])
+      // 在途旧开卡未被 reset 收养为活卡;而是自弃为「世代已切换」墓碑。
+      expect(session.backgroundCard).toBeNull()
+      expect(calls.some(call => call.path.endsWith('/settings')
+        && String(call.body.settings).includes('后台任务世代已切换'))).toBe(true)
+      session.backgroundTasks = [makeRunningTask('same-id')]
+      await session.openBackgroundCard()
+      // 新世代开新卡(新 message):不复用旧卡即本地形态的「命名空间」。
+      expect(sentCards).toHaveLength(2)
+      expect(session.backgroundCard.messageId).not.toBe('om_status_1')
+    } finally {
+      release()
+      await session.resetBackgroundTasks()
+      globalThis.fetch = baseFetch
+    }
+  })
+
+  test('a failed terminal update remains visible and can be retried without duplicate rows', async () => {
+    // 合并调和:上游经 agentCards.deps.patchSettingsChecked 注入共享卡终态写
+    // 失败;定型 session.ts 无 agentCards 子系统,终态写 = 整卡墓碑
+    // feishu.updateCard(注入缝 feishuMockState.updateCard)。语义保留:reset
+    // 抛出失败、任务先翻 killed;重试不重发卡(行不重复、失败卡仍在原地)。
+    const session = new Session('background-update-failure', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('running')]
+    await session.openBackgroundCard()
+    feishuMockState.updateCard = async () => { throw new Error('terminal update MISS') }
+    try {
+      await expect(session.resetBackgroundTasks()).rejects.toThrow('terminal update MISS')
+      expect(session.backgroundTasks[0].status).toBe('killed')
+    } finally { feishuMockState.updateCard = null }
+    await session.resetBackgroundTasks()
+    expect(session.backgroundTasks).toEqual([])
+    expect(sentCards).toHaveLength(1)
+  })
+
+  test('a failed launch is visible in the delegation panel without a main tool panel', async () => {
+    const session = new Session('native-launch-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_failed_child')
+    cardkit.recordCardCreated('card_failed_child', 1)
+    try {
+      proc.emit('tool_use', { id: 'agent-tool', name: 'Agent', input: { description: '检查接口' }, parentToolUseId: null })
+      proc.emit('tool_result', { tool_use_id: 'agent-tool', content: '无法启动子 Agent', is_error: true, parentToolUseId: null })
+      await session.backgroundSync
+      expect(session.currentTurn.toolByUseId.size).toBe(0)
+      expect(session.backgroundTasks).toHaveLength(1)
+      expect(session.backgroundTasks[0].status).toBe('failed')
+      // 合并调和:上游共享卡把失败渲染到开卡卡上并钉 '"子 Agent失败"' 文案;
+      // 定型本地背景卡为独立卡,失败经整卡墓碑(updatedCards)落地,header
+      // 文案为本地 statusLabel '— ❌ 失败'。断言随本地通道,意图不变:失败与
+      // 错误原文可见,且主轮卡上不出现 tool 面板(toolByUseId 保持 0)。
+      await waitUntil(() => session.backgroundCard === null && updatedCards.length > 0)
+      const tombstone = JSON.stringify(updatedCards.at(-1))
+      expect(tombstone).toContain('❌ 失败')
+      expect(tombstone).toContain('无法启动子 Agent')
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
+      // 合并取舍:上游 closeChat 属 agentCards 共享卡子系统(未并入定型
+      // session.ts);本地 resetBackgroundTasks 已清后台句柄,无需 closeChat。
+      await cardkit.dispose('card_failed_child')
+    }
+  })
+
+  test('a successful async launch receipt leaves the child running until its native result', async () => {
+    const session = new Session('native-background-receipt', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_async_child')
+    cardkit.recordCardCreated('card_async_child', 1)
+    try {
+      proc.emit('tool_use', { id: 'agent-tool', name: 'Agent', input: { description: '检查接口', run_in_background: true }, parentToolUseId: null })
+      expect(session.currentTurn.footerStatusLabel).toBe('Working...')
+      proc.emit('tool_result', { tool_use_id: 'agent-tool', content: 'Agent launched', is_error: false, parentToolUseId: null })
+      expect(session.currentTurn.footerStatusLabel).toBe('Thinking...')
+      expect(session.backgroundTasks[0].status).toBe('running')
+      proc.emit('bg_task_started', { task_id: 'native-id', tool_use_id: 'agent-tool', description: '检查接口', task_type: 'local_agent' })
+      proc.emit('bg_task_settled', { task_id: 'native-id', status: 'completed', summary: '接口正常' })
+      await session.backgroundSync
+      expect(session.backgroundTasks).toHaveLength(1)
+      expect(session.backgroundTasks[0].status).toBe('completed')
+      expect(session.currentTurn.toolByUseId.size).toBe(0)
+      expect(sentCards).toHaveLength(1)
+      expect(calls.filter(call => call.method === 'POST' && call.path.endsWith('/elements'))).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
+      // 合并取舍:上游 closeChat 属 agentCards 共享卡子系统(未并入定型
+      // session.ts);本地 resetBackgroundTasks 已清后台句柄,无需 closeChat。
+      await cardkit.dispose('card_async_child')
+    }
+  })
+})
+
+describe('Session optional progress presentation', () => {
+  test.each(['Bash', 'Read', 'Edit'].flatMap(name => [true, false].map(resultLands => ({ name, resultLands }))))(
+    'a tool placeholder fails silently but its result stays checked (%p)', async ({ name, resultLands }) => {
+    const session = new Session('optional-placeholder', 'chat_id') as any
+    const turn = turnState('card_optional_placeholder')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => session.onCardWriteFailure(turn.cardId, code, failure))
+    const normalFetch = globalThis.fetch
+    let finishing = false
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (init?.method === 'POST' && String(init.body).includes('tool_0') && (!finishing || !resultLands)) {
+        return Response.json({ code: 300121, msg: 'tool element rejected', error: { log_id: 'tool-write-log' } })
+      }
+      return normalFetch(input, init)
+    }) as typeof fetch
+    try {
+      sessionTools.addTool(session, session.proc, 'ordinary-tool', name, { command: 'echo ready', file_path: '/tmp/source.ts' })
+      await cardkit.flush(turn.cardId)
+      expect(sentRawTexts).toHaveLength(0)
+      expect(turn.cardWriteFailureNotices.size).toBe(0)
+      expect(cardkit.isDeadElement(turn.cardId, 'tool_0')).toBe(true)
+      finishing = true
+      sessionTools.completeTool(session, session.proc, 'ordinary-tool', 'actual tool result', false)
+      await cardkit.flush(turn.cardId)
+      expect(cardkit.isDeadElement(turn.cardId, 'tool_0')).toBe(!resultLands)
+      expect(sentRawTexts).toHaveLength(resultLands ? 0 : 1)
+      if (resultLands) {
+        const result = calls.find(call => call.method === 'POST' && String(call.body?.elements).includes('tool_0'))
+        expect(result?.body.target_element_id).toBe('footer')
+      } else {
+        // 合并调和(取舍):上游非容量失败通知附 formatFeishuError 原文(log_id=…);
+        // 本地冻结文案为分类摘要(main 原文,code+操作类别,绝不内插响应原文)。
+        // 用例本意"失败以用户可见诊断上报"不变,按合并实现文案对齐。
+        expect(sentRawTexts[0]).toContain('不是卡片元素上限')
+        expect(sentRawTexts[0]).toContain('code=300121')
+      }
+    } finally { globalThis.fetch = normalFetch; session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+
+  test.each(['plan', 'tasks'])('existing %s overview failures stay silent while timeline failures are reported', async kind => {
+    const session = new Session('optional-overview', 'chat_id') as any
+    const turn = turnState('card_optional_overview')
+    const proc = new FakeAgentProc('codex', 'overview-thread')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => session.onCardWriteFailure(turn.cardId, code, failure))
+    let revision = 0
+    const update = () => {
+      revision++
+      if (kind === 'plan') {
+        proc.emit('turn_plan_updated', { plan: [{ step: `step ${revision}`, status: 'inProgress' }] })
+      } else {
+        const name = revision === 1 ? 'TaskCreate' : 'TaskUpdate'
+        sessionTools.addTool(session, session.proc, `task-${revision}`, name, { subject: 'work', taskId: '1', status: 'in_progress' })
+        sessionTools.completeTool(session, session.proc, `task-${revision}`, JSON.stringify({ task: { id: '1', subject: 'work', status: 'in_progress' } }), false)
+      }
+    }
+    const normalFetch = globalThis.fetch
+    let rejectTimeline = false
+    try {
+      update()
+      await cardkit.flush(turn.cardId)
+      const overviewId = kind === 'plan' ? 'plan_live' : 'task_board_live'
+      globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+        const overview = init?.method === 'PUT' && String(input).endsWith(`/elements/${overviewId}`)
+        const timeline = kind === 'plan'
+          ? init?.method === 'POST' && String(init.body).includes('plan_update_')
+          : init?.method === 'PUT' && /\/elements\/tool_\d+$/.test(String(input))
+        if (overview || (rejectTimeline && timeline)) return Response.json({ code: 300121, msg: 'snapshot rejected' })
+        return normalFetch(input, init)
+      }) as typeof fetch
+      update()
+      await cardkit.flush(turn.cardId)
+      expect(sentRawTexts).toHaveLength(0)
+      expect(turn.cardWriteFailureNotices.size).toBe(0)
+      expect(cardkit.isDeadElement(turn.cardId, overviewId)).toBe(false)
+      rejectTimeline = true
+      update()
+      await cardkit.flush(turn.cardId)
+      expect(sentRawTexts).toHaveLength(1)
+      // 合并调和(取舍):同前例 —— 上游通知附响应原文(snapshot rejected);
+      // 本地冻结文案为分类摘要(code+操作类别),按合并实现对齐。
+      expect(sentRawTexts[0]).toContain('不是卡片元素上限')
+      expect(sentRawTexts[0]).toContain('code=300121')
+    } finally { globalThis.fetch = normalFetch; session.stopFooterStatus(turn); await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+})
+
+describe('Session Claude task live panel (task_board_live)', () => {
+  test('native SDK task calls render creation and every status update in one live panel', async () => {
+    const session = new Session('claude-tasks', 'chat_id') as any
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max' }) as any
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_claude_tasks')
+    cardkit.recordCardCreated('card_claude_tasks', 1)
+    let index = 0
+    const task = async (name: string, input: any, content: string) => {
+      const id = `task-call-${index++}`
+      proc.handleMessage({ type: 'assistant', parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_use', id, name, input }] } })
+      proc.handleMessage({ type: 'user', parent_tool_use_id: null,
+        message: { content: [{ type: 'tool_result', tool_use_id: id, content }] } })
+      await cardkit.flush('card_claude_tasks')
+      const writes = calls.filter(call => call.method === 'PUT'
+        && call.path === '/cards/card_claude_tasks/elements/task_board_live')
+      return JSON.parse(writes.at(-1)!.body.element)
+    }
+    try {
+      await task('TaskCreate', { subject: '验证任务创建' }, 'Task #1 created successfully: 验证任务创建')
+      const created = await task('TaskCreate', { subject: '验证任务完成' }, 'Task #2 created successfully: 验证任务完成')
+      expect(created.expanded).toBe(true)
+      expect(created.elements[0].content).toContain('- ⬜ 验证任务创建')
+      expect(created.elements[0].content).toContain('- ⬜ 验证任务完成')
+
+      const running = await task('TaskUpdate', { taskId: '1', status: 'in_progress' }, 'Updated task #1 status')
+      expect(running.elements[0].content).toContain('- 🔄 验证任务创建')
+      await task('TaskList', {}, '#1 [in_progress] 验证任务创建\n#2 [pending] 验证任务完成')
+      await task('TaskUpdate', { taskId: '1', status: 'completed' }, 'Updated task #1 status')
+      await task('TaskUpdate', { taskId: '2', status: 'in_progress' }, 'Updated task #2 status')
+      const completed = await task('TaskUpdate', { taskId: '2', status: 'completed' }, 'Updated task #2 status')
+      expect(completed.elements[0].content).toContain('- ✅ 验证任务创建')
+      expect(completed.elements[0].content).toContain('- ✅ 验证任务完成')
+      expect(session.taskBoard.map((entry: any) => entry.status)).toEqual(['completed', 'completed'])
+      const liveAdds = calls.filter(call => call.method === 'POST'
+        && call.path === '/cards/card_claude_tasks/elements'
+        && String(call.body?.elements).includes('"task_board_live"'))
+      expect(liveAdds).toHaveLength(1)
+      expect(liveAdds[0].body.target_element_id).toBe('footer')
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose('card_claude_tasks')
+    }
   })
 
   test('stop cleanup cannot clear background state installed by a newer lifecycle during old-card settlement', async () => {
@@ -11109,6 +15322,2121 @@ describe('Session codex plan live panel (plan_live)', () => {
       await cardkit.dispose(turn.cardId)
     }
   })
+
+  test.each([false, true])('a transient live footer failure recovers without pausing clocks (consumed UUID: %s)', async consumedUuid => {
+    const session = new Session('footer-transient-miss', 'chat_id') as any
+    const turn = turnState('card_footer_transient_miss')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure(turn.cardId, code, failure)
+    })
+    const proxyEnv = Object.fromEntries([
+      'HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy',
+    ].map(key => [key, process.env[key]]))
+    // Keep the mocked fetch independent of system proxy discovery and Bun's direct dispatcher.
+    for (const key of Object.keys(proxyEnv)) process.env[key] = /no_proxy/i.test(key) ? '*' : ''
+    const retryDelays: number[] = []
+    let now = Date.now()
+    const clockSpy = spyOn(Date, 'now').mockImplementation(() => now)
+    const originalSetTimeout = globalThis.setTimeout
+    const timeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: any, delay: number, ...args: any[]) => {
+      if ([3000, 4000, 5000, 8000, 15000, 60000].includes(delay)) {
+        retryDelays.push(delay)
+        now += delay
+        return originalSetTimeout(callback, 0, ...args)
+      }
+      return originalSetTimeout(callback, delay, ...args)
+    }) as typeof setTimeout)
+    let footerAttempts = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (method === 'PUT' && path === `/cards/${turn.cardId}/elements/footer`) {
+        footerAttempts++
+        if (footerAttempts === 1) {
+          return new Response(JSON.stringify({ code: 300308, msg: 'Server Internal Error' }), {
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (consumedUuid && footerAttempts === 2) {
+          return Response.json({ code: 200770, msg: 'ErrMsg: this UUID has been recently consumed;' })
+        }
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.startThinkingFooter(turn)
+      await cardkit.flush(turn.cardId)
+      await waitUntil(() => !turn.footerStatusWriteCardId)
+      expect(footerAttempts).toBe(consumedUuid ? 3 : 2)
+      expect(retryDelays).toEqual(consumedUuid ? [3000, 8000] : [3000])
+      expect(turn.footerStatusFailedCardId).not.toBe(turn.cardId)
+      expect(turn.footerStatusHandle).not.toBeNull()
+      expect(sentRawTexts).toHaveLength(0)
+      expect(turn.cardWriteFailureNotices.size).toBe(0)
+
+      session.startWritingFooter(turn)
+      await cardkit.flush(turn.cardId)
+      expect(footerAttempts).toBe(consumedUuid ? 4 : 3)
+      expect(sentRawTexts).toHaveLength(0)
+      expect(turn.cardWriteFailureNotices.size).toBe(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      try { await cardkit.dispose(turn.cardId) }
+      finally {
+        timeoutSpy.mockRestore()
+        clockSpy.mockRestore()
+        for (const [key, value] of Object.entries(proxyEnv)) {
+          if (value === undefined) delete process.env[key]
+          else process.env[key] = value
+        }
+      }
+    }
+  })
+})
+
+describe('Session card outage backpressure', () => {
+  test('slow live writes coalesce phase changes and cannot queue behind a terminal footer', async () => {
+    const session = new Session('slow-footer', 'chat_id') as any
+    const turn = turnState('card_slow_footer')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const baseFetch = globalThis.fetch
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let writes = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith('/elements/footer') && ++writes === 1) await gate
+      return baseFetch(input, init)
+    }) as typeof fetch
+    try {
+      session.startThinkingFooter(turn)
+      await waitUntil(() => writes === 1)
+      for (let i = 0; i < 20; i++) {
+        session.startWorkingFooter(turn)
+        session.startWritingFooter(turn)
+      }
+      const closed = session.closeTurnCard(undefined, { hasFreshResult: false })
+      release()
+      await closed
+      expect(writes).toBe(2) // initial live write + final checked transaction
+      expect(turn.footerStatusHandle).toBeNull()
+      const footers = calls.filter(call => call.path.endsWith('/elements/footer'))
+      expect(JSON.parse(footers.at(-1)!.body.element).content).toContain('✅')
+      expect(cardkit.isDisposed(turn.cardId)).toBe(true)
+    } finally {
+      release()
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test.each([300308, 200770])('live footer failures stay silent without blocking body or final state (code: %s)', async code => {
+    const cfg = config as any
+    const previousRuntime = cfg.runtime
+    cfg.runtime = { ...(previousRuntime ?? {}), live_elapsed: 'second' }
+    const session = new Session('footer-outage', 'chat_id') as any
+    const turn = turnState('card_footer_outage')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => session.onCardWriteFailure(turn.cardId, code, failure))
+    const proxyEnv = Object.fromEntries([
+      'HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy',
+    ].map(key => [key, process.env[key]]))
+    // Keep the mocked fetch independent of system proxy discovery and Bun's direct dispatcher.
+    for (const key of Object.keys(proxyEnv)) process.env[key] = /no_proxy/i.test(key) ? '*' : ''
+    const retryDelays: number[] = []
+    let now = Date.now()
+    const clockSpy = spyOn(Date, 'now').mockImplementation(() => now)
+    const originalSetTimeout = globalThis.setTimeout
+    const timeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: any, delay: number, ...args: any[]) => {
+      if ([3000, 4000, 5000, 8000, 15000, 60000].includes(delay)) {
+        retryDelays.push(delay)
+        now += delay
+        return originalSetTimeout(callback, 0, ...args)
+      }
+      return originalSetTimeout(callback, delay, ...args)
+    }) as typeof setTimeout)
+    const baseFetch = globalThis.fetch
+    let rejectFooter = true
+    let attempts = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith('/elements/footer')) {
+        attempts++
+        const consumed = code === 200770 && attempts % 2 === 0
+        if (rejectFooter) return Response.json({
+          code: consumed ? 200770 : 300308,
+          msg: consumed ? 'this UUID has been recently consumed' : 'Server Internal Error',
+        }, {
+          headers: { 'x-tt-logid': `outage-${attempts}` },
+        })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+    try {
+      session.startThinkingFooter(turn)
+      await cardkit.flush(turn.cardId)
+      await waitUntil(() => turn.footerStatusFailedCardId === turn.cardId)
+      const failedAttempts = 6
+      expect(attempts).toBe(failedAttempts)
+      expect(retryDelays).toEqual([3000, 8000, 15000, 15000, 15000, 4000])
+      expect(turn.footerStatusHandle).toBeNull()
+      expect(sentRawTexts).toHaveLength(0)
+      expect(turn.cardWriteFailureNotices.size).toBe(0)
+      session.startThinkingFooter(turn)
+      await cardkit.flush(turn.cardId)
+      expect(attempts).toBe(failedAttempts)
+      expect(await cardkit.addElementChecked(turn.cardId, {
+        tag: 'markdown', element_id: 'body_after_clock_failure', content: '正文仍然可以写入',
+      })).toBe(true)
+      rejectFooter = false
+      session.startWorkingFooter(turn)
+      await cardkit.flush(turn.cardId)
+      await waitUntil(() => !turn.footerStatusWriteCardId)
+      expect(attempts).toBe(failedAttempts + 1)
+      expect(turn.footerStatusHandle).toBeNull()
+      expect(JSON.parse(calls.filter(call => call.path.endsWith('/elements/footer')).at(-1)!.body.element).content)
+        .toContain('Working...')
+      await session.closeTurnCard(undefined, { hasFreshResult: false })
+      expect(attempts).toBe(failedAttempts + 2)
+      expect(cardkit.isDisposed(turn.cardId)).toBe(true)
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      if (previousRuntime === undefined) delete cfg.runtime
+      else cfg.runtime = previousRuntime
+      try { await cardkit.dispose(turn.cardId) }
+      finally {
+        timeoutSpy.mockRestore()
+        clockSpy.mockRestore()
+        for (const [key, value] of Object.entries(proxyEnv)) {
+          if (value === undefined) delete process.env[key]
+          else process.env[key] = value
+        }
+      }
+    }
+  }, 15_000)
+
+  test('a retired card clock failure cannot pause the replacement card', async () => {
+    const session = new Session('retired-footer', 'chat_id') as any
+    const turn = turnState('card_retired_footer')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    cardkit.recordCardCreated('card_new_footer', 1)
+    const baseFetch = globalThis.fetch
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let started = false
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes('/cards/card_retired_footer/elements/footer')) {
+        started = true
+        await gate
+        return Response.json({ code: 300121, msg: 'element rejected' })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+    try {
+      session.startThinkingFooter(turn)
+      await waitUntil(() => started)
+      session.stopFooterStatus(turn)
+      turn.cardId = 'card_new_footer'
+      session.startWorkingFooter(turn)
+      await cardkit.flush(turn.cardId)
+      release()
+      await cardkit.flush('card_retired_footer')
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(turn.footerStatusFailedCardId).toBeUndefined()
+      expect(turn.footerStatusLabel).toBe('Working...')
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      release()
+      session.stopFooterStatus(turn)
+      await cardkit.dispose('card_retired_footer')
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('status card clocks pause silently after failure but still commit the final status', async () => {
+    const session = new Session('status-footer-outage', 'chat_id') as any
+    const baseFetch = globalThis.fetch
+    let rejectFooter = true
+    let attempts = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).endsWith('/elements/footer')) {
+        attempts++
+        if (rejectFooter) return Response.json({ code: 300121, msg: 'element rejected' })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+    const handle = await session.openStatusCard('状态操作', '进行中')
+    try {
+      await cardkit.flush(handle.cardId)
+      await new Promise(resolve => setTimeout(resolve, 0))
+      expect(sentRawTexts).toHaveLength(0)
+      session.setStatusCard(handle, '进行中')
+      await cardkit.flush(handle.cardId)
+      expect(attempts).toBe(1)
+      rejectFooter = false
+      session.setStatusCard(handle, '新进度')
+      await cardkit.flush(handle.cardId)
+      expect(attempts).toBe(2)
+      await session.closeStatusCard(handle, '完成')
+      expect(attempts).toBe(3)
+      expect(cardkit.isDisposed(handle.cardId)).toBe(true)
+      expect(sentRawTexts).toHaveLength(0)
+    } finally {
+      handle.timer.stop()
+      await cardkit.dispose(handle.cardId)
+    }
+  })
+})
+
+describe('Session lifecycle reliability', () => {
+  test('daemon recovery finishes the saved thread initialization before delivering a queued message', async () => {
+    const session = new Session('daemon-restore-input', 'chat_id') as any
+    const ref = { provider: 'codex' as const, sessionId: 'saved-thread', cwd: session.workDir }
+    session.selectedProvider = 'codex'
+    // Match the source-less fake process, independently of registry test order.
+    session.selectedTokenSourceId = null
+    session.lastSessionRef = ref
+    session.lastSessionId = ref.sessionId
+    let releaseInit!: () => void
+    let spawned!: () => void
+    const spawnReady = new Promise<void>(resolve => { spawned = resolve })
+    const proc = new FakeAgentProc('codex', ref.sessionId)
+    proc.launchKind = 'resume'
+    proc.initialization = new Promise<void>(resolve => { releaseInit = resolve })
+    let spawnCount = 0
+    session.spawnAgent = (source: unknown) => {
+      expect(source).toEqual(ref)
+      spawnCount++
+      spawned()
+      return proc
+    }
+
+    const restoration = session.restoreAfterDaemonRestart()
+    await spawnReady
+    const message = session.onUserMessage('重启期间收到的消息')
+    await Promise.resolve()
+    expect(proc.sentTexts).toEqual([])
+    expect(session.shouldRevive()).toBe(true)
+    proc.emit('init', { session_id: ref.sessionId })
+    releaseInit()
+    try {
+      expect(await restoration).toBe(true)
+      await message
+      expect(spawnCount).toBe(1)
+      expect(proc.killCalls).toBe(0)
+      // 合并调和(取舍):本地投递 pin(dispatchHumanBatch)不承担上游
+      // sendClaimedUserText 的「未登记 proc 首投」规则注入 — spawn 的
+      // developerInstructions 已给约定,仅真实模式变更才注入更新。proc 由
+      // 测试 spawnAgent 覆写直给,未 pre-seed,断言用户原文。
+      expect(proc.sentTexts).toEqual(['重启期间收到的消息'])
+      expect(session.lastSessionId).toBe(ref.sessionId)
+    } finally {
+      await session.stop('测试收尾', { announce: false })
+    }
+  })
+
+  test.each(['codex', 'claude', 'dsh'] as const)('failed %s daemon recovery blocks queued input and preserves the resume point until an explicit retry', async provider => {
+    const session = new Session(`daemon-restore-failure-${provider}`, 'chat_id') as any
+    const ref = { provider, sessionId: 'saved-thread', cwd: session.workDir }
+    session.selectedProvider = provider
+    if (provider === 'dsh') session.selectedEffort = 'off'
+    session.lastSessionRef = ref
+    session.lastSessionId = ref.sessionId
+    resumeRefs.set(`${session.sessionName}:${provider}`, ref)
+    let fail = true
+    let spawnCount = 0
+    session.spawnAgent = () => { spawnCount++; return new FakeAgentProc(provider, ref.sessionId) }
+    const init = async () => fail
+      ? { state: 'error', error: new Error('resume transport failed') }
+      : { state: 'init' }
+    session.waitForCodexInitialization = init
+    session.waitForProcEarlyFailure = init
+
+    expect(await session.restoreAfterDaemonRestart()).toBe(false)
+    expect(session.shouldRevive()).toBe(true)
+    await session.onUserMessage('不得开启新会话')
+    expect(spawnCount).toBe(1)
+    expect(session.proc).toBeNull()
+    expect(session.lastSessionId).toBe(ref.sessionId)
+    expect(resumeRefs.get(`${session.sessionName}:${provider}`)).toEqual(ref)
+    expect(sentTexts.join('\n')).toContain('这条消息未送给 Agent')
+    expect(clearedResumes).toEqual([])
+
+    fail = false
+    expect(await session.restart(true, { announce: false })).toBe(true)
+    expect(session.daemonRestoreRequired).toBe(false)
+    expect(session.lastSessionId).toBe(ref.sessionId)
+    await session.stop('测试收尾', { announce: false })
+    expect(session.shouldRevive()).toBe(false)
+  })
+
+  test('daemon recovery without a resume point never creates a fresh conversation implicitly', async () => {
+    const session = new Session('daemon-restore-missing', 'chat_id') as any
+    let spawns = 0
+    session.spawnAgent = () => { spawns++; return new FakeAgentProc('codex') }
+    expect(await session.restoreAfterDaemonRestart()).toBe(false)
+    await session.onUserMessage('不得创建新会话')
+    expect(spawns).toBe(0)
+    expect(session.shouldRevive()).toBe(true)
+    await session.stop('用户明确停止', { announce: false })
+    expect(session.shouldRevive()).toBe(false)
+  })
+
+  test('explicit fresh start clears a failed daemon recovery guard', async () => {
+    const session = new Session('daemon-restore-fresh', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    expect(await session.restoreAfterDaemonRestart()).toBe(false)
+    const proc = new FakeAgentProc('codex', 'new-thread')
+    proc.launchKind = 'fresh'
+    session.spawnAgent = () => proc
+    expect(await session.start({ announce: false })).toBe(true)
+    expect(session.daemonRestoreRequired).toBe(false)
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('the outer initialization guard allows a ten-minute materialization read to finish', async () => {
+    const session = new Session('daemon-restore-slow', 'chat_id') as any
+    let now = 0
+    let nextId = 1
+    const timers = new Map<number, { due: number; callback: () => void }>()
+    const timeout = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay: number) => {
+      const id = nextId++
+      timers.set(id, { due: now + delay, callback })
+      return id as unknown as ReturnType<typeof setTimeout>
+    }) as typeof setTimeout)
+    const clear = spyOn(globalThis, 'clearTimeout').mockImplementation(((id: number) => { timers.delete(id) }) as typeof clearTimeout)
+    let ready!: () => void
+    const initialization = new Promise<void>(resolve => { ready = resolve })
+    let outcome: unknown = null
+    let notices = 0
+    try {
+      const waiting = session.waitForCodexInitialization(initialization, () => { notices++ })
+      void waiting.then((result: unknown) => { outcome = result })
+      for (const elapsed of [120_000, 660_000]) {
+        now = elapsed
+        for (const [id, timer] of timers) {
+          if (timer.due > now) continue
+          timers.delete(id)
+          timer.callback()
+        }
+        await Promise.resolve()
+        expect(outcome).toBeNull()
+      }
+      ready()
+      expect(await waiting).toEqual({ state: 'init', error: undefined })
+      expect(notices).toBe(1)
+      expect(timers.size).toBe(0)
+    } finally {
+      timeout.mockRestore()
+      clear.mockRestore()
+    }
+  })
+
+  test('Codex init timeout is a failed start and never reports ready', async () => {
+    const session = new Session('codex-timeout', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', null)
+    const statuses: string[] = []
+    session.selectedProvider = 'codex'
+    session.spawnAgent = () => proc
+    session.waitForCodexInitialization = async () => ({ state: 'timeout' })
+
+    const ok = await session.start({
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(proc.killCalls).toBe(1)
+    expect(session.proc).toBeNull()
+    expect(session.status).toBe('stopped')
+    expect(statuses.some(status => status.includes('启动超时'))).toBe(true)
+    expect(statuses.some(status => status.includes('720 秒'))).toBe(true)
+    expect(statuses.some(status => status.includes('已就绪'))).toBe(false)
+  })
+
+  test('Codex initialization rejection surfaces the method-specific error instead of the outer timeout', async () => {
+    const session = new Session('codex-init-error', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', null)
+    proc.initialization = Promise.reject(new Error(
+      'codex app-server thread/start request timed out after 30000ms (id=2)',
+    ))
+    const statuses: string[] = []
+    session.selectedProvider = 'codex'
+    session.spawnAgent = () => proc
+
+    const ok = await session.start({
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(proc.killCalls).toBe(1)
+    expect(statuses.join('\n')).toContain('thread/start request timed out after 30000ms (id=2)')
+    expect(statuses.join('\n')).not.toContain('启动超时')
+    expect(statuses.join('\n')).not.toContain('已就绪')
+  })
+
+  test('Codex init failure also exposes an unconfirmed process termination', async () => {
+    const session = new Session('codex-init-kill-fails', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', null)
+    proc.initialization = Promise.reject(new Error('thread/start transport failed'))
+    proc.kill = async () => {
+      proc.killCalls++
+      throw new Error('kill timeout')
+    }
+    session.selectedProvider = 'codex'
+    session.spawnAgent = () => proc
+    const statuses: string[] = []
+
+    const ok = await session.start({
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(session.blockedProc).toBe(proc)
+    expect(statuses.join('\n')).toContain('thread/start transport failed')
+    expect(statuses.join('\n')).toContain('进程终止未确认: kill timeout')
+
+    proc.alive = false
+    proc.emit('exit', { code: null, signal: 'SIGKILL', expected: true })
+  })
+
+  test('confirmed no-rollout resume failure invalidates only the matching legacy ghost binding', async () => {
+    const session = new Session('codex-ghost-resume', 'chat_id') as any
+    const ghostId = '0198d6fa-1234-7000-8000-000000000001'
+    const ghostRef = { provider: 'codex' as const, sessionId: ghostId, cwd: session.workDir }
+    session.selectedProvider = 'codex'
+    session.lastSessionRef = ghostRef
+    session.lastSessionId = ghostRef.sessionId
+    resumeRefs.set(`${session.sessionName}:codex`, ghostRef)
+    const proc = new FakeAgentProc('codex', null)
+    proc.launchKind = 'resume'
+    proc.initialization = Promise.reject(new CodexRpcResponseError(
+      'thread/resume', 2, -32600, `no rollout found for thread id ${ghostId}`,
+    ))
+    session.spawnAgent = () => proc
+    const statuses: string[] = []
+
+    const ok = await session.restart(true, {
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(proc.killCalls).toBe(1)
+    expect(clearedResumes).toContainEqual([session.sessionName, 'codex'])
+    expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+    expect(session.lastSessionRef).toBeNull()
+    expect(session.lastSessionId).toBeNull()
+    expect(statuses.join('\n')).toContain(`no rollout found for thread id ${ghostId}`)
+    expect(statuses.join('\n')).toContain('已作废无 rollout 的恢复点')
+  })
+
+  test('unrelated or mismatched Codex resume errors never clear a binding', () => {
+    const session = new Session('codex-resume-keep', 'chat_id') as any
+    const currentId = '0198d6fa-1234-7000-8000-000000000010'
+    const olderId = '0198d6fa-1234-7000-8000-000000000011'
+    const ref = { provider: 'codex' as const, sessionId: currentId, cwd: session.workDir }
+    session.selectedProvider = 'codex'
+    session.lastSessionRef = ref
+    session.lastSessionId = ref.sessionId
+    resumeRefs.set(`${session.sessionName}:codex`, ref)
+
+    expect(session.invalidateMissingCodexResume(
+      ref.sessionId,
+      new Error('codex app-server thread/resume failed: account unavailable'),
+    )).toBeNull()
+    expect(session.invalidateMissingCodexResume(
+      ref.sessionId,
+      new CodexRpcResponseError(
+        'thread/resume', 2, -32600, `no rollout found for thread id ${olderId}`,
+      ),
+    )).toBeNull()
+    expect(session.invalidateMissingCodexResume(
+      ref.sessionId,
+      new CodexRpcResponseError(
+        'thread/resume', 3, -32000, `no rollout found for thread id ${currentId}`,
+      ),
+    )).toBeNull()
+    expect(session.invalidateMissingCodexResume(
+      ref.sessionId,
+      new CodexRpcResponseError(
+        'thread/resume', 4, -32600, `prefix: no rollout found for thread id ${currentId}`,
+      ),
+    )).toBeNull()
+
+    expect(clearedResumes).toEqual([])
+    expect(resumeRefs.get(`${session.sessionName}:codex`)).toEqual(ref)
+    expect(session.lastSessionId).toBe(ref.sessionId)
+  })
+
+  test('legacy cwd-null ghost binding is invalidated during thread/read migration', async () => {
+    const session = new Session('codex-legacy-ghost', 'chat_id') as any
+    const ghostId = '0198d6fa-1234-7000-8000-000000000099'
+    const ghostRef = { provider: 'codex' as const, sessionId: ghostId, cwd: null }
+    session.selectedProvider = 'codex'
+    session.lastSessionRef = ghostRef
+    session.lastSessionId = ghostId
+    resumeRefs.set(`${session.sessionName}:codex`, ghostRef)
+    session.resolveLegacyResumeRef = async () => {
+      const readError = new CodexRpcResponseError(
+        'thread/read', 2, -32600, `no rollout found for thread id ${ghostId}`,
+      )
+      const cleanupError = new Error('catalog kill timeout')
+      throw new AggregateError(
+        [readError, cleanupError],
+        `Codex legacy resume lookup and cleanup failed: read=${readError.message}; cleanup=${cleanupError.message}`,
+      )
+    }
+    let spawnCalls = 0
+    session.spawnAgent = () => { spawnCalls++; return new FakeAgentProc('codex') }
+    const statuses: string[] = []
+
+    const ok = await session.restart(true, {
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(spawnCalls).toBe(0)
+    expect(clearedResumes).toContainEqual([session.sessionName, 'codex'])
+    expect(session.lastSessionRef).toBeNull()
+    expect(session.lastSessionId).toBeNull()
+    expect(statuses.join('\n')).toContain('旧会话不可恢复')
+    expect(statuses.join('\n')).toContain('已作废无 rollout 的恢复点')
+    expect(statuses.join('\n')).toContain('catalog kill timeout')
+  })
+
+  test('serializes concurrent restarts so a kill completes before either replacement spawn', async () => {
+    const session = new Session('restart-race', 'chat_id') as any
+    const initial = new FakeAgentProc('claude', 'session-initial')
+    session.proc = initial
+    session.selectedProvider = 'claude'
+    session.waitForProcEarlyFailure = async () => ({ state: 'ready' })
+
+    let releaseInitialKill: () => void = () => {}
+    const initialKillGate = new Promise<void>(resolve => { releaseInitialKill = resolve })
+    initial.kill = async () => {
+      initial.killCalls++
+      await initialKillGate
+      initial.alive = false
+      initial.emit('exit', { code: 0, signal: null, expected: true })
+    }
+
+    const spawned: FakeAgentProc[] = []
+    const aliveAtSpawn: number[] = []
+    session.spawnAgent = () => {
+      aliveAtSpawn.push([initial, ...spawned].filter(proc => proc.alive).length)
+      const proc = new FakeAgentProc('claude', `session-${spawned.length + 1}`)
+      spawned.push(proc)
+      return proc
+    }
+
+    const first = session.restart(false, { announce: false })
+    const second = session.restart(false, { announce: false })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(initial.killCalls).toBe(1)
+    expect(spawned).toHaveLength(0)
+    releaseInitialKill()
+
+    expect(await Promise.all([first, second])).toEqual([true, true])
+    expect(aliveAtSpawn).toEqual([0, 0])
+    expect(spawned).toHaveLength(2)
+    expect(spawned[0].killCalls).toBe(1)
+    expect(spawned.filter(proc => proc.alive)).toEqual([spawned[1]])
+    expect(session.proc).toBe(spawned[1])
+
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('restart freezes a Codex conversation that materializes while the old process is stopping', async () => {
+    const session = new Session('restart-materialize-race', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const oldProc = new FakeAgentProc('codex', 'materialized-thread')
+    oldProc.launchKind = 'fresh'
+    oldProc.conversationResumable = false
+    session.proc = oldProc
+    session.wireProc(oldProc)
+    oldProc.kill = async () => {
+      oldProc.killCalls++
+      oldProc.conversationResumable = true
+      oldProc.emit('conversation_materialized', {
+        session_id: oldProc.sessionId,
+        source: 'turn/started notification',
+      })
+      oldProc.alive = false
+      oldProc.emit('exit', { code: 0, signal: null, expected: true })
+    }
+    let resumedRef: any = null
+    session.spawnAgent = (ref: any) => {
+      resumedRef = ref
+      const replacement = new FakeAgentProc('codex', ref?.sessionId ?? null)
+      replacement.launchKind = 'resume'
+      replacement.conversationResumable = true
+      return replacement
+    }
+
+    const ok = await session.restart(true, { announce: false })
+
+    expect(ok).toBe(true)
+    expect(resumedRef).toEqual({
+      provider: 'codex', sessionId: 'materialized-thread', cwd: session.workDir,
+    })
+    expect(session.lastSessionId).toBe('materialized-thread')
+    expect(resumeRefs.get(`${session.sessionName}:codex`)?.sessionId).toBe('materialized-thread')
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('restart waits an in-flight Codex materialization verification before killing its owner', async () => {
+    const session = new Session('restart-materialize-barrier', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const oldProc = new FakeAgentProc('codex', 'verified-thread')
+    oldProc.launchKind = 'fresh'
+    oldProc.conversationResumable = false
+    let releaseVerification: () => void = () => {}
+    oldProc.materializationBarrier = new Promise<void>(resolve => { releaseVerification = resolve })
+    session.proc = oldProc
+    session.wireProc(oldProc)
+    let resumedRef: any = null
+    session.spawnAgent = (ref: any) => {
+      resumedRef = ref
+      const replacement = new FakeAgentProc('codex', ref?.sessionId ?? null)
+      replacement.launchKind = 'resume'
+      return replacement
+    }
+
+    const restarting = session.restart(true, { announce: false })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(oldProc.killCalls).toBe(0)
+    session.pendingMidTurnMsgs = [{
+      text: 'must not drain', wireText: 'must not drain', userOpenId: '', msgId: '',
+    }]
+    oldProc.emit('result', { is_error: false, checkpoint: null })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(oldProc.sentTexts).toEqual([])
+    expect(session.pendingMidTurnMsgs).toHaveLength(1)
+
+    oldProc.conversationResumable = true
+    releaseVerification()
+    expect(await restarting).toBe(true)
+    expect(oldProc.killCalls).toBe(1)
+    expect(resumedRef?.sessionId).toBe('verified-thread')
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('restart preserves an idle fresh Codex process when its only resume point cannot be verified', async () => {
+    const session = new Session('restart-materialize-fails-safe', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.status = 'idle'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    proc.materializationBarrier = Promise.reject(new Error('thread/read materialization timeout'))
+    session.proc = proc
+    session.wireProc(proc)
+    session.agentCapability = 'retained-process-capability'
+    let spawnCalls = 0
+    session.spawnAgent = () => { spawnCalls++; return new FakeAgentProc('codex') }
+    const statuses: string[] = []
+
+    const ok = await session.restart(true, {
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })
+
+    expect(ok).toBe(false)
+    expect(proc.killCalls).toBe(0)
+    expect(spawnCalls).toBe(0)
+    expect(session.proc).toBe(proc)
+    expect(session.stoppingProc).toBeNull()
+    expect(session.status).toBe('idle')
+    expect(session.acceptsAgentCapability('retained-process-capability')).toBe(true)
+    expect(statuses.join('\n')).toContain('已保留当前进程')
+    proc.materializationBarrier = null
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('stop persists a verified Codex materialization that lands during SIGTERM', async () => {
+    const session = new Session('stop-materialize-race', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'materialized-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+    session.wireProc(proc)
+    proc.kill = async () => {
+      proc.killCalls++
+      proc.conversationResumable = true
+      proc.emit('conversation_materialized', {
+        session_id: proc.sessionId,
+        source: 'turn/started notification',
+      })
+      proc.alive = false
+      proc.emit('exit', { code: 0, signal: null, expected: true })
+    }
+
+    await session.stop('测试停止', { announce: false })
+
+    expect(session.lastSessionId).toBe('materialized-thread')
+    expect(resumeRefs.get(`${session.sessionName}:codex`)?.sessionId).toBe('materialized-thread')
+  })
+
+  test('stop fails transparently when the final materialized Codex resume point cannot fsync', async () => {
+    const session = new Session('stop-materialize-fsync-fails', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'materialized-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+    session.wireProc(proc)
+    proc.kill = async () => {
+      proc.killCalls++
+      proc.conversationResumable = true
+      proc.alive = false
+      proc.emit('exit', { code: 0, signal: null, expected: true })
+    }
+    setResumeWriteError(new Error('final resume-map fsync failed'))
+
+    try {
+      await expect(session.stop('测试停止', { announce: false })).rejects.toThrow(
+        'final resume-map fsync failed',
+      )
+      expect(session.status).toBe('stopped')
+      expect(session.proc).toBeNull()
+      expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+      expect(sentRawTexts.some(text => text.includes('当前进程可继续'))).toBe(false)
+    } finally {
+      setResumeWriteError(null)
+    }
+  })
+
+  test('a blocked Codex process that materializes before its late exit still commits resume and checkpoint', async () => {
+    const session = new Session('blocked-late-materialize', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    const proc = new FakeAgentProc('codex', 'fresh-thread')
+    proc.launchKind = 'fresh'
+    proc.conversationResumable = false
+    session.proc = proc
+    session.wireProc(proc)
+    const checkpoint = {
+      provider: 'codex' as const,
+      kind: 'turn' as const,
+      id: 'turn-fast',
+      source: { provider: 'codex' as const, sessionId: 'fresh-thread', cwd: session.workDir },
+    }
+    proc.emit('result', { is_error: false, checkpoint })
+    proc.kill = async () => {
+      proc.killCalls++
+      throw new Error('kill timeout')
+    }
+
+    await expect(session.stop('测试停止', { announce: false })).rejects.toThrow('kill timeout')
+    expect(session.blockedProc).toBe(proc)
+    proc.conversationResumable = true
+    proc.alive = false
+    proc.emit('exit', { code: null, signal: 'SIGKILL', expected: true })
+
+    expect(session.proc).toBeNull()
+    expect(resumeRefs.get(`${session.sessionName}:codex`)?.sessionId).toBe('fresh-thread')
+    expect(turnAnchorsBySession.get(session.sessionName)?.[0]?.checkpoint).toEqual(checkpoint)
+  })
+
+  test('ignores late events from a replaced process generation', async () => {
+    const session = new Session('stale-events', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-session')
+    const currentProc = new FakeAgentProc('claude', 'current-session')
+    session.attachProc(oldProc)
+    session.attachProc(currentProc)
+    session.initCount = 0
+
+    oldProc.emit('init', { session_id: 'old-session' })
+    oldProc.emit('assistant_text', { text: 'stale output', parentToolUseId: null })
+    oldProc.emit('exit', { code: 0, signal: 'SIGTERM', expected: false })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(session.proc).toBe(currentProc)
+    expect(session.initCount).toBe(0)
+    expect(session.orphanAssistantCurrent).toBe('')
+    expect(sentTexts.some(text => text.includes('异常退出'))).toBe(false)
+
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('an obsolete main-card open cannot replace a newer process turn or clear its opening owner', async () => {
+    const session = new Session('stale-main-open', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-session')
+    const newProc = new FakeAgentProc('claude', 'new-session')
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+
+    let releaseOldConvert: () => void = () => {}
+    const oldConvertGate = new Promise<void>(resolve => { releaseOldConvert = resolve })
+    let releaseNewConvert: () => void = () => {}
+    const newConvertGate = new Promise<void>(resolve => { releaseNewConvert = resolve })
+    let convertCount = 0
+    const baseFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.pathname.endsWith('/cards/id_convert')) {
+        const n = ++convertCount
+        if (n === 1) await oldConvertGate
+        if (n === 2) await newConvertGate
+        return new Response(JSON.stringify({ code: 0, data: { card_id: n === 1 ? 'card_old_open' : 'card_new_open' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      session.attachProc(oldProc)
+      session.pendingUserMessageCount = 1
+      session.pendingTurnInputs = ['old input']
+      oldProc.emit('init', { session_id: 'old-session' })
+      await waitUntil(() => convertCount === 1)
+
+      session.attachProc(newProc)
+      session.pendingUserMessageCount = 1
+      session.pendingTurnInputs = ['new input']
+      newProc.emit('init', { session_id: 'new-session' })
+      await waitUntil(() => convertCount === 2)
+
+      releaseOldConvert()
+      await waitUntil(() => calls.some(call =>
+        call.method === 'PATCH' && call.path === '/cards/card_old_open/settings'
+      ))
+      expect(session.currentTurn).toBeNull()
+      expect(session.openingTurn).toBe(true)
+
+      releaseNewConvert()
+      await waitUntil(() => session.currentTurn?.cardId === 'card_new_open' && !session.openingTurn)
+      expect(session.currentTurn.cardId).toBe('card_new_open')
+      expect(session.proc).toBe(newProc)
+    } finally {
+      releaseOldConvert()
+      releaseNewConvert()
+      if (session.currentTurn) await session.closeTurnCard('测试收尾')
+      globalThis.fetch = baseFetch
+    }
+  })
+
+  test('cold reset failure never leaves a main-card opening owner behind', async () => {
+    const session = new Session('cold-reset-failure', 'chat_id') as any
+    session.resetFreshConversationState = () => { throw new Error('reset failed') }
+
+    await expect(session.startColdUserTurn('hello', 'hello', 'ou_user')).rejects.toThrow('reset failed')
+
+    expect(session.openingTurn).toBe(false)
+    expect(session.openingTurnOwner).toBeNull()
+    expect(sentCards).toHaveLength(0)
+  })
+
+  test('opens a mid-turn card before feeding the buffered batch and drops input on card init failure', async () => {
+    const session = new Session('midturn-card-first', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.pendingMidTurnMsgs = [{
+      text: 'queued input', wireText: 'queued input', userOpenId: 'ou_user', msgId: 'om_queued',
+    }]
+    session.pendingReactionIds = new Map([['om_queued', 'reaction_waiting']])
+
+    const baseFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      if (url.pathname.endsWith('/cards/id_convert')) {
+        return new Response(JSON.stringify({ code: 99, msg: 'convert failed' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      await session.drainMidTurnAndOpen()
+
+      expect(proc.sentTexts).toEqual([])
+      expect(session.currentTurn).toBeNull()
+      expect(session.status).toBe('idle')
+      expect(sentRawTexts.join('\n')).toContain('尚未送给 Claude')
+      expect(deletedReactions).toContainEqual(['om_queued', 'reaction_waiting'])
+    } finally {
+      globalThis.fetch = baseFetch
+    }
+  })
+
+  test('unexpected exit terminalizes the main card, settles tasks, and alerts even for code=0 SIGTERM', async () => {
+    const session = new Session('unexpected-exit', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    const turn = turnState('card_unexpected_exit')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    session.backgroundTasks = [{
+      id: 'bg-1', type: 'shell', description: 'still running', status: 'running',
+      startedAt: Date.now(), steps: [],
+    }]
+    cardkit.recordCardCreated(turn.cardId, 1)
+    session.attachProc(proc)
+
+    proc.emit('exit', { code: 0, signal: 'SIGTERM', expected: false })
+    await session.lifecycleTail
+
+    expect(session.proc).toBeNull()
+    expect(session.currentTurn).toBeNull()
+    expect(session.backgroundTasks).toEqual([])
+    expect(session.status).toBe('stopped')
+    expect(sentTexts.some(text =>
+      text.includes('异常退出') && text.includes('code=0') && text.includes('SIGTERM')
+    )).toBe(true)
+    const footerWrites = calls.filter(call =>
+      call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`
+    )
+    expect(footerWrites.some(call => JSON.parse(call.body.element).content.includes('异常退出'))).toBe(true)
+    expect(calls.some(call =>
+      call.method === 'PATCH' && call.path === `/cards/${turn.cardId}/settings`
+    )).toBe(true)
+  })
+
+  test('a three-hour turn uses hours in both the final footer and chat-list preview', async () => {
+    const session = new Session('long-turn-duration', 'chat_id') as any
+    const turn = turnState('card_long_turn_duration')
+    turn.startedAt = Date.now() - 10_800_000
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    try {
+      await session.closeTurnCard(undefined, { hasFreshResult: false })
+      const footer = calls.find(call =>
+        call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`
+      )
+      expect(JSON.parse(footer?.body.element ?? '{}').content).toContain('✅ ⏱ 3h')
+      const settings = calls.find(call =>
+        call.method === 'PATCH' && call.path === `/cards/${turn.cardId}/settings`
+      )
+      expect(JSON.parse(settings?.body.settings ?? '{}').config.summary.content).toBe('✅ · ⏱ 3h')
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+      session.dispose()
+    }
+  })
+
+  test('keeps CardKit state and sends fallback when the terminal footer transaction misses', async () => {
+    const session = new Session('terminal-miss', 'chat_id') as any
+    const turn = turnState('card_terminal_miss')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    const baseFetch = globalThis.fetch
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      if (method === 'PUT' && path === `/cards/${turn.cardId}/elements/footer`) {
+        calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+        return new Response(JSON.stringify({ code: 300121, msg: 'footer rejected' }), {
+          headers: { 'Content-Type': 'application/json', 'x-tt-logid': 'terminal-footer-id' },
+        })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      await session.closeTurnCard()
+
+      expect(sentRawTexts.join('\n')).toContain('终态写入失败')
+      expect(sentRawTexts.join('\n')).toContain('footer=MISS')
+      expect(sentRawTexts.join('\n')).toContain('message=footer rejected')
+      expect(sentRawTexts.join('\n')).toContain('log_id=terminal-footer-id')
+      // A disposed card returns false immediately. A successful repair PATCH
+      // proves closeTurnCard deliberately retained the state after the miss.
+      expect(await cardkit.patchSettingsChecked(turn.cardId, { config: { streaming_mode: false } })).toBe(true)
+    } finally {
+      globalThis.fetch = baseFetch
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('an old close snapshots usage and reactions without clearing the next turn', async () => {
+    const session = new Session('close-snapshot', 'chat_id') as any
+    const oldProc = new FakeAgentProc('codex', 'old-session')
+    oldProc.lastUsage = { input_tokens: 100, output_tokens: 11, total_tokens: 111 }
+    ;(oldProc as any).lastContextWindow = 1000
+    session.proc = oldProc
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = null
+    const oldTurn = turnState('card_close_snapshot_old')
+    oldTurn.userOpenId = ''
+    session.currentTurn = oldTurn
+    session.lastTurnUsage = { input_tokens: 100, output_tokens: 11, total_tokens: 111 }
+    session.lastTurnDelta = { tokens: 111, costUsd: 1.234, durationMs: 1000 }
+    session.currentBatchReactionIds = new Map([['om_old_batch', 'rid_old_batch']])
+    session.pendingReactionIds = new Map([['om_old_pending', 'rid_old_pending']])
+    cardkit.recordCardCreated(oldTurn.cardId, 1)
+
+    let signalFlushStarted: () => void = () => {}
+    const flushStarted = new Promise<void>(resolve => { signalFlushStarted = resolve })
+    let releaseFlush: () => void = () => {}
+    const flushGate = new Promise<void>(resolve => { releaseFlush = resolve })
+    const realFlush = cardkit.flush
+    const flushSpy = spyOn(cardkit, 'flush').mockImplementation(async (cardId: string) => {
+      if (cardId === oldTurn.cardId) {
+        signalFlushStarted()
+        await flushGate
+      }
+      await realFlush(cardId)
+    })
+
+    try {
+      const closing = session.closeTurnCard(undefined, { hasFreshResult: true })
+      await flushStarted
+
+      const newProc = new FakeAgentProc('codex', 'new-session')
+      newProc.lastUsage = { input_tokens: 9000, output_tokens: 999, total_tokens: 9999 }
+      session.attachProc(newProc)
+      const newTurn = turnState('card_close_snapshot_new')
+      session.currentTurn = newTurn
+      session.lastTurnUsage = { input_tokens: 9000, output_tokens: 999, total_tokens: 9999 }
+      session.lastTurnDelta = { tokens: 9999, costUsd: 9.999, durationMs: 9000 }
+      session.currentBatchReactionIds = new Map([['om_new_batch', 'rid_new_batch']])
+      session.pendingReactionIds = new Map([['om_new_pending', 'rid_new_pending']])
+
+      releaseFlush()
+      await closing
+
+      expect(session.currentTurn).toBe(newTurn)
+      expect([...session.currentBatchReactionIds.entries()]).toEqual([['om_new_batch', 'rid_new_batch']])
+      expect([...session.pendingReactionIds.entries()]).toEqual([['om_new_pending', 'rid_new_pending']])
+      expect(deletedReactions).toContainEqual(['om_old_batch', 'rid_old_batch'])
+      expect(deletedReactions).toContainEqual(['om_old_pending', 'rid_old_pending'])
+      expect(deletedReactions).not.toContainEqual(['om_new_batch', 'rid_new_batch'])
+
+      const footer = calls.find(call =>
+        call.method === 'PUT' && call.path === `/cards/${oldTurn.cardId}/elements/footer`
+      )
+      const footerContent = JSON.parse(footer?.body.element ?? '{}').content as string
+      expect(footerContent).toContain('$1.234')
+      expect(footerContent).not.toContain('$9.999')
+      const settingsCall = calls.find(call =>
+        call.method === 'PATCH' && call.path === `/cards/${oldTurn.cardId}/settings`
+      )
+      const settings = JSON.parse(settingsCall?.body.settings ?? '{}')
+      expect(settings.config.summary.content).toContain('📶 11')
+      expect(settings.config.summary.content).not.toContain('999')
+    } finally {
+      releaseFlush()
+      flushSpy.mockRestore()
+      if (session.currentTurn) session.stopFooterStatus(session.currentTurn)
+      session.currentTurn = null
+      await cardkit.dispose(oldTurn.cardId)
+    }
+  })
+
+  test('restart waits for a close that already removed currentTurn before spawning', async () => {
+    const session = new Session('restart-close-owner', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-session')
+    const oldTurn = turnState('card_restart_close_owner')
+    oldTurn.provider = 'claude'
+    oldTurn.userOpenId = ''
+    session.proc = oldProc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.currentTurn = oldTurn
+    cardkit.recordCardCreated(oldTurn.cardId, 1)
+
+    let signalFlushStarted: () => void = () => {}
+    const flushStarted = new Promise<void>(resolve => { signalFlushStarted = resolve })
+    let releaseFlush: () => void = () => {}
+    const flushGate = new Promise<void>(resolve => { releaseFlush = resolve })
+    const realFlush = cardkit.flush
+    const flushSpy = spyOn(cardkit, 'flush').mockImplementation(async (cardId: string) => {
+      if (cardId === oldTurn.cardId) {
+        signalFlushStarted()
+        await flushGate
+      }
+      await realFlush(cardId)
+    })
+    const spawned: FakeAgentProc[] = []
+    session.spawnAgent = () => {
+      const proc = new FakeAgentProc('claude', `new-session-${spawned.length + 1}`)
+      spawned.push(proc)
+      return proc
+    }
+    session.waitForProcEarlyFailure = async () => ({ state: 'ready' })
+
+    try {
+      const oldClose = session.closeTurnCard('旧轮收尾')
+      await flushStarted
+      expect(session.currentTurn).toBeNull()
+
+      const restarting = session.restart(false, { announce: false })
+      await waitUntil(() => oldProc.killCalls === 1)
+      expect(spawned).toHaveLength(0)
+
+      releaseFlush()
+      await oldClose
+      expect(await restarting).toBe(true)
+      expect(spawned).toHaveLength(1)
+      expect(session.proc).toBe(spawned[0])
+    } finally {
+      releaseFlush()
+      flushSpy.mockRestore()
+      if (session.proc?.isAlive()) await session.stop('测试收尾', { announce: false })
+      await cardkit.dispose(oldTurn.cardId)
+    }
+  })
+
+  test('Claude pending precommit failure leaves the old binding untouched and never starts replacement', async () => {
+    const session = new Session('rollback-anchor-commit', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.lastSessionId = 'old-session'
+    session.lastSessionRef = { provider: 'claude', sessionId: 'old-session', cwd: session.workDir }
+    const oldAnchor = {
+      checkpoint: {
+        provider: 'claude', kind: 'assistant-message', id: 'assistant-old',
+        source: { provider: 'claude', sessionId: 'old-session', cwd: session.workDir },
+      },
+      preview: 'old input', ts: 1, writes: [],
+    } as any
+    const nextAnchor = {
+      checkpoint: {
+        provider: 'claude', kind: 'assistant-message', id: 'assistant-next',
+        source: { provider: 'claude', sessionId: 'source-session', cwd: session.workDir },
+      },
+      preview: 'next input', ts: 2, writes: [],
+    } as any
+    turnAnchorsBySession.set(session.sessionName, [oldAnchor])
+    branchBaseBySession.set(session.sessionName, { kind: 'fresh' })
+
+    const replacement = new FakeAgentProc('claude', 'replacement-session')
+    session.restartUnlocked = async () => {
+      session.proc = replacement
+      session.lastSessionId = 'replacement-session'
+      session.lastSessionRef = { provider: 'claude', sessionId: 'replacement-session', cwd: session.workDir }
+      session.status = 'idle'
+      return true
+    }
+    const realReplace = feishu.replaceTurnAnchors
+    let replaceCalls = 0
+    const replaceSpy = spyOn(feishu, 'replaceTurnAnchors').mockImplementation((sessionName, anchors, base) => {
+      replaceCalls++
+      if (replaceCalls === 1) throw new Error('turn-map fsync failed')
+      return realReplace(sessionName, anchors, base)
+    })
+
+    try {
+      await expect(session.rollbackTo(
+        {
+          kind: 'fork',
+          source: { provider: 'claude', sessionId: 'source-session', cwd: session.workDir },
+          through: nextAnchor.checkpoint,
+        },
+        { anchors: [nextAnchor], base: { kind: 'fresh' } },
+        { announce: false },
+      )).rejects.toThrow('turn-map fsync failed')
+
+      expect(replacement.killCalls).toBe(0)
+      expect(session.proc).toBeNull()
+      expect(session.status).toBe('stopped')
+      expect(session.lastSessionId).toBe('old-session')
+      expect(turnAnchorsBySession.get(session.sessionName)).toEqual([oldAnchor])
+      expect(branchBaseBySession.get(session.sessionName)).toEqual({ kind: 'fresh' })
+      expect(boundResumes).not.toContainEqual([session.sessionName, 'old-session', 'claude'])
+      expect(replaceCalls).toBe(1)
+    } finally {
+      replaceSpy.mockRestore()
+    }
+  })
+
+  test('Codex rollback stops replacement and restores state when post-start branch commit fails', async () => {
+    const session = new Session('codex-rollback-anchor-commit', 'chat_id') as any
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = null
+    session.lastSessionId = 'old-thread'
+    session.lastSessionRef = { provider: 'codex', sessionId: 'old-thread', cwd: session.workDir }
+    const oldAnchor = {
+      checkpoint: {
+        provider: 'codex', kind: 'turn', id: 'turn-old',
+        source: { provider: 'codex', sessionId: 'old-thread', cwd: session.workDir },
+      },
+      preview: 'old input', ts: 1, writes: [],
+    } as any
+    const nextAnchor = {
+      checkpoint: {
+        provider: 'codex', kind: 'turn', id: 'turn-next',
+        source: { provider: 'codex', sessionId: 'source-thread', cwd: session.workDir },
+      },
+      preview: 'next input', ts: 2, writes: [],
+    } as any
+    turnAnchorsBySession.set(session.sessionName, [oldAnchor])
+    branchBaseBySession.set(session.sessionName, { kind: 'fresh' })
+
+    const replacement = new FakeAgentProc('codex', 'replacement-thread')
+    session.restartUnlocked = async () => {
+      session.proc = replacement
+      session.lastSessionId = 'replacement-thread'
+      session.lastSessionRef = { provider: 'codex', sessionId: 'replacement-thread', cwd: session.workDir }
+      session.status = 'idle'
+      return true
+    }
+    const realReplace = feishu.replaceTurnAnchors
+    let replaceCalls = 0
+    const replaceSpy = spyOn(feishu, 'replaceTurnAnchors').mockImplementation((sessionName, anchors, base, pending) => {
+      replaceCalls++
+      if (replaceCalls === 1) throw new Error('turn-map fsync failed')
+      return realReplace(sessionName, anchors, base, pending)
+    })
+
+    try {
+      await expect(session.rollbackTo(
+        {
+          kind: 'fork',
+          source: { provider: 'codex', sessionId: 'source-thread', cwd: session.workDir },
+          through: nextAnchor.checkpoint,
+        },
+        { anchors: [nextAnchor], base: { kind: 'fresh' } },
+        { announce: false },
+      )).rejects.toThrow('turn-map fsync failed')
+
+      expect(replacement.killCalls).toBe(1)
+      expect(session.proc).toBeNull()
+      expect(session.status).toBe('stopped')
+      expect(session.lastSessionId).toBe('old-thread')
+      expect(turnAnchorsBySession.get(session.sessionName)).toEqual([oldAnchor])
+      expect(branchBaseBySession.get(session.sessionName)).toEqual({ kind: 'fresh' })
+      expect(boundResumes).toContainEqual([session.sessionName, 'old-thread', 'codex'])
+      expect(replaceCalls).toBe(2)
+    } finally {
+      replaceSpy.mockRestore()
+    }
+  })
+
+  test('rollback never resurrects a previous Codex binding that app-server confirmed has no rollout', async () => {
+    const session = new Session('codex-rollback-ghost', 'chat_id') as any
+    const ghostId = '0198d6fa-1234-7000-8000-000000000077'
+    const ghostRef = { provider: 'codex' as const, sessionId: ghostId, cwd: session.workDir }
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = null
+    session.lastSessionId = ghostId
+    session.lastSessionRef = ghostRef
+    resumeRefs.set(`${session.sessionName}:codex`, ghostRef)
+    const oldAnchor = {
+      checkpoint: {
+        provider: 'codex', kind: 'turn', id: 'turn-old', source: ghostRef,
+      },
+      preview: 'old input', ts: 1, writes: [],
+    } as any
+    turnAnchorsBySession.set(session.sessionName, [oldAnchor])
+    branchBaseBySession.set(session.sessionName, { kind: 'fresh' })
+    const replacement = new FakeAgentProc('codex', null)
+    replacement.launchKind = 'fork'
+    replacement.initialization = Promise.reject(new CodexRpcResponseError(
+      'thread/fork', 2, -32600, `no rollout found for thread id ${ghostId}`,
+    ))
+    session.spawnAgent = () => replacement
+
+    const ok = await session.rollbackTo(
+      { kind: 'fork', source: ghostRef },
+      { anchors: [], base: { kind: 'fork', source: ghostRef } },
+      { announce: false },
+    )
+
+    expect(ok).toBe(false)
+    expect(replacement.killCalls).toBe(1)
+    expect(resumeRefs.has(`${session.sessionName}:codex`)).toBe(false)
+    expect(session.lastSessionRef).toBeNull()
+    expect(session.lastSessionId).toBeNull()
+    expect(turnAnchorsBySession.get(session.sessionName)).toEqual([oldAnchor])
+    expect(branchBaseBySession.get(session.sessionName)).toEqual({ kind: 'fresh' })
+  })
+
+  test('rollback retains the prior binding when confirmed-ghost cleanup itself fails', async () => {
+    const session = new Session('codex-rollback-ghost-clear-fails', 'chat_id') as any
+    const ghostId = '0198d6fa-1234-7000-8000-000000000078'
+    const ghostRef = { provider: 'codex' as const, sessionId: ghostId, cwd: session.workDir }
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = null
+    session.lastSessionId = ghostId
+    session.lastSessionRef = ghostRef
+    resumeRefs.set(`${session.sessionName}:codex`, ghostRef)
+    const replacement = new FakeAgentProc('codex', null)
+    replacement.launchKind = 'fork'
+    replacement.initialization = Promise.reject(new CodexRpcResponseError(
+      'thread/fork', 2, -32600, `no rollout found for thread id ${ghostId}`,
+    ))
+    session.spawnAgent = () => replacement
+    const clearSpy = spyOn(feishu, 'clearSessionResumeChecked').mockImplementation(() => {
+      throw new Error('ghost cleanup fsync failed')
+    })
+
+    try {
+      const ok = await session.rollbackTo(
+        { kind: 'fork', source: ghostRef },
+        { anchors: [], base: { kind: 'fork', source: ghostRef } },
+        { announce: false },
+      )
+
+      expect(ok).toBe(false)
+      expect(session.lastSessionRef).toEqual(ghostRef)
+      expect(session.lastSessionId).toBe(ghostId)
+      expect(resumeRefs.get(`${session.sessionName}:codex`)).toEqual(ghostRef)
+    } finally {
+      clearSpy.mockRestore()
+    }
+  })
+
+  test('rollback stops an attached replacement when restart throws after it became ready', async () => {
+    const session = new Session('rollback-ready-throw', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.lastSessionId = 'old-session'
+    session.lastSessionRef = { provider: 'claude', sessionId: 'old-session', cwd: session.workDir }
+    const oldAnchor = {
+      checkpoint: {
+        provider: 'claude', kind: 'assistant-message', id: 'assistant-old',
+        source: { provider: 'claude', sessionId: 'old-session', cwd: session.workDir },
+      },
+      preview: 'old input', ts: 1, writes: [],
+    } as any
+    turnAnchorsBySession.set(session.sessionName, [oldAnchor])
+    branchBaseBySession.set(session.sessionName, { kind: 'fresh' })
+    const replacement = new FakeAgentProc('claude', 'replacement-session')
+    session.restartUnlocked = async () => {
+      session.proc = replacement
+      session.lastSessionId = 'replacement-session'
+      session.lastSessionRef = { provider: 'claude', sessionId: 'replacement-session', cwd: session.workDir }
+      session.status = 'idle'
+      throw new Error('ready callback failed')
+    }
+
+    await expect(session.rollbackTo({
+      kind: 'resume',
+      source: { provider: 'claude', sessionId: 'source-session', cwd: session.workDir },
+    })).rejects.toThrow('ready callback failed')
+
+    expect(replacement.killCalls).toBe(1)
+    expect(session.proc).toBeNull()
+    expect(session.status).toBe('stopped')
+    expect(session.lastSessionId).toBe('old-session')
+    expect(turnAnchorsBySession.get(session.sessionName)).toEqual([oldAnchor])
+    expect(branchBaseBySession.get(session.sessionName)).toEqual({ kind: 'fresh' })
+  })
+
+  test('Claude rs precommits pending fork intent before restart and restores it on failure', async () => {
+    const session = new Session('pending-rollback', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.lastSessionId = 'previous-session'
+    session.lastSessionRef = {
+      provider: 'claude', sessionId: 'previous-session', cwd: session.workDir,
+    }
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    let sawPrecommit = false
+    session.restartUnlocked = async () => {
+      sawPrecommit = pendingConversationLaunchBySession.get(session.sessionName)?.launch.source.sessionId === 'source-session'
+      return false
+    }
+
+    const ok = await session.rollbackTo(launch, {
+      anchors: [], base: launch,
+    })
+
+    expect(ok).toBe(false)
+    expect(sawPrecommit).toBe(true)
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingConversationMaterialization).toBeNull()
+  })
+
+  test('Claude startForked persists pending intent before startup grace', async () => {
+    const session = new Session('pending-start-forked', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.lastSessionId = null
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    let sawPrecommit = false
+    session.startUnlocked = async () => {
+      sawPrecommit = pendingConversationLaunchBySession.has(session.sessionName)
+      return true
+    }
+
+    expect(await session.startForked(launch)).toBe(true)
+    expect(sawPrecommit).toBe(true)
+    expect(pendingConversationLaunchBySession.get(session.sessionName)).toEqual({
+      launch,
+      previousSessionId: null,
+    })
+  })
+
+  test('constructor restores pending fork or materialized resume without silent fresh start', () => {
+    const pendingName = 'pending-reload'
+    const pendingCwd = `/tmp/lodestar-projects/${pendingName}`
+    const pending = {
+      launch: {
+        kind: 'fork' as const,
+        source: { provider: 'claude' as const, sessionId: 'source-session', cwd: pendingCwd },
+      },
+      previousSessionId: 'previous-session',
+    }
+    modelSelections.set(pendingName, {
+      provider: 'claude', model: 'claude-opus-4-6', effort: 'high', tokenSourceId: 'claude-native',
+    })
+    resumeRefs.set(`${pendingName}:claude`, {
+      provider: 'claude', sessionId: 'previous-session', cwd: pendingCwd,
+    })
+    pendingConversationLaunchBySession.set(pendingName, pending)
+    const beforeInit = new Session(pendingName, 'chat_pending') as any
+    expect(beforeInit.pendingMaterializationLaunch()).toEqual(pending.launch)
+
+    const materializedName = 'pending-materialized-reload'
+    const materializedCwd = `/tmp/lodestar-projects/${materializedName}`
+    const materializedPending = {
+      launch: {
+        kind: 'fork' as const,
+        source: { provider: 'claude' as const, sessionId: 'source-session', cwd: materializedCwd },
+      },
+      previousSessionId: 'previous-session',
+    }
+    modelSelections.set(materializedName, {
+      provider: 'claude', model: 'claude-opus-4-6', effort: 'high', tokenSourceId: 'claude-native',
+    })
+    resumeRefs.set(`${materializedName}:claude`, {
+      provider: 'claude', sessionId: 'new-materialized-session', cwd: materializedCwd,
+    })
+    pendingConversationLaunchBySession.set(materializedName, materializedPending)
+    const afterInit = new Session(materializedName, 'chat_materialized') as any
+    expect(afterInit.pendingMaterializationLaunch()).toEqual({
+      kind: 'resume',
+      source: {
+        provider: 'claude', sessionId: 'new-materialized-session', cwd: materializedCwd,
+      },
+    })
+  })
+
+  test('Claude init binds the new id and first result consumes the durable pending marker', () => {
+    const session = new Session('pending-materialize', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    const pending = { launch, previousSessionId: 'previous-session' }
+    session.lastSessionId = 'previous-session'
+    session.lastSessionRef = {
+      provider: 'claude', sessionId: 'previous-session', cwd: session.workDir,
+    }
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    session.proc = new FakeAgentProc('claude', 'new-session')
+
+    expect(session.persistResumableSessionId(true)).toBeNull()
+    expect(resumeRefs.get(`${session.sessionName}:claude`)?.sessionId).toBe('new-session')
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
+    expect(session.pendingMaterializationLaunch()).toEqual({
+      kind: 'resume',
+      source: { provider: 'claude', sessionId: 'new-session', cwd: session.workDir },
+    })
+
+    expect(session.consumePendingConversationMaterialization()).toBeNull()
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingConversationMaterialization).toBeNull()
+  })
+
+  test('Claude init rejects a fork that reuses source or previous session id', () => {
+    const session = new Session('pending-same-id', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    const pending = { launch, previousSessionId: 'source-session' }
+    session.lastSessionId = 'source-session'
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    session.proc = new FakeAgentProc('claude', 'source-session')
+
+    expect(() => session.persistResumableSessionId(true)).toThrow('did not materialize an independent session id')
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
+  })
+
+  test('Claude result without a session id keeps the durable fork intent', () => {
+    const session = new Session('pending-missing-session-id', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    const pending = { launch, previousSessionId: 'previous-session' }
+    session.lastSessionId = 'previous-session'
+    session.lastSessionRef = {
+      provider: 'claude', sessionId: 'previous-session', cwd: session.workDir,
+    }
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    session.proc = new FakeAgentProc('claude', null)
+
+    expect(session.persistResumableSessionId()).toContain('did not provide a materialized session id')
+    expect(session.consumePendingConversationMaterialization()).toContain('保留 pending marker')
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
+  })
+
+  test('Codex constructor clears stale Claude pending before validating its old cwd', () => {
+    const sessionName = 'codex-clears-stale-claude-pending'
+    modelSelections.set(sessionName, {
+      provider: 'codex', model: 'gpt-5.6-sol', effort: 'low', tokenSourceId: 'codex-sub',
+    })
+    pendingConversationLaunchBySession.set(sessionName, {
+      launch: {
+        kind: 'fork',
+        source: { provider: 'claude', sessionId: 'source-session', cwd: '/srv/old-claude-project' },
+      },
+      previousSessionId: null,
+    })
+
+    expect(() => new Session(sessionName, 'chat_id')).not.toThrow()
+    expect(pendingConversationLaunchBySession.has(sessionName)).toBe(false)
+  })
+
+  test('explicit fresh and provider switch clear pending intent before changing routing', async () => {
+    const session = new Session('pending-clear', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const launch = {
+      kind: 'fork' as const,
+      source: { provider: 'claude' as const, sessionId: 'source-session', cwd: session.workDir },
+    }
+    const pending = { launch, previousSessionId: null }
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    session.startUnlocked = async () => true
+
+    expect(await session.restartUnlocked(false, { announce: false })).toBe(true)
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(false)
+    expect(session.pendingConversationMaterialization).toBeNull()
+
+    session.selectedProvider = 'claude'
+    session.pendingConversationMaterialization = pending
+    pendingConversationLaunchBySession.set(session.sessionName, pending)
+    setTurnAnchorWriteError(new Error('turn state fsync failed'))
+    await expect(session.applyModelSelectionUnlocked('codex', 'gpt-5.6-sol', 'low', 'codex-sub'))
+      .rejects.toThrow('turn state fsync failed')
+    expect(session.selectedProvider).toBe('claude')
+    expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
+    setTurnAnchorWriteError(null)
+  })
+
+  test('result still terminalizes the turn when resume-map persistence fails', async () => {
+    const session = new Session('resume-write-result', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-current')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.wireProc(proc)
+    const turn = turnState('card_resume_write_result')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    proc.lastResult = {
+      cost_usd: null, cost_delta_usd: null, duration_ms: 1, num_turns: 1,
+      usage: null, subtype: 'success', is_error: false,
+    }
+    setResumeWriteError(new Error('resume-map fsync failed'))
+
+    proc.emit('result', {
+      subtype: 'success', is_error: false, duration_ms: 1, usage: null,
+      checkpoint: {
+        provider: 'codex', kind: 'turn', id: 'turn-1',
+        source: { provider: 'codex', sessionId: 'thread-current', cwd: session.workDir },
+      },
+    })
+
+    await waitUntil(() => session.currentTurn === null)
+    expect(session.status).toBe('idle')
+    expect(session.lastSessionId).toBe('thread-current')
+    expect(sentRawTexts.some(text => text.includes('resume-map fsync failed'))).toBe(true)
+    setResumeWriteError(null)
+  })
+
+  test('result exposes checkpoint persistence failure and does not retain an in-memory-only anchor', async () => {
+    const session = new Session('anchor-write-result', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-current')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.wireProc(proc)
+    proc.lastResult = {
+      cost_usd: null, cost_delta_usd: null, duration_ms: 1, num_turns: 1,
+      usage: null, subtype: 'success', is_error: false,
+    }
+    setTurnAnchorWriteError(new Error('turn-map fsync failed'))
+
+    proc.emit('result', {
+      subtype: 'success', is_error: false, duration_ms: 1, usage: null,
+      checkpoint: {
+        provider: 'codex', kind: 'turn', id: 'turn-1',
+        source: { provider: 'codex', sessionId: 'thread-current', cwd: session.workDir },
+      },
+    })
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(session.status).toBe('idle')
+    expect(turnAnchorsBySession.has(session.sessionName)).toBe(false)
+    expect(sentRawTexts.some(text => text.includes('turn-map fsync failed'))).toBe(true)
+    setTurnAnchorWriteError(null)
+  })
+
+  test('result racing card open carries checkpoint persistence failure into deferred close', () => {
+    const session = new Session('anchor-write-open-race', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'thread-current')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.wireProc(proc)
+    proc.lastResult = {
+      cost_usd: null, cost_delta_usd: null, duration_ms: 1, num_turns: 1,
+      usage: null, subtype: 'success', is_error: false,
+    }
+    const owner = session.beginTurnOpen(proc, session.procEpoch)
+    setTurnAnchorWriteError(new Error('turn-map race failed'))
+
+    proc.emit('result', {
+      subtype: 'success', is_error: false, duration_ms: 1, usage: null,
+      checkpoint: {
+        provider: 'codex', kind: 'turn', id: 'turn-race',
+        source: { provider: 'codex', sessionId: 'thread-current', cwd: session.workDir },
+      },
+    })
+
+    expect(owner.sawResult).toBe(true)
+    expect(owner.terminalSuffix).toContain('turn-map race failed')
+    expect(owner.terminalForcePush).toBe(true)
+    session.releaseTurnOpen(owner)
+    setTurnAnchorWriteError(null)
+  })
+
+  test('stop clears visible state but keeps an unconfirmed process blocked until its real exit', async () => {
+    const session = new Session('stop-kill-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    const lifecycleSnapshots: Array<{ shouldRevive: boolean; status: string }> = []
+    session.opts.onLifecycleChange = () => {
+      lifecycleSnapshots.push({ shouldRevive: session.shouldRevive(), status: session.status })
+    }
+    proc.kill = async () => {
+      // The persisted alive marker callback must run before the first kill
+      // await, while the explicit stop intent already excludes this process.
+      expect(lifecycleSnapshots[0]).toEqual({ shouldRevive: false, status: 'stopped' })
+      throw new Error('kill timeout')
+    }
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_stop_kill_failure')
+    session.pendingMidTurnMsgs = [{ text: 'queued', wireText: 'queued', userOpenId: '', msgId: '' }]
+    session.backgroundTasks = [{
+      id: 'bg', type: 'shell', description: 'running', status: 'running', startedAt: Date.now(), steps: [],
+    }]
+
+    await expect(session.stop('测试', { announce: false })).rejects.toThrow('kill timeout')
+    expect(session.proc).toBe(proc)
+    expect(session.blockedProc).toBe(proc)
+    expect(session.shouldRevive()).toBe(false)
+    expect(session.currentTurn).toBeNull()
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(session.backgroundTasks).toEqual([])
+    expect(session.status).toBe('stopped')
+    expect(lifecycleSnapshots.length).toBeGreaterThanOrEqual(2)
+    await session.onUserMessage('must not spawn or feed')
+    expect(proc.sentTexts).toEqual([])
+    expect(sentTexts.some(text => text.includes('会话已阻断'))).toBe(true)
+
+    proc.alive = false
+    proc.emit('exit', { code: 0, signal: 'SIGKILL', expected: true })
+    expect(session.proc).toBeNull()
+    expect(session.blockedProc).toBeNull()
+  })
+
+  test.each(['stop', 'restart'] as const)('%s closes delegation admission before awaiting child cancellation', async action => {
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    let entered!: () => void
+    const cancelling = new Promise<void>(resolve => { entered = resolve })
+    const session = new Session(`delegation-${action}`, 'chat_id', {
+      onCancelAgentRuns: async () => { entered(); await gate },
+    }) as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.agentCapability = 'old-capability'
+    let starts = 0
+    session.startUnlocked = async () => { starts++; return true }
+
+    expect(session.acceptsAgentCapability('old-capability')).toBe(true)
+    const operation = action === 'stop'
+      ? session.stop('cancel children', { announce: false })
+      : session.restart(false, { announce: false })
+    await cancelling
+    expect(session.acceptsAgentCapability('old-capability')).toBe(false)
+    expect(proc.killCalls).toBe(0)
+    expect(starts).toBe(0)
+    release()
+    await operation
+    expect(proc.killCalls).toBe(1)
+    expect(starts).toBe(action === 'restart' ? 1 : 0)
+  })
+
+  test.each(['stop', 'restart'] as const)('%s still stops its main process and exposes delegated cancellation failure', async action => {
+    const session = new Session(`delegation-failed-${action}`, 'chat_id', {
+      onCancelAgentRuns: async () => { throw new Error('delegated process exit unconfirmed') },
+    }) as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.agentCapability = 'old-capability'
+    let starts = 0
+    session.startUnlocked = async () => { starts++; return true }
+    const statuses: string[] = []
+
+    if (action === 'stop') {
+      await expect(session.stop('cancel children', { announce: false }))
+        .rejects.toThrow('delegated process exit unconfirmed')
+    } else {
+      expect(await session.restart(false, {
+        announce: false,
+        onStatus: (status: string) => statuses.push(status),
+      })).toBe(false)
+      expect(statuses.join('\n')).toContain('agents=delegated process exit unconfirmed')
+    }
+    expect(proc.killCalls).toBe(1)
+    expect(starts).toBe(0)
+    expect(session.proc).toBeNull()
+    expect(session.acceptsAgentCapability('old-capability')).toBe(false)
+  })
+
+  test('restart does not spawn after kill failure and still clears stale lifecycle state', async () => {
+    const session = new Session('restart-kill-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    proc.kill = async () => { throw new Error('kill timeout') }
+    let spawnCalls = 0
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_restart_kill_failure')
+    session.pendingUserMessageCount = 1
+    session.spawnAgent = () => { spawnCalls++; return new FakeAgentProc('claude') }
+
+    expect(await session.restart(false, { announce: false })).toBe(false)
+    expect(spawnCalls).toBe(0)
+    expect(session.proc).toBe(proc)
+    expect(session.blockedProc).toBe(proc)
+    expect(session.currentTurn).toBeNull()
+    expect(session.pendingUserMessageCount).toBe(0)
+    expect(session.status).toBe('stopped')
+
+    expect(await session.start({ announce: false })).toBe(false)
+    expect(spawnCalls).toBe(0)
+    proc.alive = false
+    proc.emit('exit', { code: 0, signal: 'SIGKILL', expected: true })
+    expect(session.proc).toBeNull()
+  })
+
+  test('legacy resume cwd verification fails before an existing process is killed', async () => {
+    const session = new Session('legacy-resume-cwd', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'running-thread')
+    session.selectedProvider = 'codex'
+    session.proc = proc
+    session.status = 'idle'
+    session.lastSessionId = 'legacy-thread'
+    session.lastSessionRef = { provider: 'codex', sessionId: 'legacy-thread', cwd: null }
+    session.resolveLegacyResumeRef = async () => { throw new Error('stored cwd mismatch') }
+
+    expect(await session.restart(true, { announce: false })).toBe(false)
+    expect(proc.killCalls).toBe(0)
+    expect(session.proc).toBe(proc)
+    expect(session.status).toBe('idle')
+  })
+
+  test('process ownership still becomes blocked when kill and terminal cleanup both fail', async () => {
+    const session = new Session('stop-double-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    proc.kill = async () => { throw new Error('kill timeout') }
+    session.proc = proc
+    session.wireProc(proc)
+    session.resetBackgroundTasks = async () => { throw new Error('background cleanup failed') }
+
+    await expect(session.stop('测试', { announce: false })).rejects.toThrow(
+      /stop failed: kill timeout; background cleanup failed/,
+    )
+
+    expect(session.proc).toBe(proc)
+    expect(session.stoppingProc).toBeNull()
+    expect(session.blockedProc).toBe(proc)
+    expect(session.shouldRevive()).toBe(false)
+    await session.onUserMessage('must remain blocked')
+    expect(proc.sentTexts).toEqual([])
+
+    proc.alive = false
+    proc.emit('exit', { code: 0, signal: 'SIGKILL', expected: true })
+  })
+
+  test('restart surfaces cleanup separately and never spawns after a failed stop transaction', async () => {
+    const session = new Session('restart-double-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    const statuses: string[] = []
+    let spawnCalls = 0
+    proc.kill = async () => { throw new Error('kill timeout') }
+    session.proc = proc
+    session.wireProc(proc)
+    session.resetBackgroundTasks = async () => { throw new Error('background cleanup failed') }
+    session.spawnAgent = () => { spawnCalls++; return new FakeAgentProc('claude') }
+
+    expect(await session.restart(false, {
+      announce: false,
+      onStatus: (status: string) => statuses.push(status),
+    })).toBe(false)
+
+    expect(spawnCalls).toBe(0)
+    expect(session.blockedProc).toBe(proc)
+    expect(statuses.join('\n')).toContain('kill=kill timeout')
+    expect(statuses.join('\n')).toContain('cleanup=background cleanup failed')
+
+    proc.alive = false
+    proc.emit('exit', { code: 0, signal: 'SIGKILL', expected: true })
+  })
+
+  test('kill command terminalizes its status card with the blocked-process failure', async () => {
+    const session = new Session('kill-command-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    proc.kill = async () => { throw new Error('kill timeout') }
+    session.proc = proc
+    session.wireProc(proc)
+
+    await expect(session.runCommand('kill')).resolves.toBe(true)
+
+    const footerContents = calls
+      .filter(call => call.method === 'PUT' && call.path.includes('/elements/footer'))
+      .map(call => JSON.parse(call.body.element).content as string)
+    expect(footerContents.some(content =>
+      content.includes('未确认终止') && content.includes('会话已阻断') && content.includes('kill timeout')
+    )).toBe(true)
+    const terminalSettings = calls
+      .filter(call => call.method === 'PATCH' && call.path.endsWith('/settings'))
+      .map(call => JSON.parse(call.body.settings))
+    expect(terminalSettings.some(settings => settings?.config?.streaming_mode === false)).toBe(true)
+
+    proc.alive = false
+    proc.emit('exit', { code: 0, signal: 'SIGKILL', expected: true })
+  })
+
+  test('retains static card state when mutation reopens streaming and close also fails', async () => {
+    const session = new Session('static-card-miss', 'chat_id') as any
+    const cardId = 'card_static_miss'
+    cardkit.recordCardCreated(cardId, 1)
+    const baseFetch = globalThis.fetch
+    let replaceAttempts = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      if (method === 'PUT' && path.includes('/elements/')) {
+        replaceAttempts++
+        return new Response(JSON.stringify(replaceAttempts === 1
+          ? { code: 300309, msg: 'stream closed' }
+          : { code: 300121, msg: 'replace rejected' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      if (method === 'PATCH' && path.endsWith('/settings')) {
+        const body = init?.body ? JSON.parse(String(init.body)) : {}
+        const settings = JSON.parse(String(body.settings ?? '{}'))
+        const reopening = settings?.config?.streaming_mode === true
+        return new Response(JSON.stringify(reopening
+          ? { code: 0, data: {} }
+          : { code: 300121, msg: 'close rejected' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+
+    try {
+      const landed = await session.mutateStaticCard(cardId, 'test static', async () => {
+        const replaced = await cardkit.replaceElementChecked(cardId, 'panel', {
+          tag: 'markdown', element_id: 'panel', content: 'new',
+        }, { notifyCardFailure: false })
+        if (!replaced) throw new Error('replace failed')
+      })
+      expect(landed).toBe(false)
+    } finally {
+      globalThis.fetch = baseFetch
+    }
+    // A disposed/tombstoned card would return false without an HTTP call.
+    expect(await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })).toBe(true)
+    await cardkit.dispose(cardId)
+  })
+
+  test('retains static card state when the checked mutation misses even if streaming-off lands', async () => {
+    const session = new Session('static-mutation-miss', 'chat_id') as any
+    const cardId = 'card_static_mutation_miss'
+    cardkit.recordCardCreated(cardId, 1)
+
+    expect(await session.mutateStaticCard(cardId, 'test static', async () => {
+      throw new Error('mutation MISS')
+    })).toBe(false)
+
+    // A disposed card returns false immediately; true proves the failed
+    // mutation retained repairable CardKit state.
+    expect(await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } })).toBe(true)
+    await cardkit.dispose(cardId)
+  })
+
+  test('hard stop terminalizes an active main card before releasing lifecycle ownership', async () => {
+    const session = new Session('stop-active-card', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    const turn = turnState('card_stop_active')
+    turn.userOpenId = ''
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    await session.stop('测试停止', { announce: false })
+
+    const footer = calls.find(call =>
+      call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`
+    )
+    expect(JSON.parse(footer?.body.element ?? '{}').content).toContain('🛑 测试停止')
+    expect(calls.some(call =>
+      call.method === 'PATCH' && call.path === `/cards/${turn.cardId}/settings`
+    )).toBe(true)
+  })
+
+  test('a user message owns the lifecycle mutex before a subsequently queued restart', async () => {
+    const session = new Session('message-lifecycle-mutex', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.initCount = 1
+    session.status = 'idle'
+
+    let signalOpenStarted: () => void = () => {}
+    const openStarted = new Promise<void>(resolve => { signalOpenStarted = resolve })
+    let releaseOpen: () => void = () => {}
+    const openGate = new Promise<void>(resolve => { releaseOpen = resolve })
+    session.openTurnCard = async () => {
+      signalOpenStarted()
+      await openGate
+      const turn = turnState('card_message_mutex')
+      turn.userOpenId = ''
+      session.currentTurn = turn
+      cardkit.recordCardCreated(turn.cardId, 1)
+      return turn
+    }
+    const spawned: FakeAgentProc[] = []
+    session.spawnAgent = () => {
+      const next = new FakeAgentProc('claude', `session-next-${spawned.length}`)
+      spawned.push(next)
+      return next
+    }
+    session.waitForProcEarlyFailure = async () => ({ state: 'ready' })
+
+    const message = session.onUserMessage('first')
+    await openStarted
+    const restart = session.restart(false, { announce: false })
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(proc.killCalls).toBe(0)
+
+    releaseOpen()
+    await message
+    // 合并调和(取舍):上游真人投递经 sendClaimedUserText 对「未登记模式」的
+    // proc 首投会注入 fileDeliveryAgentContext;本地投递 pin(dispatchHumanBatch)
+    // 不承担首投规则注入 — spawn 的 developerInstructions 已给约定,仅真实模式
+    // 变更才注入更新。本例 proc 为测试直挂(非 spawn,无 pre-seed),按本地
+    // 语义断言用户原文。
+    expect(proc.sentTexts).toEqual(['first'])
+    expect(await restart).toBe(true)
+    expect(proc.killCalls).toBe(1)
+    expect(session.proc).toBe(spawned[0])
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('persisted model selection cannot mutate Session state while a user message owns lifecycle', async () => {
+    const session = new Session('model-lifecycle-mutex', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'session-1')
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.initCount = 1
+
+    let signalOpenStarted: () => void = () => {}
+    const openStarted = new Promise<void>(resolve => { signalOpenStarted = resolve })
+    let releaseOpen: () => void = () => {}
+    const openGate = new Promise<void>(resolve => { releaseOpen = resolve })
+    session.openTurnCard = async () => {
+      signalOpenStarted()
+      await openGate
+      const turn = turnState('card_model_mutex')
+      turn.userOpenId = ''
+      session.currentTurn = turn
+      cardkit.recordCardCreated(turn.cardId, 1)
+      return turn
+    }
+
+    const message = session.onUserMessage('first')
+    await openStarted
+    const selection = session.applyModelSelection('codex', 'gpt-5.6-sol', 'xhigh', 'codex-sub')
+    await new Promise(resolve => setTimeout(resolve, 0))
+    expect(session.selectedProvider).toBe('claude')
+
+    releaseOpen()
+    await message
+    await selection
+    expect(session.selectedProvider).toBe('codex')
+    await session.stop('测试收尾', { announce: false })
+  })
+
+  test('card action helpers report stale, invalid, and internal failures explicitly', async () => {
+    const session = new Session('action-outcomes', 'chat_id') as any
+
+    expect(await session.onPermissionDecision('missing', 'allow', 'ou_user')).toEqual({
+      ok: false,
+      message: '此权限请求已失效或已处理',
+    })
+    const proc = new FakeAgentProc('claude', 'session-1')
+    proc.sendPermissionResponse = () => { throw new Error('pipe closed') }
+    session.proc = proc
+    session.pendingPermissions.set('perm-1', { toolUseId: 'tool-1' })
+    const failedPermission = await session.onPermissionDecision('perm-1', 'allow', 'ou_user')
+    expect(failedPermission.ok).toBe(false)
+    expect(failedPermission.message).toContain('pipe closed')
+    expect(session.pendingPermissions.has('perm-1')).toBe(true)
+
+    expect(await session.onAskAnswer('missing', 0, 0, 'ou_user')).toBe(false)
+    session.pendingAsks.set('ask-1', {
+      questions: [{ question: 'Pick?', options: [{ label: 'A' }] }],
+      i: 0,
+      answers: {},
+      answered: new Map(),
+      currentIdx: 0,
+    })
+    expect(await session.onAskAnswer('ask-1', 1, 0, 'ou_user')).toBe(false)
+    expect(await session.onAskAnswer('ask-1', 0, 9, 'ou_user')).toBe(false)
+    expect(await session.onAskAnswer('ask-1', 0, 0, 'ou_user')).toBe(true)
+
+    session.selectedProvider = 'codex'
+    expect((await session.onForkSelect(0, 'ou_user')).ok).toBe(false)
+    expect((await session.onBackSelect(0)).ok).toBe(false)
+    expect((await session.onResumeSelect('session-1')).ok).toBe(false)
+  })
 })
 
 describe('rs (restart) — 双模式列表分支', () => {
@@ -11171,7 +17499,7 @@ describe('rs (restart) — 双模式列表分支', () => {
 
     await session.runCommand('rs', 'ou_user')
 
-    expect(listOpenId).toBe('ou_user')
+    expect(listOpenId!).toBe('ou_user')
     expect(restartCalled).toBe(false)
   })
 })
@@ -11194,7 +17522,7 @@ describe('bk (back) — 命令阶段不预停(上游 ff44afb)', () => {
 
     // 「看完不点也被终止」修复:命令只展示列表,进程保持存活,不占 lifecycle。
     expect(stopCalls).toBe(0)
-    expect(listOpenId).toBe('ou_user')
+    expect(listOpenId!).toBe('ou_user')
     expect(session.lifecycleEpoch).toBe(epochBefore)
   })
 })
@@ -11333,7 +17661,7 @@ describe('Session Codex capacity 外挂(turn_retry 驱动,D-07)', () => {
     cardkit.recordCardCreated(turn.cardId, 1)
     // 真实 startFooterStatus 路径:只让计时器句柄确定化,不替换 footer 实现。
     const timeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(
-      (() => DETERMINISTIC_FOOTER_HANDLE) as typeof setTimeout,
+      (() => DETERMINISTIC_FOOTER_HANDLE) as unknown as typeof setTimeout,
     )
 
     try {
@@ -11686,7 +18014,10 @@ describe('Session conversation launch 数据流(上游 ff44afb 簇 1)', () => {
 
     const fresh = session.spawnAgent(undefined, 'claude') as any
     expect(fresh.opts.resumeSessionId).toBeUndefined()
-    expect(fresh.opts.forkSession).toBe(false)
+    // 合并调和(取舍):launch 装配(agent-launch.ts)按上游形态稀疏落键 ——
+    // fresh 分支整体不产 resume/fork 键,与本地旧形态的显式 forkSession:false
+    // 等价(进程层仅在 truthy 时向 SDK 转发,claude-agent-process:1095)。
+    expect(fresh.opts.forkSession).toBeUndefined()
 
     const source = { provider: 'claude', sessionId: 'other-session', cwd: session.workDir }
     session.pendingConversationLaunch = {
@@ -11695,7 +18026,7 @@ describe('Session conversation launch 数据流(上游 ff44afb 簇 1)', () => {
       previousSessionId: null,
     }
     const foreign = session.spawnAgent(undefined, 'claude', { kind: 'restart' }) as any
-    expect(foreign.opts.forkSession).toBe(false)
+    expect(foreign.opts.forkSession).toBeUndefined()
     expect(foreign.opts.resumeSessionId).toBeUndefined()
   })
 
@@ -11814,21 +18145,27 @@ describe('Session conversation launch 数据流(上游 ff44afb 簇 1)', () => {
     await expect(session.listCodexConversations()).rejects.toThrow('Codex history requested for a non-Codex session')
 
     session.selectedProvider = 'codex'
-    const summary = { provider: 'codex', sessionId: 't1', cwd: session.workDir, preview: 'hi', ts: 1 }
+    const summary = { provider: 'codex' as const, sessionId: 't1', cwd: session.workDir, preview: 'hi', ts: 1 }
+    // 合并调和(取舍):catalog 进程取上游形态 —— listCodexConversations 内联构造
+    // CodexProcess(本地 spawnCodexCatalogProcess 接缝未并入),构造本身不 spawn;
+    // 真实 spawn 只发生在 listConversations。替身钉原型 listConversations/kill:
+    // 覆盖本次一次性进程的全部外部行为面(spawn→list→kill、失败也 kill)。
     let killCalls = 0
-    session.spawnCodexCatalogProcess = () => ({
-      listConversations: async () => [summary],
-      kill: async () => { killCalls++ },
-    })
-    expect(await session.listCodexConversations()).toEqual([summary])
-    expect(killCalls).toBe(1)
+    const listSpy = spyOn(CodexProcess.prototype, 'listConversations')
+      .mockImplementation(async () => [summary])
+    const killSpy = spyOn(CodexProcess.prototype, 'kill')
+      .mockImplementation(async () => { killCalls++ })
+    try {
+      expect(await session.listCodexConversations()).toEqual([summary])
+      expect(killCalls).toBe(1)
 
-    session.spawnCodexCatalogProcess = () => ({
-      listConversations: async () => { throw new Error('thread/list exploded') },
-      kill: async () => { killCalls++ },
-    })
-    await expect(session.listCodexConversations()).rejects.toThrow('thread/list exploded')
-    expect(killCalls).toBe(2)
+      listSpy.mockImplementation(async () => { throw new Error('thread/list exploded') })
+      await expect(session.listCodexConversations()).rejects.toThrow('thread/list exploded')
+      expect(killCalls).toBe(2)
+    } finally {
+      listSpy.mockRestore()
+      killSpy.mockRestore()
+    }
   })
 
   test('conversationRouting 快照与 applyConversationRouting:运行中拒绝,provider 切换清锚换基线', () => {
@@ -11836,15 +18173,28 @@ describe('Session conversation launch 数据流(上游 ff44afb 簇 1)', () => {
     session.selectedProvider = 'claude'
     session.selectedModel = 'claude:glm'
     session.selectedEffort = 'max'
-    expect(session.conversationRouting()).toEqual({ provider: 'claude', model: 'claude:glm', effort: 'max' })
+    // 合并调和(取舍):快照形状取上游(合并实现收窄类型声明、保留富行为)——
+    // tokenSourceId 恒随快照(codex 账号/conversationRouting→apply 运行时往返
+    // 依赖),codexAccountAutomatic 在未绑 API 来源且账号仍为 auto 时随行;
+    // 本地 D-02 slim 三字段形态已被合并实现取代。
+    expect(session.conversationRouting()).toEqual({
+      provider: 'claude',
+      tokenSourceId: null,
+      model: 'claude:glm',
+      effort: 'max',
+      codexAccountAutomatic: true,
+    })
 
     session.proc = new FakeAgentProc('claude', 's1')
     expect(() => session.applyConversationRouting({ provider: 'codex', model: null, effort: null }))
       .toThrow('cannot change conversation routing while the session is running')
     session.proc = null
 
-    expect(() => session.applyConversationRouting({ provider: 'gemini', model: null, effort: null }))
-      .toThrow('unknown conversation routing provider')
+    // 合并调和(取舍):本地 provider 白名单('unknown conversation routing
+    // provider')未并入合并实现 —— apply 取上游形态,运行时只校验 token source
+    // 归属(source.agent !== routing.provider),provider 合法性由
+    // ConversationRouting.provider: AgentProvider 在编译期约束。
+
 
     // WR-01:dsh 路由必须放行(归一化走 session-model 的固定档位目录),否则
     // btw/fk 的临时群会走到「先建群再散群」。
@@ -11947,7 +18297,12 @@ describe('Session rollbackTo/startForked 补偿事务(4185808 终态,挂账 #5/�
     expect(replacement.isAlive()).toBe(true)
     expect(session.lastSessionId).toBe('replacement-session')
     expect(session.lastSessionRef?.sessionId).toBe('replacement-session')
-    expect(boundResumes).toEqual([])
+    // 合并调和(取舍):上游 stop 在 kill 前/后会对仍 resumable 的进程幂等重绑
+    // 其自身 id(会话生命周期可靠性簇 15965「stop persists a verified Codex
+    // materialization that lands during SIGTERM」依赖该重绑,不可删)。断言收窄为
+    // 核心不变量 —— 无任何把旧 id 绑回的 restore 写,替换自身的正向绑定保持:
+    expect(boundResumes.filter(entry => entry[1] === 'old-session')).toEqual([])
+    expect(boundResumes).toContainEqual([session.sessionName, 'replacement-session', 'claude'])
     expect(seededTurnAnchors).toEqual([])
   })
 
@@ -12165,7 +18520,7 @@ describe('Session restart 前置三件 + constructor 恢复区 + materialization
     expect(await session.restart(false, { announce: false })).toBe(true)
 
     // 取消发生在 restart 头部(fresh reset/停进程之前),持久态与内存 marker 双清
-    expect(pendingAtReset).toBe(false)
+    expect(pendingAtReset!).toBe(false)
     expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(false)
     expect(session.pendingConversationMaterialization).toBeNull()
   })
@@ -12188,7 +18543,7 @@ describe('Session restart 前置三件 + constructor 恢复区 + materialization
     expect(await session.restart(false, { announce: false })).toBe(false)
 
     // 先持久清再停进程;停失败(kill 抛出)→ 恢复 pending 原值
-    expect(pendingAtKill).toBe(false)
+    expect(pendingAtKill!).toBe(false)
     expect(pendingConversationLaunchBySession.get(session.sessionName)).toEqual(pending)
     expect(session.pendingConversationMaterialization).toEqual(pending)
   })
@@ -12293,8 +18648,10 @@ describe('Session restart 前置三件 + constructor 恢复区 + materialization
     const proc = new FakeAgentProc('claude', 'new-session')
     session.proc = proc
 
+    // 合并调和(取舍):persist 签名并入上游 (fatal, proc, notify)——本地
+    // proc-first 形参退役;显式 proc 走第二参数,fatal 保持 false(非致命返回消息)。
     // persist 推进绑定但不清 durable marker(marker 归首个 result 消费)
-    expect(session.persistResumableSessionId(proc)).toBeNull()
+    expect(session.persistResumableSessionId(false, proc)).toBeNull()
     expect(resumeRefs.get(`${session.sessionName}:claude`)?.sessionId).toBe('new-session')
     expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
     expect(session.pendingMaterializationLaunch()).toEqual({
@@ -12337,12 +18694,14 @@ describe('Session restart 前置三件 + constructor 恢复区 + materialization
     pendingConversationLaunchBySession.set(session.sessionName, pending)
     const sameId = new FakeAgentProc('claude', 'source-session')
     session.proc = sameId
-    expect(session.persistResumableSessionId(sameId)).toContain('did not materialize an independent session id')
+    // 合并调和(取舍):persist 签名为上游 (fatal, proc, notify);此断言验的是
+    // 非致命路径返回消息,显式 proc 走第二参数、fatal=false。
+    expect(session.persistResumableSessionId(false, sameId)).toContain('did not materialize an independent session id')
     expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
 
     const noId = new FakeAgentProc('claude', null)
     session.proc = noId
-    expect(session.persistResumableSessionId(noId)).toContain('did not provide a materialized session id')
+    expect(session.persistResumableSessionId(false, noId)).toContain('did not provide a materialized session id')
     expect(session.consumePendingConversationMaterialization()).toContain('保留 pending marker')
     expect(pendingConversationLaunchBySession.has(session.sessionName)).toBe(true)
   })
@@ -12605,19 +18964,21 @@ describe('Session turn 锚数据流(4185808 终态,挂账 #3)', () => {
     session.pendingConversationLaunch = {
       lease, launch: { kind: 'fork', source }, previousSessionId: 'prev-1',
     }
-    const sameAsSource = session.persistResumableSessionId(procSameAsSource)
+    // 合并调和(取舍):persist 签名为上游 (fatal, proc, notify)——本地 proc-first
+    // 形参退役;拒绝推进路径保持非致命,显式 proc 走第二参数、fatal=false。
+    const sameAsSource = session.persistResumableSessionId(false, procSameAsSource)
     expect(sameAsSource).toContain('src-1')
     expect(boundResumes).toEqual([])
 
     const procSameAsPrevious = new FakeAgentProc('codex', 'prev-1')
     session.proc = procSameAsPrevious
-    const sameAsPrevious = session.persistResumableSessionId(procSameAsPrevious)
+    const sameAsPrevious = session.persistResumableSessionId(false, procSameAsPrevious)
     expect(sameAsPrevious).toContain('prev-1')
     expect(boundResumes).toEqual([])
 
     const procIndependent = new FakeAgentProc('codex', 'forked-new')
     session.proc = procIndependent
-    expect(session.persistResumableSessionId(procIndependent)).toBeNull()
+    expect(session.persistResumableSessionId(false, procIndependent)).toBeNull()
     expect(boundResumes).toEqual([['persist-independent-id', 'forked-new', 'codex']])
   })
 })
@@ -12688,7 +19049,10 @@ describe('Session resume 绑定失效清理(4185808,挂账 #1/#4)', () => {
     session.spawnAgent = () => {
       const proc = new FakeAgentProc('codex', null)
       proc.launchKind = 'resume'
-      proc.sendInitialize = () => proc.emit('error', noRolloutError('ghost-thread'))
+      // 合并调和(取舍):no-rollout 失败改经 initialize 事务 promise 收口
+      // (main 事件版恢复网关已随上游 session 恢复优化退役;上游 15694 号用例
+      // 同型注入)。作废 ghost 绑定 + 群内可观测的语义不变。
+      proc.initialization = Promise.reject(noRolloutError('ghost-thread'))
       return proc
     }
     const statuses: string[] = []
@@ -13319,7 +19683,9 @@ describe('Session DSH backend wiring (upstream 722e45a)', () => {
     codexSession.proc = codexProc
     codexSession.status = 'idle'
     codexSession.wireProc(codexProc)
-    codexProc.dispatchFactory = () => ({ kind: 'queued', provider: 'codex' })
+    // 伪造非法运行形态(queued 只允许 claude/dsh)以核对 session 侧拒绝分支,故宽化过检。
+    codexProc.dispatchFactory = () =>
+      ({ kind: 'queued', provider: 'codex' } as unknown as UserTextDispatch)
     expect(await codexSession.startHostAskContinuation('system input', codexProc)).toBe('failed')
   })
 
@@ -13351,8 +19717,10 @@ describe('Session DSH backend wiring (upstream 722e45a)', () => {
       session.selectedEffort = 'off'
       expect(session.dshEffortForSpawn()).toBe('off')
 
-      // xhigh 是 claude/codex 词表的值,对 DSH 非法 → 不吞、不回落
-      session.selectedEffort = 'xhigh'
+      // 合并调和(取舍):合并后 DSH 词表 = 上游 7 档(off/minimal/low/medium/high/
+      // xhigh/max,agent-process.ts 头注),xhigh 已属合法值 —— 非法探针换成
+      // 7 档之外的 'ultra'。「取不到即抛、绝不回落 Codex 的 max」语义不变。
+      session.selectedEffort = 'ultra'
       expect(() => session.dshEffortForSpawn()).toThrow('DSH model reasoning effort is unavailable')
 
       ;(config as any).deepseek_harness = { api_key: 'dsh-key', model: 'deepseek-v4-pro', effort: 'high' }
@@ -13470,11 +19838,18 @@ describe('Session DSH backend wiring (upstream 722e45a)', () => {
       await cardkit.flush(cardId)
 
       expect(balanceRequests).toEqual(['https://api.deepseek.com/user/balance'])
-      const content = calls
+      // 合并调和(取舍):合并后 console 额度元素走上游「全部账号额度」聚合面板
+      // (accountUsages 在场时 markdown 行不再渲染,cards/console.ts 双源注释),
+      // dsh 余额作为 deepseek-harness 行补进面板 —— 本地 `[deepseek-harness]`
+      // 段不进注册表,聚合读数看不到它。核心语义不变:余额值上卡(¥ 66.88),
+      // 且只查一次 DeepSeek /user/balance,不查 Claude profile。
+      const panel = calls
         .filter(call => call.method === 'PUT' && call.path === `/cards/${cardId}/elements/console_usage`)
-        .map(call => JSON.parse(call.body.element).content as string)
+        .map(call => JSON.parse(call.body.element))
         .at(-1)
-      expect(content).toContain('66.88')
+      expect(panel.tag).toBe('collapsible_panel')
+      expect(panel.element_id).toBe('console_usage')
+      expect(panel.elements.map((el: any) => el.content).join('\n')).toContain('余额 ¥ 66.88')
       await cardkit.dispose(cardId)
     } finally {
       globalThis.fetch = passthrough
@@ -13500,12 +19875,19 @@ describe('Session DSH model panel and console (upstream 722e45a)', () => {
       expect(dsh!.model).toBe('deepseek-v4-pro')
       expect(dsh!.efforts[0]!.effort).toBe('off')
 
+      // 合并调和(取舍):合并后 DSH 词表 = 上游 7 档(agent-process.ts 头注),
+      // medium/xhigh 已是合法档位值 —— 仍被「固定选项二元锁死」拒绝(非该档位
+      // 锁定的 effort),口径从词表错误改为「不在固定选项中」;词表门改用 7 档外
+      // 的 'ultra' 覆盖(仍报 'DSH reasoning effort 无效')。
       const medium = await session.onModelEffortSelect('deepseek-v4-pro', 'medium', '', 'ou_user', 'dsh')
       expect(medium.ok).toBe(false)
-      expect(medium.message).toBe('DSH reasoning effort 无效')
+      expect(medium.message).toBe('DeepSeek Harness · deepseek-v4-pro/medium 不在固定选项中')
       const xhigh = await session.onModelEffortSelect('deepseek-v4-pro', 'xhigh', '', 'ou_user', 'dsh')
       expect(xhigh.ok).toBe(false)
-      expect(xhigh.message).toBe('DSH reasoning effort 无效')
+      expect(xhigh.message).toBe('DeepSeek Harness · deepseek-v4-pro/xhigh 不在固定选项中')
+      const ultra = await session.onModelEffortSelect('deepseek-v4-pro', 'ultra', '', 'ou_user', 'dsh')
+      expect(ultra.ok).toBe(false)
+      expect(ultra.message).toBe('DSH reasoning effort 无效')
 
       const result = await session.onModelEffortSelect('deepseek-v4-pro', 'off', '', 'ou_user', 'dsh')
 
@@ -13556,7 +19938,9 @@ describe('Session DSH model panel and console (upstream 722e45a)', () => {
   test('控制台:DSH 余额占位、DeepSeek Harness 分组与 provider 标签', async () => {
     const cards = await import('./cards')
 
-    const placeholder = cards.consoleUsageElement({ provider: 'dsh', usageSource: 'provider' }) as any
+    const placeholder = cards.consoleUsageElement({
+      sessionName: 'dsh-console', status: 'idle', provider: 'dsh', usageSource: 'provider',
+    }) as any
     expect(placeholder.content).toContain('📊 余额')
     expect(placeholder.content).toContain('加载中')
 
@@ -13728,7 +20112,12 @@ describe('Session 容量指纹换卡与开卡失败两级阶梯 (上游 378f4a4)
       expect(sentRawTexts).toHaveLength(1)
       expect(sentRawTexts[0]).toContain('仍超出飞书容量')
       expect(sentRawTexts[0]).toContain('300305')
-      expect(sentRawTexts[0]).not.toContain('number of card components')
+      // 合并调和(取舍):合并实现在本分支采用上游 378f4a4 合成文案(本地前缀 +
+      // formatFeishuError 诊断尾)。同套件上游用例(an oversized compaction
+      // completion…,已钉 'message=…'/log_id=MISS)要求该尾在位,与本地旧断言
+      // not.toContain(响应原文)互斥;按合并实现对齐。凭据安全口径仍由非容量
+      // 分支承担(该分支只用失败分类摘要,绝不内插原文)。
+      expect(sentRawTexts[0]).toContain('message=number of card components exceeds the limit')
       // 第三次同指纹:已经报过,不再重复通知
       session.onCardWriteFailure(newCardId, 300305, capacityMeta(newCardId, 'fp-same-payload'))
       expect(sentRawTexts).toHaveLength(1)

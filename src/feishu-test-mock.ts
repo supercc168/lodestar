@@ -9,15 +9,34 @@
  * mock.module 只注册一次,加载顺序不再影响结果。
  *
  * 捕获数组是共享可变状态,测试文件在 beforeEach 里调 resetFeishuMock()。
+ *
+ * 合并口径(0.20.5 merge):
+ *  - 本地 feishuMockState 注入缝与上游 setXxxHandler 系列并存(两种风格
+ *    的用例都直接依赖各自钩子);
+ *  - 行为对齐已合并的 src/feishu.ts:string 形态 resume 入参归一为
+ *    provider ?? 'codex'(sessionResumeRefFromArgs 同语义);clear 省略
+ *    provider 时整会话三 provider(codex/claude/dsh)全清;turn anchor
+ *    写入口剥回流字段(canonicalTurnAnchor 同语义);
+ *  - replaceTurnAnchors 同时写入两种 clear 捕获(本地 clearedTurnAnchors /
+ *    上游 clearedTurnAnchorSessions);
+ *  - 上游任务线新增的图片与 chat-tail 面(sentImages/uploadedImages/
+ *    sentLocalFiles/getChatTailMessageId)全量保留。
  */
 import { mock } from 'bun:test'
-import type { WatchdogMode } from './turn-watchdog'
 import type { TurnAnchor } from './feishu'
 import type { ConversationBranchBase, ConversationRef, PendingConversationLaunch } from './conversation'
+import type { ProjectProfile } from './config'
+import { profileForWorkspace, resolveWorkspaceDir } from './workspace'
 
 export const sentCards: object[] = []
+export const chatTailMessages = new Map<string, string>()
 export const sentTexts: string[] = []
 export const sentRawTexts: string[] = []
+export const sentImages: Array<[string, string]> = []
+export const uploadedImages: string[] = []
+export const sentLocalFiles: Array<[string, string]> = []
+let imageUploadHandler: ((path: string) => Promise<string | null>) | null = null
+export function setImageUploadHandler(handler: ((path: string) => Promise<string | null>) | null): void { imageUploadHandler = handler }
 export const updatedCards: Array<[string, object]> = []
 export const addedReactions: Array<[string, string]> = []
 export const deletedReactions: Array<[string, string]> = []
@@ -31,6 +50,7 @@ export const urgentPushes: Array<[string, string[]]> = []
 export const clearedResumes: Array<[string, string | undefined]> = []
 /** session fork/back 测试用内存 turn-map V4 容器与 mutation 记录(上游 ff44afb)。 */
 export const turnAnchorsBySession = new Map<string, TurnAnchor[]>()
+export const clearedTurnAnchorSessions: string[] = []
 export const seededTurnAnchors: Array<[string, TurnAnchor[]]> = []
 export const branchBaseBySession = new Map<string, ConversationBranchBase>()
 export const pendingConversationLaunchBySession = new Map<string, PendingConversationLaunch>()
@@ -43,6 +63,10 @@ let resumeWriteError: Error | null = null
 export function setResumeWriteError(error: Error | null): void { resumeWriteError = error }
 let turnAnchorWriteError: Error | null = null
 export function setTurnAnchorWriteError(error: Error | null): void { turnAnchorWriteError = error }
+let updateCardHandler: ((messageId: string, card: object) => Promise<void>) | null = null
+export function setUpdateCardHandler(handler: ((messageId: string, card: object) => Promise<void>) | null): void {
+  updateCardHandler = handler
+}
 /** task v2 list 调用捕获(测 tasklist-worker 的 scanTaskSections 调用预算:每个 section
  *  只能拉一次,防双重拉取回归——上游 2026-07-30 配额审查)。beforeEach 调 resetFeishuMock() 清空。 */
 export const listSectionTasksCalls: Array<[string, boolean | undefined]> = []
@@ -54,11 +78,17 @@ export const deleteTasklistCalls: string[] = []
 export const movedTasks: Array<[string, string, string]> = []
 export const addedTaskComments: Array<[string, string]> = []
 /** [projects.<name>] 项目 profile 替身,测试往里 set 后 Session 构造时可查到。 */
-export const projectProfiles = new Map<string, { cwd?: string; watchdogMode?: WatchdogMode }>()
+export const projectProfiles = new Map<string, ProjectProfile>()
 /** 持久化 model selection 替身(4185808 constructor 恢复区用例:构造期 provider
  *  由此决定;既有用例不 set → null,行为零变化)。 */
-export const modelSelections = new Map<string, { provider: string; model: string | null; effort: string | null }>()
-/** chatIdForSession 替身返回值,测试可改。 */
+export const modelSelections = new Map<string, {
+  provider: 'codex' | 'claude' | 'dsh'
+  model: string | null
+  effort: string | null
+  tokenSourceId?: string | null
+}>()
+/** 显式替身注入缝(本地线):聊天尾号、sendCard/updateCard/远端删除/扫描钩子。
+ *  resetFeishuMock() 复位。上游 setXxxHandler 系列与此并存。 */
 export const feishuMockState = {
   chatIdForSession: null as string | null,
   sendCard: null as null | ((chatId: string, card: object) => Promise<string | null>),
@@ -74,7 +104,11 @@ export const feishuMockState = {
 }
 
 export function resetFeishuMock(): void {
-  for (const arr of [sentCards, sentTexts, sentRawTexts, updatedCards, addedReactions, deletedReactions, boundResumes, clearedTurnAnchors, truncatedTurnAnchors, urgentPushes]) {
+  for (const arr of [
+    sentCards, sentTexts, sentRawTexts, updatedCards, addedReactions, deletedReactions, boundResumes,
+    clearedTurnAnchors, truncatedTurnAnchors, urgentPushes, clearedResumes, clearedTurnAnchorSessions,
+    seededTurnAnchors, sentImages, uploadedImages, sentLocalFiles,
+  ]) {
     arr.length = 0
   }
   for (const arr of [listSectionTasksCalls, listTasklistSectionsCalls, listTasklistTasksCalls]) {
@@ -83,10 +117,8 @@ export function resetFeishuMock(): void {
   for (const arr of [deleteTasklistCalls, movedTasks, addedTaskComments]) {
     arr.length = 0
   }
-  for (const arr of [clearedResumes, seededTurnAnchors]) {
-    arr.length = 0
-  }
   projectProfiles.clear()
+  chatTailMessages.clear()
   modelSelections.clear()
   resumeRefs.clear()
   turnAnchorsBySession.clear()
@@ -94,6 +126,8 @@ export function resetFeishuMock(): void {
   pendingConversationLaunchBySession.clear()
   resumeWriteError = null
   turnAnchorWriteError = null
+  updateCardHandler = null
+  imageUploadHandler = null
   feishuMockState.chatIdForSession = null
   feishuMockState.sendCard = null
   feishuMockState.deleteTasklistByGuid = null
@@ -103,7 +137,7 @@ export function resetFeishuMock(): void {
 }
 
 /** bindSessionResume(Checked) 双形态入参归一(与真实 sessionResumeRefFromArgs 同语义:
- *  string 老签名缺 cwd → cwd:null;ref 对象原样)。 */
+ *  string 老签名缺 provider → 'codex'、缺 cwd → null;ref 对象原样)。 */
 function normalizeResumeArgs(
   sessionIdOrRef: string | ConversationRef,
   provider?: string,
@@ -119,6 +153,8 @@ function normalizeResumeArgs(
 
 mock.module('./feishu', () => ({
   PROJECTS_ROOT: '/tmp/lodestar-projects',
+  resolveProjectDir: (name: string) => resolveWorkspaceDir(name, '/tmp/lodestar-projects', Object.fromEntries(projectProfiles)),
+  projectProfileForDirectory: (workDir: string) => profileForWorkspace(workDir, '/tmp/lodestar-projects', Object.fromEntries(projectProfiles)),
   getSessionResume: (sessionName: string, provider = 'codex') =>
     resumeRefs.get(`${sessionName}:${provider}`)?.sessionId ?? null,
   getSessionResumeRef: (sessionName: string, provider = 'codex') => {
@@ -129,26 +165,43 @@ mock.module('./feishu', () => ({
   /** listCodexConversations/start 的登录门替身:默认已登录(与真实导出同名同签名)。 */
   isOpenAIChatGPTAuthenticated: () => true,
   getTenantToken: async () => 'tenant-token',
+  uploadImageKey: async (path: string) => {
+    uploadedImages.push(path)
+    return imageUploadHandler ? imageUploadHandler(path) : 'img_generated'
+  },
+  sendImage: async (chatId: string, key: string) => { sentImages.push([chatId, key]); return `om_image_${sentImages.length}` },
+  uploadAndSend: async (chatId: string, path: string) => { sentLocalFiles.push([chatId, path]); return true },
   preferredChatForSession: new Map(),
+  chatNameCache: new Map(),
+  getChatTailMessageId: async (chatId: string) => chatTailMessages.get(chatId) ?? null,
   sendCard: async (chatId: string, card: object) => {
     sentCards.push(card)
     if (feishuMockState.sendCard) return await feishuMockState.sendCard(chatId, card)
-    return `om_status_${sentCards.length}`
+    const id = `om_status_${sentCards.length}`
+    chatTailMessages.set(chatId, id)
+    return id
   },
-  sendText: async (_chatId: string, text: string) => {
+  sendText: async (chatId: string, text: string) => {
     sentTexts.push(text)
+    chatTailMessages.set(chatId, 'om_text')
     return 'om_text'
   },
-  sendTextRaw: async (_chatId: string, text: string) => {
+  sendTextRaw: async (chatId: string, text: string) => {
     sentRawTexts.push(text)
+    chatTailMessages.set(chatId, 'om_raw')
     return 'om_raw'
   },
-  deleteReaction: async (messageId: string, reactionId: string) => {
-    deletedReactions.push([messageId, reactionId])
+  updateCard: async (messageId: string, card: object) => {
+    updatedCards.push([messageId, card])
+    if (feishuMockState.updateCard) await feishuMockState.updateCard(messageId, card)
+    if (updateCardHandler) await updateCardHandler(messageId, card)
   },
   addReaction: async (messageId: string, reactionType: string) => {
     addedReactions.push([messageId, reactionType])
     return `reaction-${messageId}`
+  },
+  deleteReaction: async (messageId: string, reactionId: string) => {
+    deletedReactions.push([messageId, reactionId])
   },
   urgentApp: async (messageId: string, openIds: string[]) => {
     urgentPushes.push([messageId, openIds])
@@ -168,45 +221,32 @@ mock.module('./feishu', () => ({
   },
   bindSessionResume: (sessionName: string, sessionIdOrRef: string | ConversationRef, provider?: string, cwd?: string) => {
     const normalized = normalizeResumeArgs(sessionIdOrRef, provider, cwd)
-    boundResumes.push([
-      sessionName,
-      normalized.sessionId,
-      typeof sessionIdOrRef === 'string' ? provider : normalized.provider,
-    ])
+    boundResumes.push([sessionName, normalized.sessionId, normalized.provider])
     resumeRefs.set(`${sessionName}:${normalized.provider}`, normalized)
   },
   bindSessionResumeChecked: (sessionName: string, sessionIdOrRef: string | ConversationRef, provider?: string, cwd?: string) => {
     if (resumeWriteError) throw resumeWriteError
     const normalized = normalizeResumeArgs(sessionIdOrRef, provider, cwd)
-    boundResumes.push([
-      sessionName,
-      normalized.sessionId,
-      typeof sessionIdOrRef === 'string' ? provider : normalized.provider,
-    ])
+    boundResumes.push([sessionName, normalized.sessionId, normalized.provider])
     resumeRefs.set(`${sessionName}:${normalized.provider}`, normalized)
   },
   clearSessionResume: (sessionName: string, provider?: string) => {
     clearedResumes.push([sessionName, provider])
     if (provider) resumeRefs.delete(`${sessionName}:${provider}`)
-    else for (const p of ['codex', 'claude']) resumeRefs.delete(`${sessionName}:${p}`)
+    else for (const p of ['codex', 'claude', 'dsh']) resumeRefs.delete(`${sessionName}:${p}`)
   },
   clearSessionResumeChecked: (sessionName: string, provider?: string) => {
     if (resumeWriteError) throw resumeWriteError
     clearedResumes.push([sessionName, provider])
     if (provider) resumeRefs.delete(`${sessionName}:${provider}`)
-    else for (const p of ['codex', 'claude']) resumeRefs.delete(`${sessionName}:${p}`)
+    else for (const p of ['codex', 'claude', 'dsh']) resumeRefs.delete(`${sessionName}:${p}`)
   },
   bindSessionModel: () => {},
   bindSessionModelChecked: () => {},
   provisionProject: () => {},
   projectProfile: (name: string) => projectProfiles.get(name),
-  updateCard: async (messageId: string, card: object) => {
-    updatedCards.push([messageId, card])
-    if (feishuMockState.updateCard) await feishuMockState.updateCard(messageId, card)
-  },
   chatIdForSession: (_sessionName: string) => feishuMockState.chatIdForSession,
   // tasklist 生命周期(01-06 / ec149d7:enable/delete/reconcile 全流程可在测试内走真实 tasklist.ts)
-  resolveProjectDir: (projectName: string) => `/tmp/lodestar-projects/${projectName}`,
   fetchChatOwnerOpenId: async (_chatId: string) => 'ou_owner',
   createTasklistWithOwner: async (name: string, _ownerOpenId: string) => ({
     guid: `tl_${name}`, name, url: '', createdAt: '2026-09-01T00:00:00Z',
@@ -255,6 +295,9 @@ mock.module('./feishu', () => ({
       checkpoint: a.checkpoint, preview: a.preview, ts: a.ts, writes: a.writes,
     })),
   getSessionBranchBase: (sessionName: string) => branchBaseBySession.get(sessionName) ?? null,
+  setSessionBranchBase: (sessionName: string, base: ConversationBranchBase) => {
+    branchBaseBySession.set(sessionName, base)
+  },
   getPendingConversationLaunch: (sessionName: string) =>
     pendingConversationLaunchBySession.get(sessionName) ?? null,
   setPendingConversationLaunchChecked: (sessionName: string, pending: PendingConversationLaunch | null) => {
@@ -282,6 +325,7 @@ mock.module('./feishu', () => ({
   ) => {
     if (turnAnchorWriteError) throw turnAnchorWriteError
     clearedTurnAnchors.push(sessionName)
+    clearedTurnAnchorSessions.push(sessionName)
     // 写入口剥回流字段(与真实 canonicalTurnAnchor 同语义):uuid/sid 等额外字段
     // round-trip 回写时不得污染容器——rollbackTo restore 快照依赖。
     const copied = anchors.map(a => ({ checkpoint: a.checkpoint, preview: a.preview, ts: a.ts, writes: a.writes }))
@@ -296,3 +340,10 @@ mock.module('./feishu', () => ({
   ensureChatForSession: async (chatName: string) => ({ chatId: `oc_${chatName}`, created: true, joined: true }),
   disbandChatForSession: async () => ({ chatId: null, disbanded: true }),
 }))
+
+// 随机顺序可能先加载 AgentService，令默认卡片依赖保存真实函数的副本。
+// mock.module 只更新模块导出；同步替换这两份已捕获的引用，避免测试访问飞书。
+const { agentCardsDeps } = await import('./agent-cards-runtime')
+const mockedFeishu = await import('./feishu')
+agentCardsDeps.sendCard = mockedFeishu.sendCard
+agentCardsDeps.getChatTailMessageId = mockedFeishu.getChatTailMessageId

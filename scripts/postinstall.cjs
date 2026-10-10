@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Postinstall banner — 只告诉用户下一步跑什么, 不在这里拉起向导。
+// 清理废弃的受管 Skill 并提示下一步，不在这里拉起向导或 daemon。
 //
 // 为什么不自动拉向导: npm 7+ pipe 了 postinstall 的 stdio, 自动拉向导只能
 // 靠接管 /dev/tty 把终端塞给子进程 —— 这套机制脆弱 (作者原注 "Tricky")。
@@ -9,35 +9,9 @@
 //
 // 稳的做法是 trigger-on-first-run: 用户在真终端首跑 lodestar-daemon 时,
 // cli.ts 发现没 config + isTTY 就自动进入向导 (真 TTY, readline 一定正常)。
-// 所以这里只打个提示就 process.exit(0), 不 spawn 任何子进程, 永不卡死。
+// 清理仅操作本地 Skill 文件，不读配置或凭据，也不启动子进程。
 
 const fs = require('fs')
-const path = require('path')
-const { execFileSync } = require('child_process')
-
-// 自愈:确保当前平台的 SDK native binary 已装。走 SDK 默认入口后该 binary 是必需,
-// 但 npm i -g 对 nested platform optional 在某些 npm 版本/历史残留下会漏装。
-// 装漏了就在这里补,不依赖 npm 行为。非交互、stdio ignore,不碰 tty(区别于曾导致
-// macOS 卡死的 readline 向导)。
-;(function ensureNativeBinary () {
-  const base = `claude-agent-sdk-${process.platform}-${process.arch}`
-  const variants = process.platform === 'linux' ? [base, `${base}-musl`] : [base]
-  const nm = path.join(__dirname, '..', 'node_modules', '@anthropic-ai')
-  const has = (name) =>
-    fs.existsSync(path.join(nm, name)) ||
-    fs.existsSync(path.join(nm, 'claude-agent-sdk', 'node_modules', '@anthropic-ai', name))
-  if (variants.some(has)) return
-  try {
-    const npm = process.platform === 'win32' ? 'npm.cmd' : 'npm'
-    execFileSync(npm, ['install', '--include=optional', '--no-save', '--no-audit', '--no-fund'], {
-      cwd: path.join(__dirname, '..'),
-      stdio: 'ignore',
-      timeout: 180000,
-    })
-  } catch {
-    // 补装失败:静默(optional)。daemon 启动时 SDK 会报明确的 "Native CLI binary not found"
-  }
-})()
 
 function termWrite (msg) {
   try {
@@ -54,10 +28,18 @@ function termWrite (msg) {
   }
 }
 
-termWrite('\n  \x1b[1m\x1b[36m✓ Lodestar 已安装\x1b[0m\n')
-termWrite('\n  \x1b[2m下一步: 在终端跑 \x1b[32mlodestar-daemon\x1b[0m\x1b[2m 进入配置向导\x1b[0m')
-termWrite('\n  \x1b[2m(首次运行会自动拉起向导; 也可直接跑 \x1b[32mlodestar-setup\x1b[0m\x1b[2m)\x1b[0m\n\n')
-termWrite('  启动时不检查或更新 Agent，自动更新默认关闭。\n')
-termWrite('  安装/更新 Agent: lodestar-update；定期更新可在 [runtime.agent_auto_update] 中分别开启 codex、claude、dsh。\n\n')
+async function main () {
+  const { removeManagedSkill } = require('../src/managed-skill-cleanup.cjs')
+  removeManagedSkill('lodestar-files')
 
-process.exit(0)
+  termWrite('\n  \x1b[1m\x1b[36m✓ Lodestar 已安装\x1b[0m\n')
+  termWrite('\n  \x1b[2m下一步: 在终端跑 \x1b[32mlodestar-daemon\x1b[0m\x1b[2m 进入配置向导\x1b[0m')
+  termWrite('\n  \x1b[2m(首次运行会自动拉起向导; 也可直接跑 \x1b[32mlodestar-setup\x1b[0m\x1b[2m)\x1b[0m\n\n')
+  termWrite('  启动时不检查或更新 Agent，自动更新默认关闭。\n')
+  termWrite('  安装/更新 Agent: lodestar-update --agents-only；定期更新可在 [runtime.agent_auto_update] 中分别开启 codex、claude、dsh。\n\n')
+}
+
+main().catch(error => {
+  console.error('Lodestar 安装清理失败:', error)
+  process.exitCode = 1
+})

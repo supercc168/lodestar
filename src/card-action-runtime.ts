@@ -1,8 +1,13 @@
 /**
  * 卡片动作运行时原语:按 key FIFO(PerKeyActor)+ 动作幂等(ActionDeduper)+
  * 准入校验(validateCardActionAdmission)。上游 ec149d7 按线移植(近原样),
- * 适配点:SUPPORTED_CARD_ACTION_KINDS 与语义 key 按本地 daemon.ts 实际分发的
- * kind 全集重建(host_ask/gsd_* 为本地功能;上游 registry 形态 kind 不收,D-02)。
+ * 适配点:SUPPORTED_CARD_ACTION_KINDS 与语义 key 取并集 —— 本地 daemon.ts
+ * 实际分发 kind(host_ask、gsd_* 系列、agy_forward_codex、agent_run_cancel 等本地功能)
+ * ∪ 上游模型面板 kind(provider_select/model_custom_prompt/model_panel_cancel/
+ * model_page/model_list_open/model_add/model_remove/model_custom_remove)。
+ * 两个显式取舍:token_source_enable 不收(本地保护线 D-02,本地测试锁定);
+ * agent_project_cancel 补收(上游 agentRunElement 发出、daemon 分发停止项目
+ * 任务,上游 runtime 白名单遗漏该 kind)。
  * 本模块只提供原语,daemon 接线在后续 plan(01-08)。
  */
 export type ActionClaim = 'started' | 'inflight' | 'completed'
@@ -13,12 +18,14 @@ export type ActorEnqueueResult<T> =
   | { accepted: false; reason: 'closed' | 'invalid-key' }
 
 export const SUPPORTED_CARD_ACTION_KINDS = new Set([
-  'permission', 'menu', 'model_select', 'model_effort_select', 'ask', 'host_ask',
-  'worktree_disband', 'temp_fork_select', 'temp_back_select', 'temp_resume_select',
-  'tasklist_enable', 'tasklist_delete_prompt', 'tasklist_delete_confirm',
-  'gsd_refresh', 'gsd_select', 'gsd_continue', 'gsd_pause', 'gsd_complete',
-  'gsd_new_prompt', 'agy_forward_codex', 'agent_identity_page', 'agent_run_cancel',
-  'notify_callback', 'notify_reply', 'notify_reply_cancel',
+  'permission', 'menu', 'provider_select', 'model_select', 'model_custom_prompt',
+  'model_panel_cancel', 'model_effort_select', 'ask', 'host_ask', 'worktree_disband',
+  'temp_fork_select', 'temp_back_select', 'temp_resume_select', 'tasklist_enable',
+  'tasklist_delete_prompt', 'tasklist_delete_confirm',
+  'agent_identity_page', 'model_page', 'notify_callback', 'notify_reply', 'notify_reply_cancel',
+  'model_list_open', 'model_add', 'model_remove', 'model_custom_remove',
+  'agent_run_cancel', 'agent_project_cancel', 'gsd_refresh', 'gsd_select', 'gsd_continue',
+  'gsd_pause', 'gsd_complete', 'gsd_new_prompt', 'agy_forward_codex',
 ])
 
 /** Admission validation runs synchronously before actor/dedupe reservation;
@@ -227,12 +234,24 @@ function cardActionSemanticKey(data: any): string {
     case 'gsd_complete':
     case 'gsd_new_prompt': resource = { task_slug: value.task_slug, panel_gen: value.panel_gen }; break
     case 'agy_forward_codex': resource = { result_id: value.result_id }; break
+    // 本地语义(测试锁定):agent_identity_page 按 panel_id 收敛,同面板翻页
+    // 共用一个 key —— 快速连点第二下按 inflight 抑制,不重复派发。
     case 'agent_identity_page': resource = { panel_id: value.panel_id }; break
-    case 'agent_run_cancel': resource = { run_id: value.run_id }; break
+    case 'agent_run_cancel':
+    case 'agent_project_cancel': resource = { run_id: value.run_id }; break
+    case 'token_source_enable': resource = { source_id: value.source_id }; break
+    case 'model_page': resource = { panel_id: value.panel_id, source_id: value.source_id, page: value.page }; break
+    case 'model_list_open': resource = { panel_id: value.panel_id, source_id: value.source_id, mode: value.mode }; break
+    case 'model_add':
+    case 'model_remove':
+    case 'model_custom_remove': resource = { panel_id: value.panel_id, source_id: value.source_id, model: value.model }; break
     case 'notify_callback': resource = { notify_id: value.notify_id }; break
     case 'notify_reply': resource = { notify_id: value.notify_id }; break
     case 'notify_reply_cancel': resource = { notify_id: value.notify_id, reply_id: value.reply_id }; break
+    case 'provider_select':
     case 'model_select':
+    case 'model_custom_prompt':
+    case 'model_panel_cancel':
     case 'model_effort_select': resource = { panel_id: value.panel_id }; break
     default: resource = value
   }
@@ -255,7 +274,7 @@ export function cardActionDedupeIdentity(data: any): CardActionDedupeIdentity {
   return {
     ...(eventId ? { deliveryKey: `event\u0000${eventId}` } : {}),
     businessKey: `semantic\u0000${cardActionSemanticKey(data)}`,
-    ...(['agent_identity_page', 'notify_reply'].includes(data?.action?.value?.kind) ? { repeatable: true } : {}),
+    ...(['agent_identity_page', 'model_page', 'model_list_open', 'model_add', 'model_remove', 'model_custom_remove', 'notify_reply'].includes(data?.action?.value?.kind) ? { repeatable: true } : {}),
   }
 }
 

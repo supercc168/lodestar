@@ -1,5 +1,5 @@
 import { execFileSync } from 'node:child_process'
-import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs'
+import { existsSync, mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, describe, expect, test } from 'bun:test'
@@ -10,7 +10,6 @@ import {
   readWorktreeInstructionsForManagedBranch,
   removeProjectWorktreeIfClean,
   withProjectWorktreeLock,
-  worktreeInstructionsPathForManagedBranch,
 } from './worktree'
 
 let roots: string[] = []
@@ -100,6 +99,55 @@ describe('project worktrees', () => {
     expect(() => removeProjectWorktreeIfClean(repo, 'feishu', 'dirty-work')).toThrow(/uncommitted/)
   })
 
+  test('refuses to remove work branches mounted outside the managed sibling path', () => {
+    const { root, repo } = initRepo()
+    const outside = join(root, 'manual-checkout')
+    git(repo, ['worktree', 'add', '-b', 'work/manual', outside, 'HEAD'])
+
+    expect(() => removeProjectWorktreeIfClean(repo, 'feishu', 'manual')).toThrow(/outside managed path/)
+    expect(existsSync(outside)).toBe(true)
+    expect(git(outside, ['branch', '--show-current']).trim()).toBe('work/manual')
+  })
+
+  test('rejects an unrelated repository at the managed path before remote disband can start', () => {
+    const { root, repo } = initRepo()
+    const unrelated = join(root, 'feishu[unrelated]')
+    mkdirSync(unrelated)
+    git(unrelated, ['init'])
+
+    expect(() => removeProjectWorktreeIfClean(repo, 'feishu', 'unrelated')).toThrow(/not a registered worktree/)
+    expect(existsSync(unrelated)).toBe(true)
+  })
+
+  test.skipIf(process.platform === 'win32')('preserves quoted and newline-containing paths in the Git worktree registry', () => {
+    const { root, repo } = initRepo()
+    const projectName = '项目\n"quoted"'
+    const first = ensureProjectWorktree(repo, projectName, 'path-test')
+
+    // git worktree add 在 macOS 上把注册路径解析为真实路径(/var → /private/var),
+    // 注册表路径按合并语义保留 git 原样输出;比较时同样归一。
+    expect(listProjectWorktrees(repo, projectName)[0]?.worktreePath).toBe(realpathSync(join(root, `${projectName}[path-test]`)))
+    expect(ensureProjectWorktree(repo, projectName, 'path-test').createdWorktree).toBe(false)
+    expect(removeProjectWorktreeIfClean(repo, projectName, 'path-test').removedWorktree).toBe(true)
+    expect(existsSync(first.worktreePath)).toBe(false)
+  })
+
+  test('recognizes managed worktrees and their instructions through a symlinked project root', () => {
+    const { root, repo } = initRepo()
+    const aliasRoot = `${root}-alias`
+    symlinkSync(root, aliasRoot, process.platform === 'win32' ? 'junction' : 'dir')
+    roots.push(aliasRoot)
+    const first = ensureProjectWorktree(repo, 'feishu', 'Prompt-work')
+    writeFileSync(join(first.worktreePath, 'AGENTS.PROMPT.md'), '# shared instructions\n')
+
+    const aliasRepo = join(aliasRoot, 'feishu')
+    expect(ensureProjectWorktree(aliasRepo, 'feishu', 'Prompt-work').createdWorktree).toBe(false)
+    expect(readWorktreeInstructionsForManagedBranch(first.worktreePath, aliasRepo, 'feishu')?.content)
+      .toBe('# shared instructions')
+    rmSync(join(first.worktreePath, 'AGENTS.PROMPT.md'))
+    expect(removeProjectWorktreeIfClean(aliasRepo, 'feishu', 'Prompt-work').removedWorktree).toBe(true)
+  })
+
   test('removes clean worktree directory but keeps branch discoverable', () => {
     const { repo } = initRepo()
     const result = ensureProjectWorktree(repo, 'feishu', 'clean-work')
@@ -172,7 +220,7 @@ describe('project worktrees', () => {
     writeFileSync(join(result.worktreePath, 'agents.avatar.md'), '# extra rules\n')
 
     expect(
-      worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu'),
+      readWorktreeInstructionsForManagedBranch(result.worktreePath, repo, 'feishu')?.path,
     ).toBe(join(result.worktreePath, 'agents.avatar.md'))
   })
 
@@ -181,7 +229,7 @@ describe('project worktrees', () => {
     const result = ensureProjectWorktree(repo, 'feishu', 'avatar-art')
     writeFileSync(join(result.worktreePath, 'agents.avatar-art.md'), '# extra rules\n')
 
-    expect(worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu')).toBeNull()
+    expect(readWorktreeInstructionsForManagedBranch(result.worktreePath, repo, 'feishu')).toBeNull()
   })
 
   test('reads slug-specific AGENTS content for managed worktree branches', () => {
@@ -203,14 +251,14 @@ describe('project worktrees', () => {
     const result = ensureProjectWorktree(repo, 'feishu', 'prompt-work')
     writeFileSync(join(result.worktreePath, 'agents.other.md'), '# extra rules\n')
 
-    expect(worktreeInstructionsPathForManagedBranch(result.worktreePath, repo, 'feishu')).toBeNull()
+    expect(readWorktreeInstructionsForManagedBranch(result.worktreePath, repo, 'feishu')).toBeNull()
   })
 
   test('skips slug-specific AGENTS files outside managed worktree branches', () => {
     const { repo } = initRepo()
     writeFileSync(join(repo, 'agents.main.md'), '# extra rules\n')
 
-    expect(worktreeInstructionsPathForManagedBranch(repo, repo, 'feishu')).toBeNull()
+    expect(readWorktreeInstructionsForManagedBranch(repo, repo, 'feishu')).toBeNull()
   })
 
   test('skips managed-branch AGENTS lookup in non-git project directories', () => {
@@ -220,7 +268,6 @@ describe('project worktrees', () => {
     mkdirSync(projectDir)
     writeFileSync(join(projectDir, 'agents.prompt.md'), '# extra rules\n')
 
-    expect(worktreeInstructionsPathForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
     expect(readWorktreeInstructionsForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
   })
 
@@ -232,7 +279,6 @@ describe('project worktrees', () => {
     git(projectDir, ['init'])
     writeFileSync(join(projectDir, 'agents.prompt.md'), '# extra rules\n')
 
-    expect(worktreeInstructionsPathForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
     expect(readWorktreeInstructionsForManagedBranch(projectDir, projectDir, 'test1')).toBeNull()
   })
 })

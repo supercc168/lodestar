@@ -17,6 +17,7 @@
 
 import type { Session } from './session'
 import * as feishu from './feishu'
+import { formatFeishuError } from './feishu-errors'
 import * as cards from './cards'
 import { log } from './log'
 import { claudeTranscriptDir } from './claude-agent-process'
@@ -31,6 +32,7 @@ import {
 import { closeSync, openSync, readSync, readdirSync, statSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { join } from 'node:path'
+import { diagnosticIdLabel } from './session-util'
 
 const DAY_MS = 24 * 60 * 60 * 1000
 const PANEL_TTL_MS = 30 * 60 * 1000
@@ -340,13 +342,14 @@ async function showTurnList(s: Session, mode: 'fork' | 'back', userOpenId: strin
     entries,
   })
   let messageId: string | null
-  try { messageId = await feishu.sendCard(s.chatId, card) } catch (error) {
+  let failure: unknown
+  try { messageId = await feishu.sendCard(s.chatId, card, error => { failure = error }) } catch (error) {
     panelMap(s).delete(panel.id)
     throw error
   }
   if (!messageId) {
     panelMap(s).delete(panel.id)
-    await feishu.sendTextRaw(s.chatId, `❌ ${mode === 'fork' ? 'fk' : 'bk'} 列表发送失败`)
+    await feishu.sendTextRaw(s.chatId, `❌ ${mode === 'fork' ? 'fk' : 'bk'} 列表发送失败\n${formatFeishuError(failure)}`)
   }
 }
 
@@ -387,13 +390,14 @@ export async function showResumeList(s: Session, userOpenId: string): Promise<vo
   const panel = createPanel(s, 'resume', userOpenId, choices)
   const card = cards.resumeListCard({ projectName: baseSessionName(s), panelId: panel.id, entries })
   let messageId: string | null
-  try { messageId = await feishu.sendCard(s.chatId, card) } catch (error) {
+  let failure: unknown
+  try { messageId = await feishu.sendCard(s.chatId, card, error => { failure = error }) } catch (error) {
     panelMap(s).delete(panel.id)
     throw error
   }
   if (!messageId) {
     panelMap(s).delete(panel.id)
-    await feishu.sendTextRaw(s.chatId, '❌ rs 历史列表发送失败')
+    await feishu.sendTextRaw(s.chatId, `❌ rs 历史列表发送失败\n${formatFeishuError(failure)}`)
   }
 }
 
@@ -486,10 +490,11 @@ export async function onBackSelect(s: Session, panelId: string, choiceId: string
     const lease = s.beginLifecycle('back')
     let writeLogWarning = ''
     try {
-      const messageId = await feishu.sendCard(s.chatId, cards.writeLogCard({ projectName: panel.baseName, entries: choice.writes }))
-      if (!messageId) writeLogWarning = '；文件变更记录卡发送失败'
+      let failure: unknown
+      const messageId = await feishu.sendCard(s.chatId, cards.writeLogCard({ projectName: panel.baseName, entries: choice.writes }), error => { failure = error })
+      if (!messageId) writeLogWarning = `；文件变更记录卡发送失败: ${formatFeishuError(failure)}`
     } catch (error) {
-      writeLogWarning = `；文件变更记录卡发送失败: ${error instanceof Error ? error.message : error}`
+      writeLogWarning = `；文件变更记录卡发送失败: ${formatFeishuError(error)}`
     }
     if (!s.ownsLifecycle(lease) || s.hasPreservedWatchdogRecovery()) {
       return { ok: false, message: '回退被更新的会话操作打断，未执行' }
@@ -509,7 +514,7 @@ export async function onBackSelect(s: Session, panelId: string, choiceId: string
         message: `本群已准备 Claude 新分支；发送下一条消息时生成并接入，旧会话未删除，磁盘文件未回滚${writeLogWarning}`,
       }
     }
-    const thread = s.lastSessionId ? ` ${s.lastSessionId.slice(0, 8)}…` : ''
+    const thread = s.lastSessionId ? ` ${diagnosticIdLabel(s.lastSessionId)}` : ''
     return { ok: true, message: `本群已改接新会话${thread}；旧会话未删除，磁盘文件未回滚${writeLogWarning}` }
   } catch (error) {
     return { ok: false, message: `回退失败: ${error instanceof Error ? error.message : error}` }
@@ -569,7 +574,7 @@ export async function onResumeSelect(s: Session, panelId: string, choiceId: stri
     if (!s.ownsLifecycle(lease) || s.hasPreservedWatchdogRecovery()) {
       return finish(false, '历史分支被更新的会话操作打断，未执行', 'unchanged')
     }
-    log(`session-temp: history fork ${s.sessionName} ← ${choice.launch.source.provider} ${sourceId.slice(0, 8)}`)
+    log(`session-temp: history fork ${s.sessionName} ← ${choice.launch.source.provider} ${sourceId}`)
     const ok = await s.rollbackTo(choice.launch, {
       anchors: [],
       base: choice.launch,

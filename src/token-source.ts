@@ -1,254 +1,300 @@
 /**
- * TokenSource 适配层(Phase 1 slim)——把本地已验证的 claude-models / codex-models
- * 收敛成统一的「凭据 + 模型 + spawn 注入」入口,不引入上游 [token_source.*] TOML,
- * 不改飞书 model 面板 UX。
- *
- * 真相源仍是:
- *   - [claude.models.*] → claude-models.ts profiles
- *   - [codex.models.*]  → codex-models.ts profiles
- *   - 内建 login 档(fable/opus / gpt-5.6-sol)
- *
- * 本层职责:
- *   resolveTokenSource(provider, selection) → TokenSource
- *   source.spawnEnv / spawnOverrides / resolveSpawnModel / usageSource
- *
- * Claude spawn 语义与 ClaudeAgentProcess.buildSpawnEnv 历史行为一致:
- *   scrub ANTHROPIC_* + tier alias →(api 才)注入 profile env → tier env + GSD_RUNTIME。
- * Codex spawn 语义委托 codexSpawnOverrides(登录空覆盖 / api 注入 provider+key)。
+ * 账号、模型、启动环境和额度的共享接口及 registry。
+ * 每个 token-source-*.ts 模块注册 factory，由 token-source-builtins.ts 构建实例。
  */
 
-import type { AgentProvider, AgentUsageSource } from './agent-process'
-import { usageSourceForAgent } from './agent-process'
-import {
-  CLAUDE_MODEL_ALIAS_KEYS,
-  claudeModelConfigured,
-  claudeModelEnv,
-  claudeModelIsApiRoute,
-  claudeModelProfile,
-  claudeModelProfiles,
-  claudeModelTierEnv,
-  resolveClaudeSdkModel,
-  type ClaudeModelProfile,
-} from './claude-models'
-import { dshSourceFromConfig } from './token-source-dsh'
-import {
-  codexModelConfigured,
-  codexModelIsGrok,
-  codexModelProfile,
-  codexModelProfiles,
-  codexSpawnOverrides,
-  resolveCodexModelId,
-  type CodexModelProfile,
-} from './codex-models'
+import type { AgentProvider, AgentReasoningEffort } from './agent-process'
+import type { TokenSourceConfig } from './config'
+import type { AccountInfo, Settings } from '@anthropic-ai/claude-agent-sdk'
+import type { CodexApiProvider } from './codex-process'
+import type { CodexCredits } from './codex-credits'
+import { log } from './log'
+import { codexAccounts } from './codex-accounts'
 
-export type TokenSourceKind = 'login' | 'api'
+export type TokenSourceAgent = AgentProvider
 
-/** spawn 侧 codex 覆盖(与 codexSpawnOverrides 同形)。 */
-export interface TokenSourceCodexOverrides {
-  modelId: string | undefined
-  configArgs: string[]
-  env: Record<string, string>
+/** 账号模型目录中的一个可选模型。 */
+export interface TokenSourceModel {
+  model: string
+  display: string
+  efforts: AgentReasoningEffort[]
+  /** 模型默认或用户/Agent 选定的请求档位；null 表示需要手动选择。 */
+  defaultEffort: AgentReasoningEffort | null
+  /** 真实 turn 已观测到 1M 上下文；undefined 表示未确认，仅供面板展示。 */
+  context1m?: boolean
+  /** 账号或业务规则明确拒绝的模型；目录外的手动补录不因此禁用。 */
+  unavailableReason?: string
+  origin?: 'upstream' | 'custom'
 }
 
-/**
- * 一个可选的「模型 + 凭据路由」槽位。id/selectionModel 与飞书面板 key 对齐
- * (claude:fable / claude:glm / gpt-5.6-sol / codex:<slug>)。
- */
+export interface TokenSourceModelCatalogState {
+  status: 'idle' | 'loading' | 'ready' | 'disabled' | 'failed'
+  updatedAt: number | null
+  error?: string
+}
+
+// ── 统一用量(codex 5h/weekly、glm 5h/monthly 归一) ────────────────────
+
+export interface UsageWindowUnified {
+  kind: string
+  label: string
+  percent: number | null
+  resetsAt: Date | null
+  used?: number
+  total?: number
+  /** Successful Plus response omitted 5h; preserve the full-window annotation without inventing a reset time. */
+  unreportedFull?: boolean
+}
+
+export type UsageStateUnified =
+  | 'ok'
+  | 'no_credentials'
+  | 'not_applicable'   // 该 source 无额度查询
+  | 'rate_limited'
+  | 'network'
+
+export interface UsageSnapshotUnified {
+  state: UsageStateUnified
+  kind?: 'quota' | 'balance'
+  balance?: { remaining: number; currency: string }
+  quota?: { remaining: number | null; limit: number | null; currency: string }
+  planLabel?: string
+  windows: UsageWindowUnified[]
+  reason?: string
+  fetchedAt?: number
+  /** Minimum delay reported by the quota service after a failed read. */
+  retryAfterMs?: number
+  /** Codex 账号可用的额度重置卡次数，仅在 hi 中展示。 */
+  resetCredits?: number | null
+  /** Consumable Codex credits; omitted for sources without this concept. */
+  credits?: CodexCredits | null
+}
+
+// ── env helper(各 source 共享:scrub 残留凭据防 A 账号夹带 B 的 key) ─────
+type Env = Record<string, string | undefined>
+
+export const ANTHROPIC_ENV_KEYS = [
+  'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_BASE_URL',
+  'ANTHROPIC_DEFAULT_OPUS_MODEL', 'ANTHROPIC_DEFAULT_SONNET_MODEL', 'ANTHROPIC_DEFAULT_HAIKU_MODEL',
+  'ANTHROPIC_DEFAULT_FABLE_MODEL', 'ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL',
+  'CLAUDE_CODE_SUBAGENT_MODEL', 'ANTHROPIC_CUSTOM_HEADERS', 'CLAUDE_CODE_OAUTH_TOKEN',
+  'CLAUDE_CODE_USE_BEDROCK', 'CLAUDE_CODE_USE_VERTEX', 'CLAUDE_CODE_USE_FOUNDRY',
+  'CLAUDE_CODE_EFFORT_LEVEL',
+]
+
+export function scrubAnthropicEnv(base: Env): Env {
+  const out: Env = { ...base }
+  for (const k of ANTHROPIC_ENV_KEYS) delete out[k]
+  delete out.LODESTAR_PACKY_API_KEY
+  return out
+}
+
+export function scrubDshEnv(base: Env): Env {
+  const out = scrubAnthropicEnv(base)
+  for (const key of Object.keys(out)) {
+    if (/^(DSH_|DEEPSEEK_|LODESTAR_DSH_|ZAI_|ZHIPU_)/.test(key)) delete out[key]
+  }
+  return out
+}
+
+// ── TokenSource 接口 ─────────────────────────────────────
+
 export interface TokenSource {
   id: string
-  kind: TokenSourceKind
-  provider: AgentProvider
-  displayName: string
-  description: string
-  /** 飞书 model 选择用的 key(与 FIXED_MODEL_CHOICES / codexModelChoices 一致)。 */
-  selectionModel: string
-  /** 是否已配好凭据(login 恒 true;api 看 profile.configured)。 */
-  enabled(): boolean
-  /** 发给 agent 进程的真实 model id(claude SDK / codex app-server)。 */
-  resolveSpawnModel(): string | undefined
-  /**
-   * Claude:在 base env 上 scrub 后按 kind 注入,并锁 tier + GSD_RUNTIME。
-   * Codex:合并 providerEnv + GSD_RUNTIME(完整 PATH/config 仍由 buildCodexSpawnEnv 叠)。
-   */
-  spawnEnv(base: Record<string, string>): Record<string, string>
-  /** Codex 专用:configArgs + providerEnv + modelId。Claude 返回空覆盖。 */
-  spawnOverrides(): TokenSourceCodexOverrides
-  /** 控制台额度数据源(codex / glm / provider / not_applicable)。 */
-  usageSource(): AgentUsageSource
-  /** Claude API 路由需绕开 reclaude 包装器;login 走 [claude] bin。 */
-  isApiRoute(): boolean
-}
-
-const ANTHROPIC_SCRUB_KEYS = [
-  'ANTHROPIC_BASE_URL',
-  'ANTHROPIC_AUTH_TOKEN',
-  'ANTHROPIC_API_KEY',
-  ...CLAUDE_MODEL_ALIAS_KEYS,
-] as const
-
-/** 抹掉 ANTHROPIC 路由凭据与四档 tier alias,防 A 档残留夹带到 B 档。 */
-export function scrubAnthropicEnv(base: Record<string, string>): Record<string, string> {
-  const out = { ...base }
-  for (const key of ANTHROPIC_SCRUB_KEYS) delete out[key]
-  return out
-}
-
-function claudeSourceFromProfile(profile: ClaudeModelProfile): TokenSource {
-  const selectionModel = profile.key
-  return {
-    id: profile.key,
-    kind: profile.route,
-    provider: 'claude',
-    displayName: profile.displayName,
-    description: profile.description,
-    selectionModel,
-    enabled: () => profile.configured,
-    resolveSpawnModel: () => resolveClaudeSdkModel(selectionModel),
-    spawnEnv(base) {
-      const env = scrubAnthropicEnv(base)
-      if (profile.route === 'api') Object.assign(env, claudeModelEnv(selectionModel))
-      Object.assign(env, claudeModelTierEnv(selectionModel), { GSD_RUNTIME: 'claude' })
-      return env
-    },
-    spawnOverrides: () => ({ modelId: undefined, configArgs: [], env: {} }),
-    usageSource: () => usageSourceForAgent('claude', selectionModel),
-    isApiRoute: () => profile.route === 'api',
+  /** One visible Codex source, with a separate native auth/catalog binding for each named account. */
+  forAccount?(accountId: string): TokenSource
+  /** Stable fingerprint of fields that affect spawned process routing/env.
+   * Registry rebuilds with the same effective config keep the same value;
+   * credential/base-url/slot changes force an idle process replacement. */
+  spawnRevision?: string
+  /** 模型能力需要不同的进程环境时参与启动身份，例如无 effort 参数的网关模型。 */
+  modelEnvironmentRevision?(model: string): string
+  /** 固定种类(声明式:string —— 加 source 不扩枚举) */
+  kind: string
+  /** 绑定哪个 agent 进程(协议强制:claude 走 Anthropic,codex 走 OpenAI/app-server) */
+  agent: TokenSourceAgent
+  display: string
+  /** 配没配凭据(面板据此决定可选 vs 灰显「启用」)。廉价同步信号:
+   *  codex 看 ~/.codex 登录态;glm 看 config 有没有 token。精确有效性在 spawn/查额度时暴露。 */
+  enabled: boolean
+  models: TokenSourceModel[]
+  /** availableModels 包含接口目录及补录记录，origin 区分隐藏/显示和补录/删除。 */
+  modelSelection?: {
+    mode?: 'allowlist' | 'catalog'; modelIds: string[]; availableModels: TokenSourceModel[]
+    /** 默认精选随目录更新；显隐只保存增量，不把目录快照写成固定白名单。 */
+    selectDefaults?(catalog: readonly TokenSourceModel[]): string[]
+    /** 自动精选项的家族隐藏键；手动显示的旧版本仍按精确 ID 隐藏。 */
+    visibilityKey?(model: string): string
   }
+  /** Committed catalog state. A ready snapshot may include a background refresh error. */
+  modelCatalogState?: TokenSourceModelCatalogState
+  defaultModel: string
+  /** Startup/background worker only. Interactive consumers must not call or await this. */
+  refreshModels(): Promise<void>
+  /** 面板手动补录模型名时的存在性校验(端点 200/1214 判别)。
+   *  未声明时允许手动补录并选择 Agent 请求档位，实际请求错误由后端报告。 */
+  verifyModel?(model: string): Promise<'exists' | 'not_found' | 'no_verdict'>
+  validateCustomModelId?(model: string): void
+  spawnEnv(base: Env, model?: string): Env
+  resolveSpawnModel(model: string): string | undefined
+  /** 该 source spawn 的 claude 子进程 settingSources(覆盖 DEFAULT_SETTING_SOURCES)。
+   *  注入 env 的 source(glm/deepseek)不设 → DEFAULT(['project','local'],spawnEnv 权威);
+   *  透传型 source(native)设 ['user','project','local'] → 读本机 Claude Code 配置。 */
+  settingSources?: readonly string[]
+  /** Claude 来源的进程级设置覆盖；不修改本机 settings 文件。 */
+  claudeSettings?: Settings
+  /** Custom Responses provider; subscription account selection/usage do not apply. */
+  codexApiProvider?: CodexApiProvider
+  /** 在 Claude SDK 接收用户输入前确认实际认证来源。 */
+  validateClaudeAccount?(account: AccountInfo): void
+  /** 同一真实计费账号的 Agent / 模型 Key 只占 hi 中一行。 */
+  usageAccount?: { id: string; label: string }
+  /** Runtime facades return cached data only; private factory instances load it in the background. */
+  readUsage(): Promise<UsageSnapshotUnified>
 }
 
-/** 未知/空 selection 的 Claude 回落:登录默认 Fable 5(与 resolveClaudeSdkModel 一致)。 */
-function claudeFallbackSource(model: string | null | undefined): TokenSource {
-  const selectionModel =
-    model?.startsWith('claude:') && model !== 'claude:default' ? model : 'claude:fable'
-  const kind: TokenSourceKind = claudeModelIsApiRoute(selectionModel) ? 'api' : 'login'
-  return {
-    id: selectionModel,
-    kind,
-    provider: 'claude',
-    displayName: `Claude Code · ${selectionModel.replace(/^claude:/, '')}`,
-    description: '',
-    selectionModel,
-    enabled: () => claudeModelConfigured(selectionModel),
-    resolveSpawnModel: () => resolveClaudeSdkModel(selectionModel),
-    spawnEnv(base) {
-      const env = scrubAnthropicEnv(base)
-      if (claudeModelIsApiRoute(selectionModel)) Object.assign(env, claudeModelEnv(selectionModel))
-      Object.assign(env, claudeModelTierEnv(selectionModel), { GSD_RUNTIME: 'claude' })
-      return env
-    },
-    spawnOverrides: () => ({ modelId: undefined, configArgs: [], env: {} }),
-    usageSource: () => usageSourceForAgent('claude', selectionModel),
-    isApiRoute: () => claudeModelIsApiRoute(selectionModel),
-  }
+/** 隐藏只影响选择面板，已配置的模型仍按上游能力启动。 */
+export function tokenSourceRuntimeModels(source: TokenSource): TokenSourceModel[] {
+  return source.modelSelection ? [...source.models, ...source.modelSelection.availableModels.filter(
+    model => !source.models.some(selected => selected.model === model.model))] : source.models
 }
 
-function codexSourceFromProfile(profile: CodexModelProfile): TokenSource {
-  const selectionModel = profile.key
-  return {
-    id: profile.key,
-    kind: profile.route,
-    provider: 'codex',
-    displayName: profile.displayName,
-    description: profile.description,
-    selectionModel,
-    enabled: () => profile.configured,
-    resolveSpawnModel: () => profile.modelId || undefined,
-    spawnEnv(base) {
-      const overrides = codexSpawnOverrides(selectionModel)
-      return { ...base, ...overrides.env, GSD_RUNTIME: 'codex' }
-    },
-    spawnOverrides: () => codexSpawnOverrides(selectionModel),
-    usageSource: () => 'codex',
-    isApiRoute: () => profile.route === 'api',
-  }
+export function tokenSourceRuntimeModel(source: TokenSource, model: string | undefined | null): TokenSourceModel | undefined {
+  const key = (id: string | undefined | null) => source.agent === 'claude' ? id?.replace(/\[1m\]$/, '') : id
+  return tokenSourceRuntimeModels(source).find(entry => key(entry.model) === key(model))
 }
 
-/** 内建 / 裸 model id(gpt-5.6-sol 等)的 codex login source。 */
-function codexLoginSource(model: string | null | undefined): TokenSource {
-  const selectionModel = model?.trim() || 'gpt-5.6-sol'
-  const id = selectionModel.startsWith('codex:') ? selectionModel : `codex-login:${selectionModel}`
-  return {
-    id,
-    kind: 'login',
-    provider: 'codex',
-    displayName: `Codex · ${selectionModel}`,
-    description: 'Codex 登录/默认档(无独立 [codex.models] 节)。',
-    selectionModel,
-    enabled: () => true,
-    resolveSpawnModel: () => resolveCodexModelId(selectionModel),
-    spawnEnv(base) {
-      return { ...base, GSD_RUNTIME: 'codex' }
-    },
-    spawnOverrides: () => codexSpawnOverrides(selectionModel),
-    usageSource: () => 'codex',
-    isApiRoute: () => false,
-  }
+export function tokenSourceProcessRevision(source: TokenSource | undefined, model?: string | null): string | null {
+  const revision = source?.spawnRevision ?? null
+  const modelRevision = source?.modelEnvironmentRevision?.(model ?? source.defaultModel)
+  return modelRevision === undefined ? revision : JSON.stringify([revision, modelRevision])
 }
 
-/**
- * 按当前会话 (provider, selectedModel) 解析 TokenSource。
- * 未命中 profile 时回落 login 默认,行为与 normalizeFixedModelSelection 一致:
- * 不会静默把未配置 api 档当成已鉴权。
- */
-export function resolveTokenSource(
-  provider: AgentProvider,
-  model: string | null | undefined,
-): TokenSource {
-  // dsh 是单档后端:模型名与凭据同来自 [deepseek-harness],不看 model 前缀。
-  if (provider === 'dsh') return dshSourceFromConfig()
-  if (provider === 'claude') {
-    const profile = claudeModelProfile(model)
-    if (profile) return claudeSourceFromProfile(profile)
-    return claudeFallbackSource(model)
-  }
-  if (codexModelIsGrok(model)) {
-    throw new Error(`Grok 模型 ${model ?? ''} 必须使用 Claude provider`)
-  }
-  const profile = codexModelProfile(model)
-  if (profile) return codexSourceFromProfile(profile)
-  return codexLoginSource(model)
+// ── provider factory registry(声明式:每 source 模块加载时登记) ──────────
+
+/** 飞书 setup 命令接入(`<commandSuffix>-setup`):source 声明引导 + 参数解析,
+ *  加新 source 不必改 session-commands 命令路由(声明式 generic 路由)。 */
+export interface TokenSourceSetup {
+  /** 命令后缀:飞书发 `<commandSuffix>-setup <args>`;通常 = configSectionId。 */
+  commandSuffix: string
+  /** model 面板「启用」按钮的引导文本(含命令用法)。 */
+  hint: (display: string) => string
+  /** 解析飞书命令参数 → 写 config.toml 的 cfg;失败返 { error }。 */
+  parseArgs: (args: string) => { config: TokenSourceConfig } | { error: string }
+  /** 保存前使用候选凭据查询账号接口；不依赖本机 Agent 安装，不修改运行中来源。 */
+  validate: (cfg: TokenSourceConfig) => Promise<void>
 }
 
-/** 当前配置下全部已知 source(claude 全 profiles + codex api profiles + 内建 login sol)。 */
+/** 本机 settings.json 探测:config.toml 没配时,若本机 Claude Code 配的 host 命中本 source,
+ *  自动启用(凭据从 settings.json 取)—— 新机装 lodestar 不用手动 config.toml,本机配啥自动认。 */
+export interface TokenSourceDetection {
+  fromSettingsEnv(env: Record<string, string>): Partial<TokenSourceConfig> | null
+}
+
+export interface TokenSourceFactoryDef {
+  kind: string
+  /** config.toml 里该 source 的 section id(如 'glm');undefined = 无 config(codex 走本地 login) */
+  configSectionId?: string
+  build: (cfg: TokenSourceConfig, detected?: Partial<TokenSourceConfig> | null) => TokenSource
+  /** 飞书 setup 命令接入(可选;codex login / native 无独立 setup)。 */
+  setup?: TokenSourceSetup
+  /** 独立的余额凭据配置，校验通过后才保存；不改变推理凭据。 */
+  usageSetup?: TokenSourceSetup
+  /** 本机 settings.json 探测(可选;codex / native 无)—— 命中 host 则自动启用。 */
+  detect?: TokenSourceDetection
+}
+
+const factoryRegistry = new Map<string, TokenSourceFactoryDef>()
+
+/** 每个 source 模块加载时调:声明式登记。加新 source = 新建模块 + builtins import。 */
+export function registerTokenSourceFactory(def: TokenSourceFactoryDef): void {
+  factoryRegistry.set(def.kind, def)
+}
+
+export function tokenSourceFactories(): TokenSourceFactoryDef[] {
+  return [...factoryRegistry.values()]
+}
+
+// ── instance registry(daemon 运行时:已构建的 source 实例) ──────────────
+
+const registry = new Map<string, TokenSource>()
+let defaultId: string | null = null
+let registryGeneration = 0
+
+export function tokenSourceRegistryRevision(): number { return registryGeneration }
+
+export function registerTokenSource(s: TokenSource, opts?: { default?: boolean }): void {
+  registry.set(s.id, s)
+  if (opts?.default || defaultId === null) defaultId = s.id
+}
+
+export function getTokenSource(id: string | null | undefined): TokenSource | undefined {
+  return id ? registry.get(id) : undefined
+}
+
+export function getTokenSourceForAccount(id: string | null | undefined, accountId = 'default'): TokenSource | undefined {
+  const source = getTokenSource(id)
+  return source?.forAccount ? source.forAccount(accountId) : source
+}
+
 export function listTokenSources(): TokenSource[] {
-  const claude = claudeModelProfiles().map(claudeSourceFromProfile)
-  const codexApi = codexModelProfiles()
-    .filter(profile => !codexModelIsGrok(profile.key))
-    .map(codexSourceFromProfile)
-  const sol = codexLoginSource('gpt-5.6-sol')
-  // DSH 是独立后端:一档一位,未配置 `[deepseek-harness].api_key` 时 enabled() 为假
-  // (身份目录只显示不生效),不改 claude/codex 既有档位的 id 与顺序。
-  const dsh = dshSourceFromConfig()
-  // sol 与可能的 codex:gpt-5.6-sol 去重
-  const seen = new Set<string>()
-  const out: TokenSource[] = []
-  for (const s of [...claude, sol, ...codexApi, dsh]) {
-    if (seen.has(s.id)) continue
-    seen.add(s.id)
-    out.push(s)
-  }
-  return out
+  return [...registry.values()]
 }
 
-/** Claude spawn 单入口:scrub + inject + tier + GSD_RUNTIME(供 ClaudeAgentProcess 调)。 */
-export function resolveClaudeSpawnEnv(
-  model: string | null | undefined,
-  base: Record<string, string>,
-): Record<string, string> {
-  return resolveTokenSource('claude', model).spawnEnv(base)
+export function listTokenSourcesByAgent(agent: TokenSourceAgent): TokenSource[] {
+  return listTokenSources().filter(s => s.agent === agent)
 }
 
-/** Codex spawn 覆盖单入口(供 session.spawnAgent 调)。 */
-export function resolveCodexSpawnOverrides(
-  model: string | null | undefined,
-): TokenSourceCodexOverrides {
-  return resolveTokenSource('codex', model).spawnOverrides()
+/** 某 agent 下所有「已启用」的 source(spawn / 默认选择 / 额度查询只认 enabled,
+ *  disabled 的不参与 —— 避免未配置的 source 把空凭据注入子进程)。 */
+export function listEnabledTokenSourcesByAgent(agent: TokenSourceAgent): TokenSource[] {
+  return listTokenSourcesByAgent(agent).filter(s => s.enabled)
 }
 
-/** 与 usageSourceForAgent 对齐的便捷包装(会话/console 可统一走 source)。 */
-export function resolveUsageSource(
-  provider: AgentProvider,
-  model: string | null | undefined,
-): AgentUsageSource {
-  return resolveTokenSource(provider, model).usageSource()
+export function setDefaultTokenSource(id: string): void {
+  if (registry.has(id)) defaultId = id
+}
+
+/** 仅供测试重置全局 registry,保证用例隔离。 */
+export function resetTokenSourceRegistry(): void {
+  registry.clear()
+  defaultId = null
+  registryGeneration++
+}
+
+/** Initial daemon warmup only. Config edits preserve compatible snapshots and schedule
+ * their own background refresh; no interactive consumer waits for this barrier. */
+let refreshAllInFlight: { generation: number; promise: Promise<void> } | null = null
+
+export function refreshAllTokenSourceModels(): Promise<void> {
+  const generation = registryGeneration
+  if (refreshAllInFlight?.generation === generation) return refreshAllInFlight.promise
+  const promise = Promise.allSettled(listTokenSourceAccounts().map(async ts => {
+    await ts.refreshModels()
+    log(`token-source ${ts.id}: ${ts.models.length} models loaded`)
+  }))
+    .then(() => {})
+    .finally(() => {
+      if (refreshAllInFlight?.promise === promise) refreshAllInFlight = null
+    })
+  refreshAllInFlight = { generation, promise }
+  return promise
+}
+
+/** Account views have independent caches and refreshes; one slow login cannot block another. */
+export function listTokenSourceAccounts(): TokenSource[] {
+  return listTokenSources().flatMap(source => source.forAccount
+    ? codexAccounts.list().map(account => source.forAccount!(account.id)) : [source])
+}
+
+/** Startup/diagnostic barrier. Interactive discovery must read the committed cache instead. */
+export function pendingTokenSourceModelRefresh(): Promise<void> | null {
+  return refreshAllInFlight?.promise ?? null
+}
+
+/** 等待当前目录加载；等待期间若配置重建了 registry，继续等待新一轮。
+ * 只等待已有请求，不自行重新拉取模型。 */
+export async function waitForTokenSourceModelRefresh(): Promise<void> {
+  let pending: Promise<void> | null
+  while ((pending = pendingTokenSourceModelRefresh())) await pending
 }

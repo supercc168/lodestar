@@ -1387,18 +1387,6 @@ function tail(s: string, limit: number): string {
   return s.length <= limit ? s : s.slice(s.length - limit)
 }
 
-function errorOutput(e: unknown): string {
-  if (e && typeof e === 'object') {
-    const any = e as { stderr?: Buffer | string; stdout?: Buffer | string; message?: string }
-    const stderr = any.stderr ? String(any.stderr).trim() : ''
-    const stdout = any.stdout ? String(any.stdout).trim() : ''
-    if (stderr) return stderr
-    if (stdout) return stdout
-    if (any.message) return any.message
-  }
-  return String(e)
-}
-
 function messageOf(e: unknown): string {
   return e instanceof Error ? e.message : String(e)
 }

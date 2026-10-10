@@ -6,21 +6,2706 @@ import { StringDecoder } from 'node:string_decoder'
 import { Writable } from 'node:stream'
 
 import {
-  buildCodexAppServerArgs,
-  buildCodexSpawnEnv,
-  buildSpawnPath,
-  codexLoginStatusAuthenticated,
   diffUsageTotals,
   effectiveTurnTokens,
   contextCompactionNoticeFromMessage,
   contextCompactionNoticeFromNotification,
   CodexProcess,
   CodexRpcResponseError,
+  codexAppServerArgs,
+  codexApiProviderArgs,
+  codexAppServerSpawnOptions,
   imageGenerationOutput,
   usageFromTokenUsagePayload,
 } from './codex-process'
+import { resetAgentSessionRegistryForTest } from './agent-session-registry'
+// fork-only helpers under test:
+import { buildCodexAppServerArgs, buildCodexSpawnEnv, buildSpawnPath, codexLoginStatusAuthenticated } from './codex-process'
 import { validateConversationLaunch } from './conversation'
 
+function makeCodexLifecycleHarness(stdinOverrides: Record<string, unknown> = {}): any {
+  const proc = Object.create(CodexProcess.prototype) as any
+  proc.alive = true
+  proc.expectedExit = false
+  proc.exitEventEmitted = false
+  proc.stdoutBuf = ''
+  proc.stderrBuf = ''
+  proc.childExitCode = null
+  proc.childExitSignal = null
+  proc.requestCounter = 0
+  proc.pending = new Map()
+  proc.serverRequests = new Map()
+  proc.proc = {
+    stdin: {
+      destroyed: false,
+      writableEnded: false,
+      writable: true,
+      write: () => true,
+      ...stdinOverrides,
+    },
+    kill: () => true,
+  }
+  proc.exitPromise = new Promise<void>(resolve => { proc.resolveExit = resolve })
+  return proc
+}
+
+test('custom Codex providers use environment auth without a subscription login override', () => {
+  const args = codexApiProviderArgs({ id: 'packy', name: 'Packy "API"', baseUrl: 'https://cf.api.fan/v1', envKey: 'PACKY_KEY' })
+  expect(args).toContain('model_provider="packy"')
+  const definition = args.find(arg => arg.startsWith('model_providers.packy='))!
+  expect(definition).toContain(`name=${JSON.stringify('Packy "API"')}`)
+  expect(definition).toContain('requires_openai_auth=false')
+  expect(definition).toContain('env_key="PACKY_KEY"')
+  expect(args.join(' ')).not.toContain('forced_login_method')
+  expect(() => codexApiProviderArgs({ id: 'openai', name: 'bad', baseUrl: 'https://host', envKey: 'KEY' })).toThrow('保留')
+})
+
+test('custom provider is explicit on fresh, resumed and forked Codex threads', async () => {
+  const apiProvider = { id: 'packy', name: 'PackyAPI', baseUrl: 'https://cf.api.fan/v1', envKey: 'PACKY_KEY' }
+  for (const kind of ['fresh', 'resume', 'fork'] as const) {
+    const launch = kind === 'fresh' ? { kind } : { kind, source: { provider: 'codex', sessionId: 'source-thread', cwd: '/repo' } }
+    const { proc, calls } = makeCodexProtocolHarness({ model: 'kimi-k3', effort: 'high', apiProvider, launch })
+    await proc.initializeAndStartThread()
+    const call = calls.find(call => call.method === `thread/${kind === 'fresh' ? 'start' : kind}`)!
+    expect(call.params.modelProvider).toBe('packy')
+    expect(call.params.model).toBe('kimi-k3')
+    expect(call.params.config.model_reasoning_effort).toBe('high')
+  }
+})
+
+test('returning to a Codex subscription overrides a previous API provider on resume', async () => {
+  const { proc, calls } = makeCodexProtocolHarness({ tokenSourceId: 'codex-sub', model: 'gpt-test', effort: 'high',
+    launch: { kind: 'resume', source: { provider: 'codex', sessionId: 'source-thread', cwd: '/repo' } } })
+  await proc.initializeAndStartThread()
+  expect(calls.find(call => call.method === 'thread/resume')!.params.modelProvider).toBe('openai')
+})
+
+type ProtocolCall = { method: string; params: any }
+
+test('steering targets the active Codex turn without starting or interrupting it', async () => {
+  const { proc, calls, events } = makeCodexProtocolHarness({}, (method, params) => {
+    expect(method).toBe('turn/steer')
+    return { turnId: params.expectedTurnId }
+  })
+  proc.sessionId = 'thread'
+  proc.currentTurnId = 'active-turn'
+  await expect(proc.steerUserText('focus on tests', ['/tmp/input.txt'], 'input-1')).resolves.toBe(true)
+  expect(calls).toEqual([{ method: 'turn/steer', params: {
+    threadId: 'thread', expectedTurnId: 'active-turn', clientUserMessageId: 'input-1',
+    input: [{ type: 'text', text: '[file: /tmp/input.txt]\n\nfocus on tests', text_elements: [] }],
+  } }])
+  expect(events).toEqual([])
+  expect(proc.currentTurnId).toBe('active-turn')
+  const notification = { threadId: 'thread', turnId: 'active-turn', item: { type: 'userMessage', id: 'native-item', clientId: 'input-1', content: [] } }
+  proc.handleNotification('item/started', { ...notification, threadId: 'child-thread' })
+  proc.handleNotification('item/started', { ...notification, turnId: 'old-turn' })
+  proc.handleNotification('item/started', { ...notification, item: { ...notification.item, clientId: 'unknown-input' } })
+  expect(events.filter(([name]) => name === 'user_input_consumed')).toEqual([])
+  proc.handleNotification('item/started', notification)
+  proc.handleNotification('item/started', notification)
+  proc.handleNotification('item/completed', notification)
+  expect(events.filter(([name]) => name === 'user_input_consumed')).toEqual([['user_input_consumed', { inputId: 'input-1' }]])
+  expect(events.filter(([name]) => name === 'input_batch_end')).toEqual([])
+  proc.handleNotification('item/started', { threadId: 'child-thread', turnId: 'child-turn', item: { type: 'reasoning', id: 'child-reasoning' } })
+  expect(events.filter(([name]) => name === 'input_batch_end')).toEqual([])
+  proc.handleNotification('item/started', { threadId: 'thread', turnId: 'active-turn', item: { type: 'reasoning', id: 'main-reasoning' } })
+  proc.handleNotification('item/started', { threadId: 'thread', turnId: 'active-turn', item: { type: 'reasoning', id: 'main-reasoning-2' } })
+  expect(events.filter(([name]) => name === 'input_batch_end')).toEqual([['input_batch_end', { itemId: 'main-reasoning' }]])
+})
+
+test('Codex consumption can precede its RPC receipt and remains in native event order', async () => {
+  let proc: any
+  const h = makeCodexProtocolHarness({}, async (_method, params) => {
+    proc.handleNotification('item/started', { threadId: 'thread', turnId: 'turn',
+      item: { type: 'userMessage', id: 'native-item', clientId: params.clientUserMessageId, content: [] } })
+    expect(h.events.map(([name]) => name)).toEqual(['user_input_consumed'])
+    return { turnId: 'turn' }
+  })
+  proc = h.proc
+  proc.sessionId = 'thread'; proc.currentTurnId = 'turn'
+  await proc.steerUserText('guidance', [], 'before-ack')
+  expect(h.events).toEqual([['user_input_consumed', { inputId: 'before-ack' }]])
+})
+
+test('idle steering submits nothing; rejection and unknown receipts never start another turn', async () => {
+  for (const outcome of ['rejected', 'malformed', 'late-success']) {
+    const { proc, calls, events } = makeCodexProtocolHarness({}, () => {
+      proc.currentTurnId = null
+      if (outcome === 'rejected') throw new Error('no active turn')
+      return outcome === 'malformed' ? {} : { turnId: 'active-turn' }
+    })
+    expect(await proc.steerUserText('idle')).toBe(false)
+    expect(calls).toEqual([])
+    proc.sessionId = 'thread'
+    proc.currentTurnId = 'active-turn'
+    if (outcome === 'late-success') await expect(proc.steerUserText('more')).resolves.toBe(true)
+    else await expect(proc.steerUserText('more')).rejects.toThrow(outcome === 'rejected' ? 'no active turn' : '未确认')
+    expect(calls.map(call => call.method)).toEqual(['turn/steer'])
+    expect(events).toEqual([])
+    expect(proc.currentTurnId).toBeNull()
+  }
+})
+
+test('model discovery rejects repeated or malformed pagination instead of looping or returning a partial catalog', async () => {
+  for (const nextCursor of ['repeated-page', 42, undefined]) {
+    let pages = 0
+    const { proc } = makeCodexProtocolHarness({}, async method => {
+      if (method === 'initialize') return {}
+      if (method === 'model/list') {
+        if (++pages > 2) throw new Error('test guard: pagination failed to terminate')
+        return { data: [], nextCursor }
+      }
+      throw new Error(`unexpected request ${method}`)
+    })
+    await expect(proc.listModels()).rejects.toThrow(
+      typeof nextCursor === 'string' ? 'model/list returned a repeated nextCursor' : 'model/list returned an invalid nextCursor',
+    )
+    expect(pages).toBe(typeof nextCursor === 'string' ? 2 : 1)
+  }
+})
+
+function makeCodexProtocolHarness(
+  opts: Record<string, unknown> = {},
+  respond?: (method: string, params: any) => any | Promise<any>,
+): { proc: any; calls: ProtocolCall[]; writes: any[]; events: Array<[string, any]> } {
+  const proc = Object.create(CodexProcess.prototype) as any
+  const calls: ProtocolCall[] = []
+  const writes: any[] = []
+  const events: Array<[string, any]> = []
+  proc.alive = true
+  proc.turnRetryEnabled = true
+  proc.opts = { workDir: '/repo', ...opts }
+  proc.readyPromise = null
+  proc.initializePromise = null
+  proc.conversationResumable = false
+  proc.conversationRolloutPath = null
+  proc.currentTurnId = null
+  proc.sessionId = null
+  proc.lastCompletedTurnId = null
+  proc.lastUsage = null
+  proc.lastResult = {
+    cost_usd: null,
+    cost_delta_usd: null,
+    duration_ms: null,
+    num_turns: null,
+    usage: null,
+    subtype: null,
+    is_error: false,
+  }
+  proc.write = (message: any) => {
+    writes.push(message)
+    // merged write() contract: return null on success, an Error on failure.
+    return null
+  }
+  proc.request = async (method: string, params: any) => {
+    calls.push({ method, params })
+    let result: any
+    if (respond) result = await respond(method, params)
+    else if (method === 'initialize') result = {}
+    else if (method === 'thread/start') result = { thread: { id: 'fresh-thread', cwd: '/repo' } }
+    else if (method === 'thread/resume') result = { thread: { id: params.threadId, cwd: '/repo' } }
+    else if (method === 'thread/fork') result = { thread: { id: 'forked-thread', cwd: '/repo' } }
+    else if (method === 'model/list' || method === 'thread/list') result = { data: [], nextCursor: null }
+    else throw new Error(`unexpected request ${method}`)
+    if (
+      method.startsWith('thread/')
+      && typeof result?.thread?.id === 'string'
+      && !Object.prototype.hasOwnProperty.call(result.thread, 'path')
+    ) {
+      result = {
+        ...result,
+        thread: {
+          ...result.thread,
+          path: `/rollouts/rollout-${result.thread.id}.jsonl`,
+        },
+      }
+    }
+    return result
+  }
+  proc.primeRolloutImageGenerationScan = () => {}
+  proc.flushRolloutImageGenerations = () => {}
+  proc.assertConversationRolloutMaterialized = () => {}
+  proc.verifyConversationMaterialized = async () => {}
+  proc.emit = (event: string, payload: any) => {
+    events.push([event, payload])
+    return true
+  }
+  return { proc, calls, writes, events }
+}
+
+const CAPACITY_MESSAGE = 'Selected model is at capacity. Please try a different model'
+const STREAM_MESSAGE = 'stream disconnected before completion: An error occurred while processing your request. You can retry your request, or contact us through our help center at help.openai.com if the error persists. Please include the request ID 00000000-0000-4000-8000-000000000001 in your message.'
+const COMPACT_MESSAGE = 'Error running remote compact task: Connection failed: error sending request'
+const COMPACT_ERROR = { message: COMPACT_MESSAGE, codexErrorInfo: { httpConnectionFailed: { httpStatusCode: null } } }
+const REQUEST_TIMEOUT_MESSAGE = 'request timed out'
+const REQUEST_TIMEOUT_ERROR = { message: 'unexpected status 408 Request Timeout: {"detail":"Request body read timed out"}', codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 408 } } }
+const OVERLOADED_ERROR = { message: 'Service temporarily overloaded', codexErrorInfo: 'serverOverloaded' }
+const TRANSPORT_ERROR_KINDS = ['httpConnectionFailed', 'responseStreamConnectionFailed', 'responseStreamDisconnected', 'responseTooManyFailedAttempts']
+
+async function withCapacityClock(run: (clock: {
+  timers: Map<number, { callback: () => void; delay: number }>
+  tick(): Promise<void>
+}) => Promise<void>): Promise<void> {
+  let nextId = 100_000
+  const timers = new Map<number, { callback: () => void; delay: number }>()
+  const timeout = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay: number) => {
+    const id = nextId++
+    timers.set(id, { callback, delay })
+    return id as unknown as ReturnType<typeof setTimeout>
+  }) as typeof setTimeout)
+  const clear = spyOn(globalThis, 'clearTimeout').mockImplementation(((id: number) => { timers.delete(id) }) as typeof clearTimeout)
+  try {
+    await run({
+      timers,
+      async tick() {
+        const next = timers.entries().next().value
+        if (!next) throw new Error('no scheduled capacity retry')
+        timers.delete(next[0])
+        next[1].callback()
+        await flushCapacityMicrotasks()
+      },
+    })
+  } finally {
+    timeout.mockRestore()
+    clear.mockRestore()
+  }
+}
+
+async function flushCapacityMicrotasks(): Promise<void> {
+  for (let i = 0; i < 12; i++) await Promise.resolve()
+}
+
+function capacityHarness(respond?: (method: string, params: any) => any | Promise<any>) {
+  let turn = 0
+  const harness = makeCodexProtocolHarness({ model: 'selected-model', effort: 'high' }, respond ?? (method => {
+    if (method === 'turn/start') return { turn: { id: `capacity-turn-${++turn}` } }
+    if (method === 'turn/interrupt') return {}
+    throw new Error(`unexpected request ${method}`)
+  }))
+  harness.proc.sessionId = 'capacity-thread'
+  harness.proc.readyPromise = Promise.resolve()
+  harness.proc.conversationResumable = true
+  // 本地 fork 语义:turn_started 只从持久化的 turn/started 通知发出
+  //(上游 recordTurnStarted 把响应与通知折叠成一次,合并实现保留 fork 的通知路径)。
+  // 真实 app-server 必然回放该通知;harness 在 turn/start 响应处同步补放,
+  // 让 RPC 响应与主动通知的时序与线上一致。
+  const innerRequest = harness.proc.request
+  harness.proc.request = async (method: string, params: any) => {
+    const result = await innerRequest(method, params)
+    if (method === 'turn/start') {
+      const turnId = typeof result?.turn?.id === 'string' && result.turn.id
+        ? result.turn.id
+        : typeof result?.turnId === 'string' && result.turnId ? result.turnId : null
+      if (turnId) {
+        harness.proc.handleNotification('turn/started', {
+          threadId: 'capacity-thread',
+          turn: { id: turnId },
+        })
+      }
+    }
+    return result
+  }
+  return harness
+}
+
+function completeCapacityTurn(proc: any, error: any = { message: CAPACITY_MESSAGE }): void {
+  proc.handleNotification('turn/completed', {
+    threadId: 'capacity-thread',
+    turn: { id: proc.currentTurnId, status: error ? 'failed' : 'completed', error },
+  })
+}
+
+describe('native Codex quota terminal classification', () => {
+  test('early error never switches; only main-thread terminal failure carries accepted recovery metadata', async () => {
+    const { proc, events } = capacityHarness()
+    proc.sendUserText('one task'); await flushCapacityMicrotasks()
+    const error = { codexErrorInfo: 'usageLimitExceeded', message: "You've hit your usage limit." }
+    proc.handleNotification('error', { threadId: 'capacity-thread', turnId: proc.currentTurnId, error, willRetry: false })
+    expect(events.filter(([name]) => name === 'result')).toHaveLength(0)
+    completeCapacityTurn(proc, error)
+    expect(events.find(([name]) => name === 'result')?.[1]).toMatchObject({ is_error: true, codexQuotaFailure: { accepted: true } })
+  })
+  test('explicit turn/start rejection preserves unaccepted input including file hints', async () => {
+    const { proc, events } = capacityHarness(async () => {
+      throw new CodexRpcResponseError('turn/start', 1, -32000, 'usage denied', { codexErrorInfo: 'usageLimitExceeded' })
+    })
+    proc.sendUserText('one task', ['/input']); await flushCapacityMicrotasks()
+    expect(events.find(([name]) => name === 'result')?.[1]).toMatchObject({
+      codexQuotaFailure: { accepted: false, rejectedInput: '[file: /input]\n\none task' },
+    })
+  })
+  test('transport timeout and rate-limited control APIs cannot authorize replay', async () => {
+    const { proc, events } = capacityHarness(async () => { throw new Error('turn/start timed out HTTP 429') })
+    proc.sendUserText('one task'); await flushCapacityMicrotasks()
+    const result = events.find(([name]) => name === 'result')?.[1]
+    expect(result.is_error).toBe(true); expect(result.codexQuotaFailure).toBeUndefined()
+  })
+})
+
+describe('codex model capacity recovery', () => {
+  test('waits for terminal failure, keeps one logical task open and continues its existing history', async () => {
+    await withCapacityClock(async clock => {
+      const { proc, calls, events } = capacityHarness()
+      proc.sendUserText('original task', ['/tmp/input.png'])
+      await flushCapacityMicrotasks()
+      for (const willRetry of [true, false]) {
+        proc.handleNotification('error', {
+          threadId: 'capacity-thread', turnId: proc.currentTurnId,
+          error: { message: CAPACITY_MESSAGE }, willRetry,
+        })
+      }
+      expect(clock.timers.size).toBe(0)
+      expect(events.filter(([event]) => event === 'error').map(([, error]) => error.message))
+        .toEqual([CAPACITY_MESSAGE, CAPACITY_MESSAGE])
+
+      // The completion may omit the error already supplied by the notification.
+      const failedId = proc.currentTurnId
+      proc.handleNotification('turn/completed', {
+        threadId: 'capacity-thread', turn: { id: failedId, status: 'failed' },
+      })
+      proc.handleNotification('turn/completed', {
+        threadId: 'capacity-thread', turn: { id: failedId, status: 'failed', error: { message: CAPACITY_MESSAGE } },
+      })
+      expect(events.filter(([event]) => event === 'result')).toEqual([])
+      expect(proc.lastCompletedTurnId).toBeNull()
+      expect([...clock.timers.values()].map(timer => timer.delay)).toEqual([5_000])
+      expect(proc.turnRetry).toMatchObject({ phase: 'waiting', attempt: 1, message: CAPACITY_MESSAGE })
+      await clock.tick()
+
+      const starts = calls.filter(call => call.method === 'turn/start')
+      expect(starts).toHaveLength(2)
+      expect(starts[0]!.params.input[0].text).toBe('[file: /tmp/input.png]\n\noriginal task')
+      expect(starts[1]!.params.input[0].text).toContain('继续完成用户尚未完成的任务')
+      expect(starts[1]!.params.input[0].text).not.toContain('original task')
+      expect(starts[1]!.params).toEqual({ ...starts[0]!.params, input: starts[1]!.params.input })
+      expect(proc.opts).toMatchObject({ model: 'selected-model', effort: 'high' })
+      expect(events.filter(([event]) => event === 'turn_started').at(-1)?.[1].retry).toBe(true)
+      completeCapacityTurn(proc, null)
+      expect(events.filter(([event]) => event === 'result')).toEqual([
+        ['result', expect.objectContaining({ is_error: false, turn_id: 'capacity-turn-2' })],
+      ])
+      expect(proc.turnRetry).toBeNull()
+      expect(clock.timers.size).toBe(0)
+    })
+  })
+
+  test('keeps retrying with capped backoff and resets after a successful task', async () => {
+    await withCapacityClock(async clock => {
+      const { proc, events } = capacityHarness()
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      for (const delay of [5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000]) {
+        completeCapacityTurn(proc)
+        expect([...clock.timers.values()].map(timer => timer.delay)).toEqual([delay])
+        expect(events.filter(([event]) => event === 'result')).toEqual([])
+        await clock.tick()
+      }
+      completeCapacityTurn(proc, null)
+      proc.sendUserText('next task')
+      await flushCapacityMicrotasks()
+      completeCapacityTurn(proc)
+      expect(proc.turnRetry).toMatchObject({ attempt: 1, delayMs: 5_000 })
+    })
+  })
+
+  test('retries an explicitly rejected turn/start with its original input and files', async () => {
+    await withCapacityClock(async clock => {
+      let starts = 0
+      const { proc, calls, events } = capacityHarness(method => {
+        if (method !== 'turn/start') throw new Error(`unexpected request ${method}`)
+        if (++starts === 1) throw new CodexRpcResponseError(method, 1, -32000, CAPACITY_MESSAGE)
+        return { turn: { id: 'accepted-retry' } }
+      })
+      proc.sendUserText('unaccepted task', ['/tmp/data.csv'])
+      await flushCapacityMicrotasks()
+      expect(events.filter(([event]) => event === 'result')).toEqual([])
+      await clock.tick()
+      expect(calls[1]).toEqual(calls[0])
+      // No earlier accepted turn: this boundary must seed the usage baseline.
+      expect(events.find(([event]) => event === 'turn_started')?.[1].retry).toBeUndefined()
+      completeCapacityTurn(proc, null)
+    })
+  })
+
+  test('unrelated failures and initialization errors remain terminal', async () => {
+    await withCapacityClock(async clock => {
+      for (const error of [
+        new CodexRpcResponseError('turn/start', 1, -32000, 'Usage limit exceeded'),
+        new CodexRpcResponseError('thread/start', 1, -32000, CAPACITY_MESSAGE),
+        new Error('turn/start request timed out'),
+      ]) {
+        const { proc, events } = capacityHarness(() => { throw error })
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+        expect(proc.lastResult.is_error).toBe(true)
+        expect(clock.timers.size).toBe(0)
+      }
+      for (const message of ['Context window capacity exceeded', 'Unauthorized', 'Usage limit exceeded']) {
+        const { proc, events } = capacityHarness()
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        completeCapacityTurn(proc, { message })
+        expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+        expect(clock.timers.size).toBe(0)
+      }
+    })
+  })
+
+  test.each([CAPACITY_MESSAGE, STREAM_MESSAGE, COMPACT_MESSAGE, REQUEST_TIMEOUT_MESSAGE])('interrupt during backoff cancels even an already-queued timer callback (%s)', async message => {
+    await withCapacityClock(async clock => {
+      const { proc, calls, events } = capacityHarness()
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      completeCapacityTurn(proc, { message })
+      const staleTimer = [...clock.timers.values()][0]!
+      proc.sendInterrupt()
+      expect(clock.timers.size).toBe(0)
+      staleTimer.callback()
+      await flushCapacityMicrotasks()
+      expect(calls.filter(call => call.method === 'turn/start')).toHaveLength(1)
+      expect(events.filter(([event]) => event === 'result')).toEqual([
+        ['result', expect.objectContaining({ subtype: 'interrupted', checkpoint: null })],
+      ])
+    })
+  })
+
+  test.each([CAPACITY_MESSAGE, STREAM_MESSAGE, COMPACT_MESSAGE, REQUEST_TIMEOUT_MESSAGE])('interrupt also cancels a retry awaiting its turn/start acknowledgement (%s)', async message => {
+    await withCapacityClock(async clock => {
+      let resolveRetry!: (value: any) => void
+      let starts = 0
+      const { proc, calls, events } = capacityHarness(method => {
+        if (method === 'turn/interrupt') return {}
+        if (++starts === 1) return { turn: { id: 'first-turn' } }
+        return new Promise(resolve => { resolveRetry = resolve })
+      })
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      completeCapacityTurn(proc, { message })
+      await clock.tick()
+      proc.sendInterrupt()
+      proc.sendInterrupt()
+      resolveRetry({ turn: { id: 'cancelled-retry' } })
+      await flushCapacityMicrotasks()
+      expect(proc.currentTurnId).toBeNull()
+      expect(calls.at(-1)).toEqual({
+        method: 'turn/interrupt', params: { threadId: 'capacity-thread', turnId: 'cancelled-retry' },
+      })
+      proc.handleNotification('turn/completed', {
+        threadId: 'capacity-thread',
+        turn: { id: 'cancelled-retry', status: 'failed', error: { message } },
+      })
+      expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+      expect(clock.timers.size).toBe(0)
+    })
+  })
+
+  test.each([CAPACITY_MESSAGE, STREAM_MESSAGE, COMPACT_MESSAGE, REQUEST_TIMEOUT_MESSAGE])('a synchronous stop at the retry progress event prevents the request from being sent (%s)', async message => {
+    await withCapacityClock(async clock => {
+      const { proc, calls, events } = capacityHarness()
+      const emit = proc.emit
+      proc.emit = (event: string, payload: any) => {
+        emit(event, payload)
+        if (event === 'turn_retry' && payload.phase === 'retrying') proc.sendInterrupt()
+        return true
+      }
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      completeCapacityTurn(proc, { message })
+      await clock.tick()
+      expect(calls.filter(call => call.method === 'turn/start')).toHaveLength(1)
+      expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+    })
+  })
+
+  test.each([CAPACITY_MESSAGE, STREAM_MESSAGE, COMPACT_MESSAGE, REQUEST_TIMEOUT_MESSAGE])('new input, native continuation, kill and OS exit all retire the waiting timer (%s)', async message => {
+    await withCapacityClock(async clock => {
+      for (const action of ['input', 'native', 'kill', 'exit']) {
+        const { proc, calls, events } = capacityHarness()
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        completeCapacityTurn(proc, { message })
+        const staleTimer = [...clock.timers.values()][0]!
+        if (action === 'input') proc.sendUserText('new instruction')
+        if (action === 'native') proc.handleNotification('turn/started', {
+          threadId: 'capacity-thread', turn: { id: 'native-continuation' },
+        })
+        if (action === 'kill') {
+          proc.sendSignal = () => {}
+          proc.waitForExit = async () => true
+          await proc.kill()
+        }
+        if (action === 'exit') proc.handleChildExit(1, null)
+        expect(clock.timers.size).toBe(0)
+        staleTimer.callback()
+        await flushCapacityMicrotasks()
+        expect(calls.filter(call => call.method === 'turn/start')).toHaveLength(action === 'input' ? 2 : 1)
+        if (action === 'native') {
+          expect(proc.currentTurnId).toBe('native-continuation')
+          expect(events.filter(([event]) => event === 'turn_retry').at(-1)?.[1].phase).toBe('retrying')
+        }
+      }
+    })
+  })
+
+  test.each([CAPACITY_MESSAGE, STREAM_MESSAGE, COMPACT_MESSAGE, REQUEST_TIMEOUT_MESSAGE])('child-thread and stale retryable errors cannot turn an unrelated failure into a retry (%s)', async message => {
+    await withCapacityClock(async clock => {
+      const { proc, events } = capacityHarness()
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      for (const [threadId, turnId] of [['child-thread', proc.currentTurnId], ['capacity-thread', 'old-turn']]) {
+        proc.handleNotification('error', { threadId, turnId, error: { message }, willRetry: false })
+        proc.handleNotification('turn/completed', { threadId, turn: { id: turnId, status: 'failed', error: { message } } })
+      }
+      proc.handleNotification('turn/completed', {
+        threadId: 'capacity-thread', turn: { id: proc.currentTurnId, status: 'failed' },
+      })
+      expect(clock.timers.size).toBe(0)
+      expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+    })
+  })
+})
+
+describe('codex transient failure recovery', () => {
+  test.each([
+    ...[
+      { message: STREAM_MESSAGE, codexErrorInfo: 'other' },
+      { message: STREAM_MESSAGE },
+      { message: 'upstream stream ended', codexErrorInfo: { responseStreamDisconnected: { httpStatusCode: null } } },
+    ].map(error => ({ error, reason: 'stream_disconnected', continuationMessage: '响应流连接中断' })),
+    ...[
+      COMPACT_ERROR,
+      { message: COMPACT_MESSAGE },
+      { message: COMPACT_MESSAGE, codexErrorInfo: 'other' },
+      { ...COMPACT_ERROR, message: `${COMPACT_MESSAGE} for url (https://example.com/responses/compact)` },
+      { message: `Codex ${COMPACT_MESSAGE}`, codexErrorInfo: 'httpConnectionFailed' },
+      { message: 'Error running remote compact task: request timed out', codexErrorInfo: 'other' },
+      { message: 'Error running remote compact task: unexpected status 503 Service Unavailable', codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 503 } } },
+      ...[408, 503].map(httpStatusCode => ({ message: COMPACT_MESSAGE, codexErrorInfo: { httpConnectionFailed: { httpStatusCode } } })),
+    ].map(error => ({ error, reason: 'compact_connection_failed', continuationMessage: '远程压缩时连接失败' })),
+    ...[
+      REQUEST_TIMEOUT_ERROR, OVERLOADED_ERROR,
+      { message: REQUEST_TIMEOUT_MESSAGE, codexErrorInfo: 'other' },
+      { message: 'workspace routing discovery timed out', codexErrorInfo: 'other' },
+      { message: 'unexpected status 502 Bad Gateway', codexErrorInfo: 'other' },
+      { message: 'Connection failed: error sending request', codexErrorInfo: 'other' },
+    ].map(error => ({ error, reason: 'transient_error', continuationMessage: '临时连接或服务错误' })),
+    ...TRANSPORT_ERROR_KINDS.flatMap(kind => [undefined, null, 408, 500, 502, 503, 504].map(httpStatusCode => ({
+      error: { message: 'Upstream transport failed', codexErrorInfo: { [kind]: httpStatusCode === undefined ? {} : { httpStatusCode } } },
+      reason: kind === 'responseStreamDisconnected' ? 'stream_disconnected' : 'transient_error',
+      continuationMessage: kind === 'responseStreamDisconnected' ? '响应流连接中断' : '临时连接或服务错误',
+    }))),
+    // fork WR-03 宽口径(合并保留):满载文案先于 codexErrorInfo 标签判定,
+    // 'unauthorized'/429 伴随 "Selected model is at capacity" 时归 capacity 重试
+    //(对齐 session.isCodexCapacityError 分类面)。
+    ...[
+      { message: CAPACITY_MESSAGE, codexErrorInfo: 'unauthorized' },
+      { message: CAPACITY_MESSAGE, codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 429 } } },
+    ].map(error => ({ error, reason: 'capacity', continuationMessage: '上一轮因模型暂时满载而中断' })),
+  ])('continues accepted history only after a failed terminal event (%j)', async ({ error, reason, continuationMessage }) => {
+    await withCapacityClock(async clock => {
+      const { proc, calls, events } = capacityHarness()
+      proc.sendUserText('task with completed effects', ['/tmp/input.csv'])
+      await flushCapacityMicrotasks()
+      const turnId = proc.currentTurnId
+      proc.handleNotification('item/completed', {
+        threadId: 'capacity-thread', turnId,
+        item: { id: 'completed-tool', type: 'commandExecution', command: 'echo done', cwd: '/repo', status: 'completed', aggregatedOutput: 'done', exitCode: 0 },
+      })
+      for (const willRetry of [true, false]) {
+        proc.handleNotification('error', { threadId: 'capacity-thread', turnId, error, willRetry })
+        expect(clock.timers.size).toBe(0)
+      }
+      // The terminal error may be supplied only by the preceding notification.
+      proc.handleNotification('turn/completed', { threadId: 'capacity-thread', turn: { id: turnId, status: 'failed' } })
+      proc.handleNotification('turn/completed', { threadId: 'capacity-thread', turn: { id: turnId, status: 'failed', error } })
+      expect(proc.turnRetry).toMatchObject({ reason, attempt: 1, delayMs: 5000, message: error.message })
+      expect(clock.timers.size).toBe(1)
+      expect(events.filter(([name]) => name === 'result')).toHaveLength(0)
+      expect(events.filter(([name]) => name === 'error')).toHaveLength(2)
+      await clock.tick()
+      const starts = calls.filter(call => call.method === 'turn/start')
+      expect(starts).toHaveLength(2)
+      const continuation = starts[1]!.params.input[0].text
+      expect(continuation).toContain(continuationMessage)
+      expect(continuation).toContain('避免重复已完成的操作')
+      expect(continuation).not.toContain('task with completed effects')
+      expect(continuation).not.toContain('/tmp/input.csv')
+      expect(starts[1]!.params).toEqual({ ...starts[0]!.params, input: starts[1]!.params.input })
+      expect(events.filter(([name]) => name === 'turn_started').at(-1)?.[1].retry).toBe(true)
+      completeCapacityTurn(proc, null)
+      expect(events.filter(([name]) => name === 'result')).toEqual([
+        ['result', expect.objectContaining({ is_error: false })],
+      ])
+      expect(clock.timers.size).toBe(0)
+    })
+  })
+
+  test.each([{ message: STREAM_MESSAGE, codexErrorInfo: 'other' }, COMPACT_ERROR, REQUEST_TIMEOUT_ERROR, OVERLOADED_ERROR])('limits transient recovery to three attempts and preserves the final error (%j)', async error => {
+    await withCapacityClock(async clock => {
+      const { proc, events } = capacityHarness()
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      for (const delay of [5000, 10000, 20000]) {
+        completeCapacityTurn(proc, error)
+        expect([...clock.timers.values()].map(timer => timer.delay)).toEqual([delay])
+        expect(events.filter(([name]) => name === 'result')).toHaveLength(0)
+        await clock.tick()
+      }
+      completeCapacityTurn(proc, error)
+      expect(clock.timers.size).toBe(0)
+      expect(proc.turnRetry).toBeNull()
+      expect(events.filter(([name]) => name === 'result')).toEqual([
+        ['result', expect.objectContaining({ is_error: true, error: error.message })],
+      ])
+      proc.sendUserText('next task')
+      await flushCapacityMicrotasks()
+      completeCapacityTurn(proc, error)
+      expect(proc.turnRetry).toMatchObject({ attempt: 1, delayMs: 5000 })
+    })
+  })
+
+  test('stream, compact and service failures share a budget that capacity failures neither consume nor reset', async () => {
+    await withCapacityClock(async clock => {
+      const { proc, events } = capacityHarness()
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      for (const [delay, error] of [[5000, COMPACT_ERROR], [10000, { message: STREAM_MESSAGE }], [20000, REQUEST_TIMEOUT_ERROR]] as const) {
+        for (let i = 0; i < 4; i++) {
+          completeCapacityTurn(proc)
+          await clock.tick()
+        }
+        completeCapacityTurn(proc, error)
+        expect(proc.turnRetry.delayMs).toBe(delay)
+        await clock.tick()
+      }
+      completeCapacityTurn(proc, OVERLOADED_ERROR)
+      expect(clock.timers.size).toBe(0)
+      expect(events.filter(([name]) => name === 'result')).toHaveLength(1)
+    })
+  })
+
+  test.each([{ message: STREAM_MESSAGE }, COMPACT_ERROR, REQUEST_TIMEOUT_ERROR, OVERLOADED_ERROR])('successful completion restores the transient budget for the next task (%j)', async error => {
+    await withCapacityClock(async clock => {
+      const { proc } = capacityHarness()
+      for (let task = 0; task < 2; task++) {
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        for (const delay of [5000, 10000, 20000]) {
+          completeCapacityTurn(proc, error)
+          expect(proc.turnRetry.delayMs).toBe(delay)
+          await clock.tick()
+        }
+        completeCapacityTurn(proc, null)
+        expect(proc.turnRetry).toBeNull()
+      }
+    })
+  })
+
+  test.each([{ message: STREAM_MESSAGE, codexErrorInfo: 'other' }, COMPACT_ERROR, REQUEST_TIMEOUT_ERROR, OVERLOADED_ERROR])('explicit rejection resends unaccepted input, while unknown transport outcomes stay terminal (%j)', async error => {
+    await withCapacityClock(async clock => {
+      let starts = 0
+      const { proc, calls, events } = capacityHarness(method => {
+        if (++starts === 1) throw new CodexRpcResponseError(method, 1, -32000, error.message, { codexErrorInfo: error.codexErrorInfo })
+        return { turn: { id: 'accepted-stream-retry' } }
+      })
+      proc.sendUserText('unaccepted task', ['/tmp/input.csv'])
+      await flushCapacityMicrotasks()
+      await clock.tick()
+      expect(calls[1]).toEqual(calls[0])
+      expect(events.find(([name]) => name === 'turn_started')?.[1].retry).toBeUndefined()
+      completeCapacityTurn(proc, null)
+      for (const failure of [new Error(error.message), new Error('turn/start timed out'),
+        new CodexRpcResponseError('thread/start', 2, -32000, error.message)]) {
+        const h = capacityHarness(() => { throw failure })
+        h.proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        expect(h.events.filter(([name]) => name === 'result')).toHaveLength(1)
+        expect(clock.timers.size).toBe(0)
+      }
+    })
+  })
+
+  test('permanent errors and unconfirmed terminal states do not authorize transient recovery', async () => {
+    await withCapacityClock(async clock => {
+      for (const error of [
+        ...['unauthorized', 'usageLimitExceeded', 'contextWindowExceeded', 'badRequest'].map(codexErrorInfo => ({ message: STREAM_MESSAGE, codexErrorInfo })),
+        ...[400, 401, 403, 429].map(httpStatusCode => ({ message: STREAM_MESSAGE, codexErrorInfo: { responseStreamDisconnected: { httpStatusCode } } })),
+        ...['unauthorized', 'usageLimitExceeded', 'contextWindowExceeded', 'badRequest'].map(codexErrorInfo => ({ message: COMPACT_MESSAGE, codexErrorInfo })),
+        ...[400, 401, 403, 429].map(httpStatusCode => ({ message: COMPACT_MESSAGE, codexErrorInfo: { httpConnectionFailed: { httpStatusCode } } })),
+        ...['Error running remote compact task: Unauthorized', 'Error running remote compact task: context window exceeded'].map(message => ({ message, codexErrorInfo: 'httpConnectionFailed' })),
+        ...TRANSPORT_ERROR_KINDS.flatMap(kind => [0, 400, 401, 403, 404, 409, 413, 422, 429, 501, 505, '503'].map(httpStatusCode => ({ message: COMPACT_MESSAGE, codexErrorInfo: { [kind]: { httpStatusCode } } }))),
+        ...['sessionBudgetExceeded', 'rateLimitExceeded', 'flexUnavailable', 'cyberPolicy', 'misalignmentPolicyViolation', 'tooManyDenials', 'threadRollbackFailed', 'sandboxError', 'internalServerError', 'futureError'].map(codexErrorInfo => ({ message: COMPACT_MESSAGE, codexErrorInfo })),
+        ...[{ activeTurnNotSteerable: { turnKind: 'compact' } }, { httpConnectionFailed: null }, { futureError: {} }, { httpConnectionFailed: {}, unauthorized: {} }, ['httpConnectionFailed']].map(codexErrorInfo => ({ message: COMPACT_MESSAGE, codexErrorInfo })),
+        // 合并口径(fork WR-03 宽分类):"Selected model is at capacity" 文案先于
+        // codexErrorInfo 判定,伴随 'unauthorized'/429 标签时仍归 capacity(与
+        // session.isCodexCapacityError 分类面对齐)——这两例在上方 transient
+        // failure recovery 参数化重试组中验证其重试行为。
+        { message: 'unexpected status 401 Unauthorized', codexErrorInfo: { httpConnectionFailed: { httpStatusCode: null } } },
+        ...['unexpected status 401 Unauthorized', 'usage limit exceeded', "You've hit your usage limit"].map(additionalDetails => ({ message: 'Upstream transport failed', codexErrorInfo: { httpConnectionFailed: { httpStatusCode: null } }, additionalDetails })),
+        { message: 'workspace routing discovery failed', codexErrorInfo: 'other' },
+        { message: `${COMPACT_MESSAGE}: usage limit exceeded`, codexErrorInfo: 'other' },
+        { message: 'An error occurred while processing your request.', codexErrorInfo: 'other' },
+      ]) {
+        const { proc, events } = capacityHarness()
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        completeCapacityTurn(proc, error)
+        expect(events.filter(([name]) => name === 'result')).toHaveLength(1)
+        expect(clock.timers.size).toBe(0)
+      }
+      for (const error of [{ message: STREAM_MESSAGE }, COMPACT_ERROR, REQUEST_TIMEOUT_ERROR, OVERLOADED_ERROR]) {
+        for (const terminal of [{ status: 'interrupted', id: 'capacity-turn-1' }, { status: 'failed' }]) {
+          const { proc } = capacityHarness()
+          proc.sendUserText('do work')
+          await flushCapacityMicrotasks()
+          proc.handleNotification('turn/completed', { threadId: 'capacity-thread', turn: { ...terminal, error } })
+          expect(clock.timers.size).toBe(0)
+        }
+      }
+    })
+  })
+
+  test('matching terminal diagnostics retain omitted native error metadata without borrowing a different error', async () => {
+    await withCapacityClock(async clock => {
+      for (const metadata of [
+        { codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 401 } } },
+        { codexErrorInfo: 'unauthorized' },
+        { codexErrorInfo: 'other', additionalDetails: 'usage limit exceeded' },
+      ]) {
+        const { proc, events } = capacityHarness()
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        proc.handleNotification('error', { threadId: 'capacity-thread', turnId: proc.currentTurnId,
+          error: { message: COMPACT_MESSAGE, ...metadata }, willRetry: false })
+        completeCapacityTurn(proc, { message: COMPACT_MESSAGE })
+        expect(clock.timers.size).toBe(0)
+        expect(events.filter(([name]) => name === 'result')).toHaveLength(1)
+      }
+      for (const sameMessage of [true, false]) {
+        const { proc, events } = capacityHarness()
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        proc.handleNotification('error', { threadId: 'capacity-thread', turnId: proc.currentTurnId,
+          error: { message: 'Upstream transport failed', codexErrorInfo: { httpConnectionFailed: { httpStatusCode: 503 } } }, willRetry: false })
+        completeCapacityTurn(proc, { message: sameMessage ? 'Upstream transport failed' : 'Unknown terminal failure' })
+        expect(clock.timers.size).toBe(sameMessage ? 1 : 0)
+        if (sameMessage) { await clock.tick(); completeCapacityTurn(proc, null) }
+        expect(events.filter(([name]) => name === 'result')).toHaveLength(1)
+      }
+    })
+  })
+
+  test('failed manual compaction cannot resume an already completed task; new input restores automatic recovery', async () => {
+    await withCapacityClock(async clock => {
+      let starts = 0
+      const { proc, calls, events } = capacityHarness(method => {
+        if (method === 'thread/compact/start') return {}
+        if (method === 'turn/start') return { turn: { id: `user-turn-${++starts}` } }
+        throw new Error(`unexpected request ${method}`)
+      })
+      proc.sendUserText('completed task')
+      await flushCapacityMicrotasks()
+      completeCapacityTurn(proc, null)
+      await proc.compactThread()
+      proc.handleNotification('turn/started', { threadId: 'capacity-thread', turn: { id: 'manual-compact' } })
+      completeCapacityTurn(proc, COMPACT_ERROR)
+      expect(clock.timers.size).toBe(0)
+      expect(calls.filter(call => call.method === 'turn/start')).toHaveLength(1)
+      expect(events.filter(([name, payload]) => name === 'result' && payload.is_error)).toHaveLength(1)
+      proc.sendUserText('new task')
+      await flushCapacityMicrotasks()
+      completeCapacityTurn(proc, COMPACT_ERROR)
+      expect(clock.timers.size).toBe(1)
+    })
+  })
+
+  test.each(['active', 'waiting'])('manual compaction cannot disable recovery for a %s task', async state => {
+    await withCapacityClock(async clock => {
+      const { proc } = capacityHarness()
+      proc.sendUserText('do work')
+      await flushCapacityMicrotasks()
+      if (state === 'waiting') completeCapacityTurn(proc, COMPACT_ERROR)
+      await expect(proc.compactThread()).rejects.toThrow('while a task is active')
+      if (state === 'active') completeCapacityTurn(proc, COMPACT_ERROR)
+      expect(clock.timers.size).toBe(1)
+    })
+  })
+
+  test('routing discovery failure continues only with a native timeout from the same turn', async () => {
+    await withCapacityClock(async clock => {
+      const { proc, calls, events } = capacityHarness()
+      proc.sendUserText('task with completed effects')
+      await flushCapacityMicrotasks()
+      const turnId = proc.currentTurnId
+      proc.handleNotification('error', {
+        threadId: 'capacity-thread', turnId, willRetry: true,
+        error: { message: 'Reconnecting... 3/5', codexErrorInfo: 'other', additionalDetails: 'workspace routing discovery timed out' },
+      })
+      expect(clock.timers.size).toBe(0)
+      const error = { message: 'workspace routing discovery failed', codexErrorInfo: 'other' }
+      proc.handleNotification('error', { threadId: 'capacity-thread', turnId, error, willRetry: false })
+      proc.handleNotification('turn/completed', { threadId: 'capacity-thread', turn: { id: turnId, status: 'failed' } })
+      expect(proc.turnRetry).toMatchObject({ reason: 'transient_error', delayMs: 5000 })
+      expect(events.filter(([name]) => name === 'result')).toHaveLength(0)
+      await clock.tick()
+      expect(calls.filter(call => call.method === 'turn/start').at(-1)!.params.input[0].text).not.toContain('task with completed effects')
+      // Timeout evidence from the previous attempt cannot authorize this one.
+      completeCapacityTurn(proc, error)
+      expect(clock.timers.size).toBe(0)
+      expect(events.filter(([name]) => name === 'result')).toHaveLength(1)
+    })
+  })
+
+  test('routing timeout hints cannot override permanent errors or cross thread, turn and task boundaries', async () => {
+    await withCapacityClock(async clock => {
+      for (const scenario of ['child', 'stale', 'permanent', 'permanent-hint', 'http-hint', 'permanent-text-hint', 'http-text-hint', 'nonretrying', 'new-input']) {
+        const { proc, events } = capacityHarness()
+        proc.sendUserText('do work')
+        await flushCapacityMicrotasks()
+        proc.handleNotification('error', {
+          threadId: scenario === 'child' ? 'child-thread' : 'capacity-thread',
+          turnId: scenario === 'stale' ? 'old-turn' : proc.currentTurnId,
+          willRetry: scenario !== 'nonretrying',
+          error: { message: scenario === 'permanent-text-hint' ? 'unauthorized'
+              : scenario === 'http-text-hint' ? 'unexpected status 401 Unauthorized' : 'Reconnecting... 3/5',
+            codexErrorInfo: scenario === 'permanent-hint' ? 'unauthorized'
+              : scenario === 'http-hint' ? { httpConnectionFailed: { httpStatusCode: 401 } } : 'other',
+            additionalDetails: 'workspace routing discovery timed out' },
+        })
+        if (scenario === 'new-input') {
+          completeCapacityTurn(proc, null)
+          proc.sendUserText('next task')
+          await flushCapacityMicrotasks()
+        }
+        completeCapacityTurn(proc, { message: 'workspace routing discovery failed', codexErrorInfo: scenario === 'permanent' ? 'unauthorized' : 'other' })
+        expect(clock.timers.size).toBe(0)
+        expect(events.filter(([name, payload]) => name === 'result' && payload.is_error)).toHaveLength(1)
+      }
+    })
+  })
+})
+
+describe('codex JSON-RPC lifecycle reliability', () => {
+  test('starts the complete app-server feature surface without isolation overrides', () => {
+    expect(codexAppServerArgs()).toEqual(['app-server', '--listen', 'stdio://'])
+  })
+
+  for (const resume of [false, true]) {
+    test(`delegated Codex workers retain native delegation at process and thread launch (resume=${resume})`, async () => {
+      expect(codexAppServerArgs()).toEqual(['app-server', '--listen', 'stdio://'])
+      const { proc, calls } = makeCodexProtocolHarness({
+        model: 'worker-model', effort: 'xhigh',
+        ...(resume ? { launch: { kind: 'resume', source: { provider: 'codex', sessionId: 'worker-thread', cwd: '/repo' } } } : {}),
+      })
+      await proc.initializeAndStartThread()
+      const launch = calls.find(call => call.method === (resume ? 'thread/resume' : 'thread/start'))!
+      expect(launch.params.config).not.toHaveProperty('features.multi_agent')
+      expect(launch.params.config.model_reasoning_effort).toBe('xhigh')
+      expect(launch.params.sandbox).toBe('danger-full-access')
+      expect(launch.params.model).toBe('worker-model')
+    })
+    for (const allowUserInput of [true, false]) {
+      test(`Codex input tools follow the current invocation policy (resume=${resume}, allowUserInput=${allowUserInput})`, async () => {
+        const { proc, calls } = makeCodexProtocolHarness({
+          allowUserInput, model: 'worker-model', effort: 'xhigh', appendSystemPrompt: 'complete the goal without questions',
+          ...(resume ? { launch: { kind: 'resume', source: { provider: 'codex', sessionId: 'worker-thread', cwd: '/repo' } } } : {}),
+        }, async (method, params) => {
+          if (method === 'initialize') return {}
+          if (method === 'thread/start' || method === 'thread/resume') {
+            return { thread: { id: params.threadId ?? 'worker-thread', cwd: '/repo' } }
+          }
+          if (method === 'turn/start') return { turn: { id: 'execution-turn', status: 'inProgress' } }
+          throw new Error(`unexpected request ${method}`)
+        })
+        proc.readyPromise = proc.initializeAndStartThread()
+        await proc.startTurn('complete the goal')
+        const launch = calls.find(call => call.method === (resume ? 'thread/resume' : 'thread/start'))!
+        expect(launch.params.config['features.default_mode_request_user_input']).toBe(allowUserInput)
+        expect(launch.params.config['tools.experimental_request_user_input.enabled']).toBe(allowUserInput)
+        expect(launch.params.config.model_reasoning_effort).toBe('xhigh')
+        expect(launch.params.model).toBe('worker-model')
+        const turn = calls.find(call => call.method === 'turn/start')!
+        expect(turn.params.collaborationMode).toEqual(allowUserInput ? undefined : {
+          mode: 'default',
+          settings: { model: 'worker-model', reasoning_effort: 'xhigh', developer_instructions: 'complete the goal without questions' },
+        })
+      })
+    }
+  }
+
+  test('keeps Windows-compatible Codex spawning shell-free so TOML argv stays literal', () => {
+    const env = { PATH: 'C:\\bin' }
+    expect(codexAppServerSpawnOptions('C:\\repo', env)).toEqual({
+      cwd: 'C:\\repo',
+      stdio: ['pipe', 'pipe', 'pipe'],
+      shell: false,
+      env,
+    })
+    expect(codexAppServerArgs()).not.toContain('--disable')
+  })
+
+  test('registers pending before write and clears its timeout on response', async () => {
+    let written = ''
+    const proc = makeCodexLifecycleHarness({
+      write: (chunk: string) => {
+        written = chunk
+        const id = JSON.parse(chunk).id
+        proc.handleMessage({ id, result: { ok: true } })
+        return true
+      },
+    })
+
+    await expect(proc.request('model/list', {}, 20)).resolves.toEqual({ ok: true })
+    expect(JSON.parse(written)).toMatchObject({ id: 1, method: 'model/list' })
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('JSON-RPC response errors retain the pending method in diagnostics', async () => {
+    const proc = makeCodexLifecycleHarness({
+      write: (chunk: string) => {
+        const id = JSON.parse(chunk).id
+        queueMicrotask(() => proc.handleMessage({
+          id,
+          error: { code: -32000, message: 'no rollout found for thread id ghost-thread' },
+        }))
+        return true
+      },
+    })
+
+    const request = proc.request('thread/resume', {}, 20)
+    await expect(request).rejects.toThrow('codex app-server thread/resume failed')
+    await expect(request).rejects.toMatchObject({
+      method: 'thread/resume',
+      requestId: 1,
+      serverCode: -32000,
+      serverMessage: 'no rollout found for thread id ghost-thread',
+    })
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('rejects dead stdin writes without leaving a pending request', async () => {
+    const proc = makeCodexLifecycleHarness({ writable: false })
+
+    await expect(proc.request('initialize', {}, 20)).rejects.toThrow('stdin is not writable')
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('rejects asynchronous stdin write failures without leaking pending', async () => {
+    const proc = makeCodexLifecycleHarness({
+      write: (_chunk: string, callback: (error?: Error) => void) => {
+        queueMicrotask(() => callback(new Error('EPIPE')))
+        return true
+      },
+    })
+
+    await expect(proc.request('initialize', {}, 20)).rejects.toThrow('EPIPE')
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('a spawn error without a pid terminalizes lifecycle instead of leaving a ghost alive process', async () => {
+    const proc = makeCodexLifecycleHarness()
+    const exits: any[] = []
+    proc.on('error', () => {})
+    proc.on('exit', (event: any) => exits.push(event))
+    const pending = proc.request('initialize', {}, 100)
+
+    proc.handleChildProcessError(Object.assign(new Error('spawn ENOENT'), { code: 'ENOENT' }))
+
+    await expect(pending).rejects.toThrow('process failed before initialize response')
+    expect(proc.isAlive()).toBe(false)
+    await expect(proc.kill(1)).resolves.toBeUndefined()
+    expect(exits).toEqual([{ code: null, signal: null, expected: false }])
+  })
+
+  test('OS exit keeps pending RPCs alive until a final stdout response is drained on close', async () => {
+    let requestId = 0
+    const proc = makeCodexLifecycleHarness({
+      write: (chunk: string) => {
+        requestId = JSON.parse(chunk).id
+        return true
+      },
+    })
+    const pending = proc.request('thread/read', {}, 100)
+    proc.stdoutBuf = JSON.stringify({ id: requestId, result: { thread: { id: 'thread-1' } } })
+
+    proc.handleChildExit(0, null)
+    expect(proc.pending.size).toBe(1)
+    proc.handleChildClose(0, null)
+
+    await expect(pending).resolves.toEqual({ thread: { id: 'thread-1' } })
+    expect(proc.pending.size).toBe(0)
+    expect(proc.isAlive()).toBe(false)
+  })
+
+  test('stdin EPIPE does not reject an already-sent RPC whose response is in the stdout tail', async () => {
+    let requestId = 0
+    const proc = makeCodexLifecycleHarness({
+      write: (chunk: string) => {
+        requestId = JSON.parse(chunk).id
+        return true
+      },
+    })
+    proc.expectedExit = true
+    const pending = proc.request('thread/read', {}, 100)
+
+    proc.handleStdinError(new Error('EPIPE'))
+    expect(proc.pending.size).toBe(1)
+    proc.stdoutBuf = JSON.stringify({ id: requestId, result: { thread: { id: 'thread-1' } } })
+    proc.handleChildClose(0, null)
+
+    await expect(pending).resolves.toEqual({ thread: { id: 'thread-1' } })
+  })
+
+  test('public exit waits for tail materialization continuations before Session cleanup', async () => {
+    const proc = makeCodexLifecycleHarness()
+    const exits: any[] = []
+    proc.on('exit', (event: any) => exits.push(event))
+    let releaseMaterialization: () => void = () => {}
+    const materialization = new Promise<void>(resolve => {
+      releaseMaterialization = resolve
+    })
+    proc.conversationMaterializationVerification = materialization
+    void materialization.then(() => {
+      proc.conversationMaterializationVerification = null
+    })
+
+    proc.handleChildExit(0, null)
+    proc.handleChildClose(0, null)
+    expect(exits).toEqual([])
+    expect(proc.isAlive()).toBe(true)
+
+    releaseMaterialization()
+    await proc.exitPromise
+    expect(exits).toEqual([{ code: 0, signal: null, expected: false }])
+    expect(proc.isAlive()).toBe(false)
+  })
+
+  test('times out unanswered requests and removes them from pending', async () => {
+    const proc = makeCodexLifecycleHarness()
+
+    await expect(proc.request('thread/start', {}, 5)).rejects.toThrow('timed out after 5ms')
+    expect(proc.pending.size).toBe(0)
+  })
+
+  test('waits for real exit after SIGKILL instead of returning after delivery', async () => {
+    const proc = makeCodexLifecycleHarness()
+    const signals: string[] = []
+    proc.proc.kill = (signal: string) => {
+      signals.push(signal)
+      if (signal === 'SIGKILL') {
+        queueMicrotask(() => {
+          proc.alive = false
+          proc.exitEventEmitted = true
+          proc.resolveExit()
+        })
+      }
+      return true
+    }
+
+    await expect(proc.kill(5)).resolves.toBeUndefined()
+    expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+    expect(proc.alive).toBe(false)
+  })
+
+  test('rejects kill when neither TERM nor KILL produces an exit', async () => {
+    const proc = makeCodexLifecycleHarness()
+    const signals: string[] = []
+    proc.proc.kill = (signal: string) => {
+      signals.push(signal)
+      return true
+    }
+
+    await expect(proc.kill(2)).rejects.toThrow('did not exit after SIGTERM and SIGKILL')
+    expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
+  })
+})
+
+describe('codex app-server conversation protocol', () => {
+  test('catalog and main launch share one initialize handshake and send initialized once', async () => {
+    let releaseInitialize!: () => void
+    const initializeGate = new Promise<void>(resolve => { releaseInitialize = resolve })
+    const { proc, calls, writes } = makeCodexProtocolHarness({}, async (method, _params) => {
+      if (method === 'initialize') {
+        await initializeGate
+        return {}
+      }
+      if (method === 'thread/start') return { thread: { id: 'main-thread', cwd: '/repo' } }
+      if (method === 'model/list') return { data: [], nextCursor: null }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    const main = proc.initializeAndStartThread()
+    const catalog = proc.listModels()
+    await Promise.resolve()
+    expect(calls.filter(c => c.method === 'initialize')).toHaveLength(1)
+
+    releaseInitialize()
+    await expect(Promise.all([main, catalog])).resolves.toEqual([undefined, []])
+    expect(calls.filter(c => c.method === 'initialize')).toHaveLength(1)
+    expect(writes).toEqual([{ method: 'initialized' }])
+    expect(calls.findIndex(c => c.method === 'initialize')).toBeLessThan(calls.findIndex(c => c.method === 'thread/start'))
+    expect(calls.findIndex(c => c.method === 'initialize')).toBeLessThan(calls.findIndex(c => c.method === 'model/list'))
+  })
+
+  test('does not issue catalog requests when the initialized notification cannot be written', async () => {
+    const { proc, calls } = makeCodexProtocolHarness()
+    proc.write = () => new Error('stdin is not writable')
+
+    await expect(proc.listModels()).rejects.toThrow('initialized notification write failed')
+    expect(calls.filter(c => c.method === 'initialize')).toHaveLength(1)
+    expect(calls.some(c => c.method === 'model/list')).toBe(false)
+  })
+
+  test('maps an explicit fresh launch to thread/start', async () => {
+    const { proc, calls } = makeCodexProtocolHarness({
+      launch: { kind: 'fresh' },
+    })
+
+    await proc.initializeAndStartThread()
+    const launches = calls.filter(c => c.method.startsWith('thread/'))
+    expect(launches).toHaveLength(1)
+    expect(launches[0].method).toBe('thread/start')
+    expect(launches[0].params).not.toHaveProperty('threadId')
+    expect(proc.sessionId).toBe('fresh-thread')
+    expect(proc.isConversationResumable()).toBe(false)
+  })
+
+  test('maps explicit resume to thread/resume', async () => {
+    const { proc, calls } = makeCodexProtocolHarness({
+      launch: { kind: 'resume', source: { provider: 'codex', sessionId: 'explicit-thread', cwd: '/repo' } },
+    })
+    await proc.initializeAndStartThread()
+    expect(calls.find(c => c.method === 'thread/resume')?.params).toMatchObject({
+      threadId: 'explicit-thread', cwd: '/repo', excludeTurns: true,
+    })
+    expect(proc.isConversationResumable()).toBe(true)
+  })
+
+  test('maps a Codex turn checkpoint to thread/fork lastTurnId', async () => {
+    const source = { provider: 'codex' as const, sessionId: 'source-thread', cwd: '/repo' }
+    const { proc, calls } = makeCodexProtocolHarness({
+      launch: {
+        kind: 'fork',
+        source,
+        through: { provider: 'codex', kind: 'turn', id: 'turn-7', source },
+      },
+    })
+
+    await proc.initializeAndStartThread()
+    expect(calls.find(c => c.method === 'thread/fork')?.params).toMatchObject({
+      threadId: 'source-thread',
+      lastTurnId: 'turn-7',
+      cwd: '/repo',
+      excludeTurns: true,
+    })
+    expect(proc.sessionId).toBe('forked-thread')
+    expect(proc.isConversationResumable()).toBe(true)
+  })
+
+  test('sendInitialize returns the same exact readiness transaction to every caller', async () => {
+    let releaseStart!: () => void
+    const startGate = new Promise<void>(resolve => { releaseStart = resolve })
+    const { proc } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/start') {
+        await startGate
+        return { thread: { id: 'fresh-thread', cwd: '/repo' } }
+      }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    proc.sendInitialize()
+    const first = proc.initializationPromise()
+    proc.sendInitialize()
+    const second = proc.initializationPromise()
+    expect(second).toBe(first)
+    releaseStart()
+    await expect(first).resolves.toBeUndefined()
+  })
+
+  test('rejects a non-turn fork checkpoint before sending thread/fork', async () => {
+    const source = { provider: 'codex', sessionId: 'source-thread', cwd: '/repo' }
+    const { proc, calls } = makeCodexProtocolHarness({
+      launch: {
+        kind: 'fork',
+        source,
+        through: { provider: 'codex', kind: 'assistant-message', id: 'message-1', source },
+      },
+    })
+
+    await expect(proc.initializeAndStartThread()).rejects.toThrow('must be a codex turn checkpoint')
+    expect(calls.some(c => c.method === 'thread/fork')).toBe(false)
+  })
+
+  test('rejects a fork response that reuses the source id without falling back', async () => {
+    const source = { provider: 'codex' as const, sessionId: 'source-thread', cwd: '/repo' }
+    const { proc, calls } = makeCodexProtocolHarness({
+      launch: { kind: 'fork', source },
+    }, async (method, params) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/fork') return { thread: { id: params.threadId, cwd: '/repo' } }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    await expect(proc.initializeAndStartThread()).rejects.toThrow('returned source thread id')
+    expect(calls.filter(c => c.method === 'thread/fork')).toHaveLength(1)
+    expect(calls.some(c => c.method === 'thread/resume' || c.method === 'thread/start')).toBe(false)
+    expect(proc.sessionId).toBeNull()
+  })
+
+  test('rejects a fork response without a new thread id', async () => {
+    const source = { provider: 'codex' as const, sessionId: 'source-thread', cwd: '/repo' }
+    const { proc, calls } = makeCodexProtocolHarness({
+      launch: { kind: 'fork', source },
+    }, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/fork') return { thread: { cwd: '/repo' } }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    await expect(proc.initializeAndStartThread()).rejects.toThrow('thread/fork returned no thread.id')
+    expect(calls.some(c => c.method === 'thread/resume' || c.method === 'thread/start')).toBe(false)
+    expect(proc.sessionId).toBeNull()
+  })
+
+  test('rejects a launch response for a different cwd before exposing the thread id', async () => {
+    const { proc } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/start') return { thread: { id: 'wrong-cwd-thread', cwd: '/other' } }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    await expect(proc.initializeAndStartThread()).rejects.toThrow('returned cwd=/other, expected /repo')
+    expect(proc.sessionId).toBeNull()
+  })
+
+  test('rejects a launch response without an authoritative rollout path', async () => {
+    const { proc } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/start') {
+        return { thread: { id: 'pathless-thread', cwd: '/repo', path: null } }
+      }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    await expect(proc.initializeAndStartThread()).rejects.toThrow('returned invalid thread.path=MISS')
+    expect(proc.sessionId).toBeNull()
+  })
+
+  test('runs every Codex turn with the complete danger-full-access policy', async () => {
+    const { proc, calls } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'turn/start') return { turn: { id: 'agent-turn' } }
+      throw new Error(`unexpected request ${method}`)
+    })
+    proc.readyPromise = Promise.resolve()
+    proc.sessionId = 'agent-thread'
+    await proc.startTurn('work')
+    expect(calls[0]).toMatchObject({
+      method: 'turn/start',
+      params: {
+        sandboxPolicy: { type: 'dangerFullAccess' },
+        runtimeWorkspaceRoots: ['/repo'],
+      },
+    })
+  })
+
+  test('rejects a resume response that routes to a different thread id', async () => {
+    const source = { provider: 'codex' as const, sessionId: 'expected-thread', cwd: '/repo' }
+    const { proc } = makeCodexProtocolHarness({
+      launch: { kind: 'resume', source },
+    }, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/resume') {
+        return { thread: { id: 'wrong-thread', cwd: '/repo' } }
+      }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    await expect(proc.initializeAndStartThread()).rejects.toThrow(
+      'thread/resume returned thread id wrong-thread, expected expected-thread',
+    )
+    expect(proc.sessionId).toBeNull()
+  })
+
+  test('turn/start response and notification share one canonical transition', async () => {
+    const { proc, events } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'turn/start') return { turn: { id: 'turn-response' } }
+      throw new Error(`unexpected request ${method}`)
+    })
+    proc.readyPromise = Promise.resolve()
+    proc.sessionId = 'main-thread'
+    proc.conversationResumable = false
+
+    await proc.startTurn('hello')
+    expect(proc.isConversationResumable()).toBe(false)
+    expect(events.filter(([event]) => event === 'conversation_materialized')).toEqual([])
+    proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: { id: 'turn-response' },
+    })
+    await Promise.resolve()
+
+    expect(proc.currentTurnId).toBe('turn-response')
+    expect(events.filter(([event]) => event === 'turn_started')).toEqual([
+      ['turn_started', { turn_id: 'turn-response', thread_id: 'main-thread' }],
+    ])
+    expect(events.filter(([event]) => event === 'conversation_materialized')).toEqual([
+      ['conversation_materialized', {
+        session_id: 'main-thread',
+        source: 'turn/started notification',
+      }],
+    ])
+    expect(proc.isConversationResumable()).toBe(true)
+  })
+
+  test('malformed turn/started cannot mark a fresh conversation resumable', () => {
+    const { proc, events } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.conversationResumable = false
+
+    // 合并口径(fork 8ae9856):空 turn.id 的通知记日志并忽略,不 throw(上游
+    // recordTurnStarted 的 no-turn.id throw 随该机制一并删除)。安全性不变:
+    // 未物化/未夺主。
+    expect(() => proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: {},
+    })).not.toThrow()
+
+    expect(proc.currentTurnId ?? null).toBeNull()
+    expect(proc.isConversationResumable()).toBe(false)
+    expect(events.filter(([event]) => event === 'conversation_materialized')).toEqual([])
+    expect(events.filter(([event]) => event === 'turn_started')).toEqual([])
+  })
+
+  test('turn lifecycle notifications without the exact main thread id fail closed', () => {
+    const { proc, events } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.currentTurnId = 'turn-current'
+
+    // 异轮 turn/started 不得夺取轮属主(冲突守卫;缺失 threadId 按 fork 口径
+    // 归属主线程,但 id 不匹配照样拒绝)。
+    proc.handleNotification('turn/started', { turn: { id: 'turn-missing-thread' } })
+    expect(proc.currentTurnId).toBe('turn-current')
+
+    // 显式异线程(sub-thread)的终止通知被 isForeignThread 前置过滤:既不得
+    // 终结主轮、也不得 emit result(合并保留 fork 的外线程隔离)。
+
+    proc.handleNotification('turn/completed', {
+      threadId: 'child-thread',
+      turn: { id: 'turn-current', status: 'completed' },
+    })
+    expect(proc.currentTurnId).toBe('turn-current')
+    expect(events.filter(([event]) => event === 'turn_started' || event === 'result')).toEqual([])
+  })
+
+  test('turn/started without authoritative thread/read acknowledgement emits failure and stays unbound', async () => {
+    const { proc, events } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.conversationRolloutPath = '/rollouts/rollout-main-thread.jsonl'
+    proc.conversationResumable = false
+    proc.verifyConversationMaterialized = async () => {
+      throw new Error('rollout stat EACCES')
+    }
+
+    proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: { id: 'turn-1' },
+    })
+    await Promise.resolve()
+
+    expect(proc.isConversationResumable()).toBe(false)
+    expect(events.filter(([event]) => event === 'conversation_materialized')).toEqual([])
+    expect(events.filter(([event]) => event === 'conversation_materialization_failed')).toEqual([
+      ['conversation_materialization_failed', {
+        session_id: 'main-thread',
+        path: '/rollouts/rollout-main-thread.jsonl',
+        source: 'turn/started notification',
+        error: expect.any(Error),
+      }],
+    ])
+  })
+
+  test('materialization verification requires thread/read includeTurns and exact id cwd path', async () => {
+    const { proc, calls } = makeCodexProtocolHarness({}, async (method, params) => {
+      if (method === 'thread/read') {
+        return {
+          thread: {
+            id: params.threadId,
+            cwd: '/repo',
+            path: '/rollouts/rollout-main-thread.jsonl',
+            turns: [{ id: 'turn-1' }],
+          },
+        }
+      }
+      throw new Error(`unexpected request ${method}`)
+    })
+    delete proc.verifyConversationMaterialized
+    proc.sessionId = 'main-thread'
+    proc.conversationRolloutPath = '/rollouts/rollout-main-thread.jsonl'
+
+    await expect(proc.verifyConversationMaterialized('turn/started notification')).resolves.toBeUndefined()
+    expect(calls).toContainEqual({
+      method: 'thread/read',
+      params: { threadId: 'main-thread', includeTurns: true },
+    })
+  })
+
+  test('materialization barrier drains a completion-triggered retry before settling', async () => {
+    const { proc } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.conversationRolloutPath = '/rollouts/rollout-main-thread.jsonl'
+    proc.conversationResumable = false
+    let attempts = 0
+    let releaseRetry: () => void = () => {}
+    const retryGate = new Promise<void>(resolve => { releaseRetry = resolve })
+    proc.verifyConversationMaterialized = async () => {
+      attempts++
+      if (attempts === 1) throw new Error('first verification raced persistence')
+      await retryGate
+    }
+
+    proc.markConversationMaterialized('turn/started notification')
+    proc.markConversationMaterialized('turn/completed notification')
+    const barrier = proc.conversationMaterializationBarrier()
+    expect(barrier).not.toBeNull()
+    let settled = false
+    void barrier!.then(() => { settled = true })
+    for (let i = 0; i < 6; i++) await Promise.resolve()
+
+    expect(attempts).toBe(2)
+    expect(settled).toBe(false)
+    releaseRetry()
+    await expect(barrier!).resolves.toBeUndefined()
+    expect(proc.isConversationResumable()).toBe(true)
+  })
+
+  test('does not revive a completed turn when its turn/start response arrives late', async () => {
+    let resolveStart!: (value: any) => void
+    const startResponse = new Promise<any>(resolve => { resolveStart = resolve })
+    const { proc, events } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'turn/start') return startResponse
+      throw new Error(`unexpected request ${method}`)
+    })
+    proc.readyPromise = Promise.resolve()
+    proc.sessionId = 'main-thread'
+    proc.lastCompletedTurnId = 'previous-turn'
+
+    // 走交付路径(fork 口径):建 delivery 即清上一轮 checkpoint,与响应/通知
+    // 到达顺序无关。
+    proc.sendUserText('fast turn')
+    expect(proc.lastCompletedTurnId).toBeNull()
+    proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: { id: 'fast-turn' },
+    })
+    proc.handleNotification('turn/completed', {
+      threadId: 'main-thread',
+      turn: { id: 'fast-turn', status: 'completed', durationMs: 1 },
+    })
+    resolveStart({ turn: { id: 'fast-turn' } })
+    for (let i = 0; i < 8; i++) await Promise.resolve()
+
+    // 迟到的 turn/start 响应(delivery 已终结)不得复活轮属主,也不得重复
+    // 发 turn_started(通知路径是唯一发点)。
+    expect(proc.currentTurnId).toBeNull()
+    expect(proc.lastCompletedTurnId).toBe('fast-turn')
+    expect(events.filter(([event]) => event === 'turn_started')).toHaveLength(1)
+  })
+
+  test('late turn/started for a finished id cannot capture the next turn owner', () => {
+    const { proc } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.finishedTurnIds = new Set(['turn-old'])
+    const { delivery } = proc.beginTurnStart()
+
+    // 已终结 turn 的迟到 turn/started(finishedTurnIds 守卫)被忽略。
+    proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: { id: 'turn-old' },
+    })
+    expect(delivery.turnId).toBeNull()
+    expect(proc.currentTurnId).toBeNull()
+
+    // 新 turn 正常接管投递。
+    proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: { id: 'turn-new' },
+    })
+    expect(delivery.turnId).toBe('turn-new')
+    expect(proc.currentTurnId).toBe('turn-new')
+  })
+
+  test('late or duplicate turn/completed cannot clear a newer active turn or emit a second result', () => {
+    const { proc, events } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.currentTurnId = 'turn-new'
+    proc.lastCompletedTurnId = 'checkpoint-newer'
+    proc.finishedTurnIds = new Set(['turn-finished'])
+
+    proc.handleNotification('turn/completed', {
+      threadId: 'main-thread',
+      turn: { id: 'turn-finished', status: 'completed' },
+    })
+    proc.handleNotification('turn/completed', {
+      threadId: 'main-thread',
+      turn: { id: 'turn-old-first-terminal', status: 'completed' },
+    })
+
+    expect(proc.currentTurnId).toBe('turn-new')
+    expect(proc.lastCompletedTurnId).toBe('checkpoint-newer')
+    expect(events.filter(([event]) => event === 'result')).toEqual([])
+    expect(proc.finishedTurnIds.has('turn-old-first-terminal')).toBe(true)
+  })
+
+  test('a duplicate completion for the current turn emits exactly one terminal result', () => {
+    const { proc, events } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.currentTurnId = 'turn-1'
+    proc.conversationResumable = true
+    proc.finishedTurnIds = new Set()
+    const notification = {
+      threadId: 'main-thread',
+      turn: { id: 'turn-1', status: 'completed' },
+    }
+
+    proc.handleNotification('turn/completed', notification)
+    proc.handleNotification('turn/completed', notification)
+
+    expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
+    expect(proc.currentTurnId).toBeNull()
+  })
+
+  test('ignores an old request timeout after its turn completed and the next turn started', async () => {
+    let rejectFirst!: (error: Error) => void
+    let resolveSecond!: (value: any) => void
+    const firstResponse = new Promise<any>((_resolve, reject) => { rejectFirst = reject })
+    const secondResponse = new Promise<any>(resolve => { resolveSecond = resolve })
+    let requestIndex = 0
+    const { proc, events } = makeCodexProtocolHarness({}, async (method) => {
+      if (method !== 'turn/start') throw new Error(`unexpected request ${method}`)
+      requestIndex += 1
+      return requestIndex === 1 ? firstResponse : secondResponse
+    })
+    proc.readyPromise = Promise.resolve()
+    proc.sessionId = 'main-thread'
+
+    proc.sendUserText('first')
+    await Promise.resolve()
+    proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: { id: 'first-turn' },
+    })
+    proc.handleNotification('turn/completed', {
+      threadId: 'main-thread',
+      turn: { id: 'first-turn', status: 'completed', durationMs: 1 },
+    })
+
+    proc.sendUserText('second')
+    await Promise.resolve()
+    proc.handleNotification('turn/started', {
+      threadId: 'main-thread',
+      turn: { id: 'second-turn' },
+    })
+
+    rejectFirst(new Error('turn/start request timed out'))
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(proc.currentTurnId).toBe('second-turn')
+    expect(proc.lastResult.is_error).toBe(false)
+    expect(events.filter(([event]) => event === 'result')).toEqual([
+      ['result', expect.objectContaining({ turn_id: 'first-turn', is_error: false })],
+    ])
+
+    resolveSecond({ turn: { id: 'second-turn' } })
+    await Promise.resolve()
+    await Promise.resolve()
+    expect(proc.currentTurnId).toBe('second-turn')
+    expect(events.filter(([event]) => event === 'turn_started')).toHaveLength(2)
+  })
+
+  test('still reports a turn/start rejection owned by the current generation', async () => {
+    const { proc, events } = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'turn/start') throw new Error('current request failed')
+      throw new Error(`unexpected request ${method}`)
+    })
+    proc.readyPromise = Promise.resolve()
+    proc.sessionId = 'main-thread'
+
+    proc.sendUserText('will fail')
+    await new Promise(resolve => setTimeout(resolve, 0))
+
+    expect(proc.currentTurnId).toBeNull()
+    expect(events.filter(([event]) => event === 'result')).toEqual([
+      ['result', expect.objectContaining({
+        subtype: 'codex_turn_start_failed',
+        is_error: true,
+        error: 'current request failed',
+      })],
+    ])
+  })
+
+  test('records the canonical main-thread turn/completed id publicly', () => {
+    const { proc, events } = makeCodexProtocolHarness()
+    proc.sessionId = 'main-thread'
+    proc.currentTurnId = 'turn-9'
+
+    proc.handleNotification('turn/completed', {
+      threadId: 'main-thread',
+      turn: { id: 'turn-9', status: 'completed', durationMs: 25 },
+    })
+
+    expect(proc.lastCompletedTurnId).toBe('turn-9')
+    expect(proc.currentTurnId).toBeNull()
+    expect(events.filter(([event]) => event === 'result')).toEqual([
+      ['result', expect.objectContaining({
+        turn_id: 'turn-9',
+        checkpoint: {
+          provider: 'codex',
+          kind: 'turn',
+          id: 'turn-9',
+          source: { provider: 'codex', sessionId: 'main-thread', cwd: '/repo' },
+        },
+      })],
+    ])
+  })
+
+  test('failed or malformed terminal turns cannot reuse an earlier checkpoint', () => {
+    for (const turn of [
+      { id: 'failed-turn', status: 'failed', error: { type: 'model_error' } },
+      { status: 'completed' },
+    ]) {
+      const { proc, events } = makeCodexProtocolHarness()
+      proc.sessionId = 'main-thread'
+      proc.lastCompletedTurnId = 'previous-turn'
+      proc.handleNotification('turn/completed', { threadId: 'main-thread', turn })
+
+      expect(proc.lastCompletedTurnId).toBeNull()
+      expect(events.find(([event]) => event === 'result')?.[1].checkpoint).toBeNull()
+    }
+  })
+
+  test('lists exact-cwd interactive conversations across every page without over-filtering their source', async () => {
+    const { proc, calls, writes } = makeCodexProtocolHarness({}, async (method, params) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/list' && params.cursor === null) {
+        return {
+          data: [{ id: 'newer', cwd: '/repo', preview: 'new task', updatedAt: 1_777_000_000, status: { type: 'idle' } }],
+          nextCursor: 'page-2',
+        }
+      }
+      if (method === 'thread/list' && params.cursor === 'page-2') {
+        return {
+          data: [{ id: 'older', cwd: '/repo', preview: 'old task', updatedAt: 1_776_000_000, status: { type: 'systemError' } }],
+          nextCursor: null,
+        }
+      }
+      throw new Error(`unexpected request ${method}`)
+    })
+
+    await expect(proc.listConversations()).resolves.toEqual([
+      { provider: 'codex', sessionId: 'newer', cwd: '/repo', preview: 'new task', ts: 1_777_000_000_000, status: 'idle' },
+      { provider: 'codex', sessionId: 'older', cwd: '/repo', preview: 'old task', ts: 1_776_000_000_000, status: 'systemError' },
+    ])
+    expect(calls.filter(c => c.method === 'thread/list').map(c => c.params)).toEqual([
+      {
+        cursor: null,
+        limit: 100,
+        sortKey: 'updated_at',
+        sortDirection: 'desc',
+        cwd: '/repo',
+      },
+      {
+        cursor: 'page-2',
+        limit: 100,
+        sortKey: 'updated_at',
+        sortDirection: 'desc',
+        cwd: '/repo',
+      },
+    ])
+    expect(writes).toEqual([{ method: 'initialized' }])
+    expect(calls.some(c => c.method === 'thread/start')).toBe(false)
+  })
+
+  test('excludes delegated Agent threads from the main rs history', async () => {
+    resetAgentSessionRegistryForTest(['codex:delegated'])
+    try {
+      const { proc } = makeCodexProtocolHarness({}, async (method) => {
+        if (method === 'initialize') return {}
+        if (method === 'thread/list') return {
+          data: [
+            { id: 'delegated', cwd: '/repo', preview: 'child work', updatedAt: 2 },
+            { id: 'main', cwd: '/repo', preview: 'main work', updatedAt: 1 },
+          ],
+          nextCursor: null,
+        }
+        throw new Error(`unexpected request ${method}`)
+      })
+      await expect(proc.listConversations()).resolves.toEqual([
+        { provider: 'codex', sessionId: 'main', cwd: '/repo', preview: 'main work', ts: 1000 },
+      ])
+    } finally {
+      resetAgentSessionRegistryForTest()
+    }
+  })
+
+  test('surfaces thread/list transport and malformed-response failures', async () => {
+    const failed = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/list') throw new Error('list unavailable')
+      throw new Error(`unexpected request ${method}`)
+    }).proc
+    await expect(failed.listConversations()).rejects.toThrow('list unavailable')
+
+    const malformed = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/list') return { nextCursor: null }
+      throw new Error(`unexpected request ${method}`)
+    }).proc
+    await expect(malformed.listConversations()).rejects.toThrow('no data array')
+
+    const wrongCwd = makeCodexProtocolHarness({}, async (method) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/list') {
+        return { data: [{ id: 'wrong', cwd: '/other', preview: 'x', updatedAt: 1 }], nextCursor: null }
+      }
+      throw new Error(`unexpected request ${method}`)
+    }).proc
+    await expect(wrongCwd.listConversations()).rejects.toThrow('invalid thread summary')
+  })
+
+  test('resolves a legacy resume id through stable thread/read cwd metadata', async () => {
+    const { proc, calls } = makeCodexProtocolHarness({}, async (method, params) => {
+      if (method === 'initialize') return {}
+      if (method === 'thread/read') return { thread: { id: params.threadId, cwd: '/repo' } }
+      throw new Error(`unexpected request ${method}`)
+    })
+    await expect(proc.readConversationRef('legacy-thread')).resolves.toEqual({
+      provider: 'codex', sessionId: 'legacy-thread', cwd: '/repo',
+    })
+    expect(calls.find(call => call.method === 'thread/read')?.params).toEqual({
+      threadId: 'legacy-thread', includeTurns: false,
+    })
+  })
+})
+
+describe('codex rollout incremental reader', () => {
+  test('authoritative rollout checks require the exact app-server path to be a readable file', () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-rollout-authority-'))
+    const file = join(root, 'rollout-thread-1.jsonl')
+    const { proc } = makeCodexProtocolHarness()
+    delete proc.assertConversationRolloutMaterialized
+    proc.conversationRolloutPath = file
+
+    try {
+      expect(() => proc.assertConversationRolloutMaterialized('test notification')).toThrow(
+        'rollout is not readable',
+      )
+      writeFileSync(file, '{}\n')
+      expect(() => proc.assertConversationRolloutMaterialized('test notification')).not.toThrow()
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+
+  test('reads only appended bytes and retains an incomplete JSON line', () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-rollout-'))
+    const file = join(root, 'rollout.jsonl')
+    try {
+      const proc = Object.create(CodexProcess.prototype) as any
+      const seen: any[] = []
+      proc.sessionId = 'thread-1'
+      proc.rolloutFilePath = file
+      proc.rolloutReadOffset = 0
+      proc.rolloutLineRemainder = ''
+      proc.rolloutDecoder = new StringDecoder('utf8')
+      proc.emitRolloutImageGeneration = (payload: any) => { seen.push(payload) }
+
+      const line = JSON.stringify({ payload: { type: 'image_generation_end', call_id: 'img-1' } })
+      const split = Math.floor(line.length / 2)
+      writeFileSync(file, line.slice(0, split))
+      proc.flushRolloutImageGenerations()
+      expect(seen).toHaveLength(0)
+      expect(proc.rolloutReadOffset).toBe(split)
+
+      appendFileSync(file, line.slice(split) + '\n')
+      proc.flushRolloutImageGenerations()
+      expect(seen).toEqual([{ type: 'image_generation_end', call_id: 'img-1' }])
+      expect(proc.rolloutReadOffset).toBe(Buffer.byteLength(line + '\n'))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('codex process compaction notifications', () => {
+  test('detects explicit thread compaction notifications', () => {
+    const notice = contextCompactionNoticeFromNotification('thread/compacted', {
+      threadId: 'thread-1',
+      turnId: 'turn-1',
+    })
+
+    expect(notice?.sourceMethod).toBe('thread/compacted')
+    expect(notice?.threadId).toBe('thread-1')
+    expect(notice?.turnId).toBe('turn-1')
+  })
+
+  test('detects Codex event messages persisted as context_compacted', () => {
+    const notice = contextCompactionNoticeFromNotification('event_msg', {
+      type: 'context_compacted',
+    })
+
+    expect(notice?.sourceMethod).toBe('event_msg')
+    expect(notice?.sourceType).toBe('context_compacted')
+    expect(notice?.phase).toBe('end')
+  })
+
+  test('detects raw compacted records with replacement history', () => {
+    const notice = contextCompactionNoticeFromMessage({
+      timestamp: '2026-06-03T16:03:16.331Z',
+      type: 'compacted',
+      payload: {
+        message: '',
+        replacement_history: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: '旧消息' }] },
+        ],
+      },
+    })
+
+    expect(notice?.sourceMethod).toBe('compacted')
+    expect(notice?.sourceType).toBe('compacted')
+    expect(notice?.phase).toBe('start')
+    expect(notice?.timestamp).toBe('2026-06-03T16:03:16.331Z')
+    expect(notice?.replacement_history).toHaveLength(1)
+  })
+
+  test('detects raw response compaction items', () => {
+    const notice = contextCompactionNoticeFromNotification('rawResponseItem/completed', {
+      item: {
+        type: 'contextCompaction',
+        id: 'item-1',
+      },
+      threadId: 'thread-2',
+    })
+
+    expect(notice?.sourceMethod).toBe('rawResponseItem/completed')
+    expect(notice?.sourceType).toBe('contextCompaction')
+    expect(notice?.phase).toBe('end')
+    expect(notice?.itemId).toBe('item-1')
+    expect(notice?.threadId).toBe('thread-2')
+  })
+
+  test('marks live app-server context compaction item start and completion', () => {
+    const started = contextCompactionNoticeFromNotification('item/started', {
+      item: {
+        type: 'contextCompaction',
+        id: 'compact-1',
+      },
+      threadId: 'thread-3',
+      turnId: 'turn-3',
+    })
+    const completed = contextCompactionNoticeFromNotification('item/completed', {
+      item: {
+        type: 'contextCompaction',
+        id: 'compact-1',
+        replacementHistory: [
+          { type: 'message', role: 'user', content: [{ type: 'input_text', text: '旧消息' }] },
+        ],
+      },
+      threadId: 'thread-3',
+      turnId: 'turn-3',
+    })
+
+    expect(started?.phase).toBe('start')
+    expect(started?.itemId).toBe('compact-1')
+    expect(started?.threadId).toBe('thread-3')
+    expect(completed?.phase).toBe('end')
+    expect(completed?.itemId).toBe('compact-1')
+    expect(completed?.replacementHistory).toHaveLength(1)
+  })
+
+  test('ignores unrelated notifications', () => {
+    expect(contextCompactionNoticeFromNotification('thread/settings/updated', {
+      threadSettings: { model: 'gpt-5' },
+    })).toBeNull()
+  })
+
+  test('unmapped app-server notifications are logged without breaking message handling', () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const raw: unknown[] = []
+    const compacted: unknown[] = []
+    proc.opts = { workDir: '/tmp' }
+    proc.emit = (event: string, payload: unknown) => {
+      if (event === 'raw') raw.push(payload)
+      if (event === 'context_compacted') compacted.push(payload)
+      return true
+    }
+
+    expect(() => proc.handleNotification('item/started', {
+      item: { type: 'contextCompaction', id: 'compact-2' },
+      threadId: 'thread-4',
+      turnId: 'turn-4',
+    })).not.toThrow()
+    expect(() => proc.handleNotification('thread/status/changed', {
+      threadId: 'thread-4',
+      status: { type: 'idle' },
+    })).not.toThrow()
+    expect(() => proc.handleNotification('item/started', {
+      item: { type: 'reasoning', id: 'rs-1', summary: [], content: [] },
+      threadId: 'thread-4',
+      turnId: 'turn-4',
+    })).not.toThrow()
+    // reasoning item 走 UNMAPPED log(不 emit raw);thread/status/changed 已被
+    // 子 agent 状态机消费(exec-cell 编排的终态信号),不再落 raw。
+    expect(raw).toHaveLength(0)
+    expect(compacted).toHaveLength(1)
+  })
+
+  test('retains the completed image prompt when the start event has no prompt', () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const events: Array<[string, any]> = []
+    proc.opts = { workDir: '/tmp' }
+    proc.emittedImageGenerationIds = new Set()
+    proc.emit = (event: string, payload: unknown) => {
+      events.push([event, payload])
+      return true
+    }
+
+    proc.handleNotification('item/started', {
+      item: {
+        type: 'imageGeneration',
+        id: 'img-1',
+        status: 'inProgress',
+      },
+      threadId: 'thread-5',
+      turnId: 'turn-5',
+    })
+    proc.handleNotification('item/completed', {
+      item: {
+        type: 'imageGeneration',
+        id: 'img-1',
+        status: 'completed',
+        revised_prompt: 'A cute cat curled up in a sunbeam.',
+        saved_path: '/tmp/cat.png',
+        result: 'ignored when saved_path exists',
+      },
+      threadId: 'thread-5',
+      turnId: 'turn-5',
+    })
+
+    expect(events).toEqual([
+      ['tool_use', {
+        id: 'img-1',
+        name: 'ImageGeneration',
+        input: {
+          status: 'inProgress',
+          revisedPrompt: undefined,
+        },
+      }],
+      ['tool_result', {
+        tool_use_id: 'img-1',
+        content: '/tmp/cat.png',
+        is_error: false,
+        input: { status: 'completed', revisedPrompt: 'A cute cat curled up in a sunbeam.' },
+      }],
+    ])
+  })
+
+  test('materializes inline base64 image generation results to a sendable file path', () => {
+    const root = mkdtempSync(join(tmpdir(), 'lodestar-imggen-'))
+    try {
+      const output = imageGenerationOutput({
+        call_id: 'ig-inline',
+        result: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=',
+      }, 'thread-inline', root)
+
+      expect(output).toBe(join(root, 'thread-inline', 'ig-inline.png'))
+      expect(readFileSync(output).subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
+    } finally {
+      rmSync(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('codex token usage helpers', () => {
+  test('parses app-server token usage payloads for last and total snapshots', () => {
+    expect(usageFromTokenUsagePayload({
+      totalTokens: 1200,
+      inputTokens: 900,
+      outputTokens: 300,
+      reasoningOutputTokens: 220,
+      cachedInputTokens: 400,
+    })).toEqual({
+      total_tokens: 1200,
+      input_tokens: 900,
+      output_tokens: 300,
+      reasoning_output_tokens: 220,
+      cache_creation_input_tokens: undefined,
+      cache_read_input_tokens: 400,
+    })
+  })
+
+  test('computes turn aggregate from absolute thread totals', () => {
+    const usage = diffUsageTotals(
+      {
+        total_tokens: 10_000,
+        input_tokens: 7_000,
+        output_tokens: 3_000,
+        reasoning_output_tokens: 1_200,
+        cache_read_input_tokens: 2_800,
+      },
+      {
+        total_tokens: 4_000,
+        input_tokens: 3_100,
+        output_tokens: 900,
+        reasoning_output_tokens: 500,
+        cache_read_input_tokens: 1_200,
+      },
+    )
+
+    expect(usage).toEqual({
+      total_tokens: 6000,
+      input_tokens: 3900,
+      output_tokens: 2100,
+      reasoning_output_tokens: 700,
+      cache_creation_input_tokens: undefined,
+      cache_read_input_tokens: 1600,
+    })
+    expect(effectiveTurnTokens(usage)).toBe(6000)
+    expect(effectiveTurnTokens({ total_tokens: 1234 })).toBe(1234)
+    expect(effectiveTurnTokens(null)).toBeNull()
+  })
+
+  test('clamps negative deltas and treats missing totals as unknown', () => {
+    expect(diffUsageTotals(
+      { input_tokens: 100, output_tokens: 20 },
+      { input_tokens: 120, output_tokens: 10 },
+    )).toEqual({
+      total_tokens: undefined,
+      input_tokens: 0,
+      output_tokens: 10,
+      reasoning_output_tokens: undefined,
+      cache_creation_input_tokens: undefined,
+      cache_read_input_tokens: undefined,
+    })
+    expect(diffUsageTotals(null, null)).toBeNull()
+  })
+})
+
+describe('codex collab agent translation (ultra multi-agent)', () => {
+  function makeProc(): { proc: any; events: Array<[string, any]> } {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const events: Array<[string, any]> = []
+    proc.opts = { workDir: '/tmp' }
+    proc.collabAgentNames = new Map()
+    proc.collabAgentSettled = new Set()
+    proc.collabAgentSummaries = new Map()
+    proc.emit = (event: string, payload: unknown) => {
+      events.push([event, payload])
+      return true
+    }
+    return { proc, events }
+  }
+
+  test('subAgentActivity started → bg_task_started + promoted; completed terminal via collabAgentToolCall → bg_task_settled', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/started', {
+      item: {
+        type: 'subAgentActivity',
+        id: 'call_1',
+        kind: 'started',
+        agentThreadId: 'agent-thread-1',
+        agentPath: '/root/order_schema/official_history_orders',
+      },
+      threadId: 'main-thread',
+      turnId: 'turn-1',
+    })
+
+    const bgEvents = events.filter(([e]) => e.startsWith('bg_task'))
+    expect(bgEvents).toEqual([
+      ['bg_task_started', {
+        task_id: 'agent-thread-1',
+        task_type: 'local_agent',
+        description: 'official_history_orders',
+        prompt: undefined,
+      }],
+      ['bg_task_updated', {
+        task_id: 'agent-thread-1',
+        patch: { is_backgrounded: true },
+      }],
+    ])
+
+    // wait 调用携带 agentsStates:running → updated;completed(message)→ settled。
+    proc.handleNotification('item/completed', {
+      item: {
+        type: 'collabAgentToolCall',
+        id: 'call_2',
+        tool: 'wait',
+        status: 'completed',
+        agentsStates: {
+          'agent-thread-1': { status: 'completed', message: '调查结论:可以改' },
+        },
+      },
+      threadId: 'main-thread',
+      turnId: 'turn-1',
+    })
+
+    const settled = events.filter(([e]) => e === 'bg_task_settled')
+    expect(settled).toEqual([['bg_task_settled', {
+      task_id: 'agent-thread-1',
+      status: 'completed',
+      summary: '调查结论:可以改',
+    }]])
+
+    // 同 agent 的后续 wait item 重复携带终态 → 不重复结算、不翻活。
+    proc.handleNotification('item/completed', {
+      item: {
+        type: 'collabAgentToolCall',
+        id: 'call_3',
+        tool: 'wait',
+        status: 'completed',
+        agentsStates: {
+          'agent-thread-1': { status: 'completed', message: '调查结论:可以改' },
+        },
+      },
+      threadId: 'main-thread',
+      turnId: 'turn-1',
+    })
+    expect(events.filter(([e]) => e === 'bg_task_settled')).toHaveLength(1)
+  })
+
+  test('spawnAgent emits one Agent tool panel (started) and closes it once (completed)', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/started', {
+      item: {
+        type: 'collabAgentToolCall',
+        id: 'spawn-1',
+        tool: 'spawnAgent',
+        status: 'inProgress',
+        prompt: '调查 history_orders 接口',
+        receiverThreadIds: ['agent-thread-2'],
+        agentsStates: { 'agent-thread-2': { status: 'running', message: null } },
+      },
+      threadId: 'main-thread',
+      turnId: 'turn-2',
+    })
+
+    // spawn started:一个 Agent tool_use + bg_task_started/promoted(先于 subAgentActivity)
+    const toolUses = events.filter(([e]) => e === 'tool_use')
+    expect(toolUses).toHaveLength(1)
+    expect(toolUses[0][1].name).toBe('Agent')
+    expect(toolUses[0][1].input.description).toBe('派生 1 个子 agent')
+
+    proc.handleNotification('item/completed', {
+      item: {
+        type: 'collabAgentToolCall',
+        id: 'spawn-1',
+        tool: 'spawnAgent',
+        status: 'completed',
+        receiverThreadIds: ['agent-thread-2'],
+        agentsStates: { 'agent-thread-2': { status: 'running', message: null } },
+      },
+      threadId: 'main-thread',
+      turnId: 'turn-2',
+    })
+
+    // completed 不再补 tool_use,只补 tool_result 关面板。
+    expect(events.filter(([e]) => e === 'tool_use')).toHaveLength(1)
+    const results = events.filter(([e]) => e === 'tool_result')
+    expect(results).toHaveLength(1)
+    expect(results[0][1].tool_use_id).toBe('spawn-1')
+    expect(results[0][1].content).toContain('agent-thread-2: running')
+  })
+
+  test('pure orchestration calls (wait/sendInput/closeAgent) emit no tool panels', () => {
+    const { proc, events } = makeProc()
+    for (const tool of ['wait', 'sendInput', 'resumeAgent', 'closeAgent']) {
+      proc.handleNotification('item/started', {
+        item: { type: 'collabAgentToolCall', id: `x-${tool}`, tool, status: 'inProgress', agentsStates: {} },
+        threadId: 'main-thread', turnId: 'turn-3',
+      })
+      proc.handleNotification('item/completed', {
+        item: { type: 'collabAgentToolCall', id: `x-${tool}`, tool, status: 'completed', agentsStates: {} },
+        threadId: 'main-thread', turnId: 'turn-3',
+      })
+    }
+    expect(events.filter(([e]) => e === 'tool_use' || e === 'tool_result')).toHaveLength(0)
+  })
+
+  test('errored agent settles as failed; unknown orchestration items stay out of UNHANDLED noise', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/started', {
+      item: {
+        type: 'subAgentActivity',
+        id: 'call_9',
+        kind: 'started',
+        agentThreadId: 'agent-thread-3',
+        agentPath: '/root/fix_bug',
+      },
+      threadId: 'main-thread', turnId: 'turn-4',
+    })
+    proc.handleNotification('item/completed', {
+      item: {
+        type: 'collabAgentToolCall',
+        id: 'call_10',
+        tool: 'wait',
+        status: 'completed',
+        agentsStates: { 'agent-thread-3': { status: 'errored', message: 'context window exceeded' } },
+      },
+      threadId: 'main-thread', turnId: 'turn-4',
+    })
+
+    const settled = events.filter(([e]) => e === 'bg_task_settled')
+    expect(settled).toEqual([['bg_task_settled', {
+      task_id: 'agent-thread-3',
+      status: 'failed',
+      summary: 'context window exceeded',
+    }]])
+    expect(events.filter(([e]) => e === 'raw')).toHaveLength(0)
+  })
+})
+
+describe('codex collab followup reactivation', () => {
+  test('settled agent re-runs via followup: revive then settle again', () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const events: Array<[string, any]> = []
+    proc.opts = { workDir: '/tmp' }
+    proc.collabAgentNames = new Map()
+    proc.collabAgentSettled = new Set()
+    proc.collabAgentSummaries = new Map()
+    proc.emit = (event: string, payload: unknown) => {
+      events.push([event, payload])
+      return true
+    }
+
+    const startedItem = {
+      type: 'subAgentActivity',
+      id: 'call_a',
+      kind: 'started',
+      agentThreadId: 'agent-r',
+      agentPath: '/root/final_review',
+    }
+    proc.handleNotification('item/started', { item: startedItem, threadId: 'm', turnId: 't' })
+    proc.handleNotification('item/completed', {
+      item: {
+        type: 'collabAgentToolCall',
+        id: 'w1',
+        tool: 'wait',
+        status: 'completed',
+        agentsStates: { 'agent-r': { status: 'completed', message: '初审完成' } },
+      },
+      threadId: 'm', turnId: 't',
+    })
+    expect(events.filter(([e]) => e === 'bg_task_settled')).toHaveLength(1)
+
+    // followup_task:agent 重新 running → 补 started+promote 让沉降后已清空的
+    // entry 重新入池,running patch 翻活墓碑。
+    proc.handleNotification('item/completed', {
+      item: {
+        type: 'collabAgentToolCall',
+        id: 'w2',
+        tool: 'sendInput',
+        status: 'completed',
+        agentsStates: { 'agent-r': { status: 'running', message: null } },
+      },
+      threadId: 'm', turnId: 't',
+    })
+    const tail = events.filter(([e]) => e.startsWith('bg_task')).slice(-3)
+    expect(tail.map(([e]) => e)).toEqual(['bg_task_started', 'bg_task_updated', 'bg_task_updated'])
+    expect(tail[0][1].description).toBe('final_review')
+    expect(tail[2][1].patch).toEqual({ status: 'running' })
+
+    // 第二次完成 → 重新结算,summary 换新。
+    proc.handleNotification('item/completed', {
+      item: {
+        type: 'collabAgentToolCall',
+        id: 'w3',
+        tool: 'wait',
+        status: 'completed',
+        agentsStates: { 'agent-r': { status: 'completed', message: '复审完成' } },
+      },
+      threadId: 'm', turnId: 't',
+    })
+    const settled = events.filter(([e]) => e === 'bg_task_settled')
+    expect(settled).toHaveLength(2)
+    expect(settled[1][1].summary).toBe('复审完成')
+  })
+})
+
+describe('codex collab closeAgent and terminal-first edge cases', () => {
+  function makeProc(): { proc: any; events: Array<[string, any]> } {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const events: Array<[string, any]> = []
+    proc.opts = { workDir: '/tmp' }
+    proc.collabAgentNames = new Map()
+    proc.collabAgentSettled = new Set()
+    proc.collabAgentSummaries = new Map()
+    proc.emit = (event: string, payload: unknown) => {
+      events.push([event, payload])
+      return true
+    }
+    return { proc, events }
+  }
+
+  test('closeAgent settles receivers as stopped even when snapshot says running', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/started', {
+      item: {
+        type: 'subAgentActivity', id: 'sa1', kind: 'started',
+        agentThreadId: 'ag-1', agentPath: '/root/worker',
+      },
+      threadId: 'm', turnId: 't',
+    })
+    proc.handleNotification('item/completed', {
+      item: {
+        type: 'collabAgentToolCall', id: 'c1', tool: 'closeAgent', status: 'completed',
+        receiverThreadIds: ['ag-1'],
+        agentsStates: { 'ag-1': { status: 'running', message: null } },
+      },
+      threadId: 'm', turnId: 't',
+    })
+    const settled = events.filter(([e]) => e === 'bg_task_settled')
+    expect(settled).toEqual([['bg_task_settled', { task_id: 'ag-1', status: 'stopped' }]])
+  })
+
+  test('terminal-first agent: started+promoted+settled in one item, no running patch after settle', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/completed', {
+      item: {
+        type: 'collabAgentToolCall', id: 'w9', tool: 'wait', status: 'completed',
+        receiverThreadIds: ['ag-fast'],
+        agentsStates: { 'ag-fast': { status: 'completed', message: '秒完' } },
+      },
+      threadId: 'm', turnId: 't',
+    })
+    const kinds = events.filter(([e]) => e.startsWith('bg_task')).map(([e]) => e)
+    expect(kinds).toEqual(['bg_task_started', 'bg_task_updated', 'bg_task_settled'])
+  })
+
+  test('spawn-first uses placeholder name; subAgentActivity later patches real name', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/started', {
+      item: {
+        type: 'collabAgentToolCall', id: 'sp1', tool: 'spawnAgent', status: 'inProgress',
+        receiverThreadIds: ['ag-2'], prompt: 'gAAAAABciphertext',
+        agentsStates: { 'ag-2': { status: 'running', message: null } },
+      },
+      threadId: 'm', turnId: 't',
+    })
+    const firstStarted = events.find(([e]) => e === 'bg_task_started')!
+    expect(firstStarted[1].description).toBe('子 agent')
+    expect(firstStarted[1].prompt).toBe('(继承主线程历史的密文任务书)')
+
+    proc.handleNotification('item/started', {
+      item: {
+        type: 'subAgentActivity', id: 'sa2', kind: 'started',
+        agentThreadId: 'ag-2', agentPath: '/root/etl/orders',
+      },
+      threadId: 'm', turnId: 't',
+    })
+    const starteds = events.filter(([e]) => e === 'bg_task_started')
+    expect(starteds).toHaveLength(2)
+    expect(starteds[1][1].description).toBe('orders')
+  })
+})
+
+describe('codex subagent item filtering (main-card cleanliness)', () => {
+  function makeProc(): { proc: any; events: Array<[string, any]> } {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const events: Array<[string, any]> = []
+    proc.opts = { workDir: '/tmp' }
+    proc.collabAgentNames = new Map()
+    proc.collabAgentSettled = new Set()
+    proc.collabAgentSummaries = new Map()
+    proc.sessionId = 'main-thread'
+    proc.emit = (event: string, payload: unknown) => {
+      events.push([event, payload])
+      return true
+    }
+    return { proc, events }
+  }
+
+  test('subagent-thread commandExecution becomes subagent_step, not tool_use', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/started', {
+      item: { type: 'commandExecution', id: 'exec-1', command: 'pytest -q', cwd: '/tmp' },
+      threadId: 'sub-thread-1',
+      turnId: 'turn-1',
+    })
+    proc.handleNotification('item/completed', {
+      item: { type: 'commandExecution', id: 'exec-1', command: 'pytest -q', aggregatedOutput: '3 passed', exitCode: 0 },
+      threadId: 'sub-thread-1',
+      turnId: 'turn-1',
+    })
+    expect(events.filter(([e]) => e === 'tool_use')).toHaveLength(0)
+    const steps = events.filter(([e]) => e === 'subagent_step')
+    expect(steps).toHaveLength(2)
+    expect(steps[0][1]).toMatchObject({ thread_id: 'sub-thread-1', tool: 'Bash', phase: 'started' })
+    expect(steps[1][1]).toMatchObject({
+      thread_id: 'sub-thread-1', tool: 'Bash', phase: 'completed', brief: '→ 3 passed',
+    })
+  })
+
+  test('subagent Bash step brief unwraps PowerShell-wrapped desc command', () => {
+    // Windows 上 Codex 把命令包进 powershell.exe 调用,子 agent 后台卡 steps
+    // 的 brief 也要显示中文说明,不显示 powershell.exe 路径。
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/started', {
+      item: {
+        type: 'commandExecution', id: 'exec-ps', cwd: 'C:\\repo',
+        command: `'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -Command '# desc: 查看模板目录状态\nGet-ChildItem "C:\\repo\\templates" -Recurse'`,
+      },
+      threadId: 'sub-thread-1',
+      turnId: 'turn-1',
+    })
+    const steps = events.filter(([e]) => e === 'subagent_step')
+    expect(steps).toHaveLength(1)
+    expect((steps[0][1] as any).brief).toBe('查看模板目录状态')
+  })
+
+  test('subagent agentMessage does not leak into main assistant stream', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/completed', {
+      item: { type: 'agentMessage', id: 'msg-sub', text: '子 agent 阶段性输出' },
+      threadId: 'sub-thread-1',
+      turnId: 'turn-1',
+    })
+    expect(events.filter(([e]) => e === 'assistant_block_stop')).toHaveLength(0)
+    // 主线程的 agentMessage 不受影响
+    proc.handleNotification('item/completed', {
+      item: { type: 'agentMessage', id: 'msg-main', text: '主线程正文' },
+      threadId: 'main-thread',
+      turnId: 'turn-1',
+    })
+    expect(events.filter(([e]) => e === 'assistant_block_stop')).toHaveLength(1)
+  })
+
+  test('main-thread commandExecution still emits tool_use (unchanged behavior)', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/started', {
+      item: { type: 'commandExecution', id: 'exec-2', command: 'ls', cwd: '/tmp' },
+      threadId: 'main-thread',
+      turnId: 'turn-1',
+    })
+    expect(events.filter(([e]) => e === 'tool_use')).toHaveLength(1)
+  })
+})
+
+describe('codex subagent step filtering', () => {
+  test('reasoning items produce no subagent_step (step budget reserved for tools)', () => {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const events: Array<[string, any]> = []
+    proc.opts = { workDir: '/tmp' }
+    proc.collabAgentNames = new Map()
+    proc.collabAgentSettled = new Set()
+    proc.collabAgentSummaries = new Map()
+    proc.sessionId = 'main-thread'
+    proc.emit = (event: string, payload: unknown) => {
+      events.push([event, payload])
+      return true
+    }
+    for (const phase of ['item/started', 'item/completed'] as const) {
+      proc.handleNotification(phase, {
+        item: { type: 'reasoning', id: 'rs-1', summary: [], content: ['思考中…'] },
+        threadId: 'sub-thread-1',
+        turnId: 't',
+      })
+    }
+    // reasoning 完成也不出 step
+    expect(events.filter(([e]) => e === 'subagent_step')).toHaveLength(0)
+  })
+})
+
+describe('codex exec-cell orchestration via thread/status/changed', () => {
+  function makeProc(): { proc: any; events: Array<[string, any]> } {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const events: Array<[string, any]> = []
+    proc.opts = { workDir: '/tmp' }
+    proc.collabAgentNames = new Map()
+    proc.collabAgentSettled = new Set()
+    proc.collabAgentSummaries = new Map()
+    proc.collabAgentWasActive = new Set()
+    proc.sessionId = 'main-thread'
+    proc.emit = (event: string, payload: unknown) => {
+      events.push([event, payload])
+      return true
+    }
+    return { proc, events }
+  }
+
+  test('idle(create)→active→idle(complete) settles as completed; create-idle does not', () => {
+    const { proc, events } = makeProc()
+    // spawn 信号(subAgentActivity)先到
+    proc.handleNotification('item/started', {
+      item: { type: 'subAgentActivity', id: 'sa', kind: 'started', agentThreadId: 'ag-x', agentPath: '/root/etl' },
+      threadId: 'main-thread', turnId: 't',
+    })
+    // 创建态 idle:不结算
+    proc.handleNotification('thread/status/changed', { threadId: 'ag-x', status: { type: 'idle' } })
+    expect(events.filter(([e]) => e === 'bg_task_settled')).toHaveLength(0)
+    // active:running
+    proc.handleNotification('thread/status/changed', { threadId: 'ag-x', status: { type: 'active', activeFlags: [] } })
+    // 完成态 idle:结算 completed
+    proc.handleNotification('thread/status/changed', { threadId: 'ag-x', status: { type: 'idle' } })
+    const settled = events.filter(([e]) => e === 'bg_task_settled')
+    expect(settled).toEqual([['bg_task_settled', { task_id: 'ag-x', status: 'completed' }]])
+  })
+
+  test('revive after idle: second active re-enters pool and settles again', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/started', {
+      item: { type: 'subAgentActivity', id: 'sa', kind: 'started', agentThreadId: 'ag-y', agentPath: '/root/rev' },
+      threadId: 'main-thread', turnId: 't',
+    })
+    proc.handleNotification('thread/status/changed', { threadId: 'ag-y', status: { type: 'active' } })
+    proc.handleNotification('thread/status/changed', { threadId: 'ag-y', status: { type: 'idle' } })
+    // 复活:followup 再拉起 → settled 清除,重新入池 running
+    proc.handleNotification('thread/status/changed', { threadId: 'ag-y', status: { type: 'active' } })
+    const revived = events.filter(([e]) => e === 'bg_task_settled')
+    expect(revived).toHaveLength(1) // 尚未第二次 idle
+    const lastStarted = events.filter(([e]) => e === 'bg_task_started').at(-1)!
+    expect(lastStarted[1].description).toBe('rev')
+    proc.handleNotification('thread/status/changed', { threadId: 'ag-y', status: { type: 'idle' } })
+    expect(events.filter(([e]) => e === 'bg_task_settled')).toHaveLength(2)
+  })
+
+  test('main-thread and unknown-thread status changes are ignored', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('thread/status/changed', { threadId: 'main-thread', status: { type: 'active' } })
+    proc.handleNotification('thread/status/changed', { threadId: 'unknown-ag', status: { type: 'active' } })
+    expect(events.filter(([e]) => e.startsWith('bg_task'))).toHaveLength(0)
+  })
+})
+
+describe('codex review-round-3 fixes', () => {
+  function makeProc(): { proc: any; events: Array<[string, any]> } {
+    const proc = Object.create(CodexProcess.prototype) as any
+    const events: Array<[string, any]> = []
+    proc.opts = { workDir: '/tmp' }
+    proc.collabAgentNames = new Map()
+    proc.collabAgentSettled = new Set()
+    proc.collabAgentSummaries = new Map()
+    proc.collabAgentWasActive = new Set()
+    proc.sessionId = 'main-thread'
+    proc.emit = (event: string, payload: unknown) => {
+      events.push([event, payload])
+      return true
+    }
+    return { proc, events }
+  }
+
+  test('child turn/completed does not emit main result (entry-level threadId filter)', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('turn/completed', {
+      threadId: 'sub-thread',
+      turn: { id: 'turn-sub', status: 'completed', durationMs: 1000 },
+    })
+    expect(events.filter(([e]) => e === 'result')).toHaveLength(0)
+    // 主线程 turn 照常
+    proc.handleNotification('turn/completed', {
+      threadId: 'main-thread',
+      turn: { id: 'turn-main', status: 'completed', durationMs: 2000 },
+    })
+    expect(events.filter(([e]) => e === 'result')).toHaveLength(1)
+  })
+
+  test('child agentMessage/delta does not emit assistant_text', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/agentMessage/delta', {
+      threadId: 'sub-thread', turnId: 't', itemId: 'msg-sub', delta: '子agent输出',
+    })
+    expect(events.filter(([e]) => e === 'assistant_text')).toHaveLength(0)
+    proc.handleNotification('item/agentMessage/delta', {
+      threadId: 'main-thread', turnId: 't', itemId: 'msg-main', delta: '主线程正文',
+    })
+    expect(events.filter(([e]) => e === 'assistant_text')).toHaveLength(1)
+  })
+
+  test('child tokenUsage does not overwrite main-thread usage', () => {
+    const { proc, events } = makeProc()
+    proc.lastUsage = { total_tokens: 999 }
+    proc.handleNotification('thread/tokenUsage/updated', {
+      threadId: 'sub-thread', turnId: 't',
+      tokenUsage: { last: { totalTokens: 1 }, total: { totalTokens: 2 } },
+    })
+    expect(events.filter(([e]) => e === 'token_usage')).toHaveLength(0)
+    expect(proc.lastUsage.total_tokens).toBe(999)
+  })
+
+  test('systemError settles as failed; agentMessage text becomes settle summary', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/started', {
+      item: { type: 'subAgentActivity', id: 'sa', kind: 'started', agentThreadId: 'ag-e', agentPath: '/root/review' },
+      threadId: 'main-thread', turnId: 't',
+    })
+    proc.handleNotification('item/completed', {
+      item: { type: 'agentMessage', id: 'm1', text: '审查结论:发现 2 处问题' },
+      threadId: 'ag-e', turnId: 't',
+    })
+    proc.handleNotification('thread/status/changed', { threadId: 'ag-e', status: { type: 'active' } })
+    proc.handleNotification('thread/status/changed', { threadId: 'ag-e', status: { type: 'systemError' } })
+    const settled = events.filter(([e]) => e === 'bg_task_settled')
+    expect(settled).toEqual([['bg_task_settled', {
+      task_id: 'ag-e', status: 'failed', summary: '审查结论:发现 2 处问题',
+    }]])
+  })
+
+  test('authoritative agentsStates terminal corrects fallback completed into failed', () => {
+    const { proc, events } = makeProc()
+    proc.handleNotification('item/started', {
+      item: { type: 'subAgentActivity', id: 'sa', kind: 'started', agentThreadId: 'ag-c', agentPath: '/root/x' },
+      threadId: 'main-thread', turnId: 't',
+    })
+    // idle 兜底先结算成 completed
+    proc.handleNotification('thread/status/changed', { threadId: 'ag-c', status: { type: 'active' } })
+    proc.handleNotification('thread/status/changed', { threadId: 'ag-c', status: { type: 'idle' } })
+    // 权威 agentsStates 随后带 errored → 墓碑纠正为 failed,不翻活
+    proc.handleNotification('item/completed', {
+      item: {
+        type: 'collabAgentToolCall', id: 'w', tool: 'wait', status: 'completed',
+        agentsStates: { 'ag-c': { status: 'errored', message: 'boom' } },
+      },
+      threadId: 'main-thread', turnId: 't',
+    })
+    expect(events.filter(([e]) => e === 'bg_task_settled')).toHaveLength(1)
+    const corrections = events.filter(([e, p]) => e === 'bg_task_updated' && (p as any).patch?.status === 'failed')
+    expect(corrections).toHaveLength(1)
+    expect((corrections[0][1] as any).patch.error).toBe('boom')
+  })
+
+  test('late subAgentActivity name patch does not revive a settled task', () => {
+    const { proc, events } = makeProc()
+    // spawn-first 占位
+    proc.handleNotification('item/started', {
+      item: {
+        type: 'collabAgentToolCall', id: 'sp', tool: 'spawnAgent', status: 'inProgress',
+        receiverThreadIds: ['ag-l'], agentsStates: { 'ag-l': { status: 'running', message: null } },
+      },
+      threadId: 'main-thread', turnId: 't',
+    })
+    // 结算
+    proc.handleNotification('thread/status/changed', { threadId: 'ag-l', status: { type: 'active' } })
+    proc.handleNotification('thread/status/changed', { threadId: 'ag-l', status: { type: 'idle' } })
+    const settledBefore = events.filter(([e]) => e === 'bg_task_settled').length
+    // 晚到的 subAgentActivity(started)带真名 —— 只改 map,不发 started(不复活)
+    proc.handleNotification('item/started', {
+      item: { type: 'subAgentActivity', id: 'sa-late', kind: 'started', agentThreadId: 'ag-l', agentPath: '/root/real_name' },
+      threadId: 'main-thread', turnId: 't',
+    })
+    expect(events.filter(([e]) => e === 'bg_task_settled').length).toBe(settledBefore)
+    const starteds = events.filter(([e]) => e === 'bg_task_started')
+    expect(starteds.length).toBe(1) // 只有 spawn-first 那次
+  })
+})
+
+
+// ═══════════════════════════════════════════════════════════════════════
+// 以下为本地 fork 独有测试(合并保留):交付回执模型、D-11 委派、D3 输入、
+// 外线程隔离、宽口径容量重试、本地 spawn/登录帮助函数锚。
+// 上游同义测试保留在上方,不重复。
+// ═══════════════════════════════════════════════════════════════════════
+
+// ── 交付模型探针与 turn/start 回执(本地独有)──────────────────────────
 function notificationHarness(): { proc: any; events: Array<[string, any]> } {
   const proc = Object.create(CodexProcess.prototype) as any
   const events: Array<[string, any]> = []
@@ -82,7 +2767,7 @@ function pendingTurnStartFixture(threadId: string): {
 
 function requestFailureTurnStartFixture(
   threadId: string,
-  stdin: { write: (...args: any[]) => unknown },
+  stdin: { write: (...args: any[]) => unknown; writable?: boolean },
 ): { proc: any; resultEvents: any[] } {
   const proc = Object.create(CodexProcess.prototype) as any
   const resultEvents: any[] = []
@@ -353,10 +3038,11 @@ describe('codex turn/start delivery receipt', () => {
     proc.primeRolloutImageGenerationScan = () => {}
     proc.flushRolloutImageGenerations = () => {}
     proc.emit = () => true
+    proc.write = () => null
     proc.request = (method: string, params: any) => {
       requests.push({ method, params })
       // 4185808:thread.path 成为 rollout 权威,init 响应必须带合法路径。
-      if (method === 'thread/start') return Promise.resolve({ thread: { id: 'thread-late-init', path: '/tmp/rollouts/thread-late-init.jsonl' } })
+      if (method === 'thread/start') return Promise.resolve({ thread: { id: 'thread-late-init', cwd: '/tmp', path: '/tmp/rollouts/thread-late-init.jsonl' } })
       if (method === 'turn/start') return turnStart.promise
       return Promise.resolve({})
     }
@@ -399,6 +3085,7 @@ describe('codex turn/start delivery receipt', () => {
     proc.emittedImageGenerationIds = new Set()
     proc.readyPromise = new Promise<void>(() => {})
     proc.emit = () => true
+    proc.write = () => null
 
     const dispatch = proc.sendUserText('doomed hello') as any
     expect(dispatch.kind).toBe('turn_start_pending')
@@ -410,310 +3097,6 @@ describe('codex turn/start delivery receipt', () => {
       deliveryId: dispatch.deliveryId,
       threadId: null,
     })
-  })
-})
-
-describe('codex process compaction notifications', () => {
-  test('detects explicit thread compaction notifications', () => {
-    const notice = contextCompactionNoticeFromNotification('thread/compacted', {
-      threadId: 'thread-1',
-      turnId: 'turn-1',
-    })
-
-    expect(notice?.sourceMethod).toBe('thread/compacted')
-    expect(notice?.threadId).toBe('thread-1')
-    expect(notice?.turnId).toBe('turn-1')
-  })
-
-  test('detects Codex event messages persisted as context_compacted', () => {
-    const notice = contextCompactionNoticeFromNotification('event_msg', {
-      type: 'context_compacted',
-    })
-
-    expect(notice?.sourceMethod).toBe('event_msg')
-    expect(notice?.sourceType).toBe('context_compacted')
-    expect(notice?.phase).toBe('end')
-  })
-
-  test('detects raw compacted records with replacement history', () => {
-    const notice = contextCompactionNoticeFromMessage({
-      timestamp: '2026-06-03T16:03:16.331Z',
-      type: 'compacted',
-      payload: {
-        message: '',
-        replacement_history: [
-          { type: 'message', role: 'user', content: [{ type: 'input_text', text: '旧消息' }] },
-        ],
-      },
-    })
-
-    expect(notice?.sourceMethod).toBe('compacted')
-    expect(notice?.sourceType).toBe('compacted')
-    expect(notice?.phase).toBe('start')
-    expect(notice?.timestamp).toBe('2026-06-03T16:03:16.331Z')
-    expect(notice?.replacement_history).toHaveLength(1)
-  })
-
-  test('detects raw response compaction items', () => {
-    const notice = contextCompactionNoticeFromNotification('rawResponseItem/completed', {
-      item: {
-        type: 'contextCompaction',
-        id: 'item-1',
-      },
-      threadId: 'thread-2',
-    })
-
-    expect(notice?.sourceMethod).toBe('rawResponseItem/completed')
-    expect(notice?.sourceType).toBe('contextCompaction')
-    expect(notice?.phase).toBe('end')
-    expect(notice?.itemId).toBe('item-1')
-    expect(notice?.threadId).toBe('thread-2')
-  })
-
-  test('marks live app-server context compaction item start and completion', () => {
-    const started = contextCompactionNoticeFromNotification('item/started', {
-      item: {
-        type: 'contextCompaction',
-        id: 'compact-1',
-      },
-      threadId: 'thread-3',
-      turnId: 'turn-3',
-    })
-    const completed = contextCompactionNoticeFromNotification('item/completed', {
-      item: {
-        type: 'contextCompaction',
-        id: 'compact-1',
-        replacementHistory: [
-          { type: 'message', role: 'user', content: [{ type: 'input_text', text: '旧消息' }] },
-        ],
-      },
-      threadId: 'thread-3',
-      turnId: 'turn-3',
-    })
-
-    expect(started?.phase).toBe('start')
-    expect(started?.itemId).toBe('compact-1')
-    expect(started?.threadId).toBe('thread-3')
-    expect(completed?.phase).toBe('end')
-    expect(completed?.itemId).toBe('compact-1')
-    expect(completed?.replacementHistory).toHaveLength(1)
-  })
-
-  test('ignores unrelated notifications', () => {
-    expect(contextCompactionNoticeFromNotification('thread/settings/updated', {
-      threadSettings: { model: 'gpt-5' },
-    })).toBeNull()
-  })
-
-  test('unmapped app-server notifications are logged without breaking message handling', () => {
-    const proc = Object.create(CodexProcess.prototype) as any
-    const raw: unknown[] = []
-    const compacted: unknown[] = []
-    proc.opts = { workDir: '/tmp' }
-    proc.emit = (event: string, payload: unknown) => {
-      if (event === 'raw') raw.push(payload)
-      if (event === 'context_compacted') compacted.push(payload)
-      return true
-    }
-
-    expect(() => proc.handleNotification('item/started', {
-      item: { type: 'contextCompaction', id: 'compact-2' },
-      threadId: 'thread-4',
-      turnId: 'turn-4',
-    })).not.toThrow()
-    expect(() => proc.handleNotification('thread/status/changed', {
-      threadId: 'thread-4',
-      status: { type: 'idle' },
-    })).not.toThrow()
-    expect(() => proc.handleNotification('item/started', {
-      item: { type: 'reasoning', id: 'rs-1', summary: [], content: [] },
-      threadId: 'thread-4',
-      turnId: 'turn-4',
-    })).not.toThrow()
-    // thread/status/changed 已从高频静默 raw 名单改道 handleThreadStatusChanged
-    // (cf41941):未知线程 no-op,不再 emit raw。
-    expect(raw).toHaveLength(0)
-    expect(compacted).toHaveLength(1)
-  })
-
-  test('ignores child-thread completion and compaction while the primary turn is running', () => {
-    const proc = Object.create(CodexProcess.prototype) as any
-    const events: string[] = []
-    proc.opts = { workDir: '/tmp' }
-    proc.sessionId = 'primary-thread'
-    proc.currentTurnId = 'primary-turn'
-    proc.lastUsage = null
-    proc.emit = (event: string) => {
-      events.push(event)
-      return true
-    }
-
-    proc.handleNotification('thread/started', {
-      thread: { id: 'child-thread' },
-    })
-    proc.handleNotification('turn/started', {
-      threadId: 'child-thread',
-      turn: { id: 'child-turn' },
-    })
-    proc.handleNotification('turn/completed', {
-      threadId: 'child-thread',
-      turn: { id: 'child-turn', status: 'completed' },
-    })
-    proc.handleNotification('item/completed', {
-      threadId: 'child-thread',
-      turnId: 'child-turn',
-      item: { type: 'contextCompaction', id: 'child-compact' },
-    })
-    proc.handleMessage({
-      type: 'context_compacted',
-      threadId: 'child-thread',
-      turnId: 'child-turn',
-    })
-
-    expect(proc.sessionId).toBe('primary-thread')
-    expect(proc.currentTurnId).toBe('primary-turn')
-    expect(events).toEqual([])
-
-    proc.handleNotification('item/completed', {
-      threadId: 'primary-thread',
-      turnId: 'primary-turn',
-      item: { type: 'contextCompaction', id: 'primary-compact' },
-    })
-    proc.handleNotification('turn/completed', {
-      threadId: 'primary-thread',
-      turn: { id: 'primary-turn', status: 'completed' },
-    })
-
-    expect(events).toEqual(['context_compacted', 'result'])
-    expect(proc.currentTurnId).toBeNull()
-  })
-
-  test('uses the requested resume thread as the primary filter before init completes', () => {
-    const proc = Object.create(CodexProcess.prototype) as any
-    proc.opts = {
-      workDir: '/tmp',
-      launch: { kind: 'resume', source: { provider: 'codex', sessionId: 'resume-thread', cwd: '/tmp' } },
-    }
-    proc.sessionId = null
-
-    proc.handleNotification('thread/started', {
-      thread: { id: 'child-thread' },
-    })
-    expect(proc.sessionId).toBeNull()
-
-    proc.handleNotification('thread/started', {
-      thread: { id: 'resume-thread' },
-    })
-    expect(proc.sessionId).toBe('resume-thread')
-  })
-
-  test('rejects child-thread server requests without exposing them to the primary session', () => {
-    const proc = Object.create(CodexProcess.prototype) as any
-    const events: string[] = []
-    const responses: any[] = []
-    proc.opts = { workDir: '/tmp' }
-    proc.sessionId = 'primary-thread'
-    proc.serverRequests = new Map()
-    proc.emit = (event: string) => {
-      events.push(event)
-      return true
-    }
-    proc.write = (response: any) => responses.push(response)
-
-    proc.handleMessage({
-      id: 1,
-      method: 'item/tool/requestUserInput',
-      params: {
-        threadId: 'child-thread',
-        itemId: 'child-ask',
-        questions: [],
-      },
-    })
-
-    expect(events).toEqual([])
-    expect(responses).toEqual([{
-      id: 1,
-      error: { code: -32601, message: 'server request belongs to a child thread' },
-    }])
-    expect(proc.serverRequests.size).toBe(0)
-
-    proc.handleMessage({
-      id: 2,
-      method: 'item/tool/requestUserInput',
-      params: {
-        threadId: 'primary-thread',
-        itemId: 'primary-ask',
-        questions: [],
-      },
-    })
-
-    expect(events).toEqual(['tool_use', 'can_use_tool'])
-    expect(proc.serverRequests.has('2')).toBe(true)
-  })
-
-  test('maps snake_case image generation fields to a sendable result path', () => {
-    const proc = Object.create(CodexProcess.prototype) as any
-    const events: Array<[string, any]> = []
-    proc.opts = { workDir: '/tmp' }
-    proc.emittedImageGenerationIds = new Set()
-    proc.emit = (event: string, payload: unknown) => {
-      events.push([event, payload])
-      return true
-    }
-
-    proc.handleNotification('item/started', {
-      item: {
-        type: 'imageGeneration',
-        id: 'img-1',
-        status: 'inProgress',
-        revised_prompt: 'A cute cat curled up in a sunbeam.',
-      },
-      threadId: 'thread-5',
-      turnId: 'turn-5',
-    })
-    proc.handleNotification('item/completed', {
-      item: {
-        type: 'imageGeneration',
-        id: 'img-1',
-        status: 'completed',
-        revised_prompt: 'A cute cat curled up in a sunbeam.',
-        saved_path: '/tmp/cat.png',
-        result: 'ignored when saved_path exists',
-      },
-      threadId: 'thread-5',
-      turnId: 'turn-5',
-    })
-
-    expect(events).toEqual([
-      ['tool_use', {
-        id: 'img-1',
-        name: 'ImageGeneration',
-        input: {
-          status: 'inProgress',
-          revisedPrompt: 'A cute cat curled up in a sunbeam.',
-        },
-      }],
-      ['tool_result', {
-        tool_use_id: 'img-1',
-        content: '/tmp/cat.png',
-        is_error: false,
-      }],
-    ])
-  })
-
-  test('materializes inline base64 image generation results to a sendable file path', () => {
-    const root = mkdtempSync(join(tmpdir(), 'lodestar-imggen-'))
-    try {
-      const output = imageGenerationOutput({
-        call_id: 'ig-inline',
-        result: 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=',
-      }, 'thread-inline', root)
-
-      expect(output).toBe(join(root, 'thread-inline', 'ig-inline.png'))
-      expect(readFileSync(output).subarray(0, 8)).toEqual(Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]))
-    } finally {
-      rmSync(root, { recursive: true, force: true })
-    }
   })
 })
 
@@ -933,117 +3316,8 @@ describe('codex structured progress notifications', () => {
   })
 })
 
-describe('codex 多 agent collab→bg 翻译状态机(上游 cf41941)', () => {
-  test('exec-cell 生命周期:spawn→创建 idle 不结算→active→agentMessage 采集→idle 结算 completed(summary 墓碑)→重复 idle 去重', () => {
-    const { proc, events } = notificationHarness()
-    proc.handleNotification('item/started', {
-      threadId: 'thread-structured',
-      item: { type: 'subAgentActivity', id: 'act-1', kind: 'started', agentThreadId: 'sub-1', agentPath: '/root/order/worker' },
-    })
-    expect(events).toEqual([
-      ['subagent_activity', { activityId: 'act-1', agentThreadId: 'sub-1', agentPath: '/root/order/worker', kind: 'started' }],
-      ['bg_task_started', { task_id: 'sub-1', task_type: 'local_agent', description: 'worker' }],
-      ['bg_task_updated', { task_id: 'sub-1', patch: { is_backgrounded: true } }],
-    ])
-    events.length = 0
-
-    // 首个 idle 是创建态(spawn 后未开跑):没见过 active 不结算。
-    proc.handleNotification('thread/status/changed', { threadId: 'sub-1', status: { type: 'idle' } })
-    expect(events).toEqual([])
-
-    proc.handleNotification('thread/status/changed', { threadId: 'sub-1', status: { type: 'active' } })
-    expect(events).toEqual([['bg_task_updated', { task_id: 'sub-1', patch: { status: 'running' } }]])
-    events.length = 0
-
-    // 外线程 agentMessage:捕获末段文本作 summary,不出 step、不进主卡。
-    proc.handleNotification('item/completed', {
-      threadId: 'sub-1',
-      item: { type: 'agentMessage', id: 'am-1', text: '结论:全部通过' },
-    })
-    expect(events).toEqual([])
-
-    proc.handleNotification('thread/status/changed', { threadId: 'sub-1', status: { type: 'idle' } })
-    expect(events).toEqual([['bg_task_settled', { task_id: 'sub-1', status: 'completed', summary: '结论:全部通过' }]])
-    events.length = 0
-
-    // 重复终态快照:settled 去重。
-    proc.handleNotification('thread/status/changed', { threadId: 'sub-1', status: { type: 'idle' } })
-    expect(events).toEqual([])
-  })
-
-  test('systemError 结算 failed;followup 复活(active 再临)清标记重新入池', () => {
-    const { proc, events } = notificationHarness()
-    proc.handleNotification('item/started', {
-      threadId: 'thread-structured',
-      item: { type: 'subAgentActivity', id: 'act-2', kind: 'started', agentThreadId: 'sub-2', agentPath: '/root/fixer' },
-    })
-    proc.handleNotification('thread/status/changed', { threadId: 'sub-2', status: { type: 'active' } })
-    events.length = 0
-
-    proc.handleNotification('thread/status/changed', { threadId: 'sub-2', status: { type: 'systemError' } })
-    expect(events).toEqual([['bg_task_settled', { task_id: 'sub-2', status: 'failed', summary: undefined }]])
-    events.length = 0
-
-    // 复活:closeAgent/终态后线程重新 active → 清 settled 标记 + 重新入池 + running。
-    proc.handleNotification('thread/status/changed', { threadId: 'sub-2', status: { type: 'active' } })
-    expect(events).toEqual([
-      ['bg_task_started', { task_id: 'sub-2', task_type: 'local_agent', description: 'fixer' }],
-      ['bg_task_updated', { task_id: 'sub-2', patch: { is_backgrounded: true } }],
-      ['bg_task_updated', { task_id: 'sub-2', patch: { status: 'running' } }],
-    ])
-    events.length = 0
-
-    proc.handleNotification('thread/status/changed', { threadId: 'sub-2', status: { type: 'idle' } })
-    expect(events).toEqual([['bg_task_settled', { task_id: 'sub-2', status: 'completed', summary: undefined }]])
-  })
-
-  test('未知线程的 thread/status/changed 不驱动后台卡(主线程/未 spawn 线程)', () => {
-    const { proc, events } = notificationHarness()
-    proc.handleNotification('thread/status/changed', { threadId: 'thread-structured', status: { type: 'active' } })
-    proc.handleNotification('thread/status/changed', { threadId: 'sub-unknown', status: { type: 'active' } })
-    expect(events).toEqual([])
-  })
-
-  test('spawn-first 占位名入卡(密文任务书归一)+ subAgentActivity 后到补名', () => {
-    const { proc, events } = notificationHarness()
-    const fernet = 'gAAAAB' + 'x'.repeat(60)
-    proc.handleNotification('item/started', {
-      threadId: 'thread-structured',
-      item: {
-        type: 'collabAgentToolCall',
-        id: 'collab-9',
-        tool: 'spawnAgent',
-        status: 'inProgress',
-        prompt: fernet,
-        model: 'gpt-5.6-sol',
-        receiverThreadIds: ['sub-9'],
-        agentsStates: { 'sub-9': { status: 'pendingInit' } },
-      },
-    })
-    expect(events).toEqual([
-      ['bg_task_started', { task_id: 'sub-9', task_type: 'local_agent', description: '子 agent', prompt: '(继承主线程历史的密文任务书)' }],
-      ['bg_task_updated', { task_id: 'sub-9', patch: { is_backgrounded: true } }],
-      ['bg_task_updated', { task_id: 'sub-9', patch: { status: 'pending' } }],
-      // spawn 在主卡留一行摘要面板 —— prompt 密文归一,description 写「派生 N 个子 agent」。
-      ['tool_use', {
-        id: 'collab-9',
-        name: 'Agent',
-        input: { tool: 'spawnAgent', prompt: '(继承主线程历史的密文任务书)', description: '派生 1 个子 agent', model: 'gpt-5.6-sol' },
-      }],
-    ])
-    events.length = 0
-
-    // agentPath 真名后到:已知 id 补名(仅 started patch,不重发 is_backgrounded)。
-    proc.handleNotification('item/started', {
-      threadId: 'thread-structured',
-      item: { type: 'subAgentActivity', id: 'act-9', kind: 'started', agentThreadId: 'sub-9', agentPath: '/root/order/writer' },
-    })
-    expect(events).toEqual([
-      ['subagent_activity', { activityId: 'act-9', agentThreadId: 'sub-9', agentPath: '/root/order/writer', kind: 'started' }],
-      ['bg_task_started', { task_id: 'sub-9', task_type: 'local_agent', description: 'writer' }],
-    ])
-  })
-
+// ── collab 状态机 fork 叠加锚(cf41941)────────────────────────────────
+describe('codex collab 状态机 fork 叠加锚(cf41941)', () => {
   test('timeline 压缩:wait/sendInput 编排调用不出面板;spawn completed 出摘要 result;closeAgent 强制结算 receiver', () => {
     const { proc, events } = notificationHarness()
     proc.handleNotification('item/started', {
@@ -1115,409 +3389,12 @@ describe('codex 多 agent collab→bg 翻译状态机(上游 cf41941)', () => {
     expect(events).toEqual([])
   })
 
-  test('subagent Bash step brief unwraps PowerShell-wrapped desc command', () => {
-    // Windows 上 Codex 把命令包进 powershell.exe 调用,子 agent 后台卡 steps
-    // 的 brief 也要显示中文说明,不显示 powershell.exe 路径。
-    const { proc, events } = notificationHarness()
-    proc.handleNotification('item/started', {
-      item: {
-        type: 'commandExecution', id: 'exec-ps', cwd: 'C:\\repo',
-        command: `'C:\\Windows\\System32\\WindowsPowerShell\\v1.0\\powershell.exe' -Command '# desc: 查看模板目录状态\nGet-ChildItem "C:\\repo\\templates" -Recurse'`,
-      },
-      threadId: 'sub-thread-1',
-      turnId: 'turn-1',
-    })
-    const steps = events.filter(([e]) => e === 'subagent_step')
-    expect(steps).toHaveLength(1)
-    expect((steps[0][1] as any).brief).toBe('查看模板目录状态')
-  })
-
   test('外线程其余事件(turn/delta/usage)仍全吞掉,不冒充主轮信号', () => {
     const { proc, events } = notificationHarness()
     proc.handleNotification('turn/completed', { threadId: 'sub-y', turn: { id: 't-y', status: 'completed' } })
     proc.handleNotification('item/agentMessage/delta', { threadId: 'sub-y', itemId: 'am-y', delta: '子 agent 正文' })
     proc.handleNotification('thread/tokenUsage/updated', { threadId: 'sub-y', tokenUsage: { last: { totalTokens: 9 } } })
     expect(events).toEqual([])
-  })
-})
-
-// ── 上游 ec149d7 主题 H:控制面加固 ─────────────────────────────────
-// 30s 控制请求超时 / write 前置可写检查 / rejectPendingRequests /
-// SIGTERM→SIGKILL waitForExit / rollout StringDecoder+remainder。
-function makeCodexLifecycleHarness(stdinOverrides: Record<string, unknown> = {}): any {
-  const proc = Object.create(CodexProcess.prototype) as any
-  proc.alive = true
-  proc.expectedExit = false
-  proc.requestCounter = 0
-  proc.pending = new Map()
-  proc.serverRequests = new Map()
-  proc.stdinErrorListenerAttached = true
-  proc.proc = {
-    stdin: {
-      destroyed: false,
-      writableEnded: false,
-      writable: true,
-      write: () => true,
-      ...stdinOverrides,
-    },
-    kill: () => true,
-  }
-  proc.exitPromise = new Promise<void>(resolve => { proc.resolveExit = resolve })
-  return proc
-}
-
-/** bun 1.3.5 对「await 永不 settle 的 promise + per-test timeout」会忙旋而非判超时
- *  (本仓实测 88% CPU 挂死)—— 用 race 包住被测 promise,悬挂时测试自身仍快速失败。 */
-async function settlementWithin(promise: Promise<unknown>, timeoutMs = 500): Promise<string> {
-  let timer: ReturnType<typeof setTimeout> | null = null
-  try {
-    return await Promise.race([
-      promise.then(() => 'resolved', (e: Error) => `rejected: ${e.message}`),
-      new Promise<string>(resolve => {
-        timer = setTimeout(() => resolve('hung'), timeoutMs)
-      }),
-    ])
-  } finally {
-    if (timer) clearTimeout(timer)
-  }
-}
-
-describe('codex JSON-RPC 控制面可靠性(上游 ec149d7 主题 H)', () => {
-  test('未答控制请求按超时拒绝并从 pending 移除', async () => {
-    const proc = makeCodexLifecycleHarness()
-
-    const outcome = await settlementWithin(proc.request('thread/start', {}, 5))
-    expect(outcome).toContain('timed out after 5ms')
-    expect(proc.pending.size).toBe(0)
-  })
-
-  test('stdin 不可写时同步拒绝,不留悬挂 pending', async () => {
-    const proc = makeCodexLifecycleHarness({ writable: false })
-
-    const outcome = await settlementWithin(proc.request('initialize', {}, 20))
-    expect(outcome).toContain('stdin is not writable')
-    expect(proc.pending.size).toBe(0)
-  })
-
-  test('SIGTERM/SIGKILL 都杀不死时 kill 如实拒绝,不静默返回', async () => {
-    const proc = makeCodexLifecycleHarness()
-    const signals: string[] = []
-    proc.proc.kill = (signal: string) => {
-      signals.push(signal)
-      return true
-    }
-
-    await expect(proc.kill(2)).rejects.toThrow('did not exit after SIGTERM and SIGKILL')
-    expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
-  })
-
-  test('先注册 pending 再写,响应到达清 pending 与超时定时器', async () => {
-    let written = ''
-    const proc = makeCodexLifecycleHarness({
-      write: (chunk: string) => {
-        written = chunk
-        const id = JSON.parse(chunk).id
-        proc.handleMessage({ id, result: { ok: true } })
-        return true
-      },
-    })
-
-    await expect(proc.request('model/list', {}, 20)).resolves.toEqual({ ok: true })
-    expect(JSON.parse(written)).toMatchObject({ id: 1, method: 'model/list' })
-    expect(proc.pending.size).toBe(0)
-  })
-
-  test('异步 stdin 写失败以原始 error 拒绝(EPIPE 可分类),pending 不泄漏', async () => {
-    const epipe = Object.assign(new Error('EPIPE'), { code: 'EPIPE' })
-    const proc = makeCodexLifecycleHarness({
-      write: (_chunk: string, callback: (error?: Error) => void) => {
-        queueMicrotask(() => callback(epipe))
-        return true
-      },
-    })
-
-    const outcome = await settlementWithin(proc.request('initialize', {}, 200))
-    expect(outcome).toContain('EPIPE')
-    expect(proc.pending.size).toBe(0)
-  })
-
-  test('SIGTERM 未死升级 SIGKILL 并等真实 exit 才返回', async () => {
-    const proc = makeCodexLifecycleHarness()
-    const signals: string[] = []
-    proc.proc.kill = (signal: string) => {
-      signals.push(signal)
-      if (signal === 'SIGKILL') {
-        queueMicrotask(() => {
-          proc.alive = false
-          proc.resolveExit()
-        })
-      }
-      return true
-    }
-
-    await expect(proc.kill(5)).resolves.toBeUndefined()
-    expect(signals).toEqual(['SIGTERM', 'SIGKILL'])
-    expect(proc.alive).toBe(false)
-  })
-})
-
-// ── 上游 4185808 主题 D:codex materialization 验证与事件次序纪律 ──────
-// conversationResumable/rollout 路径权威 + thread/read 5s 验证 +
-// conversation_materialized/_materialization_failed 事件 + CodexRpcResponseError
-// 分类 + exit-close drain 次序 + stdin EPIPE 不连坐 + spawn 失败终态化。
-function materializationHarness(workDir: string): {
-  proc: any
-  events: Array<[string, any]>
-  requests: Array<{ method: string; params: any; timeoutMs?: number }>
-} {
-  const proc = Object.create(CodexProcess.prototype) as any
-  const events: Array<[string, any]> = []
-  const requests: Array<{ method: string; params: any; timeoutMs?: number }> = []
-  proc.opts = { workDir, effort: 'high' }
-  proc.sessionId = 'thread-mat'
-  proc.alive = true
-  proc.expectedExit = false
-  proc.pendingTurnStart = null
-  proc.currentTurnId = null
-  proc.lastUsage = null
-  proc.conversationResumable = false
-  proc.conversationRolloutPath = null
-  proc.conversationMaterializationVerification = null
-  proc.conversationMaterializationRetrySource = null
-  proc.lastConversationMaterializationFailure = null
-  proc.emittedImageGenerationIds = new Set()
-  proc.flushRolloutImageGenerations = () => {}
-  proc.emit = (event: string, payload: unknown) => {
-    events.push([event, payload])
-    return true
-  }
-  proc.request = (method: string, params: any, timeoutMs?: number) => {
-    requests.push({ method, params, timeoutMs })
-    return Promise.resolve({
-      thread: { id: proc.sessionId, cwd: workDir, path: proc.conversationRolloutPath, turns: [] },
-    })
-  }
-  return { proc, events, requests }
-}
-
-/** 驱动 materialization 验证收敛:等 barrier(失败吞掉)+ 两拍微任务让
- *  emit/finally 续体跑完。RED 阶段 barrier 方法不存在时为 no-op。 */
-async function drainMaterialization(proc: any): Promise<void> {
-  const barrier = proc.conversationMaterializationBarrier?.()
-  if (barrier) await barrier.catch(() => {})
-  await Promise.resolve()
-  await Promise.resolve()
-}
-
-describe('codex conversation materialization 验证(上游 4185808 主题 D)', () => {
-  test('turn/started 触发 thread/read(10min 超时)验证,rollout 在盘 → conversation_materialized + resumable', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'lodestar-mat-'))
-    try {
-      const rollout = join(root, 'thread-mat.jsonl')
-      writeFileSync(rollout, '{"type":"turn_started"}\n')
-      const { proc, events, requests } = materializationHarness(root)
-      proc.conversationRolloutPath = rollout
-
-      proc.handleNotification('turn/started', { threadId: 'thread-mat', turn: { id: 'turn-1' } })
-      await drainMaterialization(proc)
-
-      expect(requests).toContainEqual({
-        method: 'thread/read',
-        params: { threadId: 'thread-mat', includeTurns: true },
-        timeoutMs: 600000,
-      })
-      expect(events).toContainEqual(['turn_started', { turn_id: 'turn-1', thread_id: 'thread-mat' }])
-      expect(events).toContainEqual([
-        'conversation_materialized',
-        { session_id: 'thread-mat', source: 'turn/started notification' },
-      ])
-      expect(proc.isConversationResumable()).toBe(true)
-      expect(proc.conversationMaterializationFailure()).toBeNull()
-    } finally {
-      rmSync(root, { recursive: true, force: true })
-    }
-  })
-
-  test('rollout 不在盘 → conversation_materialization_failed 可观测且不置 resumable;下一信号重验成功补发 materialized', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'lodestar-mat-fail-'))
-    try {
-      const rollout = join(root, 'thread-mat.jsonl')
-      const { proc, events } = materializationHarness(root)
-      proc.conversationRolloutPath = rollout // 文件不存在:statSync 失败
-
-      proc.handleNotification('turn/started', { threadId: 'thread-mat', turn: { id: 'turn-1' } })
-      await drainMaterialization(proc)
-
-      const failed = events.filter(([name]) => name === 'conversation_materialization_failed')
-      expect(failed).toHaveLength(1)
-      expect(failed[0][1]).toMatchObject({
-        session_id: 'thread-mat',
-        path: rollout,
-        source: 'turn/started notification',
-      })
-      expect(failed[0][1].error).toBeInstanceOf(Error)
-      expect(proc.isConversationResumable()).toBe(false)
-      expect(proc.conversationMaterializationFailure()).toBeInstanceOf(Error)
-
-      // 落盘后同 turn 的下一个 turn/started 重验成功 → materialized 补发。
-      writeFileSync(rollout, '{"type":"turn_started"}\n')
-      proc.handleNotification('turn/started', { threadId: 'thread-mat', turn: { id: 'turn-1' } })
-      await drainMaterialization(proc)
-
-      expect(events).toContainEqual([
-        'conversation_materialized',
-        { session_id: 'thread-mat', source: 'turn/started notification' },
-      ])
-      expect(proc.isConversationResumable()).toBe(true)
-      expect(proc.conversationMaterializationFailure()).toBeNull()
-    } finally {
-      rmSync(root, { recursive: true, force: true })
-    }
-  })
-
-  test('RPC 响应错误分类为 CodexRpcResponseError(method/id/code/message);字符串错误 code=null', async () => {
-    const mod = (await import('./codex-process')) as any
-    const proc = makeCodexLifecycleHarness()
-
-    const first = proc.request('thread/resume', {}, 200)
-    proc.handleMessage({ id: 1, error: { code: -32600, message: 'no rollout found for thread id thread-mat' } })
-    const firstError = await first.then(() => null, (e: Error) => e)
-    expect(firstError).toBeInstanceOf(mod.CodexRpcResponseError)
-    expect(firstError).toMatchObject({
-      name: 'CodexRpcResponseError',
-      method: 'thread/resume',
-      requestId: 1,
-      serverCode: -32600,
-      serverMessage: 'no rollout found for thread id thread-mat',
-    })
-
-    const second = proc.request('thread/read', {}, 200)
-    proc.handleMessage({ id: 2, error: 'boom' })
-    const secondError = await second.then(() => null, (e: Error) => e)
-    expect(secondError).toBeInstanceOf(mod.CodexRpcResponseError)
-    expect(secondError).toMatchObject({ serverCode: null, serverMessage: 'boom' })
-
-    // 传输错误(写失败)保留原始 error 分类(01-09 契约),不得包成 RPC 响应错误。
-    const epipe = Object.assign(new Error('EPIPE'), { code: 'EPIPE' })
-    const transport = makeCodexLifecycleHarness({
-      write: (_chunk: string, callback: (error?: Error) => void) => {
-        queueMicrotask(() => callback(epipe))
-        return true
-      },
-    })
-    const third = transport.request('initialize', {}, 200)
-    const thirdError = await third.then(() => null, (e: Error) => e)
-    expect((thirdError as any).code).toBe('EPIPE')
-    expect(thirdError).not.toBeInstanceOf(mod.CodexRpcResponseError)
-  })
-})
-
-describe('codex exit-close-error 事件次序纪律(上游 4185808 主题 D)', () => {
-  function lifecycleEventHarness(): { proc: any; events: Array<[string, any]> } {
-    const proc = makeCodexLifecycleHarness()
-    const events: Array<[string, any]> = []
-    proc.stdoutBuf = ''
-    proc.stderrBuf = ''
-    proc.exitEventEmitted = false
-    proc.childExitCode = null
-    proc.childExitSignal = null
-    proc.conversationMaterializationVerification = null
-    proc.emit = (event: string, payload: unknown) => {
-      events.push([event, payload])
-      return true
-    }
-    return { proc, events }
-  }
-
-  test('exit 先到不拒未答请求;close 先 drain stdout tail(final response 不丢)再拒真正未答', async () => {
-    const { proc, events } = lifecycleEventHarness()
-    const answered = proc.request('turn/start', {}, 1000)
-    const unanswered = proc.request('model/list', {}, 1000)
-    expect(proc.pending.size).toBe(2)
-
-    proc.handleChildExit(0, null)
-    expect(proc.pending.size).toBe(2) // exit 不拒:final response 可能还在 stdout 缓冲
-    expect(proc.isAlive()).toBe(true) // 公开 exit 事件前所有权仍在
-    expect(events.filter(([name]) => name === 'exit')).toHaveLength(0)
-
-    proc.stdoutBuf = JSON.stringify({ id: 1, result: { turn: { id: 'turn-tail' } } }) // 无尾部换行
-    proc.handleChildClose(0, null)
-
-    expect(await settlementWithin(answered)).toBe('resolved')
-    expect(await settlementWithin(unanswered)).toBe('rejected: codex app-server closed before model/list response (id=2)')
-    expect(events.filter(([name]) => name === 'exit')).toEqual([
-      ['exit', { code: 0, signal: null, expected: false }],
-    ])
-    expect(proc.isAlive()).toBe(false)
-    expect(proc.pending.size).toBe(0)
-  })
-
-  test('stdin error 事件不连坐 pending 表(EPIPE 只由 per-write 回调拒自己的请求)', async () => {
-    const { proc, events } = lifecycleEventHarness()
-    const untouched = proc.request('turn/start', {}, 1000)
-    expect(proc.pending.size).toBe(1)
-
-    proc.handleStdinError(Object.assign(new Error('write EPIPE'), { code: 'EPIPE' }))
-
-    expect(proc.pending.size).toBe(1) // 不连坐:已注册请求保留(等响应/close/超时)
-    expect(await settlementWithin(untouched, 30)).toBe('hung')
-    expect(events.map(([name]) => name)).toEqual(['error'])
-  })
-
-  test('spawn 失败(无 pid)终态化:alive=false + 拒未答 + exit(null,null) 单次', async () => {
-    const { proc, events } = lifecycleEventHarness()
-    proc.proc.pid = undefined
-    const doomed = proc.request('initialize', {}, 1000)
-
-    proc.handleChildProcessError(new Error('spawn codex ENOENT'))
-
-    expect(proc.alive).toBe(false)
-    expect(proc.isAlive()).toBe(false)
-    expect(await settlementWithin(doomed)).toBe(
-      'rejected: codex app-server process failed before initialize response (id=1): spawn codex ENOENT',
-    )
-    expect(events.filter(([name]) => name === 'exit')).toEqual([
-      ['exit', { code: null, signal: null, expected: false }],
-    ])
-  })
-
-  test('OS exit 已见但 stdio 未 close 时,kill 等待 close、超时如实抛出', async () => {
-    const { proc } = lifecycleEventHarness()
-    proc.alive = false // handleChildExit 已跑,close 未到
-    await expect(proc.kill(5)).rejects.toThrow('exited but stdio did not close within 5ms')
-  })
-})
-
-describe('codex rollout 增量读取(StringDecoder+remainder)', () => {
-  test('只读追加字节,半行 JSON 保留 remainder 到下次拼接', () => {
-    const root = mkdtempSync(join(tmpdir(), 'lodestar-rollout-'))
-    const file = join(root, 'rollout.jsonl')
-    try {
-      const proc = Object.create(CodexProcess.prototype) as any
-      const seen: any[] = []
-      proc.sessionId = 'thread-1'
-      proc.rolloutFilePath = file
-      proc.rolloutReadOffset = 0
-      proc.rolloutLineRemainder = ''
-      proc.rolloutDecoder = new StringDecoder('utf8')
-      proc.emitRolloutImageGeneration = (payload: any) => { seen.push(payload) }
-
-      // 多字节 UTF-8(中文 prompt)故意让切点落在字符中间:分段读不裂字。
-      const line = JSON.stringify({ payload: { type: 'image_generation_end', call_id: 'img-1', revisedPrompt: '生成一只柴犬' } })
-      const bytes = Buffer.from(line, 'utf8')
-      const split = bytes.indexOf(Buffer.from('柴', 'utf8')[0]) + 1 // 柴 的首字节后切开
-      writeFileSync(file, bytes.subarray(0, split))
-      proc.flushRolloutImageGenerations()
-      expect(seen).toHaveLength(0)
-      expect(proc.rolloutReadOffset).toBe(split)
-
-      appendFileSync(file, Buffer.concat([bytes.subarray(split), Buffer.from('\n')]))
-      proc.flushRolloutImageGenerations()
-      expect(seen).toEqual([{ type: 'image_generation_end', call_id: 'img-1', revisedPrompt: '生成一只柴犬' }])
-      expect(proc.rolloutReadOffset).toBe(bytes.length + 1)
-    } finally {
-      rmSync(root, { recursive: true, force: true })
-    }
   })
 })
 
@@ -1554,74 +3431,16 @@ describe('codex onStdout 解析与分发分离(cf41941 事故防放大器)', () 
   })
 })
 
-describe('codex token usage helpers', () => {
-  test('parses app-server token usage payloads for last and total snapshots', () => {
-    expect(usageFromTokenUsagePayload({
-      totalTokens: 1200,
-      inputTokens: 900,
-      outputTokens: 300,
-      reasoningOutputTokens: 220,
-      cachedInputTokens: 400,
-    })).toEqual({
-      total_tokens: 1200,
-      input_tokens: 900,
-      output_tokens: 300,
-      reasoning_output_tokens: 220,
-      cache_creation_input_tokens: undefined,
-      cache_read_input_tokens: 400,
-    })
-  })
-
-  test('computes turn aggregate from absolute thread totals', () => {
-    const usage = diffUsageTotals(
-      {
-        total_tokens: 10_000,
-        input_tokens: 7_000,
-        output_tokens: 3_000,
-        reasoning_output_tokens: 1_200,
-        cache_read_input_tokens: 2_800,
-      },
-      {
-        total_tokens: 4_000,
-        input_tokens: 3_100,
-        output_tokens: 900,
-        reasoning_output_tokens: 500,
-        cache_read_input_tokens: 1_200,
-      },
-    )
-
-    expect(usage).toEqual({
-      total_tokens: 6000,
-      input_tokens: 3900,
-      output_tokens: 2100,
-      reasoning_output_tokens: 700,
-      cache_creation_input_tokens: undefined,
-      cache_read_input_tokens: 1600,
-    })
-    expect(effectiveTurnTokens(usage)).toBe(6000)
-    expect(effectiveTurnTokens({ total_tokens: 1234 })).toBe(1234)
-    expect(effectiveTurnTokens(null)).toBeNull()
-  })
-
-  test('clamps negative deltas and treats missing totals as unknown', () => {
-    expect(diffUsageTotals(
-      { input_tokens: 100, output_tokens: 20 },
-      { input_tokens: 120, output_tokens: 10 },
-    )).toEqual({
-      total_tokens: undefined,
-      input_tokens: 0,
-      output_tokens: 10,
-      reasoning_output_tokens: undefined,
-      cache_creation_input_tokens: undefined,
-      cache_read_input_tokens: undefined,
-    })
-    expect(diffUsageTotals(null, null)).toBeNull()
-  })
-})
-
 describe('buildCodexAppServerArgs', () => {
   test('no overrides → bare app-server on stdio', () => {
     expect(buildCodexAppServerArgs([])).toEqual(['app-server', '--listen', 'stdio://'])
+  })
+  test('allowDelegation === false → --disable multi_agent before --listen (fork D-11)', () => {
+    expect(buildCodexAppServerArgs([], false)).toEqual([
+      'app-server',
+      '--disable', 'multi_agent',
+      '--listen', 'stdio://',
+    ])
   })
   test('inserts -c overrides before --listen', () => {
     const args = buildCodexAppServerArgs(['-c', 'model_provider="lodestar_kimi"'])
@@ -1721,7 +3540,15 @@ describe('codex request_user_input 三小件(D3)', () => {
     const proc = Object.create(CodexProcess.prototype) as any
     proc.opts = { workDir: '/tmp', effort: 'high' }
     const params = proc.threadParams()
-    expect(params.config).toEqual({ 'features.default_mode_request_user_input': true })
+    expect(params.config).toEqual({
+      'tools.experimental_request_user_input.enabled': true,
+      'features.default_mode_request_user_input': true,
+      model_reasoning_effort: 'high',
+    })
+    // 单层委派(D-11 口径 3):allowDelegation === false 时 thread 级关闭 multi_agent。
+    const delegated = Object.create(CodexProcess.prototype) as any
+    delegated.opts = { workDir: '/tmp', effort: 'high', allowDelegation: false }
+    expect(delegated.threadParams().config['features.multi_agent']).toBe(false)
   })
 
   test('respondError 带 code:-32601(缺 code 会让 app-server 反序列化失败悬挂)', () => {
@@ -1759,10 +3586,6 @@ describe('codex assistant emit 契约带 parentToolUseId(上游 7c14677-B)', () 
   })
 })
 
-// ── 上游 ff44afb/4185808:ConversationLaunch 三分支映射与 thread/fork 原语 ──
-// launch{fresh|resume|fork} → thread/start|resume|fork RPC 形状;fork 源 id
-// guard(挂账 #7);fork 过 materialization 门 → resumable(launchKind!=='fresh'
-// 门天然覆盖)。resumeSessionId 兼容分支已随 04-03 spawnAgent 翻转删除。
 function launchHarness(
   workDir: string,
   optsExtra: Record<string, unknown>,
@@ -1789,6 +3612,7 @@ function launchHarness(
   proc.lastConversationMaterializationFailure = null
   proc.emittedImageGenerationIds = new Set()
   proc.primeRolloutImageGenerationScan = () => {}
+  proc.write = () => null
   proc.emit = (event: string, payload: unknown) => {
     events.push([event, payload])
     return true
@@ -1971,10 +3795,7 @@ describe('validateConversationLaunch 五重校验(上游 ff44afb)', () => {
   })
 })
 
-// ── 上游 ff44afb:codex checkpoint 采集与清空生命周期 ──────────────────
-// lastCompletedTurnId 仅在 status==='completed' && !error && turn.id 置位;
-// turn/started、sendUserText 建 delivery 处、failTurnStart、非 checkpointable
-// 终态四处清空(陷阱 3);result 事件带 codex checkpoint 载荷。
+// ── checkpoint 本地清空点与 isForeignThread 外线程隔离(ff44afb 叠加锚)──
 function checkpointHarness(workDir = '/tmp'): { proc: any; events: Array<[string, any]> } {
   const proc = Object.create(CodexProcess.prototype) as any
   const events: Array<[string, any]> = []
@@ -1994,73 +3815,8 @@ function checkpointHarness(workDir = '/tmp'): { proc: any; events: Array<[string
   return { proc, events }
 }
 
-describe('codex checkpoint 采集与清空(上游 ff44afb)', () => {
-  test('records the canonical main-thread turn/completed id publicly', () => {
-    const { proc, events } = checkpointHarness('/work')
 
-    proc.handleNotification('turn/started', { threadId: 'thread-ckpt', turn: { id: 'turn-1' } })
-    proc.handleNotification('turn/completed', {
-      threadId: 'thread-ckpt',
-      turn: { id: 'turn-1', status: 'completed' },
-    })
-
-    expect(proc.lastCompletedTurnId).toBe('turn-1')
-    const result = events.find(([name]) => name === 'result')
-    expect(result?.[1].checkpoint).toEqual({
-      provider: 'codex',
-      kind: 'turn',
-      id: 'turn-1',
-      // source.cwd === workDir:fork through 锚归属校验的上游前提。
-      source: { provider: 'codex', sessionId: 'thread-ckpt', cwd: '/work' },
-    })
-  })
-
-  test('failed or malformed terminal turns cannot reuse an earlier checkpoint', () => {
-    const { proc, events } = checkpointHarness()
-
-    // 完成轮建立 checkpoint。
-    proc.handleNotification('turn/started', { threadId: 'thread-ckpt', turn: { id: 'turn-1' } })
-    proc.handleNotification('turn/completed', {
-      threadId: 'thread-ckpt',
-      turn: { id: 'turn-1', status: 'completed' },
-    })
-    expect(proc.lastCompletedTurnId).toBe('turn-1')
-
-    // 清空点 1:新 turn 开始即清空(上轮锚不得跨入进行中的新轮)。
-    proc.handleNotification('turn/started', { threadId: 'thread-ckpt', turn: { id: 'turn-2' } })
-    expect(proc.lastCompletedTurnId).toBeNull()
-
-    // 失败终态不置位:result checkpoint 载荷为 null。
-    proc.handleNotification('turn/completed', {
-      threadId: 'thread-ckpt',
-      turn: { id: 'turn-2', status: 'failed', error: { message: 'boom' } },
-    })
-    expect(proc.lastCompletedTurnId).toBeNull()
-    const failedResult = events.filter(([name]) => name === 'result').at(-1)
-    expect(failedResult?.[1].is_error).toBe(true)
-    expect(failedResult?.[1].checkpoint).toBeNull()
-
-    // 中断终态(非 completed 状态)同样不可锚定。
-    proc.handleNotification('turn/started', { threadId: 'thread-ckpt', turn: { id: 'turn-3' } })
-    proc.handleNotification('turn/completed', {
-      threadId: 'thread-ckpt',
-      turn: { id: 'turn-3', status: 'interrupted' },
-    })
-    expect(proc.lastCompletedTurnId).toBeNull()
-
-    // 畸形终态(无 turn.id)清空而非复用上轮:先完成一轮再喂畸形通知。
-    proc.handleNotification('turn/started', { threadId: 'thread-ckpt', turn: { id: 'turn-4' } })
-    proc.handleNotification('turn/completed', {
-      threadId: 'thread-ckpt',
-      turn: { id: 'turn-4', status: 'completed' },
-    })
-    expect(proc.lastCompletedTurnId).toBe('turn-4')
-    proc.handleNotification('turn/completed', { threadId: 'thread-ckpt', turn: { status: 'completed' } })
-    expect(proc.lastCompletedTurnId).toBeNull()
-    const malformedResult = events.filter(([name]) => name === 'result').at(-1)
-    expect(malformedResult?.[1].checkpoint).toBeNull()
-  })
-
+describe('codex checkpoint fork 叠加锚(交付清空点与 isThread 隔离)', () => {
   test('sendUserText 建 delivery 处与 failTurnStart 均清空(清空点 2/3,陷阱 3 本地落点)', async () => {
     const fixture = pendingTurnStartFixture('thread-ckpt')
 
@@ -2079,7 +3835,6 @@ describe('codex checkpoint 采集与清空(上游 ff44afb)', () => {
     expect(fixture.proc.lastCompletedTurnId).toBeNull()
     expect(fixture.resultEvents.at(-1)?.is_error).toBe(true)
   })
-})
 
 // GREEN 后叠加锚(本地独有):外线程事件不产生 checkpoint 副作用——
 // isForeignThread 前置过滤(98bb01d)在 checkpoint 采集之前,子线程
@@ -2105,11 +3860,8 @@ describe('codex checkpoint 外线程隔离(本地 isForeignThread 叠加锚)', (
     expect(proc.lastCompletedTurnId).toBe('turn-1')
   })
 })
+})
 
-// ── 上游 ff44afb:thread/list 历史目录与 thread/read legacy cwd 解析 ──────
-// app-server owns discovery(Don't Hand-Roll):不扫 rollout、不建第二索引;
-// cwd 参数精确过滤 + sortKey updated_at 分页 + 严格结构校验即 throw +
-// updatedAt 秒→毫秒。
 function catalogHarness(
   workDir: string,
   respond: (method: string, params: any) => any,
@@ -2119,6 +3871,9 @@ function catalogHarness(
   proc.opts = { workDir, effort: 'high' }
   // 线程 handshake 已完成:catalog 前置(ensureCatalogReady)直接放行。
   proc.readyPromise = Promise.resolve()
+  // 合并实现里 catalog 走 ensureInitialized()(initialize RPC + initialized 通知
+  // write);write 契约:null = 成功。probe 不触碰真实 stdin。
+  proc.write = () => null
   proc.request = (method: string, params: any) => {
     requests.push({ method, params })
     return Promise.resolve(respond(method, params))
@@ -2126,42 +3881,7 @@ function catalogHarness(
   return { proc, requests }
 }
 
-describe('codex thread/list 历史目录(上游 ff44afb)', () => {
-  test('cwd 参数过滤+sortKey updated_at 分页+updatedAt 秒→毫秒+status 归一', async () => {
-    const workDir = '/work'
-    const pages: Record<string, any> = {
-      first: {
-        data: [{ id: 't1', preview: 'p1', updatedAt: 1700000001, cwd: workDir, status: 'idle' }],
-        nextCursor: 'cur-2',
-      },
-      'cur-2': {
-        data: [{ id: 't2', preview: 'p2', updatedAt: 1700000002, cwd: workDir, status: { type: 'active' } }],
-        nextCursor: null,
-      },
-    }
-    const { proc, requests } = catalogHarness(workDir, (method, params) => {
-      if (method !== 'thread/list') throw new Error(`unexpected method ${method}`)
-      return pages[params.cursor ?? 'first']
-    })
-
-    const rows = await proc.listConversations()
-
-    const listRequests = requests.filter(r => r.method === 'thread/list')
-    expect(listRequests).toHaveLength(2)
-    for (const r of listRequests) {
-      expect(r.params.cwd).toBe(workDir)
-      expect(r.params.sortKey).toBe('updated_at')
-      expect(r.params.sortDirection).toBe('desc')
-      expect(r.params.limit).toBe(100)
-    }
-    expect(listRequests[0].params.cursor).toBeNull()
-    expect(listRequests[1].params.cursor).toBe('cur-2')
-    expect(rows).toEqual([
-      { provider: 'codex', sessionId: 't1', cwd: workDir, preview: 'p1', ts: 1700000001000, status: 'idle' },
-      { provider: 'codex', sessionId: 't2', cwd: workDir, preview: 'p2', ts: 1700000002000, status: 'active' },
-    ])
-  })
-
+describe('codex thread/list 严格结构校验(fork 叠加锚)', () => {
   test('严格结构校验即 throw:cwd 不匹配 summary/invalid nextCursor/重复 cursor/无 data', async () => {
     const workDir = '/work'
     // cwd 不匹配条目 = invalid summary(请求已按 cwd 过滤,响应违约即 throw)。
@@ -2186,86 +3906,10 @@ describe('codex thread/list 历史目录(上游 ff44afb)', () => {
     const noData = catalogHarness(workDir, () => ({}))
     await expect(noData.proc.listConversations()).rejects.toThrow(/no data array/)
   })
-
-  test('thread/list skips delegated Agent native sessions', async () => {
-    const { resetAgentSessionRegistryForTest } = await import('./agent-session-registry')
-    resetAgentSessionRegistryForTest(['codex:delegated-thread'])
-    try {
-      const workDir = '/work'
-      const { proc } = catalogHarness(workDir, () => ({
-        data: [
-          { id: 'delegated-thread', preview: 'agent work', updatedAt: 1700000001, cwd: workDir, status: 'idle' },
-          { id: 'main-thread', preview: 'main work', updatedAt: 1700000002, cwd: workDir, status: 'idle' },
-        ],
-        nextCursor: null,
-      }))
-      const rows = await proc.listConversations()
-      expect(rows.map((row: { sessionId: string }) => row.sessionId)).toEqual(['main-thread'])
-    } finally {
-      resetAgentSessionRegistryForTest()
-    }
-  })
-
-  test('readConversationRef:thread/read {includeTurns:false} 以权威 cwd 组装 ConversationRef', async () => {
-    const { proc, requests } = catalogHarness('/work', () => ({
-      thread: { id: 'legacy-thread', cwd: '/authoritative' },
-    }))
-
-    const ref = await proc.readConversationRef('legacy-thread')
-
-    expect(requests).toContainEqual({
-      method: 'thread/read',
-      params: { threadId: 'legacy-thread', includeTurns: false },
-    })
-    expect(ref).toEqual({ provider: 'codex', sessionId: 'legacy-thread', cwd: '/authoritative' })
-
-    // id 不符 = invalid reference throw;空 id 直接拒绝。
-    const mismatch = catalogHarness('/work', () => ({ thread: { id: 'other-thread', cwd: '/x' } }))
-    await expect(mismatch.proc.readConversationRef('legacy-thread')).rejects.toThrow(/invalid conversation reference/)
-    await expect(proc.readConversationRef('  ')).rejects.toThrow(/requires a session id/)
-  })
 })
 
-// ── 上游 2e6e1e0:Codex 模型满载自动重试(进程层主导,D-07)──────────────
-// 本地适配点:交付模型(PendingTurnStart.settle)与 turn/started 只在通知路径
-// emit,因此 harness 在 turn/start 响应后同步回放 turn/started 通知(等价上游
-// recordTurnStarted 的响应路径)。假时钟与 9 例断言随上游逐条保留。
-const CAPACITY_MESSAGE = 'Selected model is at capacity. Please try a different model'
-
-async function withCapacityClock(run: (clock: {
-  timers: Map<number, { callback: () => void; delay: number }>
-  tick(): Promise<void>
-}) => Promise<void>): Promise<void> {
-  let nextId = 100_000
-  const timers = new Map<number, { callback: () => void; delay: number }>()
-  const timeout = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: () => void, delay: number) => {
-    const id = nextId++
-    timers.set(id, { callback, delay })
-    return id as unknown as ReturnType<typeof setTimeout>
-  }) as typeof setTimeout)
-  const clear = spyOn(globalThis, 'clearTimeout').mockImplementation(((id: number) => { timers.delete(id) }) as typeof clearTimeout)
-  try {
-    await run({
-      timers,
-      async tick() {
-        const next = timers.entries().next().value
-        if (!next) throw new Error('no scheduled capacity retry')
-        timers.delete(next[0])
-        next[1].callback()
-        await flushCapacityMicrotasks()
-      },
-    })
-  } finally {
-    timeout.mockRestore()
-    clear.mockRestore()
-  }
-}
-
-async function flushCapacityMicrotasks(): Promise<void> {
-  for (let i = 0; i < 12; i++) await Promise.resolve()
-}
-
-function capacityHarness(respond?: (method: string, params: any) => any | Promise<any>) {
+// ── 宽口径容量重试(fork WR-03,并入上游 2e6e1e0 引擎的 fork 锚点)──────
+function forkCapacityHarness(respond?: (method: string, params: any) => any | Promise<any>) {
   let turn = 0
   const events: Array<[string, any]> = []
   const calls: Array<{ method: string; params: any }> = []
@@ -2285,11 +3929,13 @@ function capacityHarness(respond?: (method: string, params: any) => any | Promis
   proc.turnStartGeneration = 0
   proc.lastUsage = null
   proc.lastCompletedTurnId = null
-  proc.capacityRetryTimer = null
-  proc.capacityRetryCount = 0
-  proc.capacityRetryHasStarted = false
-  proc.capacityRetryEnabled = true
+  proc.turnRetryTimer = null
+  proc.turnRetryCount = 0
+  proc.transientRetryCount = 0
+  proc.turnRetryHasStarted = false
+  proc.turnRetryEnabled = true
   proc.turnError = null
+  proc.routingTimeoutTurnId = null
   proc.turnRetry = null
   proc.finishedTurnIds = new Set()
   proc.exitEventEmitted = false
@@ -2321,126 +3967,7 @@ function capacityHarness(respond?: (method: string, params: any) => any | Promis
   return { proc, calls, events }
 }
 
-function completeCapacityTurn(proc: any, error: any = { message: CAPACITY_MESSAGE }): void {
-  proc.handleNotification('turn/completed', {
-    threadId: 'capacity-thread',
-    turn: { id: proc.currentTurnId, status: error ? 'failed' : 'completed', error },
-  })
-}
-
-describe('codex model capacity recovery', () => {
-  test('waits for terminal failure, keeps one logical task open and continues its existing history', async () => {
-    await withCapacityClock(async clock => {
-      const { proc, calls, events } = capacityHarness()
-      proc.sendUserText('original task', ['/tmp/input.png'])
-      await flushCapacityMicrotasks()
-      for (const willRetry of [true, false]) {
-        proc.handleNotification('error', {
-          threadId: 'capacity-thread', turnId: proc.currentTurnId,
-          error: { message: CAPACITY_MESSAGE }, willRetry,
-        })
-      }
-      expect(clock.timers.size).toBe(0)
-      expect(events.filter(([event]) => event === 'error').map(([, error]) => error.message))
-        .toEqual([CAPACITY_MESSAGE, CAPACITY_MESSAGE])
-
-      // The completion may omit the error already supplied by the notification.
-      const failedId = proc.currentTurnId
-      proc.handleNotification('turn/completed', {
-        threadId: 'capacity-thread', turn: { id: failedId, status: 'failed' },
-      })
-      proc.handleNotification('turn/completed', {
-        threadId: 'capacity-thread', turn: { id: failedId, status: 'failed', error: { message: CAPACITY_MESSAGE } },
-      })
-      expect(events.filter(([event]) => event === 'result')).toEqual([])
-      expect(proc.lastCompletedTurnId).toBeNull()
-      expect([...clock.timers.values()].map(timer => timer.delay)).toEqual([5_000])
-      expect(proc.turnRetry).toMatchObject({ phase: 'waiting', attempt: 1, message: CAPACITY_MESSAGE })
-      await clock.tick()
-
-      const starts = calls.filter(call => call.method === 'turn/start')
-      expect(starts).toHaveLength(2)
-      expect(starts[0]!.params.input[0].text).toBe('[file: /tmp/input.png]\n\noriginal task')
-      expect(starts[1]!.params.input[0].text).toContain('继续完成用户尚未完成的任务')
-      expect(starts[1]!.params.input[0].text).not.toContain('original task')
-      expect(starts[1]!.params).toEqual({ ...starts[0]!.params, input: starts[1]!.params.input })
-      expect(proc.opts).toMatchObject({ model: 'selected-model', effort: 'high' })
-      expect(events.filter(([event]) => event === 'turn_started').at(-1)?.[1].retry).toBe(true)
-      completeCapacityTurn(proc, null)
-      expect(events.filter(([event]) => event === 'result')).toEqual([
-        ['result', expect.objectContaining({ is_error: false, turn_id: 'capacity-turn-2' })],
-      ])
-      expect(proc.turnRetry).toBeNull()
-      expect(clock.timers.size).toBe(0)
-    })
-  })
-
-  test('keeps retrying with capped backoff and resets after a successful task', async () => {
-    await withCapacityClock(async clock => {
-      const { proc, events } = capacityHarness()
-      proc.sendUserText('do work')
-      await flushCapacityMicrotasks()
-      for (const delay of [5_000, 10_000, 20_000, 40_000, 60_000, 60_000, 60_000]) {
-        completeCapacityTurn(proc)
-        expect([...clock.timers.values()].map(timer => timer.delay)).toEqual([delay])
-        expect(events.filter(([event]) => event === 'result')).toEqual([])
-        await clock.tick()
-      }
-      completeCapacityTurn(proc, null)
-      proc.sendUserText('next task')
-      await flushCapacityMicrotasks()
-      completeCapacityTurn(proc)
-      expect(proc.turnRetry).toMatchObject({ attempt: 1, delayMs: 5_000 })
-    })
-  })
-
-  test('retries an explicitly rejected turn/start with its original input and files', async () => {
-    await withCapacityClock(async clock => {
-      let starts = 0
-      const { proc, calls, events } = capacityHarness(method => {
-        if (method !== 'turn/start') throw new Error(`unexpected request ${method}`)
-        if (++starts === 1) throw new CodexRpcResponseError(method, 1, -32000, CAPACITY_MESSAGE)
-        return { turn: { id: 'accepted-retry' } }
-      })
-      proc.sendUserText('unaccepted task', ['/tmp/data.csv'])
-      await flushCapacityMicrotasks()
-      expect(events.filter(([event]) => event === 'result')).toEqual([])
-      await clock.tick()
-      expect(calls[1]).toEqual(calls[0])
-      // No earlier accepted turn: this boundary must seed the usage baseline.
-      expect(events.find(([event]) => event === 'turn_started')?.[1].retry).toBeUndefined()
-      completeCapacityTurn(proc, null)
-    })
-  })
-
-  test('unrelated failures and initialization errors remain terminal', async () => {
-    await withCapacityClock(async clock => {
-      for (const error of [
-        new CodexRpcResponseError('turn/start', 1, -32000, 'Usage limit exceeded'),
-        new CodexRpcResponseError('thread/start', 1, -32000, CAPACITY_MESSAGE),
-        new Error('turn/start request timed out'),
-      ]) {
-        const { proc, events } = capacityHarness(() => { throw error })
-        proc.sendUserText('do work')
-        await flushCapacityMicrotasks()
-        expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
-        expect(proc.lastResult.is_error).toBe(true)
-        expect(clock.timers.size).toBe(0)
-      }
-      for (const message of ['Context window capacity exceeded', 'Unauthorized', 'Usage limit exceeded']) {
-        const { proc, events } = capacityHarness()
-        proc.sendUserText('do work')
-        await flushCapacityMicrotasks()
-        completeCapacityTurn(proc, { message })
-        expect(events.filter(([event]) => event === 'result')).toHaveLength(1)
-        expect(clock.timers.size).toBe(0)
-      }
-    })
-  })
-
-  // 02-REVIEW WR-03:session 自主重试环删除后进程层是唯一调度者 —— 宽口径容量失败
-  // (serverOverloaded / "at capacity"+"model" / please try a different model)必须和
-  // 严格正则一样进入进程层退避,否则相对 phase 前的 60s 自动重试是功能回退。
+describe('codex model capacity recovery(fork 宽口径与交付锚)', () => {
   test('宽口径容量失败同样进入进程层退避重试', async () => {
     await withCapacityClock(async clock => {
       for (const message of [
@@ -2448,7 +3975,7 @@ describe('codex model capacity recovery', () => {
         'Upstream model is at capacity, please retry later',
         'Please try a different model',
       ]) {
-        const { proc, events } = capacityHarness()
+        const { proc, events } = forkCapacityHarness()
         proc.sendUserText('do work')
         await flushCapacityMicrotasks()
         completeCapacityTurn(proc, { message })
@@ -2465,7 +3992,7 @@ describe('codex model capacity recovery', () => {
     await withCapacityClock(async clock => {
       let starts = 0
       const serverMessage = 'serverOverloaded'
-      const { proc, calls, events } = capacityHarness(method => {
+      const { proc, calls, events } = forkCapacityHarness(method => {
         if (method !== 'turn/start') throw new Error(`unexpected request ${method}`)
         if (++starts === 1) throw new CodexRpcResponseError(method, 1, -32000, serverMessage)
         return { turn: { id: 'accepted-wide-retry' } }
@@ -2482,7 +4009,7 @@ describe('codex model capacity recovery', () => {
 
   test('interrupt during backoff cancels even an already-queued timer callback', async () => {
     await withCapacityClock(async clock => {
-      const { proc, calls, events } = capacityHarness()
+      const { proc, calls, events } = forkCapacityHarness()
       proc.sendUserText('do work')
       await flushCapacityMicrotasks()
       completeCapacityTurn(proc)
@@ -2502,7 +4029,7 @@ describe('codex model capacity recovery', () => {
     await withCapacityClock(async clock => {
       let resolveRetry!: (value: any) => void
       let starts = 0
-      const { proc, calls, events } = capacityHarness(method => {
+      const { proc, calls, events } = forkCapacityHarness(method => {
         if (method === 'turn/interrupt') return {}
         if (++starts === 1) return { turn: { id: 'first-turn' } }
         return new Promise(resolve => { resolveRetry = resolve })
@@ -2530,7 +4057,7 @@ describe('codex model capacity recovery', () => {
 
   test('a synchronous stop at the retry progress event prevents the request from being sent', async () => {
     await withCapacityClock(async clock => {
-      const { proc, calls, events } = capacityHarness()
+      const { proc, calls, events } = forkCapacityHarness()
       const emit = proc.emit
       proc.emit = (event: string, payload: any) => {
         emit(event, payload)
@@ -2549,7 +4076,7 @@ describe('codex model capacity recovery', () => {
   test('new input, native continuation, kill and OS exit all retire the waiting timer', async () => {
     await withCapacityClock(async clock => {
       for (const action of ['input', 'native', 'kill', 'exit']) {
-        const { proc, calls, events } = capacityHarness()
+        const { proc, calls, events } = forkCapacityHarness()
         proc.sendUserText('do work')
         await flushCapacityMicrotasks()
         completeCapacityTurn(proc)
@@ -2578,7 +4105,7 @@ describe('codex model capacity recovery', () => {
 
   test('child-thread and stale capacity errors cannot turn an unrelated failure into a retry', async () => {
     await withCapacityClock(async clock => {
-      const { proc, events } = capacityHarness()
+      const { proc, events } = forkCapacityHarness()
       proc.sendUserText('do work')
       await flushCapacityMicrotasks()
       for (const [threadId, turnId] of [['child-thread', proc.currentTurnId], ['capacity-thread', 'old-turn']]) {
@@ -2595,7 +4122,7 @@ describe('codex model capacity recovery', () => {
 
   test('容量拒绝先结算交付再排重试(本地交付模型,session await 不悬挂)', async () => {
     await withCapacityClock(async clock => {
-      const { proc } = capacityHarness(method => {
+      const { proc } = forkCapacityHarness(method => {
         if (method !== 'turn/start') throw new Error(`unexpected request ${method}`)
         throw new CodexRpcResponseError(method, 1, -32000, CAPACITY_MESSAGE)
       })

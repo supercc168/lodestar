@@ -1,7 +1,32 @@
+/**
+ * Delegated-agent cards: identity directory + standalone run card (local layout)
+ * ∪ shared-task-card row elements (upstream v0.20.x agent-cards flow).
+ *
+ * 合并要点:
+ * - agentRunCard / agentWorkerElement / agentRunFooterElement / agentRunSummary
+ *   维持本地语义(任务卡标题按 parentKind 区分并给出 worker 数、worker 折叠面板、
+ *   取消委派按钮、本地状态/耗时文案),本地测试与 agent-service 刷 footer 依赖它们。
+ * - 上游增量 agentRunElement / agentRunElementId / agentCardSummary /
+ *   delegationCardSummary 原样纳入(agent-cards.ts 共享任务卡按行 patch 它们);
+ *   agentRunElement 内部使用上游口径的私有 helper(状态词带任务 kind、
+ *   耗时 formatDuration、结果 boundedResultContent、任务内容 compactTaskContent),
+ *   不复用本地导出的同名函数,避免两套文案互相污染。
+ * - identityRow 维持本地文案(ready / · default)。
+ */
 import { createHash } from 'node:crypto'
 import type { AgentIdentity, AgentSourceFailure } from '../agent-identities'
 import type { AgentRunSnapshot, AgentWorkerResult } from '../agent-run-types'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
+import { formatDuration } from './duration'
+import {
+  AGENT_CARD_TASK_KIND_ORDER,
+  agentCardTaskKindIcon,
+  agentCardTaskKindLabel,
+  type AgentCardTaskKind,
+} from './task-kind'
+import { boundedResultContent, compactTaskContent } from './task-content'
+
+export type { AgentCardTaskKind } from './task-kind'
 
 const PROMPT_PREVIEW_CHARS = 10_000
 const WORKER_TOTAL_PREVIEW_CHARS = 48_000
@@ -22,7 +47,9 @@ export function agentIdentityListCard(opts: AgentIdentityListCardOpts): object {
     element_id: ELEMENTS.agentIdentityPanel,
     content: [
       '**全局 Agent 身份**',
-      '列出本机已配置的固定档位（一档一位）。目录只读，不能在此开跑；委派由主 Agent 调用 lodestar-agent。',
+      // 本地目录语义(只读、不在此开跑)∪ 上游措辞(主 Agent 统一分配和汇总),
+      // 两版测试的断言各取其可共存部分。
+      '列出本机已配置的固定档位（一档一位）。目录只读，不能在此开跑；委派由主 Agent 统一分配和汇总（lodestar-agent）。',
       `目录第 ${opts.page + 1}/${opts.totalPages} 页`,
     ].join('\n'),
   }]
@@ -77,6 +104,58 @@ export function agentRunCard(run: AgentRunSnapshot): object {
     },
     body: { elements },
   }
+}
+
+/** One visible line per invocation. Everything else stays inside this panel. */
+export function agentRunElement(run: AgentRunSnapshot): object {
+  const project = run.owner?.kind === 'project'
+  return {
+    tag: 'collapsible_panel',
+    element_id: agentRunElementId(run.runId),
+    header: { title: { tag: 'plain_text', content: elementSummary(run) } },
+    expanded: false,
+    elements: [{
+      tag: 'markdown',
+      content: [
+        `**${escapeMarkdown(run.description ?? '说明 MISS')}**`,
+        ...(project ? [`项目 ${inlineCode(run.owner!.name)} · ${inlineCode(run.runId)}`] : []),
+        elementFooterContent(run),
+        `**任务说明**\n${sanitizeMarkdownForCardKit(compactTaskContent(run.prompt))}`,
+        ...run.workers.map(worker => inlineWorkerContent(worker, WORKER_MAX_PREVIEW_CHARS, project)),
+      ].join('\n\n'),
+    }, ...(project && !isTerminal(run.status) ? [{
+      tag: 'button', text: { tag: 'plain_text', content: '停止本次任务' }, type: 'danger',
+      behaviors: [{ type: 'callback', value: { kind: 'agent_project_cancel', run_id: run.runId } }],
+    }] : [])],
+  }
+}
+
+export function agentRunElementId(runId: string): string {
+  return `ar_${createHash('sha256').update(runId).digest('hex').slice(0, 16)}`
+}
+
+export function agentCardSummary(runs: AgentRunSnapshot[]): string {
+  return delegationCardSummary(runs.map(run => ({
+    summary: elementSummary(run), status: run.status, terminal: isTerminal(run.status), kind: 'delegated',
+  })))
+}
+
+export function delegationCardSummary(tasks: Array<{
+  summary: string
+  status: string
+  terminal: boolean
+  kind?: AgentCardTaskKind
+}>): string {
+  if (tasks.length === 1) return tasks[0]!.summary
+  const done = tasks.filter(task => task.terminal).length
+  const failed = tasks.filter(task => task.status === 'failed').length
+  const waiting = tasks.filter(task => task.status === 'needs_input' || task.status === 'paused').length
+  const kinds = new Set(tasks.map(task => task.kind ?? 'delegated'))
+  const kindList = AGENT_CARD_TASK_KIND_ORDER.filter(kind => kinds.has(kind))
+  const category = kindList.length === 1
+    ? `${agentCardTaskKindIcon(kindList[0]!)} ${agentCardTaskKindLabel(kindList[0]!)}`
+    : `🧩 运行任务 · ${kindList.map(kind => `${agentCardTaskKindLabel(kind)} ${tasks.filter(task => (task.kind ?? 'delegated') === kind).length}`).join(' · ')}`
+  return `${category} · 已结束 ${done}/${tasks.length}${failed ? ` · 失败 ${failed}` : ''}${waiting ? ` · 待处理 ${waiting}` : ''}`
 }
 
 export function agentWorkerElement(
@@ -166,6 +245,7 @@ export function agentWorkerElementId(identityId: string): string {
 }
 
 export function agentWorkerPreviewChars(workerCount: number): number {
+  // Keep the shared-card budget bounded when several workers finish together.
   const count = Math.max(1, Math.floor(workerCount))
   return Math.min(WORKER_MAX_PREVIEW_CHARS, Math.max(WORKER_MIN_PREVIEW_CHARS, Math.floor(WORKER_TOTAL_PREVIEW_CHARS / count)))
 }
@@ -246,6 +326,83 @@ function runStatusLabel(run: AgentRunSnapshot): string {
     case 'running': return run.workers.length > 0 && run.workers.every(worker => isTerminal(worker.status))
       ? '⏳ 正在收尾' : '⏳ 正在执行'
   }
+}
+
+/** 上游口径的运行状态词(带任务 kind),仅共享任务卡行(agentRunElement)使用。 */
+function elementStatusLabel(run: AgentRunSnapshot): string {
+  const kindLabel = agentCardTaskKindLabel(run.owner?.kind === 'project' ? 'project' : 'delegated')
+  switch (run.status) {
+    case 'completed': return `✅ ${kindLabel}完成`
+    case 'failed': return `❌ ${kindLabel}失败`
+    case 'cancelled': return `🛑 ${kindLabel}已取消`
+    case 'needs_input': return run.owner?.kind === 'project' ? '❗ 项目任务不支持交互提问' : `❓ ${kindLabel}等待主 Agent 回复`
+    case 'queued': return `⏳ ${kindLabel}等待执行`
+    case 'running': return run.workers.length > 0 && run.workers.every(worker => isTerminal(worker.status))
+      ? `⏳ ${kindLabel}正在收尾` : `⏳ ${kindLabel}正在执行`
+  }
+}
+
+/** 共享任务卡行的折叠标题(上游口径:描述 + 多 worker 时补 done/total)。 */
+function elementSummary(run: AgentRunSnapshot): string {
+  const done = run.workers.filter(item => item.status === 'completed').length
+  return `${elementStatusLabel(run)} · ${shortText(run.description ?? '说明 MISS', 40)}${run.workers.length > 1 ? ` · ${done}/${run.workers.length}` : ''}`
+}
+
+/** 共享任务卡行内嵌的页脚行(上游口径:kind 状态词 + formatDuration)。 */
+function elementFooterContent(run: AgentRunSnapshot): string {
+  const completed = run.workers.filter(item => item.status === 'completed').length
+  const failed = run.workers.filter(item => item.status === 'failed').length
+  const waiting = run.workers.filter(item => item.status === 'needs_input').length
+  const running = run.workers.filter(item => item.status === 'running').length
+  const queued = run.workers.filter(item => item.status === 'queued').length
+  const cancelled = run.workers.filter(item => item.status === 'cancelled').length
+  const counts = [
+    running ? `执行中 ${running}` : '',
+    queued ? `排队 ${queued}` : '',
+    waiting ? `待答 ${waiting}` : '',
+    failed ? `失败 ${failed}` : '',
+    cancelled ? `已取消 ${cancelled}` : '',
+  ].filter(Boolean)
+  const duration = run.finishedAt ? Date.parse(run.finishedAt) - Date.parse(run.createdAt) : null
+  return [
+    `**${elementStatusLabel(run)}** · 完成 ${completed}/${run.workers.length}`,
+    ...(counts.length ? [counts.join(' · ')] : []),
+    ...(duration != null && Number.isFinite(duration) ? [`⏱ 用时 ${formatDuration(duration / 1000)}`] : []),
+    ...(run.error ? [escapeMarkdown(run.error)] : []),
+  ].join('\n')
+}
+
+/** 共享任务卡行内联的单个 worker 正文(上游口径:模型行 + bounded 结果 + 3 条最近动作)。 */
+function inlineWorkerContent(worker: AgentWorkerResult, outputPreviewChars: number, project: boolean): string {
+  const status = workerStatusLabel(worker)
+  const body: string[] = [`模型 ${inlineCode(worker.model)} · 推理 ${inlineCode(worker.effort)}`]
+  if (worker.durationMs != null) body.push(`用时 ${formatDuration(worker.durationMs / 1000)}`)
+  if (worker.status === 'queued' && worker.queuedReason) body.push('', escapeMarkdown(worker.queuedReason))
+  if (worker.pendingInput) {
+    body.push('', project ? '**项目任务不支持交互提问**' : '**等待主 Agent 回答**')
+    for (const question of worker.pendingInput.questions) {
+      body.push(`- ${escapeMarkdown(question.question)}`)
+      if (question.options.length) body.push(`  选项：${question.options.map(option => inlineCode(option.label)).join(' / ')}`)
+    }
+  }
+  if (worker.error) body.push('', worker.status === 'cancelled' ? '**停止原因**' : '**失败原因**', sanitizeMarkdownForCardKit(worker.error))
+  if (worker.output) body.push('', worker.status === 'failed' || worker.status === 'cancelled' ? '**已生成的内容**' : '**结果**', sanitizeMarkdownForCardKit(boundedResultContent(worker.output, outputPreviewChars)))
+  if (!worker.output && !worker.error && !worker.pendingInput) {
+    body.push('', worker.status === 'completed'
+      ? '_任务已完成，没有正文输出。_'
+      : worker.status === 'cancelled'
+        ? '_任务已取消。_'
+        : worker.status === 'queued' ? '_等待开始执行。_' : '_正在执行任务，结果会显示在这里。_')
+  }
+  if (worker.steps.length) {
+    body.push('', '**最近动作**')
+    for (const step of worker.steps.slice(-3)) {
+      const icon = step.tool === 'tool error' ? '❌' : step.phase === 'completed' ? '✓' : step.phase === 'started' ? '→' : '·'
+      const label = step.tool === 'tool error' ? '工具执行失败' : step.tool === 'tool result' ? '工具执行完成' : step.tool
+      body.push(`- ${icon} ${inlineCode(label)} ${escapeMarkdown(shortText(step.detail, 180))}`)
+    }
+  }
+  return [`**${status} · ${escapeMarkdown(worker.identityName)}**`, ...body].join('\n')
 }
 
 function durationLabel(ms: number): string {
