@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
   DELEGATED_AGENT_INSTRUCTIONS,
+  PROJECT_AGENT_INSTRUCTIONS,
   agentSkillBody,
   ensureLodestarAgentCommand,
   ensureLodestarAgentSkill,
@@ -50,39 +51,30 @@ describe('lodestar-agent skill body', () => {
     expect(body).not.toContain('reviewers')
     expect(body).not.toMatch(/question\/review\/critique/)
     expect(body).not.toContain('managed-skills')
+    expect(body).toContain('Main Agents, delegated Agents and native subagents may delegate further')
+    expect(body).toContain('Lodestar does not impose a delegation depth limit')
+    expect(body).toContain('Nested calls inherit the project, conversation ID (chat_id), interaction policy')
+    for (const instructions of [DELEGATED_AGENT_INSTRUCTIONS, PROJECT_AGENT_INSTRUCTIONS]) {
+      expect(instructions).toContain('You may delegate work through Lodestar or provider-native Agent/subagent tools')
+      expect(instructions).toContain('replaces earlier Lodestar instructions prohibiting further delegation')
+    }
   })
 
-  test('forbids routing a self-call through lodestar-agent', () => {
+  test('allows self-calls and recursive work while preserving caller delivery ownership', () => {
     const body = agentSkillBody()
-    expect(body).toContain('MUST NOT use this Skill')
-    expect(body).toContain('native Agent')
-    expect(body).toContain('Self-calls MUST use')
-    expect(body).not.toMatch(/Token Source/)
+    expect(body).toContain('Calling your own model or Agent through `lodestar-agent` is allowed')
+    expect(body).toContain('Claude subscription source')
+    expect(body).toContain('## Recursive delegation')
+    expect(body).not.toContain('Only the main Agent may delegate work')
+    expect(body).not.toContain('without further delegation')
+    expect(DELEGATED_AGENT_INSTRUCTIONS).toContain('you may use question tools to ask the main Agent')
+    for (const instructions of [DELEGATED_AGENT_INSTRUCTIONS, PROJECT_AGENT_INSTRUCTIONS]) {
+      expect(instructions).toContain('Return task results and local artifact paths to the caller')
+      expect(instructions).toContain('Do not emit file-delivery markers')
+    }
+    expect(PROJECT_AGENT_INSTRUCTIONS).toContain('nobody is available to answer questions')
   })
 
-  test('单层委派章节与禁自调用 Hard rule 并存(worker 不得再委派)', () => {
-    const body = agentSkillBody()
-    // 新章节:主 Agent 唯一有权委派,worker 一律自行完成。
-    expect(body).toContain('## Single-level delegation')
-    expect(body).toContain('Only the main Agent may delegate work')
-    expect(body).toContain('do not delegate further')
-    expect(body).toContain('LODESTAR_AGENT_ROLE=worker')
-    expect(body).toContain('Native subagents are also delegated Agents')
-    // 原 Hard rule 仍在,且限定主 Agent、明确不豁免单层委派。
-    expect(body).toContain('## Hard rule: native Agent capabilities for self-calls')
-    expect(body).toContain('For the main Agent only')
-    expect(body).toContain('This does not exempt delegated Agents')
-    // 调用方需在 prompt 里显式要求子 Agent 自行完成。
-    expect(body).toContain('Explicitly tell it to complete the work itself without further delegation.')
-  })
-
-  test('DELEGATED_AGENT_INSTRUCTIONS 四类约束齐备(含原生工具与 CLI/HTTP 面)', () => {
-    expect(DELEGATED_AGENT_INSTRUCTIONS).toContain('a delegated Agent working on a task assigned by the main Agent')
-    expect(DELEGATED_AGENT_INSTRUCTIONS).toContain('Complete this task yourself')
-    expect(DELEGATED_AGENT_INSTRUCTIONS).toContain('must not create or invoke any further Agents or subagents')
-    expect(DELEGATED_AGENT_INSTRUCTIONS).toContain('provider-native Agent/subagent tools')
-    expect(DELEGATED_AGENT_INSTRUCTIONS).toContain('report the need to the main Agent')
-  })
 })
 
 describe('ensureLodestarAgentSkill', () => {

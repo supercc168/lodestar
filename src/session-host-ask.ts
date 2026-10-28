@@ -4,7 +4,7 @@ import type { Session } from './session'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
-import { log } from './log'
+import { log, logError } from './log'
 
 type HostAskActionResult = { ok: boolean; message: string; card?: object }
 type HostAskRecord = {
@@ -123,7 +123,7 @@ function collectHostAskQuestions(raw: unknown): cards.AskQuestion[] {
 export function parseHostAskPayload(payloadText: string): { questions: cards.AskQuestion[]; inputJson: string } | null {
   const parsed = tryParseAskUsrJson(payloadText)
   if ('error' in parsed) {
-    log(`host ask: invalid askusr JSON: ${parsed.error}`)
+    log("host ask: invalid askusr JSON")
     return null
   }
   const raw = parsed.value
@@ -180,7 +180,7 @@ async function createOrUpdateHostAskCard(s: Session, askId: string): Promise<voi
     )
     if (ask.currentIdx === undefined) {
       try { await cardkit.dispose(ask.cardId) }
-      catch (e) { log(`session "${s.sessionName}": host ask card dispose failed: ${e}`) }
+      catch (e) { logError("session: host ask card dispose failed", e) }
     }
     return
   }
@@ -189,14 +189,14 @@ async function createOrUpdateHostAskCard(s: Session, askId: string): Promise<voi
   try {
     const messageId = await feishu.sendCard(s.chatId, card)
     if (!messageId) {
-      log(`session "${s.sessionName}": host ask sendCard failed`)
+      log("session: host ask sendCard failed")
       await feishu.sendText(s.chatId, '❌ 澄清问题卡片发送失败，当前轮次无法继续。')
       return
     }
     let cardId = ''
     try { cardId = await cardkit.convertMessageToCard(messageId) }
     catch (e) {
-      log(`session "${s.sessionName}": host ask id_convert failed: ${e}`)
+      logError("session: host ask id_convert failed", e)
       await feishu.sendText(s.chatId, '❌ 澄清问题卡片初始化失败，当前轮次无法继续。')
       return
     }
@@ -210,7 +210,7 @@ async function createOrUpdateHostAskCard(s: Session, askId: string): Promise<voi
         cards.askUserQuestionElement(0, askId, ask.questions, '✅', hostAskState(ask), 'host_ask'),
       )
       try { await cardkit.dispose(cardId) }
-      catch (e) { log(`session "${s.sessionName}": host ask card dispose failed: ${e}`) }
+      catch (e) { logError("session: host ask card dispose failed", e) }
     }
   } finally {
     const latest = s.pendingHostAsks.get(askId)
@@ -271,7 +271,7 @@ async function maybeContinueHostAsk(s: Session, askId: string): Promise<void> {
   } catch (e) {
     resetResume()
     const message = e instanceof Error ? e.message : String(e)
-    log(`session "${s.sessionName}": host ask continue failed: ${message}`)
+    log("session: host ask continue failed")
     await feishu.sendText(s.chatId, `❌ askusr 续跑失败: ${message}`)
   }
 }
@@ -320,16 +320,16 @@ export function hasPendingHostAsk(s: Session): boolean {
 
 export function queueHostAskFromMarker(s: Session, payloadText: string, _rawMarker: string): void {
   if (s.proc?.provider !== 'codex' && s.proc?.provider !== 'claude') {
-    log(`session "${s.sessionName}": ignore askusr marker from unsupported backend (${s.proc?.provider ?? 'none'})`)
+    log('session: ignore askusr marker from unsupported backend')
     return
   }
   if (s.pendingHostAsks.size > 0) {
-    log(`session "${s.sessionName}": ignore askusr marker because another host ask is pending`)
+    log("session: ignore askusr marker because another host ask is pending")
     return
   }
   const parsed = parseHostAskPayload(payloadText)
   if (!parsed) {
-    log(`session "${s.sessionName}": invalid askusr marker payload`)
+    log("session: invalid askusr marker payload")
     return
   }
   const askId = `host_ask_${randomUUID()}`

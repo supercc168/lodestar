@@ -1,4 +1,4 @@
-import { log } from './log'
+import { log, logError } from './log'
 
 const resources = new Set<BackgroundRefresh>()
 let running = false
@@ -12,7 +12,8 @@ export class BackgroundRefresh {
   private retired = false
 
   constructor(readonly label: string, private readonly interval: number,
-    private readonly load: () => Promise<void>, dueAt = 0) {
+    private readonly load: () => Promise<void>, dueAt = 0,
+    private readonly minimumRetryMs = 0) {
     this.dueAt = dueAt
     resources.add(this)
     this.schedule()
@@ -25,16 +26,18 @@ export class BackgroundRefresh {
     if (this.pending) return this.pending
     clearTimeout(this.timer)
     const pending = Promise.resolve().then(() => this.retired ? undefined : this.load()).then(() => {
+      if (this.failures) log(this.label === 'usage' ? 'usage refresh recovered' : 'model catalog refresh recovered')
       this.failures = 0
       this.dueAt = Date.now() + this.interval
     }, error => {
       this.failures++
       const retryAfter = Number((error as { retryAfterMs?: number })?.retryAfterMs)
       this.dueAt = Date.now() + Math.max(
+        this.minimumRetryMs,
         Math.min(300_000, 60_000 * 2 ** Math.min(this.failures - 1, 3)),
         Number.isFinite(retryAfter) ? retryAfter : 0,
       )
-      log(`${this.label} refresh MISS: ${error instanceof Error ? error.message : String(error)}`)
+      if (this.failures === 1) logError(this.label === 'usage' ? 'usage refresh failed' : 'model catalog refresh failed', error)
       throw error
     }).finally(() => {
       if (this.pending === pending) this.pending = undefined

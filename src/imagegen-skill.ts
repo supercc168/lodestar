@@ -37,7 +37,7 @@ import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { config } from './config'
-import { log } from './log'
+import { log, logError } from './log'
 import { DATA_DIR } from './paths'
 
 const SKILL_NAME = 'imagegen'
@@ -320,13 +320,13 @@ export function ensureImagegenVenv(): boolean {
   const py = imagegenVenvPython()
   try {
     if (!existsSync(py)) {
-      log(`imagegen-skill: creating venv at ${venvDir}`)
+      log("imagegen-skill: creating venv")
       mkdirSync(dirname(venvDir), { recursive: true })
       // daemon 以 Node 运行(launchd → node dist/lodestar.js),不能用 Bun.spawnSync。
       const created = spawnSync('python3', ['-m', 'venv', venvDir], { encoding: 'utf8' })
       if (created.status !== 0) {
         log(
-          `imagegen-skill: venv create failed code=${created.status}: ${(created.stderr || created.stdout || '').toString().trim()}`,
+          "imagegen-skill: venv create failed",
         )
         return false
       }
@@ -339,7 +339,7 @@ export function ensureImagegenVenv(): boolean {
     )
     if (pip.status !== 0) {
       log(
-        `imagegen-skill: pip install openai failed code=${pip.status}: ${(pip.stderr || pip.stdout || '').toString().trim()}`,
+        "imagegen-skill: pip install failed",
       )
       return false
     }
@@ -347,13 +347,13 @@ export function ensureImagegenVenv(): boolean {
       encoding: 'utf8',
     })
     if (check.status !== 0) {
-      log(`imagegen-skill: openai import check failed: ${(check.stderr || '').toString().trim()}`)
+      log("imagegen-skill: import check failed")
       return false
     }
-    log(`imagegen-skill: venv ok openai=${(check.stdout || '').toString().trim()} py=${py}`)
+    log("imagegen-skill: venv ok")
     return true
   } catch (e) {
-    log(`imagegen-skill: venv bootstrap error: ${e}`)
+    logError("imagegen-skill: venv bootstrap error", e)
     return false
   }
 }
@@ -404,14 +404,14 @@ function syncTreeFromAssets(assetRoot: string, destRoot: string): number {
   for (const rel of VENDORED_RELATIVE_FILES) {
     const src = join(assetRoot, rel)
     if (!existsSync(src)) {
-      log(`imagegen-skill: missing vendored file ${src}`)
+      log("imagegen-skill: missing vendored file")
       continue
     }
     const dest = join(destRoot, rel)
     const r = copyFileIfChanged(src, dest)
     if (r !== 'skipped') {
       changes++
-      log(`imagegen-skill: ${r} ${dest}`)
+      log('imagegen-skill: synchronized')
     }
   }
   return changes
@@ -436,7 +436,7 @@ function installWrapper(scriptPathForWrapper: string): string | null {
     ].join('\n')
     const path = imagegenWrapperPath()
     const r = writeFileIfChanged(path, stub, 0o700)
-    if (r !== 'skipped') log(`imagegen-skill: ${r} stub wrapper ${path}`)
+    if (r !== 'skipped') log("imagegen-skill: stub wrapper")
     return path
   }
 
@@ -449,7 +449,7 @@ function installWrapper(scriptPathForWrapper: string): string | null {
     venvPython: imagegenVenvPython(),
   })
   const r = writeFileIfChanged(path, body, 0o700)
-  if (r !== 'skipped') log(`imagegen-skill: ${r} wrapper ${path}`)
+  if (r !== 'skipped') log("imagegen-skill: wrapper")
   return path
 }
 
@@ -488,16 +488,16 @@ export function ensureImagegenSkill(): void {
       })
       const skillFile = join(destRoot, 'SKILL.md')
       const r = writeFileIfChanged(skillFile, body)
-      if (r !== 'skipped') log(`imagegen-skill: ${r} ${skillFile}`)
+      if (r !== 'skipped') log('imagegen-skill: synchronized')
     } catch (e) {
-      log(`imagegen-skill: sync failed (${destRoot}): ${e}`)
+      logError("imagegen-skill: sync failed", e)
     }
   }
 
   try {
     installWrapper(canonicalScript)
   } catch (e) {
-    log(`imagegen-skill: wrapper install failed: ${e}`)
+    logError("imagegen-skill: wrapper install failed", e)
   }
 
   // Bootstrap venv whenever skill sync runs so first generate does not
@@ -505,10 +505,7 @@ export function ensureImagegenSkill(): void {
   ensureImagegenVenv()
 
   if (imagegenConfigured()) {
-    log(
-      `imagegen-skill: ready model=${config.imagegen.model}` +
-        (config.imagegen.baseUrl ? ` base_url=${config.imagegen.baseUrl}` : ' base_url=(default)'),
-    )
+    log('imagegen-skill: configured')
   } else {
     log('imagegen-skill: installed skill stubs; set [imagegen] api_key to enable')
   }

@@ -4,7 +4,7 @@ import * as feishu from './feishu'
 import { agentProviderLabel } from './agent-process'
 import { resolveClaudeSdkModel } from './claude-models'
 import { resolveCodexModelId } from './codex-models'
-import { log } from './log'
+import { log, logError } from './log'
 import { messageOf } from './session-util'
 import {
   completeGsdTask,
@@ -47,7 +47,7 @@ function gsdCodexPolicyDrift(s: Session): string[] | undefined {
   if (s.currentProvider() !== 'codex') return undefined
   const check = checkGsdCodexPolicy()
   if (check.ok || check.skipped) return undefined
-  log(`session "${s.sessionName}": gsd codex policy drift: ${check.drift.join('; ')}`)
+  log("session: gsd codex policy drift")
   return check.drift
 }
 
@@ -287,7 +287,7 @@ async function publishCard(
       await feishu.updateCard(s.gsdPanelMessageId, card)
       return true
     } catch (e) {
-      log(`session "${s.sessionName}": gsd panel update failed: ${messageOf(e)}; resending`)
+      logError('session: gsd panel update failed; resending', e)
     }
   }
   const messageId = await feishu.sendCard(s.chatId, card)
@@ -295,7 +295,7 @@ async function publishCard(
     s.gsdPanelMessageId = messageId
     return true
   }
-  log(`session "${s.sessionName}": gsd panel send failed`)
+  log("session: gsd panel send failed")
   await feishu.sendTextRaw(s.chatId, '❌ gsd 面板发送失败')
   return false
 }
@@ -339,7 +339,7 @@ export async function refreshGsdPanelIfPresent(s: Session): Promise<void> {
     const card = buildCard(s, undefined, awaiting)
     await publishCard(s, card)
   } catch (e) {
-    log(`session "${s.sessionName}": refreshGsdPanelIfPresent failed: ${messageOf(e)}`)
+    logError("session: refreshGsdPanelIfPresent failed", e)
   }
 }
 
@@ -384,7 +384,7 @@ export async function onGsdSelect(
     return resultWithCard(s, true, `已选择 ${snapshot.taskName || snapshot.taskSlug}`)
   } catch (e) {
     const message = `选择失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": gsd select failed: ${messageOf(e)}`)
+    logError("session: gsd select failed", e)
     return resultWithCard(s, false, message)
   }
 }
@@ -461,14 +461,14 @@ export async function onGsdContinue(
     // user can retry `gsd continue`. Matches daemon toast-first long-ops
     // (fork/back/resume). Create-task path still awaits (needs inject outcome).
     void s.onUserMessage(prompt).catch(e => {
-      log(`session "${s.sessionName}": gsd continue inject failed: ${messageOf(e)}`)
+      logError("session: gsd continue inject failed", e)
       clearGsdExecution(s)
       void refreshGsdPanelIfPresent(s)
     })
     return resultWithCard(s, true, '已注入')
   } catch (e) {
     const message = `继续失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": gsd continue failed: ${messageOf(e)}`)
+    logError("session: gsd continue failed", e)
     clearGsdExecution(s)
     return resultWithCard(s, false, message)
   }
@@ -495,7 +495,7 @@ export async function onGsdPause(
     return resultWithCard(s, true, snap.status === '已暂停' ? '已暂停' : '暂停未生效')
   } catch (e) {
     const message = `暂停失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": gsd pause failed: ${messageOf(e)}`)
+    logError("session: gsd pause failed", e)
     return resultWithCard(s, false, message)
   }
 }
@@ -521,7 +521,7 @@ export async function onGsdComplete(
     return resultWithCard(s, true, snap.status === '已完成' ? '已完成' : '完成未生效')
   } catch (e) {
     const message = `完成失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": gsd complete failed: ${messageOf(e)}`)
+    logError("session: gsd complete failed", e)
     return resultWithCard(s, false, message)
   }
 }
@@ -606,7 +606,7 @@ export async function startNamedGsdTask(
     const message = createdSlug
       ? `任务已创建（${createdSlug}）但未成功注入: ${detail}。可发 gsd continue 重试。`
       : `创建任务失败: ${detail}`
-    log(`session "${s.sessionName}": gsd create task failed: ${detail}`)
+    log("session: gsd create task failed")
     return resultWithCard(s, false, message)
   }
 }

@@ -34,7 +34,7 @@ import {
   codexModelIsGrok,
   codexModelIsApiRoute,
 } from './codex-models'
-import { log } from './log'
+import { logError, logDiagnostic } from './log'
 import {
   messageOf,
   type LifecycleLease,
@@ -54,6 +54,7 @@ export interface ModelPanelState {
   sourceRevision?: string
   page?: number
   totalPages?: number
+  refresh?: { source: TokenSource; mode: 'select' | 'add'; result: ModelActionResult }
 }
 
 export const MODEL_PAGE_SIZE = 20
@@ -102,7 +103,7 @@ export async function finishModelSettingsChange(
   if (error !== null) {
     change.phase = 'failed'
     change.error = `${error}。本次完整设置未保存，后续输入暂停；请重新发送 md 完成选择，或 restart 恢复已保存的设置。`
-    log(`session "${s.sessionName}": model settings incomplete: ${change.error}`)
+    logError('session-model: model settings incomplete', change.error)
     return modelChangeFailure(s, change.error)
   }
   s.modelSettingsChange = null
@@ -434,9 +435,6 @@ export function fixedModelChoices(s: Session): cards.ModelChoice[] {
 function providerChoices(s: Session): cards.ProviderChoice[] {
   const cur = s.currentTokenSource()
   return listTokenSources().map(source => s.tokenSource(source.id)!)
-    // native 是兜底项:仅在 enabled 时露面(本机未命中 Pro provider → 作为默认通路);
-    // disabled 说明本机已用 GLM,此时它没意义,不显示灰项干扰选择。
-    .filter(ts => ts.enabled || ts.kind !== 'claude-native')
     .map(ts => ({
       provider: ts.agent as AgentProvider,
       sourceId: ts.id,
@@ -503,11 +501,54 @@ export async function showModelPanel(s: Session): Promise<void> {
   }
 }
 
+/** Explicit list requests bypass the periodic cadence without holding the chat
+ * actor while I/O runs. Internal redraws and pagination keep their snapshot. */
+function refreshModelPanel(s: Session, source: TokenSource, panelId: string, mode: 'select' | 'add'): ModelActionResult {
+  const previous = s.modelPanels.get(panelId)!
+  if (previous.refresh?.source === source && previous.refresh.mode === mode
+    && previous.refresh.result.canPresent?.() !== false) return previous.refresh.result
+  const revision = source.spawnRevision
+  const accountId = source.accountId !== undefined || source.forAccount || source.kind === 'codex-subscription'
+    ? s.tokenSourceAccountId(source.id) : undefined
+  const epoch = s.modelPanelRefreshEpoch
+  const panel: ModelPanelState = { models: [], sourceId: source.id, mode, messageId: previous.messageId }
+  s.modelPanels.set(panelId, panel)
+  const current = (expected = panel) => Session.all.has(s) && !s.modelSettingsChangesClosed
+    && s.modelPanelRefreshEpoch === epoch && s.modelPanels.get(panelId) === expected && s.tokenSource(source.id) === source
+    && source.spawnRevision === revision && (accountId === undefined || s.tokenSourceAccountId(source.id) === accountId)
+  const stale = (): ModelActionResult => ({ ok: false, message: '模型面板或账号已变化，本次刷新未覆盖当前面板，请重新打开模型列表。', canPresent: () => false })
+  const failed = (message: string): ModelActionResult => ({
+    ok: false, message, canPresent: () => current(),
+    card: cards.selectionResultCard({ title: '模型目录刷新失败', message, ok: false }),
+  })
+  const message = `已开始刷新 ${source.display} 的模型列表，完成后会更新本卡。`
+  const result: ModelActionResult = {
+    ok: false, pending: true, message, canPresent: () => current(),
+    card: cards.selectionResultCard({ title: '⏳ 模型目录刷新中', message, ok: true }),
+    completion: Promise.resolve().then(() => source.refreshModels()).then(async () => {
+      if (!current()) return stale()
+      delete panel.refresh
+      const rendering = mode === 'add' ? onModelAddOpen(s, panelId, source.id) : onProviderSelect(s, source.id, panelId)
+      const renderedPanel = s.modelPanels.get(panelId)
+      const rendered = await rendering
+      return rendered.ok ? { ...rendered, canPresent: () => !!renderedPanel && current(renderedPanel) } : failed(rendered.message)
+    }).catch(error => {
+      logError('session-model: manual catalog refresh failed', error)
+      if (!current()) return stale()
+      delete panel.refresh
+      return failed(`模型目录刷新失败：${messageOf(error)}。请重新打开模型列表重试。`)
+    }),
+  }
+  panel.refresh = { source, mode, result }
+  return result
+}
+
 /** 第1级点账号 → 发第2级(该账号的模型列表)。返回第2级卡替换当前卡。 */
 export async function onProviderSelect(
   s: Session,
   sourceIdRaw: string,
   panelIdRaw = '',
+  refresh = false,
 ): Promise<ModelActionResult> {
   const sourceId = sourceIdRaw.trim()
   const ts = s.tokenSource(sourceId)
@@ -515,6 +556,10 @@ export async function onProviderSelect(
   if (!ts.enabled) return { ok: false, message: ts.modelCatalogState?.error ?? `${ts.display} 未配置,请先点「启用」` }
   const panelId = panelIdRaw.trim()
   if (!s.modelPanels.has(panelId)) return { ok: false, message: '模型面板已失效，请重新发送 model' }
+  if (refresh) {
+    if (s.modelSettingsChangesClosed || !Session.all.has(s)) return { ok: false, message: '会话已关闭，不能刷新模型目录' }
+    return refreshModelPanel(s, ts, panelId, 'select')
+  }
   if (ts.modelCatalogState?.status === 'failed') {
     return { ok: false, message: `模型目录 MISS：${ts.modelCatalogState.error ?? '刷新失败'}` }
   }
@@ -556,11 +601,15 @@ export async function onModelPage(s: Session, panelId: string, sourceId: string,
 }
 
 /** 可编辑来源的完整候选目录；不接受回调自行传入候选项或来源。 */
-export async function onModelAddOpen(s: Session, panelId: string, sourceId: string): Promise<ModelActionResult> {
+export async function onModelAddOpen(s: Session, panelId: string, sourceId: string, refresh = false): Promise<ModelActionResult> {
   const panel = s.modelPanels.get(panelId)
   const source = s.tokenSource(sourceId)
   if (!panel || panel.sourceId !== sourceId || !source?.enabled || !source.modelSelection) {
     return { ok: false, message: '模型管理面板已失效，请重新发送 md' }
+  }
+  if (refresh) {
+    if (s.modelSettingsChangesClosed || !Session.all.has(s)) return { ok: false, message: '会话已关闭，不能刷新模型目录' }
+    return refreshModelPanel(s, source, panelId, 'add')
   }
   if (source.modelCatalogState?.status !== 'ready') return { ok: false, message: source.modelCatalogState?.error ?? '目录未就绪' }
   const candidates = source.modelSelection.availableModels.filter(model =>
@@ -588,8 +637,8 @@ export async function onModelListEdit(
     if (users.length) return { ok: false, message: `补录模型仍被会话 ${users.map(session => session.sessionName).join('、')} 选用，请先切换再删除` }
   }
   try {
-    if (action === 'delete') await removeCustomTokenSourceModel(sourceId, model, s.codexAccountId())
-    else await editTokenSourceModels(sourceId, model, action, s.codexAccountId())
+    if (action === 'delete') await removeCustomTokenSourceModel(sourceId, model, s.tokenSourceAccountId(sourceId))
+    else await editTokenSourceModels(sourceId, model, action, s.tokenSourceAccountId(sourceId))
     // 其他面板的快照在列表变化后失效；不影响会话、进程和正在运行的 turn。
     for (const session of Session.all) {
       for (const [id, other] of session.modelPanels) {
@@ -667,7 +716,7 @@ export async function consumeModelCustomMessage(
       closed = await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } }, failure => { settingsFailure = failure })
       if (!closed) throw new Error(`model panel streaming-off rejected: ${formatFeishuError(settingsFailure)}`)
     } catch (e: any) {
-      log(`model-custom: card update MISS (${e?.message ?? e})`)
+      logError('session-model: card update failed', e)
       cardFailures.push(messageOf(e))
     } finally {
       if (cardId) {
@@ -680,15 +729,13 @@ export async function consumeModelCustomMessage(
             closed = await cardkit.patchSettingsChecked(cardId, { config: { streaming_mode: false } }, failure => { settingsFailure = failure })
             if (!closed) cardFailures.push(`model panel streaming-off rejected: ${formatFeishuError(settingsFailure)}`)
           } catch (e: any) {
-            log(`model-custom: streaming-off retry MISS (${e?.message ?? e})`)
+            logError('session-model: streaming close retry failed', e)
             cardFailures.push(formatFeishuError(e))
           }
         }
         if (replaced && closed) {
           try { await cardkit.dispose(cardId) }
-          catch (e: any) { log(`model-custom: card dispose MISS (${e?.message ?? e})`) }
-        } else {
-          log(`model-custom: retain card state after checked MISS mutation=${replaced} streamingOff=${closed} card=${cardId.slice(0, 12)}`)
+          catch (e: any) { logError('session-model: card disposal failed', e) }
         }
       }
     }
@@ -700,7 +747,7 @@ export async function consumeModelCustomMessage(
     const details = [...new Set(cardFailures)].join('\n')
     const fallback = `⚠️ 模型补录结果未能写回原卡。${result}${details ? `\n${details}` : ''}\n请重新发送 model 打开面板。`
     const sent = await feishu.sendTextRaw(s.chatId, fallback)
-    if (!sent) log(`model-custom: visible fallback send MISS (${result})`)
+    if (!sent) logDiagnostic('session-model: visible fallback send MISS')
     return false
   }
   const failCard = (reason: string) => updateCardOrFallback(
@@ -723,13 +770,12 @@ export async function consumeModelCustomMessage(
     return true
   }
   try {
-    await registerCustomTokenSourceModel(ts.id, model, s.codexAccountId())
+    await registerCustomTokenSourceModel(ts.id, model, s.tokenSourceAccountId(ts.id))
   } catch (error) {
-    log(`model-custom: config/refresh MISS (${messageOf(error)})`)
+    logError('session-model: config/refresh MISS', error)
     await failCard(`配置写入或模型刷新失败：${messageOf(error)}`)
     return true
   }
-  log(`model-custom: ${ts.id} 补录 ${model} by ${user}(记录已持久化)`)
   for (const session of Session.all) {
     for (const [id, panel] of session.modelPanels) {
       if (panel.sourceId === ts.id && (session !== s || id !== pending.panelId)) session.modelPanels.delete(id)
@@ -765,7 +811,7 @@ export async function consumeModelCustomMessage(
     if (result.completion) {
       void result.completion.then(present).catch(async error => {
         const message = `模型补录后的切换结果呈现失败：${messageOf(error)}`
-        log(`model-custom: ${message}`)
+        logError('session-model: custom model result delivery failed', error)
         await feishu.sendTextRaw(s.chatId, `❌ ${message}`)
       })
     }
@@ -1036,7 +1082,7 @@ export async function onModelEffortSelect(
       const message = selectionApplied
         ? `模型选择已保存，但后端重建失败: ${messageOf(e)}`
         : `模型切换失败: ${messageOf(e)}`
-      log(`session "${s.sessionName}": set model settings failed: ${messageOf(e)}`)
+      logError('session-model.settings_failed', e)
       await feishu.sendText(s.chatId, `❌ ${message}`)
       return { ok: false, message }
     } finally {
@@ -1108,7 +1154,7 @@ export async function onModelEffortSelect(
     // (SDK 记新 model,下轮/下次生效)。不再 stopIdle respawn —— 那基于旧 env-alias 假设,
     // 且会静默打断用户(发 model 选个模型就把 claude 进程杀了,离谱)。
     // 同 provider 且同 source 才热切换(env 没变,setModelSettings 改 model 即够);
-    // 跨 source(GLM↔DeepSeek↔native,即使同 provider)env 变了 → 跳过热切换,交给
+    // 跨 source(GLM↔DeepSeek↔Claude 订阅,即使同 provider)env 变了 → 跳过热切换,交给
     // applyModelSelection→stopIdleMismatchedProcess 杀进程重启换 env。热切换只改 model
     // 不重注入 env,跨 source 会打到上一个 source 的 base_url(silent divergence)。
     if (s.proc?.isAlive() && s.proc.provider === provider && !sourceChanged && !environmentChanged && !processNeedsStop) {
@@ -1142,7 +1188,7 @@ export async function onModelEffortSelect(
     }
   } catch (e) {
     const message = `模型切换失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": set model settings failed: ${messageOf(e)}`)
+    logError('session-model: set model settings failed', e)
     return { ok: false, message }
   }
 }

@@ -24,6 +24,10 @@ config.toml
 *.pid
 *.log
 
+# Python helper caches
+__pycache__/
+*.py[cod]
+
 # Build outputs
 dist/
 

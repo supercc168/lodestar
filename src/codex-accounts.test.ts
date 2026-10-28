@@ -1,22 +1,108 @@
 import { afterEach, describe, expect, spyOn, test } from 'bun:test'
 import * as fs from 'node:fs'
 import * as stateStore from './state-store'
-import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync, existsSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, statSync, symlinkSync, unlinkSync, writeFileSync, existsSync, lstatSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { CodexAccounts, reserveCodexLogin, isCodexLoginPending } from './codex-accounts'
+import { EventEmitter } from 'node:events'
+import { CodexAccounts, reserveCodexLogin, isCodexLoginPending, bindProcessCodexAccount,
+  boundCodexAccount, processCodexAccount, liveCodexQuotaReaders, watchCodexQuotaReaders } from './codex-accounts'
 
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
 function fixture() {
-  const root = mkdtempSync(join(tmpdir(), 'codex-account-test-')); roots.push(root)
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'codex-account-test-'))); roots.push(root)
   const home = join(root, 'native'); mkdirSync(home)
   writeFileSync(join(home, 'config.toml'), 'model = "test-model"\n')
   writeFileSync(join(home, 'auth.json'), '{"native":"must-not-change"}')
   return new CodexAccounts(home, join(root, 'accounts'), join(root, 'accounts.json'))
 }
 
+test('live quota discovery includes native owners, excludes controls/wrappers and fences rebinding', () => {
+  class Reader extends EventEmitter {
+    alive = true
+    isAlive() { return this.alive }
+    readRateLimits() { return Promise.resolve({}) }
+  }
+  const native = new Reader(), wrapper = new Reader(), unboundApi = new Reader()
+  const control = Object.assign(new EventEmitter(), { isAlive: () => true })
+  let changes = 0
+  const unwatch = watchCodexQuotaReaders(() => { changes++ })
+  try {
+    expect(boundCodexAccount(unboundApi)).toBeNull()
+    expect(processCodexAccount(unboundApi)).toBe('default')
+    bindProcessCodexAccount(control, 'registry-a')
+    bindProcessCodexAccount(wrapper, 'registry-a', false)
+    expect(changes).toBe(0)
+    expect(boundCodexAccount(wrapper)).toBe('registry-a')
+    expect(liveCodexQuotaReaders('registry-a')).toHaveLength(0)
+    bindProcessCodexAccount(native, 'registry-a')
+    const first = liveCodexQuotaReaders('registry-a')[0]!
+    expect(first.reader).toBe(native)
+    expect(first.isCurrent()).toBe(true)
+    expect(changes).toBe(1)
+    bindProcessCodexAccount(native, 'registry-a')
+    expect(first.isCurrent()).toBe(true)
+    expect(changes).toBe(1)
+    bindProcessCodexAccount(native, 'registry-b')
+    expect(first.isCurrent()).toBe(false)
+    expect(boundCodexAccount(native)).toBe('registry-b')
+    expect(liveCodexQuotaReaders('registry-a')).toHaveLength(0)
+    const second = liveCodexQuotaReaders('registry-b')[0]!
+    expect(second.isCurrent()).toBe(true)
+    native.alive = false; native.emit('exit')
+    expect(second.isCurrent()).toBe(false)
+    expect(liveCodexQuotaReaders('registry-b')).toHaveLength(0)
+    expect(changes).toBe(3)
+    unwatch()
+    bindProcessCodexAccount(wrapper, 'registry-b', true)
+    expect(changes).toBe(3)
+  } finally {
+    unwatch()
+    for (const proc of [native, wrapper, control]) proc.emit('exit')
+  }
+})
+
 describe('Codex native and named accounts', () => {
+  test('new accounts have private plugin caches and never copy another account installation state', () => {
+    const accounts = fixture()
+    const nativePlugins = join(accounts.defaultHome, 'plugins')
+    mkdirSync(join(nativePlugins, 'cache'), { recursive: true })
+    writeFileSync(join(nativePlugins, 'cache', 'native-plugin'), 'native only')
+    const first = accounts.prepareHome(accounts.ensure('one').id)
+    const second = accounts.prepareHome(accounts.ensure('two').id)
+    for (const home of [first, second]) {
+      expect(lstatSync(join(home, 'plugins')).isSymbolicLink()).toBe(false)
+      expect(existsSync(join(home, 'plugins', 'cache', 'native-plugin'))).toBe(false)
+    }
+    writeFileSync(join(first, 'plugins', 'one-only'), 'one')
+    expect(existsSync(join(second, 'plugins', 'one-only'))).toBe(false)
+    expect(existsSync(join(nativePlugins, 'one-only'))).toBe(false)
+  })
+
+  test('launch preparation repairs old shared plugins even when npm lifecycle was skipped', () => {
+    const accounts = fixture()
+    const account = accounts.ensure('old account')
+    const home = accounts.home(account.id)
+    const nativePlugins = join(accounts.defaultHome, 'plugins')
+    mkdirSync(home, { recursive: true })
+    mkdirSync(join(nativePlugins, 'cache'), { recursive: true })
+    writeFileSync(join(nativePlugins, 'cache', 'installed-plugin'), 'cached plugin')
+    symlinkSync(nativePlugins, join(home, 'plugins'), process.platform === 'win32' ? 'junction' : 'dir')
+    writeFileSync(join(home, 'auth.json'), 'account auth')
+    writeFileSync(join(home, 'plugin-install-state.json'), 'account installation state')
+    const env = accounts.env(account.id, {})
+    expect(env.CODEX_HOME).toBe(home)
+    expect(lstatSync(join(home, 'plugins')).isSymbolicLink()).toBe(false)
+    expect(readFileSync(join(home, 'plugins', 'cache', 'installed-plugin'), 'utf8')).toBe('cached plugin')
+    rmSync(join(home, 'plugins', 'cache', 'installed-plugin'))
+    accounts.env(account.id, {})
+    expect(existsSync(join(home, 'plugins', 'cache', 'installed-plugin'))).toBe(false)
+    expect(readFileSync(join(nativePlugins, 'cache', 'installed-plugin'), 'utf8')).toBe('cached plugin')
+    expect(readFileSync(join(home, 'auth.json'), 'utf8')).toBe('account auth')
+    expect(readFileSync(join(home, 'plugin-install-state.json'), 'utf8')).toBe('account installation state')
+  })
+
   test('each native login invalidates its cache revision without touching credentials or other accounts', () => {
     const accounts = fixture()
     const named = accounts.ensure('work')

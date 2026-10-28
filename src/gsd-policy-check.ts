@@ -2,7 +2,7 @@ import { spawnSync } from 'node:child_process'
 import { existsSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { log } from './log'
+import { logError } from './log'
 
 /**
  * GSD Codex 子 agent 分层策略一致性检查(harness 规则)。
@@ -71,7 +71,7 @@ export function checkGsdCodexPolicy(): GsdPolicyCheckResult {
     })
     let result: GsdPolicyCheckResult
     if (res.error) {
-      log(`gsd codex policy check error: ${res.error.message}`)
+      logError('gsd codex policy check error', res.error)
       result = { ok: true, drift: [], skipped: true }
     } else if (res.status === 0) {
       result = { ok: true, drift: [], skipped: false }
@@ -84,7 +84,7 @@ export function checkGsdCodexPolicy(): GsdPolicyCheckResult {
     cached = { at: now, result }
     return result
   } catch (error) {
-    log(`gsd codex policy check failed: ${error instanceof Error ? error.message : String(error)}`)
+    logError('gsd codex policy check failed', error)
     return { ok: true, drift: [], skipped: true }
   }
 }

@@ -33,7 +33,7 @@ export function createNotifyReplyRuntime(deps: {
   sendText(chatId: string, text: string): Promise<string | null>
   dispatch(reg: NotifyRegistration, response: NotifyTextResponse, openId: string): Promise<DispatchResult>
   onWaitingChanged(chatId: string): void
-  log(text: string): void
+  logError(event: string, error: unknown): void
 }) {
   const detailOf = (error: unknown) => error instanceof Error ? error.message : String(error)
   const unavailable = (reg: NotifyRegistration | undefined, chatId: string, openId: string): string | null => {
@@ -46,15 +46,15 @@ export function createNotifyReplyRuntime(deps: {
     if (isDispatching(reg.notifyId)) return '通知正在处理中'
     return null
   }
-  // 错误提示是尽力而为的旁路:飞书拒绝(非 0 code)或 SDK 重试耗尽时 sendText 返回
-  // null,这既不该变成新的异常,也不该让调用方把这条消息当成"消费失败"重走一遍
-  // (02-REVIEW WR-01)。
+  // A failed error notice must not make an already consumed reply execute twice.
   const report = async (chatId: string, message: string) => {
-    deps.log(`notify-reply: ${message}`)
+    deps.logError('notify.reply.presentation_failed', new Error(message))
     try {
-      if (!await deps.sendText(chatId, `❌ ${message}`)) deps.log(`notify-reply: 错误提示发送失败: ${message}`)
+      if (!await deps.sendText(chatId, `❌ ${message}`)) {
+        deps.logError('notify.reply.error_notice_failed', new Error('error notice not delivered'))
+      }
     } catch (error) {
-      deps.log(`notify-reply: 错误提示发送异常: ${detailOf(error)}`)
+      deps.logError('notify.reply.error_notice_failed', error)
     }
   }
   const update = async (reg: NotifyRegistration, messageId: string, card: object, context: string) => {
@@ -108,7 +108,7 @@ export function createNotifyReplyRuntime(deps: {
             setReplyState(previous.notifyId, cancelled)
             await update(previous, cancelled.promptMessageId, buildNotifyReplyCard(previous, cancelled), '已放弃上一条回复并切换通知')
           } catch (error) {
-            deps.log(`notify-reply: 取消 ${previous.notifyId} 失败，保留其等待态: ${detailOf(error)}`)
+            deps.logError('notify.reply.cancel_failed', error)
           }
         }
         const state: NotifyReplyState = {
@@ -194,6 +194,7 @@ export function createNotifyReplyRuntime(deps: {
           const recorded = reg.callbackUrl
             ? recordCallbackSuccess(reg.notifyId, undefined, openId)
             : { state: 'complete' as const }
+          if (recorded.state === 'unknown') deps.logError('notify.reply.unknown', new Error(recorded.detail))
           resolution = {
             kind: 'text', text, operatorOpenId: openId,
             status: recorded.state === 'unknown' ? 'unknown' : reg.callbackUrl ? 'delivered' : 'done',
@@ -207,7 +208,7 @@ export function createNotifyReplyRuntime(deps: {
             // and freeze this notification instead of enabling a duplicate.
             const detail = `${result.detail}；失败状态保存失败：${detailOf(error)}`
             try { markUnknown(reg.notifyId, undefined, openId, detail) }
-            catch (persistError) { deps.log(`notify-reply: UNKNOWN persistence failed: ${detailOf(persistError)}`) }
+            catch (persistError) { deps.logError('notify.reply.unknown_persist_failed', persistError) }
             resolution = { ...resolution, status: 'unknown', detail }
           }
         }
@@ -217,7 +218,6 @@ export function createNotifyReplyRuntime(deps: {
           : `回复未送达：${resolution.detail}`
         await update(reg, state.promptMessageId, buildNotifyReplyCard(reg, sending, resolution), context)
         await update(reg, reg.messageId, buildNotifyCardFromReg(reg, resolution), context)
-        deps.log(`notify-reply: notify_id=${reg.notifyId} status=${resolution.status}`)
         return true
       } finally {
         clearDispatching(reg.notifyId)

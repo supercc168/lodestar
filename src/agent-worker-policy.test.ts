@@ -1,20 +1,6 @@
-/**
- * D-11 口径 3「单层委派」回归网(合并版:上游 runIsolated 子进程模式 + 本地策略/接线用例)。
- *
- * 三层齐备,拒绝面各验其一:
- *  ①②  策略层 —— 会话归属 worker principal 的 startRun/followUp 首行即拒,绝不建 run;
- *  ③④⑥ 原生工具层 —— claude `disallowedTools` / codex `--disable multi_agent` + thread config;
- *  ⑤⑦  接线层 —— 主 Agent(session principal)仍可委派并续跑;worker 的指令/ROLE/开关同帧下发。
- * 指令注入点在 runner(agent-runner.ts 按 projectBound 拼接 DELEGATED_AGENT_INSTRUCTIONS /
- * PROJECT_AGENT_INSTRUCTIONS),不在 service 边界 —— ⑦ 据此把捕获点定在 service→runner 的
- * 传参面(只透传会话指令),注入后全文由第二组 12 连发用例逐 binding 校验。
- * 深度/子树闸门(MAX_DELEGATION_DEPTH / MAX_SUBTREE_ACTIVE_RUNS)已随实现删除,
- * 对应的源码常量断言一并移除(策略拒绝先行,闸门本就不可达)。
- *
- * SDK/真实启动链路用例一律走 runIsolated 子进程:同进程 mock.module 会漂到
- * tasklist 等真实 spawn 用例上(历史实测 4+1 fail),真实 createAgentProcess 还会
- * 拉起 claude-agent-process/codex-process 全依赖图 —— 子进程隔离是唯一稳定形态。
- */
+/** Recursive delegation retains project/chat ancestry, native tools,
+ * caller-owned delivery and the binding-specific input boundary.
+ * Native SDK launch probes run in isolated local child processes. */
 import { describe, expect, test } from 'bun:test'
 import { readFileSync } from 'node:fs'
 import { join } from 'node:path'
@@ -72,8 +58,8 @@ test('new and resumed workers use binding-specific delegation, caller-owned deli
     import { mock } from 'bun:test'
     import { EventEmitter } from 'node:events'
     const captured = []
-    mock.module('./src/token-source', () => ({ getTokenSourceForAccount: () => ({ id: 'test-source' }) }))
-    mock.module('./src/agent-session-registry', () => ({ rememberAgentSession() {} }))
+    mock.module('./src/token-source', () => ({ listTokenSources: () => [], getTokenSourceForAccount: () => ({ id: 'test-source' }) }))
+    mock.module('./src/agent-session-registry', () => ({ rememberAgentSession() {}, isAgentSession: () => false }))
     mock.module('./src/agent-launch', () => ({ createAgentProcess: options => {
       captured.push({ allowUserInput: options.allowUserInput, allowDelegation: options.allowDelegation,
         instructions: options.developerInstructions, role: options.hostEnv.LODESTAR_AGENT_ROLE, model: options.model,
@@ -90,7 +76,7 @@ test('new and resumed workers use binding-specific delegation, caller-owned deli
     for (const provider of ['codex', 'claude', 'dsh']) {
       for (const projectBound of [false, true]) {
         for (const resumeSessionId of [undefined, 'test-session']) {
-          await startAgentWorker({ identity: { tokenSourceId: 'test-source', provider, model: 'worker-model', supportedEfforts: ['high'] },
+          await startAgentWorker({ identity: { id: 'agent:test', tokenSourceId: 'test-source', provider, model: 'worker-model', supportedEfforts: ['high'] },
             projectBound, resumeSessionId, effort: 'high', codexAccountId: 'named-work', workDir: process.cwd(),
             prompt: 'task', developerInstructions: 'project rule', hostEnv: { LODESTAR_AGENT_ROLE: 'main' } }).done
         }
@@ -104,23 +90,23 @@ test('new and resumed workers use binding-specific delegation, caller-owned deli
   ])
   expect(captured.filter((launch: any) => launch.launch.kind === 'resume')).toHaveLength(6)
   for (const launch of captured) {
-    // 缺省判定(agent-runner):会话归属一律关闸,项目归属不设闸。
-    expect(launch.allowDelegation).toBe(!launch.allowUserInput)
+    // Both bindings retain native delegation unless explicitly opted out.
+    expect(launch.allowDelegation).not.toBe(false)
     expect(launch.role).toBe('worker')
     expect(launch.model).toBe('worker-model')
     expect(launch.effort).toBe('high')
     expect(launch.codexAccountId).toBe('named-work')
     expect(launch.instructions).toContain('project rule')
     expect(launch.instructions).not.toMatch(/\[\[send:|30 MB|files on|需要交付文件时直接提交/)
+    expect(launch.instructions).toContain('You may delegate work through Lodestar or provider-native Agent/subagent tools')
+    expect(launch.instructions).toContain('Return task results and local artifact paths to the caller')
+    expect(launch.instructions).toContain('Do not emit file-delivery markers')
     if (launch.allowUserInput) {
-      // 会话归属(projectBound=false):单层委派的指令层 —— 自己完成,不得再委派。
       expect(launch.instructions).toContain('You are a delegated Agent working on a task assigned by the main Agent.')
-      expect(launch.instructions).toContain('Complete this task yourself. You must not create or invoke any further Agents or subagents.')
-      expect(launch.instructions).toContain('If additional Agent work is needed, report the need to the main Agent so it can assign that work.')
-      expect(launch.instructions).not.toContain('You may delegate work through Lodestar or provider-native Agent/subagent tools')
-      expect(launch.instructions).not.toContain('Return task results and local artifact paths to the caller')
+      expect(launch.instructions).toContain('you may use question tools to ask the main Agent')
+      expect(launch.instructions).not.toContain('must not create or invoke any further Agents or subagents')
     } else {
-      // 项目归属(projectBound=true):上游多层语义 + caller-owned 交付 + 非交互输入策略。
+      // Project calls preserve nested delegation and caller-owned delivery without interactive input.
       expect(launch.instructions).toContain('You may delegate work through Lodestar or provider-native Agent/subagent tools')
       expect(launch.instructions).toContain('Manage any delegated work yourself; do not return requests for the caller to arrange additional Agent work.')
       expect(launch.instructions).toContain('Return task results and local artifact paths to the caller')
@@ -136,9 +122,6 @@ test('new and resumed workers use binding-specific delegation, caller-owned deli
     }
   }
 })
-
-/** D-11 口径 3:会话归属的 worker principal 不得再委派(文案与抛错路径见 agent-service.ts)。 */
-const NESTED_DELEGATION_ERROR = 'Delegated Agents cannot delegate again; ask the main Agent to assign additional work.'
 
 function identity(id: string, name = id): AgentIdentity {
   return {
@@ -241,32 +224,38 @@ async function delegatedWorker(makeHandle: () => AgentWorkerHandle) {
   return { service, root, artifacts, parent, worker: worker! }
 }
 
-describe('D-11 口径 3:单层委派(策略 + 原生工具 + 接线)', () => {
-  test('① worker principal 再委派在策略层被拒,拒绝先于任何副作用(无新 run 落盘)', async () => {
-    const control = controlledHandle()
-    const { service, root, artifacts, parent, worker } = await delegatedWorker(() => control.handle)
-    expect(worker.kind).toBe('worker')
-    const before = artifacts.map(item => item.runId).filter(Boolean)
-    await expect(service.startRun(worker, { identityIds: ['agent:a'], prompt: 'nested', description: 'nested run' }))
-      .rejects.toThrow(NESTED_DELEGATION_ERROR)
-    // 拒绝先于建 run:无任何新 run 落盘。
-    expect(artifacts.map(item => item.runId).filter(Boolean)).toEqual(before)
-    control.resolve(result('sid-child'))
-    await waitForStatus(service, root, parent.runId, 'completed')
-    await service.shutdown('test cleanup')
+describe('recursive worker delegation and explicit native capability controls', () => {
+  test('worker admission creates a bound descendant and cancellation reaches it', async () => {
+    const controls: ReturnType<typeof controlledHandle>[] = []
+    const { service, root, parent, worker } = await delegatedWorker(() => {
+      const control = controlledHandle(); controls.push(control); return control.handle
+    })
+    try {
+      const child = await service.startRun(worker, { identityIds: ['agent:a'], prompt: 'nested', description: 'nested run' })
+      expect(child).toMatchObject({ parentRunId: parent.runId, parentKind: 'delegate', depth: 1, chatId: parent.chatId })
+      await service.cancelRun(root, parent.runId, 'cancel descendants')
+      expect(service.getRun(root, child.runId).status).toBe('cancelled')
+    } finally { await service.shutdown('test cleanup') }
   })
 
-  test('② worker principal 不能借 follow-up 曲线再委派', async () => {
-    const control = controlledHandle()
-    const { service, root, parent, worker } = await delegatedWorker(() => control.handle)
-    await expect(service.followUp(worker, parent.runId, { identityId: 'agent:a', prompt: 'nested follow-up', description: 'nested follow-up' }))
-      .rejects.toThrow(NESTED_DELEGATION_ERROR)
-    control.resolve(result('sid-child'))
-    await waitForStatus(service, root, parent.runId, 'completed')
-    await service.shutdown('test cleanup')
+  test('worker can follow up its completed descendant while retaining ancestry', async () => {
+    const controls: ReturnType<typeof controlledHandle>[] = []
+    const { service, root, parent, worker } = await delegatedWorker(() => {
+      const control = controlledHandle(); controls.push(control); return control.handle
+    })
+    try {
+      const child = await service.startRun(worker, { identityIds: ['agent:a'], prompt: 'nested', description: 'nested run' })
+      for (let i = 0; i < 200 && controls.length < 2; i++) await new Promise(resolve => setTimeout(resolve, 1))
+      controls[1]!.resolve(result('sid-child'))
+      await waitForStatus(service, root, child.runId, 'completed')
+      const next = await service.followUp(worker, child.runId, { prompt: 'continue child', description: 'nested follow-up' })
+      expect(next).toMatchObject({ parentRunId: parent.runId, parentKind: 'delegate', depth: 1, resumedFromRunId: child.runId })
+      await service.cancelRun(root, parent.runId)
+      expect(service.getRun(root, next.runId).status).toBe('cancelled')
+    } finally { await service.shutdown('test cleanup') }
   })
 
-  test('③ codex worker 的启动参数与 thread config 同时关闭委派,默认档不受影响', () => {
+  test('③ Codex 显式opt-out关闭委派，默认档保持原生能力', () => {
     const restrictedArgs = buildCodexAppServerArgs(['-c', 'model_provider="x"'], false)
     expect(restrictedArgs.slice(restrictedArgs.indexOf('--disable'), restrictedArgs.indexOf('--disable') + 2))
       .toEqual(['--disable', 'multi_agent'])
@@ -286,7 +275,7 @@ describe('D-11 口径 3:单层委派(策略 + 原生工具 + 接线)', () => {
     expect(source).toContain('buildCodexAppServerArgs(opts.configArgs, opts.allowDelegation)')
   })
 
-  test('④ claude worker 在 SDK 层禁用原生委派工具,主 Agent 不受影响', () => {
+  test('④ Claude 显式opt-out关闭委派，默认档保持原生能力', () => {
     const captured = runIsolated(`
       import { mock } from 'bun:test'
       const captured = []
@@ -327,7 +316,7 @@ describe('D-11 口径 3:单层委派(策略 + 原生工具 + 接线)', () => {
     await service.shutdown('test cleanup')
   })
 
-  test('⑥ 贯通:worker 真实启动链路禁用委派,并按 projectBound 选择原生输入策略', () => {
+  test('⑥ worker 真实启动保留委派，仅项目归属禁用交互工具', () => {
     const captured = runIsolated(`
       import { mock } from 'bun:test'
       const captured = []
@@ -356,12 +345,12 @@ describe('D-11 口径 3:单层委派(策略 + 原生工具 + 接线)', () => {
       console.log(JSON.stringify(captured))
     `)
     expect(captured).toEqual([
-      { disallowedTools: ['Agent', 'Task'] },
+      { disallowedTools: null },
       { disallowedTools: ['AskUserQuestion', 'EnterPlanMode', 'ExitPlanMode'] },
     ])
   })
 
-  test('⑦ worker 身份:ROLE/capability/委派开关在 service 边界下发,指令注入点归 runner', async () => {
+  test('⑦ worker 身份:ROLE/capability在 service 边界下发,指令注入点归 runner', async () => {
     const seen: Array<{
       developerInstructions?: string
       hostEnv: Record<string, string | undefined>
@@ -386,7 +375,7 @@ describe('D-11 口径 3:单层委派(策略 + 原生工具 + 接线)', () => {
     expect(instructions).not.toContain(DELEGATED_AGENT_INSTRUCTIONS)
     expect(seen[0].hostEnv.LODESTAR_AGENT_ROLE).toBe('worker')
     expect(seen[0].hostEnv.LODESTAR_AGENT_CAPABILITY).toBeTruthy()
-    expect(seen[0].allowDelegation).toBe(false)
+    expect(seen[0].allowDelegation).not.toBe(false)
     expect(seen[0].projectBound).toBe(false)
 
     // 主 Agent 环境由 session.ts 写 ROLE='main'(与 worker 'worker' 对置):源码级钉住。

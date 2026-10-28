@@ -91,7 +91,22 @@ Token Source 管理账号凭据、模型目录、启动环境、默认模型、e
 | PackyAPI | `[token_source.packy]`、`[token_source.packy-secondary]`；按令牌目录筛选模型，Claude 入口默认精选 MiniMax M、Opus、Fable、Qwen Max 家族最新版；Codex 入口精选 Kimi K、Grok 家族最新版，主令牌与 `packy-codex` 共用凭据 |
 | DeepSeek Harness | `[token_source.deepseek-harness]`；模型、effort 与上下文容量来自当前安装的 DSH 原生目录 |
 | DSH GLM Coding Plan | `[token_source.dsh-glm]` 或复用 `glm`；账号接口返回模型，DSH 原生适配器提供能力和推理档位 |
-| Claude native | 沿用本机 Claude 配置，目录来自 SDK `supportedModels()`；有已启用的第三方 Claude 侧来源时让位 |
+
+Claude 订阅统一由 `claude-sub` 管理登录验证、模型目录和额度，在 `md` 中选择“Claude Code 订阅”。
+
+`claude-accounts.ts` 管理默认及按 `hi 备注` 首次收录的账号元数据，原生登录由用户手动完成；来源内部使用独立账号视图、模型目录和额度缓存。MD 汇总可用账号目录，启动时再校验实际选中的账号；默认账号未登录不会遮住已收录的可用账号。`claude-account-selection.ts` 只在启动时选号，不负责耗尽轮换。主会话首次提交输入前完成原生身份验证，账号实际变化会使旧模型/额度缓存失效。
+
+新增备注账号持久化经过 `authenticating`、`syncing`，首次 Skills/插件同步及共享历史准备完成后才进入 `ready`。认证后保留同一个 control-only 进程等待同步，最长 120 秒；普通模型、额度查询和任务启动只接受 ready 账号，已有默认账号会话继续运行。失败记录为 `sync_failed`，保留原因和重试时间，用户通过 `hi 备注` 显式重试；不随每分钟额度刷新重启同步进程。中断后保留未完成状态，旧版 `enrolling` 记录仍可通过显式收录恢复。原生控制查询不提交用户输入，但初始化仍会触发云同步，因此不能在首次认证完成后立即关闭进程。
+
+`claude-sync-warmup.ts` 核对原生身份对应的账号桶，要求 Skills 和插件各自有成功轮次标记、清单所列文件落地、待处理项和暂存目录清空，且连续两次间隔至少 5 秒的检查保持一致。原生复用此前成功轮次时，允许认证桶与启动前已完成快照完全一致；空远端集合有成功标记即可完成，不要求与默认账号技能集合相同。用户设置或本次启动设置显式关闭相应云同步时跳过该通道；缺目录、服务端未开放同步或未知文件格式不能推断为关闭，缺少完成证据仍超时报错。当前 SDK 无公开同步完成事件，检测依赖原生落盘标记，后续原生格式变化需适配。
+
+`session-activity.ts` 按实际存活的 Claude 订阅进程与账号绑定统计会话：执行中或最近 30 分钟收到用户消息即为活跃，启动、等待回答、排队和后台任务也计入；同群去重，当前待启动群排除后再加一。消息时间持久化，重启后可恢复近期活跃判断，不保存消息内容。
+
+`claude-quota.ts` 以完整 5h 额度为一份，所有账号统一：普通完整周窗口为 10 份，Fable 总周为 5 份、专属周为 10 份。5h、总周及实际返回的 OAuth、当前模型专属窗口均参与约束；缺值、重复、无效或过期重置时间均为 `MISS`，Fable 缺少唯一专属周也不参与选号。真实窗口耗尽与预测不足分别处理。
+
+令已有活跃会话为 `N`、新增后每小时需求 `d = 0.1 × (N+1)`，某窗口当前余额为 `R`、完整容量为 `C`、距重置为 `H` 小时。当前段需求为 `d × min(H,1)`，分数为 `(R - d × min(H,1)) / max(H,1)`；若 `H < 1`，另检查重置后需求 `d × (1-H)`，其分数为 `C - d × (1-H)`（按一小时计）。账号 `score` 取所有段分数的最小值，`pressure` 取各段需求/额度的最大值，全部段满足需求才是 `fits`。先选 fits 账号并按 score 降序、pressure 升序；预测不足但真实可用的账号保留 `ready`，按 pressure 升序、score 降序分摊。之后按活跃会话数升序、5h 剩余降序及默认/收录顺序排序。各窗口始终使用自己的重置时间，预留不改真实额度，也不从速率再次扣除；不设临期绝对优先，显式指定账号不经过这套自动排序。
+
+各账号共享默认目录下的 `projects`、`tasks`、`file-history`、`plans`，凭据与账号设置各自独立。`claude-session-lease.ts` 按共享历史真实路径和原生 session ID 管理 daemon 内的写入互斥：新会话和分叉先分配原生 UUID，恢复沿用原 ID，分叉在原生初始化完成前还保护源会话。只有确认原生进程退出才释放写入权；纯账号/模型/额度控制查询不取得写入权，不允许提交用户任务。历史路径按实际 cwd 归一化，兼容长路径编码及原生项目目录名覆盖。
 
 `model` 按 Claude Code、Codex、DeepSeek Harness 分组，组 ID 由 `ELEMENTS.modelAgentGroup` 生成。两个 Agent 下的 DeepSeek 来源都显示为 DeepSeek，协议 id 保持不变。选账号后进入模型列表；多个档位才展示 effort 卡，只有一个档位时直接应用，获取失败显示 `MISS`。同 provider/source 的切换调用 `setModelSettings`：Claude 和 DSH 从后续 turn 使用，Codex 保存选择并在重启进程后应用。跨 provider/source 或需要变更项目启动配置时，只能在空闲状态更换进程。
 
@@ -141,7 +156,7 @@ Claude 自带 ask 工具接到 SDK `canUseTool`：
 
 ## Claude 启动配置
 
-GLM、DeepSeek、OpenRouter 等来源先清除冲突的 Anthropic 环境变量（含模型角色、OAuth 和云供应商选择），再注入各自凭据；默认读取 `project`、`local` settings。Claude Code 订阅读取 `user`、`project`、`local`，通过进程级 `settings` 覆盖冲突路由和 API key helper，不改本机文件；SDK `accountInfo()` 确认第一方订阅后才向 streaming input 放行用户输入。Claude native 沿用本机环境并读取 `user`、`project`、`local`。Token Source 指定的 settings 来源优先；未绑定 Token Source 时才使用项目 `setting_sources`。给注入凭据的来源加上 `user` 会重新引入本机 settings 中的路由。
+GLM、DeepSeek、OpenRouter 等来源先清除冲突的 Anthropic 环境变量（含模型角色、OAuth 和云供应商选择），再注入各自凭据；默认读取 `project`、`local` settings。Claude Code 订阅读取 `user`、`project`、`local`，通过进程级 `settings` 覆盖冲突路由和 API key helper，不改本机文件；SDK `accountInfo()` 确认第一方订阅后才向 streaming input 放行用户输入。Token Source 指定的 settings 来源优先；未绑定 Token Source 时才使用项目 `setting_sources`。给注入凭据的来源加上 `user` 会重新引入本机 settings 中的路由。
 
 ### Codex 侧行为保持原样
 
@@ -181,6 +196,24 @@ Claude 使用 `permissionMode: default`：普通工具在 `canUseTool` 中放行
 - 对话卡续卡 banner 在 Codex 下保持 `Codex turn` 原文，在 Claude 下显示 `Claude turn`。
 - Grok 选择、默认值和旧持久化值统一落到 Claude provider；Codex Grok profile 从 picker/TokenSource 过滤并在 spawn 边界拒绝。
 - Grok query 使用路由专属 effort（无痕 `high` / CatCodex `xhigh`）+ disabled Claude adaptive thinking；这只改善兼容率，不掩盖上游 content-block 错误。
+安全模式由 `[claude.safe_mode]` 按 Token Source 与模型目录 ID 配置，所有来源（包括 `claude-sub`）默认关闭，仅显式配置后开启。主会话、委派、续跑和分叉共用判断；启用后复用本机已配置的 GLM Key，固定通过 `https://api.z.ai/api/coding/paas/v4` 的 `glm-5.3-flash` 翻译与按规则审查。普通用户聊天的首条输入、运行中追加输入及提问答案值先译为英文。主模型输出语言不受限制，面向飞书的自然语言输出统一经 Flash 译为中文展示；`AskUserQuestion` 保留原生问题键和选项对应关系，提交的答案值使用英文译文。Linux 与 macOS 使用同一套逻辑。
+
+Flash 的请求按普通对话组织：固定的简短 system 提示词，按顺序排列的历史原文（user）与译文（assistant），最后追加当前目标语言要求和待翻译自然文本。每条原文前的 `Source` 标题说明谁对谁说、来自哪种可见内容；它是对话来源说明，不是 SDK 元数据，旧记录未区分的来源会明确标注。提示词只要求忠实翻译、保持术语一致及按显式规则审查，不回答或执行原文中的任务。模型不接收 JSON 数据包、字段边界、会话 ID、消费状态或原生事件结构。正常响应直接返回完整译文；只有拒绝或需检查时才以 `[[TRANSLATION_REJECT]]` 或 `[[TRANSLATION_REVIEW]]` 开头并附原因，由程序解析，不作为译文展示。只接受完整结束的单个正文，不解析思考内容，也不再发起独立模型复核。
+
+字段提取、对应关系和译文回填由程序负责。围栏代码、文件正文及交付标记绕过 Flash，回填时保留原值；句中的行内代码、路径和链接保留在自然语句中，程序校验其原值和数量。每个提取的自然语言片段调用一次国际 Coding Plan 的 `POST /chat/completions`，多字段逐项翻译，当前批次的已完成译文用于后续片段的术语一致性；纯代码或协议内容无需模型请求。
+
+翻译上下文是 Lodestar 自行记录的输入输出历史，按工作目录和 Claude session id 隔离，不读取 Claude Code 的完整上下文或原生 transcript。记录用户已提交的原文及英文译文，以及经验证用于飞书展示的 Claude 自然语言原文和中文译文；尚未消费的输入单独标记，取消后移除。宿主注入规则、内部用户或系统消息、主会话未展示的问答及任务回执、思考内容、文件内容和原始工具数据不进入这份历史；子 Agent 卡片实际展示的回执仍翻译并记录。
+
+翻译调用不额外保存请求、响应或原始正文调试日志。调用失败按统一日志规则记录不含用户身份的故障摘要；原始错误继续反馈给对应调用方。翻译上下文用于术语一致性、续跑和分叉，仍按上述规则保存。
+
+续跑恢复本地保存的翻译历史；分叉只继承指定 checkpoint 及以前的记录，再绑定新 session id。私有记录使用 v2 的独立原文和译文字段；v1 仅按已知且无歧义的双语包装格式迁移，不猜测、不读取原生历史重建。旧会话尚无本地翻译记录时，从本次启用开始积累。已有记录损坏、归属不符、旧格式歧义或分叉锚点缺失时明确报错。
+
+每次翻译操作读取一份不可变的输入输出历史快照，仅用于理解指代和术语。模型历史只使用原文与译文，保留已记录的自然语言，不按条数或长度静默裁剪；围栏代码和交付协议直接排除，不插入省略占位说明。翻译失败或取消后未发出的内容不记作已展示输出；若上游拒绝请求，按实际错误报告。
+
+翻译只覆盖飞书原有的自然语言展示，包括主 Agent 正文、命令首行 `# desc:` 说明、Task/Todo 任务文字、MCP 已知自然语言字段、后台 `task_*` 说明与结果、Cron 触发提示词、原生错误，以及委派任务的说明、结果和问答。子 Agent 仍通过原有后台进度、完成通知和工具步骤展示，原先隐藏的逐条正文继续隐藏。展示使用独立的已验证译文；执行命令、工具参数、任务状态和 ID、原始 API 结果与问答键保持原值，委派 API 不返回中文展示字段，也不为卡片译文新增委派历史产物。代码、文件内容、路径、链接、命令 stdout/stderr 和文件交付标记不翻译。静态中文界面、翻译服务自身错误及宿主系统诊断直接展示，不递归调用翻译器。
+
+可通过 `[claude].translation_validation_rules` 指定输入内容规则；缺省只做忠实翻译，不自动按身份或地区拦截。拒绝、需检查标记、接口失败或本地标记/字面量校验失败均明确报错，不放行未通过的文本，不切换模型或端点。此模式不改写原生历史、项目文件或工具执行数据。指令类内容明确不送 Flash：Claude Code 原生的 `CLAUDE.md`、`MEMORY.md` 和 Skills 由其自行处理，自定义 developer/system 指令原样传递，宿主自有英文模板直接使用。这些是翻译范围的明确例外，不要求全部原生上下文均为英文。仍保留真实宿主身份和文件交付协议，不隐藏运行环境，也不保证账号风控结果。配置方式见[本机配置](configuration.md#本机配置)。
+
 Lodestar 每次启动 Claude SDK 子进程时自动设置 `CLAUDE_CODE_ENABLE_TODO_TOOLS=1`，让新版 Claude 及第三方模型继续提供任务清单工具。安装或升级后无需手动修改配置，已有进程需重新启动后生效。任务创建和状态更新显示在会话卡片中，是否使用清单由 Agent 判断，项目 `tools` 限制仍生效。
 
 ## OpenRouter
@@ -237,7 +270,7 @@ Agent 运行依赖由 `src/agent-updates.ts` 独立安装，daemon 启动时不�
 - 每个进程默认读取项目 `.mcp.json` 的 stdio/HTTP MCP，并加载 `.agents/skills`、`.dsh/skills` 和 Lodestar 管理的 Skill。项目 `tools` 和 `load_project_mcp` 对 DSH 生效。
 - 图片 MIME 由文件字节识别。飞书下载的 JPEG 可能使用 `.png` 文件名，不能据扩展名声明编码；无法识别的图片明确报错。
 - 运行状态保存在 `src/paths.ts` 的 `DSH_HOME_DIR`。不读取用户 DSH settings 或凭据文件；`DEEPSEEK_API_KEY`、`DEEPSEEK_BASE_URL` 由选定账号显式注入。默认 telemetry 插件不加载。
-- 委派 worker 与原生子 Agent 均保留继续派工能力。Lodestar 调用上下文通过原生 ShellEnv 传给当前 Agent 及其后代，Agent CLI 使用它保留项目、群和任务归属。
+- 委派 worker 与原生子 Agent 均保留继续派工能力。Lodestar 调用上下文通过原生 ShellEnv 传给当前 Agent 及其后代，Agent CLI 使用它保留项目、对话 ID（`chat_id`）和任务归属。
 - 中断使用不可变原因对象，避免 Node fetch 附加 `stack` 属性后破坏 DSH 的无损 JSON 日志校验。关闭先回收 Agent，再通过协议、stdin EOF 与精确子进程终止确认退出。
 
 需要 Node 22.19+（22.x）或 Node 24+；`[token_source.deepseek-harness].bin` 指定 Node 路径。DSH 是开发者预览版，升级依赖时须同步检查桥接协议并运行原生集成测试。`src/dsh-process.test.ts` 使用真实运行时和本地模拟模型/MCP，不连接飞书或付费 API。
@@ -248,11 +281,11 @@ Agent 运行依赖由 `src/agent-updates.ts` 独立安装，daemon 启动时不�
 
 各进程类将原生文本、工具、结果、用量、压缩和后台任务转换成 `AgentProcess` 事件。共享事件由 Session 和卡片消费，保留各后端在初始化、上下文和后台任务上的差异。
 
-主 Agent、委派 Agent 和原生子 Agent 均可继续派工，不设置 Lodestar 委派层数上限，也不禁用各后端原生委派工具。Skill、worker 提示词和运行时入口保持一致；项目调用的非交互要求及调用方负责交付的规则沿委派链继承。Lodestar 后续任务记录当前调用方作为父任务，续跑来源单独记录，取消沿父子关系传播。运行状态原子落盘，大段输入输出单独存放；委派会话登记后从主群的历史列表中排除。
+主 Agent、委派 Agent 和原生子 Agent 均可继续派工，不设置 Lodestar 委派层数上限，也不禁用各后端原生委派工具。Lodestar Agent 不支持调用 Claude 订阅，遵守 Claude 用户协议；中转站等第三方来源的 Claude 模型仍可调用。限制仅按来源 ID 与类型判断，不按模型名称或显示名判断，主会话的 Claude 订阅能力不受影响。Skill、worker 提示词和运行时入口保持一致；项目调用的非交互要求及调用方负责交付的规则沿委派链继承。Lodestar 后续任务记录当前调用方作为父任务，续跑来源单独记录，取消沿父子关系传播。运行状态原子落盘，大段输入输出单独存放；委派会话登记后从主会话的历史列表中排除。
 
 委派、原生子 Agent 和后台任务由同一个 `AgentCards` 实例展示。每项仅显示状态和一句说明，类型、进度、任务正文、结果、待回答问题及失败原因放在折叠体内，动作只展示最近三步。原生子 Agent 启动即展示，普通前台命令仍在观察池中；启动工具和 SDK task id 关联后只保留一项。
 
-群尾委派卡复用至容量用满或出现新消息；原任务继续在原卡更新，后台任务不再迁移。Card Kit 生命周期由共享卡片统一结算，停止主进程只结算其所属任务，不关闭仍有委派执行的共享卡；不展示 depth、session id 或 request id。
+按对话 ID 定位消息尾部的委派卡，复用至容量用满或出现新消息；原任务继续在原卡更新，后台任务不再迁移。Card Kit 生命周期由共享卡片统一结算，停止主进程只结算其所属任务，不关闭仍有委派执行的共享卡；不展示 depth、session id 或 request id。
 
 ## 源码与验证
 

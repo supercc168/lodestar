@@ -1,9 +1,6 @@
-/** Agent 运行时包安装子进程封装(上游 9a6209b 摘录)。
- *
- *  与上游的差异:上游依赖第三方 spawn 包处理 Windows `.cmd` 垫片,本地按
- *  「零新增依赖」硬约束改用内置 `node:child_process`(与 codex-process.ts 同惯例);
- *  spawn 仍走参数数组形式,不拼 shell 字符串(T-02-17)。 */
-import { execFile, spawn } from 'node:child_process'
+import { execFile } from 'node:child_process'
+import { realpathSync } from 'node:fs'
+import { spawn } from 'cross-spawn'
 
 const REGISTRY = 'https://registry.npmjs.org'
 
@@ -30,6 +27,10 @@ export async function installAgentPackages(directory: string, signal?: AbortSign
   terminationTimeoutMs?: number
 } = {}): Promise<void> {
   signal?.throwIfAborted()
+  // npm 10 can treat an aliased --prefix (for example /var vs /private/var)
+  // as a linked project and silently drop root overrides. Use one physical
+  // directory for both the project root and cwd before dependency resolution.
+  directory = realpathSync(directory)
   const platform = options.platform ?? process.platform
   const timeoutMs = options.timeoutMs ?? 300_000
   const terminationTimeoutMs = options.terminationTimeoutMs ?? 10_000

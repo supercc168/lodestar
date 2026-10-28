@@ -17,6 +17,7 @@ const routing: ConversationRouting = {
   provider: 'codex',
   model: 'gpt-5.6-sol',
   effort: 'high',
+  tokenSourceId: null,
 }
 
 function createOptions(launch: ConversationLaunch = { kind: 'fresh' }): CreateTempSessionOptions {

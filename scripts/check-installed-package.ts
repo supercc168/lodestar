@@ -14,14 +14,17 @@ assert.equal(installed.version, expected.version)
 assert.ok(!Object.keys(installed.dependencies).some(name => name.startsWith('@deepseek-ai/') || name.startsWith('@anthropic-ai/') || name === '@openai/codex'),
   'Agent 不应作为固定发布依赖安装')
 
-const help = Bun.spawnSync({ cmd: [join(prefix, 'node_modules/.bin/lodestar-agent'), '--help'], stdout: 'pipe', stderr: 'pipe' })
-assert.equal(help.exitCode, 0, help.stderr.toString())
-assert.ok(help.stdout.toString().includes('lodestar-agent'), 'npm 命令链接没有执行 CLI')
+for (const command of ['lodestar-agent', 'lodestar-claude']) {
+  const help = Bun.spawnSync({ cmd: [join(prefix, 'node_modules/.bin', command), '--help'], stdout: 'pipe', stderr: 'pipe' })
+  assert.equal(help.exitCode, 0, help.stderr.toString())
+  assert.ok(help.stdout.toString().includes(command), `${command} npm 命令链接没有执行 CLI`)
+}
 
 const scratch = mkdtempSync(join(tmpdir(), 'lodestar-installed-check-'))
 const entry = join(scratch, 'probe.ts')
 const output = join(packageRoot, 'dist', '_installed_runtime_check.js')
 assert.ok(!existsSync(output), '安装目录已存在同名验收文件')
+let verified = false
 try {
   writeFileSync(entry, `
     import assert from 'node:assert/strict'
@@ -56,7 +59,12 @@ try {
   assert.equal(code, 0, `${stdout}\n${stderr}`)
   console.log(stdout.trim())
   console.log(JSON.stringify({ installedVersion: installed.version, latestAgentRuntimes: 'passed', cliSymlink: 'passed' }))
+  verified = true
 } finally {
-  if (existsSync(output)) unlinkSync(output)
-  rmSync(scratch, { recursive: true })
+  try {
+    if (existsSync(output)) unlinkSync(output)
+    if (verified) rmSync(scratch, { recursive: true })
+  } finally {
+    if (existsSync(scratch)) console.error(`安装包验收未完成或清理失败，诊断目录已保留：${scratch}`)
+  }
 }

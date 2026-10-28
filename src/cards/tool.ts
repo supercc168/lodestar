@@ -130,6 +130,7 @@ export function summarizeToolInput(name: string, input: any): string {
 }
 
 function summarizeServerSideToolInput(name: string, input: any): string {
+  if (typeof input?.__displayDescription === 'string' && input.__displayDescription.trim()) return input.__displayDescription
   const tool = typeof input?.tool === 'string' && input.tool
     ? input.tool
     : serverSideToolName(name)
@@ -168,7 +169,8 @@ function bashPresentation(input: any): { description: string; command: string } 
   const explicit = String(input?.description ?? input?.reason ?? '').trim()
   // desc 注释 / 包装剥离统一走 shell-command 模块,与后台卡、子 agent 简报共用一份解析。
   const info = shellCommandPresentation(rawCommand)
-  return { description: info.description || explicit, command: info.command }
+  const translated = typeof input?.__displayDescription === 'string' ? input.__displayDescription : undefined
+  return { description: translated ?? (info.description || explicit), command: info.command }
 }
 
 function fenceBlock(text: string, lang = ''): string {
@@ -195,7 +197,8 @@ function inlineCode(v: unknown): string {
 /** Compact status-only shell panels: keep title/status on the card, hide
  * command text and stdout/stderr so long shell runs don't bloat Feishu cards
  * into 200860 "card over max size". */
-function shellStatusLabel(output: string | null): string {
+function shellStatusLabel(output: string | null, status?: string): string {
+  if (status === '❌') return output?.includes('已拒绝') ? '已拒绝' : '执行失败'
   if (output == null) return '执行中'
   return '已完成'
 }
@@ -205,10 +208,11 @@ function renderCompactShellBody(
   output: string | null,
   resolvedNote?: string,
   extras: string[] = [],
+  status?: string,
 ): string {
   const lines: string[] = []
   if (title) lines.push(`**标题**: ${title}`)
-  lines.push(`**状态**: ${shellStatusLabel(output)}`)
+  lines.push(`**状态**: ${shellStatusLabel(output, status)}`)
   for (const line of extras) {
     if (line) lines.push(line)
   }
@@ -217,7 +221,8 @@ function renderCompactShellBody(
     lines.push(resolvedNote)
   }
   lines.push('')
-  lines.push('_命令与输出已隐藏，详见服务端日志。_')
+  if (status === '❌' && output) lines.push(outputPreviewBlock(output))
+  else lines.push('_命令与输出已隐藏。_')
   return lines.join('\n')
 }
 
@@ -238,23 +243,34 @@ function firstStringField(value: unknown): string {
   return ''
 }
 
-function renderBashBody(input: any, output: string | null, resolvedNote?: string): string {
-  // Feishu card size (200860) is easily blown by dumping full command + stdout.
-  // Header already carries title+status; body stays compact: title/status only.
+function renderBashBody(input: any, output: string | null, resolvedNote?: string, details = false, status?: string): string {
   const info = bashPresentation(input)
   const title = info.description || summarizeBashInput(input) || 'Shell'
   const extras: string[] = []
   const cwd = input?.cwd ?? input?.workdir
   if (cwd) extras.push(`**cwd**: ${inlineCode(cwd)}`)
-  return renderCompactShellBody(title, output, resolvedNote, extras)
+  // Approval needs an inspectable command. Translated tool events keep the
+  // verified purpose and bounded result while retaining the native command.
+  if (details || typeof input?.__displayDescription === 'string') {
+    return [
+      `**标题**: ${title}`,
+      `**目的**: ${title}`,
+      `**状态**: ${shellStatusLabel(output, status)}`,
+      ...extras,
+      '', '**命令**', fenceBlock(info.command || '(空命令)', 'bash'),
+      ...(resolvedNote ? ['', resolvedNote] : []),
+      ...(output == null ? [] : ['', '---', '**output:**', outputPreviewBlock(output)]),
+    ].join('\n')
+  }
+  return renderCompactShellBody(title, output, resolvedNote, extras, status)
 }
 
-function renderShellSessionBody(input: any, output: string | null, resolvedNote?: string): string {
+function renderShellSessionBody(input: any, output: string | null, resolvedNote?: string, status?: string): string {
   const session = input?.session_id ?? input?.sessionId
   const title = summarizeShellSessionInput(input)
   const extras: string[] = []
   if (session !== undefined) extras.push(`**session**: ${inlineCode(session)}`)
-  return renderCompactShellBody(title, output, resolvedNote, extras)
+  return renderCompactShellBody(title, output, resolvedNote, extras, status)
 }
 
 function fileChangeEntries(input: any): any[] {
@@ -782,12 +798,14 @@ function renderServerSideToolBody(name: string, input: any, output: string | nul
     `**类型**: 模型服务端内置工具`,
     `**tool**: ${inlineCode(typeof input?.tool === 'string' && input.tool ? input.tool : serverSideToolName(name))}`,
   ]
+  if (typeof input?.__displayDescription === 'string' && input.__displayDescription.trim()) lines.push(`**目的**: ${input.__displayDescription}`)
   const rawInput = input?.input
   if (rawInput && typeof rawInput === 'object') {
     lines.push('')
     lines.push('**input**')
     if (Object.keys(rawInput).length > 0) {
-      lines.push(jsonBlock(rawInput, 2000))
+      const { __displayDescription: _displayDescription, ...visibleInput } = rawInput
+      lines.push(jsonBlock(visibleInput, 2000))
     } else {
       lines.push('_provider 未提供结构化 input_')
     }
@@ -896,9 +914,9 @@ export function toolCallElement(
     : `${status} 🔧 ${toolName}`
   const noteBlock = resolvedNote ? `\n\n${resolvedNote}` : ''
   const body = isBashCommandTool(name)
-    ? renderBashBody(input, output, resolvedNote)
+    ? renderBashBody(input, output, resolvedNote, false, status)
     : isShellSessionTool(name)
-      ? renderShellSessionBody(input, output, resolvedNote)
+      ? renderShellSessionBody(input, output, resolvedNote, status)
       : isServerSideTool(name)
         ? renderServerSideToolBody(name, input, output, resolvedNote)
         : isFileChangeTool(name)
@@ -1037,7 +1055,7 @@ export function toolCallPermissionElement(
     ? `🔐 等审批 · ${toolName}: ${summary}`
     : `🔐 等审批 · ${toolName}`
   const inputBlock = isBashCommandTool(name)
-    ? renderBashBody(input, null)
+    ? renderBashBody(input, null, undefined, true)
     : isShellSessionTool(name)
       ? renderShellSessionBody(input, null)
       : isFileChangeTool(name)

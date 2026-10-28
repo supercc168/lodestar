@@ -306,6 +306,15 @@ describe('applyBgToolUse / applyBgToolResult — 双池 steps 累积', () => {
     expect(s.active[0].steps[0].brief).not.toContain('# desc')
   })
 
+  test('translated shell descriptions and result prose reach background steps without mutating commands', () => {
+    let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
+    const input = Object.freeze({ command: '# desc: Inspect project files\nls /tmp/中文', __displayDescription: '检查项目文件' })
+    s = applyBgToolUse(s, 'p', 'tu', 'Bash', input)
+    s = applyBgToolResult(s, 'p', 'tu', '已读取项目文件', false)
+    expect(s.active[0].steps[0].brief).toBe('Bash 检查项目文件 → 已读取项目文件')
+    expect(input.command).toBe('# desc: Inspect project files\nls /tmp/中文')
+  })
+
   test('tool_result 错误加 ❌', () => {
     let s: BgStore = { active: [mk({ id: 't1', toolUseId: 'p', status: 'running' })], pending: [] }
     s = applyBgToolUse(s, 'p', 'tu', 'Bash', { command: 'npm test' })
@@ -415,7 +424,7 @@ describe('isBgTerminal / hasActiveBgTask', () => {
 })
 
 describe('任务面板：标题简洁，详情折叠', () => {
-  test('短说明标题单行，展开保留错误、终态摘要及全部步骤', () => {
+  test('短说明标题单行，展开保留错误、完整结果及最近三步', () => {
     const panel = backgroundTaskPanel(mk({
       id: 'long', status: 'failed', description: '检查认证流程', error: '读取失败', summary: '部分结果',
       steps: [1, 2, 3, 4].map(i => ({ toolUseId: String(i), tool: 'Read', brief: `检查步骤 ${i}` })),
@@ -426,7 +435,8 @@ describe('任务面板：标题简洁，详情折叠', () => {
     const body = panel.elements[0].content
     expect(body).toContain('读取失败')
     expect(body).toContain('部分结果')
-    expect(body).toContain('检查步骤 1')
+    expect(body).not.toContain('检查步骤 1')
+    expect(body).toContain('检查步骤 2')
     expect(body).toContain('检查步骤 4')
   })
 })
@@ -440,7 +450,7 @@ describe('backgroundLiveSummary — 聊天列表预览全文(建卡与刷新共�
 })
 
 describe('任务 panel —— 标题状态+时长,展开详情', () => {
-  test('running:header 写「责任人·描述 — 运行中 <档位>」,时长随 now', () => {
+  test('running:header 保留责任人与说明，不显示活跃计时', () => {
     const t = mk({ id: 't1', type: 'subagent', description: '搜索认证', status: 'running', startedAt: 0, subagentType: 'Explore' })
     const panel = backgroundTaskPanel(t, 45_000) as any
     expect(panel.tag).toBe('collapsible_panel')
@@ -448,22 +458,22 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     expect(panel.element_id).toBe(BG_ELEMENTS.panel('t1'))
     expect(panel.header.title.content).toContain('Explore')
     expect(panel.header.title.content).toContain('搜索认证')
-    expect(panel.header.title.content).toContain('运行中')
-    expect(panel.header.title.content).toContain('(<1m)')
+    expect(panel.header.title.content).toContain('子 Agent正在执行')
+    expect(panel.header.title.content).not.toContain('(<1m)')
   })
 
-  test('running + second 模式:header 写精确秒数', () => {
+  test('共享行 second 模式也不显示活跃计时', () => {
     const t = mk({ id: 't1', type: 'subagent', description: '搜索认证', status: 'running', startedAt: 0, subagentType: 'Explore' })
     const panel = backgroundTaskPanel(t, 45_000, 'second') as any
-    expect(panel.header.title.content).toContain('(45s)')
+    expect(panel.header.title.content).not.toContain('(45s)')
     expect(panel.header.title.content).not.toContain('<1m')
   })
 
   test('运行中详情不展示静止的计时数字', () => {
     const t = mk({ id: 't1', type: 'subagent', description: '搜索认证', status: 'running', startedAt: 0, subagentType: 'Explore' })
     const panel = backgroundTaskPanel(t, 45_000) as any
-    // header 用随 tick 更新的档位标签;body 不冻结任何秒数。
-    expect(panel.header.title.content).toContain('(<1m)')
+    // 共享行不需要定时刷新计时，正文也不冻结运行秒数。
+    expect(panel.header.title.content).not.toContain('(<1m)')
     expect(panel.elements[0].content).not.toContain('45s')
   })
 
@@ -479,7 +489,7 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     const panel = backgroundTaskPanel(t, 53000) as any
     const title = panel.header.title.content
 
-    expect(title).toBe('⚙️ shell · 后台轮询READY后立即serialize Track C — 🟡 运行中 (<1m)')
+    expect(title).toBe('⏳ 后台进程正在执行 · 后台轮询READY后立即serialize Track C')
     expect(title.split('\n')).toHaveLength(1)
     expect(title).not.toContain('# desc:')
     expect(title).not.toContain('cd /Users')
@@ -490,7 +500,7 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     const command = 'cd /workspace\nset -e\nbun test src/cards/background.test.ts'
     const running = mk({ id: 't1', type: 'shell', description: command, status: 'running', startedAt: 0 })
     const title = (backgroundTaskPanel(running, 53000) as any).header.title.content
-    expect(title).toContain('Shell 脚本 · 3 行 · bun test src/cards/background.test.ts')
+    expect(title).toContain('Shell 脚本 · 3 行 · bun test src/cards/')
     expect(title.split('\n')).toHaveLength(1)
     expect(title).not.toContain('cd /workspace')
 
@@ -513,22 +523,22 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     expect(panel.header.title.content).toContain('用时 3h')
   })
 
-  test('失败状态与耗时在标题可见（body 精简不回显耗时）', () => {
+  test('失败状态与实际耗时可见', () => {
     const t = mk({ id: 't1', status: 'failed', startedAt: 0, usage: { total_tokens: 1, tool_uses: 1, duration_ms: 12000 } })
     const panel = backgroundTaskPanel(t) as any
     expect(panel.header.title.content).toContain('失败')
     expect(panel.header.title.content).toContain('12s')
-    expect(panel.elements[0].content).not.toContain('12s')
+    expect(panel.elements[0].content).toContain('12s')
   })
 
-  test('body 精简:不含用量/摘要,无 steps 时占位', () => {
+  test('body 不含用量，保留实时进度', () => {
     const t = mk({ id: 't1', type: 'subagent', description: 'd', status: 'running', subagentType: 'Explore', usage: { total_tokens: 1200, tool_uses: 8, duration_ms: 1000 }, summary: '命中 3 处' })
     const panel = backgroundTaskPanel(t, 1000) as any
     const body = panel.elements[0]
     expect(body.element_id).toBe('bgb_2alkgm') // bgb_ + shortIdHash('t1')
     expect(body.content).not.toContain('1.2K tok')
-    expect(body.content).not.toContain('命中 3 处')
-    expect(body.content).toContain('暂无执行记录')
+    expect(body.content).toContain('命中 3 处')
+    expect(body.content).toContain('**进度**')
   })
 
   test('详情包含任务说明和最近动作', () => {
@@ -540,7 +550,7 @@ describe('任务 panel —— 标题状态+时长,展开详情', () => {
     expect(body.content).toContain('Grep')
     expect(body.content).toContain('命中 3 处')
     expect(body.content).not.toContain('执行过程')
-    expect(body.content).not.toContain('找 auth 代码')
+    expect(body.content).toContain('找 auth 代码')
   })
 })
 
@@ -578,20 +588,20 @@ describe('整卡三态', () => {
   test('标题明确区分后台命令和子 Agent', () => {
     const processPanel = backgroundTaskPanel(mk({ id: 'shell', type: 'shell', description: '构建', status: 'failed' })) as any
     const childPanel = backgroundTaskPanel(mk({ id: 'child', type: 'subagent', description: '检查', status: 'failed' })) as any
-    expect(processPanel.header.title.content).toContain('⚙️ shell · 构建')
-    expect(childPanel.header.title.content).toContain('🟢 子agent · 检查')
+    expect(processPanel.header.title.content).toContain('后台进程失败 · 构建')
+    expect(childPanel.header.title.content).toContain('子 Agent失败 · 检查')
   })
 
-  test('终态摘要按 400 字截断展示，任务说明不入详情', () => {
+  test('正常结果完整展示，任务说明精简', () => {
     const panel = backgroundTaskPanel(mk({
       id: 'long-content', type: 'subagent', description: '检查', status: 'completed',
       prompt: `先检查 ${'任务细节 '.repeat(200)}任务末尾标记`,
       summary: `${'完整结果 '.repeat(1000)}结果末尾标记`,
     })) as any
     const body = panel.elements[0].content
-    expect(body).toContain('📝 完整结果')
+    expect(body).toContain('**结果**')
     expect(body).not.toContain('任务末尾标记')
-    expect(body).not.toContain('结果末尾标记')
+    expect(body).toContain('结果末尾标记')
   })
 
   test('BG_ELEMENTS id 生成:panel/body 走短哈希,fold/foldBody 固定 id 不哈希', () => {
@@ -690,26 +700,26 @@ describe('subagentStepBrief —— 子 agent 步骤单行简报', () => {
 })
 
 describe('settle summary 墓碑 —— 终态 entry 的 summary 置顶渲染', () => {
-  test('终态 + summary:body 首行 📝 摘要(≤400 字),steps 完整跟在后面', () => {
+  test('终态结果在最近动作之前展示', () => {
     let s: BgStore = { active: [mk({ id: 't1', type: 'subagent', toolUseId: 'p', description: 'd', status: 'running' })], pending: [] }
     s = applyBgToolUse(s, 'p', 'tu_1', 'Grep', { pattern: 'auth', path: 'src' })
     const done: BgTaskEntry = { ...s.active[0], status: 'completed', summary: '结论:全部通过', endTime: 1000, usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } }
     const body = (backgroundTaskPanel(done, 2000) as any).elements[0]
-    expect(body.content).toContain('📝 结论:全部通过')
-    expect(body.content.indexOf('📝')).toBeLessThan(body.content.indexOf('Grep'))
+    expect(body.content).toContain('结论:全部通过')
+    expect(body.content.indexOf('**结果**')).toBeLessThan(body.content.indexOf('Grep'))
   })
 
-  test('summary 超 400 字截断', () => {
+  test('正常结果超过 400 字仍完整显示', () => {
     const t = mk({ id: 't1', status: 'completed', summary: 'x'.repeat(500), usage: { total_tokens: 1, tool_uses: 1, duration_ms: 1000 } })
     const body = (backgroundTaskPanel(t, 2000) as any).elements[0]
     expect(body.content).toContain('x'.repeat(400))
-    expect(body.content).not.toContain('x'.repeat(401))
+    expect(body.content).toContain('x'.repeat(500))
   })
 
-  test('非终态 entry 的 summary 不渲染(running 时 body 仍精简)', () => {
+  test('非终态 entry 展示实时进度', () => {
     const t = mk({ id: 't1', status: 'running', summary: '中途摘要' })
     const body = (backgroundTaskPanel(t, 2000) as any).elements[0]
-    expect(body.content).not.toContain('中途摘要')
+    expect(body.content).toContain('中途摘要')
     expect(body.content).not.toContain('📝')
   })
 })
@@ -829,13 +839,14 @@ describe('折叠汇总 —— 更早已完成任务收进 bg_fold', () => {
     expect(BG_FOLD_KEEP).toBe(2)
   })
 
-  test('超长终态摘要按 400 字截断(卡片安全)', () => {
+  test('超长终态结果在安全上限内截断并明示', () => {
     const oversizedPanel = backgroundTaskPanel(mk({
       id: 'oversized-result', type: 'subagent', description: '检查', status: 'completed',
       summary: `${'完整结果 '.repeat(2000)}结果截断标记`,
     })) as any
     const oversizedBody = oversizedPanel.elements[0].content
-    expect(oversizedBody).toContain('📝 完整结果')
+    expect(oversizedBody).toContain('**结果**')
+    expect(oversizedBody).toContain('结果超过卡片安全上限，已截断')
     expect(oversizedBody).not.toContain('结果截断标记')
   })
 })

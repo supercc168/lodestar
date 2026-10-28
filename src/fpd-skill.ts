@@ -31,7 +31,7 @@ import {
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { log } from './log'
+import { log, logError } from './log'
 import { DATA_DIR } from './paths'
 
 const SKILL_NAME = 'fable-plan-dsh-exec'
@@ -163,25 +163,25 @@ function prependPath(env: NodeJS.ProcessEnv, dir: string): void {
 function writeSkillMd(assetRoot: string, destRoot: string): void {
   const src = join(assetRoot, 'SKILL.md')
   if (!existsSync(src)) {
-    log(`fpd-skill: missing ${src}; skip SKILL.md`)
+    log('fpd-skill: skill source missing')
     return
   }
   const dest = join(destRoot, 'SKILL.md')
   const r = writeFileIfChanged(dest, readFileSync(src, 'utf8'))
-  if (r !== 'skipped') log(`fpd-skill: ${r} ${dest}`)
+  if (r !== 'skipped') log('fpd-skill: synchronized')
 }
 
 function installBin(assetRoot: string, dataDir: string, runtime: string, env: NodeJS.ProcessEnv): void {
   const helperSrc = join(assetRoot, 'scripts', 'fpd.mjs')
   if (!existsSync(helperSrc)) {
-    log(`fpd-skill: missing ${helperSrc}; skip fpd command`)
+    log('fpd-skill: helper source missing')
     return
   }
   const helperDest = fpdHelperBinPath(dataDir)
   const r = copyFileIfChanged(helperSrc, helperDest, 0o755)
-  if (r !== 'skipped') log(`fpd-skill: ${r} helper ${helperDest}`)
+  if (r !== 'skipped') log('fpd-skill: helper synchronized')
   const shim = writeFileIfChanged(fpdBinPath(dataDir), fpdShimBody(runtime, helperDest), 0o700)
-  if (shim !== 'skipped') log(`fpd-skill: ${shim} command ${fpdBinPath(dataDir)}`)
+  if (shim !== 'skipped') log('fpd-skill: command synchronized')
   prependPath(env, dirname(helperDest))
 }
 
@@ -208,13 +208,13 @@ export function ensureFpdSkill(opts: EnsureFpdSkillOptions = {}): void {
     try {
       writeSkillMd(assetRoot, destRoot)
     } catch (error) {
-      log(`fpd-skill: sync failed (${destRoot}): ${error}`)
+      logError("fpd-skill: sync failed", error)
     }
   }
   try {
     installBin(assetRoot, opts.dataDir ?? DATA_DIR, opts.runtime ?? process.execPath, env)
   } catch (error) {
-    log(`fpd-skill: bin install failed: ${error}`)
+    logError("fpd-skill: bin install failed", error)
   }
   log('fpd-skill: ready (fable-plan-dsh-exec skill + fpd command)')
 }

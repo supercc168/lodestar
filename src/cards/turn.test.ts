@@ -17,6 +17,21 @@ import {
 } from './turn'
 import { editBatchElement, readBatchElement, summarizeToolInput, toolCallElement, toolCallPermissionElement } from './tool'
 
+test('translated shell descriptions affect presentation without changing the command', () => {
+  const command = '# desc: Inspect the current branch\ngit status --short -- /tmp/中文.txt'
+  const input = Object.freeze({ command, description: 'Inspect the current branch', __displayDescription: '检查当前分支' })
+  const tool = toolCallElement(0, 'Bash', input, 'raw command output', '✅') as any
+  const permission = toolCallPermissionElement(0, 'Bash', input, 'request-id') as any
+  for (const element of [tool, permission]) {
+    expect(element.header.title.content).toContain('检查当前分支')
+    expect(element.elements[0].content).toContain('**目的**: 检查当前分支')
+    expect(element.elements[0].content).toContain('git status --short -- /tmp/中文.txt')
+    expect(element.header.title.content).not.toContain('Inspect the current branch')
+  }
+  expect(input.command).toBe(command)
+  expect(summarizeToolInput('Bash', input)).toBe('检查当前分支')
+})
+
 describe('main conversation card rendering', () => {
   test('narrow model row buttons use one character while wide actions keep full labels', () => {
     const model = { provider: 'claude' as const, sourceId: 'glm', model: 'GLM-test', displayName: 'GLM-test',
@@ -885,8 +900,20 @@ describe('bash-like tool card rendering', () => {
     const body1 = el.elements[0].content
     expect(body1).toContain('**标题**: 查看 Git 远端地址')
     expect(body1).toContain('**状态**: 执行中')
-    expect(body1).not.toContain('git remote -v')
+    expect(body1).toContain('git remote -v')
     expect(body1).not.toContain('# desc:')
+  })
+
+  test('denied and failed shell calls preserve their reason and terminal state', () => {
+    const input = { command: '# desc: 检查目录\nls -ld /tmp/中文' }
+    const denied = toolCallElement(0, 'Bash', input, '🚫 已拒绝 by tester', '❌') as any
+    expect(denied.elements[0].content).toContain('**状态**: 已拒绝')
+    expect(denied.elements[0].content).toContain('🚫 已拒绝 by tester')
+    expect(denied.elements[0].content).not.toContain('已完成')
+    const failed = toolCallElement(1, 'Bash', input, '权限不足', '❌') as any
+    expect(failed.elements[0].content).toContain('**状态**: 执行失败')
+    expect(failed.elements[0].content).toContain('权限不足')
+    expect(failed.elements[0].content).not.toContain('已完成')
   })
 
   test('hides long bash command and output in tool panels', () => {

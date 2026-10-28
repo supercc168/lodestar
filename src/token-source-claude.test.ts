@@ -7,6 +7,178 @@ function isolated(script: string): void {
   expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
 }
 
+test('unfinished Claude onboarding is excluded from catalogs and cannot start model or usage queries', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    import { mkdtempSync, mkdirSync, readFileSync, writeFileSync, rmSync } from 'node:fs'
+    import { join } from 'node:path'
+    import { tmpdir } from 'node:os'
+    const dir = mkdtempSync(join(tmpdir(), 'claude-onboarding-gate-'))
+    process.env.CLAUDE_CONFIG_DIR = join(dir, 'native')
+    const { config } = await import('./src/config'); config.claude.env = {}
+    const accounts = await import('./src/claude-accounts')
+    const stateFile = join(dir, 'accounts.json')
+    const manager = new accounts.ClaudeAccounts({ home: dir, accountsDir: join(dir, 'accounts'), stateFile, env: process.env })
+    mkdirSync(join(manager.root, 'named'), { recursive: true })
+    const account = await manager.enroll('named', async () => ({ email: 'named@example.test', organization: 'test',
+      subscriptionType: 'max', apiProvider: 'firstParty' }))
+    mock.module('./src/claude-accounts', () => ({ ...accounts, claudeAccounts: manager }))
+    const modelsModule = await import('./src/token-source-models')
+    const usageModule = await import('./src/claude-usage')
+    let modelReads = 0, usageReads = 0
+    mock.module('./src/token-source-models', () => ({ ...modelsModule, fetchNativeClaudeModels: async () => {
+      modelReads++; return [{ model: 'opus', display: 'Opus', efforts: ['high'], defaultEffort: 'high' }]
+    } }))
+    mock.module('./src/claude-usage', () => ({ ...usageModule, fetchClaudeSubscriptionUsage: async () => {
+      usageReads++; return { state: 'ok', windows: [] }
+    } }))
+    const { tokenSourceFactories } = await import('./src/token-source')
+    await import('./src/token-source-claude')
+    const root = tokenSourceFactories().find(item => item.kind === 'claude-subscription').build({})
+    const retained = root.forAccount(account.id)
+    try {
+      for (const phase of ['authenticating', 'syncing', 'sync_failed', 'enrolling']) {
+        const state = JSON.parse(readFileSync(stateFile, 'utf8'))
+        state.accounts[0].state = phase
+        writeFileSync(stateFile, JSON.stringify(state))
+        assert.deepEqual(root.listAccounts().map(value => value.id), ['default'])
+        assert.throws(() => root.forAccount(account.id), /收录|首次同步/)
+        await retained.refreshModels()
+        assert.equal(retained.modelCatalogState.status, 'failed')
+        await assert.rejects(retained.readUsage(), /收录|首次同步/)
+        assert.equal(modelReads, 0)
+        assert.equal(usageReads, 0)
+      }
+      // Existing default-account work remains independent of named-account warm-up.
+      const native = root.forAccount('default')
+      await native.refreshModels()
+      assert.equal(native.modelCatalogState.status, 'ready')
+      assert.equal((await native.readUsage()).state, 'ok')
+      assert.equal(modelReads, 1)
+      assert.equal(usageReads, 1)
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  `)
+})
+
+test('named Claude accounts synchronize once at model startup and never during catalog, quota or ready-account checks', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    import { mkdtempSync, mkdirSync, readFileSync, statSync, writeFileSync, rmSync } from 'node:fs'
+    import { join } from 'node:path'
+    import { tmpdir } from 'node:os'
+    const dir = mkdtempSync(join(tmpdir(), 'claude-startup-sync-'))
+    process.env.CLAUDE_CONFIG_DIR = join(dir, 'native')
+    const { config } = await import('./src/config'); config.claude.env = {}
+    const accounts = await import('./src/claude-accounts')
+    const manager = new accounts.ClaudeAccounts({ home: dir, accountsDir: join(dir, 'accounts'),
+      stateFile: join(dir, 'accounts.json'), env: process.env })
+    const info = { email: 'named@example.test', organization: 'test', subscriptionType: 'max', apiProvider: 'firstParty' }
+    mkdirSync(join(manager.root, 'named'), { recursive: true })
+    const account = await manager.enroll('named', async () => info)
+    const target = join(account.configDir, '.claude.json')
+    const before = JSON.stringify({ mcpServers: { old: { command: 'old-server' } }, theme: 'account-preference' })
+    const servers = { shared: { command: 'shared-server' } }
+    writeFileSync(join(manager.sharedConfigDir(), '.claude.json'), JSON.stringify({ mcpServers: servers, theme: 'global-preference' }))
+    writeFileSync(target, before)
+    const beforeStat = statSync(target)
+    const preparations = [], prepareShared = manager.prepareShared.bind(manager)
+    manager.prepareShared = id => { preparations.push(id); return prepareShared(id) }
+    mock.module('./src/claude-accounts', () => ({ ...accounts, claudeAccounts: manager }))
+    class FakeProcess extends EventEmitter {
+      constructor(options) {
+        super(); this.options = options; this.alive = true
+        assert.equal(options.prepare, undefined)
+        options.transformEnv?.({})
+      }
+      isAlive() { return this.alive }
+      async kill() { this.alive = false; this.emit('exit', { code: 0, signal: null, expected: true }) }
+      async listModels() {
+        await this.options.validateAccount?.(info)
+        return [{ model: 'opus', displayName: 'Opus',
+          supportedReasoningEfforts: [{ reasoningEffort: 'high' }], defaultReasoningEffort: 'high' }]
+      }
+      async readSubscriptionUsage() {
+        await this.options.validateAccount?.(info)
+        return { subscription_type: 'max', rate_limits_available: true, rate_limits: {
+          five_hour: { utilization: 10, resets_at: null }, seven_day: { utilization: 20, resets_at: null },
+        } }
+      }
+    }
+    mock.module('./src/claude-agent-process', () => ({ ClaudeAgentProcess: FakeProcess, assertClaudeCodeAvailable() {} }))
+    const registry = await import('./src/token-source')
+    await import('./src/token-source-claude')
+    const { createAgentProcess } = await import('./src/agent-launch')
+    const { enrollClaudeAccount } = await import('./src/claude-account-selection')
+    const root = registry.tokenSourceFactories().find(item => item.kind === 'claude-subscription').build({})
+    registry.resetTokenSourceRegistry(); registry.registerTokenSource(root)
+    const source = root.forAccount(account.id)
+    try {
+      await source.refreshModels()
+      assert.equal(source.modelCatalogState.status, 'ready')
+      assert.equal((await source.readUsage()).state, 'ok')
+      assert.equal(await enrollClaudeAccount('named'), account.id)
+      assert.deepEqual(preparations, [])
+      assert.equal(readFileSync(target, 'utf8'), before)
+      assert.equal(statSync(target).mtimeMs, beforeStat.mtimeMs)
+      assert.equal(statSync(target).ino, beforeStat.ino)
+      const created = createAgentProcess({ provider: 'claude', tokenSourceId: 'claude-sub', claudeAccountId: account.id,
+        workDir: dir, model: 'opus', effort: 'high' })
+      try {
+        assert.deepEqual(preparations, [account.id])
+        assert.deepEqual(JSON.parse(readFileSync(target, 'utf8')), { mcpServers: servers, theme: 'account-preference' })
+        source.spawnEnv({})
+        assert.deepEqual(preparations, [account.id])
+      } finally { await created.process.kill() }
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  `)
+})
+
+test('native default settings cannot redirect config or keychain before the SDK query is created', () => {
+  isolated(`
+    import assert from 'node:assert/strict'
+    import { mock } from 'bun:test'
+    import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs'
+    import { join } from 'node:path'
+    import { tmpdir } from 'node:os'
+    const dir = mkdtempSync(join(tmpdir(), 'claude-default-settings-'))
+    delete process.env.CLAUDE_CONFIG_DIR
+    const { config } = await import('./src/config'); config.claude.env = {}
+    const accounts = await import('./src/claude-accounts')
+    const manager = new accounts.ClaudeAccounts({ home: dir, stateFile: join(dir, 'accounts.json'), env: {} })
+    mock.module('./src/claude-accounts', () => ({ ...accounts, claudeAccounts: manager }))
+    const updates = await import('./src/agent-updates')
+    let queries = 0
+    mock.module('./src/agent-updates', () => ({ ...updates, agentPackagePath: () => '/unused-test-sdk',
+      loadClaudeSdk: async () => ({ query: () => { queries++; throw new Error('query should not be reached') } }) }))
+    const { tokenSourceFactories } = await import('./src/token-source')
+    const { assertClaudeDefaultSettingsEnvironment } = await import('./src/token-source-claude')
+    const root = manager.sharedConfigDir(); mkdirSync(root, { recursive: true })
+    const path = join(root, 'settings.json')
+    try {
+      assertClaudeDefaultSettingsEnvironment(root)
+      for (const value of ['/different/config', '', null]) {
+        writeFileSync(path, JSON.stringify({ env: { CLAUDE_CONFIG_DIR: value, ANTHROPIC_API_KEY: 'must-not-leak' } }))
+        const source = tokenSourceFactories().find(factory => factory.kind === 'claude-subscription').build({}).forAccount('default')
+        await source.refreshModels()
+        assert.equal(queries, 0)
+        assert.equal(source.modelCatalogState.status, 'failed')
+        assert.match(source.modelCatalogState.error, /重定向/)
+        assert.doesNotMatch(source.modelCatalogState.error, /must-not-leak|different/)
+      }
+      writeFileSync(path, JSON.stringify({ env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: '/other' } }))
+      assert.throws(() => assertClaudeDefaultSettingsEnvironment(root), /存储冲突/)
+      writeFileSync(path, '{bad JSON must-not-leak')
+      assert.throws(() => assertClaudeDefaultSettingsEnvironment(root), error => /格式无效/.test(error.message) && !error.message.includes('must-not-leak'))
+      writeFileSync(path, JSON.stringify({ env: { CLAUDE_SECURESTORAGE_CONFIG_DIR: '', OTHER: 'preserved' } }))
+      assertClaudeDefaultSettingsEnvironment(root)
+      assert.equal(queries, 0)
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  `)
+})
+
 test('Claude subscription coexists with other accounts and refreshes authoritative auth/catalog failures', () => {
   isolated(`
     import assert from 'node:assert/strict'
@@ -18,9 +190,9 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
         { kind: 'fiveHour', label: '5h 窗口', percent: 10, resetsAt: null },
       ] }),
     }))
-    let account = { subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
+    let account = { email: 'default@example.test', subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
     let failure = null
-    let models = [{ model: 'sonnet', display: 'Sonnet', efforts: ['high', 'low'], defaultEffort: 'high' }]
+    let models = [{ model: 'opus', display: 'Opus', efforts: ['high', 'low'], defaultEffort: 'high' }]
     mock.module('./src/token-source-models', () => ({ ...nativeModels,
       fetchNativeClaudeModels: async options => {
         options?.validateAccount?.(account)
@@ -40,11 +212,12 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
     assert.equal(registry.getTokenSource('openrouter').enabled, true)
     await source.refreshModels()
     assert.equal(source.modelCatalogState.status, 'ready')
-    assert.equal(source.defaultModel, 'sonnet')
+    assert.equal(source.defaultModel, 'opus')
     assert.deepEqual(source.models[0].efforts, ['high', 'low'])
     assert.equal(source.models[0].defaultEffort, 'high')
     await (await import('./src/token-source-cache')).refreshTokenSourceUsage(source)
-    assert.equal((await source.readUsage()).state, 'ok')
+    assert.equal((await source.forAccount('default').readUsage()).state, 'ok')
+    assert.equal((await source.readUsage()).state, 'not_applicable')
 
     account = {}
     await source.refreshModels()
@@ -54,7 +227,7 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
     assert.deepEqual(source.models, [])
     assert.deepEqual(source.modelSelection.availableModels, [])
 
-    account = { subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
+    account = { email: 'default@example.test', subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
     await source.refreshModels()
     assert.equal(source.enabled, true)
     assert.equal(source.modelCatalogState.status, 'ready')
@@ -70,14 +243,17 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
     assert.equal(source.modelCatalogState.status, 'ready')
     assert.match(source.modelCatalogState.error, /目录为空/)
 
-    // Independent subscription detection must not disable the legacy local-config route.
+    // The retired local-config source is not registered, even with an old enabled flag.
     config.token_sources = {}
     buildTokenSourcesFromConfig()
-    assert.equal(registry.getTokenSource('claude-native').enabled, true)
+    assert.equal(registry.getTokenSource('claude-native'), undefined)
+    config.token_sources['claude-native'] = { enabled: true }
+    buildTokenSourcesFromConfig()
+    assert.equal(registry.getTokenSource('claude-native'), undefined)
   `)
 })
 
-test('disabled Claude subscription skips native queries and discovery until explicitly enabled', () => {
+test('Claude subscription remains excluded from Lodestar Agent when explicitly enabled', () => {
   isolated(`
     import assert from 'node:assert/strict'
     import { mock } from 'bun:test'
@@ -113,9 +289,9 @@ test('disabled Claude subscription skips native queries and discovery until expl
       assert.notEqual((await source.readUsage()).state, 'ok')
       const catalog = await buildAgentSkillIdentityCatalog([source])
       assert.deepEqual(catalog.identities, [])
-      assert.equal(catalog.sourceFailures[0].status, 'disabled')
+      assert.deepEqual(catalog.sourceFailures, [])
       assert.throws(() => createAgentProcess({ provider: 'claude', workDir: '/tmp', tokenSourceId: source.id,
-        model: 'sonnet', effort: 'high' }), /token source disabled/)
+        model: 'sonnet', effort: 'high' }), /Claude 订阅已禁用/)
     }
     assert.equal(modelQueries, 0)
     assert.equal(usageQueries, 0)
@@ -126,7 +302,9 @@ test('disabled Claude subscription skips native queries and discovery until expl
     assert.equal(enabled.enabled, true)
     assert.equal(enabled.modelCatalogState.status, 'ready')
     await (await import('./src/token-source-cache')).refreshTokenSourceUsage(enabled)
-    assert.equal((await buildAgentSkillIdentityCatalog([enabled])).identities.length, 2)
+    assert.equal((await buildAgentSkillIdentityCatalog([enabled])).identities.length, 0)
+    assert.equal(enabled.models.length, 2)
+    assert.equal(enabled.enabled, true)
     assert.equal(modelQueries, 1)
     assert.equal(usageQueries, 1)
   `)
@@ -140,7 +318,7 @@ test('Claude subscription quota uses authenticated native control and keeps the 
     let quotaNow = Date.now()
     Date.now = () => quotaNow
     const queries = []
-    let account = { subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
+    let account = { email: 'default@example.test', subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
     let data = { subscription_type: 'max', rate_limits_available: true, rate_limits: {
       five_hour: { utilization: 12.5, resets_at: null },
       seven_day: { utilization: 20, resets_at: null },
@@ -173,7 +351,9 @@ test('Claude subscription quota uses authenticated native control and keeps the 
     await import('./src/token-source-claude')
     const { config } = await import('./src/config')
     config.claude.env = { ANTHROPIC_API_KEY: 'wrong-key', ANTHROPIC_BASE_URL: 'https://wrong.test' }
-    const source = tokenSourceFactories().find(f => f.kind === 'claude-subscription').build({})
+    const { claudeAccounts } = await import('./src/claude-accounts')
+    claudeAccounts.observeIdentity('default', account)
+    const source = tokenSourceFactories().find(f => f.kind === 'claude-subscription').build({}).forAccount('default')
     const [first, concurrent] = await Promise.all([source.readUsage(), source.readUsage()])
     assert.equal(first, concurrent)
     assert.equal(queries.length, 1)
@@ -230,7 +410,7 @@ test('Claude subscription quota uses authenticated native control and keeps the 
     assert.match(wrongProvider.reason, /不是第一方订阅/)
     assert.deepEqual(queries.at(-1).requests, [])
 
-    account = { subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
+    account = { email: 'default@example.test', subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
     data.rate_limits = null
     quotaNow += 300_000
     const missing = await source.readUsage()
@@ -255,8 +435,14 @@ test('Claude subscription gates queued input on native authentication for main a
     import assert from 'node:assert/strict'
     import { mock } from 'bun:test'
     const updates = await import('./src/agent-updates')
+    const translations = []
+    mock.module('./src/claude-translation', () => ({ createClaudeTranslation: () => ({
+      toEnglish: async (text, _signal, kind) => { translations.push({ text, kind }); return 'Translated: ' + text },
+      toChinese: async text => text,
+      toChineseFields: async fields => fields,
+    }) }))
     const queries = []
-    let account = { subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
+    let account = { email: 'default@example.test', subscriptionType: 'Claude Max', apiProvider: 'firstParty' }
     let releaseAuth
     let authGate = Promise.resolve()
     const tick = () => new Promise(resolve => setTimeout(resolve, 0))
@@ -285,13 +471,18 @@ test('Claude subscription gates queued input on native authentication for main a
     const { validateClaudeSubscriptionAccount } = await import('./src/token-source-claude')
     const { createAgentProcess } = await import('./src/agent-launch')
     const factory = tokenSourceFactories().find(f => f.kind === 'claude-subscription')
-    const source = factory.build({})
+    const { claudeAccounts } = await import('./src/claude-accounts')
+    claudeAccounts.observeIdentity('default', account)
+    const root = factory.build({})
+    const source = root.forAccount('default')
     await source.refreshModels()
     assert.equal(source.modelCatalogState.status, 'ready')
     assert.equal(queries[0].delivered.length, 0)
     assert.equal(queries[0].closed, true)
-    registerTokenSource(source)
+    assert.deepEqual(translations, [])
+    registerTokenSource(root)
     const { config } = await import('./src/config')
+    config.claude.safe_mode = { 'claude-sub': ['*'] }
     config.claude.env = {
       ANTHROPIC_API_KEY: 'wrong-key', ANTHROPIC_AUTH_TOKEN: 'wrong-token',
       ANTHROPIC_BASE_URL: 'https://wrong.test', CLAUDE_CODE_OAUTH_TOKEN: 'wrong-oauth',
@@ -322,6 +513,7 @@ test('Claude subscription gates queued input on native authentication for main a
       assert.equal(record.options.disallowedTools?.includes('Agent') ?? false, false)
       releaseAuth()
       await waitFor(() => record.delivered.length === 1)
+      assert.equal(record.delivered[0].message.content[0].text, 'Translated: queued task')
       await proc.kill()
       await record.inputDone
       assert.equal(record.closed, true)

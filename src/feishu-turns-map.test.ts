@@ -281,8 +281,9 @@ describe('session turn checkpoint persistence', () => {
       codex: [],
       ambiguous: [],
     })
-    // rejected 路径真实驱动:codex 键在场/双键歧义/坏 checkpoint/缺 sid 共 4 条被丢弃且计数可观测
-    expect(result.stderr).toContain('rejected 4 malformed turn anchors')
+    // Invalid persisted rows are rejected; ordinary logs must not reveal counts or IDs.
+    expect(result.stderr).toContain('feishu malformed turn anchors rejected')
+    expect(result.stderr).not.toContain('rejected 4')
   })
 
   test('round-trips explicit fresh and full-fork bases with absolute cwd', () => {
@@ -449,7 +450,8 @@ describe('session turn checkpoint persistence', () => {
 
     expect(result.exitCode, result.stderr).toBe(0)
     expect(extract(result)).toEqual({ pending: null, anchors: [] })
-    expect(result.stderr).toContain('rejected 1 malformed turn anchors')
+    expect(result.stderr).toContain('feishu malformed turn anchors rejected')
+    expect(result.stderr).not.toMatch(/unsafe|source-session|rejected 1/)
   })
 
   test('append and ordinary replace preserve pending; explicit null consumes it', () => {

@@ -82,7 +82,7 @@ function harness() {
       waitingChanged.push(chatId)
       controls.waitingChanged(chatId)
     },
-    log: (text: string) => { logs.push(text) },
+    logError: (event: string, _error: unknown) => { logs.push(event) },
   }
   const runtime = createNotifyReplyRuntime(io)
   const open = (notifyId = 'nf_reply', openId = 'ou_owner', chatId = 'oc_group') => runtime.open(notifyId, chatId, openId)
@@ -701,7 +701,7 @@ describe('notification reply local guards (本地定型语义)', () => {
     expect(get('nf_reply')!.unknownAt).toBeDefined()
     expect(h.titleOf(1)).toBe('回复送达状态未知')
     expect(h.bodyOf(2)).toContain('送达状态未知，禁止自动重试')
-    expect(h.logs.some(line => line.includes('status=unknown'))).toBe(true)
+    expect(h.logs.some(line => line.includes('notify.reply.unknown'))).toBe(true)
     // 冻结后既不重开等待卡,也不重发。
     expect((await h.open()).ok).toBe(false)
     expect(await h.runtime.consume(incoming({ messageId: 'om_again' }))).toBe(false)
@@ -786,7 +786,7 @@ describe('notification reply local guards (本地定型语义)', () => {
     // 修复前 report() 抛错会穿出 consume(),daemon 侧后续处理(host_ask / 缓冲 /
     // onUserMessage)整段被跳过 —— 这里锁定"提示发不出去"不等于"消费失败"。
     expect(await h.runtime.consume(incoming())).toBe(true)
-    expect(h.logs.some(text => text.includes('错误提示发送失败'))).toBe(true)
+    expect(h.logs.some(text => text.includes('notify.reply.error_notice_failed'))).toBe(true)
     expect(get('nf_reply')!.replyState!.status).toBe('waiting')
     expect(h.delivered).toHaveLength(0)
   })
@@ -805,8 +805,8 @@ describe('notification reply local guards (本地定型语义)', () => {
     __setStoreFileForTest(join(file, 'bad.json'), false)
     const result = await h.open('nf_second')
     // 取消两条都失败(各自日志一次,证明循环没在第一条就中断),新等待卡仍然发出。
-    expect(h.logs.filter(text => text.includes('取消 nf_reply 失败'))).toHaveLength(1)
-    expect(h.logs.filter(text => text.includes('取消 nf_other 失败'))).toHaveLength(1)
+    expect(h.logs.filter(text => text.includes('notify.reply.cancel_failed'))).toHaveLength(2)
+    expect(h.logs.every(text => !text.includes('nf_reply') && !text.includes('nf_other'))).toBe(true)
     expect(h.sent).toHaveLength(2)
     // 取消失败的通知保留等待态(内存回滚),不会静默变成半取消。
     expect(get('nf_reply')!.replyState!.status).toBe('waiting')
@@ -828,6 +828,6 @@ describe('notification reply local guards (本地定型语义)', () => {
       ok: true, message: '等待输入卡片已发送，请在群里回复一条文字', presented: true,
     })
     expect(h.sent).toHaveLength(2)
-    expect(h.logs.some(text => text.includes('错误提示发送失败'))).toBe(true)
+    expect(h.logs.some(text => text.includes('notify.reply.error_notice_failed'))).toBe(true)
   })
 })

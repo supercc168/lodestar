@@ -95,6 +95,10 @@ export interface LodestarConfig {
      * 按目录探测加载 .claude//CLAUDE.md —— 注意 auto 会整体加载项目 hooks,
      * 见 README「auto 档要点」。解析在 settingSourcesFromProfile。 */
     defaultSettingSources?: string
+    /** Optional operator rules for GLM validation of safe-mode input. */
+    translation_validation_rules?: string
+    /** Token Source → exact catalog model IDs. ['*'] enables all models; [] disables the source. */
+    safe_mode: Record<string, string[]>
     env: Record<string, string>
     models: Record<string, ClaudeModelConfig>
   }
@@ -250,12 +254,29 @@ function parseToml(text: string): Record<string, Record<string, string>> {
     const sec = line.match(/^\[([^\]]+)\]$/)
     if (sec) {
       section = sec[1].trim()
+      if (section.startsWith('claude.safe_mode.')) {
+        throw new Error('lodestar: use [claude.safe_mode] with Token Source keys, not nested tables')
+      }
       out[section] ??= {}
       continue
+    }
+    if (/^\[+\s*claude\.safe_mode(?:[.\]\s]|$)/.test(line)) {
+      throw new Error('lodestar: invalid [claude.safe_mode] table header')
     }
     const kv = line.match(/^([\w.-]+)\s*=\s*(.+)$/)
     if (kv) {
       let v = kv[2].trim()
+      if (section === 'claude.safe_mode') {
+        if (!/^[a-zA-Z0-9][a-zA-Z0-9_-]*$/.test(kv[1])) {
+          throw new Error(`lodestar: invalid [claude.safe_mode] Token Source key "${kv[1]}"`)
+        }
+        if (!/^(?:"(?:[^"\\]|\\[\\"])*"|'[^']*')$/.test(v)) {
+          throw new Error(`lodestar: [claude.safe_mode].${kv[1]} must be a quoted string of model IDs, "*", or ""`)
+        }
+        if (Object.hasOwn(out[section], kv[1])) {
+          throw new Error(`lodestar: duplicate [claude.safe_mode].${kv[1]}`)
+        }
+      }
       const dq = v.startsWith('"') && v.endsWith('"')
       const sq = v.startsWith("'") && v.endsWith("'")
       if (dq || sq) {
@@ -266,6 +287,8 @@ function parseToml(text: string): Record<string, Record<string, string>> {
         if (dq) v = v.replace(/\\([\\"])/g, '$1')
       }
       out[section][kv[1]] = v
+    } else if (section === 'claude.safe_mode' || (section === 'claude' && /^safe_mode(?:\s|=|$)/.test(line))) {
+      throw new Error('lodestar: invalid entry in [claude.safe_mode]; expected Token Source = "model IDs"')
     }
   }
   return out
@@ -280,7 +303,7 @@ export function loadConfig(): LodestarConfig {
     raw = readFileSync(CONFIG_FILE, 'utf8')
   } catch (e) {
     process.stderr.write(
-      `lodestar: cannot read config at ${CONFIG_FILE}\n` +
+      'lodestar: cannot read configuration\n' +
       `  → 运行 \`lodestar-setup\` 走交互式向导生成 (Feishu / Codex / 工作目录)\n` +
       `  → 或手写: 设 LODESTAR_CONFIG=/path/to/config.toml 覆盖默认路径\n` +
       `    [feishu]\n    app_id = "cli_xxx"\n    app_secret = "xxx"\n\n`,
@@ -492,6 +515,19 @@ export function loadConfig(): LodestarConfig {
     apiKey: imagegenApiKey || undefined,
     model: imagegenModelRaw || 'gpt-image-2.5-flare',
   }
+  if (t.claude?.safe_mode !== undefined) {
+    throw new Error('lodestar: safe_mode must use the [claude.safe_mode] table')
+  }
+  const claudeSafeMode: LodestarConfig['claude']['safe_mode'] = {}
+  for (const [sourceId, value] of Object.entries(t['claude.safe_mode'] ?? {})) {
+    const trimmed = value.trim()
+    const models = trimmed === '' ? [] : trimmed.split(',').map(model => model.trim())
+    if (models.some(model => !model || /[\s,"']/.test(model))
+      || (models.some(model => model.includes('*')) && (models.length !== 1 || models[0] !== '*'))) {
+      throw new Error(`lodestar: [claude.safe_mode].${sourceId} must be comma-separated exact model IDs, "*", or ""`)
+    }
+    claudeSafeMode[sourceId] = models
+  }
   return {
     feishu: { app_id: appId, app_secret: appSecret },
     runtime: { projects_root: projectsRoot, live_elapsed: liveElapsed, agent_auto_update: agentAutoUpdate },
@@ -510,6 +546,9 @@ export function loadConfig(): LodestarConfig {
       defaultSettingSources: claudeDefaultSettingSources,
       env: claudeEnv,
       models: claudeModelSections(),
+      safe_mode: claudeSafeMode,
+      ...(t.claude?.translation_validation_rules !== undefined
+        ? { translation_validation_rules: t.claude.translation_validation_rules } : {}),
     },
     projects: projectSections(),
     imagegen,

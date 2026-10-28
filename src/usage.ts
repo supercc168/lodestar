@@ -15,15 +15,15 @@ import type { ChildProcessByStdio } from 'node:child_process'
 import { spawn } from 'cross-spawn'
 import type { Readable, Writable } from 'node:stream'
 import { config } from './config'
+import { networkFetch } from './network'
 import { codexModelProfile } from './codex-models'
 import { resolveCodexBin } from './codex-process'
-import { log } from './log'
+import { logError, logDiagnostic } from './log'
 import { EventEmitter } from 'node:events'
 import { StringDecoder } from 'node:string_decoder'
 import { createHash } from 'node:crypto'
-import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
-import { plusFiveHourWindow } from './codex-quota'
-import { UsageReadCache, USAGE_FRESH_MS, isUsageAuthError, isUsageRateLimitError } from './usage-cache'
+import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT, liveCodexQuotaReaders } from './codex-accounts'
+import { UsageReadCache, UsageReadSupersededError, USAGE_FRESH_MS, isUsageAuthError, isUsageRateLimitError, type UsageReadOptions } from './usage-cache'
 import { observeCodexAccountEmail } from './codex-account-info'
 import { parseCodexCredits, type CodexCredits } from './codex-credits'
 
@@ -33,8 +33,6 @@ export interface UsageWindow {
   percent: number | null
   resetsAt: Date | null
   durationMins?: number | null
-  /** Successful Plus response omitted 5h; full window per the configured product rule, reset time unknown. */
-  unreportedFull?: boolean
 }
 
 /** 额度快照里单个计量桶(read 端点 rateLimitsByLimitId 的一个条目)。 */
@@ -165,16 +163,16 @@ export function consumeCodexResetCredit(
       }
       if (usageGenerations.get(accountId) !== generation) usage = { state: 'auth_failed' }
       else cacheUsage(accountId, usage)
-      if (usage.state !== 'ok') log(`codex-reset: ${accountId} quota refresh failed: ${usage.state === 'network' ? usage.reason : usage.state}`)
+      if (usage.state !== 'ok') logDiagnostic('codex reset quota refresh failed', { reason: usage.state })
       result = { outcome: response.outcome, usage }
     } catch (error) {
       failure = error
-      log(`codex-reset: ${accountId}: ${error}`)
+      logError('codex quota reset failed', error)
     }
     try { await app.close() }
     catch (error) {
       const message = `控制连接关闭失败：${error instanceof Error ? error.message : String(error)}`
-      log(`codex-reset: ${accountId}: ${message}`)
+      logError('codex quota reset connection close failed', error)
       // Preserve a confirmed redemption even if cleanup fails, so the receipt cannot suggest using another card.
       if (result) result.cleanupError = message
       else throw new AggregateError([failure, error], `${String(failure)}；${message}`)
@@ -201,14 +199,15 @@ export class AppServerOnce extends EventEmitter {
     timer: ReturnType<typeof setTimeout>
   }>()
 
-  /** 测试缝:显式传 opts.bin 时 opts.args 视为完整命令行(假 app-server 测管道,
-   * 不 spawn 真 codex);生产路径 bin 缺省,opts.args 追加在标准 app-server 调用之后。 */
+  /** 测试缝:同时显式传 opts.bin 和 opts.args 时,args 是完整命令行。
+   * 仅覆盖 binary 或默认生产路径仍构造账号路由并禁用插件的控制查询参数。 */
   constructor(opts: { accountId?: string; env?: Record<string, string | undefined>; args?: string[]; bin?: string; login?: boolean; cwd?: string } = {}) {
     super()
     const accountId = opts.accountId ?? DEFAULT_CODEX_ACCOUNT
-    const args = opts.bin !== undefined
-      ? (opts.args ?? ['app-server', '--listen', 'stdio://'])
-      : ['app-server', '--listen', 'stdio://', ...(opts.args ?? codexAccounts.cliArgs(accountId))]
+    const args = opts.bin !== undefined && opts.args !== undefined
+      ? opts.args
+      : ['app-server', '--listen', 'stdio://', ...(opts.args ?? codexAccounts.cliArgs(accountId)),
+        '-c', 'features.plugins=false', '-c', 'features.apps=false']
     this.proc = spawn(opts.bin ?? resolveCodexBin(), args, {
       stdio: ['pipe', 'pipe', 'pipe'],
       shell: false,
@@ -217,10 +216,8 @@ export class AppServerOnce extends EventEmitter {
     }) as ChildProcessByStdio<Writable, Readable, Readable>
     this.exitPromise = new Promise(resolve => { this.resolveExit = resolve })
     this.proc.stdout.on('data', (chunk: Buffer) => this.onStdout(chunk))
-    this.proc.stderr.on('data', (chunk: Buffer) => {
-      const s = chunk.toString().trim()
-      if (s) log(`usage[codex stderr]: ${s}`)
-    })
+    // Native stderr may contain account data; protocol/exit failures retain safe diagnostics.
+    this.proc.stderr.resume()
     const finish = (error: Error) => {
       if (!this.alive) return
       this.alive = false
@@ -235,7 +232,7 @@ export class AppServerOnce extends EventEmitter {
     }
     this.proc.on('error', error => finish(new Error(`codex app-server spawn failed: ${error.message}`)))
     this.proc.stdin.on('error', error => {
-      log(`usage: codex stdin failed: ${error.message}`)
+      logError('codex control input failed', error)
       this.emit('protocolError', error)
     })
     // Drain stdout before rejecting requests; exit can precede buffered JSON-RPC responses.
@@ -264,7 +261,7 @@ export class AppServerOnce extends EventEmitter {
         if (!hasId) this.emit('notification', msg.method, msg.params)
         else {
           // Server request IDs are a different namespace. Never consume a pending client read with the same ID.
-          log(`usage: unsupported Codex server request: ${msg.method}`)
+          logDiagnostic('codex control request unsupported')
           this.proc.stdin.write(JSON.stringify({ id: msg.id, error: { code: -32601, message: `Unsupported server request: ${msg.method}` } }) + '\n')
         }
         continue
@@ -363,9 +360,8 @@ function windowFromRateLimit(w: any): UsageWindow | null {
   }
 }
 
-/** 窗口归类:按 windowDurationMins 真实时长归类(短窗→5h 档,周量级→weekly),
- * 位置只作 fallback。不硬编码"当前套餐必然 300/10080"——只把时长最接近
- * 5h 量级的认作 fiveHour,其余(含缺失时长)按 primary/secondary 位置。 */
+/** 按接口实际返回的时长归类：短窗归 fiveHour，长窗归 weekly；
+ * 时长不能区分两个窗口时保留 primary/secondary 位置，不创建未返回的窗口。 */
 function classifyWindows(limits: any): { fiveHour: UsageWindow | null; weekly: UsageWindow | null } {
   const primary = windowFromRateLimit(limits?.primary)
   const secondary = windowFromRateLimit(limits?.secondary)
@@ -375,6 +371,7 @@ function classifyWindows(limits: any): { fiveHour: UsageWindow | null; weekly: U
     w?.durationMins != null && w.durationMins > 720
   if (isShort(primary) && isLong(secondary)) return { fiveHour: primary, weekly: secondary }
   if (isShort(secondary) && isLong(primary)) return { fiveHour: secondary, weekly: primary }
+  if (isShort(secondary) && !primary) return { fiveHour: secondary, weekly: null }
   if (isLong(primary) && !secondary) return { fiveHour: null, weekly: primary }
   if (isLong(secondary) && !primary) return { fiveHour: null, weekly: secondary }
   // 时长缺失或均为短窗:按位置(primary=5h 档,secondary=周)
@@ -469,54 +466,16 @@ export function providerUsageSnapshotFromResponse(providerName: string, response
   }
 }
 
-/** 本地定制:turn 中 rateLimits 通知(rolling)把当轮额度写进账号 cache,
- * 让 footer/hi 面板不 spawn codex app-server 也能显示(codex:slug 渠道无
- * ChatGPT 额度,走 provider 余额)。上游侧的 observeRateLimitsNotification
- * 只观察不写 cache —— 两级并存:本轮实测 rateLimits 比 read 端点更新,
- * 但只在没有成功快照时才落地(与 cacheUsage 对瞬态失败的策略一致)。 */
+/** Legacy conversion helper: rolling notifications never update authoritative caches. */
 export function updateUsageFromRateLimits(rateLimits: any, accountId = DEFAULT_CODEX_ACCOUNT): UsageSnapshot {
   if (!rateLimits) return peekUsage(accountId) ?? { state: 'network', reason: 'empty rate limit update' }
-  const snapshot: Extract<UsageSnapshot, { state: 'ok' }> = {
-    state: 'ok',
-    subscriptionType: rateLimits.planType,
-    ...classifyWindows(rateLimits),
-    fetchedAt: Date.now(),
-  }
-  cacheUsage(accountId, snapshot)
-  return snapshot
+  return { state: 'ok', subscriptionType: rateLimits.planType,
+    ...classifyWindows(rateLimits), fetchedAt: Date.now() }
 }
 
-/** 通知负载的形态签名,只用于日志(归属判断不可信,2026-08-20 源码核实:
- * 上游 SSE/WS 事件缺 metered_limit_name 时客户端解析器把 limitId 强补
- * "codex" —— Spark 桶的内容会被贴上主桶标签)。 */
-function describeNotification(rateLimits: any): string {
-  if (!rateLimits) return 'empty'
-  const w = (x: any): string => x ? `${x.usedPercent ?? '?'}%/${x.windowDurationMins ?? '?'}m` : 'null'
-  return `limitId=${rateLimits.limitId ?? 'null'} name=${rateLimits.limitName ?? 'null'} primary=${w(rateLimits.primary)} secondary=${w(rateLimits.secondary)}`
-}
-
-/** rolling 通知的观察日志:记录通知形态,并和 cache 里已知桶对比。通知
- * limitId 与内容可能错标(见 describeNotification),只用于异常可见性,
- * 不写 cache —— 权威状态只来自 readUsage 的 read 端点(整体替换)。 */
-export function observeRateLimitsNotification(rateLimits: any, accountId = DEFAULT_CODEX_ACCOUNT): void {
-  const desc = describeNotification(rateLimits)
-  const cache = caches.get(accountId)
-  const known = cache?.state === 'ok' ? (cache.buckets ?? []) : []
-  const matches = known.filter(b =>
-    windowsEqual(b.fiveHour, windowFromRateLimit(rateLimits?.primary))
-    && windowsEqual(b.weekly, windowFromRateLimit(rateLimits?.secondary)))
-  if (known.length > 0 && matches.length === 0) {
-    log(`usage: rate-limit notification matches NO known bucket — possible relabel or new bucket, will resolve on next read. (${desc})`)
-  } else if (rateLimits?.limitId && matches.length === 1 && matches[0].limitId !== rateLimits.limitId) {
-    log(`usage: rate-limit notification labeled limitId=${rateLimits.limitId} but content matches bucket ${matches[0].limitId} (known codex parser fallback relabels; ignoring notification payload)`)
-  }
-}
-
-function windowsEqual(a: UsageWindow | null, b: UsageWindow | null): boolean {
-  if (!a || !b) return !a && !b
-  return a.percent === b.percent && a.durationMins === b.durationMins
-    && a.resetsAt?.getTime() === b.resetsAt?.getTime()
-}
+/** Rolling quota notifications are not authoritative and cannot update cached usage.
+ * Keep the observer entry point without logging account/bucket identifiers. */
+export function observeRateLimitsNotification(_rateLimits: any, _accountId = DEFAULT_CODEX_ACCOUNT): void {}
 
 /** 三方 codex 渠道(codex:<slug>,route=api)查 provider /v1/usage(CCSwitch 兼容
  * 余额形状):base_url/api_key 取自 [codex.models.<slug>]。非 api 路由或模型名
@@ -546,7 +505,7 @@ async function fetchProviderUsage(model: string): Promise<UsageSnapshot | null> 
   const controller = new AbortController()
   const timer = setTimeout(() => controller.abort(), API_TIMEOUT_MS)
   try {
-    const res = await fetch(providerUsageEndpoint(baseUrl), {
+    const res = await networkFetch(providerUsageEndpoint(baseUrl), {
       method: 'GET',
       headers: { authorization: `Bearer ${apiKey}`, accept: 'application/json' },
       signal: controller.signal,
@@ -576,7 +535,7 @@ async function fetchProviderUsage(model: string): Promise<UsageSnapshot | null> 
     return providerUsageSnapshotFromBody(providerName, await res.text(), res.headers.get('content-type'))
   } catch (e: any) {
     const reason = e?.name === 'AbortError' ? `timeout after ${API_TIMEOUT_MS}ms` : (e?.message ?? String(e))
-    log(`usage: provider usage fetch failed for ${providerName}: ${reason}`)
+    logError('usage: provider usage fetch failed', e)
     return {
       state: 'provider_unavailable',
       providerName,
@@ -606,7 +565,7 @@ async function fetchUsage(accountId: string): Promise<UsageSnapshot> {
     })
     return snapshotFromReadResponse(limitsRes, account.planType, readStartedAt)
   } catch (e: any) {
-    log(`usage: codex app-server usage failed: ${e?.message ?? e}`)
+    logError('codex quota read failed', e)
     if (isUsageAuthError(e)) return { state: 'auth_failed' }
     if (isUsageRateLimitError(e)) return { state: 'rate_limited' }
     return { state: 'network', reason: e?.message ?? String(e) }
@@ -621,13 +580,14 @@ export function snapshotFromReadResponse(limitsRes: any, planType?: string | nul
   const { buckets, defaultLimitId } = bucketsFromReadResponse(limitsRes)
   const def = buckets.find(b => b.limitId === defaultLimitId) ?? buckets[0]
   if (!def) return { state: 'network', reason: 'empty rate limit response' }
-  const subscriptionType = planType ?? limitsRes?.rateLimits?.planType ?? undefined
-  def.fiveHour = plusFiveHourWindow(subscriptionType, def.fiveHour)
+  const quotaPlanType = limitsRes?.rateLimits?.planType
+  const subscriptionType = quotaPlanType ?? planType ?? undefined
+  const accountFingerprint = typeof limitsRes?.accountId === 'string' && limitsRes.accountId
+    ? createHash('sha256').update(limitsRes.accountId).digest('hex') : undefined
   return {
     state: 'ok',
     subscriptionType,
-    ...(typeof limitsRes?.accountId === 'string' && limitsRes.accountId
-      ? { accountFingerprint: createHash('sha256').update(limitsRes.accountId).digest('hex') } : {}),
+    ...(accountFingerprint ? { accountFingerprint } : {}),
     ...(typeof limitsRes?.ordinaryUsageAllowed === 'boolean' ? { ordinaryUsageAllowed: limitsRes.ordinaryUsageAllowed } : {}),
     rateLimitReachedType: def.rateLimitReachedType,
     spendControlReached: def.spendControlReached,
@@ -668,35 +628,52 @@ export function captureCodexUsageCache(accountId = DEFAULT_CODEX_ACCOUNT) {
 
 const ACCOUNT_ID_RE = /^[a-f0-9-]{36}$/i
 
-/** 读额度,双语义入口:
- *  - 第一参 `codex:<slug>`(本地调用,如 session 传 opts.model)→ 先查该三方
- *    渠道的 provider /v1/usage;非 api 路由/未配(返回 null)回退官方账号额度;
- *  - 第一参为 account id(上游调用形态 readUsage(accountId),'default' 或 uuid)
- *    → 按账号读取;两者都不像(如官方模型名 'gpt-5.6-sol'、undefined)→ 用默认账号。 */
-export function readUsage(modelOrAccount?: string, accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot> {
-  const providerModel = modelOrAccount?.startsWith('codex:') ? modelOrAccount : undefined
-  if (providerModel) {
-    return fetchProviderUsage(providerModel).then(providerUsage => providerUsage ?? readAccountUsage(accountId))
+/** Preserve model-route compatibility while supporting forced authoritative account reads. */
+export function readUsage(modelOrAccount?: string, accountOrOptions: string | Pick<UsageReadOptions, 'force'> = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot> {
+  const options = typeof accountOrOptions === 'string' ? {} : accountOrOptions
+  const fallback = typeof accountOrOptions === 'string' ? accountOrOptions : DEFAULT_CODEX_ACCOUNT
+  if (modelOrAccount?.startsWith('codex:')) {
+    return fetchProviderUsage(modelOrAccount).then(snapshot => snapshot ?? readAccountUsage(fallback, options))
   }
-  const account = modelOrAccount && (modelOrAccount === DEFAULT_CODEX_ACCOUNT || ACCOUNT_ID_RE.test(modelOrAccount))
-    ? modelOrAccount
-    : accountId
-  return readAccountUsage(account)
+  const account = modelOrAccount && (modelOrAccount === DEFAULT_CODEX_ACCOUNT
+    || ACCOUNT_ID_RE.test(modelOrAccount) || codexAccounts.list().some(account => account.id === modelOrAccount))
+    ? modelOrAccount : fallback
+  return readAccountUsage(account, options)
 }
 
-function readAccountUsage(accountId: string): Promise<UsageSnapshot> {
+function readAccountUsage(accountId: string, options: Pick<UsageReadOptions, 'force'>): Promise<UsageSnapshot> {
   const generation = usageGenerations.get(accountId) ?? 0
+  let live = liveCodexQuotaReaders(accountId)[0]
+  let revision: string | undefined
+  const ownsRead = () => !live || live.isCurrent() && (revision === undefined || codexAccounts.revision(accountId) === revision)
+  const isCurrent = () => (usageGenerations.get(accountId) ?? 0) === generation && ownsRead()
   return usageReads.read(accountId, async () => {
-    try { return await fetchUsage(accountId) }
-    catch (error) { log(`usage: ${accountId} fetch failed: ${error}`); throw error }
-  })
-    .catch((e): UsageSnapshot => {
-      if (isUsageAuthError(e)) return { state: 'auth_failed' }
-      if (isUsageRateLimitError(e)) return { state: 'rate_limited' }
-      return { state: 'network', reason: String(e) }
-    }).then((snapshot): UsageSnapshot => {
+    try {
+      // A selected connection may not fall back to cold startup after exit.
+      // If none existed, include a process registered while this call was queued.
+      live ??= liveCodexQuotaReaders(accountId)[0]
+      if (live) {
+        revision = codexAccounts.revision(accountId)
+        const reader = live.reader
+        return await fetchUsageFromConnection(() => reader.readRateLimits(), isCurrent)
+      }
+      return await fetchUsage(accountId)
+    }
+    catch (error) {
+      if (!(error instanceof UsageReadSupersededError)) logError('codex quota fetch failed', error)
+      throw error
+    }
+  }, { force: options.force, isCurrent }).then((snapshot): UsageSnapshot => {
       if ((usageGenerations.get(accountId) ?? 0) !== generation) return { state: 'auth_failed' }
+      if (!ownsRead()) return { state: 'network', reason: '额度读取所属连接或账号已变化' }
       cacheUsage(accountId, snapshot)
+      return snapshot
+    }, (error): UsageSnapshot => {
+      if ((usageGenerations.get(accountId) ?? 0) !== generation) return { state: 'auth_failed' }
+      const snapshot: UsageSnapshot = isUsageAuthError(error) ? { state: 'auth_failed' }
+        : isUsageRateLimitError(error) ? { state: 'rate_limited' }
+        : { state: 'network', reason: String(error) }
+      if (!(error instanceof UsageReadSupersededError) && ownsRead()) cacheUsage(accountId, snapshot)
       return snapshot
     })
 }
@@ -706,31 +683,28 @@ export async function readUsageForDisplay(accountId = DEFAULT_CODEX_ACCOUNT): Pr
   return peekUsage(accountId) ?? { state: 'network', reason: '额度缓存尚未就绪，后台刷新中' }
 }
 
-/** 用现有连接刷新额度；请求失败返回 null 并记录原始错误。
+/** 用现有连接刷新额度；请求失败返回 null 并记录安全诊断。
  * 成功快照另存供启动与页脚使用，页脚沿用原额度格式。 */
-export function refreshUsageFromConnection(request: (method: string, params: any) => Promise<any>, accountId = DEFAULT_CODEX_ACCOUNT): Promise<UsageSnapshot | null> {
+export function refreshUsageFromConnection(
+  request: (method: string, params: any) => Promise<any>, accountId = DEFAULT_CODEX_ACCOUNT,
+  options: UsageReadOptions = {},
+): Promise<UsageSnapshot | null> {
   const generation = usageGenerations.get(accountId) ?? 0
+  const isCurrent = () => (usageGenerations.get(accountId) ?? 0) === generation && (options.isCurrent?.() ?? true)
   return usageReads.read(accountId, async () => {
     try {
-      let readStartedAt: number | undefined
-      const response = await requestCodexQuotaWithRetry(() => {
-        readStartedAt = Date.now()
-        return request('account/rateLimits/read', {})
-      })
-      const snap = snapshotFromReadResponse(response, undefined, readStartedAt)
-      if (snap.state !== 'ok') log(`usage: refresh from connection: ${snap.state === 'network' ? snap.reason : snap.state}`)
-      return snap
+      return await fetchUsageFromConnection(() => request('account/rateLimits/read', {}), isCurrent)
     } catch (error) {
-      log(`usage: refresh from connection failed: ${error instanceof Error ? error.message : String(error)}`)
+      if (!(error instanceof UsageReadSupersededError)) logError('codex live quota refresh failed', error)
       throw error
     }
-  }).then((snap) => {
-      if ((usageGenerations.get(accountId) ?? 0) !== generation) return null
-      if ((usageGenerations.get(accountId) ?? 0) === generation) cacheUsage(accountId, snap)
+  }, { force: options.force, isCurrent }).then((snap) => {
+      if (!isCurrent()) return null
+      cacheUsage(accountId, snap)
       return snap
     })
     .catch((e: any) => {
-      if ((usageGenerations.get(accountId) ?? 0) === generation) {
+      if (!(e instanceof UsageReadSupersededError) && isCurrent()) {
         if (isUsageAuthError(e)) {
           caches.set(accountId, { state: 'auth_failed' })
           successfulCaches.delete(accountId)
@@ -740,6 +714,23 @@ export function refreshUsageFromConnection(request: (method: string, params: any
       }
       return null
     })
+}
+
+async function fetchUsageFromConnection(request: () => Promise<any>, isCurrent: () => boolean): Promise<UsageSnapshot> {
+  let readStartedAt: number | undefined
+  const response = await requestCodexQuotaWithRetry(async () => {
+    if (!isCurrent()) throw new UsageReadSupersededError()
+    readStartedAt = Date.now()
+    try { return await request() }
+    catch (error) {
+      if (!isCurrent()) throw new UsageReadSupersededError()
+      throw error
+    }
+  })
+  if (!isCurrent()) throw new UsageReadSupersededError()
+  const snapshot = snapshotFromReadResponse(response, undefined, readStartedAt)
+  if (snapshot.state !== 'ok') logDiagnostic('codex live quota refresh failed', { reason: snapshot.state })
+  return snapshot
 }
 
 const usageGenerations = new Map<string, number>()
@@ -770,7 +761,6 @@ export async function requestCodexControlWithRetry<T>(request: () => Promise<T>,
       const transient = /error sending request|timed? ?out|timeout|ECONNRESET|ETIMEDOUT|EAI_AGAIN|connection (?:reset|closed)|\b(?:429|502|503|504)\b/i.test(message)
       if (!transient) throw error
       if (attempt >= delays.length) throw new Error(`Codex ${operation}失败（已尝试 ${attempt + 1} 次）：${message}`, { cause: error })
-      log(`usage: ${operation} retry ${attempt + 1}/${delays.length} in ${delays[attempt]}ms: ${message}`)
       await new Promise(resolve => setTimeout(resolve, delays[attempt]))
     }
   }

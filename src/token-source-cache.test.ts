@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { cachedTokenSource, disposeCachedTokenSource, refreshTokenSourceUsage } from './token-source-cache'
+import { cachedTokenSource, disposeCachedTokenSource, refreshTokenSourceUsage, peekTokenSourceUsage } from './token-source-cache'
 import type { TokenSource, UsageSnapshotUnified } from './token-source'
 import { withModelVisibility } from './token-source-visibility'
 import type { TokenSourceConfig } from './config'
@@ -39,6 +39,166 @@ function fixture() {
 }
 
 describe('Token Source cache boundary', () => {
+  test('Codex background reads and retries stay throttled while other sources retain their cadence', () => {
+    const script = `
+      import assert from 'node:assert/strict'
+      import { cachedTokenSource, disposeCachedTokenSource, refreshTokenSourceUsage } from './src/token-source-cache'
+      import { startBackgroundRefresh, stopBackgroundRefresh } from './src/background-refresh'
+      let now = 0
+      const timers = new Map()
+      Date.now = () => now
+      globalThis.setTimeout = (fn, delay) => {
+        const handle = { unref() {} }
+        timers.set(handle, { fn, at: now + delay })
+        return handle
+      }
+      globalThis.clearTimeout = handle => timers.delete(handle)
+      const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve() }
+      const advance = async milliseconds => {
+        assert.ok(milliseconds >= 0, 'virtual time must not move backwards')
+        const target = now + milliseconds
+        for (;;) {
+          const next = [...timers.entries()].filter(([, timer]) => timer.at <= target)
+            .sort((a, b) => a[1].at - b[1].at)[0]
+          if (!next) break
+          now = next[1].at
+          timers.delete(next[0]); next[1].fn(); await flush()
+        }
+        now = target
+      }
+      const scenario = async (kind, usageInterval, modelInterval, retryDelays) => {
+        now = 0
+        const state = { usage: 0, models: 0, usageError: undefined, modelError: undefined }
+        const create = () => {
+          const raw = {
+            id: kind, kind, agent: kind === 'codex-subscription' ? 'codex' : 'claude',
+            display: 'Test', enabled: true, models: [], defaultModel: '',
+            accountRevision: () => 'stable', modelCatalogState: { status: 'idle', updatedAt: null },
+            spawnEnv: env => env, resolveSpawnModel: model => model,
+            async refreshModels() {
+              state.models++
+              if (state.modelError) throw state.modelError
+              raw.models = [{ model: 'test-model', display: 'Test', efforts: ['high'], defaultEffort: 'high' }]
+              raw.modelCatalogState = { status: 'ready', updatedAt: now }
+            },
+            async readUsage() {
+              state.usage++
+              if (state.usageError) throw state.usageError
+              return { state: 'ok', windows: [] }
+            },
+          }
+          return raw
+        }
+        const source = cachedTokenSource(create, {}, kind, 'same-settings')
+        try {
+          await source.readUsage()
+          assert.equal(state.usage, 0)
+          // Startup warms both resources immediately, before timers are enabled.
+          await source.refreshModels(); await refreshTokenSourceUsage(source)
+          assert.equal(now, 0)
+          assert.deepEqual([state.usage, state.models], [1, 1])
+          startBackgroundRefresh()
+          await advance(usageInterval - 1)
+          await source.readUsage(); await source.readUsage()
+          assert.deepEqual([state.usage, state.models], [1, 1])
+          await advance(1)
+          assert.deepEqual([state.usage, state.models], [2, modelInterval === usageInterval ? 2 : 1])
+          if (modelInterval > usageInterval) {
+            await advance(modelInterval - now - 1)
+            assert.equal(state.models, 1)
+            await advance(1)
+          }
+          assert.equal(state.models, 2)
+          assert.equal(state.usage, 1 + modelInterval / usageInterval)
+
+          for (const [counter, errorKey, refresh, interval] of [
+            ['usage', 'usageError', () => refreshTokenSourceUsage(source), usageInterval],
+            ['models', 'modelError', () => source.refreshModels(), modelInterval],
+          ]) {
+            state[errorKey] = new Error('HTTP 503 unavailable')
+            await assert.rejects(refresh(), /HTTP 503/)
+            const delays = kind === 'codex-subscription' ? [interval, interval] : retryDelays
+            for (const delay of delays) {
+              const before = state[counter]
+              await advance(delay - 1)
+              await source.readUsage()
+              assert.equal(state[counter], before)
+              await advance(1)
+              assert.equal(state[counter], before + 1)
+            }
+            const longerRetry = Math.max(interval * 2, 600000)
+            state[errorKey].retryAfterMs = longerRetry
+            await assert.rejects(refresh(), /HTTP 503/)
+            const before = state[counter]
+            await advance(longerRetry - 1)
+            assert.equal(state[counter], before)
+            await advance(1)
+            assert.equal(state[counter], before + 1)
+            state[errorKey] = undefined
+            await refresh()
+          }
+        } finally {
+          stopBackgroundRefresh(); disposeCachedTokenSource(source)
+          assert.equal(timers.size, 0)
+        }
+      }
+      await scenario('codex-subscription', 7200000, 7200000, [])
+      await scenario('other-source', 60000, 300000, [60000, 120000, 240000, 300000])
+    `
+    const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', script], {
+      cwd: process.cwd(), stdout: 'pipe', stderr: 'pipe',
+    })
+    expect(result.exitCode, result.stdout.toString() + result.stderr.toString()).toBe(0)
+  })
+
+  test('account catalogs and quota are fenced by each account revision, including a late default-account refresh', async () => {
+    const revisions: Record<string, string> = { default: 'old', named: 'stable' }
+    let barrier = Promise.resolve()
+    const make = (id: string): TokenSource => {
+      const bound = revisions[id]!
+      const source: TokenSource = {
+        id: 'account-cache-test', kind: 'claude-subscription', agent: 'claude', accountId: id,
+        accountRevision: account => revisions[account]!, display: id, enabled: true,
+        defaultModel: 'opus', models: [], modelCatalogState: { status: 'idle', updatedAt: null },
+        spawnEnv: env => env, resolveSpawnModel: model => model,
+        async refreshModels() {
+          await barrier
+          source.models = [{ model: bound, display: bound, efforts: ['high'], defaultEffort: 'high' }]
+          source.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
+        },
+        async readUsage() { await barrier; return { state: 'ok', windows: [{ kind: 'weekly', label: id,
+          percent: bound === 'old' ? 10 : 50, resetsAt: null }] } },
+      }
+      return source
+    }
+    const create = (): TokenSource => ({ ...make('default'), accountId: undefined, aggregateAccountCatalog: true,
+      listAccounts: () => Object.keys(revisions).map(id => ({ id, name: id })), forAccount: make })
+    const root = cachedTokenSource(create, {}, 'account-cache', 'same')
+    const old = root.forAccount!('default'), named = root.forAccount!('named')
+    const blocked = gate()
+    try {
+      await root.refreshModels(); await refreshTokenSourceUsage(root)
+      expect(peekTokenSourceUsage(old)?.windows[0]?.percent).toBe(10)
+      barrier = blocked.promise
+      const pendingModels = old.refreshModels(), pendingQuota = refreshTokenSourceUsage(old)
+      await Promise.resolve(); await Promise.resolve()
+      revisions.default = 'new'
+      const fresh = root.forAccount!('default')
+      expect(fresh).not.toBe(old)
+      expect(root.forAccount!('named')).toBe(named)
+      expect(peekTokenSourceUsage(old)?.state).toBe('no_credentials')
+      expect(fresh.models).toEqual([])
+      blocked.release(); await Promise.all([pendingModels, pendingQuota])
+      expect(fresh.models).toEqual([])
+      expect(peekTokenSourceUsage(fresh)).toBeUndefined()
+      barrier = Promise.resolve()
+      await fresh.refreshModels(); await refreshTokenSourceUsage(fresh)
+      expect(fresh.models[0]?.model).toBe('new')
+      expect(peekTokenSourceUsage(fresh)?.windows[0]?.percent).toBe(50)
+      expect((await root.readUsage()).state).toBe('not_applicable')
+    } finally { blocked.release(); disposeCachedTokenSource(root) }
+  })
+
   test('slow model and quota refreshes never clear or block the committed snapshot', async () => {
     const { create, state } = fixture()
     const source = cachedTokenSource(create, {}, 'slow', 'slow')

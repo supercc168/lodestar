@@ -47,6 +47,8 @@ import type {
 } from '../claude-agent-process'
 import { fmtElapsed, liveElapsed, type LiveElapsedMode } from './format'
 import { sanitizeMarkdownForCardKit } from './elements'
+import { boundedResultContent, compactTaskContent } from './task-content'
+import { formatDuration } from './duration'
 import { shellCommandDescription } from './shell-command'
 import { agentCardTaskKindLabel, type AgentCardTaskKind } from './task-kind'
 import { summarizeToolInput } from './tool'
@@ -441,7 +443,9 @@ function briefInput(name: string, input: any): string {
   switch (name) {
     // 与主卡工具面板共用 shell-command 解析:Windows PowerShell 包装 / desc 注释
     // 统一剥掉,steps 里显示中文说明而非 powershell.exe 路径。
-    case 'Bash': return shellCommandDescription(s(input?.command)) || '(空命令)'
+    case 'Bash': return typeof input?.__displayDescription === 'string'
+      ? input.__displayDescription
+      : shellCommandDescription(s(input?.command)) || '(空命令)'
     case 'Read': return s(input?.file_path)
     case 'Edit': return s(input?.file_path)
     case 'Write': return s(input?.file_path)
@@ -666,19 +670,27 @@ export function backgroundLiveSummary(tasks: BgTaskEntry[]): string {
   return `🧭 子agent · ${summarizeBackground(tasks)}`
 }
 
-/** 详情 body —— 精简:error(异常一行) + 终态摘要墓碑 + steps(执行过程,
- *  每步一行)。运行期的用量/prompt 等元信息不入 body(header 状态行已够,后面
- *  占行越少越好)。 */
 function renderDetailBody(t: BgTaskEntry): string {
-  const lines: string[] = []
+  const kindLabel = agentCardTaskKindLabel(backgroundTaskKind(t))
+  const typeLabel = TYPE_LABEL[t.type]
+  const lines: string[] = [
+    `**${kindLabel}${typeLabel !== kindLabel ? ` · ${typeLabel}` : ''}**${ownerOf(t) !== typeLabel ? ` · ${ownerOf(t)}` : ''}${isBgTerminal(t) ? ` · 用时 ${formatDuration(terminalElapsed(t) / 1000)}` : ''}`,
+    t.description || '说明 MISS',
+  ]
   if (t.error) lines.push(`⚠ ${t.error}`)
-  // 终态摘要(子 agent 最终答复 / Claude task summary)置顶:墓碑展开第一眼
-  // 是结果,不是过程。有界预览,steps 仍然完整跟在后面。
-  if (isBgTerminal(t) && t.summary) lines.push(`📝 ${t.summary.slice(0, 400)}`, '')
-  for (let i = 0; i < t.steps.length; i++) {
-    lines.push(`${i + 1}. ${t.steps[i].brief}`)
+  // 终态摘要(子 agent 最终答复 / Claude task summary)置顶并完整展示;
+  // 任务说明只保留短摘要,最近动作仍然跟在后面。
+  if (t.summary) lines.push('', `**${isBgTerminal(t) ? '结果' : '进度'}**`, isBgTerminal(t)
+    ? boundedResultContent(t.summary)
+    : compactTaskContent(t.summary))
+  if (t.prompt) lines.push('', '**任务说明**', compactTaskContent(t.prompt))
+  if (t.steps.length) {
+    lines.push('', '**最近动作**')
+    for (const step of t.steps.slice(-3)) lines.push(`- ${step.brief}`)
+  } else if (t.lastToolName) {
+    lines.push('', `最近动作：${t.lastToolName}`)
   }
-  return sanitizeMarkdownForCardKit(lines.length > 0 ? lines.join('\n') : '_(暂无执行记录)_')
+  return sanitizeMarkdownForCardKit(lines.join('\n'))
 }
 
 export function backgroundTaskSummary(t: BgTaskEntry): string {
@@ -687,17 +699,17 @@ export function backgroundTaskSummary(t: BgTaskEntry): string {
     running: `⏳ ${kindLabel}正在执行`, pending: `⏳ ${kindLabel}等待执行`, paused: `⏸️ ${kindLabel}已暂停`,
     completed: `✅ ${kindLabel}完成`, failed: `❌ ${kindLabel}失败`, killed: `🛑 ${kindLabel}已终止`,
   }[t.status]
-  const description = t.description.replace(/\s+/g, ' ').trim() || '说明 MISS'
+  const description = displayDescription(t).replace(/\s+/g, ' ').trim() || '说明 MISS'
   return `${status} · ${description.length <= 40 ? description : `${description.slice(0, 39)}…`}`
 }
 
-/** 单任务的整 panel —— 标题写「图标 责任人·描述 — 状态·时长」,展开看详情 body。
- *  session 据此 addElement(新任务)/replaceElement(刷新,整个 panel)。
- *  liveElapsedMode 只影响活跃态 header 时长文案;终态仍用精确 fmtElapsed。 */
+/** Shared task row: category and state stay visible, with local owner,
+ * resumed marker and actual terminal duration. Running rows have no ticking
+ * clock. Optional timing parameters remain compatible with older callers. */
 export function backgroundTaskPanel(
   t: BgTaskEntry,
-  now: number = Date.now(),
-  liveElapsedMode: LiveElapsedMode = 'bucket',
+  _now: number = Date.now(),
+  _liveElapsedMode: LiveElapsedMode = 'bucket',
 ): object {
   return {
     tag: 'collapsible_panel',
@@ -705,7 +717,7 @@ export function backgroundTaskPanel(
     header: {
       title: {
         tag: 'plain_text',
-        content: `${TYPE_ICON[t.type]} ${ownerOf(t)}${t.resumed ? '(续跑)' : ''} · ${displayDescription(t)} — ${statusLabel(t, now, liveElapsedMode)}`,
+        content: `${backgroundTaskSummary(t)}${t.subagentType || t.workflowName ? ` · ${ownerOf(t)}` : ''}${t.resumed ? '(续跑)' : ''}${isBgTerminal(t) ? ` · 用时 ${fmtElapsed(terminalElapsed(t))}` : ''}`,
       },
     },
     expanded: false,

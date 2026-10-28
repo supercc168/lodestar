@@ -17,14 +17,17 @@
  * Stop:  SIGTERM
  */
 
+import { finishStartupLogging } from './src/daemon-startup-logging'
 import * as lark from '@larksuiteoapi/node-sdk'
 import { startBackgroundRefresh, stopBackgroundRefresh } from './src/background-refresh'
+import { startCodexLiveUsageRefresh, stopCodexLiveUsageRefresh } from './src/codex-live-usage'
 import { codexActivation } from './src/codex-activation'
 import { refreshTokenSourceUsage } from './src/token-source-cache'
 import { pendingSourceCommands } from './src/session-commands'
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { Session } from './src/session'
+import { sessionActivity } from './src/session-activity'
 import * as feishu from './src/feishu'
 import { formatFeishuError } from './src/feishu-errors'
 import * as cards from './src/cards'
@@ -62,7 +65,7 @@ import { settleCodexAccountCards } from './src/session-codex-accounts'
 import { removeManagedSkill } from './src/managed-skills'
 import { beginAgyForwardToCodex } from './src/session-agy'
 import { config } from './src/config'
-import { log } from './src/log'
+import { log, logError, logDiagnostic } from './src/log'
 import { startAgentAutoUpdates } from './src/agent-updates'
 import { DEBUG_CTX_FILE, DEBUG_SOCK_FILE, PID_FILE } from './src/paths'
 import { checkPidGuard, writePidFile } from './src/pid-guard'
@@ -97,7 +100,7 @@ import {
 {
   const guard = checkPidGuard(PID_FILE)
   if (guard.state === 'exit') {
-    console.error(`lodestar-daemon: already running (pid ${guard.pid})`)
+    console.error('lodestar-daemon: already running')
     process.exit(1)
   }
   if (existsSync(PID_FILE)) { try { unlinkSync(PID_FILE) } catch {} }
@@ -119,7 +122,7 @@ const cleanup = () => {
   cleanupDone = true
   try {
     sessionRecovery.persist()
-  } catch (e) { log(`alive marker write failed: ${e}`) }
+  } catch (e) { logError('daemon.recovery_marker.write_failed', e) }
   try { unlinkSync(PID_FILE) } catch {}
   try { unlinkSync(DEBUG_SOCK_FILE) } catch {}
 }
@@ -135,6 +138,7 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
   if (shutdownPromise) return shutdownPromise
   shutdownRequested = true
   stopBackgroundRefresh()
+  stopCodexLiveUsageRefresh()
   const activationStopped = codexActivation.stop().then(
     value => ({ status: 'fulfilled' as const, value }), reason => ({ status: 'rejected' as const, reason }),
   )
@@ -147,18 +151,18 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
   try { stopFeishuWs?.() }
   catch (error) {
     shutdownExitCode = 1
-    log(`shutdown WebSocket close failed: ${error}`)
+    logError('daemon.shutdown.websocket_close_failed', error)
   }
   // Keep boot's not-yet-restored names while admitted commands drain. Freeze
   // only after that drain, so an already-accepted user kill is respected.
   try {
     sessionRecovery.persist()
   } catch (e) {
-    log(`shutdown alive marker write failed: ${e}`)
+    logError('daemon.shutdown.recovery_marker_failed', e)
     shutdownExitCode = 1
   }
   shutdownPromise = (async () => {
-    log(`${reason}: staged shutdown begin sessions=${sessions.size}`)
+    logDiagnostic('daemon.shutdown.started', { reason })
     try {
       const stopping = (async () => {
         await drainDynamicWork(() => [
@@ -189,7 +193,7 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
           for (const result of results) {
             if (result.status === 'rejected') {
               shutdownExitCode = 1
-              log(`shutdown session stop failed: ${result.reason}`)
+              logError('daemon.shutdown.session_stop_failed', result.reason)
             }
           }
           return 'stopped' as const
@@ -199,12 +203,12 @@ function requestShutdown(reason: string, exitCode: number): Promise<void> {
       if (deadlineTimer) clearTimeout(deadlineTimer)
       if (outcome === 'deadline') {
         shutdownExitCode = 1
-        log(`${reason}: shutdown deadline ${SHUTDOWN_DEADLINE_MS}ms reached; forcing exit`)
+        logDiagnostic('daemon.shutdown.deadline', { timeoutMs: SHUTDOWN_DEADLINE_MS })
       } else {
-        log(`${reason}: all sessions stopped`)
+        log('daemon.shutdown.completed')
       }
     } catch (e) {
-      log(`${reason}: staged shutdown failed: ${e}`)
+      logError('daemon.shutdown.failed', e)
       shutdownExitCode = 1
     } finally {
       cleanup()
@@ -225,20 +229,20 @@ if (process.platform === 'win32') {
   process.on('SIGBREAK', () => { void requestShutdown('SIGBREAK', 0) })
 }
 process.on('unhandledRejection', e => {
-  // 本地红线(存活哲学):只打日志,绝不退出进程 —— WS 自愈体系与 LaunchAgent
-  // keepalive 依赖 daemon 常驻。上游 ec149d7 在此挂 requestShutdown(…, 1) 的
-  // hunk 明确不采纳(01-CONTEXT 锁定决策;仅信号走分级关停)。
-  log(`unhandledRejection: ${e instanceof Error ? e.stack ?? e.message : e}`)
+  // 保留本地常驻策略；未处理错误仅记录安全摘要，信号走统一关停。
+  logError('daemon.unhandled_rejection', e)
 })
 process.on('uncaughtException', e => {
-  // 同上:log-only,不退出进程。
-  log(`uncaughtException: ${e.stack ?? e.message}`)
+  logError('daemon.uncaught_exception', e)
 })
 
 // ── Session registry ────────────────────────────────────────────────────
 const sessions = new Map<string, Session>()  // key = chatId
 const agentService = new AgentService()
 const chatActor = new PerKeyActor()
+// Local, opt-in exception for restart verification; no group is enabled by
+// default and the native recovery path still owns the conversation binding.
+const restartContinueChatId = process.env.LODESTAR_RESTART_CONTINUE_CHAT_ID?.trim()
 const sessionRecovery = new DaemonSessionRecovery({
   readMarker: feishu.readAliveMarker,
   writeMarker: feishu.writeAliveMarker,
@@ -247,7 +251,20 @@ const sessionRecovery = new DaemonSessionRecovery({
   sessionFor,
   actor: chatActor,
   isShuttingDown: () => shutdownRequested,
+  restartContinuation: restartContinueChatId ? {
+    chatId: restartContinueChatId,
+    send: async restored => {
+      const session = sessions.get(restartContinueChatId)
+      if (!session || session !== restored) throw new Error('restart continuation session binding changed')
+      try { await session.continueAfterDaemonRestart() }
+      catch (error) {
+        await feishu.sendText(restartContinueChatId, `⚠️ 重启自动续接失败：${error instanceof Error ? error.message : error}`)
+        throw error
+      }
+    },
+  } : undefined,
   log,
+  logError,
 })
 const cardActionDeduper = new ActionDeduper(30_000)
 // 动态在途工作集:卡片动作后台段(准入编排的 track 注入)登记于此,
@@ -266,18 +283,17 @@ function trackCardActionWork<T>(work: Promise<T>): Promise<T> {
 /** Preserve Feishu delivery order per chat without delaying the WS ACK. Work
  * in different groups remains concurrent; messages and lifecycle commands in
  * one group cannot overtake an earlier attachment download/card open. */
-function enqueueMessage(data: any, source = 'ws'): boolean {
+function enqueueMessage(data: any): boolean {
   if (shutdownRequested) {
-    log(`${source}: reject inbound message: daemon shutdown in progress`)
+    log('daemon.inbound.rejected_shutdown')
     return false
   }
-  const chatId = String(data?.message?.chat_id ?? '')
   const admitted = messageAdmission.accept(data)
   if (!admitted.accepted) {
-    log(`${source}: reject inbound message${chatId ? '' : ' without chat_id'}: actor ${admitted.reason}`)
+    log('daemon.inbound.admission_rejected')
     return false
   }
-  void admitted.completion.catch(e => { log(`${source}: handleMessage rejected chat=${chatId.slice(0, 8)}…: ${e}`) })
+  void admitted.completion.catch(e => { logError('daemon.inbound.failed', e) })
   return true
 }
 
@@ -411,7 +427,7 @@ const notifyReplies = createNotifyReplyRuntime({
   sendText: feishu.sendText,
   dispatch: dispatchCallback,
   onWaitingChanged: chatId => sessions.get(chatId)?.refreshPendingAsks(),
-  log,
+  logError,
 })
 
 async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> {
@@ -443,7 +459,7 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
   // 新消息误杀(上游 ec149d7 点名坑)。
   const createTime = Number(message.create_time ?? 0)
   if (isStaleAtReceipt(createTime, receivedAt, STALE_THRESHOLD_MS)) {
-    log(`drop stale message ${msgId} ageAtReceipt=${Math.round((receivedAt - createTime) / 1000)}s`)
+    log('daemon.inbound.stale_message_dropped')
     if (msgId) void feishu.addReaction(msgId, 'CrossMark')
     return
   }
@@ -465,8 +481,7 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
         seeded_at: new Date().toISOString(),
         seeded_msg_id: msgId ?? '',
       }, null, 2))
-      log(`debug: seeded inject context chat=${chatId.slice(0, 8)}… sender=${userOpenId.slice(0, 8)}…`)
-    } catch (e) { log(`debug: seed context failed: ${e}`) }
+    } catch (e) { logError('daemon.debug_context.write_failed', e) }
     const stripped = debugTextRaw.slice('[DEBUG]'.length)
     contentObjForDebug.text = stripped
     message.content = JSON.stringify(contentObjForDebug)
@@ -485,13 +500,20 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
     groupName = (await feishu.fetchChatName(chatId)) ?? undefined
   }
   if (!groupName) {
-    log(`unknown chat ${chatId}, dropping message`)
+    log('daemon.inbound.unbound_message_dropped')
     await feishu.sendText(chatId, '❌ 无法识别群名。请确认：① 机器人已被拉进本群；② 群已设置名称（未命名群拿不到群名，无法映射项目目录）。设置后再发一条消息即可。')
     return
   }
   const sessionName = feishu.sanitizeSessionName(groupName)
   feishu.bindSessionToChat(sessionName, chatId)
   const session = sessionFor(chatId, sessionName)
+  try { sessionActivity.recordUserMessage(chatId, createTime, receivedAt) }
+  catch (error) {
+    const reason = error instanceof Error ? error.message : String(error)
+    logError('daemon.session_activity.persist_failed', reason)
+    await feishu.sendText(chatId, `❌ 用户消息活跃时间保存失败，未执行本条消息：${reason}`)
+    return
+  }
 
   let contentObj: any = {}
   try { contentObj = JSON.parse(message.content ?? '{}') } catch {}
@@ -587,7 +609,7 @@ async function handleMessage(data: any, receivedAt = Date.now()): Promise<void> 
     // Post 已经走 markdown 解码;还落到空,要么是不支持的 message_type
     // (sticker / share_chat / audio / ...),要么是 post 里只剩 emotion /
     // 未知 tag。留 log 防再有"静默 1.5h"那种 case 没法回溯。
-    log(`drop empty message ${msgId} type=${msgType}`)
+    log('daemon.inbound.empty_message_dropped')
     return
   }
   // 多条消息缓冲:>>> 开始收集 / <<< 收尾合并。返回 true = 已缓冲或已合并,
@@ -658,22 +680,24 @@ function modelActionResponse(result: ModelActionResult): any {
     result.pending ? undefined : result.message,
   )
   if (result.completion) response.__modelActionCompletion = result.completion
+  if (result.canPresent) response.__modelActionCanPresent = result.canPresent
   return response
 }
 
 async function sendActionReceipt(chatId: string, text: string): Promise<void> {
   if (!chatId) {
-    log(`card-action: cannot send receipt without chat_id: ${text}`)
+    log('daemon.card_action.receipt_binding_missing')
     return
   }
   const sent = await feishu.sendTextRaw(chatId, text)
-  if (!sent) log(`card-action: visible receipt MISS chat=${chatId.slice(0, 8)}… text=${text.slice(0, 120)}`)
+  if (!sent) log('daemon.card_action.receipt_failed')
 }
 
 async function publishCardActionResult(data: any, result: any): Promise<void> {
   // 通知回复的等待卡由 runtime 自己维护(与 __cardActionCompletion 并列,
   // 不改后者:push 模式 notify_callback 仍靠它驱动 dedupe)。
   if (result?.__cardActionPresented) return
+  if (result?.__modelActionCanPresent && !result.__modelActionCanPresent()) return
   const kind = String(data?.action?.value?.kind ?? 'unknown')
   const label = cardActionLabel(kind)
   const chatId = String(
@@ -695,7 +719,7 @@ async function publishCardActionResult(data: any, result: any): Promise<void> {
       await feishu.updateCard(messageId, card)
       return
     } catch (e) {
-      log(`card-action: ${kind} original-card update failed: ${e instanceof Error ? e.message : e}`)
+      logError('daemon.card_action.original_card_update_failed', e)
       const recovery = kind === 'temp_resume_select'
         ? '请发送 rs 查看当前状态。'
         : '请重新打开操作面板。'
@@ -762,13 +786,12 @@ const cardActionAdmission = createCardActionAdmission<any, object>({
   },
   present: publishCardActionResult,
   presentExecutionFailure: async (data, error) => {
-    const kind = String(data?.action?.value?.kind ?? 'unknown')
-    log(`handleCardAction ${kind}: ${error instanceof Error ? error.stack ?? error.message : error}`)
+    logError('daemon.card_action.failed', error)
     await publishCardActionFailure(data, error)
   },
   presentPresentationFailure: async (data, error) => {
     const kind = String(data?.action?.value?.kind ?? 'unknown')
-    log(`card-action presentation ${kind}: ${error instanceof Error ? error.message : error}`)
+    logError('daemon.card_action.presentation_failed', error)
     await sendActionReceipt(
       String(data?.context?.open_chat_id ?? ''),
       `⚠️ ${cardActionLabel(kind)}已执行，但结果呈现失败。`,
@@ -786,14 +809,16 @@ const cardActionAdmission = createCardActionAdmission<any, object>({
       // Start presentation only after the pending card has landed. The actor
       // is released while the backend works, so stop/questions stay usable.
       return modelActionCompletion(modelCompletion,
-        final => publishCardActionResult(data, modelActionResponse(final)))
+        final => final.canPresent
+          ? chatActor.enqueue(String(data?.context?.open_chat_id ?? ''), () => publishCardActionResult(data, modelActionResponse(final)))
+          : publishCardActionResult(data, modelActionResponse(final)))
     }
     const completion = result?.__cardActionCompletion
     return completion && typeof completion.then === 'function' ? completion : null
   },
   track: work => { trackCardActionWork(work) },
   onBackgroundError: error => {
-    log(`card-action background: ${error instanceof Error ? error.stack ?? error.message : error}`)
+    logError('daemon.card_action.background_failed', error)
   },
   responses: {
     accepted: data => ({
@@ -898,7 +923,7 @@ async function handleCardAction(data: any): Promise<any> {
       }
     }
     case 'provider_select': {
-      const result = await session.onProviderSelect(String(value.source_id ?? ''), String(value.panel_id ?? ''))
+      const result = await session.onProviderSelect(String(value.source_id ?? ''), String(value.panel_id ?? ''), true)
       return modelActionResponse(result)
     }
     case 'model_page': {
@@ -910,7 +935,7 @@ async function handleCardAction(data: any): Promise<any> {
       const source = String(value.source_id ?? '')
       if (value.mode !== 'add' && value.mode !== 'select') throw new Error('模型管理模式无效')
       return modelActionResponse(await (value.mode === 'add'
-        ? session.onModelAddOpen(panel, source) : session.onProviderSelect(source, panel)))
+        ? session.onModelAddOpen(panel, source, true) : session.onProviderSelect(source, panel, true)))
     }
     case 'model_add':
     case 'model_remove':
@@ -1125,7 +1150,7 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
 
   const reg = getNotifyCallback(notifyId)
   if (!reg) {
-    log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… not found (expired or pre-restart)`)
+    log('daemon.notify_callback.registration_missing')
     return { toast: { type: 'error', content: '通知已过期或已移除' } }
   }
   // Idempotency: a finalized card refuses re-fire ("已处理过"); an
@@ -1157,7 +1182,7 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
   }
   const button = reg.buttons.find((b) => b.id === buttonId)
   if (!button) {
-    log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… unknown button_id="${buttonId}"`)
+    log('daemon.notify_callback.button_unknown')
     return withNotifyContext(reg, withBusinessOutcome(
       { toast: { type: 'error', content: '未知按钮' } },
       false,
@@ -1171,12 +1196,13 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
     // 保留),verdict 卡照常回(准入层 ACK 后经 message.patch 落原卡)。
     const recorded = recordCallbackSuccess(reg.notifyId, button.id, userId)
     if (recorded.state === 'unknown') {
-      log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… verdict tombstone UNKNOWN (pull/display): ${recorded.detail}`)
+      log('notify.callback.unknown')
     }
-    log(`notify-callback: notify_id=${notifyId.slice(0, 12)}… resolved button="${buttonId}" by=${userId.slice(0, 8)}… (no callback, pull/display)`)
-    return withNotifyContext(reg, actionCardResponse(
-      buildNotifyCardFromReg(reg, { status: 'done', buttonId: button.id, text: button.text, operatorOpenId: userId }),
-    ))
+    return withNotifyContext(reg, {
+      ...actionCardResponse(
+        buildNotifyCardFromReg(reg, { status: 'done', buttonId: button.id, text: button.text, operatorOpenId: userId }),
+      ),
+    })
   }
 
   // Push mode: drive BOTH card states via message.patch on the original card
@@ -1196,7 +1222,7 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
   setDispatching(reg.notifyId)
   const phase2 = trackCardActionWork(pushNotifyCallbackPhase2(reg, button, userId))
   void phase2.catch(e => {
-    log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-2 rejected: ${e instanceof Error ? e.message : e}`)
+    logError('daemon.notify_callback.phase_two_failed', e)
   })
   const completion = phase2.then<'complete' | 'retry'>(outcome =>
     outcome === 'retry' ? 'retry' : 'complete'
@@ -1226,7 +1252,7 @@ async function pushNotifyCallbackPhase2(
     try {
       await feishu.updateCard(reg.messageId, processingCard)
     } catch (e) {
-      log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-1 (processing) updateCard failed: ${e instanceof Error ? e.message : e}`)
+      logError('daemon.notify_callback.processing_card_failed', e)
     }
 
     // Push + Phase 2 final card.
@@ -1250,7 +1276,7 @@ async function pushNotifyCallbackPhase2(
           status: 'unknown', buttonId: button.id, text: button.text,
           operatorOpenId: userId, detail: recorded.detail,
         }
-        log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… callback succeeded but tombstone is UNKNOWN: ${recorded.detail}`)
+        log('daemon.notify_callback.confirmation_unknown')
         try {
           await sendActionReceipt(
             reg.chatId,
@@ -1259,7 +1285,7 @@ async function pushNotifyCallbackPhase2(
         } catch (e) {
           // Presentation failure after an external success must never turn the
           // business outcome back into retry.
-          log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… UNKNOWN warning receipt failed: ${e instanceof Error ? e.message : e}`)
+          logError('daemon.notify_callback.unknown_receipt_failed', e)
         }
       }
     } else {
@@ -1275,17 +1301,17 @@ async function pushNotifyCallbackPhase2(
       const finalCard = buildNotifyCardFromReg(reg, resolution)
       await feishu.updateCard(reg.messageId, finalCard)
     } catch (e) {
-      log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… phase-2 (final) presentation failed: ${e instanceof Error ? e.message : e}`)
+      logError('daemon.notify_callback.final_card_failed', e)
       try {
         await sendActionReceipt(
           reg.chatId,
           `⚠️ 通知反馈${outcome === 'retry' ? '失败且结果卡更新失败，可重新点击' : outcome === 'unknown' ? '送达状态未知且结果卡更新失败，禁止自动重试' : '已执行，但结果卡更新失败'}: ${e instanceof Error ? e.message : e}`,
         )
       } catch (receiptError) {
-        log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… final fallback receipt failed: ${receiptError instanceof Error ? receiptError.message : receiptError}`)
+        logError('daemon.notify_callback.fallback_receipt_failed', receiptError)
       }
     }
-    log(`notify-callback: notify_id=${reg.notifyId.slice(0, 12)}… button="${button.id}" ${outcome === 'complete' ? 'delivered' : outcome === 'unknown' ? 'unknown/non-retryable' : `failed: ${result.detail}`} by=${userId.slice(0, 8)}…`)
+    if (outcome !== 'complete') logDiagnostic('daemon.notify_callback.failed', { reason: outcome })
     return outcome
   } finally {
     clearDispatching(reg.notifyId)
@@ -1293,9 +1319,6 @@ async function pushNotifyCallbackPhase2(
 }
 
 // ── WebSocket boot ─────────────────────────────────────────────────────
-function fmt(m: any[]): string {
-  return m.map(x => typeof x === 'string' ? x : JSON.stringify(x)).join(' ')
-}
 
 // ── Debug message injection ─────────────────────────────────────────────
 // Listens on a unix socket so scripts/test-inject.ts can replay messages
@@ -1307,7 +1330,6 @@ function startDebugSocket(): void {
     // Bun.serve({unix:...}) 在 Windows 上不支持,且 debug 注入是
     // dev-only 路径(scripts/test-inject.ts 用的),end user 不需要。
     // 想在 Windows 上 spike 这个,换成 loopback HTTP 即可。
-    log('debug: inject socket skipped on Windows (dev-only feature)')
     return
   }
   if (typeof Bun === 'undefined') {
@@ -1316,7 +1338,6 @@ function startDebugSocket(): void {
     // 直接跳过即可 —— 既不报错也不引入 node:http 的 socket-path 端口
     // 适配工作量。本机 `bun daemon.ts` 因为 Bun 是 defined 的,这条
     // 分支不进。
-    log('debug: inject socket skipped (Bun runtime only — npm/Node build does not include it)')
     return
   }
   try { if (existsSync(DEBUG_SOCK_FILE)) unlinkSync(DEBUG_SOCK_FILE) } catch {}
@@ -1358,7 +1379,6 @@ function startDebugSocket(): void {
             const response = await feishu.client.im.v1.message.get({ path: { message_id: body.message_id } })
             if (response.code !== 0) throw new Error(`message.get failed: ${formatFeishuError(response)}`)
             const event = debugModelActionEvent(body, ctx, response.data?.items?.[0], config.feishu.app_id, panel.messageId)
-            log(`debug: model action ${body.value.kind} chat=${ctx.chat_id.slice(0, 8)}…`)
             const admission = acceptCardAction(event)
             // 排到相同群的 actor 尾部，等待正常业务处理与卡片呈现完成。
             await chatActor.enqueue(ctx.chat_id, async () => {})
@@ -1395,9 +1415,8 @@ function startDebugSocket(): void {
             create_time: String(Date.now()),
           },
         }
-        log(`debug: inject text=${JSON.stringify(text).slice(0, 80)} msg_id=${realMsgId}`)
         // Don't await — match real WS dispatcher behavior (fire-and-forget per event).
-        if (!enqueueMessage(payload, 'debug')) {
+        if (!enqueueMessage(payload)) {
           return new Response('daemon shutdown in progress', { status: 503 })
         }
         if (body.wait_for_handling === true) await chatActor.enqueue(ctx.chat_id, async () => {})
@@ -1407,14 +1426,13 @@ function startDebugSocket(): void {
       },
     })
     try { chmodSync(DEBUG_SOCK_FILE, 0o600) } catch {}
-    log(`debug: inject socket listening at ${DEBUG_SOCK_FILE}`)
   } catch (e) {
-    log(`debug: socket bind failed: ${e}`)
+    logError('daemon.debug_socket.bind_failed', e)
   }
 }
 
 async function boot(): Promise<void> {
-  log(`lodestar-daemon: pid ${process.pid} starting`)
+  log('daemon.started')
   sessionRecovery.load()
   // token source registry 先于 session 构建填充:session 构造会查 registry 推导 tokenSourceId。
   // config.toml [token_source.*] 在此落地为可用的 TokenSource。
@@ -1428,6 +1446,7 @@ async function boot(): Promise<void> {
   await refreshAllTokenSourceModels()
   await Promise.allSettled(listTokenSourceAccounts().map(refreshTokenSourceUsage))
   if (shutdownRequested) return
+  startCodexLiveUsageRefresh()
   startBackgroundRefresh()
   codexActivation.start()
   feishu.loadTempSessionLeases()
@@ -1446,7 +1465,7 @@ async function boot(): Promise<void> {
   try {
     await reconcileTasklistDeletions()
   } catch (e) {
-    log(`tasklist deletion reconcile failed: ${e instanceof Error ? e.message : e}`)
+    logError('daemon.tasklist_reconcile.failed', e)
   }
   if (shutdownRequested) return
 
@@ -1473,8 +1492,8 @@ async function boot(): Promise<void> {
   let scheduledRebuildDueAt = 0
   let scheduledRebuildReason = ''
   let scheduledRebuildVerifyAfter = false
-  let rebuildWs: (reason: string, verifyAfter?: boolean) => void = (reason) => {
-    log(`[ws] rebuild requested before WS init — ${reason}`)
+  let rebuildWs: (reason: string, verifyAfter?: boolean) => void = (_reason) => {
+    log('daemon.websocket.rebuild_before_init')
   }
   const scheduleWsRebuild = (reason: string, delayMs = 0, verifyAfter = false) => {
     if (shutdownRequested) return
@@ -1482,7 +1501,6 @@ async function boot(): Promise<void> {
     if (scheduledRebuildTimer) {
       scheduledRebuildVerifyAfter ||= verifyAfter
       if (dueAt >= scheduledRebuildDueAt) {
-        log(`[ws] rebuild already scheduled — ${reason}`)
         return
       }
       clearTimeout(scheduledRebuildTimer)
@@ -1502,11 +1520,11 @@ async function boot(): Promise<void> {
   }
 
   const wsLogger = {
-    error: (m: any[]) => log(`[ws-sdk error] ${fmt(m)}`),
+    error: (m: any[]) => logError('daemon.websocket.sdk_error', m.flat(2).find(value => value instanceof Error || value && typeof value === 'object')),
     warn:  (m: any[]) => {
-      const text = fmt(m)
-      log(`[ws-sdk warn] ${text}`)
-      if (text.includes('no pong/inbound')) {
+      const messages = m.flat(2)
+      logError('daemon.websocket.sdk_warning', messages.find(value => value instanceof Error || value && typeof value === 'object'))
+      if (messages.some(value => typeof value === 'string' && value.includes('no pong/inbound'))) {
         scheduleWsRebuild(
           'ping-timeout: SDK liveness watchdog fired',
           2_000,
@@ -1514,11 +1532,11 @@ async function boot(): Promise<void> {
         )
       }
     },
-    info:  (m: any[]) => log(`[ws-sdk] ${fmt(m)}`),
+    info:  (_m: any[]) => { /* routine SDK messages are not diagnostic output */ },
     debug: (_m: any[]) => { /* drop */ },
     trace: (_m: any[]) => { /* drop */ },
   }
-  const dispatcher = new lark.EventDispatcher({})
+  const dispatcher = new lark.EventDispatcher({ logger: wsLogger, loggerLevel: lark.LoggerLevel.warn })
 
   // ── connected-but-deaf self-heal ────────────────────────────────────────
   // Feishu 长连接是**集群模式**(官方文档原话:"同一应用部署多个 client,
@@ -1588,14 +1606,14 @@ async function boot(): Promise<void> {
     // reconnect (the pingTimeout watchdog only arms AFTER 'open'). 10s cap →
     // fail-fast into the SDK's reconnect loop instead of hanging indefinitely.
     handshakeTimeoutMs: 10_000,
-    onReconnecting: () => log('[ws] reconnecting — WS lost, SDK is retrying'),
+    onReconnecting: () => log('daemon.websocket.reconnecting'),
     // SDK 自己重连成功了 —— 但这正是僵尸聋的高发点。不信它,延迟一拍后整个
     // 换新 client(见 onReconnectedHeal)。
     onReconnected:  () => onReconnectedHeal(),
     // SDK exhausted its own reconnect budget. Do NOT exit the process — that
     // SIGTERMs every Codex subprocess / live card across all
     // groups. Rebuild a fresh WS client in place; the rest keeps running.
-    onError: (err) => rebuildWs(`SDK onError: ${err?.message ?? err}`),
+    onError: (err) => { logError('daemon.websocket.connection_failed', err); rebuildWs('sdk-error') },
   })
 
   // Fresh-client rebuild: force-close the (possibly server-side-zombie) old
@@ -1604,9 +1622,9 @@ async function boot(): Promise<void> {
   // cards; never exits the process. close({force}) does
   // removeAllListeners() before terminate(), so the old client fires no stray
   // reconnect. verifyAfter arms a post-rebuild check (only for active groups).
-  rebuildWs = (reason: string, verifyAfter = false) => {
+  rebuildWs = (_reason: string, verifyAfter = false) => {
     if (shutdownRequested) return
-    if (rebuilding) { log(`[ws] rebuild skipped (already rebuilding) — ${reason}`); return }
+    if (rebuilding) return
     if (scheduledRebuildTimer) {
       clearTimeout(scheduledRebuildTimer)
       scheduledRebuildTimer = null
@@ -1614,12 +1632,12 @@ async function boot(): Promise<void> {
     }
     rebuilding = true
     consecRebuilds++
-    log(`[ws] rebuild #${consecRebuilds} (fresh WSClient) — ${reason}`)
+    logDiagnostic('daemon.websocket.rebuild', { attempt: consecRebuilds })
     const old = ws
-    try { old?.close({ force: true }) } catch (e) { log(`[ws] rebuild: old close failed: ${e}`) }
+    try { old?.close({ force: true }) } catch (e) { logError('daemon.websocket.old_close_failed', e) }
     ws = makeWs()
     void ws.start({ eventDispatcher: dispatcher }).catch(e => {
-      log(`[ws] rebuild start failed: ${e}`)
+      logError('daemon.websocket.rebuild_start_failed', e)
       scheduleWsRebuild(`fresh client start failed: ${e}`, SETTLE_MS, verifyAfter)
     })
     rebuilding = false
@@ -1639,8 +1657,7 @@ async function boot(): Promise<void> {
       verifyTimer = null
       if (lastEventAt >= armedAt) { consecRebuilds = 0; return }  // events resumed → healthy
       if (consecRebuilds >= MAX_CONSEC_REBUILDS) {
-        log(`[ws] STILL deaf after ${MAX_CONSEC_REBUILDS} fresh rebuilds — auto-heal exhausted, ` +
-            `leaving last client up (no process exit). Restart the configured service or run lodestar-stop && lodestar-daemon`)
+        log('daemon.websocket.recovery_exhausted')
         consecRebuilds = 0
         return
       }
@@ -1656,8 +1673,7 @@ async function boot(): Promise<void> {
   // gets the single precautionary rebuild and no retry storm.
   const onReconnectedHeal = () => {
     const wasRecentlyActive = (Date.now() - lastEventAt) < RECENT_ACTIVITY_MS
-    log(`[ws] reconnected — swapping in a fresh WSClient (cluster-routing precaution; ` +
-        `recentlyActive=${wasRecentlyActive})`)
+    log('daemon.websocket.reconnected')
     consecRebuilds = 0
     scheduleWsRebuild('post-reconnect precaution', SETTLE_MS, wasRecentlyActive)
   }
@@ -1684,7 +1700,6 @@ async function boot(): Promise<void> {
       return
     }
     wsUnhealthyTicks++
-    log(`[ws] watchdog: state=${state} (${wsUnhealthyTicks}/${WS_CONNECTING_GRACE_TICKS})`)
     if (wsUnhealthyTicks >= WS_CONNECTING_GRACE_TICKS) {
       wsUnhealthyTicks = 0
       rebuildWs(`watchdog: stuck in '${state}' ~${Math.round((WS_WATCHDOG_INTERVAL_MS * WS_CONNECTING_GRACE_TICKS) / 1000)}s`)
@@ -1751,23 +1766,27 @@ async function boot(): Promise<void> {
   // Reserve recovery ahead of both messages and card actions in each chat's
   // FIFO before ingress opens. Feishu REST status cards do not require WS.
   const revival = sessionRecovery.enqueue()
-  // Agent 自动更新(上游 c55bb44 / D-06):只挂定时器,不做任何主动检查或安装 ——
-  // 默认三开关全 false → 零定时器严格 no-op;只有显式 `true` 的 agent 才按 6h 节拍更新。
-  stopAgentAutoUpdates = startAgentAutoUpdates(log, { enabled: config.runtime.agent_auto_update })
+  stopAgentAutoUpdates = startAgentAutoUpdates(message => {
+    if (message.includes('自动更新未完成:')) logError('daemon.agent_update.failed', message)
+    else if (message.includes('已更新，新进程使用新版')) log('daemon.agent_update.completed')
+  }, { enabled: config.runtime.agent_auto_update })
   void ws.start({ eventDispatcher: dispatcher }).catch(e => {
-    log(`[ws] initial start failed: ${e}`)
+    logError('daemon.websocket.start_failed', e)
     scheduleWsRebuild(`initial start failed: ${e}`, SETTLE_MS, false)
   })
-  log(`lodestar-daemon: WS start requested, watching ${feishu.chatNameCache.size} groups`)
+  log('daemon.ready')
   startDebugSocket()
   for (const reg of recoveredCallbacks) {
     void trackCardActionWork(chatActor.enqueue(reg.chatId, () => notifyReplies.recover(reg)))
-      .catch(error => log(`notify-reply recovery failed: ${error instanceof Error ? error.message : error}`))
+      .catch(error => logError('daemon.notify_reply.recovery_failed', error))
   }
   await revival
 }
 
+// All staged-shutdown dependencies now exist; import/initialization failures
+// before this point must use the bootstrap handler instead of partial cleanup.
+finishStartupLogging()
 boot().catch(e => {
-  log(`boot fatal: ${e}`)
+  logError('daemon.boot.failed', e)
   void requestShutdown('boot fatal', 1)
 })

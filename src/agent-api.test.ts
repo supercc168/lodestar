@@ -3,7 +3,7 @@ import { createServer, request, type Server } from 'node:http'
 import { Readable } from 'node:stream'
 import { handleAgentRequest } from './agent-api'
 import { buildAgentIdentityCatalog } from './agent-identities'
-import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type TokenSource, type UsageSnapshotUnified } from './token-source'
+import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type TokenSource } from './token-source'
 
 let server: Server | null = null
 afterEach(() => { server?.close(); server = null })
@@ -211,39 +211,53 @@ describe('delegated Agent HTTP API', () => {
     expect(requests).toHaveLength(1)
   })
 
-  test('identity listing serves the synchronous catalog without querying subscription usage', async () => {
-    // 定型实现:GET /agents/identities 走同步目录(getAgentIdentityCatalog),不再做订阅额度校验;
-    // 订阅可用性语义由 getAgentSkillIdentityCatalog 承担(见 src/agent-identities.test.ts)。
+  test.each(['session', 'project'] as const)('%s discovery excludes subscriptions and preserves third-party Claude models without usage queries', async kind => {
     const previousSources = listTokenSources()
     let checks = 0
-    let usage: UsageSnapshotUnified = { state: 'network', windows: [], reason: 'Claude 原生额度接口未返回 rate_limits 数据' }
     const subscription: TokenSource = {
       id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', display: 'Claude Code 订阅', enabled: true,
       models: [{ model: 'sonnet', display: 'Sonnet', efforts: ['high'], defaultEffort: 'high' }],
       defaultModel: 'sonnet', modelCatalogState: { status: 'ready', updatedAt: 1 },
       refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
-      readUsage: async () => { checks++; return usage },
+      readUsage: async () => { checks++; throw new Error('discovery must not query usage') },
+    }
+    const mixed: TokenSource = { ...subscription,
+      id: 'packy', kind: 'packy', display: 'Packy', defaultModel: 'MiniMax-M3',
+      models: [
+        { model: 'claude-opus-5-5', display: 'Claude Opus', efforts: ['high'], defaultEffort: 'high' },
+        { model: 'MiniMax-M3', display: 'MiniMax M3', efforts: ['default'], defaultEffort: 'default' },
+      ],
     }
     resetTokenSourceRegistry()
     registerTokenSource(subscription)
+    registerTokenSource(mixed)
     try {
-      const before = buildAgentIdentityCatalog([subscription])
-      const base = await serve()
-      const headers = { authorization: 'Bearer secret' }
-      const response = await fetch(`${base}/agents/identities`, { headers })
+      const before = buildAgentIdentityCatalog([subscription, mixed])
+      const base = await serve(undefined, kind === 'project')
+      const headers = { authorization: `Bearer ${kind === 'project' ? 'project-secret' : 'secret'}` }
+      const path = `/agents/identities${kind === 'project' ? '?project=project' : ''}`
+      const response = await fetch(`${base}${path}`, { headers })
       expect(response.status).toBe(200)
       const catalog = await response.json() as any
-      expect(catalog.identities).toMatchObject([{
-        token_source_id: 'claude-sub', model: 'sonnet', default_effort: 'high', status: 'ready',
-      }])
+      expect(catalog.identities).toMatchObject([
+        { token_source_id: 'packy', model: 'claude-opus-5-5', provider: 'claude', status: 'ready' },
+        { token_source_id: 'packy', model: 'MiniMax-M3', provider: 'claude', status: 'ready' },
+      ])
+      expect(catalog.identities).toHaveLength(2)
       expect(catalog.source_failures).toEqual([])
-      expect(buildAgentIdentityCatalog([subscription])).toEqual(before)
-      expect(checks).toBe(0)
+      expect(buildAgentIdentityCatalog([subscription, mixed])).toEqual(before)
+      expect(subscription.enabled).toBe(true)
+      expect(subscription.models).toHaveLength(1)
+      expect(mixed.models).toHaveLength(2)
 
-      usage = { state: 'no_credentials', windows: [], reason: '订阅额度接口不可用' }
-      const again = await fetch(`${base}/agents/identities`, { headers })
-      expect(again.status).toBe(200)
-      expect(await again.json() as any).toEqual(catalog)
+      subscription.models.push({ model: 'future-model', display: 'Future', efforts: ['high'], defaultEffort: 'high' })
+      mixed.models.push({ model: 'opaque-model', display: 'Claude Fable', efforts: ['high'], defaultEffort: 'high' })
+      const refreshed = await fetch(`${base}${path}`, { headers })
+      expect(refreshed.status).toBe(200)
+      const refreshedCatalog = await refreshed.json() as any
+      expect(refreshedCatalog.identities.map((identity: any) => identity.model)).toEqual(['claude-opus-5-5', 'MiniMax-M3', 'opaque-model'])
+      expect(refreshedCatalog.identities.every((identity: any) => identity.token_source_id === 'packy')).toBe(true)
+      expect(refreshedCatalog.source_failures).toEqual([])
       expect(checks).toBe(0)
     } finally {
       resetTokenSourceRegistry()

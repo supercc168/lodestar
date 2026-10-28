@@ -1,10 +1,10 @@
 import { codexAccounts } from './codex-accounts'
 import { readAllCodexUsage } from './codex-account-usage'
 import { codexUsageToUnified } from './token-source-codex'
-import { listTokenSources, tokenSourceRegistryRevision, type UsageSnapshotUnified } from './token-source'
+import { listTokenSources, tokenSourceRegistryRevision, tokenSourceAccounts, tokenSourceAccountRevision, type UsageSnapshotUnified } from './token-source'
 import { sharedAccountId } from './token-source-accounts'
 import { codexUsageCacheRevision } from './usage'
-import { log } from './log'
+import { logError } from './log'
 
 export interface AccountUsage {
   id: string
@@ -16,7 +16,8 @@ let pending: { key: string; promise: Promise<AccountUsage[]> } | undefined
 
 function cacheKey(): string {
   return JSON.stringify([tokenSourceRegistryRevision(), codexUsageCacheRevision(),
-    listTokenSources().map(source => [source.id, source.enabled, source.spawnRevision, source.usageAccount]),
+    listTokenSources().map(source => [source.id, source.enabled, source.spawnRevision, source.usageAccount,
+      tokenSourceAccounts(source).map(account => [account.id, account.name, tokenSourceAccountRevision(source, account.id)])]),
     codexAccounts.list().map(account => [account.id, account.name, account.revision])])
 }
 
@@ -24,10 +25,11 @@ function cacheKey(): string {
 export function readAllAccountUsage(): Promise<AccountUsage[]> {
   const key = cacheKey()
   if (pending?.key === key) return pending.promise
-  const order = ['codex-sub', 'claude-sub', 'glm', 'dsh-glm', 'deepseek', 'deepseek-harness', 'openrouter', 'claude-native']
+  const order = ['codex-sub', 'claude-sub', 'glm', 'dsh-glm', 'deepseek', 'deepseek-harness', 'openrouter']
   const position = (id: string) => order.includes(id) ? order.indexOf(id) : order.length
   const sources = listTokenSources().filter(source => source.enabled
-    || source.kind === 'codex-subscription' && codexAccounts.list().some(account => account.id !== 'default'))
+    || source.kind === 'codex-subscription' && codexAccounts.list().some(account => account.id !== 'default')
+    || source.forAccount && tokenSourceAccounts(source).some(account => account.id !== 'default'))
     .sort((a, b) => position(a.id) - position(b.id))
   const seen = new Set<string>()
   const reads: Array<Promise<AccountUsage[]>> = []
@@ -38,6 +40,17 @@ export function readAllAccountUsage(): Promise<AccountUsage[]> {
       }))))
       continue
     }
+    if (source.aggregateAccountCatalog && source.forAccount) {
+      reads.push(Promise.all(tokenSourceAccounts(source).map(async account => {
+        const view = source.forAccount!(account.id)
+        let usage: UsageSnapshotUnified
+        try { usage = await view.readUsage() }
+        catch (error) { usage = { state: 'network', windows: [], reason: error instanceof Error ? error.message : String(error) } }
+        return { id: view.usageAccount?.id ?? `${source.id}:${account.id}`,
+          label: view.usageAccount?.label ?? `${source.display}·${account.name}`, usage }
+      })))
+      continue
+    }
     const id = source.usageAccount?.id ?? sharedAccountId(source.id)
     if (seen.has(id)) continue
     seen.add(id)
@@ -45,7 +58,7 @@ export function readAllAccountUsage(): Promise<AccountUsage[]> {
       : source.kind === 'claude-subscription' ? 'Claude 订阅' : source.display)
     reads.push(Promise.resolve().then(() => source.readUsage()).catch((error): UsageSnapshotUnified => {
       const reason = error instanceof Error ? error.message : String(error)
-      log(`account usage ${id} MISS: ${reason}`)
+      logError('account usage read failed', error)
       return { state: 'network', windows: [], reason }
     }).then(usage => [{ id, label, usage }]))
   }

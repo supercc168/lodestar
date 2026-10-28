@@ -1,11 +1,12 @@
 import type { Session } from './session'
 import type { AgentProvider } from './agent-process'
+import { getTokenSource } from './token-source'
 import { channelInstructions } from './instructions'
-import type { FileDeliveryMode } from './file-delivery-types'
+import { claudeTranslationModeEnabled } from './claude-translation-mode'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
-import { log } from './log'
+import { logError } from './log'
 import * as worktree from './worktree'
 import { messageOf, type WorktreeActionResult } from './session-util'
 
@@ -34,11 +35,10 @@ export function worktreeSessionDir(s: Session): string {
   return worktree.expectedWorktreePath(projectDir, projectName, slug)
 }
 
-/** 各后端的渠道指令由 instructions.channelInstructions(provider, mode) 统一生成
- *  (上游,含 dsh 问询工具的 provider 分支);本地旧三常量形态由 channelInstructions
- *  覆盖,agent-launch 断言只依赖返回值。 */
-export function spawnDeveloperInstructions(s: Session, mode: FileDeliveryMode, provider: AgentProvider = s.currentProvider()): string {
-  const base = channelInstructions(provider, mode)
+export function spawnDeveloperInstructions(s: Session, provider: AgentProvider = s.currentProvider()): string {
+  const model = s.selectedModel ?? (s.selectedTokenSourceId ? getTokenSource(s.selectedTokenSourceId)?.defaultModel : undefined)
+  const translate = provider === 'claude' && claudeTranslationModeEnabled(s.selectedTokenSourceId, model)
+  const base = channelInstructions(translate ? 'en' : 'zh')
   const extra = worktreeExtraInstruction(s)
   return extra ? `${base}\n${extra}` : base
 }
@@ -213,7 +213,7 @@ async function worktreeActionResult(
     return { ok, message, card: await buildWorktreeListCard(s, { type, content: message }) }
   } catch (e) {
     const listError = `列表刷新失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": wt action panel refresh failed: ${messageOf(e)}`)
+    logError('session-worktree: wt action panel refresh failed', e)
     return {
       ok: false,
       message: `${message}\n${listError}`,

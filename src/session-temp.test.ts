@@ -63,8 +63,8 @@ interface TempHarness {
 function makeHarness(sessionName = 'project', provider: 'claude' | 'codex' = 'codex'): TempHarness {
   const state: TempHarnessState = {
     routing: provider === 'codex'
-      ? { provider: 'codex', model: 'gpt-5.6-sol', effort: 'high' }
-      : { provider: 'claude', model: 'claude-opus-4-6', effort: 'max' as any },
+      ? { provider: 'codex', tokenSourceId: null, model: 'gpt-5.6-sol', effort: 'high' }
+      : { provider: 'claude', tokenSourceId: null, model: 'claude-opus-4-6', effort: 'max' as any },
     rollbackResult: true,
     preservedRecovery: false,
     leaseStolen: false,
@@ -98,6 +98,7 @@ function makeHarness(sessionName = 'project', provider: 'claude' | 'codex' = 'co
     ownsLifecycle: (lease: object | null | undefined) =>
       !!lease && lease === currentLease && !state.leaseStolen,
     listCodexConversations: async () => state.history.slice(),
+    claudeHistoryOptions: () => ({ configDir: process.env.CLAUDE_CONFIG_DIR }),
     rollbackTo: async (launch: ConversationLaunch, branchState?: { anchors: TurnAnchor[]; base: any }) => {
       rollbackCalls.push(launch)
       rollbackStates.push(branchState)
@@ -808,6 +809,24 @@ describe('session-temp panel claim 五重拒绝', () => {
 })
 
 // ── TTL / consumed 状态(假时钟驱动) ─────────────────────────────────
+
+describe('session-temp account routing snapshots', () => {
+  for (const field of ['claudeAccountId', 'codexAccountId', 'tokenSourceId'] as const) {
+    test(`changing ${field} invalidates an existing picker without consuming it`, async () => {
+      const h = makeHarness('account-routing', 'claude')
+      seedAnchors(h, 'claude', ['account-bound-input'])
+      await showForkList(h.session, 'ou_owner')
+      const value = pickerValue(sentCards[0], 'account-bound-input')
+      const original = h.state.routing
+      h.state.routing = { ...original, [field]: 'different-account-or-source' }
+      const rejected = await onForkSelect(h.session, value.panelId, value.choiceId, 'ou_owner')
+      expect(rejected).toMatchObject({ ok: false, replaceCard: false })
+      expect(h.createCalls).toHaveLength(0)
+      h.state.routing = original
+      expect((await onForkSelect(h.session, value.panelId, value.choiceId, 'ou_owner')).ok).toBe(true)
+    })
+  }
+})
 
 describe('session-temp panel TTL 与 consumed 状态', () => {
   test('open panel 超 30min TTL 过期,claim 拒绝', async () => {

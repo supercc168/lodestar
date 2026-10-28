@@ -3,7 +3,7 @@
 import type { AgentProvider, AgentReasoningEffort, AgentUsageSource } from './agent-process'
 import type { ConversationBranchBase, ConversationLaunch, ConversationRouting } from './conversation'
 import type { TurnAnchor } from './feishu'
-import type { FileDeliveryHandle, FileDeliveryMode } from './file-delivery-types'
+import type { FileDeliveryHandle } from './file-delivery-types'
 
 /**
  *   'user_message'   — 用户消息批次
@@ -50,6 +50,9 @@ export interface TurnState {
     i: number
     name: string
     input: any
+    /** Presentation-only copies; native inputs/results remain untouched. */
+    displayInput?: any
+    displayOutput?: string
     resolvedNote?: string
     output?: string
     isError?: boolean
@@ -107,7 +110,7 @@ export interface TurnState {
    * batch at a new i. */
   toolBatches: Map<number, {
     kind: 'read' | 'edit'
-    items: Array<{ toolUseId: string; input: any; output: string | null; isError: boolean }>
+    items: Array<{ toolUseId: string; input: any; displayInput?: any; output: string | null; displayOutput?: string; isError: boolean }>
   }>
   openBatchI: number | null
   /** Task 工具按类型分两个合并槽(连续同类调用复用同一面板,切类则前一类定稿):
@@ -237,9 +240,6 @@ export interface TurnState {
   /** Cloud uploads survive conversation-card rotations and settle before the turn closes.
    * (上游) */
   fileDelivery?: FileDeliveryHandle
-  /** Freeze the transport when its input reaches the Agent, before it prepares files.
-   * (上游) */
-  fileDeliveryMode?: FileDeliveryMode
 }
 
 export type Status = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'

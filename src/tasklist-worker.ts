@@ -5,7 +5,7 @@ import { StringDecoder } from 'node:string_decoder'
 import { buildAgySpawnPath, resolveAgyBin, agyPrintArgs } from './agy-task'
 import { resolveCodexBin } from './codex-process'
 import * as feishu from './feishu'
-import { log } from './log'
+import { log, logError } from './log'
 import * as tasklist from './tasklist'
 import { withProjectWorktreeLock } from './worktree'
 import {
@@ -98,10 +98,10 @@ export function startTasklistWorker(opts: TasklistWorkerStartOptions = {}): void
   bootTimer = setTimeout(() => {
     bootTimer = null
     startupPromise = initializeTasklistWorker(opts.reconcileDeletions ?? tasklist.reconcileTasklistDeletions)
-      .catch(e => log(`tasklist-worker: startup failed: ${messageOf(e)}`))
+      .catch(e => logError("tasklist-worker: startup failed", e))
       .finally(() => { startupPromise = null })
   }, opts.bootDelayMs ?? TASKLIST_WORKER_BOOT_DELAY_MS)
-  log(`tasklist-worker: scheduled every ${TASKLIST_WORKER_INTERVAL_MS / 1000}s`)
+  log('tasklist-worker: scheduled')
 }
 
 async function initializeTasklistWorker(reconcileDeletions: () => Promise<void>): Promise<void> {
@@ -110,7 +110,7 @@ async function initializeTasklistWorker(reconcileDeletions: () => Promise<void>)
   } catch (e) {
     // Tombstones remain durable and are excluded from normal scans. Surface
     // the failure, but one broken remote deletion must not starve other projects.
-    log(`tasklist-worker: deletion reconcile failed: ${messageOf(e)}`)
+    logError("tasklist-worker: deletion reconcile failed", e)
   }
   if (stopping) return
   await runTasklistWorkerOnce()
@@ -132,7 +132,7 @@ export async function runTasklistWorkerOnce(): Promise<void> {
       if (activeProjectScans.has(projectName)) continue
       if (activeProjectScans.size >= MAX_ACTIVE_PROJECT_SCANS) break
       const scan = processTasklist(projectName)
-        .catch(e => log(`tasklist-worker: ${projectName} scan crashed: ${messageOf(e)}`))
+        .catch(e => logError("tasklist-worker: scan crashed", e))
         .finally(() => { activeProjectScans.delete(projectName) })
       activeProjectScans.set(projectName, scan)
       nextProjectScanIndex = (index + 1) % bindings.length
@@ -141,7 +141,7 @@ export async function runTasklistWorkerOnce(): Promise<void> {
     // 「全部扫描收尾后才 settle」的时序,扫描进行中不误沉降活动卡)。
     if (activeProjectScans.size === 0) tasklistCards.settleIdleProjects()
   } catch (e) {
-    log(`tasklist-worker: scan failed: ${messageOf(e)}`)
+    logError("tasklist-worker: scan failed", e)
   } finally {
     running = false
   }
@@ -204,7 +204,7 @@ async function processTasklist(projectName: string): Promise<void> {
     const cachedBinding = tasklist.getTasklistBinding(projectName)
     if (!cachedBinding) throw new Error(`tasklist is not enabled for ${projectName}`)
     if (cachedBinding.deleting) {
-      log(`tasklist-worker: skip ${projectName}; tasklist deletion is pending`)
+      log('tasklist-worker: skip pending tasklist deletion')
       return
     }
     let binding = cachedBinding
@@ -222,7 +222,7 @@ async function processTasklist(projectName: string): Promise<void> {
     await markStaleRunningProcesses(projectName, binding)
     binding = tasklist.getTasklistBinding(projectName) ?? binding
     if (hasRecoveredAutomationRunForProject(projectName)) {
-      log(`tasklist-worker: skip ${projectName}; recovered automation run is still alive`)
+      log('tasklist-worker: skip live recovered automation')
       return
     }
     const buckets = await scanTaskSections(binding)
@@ -234,7 +234,7 @@ async function processTasklist(projectName: string): Promise<void> {
     if (await processExecutingTask(projectName, projectDir, binding, buckets.aiDoing)) return
   } catch (e) {
     const msg = messageOf(e)
-    log(`tasklist-worker: ${projectName} failed: ${msg}`)
+    log("tasklist-worker: failed")
     safeUpdate(projectName, binding => {
       binding.worker ??= {}
       binding.worker.lastScanAt = new Date().toISOString()
@@ -335,13 +335,13 @@ async function markStaleRunningProcesses(projectName: string, binding: TasklistB
     }
     if (!tracked?.pgid || !unixProcessGroupExists(tracked.pgid)) activeAutomationRuns.delete(record.runId)
     const error = `recorded ${record.kind} process is no longer running (pid ${record.pid ?? 'unknown'})${cleanupError}`
-    log(`tasklist-worker: mark stale process failed project=${projectName} run=${record.runId}: ${error}`)
+    logError('tasklist-worker: mark stale process failed', error)
     markProcessFailed(projectName, record, error)
     if (record.taskGuid) {
       try {
         await commentAndStoreError(projectName, record.taskGuid, `自动化进程已丢失：${error}`)
       } catch (e) {
-        log(`tasklist-worker: stale process comment failed run=${record.runId}: ${messageOf(e)}`)
+        logError("tasklist-worker: stale process comment failed", e)
       }
     }
   }
@@ -354,7 +354,7 @@ function registerPersistedAutomationRuns(): void {
       .flatMap(binding => Object.values(binding.processes ?? {}))
       .filter(record => record.status === 'running').length
     if (running > 0) {
-      log(`tasklist-worker: ${running} recovered Windows run(s) cannot be adopted after restart without a Job Object; taskkill /T remains available only for leaders spawned by this daemon`)
+      log("tasklist-worker: recovered Windows run(s) cannot be adopted after restart without a Job Object; taskkill /T remains available only leaders spawned by this daemon")
     }
     return
   }
@@ -373,12 +373,12 @@ export function registerRecoveredAutomationRun(record: AutomationProcessRecord):
   if (activeAutomationRuns.has(record.runId)) return false
   if (!isRecordedProcessAlive(record)) return false
   if (!record.pid || !record.pgid || record.pgid <= 0) {
-    log(`tasklist-worker: cannot adopt recovered run=${record.runId}; missing pid/pgid`)
+    log('tasklist-worker: recovery missing process identity')
     return false
   }
   const actualPgid = processGroupIdForPid(record.pid)
   if (actualPgid !== record.pgid) {
-    log(`tasklist-worker: cannot adopt recovered run=${record.runId}; persisted pgid=${record.pgid} actual=${actualPgid ?? 'MISS'}`)
+    log('tasklist-worker: recovery process identity mismatch')
     return false
   }
   activeAutomationRuns.set(record.runId, {
@@ -390,7 +390,7 @@ export function registerRecoveredAutomationRun(record: AutomationProcessRecord):
     pgid: record.pgid,
     leaderFinished: true,
   })
-  log(`tasklist-worker: adopted recovered run=${record.runId} pid=${record.pid} pgid=${record.pgid}`)
+  log("tasklist-worker: adopted recovered")
   return true
 }
 
@@ -756,7 +756,7 @@ async function runAgyPick(
     timeoutMs: PLAN_TIMEOUT_MS,
   })
   if (result.status !== 'exited' || result.exitCode !== 0) {
-    log(`tasklist-worker: agy pick failed for ${projectName}: ${processFailureText(result)}`)
+    log("tasklist-worker: agy pick failed")
     return null
   }
   const selected = parseSelectedTaskGuid(result.stdoutTail ?? '', tasks.map(t => t.guid))
@@ -855,7 +855,7 @@ async function runCodexExecution(
       ].join('\n')))
     } catch (e) {
       const msg = `Codex 执行评论写入失败：${messageOf(e)}`
-      log(`tasklist-worker: ${msg}`)
+      log('tasklist-worker: synchronized')
       safeUpdate(projectName, b => {
         const state = tasklist.taskStateFor(b, taskGuid)
         state.lastError = msg
@@ -995,7 +995,7 @@ async function runAgentProcess(opts: {
   const treeCleanupWarning = automationTreeSupportWarning()
   if (treeCleanupWarning) {
     record.treeCleanupWarning = treeCleanupWarning
-    log(`tasklist-worker: run=${runId}: ${treeCleanupWarning}`)
+    log('tasklist-worker: synchronized')
   }
   const proc = spawn(opts.command[0], opts.command.slice(1), {
     cwd: opts.cwd,
@@ -1024,7 +1024,7 @@ async function runAgentProcess(opts: {
   if (opts.taskGuid && opts.refKey) {
     markRunOnTask(opts.projectName, opts.taskGuid, opts.refKey, runId, opts.fingerprint, 'running')
   }
-  log(`tasklist-worker: spawned ${opts.kind} run=${runId} pid=${record.pid ?? 'unknown'} cwd=${opts.cwd}`)
+  log("tasklist-worker: spawned")
 
   const stdoutDecoder = new StringDecoder('utf8')
   const stderrDecoder = new StringDecoder('utf8')
@@ -1114,10 +1114,10 @@ function signalAutomationRun(run: AutomationRunHandle, signal: NodeJS.Signals): 
     } else if (proc) {
       proc.kill(signal)
     } else {
-      log(`tasklist-worker: cannot send ${signal} to recovered run=${run.runId}; no verified pgid`)
+      log('tasklist-worker: recovery signal requires verified process group')
     }
   } catch (e: any) {
-    if (e?.code !== 'ESRCH') log(`tasklist-worker: ${signal} failed for run=${run.runId} pid=${run.pid ?? 'unknown'} pgid=${run.pgid ?? 'unknown'}: ${messageOf(e)}`)
+    if (e?.code !== 'ESRCH') logError("tasklist-worker: failed", e)
   }
 }
 
@@ -1236,7 +1236,7 @@ function safeUpdate(projectName: string, update: (binding: TasklistBinding) => v
   try {
     tasklist.updateTasklistBinding(projectName, update)
   } catch (e) {
-    log(`tasklist-worker: state update failed for ${projectName}: ${messageOf(e)}`)
+    logError("tasklist-worker: state update failed", e)
   }
 }
 

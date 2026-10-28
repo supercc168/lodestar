@@ -1,4 +1,4 @@
-import { afterEach, beforeEach, describe, expect, setSystemTime, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
@@ -26,6 +26,16 @@ import {
   setReplyState,
   type NotifyRegistration,
 } from './notify-callbacks'
+
+import * as network from './network'
+
+// These tests exercise callback payloads and outcomes; proxy selection is covered by network.test.ts.
+let restoreCallbackTransport: () => void = () => {}
+beforeEach(() => {
+  const transport = spyOn(network, 'localFetch').mockImplementation((url, init) => globalThis.fetch(url, init))
+  restoreCallbackTransport = () => transport.mockRestore()
+})
+afterEach(() => { restoreCallbackTransport() })
 
 let tempDir: string
 let tempFile: string

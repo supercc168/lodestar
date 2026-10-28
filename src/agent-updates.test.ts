@@ -652,7 +652,8 @@ test('daemon 接线 HEAD 语义:只挂定时器(默认关=零定时器),启动�
   // HEAD 语义:启动不调用主动更新(D-06 / T-02-18)。
   expect(source.includes('updateAgentRuntimes')).toBe(false)
   // 开关来自配置三开关对象,而不是硬编码 true。
-  expect(source).toContain('startAgentAutoUpdates(log, { enabled: config.runtime.agent_auto_update })')
+  expect(source).toContain('stopAgentAutoUpdates = startAgentAutoUpdates(message => {')
+  expect(source).toContain('}, { enabled: config.runtime.agent_auto_update })')
 })
 
 test('setup 模板与 postinstall 提示:自动更新默认关,--agents-only 为实际入口', async () => {

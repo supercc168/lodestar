@@ -1,7 +1,7 @@
 import type { Session } from './session'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
-import { log } from './log'
+import { log, logError } from './log'
 import { clearGsdAwaitingName, isGsdBareword, runGsdTextCommand } from './session-gsd'
 import { diagnosticIdLabel, messageOf } from './session-util'
 
@@ -42,17 +42,17 @@ const sourceCommandWork = new Set<Promise<void>>()
 function backgroundSourceCommand(s: Session, work: Promise<void>): void {
   const tracked = work.catch(async error => {
     const message = `账号操作或结果呈现失败：${messageOf(error)}`
-    log(message)
+    logError('session-commands: account operation failed', error)
     await feishu.sendTextRaw(s.chatId, `❌ ${message}`)
     throw error
   })
   sourceCommandWork.add(tracked)
-  void tracked.finally(() => sourceCommandWork.delete(tracked)).catch(error => log(`账号操作结果发送失败：${messageOf(error)}`))
+  void tracked.finally(() => sourceCommandWork.delete(tracked)).catch(error => logError('session-commands: account operation result delivery failed', error))
 }
 
 export function pendingSourceCommands(): Promise<void>[] { return [...sourceCommandWork] }
 
-/** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`, `files`)
+/** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
  * plus their two-letter aliases where applicable.
  * Returns true if the command was consumed (don't forward to Codex).
  * Exact match, case-insensitive, ignores trailing whitespace.
@@ -75,6 +75,11 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
 
   const namedHi = raw.trim().match(/^hi[ \t]+([^\r\n]+)$/i)
   if (namedHi) {
+    if (s.currentProvider() === 'claude') {
+      const { runClaudeNamedHi } = await import('./session-claude-accounts')
+      backgroundSourceCommand(s, runClaudeNamedHi(s, namedHi[1].trim()))
+      return true
+    }
     const { runCodexNamedHi } = await import('./session-codex-accounts')
     await runCodexNamedHi(s, namedHi[1].trim())
     return true
@@ -144,11 +149,6 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
   }
   if (raw.trim().toLowerCase() === 'task') {
     await s.showTasklistPanel()
-    return true
-  }
-  const files = raw.trim().match(/^files(?:[ \t]+([^\r\n]+))?$/i)
-  if (files) {
-    await s.runFileDeliveryCommand((files[1] ?? '').trim(), userOpenId)
     return true
   }
   if (isGsdBareword(raw)) {
@@ -288,7 +288,6 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
         if (!s.ownsLifecycle(lease)) return true
         return true
       }
-      log(`session "${s.sessionName}": stop command — interrupt + drop count=${s.pendingUserMessageCount} midBuffer=${s.pendingMidTurnMsgs.length}`)
       // Cancelled queued msgs: remove the OneSecond (no longer waiting)
       // and stamp a CrossMark (explicit cancelled state, distinct from
       // a natural release where reactions just disappear). Cancelled
@@ -318,7 +317,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
         s.currentBatchReactionIds = new Map()
       }
       const interrupt = s.beginTurnInterrupt('user')
-      if (!interrupt) log(`session "${s.sessionName}": stop command found no live process`)
+      if (!interrupt) log('session-commands.stop_no_live_process')
       // 主动封口,把 footer 改成 🛑 打断、停止 footer 状态计时、把 streaming_mode
       // 翻回 false,否则卡片会僵在运行中状态。SDK 的 post-interrupt
       // result 也会进 closeTurnCard,但 currentTurn 已被这里置空,那条
@@ -356,7 +355,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
         try {
           await s.closeStatusCard(statusCard, finalStatus)
         } catch (e) {
-          log(`session "${s.sessionName}": kill status card close failed: ${messageOf(e)}`)
+          logError('session-commands.kill_card_close_failed', e)
           await feishu.sendTextRaw(s.chatId, `${finalStatus}\n⚠️ kill 状态卡片终态写入失败: ${messageOf(e)}`)
         }
         // openStatusCard already provides the visible failure when present. If

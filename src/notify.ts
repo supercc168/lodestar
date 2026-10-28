@@ -53,7 +53,7 @@
 
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
-import { log } from './log'
+import { log, logError } from './log'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
 import { FeishuRequestError } from './feishu-retry'
@@ -427,7 +427,7 @@ export function startNotifyServer(opts: NotifyOptions): Server | undefined {
   try {
     const server = createServer((req, res) => {
       dispatchNotifyRequest(opts, req, res).catch((err: any) => {
-        log(`notify: handler crash: ${err?.message ?? err}`)
+        logError('notify.handler.failed', err)
         if (!res.headersSent) {
           res.statusCode = 500
           res.setHeader('content-type', 'text/plain; charset=utf-8')
@@ -438,14 +438,14 @@ export function startNotifyServer(opts: NotifyOptions): Server | undefined {
       })
     })
     server.on('error', (err: Error) => {
-      log(`notify: server bind failed (${opts.bind}:${opts.port}): ${err.message}`)
+      logError('notify.server.bind_failed', err)
     })
     server.listen(opts.port, opts.bind, () => {
-      log(`notify: HTTP listening at http://${opts.bind}:${opts.port}/notify`)
+      log('notify.server.ready')
     })
     return server
   } catch (e) {
-    log(`notify: server bind failed (${opts.bind}:${opts.port}): ${e}`)
+    logError('notify.server.bind_failed', e)
   }
 }
 
@@ -470,7 +470,7 @@ export async function handleNotifyRequest(
   if (req.method === 'GET' && url.pathname === '/') {
     return sendText(200,
       'lodestar notify\n' +
-      'POST /notify        body={project,text,title?,level?,images?,buttons?,allow_reply?,callback?}  → push card to group\n' +
+      'POST /notify        body={project,text,title?,level?,images?,buttons?,allow_reply?,callback?}  → push card to the project\'s bound conversation ID (chat_id)\n' +
       'GET  /notify/result/<notify_id>  → poll a button choice or text reply (pull mode, no callback server)\n' +
       'GET  /agents/identities; POST/GET/DELETE /agents/runs[/<id>]  → capability-protected delegated Agents\n' +
       'levels: info|warn|error (default info); images=[/abs/*.png] uploaded + embedded\n' +
@@ -528,7 +528,6 @@ export async function handleNotifyRequest(
   // Pure open_url buttons (url set) need neither registration nor notify_id.
   const hasButtons = !!(buttons && buttons.length)
   if (hasButtons && allowReply) return sendText(400, MIXED_INTERACTION_ERROR)
-  const interactive = hasButtons || allowReply
   const hasCallbackButtons = !!(buttons && buttons.some((b) => !b.url))
   // 本地:纯 open_url 卡没有回调面,不申请 notify_id、不落注册(上游此处
   // 无 open_url 概念);文本回复卡必须注册,否则回复态无处落盘。
@@ -541,9 +540,9 @@ export async function handleNotifyRequest(
   const sessionName = transport.sanitizeSessionName(project)
   const chatId = transport.chatIdForSession(sessionName)
   if (!chatId) {
-    log(`notify: project "${project}" (sanitized "${sessionName}") has no chat binding → 404`)
+    log('notify.binding_missing')
     return sendText(404,
-      `project "${project}" not bound — send any message in that Feishu group at least once after the daemon started, then retry`)
+      `project "${project}" has no conversation ID (chat_id) binding — send a message in the intended Feishu conversation, then retry`)
   }
 
   const imageInputs = Array.isArray(body.images) ? body.images : []
@@ -563,7 +562,7 @@ export async function handleNotifyRequest(
   let sendFailure: unknown
   const messageId = await transport.sendCard(chatId, card, error => { sendFailure = error })
   if (!messageId) {
-    log(`notify: sendCard failed → 502 (project="${project}" chat=${chatId.slice(0, 8)}…)`)
+    logError('notify.card.send_failed', sendFailure)
     return sendText(502, `feishu sendCard failed: ${formatFeishuError(sendFailure)}`)
   }
 
@@ -586,8 +585,6 @@ export async function handleNotifyRequest(
     registerCallback(reg)
   }
 
-  const openUrlCount = buttons?.filter((b) => b.url).length ?? 0
-  log(`notify: → ${project} (${chatId.slice(0, 8)}…) level=${level} bytes=${text.length} images=${images.length} buttons=${buttons?.length ?? 0} open_url=${openUrlCount} allowReply=${allowReply} interactive=${interactive} push=${notifiable && !!callbackUrlOrDefault ? 1 : 0} msg=${messageId}`)
   sendJson(200, {
     ok: true,
     chat_id: chatId,

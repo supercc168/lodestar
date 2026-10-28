@@ -24,7 +24,7 @@ import {
 } from './token-source'
 import { CLAUDE_EFFORTS } from './token-source-models'
 import { verifyModelExists } from './model-existence'
-import { log } from './log'
+import { logError } from './log'
 import { fetchApiModelData } from './token-source-model-api'
 
 type Env = Record<string, string | undefined>
@@ -132,7 +132,7 @@ registerTokenSourceFactory({
       },
     }
     function catalogFailed(e: unknown): void {
-      log(`grok-wuhen refreshModels MISS: ${e instanceof Error ? e.message : String(e)}`)
+      logError('grok-wuhen refreshModels MISS', e)
       ts.models = []
       ts.modelCatalogState = { status: 'failed', updatedAt: Date.now(), error: e instanceof Error ? e.message : String(e) }
     }

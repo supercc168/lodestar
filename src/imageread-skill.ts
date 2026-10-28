@@ -36,7 +36,7 @@ import {
 import { homedir } from 'node:os'
 import { dirname, join } from 'node:path'
 import { fileURLToPath } from 'node:url'
-import { log } from './log'
+import { log, logError } from './log'
 import { DATA_DIR } from './paths'
 
 const SKILL_NAME = 'imageread'
@@ -151,7 +151,7 @@ function syncTreeFromAssets(assetRoot: string, destRoot: string): number {
   for (const rel of VENDORED_RELATIVE_FILES) {
     const src = join(assetRoot, rel)
     if (!existsSync(src)) {
-      log(`imageread-skill: missing vendored file ${src}`)
+      log("imageread-skill: missing vendored file")
       continue
     }
     const dest = join(destRoot, rel)
@@ -159,7 +159,7 @@ function syncTreeFromAssets(assetRoot: string, destRoot: string): number {
     const r = copyFileIfChanged(src, dest, mode)
     if (r !== 'skipped') {
       changes++
-      log(`imageread-skill: ${r} ${dest}`)
+      log('imageread-skill: synchronized')
     }
   }
   return changes
@@ -168,20 +168,20 @@ function syncTreeFromAssets(assetRoot: string, destRoot: string): number {
 function writeSkillMd(assetRoot: string, destRoot: string, binPath: string): void {
   const src = join(assetRoot, 'SKILL.md')
   if (!existsSync(src)) {
-    log(`imageread-skill: missing ${src}; skip SKILL.md`)
+    log('imageread-skill: skill source missing')
     return
   }
   const body = applyImagereadSkillBody(readFileSync(src, 'utf8'), binPath)
   const dest = join(destRoot, 'SKILL.md')
   const r = writeFileIfChanged(dest, body)
-  if (r !== 'skipped') log(`imageread-skill: ${r} ${dest}`)
+  if (r !== 'skipped') log('imageread-skill: synchronized')
 }
 
 function installBin(assetRoot: string): string {
   const src = join(assetRoot, 'scripts', 'imageread.sh')
   const binPath = imagereadBinPath()
   const r = copyFileIfChanged(src, binPath, 0o755)
-  if (r !== 'skipped') log(`imageread-skill: ${r} bin ${binPath}`)
+  if (r !== 'skipped') log('imageread-skill: executable synchronized')
   return binPath
 }
 
@@ -210,14 +210,14 @@ export function ensureImagereadSkill(): void {
       syncTreeFromAssets(assetRoot, destRoot)
       writeSkillMd(assetRoot, destRoot, binPath)
     } catch (e) {
-      log(`imageread-skill: sync failed (${destRoot}): ${e}`)
+      logError("imageread-skill: sync failed", e)
     }
   }
 
   try {
     installBin(assetRoot)
   } catch (e) {
-    log(`imageread-skill: bin install failed: ${e}`)
+    logError("imageread-skill: bin install failed", e)
   }
 
   log('imageread-skill: ready (shells out to user codex CLI; no credentials managed)')

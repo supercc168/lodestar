@@ -11,6 +11,7 @@ export class DaemonSessionRecovery {
   private pending: Set<string> | null = null
   private shutdownSnapshot: string[] | null = null
   private revival: Promise<void> | null = null
+  private restartContinuationAttempted = false
 
   constructor(private readonly deps: {
     readMarker(): string[]
@@ -21,6 +22,12 @@ export class DaemonSessionRecovery {
     actor: PerKeyActor
     isShuttingDown(): boolean
     log(message: string): void
+    logError(event: string, error: unknown): void
+    /** Explicit local opt-in for one chat; never replays the previous input. */
+    restartContinuation?: {
+      chatId: string
+      send(session: RecoverableSession): Promise<void>
+    }
   }) {}
 
   /** Must run before the first boot await, including model catalog loading. */
@@ -68,13 +75,12 @@ export class DaemonSessionRecovery {
     if (this.revival) return this.revival
     if (this.deps.isShuttingDown()) return Promise.resolve()
     const names = [...this.pending]
-    this.deps.log(`revive: ${names.length} session(s) marked alive on shutdown: ${names.join(', ')}`)
     this.revival = Promise.all(names.map(name => {
       const chatId = this.deps.chatIdForSession(name)
       if (!chatId) {
         // Keep the unresolved intent for the next boot; do not silently lose
         // a saved conversation because its chat binding is unavailable.
-        this.deps.log(`revive: no chatId binding for "${name}"; recovery remains pending`)
+        this.deps.log('session.recovery.binding_missing')
         return Promise.resolve()
       }
       return this.deps.actor.enqueue(chatId, async () => {
@@ -83,9 +89,22 @@ export class DaemonSessionRecovery {
         try {
           session = this.deps.sessionFor(chatId, name)
           const ok = await session.restoreAfterDaemonRestart()
-          this.deps.log(`revive: "${name}" ${ok ? 'restored' : 'did not start'}`)
+          if (!ok) this.deps.log('session.recovery.did_not_start')
+          const continuation = this.deps.restartContinuation
+          if (ok && !this.deps.isShuttingDown() && !this.restartContinuationAttempted
+            && continuation?.chatId === chatId) {
+            // Claim before the write: uncertain submission must not be replayed,
+            // even if multiple saved names resolve to the same configured chat.
+            this.restartContinuationAttempted = true
+            try {
+              await continuation.send(session)
+              this.deps.log('session.recovery.continuation_submitted')
+            } catch (error) {
+              this.deps.logError('session.recovery.continuation_failed', error)
+            }
+          }
         } catch (error) {
-          this.deps.log(`revive: restore "${name}" failed: ${error}`)
+          this.deps.logError('session.recovery.failed', error)
         } finally {
           // Once constructed, Session owns failed recovery intent as well as
           // a running process. Construction failure leaves our intent intact.
@@ -93,7 +112,7 @@ export class DaemonSessionRecovery {
           this.persist()
         }
       })
-    })).then(() => {})
+    })).then(() => { if (names.length) this.deps.log('session.recovery.finished') })
     return this.revival
   }
 }

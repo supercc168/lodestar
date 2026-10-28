@@ -17,7 +17,7 @@ import { networkFetch } from './network'
 import { createHash, randomUUID } from 'node:crypto'
 import { getTenantToken } from './feishu'
 import { FeishuRequestError, FeishuRecoveryWindow, isTransientFeishuError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
-import { log } from './log'
+import { log, logError, logDiagnostic } from './log'
 import { ELEMENTS, neutralizeMarkdownImagesInCard } from './cards/elements'
 
 const BASE = 'https://open.feishu.cn/open-apis/cardkit/v1'
@@ -471,7 +471,7 @@ async function callStateMutation(cardId: string, method: 'PUT' | 'PATCH', path: 
       await call(method, path, { ...body, sequence: nextSeq(cardId) }, recovery, error => {
         if (isAmbiguousMutationFailure(error)) uncertain = true
       })
-      if (confirming) log(`cardkit confirmed ${method} ${path}: same state accepted with new UUID and sequence`)
+      if (confirming) log('cardkit uncertain write confirmed')
       return
     } catch (error) {
       if (!uncertain || !isUuidConsumedFailure(error)) throw error
@@ -508,7 +508,7 @@ async function addElementMutation(cardId: string, s: CardState, element: object,
     await callStateMutation(cardId, 'PUT', `/cards/${cardId}/elements/${elementId}`, {
       element: JSON.stringify(element),
     }, recovery)
-    log(`cardkit reconciled uncertain add ${cardId} element=${elementId}: latest content accepted with PUT`)
+    log('cardkit uncertain insertion reconciled')
   }
   if (!elementId || !s.confirmedAdds.has(elementId)) s.elementCount++
   if (elementId) {
@@ -566,8 +566,8 @@ function isRecoveryExhausted(error: unknown): boolean {
  * (AbortError)、证书/配置错误与窗口耗尽失败一律不重试(上游
  * cardkit-retry 的永久错误清单)。 */
 async function withNetworkRetry(
-  cardId: string,
-  label: string,
+  _cardId: string,
+  _label: string,
   op: () => Promise<void>,
 ): Promise<void> {
   let lastErr: unknown = null
@@ -584,7 +584,7 @@ async function withNetworkRetry(
           || (e instanceof TypeError && /fetch failed/i.test(e.message)))
       if (!retriable || attempt === NETWORK_RETRY_DELAYS_MS.length) throw e
       const delay = NETWORK_RETRY_DELAYS_MS[attempt] ?? 0
-      log(`cardkit ${label} ${cardId}: network error, retry ${attempt + 1}/${NETWORK_RETRY_DELAYS_MS.length} in ${delay}ms: ${e}`)
+      logError('cardkit.network.retry', e)
       if (delay > 0) await sleep(delay)
     }
   }
@@ -660,13 +660,13 @@ async function withReopenOnStreamingClosed(
       if (!silent || (silent === 'non-capacity' && isCardCapacityFailure(failure.code, failure))) {
         cards.get(cardId)?.onFailure?.(failure.code, payload)
       }
-    } catch (callbackError) {
-      log(`cardkit failure callback ${cardId}: ${callbackError}`)
+    } catch (error) {
+      logError('cardkit failure callback failed', error)
     }
     try {
       onFailure?.(failure.code, payload)
-    } catch (callbackError) {
-      log(`cardkit per-call failure callback ${cardId}: ${callbackError}`)
+    } catch (error) {
+      logError('cardkit write failure callback failed', error)
     }
   }
   try {
@@ -674,23 +674,23 @@ async function withReopenOnStreamingClosed(
     return
   } catch (e) {
     if (!isStreamingClosed(e)) {
-      log(`cardkit ${label} ${cardId}: ${e}`)
+      logError('cardkit write failed', e)
       await fail(e)
       return
     }
-    log(`cardkit ${label} ${cardId}: streaming closed (code=${(e as any).code}) — reopening`)
+    log('cardkit streaming reopening')
   }
   try {
     await withNetworkRetry(cardId, `${label} reopenStreaming`, () => reopenStreaming(cardId, recovery))
   } catch (re) {
-    log(`cardkit STREAMING_REOPEN_FAILED ${cardId}: ${re}`)
+    logError('cardkit streaming reopen failed', re)
     await fail(re)
     return
   }
   try {
     await withNetworkRetry(cardId, `${label} retry-after-reopen`, () => op(recovery))
   } catch (e2) {
-    log(`cardkit ${label} ${cardId} retry-after-reopen: ${e2}`)
+    logError('cardkit write failed after reopen', e2)
     await fail(e2)
   }
 }
@@ -734,7 +734,7 @@ export async function convertMessageToCard(
         continue
       }
       const nextDelay = delays[i + 1] ?? 0
-      log(`cardkit id_convert ${messageId}: empty result, retry ${i + 2}/${delays.length} in ${nextDelay}ms`)
+      logDiagnostic('cardkit lookup retry', { attempt: i + 2, retryInMs: nextDelay })
     }
   }
   throw lastErr

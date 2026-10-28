@@ -284,7 +284,7 @@ describe('project worktrees', () => {
 })
 
 function initRepo(): { root: string; repo: string } {
-  const root = mkdtempSync(join(tmpdir(), 'lodestar-wt-'))
+  const root = realpathSync(mkdtempSync(join(tmpdir(), 'lodestar-wt-')))
   roots.push(root)
   const repo = join(root, 'feishu')
   mkdirSync(repo)

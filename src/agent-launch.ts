@@ -1,4 +1,7 @@
-import type { ProjectProfile } from './config'
+import { config, type ProjectProfile } from './config'
+import { createClaudeTranslation } from './claude-translation'
+import { ClaudeTranslationContext } from './claude-translation-context'
+import { claudeTranslationModeEnabled } from './claude-translation-mode'
 import type {
   AgentProcess,
   AgentProvider,
@@ -12,6 +15,8 @@ import type { ConversationLaunch } from './conversation'
 import { getTokenSourceForAccount, tokenSourceProcessRevision, tokenSourceRuntimeModel } from './token-source'
 import { bindProcessCodexAccount, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
 import { CodexAccountProcess } from './codex-account-process'
+import { bindProcessClaudeAccount, claudeAccounts, DEFAULT_CLAUDE_ACCOUNT } from './claude-accounts'
+import { selectClaudeAccount } from './claude-account-selection'
 
 export interface AgentLaunchOptions {
   provider: AgentProvider
@@ -22,6 +27,11 @@ export interface AgentLaunchOptions {
   codexAccountPreference?: string | null
   /** Internal raw launch: user explicitly chose this account; let native Codex validate it. */
   codexManualAccount?: boolean
+  claudeAccountId?: string
+  /** null = automatic at startup; an account id = this launch only. No mid-turn rotation. */
+  claudeAccountPreference?: string | null
+  /** Existing active chats, excluding the Session whose prospective launch is being ranked. */
+  claudeActiveSessions?: ReadonlyMap<string, number>
   model?: string
   effort?: AgentReasoningEffort
   launch?: ConversationLaunch
@@ -61,10 +71,23 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
     })
     return { process, sourceRevision: null }
   }
-  const accountId = opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT
+  const claudeSubscription = opts.provider === 'claude' && opts.tokenSourceId === 'claude-sub'
+  if (claudeSubscription && config.token_sources?.['claude-sub']?.enabled === false) {
+    throw new Error('Claude 订阅已禁用；发送 claude-sub on 启用')
+  }
+  const managedClaudeAccount = claudeSubscription
+    && (opts.claudeAccountPreference !== undefined || opts.claudeAccountId !== undefined)
+  const accountId = claudeSubscription
+    ? opts.claudeAccountPreference !== undefined
+      ? selectClaudeAccount({ model: opts.model ?? '', effort: opts.effort, preferred: opts.claudeAccountPreference,
+        activeSessions: opts.claudeActiveSessions })
+      : opts.claudeAccountId ?? DEFAULT_CLAUDE_ACCOUNT
+    : opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT
   const source = getTokenSourceForAccount(opts.tokenSourceId, accountId)
   const manual = opts.provider === 'codex' && opts.tokenSourceId === 'codex-sub' && opts.codexManualAccount === true
+    || claudeSubscription && typeof opts.claudeAccountPreference === 'string'
   if (opts.tokenSourceId && !source) throw new Error(`token source not found: ${opts.tokenSourceId}`)
+  if (opts.provider === 'claude' && !source) throw new Error('Claude 账号来源未选择，请通过 md 选择 Claude Code 订阅或已配置的第三方账号')
   if (source && !source.enabled && !manual) throw new Error(`token source disabled: ${source.id}`)
   if (source && source.agent !== opts.provider) {
     throw new Error(`token source ${source.id} belongs to ${source.agent}, not ${opts.provider}`)
@@ -111,8 +134,21 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
   if (opts.provider === 'claude') {
     assertClaudeCodeAvailable()
     if (!isClaudeReasoningEffort(opts.effort)) throw new Error(`invalid Claude effort: ${opts.effort ?? 'MISS'}`)
-    return {
-      process: new ClaudeAgentProcess({
+    const translationEnabled = claudeTranslationModeEnabled(source?.id, requestedModel)
+    const translationContext = translationEnabled ? new ClaudeTranslationContext({
+      workDir: opts.workDir,
+      ...(opts.launch && opts.launch.kind !== 'fresh' ? {
+        resumeSessionId: opts.launch.source.sessionId,
+        ...(opts.launch.kind === 'fork' ? { forkSession: true } : {}),
+        ...(opts.launch.kind === 'fork' && opts.launch.through?.provider === 'claude'
+          ? { resumeSessionAt: opts.launch.through.id } : {}),
+      } : {}),
+    }) : undefined
+    if (managedClaudeAccount) claudeAccounts.prepareShared(accountId)
+    const releaseAccount = managedClaudeAccount ? claudeAccounts.acquireUse(accountId) : undefined
+    let process: ClaudeAgentProcess
+    try {
+      process = new ClaudeAgentProcess({
         workDir: opts.workDir,
         model,
         effort: opts.effort,
@@ -135,11 +171,21 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
         ...(source?.validateClaudeAccount ? { validateAccount: source.validateClaudeAccount } : {}),
         ...(opts.managedSkillPluginPath ? { managedSkillPluginPath: opts.managedSkillPluginPath } : {}),
         tokenSourceId: source?.id ?? null,
+        ...(translationContext ? {
+          translationContext,
+          translation: createClaudeTranslation({ validationRules: config.claude.translation_validation_rules,
+            context: () => translationContext.snapshot() }),
+        } : {}),
         transformEnv,
         hostEnv: opts.hostEnv,
-      }),
-      sourceRevision,
+      })
+    } catch (error) {
+      releaseAccount?.()
+      throw error
     }
+    if (claudeSubscription) bindProcessClaudeAccount(process, accountId)
+    if (releaseAccount) process.once('exit', releaseAccount)
+    return { process, sourceRevision }
   }
 
   if (opts.effort !== undefined && !isCodexReasoningEffort(opts.effort)) throw new Error(`invalid Codex effort: ${opts.effort}`)

@@ -22,6 +22,7 @@ import { resetAgentSessionRegistryForTest } from './agent-session-registry'
 // fork-only helpers under test:
 import { buildCodexAppServerArgs, buildCodexSpawnEnv, buildSpawnPath, codexLoginStatusAuthenticated } from './codex-process'
 import { validateConversationLaunch } from './conversation'
+import * as logModule from './log'
 
 function makeCodexLifecycleHarness(stdinOverrides: Record<string, unknown> = {}): any {
   const proc = Object.create(CodexProcess.prototype) as any
@@ -29,7 +30,6 @@ function makeCodexLifecycleHarness(stdinOverrides: Record<string, unknown> = {})
   proc.expectedExit = false
   proc.exitEventEmitted = false
   proc.stdoutBuf = ''
-  proc.stderrBuf = ''
   proc.childExitCode = null
   proc.childExitSignal = null
   proc.requestCounter = 0
@@ -567,6 +567,8 @@ describe('codex model capacity recovery', () => {
 })
 
 describe('codex transient failure recovery', () => {
+  const retryDelays = [5000, 10000, 20000, 40000, 60000, 60000, 60000, 60000, 60000, 60000]
+
   test.each([
     ...[
       { message: STREAM_MESSAGE, codexErrorInfo: 'other' },
@@ -641,13 +643,14 @@ describe('codex transient failure recovery', () => {
     })
   })
 
-  test.each([{ message: STREAM_MESSAGE, codexErrorInfo: 'other' }, COMPACT_ERROR, REQUEST_TIMEOUT_ERROR, OVERLOADED_ERROR])('limits transient recovery to three attempts and preserves the final error (%j)', async error => {
+  test.each([{ message: STREAM_MESSAGE, codexErrorInfo: 'other' }, COMPACT_ERROR, REQUEST_TIMEOUT_ERROR, OVERLOADED_ERROR])('limits transient recovery to ten retries and preserves the final error (%j)', async error => {
     await withCapacityClock(async clock => {
-      const { proc, events } = capacityHarness()
+      const { proc, calls, events } = capacityHarness()
       proc.sendUserText('do work')
       await flushCapacityMicrotasks()
-      for (const delay of [5000, 10000, 20000]) {
+      for (const [index, delay] of retryDelays.entries()) {
         completeCapacityTurn(proc, error)
+        expect(proc.turnRetry.attempt).toBe(index + 1)
         expect([...clock.timers.values()].map(timer => timer.delay)).toEqual([delay])
         expect(events.filter(([name]) => name === 'result')).toHaveLength(0)
         await clock.tick()
@@ -655,6 +658,7 @@ describe('codex transient failure recovery', () => {
       completeCapacityTurn(proc, error)
       expect(clock.timers.size).toBe(0)
       expect(proc.turnRetry).toBeNull()
+      expect(calls.filter(call => call.method === 'turn/start')).toHaveLength(11)
       expect(events.filter(([name]) => name === 'result')).toEqual([
         ['result', expect.objectContaining({ is_error: true, error: error.message })],
       ])
@@ -670,13 +674,15 @@ describe('codex transient failure recovery', () => {
       const { proc, events } = capacityHarness()
       proc.sendUserText('do work')
       await flushCapacityMicrotasks()
-      for (const [delay, error] of [[5000, COMPACT_ERROR], [10000, { message: STREAM_MESSAGE }], [20000, REQUEST_TIMEOUT_ERROR]] as const) {
+      const errors = [COMPACT_ERROR, { message: STREAM_MESSAGE }, REQUEST_TIMEOUT_ERROR, OVERLOADED_ERROR]
+      for (const [index, delay] of retryDelays.entries()) {
         for (let i = 0; i < 4; i++) {
           completeCapacityTurn(proc)
           await clock.tick()
         }
-        completeCapacityTurn(proc, error)
+        completeCapacityTurn(proc, errors[index % errors.length]!)
         expect(proc.turnRetry.delayMs).toBe(delay)
+        expect(events.filter(([name]) => name === 'result')).toHaveLength(0)
         await clock.tick()
       }
       completeCapacityTurn(proc, OVERLOADED_ERROR)
@@ -691,7 +697,7 @@ describe('codex transient failure recovery', () => {
       for (let task = 0; task < 2; task++) {
         proc.sendUserText('do work')
         await flushCapacityMicrotasks()
-        for (const delay of [5000, 10000, 20000]) {
+        for (const delay of retryDelays) {
           completeCapacityTurn(proc, error)
           expect(proc.turnRetry.delayMs).toBe(delay)
           await clock.tick()
@@ -1955,7 +1961,7 @@ describe('codex process compaction notifications', () => {
       threadId: 'thread-4',
       turnId: 'turn-4',
     })).not.toThrow()
-    // reasoning item 走 UNMAPPED log(不 emit raw);thread/status/changed 已被
+    // 已知 reasoning item 静默忽略(不 emit raw);thread/status/changed 已被
     // 子 agent 状态机消费(exec-cell 编排的终态信号),不再落 raw。
     expect(raw).toHaveLength(0)
     expect(compacted).toHaveLength(1)
@@ -2804,6 +2810,19 @@ async function receiptWithin(dispatch: any, timeoutMs = 50): Promise<any> {
 }
 
 describe('codex turn/start delivery receipt', () => {
+  test('context metadata remains in the exact input owned by the reliable delivery', async () => {
+    const { proc, resolveTurnStart } = pendingTurnStartFixture('thread-1')
+    let startedInput: string | undefined
+    const originalStart = proc.startTurn
+    proc.startTurn = (text: string) => { startedInput = text; return originalStart() }
+    const dispatch = proc.sendUserText('task', ['/tmp/input.txt'], { contextPrefix: 'context\n' })
+    expect(dispatch.kind).toBe('turn_start_pending')
+    expect(startedInput).toBe('[file: /tmp/input.txt]\n\ncontext\ntask')
+    expect(proc.pendingTurnStart.inputText).toBe(startedInput)
+    resolveTurnStart({ turn: { id: 'turn-1' } })
+    expect(await dispatch.settlement).toMatchObject({ kind: 'ack', threadId: 'thread-1', turnId: 'turn-1' })
+  })
+
   test('turn/started ACK wins over a later RPC rejection', async () => {
     const { proc, rejectTurnStart, resultEvents } = pendingTurnStartFixture('thread-1')
     const dispatch = proc.sendUserText('hello') as any
@@ -4144,5 +4163,49 @@ describe('codex model capacity recovery(fork 宽口径与交付锚)', () => {
       expect(proc.turnRetry).toMatchObject({ phase: 'waiting', attempt: 1, message: CAPACITY_MESSAGE })
       expect(clock.timers.size).toBe(1)
     })
+  })
+})
+
+describe('Codex protocol log privacy', () => {
+  test('normal protocol payloads and compaction never enter ordinary logs', () => {
+    const diagnostic = spyOn(logModule, 'logDiagnostic').mockImplementation(() => {})
+    const failure = spyOn(logModule, 'logError').mockImplementation(() => {})
+    try {
+      const { proc, events } = makeCodexProtocolHarness()
+      const privateText = 'private-user private-project private-group /private/source.ts oc_private'
+      proc.sessionId = 'private-session'
+      for (const method of ['turn/moderationMetadata', 'turn/diff/updated', 'item/commandExecution/outputDelta',
+        'item/commandExecution/terminalInteraction', 'thread/readState/changed', 'remoteControl/status/changed', 'account/updated']) {
+        proc.handleNotification(method, { threadId: 'private-session', turnId: 'private-turn', itemId: 'private-item',
+          delta: privateText, diff: privateText, metadata: privateText, stdin: privateText })
+      }
+      for (const type of ['reasoning', 'sleep']) {
+        for (const method of ['item/started', 'item/completed']) proc.handleNotification(method, {
+          threadId: 'private-session', turnId: 'private-turn', item: { id: 'private-item', type, content: privateText },
+        })
+      }
+      proc.handleNotification('item/started', { item: { id: 'private-item', type: 'agentMessage', text: privateText } })
+      proc.handleNotification('item/completed', { threadId: 'private-session', turnId: 'private-turn',
+        item: { id: 'private-compaction', type: 'contextCompaction', summary: privateText } })
+      expect(events.some(([event]) => event === 'context_compacted')).toBe(true)
+      expect(diagnostic).not.toHaveBeenCalled()
+      expect(failure).not.toHaveBeenCalled()
+    } finally { diagnostic.mockRestore(); failure.mockRestore() }
+  })
+
+  test('unknown and malformed events retain fixed diagnoses without identities or payloads', () => {
+    const diagnostic = spyOn(logModule, 'logDiagnostic').mockImplementation(() => {})
+    try {
+      const { proc } = makeCodexProtocolHarness()
+      const privateText = 'private-user private-project private-group /private/source.ts oc_private'
+      proc.handleNotification(privateText, { text: privateText, threadId: 'private-session' })
+      proc.handleNotification('item/started', { item: { id: 'private-item', type: privateText, text: privateText } })
+      proc.handleNotification('item/started', { item: { text: privateText } })
+      expect(diagnostic.mock.calls).toEqual([
+        ['codex-process: unsupported protocol notification'],
+        ['codex-process: unsupported protocol item'],
+        ['codex-process: malformed protocol event'],
+      ])
+    } finally { diagnostic.mockRestore() }
   })
 })

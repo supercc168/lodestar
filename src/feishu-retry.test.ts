@@ -97,7 +97,8 @@ test('a shared recovery window accepts success at 55 seconds and records only ac
     }
   `)
   expect(stderr).not.toContain('first-attempt success')
-  expect(stderr.match(/cardkit PUT recovered: attempts=5 elapsed=55000ms/g)).toHaveLength(2)
+  expect(stderr.match(/feishu request recovered/g)).toHaveLength(1)
+  expect(stderr).not.toContain('cardkit PUT')
   expect(stderr).not.toContain('FINAL')
 })
 
@@ -125,8 +126,8 @@ test('request time and waits share one deadline and exhaustion retains the final
       api: 'cardkit', recovery,
     }).catch(error => error)
     assert.equal(expired, lastFailure)
-    assert.equal(logs.filter(entry => entry.text.includes('; FINAL')).length, 1)
-    assert.ok(logs.filter(entry => entry.text.includes('; FINAL')).every(entry => entry.time === startedAt + 60000))
+    assert.equal(logs.filter(entry => entry.text.includes('feishu request failed')).length, 1)
+    assert.ok(logs.filter(entry => entry.text.includes('feishu request failed')).every(entry => entry.time === startedAt + 60000))
     const empty = new FeishuRecoveryWindow()
     now += 60000
     assert.throws(() => empty.timeoutMs(15000), error => error.name === 'TimeoutError')
@@ -147,8 +148,103 @@ test('a fast outage is retried through the full minute instead of exhausting an 
     assert.deepEqual(delays, [3000, 8000, 15000, 15000, 15000, 4000])
     assert.equal(now - startedAt, 60000)
     assert.equal(failure, lastFailure)
-    assert.equal(logs.filter(entry => entry.text.includes('; FINAL')).length, 1)
-    assert.ok(logs.filter(entry => entry.text.includes('; FINAL')).every(entry => entry.time === startedAt + 60000))
+    assert.equal(logs.filter(entry => entry.text.includes('feishu request failed')).length, 1)
+    assert.ok(logs.filter(entry => entry.text.includes('feishu request failed')).every(entry => entry.time === startedAt + 60000))
+  `)
+})
+
+test('a configured retry cap allows six attempts and returns the final error without consuming the remaining window', async () => {
+  await runRecoveryScript(`
+    for (const succeedsOnLastAttempt of [false, true]) {
+      delays.length = 0
+      logs.length = 0
+      const duration = 32 * 60000
+      const recovery = new FeishuRecoveryWindow(duration, 5), startedAt = now
+      const starts = []
+      let lastFailure
+      const result = await withFeishuRetry('bounded upload', async () => {
+        starts.push(now - startedAt)
+        assert.ok(starts.length <= 6, 'must not start a seventh upload')
+        if (succeedsOnLastAttempt && starts.length === 6) return 'uploaded'
+        lastFailure = new DOMException('upload timeout ' + starts.length, 'TimeoutError')
+        throw lastFailure
+      }, { recovery }).catch(error => error)
+      assert.deepEqual(starts, [0, 3000, 11000, 26000, 41000, 56000])
+      assert.deepEqual(delays, [3000, 8000, 15000, 15000, 15000])
+      assert.equal(now - startedAt, 56000)
+      assert.equal(recovery.remainingMs(), duration - 56000)
+      if (succeedsOnLastAttempt) {
+        assert.equal(result, 'uploaded')
+        assert.equal(logs.filter(entry => entry.text.includes('feishu request failed')).length, 0)
+      } else {
+        assert.equal(result, lastFailure)
+        assert.equal(result.message, 'upload timeout 6')
+        const finalLogs = logs.filter(entry => entry.text.includes('feishu request failed'))
+        assert.equal(finalLogs.length, 1)
+        assert.equal(finalLogs[0].time, startedAt + 56000)
+      }
+    }
+  `)
+})
+
+test('a long recovery window still caps the final request at its remaining deadline', async () => {
+  await runRecoveryScript(`
+    const duration = 32 * 60000
+    const recovery = new FeishuRecoveryWindow(duration, 5), startedAt = now
+    const starts = [], timeouts = []
+    let lastFailure
+    const failure = await withFeishuRetry('slow upload', async () => {
+      starts.push(now - startedAt)
+      const timeout = recovery.timeoutMs(300000)
+      timeouts.push(timeout)
+      now += timeout
+      lastFailure = new FeishuRequestError('server busy', 503, undefined, '300', 'upload-' + starts.length)
+      throw lastFailure
+    }, { recovery }).catch(error => error)
+    assert.deepEqual(starts, [0, 600000, 1200000, 1800000])
+    assert.deepEqual(timeouts, [300000, 300000, 300000, 120000])
+    assert.deepEqual(delays, [300000, 300000, 300000])
+    assert.equal(now - startedAt, duration)
+    assert.equal(failure, lastFailure)
+    assert.equal(failure.logId, 'upload-4')
+    assert.equal(recovery.remainingMs(), 0)
+    assert.throws(() => recovery.timeoutMs(300000), error => error === lastFailure)
+    const expired = await withFeishuRetry('expired upload', async () => assert.fail('request after deadline'), {
+      recovery,
+    }).catch(error => error)
+    assert.equal(expired, lastFailure)
+  `)
+})
+
+test('Retry-After at or beyond a configured long window never starts an early retry', async () => {
+  await runRecoveryScript(`
+    const duration = 32 * 60000
+    for (const hint of [String(duration / 1000), String(duration / 1000 + 1)]) {
+      const recovery = new FeishuRecoveryWindow(duration, 5), startedAt = now
+      const source = new FeishuRequestError('rate limited', 429, 230020, hint, 'long-cooldown')
+      let timer, attempts = 0, settled = false
+      globalThis.setTimeout = (fn, ms) => {
+        assert.equal(ms, duration)
+        timer = fn
+        return 1
+      }
+      const result = withFeishuRetry('long upload cooldown', async () => {
+        attempts++
+        throw source
+      }, { recovery }).catch(error => error).then(error => { settled = true; return error })
+      while (!timer && !settled) await new Promise(resolve => originalSetTimeout(resolve, 0))
+      assert.ok(timer, 'must wait until the configured deadline')
+      now = startedAt + duration - 1
+      await Promise.resolve()
+      assert.equal(settled, false)
+      assert.equal(attempts, 1)
+      now = startedAt + duration
+      timer()
+      assert.equal(await result, source)
+      assert.equal(settled, true)
+      assert.equal(attempts, 1)
+      assert.equal(recovery.remainingMs(), 0)
+    }
   `)
 })
 

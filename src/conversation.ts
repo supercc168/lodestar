@@ -60,6 +60,11 @@ export interface PendingConversationLaunch {
  * 本地 slim 层裁剪(D-02):无 token source registry 概念,上游 source id 字段不收。 */
 export interface ConversationRouting {
   provider: AgentProvider
+  codexAccountId?: string
+  codexAccountAutomatic?: boolean
+  /** Snapshot for the first launch of a temporary Claude subscription session. */
+  claudeAccountId?: string
+  tokenSourceId: string | null
   model: string | null
   effort: AgentReasoningEffort | null
 }

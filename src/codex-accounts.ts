@@ -4,6 +4,8 @@ import { homedir } from 'node:os'
 import { isAbsolute, join, relative, resolve, sep } from 'node:path'
 import { CODEX_ACCOUNTS_DIR, CODEX_ACCOUNTS_FILE } from './paths'
 import { writeJsonStateAtomic } from './state-store'
+import { prepareCodexPluginDirectory } from './codex-plugin-cache.cjs'
+import { logError } from './log'
 
 export const DEFAULT_CODEX_ACCOUNT = 'default'
 type Env = Record<string, string | undefined>
@@ -22,7 +24,7 @@ interface AccountState {
 }
 
 const SHARED_DIRS = [
-  'sessions', 'archived_sessions', 'skills', 'rules', 'prompts', 'plugins',
+  'sessions', 'archived_sessions', 'skills', 'rules', 'prompts',
   'memories', 'generated_images', 'thread-writer-locks',
 ]
 const SHARED_FILES = ['config.toml', 'AGENTS.md', 'AGENTS.override.md', 'hooks.json',
@@ -166,7 +168,7 @@ export class CodexAccounts {
     return JSON.stringify([this.home(id), account.revision ?? null])
   }
 
-  /** Directory symlinks keep native thread history and locks together. Never link auth or model caches. */
+  /** Share native thread history and locks, but keep auth, model and plugin caches account-local. */
   prepareHome(id: string): string {
     const home = this.home(id)
     if (id === DEFAULT_CODEX_ACCOUNT) return home
@@ -179,6 +181,7 @@ export class CodexAccounts {
     let auth
     try { auth = lstatSync(join(home, 'auth.json')) } catch (error: any) { if (error.code !== 'ENOENT') throw error }
     if (auth?.isSymbolicLink() || (auth && !auth.isFile())) throw new Error('额外账号的 auth.json 必须为独立文件')
+    prepareCodexPluginDirectory(home, this.defaultHome)
     // Ensure a single shared config even on a machine that has never created config.toml.
     try { writeFileSync(join(this.defaultHome, 'config.toml'), '', { flag: 'wx', mode: 0o600 }) }
     catch (error: any) { if (error.code !== 'EEXIST') throw error }
@@ -243,10 +246,52 @@ export const codexAccounts = new CodexAccounts()
 const processAccounts = new WeakMap<object, string>()
 interface OwnedCodexProcess { isAlive(): boolean; once(event: 'exit', listener: () => void): unknown }
 const boundProcesses = new Map<OwnedCodexProcess, { id: string; ownsNativeProcess: boolean }>()
+export interface CodexQuotaReader extends OwnedCodexProcess {
+  readRateLimits(): Promise<any>
+  on(event: 'rate_limits_updated' | 'result', listener: (...args: any[]) => void): unknown
+  off(event: 'rate_limits_updated' | 'result', listener: (...args: any[]) => void): unknown
+}
+const quotaReaderWatchers = new Set<() => void>()
+function isQuotaReader(proc: OwnedCodexProcess): proc is CodexQuotaReader {
+  const reader = proc as Partial<CodexQuotaReader>
+  return typeof reader.readRateLimits === 'function' && typeof reader.on === 'function' && typeof reader.off === 'function'
+}
+function notifyQuotaReaderWatchers(): void {
+  for (const listener of [...quotaReaderWatchers]) {
+    try { listener() } catch (error) { logError('codex quota reader observer failed', error) }
+  }
+}
 export function bindProcessCodexAccount(proc: OwnedCodexProcess, id: string, ownsNativeProcess = true): void {
   processAccounts.set(proc, id)
-  if (!boundProcesses.has(proc)) proc.once('exit', () => boundProcesses.delete(proc))
+  const previous = boundProcesses.get(proc)
+  if (previous?.id === id && previous.ownsNativeProcess === ownsNativeProcess) return
+  if (!previous) proc.once('exit', () => {
+    const removed = boundProcesses.get(proc)
+    boundProcesses.delete(proc)
+    if (removed?.ownsNativeProcess && isQuotaReader(proc)) notifyQuotaReaderWatchers()
+  })
   boundProcesses.set(proc, { id, ownsNativeProcess })
+  if ((previous?.ownsNativeProcess || ownsNativeProcess) && isQuotaReader(proc)) notifyQuotaReaderWatchers()
+}
+
+/** Only native subscription task processes can lend their authenticated RPC
+ * connection. Short-lived control clients have no readRateLimits capability;
+ * logical account wrappers do not own a native process, and API tasks never bind. */
+export function liveCodexQuotaReaders(accountId?: string): Array<{
+  accountId: string; reader: CodexQuotaReader; isCurrent(): boolean
+}> {
+  return [...boundProcesses].flatMap(([reader, binding]) => {
+    if (!binding.ownsNativeProcess || (accountId !== undefined && binding.id !== accountId)
+      || !reader.isAlive() || !isQuotaReader(reader)) return []
+    return [{ accountId: binding.id, reader,
+      isCurrent: () => boundProcesses.get(reader) === binding && binding.ownsNativeProcess && reader.isAlive() }]
+  })
+}
+
+/** This registry owns no timers and starts no queries. */
+export function watchCodexQuotaReaders(listener: () => void): () => void {
+  quotaReaderWatchers.add(listener)
+  return () => { quotaReaderWatchers.delete(listener) }
 }
 export function codexAccountInUse(id: string, includeWaitingTasks = false): boolean {
   return [...boundProcesses].some(([proc, account]) => account.id === id
@@ -263,4 +308,9 @@ export function reserveCodexLogin(id: string): () => void {
 }
 export function processCodexAccount(proc: object | null | undefined): string {
   return proc ? processAccounts.get(proc) ?? DEFAULT_CODEX_ACCOUNT : DEFAULT_CODEX_ACCOUNT
+}
+
+/** Unlike the legacy display helper, an unbound/API process has no account. */
+export function boundCodexAccount(proc: object | null | undefined): string | null {
+  return proc ? processAccounts.get(proc) ?? null : null
 }

@@ -8,7 +8,6 @@ import type { TokenSourceConfig } from './config'
 import type { AccountInfo, Settings } from '@anthropic-ai/claude-agent-sdk'
 import type { CodexApiProvider } from './codex-process'
 import type { CodexCredits } from './codex-credits'
-import { log } from './log'
 import { codexAccounts } from './codex-accounts'
 
 export type TokenSourceAgent = AgentProvider
@@ -42,8 +41,6 @@ export interface UsageWindowUnified {
   resetsAt: Date | null
   used?: number
   total?: number
-  /** Successful Plus response omitted 5h; preserve the full-window annotation without inventing a reset time. */
-  unreportedFull?: boolean
 }
 
 export type UsageStateUnified =
@@ -101,8 +98,13 @@ export function scrubDshEnv(base: Env): Env {
 
 export interface TokenSource {
   id: string
-  /** One visible Codex source, with a separate native auth/catalog binding for each named account. */
+  /** One visible source, with separate native auth/catalog bindings for each account. */
   forAccount?(accountId: string): TokenSource
+  listAccounts?(): Array<{ id: string; name: string }>
+  accountRevision?(accountId: string): string
+  accountId?: string
+  /** The root exposes committed account catalogs; its quota is never borrowed from one account. */
+  aggregateAccountCatalog?: boolean
   /** Stable fingerprint of fields that affect spawned process routing/env.
    * Registry rebuilds with the same effective config keep the same value;
    * credential/base-url/slot changes force an idle process replacement. */
@@ -129,7 +131,8 @@ export interface TokenSource {
   /** Committed catalog state. A ready snapshot may include a background refresh error. */
   modelCatalogState?: TokenSourceModelCatalogState
   defaultModel: string
-  /** Startup/background worker only. Interactive consumers must not call or await this. */
+  /** Refresh for startup, scheduled work, or an explicit model-list request.
+   * Other interactive consumers read the committed cache. */
   refreshModels(): Promise<void>
   /** 面板手动补录模型名时的存在性校验(端点 200/1214 判别)。
    *  未声明时允许手动补录并选择 Agent 请求档位，实际请求错误由后端报告。 */
@@ -139,7 +142,7 @@ export interface TokenSource {
   resolveSpawnModel(model: string): string | undefined
   /** 该 source spawn 的 claude 子进程 settingSources(覆盖 DEFAULT_SETTING_SOURCES)。
    *  注入 env 的 source(glm/deepseek)不设 → DEFAULT(['project','local'],spawnEnv 权威);
-   *  透传型 source(native)设 ['user','project','local'] → 读本机 Claude Code 配置。 */
+   *  Claude 订阅设 ['user','project','local']，通过进程级 settings 隔离账号路由。 */
   settingSources?: readonly string[]
   /** Claude 来源的进程级设置覆盖；不修改本机 settings 文件。 */
   claudeSettings?: Settings
@@ -196,11 +199,11 @@ export interface TokenSourceFactoryDef {
   /** config.toml 里该 source 的 section id(如 'glm');undefined = 无 config(codex 走本地 login) */
   configSectionId?: string
   build: (cfg: TokenSourceConfig, detected?: Partial<TokenSourceConfig> | null) => TokenSource
-  /** 飞书 setup 命令接入(可选;codex login / native 无独立 setup)。 */
+  /** 飞书 setup 命令接入(可选;订阅登录无独立 setup)。 */
   setup?: TokenSourceSetup
   /** 独立的余额凭据配置，校验通过后才保存；不改变推理凭据。 */
   usageSetup?: TokenSourceSetup
-  /** 本机 settings.json 探测(可选;codex / native 无)—— 命中 host 则自动启用。 */
+  /** 本机 settings.json 探测(可选;订阅无)—— 命中 host 则自动启用。 */
   detect?: TokenSourceDetection
 }
 
@@ -237,6 +240,15 @@ export function getTokenSourceForAccount(id: string | null | undefined, accountI
   return source?.forAccount ? source.forAccount(accountId) : source
 }
 
+export function tokenSourceAccounts(source: TokenSource): Array<{ id: string; name: string }> {
+  return source.listAccounts?.() ?? (source.kind === 'codex-subscription' ? codexAccounts.list() : [])
+}
+
+export function tokenSourceAccountRevision(source: TokenSource, accountId: string): string {
+  return source.accountRevision?.(accountId)
+    ?? (source.kind === 'codex-subscription' ? codexAccounts.revision(accountId) : accountId)
+}
+
 export function listTokenSources(): TokenSource[] {
   return [...registry.values()]
 }
@@ -269,9 +281,10 @@ let refreshAllInFlight: { generation: number; promise: Promise<void> } | null = 
 export function refreshAllTokenSourceModels(): Promise<void> {
   const generation = registryGeneration
   if (refreshAllInFlight?.generation === generation) return refreshAllInFlight.promise
-  const promise = Promise.allSettled(listTokenSourceAccounts().map(async ts => {
+  const targets = listTokenSources().flatMap(source => source.aggregateAccountCatalog ? [source]
+    : source.forAccount ? tokenSourceAccounts(source).map(account => source.forAccount!(account.id)) : [source])
+  const promise = Promise.allSettled(targets.map(async ts => {
     await ts.refreshModels()
-    log(`token-source ${ts.id}: ${ts.models.length} models loaded`)
   }))
     .then(() => {})
     .finally(() => {
@@ -284,7 +297,7 @@ export function refreshAllTokenSourceModels(): Promise<void> {
 /** Account views have independent caches and refreshes; one slow login cannot block another. */
 export function listTokenSourceAccounts(): TokenSource[] {
   return listTokenSources().flatMap(source => source.forAccount
-    ? codexAccounts.list().map(account => source.forAccount!(account.id)) : [source])
+    ? tokenSourceAccounts(source).map(account => source.forAccount!(account.id)) : [source])
 }
 
 /** Startup/diagnostic barrier. Interactive discovery must read the committed cache instead. */

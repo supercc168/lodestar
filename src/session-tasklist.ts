@@ -2,7 +2,7 @@ import type { Session } from './session'
 import * as cards from './cards'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
-import { log } from './log'
+import { log, logError } from './log'
 import * as tasklist from './tasklist'
 import { messageOf, type TasklistActionResult } from './session-util'
 
@@ -28,10 +28,10 @@ export async function showTasklistPanel(s: Session): Promise<void> {
   if (binding && !binding.chatId) {
     try {
       tasklist.updateTasklistBinding(projectName, b => { b.chatId = s.chatId })
-      log(`session "${s.sessionName}": backfilled tasklist chatId → ${s.chatId}`)
+      log("session: backfilled tasklist chatId")
       await feishu.sendTextRaw(s.chatId, '✅ 已将自动化状态卡绑定到本群')
     } catch (e) {
-      log(`session "${s.sessionName}": tasklist chatId self-heal failed: ${messageOf(e)}`)
+      logError("session: tasklist chatId self-heal failed", e)
     }
   }
   let failure: unknown
@@ -52,7 +52,7 @@ export async function onTasklistEnable(s: Session): Promise<TasklistActionResult
     }
   } catch (e) {
     const message = `启用失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": tasklist enable failed: ${messageOf(e)}`)
+    logError('session-tasklist: tasklist enable failed', e)
     return {
       ok: false,
       message,
@@ -99,7 +99,7 @@ export async function onTasklistDeleteConfirm(s: Session, guidRaw: string): Prom
     }
   } catch (e) {
     const message = `删除失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": tasklist delete failed: ${messageOf(e)}`)
+    logError('session-tasklist: tasklist delete failed', e)
     return {
       ok: false,
       message,

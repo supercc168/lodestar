@@ -72,7 +72,6 @@ let activeHandle: AgentWorkerHandle | undefined
 const completed: Array<Record<string, unknown>> = []
 const artifacts = new Map<string, string>()
 /** Thread 创建时的原生委派口径(sessionId → delegation capable)。 */
-const delegationCapability = new Map<string, boolean>()
 const snapshots: AgentRunSnapshot[] = []
 const errors: string[] = []
 let validationStatus: 'running' | 'passed' | 'failed' = 'running'
@@ -265,25 +264,7 @@ async function runCase(name: string, projectBound: boolean, resumeSessionId?: st
     assert.equal(lastContext?.collaboration_mode?.mode, 'default')
     assert(lastContext.collaboration_mode.settings.developer_instructions.includes('no question or answer interface'))
   }
-  // 合并语义(上游多层委派 × 本地 D-11 口径 3 × codex 原生约束):
-  // 1) 项目归属线程保留上游多层委派(原生 multi_agent 开启,classic 经
-  //    tool_search 的 Multi-agent 目录、Code Mode 经 collaboration 命名空间);
-  // 2) 会话归属 worker 线程按 D-11 在创建时即关闭原生再委派
-  //    (`--disable multi_agent` + thread config features.multi_agent=false);
-  // 3) codex-cli 0.162.1 实测(2026-10 app-server 探针):multi_agent 能力在
-  //    thread/start 时烘焙进 rollout,对该 thread id 不可逆 —— resume/fork 的
-  //    config 键、multiAgentMode RPC(thread/resume、turn/start、
-  //    thread/settings/update)与进程级 --disable 都无法改写已建线程。故原生
-  //    委派工具随「线程创建时的归属」固定:session_to_project / plan_to_project
-  //    接管续跑不恢复(实现侧不做无效回写);
-  // 4) Code Mode 的 collaboration 命名空间不受该开关门控,创建/接管均在。
-  // 断言口径:委派工具在 ⇔ 线程创建口径允许(project 归属或 codeMode)。
-  const delegationExpected = resumeSessionId
-    ? delegationCapability.get(resumeSessionId)!
-    : (projectBound || codeMode)
-  delegationCapability.set(result.session_id, delegationExpected)
-  assert(active.summaries.every(item => item.delegationToolsPresent === delegationExpected),
-    delegationExpected ? 'native delegation tools were lost' : 'session-owned worker thread exposed native delegation tools')
+  assert(active.summaries.every(item => item.delegationToolsPresent === true), 'native delegation tools were lost')
   if (codeMode) assert(active.summaries.every(item => (item.toolNames as string[]).includes('functions.exec')), 'Code Mode was lost')
   assert(active.wire.length >= 3 && JSON.stringify(native.records).includes(proof), 'missing native execution evidence')
   if (name === 'plan_to_session') assert.equal(lastContext?.collaboration_mode?.mode, 'plan')

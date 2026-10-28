@@ -7,13 +7,6 @@ export const ULTRA_MIN_WEEKLY_SHARES = 0.5
 const WEEK_MS = 7 * 24 * 3_600_000
 const WEEKLY_EARLY_FINISH_HOURS = 5
 
-/** User-defined subscription rule: successful Plus reads without a short window mean a full 5h budget.
- * This does not fabricate a reset timestamp, and never applies to failed reads or malformed windows. */
-export function plusFiveHourWindow(plan: string | undefined, window: UsageWindow | null): UsageWindow | null {
-  return plan === 'plus' && window === null
-    ? { percent: 0, resetsAt: null, durationMins: 300, unreportedFull: true } : window
-}
-
 /** Native personal plan SKUs. Shares are relative weekly allowances, not token estimates. */
 export function codexWeeklyShares(plan: string | undefined): 1 | 5 | 20 | null {
   switch (plan) {
@@ -30,7 +23,7 @@ export function codexModelQuota(usage: Extract<UsageSnapshot, { state: 'ok' }>, 
     || b.normalModelSlug === model) ?? usage
   const ordinaryUsageAllowed = !('limitId' in quota) || quota.limitId === usage.defaultLimitId
     ? usage.ordinaryUsageAllowed : undefined
-  return { ...quota, ordinaryUsageAllowed, fiveHour: plusFiveHourWindow(usage.subscriptionType, quota.fiveHour) }
+  return { ...quota, ordinaryUsageAllowed }
 }
 
 type CodexQuotaAccess = { state: 'subscription' | 'credits' } | { state: 'exhausted' | 'miss'; reason: string }
@@ -130,9 +123,6 @@ export function rankCodexQuota(usage: UsageSnapshot, model: string, now = Date.n
   const shares = codexWeeklyShares(usage.subscriptionType)
   if (shares === null) return { ...out, reason: `未知周额度套餐：${usage.subscriptionType ?? 'MISS'}` }
   out.shares = shares
-  if (effort === 'ultra' && usage.subscriptionType === 'plus') {
-    return { ...out, state: 'excluded', reason: 'Ultra 自动选择不使用 Plus' }
-  }
   const quota = codexModelQuota(usage, model)
   const access = codexQuotaAccess(quota)
   if (access.state === 'miss') return { ...out, reason: access.reason }
@@ -143,11 +133,20 @@ export function rankCodexQuota(usage: UsageSnapshot, model: string, now = Date.n
     return { ...out, state: 'exhausted', reason: access.reason,
       ...(resets.length === exhausted.length && resets.length ? { retryAt: Math.max(...resets) } : {}) }
   }
+  const credits = codexCreditAvailability(quota.credits)
+  if (effort === 'ultra' && usage.subscriptionType === 'plus' && quota.fiveHour !== null && credits !== 'available') {
+    return credits === 'unknown'
+      ? { ...out, reason: 'Ultra 自动选择有短窗的 Plus，积分 MISS' }
+      : { ...out, state: 'excluded', reason: 'Ultra 自动选择有短窗的 Plus 需要可用积分' }
+  }
   if (access.state === 'credits') {
     return { ...out, state: 'ready', funding: 'credits', credits: quota.credits! }
   }
   const weekly = quota.weekly
   if (!weekly || weekly.percent === null) return { ...out, reason: '周额度 MISS' }
+  if (weekly.durationMins != null && weekly.durationMins !== 10080) {
+    return { ...out, reason: `周额度窗口时长不匹配：${weekly.durationMins} 分钟（需要 10080 分钟）` }
+  }
   // A stale/resetting window is not an infinite score or a fabricated new allowance.
   const reset = weekly.resetsAt?.getTime()
   if (reset == null || !Number.isFinite(reset) || reset <= now) return { ...out, reason: '周重置时间 MISS 或已过期' }
@@ -155,17 +154,16 @@ export function rankCodexQuota(usage: UsageSnapshot, model: string, now = Date.n
   const hours = (reset - now) / 3_600_000
   const scoringHours = hours - WEEKLY_EARLY_FINISH_HOURS
   const weeklyScore = scoringHours > 0 ? remaining / scoringHours : null
-  const credits = codexCreditAvailability(quota.credits)
-  if (effort === 'ultra' && remaining < ULTRA_MIN_WEEKLY_SHARES && credits !== 'available') {
+  if (effort === 'ultra' && usage.subscriptionType !== 'plus' && remaining < ULTRA_MIN_WEEKLY_SHARES && credits !== 'available') {
     if (credits === 'unknown') return { ...out, remaining, hours, weeklyScore, reason: 'Ultra 周余量不足，积分 MISS' }
     return { ...out, state: 'waiting', remaining, hours, weeklyScore,
       reason: `Ultra 至少需要 ${ULTRA_MIN_WEEKLY_SHARES} 份周余量`, retryAt: reset }
   }
   const priority = scoringHours <= 0 ? 'expiring' as const : undefined
-  if (usage.subscriptionType === 'plus') {
-    const short = quota.fiveHour!
+  if (usage.subscriptionType === 'plus' && quota.fiveHour !== null) {
+    const short = quota.fiveHour
     const fiveHourRemaining = PLUS_FIVE_HOUR_SHARES * (100 - short.percent!) / 100
-    const fiveHourHours = short.unreportedFull ? 5 : ((short.resetsAt?.getTime() ?? NaN) - now) / 3_600_000
+    const fiveHourHours = ((short.resetsAt?.getTime() ?? NaN) - now) / 3_600_000
     if (!Number.isFinite(fiveHourHours) || fiveHourHours <= 0) return { ...out, reason: '5h 重置时间 MISS 或已过期' }
     return { state: 'ready', shares, remaining, hours, priority, weeklyScore, fiveHourRemaining, fiveHourHours,
       availableNow: Math.min(remaining, fiveHourRemaining),

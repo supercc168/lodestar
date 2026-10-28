@@ -19,7 +19,6 @@ import type { Session } from './session'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
 import * as cards from './cards'
-import { log } from './log'
 import { claudeTranscriptDir } from './claude-agent-process'
 import { isAgentSession } from './agent-session-registry'
 import {
@@ -29,9 +28,9 @@ import {
   type ConversationRouting,
   type ConversationSummary,
 } from './conversation'
-import { closeSync, openSync, readSync, readdirSync, statSync } from 'node:fs'
+import { closeSync, openSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
-import { join } from 'node:path'
+import { isAbsolute, join, resolve } from 'node:path'
 import { diagnosticIdLabel } from './session-util'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -131,10 +130,13 @@ function panelMap(s: Session): Map<string, TempPanelState> {
   return panels
 }
 
-/** 路由一致性比较(D-02 slim 层裁剪:本地 ConversationRouting 无 token source
- *  registry 字段,上游对应比较项随字段一并裁剪)。 */
+/** 选择卡绑定账号、来源与模型快照，防止切换路由后复用旧按钮。 */
 function sameRouting(a: ConversationRouting, b: ConversationRouting): boolean {
   return a.provider === b.provider
+    && (a.codexAccountId ?? 'default') === (b.codexAccountId ?? 'default')
+    && !!a.codexAccountAutomatic === !!b.codexAccountAutomatic
+    && (a.claudeAccountId ?? 'default') === (b.claudeAccountId ?? 'default')
+    && a.tokenSourceId === b.tokenSourceId
     && a.model === b.model
     && a.effort === b.effort
 }
@@ -221,8 +223,8 @@ function usableBranchBase(s: Session): ConversationBranchBase {
 
 // ── Claude stopped-session history catalog ───────────────────────────
 
-export function listClaudeSessions(workDir: string): ConversationSummary[] {
-  const dir = claudeTranscriptDir(workDir)
+export function listClaudeSessions(workDir: string, options?: { configDir?: string; projectDirName?: string }): ConversationSummary[] {
+  const dir = claudeTranscriptDir(workDir, options)
   let names: string[]
   try {
     names = readdirSync(dir)
@@ -232,10 +234,12 @@ export function listClaudeSessions(workDir: string): ConversationSummary[] {
   }
   const all: ConversationSummary[] = []
   for (const name of names) {
-    if (!name.endsWith('.jsonl')) continue
+    if (!name.endsWith('.jsonl') || name.includes('.orphaned-') || name.includes('.superseded-')) continue
     const sessionId = name.slice(0, -6)
     if (isAgentSession('claude', sessionId)) continue
     const full = join(dir, name)
+    const preview = firstUserSummary(full, workDir)
+    if (preview === null) continue
     let mtime: number
     try { mtime = statSync(full).mtimeMs } catch (error: any) {
       throw new Error(`读取 Claude 会话元数据失败 (${name}): ${error?.message ?? error}`)
@@ -244,7 +248,7 @@ export function listClaudeSessions(workDir: string): ConversationSummary[] {
       provider: 'claude',
       sessionId,
       cwd: workDir,
-      preview: firstUserSummary(full),
+      preview,
       ts: mtime,
     })
   }
@@ -259,10 +263,7 @@ function recentHistory(entries: ConversationSummary[]): ConversationSummary[] {
   return ordered.slice(0, Math.min(HISTORY_CARD_MAX, Math.max(10, withinCount)))
 }
 
-/** 从 transcript 提取首条用户输入(会话主题)。优先 queue-operation 的 enqueue
- *  content(用户原始输入);fallback 首条 user message 的 text。只读前 64KB ——
- *  首条用户输入总在文件开头,避免对大 transcript 全量读。 */
-function firstUserSummary(path: string): string {
+function firstUserSummary(path: string, workDir?: string): string | null {
   let text = ''
   let fd: number | null = null
   try {
@@ -276,21 +277,30 @@ function firstUserSummary(path: string): string {
     if (fd !== null) closeSync(fd)
   }
   let fallback = ''
+  let queued = ''
+  let checkedCwd = false
+  const canonical = (path: string): string => { try { return realpathSync(path) } catch { return resolve(path) } }
   for (const raw of text.split('\n')) {
     const line = raw.trim()
     if (!line) continue
     let data: any
     try { data = JSON.parse(line) } catch { continue }
+    if (!data || typeof data !== 'object' || Array.isArray(data)) continue
+    if (data.isSidechain === true) return null
+    if (!checkedCwd && workDir && typeof data.cwd === 'string' && isAbsolute(data.cwd)) {
+      if (canonical(data.cwd) !== canonical(workDir)) return null
+      checkedCwd = true
+    }
     if (data.type === 'queue-operation' && data.operation === 'enqueue' && typeof data.content === 'string') {
       const content = data.content.trim()
-      if (content) return content.slice(0, 80)
+      if (content && !queued) queued = content
     }
     if (!fallback && data.type === 'user' && data.message) {
       const userText = userMessageText(data.message)
       if (userText) fallback = userText
     }
   }
-  return fallback.slice(0, 80)
+  return (queued || fallback).slice(0, 80)
 }
 
 function userMessageText(message: any): string {
@@ -370,7 +380,7 @@ export async function showResumeList(s: Session, userOpenId: string): Promise<vo
   try {
     history = s.selectedProvider === 'codex'
       ? await s.listCodexConversations()
-      : s.selectedProvider === 'dsh' ? await s.listDshConversations() : listClaudeSessions(s.workDir)
+      : s.selectedProvider === 'dsh' ? await s.listDshConversations() : listClaudeSessions(s.workDir, s.claudeHistoryOptions())
   } catch (error) {
     await feishu.sendTextRaw(s.chatId, `❌ 历史会话读取失败: ${error instanceof Error ? error.message : error}`)
     return
@@ -450,7 +460,6 @@ export async function onForkSelect(s: Session, panelId: string, choiceId: string
     if (choice.kind !== 'fork') return { ok: false, message: '选择项类型不匹配' }
     if (!s.opts.onCreateTempSession) return { ok: false, message: '临时群能力未就绪' }
     const chatName = reserveTempChatName(panel.baseName)
-    log(`session-temp: fork ${s.sessionName} → ${chatName} (${choice.launch.kind})`)
     await feishu.sendText(s.chatId, `🔱 正在分叉到 ${chatName}…`)
     let result
     try {
@@ -499,7 +508,7 @@ export async function onBackSelect(s: Session, panelId: string, choiceId: string
     if (!s.ownsLifecycle(lease) || s.hasPreservedWatchdogRecovery()) {
       return { ok: false, message: '回退被更新的会话操作打断，未执行' }
     }
-    log(`session-temp: back ${s.sessionName} (${choice.launch.kind}, writes=${choice.writes.length})`)
+
     const ok = await s.rollbackTo(choice.launch, {
       anchors: choice.seedAnchors,
       base: choice.branchBase,
@@ -574,7 +583,7 @@ export async function onResumeSelect(s: Session, panelId: string, choiceId: stri
     if (!s.ownsLifecycle(lease) || s.hasPreservedWatchdogRecovery()) {
       return finish(false, '历史分支被更新的会话操作打断，未执行', 'unchanged')
     }
-    log(`session-temp: history fork ${s.sessionName} ← ${choice.launch.source.provider} ${sourceId}`)
+
     const ok = await s.rollbackTo(choice.launch, {
       anchors: [],
       base: choice.launch,

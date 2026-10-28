@@ -26,7 +26,7 @@
 
 import { homedir } from 'node:os'
 import { join } from 'node:path'
-import { lodestarDataDir, managedClaudePluginDir } from './data-dir.cjs'
+import { lodestarDataDir, managedClaudePluginDir, codexAccountsDir } from './data-dir.cjs'
 
 const HOME = homedir()
 const IS_WIN = process.platform === 'win32'
@@ -67,6 +67,10 @@ export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
  *  key = sessionName(主群名或 <project>*MMDD-HHMM 临时群名)。 */
 export const SESSION_TURNS_MAP_FILE = join(DATA_DIR, 'session-turns-map.json')
 export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
+/** Last real inbound user-message time per chat, used by Claude account reservations. */
+export const SESSION_ACTIVITY_FILE = join(DATA_DIR, 'session-activity.json')
+/** Private bilingual exchanges visible at the Claude translation boundary; never native transcripts. */
+export const CLAUDE_TRANSLATION_CONTEXT_DIR = join(DATA_DIR, 'claude-translation-context')
 /** Exact chats created by the temporary-session runtime; required before `bye` may delete. */
 export const TEMP_SESSION_LEASES_FILE = join(DATA_DIR, 'temp-session-leases.json')
 export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
@@ -86,12 +90,14 @@ export const MANAGED_CLAUDE_PLUGIN_DIR = managedClaudePluginDir()
  *  (上游 722e45a)。运行期状态落 DATA_DIR,不落回仓库。 */
 export const DSH_HOME_DIR = join(DATA_DIR, 'dsh')
 /** Named Codex credentials and per-group selections; the default account stays in native CODEX_HOME. */
-export const CODEX_ACCOUNTS_DIR = join(DATA_DIR, 'codex-accounts')
+export const CODEX_ACCOUNTS_DIR = codexAccountsDir()
 export const CODEX_ACCOUNTS_FILE = join(DATA_DIR, 'codex-accounts.json')
 export const CODEX_QUOTA_BLOCKS_FILE = join(DATA_DIR, 'codex-quota-blocks.json')
-/** Opt-in Agent 运行时安装根(上游 9a6209b)。每个 agent 一个目录,内含
- *  fingerprint 版本目录与 `current.json` 选择文件。只有 `[runtime.agent_auto_update]`
- *  显式开启或手动更新才会写入 —— daemon 启动不检查、不安装(D-06)。 */
+/** Named Claude subscriptions keep native credentials here; only explicit names are discovered. */
+export const CLAUDE_ACCOUNTS_DIR = join(HOME, '.claude-accounts')
+/** Private enrollment phases and identity revisions; never contains subscription credentials. */
+export const CLAUDE_ACCOUNTS_FILE = join(DATA_DIR, 'claude-accounts.json')
+/** Automatically updated, immutable Agent runtime installations and status. */
 export const AGENT_RUNTIMES_DIR = join(DATA_DIR, 'agent-runtimes')
 /** 真实窗口观测缓存:key = `<sourceId>:<model>`(如 `glm:GLM-5.3`),value = 窗口
  *  token 数(200000 / 1000000)。来源 = 每轮真实 turn 的 SDK modelUsage.contextWindow
@@ -114,7 +120,7 @@ export const ALIVE_MARKER_FILE = join(DATA_DIR, 'alive-on-shutdown.json')
 export const INBOX_DIR = join(DATA_DIR, 'inbox')
 /** One private receipt per cloud-file delivery; remote files are managed in their Feishu folder. */
 export const FILE_DELIVERIES_DIR = join(DATA_DIR, 'file-deliveries')
-/** Workspace delivery preferences and per-chat Drive folder bindings; v1 chat preferences migrate on access. */
+/** Per-chat Drive folder bindings; legacy preferences are ignored during migration. */
 export const FILE_DELIVERY_GROUPS_FILE = join(DATA_DIR, 'file-delivery-groups.json')
 /** Unix-socket endpoint the daemon listens on for debug message
  * injection (see scripts/test-inject.ts). A real Feishu user sends

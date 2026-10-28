@@ -9,9 +9,10 @@ import {
   TurnWatchdog,
   type WatchdogSettings,
 } from './turn-watchdog'
-import { fileDeliveryAgentContext } from './instructions'
+import { channelInstructions } from './instructions'
+import { closeSync, ftruncateSync, openSync } from 'node:fs'
 import { FileDeliveryBatch } from './file-delivery'
-import { GroupFileDelivery } from './group-file-delivery'
+import type { CardWriteFailure } from './cardkit'
 import type { FileDeliverySnapshot } from './file-delivery-types'
 import {
   NothingToCompactError,
@@ -65,7 +66,7 @@ const sessionHostAsk = await import('./session-host-ask')
 const { ClaudeAgentProcess } = await import('./claude-agent-process')
 const { FeishuRecoveryWindow } = await import('./feishu-retry')
 const feishu = await import('./feishu')
-const { groupFileDelivery } = await import('./file-delivery-runtime')
+const { config } = await import('./config')
 const { getTokenSource, listTokenSources, registerTokenSource, refreshAllTokenSourceModels, resetTokenSourceRegistry, tokenSourceProcessRevision } = await import('./token-source')
 const { buildTokenSourcesFromConfig } = await import('./token-source-builtins')
 const {
@@ -74,8 +75,7 @@ const {
   normalizePersistedModelSelection,
   configuredDefaultSelection,
 } = await import('./session-model')
-const { config } = await import('./config')
-const { peekUsage, updateUsageFromRateLimits, refreshUsageFromConnection, invalidateCodexUsage } = await import('./usage')
+const { peekUsage, refreshUsageFromConnection, invalidateCodexUsage } = await import('./usage')
 
 interface FetchCall {
   method: string
@@ -322,6 +322,9 @@ afterEach(() => {
     }
     session.dispose()
   }
+  const retained = listTokenSources().filter(source => source.id !== 'session-native-fixture')
+  resetTokenSourceRegistry()
+  for (const source of retained) registerTokenSource(source)
   globalThis.fetch = originalFetch
   failureNotificationWait.mockRestore()
 })
@@ -382,6 +385,18 @@ function turnState(
     outboundSentPaths: new Set(),
     hostAskMarkersSeen: new Set(),
   }
+}
+
+function prepareNativeSource(session: any): void {
+  const id = 'session-native-fixture'
+  registerTokenSource({ id, kind: 'test', agent: 'claude', display: 'Fixture', enabled: true,
+    defaultModel: 'fable', models: [{ model: 'fable', display: 'Fable', efforts: ['max'], defaultEffort: 'max' }],
+    modelCatalogState: { status: 'ready', updatedAt: 1 }, refreshModels: async () => {},
+    spawnEnv: env => env, resolveSpawnModel: model => model,
+    readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+  })
+  session.selectedTokenSourceId = id
+  session.selectedModel = 'fable'
 }
 
 function strictExecResult(literal = 'ready'): string {
@@ -4598,35 +4613,6 @@ describe('Session system-owned Claude host-ask continuation', () => {
   })
 })
 
-function deferCardSettingsPatch(cardId: string): {
-  entered: Promise<void>
-  release: () => void
-  restore: () => void
-} {
-  const entered = deferred<void>()
-  const release = deferred<void>()
-  const passthroughFetch = globalThis.fetch
-  globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-    const url = new URL(String(input))
-    if (
-      String(init?.method ?? 'GET') === 'PATCH' &&
-      url.pathname.endsWith(`/cards/${cardId}/settings`)
-    ) {
-      entered.resolve()
-      await release.promise
-    }
-    return await passthroughFetch(input, init)
-  }) as typeof fetch
-  return {
-    entered: entered.promise,
-    release: () => release.resolve(),
-    restore: () => {
-      release.resolve()
-      globalThis.fetch = passthroughFetch
-    },
-  }
-}
-
 async function waitForHostAskAttempt(ask: { resumeStarted?: boolean }, session: any): Promise<void> {
   const deadline = Date.now() + 2_000
   while (session.pendingHostAsks.has('host-ask-race') && ask.resumeStarted !== false) {
@@ -5184,10 +5170,7 @@ describe('Session Codex watchdog progress observation', () => {
     }]
     first.session.status = 'working'
 
-    const seededUsage = updateUsageFromRateLimits({
-      planType: 'stable',
-      primary: { usedPercent: 17, resetsAt: 1_700_000_000, windowDurationMins: 300 },
-    })
+    const seededUsage = peekUsage()
     const planBefore = JSON.stringify({
       steps: nextTurn.planSteps,
       explanation: nextTurn.planExplanation,
@@ -6458,7 +6441,7 @@ describe('Session Codex watchdog structured activity and safety', () => {
 })
 
 describe('Session Codex watchdog warning and model guard', () => {
-  test('schedules footer and background refreshes at elapsed-bucket boundaries', () => {
+  test('schedules footer at elapsed-bucket boundaries and coalesces background changes', () => {
     const session = new Session('bucket-scheduling', 'chat_id') as any
     const turn = turnState('card_bucket_scheduling')
     const delays: number[] = []
@@ -6484,16 +6467,17 @@ describe('Session Codex watchdog warning and model guard', () => {
         id: 'old', type: 'shell', description: 'old', status: 'running',
         startedAt: now - 300_001, steps: [],
       }]
-      session.startBackgroundRefreshTick()
-      expect(delays.at(-1)).toBeGreaterThanOrEqual(299_000)
+      session.onBackgroundTaskChanged()
+      expect(delays.at(-1)).toBe(1500)
+      expect(session.backgroundRefreshTick).toBeNull()
 
       session.backgroundTasks.push({
         id: 'new', type: 'shell', description: 'new', status: 'running',
         startedAt: Date.now(), steps: [],
       })
-      session.rescheduleBackgroundRefreshTick()
-      expect(delays.at(-1)).toBeGreaterThanOrEqual(29_900)
-      expect(delays.at(-1)).toBeLessThanOrEqual(30_000)
+      session.onBackgroundTaskChanged()
+      expect(delays.at(-1)).toBe(1500)
+      expect(session.backgroundRefreshTick).toBeNull()
     } finally {
       session.stopFooterStatus(turn)
       session.stopBackgroundRefreshTick()
@@ -6502,7 +6486,7 @@ describe('Session Codex watchdog warning and model guard', () => {
     }
   })
 
-  test('second live_elapsed mode uses 1s footer and 1s background ticks', async () => {
+  test('second live_elapsed mode uses 1s footer and event-driven background updates', async () => {
     const previous = config.runtime.live_elapsed
     config.runtime.live_elapsed = 'second'
     const session = new Session('second-scheduling', 'chat_id') as any
@@ -6529,8 +6513,9 @@ describe('Session Codex watchdog warning and model guard', () => {
         id: 'bg', type: 'shell', description: 'bg', status: 'running',
         startedAt: Date.now() - 300_001, steps: [],
       }]
-      session.startBackgroundRefreshTick()
-      expect(delays.at(-1)).toBe(1000)
+      session.onBackgroundTaskChanged()
+      expect(delays.at(-1)).toBe(1500)
+      expect(session.backgroundRefreshTick).toBeNull()
 
       session.renderFooterStatus = renderFooterStatus
       turn.footerStatusHandle = DETERMINISTIC_FOOTER_HANDLE
@@ -6944,7 +6929,7 @@ describe('Session in-flight user guidance', () => {
     return { session, proc, turn }
   }
 
-  for (const provider of ['codex', 'claude'] as const) {
+  for (const provider of ['codex', 'claude', 'dsh'] as const) {
     test(`${provider} waits for native consumption before changing the presentation card`, async () => {
       const { session, proc, turn } = running(provider)
       const steered: any[] = []
@@ -7173,7 +7158,7 @@ describe('Session in-flight user guidance', () => {
     } finally { await session.closeTurnCard('测试收尾') }
   })
 
-  for (const provider of ['codex', 'claude'] as const) {
+  for (const provider of ['codex', 'claude', 'dsh'] as const) {
     test(`${provider} combines the consecutive consumed 2–10 messages into one supplemental card`, async () => {
       const { session, proc, turn } = running(provider)
       const ids: string[] = []
@@ -7195,7 +7180,7 @@ describe('Session in-flight user guidance', () => {
           await new Promise(resolve => setTimeout(resolve, 2))
           expect(sentCards).toEqual([])
         }
-        if (provider === 'codex') proc.emit('input_batch_end', { itemId: 'reasoning-for-all-inputs' })
+        if (provider !== 'claude') proc.emit('input_batch_end', { itemId: 'reasoning-for-all-inputs' })
         proc.emit('assistant_text', { text: '收到，测试消息 1–10 均已接收。', parentToolUseId: null })
         proc.emit('assistant_block_stop', { parentToolUseId: null })
         await waitUntil(() => session.steeringBoundary === null)
@@ -7304,8 +7289,9 @@ describe('Session in-flight user guidance', () => {
     expect(sentRawTexts.some(text => text.includes('缺少原生处理位置确认'))).toBe(true)
   })
 
-  test('backends without steering retain the existing next-turn input batch', async () => {
-    const { session, proc } = running('dsh')
+  test('a process without the steering capability retains the existing next-turn input batch', async () => {
+    const { session, proc } = running()
+    proc.steerUserText = undefined
     try {
       await session.onUserMessage('next task')
       expect(session.pendingMidTurnMsgs.map((msg: any) => msg.text)).toEqual(['next task'])
@@ -7382,154 +7368,154 @@ describe('Session in-flight user guidance', () => {
   })
 })
 
-describe('Session cloud file receipts', () => {
-  for (const provider of ['codex', 'claude', 'dsh'] as const) {
-    test(`${provider} BTW uses its workspace mode and updates on the next input while WT stays separate`, async () => {
-      const registry = new GroupFileDelivery({
-        read: () => undefined, write: () => {}, workDirForChat: () => undefined,
-        getChatName: async id => id,
-        createFolder: async name => ({ token: name, url: `https://example.com/${name}` }),
-        getFolder: async folder => ({ ...folder, name: folder.token }),
-        renameFolder: async (folder, name) => ({ ...folder, name }),
-        grantFolderAccess: async () => {},
-      })
-      const mode = spyOn(groupFileDelivery, 'mode').mockImplementation((chatId, workDir) => registry.mode(chatId, workDir))
-      const main = new Session('workspace-modes', 'main')
-      const btw = new Session('workspace-modes*0917-1234', 'btw') as any
-      const wt = new Session('workspace-modes[feature]', 'wt')
-      try {
-        await registry.enable(main.chatId, main.workDir, 'user')
-        expect(btw.getFileDeliveryMode()).toBe('drive')
-        expect(wt.getFileDeliveryMode()).toBe('chat')
-        const proc = new FakeAgentProc(provider)
-        btw.procFileDeliveryModes.set(proc, 'drive')
-        btw.sendClaimedUserText(proc, 'first')
-        await registry.disable(main.chatId, main.workDir)
-        btw.sendClaimedUserText(proc, 'second')
-        btw.sendClaimedUserText(proc, 'third')
-        expect(proc.sentTexts).toEqual(['first', `${fileDeliveryAgentContext('chat')}\n\nsecond`, 'third'])
-      } finally { mode.mockRestore(); main.dispose(); btw.dispose(); wt.dispose() }
-    })
+describe('Session automatic file delivery', () => {
+  let fileDir: string
+  beforeEach(() => { fileDir = mkdtempSync(join(tmpdir(), 'lodestar-delivery-test-')) })
+  afterEach(() => { rmSync(fileDir, { recursive: true, force: true }) })
+  const localFile = (name: string, bytes = feishu.MAX_UPLOAD_BYTES + 1): string => {
+    const path = join(fileDir, name)
+    const fd = openSync(path, 'w')
+    try { ftruncateSync(fd, bytes) } finally { closeSync(fd) }
+    return path
   }
 
-  test('keeps ordinary file and image messages as the default with no cloud card or upload', () => {
-    const session = new Session('native-files', 'unconfigured-chat') as any
+  test.each(['codex', 'claude', 'dsh'] as const)('%s routes files in main, BTW and WT sessions without changing user input', async provider => {
+    const small = localFile('report.pdf', 1024)
+    const large = localFile('video.mp4')
+    for (const name of ['project', 'project*0917-1234', 'project[feature]']) {
+      const session = new Session(name, name) as any
+      const proc = new FakeAgentProc(provider)
+      const cloudPaths: string[] = []
+      session.proc = proc
+      session.currentTurn = turnState()
+      session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
+      await session.sendClaimedUserText(proc, '生成报告和视频')
+      session.sendOutboundPath(small, 'send marker')
+      session.sendOutboundPath(large, 'send marker')
+      expect(sentLocalFiles).toContainEqual([name, small])
+      expect(cloudPaths).toEqual([large])
+      expect(proc.sentTexts).toEqual(['生成报告和视频'])
+      session.dispose()
+    }
+  })
+
+  test('sends files up to exactly 30 MiB to chat and larger files to Drive within the same turn', () => {
+    const session = new Session('mixed-files', 'chat') as any
     const turn = turnState()
     session.currentTurn = turn
-    session.createFileDeliveryForTurn = () => { throw new Error('cloud delivery must not be used by default') }
-    expect(session.getFileDeliveryMode()).toBe('chat')
-    session.sendOutboundPath('/tmp/report.pdf', 'send marker')
-    session.sendOutboundPath('/tmp/image.png', 'send marker')
-    expect(sentLocalFiles).toEqual([['unconfigured-chat', '/tmp/report.pdf'], ['unconfigured-chat', '/tmp/image.png']])
-    expect(turn.fileDelivery).toBeUndefined()
-    expect(turn.fileDeliveryMode).toBe('chat')
+    const cloudPaths: string[] = []
+    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
+    const tiny = localFile('report.pdf', 1)
+    const boundary = localFile('boundary.zip', 30 * 1024 * 1024)
+    const oversized = localFile('oversized.zip', 30 * 1024 * 1024 + 1)
+    const image = localFile('image.png', 1024)
+    for (const path of [tiny, boundary, oversized, image, boundary, oversized]) session.sendOutboundPath(path, 'send marker')
+    expect(sentLocalFiles).toEqual([['chat', tiny], ['chat', boundary], ['chat', image]])
+    expect(cloudPaths).toEqual([oversized])
+    expect(turn.outboundSentPaths).toEqual(new Set([tiny, boundary, image]))
     expect(sentCards).toHaveLength(0)
   })
 
-  test('switches only newly admitted batches, so one turn never mixes attachment and cloud delivery', () => {
-    const session = new Session('file-mode-switch', 'chat') as any
-    let mode = 'chat'
-    const cloudPaths: string[] = []
-    session.getFileDeliveryMode = () => mode
-    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
-    session.currentTurn = turnState()
-    session.sendOutboundPath('/tmp/first.pdf', 'send marker')
-    mode = 'drive'
-    session.sendOutboundPath('/tmp/second.pdf', 'send marker')
-    expect(sentLocalFiles.map(([, path]) => path)).toEqual(['/tmp/first.pdf', '/tmp/second.pdf'])
-    expect(cloudPaths).toEqual([])
-    session.currentTurn = turnState()
-    session.sendOutboundPath('/tmp/third.pdf', 'send marker')
-    expect(cloudPaths).toEqual(['/tmp/third.pdf'])
+  test('small files never initialize Drive or require a delivery requester', () => {
+    const session = new Session('native-files', 'chat') as any
+    const turn = turnState()
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    session.createFileDeliveryForTurn = () => { throw new Error('Drive must not be used for small files') }
+    const report = localFile('report.pdf', 1024)
+    session.sendOutboundPath(report, 'send marker')
+    expect(sentLocalFiles).toEqual([['chat', report]])
+    expect(turn.fileDelivery).toBeUndefined()
+    expect(sentTexts).toHaveLength(0)
   })
 
-  test('updates delivery rules only when the group mode changes, without repeating startup rules', () => {
-    const session = new Session('file-mode-context', 'chat') as any
-    const proc = new FakeAgentProc('codex')
-    let mode = 'drive'
-    session.getFileDeliveryMode = () => mode
-    session.procFileDeliveryModes.set(proc, mode)
-    session.sendClaimedUserText(proc, '生成大文件')
-    mode = 'chat'
-    session.sendClaimedUserText(proc, '继续交付')
-    session.sendClaimedUserText(proc, '生成报告')
-    mode = 'drive'
-    session.sendClaimedUserText(proc, '生成视频')
-    expect(proc.sentTexts).toEqual([
-      '生成大文件',
-      `${fileDeliveryAgentContext('chat')}\n\n继续交付`,
-      '生成报告',
-      `${fileDeliveryAgentContext('drive')}\n\n生成视频`,
-    ])
-    expect(proc.sentTexts[3]).not.toMatch(/30|大小|压缩|分卷/)
-  })
-
-  test('freezes delivery before file generation so changing the group switch cannot invalidate the prepared file', () => {
-    const session = new Session('file-mode-preparation', 'chat') as any
-    const proc = new FakeAgentProc('codex')
-    session.proc = proc
-    let mode = 'drive'
-    session.getFileDeliveryMode = () => mode
-    session.procFileDeliveryModes.set(proc, mode)
-    const cloudPaths: string[] = []
-    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
+  test('reports missing files and directories without sending or creating a cloud batch', () => {
+    const session = new Session('invalid-files', 'chat') as any
     session.currentTurn = turnState()
-    session.sendClaimedUserText(proc, '生成视频')
-    mode = 'chat'
-    session.sendOutboundPath('/tmp/video.mp4', 'send marker')
-    expect(cloudPaths).toEqual(['/tmp/video.mp4'])
+    session.createFileDeliveryForTurn = () => { throw new Error('must validate the file first') }
+    session.sendOutboundPath(join(fileDir, 'missing.zip'), 'send marker')
+    session.sendOutboundPath(fileDir, 'send marker')
     expect(sentLocalFiles).toEqual([])
-    session.currentTurn = turnState()
-    session.sendClaimedUserText(proc, '生成报告')
-    session.sendOutboundPath('/tmp/report.pdf', 'send marker')
-    expect(sentLocalFiles).toEqual([['chat', '/tmp/report.pdf']])
-    expect(proc.sentTexts).toEqual(['生成视频', `${fileDeliveryAgentContext('chat')}\n\n生成报告`])
+    expect(session.currentTurn.fileDelivery).toBeUndefined()
+    expect(sentTexts).toHaveLength(2)
+    expect(sentTexts.every(text => text.includes('文件交付失败'))).toBe(true)
   })
 
-  test('keeps the injected delivery mode if the backend opens its card after the group switch changed', () => {
-    const session = new Session('file-mode-late-card', 'chat') as any
-    const proc = new FakeAgentProc('codex')
-    session.proc = proc
-    let mode = 'drive'
-    session.getFileDeliveryMode = () => mode
-    session.procFileDeliveryModes.set(proc, mode)
-    const cloudPaths: string[] = []
-    session.createFileDeliveryForTurn = () => ({ add: (path: string) => cloudPaths.push(path), finish: async () => cloudPaths, cancel: () => false })
-    session.sendClaimedUserText(proc, '生成视频')
-    mode = 'chat'
+  test('reports a cloud setup failure without falling back to a chat attachment', () => {
+    const session = new Session('cloud-failure', 'chat') as any
     session.currentTurn = turnState()
-    session.sendOutboundPath('/tmp/late-video.mp4', 'send marker')
-    expect(cloudPaths).toEqual(['/tmp/late-video.mp4'])
+    session.createFileDeliveryForTurn = () => { throw new Error('云空间权限不足') }
+    session.sendOutboundPath(localFile('large.zip'), 'send marker')
     expect(sentLocalFiles).toEqual([])
+    expect(sentTexts.some(text => text.includes('云空间权限不足'))).toBe(true)
+    expect(session.currentTurn.outboundSentPaths.size).toBe(0)
   })
 
-  test('retries a delivery-rule update after the backend rejects its input write', () => {
-    const session = new Session('file-mode-write-error', 'chat') as any
+  test('releases the pending input claim after the backend rejects its input write', async () => {
+    const session = new Session('file-input-error', 'chat') as any
     const proc = new FakeAgentProc('codex')
-    session.procFileDeliveryModes.set(proc, 'drive')
-    session.getFileDeliveryMode = () => 'chat'
     const send = proc.sendUserText.bind(proc)
     proc.sendUserText = () => { throw new Error('input closed') }
-    expect(() => session.sendClaimedUserText(proc, '生成报告')).toThrow('input closed')
+    await expect(session.sendClaimedUserText(proc, '生成报告')).rejects.toThrow('input closed')
     expect(session.pendingUserMessageCount).toBe(0)
-    expect(session.procFileDeliveryModes.get(proc)).toBe('drive')
     proc.sendUserText = send
-    session.sendClaimedUserText(proc, '生成报告')
-    expect(proc.sentTexts).toEqual([`${fileDeliveryAgentContext('chat')}\n\n生成报告`])
+    await session.sendClaimedUserText(proc, '生成报告')
+    expect(proc.sentTexts).toEqual(['生成报告'])
   })
 
-  test('routes files commands to the current group settings without forwarding them to an Agent', async () => {
+  test('an async translation rejection releases the pending claim without adding context', async () => {
+    const session = new Session('translation-delivery-failure', 'chat') as any
+    const proc = new FakeAgentProc('claude', 'translation-session', 'claude-sub') as any
+    proc.translationEnabled = true
+    session.proc = proc
+    session.wireProc(proc)
+    session.closeTurnCard = async () => {}
+    await session.sendClaimedUserText(proc, 'first')
+    expect(session.pendingUserMessageCount).toBe(1)
+    proc.lastResult = { ...proc.lastResult, subtype: 'claude_turn_start_failed', is_error: true }
+    proc.emit('result', { subtype: 'claude_turn_start_failed', is_error: true, error: 'validation rejected' })
+    expect(session.pendingUserMessageCount).toBe(0)
+    await session.sendClaimedUserText(proc, 'second')
+    expect(proc.sentTexts).toEqual(['first', 'second'])
+    proc.emit('user_input_submitted', {})
+    proc.hasPendingNativeTurn = () => false
+    session.userInterrupted = true
+    session.interrupt()
+    expect(session.userInterrupted).toBe(false)
+    session.dispose()
+  })
+
+  test('nontranslated Claude sources retain their existing failed-input and interrupt handling', async () => {
+    for (const sourceId of ['claude-sub', 'glm', 'deepseek']) {
+      const session = new Session(`plain-${sourceId}`, 'chat') as any
+      const proc = new FakeAgentProc('claude', `${sourceId}-session`, sourceId) as any
+      proc.hasPendingNativeTurn = () => false
+      session.proc = proc
+      session.wireProc(proc)
+      session.closeTurnCard = async () => {}
+      session.pendingUserMessageCount = 2
+      proc.lastResult = { ...proc.lastResult, subtype: 'claude_turn_start_failed', is_error: true }
+      proc.emit('result', { subtype: 'claude_turn_start_failed', is_error: true, error: 'native write failed' })
+      expect(session.pendingUserMessageCount).toBe(2)
+      session.userInterrupted = true
+      session.interrupt()
+      expect(session.userInterrupted).toBe(true)
+      session.dispose()
+    }
+  })
+
+  test('files is no longer intercepted as a control command', async () => {
     const session = new Session('file-commands', 'chat') as any
-    const calls: unknown[][] = []
-    session.runFileDeliveryCommand = async (...args: unknown[]) => { calls.push(args) }
-    for (const command of ['files', 'files on', 'FILES OFF']) expect(await session.runCommand(command, 'ou_user')).toBe(true)
-    expect(calls).toEqual([['', 'ou_user'], ['on', 'ou_user'], ['OFF', 'ou_user']])
+    for (const command of ['files', 'files on', 'FILES OFF', 'files status']) {
+      expect(await session.runCommand(command, 'ou_user')).toBe(false)
+    }
+    expect(sentCards).toHaveLength(0)
+    expect(sentTexts).toHaveLength(0)
   })
 
   test('keeps one delivery across rotations, deduplicates markers, and waits for final publication', async () => {
     const session = new Session('files', 'chat_id') as any
     const turn = turnState('card_file_receipt')
-    turn.fileDeliveryMode = 'drive'
     cardkit.recordCardCreated(turn.cardId, 1)
     session.currentTurn = turn
     const admitted: string[] = []
@@ -7542,20 +7528,22 @@ describe('Session cloud file receipts', () => {
       factories++
       return { add: (path: string) => { admitted.push(path) }, finish: () => { finishStarted = true; return publication } }
     }
-    session.sendOutboundPath('/tmp/large.mp4', 'send marker')
-    session.sendOutboundPath('/tmp/large.mp4', 'duplicate marker')
-    session.sendOutboundPath('/tmp/report.pdf', 'send marker after rotation')
+    const large = localFile('large.mp4')
+    session.sendOutboundPath(large, 'send marker')
+    session.sendOutboundPath(large, 'duplicate marker')
+    const report = localFile('report.pdf')
+    session.sendOutboundPath(report, 'send marker after rotation')
     expect(factories).toBe(1)
-    expect(admitted).toEqual(['/tmp/large.mp4', '/tmp/report.pdf'])
+    expect(admitted).toEqual([large, report])
     expect(turn.outboundSentPaths.size).toBe(0)
     expect(sentLocalFiles).toHaveLength(0)
     const closed = session.closeTurnCard()
     await waitUntil(() => finishStarted)
     expect(cardkit.isDisposed(turn.cardId)).toBe(false)
-    release(['/tmp/large.mp4'])
+    release([large])
     await closed
-    expect(turn.outboundSentPaths.has('/tmp/large.mp4')).toBe(true)
-    expect(turn.outboundSentPaths.has('/tmp/report.pdf')).toBe(false)
+    expect(turn.outboundSentPaths.has(large)).toBe(true)
+    expect(turn.outboundSentPaths.has(report)).toBe(false)
     expect(cardkit.isDisposed(turn.cardId)).toBe(true)
   })
 
@@ -7569,12 +7557,9 @@ describe('Session cloud file receipts', () => {
     session.proc = proc
     session.selectedProvider = provider
     session.selectedEffort = 'high'
-    session.getFileDeliveryMode = () => 'drive'
-    session.procFileDeliveryModes.set(proc, 'drive')
     session.wireProc(proc)
     const turn = turnState(`card_file_handoff_${provider}_${isError}`)
     turn.provider = provider
-    turn.fileDeliveryMode = 'drive'
     session.currentTurn = turn
     cardkit.recordCardCreated(turn.cardId, 1)
     const receipts: FileDeliverySnapshot[] = []
@@ -7600,7 +7585,8 @@ describe('Session cloud file receipts', () => {
       reportError: async message => { errors.push(message) },
     })
     session.createFileDeliveryForTurn = () => delivery
-    session.sendOutboundPath('/tmp/preview.mp4', 'send marker')
+    const preview = localFile('preview.mp4')
+    session.sendOutboundPath(preview, 'send marker')
     await waitUntil(() => uploadSignal !== undefined)
     try {
       session.pendingMidTurnMsgs = [{
@@ -7624,7 +7610,7 @@ describe('Session cloud file receipts', () => {
       expect(receipts[0].files.map(file => file.status)).toEqual(['ready'])
       expect(receipts[0].error).toBeUndefined()
       expect(errors).toEqual([])
-      expect(turn.outboundSentPaths.has('/tmp/preview.mp4')).toBe(true)
+      expect(turn.outboundSentPaths.has(preview)).toBe(true)
       expect(cardkit.isDisposed(turn.cardId)).toBe(true)
       expect(session.fileDeliveries.size).toBe(0)
       expect(session.currentTurn).toBe(nextTurn)
@@ -7641,7 +7627,6 @@ describe('Session cloud file receipts', () => {
   test.each(['hard', 'soft'])('%s stop cancels file delivery after the agent finished and its turn was captured', async mode => {
     const session = new Session('closing-files', 'chat_id') as any
     const turn = turnState('card_closing_files')
-    turn.fileDeliveryMode = 'drive'
     session.currentTurn = turn
     cardkit.recordCardCreated(turn.cardId, 1)
     let finishStarted = false
@@ -7653,7 +7638,8 @@ describe('Session cloud file receipts', () => {
       finish: () => { finishStarted = true; return published },
       cancel: (reason: string) => { cancelled = reason; release([]); return true },
     })
-    session.sendOutboundPath('/tmp/large.mp4', 'send marker')
+    const large = localFile('large.mp4')
+    session.sendOutboundPath(large, 'send marker')
     const close = session.closeTurnCard()
     await waitUntil(() => finishStarted)
     expect(session.currentTurn).toBeNull()
@@ -7667,6 +7653,37 @@ describe('Session cloud file receipts', () => {
 })
 
 describe('generated image delivery', () => {
+  test('a generated image over 30 MiB uses Drive and deduplicates its later send marker', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-large-image-test-'))
+    const image = join(dir, 'large-image.png')
+    const fd = openSync(image, 'w')
+    try { ftruncateSync(fd, feishu.MAX_UPLOAD_BYTES + 1) } finally { closeSync(fd) }
+    const session = new Session('large-image', 'chat_id') as any
+    const turn = turnState('card_large_image')
+    session.currentTurn = turn
+    const admitted: string[] = []
+    session.createFileDeliveryForTurn = () => ({ add: (path: string) => admitted.push(path), finish: async () => admitted, cancel: () => false })
+    cardkit.recordCardCreated(turn.cardId, 1)
+    try {
+      sessionTools.addTool(session, session.proc, 'large-image-call', 'ImageGeneration', { revisedPrompt: 'Large picture' })
+      sessionTools.completeTool(session, session.proc, 'large-image-call', image, false)
+      await sessionTools.waitForImageDeliveries(turn)
+      session.sendOutboundPath(image, 'duplicate marker')
+      expect(admitted).toEqual([image])
+      expect(uploadedImages).toEqual([])
+      expect(sentImages).toEqual([])
+      expect(sentLocalFiles).toEqual([])
+      expect(turn.outboundSentPaths.has(image)).toBe(false)
+      await session.closeTurnCard()
+      expect(turn.outboundSentPaths.has(image)).toBe(true)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+      session.dispose()
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+
   test('card rotation waits for the generated image on the old tool card', async () => {
     const session = new Session('image-rotation', 'chat_id') as any
     const oldCardId = 'card_image_rotation_old'
@@ -10210,29 +10227,26 @@ describe('Session provider switching', () => {
   })
   afterAll(() => resetTokenSourceRegistry())
 
-  test('uses provider-specific ask instructions', () => {
+  test('uses the same channel instructions across backends and English in safe mode', () => {
     const session = new Session('probe', 'chat_id') as any
 
-    // codex 侧改走原生 request_user_input 工具指令(D3 三小件);
-    // askusr marker 指令退役,但 marker 解析栈保留作违规兜底(291c34a)。
-    session.selectedProvider = 'codex'
-    const codexInstructions = session.spawnDeveloperInstructions()
-    expect(codexInstructions).toContain('request_user_input')
-    expect(codexInstructions).not.toContain('[[askusr:')
+    for (const provider of ['codex', 'claude', 'dsh']) {
+      session.selectedProvider = provider
+      expect(session.spawnDeveloperInstructions()).toBe(channelInstructions())
+    }
 
     session.selectedProvider = 'claude'
-    const instructions = session.spawnDeveloperInstructions()
-    expect(instructions).toContain('AskUserQuestion')
-    expect(instructions).not.toContain('[[askusr:')
-
-    // DSH 原生后端走自带 ask_user_question 工具(上游 722e45a DSH_CHANNEL_INSTRUCTIONS),
-    // 不复用 Codex 的 request_user_input 文案。
-    session.selectedProvider = 'dsh'
-    const dshInstructions = session.spawnDeveloperInstructions()
-    expect(dshInstructions).toContain('ask_user_question')
-    expect(dshInstructions).not.toContain('request_user_input')
-    expect(dshInstructions).not.toContain('AskUserQuestion')
-    expect(dshInstructions).not.toContain('[[askusr:')
+    session.selectedTokenSourceId = 'claude-sub'
+    expect(session.spawnDeveloperInstructions()).toBe(channelInstructions())
+    const previousSafeMode = config.claude.safe_mode
+    config.claude.safe_mode = { 'claude-sub': ['*'] }
+    try {
+      const english = session.spawnDeveloperInstructions()
+      expect(english).toBe(channelInstructions('en'))
+    } finally {
+      config.claude.safe_mode = previousSafeMode
+      session.dispose()
+    }
   })
 
   test('keeps selected provider resume id from being overwritten by stale backend events', () => {
@@ -10534,21 +10548,23 @@ describe('Session provider switching', () => {
   })
 
   test.each(['stopped', 'idle', 'working'])('disabled Claude subscription rejects new input while %s without stopping the process', async state => {
+    const sourceId = 'claude-sub'
     const session = new Session('subscription-off', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'existing-conversation', 'claude-sub')
+    const proc = new FakeAgentProc('claude', 'existing-conversation', sourceId)
     session.selectedProvider = 'claude'
-    session.selectedTokenSourceId = 'claude-sub'
+    session.selectedTokenSourceId = sourceId
     session.selectedModel = 'sonnet'
     session.selectedEffort = 'high'
     session.proc = state === 'stopped' ? null : proc
     session.currentTurn = state === 'working' ? turnState('running-subscription') : null
     session.status = state
     const turn = session.currentTurn
-    session.tokenSource = () => ({ id: 'claude-sub', kind: 'claude-subscription', enabled: false,
-      modelCatalogState: { status: 'disabled', error: 'Claude Code 订阅已禁用；发送 claude-sub on 启用' } })
+    const hint = 'Claude Code 订阅已禁用；发送 claude-sub on 启用'
+    session.tokenSource = () => ({ id: sourceId, kind: 'claude-subscription', enabled: false,
+      modelCatalogState: { status: 'disabled', error: hint } })
     try {
       await session.onUserMessage('new task', [], 'ou_user', 'om_new')
-      expect(sentTexts.at(-1)).toContain('claude-sub on')
+      expect(sentTexts.at(-1)).toContain(hint)
       expect(sentTexts.at(-1)).toContain('消息未送给 Agent')
       expect(proc.sentTexts).toEqual([])
       expect(proc.killCalls).toBe(0)
@@ -10560,7 +10576,7 @@ describe('Session provider switching', () => {
 
   test.each([false, true])('Claude subscription rechecks the switch after opening an input card (queued=%s)', async queued => {
     const session = new Session('subscription-race', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'existing-conversation', 'claude-sub')
+    const proc = Object.assign(new FakeAgentProc('claude', 'existing-conversation', 'claude-sub'), { translationEnabled: true })
     session.proc = proc
     session.selectedProvider = 'claude'
     session.selectedTokenSourceId = 'claude-sub'
@@ -10579,6 +10595,8 @@ describe('Session provider switching', () => {
       return turn
     }
     session.closeTurnCard = async (status: string) => { statuses.push(status); session.currentTurn = null }
+    const previousSafeMode = config.claude.safe_mode
+    config.claude.safe_mode = { 'claude-sub': ['*'] }
     try {
       if (queued) {
         session.pendingMidTurnMsgs = [{ text: 'queued task', wireText: 'queued task', userOpenId: '', msgId: '' }]
@@ -10596,7 +10614,10 @@ describe('Session provider switching', () => {
       expect(proc.sentTexts).toHaveLength(1)
       expect(proc.sentTexts[0]).toContain('enabled again')
       expect(proc.killCalls).toBe(0)
-    } finally { session.dispose() }
+    } finally {
+      config.claude.safe_mode = previousSafeMode
+      session.dispose()
+    }
   })
 
   test('MD uses cached models immediately and never waits for catalog I/O', async () => {
@@ -10637,6 +10658,144 @@ describe('Session provider switching', () => {
       expect(refreshes).toBe(1)
     } finally {
       release(); await background; session.dispose(); resetTokenSourceRegistry()
+      for (const entry of previous) registerTokenSource(entry)
+    }
+  })
+
+  test('manual model lists refresh immediately while pagination and internal redraws reuse the committed catalog', async () => {
+    const { cachedTokenSource, disposeCachedTokenSource } = await import('./token-source-cache')
+    const previous = listTokenSources()
+    resetTokenSourceRegistry()
+    let release!: () => void
+    const barrier = new Promise<void>(resolve => { release = resolve })
+    let refreshes = 0
+    const create = () => {
+      const raw: import('./token-source').TokenSource = {
+        id: 'manual-catalog', kind: 'codex-subscription', agent: 'codex', display: 'Codex', enabled: true,
+        models: [], defaultModel: '', accountRevision: () => 'stable', modelCatalogState: { status: 'idle', updatedAt: null },
+        async refreshModels() {
+          refreshes++; await barrier
+          const available = Array.from({ length: 26 }, (_, i) => ({ model: `manual-${i}`, display: `Manual ${i}`, efforts: ['high' as const], defaultEffort: 'high' as const }))
+          raw.models = available.slice(0, 25)
+          raw.modelSelection = { mode: 'catalog', modelIds: raw.models.map(m => m.model), availableModels: available }
+          raw.modelCatalogState = { status: 'ready', updatedAt: Date.now() }
+        },
+        spawnEnv: env => env, resolveSpawnModel: model => model,
+        readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+      }
+      return raw
+    }
+    const source = cachedTokenSource(create, {}, 'manual-account', 'manual-config')
+    registerTokenSource(source)
+    const session = new Session('manual-catalog', 'chat_id')
+    try {
+      await session.showModelPanel()
+      const panelId = [...session.modelPanels.keys()][0]!
+      const pending = await session.onProviderSelect(source.id, panelId, true)
+      expect(pending.pending).toBe(true)
+      expect(pending.canPresent?.()).toBe(true)
+      const repeated = await session.onProviderSelect(source.id, panelId, true)
+      expect(repeated.completion).toBe(pending.completion)
+      expect((await session.onModelPage(panelId, source.id, 0)).ok).toBe(false)
+      // Stop stays usable while the shared lookup is still pending. A new
+      // explicit request must not reuse the cancelled presentation receipt.
+      await session.stop('test', { announce: false })
+      const afterStop = await session.onProviderSelect(source.id, panelId, true)
+      expect(afterStop.completion).not.toBe(pending.completion)
+      release()
+      expect((await pending.completion!).canPresent?.()).toBe(false)
+      const ready = await afterStop.completion!
+      expect(ready.ok).toBe(true)
+      expect(ready.canPresent?.()).toBe(true)
+      expect(refreshes).toBe(1)
+      expect(JSON.stringify(ready.card)).toContain('manual-0')
+      expect((await session.onModelPage(panelId, source.id, 1)).ok).toBe(true)
+      expect((await session.onProviderSelect(source.id, panelId)).ok).toBe(true)
+      expect(refreshes).toBe(1)
+      const add = await session.onModelAddOpen(panelId, source.id, true)
+      expect(add.pending).toBe(true)
+      const hidden = await add.completion!
+      expect(hidden.ok).toBe(true)
+      expect(JSON.stringify(hidden.card)).toContain('manual-25')
+      expect(refreshes).toBe(2)
+      expect((await session.onModelAddOpen(panelId, source.id)).ok).toBe(true)
+      expect(refreshes).toBe(2)
+    } finally {
+      release(); session.dispose(); disposeCachedTokenSource(source); resetTokenSourceRegistry()
+      for (const source of previous) registerTokenSource(source)
+    }
+  })
+
+  test('manual model refresh failures remain visible and can be retried without waiting for the automatic cadence', async () => {
+    const previous = listTokenSources()
+    let fails = true, refreshes = 0
+    const source: import('./token-source').TokenSource = {
+      id: 'manual-failure', kind: 'test', agent: 'claude', display: 'Test', enabled: true,
+      models: [], defaultModel: '', modelCatalogState: { status: 'failed', updatedAt: 1, error: 'previous failure' },
+      async refreshModels() {
+        refreshes++
+        if (fails) throw new Error('HTTP 503 directory unavailable')
+        source.models = [{ model: 'recovered', display: 'Recovered', efforts: ['high'], defaultEffort: 'high' }]
+        source.modelCatalogState = { status: 'ready', updatedAt: 2 }
+      },
+      spawnEnv: env => env, resolveSpawnModel: model => model,
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    }
+    registerTokenSource(source)
+    const session = new Session('manual-failure', 'chat_id')
+    try {
+      session.modelPanels.set('panel', { models: [], messageId: 'om_manual' })
+      const first = await session.onProviderSelect(source.id, 'panel', true)
+      const failed = await first.completion!
+      expect(failed.ok).toBe(false)
+      expect(failed.message).toContain('HTTP 503 directory unavailable')
+      expect(failed.canPresent?.()).toBe(true)
+      fails = false
+      const second = await session.onProviderSelect(source.id, 'panel', true)
+      expect((await second.completion!).ok).toBe(true)
+      expect(refreshes).toBe(2)
+    } finally {
+      session.dispose(); resetTokenSourceRegistry()
+      for (const entry of previous) registerTokenSource(entry)
+    }
+  })
+
+  test.each(['stop', 'dispose', 'shutdown', 'panel', 'source', 'account'] as const)('manual directory receipts cannot overwrite a later %s transition', async transition => {
+    const { modelActionCompletion } = await import('./session-util')
+    const previous = listTokenSources()
+    const source: import('./token-source').TokenSource = {
+      id: 'manual-late', kind: 'codex-subscription', agent: 'codex', display: 'Codex', enabled: true,
+      models: [{ model: 'late', display: 'Late', efforts: ['high'], defaultEffort: 'high' }], defaultModel: 'late',
+      modelCatalogState: { status: 'ready', updatedAt: 1 }, refreshModels: async () => {},
+      spawnEnv: env => env, resolveSpawnModel: model => model,
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    }
+    registerTokenSource(source)
+    const session = new Session('manual-late', 'chat_id')
+    const account = spyOn(session, 'tokenSourceAccountId').mockReturnValue('original')
+    try {
+      session.modelPanels.set('panel', { models: [], messageId: 'om_manual' })
+      const pending = await session.onProviderSelect(source.id, 'panel', true)
+      // The backend can finish while presentation of the pending card is still awaiting I/O.
+      const final = await pending.completion!
+      expect(final.ok).toBe(true)
+      expect(final.canPresent?.()).toBe(true)
+      if (transition === 'stop') await session.stop('test', { announce: false })
+      else if (transition === 'dispose') session.dispose()
+      else if (transition === 'shutdown') session.closeModelSettingsChanges()
+      else if (transition === 'panel') session.modelPanels.set('panel', { models: [] })
+      else if (transition === 'source') registerTokenSource({ ...source, spawnRevision: 'changed' })
+      else account.mockReturnValue('changed')
+      expect(final.canPresent?.()).toBe(false)
+      let presented = false
+      await modelActionCompletion(Promise.resolve(final), async () => { presented = true })
+      expect(presented).toBe(false)
+      if (transition === 'stop') {
+        const retry = await session.onProviderSelect(source.id, 'panel', true)
+        expect((await retry.completion!).canPresent?.()).toBe(true)
+      }
+    } finally {
+      account.mockRestore(); session.dispose(); resetTokenSourceRegistry()
       for (const entry of previous) registerTokenSource(entry)
     }
   })
@@ -14179,38 +14338,36 @@ describe('Session 开卡/迁移单飞与 SDK-input claims(上游 7c14677 主题 
       await cardkit.dispose(session.currentTurn.cardId)
     }
   })
-
-  test('迁移窗口内新终态 entry 不未画先删:快照在 flush 后取,只移除已画入历史的终态', async () => {
-    const session = new Session('probe', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'claude-session-1')
-    session.proc = proc
-    session.selectedProvider = 'claude'
-    session.wireProc(proc)
-    const now = Date.now()
-    session.backgroundTasks = [
-      { id: 'painted', type: 'shell', description: 'done early', status: 'completed', startedAt: now - 9000, endTime: now - 1000, steps: [] },
-      { id: 'late-terminal', type: 'shell', description: 'finishes mid-migration', status: 'running', startedAt: now - 5000, steps: [] },
-    ]
-    session.backgroundCard = { messageId: 'om_bg_migrate_race', cardId: 'card_bg_migrate_race' }
-    session.backgroundDetailAdded = new Set(['painted', 'late-terminal'])
-    cardkit.recordCardCreated('card_bg_migrate_race', 2)
-    // 历史快照 updateCard 的 await 窗口内:活跃任务转终态
-    feishuMockState.updateCard = async (messageId: string) => {
-      if (messageId !== 'om_bg_migrate_race') return
-      feishuMockState.updateCard = null
-      proc.emit('bg_task_settled', { task_id: 'late-terminal', status: 'completed' })
+  test("迁移窗口内新终态 entry 不未画先删:快照在 flush 后取,只移除已画入历史的终态", async () => {
+    const session = new Session('shared-background-owner-race', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-owner')
+    session.proc = oldProc
+    session.backgroundTasks = [makeRunningTask('captured-old-active')]
+    let entered!: () => void
+    let release!: () => void
+    const admission = new Promise<void>(r => { entered = r })
+    const gate = new Promise<void>(r => { release = r })
+    const writes: any[][] = []
+    session.agentCards = {
+      syncBackground: async (_chat: string, _owner: string, rows: any[]) => { writes.push(rows); entered(); await gate },
+      releaseBackground: () => {},
     }
-
-    await session.migrateBackgroundCard()
-
-    // 已画入快照的 painted 被移除;窗口内新终态 late-terminal 保留(未画入,
-    // 由重建卡补墓碑)——旧代码在这里把它连同快照外状态一起删掉
-    expect(session.backgroundTasks.map((t: any) => t.id)).toEqual(['late-terminal'])
-    expect(session.backgroundTasks[0].status).toBe('completed')
-    // 迁移期冻结:settle 未对旧卡二次 updateCard(仅历史快照一次)
-    expect(updatedCards.filter(([id]) => id === 'om_bg_migrate_race')).toHaveLength(1)
-    // 冻结事件换来的重建收据在位(主卡落地/失败路径消费)
-    expect(session.pendingRebuildBackgroundCard).toBe(true)
+    const lease = session.beginLifecycle('stop')
+    const pending = true ? session.resetBackgroundTasks(lease) : session.refreshBackgroundCardFull()
+    await admission
+    const newerLease = session.beginLifecycle('hi')
+    const newerProc = new FakeAgentProc('claude', 'new-owner')
+    session.proc = newerProc
+    const newer = [makeRunningTask('new-active')]
+    session.backgroundTasks = newer
+    release()
+    await pending
+    expect(session.lifecycleOwner).toBe(newerLease)
+    expect(session.proc).toBe(newerProc)
+    expect(session.backgroundTasks).toBe(newer)
+    expect(writes[0][0].id).toBe('captured-old-active')
+    expect(writes[0][0].status).toBe(true ? 'killed' : 'running')
+    session.dispose()
   })
 
   test('SDK-input claim 被 init 边界认领:task-notification init 不再开 inputs=0 空卡', async () => {
@@ -14263,231 +14420,6 @@ describe('Session 开卡/迁移单飞与 SDK-input claims(上游 7c14677 主题 
       session.stopFooterStatus(session.currentTurn)
       await cardkit.dispose(session.currentTurn.cardId)
     }
-  })
-})
-
-describe('Session claude 子 agent 工具调用不上主卡(上游 89a04d7)', () => {
-  // 对齐 codex 侧 isSubagentThread 分流(cf41941):claude 子 agent 的工具调用按
-  // parentToolUseId 归属后台 task,只累积进 steps(后台卡展开可见),不上主卡
-  // 面板 —— 主卡只承载主 agent,多 agent 期间面板数不爆表。
-  function claudeSubagentFixture(cardId: string): { session: any; proc: FakeAgentProc } {
-    const session = new Session('probe', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'claude-session-1')
-    session.proc = proc
-    session.wireProc(proc)
-    session.currentTurn = turnState(cardId, { provider: 'claude', model: 'claude:glm', usageSource: 'glm' })
-    cardkit.recordCardCreated(cardId, 1)
-    return { session, proc }
-  }
-
-  test('子 agent tool_use/tool_result 只进 bg steps,不 addTool/completeTool 上主卡', async () => {
-    const { session, proc } = claudeSubagentFixture('card_subagent_iso')
-    try {
-      // 主线程 Task tool_use 触发子 agent → bg task 建立(toolUseId 关联)
-      proc.emit('tool_use', { id: 'task_main_1', name: 'Task', input: { description: 'review' }, parentToolUseId: null })
-      proc.emit('bg_task_started', { task_id: 't1', tool_use_id: 'task_main_1', description: 'review' })
-      // 子 agent 内的工具调用:parentToolUseId 指向主线程 Task
-      proc.emit('tool_use', { id: 'sub_read_1', name: 'Read', input: { file_path: '/tmp/a.ts' }, parentToolUseId: 'task_main_1' })
-      proc.emit('tool_result', { tool_use_id: 'sub_read_1', content: 'file body', is_error: false, parentToolUseId: 'task_main_1' })
-
-      // steps 已累积(含结果回填)
-      const t1 = session.backgroundTasks.concat(session.pendingBgTasks).find((t: any) => t.id === 't1')
-      expect(t1).toBeDefined()
-      expect(t1.steps.length).toBe(1)
-      expect(t1.steps[0].tool).toBe('Read')
-      expect(t1.steps[0].brief).toContain('→ file body')
-      // 主卡 toolByUseId 不含子 agent 工具 —— 没走 addTool/completeTool
-      expect(session.currentTurn.toolByUseId.has('sub_read_1')).toBe(false)
-      // 合并调和(取舍):合并实现并入上游 89a04d7 原生委派面板模型 —— 主线程
-      // Task/Agent tool_use 直接建立委派 task(启动工具也归入委派面板,不上
-      // 主卡),SDK task id 经 tool_use_id 回填合并后仍只有一项。本地旧接线
-      // (Task 照常 addTool 上主卡)是 89a04d7 落地前的形态,已被上游语义取代。
-      expect(session.currentTurn.toolByUseId.has('task_main_1')).toBe(false)
-      expect(session.backgroundTasks).toHaveLength(1)
-      await cardkit.flush('card_subagent_iso')
-    } finally {
-      session.stopFooterStatus(session.currentTurn)
-      // 合并取舍:上游 closeChat 属 agentCards 共享卡子系统(未并入定型
-      // session.ts);本地 resetBackgroundTasks 已清后台句柄,无需 closeChat。
-      await session.resetBackgroundTasks()
-      await cardkit.dispose('card_subagent_iso')
-    }
-  })
-
-  test('DSH 子工具返回内容块时不抛异常，也不写入主对话卡', async () => {
-    const session = new Session('probe', 'chat_id') as any
-    const proc = new FakeAgentProc('dsh', 'dsh-session')
-    session.proc = proc
-    session.wireProc(proc)
-    session.currentTurn = turnState('card_dsh_child_blocks')
-    cardkit.recordCardCreated('card_dsh_child_blocks', 1)
-    try {
-      proc.emit('bg_task_started', { task_id: 'child', tool_use_id: 'child', description: 'DSH child', task_type: 'agent' })
-      proc.emit('tool_use', { id: 'child-bash', name: 'Bash', input: { command: 'echo child' }, parentToolUseId: 'child' })
-      expect(() => proc.emit('tool_result', { tool_use_id: 'child-bash', content: [{ type: 'text', text: 'started background job bash-1' }],
-        is_error: false, parentToolUseId: 'child' })).not.toThrow()
-      const child = [...session.backgroundTasks, ...session.pendingBgTasks].find((entry: any) => entry.id === 'child')
-      expect(child.steps[0].brief).toContain('started background job bash-1')
-      expect(session.currentTurn.toolByUseId.has('child-bash')).toBe(false)
-      expect(proc.isAlive()).toBe(true)
-    } finally {
-      session.stopFooterStatus(session.currentTurn)
-      await session.resetBackgroundTasks()
-      // 合并取舍:上游 closeChat 属 agentCards 共享卡子系统(未并入定型
-      // session.ts);本地 resetBackgroundTasks 已清后台句柄,无需 closeChat。
-      await cardkit.dispose('card_dsh_child_blocks')
-    }
-  })
-
-  test('子 agent assistant text/block_stop 不进入主卡,主 agent 正文仍正常渲染', async () => {
-    const session = new Session('probe', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'claude-session-1')
-    session.proc = proc
-    session.wireProc(proc)
-    session.currentTurn = turnState('card_subagent_text_iso')
-    cardkit.recordCardCreated('card_subagent_text_iso', 1)
-
-    try {
-      proc.emit('assistant_text', {
-        text: '我将并行开展多轮搜索来收集证据。',
-        parentToolUseId: 'task_main_1',
-      })
-      proc.emit('assistant_block_stop', {
-        index: 'assistant_child_1',
-        parentToolUseId: 'task_main_1',
-      })
-
-      expect(session.currentTurn.assistantSegmentCount).toBe(0)
-      expect(session.currentTurn.segmentTexts.size).toBe(0)
-
-      proc.emit('assistant_text', { text: '这是主 Agent 的结论。', parentToolUseId: null })
-      proc.emit('assistant_block_stop', { index: 'assistant_main_1', parentToolUseId: null })
-      await cardkit.flush('card_subagent_text_iso')
-
-      expect(session.currentTurn.assistantSegmentCount).toBe(1)
-      expect([...session.currentTurn.segmentTexts.values()]).toEqual(['这是主 Agent 的结论。'])
-      expect(calls.some(call =>
-        call.method === 'POST' &&
-        call.path === '/cards/card_subagent_text_iso/elements' &&
-        String(call.body?.elements ?? '').includes('我将并行开展多轮搜索')
-      )).toBe(false)
-    } finally {
-      session.stopFooterStatus(session.currentTurn)
-      await cardkit.dispose('card_subagent_text_iso')
-    }
-  })
-
-  test('parentToolUseId 无归属 task 的 tool_use(如合成 AskUserQuestion)仍走主卡', async () => {
-    const { session, proc } = claudeSubagentFixture('card_subagent_orphan')
-    try {
-      proc.emit('tool_use', { id: 'orphan_1', name: 'Bash', input: { command: 'echo hi' }, parentToolUseId: 'unknown_parent' })
-      expect(session.currentTurn.toolByUseId.has('orphan_1')).toBe(true)
-      // 孤儿 tool_result 也照常 completeTool 回填主卡面板
-      proc.emit('tool_result', { tool_use_id: 'orphan_1', content: 'hi', is_error: false, parentToolUseId: 'unknown_parent' })
-      expect(session.currentTurn.toolByUseId.get('orphan_1').output).toBe('hi')
-      await cardkit.flush('card_subagent_orphan')
-    } finally {
-      session.stopFooterStatus(session.currentTurn)
-      await cardkit.dispose('card_subagent_orphan')
-    }
-  })
-
-  test('parentToolUseId 为 null 的主线程工具行为与现状一致(addTool/completeTool + Task id 记录)', async () => {
-    const { session, proc } = claudeSubagentFixture('card_subagent_mainline')
-    try {
-      proc.emit('tool_use', { id: 'main_bash_1', name: 'Bash', input: { command: 'pwd' }, parentToolUseId: null })
-      expect(session.currentTurn.toolByUseId.has('main_bash_1')).toBe(true)
-      proc.emit('tool_result', { tool_use_id: 'main_bash_1', content: '/tmp', is_error: false, parentToolUseId: null })
-      expect(session.currentTurn.toolByUseId.get('main_bash_1').output).toBe('/tmp')
-      // 主线程 Task tool_use 记录 lastMainTaskToolUseId(task_started 缺 tool_use_id 时兜底关联)
-      proc.emit('tool_use', { id: 'main_task_1', name: 'Task', input: { description: 'spawn' }, parentToolUseId: null })
-      expect(session.lastMainTaskToolUseId).toBe('main_task_1')
-      // 合并调和(取舍):合并实现并入上游原生委派面板模型 —— 主线程 Task
-      // tool_use 即建立 subagent 委派项(toolUseId 关联,等 SDK task id 回填);
-      // 普通主线程工具(Bash)不产生任何 bg 项,addTool/completeTool 行为不变。
-      expect(session.backgroundTasks).toHaveLength(1)
-      expect(session.backgroundTasks[0]).toMatchObject({
-        id: 'main_task_1', toolUseId: 'main_task_1', type: 'subagent', isBackgrounded: true,
-      })
-      expect(session.pendingBgTasks).toEqual([])
-      await cardkit.flush('card_subagent_mainline')
-    } finally {
-      session.stopFooterStatus(session.currentTurn)
-      await session.resetBackgroundTasks()
-      await cardkit.dispose('card_subagent_mainline')
-    }
-  })
-})
-
-describe('Session codex 子 agent 后台游标卡接线(上游 cf41941)', () => {
-  function codexBgFixture(): { session: any; proc: FakeAgentProc } {
-    const session = new Session('probe', 'chat_id') as any
-    const proc = new FakeAgentProc('codex', 'codex-session-1')
-    session.proc = proc
-    session.selectedProvider = 'codex'
-    session.wireProc(proc)
-    return { session, proc }
-  }
-
-  test('subagent_step 事件经 cards.applySubagentStep 更新 bg 池,步骤在游标卡可见', () => {
-    const { session, proc } = codexBgFixture()
-    // 预置活卡句柄:避免本测触发 openBackgroundCard 的 await 链在测试结束后
-    // 撞原始 fetch(挂账第 2 项已知模式);本测只锁 store 累积语义。
-    session.backgroundCard = { messageId: 'om_bg_steps', cardId: 'card_bg_steps' }
-    proc.emit('bg_task_started', { task_id: 'sub-1', task_type: 'local_agent', description: 'worker' })
-    proc.emit('bg_task_updated', { task_id: 'sub-1', patch: { is_backgrounded: true } })
-
-    // wire 形态与 codex-process emitSubagentStep 一致:brief 不带工具名前缀
-    // (applySubagentStep 在 started 时自己拼 `${tool} ${brief}`)。
-    proc.emit('subagent_step', { thread_id: 'sub-1', item_id: 'cmd-1', tool: 'Bash', phase: 'started', brief: 'bun test' })
-    proc.emit('subagent_step', { thread_id: 'sub-1', item_id: 'cmd-1', tool: undefined, phase: 'completed', brief: '→ 12 pass' })
-
-    const t = session.backgroundTasks.find((x: any) => x.id === 'sub-1')
-    expect(t).toBeDefined()
-    expect(t.steps).toHaveLength(1)
-    expect(t.steps[0].brief).toBe('Bash bun test → 12 pass')
-
-    // 未知 thread(先于 started 到达的极早期)丢弃,不产生新 entry。
-    proc.emit('subagent_step', { thread_id: 'sub-nope', item_id: 'x-1', tool: 'Bash', phase: 'started', brief: 'x' })
-    expect(session.backgroundTasks.some((x: any) => x.id === 'sub-nope')).toBe(false)
-    expect(session.pendingBgTasks).toEqual([])
-    // 收尾:卸下预置句柄走纯内存清理分支,防 afterEach dispose 的 settle
-    // continuation 在 fetch 复原后撞真实 API(挂账第 2 项既有模式,不新增)。
-    session.backgroundCard = null
-  })
-
-  test('codex 子 agent bg_task_settled 不置位 bgResumePending(结果由主 turn 收编,不自发开轮)', () => {
-    const { session, proc } = codexBgFixture()
-    session.initCount = 1
-    expect(session.currentTurn).toBeNull()
-
-    proc.emit('bg_task_settled', { task_id: 'tx', status: 'completed' })
-
-    expect(session.bgResumePending).toBe(false)
-  })
-
-  test('claude 子 agent bg_task_settled 行为不变:仍置位 bgResumePending(SDK 自发恢复轮)', () => {
-    const session = new Session('probe', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'claude-session-1')
-    session.proc = proc
-    session.selectedProvider = 'claude'
-    session.wireProc(proc)
-    session.initCount = 1
-
-    proc.emit('bg_task_settled', { task_id: 'tx', status: 'completed' })
-
-    expect(session.bgResumePending).toBe(true)
-  })
-
-  test('开卡落地后复查:await 窗口内全部终态(短命 agent)→ 直接沉降,活卡不僵死(#9)', async () => {
-    const { session, proc } = codexBgFixture()
-    // start 与 settle 同批到达:settle 那刻 backgroundCard 还是 null(开卡在 await),
-    // 沉降空转 —— 落地后必须复查,否则活卡带终态快照永不 settle。
-    proc.emit('bg_task_started', { task_id: 'st-1', task_type: 'local_agent', description: 'short-lived' })
-    proc.emit('bg_task_settled', { task_id: 'st-1', status: 'completed', summary: 'done' })
-
-    await waitFor(() => session.backgroundCard === null && session.backgroundTasks.length === 0)
-    expect(session.openingBackground).toBe(false)
   })
 })
 
@@ -14557,7 +14489,7 @@ describe('Session usage cache cross-backend isolation', () => {
     expect(peekUsage()).toBe(seeded)
   })
 
-  test('codex 的 rate_limits_updated 只观察不写缓存(权威在 read 端点)', () => {
+  test('codex 的 rate_limits_updated 不直接写缓存(权威在 read 端点)', () => {
     const session = new Session('probe', 'chat_id') as any
     const codexProc = new FakeAgentProc('codex')
     session.proc = codexProc
@@ -14567,12 +14499,53 @@ describe('Session usage cache cross-backend isolation', () => {
       primary: { usedPercent: 7, resetsAt: 1_700_000_000, windowDurationMins: 300 },
     })
 
-    // rolling 通知不再驱动 cache —— 2026-08-20 源码核实 codex 解析器在
-    // 上游缺 metered_limit_name 时把 limitId 强补 "codex",通知归属不可信;
-    // turn 收尾由 closeTurnCard 在现有连接 read 端点整体刷新。
+    // Rolling payloads are not authoritative; the live reader uses them only
+    // as a signal to reread the complete account snapshot on its connection.
     const snap = peekUsage() as any
     expect(snap?.fiveHour?.percent).not.toBe(7)
   })
+
+  for (const relogin of [false, true]) {
+    test(`Codex final footer waits for live quota and preserves its captured login generation (relogin=${relogin})`, async () => {
+      const liveUsage = await import('./codex-live-usage')
+      const { bindProcessCodexAccount } = await import('./codex-accounts')
+      const { captureCodexUsageCache } = await import('./usage')
+      invalidateCodexUsage('default')
+      const raw = (percent: number) => ({ rateLimits: { primary: {
+        usedPercent: percent, windowDurationMins: 300, resetsAt: Math.floor(Date.now() / 1000) + 3600,
+      } } })
+      await refreshUsageFromConnection(async () => raw(10))
+      const captured = captureCodexUsageCache('default')
+      const session = new Session('live-footer', 'chat_id') as any
+      const proc = new FakeAgentProc('codex', 'live-footer', 'codex-sub')
+      bindProcessCodexAccount(proc, 'default')
+      let release!: () => void
+      const gate = new Promise<void>(resolve => { release = resolve })
+      const wait = spyOn(liveUsage, 'waitForLiveCodexUsage').mockImplementation(async account => {
+        expect(account).toBe('default')
+        await gate
+        await refreshUsageFromConnection(async () => raw(27), account, { force: true })
+      })
+      try {
+        let settled = false
+        const pending = session.footerUsageSuffix('codex', proc, null, undefined, captured, 'model')
+          .then((value: string) => { settled = true; return value })
+        await Promise.resolve()
+        expect(settled).toBe(false)
+        expect(wait).toHaveBeenCalledTimes(1)
+        if (relogin) invalidateCodexUsage('default')
+        release()
+        const suffix = await pending
+        expect(suffix).toContain(relogin ? '额度 MISS' : '27%')
+        expect(suffix).not.toContain('10%')
+        await proc.kill()
+        await session.footerUsageSuffix('codex', proc, null, undefined, captured, 'model')
+        expect(wait).toHaveBeenCalledTimes(1)
+      } finally {
+        release(); wait.mockRestore(); await proc.kill(); session.dispose(); invalidateCodexUsage('default')
+      }
+    })
+  }
 
   test('额度后缀保留原紧凑倒计时与百分比格式，缺失值显示 MISS', () => {
     const session = new Session('probe', 'chat_id') as any
@@ -14679,221 +14652,6 @@ describe('Session usage cache cross-backend isolation', () => {
 function makeRunningTask(id: string): any {
   return { id, type: 'shell', description: `bg ${id}`, status: 'running', startedAt: Date.now() - 5000, steps: [] }
 }
-
-function installConcurrentBackgroundState(session: any, prefix: string): {
-  tasks: any[]
-  pending: any[]
-  card: { messageId: string; cardId: string }
-  details: Set<string>
-  archive: Array<{ id: string; description: string }>
-} {
-  const taskId = `${prefix}-completed`
-  const pendingId = `${prefix}-pending`
-  const tasks = [{
-    ...makeRunningTask(taskId),
-    type: 'subagent',
-    subagentType: 'verifier',
-    status: 'completed',
-    endTime: Date.now(),
-  }]
-  const pending = [makeRunningTask(pendingId)]
-  const card = { messageId: `om_bg_${prefix}`, cardId: `card_bg_${prefix}` }
-  const details = new Set([taskId])
-  const archive = [{ id: `${prefix}-archive`, description: `${prefix} archive` }]
-  session.backgroundTasks = tasks
-  session.pendingBgTasks = pending
-  session.backgroundCard = card
-  session.backgroundDetailAdded = details
-  session.bgArchive = archive
-  return { tasks, pending, card, details, archive }
-}
-
-describe('Session resetBackgroundTasks on kill/restart', () => {
-  // 复现:SDK 子进程一死就不再发 task_settled,活跃 entry 永远卡 running,
-  // backgroundRefreshTick(不归 SDK 管)还会继续跨档刷新「🟡 运行中」—— 卡片
-  // 永不沉降,伪造「还在跑」。kill(stop)/restart 必须
-  // 主动结算。回归:2026-07-06。
-
-  test('stop() kills proc AND clears running background tasks (public kill path)', async () => {
-    // 用户真实触发路径:kill 命令 → session.stop()。修复前 stop 只杀进程,
-    // 不碰 backgroundTasks,running entry 留在内存 + refresh tick 继续伪造时长。
-    const session = new Session('probe', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'claude-session-1')
-    session.proc = proc
-    session.backgroundTasks = [makeRunningTask('t1'), makeRunningTask('t2')]
-    session.pendingBgTasks = [makeRunningTask('foreground')]
-    // 合并调和:上游经 refreshBackgroundCardFull 自动开共享卡;定型 session.ts
-    // 开卡走本地 openBackgroundCard(refresh 只原地刷新既有卡)—— 显式 await
-    // 本地开卡,等价上游「先建卡,再 stop」的编排意图。
-    await session.openBackgroundCard()
-    session.scheduleBackgroundRefresh()
-
-    await session.stop('已终止', { announce: false })
-
-    expect(proc.killCalls).toBe(1)
-    expect(session.backgroundTasks).toEqual([])
-    expect(session.pendingBgTasks).toEqual([])
-    // 本地无上游 backgroundSync(共享卡写单飞);等价钉:句柄已随沉降清空。
-    expect(session.backgroundCard).toBeNull()
-    expect(session.backgroundRefreshTimer).toBeNull()
-    expect(sentCards).toHaveLength(1)
-    // 上游钉共享卡元素写(PUT body.element);本地终态经整卡墓碑
-    // feishu.updateCard(updatedCards)落地,断言随本地通道迁移 —— 意图不变:
-    // 墓碑含「已终止」、不泄漏 foreground 前台挂单。
-    expect(updatedCards).toHaveLength(1)
-    const tombstone = JSON.stringify(updatedCards[0]![1])
-    expect(tombstone).toContain('已终止')
-    expect(tombstone).not.toContain('foreground')
-    const settings = calls.filter(call => call.path.endsWith('/settings')).at(-1)!
-    expect(JSON.parse(settings.body.settings).config.streaming_mode).toBe(false)
-  })
-
-  test('a main message leaves running work in its original panel', async () => {
-    const session = new Session('probe', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'claude-session-1')
-    session.proc = proc
-    session.backgroundTasks = [makeRunningTask('running')]
-    // 合并调和:上游 refresh 自动开卡、运行期 summary 上共享卡;定型 session.ts
-    // 显式 openBackgroundCard 开卡、refresh 原地 replaceElement(不重发、不整卡
-    // 更新)——意图一致:主消息提交后,运行中的工作留在原卡。变化点改用
-    // steps(本地运行期 panel 的可见通道;上游用 summary),元素写需 flush。
-    await session.openBackgroundCard()
-    await feishu.sendCard('chat_id', { schema: '2.0', body: { elements: [] } })
-    session.backgroundTasks = [{ ...session.backgroundTasks[0], steps: [{ brief: '检查中' }] }]
-    await session.refreshBackgroundCardFull()
-    await cardkit.flush(session.backgroundCard.cardId)
-    expect(sentCards).toHaveLength(2)
-    expect(updatedCards).toHaveLength(0)
-    expect(calls.some(call => call.method === 'PUT' && String(call.body.element).includes('检查中'))).toBe(true)
-    await session.resetBackgroundTasks()
-  })
-
-  test('stop waits for an admitted open, settles it, and namespaces a later process', async () => {
-    // 合并调和:上游为共享卡体系(reset await 在途 admitted open、同卡元素
-    // 世代命名空间,开卡等待由 backgroundSync 单飞)。定型 session.ts 保留本地
-    // 语义:开卡 fire-and-forget + 世代号作废 —— reset 不等开卡,在途旧开卡
-    // 落地后自弃为「世代已切换」墓碑;后续同 id 进程开全新卡(新 message)不
-    // 复用旧卡。意图保留:reset 与在途开卡互不污染、后到进程不撞旧卡状态。
-    const session = new Session('background-open-generation', 'chat_id') as any
-    session.backgroundTasks = [makeRunningTask('same-id')]
-    let release!: () => void
-    const gate = new Promise<void>(resolve => { release = resolve })
-    const baseFetch = globalThis.fetch
-    let converting = false
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      if (new URL(String(input)).pathname.endsWith('/cards/id_convert')) {
-        converting = true
-        await gate
-      }
-      return baseFetch(input, init)
-    }) as typeof fetch
-    try {
-      // 生产同款接线(onBackgroundTaskChanged 开卡分支):世代化开卡不阻塞调用方。
-      session.openingBackground = true
-      const generation = ++session.backgroundOpenGeneration
-      const opening = session.openBackgroundCard(generation).finally(() => {
-        if (session.backgroundOpenGeneration === generation) session.openingBackground = false
-      })
-      await waitUntil(() => converting)
-      const resetting = session.resetBackgroundTasks()
-      release()
-      await Promise.all([opening, resetting])
-      expect(session.backgroundTasks).toEqual([])
-      // 在途旧开卡未被 reset 收养为活卡;而是自弃为「世代已切换」墓碑。
-      expect(session.backgroundCard).toBeNull()
-      expect(calls.some(call => call.path.endsWith('/settings')
-        && String(call.body.settings).includes('后台任务世代已切换'))).toBe(true)
-      session.backgroundTasks = [makeRunningTask('same-id')]
-      await session.openBackgroundCard()
-      // 新世代开新卡(新 message):不复用旧卡即本地形态的「命名空间」。
-      expect(sentCards).toHaveLength(2)
-      expect(session.backgroundCard.messageId).not.toBe('om_status_1')
-    } finally {
-      release()
-      await session.resetBackgroundTasks()
-      globalThis.fetch = baseFetch
-    }
-  })
-
-  test('a failed terminal update remains visible and can be retried without duplicate rows', async () => {
-    // 合并调和:上游经 agentCards.deps.patchSettingsChecked 注入共享卡终态写
-    // 失败;定型 session.ts 无 agentCards 子系统,终态写 = 整卡墓碑
-    // feishu.updateCard(注入缝 feishuMockState.updateCard)。语义保留:reset
-    // 抛出失败、任务先翻 killed;重试不重发卡(行不重复、失败卡仍在原地)。
-    const session = new Session('background-update-failure', 'chat_id') as any
-    session.backgroundTasks = [makeRunningTask('running')]
-    await session.openBackgroundCard()
-    feishuMockState.updateCard = async () => { throw new Error('terminal update MISS') }
-    try {
-      await expect(session.resetBackgroundTasks()).rejects.toThrow('terminal update MISS')
-      expect(session.backgroundTasks[0].status).toBe('killed')
-    } finally { feishuMockState.updateCard = null }
-    await session.resetBackgroundTasks()
-    expect(session.backgroundTasks).toEqual([])
-    expect(sentCards).toHaveLength(1)
-  })
-
-  test('a failed launch is visible in the delegation panel without a main tool panel', async () => {
-    const session = new Session('native-launch-failure', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'claude-session')
-    session.proc = proc
-    session.wireProc(proc)
-    session.currentTurn = turnState('card_failed_child')
-    cardkit.recordCardCreated('card_failed_child', 1)
-    try {
-      proc.emit('tool_use', { id: 'agent-tool', name: 'Agent', input: { description: '检查接口' }, parentToolUseId: null })
-      proc.emit('tool_result', { tool_use_id: 'agent-tool', content: '无法启动子 Agent', is_error: true, parentToolUseId: null })
-      await session.backgroundSync
-      expect(session.currentTurn.toolByUseId.size).toBe(0)
-      expect(session.backgroundTasks).toHaveLength(1)
-      expect(session.backgroundTasks[0].status).toBe('failed')
-      // 合并调和:上游共享卡把失败渲染到开卡卡上并钉 '"子 Agent失败"' 文案;
-      // 定型本地背景卡为独立卡,失败经整卡墓碑(updatedCards)落地,header
-      // 文案为本地 statusLabel '— ❌ 失败'。断言随本地通道,意图不变:失败与
-      // 错误原文可见,且主轮卡上不出现 tool 面板(toolByUseId 保持 0)。
-      await waitUntil(() => session.backgroundCard === null && updatedCards.length > 0)
-      const tombstone = JSON.stringify(updatedCards.at(-1))
-      expect(tombstone).toContain('❌ 失败')
-      expect(tombstone).toContain('无法启动子 Agent')
-    } finally {
-      session.stopFooterStatus(session.currentTurn)
-      await session.resetBackgroundTasks()
-      // 合并取舍:上游 closeChat 属 agentCards 共享卡子系统(未并入定型
-      // session.ts);本地 resetBackgroundTasks 已清后台句柄,无需 closeChat。
-      await cardkit.dispose('card_failed_child')
-    }
-  })
-
-  test('a successful async launch receipt leaves the child running until its native result', async () => {
-    const session = new Session('native-background-receipt', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'claude-session')
-    session.proc = proc
-    session.wireProc(proc)
-    session.currentTurn = turnState('card_async_child')
-    cardkit.recordCardCreated('card_async_child', 1)
-    try {
-      proc.emit('tool_use', { id: 'agent-tool', name: 'Agent', input: { description: '检查接口', run_in_background: true }, parentToolUseId: null })
-      expect(session.currentTurn.footerStatusLabel).toBe('Working...')
-      proc.emit('tool_result', { tool_use_id: 'agent-tool', content: 'Agent launched', is_error: false, parentToolUseId: null })
-      expect(session.currentTurn.footerStatusLabel).toBe('Thinking...')
-      expect(session.backgroundTasks[0].status).toBe('running')
-      proc.emit('bg_task_started', { task_id: 'native-id', tool_use_id: 'agent-tool', description: '检查接口', task_type: 'local_agent' })
-      proc.emit('bg_task_settled', { task_id: 'native-id', status: 'completed', summary: '接口正常' })
-      await session.backgroundSync
-      expect(session.backgroundTasks).toHaveLength(1)
-      expect(session.backgroundTasks[0].status).toBe('completed')
-      expect(session.currentTurn.toolByUseId.size).toBe(0)
-      expect(sentCards).toHaveLength(1)
-      expect(calls.filter(call => call.method === 'POST' && call.path.endsWith('/elements'))).toHaveLength(0)
-    } finally {
-      session.stopFooterStatus(session.currentTurn)
-      await session.resetBackgroundTasks()
-      // 合并取舍:上游 closeChat 属 agentCards 共享卡子系统(未并入定型
-      // session.ts);本地 resetBackgroundTasks 已清后台句柄,无需 closeChat。
-      await cardkit.dispose('card_async_child')
-    }
-  })
-})
 
 describe('Session optional progress presentation', () => {
   test.each(['Bash', 'Read', 'Edit'].flatMap(name => [true, false].map(resultLands => ({ name, resultLands }))))(
@@ -15030,129 +14788,98 @@ describe('Session Claude task live panel (task_board_live)', () => {
       await cardkit.dispose('card_claude_tasks')
     }
   })
-
-  test('stop cleanup cannot clear background state installed by a newer lifecycle during old-card settlement', async () => {
-    const session = new Session('background-stop-cleanup-race', 'chat_id') as any
-    const oldProc = new FakeAgentProc('claude', 'old-background-session')
-    const oldCardPatch = deferCardSettingsPatch('card_bg_old')
+  test("stop cleanup cannot clear background state installed by a newer lifecycle during old-card settlement", async () => {
+    const session = new Session('shared-background-owner-race', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-owner')
     session.proc = oldProc
-    session.status = 'working'
-    session.backgroundTasks = [{
-      ...makeRunningTask('old-active'),
-      type: 'subagent',
-      subagentType: 'executor',
-    }]
-    session.pendingBgTasks = [makeRunningTask('old-pending')]
-    session.backgroundCard = { messageId: 'om_bg_old', cardId: 'card_bg_old' }
-    session.backgroundDetailAdded = new Set(['old-active'])
-    session.bgArchive = [{ id: 'old-archive', description: 'old archive' }]
-    cardkit.recordCardCreated('card_bg_old', 1)
-
-    const stopping = session.stop('background cleanup race', { announce: false })
-    try {
-      await oldCardPatch.entered
-      const newerLease = session.beginLifecycle('hi')
-      const newerProc = new FakeAgentProc('claude', 'new-background-session')
-      session.proc = newerProc
-      session.status = 'working'
-      const newer = installConcurrentBackgroundState(session, 'new')
-      session.openingBackground = true
-
-      oldCardPatch.release()
-      await stopping
-
-      expect(session.lifecycleOwner).toBe(newerLease)
-      expect(session.proc).toBe(newerProc)
-      expect(session.status).toBe('working')
-      expect(session.backgroundTasks).toBe(newer.tasks)
-      expect(session.backgroundTasks.map((task: any) => task.id)).toEqual(['new-completed'])
-      expect(session.pendingBgTasks).toBe(newer.pending)
-      expect(session.pendingBgTasks.map((task: any) => task.id)).toEqual(['new-pending'])
-      expect(session.backgroundCard).toBe(newer.card)
-      expect(session.backgroundDetailAdded).toBe(newer.details)
-      expect(session.backgroundDetailAdded).toEqual(new Set(['new-completed']))
-      expect(session.bgArchive).toBe(newer.archive)
-      expect(session.bgArchive).toEqual([{ id: 'new-archive', description: 'new archive' }])
-      expect(session.openingBackground).toBe(true)
-    } finally {
-      oldCardPatch.restore()
+    session.backgroundTasks = [makeRunningTask('captured-old-active')]
+    let entered!: () => void
+    let release!: () => void
+    const admission = new Promise<void>(r => { entered = r })
+    const gate = new Promise<void>(r => { release = r })
+    const writes: any[][] = []
+    session.agentCards = {
+      syncBackground: async (_chat: string, _owner: string, rows: any[]) => { writes.push(rows); entered(); await gate },
+      releaseBackground: () => {},
     }
+    const lease = session.beginLifecycle('stop')
+    const pending = true ? session.resetBackgroundTasks(lease) : session.refreshBackgroundCardFull()
+    await admission
+    const newerLease = session.beginLifecycle('hi')
+    const newerProc = new FakeAgentProc('claude', 'new-owner')
+    session.proc = newerProc
+    const newer = [makeRunningTask('new-active')]
+    session.backgroundTasks = newer
+    release()
+    await pending
+    expect(session.lifecycleOwner).toBe(newerLease)
+    expect(session.proc).toBe(newerProc)
+    expect(session.backgroundTasks).toBe(newer)
+    expect(writes[0][0].id).toBe('captured-old-active')
+    expect(writes[0][0].status).toBe(true ? 'killed' : 'running')
+    session.dispose()
   })
-
-  test('natural old-card settlement cannot clear a concurrently installed background state', async () => {
-    const session = new Session('background-natural-settle-race', 'chat_id') as any
-    const oldCardPatch = deferCardSettingsPatch('card_bg_natural_old')
-    session.backgroundTasks = [{
-      ...makeRunningTask('old-completed'),
-      type: 'subagent',
-      subagentType: 'executor',
-      status: 'completed',
-      endTime: Date.now(),
-    }]
-    session.backgroundCard = { messageId: 'om_bg_natural_old', cardId: 'card_bg_natural_old' }
-    session.backgroundDetailAdded = new Set(['old-completed'])
-    session.bgArchive = [{ id: 'natural-old-archive', description: 'natural old archive' }]
-    cardkit.recordCardCreated('card_bg_natural_old', 1)
-
-    const settling = session.settleBackgroundCard()
-    try {
-      await oldCardPatch.entered
-      const newer = installConcurrentBackgroundState(session, 'natural-new')
-
-      oldCardPatch.release()
-      await settling
-
-      expect(session.backgroundTasks).toBe(newer.tasks)
-      expect(session.backgroundTasks.map((task: any) => task.id)).toEqual(['natural-new-completed'])
-      expect(session.pendingBgTasks).toBe(newer.pending)
-      expect(session.pendingBgTasks.map((task: any) => task.id)).toEqual(['natural-new-pending'])
-      expect(session.backgroundCard).toBe(newer.card)
-      expect(session.backgroundDetailAdded).toBe(newer.details)
-      expect(session.backgroundDetailAdded).toEqual(new Set(['natural-new-completed']))
-      expect(session.bgArchive).toBe(newer.archive)
-      expect(session.bgArchive).toEqual([{
-        id: 'natural-new-archive',
-        description: 'natural-new archive',
-      }])
-    } finally {
-      oldCardPatch.restore()
+  test("natural old-card settlement cannot clear a concurrently installed background state", async () => {
+    const session = new Session('shared-background-owner-race', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-owner')
+    session.proc = oldProc
+    session.backgroundTasks = [makeRunningTask('captured-old-active')]
+    let entered!: () => void
+    let release!: () => void
+    const admission = new Promise<void>(r => { entered = r })
+    const gate = new Promise<void>(r => { release = r })
+    const writes: any[][] = []
+    session.agentCards = {
+      syncBackground: async (_chat: string, _owner: string, rows: any[]) => { writes.push(rows); entered(); await gate },
+      releaseBackground: () => {},
     }
+    const lease = session.beginLifecycle('stop')
+    const pending = false ? session.resetBackgroundTasks(lease) : session.refreshBackgroundCardFull()
+    await admission
+    const newerLease = session.beginLifecycle('hi')
+    const newerProc = new FakeAgentProc('claude', 'new-owner')
+    session.proc = newerProc
+    const newer = [makeRunningTask('new-active')]
+    session.backgroundTasks = newer
+    release()
+    await pending
+    expect(session.lifecycleOwner).toBe(newerLease)
+    expect(session.proc).toBe(newerProc)
+    expect(session.backgroundTasks).toBe(newer)
+    expect(writes[0][0].id).toBe('captured-old-active')
+    expect(writes[0][0].status).toBe(false ? 'killed' : 'running')
+    session.dispose()
   })
-
-  test('old-card settlement renders its captured killed tasks when flush overlaps newer background state', async () => {
-    const session = new Session('background-captured-history-race', 'chat_id') as any
-    const oldCardPatch = deferCardSettingsPatch('card_bg_captured_old')
-    session.backgroundTasks = [{
-      ...makeRunningTask('captured-old-active'),
-      type: 'subagent',
-      subagentType: 'executor',
-    }]
-    session.backgroundCard = {
-      messageId: 'om_bg_captured_old',
-      cardId: 'card_bg_captured_old',
+  test("old-card settlement renders its captured killed tasks when flush overlaps newer background state", async () => {
+    const session = new Session('shared-background-owner-race', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-owner')
+    session.proc = oldProc
+    session.backgroundTasks = [makeRunningTask('captured-old-active')]
+    let entered!: () => void
+    let release!: () => void
+    const admission = new Promise<void>(r => { entered = r })
+    const gate = new Promise<void>(r => { release = r })
+    const writes: any[][] = []
+    session.agentCards = {
+      syncBackground: async (_chat: string, _owner: string, rows: any[]) => { writes.push(rows); entered(); await gate },
+      releaseBackground: () => {},
     }
-    session.backgroundDetailAdded = new Set(['captured-old-active'])
-    cardkit.recordCardCreated('card_bg_captured_old', 1)
-    const queuedPatch = cardkit.patchSettings('card_bg_captured_old', { config: {} })
-
-    try {
-      await oldCardPatch.entered
-      const resetting = session.resetBackgroundTasks()
-      const newer = installConcurrentBackgroundState(session, 'render-new')
-      oldCardPatch.release()
-      await queuedPatch
-      await resetting
-
-      const historyCard = updatedCards.find(([messageId]) => (
-        messageId === 'om_bg_captured_old'
-      ))?.[1]
-      expect(JSON.stringify(historyCard)).toContain('captured-old-active')
-      expect(JSON.stringify(historyCard)).not.toContain('render-new-completed')
-      expect(session.backgroundTasks).toBe(newer.tasks)
-      expect(session.backgroundCard).toBe(newer.card)
-    } finally {
-      oldCardPatch.restore()
-    }
+    const lease = session.beginLifecycle('stop')
+    const pending = true ? session.resetBackgroundTasks(lease) : session.refreshBackgroundCardFull()
+    await admission
+    const newerLease = session.beginLifecycle('hi')
+    const newerProc = new FakeAgentProc('claude', 'new-owner')
+    session.proc = newerProc
+    const newer = [makeRunningTask('new-active')]
+    session.backgroundTasks = newer
+    release()
+    await pending
+    expect(session.lifecycleOwner).toBe(newerLease)
+    expect(session.proc).toBe(newerProc)
+    expect(session.backgroundTasks).toBe(newer)
+    expect(writes[0][0].id).toBe('captured-old-active')
+    expect(writes[0][0].status).toBe(true ? 'killed' : 'running')
+    session.dispose()
   })
 })
 
@@ -15598,6 +15325,57 @@ describe('Session card outage backpressure', () => {
 })
 
 describe('Session lifecycle reliability', () => {
+  test('explicit restart continuation sends a new request on the restored native conversation', async () => {
+    const session = new Session('daemon-continue-ready', 'chat_id') as any
+    const proc = new FakeAgentProc('codex', 'saved-thread')
+    session.selectedProvider = 'codex'
+    session.selectedTokenSourceId = null
+    session.proc = proc
+    session.lastSessionId = proc.sessionId
+    session.lastSessionRef = { provider: 'codex', sessionId: proc.sessionId, cwd: session.workDir }
+    session.initCount = 1
+    session.status = 'idle'
+    session.spawnAgent = () => { throw new Error('must not spawn another conversation') }
+    try {
+      await session.continueAfterDaemonRestart()
+      expect(proc.sentTexts).toHaveLength(1)
+      expect(proc.sentTexts[0]).toContain('[宿主重启自动续接]')
+      expect(proc.sentTexts[0]).toContain('不要重复已完成的测试或操作')
+      expect(session.lastSessionId).toBe('saved-thread')
+      expect(proc.killCalls).toBe(0)
+      await expect(session.continueAfterDaemonRestart()).rejects.toThrow('未发送自动续接请求')
+      expect(proc.sentTexts).toHaveLength(1)
+    } finally { await session.stop('测试收尾', { announce: false }) }
+  })
+
+  test.each(['quota', 'exited', 'different-thread', 'busy', 'different-source', 'exits-before-send', 'card-open-failed'])(
+    'restart continuation never opens a fresh conversation or queues into an unavailable one: %s', async reason => {
+      const session = new Session(`daemon-continue-${reason}`, 'chat_id') as any
+      const proc = new FakeAgentProc('codex', 'saved-thread')
+      session.selectedProvider = 'codex'
+      session.selectedTokenSourceId = null
+      session.proc = proc
+      session.lastSessionId = proc.sessionId
+      session.lastSessionRef = { provider: 'codex', sessionId: proc.sessionId, cwd: session.workDir }
+      session.initCount = 1
+      session.status = 'idle'
+      if (reason === 'quota') { session.daemonRestoreRequired = true; session.status = 'starting' }
+      if (reason === 'exited') proc.alive = false
+      if (reason === 'different-thread') proc.sessionId = 'another-thread'
+      if (reason === 'busy') session.pendingUserMessageCount = 1
+      if (reason === 'different-source') session.selectedTokenSourceId = 'other-source'
+      if (reason === 'exits-before-send') session.stopIdleMismatchedProcessUnlocked = async () => { proc.alive = false }
+      if (reason === 'card-open-failed') session.openTurnCard = async () => null
+      session.spawnAgent = () => { throw new Error('must not spawn another conversation') }
+      try {
+        await expect(session.continueAfterDaemonRestart()).rejects.toThrow('未发送')
+        expect(proc.sentTexts).toEqual([])
+        expect(session.pendingMidTurnMsgs).toEqual([])
+        expect(session.lastSessionId).toBe('saved-thread')
+      } finally { session.proc = null; session.dispose() }
+    },
+  )
+
   test('daemon recovery finishes the saved thread initialization before delivering a queued message', async () => {
     const session = new Session('daemon-restore-input', 'chat_id') as any
     const ref = { provider: 'codex' as const, sessionId: 'saved-thread', cwd: session.workDir }
@@ -16795,7 +16573,7 @@ describe('Session lifecycle reliability', () => {
       previousSessionId: 'previous-session',
     }
     modelSelections.set(pendingName, {
-      provider: 'claude', model: 'claude-opus-4-6', effort: 'high', tokenSourceId: 'claude-native',
+      provider: 'claude', model: 'claude-opus-4-6', effort: 'high', tokenSourceId: 'claude-sub',
     })
     resumeRefs.set(`${pendingName}:claude`, {
       provider: 'claude', sessionId: 'previous-session', cwd: pendingCwd,
@@ -16814,7 +16592,7 @@ describe('Session lifecycle reliability', () => {
       previousSessionId: 'previous-session',
     }
     modelSelections.set(materializedName, {
-      provider: 'claude', model: 'claude-opus-4-6', effort: 'high', tokenSourceId: 'claude-native',
+      provider: 'claude', model: 'claude-opus-4-6', effort: 'high', tokenSourceId: 'claude-sub',
     })
     resumeRefs.set(`${materializedName}:claude`, {
       provider: 'claude', sessionId: 'new-materialized-session', cwd: materializedCwd,
@@ -17527,94 +17305,6 @@ describe('bk (back) — 命令阶段不预停(上游 ff44afb)', () => {
   })
 })
 
-describe('Session warm-resume 工程师续跑感知(已结算 agent 档案复活)', () => {
-  // 2026-07-08 事故:pokemon 群主 agent 用 SendMessage 热续跑刚完成的工程师
-  // ("was stopped (completed); resumed it"),SDK 不重发 task_started,只在最终
-  // 完成时来一条 task_notification。卡沉降已清池 → unknown no-op → 续跑 6 分钟
-  // 全程飞书无任何状态。冷续跑("resumed from transcript")会重发 task_started,
-  // 不受影响。
-  async function waitFor(cond: () => boolean, ms = 2000): Promise<void> {
-    const t0 = Date.now()
-    while (!cond()) {
-      if (Date.now() - t0 > ms) throw new Error('waitFor timeout')
-      await new Promise(resolve => setTimeout(resolve, 5))
-    }
-  }
-
-  function wiredClaudeSession(): { session: any; proc: any } {
-    const session = new Session('probe', 'chat_id') as any
-    const proc = new FakeAgentProc('claude', 'claude-session-1')
-    session.proc = proc
-    session.selectedProvider = 'claude'
-    session.wireProc(proc)
-    return { session, proc }
-  }
-
-  /** 走完一轮正常生命周期:started → 开卡 → settled → 卡沉降清池(档案应留名片)。 */
-  async function runAgentToSettled(session: any, proc: any): Promise<void> {
-    proc.emit('bg_task_started', {
-      task_id: 'ag1', task_type: 'local_agent', subagent_type: 'client-engineer',
-      tool_use_id: 'tu1', description: '稀有度钳制下沉实施',
-    })
-    await waitFor(() => session.backgroundCard !== null)
-    proc.emit('bg_task_settled', { task_id: 'ag1', status: 'completed' })
-    await waitFor(() => session.backgroundTasks.length === 0 && session.backgroundCard === null)
-  }
-
-  test('卡沉降清池后档案留有 agent 名片;热续跑只来终态 → 补发一次性墓碑卡', async () => {
-    const { session, proc } = wiredClaudeSession()
-    await runAgentToSettled(session, proc)
-
-    expect(session.bgArchive).toHaveLength(1)
-    expect(session.bgArchive[0]).toMatchObject({ id: 'ag1', subagentType: 'client-engineer' })
-
-    const cardsBefore = sentCards.length
-    // 热续跑:运行期零事件,只有最终 task_notification
-    proc.emit('bg_task_settled', {
-      task_id: 'ag1', status: 'completed',
-      usage: { total_tokens: 100, tool_uses: 5, duration_ms: 360_000 },
-    })
-    await waitFor(() => sentCards.length === cardsBefore + 1)
-
-    const tombstone = JSON.stringify(sentCards[sentCards.length - 1])
-    expect(tombstone).toContain('client-engineer(续跑)')
-    expect(tombstone).toContain('已结束')
-    // 一次性卡不留活卡句柄、不占池
-    expect(session.backgroundCard).toBeNull()
-    expect(session.backgroundTasks).toEqual([])
-  })
-
-  test('未知且不在档案的 settle 维持 no-fallback(前台噪音不回归)', async () => {
-    const { session, proc } = wiredClaudeSession()
-    proc.emit('bg_task_settled', { task_id: 'ghost', status: 'completed' })
-    await new Promise(resolve => setTimeout(resolve, 30))
-    expect(sentCards.length).toBe(0)
-    expect(session.backgroundTasks).toEqual([])
-  })
-
-  test('热续跑运行期来了 task_updated → 以「续跑」running 条目复活并重开活卡,再 settle 走正常沉降', async () => {
-    const { session, proc } = wiredClaudeSession()
-    await runAgentToSettled(session, proc)
-
-    const cardsBefore = sentCards.length
-    proc.emit('bg_task_updated', { task_id: 'ag1', patch: { status: 'running' } })
-    await waitFor(() => session.backgroundCard !== null)
-
-    expect(session.backgroundTasks).toHaveLength(1)
-    expect(session.backgroundTasks[0]).toMatchObject({ id: 'ag1', status: 'running', resumed: true, type: 'subagent' })
-    const liveCard = JSON.stringify(sentCards[sentCards.length - 1])
-    expect(sentCards.length).toBe(cardsBefore + 1)
-    expect(liveCard).toContain('client-engineer(续跑)')
-
-    // 复活后的正常结算:走已知 task 沉降路径,不再发一次性卡
-    proc.emit('bg_task_settled', { task_id: 'ag1', status: 'completed' })
-    await waitFor(() => session.backgroundTasks.length === 0 && session.backgroundCard === null)
-    expect(sentCards.length).toBe(cardsBefore + 1)
-    // 再次清池后名片仍在档案里,支持同一工程师第二次续跑
-    expect(session.bgArchive.some((a: any) => a.id === 'ag1')).toBe(true)
-  })
-})
-
 describe('isCodexCapacityError', () => {
   test('matches serverOverloaded capacity messages', () => {
     expect(isCodexCapacityError('Selected model is at capacity. Please try a different model.')).toBe(true)
@@ -17989,6 +17679,7 @@ describe('Session conversation launch 数据流(上游 ff44afb 簇 1)', () => {
 
   test('spawnAgent 将 claude fork launch 翻译为 resumeSessionId/resumeSessionAt/forkSession 三参', () => {
     const session = new Session('claude-fork-translate', 'chat_id') as any
+    prepareNativeSource(session)
     session.selectedProvider = 'claude'
     const source = { provider: 'claude', sessionId: 'source-session', cwd: session.workDir }
     session.pendingConversationLaunch = {
@@ -18010,6 +17701,7 @@ describe('Session conversation launch 数据流(上游 ff44afb 簇 1)', () => {
 
   test('spawnAgent 无 pending intent 时 fresh;lease 不符的 intent 不消费(lease 归属检查)', () => {
     const session = new Session('claude-launch-lease', 'chat_id') as any
+    prepareNativeSource(session)
     session.selectedProvider = 'claude'
 
     const fresh = session.spawnAgent(undefined, 'claude') as any
@@ -19368,71 +19060,36 @@ describe('Session 簇 3 竞态甄别(上游 ff44afb 簇 3——五域代表例,0
       await cardkit.dispose(oldTurn.cardId)
     }
   })
-
-  // 红因(首跑):openBackgroundCard 落地无世代校验——reset 后晚到的旧 convert 把
-  // card_bg_old 安装为活卡(日志 'background card opened cardId=card_bg_old
-  // tasks=1'),其 finally 还清掉新开卡的 openingBackground 标记;旧卡永不终态化
-  // (PATCH settings 等待超时)。
-  // 收账(Task 2):backgroundOpenGeneration 世代化(开卡捕获/reset 作废/晚到自弃
-  // 终态化,完整 owner 结构不移植);转绿。
-  test('an old background open cannot revive after reset or clear a newer opening owner(甄别来源=ff44afb 簇 3:BackgroundOpenOwner)', async () => {
-    const session = new Session('background-open-generation', 'chat_id') as any
-    session.backgroundTasks = [makeRunningTask('old')]
-
-    let releaseOldConvert: () => void = () => {}
-    const oldConvertGate = new Promise<void>(resolve => { releaseOldConvert = resolve })
-    let releaseNewConvert: () => void = () => {}
-    const newConvertGate = new Promise<void>(resolve => { releaseNewConvert = resolve })
-    let convertCount = 0
-    const baseFetch = globalThis.fetch
-    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
-      const url = new URL(String(input))
-      if (url.pathname.endsWith('/cards/id_convert')) {
-        const n = ++convertCount
-        if (n === 1) await oldConvertGate
-        if (n === 2) await newConvertGate
-        return new Response(JSON.stringify({ code: 0, data: { card_id: n === 1 ? 'card_bg_old' : 'card_bg_new' } }), {
-          headers: { 'Content-Type': 'application/json' },
-        })
-      }
-      return baseFetch(input, init)
-    }) as typeof fetch
-
-    try {
-      session.onBackgroundTaskChanged()
-      await waitUntil(() => convertCount === 1)
-
-      await session.resetBackgroundTasks()
-      expect(session.backgroundCard).toBeNull()
-      expect(session.openingBackground).toBe(false)
-
-      session.backgroundTasks = [makeRunningTask('new')]
-      session.onBackgroundTaskChanged()
-      await waitUntil(() => convertCount === 2)
-
-      releaseOldConvert()
-      // 旧开卡晚到落地必须被终态化(streamingOff PATCH),不得复活为活卡。
-      await waitUntil(() => calls.some(call =>
-        call.method === 'PATCH' && call.path === '/cards/card_bg_old/settings'
-      ))
-      expect(session.backgroundCard).toBeNull()
-      expect(session.openingBackground).toBe(true)
-
-      releaseNewConvert()
-      await waitUntil(() => session.backgroundCard?.cardId === 'card_bg_new' && !session.openingBackground)
-      expect(session.backgroundTasks.map((task: any) => task.id)).toEqual(['new'])
-    } finally {
-      releaseOldConvert()
-      releaseNewConvert()
-      session.stopBackgroundRefreshTick()
-      if (session.backgroundRefreshTimer) clearTimeout(session.backgroundRefreshTimer)
-      session.backgroundRefreshTimer = null
-      const cardId = session.backgroundCard?.cardId
-      session.backgroundCard = null
-      session.backgroundTasks = []
-      if (cardId) await cardkit.dispose(cardId)
-      globalThis.fetch = baseFetch
+  test("an old background open cannot revive after reset or clear a newer opening owner(甄别来源=ff44afb 簇 3:BackgroundOpenOwner)", async () => {
+    const session = new Session('shared-background-owner-race', 'chat_id') as any
+    const oldProc = new FakeAgentProc('claude', 'old-owner')
+    session.proc = oldProc
+    session.backgroundTasks = [makeRunningTask('captured-old-active')]
+    let entered!: () => void
+    let release!: () => void
+    const admission = new Promise<void>(r => { entered = r })
+    const gate = new Promise<void>(r => { release = r })
+    const writes: any[][] = []
+    session.agentCards = {
+      syncBackground: async (_chat: string, _owner: string, rows: any[]) => { writes.push(rows); entered(); await gate },
+      releaseBackground: () => {},
     }
+    const lease = session.beginLifecycle('stop')
+    const pending = true ? session.resetBackgroundTasks(lease) : session.refreshBackgroundCardFull()
+    await admission
+    const newerLease = session.beginLifecycle('hi')
+    const newerProc = new FakeAgentProc('claude', 'new-owner')
+    session.proc = newerProc
+    const newer = [makeRunningTask('new-active')]
+    session.backgroundTasks = newer
+    release()
+    await pending
+    expect(session.lifecycleOwner).toBe(newerLease)
+    expect(session.proc).toBe(newerProc)
+    expect(session.backgroundTasks).toBe(newer)
+    expect(writes[0][0].id).toBe('captured-old-active')
+    expect(writes[0][0].status).toBe(true ? 'killed' : 'running')
+    session.dispose()
   })
 
   test('an obsolete main-card open cannot replace a newer process turn or clear its opening owner(甄别来源=ff44afb 簇 3:terminalizeSupersededCard)', async () => {
@@ -19534,6 +19191,7 @@ describe('Session delegated-agent capability and cancel', () => {
 
   test('spawnAgent injects LODESTAR_AGENT_* hostEnv into Claude process', () => {
     const session = new Session('spawn-hostenv', 'chat_id') as any
+    prepareNativeSource(session)
     session.selectedProvider = 'claude'
     const proc = session.spawnAgent()
     expect(proc.opts.hostEnv.LODESTAR_AGENT_URL).toMatch(/^http:\/\//)
@@ -19656,6 +19314,26 @@ describe('Session DSH backend wiring (upstream 722e45a)', () => {
     expect(session.pendingMidTurnMsgs).toEqual([])
     expect(session.pendingUserMessageCount).toBe(1)
     expect(session.ackedHumanDelivery?.turn).toBe(session.currentTurn)
+  })
+
+  test('DSH settled result releases acknowledged human delivery before a later process exit', async () => {
+    const { session, proc } = pendingHumanDrainFixture('dsh')
+    expect(await session.drainMidTurnAndOpen()).toBe('committed')
+    expect(session.ackedHumanDelivery).not.toBeNull()
+    const sent = proc.sentTexts.slice()
+    proc.lastResult = { ...proc.lastResult, subtype: 'success', is_error: false }
+    proc.emit('result', { subtype: 'success', is_error: false, duration_ms: 1 })
+    await session.waitForTurnCloses()
+    expect(session.ackedHumanDelivery).toBeNull()
+    expect(session.pendingHumanDelivery).toBeNull()
+    expect(session.currentTurn).toBeNull()
+    proc.alive = false
+    proc.emit('exit', { code: 0, signal: null, expected: true })
+    await Promise.resolve()
+    expect(session.pendingMidTurnMsgs).toEqual([])
+    expect(session.restoredHumanDelivery).toBeNull()
+    expect(session.hasQueuedHumanWork()).toBe(false)
+    expect(proc.sentTexts).toEqual(sent)
   })
 
   test('DSH system dispatch 接受 queued/dsh;codex 的 queued 仍被拒,所有者校验保持', async () => {
@@ -20515,5 +20193,1059 @@ describe('Session 换卡支撑接线 (上游 378f4a4)', () => {
       session.stopFooterStatus(turn)
       await cardkit.dispose(cardId)
     }
+  })
+})
+
+describe('Session claude subagent tool calls stay off the main card', () => {
+  // 2026-08-18 对齐 codex 侧 isSubagentThread 分流(cf41941):claude 子 agent 的
+  // 工具调用按 parent_tool_use_id 归属后台 task,只累积 steps,不上主卡面板 ——
+  // 主卡只承载主 agent,多 agent 时面板数不爆表。
+  test('子 agent tool_use/tool_result 只进 bg steps,不 addTool/completeTool', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_subagent_iso')
+    cardkit.recordCardCreated('card_subagent_iso', 1)
+
+    try {
+      // 主线程 Task tool_use 触发子 agent → bg task 建立(toolUseId 关联)
+      proc.emit('tool_use', { id: 'task_main_1', name: 'Task', input: { description: 'review' }, parentToolUseId: null })
+      proc.emit('bg_task_started', { task_id: 't1', tool_use_id: 'task_main_1', description: 'review' })
+      // 子 agent 内的工具调用:parentToolUseId 指向主线程 Task
+      proc.emit('tool_use', { id: 'sub_read_1', name: 'Read', input: { file_path: '/tmp/a.ts' }, parentToolUseId: 'task_main_1' })
+      proc.emit('tool_result', { tool_use_id: 'sub_read_1', content: 'file body', is_error: false, parentToolUseId: 'task_main_1' })
+
+      // steps 已累积(含结果回填)
+      const t1 = session.backgroundTasks.concat(session.pendingBgTasks).find((t: any) => t.id === 't1')
+      expect(t1).toBeDefined()
+      expect(t1.steps.length).toBe(1)
+      expect(t1.steps[0].tool).toBe('Read')
+      expect(t1.steps[0].brief).toContain('→ file body')
+      // 主卡 toolByUseId 不含子 agent 工具 —— 没走 addTool/completeTool
+      expect(session.currentTurn.toolByUseId.has('sub_read_1')).toBe(false)
+      // 启动工具也归入委派面板，SDK task id 回填后仍然只有一项。
+      expect(session.currentTurn.toolByUseId.has('task_main_1')).toBe(false)
+      expect(session.backgroundTasks).toHaveLength(1)
+      await cardkit.flush('card_subagent_iso')
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      await cardkit.dispose('card_subagent_iso')
+    }
+  })
+
+  test('DSH 子工具返回内容块时不抛异常，也不写入主对话卡', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('dsh', 'dsh-session')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_dsh_child_blocks')
+    cardkit.recordCardCreated('card_dsh_child_blocks', 1)
+    try {
+      proc.emit('bg_task_started', { task_id: 'child', tool_use_id: 'child', description: 'DSH child', task_type: 'agent' })
+      proc.emit('tool_use', { id: 'child-bash', name: 'Bash', input: { command: 'echo child' }, parentToolUseId: 'child' })
+      expect(() => proc.emit('tool_result', { tool_use_id: 'child-bash', content: [{ type: 'text', text: 'started background job bash-1' }],
+        is_error: false, parentToolUseId: 'child' })).not.toThrow()
+      const child = [...session.backgroundTasks, ...session.pendingBgTasks].find((entry: any) => entry.id === 'child')
+      expect(child.steps[0].brief).toContain('started background job bash-1')
+      expect(session.currentTurn.toolByUseId.has('child-bash')).toBe(false)
+      expect(proc.isAlive()).toBe(true)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      await cardkit.dispose('card_dsh_child_blocks')
+    }
+  })
+
+  test('displays the verified translation and preserves delivery markers', async () => {
+    const session = new Session('translation-display', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-translated-session')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_translated_text')
+    cardkit.recordCardCreated('card_translated_text', 1)
+    try {
+      proc.emit('assistant_text', {
+        text: 'The report is ready. `[[send: /tmp/report.txt]]`',
+        displayText: '报告已完成。`[[send: /tmp/report.txt]]`', parentToolUseId: null,
+      })
+      proc.emit('assistant_block_stop', { index: 'translated-main', parentToolUseId: null })
+      await cardkit.flush('card_translated_text')
+      expect([...session.currentTurn.segmentTexts.values()]).toEqual(['报告已完成。`[[send: /tmp/report.txt]]`'])
+      expect(calls.some(call => JSON.stringify(call.body).includes('The report is ready'))).toBe(false)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      session.dispose()
+      await cardkit.dispose('card_translated_text')
+    }
+  })
+
+  test('子 agent assistant text/block_stop 不进入主卡,主 agent 正文仍正常渲染', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_subagent_text_iso')
+    cardkit.recordCardCreated('card_subagent_text_iso', 1)
+
+    try {
+      proc.emit('assistant_text', {
+        text: '我将并行开展多轮搜索来收集证据。',
+        parentToolUseId: 'task_main_1',
+      })
+      proc.emit('assistant_block_stop', {
+        index: 'assistant_child_1',
+        parentToolUseId: 'task_main_1',
+      })
+
+      expect(session.currentTurn.assistantSegmentCount).toBe(0)
+      expect(session.currentTurn.segmentTexts.size).toBe(0)
+
+      proc.emit('assistant_text', { text: '这是主 Agent 的结论。', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { index: 'assistant_main_1', parentToolUseId: null })
+      await cardkit.flush('card_subagent_text_iso')
+
+      expect(session.currentTurn.assistantSegmentCount).toBe(1)
+      expect([...session.currentTurn.segmentTexts.values()]).toEqual(['这是主 Agent 的结论。'])
+      expect(calls.some(call =>
+        call.method === 'POST' &&
+        call.path === '/cards/card_subagent_text_iso/elements' &&
+        String(call.body?.elements ?? '').includes('我将并行开展多轮搜索')
+      )).toBe(false)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose('card_subagent_text_iso')
+    }
+  })
+
+  test('parentToolUseId 无归属 task 的 tool_use(如合成 AskUserQuestion)仍走主卡', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_subagent_orphan')
+    cardkit.recordCardCreated('card_subagent_orphan', 1)
+
+    try {
+      proc.emit('tool_use', { id: 'orphan_1', name: 'Bash', input: { command: 'echo hi' }, parentToolUseId: 'unknown_parent' })
+      expect(session.currentTurn.toolByUseId.has('orphan_1')).toBe(true)
+      await cardkit.flush('card_subagent_orphan')
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await cardkit.dispose('card_subagent_orphan')
+    }
+  })
+})
+
+describe('Session background tasks in shared delegation cards', () => {
+  function makeRunningTask(id: string): any {
+    return { id, type: 'shell', description: `bg ${id}`, status: 'running', startedAt: Date.now() - 5000, steps: [] }
+  }
+
+  test('stop drains visible tasks as killed and drops ordinary foreground commands', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.backgroundTasks = [makeRunningTask('t1'), makeRunningTask('t2')]
+    session.pendingBgTasks = [makeRunningTask('foreground')]
+    await session.refreshBackgroundCardFull()
+    session.scheduleBackgroundRefresh()
+
+    await session.stop('已终止', { announce: false })
+
+    expect(proc.killCalls).toBe(1)
+    expect(session.backgroundTasks).toEqual([])
+    expect(session.pendingBgTasks).toEqual([])
+    expect(session.backgroundSync).toBeNull()
+    expect(session.backgroundRefreshTimer).toBeNull()
+    expect(sentCards).toHaveLength(1)
+    const writes = calls.filter(call => call.method === 'PUT').map(call => String(call.body.element)).join('\n')
+    expect(writes).toContain('已终止')
+    expect(writes).not.toContain('foreground')
+    expect(updatedCards).toHaveLength(0)
+    const settings = calls.filter(call => call.path.endsWith('/settings')).at(-1)!
+    expect(JSON.parse(settings.body.settings).config.streaming_mode).toBe(false)
+    await session.agentCards.closeChat('chat_id')
+  })
+
+  test('a main message leaves running work in its original panel', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.backgroundTasks = [makeRunningTask('running')]
+    await session.refreshBackgroundCardFull()
+    await feishu.sendCard('chat_id', { schema: '2.0', body: { elements: [] } })
+    session.backgroundTasks = [{ ...session.backgroundTasks[0], summary: '检查中' }]
+    await session.refreshBackgroundCardFull()
+    expect(sentCards).toHaveLength(2)
+    expect(updatedCards).toHaveLength(0)
+    expect(calls.some(call => call.method === 'PUT' && String(call.body.element).includes('检查中'))).toBe(true)
+    await session.resetBackgroundTasks()
+    await session.agentCards.closeChat('chat_id')
+  })
+
+  test('stop waits for an admitted open, settles it, and namespaces a later process', async () => {
+    const session = new Session('background-open-generation', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('same-id')]
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const baseFetch = globalThis.fetch
+    let converting = false
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (new URL(String(input)).pathname.endsWith('/cards/id_convert')) {
+        converting = true
+        await gate
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+    try {
+      const opening = session.refreshBackgroundCardFull()
+      await waitUntil(() => converting)
+      let resetDone = false
+      const resetting = session.resetBackgroundTasks().then(() => { resetDone = true })
+      await Promise.resolve()
+      expect(resetDone).toBe(false)
+      release()
+      await Promise.all([opening, resetting])
+      expect(session.backgroundTasks).toEqual([])
+      session.backgroundTasks = [makeRunningTask('same-id')]
+      await session.refreshBackgroundCardFull()
+      expect(sentCards).toHaveLength(1)
+      const appended = calls.filter(call => call.method === 'POST' && call.path.endsWith('/elements'))
+      expect(appended).toHaveLength(1)
+      const initialId = (sentCards[0] as any).body.elements[0].element_id
+      expect(JSON.parse(appended[0]!.body.elements)[0].element_id).not.toBe(initialId)
+    } finally {
+      release()
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      globalThis.fetch = baseFetch
+    }
+  })
+
+  test('a failed terminal update remains visible and can be retried without duplicate rows', async () => {
+    const session = new Session('background-update-failure', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('running')]
+    await session.refreshBackgroundCardFull()
+    const patch = spyOn(session.agentCards.deps, 'patchSettingsChecked').mockResolvedValue(false)
+    try {
+      await expect(session.resetBackgroundTasks()).rejects.toThrow('settings update MISS')
+      expect(session.backgroundTasks[0].status).toBe('killed')
+    } finally { patch.mockRestore() }
+    await session.resetBackgroundTasks()
+    expect(session.backgroundTasks).toEqual([])
+    expect(sentCards).toHaveLength(1)
+    await session.agentCards.closeChat('chat_id')
+  })
+
+  test('repeated settings failures with new request ids notify once until the panel recovers', async () => {
+    const session = new Session('background-settings-notices', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('running')]
+    await session.refreshBackgroundCardFull()
+    const patchSettings = session.agentCards.deps.patchSettingsChecked
+    let rejecting = true
+    let attempts = 0
+    const patch = spyOn(session.agentCards.deps, 'patchSettingsChecked').mockImplementation(
+      async (cardId: string, settings: object, onFailure?: (failure: CardWriteFailure) => void) => {
+        if (!rejecting) return patchSettings(cardId, settings, onFailure)
+        onFailure?.({ cardId, operation: 'patchSettings', code: 200860,
+          message: 'ErrMsg: card over max size;', logId: `settings-request-${++attempts}` })
+        return false
+      },
+    )
+    const refresh = () => session.refreshBackgroundCardFull().catch((error: unknown) => session.reportBackgroundWriteFailure(error))
+    try {
+      session.backgroundTasks = [{ ...session.backgroundTasks[0], status: 'completed', summary: '任务结果' }]
+      await refresh()
+      await refresh()
+      await refresh()
+      expect(attempts).toBe(3)
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('code=200860 message=ErrMsg: card over max size; log_id=settings-request-1')
+      expect(sentCards).toHaveLength(1)
+
+      rejecting = false
+      await refresh()
+      rejecting = true
+      session.backgroundTasks = [{ ...session.backgroundTasks[0], summary: '补充任务结果' }]
+      await refresh()
+      expect(sentRawTexts).toHaveLength(2)
+      expect(sentRawTexts[1]).toContain('log_id=settings-request-4')
+    } finally {
+      patch.mockRestore()
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+    }
+  })
+
+  test('background error batches preserve new causes without repeating known ones', async () => {
+    const session = new Session('background-notice-causes', 'chat_id') as any
+    const failure = (id: number) => new Error(`agent card settings update MISS: code=200860 message=card over max size log_id=request-${id}`)
+    await session.reportBackgroundWriteFailure(new AggregateError([failure(1), failure(2)]))
+    expect(sentRawTexts).toHaveLength(1)
+    expect(sentRawTexts[0]).toContain('log_id=request-1')
+    expect(sentRawTexts[0]).not.toContain('request-2')
+
+    const cleanupFailure = new Error('agent moved task row deletion MISS: code=300317 message=cleanup rejected log_id=cleanup-request')
+    await session.reportBackgroundWriteFailure(new AggregateError([
+      failure(3), new AggregateError([cleanupFailure, failure(4)]),
+    ]))
+    expect(sentRawTexts).toHaveLength(2)
+    expect(sentRawTexts[1]).toContain('cleanup rejected log_id=cleanup-request')
+    expect(sentRawTexts[1]).not.toContain('card over max size')
+    await session.reportBackgroundWriteFailure(failure(5))
+    expect(sentRawTexts).toHaveLength(2)
+  })
+
+  test('a failed launch is visible in the delegation panel without a main tool panel', async () => {
+    const session = new Session('native-launch-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_failed_child')
+    cardkit.recordCardCreated('card_failed_child', 1)
+    try {
+      proc.emit('tool_use', { id: 'agent-tool', name: 'Agent', input: { description: '检查接口' }, parentToolUseId: null })
+      proc.emit('tool_result', { tool_use_id: 'agent-tool', content: '无法启动子 Agent', is_error: true, parentToolUseId: null })
+      await session.backgroundSync
+      expect(session.currentTurn.toolByUseId.size).toBe(0)
+      expect(session.backgroundTasks).toHaveLength(1)
+      expect(session.backgroundTasks[0].status).toBe('failed')
+      const rendered = calls.filter(call => call.method === 'PUT').map(call => String(call.body.element)).join('\n')
+      expect(rendered).toContain('子 Agent失败')
+      expect(rendered).toContain('无法启动子 Agent')
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      await cardkit.dispose('card_failed_child')
+    }
+  })
+
+  test('a successful async launch receipt leaves the child running until its native result', async () => {
+    const session = new Session('native-background-receipt', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_async_child')
+    cardkit.recordCardCreated('card_async_child', 1)
+    try {
+      proc.emit('tool_use', { id: 'agent-tool', name: 'Agent', input: { description: '检查接口', run_in_background: true }, parentToolUseId: null })
+      expect(session.currentTurn.footerStatusLabel).toBe('Working...')
+      proc.emit('tool_result', { tool_use_id: 'agent-tool', content: 'Agent launched', is_error: false, parentToolUseId: null })
+      expect(session.currentTurn.footerStatusLabel).toBe('Thinking...')
+      expect(session.backgroundTasks[0].status).toBe('running')
+      proc.emit('bg_task_started', { task_id: 'native-id', tool_use_id: 'agent-tool', description: '检查接口', task_type: 'local_agent' })
+      proc.emit('bg_task_settled', { task_id: 'native-id', status: 'completed', summary: '接口正常' })
+      await session.backgroundSync
+      expect(session.backgroundTasks).toHaveLength(1)
+      expect(session.backgroundTasks[0].status).toBe('completed')
+      expect(session.currentTurn.toolByUseId.size).toBe(0)
+      expect(sentCards).toHaveLength(1)
+      expect(calls.filter(call => call.method === 'POST' && call.path.endsWith('/elements'))).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      await cardkit.dispose('card_async_child')
+    }
+  })
+})
+
+describe('Session live_elapsed second mode', () => {  test('second live_elapsed mode updates the main footer without background clock timers', async () => {
+    // 显式钉死 second 模式，隔离本机配置差异。
+    const cfg = config as any
+    const previousRuntime = cfg.runtime
+    cfg.runtime = { ...(previousRuntime ?? {}), live_elapsed: 'second' }
+    const session = new Session('second-scheduling', 'chat_id') as any
+    const turn = turnState('card_second_scheduling')
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const delays: number[] = []
+    const timeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation((
+      (_callback: (...args: any[]) => void, delay?: number) => {
+        delays.push(Number(delay ?? 0))
+        return DETERMINISTIC_FOOTER_HANDLE
+      }
+    ) as typeof setTimeout)
+
+    try {
+      session.startThinkingFooter(turn)
+      expect(delays).toHaveLength(1)
+      expect(delays[0]).toBe(1000)
+      await cardkit.flush(turn.cardId)
+      await Bun.sleep(0)
+      session.stopFooterStatus(turn)
+
+      // startFooterStatus 先 Date.now() 记 startedAt,再 Date.now() 算 elapsed。
+      // 第一次返回 base,后续返回 base+45s → 文案 Writing... (45s)。
+      session.stopFooterStatus(turn)
+      const base = Date.now()
+      let nowCalls = 0
+      const nowSpy = spyOn(Date, 'now').mockImplementation(() => {
+        nowCalls += 1
+        return nowCalls === 1 ? base : base + 45_000
+      })
+      try {
+        session.startWritingFooter(turn)
+      } finally {
+        nowSpy.mockRestore()
+      }
+      await cardkit.flush(turn.cardId)
+      const footerWrites = calls
+        .filter(call => call.method === 'PUT' && call.path === `/cards/${turn.cardId}/elements/footer`)
+        .map(call => JSON.parse(call.body.element).content as string)
+      expect(footerWrites.at(-1)).toContain('Writing... (45s)')
+    } finally {
+      session.stopFooterStatus(turn)
+      timeoutSpy.mockRestore()
+      if (previousRuntime === undefined) delete cfg.runtime
+      else cfg.runtime = previousRuntime
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test.each([false, true])('a transient live footer failure recovers without pausing clocks (consumed UUID: %s)', async consumedUuid => {
+    const session = new Session('footer-transient-miss', 'chat_id') as any
+    const turn = turnState('card_footer_transient_miss')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1, (code, failure) => {
+      session.onCardWriteFailure(turn, turn.cardId, code, failure)
+    })
+    const proxyEnv = Object.fromEntries([
+      'HTTP_PROXY', 'http_proxy', 'HTTPS_PROXY', 'https_proxy', 'ALL_PROXY', 'all_proxy', 'NO_PROXY', 'no_proxy',
+    ].map(key => [key, process.env[key]]))
+    // Keep the mocked fetch independent of system proxy discovery and Bun's direct dispatcher.
+    for (const key of Object.keys(proxyEnv)) process.env[key] = /no_proxy/i.test(key) ? '*' : ''
+    const retryDelays: number[] = []
+    let now = Date.now()
+    const clockSpy = spyOn(Date, 'now').mockImplementation(() => now)
+    const originalSetTimeout = globalThis.setTimeout
+    const timeoutSpy = spyOn(globalThis, 'setTimeout').mockImplementation(((callback: any, delay: number, ...args: any[]) => {
+      if ([3000, 4000, 5000, 8000, 15000, 60000].includes(delay)) {
+        retryDelays.push(delay)
+        now += delay
+        return originalSetTimeout(callback, 0, ...args)
+      }
+      return originalSetTimeout(callback, delay, ...args)
+    }) as typeof setTimeout)
+    let footerAttempts = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = new URL(String(input))
+      const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+      const method = String(init?.method ?? 'GET')
+      calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+      if (method === 'PUT' && path === `/cards/${turn.cardId}/elements/footer`) {
+        footerAttempts++
+        if (footerAttempts === 1) {
+          return new Response(JSON.stringify({ code: 300308, msg: 'Server Internal Error' }), {
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        if (consumedUuid && footerAttempts === 2) {
+          return Response.json({ code: 200770, msg: 'ErrMsg: this UUID has been recently consumed;' })
+        }
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.startThinkingFooter(turn)
+      await cardkit.flush(turn.cardId)
+      await waitUntil(() => !turn.footerStatusWriteCardId)
+      expect(footerAttempts).toBe(consumedUuid ? 3 : 2)
+      expect(retryDelays).toEqual(consumedUuid ? [3000, 8000] : [3000])
+      expect(turn.footerStatusFailedCardId).not.toBe(turn.cardId)
+      expect(turn.footerStatusHandle).not.toBeNull()
+      expect(sentRawTexts).toHaveLength(0)
+      expect(turn.cardWriteFailureNotices.size).toBe(0)
+
+      session.startWritingFooter(turn)
+      await cardkit.flush(turn.cardId)
+      expect(footerAttempts).toBe(consumedUuid ? 4 : 3)
+      expect(sentRawTexts).toHaveLength(0)
+      expect(turn.cardWriteFailureNotices.size).toBe(0)
+    } finally {
+      session.stopFooterStatus(turn)
+      try { await cardkit.dispose(turn.cardId) }
+      finally {
+        timeoutSpy.mockRestore()
+        clockSpy.mockRestore()
+        for (const [key, value] of Object.entries(proxyEnv)) {
+          if (value === undefined) delete process.env[key]
+          else process.env[key] = value
+        }
+      }
+    }
+  })
+})
+
+describe('Session translated tool presentation', () => {
+  function translatedToolSession(name: string) {
+    const session = new Session(name, 'chat_id') as any
+    session.currentTurn = turnState(`card_${name}`)
+    session.maybeMidTurnRotate = () => {}
+    session.startWorkingFooter = () => {}
+    session.startThinkingFooter = () => {}
+    cardkit.recordCardCreated(session.currentTurn.cardId, 1)
+    return session
+  }
+
+  test('translated summaries and results survive card rotation while native data stays exact', async () => {
+    const session = translatedToolSession('translated_rotation')
+    const oldTurn = session.currentTurn
+    const summary = spyOn(cardkit, 'patchSummaryThrottled').mockImplementation(() => {})
+    const rawInput = Object.freeze({ command: '# desc: Inspect files\nls /tmp/中文', description: 'Inspect files' })
+    const shownInput = { ...rawInput, __displayDescription: '检查文件' }
+    const rawOutput = 'The requested directory does not exist: /tmp/中文'
+    const shownOutput = '请求的目录不存在：/tmp/中文'
+    const nextTurn = turnState('card_translated_rotation_next')
+    try {
+      sessionTools.addTool(session, session.proc, 'tool-translated', 'Bash', rawInput, shownInput)
+      await cardkit.flush(oldTurn.cardId)
+      expect(summary.mock.calls[0]?.[1]).toContain('检查文件')
+      expect(oldTurn.toolByUseId.get('tool-translated').input).toBe(rawInput)
+      session.currentTurn = nextTurn
+      cardkit.recordCardCreated(nextTurn.cardId, 1)
+      sessionTools.rebuildToolsOnRotate(session, oldTurn.cardId, nextTurn.cardId, oldTurn.toolByUseId, oldTurn.toolBatches)
+      await cardkit.flush(nextTurn.cardId)
+      const created = calls.find(call => call.method === 'POST' && call.path === `/cards/${nextTurn.cardId}/elements`)!
+      const rebuilt = JSON.parse(created.body.elements)[0]
+      expect(rebuilt.header.title.content).toContain('检查文件')
+      expect(rebuilt.elements[0].content).toContain('ls /tmp/中文')
+      sessionTools.completeTool(session, session.proc, 'tool-translated', rawOutput, true, undefined, shownOutput)
+      await cardkit.flush(nextTurn.cardId)
+      const completed = calls.filter(call => call.method === 'PUT' && call.path.startsWith(`/cards/${nextTurn.cardId}/elements/`)).at(-1)!
+      const element = JSON.parse(completed.body.element)
+      expect(element.elements[0].content).toContain(shownOutput)
+      expect(element.elements[0].content).not.toContain(rawOutput)
+      const meta = nextTurn.toolByUseId.get('tool-translated')
+      expect(meta.input).toBe(rawInput)
+      expect(meta.output).toBe(rawOutput)
+      expect(meta.displayInput).toEqual(shownInput)
+      expect(meta.displayOutput).toBe(shownOutput)
+      expect(rawInput.command).toBe('# desc: Inspect files\nls /tmp/中文')
+    } finally {
+      summary.mockRestore()
+      await cardkit.dispose(oldTurn.cardId)
+      await cardkit.dispose(nextTurn.cardId)
+      session.dispose()
+    }
+  })
+
+  test('task cards combine native creation IDs with translated inputs and structured snapshots', async () => {
+    const session = translatedToolSession('translated_tasks')
+    const turn = session.currentTurn
+    try {
+      const create = { subject: 'Read source', description: 'Inspect the source', activeForm: 'Reading source' }
+      const shownCreate = { subject: '读取源码', description: '检查源码', activeForm: '正在读取源码' }
+      sessionTools.addTool(session, session.proc, 'task-create', 'TaskCreate', create, shownCreate)
+      const receipt = 'Task #28 created successfully: Read source'
+      sessionTools.completeTool(session, session.proc, 'task-create', receipt, false, undefined, '任务已创建：读取源码')
+      expect(session.taskBoard).toEqual([
+        { id: '28', subject: '读取源码', description: '检查源码', activeForm: '正在读取源码', status: 'pending' },
+      ])
+      const update = { taskId: '28', status: 'in_progress', activeForm: 'Reviewing source' }
+      sessionTools.addTool(session, session.proc, 'task-update', 'TaskUpdate', update, { ...update, activeForm: '正在检查源码' })
+      sessionTools.completeTool(session, session.proc, 'task-update', 'Updated task #28 status', false, undefined, '已更新任务状态')
+      expect(session.taskBoard[0]).toMatchObject({ id: '28', status: 'in_progress', activeForm: '正在检查源码' })
+      const rawList = JSON.stringify({ tasks: [{ id: '28', subject: 'Read source', status: 'completed' }] })
+      const shownList = JSON.stringify({ tasks: [{ id: '28', subject: '读取源码', status: 'completed' }] })
+      sessionTools.addTool(session, session.proc, 'task-list', 'TaskList', {})
+      sessionTools.completeTool(session, session.proc, 'task-list', rawList, false, undefined, shownList)
+      expect(session.taskBoard[0]).toMatchObject({ id: '28', subject: '读取源码', status: 'completed' })
+      const rawGet = JSON.stringify({ task: { id: '28', subject: 'Read source', status: 'completed', description: 'All files inspected' } })
+      const shownGet = JSON.stringify({ task: { id: '28', subject: '读取源码', status: 'completed', description: '已检查全部文件' } })
+      sessionTools.addTool(session, session.proc, 'task-get', 'TaskGet', { taskId: '28' })
+      sessionTools.completeTool(session, session.proc, 'task-get', rawGet, false, undefined, shownGet)
+      expect(session.taskBoard[0]).toMatchObject({ id: '28', description: '已检查全部文件' })
+      await cardkit.flush(turn.cardId)
+      expect(turn.toolByUseId.get('task-create').output).toBe(receipt)
+      expect(turn.toolByUseId.get('task-list').output).toBe(rawList)
+      expect(turn.toolByUseId.get('task-get').output).toBe(rawGet)
+      const rendered = calls.filter(call => call.method === 'PUT').map(call => call.body.element).join('\n')
+      expect(rendered).toContain('读取源码')
+      expect(rendered).not.toContain('Read source')
+    } finally { await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+
+  test('image delivery uses the original output path and displays translated final prompt metadata', async () => {
+    const session = translatedToolSession('translated_image')
+    const turn = session.currentTurn
+    try {
+      sessionTools.addTool(session, session.proc, 'image', 'ImageGeneration', { prompt: 'A small boat', status: 'inProgress' }, { prompt: '一艘小船', status: 'inProgress' })
+      sessionTools.completeTool(session, session.proc, 'image', '/tmp/原始图片.png', false,
+        { revisedPrompt: 'A blue small boat', status: 'completed' }, '图片已生成',
+        { revisedPrompt: '一艘蓝色小船', status: 'completed' })
+      await sessionTools.waitForImageDeliveries(turn)
+      await cardkit.flush(turn.cardId)
+      expect(uploadedImages).toEqual(['/tmp/原始图片.png'])
+      expect(turn.toolByUseId.get('image').output).toBe('/tmp/原始图片.png')
+      expect(turn.toolByUseId.get('image').input.revisedPrompt).toBe('A blue small boat')
+      const completed = calls.filter(call => call.method === 'PUT').at(-1)!
+      const element = JSON.parse(completed.body.element)
+      expect(element.elements[0].content).toContain('一艘小船')
+      expect(element.elements[0].content).toContain('一艘蓝色小船')
+      expect(element.elements[0].content).not.toContain('A blue small boat')
+      expect(element.elements[1]).toMatchObject({ tag: 'img', img_key: 'img_generated' })
+    } finally { await cardkit.dispose(turn.cardId); session.dispose() }
+  })
+})
+
+describe('Session Claude translated event wiring', () => {
+  test('hidden main question receipts never enter Flash or history while displayed child receipts still do', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { ClaudeTranslationContext } = await import('./claude-translation-context')
+    const directory = mkdtempSync(join(tmpdir(), 'session-question-receipts-'))
+    const context = new ClaudeTranslationContext({ workDir: tmpdir(), storeDir: directory })
+    await context.initialize(new AbortController().signal)
+    context.bindSession('question-receipts')
+    const translated: string[] = [], results: any[] = [], errors: Error[] = []
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high', tokenSourceId: 'claude-sub', translationContext: context,
+      translation: {
+        toEnglish: async text => text,
+        toChinese: async text => { translated.push(text); return `ZH:${text}` },
+        toChineseFields: async fields => { translated.push(...fields); return fields.map(text => `ZH:${text}`) },
+      },
+    }) as any
+    proc.translationContextInitialized = true
+    proc.on('tool_result', (event: any) => results.push(event))
+    proc.on('error', (error: Error) => errors.push(error))
+    const session = new Session('translated-question-receipts', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_translated_question_receipts')
+    session.onBackgroundTaskChanged = () => {}
+    session.startThinkingFooter = () => {}
+    cardkit.recordCardCreated(session.currentTurn.cardId, 1)
+    const input = { questions: [{ question: 'Complete the task?', options: [{ label: 'Complete' }] }] }
+    const receipt = async (id: string, content: string, isError: boolean, parent: string | null = null) => {
+      await proc.handleTranslatedMessage({ type: 'assistant', uuid: `${id}-input`, parent_tool_use_id: parent,
+        message: { content: [{ type: 'tool_use', id, name: 'AskUserQuestion', input }] } })
+      await proc.handleTranslatedMessage({ type: 'user', uuid: `${id}-result`, parent_tool_use_id: parent,
+        message: { content: [{ type: 'tool_result', tool_use_id: id, content, is_error: isError }] } })
+    }
+    try {
+      const invalid = '<tool_use_error>questions.0.options: must contain at least two options</tool_use_error>'
+      await receipt('invalid-question', invalid, true)
+      await receipt('hidden-question-echo', 'The user answered: Complete', false)
+      await receipt('unowned-question', invalid, true, 'unknown-parent')
+      expect(translated).toEqual([])
+      expect(context.snapshot().entries).toEqual([])
+      expect(session.currentTurn.toolByUseId.size).toBe(0)
+      expect(results.map(event => event.content)).toEqual([invalid, 'The user answered: Complete', invalid])
+      expect(results.every(event => event.displayContent === undefined)).toBe(true)
+      session.backgroundTasks = [{ id: 'child-task', toolUseId: 'parent-tool', type: 'subagent', status: 'running',
+        description: 'Visible task', startedAt: Date.now(),
+        steps: [{ toolUseId: 'child-question', tool: 'AskUserQuestion', brief: 'AskUserQuestion' }] }]
+      await receipt('child-question', 'The question was cancelled', true, 'parent-tool')
+      expect(translated).toEqual(['The question was cancelled'])
+      expect(context.snapshot().entries).toHaveLength(1)
+      expect(context.snapshot().entries[0]).toMatchObject({
+        original: 'The question was cancelled', translated: 'ZH:The question was cancelled',
+      })
+      expect(session.backgroundTasks[0].steps[0].brief).toContain('ZH:The question was cancelled')
+      expect(errors).toEqual([])
+    } finally {
+      session.dispose()
+      await cardkit.dispose('card_translated_question_receipts')
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('child prose never enters translation, history or background summaries in any task state', async () => {
+    const { mkdtempSync, rmSync } = await import('node:fs')
+    const { tmpdir } = await import('node:os')
+    const { join } = await import('node:path')
+    const { ClaudeTranslationContext } = await import('./claude-translation-context')
+    const directory = mkdtempSync(join(tmpdir(), 'session-presentation-context-'))
+    const context = new ClaudeTranslationContext({ workDir: tmpdir(), storeDir: directory })
+    await context.initialize(new AbortController().signal)
+    context.bindSession('session-presentation-context')
+    const translated: string[] = []
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high', tokenSourceId: 'claude-sub', translationContext: context,
+      translation: {
+        toEnglish: async text => text,
+        toChinese: async text => { translated.push(text); return `ZH:${text}` },
+        toChineseFields: async fields => { translated.push(...fields); return fields.map(text => `ZH:${text}`) },
+      },
+    }) as any
+    proc.translationContextInitialized = true
+    const session = new Session('translated-child-visibility', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    session.onBackgroundTaskChanged = () => {}
+    session.backgroundTasks = [{ id: 'child-task', toolUseId: 'parent-tool', status: 'completed',
+      description: 'Visible task', summary: 'Authoritative result', steps: [] }]
+    const message = (id: string, text: string, parent = 'parent-tool') => ({ type: 'assistant', uuid: id,
+      parent_tool_use_id: parent, message: { content: [{ type: 'text', text }] } })
+    try {
+      await proc.handleTranslatedMessage(message('unknown-child', 'Unknown hidden child text', 'unknown-parent'))
+      for (const status of ['pending', 'running', 'completed']) {
+        session.backgroundTasks[0].status = status
+        await proc.handleTranslatedMessage(message(`${status}-child`, `Hidden ${status} child text`))
+        expect(session.backgroundTasks[0].summary).toBe('Authoritative result')
+        expect(translated).toEqual([])
+        expect(context.snapshot().entries).toEqual([])
+      }
+    } finally {
+      session.dispose()
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test('nontranslated Sessions do not install a presentation policy', () => {
+    const session = new Session('plain-presentation-policy', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'plain-policy-session', 'glm') as any
+    let installed = false
+    proc.setTranslationPresentationPolicy = () => { installed = true }
+    try {
+      session.wireProc(proc)
+      expect(installed).toBe(false)
+    } finally { session.dispose() }
+  })
+
+  function wiredTranslatedSession(name: string, withTurn = true) {
+    const session = new Session(name, 'chat_id') as any
+    const proc = new FakeAgentProc('claude', `native_${name}`)
+    session.selectedProvider = 'claude'
+    session.wireProc(proc)
+    session.maybeMidTurnRotate = () => {}
+    session.startWorkingFooter = () => {}
+    session.startThinkingFooter = () => {}
+    if (withTurn) {
+      session.currentTurn = turnState(`card_${name}`)
+      session.currentTurn.provider = 'claude'
+      cardkit.recordCardCreated(session.currentTurn.cardId, 1)
+    }
+    return { session, proc }
+  }
+
+  test('native tool events use display metadata in permission cards and after rotation while permission machine data stays raw', async () => {
+    const { session, proc } = wiredTranslatedSession('translated_event_tool')
+    const oldTurn = session.currentTurn
+    const newTurn = turnState('card_translated_event_tool_next')
+    const permissionReply = spyOn(proc, 'sendPermissionResponse')
+    const rawInput = Object.freeze({ command: '# desc: Inspect permissions\nls -ld /tmp/中文', description: 'Inspect permissions' })
+    const displayInput = { ...rawInput, __displayDescription: '检查目录权限' }
+    const suggestions = [{ type: 'addDirectories', directories: ['/tmp/中文'], destination: 'session' }]
+    try {
+      proc.emit('tool_use', { id: 'translated-tool', name: 'Bash', input: rawInput, displayInput, parentToolUseId: null })
+      proc.emit('can_use_tool', { request_id: 'translated-permission', tool_name: 'Bash', tool_use_id: 'translated-tool', input: rawInput, permission_suggestions: suggestions })
+      await cardkit.flush(oldTurn.cardId)
+      const permission = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/elements/tool_0')).at(-1)!
+      expect(JSON.parse(permission.body.element).header.title.content).toContain('等审批 · Bash: 检查目录权限')
+      expect(JSON.parse(permission.body.element).elements[0].content).toContain('ls -ld /tmp/中文')
+      expect(session.pendingPermissions.get('translated-permission').permissionSuggestions).toBe(suggestions)
+      expect(await session.onPermissionDecision('translated-permission', 'allow_always', 'tester')).toMatchObject({ ok: true })
+      expect(permissionReply).toHaveBeenCalledWith('translated-permission', 'allow', { updatedPermissions: suggestions })
+      await cardkit.flush(oldTurn.cardId)
+      const allowed = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/elements/tool_0')).at(-1)!
+      expect(JSON.parse(allowed.body.element).header.title.content).toContain('检查目录权限')
+      session.currentTurn = newTurn
+      cardkit.recordCardCreated(newTurn.cardId, 1)
+      sessionTools.rebuildToolsOnRotate(session, oldTurn.cardId, newTurn.cardId, oldTurn.toolByUseId, oldTurn.toolBatches)
+      proc.emit('tool_result', { tool_use_id: 'translated-tool', content: 'Permission denied', displayContent: '权限不足', is_error: true, parentToolUseId: null })
+      await cardkit.flush(newTurn.cardId)
+      const done = calls.filter(call => call.method === 'PUT' && call.path.startsWith(`/cards/${newTurn.cardId}/elements/`)).at(-1)!
+      expect(JSON.parse(done.body.element).elements[0].content).toContain('权限不足')
+      expect(JSON.parse(done.body.element).elements[0].content).not.toContain('Permission denied')
+      expect(newTurn.toolByUseId.get('translated-tool').input).toBe(rawInput)
+      expect(newTurn.toolByUseId.get('translated-tool').output).toBe('Permission denied')
+      expect(newTurn.toolByUseId.get('translated-tool').displayOutput).toBe('权限不足')
+      expect(rawInput.command).toBe('# desc: Inspect permissions\nls -ld /tmp/中文')
+    } finally {
+      permissionReply.mockRestore()
+      session.dispose()
+      await cardkit.dispose(oldTurn.cardId)
+      await cardkit.dispose(newTurn.cardId)
+    }
+  })
+
+  test('denying a translated permission keeps its Chinese purpose and the exact native request ID', async () => {
+    const { session, proc } = wiredTranslatedSession('translated_permission_deny')
+    const turn = session.currentTurn
+    const permissionReply = spyOn(proc, 'sendPermissionResponse')
+    try {
+      const input = { command: '# desc: Remove temporary file\nrm /tmp/task-output' }
+      proc.emit('tool_use', { id: 'deny-tool', name: 'Bash', input, displayInput: { ...input, __displayDescription: '删除临时文件' }, parentToolUseId: null })
+      proc.emit('can_use_tool', { request_id: 'native-permission-id', tool_name: 'Bash', tool_use_id: 'deny-tool', input })
+      await session.onPermissionDecision('native-permission-id', 'deny', 'tester')
+      await cardkit.flush(turn.cardId)
+      expect(permissionReply).toHaveBeenCalledWith('native-permission-id', 'deny', undefined)
+      const last = calls.filter(call => call.method === 'PUT' && call.path.endsWith('/elements/tool_0')).at(-1)!
+      const element = JSON.parse(last.body.element)
+      expect(element.header.title.content).toContain('删除临时文件')
+      expect(element.elements[0].content).toContain('已拒绝')
+      expect(turn.toolByUseId.get('deny-tool').input.command).toBe(input.command)
+    } finally {
+      permissionReply.mockRestore()
+      session.dispose()
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('native background events and tool steps use Chinese panels while child prose stays hidden', async () => {
+    const { session, proc } = wiredTranslatedSession('translated_background_events')
+    const turn = session.currentTurn
+    const rawAgentInput = Object.freeze({ description: 'Review code', prompt: 'Check the source tree', subagent_type: 'Explore', run_in_background: true })
+    try {
+      proc.emit('tool_use', { id: 'parent-tool', name: 'Agent', input: rawAgentInput, displayInput: { ...rawAgentInput, description: '检查代码', prompt: '检查源码树' }, parentToolUseId: null })
+      expect(session.nativeAgentTools.get('parent-tool').input).toBe(rawAgentInput)
+      proc.emit('bg_task_started', { task_id: 'native-task-id', tool_use_id: 'parent-tool', task_type: 'local_agent', subagent_type: 'Explore', description: 'Review code', prompt: 'Check the source tree', display: { description: '检查代码', prompt: '检查源码树' } })
+      const rawChildInput = Object.freeze({ command: '# desc: Inspect the source tree\nls /tmp/中文', description: 'Inspect the source tree' })
+      proc.emit('tool_use', { id: 'child-tool', name: 'Bash', input: rawChildInput, displayInput: { ...rawChildInput, __displayDescription: '检查源码树' }, parentToolUseId: 'parent-tool' })
+      proc.emit('tool_result', { tool_use_id: 'child-tool', content: 'Source tree inspected', displayContent: '已检查源码树', is_error: false, parentToolUseId: 'parent-tool' })
+      proc.emit('assistant_text', { text: 'The child found two issues', displayText: '子任务发现两个问题', parentToolUseId: 'parent-tool' })
+      proc.emit('assistant_block_stop', { index: 'child-message', parentToolUseId: 'parent-tool' })
+      expect(turn.assistantSegmentCount).toBe(0)
+      expect(turn.segmentTexts.size).toBe(0)
+      expect(session.backgroundTasks[0]).toMatchObject({ id: 'native-task-id', toolUseId: 'parent-tool', subagentType: 'Explore', description: '检查代码', prompt: '检查源码树' })
+      expect(session.backgroundTasks[0].summary).toBeUndefined()
+      expect(session.backgroundTasks[0].steps[0].brief).toBe('Bash 检查源码树 → 已检查源码树')
+      await session.refreshBackgroundCardFull()
+      expect(JSON.stringify([...sentCards, ...calls])).not.toContain('子任务发现两个问题')
+      proc.emit('bg_task_progress', { task_id: 'native-task-id', description: 'Checking two findings', summary: 'Working on confirmation', display: { description: '核对两个发现', summary: '正在确认结果' } })
+      expect(session.backgroundTasks[0]).toMatchObject({ description: '核对两个发现', summary: '正在确认结果' })
+      proc.emit('bg_task_updated', { task_id: 'native-task-id', patch: { description: 'One file is inaccessible', error: 'Read access denied', status: 'running' }, display: { description: '一个文件无法访问', error: '读取权限不足' } })
+      expect(session.backgroundTasks[0]).toMatchObject({ description: '一个文件无法访问', error: '读取权限不足', status: 'running' })
+      proc.emit('bg_task_settled', { task_id: 'native-task-id', status: 'completed', summary: 'Reviewed all readable files', display: { summary: '已检查所有可读文件' } })
+      proc.emit('assistant_text', { text: 'Late child text', displayText: '迟到的子任务文本', parentToolUseId: 'parent-tool' })
+      await session.refreshBackgroundCardFull()
+      expect(session.backgroundTasks[0]).toMatchObject({ status: 'completed', summary: '已检查所有可读文件' })
+      const rendered = JSON.stringify([...sentCards, ...calls])
+      expect(rendered).toContain('已检查所有可读文件')
+      expect(rendered).toContain('读取权限不足')
+      expect(rendered).not.toContain('The child found two issues')
+      expect(rendered).not.toContain('子任务发现两个问题')
+      expect(rendered).not.toContain('迟到的子任务文本')
+      expect(rendered).not.toContain('Read access denied')
+      expect(rendered).not.toContain('Check the source tree')
+      expect(turn.toolByUseId.size).toBe(0)
+      expect(rawAgentInput.subagent_type).toBe('Explore')
+      expect(rawChildInput.command).toBe('# desc: Inspect the source tree\nls /tmp/中文')
+    } finally {
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      session.dispose()
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('synchronous native Agent result uses translated completion prose and keeps the original tool contract', async () => {
+    const { session, proc } = wiredTranslatedSession('translated_sync_agent')
+    const turn = session.currentTurn
+    const input = Object.freeze({ description: 'Inspect files', prompt: 'Inspect source files', run_in_background: false })
+    try {
+      proc.emit('tool_use', { id: 'sync-child', name: 'Agent', input, displayInput: { ...input, description: '检查文件', prompt: '检查源文件' }, parentToolUseId: null })
+      proc.emit('tool_result', { tool_use_id: 'sync-child', content: 'All source files inspected', displayContent: '已检查全部源文件', is_error: false, parentToolUseId: null })
+      await session.refreshBackgroundCardFull()
+      expect(session.backgroundTasks[0]).toMatchObject({ id: 'sync-child', description: '检查文件', summary: '已检查全部源文件', status: 'completed' })
+      expect(JSON.stringify([...sentCards, ...calls])).not.toContain('All source files inspected')
+      expect(input.run_in_background).toBe(false)
+      expect(turn.segmentTexts.size).toBe(0)
+    } finally {
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      session.dispose()
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('native input and terminal errors show displayError while retaining immutable raw event errors', async () => {
+    const { session, proc } = wiredTranslatedSession('translated_native_errors')
+    const turn = session.currentTurn
+    const inputError = Object.freeze({ error: 'Native input rejected E_INPUT', displayError: '原生输入被拒绝 E_INPUT' })
+    const resultError = Object.freeze({ subtype: 'error_during_execution', is_error: true, error: 'Native operation failed E_TASK', displayError: '原生操作失败 E_TASK' })
+    try {
+      proc.emit('turn_input_error', inputError)
+      expect(sentRawTexts.some(text => text.includes('原生输入被拒绝 E_INPUT'))).toBe(true)
+      expect(sentRawTexts.some(text => text.includes('Native input rejected'))).toBe(false)
+      proc.lastResult = { ...proc.lastResult, is_error: true, subtype: 'error_during_execution' }
+      proc.emit('result', resultError)
+      await session.waitForTurnCloses()
+      expect(session.currentTurn).toBeNull()
+      const rendered = JSON.stringify([...sentCards, ...calls, ...sentRawTexts])
+      expect(rendered).toContain('原生操作失败 E_TASK')
+      expect(rendered).not.toContain('Native operation failed E_TASK')
+      expect(inputError.error).toBe('Native input rejected E_INPUT')
+      expect(resultError.error).toBe('Native operation failed E_TASK')
+      expect(proc.lastResult.subtype).toBe('error_during_execution')
+    } finally {
+      session.dispose()
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('scheduled wakeups record Chinese preview text and place translated agentmessage on their own card', async () => {
+    const { session, proc } = wiredTranslatedSession('translated_cron_events', false)
+    const event = Object.freeze({ text: 'Check the scheduled build', displayText: '检查定时构建', promptId: 'native-cron-prompt' })
+    let cardId: string | undefined
+    try {
+      proc.emit('init', { session_id: proc.sessionId })
+      proc.emit('scheduled_turn_input', event)
+      await waitUntil(() => session.currentTurn !== null)
+      cardId = session.currentTurn.cardId
+      expect(session.currentTurn.trigger).toBe('scheduled_wakeup')
+      expect(session.lastTurnUserPreview).toBe('⏰ 检查定时构建')
+      proc.emit('assistant_text', { text: 'The scheduled build passed', displayText: '定时构建已通过', parentToolUseId: null })
+      proc.emit('assistant_block_stop', { index: 'scheduled-message', parentToolUseId: null })
+      await cardkit.flush(cardId!)
+      expect([...session.currentTurn.segmentTexts.values()]).toEqual(['定时构建已通过'])
+      const rendered = JSON.stringify([...sentCards, ...calls])
+      expect(rendered).toContain('定时构建已通过')
+      expect(rendered).not.toContain('The scheduled build passed')
+      expect(event.text).toBe('Check the scheduled build')
+      expect(event.promptId).toBe('native-cron-prompt')
+    } finally {
+      if (session.currentTurn) await session.closeTurnCard('测试收尾')
+      session.dispose()
+      if (cardId) await cardkit.dispose(cardId)
+    }
+  })
+})
+
+describe('Claude model selection across configured translation boundaries', () => {
+  async function withSelection(
+    sourceId: string, models: string[], initialTranslation: boolean,
+    run: (session: any, proc: FakeAgentProc) => Promise<void>,
+  ): Promise<void> {
+    const previousSources = listTokenSources()
+    const previousModes = config.claude.safe_mode
+    const source = {
+      id: sourceId, kind: 'test', agent: 'claude' as const, display: sourceId, enabled: true,
+      defaultModel: 'GLM-5.3', modelCatalogState: { status: 'ready' as const, updatedAt: 1 },
+      models: ['GLM-5.3', 'GLM-5.3-Flash'].map(model => ({ model, display: model,
+        efforts: ['max' as const], defaultEffort: 'max' as const })),
+      refreshModels: async () => {}, spawnEnv: (env: Record<string, string | undefined>) => env,
+      resolveSpawnModel: (model: string) => `${model}[1m]`,
+      readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    }
+    registerTokenSource(source)
+    config.claude.safe_mode = { ...previousModes, [sourceId]: models }
+    const session = new Session(`translation-boundary-${sourceId}`, 'chat_id') as any
+    const proc = Object.assign(new FakeAgentProc('claude', 'boundary-native-session', sourceId), {
+      translationEnabled: initialTranslation,
+    })
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = sourceId
+    session.selectedModel = 'GLM-5.3'
+    session.selectedEffort = 'max'
+    session.modelPanels.set('boundary-panel', { models: source.models.map(entry => ({
+      provider: 'claude', sourceId, model: entry.model, displayName: entry.display,
+      efforts: [{ effort: 'max', isDefault: true }],
+    })) })
+    try {
+      await run(session, proc)
+    } finally {
+      session.dispose()
+      config.claude.safe_mode = previousModes
+      resetTokenSourceRegistry()
+      for (const entry of previousSources) registerTokenSource(entry)
+    }
+  }
+
+  for (const fromEnabled of [true, false]) {
+    test(`idle model change ${fromEnabled ? 'out of' : 'into'} translation replaces only the process and preserves native history`, async () => {
+      await withSelection('glm', ['GLM-5.3'], fromEnabled, async (session, proc) => {
+        session.selectedModel = fromEnabled ? 'GLM-5.3' : 'GLM-5.3-Flash'
+        const target = fromEnabled ? 'GLM-5.3-Flash' : 'GLM-5.3'
+        const result = await session.onModelEffortSelect(target, 'max', 'boundary-panel', '', 'claude')
+        expect(result.ok).toBe(true)
+        expect(proc.setModelSettingsCalls).toEqual([])
+        expect(proc.killCalls).toBe(1)
+        expect(session.selectedModel).toBe(target)
+        expect(boundResumes).toContainEqual([session.sessionName, 'boundary-native-session', 'claude'])
+        expect(session.lastSessionId).toBe('boundary-native-session')
+      })
+    })
+  }
+
+  test('a running task cannot change the configured translation boundary', async () => {
+    await withSelection('glm', ['GLM-5.3'], true, async (session, proc) => {
+      session.currentTurn = { ...turnState(), provider: 'claude' }
+      const result = await session.onModelEffortSelect('GLM-5.3-Flash', 'max', 'boundary-panel', '', 'claude')
+      expect(result.ok).toBe(false)
+      expect(result.message).toContain('请等当前任务结束后再选择')
+      expect(proc.setModelSettingsCalls).toEqual([])
+      expect(proc.killCalls).toBe(0)
+      expect(session.selectedModel).toBe('GLM-5.3')
+      expect(boundResumes).toEqual([])
+    })
+  })
+
+  for (const enabled of [true, false]) {
+    test(`models sharing translation=${enabled} retain the existing hot update`, async () => {
+      await withSelection('glm', enabled ? ['*'] : [], enabled, async (session, proc) => {
+        const result = await session.onModelEffortSelect('GLM-5.3-Flash', 'max', 'boundary-panel', '', 'claude')
+        expect(result.ok).toBe(true)
+        expect(proc.setModelSettingsCalls).toEqual([['GLM-5.3-Flash[1m]', 'max']])
+        expect(proc.killCalls).toBe(0)
+        expect(session.proc).toBe(proc)
+      })
+    })
+  }
+
+  test('an explicitly disabled subscription source does not force translation or process replacement', async () => {
+    await withSelection('claude-sub', [], false, async (session, proc) => {
+      const result = await session.onModelEffortSelect('GLM-5.3-Flash', 'max', 'boundary-panel', '', 'claude')
+      expect(result.ok).toBe(true)
+      expect(proc.setModelSettingsCalls).toEqual([['GLM-5.3-Flash[1m]', 'max']])
+      expect(proc.killCalls).toBe(0)
+      expect(session.proc).toBe(proc)
+    })
+  })
+
+  test('an unspecified selection compares the catalog default before spawn alias resolution', async () => {
+    await withSelection('glm', ['GLM-5.3'], true, async (session, proc) => {
+      session.selectedModel = null
+      expect(session.modelSelectionNeedsProcessStop()).toBe(false)
+      Object.assign(proc, { translationEnabled: false })
+      expect(session.modelSelectionNeedsProcessStop()).toBe(true)
+    })
+  })
+})
+
+describe('Session shared cards preserve warm agent resumes', () => {
+  test('a completed archived agent resumes in the shared row with native task ownership', async () => {
+    const session = new Session('shared-warm-resume', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'warm-native-session')
+    session.wireProc(proc)
+    session.backgroundTasks = [{ id: 'warm-task', toolUseId: 'warm-parent', type: 'subagent',
+      subagentType: 'executor', description: '检查接口', status: 'completed', startedAt: Date.now(),
+      endTime: Date.now(), summary: '首次完成', steps: [], isBackgrounded: true }]
+    await session.refreshBackgroundCardFull()
+    expect(session.bgArchive).toHaveLength(1)
+    proc.emit('bg_task_updated', { task_id: 'warm-task', patch: { status: 'running', description: '继续检查接口' } })
+    expect(session.backgroundTasks[0]).toMatchObject({ id: 'warm-task', toolUseId: 'warm-parent',
+      status: 'running', resumed: true, description: '继续检查接口' })
+    proc.emit('bg_task_settled', { task_id: 'warm-task', status: 'completed', summary: '续跑完成' })
+    await session.refreshBackgroundCardFull()
+    expect(session.backgroundTasks[0]).toMatchObject({ status: 'completed', summary: '续跑完成', resumed: true })
+    await session.resetBackgroundTasks()
+    expect(session.bgArchive).toEqual([])
+    await session.agentCards.closeChat('chat_id')
+  })
+
+  test('an archived agent with only a late result publishes through shared cards', async () => {
+    const session = new Session('shared-warm-result', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'warm-native-result')
+    session.wireProc(proc)
+    session.bgArchive = [{ id: 'warm-task', toolUseId: 'warm-parent', subagentType: 'reviewer', description: '复核接口' }]
+    proc.emit('bg_task_settled', { task_id: 'warm-task', status: 'completed', summary: '续跑结果' })
+    await session.backgroundSync
+    expect(session.backgroundTasks[0]).toMatchObject({ id: 'warm-task', resumed: true,
+      type: 'subagent', summary: '续跑结果', status: 'completed' })
+    expect(sentCards).toHaveLength(1)
+    expect(updatedCards).toEqual([])
+    await session.resetBackgroundTasks()
+    await session.agentCards.closeChat('chat_id')
   })
 })

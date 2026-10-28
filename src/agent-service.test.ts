@@ -1,18 +1,16 @@
 import { afterAll, describe, expect, test } from 'bun:test'
-import { mkdtempSync, mkdirSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, mkdirSync, readFileSync, realpathSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { agentRunCard } from './cards/agents'
 import { AgentService, type AgentServiceDeps } from './agent-service'
 import type { AgentPrincipal } from './agent-context'
-import type { AgentIdentity, AgentIdentityCatalog } from './agent-identities'
+import { agentIdentityId, type AgentIdentity, type AgentIdentityCatalog } from './agent-identities'
 import { AgentWorkerFailure, type AgentWorkerHandle, type AgentWorkerResult } from './agent-runner'
 import type { AgentInputRequest, AgentRunSnapshot } from './agent-run-types'
 import { AGENT_RUNS_DIR } from './paths'
 import { projectProfiles, sentLocalFiles } from './feishu-test-mock'
-
-/** D-11 口径 3:会话归属的 worker principal 不得再委派(文案与抛错路径见 agent-service.ts)。 */
-const NESTED_DELEGATION_ERROR = 'Delegated Agents cannot delegate again; ask the main Agent to assign additional work.'
+import { config } from './config'
 
 function identity(id: string, name = id): AgentIdentity {
   return {
@@ -132,6 +130,288 @@ function harness(opts: {
   return { service, root: service.rootPrincipal(session), artifacts, textArtifacts, artifactReads, texts }
 }
 
+describe('Lodestar Agent Claude subscription admission', () => {
+  const restriction = "Lodestar Agent does not support Claude subscription calls; comply with Claude's user agreement."
+  const blocked = [
+    { ...identity('claude-sub'), model: 'opus' },
+    { ...identity('claude-subscription'), model: 'unmarked-model' },
+  ]
+  const thirdParty = [
+    { ...identity('packy'), model: 'claude-opus-4-6', modelDisplay: 'Claude Opus' },
+    { ...identity('openrouter'), model: 'anthropic/claude-sonnet-4.6', modelDisplay: 'Claude Sonnet' },
+  ]
+  for (const mode of ['session', 'project'] as const) {
+    test(`${mode}: stale Claude subscription identities and mixed batches fail before cards, artifacts or processes`, async () => {
+      let cards = 0, starts = 0
+      const h = harness({ identities: [identity('glm'), ...blocked],
+        sendCard: async () => { cards++; return 'unexpected-card' },
+        startWorker: () => { starts++; return resolvedHandle(result('unexpected-session')) },
+      })
+      const principal = mode === 'session' ? h.root : h.service.projectPrincipal({ owner: {
+        kind: 'project', name: session.sessionName, chatId: session.chatId, workDir: session.workDir,
+      } })
+      const ids = [...blocked.map(item => item.id), agentIdentityId('claude-sub', 'opus'),
+        agentIdentityId('claude-subscription', 'unmarked-model')]
+      for (const id of ids) {
+        for (const identityIds of [[id], ['agent:glm', id]]) {
+          await expect(h.service.startRun(principal, { identityIds, description: '准入校验', prompt: 'work' }))
+            .rejects.toThrow(restriction)
+        }
+      }
+      expect(cards).toBe(0)
+      expect(starts).toBe(0)
+      expect(h.artifacts).toHaveLength(0)
+      expect(h.textArtifacts.size).toBe(0)
+    })
+
+    test(`${mode}: third-party Claude models support new runs and both continuation routes`, async () => {
+      for (const selected of thirdParty) {
+        const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
+        const h = harness({ identities: [selected], startWorker: opts => {
+          calls.push(opts)
+          return resolvedHandle(result(opts.resumeSessionId ?? 'third-party-native'))
+        } })
+        const principal = mode === 'session' ? h.root : h.service.projectPrincipal({ owner: {
+          kind: 'project', name: session.sessionName, chatId: session.chatId, workDir: session.workDir,
+        } })
+        const fresh = await h.service.startRun(principal, {
+          identityIds: [selected.id], description: '中转站模型', prompt: 'work',
+        })
+        await waitFor(h.service, principal, fresh.runId, 'completed')
+        const resumed = await h.service.startRun(principal, {
+          identityIds: [], sessionId: 'third-party-native', description: '继续中转站模型', prompt: 'next',
+        })
+        await waitFor(h.service, principal, resumed.runId, 'completed')
+        const followed = await h.service.followUp(principal, resumed.runId, { description: '继续任务', prompt: 'next' })
+        await waitFor(h.service, principal, followed.runId, 'completed')
+        expect(calls.map(call => call.identity)).toEqual([selected, selected, selected])
+        expect(calls.map(call => call.resumeSessionId)).toEqual([undefined, 'third-party-native', 'third-party-native'])
+      }
+    })
+
+    test(`${mode}: old subscription history refuses implicit or explicit subscription recovery and permits explicit supported sources`, async () => {
+      for (const oldIdentity of [blocked[0]!, blocked[1]!, {
+        ...identity('legacy-unlisted'), tokenSourceId: 'claude-sub', model: 'opus',
+      }]) {
+        const history = completedHistory(1)[0]!
+        Object.assign(history.workers[0]!, {
+          identityId: oldIdentity.id, tokenSourceId: oldIdentity.tokenSourceId, model: oldIdentity.model,
+        })
+        if (mode === 'project') history.owner = {
+          kind: 'project', name: session.sessionName, chatId: session.chatId, workDir: session.workDir,
+        }
+        let cards = 0
+        const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
+        const h = harness({ identities: [identity('glm'), ...thirdParty, ...blocked], loadArtifacts: () => [history],
+          sendCard: async () => `card-${++cards}`,
+          startWorker: opts => { calls.push(opts); return resolvedHandle(result(opts.resumeSessionId!)) },
+        })
+        const principal = mode === 'session' ? h.root : h.service.projectPrincipal({ owner: {
+          kind: 'project', name: session.sessionName, chatId: session.chatId, workDir: session.workDir,
+        } })
+        const initialArtifacts = h.artifacts.length
+        for (const selected of [undefined, ...blocked.map(item => item.id), agentIdentityId('claude-sub', 'opus')]) {
+          await expect(h.service.startRun(principal, {
+            identityIds: selected ? [selected] : [], sessionId: 'sid-history-0', description: '恢复旧任务', prompt: 'next',
+          })).rejects.toThrow(restriction)
+          await expect(h.service.followUp(principal, history.runId, {
+            identityId: selected, description: '继续旧任务', prompt: 'next',
+          })).rejects.toThrow(restriction)
+        }
+        expect(cards).toBe(0)
+        expect(calls).toHaveLength(0)
+        expect(h.artifacts).toHaveLength(initialArtifacts)
+        for (const allowed of [identity('glm'), ...thirdParty]) {
+          const resumed = await h.service.startRun(principal, {
+            identityIds: [allowed.id], sessionId: 'sid-history-0', description: '切换来源恢复', prompt: 'next',
+          })
+          await waitFor(h.service, principal, resumed.runId, 'completed')
+          const followed = await h.service.followUp(principal, history.runId, {
+            identityId: allowed.id, description: '切换来源继续', prompt: 'next',
+          })
+          await waitFor(h.service, principal, followed.runId, 'completed')
+        }
+        expect(calls).toHaveLength(6)
+        expect(calls.every(call => call.identity.provider === 'claude' && call.identity.tokenSourceId !== 'claude-sub'
+          && call.resumeSessionId === 'sid-history-0')).toBe(true)
+      }
+    })
+  }
+})
+
+test('verified worker presentation stays on live cards without changing native API or history', async () => {
+  const previousSafeMode = config.claude.safe_mode
+  config.claude.safe_mode = { glm: ['*'] }
+  try {
+    const cards: string[] = []
+    const h = harness({
+      identities: [identity('glm')],
+      startWorker: options => {
+        expect(options.callbacks?.onDisplayContext?.({ description: '检查接口', prompt: '检查接口实现' })).toBe(true)
+        return resolvedHandle({ ...result('native-glm', 'Native result'), displayOutput: '检查结果' })
+      },
+      sendCard: async (_chatId, card) => { cards.push(JSON.stringify(card)); return 'message-1' },
+      replaceElementChecked: async (_card, _id, element) => { cards.push(JSON.stringify(element)); return true },
+    })
+    const started = await h.service.startRun(h.root, { identityIds: ['agent:glm'], description: 'Inspect API', prompt: 'Inspect API implementation' })
+    const completed = await waitFor(h.service, h.root, started.runId, 'completed')
+    expect(completed.workers[0]!.output).toBe('Native result')
+    expect(JSON.stringify(completed)).not.toContain('display')
+    expect(completed.workers[0]!.translationEnabled).toBeUndefined()
+    expect(cards[0]).toContain('正在翻译任务说明')
+    expect(cards.every(card => !card.includes('Inspect API'))).toBe(true)
+    expect(cards.some(card => card.includes('检查接口实现') && card.includes('检查结果'))).toBe(true)
+    const durable = h.artifacts.at(-1) as AgentRunSnapshot
+    const worker = durable.workers[0]!
+    expect(worker.output).toBe('')
+    expect(JSON.stringify(h.artifacts)).not.toContain('display')
+    expect(worker.translationEnabled).toBeUndefined()
+    expect(h.textArtifacts.get(join(AGENT_RUNS_DIR, worker.outputArtifact!))).toBe('Native result')
+    expect(h.textArtifacts.size).toBe(2)
+    expect([...h.textArtifacts.keys()].some(path => path.includes('.display-'))).toBe(false)
+  } finally {
+    config.claude.safe_mode = previousSafeMode
+  }
+})
+
+test.each(['glm', 'deepseek'])('unconfigured %s workers retain their native presentation', async source => {
+  const cards: string[] = []
+  const h = harness({ identities: [identity(source)], startWorker: options => {
+    expect(options.identity.tokenSourceId).toBe(source)
+    return resolvedHandle(result(`${source}-native`, 'English result'))
+  }, sendCard: async (_chat, card) => { cards.push(JSON.stringify(card)); return `${source}-message` } })
+  const run = await h.service.startRun(h.root, { identityIds: [`agent:${source}`], description: 'Inspect API', prompt: 'Check the explanation' })
+  const completed = await waitFor(h.service, h.root, run.runId, 'completed')
+  expect(completed.workers[0]!.tokenSourceId).toBe(source)
+  expect(completed.workers[0]!.translationEnabled).toBeUndefined()
+  expect(completed.workers[0]!.output).toBe('English result')
+  expect(cards[0]).toContain('Inspect API')
+  expect(cards[0]).not.toContain('正在翻译任务说明')
+})
+
+test.each([
+  ['glm', 'GLM-5.3', true],
+  ['glm', 'GLM-5.3-Flash', false],
+  ['deepseek', 'deepseek-chat', false],
+] as const)('worker cards honor safety configuration for %s/%s: %s', async (source, model, translated) => {
+  const previousSafeMode = config.claude.safe_mode
+  config.claude.safe_mode = { 'claude-sub': [], glm: ['GLM-5.3'] }
+  try {
+    const cards: string[] = []
+    const selected = { ...identity(source), model }
+    const h = harness({ identities: [selected], startWorker: options => {
+      expect(options.identity.tokenSourceId).toBe(source)
+      expect(options.identity.model).toBe(model)
+      if (translated) expect(options.callbacks?.onDisplayContext?.({ description: '检查接口', prompt: '检查接口实现' })).toBe(true)
+      return resolvedHandle({ ...result(`native-${source}`, 'Native result'), ...(translated ? { displayOutput: '检查结果' } : {}) })
+    },
+    sendCard: async (_chat, card) => { cards.push(JSON.stringify(card)); return 'message-1' },
+    replaceElementChecked: async (_card, _id, element) => { cards.push(JSON.stringify(element)); return true },
+    })
+    const run = await h.service.startRun(h.root, { identityIds: [selected.id], description: 'Inspect API', prompt: 'Inspect API implementation' })
+    const completed = await waitFor(h.service, h.root, run.runId, 'completed')
+    expect(completed.workers[0]!.output).toBe('Native result')
+    expect(completed.workers[0]!.translationEnabled).toBeUndefined()
+    expect(cards[0]!.includes('正在翻译任务说明')).toBe(translated)
+    if (translated) {
+      expect(cards.every(card => !card.includes('Inspect API'))).toBe(true)
+      expect(cards.some(card => card.includes('检查结果'))).toBe(true)
+    } else {
+      expect(cards[0]).toContain('Inspect API')
+      expect(cards.some(card => card.includes('Native result'))).toBe(true)
+      expect(cards.every(card => !card.includes('译文 MISS'))).toBe(true)
+    }
+  } finally {
+    config.claude.safe_mode = previousSafeMode
+  }
+})
+
+test('evicted native history ignores obsolete presentation artifact references', () => {
+  const history = completedHistory(520)
+  Object.assign(history[0]!.workers[0]!, {
+    displayOutput: '历史结果', displayPrompt: '历史任务说明', displayDescription: '历史任务',
+    displayOutputArtifact: 'missing-display-output.txt', displayPromptArtifact: 'missing-display-prompt.txt',
+  })
+  const h = harness({ loadArtifacts: () => history })
+  expect(h.service.getRun(h.root, 'agent_history_0').workers[0]!.output).toBe('original output 0')
+  expect(h.artifactReads).toHaveLength(2)
+  const native = h.service.getRun(h.root, 'agent_history_0')
+  expect(native.prompt).toBe('original prompt 0')
+  expect(native.workers[0]!.output).toBe('original output 0')
+  expect(JSON.stringify(native)).not.toContain('display')
+  expect(h.artifactReads).toHaveLength(4)
+  expect(h.artifactReads).not.toContain('missing-display-output.txt')
+  expect(h.artifactReads).not.toContain('missing-display-prompt.txt')
+})
+
+test.each(['displayOutputArtifact', 'displayPromptArtifact'] as const)('startup and native API ignore an obsolete missing %s', field => {
+  const saved = completedHistory(1)[0]!
+  saved.runId = `agent_missing_${field}`
+  Object.assign(saved.workers[0]!, { [field]: `${saved.runId}.missing.txt`, translationEnabled: true })
+  saved.promptArtifact = `${saved.runId}.prompt.txt`
+  saved.workers[0]!.outputArtifact = `${saved.runId}.output.txt`
+  const artifact = join(AGENT_RUNS_DIR, `${saved.runId}.json`)
+  const promptArtifact = join(AGENT_RUNS_DIR, saved.promptArtifact)
+  const outputArtifact = join(AGENT_RUNS_DIR, saved.workers[0]!.outputArtifact)
+  mkdirSync(AGENT_RUNS_DIR, { recursive: true })
+  writeFileSync(artifact, JSON.stringify(saved))
+  writeFileSync(promptArtifact, saved.prompt)
+  writeFileSync(outputArtifact, saved.workers[0]!.output)
+  try {
+    const service = new AgentService()
+    const native = service.getRun(service.rootPrincipal(session), saved.runId)
+    expect(native.prompt).toBe('original prompt 0')
+    expect(native.workers[0]!.output).toBe('original output 0')
+    expect(native.workers[0]!.translationEnabled).toBeUndefined()
+    expect(native.workers[0]).not.toHaveProperty(field)
+    const durable = JSON.parse(readFileSync(artifact, 'utf8'))
+    expect(durable.workers[0]).not.toHaveProperty(field)
+    expect(durable.workers[0].translationEnabled).toBeUndefined()
+  } finally {
+    for (const path of [artifact, promptArtifact, outputArtifact]) rmSync(path)
+  }
+})
+
+test('translated pending questions keep original API keys and clear their display after answering', async () => {
+  const native: AgentInputRequest = { requestId: 'translated-question', questions: [{ id: 'Which test?', question: 'Which test?', options: [{ label: 'Unit test' }] }] }
+  const display: AgentInputRequest = { requestId: native.requestId, questions: [{ id: 'Which test?', question: '选择哪种测试？', options: [{ label: '单元测试' }] }] }
+  const control = controlledHandle()
+  let pending: AgentInputRequest | null = null
+  const cards: string[] = []
+  const h = harness({
+    identities: [identity('glm')],
+    startWorker: options => {
+      queueMicrotask(() => {
+        pending = native
+        options.callbacks?.onNeedsInput?.(native, display)
+        options.callbacks?.onProgress?.({ at: new Date().toISOString(), phase: 'started', tool: 'Bash', detail: 'Inspect files', displayDetail: '检查文件' })
+      })
+      return {
+        ...control.handle, pendingInput: () => pending, displayPendingInput: () => pending ? display : null,
+        answer(requestId, answers) {
+          expect(requestId).toBe(native.requestId)
+          expect(answers).toEqual({ 'Which test?': 'Unit test' })
+          pending = null
+        },
+      }
+    },
+    replaceElementChecked: async (_card, _id, element) => { cards.push(JSON.stringify(element)); return true },
+  })
+  const started = await h.service.startRun(h.root, { identityIds: ['agent:glm'], description: 'Inspect API', prompt: 'Inspect API' })
+  const waiting = await waitFor(h.service, h.root, started.runId, 'needs_input')
+  expect(waiting.workers[0]!.pendingInput).toEqual(native)
+  expect(waiting.workers[0]!.steps[0]!.detail).toBe('Inspect files')
+  expect(JSON.stringify(waiting)).not.toContain('display')
+  expect(cards.some(card => card.includes('选择哪种测试？') && card.includes('单元测试'))).toBe(true)
+  await h.service.answer(h.root, started.runId, { requestId: native.requestId, answers: { 'Which test?': 'Unit test' } })
+  const durable = h.artifacts.at(-1) as AgentRunSnapshot
+  expect(durable.workers[0]!.pendingInput).toBeUndefined()
+  expect(durable.workers[0]!.displayPendingInput).toBeUndefined()
+  expect(cards.at(-1)).not.toContain('选择哪种测试？')
+  control.resolve({ ...result('translated-question-session'), displayOutput: '已完成' })
+  await waitFor(h.service, h.root, started.runId, 'completed')
+})
+
 async function waitFor(
   service: AgentService,
   principal: AgentPrincipal,
@@ -245,7 +525,7 @@ describe('AgentService', () => {
       const other = service.rootPrincipal({ ...session, workDir })
       expect(() => service.getRun(other, first.runId)).toThrow('different Session')
       await expect(service.startRun(other, { description: '同项目恢复', identityIds: [], sessionId: terminal.workers[0]!.sessionId, prompt: 'next' }))
-        .rejects.toThrow('different project or group')
+        .rejects.toThrow('different project or conversation ID (chat_id)')
       await expect(service.cancelRun(other, first.runId)).rejects.toThrow('different Session')
     }
     await expect(service.followUp(root, first.runId, { description: '越界目录', prompt: 'next', workDir: join(testDir, 'other') }))
@@ -666,7 +946,7 @@ describe('AgentService', () => {
       expect(() => service.getRun(outsider, 'agent_history_0')).toThrow()
       if (other.chatId || other.workDir) {
         await expect(service.startRun(outsider, { description: '越界恢复', identityIds: [], sessionId: 'sid-history-0', prompt: 'next' }))
-          .rejects.toThrow('different project or group')
+          .rejects.toThrow('different project or conversation ID (chat_id)')
       }
     }
     expect(artifactReads).toHaveLength(0)
@@ -695,7 +975,7 @@ describe('AgentService', () => {
     })
   }
 
-  test('resumes with another model within the project and rejects cross-project or cross-group callers', async () => {
+  test('resumes with another model within the project and rejects callers from other projects or conversation IDs', async () => {
     const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
     const { service, root } = harness({
       identities: [identity('a'), identity('b')],
@@ -711,9 +991,9 @@ describe('AgentService', () => {
     for (const other of [{ chatId: 'other-chat' }, { workDir: '/other-repo' }]) {
       const outsider = service.rootPrincipal({ ...session, ...other })
       await expect(service.startRun(outsider, { description: '跨范围恢复', identityIds: [], sessionId: 'sid-agent:a', prompt: 'next' }))
-        .rejects.toThrow('different project or group')
+        .rejects.toThrow('different project or conversation ID (chat_id)')
       await expect(service.followUp(outsider, first.runId, { description: '跨范围恢复', identityId: 'agent:a', prompt: 'next' }))
-        .rejects.toThrow('different project or group')
+        .rejects.toThrow('different project or conversation ID (chat_id)')
     }
     const sameProject = service.rootPrincipal({ ...session, sessionName: 'another-session' })
     const resumed = await service.startRun(sameProject, { description: '同项目恢复', identityIds: [], sessionId: 'sid-agent:a', prompt: 'next' })
@@ -823,7 +1103,7 @@ describe('AgentService', () => {
 
   test.each(['session', 'project'] as const)('%s workers apply the ownership delegation policy and resume descendants without a depth limit', async kind => {
     const calls = new Map<string, { opts: Parameters<AgentServiceDeps['startWorker']>[0]; control: ReturnType<typeof controlledHandle> }>()
-    const { service, root, artifacts } = harness({ startWorker: opts => {
+    const { service, root } = harness({ startWorker: opts => {
       const control = controlledHandle()
       calls.set(opts.prompt, { opts, control })
       return control.handle
@@ -840,22 +1120,6 @@ describe('AgentService', () => {
     }
     try {
       const parent = await spawn(owner, 'parent', 'packages/app')
-      if (kind === 'session') {
-        // D-11 口径 3:会话归属的 worker principal 首行即拒再委派(拒绝先于任何副作用);
-        // 项目归属沿用上游多层语义。
-        const before = artifacts.length
-        await expect(service.startRun(parent.principal, { ...request, prompt: 'child' }))
-          .rejects.toThrow(NESTED_DELEGATION_ERROR)
-        await expect(service.followUp(parent.principal, parent.run.runId, { description: '继续委派', prompt: 'follow-up' }))
-          .rejects.toThrow(NESTED_DELEGATION_ERROR)
-        expect(calls.size).toBe(1)
-        expect(artifacts.length).toBe(before)
-        await expect(service.cancelRun(parent.principal, parent.run.runId)).rejects.toThrow('containing run')
-        calls.get('parent')!.control.resolve(result('parent-native', 'parent-native'))
-        const terminal = await waitFor(service, owner, parent.run.runId, 'completed')
-        expect(terminal.workers[0]!.output).toBe('parent-native')
-        return
-      }
       const child = await spawn(parent.principal, 'child')
       expect(child.run).toMatchObject({ parentRunId: parent.run.runId, parentKind: 'delegate', depth: 1,
         workDir: parent.run.workDir, owner: parent.run.owner })
@@ -889,7 +1153,10 @@ describe('AgentService', () => {
       expect(followed).toMatchObject({ parentRunId: parent.run.runId, parentKind: 'delegate', depth: 1,
         resumedFromRunId: resumed.runId })
       expect(service.getRun(parent.principal, followed.runId).runId).toBe(followed.runId)
-      for (const { opts } of calls.values()) expect(opts.projectBound).toBe(kind === 'project')
+      for (const { opts } of calls.values()) {
+        expect(opts.projectBound).toBe(kind === 'project')
+        expect(opts.allowDelegation).not.toBe(false)
+      }
 
       await service.cancelRun(owner, parent.run.runId, 'stop nested task tree')
       for (const descendant of descendants.slice(1)) {
@@ -918,7 +1185,7 @@ describe('AgentService', () => {
     service.presentation.add = async snapshot => {
       // Hold admission before entering the shared chat writer, so ancestor
       // results can finish while this child is still opening its card.
-      if (++cards === (kind === 'session' ? 2 : 3)) { cardEntered(); await released }
+      if (++cards === 3) { cardEntered(); await released }
       return add(snapshot)
     }
     const owner = kind === 'session' ? root : service.projectPrincipal({
@@ -927,22 +1194,6 @@ describe('AgentService', () => {
     const request = { description: '开卡期间取消', identityIds: ['agent:a'], prompt: 'task' }
     try {
       const parent = await service.startRun(owner, request)
-      if (kind === 'session') {
-        // D-11 口径 3:会话归属的 worker 不再派生后代;待开卡的子 run 只能由
-        // 会话主的 follow-up 产生,取消父 run 仍须在开卡窗口内命中它。
-        await waitForCondition(() => calls.length === 1)
-        controls[0].resolve(result('parent-native'))
-        await waitFor(service, owner, parent.runId, 'completed')
-        const creating = service.followUp(owner, parent.runId, { description: '开卡期间取消', prompt: 'pending child' })
-        await entered
-        expect(await service.cancelRun(owner, parent.runId, 'cancel pending descendant')).toBe(true)
-        releaseCard()
-        const child = await creating
-        expect(child.status).toBe('cancelled')
-        expect(service.getRun(owner, parent.runId).status).toBe('completed')
-        expect(calls).toHaveLength(1)
-        return
-      }
       await waitForCondition(() => calls.length === 1)
       const worker = service.principalForCapability(calls[0].hostEnv.LODESTAR_AGENT_CAPABILITY!)!
       const child = await service.startRun(worker, request)
@@ -962,8 +1213,7 @@ describe('AgentService', () => {
     } finally { releaseCard(); await service.shutdown('test cleanup') }
   })
 
-  // D-11 口径 3 后,后代 run 只能由主 Agent 的 follow-up 产生(worker principal
-  // 首行即拒),故子树/自取消语义改用 follow-up 子 run 验证。
+  // Follow-up children retain the same subtree cancellation and self-mutation boundaries.
   test('scopes follow-up child runs to the parent subtree and recursively cancels descendants', async () => {
     const controls: ReturnType<typeof controlledHandle>[] = []
     const capabilities: string[] = []
@@ -1571,9 +1821,9 @@ describe('project-owned Agent runs', () => {
     const principal = h.service.projectPrincipal(context())
     const run = await h.service.startRun(principal, request)
     await waitFor(h.service, principal, run.runId, 'running')
-    await expect(h.service.cancelProjectRunFromCard(run.runId, 'other', run.cardMessageId!, 'user')).rejects.toThrow('当前群')
-    await expect(h.service.cancelProjectRunFromCard(run.runId, run.chatId, 'forged', 'user')).rejects.toThrow('当前群')
-    await expect(h.service.cancelProjectRunFromCard(run.runId, run.chatId, run.cardMessageId!, '')).rejects.toThrow('当前群')
+    await expect(h.service.cancelProjectRunFromCard(run.runId, 'other', run.cardMessageId!, 'user')).rejects.toThrow('当前对话 ID（chat_id）')
+    await expect(h.service.cancelProjectRunFromCard(run.runId, run.chatId, 'forged', 'user')).rejects.toThrow('当前对话 ID（chat_id）')
+    await expect(h.service.cancelProjectRunFromCard(run.runId, run.chatId, run.cardMessageId!, '')).rejects.toThrow('当前对话 ID（chat_id）')
     expect(await h.service.cancelProjectRunFromCard(run.runId, run.chatId, run.cardMessageId!, 'user')).toBe(true)
     expect(h.service.getRun(principal, run.runId).status).toBe('cancelled')
   })
@@ -1788,7 +2038,7 @@ describe('native session-id recovery', () => {
 })
 
 describe('project-owned session identity boundaries', () => {
-  test('explicit identity and workdir cannot import a foreign project or group session', async () => {
+  test('explicit identity and workdir cannot import a session from another project or conversation ID', async () => {
     let starts = 0
     let cards = 0
     const h = harness({ loadArtifacts: () => completedHistory(1), identities: [identity('a'), identity('codex')],
@@ -1802,10 +2052,10 @@ describe('project-owned session identity boundaries', () => {
       const principal = h.service.projectPrincipal({ owner })
       for (const identityIds of [[], ['agent:a'], ['agent:codex']]) {
         await expect(h.service.startRun(principal, { identityIds, sessionId: 'sid-history-0', description: '禁止越界', prompt: 'next', workDir: session.workDir }))
-          .rejects.toThrow('different project or group')
+          .rejects.toThrow('different project or conversation ID (chat_id)')
       }
       await expect(h.service.followUp(principal, 'agent_history_0', { description: '禁止越界续跑', prompt: 'next', identityId: 'agent:a' }))
-        .rejects.toThrow('different project or group')
+        .rejects.toThrow('different project or conversation ID (chat_id)')
     }
     expect(starts).toBe(0)
     expect(cards).toBe(0)
@@ -1826,7 +2076,7 @@ describe('project-owned session identity boundaries', () => {
     conflicting.chatId = 'other-chat'
     const ambiguous = harness({ loadArtifacts: () => [history, conflicting] })
     await expect(ambiguous.service.startRun(ambiguous.root, { identityIds: ['agent:a'], sessionId: 'sid-history-0', description: '归属冲突', prompt: 'next' }))
-      .rejects.toThrow('different project or group')
+      .rejects.toThrow('different project or conversation ID (chat_id)')
   })
 
   test('project aliases share session ids but resume directories cannot escape the project', async () => {

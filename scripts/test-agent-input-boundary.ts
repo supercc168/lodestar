@@ -205,14 +205,10 @@ async function runCase(name: string, projectBound: boolean, resumeSessionId?: st
   assert.equal(active.needsInput, projectBound ? 0 : 1)
   assert(active.summaries.every(item => item.questionToolPresent === !projectBound))
   assert(active.summaries.every(item => item.planApprovalToolsPresent === !projectBound))
-  // 合并语义(D-11 口径 3):会话归属的 worker 在 SDK 层硬关原生委派
-  // (disallowedTools: Agent/Task → 委派工具缺席),项目归属延续上游多层委派
-  // (Workflow + Agent/Task),输入策略切换不改变该口径。
   assert(active.summaries.every(item => {
     const names = item.toolNames as string[]
-    const canDelegate = names.includes('Agent') || names.includes('Task')
-    return projectBound ? names.includes('Workflow') && canDelegate : !canDelegate
-  }), projectBound ? 'native delegation tools were lost' : 'session-owned worker exposed native delegation tools')
+    return names.includes('Workflow') && (names.includes('Agent') || names.includes('Task'))
+  }), 'native delegation tools were lost')
   assert(active.summaries.every(item => item.projectInstructionsPresent === projectBound))
   assert(active.summaries.every(item => item.delegatedQuestionInstructionsPresent === !projectBound))
   assert(active.summaries.every(item => item.questionToolInstructionsPresent === !projectBound))

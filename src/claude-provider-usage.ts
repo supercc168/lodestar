@@ -17,7 +17,7 @@
  */
 
 import { claudeModelProfile } from './claude-models'
-import { log } from './log'
+import { log, logError } from './log'
 
 const API_TIMEOUT_MS = 10_000
 
@@ -267,7 +267,7 @@ async function fetchClaudeProviderUsage(model: string): Promise<ClaudeProviderUs
     return snapshotFromBody(kind, providerName, await res.text(), res.headers.get('content-type'))
   } catch (e: any) {
     const reason = e?.name === 'AbortError' ? `timeout after ${API_TIMEOUT_MS}ms` : (e?.message ?? String(e))
-    log(`claude-provider-usage: fetch failed for ${providerName}: ${reason}`)
+    log("claude-provider-usage: fetch failed")
     return { state: 'network', providerName, reason }
   } finally {
     clearTimeout(timer)
@@ -314,7 +314,7 @@ export async function readDeepseekBalance(
     return snapshotFromBody(kind, providerName, await res.text(), res.headers.get('content-type'))
   } catch (e: any) {
     const reason = e?.name === 'AbortError' ? `timeout after ${API_TIMEOUT_MS}ms` : (e?.message ?? String(e))
-    log(`claude-provider-usage: DSH balance fetch failed for ${providerName}: ${reason}`)
+    log("claude-provider-usage: DSH balance fetch failed")
     return { state: 'network', providerName, reason }
   } finally {
     clearTimeout(timer)
@@ -353,7 +353,7 @@ export async function readClaudeProviderUsage(model: string): Promise<ClaudeProv
       return d
     })
     .catch((e): ClaudeProviderUsageSnapshot => {
-      log(`claude-provider-usage: fetch threw for ${key}: ${e}`)
+      logError("claude-provider-usage: fetch threw", e)
       inFlightByModel.delete(key)
       return cacheByModel.get(key) ?? { state: 'network', reason: String(e) }
     })

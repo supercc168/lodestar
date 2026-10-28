@@ -6,7 +6,7 @@ import type { Session } from './session'
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
-import { log } from './log'
+import { log, logError } from './log'
 import {
   AGY_DEFAULT_MODEL,
   AGY_HOST_TIMEOUT_MS,
@@ -202,7 +202,7 @@ export function beginAgyForwardToCodex(s: Session, resultIdRaw: string, userOpen
     } catch (e) {
       record.used = false
       const msg = `❌ agy 结果转发 ${backend} 失败: ${messageOf(e)}`
-      log(`session "${s.sessionName}": ${msg}`)
+      log("session-agy: state changed")
       await feishu.sendTextRaw(s.chatId, msg)
     }
   })()
@@ -251,7 +251,7 @@ export async function runAgyCommand(s: Session, prompt: string): Promise<void> {
     try {
       cardId = await cardkit.convertMessageToCard(messageId)
     } catch (e) {
-      log(`session "${s.sessionName}": agy card id_convert failed: ${e}`)
+      logError("session: agy card id_convert failed", e)
       await feishu.sendTextRaw(s.chatId, `❌ agy 卡片初始化失败，任务未启动: ${messageOf(e)}`)
       return
     }
@@ -261,12 +261,12 @@ export async function runAgyCommand(s: Session, prompt: string): Promise<void> {
       if (taskRef?.cardWriteFailed) return
       if (taskRef) taskRef.cardWriteFailed = true
       const msg = `❌ agy 卡片更新失败${code ? ` code=${code}` : ''}，请查看 daemon 日志。`
-      log(`session "${s.sessionName}": ${msg}`)
+      log("session-agy: state changed")
       void feishu.sendTextRaw(s.chatId, msg)
     })
 
-    const { proc, bin, args } = spawnAgyPrint(prompt, s.workDir)
-    log(`session "${s.sessionName}": spawn agy ${bin} ${args.slice(0, -1).join(' ')} <prompt> cwd=${s.workDir}`)
+    const { proc } = spawnAgyPrint(prompt, s.workDir)
+    log('session: agy spawned')
     let resolveDone!: () => void
     const done = new Promise<void>(resolve => { resolveDone = resolve })
     let task!: AgyTaskState
@@ -312,7 +312,7 @@ export async function runAgyCommand(s: Session, prompt: string): Promise<void> {
     proc.stderr.on('data', chunk => appendAgyOutput(task, 'stderr', chunk))
     proc.on('error', err => {
       task.spawnError = err.message
-      log(`session "${s.sessionName}": agy spawn error: ${err.message}`)
+      log("session: agy spawn error")
     })
     proc.on('close', (code, signal) => {
       void finishAgyTask(s, task, code, signal)
@@ -408,7 +408,7 @@ async function finishAgyTask(s: Session, task: AgyTaskState, code: number | null
     await cardkit.dispose(task.cardId)
   } catch (e) {
     status = `❌ agy 收尾失败: ${messageOf(e)}`
-    log(`session "${s.sessionName}": ${status}`)
+    log("session-agy: state changed")
     await feishu.sendTextRaw(s.chatId, status)
   } finally {
     if (s.runningAgy === task) {
@@ -416,7 +416,7 @@ async function finishAgyTask(s: Session, task: AgyTaskState, code: number | null
       s.status = s.isRunning() ? 'idle' : 'stopped'
       s.opts.onLifecycleChange?.()
     }
-    log(`session "${s.sessionName}": agy finished status=${status} code=${code} signal=${signal} stdout=${task.stdoutBytes} stderr=${task.stderrBytes}`)
+    log("session: agy finished")
     task.resolveDone()
   }
 }

@@ -10,9 +10,9 @@ import spawn from 'cross-spawn'
 import type { ChildProcess } from 'node:child_process'
 import type { ProjectProfile } from './config'
 import { DSH_HOME_DIR } from './paths'
-import { DSH_PROTOCOL_VERSION, DSH_VERSION, type DshNotification } from './dsh-protocol'
+import { DSH_PROTOCOL_VERSION, type DshNotification } from './dsh-protocol'
 import { agentRuntimeRoot } from './agent-updates'
-import { log } from './log'
+import { log, logError } from './log'
 
 export interface DshRuntimeOptions {
   cwd: string
@@ -89,9 +89,6 @@ export class DshRuntime extends EventEmitter {
     const require = createRequire(join(runtimeRoot, 'package.json'))
     const manifestPath = require.resolve('@deepseek-ai/dsh/package.json')
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-    // 本地协议版本钉:运行的 DSH 运行时 manifest 必须精确匹配(见 dsh-protocol)。
-    if (manifest.version !== DSH_VERSION) throw new Error(`DSH runtime version mismatch: expected ${DSH_VERSION}, got ${manifest.version}`)
-    log(`dsh runtime: ${manifest.version} (${runtimeRoot})`)
     const providerPatches = dshProviderPatches(opts.env)
     const home = opts.home ?? DSH_HOME_DIR
     mkdirSync(home, { recursive: true, mode: 0o700 })
@@ -122,7 +119,11 @@ export class DshRuntime extends EventEmitter {
       ...['sdk-jsonrpc-server', 'session-title-llm', 'session-telemetry-otel', 'settings', 'credentials', 'llm-pi-ai'].map(id => ({ id, disabled: true })),
       { id: 'approval', config: { policy: 'ask' } },
       { id: 'permission', config: { defaultPreset: 'lodestar', presets: { lodestar: { sandbox: 'danger-full-access', approval: 'ask' } } } },
-      { id: 'system-prompt', config: { personaPrefix: 'You are a coding agent powered by {{model}}.', personaSuffix: 'Your working directory is {{cwd}}.' } },
+      // Keep native descendants able to delegate when DSH changes its default depth limit.
+      { id: 'tool-subagent', config: { provider: 'spawn', toolName: 'subagent', backgroundMode: 'continuable', maxDepth: 'provider-managed' } },
+      { id: 'tool-subagent-fork', config: { provider: 'fork', toolName: 'subagent_fork', backgroundMode: 'one-shot', maxDepth: 'provider-managed' } },
+      // DSH supplies working-directory context; newer releases no longer register {{cwd}}.
+      { id: 'system-prompt', config: { personaPrefix: 'You are a coding agent powered by {{model}}.', personaSuffix: '' } },
       { id: 'skill-filesystem', config: { includeDefaultRoots: true, ...(opts.managedSkillDir ? { customSkillDirs: [opts.managedSkillDir] } : {}) } },
       { insert: [{ id: 'lodestar-bridge', name: bridge },
         { id: 'lodestar-ask-user', name: '@deepseek-ai/dsh-tool-ask-user' }, ...mcp] },
@@ -151,7 +152,6 @@ export class DshRuntime extends EventEmitter {
     this.child.stderr!.setEncoding('utf8')
     this.child.stderr!.on('data', (chunk: string) => {
       this.stderr = (this.stderr + chunk).slice(-16_384)
-      log(`dsh stderr: ${chunk.trimEnd()}`)
     })
     this.child.stdin!.on('error', error => this.transportFailure(error))
     const lines = createInterface({ input: this.child.stdout!, crlfDelay: Infinity })
@@ -174,8 +174,8 @@ export class DshRuntime extends EventEmitter {
   isAlive(): boolean { return !this.exited }
   initialize(): Promise<void> {
     return this.initTask ??= this.request('initialize', {}, 30_000).then(result => {
-      // 本地严格握手:协议版本与运行时版本都要精确匹配(非仅存在性检查)。
-      if (result.protocolVersion !== DSH_PROTOCOL_VERSION || result.runtimeVersion !== DSH_VERSION) {
+      // 只校验桥接协议；运行时沿用安装器所选的最新版本。
+      if (result.protocolVersion !== DSH_PROTOCOL_VERSION || typeof result.runtimeVersion !== 'string' || !result.runtimeVersion) {
         throw new Error(`DSH handshake version mismatch: ${JSON.stringify(result)}`)
       }
       this.initialized = true
@@ -201,7 +201,7 @@ export class DshRuntime extends EventEmitter {
       if (frame.jsonrpc !== '2.0') throw new Error('invalid DSH JSON-RPC envelope')
       if (typeof frame.id === 'number') {
         const pending = this.pending.get(frame.id)
-        if (!pending) { log(`dsh: unexpected response id=${frame.id}`); return }
+        if (!pending) { log('dsh.response_unmatched'); return }
         this.pending.delete(frame.id)
         clearTimeout(pending.timer)
         if (frame.error) pending.reject(new Error(`DSH RPC error: ${frame.error.message}`))
@@ -228,7 +228,7 @@ export class DshRuntime extends EventEmitter {
     this.closing = true
     if (this.initialized) {
       try { await this.request('shutdown', {}, timeoutMs) }
-      catch (error) { log(`dsh shutdown: ${error}`) }
+      catch (error) { logError('dsh.shutdown.failed', error) }
     }
     this.child.stdin!.end()
     const waitExit = async (ms: number): Promise<boolean> => {
@@ -238,10 +238,9 @@ export class DshRuntime extends EventEmitter {
       return this.exited
     }
     if (await waitExit(timeoutMs)) return
-    log(`dsh: terminate owned child pid=${this.pid}`)
     this.child.kill('SIGTERM')
     if (await waitExit(timeoutMs)) return
-    log(`dsh: kill unresponsive owned child pid=${this.pid}`)
+    log('dsh.shutdown.force_termination')
     this.child.kill('SIGKILL')
     if (!await waitExit(timeoutMs)) throw new Error(`DSH child exit not confirmed: pid=${this.pid}`)
   }
@@ -250,7 +249,7 @@ export class DshRuntime extends EventEmitter {
 /** Read-only native catalog operations always reap their own process. */
 export async function queryDshRuntime(opts: DshRuntimeOptions, method: 'model/list' | 'session/list', params = {}): Promise<any> {
   const runtime = new DshRuntime(opts)
-  runtime.on('failure', error => log(`dsh catalog: ${error}`))
+  runtime.on('failure', error => logError('dsh.catalog.failed', error))
   let failure: unknown
   let result: unknown
   try { await runtime.initialize(); result = await runtime.request(method, params) }

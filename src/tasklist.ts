@@ -1,7 +1,7 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { TASKLIST_MAP_FILE } from './paths'
 import * as feishu from './feishu'
-import { log } from './log'
+import { log, logError } from './log'
 import { writeJsonStateAtomic } from './state-store'
 
 export type TasklistSectionKey = 'design' | 'aiTodo' | 'aiDoing' | 'aiReview' | 'done'
@@ -274,7 +274,7 @@ async function ensureDefaultDesignSection(tasklistGuid: string, storedGuid?: str
       throw new Error(`stored design section ${storedGuid} belongs to tasklist ${stored.tasklistGuid}, expected ${tasklistGuid}`)
     }
     if (stored.isDefault) section = stored
-    else log(`tasklist: ignore non-default stored design section ${storedGuid}`)
+    else log('tasklist.legacy_design_section.ignored')
   }
   if (!section) {
     const guid = await feishu.discoverTasklistDefaultSectionGuid(tasklistGuid)
@@ -303,12 +303,12 @@ async function removeEmptyLegacyDesignSections(
     }
     const tasks = await feishu.listSectionTasks(section.guid)
     if (tasks.length > 0) {
-      log(`tasklist: keep non-empty legacy design section ${section.guid} tasks=${tasks.length}`)
+      log('tasklist.legacy_design_section.retained')
       out.push(section)
       continue
     }
     await feishu.deleteTasklistSection(section.guid)
-    log(`tasklist: deleted empty legacy design section ${section.guid}`)
+    log('tasklist.legacy_design_section.deleted')
   }
   return out
 }
@@ -340,10 +340,7 @@ async function finishTasklistDeletion(projectName: string, expectedGuid: string)
     binding.deleting!.lastError = undefined
   })
   try {
-    const remoteResult = await deleteTasklistRemoteIdempotently(expectedGuid)
-    if (remoteResult === 'already_deleted') {
-      log(`tasklist: ${projectName} remote list ${expectedGuid} is already deleted (code=1470404); finishing tombstone`)
-    }
+    await deleteTasklistRemoteIdempotently(expectedGuid)
     const latest = bindings.get(projectName)
     if (!latest || latest.guid !== expectedGuid || !latest.deleting) {
       throw new Error(`tasklist deletion state changed before local commit: ${projectName}`)
@@ -360,7 +357,7 @@ async function finishTasklistDeletion(projectName: string, expectedGuid: string)
         if (binding.guid === expectedGuid && binding.deleting) binding.deleting.lastError = error
       })
     } catch (persistError) {
-      log(`tasklist: failed to persist delete error for ${projectName}: ${persistError}`)
+      logError('tasklist.delete_error.persist_failed', persistError)
     }
     throw e
   }
@@ -376,9 +373,8 @@ export async function reconcileTasklistDeletions(): Promise<void> {
   for (const item of pending) {
     try {
       await withTasklistLifecycleLock(item.projectName, () => finishTasklistDeletion(item.projectName, item.guid))
-      log(`tasklist: reconciled pending deletion for ${item.projectName}`)
-    } catch (e) {
-      failures.push(`${item.projectName}: ${e instanceof Error ? e.message : String(e)}`)
+    } catch (error) {
+      failures.push(`${item.projectName}: ${error instanceof Error ? error.message : String(error)}`)
     }
   }
   if (failures.length > 0) throw new Error(`tasklist deletion reconcile failed: ${failures.join('; ')}`)
@@ -438,9 +434,8 @@ function loadTasklistMap(): void {
       normalizeBinding(projectName, binding)
       bindings.set(projectName, binding)
     }
-    log(`tasklist: loaded ${bindings.size} project bindings`)
-  } catch (e) {
-    log(`tasklist: load map failed: ${e}`)
+  } catch (error) {
+    logError('tasklist: load map failed', error)
   }
 }
 

@@ -113,13 +113,12 @@ export function codexAccountPanel(view: CodexAccountCardView): object {
     ...(view.phase === 'accounts' ? { vertical_spacing: '8px' } : {}), elements }
 }
 
-function accountUsageWindow(window: UsageWindow | null, label: string): object {
-  const value = window?.percent
+function accountUsageWindow(window: UsageWindow, label: string): object {
+  const value = window.percent
   if (value == null || !Number.isFinite(value) || value < 0 || value > 100) return md(`${label}　MISS`)
   const filled = Math.round(value / 100 * 6)
   const color = value >= 100 ? 'red' : value >= 80 ? 'orange' : 'green'
-  const reset = window!.unreportedFull ? '满窗'
-    : window!.resetsAt && Number.isFinite(window!.resetsAt.getTime()) ? fmtResetIn(window!.resetsAt) : 'MISS'
+  const reset = window.resetsAt && Number.isFinite(window.resetsAt.getTime()) ? fmtResetIn(window.resetsAt) : 'MISS'
   return md(`${label}　<font color='${color}'>${'▰'.repeat(filled)}${'▱'.repeat(6 - filled)}</font>　${Math.round(value)}% <font color='grey'>「${reset}」</font>`)
 }
 
@@ -150,7 +149,7 @@ function accountRows(view: CodexAccountCardView): object[] {
     if (entry.duplicateOf) { row.push(muted(`与「${entry.duplicateOf}」同一账号，合计只计一次`)); continue }
     if (schedule && schedule.state !== 'ready') {
       row.push(muted(schedule.state === 'exhausted' ? '⏳ 暂不可用'
-          : schedule.state === 'excluded' ? 'Ultra 自动排除 Plus'
+          : schedule.state === 'excluded' ? 'Plus 无可用积分 · 不参与 Ultra'
           : schedule.state === 'waiting' ? `⏳ 周余量 ${schedule.remaining?.toPrecision(3)} 份 · 未达 0.5 份`
           : 'MISS · 无法排序'))
       if (schedule.reason && usage.state === 'ok') row.push({ tag: 'collapsible_panel', expanded: false,
@@ -162,7 +161,7 @@ function accountRows(view: CodexAccountCardView): object[] {
         header: { title: { tag: 'plain_text', content: '查询错误' } }, elements: [md(text(usage.reason))] })
       continue
     }
-    row.push(accountUsageWindow(usage.weekly, '周'))
+    if (usage.weekly) row.push(accountUsageWindow(usage.weekly, '周'))
     if (usage.fiveHour) row.push(accountUsageWindow(usage.fiveHour, '5h'))
     const credits = codexCreditsSummary(usage.credits)
     if (credits) row.push(md(credits))

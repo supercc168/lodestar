@@ -6,7 +6,8 @@ import { agentCardsDeps } from './agent-cards-runtime'
 import { agentOwnerKey, agentRunOwner, requireAgentDescription, requireAgentWorkDir, PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
 import * as feishu from './feishu'
 import { config } from './config'
-import { getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
+import { claudeTranslationModeEnabled } from './claude-translation-mode'
+import { assertAgentIdentityIdAllowed, assertAgentSourceAllowed, getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
 import { AgentWorkerFailure, startAgentWorker, type AgentWorkerHandle } from './agent-runner'
 import { agentApiUrl } from './agent-runtime'
 import { workspaceKey } from './workspace'
@@ -21,7 +22,7 @@ import type {
 } from './agent-run-types'
 import { AGENT_RUNS_DIR, MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { writeJsonStateAtomic, writeStateFileAtomic } from './state-store'
-import { log } from './log'
+import { logError } from './log'
 import type { Session } from './session'
 import { agentPrincipalContext, type AgentExecutionContext, type AgentPrincipal } from './agent-context'
 import type { AgentReasoningEffort } from './agent-process'
@@ -30,11 +31,6 @@ export type { AgentPrincipal } from './agent-context'
 
 const MAX_CACHED_RUN_ARTIFACTS = 512
 const MAX_WORKER_STEPS = 50
-/** 单层委派(D-11 口径 3):被委派的 Agent 不得再委派 —— 会话归属的 worker
- *  principal 的 startRun/followUp 首行即拒(拒绝先于任何副作用);项目归属沿用
- *  上游多层级语义,不设闸。三层齐备的另两层见 agent-launch(claude disallowedTools /
- *  codex --disable multi_agent / dsh tools.restrict)与 agent-skill(指令层)。 */
-const NESTED_DELEGATION_ERROR = 'Delegated Agents cannot delegate again; ask the main Agent to assign additional work.'
 
 interface AgentRunRecord {
   snapshot: AgentRunSnapshot
@@ -119,8 +115,6 @@ export class AgentService {
   }
 
   private async startRunOnce(principal: AgentPrincipal, request: AgentRunRequest, metadata: RequestMetadata): Promise<AgentRunSnapshot> {
-    // D-11 口径 1:策略层先拒 —— 拒绝必须发生在任何副作用(建 run/落盘/开卡/起进程)之前。
-    if (principal.kind === 'worker' && principal.context.owner.kind === 'session') throw new Error(NESTED_DELEGATION_ERROR)
     this.assertAcceptingRuns()
     requireAgentDescription(request.description)
     if (request.sessionId !== undefined) {
@@ -149,8 +143,6 @@ export class AgentService {
     request: AgentFollowUpRequest,
     metadata: RequestMetadata,
   ): Promise<AgentRunSnapshot> {
-    // follow-up 同样是一次委派动作:会话归属的 worker principal 不得借它曲线再委派。
-    if (principal.kind === 'worker' && principal.context.owner.kind === 'session') throw new Error(NESTED_DELEGATION_ERROR)
     this.assertAcceptingRuns()
     requireAgentDescription(request.description)
     const source = this.runs.get(runId)
@@ -169,8 +161,10 @@ export class AgentService {
   }
 
   private requireIdentity(principal: AgentPrincipal, id: string): AgentIdentity {
+    assertAgentIdentityIdAllowed(id)
     const identity = this.deps.getCatalog(agentPrincipalContext(principal).codexAccountId).identities.find(item => item.id === id)
     if (!identity) throw new Error(`agent identity not found: ${id}`)
+    assertAgentSourceAllowed(identity.tokenSourceId)
     if (identity.status !== 'ready') throw new Error(`${identity.displayName}: ${identity.reason ?? identity.status}`)
     return identity
   }
@@ -181,6 +175,10 @@ export class AgentService {
   ): Promise<AgentRunSnapshot> {
     const context = agentPrincipalContext(principal)
     this.assertResumeProject(principal, history.run)
+    if (!selected) {
+      assertAgentIdentityIdAllowed(history.worker.identityId)
+      assertAgentSourceAllowed(history.worker.tokenSourceId)
+    }
     const identity = selected ?? this.requireIdentity(principal, history.worker.identityId)
     if (identity.provider !== history.worker.provider) throw new Error('native session belongs to a different Agent backend')
     const sameOwner = agentOwnerKey(agentRunOwner(history.run.snapshot)) === agentOwnerKey(context.owner)
@@ -226,6 +224,9 @@ export class AgentService {
     worker.status = nextInput ? 'needs_input' : 'running'
     if (nextInput) worker.pendingInput = nextInput
     else delete worker.pendingInput
+    const nextDisplayInput = handle.displayPendingInput?.()
+    if (nextDisplayInput) worker.displayPendingInput = nextDisplayInput
+    else delete worker.displayPendingInput
     delete worker.queuedReason
     this.refreshNonterminalStatus(run)
     this.persist(run)
@@ -260,7 +261,7 @@ export class AgentService {
     const run = this.runs.get(runId)
     if (!run || agentRunOwner(run.snapshot).kind !== 'project' || !userId || !messageId
       || run.snapshot.chatId !== chatId || run.snapshot.cardMessageId !== messageId) {
-      throw new Error('项目任务卡片无效或不属于当前群')
+      throw new Error('项目任务卡片无效或不属于当前对话 ID（chat_id）')
     }
     return this.cancelRun(this.projectPrincipal({ owner: agentRunOwner(run.snapshot) }), runId, '用户通过项目任务卡取消')
   }
@@ -373,8 +374,10 @@ export class AgentService {
     const codexAccountId = context.codexAccountId
     const catalog = this.deps.getCatalog(codexAccountId)
     const identities = request.identityIds.map(id => {
+      assertAgentIdentityIdAllowed(id)
       const identity = catalog.identities.find(item => item.id === id)
       if (!identity) throw new Error(`agent identity not found: ${id}`)
+      assertAgentSourceAllowed(identity.tokenSourceId)
       if (identity.status !== 'ready') throw new Error(`${identity.displayName}: ${identity.reason ?? identity.status}`)
       return identity
     })
@@ -382,6 +385,7 @@ export class AgentService {
       identity,
       resolveEffort(identity, request.effort),
       options.resumeSessionId,
+      identity.provider === 'claude' && claudeTranslationModeEnabled(identity.tokenSourceId, identity.model),
     ))
     const runId = `agent_${randomUUID()}`
     const snapshot: AgentRunSnapshot = {
@@ -456,7 +460,7 @@ export class AgentService {
     for (const identity of identities) {
       const resumeSessionId = options.resumeSessionId
       void this.executeWorker(run, identity, request.prompt, admittedWorkDir, resumeSessionId).catch(error => {
-        log(`agent: run=${runId} worker=${identity.id} crashed: ${messageOf(error)}`)
+        logError('agent-service: worker crashed', error)
       })
     }
     return this.readSnapshot(run)
@@ -503,16 +507,13 @@ export class AgentService {
         effort: worker.effort as AgentReasoningEffort,
         workDir: run.snapshot.workDir,
         prompt,
+        description: run.snapshot.description,
         resumeSessionId,
         projectBound: run.context!.owner.kind === 'project',
         ...(run.context!.owner.kind === 'session'
           ? { developerInstructions: run.context!.sessionInstructions!(identity.provider) } : {}),
         profile: fullAgentProfile(feishu.projectProfileForDirectory(run.snapshot.workDir)),
         ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1' ? {} : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
-        // 原生工具层(D-11 口径 3):会话归属 worker 一律关闭再委派(claude
-        // disallowedTools / codex --disable multi_agent / dsh tools.restrict);
-        // 项目归属延续上游多层语义,不设闸。
-        ...(run.context!.owner.kind === 'session' ? { allowDelegation: false } : {}),
         hostEnv: {
           // 同 session.spawnAgent:全量测试泄漏的残缺 config mock 不含 notify。
           LODESTAR_AGENT_URL: agentApiUrl(config.notify?.bind ?? '127.0.0.1', config.notify?.port ?? 9876),
@@ -523,14 +524,26 @@ export class AgentService {
           LODESTAR_AGENT_ROLE: 'worker',
         },
         callbacks: {
-          onNeedsInput: request => {
+          onNeedsInput: (request, displayRequest) => {
             if (run.cancelled) return
             if (run.context!.owner.kind === 'project') throw new Error(PROJECT_AGENT_INPUT_ERROR)
             worker.status = 'needs_input'
             worker.pendingInput = request
+            if (displayRequest) worker.displayPendingInput = displayRequest
+            else delete worker.displayPendingInput
             this.refreshNonterminalStatus(run)
             this.persist(run)
             void this.updateWorkerCard(run, worker)
+          },
+          onDisplayContext: context => {
+            if (run.cancelled) return false
+            worker.displayDescription = context.description
+            worker.displayPrompt = context.prompt
+            this.persist(run)
+            void this.updateWorkerCard(run, worker)
+            // The existing card queue owns delivery; this acknowledges that
+            // the live presentation state accepted these translated fields.
+            return true
           },
           onProgress: step => this.recordStep(run, worker, step),
           onCodexAccount: accountId => {
@@ -550,6 +563,7 @@ export class AgentService {
       if (run.cancelled) return
       this.clearProgressTimer(run, identity.id)
       worker.output = result.output
+      if (result.displayOutput !== undefined) worker.displayOutput = result.displayOutput
       worker.outputTruncated = result.outputTruncated
       worker.sessionId = result.sessionId
       worker.checkpointId = result.checkpointId
@@ -557,6 +571,7 @@ export class AgentService {
       worker.usage = result.usage
       worker.finishedAt = new Date().toISOString()
       delete worker.pendingInput
+      delete worker.displayPendingInput
       if (run.cancelled) return
       worker.status = 'completed'
       this.persist(run)
@@ -566,6 +581,8 @@ export class AgentService {
       // 取消路径的 status/error 仍由 cancelTree 统一落「停止原因」。
       if (error instanceof AgentWorkerFailure) {
         worker.output = error.output
+        if (error.displayOutput !== undefined) worker.displayOutput = error.displayOutput
+        if (error.displayError !== undefined) worker.displayError = error.displayError
         worker.outputTruncated = false
         if (error.sessionId) worker.sessionId = error.sessionId
         this.persist(run)
@@ -577,6 +594,7 @@ export class AgentService {
         worker.finishedAt = new Date().toISOString()
         if (worker.startedAt) worker.durationMs = Date.now() - Date.parse(worker.startedAt)
         delete worker.pendingInput
+        delete worker.displayPendingInput
         this.persist(run)
         await this.updateWorkerCard(run, worker)
       }
@@ -630,9 +648,9 @@ export class AgentService {
       run.finalized = false
       run.snapshot.status = 'failed'
       run.snapshot.error = `Agent terminal persistence failed: ${messageOf(error)}`
-      log(`agent: terminal finalization failed run=${run.snapshot.runId}: ${messageOf(error)}`)
+      logError('agent-service: terminal finalization failed', error)
       void this.deps.sendTextRaw(run.snapshot.chatId, `❌ agent ${run.snapshot.runId} 收尾失败: ${messageOf(error)}`)
-        .catch(deliveryError => log(`agent: terminal failure delivery failed: ${messageOf(deliveryError)}`))
+        .catch(deliveryError => logError('agent-service: terminal failure delivery failed', deliveryError))
     })
   }
 
@@ -670,7 +688,7 @@ export class AgentService {
       run.snapshot.error = error.message
       this.persist(run)
       await this.deps.sendTextRaw(run.snapshot.chatId, `❌ Agent 取消未完成: ${error.message}`)
-        .catch(deliveryError => log(`agent: cancellation failure notice failed: ${messageOf(deliveryError)}`))
+        .catch(deliveryError => logError('agent-service: cancellation failure notice failed', deliveryError))
       throw error
     }
     const cancelledWorkers: AgentWorkerResult[] = []
@@ -680,6 +698,7 @@ export class AgentService {
         worker.error = reason
         worker.finishedAt = new Date().toISOString()
         delete worker.pendingInput
+        delete worker.displayPendingInput
         cancelledWorkers.push(worker)
       }
     }
@@ -709,7 +728,7 @@ export class AgentService {
       await this.deps.sendTextRaw(
         run.snapshot.chatId,
         `⚠️ 委派卡片出现更新错误 · ${run.snapshot.description ?? run.snapshot.runId}\n结果已保存，卡片更新期间出现 ${run.snapshot.presentationErrors.length} 个错误：\n${preview}\n任务：${run.snapshot.runId}`,
-      ).catch(error => log(`agent: warning delivery failed run=${run.snapshot.runId}: ${messageOf(error)}`))
+      ).catch(error => logError('agent-service: warning delivery failed', error))
     }
   }
 
@@ -733,7 +752,7 @@ export class AgentService {
     const errors = run.snapshot.presentationErrors ?? []
     if (!errors.includes(detail)) errors.push(detail)
     run.snapshot.presentationErrors = errors
-    log(`agent: ${detail} run=${run.snapshot.runId}`)
+    logError('agent-service: worker presentation failed', detail)
   }
 
   private persist(run: AgentRunRecord): void {
@@ -748,6 +767,7 @@ export class AgentService {
       this.persistTextArtifact(run, worker.outputArtifact, worker.output)
     }
     const durable = cloneSnapshot(run.snapshot)
+    stripPresentation(durable)
     durable.prompt = ''
     for (const worker of durable.workers) worker.output = ''
     this.deps.writeArtifact(join(AGENT_RUNS_DIR, `${run.snapshot.runId}.json`), durable)
@@ -762,6 +782,7 @@ export class AgentService {
 
   private readSnapshot(run: AgentRunRecord): AgentRunSnapshot {
     const snapshot = cloneSnapshot(run.snapshot)
+    stripPresentation(snapshot)
     if (run.artifactsUnloaded) hydrateSnapshotArtifacts(snapshot, snapshot.runId, this.deps.readTextArtifact)
     return snapshot
   }
@@ -778,7 +799,7 @@ export class AgentService {
     const caller = agentPrincipalContext(principal).owner
     const origin = agentRunOwner(run.snapshot)
     if (caller.chatId !== origin.chatId || workspaceKey(caller.workDir) !== workspaceKey(origin.workDir)) {
-      throw new Error('agent session belongs to a different project or group; cross-project and cross-group resume is not allowed')
+      throw new Error('agent session belongs to a different project or conversation ID (chat_id); resuming across projects or conversation IDs is not allowed')
     }
   }
 
@@ -788,12 +809,12 @@ export class AgentService {
     const matches = [...this.runs.values()].flatMap(run => run.snapshot.workers
       .filter(worker => worker.sessionId === sessionId)
       .map(worker => ({ run, worker })))
-    if (!matches.length) throw new Error('agent session project/group ownership is unknown; only registered sessions in this project and group can be resumed')
+    if (!matches.length) throw new Error('agent session ownership is unknown; only sessions registered under this project and conversation ID (chat_id) can be resumed')
     for (const { run } of matches) this.assertResumeProject(principal, run)
     if (new Set(matches.map(({ worker }) => worker.provider)).size > 1) {
       throw new Error('native session id has conflicting backend records; its unique identity cannot be established')
     }
-    // Session/project bindings can share a native id within one project and group, without joining cancellation trees.
+    // Session/project bindings can share a native id within one project and conversation ID (chat_id), without joining cancellation trees.
     const parents = new Set(matches.flatMap(({ run }) => [run.snapshot.resumedFromRunId, run.snapshot.parentRunId]))
     const latest = matches.filter(({ run }) => !parents.has(run.snapshot.runId))
       .sort((a, b) => Date.parse(b.run.snapshot.createdAt) - Date.parse(a.run.snapshot.createdAt))[0]
@@ -870,6 +891,7 @@ export class AgentService {
 
   private loadDurableRuns(): void {
     for (const snapshot of this.deps.loadArtifacts()) {
+      stripPresentation(snapshot)
       if (!isTerminal(snapshot.status)) {
         snapshot.status = 'failed'
         snapshot.error = 'daemon restarted before this Agent run reached a terminal state'
@@ -880,6 +902,7 @@ export class AgentService {
             worker.error = snapshot.error
             worker.finishedAt = snapshot.finishedAt
             delete worker.pendingInput
+            delete worker.displayPendingInput
           }
         }
       }
@@ -917,10 +940,12 @@ export class AgentService {
         && run.handles.size === 0)
       .sort((a, b) => Date.parse(a.snapshot.finishedAt ?? a.snapshot.createdAt) - Date.parse(b.snapshot.finishedAt ?? b.snapshot.createdAt))
     // The run map is the continuation index and cancellation tree, not a cache.
-    // Keep every record and link; only evict text already saved in artifacts.
+    // Keep every record and link. Native text has durable artifacts; translated
+    // presentation belongs only to the already-rendered card.
     for (const run of terminal.slice(0, Math.max(0, terminal.length - MAX_CACHED_RUN_ARTIFACTS))) {
       run.snapshot.prompt = ''
       for (const worker of run.snapshot.workers) worker.output = ''
+      stripPresentation(run.snapshot)
       run.artifactsUnloaded = true
     }
   }
@@ -950,11 +975,13 @@ function workerSnapshot(
   identity: AgentIdentity,
   effort: AgentReasoningEffort,
   resumeSessionId?: string,
+  translationEnabled = false,
 ): AgentWorkerResult {
   return {
     identityId: identity.id,
     identityName: identity.displayName,
     tokenSourceId: identity.tokenSourceId,
+    ...(translationEnabled ? { translationEnabled: true } : {}),
     provider: identity.provider,
     model: identity.model,
     effort,
@@ -994,6 +1021,23 @@ function isWorkerTerminal(status: AgentWorkerResult['status']): boolean {
 
 function cloneSnapshot(snapshot: AgentRunSnapshot): AgentRunSnapshot {
   return JSON.parse(JSON.stringify(snapshot)) as AgentRunSnapshot
+}
+
+/** Translations belong to live cards, never native Agent APIs or run history. */
+function stripPresentation(snapshot: AgentRunSnapshot): void {
+  for (const worker of snapshot.workers) {
+    delete worker.translationEnabled
+    delete worker.displayOutput
+    delete worker.displayDescription
+    delete worker.displayPrompt
+    delete worker.displayPendingInput
+    delete worker.displayError
+    // Discard references left by the unreleased presentation-artifact format.
+    // Those files are not used by native APIs or restored historical cards.
+    Reflect.deleteProperty(worker, 'displayOutputArtifact')
+    Reflect.deleteProperty(worker, 'displayPromptArtifact')
+    for (const step of worker.steps) delete step.displayDetail
+  }
 }
 
 function loadAgentRunArtifacts(): AgentRunSnapshot[] {

@@ -2,6 +2,7 @@ import { describe, expect, test } from 'bun:test'
 import { codexAccountCard, codexAccountPanel, CODEX_ACCOUNTS_PAGE_SIZE, type CodexAccountCardView } from './codex-account'
 import { aggregateCodexUsage, type CodexAccountUsage } from '../codex-account-usage'
 import { rankCodexQuota } from '../codex-quota'
+import { snapshotFromReadResponse } from '../usage'
 
 const waiting: CodexAccountCardView = { phase: 'waiting', name: '工作',
   verification: { url: 'https://auth.openai.com/codex/device', code: 'ABCD-1234' }, hint: '取消：codex-login-cancel 工作' }
@@ -13,7 +14,37 @@ function entry(index: number): CodexAccountUsage {
   } }
 }
 describe('compact Codex account cards', () => {
-  test('credit-only accounts show their balance and scheduling rank without a fabricated hourly score', () => {
+  test('Plus weekly-only responses omit short windows from account rows and reset receipts', () => {
+    const usage = snapshotFromReadResponse({ rateLimits: { limitId: 'codex', planType: 'plus',
+      primary: { usedPercent: 24, windowDurationMins: 10080, resetsAt: (Date.now() + 3 * 86400_000) / 1000 },
+      credits: { hasCredits: false, unlimited: false, balance: '0' },
+    }, rateLimitResetCredits: { availableCount: 0 } })
+    const panel = codexAccountPanel({ phase: 'accounts', total: aggregateCodexUsage([{ ...entry(0), usage }]) }) as any
+    expect(panel.elements[0].elements).toHaveLength(2)
+    expect(panel.elements[0].elements[1].content).toBe("周　<font color='green'>▰▱▱▱▱▱</font>　24% <font color='grey'>「3.0d」</font>")
+    const reset = JSON.stringify(codexAccountPanel({ phase: 'success', resetUsage: usage }))
+    expect(reset).toContain('周 · 24%')
+    expect(JSON.stringify(panel)).not.toMatch(/5h|满窗/)
+    expect(reset).not.toMatch(/5h|满窗/)
+  })
+  test('omits an absent weekly window and keeps incomplete reported short windows visible', () => {
+    const usage = snapshotFromReadResponse({ rateLimits: { limitId: 'codex', planType: 'plus',
+      primary: { windowDurationMins: 300 },
+      credits: { hasCredits: false, unlimited: false, balance: '0' },
+    }, rateLimitResetCredits: { availableCount: 0 } })
+    const panel = codexAccountPanel({ phase: 'accounts', total: aggregateCodexUsage([{ ...entry(0), usage }]) }) as any
+    expect(panel.elements[0].elements).toHaveLength(2)
+    expect(panel.elements[0].elements[1].content).toBe('5h　MISS')
+    const reset = JSON.stringify(codexAccountPanel({ phase: 'success', resetUsage: usage }))
+    expect(reset).toContain('5h · MISS')
+    expect(reset).not.toContain('周 ·')
+    if (usage.state !== 'ok') throw new Error('fixture')
+    usage.fiveHour!.percent = 0
+    const missingReset = codexAccountPanel({ phase: 'accounts', total: aggregateCodexUsage([{ ...entry(0), usage }]) }) as any
+    expect(missingReset.elements[0].elements[1].content).toBe("5h　<font color='green'>▱▱▱▱▱▱</font>　0% <font color='grey'>「MISS」</font>")
+    expect(JSON.stringify(codexAccountPanel({ phase: 'success', resetUsage: usage }))).toContain('重置时间 MISS')
+  })
+  test.each([undefined, 'ultra'] as const)('credit-only accounts show their balance and scheduling rank without a fabricated hourly score (%s)', effort => {
     const rows = [entry(0), entry(1)]
     for (const row of rows) {
       if (row.usage.state !== 'ok') throw new Error('fixture')
@@ -23,8 +54,8 @@ describe('compact Codex account cards', () => {
       row.usage.spendControlReached = false
       row.usage.credits = { hasCredits: true, unlimited: false, balance: row.account.id === '0' ? 10 : 62500 }
     }
-    const candidates = rows.map(row => ({ ...row, identity: row.fingerprint!, ...rankCodexQuota(row.usage, 'model') }))
-    const panel = codexAccountPanel({ phase: 'accounts', total: aggregateCodexUsage(rows), scheduling: { candidates, ultra: false } }) as any
+    const candidates = rows.map(row => ({ ...row, identity: row.fingerprint!, ...rankCodexQuota(row.usage, 'model', Date.now(), effort) }))
+    const panel = codexAccountPanel({ phase: 'accounts', total: aggregateCodexUsage(rows), scheduling: { candidates, ultra: effort === 'ultra' } }) as any
     expect(panel.elements[0].header.title.content).toBe('#1·账号 1「积分」 · 重置 0')
     expect(panel.elements[1].header.title.content).toBe('#2·账号 0「积分」 · 重置 0')
     expect(JSON.stringify(panel.elements[0])).toContain('积分 62.5k')
@@ -50,10 +81,12 @@ describe('compact Codex account cards', () => {
     expect(normal).not.toContain('Pro 20×'); expect(normal).not.toContain('Pro 5×')
     expect(normal).toContain('暂不可用')
     expect(normal).toContain('额度耗尽')
+    if (rows[2].usage.state !== 'ok') throw new Error('fixture')
+    rows[2].usage.weekly!.percent = 50
     const ultraCandidates = rows.map(row => ({ ...row, identity: row.fingerprint!, ...rankCodexQuota(row.usage, 'model', Date.now(), 'ultra') }))
     const ultra = JSON.stringify(codexAccountCard({ phase: 'accounts', total, scheduling: { candidates: ultraCandidates, ultra: true } }))
     expect(ultra).not.toContain('Ultra · Pro ≥ 0.5 份'); expect(ultra).toContain('#1·账号 0「0.789/h」')
-    expect(ultra).toContain('Ultra 自动排除 Plus')
+    expect(ultra).toContain('Plus 无可用积分 · 不参与 Ultra')
   })
   test('renders the scheduling order before pagination, compact quota lines and an unchanged folded command panel', () => {
     const now = Date.now()

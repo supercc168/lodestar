@@ -10,7 +10,7 @@
 import * as cardkit from './cardkit'
 import * as cards from './cards'
 import * as feishu from './feishu'
-import { log } from './log'
+import { log, logError } from './log'
 import * as tasklist from './tasklist'
 import type { AutomationProcessRecord } from './tasklist'
 
@@ -72,9 +72,9 @@ export function backfillChatId(projectName: string): void {
   if (!chatId) return
   try {
     tasklist.updateTasklistBinding(projectName, b => { b.chatId = chatId })
-    log(`tasklist-cards: backfilled chatId for "${projectName}" → ${chatId}`)
+    log("tasklist-cards: backfilled chatId")
   } catch (e) {
-    log(`tasklist-cards: backfill chatId failed for "${projectName}": ${e}`)
+    logError("tasklist-cards: backfill chatId failed", e)
   }
 }
 
@@ -97,7 +97,7 @@ export function onRunStart(record: AutomationProcessRecord): void {
     else if (!opening.has(record.projectName)) void openCard(record.projectName)
     // opening 中:仅落视图,openCard 完成后 reconcileAll 兜底。
   } catch (e) {
-    log(`tasklist-cards: onRunStart failed: ${e}`)
+    logError("tasklist-cards: onRunStart failed", e)
   }
 }
 
@@ -108,7 +108,7 @@ export function onRunStdout(runId: string, projectName: string, tail: string): v
     pc.burst = cards.burstUpdateStdout(pc.burst, runId, tail)
     // 不主动写卡;30s tick 统一重渲染 running panel。
   } catch (e) {
-    log(`tasklist-cards: onRunStdout failed: ${e}`)
+    logError("tasklist-cards: onRunStdout failed", e)
   }
 }
 
@@ -121,7 +121,7 @@ export function onRunSettle(record: AutomationProcessRecord): void {
     pc.burst = cards.burstSettleRun(pc.burst, record.runId, processStatus, record.error, Date.now())
     if (pc.handle) { renderRun(pc, record.runId); patchSummary(pc) }
   } catch (e) {
-    log(`tasklist-cards: onRunSettle failed: ${e}`)
+    logError("tasklist-cards: onRunSettle failed", e)
   }
 }
 
@@ -139,7 +139,7 @@ export function settleIdleProjects(): void {
       else if (!opening.has(pc.projectName)) cardsByProject.delete(pc.projectName)
     }
   } catch (e) {
-    log(`tasklist-cards: settleIdleProjects failed: ${e}`)
+    logError("tasklist-cards: settleIdleProjects failed", e)
   }
 }
 
@@ -153,17 +153,17 @@ async function openCard(projectName: string): Promise<void> {
     const binding = tasklist.getTasklistBinding(projectName)
     if (!binding) return
     const chatId = resolveChatId(binding, feishu.chatIdForSession)
-    if (!chatId) { log(`tasklist-cards: no chatId for "${projectName}", skip card this burst`); return }
+    if (!chatId) { log("tasklist-cards: no chatId, skip card this burst"); return }
     // 开卡前一次性快照 runs:openCard 跨两个 await,期间 onRunStart 可能已给同项目
     // 追加新 run(onRunStart 只挡"开卡调用"这一次,不挡视图追加)。若后续用 post-await
     // 的 pc.burst.runs 重新取值,会把"发卡时其实没写进去"的 run 误标进 addedPanels,
     // 导致 reconcileAll 对一个从未 addElement 过的 element_id 发 replaceElement → 飞书拒绝。
     const initialRuns = pc.burst.runs
     const messageId = await feishu.sendCard(chatId, cards.automationLiveCard(projectName, initialRuns))
-    if (!messageId) { log(`tasklist-cards: sendCard failed for "${projectName}"`); return }
+    if (!messageId) { log("tasklist-cards: sendCard failed"); return }
     let cardId: string
     try { cardId = await cardkit.convertMessageToCard(messageId) }
-    catch (e) { log(`tasklist-cards: convertMessageToCard failed "${projectName}": ${e}`); return }
+    catch (e) { logError("tasklist-cards: convertMessageToCard failed", e); return }
     // 两次 await 期间,settleIdleProjects 可能已把这个空壳 pc(handle 仍为 null)当空闲
     // 沉降清掉。此时 registry 里要么没有条目、要么是新壳的 pc,和局部变量 pc 不再是
     // 同一对象 —— 说明这次开卡已被回收/替换,不能再提交 handle,否则 timer 挂在一个
@@ -180,7 +180,7 @@ async function openCard(projectName: string): Promise<void> {
     reconcileAll(pc)
     handle.refreshTimer = setInterval(() => tick(projectName), REFRESH_TICK_MS)
   } catch (e) {
-    log(`tasklist-cards: openCard error "${projectName}": ${e}`)
+    logError("tasklist-cards: openCard error", e)
   } finally {
     opening.delete(projectName)
   }
@@ -230,6 +230,6 @@ async function settleCard(projectName: string): Promise<void> {
   try {
     await feishu.updateCard(pc.handle.messageId, cards.automationHistoryCard(projectName, pc.burst.runs))
   } catch (e) {
-    log(`tasklist-cards: settleCard updateCard failed "${projectName}": ${e}`)
+    logError("tasklist-cards: settleCard updateCard failed", e)
   }
 }

@@ -1,6 +1,6 @@
-import { describe, expect, mock, test } from 'bun:test'
+import { afterEach, beforeEach, describe, expect, test } from 'bun:test'
 
-mock.module('./config', () => ({
+const configFixture = {
   config: {
     // mock.module 是进程级的；补齐共享 runtime，避免污染同批运行的 Session 测试。
     runtime: {
@@ -40,7 +40,15 @@ mock.module('./config', () => ({
     },
     claude: { env: {}, models: {} },
   },
-}))
+}
+const { config } = await import('./config')
+let savedConfig: { codex: typeof config.codex; claude: typeof config.claude }
+beforeEach(() => {
+  savedConfig = { codex: config.codex, claude: config.claude }
+  config.codex = { ...config.codex, ...structuredClone(configFixture.config.codex) } as typeof config.codex
+  config.claude = { ...config.claude, ...structuredClone(configFixture.config.claude), safe_mode: {} }
+})
+afterEach(() => { Object.assign(config, savedConfig) })
 
 const {
   codexProviderSlug,

@@ -3,6 +3,13 @@ import { EventEmitter } from 'node:events'
 import { AgentWorkerFailure, collectAgentTurn, startAgentWorker } from './agent-runner'
 import { rememberAgentSession, isAgentSession, resetAgentSessionRegistryForTest } from './agent-session-registry'
 import { registerTokenSource, resetTokenSourceRegistry } from './token-source'
+import { mkdtempSync, rmSync } from 'node:fs'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
+import { ClaudeAgentProcess } from './claude-agent-process'
+import { ClaudeTranslationContext } from './claude-translation-context'
+import { bindProcessCodexAccount } from './codex-accounts'
+import * as liveCodexUsage from './codex-live-usage'
 
 class FakeProcess extends EventEmitter {
   provider = 'claude' as const
@@ -34,7 +41,422 @@ afterEach(() => {
   resetTokenSourceRegistry()
 })
 
+test('worker startup rejects Claude subscriptions before creating a process while third-party Claude remains available', () => {
+  const run = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', `
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    let currentSource
+    const launches = [], rejected = [], accepted = []
+    mock.module('./src/token-source', () => ({ listTokenSources: () => [], getTokenSourceForAccount: () => currentSource }))
+    mock.module('./src/agent-session-registry', () => ({ rememberAgentSession() {}, isAgentSession: () => false }))
+    mock.module('./src/agent-launch', () => ({ createAgentProcess: options => {
+      if (options.allowDelegation === false) throw new Error('nested delegation unexpectedly disabled')
+      launches.push(options)
+      const proc = new EventEmitter()
+      Object.assign(proc, { provider: options.provider, sessionId: 'native-session', alive: true,
+        isAlive() { return this.alive }, sendInitialize() {},
+        sendUserText() { queueMicrotask(() => this.emit('result', { is_error: false })) },
+        async kill() { this.alive = false; this.emit('exit', { code: 0 }) },
+      })
+      return { process: proc }
+    } }))
+    const { startAgentWorker } = await import('./src/agent-runner')
+    const { agentIdentityId } = await import('./src/agent-identities')
+    const denied = [
+      { source: 'claude-sub', model: 'opus' },
+      { source: 'disguised-subscription', kind: 'claude-subscription', model: 'unmarked-model' },
+      { source: 'claude-subscription', model: 'unmarked-model' },
+      { source: 'packy', model: 'unmarked-model', id: agentIdentityId('claude-sub', 'opus') },
+    ]
+    for (const projectBound of [false, true]) {
+      for (const resumeSessionId of [undefined, 'native-session']) {
+        for (const entry of denied) {
+          currentSource = { id: entry.source, kind: entry.kind ?? 'api', resolveSpawnModel: () => { throw new Error('admission must not resolve models') } }
+          const count = launches.length
+          try {
+            const handle = startAgentWorker({
+              identity: { id: entry.id ?? agentIdentityId(entry.source, entry.model), tokenSourceId: entry.source,
+                provider: 'claude', model: entry.model, modelDisplay: entry.display ?? entry.model, supportedEfforts: ['high'] },
+              projectBound, resumeSessionId, effort: 'high', workDir: process.cwd(), prompt: 'task', hostEnv: {},
+            })
+            await handle.done
+            rejected.push({ error: 'unexpected success', started: launches.length !== count })
+          } catch (error) { rejected.push({ error: error.message, started: launches.length !== count }) }
+        }
+        for (const entry of [
+          { source: 'glm', model: 'GLM-5.3-Flash', provider: 'claude' },
+          { source: 'deepseek', model: 'deepseek-chat', provider: 'claude' },
+          { source: 'codex-sub', model: 'gpt-5', provider: 'codex' },
+          { source: 'dsh-glm', model: 'GLM-5.3-Flash', provider: 'dsh' },
+          { source: 'packy', model: 'claude-opus-4-6', provider: 'claude' },
+          { source: 'openrouter', model: 'anthropic/claude-sonnet-4.6', provider: 'claude' },
+          { source: 'packy-secondary', model: 'custom-model', provider: 'claude', display: 'Claude Fable 5' },
+        ]) {
+          currentSource = { id: entry.source, kind: 'api', resolveSpawnModel: () => { throw new Error('admission must not resolve models') } }
+          await startAgentWorker({
+            identity: { id: agentIdentityId(entry.source, entry.model), tokenSourceId: entry.source,
+              provider: entry.provider, model: entry.model, modelDisplay: entry.display ?? entry.model, supportedEfforts: ['high'] },
+            projectBound, resumeSessionId, effort: 'high', workDir: process.cwd(), prompt: 'task', hostEnv: {},
+          }).done
+          accepted.push(entry.source)
+        }
+      }
+    }
+    console.log(JSON.stringify({ rejected, accepted, launches: launches.length }))
+  `], { cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'test' }, stdout: 'pipe', stderr: 'pipe' })
+  expect(run.exitCode, run.stderr.toString()).toBe(0)
+  const result = JSON.parse(run.stdout.toString().trim().split('\n').at(-1)!)
+  expect(result.rejected).toHaveLength(16)
+  expect(result.rejected.every((entry: { error: string; started: boolean }) => entry.error
+    === "Lodestar Agent does not support Claude subscription calls; comply with Claude's user agreement." && !entry.started)).toBe(true)
+  expect(result.launches).toBe(28)
+  expect(result.accepted).toEqual(Array.from({ length: 4 }, () => ['glm', 'deepseek', 'codex-sub', 'dsh-glm', 'packy', 'openrouter', 'packy-secondary']).flat())
+})
+
+describe('delegated Codex final quota refresh', () => {
+  test.each([false, true])('waits on the current bound account before killing a result process (is_error=%s)', async isError => {
+    const proc = new FakeProcess() as any
+    proc.provider = 'codex'; proc.tokenSourceId = 'codex-sub'
+    bindProcessCodexAccount(proc, 'worker-before', false)
+    const order: string[] = []
+    let release!: () => void
+    let markStarted!: () => void
+    const started = new Promise<void>(resolve => { markStarted = resolve })
+    const quota = spyOn(liveCodexUsage, 'waitForLiveCodexUsage').mockImplementation(accountId => {
+      order.push(`quota:${accountId}`)
+      markStarted()
+      return new Promise<void>(resolve => { release = resolve })
+    })
+    const kill = proc.kill.bind(proc)
+    proc.kill = async () => { order.push('kill'); await kill() }
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    const completed = handle.done.then(value => ({ value, error: null }), error => ({ value: null, error }))
+    try {
+      bindProcessCodexAccount(proc, 'worker-current', false)
+      proc.emit('assistant_text', { text: 'retained result' })
+      proc.emit('result', { is_error: isError, error: isError ? 'task failed' : undefined })
+      await started
+      expect(order).toEqual(['quota:worker-current'])
+      expect(proc.isAlive()).toBe(true)
+      release()
+      const result = await completed
+      expect(order).toEqual(['quota:worker-current', 'kill'])
+      if (isError) {
+        expect(result.error).toBeInstanceOf(AgentWorkerFailure)
+        expect(result.error).toMatchObject({ message: 'task failed', output: 'retained result' })
+      } else expect(result.value).toMatchObject({ output: 'retained result', sessionId: 'sid-1' })
+    } finally { release?.(); await handle.cancel(); quota.mockRestore() }
+  })
+
+  test.each(['api', 'unbound', 'claude'])('skips quota waiting for %s workers', async kind => {
+    const proc = new FakeProcess() as any
+    proc.provider = kind === 'claude' ? 'claude' : 'codex'
+    proc.tokenSourceId = kind === 'api' ? 'packy-codex' : kind === 'claude' ? 'glm' : 'codex-sub'
+    const quota = spyOn(liveCodexUsage, 'waitForLiveCodexUsage').mockImplementation(async () => {
+      throw new Error('unexpected quota read')
+    })
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    try {
+      proc.emit('result', { is_error: false })
+      await handle.done
+      expect(quota).not.toHaveBeenCalled()
+      expect(proc.isAlive()).toBe(false)
+    } finally { await handle.cancel(); quota.mockRestore() }
+  })
+
+  test.each(['before-result', 'during-quota', 'submission-error'])('stops without quota delay on %s', async scenario => {
+    const proc = new FakeProcess() as any
+    proc.provider = 'codex'; proc.tokenSourceId = 'codex-sub'
+    bindProcessCodexAccount(proc, 'cancelled-worker', false)
+    let release!: () => void
+    let markStarted!: () => void
+    const started = new Promise<void>(resolve => { markStarted = resolve })
+    const quota = spyOn(liveCodexUsage, 'waitForLiveCodexUsage').mockImplementation(() => {
+      markStarted()
+      return new Promise<void>(resolve => { release = resolve })
+    })
+    if (scenario === 'submission-error') proc.sendUserText = () => { throw new Error('submission failed') }
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    const completed = handle.done.then(value => ({ value, error: null }), error => ({ value: null, error }))
+    try {
+      if (scenario === 'during-quota') {
+        proc.emit('result', { is_error: false })
+        await started
+        expect(quota).toHaveBeenCalledTimes(1)
+        expect(proc.isAlive()).toBe(true)
+      }
+      if (scenario !== 'submission-error') await handle.cancel('stop now')
+      const result = await completed
+      expect(proc.isAlive()).toBe(false)
+      if (scenario !== 'during-quota') {
+        expect(quota).not.toHaveBeenCalled()
+        expect(result.error).toBeInstanceOf(AgentWorkerFailure)
+        expect(result.error.message).toBe(scenario === 'submission-error' ? 'submission failed' : 'stop now')
+      }
+    } finally { release?.(); await handle.cancel(); quota.mockRestore() }
+  })
+
+  test('a final quota failure does not prevent process cleanup or overwrite the completed task', async () => {
+    const proc = new FakeProcess() as any
+    proc.provider = 'codex'; proc.tokenSourceId = 'codex-sub'
+    bindProcessCodexAccount(proc, 'quota-failure-worker', false)
+    const quota = spyOn(liveCodexUsage, 'waitForLiveCodexUsage').mockRejectedValue(new Error('quota unavailable'))
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    try {
+      proc.emit('result', { is_error: false })
+      await expect(handle.done).resolves.toMatchObject({ sessionId: 'sid-1' })
+      expect(quota).toHaveBeenCalledTimes(1)
+      expect(proc.isAlive()).toBe(false)
+    } finally { await handle.cancel(); quota.mockRestore() }
+  })
+})
+
 describe('full delegated Agent runner', () => {
+  test('only visible worker prose and progress enter translation and conversation history', async () => {
+    const directory = mkdtempSync(join(tmpdir(), 'worker-presentation-context-'))
+    const context = new ClaudeTranslationContext({ workDir: tmpdir(), storeDir: directory })
+    await context.initialize(new AbortController().signal)
+    context.bindSession('worker-presentation-session')
+    const translated: string[] = [], progress: any[] = [], nativeResults: string[] = []
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high', tokenSourceId: 'claude-sub', translationContext: context,
+      translation: {
+        toEnglish: async text => text,
+        toChinese: async text => { translated.push(text); return `ZH:${text}` },
+        toChineseFields: async fields => { translated.push(...fields); return fields.map(text => `ZH:${text}`) },
+      },
+    }) as any
+    proc.translationContextInitialized = true
+    proc.sessionId = 'worker-presentation-session'
+    proc.sendInitialize = () => {}
+    proc.sendUserText = () => {}
+    proc.kill = async () => { proc.alive = false }
+    proc.on('tool_result', (event: { content: string }) => nativeResults.push(event.content))
+    const handle = collectAgentTurn(proc, 'Task', { onProgress: step => progress.push(step) }, () => {})
+    try {
+      await proc.handleTranslatedMessage({ type: 'assistant', uuid: 'hidden-child', parent_tool_use_id: 'native-parent',
+        message: { content: [{ type: 'text', text: 'HIDDEN_CHILD_PROSE' }] } })
+      await proc.handleTranslatedMessage({ type: 'assistant', uuid: 'worker-tool', message: { content: [
+        { type: 'tool_use', id: 'native-tool', name: 'Agent', input: { description: 'Visible progress', prompt: 'HIDDEN_TOOL_PROMPT' } },
+      ] } })
+      await proc.handleTranslatedMessage({ type: 'user', uuid: 'hidden-result', message: { content: [
+        { type: 'tool_result', tool_use_id: 'native-tool', content: 'HIDDEN_TOOL_RECEIPT' },
+      ] } })
+      await proc.handleTranslatedMessage({ type: 'user', uuid: 'hidden-unseen-result', message: { content: [
+        { type: 'tool_result', tool_use_id: 'unseen-native-tool', content: 'HIDDEN_UNSEEN_TOOL_RECEIPT' },
+      ] } })
+      await proc.handleTranslatedMessage({ type: 'system', subtype: 'task_started', task_id: 'child-task',
+        description: 'HIDDEN_BACKGROUND_DESCRIPTION', prompt: 'HIDDEN_BACKGROUND_PROMPT' })
+      await proc.handleTranslatedMessage({ type: 'user', isMeta: true, promptSource: 'sdk', uuid: 'hidden-schedule',
+        message: { content: 'HIDDEN_SCHEDULED_PROMPT' } })
+      await proc.handleTranslatedMessage({ type: 'assistant', uuid: 'visible-answer',
+        message: { content: [{ type: 'text', text: 'Visible answer' }] } })
+      proc.emit('result', { is_error: false })
+      expect(await handle.done).toMatchObject({ output: 'Visible answer', displayOutput: 'ZH:Visible answer' })
+      expect(progress).toContainEqual(expect.objectContaining({ phase: 'started', detail: 'Visible progress', displayDetail: 'ZH:Visible progress' }))
+      expect(progress).toContainEqual(expect.objectContaining({ phase: 'completed', detail: '' }))
+      expect(nativeResults).toEqual(['HIDDEN_TOOL_RECEIPT', 'HIDDEN_UNSEEN_TOOL_RECEIPT'])
+      expect(translated).toEqual(['Visible progress', 'Visible answer'])
+      const history = JSON.stringify(context.snapshot())
+      expect(history).toContain('Visible progress')
+      expect(history).toContain('Visible answer')
+      expect(history).not.toContain('HIDDEN_')
+    } finally {
+      await handle.cancel()
+      rmSync(directory, { recursive: true, force: true })
+    }
+  })
+
+  test.each(['glm', 'claude-sub'])('nontranslated %s workers do not install a presentation policy', async source => {
+    const proc = new FakeProcess() as any
+    proc.tokenSourceId = source
+    proc.translationEnabled = false
+    let installed = false
+    proc.setTranslationPresentationPolicy = () => { installed = true }
+    const handle = collectAgentTurn(proc, 'Task', {}, () => {})
+    expect(installed).toBe(false)
+    proc.emit('assistant_text', { text: 'Native output', parentToolUseId: null })
+    proc.emit('result', { is_error: false })
+    expect(await handle.done).toMatchObject({ output: 'Native output' })
+  })
+
+  test('delegation returns native prose and question keys while the UI has translations', async () => {
+    const proc = new FakeProcess() as any
+    proc.tokenSourceId = 'claude-sub'
+    proc.translationEnabled = true
+    const displayed: unknown[] = []
+    const handle = collectAgentTurn(proc, 'work', { onNeedsInput: (_request, display) => displayed.push(display) }, () => {})
+    const originalInput = { questions: [{ question: 'Which test?', options: [{ label: 'Unit test' }] }] }
+    proc.emit('assistant_text', { text: 'Ready.', displayText: '已准备好。', parentToolUseId: null })
+    proc.emit('can_use_tool', { request_id: 'q-translated', tool_name: 'AskUserQuestion', originalInput,
+      input: { questions: [{ question: '选择哪种测试？', options: [{ label: '单元测试' }] }] } })
+    expect(handle.pendingInput()?.questions[0]?.question).toBe('Which test?')
+    expect(handle.displayPendingInput?.()?.questions[0]).toMatchObject({ id: 'Which test?', question: '选择哪种测试？' })
+    expect(displayed).toEqual([handle.displayPendingInput?.()])
+    handle.answer('q-translated', { 'Which test?': 'Unit test' })
+    expect(proc.permissionResponses[0][2].updatedInput).toEqual({ ...originalInput, answers: { 'Which test?': 'Unit test' } })
+    proc.emit('result', { is_error: false })
+    expect(await handle.done).toMatchObject({ output: 'Ready.', displayOutput: '已准备好。' })
+    expect(handle.displayPendingInput?.()).toBeNull()
+  })
+
+  test.each(['claude-sub', 'glm'])('%s translation display context precedes native submission', async source => {
+    const proc = new FakeProcess() as any
+    proc.tokenSourceId = source
+    proc.translationEnabled = true
+    let complete!: (texts: string[]) => void
+    const fields: unknown[] = []
+    const contexts: unknown[] = []
+    proc.translateDisplayFields = (texts: string[], _signal: AbortSignal, acceptDisplay: (fields: string[]) => boolean) => {
+      fields.push(texts)
+      return new Promise<string[]>(resolve => { complete = translated => { acceptDisplay(translated); resolve(translated) } })
+    }
+    const handle = collectAgentTurn(proc, 'Inspect API', { onDisplayContext: value => { contexts.push(value) } }, () => {}, undefined,
+      true, { description: 'Inspect API', prompt: 'Inspect API' })
+    expect(proc.initialized).toBe(true)
+    expect(proc.prompts).toEqual([])
+    expect(fields).toEqual([['Inspect API', 'Inspect API']])
+    complete(['检查接口', '检查接口'])
+    await Promise.resolve()
+    expect(contexts).toEqual([{ description: '检查接口', prompt: '检查接口' }])
+    expect(proc.prompts).toEqual(['Inspect API'])
+    expect(proc.tokenSourceId).toBe(source)
+    proc.emit('result', { is_error: false })
+    await handle.done
+  })
+
+  test('cancelling display-context translation prevents a late native task submission', async () => {
+    const proc = new FakeProcess() as any
+    proc.tokenSourceId = 'claude-sub'
+    proc.translationEnabled = true
+    let complete!: (texts: string[]) => void
+    let signal!: AbortSignal
+    proc.translateDisplayFields = (_texts: string[], supplied: AbortSignal) => {
+      signal = supplied
+      return new Promise<string[]>(resolve => { complete = resolve })
+    }
+    const contexts: unknown[] = []
+    const handle = collectAgentTurn(proc, 'Inspect API', { onDisplayContext: value => { contexts.push(value) } }, () => {}, undefined,
+      true, { description: 'Inspect API', prompt: 'Inspect API' })
+    const failure = handle.done.catch(error => error)
+    await handle.cancel()
+    complete(['检查接口', '检查接口'])
+    await Promise.resolve()
+    expect(signal.aborted).toBe(true)
+    expect(proc.prompts).toEqual([])
+    expect(contexts).toEqual([])
+    expect(await failure).toBeInstanceOf(AgentWorkerFailure)
+  })
+
+  test.each(['accepted', 'rejected', 'thrown', 'cancelled', 'unobserved'] as const)(
+    'delegated display context joins history only after acceptance: %s', async outcome => {
+      const directory = mkdtempSync(join(tmpdir(), 'worker-display-history-'))
+      const context = new ClaudeTranslationContext({ workDir: tmpdir(), storeDir: directory })
+      await context.initialize(new AbortController().signal)
+      context.bindSession(`worker-display-${outcome}`)
+      let complete!: (texts: string[]) => void
+      let translationStarted!: () => void
+      const started = new Promise<void>(resolve => { translationStarted = resolve })
+      const nativePrompts: string[] = [], displayed: unknown[] = []
+      const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high', tokenSourceId: 'claude-sub',
+        translationContext: context, translation: {
+          toEnglish: async text => text,
+          toChinese: async text => text,
+          toChineseFields: async () => {
+            translationStarted()
+            return new Promise<string[]>(resolve => { complete = resolve })
+          },
+        },
+      }) as any
+      proc.translationContextInitialized = true
+      proc.sessionId = `worker-display-${outcome}`
+      proc.sendInitialize = () => {}
+      proc.sendUserText = (text: string) => { nativePrompts.push(text) }
+      proc.kill = async () => { proc.alive = false }
+      let finishTranslation!: () => void
+      const translated = new Promise<void>(resolve => { finishTranslation = resolve })
+      const translateDisplayFields = proc.translateDisplayFields.bind(proc)
+      proc.translateDisplayFields = async (...args: any[]) => {
+        try { return await translateDisplayFields(...args) }
+        finally { finishTranslation() }
+      }
+      const handle = collectAgentTurn(proc, 'Inspect electric charge', outcome === 'unobserved' ? {} : {
+        onDisplayContext: value => {
+          expect(context.snapshot().entries).toEqual([])
+          displayed.push(value)
+          if (outcome === 'thrown') throw new Error('Display state rejected the task')
+          return outcome !== 'rejected'
+        },
+      }, () => {}, undefined, true, { description: 'Inspect charge', prompt: 'Inspect electric charge' })
+      const done = handle.done.catch(error => error)
+      try {
+        await started
+        if (outcome === 'cancelled') await handle.cancel()
+        complete(['检查电荷', '检查电荷计算'])
+        await translated
+        // The runner submits native input in the continuation after this boundary.
+        await Promise.resolve()
+        if (outcome === 'accepted' || outcome === 'unobserved') {
+          expect(nativePrompts).toEqual(['Inspect electric charge'])
+          proc.emit('result', { is_error: false })
+          await done
+        } else {
+          expect(await done).toBeInstanceOf(AgentWorkerFailure)
+          expect(nativePrompts).toEqual([])
+        }
+        const entries = context.snapshot().entries
+        if (outcome === 'accepted') {
+          expect(entries).toHaveLength(1)
+          expect(entries[0]).toMatchObject({
+            original: 'Inspect charge\n\nInspect electric charge', translated: '检查电荷\n\n检查电荷计算',
+            origin: 'Caller → delegated Claude Code agent, also shown to the Feishu user: delegated task request.',
+          })
+        } else expect(entries).toEqual([])
+        expect(displayed).toHaveLength(outcome === 'cancelled' || outcome === 'unobserved' ? 0 : 1)
+      } finally {
+        await handle.cancel()
+        rmSync(directory, { recursive: true, force: true })
+      }
+    },
+  )
+
+  test('translation-enabled output without verified presentation fails without exposing raw text on the card', async () => {
+    const proc = new FakeProcess() as any
+    proc.tokenSourceId = 'claude-sub'
+    proc.translationEnabled = true
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    proc.emit('assistant_text', { text: 'Unverified prose' })
+    const error = await handle.done.catch(error => error)
+    expect(error).toBeInstanceOf(AgentWorkerFailure)
+    expect(error.message).toContain('missing verified translation')
+    expect(error.output).toBe('Unverified prose')
+    expect(error.displayOutput).toBe('')
+  })
+
+  test('translated descriptions reach progress without changing or exposing executed commands', async () => {
+    const proc = new FakeProcess() as any
+    const progress: any[] = []
+    const handle = collectAgentTurn(proc, 'work', { onProgress: step => progress.push(step) }, () => {})
+    proc.emit('tool_use', { name: 'Bash', input: { command: '# desc: Inspect files\ncat .env' },
+      displayInput: { command: '# desc: Inspect files\ncat .env', __displayDescription: '检查文件' } })
+    proc.emit('tool_use', { name: 'Agent', input: { description: 'Inspect API', prompt: 'secret' },
+      displayInput: { description: '检查接口', prompt: 'secret' } })
+    expect(progress.map(step => step.detail)).toEqual(['Inspect files', 'Inspect API'])
+    expect(progress.map(step => step.displayDetail)).toEqual(['检查文件', '检查接口'])
+    expect(JSON.stringify(progress)).not.toContain('secret')
+    expect(JSON.stringify(progress)).not.toContain('cat .env')
+    proc.emit('result', { is_error: false })
+    await handle.done
+  })
+
+  test('failure preserves verified partial output and error separately from native diagnostics', async () => {
+    const proc = new FakeProcess() as any
+    const handle = collectAgentTurn(proc, 'work', {}, () => {})
+    proc.emit('assistant_text', { text: 'Partial result', displayText: '部分结果' })
+    proc.emit('result', { is_error: true, error: 'Request failed', displayError: '请求失败' })
+    const failure = await handle.done.catch(error => error)
+    expect(failure).toMatchObject({ output: 'Partial result', displayOutput: '部分结果', message: 'Request failed', displayError: '请求失败' })
+  })
+
   test('successful account selection keeps other-account diagnostics out of delegated progress', async () => {
     const proc = new FakeProcess() as any
     proc.provider = 'codex'

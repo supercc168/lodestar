@@ -1,12 +1,11 @@
 import { existsSync, readFileSync } from 'node:fs'
 import { codexAccounts, isCodexLoginPending, type CodexAccount } from './codex-accounts'
-import { peekSuccessfulUsage, peekUsage, type UsageSnapshot } from './usage'
+import { peekSuccessfulUsage, peekUsage, readUsage, type UsageSnapshot } from './usage'
 import { codexModelQuota, codexQuotaMeter, codexWeekUsedSince, compareCodexQuota, rankCodexQuota, type CodexQuotaRank } from './codex-quota'
 import { getTokenSourceForAccount, tokenSourceRuntimeModel, type TokenSource } from './token-source'
 import type { AgentReasoningEffort } from './agent-process'
 import { CODEX_QUOTA_BLOCKS_FILE } from './paths'
 import { writeJsonStateAtomic } from './state-store'
-import { log } from './log'
 import { codexCreditsReplenished, parseCodexCredits, type CodexCredits } from './codex-credits'
 
 export interface CodexAccountCandidate extends CodexQuotaRank {
@@ -36,6 +35,9 @@ export interface CodexSelectionOptions {
   signal?: AbortSignal
   /** Launch from the last successful cached quota if possible; all reads share the same cooldown. */
   preferCachedUsage?: boolean
+  /** One task-start fallback, or accounts whose observed reset time just arrived.
+   * Ordinary quota-wait iterations must not opt into network I/O. */
+  refreshUsage?: true | readonly string[]
   /** Native quota error from a manually chosen process whose quota had not been read. Only used once. */
   failedAccountId?: string
 }
@@ -48,6 +50,7 @@ export class CodexAccountScheduler {
   constructor(private readonly deps: {
     accounts: () => CodexAccount[]
     usage: (id: string) => Promise<UsageSnapshot>
+    refreshUsage?: (id: string) => Promise<UsageSnapshot>
     cachedUsage: (id: string) => UsageSnapshot | null
     identity: (id: string) => string | null
     compatible: (id: string, model: string, effort?: AgentReasoningEffort) => Promise<string | null>
@@ -111,7 +114,7 @@ export class CodexAccountScheduler {
     }
     // Cached and live quota passes belong to one decision. Recheck each account's catalog only once.
     const checkedModels = new Map<string, Promise<string | null>>()
-    if (opts.preferCachedUsage) {
+    if (opts.preferCachedUsage || opts.refreshUsage) {
       const cached = await this.chooseAutomatic(accounts, opts, true, checkedModels)
       if (cached.selected) return cached
     }
@@ -129,7 +132,9 @@ export class CodexAccountScheduler {
         usage = { state: 'network', reason: '正在登录' }
       } else {
         try {
-          usage = cached ? this.deps.cachedUsage(account.id) : await this.deps.usage(account.id)
+          const refresh = opts.refreshUsage === true || Array.isArray(opts.refreshUsage) && opts.refreshUsage.includes(account.id)
+          usage = cached ? this.deps.cachedUsage(account.id)
+            : refresh && this.deps.refreshUsage ? await this.deps.refreshUsage(account.id) : await this.deps.usage(account.id)
           const fingerprint = usage?.state === 'ok' ? usage.accountFingerprint ?? this.deps.identity(account.id) : null
           if (fingerprint) identity = fingerprint
           else if (usage?.state === 'ok') reason = '账号身份 MISS'
@@ -172,12 +177,19 @@ export class CodexAccountScheduler {
         const replenished = freshCredits && codexCreditsReplenished(block.credits, quota.credits)
         const resetObserved = fresh && rank.funding !== 'credits' && block.windows.some(old => {
           const w = quota[old.kind]
+          // A successful read can remove a limit; do not wait for that absent window to reset.
+          if (w === null) return true
           return w && w.percent !== null && ((old.percent !== null && w.percent < old.percent)
             || (old.reset !== null && old.reset <= now && (w.resetsAt?.getTime() ?? 0) > old.reset))
         })
         if (rank.state === 'ready') {
           if (resetObserved || replenished) recovered.add(block.key)
-          else rank = { ...rank, state: 'exhausted', score: null, reason: '上次请求已确认额度耗尽，等待接口确认恢复' }
+          else {
+            const reset = Math.min(...block.windows.map(window => window.reset)
+              .filter((value): value is number => value !== null && Number.isFinite(value) && value > now))
+            rank = { ...rank, state: 'exhausted', score: null, reason: '上次请求已确认额度耗尽，等待接口确认恢复',
+              ...(Number.isFinite(reset) ? { retryAt: reset } : {}) }
+          }
         }
         // Observe an actually depleted balance before a later, possibly smaller replenishment.
         // Unknown credit data never erases the last observation or becomes a zero baseline.
@@ -195,7 +207,6 @@ export class CodexAccountScheduler {
     const selected = ready[0] ?? null
     const exhausted = candidates.filter(c => c.state === 'exhausted' || c.state === 'waiting')
     const retryAt = exhausted.length ? Math.min(...exhausted.map(c => c.retryAt ?? now + 60_000)) : undefined
-    for (const c of candidates) log(`codex scheduler${cached ? ' [cache]' : ''}: ${c.account.name} ${c.state} priority=${c.funding ?? c.priority ?? 'score'} score=${c.score ?? (c.funding === 'credits' || c.priority === 'expiring' ? 'N/A' : 'MISS')}${c.reason ? ` (${c.reason})` : ''}`)
     return { selected, candidates, ...(retryAt !== undefined ? { retryAt } : {}) }
   }
 }
@@ -222,6 +233,7 @@ export async function checkCodexModelCompatibility(source: TokenSource, model: s
 export const codexAccountScheduler = new CodexAccountScheduler({
   accounts: () => codexAccounts.list(), usage: async id => peekUsage(id)
     ?? { state: 'network', reason: '额度缓存尚未就绪，后台刷新中' }, cachedUsage: peekSuccessfulUsage,
+  refreshUsage: id => readUsage(id, { force: true }),
   identity: id => codexAccounts.fingerprint(id), pendingLogin: isCodexLoginPending,
   now: Date.now, stateFile: CODEX_QUOTA_BLOCKS_FILE,
   compatible: async (id, model, effort) => {

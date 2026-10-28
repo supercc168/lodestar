@@ -16,13 +16,13 @@
 - footer 模型标识固定为 `agent · 模型名/effort`（agent 小写）。窗口额度沿用 `4.1h·7%·[6.9d·17%]` 的紧凑倒计时格式，不改成“额度 5h 已用…”或加入月度工具明细；余额显示 `余额 $…` / `余额 ¥…`。失败显示 MISS；Codex footer 刷新失败、进程已退出或换号时可按原格式直接展示本条回复所属账号的成功缓存，不加缓存或刷新失败标注，无缓存或认证失败仍 MISS。Codex 有消费积分时在窗口后追加 `积分 62.5k`；所有消费积分统一用小写 `k` / `m` 缩写千和百万，最多一位小数、去除尾零；未知显示 `积分 MISS`、确认没有则省略；不附加套餐、累计消费或解释性括号。
 - Codex `request_user_input` 和 Claude `AskUserQuestion` 共用问答卡，保留各自回包语义、历史回答和自定义输入入口。
 - `tool.ts` 生成工具摘要，`shell-command.ts` 解析 Bash、PowerShell 及引号包装后的首行 `# desc:`。Claude TaskCreate/Update/List/Get 在 `task-board.ts` 中累积为完整任务板。
-- 生图工具默认收起，完整提示词放在折叠体内，图片以结构化 `img` 子组件展示并允许点击预览。不要把提示词塞进标题，也不要把已嵌入的图片再单独发送。图片上传由 Session helper 处理，模板只接收 image key。
+- 生图工具默认收起，完整提示词放在折叠体内；不超过 30 MB 的图片以结构化 `img` 子组件展示并允许点击预览，超过的图片由交付层转云空间。不要把提示词塞进标题，也不要把已嵌入的图片再单独发送。图片上传由 Session helper 处理，模板只接收 image key。
 - `hi` 的额度区用展开式浅蓝面板，全局所有账号各占一行、notation 字号、2px 行间距，无进度条和底部解释。Codex 按账号备注分行，只显示主额度、消费积分及“重置 N”，排除 Spark/gpt-reserve；DeepSeek、GLM 的跨 Agent 入口合为一行；GLM 月工具只显示百分比。统一额度摘要与 footer 不附带重置次数。活跃项目行尾显示实际 Codex 进程的账号备注；账号未知时省略整个备注，不显示账号 MISS。账号列表每页附完整 Codex 账号命令说明，底部「Codex 命令」面板默认折叠。
-- Codex 的 `hi`、footer 和账号额度只显示主额度；保留主额度自身的短时窗口、周窗口，不展示 GPT-5.3-Codex-Spark 等模型的附加额度。
-- `codex-accounts` 去掉记录数和调度汇总行，按调度顺序排序后分页；每项标题为 `#1·备注「0.111/h」 · 重置 N`，重置次数取该账号额度缓存，保留零、缺失用 MISS；临期直接优先时用「临期优先」，仅剩消费积分时用「积分」且不伪造小时分数，无排名或分数用 MISS。正文首行为“邮箱：…”，随后周、可选 5h 各一行，以六格进度条、已用百分比和「5.2d」真实倒计时显示，有消费积分时另加 `积分 62.5k`，未知显示 `积分 MISS`、确认没有则省略，不附加套餐或重置卡数；暂不可用保留可展开的具体原因，完整命令区保持默认折叠。调用方只读取账号邮箱缓存；后台模型/额度查询复用原生 `account/read` 发布邮箱，被额度去重的记录也保留各自账号信息。邮箱、额度及调度失败保留 MISS 和可展开的错误，不用备注或旧登录记录代替。后台激活错误由调用方传入 `activationErrors`，在对应账号下显示可展开的「后台激活 MISS」，模板不查询激活状态。
-- Claude 订阅 footer 同时保留 5 小时与周额度，周额度按该条回复的模型选择专属窗口或总窗口；已返回的专属窗口缺数据时显示 MISS。hi 仍列出全部额度窗口。
-- `background.ts` 累积 Claude `task_*`、Codex collab 和 DSH 子 Agent 事件：子 Agent 直接展示，普通前台命令留在 pending，渲染为吸附对话末尾的「后台游标卡」(active/pending 双池(workflow/monitor 白名单 task_started 直入 active)、沉降历史快照、全终态固化)。委派任务卡在 `agent-cards.ts`，类别和摘要复用 `backgroundTaskKind`/`backgroundTaskSummary`：默认折叠，标题明确标出“委派任务 / 子 Agent / 后台进程”类别、状态与最多 40 字说明，详情只保留任务说明短摘要，结果在卡片安全上限内完整展示，超限明确截断，具体类型、错误和最近三步动作仍保留；完成后显示实际耗时，运行中不放需要定时刷新的计时。
-- 项目独立 Agent 调用在 `agent-cards.ts` 使用专属卡，一次 run 一张，不复用共享群尾卡；模板显示“项目任务”；项目调用不支持交互提问，不提供调用方回答指引。取消按钮通过 `agent_project_cancel` 路由，不依赖活跃 Session。
+- Codex 的 `hi`、footer 和账号额度只显示主额度；只渲染接口实际返回的短时窗口、周窗口，缺少整个窗口时不补零或满窗，已返回窗口缺字段仍显示 MISS；不展示 GPT-5.3-Codex-Spark 等模型的附加额度。
+- `codex-accounts` 去掉记录数和调度汇总行，按调度顺序排序后分页；每项标题为 `#1·备注「0.111/h」 · 重置 N`，重置次数取该账号额度缓存，保留零、缺失用 MISS；临期直接优先时用「临期优先」，仅剩消费积分时用「积分」且不伪造小时分数，无排名或分数用 MISS。正文首行为“邮箱：…”，随后按接口实际返回显示周、5h 窗口，各占一行，以六格进度条、已用百分比和「5.2d」真实倒计时显示，有消费积分时另加 `积分 62.5k`，未知显示 `积分 MISS`、确认没有则省略，不附加套餐或重置卡数；暂不可用保留可展开的具体原因，完整命令区保持默认折叠。调用方只读取账号邮箱缓存；后台模型/额度查询复用原生 `account/read` 发布邮箱，被额度去重的记录也保留各自账号信息。邮箱、额度及调度失败保留 MISS 和可展开的错误，不用备注或旧登录记录代替。后台激活错误由调用方传入 `activationErrors`，在对应账号下显示可展开的「后台激活 MISS」，模板不查询激活状态。
+- Claude 订阅 footer 同时保留 5 小时与周额度，周额度按该条回复的模型选择专属窗口或总窗口；已返回的专属窗口缺数据时显示 MISS。hi 仍列出全部额度窗口。MD 和 hi 只使用 `claude-sub` 表示 Claude 订阅，不另设本机配置入口。
+- Claude 订阅多账号在 hi 各占一行并使用账号备注；活跃项目显示实际运行的 Claude 账号。footer 捕获本轮真实账号的缓存视图，不随下一轮选号变化，不从聚合模型目录借用其他账号额度。
+- `background.ts` 累积 Claude `task_*`、Codex collab 和 DSH 子 Agent 事件；子 Agent 直接展示，普通前台命令留在 pending。任务行与委派共用 `agent-cards.ts`：默认折叠，标题明确标出“委派任务 / 子 Agent / 后台进程”类别、状态与最多 40 字说明，详情只保留任务说明短摘要，结果在卡片安全上限内完整展示，超限明确截断，具体类型、错误和最近三步动作仍保留；完成后显示实际耗时，运行中不放需要定时刷新的计时。本地后台游标卡扩展仍由 Session 管理。
 - 临时会话选择卡只携带 `panel_id`、opaque `choice_id`。provider、cwd、source、owner、launch 保存在 Session 短期状态，不能信任回调传入的可执行 id、数组下标或路径。
 - 公式段使用固定 id 的单个顶层 `column_set`，按源码顺序替换内部 markdown/image。小图可用 `crop_center` 和精确 `size`；宽图用 `fit_horizontal`，不传 `size`，由容器缩放。
 - Card action 立即换卡返回 `{ card: { type: 'raw', data: card } }`。异步更新先返回 toast ACK，再调用 `feishu.updateCard()`；不用 callback-token 的 `/interactive/v1/card/update`，该端点会让 schema 2.0 卡片空白。`notify_callback` 在 Session 存在性检查前分流。

@@ -1,10 +1,14 @@
 import { expect, test } from 'bun:test'
+import { channelInstructions } from './instructions'
 
-test('main Agent launches select the directory delivery rules for Codex, Claude and DSH', () => {
+test('main Agent launches share channel instructions without reading file delivery state', () => {
   // Isolate module mocks so no real Agent or Feishu service is started.
   const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', `
     import { mock } from 'bun:test'
+    import { writeFileSync } from 'node:fs'
     import './src/feishu-test-mock'
+    const { FILE_DELIVERY_GROUPS_FILE } = await import('./src/paths')
+    writeFileSync(FILE_DELIVERY_GROUPS_FILE, 'invalid delivery state')
     const launches = []
     mock.module('./src/agent-launch', () => ({ createAgentProcess: options => {
       const entry = { provider: options.provider, instructions: options.developerInstructions, inputs: [] }
@@ -26,43 +30,27 @@ test('main Agent launches select the directory delivery rules for Codex, Claude 
     } }))
     const { Session } = await import('./src/session')
     for (const provider of ['codex', 'claude', 'dsh']) {
-      for (const mode of ['chat', 'drive']) {
-        const session = new Session('launch-' + provider + '-' + mode, 'chat-' + mode)
-        session.selectedProvider = provider
-        session.selectedTokenSourceId = null
-        session.selectedModel = 'test-model'
-        session.selectedEffort = 'high'
-        session.getFileDeliveryMode = () => mode
-        const proc = session.spawnAgent()
-        session.sendClaimedUserText(proc, '生成报告')
-        session.sendClaimedUserText(proc, '继续')
-      }
+      const session = new Session('launch-' + provider, 'chat-' + provider)
+      session.selectedProvider = provider
+      session.selectedTokenSourceId = null
+      session.selectedModel = 'test-model'
+      session.selectedEffort = 'high'
+      const proc = session.spawnAgent()
+      await session.sendClaimedUserText(proc, '生成报告')
+      await session.sendClaimedUserText(proc, '继续')
     }
-    const broken = new Session('broken-delivery-config', 'chat-broken')
-    broken.getFileDeliveryMode = () => { throw new Error('group config unreadable') }
-    let error
-    try { broken.spawnAgent() } catch (e) { error = e.message }
-    console.log(JSON.stringify({ launches, error }))
+    console.log(JSON.stringify({ launches }))
   `], { cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'test' }, stdout: 'pipe', stderr: 'pipe' })
   if (result.exitCode !== 0) throw new Error(result.stderr.toString() || result.stdout.toString())
-  const { launches, error } = JSON.parse(result.stdout.toString().trim().split('\n').at(-1)!)
-  expect(error).toBe('group config unreadable')
-  expect(launches).toHaveLength(6)
-  for (const [index, launch] of launches.entries()) {
-    expect(launch.instructions).toContain('[[send: /abs/path]]')
+  const { launches } = JSON.parse(result.stdout.toString().trim().split('\n').at(-1)!)
+  expect(launches).toHaveLength(3)
+  for (const launch of launches) {
+    expect(launch.instructions).toBe(channelInstructions())
     expect(launch.inputs).toEqual(['生成报告', '继续'])
-    if (index % 2 === 0) {
-      expect(launch.instructions).toContain('30 × 1024 × 1024')
-      expect(launch.instructions).toContain('交付前检查文件大小')
-    } else {
-      expect(launch.instructions).not.toMatch(/30|大小|压缩|分卷|分片/)
-    }
-    const questionTool = { codex: 'request_user_input', claude: 'AskUserQuestion', dsh: 'ask_user_question' }[launch.provider as 'codex' | 'claude' | 'dsh']
-    expect(launch.instructions).toContain(questionTool)
   }
 })
 
-test('BTW launches first with migrated directory settings; WT launches with its own profile and delivery rules', () => {
+test('BTW shares the main profile and WT keeps its own profile with identical instructions despite legacy delivery settings', () => {
   const result = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', `
     import { mock } from 'bun:test'
     import { writeFileSync } from 'node:fs'
@@ -108,6 +96,6 @@ test('BTW launches first with migrated directory settings; WT launches with its 
     expect(launch.workDir).toBe(wt ? wtDir : mainDir)
     expect(launch.profile.tools).toBe(wt ? 'Read,Edit' : 'Read')
     expect(launch.profile.loadProjectMcp).toBe(wt)
-    expect(launch.developerInstructions.includes('30 × 1024 × 1024')).toBe(wt)
+    expect(launch.developerInstructions).toBe(channelInstructions())
   }
 })
