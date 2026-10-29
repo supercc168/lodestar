@@ -88,6 +88,13 @@ function completion(delta: { content?: string; tool_calls?: any[] }, finish = 's
   }
 }
 
+// 宿主 DSH 会话内运行测试会继承 daemon 注入的 LODESTAR_DSH_*（如 dsh-glm 的 zai-coding-cn 纯 GLM 目录），
+// 经 DshProcess 的 {...process.env, ...hostEnv} 透传后覆盖夹具声明的 provider；
+// 基线 env 一律剥离该前缀，夹具显式设置的值才是唯一真相源。
+function sanitizeAmbientDshEnv(env: Record<string, string | undefined>): Record<string, string | undefined> {
+  return Object.fromEntries(Object.entries(env).filter(([key]) => !key.startsWith('LODESTAR_DSH_')))
+}
+
 async function fixture(reply: (body: any, count: number, protocol: ModelProtocol) => FixtureResponse | Promise<FixtureResponse>) {
   const dir = await mkdtemp(join(tmpdir(), 'lodestar-dsh-test-'))
   cleanups.push(() => rm(dir, { recursive: true, force: true }))
@@ -108,7 +115,7 @@ async function fixture(reply: (body: any, count: number, protocol: ModelProtocol
     workDir: dir, tokenSourceId: 'deepseek-harness', model: 'deepseek-v4-flash', effort: 'high',
     profile: { loadProjectMcp: false },
     runtimeOptions: { home: join(dir, 'home') },
-    transformEnv: env => ({ ...env, DEEPSEEK_API_KEY: 'local-test-key', DEEPSEEK_BASE_URL: `http://127.0.0.1:${server.port}` }),
+    transformEnv: env => ({ ...sanitizeAmbientDshEnv(env), DEEPSEEK_API_KEY: 'local-test-key', DEEPSEEK_BASE_URL: `http://127.0.0.1:${server.port}` }),
   }
   function processFor(launch?: ConversationLaunch, overrides: Partial<DshSpawnOptions> = {}) {
     const proc = new DshProcess({ ...opts, ...overrides, launch })
@@ -161,7 +168,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
     } })
     const source = tokenSourceFactories().find(entry => entry.kind === 'deepseek-harness')!
       .build(configs['deepseek-harness']!)
-    const proc = f.processFor(undefined, { transformEnv: env => source.spawnEnv({ ...env,
+    const proc = f.processFor(undefined, { transformEnv: env => source.spawnEnv({ ...sanitizeAmbientDshEnv(env),
       NODE_OPTIONS: [env.NODE_OPTIONS, `--import=${pathToFileURL(preloadPath).href}`].filter(Boolean).join(' '),
     }) })
     await proc.initializationPromise()
@@ -228,7 +235,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
     const model = 'glm-manual-catalog-probe'
     const f = await fixture(() => completion({ content: 'custom GLM replied' }, 'stop', model))
     const proc = f.processFor(undefined, { tokenSourceId: 'dsh-glm', model, effort: 'high',
-      transformEnv: env => ({ ...env, LODESTAR_DSH_PROVIDER: 'zai-coding-cn', LODESTAR_DSH_GLM_API_KEY: 'local-test-key',
+      transformEnv: env => ({ ...sanitizeAmbientDshEnv(env), LODESTAR_DSH_PROVIDER: 'zai-coding-cn', LODESTAR_DSH_GLM_API_KEY: 'local-test-key',
         LODESTAR_DSH_BASE_URL: f.baseUrl, LODESTAR_DSH_MODELS: JSON.stringify([model]), LODESTAR_DSH_DEFAULT_MODEL: model }) })
     await proc.initializationPromise()
     const done = nextResult(proc)
@@ -243,7 +250,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
       name: 'bash', arguments: JSON.stringify({ command: '# desc: 验证 GLM 原生工具调用\nprintf glm-tool-proof', description: 'Return proof' }),
     } }] }, 'tool_calls', 'glm-5.3') : completion({ content: `glm reply ${count}` }, 'stop', 'glm-5.3'))
     const overrides: Partial<DshSpawnOptions> = { tokenSourceId: 'dsh-glm', model: 'glm-5.3', effort: 'low',
-      transformEnv: env => ({ ...env, LODESTAR_DSH_PROVIDER: 'zai-coding-cn', LODESTAR_DSH_GLM_API_KEY: 'glm-local-test-key',
+      transformEnv: env => ({ ...sanitizeAmbientDshEnv(env), LODESTAR_DSH_PROVIDER: 'zai-coding-cn', LODESTAR_DSH_GLM_API_KEY: 'glm-local-test-key',
         LODESTAR_DSH_BASE_URL: f.baseUrl, LODESTAR_DSH_MODELS: '["glm-5.3"]', LODESTAR_DSH_DEFAULT_MODEL: 'glm-5.3' }) }
     const proc = f.processFor(undefined, overrides)
     await proc.initializationPromise()
