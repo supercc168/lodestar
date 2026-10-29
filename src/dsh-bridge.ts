@@ -25,7 +25,7 @@ import { DSH_PROTOCOL_VERSION } from './dsh-protocol.ts'
 export const name = 'lodestar-bridge'
 export const inject = ['agents', 'llm', 'agentDefaultModel', 'sessionPersistence', 'tools', 'systemPrompt', 'userQuestions', 'compaction', 'shellEnv', 'attachments', 'sdkAppStartup']
 const PROVIDER = process.env.LODESTAR_DSH_PROVIDER ?? 'deepseek-official'
-if (!['deepseek-official', 'zai-coding-cn', 'zai'].includes(PROVIDER)) throw new Error(`Unsupported DSH provider: ${PROVIDER}`)
+if (!['deepseek-official', 'zai-coding-cn', 'zai', 'openai-relay'].includes(PROVIDER)) throw new Error(`Unsupported DSH provider: ${PROVIDER}`)
 // Explicit opt-out remains available; native descendants otherwise keep delegation tools.
 const DELEGATION_TOOLS = ['subagent', 'subagent_fork', 'workflow', 'ralph', 'send_message']
 

@@ -13,6 +13,7 @@ import { readClaudeSettingsEnv } from './glm-usage'
 import { withModelVisibility } from './token-source-visibility'
 import { sharedTokenSourceConfigs } from './token-source-accounts'
 import { cachedTokenSource, disposeCachedTokenSource } from './token-source-cache'
+import { buildRelayTokenSource, relayAgentTargets } from './token-source-relay'
 
 // provider 模块 —— import 即登记到 factory registry(副作用)。
 import './token-source-codex'
@@ -48,7 +49,17 @@ export function buildTokenSourcesFromConfig(): number {
     }
     return { cfg, detected, create, initial: create() }
   })
-  const sources = definitions.map(({ cfg, detected, create, initial }) => {
+  const relayDefinitions = Object.entries(config.relays ?? {}).flatMap(([siteId, relay]) =>
+    relayAgentTargets(relay).map(agent => {
+      const create = () => {
+        const source = buildRelayTokenSource(siteId, relay, agent)
+        source.spawnRevision = JSON.stringify([siteId, relay, agent])
+        return source
+      }
+      return { cfg: relay as unknown as TokenSourceConfig, detected: null, create, initial: create(), relay: true }
+    }))
+  const allDefinitions = [...definitions.map(item => ({ ...item, relay: false })), ...relayDefinitions]
+  const sources = allDefinitions.map(({ cfg, detected, create, initial }) => {
     const routing = (value: Partial<TokenSourceConfig> | null) => {
       const { display, model, effort, models, hidden_models, shown_models, custom_models, slots, default: _default, ...identity } = value ?? {}
       return identity
