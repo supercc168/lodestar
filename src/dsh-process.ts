@@ -105,7 +105,12 @@ export class DshProcess extends EventEmitter implements AgentProcess {
     const launch = opts.launch ?? { kind: 'fresh' }
     validateConversationLaunch(launch, 'dsh', opts.workDir)
     this.launchKind = launch.kind
-    const base = { ...process.env, ...opts.hostEnv }
+    // LODESTAR_DSH_* 由 Lodestar 按会话经 hostEnv/transformEnv 注入子进程；
+    // 从祖先 DSH 进程继承的 ambient 值不是预期语义，在此边界统一剥离，
+    // opts 显式提供的值在剥离之后合并，不受影响。
+    const inherited = Object.fromEntries(Object.entries(process.env)
+      .filter(([key]) => !key.startsWith('LODESTAR_DSH_')))
+    const base = { ...inherited, ...opts.hostEnv }
     this.runtime = new DshRuntime({ cwd: opts.workDir,
       env: opts.transformEnv ? opts.transformEnv(base) : base,
       profile: opts.profile,

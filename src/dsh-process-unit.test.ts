@@ -157,6 +157,29 @@ afterAll(async () => {
 })
 
 describe('DshProcess 契约', () => {
+  test('ambient LODESTAR_DSH_* 不透传子进程;hostEnv 显式值保留', () => {
+    const ambient = {
+      LODESTAR_DSH_PROVIDER: 'zai-coding-cn', LODESTAR_DSH_MODELS: '["glm-5.3"]',
+      LODESTAR_DSH_BASE_URL: 'https://ambient.example', LODESTAR_DSH_DEFAULT_MODEL: 'glm-5.3',
+    }
+    const saved = Object.entries(ambient).map(([key]) => [key, process.env[key]] as const)
+    try {
+      Object.assign(process.env, ambient, { KEEP_ME: 'untouched' })
+      // 不带 hostEnv:ambient 前缀整体剥离,无关变量原样保留。
+      processFor()
+      const stripped = FakeDshRuntime.latest().options.env
+      for (const key of Object.keys(ambient)) expect(stripped[key]).toBeUndefined()
+      expect(stripped.KEEP_ME).toBe('untouched')
+      // hostEnv 显式提供值:在剥离之后合并,显式值是唯一真相源。
+      processFor({ hostEnv: { LODESTAR_DSH_PROVIDER: 'deepseek-official' } })
+      const explicit = FakeDshRuntime.latest().options.env
+      expect(explicit.LODESTAR_DSH_PROVIDER).toBe('deepseek-official')
+      expect(explicit.LODESTAR_DSH_MODELS).toBeUndefined()
+    } finally {
+      for (const [key, value] of saved) { if (value === undefined) delete process.env[key]; else process.env[key] = value }
+    }
+  })
+
   test('成功投递返回 queued/dsh 派发,而不是 void', async () => {
     const proc = processFor()
     const runtime = FakeDshRuntime.latest()
