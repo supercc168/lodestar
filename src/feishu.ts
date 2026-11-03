@@ -969,10 +969,19 @@ export function setSessionBranchBase(sessionName: string, base: ConversationBran
 // 与 worktree 的 [slug](独立目录 + git 分支)区分:*后缀 = 同一项目目录、新群、
 // 新会话。workDir 解析靠 tempProjectName 剥后缀回原目录。
 const TEMP_SUFFIX_RE = /\*[0-9]{4}-[0-9]{4}(-[0-9]+)?$/
+const WORKTREE_SUFFIX_RE = /^(.+)\[[^\[\]]+\]$/
 
 /** 剥临时群 *MMDD-HHMM 后缀,返回原项目名;非临时群返回 null。 */
 export function tempProjectName(sessionName: string): string | null {
   return TEMP_SUFFIX_RE.test(sessionName) ? sessionName.replace(TEMP_SUFFIX_RE, '') : null
+}
+
+/** Resolve the canonical main-session name for main, BTW, WT and BTW-from-WT sessions.
+ *  剥临时群 * 后缀再剥 worktree [slug] 后缀,统一解析回主项目名(上游 c452546):
+ *  BTW/WT 交付文件夹、任务清单绑定等主项目口径共用此入口。 */
+export function mainSessionName(sessionName: string): string {
+  const tempBase = tempProjectName(sessionName) ?? sessionName
+  return tempBase.match(WORKTREE_SUFFIX_RE)?.[1] ?? tempBase
 }
 
 /** 拼临时群名:projectName*MMDD-HHMM。同分钟已有同名则加 -2、-3… 去重。
@@ -1199,6 +1208,13 @@ export function chatIdForSession(sessionName: string): string | null {
     log('feishu chat binding ambiguous')
   }
   return null
+}
+
+/** Resolve the main group's chat id while keeping the current chat as a safe
+ * fallback for a main session whose binding has not been persisted yet. */
+export function mainChatIdForSession(sessionName: string, fallbackChatId?: string): string | null {
+  const mainName = mainSessionName(sessionName)
+  return chatIdForSession(mainName) ?? (mainName === sessionName ? fallbackChatId ?? null : null)
 }
 
 export async function refreshChatList(): Promise<void> {

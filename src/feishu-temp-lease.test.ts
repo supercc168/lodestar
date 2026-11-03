@@ -32,6 +32,7 @@ function runFresh(work: string, leases?: object) {
   const feishuModule = pathToFileURL(join(import.meta.dir, 'feishu.ts')).href
   const script = `
     import * as feishu from ${JSON.stringify(feishuModule)}
+    const { bindSessionToChat, mainSessionName, mainChatIdForSession } = feishu
     import { readFileSync } from 'node:fs'
     import { join } from 'node:path'
     const dataDir = ${JSON.stringify(dataDir)}
@@ -53,6 +54,31 @@ function runFresh(work: string, leases?: object) {
 }
 
 describe('temporary-session leases', () => {
+  test('maps main, WT, BTW and BTW-from-WT sessions back to the main group', () => {
+    const result = runFresh(`
+      bindSessionToChat('project', 'oc_main')
+      out({
+        names: [
+          mainSessionName('project'),
+          mainSessionName('project*0821-1337'),
+          mainSessionName('project[feature]'),
+          mainSessionName('project[feature]*0821-1337'),
+        ],
+        chats: [
+          mainChatIdForSession('project', 'oc_current'),
+          mainChatIdForSession('project*0821-1337', 'oc_temp'),
+          mainChatIdForSession('project[feature]', 'oc_worktree'),
+          mainChatIdForSession('project[feature]*0821-1337', 'oc_temp_worktree'),
+        ],
+      })
+    `)
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(result.value).toEqual({
+      names: ['project', 'project', 'project', 'project'],
+      chats: ['oc_main', 'oc_main', 'oc_main', 'oc_main'],
+    })
+  })
+
   test('persists and reloads exact chat/name ownership', () => {
     const result = runFresh(`
       feishu.registerTempSessionLease('project*0821-1337', 'oc_temp')

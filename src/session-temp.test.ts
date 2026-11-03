@@ -262,6 +262,16 @@ describe('session-temp Codex btw/fork(上游 ff44afb)', () => {
     expect(sentTexts.at(-1)).toContain('已创建')
   })
 
+  test('WT 中创建 BTW 保留 worktree 后缀(本地语义,上游 c452546 剥法不采)', async () => {
+    // 本地 workspace 按群名解析目录:temp 名带 [slug] 才锚定 worktree cwd;
+    // 上游交付主群名口径走 file-delivery 的 mainChatIdForSession,不依赖此处。
+    const h = makeHarness('project[feature]')
+
+    await runBtwCommand(h.session, 'ou_owner')
+
+    expect(h.createCalls[0].chatName).toBe('project[feature]*0000-0000')
+  })
+
   test('并发创建会同步预留临时群名，避免同分钟同名', async () => {
     const first = makeHarness()
     const second = makeHarness()

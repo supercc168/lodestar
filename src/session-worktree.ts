@@ -11,9 +11,10 @@ import * as worktree from './worktree'
 import { messageOf, type WorktreeActionResult } from './session-util'
 
 export function worktreeProjectName(s: Session): string {
-  // 临时群(*MMDD-HHMM)先剥后缀再解析 worktree 群名(上游 ff44afb):从
+  // 统一剥临时群(*MMDD-HHMM)与 worktree([slug])后缀解析回主项目名(上游
+  // c452546 mainSessionName,与旧 projectNameFromSessionName 剥法同正则):从
   // worktree 群发起 btw/fk 的临时子群,wt 约定与说明书解析回归 worktree 本体。
-  return worktree.projectNameFromSessionName(feishu.tempProjectName(s.sessionName) ?? s.sessionName)
+  return feishu.mainSessionName(s.sessionName)
 }
 
 export function worktreeProjectDir(s: Session): string {

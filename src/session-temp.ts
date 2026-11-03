@@ -100,7 +100,10 @@ const panelsBySession = new WeakMap<Session, Map<string, TempPanelState>>()
 const reservedTempChatNames = new Set<string>()
 
 /** 临时群 baseName:只剥 * 临时后缀,保留 [slug] worktree 后缀(上游 ff44afb:
- *  temp-of-worktree 留在 worktree cwd,群名/子临时群名随 worktree 走)。 */
+ *  temp-of-worktree 留在 worktree cwd,群名/子临时群名随 worktree 走)。
+ *  上游 c452546 曾改为 mainSessionName(连 [slug] 一起剥),不采:本地 workspace
+ *  按群名解析目录,temp 名带 slug 才能锚定 worktree;交付主群名口径由
+ *  file-delivery 的 mainChatIdForSession 独立完成,不依赖此处。 */
 function baseSessionName(s: Session): string {
   return feishu.tempProjectName(s.sessionName) ?? s.sessionName
 }
