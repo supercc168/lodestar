@@ -112,6 +112,12 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 
 <!-- MANUAL: Add manually maintained notes below this line. -->
 
+## 发布凭据与通道（本机实际状态）
+- 本机没有 `~/.git-credentials`；GitHub API token 从 osxkeychain 取（`printf 'protocol=https\nhost=github.com\n\n' | git credential fill`），仓库 push 走 SSH。
+- GitHub Packages 发布令牌经 GitHub OAuth device flow 获取（scopes `write:packages`），存 `~/.gh-packages-token`（0600）；发布时按清单写临时项目 `.npmrc`，用后即删。令牌在 GitHub 设置的 "GitHub CLI" 授权项下，可随时撤销。
+- npmjs 未配置凭据：2026-11-04 v0.21.24 发布时用户决定**暂跳过 npmjs**（无账号，`supercc168` 尚未注册），仅发布 GitHub Packages；该偏差只对当次生效，后续版本若已注册 npmjs 须按清单双仓库补发。
+- `prepublishOnly`（`bun run ci`）含 `test:randomized`，单进程 bun 的 mock 注册顺序敏感导致长期隔离失败（v0.21.24 前基线 276 个、发布时 52 个），本地发布须 `npm publish --ignore-scripts` 跳过钩子，且仅在其余清单验证全绿后使用。
+
 ## GSD / 长任务
 - 多阶段、长任务、TRACKER/阶段推进：用项目 skill **`yiui-gsd`**（canonical `.agents/skills/yiui-gsd`；Claude 入口 `.claude/skills/yiui-gsd`）。
 - 操作前先读 `.gsd/TRACKER.md`；任务 STATE 的 canonical 路径是 `.gsd/<slug>/.planning/STATE.md`，底层 GSD 命令必须显式带 `--ws <slug>`。
