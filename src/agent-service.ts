@@ -14,6 +14,7 @@ import { workspaceKey } from './workspace'
 import type {
   AgentAnswerRequest,
   AgentFollowUpRequest,
+  AgentRunOwner,
   AgentRunRequest,
   AgentRunSnapshot,
   AgentRunStatus,
@@ -26,6 +27,13 @@ import { logError } from './log'
 import type { Session } from './session'
 import { agentPrincipalContext, type AgentExecutionContext, type AgentPrincipal } from './agent-context'
 import type { AgentReasoningEffort } from './agent-process'
+import {
+  AgentRequestStore,
+  type AgentOperatorResolution,
+  type AgentProjectBinding,
+  type AgentRequestRecord,
+  type AgentRequestState,
+} from './agent-request-store'
 
 export type { AgentPrincipal } from './agent-context'
 
@@ -46,9 +54,34 @@ interface AgentRunRecord {
   finalized: boolean
   persistedArtifacts: Set<string>
   artifactsUnloaded: boolean
+  /** Empty handles after a restart provide no native termination evidence. */
+  recovered: boolean
 }
 
 type RequestMetadata = { requestId?: string; requestHash?: string }
+
+export interface AgentRequestSnapshot {
+  requestId: string
+  state: AgentRequestState
+  /** Durable association only; null does not prove non-admission while unresolved. */
+  runId: string | null
+  run?: AgentRunSnapshot
+  resolution?: AgentOperatorResolution
+}
+
+export interface AgentBindingGuard {
+  expectedBinding: string
+  /** Exact transport body, retained privately for durable retry conflict detection. */
+  requestBody?: unknown
+}
+
+/** The action created a run, so a failed response cannot prove non-admission. */
+export class AgentRequestUncertainError extends Error {
+  constructor(cause: unknown) {
+    super(`Agent request may already be admitted; query the same request_id before retrying: ${messageOf(cause)}`, { cause })
+    this.name = 'AgentRequestUncertainError'
+  }
+}
 
 interface CreateRunOptions {
   parentRunId?: string
@@ -62,6 +95,7 @@ interface CreateRunOptions {
 }
 
 export interface AgentServiceDeps extends AgentCardsDeps {
+  requestStore?: AgentRequestStore
   getCatalog: typeof getAgentIdentityCatalog
   startWorker: typeof startAgentWorker
   sendTextRaw(chatId: string, text: string): Promise<unknown>
@@ -84,6 +118,7 @@ const DEFAULT_DEPS: AgentServiceDeps = {
 
 export class AgentService {
   readonly presentation: AgentCards
+  private readonly requestStore: AgentRequestStore
   private readonly runs = new Map<string, AgentRunRecord>()
   private readonly capabilities = new Map<string, AgentPrincipal>()
   private readonly cancellationEpochBySession = new Map<string, number>()
@@ -94,6 +129,7 @@ export class AgentService {
 
   constructor(private readonly deps: AgentServiceDeps = DEFAULT_DEPS) {
     this.presentation = new AgentCards(deps)
+    this.requestStore = deps.requestStore ?? (deps === DEFAULT_DEPS ? new AgentRequestStore() : AgentRequestStore.memory())
     this.loadDurableRuns()
   }
 
@@ -110,8 +146,8 @@ export class AgentService {
     return this.capabilities.get(capability) ?? null
   }
 
-  startRun(principal: AgentPrincipal, request: AgentRunRequest): Promise<AgentRunSnapshot> {
-    return this.withRequestId(principal, request, 'run', metadata => this.startRunOnce(principal, request, metadata))
+  startRun(principal: AgentPrincipal, request: AgentRunRequest, bindingGuard?: string | AgentBindingGuard): Promise<AgentRunSnapshot> {
+    return this.withRequestId(principal, request, 'run', metadata => this.startRunOnce(principal, request, metadata), bindingGuard)
   }
 
   private async startRunOnce(principal: AgentPrincipal, request: AgentRunRequest, metadata: RequestMetadata): Promise<AgentRunSnapshot> {
@@ -133,8 +169,8 @@ export class AgentService {
     })
   }
 
-  followUp(principal: AgentPrincipal, runId: string, request: AgentFollowUpRequest): Promise<AgentRunSnapshot> {
-    return this.withRequestId(principal, request, `follow-up:${runId}`, metadata => this.followUpOnce(principal, runId, request, metadata))
+  followUp(principal: AgentPrincipal, runId: string, request: AgentFollowUpRequest, bindingGuard?: string | AgentBindingGuard): Promise<AgentRunSnapshot> {
+    return this.withRequestId(principal, request, `follow-up:${runId}`, metadata => this.followUpOnce(principal, runId, request, metadata), bindingGuard)
   }
 
   private async followUpOnce(
@@ -238,6 +274,60 @@ export class AgentService {
     return this.readSnapshot(this.requireAccessibleRun(principal, runId))
   }
 
+  getProjectBinding(principal: AgentPrincipal): AgentProjectBinding {
+    return this.requestStore.getProjectBinding(this.requireProjectOwner(principal))
+  }
+
+  assertProjectBinding(principal: AgentPrincipal, expectedBinding: string): AgentProjectBinding {
+    return this.requestStore.assertExpectedBinding(this.requireProjectOwner(principal), expectedBinding)
+  }
+
+  getRequest(principal: AgentPrincipal, requestId: string, expectedBinding: string): AgentRequestSnapshot {
+    const owner = this.requireProjectOwner(principal)
+    const record = this.requestStore.lookup(owner, requestId, expectedBinding)
+    if (!record) throw new Error(`agent request not found: ${requestId}`)
+    return this.requestSnapshot(principal, this.synchronizeRequest(owner, record))
+  }
+
+  async cancelRequest(principal: AgentPrincipal, requestId: string, expectedBinding: string): Promise<AgentRequestSnapshot> {
+    const owner = this.requireProjectOwner(principal)
+    let record = this.requestStore.fenceCancellation(owner, requestId, expectedBinding)
+    const key = this.requestPromiseKey(owner, requestId)
+    const pending = this.requests.get(key)
+    if (pending) await pending.promise.catch(() => {})
+    record = this.requestStore.lookup(owner, requestId, expectedBinding) ?? record
+    if (record.state === 'cancelled' || record.state === 'resolved' || record.state === 'unknown') {
+      return this.requestSnapshot(principal, this.synchronizeRequest(owner, record))
+    }
+    const run = this.findRequestRun(owner, record)
+    if (!run) {
+      record = this.requestStore.markCancelled(owner, requestId)
+      return this.requestSnapshot(principal, record)
+    }
+    if (!record.run_id) record = this.requestStore.markAdmitted(owner, requestId, run.snapshot.runId)
+    if (isTerminal(run.snapshot.status) && !this.treeHasActiveRun(run)) {
+      record = this.synchronizeRequest(owner, record)
+      return this.requestSnapshot(principal, record)
+    }
+    try {
+      await this.cancelTree(run, 'cancelled by project request fence')
+      record = this.synchronizeRequest(owner, this.requestStore.lookup(owner, requestId, expectedBinding) ?? record)
+    } catch {
+      record = this.requestStore.markUnknown(owner, requestId, run.snapshot.runId)
+    }
+    return this.requestSnapshot(principal, record)
+  }
+
+  reconcileRequest(
+    principal: AgentPrincipal,
+    requestId: string,
+    expectedBinding: string,
+    input: { stopped: true; reason: string },
+  ): AgentRequestSnapshot {
+    const owner = this.requireProjectOwner(principal)
+    return this.requestSnapshot(principal, this.requestStore.reconcile(owner, requestId, expectedBinding, input))
+  }
+
   async cancelRun(principal: AgentPrincipal, runId: string, reason = 'agent run cancelled'): Promise<boolean> {
     const run = this.requireMutableDescendant(principal, runId)
     if (!this.treeHasActiveRun(run)) return false
@@ -269,24 +359,37 @@ export class AgentService {
   private async withRequestId(
     principal: AgentPrincipal, request: AgentRunRequest | AgentFollowUpRequest, operation: string,
     action: (metadata: RequestMetadata) => Promise<AgentRunSnapshot>,
+    bindingGuard?: string | AgentBindingGuard,
   ): Promise<AgentRunSnapshot> {
     if ((request.requestId || request.requesterOpenId) && principal.kind !== 'project') {
       throw new Error('request_id and requester_open_id require explicit project mode')
     }
     if (!request.requestId) return action({})
-    const ownerKey = agentOwnerKey(agentPrincipalContext(principal).owner)
-    const key = JSON.stringify([ownerKey, request.requestId])
-    const hash = createHash('sha256').update(JSON.stringify({ operation,
+    const owner = this.requireProjectOwner(principal)
+    const key = this.requestPromiseKey(owner, request.requestId)
+    const normalizedBody = { operation,
       prompt: request.prompt, description: request.description, effort: request.effort, workDir: request.workDir,
       requesterOpenId: request.requesterOpenId, identityIds: 'identityIds' in request ? request.identityIds : undefined,
       identityId: 'identityId' in request ? request.identityId : undefined,
       sessionId: 'sessionId' in request ? request.sessionId : undefined,
-    })).digest('hex')
-    const previous = [...this.runs.values()].find(run => run.snapshot.requestId === request.requestId
-      && agentOwnerKey(agentRunOwner(run.snapshot)) === ownerKey)
-    if (previous) {
-      if (previous.snapshot.requestHash !== hash) throw new Error('request_id was already used with different input')
-      return this.readSnapshot(previous)
+    }
+    const guard = typeof bindingGuard === 'string' ? { expectedBinding: bindingGuard } : bindingGuard
+    // The submitted body alone cannot distinguish /runs from follow-up, or
+    // two different continuation sources. Keep that operation in the hash.
+    const body = guard ? { operation, requestBody: guard.requestBody ?? normalizedBody } : normalizedBody
+    const hash = createHash('sha256').update(JSON.stringify(body)).digest('hex')
+    const prepared = this.requestStore.prepareAdmission(owner, request.requestId, guard?.expectedBinding, hash, body)
+    if (!prepared.created) {
+      const synchronized = this.synchronizeRequest(owner, prepared.record)
+      if (synchronized.state === 'cancel_requested' || synchronized.state === 'cancelled') {
+        throw new Error('request_id has a durable cancel fence')
+      }
+      if (synchronized.state === 'unknown') {
+        throw new Error('request admission or termination is unknown; explicit reconciliation is required')
+      }
+      const previous = this.findRequestRun(owner, synchronized)
+      if (previous) return this.readSnapshot(previous)
+      if (synchronized.state === 'resolved') throw new Error('request_id is already resolved without an admitted run')
     }
     const pending = this.requests.get(key)
     if (pending) {
@@ -294,6 +397,34 @@ export class AgentService {
       return pending.promise
     }
     const promise = Promise.resolve().then(() => action({ requestId: request.requestId, requestHash: hash }))
+      .then(snapshot => {
+        let record = this.requestStore.markAdmitted(owner, request.requestId!, snapshot.runId)
+        record = this.synchronizeRequest(owner, record)
+        return snapshot
+      }).catch(error => {
+        const run = [...this.runs.values()].find(candidate => candidate.snapshot.requestId === request.requestId
+          && agentOwnerKey(agentRunOwner(candidate.snapshot)) === agentOwnerKey(owner))
+        if (run) {
+          // This also catches failures inside the success continuation above.
+          // Keep the run/request association even when durable admission fails;
+          // the caller must observe this same request, never submit new work.
+          try {
+            const record = this.requestStore.markAdmitted(owner, request.requestId!, run.snapshot.runId)
+            this.synchronizeRequest(owner, record)
+          } catch (persistenceError) {
+            logError('agent-service: admitted request persistence failed', persistenceError)
+          }
+          logError('agent-service: request admission outcome uncertain', error)
+          throw new AgentRequestUncertainError(error)
+        }
+        const current = this.requestStore.lookup(owner, request.requestId!, prepared.binding.binding_id)
+        if (current?.state === 'cancel_requested' || current?.state === 'cancelled') {
+          this.requestStore.markCancelled(owner, request.requestId!)
+        } else {
+          this.requestStore.markResolved(owner, request.requestId!)
+        }
+        throw error
+      })
     this.requests.set(key, { hash, promise })
     try { return await promise }
     finally { this.requests.delete(key) }
@@ -344,7 +475,10 @@ export class AgentService {
     this.pendingRunCreations.add(creation)
     const settled = () => {
       this.pendingRunCreations.delete(creation)
-      if (parent) parent.pendingChildCreations--
+      if (parent) {
+        parent.pendingChildCreations--
+        this.synchronizeRunRequests(parent)
+      }
     }
     void creation.then(settled, settled)
     return creation
@@ -424,6 +558,7 @@ export class AgentService {
       finalized: false,
       persistedArtifacts: new Set(),
       artifactsUnloaded: false,
+      recovered: false,
     }
     try {
       await this.presentation.add(snapshot)
@@ -443,6 +578,7 @@ export class AgentService {
     if (options.parentRunId) parent?.children.add(runId)
     const invalidated = this.shuttingDown || this.currentCancellationEpoch(context) !== options.cancellationEpoch
       || ancestorEpochs.some(([ancestor, epoch]) => ancestor.cancellationEpoch !== epoch)
+      || !!options.requestId && this.requestStore.blocksAdmission(owner, options.requestId)
     if (invalidated) {
       run.cancelled = true
       const reason = '任务已在启动前取消'
@@ -493,6 +629,7 @@ export class AgentService {
       this.persist(run)
       await this.updateWorkerCard(run, worker)
       if (run.cancelled) return
+      if (run.snapshot.requestId && this.requestStore.blocksAdmission(agentRunOwner(run.snapshot), run.snapshot.requestId)) return
       this.assertSameOwner(run, run.context!)
       // Card creation and updates may wait while directories are removed or replaced by symlinks.
       const validatedWorkDir = resumeSessionId
@@ -560,9 +697,9 @@ export class AgentService {
       })
       run.handles.set(identity.id, handle)
       const result = await handle.done
-      if (run.cancelled) return
       this.clearProgressTimer(run, identity.id)
       worker.output = result.output
+      if (result.finalOutput !== undefined) worker.finalOutput = result.finalOutput
       if (result.displayOutput !== undefined) worker.displayOutput = result.displayOutput
       worker.outputTruncated = result.outputTruncated
       worker.sessionId = result.sessionId
@@ -572,7 +709,14 @@ export class AgentService {
       worker.finishedAt = new Date().toISOString()
       delete worker.pendingInput
       delete worker.displayPendingInput
-      if (run.cancelled) return
+      if (run.cancelled) {
+        // A terminal native result may race a durable cancellation request.
+        // Preserve the actual late outcome even though the run itself remains
+        // cancelled and cannot advance business work.
+        worker.status = 'completed'
+        this.persist(run)
+        return
+      }
       worker.status = 'completed'
       this.persist(run)
       await this.updateWorkerCard(run, worker)
@@ -581,6 +725,7 @@ export class AgentService {
       // 取消路径的 status/error 仍由 cancelTree 统一落「停止原因」。
       if (error instanceof AgentWorkerFailure) {
         worker.output = error.output
+        if (error.finalOutput !== undefined) worker.finalOutput = error.finalOutput
         if (error.displayOutput !== undefined) worker.displayOutput = error.displayOutput
         if (error.displayError !== undefined) worker.displayError = error.displayError
         worker.outputTruncated = false
@@ -605,6 +750,7 @@ export class AgentService {
       if (capability) this.capabilities.delete(capability)
       run.capabilityByIdentity.delete(identity.id)
       this.recomputeRun(run)
+      this.synchronizeRunRequests(run)
     }
   }
 
@@ -682,6 +828,10 @@ export class AgentService {
       if (handle.isAlive?.()) throw new Error(`${identityId}: Agent process is still alive after cancellation`)
       run.handles.delete(identityId)
     })))
+    // A cancel implementation may resolve its terminal result while returning.
+    // Give executeWorker's already-queued continuation a turn to preserve that
+    // late outcome before unresolved workers are marked cancelled.
+    await Promise.resolve()
     if (failures.some(result => result.status === 'rejected')) {
       const error = cancellationError(failures)
       run.snapshot.status = 'failed'
@@ -721,6 +871,7 @@ export class AgentService {
     run.finalizing = false
     this.persist(run)
     run.finalized = true
+    this.synchronizeRunRequests(run)
     this.pruneRunArtifacts()
     if (run.snapshot.presentationErrors?.length) {
       const details = run.snapshot.presentationErrors.map((detail, index) => `${index + 1}. ${detail}`).join('\n')
@@ -765,11 +916,21 @@ export class AgentService {
         worker.outputArtifact = `${run.snapshot.runId}.${identityHash}.output.txt`
       }
       this.persistTextArtifact(run, worker.outputArtifact, worker.output)
+      if (worker.finalOutput !== undefined) {
+        if (!worker.finalOutputArtifact) {
+          const identityHash = createHash('sha256').update(worker.identityId).digest('hex').slice(0, 16)
+          worker.finalOutputArtifact = `${run.snapshot.runId}.${identityHash}.final-output.txt`
+        }
+        this.persistTextArtifact(run, worker.finalOutputArtifact, worker.finalOutput)
+      }
     }
     const durable = cloneSnapshot(run.snapshot)
     stripPresentation(durable)
     durable.prompt = ''
-    for (const worker of durable.workers) worker.output = ''
+    for (const worker of durable.workers) {
+      worker.output = ''
+      delete worker.finalOutput
+    }
     this.deps.writeArtifact(join(AGENT_RUNS_DIR, `${run.snapshot.runId}.json`), durable)
   }
 
@@ -892,7 +1053,9 @@ export class AgentService {
   private loadDurableRuns(): void {
     for (const snapshot of this.deps.loadArtifacts()) {
       stripPresentation(snapshot)
-      if (!isTerminal(snapshot.status)) {
+      const interrupted = !isTerminal(snapshot.status)
+      this.requestStore.importRun(snapshot)
+      if (interrupted) {
         snapshot.status = 'failed'
         snapshot.error = 'daemon restarted before this Agent run reached a terminal state'
         snapshot.finishedAt = new Date().toISOString()
@@ -919,9 +1082,13 @@ export class AgentService {
         finalizing: false,
         finalized: true,
         artifactsUnloaded: false,
+        recovered: true,
         persistedArtifacts: new Set([
           ...(snapshot.promptArtifact ? [snapshot.promptArtifact] : []),
-          ...snapshot.workers.flatMap(worker => worker.outputArtifact ? [worker.outputArtifact] : []),
+          ...snapshot.workers.flatMap(worker => [
+            ...(worker.outputArtifact ? [worker.outputArtifact] : []),
+            ...(worker.finalOutputArtifact ? [worker.finalOutputArtifact] : []),
+          ]),
         ]),
       }
       this.runs.set(snapshot.runId, record)
@@ -930,7 +1097,85 @@ export class AgentService {
     for (const run of this.runs.values()) {
       if (run.snapshot.parentRunId) this.runs.get(run.snapshot.parentRunId)?.children.add(run.snapshot.runId)
     }
+    for (const record of this.requestStore.allRecords()) {
+      const owner = { kind: 'project' as const, name: record.project, chatId: record.chat_id, workDir: record.work_dir }
+      if (record.state === 'cancelled' || record.state === 'resolved' || record.state === 'unknown') continue
+      // A crash can happen after a terminal snapshot but before cleanup or
+      // the request fact commits. Neither that snapshot nor absent handles
+      // proves that any previously admitted native process has stopped.
+      this.requestStore.markUnknown(owner, record.request_id, record.run_id)
+    }
     this.pruneRunArtifacts()
+  }
+
+  private requireProjectOwner(principal: AgentPrincipal): AgentRunOwner & { kind: 'project' } {
+    if (principal.kind !== 'project') throw new Error('project request operations require explicit project mode')
+    const owner = agentPrincipalContext(principal).owner
+    if (owner.kind !== 'project') throw new Error('project request operations require explicit project mode')
+    return { ...owner, kind: 'project' }
+  }
+
+  private requestPromiseKey(owner: ReturnType<AgentService['requireProjectOwner']>, requestId: string): string {
+    return JSON.stringify([agentOwnerKey(owner), requestId])
+  }
+
+  private synchronizeRequest(owner: ReturnType<AgentService['requireProjectOwner']>, record: AgentRequestRecord): AgentRequestRecord {
+    if (record.resolution || record.state === 'unknown'
+      || record.state === 'resolved' || record.state === 'cancelled') return record
+    const run = this.findRequestRun(owner, record)
+    if (!run) return record.run_id ? this.requestStore.markUnknown(owner, record.request_id, record.run_id) : record
+    if (run.recovered) return this.requestStore.markUnknown(owner, record.request_id, run.snapshot.runId)
+    if (!record.run_id) {
+      // Both admission and completion may have met the same storage outage.
+      // Only this live service's original run can repair the missing link;
+      // restored snapshots still take the conservative path above.
+      try { record = this.requestStore.markAdmitted(owner, record.request_id, run.snapshot.runId) }
+      catch (error) {
+        logError('agent-service: request association persistence failed', error)
+        return record
+      }
+    }
+    if (!run.finalized || !isTerminal(run.snapshot.status) || this.treeHasActiveRun(run)) return record
+    if (run.snapshot.status === 'cancelled') return this.requestStore.markCancelled(owner, record.request_id, run.snapshot.runId)
+    return this.requestStore.markResolved(owner, record.request_id, run.snapshot.runId)
+  }
+
+  private requestSnapshot(principal: AgentPrincipal, record: AgentRequestRecord): AgentRequestSnapshot {
+    const run = this.findRequestRun(this.requireProjectOwner(principal), record)
+    return {
+      requestId: record.request_id,
+      state: record.state,
+      runId: record.run_id ?? null,
+      ...(run && this.canAccess(principal, run) ? { run: this.readSnapshot(run) } : {}),
+      ...(record.resolution ? { resolution: record.resolution } : {}),
+    }
+  }
+
+  private findRequestRun(owner: AgentRunOwner, record: AgentRequestRecord): AgentRunRecord | undefined {
+    return record.run_id ? this.runs.get(record.run_id) : [...this.runs.values()].find(run =>
+      run.snapshot.requestId === record.request_id && agentOwnerKey(agentRunOwner(run.snapshot)) === agentOwnerKey(owner))
+  }
+
+  private synchronizeRunRequests(run: AgentRunRecord): void {
+    // A parent can finish its turn while descendants still run. The last
+    // descendant's confirmed cleanup must also persist the parent's fact.
+    for (let current: AgentRunRecord | undefined = run; current;
+      current = current.snapshot.parentRunId ? this.runs.get(current.snapshot.parentRunId) : undefined) {
+      const owner = agentRunOwner(current.snapshot)
+      const requestId = current.snapshot.requestId
+      if (owner.kind !== 'project' || !requestId || current.recovered || !current.finalized) continue
+      try {
+        const binding = this.requestStore.getProjectBinding(owner)
+        let record = this.requestStore.lookup(owner, requestId, binding.binding_id)
+        if (!record) continue
+        if (!record.run_id) record = this.requestStore.markAdmitted(owner, requestId, current.snapshot.runId)
+        this.synchronizeRequest({ ...owner, kind: 'project' }, record)
+      } catch (error) {
+        // Keep the completed output and the old unresolved durable fact. A
+        // live lookup can retry this write; a restart must remain unknown.
+        logError('agent-service: terminal request persistence failed', error)
+      }
+    }
   }
 
   private pruneRunArtifacts(): void {
@@ -944,7 +1189,10 @@ export class AgentService {
     // presentation belongs only to the already-rendered card.
     for (const run of terminal.slice(0, Math.max(0, terminal.length - MAX_CACHED_RUN_ARTIFACTS))) {
       run.snapshot.prompt = ''
-      for (const worker of run.snapshot.workers) worker.output = ''
+      for (const worker of run.snapshot.workers) {
+        worker.output = ''
+        delete worker.finalOutput
+      }
       stripPresentation(run.snapshot)
       run.artifactsUnloaded = true
     }
@@ -1105,6 +1353,7 @@ function hydrateSnapshotArtifacts(
   if (snapshot.promptArtifact) snapshot.prompt = read(snapshot.promptArtifact, `prompt for ${snapshotPath}`)
   for (const worker of snapshot.workers) {
     if (worker.outputArtifact) worker.output = read(worker.outputArtifact, `output for ${snapshotPath}`)
+    if (worker.finalOutputArtifact) worker.finalOutput = read(worker.finalOutputArtifact, `final output for ${snapshotPath}`)
   }
 }
 

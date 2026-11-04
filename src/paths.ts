@@ -18,6 +18,9 @@
  *   session-model-map.json  — per-session selected Codex model (in DATA_DIR)
  *   tasklist-map.json       — project tasklist bindings     (in DATA_DIR)
  *   agent-runs/             — durable delegated-agent runs    (in DATA_DIR)
+ *   agent-requests.json     — durable project request fences  (in DATA_DIR)
+ *   agent-project-client.json  — ordinary local project capability (in DATA_DIR)
+ *   agent-operator-client.json — separate local operator capability (in DATA_DIR)
  *   agent-session-ids.json  — delegated native session ids    (in DATA_DIR)
  *   notify-callbacks.json   — /notify button→callback map   (in DATA_DIR)
  *   agent-runtimes/         — opt-in installed Agent runtimes (in DATA_DIR)
@@ -78,8 +81,12 @@ export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
  *  runs survive daemon restart, remain follow-up capable, and can be inspected
  *  from CLI/HTTP. */
 export const AGENT_RUNS_DIR = join(DATA_DIR, 'agent-runs')
+/** Project binding identity, request hashes, admission state and cancellation fences. */
+export const AGENT_REQUESTS_FILE = join(DATA_DIR, 'agent-requests.json')
 /** Private local client credentials, rotated on daemon startup. Never injected into workers. */
 export const AGENT_PROJECT_CLIENT_FILE = join(DATA_DIR, 'agent-project-client.json')
+/** Separate local operator credential. It is never copied into project client config or worker context. */
+export const AGENT_OPERATOR_CLIENT_FILE = join(DATA_DIR, 'agent-operator-client.json')
 /** Provider-native session ids created by delegated agents. Main-session
  *  rs/fk history must skip these ids so background work never pollutes it. */
 export const AGENT_SESSION_IDS_FILE = join(DATA_DIR, 'agent-session-ids.json')

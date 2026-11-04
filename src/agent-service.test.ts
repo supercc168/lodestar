@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os'
 import { join, resolve } from 'node:path'
 import { agentRunCard } from './cards/agents'
 import { AgentService, type AgentServiceDeps } from './agent-service'
+import { AgentRequestStore } from './agent-request-store'
 import type { AgentPrincipal } from './agent-context'
 import { agentIdentityId, type AgentIdentity, type AgentIdentityCatalog } from './agent-identities'
 import { AgentWorkerFailure, type AgentWorkerHandle, type AgentWorkerResult } from './agent-runner'
@@ -85,6 +86,7 @@ function completedHistory(count: number, chain = false): AgentRunSnapshot[] {
 }
 
 function harness(opts: {
+  requestStore?: AgentRequestStore
   identities?: AgentIdentity[]
   startWorker?: AgentServiceDeps['startWorker']
   loadArtifacts?: AgentServiceDeps['loadArtifacts']
@@ -102,6 +104,7 @@ function harness(opts: {
   const artifactReads: string[] = []
   const texts: string[] = []
   const deps: AgentServiceDeps = {
+    requestStore: opts.requestStore,
     getCatalog: () => catalog,
     startWorker: opts.startWorker ?? (worker => resolvedHandle(result(`sid-${worker.identity.id}`, `output-${worker.identity.id}`))),
     sendCard: opts.sendCard ?? (async () => 'message-1'),
@@ -1773,7 +1776,9 @@ describe('project-owned Agent runs', () => {
 
   test('request ids deduplicate concurrent submissions and survive reload; changed requests are rejected', async () => {
     let starts = 0
-    const h = harness({ startWorker: () => { starts++; return resolvedHandle(result('idempotent')) } })
+    const storePath = join(testDir, 'request-idempotency.json')
+    const requestStore = new AgentRequestStore({ path: storePath })
+    const h = harness({ requestStore, startWorker: () => { starts++; return resolvedHandle(result('idempotent')) } })
     const principal = h.service.projectPrincipal(context())
     const input = { ...request, requestId: 'job-123' }
     const [first, second] = await Promise.all([h.service.startRun(principal, input), h.service.startRun(principal, input)])
@@ -1781,7 +1786,9 @@ describe('project-owned Agent runs', () => {
     const completed = await waitFor(h.service, principal, first.runId, 'completed')
     expect(starts).toBe(1)
     await expect(h.service.startRun(principal, { ...input, prompt: 'different' })).rejects.toThrow('different input')
-    const loaded = harness({ loadArtifacts: () => [structuredClone(completed)], startWorker: () => { throw new Error('must not restart') } })
+    // A restart retains both the artifact and the durable admission/exit fact.
+    const loaded = harness({ requestStore: new AgentRequestStore({ path: storePath }),
+      loadArtifacts: () => [structuredClone(completed)], startWorker: () => { throw new Error('must not restart') } })
     const replay = await loaded.service.startRun(loaded.service.projectPrincipal(context()), input)
     expect(replay).toMatchObject({ runId: first.runId, status: 'completed', requestId: 'job-123' })
     await expect(h.service.startRun(h.root, input)).rejects.toThrow('explicit project mode')

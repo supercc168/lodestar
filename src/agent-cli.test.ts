@@ -287,9 +287,16 @@ test('explicit project CLI uses the private daemon endpoint and preserves projec
   const dir = mkdtempSync(join(tmpdir(), 'lodestar-project-cli-'))
   const requests: { url: string; token: string | null; body: any }[] = []
   const server = Bun.serve({ hostname: '127.0.0.1', port: 0, async fetch(request) {
-    requests.push({ url: request.url, token: request.headers.get('authorization'), body: request.method === 'POST' ? await request.json() : null })
+    const body = request.method === 'POST' ? await request.json() : null
+    requests.push({ url: request.url, token: request.headers.get('authorization'), body })
+    if (new URL(request.url).pathname.endsWith('/reconcile')) {
+      return Response.json({ request_id: 'job-1', state: 'resolved', resolution: {
+        kind: 'operator_attested', reason: body.reason, at: '2026-11-04T00:00:00.000Z', binding_id: body.expected_binding,
+      } })
+    }
     return Response.json({ run_id: 'agent_cli_project', binding: 'project', project: 'repo', status: 'completed', workers: [{
       identity_id: 'agent:a', identity_name: 'A', session_id: 'native', status: 'completed', output: 'done',
+      final_output: '  final\n```text\n{not-json}\n```  \n',
     }] })
   } })
   const env = { ...process.env, LODESTAR_DATA_DIR: dir, LODESTAR_AGENT_ROLE: undefined, LODESTAR_AGENT_SESSION: undefined, DSH_LODESTAR_AGENT_CONTEXT: undefined,
@@ -303,11 +310,24 @@ test('explicit project CLI uses the private daemon endpoint and preserves projec
   }
   try {
     writeFileSync(join(dir, 'agent-project-client.json'), JSON.stringify({ baseUrl: `http://127.0.0.1:${server.port}`, capability: 'test-project-key' }))
+    writeFileSync(join(dir, 'agent-operator-client.json'), JSON.stringify({ baseUrl: `http://127.0.0.1:${server.port}`, capability: 'test-operator-key' }))
     const result = await exec(['run', '--project', 'repo', '--identity', 'agent:a', '--description', '任务', '--prompt', '--project', '--request-id', 'job-1'])
     expect(result.code, result.error).toBe(0)
     expect(result.out).toContain("lodestar-agent --project 'repo' run --session 'native'")
     expect(requests[0]).toMatchObject({ token: 'Bearer test-project-key', body: { prompt: '--project', request_id: 'job-1' } })
     expect(new URL(requests[0].url).searchParams.get('project')).toBe('repo')
+    const jsonStatus = await exec(['--project', 'repo', 'status', 'agent_cli_project', '--json'])
+    expect(jsonStatus.code, jsonStatus.error).toBe(0)
+    expect(JSON.parse(jsonStatus.out).workers[0].final_output).toBe('  final\n```text\n{not-json}\n```  \n')
+    const reconcile = await exec(['--project', 'repo', 'requests', 'reconcile', '--request', 'job-1',
+      '--expected-binding', 'binding-1', '--stopped', '--reason', 'operator verified native work stopped', '--json'])
+    expect(reconcile.code, reconcile.error).toBe(0)
+    expect(JSON.parse(reconcile.out)).toMatchObject({ request_id: 'job-1', state: 'resolved',
+      resolution: { kind: 'operator_attested', binding_id: 'binding-1' } })
+    expect(requests.at(-1)).toMatchObject({ body: {
+      expected_binding: 'binding-1', stopped: true, reason: 'operator verified native work stopped',
+    } })
+    expect(requests.at(-1)?.token).toBe('Bearer test-operator-key')
     const answer = await exec(['--project', 'repo', 'answer', 'agent_cli_project', '--request', 'q', '--stdin'])
     expect(answer.code).toBe(1)
     expect(answer.error).toContain('non-interactive')
@@ -325,7 +345,11 @@ test('explicit project CLI uses the private daemon endpoint and preserves projec
       expect(agent.code).toBe(1)
       expect(agent.error).toContain('must remain session-bound')
     }
-    expect(requests).toHaveLength(2)
+    const managedReconcile = await exec(['--project', 'repo', 'requests', 'reconcile', '--request', 'job-1',
+      '--expected-binding', 'binding-1', '--stopped', '--reason', 'operator stop'], { LODESTAR_AGENT_ROLE: 'worker' })
+    expect(managedReconcile.code).toBe(1)
+    expect(managedReconcile.error).toContain('must remain session-bound')
+    expect(requests).toHaveLength(4)
     const duplicate = await exec(['--project', 'repo', 'identities', '--project', 'repo'])
     expect(duplicate.code).toBe(1)
     expect(duplicate.error).toContain('only be specified once')

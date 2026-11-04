@@ -27,6 +27,7 @@ import { localFetch } from './network'
  */
 
 import { readFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { log, logError } from './log'
 import { NOTIFY_CALLBACKS_FILE } from './paths'
 import { writeJsonStateAtomic } from './state-store'
@@ -57,28 +58,48 @@ export interface NotifyReplyState {
   openId: string
   promptMessageId: string
   openedAt: number
+  /** Version of the notification view that opened this prompt. New-mode
+   * replies must still match this version when the text arrives. */
+  version?: number
   status: 'waiting' | 'sending' | 'failed' | 'cancelled'
   cancelReason?: 'switched'
   response?: NotifyTextResponse
   error?: string
 }
 
-export interface NotifyTextResponse {
+export type NotifyTransportState = 'pending' | 'applied' | 'unknown'
+
+/** Normalized complete card input retained for idempotent PUT retries. Image
+ * paths are caller data; uploaded keys remain in imageKeys. */
+export interface NotifyDesiredBody {
+  project: string
+  title: string
   text: string
-  /** User's message, distinct from the original notification message_id. */
-  message_id: string
-  prompt_message_id: string
+  level: 'info' | 'warn' | 'error'
+  images: string[]
+  buttons: NotifyButton[]
+  allowReply: boolean
+  callbackUrl: string
 }
 
-export interface NotifyReplyState {
-  id: string
-  openId: string
-  promptMessageId: string
-  openedAt: number
-  status: 'waiting' | 'sending' | 'failed' | 'cancelled'
-  cancelReason?: 'switched'
-  response?: NotifyTextResponse
-  error?: string
+function stableJson(value: unknown): string {
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  if (value && typeof value === 'object') {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .filter(([, entry]) => entry !== undefined)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([key, entry]) => `${JSON.stringify(key)}:${stableJson(entry)}`)
+      .join(',')}}`
+  }
+  return JSON.stringify(value)
+}
+
+export function canonicalNotifyHash(value: unknown): string {
+  return createHash('sha256').update(stableJson(value)).digest('hex')
+}
+
+export function canonicalNotifyRequestHash(version: number, desired: NotifyDesiredBody): string {
+  return canonicalNotifyHash({ version, desired })
 }
 
 /** A registered interactive `/notify` card. Persisted wholesale so the
@@ -121,8 +142,29 @@ export interface NotifyRegistration {
    * confirmed. Never retry automatically: the external side effect may
    * already have happened. */
   unknownAt?: number
-  unknownBy?: { buttonId?: string; openId: string }
+  unknownBy?: { buttonId?: string; openId?: string }
   unknownReason?: string
+  /** New durable creation/update lifecycle. Absent on legacy callers. */
+  requestId?: string
+  requestHash?: string
+  requestVersion?: number
+  requestBody?: NotifyDesiredBody
+  feishuUuid?: string
+  transportState?: NotifyTransportState
+  transportDetail?: string
+  desiredVersion?: number
+  appliedVersion?: number
+  desiredHash?: string
+  appliedHash?: string
+  appliedBody?: NotifyDesiredBody
+  desiredBody?: NotifyDesiredBody
+  /** First Feishu create attempt. The one-hour UUID dedupe window starts
+   * here, not when the local request record was prepared. */
+  createAttemptedAt?: number
+  /** Persisted immediately before message.patch. Presence after restart means
+   * the remote update outcome is ambiguous and must freeze as unknown. */
+  updateDispatch?: { version: number; startedAt: number }
+  updatedAt?: number
 }
 
 /** Drop registrations older than this on load. 7 days matches the
@@ -135,6 +177,7 @@ const MAX_AGE_MS = 7 * 24 * 60 * 60 * 1000
  * inside Feishu's ~3s inline card-replace window so the resolved card
  * still renders. Surfaced as a timeout, not papered over. */
 const CALLBACK_TIMEOUT_MS = 2500
+export const NOTIFY_CREATE_RETRY_WINDOW_MS = 60 * 60 * 1000
 
 const map = new Map<string, NotifyRegistration>()
 let lastRuntimePruneAt = Date.now()
@@ -146,6 +189,24 @@ const dispatching = new Set<string>()
 export function isDispatching(notifyId: string): boolean { return dispatching.has(notifyId) }
 export function setDispatching(notifyId: string): void { dispatching.add(notifyId) }
 export function clearDispatching(notifyId: string): void { dispatching.delete(notifyId) }
+
+/** HTTP create/update and Feishu answer paths share this keyed serializer.
+ * The key is request_id before a notify_id exists, then notify_id afterward. */
+const notifyLocks = new Map<string, Promise<void>>()
+export async function withNotifyLock<T>(key: string, operation: () => Promise<T>): Promise<T> {
+  const previous = notifyLocks.get(key) ?? Promise.resolve()
+  let release!: () => void
+  const current = new Promise<void>(resolve => { release = resolve })
+  const tail = previous.then(() => current)
+  notifyLocks.set(key, tail)
+  await previous
+  try {
+    return await operation()
+  } finally {
+    release()
+    if (notifyLocks.get(key) === tail) notifyLocks.delete(key)
+  }
+}
 
 /** Persistence target. Defaults to {@link NOTIFY_CALLBACKS_FILE}; the
  * `__setStoreFileForTest` escape hatch redirects it so the unit test
@@ -160,6 +221,144 @@ function saveCallbacks(): void {
   } catch (e) {
     logError('notify.callbacks.save_failed', e)
     throw e
+  }
+}
+
+const STORED_BUTTON_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
+
+function validStoredButton(value: unknown): value is NotifyButton {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const button = value as Record<string, unknown>
+  if (typeof button.id !== 'string' || !STORED_BUTTON_ID_RE.test(button.id)
+    || typeof button.text !== 'string' || !button.text.trim() || button.text.length > 64
+    || !['default', 'primary', 'danger'].includes(String(button.type))) return false
+  if (button.url !== undefined) {
+    if (typeof button.url !== 'string' || button.url.length > 2000) return false
+    try {
+      const url = new URL(button.url)
+      if (url.protocol !== 'http:' && url.protocol !== 'https:') return false
+    } catch { return false }
+  }
+  return Object.keys(button).every(key => ['id', 'text', 'type', 'url'].includes(key))
+}
+
+function validStoredCallbackUrl(value: string): boolean {
+  if (!value) return true
+  try {
+    const url = new URL(value)
+    const host = url.hostname.replace(/^\[|]$/g, '')
+    return url.protocol === 'http:' && ['127.0.0.1', 'localhost', '::1'].includes(host)
+  } catch { return false }
+}
+
+function validDesiredBody(value: unknown): value is NotifyDesiredBody {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const desired = value as Record<string, unknown>
+  if (!Object.keys(desired).every(key => [
+    'project', 'title', 'text', 'level', 'images', 'buttons', 'allowReply', 'callbackUrl',
+  ].includes(key))) return false
+  if (typeof desired.project !== 'string' || !desired.project
+    || typeof desired.title !== 'string' || typeof desired.text !== 'string' || !desired.text
+    || !['info', 'warn', 'error'].includes(String(desired.level))
+    || !Array.isArray(desired.images) || desired.images.some(image => typeof image !== 'string' || !image)
+    || !Array.isArray(desired.buttons) || desired.buttons.some(button => !validStoredButton(button))
+    || typeof desired.allowReply !== 'boolean' || typeof desired.callbackUrl !== 'string'
+    || !validStoredCallbackUrl(desired.callbackUrl)) return false
+  const ids = new Set((desired.buttons as NotifyButton[]).map(button => button.id))
+  if (ids.size !== desired.buttons.length || (desired.allowReply && desired.buttons.length > 0)) return false
+  return true
+}
+
+function validImageKeys(value: unknown, desired: NotifyDesiredBody): boolean {
+  if (!Array.isArray(value) || value.length !== desired.images.length) return false
+  return value.every((entry, index) => {
+    if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false
+    const image = entry as Record<string, unknown>
+    return typeof image.key === 'string' && image.src === desired.images[index]
+      && (image.error === undefined || typeof image.error === 'string')
+      && Object.keys(image).every(key => ['key', 'src', 'error'].includes(key))
+  })
+}
+
+function validReplyState(value: unknown): boolean {
+  if (value === undefined) return true
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  const state = value as Record<string, any>
+  if (typeof state.id !== 'string' || !state.id || typeof state.openId !== 'string' || !state.openId
+    || typeof state.promptMessageId !== 'string' || !Number.isFinite(state.openedAt)
+    || !['waiting', 'sending', 'failed', 'cancelled'].includes(state.status)
+    || (state.version !== undefined && (!Number.isSafeInteger(state.version) || state.version < 1))
+    || (state.cancelReason !== undefined && state.cancelReason !== 'switched')
+    || (state.error !== undefined && typeof state.error !== 'string')) return false
+  if (state.response !== undefined) {
+    const response = state.response
+    if (!response || typeof response !== 'object' || Array.isArray(response)
+      || typeof response.text !== 'string' || typeof response.message_id !== 'string' || !response.message_id
+      || typeof response.prompt_message_id !== 'string' || !response.prompt_message_id
+      || !Object.keys(response).every(key => ['text', 'message_id', 'prompt_message_id'].includes(key))) return false
+  }
+  return Object.keys(state).every(key => [
+    'id', 'openId', 'promptMessageId', 'openedAt', 'version', 'status', 'cancelReason', 'response', 'error',
+  ].includes(key))
+}
+
+function validateDurableRegistration(rec: Record<string, any>, storedId: string): void {
+  if (typeof rec.requestId !== 'string' || !rec.requestId || [...rec.requestId].length > 200
+    || typeof rec.requestHash !== 'string' || !/^[a-f0-9]{64}$/.test(rec.requestHash)
+    || !Number.isSafeInteger(rec.requestVersion) || rec.requestVersion < 1
+    || !validDesiredBody(rec.requestBody)
+    || typeof rec.feishuUuid !== 'string' || rec.feishuUuid.length < 1 || rec.feishuUuid.length > 50
+    || !['pending', 'applied', 'unknown'].includes(rec.transportState)
+    || !Number.isSafeInteger(rec.desiredVersion) || rec.desiredVersion < 1
+    || !Number.isSafeInteger(rec.appliedVersion) || rec.appliedVersion < 0
+    || rec.appliedVersion > rec.desiredVersion
+    || typeof rec.desiredHash !== 'string' || !/^[a-f0-9]{64}$/.test(rec.desiredHash)
+    || !validDesiredBody(rec.desiredBody)
+    || (rec.createAttemptedAt !== undefined && (!Number.isFinite(rec.createAttemptedAt) || rec.createAttemptedAt < 0))
+    || (rec.updateDispatch !== undefined && (!rec.updateDispatch || typeof rec.updateDispatch !== 'object'
+      || !Number.isSafeInteger(rec.updateDispatch.version) || rec.updateDispatch.version < 1
+      || !Number.isFinite(rec.updateDispatch.startedAt)))) {
+    throw new Error(`notify request lifecycle invalid: ${storedId}`)
+  }
+  if (canonicalNotifyRequestHash(rec.requestVersion, rec.requestBody) !== rec.requestHash
+    || canonicalNotifyHash(rec.desiredBody) !== rec.desiredHash) {
+    throw new Error(`notify request hash mismatch: ${storedId}`)
+  }
+  if (rec.project !== rec.desiredBody.project || rec.title !== rec.desiredBody.title
+    || rec.text !== rec.desiredBody.text || rec.level !== rec.desiredBody.level
+    || rec.callbackUrl !== rec.desiredBody.callbackUrl || rec.allowReply !== rec.desiredBody.allowReply
+    || canonicalNotifyHash(rec.buttons) !== canonicalNotifyHash(rec.desiredBody.buttons)
+    || !validImageKeys(rec.imageKeys, rec.desiredBody)) {
+    throw new Error(`notify desired representation mismatch: ${storedId}`)
+  }
+  if (!validReplyState(rec.replyState)
+    || (rec.replyMessageIds !== undefined && (!Array.isArray(rec.replyMessageIds)
+      || rec.replyMessageIds.some((id: unknown) => typeof id !== 'string' || !id)))
+    || (rec.dispatchState !== undefined && (!rec.dispatchState || typeof rec.dispatchState !== 'object'
+      || typeof rec.dispatchState.buttonId !== 'string' || typeof rec.dispatchState.openId !== 'string'
+      || !Number.isFinite(rec.dispatchState.startedAt)))
+    || (rec.resolvedAt !== undefined && (!Number.isFinite(rec.resolvedAt) || !rec.resolvedBy
+      || typeof rec.resolvedBy.openId !== 'string' || !rec.resolvedBy.openId
+      || (rec.resolvedBy.buttonId !== undefined && typeof rec.resolvedBy.buttonId !== 'string')))
+    || (rec.unknownAt !== undefined && (!Number.isFinite(rec.unknownAt)
+      || (rec.unknownBy !== undefined && (typeof rec.unknownBy !== 'object'
+        || (rec.unknownBy.openId !== undefined && typeof rec.unknownBy.openId !== 'string')
+        || (rec.unknownBy.buttonId !== undefined && typeof rec.unknownBy.buttonId !== 'string')))
+      || (rec.unknownReason !== undefined && typeof rec.unknownReason !== 'string')))) {
+    throw new Error(`notify answer state invalid: ${storedId}`)
+  }
+  if (rec.appliedVersion === 0) {
+    if (rec.appliedHash !== undefined || rec.appliedBody !== undefined) {
+      throw new Error(`notify unapplied lifecycle invalid: ${storedId}`)
+    }
+  } else if (typeof rec.appliedHash !== 'string' || !/^[a-f0-9]{64}$/.test(rec.appliedHash)
+    || !validDesiredBody(rec.appliedBody) || canonicalNotifyHash(rec.appliedBody) !== rec.appliedHash) {
+    throw new Error(`notify applied hash mismatch: ${storedId}`)
+  }
+  if (rec.transportState === 'applied' && (!rec.messageId || rec.appliedVersion !== rec.desiredVersion
+    || rec.appliedHash !== rec.desiredHash
+    || canonicalNotifyHash(rec.appliedBody) !== canonicalNotifyHash(rec.desiredBody))) {
+    throw new Error(`notify applied lifecycle invalid: ${storedId}`)
   }
 }
 
@@ -183,10 +382,44 @@ export function loadCallbacks(): NotifyRegistration[] {
     const cutoff = Date.now() - MAX_AGE_MS
     let dropped = 0
     let interrupted = 0
-    for (const rec of Object.values(obj)) {
-      if (!rec || typeof rec !== 'object') continue
-      if (typeof rec.notifyId !== 'string' || typeof rec.callbackUrl !== 'string') continue
-      if (typeof rec.createdAt !== 'number' || rec.createdAt < cutoff) { dropped++; continue }
+    const requestIds = new Set<string>()
+    for (const [storedId, rec] of Object.entries(obj)) {
+      if (!rec || typeof rec !== 'object' || Array.isArray(rec)) throw new Error(`notify callback record invalid: ${storedId}`)
+      if (typeof rec.notifyId !== 'string' || rec.notifyId !== storedId || typeof rec.callbackUrl !== 'string') {
+        throw new Error(`notify callback identity invalid: ${storedId}`)
+      }
+      if (typeof rec.createdAt !== 'number' || !Number.isFinite(rec.createdAt)) {
+        throw new Error(`notify callback createdAt invalid: ${storedId}`)
+      }
+      if (typeof rec.chatId !== 'string' || typeof rec.messageId !== 'string'
+        || typeof rec.project !== 'string' || typeof rec.title !== 'string' || typeof rec.text !== 'string'
+        || !['info', 'warn', 'error'].includes(rec.level)
+        || !Array.isArray(rec.imageKeys) || !Array.isArray(rec.buttons)
+        || (rec.allowReply !== undefined && typeof rec.allowReply !== 'boolean')) {
+        throw new Error(`notify callback body invalid: ${storedId}`)
+      }
+      if (rec.requestId !== undefined) {
+        if (requestIds.has(rec.requestId)) {
+          throw new Error(`notify request identity invalid: ${storedId}`)
+        }
+        requestIds.add(rec.requestId)
+        validateDurableRegistration(rec, storedId)
+        if (rec.updateDispatch && rec.transportState === 'pending') {
+          rec.transportState = 'unknown'
+          rec.transportDetail = 'service restarted while a Feishu card update was in flight'
+          rec.unknownAt = Date.now()
+          rec.unknownReason = rec.transportDetail
+          interrupted++
+        }
+        if (!rec.messageId && rec.transportState === 'pending' && rec.createAttemptedAt !== undefined
+          && Date.now() - rec.createAttemptedAt >= NOTIFY_CREATE_RETRY_WINDOW_MS) {
+          rec.transportState = 'unknown'
+          rec.transportDetail = 'notification creation exceeded Feishu UUID dedupe window'
+          rec.unknownAt = Date.now()
+          rec.unknownReason = rec.transportDetail
+          interrupted++
+        }
+      } else if (rec.createdAt < cutoff) { dropped++; continue }
       // A durable sending marker precedes the external POST. After a crash
       // its outcome is uncertain; never replay a potentially delivered reply.
       if (rec.replyState?.status === 'sending' && !rec.resolvedAt && !rec.unknownAt) {
@@ -221,12 +454,75 @@ export function register(reg: NotifyRegistration): void {
     prune(now)
     lastRuntimePruneAt = now
   }
+  if (reg.requestId) {
+    const existing = getByRequestId(reg.requestId)
+    if (existing && existing.notifyId !== reg.notifyId) throw new Error(`notify request_id already exists: ${reg.requestId}`)
+    if (map.has(reg.notifyId)) throw new Error(`notify_id already exists: ${reg.notifyId}`)
+  }
   map.set(reg.notifyId, reg)
   saveCallbacks()
 }
 
 export function get(notifyId: string): NotifyRegistration | undefined {
   return map.get(notifyId)
+}
+
+export function getByRequestId(requestId: string): NotifyRegistration | undefined {
+  let found: NotifyRegistration | undefined
+  for (const rec of map.values()) {
+    if (rec.requestId !== requestId) continue
+    if (found) throw new Error(`duplicate notify request_id: ${requestId}`)
+    found = rec
+  }
+  return found
+}
+
+/** Persist a lifecycle mutation atomically with an in-memory rollback. */
+export function mutateRegistration(notifyId: string, mutate: (rec: NotifyRegistration) => void): NotifyRegistration {
+  const rec = map.get(notifyId)
+  if (!rec) throw new Error(`notify registration not found: ${notifyId}`)
+  const previous = structuredClone(rec)
+  mutate(rec)
+  try {
+    saveCallbacks()
+    return rec
+  } catch (error) {
+    for (const key of Object.keys(rec) as Array<keyof NotifyRegistration>) delete rec[key]
+    Object.assign(rec, previous)
+    throw error
+  }
+}
+
+/** Validate the immutable card ownership and applied view before accepting an
+ * answer. Legacy records retain their historical relaxed missing-context
+ * behavior; new request_id records require every binding. */
+export function validateNotifyInteraction(
+  reg: NotifyRegistration,
+  input: {
+    version?: unknown
+    chatId?: string
+    messageId?: string
+    expectedMessageId?: string
+    project?: string
+    openId?: string
+  },
+): string | null {
+  const expectedMessageId = input.expectedMessageId ?? reg.messageId
+  if (!input.openId) return '无法识别操作人，操作未执行'
+  // Legacy cards were explicitly registration-routed so forwarded/copied
+  // callbacks with missing or changed Feishu context remained usable.
+  if (!reg.requestId) return null
+  if (input.chatId && input.chatId !== reg.chatId) return '通知不属于当前群，操作未执行'
+  if (input.messageId && input.messageId !== expectedMessageId) return '通知消息已过期或不匹配，操作未执行'
+  if (!input.project || input.project !== reg.project) return '通知不属于当前项目，操作未执行'
+  if (!input.chatId || input.chatId !== reg.chatId) return '通知缺少原群归属，操作未执行'
+  if (!input.messageId || input.messageId !== expectedMessageId) return '通知缺少原消息归属，操作未执行'
+  const version = typeof input.version === 'number' ? input.version : Number(input.version)
+  if (!Number.isSafeInteger(version) || version !== reg.appliedVersion
+    || reg.appliedVersion !== reg.desiredVersion || reg.transportState !== 'applied') {
+    return '通知版本已过期或尚未送达，操作未执行'
+  }
+  return null
 }
 
 /** Commit the uncertain interval before any external side effect is allowed. */
@@ -380,7 +676,7 @@ export function prune(now: number = Date.now()): number {
   const cutoff = now - MAX_AGE_MS
   let removed = 0
   for (const [id, rec] of map) {
-    if (typeof rec.createdAt !== 'number' || rec.createdAt < cutoff) {
+    if (!rec.requestId && (typeof rec.createdAt !== 'number' || rec.createdAt < cutoff)) {
       map.delete(id)
       removed++
     }
@@ -428,6 +724,7 @@ export async function dispatchCallback(
     message_id: reg.messageId,
     chat_id: reg.chatId,
     project: reg.project,
+    ...(reg.requestId ? { version: reg.appliedVersion } : {}),
     ...('id' in answer
       ? { button: { id: answer.id, text: answer.text, type: answer.type } }
       : { response: { type: 'text', ...answer } }),
@@ -489,6 +786,7 @@ export function __setStoreFileForTest(file: string, clearMemory = true): void {
   if (clearMemory) {
     map.clear()
     dispatching.clear()  // simulate a full process restart
+    notifyLocks.clear()
   }
 }
 
@@ -546,6 +844,12 @@ export function buildNotifyResult(reg: NotifyRegistration): object {
     message_id: reg.messageId,
     resolved,
     unknown,
+    ...(reg.requestId ? {
+      request_id: reg.requestId,
+      transport_state: reg.transportState,
+      version: reg.desiredVersion,
+      applied_version: reg.appliedVersion,
+    } : {}),
     ...(reg.replyState ? {
       reply: {
         status: resolved && buttonId === undefined ? 'resolved'

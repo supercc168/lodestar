@@ -180,6 +180,51 @@ lodestar-agent --project '<项目名>' status '<run-id>' --json
 
 HTTP 使用原 `/agents/…` 路径并增加 `?project=<项目名>`，Bearer 凭据来自 daemon 启动时生成的私有 `agent-project-client.json`（状态目录内，本机同用户读取，重启后轮换）。CLI 自动读取，无需配置或输出凭据。项目凭据只用于显式项目路由，会话和 worker 凭据不能用来调用项目路由。请求体可增加 `request_id`；`requester_open_id`（CLI `--requester`）保留为调用方记录，不触发文件交付或授权。响应中的 `binding: "project"`、`project` 标明归属。旧会话接口保持原调用方式。
 
+### 项目 API 的稳定结果、binding 与取消栅栏
+
+项目调用的 `workers[].output` 保留累计可见正文；`workers[].final_output` 只保存最后一个完整结束的顶层 assistant block，保持原始空白，不从旧累计正文推断。Codex、Claude 和 DSH 的子 Agent/未结束尾段/空 stop 不会冒充 `final_output`。状态、请求重放、daemon 重启和 `--json` 返回同一内容；项目工作流只在 run 与选中 worker 都终态后消费它。
+
+通用本机 API：
+
+```text
+GET    /agents/project-binding?project=<项目名>
+GET    /agents/requests/<request_id>?project=<项目名>&expected_binding=<binding_id>
+DELETE /agents/requests/<request_id>?project=<项目名>&expected_binding=<binding_id>
+POST   /agents/requests/<request_id>/reconcile?project=<项目名>
+```
+
+`/agents/project-binding` 返回 project、chat、canonical root、持久 installation id 和对这些值生成的 opaque binding id。新模式的 POST run、request lookup、cancel 和 reconciliation 都要提供当前 `expected_binding`；项目/群/根目录或安装变化返回冲突，不能把旧请求当成“没找到”后重新执行。已经 admitted 的请求查状态/停止不重新要求 identity 仍 ready。
+
+request 状态为 `pending`、`admitted`、`cancel_requested`、`cancelled`、`unknown`、`resolved`。`DELETE` 先持久化取消 fence：即使请求尚未到达，也禁止以后同编号准入；只有递归原生进程确认停止才返回 cancelled。daemon 重启、wrapper 退出或本机 observer 消失不能证明远端停止，遗留执行保持 `unknown`，相同业务不能 fresh replay。
+
+operator reconciliation 需要**另一份本机 capability**：`agent-operator-client.json`。普通项目用的 `agent-project-client.json`、Agent、worker 和外部软件不能调用。操作者须先在 API 外核实原生工作已停止，再运行：
+
+```bash
+# desc: 人工核实未知项目请求已停止
+lodestar-agent --project '<项目名>' requests reconcile \
+  --request '<request_id>' \
+  --expected-binding '<原 binding_id>' \
+  --stopped \
+  --reason '<核实方式与结果>' \
+  --json
+```
+
+只有 `unknown` 可处理。结果保存 `operator_attested`、reason、time 和 binding；这是人工声明，不是进程证明或业务成功，也不会重放任务。上层工作流仍须由 owner 明确选择 retry/resume/fail/cancel，迟到结果继续保留。
+
+### 版本化本机通知
+
+旧 `POST /notify` 调用保持原格式。需要跨重启去重时增加稳定 `request_id` 和正整数 `version`；Lodestar 在发送前保存请求 hash、`notify_id` 和不超过 50 字的 Feishu UUID。相同 request/body 返回原映射，冲突正文返回 409；纯文字通知也会返回 `notify_id`。
+
+```text
+POST /notify
+PUT  /notify/<notify_id>
+GET  /notify/result/<notify_id>
+```
+
+`PUT /notify/<notify_id>` 接收 project、递增 version 和完整卡片字段，只 patch 原始 `message_id`，不另发替代消息。同 version/同 body 幂等，不同 body 冲突，旧 version 返回当前状态。响应和 GET 结果在新记录上包含 `request_id`、`transport_state`、`version`、`applied_version`；只有 `transport_state:"applied"` 且 applied version 等于目标版本才算送达。
+
+create 在 Feishu UUID 一小时去重窗外仍未确认，或 UUID 已消费却没有可恢复 `message_id` 时变成 `unknown`。`message.patch` 已发出但响应丢失同样返回 HTTP 202 / `transport_state:"unknown"`，不能自动 PUT 重放。按钮/文字回调核对新记录的 project、chat、原 message、applied version 和 operator；旧通知继续按已有 `notify_id` 支持转发卡片。回调非 2xx 不结案，保留按钮供授权用户重试；2xx 后才冻结结果。
+
 ## 飞书任务清单
 
 发 `task`，点“启用”可为当前项目创建并绑定 `<project>[lodestar]` 任务清单。主群、同一项目的所有 WT 及其 BTW/FK 临时群共用清单。在其中任一群删除清单，都作用于整个项目；删除需要在卡片上再次确认，会删除整个清单及其中任务。该面板管理清单绑定，任务执行由用户和 Agent 安排。

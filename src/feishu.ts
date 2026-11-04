@@ -1426,10 +1426,16 @@ async function sendViaSdkWithRetry(
   msgType: 'text' | 'interactive' | 'image' | 'file',
   content: string,
   onFailure?: (error: unknown) => void,
+  callerUuid?: string,
 ): Promise<string | null> {
   // Same uuid across retries → Feishu dedupes on its side so a successful-
   // but-response-lost first attempt doesn't produce a duplicate message.
-  const uuid = randomUUID()
+  const uuid = callerUuid ?? randomUUID()
+  if (!uuid || uuid.length > 50) {
+    const error = new Error('Feishu message UUID must be 1-50 characters')
+    onFailure?.(error)
+    return null
+  }
   try {
     return await withOutputRecovery(`send${what} chat=${chatId}`, async () => {
       const res: any = await client.im.message.create({
@@ -1468,13 +1474,19 @@ export async function sendText(chatId: string, text: string, onFailure?: (error:
   return withChatMessageOrder(chatId, () => sendViaSdkWithRetry('Text', chatId, 'text', JSON.stringify({ text }), onFailure))
 }
 
-export async function sendCard(chatId: string, card: object, onFailure?: (error: unknown) => void): Promise<string | null> {
+export async function sendCard(
+  chatId: string,
+  card: object,
+  onFailure?: (error: unknown) => void,
+  uuid?: string,
+): Promise<string | null> {
   return withChatMessageOrder(chatId, () => sendViaSdkWithRetry(
     'Card',
     chatId,
     'interactive',
     JSON.stringify(neutralizeMarkdownImagesInCard(card)),
     onFailure,
+    uuid,
   ))
 }
 

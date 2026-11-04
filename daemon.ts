@@ -43,6 +43,8 @@ import {
   setDispatching,
   clearDispatching,
   loadCallbacks,
+  validateNotifyInteraction,
+  withNotifyLock,
   type NotifyButton,
   type NotifyRegistration,
 } from './src/notify-callbacks'
@@ -57,7 +59,12 @@ import { ensureImagegenSkill } from './src/imagegen-skill'
 import { ensureImagereadSkill } from './src/imageread-skill'
 import { ensureFpdSkill } from './src/fpd-skill'
 import { startTasklistWorker, stopTasklistWorker } from './src/tasklist-worker'
-import { acceptsProjectCapability, createAgentProjectClient } from './src/agent-project-client'
+import {
+  acceptsOperatorCapability,
+  acceptsProjectCapability,
+  createAgentOperatorClient,
+  createAgentProjectClient,
+} from './src/agent-project-client'
 import { resolveAgentProject } from './src/agent-project'
 import { agentApiUrl } from './src/agent-runtime'
 import { codexLogins } from './src/codex-login'
@@ -866,10 +873,30 @@ async function handleCardAction(data: any): Promise<any> {
     const notifyId = String(value.notify_id ?? '')
     const reg = getNotifyCallback(notifyId)
     if (reg) data.__cardActionChatId = reg.chatId
-    if (value.kind === 'notify_callback') return await handleNotifyCallback(value, chatId, userId)
-    const result = value.kind === 'notify_reply'
-      ? await notifyReplies.open(notifyId, chatId, userId)
-      : await notifyReplies.cancel(notifyId, String(value.reply_id ?? ''), chatId, userId)
+    const actionMessageId = String(data?.context?.open_message_id ?? '')
+    if (reg) {
+      const ownershipError = validateNotifyInteraction(reg, {
+        version: value.version,
+        chatId,
+        messageId: actionMessageId,
+        expectedMessageId: value.kind === 'notify_reply_cancel'
+          ? reg.replyState?.promptMessageId ?? reg.messageId
+          : reg.messageId,
+        project: value.project,
+        openId: userId,
+      })
+      if (ownershipError) {
+        return withNotifyContext(reg, withBusinessOutcome({
+          toast: { type: 'error', content: ownershipError },
+        }, false))
+      }
+    }
+    if (value.kind === 'notify_callback') {
+      return await withNotifyLock(`notify:${notifyId}`, () => handleNotifyCallback(value, chatId, userId, actionMessageId))
+    }
+    const result = await withNotifyLock(`notify:${notifyId}`, () => value.kind === 'notify_reply'
+      ? notifyReplies.open(notifyId, chatId, userId, value.version)
+      : notifyReplies.cancel(notifyId, String(value.reply_id ?? ''), chatId, userId, value.version))
     const response = withBusinessOutcome({
       toast: { type: result.ok ? 'success' : 'error', content: result.message },
       __cardActionPresented: result.presented === true,
@@ -1148,7 +1175,7 @@ async function handleCardAction(data: any): Promise<any> {
 // Pull / display-only mode (no callback) freezes on the verdict in a
 // single inline step (no push to wait for). Every failure is surfaced
 // on the card or toast — no silent swallow.
-async function handleNotifyCallback(value: any, _chatId: string, userId: string): Promise<any> {
+async function handleNotifyCallback(value: any, _chatId: string, userId: string, _messageId: string): Promise<any> {
   const notifyId = String(value?.notify_id ?? '')
   const buttonId = String(value?.button_id ?? '')
   if (!notifyId) return { toast: { type: 'error', content: '回调缺少 notify_id' } }
@@ -1225,7 +1252,10 @@ async function handleNotifyCallback(value: any, _chatId: string, userId: string)
     }, false))
   }
   setDispatching(reg.notifyId)
-  const phase2 = trackCardActionWork(pushNotifyCallbackPhase2(reg, button, userId))
+  const phase2 = trackCardActionWork(withNotifyLock(
+    `notify:${reg.notifyId}`,
+    () => pushNotifyCallbackPhase2(reg, button, userId),
+  ))
   void phase2.catch(e => {
     logError('daemon.notify_callback.phase_two_failed', e)
   })
@@ -1718,12 +1748,15 @@ async function boot(): Promise<void> {
   }
   const recoveredCallbacks = loadCallbacks()
   const projectClient = createAgentProjectClient(agentApiUrl(config.notify.bind, config.notify.port))
+  const operatorClient = createAgentOperatorClient(agentApiUrl(config.notify.bind, config.notify.port))
   startNotifyServer({
     bind: config.notify.bind,
     port: config.notify.port,
     extraHandler: (req, res, url) => handleAgentRequest(req, res, url, {
       service: agentService,
       authorizeProject: (capability, project) => acceptsProjectCapability(projectClient, capability)
+        ? agentService.projectPrincipal(resolveAgentProject(project)) : null,
+      authorizeOperator: (capability, project) => acceptsOperatorCapability(operatorClient, capability)
         ? agentService.projectPrincipal(resolveAgentProject(project)) : null,
       authorizeSession: capability => {
         for (const session of sessions.values()) {
