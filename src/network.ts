@@ -22,8 +22,8 @@ async function transport(url: URL, init: RequestInit, proxy?: string): Promise<R
     if (!proxy && (process.env[key.toLowerCase()] || process.env[key])) {
       // Bun 1.3.x ignores an empty proxy option and still reads the environment.
       // A direct dispatcher is required for bypasses; it never retries a failed proxy.
-      // This optional Bun-only dependency requires Node 18.17, so Node 18.15 uses
-      // the node-fetch transport below without loading it.
+      // Optional Bun-only dependency (engines 已声明 Node 22.19+,undici 6 仍兼容);
+      // 无代理直连不走此分支。
       const undici = await import('undici')
       bunDirect ??= new undici.Agent()
       return await undici.fetch(url, { ...init, redirect: 'manual', dispatcher: bunDirect } as Parameters<typeof undici.fetch>[1]) as unknown as Response

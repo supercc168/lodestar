@@ -184,6 +184,7 @@ export {
   backgroundLiveCard,
   backgroundHistoryCard,
   backgroundMigratedMarker,
+  backgroundMigratedElement,
 } from './cards/background'
 export {
   type AutomationRunKind,

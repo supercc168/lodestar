@@ -14653,6 +14653,280 @@ function makeRunningTask(id: string): any {
   return { id, type: 'shell', description: `bg ${id}`, status: 'running', startedAt: Date.now() - 5000, steps: [] }
 }
 
+describe('Session background tasks in shared delegation cards', () => {
+  function makeRunningTask(id: string): any {
+    return { id, type: 'shell', description: `bg ${id}`, status: 'running', startedAt: Date.now() - 5000, steps: [] }
+  }
+
+  test('stop drains visible tasks as killed and drops ordinary foreground commands', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.backgroundTasks = [makeRunningTask('t1'), makeRunningTask('t2')]
+    session.pendingBgTasks = [makeRunningTask('foreground')]
+    await session.refreshBackgroundCardFull()
+    session.scheduleBackgroundRefresh()
+
+    await session.stop('已终止', { announce: false })
+
+    expect(proc.killCalls).toBe(1)
+    expect(session.backgroundTasks).toEqual([])
+    expect(session.pendingBgTasks).toEqual([])
+    expect(session.backgroundSync).toBeNull()
+    expect(session.backgroundRefreshTimer).toBeNull()
+    expect(sentCards).toHaveLength(1)
+    const writes = calls.filter(call => call.method === 'PUT').map(call => String(call.body.element)).join('\n')
+    expect(writes).toContain('已终止')
+    expect(writes).not.toContain('foreground')
+    expect(updatedCards).toHaveLength(0)
+    const settings = calls.filter(call => call.path.endsWith('/settings')).at(-1)!
+    expect(JSON.parse(settings.body.settings).config.streaming_mode).toBe(false)
+    await session.agentCards.closeChat('chat_id')
+  })
+
+  test('a new main card moves running work to the chat tail', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1')
+    session.proc = proc
+    session.backgroundTasks = [makeRunningTask('running')]
+    await session.refreshBackgroundCardFull()
+    expect(sentCards).toHaveLength(1)
+    const panel = (sentCards[0] as any).body.elements[0].element_id as string
+    const converted = new Map<string, string>()
+    const convert = session.agentCards.deps.convertMessageToCard
+    session.agentCards.deps.convertMessageToCard = async (messageId: string) => {
+      const cardId = await convert(messageId)
+      converted.set(messageId, cardId)
+      return cardId
+    }
+    const owner = session.beginTurnOpen(proc, 0, true)
+    let turn: any = null
+    try {
+      turn = await session.openTurnCard(owner, '', 'user_message')
+      expect(turn).not.toBeNull()
+      // 委派卡 → 主卡 → 重建后的委派卡
+      expect(sentCards).toHaveLength(3)
+      expect((sentCards[2] as any).body.elements[0].element_id).toBe(panel)
+      expect(calls.some(call => call.method === 'DELETE' && call.path.includes(`/elements/${panel}`))).toBe(true)
+      const rebuiltCardId = converted.get('om_status_3')
+      expect(rebuiltCardId).toBeTruthy()
+      // 后续任务进度只能写重建后的群尾卡，不能回到旧卡。
+      session.backgroundTasks = [{ ...session.backgroundTasks[0], summary: '检查中' }]
+      await session.refreshBackgroundCardFull()
+      const write = calls.find(call => call.method === 'PUT' && String(call.body.element).includes('检查中'))
+      expect(write?.path).toContain(`/cards/${rebuiltCardId}`)
+    } finally {
+      session.agentCards.deps.convertMessageToCard = convert
+      if (turn) {
+        session.stopFooterStatus(turn)
+        await cardkit.dispose(turn.cardId)
+      }
+      session.releaseTurnOpen(owner)
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+    }
+  })
+
+  test('mid-turn rotation keeps running work behind the new card', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    const turn = turnState('card_rotate_reanchor')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const order: string[] = []
+    const prepare = session.agentCards.prepareNewCard
+    const rebuild = session.agentCards.rebuildTailCard
+    session.agentCards.prepareNewCard = async (chatId: string) => {
+      order.push('prepare')
+      expect(sentCards).toHaveLength(0)
+      return prepare.call(session.agentCards, chatId)
+    }
+    session.agentCards.rebuildTailCard = async (chatId: string) => {
+      order.push('rebuild')
+      expect(sentCards).toHaveLength(1)
+      return rebuild.call(session.agentCards, chatId)
+    }
+    try {
+      session.startMidTurnRotate(turn)
+      await turn.rotating
+      expect(order.slice(0, 2)).toEqual(['prepare', 'rebuild'])
+    } finally {
+      session.agentCards.prepareNewCard = prepare
+      session.agentCards.rebuildTailCard = rebuild
+      if (turn.rotating) await turn.rotating
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+      session.dispose()
+    }
+  })
+
+  test('stop waits for an admitted open, settles it, and namespaces a later process', async () => {
+    const session = new Session('background-open-generation', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('same-id')]
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    const baseFetch = globalThis.fetch
+    let converting = false
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (new URL(String(input)).pathname.endsWith('/cards/id_convert')) {
+        converting = true
+        await gate
+      }
+      return baseFetch(input, init)
+    }) as typeof fetch
+    try {
+      const opening = session.refreshBackgroundCardFull()
+      await waitUntil(() => converting)
+      let resetDone = false
+      const resetting = session.resetBackgroundTasks().then(() => { resetDone = true })
+      await Promise.resolve()
+      expect(resetDone).toBe(false)
+      release()
+      await Promise.all([opening, resetting])
+      expect(session.backgroundTasks).toEqual([])
+      session.backgroundTasks = [makeRunningTask('same-id')]
+      await session.refreshBackgroundCardFull()
+      expect(sentCards).toHaveLength(1)
+      const appended = calls.filter(call => call.method === 'POST' && call.path.endsWith('/elements'))
+      expect(appended).toHaveLength(1)
+      const initialId = (sentCards[0] as any).body.elements[0].element_id
+      expect(JSON.parse(appended[0]!.body.elements)[0].element_id).not.toBe(initialId)
+    } finally {
+      release()
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      globalThis.fetch = baseFetch
+    }
+  })
+
+  test('a failed terminal update remains visible and can be retried without duplicate rows', async () => {
+    const session = new Session('background-update-failure', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('running')]
+    await session.refreshBackgroundCardFull()
+    const patch = spyOn(session.agentCards.deps, 'patchSettingsChecked').mockResolvedValue(false)
+    try {
+      await expect(session.resetBackgroundTasks()).rejects.toThrow('settings update MISS')
+      expect(session.backgroundTasks[0].status).toBe('killed')
+    } finally { patch.mockRestore() }
+    await session.resetBackgroundTasks()
+    expect(session.backgroundTasks).toEqual([])
+    expect(sentCards).toHaveLength(1)
+    await session.agentCards.closeChat('chat_id')
+  })
+
+  test('repeated settings failures with new request ids notify once until the panel recovers', async () => {
+    const session = new Session('background-settings-notices', 'chat_id') as any
+    session.backgroundTasks = [makeRunningTask('running')]
+    await session.refreshBackgroundCardFull()
+    const patchSettings = session.agentCards.deps.patchSettingsChecked
+    let rejecting = true
+    let attempts = 0
+    const patch = spyOn(session.agentCards.deps, 'patchSettingsChecked').mockImplementation(
+      async (cardId: string, settings: object, onFailure?: (failure: CardWriteFailure) => void) => {
+        if (!rejecting) return patchSettings(cardId, settings, onFailure)
+        onFailure?.({ cardId, operation: 'patchSettings', code: 200860,
+          message: 'ErrMsg: card over max size;', logId: `settings-request-${++attempts}` })
+        return false
+      },
+    )
+    const refresh = () => session.refreshBackgroundCardFull().catch((error: unknown) => session.reportBackgroundWriteFailure(error))
+    try {
+      session.backgroundTasks = [{ ...session.backgroundTasks[0], status: 'completed', summary: '任务结果' }]
+      await refresh()
+      await refresh()
+      await refresh()
+      expect(attempts).toBe(3)
+      expect(sentRawTexts).toHaveLength(1)
+      expect(sentRawTexts[0]).toContain('code=200860 message=ErrMsg: card over max size; log_id=settings-request-1')
+      expect(sentCards).toHaveLength(1)
+
+      rejecting = false
+      await refresh()
+      rejecting = true
+      session.backgroundTasks = [{ ...session.backgroundTasks[0], summary: '补充任务结果' }]
+      await refresh()
+      expect(sentRawTexts).toHaveLength(2)
+      expect(sentRawTexts[1]).toContain('log_id=settings-request-4')
+    } finally {
+      patch.mockRestore()
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+    }
+  })
+
+  test('background error batches preserve new causes without repeating known ones', async () => {
+    const session = new Session('background-notice-causes', 'chat_id') as any
+    const failure = (id: number) => new Error(`agent card settings update MISS: code=200860 message=card over max size log_id=request-${id}`)
+    await session.reportBackgroundWriteFailure(new AggregateError([failure(1), failure(2)]))
+    expect(sentRawTexts).toHaveLength(1)
+    expect(sentRawTexts[0]).toContain('log_id=request-1')
+    expect(sentRawTexts[0]).not.toContain('request-2')
+
+    const cleanupFailure = new Error('agent moved task row deletion MISS: code=300317 message=cleanup rejected log_id=cleanup-request')
+    await session.reportBackgroundWriteFailure(new AggregateError([
+      failure(3), new AggregateError([cleanupFailure, failure(4)]),
+    ]))
+    expect(sentRawTexts).toHaveLength(2)
+    expect(sentRawTexts[1]).toContain('cleanup rejected log_id=cleanup-request')
+    expect(sentRawTexts[1]).not.toContain('card over max size')
+    await session.reportBackgroundWriteFailure(failure(5))
+    expect(sentRawTexts).toHaveLength(2)
+  })
+
+  test('a failed launch is visible in the delegation panel without a main tool panel', async () => {
+    const session = new Session('native-launch-failure', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_failed_child')
+    cardkit.recordCardCreated('card_failed_child', 1)
+    try {
+      proc.emit('tool_use', { id: 'agent-tool', name: 'Agent', input: { description: '检查接口' }, parentToolUseId: null })
+      proc.emit('tool_result', { tool_use_id: 'agent-tool', content: '无法启动子 Agent', is_error: true, parentToolUseId: null })
+      await session.backgroundSync
+      expect(session.currentTurn.toolByUseId.size).toBe(0)
+      expect(session.backgroundTasks).toHaveLength(1)
+      expect(session.backgroundTasks[0].status).toBe('failed')
+      const rendered = calls.filter(call => call.method === 'PUT').map(call => String(call.body.element)).join('\n')
+      expect(rendered).toContain('子 Agent失败')
+      expect(rendered).toContain('无法启动子 Agent')
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      await cardkit.dispose('card_failed_child')
+    }
+  })
+
+  test('a successful async launch receipt leaves the child running until its native result', async () => {
+    const session = new Session('native-background-receipt', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session')
+    session.proc = proc
+    session.wireProc(proc)
+    session.currentTurn = turnState('card_async_child')
+    cardkit.recordCardCreated('card_async_child', 1)
+    try {
+      proc.emit('tool_use', { id: 'agent-tool', name: 'Agent', input: { description: '检查接口', run_in_background: true }, parentToolUseId: null })
+      expect(session.currentTurn.footerStatusLabel).toBe('Working...')
+      proc.emit('tool_result', { tool_use_id: 'agent-tool', content: 'Agent launched', is_error: false, parentToolUseId: null })
+      expect(session.currentTurn.footerStatusLabel).toBe('Thinking...')
+      expect(session.backgroundTasks[0].status).toBe('running')
+      proc.emit('bg_task_started', { task_id: 'native-id', tool_use_id: 'agent-tool', description: '检查接口', task_type: 'local_agent' })
+      proc.emit('bg_task_settled', { task_id: 'native-id', status: 'completed', summary: '接口正常' })
+      await session.backgroundSync
+      expect(session.backgroundTasks).toHaveLength(1)
+      expect(session.backgroundTasks[0].status).toBe('completed')
+      expect(session.currentTurn.toolByUseId.size).toBe(0)
+      expect(sentCards).toHaveLength(1)
+      expect(calls.filter(call => call.method === 'POST' && call.path.endsWith('/elements'))).toHaveLength(0)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      await session.resetBackgroundTasks()
+      await session.agentCards.closeChat('chat_id')
+      await cardkit.dispose('card_async_child')
+    }
+  })
+})
+
 describe('Session optional progress presentation', () => {
   test.each(['Bash', 'Read', 'Edit'].flatMap(name => [true, false].map(resultLands => ({ name, resultLands }))))(
     'a tool placeholder fails silently but its result stays checked (%p)', async ({ name, resultLands }) => {
@@ -21247,5 +21521,92 @@ describe('Session shared cards preserve warm agent resumes', () => {
     expect(updatedCards).toEqual([])
     await session.resetBackgroundTasks()
     await session.agentCards.closeChat('chat_id')
+  })
+})
+
+describe('Session task-end notifications', () => {
+  function task(status: 'running' | 'completed') {
+    return {
+      id: 't1', type: 'shell' as const, description: '后台命令', status,
+      startedAt: Date.now(), ...(status === 'completed' ? { endTime: Date.now() } : {}), steps: [],
+    }
+  }
+
+  test('a closed turn keeps the phone push until the background work ends', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.backgroundTasks = [task('running')]
+    session.currentTurn = turnState('card_bg_running')
+    cardkit.recordCardCreated('card_bg_running', 1)
+    try {
+      await session.closeTurnCard()
+      expect(urgentPushes).toHaveLength(0)
+
+      session.backgroundTasks = [task('completed')]
+      await session.notifyBackgroundEnd()
+      expect(urgentPushes).toEqual([['om_session_turn', ['ou_user']]])
+      await session.notifyBackgroundEnd()
+      expect(urgentPushes).toHaveLength(1)
+    } finally {
+      await cardkit.dispose('card_bg_running')
+      session.dispose()
+    }
+  })
+
+  test('an open turn takes over the task-end push and the resume turn does not repeat it', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.lastClosedTurnMessageId = 'om_previous_turn'
+    session.backgroundTasks = [task('completed')]
+    session.currentTurn = turnState('card_next_turn')
+    cardkit.recordCardCreated('card_next_turn', 1)
+    try {
+      // 后台已结束但新一轮正在进行：这一轮收尾负责推送。
+      await session.notifyBackgroundEnd()
+      expect(urgentPushes).toHaveLength(0)
+
+      session.currentTurn.trigger = 'bg_task_resume'
+      await session.closeTurnCard()
+      expect(urgentPushes).toHaveLength(1)
+    } finally {
+      await cardkit.dispose('card_next_turn')
+    }
+
+    // 任务结束通知已经发过；同一代际的迟到续跑轮不再重复推送。
+    urgentPushes.length = 0
+    session.backgroundWorkGeneration = 2
+    session.notifiedBackgroundWorkGeneration = 2
+    session.currentTurn = { ...turnState('card_late_resume'), trigger: 'bg_task_resume' }
+    cardkit.recordCardCreated('card_late_resume', 1)
+    try {
+      await session.closeTurnCard()
+      expect(urgentPushes).toHaveLength(0)
+    } finally {
+      await cardkit.dispose('card_late_resume')
+      session.dispose()
+    }
+  })
+
+  test('the task-end notice is skipped while the turn close is still in flight', async () => {
+    const session = new Session('probe', 'chat_id') as any
+    session.lastUserOpenId = 'ou_user'
+    session.lastClosedTurnMessageId = 'om_previous_turn'
+    let release!: () => void
+    const gate = new Promise<void>(resolve => { release = resolve })
+    session.backgroundTasks = [task('completed')]
+    session.currentTurn = turnState('card_closing')
+    cardkit.recordCardCreated('card_closing', 1)
+    const close = session.closeTurnCard()
+    session.turnCloseInflight.add(gate)
+    await session.notifyBackgroundEnd()
+    expect(urgentPushes).toHaveLength(0)
+    release()
+    session.turnCloseInflight.delete(gate)
+    await close
+    // closeTurnCard 结束时没有活跃后台任务，正常推送一次。
+    await waitUntil(() => urgentPushes.length === 1)
+    expect(urgentPushes).toEqual([['om_session_turn', ['ou_user']]])
+    await cardkit.dispose('card_closing')
+    session.dispose()
   })
 })

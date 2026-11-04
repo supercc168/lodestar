@@ -34,7 +34,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 ## 开发规则
 
 ### Working In This Directory
-- Runtime 是 **Bun**；源码开发通常用 `bun daemon.ts` 或 `bun run start`，发布包通过 `bun build --target=node` 生成 Node.js ≥ 18.15 的发布入口。
+- Runtime 是 **Bun**；源码开发通常用 `bun daemon.ts` 或 `bun run start`，发布包通过 `bun build --target=node` 生成 Node.js 22.19+（22.x）或 24+ 的发布入口；发布包由 Node 运行，Bun 自动加载的 `.env` 行为不适用于 npm 入口（上游 v0.21.26）。
 - daemon 通过统一 `AgentProcess` 接口（`src/agent-process.ts`）驱动两类后端：Codex 走 `codex app-server --listen stdio://` JSON-RPC，Claude 走 `@anthropic-ai/claude-agent-sdk` 的 `query()` streaming-input 长驻进程；session 默认 provider 是 Claude/GLM，可用 `model` 切到 Codex。不要恢复 tmux、JSONL 队列或 1.x 传输机制。
 - 运行状态全部在 XDG 目录外置：配置默认在 `~/.config/lodestar/config.toml`，日志和 runtime map 默认在 `~/.local/share/lodestar/`。凭据只应存在于 `config.toml`，不要写入仓库；新增持久状态通过 `src/paths.ts` 定义，遵循 XDG 和 Windows 路径约定。
 - Assistant 正文和 footer 状态不使用 Card Kit `/content` 打字流；正文按完整段 `addElement` 插入，footer 状态用 `replaceElement` 直接替换。
@@ -55,7 +55,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - `agy <prompt>` 在当前 session 工作目录内独占运行 `agy --print`，用独立 Card Kit 卡片展示 prompt、状态、输出、仓库变更和“转 Codex”按钮；不要把它混入普通 Codex turn 卡片。
 - `task` 打开项目任务清单面板；启用后创建/绑定 `<project>[lodestar]` 飞书任务清单，daemon 内置 worker 会扫描 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成` 分组并驱动规划、执行、审核和本地合并。
 - 本地脚本可通过 `POST http://127.0.0.1:9876/notify` 发送 `{project, text, level}` 到绑定群。
-- 源码运行使用 `bun daemon.ts` 或 `bun run start`；`bun run build` 生成 Node.js ≥ 18.15 的发布入口。
+- 源码运行使用 `bun daemon.ts` 或 `bun run start`；`bun run build` 生成 Node.js 22.19+（22.x）或 24+ 的发布入口。
 - `config.ts` 在 import 时同步读取配置，缺失时报错。首次安装的延迟导入只放在 `cli.ts`。
 - 配置默认位于 `~/.config/lodestar/config.toml`，状态位于 `~/.local/share/lodestar/`。新增持久状态通过 `src/paths.ts` 定义，遵循 XDG 和 Windows 路径约定。
 - 凭据、本机配置、聊天成员、debug context 和 `~/.codex`、`~/.claude` 内容不得写入跟踪文件。

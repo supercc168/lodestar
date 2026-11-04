@@ -2104,6 +2104,7 @@ describe('codex collab agent translation (ultra multi-agent)', () => {
     const events: Array<[string, any]> = []
     proc.opts = { workDir: '/tmp' }
     proc.collabAgentNames = new Map()
+    proc.collabAgentTitles = new Map()
     proc.collabAgentSettled = new Set()
     proc.collabAgentSummaries = new Map()
     proc.emit = (event: string, payload: unknown) => {
@@ -2201,6 +2202,23 @@ describe('codex collab agent translation (ultra multi-agent)', () => {
     expect(toolUses).toHaveLength(1)
     expect(toolUses[0][1].name).toBe('Agent')
     expect(toolUses[0][1].input.description).toBe('派生 1 个子 agent')
+    // 行标题是子 Agent 的任务(prompt 首行),不是 agentPath 代号,也不被后续步骤覆盖。
+    const bgStarted = events.filter(([e]) => e === 'bg_task_started')
+    expect(bgStarted.at(-1)?.[1]).toMatchObject({
+      task_id: 'agent-thread-2', description: '调查 history_orders 接口', prompt: '调查 history_orders 接口',
+    })
+    proc.handleNotification('item/started', {
+      item: {
+        type: 'subAgentActivity',
+        id: 'activity-2',
+        kind: 'started',
+        agentThreadId: 'agent-thread-2',
+        agentPath: '/root/investigate',
+      },
+      threadId: 'main-thread',
+      turnId: 'turn-2',
+    })
+    expect(events.filter(([e]) => e === 'bg_task_started').at(-1)?.[1].description).toBe('调查 history_orders 接口')
 
     proc.handleNotification('item/completed', {
       item: {
@@ -2221,6 +2239,33 @@ describe('codex collab agent translation (ultra multi-agent)', () => {
     expect(results).toHaveLength(1)
     expect(results[0][1].tool_use_id).toBe('spawn-1')
     expect(results[0][1].content).toContain('agent-thread-2: running')
+  })
+
+  test('a later spawn prompt upgrades the agentPath row title to the real task', () => {
+    const { proc, events } = makeProc()
+    // subAgentActivity arrives first and names the row by agentPath.
+    proc.handleNotification('item/started', {
+      item: { type: 'subAgentActivity', id: 'a1', kind: 'started',
+        agentThreadId: 'agent-thread-title', agentPath: '/root/sleep_agent' },
+      threadId: 'main-thread', turnId: 'turn-title',
+    })
+    expect(events.filter(([e]) => e === 'bg_task_started').at(-1)?.[1].description).toBe('sleep_agent')
+    // The spawn tool call carries the real task prompt; the row must switch to it.
+    proc.handleNotification('item/started', {
+      item: { type: 'collabAgentToolCall', id: 'spawn-title', tool: 'spawnAgent', status: 'inProgress',
+        prompt: '执行 240 秒 sleep 后汇报', agentsStates: { 'agent-thread-title': { status: 'running', message: null } } },
+      threadId: 'main-thread', turnId: 'turn-title',
+    })
+    expect(events.filter(([e]) => e === 'bg_task_started').at(-1)?.[1]).toMatchObject({
+      task_id: 'agent-thread-title', description: '执行 240 秒 sleep 后汇报', prompt: '执行 240 秒 sleep 后汇报',
+    })
+    // A later activity update must not put the codename back.
+    proc.handleNotification('item/started', {
+      item: { type: 'subAgentActivity', id: 'a2', kind: 'started',
+        agentThreadId: 'agent-thread-title', agentPath: '/root/sleep_agent' },
+      threadId: 'main-thread', turnId: 'turn-title',
+    })
+    expect(events.filter(([e]) => e === 'bg_task_started').at(-1)?.[1].description).toBe('执行 240 秒 sleep 后汇报')
   })
 
   test('pure orchestration calls (wait/sendInput/closeAgent) emit no tool panels', () => {
@@ -2277,6 +2322,7 @@ describe('codex collab followup reactivation', () => {
     const events: Array<[string, any]> = []
     proc.opts = { workDir: '/tmp' }
     proc.collabAgentNames = new Map()
+    proc.collabAgentTitles = new Map()
     proc.collabAgentSettled = new Set()
     proc.collabAgentSummaries = new Map()
     proc.emit = (event: string, payload: unknown) => {
@@ -2344,6 +2390,7 @@ describe('codex collab closeAgent and terminal-first edge cases', () => {
     const events: Array<[string, any]> = []
     proc.opts = { workDir: '/tmp' }
     proc.collabAgentNames = new Map()
+    proc.collabAgentTitles = new Map()
     proc.collabAgentSettled = new Set()
     proc.collabAgentSummaries = new Map()
     proc.emit = (event: string, payload: unknown) => {
@@ -2421,6 +2468,7 @@ describe('codex subagent item filtering (main-card cleanliness)', () => {
     const events: Array<[string, any]> = []
     proc.opts = { workDir: '/tmp' }
     proc.collabAgentNames = new Map()
+    proc.collabAgentTitles = new Map()
     proc.collabAgentSettled = new Set()
     proc.collabAgentSummaries = new Map()
     proc.sessionId = 'main-thread'
@@ -2503,6 +2551,7 @@ describe('codex subagent step filtering', () => {
     const events: Array<[string, any]> = []
     proc.opts = { workDir: '/tmp' }
     proc.collabAgentNames = new Map()
+    proc.collabAgentTitles = new Map()
     proc.collabAgentSettled = new Set()
     proc.collabAgentSummaries = new Map()
     proc.sessionId = 'main-thread'
@@ -2528,6 +2577,7 @@ describe('codex exec-cell orchestration via thread/status/changed', () => {
     const events: Array<[string, any]> = []
     proc.opts = { workDir: '/tmp' }
     proc.collabAgentNames = new Map()
+    proc.collabAgentTitles = new Map()
     proc.collabAgentSettled = new Set()
     proc.collabAgentSummaries = new Map()
     proc.collabAgentWasActive = new Set()
@@ -2589,6 +2639,7 @@ describe('codex review-round-3 fixes', () => {
     const events: Array<[string, any]> = []
     proc.opts = { workDir: '/tmp' }
     proc.collabAgentNames = new Map()
+    proc.collabAgentTitles = new Map()
     proc.collabAgentSettled = new Set()
     proc.collabAgentSummaries = new Map()
     proc.collabAgentWasActive = new Set()
@@ -2720,6 +2771,7 @@ function notificationHarness(): { proc: any; events: Array<[string, any]> } {
   proc.emittedImageGenerationIds = new Set()
   // collab→bg 翻译状态机四表(cf41941):Object.create 不跑字段初始化器,手动补。
   proc.collabAgentNames = new Map()
+  proc.collabAgentTitles = new Map()
   proc.collabAgentSettled = new Set()
   proc.collabAgentWasActive = new Set()
   proc.collabAgentSummaries = new Map()
