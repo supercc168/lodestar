@@ -1,12 +1,227 @@
-import { afterEach, describe, expect, test } from 'bun:test'
+import { afterAll, afterEach, describe, expect, test } from 'bun:test'
+import { mkdtempSync, mkdirSync, realpathSync, renameSync, rmSync } from 'node:fs'
 import { createServer, request, type Server } from 'node:http'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { Readable } from 'node:stream'
 import { handleAgentRequest } from './agent-api'
 import { buildAgentIdentityCatalog } from './agent-identities'
 import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type TokenSource } from './token-source'
+import { AgentService, type AgentServiceDeps } from './agent-service'
+import { AgentRequestStore } from './agent-request-store'
+import type { AgentRunSnapshot } from './agent-run-types'
+import type { AgentWorkerHandle, AgentWorkerResult } from './agent-runner'
 
 let server: Server | null = null
 afterEach(() => { server?.close(); server = null })
+
+const durableRoot = realpathSync(mkdtempSync(join(tmpdir(), 'lodestar-agent-api-')))
+afterAll(() => rmSync(durableRoot, { recursive: true, force: true }))
+
+async function serveDurable(startWorker: AgentServiceDeps['startWorker']) {
+  const storePath = join(durableRoot, `${crypto.randomUUID()}.json`)
+  const requestStore = new AgentRequestStore({ path: storePath })
+  const artifacts = new Map<string, AgentRunSnapshot>()
+  const deps: AgentServiceDeps = {
+    requestStore,
+    getCatalog: () => ({ catalogGeneration: 'test', sourceFailures: [], identities: [{
+      id: 'agent:test', displayName: 'Test', tokenSourceId: 'glm', tokenSourceDisplay: 'GLM',
+      provider: 'claude', model: 'GLM-5.3', modelDisplay: 'GLM', defaultEffort: 'max',
+      supportedEfforts: ['max'], sourceDefault: true, status: 'ready',
+    }] }),
+    startWorker,
+    sendCard: async () => 'message-test', sendTextRaw: async () => true,
+    getChatTailMessageId: async () => null, getElementCount: () => 1,
+    addElementResult: async () => ({ landed: true }), deleteElementChecked: async () => true,
+    convertMessageToCard: async () => 'card-test', recordCardCreated: () => {},
+    replaceElementResult: async () => ({ landed: true }), cancelSummary: () => {},
+    patchSettingsChecked: async () => true, dispose: async () => {},
+    writeArtifact: (path, value) => { artifacts.set(path, structuredClone(value) as AgentRunSnapshot) },
+    writeTextArtifact: () => {}, readTextArtifact: () => '', loadArtifacts: () => [],
+  }
+  let service = new AgentService(deps)
+  const projectContext = { owner: { kind: 'project' as const, name: 'project', chatId: 'chat', workDir: durableRoot } }
+  let principal = service.projectPrincipal(projectContext)
+  const binding = service.getProjectBinding(principal).binding_id
+  server = createServer((req, res) => {
+    void handleAgentRequest(req, res, new URL(req.url!, `http://${req.headers.host}`), {
+      service, authorizeSession: () => null,
+      authorizeProject: (token, project) => token === 'project-secret' && project === 'project' ? principal : null,
+    })
+  })
+  await new Promise<void>(resolve => server!.listen(0, '127.0.0.1', resolve))
+  const address = server.address()
+  if (!address || typeof address === 'string') throw new Error('no address')
+  const base = `http://127.0.0.1:${address.port}`
+  const headers = { authorization: 'Bearer project-secret', 'content-type': 'application/json' }
+  const post = (path: string, body: object) => fetch(`${base}${path}?project=project`, { method: 'POST', headers, body: JSON.stringify(body) })
+  const lookup = (id: string) => fetch(`${base}/agents/requests/${id}?project=project&expected_binding=${binding}`, { headers })
+  const reload = () => {
+    service = new AgentService({ ...deps, requestStore: new AgentRequestStore({ path: storePath }),
+      loadArtifacts: () => [...artifacts.values()].map(snapshot => structuredClone(snapshot)) })
+    principal = service.projectPrincipal(projectContext)
+  }
+  return { get service() { return service }, get principal() { return principal },
+    binding, requestStore, storePath, artifacts, deps, post, lookup, reload }
+}
+
+async function until(check: () => boolean): Promise<void> {
+  for (let i = 0; i < 200; i++) {
+    if (check()) return
+    await new Promise(resolve => setTimeout(resolve, 1))
+  }
+  throw new Error('condition did not become true')
+}
+
+describe('durable Agent HTTP admission', () => {
+  test('request run_id stays durably null while an unrecorded native run is alive', async () => {
+    let starts = 0
+    let alive = true
+    let finish!: (value: AgentWorkerResult) => void
+    const done = new Promise<AgentWorkerResult>(resolve => { finish = resolve })
+    const h = await serveDurable(() => {
+      starts++
+      return { done, pendingInput: () => null, answer() {}, isAlive: () => alive,
+        cancel: async () => { alive = false; finish({ output: 'stopped', outputTruncated: false, sessionId: 'native-unrecorded', durationMs: 1, usage: null }) } }
+    })
+    const markAdmitted = h.requestStore.markAdmitted.bind(h.requestStore)
+    h.requestStore.markAdmitted = () => { throw new Error('admission storage unavailable') }
+    let status = 0
+    let observed: any
+    let nativeStillAlive = false
+    try {
+      const response = await h.post('/agents/runs', { description: 'unrecorded run', prompt: 'work', identity_ids: ['agent:test'],
+        request_id: 'unrecorded-live', expected_binding: h.binding })
+      status = response.status
+      await until(() => starts === 1)
+      observed = await (await h.lookup('unrecorded-live')).json()
+      nativeStillAlive = alive
+    } finally {
+      h.requestStore.markAdmitted = markAdmitted
+      await h.service.cancelRequest(h.principal, 'unrecorded-live', h.binding)
+    }
+    expect(status).toBe(503)
+    expect(observed).toMatchObject({ request_id: 'unrecorded-live', state: 'pending', run_id: null,
+      run: { run_id: expect.any(String), status: 'running' } })
+    expect(nativeStillAlive).toBe(true)
+    expect(starts).toBe(1)
+  })
+
+  test('request run_id identifies admitted terminal work even when its artifact is missing', async () => {
+    let starts = 0
+    const h = await serveDurable(() => {
+      starts++
+      return { done: Promise.resolve({ output: 'done', outputTruncated: false, sessionId: 'native-terminal', durationMs: 1, usage: null }),
+        pendingInput: () => null, answer() {}, cancel: async () => {} }
+    })
+    const response = await h.post('/agents/runs', { description: 'terminal run', prompt: 'work', identity_ids: ['agent:test'],
+      request_id: 'missing-terminal-artifact', expected_binding: h.binding })
+    const run = await response.json() as any
+    expect(response.status).toBe(202)
+    await until(() => h.service.getRequest(h.principal, 'missing-terminal-artifact', h.binding).state === 'resolved')
+    h.artifacts.clear()
+    h.reload()
+    const observed = await (await h.lookup('missing-terminal-artifact')).json() as any
+    expect(observed).toEqual({ request_id: 'missing-terminal-artifact', state: 'resolved', run_id: run.run_id })
+    expect(starts).toBe(1)
+  })
+
+  test('request run_id is explicitly null for a durable pre-admission rejection', async () => {
+    let starts = 0
+    const h = await serveDurable(() => { starts++; throw new Error('invalid identity must not launch') })
+    const response = await h.post('/agents/runs', { description: 'invalid identity', prompt: 'work', identity_ids: ['agent:missing'],
+      request_id: 'known-unadmitted', expected_binding: h.binding })
+    expect(response.status).toBe(409)
+    expect((await response.json() as any).error).toContain('agent identity not found')
+    for (let i = 0; i < 2; i++) {
+      const observed = await (await h.lookup('known-unadmitted')).json()
+      expect(observed).toEqual({ request_id: 'known-unadmitted', state: 'resolved', run_id: null })
+      h.reload()
+    }
+    expect(starts).toBe(0)
+  })
+
+  test('guarded follow-up hashes include source and operation while exact retries survive restart', async () => {
+    let starts = 0
+    const h = await serveDurable(options => ({
+      done: Promise.resolve({ output: 'done', outputTruncated: false, sessionId: options.resumeSessionId ?? `native-${++starts}`, durationMs: 1, usage: null }),
+      pendingInput: () => null, answer() {}, cancel: async () => {},
+    }))
+    const sourceBody = { description: 'source', prompt: 'source', identity_ids: ['agent:test'] }
+    const sourceA = await (await h.post('/agents/runs', sourceBody)).json() as any
+    const sourceB = await (await h.post('/agents/runs', sourceBody)).json() as any
+    await until(() => [sourceA, sourceB].every(source => h.service.getRun(h.principal, source.run_id).status === 'completed'))
+    const body = { description: 'continue source', prompt: 'next', identity_ids: ['agent:test'], request_id: 'source-aware', expected_binding: h.binding }
+    const pathA = `/agents/runs/${sourceA.run_id}/follow-up`
+    const first = await h.post(pathA, body)
+    expect(first.status).toBe(202)
+    const admitted = await first.json() as any
+    await until(() => h.service.getRequest(h.principal, 'source-aware', h.binding).state === 'resolved')
+    const replay = await h.post(pathA, body)
+    expect(replay.status).toBe(202)
+    expect((await replay.json() as any).run_id).toBe(admitted.run_id)
+    const otherSource = await h.post(`/agents/runs/${sourceB.run_id}/follow-up`, body)
+    expect(otherSource.status).toBe(409)
+    expect((await otherSource.json() as any).error).toContain('different input')
+    expect((await h.post('/agents/runs', body)).status).toBe(409)
+    expect((await h.post(pathA, { ...body, prompt: 'different' })).status).toBe(409)
+    h.reload()
+    const recovered = await h.post(pathA, body)
+    expect(recovered.status).toBe(202)
+    expect((await recovered.json() as any).run_id).toBe(admitted.run_id)
+    expect((await h.post(`/agents/runs/${sourceB.run_id}/follow-up`, body)).status).toBe(409)
+    expect(h.artifacts.size).toBe(3)
+  })
+
+  test.each(['run', 'follow-up'] as const)('%s returns 503 after real admission rename failure and reuses its original request', async operation => {
+    let starts = 0
+    let alive = true
+    let finish!: (value: AgentWorkerResult) => void
+    const done = new Promise<AgentWorkerResult>(resolve => { finish = resolve })
+    const handle: AgentWorkerHandle = { done, isAlive: () => alive, pendingInput: () => null, answer() {}, cancel: async () => {} }
+    const h = await serveDurable(() => {
+      starts++
+      if (operation === 'follow-up' && starts === 1) return {
+        ...handle, isAlive: () => false, done: Promise.resolve({ output: 'source', outputTruncated: false, sessionId: 'native-source', durationMs: 1, usage: null }),
+      }
+      return handle
+    })
+    let path = '/agents/runs'
+    if (operation === 'follow-up') {
+      const source = await h.post(path, { description: 'source', prompt: 'source', identity_ids: ['agent:test'] })
+      const body = await source.json() as any
+      await until(() => h.service.getRun(h.principal, body.run_id).status === 'completed')
+      path = `/agents/runs/${body.run_id}/follow-up`
+    }
+    const original = h.requestStore.markAdmitted.bind(h.requestStore)
+    h.requestStore.markAdmitted = (...args) => {
+      h.requestStore.markAdmitted = original
+      const savedPath = `${h.storePath}.saved`
+      renameSync(h.storePath, savedPath)
+      mkdirSync(h.storePath)
+      try { return original(...args) }
+      finally { rmSync(h.storePath, { recursive: true }); renameSync(savedPath, h.storePath) }
+    }
+    const body = { description: 'admission failure', prompt: 'work', request_id: 'uncertain', expected_binding: h.binding,
+      ...(operation === 'run' ? { identity_ids: ['agent:test'] } : {}) }
+    const response = await h.post(path, body)
+    await until(() => starts === (operation === 'run' ? 1 : 2))
+    const observed = await (await h.lookup('uncertain')).json() as any
+    const replay = await h.post(path, body)
+    const replayed = await replay.json() as any
+    const nativeStillAlive = alive
+    alive = false
+    finish({ output: 'done', outputTruncated: false, sessionId: 'native-source', durationMs: 1, usage: null })
+    expect(response.status).toBe(503)
+    expect(nativeStillAlive).toBe(true)
+    expect((await response.json() as any).error).toContain('same request_id')
+    expect(observed.state).not.toBe('resolved')
+    expect(observed.run.status).toBe('running')
+    expect(replay.status).toBe(202)
+    expect(replayed.run_id).toBe(observed.run.run_id)
+    expect(starts).toBe(operation === 'run' ? 1 : 2)
+  })
+})
 
 async function serve(onStart?: (request: any) => void, projectMode = false) {
   const session = { sessionName: 'project', chatId: 'chat', workDir: '/repo', codexAccountId: () => 'default' } as any
@@ -20,7 +235,8 @@ async function serve(onStart?: (request: any) => void, projectMode = false) {
         ...(principal.kind === 'project' ? { owner: principal.context.owner } : {}),
         runId: 'agent_1', sessionName: 'project', chatId: 'chat', workDir: request.workDir ?? '/repo', description: request.description, prompt: request.prompt,
         depth: 0, status: 'running', createdAt: new Date().toISOString(), workers: [{
-          identityId: 'agent:a', status: 'running', sessionId: request.sessionId, output: request.prompt, steps: [],
+          identityId: 'agent:a', status: 'running', sessionId: request.sessionId, output: request.prompt,
+          finalOutput: `  final:${request.prompt}  \n`, steps: [],
         }],
       }
       return current
@@ -31,17 +247,39 @@ async function serve(onStart?: (request: any) => void, projectMode = false) {
     },
     async answer() { return { ...current, status: 'running' } },
     async cancelRun() { current.status = 'cancelled'; return true },
+    getProjectBinding() {
+      return { installation_id: 'installation-test', binding_id: 'binding-test', project: 'project', chat_id: 'chat', work_dir: '/repo' }
+    },
+    assertProjectBinding(_principal: any, expected: string) {
+      if (expected !== 'binding-test') throw new Error('project_binding_changed')
+    },
+    getRequest(_principal: any, requestId: string) {
+      if (requestId === 'missing') throw new Error(`agent request not found: ${requestId}`)
+      return { requestId, state: 'admitted', runId: 'agent_1', run: current }
+    },
+    async cancelRequest(_principal: any, requestId: string) {
+      return { requestId, state: 'cancelled', runId: 'agent_1', run: current }
+    },
+    reconcileRequest(_principal: any, requestId: string, expected: string, input: any) {
+      return { requestId, state: 'resolved', runId: 'agent_1', run: current,
+        resolution: { kind: 'operator_attested', reason: input.reason, at: new Date().toISOString(), binding_id: expected } }
+    },
   }
   server = createServer((req, res) => {
     const url = new URL(req.url ?? '/', `http://${req.headers.host}`)
+    const projectPrincipal = (project: string) => ({ kind: 'project' as const, depth: -1 as const,
+      context: { owner: { kind: 'project' as const, name: project, chatId: 'chat', workDir: '/repo' } } })
     void handleAgentRequest(req, res, url, {
       service: service as any,
       authorizeSession: token => token === 'secret' ? session : null,
       ...(projectMode ? { authorizeProject: (token: string, project: string) => {
         if (token !== 'project-secret') return null
         if (project !== 'project') throw new Error('unknown project')
-        return { kind: 'project' as const, depth: -1 as const,
-          context: { owner: { kind: 'project' as const, name: project, chatId: 'chat', workDir: '/repo' } } }
+        return projectPrincipal(project)
+      }, authorizeOperator: (token: string, project: string) => {
+        if (token !== 'operator-secret') return null
+        if (project !== 'project') throw new Error('unknown project')
+        return projectPrincipal(project)
       } } : {}),
     })
   })
@@ -303,8 +541,12 @@ describe('delegated Agent HTTP API', () => {
       method: 'POST', headers, body: JSON.stringify({ description: '任务说明', identity_ids: ['agent:a'], prompt: 'do it' }),
     })
     expect(created.status).toBe(202)
-    expect((await created.json() as any).run_id).toBe('agent_1')
-    expect((await fetch(`${base}/agents/runs/agent_1`, { headers })).status).toBe(200)
+    const createdBody = await created.json() as any
+    expect(createdBody.run_id).toBe('agent_1')
+    expect(createdBody.workers[0]).toMatchObject({ output: 'do it', final_output: '  final:do it  \n' })
+    const status = await fetch(`${base}/agents/runs/agent_1`, { headers })
+    expect(status.status).toBe(200)
+    expect((await status.json() as any).workers[0].final_output).toBe('  final:do it  \n')
 
     const follow = await fetch(`${base}/agents/runs/agent_1/follow-up`, {
       method: 'POST', headers, body: JSON.stringify({ description: '继续任务', prompt: 'continue' }),
@@ -336,6 +578,57 @@ describe('delegated Agent HTTP API', () => {
     })
     expect(invalid.status).toBe(409)
     expect(requests).toHaveLength(1)
+  })
+
+  test('project binding and request lifecycle routes enforce expected_binding before admission', async () => {
+    const requests: any[] = []
+    const base = await serve(value => requests.push(value), true)
+    const headers = { authorization: 'Bearer project-secret', 'content-type': 'application/json' }
+    const bindingResponse = await fetch(`${base}/agents/project-binding?project=project`, { headers })
+    expect(bindingResponse.status).toBe(200)
+    expect(await bindingResponse.json()).toEqual({
+      installation_id: 'installation-test', binding_id: 'binding-test', project: 'project', chat_id: 'chat', work_dir: '/repo',
+    })
+
+    const rejected = await fetch(`${base}/agents/runs?project=project`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ expected_binding: 'wrong', request_id: 'guarded', description: '绑定校验', identity_ids: ['agent:a'], prompt: 'work' }),
+    })
+    expect(rejected.status).toBe(409)
+    expect((await rejected.json() as any).error).toBe('project_binding_changed')
+    expect(requests).toHaveLength(0)
+
+    const admitted = await fetch(`${base}/agents/runs?project=project`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ expected_binding: 'binding-test', request_id: 'guarded', description: '绑定校验', identity_ids: ['agent:a'], prompt: 'work' }),
+    })
+    expect(admitted.status).toBe(202)
+    expect(requests[0]).not.toHaveProperty('expectedBinding')
+    expect(requests[0]).not.toHaveProperty('expected_binding')
+
+    expect((await fetch(`${base}/agents/requests/guarded?project=project`, { headers })).status).toBe(409)
+    const lookup = await fetch(`${base}/agents/requests/guarded?project=project&expected_binding=binding-test`, { headers })
+    expect(await lookup.json()).toMatchObject({ request_id: 'guarded', state: 'admitted', run: { run_id: 'agent_1' } })
+    const cancelled = await fetch(`${base}/agents/requests/guarded?project=project&expected_binding=binding-test`, { method: 'DELETE', headers })
+    expect(await cancelled.json()).toMatchObject({ request_id: 'guarded', state: 'cancelled' })
+    const missing = await fetch(`${base}/agents/requests/missing?project=project&expected_binding=binding-test`, { headers })
+    expect(missing.status).toBe(404)
+
+    const refused = await fetch(`${base}/agents/requests/guarded/reconcile?project=project`, {
+      method: 'POST', headers,
+      body: JSON.stringify({ expected_binding: 'binding-test', stopped: true, reason: 'operator verified stop' }),
+    })
+    expect(refused.status).toBe(403)
+    const reconciled = await fetch(`${base}/agents/requests/guarded/reconcile?project=project`, {
+      method: 'POST', headers: { ...headers, authorization: 'Bearer operator-secret' },
+      body: JSON.stringify({ expected_binding: 'binding-test', stopped: true, reason: 'operator verified stop' }),
+    })
+    expect(await reconciled.json()).toMatchObject({
+      request_id: 'guarded', state: 'resolved', resolution: { kind: 'operator_attested', binding_id: 'binding-test' },
+    })
+    expect((await fetch(`${base}/agents/project-binding?project=project`, {
+      headers: { authorization: 'Bearer operator-secret' },
+    })).status).toBe(403)
   })
 })
 

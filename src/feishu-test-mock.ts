@@ -30,6 +30,7 @@ import { profileForWorkspace, resolveWorkspaceDir } from './workspace'
 import { mainSessionName, normalizeTempRole, tempProjectName } from './session-name'
 
 export const sentCards: object[] = []
+export const sentCardUuids: Array<string | undefined> = []
 export const chatTailMessages = new Map<string, string>()
 export const sentTexts: string[] = []
 export const sentRawTexts: string[] = []
@@ -92,7 +93,7 @@ export const modelSelections = new Map<string, {
  *  resetFeishuMock() 复位。上游 setXxxHandler 系列与此并存。 */
 export const feishuMockState = {
   chatIdForSession: null as string | null,
-  sendCard: null as null | ((chatId: string, card: object) => Promise<string | null>),
+  sendCard: null as null | ((chatId: string, card: object, onFailure?: (error: unknown) => void, uuid?: string) => Promise<string | null>),
   /** 远端删除替身覆盖:抛错模拟删除失败(如 code=1470404 already deleted)。 */
   deleteTasklistByGuid: null as null | ((guid: string) => Promise<void>),
   /** listSectionTasks 覆盖:测试可让扫描挂起(轮转上限用例)或返回定制任务。 */
@@ -107,7 +108,7 @@ export const preferredChatForSession = new Map<string, string>()
 
 export function resetFeishuMock(): void {
   for (const arr of [
-    sentCards, sentTexts, sentRawTexts, updatedCards, addedReactions, deletedReactions, boundResumes,
+    sentCards, sentCardUuids, sentTexts, sentRawTexts, updatedCards, addedReactions, deletedReactions, boundResumes,
     clearedTurnAnchors, truncatedTurnAnchors, urgentPushes, clearedResumes, clearedTurnAnchorSessions,
     seededTurnAnchors, sentImages, uploadedImages, sentLocalFiles,
   ]) {
@@ -178,9 +179,10 @@ mock.module('./feishu', () => ({
   preferredChatForSession,
   chatNameCache: new Map(),
   getChatTailMessageId: async (chatId: string) => chatTailMessages.get(chatId) ?? null,
-  sendCard: async (chatId: string, card: object) => {
+  sendCard: async (chatId: string, card: object, onFailure?: (error: unknown) => void, uuid?: string) => {
     sentCards.push(card)
-    if (feishuMockState.sendCard) return await feishuMockState.sendCard(chatId, card)
+    sentCardUuids.push(uuid)
+    if (feishuMockState.sendCard) return await feishuMockState.sendCard(chatId, card, onFailure, uuid)
     const id = `om_status_${sentCards.length}`
     chatTailMessages.set(chatId, id)
     return id

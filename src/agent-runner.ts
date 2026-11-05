@@ -17,6 +17,8 @@ const INPUT_TOOLS = new Set(['AskUserQuestion', 'request_user_input'])
 
 export interface AgentWorkerResult {
   output: string
+  /** Last non-empty completed top-level assistant block. */
+  finalOutput?: string
   displayOutput?: string
   outputTruncated: boolean
   sessionId: string
@@ -29,7 +31,7 @@ export interface AgentWorkerResult {
  *  调用方(agent-service)据此把 output 落回 worker.output。 */
 export class AgentWorkerFailure extends Error {
   constructor(cause: Error, readonly output: string, readonly sessionId: string | null, readonly displayOutput?: string,
-    readonly displayError?: string) {
+    readonly displayError?: string, readonly finalOutput?: string) {
     super(cause.message, { cause })
     this.name = 'AgentWorkerFailure'
   }
@@ -117,6 +119,8 @@ export function collectAgentTurn(
   presentationContext?: { description: string; prompt: string },
 ): AgentWorkerHandle {
   const output: string[] = []
+  let currentAssistantBlock = ''
+  let finalOutput: string | undefined
   const displayOutput: string[] = []
   const requiresTranslation = processUsesClaudeTranslation(proc)
   let hasDisplayOutput = requiresTranslation
@@ -154,6 +158,7 @@ export function collectAgentTurn(
   }
   const cleanupListeners = () => {
     proc.off('assistant_text', onText)
+    proc.off('assistant_block_stop', onAssistantBlockStop)
     proc.off('tool_use', onToolUse)
     proc.off('tool_result', onToolResult)
     proc.off('subagent_step', onSubagentStep)
@@ -202,7 +207,8 @@ export function collectAgentTurn(
         rejectDone(new AgentWorkerFailure(failure, output.join('').trim(), proc.sessionId,
           hasDisplayOutput ? displayOutput.join('').trim() : undefined,
           result?.displayError === undefined ? undefined
-            : [result.displayError, ...failures.filter(value => value !== error).map(value => value.message)].join('; ')))
+            : [result.displayError, ...failures.filter(value => value !== error).map(value => value.message)].join('; '),
+          finalOutput))
         return
       }
       const sessionId = proc.sessionId
@@ -210,6 +216,8 @@ export function collectAgentTurn(
         rejectDone(new AgentWorkerFailure(
           new Error('delegated agent completed without a native session id'), output.join('').trim(), null,
           hasDisplayOutput ? displayOutput.join('').trim() : undefined,
+          undefined,
+          finalOutput,
         ))
         return
       }
@@ -217,6 +225,7 @@ export function collectAgentTurn(
       const checkpointId = checkpointIdFrom(result?.checkpoint, proc)
       resolveDone({
         output: text,
+        ...(finalOutput !== undefined ? { finalOutput } : {}),
         // D-14:截断退场。上游把输出体量保护交给卡片连续输出(本仓 03-04/03-05 已
         // 落地换卡与指纹去重),runner 不再按固定上限截断;字段保留但恒为 false,
         // 避免卡片层与既有调用方连锁改动。
@@ -233,12 +242,19 @@ export function collectAgentTurn(
   const onText = (event: { text?: string; displayText?: string; parentToolUseId?: string | null }) => {
     if (settled || event?.parentToolUseId || typeof event?.text !== 'string') return
     output.push(event.text)
+    currentAssistantBlock += event.text
     if (requiresTranslation && typeof event.displayText !== 'string') {
       void finish(new Error('Claude subscription delegated output is missing verified translation'))
       return
     }
     hasDisplayOutput ||= typeof event.displayText === 'string'
     displayOutput.push(event.displayText ?? event.text)
+  }
+  const onAssistantBlockStop = (event: { parentToolUseId?: string | null }) => {
+    if (settled || event?.parentToolUseId) return
+    const completed = currentAssistantBlock
+    currentAssistantBlock = ''
+    if (completed.trim()) finalOutput = completed
   }
   const emitProgress = (step: AgentStep) => {
     if (settled) return
@@ -338,6 +354,7 @@ export function collectAgentTurn(
   }
 
   proc.on('assistant_text', onText)
+  proc.on('assistant_block_stop', onAssistantBlockStop)
   proc.on('tool_use', onToolUse)
   proc.on('tool_result', onToolResult)
   proc.on('subagent_step', onSubagentStep)

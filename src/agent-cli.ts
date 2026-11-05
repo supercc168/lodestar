@@ -3,7 +3,7 @@ import { resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { localFetch } from './network'
 import { requireAgentDescription, PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
-import { readAgentProjectClient } from './agent-project-client'
+import { readAgentOperatorClient, readAgentProjectClient } from './agent-project-client'
 
 interface CliContext {
   baseUrl: string
@@ -34,7 +34,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     process.stdout.write(`${usage()}\n`)
     return
   }
-  const context = cliContext(selected.project)
+  const context = command === 'requests' ? operatorCliContext(selected.project) : cliContext(selected.project)
   switch (command) {
     case 'identities': {
       const data = await requestJson(context, 'GET', '/agents/identities')
@@ -50,6 +50,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       return
     case 'answer':
       await answerCommand(context, argv)
+      return
+    case 'requests':
+      await requestsCommand(context, argv)
       return
     case 'status': {
       const runId = requiredArg(argv[0], 'status requires run_id')
@@ -143,6 +146,39 @@ async function answerCommand(context: CliContext, argv: string[]): Promise<void>
     ...(identityId ? { identity_id: identityId } : {}),
   })
   await waitAndPrintRun(context, String(run.run_id ?? runId))
+}
+
+async function requestsCommand(context: CliContext, argv: string[]): Promise<void> {
+  if (!context.project) throw new Error('requests reconcile requires explicit --project mode')
+  const action = argv.shift() ?? ''
+  if (action !== 'reconcile') throw new Error('requests requires the reconcile subcommand')
+  let requestId = ''
+  let expectedBinding = ''
+  let reason = ''
+  let stopped = false
+  let json = false
+  for (let i = 0; i < argv.length; i++) {
+    const arg = argv[i]
+    const next = () => requiredArg(argv[++i], `${arg} requires a value`)
+    switch (arg) {
+      case '--request': requestId = next(); break
+      case '--expected-binding': expectedBinding = next(); break
+      case '--reason': reason = next(); break
+      case '--stopped': stopped = true; break
+      case '--json': json = true; break
+      default: throw new Error(`unknown requests reconcile option: ${arg}`)
+    }
+  }
+  if (!requestId) throw new Error('requests reconcile requires --request')
+  if (!expectedBinding) throw new Error('requests reconcile requires --expected-binding')
+  if (!stopped) throw new Error('requests reconcile requires --stopped')
+  if (!reason) throw new Error('requests reconcile requires --reason')
+  const result = await requestJson(context, 'POST', `/agents/requests/${encodeURIComponent(requestId)}/reconcile`, {
+    expected_binding: expectedBinding,
+    stopped: true,
+    reason,
+  })
+  process.stdout.write(json ? `${JSON.stringify(result, null, 2)}\n` : `${JSON.stringify(result)}\n`)
 }
 
 export function parsePromptArgs(argv: string[], identitiesRequired: boolean): PromptArgs {
@@ -243,7 +279,7 @@ export function extractProjectOption(argv: string[]): { project?: string; argv: 
   let project: string | undefined
   const remaining: string[] = []
   const paired = new Set(['--identity', '-i', '--effort', '--description', '--workdir', '--session', '--prompt',
-    '--request', '--answer', '--request-id', '--requester'])
+    '--request', '--answer', '--request-id', '--requester', '--expected-binding', '--reason'])
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     if (arg === '--project') {
@@ -259,10 +295,7 @@ export function extractProjectOption(argv: string[]): { project?: string; argv: 
 
 function cliContext(project?: string): CliContext {
   if (project !== undefined) {
-    if (['LODESTAR_AGENT_ROLE', 'LODESTAR_AGENT_URL', 'LODESTAR_AGENT_CAPABILITY', 'LODESTAR_AGENT_SESSION', 'DSH_LODESTAR_AGENT_CONTEXT']
-      .some(key => process.env[key] !== undefined)) {
-      throw new Error('Agent task calls must remain session-bound; --project is only for independent services and applications')
-    }
+    assertIndependentProjectCall()
     return { ...readAgentProjectClient(), project }
   }
   const delegation = process.env.DSH_LODESTAR_AGENT_CONTEXT
@@ -286,6 +319,19 @@ function cliContext(project?: string): CliContext {
     throw new Error('lodestar-agent must run inside a Lodestar-managed Agent session (missing capability)')
   }
   return { baseUrl, capability }
+}
+
+function operatorCliContext(project?: string): CliContext {
+  if (project === undefined) throw new Error('requests reconcile requires explicit --project mode')
+  assertIndependentProjectCall()
+  return { ...readAgentOperatorClient(), project }
+}
+
+function assertIndependentProjectCall(): void {
+  if (['LODESTAR_AGENT_ROLE', 'LODESTAR_AGENT_URL', 'LODESTAR_AGENT_CAPABILITY', 'LODESTAR_AGENT_SESSION', 'DSH_LODESTAR_AGENT_CONTEXT']
+    .some(key => process.env[key] !== undefined)) {
+    throw new Error('Agent task calls must remain session-bound; --project is only for independent services and applications')
+  }
 }
 
 async function requestJson(context: CliContext, method: string, path: string, body?: object): Promise<any> {
@@ -393,6 +439,7 @@ function usage(): string {
     '  lodestar-agent answer <run_id> [--identity <id>] --request <id> (--answer key=value | --stdin)',
     '  lodestar-agent status <run_id> [--json]',
     '  lodestar-agent cancel <run_id>',
+    '  lodestar-agent --project <project> requests reconcile --request <id> --expected-binding <id> --stopped --reason <text> [--json]',
     '',
     "Lodestar Agent does not support Claude subscription calls; comply with Claude's user agreement. Third-party Claude sources remain supported.",
     'Use --prompt <text> instead of --stdin for inline input. --no-wait returns the started run as JSON.',

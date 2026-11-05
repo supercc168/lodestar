@@ -244,19 +244,19 @@ describe('buildNotifyCard', () => {
     expect(findButtonValues(card)).toHaveLength(0)
   })
 
-  test('resolution marker replaces the button row across all 5 states', () => {
+  test('terminal resolution freezes choices while a definite callback rejection keeps buttons retryable', () => {
     const base = {
       title: 'ops', text: 'approve?', level: 'info' as const,
       notifyId: 'nf_abc',
       buttons: [{ id: 'approve', text: '✅ 通过', type: 'primary' as const }],
     }
     const states = [
-      { status: 'processing' as const, want: /⏳/, color: 'blue' },
-      { status: 'delivered' as const, want: /反馈已送达/, color: 'green' },
-      { status: 'failed' as const, want: /回调失败:nope/, color: 'red', detail: 'nope' },
+      { status: 'processing' as const, want: /⏳/, color: 'blue', buttons: 0 },
+      { status: 'delivered' as const, want: /反馈已送达/, color: 'green', buttons: 0 },
+      { status: 'failed' as const, want: /回调失败:nope/, color: 'red', detail: 'nope', buttons: 1 },
       // unknown(ec149d7):外部回调已成功但本地确认状态未知 —— 红色冻结,无按钮。
-      { status: 'unknown' as const, want: /确认状态未知，禁止自动重试/, color: 'red', detail: 'disk gone' },
-      { status: 'done' as const, want: /已选择/, color: 'green' },
+      { status: 'unknown' as const, want: /确认状态未知，禁止自动重试/, color: 'red', detail: 'disk gone', buttons: 0 },
+      { status: 'done' as const, want: /已选择/, color: 'green', buttons: 0 },
     ]
     for (const s of states) {
       const card: any = buildNotifyCard({
@@ -266,8 +266,7 @@ describe('buildNotifyCard', () => {
           operatorOpenId: 'ou_x', ...(s.detail ? { detail: s.detail } : {}),
         },
       })
-      // No interactive buttons in any resolution state.
-      expect(findButtonValues(card)).toHaveLength(0)
+      expect(findButtonValues(card)).toHaveLength(s.buttons)
       const marker: any = cardBody(card).find(
         (e: any) => e.tag === 'markdown' && typeof e.content === 'string' && e.content.includes('已选'),
       )

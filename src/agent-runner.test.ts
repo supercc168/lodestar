@@ -664,13 +664,16 @@ describe('full delegated Agent runner', () => {
   test('a failed task preserves the output produced before the error', async () => {
     const proc = new FakeProcess() as any
     const handle = collectAgentTurn(proc, 'work', {}, () => {})
-    proc.emit('assistant_text', { text: '已完成的调查结果' })
+    proc.emit('assistant_text', { text: '  已完成的调查结果  \n' })
+    proc.emit('assistant_block_stop', { parentToolUseId: null })
+    proc.emit('assistant_text', { text: '未完成的尾段' })
     proc.emit('result', { is_error: true, error: 'upstream request failed' })
     const error = await handle.done.catch(error => error)
     expect(error).toBeInstanceOf(AgentWorkerFailure)
     expect(error.name).toBe('AgentWorkerFailure')
     expect(error.message).toBe('upstream request failed')
-    expect(error.output).toBe('已完成的调查结果')
+    expect(error.output).toBe('已完成的调查结果  \n未完成的尾段')
+    expect(error.finalOutput).toBe('  已完成的调查结果  \n')
     expect(error.sessionId).toBe('sid-1')
   })
 
@@ -678,11 +681,13 @@ describe('full delegated Agent runner', () => {
     const proc = new FakeProcess() as any
     const handle = collectAgentTurn(proc, 'cancel late', {}, () => {})
     proc.emit('assistant_text', { text: '部分结果', parentToolUseId: null })
+    proc.emit('assistant_block_stop', { parentToolUseId: null })
     const cancelling = handle.cancel('stop now')
     const failure = await handle.done.then(() => null, error => error)
     expect(failure).toBeInstanceOf(AgentWorkerFailure)
     expect(failure.message).toBe('stop now')
     expect(failure.output).toBe('部分结果')
+    expect(failure.finalOutput).toBe('部分结果')
     await cancelling
   })
 

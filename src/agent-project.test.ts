@@ -2,7 +2,14 @@ import { describe, expect, test } from 'bun:test'
 import { mkdtempSync, mkdirSync, realpathSync, rmSync, statSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { acceptsProjectCapability, createAgentProjectClient, readAgentProjectClient } from './agent-project-client'
+import {
+  acceptsOperatorCapability,
+  acceptsProjectCapability,
+  createAgentOperatorClient,
+  createAgentProjectClient,
+  readAgentOperatorClient,
+  readAgentProjectClient,
+} from './agent-project-client'
 import { resolveAgentProject } from './agent-project'
 
 // Each local service credential is private and replaced on daemon startup.
@@ -24,6 +31,23 @@ describe('project Agent client', () => {
       }
       writeFileSync(path, 'not json')
       expect(() => readAgentProjectClient(path)).toThrow()
+    } finally { rmSync(dir, { recursive: true, force: true }) }
+  })
+
+  test('keeps the operator capability in a separate private client file', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-operator-client-'))
+    const projectPath = join(dir, 'project.json')
+    const operatorPath = join(dir, 'operator.json')
+    try {
+      const project = createAgentProjectClient('http://127.0.0.1:9876', projectPath)
+      const operator = createAgentOperatorClient('http://127.0.0.1:9876', operatorPath)
+      expect(readAgentProjectClient(projectPath)).toEqual(project)
+      expect(readAgentOperatorClient(operatorPath)).toEqual(operator)
+      expect(Object.keys(readAgentProjectClient(projectPath)).sort()).toEqual(['baseUrl', 'capability'])
+      expect(acceptsProjectCapability(project, operator.capability)).toBe(false)
+      expect(acceptsOperatorCapability(operator, project.capability)).toBe(false)
+      expect(acceptsOperatorCapability(operator, operator.capability)).toBe(true)
+      if (process.platform !== 'win32') expect(statSync(operatorPath).mode & 0o777).toBe(0o600)
     } finally { rmSync(dir, { recursive: true, force: true }) }
   })
 

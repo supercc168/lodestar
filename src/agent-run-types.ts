@@ -81,10 +81,14 @@ export interface AgentWorkerResult {
   effort: string
   status: AgentWorkerStatus
   output: string
+  /** Last non-empty completed top-level assistant block. */
+  finalOutput?: string
   /** Verified presentation text; native output remains unchanged for callers. */
   displayOutput?: string
   /** Durable output is stored separately so lifecycle snapshots stay small. */
   outputArtifact?: string
+  /** Durable final output is independent from cumulative output. */
+  finalOutputArtifact?: string
   displayDescription?: string
   displayPrompt?: string
   outputTruncated?: boolean

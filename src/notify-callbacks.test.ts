@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, setSystemTime, spyOn, test } from 'bun:test'
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
+import { createHash } from 'node:crypto'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -24,6 +25,7 @@ import {
   register,
   setDispatching,
   setReplyState,
+  validateNotifyInteraction,
   type NotifyRegistration,
 } from './notify-callbacks'
 
@@ -333,6 +335,121 @@ describe('buildNotifyResult (pull payload)', () => {
   })
 })
 
+describe('versioned notify ownership', () => {
+  function hash(value: unknown): string {
+    const stable = (entry: unknown): string => {
+      if (Array.isArray(entry)) return `[${entry.map(stable).join(',')}]`
+      if (entry && typeof entry === 'object') {
+        return `{${Object.entries(entry as Record<string, unknown>)
+          .filter(([, child]) => child !== undefined)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([key, child]) => `${JSON.stringify(key)}:${stable(child)}`)
+          .join(',')}}`
+      }
+      return JSON.stringify(entry)
+    }
+    return createHash('sha256').update(stable(value)).digest('hex')
+  }
+
+  function versionedReg(overrides: Partial<NotifyRegistration> = {}): NotifyRegistration {
+    return sampleReg({
+      notifyId: 'nf_versioned',
+      requestId: 'hub:instance:card',
+      requestHash: 'request-hash',
+      feishuUuid: 'stable-uuid',
+      transportState: 'applied',
+      desiredVersion: 3,
+      appliedVersion: 3,
+      desiredHash: 'desired-hash',
+      appliedHash: 'desired-hash',
+      desiredBody: {
+        project: 'feishu', title: 'ops', text: 'approve?', level: 'info', images: [],
+        buttons: [{ id: 'approve', text: '✅ 通过', type: 'primary' }],
+        allowReply: false, callbackUrl: 'http://127.0.0.1:9999/hook',
+      },
+      ...overrides,
+    })
+  }
+
+  test('only the applied version and original operator/chat/message binding may answer', () => {
+    const reg = versionedReg()
+    const valid = {
+      version: 3, chatId: 'oc_chat', messageId: 'om_msg', project: 'feishu', openId: 'ou_operator',
+    }
+    expect(validateNotifyInteraction(reg, valid)).toBeNull()
+    expect(validateNotifyInteraction(reg, { ...valid, version: 2 })).toContain('版本')
+    expect(validateNotifyInteraction(reg, { ...valid, chatId: 'oc_forged' })).toContain('当前群')
+    expect(validateNotifyInteraction(reg, { ...valid, messageId: 'om_forged' })).toContain('消息')
+    expect(validateNotifyInteraction(reg, { ...valid, project: 'forged' })).toContain('项目')
+    expect(validateNotifyInteraction(reg, { ...valid, openId: '' })).toContain('操作人')
+    reg.transportState = 'pending'
+    reg.desiredVersion = 4
+    expect(validateNotifyInteraction(reg, valid)).toContain('版本')
+  })
+
+  test('legacy forwarded cards continue routing by stored notify_id while anonymous operators stay rejected', () => {
+    const legacy = sampleReg()
+    expect(validateNotifyInteraction(legacy, {
+      chatId: 'oc_forwarded', messageId: 'om_forwarded', openId: 'ou_operator',
+    })).toBeNull()
+    expect(validateNotifyInteraction(legacy, {
+      chatId: 'oc_forwarded', messageId: 'om_forwarded', openId: '',
+    })).toContain('操作人')
+  })
+
+  test('request identities and unknown tombstones survive ordinary seven-day pruning', () => {
+    const now = Date.now()
+    register(versionedReg({ createdAt: now - 30 * 24 * 60 * 60 * 1000 }))
+    expect(prune(now)).toBe(0)
+    expect(get('nf_versioned')).toBeDefined()
+    const result = buildNotifyResult(get('nf_versioned')!) as any
+    expect(result).toMatchObject({
+      request_id: 'hub:instance:card', transport_state: 'applied', version: 3, applied_version: 3,
+    })
+  })
+
+  test('a partially-written versioned record fails closed instead of being dropped', () => {
+    const corrupt = versionedReg() as any
+    delete corrupt.feishuUuid
+    const original = JSON.stringify({ [corrupt.notifyId]: corrupt })
+    writeFileSync(tempFile, original)
+    __setStoreFileForTest(tempFile)
+    expect(() => loadCallbacks()).toThrow(/lifecycle invalid/)
+    expect(readFileSync(tempFile, 'utf8')).toBe(original)
+    expect(get(corrupt.notifyId)).toBeUndefined()
+  })
+
+  test('tampered durable hashes and top-level buttons fail closed without rewriting the store', () => {
+    const desired = {
+      project: 'feishu', title: 'ops', text: 'approve?', level: 'info' as const, images: [],
+      buttons: [{ id: 'approve', text: '✅ 通过', type: 'primary' as const }],
+      allowReply: false, callbackUrl: 'http://127.0.0.1:9999/hook',
+    }
+    const valid = {
+      ...versionedReg({
+        requestHash: hash({ version: 3, desired }),
+        desiredHash: hash(desired),
+        appliedHash: hash(desired),
+      }),
+      requestVersion: 3,
+      requestBody: desired,
+      appliedBody: desired,
+    }
+    for (const tamper of [
+      (record: any) => { record.desiredBody = { ...record.desiredBody, text: 'tampered' } },
+      (record: any) => { record.buttons = [{ id: 'reject', text: '❌ 拒绝', type: 'danger' }] },
+    ]) {
+      const record = structuredClone(valid)
+      tamper(record)
+      const raw = JSON.stringify({ [record.notifyId]: record })
+      writeFileSync(tempFile, raw)
+      __setStoreFileForTest(tempFile)
+      expect(() => loadCallbacks()).toThrow()
+      expect(readFileSync(tempFile, 'utf8')).toBe(raw)
+    }
+  })
+})
+
 describe('dispatchCallback', () => {
   const originalFetch = globalThis.fetch
 
@@ -389,6 +506,11 @@ describe('dispatchCallback', () => {
     expect(captured.button).toEqual({ id: 'reject', text: '❌', type: 'danger' })
     expect(captured.operator).toEqual({ open_id: 'ou_op' })
     expect(typeof captured.timestamp).toBe('number')
+
+    await dispatchCallback(sampleReg({ requestId: 'hub:card', appliedVersion: 7 }), {
+      id: 'approve', text: '✅', type: 'primary',
+    }, 'ou_op')
+    expect(captured.version).toBe(7)
   })
 
   test('text reply payload preserves user text and both message references without inventing a button', async () => {

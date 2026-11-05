@@ -1,6 +1,6 @@
 import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Session } from './session'
-import type { AgentService, AgentPrincipal } from './agent-service'
+import { AgentRequestUncertainError, type AgentService, type AgentPrincipal, type AgentRequestSnapshot } from './agent-service'
 import { agentPrincipalContext } from './agent-context'
 import { getAgentIdentityCatalog, type AgentIdentityCatalog } from './agent-identities'
 import {
@@ -20,6 +20,7 @@ export interface AgentApiContext {
   service: AgentService
   authorizeSession(capability: string): Session | null
   authorizeProject?(capability: string, project: string): AgentPrincipal | null
+  authorizeOperator?(capability: string, project: string): AgentPrincipal | null
 }
 
 export async function handleAgentRequest(
@@ -41,8 +42,13 @@ export async function handleAgentRequest(
   try {
     const projects = url.searchParams.getAll('project')
     if (projects.length > 1 || (projects.length && !projects[0].trim())) return send(400, { error: 'invalid project selector' })
+    const operatorReconcile = req.method === 'POST'
+      && /^\/agents\/requests\/[^/]+\/reconcile$/.test(url.pathname)
+    if (operatorReconcile && projects.length !== 1) return send(403, { error: 'operator reconciliation requires explicit project scope' })
     principal = projects.length
-      ? context.authorizeProject?.(capability, projects[0]) ?? null
+      ? operatorReconcile
+        ? context.authorizeOperator?.(capability, projects[0]) ?? null
+        : context.authorizeProject?.(capability, projects[0]) ?? null
       : authorizePrincipal(context, capability)
   } catch (error) { return send(409, { error: messageOf(error) }) }
   if (!principal) return send(403, { error: 'invalid or stale agent capability' })
@@ -82,13 +88,50 @@ export async function handleAgentRequest(
   if (req.method === 'GET' && url.pathname === '/agents/identities') {
     return send(200, serializeCatalog(getAgentIdentityCatalog(agentPrincipalContext(principal).codexAccountId)))
   }
+  if (req.method === 'GET' && url.pathname === '/agents/project-binding') {
+    try {
+      return send(200, context.service.getProjectBinding(principal))
+    } catch (error) { return send(409, { error: messageOf(error) }) }
+  }
   if (req.method === 'POST' && url.pathname === '/agents/runs') {
     try {
-      const run = await context.service.startRun(principal, parseAgentRunRequest(await readJsonBody(req)))
+      const body = await readJsonBody(req)
+      const expectedBinding = optionalExpectedBinding(body)
+      if (expectedBinding) context.service.assertProjectBinding(principal, expectedBinding)
+      const run = await context.service.startRun(principal, parseAgentRunRequest(body), expectedBinding
+        ? { expectedBinding, requestBody: body }
+        : undefined)
       return send(202, serializeRun(run))
     } catch (error) {
-      return send(409, { error: messageOf(error) })
+      return send(error instanceof AgentRequestUncertainError ? 503 : 409, { error: messageOf(error) })
     }
+  }
+  const requestMatch = url.pathname.match(/^\/agents\/requests\/([^/]+)(?:\/(reconcile))?$/)
+  if (requestMatch) {
+    const requestId = decodeRunId(requestMatch[1])
+    if (!requestId) return send(400, { error: 'invalid agent request id encoding' })
+    try {
+      if (!requestMatch[2] && req.method === 'GET') {
+        const expectedBinding = requiredExpectedBindingQuery(url)
+        return send(200, serializeRequest(context.service.getRequest(principal, requestId, expectedBinding)))
+      }
+      if (!requestMatch[2] && req.method === 'DELETE') {
+        const expectedBinding = requiredExpectedBindingQuery(url)
+        return send(200, serializeRequest(await context.service.cancelRequest(principal, requestId, expectedBinding)))
+      }
+      if (requestMatch[2] === 'reconcile' && req.method === 'POST') {
+        const body = reconcileBody(await readJsonBody(req))
+        context.service.assertProjectBinding(principal, body.expectedBinding)
+        return send(200, serializeRequest(context.service.reconcileRequest(principal, requestId, body.expectedBinding, {
+          stopped: true,
+          reason: body.reason,
+        })))
+      }
+    } catch (error) {
+      const message = messageOf(error)
+      return send(message.startsWith('agent request not found:') ? 404 : 409, { error: message })
+    }
+    return send(405, { error: 'unsupported agent request endpoint' })
   }
   const match = url.pathname.match(/^\/agents\/runs\/([^/]+)(?:\/(follow-up|answer))?$/)
   if (!match) return send(405, { error: 'unsupported agent endpoint' })
@@ -106,7 +149,12 @@ export async function handleAgentRequest(
         : { error: 'agent run is already terminal', run_id: runId })
     }
     if (action === 'follow-up' && req.method === 'POST') {
-      const run = await context.service.followUp(principal, runId, parseAgentFollowUpRequest(await readJsonBody(req)))
+      const body = await readJsonBody(req)
+      const expectedBinding = optionalExpectedBinding(body)
+      if (expectedBinding) context.service.assertProjectBinding(principal, expectedBinding)
+      const run = await context.service.followUp(principal, runId, parseAgentFollowUpRequest(body), expectedBinding
+        ? { expectedBinding, requestBody: body }
+        : undefined)
       return send(202, serializeRun(run))
     }
     if (action === 'answer' && req.method === 'POST') {
@@ -115,7 +163,7 @@ export async function handleAgentRequest(
       return send(200, serializeRun(run))
     }
   } catch (error) {
-    return send(409, { error: messageOf(error) })
+    return send(error instanceof AgentRequestUncertainError ? 503 : 409, { error: messageOf(error) })
   }
   return send(405, { error: 'unsupported agent endpoint' })
 }
@@ -192,6 +240,44 @@ export function serializeAgentRun(run: AgentRunSnapshot): object {
   return serializeRun(run)
 }
 
+function serializeRequest(request: AgentRequestSnapshot): object {
+  return {
+    request_id: request.requestId,
+    state: request.state,
+    run_id: request.runId,
+    ...(request.run ? { run: serializeRun(request.run) } : {}),
+    ...(request.resolution ? { resolution: request.resolution } : {}),
+  }
+}
+
+function optionalExpectedBinding(raw: unknown): string | undefined {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return undefined
+  const value = (raw as Record<string, unknown>).expected_binding
+  if (value === undefined) return undefined
+  if (typeof value !== 'string' || !value.trim() || /[\x00-\x1f]/.test(value)) throw new Error('invalid expected_binding')
+  return value.trim()
+}
+
+function requiredExpectedBindingQuery(url: URL): string {
+  const values = url.searchParams.getAll('expected_binding')
+  if (values.length !== 1 || !values[0]!.trim() || /[\x00-\x1f]/.test(values[0]!)) {
+    throw new Error('expected_binding is required exactly once')
+  }
+  return values[0]!.trim()
+}
+
+function reconcileBody(raw: unknown): { expectedBinding: string; reason: string } {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new Error('request reconciliation body must be an object')
+  const value = raw as Record<string, unknown>
+  const allowed = new Set(['expected_binding', 'stopped', 'reason'])
+  if (Object.keys(value).some(key => !allowed.has(key))) throw new Error('request reconciliation contains unknown fields')
+  const expectedBinding = optionalExpectedBinding(value)
+  if (!expectedBinding) throw new Error('request reconciliation requires expected_binding')
+  if (value.stopped !== true) throw new Error('request reconciliation requires stopped=true')
+  if (typeof value.reason !== 'string' || !value.reason.trim()) throw new Error('request reconciliation requires reason')
+  return { expectedBinding, reason: value.reason }
+}
+
 function serializeRun(run: AgentRunSnapshot): object {
   return {
     run_id: run.runId,
@@ -215,6 +301,7 @@ function serializeRun(run: AgentRunSnapshot): object {
       effort: worker.effort,
       status: worker.status,
       output: worker.output,
+      ...(worker.finalOutput !== undefined ? { final_output: worker.finalOutput } : {}),
       output_truncated: worker.outputTruncated,
       session_id: worker.sessionId,
       checkpoint_id: worker.checkpointId,

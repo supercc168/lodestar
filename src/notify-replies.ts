@@ -36,10 +36,17 @@ export function createNotifyReplyRuntime(deps: {
   logError(event: string, error: unknown): void
 }) {
   const detailOf = (error: unknown) => error instanceof Error ? error.message : String(error)
-  const unavailable = (reg: NotifyRegistration | undefined, chatId: string, openId: string): string | null => {
+  const unavailable = (
+    reg: NotifyRegistration | undefined,
+    chatId: string,
+    openId: string,
+    version?: number,
+  ): string | null => {
     if (!reg) return '通知已过期或已移除'
     if (!openId) return '无法识别回复人，操作未执行'
     if (chatId && chatId !== reg.chatId) return '通知不属于当前群，操作未执行'
+    if (reg.requestId && (version !== reg.appliedVersion || reg.appliedVersion !== reg.desiredVersion
+      || reg.transportState !== 'applied')) return '通知版本已过期或尚未送达，操作未执行'
     if (!reg.allowReply) return '此通知未开启文字回复'
     if (reg.unknownAt) return `回复送达状态未知，禁止自动重试：${reg.unknownReason}`
     if (reg.resolvedAt) return '此通知已处理'
@@ -83,9 +90,9 @@ export function createNotifyReplyRuntime(deps: {
       await update(reg, reg.messageId, buildNotifyCardFromReg(reg, resolution), '回复送达状态未知')
     },
 
-    async open(notifyId: string, chatId: string, openId: string): Promise<ReplyActionResult> {
+    async open(notifyId: string, chatId: string, openId: string, version?: number): Promise<ReplyActionResult> {
       const reg = get(notifyId)
-      const error = unavailable(reg, chatId, openId)
+      const error = unavailable(reg, chatId, openId, version)
       if (error || !reg) return { ok: false, message: error! }
       if (reg.replyState?.status === 'waiting' || reg.replyState?.status === 'sending') {
         return { ok: false, message: '此通知正在等待回复，请先在群里输入或由回复人取消' }
@@ -113,6 +120,7 @@ export function createNotifyReplyRuntime(deps: {
         }
         const state: NotifyReplyState = {
           id: randomUUID(), openId, promptMessageId: '', openedAt: Date.now(), status: 'waiting',
+          ...(reg.requestId ? { version: reg.appliedVersion } : {}),
         }
         const messageId = await deps.sendCard(reg.chatId, buildNotifyReplyCard(reg, state))
         if (!messageId) return { ok: false, message: '等待输入卡片发送失败，未开始接收回复，请重新点击「回复」' }
@@ -130,15 +138,22 @@ export function createNotifyReplyRuntime(deps: {
       }
     },
 
-    async cancel(notifyId: string, replyId: string, chatId: string, openId: string): Promise<ReplyActionResult> {
+    async cancel(
+      notifyId: string,
+      replyId: string,
+      chatId: string,
+      openId: string,
+      version?: number,
+    ): Promise<ReplyActionResult> {
       const reg = get(notifyId)
-      const error = unavailable(reg, chatId, openId)
+      const error = unavailable(reg, chatId, openId, version)
       if (error || !reg) return { ok: false, message: error! }
       const state = reg.replyState
       if (!state || state.id !== replyId || state.status !== 'waiting') {
         return { ok: false, message: '此回复已结束或正在发送，无法取消' }
       }
       if (state.openId !== openId) return { ok: false, message: '仅点击「回复」的人可以取消' }
+      if (reg.requestId && state.version !== version) return { ok: false, message: '回复版本已过期，无法取消' }
       const cancelled = { ...state, status: 'cancelled' as const }
       setReplyState(notifyId, cancelled)
       deps.onWaitingChanged(reg.chatId)
@@ -159,6 +174,8 @@ export function createNotifyReplyRuntime(deps: {
       if (!reg?.replyState) return false
       const state = reg.replyState
       if (createTime > 0 && createTime < state.openedAt) return false
+      if (reg.requestId && (state.version !== reg.appliedVersion
+        || reg.appliedVersion !== reg.desiredVersion || reg.transportState !== 'applied')) return false
       // The user's latest reply-button selection owns this input even when
       // Feishu attaches an older quoted message or a later Agent question.
       if (state.status !== 'waiting' || isDispatching(reg.notifyId)) {

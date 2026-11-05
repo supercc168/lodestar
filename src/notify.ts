@@ -21,6 +21,8 @@
  *         {"id":"gmgn","text":"GMGN","url":"https://gmgn.ai/..."}  // open_url
  *       ],
  *       "callback": "http://127.0.0.1:9999/hook"  // optional loopback URL (push; callback buttons only)
+ *       "request_id": "hub:instance:card",         // optional durable idempotency key
+ *       "version": 1                                // optional with request_id; default 1
  *     }
  *   For a text-reply card, omit buttons and set "allow_reply": true.
  *   For a plain notification, omit both. All three types support text/images.
@@ -28,6 +30,11 @@
  *   → 400 bad/empty json or missing/invalid field
  *   → 404 project not bound to any Feishu group
  *   → 502 feishu sendCard failed (network / API rejection)
+ *
+ *   PUT /notify/<notify_id>
+ *     body={project,version,...complete supported card fields}
+ *     → patches the original message; never sends a replacement
+ *     → 200 applied/current, 202 durable unknown, 409 identity/version conflict
  *
  *   GET /notify/result/<notify_id>
  *     → 200 {notify_id,project,message_id,resolved,button?,resolved_at?,resolved_by?}
@@ -60,9 +67,17 @@ import { FeishuRequestError } from './feishu-retry'
 import { downgradeExternalImagesForCardKit, sanitizeMarkdownForCardKit } from './cards/elements'
 import {
   buildNotifyResult,
+  canonicalNotifyHash,
+  canonicalNotifyRequestHash,
   get as getCallback,
+  getByRequestId,
+  isDispatching,
+  mutateRegistration,
+  NOTIFY_CREATE_RETRY_WINDOW_MS,
   register as registerCallback,
+  withNotifyLock,
   type NotifyButton,
+  type NotifyDesiredBody,
   type NotifyRegistration,
   type NotifyReplyState,
 } from './notify-callbacks'
@@ -81,6 +96,10 @@ const BUTTON_ID_RE = /^[A-Za-z0-9_-]{1,64}$/
 const BUTTON_TEXT_MAX = 64
 const MIXED_INTERACTION_ERROR = '"buttons" and "allow_reply":true are mutually exclusive; choose button selection or text reply'
 const MAX_BODY_BYTES = 4 * 1024 * 1024
+const REQUEST_ID_MAX = 200
+const VERSIONED_FIELDS = new Set([
+  'request_id', 'version', 'project', 'text', 'title', 'level', 'images', 'buttons', 'allow_reply', 'callback',
+])
 
 export interface ParsedButton {
   id: string
@@ -100,6 +119,8 @@ interface NotifyActionValue {
   kind: 'notify_callback'
   notify_id: string
   button_id: string
+  version?: number
+  project?: string
 }
 
 /** Post-click card state. The card transitions through these as a click
@@ -142,6 +163,9 @@ export function buildNotifyCard(opts: {
   /** Text-reply mode. Mutually exclusive with nonempty buttons. */
   allowReply?: boolean
   notifyId?: string
+  project?: string
+  /** Durable transport view. Included in callback values for new-mode cards. */
+  version?: number
   /** Post-click status marker — replaces the button row. See
    * {@link NotifyResolutionStatus} for the transitions. */
   resolution?: NotifyResolution
@@ -207,7 +231,7 @@ export function buildNotifyCard(opts: {
   // 明确回调失败是唯一可重试的终态(上游 ae411a6):回复按钮据此保留,
   // 其余终态(processing/delivered/done/unknown)不再可答。
   const canAnswer = interactive && (!opts.resolution || opts.resolution.status === 'failed')
-  if (!opts.resolution && hasButtons) {
+  if ((!opts.resolution || opts.resolution.status === 'failed') && hasButtons) {
     // One full-width column whose elements stack vertically ⇒ each
     // button gets its own row. open_url buttons always render; callback
     // buttons require notifyId (otherwise they'd ship a dead value —
@@ -238,6 +262,8 @@ export function buildNotifyCard(opts: {
             kind: 'notify_callback',
             notify_id: opts.notifyId,
             button_id: btn.id,
+            ...(opts.version !== undefined ? { version: opts.version } : {}),
+            ...(opts.project !== undefined ? { project: opts.project } : {}),
           } as NotifyActionValue,
         }],
       }]
@@ -263,7 +289,11 @@ export function buildNotifyCard(opts: {
       tag: 'column', width: 'weighted', weight: 1,
       elements: [{
         tag: 'button', text: { tag: 'plain_text', content: '回复' }, type: 'primary',
-        behaviors: [{ type: 'callback', value: { kind: 'notify_reply', notify_id: opts.notifyId } }],
+        behaviors: [{ type: 'callback', value: {
+          kind: 'notify_reply', notify_id: opts.notifyId,
+          ...(opts.version !== undefined ? { version: opts.version } : {}),
+          ...(opts.project !== undefined ? { project: opts.project } : {}),
+        } }],
       }],
     }] })
   }
@@ -300,7 +330,11 @@ export function buildNotifyReplyCard(
   if (status === 'waiting') {
     elements.push({ tag: 'markdown', content: `<at id=${state.openId}></at> 请在群里发送一条文字消息作为回复。\n你的下一条文字优先用于这条通知，完成后再回答 Agent 的提问。点击其他通知的「回复」会放弃本次回复；群控制命令仍然优先。` })
     elements.push({ tag: 'button', text: { tag: 'plain_text', content: '取消回复' }, type: 'default',
-      behaviors: [{ type: 'callback', value: { kind: 'notify_reply_cancel', notify_id: reg.notifyId, reply_id: state.id } }],
+      behaviors: [{ type: 'callback', value: {
+        kind: 'notify_reply_cancel', notify_id: reg.notifyId, reply_id: state.id,
+        ...(state.version !== undefined ? { version: state.version } : {}),
+        ...(reg.requestId ? { project: reg.project } : {}),
+      } }],
     })
   }
   if (status === 'cancelled' && state.cancelReason === 'switched') {
@@ -449,10 +483,133 @@ export function startNotifyServer(opts: NotifyOptions): Server | undefined {
   }
 }
 
+type NotifyTransport = Pick<typeof feishu,
+  'sanitizeSessionName' | 'chatIdForSession' | 'uploadImageKey' | 'sendCard'>
+  & Partial<Pick<typeof feishu, 'updateCard'>>
+
+function parseVersion(value: unknown): number | null {
+  return typeof value === 'number' && Number.isSafeInteger(value) && value >= 1 ? value : null
+}
+
+function failureCode(error: unknown): string | number | undefined {
+  const value = error as any
+  return value?.code ?? value?.response?.data?.code ?? value?.cause?.code
+}
+
+function normalizedVersionedBody(body: any): { desired?: NotifyDesiredBody; error?: string } {
+  const project = typeof body.project === 'string' ? body.project.trim() : ''
+  const text = typeof body.text === 'string' ? body.text : ''
+  const titleRaw = typeof body.title === 'string' ? body.title.trim() : ''
+  if (body.title !== undefined && typeof body.title !== 'string') return { error: '"title" must be a string' }
+  if (body.level !== undefined && typeof body.level !== 'string') return { error: '"level" must be a string' }
+  if (body.callback !== undefined && typeof body.callback !== 'string') return { error: '"callback" must be a string' }
+  const levelRaw = (body.level ?? 'info').toLowerCase()
+  if (!project) return { error: 'missing "project"' }
+  if (!text) return { error: 'missing "text"' }
+  if (body.allow_reply !== undefined && typeof body.allow_reply !== 'boolean') {
+    return { error: '"allow_reply" must be a boolean' }
+  }
+  if (body.images !== undefined && !Array.isArray(body.images)) return { error: '"images" must be an array' }
+  if (Array.isArray(body.images) && body.images.some((entry: unknown) => typeof entry !== 'string')) {
+    return { error: 'each image must be a string path' }
+  }
+  const { buttons, error: buttonsError } = parseButtons(body.buttons)
+  if (buttonsError) return { error: buttonsError }
+  const { url: callbackUrl, error: callbackError } = parseCallbackUrl(body.callback)
+  if (callbackError) return { error: callbackError }
+  const allowReply = body.allow_reply === true
+  if (allowReply && buttons?.length) return { error: MIXED_INTERACTION_ERROR }
+  const images = (body.images ?? []).map((entry: unknown) => String(entry ?? '').trim()).filter(Boolean)
+  return {
+    desired: {
+      project,
+      title: titleRaw || project,
+      text,
+      level: (VALID_LEVELS.has(levelRaw as Level) ? levelRaw : 'info') as Level,
+      images,
+      buttons: buttons ?? [],
+      allowReply,
+      callbackUrl: callbackUrl ?? '',
+    },
+  }
+}
+
+async function uploadNotifyImages(
+  desired: NotifyDesiredBody,
+  transport: NotifyTransport,
+): Promise<Array<{ key: string; src: string; error?: string }>> {
+  const images: Array<{ key: string; src: string; error?: string }> = []
+  for (const src of desired.images) {
+    let failure: unknown
+    const key = await transport.uploadImageKey(src, error => { failure = error })
+    images.push({ key: key ?? '', src, ...(failure === undefined ? {} : { error: formatFeishuError(failure) }) })
+  }
+  return images
+}
+
+function transportResult(reg: NotifyRegistration, ok = reg.transportState === 'applied'): object {
+  return {
+    ok,
+    chat_id: reg.chatId,
+    ...(reg.messageId ? { message_id: reg.messageId } : {}),
+    notify_id: reg.notifyId,
+    request_id: reg.requestId,
+    transport_state: reg.transportState,
+    version: reg.desiredVersion,
+    applied_version: reg.appliedVersion,
+    ...(reg.transportDetail ? { detail: reg.transportDetail } : {}),
+  }
+}
+
+function setTransportUnknown(reg: NotifyRegistration, detail: string): void {
+  try {
+    mutateRegistration(reg.notifyId, current => {
+      current.transportState = 'unknown'
+      current.transportDetail = detail
+      current.unknownAt = Date.now()
+      current.unknownReason = detail
+      delete current.unknownBy
+      current.updatedAt = Date.now()
+    })
+  } catch {
+    // The successful/possibly-successful Feishu side effect already happened.
+    // Retain the in-memory freeze even when the state file is unavailable.
+    reg.transportState = 'unknown'
+    reg.transportDetail = detail
+    reg.unknownAt = Date.now()
+    reg.unknownReason = detail
+    delete reg.unknownBy
+    reg.updatedAt = Date.now()
+  }
+}
+
+function applyDesiredToRegistration(
+  reg: NotifyRegistration,
+  desired: NotifyDesiredBody,
+  desiredHash: string,
+  version: number,
+  imageKeys?: Array<{ key: string; src: string; error?: string }>,
+): void {
+  reg.project = desired.project
+  reg.title = desired.title
+  reg.text = desired.text
+  reg.level = desired.level
+  reg.callbackUrl = desired.callbackUrl
+  reg.buttons = desired.buttons
+  reg.allowReply = desired.allowReply
+  reg.imageKeys = imageKeys ?? desired.images.map(src => ({ key: '', src, error: 'upload pending' }))
+  reg.desiredBody = desired
+  reg.desiredHash = desiredHash
+  reg.desiredVersion = version
+  reg.transportState = 'pending'
+  delete reg.transportDetail
+  reg.updatedAt = Date.now()
+}
+
 export async function handleNotifyRequest(
   req: IncomingMessage,
   res: ServerResponse,
-  transport: Pick<typeof feishu, 'sanitizeSessionName' | 'chatIdForSession' | 'uploadImageKey' | 'sendCard'> = feishu,
+  transport: NotifyTransport = feishu,
 ): Promise<void> {
   const url = new URL(req.url ?? '/', 'http://localhost')
 
@@ -470,7 +627,8 @@ export async function handleNotifyRequest(
   if (req.method === 'GET' && url.pathname === '/') {
     return sendText(200,
       'lodestar notify\n' +
-      'POST /notify        body={project,text,title?,level?,images?,buttons?,allow_reply?,callback?}  → push card to the project\'s bound conversation ID (chat_id)\n' +
+      'POST /notify        body={project,text,title?,level?,images?,buttons?,allow_reply?,callback?,request_id?,version?}  → push card to the project\'s bound conversation ID (chat_id)\n' +
+      'PUT  /notify/<notify_id>  body={project,version,...complete card fields}  → update the original versioned message in place\n' +
       'GET  /notify/result/<notify_id>  → poll a button choice or text reply (pull mode, no callback server)\n' +
       'GET  /agents/identities; POST/GET/DELETE /agents/runs[/<id>]  → capability-protected delegated Agents\n' +
       'POST /agents/relays/test|configure|reload  → capability-protected relay validation and hot reload\n' +
@@ -490,9 +648,10 @@ export async function handleNotifyRequest(
     if (!reg) return sendJson(404, { error: 'unknown notify_id', notify_id: id })
     return sendJson(200, buildNotifyResult(reg))
   }
-  if (req.method !== 'POST' || url.pathname !== '/notify') {
-    return sendText(405, 'use POST /notify')
-  }
+  const putPrefix = '/notify/'
+  const isCreate = req.method === 'POST' && url.pathname === '/notify'
+  const isUpdate = req.method === 'PUT' && url.pathname.startsWith(putPrefix)
+  if (!isCreate && !isUpdate) return sendText(405, 'use POST /notify or PUT /notify/:notify_id')
 
   let raw = ''
   let bytes = 0
@@ -507,6 +666,246 @@ export async function handleNotifyRequest(
   let body: any = {}
   try { body = JSON.parse(raw) } catch { return sendText(400, 'bad json') }
   if (!body || typeof body !== 'object' || Array.isArray(body)) return sendText(400, 'body must be an object')
+
+  if (isUpdate) {
+    let notifyId = ''
+    try { notifyId = decodeURIComponent(url.pathname.slice(putPrefix.length)).trim() }
+    catch { return sendJson(400, { error: 'invalid_notify_id_encoding' }) }
+    if (!notifyId || notifyId.includes('/')) return sendJson(400, { error: 'missing_notify_id' })
+    const version = parseVersion(body.version)
+    if (version === null) return sendJson(400, { error: 'invalid_version' })
+    for (const key of Object.keys(body)) {
+      if (!VERSIONED_FIELDS.has(key)) return sendJson(400, { error: 'unknown_field', field: key })
+    }
+    const parsed = normalizedVersionedBody(body)
+    if (!parsed.desired) return sendJson(400, { error: 'invalid_notify', detail: parsed.error })
+    const desired = parsed.desired
+    const desiredHash = canonicalNotifyHash(desired)
+    return await withNotifyLock(`notify:${notifyId}`, async () => {
+      const reg = getCallback(notifyId)
+      if (!reg?.requestId) return sendJson(404, { error: 'unknown_notify_id', notify_id: notifyId })
+      if (body.request_id !== undefined && body.request_id !== reg.requestId) {
+        return sendJson(409, { error: 'request_id_conflict', ...transportResult(reg, false) })
+      }
+      const sessionName = transport.sanitizeSessionName(desired.project)
+      const currentChatId = transport.chatIdForSession(sessionName)
+      if (desired.project !== reg.project || !currentChatId || currentChatId !== reg.chatId || !reg.messageId) {
+        return sendJson(409, { error: 'notify_binding_changed', ...transportResult(reg, false) })
+      }
+      if (version < (reg.desiredVersion ?? 0)) return sendJson(200, transportResult(reg))
+      if (version === reg.desiredVersion && desiredHash !== reg.desiredHash) {
+        return sendJson(409, { error: 'version_conflict', ...transportResult(reg, false) })
+      }
+      if (version === reg.desiredVersion && reg.transportState === 'unknown') {
+        return sendJson(202, transportResult(reg, false))
+      }
+      if (reg.resolvedAt || reg.unknownAt || reg.dispatchState
+        || reg.replyState?.status === 'waiting' || reg.replyState?.status === 'sending'
+        || isDispatching(reg.notifyId)) {
+        return sendJson(409, { error: 'notify_closed_or_answering', ...transportResult(reg, false) })
+      }
+      if (version === reg.desiredVersion && reg.transportState === 'applied'
+        && reg.appliedVersion === version) return sendJson(200, transportResult(reg))
+      if (version > (reg.desiredVersion ?? 0)) {
+        try {
+          mutateRegistration(reg.notifyId, current => applyDesiredToRegistration(current, desired, desiredHash, version))
+        } catch (error) {
+          return sendJson(500, { error: 'notify_state_persist_failed', detail: String(error) })
+        }
+      }
+      const images = await uploadNotifyImages(desired, transport)
+      try {
+        mutateRegistration(reg.notifyId, current => applyDesiredToRegistration(current, desired, desiredHash, version, images))
+      } catch (error) {
+        return sendJson(500, { error: 'notify_state_persist_failed', detail: String(error) })
+      }
+      const card = buildNotifyCard({
+        title: desired.title,
+        text: desired.text,
+        level: desired.level,
+        images,
+        buttons: desired.buttons as ParsedButton[],
+        allowReply: desired.allowReply,
+        notifyId: reg.notifyId,
+        version,
+        project: desired.project,
+      })
+      try {
+        mutateRegistration(reg.notifyId, current => {
+          current.updateDispatch = { version, startedAt: Date.now() }
+          current.updatedAt = Date.now()
+        })
+      } catch (error) {
+        return sendJson(500, { error: 'notify_state_persist_failed', detail: String(error) })
+      }
+      try {
+        if (transport.updateCard) await transport.updateCard(reg.messageId, card)
+        else await feishu.updateCard(reg.messageId, card)
+      } catch (error) {
+        setTransportUnknown(reg, `Feishu card update outcome is unknown: ${formatFeishuError(error)}`)
+        return sendJson(202, { error: 'feishu_update_unknown', ...transportResult(reg, false) })
+      }
+      try {
+        mutateRegistration(reg.notifyId, current => {
+          current.transportState = 'applied'
+          current.appliedVersion = version
+          current.appliedHash = desiredHash
+          current.appliedBody = desired
+          delete current.updateDispatch
+          delete current.transportDetail
+          current.updatedAt = Date.now()
+        })
+      } catch (error) {
+        setTransportUnknown(reg, `card update succeeded but local confirmation failed: ${error instanceof Error ? error.message : error}`)
+        return sendJson(202, transportResult(reg, false))
+      }
+      return sendJson(200, transportResult(reg))
+    })
+  }
+
+  const requestIdRaw = body.request_id
+  const requestId = requestIdRaw === undefined ? '' : (typeof requestIdRaw === 'string' ? requestIdRaw.trim() : '')
+  if (requestIdRaw === undefined && body.version !== undefined) {
+    return sendJson(400, { error: 'version_requires_request_id' })
+  }
+  if (requestIdRaw !== undefined) {
+    if (!requestId || [...requestId].length > REQUEST_ID_MAX) {
+      return sendJson(400, { error: 'invalid_request_id' })
+    }
+    for (const key of Object.keys(body)) {
+      if (!VERSIONED_FIELDS.has(key)) return sendJson(400, { error: 'unknown_field', field: key })
+    }
+    const version = body.version === undefined ? 1 : parseVersion(body.version)
+    if (version === null) return sendJson(400, { error: 'invalid_version' })
+    const parsed = normalizedVersionedBody(body)
+    if (!parsed.desired) return sendJson(400, { error: 'invalid_notify', detail: parsed.error })
+    const desired = parsed.desired
+    const desiredHash = canonicalNotifyHash(desired)
+    const requestHash = canonicalNotifyRequestHash(version, desired)
+    return await withNotifyLock(`request:${requestId}`, async () => {
+      let reg = getByRequestId(requestId)
+      if (reg) {
+        if (reg.requestHash !== requestHash) {
+          return sendJson(409, { error: 'request_id_conflict', ...transportResult(reg, false) })
+        }
+        if (reg.messageId || reg.transportState === 'applied') {
+          return sendJson(reg.transportState === 'applied' ? 200 : 202, transportResult(reg))
+        }
+        if (reg.transportState === 'unknown') return sendJson(202, transportResult(reg, false))
+        const currentChatId = transport.chatIdForSession(transport.sanitizeSessionName(desired.project))
+        if (!currentChatId || currentChatId !== reg.chatId || desired.project !== reg.project) {
+          return sendJson(409, { error: 'notify_binding_changed', ...transportResult(reg, false) })
+        }
+        if (reg.createAttemptedAt !== undefined
+          && Date.now() - reg.createAttemptedAt >= NOTIFY_CREATE_RETRY_WINDOW_MS) {
+          setTransportUnknown(reg, 'notification creation exceeded Feishu UUID dedupe window')
+          return sendJson(202, transportResult(reg, false))
+        }
+      } else {
+        const sessionName = transport.sanitizeSessionName(desired.project)
+        const chatId = transport.chatIdForSession(sessionName)
+        if (!chatId) {
+          log('notify.binding_missing')
+          return sendJson(404, { error: 'notify_binding_missing', project: desired.project })
+        }
+        reg = {
+          notifyId: `nf_${randomUUID()}`,
+          callbackUrl: desired.callbackUrl,
+          chatId,
+          messageId: '',
+          project: desired.project,
+          title: desired.title,
+          text: desired.text,
+          level: desired.level,
+          imageKeys: desired.images.map(src => ({ key: '', src, error: 'upload pending' })),
+          buttons: desired.buttons,
+          allowReply: desired.allowReply,
+          createdAt: Date.now(),
+          requestId,
+          requestHash,
+          requestVersion: version,
+          requestBody: desired,
+          feishuUuid: randomUUID(),
+          transportState: 'pending',
+          desiredVersion: version,
+          appliedVersion: 0,
+          desiredHash,
+          desiredBody: desired,
+          updatedAt: Date.now(),
+        }
+        try { registerCallback(reg) }
+        catch (error) {
+          return sendJson(500, { error: 'notify_state_persist_failed', detail: String(error) })
+        }
+      }
+
+      return await withNotifyLock(`notify:${reg.notifyId}`, async () => {
+        const images = await uploadNotifyImages(desired, transport)
+        try {
+          mutateRegistration(reg.notifyId, current => applyDesiredToRegistration(current, desired, desiredHash, version, images))
+        } catch (error) {
+          return sendJson(500, { error: 'notify_state_persist_failed', detail: String(error) })
+        }
+        const card = buildNotifyCard({
+          title: desired.title,
+          text: desired.text,
+          level: desired.level,
+          images,
+          buttons: desired.buttons as ParsedButton[],
+          allowReply: desired.allowReply,
+          notifyId: reg.notifyId,
+          version,
+          project: desired.project,
+        })
+        if (reg.createAttemptedAt === undefined) {
+          try {
+            mutateRegistration(reg.notifyId, current => {
+              current.createAttemptedAt = Date.now()
+              current.updatedAt = Date.now()
+            })
+          } catch (error) {
+            return sendJson(500, { error: 'notify_state_persist_failed', detail: String(error) })
+          }
+        }
+        let sendFailure: unknown
+        const messageId = await transport.sendCard(
+          reg.chatId,
+          card,
+          error => { sendFailure = error },
+          reg.feishuUuid,
+        )
+        if (!messageId) {
+          if (String(failureCode(sendFailure)) === '200770') {
+            setTransportUnknown(reg, 'Feishu consumed the stable UUID without returning a recoverable message_id')
+            return sendJson(202, transportResult(reg, false))
+          }
+          try {
+            mutateRegistration(reg.notifyId, current => {
+              current.transportState = 'pending'
+              current.transportDetail = formatFeishuError(sendFailure)
+              current.updatedAt = Date.now()
+            })
+          } catch {}
+          return sendJson(502, { error: 'feishu_send_failed', ...transportResult(reg, false) })
+        }
+        try {
+          mutateRegistration(reg.notifyId, current => {
+            current.messageId = messageId
+            current.transportState = 'applied'
+            current.appliedVersion = version
+            current.appliedHash = desiredHash
+            current.appliedBody = desired
+            delete current.transportDetail
+            current.updatedAt = Date.now()
+          })
+        } catch (error) {
+          setTransportUnknown(reg, `card send succeeded but local confirmation failed: ${error instanceof Error ? error.message : error}`)
+          return sendJson(202, transportResult(reg, false))
+        }
+        return sendJson(200, transportResult(reg))
+      })
+    })
+  }
   if (body.allow_reply !== undefined && typeof body.allow_reply !== 'boolean') {
     return sendText(400, '"allow_reply" must be a boolean')
   }
@@ -608,6 +1007,8 @@ export function buildNotifyCardFromReg(
     buttons: reg.buttons,
     allowReply: reg.allowReply,
     notifyId: reg.notifyId,
+    version: reg.requestId ? reg.appliedVersion : undefined,
+    project: reg.requestId ? reg.project : undefined,
     resolution,
   })
 }
