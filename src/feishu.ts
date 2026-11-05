@@ -43,6 +43,7 @@ import { sync as spawnSync } from 'cross-spawn'
 import { codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
 import { writeJsonStateAtomic, writeStateFileAtomic } from './state-store'
 import { profileForWorkspace, resolveWorkspaceDir } from './workspace'
+import { mainSessionName, normalizeTempRole, tempProjectName } from './session-name'
 import { neutralizeMarkdownImagesInCard } from './cards/elements'
 import {
   validateConversationLaunch,
@@ -964,36 +965,25 @@ export function setSessionBranchBase(sessionName: string, base: ConversationBran
   replaceTurnAnchors(sessionName, getTurnAnchors(sessionName), base)
 }
 
+export { mainSessionName, normalizeTempRole, tempProjectName }
 
-// ── 临时群名(*MMDD-HHMM 后缀,同目录多会话) ─────────────────────────
+// ── 临时群名(*后缀,同目录多会话) ───────────────────────────────────
 // 与 worktree 的 [slug](独立目录 + git 分支)区分:*后缀 = 同一项目目录、新群、
-// 新会话。workDir 解析靠 tempProjectName 剥后缀回原目录。
-const TEMP_SUFFIX_RE = /\*[0-9]{4}-[0-9]{4}(-[0-9]+)?$/
-const WORKTREE_SUFFIX_RE = /^(.+)\[[^\[\]]+\]$/
+// 新会话。默认用 *MMDD-HHMM；`btw 备注` 用 *备注 代替时间。workDir 解析靠
+// tempProjectName 剥后缀回原目录。
 
-/** 剥临时群 *MMDD-HHMM 后缀,返回原项目名;非临时群返回 null。 */
-export function tempProjectName(sessionName: string): string | null {
-  return TEMP_SUFFIX_RE.test(sessionName) ? sessionName.replace(TEMP_SUFFIX_RE, '') : null
-}
-
-/** Resolve the canonical main-session name for main, BTW, WT and BTW-from-WT sessions.
- *  剥临时群 * 后缀再剥 worktree [slug] 后缀,统一解析回主项目名(上游 c452546):
- *  BTW/WT 交付文件夹、任务清单绑定等主项目口径共用此入口。 */
-export function mainSessionName(sessionName: string): string {
-  const tempBase = tempProjectName(sessionName) ?? sessionName
-  return tempBase.match(WORKTREE_SUFFIX_RE)?.[1] ?? tempBase
-}
-
-/** 拼临时群名:projectName*MMDD-HHMM。同分钟已有同名则加 -2、-3… 去重。
+/** 拼临时群名:projectName*MMDD-HHMM 或 projectName*备注。重名则加 -2、-3… 去重。
  *  additionallyUsed:调用方额外占用的名字集(reserveTempChatName in-flight
- *  保留集,防同分钟并发建群撞名——上游 ff44afb 第二参)。 */
-export function tempChatName(projectName: string, additionallyUsed: Iterable<string> = []): string {
+ *  保留集,防并发建群撞名——上游 ff44afb 第二参);role 为 `btw 备注` 的备注。 */
+export function tempChatName(projectName: string, additionallyUsed: Iterable<string> = [], role = ''): string {
   const d = new Date()
   const pad = (n: number) => String(n).padStart(2, '0')
   const stamp = `${pad(d.getMonth() + 1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}`
+  const suffix = normalizeTempRole(role) || stamp
+  const base = `${projectName}*${suffix}`
   const used = new Set<string>([...chatNameCache.values(), ...turnsBySession.keys(), ...additionallyUsed])
-  let name = `${projectName}*${stamp}`
-  for (let seq = 2; used.has(name); seq++) name = `${projectName}*${stamp}-${seq}`
+  let name = base
+  for (let seq = 2; used.has(name); seq++) name = `${base}-${seq}`
   return name
 }
 
@@ -1806,6 +1796,6 @@ export function isOpenAIChatGPTAuthenticated(accountId = DEFAULT_CODEX_ACCOUNT):
 }
 
 export function sanitizeSessionName(raw: string): string {
-  // `*` 给临时群后缀(*MMDD-HHMM)用,和 worktree 的 `[]` 一样显式放行。
+  // `*` 给临时群后缀(*MMDD-HHMM / *备注)用,和 worktree 的 `[]` 一样显式放行。
   return raw.replace(/[^\w一-鿿\-\[\]\*]/g, '_').slice(0, 64)
 }
