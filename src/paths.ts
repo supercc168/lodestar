@@ -67,7 +67,7 @@ export const SESSION_CHAT_MAP_FILE = join(DATA_DIR, 'session-chat-map.json')
 export const SESSION_RESUME_MAP_FILE = join(DATA_DIR, 'session-resume-map.json')
 /** Per-session branch baseline + backend-native turn checkpoints + durable pending Claude fork。
  *  fk/bk 用它列"用户输入前的分界点"；rs 历史由各 backend 自己发现。
- *  key = sessionName(主群名或 <project>*MMDD-HHMM 临时群名)。 */
+ *  key = sessionName(主群名或 <project>*MMDD-HHMM / <project>*备注 临时群名)。 */
 export const SESSION_TURNS_MAP_FILE = join(DATA_DIR, 'session-turns-map.json')
 export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
 /** Last real inbound user-message time per chat, used by Claude account reservations. */
@@ -104,6 +104,11 @@ export const CODEX_QUOTA_BLOCKS_FILE = join(DATA_DIR, 'codex-quota-blocks.json')
 export const CLAUDE_ACCOUNTS_DIR = join(HOME, '.claude-accounts')
 /** Private enrollment phases and identity revisions; never contains subscription credentials. */
 export const CLAUDE_ACCOUNTS_FILE = join(DATA_DIR, 'claude-accounts.json')
+/** Native session id → Claude subscription account id observed while that
+ *  conversation ran. rs history shows it and an all-exhausted restart keeps the
+ *  original account; names always come from the live account registry, so
+ *  deleted/re-added accounts never show a stale label. Bounded. */
+export const CLAUDE_SESSION_ACCOUNTS_FILE = join(DATA_DIR, 'claude-session-accounts.json')
 /** Automatically updated, immutable Agent runtime installations and status. */
 export const AGENT_RUNTIMES_DIR = join(DATA_DIR, 'agent-runtimes')
 /** 真实窗口观测缓存:key = `<sourceId>:<model>`(如 `glm:GLM-5.3`),value = 窗口

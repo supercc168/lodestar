@@ -1,6 +1,6 @@
 {
   "name": "@supercc168/lodestar",
-  "version": "0.21.26",
+  "version": "0.21.28",
   "publishConfig": {
     "access": "public"
   },

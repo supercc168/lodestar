@@ -109,12 +109,14 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
     await s.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId)
     return true
   }
-  // btw = 开临时会话(同目录,自动启动);bye = 散临时群;fk/fork = 列当前会话 turn 分叉;
-  // bk/back = 列 turn;点选并通过 owner/stale 校验后才终止并切到新分支(上游 ff44afb)。
-  if (raw.trim().match(/^btw$/i)) {
+  // btw = 开临时会话(同目录,自动启动);`btw 备注` 用备注代替时间后缀;
+  // bye = 散临时群;fk/fork = 列当前会话 turn 分叉;
+  // bk/back = 列 turn；点选并通过 owner/stale 校验后才终止并切到新分支(上游 ff44afb)。
+  const btw = raw.trim().match(/^btw(?:[ \t]+([^\r\n]+))?$/i)
+  if (btw) {
     // 本地守卫保留(同 wt):agy 独占期拒绝 btw。
     if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 btw。'); return true }
-    await s.runBtwCommand(userOpenId)
+    await s.runBtwCommand(userOpenId, (btw[1] ?? '').trim())
     return true
   }
   if (raw.trim().match(/^bye$/i)) {

@@ -27,6 +27,7 @@ import type { TurnAnchor } from './feishu'
 import type { ConversationBranchBase, ConversationRef, PendingConversationLaunch } from './conversation'
 import type { ProjectProfile } from './config'
 import { profileForWorkspace, resolveWorkspaceDir } from './workspace'
+import { mainSessionName, normalizeTempRole, tempProjectName } from './session-name'
 
 export const sentCards: object[] = []
 export const sentCardUuids: Array<string | undefined> = []
@@ -276,31 +277,20 @@ mock.module('./feishu', () => ({
     return `comment_${addedTaskComments.length}`
   },
   // 临时群 / fork / back / rs 相关 stub(V4 容器 + checked 系列,上游 ff44afb/4185808;
-  // feishuMockState.turnAnchors 为显式替身,优先于容器返回——01-10 用例零改动)
-  // 与真实实现同一正则(ff44afb 簇 4 workDir 三形态用例依赖真实剥后缀语义;
-  // 既有用例全部使用普通群名 → 恒 null,行为零变化)。
-  tempProjectName: (sessionName: string) =>
-    /\*[0-9]{4}-[0-9]{4}(-[0-9]+)?$/.test(sessionName)
-      ? sessionName.replace(/\*[0-9]{4}-[0-9]{4}(-[0-9]+)?$/, '')
-      : null,
-  // 主群名/主群 chat_id 解析桩(上游 c452546):与真实实现同一剥后缀语义。
-  mainSessionName: (name: string) => {
-    const tempBase = /\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/.test(name)
-      ? name.replace(/\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/, '')
-      : name
-    return tempBase.match(/^(.+)\[[^\[\]]+\]$/)?.[1] ?? tempBase
-  },
+  // feishuMockState.turnAnchors 为显式替身,优先于容器返回——01-10 用例零改动)。
+  // 剥后缀直接转发真实实现(session-name):与真实语义一致,`*备注` / `*MMDD-HHMM` 都能识别。
+  tempProjectName,
+  mainSessionName,
+  normalizeTempRole,
   mainChatIdForSession: (name: string, fallback?: string) => {
-    const tempBase = /\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/.test(name)
-      ? name.replace(/\*[0-9]{4}-[0-9]{4}(?:-[0-9]+)?$/, '')
-      : name
-    const main = tempBase.match(/^(.+)\[[^\[\]]+\]$/)?.[1] ?? tempBase
+    const main = mainSessionName(name)
     return preferredChatForSession.get(main) ?? (main === name ? fallback ?? null : null)
   },
-  tempChatName: (project: string, additionallyUsed: Iterable<string> = []) => {
+  tempChatName: (project: string, additionallyUsed: Iterable<string> = [], role = '') => {
     const used = new Set(additionallyUsed)
-    let name = `${project}*0000-0000`
-    for (let seq = 2; used.has(name); seq++) name = `${project}*0000-0000-${seq}`
+    const base = `${project}*${normalizeTempRole(role) || '0000-0000'}`
+    let name = base
+    for (let seq = 2; used.has(name); seq++) name = `${base}-${seq}`
     return name
   },
   appendTurnAnchorChecked: (sessionName: string, anchor: TurnAnchor) => {
