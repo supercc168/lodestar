@@ -35,6 +35,9 @@ export function dshProviderPatches(env: Record<string, string | undefined>): obj
   const apiKeyEnv = provider === 'openai-relay' ? 'LODESTAR_DSH_OPENAI_API_KEY' : 'LODESTAR_DSH_GLM_API_KEY'
   return [
     { id: 'llm-deepseek', disabled: true },
+    // dsh 0.2.2-rc.1 gates startup on the official DeepSeek connection chain, which can
+    // never activate here (credentials stays disabled under the pi-ai GLM provider).
+    ...['authorization', 'deepseek-account', 'connection', 'file-upload', 'schedule'].map(id => ({ id, disabled: true })),
     { id: 'llm-pi-ai', disabled: false, config: { providers: { [provider]: {
       apiKeyEnv, baseURL: env.LODESTAR_DSH_BASE_URL,
       ...(provider === 'openai-relay' ? { api: 'openai-completions' } : {}),
@@ -127,8 +130,9 @@ export class DshRuntime extends EventEmitter {
       // DSH supplies working-directory context; newer releases no longer register {{cwd}}.
       { id: 'system-prompt', config: { personaPrefix: 'You are a coding agent powered by {{model}}.', personaSuffix: '' } },
       { id: 'skill-filesystem', config: { includeDefaultRoots: true, ...(opts.managedSkillDir ? { customSkillDirs: [opts.managedSkillDir] } : {}) } },
-      { insert: [{ id: 'lodestar-bridge', name: bridge },
-        { id: 'lodestar-ask-user', name: '@deepseek-ai/dsh-tool-ask-user' }, ...mcp] },
+      // dsh >= 0.2.2-rc.1 registers ask_user_question per-agent in agent.ctx; a global
+      // plugin copy makes the tool register twice and fail startup, so only the bridge remains.
+      { insert: [{ id: 'lodestar-bridge', name: bridge }, ...mcp] },
       ...providerPatches,
     ]
     const patchPath = join(this.launchDir, 'bridge.patch.yml')
