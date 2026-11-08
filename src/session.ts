@@ -1968,6 +1968,30 @@ export class Session {
     return [...Session.all].some(s => s.sessionName === sessionName && s.isRunning())
   }
 
+  /** 本 daemon 中已构造的临时群会话；`bl` 列表与 hi 的 peers 同源。
+   * 还没被任何消息唤醒的旧临时群不在里面，由持久化租约补全。 */
+  tempSessionPeers(): Array<{
+    sessionName: string
+    chatId: string
+    status: Status
+    running: boolean
+    provider: AgentProvider
+    model: string | null
+    effort: AgentReasoningEffort | null
+  }> {
+    return [...Session.all]
+      .filter(peer => feishu.tempProjectName(peer.sessionName) !== null)
+      .map(peer => ({
+        sessionName: peer.sessionName,
+        chatId: peer.chatId,
+        status: peer.status,
+        running: peer.isRunning(),
+        provider: peer.selectedProvider,
+        model: peer.selectedModel,
+        effort: peer.selectedEffort,
+      }))
+  }
+
   private modelForSpawn(provider: AgentProvider = this.selectedProvider): string | undefined {
     return provider === this.selectedProvider ? this.selectedModel ?? undefined : undefined
   }
@@ -4739,7 +4763,8 @@ export class Session {
   showBackList(userOpenId = ''): Promise<void> { return sessionTemp.showBackList(this, userOpenId) }
   showResumeList(userOpenId = ''): Promise<void> { return sessionTemp.showResumeList(this, userOpenId) }
   runBtwCommand(userOpenId: string, role = ''): Promise<void> { return sessionTemp.runBtwCommand(this, userOpenId, role) }
-  runByeCommand(): Promise<void> { return sessionTemp.runByeCommand(this) }
+  runBtwListCommand(): Promise<void> { return sessionTemp.runBtwListCommand(this) }
+  runByeCommand(userOpenId = ''): Promise<void> { return sessionTemp.runByeCommand(this, userOpenId) }
   onForkSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onForkSelect(this, panelId, choiceId, userOpenId) }
   onBackSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onBackSelect(this, panelId, choiceId, userOpenId) }
   onResumeSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onResumeSelect(this, panelId, choiceId, userOpenId) }
@@ -10276,7 +10301,8 @@ export class Session {
         if (ts.kind === 'claude-subscription') {
           const weekly = claudeWeeklyUsageWindow(snap, model)
           const missing = { percent: null, resetsAt: null }
-          return this.fmtDualWindowSuffix(fiveHour ?? missing, weekly ?? missing)
+          // 没有 5h 窗口表示该账号已取消 5 小时限额：不补 MISS，只显示周额度。
+          return this.fmtDualWindowSuffix(fiveHour ?? null, weekly ?? missing)
         }
         const weekly = snap.windows.find(w => w.kind === 'weekly')
         if (fiveHour || weekly) return this.fmtDualWindowSuffix(fiveHour ?? null, weekly ?? null)

@@ -31,7 +31,7 @@ import {
 import { closeSync, openSync, readSync, readdirSync, realpathSync, statSync } from 'node:fs'
 import { randomUUID } from 'node:crypto'
 import { isAbsolute, join, resolve } from 'node:path'
-import { diagnosticIdLabel } from './session-util'
+import { diagnosticIdLabel, messageOf } from './session-util'
 import { claudeSessionAccount } from './claude-session-accounts'
 
 const DAY_MS = 24 * 60 * 60 * 1000
@@ -105,13 +105,12 @@ interface TempPanelState {
 const panelsBySession = new WeakMap<Session, Map<string, TempPanelState>>()
 const reservedTempChatNames = new Set<string>()
 
-/** 临时群 baseName:只剥 * 临时后缀,保留 [slug] worktree 后缀(上游 ff44afb:
- *  temp-of-worktree 留在 worktree cwd,群名/子临时群名随 worktree 走)。
- *  上游 c452546 曾改为 mainSessionName(连 [slug] 一起剥),不采:本地 workspace
- *  按群名解析目录,temp 名带 slug 才能锚定 worktree;交付主群名口径由
- *  file-delivery 的 mainChatIdForSession 独立完成,不依赖此处。 */
+/** 临时群基名:剥掉 `*` 临时后缀,保留 [slug] worktree 后缀(上游 ff44afb:
+ *  temp-of-worktree 留在 worktree cwd,群名/子临时群名随 worktree 走;上游
+ *  c452546 的 mainSessionName(连 [slug] 一起剥)不采,本地 workspace 按群名
+ *  解析目录,temp 名带 slug 才能锚定 worktree)。重启后也能由群名复原。 */
 function baseSessionName(s: Session): string {
-  return feishu.tempProjectName(s.sessionName) ?? s.sessionName
+  return feishu.stripTempSuffix(s.sessionName)
 }
 
 function reserveTempChatName(baseName: string, role = ''): string {
@@ -493,17 +492,57 @@ export async function showResumeList(s: Session, userOpenId: string): Promise<vo
 }
 
 // ── btw / bye ────────────────────────────────────────────────────────
+// 交互提示统一用 `cards.tempSessionNoticeCard`：状态一眼可见，创建、加入、
+// 退出和解散共用同一版式；卡片发送失败时回退到原文并附带飞书诊断。
+
+/** 卡片发送失败必须回退原文并保留飞书诊断，不能静默丢掉回执。 */
+async function sendTempNotice(
+  s: Session,
+  opts: cards.TempSessionNoticeCardOpts,
+  fallback: string,
+): Promise<void> {
+  let failure: unknown
+  let messageId: string | null = null
+  try {
+    messageId = await feishu.sendCard(s.chatId, cards.tempSessionNoticeCard(opts), error => { failure = error })
+  } catch (error) {
+    failure = error
+  }
+  if (!messageId) await feishu.sendTextRaw(s.chatId, `${fallback}\n${formatFeishuError(failure)}`)
+}
+
+function tempNoticeFailure(s: Session, chatName: string, message: string): Promise<void> {
+  return sendTempNotice(s, { chatName, state: 'error', body: message }, `❌ ${message}`)
+}
 
 export async function runBtwCommand(s: Session, userOpenId: string, role = ''): Promise<void> {
-  if (!userOpenId) { await feishu.sendText(s.chatId, '❌ 找不到发起人，无法建临时群。'); return }
-  if (!s.opts.onCreateTempSession) { await feishu.sendText(s.chatId, '❌ 临时群能力未就绪（daemon 未注入回调）。'); return }
+  const baseName = baseSessionName(s)
   const normalizedRole = feishu.normalizeTempRole(role)
+  if (!userOpenId) { await tempNoticeFailure(s, baseName, '找不到发起人，无法建临时群。'); return }
+  if (!s.opts.onCreateTempSession) { await tempNoticeFailure(s, baseName, '临时群能力未就绪（daemon 未注入回调）。'); return }
   if (role.trim() && !normalizedRole) {
-    await feishu.sendText(s.chatId, '❌ btw 备注至少需要一个中文、字母或数字字符；空格等会写成 _。不带备注时使用时间后缀。')
+    await tempNoticeFailure(s, baseName, 'btw 备注至少需要一个中文、字母或数字字符；空格等会写成 _。不带备注时使用时间后缀。')
     return
   }
-  const chatName = reserveTempChatName(baseSessionName(s), normalizedRole)
-  await feishu.sendText(s.chatId, `🚀 正在创建 ${chatName} · ${s.backendLabel()} 新会话。它与当前群共享工作目录；当前会话不受影响。`)
+  // 带备注的 btw 用真实备注当群名,同名即同一个群:后到的人加入既有群,不再另开 *备注-2。
+  const reuse = Boolean(normalizedRole)
+  let chatName: string
+  try {
+    chatName = reuse ? feishu.tempRoleChatName(baseName, normalizedRole) : reserveTempChatName(baseName)
+  } catch (error) {
+    await tempNoticeFailure(s, baseName, messageOf(error))
+    return
+  }
+  if (chatName.length > feishu.SESSION_NAME_MAX) {
+    if (!reuse) releaseTempChatName(chatName)
+    await tempNoticeFailure(s, chatName, `群名太长（${chatName.length} > ${feishu.SESSION_NAME_MAX}），请换一个更短的备注。`)
+    return
+  }
+  await sendTempNotice(
+    s,
+    { chatName, state: 'creating', backendLabel: s.backendLabel() },
+    reuse ? `🚀 正在创建或加入 ${chatName} · ${s.backendLabel()}` : `🚀 正在创建 ${chatName} · ${s.backendLabel()}`,
+  )
   let result
   try {
     result = await s.opts.onCreateTempSession({
@@ -514,26 +553,114 @@ export async function runBtwCommand(s: Session, userOpenId: string, role = ''): 
       launch: { kind: 'fresh' },
       branchBase: { kind: 'fresh' },
       seedAnchors: [],
+      ...(reuse ? { groupMode: 'reuse' as const } : {}),
     })
   } finally {
-    releaseTempChatName(chatName)
+    if (!reuse) releaseTempChatName(chatName)
   }
   if (!result.ok) {
-    await feishu.sendText(s.chatId, `❌ 建临时会话失败: ${result.error ?? '未知'}`)
+    await tempNoticeFailure(s, chatName, `建临时会话失败: ${result.error ?? '未知'}`)
     return
   }
-  await feishu.sendText(s.chatId, `✅ 已创建 ${chatName}。临时群不会自动删除；在该群发送 bye 可停止并解散。`)
+  await sendTempNotice(
+    s,
+    {
+      chatName,
+      state: result.join ? (result.join === 'added' ? 'joined' : 'present') : 'created',
+      backendLabel: s.backendLabel(),
+    },
+    result.join ? `✅ 已加入 ${chatName}` : `✅ 已创建 ${chatName}`,
+  )
 }
 
-export async function runByeCommand(s: Session): Promise<void> {
+/** `bl` / `btwlist`：列出本机登记的全部临时会话（btw/fk 都算），
+ * 并合并本 daemon 已构造会话的实时状态；只读本地租约与内存，不发网络查询。 */
+export async function runBtwListCommand(s: Session): Promise<void> {
+  const peers = new Map(s.tempSessionPeers().map(peer => [peer.chatId, peer]))
+  const entries = new Map<string, cards.BtwListEntry>()
+  const entryFor = (
+    chatName: string,
+    chatId: string,
+    createdAt: number | null,
+    peer: ReturnType<Session['tempSessionPeers']>[number] | undefined,
+  ): cards.BtwListEntry => {
+    const selection = peer ? null : feishu.getSessionModelSelection(chatName)
+    return {
+      chatName,
+      projectName: feishu.tempProjectName(chatName) ?? chatName,
+      createdAt,
+      isCurrent: chatId === s.chatId,
+      status: peer?.status ?? null,
+      running: peer?.running ?? false,
+      provider: peer?.provider ?? selection?.provider ?? null,
+      model: peer ? peer.model : selection?.model ?? null,
+      effort: peer ? peer.effort : selection?.effort ?? null,
+    }
+  }
+  for (const lease of feishu.listTempSessionLeases()) {
+    entries.set(lease.chatId, entryFor(lease.sessionName, lease.chatId, lease.createdAt, peers.get(lease.chatId)))
+  }
+  // 兼容租约机制之前创建、但本 daemon 已加载的临时群：内存里仍在就同样列出。
+  for (const peer of peers.values()) {
+    if (!entries.has(peer.chatId)) entries.set(peer.chatId, entryFor(peer.sessionName, peer.chatId, null, peer))
+  }
+  const list = [...entries.values()].sort((a, b) => {
+    if (a.createdAt !== b.createdAt) {
+      if (a.createdAt === null) return 1
+      if (b.createdAt === null) return -1
+      return b.createdAt - a.createdAt
+    }
+    return a.chatName.localeCompare(b.chatName)
+  })
+  let messageId: string | null = null
+  let failure: unknown
+  try {
+    messageId = await feishu.sendCard(s.chatId, cards.btwListCard({ entries: list }), error => { failure = error })
+  } catch (error) {
+    failure = error
+  }
+  if (!messageId) await feishu.sendTextRaw(s.chatId, `❌ bl 列表发送失败\n${formatFeishuError(failure)}`)
+}
+
+export async function runByeCommand(s: Session, userOpenId = ''): Promise<void> {
   if (!feishu.tempProjectName(s.sessionName)) {
-    await feishu.sendText(s.chatId, '❌ bye 只能在带 *MMDD-HHMM 或 *备注 后缀的临时会话群里使用。')
+    await tempNoticeFailure(s, s.sessionName, 'bye 只能在带 *MMDD-HHMM 或 *备注 后缀的临时会话群里使用。')
     return
   }
-  if (!s.opts.onDisbandTempSession) { await feishu.sendText(s.chatId, '❌ 解散能力未就绪（daemon 未注入回调）。'); return }
-  await feishu.sendText(s.chatId, `👋 正在停止会话并解散 ${s.sessionName}…`)
-  const result = await s.opts.onDisbandTempSession(s.sessionName, s.chatId)
-  if (!result.ok) await feishu.sendText(s.chatId, `❌ 解散失败: ${result.error ?? '未知'}`)
+  if (!s.opts.onDisbandTempSession) { await tempNoticeFailure(s, s.sessionName, '解散能力未就绪（daemon 未注入回调）。'); return }
+  if (!userOpenId) { await tempNoticeFailure(s, s.sessionName, '找不到发起人，无法退出临时群。'); return }
+
+  // bye 不看创建者：谁发谁退出；群里的最后一个人退出时连同会话一起解散。
+  const disband = async (): Promise<void> => {
+    await sendTempNotice(s, { chatName: s.sessionName, state: 'disbanding' }, `👋 正在停止会话并解散 ${s.sessionName}`)
+    const result = await s.opts.onDisbandTempSession!(s.sessionName, s.chatId)
+    if (!result.ok) await tempNoticeFailure(s, s.sessionName, `解散失败: ${result.error ?? '未知'}`)
+  }
+
+  let others: string[]
+  try {
+    others = (await feishu.chatMemberOpenIds(s.chatId)).filter(id => id !== userOpenId)
+  } catch (error) {
+    await tempNoticeFailure(s, s.sessionName, `读取群成员失败: ${messageOf(error)}；未执行退出或解散。`)
+    return
+  }
+  if (others.length === 0) { await disband(); return }
+
+  await sendTempNotice(s, { chatName: s.sessionName, state: 'leaving' }, `🚪 正在退出 ${s.sessionName}`)
+  try {
+    await feishu.leaveChatForMember(s.chatId, userOpenId)
+  } catch (error) {
+    await tempNoticeFailure(s, s.sessionName, `退出失败: ${messageOf(error)}；可以在飞书群设置里手动退出。`)
+    return
+  }
+  // 两个人同时退出时可能都看到还有人：退出后再数一次，最后一个走的负责解散。
+  try {
+    if ((await feishu.chatMemberOpenIds(s.chatId)).length > 0) return
+  } catch (error) {
+    await tempNoticeFailure(s, s.sessionName, `已退出，但无法确认是否还有成员: ${messageOf(error)}；群未解散。`)
+    return
+  }
+  await disband()
 }
 
 // ── Picker actions(claim 校验最前;本地 watchdog/lease 守卫叠加其后) ──

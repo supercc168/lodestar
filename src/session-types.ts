@@ -252,7 +252,8 @@ export interface SessionOpts {
    * that construct Session directly can omit it. */
   onLifecycleChange?: () => void
   /** Daemon hook:建临时群并按显式 launch/routing 启动一个 session(上游 ff44afb:
-   *  panel choice 预计算 launch/branchBase/seedAnchors,不再传 resume 参数对)。 */
+   *  panel choice 预计算 launch/branchBase/seedAnchors,不再传 resume 参数对)。
+   * `groupMode: 'reuse'` 表示同名群已存在时只把发起人拉进群,不新建也不重启会话。 */
   onCreateTempSession?: (opts: {
     chatName: string
     userOpenId: string
@@ -261,7 +262,8 @@ export interface SessionOpts {
     launch: ConversationLaunch
     branchBase: ConversationBranchBase
     seedAnchors?: TurnAnchor[]
-  }) => Promise<{ ok: boolean; chatId?: string; error?: string }>
+    groupMode?: 'create' | 'reuse'
+  }) => Promise<{ ok: boolean; chatId?: string; error?: string; join?: 'added' | 'present' }>
   /** Daemon hook:解散临时群 + 清掉它的 Session 对象(bye 用;chatId 供精确匹配解散)。*/
   onDisbandTempSession?: (chatName: string, chatId: string) => Promise<{ ok: boolean; error?: string }>
   /** Daemon-owned delegated Agents are outside Session.proc but must be

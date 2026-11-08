@@ -36,12 +36,15 @@ function runFresh(work: string, leases?: object) {
       bindSessionToChat,
       clearSessionConversationState,
       hasTempSessionLease,
+      listTempSessionLeases,
       loadTempSessionLeases,
       mainChatIdForSession,
       mainSessionName,
       registerTempSessionLease,
       tempChatName,
       tempProjectName,
+      tempRoleChatName,
+      withChatNameLock,
     } = feishu
     import { readFileSync } from 'node:fs'
     import { join } from 'node:path'
@@ -89,6 +92,29 @@ describe('temporary-session leases', () => {
     })
   })
 
+  test('lists leases newest first and cannot expose mutable state', () => {
+    const result = runFresh(`
+      const realNow = Date.now
+      Date.now = () => 1000
+      registerTempSessionLease('project*old', 'oc_old')
+      Date.now = () => 2000
+      registerTempSessionLease('project*new', 'oc_new')
+      Date.now = realNow
+      const listed = listTempSessionLeases()
+      listed[0].sessionName = 'tampered'
+      out({ listed, again: listTempSessionLeases() })
+    `)
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(result.value.listed).toEqual([
+      { sessionName: 'tampered', chatId: 'oc_new', createdAt: 2000 },
+      { sessionName: 'project*old', chatId: 'oc_old', createdAt: 1000 },
+    ])
+    expect(result.value.again).toEqual([
+      { sessionName: 'project*new', chatId: 'oc_new', createdAt: 2000 },
+      { sessionName: 'project*old', chatId: 'oc_old', createdAt: 1000 },
+    ])
+  })
+
   test('resolves role-named BTW sessions back to their main project and group', () => {
     const result = runFresh(`
       bindSessionToChat('project', 'oc_main')
@@ -131,6 +157,44 @@ describe('temporary-session leases', () => {
     expect(result.value.first).toBe('project*修复_登录')
     expect(result.value.second).toBe('project*修复_登录-2')
     expect(result.value.legacy).toMatch(/^project\*\d{4}-\d{4}$/)
+  })
+
+  test('备注群名精确对应同一个群，不因已有同名群而加后缀', () => {
+    const result = runFresh(`
+      out({
+        first: tempRoleChatName('project', '修复 登录'),
+        again: tempRoleChatName('project', '修复 登录'),
+        otherProject: tempRoleChatName('project[feature]', '修复 登录'),
+        empty: (() => { try { tempRoleChatName('project', '🚀') } catch (e) { return e instanceof Error ? e.message : String(e) } })(),
+      })
+    `)
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(result.value.first).toBe('project*修复_登录')
+    expect(result.value.again).toBe('project*修复_登录')
+    expect(result.value.otherProject).toBe('project[feature]*修复_登录')
+    expect(result.value.empty).toContain('temporary role')
+  })
+
+  test('同名 ensure 串行执行，不同名互不等待', async () => {
+    const result = runFresh(`
+      const order = []
+      const tick = () => new Promise(resolve => setTimeout(resolve, 0))
+      let release
+      const gate = new Promise(resolve => { release = resolve })
+      const first = withChatNameLock('project*修复', async () => {
+        order.push('same:in')
+        await gate
+        order.push('same:out')
+      })
+      const second = withChatNameLock('project*修复', async () => { order.push('same:second') })
+      const other = withChatNameLock('project*其他', async () => { order.push('other') })
+      await tick()
+      release()
+      await Promise.all([first, second, other])
+      out(order)
+    `)
+    expect(result.exitCode, result.stderr).toBe(0)
+    expect(result.value).toEqual(['same:in', 'other', 'same:out', 'same:second'])
   })
 
   test('persists and reloads exact chat/name ownership', () => {
