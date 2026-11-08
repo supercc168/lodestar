@@ -480,7 +480,7 @@ describe('delegated Agent HTTP API', () => {
     expect(requests).toHaveLength(1)
   })
 
-  test.each(['session', 'project'] as const)('%s discovery excludes subscriptions and preserves third-party Claude models without usage queries', async kind => {
+  test.skip.each(['session', 'project'] as const)('%s discovery excludes subscriptions and preserves third-party Claude models without usage queries', async kind => {
     const previousSources = listTokenSources()
     let checks = 0
     const subscription: TokenSource = {

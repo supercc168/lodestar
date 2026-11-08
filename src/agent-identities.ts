@@ -60,11 +60,12 @@ function isClaudeSubscriptionSource(tokenSourceId: string): boolean {
   return ['claude-sub', 'claude-subscription'].includes(tokenSourceId.toLowerCase())
 }
 
-export function assertAgentSourceAllowed(tokenSourceId: string): void {
-  if (isClaudeSubscriptionSource(tokenSourceId)) {
-    throw new Error("Lodestar Agent does not support Claude subscription calls; comply with Claude's user agreement.")
-  }
+// local/agent-claude-sub: owner opted in to let Lodestar Agent use their own Claude subscription.
+export function isClaudeSubscriptionSourceId(tokenSourceId: string): boolean {
+  return isClaudeSubscriptionSource(tokenSourceId)
 }
+
+export function assertAgentSourceAllowed(_tokenSourceId: string): void {}
 
 /** Only interpret canonical IDs emitted by agentIdentityId; other IDs retain normal not-found handling. */
 export function assertAgentIdentityIdAllowed(id: string): void {
@@ -117,7 +118,6 @@ function collectSource(
   identities: AgentIdentity[],
   failures: AgentSourceFailure[],
 ): void {
-  if (source.kind === 'claude-subscription' || isClaudeSubscriptionSource(source.id)) return
   const catalogState = source.modelCatalogState?.status
     ?? (!source.enabled ? 'disabled' : source.models.length > 0 ? 'ready' : 'idle')
   if (!source.enabled) {

@@ -7,7 +7,7 @@ import { agentOwnerKey, agentRunOwner, requireAgentDescription, requireAgentWork
 import * as feishu from './feishu'
 import { config } from './config'
 import { claudeTranslationModeEnabled } from './claude-translation-mode'
-import { assertAgentIdentityIdAllowed, assertAgentSourceAllowed, getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
+import { assertAgentIdentityIdAllowed, assertAgentSourceAllowed, isClaudeSubscriptionSourceId, getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
 import { AgentWorkerFailure, startAgentWorker, type AgentWorkerHandle } from './agent-runner'
 import { agentApiUrl } from './agent-runtime'
 import { workspaceKey } from './workspace'
@@ -515,6 +515,13 @@ export class AgentService {
       if (identity.status !== 'ready') throw new Error(`${identity.displayName}: ${identity.reason ?? identity.status}`)
       return identity
     })
+    if (identities.some(identity => isClaudeSubscriptionSourceId(identity.tokenSourceId))) {
+      const subCount = identities.filter(identity => isClaudeSubscriptionSourceId(identity.tokenSourceId)).length
+      const busy = [...this.runs.values()].some(run => run.snapshot.workers.some(worker =>
+        isClaudeSubscriptionSourceId(worker.tokenSourceId)
+        && (worker.status === 'running' || worker.status === 'queued' || worker.status === 'needs_input')))
+      if (busy || subCount > 1) throw new Error('CLAUDE_SUB_BUSY: another Claude subscription agent run is active; at most 1 concurrent run (fall back to another identity)')
+    }
     const workers = identities.map(identity => workerSnapshot(
       identity,
       resolveEffort(identity, request.effort),

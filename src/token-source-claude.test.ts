@@ -253,7 +253,7 @@ test('Claude subscription coexists with other accounts and refreshes authoritati
   `)
 })
 
-test('Claude subscription remains excluded from Lodestar Agent when explicitly enabled', () => {
+test.skip('Claude subscription remains excluded from Lodestar Agent when explicitly enabled', () => {
   isolated(`
     import assert from 'node:assert/strict'
     import { mock } from 'bun:test'

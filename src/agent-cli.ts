@@ -441,7 +441,7 @@ function usage(): string {
     '  lodestar-agent cancel <run_id>',
     '  lodestar-agent --project <project> requests reconcile --request <id> --expected-binding <id> --stopped --reason <text> [--json]',
     '',
-    "Lodestar Agent does not support Claude subscription calls; comply with Claude's user agreement. Third-party Claude sources remain supported.",
+    'Claude subscription (claude-sub) is allowed locally: max 1 concurrent run (CLAUDE_SUB_BUSY).',
     'Use --prompt <text> instead of --stdin for inline input. --no-wait returns the started run as JSON.',
     'Agent task calls must use the managed-session context. --project is only for independent services and applications.',
     'Without --project, the existing managed-session context is required; invalid contexts never switch modes.',

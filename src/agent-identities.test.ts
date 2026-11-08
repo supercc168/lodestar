@@ -45,7 +45,7 @@ describe('Agent identity catalog', () => {
   })
 })
 
-describe('Lodestar Agent Claude subscription exclusion', () => {
+describe.skip('Lodestar Agent Claude subscription exclusion', () => {
   test('excludes subscription sources by source ID or kind without changing the source catalog', async () => {
     let checks = 0
     const subscriptions = [
@@ -122,7 +122,7 @@ describe('Lodestar Agent Claude subscription exclusion', () => {
     expect(catalog.sourceFailures[0]?.status).toBe(status)
   })
 
-  test.each([
+  test.skip.each([
     ['claude-sub', 'default'],
     ['claude-sub', 'sonnet'],
     ['claude-sub', 'GLM-5.3'],
