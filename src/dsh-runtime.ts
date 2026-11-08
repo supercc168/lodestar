@@ -24,7 +24,34 @@ export interface DshRuntimeOptions {
   patches?: string[]
 }
 
-export function dshProviderPatches(env: Record<string, string | undefined>): object[] {
+export interface DshProviderPatchOptions {
+  /**
+   * dsh >= 0.2.2-rc.1 gates startup on the official DeepSeek connection chain
+   * (`connection` is required), which can never activate under the pi-ai
+   * providers. Older runtimes lack that chain, so they keep their defaults.
+   */
+  disableDeepseekChain?: boolean
+}
+
+/** Official DeepSeek platform plugins that only make sense with DeepSeek login. */
+const DEEPSEEK_CHAIN_PLUGIN_IDS = ['authorization', 'deepseek-account', 'connection', 'file-upload', 'schedule']
+
+/**
+ * Whether the installed runtime ships the DeepSeek connection chain that newer
+ * releases make a startup requirement. Older releases have no such package and
+ * must keep their default chain enabled.
+ */
+export function dshGatesOnConnectionChain(runtimeRoot: string): boolean {
+  try {
+    createRequire(join(runtimeRoot, 'package.json')).resolve('@deepseek-ai/dsh-connection/package.json')
+    return true
+  } catch { return false }
+}
+
+export function dshProviderPatches(
+  env: Record<string, string | undefined>,
+  options: DshProviderPatchOptions = {},
+): object[] {
   const provider = env.LODESTAR_DSH_PROVIDER ?? 'deepseek-official'
   if (provider === 'deepseek-official') return []
   if (provider !== 'zai-coding-cn' && provider !== 'zai' && provider !== 'openai-relay') throw new Error(`Unsupported DSH provider: ${provider}`)
@@ -33,7 +60,11 @@ export function dshProviderPatches(env: Record<string, string | undefined>): obj
     throw new Error('Invalid DSH GLM model catalog')
   }
   const apiKeyEnv = provider === 'openai-relay' ? 'LODESTAR_DSH_OPENAI_API_KEY' : 'LODESTAR_DSH_GLM_API_KEY'
+  const deepseekChain = options.disableDeepseekChain
+    ? DEEPSEEK_CHAIN_PLUGIN_IDS.map(id => ({ id, disabled: true }))
+    : []
   return [
+    ...deepseekChain,
     { id: 'llm-deepseek', disabled: true },
     { id: 'llm-pi-ai', disabled: false, config: { providers: { [provider]: {
       apiKeyEnv, baseURL: env.LODESTAR_DSH_BASE_URL,
@@ -106,7 +137,11 @@ export class DshRuntime extends EventEmitter {
     const require = createRequire(join(runtimeRoot, 'package.json'))
     const manifestPath = require.resolve('@deepseek-ai/dsh/package.json')
     const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'))
-    const providerPatches = dshProviderPatches(opts.env)
+    // 0.2.2-rc.1 起官方连接链是启动必需；pi-ai 档位下它永远激活不了，
+    // 只在实际安装的运行时带该链时禁用，0.2.0/0.2.1 保持默认。
+    const providerPatches = dshProviderPatches(opts.env, {
+      disableDeepseekChain: dshGatesOnConnectionChain(runtimeRoot),
+    })
     const home = opts.home ?? DSH_HOME_DIR
     mkdirSync(home, { recursive: true, mode: 0o700 })
     const mcp = projectMcpRows(opts.cwd, opts.profile)

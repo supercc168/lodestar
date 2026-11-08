@@ -2,7 +2,7 @@ import { afterEach, describe, expect, test } from 'bun:test'
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { profileProvidesAskUser } from './dsh-runtime'
+import { dshGatesOnConnectionChain, dshProviderPatches, profileProvidesAskUser } from './dsh-runtime'
 
 const roots: string[] = []
 function runtimeRoot(patch?: string): string {
@@ -43,5 +43,45 @@ describe('DSH ask-user profile detection', () => {
   test('missing profile packages keep the explicit insert instead of failing', () => {
     expect(profileProvidesAskUser(runtimeRoot())).toBe(false)
     expect(profileProvidesAskUser(join(tmpdir(), 'lodestar-missing-runtime-root'))).toBe(false)
+  })
+})
+
+describe('DSH provider patches across runtime generations', () => {
+  const chainIds = ['authorization', 'deepseek-account', 'connection', 'file-upload', 'schedule']
+  const glm = { LODESTAR_DSH_PROVIDER: 'zai-coding-cn' }
+
+  function withConnectionChain(root: string): string {
+    const pkg = join(root, 'node_modules', '@deepseek-ai', 'dsh-connection')
+    mkdirSync(pkg, { recursive: true })
+    writeFileSync(join(pkg, 'package.json'), '{"name":"@deepseek-ai/dsh-connection","version":"0.2.2-rc.1"}')
+    return root
+  }
+
+  test('0.2.0/0.2.1 runtimes keep their default chain', () => {
+    const root = runtimeRoot()
+    expect(dshGatesOnConnectionChain(root)).toBe(false)
+    const ids = dshProviderPatches(glm).map((entry: any) => entry.id)
+    for (const id of chainIds) expect(ids).not.toContain(id)
+    expect(ids).toContain('llm-deepseek')
+    expect(ids).toContain('llm-pi-ai')
+  })
+
+  test('0.2.2-rc.1 runtimes disable the chain under pi-ai providers', () => {
+    const root = withConnectionChain(runtimeRoot())
+    expect(dshGatesOnConnectionChain(root)).toBe(true)
+    const patches = dshProviderPatches(glm, { disableDeepseekChain: dshGatesOnConnectionChain(root) }) as any[]
+    for (const id of chainIds) {
+      expect(patches).toContainEqual({ id, disabled: true })
+    }
+    // pi-ai 路由本身仍然启用，官方 DeepSeek 路由仍然关闭。
+    expect(patches).toContainEqual({ id: 'llm-deepseek', disabled: true })
+    expect(patches.find(entry => entry.id === 'llm-pi-ai').disabled).toBe(false)
+  })
+
+  test('the official DeepSeek provider never receives the pi-ai patches', () => {
+    const root = withConnectionChain(runtimeRoot())
+    expect(dshProviderPatches({ LODESTAR_DSH_PROVIDER: 'deepseek-official' }, {
+      disableDeepseekChain: dshGatesOnConnectionChain(root),
+    })).toEqual([])
   })
 })
