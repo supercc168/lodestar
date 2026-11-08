@@ -22,7 +22,7 @@
  *   [imagegen]                # optional independent Images API channel
  *   api_key = "sk-..."
  *   base_url = "https://..."  # optional OpenAI-compatible proxy
- *   model = "gpt-image-2.5-flare"  # optional default CLI model
+ *   model = "gpt-image-2.6-flare"  # optional default CLI model
  *   enabled = "true"          # optional; default true iff api_key set
  *
  * Loaded synchronously at import time; downstream modules read the
@@ -149,7 +149,7 @@ export interface ImagegenConfig {
   baseUrl?: string
   /** Bearer key for the Images API (injected only into the lodestar-imagegen wrapper). */
   apiKey?: string
-  /** Default `--model` for the CLI (e.g. `gpt-image-2.5-flare`). */
+  /** Default `--model` for the CLI (e.g. `gpt-image-2.6-flare`). */
   model: string
 }
 
@@ -555,7 +555,7 @@ export function loadConfig(): LodestarConfig {
     enabled: imagegenEnabled,
     baseUrl: imagegenBaseUrl || undefined,
     apiKey: imagegenApiKey || undefined,
-    model: imagegenModelRaw || 'gpt-image-2.5-flare',
+    model: imagegenModelRaw || 'gpt-image-2.6-flare',
   }
   if (t.claude?.safe_mode !== undefined) {
     throw new Error('lodestar: safe_mode must use the [claude.safe_mode] table')

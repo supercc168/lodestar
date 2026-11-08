@@ -62,9 +62,9 @@ python "$IMAGE_GEN" edit \
 - Do not silently downgrade from CLI `gpt-image-2` or built-in `image_gen` to CLI `gpt-image-1.5`; ask first unless the user already explicitly requested `gpt-image-1.5`, `scripts/image_gen.py`, or CLI fallback.
 
 ## Defaults
-> **Lodestar note (2026-09-15).** The shipped default is `gpt-image-2.5-flare`, and the `lodestar-imagegen` wrapper injects `--model <configured>` for **both** `generate` and `edit`, so the two paths can never drift to different models. Everything below describing `gpt-image-2` applies to the whole `gpt-image-2` family (`gpt-image-2.5`, `-flare`, `-sunburst`), which shares the same flexible-size constraints. Model tiers: `gpt-image-2.5-flare` (fast, default) / `gpt-image-2.5-sunburst` (quality) / `gpt-image-2.5` (balanced) / `gpt-image-2` (previous gen, fallback).
+> **Lodestar note (2026-11-06).** The shipped default is `gpt-image-2.6-flare`, and the `lodestar-imagegen` wrapper injects `--model <configured>` for **both** `generate` and `edit`, so the two paths can never drift to different models. Everything below describing `gpt-image-2` applies to the whole `gpt-image-2` family (`gpt-image-2.6`, `-flare`, `-sunburst`, `-4k`, `gpt-image-2.5`), which shares the same flexible-size constraints. Model tiers: `gpt-image-2.6-flare` (fast, default) / `gpt-image-2.6-sunburst` (quality) / `gpt-image-2.6` (balanced) / `gpt-image-2.6-4k` (4K) / `gpt-image-2.5` (previous gen) / `gpt-image-2` (legacy fallback).
 
-- Model: `gpt-image-2.5-flare`
+- Model: `gpt-image-2.6-flare`
 - Supported model family for this CLI: GPT Image models (`gpt-image-*`)
 - Size: `auto`
 - Quality: `medium`
