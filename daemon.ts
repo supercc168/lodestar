@@ -27,7 +27,7 @@ import { pendingSourceCommands } from './src/session-commands'
 import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs'
 import { dirname } from 'node:path'
 import { Session } from './src/session'
-import { sessionActivity } from './src/session-activity'
+import { countActiveClaudeSessions, sessionActivity } from './src/session-activity'
 import * as feishu from './src/feishu'
 import { formatFeishuError } from './src/feishu-errors'
 import * as cards from './src/cards'
@@ -247,6 +247,8 @@ process.on('uncaughtException', e => {
 // ── Session registry ────────────────────────────────────────────────────
 const sessions = new Map<string, Session>()  // key = chatId
 const agentService = new AgentService()
+// Agent runs rank Claude subscription accounts with the same live chat load as main Sessions.
+agentService.setClaudeActiveSessionsSource(() => countActiveClaudeSessions(Session.all))
 const chatActor = new PerKeyActor()
 // Local, opt-in exception for restart verification; no group is enabled by
 // default and the native recovery path still owns the conversation binding.

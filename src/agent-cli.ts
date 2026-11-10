@@ -389,6 +389,11 @@ function formatRun(run: any): string {
   if (run.error) lines.push(`- Error: ${run.error}`)
   for (const worker of run.workers ?? []) {
     lines.push('', `## ${worker.identity_name ?? worker.identity_id}`, '', `Status: ${worker.status}`)
+    if (worker.model) lines.push(`Model: ${worker.model}${worker.effort ? ` · ${worker.effort}` : ''}`)
+    if (worker.claude_account_id) {
+      lines.push(`Claude account: ${worker.claude_account_name ?? worker.claude_account_id} ${worker.claude_account_quota ?? 'MISS'}`)
+      if (worker.claude_account_pool) lines.push(`Claude accounts at start: ${worker.claude_account_pool}`)
+    }
     if (worker.session_id) lines.push(`Session: ${worker.session_id}`)
     if (worker.error) lines.push('', `Error: ${worker.error}`)
     if (worker.pending_input) {

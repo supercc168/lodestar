@@ -17,6 +17,7 @@ import { bindProcessCodexAccount, DEFAULT_CODEX_ACCOUNT } from './codex-accounts
 import { CodexAccountProcess } from './codex-account-process'
 import { bindProcessClaudeAccount, claudeAccounts, DEFAULT_CLAUDE_ACCOUNT } from './claude-accounts'
 import { selectClaudeAccount } from './claude-account-selection'
+import { describeClaudeLaunchAccount, type ClaudeLaunchAccount } from './agent-claude-account'
 
 export interface AgentLaunchOptions {
   provider: AgentProvider
@@ -54,6 +55,8 @@ export interface AgentLaunchOptions {
 export interface CreatedAgentProcess {
   process: AgentProcess
   sourceRevision: string | null
+  /** Claude subscription launches that went through account selection: the chosen account and the quota it was picked on. */
+  claudeAccount?: ClaudeLaunchAccount
 }
 
 /** Single source of truth for main Sessions and delegated agents, including
@@ -188,7 +191,8 @@ export function createAgentProcess(opts: AgentLaunchOptions): CreatedAgentProces
     }
     if (claudeSubscription) bindProcessClaudeAccount(process, accountId)
     if (releaseAccount) process.once('exit', releaseAccount)
-    return { process, sourceRevision }
+    const claudeAccount = managedClaudeAccount ? describeClaudeLaunchAccount(process, requestedModel ?? '') : null
+    return { process, sourceRevision, ...(claudeAccount ? { claudeAccount } : {}) }
   }
 
   if (opts.effort !== undefined && !isCodexReasoningEffort(opts.effort)) throw new Error(`invalid Codex effort: ${opts.effort}`)

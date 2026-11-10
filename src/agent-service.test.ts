@@ -2104,3 +2104,41 @@ describe('project-owned session identity boundaries', () => {
     }
   })
 })
+
+describe('Claude subscription account reporting', () => {
+  test('passes live chat load to claude-sub workers and records the startup account on the run', async () => {
+    const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
+    const h = harness({ identities: [{ ...identity('claude-sub', 'Claude Sonnet'), model: 'sonnet' }, identity('glm')], startWorker: opts => {
+      calls.push(opts)
+      opts.callbacks?.onClaudeAccount?.({ accountId: 'vale', accountName: 'vale', quota: '4.0h·7%·[6.0d·17%]',
+        pool: 'default 1.0h·90%·[6.0d·80%]; vale 4.0h·7%·[6.0d·17%]' })
+      return resolvedHandle(result('sid-claude-sub'))
+    } })
+    h.service.setClaudeActiveSessionsSource(() => new Map([['default', 1]]))
+    const run = await h.service.startRun(h.root, { identityIds: ['agent:claude-sub'], description: '选号', prompt: 'ok' })
+    await waitFor(h.service, h.root, run.runId, 'completed')
+    expect([...calls[0]!.claudeActiveSessions!]).toEqual([['default', 1]])
+    const worker = h.service.getRun(h.root, run.runId).workers[0]!
+    expect(worker).toMatchObject({ claudeAccountId: 'vale', claudeAccountName: 'vale', claudeAccountQuota: '4.0h·7%·[6.0d·17%]' })
+    const { serializeAgentRun } = await import('./agent-api')
+    expect((serializeAgentRun(h.service.getRun(h.root, run.runId)) as any).workers[0]).toMatchObject({
+      claude_account_id: 'vale', claude_account_name: 'vale', claude_account_quota: '4.0h·7%·[6.0d·17%]',
+      claude_account_pool: 'default 1.0h·90%·[6.0d·80%]; vale 4.0h·7%·[6.0d·17%]',
+    })
+    const other = await h.service.startRun(h.root, { identityIds: ['agent:glm'], description: '第三方', prompt: 'ok' })
+    await waitFor(h.service, h.root, other.runId, 'completed')
+    expect(calls[1]!.claudeActiveSessions).toBeUndefined()
+  })
+
+  test('a failing load source does not block the launch', async () => {
+    const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
+    const h = harness({ identities: [{ ...identity('claude-sub'), model: 'sonnet' }], startWorker: opts => {
+      calls.push(opts)
+      return resolvedHandle(result('sid-claude-sub'))
+    } })
+    h.service.setClaudeActiveSessionsSource(() => { throw new Error('boom') })
+    const run = await h.service.startRun(h.root, { identityIds: ['agent:claude-sub'], description: '选号', prompt: 'ok' })
+    await waitFor(h.service, h.root, run.runId, 'completed')
+    expect(calls[0]!.claudeActiveSessions?.size).toBe(0)
+  })
+})

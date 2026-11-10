@@ -765,3 +765,55 @@ test('native resume preserves the original history classification of an external
   await expect(handle.done).resolves.toMatchObject({ sessionId: 'external-session', output: 'restored' })
   expect(classified).toEqual([])
 })
+
+test('Claude subscription workers auto-select an account at startup and report it', () => {
+  const run = Bun.spawnSync([process.execPath, '--preload', './src/test-preload.ts', '-e', `
+    import { mock } from 'bun:test'
+    import { EventEmitter } from 'node:events'
+    let currentSource
+    const launches = [], reported = [], sessions = [], recorded = []
+    mock.module('./src/token-source', () => ({ listTokenSources: () => [], getTokenSourceForAccount: () => currentSource }))
+    mock.module('./src/agent-session-registry', () => ({ rememberAgentSession() {}, isAgentSession: () => false }))
+    mock.module('./src/claude-session-accounts', () => ({
+      claudeSessionAccount: id => id === 'native-session' ? 'vale' : null,
+      recordClaudeSessionAccount: (id, account) => recorded.push([id, account]),
+    }))
+    mock.module('./src/agent-launch', () => ({ createAgentProcess: options => {
+      launches.push({ ...options, claudeActiveSessions: options.claudeActiveSessions ? [...options.claudeActiveSessions] : undefined })
+      const proc = new EventEmitter()
+      Object.assign(proc, { provider: options.provider, tokenSourceId: options.tokenSourceId, subscription: options.tokenSourceId === 'claude-sub',
+        sessionId: options.launch.kind === 'resume' ? options.launch.source.sessionId : 'fresh-session', alive: true,
+        isAlive() { return this.alive }, sendInitialize() { queueMicrotask(() => this.emit('system_init', { session_id: this.sessionId })) },
+        sendUserText() { queueMicrotask(() => this.emit('result', { is_error: false })) },
+        async kill() { this.alive = false; this.emit('exit', { code: 0 }) },
+      })
+      return { process: proc, ...(options.claudeAccountPreference === null ? { claudeAccount: { accountId: 'vale', accountName: 'vale',
+        quota: '4.0h·7%·[6.0d·17%]', pool: 'default 1.0h·90%·[6.0d·80%]; vale 4.0h·7%·[6.0d·17%]' } } : {}) }
+    } }))
+    const { startAgentWorker } = await import('./src/agent-runner')
+    const { agentIdentityId } = await import('./src/agent-identities')
+    for (const [source, resumeSessionId] of [['claude-sub', undefined], ['claude-sub', 'native-session'], ['glm', undefined]]) {
+      currentSource = { id: source, kind: source === 'claude-sub' ? 'claude-subscription' : 'api' }
+      await startAgentWorker({
+        identity: { id: agentIdentityId(source, 'sonnet'), tokenSourceId: source, provider: 'claude', model: 'sonnet', modelDisplay: 'sonnet', supportedEfforts: ['medium'] },
+        projectBound: true, resumeSessionId, effort: 'medium', workDir: process.cwd(), prompt: 'ok', hostEnv: {},
+        claudeActiveSessions: new Map([['default', 2]]),
+        callbacks: { onClaudeAccount: account => reported.push(account), onSession: id => sessions.push(id) },
+      }).done
+    }
+    console.log(JSON.stringify({ launches: launches.map(item => ({ source: item.tokenSourceId, preference: item.claudeAccountPreference,
+      fallback: item.claudeExhaustedFallbackAccountId, active: item.claudeActiveSessions })), reported, sessions, recorded }))
+  `], { cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'test' }, stdout: 'pipe', stderr: 'pipe' })
+  expect(run.exitCode, run.stderr.toString()).toBe(0)
+  const result = JSON.parse(run.stdout.toString().trim().split('\n').at(-1)!)
+  expect(result.launches).toEqual([
+    { source: 'claude-sub', preference: null, active: [['default', 2]] },
+    { source: 'claude-sub', preference: null, fallback: 'vale', active: [['default', 2]] },
+    { source: 'glm' },
+  ])
+  expect(result.reported).toHaveLength(2)
+  expect(result.reported[0]).toMatchObject({ accountId: 'vale', accountName: 'vale', quota: '4.0h·7%·[6.0d·17%]' })
+  expect(result.recorded.every(([, account]: [string, string]) => account === 'vale')).toBe(true)
+  expect(result.recorded.map(([id]: [string, string]) => id)).toEqual(expect.arrayContaining(['fresh-session', 'native-session']))
+  expect(result.sessions).toContain('fresh-session')
+})

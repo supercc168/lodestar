@@ -299,6 +299,12 @@ function serializeRun(run: AgentRunSnapshot): object {
       provider: worker.provider,
       model: worker.model,
       effort: worker.effort,
+      ...(worker.claudeAccountId ? {
+        claude_account_id: worker.claudeAccountId,
+        claude_account_name: worker.claudeAccountName,
+        claude_account_quota: worker.claudeAccountQuota,
+        claude_account_pool: worker.claudeAccountPool,
+      } : {}),
       status: worker.status,
       output: worker.output,
       ...(worker.finalOutput !== undefined ? { final_output: worker.finalOutput } : {}),

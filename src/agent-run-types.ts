@@ -77,6 +77,13 @@ export interface AgentWorkerResult {
   translationEnabled?: boolean
   provider: 'codex' | 'claude' | 'dsh'
   codexAccountId?: string
+  /** Claude subscription account picked at worker startup by quota headroom. */
+  claudeAccountId?: string
+  claudeAccountName?: string
+  /** Chosen account's cached quota at selection, e.g. `4.1h·7%·[6.9d·17%]` (percent = used) or MISS. */
+  claudeAccountQuota?: string
+  /** All enrolled accounts' cached quota at selection, to show why this account won. */
+  claudeAccountPool?: string
   model: string
   effort: string
   status: AgentWorkerStatus

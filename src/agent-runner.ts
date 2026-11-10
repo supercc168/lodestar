@@ -11,6 +11,8 @@ import { getTokenSourceForAccount } from './token-source'
 import { DELEGATED_AGENT_INSTRUCTIONS, PROJECT_AGENT_INSTRUCTIONS } from './agent-skill'
 import { shellCommandPresentation } from './cards/shell-command'
 import { boundCodexAccount } from './codex-accounts'
+import type { ClaudeLaunchAccount } from './agent-claude-account'
+import { claudeSessionAccount, recordClaudeSessionAccount } from './claude-session-accounts'
 import { logError } from './log'
 
 const INPUT_TOOLS = new Set(['AskUserQuestion', 'request_user_input'])
@@ -44,6 +46,8 @@ export interface AgentWorkerCallbacks {
   onProgress?(step: AgentStep): void
   onSession?(sessionId: string): void
   onCodexAccount?(accountId: string): void
+  /** Claude subscription account chosen at startup (no mid-run rotation). */
+  onClaudeAccount?(account: ClaudeLaunchAccount): void
 }
 
 export interface AgentWorkerHandle {
@@ -71,6 +75,8 @@ export function startAgentWorker(opts: {
   hostEnv: Record<string, string | undefined>
   /** Explicit native delegation opt-out; nested delegation is enabled by default. */
   allowDelegation?: boolean
+  /** Live chat load per Claude account; spreads the startup pick like main Sessions do. */
+  claudeActiveSessions?: ReadonlyMap<string, number>
   callbacks?: AgentWorkerCallbacks
 }): AgentWorkerHandle {
   const source = getTokenSourceForAccount(opts.identity.tokenSourceId, opts.codexAccountId)
@@ -87,13 +93,24 @@ export function startAgentWorker(opts: {
   const launch: ConversationLaunch = opts.resumeSessionId
     ? { kind: 'resume', source: { provider: opts.identity.provider, sessionId: opts.resumeSessionId, cwd: opts.workDir } }
     : { kind: 'fresh' }
-  const { process: proc } = createAgentProcess({
+  // Claude subscription workers pick the account with the most quota headroom at
+  // startup, like main Sessions. Native history is shared across accounts, so a
+  // resume may land on another account; the session's original account is only
+  // preferred when every account is exhausted. Selection failures throw here and
+  // fail the worker instead of silently using the default account.
+  const claudePool = opts.identity.provider === 'claude' && opts.identity.tokenSourceId === 'claude-sub'
+  const { process: proc, claudeAccount } = createAgentProcess({
     provider: opts.identity.provider,
     workDir: opts.workDir,
     tokenSourceId: opts.identity.tokenSourceId,
     codexAccountId: opts.codexAccountId,
     ...(opts.identity.provider === 'codex' && opts.identity.tokenSourceId === 'codex-sub'
       ? { codexAccountPreference: null } : {}),
+    ...(claudePool ? {
+      claudeAccountPreference: null,
+      ...(opts.resumeSessionId ? { claudeExhaustedFallbackAccountId: claudeSessionAccount(opts.resumeSessionId) } : {}),
+      ...(opts.claudeActiveSessions ? { claudeActiveSessions: opts.claudeActiveSessions } : {}),
+    } : {}),
     model: opts.identity.model,
     effort: opts.effort,
     launch,
@@ -105,7 +122,21 @@ export function startAgentWorker(opts: {
     serviceName: 'lodestar-agent',
     ...(opts.allowDelegation === false ? { allowDelegation: false } : {}),
   })
-  return collectAgentTurn(proc, opts.prompt, opts.callbacks, undefined, opts.resumeSessionId, !opts.projectBound,
+  let callbacks = opts.callbacks
+  if (claudePool && claudeAccount) {
+    const outer = callbacks
+    callbacks = {
+      ...outer,
+      onSession: sessionId => {
+        // Keeps the all-exhausted resume fallback on this conversation's account.
+        recordClaudeSessionAccount(sessionId, claudeAccount.accountId)
+        outer?.onSession?.(sessionId)
+      },
+    }
+    try { outer?.onClaudeAccount?.(claudeAccount) }
+    catch (error) { void proc.kill().catch(() => {}); throw error }
+  }
+  return collectAgentTurn(proc, opts.prompt, callbacks, undefined, opts.resumeSessionId, !opts.projectBound,
     opts.description ? { description: opts.description, prompt: opts.prompt } : undefined)
 }
 

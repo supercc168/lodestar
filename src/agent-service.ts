@@ -123,6 +123,7 @@ export class AgentService {
   private readonly capabilities = new Map<string, AgentPrincipal>()
   private readonly cancellationEpochBySession = new Map<string, number>()
   private readonly startingNativeSessions = new Set<string>()
+  private claudeActiveSessionsSource?: () => ReadonlyMap<string, number>
   private readonly pendingRunCreations = new Set<Promise<AgentRunSnapshot>>()
   private readonly requests = new Map<string, { hash: string; promise: Promise<AgentRunSnapshot> }>()
   private shuttingDown = false
@@ -658,6 +659,8 @@ export class AgentService {
           ? { developerInstructions: run.context!.sessionInstructions!(identity.provider) } : {}),
         profile: fullAgentProfile(feishu.projectProfileForDirectory(run.snapshot.workDir)),
         ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1' ? {} : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
+        ...(identity.provider === 'claude' && isClaudeSubscriptionSourceId(identity.tokenSourceId)
+          ? { claudeActiveSessions: this.claudeActiveSessions() } : {}),
         hostEnv: {
           // 同 session.spawnAgent:全量测试泄漏的残缺 config mock 不含 notify。
           LODESTAR_AGENT_URL: agentApiUrl(config.notify?.bind ?? '127.0.0.1', config.notify?.port ?? 9876),
@@ -693,6 +696,13 @@ export class AgentService {
           onCodexAccount: accountId => {
             if (run.cancelled) return
             worker.codexAccountId = accountId
+            this.persist(run)
+          },
+          onClaudeAccount: account => {
+            worker.claudeAccountId = account.accountId
+            worker.claudeAccountName = account.accountName
+            worker.claudeAccountQuota = account.quota
+            worker.claudeAccountPool = account.pool
             this.persist(run)
           },
           onSession: sessionId => {
@@ -758,6 +768,20 @@ export class AgentService {
       run.capabilityByIdentity.delete(identity.id)
       this.recomputeRun(run)
       this.synchronizeRunRequests(run)
+    }
+  }
+
+  /** Live main-Session load per Claude subscription account (the daemon owns Session.all). */
+  setClaudeActiveSessionsSource(source: () => ReadonlyMap<string, number>): void {
+    this.claudeActiveSessionsSource = source
+  }
+
+  private claudeActiveSessions(): ReadonlyMap<string, number> {
+    try { return this.claudeActiveSessionsSource?.() ?? new Map() }
+    catch (error) {
+      // Load counting only spreads the pick; quota ranking still applies without it.
+      logError('agent claude active session count failed', error)
+      return new Map()
     }
   }
 
