@@ -18,6 +18,7 @@ interface PromptArgs {
   identityId: string
   sessionId: string
   workDir: string
+  evidenceDir: string
   effort: string
   description: string
   prompt: string
@@ -82,6 +83,7 @@ async function runCommand(context: CliContext, argv: string[]): Promise<void> {
     ...(parsed.effort ? { effort: parsed.effort } : {}),
     ...(parsed.sessionId ? { session_id: parsed.sessionId } : {}),
     ...(parsed.workDir ? { work_dir: parsed.workDir } : {}),
+    ...(parsed.evidenceDir ? { evidence_dir: parsed.evidenceDir } : {}),
     ...(parsed.requestId ? { request_id: parsed.requestId } : {}),
     ...(parsed.requesterOpenId ? { requester_open_id: parsed.requesterOpenId } : {}),
   }
@@ -99,6 +101,7 @@ async function followUpCommand(context: CliContext, argv: string[]): Promise<voi
     ...(parsed.identityId ? { identity_id: parsed.identityId } : {}),
     ...(parsed.effort ? { effort: parsed.effort } : {}),
     ...(parsed.workDir ? { work_dir: parsed.workDir } : {}),
+    ...(parsed.evidenceDir ? { evidence_dir: parsed.evidenceDir } : {}),
     ...(parsed.requestId ? { request_id: parsed.requestId } : {}),
     ...(parsed.requesterOpenId ? { requester_open_id: parsed.requesterOpenId } : {}),
   }
@@ -183,7 +186,7 @@ async function requestsCommand(context: CliContext, argv: string[]): Promise<voi
 
 export function parsePromptArgs(argv: string[], identitiesRequired: boolean): PromptArgs {
   const out: PromptArgs = {
-    identityIds: [], identityId: '', sessionId: '', workDir: '', effort: '', description: '', prompt: '', noWait: false, readStdin: false, json: false,
+    identityIds: [], identityId: '', sessionId: '', workDir: '', evidenceDir: '', effort: '', description: '', prompt: '', noWait: false, readStdin: false, json: false,
   }
   const positional: string[] = []
   for (let i = 0; i < argv.length; i++) {
@@ -205,6 +208,9 @@ export function parsePromptArgs(argv: string[], identitiesRequired: boolean): Pr
       case '--workdir':
         if (out.workDir) throw new Error('--workdir may only be specified once')
         next(); out.workDir = argv[i]!; break
+      case '--evidence-dir':
+        if (out.evidenceDir) throw new Error('--evidence-dir may only be specified once')
+        next(); out.evidenceDir = argv[i]!; break
       case '--session':
         if (!identitiesRequired) throw new Error('--session is only supported by run; follow-up accepts a run_id')
         if (out.sessionId) throw new Error('--session may only be specified once')
@@ -438,15 +444,19 @@ function usage(): string {
     'Usage:',
     '  lodestar-agent --project <project-or-worktree> <command> [options]',
     '  lodestar-agent identities [--json]',
-    '  lodestar-agent run --identity <id> [--identity <id>...] --description <summary> [--workdir <path>] [--effort <level>] [--json] --stdin',
-    '  lodestar-agent run --session <session_id> [--identity <id>] --description <summary> [--workdir <path>] [--effort <level>] [--json] --stdin',
-    '  lodestar-agent follow-up <run_id> [--identity <id>] --description <summary> [--workdir <path>] [--effort <level>] [--json] --stdin',
+    '  lodestar-agent run --identity <id> [--identity <id>...] --description <summary> [--workdir <path>] [--evidence-dir <path>] [--effort <level>] [--json] --stdin',
+    '  lodestar-agent run --session <session_id> [--identity <id>] --description <summary> [--workdir <path>] [--evidence-dir <path>] [--effort <level>] [--json] --stdin',
+    '  lodestar-agent follow-up <run_id> [--identity <id>] --description <summary> [--workdir <path>] [--evidence-dir <path>] [--effort <level>] [--json] --stdin',
     '  lodestar-agent answer <run_id> [--identity <id>] --request <id> (--answer key=value | --stdin)',
     '  lodestar-agent status <run_id> [--json]',
     '  lodestar-agent cancel <run_id>',
     '  lodestar-agent --project <project> requests reconcile --request <id> --expected-binding <id> --stopped --reason <text> [--json]',
     '',
-    'Claude subscription (claude-sub) is allowed locally: max 1 concurrent run (CLAUDE_SUB_BUSY).',
+    'Claude subscription (claude-sub) Agent runs: at most 4 concurrent overall and 2 per account by default ([agent] claude_sub_max_concurrent / claude_sub_max_per_account in config.toml, or LODESTAR_CLAUDE_SUB_MAX_CONCURRENT / LODESTAR_CLAUDE_SUB_MAX_PER_ACCOUNT).',
+    'The account is picked at admission by quota (5h used >= 80% or weekly >= 90% is excluded) and kept for the whole run; when no account can take it the run is rejected with CLAUDE_SUB_FULL (use another identity such as Codex Sol).',
+    'Runs whose work_dir, Unity project or --evidence-dir overlaps an active run are queued (status queued, queued_reason) and start automatically in FIFO order.',
+    'claude-sub 只开放 Opus（agent:Y2xhdWRlLXN1YgBvcHVz，别名 opus 跟随最新 Opus）；effort 仅 medium（默认，常规任务）/ max（难任务）。',
+    '旧的 claude-sub 非 Opus run 仍可 follow-up / --session 续接原会话，但不能用于新任务。',
     'Use --prompt <text> instead of --stdin for inline input. --no-wait returns the started run as JSON.',
     'Agent task calls must use the managed-session context. --project is only for independent services and applications.',
     'Without --project, the existing managed-session context is required; invalid contexts never switch modes.',

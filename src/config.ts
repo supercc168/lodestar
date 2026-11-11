@@ -121,11 +121,20 @@ export interface LodestarConfig {
   deepseek_harness?: DeepseekHarnessConfig
   /** [token_source.<id>] 账号配置；群内启用和补录会更新对应节。 */
   token_sources: Record<string, TokenSourceConfig>
+  /** Optional `[agent]` table: Lodestar Agent admission limits (code defaults apply when absent). */
+  agent?: AgentAdmissionConfig
   /** 通用中转站端点；每个条目由 API Key、地址和协议类型定义。 */
   relays: Record<string, RelayConfig>
 }
 
 /** `[deepseek-harness]` 账号段(ND-03 本地定形,全标量,parseToml 语义内)。 */
+export interface AgentAdmissionConfig {
+  /** Concurrent Claude subscription Agent runs across all accounts (default 4). */
+  claude_sub_max_concurrent?: number
+  /** Concurrent Claude subscription Agent runs per account (default 2). */
+  claude_sub_max_per_account?: number
+}
+
 export interface DeepseekHarnessConfig {
   /** 飞书展示名;缺省 'DeepSeek Harness'。 */
   display?: string
@@ -570,6 +579,13 @@ export function loadConfig(): LodestarConfig {
     }
     claudeSafeMode[sourceId] = models
   }
+  const agentAdmission: AgentAdmissionConfig = {}
+  for (const [field, raw] of Object.entries(t.agent ?? {})) {
+    if (field !== 'claude_sub_max_concurrent' && field !== 'claude_sub_max_per_account') continue
+    const value = Number(raw.trim())
+    if (!Number.isSafeInteger(value) || value < 1) throw new Error(`lodestar: [agent].${field} must be a positive integer`)
+    agentAdmission[field] = value
+  }
   return {
     feishu: { app_id: appId, app_secret: appSecret },
     runtime: { projects_root: projectsRoot, live_elapsed: liveElapsed, agent_auto_update: agentAutoUpdate },
@@ -597,6 +613,7 @@ export function loadConfig(): LodestarConfig {
     deepseek_harness: deepseekHarnessSection(),
     token_sources: tokenSourceSections(),
     relays: relaySections(),
+    ...(Object.keys(agentAdmission).length ? { agent: agentAdmission } : {}),
   }
 }
 

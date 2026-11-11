@@ -12,6 +12,7 @@ import type { AgentInputRequest, AgentRunSnapshot } from './agent-run-types'
 import { AGENT_RUNS_DIR } from './paths'
 import { projectProfiles, sentLocalFiles } from './feishu-test-mock'
 import { config } from './config'
+import { claudeSubFullError } from './agent-admission'
 
 function identity(id: string, name = id): AgentIdentity {
   return {
@@ -29,6 +30,11 @@ const testDir = realpathSync(mkdtempSync(join(tmpdir(), 'lodestar-agent-service-
 mkdirSync(join(testDir, 'repo', 'packages', 'app'), { recursive: true })
 mkdirSync(join(testDir, 'other'))
 afterAll(() => rmSync(testDir, { recursive: true, force: true }))
+/** Separate sibling work_dir under the session root, so concurrent runs do not share a collision lock. */
+function lane(name: string): string {
+  mkdirSync(join(testDir, 'repo', 'lanes', name), { recursive: true })
+  return `lanes/${name}`
+}
 
 const session = {
   sessionName: 'project', chatId: 'chat-1', workDir: join(testDir, 'repo'),
@@ -88,6 +94,7 @@ function completedHistory(count: number, chain = false): AgentRunSnapshot[] {
 function harness(opts: {
   requestStore?: AgentRequestStore
   identities?: AgentIdentity[]
+  resumeOnly?: AgentIdentity[]
   startWorker?: AgentServiceDeps['startWorker']
   loadArtifacts?: AgentServiceDeps['loadArtifacts']
   sendCard?: AgentServiceDeps['sendCard']
@@ -96,9 +103,11 @@ function harness(opts: {
   replaceElementChecked?: (cardId: string, elementId: string, element: object) => Promise<boolean>
   getChatTailMessageId?: AgentServiceDeps['getChatTailMessageId']
   sendTextRaw?: AgentServiceDeps['sendTextRaw']
+  selectClaudeAccount?: AgentServiceDeps['selectClaudeAccount']
 } = {}) {
   const identities = opts.identities ?? [identity('a', 'Agent A')]
-  const catalog: AgentIdentityCatalog = { catalogGeneration: 'g1', identities, sourceFailures: [] }
+  const catalog: AgentIdentityCatalog = { catalogGeneration: 'g1', identities, sourceFailures: [],
+    ...(opts.resumeOnly ? { resumeOnly: opts.resumeOnly } : {}) }
   const artifacts: unknown[] = []
   const textArtifacts = new Map<string, string>()
   const artifactReads: string[] = []
@@ -128,6 +137,7 @@ function harness(opts: {
       return text
     },
     loadArtifacts: opts.loadArtifacts ?? (() => []),
+    selectClaudeAccount: opts.selectClaudeAccount ?? (() => 'default'),
   }
   const service = new AgentService(deps)
   return { service, root: service.rootPrincipal(session), artifacts, textArtifacts, artifactReads, texts }
@@ -1132,7 +1142,7 @@ describe('AgentService', () => {
         expect(next.run.depth).toBe(depth)
         descendants.push(next)
       }
-      const unrelated = await spawn(owner, 'unrelated')
+      const unrelated = await spawn(owner, 'unrelated', lane('unrelated'))
       expect(() => service.getRun(parent.principal, unrelated.run.runId)).toThrow('not found')
       await expect(service.cancelRun(parent.principal, parent.run.runId)).rejects.toThrow('containing run')
       if (kind === 'project') {
@@ -1405,6 +1415,7 @@ describe('AgentService', () => {
     try {
       const runs = await Promise.all(Array.from({ length: 65 }, (_, index) => service.startRun(principal, {
         description: `并行任务 ${index}`, identityIds: identities.map(item => item.id), prompt: 'parallel work',
+        workDir: lane(`parallel-${index}`),
       })))
       await waitForCondition(() => controls.length === 130)
       for (const run of runs) {
@@ -1459,7 +1470,7 @@ describe('AgentService', () => {
     })
     try {
       const runs = []
-      for (const item of identities) runs.push(await service.startRun(root, { description: '任务说明', identityIds: [item.id], prompt: 'work' }))
+      for (const item of identities) runs.push(await service.startRun(root, { description: '任务说明', identityIds: [item.id], prompt: 'work', workDir: lane(item.id.replace(/\W/g, '-')) }))
       await waitForCondition(() => controls.size === 4)
       await service.cancelRun(root, runs[2]!.runId, 'cancel another task')
       const first = controls.get(identities[0]!.id)!
@@ -1506,10 +1517,10 @@ describe('AgentService', () => {
       },
     })
     try {
-      const first = await service.startRun(root, { description: '任务说明', identityIds: [identities[0]!.id], prompt: 'ask if needed' })
+      const first = await service.startRun(root, { description: '任务说明', identityIds: [identities[0]!.id], prompt: 'ask if needed', workDir: lane('input-a') })
       await waitFor(service, root, first.runId, 'needs_input')
-      const second = await service.startRun(root, { description: '任务说明', identityIds: [identities[1]!.id], prompt: 'work' })
-      const third = await service.startRun(root, { description: '任务说明', identityIds: [identities[2]!.id], prompt: 'wait' })
+      const second = await service.startRun(root, { description: '任务说明', identityIds: [identities[1]!.id], prompt: 'work', workDir: lane('input-b') })
+      const third = await service.startRun(root, { description: '任务说明', identityIds: [identities[2]!.id], prompt: 'wait', workDir: lane('input-c') })
       await waitForCondition(() => controls.size === 3)
       expect(service.getRun(root, first.runId).status).toBe('needs_input')
       expect(service.getRun(root, third.runId).status).toBe('running')
@@ -1551,9 +1562,9 @@ describe('AgentService', () => {
       },
     })
     try {
-      const first = await service.startRun(root, { description: '任务说明', identityIds: [identities[0]!.id], prompt: 'work' })
-      await service.startRun(root, { description: '任务说明', identityIds: [identities[1]!.id], prompt: 'work' })
-      const third = await service.startRun(root, { description: '任务说明', identityIds: [identities[2]!.id], prompt: 'wait' })
+      const first = await service.startRun(root, { description: '任务说明', identityIds: [identities[0]!.id], prompt: 'work', workDir: lane('retain-a') })
+      await service.startRun(root, { description: '任务说明', identityIds: [identities[1]!.id], prompt: 'work', workDir: lane('retain-b') })
+      const third = await service.startRun(root, { description: '任务说明', identityIds: [identities[2]!.id], prompt: 'wait', workDir: lane('retain-c') })
       await waitForCondition(() => controls.size === 3)
       await expect(service.cancelRun(root, first.runId, 'stop')).rejects.toThrow('kill was not confirmed')
       expect(service.getRun(root, first.runId).status).toBe('failed')
@@ -1730,8 +1741,8 @@ describe('project-owned Agent runs', () => {
     const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
     const h = harness({ startWorker: opts => { calls.push(opts); return controls[calls.length - 1].handle } })
     const project = h.service.projectPrincipal(context())
-    const sessionRun = await h.service.startRun(h.root, request)
-    const projectRun = await h.service.startRun(project, request)
+    const sessionRun = await h.service.startRun(h.root, { ...request, workDir: lane('same-chat-session') })
+    const projectRun = await h.service.startRun(project, { ...request, workDir: lane('same-chat-project') })
     await waitFor(h.service, project, projectRun.runId, 'running')
     await waitForCondition(() => calls.length === 2)
     expect(calls[0].codexAccountId).toBe('default')
@@ -2106,18 +2117,26 @@ describe('project-owned session identity boundaries', () => {
 })
 
 describe('Claude subscription account reporting', () => {
-  test('passes live chat load to claude-sub workers and records the startup account on the run', async () => {
+  test('reserves the account at admission with live chat load and records it on the run', async () => {
     const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
-    const h = harness({ identities: [{ ...identity('claude-sub', 'Claude Sonnet'), model: 'sonnet' }, identity('glm')], startWorker: opts => {
-      calls.push(opts)
-      opts.callbacks?.onClaudeAccount?.({ accountId: 'vale', accountName: 'vale', quota: '4.0h·7%·[6.0d·17%]',
-        pool: 'default 1.0h·90%·[6.0d·80%]; vale 4.0h·7%·[6.0d·17%]' })
-      return resolvedHandle(result('sid-claude-sub'))
-    } })
+    const picks: any[] = []
+    const h = harness({ identities: [{ ...identity('claude-sub', 'Claude Sonnet'), model: 'sonnet' }, identity('glm')],
+      selectClaudeAccount: options => { picks.push(options); return 'vale' },
+      startWorker: opts => {
+        calls.push(opts)
+        opts.callbacks?.onClaudeAccount?.({ accountId: 'vale', accountName: 'vale', quota: '4.0h·7%·[6.0d·17%]',
+          pool: 'default 1.0h·90%·[6.0d·80%]; vale 4.0h·7%·[6.0d·17%]' })
+        return resolvedHandle(result('sid-claude-sub'))
+      } })
     h.service.setClaudeActiveSessionsSource(() => new Map([['default', 1]]))
     const run = await h.service.startRun(h.root, { identityIds: ['agent:claude-sub'], description: '选号', prompt: 'ok' })
     await waitFor(h.service, h.root, run.runId, 'completed')
-    expect([...calls[0]!.claudeActiveSessions!]).toEqual([['default', 1]])
+    expect(picks).toHaveLength(1)
+    expect([...picks[0].activeSessions]).toEqual([['default', 1]])
+    expect([...picks[0].agent.runs]).toEqual([])
+    expect(picks[0].agent.limits).toMatchObject({ global: 4, perAccount: 2, fiveHourMaxUsed: 80, weeklyMaxUsed: 90 })
+    expect(calls[0]!.claudeAccountId).toBe('vale')
+    expect(calls[0]!.claudeActiveSessions).toBeUndefined()
     const worker = h.service.getRun(h.root, run.runId).workers[0]!
     expect(worker).toMatchObject({ claudeAccountId: 'vale', claudeAccountName: 'vale', claudeAccountQuota: '4.0h·7%·[6.0d·17%]' })
     const { serializeAgentRun } = await import('./agent-api')
@@ -2127,18 +2146,316 @@ describe('Claude subscription account reporting', () => {
     })
     const other = await h.service.startRun(h.root, { identityIds: ['agent:glm'], description: '第三方', prompt: 'ok' })
     await waitFor(h.service, h.root, other.runId, 'completed')
-    expect(calls[1]!.claudeActiveSessions).toBeUndefined()
+    expect(picks).toHaveLength(1)
+    expect(calls[1]!.claudeAccountId).toBeUndefined()
   })
 
   test('a failing load source does not block the launch', async () => {
     const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
-    const h = harness({ identities: [{ ...identity('claude-sub'), model: 'sonnet' }], startWorker: opts => {
-      calls.push(opts)
-      return resolvedHandle(result('sid-claude-sub'))
-    } })
+    const picks: any[] = []
+    const h = harness({ identities: [{ ...identity('claude-sub'), model: 'sonnet' }],
+      selectClaudeAccount: options => { picks.push(options); return 'default' },
+      startWorker: opts => { calls.push(opts); return resolvedHandle(result('sid-claude-sub')) } })
     h.service.setClaudeActiveSessionsSource(() => { throw new Error('boom') })
     const run = await h.service.startRun(h.root, { identityIds: ['agent:claude-sub'], description: '选号', prompt: 'ok' })
     await waitFor(h.service, h.root, run.runId, 'completed')
-    expect(calls[0]!.claudeActiveSessions?.size).toBe(0)
+    expect(picks[0].activeSessions.size).toBe(0)
+    expect(calls[0]!.claudeAccountId).toBe('default')
+  })
+})
+
+describe('Lodestar Agent admission: claude-sub caps and collision locks', () => {
+  const sub: AgentIdentity = { ...identity('claude-sub', 'Claude Opus'), model: 'opus', defaultEffort: 'medium', supportedEfforts: ['medium', 'max'] }
+  const codex = identity('codex')
+
+  function withEnv<T>(values: Record<string, string>, body: () => Promise<T>): Promise<T> {
+    const saved = Object.fromEntries(Object.keys(values).map(key => [key, process.env[key]]))
+    Object.assign(process.env, values)
+    return body().finally(() => {
+      for (const [key, value] of Object.entries(saved)) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    })
+  }
+
+  /** Per-prompt controllable workers. */
+  function controlledHarness(extra: Parameters<typeof harness>[0] = {}) {
+    const controls = new Map<string, ReturnType<typeof controlledHandle>>()
+    const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
+    const h = harness({ identities: [sub, codex], ...extra, startWorker: opts => {
+      calls.push(opts)
+      const control = controlledHandle()
+      controls.set(opts.prompt, control)
+      return control.handle
+    } })
+    return { ...h, controls, calls }
+  }
+
+  /** Mirrors the real per-account gate: first account under the cap, else CLAUDE_SUB_FULL. */
+  const poolSelect = (accounts: string[]): AgentServiceDeps['selectClaudeAccount'] => options => {
+    const runs = options.agent!.runs
+    const free = accounts.find(id => (runs.get(id) ?? 0) < options.agent!.limits.perAccount)
+    if (!free) throw claudeSubFullError('every account is at its per-account cap')
+    return free
+  }
+
+  test('global cap: the 3rd concurrent claude-sub run is rejected until a slot frees', () => withEnv({
+    LODESTAR_CLAUDE_SUB_MAX_CONCURRENT: '2', LODESTAR_CLAUDE_SUB_MAX_PER_ACCOUNT: '9',
+  }, async () => {
+    const h = controlledHarness({ selectClaudeAccount: poolSelect(['default']) })
+    try {
+      const a = await h.service.startRun(h.root, { identityIds: [sub.id], description: 'A', prompt: 'cap-a', workDir: lane('cap-a') })
+      const b = await h.service.startRun(h.root, { identityIds: [sub.id], description: 'B', prompt: 'cap-b', workDir: lane('cap-b') })
+      await waitForCondition(() => h.controls.size === 2)
+      await expect(h.service.startRun(h.root, { identityIds: [sub.id], description: 'C', prompt: 'cap-c', workDir: lane('cap-c') }))
+        .rejects.toThrow(/CLAUDE_SUB_FULL: global cap 2 reached[\s\S]*agent:Y29kZXgtc3ViAGdwdC02LjEtc29s/)
+      // Other providers are not capped by claude-sub slots.
+      const other = await h.service.startRun(h.root, { identityIds: [codex.id], description: 'Sol', prompt: 'cap-codex', workDir: lane('cap-codex') })
+      await waitFor(h.service, h.root, other.runId, 'running')
+      h.controls.get('cap-a')!.resolve(result('sid-cap-a'))
+      await waitFor(h.service, h.root, a.runId, 'completed')
+      const c = await h.service.startRun(h.root, { identityIds: [sub.id], description: 'C', prompt: 'cap-c', workDir: lane('cap-c') })
+      await waitFor(h.service, h.root, c.runId, 'running')
+      expect(h.service.getRun(h.root, b.runId).status).toBe('running')
+    } finally { await h.service.shutdown('test cleanup') }
+  }))
+
+  test('per-account cap with synchronous reservation: simultaneous requests spread, the overflow is rejected without fallback', () => withEnv({
+    LODESTAR_CLAUDE_SUB_MAX_CONCURRENT: '4', LODESTAR_CLAUDE_SUB_MAX_PER_ACCOUNT: '1',
+  }, async () => {
+    let releaseCards!: () => void
+    const cardsHeld = new Promise<void>(resolve => { releaseCards = resolve })
+    const h = controlledHarness({ selectClaudeAccount: poolSelect(['default', 'vale']),
+      // Every admission parks on card creation, so all three overlap before any run is registered.
+      sendCard: async () => { await cardsHeld; return 'message-1' } })
+    try {
+      const requests = ['race-a', 'race-b', 'race-c'].map(prompt => h.service.startRun(h.root,
+        { identityIds: [sub.id], description: prompt, prompt, workDir: lane(prompt) }))
+      const settled = Promise.allSettled(requests)
+      releaseCards()
+      const outcomes = await settled
+      const admitted = outcomes.filter(item => item.status === 'fulfilled').map(item => (item as PromiseFulfilledResult<AgentRunSnapshot>).value)
+      const rejected = outcomes.filter(item => item.status === 'rejected') as PromiseRejectedResult[]
+      expect(admitted).toHaveLength(2)
+      expect(rejected).toHaveLength(1)
+      expect(String(rejected[0]!.reason)).toContain('CLAUDE_SUB_FULL')
+      expect(admitted.map(run => run.workers[0]!.claudeAccountId).sort()).toEqual(['default', 'vale'])
+      await waitForCondition(() => h.calls.length === 2)
+      expect(h.calls.map(call => call.claudeAccountId).sort()).toEqual(['default', 'vale'])
+      // The account stays locked for the run; a finished run frees exactly its own account.
+      const valeRun = admitted.find(run => run.workers[0]!.claudeAccountId === 'vale')!
+      h.controls.get(valeRun.prompt)!.resolve(result('sid-vale'))
+      await waitFor(h.service, h.root, valeRun.runId, 'completed')
+      const next = await h.service.startRun(h.root, { identityIds: [sub.id], description: 'next', prompt: 'race-next', workDir: lane('race-next') })
+      expect(next.workers[0]!.claudeAccountId).toBe('vale')
+    } finally { await h.service.shutdown('test cleanup') }
+  }))
+
+  test('all accounts full or quota-excluded: rejected with CLAUDE_SUB_FULL, nothing started, no slot leaked', async () => {
+    let full = true
+    const h = controlledHarness({ selectClaudeAccount: () => {
+      if (full) throw claudeSubFullError('默认：周额度已用 100% ≥ 90%；vale：5h 已用 85% ≥ 80%')
+      return 'vale'
+    } })
+    try {
+      await expect(h.service.startRun(h.root, { identityIds: [sub.id], description: 'full', prompt: 'full', workDir: lane('full') }))
+        .rejects.toThrow('CLAUDE_SUB_FULL')
+      expect(h.calls).toHaveLength(0)
+      full = false
+      for (let index = 0; index < 4; index++) {
+        const run = await h.service.startRun(h.root, { identityIds: [sub.id], description: 'ok', prompt: `full-${index}`, workDir: lane(`full-${index}`) })
+        expect(run.workers[0]!.claudeAccountId).toBe('vale')
+      }
+    } finally { await h.service.shutdown('test cleanup') }
+  })
+
+  test('a Claude subscription worker cannot delegate onward through claude-sub', async () => {
+    const h = controlledHarness()
+    try {
+      await h.service.startRun(h.root, { identityIds: [sub.id], description: 'parent', prompt: 'nest-parent', workDir: lane('nest') })
+      await waitForCondition(() => h.calls.length === 1)
+      const worker = h.service.principalForCapability(h.calls[0]!.hostEnv.LODESTAR_AGENT_CAPABILITY!)!
+      await expect(h.service.startRun(worker, { identityIds: [sub.id], description: 'child', prompt: 'nest-child' }))
+        .rejects.toThrow('CLAUDE_SUB_NESTED')
+      const child = await h.service.startRun(worker, { identityIds: [codex.id], description: 'child', prompt: 'nest-codex' })
+      // Same run tree: the child shares the parent's work_dir lock instead of queueing behind it.
+      await waitFor(h.service, h.root, child.runId, 'running')
+    } finally { await h.service.shutdown('test cleanup') }
+  })
+
+  test('collision lock: overlapping runs queue (visible in status) and start FIFO; other directories run at once', async () => {
+    const h = controlledHarness()
+    try {
+      const shared = lane('fifo')
+      const a = await h.service.startRun(h.root, { identityIds: [codex.id], description: 'A', prompt: 'fifo-a', workDir: shared })
+      const b = await h.service.startRun(h.root, { identityIds: [sub.id], description: 'B', prompt: 'fifo-b', workDir: shared })
+      const free = await h.service.startRun(h.root, { identityIds: [codex.id], description: 'free', prompt: 'fifo-free', workDir: lane('fifo-free') })
+      const c = await h.service.startRun(h.root, { identityIds: [codex.id], description: 'C', prompt: 'fifo-c' })
+      await waitFor(h.service, h.root, a.runId, 'running')
+      await waitFor(h.service, h.root, free.runId, 'running')
+      for (const run of [b, c]) {
+        const current = h.service.getRun(h.root, run.runId)
+        expect(current.status).toBe('queued')
+        expect(current.workers[0]!.status).toBe('queued')
+        expect(current.workers[0]!.queuedReason).toContain('撞车锁排队')
+      }
+      // C (the session root) overlaps A's lane and must wait behind B as well.
+      expect(h.service.getRun(h.root, c.runId).workers[0]!.queuedReason).toContain(a.runId)
+      const { serializeAgentRun } = await import('./agent-api')
+      const serialized = serializeAgentRun(h.service.getRun(h.root, b.runId)) as any
+      expect(serialized.status).toBe('queued')
+      expect(serialized.workers[0].queued_reason).toContain('撞车锁排队')
+      expect(serialized.lock_keys).toEqual([`workdir:${join(session.workDir, 'lanes', 'fifo')}`])
+      expect(h.calls.map(call => call.prompt).sort()).toEqual(['fifo-a', 'fifo-free'])
+      h.controls.get('fifo-a')!.resolve(result('sid-a'))
+      await waitFor(h.service, h.root, b.runId, 'running')
+      expect(h.service.getRun(h.root, b.runId).workers[0]!.queuedReason).toBeUndefined()
+      expect(h.service.getRun(h.root, c.runId).status).toBe('queued')
+      h.controls.get('fifo-b')!.resolve(result('sid-b'))
+      await waitFor(h.service, h.root, b.runId, 'completed')
+      // C (session root) also overlaps the still-running lanes/fifo-free run.
+      expect(h.service.getRun(h.root, c.runId).status).toBe('queued')
+      h.controls.get('fifo-free')!.resolve(result('sid-free'))
+      await waitFor(h.service, h.root, c.runId, 'running')
+      expect(h.calls.map(call => call.prompt)).toEqual(['fifo-a', 'fifo-free', 'fifo-b', 'fifo-c'])
+    } finally { await h.service.shutdown('test cleanup') }
+  })
+
+  test('collision lock is released on failure and on cancellation, including a queued run', async () => {
+    const h = controlledHarness()
+    try {
+      const shared = lane('release')
+      const a = await h.service.startRun(h.root, { identityIds: [codex.id], description: 'A', prompt: 'rel-a', workDir: shared })
+      const b = await h.service.startRun(h.root, { identityIds: [sub.id], description: 'B', prompt: 'rel-b', workDir: shared })
+      const c = await h.service.startRun(h.root, { identityIds: [codex.id], description: 'C', prompt: 'rel-c', workDir: shared })
+      await waitFor(h.service, h.root, a.runId, 'running')
+      await h.service.cancelRun(h.root, b.runId, 'drop queued')
+      expect(h.service.getRun(h.root, b.runId).status).toBe('cancelled')
+      h.controls.get('rel-a')!.reject(new Error('boom'))
+      expect((await waitFor(h.service, h.root, a.runId, 'failed')).workers[0]!.error).toBe('boom')
+      await waitFor(h.service, h.root, c.runId, 'running')
+      expect(h.calls.map(call => call.prompt)).toEqual(['rel-a', 'rel-c'])
+      await h.service.cancelRun(h.root, c.runId, 'stop running')
+      const d = await h.service.startRun(h.root, { identityIds: [sub.id], description: 'D', prompt: 'rel-d', workDir: shared })
+      await waitFor(h.service, h.root, d.runId, 'running')
+      await waitForCondition(() => h.calls.length === 3)
+      // The cancelled queued claude-sub run released its reservation too.
+      expect(h.calls.at(-1)).toMatchObject({ prompt: 'rel-d', claudeAccountId: 'default' })
+    } finally { await h.service.shutdown('test cleanup') }
+  })
+
+  test('evidence directories and Unity project roots join the lock keys', async () => {
+    const h = controlledHarness()
+    try {
+      const evidence = join(testDir, 'evidence-shared')
+      const a = await h.service.startRun(h.root, { identityIds: [codex.id], description: 'A', prompt: 'ev-a', workDir: lane('ev-a'), evidenceDir: evidence })
+      const b = await h.service.startRun(h.root, { identityIds: [codex.id], description: 'B', prompt: 'ev-b', workDir: lane('ev-b'), evidenceDir: join(evidence, 'sub') })
+      await waitFor(h.service, h.root, a.runId, 'running')
+      const queued = h.service.getRun(h.root, b.runId)
+      expect(queued.status).toBe('queued')
+      expect(queued.evidenceDir).toBe(join(evidence, 'sub'))
+      expect(queued.workers[0]!.queuedReason).toContain(`evidence:${evidence}`)
+      mkdirSync(join(session.workDir, 'lanes', 'unity', 'Assets', 'Scripts'), { recursive: true })
+      mkdirSync(join(session.workDir, 'lanes', 'unity', 'ProjectSettings'), { recursive: true })
+      const u = await h.service.startRun(h.root, { identityIds: [codex.id], description: 'U', prompt: 'unity-a', workDir: 'lanes/unity/Assets/Scripts' })
+      expect(u.lockKeys).toEqual([
+        `workdir:${join(session.workDir, 'lanes', 'unity', 'Assets', 'Scripts')}`, `unity:${join(session.workDir, 'lanes', 'unity')}`,
+      ])
+      mkdirSync(join(session.workDir, 'lanes', 'unity', 'Packages'), { recursive: true })
+      const v = await h.service.startRun(h.root, { identityIds: [codex.id], description: 'V', prompt: 'unity-b', workDir: 'lanes/unity/Packages' })
+      expect(h.service.getRun(h.root, v.runId).status).toBe('queued')
+    } finally { await h.service.shutdown('test cleanup') }
+  })
+
+  test('daemon restart: a queued snapshot is failed on load and holds no lock afterwards', async () => {
+    const history = completedHistory(1)[0]!
+    Object.assign(history, { status: 'queued', sessionWorkDir: session.workDir, workDir: join(session.workDir, 'lanes'), lockKeys: [`workdir:${join(session.workDir, 'lanes')}`] })
+    Object.assign(history.workers[0]!, { status: 'queued', queuedReason: '撞车锁排队：x' })
+    const h = controlledHarness({ loadArtifacts: () => [history] })
+    try {
+      expect(h.service.getRun(h.root, history.runId).status).toBe('failed')
+      const run = await h.service.startRun(h.root, { identityIds: [codex.id], description: 'after restart', prompt: 'restart', workDir: lane('restart') })
+      await waitFor(h.service, h.root, run.runId, 'running')
+    } finally { await h.service.shutdown('test cleanup') }
+  })
+})
+
+describe('Lodestar Agent claude-sub: Opus only, medium / max', () => {
+  const opus: AgentIdentity = {
+    ...identity('claude-sub'), id: agentIdentityId('claude-sub', 'opus'), model: 'opus',
+    defaultEffort: 'medium', supportedEfforts: ['medium', 'max'],
+  }
+  const sonnet: AgentIdentity = {
+    ...identity('claude-sub'), id: agentIdentityId('claude-sub', 'sonnet'), model: 'sonnet',
+    defaultEffort: 'max', supportedEfforts: ['low', 'medium', 'high', 'xhigh', 'max'],
+  }
+
+  function sonnetHistory(effort = 'high'): AgentRunSnapshot {
+    const history = completedHistory(1)[0]!
+    Object.assign(history.workers[0]!, {
+      identityId: sonnet.id, identityName: sonnet.displayName, tokenSourceId: 'claude-sub', model: 'sonnet', effort,
+    })
+    return history
+  }
+
+  test('new runs default to medium, accept max, reject other efforts', async () => {
+    const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
+    const { service, root } = harness({ identities: [opus], resumeOnly: [sonnet],
+      startWorker: opts => { calls.push(opts); return resolvedHandle(result(`sid-${calls.length}`)) } })
+    const first = await service.startRun(root, { identityIds: [opus.id], description: '默认档', prompt: 'work' })
+    await waitFor(service, root, first.runId, 'completed')
+    const second = await service.startRun(root, { identityIds: [opus.id], description: '难任务', prompt: 'work', effort: 'max' })
+    await waitFor(service, root, second.runId, 'completed')
+    expect(calls.map(call => call.effort)).toEqual(['medium', 'max'])
+    for (const effort of ['low', 'high', 'xhigh', 'default', 'bogus']) {
+      await expect(service.startRun(root, { identityIds: [opus.id], description: '错档', prompt: 'work', effort }))
+        .rejects.toThrow('claude-sub 仅支持 medium / max')
+    }
+    expect(calls).toHaveLength(2)
+  })
+
+  test('new runs on non-Opus claude-sub identities are rejected with the Opus identity id', async () => {
+    const { service, root } = harness({ identities: [opus], resumeOnly: [sonnet], startWorker: () => {
+      throw new Error('must not start')
+    } })
+    for (const id of [sonnet.id, agentIdentityId('claude-sub', 'haiku'), agentIdentityId('claude-sub', 'claude-opus-5')]) {
+      await expect(service.startRun(root, { identityIds: [id], description: '非 Opus', prompt: 'work' }))
+        .rejects.toThrow(`请改用 ${opus.id}`)
+    }
+  })
+
+  test('legacy non-Opus sessions still resume with their original effort; explicit effort stays medium / max', async () => {
+    const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
+    const history = sonnetHistory('high')
+    const { service, root } = harness({ identities: [opus], resumeOnly: [sonnet], loadArtifacts: () => [history],
+      startWorker: opts => { calls.push(opts); return resolvedHandle(result(opts.resumeSessionId!)) } })
+    const followed = await service.followUp(root, history.runId, { description: '续接旧会话', prompt: 'next' })
+    await waitFor(service, root, followed.runId, 'completed')
+    const explicit = await service.followUp(root, history.runId, { identityId: sonnet.id, description: '续接旧会话', prompt: 'next', effort: 'medium' })
+    await waitFor(service, root, explicit.runId, 'completed')
+    const viaSession = await service.startRun(root, { identityIds: [], sessionId: 'sid-history-0', description: '续接旧会话', prompt: 'next' })
+    await waitFor(service, root, viaSession.runId, 'completed')
+    expect(calls.map(call => [call.identity.id, call.effort, call.resumeSessionId])).toEqual([
+      // --session resumes from the latest run of that session (the explicit medium follow-up).
+      [sonnet.id, 'high', 'sid-history-0'], [sonnet.id, 'medium', 'sid-history-0'], [sonnet.id, 'medium', 'sid-history-0'],
+    ])
+    await expect(service.followUp(root, history.runId, { description: '错档', prompt: 'next', effort: 'xhigh' }))
+      .rejects.toThrow('claude-sub 仅支持 medium / max')
+    // Switching the legacy session to Opus is allowed; inherited effort does not carry across identities.
+    const switched = await service.followUp(root, history.runId, { identityId: opus.id, description: '换 Opus', prompt: 'next' })
+    await waitFor(service, root, switched.runId, 'completed')
+    expect(calls.at(-1)).toMatchObject({ effort: 'medium', resumeSessionId: 'sid-history-0' })
+  })
+
+  test('legacy Opus runs with an out-of-policy effort resume on the default medium', async () => {
+    const calls: Parameters<AgentServiceDeps['startWorker']>[0][] = []
+    const history = completedHistory(1)[0]!
+    Object.assign(history.workers[0]!, { identityId: opus.id, tokenSourceId: 'claude-sub', model: 'opus', effort: 'xhigh' })
+    const { service, root } = harness({ identities: [opus], loadArtifacts: () => [history],
+      startWorker: opts => { calls.push(opts); return resolvedHandle(result(opts.resumeSessionId!)) } })
+    const followed = await service.followUp(root, history.runId, { description: '续接', prompt: 'next' })
+    await waitFor(service, root, followed.runId, 'completed')
+    expect(calls[0]).toMatchObject({ effort: 'medium' })
   })
 })

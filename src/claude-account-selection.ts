@@ -9,13 +9,20 @@ import { assertClaudeDefaultSettingsEnvironment, claudeSubscriptionSettings, val
 import { getTokenSourceForAccount, scrubAnthropicEnv, tokenSourceRuntimeModel } from './token-source'
 import { peekTokenSourceUsage, refreshTokenSourceUsage } from './token-source-cache'
 import { logDiagnostic, logError } from './log'
+import { agentClaudeAccountRejection, claudeSubFullError, type ClaudeSubAgentLimits } from './agent-admission'
 import { captureClaudeSyncWarmup, waitForClaudeSyncWarmup } from './claude-sync-warmup'
 
 /** Startup selection only; this function neither queries upstream nor changes any running process. */
 export function selectClaudeAccount(options: { model?: string | null; effort?: AgentReasoningEffort | null;
   preferred?: string | null; activeSessions?: ReadonlyMap<string, number>;
   /** Conversation's original account; preferred only in the all-exhausted fallback. */
-  exhaustedFallbackAccountId?: string | null }): string {
+  exhaustedFallbackAccountId?: string | null
+  /**
+   * Lodestar Agent admission: live Agent runs per account plus the Agent limits.
+   * Applies the per-account cap and 5h / weekly thresholds, and never falls back
+   * to an exhausted or full account; failure throws CLAUDE_SUB_FULL.
+   */
+  agent?: { runs: ReadonlyMap<string, number>; limits: ClaudeSubAgentLimits } }): string {
   if (config.token_sources?.['claude-sub']?.enabled === false) throw new Error('Claude 订阅已禁用；发送 claude-sub on 启用')
   if (options.preferred) return claudeAccounts.assertReady(options.preferred).id
   const diagnostics: string[] = []
@@ -58,6 +65,13 @@ export function selectClaudeAccount(options: { model?: string | null; effort?: A
       }
       if (identities.has(account.identity)) continue
       identities.add(account.identity)
+      if (options.agent) {
+        const rejection = agentClaudeAccountRejection(rank, options.agent.runs.get(account.id) ?? 0, options.agent.limits)
+        if (rejection) {
+          diagnostics.push(`${account.name}：${rejection}`)
+          continue
+        }
+      }
       candidates.push({ id: account.id, ...rank })
     } catch (error) {
       if (!quotaExhausted && !unenrolledDefault) selectionFailures++
@@ -71,6 +85,9 @@ export function selectClaudeAccount(options: { model?: string | null; effort?: A
   // otherwise fall back to the default route, then the first exhausted account.
   // Other failures (catalog, authentication or a missing usage snapshot) remain
   // visible to the caller.
+  if (options.agent && !candidates.length) {
+    throw claudeSubFullError(`Claude 自动选号无可用账号：${diagnostics.join('；') || '尚无已收录账号'}`)
+  }
   if (!candidates.length && quotaEligibleAccounts > 0
     && quotaExhaustedAccounts === quotaEligibleAccounts && selectionFailures === 0) {
     logDiagnostic('claude_account_selection_fallback', { reason: 'rate_limit' })

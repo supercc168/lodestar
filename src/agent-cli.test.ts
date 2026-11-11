@@ -75,14 +75,25 @@ describe('lodestar-agent CLI args', () => {
     expect(parsePromptArgs([
       '--description', '任务说明', '--identity', 'a', '--identity', 'b', '--identity', 'a', '--effort', 'max', '--stdin', '--no-wait',
     ], true)).toEqual({
-      description: '任务说明', identityIds: ['a', 'b'], identityId: '', sessionId: '', workDir: '', effort: 'max', prompt: '', noWait: true, readStdin: true, json: false,
+      description: '任务说明', identityIds: ['a', 'b'], identityId: '', sessionId: '', workDir: '', evidenceDir: '', effort: 'max', prompt: '', noWait: true, readStdin: true, json: false,
     })
   })
 
   test('parses a single-session follow-up', () => {
     expect(parsePromptArgs(['--description', '任务说明', '--identity', 'a', 'continue here'], false)).toEqual({
-      description: '任务说明', identityIds: [], identityId: 'a', sessionId: '', workDir: '', effort: '', prompt: 'continue here', noWait: false, readStdin: false, json: false,
+      description: '任务说明', identityIds: [], identityId: 'a', sessionId: '', workDir: '', evidenceDir: '', effort: '', prompt: 'continue here', noWait: false, readStdin: false, json: false,
     })
+  })
+
+  test('parses --evidence-dir once for run and follow-up; the API request keeps it', async () => {
+    expect(parsePromptArgs(['--description', '任务说明', '--identity', 'a', '--evidence-dir', '/tmp/ev', 'go'], true).evidenceDir).toBe('/tmp/ev')
+    expect(parsePromptArgs(['--description', '任务说明', '--evidence-dir', 'ev', 'go'], false).evidenceDir).toBe('ev')
+    expect(() => parsePromptArgs(['--description', '任务说明', '--identity', 'a', '--evidence-dir', 'a', '--evidence-dir', 'b'], true))
+      .toThrow('only be specified once')
+    const { parseAgentRunRequest, parseAgentFollowUpRequest } = await import('./agent-run-types')
+    expect(parseAgentRunRequest({ identity_ids: ['a'], description: 'd', prompt: 'p', evidence_dir: '/tmp/ev' }).evidenceDir).toBe('/tmp/ev')
+    expect(parseAgentFollowUpRequest({ description: 'd', prompt: 'p', evidence_dir: 'ev' }).evidenceDir).toBe('ev')
+    expect(() => parseAgentRunRequest({ identity_ids: ['a'], description: 'd', prompt: 'p', evidence_dir: '' })).toThrow('evidence_dir')
   })
 
   test('requires an identity for a new run', () => {
@@ -91,7 +102,7 @@ describe('lodestar-agent CLI args', () => {
 
   test('accepts session continuation without a new identity and rejects ambiguous session options', () => {
     expect(parsePromptArgs(['--description', '任务说明', '--session', 'sid', '--prompt', 'next turn', '--json'], true)).toEqual({
-      description: '任务说明', identityIds: [], identityId: '', sessionId: 'sid', workDir: '', effort: '', prompt: 'next turn', noWait: false, readStdin: false, json: true,
+      description: '任务说明', identityIds: [], identityId: '', sessionId: 'sid', workDir: '', evidenceDir: '', effort: '', prompt: 'next turn', noWait: false, readStdin: false, json: true,
     })
     expect(() => parsePromptArgs(['--session', 'sid', '--identity', 'a', '--identity', 'b'], true)).toThrow('at most one')
     expect(() => parsePromptArgs(['--session', 'sid', '--session', 'other'], true)).toThrow('only be specified once')

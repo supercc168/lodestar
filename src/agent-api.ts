@@ -285,6 +285,8 @@ function serializeRun(run: AgentRunSnapshot): object {
     ...(agentRunOwner(run).kind === 'project' ? { project: agentRunOwner(run).name } : { session_name: run.sessionName }),
     ...(run.requestId ? { request_id: run.requestId } : {}),
     work_dir: run.workDir,
+    ...(run.evidenceDir ? { evidence_dir: run.evidenceDir } : {}),
+    ...(run.lockKeys?.length ? { lock_keys: run.lockKeys } : {}),
     prompt: run.prompt,
     description: run.description,
     parent_run_id: run.parentRunId,

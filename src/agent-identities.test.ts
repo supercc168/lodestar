@@ -1,5 +1,5 @@
 import { describe, expect, test } from 'bun:test'
-import { agentIdentityId, assertAgentIdentityIdAllowed, assertAgentSourceAllowed, buildAgentIdentityCatalog, buildAgentSkillIdentityCatalog } from './agent-identities'
+import { agentIdentityId, assertAgentIdentityIdAllowed, claudeSubNewRunRejection, assertAgentSourceAllowed, buildAgentIdentityCatalog, buildAgentSkillIdentityCatalog } from './agent-identities'
 import type { TokenSource } from './token-source'
 import { config } from './config'
 
@@ -213,5 +213,52 @@ describe('Agent identity catalog(fork 档位回落)', () => {
   test('agentIdentityId encodes tokenSourceId NUL model as base64url', () => {
     const encoded = Buffer.from(`claude:glm${String.fromCharCode(0)}claude:glm`, 'utf8').toString('base64url')
     expect(agentIdentityId('claude:glm', 'claude:glm')).toBe(`agent:${encoded}`)
+  })
+})
+
+describe('claude-sub Agent identities: Opus only, medium / max', () => {
+  const efforts = ['low', 'medium', 'high', 'xhigh', 'max'] as const
+  const subscription = () => source({ id: 'claude-sub', kind: 'claude-subscription', display: 'Claude Code 订阅', defaultModel: 'opus', models: [
+    { model: 'default', display: 'Default', efforts: [...efforts], defaultEffort: 'max' },
+    { model: 'opus', display: 'Opus', efforts: [...efforts], defaultEffort: 'max' },
+    { model: 'sonnet', display: 'Sonnet', efforts: [...efforts], defaultEffort: 'max' },
+    { model: 'haiku', display: 'Haiku', efforts: ['max'], defaultEffort: 'max' },
+    { model: 'fable', display: 'Fable', efforts: [...efforts], defaultEffort: 'max' },
+    { model: 'claude-opus-5', display: 'Opus 5', efforts: [...efforts], defaultEffort: 'max' },
+  ] })
+
+  test('lists only the opus alias with medium / max and a medium default; others are resume-only', () => {
+    const catalog = buildAgentIdentityCatalog([subscription(), source()])
+    const sub = catalog.identities.filter(identity => identity.tokenSourceId === 'claude-sub')
+    expect(sub).toHaveLength(1)
+    expect(sub[0]).toMatchObject({
+      id: 'agent:Y2xhdWRlLXN1YgBvcHVz', model: 'opus', status: 'ready',
+      supportedEfforts: ['medium', 'max'], defaultEffort: 'medium',
+    })
+    expect(catalog.resumeOnly?.map(identity => identity.model)).toEqual(['default', 'sonnet', 'haiku', 'fable', 'claude-opus-5'])
+    expect(catalog.identities.filter(identity => identity.tokenSourceId === 'glm')).toHaveLength(2)
+    expect(catalog.sourceFailures).toHaveLength(0)
+  })
+
+  test('opus without medium / max is visible but unavailable', () => {
+    const catalog = buildAgentIdentityCatalog([source({ id: 'claude-sub', kind: 'claude-subscription', models: [
+      { model: 'opus', display: 'Opus', efforts: ['low', 'high'], defaultEffort: 'high' },
+    ] })])
+    expect(catalog.identities[0]).toMatchObject({ status: 'model_unavailable', supportedEfforts: [], defaultEffort: null })
+  })
+
+  test('reports a missing opus alias instead of silently listing another model', () => {
+    const catalog = buildAgentIdentityCatalog([source({ id: 'claude-sub', kind: 'claude-subscription', models: [
+      { model: 'sonnet', display: 'Sonnet', efforts: ['medium', 'max'], defaultEffort: 'max' },
+    ] })])
+    expect(catalog.identities).toHaveLength(0)
+    expect(catalog.sourceFailures[0]).toMatchObject({ tokenSourceId: 'claude-sub', status: 'models_miss' })
+  })
+
+  test('new-run rejection names the Opus identity only for non-Opus claude-sub ids', () => {
+    expect(claudeSubNewRunRejection(agentIdentityId('claude-sub', 'sonnet'))).toContain('agent:Y2xhdWRlLXN1YgBvcHVz')
+    expect(claudeSubNewRunRejection(agentIdentityId('claude-sub', 'opus'))).toBeUndefined()
+    expect(claudeSubNewRunRejection(agentIdentityId('glm', 'GLM-5.3'))).toBeUndefined()
+    expect(claudeSubNewRunRejection('agent:$$$')).toBeUndefined()
   })
 })

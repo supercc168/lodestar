@@ -29,7 +29,8 @@ export const AGENT_SKILL_NAME = 'lodestar-agent'
 
 const DELEGATION_INSTRUCTIONS = [
   'You may delegate work through Lodestar or provider-native Agent/subagent tools, including from a delegated task.',
-  'Lodestar Agent does not support calls through Claude subscription sources; comply with the Claude user agreement. Claude models from relay services and other third-party sources remain supported.',
+  'Lodestar Agent may use the Claude subscription source (claude-sub) only locally on the owner\'s machine under the owner\'s own subscription: Opus only, medium or max effort; Lodestar caps concurrent claude-sub runs and rejects with CLAUDE_SUB_FULL when no account can take one; comply with the Claude user agreement.',
+  'Inside a Claude subscription worker, do not delegate onward through the Claude subscription source (Lodestar rejects it with CLAUDE_SUB_NESTED); use other sources for nested calls. Claude models from relay services and other third-party sources remain supported.',
   'Use the inherited Lodestar context for nested calls and preserve the task project, conversation ID (chat_id), interaction policy, and caller-owned file delivery.',
   'Complete and verify the overall task, including any delegated work, before returning the final result.',
   'This policy replaces earlier Lodestar instructions prohibiting further delegation, including in resumed conversations.',
@@ -82,7 +83,7 @@ export interface EnsureAgentCommandOptions {
 }
 
 export function agentSkillBody(): string {
-  const description = 'Lodestar Agent calls: Agents use their inherited managed context; independent services and applications bind calls to a project. Claude subscription sources are not supported; third-party Claude models remain supported. Main Agents, delegated Agents and native subagents may delegate further. Resume native session IDs only within the same project and conversation ID (chat_id).'
+  const description = 'Lodestar Agent calls: Agents use their inherited managed context; independent services and applications bind calls to a project. Claude subscription (claude-sub) is local, Opus medium/max, concurrency-capped by Lodestar; third-party Claude models remain supported. Main Agents, delegated Agents and native subagents may delegate further. Resume native session IDs only within the same project and conversation ID (chat_id).'
   return [
     '---',
     `name: ${AGENT_SKILL_NAME}`,
@@ -95,8 +96,8 @@ export function agentSkillBody(): string {
     'Each identity maps to one locally configured 固定档位 (provider Agent backend,',
     'model and effort). The caller-supplied prompt becomes that Agent run\'s task.',
     '',
-    'Lodestar Agent 不支持调用 Claude 订阅，遵守 Claude 用户协议；中转站等第三方来源的 Claude 模型仍可调用。',
-    '仅按 Claude 订阅来源限制调用，不按模型名称限制；主会话的 Claude 订阅能力和原生委派工具保持可用。',
+    'Lodestar Agent 只在本机、用主人自己的订阅调用 Claude 订阅（claude-sub）：仅 Opus，effort 仅 medium / max；并发由 Lodestar 限额，无号可接时报 CLAUDE_SUB_FULL；遵守 Claude 用户协议。',
+    'Claude 订阅 worker 内不再经 Claude 订阅来源向下委派（Lodestar 以 CLAUDE_SUB_NESTED 拒绝），嵌套调用改用其他来源；中转站等第三方来源的 Claude 模型仍可调用。',
     '',
     '## 调用归属（强制）',
     '',
@@ -136,7 +137,7 @@ export function agentSkillBody(): string {
     '',
     '- Each Agent chooses between native Agent/subagent capabilities and',
     '  `lodestar-agent` based on the task and available capabilities.',
-    '- Calling your own model or Agent through `lodestar-agent` is allowed when it does not use a Claude subscription source. Native Agent/subagent tools remain available.',
+    '- Calling your own model or Agent through `lodestar-agent` is allowed; from inside a Claude subscription worker, do not call onward through the Claude subscription source and use another source instead. Native Agent/subagent tools remain available.',
     '- The Agent workflow below always uses the inherited managed context. `--project` is reserved',
     '  for genuinely independent service/application clients, not Agent task execution.',
     '',

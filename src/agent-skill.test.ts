@@ -75,6 +75,32 @@ describe('lodestar-agent skill body', () => {
     expect(PROJECT_AGENT_INSTRUCTIONS).toContain('nobody is available to answer questions')
   })
 
+  test('worker instructions describe the local Claude subscription policy without the Feishu channel prompt', () => {
+    for (const instructions of [DELEGATED_AGENT_INSTRUCTIONS, PROJECT_AGENT_INSTRUCTIONS]) {
+      expect(instructions).not.toContain('does not support calls through Claude subscription sources')
+      expect(instructions).toContain('only locally on the owner\'s machine under the owner\'s own subscription')
+      expect(instructions).toContain('Opus only, medium or max effort; Lodestar caps concurrent claude-sub runs')
+      expect(instructions).toContain('CLAUDE_SUB_FULL')
+      expect(instructions).toContain('CLAUDE_SUB_NESTED')
+      expect(instructions).not.toContain('at most 1 concurrent')
+      expect(instructions).not.toContain('owner is attending')
+      expect(instructions).not.toContain('unattended overnight')
+      expect(instructions).toContain('comply with the Claude user agreement')
+      expect(instructions).toContain('do not delegate onward through the Claude subscription source')
+      expect(instructions).toContain('Claude models from relay services and other third-party sources remain supported')
+      expect(instructions).not.toContain('# desc:')
+      expect(instructions).not.toContain('飞书通道插件')
+      expect(instructions).not.toContain('Feishu channel plugin')
+      expect(instructions).not.toContain('[[send:')
+    }
+    const body = agentSkillBody()
+    expect(body).not.toContain('不支持调用 Claude 订阅')
+    expect(body).not.toContain('Claude subscription sources are not supported')
+    expect(body).toContain('仅 Opus，effort 仅 medium / max')
+    expect(body).toContain('遵守 Claude 用户协议')
+    for (const removed of ['须主人在场', '通宵', '同时最多 1', 'owner-attended', 'max 1 concurrent']) expect(body).not.toContain(removed)
+  })
+
 })
 
 describe('ensureLodestarAgentSkill', () => {

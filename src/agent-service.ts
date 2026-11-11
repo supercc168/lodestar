@@ -7,8 +7,17 @@ import { agentOwnerKey, agentRunOwner, requireAgentDescription, requireAgentWork
 import * as feishu from './feishu'
 import { config } from './config'
 import { claudeTranslationModeEnabled } from './claude-translation-mode'
-import { assertAgentIdentityIdAllowed, assertAgentSourceAllowed, isClaudeSubscriptionSourceId, getAgentIdentityCatalog, type AgentIdentity } from './agent-identities'
+import {
+  assertAgentIdentityIdAllowed, assertAgentSourceAllowed, claudeSubEffortError, claudeSubNewRunRejection,
+  isClaudeSubAgentEffort, isClaudeSubscriptionSourceId, getAgentIdentityCatalog,
+  type AgentIdentity, type AgentIdentityCatalog,
+} from './agent-identities'
 import { AgentWorkerFailure, startAgentWorker, type AgentWorkerHandle } from './agent-runner'
+import {
+  agentRunLockKeys, claudeSubAgentLimits, claudeSubFullError, findLockCollision, formatLockKey, resolveEvidenceDir,
+  type AgentRunLockKey,
+} from './agent-admission'
+import { selectClaudeAccount } from './claude-account-selection'
 import { agentApiUrl } from './agent-runtime'
 import { workspaceKey } from './workspace'
 import type {
@@ -103,6 +112,8 @@ export interface AgentServiceDeps extends AgentCardsDeps {
   writeTextArtifact(path: string, value: string): void
   readTextArtifact(name: string, label: string): string
   loadArtifacts(): AgentRunSnapshot[]
+  /** Admission-time Claude subscription account pick (cache-only, synchronous). */
+  selectClaudeAccount?: typeof selectClaudeAccount
 }
 
 const DEFAULT_DEPS: AgentServiceDeps = {
@@ -114,6 +125,7 @@ const DEFAULT_DEPS: AgentServiceDeps = {
   writeTextArtifact: writeStateFileAtomic,
   readTextArtifact,
   loadArtifacts: loadAgentRunArtifacts,
+  selectClaudeAccount,
 }
 
 export class AgentService {
@@ -126,6 +138,12 @@ export class AgentService {
   private claudeActiveSessionsSource?: () => ReadonlyMap<string, number>
   private readonly pendingRunCreations = new Set<Promise<AgentRunSnapshot>>()
   private readonly requests = new Map<string, { hash: string; promise: Promise<AgentRunSnapshot> }>()
+  /** Claude subscription slots reserved synchronously at admission, keyed by run + identity; released at finalize. */
+  private readonly claudeReservations = new Map<string, { runId: string; accountId: string }>()
+  /** Collision locks held by started (or admitted, unblocked) runs; a run tree never collides with itself. */
+  private readonly lockHolders = new Map<string, { root: string; keys: AgentRunLockKey[] }>()
+  /** FIFO of runs waiting for a collision lock; `start` is set once the run is registered. */
+  private readonly lockWaiting: Array<{ runId: string; root: string; keys: AgentRunLockKey[]; start?: () => void }> = []
   private shuttingDown = false
 
   constructor(private readonly deps: AgentServiceDeps = DEFAULT_DEPS) {
@@ -158,7 +176,8 @@ export class AgentService {
       if (!request.sessionId.trim()) throw new Error('agent session_id must be a non-empty string')
       if (request.identityIds.length > 1) throw new Error('agent session continuation accepts at most one identity_id')
       const history = this.findSessionHistory(principal, request.sessionId)
-      const selected = request.identityIds[0] ? this.requireIdentity(principal, request.identityIds[0]) : undefined
+      const selected = request.identityIds[0]
+        ? this.requireIdentity(principal, request.identityIds[0], history.worker.identityId) : undefined
       return this.resumeRun(principal, request, metadata, history, selected)
     }
     const context = agentPrincipalContext(principal)
@@ -191,16 +210,17 @@ export class AgentService {
     }
     if (!worker.sessionId) throw new Error(`${worker.identityName} has no resumable native session id`)
     this.findSessionHistory(principal, worker.sessionId)
-    const selected = request.identityId ? this.requireIdentity(principal, request.identityId) : undefined
+    const selected = request.identityId ? this.requireIdentity(principal, request.identityId, worker.identityId) : undefined
     return this.resumeRun(principal, {
       ...request, identityIds: request.identityId ? [request.identityId] : [], sessionId: worker.sessionId,
     }, metadata, { run: source, worker }, selected)
   }
 
-  private requireIdentity(principal: AgentPrincipal, id: string): AgentIdentity {
+  /** resumeIdentityId：续接时原会话所用身份，允许命中 resumeOnly（如旧 claude-sub 非 Opus 会话）。 */
+  private requireIdentity(principal: AgentPrincipal, id: string, resumeIdentityId?: string): AgentIdentity {
     assertAgentIdentityIdAllowed(id)
-    const identity = this.deps.getCatalog(agentPrincipalContext(principal).codexAccountId).identities.find(item => item.id === id)
-    if (!identity) throw new Error(`agent identity not found: ${id}`)
+    const identity = findAgentIdentity(
+      this.deps.getCatalog(agentPrincipalContext(principal).codexAccountId), id, id === resumeIdentityId)
     assertAgentSourceAllowed(identity.tokenSourceId)
     if (identity.status !== 'ready') throw new Error(`${identity.displayName}: ${identity.reason ?? identity.status}`)
     return identity
@@ -216,15 +236,22 @@ export class AgentService {
       assertAgentIdentityIdAllowed(history.worker.identityId)
       assertAgentSourceAllowed(history.worker.tokenSourceId)
     }
-    const identity = selected ?? this.requireIdentity(principal, history.worker.identityId)
+    const identity = selected ?? this.requireIdentity(principal, history.worker.identityId, history.worker.identityId)
     if (identity.provider !== history.worker.provider) throw new Error('native session belongs to a different Agent backend')
     const sameOwner = agentOwnerKey(agentRunOwner(history.run.snapshot)) === agentOwnerKey(context.owner)
-    const effort = request.effort ?? (history.worker.identityId === identity.id ? history.worker.effort : undefined)
+    if (request.effort !== undefined && isClaudeSubscriptionSourceId(identity.tokenSourceId) && !isClaudeSubAgentEffort(request.effort)) {
+      throw new Error(claudeSubEffortError(request.effort))
+    }
+    // 沿用原档位；若原档位已不在当前身份词表内（如旧 Opus run 用过 high/xhigh），回落到身份默认档。
+    const inherited = history.worker.identityId === identity.id ? history.worker.effort : undefined
+    const effort = request.effort
+      ?? (inherited && identity.supportedEfforts.includes(inherited as AgentReasoningEffort) ? inherited : undefined)
     const workDir = request.workDir ?? history.run.snapshot.workDir
     const releaseSession = this.reserveNativeSession({ provider: identity.provider, sessionId: request.sessionId! })
     try {
       return await this.createRun(context, {
         identityIds: [identity.id], description: request.description, prompt: request.prompt, effort, workDir,
+        ...(request.evidenceDir ? { evidenceDir: request.evidenceDir } : {}),
         requesterOpenId: request.requesterOpenId ?? (sameOwner ? history.run.snapshot.requesterOpenId : undefined),
       }, {
         ...metadata,
@@ -370,6 +397,7 @@ export class AgentService {
     const key = this.requestPromiseKey(owner, request.requestId)
     const normalizedBody = { operation,
       prompt: request.prompt, description: request.description, effort: request.effort, workDir: request.workDir,
+      evidenceDir: request.evidenceDir,
       requesterOpenId: request.requesterOpenId, identityIds: 'identityIds' in request ? request.identityIds : undefined,
       identityId: 'identityId' in request ? request.identityId : undefined,
       sessionId: 'sessionId' in request ? request.sessionId : undefined,
@@ -510,19 +538,18 @@ export class AgentService {
     const catalog = this.deps.getCatalog(codexAccountId)
     const identities = request.identityIds.map(id => {
       assertAgentIdentityIdAllowed(id)
-      const identity = catalog.identities.find(item => item.id === id)
-      if (!identity) throw new Error(`agent identity not found: ${id}`)
+      // resumeRun 已校验续接身份；只有续接原生会话才可命中 resumeOnly。
+      const identity = findAgentIdentity(catalog, id, options.resumeSessionId !== undefined)
       assertAgentSourceAllowed(identity.tokenSourceId)
       if (identity.status !== 'ready') throw new Error(`${identity.displayName}: ${identity.reason ?? identity.status}`)
       return identity
     })
-    if (identities.some(identity => isClaudeSubscriptionSourceId(identity.tokenSourceId))) {
-      const subCount = identities.filter(identity => isClaudeSubscriptionSourceId(identity.tokenSourceId)).length
-      const busy = [...this.runs.values()].some(run => run.snapshot.workers.some(worker =>
-        isClaudeSubscriptionSourceId(worker.tokenSourceId)
-        && (worker.status === 'running' || worker.status === 'queued' || worker.status === 'needs_input')))
-      if (busy || subCount > 1) throw new Error('CLAUDE_SUB_BUSY: another Claude subscription agent run is active; at most 1 concurrent run (fall back to another identity)')
+    if (options.parentKind === 'delegate' && parent?.snapshot.workers.some(worker => isClaudeSubscriptionSourceId(worker.tokenSourceId))
+      && identities.some(identity => isClaudeSubscriptionSourceId(identity.tokenSourceId))) {
+      throw new Error('CLAUDE_SUB_NESTED: a Claude subscription worker may not delegate onward through the Claude subscription source; use another identity')
     }
+    const evidenceDir = request.evidenceDir ? resolveEvidenceDir(admittedWorkDir, request.evidenceDir) : undefined
+    const lockKeys = agentRunLockKeys(admittedWorkDir, evidenceDir)
     const workers = identities.map(identity => workerSnapshot(
       identity,
       resolveEffort(identity, request.effort),
@@ -551,7 +578,15 @@ export class AgentService {
       status: 'queued',
       workers,
       createdAt: new Date().toISOString(),
+      ...(evidenceDir ? { evidenceDir } : {}),
+      lockKeys: lockKeys.map(formatLockKey),
     }
+    // Synchronous admission (no await between here and presentation.add):
+    // reserve claude-sub slots/accounts and take or queue for the collision lock,
+    // so near-simultaneous requests cannot both pass the caps.
+    this.reserveClaudeSubSlots(runId, identities, workers)
+    const queuedReason = this.admitCollisionLock(runId, parent ? this.lockRootOf(parent) : runId, lockKeys)
+    if (queuedReason) for (const worker of workers) worker.queuedReason = queuedReason
     const run: AgentRunRecord = {
       snapshot,
       context,
@@ -601,13 +636,111 @@ export class AgentService {
       return this.readSnapshot(run)
     }
     this.persist(run)
-    for (const identity of identities) {
-      const resumeSessionId = options.resumeSessionId
-      void this.executeWorker(run, identity, request.prompt, admittedWorkDir, resumeSessionId).catch(error => {
-        logError('agent-service: worker crashed', error)
-      })
+    const start = () => {
+      for (const identity of identities) {
+        const resumeSessionId = options.resumeSessionId
+        void this.executeWorker(run, identity, request.prompt, admittedWorkDir, resumeSessionId).catch(error => {
+          logError('agent-service: worker crashed', error)
+        })
+      }
     }
+    const waiting = this.lockWaiting.find(entry => entry.runId === runId)
+    if (waiting) {
+      // Queued behind a collision lock: started FIFO by pumpLockQueue when it frees.
+      waiting.start = start
+      this.pumpLockQueue()
+      return this.readSnapshot(run)
+    }
+    start()
     return this.readSnapshot(run)
+  }
+
+  private lockRootOf(run: AgentRunRecord): string {
+    let current = run
+    for (let parent = current.snapshot.parentRunId ? this.runs.get(current.snapshot.parentRunId) : undefined; parent;
+      parent = current.snapshot.parentRunId ? this.runs.get(current.snapshot.parentRunId) : undefined) current = parent
+    return current.snapshot.runId
+  }
+
+  private claudeRunsByAccount(): Map<string, number> {
+    const counts = new Map<string, number>()
+    for (const { accountId } of this.claudeReservations.values()) counts.set(accountId, (counts.get(accountId) ?? 0) + 1)
+    return counts
+  }
+
+  /** Global cap, then a per-account pick under the Agent thresholds; all or nothing for the run. */
+  private reserveClaudeSubSlots(runId: string, identities: AgentIdentity[], workers: AgentWorkerResult[]): void {
+    const added: string[] = []
+    try {
+      identities.forEach((identity, index) => {
+        if (!isClaudeSubscriptionSourceId(identity.tokenSourceId)) return
+        const limits = claudeSubAgentLimits()
+        if (this.claudeReservations.size >= limits.global) {
+          throw claudeSubFullError(`global cap ${limits.global} reached (${this.claudeReservations.size} claude-sub Agent runs active or queued)`)
+        }
+        const runs = this.claudeRunsByAccount()
+        const activeSessions = new Map(this.claudeActiveSessions())
+        for (const [accountId, count] of runs) activeSessions.set(accountId, (activeSessions.get(accountId) ?? 0) + count)
+        const select = this.deps.selectClaudeAccount ?? selectClaudeAccount
+        const accountId = select({ model: identity.model, effort: workers[index]!.effort as AgentReasoningEffort,
+          activeSessions, agent: { runs, limits } })
+        const key = `${runId}\u0000${identity.id}`
+        this.claudeReservations.set(key, { runId, accountId })
+        added.push(key)
+        workers[index]!.claudeAccountId = accountId
+      })
+    } catch (error) {
+      for (const key of added) this.claudeReservations.delete(key)
+      throw error
+    }
+  }
+
+  private lockCollisionReason(root: string, keys: AgentRunLockKey[], checkWaiting: boolean,
+    waiting: ReadonlyArray<{ runId: string; root: string; keys: AgentRunLockKey[] }> = this.lockWaiting): string | null {
+    for (const [runId, holder] of this.lockHolders) {
+      if (holder.root === root) continue
+      const hit = findLockCollision(keys, holder.keys)
+      if (hit) return `撞车锁排队：${formatLockKey(hit[0])} 与运行中的 ${runId}（${formatLockKey(hit[1])}）冲突，空出后自动开跑`
+    }
+    if (checkWaiting) for (const entry of waiting) {
+      if (entry.root === root) continue
+      const hit = findLockCollision(keys, entry.keys)
+      if (hit) return `撞车锁排队：排在 ${entry.runId} 之后（${formatLockKey(hit[1])}），先到先跑`
+    }
+    return null
+  }
+
+  /** Take the lock now, or append to the FIFO and return the queued reason. */
+  private admitCollisionLock(runId: string, root: string, keys: AgentRunLockKey[]): string | null {
+    const treeHolds = [...this.lockHolders.values()].some(holder => holder.root === root)
+    const reason = this.lockCollisionReason(root, keys, !treeHolds)
+    if (reason) this.lockWaiting.push({ runId, root, keys })
+    else this.lockHolders.set(runId, { root, keys })
+    return reason
+  }
+
+  private pumpLockQueue(): void {
+    for (let index = 0; index < this.lockWaiting.length;) {
+      const entry = this.lockWaiting[index]!
+      if (!entry.start || this.lockCollisionReason(entry.root, entry.keys, true, this.lockWaiting.slice(0, index))) {
+        index++
+        continue
+      }
+      this.lockWaiting.splice(index, 1)
+      const run = this.runs.get(entry.runId)
+      if (!run || run.cancelled || run.finalized || run.finalizing) continue
+      this.lockHolders.set(entry.runId, { root: entry.root, keys: entry.keys })
+      entry.start()
+    }
+  }
+
+  /** Release claude-sub reservations and collision locks of a run reaching a terminal state. */
+  private releaseRunSlots(runId: string): void {
+    for (const [key, reservation] of this.claudeReservations) if (reservation.runId === runId) this.claudeReservations.delete(key)
+    this.lockHolders.delete(runId)
+    const waiting = this.lockWaiting.findIndex(entry => entry.runId === runId)
+    if (waiting >= 0) this.lockWaiting.splice(waiting, 1)
+    this.pumpLockQueue()
   }
 
   private async executeWorker(
@@ -659,8 +792,8 @@ export class AgentService {
           ? { developerInstructions: run.context!.sessionInstructions!(identity.provider) } : {}),
         profile: fullAgentProfile(feishu.projectProfileForDirectory(run.snapshot.workDir)),
         ...(process.env.LODESTAR_DISABLE_SKILL_SYNC === '1' ? {} : { managedSkillPluginPath: MANAGED_CLAUDE_PLUGIN_DIR }),
-        ...(identity.provider === 'claude' && isClaudeSubscriptionSourceId(identity.tokenSourceId)
-          ? { claudeActiveSessions: this.claudeActiveSessions() } : {}),
+        ...(identity.provider === 'claude' && isClaudeSubscriptionSourceId(identity.tokenSourceId) && worker.claudeAccountId
+          ? { claudeAccountId: worker.claudeAccountId } : {}),
         hostEnv: {
           // 同 session.spawnAgent:全量测试泄漏的残缺 config mock 不含 notify。
           LODESTAR_AGENT_URL: agentApiUrl(config.notify?.bind ?? '127.0.0.1', config.notify?.port ?? 9876),
@@ -890,6 +1023,7 @@ export class AgentService {
   private async finalizeRun(run: AgentRunRecord, status: AgentRunStatus, error?: string): Promise<void> {
     if (run.finalized || run.finalizing) return
     run.finalizing = true
+    this.releaseRunSlots(run.snapshot.runId)
     for (const identityId of [...run.progressTimers.keys()]) this.clearProgressTimer(run, identityId)
     run.snapshot.status = status
     run.snapshot.finishedAt = new Date().toISOString()
@@ -1271,10 +1405,18 @@ function workerSnapshot(
   }
 }
 
+function findAgentIdentity(catalog: AgentIdentityCatalog, id: string, allowResumeOnly: boolean): AgentIdentity {
+  const identity = catalog.identities.find(item => item.id === id)
+    ?? (allowResumeOnly ? catalog.resumeOnly?.find(item => item.id === id) : undefined)
+  if (identity) return identity
+  throw new Error(claudeSubNewRunRejection(id) ?? `agent identity not found: ${id}`)
+}
+
 function resolveEffort(identity: AgentIdentity, raw: string | undefined): AgentReasoningEffort {
   const effort = raw ?? identity.defaultEffort
   if (!effort) throw new Error(`${identity.displayName} default effort MISS; specify effort explicitly`)
   if (!identity.supportedEfforts.includes(effort as AgentReasoningEffort)) {
+    if (isClaudeSubscriptionSourceId(identity.tokenSourceId)) throw new Error(claudeSubEffortError(effort))
     throw new Error(`${identity.displayName} does not support effort ${effort}`)
   }
   return effort as AgentReasoningEffort

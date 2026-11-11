@@ -17,6 +17,10 @@ export interface ClaudeQuotaRank {
   /** Reset of the quota discarded first: the five-hour window when reported, otherwise the weekly window. */
   expiresAt: number | null
   fiveHourRemaining?: number
+  /** Five-hour window used %, when the account reports one (ready ranks only). */
+  fiveHourUsed?: number
+  /** Highest used % among the applicable weekly windows (ready ranks only). */
+  weeklyUsed?: number
   reason?: string
 }
 
@@ -73,9 +77,10 @@ export function rankClaudeQuota(snapshot: UsageSnapshotUnified | undefined, mode
   }))
   // 没有 5h 限额时以该模型实际生效的周额度重置时间为到期时间。
   const expiresAt = (short ?? weekly).resetsAt!.getTime()
+  const weeklyUsed = Math.max(...windows.filter(window => window.kind !== 'fiveHour').map(window => window.percent!))
   return { state: 'ready', activeSessions, remaining,
-    score: remaining / (activeSessions + 1), hasFiveHour: short !== undefined, expiresAt,
-    ...(short ? { fiveHourRemaining: (100 - short.percent!) / 100 } : {}) }
+    score: remaining / (activeSessions + 1), hasFiveHour: short !== undefined, expiresAt, weeklyUsed,
+    ...(short ? { fiveHourRemaining: (100 - short.percent!) / 100, fiveHourUsed: short.percent! } : {}) }
 }
 
 const expiryOf = (rank: ClaudeQuotaRank): number => rank.expiresAt ?? Number.POSITIVE_INFINITY

@@ -50,6 +50,42 @@ export interface AgentIdentityCatalog {
   catalogGeneration: string
   identities: AgentIdentity[]
   sourceFailures: AgentSourceFailure[]
+  /** 不对外列出、不能开新 run 的身份；仅供续接历史原生会话（如旧的 claude-sub 非 Opus 会话）。 */
+  resumeOnly?: AgentIdentity[]
+}
+
+/** Lodestar Agent 的 Claude 订阅只开放 Opus 别名（跟随最新 Opus），两档思维：medium / max。
+ *  只作用于委派 Agent 身份目录，不改 claude-sub Token Source 本身，也不影响主会话模型面板。 */
+export const CLAUDE_SUB_AGENT_MODEL = 'opus'
+export const CLAUDE_SUB_AGENT_EFFORTS = ['medium', 'max'] as const satisfies readonly AgentReasoningEffort[]
+export const CLAUDE_SUB_AGENT_DEFAULT_EFFORT: AgentReasoningEffort = 'medium'
+export const CLAUDE_SUB_EFFORT_ERROR = 'claude-sub 仅支持 medium / max'
+
+export function claudeSubOpusIdentityId(tokenSourceId = 'claude-sub'): string {
+  return agentIdentityId(tokenSourceId, CLAUDE_SUB_AGENT_MODEL)
+}
+
+export function isClaudeSubAgentEffort(value: unknown): value is (typeof CLAUDE_SUB_AGENT_EFFORTS)[number] {
+  return typeof value === 'string' && (CLAUDE_SUB_AGENT_EFFORTS as readonly string[]).includes(value)
+}
+
+export function claudeSubEffortError(effort: string): string {
+  return `${CLAUDE_SUB_EFFORT_ERROR}（收到 ${effort}）`
+}
+
+function decodeAgentIdentityId(id: string): { tokenSourceId: string; model: string } | undefined {
+  if (!/^agent:[A-Za-z0-9_-]+$/.test(id)) return undefined
+  const parts = Buffer.from(id.slice('agent:'.length), 'base64url').toString('utf8').split('\u0000')
+  if (parts.length !== 2) return undefined
+  const [tokenSourceId, model] = parts as [string, string]
+  return agentIdentityId(tokenSourceId, model) === id ? { tokenSourceId, model } : undefined
+}
+
+/** 新 run 指定了 claude-sub 的非 Opus 身份时给出明确拒绝原因；其他身份返回 undefined。 */
+export function claudeSubNewRunRejection(id: string): string | undefined {
+  const decoded = decodeAgentIdentityId(id)
+  if (!decoded || !isClaudeSubscriptionSource(decoded.tokenSourceId) || decoded.model === CLAUDE_SUB_AGENT_MODEL) return undefined
+  return `claude-sub 只开放 Opus：请改用 ${claudeSubOpusIdentityId(decoded.tokenSourceId)}（${decoded.model} 不再用于新任务，仅可续接旧会话）`
 }
 
 export function agentIdentityId(tokenSourceId: string, model: string): string {
@@ -69,13 +105,9 @@ export function assertAgentSourceAllowed(_tokenSourceId: string): void {}
 
 /** Only interpret canonical IDs emitted by agentIdentityId; other IDs retain normal not-found handling. */
 export function assertAgentIdentityIdAllowed(id: string): void {
-  if (!/^agent:[A-Za-z0-9_-]+$/.test(id)) return
-  const decoded = Buffer.from(id.slice('agent:'.length), 'base64url').toString('utf8')
-  const parts = decoded.split('\u0000')
-  if (parts.length !== 2) return
-  const [tokenSourceId, model] = parts as [string, string]
-  if (agentIdentityId(tokenSourceId, model) !== id) return
-  assertAgentSourceAllowed(tokenSourceId)
+  const decoded = decodeAgentIdentityId(id)
+  if (!decoded) return
+  assertAgentSourceAllowed(decoded.tokenSourceId)
 }
 
 export function getAgentIdentityCatalog(codexAccountId = 'default'): AgentIdentityCatalog {
@@ -98,11 +130,14 @@ export async function buildAgentSkillIdentityCatalog(sources: TokenSource[]): Pr
 export function buildAgentIdentityCatalog(sources: TokenSource[]): AgentIdentityCatalog {
   const identities: AgentIdentity[] = []
   const sourceFailures: AgentSourceFailure[] = []
-  for (const source of sources) collectSource(source, identities, sourceFailures)
-  return identityCatalog(identities, sourceFailures)
+  const resumeOnly: AgentIdentity[] = []
+  for (const source of sources) collectSource(source, identities, sourceFailures, resumeOnly)
+  return identityCatalog(identities, sourceFailures, resumeOnly)
 }
 
-function identityCatalog(identities: AgentIdentity[], sourceFailures: AgentSourceFailure[]): AgentIdentityCatalog {
+function identityCatalog(
+  identities: AgentIdentity[], sourceFailures: AgentSourceFailure[], resumeOnly: AgentIdentity[],
+): AgentIdentityCatalog {
   return {
     catalogGeneration: createHash('sha256')
       .update(JSON.stringify({ identities, sourceFailures }))
@@ -110,6 +145,21 @@ function identityCatalog(identities: AgentIdentity[], sourceFailures: AgentSourc
       .slice(0, 16),
     identities,
     sourceFailures,
+    ...(resumeOnly.length ? { resumeOnly } : {}),
+  }
+}
+
+/** claude-sub：Opus 别名收窄到 medium / max（默认 medium）；其余模型只留作续接旧会话。 */
+function applyClaudeSubPolicy(identity: AgentIdentity): AgentIdentity {
+  const supportedEfforts: AgentReasoningEffort[] = identity.supportedEfforts.filter(isClaudeSubAgentEffort)
+  const defaultEffort = supportedEfforts.includes(CLAUDE_SUB_AGENT_DEFAULT_EFFORT)
+    ? CLAUDE_SUB_AGENT_DEFAULT_EFFORT : supportedEfforts[0] ?? null
+  const unavailable = identity.status === 'ready' && !supportedEfforts.length
+  return {
+    ...identity,
+    supportedEfforts,
+    defaultEffort,
+    ...(unavailable ? { status: 'model_unavailable' as const, reason: `${CLAUDE_SUB_EFFORT_ERROR}，上游未声明这两档` } : {}),
   }
 }
 
@@ -117,6 +167,7 @@ function collectSource(
   source: TokenSource,
   identities: AgentIdentity[],
   failures: AgentSourceFailure[],
+  resumeOnly: AgentIdentity[],
 ): void {
   const catalogState = source.modelCatalogState?.status
     ?? (!source.enabled ? 'disabled' : source.models.length > 0 ? 'ready' : 'idle')
@@ -133,6 +184,18 @@ function collectSource(
     })
   } else if (source.models.length === 0) {
     failures.push({ tokenSourceId: source.id, display: source.display, status: 'models_miss', reason: '模型目录为空' })
+  }
+  if (isClaudeSubscriptionSource(source.id)) {
+    for (const model of source.models) {
+      const identity = materializeIdentity(source, model, catalogState)
+      if (model.model === CLAUDE_SUB_AGENT_MODEL) identities.push(applyClaudeSubPolicy(identity))
+      else resumeOnly.push(identity)
+    }
+    if (source.enabled && catalogState === 'ready' && source.models.length > 0
+      && !source.models.some(model => model.model === CLAUDE_SUB_AGENT_MODEL)) {
+      failures.push({ tokenSourceId: source.id, display: source.display, status: 'models_miss', reason: '模型目录缺少 opus 别名' })
+    }
+    return
   }
   for (const model of source.models) identities.push(materializeIdentity(source, model, catalogState))
 }

@@ -96,6 +96,10 @@ Claude 订阅统一由 `claude-sub` 管理登录验证、模型目录和额度�
 
 `claude-accounts.ts` 管理默认及按 `hi 备注` 首次收录的账号元数据，原生登录由用户手动完成；来源内部使用独立账号视图、模型目录和额度缓存。MD 汇总可用账号目录，启动时再校验实际选中的账号；默认账号未登录不会遮住已收录的可用账号。`claude-account-selection.ts` 只在启动时选号，不负责耗尽轮换；主会话和 `lodestar-agent run` / `follow-up` 的 Claude 订阅 worker 都按额度余量自动选号（worker 计入主会话的实时负载，恢复会话时原账号仅在全部耗尽时优先），选中的账号、额度和启动时各账号额度写入运行结果。主会话首次提交输入前完成原生身份验证，账号实际变化会使旧模型/额度缓存失效。
 
+委派 Agent 的 Claude 订阅身份由 `agent-identities.ts` 收窄：`claude-sub` 来源只把 `opus` 别名放进 `identities`，档位取上游声明与 `medium` / `max` 的交集，默认 `medium`；其他订阅模型进入目录的 `resumeOnly`，不对外列出，`agent-service.ts` 只在续接其原生会话（`follow-up` 或 `--session`，且身份与原会话一致）时允许命中，新 run 指定它们会报错并给出 Opus 身份 id。显式 effort 不在两档内报 `claude-sub 仅支持 medium / max`。`max` 经 SDK `effort: 'max'` 变成 Claude Code 的 `--effort max`，是 CLI 的最高命名档，不映射成 `ultracode`。主会话模型选择不受影响。
+
+委派 Agent 的 worker 指令（`agent-skill.ts` 的 `PROJECT_AGENT_INSTRUCTIONS` / `DELEGATED_AGENT_INSTRUCTIONS`，所有 provider）写明：Claude 订阅只在本机、用主人自己的订阅使用，仅 Opus medium / max，并发由 Lodestar 限额（无号可接时 `CLAUDE_SUB_FULL`），遵守 Claude 用户协议；Claude 订阅 worker 内不再经订阅来源向下委派（`agent-service.ts` 以 `CLAUDE_SUB_NESTED` 拒绝），嵌套调用改用其他来源。worker 指令不注入飞书通道约定（开场白、`[[send:]]` 交付标记、`# desc:` 展示约定）。并发上限（默认全局 4、每号 2）、接单预占、5h ≥80% / 周 ≥90% 阈值与撞车锁排队都在 `agent-service.ts` / `agent-admission.ts` 的接单路径上执行。
+
 新增备注账号持久化经过 `authenticating`、`syncing`，首次 Skills/插件同步及共享历史准备完成后才进入 `ready`。认证后保留同一个 control-only 进程等待同步，最长 120 秒；普通模型、额度查询和任务启动只接受 ready 账号，已有默认账号会话继续运行。失败记录为 `sync_failed`，保留原因和重试时间，用户通过 `hi 备注` 显式重试；不随每分钟额度刷新重启同步进程。中断后保留未完成状态，旧版 `enrolling` 记录仍可通过显式收录恢复。原生控制查询不提交用户输入，但初始化仍会触发云同步，因此不能在首次认证完成后立即关闭进程。
 
 `claude-sync-warmup.ts` 核对原生身份对应的账号桶，要求 Skills 和插件各自有成功轮次标记、清单所列文件落地、待处理项和暂存目录清空，且连续两次间隔至少 5 秒的检查保持一致。原生复用此前成功轮次时，允许认证桶与启动前已完成快照完全一致；空远端集合有成功标记即可完成，不要求与默认账号技能集合相同。用户设置或本次启动设置显式关闭相应云同步时跳过该通道；缺目录、服务端未开放同步或未知文件格式不能推断为关闭，缺少完成证据仍超时报错。当前 SDK 无公开同步完成事件，检测依赖原生落盘标记，后续原生格式变化需适配。

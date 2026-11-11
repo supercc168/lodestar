@@ -18,6 +18,8 @@ export interface AgentRunRequest {
   workDir?: string
   /** Unique native session ID, registered to the same project and conversation ID (chat_id). */
   sessionId?: string
+  /** Optional evidence/output directory; joins the run's collision lock keys. */
+  evidenceDir?: string
   requestId?: string
   /** Optional caller attribution; never enables file delivery. */
   requesterOpenId?: string
@@ -30,6 +32,8 @@ export interface AgentFollowUpRequest {
   effort?: string
   /** Optional working directory for this native continuation. */
   workDir?: string
+  /** Optional evidence/output directory; joins the run's collision lock keys. */
+  evidenceDir?: string
   requestId?: string
   requesterOpenId?: string
 }
@@ -146,6 +150,10 @@ export interface AgentRunSnapshot {
   error?: string
   presentationErrors?: string[]
   cardMessageId?: string
+  /** Declared evidence directory (resolved), when the caller passed one. */
+  evidenceDir?: string
+  /** Collision lock keys (`workdir:` / `unity:` / `evidence:` + path) held while the run is active. */
+  lockKeys?: string[]
 }
 
 export function parseAgentRunRequest(raw: unknown): AgentRunRequest {
@@ -166,10 +174,12 @@ export function parseAgentRunRequest(raw: unknown): AgentRunRequest {
   const prompt = requiredPrompt(value.prompt, 'agent run requires "prompt"')
   const effort = optionalString(value.effort)
   const workDir = parseWorkDir(value)
+  const evidenceDir = parseEvidenceDir(value)
   return {
     identityIds, description: requireAgentDescription(value.description), prompt,
     ...(effort ? { effort } : {}), ...(sessionId ? { sessionId } : {}),
     ...(workDir !== undefined ? { workDir } : {}),
+    ...(evidenceDir !== undefined ? { evidenceDir } : {}),
     ...parseProjectOptions(value),
   }
 }
@@ -180,12 +190,14 @@ export function parseAgentFollowUpRequest(raw: unknown): AgentFollowUpRequest {
   const identityId = optionalString(value.identity_id ?? value.identityId)
   const effort = optionalString(value.effort)
   const workDir = parseWorkDir(value)
+  const evidenceDir = parseEvidenceDir(value)
   return {
     description: requireAgentDescription(value.description),
     prompt,
     ...(identityId ? { identityId } : {}),
     ...(effort ? { effort } : {}),
     ...(workDir !== undefined ? { workDir } : {}),
+    ...(evidenceDir !== undefined ? { evidenceDir } : {}),
     ...parseProjectOptions(value),
   }
 }
@@ -214,6 +226,18 @@ export function agentOwnerKey(owner: AgentRunOwner): string {
 export function requireAgentWorkDir(raw: unknown): string {
   if (typeof raw !== 'string' || !raw.trim() || raw.includes('\0')) {
     throw new Error('agent work_dir must be a non-empty path without null bytes')
+  }
+  return raw
+}
+
+function parseEvidenceDir(value: Record<string, unknown>): string | undefined {
+  if (value.evidence_dir !== undefined && value.evidenceDir !== undefined && value.evidence_dir !== value.evidenceDir) {
+    throw new Error('conflicting agent evidence_dir and evidenceDir')
+  }
+  const raw = value.evidence_dir !== undefined ? value.evidence_dir : value.evidenceDir
+  if (raw === undefined) return undefined
+  if (typeof raw !== 'string' || !raw.trim() || raw.includes('\0')) {
+    throw new Error('agent evidence_dir must be a non-empty path without null bytes')
   }
   return raw
 }

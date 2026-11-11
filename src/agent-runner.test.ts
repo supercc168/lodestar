@@ -787,22 +787,23 @@ test('Claude subscription workers auto-select an account at startup and report i
         sendUserText() { queueMicrotask(() => this.emit('result', { is_error: false })) },
         async kill() { this.alive = false; this.emit('exit', { code: 0 }) },
       })
-      return { process: proc, ...(options.claudeAccountPreference === null ? { claudeAccount: { accountId: 'vale', accountName: 'vale',
+      return { process: proc, ...(options.claudeAccountPreference === null || options.claudeAccountId ? { claudeAccount: { accountId: 'vale', accountName: 'vale',
         quota: '4.0h·7%·[6.0d·17%]', pool: 'default 1.0h·90%·[6.0d·80%]; vale 4.0h·7%·[6.0d·17%]' } } : {}) }
     } }))
     const { startAgentWorker } = await import('./src/agent-runner')
     const { agentIdentityId } = await import('./src/agent-identities')
-    for (const [source, resumeSessionId] of [['claude-sub', undefined], ['claude-sub', 'native-session'], ['glm', undefined]]) {
+    for (const [source, resumeSessionId, reserved] of [['claude-sub', undefined], ['claude-sub', 'native-session'], ['glm', undefined], ['claude-sub', 'native-session', 'vale']]) {
       currentSource = { id: source, kind: source === 'claude-sub' ? 'claude-subscription' : 'api' }
       await startAgentWorker({
         identity: { id: agentIdentityId(source, 'sonnet'), tokenSourceId: source, provider: 'claude', model: 'sonnet', modelDisplay: 'sonnet', supportedEfforts: ['medium'] },
         projectBound: true, resumeSessionId, effort: 'medium', workDir: process.cwd(), prompt: 'ok', hostEnv: {},
         claudeActiveSessions: new Map([['default', 2]]),
+        ...(reserved ? { claudeAccountId: reserved } : {}),
         callbacks: { onClaudeAccount: account => reported.push(account), onSession: id => sessions.push(id) },
       }).done
     }
     console.log(JSON.stringify({ launches: launches.map(item => ({ source: item.tokenSourceId, preference: item.claudeAccountPreference,
-      fallback: item.claudeExhaustedFallbackAccountId, active: item.claudeActiveSessions })), reported, sessions, recorded }))
+      fallback: item.claudeExhaustedFallbackAccountId, active: item.claudeActiveSessions, account: item.claudeAccountId })), reported, sessions, recorded }))
   `], { cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'test' }, stdout: 'pipe', stderr: 'pipe' })
   expect(run.exitCode, run.stderr.toString()).toBe(0)
   const result = JSON.parse(run.stdout.toString().trim().split('\n').at(-1)!)
@@ -810,8 +811,10 @@ test('Claude subscription workers auto-select an account at startup and report i
     { source: 'claude-sub', preference: null, active: [['default', 2]] },
     { source: 'claude-sub', preference: null, fallback: 'vale', active: [['default', 2]] },
     { source: 'glm' },
+    // Reserved at admission: launches on exactly that account, no re-pick and no exhausted fallback.
+    { source: 'claude-sub', account: 'vale' },
   ])
-  expect(result.reported).toHaveLength(2)
+  expect(result.reported).toHaveLength(3)
   expect(result.reported[0]).toMatchObject({ accountId: 'vale', accountName: 'vale', quota: '4.0h·7%·[6.0d·17%]' })
   expect(result.recorded.every(([, account]: [string, string]) => account === 'vale')).toBe(true)
   expect(result.recorded.map(([id]: [string, string]) => id)).toEqual(expect.arrayContaining(['fresh-session', 'native-session']))

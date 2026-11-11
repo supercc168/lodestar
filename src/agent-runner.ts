@@ -77,6 +77,11 @@ export function startAgentWorker(opts: {
   allowDelegation?: boolean
   /** Live chat load per Claude account; spreads the startup pick like main Sessions do. */
   claudeActiveSessions?: ReadonlyMap<string, number>
+  /**
+   * Claude subscription account reserved at Agent admission. When set the worker
+   * launches on exactly this account (no re-pick, no exhausted fallback).
+   */
+  claudeAccountId?: string
   callbacks?: AgentWorkerCallbacks
 }): AgentWorkerHandle {
   const source = getTokenSourceForAccount(opts.identity.tokenSourceId, opts.codexAccountId)
@@ -106,7 +111,8 @@ export function startAgentWorker(opts: {
     codexAccountId: opts.codexAccountId,
     ...(opts.identity.provider === 'codex' && opts.identity.tokenSourceId === 'codex-sub'
       ? { codexAccountPreference: null } : {}),
-    ...(claudePool ? {
+    ...(claudePool && opts.claudeAccountId ? { claudeAccountId: opts.claudeAccountId } : {}),
+    ...(claudePool && !opts.claudeAccountId ? {
       claudeAccountPreference: null,
       ...(opts.resumeSessionId ? { claudeExhaustedFallbackAccountId: claudeSessionAccount(opts.resumeSessionId) } : {}),
       ...(opts.claudeActiveSessions ? { claudeActiveSessions: opts.claudeActiveSessions } : {}),
