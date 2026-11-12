@@ -81,7 +81,7 @@ Lodestar Agent（`lodestar-agent identities` / `run` / `follow-up` 及群内 Age
 
 Claude 订阅的 Lodestar Agent run 默认最多 4 个并发、每号最多 2 个（`config.toml` 的 `[agent]` `claude_sub_max_concurrent` / `claude_sub_max_per_account`，或环境变量 `LODESTAR_CLAUDE_SUB_MAX_CONCURRENT` / `LODESTAR_CLAUDE_SUB_MAX_PER_ACCOUNT`）。账号在接单时同步预占并锁定到 run 结束，5h 已用 ≥80% 或周额度已用 ≥90% 的账号不接新 run；无号可接时报 `CLAUDE_SUB_FULL`，不回退到已耗尽或已满的账号。worker 内不再经 Claude 订阅向下委派（`CLAUDE_SUB_NESTED`，见 `claude-agent-backend.md`）。所有来源的 run 都有撞车锁：work_dir、所在 Unity 工程根（含 `Assets/` 与 `ProjectSettings/`）或 `--evidence-dir` 与活跃 run 重叠时排队（`queued` + `queued_reason`），锁空出后按先后自动开跑。
 
-所有账号使用同一套调度模型，不区分账号类型：一个完整 5 小时额度算一份，普通完整周窗口算 10 份。Fable 的总周算 5 份、专属周算 10 份。账号余量取 5h、总周及接口实际返回的 OAuth、当前模型专属窗口中最小的剩余份数；没有 5h 窗口的账号只按周窗口计算。缺少 Fable 专属窗口时按 `MISS` 排除，其他模型专属仅兼容接口实际返回的窗口。
+所有账号使用同一套调度模型，不区分账号类型：一个完整 5 小时额度算一份，普通完整周窗口、OAuth 及模型专属周窗口算 10 份，Fable 专属周窗口算 5 份（总周的一半）。账号余量取 5h、总周及接口实际返回的 OAuth、当前模型专属窗口中最小的剩余份数；没有 5h 窗口的账号只按周窗口计算。Fable 与其他模型分开分配：Fable 模型同时受总周和专属周约束；其他模型在距总周重置超过 2 天时，只能使用总周剩余中扣除 Fable 尚未使用份额后的部分，距重置不超过 2 天释放预留。预留只依据接口实际返回的唯一 Fable 专属周窗口，缺失时不猜测；Fable 模型缺少专属周按 `MISS` 排除，仍在预留期但专属周重复或数值无效时也按 `MISS` 排除，专属周已用完时不再预留。其他模型专属仅兼容接口实际返回的窗口。
 
 选号先看能否在 5 小时窗口里安排任务，再按余量分散，不预测单个任务的用量。存活的 Claude 订阅会话只要仍在执行任务，或最近 30 分钟收到过用户消息，就计为一份负载；等待回答、排队和后台任务也计入，同群不重复计算。会话里仍在运行的原生子 Agent 每个再计一份，结束后不再计入。每次启动前把账号余量除以“活跃负载单位 + 1”，作为该账号的份额。
 

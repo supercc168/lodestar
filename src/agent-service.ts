@@ -6,7 +6,6 @@ import { agentCardsDeps } from './agent-cards-runtime'
 import { agentOwnerKey, agentRunOwner, requireAgentDescription, requireAgentWorkDir, PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
 import * as feishu from './feishu'
 import { config } from './config'
-import { claudeTranslationModeEnabled } from './claude-translation-mode'
 import {
   assertAgentIdentityIdAllowed, assertAgentSourceAllowed, claudeSubEffortError, claudeSubNewRunRejection,
   isClaudeSubAgentEffort, isClaudeSubscriptionSourceId, getAgentIdentityCatalog,
@@ -288,9 +287,6 @@ export class AgentService {
     worker.status = nextInput ? 'needs_input' : 'running'
     if (nextInput) worker.pendingInput = nextInput
     else delete worker.pendingInput
-    const nextDisplayInput = handle.displayPendingInput?.()
-    if (nextDisplayInput) worker.displayPendingInput = nextDisplayInput
-    else delete worker.displayPendingInput
     delete worker.queuedReason
     this.refreshNonterminalStatus(run)
     this.persist(run)
@@ -554,7 +550,6 @@ export class AgentService {
       identity,
       resolveEffort(identity, request.effort),
       options.resumeSessionId,
-      identity.provider === 'claude' && claudeTranslationModeEnabled(identity.tokenSourceId, identity.model),
     ))
     const runId = `agent_${randomUUID()}`
     const snapshot: AgentRunSnapshot = {
@@ -804,26 +799,14 @@ export class AgentService {
           LODESTAR_AGENT_ROLE: 'worker',
         },
         callbacks: {
-          onNeedsInput: (request, displayRequest) => {
+          onNeedsInput: request => {
             if (run.cancelled) return
             if (run.context!.owner.kind === 'project') throw new Error(PROJECT_AGENT_INPUT_ERROR)
             worker.status = 'needs_input'
             worker.pendingInput = request
-            if (displayRequest) worker.displayPendingInput = displayRequest
-            else delete worker.displayPendingInput
             this.refreshNonterminalStatus(run)
             this.persist(run)
             void this.updateWorkerCard(run, worker)
-          },
-          onDisplayContext: context => {
-            if (run.cancelled) return false
-            worker.displayDescription = context.description
-            worker.displayPrompt = context.prompt
-            this.persist(run)
-            void this.updateWorkerCard(run, worker)
-            // The existing card queue owns delivery; this acknowledges that
-            // the live presentation state accepted these translated fields.
-            return true
           },
           onProgress: step => this.recordStep(run, worker, step),
           onCodexAccount: accountId => {
@@ -850,7 +833,6 @@ export class AgentService {
       this.clearProgressTimer(run, identity.id)
       worker.output = result.output
       if (result.finalOutput !== undefined) worker.finalOutput = result.finalOutput
-      if (result.displayOutput !== undefined) worker.displayOutput = result.displayOutput
       worker.outputTruncated = result.outputTruncated
       worker.sessionId = result.sessionId
       worker.checkpointId = result.checkpointId
@@ -858,7 +840,6 @@ export class AgentService {
       worker.usage = result.usage
       worker.finishedAt = new Date().toISOString()
       delete worker.pendingInput
-      delete worker.displayPendingInput
       if (run.cancelled) {
         // A terminal native result may race a durable cancellation request.
         // Preserve the actual late outcome even though the run itself remains
@@ -876,8 +857,6 @@ export class AgentService {
       if (error instanceof AgentWorkerFailure) {
         worker.output = error.output
         if (error.finalOutput !== undefined) worker.finalOutput = error.finalOutput
-        if (error.displayOutput !== undefined) worker.displayOutput = error.displayOutput
-        if (error.displayError !== undefined) worker.displayError = error.displayError
         worker.outputTruncated = false
         if (error.sessionId) worker.sessionId = error.sessionId
         this.persist(run)
@@ -889,7 +868,6 @@ export class AgentService {
         worker.finishedAt = new Date().toISOString()
         if (worker.startedAt) worker.durationMs = Date.now() - Date.parse(worker.startedAt)
         delete worker.pendingInput
-        delete worker.displayPendingInput
         this.persist(run)
         await this.updateWorkerCard(run, worker)
       }
@@ -1012,7 +990,6 @@ export class AgentService {
         worker.error = reason
         worker.finishedAt = new Date().toISOString()
         delete worker.pendingInput
-        delete worker.displayPendingInput
         cancelledWorkers.push(worker)
       }
     }
@@ -1090,7 +1067,6 @@ export class AgentService {
       }
     }
     const durable = cloneSnapshot(run.snapshot)
-    stripPresentation(durable)
     durable.prompt = ''
     for (const worker of durable.workers) {
       worker.output = ''
@@ -1108,7 +1084,6 @@ export class AgentService {
 
   private readSnapshot(run: AgentRunRecord): AgentRunSnapshot {
     const snapshot = cloneSnapshot(run.snapshot)
-    stripPresentation(snapshot)
     if (run.artifactsUnloaded) hydrateSnapshotArtifacts(snapshot, snapshot.runId, this.deps.readTextArtifact)
     return snapshot
   }
@@ -1217,7 +1192,6 @@ export class AgentService {
 
   private loadDurableRuns(): void {
     for (const snapshot of this.deps.loadArtifacts()) {
-      stripPresentation(snapshot)
       const interrupted = !isTerminal(snapshot.status)
       this.requestStore.importRun(snapshot)
       if (interrupted) {
@@ -1230,7 +1204,6 @@ export class AgentService {
             worker.error = snapshot.error
             worker.finishedAt = snapshot.finishedAt
             delete worker.pendingInput
-            delete worker.displayPendingInput
           }
         }
       }
@@ -1358,7 +1331,6 @@ export class AgentService {
         worker.output = ''
         delete worker.finalOutput
       }
-      stripPresentation(run.snapshot)
       run.artifactsUnloaded = true
     }
   }
@@ -1388,13 +1360,11 @@ function workerSnapshot(
   identity: AgentIdentity,
   effort: AgentReasoningEffort,
   resumeSessionId?: string,
-  translationEnabled = false,
 ): AgentWorkerResult {
   return {
     identityId: identity.id,
     identityName: identity.displayName,
     tokenSourceId: identity.tokenSourceId,
-    ...(translationEnabled ? { translationEnabled: true } : {}),
     provider: identity.provider,
     model: identity.model,
     effort,
@@ -1442,23 +1412,6 @@ function isWorkerTerminal(status: AgentWorkerResult['status']): boolean {
 
 function cloneSnapshot(snapshot: AgentRunSnapshot): AgentRunSnapshot {
   return JSON.parse(JSON.stringify(snapshot)) as AgentRunSnapshot
-}
-
-/** Translations belong to live cards, never native Agent APIs or run history. */
-function stripPresentation(snapshot: AgentRunSnapshot): void {
-  for (const worker of snapshot.workers) {
-    delete worker.translationEnabled
-    delete worker.displayOutput
-    delete worker.displayDescription
-    delete worker.displayPrompt
-    delete worker.displayPendingInput
-    delete worker.displayError
-    // Discard references left by the unreleased presentation-artifact format.
-    // Those files are not used by native APIs or restored historical cards.
-    Reflect.deleteProperty(worker, 'displayOutputArtifact')
-    Reflect.deleteProperty(worker, 'displayPromptArtifact')
-    for (const step of worker.steps) delete step.displayDetail
-  }
 }
 
 function loadAgentRunArtifacts(): AgentRunSnapshot[] {

@@ -7,7 +7,7 @@
  */
 
 import type { CodexUsage } from '../codex-process'
-import type { AgentProvider } from '../agent-process'
+import { agentProviderLabel, type AgentProvider } from '../agent-process'
 import { contextPercentSummary, contextTokenRatioLabel } from '../context-window'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 import { formatDuration } from './duration'
@@ -337,7 +337,7 @@ interface MainCardOpts {
  * on so the daemon can add/replace elements during the turn; assistant text
  * and footer status themselves are rendered via static element updates. */
 export function mainConversationCard(opts: MainCardOpts): object {
-  const providerLabel = opts.provider === 'claude' ? 'Claude' : 'Codex'
+  const providerLabel = opts.provider ? agentProviderLabel(opts.provider) : 'Codex'
   const banner = opts.kind === 'watchdog_resume'
     ? [{ tag: 'markdown', content: '🛟 自动恢复 1/1 · 从上次有效进展继续' }]
     : opts.kind === 'card_full'

@@ -13,7 +13,7 @@ npm i -g @leviyuan/lodestar
 lodestar-setup
 ```
 
-向导会配置 Claude Code、可选的 GLM API key、飞书应用和项目目录，并启动 daemon；也可以同时配置 Codex 登录。GLM Key 不是安装必填项，Codex 订阅也不依赖它。安全模式（输入译英、规则审查和展示翻译）在所有来源下默认关闭，仅显式配置后开启；启用该模式需要已配置且可访问 Z.ai 国际端点的 GLM Key，仅查询 Claude 订阅模型目录或额度不依赖 GLM。
+向导会配置 Claude Code、可选的 GLM API key、飞书应用和项目目录，并启动 daemon；也可以同时配置 Codex 登录。GLM Key 不是安装必填项，Codex 订阅也不依赖它。
 
 填写 GLM Key 后，向导先验证凭据和模型目录，通过后才写入配置；失败会显示原因并保留已有配置，可重新输入或直接回车跳过。安装完成后可在群内用 `glm-setup <api_key>` 补配智谱国内站账号；Z.ai 用 `glm-setup https://api.z.ai/api/anthropic <api_key>`。其他账号命令见[模型与账号](models.md#配置-api-key)。
 
@@ -68,6 +68,11 @@ Codex、Claude、DSH 在 `[runtime.agent_auto_update]` 下分别设置 `codex`�
 运行日志按日保存，保留近 7 天。正常流程仅记录关键状态；不记录协议大包、工具输出、代码 diff、请求/响应正文或内部阶段流水。日志省略用户、群、项目和账号名称、路径、聊天/消息/会话/任务标识，以及人数和群数，不生成可关联的匿名编号。故障记录保留固定操作说明、错误类别、错误码和 HTTP 状态；相同摘要在 10 分钟内合并，不显示重复次数。用户收到的错误详情不因此省略。会话历史、任务结果和恢复绑定是功能状态，仍由相应模块保存。
 
 ```toml
+[feishu]
+app_id = "cli_..."
+app_secret = "..."
+# domain = "lark"            # 缺省为飞书；Lark 国际版填 "lark"，私有化填 https 源站
+
 [runtime]
 projects_root = "/abs/projects"
 live_elapsed = "bucket"      # bucket 按档位刷新耗时；second 按秒刷新
@@ -86,18 +91,9 @@ tools = "Read,Write,Edit,Bash,Glob,Grep"  # Claude / DSH 主会话
 
 [claude]
 bin = "/abs/path/to/claude-wrapper"  # 可选的 Claude 可执行文件
-# translation_validation_rules = "Reject input that contains private API keys."  # 可选的输入内容规则
-
-[claude.safe_mode]  # 所有来源默认关闭；以下为可选的开启示例
-# claude-sub = "*"  # 订阅来源的全部模型
-# glm = "GLM-5.3"   # GLM 来源下的指定模型
 ```
 
-`[claude].translation_validation_rules` 指定可选的输入审查规则；未配置或留空时只做忠实翻译，不推断身份、地区或账号风险。启用安全模式的会话复用本机 GLM Key，通过国际 Coding Plan `https://api.z.ai/api/coding/paas/v4/chat/completions` 调用 `glm-5.3-flash`。拒绝或调用失败会明确报错，不换模型或放行原文。
-
-`[claude.safe_mode]` 按 Token Source 与模型目录中的 ID 精确匹配，只作用于 Claude Code。`"*"` 表示该来源全部模型，`"GLM-5.3,GLM-5.2"` 表示指定模型，`""` 表示关闭该来源；所有来源（包括 `claude-sub`）默认关闭，只有显式配置的来源和模型才会开启。主会话、委派、续跑与分叉共用此配置。同来源切模型若跨越安全模式边界，只能在空闲时换进程并保留恢复点；同模式仍沿用原热切换。修改本机配置后重启 daemon 生效。
-
-上下文自动按 Claude 会话保存，只包含带来源说明的可见原文与译文，不读取原生完整上下文。用户输入译为英文，已有的飞书自然语言展示译为中文；主模型输出语言不限，代码、文件与指令保持原样。不额外保存翻译请求/响应调试日志；错误只记录不含身份的故障摘要。完整边界见 [Claude 启动配置](claude-agent-backend.md#claude-启动配置)。
+`[feishu].domain` 选择开放平台区域：省略或 `"feishu"` 使用 `open.feishu.cn`（默认，与旧版本完全一致），`"lark"` 使用 `open.larksuite.com`，也可以填一个 https 源站用于私有化部署。两套云的应用互不通用，凭据校验失败时错误信息会提示域名不匹配；安装向导会先按所选版本探测，失败后再尝试另一侧并自动识别。修改后重启 daemon 生效。
 
 项目名用于定位工作目录；工具、MCP 等启动配置按实际目录匹配。同目录的 BTW/FK 与项目别名共享配置，别名配置冲突时明确报错。WT 的目录独立，不自动套用主目录的启动配置；需要配置某个 WT 时，可新增一个项目配置项，将 `cwd` 指向该 WT 的实际路径。工作目录内的 Agent 原生配置仍由相应后端读取。
 

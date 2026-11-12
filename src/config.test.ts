@@ -12,13 +12,14 @@ interface FreshConfigResult {
   stderr: string
 }
 
-function loadFreshConfig(extraToml = ''): FreshConfigResult {
+function loadFreshConfig(extraToml = '', feishuExtra: string[] = []): FreshConfigResult {
   const root = mkdtempSync(join(tmpdir(), 'lodestar-config-fresh-'))
   const configFile = join(root, 'config.toml')
   const minimumConfig = [
     '[feishu]',
     'app_id = "cli_test"',
     'app_secret = "secret"',
+    ...feishuExtra,
   ].join('\n')
   writeFileSync(configFile, `${minimumConfig}${extraToml ? `\n\n${extraToml.trim()}\n` : '\n'}`)
 
@@ -232,76 +233,27 @@ describe('Claude subscription switch', () => {
   })
 })
 
-describe('Claude translation validation rules', () => {
-  test('does not invent content rules when omitted', () => {
+
+describe('[feishu].domain', () => {
+  test('omitted domain keeps the feishu default', () => {
     const result = loadFreshConfig()
     expect(result.exitCode).toBe(0)
-    expect(JSON.parse(result.stdout).claude.translation_validation_rules).toBeUndefined()
+    expect(JSON.parse(result.stdout).feishu.domain).toBeUndefined()
   })
 
-  test('preserves configured single-line rules and an explicit empty value', () => {
-    const rules = '拒绝包含私钥的输入；允许使用 # 标记普通代码注释。'
-    const configured = loadFreshConfig(`[claude]\ntranslation_validation_rules = "${rules}"`)
-    expect(configured.exitCode).toBe(0)
-    expect(JSON.parse(configured.stdout).claude.translation_validation_rules).toBe(rules)
-
-    const empty = loadFreshConfig('[claude]\ntranslation_validation_rules = ""')
-    expect(empty.exitCode).toBe(0)
-    expect(JSON.parse(empty.stdout).claude.translation_validation_rules).toBe('')
-  })
-})
-
-describe('Claude safe mode selection', () => {
-  test.each(['', '[claude.safe_mode]'])('defaults to no translated sources with omitted or empty rules: %s', rules => {
-    const result = loadFreshConfig(rules)
-    expect(result.exitCode).toBe(0)
-    expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({})
+  test('accepts named regions and normalizes custom https origins', () => {
+    expect(JSON.parse(loadFreshConfig('', ['domain = "feishu"']).stdout).feishu.domain).toBe('feishu')
+    expect(JSON.parse(loadFreshConfig('', ['domain = "lark"']).stdout).feishu.domain).toBe('lark')
+    expect(JSON.parse(loadFreshConfig('', ['domain = "https://open.example.com/"']).stdout).feishu.domain)
+      .toBe('https://open.example.com')
   })
 
-  test('enables only explicitly selected sources and catalog models', () => {
-    const result = loadFreshConfig('[claude.safe_mode]\nglm = "GLM-5.3, GLM-5.3-Flash"\npacky = "*"')
-    expect(result.exitCode).toBe(0)
-    expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({
-      glm: ['GLM-5.3', 'GLM-5.3-Flash'], packy: ['*'],
+  test.each(['""', '"http://open.example.com"', '"https://open.example.com/api"', '"lark2"'])(
+    'rejects an invalid domain value: %s', value => {
+      const result = loadFreshConfig('', [`domain = ${value}`])
+      expect(result.exitCode).not.toBe(0)
+      expect(result.stderr).toContain('[feishu].domain')
     })
-  })
-
-  test('an explicit empty source stays disabled without affecting other sources', () => {
-    const result = loadFreshConfig('[claude.safe_mode]\nclaude-sub = ""\nglm = "GLM-5.3"')
-    expect(result.exitCode).toBe(0)
-    expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({ 'claude-sub': [], glm: ['GLM-5.3'] })
-  })
-
-  test.each(['*', 'claude-opus-4-6'])('can explicitly enable subscription models: %s', model => {
-    const result = loadFreshConfig(`[claude.safe_mode]\nclaude-sub = "${model}"`)
-    expect(result.exitCode).toBe(0)
-    expect(JSON.parse(result.stdout).claude.safe_mode).toEqual({ 'claude-sub': [model] })
-  })
-
-  test.each([
-    'true', 'false', '42', '["GLM-5.3"]', '"GLM-5.3", "GLM-5.3-Flash"',
-    '"GLM-5.3,,GLM-5.3-Flash"', '",GLM-5.3"', '"GLM-5.3,"',
-    '"GLM-5.3,*"', '"GLM-*"', '"GLM 5.3"',
-  ])('rejects an invalid source selection: %s', value => {
-    const result = loadFreshConfig(`[claude.safe_mode]\nglm = ${value}`)
-    expect(result.exitCode).not.toBe(0)
-    expect(result.stderr).toContain('[claude.safe_mode].glm')
-  })
-
-  test.each([
-    '[claude]\nsafe_mode = true',
-    '[claude]\nsafe_mode =',
-    '[claude.safe_mode\nglm = "GLM-5.3"',
-    '[[claude.safe_mode]]\nglm = "GLM-5.3"',
-    '[claude.safe_mode.glm]\nmodel = "GLM-5.3"',
-    '[claude.safe_mode]\nglm.model = "GLM-5.3"',
-    '[claude.safe_mode]\nglm =',
-    '[claude.safe_mode]\nglm = "GLM-5.3"\nglm = "*"',
-  ])('rejects malformed safe mode configuration: %s', text => {
-    const result = loadFreshConfig(text)
-    expect(result.exitCode).not.toBe(0)
-    expect(result.stderr).toContain('[claude.safe_mode]')
-  })
 })
 
 describe('runtime live_elapsed', () => {

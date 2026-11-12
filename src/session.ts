@@ -42,8 +42,6 @@ import { DshProcess } from './dsh-process'
 import { fetchDeepseekBalance } from './token-source-deepseek'
 import { isAgentSession } from './agent-session-registry'
 
-import { processUsesClaudeTranslation } from './agent-process'
-import { claudeTranslationModeEnabled } from './claude-translation-mode'
 import { createAgentCards } from './agent-cards-runtime'
 import type { AgentCards } from './agent-cards'
 import { waitForLiveCodexUsage } from './codex-live-usage'
@@ -636,7 +634,7 @@ export class Session {
   /** onUserMessage 沉降旧卡后置位;主卡落地后据此重建后台卡(游标重回末尾)。 */
   private pendingRebuildBackgroundCard = false
   userInterrupted = false
-  private nativeAgentTools = new Map<string, { confirmed: boolean; input: any; displayInput?: any }>()
+  private nativeAgentTools = new Map<string, { confirmed: boolean; input: any }>()
   private readonly agentCards: AgentCards
   private backgroundOwner = randomBytes(16).toString('hex')
   private backgroundSync: Promise<void> | null = null
@@ -2431,10 +2429,6 @@ export class Session {
       this.blockedProc === proc
       || proc.provider !== provider
       || proc.tokenSourceId !== tokenSourceId
-      || provider === 'claude' && proc.provider === 'claude'
-        && processUsesClaudeTranslation(proc) !== claudeTranslationModeEnabled(
-          tokenSourceId, model ?? this.tokenSource(tokenSourceId)?.defaultModel,
-        )
       || provider === 'claude' && proc.provider === 'claude' && effort !== null
         && ((proc.lastEffort ?? this.selectedEffort) === 'default') !== (effort === 'default')
       || !this.processSourceMatches(this.tokenSource(tokenSourceId), model)
@@ -4590,7 +4584,7 @@ export class Session {
   }
 
   private spawnDeveloperInstructions(): string {
-    return sessionWorktree.spawnDeveloperInstructions(this, this.currentProvider())
+    return sessionWorktree.spawnDeveloperInstructions(this)
   }
 
   delegatedAgentDeveloperInstructions(provider: AgentProvider): string {
@@ -5169,12 +5163,6 @@ export class Session {
     this.steeringBoundary?.start()
     this.steeringBoundary = null
     if (!this.proc) return
-    // Local translation has no native result to acknowledge this stop. Do not
-    // consume the next actual task's result as a stale interrupt receipt.
-    if (processUsesClaudeTranslation(this.proc) && this.proc.hasPendingNativeTurn?.() === false) {
-      this.cancelTurnInterrupt('local translation interrupted before native input')
-      this.userInterrupted = false
-    }
     this.proc.sendInterrupt()
   }
 
@@ -6288,7 +6276,7 @@ export class Session {
   /** 热续跑全程零运行期事件、只来最终 task_notification:命中档案就补一张一次性
    *  墓碑卡(静态历史卡,不走活卡 streaming 生命周期),让「续跑已完成」在群里留痕。 */
   private async sendResumedAgentTombstone(e: BgTaskSettledEvent): Promise<void> {
-    const entry = cards.resurrectSettled(this.bgArchive, { ...e, ...e.display })
+    const entry = cards.resurrectSettled(this.bgArchive, { ...e })
     if (!entry) return
     this.backgroundTasks = [...this.backgroundTasks, entry]
     await this.refreshBackgroundCardFull()
@@ -6505,16 +6493,6 @@ export class Session {
     const epoch = wiredEpoch ?? ++this.procEpoch
     if (wiredEpoch === undefined && this.proc !== p) this.proc = p
     const isCurrent = (): boolean => this.proc === p && this.procEpoch === epoch
-    if (processUsesClaudeTranslation(p)) p.setTranslationPresentationPolicy?.(event => {
-      if (!isCurrent() || this.stoppingProc === p || this.blockedProc === p) return 'hidden'
-      if (event.kind === 'assistant_text' && event.parentToolUseId) return 'hidden'
-      if ((event.kind === 'tool_input' || event.kind === 'tool_result')
-        && event.parentToolUseId && this.bgTaskOwns(event.parentToolUseId)) return 'background'
-      // The main question panel never renders the SDK receipt, including
-      // validation errors raised before canUseTool created a question panel.
-      if (event.kind === 'tool_result' && event.toolName === 'AskUserQuestion') return 'hidden'
-      return 'main'
-    })
     const on = <K extends keyof AgentProcessEventMap>(
       event: K,
       handler: (payload: AgentProcessEventMap[K], snapshot: { result: CodexResultMeta; totalUsage: CodexUsage | null }) => void,
@@ -6719,10 +6697,10 @@ export class Session {
         logError('session: init turn-open handler failed', e)
       })
     })
-    on('scheduled_turn_input', ({ text, displayText, promptId }) => {
+    on('scheduled_turn_input', ({ text, promptId }) => {
       // claude 与 dsh 都上报调度轮输入;codex 走自己的 receipt 路径。
       if (p.provider !== 'claude' && p.provider !== 'dsh') return
-      this.startScheduledTurnCard(p, displayText ?? text, promptId)
+      this.startScheduledTurnCard(p, text, promptId)
     })
     on('conversation_materialized', ({ session_id: sessionId }) => {
       if (p.provider !== 'codex') return
@@ -6818,9 +6796,9 @@ export class Session {
       this.currentTurnUsageBaseline = total ? { ...total } : null
       this.currentTurnUsageBaselineKnown = true
     })
-    on('turn_input_error', ({ error, displayError }) => {
+    on('turn_input_error', ({ error }) => {
       logError('session: native input processing failed', error)
-      void feishu.sendTextRaw(this.chatId, `⚠️ ${this.backendLabel(p.provider)} 输入处理错误：${displayError ?? error}`)
+      void feishu.sendTextRaw(this.chatId, `⚠️ ${this.backendLabel(p.provider)} 输入处理错误：${error}`)
     })
     on('user_input_consumed', ({ inputId }) => this.onSteeringInputConsumed(p, epoch, inputId))
     on('input_batch_end', () => {})
@@ -6846,13 +6824,13 @@ export class Session {
     on('thread_goal_cleared', () => {
       this.handleThreadGoalCleared(p)
     })
-    on('assistant_text', ({ text, displayText, parentToolUseId }: { text: string; displayText?: string; parentToolUseId: string | null }) => {
+    on('assistant_text', ({ text, parentToolUseId }: { text: string; parentToolUseId: string | null }) => {
       // SDK/CLI 若转发子 Agent assistant 正文，会在 parentToolUseId 上标归属；
       // 其工具已进共享任务面板，正文同样不得泄漏进主对话卡。后台任务的可见进度/
       // 终稿由 task_progress/task_notification 权威事件承载。
       if (parentToolUseId) return
       if (text.trim()) this.observeWatchdogMeaningful(p, 'assistant_text')
-      this.appendAssistant(displayText ?? text)
+      this.appendAssistant(text)
     })
     on('assistant_block_stop', ({ parentToolUseId }: { parentToolUseId: string | null }) => {
       if (parentToolUseId) return
@@ -6864,8 +6842,8 @@ export class Session {
       // 主线程定稿一段 assistant = 主 agent 在继续说话、没在等 pending task → 提升后台入卡。
       this.onMainThreadAdvance()
     })
-    on('tool_use', ({ id, name, input, displayInput, parentToolUseId }) => {
-      const shownInput = displayInput ?? input
+    on('tool_use', ({ id, name, input, parentToolUseId }) => {
+      const shownInput = input
       // 子 agent 内的工具调用(parentToolUseId 非空)不上主卡 —— 只累积进对应后台
       // task 的 steps[](后台卡展开可见)。与 codex 侧 isSubagentThread 分流同构:
       // 主卡只承载主 agent,子 agent 过程不把主卡面板数刷爆。parentToolUseId 无
@@ -6889,7 +6867,7 @@ export class Session {
           turn.taskUpdateI = null
         }
         this.onMainThreadAdvance()
-        this.nativeAgentTools.set(id, { confirmed: false, input, displayInput })
+        this.nativeAgentTools.set(id, { confirmed: false, input })
         // Codex exposes each child separately through collab lifecycle events.
         // Claude's native tool is itself the initial task until task_started
         // supplies its SDK id. Both paths keep launch details off the main card.
@@ -6904,13 +6882,13 @@ export class Session {
         }
         return
       }
-      sessionTools.addTool(this, p, id, name, input, displayInput)
+      sessionTools.addTool(this, p, id, name, input)
       // 主线程发起新 tool_use = 主 agent 没在等 pending 里的 task → 它们是后台,提升入卡。
       // 前台 task 的 settled 先于主线程下一个 tool_use 到达,pending 已空,不会误提。
       if (!parentToolUseId) this.onMainThreadAdvance()
     })
-    on('tool_result', ({ tool_use_id, content, displayContent, displayInput, is_error, parentToolUseId, input }: any) => {
-      const shownContent = displayContent ?? content
+    on('tool_result', ({ tool_use_id, content, is_error, parentToolUseId, input }: any) => {
+      const shownContent = content
       // 子 agent 内的工具结果同 tool_use:只回填后台 task steps,不上主卡面板。
       if (parentToolUseId && this.bgTaskOwns(parentToolUseId)) {
         this.applyBgStore(cards.applyBgToolResult(
@@ -6934,7 +6912,7 @@ export class Session {
           if (!task) {
             this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), {
               task_id: tool_use_id, tool_use_id, task_type: 'subagent',
-              description: (nativeTool.displayInput ?? nativeTool.input)?.description || '子 Agent', prompt: (nativeTool.displayInput ?? nativeTool.input)?.prompt,
+              description: nativeTool.input?.description || '子 Agent', prompt: nativeTool.input?.prompt,
             }))
             task = this.backgroundTasks.find(entry => entry.toolUseId === tool_use_id)!
           }
@@ -6946,7 +6924,7 @@ export class Session {
         sessionTools.startThinkingIfNoToolsRunning(this)
         return
       }
-      sessionTools.completeTool(this, p, tool_use_id, content, is_error, input, displayContent, displayInput)
+      sessionTools.completeTool(this, p, tool_use_id, content, is_error, input)
     })
     on('subagent_activity', (activity: {
       activityId: string
@@ -7017,8 +6995,7 @@ export class Session {
         beforeActive !== stringSetSignature(this.activeCodexSubagentActivities)
       ) {
         this.observeWatchdogMeaningful(p, 'collab_agent_state')
-      }
-    })
+      }    })
     on('can_use_tool', (req: CanUseToolRequest) => {
       sessionPermission.renderPermission(this, req)
     })
@@ -7038,12 +7015,7 @@ export class Session {
       ).catch(() => {})
     })
     on('result', (result: any, snapshot) => {
-      if (processUsesClaudeTranslation(p) && result?.subtype === 'claude_turn_start_failed') {
-        // Async validation can reject before native init/turn_started consumes
-        // the claim. Return it so the next native turn is not misattributed.
-        this.pendingUserMessageCount = Math.max(0, this.pendingUserMessageCount - 1)
-      }
-      const event: AgentResultEvent = (result ?? {}) as AgentResultEvent
+      const event = (result ?? {}) as AgentResultEvent
       this.releaseUnconsumedSteering(p)
       const deliveryContext = this.matchingHumanDeliveryResult(p, event ?? {})
       const ownsHumanTurn = this.resultOwnsCurrentHumanTurn(p, event ?? {}, deliveryContext)
@@ -7146,7 +7118,7 @@ export class Session {
       const hasMidTurn = this.pendingMidTurnMsgs.length > 0
       const isError = snapshot.result.is_error === true
       const subtype = snapshot.result.subtype ?? 'success'
-      const failureText = result?.displayError ?? result?.error
+      const failureText = result?.error
       const failureDetail = typeof failureText === 'string' && failureText.trim() ? failureText.trim() : subtype
       const hostAskFlowActive = this.pendingHostAsks.size > 0
       const capacityError = isError && (
@@ -7225,7 +7197,7 @@ export class Session {
       const nativeTool = toolUseId ? this.nativeAgentTools.get(toolUseId) : undefined
       if (nativeTool) nativeTool.confirmed = true
       logDiagnostic("session: bg_task_started")
-      this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), { ...e, ...e.display, tool_use_id: toolUseId }))
+      this.applyBgStore(cards.applyBgTaskStarted(this.bgStore(), { ...e, tool_use_id: toolUseId }))
       if (before !== backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)) {
         this.observeWatchdogMeaningful(p, 'bg_task_started')
       }
@@ -7235,7 +7207,7 @@ export class Session {
       if (this.proc !== p) return
       const before = backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)
       this.tryResurrectBgTask(e.task_id, 'progress')
-      this.applyBgStore(cards.applyBgTaskProgress(this.bgStore(), { ...e, ...e.display }))
+      this.applyBgStore(cards.applyBgTaskProgress(this.bgStore(), { ...e }))
       if (before !== backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)) {
         this.observeWatchdogMeaningful(p, 'bg_task_progress')
       }
@@ -7246,11 +7218,11 @@ export class Session {
       const before = backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)
       logDiagnostic("session: bg_task_updated")
       this.tryResurrectBgTask(e.task_id, 'updated')
-      this.applyBgStore(cards.applyBgTaskUpdated(this.bgStore(), { ...e, patch: { ...e.patch, ...e.display } }))
+      this.applyBgStore(cards.applyBgTaskUpdated(this.bgStore(), { ...e, patch: { ...e.patch } }))
       if (before !== backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)) {
         this.observeWatchdogMeaningful(p, 'bg_task_updated')
       }
-      this.onBackgroundTaskChanged()
+      this.onBackgroundTaskChanged(!!e.patch.status || e.patch.is_backgrounded === true)
     })
     p.on('bg_task_settled', (e: BgTaskSettledEvent) => {
       if (this.proc !== p) return
@@ -7261,8 +7233,8 @@ export class Session {
         // 命中档案 → 补一次性墓碑卡留痕;未命中(漏 started 的前台命令)维持 no-fallback。
         void this.sendResumedAgentTombstone(e).catch(error => { logError('session: resumed task presentation failed', error) })
       } else {
-        this.applyBgStore(cards.applyBgTaskSettled(this.bgStore(), { ...e, ...e.display }))
-        this.onBackgroundTaskChanged()
+        this.applyBgStore(cards.applyBgTaskSettled(this.bgStore(), { ...e }))
+        this.onBackgroundTaskChanged(true)
       }
       if (before !== backgroundWatchdogSignature(this.backgroundTasks, this.pendingBgTasks)) {
         this.observeWatchdogMeaningful(p, 'bg_task_settled')

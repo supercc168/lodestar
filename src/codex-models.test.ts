@@ -46,7 +46,7 @@ let savedConfig: { codex: typeof config.codex; claude: typeof config.claude }
 beforeEach(() => {
   savedConfig = { codex: config.codex, claude: config.claude }
   config.codex = { ...config.codex, ...structuredClone(configFixture.config.codex) } as typeof config.codex
-  config.claude = { ...config.claude, ...structuredClone(configFixture.config.claude), safe_mode: {} }
+  config.claude = { ...config.claude, ...structuredClone(configFixture.config.claude) }
 })
 afterEach(() => { Object.assign(config, savedConfig) })
 

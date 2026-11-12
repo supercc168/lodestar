@@ -1,5 +1,4 @@
 import type { AgentProcess, AgentReasoningEffort, AgentTurnRetry } from './agent-process'
-import { processUsesClaudeTranslation } from './agent-process'
 import { assertAgentIdentityIdAllowed, assertAgentSourceAllowed, type AgentIdentity } from './agent-identities'
 import { createAgentProcess } from './agent-launch'
 import { rememberAgentSession } from './agent-session-registry'
@@ -9,7 +8,6 @@ import type { ConversationLaunch } from './conversation'
 import type { ProjectProfile } from './config'
 import { getTokenSourceForAccount } from './token-source'
 import { DELEGATED_AGENT_INSTRUCTIONS, PROJECT_AGENT_INSTRUCTIONS } from './agent-skill'
-import { shellCommandPresentation } from './cards/shell-command'
 import { boundCodexAccount } from './codex-accounts'
 import type { ClaudeLaunchAccount } from './agent-claude-account'
 import { claudeSessionAccount, recordClaudeSessionAccount } from './claude-session-accounts'
@@ -21,7 +19,6 @@ export interface AgentWorkerResult {
   output: string
   /** Last non-empty completed top-level assistant block. */
   finalOutput?: string
-  displayOutput?: string
   outputTruncated: boolean
   sessionId: string
   checkpointId?: string
@@ -32,17 +29,14 @@ export interface AgentWorkerResult {
 /** D-14:失败或取消时连同此前已生成的输出一起抛出 —— 失败不再吞掉正文。
  *  调用方(agent-service)据此把 output 落回 worker.output。 */
 export class AgentWorkerFailure extends Error {
-  constructor(cause: Error, readonly output: string, readonly sessionId: string | null, readonly displayOutput?: string,
-    readonly displayError?: string, readonly finalOutput?: string) {
+  constructor(cause: Error, readonly output: string, readonly sessionId: string | null, readonly finalOutput?: string) {
     super(cause.message, { cause })
     this.name = 'AgentWorkerFailure'
   }
 }
 
 export interface AgentWorkerCallbacks {
-  onNeedsInput?(request: AgentInputRequest, displayRequest?: AgentInputRequest): void
-  /** False rejects presentation, for example when the owning run was cancelled. */
-  onDisplayContext?(context: { description: string; prompt: string }): boolean | void
+  onNeedsInput?(request: AgentInputRequest): void
   onProgress?(step: AgentStep): void
   onSession?(sessionId: string): void
   onCodexAccount?(accountId: string): void
@@ -55,7 +49,6 @@ export interface AgentWorkerHandle {
   /** 进程是否仍在:供「取消后进程是否真的退出」与并发槽位判定使用。 */
   isAlive?(): boolean
   pendingInput(): AgentInputRequest | null
-  displayPendingInput?(): AgentInputRequest | null
   answer(requestId: string, answers: Record<string, string>): void
   cancel(reason?: string): Promise<void>
 }
@@ -142,8 +135,7 @@ export function startAgentWorker(opts: {
     try { outer?.onClaudeAccount?.(claudeAccount) }
     catch (error) { void proc.kill().catch(() => {}); throw error }
   }
-  return collectAgentTurn(proc, opts.prompt, callbacks, undefined, opts.resumeSessionId, !opts.projectBound,
-    opts.description ? { description: opts.description, prompt: opts.prompt } : undefined)
+  return collectAgentTurn(proc, opts.prompt, callbacks, undefined, opts.resumeSessionId, !opts.projectBound)
 }
 
 export function collectAgentTurn(
@@ -153,14 +145,10 @@ export function collectAgentTurn(
   remember: typeof rememberAgentSession = rememberAgentSession,
   expectedSessionId?: string,
   allowUserInput = true,
-  presentationContext?: { description: string; prompt: string },
 ): AgentWorkerHandle {
   const output: string[] = []
   let currentAssistantBlock = ''
   let finalOutput: string | undefined
-  const displayOutput: string[] = []
-  const requiresTranslation = processUsesClaudeTranslation(proc)
-  let hasDisplayOutput = requiresTranslation
   let lastError: Error | null = null
   let settled = false
   let finishing: Promise<void> | null = null
@@ -168,8 +156,7 @@ export function collectAgentTurn(
   let quotaWaitCancelled = false
   let cancelQuotaWait!: () => void
   const quotaWaitCancellation = new Promise<void>(resolve => { cancelQuotaWait = resolve })
-  const presentationController = new AbortController()
-  const waiting: Array<{ request: AgentInputRequest; displayRequest?: AgentInputRequest; originalInput: Record<string, unknown> }> = []
+  const waiting: Array<{ request: AgentInputRequest; originalInput: Record<string, unknown> }> = []
   let resolveDone!: (value: AgentWorkerResult) => void
   let rejectDone!: (error: Error) => void
   const startedAt = Date.now()
@@ -210,10 +197,9 @@ export function collectAgentTurn(
     proc.off('result', onResult)
     proc.off('exit', onExit)
   }
-  const finish = (error?: Error, result?: { checkpoint?: any; displayError?: string }): Promise<void> => {
+  const finish = (error?: Error, result?: { checkpoint?: any }): Promise<void> => {
     if (finishing) return finishing
     settled = true
-    presentationController.abort(new Error('delegated agent turn ended'))
     waiting.length = 0
     finishing = Promise.resolve().then(async () => {
       const registryError = rememberSession(proc.sessionId)
@@ -241,19 +227,13 @@ export function collectAgentTurn(
         ? new AggregateError(failures, failures.map(value => value.message).join('; '))
         : failures[0]
       if (failure) {
-        rejectDone(new AgentWorkerFailure(failure, output.join('').trim(), proc.sessionId,
-          hasDisplayOutput ? displayOutput.join('').trim() : undefined,
-          result?.displayError === undefined ? undefined
-            : [result.displayError, ...failures.filter(value => value !== error).map(value => value.message)].join('; '),
-          finalOutput))
+        rejectDone(new AgentWorkerFailure(failure, output.join('').trim(), proc.sessionId, finalOutput))
         return
       }
       const sessionId = proc.sessionId
       if (!sessionId) {
         rejectDone(new AgentWorkerFailure(
           new Error('delegated agent completed without a native session id'), output.join('').trim(), null,
-          hasDisplayOutput ? displayOutput.join('').trim() : undefined,
-          undefined,
           finalOutput,
         ))
         return
@@ -266,7 +246,6 @@ export function collectAgentTurn(
         // D-14:截断退场。上游把输出体量保护交给卡片连续输出(本仓 03-04/03-05 已
         // 落地换卡与指纹去重),runner 不再按固定上限截断;字段保留但恒为 false,
         // 避免卡片层与既有调用方连锁改动。
-        ...(hasDisplayOutput ? { displayOutput: displayOutput.join('').trim() } : {}),
         outputTruncated: false,
         sessionId,
         ...(checkpointId ? { checkpointId } : {}),
@@ -276,16 +255,10 @@ export function collectAgentTurn(
     })
     return finishing
   }
-  const onText = (event: { text?: string; displayText?: string; parentToolUseId?: string | null }) => {
+  const onText = (event: { text?: string; parentToolUseId?: string | null }) => {
     if (settled || event?.parentToolUseId || typeof event?.text !== 'string') return
     output.push(event.text)
     currentAssistantBlock += event.text
-    if (requiresTranslation && typeof event.displayText !== 'string') {
-      void finish(new Error('Claude subscription delegated output is missing verified translation'))
-      return
-    }
-    hasDisplayOutput ||= typeof event.displayText === 'string'
-    displayOutput.push(event.displayText ?? event.text)
   }
   const onAssistantBlockStop = (event: { parentToolUseId?: string | null }) => {
     if (settled || event?.parentToolUseId) return
@@ -298,10 +271,9 @@ export function collectAgentTurn(
     try { callbacks.onProgress?.(step) }
     catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
   }
-  const onToolUse = (event: { name?: string; input?: Record<string, unknown>; displayInput?: Record<string, unknown> }) => emitProgress({
+  const onToolUse = (event: { name?: string; input?: Record<string, unknown> }) => emitProgress({
     at: new Date().toISOString(), phase: 'started', tool: String(event?.name ?? 'tool'),
-    detail: event.displayInput ? toolProgressDescription(event.input) : '',
-    ...(event.displayInput ? { displayDetail: toolProgressDescription(event.displayInput) } : {}),
+    detail: '',
   })
   const onToolResult = (event: { is_error?: boolean }) => emitProgress({
     at: new Date().toISOString(), phase: 'completed', tool: event?.is_error ? 'tool error' : 'tool result', detail: '',
@@ -325,16 +297,8 @@ export function collectAgentTurn(
       return
     }
     let normalized: AgentInputRequest
-    let displayRequest: AgentInputRequest | undefined
     try {
-      normalized = normalizeInputRequest({ ...request, input: request.originalInput ?? request.input })
-      if (request.originalInput) {
-        displayRequest = normalizeInputRequest(request)
-        if (displayRequest.questions.length !== normalized.questions.length) throw new Error('translated question count does not match native questions')
-        displayRequest.questions = displayRequest.questions.map((question, index) => ({ ...question, id: normalized.questions[index]!.id }))
-      } else if (requiresTranslation) {
-        throw new Error('Claude subscription delegated question is missing verified translation')
-      }
+      normalized = normalizeInputRequest(request)
       if (!allowUserInput) {
         throw new Error(`${PROJECT_AGENT_INPUT_ERROR}: ${normalized.questions.map(question => question.question).join('; ')}`)
       }
@@ -344,8 +308,8 @@ export function collectAgentTurn(
       return
     }
     if (waiting.some(pending => pending.request.requestId === normalized.requestId)) return
-    waiting.push({ request: normalized, displayRequest, originalInput: request.originalInput ?? request.input ?? {} })
-    try { if (waiting.length === 1) callbacks.onNeedsInput?.(normalized, displayRequest) }
+    waiting.push({ request: normalized, originalInput: request.input ?? {} })
+    try { if (waiting.length === 1) callbacks.onNeedsInput?.(normalized) }
     catch (error) { void finish(error instanceof Error ? error : new Error(String(error))) }
   }
   const onHook = (request: { request_id: string | number }) => {
@@ -378,7 +342,7 @@ export function collectAgentTurn(
         : `正在重试 #${retry.attempt}`,
     })
   }
-  const onResult = (result: { is_error?: boolean; error?: unknown; subtype?: unknown; checkpoint?: unknown; displayError?: string }) => {
+  const onResult = (result: { is_error?: boolean; error?: unknown; subtype?: unknown; checkpoint?: unknown }) => {
     const error = result?.is_error
       ? new Error(String(result.error ?? result.subtype ?? proc.lastResult.subtype ?? 'delegated agent failed'))
       : undefined
@@ -403,34 +367,9 @@ export function collectAgentTurn(
   proc.on('codex_account_changed', onAccount)
   proc.on('result', onResult)
   proc.on('exit', onExit)
-  if (requiresTranslation) proc.setTranslationPresentationPolicy?.(event => {
-    if (settled) return 'hidden'
-    if (event.kind === 'assistant_text') return event.parentToolUseId ? 'hidden' : 'worker'
-    if (event.kind === 'tool_input') return 'worker'
-    return 'hidden'
-  })
   try {
     proc.sendInitialize()
-    if (requiresTranslation && presentationContext) {
-      void (async () => {
-        if (!proc.translateDisplayFields) throw new Error('Claude subscription delegated context translation is unavailable')
-        await proc.translateDisplayFields(
-          [presentationContext.description, presentationContext.prompt], presentationController.signal,
-          translated => {
-            if (settled || !callbacks.onDisplayContext) return false
-            if (translated.length !== 2 || translated.some(text => typeof text !== 'string')) {
-              throw new Error('Claude subscription delegated context translation returned invalid fields')
-            }
-            if (callbacks.onDisplayContext({ description: translated[0]!, prompt: translated[1]! }) === false) {
-              throw new Error('Delegated task display was not accepted')
-            }
-            return !settled
-          },
-        )
-        if (settled) return
-        proc.sendUserText(prompt)
-      })().catch(error => { if (!settled) void finish(error instanceof Error ? error : new Error(String(error))) })
-    } else proc.sendUserText(prompt)
+    proc.sendUserText(prompt)
   } catch (error) {
     void finish(error instanceof Error ? error : new Error(String(error)))
   }
@@ -439,7 +378,6 @@ export function collectAgentTurn(
     done,
     isAlive: () => proc.isAlive(),
     pendingInput: () => waiting[0]?.request ?? null,
-    displayPendingInput: () => waiting[0]?.displayRequest ?? null,
     answer(requestId: string, answers: Record<string, string>): void {
       const pending = waiting[0]
       if (!pending) throw new Error('delegated agent is not waiting for input')
@@ -448,7 +386,7 @@ export function collectAgentTurn(
       }
       proc.sendPermissionResponse(requestId, 'allow', { updatedInput: { ...pending.originalInput, answers } })
       waiting.shift()
-      if (waiting[0]) callbacks.onNeedsInput?.(waiting[0].request, waiting[0].displayRequest)
+      if (waiting[0]) callbacks.onNeedsInput?.(waiting[0].request)
     },
     async cancel(reason = 'delegated agent cancelled'): Promise<void> {
       quotaWaitCancelled = true
@@ -464,18 +402,6 @@ export function collectAgentTurn(
       if (closeError) throw closeError
     },
   }
-}
-
-function toolProgressDescription(input?: Record<string, unknown>): string {
-  // Only explicit presentation input is safe to show here. Never echo command
-  // output, arbitrary tool arguments, credentials, or unverified source prose.
-  if (!input) return ''
-  if (typeof input.__displayDescription === 'string') return input.__displayDescription
-  if (typeof input.description === 'string') return input.description
-  const command = input.command ?? input.cmd ?? input.script
-  if (typeof command === 'string') return shellCommandPresentation(command).description
-  if (typeof input.subject === 'string') return input.subject
-  return ''
 }
 
 function normalizeInputRequest(request: {

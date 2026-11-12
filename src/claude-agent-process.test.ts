@@ -8,7 +8,7 @@ let savedConfig: { codex: typeof config.codex; claude: typeof config.claude }
 beforeEach(() => {
   savedConfig = { codex: config.codex, claude: config.claude }
   config.codex = { ...config.codex, env: {}, models: {} }
-  config.claude = { ...config.claude, env: {}, models: {}, safe_mode: {} }
+  config.claude = { ...config.claude, env: {}, models: {} }
 })
 afterEach(() => { Object.assign(config, savedConfig) })
 import * as logModule from './log'

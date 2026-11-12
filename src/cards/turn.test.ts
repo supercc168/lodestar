@@ -17,21 +17,6 @@ import {
 } from './turn'
 import { editBatchElement, readBatchElement, summarizeToolInput, toolCallElement, toolCallPermissionElement } from './tool'
 
-test('translated shell descriptions affect presentation without changing the command', () => {
-  const command = '# desc: Inspect the current branch\ngit status --short -- /tmp/中文.txt'
-  const input = Object.freeze({ command, description: 'Inspect the current branch', __displayDescription: '检查当前分支' })
-  const tool = toolCallElement(0, 'Bash', input, 'raw command output', '✅') as any
-  const permission = toolCallPermissionElement(0, 'Bash', input, 'request-id') as any
-  for (const element of [tool, permission]) {
-    expect(element.header.title.content).toContain('检查当前分支')
-    expect(element.elements[0].content).toContain('**目的**: 检查当前分支')
-    expect(element.elements[0].content).toContain('git status --short -- /tmp/中文.txt')
-    expect(element.header.title.content).not.toContain('Inspect the current branch')
-  }
-  expect(input.command).toBe(command)
-  expect(summarizeToolInput('Bash', input)).toBe('检查当前分支')
-})
-
 describe('main conversation card rendering', () => {
   test('narrow model row buttons use one character while wide actions keep full labels', () => {
     const model = { provider: 'claude' as const, sourceId: 'glm', model: 'GLM-test', displayName: 'GLM-test',
@@ -204,7 +189,7 @@ describe('main conversation card rendering', () => {
     expect(md).toContain('https://res.mail.qq.com/x/test_pic_msg1.png')
   })
 
-  test('card-full continuation banner keeps Codex default and labels Claude only when requested', () => {
+  test('card-full continuation banner labels the actual backend', () => {
     const codexCard = mainConversationCard({
       sessionName: 'probe',
       turn: 2,
@@ -219,6 +204,15 @@ describe('main conversation card rendering', () => {
       kind: 'card_full',
     }) as any
     expect(claudeCard.body.elements[0].content).toContain('同一轮 Claude')
+
+    const dshCard = mainConversationCard({
+      sessionName: 'probe',
+      turn: 2,
+      provider: 'dsh',
+      kind: 'card_full',
+    }) as any
+    expect(dshCard.body.elements[0].content).toContain('同一轮 DeepSeek Harness')
+    expect(dshCard.body.elements[0].content).not.toContain('Codex')
   })
 
   test('watchdog recovery starts with its banner and never renders queued human input', () => {
