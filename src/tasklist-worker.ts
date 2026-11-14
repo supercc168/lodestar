@@ -147,6 +147,14 @@ export async function runTasklistWorkerOnce(): Promise<void> {
   }
 }
 
+/** 测试隔离：停止标记、在途扫描与轮转游标都是进程级状态，跨用例必须复位。 */
+export function resetTasklistWorkerStateForTest(): void {
+  stopping = false
+  running = false
+  activeProjectScans.clear()
+  nextProjectScanIndex = 0
+}
+
 export function roundRobinEntries<T>(values: T[], start: number): Array<{ value: T; index: number }> {
   if (values.length === 0) return []
   const normalized = ((start % values.length) + values.length) % values.length

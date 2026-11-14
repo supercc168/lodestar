@@ -38,6 +38,7 @@ import {
   registerRecoveredAutomationRun,
   reviewDiffSpec,
   reviewHeadRef,
+  resetTasklistWorkerStateForTest,
   roundRobinEntries,
   runTasklistWorkerOnce,
   sanitizeTaskCommentContent,
@@ -150,6 +151,10 @@ describe('tasklist worker task selection (upstream ec149d7)', () => {
 })
 
 describe('tasklist worker project fairness (upstream ec149d7)', () => {
+  // 停止标记/在途扫描/轮转游标是进程级状态；随机序下前面的用例可能已 stop 过 worker，
+  // 不复位会让本组首个 tick 直接 no-op。
+  beforeEach(() => { resetTasklistWorkerStateForTest() })
+
   test('rotates the fixed binding order between scans', () => {
     expect(roundRobinEntries(['a', 'b', 'c', 'd'], 2)).toEqual([
       { value: 'c', index: 2 },
