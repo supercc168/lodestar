@@ -423,6 +423,31 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(await readFile(join(f.dir, 'proof.txt'), 'utf8')).toBe('native-tool')
   }, 30_000)
 
+  // 本地开发依赖固定在 @deepseek-ai/dsh 0.2.1-rc.2（见 AGENTS.md 的测试依赖快照约定），
+  // 这条上游用例依赖 0.2.2 起“非法工具参数按 raw 透传”的行为；升级 DSH 后需重开。
+  test.skip('malformed model tool arguments are shown raw and the turn continues instead of failing the session', async () => {
+    const malformed = '{"command": "printf x'
+    const f = await fixture((_body, count) => count === 1
+      ? completion({ tool_calls: [{ index: 0, id: 'call-malformed', type: 'function', function: { name: 'bash', arguments: malformed } }] }, 'tool_calls')
+      : completion({ content: 'recovered after bad arguments' }))
+    const proc = f.processFor()
+    const uses: any[] = []
+    const results: any[] = []
+    const errors: Error[] = []
+    proc.on('tool_use', use => uses.push(use))
+    proc.on('tool_result', result => results.push(result))
+    proc.on('error', error => errors.push(error))
+    await proc.initializationPromise()
+    const result = nextResult(proc)
+    proc.sendUserText('call a tool with broken arguments')
+    expect(await result).toMatchObject({ is_error: false })
+    expect(uses).toEqual([{ id: 'call-malformed', name: 'Bash', input: { raw: malformed }, parentToolUseId: null }])
+    expect(results).toHaveLength(1)
+    expect(results[0]).toMatchObject({ tool_use_id: 'call-malformed', is_error: true })
+    expect(errors).toEqual([])
+    expect(proc.isAlive()).toBe(true)
+  }, 30_000)
+
   test('native tool-role results preserve call ids, all content blocks, errors and child ownership', async () => {
     const f = await fixture(() => completion({ content: 'unused' }))
     const proc = f.processFor()

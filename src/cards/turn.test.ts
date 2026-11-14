@@ -285,7 +285,6 @@ describe('main conversation card rendering', () => {
         }],
         servicesError: null,
       },
-      usage: undefined,
     }, 'footer') as any[]
 
     expect(elements).toHaveLength(4)

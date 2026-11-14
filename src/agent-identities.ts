@@ -92,8 +92,12 @@ export function agentIdentityId(tokenSourceId: string, model: string): string {
   return `agent:${Buffer.from(`${tokenSourceId}${String.fromCharCode(0)}${model}`, 'utf8').toString('base64url')}`
 }
 
+/** The native subscription, and reclaude, which starts Claude Code on an organisation's
+ * subscription login: both are subscription use, so neither is offered to Lodestar Agent. */
+const CLAUDE_SUBSCRIPTION_KINDS = ['claude-subscription', 'reclaude']
+
 function isClaudeSubscriptionSource(tokenSourceId: string): boolean {
-  return ['claude-sub', 'claude-subscription'].includes(tokenSourceId.toLowerCase())
+  return ['claude-sub', ...CLAUDE_SUBSCRIPTION_KINDS].includes(tokenSourceId.toLowerCase())
 }
 
 // local/agent-claude-sub: owner opted in to let Lodestar Agent use their own Claude subscription.

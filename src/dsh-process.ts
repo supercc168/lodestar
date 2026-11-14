@@ -53,6 +53,17 @@ const emptyResult = (): CodexResultMeta => ({ cost_usd: null, cost_delta_usd: nu
   num_turns: null, usage: null, subtype: null, is_error: false })
 const toolAliases: Record<string, string> = { bash: 'Bash', read: 'Read', write: 'Write', edit: 'Edit', glob: 'Glob', grep: 'Grep' }
 
+/** Arguments are model output relayed verbatim. Malformed JSON is the model's
+ * error, which DSH reports in the tool result; it must not end the session. */
+function toolCallInput(text: unknown): Record<string, any> {
+  if (typeof text !== 'string') throw new Error('invalid DSH tool call arguments')
+  try {
+    const value = JSON.parse(text)
+    if (value && typeof value === 'object' && !Array.isArray(value)) return value
+  } catch {}
+  return { raw: text }
+}
+
 /** Feishu image downloads use .png names even when the payload is JPEG. */
 function imageMediaType(bytes: Buffer): string {
   if (bytes.length >= 8 && bytes.subarray(0, 8).equals(Buffer.from([137, 80, 78, 71, 13, 10, 26, 10]))) return 'image/png'
@@ -89,7 +100,6 @@ export class DshProcess extends EventEmitter implements AgentProcess {
   private startedAt = 0
   private questionInputs = new Map<string, any[]>()
   private frames = new Map<string, { revision: number; nextIndex: number }>()
-  private toolInputs = new Map<string, { name: string; input: any }>()
   private children = new Set<string>()
   private settledChildren = new Set<string>()
   private childText = new Map<string, string>()
@@ -330,7 +340,6 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         return
       case 'session.status': return
       case 'question': {
-        this.questionInputs.set(params.id, params.questions)
         const input = { questions: params.questions.map((q: any) => ({ ...q, question: q.detail ? `${q.question}\n\n${q.detail}` : q.question })) }
         // Keep the exact displayed question as the answer key used by Session.
         this.questionInputs.set(params.id, input.questions)
@@ -405,11 +414,10 @@ export class DshProcess extends EventEmitter implements AgentProcess {
         } else if (e.type === 'turn/end' && !sub) {
           this.activeTurnId = null
         } else if (e.type === 'tool/call') {
-          const input = JSON.parse(data.arguments)
+          const input = toolCallInput(data.arguments)
           const name = toolAliases[data.name] ?? data.name
           if (['read', 'write', 'edit'].includes(data.name) && input.path) input.file_path = input.path
           if (!sub && data.name === 'subagent') this.rememberSubagentTitle(input)
-          this.toolInputs.set(data.callId, { name, input })
           this.emit('tool_use', { id: data.callId, name, input, parentToolUseId: sub ? params.sessionId : null })
         } else if (e.type === 'tool/result') {
           const message = data.message
@@ -425,7 +433,6 @@ export class DshProcess extends EventEmitter implements AgentProcess {
           }
           this.emit('tool_result', { tool_use_id: result.toolCallId, content: result.content,
             is_error: result.isError === true, parentToolUseId: sub ? params.sessionId : null })
-          this.toolInputs.delete(result.toolCallId)
         } else if (e.type === 'todo/write' && !sub) {
           this.emit('turn_plan_updated', { threadId: this.sessionId, explanation: null,
             plan: data.todos.map((item: any) => ({ step: item.content, status: item.status === 'in_progress' ? 'inProgress' : item.status })) })

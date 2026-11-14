@@ -58,9 +58,10 @@
  * need to seed the binding without leaving the keyboard.
  */
 
-import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
+import { createServer, type IncomingHttpHeaders, type IncomingMessage, type Server, type ServerResponse } from 'node:http'
 import { randomUUID } from 'node:crypto'
 import { log, logError } from './log'
+import { isLoopback } from './network-proxy'
 import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
 import { FeishuRequestError } from './feishu-retry'
@@ -447,11 +448,35 @@ export async function dispatchNotifyRequest(
     res.end('bad request URL')
     return
   }
+  // Reaching this port is treated as the owner's own request; a browser page must not
+  // reach it (any page can POST to loopback). Reject cross-origin browser callers.
+  if (isCrossOriginBrowserRequest(req.headers)) {
+    log('notify.request.cross_origin_rejected')
+    res.statusCode = 403
+    res.setHeader('content-type', 'text/plain; charset=utf-8')
+    res.end('cross-origin requests are not accepted')
+    return
+  }
   if (opts.extraHandler) {
     const handled = await opts.extraHandler(req, res, url)
     if (handled) return
   }
   await handleNotifyRequest(req, res)
+}
+
+/**
+ * Reaching this port is treated as the owner's own request, and a browser breaks that:
+ * any page can send a no-preflight POST to a loopback address. Browsers always attach
+ * `Origin` to such a request, while the local callers this server exists for (curl,
+ * scripts, agents, Node/Bun/Python clients) send none. A page served from loopback
+ * itself remains a local caller.
+ */
+export function isCrossOriginBrowserRequest(headers: IncomingHttpHeaders): boolean {
+  if (headers['sec-fetch-site'] === 'cross-site') return true
+  const origin = headers.origin
+  if (origin === undefined) return false
+  // `null` (sandboxed frames, file: pages) and malformed values are not local origins.
+  try { return !isLoopback(new URL(String(origin))) } catch { return true }
 }
 
 export function startNotifyServer(opts: NotifyOptions): Server | undefined {

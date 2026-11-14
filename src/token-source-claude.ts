@@ -24,7 +24,7 @@ export function claudeSubscriptionSettings(accountEnv: Record<string, string | u
   return { env, apiKeyHelper: '', forceLoginMethod: 'claudeai' }
 }
 
-function defaultOpus(models: TokenSource['models']): string {
+export function defaultOpus(models: TokenSource['models']): string {
   const candidates = models.filter(model => /^(?:claude:)?(?:claude-)?opus(?:$|[-\[])/i.test(model.model))
   return candidates.find(model => model.model === 'opus')?.model
     ?? candidates.sort((a, b) => b.model.localeCompare(a.model, undefined, { numeric: true }))[0]?.model ?? ''
@@ -71,7 +71,9 @@ registerTokenSourceFactory({
   configSectionId: 'claude-sub',
   build(cfg): TokenSource {
     claudeAccounts.configureNativeEnv({ ...process.env, ...config.claude.env })
-    const configuredModel = cfg.model?.trim()
+    // An empty `model` is what removing a custom default leaves behind; it means unset,
+    // like in every other source, so the catalog default applies again.
+    const configuredModel = cfg.model?.trim() || undefined
     const disabledReason = 'Claude Code 订阅已在 Lodestar 中禁用；发送 claude-sub on 启用'
     const make = (accountId: string): TokenSource => {
     const settings = claudeSubscriptionSettings(claudeAccounts.candidateEnv(claudeAccounts.get(accountId), {}))

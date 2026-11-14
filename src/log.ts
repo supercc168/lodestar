@@ -12,8 +12,14 @@ export function fileLoggingEnabled(nodeEnv: string | undefined = process.env.NOD
   return nodeEnv !== 'test'
 }
 
+/** The data dir holds state and credentials alongside logs; mode only applies
+ * when the directory is created, existing user directories are left alone. */
+export function ensureDataDir(dir: string = DATA_DIR): void {
+  mkdirSync(dir, { recursive: true, mode: 0o700 })
+}
+
 if (fileLoggingEnabled()) {
-  try { mkdirSync(DATA_DIR, { recursive: true }) } catch {}
+  try { ensureDataDir() } catch {}
 }
 
 /** 按日日志保留天数(含今天);超过即清理。 */
@@ -105,7 +111,9 @@ const ENUM_VALUES: Record<string, ReadonlySet<string>> = {
   method: new Set(['GET', 'POST', 'PUT', 'PATCH', 'DELETE']),
   reason: new Set([...ERROR_CODES, 'cancelled', 'timeout', 'authentication', 'permission', 'rate_limit',
     'capacity', 'network', 'not_found', 'conflict', 'invalid_data', 'unavailable', 'server_error', 'unknown',
-    'not_logged_in', 'not_available', 'no_data', 'SIGINT', 'SIGTERM']),
+    'not_logged_in', 'not_available', 'no_data', 'SIGINT', 'SIGTERM', 'SIGBREAK',
+    // Shutdowns the daemon starts itself: without these the log shows no cause at all.
+    'unhandledRejection', 'uncaughtException', 'boot_fatal']),
   phase: new Set(['start', 'end', 'retry', 'recovered', 'failed']),
 }
 const recentDiagnostics = new Map<string, number>()

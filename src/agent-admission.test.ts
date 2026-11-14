@@ -118,8 +118,10 @@ test('Agent account selection applies thresholds and caps and never falls back; 
       error => error.code === 'CLAUDE_SUB_FULL')
     assert.equal(selectClaudeAccount({ model: 'opus', effort: 'max', exhaustedFallbackAccountId: 'vale' }), 'vale')
     // Chat path is unchanged by the Agent thresholds: accounts the Agent path excludes stay selectable there.
+    // v0.22.1 起统一按可持续节奏评分，vale（5h 已用 90%% 但周额度充裕）在聊天路径胜出；
+    // 关键是它仍可选，Agent 路径则按 80%% / 90%% 阈值全部拒绝。
     usage.set('default', snap(85, 95)); usage.set('vale', snap(90, 10))
-    assert.equal(selectClaudeAccount({ model: 'opus', effort: 'max' }), 'default')
+    assert.equal(selectClaudeAccount({ model: 'opus', effort: 'max' }), 'vale')
     assert.throws(() => selectClaudeAccount({ model: 'opus', effort: 'max', agent: agent() }), error => error.code === 'CLAUDE_SUB_FULL')
   `)
 })

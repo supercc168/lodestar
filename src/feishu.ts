@@ -551,8 +551,8 @@ export function clearSessionResumeChecked(sessionName: string, provider?: AgentP
   else {
     const next = { ...previous }
     delete next[provider]
-    // 同上:清 codex/claude 不得连带删除仍存活的 dsh 绑定。
-    if (!next.codex && !next.claude && !next.dsh) lastSessionRefByName.delete(sessionName)
+    // 三个 provider 都清空才删除绑定，避免连带删掉仍存活的 dsh 绑定。
+    if (!AGENT_PROVIDERS.some(p => next[p])) lastSessionRefByName.delete(sessionName)
     else lastSessionRefByName.set(sessionName, next)
   }
   try { saveSessionResumeMapChecked() } catch (error) {
@@ -1695,9 +1695,11 @@ export async function deleteReaction(messageId: string, reactionId: string): Pro
 export async function urgentApp(messageId: string, openIds: string[]): Promise<void> {
   if (!messageId) { log('feishu urgent delivery missing message'); return }
   if (openIds.length === 0) { log('feishu urgent delivery missing recipients'); return }
-  const token = await getTenantToken()
   const url = `${OPEN_API_BASE}/im/v1/messages/${messageId}/urgent_app?user_id_type=open_id`
   try {
+    // Callers fire this without awaiting it; a failed token refresh must be logged here
+    // like every other delivery failure instead of surfacing as an unhandled rejection.
+    const token = await getTenantToken()
     const res = await rawFetch(url, {
       method: 'PATCH',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
@@ -1764,8 +1766,7 @@ async function uploadMultipart(filePath: string, type: 'image' | 'file'): Promis
   }
   const upload = async (recovery: FeishuRecoveryWindow): Promise<string> => {
     const token = await getTenantToken(recovery)
-    // Rebuild the multipart body; the immutable Blob can be reused. Its copied
-    // ArrayBuffer-backed view above also preserves Node 18 BlobPart compatibility.
+    // Rebuild the multipart body; the immutable Blob can be reused.
     const form = new FormData()
     if (type === 'image') form.append('image_type', 'message')
     else {

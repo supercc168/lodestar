@@ -2,7 +2,7 @@ import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 
 import { config } from './config'
 import { rankCodexQuota, unusedCodexWeek } from './codex-quota'
-import { AppServerOnce, captureCodexUsageCache, invalidateCodexUsage, observeRateLimitsNotification, peekSuccessfulUsage, peekUsage, providerUsageSnapshotFromResponse, readUsage, readUsageForDisplay, refreshUsageFromConnection, requestCodexControlWithRetry, snapshotFromReadResponse, updateUsageFromRateLimits } from './usage'
+import { AppServerOnce, captureCodexUsageCache, codexControlRetryTiming, invalidateCodexUsage, observeRateLimitsNotification, peekSuccessfulUsage, peekUsage, providerUsageSnapshotFromResponse, readUsage, readUsageForDisplay, refreshUsageFromConnection, requestCodexControlWithRetry, snapshotFromReadResponse, updateUsageFromRateLimits } from './usage'
 
 describe('AppServerOnce 管道加固(上游 ec149d7)', () => {
   // 用 bun -e 起假 app-server 测管道行为,不 spawn 真 codex(慢且依赖登录态)。
@@ -70,12 +70,14 @@ import * as networkModule from './network'
 
 let quotaNow: number
 let quotaClock: ReturnType<typeof spyOn>
+let retryWaits: ReturnType<typeof spyOn>
 beforeEach(() => {
   quotaNow = Date.now()
   quotaClock = spyOn(Date, 'now').mockImplementation(() => quotaNow)
+  retryWaits = spyOn(codexControlRetryTiming, 'wait').mockImplementation(async () => {})
   invalidateCodexUsage('default')
 })
-afterEach(() => { invalidateCodexUsage('default'); quotaClock.mockRestore() })
+afterEach(() => { invalidateCodexUsage('default'); quotaClock.mockRestore(); retryWaits.mockRestore() })
 
 test('ordinary quota reads reuse the correct live connection and never cold-start after its failure or replacement', () => {
   const script = `
@@ -217,6 +219,23 @@ describe('quota account isolation', () => {
     expect(snapshot?.state === 'ok' && unusedCodexWeek(snapshot, 'model')).toBe(true)
     invalidateCodexUsage(account)
   })
+  test('an additional model bucket never stands in for a missing main quota', () => {
+    const window = { usedPercent: 5, windowDurationMins: 10080, resetsAt: Math.floor(quotaNow / 1000) + 86400 }
+    const spark = { limitId: 'codex_spark', limitName: 'GPT-5.3-Codex-Spark', primary: window }
+    // The named main bucket has no window: the Spark bucket must not be shown as the main quota.
+    expect(snapshotFromReadResponse({ rateLimits: { limitId: 'codex', planType: 'pro' },
+      rateLimitsByLimitId: { codex: { limitId: 'codex' }, codex_spark: spark } }).state).toBe('network')
+    // Several buckets and no pointer to the main one: ownership is unknown.
+    expect(snapshotFromReadResponse({ rateLimitsByLimitId: { codex_other: { ...spark, limitId: 'codex_other' }, codex_spark: spark } }).state)
+      .toBe('network')
+    // A single bucket without a pointer is the main quota, as before.
+    const single = snapshotFromReadResponse({ rateLimitsByLimitId: { codex: { limitId: 'codex', primary: window } } })
+    expect(single.state === 'ok' && single.weekly?.percent).toBe(5)
+    const named = snapshotFromReadResponse({ rateLimits: { limitId: 'codex', planType: 'pro', primary: window },
+      rateLimitsByLimitId: { codex: { limitId: 'codex', primary: window }, codex_spark: { ...spark, primary: { ...window, usedPercent: 90 } } } })
+    expect(named.state === 'ok' && named.weekly?.percent).toBe(5)
+  })
+
   test('invalid native percentages cannot become an apparently untouched week', () => {
     for (const usedPercent of [-1, 101, NaN, Infinity]) {
       const snapshot = snapshotFromReadResponse({ rateLimits: { planType: 'pro', primary: {
@@ -301,6 +320,7 @@ describe('quota transient failures', () => {
       throw new Error('HTTP 429 too many requests')
     })).rejects.toThrow('429')
     expect(calls).toBe(1)
+    expect(retryWaits).not.toHaveBeenCalled()
   })
 
   test('a transient quota connection failure retries within the shared read before entering cooldown', async () => {
@@ -319,6 +339,7 @@ describe('quota transient failures', () => {
     expect(result).toMatchObject({ state: 'ok', weekly: { percent: 19 } })
     expect(await shared).toBe(result)
     expect(calls).toBe(2)
+    expect(retryWaits.mock.calls).toEqual([[1000]])
     expect(peekSuccessfulUsage(account)).toBe(result)
     invalidateCodexUsage(account)
   })
@@ -359,6 +380,7 @@ describe('quota transient failures', () => {
     quotaNow += 60_000
     const snapshot = await refreshUsageFromConnection(async () => { calls++; throw new Error('error sending request') }, account)
     expect(calls).toBe(3)
+    expect(retryWaits.mock.calls).toEqual([[1000], [4000]])
     expect(snapshot).toBeNull()
     expect(peekUsage(account)).toBe(cached)
     expect(peekSuccessfulUsage(account)?.fetchedAt).toBe(cached.fetchedAt)
@@ -366,7 +388,7 @@ describe('quota transient failures', () => {
     expect(await readUsageForDisplay(account)).toBe(cached)
     expect(calls).toBe(3)
     invalidateCodexUsage(account)
-  }, 10_000)
+  })
 
   test('an invalid quota response remains a live MISS while the previous successful observation stays cached', async () => {
     const account = 'invalid-refresh'

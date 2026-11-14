@@ -58,6 +58,8 @@ const {
   CAPACITY_RETRY_MAX_ATTEMPTS,
   isCodexCapacityError,
 } = await import('./session')
+
+const { cancelCompactionOnArrival } = await import('./session-commands')
 const cardkit = await import('./cardkit')
 const sessionWorktree = await import('./session-worktree')
 const mathRender = await import('./math-render')
@@ -9315,6 +9317,241 @@ describe('Fixed model selection normalization', () => {
   })
 })
 
+describe('Session whitespace-only assistant blocks', () => {
+  test('a block with no visible text is never written to the card, when it ends or when the turn closes', async () => {
+    const session = new Session('probe-ws-segment', 'chat_id') as any
+    const turn = turnState('card_ws_segment')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+
+    session.appendAssistant('real paragraph')
+    session.finalizeCurrentAssistantSegment()
+    session.appendAssistant('\n\n')
+    session.finalizeCurrentAssistantSegment()
+    await session.closeTurnCard(undefined, { hasFreshResult: false })
+
+    const written = calls.filter(call => call.path.includes('/elements'))
+    const added = written.filter(call => call.method === 'POST')
+      .flatMap(call => JSON.parse(call.body.elements).map((element: any) => element.element_id as string))
+    const replaced = written.filter(call => call.method === 'PUT').map(call => call.path.split('/').pop())
+    expect(added.filter(id => id.startsWith('assistant_'))).toEqual(['assistant_0'])
+    expect(replaced).toContain('assistant_0')
+    // The second block never created `assistant_1`, so nothing may address it.
+    expect(replaced).not.toContain('assistant_1')
+    session.dispose()
+  })
+})
+
+describe('Session compact command process exit', () => {
+  test('a process exit during compaction is reported once without an unhandled rejection', async () => {
+    class ExitingProc extends EventEmitter {
+      provider = 'claude'
+      sessionId = 'claude-session-compact-exit'
+      isAlive(): boolean { return true }
+      // Like the Claude backend: pending for the whole compaction, rejected by the exit.
+      compactThread(): Promise<void> {
+        return new Promise((_, reject) => {
+          this.once('exit', () => reject(new Error('claude thread exited during /compact')))
+        })
+      }
+    }
+    const unhandled: unknown[] = []
+    const onUnhandled = (reason: unknown): void => { unhandled.push(reason) }
+    process.on('unhandledRejection', onUnhandled)
+    const session = new Session('compact-exit', 'chat_id') as any
+    const proc = new ExitingProc()
+    session.proc = proc
+    session.status = 'idle'
+    session.initCount = 1
+    try {
+      const command = session.runCommand('cm')
+      await new Promise(resolve => setTimeout(resolve, 20))
+      proc.emit('exit')
+      await expect(command).resolves.toBe(true)
+      await new Promise(resolve => setTimeout(resolve, 20))
+
+      expect(unhandled).toEqual([])
+      expect(session.manualContextCompactionPending).toBe(false)
+      const footerWrites = calls
+        .filter(call => call.method === 'PUT' && call.path.endsWith('/elements/footer'))
+        .map(call => JSON.parse(call.body.element).content as string)
+      expect(footerWrites.some(content => content.includes('❌ 上下文压缩失败') && content.includes('exited during /compact'))).toBe(true)
+    } finally {
+      process.off('unhandledRejection', onUnhandled)
+      session.dispose()
+    }
+  })
+})
+
+describe('Session Claude history store', () => {
+  test('a launcher source lists and resolves conversations from its own directory, other sources from the shared one', () => {
+    const previous = listTokenSources()
+    resetTokenSourceRegistry()
+    const make = (id: string, claudeHistoryDir?: string) => registerTokenSource({
+      id, kind: claudeHistoryDir ? 'reclaude' : 'test', agent: 'claude', display: id, enabled: true,
+      models: [], defaultModel: '', modelCatalogState: { status: 'ready', updatedAt: 1 },
+      ...(claudeHistoryDir ? { claudeHistoryDir } : {}),
+      refreshModels: async () => {}, spawnEnv: (env: Record<string, string | undefined>) => env,
+      resolveSpawnModel: (model: string) => model,
+      readUsage: async () => ({ state: 'not_applicable' as const, windows: [] }),
+    })
+    make('shared-source')
+    make('launcher-source', '/rec/accounts/101/config')
+    const session = new Session('history-store', 'chat_id') as any
+    try {
+      session.selectedProvider = 'claude'
+      session.selectedTokenSourceId = 'shared-source'
+      const shared = session.claudeHistoryOptions().configDir
+      expect(shared).not.toBe('/rec/accounts/101/config')
+      session.selectedTokenSourceId = 'launcher-source'
+      expect(session.claudeHistoryOptions()).toEqual({ configDir: '/rec/accounts/101/config' })
+      session.selectedTokenSourceId = null
+      expect(session.claudeHistoryOptions()).toEqual({ configDir: shared })
+    } finally {
+      session.dispose()
+      resetTokenSourceRegistry()
+      for (const item of previous) registerTokenSource(item)
+    }
+  })
+})
+
+describe('Session compact command cancellation', () => {
+  /** Like the Claude backend: the compaction stays pending until the native side answers. */
+  class CompactingProc extends EventEmitter {
+    provider = 'claude'
+    sessionId = 'claude-session-compact-cancel'
+    alive = true
+    interrupts = 0
+    kills = 0
+    constructor(private readonly answersInterrupt: boolean) { super() }
+    isAlive(): boolean { return this.alive }
+    compactThread(): Promise<void> {
+      return new Promise((_, reject) => {
+        this.once('cancelled', () => reject(new Error('Compaction canceled.')))
+        this.once('failed', (error: Error) => reject(error))
+        this.once('exit', () => reject(new Error('claude thread exited during /compact')))
+      })
+    }
+    sendInterrupt(): void {
+      this.interrupts++
+      if (this.answersInterrupt) this.emit('cancelled')
+    }
+    async kill(): Promise<void> {
+      this.kills++
+      this.alive = false
+      this.emit('exit')
+    }
+  }
+  const footers = () => calls
+    .filter(call => call.method === 'PUT' && call.path.endsWith('/elements/footer'))
+    .map(call => JSON.parse(call.body.element).content as string)
+  function compacting(name: string, answersInterrupt: boolean) {
+    const session = new Session(name, 'chat_id') as any
+    const proc = new CompactingProc(answersInterrupt)
+    session.proc = proc
+    session.status = 'idle'
+    session.initCount = 1
+    return { session, proc }
+  }
+  const text = (value: string) => JSON.stringify({ text: value })
+
+  test('a stop that arrives during compaction cancels it instead of waiting behind it', async () => {
+    const { session, proc } = compacting('compact-cancel-stop', true)
+    try {
+      const command = session.runCommand('cm')
+      await new Promise(resolve => setTimeout(resolve, 20))
+      expect(session.manualContextCompactionPending).toBe(true)
+
+      expect(cancelCompactionOnArrival(session, 'text', text(' ST '))).toBe(true)
+      await expect(command).resolves.toBe(true)
+      expect(proc.interrupts).toBe(1)
+      expect(proc.kills).toBe(0)
+      expect(session.manualContextCompactionPending).toBe(false)
+      expect(footers().some(content => content.includes('🛑 上下文压缩已取消'))).toBe(true)
+      expect(footers().some(content => content.includes('上下文压缩失败'))).toBe(false)
+    } finally {
+      session.dispose()
+    }
+  })
+
+  test('a kill also stops a backend that never answers the interrupt', async () => {
+    const { session, proc } = compacting('compact-cancel-kill', false)
+    try {
+      const command = session.runCommand('cm')
+      await new Promise(resolve => setTimeout(resolve, 20))
+      session.cancelManualCompaction(true, 30)
+      expect(proc.interrupts).toBe(1)
+      expect(proc.kills).toBe(0)
+      await expect(command).resolves.toBe(true)
+      expect(proc.kills).toBe(1)
+      expect(footers().some(content => content.includes('🛑 上下文压缩已取消'))).toBe(true)
+    } finally {
+      session.dispose()
+    }
+  })
+
+  test('a stop does not force a silent backend, and nothing happens without a pending compaction', async () => {
+    const { session, proc } = compacting('compact-cancel-soft', false)
+    try {
+      expect(cancelCompactionOnArrival(session, 'text', text('kill'))).toBe(false)
+      const command = session.runCommand('cm')
+      await new Promise(resolve => setTimeout(resolve, 20))
+      session.cancelManualCompaction(false, 10)
+      await new Promise(resolve => setTimeout(resolve, 60))
+      expect(proc.kills).toBe(0)
+      expect(session.manualContextCompactionPending).toBe(true)
+      // Only the control commands end a compaction; ordinary messages wait their turn.
+      for (const [type, content] of [['text', text('please continue')], ['text', text('cm')], ['text', text('hi')],
+        ['post', text('stop')], ['text', 'not json'], ['text', undefined]] as const) {
+        expect(cancelCompactionOnArrival(session, type, content)).toBe(false)
+      }
+      for (const word of ['kill', 'kl', 'restart', 'rs', 'clear', 'cl']) {
+        expect(cancelCompactionOnArrival(session, 'text', text(word))).toBe(true)
+      }
+      proc.emit('exit')
+      await command
+    } finally {
+      session.dispose()
+    }
+  })
+
+  test('a cancel request the backend ignored does not relabel an unrelated failure', async () => {
+    const { session, proc } = compacting('compact-cancel-ignored', false)
+    try {
+      const command = session.runCommand('cm')
+      await new Promise(resolve => setTimeout(resolve, 20))
+      session.cancelManualCompaction(false)
+      proc.emit('failed', new Error('Error during compaction: overloaded'))
+      await command
+      expect(footers().some(content => content.includes('❌ 上下文压缩失败: Error during compaction: overloaded'))).toBe(true)
+      expect(footers().some(content => content.includes('已取消'))).toBe(false)
+    } finally {
+      session.dispose()
+    }
+  })
+
+  test('a failure that was not requested is still reported as a failure', async () => {
+    const { session, proc } = compacting('compact-cancel-unrequested', true)
+    try {
+      const command = session.runCommand('cm')
+      await new Promise(resolve => setTimeout(resolve, 20))
+      proc.emit('cancelled')
+      await command
+      expect(footers().some(content => content.includes('❌ 上下文压缩失败: Compaction canceled.'))).toBe(true)
+      // A cancellation flag from an earlier run must not relabel the next failure.
+      session.manualContextCompactionCancelled = true
+      const again = session.runCommand('cm')
+      await new Promise(resolve => setTimeout(resolve, 20))
+      proc.emit('cancelled')
+      await again
+      expect(footers().filter(content => content.includes('❌ 上下文压缩失败')).length).toBeGreaterThanOrEqual(2)
+    } finally {
+      session.dispose()
+    }
+  })
+})
+
 describe('Session automatic context compaction events', () => {
   test('deduplicates repeated completion for the same compaction item', async () => {
     const session = new Session('compact-dedupe', 'chat_id') as any
@@ -10962,6 +11199,34 @@ describe('Session provider switching', () => {
       expect(session.selectedEffort).toBe('off')
       expect(JSON.stringify(result.card)).toContain('DeepSeek Harness')
     } finally {
+      resetTokenSourceRegistry()
+      for (const source of previous) registerTokenSource(source)
+    }
+  })
+
+  test('DSH effort display shows MISS for a model outside the catalog while the spawn path still refuses it', () => {
+    const previous = listTokenSources()
+    registerTokenSource({ id: 'deepseek-harness', kind: 'deepseek-harness', agent: 'dsh', display: 'DeepSeek Harness', enabled: true,
+      models: [{ model: 'deepseek-v4-flash', display: 'Flash', efforts: ['off', 'high'], defaultEffort: 'high' }],
+      defaultModel: 'deepseek-v4-flash', modelCatalogState: { status: 'ready', updatedAt: Date.now() },
+      refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+      readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+    })
+    const session = new Session('dsh-effort-display', 'chat_id') as any
+    try {
+      session.selectedProvider = 'dsh'
+      session.selectedTokenSourceId = 'deepseek-harness'
+      session.selectedModel = 'deepseek-v4-flash'
+      session.selectedEffort = null
+      expect(session.currentEffortLabel()).toBe('high')
+      session.selectedModel = 'removed-model'
+      expect(session.currentEffortLabel()).toBeNull()
+      expect(session.withModel('status')).toContain('removed-model/MISS')
+      expect(() => session.dshEffortForSpawn()).toThrow('DSH model reasoning effort is unavailable')
+      session.selectedEffort = 'off'
+      expect(session.currentEffortLabel()).toBe('off')
+    } finally {
+      session.dispose()
       resetTokenSourceRegistry()
       for (const source of previous) registerTokenSource(source)
     }
@@ -14054,6 +14319,53 @@ describe('Session SDK-initiated bg-task resume turns', () => {
     }
   })
 
+  test('a stop whose post-interrupt result never arrives cannot swallow the next process\'s first result', async () => {
+    const session = new Session('probe-stale-interrupt', 'chat_id') as any
+    const hung = new FakeAgentProc('claude', 'claude-session-hung')
+    session.proc = hung
+    session.selectedProvider = 'claude'
+    session.wireProc(hung)
+    session.initCount = 1
+    session.currentTurn = turnState('card_hung')
+    cardkit.recordCardCreated('card_hung', 1)
+
+    // `stop` interrupts the turn; the hung backend never reports the interrupted result,
+    // so the user escalates to `kill`.
+    expect(await session.runCommand('stop', 'ou_user')).toBe(true)
+    expect(session.userInterrupted).toBe(true)
+    await session.stop('已终止', { announce: false })
+    expect(session.userInterrupted).toBe(false)
+
+    const next = new FakeAgentProc('claude', 'claude-session-next')
+    session.proc = next
+    session.wireProc(next)
+    session.initCount = 1
+    const turn = turnState('card_next')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated('card_next', 1)
+    session.status = 'working'
+    try {
+      emitClaudeResult(next)
+      await new Promise(resolve => setTimeout(resolve, 30))
+      // The completed turn is settled instead of being left open in streaming mode.
+      expect(session.currentTurn).toBeNull()
+      expect(cardkit.isDisposed('card_next')).toBe(true)
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose('card_next')
+      session.dispose()
+    }
+  })
+
+  test('an interrupt with no backend leaves no pending post-interrupt result to skip', () => {
+    const session = new Session('probe-interrupt-no-proc', 'chat_id') as any
+    session.userInterrupted = true
+    session.interrupt()
+    expect(session.userInterrupted).toBe(false)
+    session.dispose()
+  })
+
   test('result 抢在 bg-resume 开卡 await 窗口内到达:不重复兜底,卡片正常收尾,不卡在 working', async () => {
     const { session, proc } = wiredClaudeSession()
 
@@ -16267,6 +16579,70 @@ describe('Session lifecycle reliability', () => {
     expect(session.openingTurn).toBe(false)
     expect(session.openingTurnOwner).toBeNull()
     expect(sentCards).toHaveLength(0)
+  })
+
+  test('a throwing cold start stops the boot footer timer', async () => {
+    const session = new Session('cold-start-throw', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const realTimer = session.startFooterTimer.bind(session)
+    const timers: Array<{ stopped: boolean }> = []
+    session.startFooterTimer = (...args: any[]) => {
+      const timer = realTimer(...args)
+      const tracked = { stopped: false }
+      timers.push(tracked)
+      return { ...timer, stop() { tracked.stopped = true; timer.stop() } }
+    }
+    session.startUnlocked = async () => { throw new Error('spawn exploded') }
+    try {
+      await expect(session.startColdUserTurn('hello', 'hello', 'ou_user')).rejects.toThrow('spawn exploded')
+      expect(timers.length).toBeGreaterThan(0)
+      expect(timers.every(timer => timer.stopped)).toBe(true)
+    } finally {
+      session.stopFooterStatus(session.currentTurn)
+      if (session.currentTurn) await cardkit.dispose(session.currentTurn.cardId)
+    }
+  })
+
+  test('a throwing resume restart closes its internal status card and stops its timer', async () => {
+    const session = new Session('restart-throw', 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.lastSessionRef = { provider: 'claude', sessionId: 'resume-me', cwd: session.workDir }
+    session.lastSessionId = 'resume-me'
+    let timerStopped = false
+    const handle = { cardId: 'restart-card', title: 'restart',
+      timer: { setStatus() {}, stop() { timerStopped = true }, elapsedSec: () => 0 } }
+    const closed: string[] = []
+    session.openStatusCard = async () => handle
+    session.closeStatusCard = async (card: any, status: string) => { card.timer.stop(); closed.push(status) }
+    session.spawnAgent = () => new FakeAgentProc('claude', null)
+    session.attachProc = () => { throw new Error('attach exploded') }
+    await expect(session.restartUnlocked(true, {})).rejects.toThrow('attach exploded')
+    expect(timerStopped).toBe(true)
+    expect(closed).toEqual(['❌ 重启失败: attach exploded'])
+  })
+
+  test.each([
+    ['restart', '❌ 重启失败: restart exploded'],
+    ['clear', '❌ 清空失败: restart exploded'],
+  ] as const)('a throwing %s ends the command status card instead of leaving it running', async (command, expected) => {
+    const session = new Session(`command-${command}-throw`, 'chat_id') as any
+    session.selectedProvider = 'claude'
+    session.proc = new FakeAgentProc('claude', 'session-1')
+    session.status = 'idle'
+    const closed: string[] = []
+    let card: object | null = { cardId: 'command-card' }
+    session.openStatusCard = async () => card
+    session.setStatusCard = () => {}
+    session.closeStatusCard = async (_card: unknown, status: string) => { closed.push(status) }
+    session.restart = async () => { throw new Error('restart exploded') }
+    // 本地 rs 语义：无进行中 turn 时先列历史（claude 进程 turn 间常驻保活），
+    // 这里给一个在途 turn，走 restart 分支验证抛错时的状态卡收尾。
+    if (command === 'restart') session.currentTurn = { provider: 'claude' } as any
+    expect(await session.runCommand(command)).toBe(true)
+    expect(closed).toEqual([expected])
+    // Without a card nothing else would tell the user: the inbound error notice has to.
+    card = null
+    await expect(session.runCommand(command)).rejects.toThrow('restart exploded')
   })
 
   test('opens a mid-turn card before feeding the buffered batch and drops input on card init failure', async () => {
@@ -20954,6 +21330,49 @@ describe('Session task-end notifications', () => {
       startedAt: Date.now(), ...(status === 'completed' ? { endTime: Date.now() } : {}), steps: [],
     }
   }
+
+  test('switching source while idle settles the killed process\'s background tasks', async () => {
+    const session = new Session('probe-bg-idle-switch', 'chat_bg_idle_switch') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1', 'glm') as any
+    session.proc = proc
+    session.wireProc(proc)
+    session.initCount = 1
+    session.status = 'idle'
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'
+    session.selectedEffort = 'max'
+    // A native subagent that outlives its already closed turn.
+    proc.emit('bg_task_started', { task_id: 'native-id', tool_use_id: 'agent-tool', description: '长任务', task_type: 'local_agent' })
+    await session.backgroundSync
+    expect(session.hasActiveConversationWork()).toBe(true)
+    session.modelPanels.set('panel-ds', { models: [{
+      provider: 'claude', sourceId: 'deepseek', model: 'deepseek-v4-pro', displayName: 'DeepSeek V4 Pro',
+      efforts: [{ effort: 'high', isDefault: true }],
+    }] })
+
+    const result = await session.onModelEffortSelect('deepseek-v4-pro', 'high', 'panel-ds', 'ou_user', 'claude')
+    expect(result.ok).toBe(true)
+    expect(proc.killCalls).toBe(1)
+    expect(session.proc).toBeNull()
+    // The subagent died with its process: nothing may keep counting as running work.
+    expect(session.backgroundTasks.filter((entry: any) => entry.status === 'running')).toHaveLength(0)
+    expect(session.hasActiveConversationWork()).toBe(false)
+    expect(session.activeSubagents()).toBe(0)
+
+    const turn = turnState('card_after_idle_switch')
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    try {
+      await session.closeTurnCard()
+      // A later clean turn pushes its completion again.
+      expect(urgentPushes).toEqual([['om_session_turn', ['ou_user']]])
+    } finally {
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+      session.dispose()
+    }
+  })
 
   test('a closed turn keeps the phone push until the background work ends', async () => {
     const session = new Session('probe', 'chat_id') as any

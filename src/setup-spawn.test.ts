@@ -1,4 +1,7 @@
-import { expect, test } from 'bun:test'
+import { afterAll, expect, mock, test } from 'bun:test'
+
+// 该文件 mock 了整个 node:fs；Bun 的模块 mock 会跨文件泄漏，退出前必须还原。
+afterAll(() => mock.restore())
 
 test('setup reports asynchronous daemon spawn failure and only returns a PID after the spawn event', () => {
   const script = `

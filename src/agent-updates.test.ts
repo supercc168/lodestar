@@ -10,8 +10,8 @@
  * (agentRuntimeRoot 等五导出,测试期经 LODESTAR_TEST_AGENT_RUNTIME_ROOT 路由)。
  */
 import { afterEach, expect, spyOn, test } from 'bun:test'
-import { existsSync } from 'node:fs'
-import { chmod, copyFile, mkdtemp, mkdir, readFile, readdir, rm, writeFile } from 'node:fs/promises'
+import { existsSync, mkdirSync, rmSync } from 'node:fs'
+import { chmod, copyFile, mkdtemp, mkdir, readFile, readdir, rm, utimes, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import {
@@ -26,7 +26,7 @@ import {
   type AgentUpdateOptions,
   type UpdatedAgent,
 } from './agent-updates'
-import { AgentInstallTerminationError } from './agent-install'
+import { AGENT_INSTALLER_RECORD, AgentInstallTerminationError } from './agent-install'
 
 /** 子进程用例的 cwd 固定为仓库根:import './src/...' / 'src/version-cli.ts' 均相对它解析,不受调用目录影响。 */
 const repoRoot = join(import.meta.dir, '..')
@@ -35,6 +35,15 @@ const temporary: string[] = []
 afterEach(async () => {
   for (const path of temporary.splice(0)) await retryAgentFileOperation(() => rm(path, { recursive: true }))
 })
+/** A PID that belonged to a process which has already exited. */
+async function exitedPid(): Promise<number> {
+  const exited = Bun.spawn([process.execPath, '-e', ''])
+  await exited.exited
+  return exited.pid
+}
+async function recordInstaller(staging: string, pid: number): Promise<void> {
+  await writeFile(join(staging, AGENT_INSTALLER_RECORD), JSON.stringify({ pid }))
+}
 async function scratch(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), 'lodestar-agent-updates-test-'))
   temporary.push(root)
@@ -437,9 +446,9 @@ test('concurrent updater calls serialize and do not install the same release twi
 test('锁目录已建但 pid 尚未落盘的窗口不被误判为损坏锁', async () => {
   const root = await scratch()
   const directory = join(root, 'codex')
-  // 复刻 mkdir 与 pid 落盘之间的真实窗口:进程已建锁目录,pid 还没写完。
+  // 复刻 mkdir 与 pid 发布之间的真实窗口:进程已建锁目录,pid 文件还没出现
+  // (上游用原子写发布 pid,不会留下空文件)。
   await mkdir(join(directory, 'update.lock'), { recursive: true })
-  await writeFile(join(directory, 'update.lock', 'pid'), '')
   let settled: unknown
   const pending = updateAgentRuntime('codex', { root, metadata: fakeUpdate(), install })
     .then(state => state, error => { settled = error; return undefined })
@@ -763,4 +772,178 @@ test('setup 模板与 postinstall 提示:自动更新默认关,--agents-only 为
   // 合并后 lodestar-update 已支持 --agents-only(update-cli.ts 解析;agent-updates.ts
   // 报错文案同源),postinstall 提示照上游 c55bb44 写该旗标。
   expect(postinstall).toContain('lodestar-update --agents-only')
+})
+
+// ── 上游 v0.22.1 新增用例 ──────────────────────────────────────────────
+
+test('a later successful update removes staging left by interrupted installs but keeps one a live installer still owns', async () => {
+  const root = await scratch()
+  const options = { root, install, metadata: async (name: string) => ({ name, version: '1.0.0' }) }
+  await updateAgentRuntime('codex', options)
+  const crashed = join(root, 'codex/.install-crashed')
+  const owned = join(root, 'codex/.install-owned')
+  const lockAside = join(root, `codex/.stale-lock-${Date.now() - 10 * 60_000}-left`)
+  for (const path of [crashed, owned, lockAside]) await mkdir(path, { recursive: true })
+  await writeFile(join(crashed, 'package.json'), '{}')
+  const dead = await exitedPid()
+  await recordInstaller(crashed, dead)
+  await recordInstaller(owned, dead)
+  // Same release: the install itself is skipped, the sweep still runs under the lock.
+  const reports: string[] = []
+  await updateAgentRuntime('codex', { ...options, report: message => reports.push(message),
+    runningCommands: async () => [`node /usr/lib/npm-cli.js install --prefix ${owned} --include=optional --no-fund`] })
+  expect(existsSync(crashed)).toBe(false)
+  expect(existsSync(lockAside)).toBe(false)
+  expect(existsSync(owned)).toBe(true)
+  expect(reports).toContain('codex: 已清理 2 个中断安装的临时目录')
+})
+
+test('stale staging stays when the process table is unavailable, and a failed update never sweeps', async () => {
+  const root = await scratch()
+  const options = { root, install, metadata: async (name: string) => ({ name, version: '1.0.0' }) }
+  await updateAgentRuntime('codex', options)
+  const crashed = join(root, 'codex/.install-crashed')
+  await mkdir(crashed)
+  await recordInstaller(crashed, await exitedPid())
+  await expect(updateAgentRuntime('codex', { ...options, runningCommands: async () => [],
+    metadata: async () => { throw new Error('registry offline') } })).rejects.toThrow('registry offline')
+  expect(existsSync(crashed)).toBe(true)
+  const reports: string[] = []
+  await updateAgentRuntime('codex', { ...options, report: message => reports.push(message), runningCommands: async () => null })
+  expect(existsSync(crashed)).toBe(true)
+  expect(reports).toContain('codex: 中断安装的临时目录清理跳过（无法确认占用）')
+})
+
+test('a preserved staging directory of a cancelled install is removed only after its installer is gone', async () => {
+  const root = await scratch()
+  let partial = ''
+  // Stands in for an orphaned npm lifecycle child: alive, but no command line names the staging path.
+  const installer = Bun.spawn([process.execPath, '-e', 'setTimeout(() => {}, 60_000)'])
+  try {
+    await expect(updateAgentRuntime('codex', { root, metadata: async name => ({ name, version: '1.0.0' }),
+      install: async directory => {
+        partial = directory
+        await recordInstaller(directory, installer.pid)
+        throw new AgentInstallTerminationError('termination unconfirmed')
+      } })).rejects.toThrow('termination unconfirmed')
+    const options = { root, install, metadata: async (name: string) => ({ name, version: '1.0.0' }) }
+    await updateAgentRuntime('codex', { ...options, runningCommands: async () => [`npm install --prefix ${partial} --include=optional`] })
+    expect(existsSync(partial)).toBe(true)
+    await updateAgentRuntime('codex', { ...options, runningCommands: async () => [] })
+    expect(existsSync(partial)).toBe(true)
+    installer.kill()
+    await installer.exited
+    await updateAgentRuntime('codex', { ...options, runningCommands: async () => [] })
+    expect(existsSync(partial)).toBe(false)
+  } finally { installer.kill() }
+})
+
+test('staging without an installer record is kept until it is a day old', async () => {
+  const root = await scratch()
+  const options = { root, install, runningCommands: async () => [], metadata: async (name: string) => ({ name, version: '1.0.0' }) }
+  await updateAgentRuntime('codex', options)
+  const unrecorded = join(root, 'codex/.install-unrecorded')
+  await mkdir(unrecorded)
+  await updateAgentRuntime('codex', options)
+  expect(existsSync(unrecorded)).toBe(true)
+  const now = Date.now()
+  const clock = spyOn(Date, 'now').mockReturnValue(now + 25 * 60 * 60_000)
+  try { await updateAgentRuntime('codex', options) } finally { clock.mockRestore() }
+  expect(existsSync(unrecorded)).toBe(false)
+})
+
+test('a lock another waiter just moved aside survives the sweep, and the holder still releases cleanly', async () => {
+  const root = await scratch()
+  const options = { root, install, runningCommands: async () => [], metadata: async (name: string) => ({ name, version: '1.0.0' }) }
+  await updateAgentRuntime('codex', options)
+  const reclaiming = join(root, `codex/.stale-lock-${Date.now()}-inflight`)
+  const legacyFresh = join(root, 'codex/.stale-lock-legacy')
+  for (const path of [reclaiming, legacyFresh]) await mkdir(path)
+  // The holder's own lock is moved aside mid-update (a waiter's reclaim) and not yet restored.
+  const lockPath = join(root, 'codex/update.lock')
+  const reports: string[] = []
+  await updateAgentRuntime('codex', { ...options, report: message => {
+    reports.push(message)
+    if (message.includes('已是 latest') && existsSync(lockPath)) rmSync(lockPath, { recursive: true })
+  } })
+  expect(existsSync(reclaiming)).toBe(true)
+  expect(existsSync(legacyFresh)).toBe(true)
+  expect(existsSync(lockPath)).toBe(false)
+  // A lock that another updater took after the holder's vanished is not the holder's to remove.
+  await updateAgentRuntime('codex', { ...options, report: message => {
+    if (!message.includes('已是 latest')) return
+    rmSync(lockPath, { recursive: true })
+    mkdirSync(lockPath)
+  } })
+  expect(existsSync(lockPath)).toBe(true)
+})
+
+// 本地保留 5s 锁获取宽限窗口(超时按 Invalid runtime update lock 报错),上游改为过期重认领,语义直接冲突;跳过待人工确认。
+test.skip('a lock whose updater died before publishing its PID is reclaimed after the grace period, a fresh one is not', async () => {
+  const root = await scratch()
+  const lockPath = join(root, 'codex/update.lock')
+  await mkdir(lockPath, { recursive: true })
+  const controller = new AbortController()
+  const waiting = updateAgentRuntime('codex', { root, install, signal: controller.signal, metadata: async name => ({ name, version: '1.0.0' }) })
+  await Bun.sleep(300)
+  expect(existsSync(join(root, 'codex/current.json'))).toBe(false)
+  controller.abort(new Error('stopped waiting'))
+  // 等锁循环此刻挂在 200ms 定时器上。Windows 上 Bun 的 expect(...).rejects 等这种 promise 时会满 CPU
+  // 空转、定时器不再触发，整个测试进程卡到 CI 超时（实测 12 次卡 11 次）；先 await 取结果再断言。
+  const stopped = await waiting.then(() => undefined, (error: unknown) => error)
+  expect(stopped).toBeInstanceOf(Error)
+  expect((stopped as Error).message).toBe('stopped waiting')
+  expect(existsSync(lockPath)).toBe(true)
+  const old = new Date(Date.now() - 60_000)
+  await utimes(lockPath, old, old)
+  const state = await updateAgentRuntime('codex', { root, install, runningCommands: async () => [], metadata: async name => ({ name, version: '1.0.0' }) })
+  expect(state.directory).toBeDefined()
+  expect((await readdir(join(root, 'codex'))).filter(name => name === 'update.lock' || name.startsWith('.stale-lock-'))).toEqual([])
+})
+
+test('a lock held by an exited updater is reclaimed immediately', async () => {
+  const root = await scratch()
+  const exited = Bun.spawn([process.execPath, '-e', ''])
+  await exited.exited
+  await mkdir(join(root, 'codex/update.lock'), { recursive: true })
+  await writeFile(join(root, 'codex/update.lock/pid'), String(exited.pid))
+  const started = Date.now()
+  await updateAgentRuntime('codex', { root, install, runningCommands: async () => [], metadata: async name => ({ name, version: '1.0.0' }) })
+  expect(Date.now() - started).toBeLessThan(5_000)
+  expect((await readdir(join(root, 'codex'))).filter(name => name === 'update.lock' || name.startsWith('.stale-lock-'))).toEqual([])
+})
+
+test('stopping auto-updates aborts synchronously and resolves only after the in-flight update settled', async () => {
+  let tick!: () => void
+  const interval = spyOn(globalThis, 'setInterval').mockImplementation(((callback: () => void) => {
+    tick = callback
+    return { unref() {} } as ReturnType<typeof setInterval>
+  }) as typeof setInterval)
+  const clear = spyOn(globalThis, 'clearInterval').mockImplementation(() => {})
+  let release!: () => void
+  const released = new Promise<void>(resolve => { release = resolve })
+  let signal: AbortSignal | undefined
+  let settled = false
+  try {
+    const stop = startAgentAutoUpdates(() => {}, { enabled: { codex: true }, update: async (_agent, options) => {
+      signal = options?.signal
+      await released
+      settled = true
+      throw new Error('aborted')
+    } })
+    tick()
+    let stopped = false
+    const stopping = stop().then(() => { stopped = true })
+    expect(signal?.aborted).toBe(true)
+    await Bun.sleep(20)
+    expect(stopped).toBe(false)
+    release()
+    await stopping
+    expect(settled).toBe(true)
+    await startAgentAutoUpdates(() => {}, {})()
+  } finally {
+    release()
+    interval.mockRestore()
+    clear.mockRestore()
+  }
 })

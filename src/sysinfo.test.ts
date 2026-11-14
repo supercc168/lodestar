@@ -1,4 +1,7 @@
-import { describe, expect, test } from 'bun:test'
+import { afterAll, describe, expect, mock, test } from 'bun:test'
+
+// 该文件 mock 了整个 node:fs；Bun 的模块 mock 会跨文件泄漏，退出前必须还原。
+afterAll(() => mock.restore())
 import { parseLaunchctlList, parseMacMemory, parseProcessElapsed, readMacMemory, readMacServices } from './sysinfo'
 import { consoleHostContent, consoleHostElement } from './cards/console'
 

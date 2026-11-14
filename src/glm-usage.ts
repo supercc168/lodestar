@@ -217,4 +217,5 @@ async function requestGlmUsage(domain: string, token: string): Promise<GlmUsageS
   }
 }
 
+/** 本地兼容名：`hi` 面板与 footer 无 override，按 `[claude.models.glm]` 全局档位读取。 */
 export const readGlmUsage = fetchGlmUsage

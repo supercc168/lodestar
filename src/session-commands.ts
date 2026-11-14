@@ -37,6 +37,23 @@ function isControlCommandText(raw: string): boolean {
   return CONTROL_COMMAND_ALIASES.has(t.toLowerCase())
 }
 
+/** `compact` holds its chat's queue until the native compaction ends, so a stop, kill,
+ * restart or clear sent meanwhile would wait behind the very thing it is meant to end.
+ * Called as an inbound message arrives, before it is queued: such a command cancels the
+ * compaction right away and still runs in order afterwards. */
+export function cancelCompactionOnArrival(
+  s: Pick<Session, 'manualContextCompactionPending' | 'cancelManualCompaction'> | undefined,
+  messageType: unknown, content: unknown,
+): boolean {
+  if (!s?.manualContextCompactionPending || messageType !== 'text' || typeof content !== 'string') return false
+  let text: unknown
+  try { text = JSON.parse(content)?.text } catch { return false }
+  const command = typeof text === 'string' ? CONTROL_COMMAND_ALIASES.get(text.trim().toLowerCase()) : undefined
+  if (command !== 'stop' && command !== 'kill' && command !== 'restart' && command !== 'clear') return false
+  s.cancelManualCompaction(command !== 'stop')
+  return true
+}
+
 const sourceCommandWork = new Set<Promise<void>>()
 
 function backgroundSourceCommand(s: Session, work: Promise<void>): void {
@@ -51,6 +68,27 @@ function backgroundSourceCommand(s: Session, work: Promise<void>): void {
 }
 
 export function pendingSourceCommands(): Promise<void>[] { return [...sourceCommandWork] }
+
+/** A throwing restart must still end the command's status card: left open, its timer
+ * keeps running and the card stays "restarting" forever. The caller closes the card. */
+async function restartWithStatus(
+  s: Session, resume: boolean, statusCard: Awaited<ReturnType<Session['openStatusCard']>>, onStatus: (status: string) => void,
+  lease?: Parameters<Session['ownsLifecycle']>[0],
+): Promise<{ ok: boolean; failure?: unknown }> {
+  try {
+    return { ok: await s.restart(resume, {
+      announce: !statusCard,
+      ...(lease ? { lifecycleLease: lease } : {}),
+      onStatus: status => {
+        onStatus(status)
+        s.setStatusCard(statusCard, status)
+      },
+    }) }
+  } catch (failure) {
+    logError('session-commands: restart failed', failure)
+    return { ok: false, failure }
+  }
+}
 
 /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
  * plus their two-letter aliases where applicable.
@@ -271,7 +309,13 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
         try {
           await s.stop('已取消额度恢复', { announce: !card, onStatus: value => s.setStatusCard(card, value) })
           await s.closeStatusCard(card, '🛑 已取消额度恢复')
-        } catch (error) { await s.closeStatusCard(card, `❌ ${messageOf(error)}`); throw error }
+        } catch (error) {
+          await s.closeStatusCard(card, `❌ ${messageOf(error)}`)
+          // Without a card nothing has told the user yet; with one, rethrowing would have
+          // the inbound failure notice report the same error a second time.
+          if (!card) throw error
+          logError('session-commands: quota wait stop failed', error)
+        }
         return true
       }
       // Soft barge-out: interrupt the current turn (if any) AND drop
@@ -334,6 +378,10 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
         s.pendingReactionIds = new Map()
         s.currentBatchReactionIds = new Map()
       }
+      // Tag the imminent SDK `result` so the result handler does not
+      // repaint the footer after this stop path already closed the card.
+      // Must be set BEFORE the interrupt — the result can land next tick.
+      s.userInterrupted = true
       const interrupt = s.beginTurnInterrupt('user')
       if (!interrupt) log('session-commands.stop_no_live_process')
       // 主动封口,把 footer 改成 🛑 打断、停止 footer 状态计时、把 streaming_mode
@@ -442,23 +490,19 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
           if (!s.ownsLifecycle(lease)) return true
         }
         let lastStatus = initialStatus
-        const ok = await s.restart(true, {
-          announce: !statusCard,
-          lifecycleLease: lease,
-          onStatus: status => {
-            lastStatus = status
-            s.setStatusCard(statusCard, status)
-          },
-        })
+        const { ok, failure } = await restartWithStatus(s, true, statusCard, status => { lastStatus = status }, lease)
         if (!s.ownsLifecycle(lease)) return true
-        const finalStatus = ok
-          ? (
-              lastStatus.startsWith('✅')
-                ? lastStatus
-                : s.withWorktreeInstructionNotice(resumeThreadLabel ? '✅ 已恢复上一会话' : `✅ ${s.backendLabel()} 已就绪`)
-            )
-          : (lastStatus.startsWith('❌') ? lastStatus : '❌ 重启失败')
+        const finalStatus = failure !== undefined
+          ? `❌ 重启失败: ${messageOf(failure)}`
+          : ok
+            ? (
+                lastStatus.startsWith('✅')
+                  ? lastStatus
+                  : s.withWorktreeInstructionNotice(resumeThreadLabel ? '✅ 已恢复上一会话' : `✅ ${s.backendLabel()} 已就绪`)
+              )
+            : (lastStatus.startsWith('❌') ? lastStatus : '❌ 重启失败')
         await s.closeStatusCard(statusCard, ok ? s.withModel(finalStatus) : finalStatus)
+        if (failure !== undefined && !statusCard) throw failure
       }
       return true
       }
@@ -501,21 +545,17 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
         const statusCard = await s.openStatusCard('clear', '🧹 清空并启动新会话', 'orange')
         if (!s.ownsLifecycle(lease)) return true
         let lastStatus = '🧹 清空并启动新会话'
-        const ok = await s.restart(false, {
-          announce: !statusCard,
-          lifecycleLease: lease,
-          onStatus: status => {
-            lastStatus = status
-            s.setStatusCard(statusCard, status)
-          },
-        })
+        const { ok, failure } = await restartWithStatus(s, false, statusCard, status => { lastStatus = status }, lease)
         if (!s.ownsLifecycle(lease)) return true
         await s.closeStatusCard(
           statusCard,
-          ok
-            ? s.withModel(s.withWorktreeInstructionNotice('✅ 已清空并启动新会话'))
-            : (lastStatus.startsWith('❌') ? lastStatus : '❌ 清空失败'),
+          failure !== undefined
+            ? `❌ 清空失败: ${messageOf(failure)}`
+            : ok
+              ? s.withModel(s.withWorktreeInstructionNotice('✅ 已清空并启动新会话'))
+              : (lastStatus.startsWith('❌') ? lastStatus : '❌ 清空失败'),
         )
+        if (failure !== undefined && !statusCard) throw failure
       }
       return true
       }

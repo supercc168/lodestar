@@ -7,7 +7,7 @@
 import { randomUUID } from 'node:crypto'
 import {
   get, pendingRepliesForChat, hasReplyMessage, setReplyState, markResolved, markUnknown,
-  recordCallbackSuccess, isDispatching, setDispatching, clearDispatching,
+  recordCallbackSuccess, markUnknownRecovered, isDispatching, setDispatching, clearDispatching,
   type NotifyRegistration, type NotifyReplyState, type NotifyTextResponse, type DispatchResult,
 } from './notify-callbacks'
 import { buildNotifyCardFromReg, buildNotifyReplyCard, type NotifyResolution } from './notify'
@@ -54,19 +54,22 @@ export function createNotifyReplyRuntime(deps: {
     return null
   }
   // A failed error notice must not make an already consumed reply execute twice.
-  const report = async (chatId: string, message: string) => {
+  /** Returns whether the notice reached the chat; callers decide if that is fatal.
+   * 错误通道本身绝不抛出（02-REVIEW WR-01）：提示发不出去不等于业务消费失败。 */
+  const report = async (chatId: string, message: string): Promise<boolean> => {
     deps.logError('notify.reply.presentation_failed', new Error(message))
     try {
-      if (!await deps.sendText(chatId, `❌ ${message}`)) {
-        deps.logError('notify.reply.error_notice_failed', new Error('error notice not delivered'))
-      }
+      if (await deps.sendText(chatId, `❌ ${message}`)) return true
+      deps.logError('notify.reply.error_notice_failed', new Error('error notice not delivered'))
+      return false
     } catch (error) {
       deps.logError('notify.reply.error_notice_failed', error)
+      return false
     }
   }
-  const update = async (reg: NotifyRegistration, messageId: string, card: object, context: string) => {
-    try { await deps.updateCard(messageId, card) }
-    catch (error) { await report(reg.chatId, `${context}，卡片更新失败：${detailOf(error)}`) }
+  const update = async (reg: NotifyRegistration, messageId: string, card: object, context: string): Promise<boolean> => {
+    try { await deps.updateCard(messageId, card); return true }
+    catch (error) { return await report(reg.chatId, `${context}，卡片更新失败：${detailOf(error)}`) }
   }
 
   return {
@@ -74,10 +77,13 @@ export function createNotifyReplyRuntime(deps: {
       if (reg.dispatchState && reg.unknownAt) {
         const state = reg.dispatchState
         const button = reg.buttons.find(button => button.id === state.buttonId)
-        await update(reg, reg.messageId, buildNotifyCardFromReg(reg, {
+        const shown = await update(reg, reg.messageId, buildNotifyCardFromReg(reg, {
           status: 'unknown', buttonId: state.buttonId, text: button?.text ?? state.buttonId,
           operatorOpenId: state.openId, detail: reg.unknownReason,
         }), '按钮回调送达状态未知')
+        // 没能让用户看到状态就保留记录，下次启动再试一次（只重试一次）。
+        if (!shown) throw new Error('通知状态卡未能展示，保留记录等待下次启动重试')
+        markUnknownRecovered(reg.notifyId)
         return
       }
       const state = reg.replyState
@@ -86,8 +92,12 @@ export function createNotifyReplyRuntime(deps: {
         kind: 'text', status: 'unknown', text: state.response?.text ?? '',
         operatorOpenId: state.openId, detail: reg.unknownReason,
       }
-      await update(reg, state.promptMessageId, buildNotifyReplyCard(reg, state, resolution), '回复送达状态未知')
-      await update(reg, reg.messageId, buildNotifyCardFromReg(reg, resolution), '回复送达状态未知')
+      const promptShown = await update(reg, state.promptMessageId, buildNotifyReplyCard(reg, state, resolution), '回复送达状态未知')
+      const cardShown = await update(reg, reg.messageId, buildNotifyCardFromReg(reg, resolution), '回复送达状态未知')
+      // Only after the card update (or its failure notice) reached the chat;
+      // a failed presentation leaves the record for the next boot.
+      if (!promptShown || !cardShown) throw new Error('通知状态卡未能展示，保留记录等待下次启动重试')
+      markUnknownRecovered(reg.notifyId)
     },
 
     async open(notifyId: string, chatId: string, openId: string, version?: number): Promise<ReplyActionResult> {

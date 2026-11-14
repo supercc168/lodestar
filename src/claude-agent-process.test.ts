@@ -136,6 +136,31 @@ describe('Claude native initialization and shared writer ownership', () => {
     } finally { allow(); await proc.kill(); sdk.spy.mockRestore(); d.cleanup() }
   })
 
+  test('a failed shutdown after account validation never replaces the validation error', async () => {
+    const d = directories()
+    const spy = spyOn(agentUpdates, 'loadClaudeSdk').mockResolvedValue({
+      query() {
+        let finish!: () => void
+        const ended = new Promise<void>(resolve => { finish = resolve })
+        return {
+          accountInfo: async () => ({ subscriptionType: 'max' }),
+          close() { finish(); throw new Error('native close refused') },
+          async *[Symbol.asyncIterator]() { await ended },
+        }
+      },
+    } as any)
+    const errors: Error[] = []
+    const proc = new ClaudeAgentProcess({ workDir: d.root, effort: 'max', controlOnly: true,
+      validateAccount: () => { throw new Error('Claude 订阅未登录') } })
+    proc.on('error', error => errors.push(error))
+    try {
+      await expect(proc.initializationPromise()).rejects.toThrow('Claude 订阅未登录')
+      await expect(proc.readAccountInfo()).rejects.toThrow('Claude 订阅未登录')
+      expect(errors.map(error => error.message)).toEqual(['Claude 订阅未登录'])
+      expect(proc.isAlive()).toBe(false)
+    } finally { spy.mockRestore(); d.cleanup() }
+  })
+
   test('unconfirmed SDK shutdown keeps ownership until the read loop really exits', async () => {
     const sdk = sdkFixture('stay'), d = directories()
     const proc = new ClaudeAgentProcess({ workDir: d.root, effort: 'max', resumeSessionId: 'shutdown-session', transformEnv: env => ({ ...env, CLAUDE_CONFIG_DIR: d.a }) }) as any
@@ -345,6 +370,160 @@ describe('Claude native steering', () => {
     expect(failures).toHaveLength(1)
     expect(proc.steeringInputs.size).toBe(0)
     expect(proc.steeringResults).toEqual([])
+  })
+
+  test('stop releases the native busy state for input the SDK never took', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
+    proc.started = true
+    proc.sendUserText('still waiting in the local queue')
+    expect(proc.nativeTurnPending).toBe(true)
+    proc.sendInterrupt()
+    expect(proc.nativeTurnPending).toBe(false)
+
+    proc.sendUserText('written to native')
+    await proc.input.next()
+    proc.sendUserText('queued behind it')
+    proc.sendInterrupt()
+    // The written turn still owns the session until its native result.
+    expect(proc.nativeTurnPending).toBe(true)
+    proc.handleMessage({ type: 'result', subtype: 'error_during_execution', is_error: true, uuid: 'interrupted' })
+    expect(proc.nativeTurnPending).toBe(false)
+  })
+})
+
+describe('Claude manual compaction', () => {
+  function idle() {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
+    proc.started = true
+    proc.sessionId = 'compact-session'
+    return proc
+  }
+  function localCommand(proc: any, text: string, failed = false) {
+    const tag = failed ? 'local-command-stderr' : 'local-command-stdout'
+    proc.handleMessage({ type: 'assistant', uuid: `local-${text}`, parent_tool_use_id: null,
+      message: { role: 'assistant', model: '<synthetic>', content: [{ type: 'text', text }] },
+      local_command_source: `<${tag}>${text}</${tag}>`,
+      ...(failed ? { local_command_outcome: { kind: 'failed' } } : {}) })
+  }
+  async function settle(promise: Promise<void>) {
+    return promise.then(() => 'compacted' as const, (error: Error) => error)
+  }
+
+  test('only the compact boundary completes it, even after a successful result', async () => {
+    const proc = idle()
+    const compaction = proc.compactThread()
+    expect((await proc.input.next()).value.message.content).toEqual([{ type: 'text', text: '/compact' }])
+    expect(proc.compactionPending).toBe(true)
+    proc.handleMessage({ type: 'result', subtype: 'success', uuid: 'r', usage: { input_tokens: 1, output_tokens: 1 } })
+    let done = false
+    void compaction.then(() => { done = true })
+    await Promise.resolve()
+    expect(done).toBe(false)
+    proc.handleMessage({ type: 'system', subtype: 'compact_boundary', session_id: 'compact-session', uuid: 'b',
+      compact_metadata: { trigger: 'manual', pre_tokens: 1000 } })
+    await expect(settle(compaction)).resolves.toBe('compacted')
+    expect(proc.compactionPending).toBe(false)
+  })
+
+  test('the result of a turn stopped just before the compaction does not end it', async () => {
+    const proc = idle()
+    proc.sendUserText('long task')
+    await proc.input.next()
+    // `stop` closes the card without waiting for the native result; `cm` follows at once.
+    proc.sendInterrupt()
+    const compaction = proc.compactThread()
+    await proc.input.next()
+    let outcome: unknown
+    void settle(compaction).then(value => { outcome = value })
+    proc.handleMessage({ type: 'result', subtype: 'error_during_execution', is_error: true, uuid: 'interrupted-turn' })
+    await Promise.resolve()
+    expect(outcome).toBeUndefined()
+    expect(proc.compactionPending).toBe(true)
+    // Its own failure still ends it.
+    proc.handleMessage({ type: 'result', subtype: 'error_during_execution', is_error: true, uuid: 'compaction' })
+    await expect(settle(compaction)).resolves.toBeInstanceOf(Error)
+
+    const again = proc.compactThread()
+    proc.handleMessage({ type: 'system', subtype: 'compact_boundary', session_id: 'compact-session', uuid: 'b2',
+      compact_metadata: { trigger: 'manual', pre_tokens: 1000 } })
+    await expect(settle(again)).resolves.toBe('compacted')
+  })
+
+  test('both native nothing-to-compact outputs mean nothing to compact', async () => {
+    const { NothingToCompactError } = await import('./agent-process')
+    const proc = idle()
+    const tooFew = proc.compactThread()
+    localCommand(proc, 'Not enough messages to compact.')
+    expect(await settle(tooFew)).toBeInstanceOf(NothingToCompactError)
+    const empty = proc.compactThread()
+    localCommand(proc, 'Error: No messages to compact', true)
+    expect(await settle(empty)).toBeInstanceOf(NothingToCompactError)
+    // Older natives without the local-command marker still send the fixed text.
+    const legacy = proc.compactThread()
+    proc.handleMessage({ type: 'assistant', uuid: 'legacy', message: { content: [{ type: 'text', text: 'Not enough messages to compact.' }] } })
+    expect(await settle(legacy)).toBeInstanceOf(NothingToCompactError)
+    expect(proc.compactionPending).toBe(false)
+  })
+
+  test('cancelled, skipped and failed compactions reject with the native text', async () => {
+    const { NothingToCompactError } = await import('./agent-process')
+    const proc = idle()
+    for (const [text, failed] of [
+      ['Compaction canceled.', false],
+      ['Interrupted', false],
+      ['Not compacted · blocked by policy', false],
+      ['Compaction failed · conversation could not be reduced below the context limit', true],
+      ['Error during compaction: upstream overloaded', true],
+    ] as const) {
+      const compaction = proc.compactThread()
+      localCommand(proc, text, failed)
+      const outcome = await settle(compaction)
+      expect(outcome).toBeInstanceOf(Error)
+      expect(outcome).not.toBeInstanceOf(NothingToCompactError)
+      expect((outcome as Error).message).toBe(text)
+      expect(proc.compactionPending).toBe(false)
+    }
+  })
+
+  test('an error result while pending rejects with the native error', async () => {
+    const proc = idle()
+    const compaction = proc.compactThread()
+    proc.handleMessage({ type: 'result', subtype: 'error_during_execution', is_error: true, uuid: 'r',
+      errors: ['Error during compaction: request timed out'] })
+    const outcome = await settle(compaction)
+    expect(outcome).toBeInstanceOf(Error)
+    expect((outcome as Error).message).toBe('Error during compaction: request timed out')
+    expect(proc.listenerCount('result')).toBe(0)
+    expect(proc.listenerCount('local_command_output')).toBe(0)
+  })
+
+  test('a process that has already exited rejects immediately without writing input', async () => {
+    const proc = idle()
+    proc.alive = false
+    await expect(proc.compactThread()).rejects.toThrow('已退出')
+    expect(proc.input.items).toEqual([])
+    expect(proc.compactionPending).toBe(false)
+  })
+})
+
+describe('Claude tool event de-duplication', () => {
+  test('keeps de-duplicating recent ids while the id history stays bounded', () => {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'high' }) as any
+    const uses: string[] = []
+    const results: string[] = []
+    proc.on('tool_use', (event: any) => uses.push(event.id))
+    proc.on('tool_result', (event: any) => results.push(event.tool_use_id))
+    const emit = (id: string) => proc.handleMessage({ type: 'assistant', uuid: `a-${id}`, message: { content: [
+      { type: 'tool_use', id, name: 'Bash', input: {} },
+      { type: 'tool_result', tool_use_id: id, content: 'ok' },
+    ] } })
+    for (let i = 0; i < 5000; i++) emit(`tool-${i}`)
+    expect(proc.emittedToolUseIds.size).toBeLessThanOrEqual(4096)
+    expect(proc.emittedToolResultIds.size).toBeLessThanOrEqual(4096)
+    emit('tool-4999')
+    emit('tool-1000')
+    expect(uses).toHaveLength(5000)
+    expect(results).toHaveLength(5000)
   })
 })
 
@@ -1520,7 +1699,7 @@ describe('Claude compactThread (/compact slash command)', () => {
   test('rejects when the process is not running', async () => {
     const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
     proc.alive = false
-    await expect(proc.compactThread()).rejects.toThrow(/not running/)
+    await expect(proc.compactThread()).rejects.toThrow('已退出')
   })
 })
 
@@ -2128,6 +2307,55 @@ describe('Claude transcript context tokens', () => {
 
   test('readLastCallUsageFromTranscript returns null when file missing', () => {
     expect(readLastCallUsageFromTranscript(join(tmpdir(), 'lodestar-no-such.jsonl'))).toBeNull()
+  })
+
+  test('readLastCallUsageFromTranscript reads backwards in blocks and matches a whole-file scan', () => {
+    // Reference: the former implementation, which loaded and split the entire transcript.
+    const reference = (content: string) => {
+      const lines = content.split('\n')
+      for (let i = lines.length - 1; i >= 0; i--) {
+        try {
+          const usage = JSON.parse(lines[i]!.trim())?.message?.usage
+          if (JSON.parse(lines[i]!.trim()).type !== 'assistant' || !usage) continue
+          if ((usage.input_tokens ?? 0) + (usage.cache_read_input_tokens ?? 0) + (usage.cache_creation_input_tokens ?? 0) + (usage.output_tokens ?? 0) > 0) return usage
+        } catch { /* blank or malformed line */ }
+      }
+      return null
+    }
+    const dir = mkdtempSync(join(tmpdir(), 'lodestar-transcript-tail-'))
+    const file = join(dir, 'transcript.jsonl')
+    let seed = 20261113
+    const random = (limit: number) => (seed = (seed * 1103515245 + 12345) & 0x7fffffff) % limit
+    const line = (): string => {
+      switch (random(6)) {
+        case 0: return JSON.stringify({ type: 'assistant', message: { usage: { input_tokens: 1 + random(900), cache_read_input_tokens: random(5000), output_tokens: random(40) } } })
+        case 1: return JSON.stringify({ type: 'assistant', message: { model: '<synthetic>', usage: { input_tokens: 0, output_tokens: 0 } } })
+        case 2: return JSON.stringify({ type: 'user', message: { role: 'user', content: '多字节内容🚀'.repeat(random(40)) } })
+        case 3: return '{"type":"assistant","message":{"usage":{"input_tokens":7' // torn write
+        case 4: return ''
+        default: return JSON.stringify({ type: 'last-prompt', lastPrompt: '结尾提示' })
+      }
+    }
+    try {
+      for (let round = 0; round < 60; round++) {
+        const content = Array.from({ length: random(14) }, line).join('\n') + (random(2) ? '\n' : '')
+        writeFileSync(file, content)
+        // Blocks smaller than a line, cutting through multi-byte characters, up to one read.
+        for (const block of [1, 2, 3, 7, 16, 64, 257, 4096, 256 * 1024]) {
+          expect(readLastCallUsageFromTranscript(file, block)).toEqual(reference(content))
+        }
+      }
+      // The match can lie far before the tail block, behind a line longer than a block.
+      const usage = { input_tokens: 5, cache_read_input_tokens: 9 }
+      writeFileSync(file, [
+        JSON.stringify({ type: 'assistant', message: { usage } }),
+        JSON.stringify({ type: 'user', message: { role: 'user', content: '结果'.repeat(300_000) } }),
+        JSON.stringify({ type: 'last-prompt', lastPrompt: 'x' }), '',
+      ].join('\n'))
+      expect(readLastCallUsageFromTranscript(file)).toEqual(usage)
+      writeFileSync(file, '')
+      expect(readLastCallUsageFromTranscript(file)).toBeNull()
+    } finally { rmSync(dir, { recursive: true, force: true }) }
   })
 })
 
@@ -2772,5 +3000,96 @@ describe('Claude protocol log privacy', () => {
         ['claude-agent-process: malformed command lifecycle'],
       ])
     } finally { diagnostic.mockRestore(); failure.mockRestore() }
+  })
+})
+
+describe.skipIf(process.platform === 'win32')('Claude launcher', () => {
+  function fixture(wrapperBody: string) {
+    const root = mkdtempSync(join(tmpdir(), 'claude-process-launcher-'))
+    mkdirSync(join(root, 'sdk'))
+    const native = join(root, 'sdk', 'claude')
+    writeFileSync(native, '#!/bin/sh\necho "native:$*"\n', { mode: 0o755 })
+    const wrapper = join(root, 'reclaude')
+    writeFileSync(wrapper, `#!/bin/sh\n${wrapperBody}\n`, { mode: 0o755 })
+    const captures: any[] = []
+    let started: Promise<{ code: number | null; stdout: string }> | undefined
+    // The SDK transport: start the process it resolved, then report a non-zero exit as an error.
+    const start = (options: any) => started ??= new Promise(resolve => {
+      const child = options.spawnClaudeCodeProcess({ command: native, args: ['--verbose'], cwd: root, env: options.env,
+        signal: options.abortController.signal })
+      let stdout = ''
+      child.stdout.on('data', (chunk: Buffer) => { stdout += chunk })
+      child.once('exit', (code: number | null) => resolve({ code, stdout }))
+    })
+    const spy = spyOn(agentUpdates, 'loadClaudeSdk').mockResolvedValue({
+      query({ options }: any) {
+        captures.push(options)
+        const exit = async () => {
+          const { code } = await start(options)
+          if (code !== 0) throw new Error(`Claude Code process exited with code ${code}`)
+        }
+        return {
+          supportedModels: async () => { await exit(); return [] },
+          close() {},
+          async *[Symbol.asyncIterator]() { await exit() },
+        }
+      },
+    } as any)
+    const launcher = { command: wrapper, args: ['--org', '7', 'cli'], diagnosticPrefix: 'reclaude:' }
+    return { root, launcher, captures, output: () => started!, cleanup: () => { spy.mockRestore(); rmSync(root, { recursive: true, force: true }) } }
+  }
+
+  test('starts the binary the SDK resolved through the launcher, with the launcher arguments first', async () => {
+    // Like reclaude: consume its own arguments, then exec the first `claude` on PATH.
+    const f = fixture('[ "$1 $2 $3" = "--org 7 cli" ] || exit 9\nshift 3\nexec claude "$@"')
+    const proc = new ClaudeAgentProcess({ workDir: f.root, effort: 'max', controlOnly: true, launcher: f.launcher })
+    try {
+      expect(await proc.listModels()).toEqual([])
+      expect(typeof f.captures[0].spawnClaudeCodeProcess).toBe('function')
+      expect(f.captures[0].pathToClaudeCodeExecutable).toBeUndefined()
+      expect(await f.output()).toEqual({ code: 0, stdout: 'native:--verbose\n' })
+    } finally {
+      await proc.kill().catch(() => {})
+      f.cleanup()
+    }
+  })
+
+  test('a launcher that fails before handing over is reported with its own explanation', async () => {
+    const f = fixture('echo "同步配置…" >&2\necho "reclaude: 本机还没有绑定组织 7，请先运行 reclaude org bind 7" >&2\nexit 1')
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    const proc = new ClaudeAgentProcess({ workDir: f.root, effort: 'max', controlOnly: true, launcher: f.launcher })
+    const errors: string[] = []
+    proc.on('error', (error: Error) => errors.push(error.message))
+    const exited = new Promise(resolve => proc.once('exit', resolve))
+    const expected = 'Claude Code process exited with code 1：reclaude: 本机还没有绑定组织 7，请先运行 reclaude org bind 7'
+    try {
+      await expect(proc.listModels()).rejects.toThrow(expected)
+      await exited
+      expect(errors).toEqual([expected])
+      expect(proc.isAlive()).toBe(false)
+    } finally {
+      logged.mockRestore()
+      f.cleanup()
+    }
+  })
+
+  test('without a launcher the SDK starts Claude Code itself', async () => {
+    const captures: any[] = []
+    const spy = spyOn(agentUpdates, 'loadClaudeSdk').mockResolvedValue({
+      query({ options }: any) {
+        captures.push(options)
+        let finish!: () => void
+        const ended = new Promise<void>(resolve => { finish = resolve })
+        return { close: finish, async *[Symbol.asyncIterator]() { await ended } }
+      },
+    } as any)
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), effort: 'max', controlOnly: true })
+    try {
+      await proc.initializationPromise()
+      expect('spawnClaudeCodeProcess' in captures[0]).toBe(false)
+    } finally {
+      await proc.kill()
+      spy.mockRestore()
+    }
   })
 })

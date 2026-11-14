@@ -50,6 +50,7 @@ import { recordClaudeSessionAccount } from './claude-session-accounts'
 import { enrollClaudeAccount } from './claude-account-selection'
 import { countActiveClaudeSessions } from './session-activity'
 import { withChatMessageOrder } from './chat-message-order'
+
 import {
   validateConversationLaunch,
   type ConversationBranchBase,
@@ -451,6 +452,8 @@ const TERMINAL_COLLAB_AGENT_STATES = new Set([
 const FOOTER_THINKING_PREFIX = 'Thinking...'
 const FOOTER_WRITING = 'Writing...'
 const FOOTER_WORKING = 'Working...'
+/** Raw characters fed to the sanitizer for the 40-character chat-list preview. */
+const SUMMARY_SOURCE_CHARS = 512
 /** Final transaction guard: two 30s control RPCs plus a materialization read
  * of up to 10 minutes. Leave a minute for local lifecycle work so the exact
  * method timeout can surface before this outer guard. */
@@ -897,6 +900,8 @@ export class Session {
   runningAgy: sessionAgy.AgyTaskState | null = null
   startingAgy = false
   agyForwardPrompts = new Map<string, sessionAgy.AgyForwardRecord>()
+  /** A stop/kill/restart ended the pending `compact`; its status card says so. */
+  manualContextCompactionCancelled = false
   /** Claude Code Task 工具(TaskCreate/Update/List/Get)的累积任务板。codex
    * 的 TodoWrite 一次就带完整列表,直接渲染即可;但 Claude Code 把它拆成 4
    * 个单点工具,只有 TaskList 才有完整快照。这里跨 turn / rotate 累积一份
@@ -1024,6 +1029,9 @@ export class Session {
         this.pendingConversationMaterialization = pendingLaunch
       }
     }
+    // Registered last: a constructor that throws above must not leave a half-built
+    // session in the registry that peers and account scheduling scan.
+    Session.all.add(this)
   }
 
   /** Minimal cross-chat snapshot for the `hi` peer-list section.
@@ -1806,9 +1814,10 @@ export class Session {
       ?? this.claudeStartAccountOverride ?? DEFAULT_CLAUDE_ACCOUNT
   }
 
-  /** Histories belong to the shared native store, regardless of the billing account. */
+  /** Histories belong to the shared native store, regardless of the billing account;
+   * only a launcher source (reclaude) keeps its conversations in a directory of its own. */
   claudeHistoryOptions(): { configDir: string } {
-    return { configDir: claudeAccounts.sharedConfigDir() }
+    return { configDir: this.currentTokenSource()?.claudeHistoryDir ?? claudeAccounts.sharedConfigDir() }
   }
 
   conversationRouting(): SessionConversationRouting {
@@ -2052,11 +2061,18 @@ export class Session {
     if (this.selectedProvider === 'claude' && source?.agent === 'claude') {
       return this.selectedEffort ?? tokenSourceRuntimeModel(source, this.selectedModel ?? source.defaultModel)?.defaultEffort ?? null
     }
+    if (this.selectedProvider === 'dsh') {
+      // Display only: without a catalog entry show MISS; dshEffortForSpawn still refuses the spawn.
+      // 无注册来源时回落到 `[deepseek-harness].effort`（本地单来源形态）。
+      if (this.selectedEffort) return this.selectedEffort
+      if (source) {
+        const entry = tokenSourceRuntimeModel(source, this.selectedModel ?? source.defaultModel)
+        return entry && isDshReasoningEffort(entry.defaultEffort) ? entry.defaultEffort : null
+      }
+      const configured = config.deepseek_harness?.effort
+      return isDshReasoningEffort(configured) ? configured : null
+    }
     return this.selectedEffort
-      // DSH 档位与 Codex/Claude 枚举不同(off/low/high/max):未显式选时按 DSH
-      // 语义解析(取不到即抛,不静默回落 CODEX_EFFORT),否则面板选中标记 /
-      // 当前档位展示 / selectionUnchanged 会把 DSH 会话当 Codex 渲染(03-03)。
-      ?? (this.selectedProvider === 'dsh' ? this.dshEffortForSpawn() : undefined)
       ?? this.proc?.lastEffort
       ?? (this.selectedProvider === 'claude' ? CLAUDE_EFFORT : CODEX_EFFORT)
   }
@@ -2090,11 +2106,15 @@ export class Session {
         ? tokenSourceRuntimeModel(claudeSource, this.selectedModel ?? claudeSource.defaultModel)?.defaultEffort ?? null
         : CLAUDE_EFFORT
       : CODEX_EFFORT
-    const effort = selectedMatchesProc
-      ? this.selectedEffort
-        ?? proc?.lastEffort
-        ?? fallbackEffort
-      : proc?.lastEffort ?? fallbackEffort
+    // DSH 的档位枚举与 Codex/Claude 不同，且目录缺档时必须显示 MISS；
+    // 统一交给 currentEffortLabel 的 DSH 语义，其余后端保持本地回落顺序。
+    const effort = provider === 'dsh'
+      ? this.currentEffortLabel()
+      : selectedMatchesProc
+        ? this.selectedEffort
+          ?? proc?.lastEffort
+          ?? fallbackEffort
+        : proc?.lastEffort ?? fallbackEffort
     return {
       provider,
       model,
@@ -2473,11 +2493,20 @@ export class Session {
     try { await proc.kill() }
     catch (e) { killError = e }
     resumableStateError = await this.settleProcResumableState(proc)
+    // Subagents and background shells die with their process. Left "running", their rows
+    // suppress every later completion push and keep counting as active Claude load.
+    let backgroundError: unknown = null
+    try { await this.resetBackgroundTasks() }
+    catch (e) {
+      backgroundError = e
+      logError('session: idle stop background cleanup failed', e)
+    }
     const confirmed = this.finishProcStop(proc, killError)
     this.opts.onLifecycleChange?.()
     const failures = [
       ...(killError ? [killError] : !confirmed ? [new Error(this.blockedProcReason ?? 'process stop unconfirmed')] : []),
       ...(resumableStateError ? [new Error(resumableStateError)] : []),
+      ...(backgroundError ? [backgroundError] : []),
     ]
     if (failures.length === 1) throw failures[0]
     if (failures.length > 1) {
@@ -2801,6 +2830,9 @@ export class Session {
     }
     this.stoppingProc = proc
     this.agentCapability = null
+    // The pending post-interrupt result belongs to this process, whose ordinary events
+    // are ignored from here on. Left set, it would swallow the next process's first result.
+    this.userInterrupted = false
   }
 
   /** Returns true only when process termination is confirmed. */
@@ -2968,8 +3000,8 @@ export class Session {
         return true
       }
     }
-    if (provider === 'codex') report?.('🔎 检查 Codex 登录')
-    else report?.('🔎 检查 Claude Code')
+    if (provider === 'codex') report?.(this.currentTokenSource()?.codexApiProvider ? '🔎 检查 Codex API 来源' : '🔎 检查 Codex 登录')
+    else report?.(provider === 'dsh' ? `🔎 检查 ${this.backendLabel()}` : '🔎 检查 Claude Code')
     if (
       provider === 'codex' &&
       // 合并调和(取舍):登录预检取两侧豁免并集 —— 本地目录判定(自配 key 的
@@ -3244,7 +3276,10 @@ export class Session {
       const timer = setTimeout(() => finish('ready'), graceMs)
       const onInit = () => finish('init')
       const onError = (e: unknown) => finish('error', e)
-      const onExit = (e: unknown) => finish('exit', e)
+      // The exit event carries `{ code, signal, expected }`, not an Error; reported as is
+      // it reads 「启动失败: [object Object]」.
+      const onExit = (e: { code?: number | null; signal?: string | null } | undefined) =>
+        finish('exit', new Error(`进程已退出 (code=${e?.code ?? 'null'}, signal=${e?.signal ?? 'null'})`))
       proc.once('init', onInit)
       proc.once('error', onError)
       proc.once('exit', onExit)
@@ -3615,6 +3650,26 @@ export class Session {
     resume = false,
     opts: LifecycleProgressOpts & { onResumeInvalidated?: (sessionId: string) => void } = {},
   ): Promise<boolean> {
+    // An exception must not leave the internal status card's footer timer running forever.
+    const owned: { statusCard: StatusCardHandle | null } = { statusCard: null }
+    try {
+      return await this.restartWithStatusCard(resume, opts, owned)
+    } catch (error) {
+      const statusCard = owned.statusCard
+      owned.statusCard = null
+      if (statusCard) {
+        await this.closeStatusCard(statusCard, `❌ 重启失败: ${messageOf(error)}`)
+          .catch(closeError => logError('session: restart failure status-card close failed', closeError))
+      }
+      throw error
+    }
+  }
+
+  private async restartWithStatusCard(
+    resume: boolean,
+    opts: LifecycleProgressOpts & { onResumeInvalidated?: (sessionId: string) => void },
+    owned: { statusCard: StatusCardHandle | null },
+  ): Promise<boolean> {
     const strictResume = resume && opts.requireResumeSession === true
     const wantsPreservation = !!(opts.preserveCurrentTurn || opts.preserveQueuedHumanWork)
     const existingRecovery = strictResume ? this.preservedWatchdogRecovery : null
@@ -3739,11 +3794,17 @@ export class Session {
         ? this.withModel(`🔁 重启 ${this.backendLabel(this.proc.provider)}`)
         : this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}`)
       statusCard = await this.openStatusCard('restart', initialStatus)
-      if (!this.ownsLifecycle(lease)) return false
+      owned.statusCard = statusCard
+      if (!this.ownsLifecycle(lease)) {
+        owned.statusCard = null
+        if (statusCard) await this.closeStatusCard(statusCard, '❌ 重启已取消')
+        return false
+      }
       if (statusCard) report = status => this.setStatusCard(statusCard, status)
     }
     const announceText = announce && !statusCard
     const closeInternalStatusCard = async (finalStatus: string): Promise<void> => {
+      owned.statusCard = null
       if (statusCard) await this.closeStatusCard(statusCard, finalStatus)
     }
     // ── 上游 restart 前置密封(4185808/ec149d7 簇 4「会话生命周期可靠性」)──
@@ -3778,6 +3839,7 @@ export class Session {
         prevThreadLabel = prevSessionId.slice(0, 8)
       }
     }
+
     // 主动重启:孤儿缓冲随轮作废,不兜底推送。必须在 kill 之前丢弃 ——
     // 否则 kill 触发的 exit 处理器会抢先把缓冲当作"进程崩溃残留"兜底推出去,
     // 违背 restart 的作废语义。旧 proc 不再预置 null(上游形态):beginProcStop
@@ -3983,9 +4045,8 @@ export class Session {
         this.opts.onLifecycleChange?.()
         return false
       }
-      this.proc = proc
+      this.attachProc(proc)
       if (recovery) recovery.replacementProc = proc
-      this.wireProc(proc)
       const cleanupFailedReplacement = async (): Promise<boolean> => {
         const ownedReplacement = this.proc === proc
         if (ownedReplacement) this.proc = null
@@ -4775,7 +4836,7 @@ export class Session {
    * Passing `usage=undefined` paints the `_加载中…_` placeholder — the
    * caller is responsible for the async patch if the panel was sent. */
   async buildConsoleOpts(
-    usage: UsageSnapshot | undefined,
+    usage?: UsageSnapshot,
     glmUsage?: GlmUsageSnapshot,
     providerUsage?: ClaudeProviderUsageSnapshot,
   ): Promise<cards.ConsoleOpts> {
@@ -4928,7 +4989,7 @@ export class Session {
   async replaceStatusCardWithConsole(handle: StatusCardHandle, finalStatus: string): Promise<void> {
     handle.timer.stop()
     const elapsed = handle.timer.elapsedSec()
-    const consoleOpts = await this.buildConsoleOpts(undefined)
+    const consoleOpts = await this.buildConsoleOpts()
     await cardkit.flush(handle.cardId)
     const failures: cardkit.CardWriteFailure[] = []
     const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
@@ -5162,8 +5223,28 @@ export class Session {
     this.submittedSteering.clear()
     this.steeringBoundary?.start()
     this.steeringBoundary = null
-    if (!this.proc) return
+    if (!this.proc) {
+      // No backend will answer this interrupt, so no result may be skipped for it.
+      this.userInterrupted = false
+      return
+    }
     this.proc.sendInterrupt()
+  }
+
+  /** `compact` keeps this chat's queue until the native compaction ends, so the command
+   * that should end it would wait behind it. This runs as that command arrives, before it
+   * is queued. `force` (kill/restart/clear) also stops a backend that ignores the interrupt. */
+  cancelManualCompaction(force: boolean, graceMs = 10_000): void {
+    const proc = this.proc
+    if (!this.manualContextCompactionPending || !proc?.isAlive()) return
+    this.manualContextCompactionCancelled = true
+    proc.sendInterrupt()
+    if (!force) return
+    const timer = setTimeout(() => {
+      if (!this.manualContextCompactionPending || this.proc !== proc || !proc.isAlive()) return
+      void proc.kill().catch(error => logError('session: compaction force stop failed', error))
+    }, graceMs)
+    timer.unref?.()
   }
 
   private disabledClaudeSourceMessage(sourceId = this.selectedTokenSourceId): string | null {
@@ -5468,19 +5549,18 @@ export class Session {
         status => this.withModel(status),
       )
       let lastBootStatus = `🚀 启动 ${this.backendLabel()}`
-      // 走公共 start(本地 main 同位调用):测试经实例覆写 session.start
-      // 拦截冷启动的接缝必须保留;带 lease 时 start() 直进 startUnlocked,
-      // 既不再排队(user-message lifecycle 内嵌套)也不死锁。
-      const ok = await this.start({
-        announce: false,
-        lifecycleLease: lease,
-        freshConversationStateAlreadyReset: true,
-        onStatus: status => {
-          lastBootStatus = status
-          bootTimer.setStatus(status)
-        },
-      })
-      bootTimer.stop()
+      let ok: boolean
+      try {
+        ok = await this.start({
+          announce: false,
+          lifecycleLease: lease,
+          freshConversationStateAlreadyReset: true,
+          onStatus: status => {
+            lastBootStatus = status
+            bootTimer.setStatus(status)
+          },
+        })
+      } finally { bootTimer.stop() }
       if (this.currentTurn !== turn) {
         await this.settleCapturedStaleTurn(turn)
         return
@@ -9879,11 +9959,12 @@ export class Session {
     turn.segmentTexts.set(segId, turn.currentAssistantText)
     this.processOutboundMarkers(turn.currentAssistantText)
     this.processHostAskMarkers(turn.currentAssistantText, turn)
-    const displayText = this.cleanAssistantTextForDisplay(turn.currentAssistantText)
     // Chat-list preview: head of the latest assistant text (~40 chars —
     // 开头即主题,流式期间稳定不闪;尾部截断会把 markdown 语法尾巴糊进列表行)。
     // Feishu truncates anyway. patchSummaryThrottled is rate-limited on its own.
-    const head = displayText.slice(0, 40)
+    // Only the head is shown, so only a bounded head is sanitized: cleaning the whole
+    // segment for every delta is quadratic and blocks the loop on long replies.
+    const head = this.cleanAssistantTextForDisplay(turn.currentAssistantText.slice(0, SUMMARY_SOURCE_CHARS)).slice(0, 40)
     cardkit.patchSummaryThrottled(turn.cardId, head)
   }
 
@@ -10270,7 +10351,7 @@ export class Session {
       const snap = await ts.readUsage()
       if (snap.state === 'ok' && snap.kind !== 'balance') {
         const fiveHour = snap.windows.find(w => w.kind === 'fiveHour')
-        if (ts.kind === 'claude-subscription') {
+        if (ts.kind === 'claude-subscription' || ts.kind === 'reclaude') {
           const weekly = claudeWeeklyUsageWindow(snap, model)
           const missing = { percent: null, resetsAt: null }
           // 没有 5h 窗口表示该账号已取消 5 小时限额：不补 MISS，只显示周额度。
@@ -10478,6 +10559,9 @@ export class Session {
     // 新卡同名段不受旧卡标记影响)。
     const renderedHere = turn.mathRendered?.get(cardId)
     for (const [segId, fullText] of segmentTexts) {
+      // A whitespace-only block (common just before a tool call) never became an element;
+      // replacing it would be a write to an id the card does not have.
+      if (!fullText.trim()) continue
       if (cardkit.isDeadElement(cardId, segId)) {
         fallbackSegments.set(segId, fullText)
         continue

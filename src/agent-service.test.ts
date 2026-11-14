@@ -536,6 +536,77 @@ describe('AgentService', () => {
     }
   })
 
+  test('worker steps never queue more than one in-flight and one pending row write', async () => {
+    // Three workers report a step every few milliseconds while a row write takes far
+    // longer than the progress interval. Unmerged, the writes queue without bound and the
+    // terminal update, like every other message of the chat, waits behind them.
+    const identities = ['a', 'b', 'c'].map(id => identity(id, `Agent ${id}`))
+    const stops: Array<() => void> = []
+    const finishes: Array<() => void> = []
+    let inFlight = 0, maxInFlight = 0, progressWrites = 0
+    const { service, root } = harness({
+      identities,
+      startWorker: opts => {
+        const control = controlledHandle()
+        const timer = setInterval(() => opts.callbacks?.onProgress?.(
+          { at: new Date().toISOString(), phase: 'started', tool: 'Read', detail: 'busy-step' }), 5)
+        stops.push(() => clearInterval(timer))
+        finishes.push(() => control.resolve(result(`sid-${opts.identity.id}`, 'final-output')))
+        return control.handle
+      },
+      replaceElementChecked: async (_cardId, _elementId, element) => {
+        const terminal = JSON.stringify(element).includes('final-output')
+        if (!terminal) progressWrites++
+        inFlight++
+        maxInFlight = Math.max(maxInFlight, inFlight)
+        await new Promise(resolve => setTimeout(resolve, terminal ? 0 : 300))
+        inFlight--
+        return true
+      },
+    })
+    try {
+      const started = await service.startRun(root, { description: '进度合并', identityIds: identities.map(entry => entry.id), prompt: 'work' })
+      await new Promise(resolve => setTimeout(resolve, 1300))
+      for (const stop of stops) stop()
+      const stoppedAt = Date.now()
+      for (const finish of finishes) finish()
+      await waitForCondition(() => service.getRun(root, started.runId).status === 'completed')
+      // 1.3 s of activity with 300 ms writes: a handful of writes, never one per step or worker.
+      expect(progressWrites).toBeGreaterThan(0)
+      expect(progressWrites).toBeLessThanOrEqual(5)
+      expect(maxInFlight).toBe(1)
+      // The terminal state is not held behind a backlog of stale progress writes.
+      expect(Date.now() - stoppedAt).toBeLessThan(1500)
+    } finally {
+      for (const stop of stops) stop()
+      await service.shutdown('test cleanup')
+    }
+  }, 15_000)
+
+  test('startup rewrites only the run records that the restart changes', async () => {
+    const stored = (index: number, status: AgentRunSnapshot['status'], artifacts: boolean): AgentRunSnapshot => ({
+      ...completedHistory(index + 1)[index]!, status,
+      ...(artifacts ? { promptArtifact: `agent_history_${index}.prompt.txt` } : {}),
+      workers: completedHistory(index + 1)[index]!.workers.map(worker => ({
+        ...worker, status: status === 'completed' ? 'completed' : 'running',
+        ...(artifacts ? { outputArtifact: `agent_history_${index}.output.txt` } : {}),
+      })),
+    })
+    const { service, root, artifacts } = harness({ loadArtifacts: () => [
+      stored(0, 'completed', true),   // finished and already in the artifact layout: untouched
+      stored(1, 'running', true),     // was active when the daemon stopped: settled as failed
+      stored(2, 'completed', false),  // stored before prompts/outputs became artifacts: migrated
+    ] })
+    try {
+      const rewritten = artifacts.map((value: any) => value.runId).sort()
+      expect(rewritten).toEqual(['agent_history_1', 'agent_history_2'])
+      expect((artifacts.find((value: any) => value.runId === 'agent_history_1') as any).status).toBe('failed')
+      expect((artifacts.find((value: any) => value.runId === 'agent_history_2') as any).promptArtifact).toBe('agent_history_2.prompt.txt')
+      // The untouched run is still fully known to the service.
+      expect(service.getRun(root, 'agent_history_0').status).toBe('completed')
+    } finally { await service.shutdown('test cleanup') }
+  })
+
   test('a pending settings failure during recent-step refresh remains visible', async () => {
     const notices: string[] = []
     const control = controlledHandle()
@@ -1194,6 +1265,37 @@ describe('AgentService', () => {
     expect(run.status).toBe('cancelled')
     expect(starts).toBe(0)
     expect(shutdownComplete).toBe(true)
+  })
+
+  test('shutdown still closes chats when a run still opening its card fails', async () => {
+    let cardEntered!: () => void
+    let failCard!: () => void
+    const entered = new Promise<void>(resolve => { cardEntered = resolve })
+    const failed = new Promise<void>(resolve => { failCard = resolve })
+    const { service, root } = harness({
+      sendCard: async () => { cardEntered(); await failed; throw new Error('card rejected') },
+    })
+    const closed: string[] = []
+    service.presentation.closeChat = async chatId => { closed.push(chatId) }
+    const creating = service.startRun(root, { description: '关停期间开卡失败', identityIds: ['agent:a'], prompt: 'racing root' })
+    const creationError = creating.catch(error => error)
+    await entered
+    const stopping = service.shutdown('daemon shutdown')
+    failCard()
+    expect(String(await creationError)).toContain('card rejected')
+    await stopping
+    expect(closed).toEqual(['chat-1'])
+  })
+
+  test('card initialisation failure keeps the original error when the failure notice cannot be sent', async () => {
+    const { service, root } = harness({
+      sendCard: async () => { throw new Error('card rejected') },
+      sendTextRaw: async () => { throw new Error('notice rejected') },
+    })
+    try {
+      await expect(service.startRun(root, { description: '开卡失败', identityIds: ['agent:a'], prompt: 'fails' }))
+        .rejects.toThrow('card rejected')
+    } finally { await service.shutdown('test cleanup') }
   })
 
   test('invalidates a main-Agent follow-up whose card was opening during Session cancellation', async () => {

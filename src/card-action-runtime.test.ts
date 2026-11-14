@@ -14,6 +14,8 @@ import {
   type ActionCompletion,
 } from './card-action-runtime'
 import { drainDynamicWork, trackWork } from './inflight-work'
+import { agentRunElement } from './cards/agents'
+import type { AgentRunSnapshot } from './agent-run-types'
 import { modelActionCompletion, type ModelActionResult } from './session-util'
 
 describe('PerKeyActor', () => {
@@ -170,6 +172,23 @@ describe('card action identity', () => {
       .not.toBe(cardActionDedupeIdentity(pageOne).businessKey)
     // 翻页按钮属 repeatable:完成后不写语义墓碑,用户可连续翻阅
     expect(cardActionDedupeIdentity(pageOne).repeatable).toBe(true)
+  })
+
+  test('admits the project task stop button exactly as its card emits it', () => {
+    const card = agentRunElement({
+      runId: 'run_project', chatId: 'chat', status: 'running', description: '审查', prompt: '请审查',
+      owner: { kind: 'project', name: 'demo' }, workers: [], createdAt: new Date(0).toISOString(),
+    } as unknown as AgentRunSnapshot)
+    const values: Array<Record<string, unknown>> = []
+    JSON.stringify(card, (_key, node) => {
+      if (node && typeof node === 'object' && node.type === 'callback' && node.value) values.push(node.value)
+      return node
+    })
+    expect(values).toEqual([{ kind: 'agent_project_cancel', run_id: 'run_project' }])
+    // The daemon handles this kind; rejecting it at admission made the button a no-op.
+    expect(validateCardActionAdmission(data(values[0]!))).toBeNull()
+    expect(cardActionDedupeKey(data({ kind: 'agent_project_cancel', run_id: 'run_a' })))
+      .not.toBe(cardActionDedupeKey(data({ kind: 'agent_project_cancel', run_id: 'run_b' })))
   })
 
   test('uses event_id and semantic keys together', () => {

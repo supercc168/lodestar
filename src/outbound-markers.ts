@@ -1,4 +1,7 @@
-const SEND_MARKER_RE = /\[\[send:[ \t]*([^\n]*?)[ \t]*\]\]/g
+// The path is trimmed after matching. Optional-padding groups around the lazy capture
+// overlapped it, so an unterminated `[[send:` followed by blanks backtracked cubically
+// and stalled the event loop on every streamed delta.
+const SEND_MARKER_RE = /\[\[send:([^\n]*?)\]\]/g
 /** 只锚定 askusr 前缀；payload 用括号平衡扫描，避免选项文本里的 `]`/`]]`
  *  或模型少写一个闭合 `]`、多写一个 `}` 时整段匹配失败。 */
 const ASKUSR_OPEN_RE = /\[\[askusr:[ \t]*/g

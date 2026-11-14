@@ -2,7 +2,7 @@ import type { IncomingMessage, ServerResponse } from 'node:http'
 import type { Session } from './session'
 import { AgentRequestUncertainError, type AgentService, type AgentPrincipal, type AgentRequestSnapshot } from './agent-service'
 import { agentPrincipalContext } from './agent-context'
-import { getAgentIdentityCatalog, type AgentIdentityCatalog } from './agent-identities'
+import { getAgentSkillIdentityCatalog, type AgentIdentityCatalog } from './agent-identities'
 import {
   agentRunOwner,
   PROJECT_AGENT_INPUT_ERROR,
@@ -56,10 +56,10 @@ export async function handleAgentRequest(
   // Relay maintenance is allowed only from a session-bound Agent capability;
   // project workers must not mutate the daemon's global configuration.
   if (url.pathname.startsWith('/agents/relays/')) {
-    if (principal.kind !== 'session' && agentPrincipalContext(principal).owner.kind !== 'session') {
-      return send(403, { error: 'relay configuration requires a session-bound Agent capability' })
-    }
     try {
+      if (principal.kind !== 'session' && agentPrincipalContext(principal).owner.kind !== 'session') {
+        return send(403, { error: 'relay configuration requires a session-bound Agent capability' })
+      }
       if (req.method === 'POST' && url.pathname === '/agents/relays/test') {
         const input = parseRelayRequest(await readJsonBody(req))
         const tested = await testRelay(input.config)
@@ -86,7 +86,11 @@ export async function handleAgentRequest(
   }
 
   if (req.method === 'GET' && url.pathname === '/agents/identities') {
-    return send(200, serializeCatalog(getAgentIdentityCatalog(agentPrincipalContext(principal).codexAccountId)))
+    try {
+      return send(200, serializeCatalog(await getAgentSkillIdentityCatalog(agentPrincipalContext(principal).codexAccountId)))
+    } catch (error) {
+      return send(409, { error: messageOf(error) })
+    }
   }
   if (req.method === 'GET' && url.pathname === '/agents/project-binding') {
     try {

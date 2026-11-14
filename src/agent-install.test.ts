@@ -3,12 +3,12 @@
  * 全部注入假 spawn / 假 terminateWindows / platform,不触网、不真实安装、不依赖 Windows。
  */
 import { EventEmitter } from 'node:events'
-import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, symlinkSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { PassThrough } from 'node:stream'
 import { afterEach, expect, test } from 'bun:test'
-import { AgentInstallTerminationError, installAgentPackages, terminateWindowsInstaller } from './agent-install'
+import { AGENT_INSTALLER_RECORD, AgentInstallTerminationError, installAgentPackages, terminateWindowsInstaller } from './agent-install'
 
 const roots: string[] = []
 afterEach(() => { for (const root of roots.splice(0)) rmSync(root, { recursive: true, force: true }) })
@@ -153,4 +153,19 @@ test('a missing installation directory fails before npm starts', async () => {
   const h = installer()
   await expect(installAgentPackages(join(h.root, 'missing'), undefined, { spawn: h.spawn })).rejects.toThrow('ENOENT')
   expect(h.spawns()).toBe(0)
+})
+
+test('the running installer PID is recorded in its staging directory and removed only after success', async () => {
+  const h = installer()
+  const record = join(h.directory, AGENT_INSTALLER_RECORD)
+  const succeeded = installAgentPackages(h.directory, undefined, { spawn: h.spawn })
+  expect(JSON.parse(readFileSync(record, 'utf8'))).toEqual({ pid: 12345 })
+  h.child.emit('close', 0, null)
+  await succeeded
+  expect(existsSync(record)).toBe(false)
+  const failed = installAgentPackages(h.directory, undefined, { spawn: h.spawn })
+  h.child.emit('close', 1, null)
+  await expect(failed).rejects.toThrow('npm install exited code=1')
+  // The updater removes or preserves the whole directory; the record stays with it.
+  expect(JSON.parse(readFileSync(record, 'utf8'))).toEqual({ pid: 12345 })
 })

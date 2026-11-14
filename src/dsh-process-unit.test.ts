@@ -95,7 +95,14 @@ class SwitchableDshRuntime extends EventEmitter {
     return new actualDshRuntime.DshRuntime(options) as unknown as SwitchableDshRuntime
   }
 }
-mock.module('./dsh-runtime', () => ({ ...actualDshRuntime, DshRuntime: SwitchableDshRuntime }))
+mock.module('./dsh-runtime', () => ({
+  ...actualDshRuntime,
+  DshRuntime: SwitchableDshRuntime,
+  // mock 跨文件生效，后续测试文件需要拿回真实类；仅供测试读取。
+  __realDshRuntimeForTests: actualDshRuntime.DshRuntime,
+}))
+// mock.module 是进程级的：不还原会把替身类泄漏给后续测试文件（如 dsh-runtime.test.ts）。
+afterAll(() => mock.restore())
 
 // 带 query 的一次性副本:确保本文件拿到的是包装类,而不是其它测试文件先行
 // 加载时快照下来的真实 DshRuntime(类型经 import() 类型查询静态获得)。

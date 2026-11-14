@@ -53,7 +53,7 @@ jobs:
       - name: Set up minimum supported Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: 18.15.0
+          node-version: 22.19.0
       - name: Smoke-check Node.js bundles
         run: |
           node --check dist/lodestar.js
@@ -83,7 +83,8 @@ jobs:
   windows-agent-updates:
     name: Windows Agent update lifecycle
     runs-on: windows-latest
-    timeout-minutes: 20
+    # 正常约 2 分钟；卡住时尽早失败，不白等 20 分钟。
+    timeout-minutes: 10
     steps:
       - name: Check out repository
         uses: actions/checkout@v4

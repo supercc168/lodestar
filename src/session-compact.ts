@@ -74,6 +74,10 @@ function watchManualCompaction(proc: AgentProcess): ManualCompactionWatch {
     // 死等 context_compacted;proc exit/error 兜底 fail(onExit/onError 已注册)。
     // codex 手动压缩随之也无 timeout —— 死等 + proc exit 兜底,上游已接受的取舍。
   })
+  // The process can exit while the caller still awaits compactThread(); that failure is
+  // reported there, and this watch must not surface as an unhandled rejection, which
+  // would shut the daemon down.
+  promise.catch(() => {})
   // 大上下文压缩不设固定时限；等待完成通知，进程退出或报错时失败。
   proc.on('context_compacted', onCompacted)
   proc.once('exit', onExit)
@@ -195,6 +199,7 @@ export async function runCompactCommand(s: Session): Promise<void> {
   const watch = watchManualCompaction(proc)
   const usageWatch = watchManualCompactionUsage(proc, proc.sessionId)
   s.manualContextCompactionPending = true
+  s.manualContextCompactionCancelled = false
   try {
     s.setStatusCard(statusCard, s.withModel('🧠 发起上下文压缩'))
     await proc.compactThread()
@@ -207,6 +212,10 @@ export async function runCompactCommand(s: Session): Promise<void> {
     watch.cancel()
     if (e instanceof NothingToCompactError) {
       await finishStatus(s.withModel(`ⓘ ${e.message}`))
+    } else if (s.manualContextCompactionCancelled && /cancel|interrupt|abort|exited/i.test(messageOf(e))) {
+      // Only an outcome the cancellation produced is shown as cancelled; a backend that
+      // ignored the interrupt and then failed for another reason reports that reason.
+      await finishStatus('🛑 上下文压缩已取消')
     } else {
       await finishStatus(`❌ 上下文压缩失败: ${messageOf(e)}`)
     }

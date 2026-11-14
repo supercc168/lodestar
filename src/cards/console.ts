@@ -526,8 +526,7 @@ export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.conso
 }
 
 /** 统一额度渲染:从 tokenSource.readUsage() 的 UsageSnapshotUnified 渲染。
- * 取代 consoleUsageContent/consoleGlmUsageContent 二元 —— 加新 token source 的额度
- * 自动支持(只要它的 readUsage 返回 unified)。失败态按 no_fallbacks 显式 MISS。 */
+ * 加新 token source 的额度自动支持(只要它的 readUsage 返回 unified)。失败态按 no_fallbacks 显式 MISS。 */
 export function unifiedUsageSummary(snap: UsageSnapshotUnified | undefined): string {
   const label = snap?.kind === 'balance' ? '余额' : '额度'
   if (!snap) return `${label} 加载中…`

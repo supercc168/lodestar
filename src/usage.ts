@@ -23,7 +23,7 @@ import { EventEmitter } from 'node:events'
 import { StringDecoder } from 'node:string_decoder'
 import { createHash } from 'node:crypto'
 import { bindProcessCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT, liveCodexQuotaReaders } from './codex-accounts'
-import { UsageReadCache, UsageReadSupersededError, USAGE_FRESH_MS, isUsageAuthError, isUsageRateLimitError, type UsageReadOptions } from './usage-cache'
+import { UsageReadCache, UsageReadSupersededError, isUsageAuthError, isUsageRateLimitError, type UsageReadOptions } from './usage-cache'
 import { observeCodexAccountEmail } from './codex-account-info'
 import { parseCodexCredits, type CodexCredits } from './codex-credits'
 
@@ -578,7 +578,10 @@ async function fetchUsage(accountId: string): Promise<UsageSnapshot> {
  * 桶 map 整体替换(OpenAI 加/删桶自动跟上)。 */
 export function snapshotFromReadResponse(limitsRes: any, planType?: string | null, readStartedAt?: number): UsageSnapshot {
   const { buckets, defaultLimitId } = bucketsFromReadResponse(limitsRes)
-  const def = buckets.find(b => b.limitId === defaultLimitId) ?? buckets[0]
+  // Without a default pointer a single bucket is the main quota. Otherwise the main bucket
+  // must be the one the server names: an additional model bucket never stands in for it.
+  const def = buckets.find(b => b.limitId === defaultLimitId)
+    ?? (defaultLimitId === undefined && buckets.length === 1 ? buckets[0] : undefined)
   if (!def) return { state: 'network', reason: 'empty rate limit response' }
   const quotaPlanType = limitsRes?.rateLimits?.planType
   const subscriptionType = quotaPlanType ?? planType ?? undefined
@@ -610,11 +613,6 @@ export function peekUsage(accountId = DEFAULT_CODEX_ACCOUNT): UsageSnapshot | nu
 /** Last successful read for startup scheduling and footer displays. */
 export function peekSuccessfulUsage(accountId = DEFAULT_CODEX_ACCOUNT): Extract<UsageSnapshot, { state: 'ok' }> | null {
   return successfulCaches.get(accountId) ?? null
-}
-
-export function peekFreshUsage(accountId = DEFAULT_CODEX_ACCOUNT): Extract<UsageSnapshot, { state: 'ok' }> | null {
-  const snapshot = peekSuccessfulUsage(accountId)
-  return snapshot && Date.now() >= snapshot.fetchedAt && Date.now() - snapshot.fetchedAt < USAGE_FRESH_MS ? snapshot : null
 }
 
 /** Bind a closing footer to its account; login, deletion or quota reset invalidates the reader. */
@@ -744,13 +742,27 @@ export function invalidateCodexUsage(accountId: string): void {
   usageReads.invalidate(accountId)
 }
 
+/** The account's quota was just changed by a request of ours. Reads that began before it
+ * are superseded and their freshness and failure cooldown are dropped, so the next read
+ * is a real one. Unlike invalidation, the last successful snapshot stays: if that read
+ * fails, selection, `hi` and the activation scan still see the account's quota. */
+export function supersedeCodexUsageReads(accountId: string): void {
+  usageRevision++
+  usageGenerations.set(accountId, (usageGenerations.get(accountId) ?? 0) + 1)
+  usageReads.invalidate(accountId)
+}
+
 function requestCodexQuotaWithRetry<T>(request: () => Promise<T>): Promise<T> {
-  return requestCodexControlWithRetry(request, '额度查询', { retryRateLimits: false })
+  return requestCodexControlWithRetry(request, '额度查询')
+}
+
+/** Spacing between Codex control retries; tests replace `wait` to observe the delays without sleeping. */
+export const codexControlRetryTiming = {
+  wait: (ms: number): Promise<void> => new Promise(resolve => setTimeout(resolve, ms)),
 }
 
 /** 网络抖动重试同一个 Codex 控制请求；命中限流立即返回，不把限流继续打成重试风暴。 */
-export async function requestCodexControlWithRetry<T>(request: () => Promise<T>, operation = '额度查询',
-  _options: { retryRateLimits?: boolean } = {}): Promise<T> {
+export async function requestCodexControlWithRetry<T>(request: () => Promise<T>, operation = '额度查询'): Promise<T> {
   const delays = [1000, 4000]
   for (let attempt = 0; ; attempt++) {
     try { return await withTimeout(request(), API_TIMEOUT_MS) }
@@ -758,10 +770,10 @@ export async function requestCodexControlWithRetry<T>(request: () => Promise<T>,
       const message = error instanceof Error ? error.message : String(error)
       if (isUsageAuthError(error)) throw error
       if (isUsageRateLimitError(error)) throw error
-      const transient = /error sending request|timed? ?out|timeout|ECONNRESET|ETIMEDOUT|EAI_AGAIN|connection (?:reset|closed)|\b(?:429|502|503|504)\b/i.test(message)
+      const transient = /error sending request|timed? ?out|timeout|ECONNRESET|ETIMEDOUT|EAI_AGAIN|connection (?:reset|closed)|\b(?:502|503|504)\b/i.test(message)
       if (!transient) throw error
       if (attempt >= delays.length) throw new Error(`Codex ${operation}失败（已尝试 ${attempt + 1} 次）：${message}`, { cause: error })
-      await new Promise(resolve => setTimeout(resolve, delays[attempt]))
+      await codexControlRetryTiming.wait(delays[attempt])
     }
   }
 }

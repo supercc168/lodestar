@@ -1,8 +1,13 @@
-import { afterEach, describe, expect, test } from 'bun:test'
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs'
+import { afterEach, describe, expect, spyOn, test } from 'bun:test'
+import { mkdirSync, mkdtempSync, readdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { dshGatesOnConnectionChain, dshProviderPatches, profileProvidesAskUser } from './dsh-runtime'
+import * as dshRuntimeModule from './dsh-runtime'
+// dsh-process-unit 对 ./dsh-runtime 做了进程级 mock.module(替身类只在它构造时才开闸)，
+// 这里取它暴露的真实类，保持与生产代码同一原型、import.meta.url 不变。
+const { dshGatesOnConnectionChain, dshProviderPatches, profileProvidesAskUser } = dshRuntimeModule
+const DshRuntime = ((dshRuntimeModule as any).__realDshRuntimeForTests ?? dshRuntimeModule.DshRuntime) as typeof dshRuntimeModule.DshRuntime
+import * as logModule from './log'
 
 const roots: string[] = []
 function runtimeRoot(patch?: string): string {
@@ -83,5 +88,65 @@ describe('DSH provider patches across runtime generations', () => {
     expect(dshProviderPatches({ LODESTAR_DSH_PROVIDER: 'deepseek-official' }, {
       disableDeepseekChain: dshGatesOnConnectionChain(root),
     })).toEqual([])
+  })
+})
+
+describe('DSH launch directory', () => {
+  test('a launch that fails after the directory was created removes it and keeps the original error', () => {
+    const root = runtimeRoot()
+    const dsh = join(root, 'node_modules', '@deepseek-ai', 'dsh')
+    mkdirSync(dsh, { recursive: true })
+    writeFileSync(join(dsh, 'package.json'), '{"name":"@deepseek-ai/dsh","version":"test","bin":{"dsh":"bin.js"}}')
+    // The bridge directory cannot be created below a regular file.
+    writeFileSync(join(root, '.lodestar-bridges'), '')
+    const temp = join(root, 'tmp')
+    mkdirSync(temp)
+    const saved = { runtime: process.env.LODESTAR_TEST_AGENT_RUNTIME_ROOT, tmp: process.env.TMPDIR }
+    process.env.LODESTAR_TEST_AGENT_RUNTIME_ROOT = root
+    process.env.TMPDIR = temp
+    try {
+      expect(() => new DshRuntime({ cwd: root, env: {}, home: join(root, 'home') })).toThrow(/ENOTDIR|EEXIST/)
+      expect(readdirSync(temp)).toEqual([])
+    } finally {
+      for (const [key, value] of [['LODESTAR_TEST_AGENT_RUNTIME_ROOT', saved.runtime], ['TMPDIR', saved.tmp]] as const) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
+  })
+
+  test.skipIf(process.platform === 'win32')('a launch directory that cannot be removed on child close is logged, not thrown from the listener', async () => {
+    const root = runtimeRoot()
+    const dsh = join(root, 'node_modules', '@deepseek-ai', 'dsh')
+    mkdirSync(dsh, { recursive: true })
+    writeFileSync(join(dsh, 'package.json'), '{"name":"@deepseek-ai/dsh","version":"test","bin":{"dsh":"bin.js"}}')
+    const temp = join(root, 'tmp')
+    mkdirSync(temp)
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    const saved = { runtime: process.env.LODESTAR_TEST_AGENT_RUNTIME_ROOT, tmp: process.env.TMPDIR }
+    process.env.LODESTAR_TEST_AGENT_RUNTIME_ROOT = root
+    process.env.TMPDIR = temp
+    let launchDir = ''
+    try {
+      const runtime = new DshRuntime({ cwd: root, env: {}, home: join(root, 'home') })
+      launchDir = (runtime as any).launchDir
+      writeFileSync(join(launchDir, 'bridge.patch.yml'), '{}')
+      // 直接让清理失败：不依赖 chmod/umask 的跨文件环境，凡是删除失败都必须只记日志。
+      const failing = spyOn(runtime as any, 'removeLaunchDir').mockImplementation(() => {
+        throw new Error('launch directory is busy')
+      })
+      try {
+        // 触发真实的子进程 close 监听器；抛出的错误不得逃出事件回调。
+        expect(() => (runtime as any).child.emit('close', 1, null)).not.toThrow()
+        expect(logged).toHaveBeenCalledWith('dsh.launch_dir.cleanup_failed', expect.anything())
+      } finally { failing.mockRestore() }
+    } finally {
+      if (launchDir) rmSync(launchDir, { recursive: true, force: true })
+      logged.mockRestore()
+      for (const [key, value] of [['LODESTAR_TEST_AGENT_RUNTIME_ROOT', saved.runtime], ['TMPDIR', saved.tmp]] as const) {
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
   })
 })

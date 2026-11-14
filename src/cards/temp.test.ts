@@ -330,6 +330,46 @@ test('resumeSelectionResultCard:长摘要截断且缺失 id 显式显示 MISS', 
   expect(text).not.toContain('未知')
 })
 
+test('writeLogCard:entries 拼成代码块,空则占位', () => {
+  const full = writeLogCard({ projectName: 'p', entries: [{ tool: 'Write', path: '/a', body: 'x' }] }) as any
+  const codeEl = full.body.elements.find((e: any) => e.tag === 'markdown' && String(e.content).includes('```'))
+  expect(codeEl.content).toContain('/a  (Write)')
+  expect(codeEl.content).toContain('x')
+  expect(full.header.title.content).toContain('观察到的文件变更')
+  expect(JSON.stringify(full)).toContain('只回退对话历史，不会回滚磁盘文件')
+  expect(JSON.stringify(full)).toContain('Shell/MCP 等工具造成的副作用可能未被记录')
+
+  const empty = writeLogCard({ projectName: 'p', entries: [] }) as any
+  const emptyCode = empty.body.elements.find((e: any) => String(e.content ?? '').includes('```'))!
+  expect(emptyCode.content).toContain('未观察到 Write/Edit/FileChange 类文件变更')
+})
+
+test('writeLogCard:文件内容保持字面量，变更过多时按卡片大小上限截断并说明', () => {
+  const literal = writeLogCard({ projectName: 'p', entries: [
+    { tool: 'Write', path: '/p/README.md', body: '# T\n```bash\nnpm i\n```\n<at id=all></at> 正文 ![x](img_key)' },
+  ] }) as any
+  const content: string = literal.body.elements[1].content
+  // 内容里的围栏不能提前结束代码块，否则其后的 <at> 与图片会被当成卡片标记渲染。
+  expect(content.startsWith('````\n')).toBe(true)
+  expect(content.endsWith('\n````')).toBe(true)
+  expect(content).toContain('<at id=all></at> 正文 ![x](img_key)')
+
+  const many = Array.from({ length: 60 }, (_, i) => ({ tool: 'Edit', path: `/repo/src/file-${i}.ts`, body: '中文注释与代码 '.repeat(120) }))
+  const bounded = writeLogCard({ projectName: 'p', entries: many }) as any
+  expect(Buffer.byteLength(JSON.stringify(bounded))).toBeLessThan(30_000)
+  const shown = (bounded.body.elements[1].content.match(/\/repo\/src\/file-\d+\.ts/g) ?? []).length
+  expect(shown).toBeGreaterThan(0)
+  expect(shown).toBeLessThan(60)
+  expect(bounded.body.elements[1].content).toContain(`另有 ${60 - shown} 处文件变更超出卡片大小上限，未显示`)
+})
+
+test('writeLogCard:超长 body 截断', () => {
+  const long = 'x'.repeat(2000)
+  const card = writeLogCard({ projectName: 'p', entries: [{ tool: 'Write', path: '/a', body: long }] }) as any
+  const codeEl = card.body.elements.find((e: any) => String(e.content).includes('```'))!
+  expect(codeEl.content).toContain('…(截断)')
+})
+
 test('tempSessionNoticeCard：创建 / 就绪 / 加入用不同配色并标出群名', () => {
   const creating = tempSessionNoticeCard({
     chatName: '项目*修复登录',
