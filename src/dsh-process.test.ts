@@ -3,10 +3,16 @@ import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { pathToFileURL } from 'node:url'
-import { DshProcess } from './dsh-process'
-import type { DshSpawnOptions } from './dsh-process'
+import type { DshProcess as DshProcessType, DshSpawnOptions } from './dsh-process'
+// 真实实现用查询串导入:其他测试文件对 './dsh-process' 的 mock.module 是进程级的,
+// --randomize 打乱装载顺序后可能先注册,普通导入会拿到替身。查询串让 Bun 以独立
+// 模块 id 加载真实文件,不受替身注册表影响。
+const realDshSpecifier = './dsh-process.ts?real'
+const { DshProcess } = await import(realDshSpecifier) as { DshProcess: typeof DshProcessType }
 import type { ConversationLaunch } from './conversation'
-import { queryDshRuntime } from './dsh-runtime'
+// 同上:session.test.ts 也 mock 了 './dsh-runtime',查询走查询串导入拿真实实现。
+const realDshRuntimeSpecifier = './dsh-runtime.ts?real'
+const { queryDshRuntime } = await import(realDshRuntimeSpecifier) as typeof import('./dsh-runtime')
 import { sharedTokenSourceConfigs } from './token-source-accounts'
 import { tokenSourceFactories } from './token-source'
 import './token-source-dsh'
@@ -126,7 +132,7 @@ async function fixture(reply: (body: any, count: number, protocol: ModelProtocol
   return { dir, opts, requests, protocols, processFor, baseUrl: `http://127.0.0.1:${server.port}` }
 }
 
-function nextResult(proc: DshProcess): Promise<any> {
+function nextResult(proc: DshProcessType): Promise<any> {
   const promise = new Promise((resolve, reject) => {
     const onExit = () => { cleanup(); reject(new Error('DSH exited before result')) }
     const onResult = (result: any) => { cleanup(); resolve(result) }
@@ -391,7 +397,9 @@ describe('DSH native runtime through Lodestar bridge', () => {
     expect(JSON.stringify(f.requests[3].messages)).toContain('remember the blue lighthouse')
     expect(JSON.stringify(f.requests[3].messages)).not.toContain('continue the same conversation')
     let history: any[] = []
-    const historyDeadline = Date.now() + 5_000
+    // 全量随机化跑时本机同时在跑其他重用例:DSH 子进程落盘 session/list 可能慢于 5s,
+    // 放宽到 15s(仍是有限等待,失败仍是空列表)。
+    const historyDeadline = Date.now() + 15_000
     while (Date.now() < historyDeadline) {
       history = await queryDshRuntime(runtimeQuery, 'session/list', { cwd: f.dir })
       if (history.length >= 2) break
@@ -809,7 +817,7 @@ describe('DSH native runtime through Lodestar bridge', () => {
   }, 30_000)
 
   test('stages model changes for the next turn while retaining native delegation', async () => {
-    let proc!: DshProcess
+    let proc!: DshProcessType
     const f = await fixture(async (body, count, protocol) => {
       const names = requestToolNames(body, protocol)
       expect(names).toContain('subagent')

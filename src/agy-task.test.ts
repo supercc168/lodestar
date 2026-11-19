@@ -16,7 +16,8 @@ describe('agy git snapshots', () => {
 
     expect(snapshot.ok).toBe(true)
     expect(snapshot.statusShort).toContain('?? report.md')
-  })
+    // git 子进程在 --randomize 全量并发下偶尔超过默认 5s;这里只验快照语义。
+  }, 15_000)
 })
 
 function git(cwd: string, args: string[]): string {

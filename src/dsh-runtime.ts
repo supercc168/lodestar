@@ -186,12 +186,16 @@ export class DshRuntime extends EventEmitter {
   /** Publishes the bridge and patch into the launch directory and starts DSH. */
   private spawnChild(opts: DshRuntimeOptions, runtimeRoot: string, manifestPath: string, manifest: any,
     providerPatches: object[], home: string, mcp: object[]): ChildProcess {
-    const sourceMode = import.meta.url.endsWith('.ts')
+    // 去掉查询串再判定与解析:测试用 `?real` 之类后缀绕开进程级模块替身,
+    // 打包器也可能追加查询参数;源码/产物判定只认路径本身。
+    const moduleUrl = new URL(import.meta.url)
+    moduleUrl.search = ''
+    const sourceMode = moduleUrl.pathname.endsWith('.ts')
     const bridgeName = sourceMode ? 'dsh-bridge.ts' : 'dsh-bridge.js'
     // 桥接源码按 import.meta.url 相对路径读取(dev=src/*.ts,dist=打包后的 .js)。
-    const source = readFileSync(fileURLToPath(new URL(`./${bridgeName}`, import.meta.url)))
-    const protocol = sourceMode ? readFileSync(fileURLToPath(new URL('./dsh-protocol.ts', import.meta.url))) : Buffer.alloc(0)
-    const application = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', import.meta.url)), 'utf8'))
+    const source = readFileSync(fileURLToPath(new URL(`./${bridgeName}`, moduleUrl)))
+    const protocol = sourceMode ? readFileSync(fileURLToPath(new URL('./dsh-protocol.ts', moduleUrl))) : Buffer.alloc(0)
+    const application = JSON.parse(readFileSync(fileURLToPath(new URL('../package.json', moduleUrl)), 'utf8'))
     const identity = Buffer.from(JSON.stringify({ name: application.name, version: application.version, type: 'module', private: true }))
     const hash = createHash('sha256').update(source).update(protocol).update(identity).digest('hex').slice(0, 20)
     // Imports in the bridge must resolve against the same runtime as the DSH child.

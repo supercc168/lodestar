@@ -21,7 +21,10 @@ mock.module('node:child_process', () => {
   const actual = require('node:child_process') as typeof import('node:child_process')
   return {
     ...actual,
-    spawn: () => {
+    // 只顶替后端进程自身的 spawn:git 等外部命令交回真实实现,否则替身会随
+    // mock.module 的进程级作用域泄漏,毁掉其他文件的 git 用例(--randomize 顺序不定)。
+    spawn: (command: any, ...args: any[]) => {
+      if (String(command).includes('git')) return (actual.spawn as any)(command, ...args)
       const child = new EventEmitter() as any
       child.stdout = new PassThrough()
       child.stderr = new PassThrough()
