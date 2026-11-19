@@ -1,5 +1,18 @@
 # 发布
 
+> **本 fork（`supercc168/lodestar`）不发布 npm / GitHub Packages。**
+> 包名是 `@supercc168/lodestar`，npm 上并不存在；仓库也没有 `NPM_TOKEN`、
+> `GH_PACKAGES_TOKEN` secrets。`发布版本` 工作流已禁用，且它本身沿用上游身份
+> （校验 `@leviyuan/lodestar`、预检 `npm view @leviyuan/lodestar`），触发必失败。
+> 现在的口径：`main` + `vX.Y.Z` 标签只作版本标记；部署就是本机仓库（
+> `~/.local/npm-global/lib/node_modules/@supercc168/lodestar -> ~/lodestar`）
+> 上 `bun run build` 后重启 launchd 服务：
+> `launchctl kickstart -k gui/$(id -u)/com.supercc168.lodestar`。
+> 将来要恢复发布，再改工作流的包名校验与 GitHub Packages 预检、配好两个 token，
+> 然后 `gh workflow enable release.yml`。
+
+以下章节是**上游原始发布流程**，仅作将来恢复发布时的参考，本 fork 不执行。
+
 发布包由 GitHub Actions 的 `发布版本` 工作流（`.github/workflows/release.yml`）发布。本机没有仓库令牌，`secrets.NPM_TOKEN` 与 `secrets.GH_PACKAGES_TOKEN` 只存在于仓库 Secrets，因此**不要在本机执行 `npm publish`**，也不要为此改发布脚本。
 
 ## 步骤
