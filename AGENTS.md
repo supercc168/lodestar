@@ -55,7 +55,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - `agy <prompt>` 在当前 session 工作目录内独占运行 `agy --print`，用独立 Card Kit 卡片展示 prompt、状态、输出、仓库变更和“转 Codex”按钮；不要把它混入普通 Codex turn 卡片。
 - `task` 打开项目任务清单面板；启用后创建/绑定 `<project>[lodestar]` 飞书任务清单，daemon 内置 worker 会扫描 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成` 分组并驱动规划、执行、审核和本地合并。
 - 本地脚本可通过 `POST http://127.0.0.1:9876/notify` 发送 `{project, text, level}` 到绑定群。
-- 源码运行使用 `bun daemon.ts` 或 `bun run start`；`bun run build` 生成 Node.js 22.19+（22.x）或 24+ 的发布入口。
+- 源码运行使用 `bun daemon.ts` 或 `bun run start`；`bun run build` 生成 Node.js 22.19+（22.x）或 24+ 的发布入口，最后由 `scripts/obfuscate-dist.mjs` 对这些打包产物做轻度混淆（同版本结果可复现）。
 - `config.ts` 在 import 时同步读取配置，缺失时报错。首次安装的延迟导入只放在 `cli.ts`。
 - 配置默认位于 `~/.config/lodestar/config.toml`，状态位于 `~/.local/share/lodestar/`。新增持久状态通过 `src/paths.ts` 定义，遵循 XDG 和 Windows 路径约定。
 
@@ -74,6 +74,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 ## 模块边界
 
 - 一个群只有一个 Session 和一个当前主进程。Codex 使用 app-server JSON-RPC，Claude Code 及其第三方来源使用 Agent SDK streaming input，DSH 使用独立 Node 子进程和 Cordis stdio 桥接；不引入 tmux、JSONL 队列或旁路进程控制。
+- 单聊（p2p）不对应项目：不建 Session、不写状态、不启动任何东西，任何消息只回只读面板（`p2p-panel.ts`），没有按钮，操作都留在群里。全局总览（全部活跃项目、全部账号额度、主机）只在单聊面板，群里的 `hi` 只显示本项目的状态、模型、实际账号及其额度。细节见 `src/AGENTS.md`。
 - DSH 的 `deepseek-harness` 与 Claude 兼容的 `deepseek` 共用 DeepSeek 凭据和平台地址；`dsh-glm` 与 `glm` 共用 GLM Coding Plan 账号，前者通过原生 pi-ai 适配器接入。共享凭据只存一份，模型、effort 和可见性按 Agent 保留；旧配置冲突必须明确报错，任一 setup 入口均更新共享账号。运行时经更新器选择 latest，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。启动补丁按实际安装的 profile 判断是否已自带 ask-user 工具，避免重复注册；模型接入链需要的 credentials 服务保持启用，凭据仍只由环境变量注入。
 - Agent 运行时更新（`agent-updates.ts`）：
   - 按 `[runtime.agent_auto_update]` 的 `codex`、`claude`、`dsh` 三个独立开关每 6 小时更新对应 Agent，首次检查也在 6 小时后；三项默认关闭，各自防止重叠执行，失败互不阻塞。旧布尔总开关按原值兼容转换并提示迁移，不与新表混用。
@@ -107,13 +108,14 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
   - Codex 只展示接口实际返回的窗口，成功响应未返回短窗时不补造 5h、满额或重置时间；查询失败和已返回窗口缺值仍保留错误或 MISS。
   - 仅剩积分的账号排在有订阅余量的账号后，按积分余额降序。Plus 未返回短窗时按实际周额度评分，可参与 Ultra 自动选择，无需消费积分；返回短窗的 Plus 仍需本计量桶可用积分才能参与 Ultra，无积分排除、积分未知显示 MISS。有积分的 Pro 不受 Ultra 的 0.5 份周余量门槛限制。
   - 不据积分绕过模型权限或强制计费来源；`ordinaryUsageAllowed=false` 与 `rate_limit_reached` 仅表示套餐内额度不可用，有本计量桶积分时仍可选；工作区积分/用量限制、消费限制和真实请求耗尽仍有效。
-  - OpenRouter 用 `/credits` 查账户余额，以实际响应判断权限。中转站余额只来自可选 `balance_script`，同一站点的各 Agent 视图在 hi 合并为一个余额账号；未配置脚本时不适用，脚本失败显示 MISS。
+  - OpenRouter 用 `/credits` 查账户余额，以实际响应判断权限。中转站余额只来自可选 `balance_script`，同一站点的各 Agent 视图合并为一个余额账号（单聊面板只列一次）；未配置脚本时不适用，脚本失败显示 MISS。
 - Lodestar Agent 不支持调用 Claude 订阅，遵守 Claude 用户协议；中转站等第三方来源的 Claude 模型仍可调用。reclaude 运行在订阅登录上，与 Claude 订阅一样排除。身份目录与新建/续跑入口仅按来源 ID 与类型排除 Claude 订阅与 reclaude，不按模型名称或显示名限制。此限制只作用于 Lodestar Agent，不影响主会话的 Claude 订阅/reclaude 能力或原生委派工具。
 - `AgentService` 的委派进程与主会话共用启动入口。主 Agent、委派 Agent 和原生子 Agent 均可继续派工，不设置 Lodestar 委派层数上限，保留原生委派工具；独立服务/软件的项目调用不提供提问或回答接口，新建和续跑均须自主执行、验证直至完整完成目标，不能以索取输入、计划或部分工作结束；真实阻断和故障须如实报告；后续委派继承项目、对话 ID（`chat_id`）和交互约定，并纳入父任务的取消树。会话委派与 `--project` 项目调用都只返回结果和本地文件路径，由调用方处理交付；不注入主会话交付提示词，不执行结果中的交付标记，新建与续跑一致。具体生命周期约束见 `src/AGENTS.md`。
 - Agent 执行任务中的调用必须绑定会话，不得通过 `--project`、清除环境或借用项目凭据脱离会话；独立服务/软件调用必须显式 `--project`，每次在绑定对话 ID 下显示独立卡。对话 ID（`chat_id`）标识调用绑定对象；原生 `session_id` 是后端会话唯一 ID，与对话 ID 不同，`run_id` 仅标识一次调用。恢复限同一项目、同一对话 ID，允许会话/项目两种绑定之间续跑；未知归属、跨项目和跨对话 ID 均报错。会话委派与项目调用不设任务数量上限，但接单时有撞车锁：work_dir、所在 Unity 工程根或 `--evidence-dir` 与其他调用树的活跃 run 重叠时排队（`queued` + `queued_reason`），锁空出后按先后自动开跑；Claude 订阅 run 另有全局 / 每号并发上限（默认 4 / 2，`[agent]` 配置或环境变量覆盖，满额报 `CLAUDE_SUB_FULL`，见 `src/agent-admission.ts`）。上游限制与启动失败按实际错误报告。
 - `managed-skills.ts` 同源生成 Codex/Claude standalone Skill 和 Claude 本地插件。GLM/DeepSeek 通过插件加载 Skill，不为此重新引入 user settings 和凭据。
 - 同 provider/source 调用 `setModelSettings`；Claude 后续 turn 生效，Codex 持久设置在重启后生效。跨 provider/source 只在空闲时换进程，resume id 按 provider 隔离。
 - 保留 Claude 的原生 resume/fork、提问、project profile、MCP/Skill、主动压缩和 SDK 后台任务；保留 Codex 的权限、提问、plan/goal、compaction、usage 和 collab 事件。共享接口须表达后端差异。
+- Claude 原生安全分类器拦截（SDK `model_refusal_fallback` / `model_refusal_no_fallback`）必须在群里另发独立提醒卡，写明原模型、降级模型与类别，不能当未知事件丢弃；会话级降级后 footer 显示实际在答的模型，`md` 重选原模型必须真正切回。实现约束见 `src/AGENTS.md`。
 - `cardkit.ts` 独占生产卡的队列、sequence、TTL 重开、元素计数和写入失败状态。正文按完整 block 插入静态元素，footer 用 replace；模板和 Session 不直调 Card Kit HTTP。
 - `workspace.ts` 统一按实际工作目录（含软链接归一化）解析目录配置；BTW/FK 与来源共享目录，WT 是独立目录。项目工具/MCP 配置按目录共享；任务清单属于项目级，主群、所有 WT 及其 BTW/FK 临时群共用同一清单。模型/账号仅创建临时会话时继承快照，后续各会话独立。配置别名冲突必须报错。
 - `worktree.ts` 管理 `work/*` 分支和同级 `<project>[name]` 工作区。飞书任务清单按主项目名绑定，所有 worktree 共用；只提供绑定与删除，不启动自动规划、执行、审核或合并 worker。
@@ -124,7 +126,9 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
   - 云空间卡只列本轮云空间文件，管理按钮打开本群全部历史云空间交付文件的原生飞书目录；交付发起人获 full_access、群获 view，不转移所有权或开放公网分享。超过 20 MB 分片上传，限额由上游判断，失败不自动切换通道。
   - 原附件/图片通道保留，旧聊天附件不删除、不自动迁移。记录由 `paths.ts` 定义，远端文件不自动清理，模板不读取文件。
 - Codex 生图超过 30 MB 时自动转云空间交付；其余图片与提示词默认放在同一个折叠面板，提示词包含完成事件补回的内容，不在折叠标题中展开。图片成功嵌入后不再单发；无法嵌入时按用户要求单独发图。关闭或换卡前等待所属图片上传和写入完成。
-- `hi` 展示全部已配置账号，一账号一行；DeepSeek、GLM 不按 Agent 重复展示。Codex 只显示主额度，不显示 Spark/gpt-reserve；Codex 账号可用的重置卡次数来自 `account/rateLimits/read` 的 `rateLimitResetCredits.availableCount`，简写为“重置”，这不是飞书换卡计数，也不加入回复 footer。GLM 月工具只显示百分比，无底部说明。
+- 单聊面板的账号额度展示全部已配置账号，一账号一块（首行账号名，每个窗口一行，如 `5h　▰▰▱▱▱▱ 34%　4.1h 后重置`）；DeepSeek、GLM 不按 Agent 重复展示。群里 `hi` 只显示本项目进程实际使用的那一个账号的额度。Codex 只显示主额度，不显示 Spark/gpt-reserve；Codex 账号可用的重置卡次数来自 `account/rateLimits/read` 的 `rateLimitResetCredits.availableCount`，写作 `重置卡 N`，这不是飞书换卡计数，也不加入回复 footer。GLM 月工具只显示百分比，无底部说明。
+- Claude 订阅账号的额度明细显示到登录最早可能结束的剩余时间（`凭据剩余 23.2d`；单聊面板跟在账号名后，群里 `hi` 为额度面板首行），只来自原生 `claude auth status --json` 的 `loginExpiresAt`，不读取钥匙串、凭据文件或令牌，也不改用其他来源；按原生口径取最晚到期前 3 天为最早结束，倒计时格式同距重置，显示不超过 7.0d 橙色，显示为小时或分钟（`凭据剩余 21.6h`）或已过最早结束（`凭据可能已到期`）红色；缺失或原生输出无法识别为 `凭据 MISS`，额度查询失败时不显示，不加入回复 footer。实现约束见 `src/AGENTS.md`。
+- 群里 `hi` 的状态行、单聊面板的活跃项目与 `bl` 在会话状态后追加仍在运行的子 Agent 与后台进程数，写法同运行任务卡预览（`空闲 · 子Agent2·后台1`，0 省略），使主线程空闲但后台仍在工作的会话不再只显示「空闲」；后台进程优先取后端实时集合（Claude SDK 电平、Codex 后台终端），读取失败显示 `后台MISS`，不当作 0。实现约束见 `src/AGENTS.md`。
 - `codex-reset [备注]` 显式使用一次账号重置卡；省略备注只取当前运行账号，账号未知时要求指定。调用原生 `account/rateLimitResetCredit/consume`，同一消息及其网络重试复用幂等标识；按四种原生 outcome 展示结果，之后重新读额度，不能推算卡数或掩盖已扣卡后的刷新/关闭失败。
 
 ## 运行中的 daemon
@@ -146,7 +150,8 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - 共享 Session、Card Kit、飞书协议和持久状态变更最终跑全量测试。双后端接口变更覆盖 Codex、Claude、provider/source 切换和共享卡片。
 - CI 的 Windows 任务（`.github/workflows/ci.yml` 中列出的测试文件）里，不要用 `expect(promise).rejects` / `.resolves` 去等一个已经挂在定时器上的 promise：Windows 上 Bun 会在其中满 CPU 空转、定时器不再触发，测试进程卡到任务超时，也不会报单个用例超时。先 `await promise.then(() => undefined, error => error)` 取结果再断言。
 - 真实飞书、Agent 登录、Card action、建群/解散和 worktree smoke 需要明确目标群、账号及副作用；涉及 live daemon 仍按上节授权。
-- `mathjax-full` 随包附带修复后的传递依赖。发布前实际安装 tarball 并运行 `npm audit --omit=dev`，不能只检查源码目录的 overrides 和 Bun 锁文件。
+- 发布前通过 `bun test` 与 `bun run build`。未指定 minor/major 时只升 patch；同一版本发布 npm 和 GitHub Packages，推送 `main` 和 tag，创建 GitHub Release。发布只经 GitHub Actions 的 `发布版本` 工作流（本机无仓库令牌，不要本地 `npm publish`），完整步骤与常见坑见 `docs/release.md`。
+- `mathjax-full` 随包附带修复后的传递依赖。发布前实际安装 tarball 并运行 `npm audit --omit=dev`，不能只检查源码目录的 overrides 和 Bun 锁文件。Agent 运行目录审计只允许经用户同意、带到期日、上游确无修复版本的单条临时豁免（`scripts/agent-audit.ts`，规则见 `docs/release.md`），不得放宽为整类或整个 Agent 跳过审计。
 - Agent 包仅为开发和类型测试依赖，发布运行时由自动更新器安装。DSH 根据每次获取的 latest 递归解析同版本包族，安装快照中的精确版本用于避免包族混装，不构成兼容限制。普通安全依赖用 `bun scripts/sync-security-deps.ts` 同步，Agent 运行目录也应用这些安全修复。tarball 验收实际安装 Agent 并查询原生目录，不断言其版本等于 Lodestar 构建时版本。
 
 <!-- MANUAL: Add manually maintained notes below this line. -->

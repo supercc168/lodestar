@@ -61,6 +61,7 @@ interface TempPeer {
   provider: 'claude' | 'codex' | 'dsh'
   model: string | null
   effort: string | null
+  workload?: { background: number | null; subagents: number } | null
 }
 
 interface TempHarnessState {
@@ -582,6 +583,24 @@ describe('session-temp Codex btw/fork(上游 ff44afb)', () => {
     expect(text).toContain('创建 MISS')
     expect(text).toContain('默认模型')
     expect(text).toContain('🟢 空闲')
+  })
+
+  test('空闲但仍有后台工作的临时会话，在状态后列出子 Agent 与后台进程数', async () => {
+    const h = makeHarness()
+    h.state.peers.push({
+      sessionName: 'project*后台',
+      chatId: 'oc_background',
+      status: 'idle',
+      running: true,
+      provider: 'claude',
+      model: null,
+      effort: null,
+      workload: { background: 1, subagents: 2 },
+    })
+
+    expect(await runCommand(h.session, 'bl', 'ou_owner')).toBe(true)
+
+    expect(cardJson(sentCards.at(-1))).toContain('🟢 空闲 · 子Agent2·后台1')
   })
 
   test('bl 卡片发送失败时回退原文并保留飞书诊断', async () => {

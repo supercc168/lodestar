@@ -5,6 +5,7 @@ import { homedir, tmpdir } from 'node:os'
 import { spawn } from 'node:child_process'
 import { spawn as crossSpawn } from 'cross-spawn'
 import { delimiter, join, posix, win32 } from 'node:path'
+import { buildClaudeSpawnPath } from './claude-spawn-path'
 import { EventEmitter } from 'node:events'
 import { randomUUID } from 'node:crypto'
 import {
@@ -37,6 +38,7 @@ import {
   type AgentReasoningEffort,
   type ClaudeReasoningEffort,
   type UserTextDispatch,
+  type ModelRefusalNotice,
 } from './agent-process'
 import {
   CLAUDE_MODEL_ALIAS_KEYS,
@@ -56,6 +58,7 @@ import type {
 } from './codex-process'
 import { usageFromTokenUsagePayload } from './codex-usage'
 import { ToolFailureLoopGuard } from './tool-failure-loop'
+import { bgTaskTypeOf } from './cards/background'
 import { observeContextWindow } from './context-window-observe'
 import { acquireClaudeSessionLease, type ClaudeSessionLease } from './claude-session-lease'
 import { LauncherDiagnostics, spawnThroughLauncher, type ClaudeLauncher } from './claude-launcher'
@@ -371,17 +374,7 @@ export function resolveClaudeExecutableConfig(lookup: ClaudePathLookup = {}): Cl
   return { description: 'sdk-default' }
 }
 
-export function buildClaudeSpawnPath(): string {
-  if (process.platform === 'win32') return process.env.PATH ?? ''
-  const entries = [
-    join(homedir(), '.local', 'npm-global', 'bin'),
-    join(homedir(), '.local', 'bin'),
-    join(homedir(), '.bun', 'bin'),
-    ...(process.env.PATH ?? '').split(delimiter),
-    '/usr/local/bin', '/usr/bin', '/bin',
-  ]
-  return [...new Set(entries.filter(Boolean))].join(delimiter)
-}
+export { buildClaudeSpawnPath }
 
 
 function usageFromSdk(raw: any): CodexUsage | null {
@@ -1021,10 +1014,16 @@ export class ClaudeAgentProcess extends EventEmitter {
   } satisfies Partial<Record<HookEvent, HookCallbackMatcher[]>>
   private readonly launcherDiagnostics = new LauncherDiagnostics()
 
+  /** Latest SDK `background_tasks_changed` level: every live background task,
+   * replaced as a whole on each change. The level is per process and nothing is
+   * sent at startup, so null means no level yet; `invalid` is an unreadable payload. */
+  private backgroundTaskLevel: Array<{ subagent: boolean; ambient: boolean }> | 'invalid' | null = null
+
   sessionId: string | null = null
   lastAssistantUuid: string | null = null
   lastModel: string | null = null
   lastEffort: ClaudeReasoningEffort | null = null
+  refusalFallback: { originalModel: string | null; fallbackModel: string } | null = null
   lastThinkingTokens: number | null = null
   lastUsage: CodexUsage | null = null
   lastTotalUsage: CodexUsage | null = null
@@ -1044,6 +1043,11 @@ export class ClaudeAgentProcess extends EventEmitter {
     this.lastEffort = opts.effort
     this.lastModel = opts.model ? claudeModelKey(opts.model) : null
     this.tokenSourceId = opts.tokenSourceId ?? null
+  }
+
+  /** Known at launch, unlike `sessionId`, which arrives with the first native message. */
+  get resumedSessionId(): string | null {
+    return this.opts.resumeSessionId && !this.opts.forkSession ? this.opts.resumeSessionId : null
   }
 
   sendInitialize(): void {
@@ -1436,6 +1440,8 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
     this.opts.model = model
     this.lastModel = claudeModel ? claudeModelKey(model) : 'claude:default'
+    // 显式设置模型后原生会话不再停在安全拦截换上的降级模型。
+    this.refusalFallback = null
     this.lastEffort = null
     try {
       await this.query.applyFlagSettings({ effortLevel: effort === 'default' ? null : effort, ultracode: null })
@@ -1444,6 +1450,28 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
     this.opts.effort = effort
     this.lastEffort = effort
+  }
+
+  /** Live background processes for hi/bl: the SDK level minus subagents and
+   * `ambient` housekeeping tasks, which the SDK says activity indicators exclude.
+   * Undefined until the CLI has sent a level. */
+  async backgroundProcessCount(): Promise<number | undefined> {
+    const level = this.backgroundTaskLevel
+    if (level === 'invalid') throw new Error('Claude 后台任务列表无法识别')
+    return level?.filter(task => !task.subagent && !task.ambient).length
+  }
+
+  private recordBackgroundTaskLevel(tasks: unknown): void {
+    const entries = Array.isArray(tasks) ? tasks : null
+    if (!entries?.every(task => typeof task?.task_id === 'string' && typeof task.task_type === 'string')) {
+      this.backgroundTaskLevel = 'invalid'
+      logDiagnostic('claude-agent-process: malformed background task level')
+      return
+    }
+    this.backgroundTaskLevel = entries.map(task => ({
+      subagent: bgTaskTypeOf(task.task_type, typeof task.subagent_type === 'string' ? task.subagent_type : undefined) === 'subagent',
+      ambient: task.ambient === true,
+    }))
   }
 
   async compactThread(): Promise<void> {
@@ -1712,9 +1740,45 @@ export class ClaudeAgentProcess extends EventEmitter {
   private handleSystemMessage(raw: any): void {
     switch (raw.subtype) {
       case 'background_tasks_changed':
+        this.recordBackgroundTaskLevel(raw.tasks)
+        return
       case 'vcs_state_changed':
       case 'hook_started':
       case 'hook_response':
+      // 原生横幅文字（如“安全分类器拦下了上面的回复，带着说明再试一次”）；结论性的
+      // 降级 / 未降级由下面的 model_refusal_* 事件给出。
+      case 'informational':
+        return
+      case 'model_refusal_fallback':
+        // SDK 仅 emit direction='retry';revert/sticky 是 legacy,防御性跳过避免噪音。
+        if (typeof raw.direction === 'string' && raw.direction !== 'retry') return
+        this.handleModelRefusal(raw)
+        // 本地原始事件(卡/turn 侧消费)与上游归一化 `model_refusal` 并存。
+        this.emit('model_refusal_fallback', {
+          trigger: 'refusal',
+          direction: typeof raw.direction === 'string' ? raw.direction : 'retry',
+          original_model: String(raw.original_model ?? ''),
+          fallback_model: String(raw.fallback_model ?? ''),
+          scope: raw.scope === 'local' ? 'local' : 'session',
+          request_id: raw.request_id ?? null,
+          api_refusal_category: raw.api_refusal_category,
+          api_refusal_explanation: raw.api_refusal_explanation,
+          content: String(raw.content ?? ''),
+          uuid: String(raw.uuid ?? ''),
+          session_id: String(raw.session_id ?? ''),
+        } satisfies ModelRefusalFallbackEvent)
+        return
+      case 'model_refusal_no_fallback':
+        this.handleModelRefusal(raw)
+        this.emit('model_refusal_no_fallback', {
+          original_model: String(raw.original_model ?? ''),
+          request_id: raw.request_id ?? null,
+          api_refusal_category: raw.api_refusal_category,
+          api_refusal_explanation: raw.api_refusal_explanation,
+          content: String(raw.content ?? ''),
+          uuid: String(raw.uuid ?? ''),
+          session_id: String(raw.session_id ?? ''),
+        } satisfies ModelRefusalNoFallbackEvent)
         return
       case 'init':
         if (this.opts.forkSession && raw.session_id === this.nativeSessionId) this.sessionLease?.releaseSource()
@@ -1761,40 +1825,6 @@ export class ClaudeAgentProcess extends EventEmitter {
         return
       case 'permission_denied':
         logDiagnostic('claude-agent-process: permission denied')
-        return
-      case 'local_command_output':
-        if (typeof raw.content === 'string') this.emit('local_command_output', { text: raw.content })
-        return
-      // ── 模型拒绝 / 降级(SDK system/model_refusal_*)──────────────────
-      // 之前落 default 静默丢,模型拒答后用户在飞书卡上看不到任何降级信号。
-      case 'model_refusal_fallback': {
-        // SDK 仅 emit direction='retry';revert/sticky 是 legacy,防御性跳过避免噪音。
-        if (typeof raw.direction === 'string' && raw.direction !== 'retry' && raw.direction !== undefined) return
-        this.emit('model_refusal_fallback', {
-          trigger: 'refusal',
-          direction: typeof raw.direction === 'string' ? raw.direction : 'retry',
-          original_model: String(raw.original_model ?? ''),
-          fallback_model: String(raw.fallback_model ?? ''),
-          scope: raw.scope === 'local' ? 'local' : 'session',
-          request_id: raw.request_id ?? null,
-          api_refusal_category: raw.api_refusal_category,
-          api_refusal_explanation: raw.api_refusal_explanation,
-          content: String(raw.content ?? ''),
-          uuid: String(raw.uuid ?? ''),
-          session_id: String(raw.session_id ?? ''),
-        } satisfies ModelRefusalFallbackEvent)
-        return
-      }
-      case 'model_refusal_no_fallback':
-        this.emit('model_refusal_no_fallback', {
-          original_model: String(raw.original_model ?? ''),
-          request_id: raw.request_id ?? null,
-          api_refusal_category: raw.api_refusal_category,
-          api_refusal_explanation: raw.api_refusal_explanation,
-          content: String(raw.content ?? ''),
-          uuid: String(raw.uuid ?? ''),
-          session_id: String(raw.session_id ?? ''),
-        } satisfies ModelRefusalNoFallbackEvent)
         return
       case 'local_command_output':
         if (typeof raw.content === 'string') this.emit('local_command_output', { text: raw.content })
@@ -1855,6 +1885,35 @@ export class ClaudeAgentProcess extends EventEmitter {
     }
   }
 
+  /** SDK `model_refusal_fallback` / `model_refusal_no_fallback`：原生安全分类器拦截了
+   * 一次回复。`scope` 缺省按旧版 CLI 的会话级处理；会话级降级把 `lastModel` 改成
+   * 降级模型，直到重新设置模型（`setModelSettings`）才回到原模型。 */
+  private handleModelRefusal(raw: any): void {
+    const text = (value: unknown): string | null => typeof value === 'string' && value.trim() ? value.trim() : null
+    const fallback = raw.subtype === 'model_refusal_fallback'
+    const notice: ModelRefusalNotice = {
+      kind: fallback ? 'fallback' : 'no_fallback',
+      scope: raw.scope === 'local' ? 'local' : 'session',
+      originalModel: text(raw.original_model),
+      fallbackModel: fallback ? text(raw.fallback_model) : null,
+      category: text(raw.api_refusal_category),
+      explanation: text(raw.api_refusal_explanation),
+      uuid: text(raw.uuid),
+      retracted: Array.isArray(raw.retracted_message_uuids)
+        ? raw.retracted_message_uuids.filter((id: unknown): id is string => typeof id === 'string' && !!id)
+        : [],
+    }
+    if (!notice.originalModel || fallback && !notice.fallbackModel) {
+      logDiagnostic('claude-agent-process: malformed model refusal')
+    }
+    if (fallback && notice.scope === 'session' && notice.fallbackModel) {
+      this.refusalFallback = { originalModel: notice.originalModel, fallbackModel: notice.fallbackModel }
+      this.lastModel = claudeModelKey(notice.fallbackModel)
+    }
+    logDiagnostic(fallback ? 'claude-agent-process: model refusal fallback' : 'claude-agent-process: model refusal without fallback')
+    this.emit('model_refusal', notice)
+  }
+
   private handleAssistantMessage(raw: any): void {
     this.confirmSteeringInputs(raw)
     if (!raw.parent_tool_use_id) this.lastThinkingTokens = null
@@ -1866,7 +1925,13 @@ export class ClaudeAgentProcess extends EventEmitter {
     // 消息送进主 query() stream。只有主线程 UUID 才是本会话可 fork 的
     // checkpoint；子 Agent UUID 属于另一份 transcript，不能污染 rs/fk 锚点。
     if (!parentToolUseId && typeof raw.uuid === 'string') this.lastAssistantUuid = raw.uuid
-    if (typeof message?.model === 'string' && message.model) this.lastModel = claudeModelKey(message.model)
+    // footer/hi 显示主 Agent 实际在用的模型：子 Agent 的回复可能来自别的模型，
+    // 本地命令输出等占位消息的 model 是 `<synthetic>`，都不能顶掉它。
+    if (!parentToolUseId && typeof message?.model === 'string' && message.model && message.model !== '<synthetic>') {
+      this.lastModel = claudeModelKey(message.model)
+      // 原生自己回到了原模型（主线程回复又来自它），降级状态随之结束。
+      if (this.refusalFallback && message.model === this.refusalFallback.originalModel) this.refusalFallback = null
+    }
     const content = Array.isArray(message?.content) ? message.content : []
     if (!parentToolUseId && typeof raw.local_command_source === 'string') {
       this.emit('local_command_output', {

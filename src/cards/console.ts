@@ -10,19 +10,35 @@ import type { UsageSnapshot } from '../usage'
 import type { GlmUsageSnapshot } from '../glm-usage'
 import type { ClaudeProviderUsageSnapshot } from '../claude-provider-usage'
 import type { UsageSnapshotUnified, TokenSourceModelCatalogState } from '../token-source'
-import { usageSourceForAgent, type AgentProvider, type AgentUsageSource } from '../agent-process'
+import type { AgentProvider, AgentUsageSource } from '../agent-process'
 import { ELEMENTS } from './elements'
 import { formatDuration } from './duration'
-import { codexCreditsSummary, fmtResetIn } from './usage'
+import { codexCreditsSummary, fmtCountdown, fmtResetIn } from './usage'
 import type { AccountUsage } from '../account-usage'
-import { accountUsageRow, compactAccountUsage } from './account-usage'
+import { accountUsageLines, escapeInlineMarkdown } from './account-usage'
+import { sessionWorkloadLabel, type SessionWorkload } from './task-kind'
 
 export { fmtResetIn } from './usage'
 
+export type ConsoleStatus = 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
+
+/** 单聊面板的一个运行中会话（`Session.peerSnapshot()` 加上后台计数）。 */
+export interface ConsolePeer {
+  name: string
+  status: ConsoleStatus
+  uptimeMs?: number
+  /** Actual live Codex process account, independent of the next-start selection. */
+  codexAccountName?: string
+  claudeAccountName?: string
+  /** Background processes and subagents still running beside the main turn. */
+  workload?: SessionWorkload
+}
+
+/** 群里 `hi` 只看本项目：状态、Agent 与模型、本群进程实际使用的账号及其额度。
+ * 全部项目、主机与全部账号额度只在单聊面板（`p2p.ts`）。 */
 export interface ConsoleOpts {
-  accountUsages?: AccountUsage[]
   sessionName: string
-  status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
+  status: ConsoleStatus
   provider?: AgentProvider
   model?: string
   effort?: string
@@ -30,33 +46,12 @@ export interface ConsoleOpts {
    * Claude login/relay models from the GLM Coding Plan route. */
   usageSource?: AgentUsageSource
   worktreeInstructionNotice?: string | null
-  /** All sessions currently running across every Feishu group
-   * this daemon owns. Each entry is a sibling project. Empty/undefined
-   * → 渲染 `_无_`。The session matching this card's chat is
-   * flagged `isCurrent` so the row can be marked. */
-  peers?: Array<{
-    name: string
-    isCurrent: boolean
-    status: 'idle' | 'working' | 'awaiting_permission' | 'starting' | 'stopped'
-    uptimeMs?: number
-    /** Actual live Codex process account, independent of the next-start selection. */
-    codexAccountName?: string
-    claudeAccountName?: string
-  }>
-  /** Subscription usage snapshot from Codex app-server. Undefined → omit row.
-   * 仅 codex 后端渲染;claude/GLM 后端走 glmUsage。 */
-  usage?: UsageSnapshot
-  /** GLM Coding Plan 用量快照(claude/GLM 后端)。Undefined → loading 占位。
-   * 仅 claude 后端渲染;codex 后端走 usage。按 provider 二选一(方案 C)。 */
-  glmUsage?: GlmUsageSnapshot
-  /** Claude 第三方渠道余额(Grok 无痕 / CatCodex)。Undefined → loading。 */
-  providerUsage?: ClaudeProviderUsageSnapshot
-  /** 统一用量快照(来自 tokenSource.readUsage)。设了优先用它(取代 usage/glmUsage 二元)。
-   * 加新 token source 的额度自动支持 —— 只要 source.readUsage 返回 unified。 */
-  unifiedUsage?: UsageSnapshotUnified
-  /** Host snapshot: CPU 负载、内存、AI-managed systemd / launchd 服务。
-   * undefined 或字段缺失时明确渲染 MISS,不假数据。 */
-  sysinfo?: SysInfo
+  /** 本进程已运行的时长；未运行时缺省。 */
+  uptimeMs?: number
+  /** 主线程之外仍在运行的子 Agent 与后台进程。 */
+  workload?: SessionWorkload
+  /** 本群进程实际使用的账号及其额度缓存。缺省表示尚未读取（加载中）；null 表示未启动或账号尚未选定。 */
+  account?: AccountUsage | null
 }
 
 interface StatusCardOpts {
@@ -158,28 +153,37 @@ function fmtTokens(n: number): string {
   return (n / 1_000_000).toFixed(2).replace(/\.?0+$/, '') + 'M'
 }
 
-function fmtUptime(ms: number): string {
-  if (ms < 60_000) return `${Math.round(ms / 1000)}s`
-  const totalMin = Math.floor(ms / 60_000)
-  if (totalMin < 60) return `${totalMin}m`
-  const h = Math.floor(totalMin / 60)
-  const m = totalMin % 60
-  if (h < 24) return `${h}h ${m}m`
-  const d = Math.floor(h / 24)
-  return `${d}d ${h % 24}h`
+/** hi 与单聊面板里的时长与额度倒计时同一写法：不足 1 分钟按秒，其余同 fmtCountdown（40m、2.1h、3.0d）。 */
+export function fmtUptime(ms: number): string {
+  return ms < 60_000 ? `${Math.floor(ms / 1000)}s` : fmtCountdown(ms)
 }
 
-const PEER_STATUS_EMOJI: Record<string, string> = {
-  idle: '🟢', working: '⚙️', awaiting_permission: '🔐',
-  starting: '🚀', stopped: '⚪',
+/** 会话状态的圆点与文字，与 `bl` 相同。 */
+export const SESSION_STATUS: Readonly<Record<ConsoleStatus, { emoji: string; label: string }>> = {
+  idle: { emoji: '🟢', label: '空闲' },
+  working: { emoji: '⚙️', label: '工作中' },
+  awaiting_permission: { emoji: '🔐', label: '等审批' },
+  starting: { emoji: '🚀', label: '启动中' },
+  stopped: { emoji: '⚪', label: '未运行' },
 }
 
-const PEER_STATUS_LABEL: Record<string, string> = {
-  idle: '闲',
-  working: '工作中',
-  awaiting_permission: '等审批',
-  starting: '启动中',
-  stopped: '未运行',
+function knownStatus(status: ConsoleStatus): { emoji: string; label: string } | undefined {
+  return Object.hasOwn(SESSION_STATUS, status) ? SESSION_STATUS[status] : undefined
+}
+
+export function sessionStatusEmoji(status: ConsoleStatus): string {
+  return knownStatus(status)?.emoji ?? '·'
+}
+
+/** 会话状态文字；等审批要人处理，标橙。 */
+export function sessionStatusLabel(status: ConsoleStatus): string {
+  const label = knownStatus(status)?.label ?? status
+  return status === 'awaiting_permission' ? `<font color='orange'>${label}</font>` : label
+}
+
+/** 会话状态：圆点加文字。 */
+export function sessionStatusText(status: ConsoleStatus): string {
+  return `${sessionStatusEmoji(status)} ${sessionStatusLabel(status)}`
 }
 
 /** Render the subscription-usage section of the console card. Pulled out
@@ -386,12 +390,21 @@ const SERVICE_STATUS_EMOJI: Record<string, string> = {
   inactive: '⚪', deactivating: '🟡', failed: '❌',
 }
 
-/** Host snapshot panel body: 负载、内存、服务列表。 */
+/** 已挂的服务数；服务列表读取失败时为 0（该错误另在主机面板里写出）。 */
+export function failedServiceCount(sysinfo?: SysInfo): number {
+  return sysinfo && !sysinfo.servicesError ? sysinfo.services.filter(service => service.active === 'failed').length : 0
+}
+
+/** 主机面板默认折叠：标题用文字写出负载、内存和服务数，有服务挂掉时直接写出数量，不必展开。 */
 function hostSummary(sysinfo?: SysInfo): string[] {
   const parts: string[] = []
-  if (sysinfo?.cpu) parts.push(`L${sysinfo.cpu.load1.toFixed(2)}`)
-  if (sysinfo?.mem) parts.push(`M${sysinfo.mem.percent}%`)
-  if (sysinfo && !sysinfo.servicesError) parts.push(`S${sysinfo.services.length}`)
+  if (sysinfo?.cpu) parts.push(`负载 ${sysinfo.cpu.load1.toFixed(2)}`)
+  if (sysinfo?.mem) parts.push(`内存 ${sysinfo.mem.percent}%`)
+  if (sysinfo && !sysinfo.servicesError) {
+    parts.push(`服务 ${sysinfo.services.length}`)
+    const failed = failedServiceCount(sysinfo)
+    if (failed) parts.push(`${SERVICE_STATUS_EMOJI.failed} 失败 ${failed}`)
+  }
   return parts
 }
 
@@ -428,10 +441,15 @@ export function consoleHostContent(sysinfo?: SysInfo): string {
       const dot = SERVICE_STATUS_EMOJI[s.active] ?? '·'
       const lastActive = s.lastActiveAgoSec
       const stateAge = s.stateAgoSec
-      const parts: string[] = [s.active]
+      // 运行、停止、失败已由圆点和「已运行 / 已停 / 已挂」表达，不再重复英文状态；其余状态照写。
+      const parts: string[] = []
       if (s.active === 'active') {
         if (stateAge != null) parts.push(`已运行 ${fmtUptime(stateAge * 1000)}`)
       } else if (s.active === 'inactive' || s.active === 'failed') {
+        if (stateAge != null) {
+          const verb = s.active === 'failed' ? '已挂' : '已停'
+          parts.push(`${verb} ${fmtUptime(stateAge * 1000)}`)
+        }
         if (lastActive != null) {
           parts.push(`上次活跃 ${fmtUptime(lastActive * 1000)}前`)
         } else if (s.hasStarted === false) {
@@ -439,13 +457,12 @@ export function consoleHostContent(sysinfo?: SysInfo): string {
         } else {
           parts.push('上次活跃 MISS')
         }
-        if (stateAge != null) {
-          const verb = s.active === 'failed' ? '已挂' : '已停'
-          parts.push(`${verb} ${fmtUptime(stateAge * 1000)}`)
-        }
-      } else if (stateAge != null) {
-        parts.push(`已 ${fmtUptime(stateAge * 1000)}`)
+      } else {
+        parts.push(s.active)
+        if (stateAge != null) parts.push(`已 ${fmtUptime(stateAge * 1000)}`)
       }
+      // 只有什么都不写时才退回英文状态；有报错时报错本身就是内容。
+      if (!parts.length && !s.error) parts.push(s.active)
       if (s.active !== 'active' && s.lastExitStatus !== undefined) {
         parts.push(s.lastExitStatus < 0 ? `终止信号 ${-s.lastExitStatus}` : `退出码 ${s.lastExitStatus}`)
       }
@@ -457,58 +474,40 @@ export function consoleHostContent(sysinfo?: SysInfo): string {
   return lines.join('\n')
 }
 
-export function consoleMainContent(opts: ConsoleOpts): string {
-  const peers = opts.peers ?? []
-  if (peers.length === 0) return '_无_'
-  return peers.map((p) => {
-    const dot = PEER_STATUS_EMOJI[p.status] ?? '·'
-    const label = PEER_STATUS_LABEL[p.status] ?? p.status
-    const up = p.uptimeMs != null && p.uptimeMs > 0 ? ` · ${fmtUptime(p.uptimeMs)}` : ''
-    const mark = p.isCurrent ? ' · 当前' : ''
-    const account = p.claudeAccountName !== undefined
-      ? ` · Claude：${inlineCode(escapeMarkdown(p.claudeAccountName))}`
-      : p.codexAccountName === undefined ? '' : ` · Codex：${inlineCode(escapeMarkdown(p.codexAccountName))}`
-    return `　· ${dot} \`${p.name}\` · ${label}${up}${mark}${account}`
-  }).join('\n')
-}
-
-export function consoleMainElement(opts: ConsoleOpts, elementId = ELEMENTS.consoleProjects): object {
-  const peers = opts.peers ?? []
-  return {
-    tag: 'collapsible_panel',
-    element_id: elementId,
-    header: {
-      title: { tag: 'plain_text', content: `🗂 活跃项目 (${peers.length})` },
-    },
-    expanded: false,
-    elements: [{ tag: 'markdown', content: consoleMainContent(opts) }],
-  }
-}
-
-export function consoleCurrentModelContent(opts: ConsoleOpts): string {
-  const label = opts.model
+/** 群里 hi 的本项目信息，一项一行：状态（紧跟子 Agent 与后台进程数、运行时长）、Agent 与模型、进程实际使用的账号。 */
+export function consoleProjectContent(opts: ConsoleOpts): string {
+  // 「空闲」只说明主线程空着；后台进程和子 Agent 仍在跑时紧跟状态写出数量。
+  const workload = sessionWorkloadLabel(opts.workload)
+  const uptime = opts.uptimeMs != null && opts.uptimeMs > 0 ? ` · 已运行 ${fmtUptime(opts.uptimeMs)}` : ''
+  const model = opts.model
     ? `${opts.model}${opts.effort ? `/${opts.effort}` : ''}`
     : opts.effort
       ? `强度 ${opts.effort}`
       : '未就绪'
-  const provider = opts.provider === 'claude' ? ` (${providerLabel(opts.provider)})` : ''
+  const agent = opts.provider ? `${providerLabel(opts.provider)} · ` : ''
+  // 账号写法与单聊面板的额度区行名相同（Claude·默认、Codex·工作、GLM）。
+  const account = opts.account ? escapeInlineMarkdown(opts.account.label)
+    : opts.status === 'stopped' ? '未启动' : '未确定'
   return [
-    `**🤖 当前模型${provider}**　\`${label}\``,
+    `**状态**　${sessionStatusText(opts.status)}${workload ? ` · ${workload}` : ''}${uptime}`,
+    `**模型**　${agent}\`${model}\``,
+    `**账号**　${account}`,
     ...(opts.worktreeInstructionNotice ? [opts.worktreeInstructionNotice] : []),
   ].join('\n')
 }
 
-export function consoleCurrentModelElement(
+export function consoleProjectElement(
   opts: ConsoleOpts,
-  elementId: string = ELEMENTS.consoleCurrentModel,
+  elementId: string = ELEMENTS.consoleProject,
 ): object {
   return {
     tag: 'markdown',
     element_id: elementId,
-    content: consoleCurrentModelContent(opts),
+    content: consoleProjectContent(opts),
   }
 }
 
+/** 单聊面板的主机区：默认折叠，标题用文字写出负载、内存、服务数与失败数。 */
 export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.consoleHost): object {
   const summary = hostSummary(sysinfo)
   return {
@@ -519,7 +518,10 @@ export function consoleHostElement(sysinfo?: SysInfo, elementId = ELEMENTS.conso
         tag: 'plain_text',
         content: summary.length > 0 ? `🖥 主机 · ${summary.join(' · ')}` : '🖥 主机',
       },
+      background_color: 'grey-50',
     },
+    border: { color: 'grey-100', corner_radius: '8px' },
+    padding: '8px',
     expanded: false,
     elements: [{ tag: 'markdown', content: consoleHostContent(sysinfo) }],
   }
@@ -537,7 +539,8 @@ export function unifiedUsageSummary(snap: UsageSnapshotUnified | undefined): str
     ? `余额 ${money(snap.balance.remaining, snap.balance.currency)}` : '余额 MISS'
   if (snap.quota) return snap.quota.limit === null ? '额度 未设上限'
     : snap.quota.remaining === null ? '额度 MISS'
-    : `额度 ${money(snap.quota.remaining, snap.quota.currency)} / ${money(snap.quota.limit, snap.quota.currency)}`
+    // 与 hi 同写法：令牌额度给的是剩余与上限，写明「剩余」免得读成已用。
+    : `剩余 ${money(snap.quota.remaining, snap.quota.currency)} / ${money(snap.quota.limit, snap.quota.currency)}`
   const quota = snap.windows.length ? `额度 ${snap.windows.map(usageWindowSummary).join(' · ')}` : '额度 MISS'
   const credits = snap.credits !== undefined ? codexCreditsSummary(snap.credits) : null
   return [quota, credits].filter(Boolean).join(' · ')
@@ -549,48 +552,27 @@ function usageWindowSummary(w: UsageSnapshotUnified['windows'][number]): string 
   return `${w.label} 已用 ${value}`
 }
 
+/** 一个账号的额度明细（账号名另有一行）：积分、重置卡、凭据等账号级事实在前，其后每个窗口一行。 */
 export function consoleUnifiedUsageContent(snap: UsageSnapshotUnified | undefined): string {
-  return compactAccountUsage(snap)
+  return accountUsageLines(snap).join('\n')
 }
 
-/** 订阅额度行 —— 双源合并:
- *  - accountUsages 在场(上游 v0.20 账户聚合)→ 「全部账号额度」面板;
- *  - 兼容层:unifiedUsage(统一快照)在场走统一渲染;
- *  - 否则按实际 runtime profile 渲染 Codex、GLM、渠道余额或明确不适用(markdown 行)。 */
+/** 群里 hi 的额度区只有本群进程实际使用的那一个账号；全部账号的额度在单聊面板。 */
 export function consoleUsageElement(opts: ConsoleOpts): object {
-  if (opts.accountUsages !== undefined) {
-    const rows = opts.accountUsages
-    return {
-      tag: 'collapsible_panel', element_id: ELEMENTS.consoleUsage, expanded: true,
-      header: { title: { tag: 'plain_text', content: '全部账号额度 · 已用 / 距重置' }, background_color: 'blue-50' },
-      border: { color: 'blue-100', corner_radius: '8px' }, padding: '8px', vertical_spacing: '2px',
-      elements: rows.length ? rows.map(accountUsageRow) : [{ tag: 'markdown', text_size: 'notation', content: '暂无已配置账号' }],
-    }
-  }
-  const usageSource = opts.usageSource ?? usageSourceForAgent(opts.provider ?? 'codex', opts.model)
-  const content = opts.unifiedUsage !== undefined
-    ? consoleUnifiedUsageContent(opts.unifiedUsage)
-    : usageSource === 'glm'
-      ? consoleGlmUsageContent(opts.glmUsage)
-      : usageSource === 'codex'
-        ? consoleUsageContent(opts.usage)
-        : usageSource === 'provider'
-          ? opts.provider === 'dsh'
-            ? consoleDshBalanceContent(opts.providerUsage)
-            : consoleProviderUsageContent(opts.providerUsage)
-          : consoleUsageNotApplicableContent(opts.model)
+  const content = opts.account === undefined ? '加载中…'
+    : opts.account === null ? `<font color='grey'>${opts.status === 'stopped' ? '未启动' : '账号未确定'}</font>`
+    : consoleUnifiedUsageContent(opts.account.usage)
   return {
-    tag: 'markdown',
-    element_id: ELEMENTS.consoleUsage,
-    content,
+    tag: 'collapsible_panel', element_id: ELEMENTS.consoleUsage, expanded: true,
+    header: { title: { tag: 'plain_text', content: '📊 账号额度' }, background_color: 'blue-50' },
+    border: { color: 'blue-100', corner_radius: '8px' }, padding: '8px',
+    elements: [{ tag: 'markdown', content }],
   }
 }
 
-export function consoleBodyElements(opts: ConsoleOpts, currentModelElementId?: string): object[] {
+export function consoleBodyElements(opts: ConsoleOpts, projectElementId?: string): object[] {
   return [
-    consoleCurrentModelElement(opts, currentModelElementId),
-    consoleMainElement(opts),
-    consoleHostElement(opts.sysinfo),
+    consoleProjectElement(opts, projectElementId),
     consoleUsageElement(opts),
   ]
 }

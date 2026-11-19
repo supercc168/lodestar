@@ -19,12 +19,15 @@ export interface TurnState {
   /** Runtime model snapshot captured when this turn opens. Persistent model
    * selection may change for a later turn, but must not rewrite this card. */
   provider: AgentProvider
+  /** 原生安全拦截把会话换到降级模型时，改为实际接着回答的模型。 */
   model: string | null
   /** 运行时档位快照(上游允许 null:provider 未确认 effort 时的默认态;
    *  展示/日志读点一律 `?? 'MISS'` 兜底)。 */
   effort: AgentReasoningEffort | null
   /** Token 口径(本地):驱动「上一轮」/console 面板的用量来源分支。 */
   usageSource: AgentUsageSource
+  /** 本轮已提醒过的子 Agent 局部降级（原模型→降级模型），同一对只发一次提醒卡。 */
+  localRefusalNotices?: Set<string>
   /** Feishu message_id of the card — needed for urgent_app push on clean
    * turn close. Kept separate from cardId because cardkit's stream APIs
    * operate on card_id but the urgent_app endpoint takes message_id. */
@@ -250,7 +253,9 @@ export interface SessionOpts {
   onLifecycleChange?: () => void
   /** Daemon hook:建临时群并按显式 launch/routing 启动一个 session(上游 ff44afb:
    *  panel choice 预计算 launch/branchBase/seedAnchors,不再传 resume 参数对)。
-   * `groupMode: 'reuse'` 表示同名群已存在时只把发起人拉进群,不新建也不重启会话。 */
+   * `groupMode: 'reuse'` 表示同名群已存在时只把发起人拉进群,不新建也不重启会话。
+   * `externalRequester` 表示发起人是外部联系人(本企业成员在外部群里发起时为 false);`ownerOpenId` 只在
+   * 新群必须是外部群时给出(外部联系人发起,或本企业成员在外部群里发起),新建的外部群由该本企业成员当群主。 */
   onCreateTempSession?: (opts: {
     chatName: string
     userOpenId: string
@@ -260,9 +265,13 @@ export interface SessionOpts {
     branchBase: ConversationBranchBase
     seedAnchors?: TurnAnchor[]
     groupMode?: 'create' | 'reuse'
+    ownerOpenId?: string
+    externalRequester?: boolean
   }) => Promise<{ ok: boolean; chatId?: string; error?: string; join?: 'added' | 'present' }>
-  /** Daemon hook:解散临时群 + 清掉它的 Session 对象(bye 用;chatId 供精确匹配解散)。*/
-  onDisbandTempSession?: (chatName: string, chatId: string) => Promise<{ ok: boolean; error?: string }>
+  /** Daemon hook:解散临时群 + 清掉它的 Session 对象(bye 用;chatId 供精确匹配解散)。
+   * 外部群不能解散:`left` 表示会话已停止、机器人已退群,群留给群主手动解散;
+   * `ok` 为 false 且 `left` 时机器人已不在群里,本地清理失败要报到别处。 */
+  onDisbandTempSession?: (chatName: string, chatId: string) => Promise<{ ok: boolean; error?: string; left?: boolean }>
   /** Daemon-owned delegated Agents are outside Session.proc but must be
    * cancelled by stop/kill/restart and staged daemon shutdown. */
   onCancelAgentRuns?: (sessionName: string, chatId: string, reason: string) => Promise<void>

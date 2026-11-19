@@ -4,6 +4,7 @@ import { formatFeishuError } from './feishu-errors'
 import { log, logError } from './log'
 import { clearGsdAwaitingName, isGsdBareword, runGsdTextCommand } from './session-gsd'
 import { diagnosticIdLabel, messageOf } from './session-util'
+import type { RequesterTenant } from './requester-tenant'
 
 type ControlCommand = 'hi' | 'stop' | 'kill' | 'restart' | 'clear' | 'compact' | 'model'
 
@@ -103,14 +104,19 @@ async function restartWithStatus(
  * auto-interrupt on mid-turn user messages was removed (matching
  * Codex's native type-ahead behavior) — explicit barge-out
  * needed a knob and `kill` (full subprocess teardown) is too heavy. */
-export async function runCommand(s: Session, raw: string, userOpenId = '', messageId?: string): Promise<boolean> {
+export async function runCommand(
+  s: Session,
+  raw: string,
+  userOpenId = '',
+  messageId?: string,
+  requester?: RequesterTenant,
+): Promise<boolean> {
   // Spec: explicit non-task control commands cancel awaiting_name.
   // Daemon routes controls here before onUserMessage / maybeConsumeGsdTaskName,
   // so clear on every consumed control (including bare `gsd` panel open).
   if (isControlCommandText(raw)) {
     clearGsdAwaitingName(s)
   }
-
   const namedHi = raw.trim().match(/^hi[ \t]+([^\r\n]+)$/i)
   if (namedHi) {
     if (s.currentProvider() === 'claude') {
@@ -144,7 +150,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
       await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 wt。')
       return true
     }
-    await s.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId)
+    await s.runWorktreeCommand((wt[1] ?? '').trim(), userOpenId, requester)
     return true
   }
   // bl/btwlist = 列出本机登记的全部临时会话；btw = 开临时会话(同目录,自动启动)，
@@ -154,7 +160,7 @@ export async function runCommand(s: Session, raw: string, userOpenId = '', messa
   if (btw) {
     // 本地守卫保留(同 wt):agy 独占期拒绝 btw。
     if (s.startingAgy || s.runningAgy) { await feishu.sendText(s.chatId, '⏳ agy 任务正在执行；请等待完成，或发送 stop 打断后再使用 btw。'); return true }
-    await s.runBtwCommand(userOpenId, (btw[1] ?? '').trim())
+    await s.runBtwCommand(userOpenId, (btw[1] ?? '').trim(), requester)
     return true
   }
   if (raw.trim().match(/^(?:bl|btwlist)$/i)) {

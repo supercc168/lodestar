@@ -17,31 +17,16 @@ import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
 import { existsSync, statSync } from 'node:fs'
 import { isAbsolute } from 'node:path'
 import { agentApiUrl } from './agent-runtime'
-import {
-  CODEX_EFFORT,
-  CodexRpcResponseError,
-  CodexProcess,
-  diffUsageTotals,
-  effectiveTurnTokens,
-  isCodexReasoningEffort,
-  type CanUseToolRequest,
-  type CodexReasoningEffort,
-  type CodexUsage,
-  type CodexResultMeta,
-  type ContextCompactedNotification,
-  type HookCallbackRequest,
-  type PlanDelta,
-  type TokenUsageUpdated,
-  type ThreadGoal,
-  type TurnPlanUpdated,
-} from './codex-process'
+import { CODEX_EFFORT, CodexRpcResponseError, CodexProcess, diffUsageTotals, effectiveTurnTokens, isCodexReasoningEffort, type CanUseToolRequest, type CodexReasoningEffort, type CodexUsage, type CodexResultMeta, type ContextCompactedNotification, type HookCallbackRequest, type PlanDelta, type TokenUsageUpdated, type ThreadGoal, type TurnPlanUpdated } from './codex-process'
 import { codexModelIsApiRoute, codexModelRequiresOpenaiAuth } from './codex-models'
 import { DSH_DEFAULT_BASE_URL, DSH_DISPLAY_NAME, dshSourceFromConfig } from './token-source-dsh'
 import { queryDshRuntime } from './dsh-runtime'
 import { DshProcess } from './dsh-process'
 import { fetchDeepseekBalance } from './token-source-deepseek'
 import { isAgentSession } from './agent-session-registry'
-
+import { CLAUDE_EFFORT, agentProviderLabel, isClaudeReasoningEffort, type AgentProcess, type AgentProcessEventMap, type AgentProvider, type AgentReasoningEffort, type ClaudeReasoningEffort, type ModelRefusalNotice, isDshReasoningEffort, type AgentResultEvent, type AgentTurnRetry, type CodexUserTextSettlement, type CollabAgentStates, type DshReasoningEffort, type UserTextDispatch, usageSourceForAgent } from './agent-process'
+import { config } from './config'
+import { createAgentProcess } from './agent-launch'
 import { createAgentCards } from './agent-cards-runtime'
 import type { AgentCards } from './agent-cards'
 import { waitForLiveCodexUsage } from './codex-live-usage'
@@ -50,114 +35,48 @@ import { recordClaudeSessionAccount } from './claude-session-accounts'
 import { enrollClaudeAccount } from './claude-account-selection'
 import { countActiveClaudeSessions } from './session-activity'
 import { withChatMessageOrder } from './chat-message-order'
-
-import {
-  validateConversationLaunch,
-  type ConversationBranchBase,
-  type ConversationCheckpoint,
-  type ConversationLaunch,
-  type ConversationRef,
-  type ConversationRouting,
-  type ConversationSummary,
-  type PendingConversationLaunch,
-} from './conversation'
-import {
-  CLAUDE_EFFORT,
-  agentProviderLabel,
-  isClaudeReasoningEffort,
-  isDshReasoningEffort,
-  type AgentProcess,
-  type AgentProcessEventMap,
-  type AgentProvider,
-  type AgentReasoningEffort,
-  type AgentResultEvent,
-  type AgentTurnRetry,
-  type ClaudeReasoningEffort,
-  type CodexUserTextSettlement,
-  type CollabAgentStates,
-  type DshReasoningEffort,
-  type UserTextDispatch,
-  usageSourceForAgent,
-} from './agent-process'
-import { liveElapsed, type LiveElapsedMode } from './cards/format'
-import { createAgentProcess } from './agent-launch'
-import { getTokenSource, getTokenSourceForAccount, listEnabledTokenSourcesByAgent, tokenSourceProcessRevision, tokenSourceRuntimeModel, type TokenSource } from './token-source'
-import { boundCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT, processCodexAccount } from './codex-accounts'
-import { codexAccountCard } from './cards/codex-account'
-import {
-  claudeTranscriptPath,
-  type BgTaskStartedEvent,
-  type BgTaskProgressEvent,
-  type BgTaskUpdatedEvent,
-  type BgTaskSettledEvent,
-  type ModelRefusalFallbackEvent,
-  type ModelRefusalNoFallbackEvent,
-} from './claude-agent-process'
-import * as cardkit from './cardkit'
-import * as cards from './cards'
-import { watchdogFooterContent } from './cards/turn'
-import * as feishu from './feishu'
 import { formatFeishuError } from './feishu-errors'
 import { logError, logDiagnostic } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
-import { readSysInfo } from './sysinfo'
-import { readUsage, captureCodexUsageCache, type UsageSnapshot } from './usage'
-import { readGlmUsage, type GlmUsageSnapshot } from './glm-usage'
-import { readClaudeProviderUsage, readDeepseekBalance, type ClaudeProviderUsageSnapshot } from './claude-provider-usage'
+import { captureCodexUsageCache } from './usage'
 import { codexCreditsSummary } from './cards/usage'
-import { readAllAccountUsage } from './account-usage'
+import { readCodexAccountUsage, readTokenSourceAccountUsage, type AccountUsage } from './account-usage'
 import { claudeWeeklyUsageWindow } from './claude-usage'
-import {
-  contextLimitFromAppServer,
-  contextTokensFromUsage,
-} from './context-window'
-import { extractAskUsrMarkers, extractSendMarkerPaths, normalizeOutboundPath, stripAskUsrMarkers } from './outbound-markers'
+import { contextLimitFromAppServer, contextTokensFromUsage } from './context-window'
+import { extractSendMarkerPaths, normalizeOutboundPath, extractAskUsrMarkers, stripAskUsrMarkers } from './outbound-markers'
 import * as sessionMultimsg from './session-multimsg'
 import * as mathRender from './math-render'
 import type { TurnState, Status, SessionOpts, LastTurnDelta, CumStats } from './session-types'
-import * as sessionAgy from './session-agy'
+import type { RequesterTenant } from './requester-tenant'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
-import * as sessionHostAsk from './session-host-ask'
 import * as sessionPermission from './session-permission'
-import {
-  diagnosticIdLabel,
-  messageOf,
-  type FooterTimer,
-  type LifecycleKind,
-  type LifecycleLease,
-  type LifecycleProgressOpts,
-  type ModelActionResult,
-  type ResumeIdentity,
-  type StatusCardHandle,
-  type TasklistActionResult,
-  type WorktreeActionResult,
-} from './session-util'
-import type { GsdActionResult } from './session-gsd'
+import { diagnosticIdLabel, messageOf, type FooterTimer, type LifecycleProgressOpts, type ModelActionResult, type StatusCardHandle, type TasklistActionResult, type WorktreeActionResult, type LifecycleKind, type LifecycleLease, type ResumeIdentity } from './session-util'
 import * as sessionCommands from './session-commands'
 import * as sessionCompact from './session-compact'
 import * as sessionModel from './session-model'
 import * as sessionAgentIdentities from './session-agent-identities'
 import * as sessionTasklist from './session-tasklist'
-import * as sessionGsd from './session-gsd'
-import * as sessionWorktree from './session-worktree'
-import * as sessionTemp from './session-temp'
-import { config } from './config'
-import {
-  DEFAULT_CODEX_WATCHDOG,
-  TurnWatchdog,
-
-  type WatchdogLogEvent,
-  type WatchdogSafetySnapshot,
-  type WatchdogSettings,
-  type WatchdogVerdict,
-} from './turn-watchdog'
-import {
-  ToolFailureLoopGuard,
-  type ToolFailureLoopVerdict,
-} from './tool-failure-loop'
 import { createFileDelivery } from './file-delivery-runtime'
 import type { FileDeliveryHandle } from './file-delivery-types'
+import * as sessionWorktree from './session-worktree'
+import * as sessionTemp from './session-temp'
+import { validateConversationLaunch, type ConversationBranchBase, type ConversationCheckpoint, type ConversationLaunch, type ConversationRef, type ConversationRouting, type ConversationSummary, type PendingConversationLaunch } from './conversation'
+import { liveElapsed, type LiveElapsedMode } from './cards/format'
+import { getTokenSource, getTokenSourceForAccount, listEnabledTokenSourcesByAgent, tokenSourceProcessRevision, tokenSourceRuntimeModel, type TokenSource } from './token-source'
+import { boundCodexAccount, codexAccounts, DEFAULT_CODEX_ACCOUNT, processCodexAccount } from './codex-accounts'
+import { codexAccountCard } from './cards/codex-account'
+import { claudeTranscriptPath, type BgTaskStartedEvent, type BgTaskProgressEvent, type BgTaskUpdatedEvent, type BgTaskSettledEvent, type ModelRefusalFallbackEvent, type ModelRefusalNoFallbackEvent } from './claude-agent-process'
+import * as cardkit from './cardkit'
+import * as cards from './cards'
+import { watchdogFooterContent } from './cards/turn'
+import * as feishu from './feishu'
+import * as sessionAgy from './session-agy'
+import * as sessionHostAsk from './session-host-ask'
+import * as sessionGsd from './session-gsd'
+import type { GsdActionResult } from './session-gsd'
+import { DEFAULT_CODEX_WATCHDOG, TurnWatchdog, type WatchdogLogEvent, type WatchdogSafetySnapshot, type WatchdogSettings, type WatchdogVerdict } from './turn-watchdog'
+import { ToolFailureLoopGuard, type ToolFailureLoopVerdict } from './tool-failure-loop'
 
 export type { SessionOpts } from './session-types'
 
@@ -501,6 +420,15 @@ function timedStatus(status: string, startedAt: number): string {
 /** 本进程的后台/页脚耗时档位(bucket|second)。 */
 function liveElapsedMode(): LiveElapsedMode {
   return config.runtime.live_elapsed
+}
+
+/** The Codex subscription account a live process actually runs on. Null for everything else: API relay
+ * processes are never bound to an account, and a process still choosing one or waiting for quota has no
+ * settled account to show. Never the chat's next-start selection. */
+function liveCodexAccount(proc: AgentProcess): string | null {
+  if (proc.provider !== 'codex' || proc.codexAccountSelectionMode?.() === null) return null
+  if (proc.turnRetry?.reason === 'quota' && proc.turnRetry.phase === 'waiting') return null
+  return boundCodexAccount(proc)
 }
 
 function cardFailureDetails(failures: cardkit.CardWriteFailure[]): string {
@@ -1034,20 +962,18 @@ export class Session {
     Session.all.add(this)
   }
 
-  /** Minimal cross-chat snapshot for the `hi` peer-list section.
+  /** Minimal cross-chat snapshot for the 1:1 panel's active projects.
    * `startedAt` stays private so this is the documented read path. */
   peerSnapshot(): { name: string; status: Status; uptimeMs?: number; codexAccountName?: string; claudeAccountName?: string } {
+    const proc = this.proc?.isAlive() ? this.proc : null
+    const codexAccount = proc ? liveCodexAccount(proc) : null
     return {
       name: this.sessionName,
       status: this.status,
       uptimeMs: this.startedAt ? (Date.now() - this.startedAt) : undefined,
-      ...(this.proc?.isAlive() && this.proc.provider === 'codex'
-        && !this.currentTokenSource()?.codexApiProvider
-        && this.proc.codexAccountSelectionMode?.() !== null
-        && !(this.proc.turnRetry?.reason === 'quota' && this.proc.turnRetry.phase === 'waiting')
-        ? { codexAccountName: codexAccounts.get(processCodexAccount(this.proc)).name } : {}),
-      ...(this.proc?.isAlive() && this.proc.tokenSourceId === 'claude-sub' && processClaudeAccount(this.proc)
-        ? { claudeAccountName: claudeAccounts.get(processClaudeAccount(this.proc)!).name } : {}),
+      ...(codexAccount !== null ? { codexAccountName: codexAccounts.get(codexAccount).name } : {}),
+      ...(proc?.tokenSourceId === 'claude-sub' && processClaudeAccount(proc)
+        ? { claudeAccountName: claudeAccounts.get(processClaudeAccount(proc)!).name } : {}),
     }
   }
 
@@ -1750,6 +1676,24 @@ export class Session {
     return [...this.backgroundTasks, ...this.pendingBgTasks]
       .filter(task => task.type === 'subagent' && !cards.isBgTerminal(task)).length
   }
+  /** What still runs beside the main turn, for the hi/bl status rows. Subagents are
+   * the running rows of the shared task card (foreground included, every backend).
+   * Background processes prefer the backend's own live set (Claude's SDK level,
+   * Codex's background terminals) and fall back to the task card's non-subagent
+   * rows until a backend reports one; an unreadable live set is null (MISS). */
+  async workload(): Promise<cards.SessionWorkload> {
+    const proc = this.proc
+    if (!proc?.isAlive()) return { background: 0, subagents: 0 }
+    const subagents = this.activeSubagents()
+    const tracked = this.backgroundTasks.filter(task => task.type !== 'subagent' && !cards.isBgTerminal(task)).length
+    if (!proc.backgroundProcessCount) return { background: tracked, subagents }
+    try {
+      return { background: (await proc.backgroundProcessCount()) ?? tracked, subagents }
+    } catch (error) {
+      logError('session: background process count failed', error)
+      return { background: null, subagents }
+    }
+  }
   /** Running sessions normally revive after daemon restart. A process kept
    * only because the user's explicit stop could not yet be confirmed must not
    * undo that stop intent on the next boot. */
@@ -1977,7 +1921,7 @@ export class Session {
 
   /** 本 daemon 中已构造的临时群会话；`bl` 列表与 hi 的 peers 同源。
    * 还没被任何消息唤醒的旧临时群不在里面，由持久化租约补全。 */
-  tempSessionPeers(): Array<{
+  async tempSessionPeers(): Promise<Array<{
     sessionName: string
     chatId: string
     status: Status
@@ -1985,18 +1929,23 @@ export class Session {
     provider: AgentProvider
     model: string | null
     effort: AgentReasoningEffort | null
-  }> {
-    return [...Session.all]
+    /** 运行中会话的后台进程与子 Agent 数；未运行为 null。 */
+    workload: cards.SessionWorkload | null
+  }>> {
+    const peers = [...Session.all]
       .filter(peer => feishu.tempProjectName(peer.sessionName) !== null)
-      .map(peer => ({
-        sessionName: peer.sessionName,
-        chatId: peer.chatId,
-        status: peer.status,
-        running: peer.isRunning(),
-        provider: peer.selectedProvider,
-        model: peer.selectedModel,
-        effort: peer.selectedEffort,
-      }))
+      .map(peer => ({ peer, running: peer.isRunning() }))
+    const workloads = await Promise.all(peers.map(({ peer, running }) => running ? peer.workload() : null))
+    return peers.map(({ peer, running }, index) => ({
+      sessionName: peer.sessionName,
+      chatId: peer.chatId,
+      status: peer.status,
+      running,
+      provider: peer.selectedProvider,
+      model: peer.selectedModel,
+      effort: peer.selectedEffort,
+      workload: workloads[index] ?? null,
+    }))
   }
 
   private modelForSpawn(provider: AgentProvider = this.selectedProvider): string | undefined {
@@ -2613,6 +2562,56 @@ export class Session {
       elapsedSec(): number {
         return (Date.now() - startedAt) / 1000
       },
+    }
+  }
+
+  /** Claude 原生安全分类器拦截：在群里单独发一张提醒卡，不写进本轮对话卡。会话级降级
+   * 时本轮 footer 改为实际接着回答的降级模型；子 Agent 的局部降级每轮同一对模型只提醒
+   * 一次。卡片发不出去时改发同样内容的纯文本。 */
+  private async announceModelRefusal(notice: ModelRefusalNotice): Promise<void> {
+    const turn = this.currentTurn
+    if (turn && notice.kind === 'fallback' && notice.scope === 'session' && notice.fallbackModel) {
+      // 与 runtimeModelSelection 同一显示口径：去掉 claude: 前缀和 [1m] 记账后缀。
+      turn.model = notice.fallbackModel.replace(/^claude:/i, '').replace(/\[1m\]$/i, '')
+    }
+    if (notice.kind === 'fallback' && notice.scope === 'local' && turn) {
+      const key = `${notice.originalModel ?? ''}\n${notice.fallbackModel ?? ''}`
+      const seen = turn.localRefusalNotices ??= new Set()
+      if (seen.has(key)) return
+      seen.add(key)
+    }
+    const card = cards.modelRefusalNoticeCard(notice)
+    // 连续降级时，后一条原生通知撤回前一条：原地改写前一张提醒卡，不再多发一张过时的卡。
+    const superseded = notice.retracted.map(id => this.refusalNoticeMessages.get(id)).find(Boolean)
+    if (superseded) {
+      try {
+        await feishu.updateCard(superseded, card)
+        this.rememberRefusalNotice(notice.uuid, superseded)
+        return
+      } catch (error) {
+        logError('session: model refusal notice update failed', error)
+      }
+    }
+    let failure: unknown
+    const sent = await feishu.sendCard(this.chatId, card, error => { failure = error })
+    if (sent) {
+      this.rememberRefusalNotice(notice.uuid, sent)
+      return
+    }
+    logDiagnostic('session: model refusal notice card failed')
+    await feishu.sendTextRaw(this.chatId,
+      `${cards.modelRefusalNoticeText(notice)}\n（提醒卡发送失败，改发文字：${formatFeishuError(failure)}）`)
+  }
+
+  /** 原生降级通知 uuid → 已发提醒卡的 message_id，供后续撤回它的通知原地改写；只留最近几条。 */
+  private readonly refusalNoticeMessages = new Map<string, string>()
+
+  private rememberRefusalNotice(uuid: string | null, messageId: string): void {
+    if (!uuid) return
+    this.refusalNoticeMessages.delete(uuid)
+    this.refusalNoticeMessages.set(uuid, messageId)
+    while (this.refusalNoticeMessages.size > 16) {
+      this.refusalNoticeMessages.delete(this.refusalNoticeMessages.keys().next().value!)
     }
   }
 
@@ -3631,9 +3630,15 @@ export class Session {
   async continueAfterDaemonRestart(): Promise<void> {
     await this.runLifecycle('daemon-continue', async () => {
       const proc = this.proc
-      if (this.daemonRestoreRequired || this.status !== 'idle' || this.initCount < 1 || !proc?.isAlive()
-        || !this.lastSessionRef || proc.sessionId !== this.lastSessionRef.sessionId
-        || proc.provider !== this.lastSessionRef.provider || this.lastSessionId !== proc.sessionId
+      // Codex and DSH report init and their session id when the conversation opens. Claude reports
+      // both only with its first native message, which needs an input: a restored Claude process is
+      // ready once initialized, before any init (the state the first ordinary message after a restore
+      // is delivered in), and is identified by the saved conversation it resumes in place.
+      const initialized = this.initCount >= 1 || proc?.provider === 'claude'
+      const procSessionId = proc?.sessionId ?? proc?.resumedSessionId ?? null
+      if (this.daemonRestoreRequired || this.status !== 'idle' || !initialized || !proc?.isAlive()
+        || !this.lastSessionRef || !procSessionId || procSessionId !== this.lastSessionRef.sessionId
+        || proc.provider !== this.lastSessionRef.provider || this.lastSessionId !== procSessionId
         || this.modelSelectionNeedsProcessStop()
         || this.currentTurn || this.openingTurn || this.steeringSend
         || this.pendingUserMessageCount > 0 || this.pendingMidTurnMsgs.length > 0) {
@@ -4664,8 +4669,8 @@ export class Session {
     return sessionWorktree.worktreeExtraInstruction(this)
   }
 
-  runWorktreeCommand(arg: string, userOpenId: string): Promise<void> {
-    return sessionWorktree.runWorktreeCommand(this, arg, userOpenId)
+  runWorktreeCommand(arg: string, userOpenId: string, requester?: RequesterTenant): Promise<void> {
+    return sessionWorktree.runWorktreeCommand(this, arg, userOpenId, requester)
   }
 
   showWorktrees(): Promise<void> {
@@ -4817,113 +4822,88 @@ export class Session {
   showForkList(userOpenId = ''): Promise<void> { return sessionTemp.showForkList(this, userOpenId) }
   showBackList(userOpenId = ''): Promise<void> { return sessionTemp.showBackList(this, userOpenId) }
   showResumeList(userOpenId = ''): Promise<void> { return sessionTemp.showResumeList(this, userOpenId) }
-  runBtwCommand(userOpenId: string, role = ''): Promise<void> { return sessionTemp.runBtwCommand(this, userOpenId, role) }
+  /** `requester` 只说明发起人是否外部联系人，事件到达时算出，缺省按内部成员处理。 */
+  runBtwCommand(userOpenId: string, role = '', requester?: RequesterTenant): Promise<void> {
+    return sessionTemp.runBtwCommand(this, userOpenId, role, requester)
+  }
   runBtwListCommand(): Promise<void> { return sessionTemp.runBtwListCommand(this) }
   runByeCommand(userOpenId = ''): Promise<void> { return sessionTemp.runByeCommand(this, userOpenId) }
-  onForkSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onForkSelect(this, panelId, choiceId, userOpenId) }
-  onBackSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onBackSelect(this, panelId, choiceId, userOpenId) }
-  onResumeSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> { return sessionTemp.onResumeSelect(this, panelId, choiceId, userOpenId) }
+  onForkSelect(panelId: string, choiceId: string, userOpenId = '', requester?: RequesterTenant): Promise<sessionTemp.TempSelectionResult> {
+    return sessionTemp.onForkSelect(this, panelId, choiceId, userOpenId, requester)
+  }
+  onBackSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> {
+    return sessionTemp.onBackSelect(this, panelId, choiceId, userOpenId)
+  }
+  onResumeSelect(panelId: string, choiceId: string, userOpenId = ''): Promise<sessionTemp.TempSelectionResult> {
+    return sessionTemp.onResumeSelect(this, panelId, choiceId, userOpenId)
+  }
 
   /** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
    * plus their two-letter aliases where applicable.
    * Returns true if the command was consumed (don't forward to Codex). */
-  runCommand(raw: string, userOpenId = '', messageId?: string): Promise<boolean> {
-    return sessionCommands.runCommand(this, raw, userOpenId, messageId)
+  runCommand(raw: string, userOpenId = '', messageId?: string, requester?: RequesterTenant): Promise<boolean> {
+    return sessionCommands.runCommand(this, raw, userOpenId, messageId, requester)
   }
 
-  /** Build the hi-panel data snapshot for this session.
-   *
-   * Passing `usage=undefined` paints the `_加载中…_` placeholder — the
-   * caller is responsible for the async patch if the panel was sent. */
-  async buildConsoleOpts(
-    usage?: UsageSnapshot,
-    glmUsage?: GlmUsageSnapshot,
-    providerUsage?: ClaudeProviderUsageSnapshot,
-  ): Promise<cards.ConsoleOpts> {
+
+  /** Build the group hi-panel snapshot: this project only — status, model, and the
+   * account its live process actually uses with that account's cached quota.
+   * Every project, the host and every account's quota are in the 1:1 panel. */
+  async buildConsoleOpts(): Promise<cards.ConsoleOpts> {
     const runtime = this.runtimeModelSelection()
-    const sysinfo = await readSysInfo()
+    const [workload, account] = await Promise.all([this.workload(), this.consoleAccount()])
     return {
       sessionName: this.sessionName,
       status: this.status,
       provider: runtime.provider,
       model: runtime.model ?? undefined,
       effort: runtime.effort ?? 'MISS',
-      usageSource: runtime.usageSource,
       worktreeInstructionNotice: this.worktreeInstructionLoadedNotice(),
-      peers: [...Session.all]
-        .filter(s => s.isRunning())
-        .map(s => ({
-          ...s.peerSnapshot(),
-          isCurrent: s === this,
-        })),
-      usage,
-      glmUsage,
-      providerUsage,
-      accountUsages: await readAllAccountUsage(),
-      sysinfo,
+      ...(this.isRunning() && this.startedAt ? { uptimeMs: Date.now() - this.startedAt } : {}),
+      workload,
+      account,
     }
   }
 
-  async buildConsoleCard(usage: UsageSnapshot | undefined): Promise<object> {
-    return cards.consoleCard(await this.buildConsoleOpts(usage))
-  }
-
-  private async patchConsoleUsage(cardId: string, snapshot: cards.ConsoleOpts): Promise<void> {
-    // The card header and this quota row must come from the same runtime
-    // selection. Clone the creation-time snapshot instead of re-reading the
-    // mutable session after send/id-convert/network awaits.
-    const opts: cards.ConsoleOpts = {
-      ...snapshot,
-      usage: undefined,
-      glmUsage: undefined,
-      providerUsage: undefined,
-    }
-    // 合并调和(取舍):snapshot 缺席账户聚合数据时才即时补读(上游 patchConsoleUsage
-    // 无条件重读的形态;本地调用方经 buildConsoleOpts 冻结快照,已含 accountUsages,
-    // 不会走到这里)。失败按上游口径落一条 error 行,面板不落回 markdown。
-    if (opts.accountUsages === undefined) {
-      try { opts.accountUsages = await readAllAccountUsage() }
-      catch (error) {
-        const reason = messageOf(error)
-        logError("session: console usage MISS", error)
-        opts.accountUsages = [{ id: 'error', label: '额度', usage: { state: 'network', windows: [], reason } }]
+  /** The account this chat's live process actually runs on, with its cached quota (hi reads
+   * caches only). Null without a live process or while Codex has not settled on an account —
+   * the same cases in which the 1:1 panel omits the account name. A failed lookup shows
+   * MISS instead of failing the whole card. */
+  private async consoleAccount(): Promise<AccountUsage | null> {
+    const proc = this.proc?.isAlive() ? this.proc : null
+    if (!proc) return null
+    try {
+      // The live process decides, never the chat's next-start selection: `codex-account` switches the
+      // selection without a restart, and a relay can leave the config while its process still runs.
+      if (proc.provider === 'codex') {
+        const source = getTokenSource(proc.tokenSourceId)
+        if (source?.codexApiProvider) return await readTokenSourceAccountUsage(source)
+        const account = liveCodexAccount(proc)
+        return account === null ? null : await readCodexAccountUsage(account)
       }
-    }
-    if (opts.usageSource === 'glm') {
-      opts.glmUsage = await readGlmUsage()
-    } else if (opts.usageSource === 'codex') {
-      opts.usage = await readUsage(opts.model)
-    } else if (opts.usageSource === 'provider' && opts.model) {
-      // DSH 与 claude 的 provider 余额是两个互不相读的凭据面(D-08 双轨):
-      // dsh 读 `[deepseek-harness]` 并打 DeepSeek /user/balance,绝不落到
-      // claude profile 查询(那会拿 claude:<key> 的 token 去问别的渠道)。
-      if (opts.provider === 'dsh') {
+      // 本地扩展:DSH 走 `[deepseek-harness]` 段(不进 token source 注册表),
+      // 直接按该段凭据查 DeepSeek /user/balance。
+      if (proc.provider === 'dsh') {
         const section = config.deepseek_harness
-        const displayName = section?.display?.trim() || DSH_DISPLAY_NAME
         const apiKey = section?.api_key?.trim() ?? ''
+        if (!apiKey) return null
+        const displayName = section?.display?.trim() || DSH_DISPLAY_NAME
         const baseUrl = section?.base_url?.trim() || DSH_DEFAULT_BASE_URL
-        // 合并调和(取舍):聚合面板在场(上游「全部账号额度」路线,见
-        // cards/console.ts 双源注释)时 dsh 余额补进面板行 —— 本地
-        // `[deepseek-harness]` 段不进 token source 注册表,聚合读数看不到它;
-        // 面板行快照走 unified 同源查询(fetchDeepseekBalance 即注册表 readUsage
-        // 的实现,同端点同凭据)。markdown 兼容层(accountUsages 缺席的旧调用方)
-        // 保留本地 providerUsage 行。两条路线各自只查一次 /user/balance。
-        if (opts.accountUsages !== undefined) {
-          if (apiKey && !opts.accountUsages.some(row => row.id === 'deepseek-harness' || row.id === 'deepseek')) {
-            opts.accountUsages = [...opts.accountUsages, {
-              id: 'deepseek-harness', label: displayName,
-              usage: await fetchDeepseekBalance(baseUrl, apiKey),
-            }]
-          }
-        } else {
-          opts.providerUsage = apiKey
-            ? await readDeepseekBalance(baseUrl, apiKey, displayName)
-            : { state: 'no_credentials', providerName: displayName }
-        }
-      } else {
-        opts.providerUsage = await readClaudeProviderUsage(opts.model)
+        return { id: 'deepseek-harness', label: displayName, usage: await fetchDeepseekBalance(baseUrl, apiKey) }
       }
+      // Claude 订阅取本进程的账号视图（Claude·备注）；其他来源一个计费账号一行（GLM、DeepSeek、中转站）。
+      const source = this.tokenSource(proc.tokenSourceId)
+      if (!source || source.kind === 'claude-subscription' && !processClaudeAccount(proc)) return null
+      return await readTokenSourceAccountUsage(source)
+    } catch (error) {
+      logError('session: console account MISS', error)
+      return { id: 'error', label: 'MISS', usage: { state: 'network', windows: [], reason: messageOf(error) } }
     }
+  }
+
+  private async patchConsoleUsage(cardId: string): Promise<void> {
+    // The usage panel shows only this project's account: no other project, host or account is read.
+    const opts: cards.ConsoleOpts = { sessionName: this.sessionName, status: this.status, account: await this.consoleAccount() }
     let failure: cardkit.CardWriteFailure | undefined
     const landed = await cardkit.replaceElementChecked(
       cardId,
@@ -4973,17 +4953,8 @@ export class Session {
     return mutationLanded
   }
 
-  private patchConsoleUsageLater(cardId: string, snapshot: cards.ConsoleOpts): void {
-    void (async () => {
-      try {
-        await this.patchConsoleUsage(cardId, snapshot)
-      } catch (e) {
-        logError("session: consoleUsage patch failed", e)
-      } finally {
-        try { await cardkit.dispose(cardId) }
-        catch (e) { logError("session: console card dispose failed", e) }
-      }
-    })()
+  private patchConsoleUsageLater(cardId: string): void {
+    void this.mutateStaticCard(cardId, 'console usage', () => this.patchConsoleUsage(cardId))
   }
 
   async replaceStatusCardWithConsole(handle: StatusCardHandle, finalStatus: string): Promise<void> {
@@ -4993,28 +4964,18 @@ export class Session {
     await cardkit.flush(handle.cardId)
     const failures: cardkit.CardWriteFailure[] = []
     const onFailure = (failure: cardkit.CardWriteFailure) => { failures.push(failure) }
-    const currentModelLanded = await cardkit.replaceElementChecked(
+    const projectLanded = await cardkit.replaceElementChecked(
       handle.cardId,
       cards.ELEMENTS.footer,
-      cards.consoleCurrentModelElement(consoleOpts, cards.ELEMENTS.footer),
+      cards.consoleProjectElement(consoleOpts, cards.ELEMENTS.footer),
       { onFailure },
-    )
-    const mainLanded = await cardkit.addElementChecked(
-      handle.cardId,
-      cards.consoleMainElement(consoleOpts),
-      { type: 'insert_after', targetElementId: cards.ELEMENTS.footer, onFailure },
-    )
-    const hostLanded = await cardkit.addElementChecked(
-      handle.cardId,
-      cards.consoleHostElement(consoleOpts.sysinfo),
-      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleProjects, onFailure },
     )
     const usageLanded = await cardkit.addElementChecked(
       handle.cardId,
       cards.consoleUsageElement(consoleOpts),
-      { type: 'insert_after', targetElementId: cards.ELEMENTS.consoleHost, onFailure },
+      { type: 'insert_after', targetElementId: cards.ELEMENTS.footer, onFailure },
     )
-    if (!currentModelLanded || !mainLanded || !hostLanded || !usageLanded) {
+    if (!projectLanded || !usageLanded) {
       await feishu.sendTextRaw(this.chatId, `⚠️ 控制台卡片结构写入失败，请重新发送 hi。\n${cardFailureDetails(failures)}`)
       await this.mutateStaticCard(handle.cardId, 'console structure', async () => {})
       return
@@ -5025,35 +4986,13 @@ export class Session {
       suffix: finalStatus,
     }), onFailure)
     if (!closed) await feishu.sendTextRaw(this.chatId, `⚠️ 控制台卡片状态写入失败。\n${cardFailureDetails(failures)}`)
-    this.patchConsoleUsageLater(handle.cardId, consoleOpts)
+    this.patchConsoleUsageLater(handle.cardId)
   }
 
   async showConsole(): Promise<void> {
-    // Initial paint without usage → cards.ts renders the
-    // `_加载中…_` placeholder in the consoleUsage element. We patch
-    // it in below once readUsage() resolves; not worth blocking the
-    // panel on the Codex account/rate-limit round trip.
-    const consoleOpts = await this.buildConsoleOpts(undefined)
-    const card = cards.consoleCard(consoleOpts)
-    const messageId = await feishu.sendCard(this.chatId, card)
-    if (!messageId) return
-    // Patch the usage element asynchronously so the rest of the panel
-    // stays responsive. We don't await; failures are logged and the
-    // placeholder stays visible (no fallback fabrication).
-    void (async () => {
-      let cardId = ''
-      try {
-        cardId = await cardkit.convertMessageToCard(messageId)
-        await this.patchConsoleUsage(cardId, consoleOpts)
-      } catch (e) {
-        logError("session: consoleUsage patch failed", e)
-      } finally {
-        if (cardId) {
-          try { await cardkit.dispose(cardId) }
-          catch (e) { logError("session: console card dispose failed", e) }
-        }
-      }
-    })()
+    // The first card already contains the current cached account snapshots.
+    const opts = await this.buildConsoleOpts()
+    await feishu.sendCard(this.chatId, cards.consoleCard(opts))
   }
 
   beginTurnInterrupt(
@@ -5909,6 +5848,9 @@ export class Session {
     // Cold first write that wakes SDK — this text will own the turn after init.
     sessionGsd.noteGsdUserMessage(this, text, { startsOwnTurn: true })
     this.pendingTurnInputs.push(text)
+    // 上游 v0.23.x 在此加了 sendClaimedUserText 预投递；本地投递收据机
+    // (beginHumanDelivery/dispatchHumanBatch)是最终形态,重复投递会把同一句送两次,
+    // 故保留本地单一路径,投递失败由 dispatchHumanBatch 的拒投分支处理。
     if (wasBusy && msgId) {
       // Bootstrap race / sibling-opening race: until a card is open,
       // the OneSecond ⏳ is the only ack the user gets. The init handler
@@ -6580,14 +6522,17 @@ export class Session {
       p.on(event, (payload: AgentProcessEventMap[K]) => {
         const generation = this.steeringGeneration
         const snapshot = { result: { ...p.lastResult }, totalUsage: p.lastTotalUsage ? { ...p.lastTotalUsage } : null }
+        // 安全拦截提醒是独立卡、与正文顺序无关：不进追加换卡的缓冲，也不因 stop 换代而丢弃——
+        // 原生此时已经换到降级模型，丢掉提醒就又回到“悄悄降级”。
+        const unbuffered = event === 'error' || event === 'model_refusal'
         const dispatch = (): void => {
           if (!isCurrent()) {
             return
           }
-          if (generation !== this.steeringGeneration && event !== 'exit' && event !== 'error') return
+          if (generation !== this.steeringGeneration && event !== 'exit' && !unbuffered) return
           const boundary = this.steeringBoundary
           if (boundary && boundary.proc === p && boundary.epoch === epoch
-            && event !== 'error' && !(event === 'exit' && (this.stoppingProc === p || this.blockedProc === p))) {
+            && !unbuffered && !(event === 'exit' && (this.stoppingProc === p || this.blockedProc === p))) {
             if (event === 'user_input_consumed' && boundary.collecting) {
               handler(payload, snapshot)
               return
@@ -6879,6 +6824,11 @@ export class Session {
     on('turn_input_error', ({ error }) => {
       logError('session: native input processing failed', error)
       void feishu.sendTextRaw(this.chatId, `⚠️ ${this.backendLabel(p.provider)} 输入处理错误：${error}`)
+    })
+    on('model_refusal', notice => {
+      void this.announceModelRefusal(notice).catch(error => {
+        logError('session: model refusal notice failed', error)
+      })
     })
     on('user_input_consumed', ({ inputId }) => this.onSteeringInputConsumed(p, epoch, inputId))
     on('input_batch_end', () => {})

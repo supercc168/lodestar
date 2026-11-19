@@ -25,7 +25,8 @@ import {
   addedReactions, boundResumes, branchBaseBySession, clearedResumes, clearedTurnAnchors, deletedReactions,
   feishuMockState, modelSelections, pendingConversationLaunchBySession, projectProfiles, resetFeishuMock,
   resumeRefs, seededTurnAnchors, sentCards, sentRawTexts, sentTexts,
-  setResumeWriteError, setTurnAnchorWriteError, truncatedTurnAnchors, turnAnchorsBySession, updatedCards, urgentPushes,
+  setResumeWriteError, setTurnAnchorWriteError, setUpdateCardHandler, truncatedTurnAnchors,
+  turnAnchorsBySession, updatedCards, urgentPushes,
   sentImages, uploadedImages, sentLocalFiles, setImageUploadHandler,
 } from './feishu-test-mock'
 import type { ConversationCheckpoint, ConversationRef } from './conversation'
@@ -78,6 +79,7 @@ const {
   configuredDefaultSelection,
 } = await import('./session-model')
 const { peekUsage, refreshUsageFromConnection, invalidateCodexUsage } = await import('./usage')
+const logModule = await import('./log')
 
 interface FetchCall {
   method: string
@@ -141,7 +143,7 @@ describe('Session delegated-agent capability', () => {
       expect(await session.start({ announce: false })).toBe(true)
       expect(auth).not.toHaveBeenCalled()
       expect(session.peerSnapshot().codexAccountName).toBeUndefined()
-      expect(await session.footerUsageSuffix('codex', proc, source.id, source, null, 'kimi-k3')).toBe('  |  额度 $2.00 / $5.00')
+      expect(await session.footerUsageSuffix('codex', proc, source.id, source, null, 'kimi-k3')).toBe('  |  剩余 $2.00 / $5.00')
       expect(session.conversationRouting().codexAccountId).toBeUndefined()
       expect(session.conversationRouting().codexAccountAutomatic).toBeUndefined()
     } finally {
@@ -217,6 +219,7 @@ class FakeAgentProc extends EventEmitter {
    *  既有用例零行为差,init 分流只认显式 'fresh')+ codex checkpoint 采集字段。 */
   launchKind: 'fresh' | 'resume' | 'fork' | null | undefined = null
   lastCompletedTurnId: string | null = null
+  resumedSessionId: string | null = null
   /** 进程层容量退避快照(startFooterStatus 读它覆盖 footer,D-07):忠实替身
    *  由 emitTurnRetry 先落快照再 emit,与真实 CodexProcess.scheduleCapacityRetry
    *  的「先设置 this.turnRetry 再 emit('turn_retry')」顺序一致。 */
@@ -8317,6 +8320,141 @@ describe('Session handler business receipts (upstream ec149d7 主题 I → ff44a
     expect(await broken.onAskCustomAnswer('tool-x', 0, '答案', 'ou_user')).toBe(false)
   })
 
+  test('Claude 的 hi 展示本账号全部窗口，footer 按当前模型选择周额度并保留 5h', async () => {
+    const { claudeUsageSnapshot } = await import('./claude-usage')
+    const accountUsage = await import('./account-usage')
+    const session = new Session('claude-quota', 'chat_id') as any
+    let snapshot = claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
+      five_hour: { utilization: 7, resets_at: new Date(Date.now() + 4.1 * 3600_000).toISOString() },
+      seven_day: { utilization: 17, resets_at: new Date(Date.now() + 6.9 * 86400_000).toISOString() },
+      model_scoped: [{ display_name: 'Fable', utilization: 42, resets_at: null }],
+    } })
+    const source: any = { id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', enabled: true, models: [], defaultModel: 'opus',
+      readUsage: async () => snapshot }
+    // Each account is its own view; hi must pick the one the live process is bound to.
+    const views: string[] = []
+    source.forAccount = (account: string) => {
+      views.push(account)
+      return { ...source, usageAccount: { id: `claude:${account}`, label: `Claude·${account === 'default' ? '默认' : account}` } }
+    }
+    const previousSources = listTokenSources()
+    resetTokenSourceRegistry()
+    registerTokenSource(source)
+    session.selectedTokenSourceId = source.id
+    session.currentTokenSource = () => source
+    // The live process runs on the default Claude account; hi reads only that account's view.
+    const proc = { isAlive: () => true, provider: 'claude', tokenSourceId: source.id }
+    const { bindProcessClaudeAccount } = await import('./claude-accounts')
+    bindProcessClaudeAccount(proc as any, 'default')
+    session.proc = proc
+    session.status = 'idle'
+    const replaceSpy = spyOn(cardkit, 'replaceElementChecked').mockResolvedValue(true)
+    // The group panel never reads every account; that is the 1:1 panel's job.
+    const readAllSpy = spyOn(accountUsage, 'readAllAccountUsage').mockImplementation(async () => { throw new Error('read all accounts') })
+    const bar = (cells: number) => `<font color='green'>${'▰'.repeat(cells)}${'▱'.repeat(6 - cells)}</font>`
+    const grey = (text: string) => `<font color='grey'>${text}</font>`
+    const content = () => (replaceSpy.mock.calls.at(-1)?.[2] as any).elements[0].content
+    try {
+      expect((await session.buildConsoleOpts()).account).toEqual({ id: 'claude:default', label: 'Claude·默认', usage: snapshot })
+      expect(views).toEqual(['default'])
+      await session.patchConsoleUsage('quota-card')
+      const panel = replaceSpy.mock.calls.at(-1)?.[2] as any
+      expect(panel.element_id).toBe('console_usage')
+      expect(panel.elements).toHaveLength(1)
+      expect(content().split('\n')).toEqual([
+        `5h　${bar(0)} 7%　${grey('4.1h 后重置')}`,
+        `周　${bar(1)} 17%　${grey('6.9d 后重置')}`,
+        `Fable 周　${bar(3)} 42%　${grey('重置时间 MISS')}`,
+      ])
+      expect(readAllSpy).not.toHaveBeenCalled()
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  4.1h·7%·[6.9d·17%]')
+      // 默认档位在本地映射到 claude-fable-5(DEFAULT_CLAUDE_SDK_MODEL),按当前模型取
+      // 周额度时落 Fable 家族 → model_scoped:42%,与 'opus'(非 Fable)的双窗口径不同。
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'default')).toBe('  |  4.1h·7%·[42%]')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'claude-fable-5-1[1m]')).toBe('  |  4.1h·7%·[42%]')
+      snapshot.windows.find(window => window.kind === 'modelWeekly:Fable')!.percent = null
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'fable')).toBe('  |  4.1h·7%·[MISS]')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, null)).toBe('  |  4.1h·7%·[MISS]')
+      // 账号取消 5 小时限额后只按周额度展示，不补 5h 的 MISS。
+      snapshot = claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
+        five_hour: null,
+        seven_day: { utilization: 17, resets_at: new Date(Date.now() + 6.9 * 86400_000).toISOString() },
+      } })
+      await session.patchConsoleUsage('quota-card')
+      expect(content()).toBe(`周　${bar(1)} 17%　${grey('6.9d 后重置')}`)
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  [6.9d·17%]')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'fable')).toBe('  |  [6.9d·17%]')
+      snapshot = { state: 'network', windows: [], reason: 'query failed' }
+      await session.patchConsoleUsage('quota-card')
+      expect(content()).toContain('MISS · query failed')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null)).toBe('  |  额度 MISS')
+      expect(await session.footerUsageSuffix('codex', null, source.id, source, null)).toBe('  |  额度 MISS')
+      expect(await session.footerUsageSuffix('claude', null, 'other-source', undefined, null)).toBe('  |  额度 MISS')
+      // Only the bound account's view was ever read.
+      expect(new Set(views)).toEqual(new Set(['default']))
+      // A Claude subscription process whose account is not known yet reads no account and shows no other account's quota.
+      const viewsRead = views.length
+      session.proc = { isAlive: () => true, provider: 'claude', tokenSourceId: source.id }
+      expect((await session.buildConsoleOpts()).account).toBeNull()
+      await session.patchConsoleUsage('quota-card')
+      expect(content()).toBe(grey('账号未确定'))
+      expect(views).toHaveLength(viewsRead)
+      // A failing account lookup is MISS on the card instead of a failed hi.
+      session.proc = proc
+      source.forAccount = () => { throw new Error('account store broke') }
+      const failed = await session.buildConsoleOpts()
+      expect(failed.account).toMatchObject({ label: 'MISS', usage: { state: 'network', reason: 'account store broke' } })
+      // Without a live process there is no account either.
+      session.proc = null
+      expect((await session.buildConsoleOpts()).account).toBeNull()
+      expect(readAllSpy).not.toHaveBeenCalled()
+    } finally {
+      replaceSpy.mockRestore(); readAllSpy.mockRestore()
+      resetTokenSourceRegistry()
+      for (const previous of previousSources) registerTokenSource(previous)
+    }
+  })
+
+  test('hi that starts the session turns its status card into this project\'s panel, then refreshes only that account', async () => {
+    const session = new Session('console-card', 'chat_id') as any
+    const balance = (remaining: number) => ({ state: 'ok', kind: 'balance', balance: { remaining, currency: 'CNY' }, windows: [] })
+    session.status = 'idle'
+    session.buildConsoleOpts = async () => ({ sessionName: 'console-card', status: 'idle', provider: 'claude', model: 'm', effort: 'high',
+      account: { id: 'deepseek', label: 'DeepSeek', usage: balance(12.34) } })
+    // The refresh after the card lands reads this account again and sees its newer cached balance.
+    const reads: string[] = []
+    session.consoleAccount = async () => { reads.push('deepseek'); return { id: 'deepseek', label: 'DeepSeek', usage: balance(10) } }
+    const writes: any[] = []
+    const spies = [
+      spyOn(cardkit, 'flush').mockResolvedValue(undefined),
+      spyOn(cardkit, 'replaceElementChecked').mockImplementation(async (_card: string, id: string, element: any) => { writes.push(['replace', id, element]); return true }),
+      spyOn(cardkit, 'addElementChecked').mockImplementation(async (_card: string, element: any, position: any) => { writes.push(['add', element, position.type, position.targetElementId]); return true }),
+      spyOn(cardkit, 'cancelSummary').mockImplementation(() => {}),
+      spyOn(cardkit, 'patchSettingsChecked').mockResolvedValue(true),
+      spyOn(cardkit, 'dispose').mockResolvedValue(undefined),
+    ]
+    const rawBefore = sentRawTexts.length
+    try {
+      await session.replaceStatusCardWithConsole({ cardId: 'status-card', timer: { stop() {}, elapsedSec: () => 3 } }, '✅ Claude 已就绪')
+      for (let tick = 0; tick < 50 && writes.length < 3; tick++) await new Promise(resolve => setTimeout(resolve, 1))
+      expect(writes).toHaveLength(3)
+      expect(writes[0]).toEqual(['replace', 'footer', { tag: 'markdown', element_id: 'footer',
+        content: '**状态**　🟢 空闲\n**模型**　Claude · `m/high`\n**账号**　DeepSeek' }])
+      expect(writes[1][0]).toBe('add')
+      expect(writes[1][1]).toMatchObject({ element_id: 'console_usage', elements: [{ content: '余额 ¥12.34' }] })
+      expect(writes[1].slice(2)).toEqual(['insert_after', 'footer'])
+      expect(writes[2][0]).toBe('replace')
+      expect(writes[2][1]).toBe('console_usage')
+      expect(writes[2][2].elements[0].content).toBe('余额 ¥10.00')
+      expect(reads).toEqual(['deepseek'])
+      // Nothing about other projects or the host reaches a group card, and no write failed.
+      expect(JSON.stringify(writes)).not.toMatch(/console_projects|console_host|活跃项目|主机/)
+      expect(sentRawTexts.slice(rawBefore)).toEqual([])
+    } finally {
+      for (const spy of spies) spy.mockRestore()
+    }
+  })
+
   test('onPermissionDecision commits only at protocol response (no proc / send failure keep pending)', async () => {
     const session = new Session('receipt-permission-commit', 'chat_id') as any
     session.pendingPermissions.set('req-1', { toolUseId: 'tu-1' })
@@ -10703,26 +10841,22 @@ describe('Session provider switching', () => {
     await cardkit.dispose(turn.cardId)
   })
 
-  test('patches a console quota row from the card creation snapshot after selection changes', async () => {
+  test('patches the console quota row from the live process account only', async () => {
     const accountUsage = await import('./account-usage')
     const session = new Session('console-usage-snapshot', 'chat_id') as any
     session.selectedProvider = 'claude'
     session.selectedModel = 'claude:fable'
     session.selectedEffort = 'max'
-    // 合并调和(取舍):合并后 console 额度行走上游「全部账号额度」聚合面板
-    // (cards/console.ts 双源),元素从 markdown(content)变为 collapsible_panel。
-    // 用例语义不变:补丁必须渲染卡创建时快照的那份聚合读数 —— 选择漂移后
-    // 再读到的不同读数不得改写它。快照账户(创建期)vs 漂移账户(后读)差分。
+    // 合并调和(取舍):补丁行改由本群进程实际使用的账号决定(上游 v0.23.2
+    // 「群里 hi 只看本项目」),不再冻结创建期快照,也不读全部账号。
+    session.proc = { isAlive: () => true, provider: 'claude', tokenSourceId: 'claude-sub' }
+    session.consoleAccount = async () => ({ id: 'claude-sub', label: '快照账户',
+      usage: { state: 'ok', windows: [{ kind: 'fiveHour', label: '5h', percent: 42, resetsAt: null }] } })
     const readAllSpy = spyOn(accountUsage, 'readAllAccountUsage')
-      .mockImplementation(async () => [{ id: 'claude-sub', label: '快照账户', usage: { state: 'ok', windows: [] } }] as any)
     const cardId = 'card_console_usage_snapshot'
     try {
-      const snapshot = await session.buildConsoleOpts(undefined)
-      session.selectedModel = 'claude:glm'
-      session.selectedEffort = 'xhigh'
-      readAllSpy.mockImplementation(async () => [{ id: 'claude-sub', label: '漂移账户', usage: { state: 'ok', windows: [] } }] as any)
       cardkit.recordCardCreated(cardId, 4)
-      await session.patchConsoleUsage(cardId, snapshot)
+      await session.patchConsoleUsage(cardId)
       await cardkit.flush(cardId)
 
       const panel = calls
@@ -10732,8 +10866,8 @@ describe('Session provider switching', () => {
       expect(panel.tag).toBe('collapsible_panel')
       expect(panel.element_id).toBe('console_usage')
       const rendered = panel.elements.map((el: any) => el.content ?? '').join('\n')
-      expect(rendered).toContain('快照账户')
-      expect(rendered).not.toContain('漂移账户')
+      expect(rendered).toContain('42%')
+      expect(readAllSpy).not.toHaveBeenCalled()
     } finally {
       readAllSpy.mockRestore()
       await cardkit.dispose(cardId)
@@ -14837,57 +14971,6 @@ describe('Session usage cache cross-backend isolation', () => {
     expect(session.fmtDualWindowSuffix(null, weekly)).toBe('  |  [6.9d·17%]')
     expect(session.fmtDualWindowSuffix({ percent: 7, resetsAt: new Date(Date.now() - 1000) }, weekly)).toBe('  |  7%·[6.9d·17%]')
     expect(session.fmtDualWindowSuffix(null, null)).toBe('  |  额度 MISS')
-  })
-
-  test('Claude 的 hi 展示全部窗口，footer 按当前模型选择周额度并保留 5h', async () => {
-    const { claudeUsageSnapshot } = await import('./claude-usage')
-    const accountUsage = await import('./account-usage')
-    const session = new Session('claude-quota', 'chat_id') as any
-    let snapshot = claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
-      five_hour: { utilization: 7, resets_at: new Date(Date.now() + 4.1 * 3600_000).toISOString() },
-      seven_day: { utilization: 17, resets_at: new Date(Date.now() + 6.9 * 86400_000).toISOString() },
-      model_scoped: [{ display_name: 'Fable', utilization: 42, resets_at: null }],
-    } })
-    const source = { id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', enabled: true, readUsage: async () => snapshot }
-    session.selectedTokenSourceId = source.id
-    session.currentTokenSource = () => source
-    session.buildConsoleOpts = async () => ({ sessionName: 'claude-quota', status: 'idle', provider: 'claude' })
-    const replaceSpy = spyOn(cardkit, 'replaceElementChecked').mockResolvedValue(true)
-    const readAllSpy = spyOn(accountUsage, 'readAllAccountUsage').mockImplementation(async () => [
-      { id: source.id, label: 'Claude 订阅', usage: snapshot },
-    ])
-    try {
-      await session.patchConsoleUsage('quota-card')
-      const panel = replaceSpy.mock.calls.at(-1)?.[2] as any
-      expect(panel.element_id).toBe('console_usage')
-      expect(panel.elements).toHaveLength(1)
-      expect(panel.elements[0].content).toBe('**Claude 订阅**　5h 7%/4.1h · 周 17%/6.9d · Fable周 42%/MISS')
-      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  4.1h·7%·[6.9d·17%]')
-      // 合并调和(取舍):合并保留本地 resolveClaudeSdkModel('default') →
-      // DEFAULT_CLAUDE_SDK_MODEL('claude-fable-5')映射(本地默认档),default
-      // 因而落 Fable 家族 → 周额度取 model_scoped:Fable(42%),与 'opus'(非
-      // Fable 家族)的双窗口径不同;上游该行的 'default'→opus 映射未吸收。
-      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'default')).toBe('  |  4.1h·7%·[42%]')
-      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'claude-fable-5-1[1m]')).toBe('  |  4.1h·7%·[42%]')
-      snapshot.windows.find(window => window.kind === 'modelWeekly:Fable')!.percent = null
-      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'fable')).toBe('  |  4.1h·7%·[MISS]')
-      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, null)).toBe('  |  4.1h·7%·[MISS]')
-      // 账号取消 5 小时限额后只按周额度展示，不补 5h 的 MISS。
-      snapshot = claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
-        five_hour: null,
-        seven_day: { utilization: 17, resets_at: new Date(Date.now() + 6.9 * 86400_000).toISOString() },
-      } })
-      await session.patchConsoleUsage('quota-card')
-      expect((replaceSpy.mock.calls.at(-1)?.[2] as any).elements[0].content).toBe('**Claude 订阅**　周 17%/6.9d')
-      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  [6.9d·17%]')
-      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'fable')).toBe('  |  [6.9d·17%]')
-      snapshot = { state: 'network', windows: [], reason: 'query failed' }
-      await session.patchConsoleUsage('quota-card')
-      expect((replaceSpy.mock.calls.at(-1)?.[2] as any).elements[0].content).toContain('MISS · query failed')
-      expect(await session.footerUsageSuffix('claude', null, source.id, source, null)).toBe('  |  额度 MISS')
-      expect(await session.footerUsageSuffix('codex', null, source.id, source, null)).toBe('  |  额度 MISS')
-      expect(await session.footerUsageSuffix('claude', null, 'other-source', undefined, null)).toBe('  |  额度 MISS')
-    } finally { replaceSpy.mockRestore(); readAllSpy.mockRestore() }
   })
 
   test('Claude 收尾查询等待期间切换模型，不改变旧回复的专属周额度', async () => {
@@ -20133,11 +20216,15 @@ describe('Session DSH backend wiring (upstream 722e45a)', () => {
       session.selectedProvider = 'dsh'
       session.selectedModel = 'deepseek-v4-pro'
       session.selectedEffort = 'high'
-      const snapshot = await session.buildConsoleOpts(undefined)
+      // 合并调和(取舍):额度行改由本群进程实际使用的账号决定(上游 v0.23.2),
+      // dsh 进程没有 token source 记录,consoleAccount 直接读 `[deepseek-harness]` 段。
+      session.proc = { isAlive: () => true, provider: 'dsh', tokenSourceId: null }
+      const opts = await session.buildConsoleOpts()
+      expect(opts.account).toMatchObject({ id: 'deepseek-harness' })
       const cardId = 'card_console_usage_dsh'
       cardkit.recordCardCreated(cardId, 4)
 
-      await session.patchConsoleUsage(cardId, snapshot)
+      await session.patchConsoleUsage(cardId)
       await cardkit.flush(cardId)
 
       expect(balanceRequests).toEqual(['https://api.deepseek.com/user/balance'])
@@ -20152,7 +20239,7 @@ describe('Session DSH backend wiring (upstream 722e45a)', () => {
         .at(-1)
       expect(panel.tag).toBe('collapsible_panel')
       expect(panel.element_id).toBe('console_usage')
-      expect(panel.elements.map((el: any) => el.content).join('\n')).toContain('余额 ¥ 66.88')
+      expect(panel.elements.map((el: any) => el.content).join('\n')).toContain('余额 ¥66.88')
       await cardkit.dispose(cardId)
     } finally {
       globalThis.fetch = passthrough
@@ -20241,11 +20328,13 @@ describe('Session DSH model panel and console (upstream 722e45a)', () => {
   test('控制台:DSH 余额占位、DeepSeek Harness 分组与 provider 标签', async () => {
     const cards = await import('./cards')
 
+    // 合并调和(取舍):群里 hi 的额度区只渲染本群进程账号(上游 v0.23.2),
+    // 账号尚未读取时是「加载中…」的占位行。
     const placeholder = cards.consoleUsageElement({
       sessionName: 'dsh-console', status: 'idle', provider: 'dsh', usageSource: 'provider',
     }) as any
-    expect(placeholder.content).toContain('📊 余额')
-    expect(placeholder.content).toContain('加载中')
+    expect(placeholder.tag).toBe('collapsible_panel')
+    expect(placeholder.elements[0].content).toBe('加载中…')
 
     const panel = JSON.stringify(cards.modelSelectionPanelElement({
       sessionName: 'dsh-console',
@@ -21323,6 +21412,81 @@ describe('Session shared cards preserve warm agent resumes', () => {
     await session.agentCards.closeChat('chat_id')
   })
 })
+
+describe('Session workload shown by hi and bl', () => {
+  test('counts the task card rows when the backend has no live set of its own (DSH)', async () => {
+    const session = new Session('probe-workload-tracked', 'chat_workload_tracked') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1') as any
+    session.proc = proc
+    session.wireProc(proc)
+    try {
+      proc.emit('bg_task_started', { task_id: 'agent-1', tool_use_id: 'tool-1', description: '审查', task_type: 'local_agent' })
+      proc.emit('bg_task_started', { task_id: 'flow-1', description: 'spec', task_type: 'local_workflow' })
+      // An ordinary command stays in the observation pool: it is still the main turn's own work.
+      proc.emit('bg_task_started', { task_id: 'bash-1', description: 'npm test', task_type: 'local_bash' })
+      await session.backgroundSync
+      expect(await session.workload()).toEqual({ background: 1, subagents: 1 })
+
+      proc.emit('bg_task_settled', { task_id: 'agent-1', status: 'completed' })
+      await session.backgroundSync
+      expect(await session.workload()).toEqual({ background: 1, subagents: 0 })
+    } finally { session.dispose() }
+  })
+
+  test('prefers the backend live set and shows MISS when it cannot be read', async () => {
+    const session = new Session('probe-workload-native', 'chat_workload_native') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1') as any
+    session.proc = proc
+    session.wireProc(proc)
+    const logged = spyOn(logModule, 'logError').mockImplementation(() => {})
+    try {
+      proc.emit('bg_task_started', { task_id: 'agent-1', tool_use_id: 'tool-1', description: '审查', task_type: 'local_agent' })
+      proc.emit('bg_task_started', { task_id: 'flow-1', description: 'spec', task_type: 'local_workflow' })
+      await session.backgroundSync
+
+      proc.backgroundProcessCount = async () => 3
+      expect(await session.workload()).toEqual({ background: 3, subagents: 1 })
+      proc.backgroundProcessCount = async () => 0
+      expect(await session.workload()).toEqual({ background: 0, subagents: 1 })
+      // No level from the backend yet: fall back to the task card's own rows.
+      proc.backgroundProcessCount = async () => undefined
+      expect(await session.workload()).toEqual({ background: 1, subagents: 1 })
+
+      proc.backgroundProcessCount = async () => { throw new Error('list unavailable') }
+      expect(await session.workload()).toEqual({ background: null, subagents: 1 })
+      expect(logged).toHaveBeenCalledWith('session: background process count failed', expect.any(Error))
+
+      proc.alive = false
+      expect(await session.workload()).toEqual({ background: 0, subagents: 0 })
+    } finally {
+      logged.mockRestore()
+      session.dispose()
+    }
+  })
+
+  test('bl peers carry the workload of running temporary sessions only', async () => {
+    const running = new Session('probe-workload*运行', 'chat_workload_running') as any
+    const idle = new Session('probe-workload*未启动', 'chat_workload_idle') as any
+    const proc = new FakeAgentProc('codex', 'codex-thread-1') as any
+    proc.backgroundProcessCount = async () => 2
+    running.proc = proc
+    running.wireProc(proc)
+    running.status = 'idle'
+    try {
+      const peers = await running.tempSessionPeers()
+      expect(peers.find((peer: any) => peer.chatId === 'chat_workload_running')).toMatchObject({
+        running: true, workload: { background: 2, subagents: 0 },
+      })
+      expect(peers.find((peer: any) => peer.chatId === 'chat_workload_idle')).toMatchObject({
+        running: false, workload: null,
+      })
+    } finally {
+      running.dispose()
+      idle.dispose()
+    }
+  })
+})
+
 describe('Session task-end notifications', () => {
   function task(status: 'running' | 'completed') {
     return {
@@ -21452,3 +21616,352 @@ describe('Session task-end notifications', () => {
     session.dispose()
   })
 })
+
+describe('Claude safety refusal notices', () => {
+  const fallback = {
+    kind: 'fallback' as const, scope: 'session' as const, originalModel: 'claude-opus-5-5',
+    fallbackModel: 'claude-opus-4-8', category: 'cyber', explanation: 'Cyber safeguards flagged this message.',
+    uuid: 'notice-1', retracted: [] as string[],
+  }
+
+  function wired(name: string) {
+    const session = new Session(name, 'chat_id') as any
+    session.selectedProvider = 'claude'
+    const proc = new FakeAgentProc('claude', 'claude-session') as any
+    session.proc = proc
+    session.wireProc(proc)
+    return { session, proc }
+  }
+
+  test('a session fallback sends its own card and the running turn footer shows the fallback model', async () => {
+    const { session, proc } = wired('refusal-session')
+    const turn = turnState('card_refusal')
+    turn.provider = 'claude'; turn.model = 'claude-opus-5-5'; turn.effort = 'max'
+    session.currentTurn = turn
+    try {
+      proc.emit('model_refusal', fallback)
+      await waitUntil(() => sentCards.length === 1)
+      const card = sentCards[0] as any
+      expect(card.header.title.content).toBe('⚠️ 安全拦截 · 已降级为 Opus 4.8')
+      expect(JSON.stringify(card)).toContain('Claude Code 已改由 Opus 4.8 接着回答')
+      expect(turn.model).toBe('claude-opus-4-8')
+      expect(session.modelLine()).toBe('claude · claude-opus-4-8/max')
+      expect(sentRawTexts).toEqual([])
+    } finally { session.dispose() }
+  })
+
+  test('local fallbacks alert once per turn and model pair; a refusal without a fallback always alerts', async () => {
+    const { session, proc } = wired('refusal-local')
+    const turn = turnState('card_refusal_local')
+    turn.provider = 'claude'; turn.model = 'claude-opus-5-5'
+    session.currentTurn = turn
+    try {
+      const local = { ...fallback, scope: 'local' as const }
+      proc.emit('model_refusal', local)
+      proc.emit('model_refusal', local)
+      proc.emit('model_refusal', { ...local, fallbackModel: 'claude-sonnet-5-5' })
+      proc.emit('model_refusal', { kind: 'no_fallback', scope: 'session', originalModel: 'claude-opus-5-5',
+        fallbackModel: null, category: null, explanation: null, uuid: 'notice-stop', retracted: [] })
+      await waitUntil(() => sentCards.length === 3)
+      await new Promise(resolve => setTimeout(resolve, 5))
+      expect(sentCards.map((card: any) => card.header.title.content)).toEqual([
+        '⚠️ 安全拦截 · 子 Agent 改用 Opus 4.8',
+        '⚠️ 安全拦截 · 子 Agent 改用 Sonnet 5.5',
+        '⚠️ 安全拦截 · 本轮已终止',
+      ])
+      // Neither a local fallback nor a terminated turn changes the session's model.
+      expect(turn.model).toBe('claude-opus-5-5')
+    } finally { session.dispose() }
+  })
+
+  test('a failed card send falls back to the same notice as text with the Feishu diagnosis', async () => {
+    const { session, proc } = wired('refusal-text-fallback')
+    const send = spyOn(feishu, 'sendCard').mockImplementation(async (_chatId, _card, onFailure) => {
+      onFailure?.(Object.assign(new Error('card rejected'), { code: 230099 }))
+      return null
+    })
+    try {
+      proc.emit('model_refusal', fallback)
+      await waitUntil(() => sentRawTexts.length === 1)
+      expect(sentRawTexts[0]).toStartWith('⚠️ 安全拦截 · 已降级为 Opus 4.8\nOpus 5.5 的安全分类器拦下了本轮回复（类别 cyber）')
+      expect(sentRawTexts[0]).toContain('（提醒卡发送失败，改发文字：code=230099')
+    } finally {
+      send.mockRestore()
+      session.dispose()
+    }
+  })
+
+  test('reselecting the saved model after a session fallback really switches the live process back', async () => {
+    buildTokenSourcesFromConfig()
+    const glm = getTokenSource('glm')!
+    glm.enabled = true
+    glm.models = [{ model: 'GLM-5.2', display: 'GLM-5.2', efforts: ['max'], defaultEffort: 'max' }]
+    glm.defaultModel = 'GLM-5.2'
+    glm.modelCatalogState = { status: 'ready', updatedAt: 1 }
+    const session = new Session('refusal-reselect', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-1', 'glm') as any
+    session.proc = proc
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'
+    session.selectedEffort = 'max'
+    proc.refusalFallback = { originalModel: 'GLM-5.2', fallbackModel: 'GLM-4.7' }
+    session.modelPanels.set('panel-glm', { models: [{
+      provider: 'claude', sourceId: 'glm', model: 'GLM-5.2', displayName: 'GLM-5.2',
+      efforts: [{ effort: 'max', isDefault: true, selected: true }],
+    }] })
+    try {
+      const result = await session.onModelEffortSelect('GLM-5.2', 'max', 'panel-glm', 'ou_user', 'claude')
+      expect(result.ok).toBe(true)
+      expect(result.message).not.toContain('当前已是')
+      expect(proc.setModelSettingsCalls).toHaveLength(1)
+      expect(proc.setModelSettingsCalls[0]![1]).toBe('max')
+      expect(proc.killCalls).toBe(0)
+      expect(session.proc).toBe(proc)
+      // Without a fallback the same reselection stays a no-op.
+      proc.refusalFallback = null
+      session.modelPanels.set('panel-glm-again', { models: [{
+        provider: 'claude', sourceId: 'glm', model: 'GLM-5.2', displayName: 'GLM-5.2',
+        efforts: [{ effort: 'max', isDefault: true, selected: true }],
+      }] })
+      const again = await session.onModelEffortSelect('GLM-5.2', 'max', 'panel-glm-again', 'ou_user', 'claude')
+      expect(again.message).toContain('当前已是')
+      expect(proc.setModelSettingsCalls).toHaveLength(1)
+    } finally {
+      session.dispose()
+      resetTokenSourceRegistry()
+    }
+  })
+
+  test('reselecting while a turn is running still switches back, effective from the next turn', async () => {
+    buildTokenSourcesFromConfig()
+    const glm = getTokenSource('glm')!
+    glm.enabled = true
+    glm.models = [{ model: 'GLM-5.2', display: 'GLM-5.2', efforts: ['max'], defaultEffort: 'max' }]
+    glm.defaultModel = 'GLM-5.2'
+    glm.modelCatalogState = { status: 'ready', updatedAt: 1 }
+    const session = new Session('refusal-reselect-busy', 'chat_id') as any
+    const proc = new FakeAgentProc('claude', 'claude-session-busy', 'glm') as any
+    session.proc = proc
+    session.selectedProvider = 'claude'; session.selectedTokenSourceId = 'glm'
+    session.selectedModel = 'GLM-5.2'; session.selectedEffort = 'max'
+    session.currentTurn = turnState('card_refusal_busy')
+    proc.refusalFallback = { originalModel: 'GLM-5.2', fallbackModel: 'GLM-4.7' }
+    session.modelPanels.set('panel-busy', { models: [{
+      provider: 'claude', sourceId: 'glm', model: 'GLM-5.2', displayName: 'GLM-5.2',
+      efforts: [{ effort: 'max', isDefault: true, selected: true }],
+    }] })
+    try {
+      const result = await session.onModelEffortSelect('GLM-5.2', 'max', 'panel-busy', 'ou_user', 'claude')
+      expect(result.ok).toBe(true)
+      expect(proc.setModelSettingsCalls).toHaveLength(1)
+      expect(JSON.stringify(result.card)).toContain('当前 turn 不变')
+    } finally {
+      session.currentTurn = null
+      session.dispose()
+      resetTokenSourceRegistry()
+    }
+  })
+
+  test('a notice arriving while an input batch waits survives stop', async () => {
+    const { session, proc } = wired('refusal-steering-stop')
+    session.initCount = 1; session.turnCounter = 1; session.status = 'working'
+    const turn = turnState('card_refusal_steering')
+    turn.provider = 'claude'; turn.model = 'claude-opus-5-5'
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 2)
+    proc.steerUserText = async () => true
+    try {
+      await session.onUserMessage('waiting input', [], 'ou_user', 'om_waiting')
+      await session.steeringSend
+      proc.emit('user_input_consumed', { inputId: [...session.submittedSteering.keys()][0] })
+      expect(session.steeringBoundary.collecting).toBe(true)
+      proc.emit('model_refusal', fallback)
+      // The fallback already applies to this turn even though output events are buffered.
+      expect(turn.model).toBe('claude-opus-4-8')
+      await session.runCommand('stop')
+      expect(session.steeringBoundary).toBeNull()
+      await waitUntil(() => sentCards.length === 1)
+      expect((sentCards[0] as any).header.title.content).toBe('⚠️ 安全拦截 · 已降级为 Opus 4.8')
+    } finally { session.dispose() }
+  })
+
+  test('a later fallback that retracts the earlier notice rewrites that card instead of adding one', async () => {
+    const { session, proc } = wired('refusal-superseded')
+    const turn = turnState('card_refusal_superseded')
+    turn.provider = 'claude'; turn.model = 'claude-opus-5-5'
+    session.currentTurn = turn
+    try {
+      proc.emit('model_refusal', fallback)
+      await waitUntil(() => sentCards.length === 1)
+      proc.emit('model_refusal', { ...fallback, fallbackModel: 'claude-sonnet-5-5[1m]', uuid: 'notice-2',
+        retracted: ['partial-1', 'notice-1'] })
+      await waitUntil(() => updatedCards.length === 1)
+      expect(sentCards).toHaveLength(1)
+      expect(updatedCards[0]![0]).toBe('om_status_1')
+      expect((updatedCards[0]![1] as any).header.title.content).toBe('⚠️ 安全拦截 · 已降级为 Sonnet 5.5')
+      // Same display form as the rest of the footer: no [1m] accounting suffix.
+      expect(turn.model).toBe('claude-sonnet-5-5')
+      // A third notice retracting the second still lands on the same card.
+      proc.emit('model_refusal', { ...fallback, fallbackModel: 'claude-haiku-5-5', uuid: 'notice-3', retracted: ['notice-2'] })
+      await waitUntil(() => updatedCards.length === 2)
+      expect(updatedCards[1]![0]).toBe('om_status_1')
+      expect(sentCards).toHaveLength(1)
+    } finally { session.dispose() }
+  })
+
+  test('if rewriting the earlier card fails, the newer notice is still sent', async () => {
+    const { session, proc } = wired('refusal-superseded-fallback')
+    setUpdateCardHandler(async () => { throw new Error('message.patch rejected') })
+    try {
+      proc.emit('model_refusal', fallback)
+      await waitUntil(() => sentCards.length === 1)
+      proc.emit('model_refusal', { ...fallback, fallbackModel: 'claude-sonnet-5-5', uuid: 'notice-2', retracted: ['notice-1'] })
+      await waitUntil(() => sentCards.length === 2)
+      expect((sentCards[1] as any).header.title.content).toBe('⚠️ 安全拦截 · 已降级为 Sonnet 5.5')
+    } finally {
+      setUpdateCardHandler(null)
+      session.dispose()
+    }
+  })
+})
+
+
+  test('restart continuation reaches a restored Claude conversation before its first native message', async () => {
+    // Claude reports system/init and its session id only once a turn starts. A daemon-restored
+    // process is initialized and idle with neither, the state the first ordinary message meets.
+    const session = new Session('daemon-continue-claude', 'chat_id') as any
+    const ref = { provider: 'claude' as const, sessionId: 'saved-claude-session', cwd: session.workDir }
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.lastSessionRef = ref
+    session.lastSessionId = ref.sessionId
+    const proc = new FakeAgentProc('claude', null)
+    proc.resumedSessionId = ref.sessionId
+    let spawnCount = 0
+    session.spawnAgent = (source: unknown) => {
+      expect(source).toEqual(ref)
+      spawnCount++
+      return proc
+    }
+    try {
+      expect(await session.restoreAfterDaemonRestart()).toBe(true)
+      expect(session.status).toBe('idle')
+      expect(session.initCount).toBe(0)
+      expect(proc.sessionId).toBeNull()
+      await session.continueAfterDaemonRestart()
+      expect(proc.sentTexts).toHaveLength(1)
+      expect(proc.sentTexts[0]).toContain('[宿主重启自动续接]')
+      // A second request is refused while the first is still unconsumed: never two continuations.
+      await expect(session.continueAfterDaemonRestart()).rejects.toThrow('未发送自动续接请求')
+      // The native turn then starts on the restored conversation and its init opens the turn card.
+      proc.sessionId = ref.sessionId
+      proc.emit('init', { session_id: ref.sessionId })
+      for (let i = 0; i < 20 && !session.currentTurn; i++) await new Promise(resolve => setTimeout(resolve, 5))
+      expect(session.currentTurn).not.toBeNull()
+      expect(proc.sentTexts).toHaveLength(1)
+      expect(spawnCount).toBe(1)
+      expect(proc.killCalls).toBe(0)
+      expect(session.lastSessionId).toBe(ref.sessionId)
+    } finally { await session.stop('测试收尾', { announce: false }) }
+  })
+
+  test('restart continuation submits through a real restored ClaudeAgentProcess before any native message', async () => {
+    const agentUpdates = await import('./agent-updates')
+    const inputs: any[] = []
+    let finish!: () => void
+    const ended = new Promise<void>(resolve => { finish = resolve })
+    // Streaming input: the SDK yields nothing, neither init nor a session id, before the first input.
+    const sdk = spyOn(agentUpdates, 'loadClaudeSdk').mockResolvedValue({
+      query({ prompt }: any) {
+        void (async () => { for await (const message of prompt) inputs.push(message) })()
+        return {
+          accountInfo: async () => ({}),
+          interrupt: async () => ({ still_queued: [] }),
+          close() { finish() },
+          async *[Symbol.asyncIterator]() { await ended },
+        }
+      },
+    } as any)
+    const configDir = mkdtempSync(join(tmpdir(), 'restart-continue-claude-'))
+    const session = new Session('daemon-continue-real-claude', 'chat_id') as any
+    const ref = { provider: 'claude' as const, sessionId: 'saved-claude-session', cwd: session.workDir }
+    session.selectedProvider = 'claude'
+    session.selectedTokenSourceId = null
+    session.selectedEffort = 'max'
+    session.lastSessionRef = ref
+    session.lastSessionId = ref.sessionId
+    let proc: any = null
+    session.spawnAgent = () => (proc = new ClaudeAgentProcess({ workDir: session.workDir, effort: 'max',
+      resumeSessionId: ref.sessionId, transformEnv: (env: Record<string, string | undefined>) => ({ ...env, CLAUDE_CONFIG_DIR: configDir }) }))
+    try {
+      expect(await session.restoreAfterDaemonRestart()).toBe(true)
+      expect(session.initCount).toBe(0)
+      expect(proc.sessionId).toBeNull()
+      expect(proc.resumedSessionId).toBe(ref.sessionId)
+      await session.continueAfterDaemonRestart()
+      for (let i = 0; i < 40 && inputs.length === 0; i++) await new Promise(resolve => setTimeout(resolve, 5))
+      expect(inputs).toHaveLength(1)
+      expect(JSON.stringify(inputs[0])).toContain('[宿主重启自动续接]')
+    } finally {
+      await session.stop('测试收尾', { announce: false })
+      sdk.mockRestore()
+      rmSync(configDir, { recursive: true, force: true })
+    }
+  })
+
+  test.each(['fork-or-fresh', 'other-conversation'])(
+    'restart continuation refuses a Claude process that does not resume the saved conversation in place: %s', async reason => {
+      const session = new Session(`daemon-continue-claude-${reason}`, 'chat_id') as any
+      const ref = { provider: 'claude' as const, sessionId: 'saved-claude-session', cwd: session.workDir }
+      session.selectedProvider = 'claude'
+      session.selectedTokenSourceId = null
+      session.lastSessionRef = ref
+      session.lastSessionId = ref.sessionId
+      const proc = new FakeAgentProc('claude', null)
+      proc.resumedSessionId = reason === 'other-conversation' ? 'another-session' : null
+      session.proc = proc
+      session.initCount = 0
+      session.status = 'idle'
+      session.spawnAgent = () => { throw new Error('must not spawn another conversation') }
+      try {
+        await expect(session.continueAfterDaemonRestart()).rejects.toThrow('未发送')
+        expect(proc.sentTexts).toEqual([])
+        expect(session.lastSessionId).toBe(ref.sessionId)
+      } finally { session.proc = null; session.dispose() }
+    },
+  )
+
+  test('ClaudeAgentProcess names only an in-place resume as the conversation it continues', () => {
+    expect(new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', resumeSessionId: 'saved' }).resumedSessionId).toBe('saved')
+    expect(new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max', resumeSessionId: 'saved', forkSession: true }).resumedSessionId).toBeNull()
+    expect(new ClaudeAgentProcess({ workDir: '/tmp', effort: 'max' }).resumedSessionId).toBeNull()
+  })
+
+  test.each(['quota', 'exited', 'different-thread', 'busy', 'different-source', 'exits-before-send', 'card-open-failed'])(
+    'restart continuation never opens a fresh conversation or queues into an unavailable one: %s', async reason => {
+      const session = new Session(`daemon-continue-${reason}`, 'chat_id') as any
+      const proc = new FakeAgentProc('codex', 'saved-thread')
+      session.selectedProvider = 'codex'
+      session.selectedTokenSourceId = null
+      session.proc = proc
+      session.lastSessionId = proc.sessionId
+      session.lastSessionRef = { provider: 'codex', sessionId: proc.sessionId, cwd: session.workDir }
+      session.initCount = 1
+      session.status = 'idle'
+      if (reason === 'quota') { session.daemonRestoreRequired = true; session.status = 'starting' }
+      if (reason === 'exited') proc.alive = false
+      if (reason === 'different-thread') proc.sessionId = 'another-thread'
+      if (reason === 'busy') session.pendingUserMessageCount = 1
+      if (reason === 'different-source') session.selectedTokenSourceId = 'other-source'
+      if (reason === 'exits-before-send') session.stopIdleMismatchedProcessUnlocked = async () => { proc.alive = false }
+      if (reason === 'card-open-failed') session.openTurnCard = async () => null
+      session.spawnAgent = () => { throw new Error('must not spawn another conversation') }
+      try {
+        await expect(session.continueAfterDaemonRestart()).rejects.toThrow('未发送')
+        expect(proc.sentTexts).toEqual([])
+        expect(session.pendingMidTurnMsgs).toEqual([])
+        expect(session.lastSessionId).toBe('saved-thread')
+      } finally { session.proc = null; session.dispose() }
+    },
+  )

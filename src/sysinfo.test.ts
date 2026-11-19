@@ -134,13 +134,33 @@ describe('macOS host snapshot', () => {
     const content = consoleHostContent(snapshot)
     expect(content).toContain('1.50 / 2.00 / 2.50 (8核)')
     expect(content).toContain('37%')
-    expect(content).toContain('cc-running` · active · 已运行 2m')
-    expect(content).toContain('cc-scheduled` · inactive · 上次活跃 MISS · 退出码 0')
+    // The dot and 已运行 / 已停 / 已挂 already carry running, stopped and failed: no repeated English state.
+    expect(content).toContain('🟢 `cc-running` · 已运行 2m')
+    expect(content).toContain('⚪ `cc-scheduled` · 上次活跃 MISS · 退出码 0')
+    expect(content).toContain('❌ `codex-failed` · 上次活跃 MISS · 退出码 1')
+    expect(content).not.toMatch(/ · (active|inactive|failed) · /)
+    // The collapsed host panel spells out load, memory and services in words, failed services included.
+    expect((consoleHostElement(snapshot) as any).header.title.content).toBe('🖥 主机 · 负载 1.50 · 内存 37% · 服务 4 · ❌ 失败 2')
     expect(content).toContain('退出码 1')
     expect(content).toContain('终止信号 15')
     expect(content).not.toContain('从未启动')
-    expect(JSON.stringify(consoleHostElement(snapshot))).toContain('L1.50 · M37% · S4')
+    // A service list that could not be read gives no count in the title; the panel body carries the error.
+    expect((consoleHostElement({ ...snapshot, servicesError: 'launchctl MISS' }) as any).header.title.content)
+      .toBe('🖥 主机 · 负载 1.50 · 内存 37%')
     expect(consoleHostContent({ ...snapshot, services: [{ ...services[1]!, hasStarted: false }] })).toContain('从未启动')
+  })
+
+  test('service rows lead with the state duration and print the English state only when nothing else says it', () => {
+    const row = (service: object) => consoleHostContent({ cpu: null, mem: null, disks: [], servicesError: null,
+      services: [{ name: 'cc-x', sub: '', lastActiveAgoSec: null, stateAgoSec: null, ...service } as any] }).split('\n').at(-1)
+    expect(row({ active: 'inactive', stateAgoSec: 120, lastActiveAgoSec: 4000, lastExitStatus: 0 }))
+      .toBe('　· ⚪ `cc-x` · 已停 2m · 上次活跃 1.1h前 · 退出码 0')
+    expect(row({ active: 'failed', stateAgoSec: 40, hasStarted: false, lastExitStatus: 1 }))
+      .toBe('　· ❌ `cc-x` · 已挂 40s · 从未启动 · 退出码 1')
+    expect(row({ active: 'activating', stateAgoSec: 3 })).toBe('　· 🚀 `cc-x` · activating · 已 3s')
+    // A running job whose runtime is unreadable shows the reason, not "active".
+    expect(row({ active: 'active', error: 'ps 未返回该进程，运行时长 MISS' })).toBe('　· 🟢 `cc-x` · ps 未返回该进程，运行时长 MISS')
+    expect(row({ active: 'active' })).toBe('　· 🟢 `cc-x` · active')
   })
 })
 

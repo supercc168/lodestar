@@ -1176,6 +1176,47 @@ describe('Claude repeated tool failure correction hook', () => {
   })
 })
 
+  test('counts live background processes from the SDK level, without subagents or ambient tasks', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    // The level is per process and nothing is sent at startup: no level yet.
+    expect(await proc.backgroundProcessCount()).toBeUndefined()
+
+    proc.handleMessage({
+      type: 'system', subtype: 'background_tasks_changed', uuid: 'level-1', session_id: 'session-1',
+      tasks: [
+        { task_id: 'bash-1', task_type: 'local_bash', description: 'dev server' },
+        { task_id: 'agent-1', task_type: 'local_agent', subagent_type: 'general-purpose', description: 'review' },
+        { task_id: 'flow-1', task_type: 'local_workflow', description: 'spec' },
+        { task_id: 'watch-1', task_type: 'monitor_ws', description: 'watch', ambient: true },
+      ],
+    })
+    expect(await proc.backgroundProcessCount()).toBe(2)
+
+    // REPLACE semantics: each payload is the whole live set.
+    proc.handleMessage({ type: 'system', subtype: 'background_tasks_changed', uuid: 'level-2', session_id: 'session-1', tasks: [] })
+    expect(await proc.backgroundProcessCount()).toBe(0)
+  })
+
+  test('an unreadable level is an error until the next valid payload', async () => {
+    const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
+    const diagnostic = spyOn(logModule, 'logDiagnostic').mockImplementation(() => {})
+    try {
+      proc.handleMessage({ type: 'system', subtype: 'background_tasks_changed', tasks: [{ task_id: 'bash-1' }] })
+      const error = await proc.backgroundProcessCount().then(() => undefined, (failure: Error) => failure)
+      expect(error?.message).toBe('Claude 后台任务列表无法识别')
+      expect(diagnostic).toHaveBeenCalledWith('claude-agent-process: malformed background task level')
+
+      proc.handleMessage({ type: 'system', subtype: 'background_tasks_changed', tasks: 'not-a-list' })
+      expect(await proc.backgroundProcessCount().then(() => undefined, (failure: Error) => failure)).toBeInstanceOf(Error)
+
+      proc.handleMessage({
+        type: 'system', subtype: 'background_tasks_changed',
+        tasks: [{ task_id: 'bash-1', task_type: 'local_bash', description: 'dev server' }],
+      })
+      expect(await proc.backgroundProcessCount()).toBe(1)
+    } finally { diagnostic.mockRestore() }
+  })
+
 describe('Claude user dialog bridge', () => {
   test('emits only SDK meta string prompts as scheduled turn input', () => {
     const proc = new ClaudeAgentProcess({ workDir: '/tmp', effort: 'high' }) as any
@@ -2978,6 +3019,109 @@ describe('Claude turn-local checkpoint(上游 ff44afb)', () => {
   })
 })
 
+describe('Claude safety refusal fallback', () => {
+  const explanation = 'Cyber safeguards flagged this message. private-user /private/source.ts'
+  function capture() {
+    const proc = new ClaudeAgentProcess({ workDir: tmpdir(), model: 'claude-opus-5-5', effort: 'max' }) as any
+    const notices: unknown[] = []
+    proc.on('model_refusal', (notice: unknown) => notices.push(notice))
+    return { proc, notices }
+  }
+  function fallback(extra: Record<string, unknown> = {}) {
+    return {
+      type: 'system', subtype: 'model_refusal_fallback', trigger: 'refusal', direction: 'retry', scope: 'session',
+      original_model: 'claude-opus-5-5', fallback_model: 'claude-opus-4-8', request_id: 'req-private',
+      api_refusal_category: 'cyber', api_refusal_explanation: explanation, retracted_message_uuids: [],
+      refused_user_message_uuid: 'private-user-message', content: explanation, uuid: 'u', session_id: 'private-session',
+      ...extra,
+    }
+  }
+
+  test('a session-scoped fallback is reported and the session stays on the fallback model until set again', async () => {
+    const diagnostic = spyOn(logModule, 'logDiagnostic').mockImplementation(() => {})
+    try {
+      const { proc, notices } = capture()
+      // The first stop is only a native banner; the retry outcome follows as model_refusal_*.
+      proc.handleMessage({ type: 'system', subtype: 'informational', level: 'notice', uuid: 'i',
+        content: "Opus 5.5's safeguards stopped the response above · continuing once with that noted" })
+      expect(notices).toEqual([])
+      proc.handleMessage(fallback())
+      expect(notices).toEqual([{ kind: 'fallback', scope: 'session', originalModel: 'claude-opus-5-5',
+        fallbackModel: 'claude-opus-4-8', category: 'cyber', explanation, uuid: 'u', retracted: [] }])
+      expect(proc.refusalFallback).toEqual({ originalModel: 'claude-opus-5-5', fallbackModel: 'claude-opus-4-8' })
+      expect(proc.lastModel).toBe('claude:claude-opus-4-8')
+      // Replies from the fallback model keep it; a later explicit model setting ends it.
+      proc.handleMessage({ type: 'assistant', uuid: 'a', message: { model: 'claude-opus-4-8', content: [] } })
+      expect(proc.refusalFallback).not.toBeNull()
+      proc.started = true
+      proc.query = { setModel: async () => {}, applyFlagSettings: async () => {} }
+      await proc.setModelSettings('claude-opus-5-5', 'max')
+      expect(proc.refusalFallback).toBeNull()
+      expect(proc.lastModel).toBe('claude:claude-opus-5-5')
+      expect(diagnostic.mock.calls).toEqual([['claude-agent-process: model refusal fallback']])
+    } finally { diagnostic.mockRestore() }
+  })
+
+  test('an older CLI without scope counts as a session fallback; a main-thread reply from the original model ends it', () => {
+    const { proc, notices } = capture()
+    proc.handleMessage(fallback({ scope: undefined, api_refusal_category: undefined, api_refusal_explanation: null }))
+    expect(notices).toEqual([{ kind: 'fallback', scope: 'session', originalModel: 'claude-opus-5-5',
+      fallbackModel: 'claude-opus-4-8', category: null, explanation: null, uuid: 'u', retracted: [] }])
+    expect(proc.refusalFallback).not.toBeNull()
+    proc.handleMessage({ type: 'assistant', uuid: 'b', message: { model: 'claude-opus-5-5', content: [] } })
+    expect(proc.refusalFallback).toBeNull()
+    expect(proc.lastModel).toBe('claude:claude-opus-5-5')
+  })
+
+  test('a local fallback (subagent or side question) leaves the session model unchanged', () => {
+    const { proc, notices } = capture()
+    proc.handleMessage(fallback({ scope: 'local', retracted_message_uuids: ['partial-1', 7, '', 'notice-0'] }))
+    expect(notices).toEqual([{ kind: 'fallback', scope: 'local', originalModel: 'claude-opus-5-5',
+      fallbackModel: 'claude-opus-4-8', category: 'cyber', explanation, uuid: 'u', retracted: ['partial-1', 'notice-0'] }])
+    expect(proc.refusalFallback).toBeNull()
+    expect(proc.lastModel).toBe('claude:claude-opus-5-5')
+  })
+
+  test('a refusal without a fallback model is reported as a terminated turn', () => {
+    const diagnostic = spyOn(logModule, 'logDiagnostic').mockImplementation(() => {})
+    try {
+      const { proc, notices } = capture()
+      proc.handleMessage({ type: 'system', subtype: 'model_refusal_no_fallback', original_model: 'claude-opus-5-5',
+        request_id: null, api_refusal_category: 'bio', content: 'stopped', uuid: 'n', session_id: 's' })
+      expect(notices).toEqual([{ kind: 'no_fallback', scope: 'session', originalModel: 'claude-opus-5-5',
+        fallbackModel: null, category: 'bio', explanation: null, uuid: 'n', retracted: [] }])
+      expect(proc.refusalFallback).toBeNull()
+      expect(diagnostic.mock.calls).toEqual([['claude-agent-process: model refusal without fallback']])
+    } finally { diagnostic.mockRestore() }
+  })
+
+  test('a malformed notice is still reported, with a fixed diagnostic and no session swap', () => {
+    const diagnostic = spyOn(logModule, 'logDiagnostic').mockImplementation(() => {})
+    try {
+      const { proc, notices } = capture()
+      proc.handleMessage(fallback({ fallback_model: '', original_model: 42 }))
+      expect(notices).toEqual([{ kind: 'fallback', scope: 'session', originalModel: null,
+        fallbackModel: null, category: 'cyber', explanation, uuid: 'u', retracted: [] }])
+      expect(proc.refusalFallback).toBeNull()
+      expect(proc.lastModel).toBe('claude:claude-opus-5-5')
+      expect(diagnostic.mock.calls).toEqual([
+        ['claude-agent-process: malformed model refusal'],
+        ['claude-agent-process: model refusal fallback'],
+      ])
+    } finally { diagnostic.mockRestore() }
+  })
+
+  test('subagent and synthetic assistant messages do not replace the main model', () => {
+    const { proc } = capture()
+    proc.handleMessage({ type: 'assistant', uuid: 'sub', parent_tool_use_id: 'task-1',
+      message: { model: 'claude-haiku-5-5', content: [] } })
+    proc.handleMessage({ type: 'assistant', uuid: 'local', message: { model: '<synthetic>', content: [] } })
+    expect(proc.lastModel).toBe('claude:claude-opus-5-5')
+    proc.handleMessage({ type: 'assistant', uuid: 'main', message: { model: 'claude-opus-5-5-20261101', content: [] } })
+    expect(proc.lastModel).toBe('claude:claude-opus-5-5-20261101')
+  })
+})
+
 describe('Claude protocol log privacy', () => {
   test('known progress events are silent and unknown events log only fixed diagnoses', () => {
     const diagnostic = spyOn(logModule, 'logDiagnostic').mockImplementation(() => {})
@@ -2986,18 +3130,24 @@ describe('Claude protocol log privacy', () => {
       const proc = new ClaudeAgentProcess({ workDir: '/private/project', effort: 'high' }) as any
       const privateText = 'private-user private-group private-task /private/source.ts'
       proc.handleMessage({ type: 'tool_progress', session_id: 'private-session', tool_use_id: privateText })
-      for (const subtype of ['background_tasks_changed', 'vcs_state_changed', 'hook_started', 'hook_response']) {
+      for (const subtype of ['vcs_state_changed', 'hook_started', 'hook_response', 'informational']) {
         proc.handleMessage({ type: 'system', subtype, session_id: 'private-session', text: privateText })
       }
+      proc.handleMessage({
+        type: 'system', subtype: 'background_tasks_changed', session_id: 'private-session',
+        tasks: [{ task_id: privateText, task_type: 'local_bash', description: privateText }],
+      })
       expect(diagnostic).not.toHaveBeenCalled()
       expect(failure).not.toHaveBeenCalled()
       proc.handleMessage({ type: privateText, session_id: 'private-session', text: privateText })
       proc.handleMessage({ type: 'system', subtype: privateText, text: privateText })
       proc.handleMessage({ type: 'command_lifecycle', command_uuid: privateText, state: privateText })
+      proc.handleMessage({ type: 'system', subtype: 'background_tasks_changed', session_id: 'private-session', text: privateText })
       expect(diagnostic.mock.calls).toEqual([
         ['claude-agent-process: unknown message'],
         ['claude-agent-process: unknown system event'],
         ['claude-agent-process: malformed command lifecycle'],
+        ['claude-agent-process: malformed background task level'],
       ])
     } finally { diagnostic.mockRestore(); failure.mockRestore() }
   })

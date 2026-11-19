@@ -48,15 +48,14 @@ export {
 } from './cards/tool'
 export {
   type ConsoleOpts,
+  type ConsolePeer,
   type ModelEffortChoice,
   type ModelChoice,
   type ProviderChoice,
   consoleUsageContent,
   unifiedUsageSummary,
   consoleUsageElement,
-  consoleCurrentModelElement,
-  consoleMainElement,
-  consoleHostElement,
+  consoleProjectElement,
   consoleBodyElements,
   consoleCard,
   providerSelectionCard,
@@ -212,4 +211,10 @@ export {
   automationLiveCard,
   automationHistoryCard,
 } from './cards/automation'
-export { type AgentCardTaskKind } from './cards/task-kind'
+export { type AgentCardTaskKind, type SessionWorkload, sessionWorkloadLabel } from './cards/task-kind'
+export {
+  claudeModelDisplayName,
+  modelRefusalNoticeCard,
+  modelRefusalNoticeText,
+  modelRefusalNoticeTitle,
+} from './cards/model-refusal'

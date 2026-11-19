@@ -88,6 +88,24 @@ export type AgentResultEvent = {
   [key: string]: unknown
 }
 
+/** Claude 原生安全分类器拦截（stop_reason "refusal"）。`fallback`：原生已把这一轮
+ * 改由 `fallbackModel` 重答；`scope: 'session'` 时整个原生会话从此停在降级模型，
+ * 直到重新设置模型，`'local'` 只影响子 Agent / 旁支提问的那一次回复。`no_fallback`：
+ * 没有降级模型，本轮直接结束。模型字段是 SDK 原样的模型 ID；`explanation` 是上游
+ * 说明文字，只用于展示，不能解析。 */
+export interface ModelRefusalNotice {
+  kind: 'fallback' | 'no_fallback'
+  scope: 'session' | 'local'
+  originalModel: string | null
+  fallbackModel: string | null
+  category: string | null
+  explanation: string | null
+  /** 这条原生通知自己的 uuid；连续降级时后一条通知会在 `retracted` 里撤回前一条。 */
+  uuid: string | null
+  /** 原生 `retracted_message_uuids`：本次降级撤回的消息（含被取代的上一条降级通知）。 */
+  retracted: string[]
+}
+
 /** A Codex retry keeps the logical task open while waiting or reconnecting. */
 export interface AgentTurnRetry {
   phase: 'waiting' | 'retrying'
@@ -170,6 +188,9 @@ export interface AgentProcess extends EventEmitter {
   lastCompletedTurnId?: string | null
   lastModel: string | null
   lastEffort: AgentReasoningEffort | null
+  /** Claude only：原生因安全拦截把会话模型换成了降级模型。重新设置模型成功后清空；
+   * 此时 Session 的持久选择仍是原模型，重选同一模型也必须真正下发。 */
+  refusalFallback?: { originalModel: string | null; fallbackModel: string } | null
   /** 当前思考块的实时估计，不能用于计费或累计 token。 */
   lastThinkingTokens?: number | null
   lastUsage: CodexUsage | null
@@ -196,6 +217,10 @@ export interface AgentProcess extends EventEmitter {
   quotaWaitPromise?(): Promise<void>
   /** Codex launch/persistence metadata. Claude does not use these hooks. */
   readonly launchKind?: 'fresh' | 'resume' | 'fork'
+  /** Claude only: the saved conversation this process resumes in place (never a fork). Claude
+   * reports `sessionId` with its first native message, which needs a first input; until then this
+   * identifies a resumed conversation. Absent/null for fresh starts, forks and other backends. */
+  readonly resumedSessionId?: string | null
   isConversationResumable?(): boolean
   conversationMaterializationBarrier?(): Promise<void> | null
   conversationMaterializationFailure?(): Error | null
@@ -227,6 +252,10 @@ export interface AgentProcess extends EventEmitter {
   /** codex:在现有 app-server 连接上读账号额度(read 端点,权威多桶);
    *  claude:无此通道,返回 null(session 的额度走 token source)。 */
   readRateLimits?(): Promise<any>
+  /** 后端自报的实时后台进程数(不含子 Agent),供 hi/bl 状态行:Claude 取 SDK
+   *  `background_tasks_changed` 电平,Codex 查询主线程后台终端。尚未收到电平时
+   *  resolve undefined,调用方退回任务卡跟踪;读不到实时集合时 reject。 */
+  backgroundProcessCount?(): Promise<number | undefined>
 }
 
 /** 跨后端模型目录条目:档位词表按后端放宽(Codex 的 none..ultra 与 DSH 的
@@ -261,6 +290,8 @@ export type AgentProcessEventMap = {
    * this boundary share one card, even when delivered in separate RPC frames. */
   input_batch_end: { itemId: string }
   thinking_progress: { estimatedTokens: number }
+  /** Claude only：安全分类器拦截了一次回复（见 ModelRefusalNotice）。 */
+  model_refusal: ModelRefusalNotice
   /** Selection succeeded; diagnostics describe unused accounts and are for logs, not proactive alerts. */
   codex_account_changed: { accountId: string; previousAccountId: string | null; diagnostics: string[] }
   token_usage: TokenUsageUpdated

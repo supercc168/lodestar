@@ -1,6 +1,6 @@
 import { describe, expect, test } from 'bun:test'
 
-import { consoleBodyElements, consoleCurrentModelContent, consoleUsageContent, consoleUsageElement, modelChangeStatusCard, modelCustomPromptCard, modelEffortSelectionCard, modelResultCard, modelResultPanelElement, modelSelectionCard, providerSelectionCard, statusCard, streamingOffSettings } from './console'
+import { consoleBodyElements, consoleCard, consoleGlmUsageContent, consoleProjectContent, consoleProviderUsageContent, consoleUsageContent, consoleUsageNotApplicableContent, modelChangeStatusCard, modelCustomPromptCard, modelEffortSelectionCard, modelResultCard, modelResultPanelElement, modelSelectionCard, providerSelectionCard, statusCard, streamingOffSettings } from './console'
 import {
   askUserQuestionElement,
   contextCompactionElement,
@@ -253,90 +253,76 @@ describe('main conversation card rendering', () => {
     expect(new Set(elements.map(element => element.element_id)).size).toBe(elements.length)
   })
 
-  test('console body can replace a status card footer in place', () => {
+  test('group hi shows only this project and can replace a status card footer in place', () => {
+    const usage = { state: 'ok' as const, windows: [{ kind: 'weekly', label: '周配额', percent: 24, resetsAt: null }] }
     const elements = consoleBodyElements({
       sessionName: 'probe',
-      status: 'idle',
-      model: 'gpt-5-codex',
-      effort: 'xhigh',
-      worktreeInstructionNotice: '已载入wt特殊约定',
-      peers: [{
-        name: 'probe',
-        isCurrent: true,
-        status: 'working',
-        uptimeMs: 65_000,
-        codexAccountName: '工作订阅',
-      }],
-      sysinfo: {
-        cpu: { cores: 8, load1: 0.42, load5: 0.37, load15: 0.29 },
-        mem: {
-          totalBytes: 16 * 1024 * 1024 * 1024,
-          availBytes: 6 * 1024 * 1024 * 1024,
-          usedBytes: 10 * 1024 * 1024 * 1024,
-          percent: 63,
-        },
-        disks: [],
-        services: [{
-          name: 'codex-probe-runner',
-          active: 'active',
-          sub: 'running',
-          lastActiveAgoSec: 120,
-          stateAgoSec: 120,
-        }],
-        servicesError: null,
-      },
-    }, 'footer') as any[]
-
-    expect(elements).toHaveLength(4)
-    expect(elements[0].element_id).toBe('footer')
-    expect(elements[0].tag).toBe('markdown')
-    expect(elements[0].content).toContain('**🤖 当前模型**')
-    expect(elements[0].content).toContain('`gpt-5-codex/xhigh`')
-    expect(elements[0].content).toContain('已载入wt特殊约定')
-
-    expect(elements[1].element_id).toBe('console_projects')
-    expect(elements[1].tag).toBe('collapsible_panel')
-    expect(elements[1].expanded).toBe(false)
-    expect(elements[1].header.title.content).toBe('🗂 活跃项目 (1)')
-    expect(elements[1].elements[0].content).toContain('`probe` · 工作中 · 1m · 当前')
-    expect(elements[1].elements[0].content).toContain(' · Codex：`工作订阅`')
-    expect(elements[1].elements[0].content).not.toContain('gpt-5-codex')
-
-    expect(elements[2].element_id).toBe('console_host')
-    expect(elements[2].tag).toBe('collapsible_panel')
-    expect(elements[2].expanded).toBe(false)
-    expect(elements[2].header.title.content).toBe('🖥 主机 · L0.42 · M63% · S1')
-    expect(elements[2].elements[0].content).toContain('**负载**')
-    expect(elements[2].elements[0].content).toContain('**内存**')
-    expect(elements[2].elements[0].content).toContain('**服务**')
-    expect(elements[2].elements[0].content).not.toContain('**💽 磁盘**')
-
-    expect(elements[3].element_id).toBe('console_usage')
-    expect(elements[3].content).toContain('加载中')
-
-    const body = JSON.stringify(elements)
-    expect(body).not.toContain('活跃上下文')
-    expect(body).not.toContain('上一轮')
-    expect(body).not.toContain('累计')
-    expect(body).not.toContain('thread')
-  })
-
-  test('console keeps the original Codex model header but labels Claude explicitly', () => {
-    expect(consoleCurrentModelContent({
-      sessionName: 'probe',
-      status: 'idle',
+      status: 'working',
       provider: 'codex',
       model: 'gpt-5-codex',
       effort: 'xhigh',
-    })).toContain('**🤖 当前模型**　`gpt-5-codex/xhigh`')
+      worktreeInstructionNotice: '已载入wt特殊约定',
+      uptimeMs: 65_000,
+      workload: { background: 0, subagents: 0 },
+      account: { id: 'codex:work', label: 'Codex·工作订阅', usage },
+    }, 'footer') as any[]
 
-    expect(consoleCurrentModelContent({
-      sessionName: 'probe',
-      status: 'idle',
-      provider: 'claude',
-      model: 'claude:default',
-      effort: 'high',
-    })).toContain('**🤖 当前模型 (Claude)**　`claude:default/high`')
+    expect(elements).toHaveLength(2)
+    expect(elements[0]).toEqual({ tag: 'markdown', element_id: 'footer', content: [
+      '**状态**　⚙️ 工作中 · 已运行 1m',
+      '**模型**　Codex · `gpt-5-codex/xhigh`',
+      '**账号**　Codex·工作订阅',
+      '已载入wt特殊约定',
+    ].join('\n') })
+
+    expect(elements[1].element_id).toBe('console_usage')
+    expect(elements[1].tag).toBe('collapsible_panel')
+    expect(elements[1].expanded).toBe(true)
+    expect(elements[1].elements).toHaveLength(1)
+    expect(elements[1].elements[0].content).toContain('24%')
+
+    // No other project, host or other account: those are in the 1:1 panel.
+    const body = JSON.stringify(elements)
+    for (const absent of ['活跃项目', '主机', '负载', '全部账号', 'console_projects', 'console_host', '活跃上下文', '上一轮', '累计', 'thread']) {
+      expect(body).not.toContain(absent)
+    }
+    const card = consoleCard({ sessionName: 'probe', status: 'awaiting_permission' }) as any
+    expect(card.header.title.content).toBe('🌟 Lodestar · probe')
+    expect(card.header.template).toBe('orange')
+    expect(card.body.elements.map((element: any) => element.element_id)).toEqual(['console_project', 'console_usage'])
+  })
+
+  test('the status line counts background work right after the status, then the uptime', () => {
+    const status = (opts: object) => consoleProjectContent({ sessionName: 'probe', status: 'idle', ...opts }).split('\n')[0]
+    expect(status({ uptimeMs: 65_000, workload: { background: 2, subagents: 1 } })).toBe('**状态**　🟢 空闲 · 子Agent1·后台2 · 已运行 1m')
+    // Nothing running beside the main turn adds nothing.
+    expect(status({ workload: { background: 0, subagents: 0 } })).toBe('**状态**　🟢 空闲')
+    expect(status({ status: 'working', workload: { background: null, subagents: 0 } })).toBe('**状态**　⚙️ 工作中 · 后台MISS')
+    expect(status({ status: 'awaiting_permission' })).toBe("**状态**　🔐 <font color='orange'>等审批</font>")
+    expect(status({ status: 'stopped' })).toBe('**状态**　⚪ 未运行')
+    // Uptimes share the quota countdown format: seconds, whole minutes, then one decimal hours or days (never "3d 0h").
+    const MIN = 60_000, HOUR = 3600_000, DAY = 86400_000
+    for (const [uptimeMs, shown] of [[8_000, '8s'], [59_900, '59s'], [40 * MIN, '40m'], [2 * HOUR + 5 * MIN, '2.1h'], [3 * DAY, '3.0d']] as const) {
+      expect(status({ uptimeMs })).toBe(`**状态**　🟢 空闲 · 已运行 ${shown}`)
+    }
+  })
+
+  test('the account line names the account the process actually runs on, written like the 1:1 quota rows', () => {
+    const account = (opts: object) => consoleProjectContent({ sessionName: 'probe', status: 'idle', ...opts }).split('\n')[2]
+    const usage = { state: 'not_applicable' as const, windows: [] }
+    expect(account({ account: { id: 'claude:x', label: 'Claude·a*b_[c]', usage } })).toBe('**账号**　Claude·a&#42;b&#95;&#91;c&#93;')
+    expect(account({ account: { id: 'glm', label: 'GLM', usage } })).toBe('**账号**　GLM')
+    // No settled account yet, or no process at all.
+    expect(account({ account: null })).toBe('**账号**　未确定')
+    expect(account({ account: null, status: 'stopped' })).toBe('**账号**　未启动')
+  })
+
+  test('the model line names the Agent for every backend', () => {
+    const model = (opts: object) => consoleProjectContent({ sessionName: 'probe', status: 'idle', ...opts }).split('\n')[1]
+    expect(model({ provider: 'codex', model: 'gpt-5-codex', effort: 'xhigh' })).toBe('**模型**　Codex · `gpt-5-codex/xhigh`')
+    expect(model({ provider: 'claude', model: 'claude:default', effort: 'high' })).toBe('**模型**　Claude · `claude:default/high`')
+    expect(model({ provider: 'dsh', effort: 'high' })).toBe('**模型**　DeepSeek Harness · `强度 high`')
+    expect(model({})).toBe('**模型**　`未就绪`')
   })
 
   test('model pagination carries the source and panel identity on navigation buttons', () => {
@@ -540,81 +526,56 @@ describe('main conversation card rendering', () => {
     expect(content).toContain('12.34 USD')
   })
 
-  test('usage panel routes only the claude:glm profile to GLM quota', () => {
-    const glm = consoleUsageElement({
-      sessionName: 'probe',
-      status: 'idle',
-      provider: 'claude',
-      model: 'claude:glm',
-      glmUsage: {
-        state: 'ok',
-        level: 'max',
-        fiveHour: { percent: 23, resetsAt: null },
-        monthly: null,
-        fetchedAt: Date.now(),
-      },
-    } as any) as any
-    expect(glm.content).toContain('GLM 额度')
-    expect(glm.content).toContain('23%')
+  test('GLM quota wording stays on the GLM helper', () => {
+    const glm = consoleGlmUsageContent({
+      state: 'ok',
+      level: 'max',
+      fiveHour: { percent: 23, resetsAt: null },
+      monthly: null,
+      fetchedAt: Date.now(),
+    } as any)
+    expect(glm).toContain('GLM 额度')
+    expect(glm).toContain('23%')
 
+    // 非 GLM 的 claude 档位没有可查额度源：明确写「不适用」并带上档位名。
     for (const model of ['claude:fable', 'claude:opus', 'claude:relay']) {
-      const element = consoleUsageElement({
-        sessionName: 'probe',
-        status: 'idle',
-        provider: 'claude',
-        model,
-        glmUsage: { state: 'rate_limited' },
-      } as any) as any
-      expect(element.content).toContain('不适用')
-      expect(element.content).toContain(model)
-      expect(element.content).not.toContain('GLM 额度')
+      const element = consoleUsageNotApplicableContent(model)
+      expect(element).toContain('不适用')
+      expect(element).toContain(model)
+      expect(element).not.toContain('GLM 额度')
     }
   })
 
-  test('usage panel routes claude:grok* to provider channel balance', () => {
-    const cat = consoleUsageElement({
-      sessionName: 'probe',
-      status: 'idle',
-      provider: 'claude',
-      model: 'claude:grokcc',
-      usageSource: 'provider',
-      providerUsage: {
-        state: 'ok',
-        providerName: 'Claude Code · Grok 4.6(CatCodex)',
-        tokenName: 'cc-grok',
-        unlimited: true,
-        totalUsed: 390_493_193,
-        isValid: true,
-        fetchedAt: Date.now(),
-      },
-    } as any) as any
-    expect(cat.content).toContain('渠道额度')
-    expect(cat.content).toContain('不限')
-    expect(cat.content).toContain('cc-grok')
-    expect(cat.content).toContain('390.5M')
-    expect(cat.content).not.toContain('GLM 额度')
-    expect(cat.content).not.toContain('不适用')
+  test('provider channel balance wording covers Grok CatCodex and Wuhen', () => {
+    const cat = consoleProviderUsageContent({
+      state: 'ok',
+      providerName: 'Claude Code · Grok 4.6(CatCodex)',
+      tokenName: 'cc-grok',
+      unlimited: true,
+      totalUsed: 390_493_193,
+      isValid: true,
+      fetchedAt: Date.now(),
+    } as any)
+    expect(cat).toContain('渠道额度')
+    expect(cat).toContain('不限')
+    expect(cat).toContain('cc-grok')
+    expect(cat).toContain('390.5M')
+    expect(cat).not.toContain('GLM 额度')
+    expect(cat).not.toContain('不适用')
 
-    const wuhen = consoleUsageElement({
-      sessionName: 'probe',
-      status: 'idle',
-      provider: 'claude',
-      model: 'claude:grok',
-      usageSource: 'provider',
-      providerUsage: {
-        state: 'ok',
-        providerName: 'Claude Code · Grok 4.6(无痕)',
-        planName: '钱包余额',
-        unlimited: false,
-        remaining: 2544.33,
-        unit: 'USD',
-        isValid: true,
-        fetchedAt: Date.now(),
-      },
-    } as any) as any
-    expect(wuhen.content).toContain('渠道额度')
-    expect(wuhen.content).toContain('钱包余额')
-    expect(wuhen.content).toContain('2544.33 USD')
+    const wuhen = consoleProviderUsageContent({
+      state: 'ok',
+      providerName: 'Claude Code · Grok 4.6(无痕)',
+      planName: '钱包余额',
+      unlimited: false,
+      remaining: 2544.33,
+      unit: 'USD',
+      isValid: true,
+      fetchedAt: Date.now(),
+    } as any)
+    expect(wuhen).toContain('渠道额度')
+    expect(wuhen).toContain('钱包余额')
+    expect(wuhen).toContain('2544.33 USD')
   })
 })
 

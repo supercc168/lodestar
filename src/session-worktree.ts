@@ -3,10 +3,12 @@ import type { AgentProvider } from './agent-process'
 import { channelInstructions } from './instructions'
 import * as cards from './cards'
 import * as feishu from './feishu'
-import { formatFeishuError } from './feishu-errors'
+import { formatFeishuError, redactMemberIds } from './feishu-errors'
 import { logError } from './log'
+import { INTERNAL_REQUESTER, type RequesterTenant } from './requester-tenant'
 import * as worktree from './worktree'
 import { messageOf, type WorktreeActionResult } from './session-util'
+import { newGroupFields, type NewGroupFields } from './session-group-owner'
 
 export function worktreeProjectName(s: Session): string {
   // 统一剥临时群(*MMDD-HHMM)与 worktree([slug])后缀解析回主项目名(上游
@@ -75,7 +77,12 @@ export function worktreeExtraInstruction(s: Session): string | null {
   ].join('\n')
 }
 
-export async function runWorktreeCommand(s: Session, arg: string, userOpenId: string): Promise<void> {
+export async function runWorktreeCommand(
+  s: Session,
+  arg: string,
+  userOpenId: string,
+  requester: RequesterTenant = INTERNAL_REQUESTER,
+): Promise<void> {
   if (!arg) {
     await showWorktrees(s)
     return
@@ -100,18 +107,29 @@ export async function runWorktreeCommand(s: Session, arg: string, userOpenId: st
   const projectDir = worktreeProjectDir(s)
   // 文本命令建群/复活与卡片按钮解散是不同分发路径 —— 经项目级 worktree 锁
   // 串行,防跨路径并发建/删 worktree 的注册表竞态(上游 ec149d7,挂账第 4 项收口)。
+  // WT 群与临时群同一规则：外部群里发起或外部联系人发起时建外部群（机器人不能当群主）。群类型和群主
+  // 在建 worktree 和分支之前就确定，查询失败或群主不合格直接报错，不留下半成品。
+  let group: NewGroupFields
+  try {
+    group = await newGroupFields(s, userOpenId, requester, worktree.worktreeChatName(projectName, slug), 'worktree')
+  } catch (e) {
+    await feishu.sendText(s.chatId, `❌ wt 失败: ${redactMemberIds(messageOf(e))}`)
+    return
+  }
   try {
     await worktree.withProjectWorktreeLock(projectDir, async () => {
       let ensured: worktree.EnsureWorktreeResult
       try {
         ensured = worktree.ensureProjectWorktree(projectDir, projectName, slug)
       } catch (e) {
-        await feishu.sendText(s.chatId, `❌ wt 失败: ${messageOf(e)}`)
+        await feishu.sendText(s.chatId, `❌ wt 失败: ${redactMemberIds(messageOf(e))}`)
         return
       }
 
       try {
-        const chat = await feishu.ensureChatForSession(ensured.chatName, userOpenId)
+        const chat = await feishu.ensureWorktreeChatForSession(
+          ensured.chatName, userOpenId, group.ownerOpenId, group.externalRequester === true,
+        )
         const action = chat.created ? '已创建' : (chat.joined ? '已加入' : '已在群内')
         let parentFailure: unknown
         const parentMsg = await feishu.sendCard(s.chatId, cards.worktreeNoticeCard({
@@ -129,11 +147,11 @@ export async function runWorktreeCommand(s: Session, arg: string, userOpenId: st
         }), error => { childFailure = error })
         if (!childMsg) await feishu.sendTextRaw(chat.chatId, `❌ wt 卡片失败: ${slug}\n${formatFeishuError(childFailure)}`)
       } catch (e) {
-        await feishu.sendText(s.chatId, `❌ wt 已建，拉群失败: ${messageOf(e)}`)
+        await feishu.sendText(s.chatId, `❌ wt 已建，拉群失败: ${redactMemberIds(messageOf(e))}`)
       }
     })
   } catch (e) {
-    await feishu.sendText(s.chatId, `❌ wt 失败: ${messageOf(e)}`)
+    await feishu.sendText(s.chatId, `❌ wt 失败: ${redactMemberIds(messageOf(e))}`)
   }
 }
 
@@ -264,25 +282,35 @@ export async function onWorktreeDisband(s: Session, slugRaw: string): Promise<Wo
       }
       worktree.assertProjectWorktreeClean(projectDir, projectName, slug)
       const disbandedTemps: string[] = []
+      // 外部临时群机器人不能解散，只能退群；群留给群主手动解散，单独计数。
+      const leftTemps: string[] = []
       for (const name of tempNames) {
         const tempChatId = (chatIndex.get(name) ?? [])[0]
         if (!tempChatId) continue
         const result = await s.opts.onDisbandTempSession!(name, tempChatId)
         if (!result.ok) {
-          const done = disbandedTemps.length ? `（已解散 ${disbandedTemps.join('、')}）` : ''
-          const message = `❌ 解散 ${slug} 失败: 临时群 ${name} 未解散${done}: ${result.error ?? '未知'}`
+          const done = [
+            ...(disbandedTemps.length ? [`已解散 ${disbandedTemps.join('、')}`] : []),
+            ...(leftTemps.length ? [`机器人已退出 ${leftTemps.join('、')}`] : []),
+          ].join('；')
+          const message = `❌ 解散 ${slug} 失败: 临时群 ${name} 未解散${done ? `（${done}）` : ''}: ${result.error ?? '未知'}`
           return { ok: false, message, type: 'error' as const }
         }
-        disbandedTemps.push(name)
+        if (result.left) leftTemps.push(name)
+        else disbandedTemps.push(name)
       }
       const disbanded = await feishu.disbandChatForSession(chatName)
       const removed = worktree.removeProjectWorktreeIfClean(projectDir, projectName, slug)
       const message = [
         `✅ ${slug} 已解散`,
         removed.removedWorktree ? 'dir removed' : 'dir missing',
-        disbanded.disbanded ? 'group removed' : 'group missing',
+        // 外部 WT 群机器人不能解散，只能退群：群留给群主手动解散，目录照删。
+        disbanded.disbanded ? 'group removed' : disbanded.left ? '机器人已退出 WT 群，请群主手动解散' : 'group missing',
         removed.branch,
-        disbandedTemps.length > 0 ? `临时群 ${disbandedTemps.length} 个已解散` : '无临时群',
+        disbandedTemps.length + leftTemps.length === 0 ? '无临时群' : [
+          ...(disbandedTemps.length > 0 ? [`临时群 ${disbandedTemps.length} 个已解散`] : []),
+          ...(leftTemps.length > 0 ? [`外部临时群 ${leftTemps.length} 个机器人已退出，请群主手动解散`] : []),
+        ].join('；'),
       ].join('\n')
       return { ok: true, message, type: 'success' as const }
     })

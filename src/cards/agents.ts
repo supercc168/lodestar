@@ -168,7 +168,7 @@ export function delegationCardSummary(tasks: Array<{
   return done ? `✅ ${done}` : `✅ ${tasks.length}项已完成`
 }
 
-/** e.g. `后台1·子Agent1`; three or more kinds return null so the caller can
+/** e.g. `子Agent1·后台1`; three or more kinds return null so the caller can
  * collapse to a total that still fits the ~15 character preview. */
 function kindCounts(tasks: Array<{ kind?: AgentCardTaskKind }>): string | null {
   const counts = new Map<AgentCardTaskKind, number>()
