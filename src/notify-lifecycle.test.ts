@@ -283,7 +283,6 @@ describe('versioned notify lifecycle', () => {
       version: 4,
       applied_version: 4,
       resolved: true,
-      resolved_by: 'ou_operator',
       response: {
         type: 'text',
         text: 'Use option B',
@@ -295,7 +294,6 @@ describe('versioned notify lifecycle', () => {
     loadCallbacks()
     expect(buildNotifyResult(get(notifyId)!)).toMatchObject({
       resolved: true,
-      resolved_by: 'ou_operator',
       message_id: 'om_original',
       version: 4,
       applied_version: 4,

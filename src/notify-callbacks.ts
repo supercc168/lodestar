@@ -55,14 +55,15 @@ export interface NotifyTextResponse {
 
 export interface NotifyReplyState {
   id: string
-  openId: string
+  /** In-memory only; never written to disk. */
+  openId?: string
   promptMessageId: string
   openedAt: number
   /** Version of the notification view that opened this prompt. New-mode
    * replies must still match this version when the text arrives. */
   version?: number
   status: 'waiting' | 'sending' | 'failed' | 'cancelled'
-  cancelReason?: 'switched'
+  cancelReason?: 'switched' | 'restart'
   response?: NotifyTextResponse
   error?: string
 }
@@ -102,9 +103,9 @@ export function canonicalNotifyRequestHash(version: number, desired: NotifyDesir
   return canonicalNotifyHash({ version, desired })
 }
 
-/** A registered interactive `/notify` card. Persisted wholesale so the
- * resolved-card rebuild after a click can re-render the original
- * images/text/header without re-uploading. */
+/** A registered interactive `/notify` card. Persisted without any person
+ * identity so the resolved-card rebuild after a click can re-render the
+ * original images/text/header without re-uploading. */
 export interface NotifyRegistration {
   notifyId: string
   /** Loopback HTTP URL the caller pledged to listen on. */
@@ -128,7 +129,7 @@ export interface NotifyRegistration {
   replyMessageIds?: string[]
   /** Written before a button callback can run. An interrupted dispatch must
    * not become retryable after restart because its external effect is unknown. */
-  dispatchState?: { buttonId: string; openId: string; startedAt: number }
+  dispatchState?: { buttonId: string; startedAt: number }
   /** Unix-ms epoch. Used by {@link prune} (7-day TTL) and never
    * mutated after creation. */
   createdAt: number
@@ -137,12 +138,12 @@ export interface NotifyRegistration {
    * re-dispatch — prevents a double-fire when two members tap the
    * same card near-simultaneously. */
   resolvedAt?: number
-  resolvedBy?: { buttonId?: string; openId: string }
+  resolvedBy?: { buttonId?: string }
   /** Dispatch was interrupted or its durable completion could not be
    * confirmed. Never retry automatically: the external side effect may
    * already have happened. */
   unknownAt?: number
-  unknownBy?: { buttonId?: string; openId?: string }
+  unknownBy?: { buttonId?: string }
   unknownReason?: string
   /** New durable creation/update lifecycle. Absent on legacy callers. */
   requestId?: string
@@ -168,6 +169,9 @@ export interface NotifyRegistration {
   /** Set once boot recovery has re-rendered an interrupted dispatch as UNKNOWN.
    * Absent on older records, which are therefore recovered one more time. */
   unknownRecoveredAt?: number
+  /** Set once a boot has re-rendered a reply prompt whose person was not
+   * persisted. Absent on older records, which are therefore presented once. */
+  restartRecoveredAt?: number
 }
 
 /** Drop registrations older than this on load. 7 days matches the
@@ -216,10 +220,22 @@ export async function withNotifyLock<T>(key: string, operation: () => Promise<T>
  * can run hermetically without clobbering the user's real state. */
 let storeFile = NOTIFY_CALLBACKS_FILE
 
+/** Serialize a copy without any person identity. The live map keeps the raw
+ * id only while the prompt is active; it is never written to disk. */
+function persistableRegistration(reg: NotifyRegistration): NotifyRegistration {
+  const copy = JSON.parse(JSON.stringify(reg)) as NotifyRegistration
+  for (const holder of [copy.replyState, (copy as any).dispatchState, (copy as any).resolvedBy, (copy as any).unknownBy]) {
+    if (!holder) continue
+    delete holder.openId
+    delete holder.openIdHash
+  }
+  return copy
+}
+
 function saveCallbacks(): void {
   try {
     const obj: Record<string, NotifyRegistration> = {}
-    for (const [k, v] of map) obj[k] = v
+    for (const [k, v] of map) obj[k] = persistableRegistration(v)
     writeJsonStateAtomic(storeFile, obj)
   } catch (e) {
     logError('notify.callbacks.save_failed', e)
@@ -287,11 +303,13 @@ function validReplyState(value: unknown): boolean {
   if (value === undefined) return true
   if (!value || typeof value !== 'object' || Array.isArray(value)) return false
   const state = value as Record<string, any>
-  if (typeof state.id !== 'string' || !state.id || typeof state.openId !== 'string' || !state.openId
+  // openId 只在内存里有值,落盘后缺席(人员标识不写盘),因此这里按可选校验。
+  if (typeof state.id !== 'string' || !state.id
+    || (state.openId !== undefined && (typeof state.openId !== 'string' || !state.openId))
     || typeof state.promptMessageId !== 'string' || !Number.isFinite(state.openedAt)
     || !['waiting', 'sending', 'failed', 'cancelled'].includes(state.status)
     || (state.version !== undefined && (!Number.isSafeInteger(state.version) || state.version < 1))
-    || (state.cancelReason !== undefined && state.cancelReason !== 'switched')
+    || (state.cancelReason !== undefined && !['switched', 'restart'].includes(state.cancelReason))
     || (state.error !== undefined && typeof state.error !== 'string')) return false
   if (state.response !== undefined) {
     const response = state.response
@@ -338,10 +356,11 @@ function validateDurableRegistration(rec: Record<string, any>, storedId: string)
     || (rec.replyMessageIds !== undefined && (!Array.isArray(rec.replyMessageIds)
       || rec.replyMessageIds.some((id: unknown) => typeof id !== 'string' || !id)))
     || (rec.dispatchState !== undefined && (!rec.dispatchState || typeof rec.dispatchState !== 'object'
-      || typeof rec.dispatchState.buttonId !== 'string' || typeof rec.dispatchState.openId !== 'string'
+      || typeof rec.dispatchState.buttonId !== 'string'
+      || (rec.dispatchState.openId !== undefined && typeof rec.dispatchState.openId !== 'string')
       || !Number.isFinite(rec.dispatchState.startedAt)))
     || (rec.resolvedAt !== undefined && (!Number.isFinite(rec.resolvedAt) || !rec.resolvedBy
-      || typeof rec.resolvedBy.openId !== 'string' || !rec.resolvedBy.openId
+      || (rec.resolvedBy.openId !== undefined && (typeof rec.resolvedBy.openId !== 'string' || !rec.resolvedBy.openId))
       || (rec.resolvedBy.buttonId !== undefined && typeof rec.resolvedBy.buttonId !== 'string')))
     || (rec.unknownAt !== undefined && (!Number.isFinite(rec.unknownAt)
       || (rec.unknownBy !== undefined && (typeof rec.unknownBy !== 'object'
@@ -385,6 +404,7 @@ export function loadCallbacks(): NotifyRegistration[] {
     const cutoff = Date.now() - MAX_AGE_MS
     let dropped = 0
     let interrupted = 0
+    let migrated = false
     const requestIds = new Set<string>()
     for (const [storedId, rec] of Object.entries(obj)) {
       if (!rec || typeof rec !== 'object' || Array.isArray(rec)) throw new Error(`notify callback record invalid: ${storedId}`)
@@ -400,6 +420,18 @@ export function loadCallbacks(): NotifyRegistration[] {
         || !Array.isArray(rec.imageKeys) || !Array.isArray(rec.buttons)
         || (rec.allowReply !== undefined && typeof rec.allowReply !== 'boolean')) {
         throw new Error(`notify callback body invalid: ${storedId}`)
+      }
+      // 旧版本把操作人标识写进了状态文件:读到即清理,之后不再回写。
+      for (const holder of [rec.replyState, rec.dispatchState, rec.resolvedBy, rec.unknownBy]) {
+        if (!holder || typeof holder !== 'object') continue
+        if ('openId' in holder) { delete holder.openId; migrated = true }
+        if ('openIdHash' in holder) { delete holder.openIdHash; migrated = true }
+      }
+      // 没有持久化操作人标识,等待中的回复提示无法恢复:取消并请用户重新点击。
+      if (rec.replyState?.status === 'waiting' && !rec.resolvedAt && !rec.unknownAt) {
+        rec.replyState.status = 'cancelled'
+        rec.replyState.cancelReason = 'restart'
+        interrupted++
       }
       if (rec.requestId !== undefined) {
         if (requestIds.has(rec.requestId)) {
@@ -427,23 +459,29 @@ export function loadCallbacks(): NotifyRegistration[] {
       // its outcome is uncertain; never replay a potentially delivered reply.
       if (rec.replyState?.status === 'sending' && !rec.resolvedAt && !rec.unknownAt) {
         rec.unknownAt = Date.now()
-        rec.unknownBy = { openId: rec.replyState.openId }
+        rec.unknownBy = {}
         rec.unknownReason = '服务在文字回复回传期间中断，无法确认是否送达，禁止自动重试'
         interrupted++
       }
       if (rec.dispatchState && !rec.resolvedAt && !rec.unknownAt) {
         rec.unknownAt = Date.now()
-        rec.unknownBy = { buttonId: rec.dispatchState.buttonId, openId: rec.dispatchState.openId }
+        rec.unknownBy = { buttonId: rec.dispatchState.buttonId }
         rec.unknownReason = '服务在按钮回调期间中断，无法确认是否送达，禁止自动重试'
         interrupted++
       }
       map.set(rec.notifyId, rec as NotifyRegistration)
-      if ((rec.replyState?.status === 'sending' || rec.dispatchState) && rec.unknownAt && !rec.unknownRecoveredAt) {
+      if (rec.unknownAt && !rec.unknownRecoveredAt && !interruptedCallbacks.includes(rec)) {
+        interruptedCallbacks.push(rec)
+      }
+      // A cancelled restart prompt whose expired card was not shown yet is
+      // retried on the next boot; successful recovery records the marker.
+      if (rec.replyState?.status === 'cancelled' && rec.replyState.cancelReason === 'restart'
+        && !rec.restartRecoveredAt && !interruptedCallbacks.includes(rec)) {
         interruptedCallbacks.push(rec)
       }
     }
     if (interrupted) log('notify.callbacks.interrupted_state_unknown')
-    if (dropped > 0 || interrupted > 0) saveCallbacks()
+    if (dropped > 0 || interrupted > 0 || migrated) saveCallbacks()
   } catch (e) {
     logError('notify.callbacks.load_failed', e)
     throw e
@@ -531,11 +569,11 @@ export function validateNotifyInteraction(
 }
 
 /** Commit the uncertain interval before any external side effect is allowed. */
-export function beginCallbackDispatch(notifyId: string, buttonId: string, openId: string): void {
+export function beginCallbackDispatch(notifyId: string, buttonId: string, _openId: string): void {
   const rec = map.get(notifyId)
   if (!rec) throw new Error(`notify registration not found: ${notifyId}`)
   if (rec.resolvedAt || rec.unknownAt || rec.dispatchState) throw new Error('notify callback is already dispatched or finalized')
-  rec.dispatchState = { buttonId, openId, startedAt: Date.now() }
+  rec.dispatchState = { buttonId, startedAt: Date.now() }
   try { saveCallbacks() }
   catch (error) { delete rec.dispatchState; throw error }
 }
@@ -551,7 +589,7 @@ export function recordCallbackFailure(notifyId: string): { state: 'retry' } | { 
   catch (error) {
     rec.dispatchState = state
     const detail = `callback failure persistence failed: ${error instanceof Error ? error.message : error}`
-    try { markUnknown(notifyId, state.buttonId, state.openId, detail) }
+    try { markUnknown(notifyId, state.buttonId, detail) }
     catch (unknownError) {
       rec.unknownReason = `${detail}; unknown tombstone persistence also failed: ${unknownError instanceof Error ? unknownError.message : unknownError}`
     }
@@ -590,7 +628,7 @@ export function setReplyState(notifyId: string, state: NotifyReplyState): void {
   }
 }
 
-export function markResolved(notifyId: string, buttonId: string | undefined, openId: string): void {
+export function markResolved(notifyId: string, buttonId: string | undefined, _openId: string): void {
   const rec = map.get(notifyId)
   if (!rec) throw new Error(`notify registration not found: ${notifyId}`)
   const previous = {
@@ -602,7 +640,7 @@ export function markResolved(notifyId: string, buttonId: string | undefined, ope
     dispatchState: rec.dispatchState,
   }
   rec.resolvedAt = Date.now()
-  rec.resolvedBy = { ...(buttonId !== undefined ? { buttonId } : {}), openId }
+  rec.resolvedBy = { ...(buttonId !== undefined ? { buttonId } : {}) }
   delete rec.unknownAt
   delete rec.unknownBy
   delete rec.unknownReason
@@ -636,10 +674,18 @@ export function markUnknownRecovered(notifyId: string): void {
   catch (error) { delete rec.unknownRecoveredAt; throw error }
 }
 
+/** Boot recovery presented a cancelled reply prompt once; later boots skip it. */
+export function markRestartRecovered(notifyId: string): void {
+  const rec = map.get(notifyId)
+  if (!rec) throw new Error(`notify registration not found: ${notifyId}`)
+  rec.restartRecoveredAt = Date.now()
+  try { saveCallbacks() }
+  catch (error) { delete rec.restartRecoveredAt; throw error }
+}
+
 export function markUnknown(
   notifyId: string,
   buttonId: string | undefined,
-  openId: string,
   reason: string,
 ): void {
   const rec = map.get(notifyId)
@@ -647,7 +693,7 @@ export function markUnknown(
   delete rec.resolvedAt
   delete rec.resolvedBy
   rec.unknownAt = Date.now()
-  rec.unknownBy = { ...(buttonId !== undefined ? { buttonId } : {}), openId }
+  rec.unknownBy = { ...(buttonId !== undefined ? { buttonId } : {}) }
   rec.unknownReason = reason
   delete rec.unknownRecoveredAt
   // Keep the in-memory unknown guard even if this write throws. The caller
@@ -674,7 +720,7 @@ export function recordCallbackSuccess(
     const resolvedDetail = resolvedError instanceof Error ? resolvedError.message : String(resolvedError)
     let detail = `resolved tombstone persistence failed: ${resolvedDetail}`
     try {
-      markUnknown(notifyId, buttonId, openId, detail)
+      markUnknown(notifyId, buttonId, detail)
     } catch (unknownError) {
       const unknownDetail = unknownError instanceof Error ? unknownError.message : String(unknownError)
       detail += `; unknown tombstone persistence also failed: ${unknownDetail}`
@@ -719,10 +765,8 @@ export interface DispatchResult {
  *   {
  *     "notify_id": "nf_...",
  *     "message_id": "om_...",
- *     "chat_id": "oc_...",
  *     "project": "feishu",
  *     "button": { "id": "approve", "text": "✅ 通过", "type": "primary" },
- *     "operator": { "open_id": "ou_..." },
  *     "timestamp": 1700000000
  *   }
  *
@@ -732,18 +776,18 @@ export interface DispatchResult {
 export async function dispatchCallback(
   reg: NotifyRegistration,
   answer: NotifyButton | NotifyTextResponse,
-  operatorOpenId: string,
+  _operatorOpenId: string,
 ): Promise<DispatchResult> {
+  // The callback body stays minimal: the caller already knows the project it
+  // targeted, and chat_id/open_id must never leave the daemon's own state.
   const payload = {
     notify_id: reg.notifyId,
     message_id: reg.messageId,
-    chat_id: reg.chatId,
     project: reg.project,
     ...(reg.requestId ? { version: reg.appliedVersion } : {}),
     ...('id' in answer
       ? { button: { id: answer.id, text: answer.text, type: answer.type } }
       : { response: { type: 'text', ...answer } }),
-    operator: { open_id: operatorOpenId },
     timestamp: Math.floor(Date.now() / 1000),
   }
   const controller = new AbortController()
@@ -841,9 +885,9 @@ export function __setPendingReplyForTest(chatId: string, active: boolean): void 
 /** Build the pull-result payload for `GET /notify/result/<id>`. Pure
  * function over a registration — extracted so the HTTP handler stays
  * thin and the shape is unit-testable. `resolved:false` while pending;
- * once frozen, the chosen button (id+text+type), resolve timestamp and
- * operator open_id are included so a stateless caller has the full
- * verdict without running a callback server. */
+ * once frozen, the chosen button (id+text+type) and resolve timestamp are
+ * included so a stateless caller has the verdict. The operator's open_id is
+ * deliberately not exposed: /notify is reachable by any local process. */
 export function buildNotifyResult(reg: NotifyRegistration): object {
   const resolved = !!reg.resolvedAt
   const unknown = !!reg.unknownAt
@@ -870,7 +914,6 @@ export function buildNotifyResult(reg: NotifyRegistration): object {
         status: resolved && buttonId === undefined ? 'resolved'
           : unknown && buttonId === undefined ? 'unknown' : reg.replyState.status,
         prompt_message_id: reg.replyState.promptMessageId,
-        operator: { open_id: reg.replyState.openId },
         ...(reg.replyState.cancelReason ? { cancel_reason: reg.replyState.cancelReason } : {}),
         ...(reg.replyState.error ? { error: reg.replyState.error } : {}),
       },
@@ -879,14 +922,12 @@ export function buildNotifyResult(reg: NotifyRegistration): object {
       ? {
           ...verdict,
           resolved_at: reg.resolvedAt,
-          resolved_by: reg.resolvedBy?.openId ?? null,
         }
       : {}),
     ...(unknown
       ? {
           ...verdict,
           unknown_at: reg.unknownAt,
-          unknown_by: reg.unknownBy?.openId ?? null,
           unknown_reason: reg.unknownReason,
         }
       : {}),

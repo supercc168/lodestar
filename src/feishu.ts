@@ -1,6 +1,6 @@
 import { networkFetch } from './network'
 import { FeishuRecoveryWindow, FeishuRequestError, readFeishuResponse, withFeishuRetry } from './feishu-retry'
-import { feishuErrorDetails, formatFeishuError, redactMemberIds } from './feishu-errors'
+import { feishuErrorDetails, formatFeishuError, redactMemberIds, redactPersonIdentifiers } from './feishu-errors'
 import { withChatMessageOrder } from './chat-message-order'
 /**
  * Feishu (Lark) primitives: Lark client, tenant token cache, chat
@@ -16,7 +16,6 @@ import { execSync } from 'node:child_process'
 import { randomUUID } from 'node:crypto'
 import { mkdirSync, readFileSync, statSync, writeFileSync } from 'node:fs'
 import { readFile } from 'node:fs/promises'
-import { homedir } from 'node:os'
 import { basename, extname, isAbsolute, join } from 'node:path'
 import { config, type ProjectProfile } from './config'
 import { openApiBaseFor } from './feishu-endpoint'
@@ -32,7 +31,6 @@ import {
 } from './agent-process'
 import {
   ALIVE_MARKER_FILE,
-  INBOX_DIR,
   SESSION_CHAT_MAP_FILE,
   SESSION_MODEL_MAP_FILE,
   SESSION_RESUME_MAP_FILE,
@@ -40,9 +38,11 @@ import {
   TEMP_SESSION_LEASES_FILE,
 } from './paths'
 import { log, logError } from './log'
+import { attachmentDir } from './attachments'
+import { sessionActivity } from './session-activity'
 import { sync as spawnSync } from 'cross-spawn'
 import { codexAccounts, DEFAULT_CODEX_ACCOUNT } from './codex-accounts'
-import { writeJsonStateAtomic, writeStateFileAtomic } from './state-store'
+import { writeJsonStateAtomic } from './state-store'
 import { profileForWorkspace, resolveWorkspaceDir } from './workspace'
 import { SESSION_NAME_MAX, mainSessionName, normalizeTempRole, stripTempSuffix, tempProjectName, tempRoleChatName } from './session-name'
 import { neutralizeMarkdownImagesInCard } from './cards/elements'
@@ -797,6 +797,7 @@ export function loadSessionTurnsMap(): void {
     }
     turnsBySession.clear()
     let rejected = 0
+    let scrubbed = false
     for (const [name, value] of Object.entries(obj)) {
       let arr: unknown[]
       let base: ConversationBranchBase
@@ -844,8 +845,11 @@ export function loadSessionTurnsMap(): void {
       const clean: TurnAnchor[] = []
       for (const value of arr) {
         const anchor = parseTurnAnchor(value, legacyProvider)
-        if (anchor) clean.push(anchor)
-        else rejected++
+        if (anchor) {
+          const redacted = redactPersonIdentifiers(anchor.preview)
+          if (redacted !== anchor.preview) { anchor.preview = redacted; scrubbed = true }
+          clean.push(anchor)
+        } else rejected++
       }
       if (clean.length || base !== null || pendingLaunch) {
         turnsBySession.set(name, {
@@ -856,6 +860,7 @@ export function loadSessionTurnsMap(): void {
       }
     }
     if (rejected > 0) log('feishu malformed turn anchors rejected')
+    if (scrubbed) saveSessionTurnsMapChecked()
   } catch (e: any) {
     // ENOENT(首次启动无文件)静默;其他(JSON 损坏等)要暴露,符合 no-fallbacks。
     if (e?.code !== 'ENOENT') logError('feishu turn anchors load failed', e)
@@ -1133,8 +1138,9 @@ export function unbindSessionModel(sessionName: string): void {
  * Remove conversation-scoped state after a session has been permanently
  * deleted. Callers must not use this for ordinary provider switches/restarts.
  */
-export function clearSessionConversationState(sessionName: string): void {
+export function clearSessionConversationState(sessionName: string, chatIdHint?: string): void {
   const previousChat = preferredChatForSession.get(sessionName)
+  const activityChatId = previousChat ?? chatIdHint
   const previousResume = lastSessionRefByName.get(sessionName)
   const previousModel = selectedModelByName.get(sessionName)
   const previousTurns = turnsBySession.get(sessionName)
@@ -1148,6 +1154,9 @@ export function clearSessionConversationState(sessionName: string): void {
   for (const [chatId] of previousLeases) tempSessionLeaseByChat.delete(chatId)
 
   try {
+    // The activity store is a separate file; drop the chat timestamp before
+    // the map writes so a permanently deleted conversation leaves no residue.
+    if (activityChatId) sessionActivity.forget(activityChatId)
     saveSessionChatMapChecked()
     saveSessionResumeMapChecked()
     saveSessionModelMapChecked()
@@ -1554,12 +1563,12 @@ export async function ensureWorktreeChatForSession(
 export async function disbandChatForSession(sessionName: string): Promise<{ chatId: string | null; disbanded: boolean; left?: boolean }> {
   const chatId = await findNormalChatIdByName(sessionName)
   if (!chatId) {
-    unbindSessionChat(sessionName)
+    clearSessionConversationState(sessionName)
     return { chatId: null, disbanded: false }
   }
   if (await isExternalChat(chatId)) {
     await leaveChatAsBot(chatId)
-    if (preferredChatForSession.get(sessionName) === chatId) unbindSessionChat(sessionName)
+    clearSessionConversationState(sessionName, chatId)
     return { chatId, disbanded: false, left: true }
   }
   const res = await client.im.chat.delete({ path: { chat_id: chatId } })
@@ -1567,7 +1576,7 @@ export async function disbandChatForSession(sessionName: string): Promise<{ chat
     throw sdkApiError('feishu chat.delete', res)
   }
   chatNameCache.delete(chatId)
-  if (preferredChatForSession.get(sessionName) === chatId) unbindSessionChat(sessionName)
+  clearSessionConversationState(sessionName, chatId)
   return { chatId, disbanded: true }
 }
 
@@ -1805,8 +1814,6 @@ export async function fetchChatName(chatId: string): Promise<string | null> {
   }
 }
 
-export * from './feishu-task'
-
 // ── Outbound: text + card ──────────────────────────────────────────────
 async function sendViaSdkWithRetry(
   what: 'Text' | 'Card' | 'Image' | 'File',
@@ -2025,15 +2032,17 @@ export async function downloadAttachment(
       await readFeishuResponse(res, `download ${type}`)
     }
     const buf = Buffer.from(await res.arrayBuffer())
-    mkdirSync(INBOX_DIR, { recursive: true })
+    const dir = attachmentDir()
+    mkdirSync(dir, { recursive: true, mode: 0o700 })
     const safeName = name
       ? name.replace(/[^a-zA-Z0-9._-]/g, '_')
       : `${key.replace(/[^a-zA-Z0-9_-]/g, '_')}.png`
-    // The inbox is shared by every chat. Timestamps and sanitized names can
-    // collide when simultaneous attachments arrive, so never overwrite a
-    // previous message's bytes (including a pre-existing symlink).
-    const path = join(INBOX_DIR, `${Date.now()}-${randomUUID()}-${safeName}`)
-    writeFileSync(path, buf, { flag: 'wx' })
+    // The directory is shared by every chat in this process. Timestamps and
+    // sanitized names can collide when simultaneous attachments arrive, so
+    // never overwrite a previous message's bytes (including a pre-existing
+    // symlink), and keep new files private to the owner.
+    const path = join(dir, `${Date.now()}-${randomUUID()}-${safeName}`)
+    writeFileSync(path, buf, { flag: 'wx', mode: 0o600 })
     return path
   } catch (e) {
     logError('feishu attachment download failed', e)
@@ -2179,24 +2188,11 @@ export async function uploadAndSend(chatId: string, filePath: string): Promise<b
 }
 
 // ── Project provisioning ──────────────────────────────────────────────
-// Bootstrap ~/{name}: create dir, mark as trusted in ~/.codex/config.toml so
-// Codex skips the project trust dialog, and `git init` so the project starts as
-// a real repo.
+// Bootstrap ~/{name}: create the directory and `git init`. Codex project trust
+// is passed per launch with `-c` (codex-process.ts); it must not be accumulated
+// in the shared ~/.codex/config.toml, which the backend Agent can read.
 export function provisionProject(workDir: string): void {
   mkdirSync(workDir, { recursive: true })
-  const codexConfigPath = join(homedir(), '.codex', 'config.toml')
-  try {
-    mkdirSync(join(homedir(), '.codex'), { recursive: true })
-    let text = ''
-    try { text = readFileSync(codexConfigPath, 'utf8') } catch {}
-    const header = `[projects.${JSON.stringify(workDir)}]`
-    if (!text.includes(header)) {
-      const prefix = text.trimEnd()
-      text = `${prefix}${prefix ? '\n\n' : ''}${header}\ntrust_level = "trusted"\n`
-      // 读-改-写用户真实 ~/.codex/config.toml:原子替换,崩溃/满盘不毁原文件。
-      writeStateFileAtomic(codexConfigPath, text)
-    }
-  } catch (e) { logError('codex trust settings write failed', e) }
   try { execSync('git init -q', { cwd: workDir, stdio: 'ignore' }) } catch {}
 }
 

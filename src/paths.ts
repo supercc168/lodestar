@@ -16,7 +16,6 @@
  *   session-chat-map.json   — duplicate-name routing        (in DATA_DIR)
  *   session-resume-map.json — last-known Codex thread_id  (in DATA_DIR)
  *   session-model-map.json  — per-session selected Codex model (in DATA_DIR)
- *   tasklist-map.json       — project tasklist bindings     (in DATA_DIR)
  *   agent-runs/             — durable delegated-agent runs    (in DATA_DIR)
  *   agent-requests.json     — durable project request fences  (in DATA_DIR)
  *   agent-project-client.json  — ordinary local project capability (in DATA_DIR)
@@ -74,7 +73,6 @@ export const SESSION_MODEL_MAP_FILE = join(DATA_DIR, 'session-model-map.json')
 export const SESSION_ACTIVITY_FILE = join(DATA_DIR, 'session-activity.json')
 /** Exact chats created by the temporary-session runtime; required before `bye` may delete. */
 export const TEMP_SESSION_LEASES_FILE = join(DATA_DIR, 'temp-session-leases.json')
-export const TASKLIST_MAP_FILE = join(DATA_DIR, 'tasklist-map.json')
 /** Durable delegated-agent runs. Every state transition is written so completed
  *  runs survive daemon restart, remain follow-up capable, and can be inspected
  *  from CLI/HTTP. */
@@ -127,16 +125,17 @@ export const NOTIFY_CALLBACKS_FILE = join(DATA_DIR, 'notify-callbacks.json')
  * The daemon also refreshes it on session lifecycle changes so rapid
  * repeated restarts do not lose the revive list. */
 export const ALIVE_MARKER_FILE = join(DATA_DIR, 'alive-on-shutdown.json')
-export const INBOX_DIR = join(DATA_DIR, 'inbox')
 /** One private receipt per cloud-file delivery; remote files are managed in their Feishu folder. */
 export const FILE_DELIVERIES_DIR = join(DATA_DIR, 'file-deliveries')
 /** Per-chat Drive folder bindings; legacy preferences are ignored during migration. */
 export const FILE_DELIVERY_GROUPS_FILE = join(DATA_DIR, 'file-delivery-groups.json')
 /** Unix-socket endpoint the daemon listens on for debug message
  * injection (see scripts/test-inject.ts). A real Feishu user sends
- * a `[DEBUG]…` text once to seed `DEBUG_CTX_FILE` with chat_id +
- * sender_open_id; the injector then POSTs `{text}` here and the
- * daemon replays it through `handleMessage` as if WS had delivered
- * it. File mode 0600 — daemon-private, never network-exposed. */
+ * a `[DEBUG]…` text once to seed `DEBUG_CTX_FILE` with the target chat;
+ * the sender open_id is held in daemon memory only. The injector then
+ * POSTs `{text}` here and the daemon replays it through `handleMessage`
+ * as if WS had delivered it. Created only for an explicit
+ * `LODESTAR_DEBUG_SOCKET=1` Bun run, removed on shutdown; never
+ * network-exposed. */
 export const DEBUG_SOCK_FILE = join(DATA_DIR, 'debug.sock')
 export const DEBUG_CTX_FILE = join(DATA_DIR, 'debug-context.json')

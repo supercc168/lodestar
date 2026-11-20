@@ -1008,7 +1008,8 @@ describe('AgentService', () => {
     await waitFor(service, root, started.runId, 'completed')
     expect(seen[0].LODESTAR_AGENT_CAPABILITY).toBeTruthy()
     expect(seen[0].LODESTAR_AGENT_URL).toMatch(/^http:\/\//)
-    expect(seen[0].LODESTAR_AGENT_SESSION).toBe('project')
+    // 受管上下文改由 ROLE/URL/CAPABILITY 判定,不再注入 SESSION 名
+    expect(seen[0].LODESTAR_AGENT_SESSION).toBeUndefined()
   })
 
   test.each(['session', 'project'] as const)('%s workers apply the ownership delegation policy and resume descendants without a depth limit', async kind => {
@@ -2386,4 +2387,19 @@ describe('Lodestar Agent claude-sub: Opus only, medium / max', () => {
     await waitFor(service, root, followed.runId, 'completed')
     expect(calls[0]).toMatchObject({ effort: 'medium' })
   })
+})
+
+test('project runs never persist or return the caller open_id', async () => {
+  const h = harness()
+  const principal = h.service.projectPrincipal({ owner: {
+    kind: 'project', name: session.sessionName, chatId: session.chatId, workDir: session.workDir,
+  } })
+  const run = await h.service.startRun(principal, {
+    identityIds: ['agent:a'], description: '任务说明', prompt: 'work', requesterOpenId: 'ou_secret_requester',
+  })
+  await waitFor(h.service, principal, run.runId, 'completed')
+  const persisted = h.artifacts.filter((value: any) => value.runId === run.runId).at(-1) as any
+  expect(persisted).toBeDefined()
+  expect(persisted.requesterOpenId).toBeUndefined()
+  expect(JSON.stringify(persisted)).not.toContain('ou_secret_requester')
 })

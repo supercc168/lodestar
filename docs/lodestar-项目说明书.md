@@ -235,7 +235,6 @@ projects_root = "~/"     # 项目根目录,可选,默认主目录
 | `clear` / `cl` | 清空上下文、开一段全新对话 |
 | `compact` / `cm` | 压缩当前上下文(长对话省 token) |
 | `model` / `md` | **切换 AI 模型**(见 7.3) |
-| `task` | 打开任务清单面板(见 7.5) |
 | `wt` / `worktree` | 多分支并行开发(见 7.4) |
 
 ![图 7.2 hi 控制台](images/feishu/7.2-hi-console.png)
@@ -267,13 +266,7 @@ projects_root = "~/"     # 项目根目录,可选,默认主目录
 ![图 7.4 wt 分支列表卡片](images/feishu/7.4-worktree.png)
 > 📷 **待补图 7.4** ｜ 截图内容:群里发 `wt` 弹出的分支列表卡片(展示 `work/*` 各分支状态 clean/dirty/merged 和"删"按钮)。
 
-### 7.5 任务清单自动化(`task`,预览版)
-群里发 `task` → 点 `启用`,会创建一个绑定的飞书任务清单,分成 `设计中` / `[AI]待执行` / `[AI]执行中` / `[AI]待审核` / `已完成` 几个分组。后台 worker 会自动挑任务、规划、在本地分支上执行、生成审查请求,你人工确认后触发合并。适合把一批任务丢给 AI 排队处理。
-
-![图 7.5 task 任务清单面板](images/feishu/7.5-task-panel.png)
-> 📷 **待补图 7.5** ｜ 截图内容:群里发 `task` 弹出的任务清单面板卡片,以及(可选)绑定后的飞书任务清单里几个分组的样子。
-
-### 7.6 发图片、文件、@
+### 7.5 发图片、文件、@
 - **发图片/文件**:直接在群里发**真图片/文件附件**(不是发路径文字),机器人会自动下载到本地并交给 AI 处理。
 - **一次性外部任务**:`agy <prompt>` 会用独立卡片跑一个外部 agy 任务。
 
@@ -385,7 +378,6 @@ curl -sS -X POST http://127.0.0.1:9876/notify \
 | `src/claude-agent-process.ts` / `src/codex-process.ts` | Claude / Codex 两个后端实现 |
 | `src/feishu.ts` | 飞书 API:消息、群管理、附件、reaction |
 | `src/cardkit.ts` + `src/cards/` | 飞书卡片流式渲染 |
-| `src/tasklist-worker.ts` | 任务清单自动化后台 worker |
 | `src/notify.ts` | 本机 HTTP 通知服务 |
 | `src/config.ts` / `src/paths.ts` | 配置读取 / 运行时路径 |
 | `src/setup.ts` | 首次配置向导 |

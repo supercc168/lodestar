@@ -7,6 +7,7 @@ import { isAbsolute, relative } from 'node:path'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 import { prioritizeVisibleSlice } from './task-board'
 import { shellCommandPresentation, shellCommandDescription } from './shell-command'
+import { TASK_LIST_VISIBLE_LIMIT } from './task-board'
 import { closeOpenMarkdownFence, fencedCodeBlock, sliceWholeCharacters } from '../markdown-code'
 
 function isBashCommandTool(name: string): boolean {
@@ -629,9 +630,9 @@ function renderPathSearchBody(name: string, input: any, output: string | null, r
 function renderTodoBody(input: any, output: string | null, resolvedNote?: string): string {
   const todos = Array.isArray(input?.todos) ? input.todos : []
   const lines: string[] = [`**待办**: ${todos.length} 项`]
-  // 条目放得下时保持原顺序;超过 12 条时未完成(进行中/待办)优先显示,
+  // 条目放得下时保持原顺序;超过上限时未完成(进行中/待办)优先显示,
   // 已完成的先隐藏 —— 与 Task 工具任务板的展示优先级一致。
-  const shown = prioritizeVisibleSlice(todos, 12, (todo: any) => todo?.status === 'completed')
+  const shown = prioritizeVisibleSlice(todos, TASK_LIST_VISIBLE_LIMIT, (todo: any) => todo?.status === 'completed')
   for (const todo of shown.items) {
     const status = todoStatusLabel(todo?.status)
     const content = String(todo?.content ?? todo?.activeForm ?? '').trim() || '(空)'

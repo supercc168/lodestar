@@ -20,6 +20,7 @@ import { randomUUID } from 'node:crypto'
 import type { Readable, Writable } from 'node:stream'
 import { spawn as crossSpawn } from 'cross-spawn'
 import { config } from './config'
+import { scrubAgentHostEnv } from './agent-env'
 import { logError, logDiagnostic } from './log'
 import { agentBin } from './agent-updates'
 import { prepareCodexInputPolicyCatalog, type CodexInputPolicyCatalog } from './codex-input-policy'
@@ -141,9 +142,7 @@ export function buildCodexSpawnEnv(
   hostEnv?: Record<string, string | undefined>,
 ): Record<string, string> {
   const env: Record<string, string> = {
-    ...(process.env as Record<string, string>),
-    NPM_CONFIG_LOGLEVEL: 'error',
-    PATH: buildSpawnPath(),
+    ...scrubAgentHostEnv({ ...(process.env as Record<string, string>), NPM_CONFIG_LOGLEVEL: 'error', PATH: buildSpawnPath() }),
     ...config.codex.env,
     ...providerEnv,
     GSD_RUNTIME: 'codex',
@@ -617,6 +616,9 @@ export class CodexProcess extends EventEmitter {
     const providerArgs = opts.apiProvider ? codexApiProviderArgs(opts.apiProvider)
       : [...(opts.tokenSourceId === 'codex-sub' ? ['-c', 'model_provider="openai"'] : []),
         ...codexAccounts.cliArgs(opts.codexAccountId ?? DEFAULT_CODEX_ACCOUNT)]
+    // Project trust is scoped to this launch; never write it to the shared
+    // ~/.codex/config.toml (the backend Agent reads that file).
+    const projectTrustArgs = ['-c', `projects.${JSON.stringify(opts.workDir)}.trust_level="trusted"`]
     const baseEnv = buildCodexSpawnEnv(opts.providerEnv, opts.hostEnv)
     const routedEnv = opts.transformEnv ? opts.transformEnv(baseEnv) : baseEnv
     const spawnEnv = opts.apiProvider
@@ -629,7 +631,7 @@ export class CodexProcess extends EventEmitter {
       // catalog 覆盖合流:统一插在 --listen 之前。
       const args = buildCodexAppServerArgs(opts.configArgs, opts.allowDelegation)
       const listenAt = args.indexOf('--listen')
-      this.spawnNative(codexBin, [...args.slice(0, listenAt), ...providerArgs,
+      this.spawnNative(codexBin, [...args.slice(0, listenAt), ...providerArgs, ...projectTrustArgs,
         ...(catalog ? ['-c', `model_catalog_json=${JSON.stringify(catalog.path)}`,
           ...catalog.disabledFeatures.flatMap(feature => ['--disable', feature])] : []),
         ...args.slice(listenAt)], spawnEnv)

@@ -66,8 +66,6 @@ export const ELEMENTS = {
   agentIdentityPanel: 'agent_identity_panel',
   /** Footer on an independent agent-run card. */
   agentRunFooter: 'agent_run_footer',
-  /** Tasklist automation panel. */
-  tasklistPanel: 'tasklist_panel',
   /** GSD status panel (TRACKER / active task / bridge). */
   gsdPanel: 'gsd_panel',
   /** Independent receipt for one turn's delivered cloud files. */

@@ -6,7 +6,6 @@
 `Session` 管理生命周期，`AgentProcess` 定义共享后端事件，具体进程类转换协议，`cardkit.ts` 串行写卡。
 
 ## Purpose
-`src/` 是 Lodestar daemon 的核心实现层，封装飞书 API、统一 `AgentProcess` 后端接口及其 Codex / Claude 两类实现、每个群的 session 状态机、Card Kit 流式更新、模型/effort 持久选择、`wt` worktree 群编排、`agents`/`lodestar-agent` 完整委派（固定档位 identity）、`agy <prompt>` 外部任务、`task` 飞书任务清单自动化、入站多条消息合并(`>>>`/`<<<`)、临时会话 `fk`/`bk`/`rs`/`btw`/`bye` 分叉回滚与临时群、安装/停止/升级 CLI，以及 runtime state 路径和配置读取。session 默认 provider 为 Claude/GLM，可经 `model` 切到 Codex。
 
 ## Key Files
 | File | Description |
@@ -25,7 +24,6 @@
 | `agent-skill.ts` | 双目录 SKILL.md + `DATA_DIR/bin/lodestar-agent` wrapper；措辞为固定档位 identity。 |
 | `inbound-message.ts` | 入站 freshness + native image/file/media 资源映射（视频走 `file_key`，失败可见回执）。 |
 | `session-worktree.ts` | `wt` session 侧编排：项目名/目录约定、额外 worktree instructions 注入、列表卡、建群/入群和解散回调。 |
-| `session-tasklist.ts` | `task` 面板的 session 回调：启用项目任务清单、删除确认和面板重绘。 |
 | `session-model.ts` | `model` 面板流程：通过 Codex app-server 动态拉取模型列表、选择模型和 reasoning effort、持久化 session 选择。 |
 | `session-compact.ts` | 手动 `compact` 命令流程：发起 app-server 上下文压缩、监听完成事件和 token usage 快照、更新状态卡。 |
 | `session-tools.ts` | 工具调用面板、工具结果自动发文件和换卡后的工具面板重建逻辑；连续 Read / 连续 Edit 系(Edit/MultiEdit/NotebookEdit)各自合并成单个批次面板。 |
@@ -36,9 +34,6 @@
 | `session-multimsg.ts` | 入站多条消息缓冲状态机:`>>>`(≥3) 开缓冲、`<<<`(≥3) 合并 flush 成一条发给 agent、缓冲中的普通消息原样追加;缓冲期间每条打 📌,flush 释放,`stop`/`kill`/`restart`/`clear` 经 `clearMultiMsgBuffer` 丢弃并打 ❌;永不超时,只活在内存(daemon 重启会丢并打 ❌ 让失败可见)。 |
 | `session-temp.ts` | 临时会话 / fork / back / rs 历史分支:`fk` 列当前 provider+cwd 匹配锚 fork 到临时群、`bk` 列锚点选后才 stop→rollbackTo、`rs` 双后端同 cwd 历史 fork 独立分支、`btw` 建临时群启动干净会话、`bye` 散临时群(lease 守卫);选择卡只带 `{kind,panel_id,choice_id}`。 |
 | `agy-task.ts` | 外部 agy CLI 辅助：解析可执行文件、构造 `agy --print` 参数、补 PATH、采集执行前后 Git 快照和 diff 摘要。 |
-| `tasklist.ts` | `task` 项目清单绑定和状态存储；创建 `<project>[lodestar]` 清单、维护分组 GUID、记录自动化进程和每个任务的运行状态。 |
-| `tasklist-worker.ts` | 任务清单轮询 worker；按 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成` 分组驱动 Codex/agy 规划、选择、执行、审核和本地合并。 |
-| `tasklist-worker-git.ts` | `tasklist-worker` 的本地 Git worktree、artifact tag 和 local review ref 辅助逻辑。 |
 | `agent-process.ts` | 统一 agent 后端接口：定义 `AgentProcess`（`EventEmitter`）、`AgentProvider = 'codex' \| 'claude'`、统一 `AgentProcessEventMap`、Claude reasoning effort 集合（`low`/`medium`/`high`/`xhigh`/`max`，默认 `max`）和 `providerFromModel` 等 provider 辅助；`CodexProcess` 与 `ClaudeAgentProcess` 都实现该接口。 |
 | `codex-process.ts` | 实现 `AgentProcess` 的 Codex 后端：启动 `codex app-server --listen stdio://`，处理 JSON-RPC 请求、通知、工具权限、模型列表/settings、thread 启停和 app-server 事件映射。 |
 | `codex-usage.ts` | 解析 app-server token usage payload，并计算 per-turn absolute total 差值与有效 token。 |
@@ -54,7 +49,6 @@
 | `feishu-task.ts` | 飞书 Task v2 清单/分组/任务/评论 API 包装，以及 Task API 错误格式化。 |
 | `worktree.ts` | `wt` 的 Git worktree 逻辑：按 `work/*` 分支扫描、创建同级 `<project>[name]` worktree、归档已合并分支、重新激活时更新到主线、干净检查和删除目录。 |
 | `config.ts` | 同步读取 `config.toml`，解析 `[feishu]`、`[runtime]`、`[notify]` 和可选 `[codex.env]`。 |
-| `paths.ts` | XDG/Windows runtime 路径解析，以及 PID、日志、session/chat/resume/model/alive/tasklist map、inbox、debug socket 路径常量。 |
 | `notify.ts` | 本机 HTTP 通知服务，接收 `{project, text, title?, level?, images?, buttons?, callback?}` 并发送飞书 markdown 卡片；`buttons` 把卡片变成交互卡 —— `callback` 在则点击时 push 给调用方 loopback 服务，不在则 `GET /notify/result/<notify_id>` pull 取结果。 |
 | `notify-callbacks.ts` | `/notify` 交互按钮的注册表与回调分发：持久化 `notify_id → callback URL + 原始卡片参数` 到 `notify-callbacks.json`(7 天 TTL)；`callback` 在时把 `{notify_id, button, operator, …}` POST 到调用方 loopback URL(2.5s 超时)，失败显式暴露不兜底；`buildNotifyResult` 供 pull 端点输出裁决；in-memory `dispatching` Set 做两阶段点击的并发护栏(仅内存,restart 清零)。 |
 | `notify-skill.ts` | 在本机 Codex(`~/.codex/skills/`)和 Claude Code(`~/.claude/skills/`)两个 skills 目录生成/维护 Feishu notify 技能说明;两侧同源、幂等覆盖。 |
@@ -75,7 +69,6 @@
 | `inbound-markers.ts` | 与 `outbound-markers.ts` 对称,解析用户入站消息里的多条消息起始/收尾标记:`>>>`(≥3) 开始收集、`<<<`(≥3) 收尾合并,标记前缀从 body 去掉不转发给 agent;阈值 ≥3 是用户确认的本意(普通 `>`/`>>` 引用不误触,三级嵌套引用 `>>>` 会——可接受)。 |
 | `log.ts` | 按日滚动 logger：写 `daemon-YYYY-MM-DD.log`（本地日期），跨天与启动时清理超过 7 天的旧日志；启动把老 `daemon.log` 迁移成按日文件。 |
 | `feishu-test-mock.ts` | 共享的 `./feishu` 测试替身(仅供 `*.test.ts` import):统一 `mock.module` 注册,避免多测试文件的窄 mock 互相覆盖(cardkit 的窄 mock 曾顶掉 session 的全量 mock,导致单进程 `bun test src/` 时 Session 构造炸 `getSessionModelSelection`);导出 `sentCards`/`sentTexts`/`deletedReactions` 等捕获数组和 `resetFeishuMock()`。 |
-| `*.test.ts` | Bun 单元测试，覆盖 Card Kit、turn/agy/task card 渲染、tasklist worker、card action 回调返回、context window 展示、outbound/inbound marker、入站多条消息合并、后台任务卡、临时会话卡、notify 回调、Codex 事件解析、usage 快照、session 行为和 worktree/agy Git 行为。 |
 
 
 ## Subdirectories
@@ -91,7 +84,6 @@
 - 修改 `src/` 代码时，**不得**为了验证卡片/交互效果而去停止、重启、切换或并行接管 live daemon；用户若只说“测试”“预览”“发一张看看”，一律视为**未授权**。只有用户明确点名对应 daemon/service 操作时才能执行。
 - `wt` 命令的 Git 操作集中在 `worktree.ts`；不要在 `session.ts` 里散写 `git` shell 命令。
 - `agy <prompt>` 的 CLI 参数、PATH 和 Git 快照集中在 `agy-task.ts`；session 侧进程生命周期、输出收集、状态刷新和卡片接线集中在 `session-agy.ts`。
-- `task` 面板按钮由 `session-tasklist.ts` 处理，持久状态集中在 `tasklist.ts`，后台自动化集中在 `tasklist-worker.ts`；不要把轮询、进程状态或 Git 产物逻辑塞进卡片模板。
 - `model` 命令为固定选项(codex 内建=gpt-5.6-sol/max、claude 第一方=Fable 5/Opus 5 均 max、glm=effort 随 config、Grok 无痕=官方最高 xhigh、CatCodex=网关兼容 xhigh),effort 锁死一键生效,不动态拉取 `model/list`；Grok 不得走 Codex。
 - 连续失败工具熔断在 `tool-failure-loop.ts` 保持纯检测，在 `Session` 统一执行第三次软中断/卡片终态/真人队列续投；Claude 的第二次纠错提示留在 SDK `PostToolUseFailure` hook。不要把它并入 Codex-only turn watchdog，也不要自动重放失败任务。
 - Claude/Codex spawn 凭据与 model 注入经 `token-source.ts` 单入口；新增档位仍写 `[claude.models.*]`/`[codex.models.*]` 与 `claude-models`/`codex-models` profile，不要平行再加一套 `[token_source.*]` 配置。委派 worker 同样只走 `resolveTokenSource*`。
@@ -112,7 +104,6 @@
 - 真实群 smoke 若会触碰 live daemon/service，先单独征得用户明确许可；“我想先看看效果”或“发个测试卡”不足以授权 stop/restart/switch daemon。
 - 修改 `model` 或 `wt` 创建/加入/解散流程后，用 debug 注入在真实群里验证 `model`、`wt`、`wt <name>` 和解散按钮；测试结束后清理临时 worktree、群和本地分支。
 - 修改 `agy` 命令、外部进程、Git 快照或卡片结构后，至少运行 `bun test src/agy-task.test.ts src/cards/agy.test.ts`，共享 session 行为变更再运行全量 `bun test`。
-- 修改 `task` 面板、清单分组、worker 调度、任务评论或本地审查/合并流程后，至少运行 `bun test src/tasklist-worker.test.ts src/cards/task.test.ts`；触及共享 session 或 Feishu API 包装时运行全量 `bun test`。
 - 修改 `cards/` 渲染或工具摘要时至少运行相关 Bun 测试：`bun test src/cards/turn.test.ts src/cardkit.test.ts src/context-window.test.ts`。
 
 ### Common Patterns
@@ -123,7 +114,6 @@
 - `agy <prompt>` 使用 `agy --model "Gemini 3.1 Pro (High)" --dangerously-skip-permissions --print-timeout 180m0s -p <prompt>`，每个 session 同时只允许一个任务；`stop`/`kill`/`restart` 要清理正在运行的 agy 进程和状态刷新定时器。
 - `agy` 卡片每 30 秒更新状态统计，stdout/stderr 用 `StringDecoder` 收集，空输出需要显式报错说明；完成后可用卡片按钮把结果幂等转发给 Codex。
 - `task` 清单名固定为 `<project>[lodestar]`，分组固定为 `设计中`、`[AI]待执行`、`[AI]执行中`、`[AI]待审核`、`已完成`；默认分组会被重命名为 `设计中`，其他分组按缺失补齐。
-- `tasklist-worker` 启动后延迟 15 秒首次扫描，此后每 30 秒扫描一次；同一时间只跑一个 scan，运行记录写入 `tasklist-map.json` 并在进程丢失时向任务评论暴露错误。
 - 任务自动执行使用 `AI-AUTO`/`AI-REVIEW` 本地 worktree 和 `AI-AUTO/<task-guid>` tag 作为审查产物；人工在 `[AI]待审核` 中勾选完成是触发本地合并的信号。
 - 入站多条消息合并走 `session-multimsg.ts` 状态机 + `inbound-markers.ts` 解析;`>>>`/`<<<` 阈值 ≥3,缓冲只活在内存(daemon 重启会丢并打 ❌ 让失败可见,符合 no_fallbacks)。
 - 临时会话 `fk`/`bk` 的 turn 锚点用 daemon 记的 V4 turn-map(checkpoint + preview + writes);`rs` 空闲态的历史发现由后端自己负责(Claude transcript / Codex `thread/list`),不维护自有会话索引——之前的 resume-map + 后缀归属判断会漏会话并把 worktree 群误归项目。
@@ -138,13 +128,10 @@
 ## Dependencies
 
 ### Internal
-- `session.ts` 经 `AgentProcess` 接口（`agent-process.ts`）持有当前 `proc`，按 `selectedProvider` 在 `ClaudeAgentProcess`（默认）和 `CodexProcess` 之间 spawn；并依赖 `cardkit.ts`、`cards.ts`、`feishu.ts` 和 `session-*` helper；业务面板/命令 helper 再依赖 `worktree.ts`、`tasklist.ts`、`agy-task.ts` 等领域模块。
 - `claude-agent-process.ts` 依赖 `@anthropic-ai/claude-agent-sdk`、`agent-process.ts`、`token-source.ts`（spawn env / apiRoute 单入口，内部委托 `claude-models.ts`）、`codex-usage.ts`（token usage 解析复用）和 `config.ts`；`glm-usage.ts` / `claude-provider-usage.ts` 被 `session.ts`（console opts）和 `cards/console.ts` 消费。
 - `token-source.ts` 适配 `claude-models.ts` / `codex-models.ts` 与 `agent-process.usageSourceForAgent`；`session.ts` Codex spawn 走 `resolveCodexSpawnOverrides`，console 额度源走 `resolveUsageSource`。
-- `tasklist-worker.ts` 依赖 `tasklist.ts`、`feishu.ts`、`agy-task.ts`、`codex-process.ts` 和 `tasklist-worker-git.ts`；本地 Git worktree、tag 与审查 diff 约定集中在 `tasklist-worker-git.ts`。
 - 后台任务卡 `cards/background.ts` 由 `claude-agent-process.ts` 的 SDK `task_*` 事件(started/progress/updated/settled)经 `session.ts`/`session-tools.ts` 驱动;`session-temp.ts` 依赖 `cards/temp.ts` + turn-map,`session-multimsg.ts` 依赖 `inbound-markers.ts`。
 - `cardkit.ts` 依赖 `feishu.getTenantToken()` 获取 Card Kit API token。
-- `feishu.ts` 依赖 `config.ts`、`paths.ts` 和 `codex-process.resolveCodexBin()`，并维护 session chat/resume/model/alive/tasklist runtime map。
 - CLI 文件依赖 `paths.ts`、`pid-guard.ts`、`setup.ts` 和 Node/Bun process API。
 
 ### External
@@ -152,7 +139,7 @@
 - `codex` CLI：无头 app-server、ChatGPT 登录状态、模型使用量。
 - `@anthropic-ai/claude-agent-sdk` / `@anthropic-ai/sdk`：Claude 后端 `query()` streaming-input transport、模型档位路由、user dialog。
 - `claude` CLI：Claude Code 本机可执行文件，`assertClaudeCodeAvailable` 启动前检查；模型路由真相源是其 `~/.claude/settings.json`。
-- Feishu Card Kit v1、IM Open API 和 Task v2 Open API：卡片、消息、reaction、附件、urgent app、任务清单、分组、任务和评论。
+- Feishu Card Kit v1、IM Open API 和 Task v2 Open API：卡片、消息、reaction、附件、urgent app。
 - Bun test/build runtime，Node.js child process/fs/http/path/os API。
 - systemd：`sysinfo.ts` 只读用户服务状态，用于控制台展示。
 - Codex 的 `plugins` 整个目录按账号独立，不加入共享路径；账号安装清单不同，原生同步会清理缓存。`codex-plugin-cache.cjs` 由 npm postinstall 和账号启动准备共用，将旧的默认插件链接迁为独立副本，保留源缓存、登录态、账号安装状态及其他共享历史。新账号创建空插件目录，已有独立目录不重复填充。安装迁移不启动 Agent/daemon，不读凭据；路径异常和迁移失败须明确报错，不能悄悄继续共享。
@@ -169,10 +156,10 @@
 
 - 本机环境变量 `LODESTAR_RESTART_CONTINUE_CHAT_ID` 可显式给一个精确群开启重启自动续接，默认关闭。只在原生会话成功恢复且空闲时，在同群 actor 内提交一次标明宿主来源的新续接请求；不重放旧输入、不启动新会话、不跨群。恢复或提交失败明确报告，不自动重试；不修改普通用户消息路径的默认行为。就绪与身份按后端区分：Codex、DSH 在打开会话时就发 init 并给出会话 ID，须已收到；Claude 的原生 init 与 `sessionId` 要到首轮的第一条原生消息才出现，恢复流程完成初始化并置为空闲即就绪（此时 `initCount` 为 0、`sessionId` 为 null），身份在 `sessionId` 未知时改用进程的 `resumedSessionId`（就地 resume 的保存会话，fork 与新会话为 null）与保存的会话比对，`sessionId` 一旦已知仍以它为准。续接请求与恢复后的第一条普通消息同路送入，由首轮 init 开卡，提交失败同样报错；开卡失败与普通消息相同（红色提示并中断该轮），日志仍记为已提交。不能统一要求 `initCount ≥ 1` 或 `proc.sessionId`，否则 Claude 会话的续接必然失败；测试替身须在首条原生消息前保持 `sessionId` 为 null。
 
-- `workspace.ts` 定义工作目录键与项目 profile：BTW/FK 去临时后缀并共享原目录，WT 保留独立目录；别名和软链接归一化，冲突报错。主会话与委派按实际执行目录查工具/MCP 配置。任务清单按主项目名持久化，主群、所有 WT 及其临时群共用。云空间目录按项目主群共享（BTW/FK/WT 群都进主群目录），模型/账号与会话历史各自保留原边界；临时会话模型/账号创建时继承，之后独立。带备注的 `btw` 群名精确等于 `<基名>*<备注>`，基名跟随当前群（主群 `<项目>`、WT 群 `<项目>[分支]`），总长受 `SESSION_NAME_MAX` 限制且超长明确拒绝；同名群由 `ensureTempChatForSession` 加入并拉人，不追加 `-2`，只有新建群才启动会话；`bye` 不看创建者：群成员用 `leaveChatForMember` 把自己移出，退出前后按 `chatMemberOpenIds` 复核，最后一人退出时停止会话并解散群。外部联系人（发送者或卡片操作者的 `tenant_key` 与事件的应用 `tenant_key` 不同，任一缺失按内部成员）只在事件到达时判断，`RequesterTenant` 随 `runCommand`→`runBtwCommand`/`runWorktreeCommand` 和 `onForkSelect` 显式传递，不记录、不缓存发起人。外部联系人要新建临时群时（`btw`、`fk`，以及同名群还不存在的 `btw 备注`——先用 `findNormalChatIdByName` 查，已存在就直接加入、不要群主），由 `resolveTempGroupOwner` 取当前群群主当新群群主（须是 `ou_` 用户、不是发起人、`chatMembers.get` 的 `tenant_key` 等于应用租户，否则报错且不建群），建群请求带 `owner_id`，`user_id_list` 为发起人和群主；请求另带 `externalRequester`，加入既有群时也据此给提示。本企业成员在内部群里发起时请求不变，不出现 `ownerOpenId`/`externalRequester`；在外部群里发起时（`isExternalChat(s.chatId)`；群类型建好后不能改，`feishu.ts` 读到确定值后按 chat_id 缓存，读取失败报错且不建群）同样建外部群：`ownerOpenId` 为发起人本人、`externalRequester: false`，不查来源群群主、不预查同名群（加入既有群不用群主），之后外部联系人也能加入。指定群主的建群请求一律带 `external: true`：初始成员全是本企业的人时不声明就会建成内部群，之后外部成员再也进不来；外部群请求遇 232033 提示应用的对外共享权限，本企业成员发起时不给外部联系人的提示。开启对外共享的应用发版前用 `scripts/test-external-temp-group.ts` 实测一次。这套群类型与群主规则在 `session-group-owner.ts` 的 `newGroupFields`，临时群（`'temp'`）与 wt（`'worktree'`，同名 WT 群作复用名）共用，日志事件按入口取不同的字面量；`isExternalChat` 在单聊同款的查询窗口内重试瞬态错误。wt 在建 worktree 和分支之前就确定群类型与群主，失败直接报错不留半成品，建群 / 拉人走 `ensureWorktreeChatForSession`（同名串行、外部群提示，内部 WT 群拒绝外部联系人时给 WT 专用说明）；`disbandChatForSession`（wt 删除）遇外部 WT 群改为机器人退群并返回 `left`，目录照删。外部联系人发带名称的 `wt` 与 `btw 备注` 同规则：同名 WT 群已存在只加入、不要群主，否则由当前群群主当群主建外部 WT 群；不带参数的列表照常。机器人不能解散外部群，也不能移出其中成员：`bye` 先查 `isExternalChat`（失败只报错），外部群不走退出/最后一人流程，先发 `retiring` 提示再停止会话、`leaveChatAsBot` 退群并按解散清理本地状态，群留给群主手动解散；退群成功但本地清理失败时运行时返回 `ok:false, left:true`，失败改报到来源群（基名群或项目主群，经 `chatIdForSession` 解析，解析不到只记日志）。`disbandChatForSessionExact` 遇外部群改为退群并返回 `left`，建群补偿和 `wt` 删除同样只退群。群主、同名群和群类型查询失败都在群里显示并以固定事件名 `logError`。临时群建群/拉人、`wt` 失败和入站兜底报错用 `redactMemberIds` 去掉飞书回显的成员 ID（列表、`user_id: …` 和真实形态的 `ou_`/`on_` 加 32 位小写十六进制，`on_call` 等普通文本不动）；外部联系人流程对 232043 按飞书列出的不可见成员区分提示（发起人：先单聊确认；群主：加入应用可用范围；其余两条都给），对加入时的 232028 提示换备注。外部联系人的 `[DEBUG]` 消息不写调试上下文（`shouldSeedDebugContext`）。`wt` 的「删」先用 `tempChatNamesUnderWorktree` 收集该分支下的临时群，逐群确认非运行且唯一后先解散它们，再删 worktree 群和目录。`btw`/`bye` 的状态提示统一用 `cards.tempSessionNoticeCard`：一次操作只发一张卡，创建/加入/退出/解散的终态用 `message.patch` 原地更新，正文只保留一行状态和一行短提示（群名由标题承载）；发送失败回退原文并带飞书诊断，原地更新失败只回退原文，不补发第二张卡。`bl`/`btwlist` 从 `listTempSessionLeases()` 和本 daemon 的 `Session.all` 汇总全部临时会话（含未构造的旧租约），按创建时间倒序展示群名、项目、模型与实时状态（运行中会话附子 Agent/后台进程数）；只读本地状态和运行中后端的本机进程状态，不发群列表查询，不把未加载会话标成成功运行。
+- `workspace.ts` 定义工作目录键与项目 profile：BTW/FK 去临时后缀并共享原目录，WT 保留独立目录；别名和软链接归一化，冲突报错。主会话与委派按实际执行目录查工具/MCP 配置。云空间目录按项目主群共享（BTW/FK/WT 群都进主群目录），模型/账号与会话历史各自保留原边界；临时会话模型/账号创建时继承，之后独立。带备注的 `btw` 群名精确等于 `<基名>*<备注>`，基名跟随当前群（主群 `<项目>`、WT 群 `<项目>[分支]`），总长受 `SESSION_NAME_MAX` 限制且超长明确拒绝；同名群由 `ensureTempChatForSession` 加入并拉人，不追加 `-2`，只有新建群才启动会话；`bye` 不看创建者：群成员用 `leaveChatForMember` 把自己移出，退出前后按 `chatMemberOpenIds` 复核，最后一人退出时停止会话并解散群。外部联系人（发送者或卡片操作者的 `tenant_key` 与事件的应用 `tenant_key` 不同，任一缺失按内部成员）只在事件到达时判断，`RequesterTenant` 随 `runCommand`→`runBtwCommand`/`runWorktreeCommand` 和 `onForkSelect` 显式传递，不记录、不缓存发起人。外部联系人要新建临时群时（`btw`、`fk`，以及同名群还不存在的 `btw 备注`——先用 `findNormalChatIdByName` 查，已存在就直接加入、不要群主），由 `resolveTempGroupOwner` 取当前群群主当新群群主（须是 `ou_` 用户、不是发起人、`chatMembers.get` 的 `tenant_key` 等于应用租户，否则报错且不建群），建群请求带 `owner_id`，`user_id_list` 为发起人和群主；请求另带 `externalRequester`，加入既有群时也据此给提示。本企业成员在内部群里发起时请求不变，不出现 `ownerOpenId`/`externalRequester`；在外部群里发起时（`isExternalChat(s.chatId)`；群类型建好后不能改，`feishu.ts` 读到确定值后按 chat_id 缓存，读取失败报错且不建群）同样建外部群：`ownerOpenId` 为发起人本人、`externalRequester: false`，不查来源群群主、不预查同名群（加入既有群不用群主），之后外部联系人也能加入。指定群主的建群请求一律带 `external: true`：初始成员全是本企业的人时不声明就会建成内部群，之后外部成员再也进不来；外部群请求遇 232033 提示应用的对外共享权限，本企业成员发起时不给外部联系人的提示。开启对外共享的应用发版前用 `scripts/test-external-temp-group.ts` 实测一次。这套群类型与群主规则在 `session-group-owner.ts` 的 `newGroupFields`，临时群（`'temp'`）与 wt（`'worktree'`，同名 WT 群作复用名）共用，日志事件按入口取不同的字面量；`isExternalChat` 在单聊同款的查询窗口内重试瞬态错误。wt 在建 worktree 和分支之前就确定群类型与群主，失败直接报错不留半成品，建群 / 拉人走 `ensureWorktreeChatForSession`（同名串行、外部群提示，内部 WT 群拒绝外部联系人时给 WT 专用说明）；`disbandChatForSession`（wt 删除）遇外部 WT 群改为机器人退群并返回 `left`，目录照删。外部联系人发带名称的 `wt` 与 `btw 备注` 同规则：同名 WT 群已存在只加入、不要群主，否则由当前群群主当群主建外部 WT 群；不带参数的列表照常。机器人不能解散外部群，也不能移出其中成员：`bye` 先查 `isExternalChat`（失败只报错），外部群不走退出/最后一人流程，先发 `retiring` 提示再停止会话、`leaveChatAsBot` 退群并按解散清理本地状态，群留给群主手动解散；退群成功但本地清理失败时运行时返回 `ok:false, left:true`，失败改报到来源群（基名群或项目主群，经 `chatIdForSession` 解析，解析不到只记日志）。`disbandChatForSessionExact` 遇外部群改为退群并返回 `left`，建群补偿和 `wt` 删除同样只退群。群主、同名群和群类型查询失败都在群里显示并以固定事件名 `logError`。临时群建群/拉人、`wt` 失败和入站兜底报错用 `redactMemberIds` 去掉飞书回显的成员 ID（列表、`user_id: …` 和真实形态的 `ou_`/`on_` 加 32 位小写十六进制，`on_call` 等普通文本不动）；外部联系人流程对 232043 按飞书列出的不可见成员区分提示（发起人：先单聊确认；群主：加入应用可用范围；其余两条都给），对加入时的 232028 提示换备注。外部联系人的 `[DEBUG]` 消息不写调试上下文（`shouldSeedDebugContext`）。`wt` 的「删」先用 `tempChatNamesUnderWorktree` 收集该分支下的临时群，逐群确认非运行且唯一后先解散它们，再删 worktree 群和目录。`btw`/`bye` 的状态提示统一用 `cards.tempSessionNoticeCard`：一次操作只发一张卡，创建/加入/退出/解散的终态用 `message.patch` 原地更新，正文只保留一行状态和一行短提示（群名由标题承载）；发送失败回退原文并带飞书诊断，原地更新失败只回退原文，不补发第二张卡。`bl`/`btwlist` 从 `listTempSessionLeases()` 和本 daemon 的 `Session.all` 汇总全部临时会话（含未构造的旧租约），按创建时间倒序展示群名、项目、模型与实时状态（运行中会话附子 Agent/后台进程数）；只读本地状态和运行中后端的本机进程状态，不发群列表查询，不把未加载会话标成成功运行。
 - 群里 `hi` 的状态行（本会话）、单聊面板的活跃项目与 `bl` 的会话状态后紧跟 `Session.workload()` 的计数（`cards.sessionWorkloadLabel`，写法与任务卡预览相同 `子Agent2·后台1`，0 省略）。子 Agent 即 `activeSubagents()`：任务卡上运行中的原生子 Agent（含前台，三后端通用）。后台进程优先取 `AgentProcess.backgroundProcessCount()` 的后端实时集合：Claude 记录 SDK `background_tasks_changed` 电平（REPLACE 语义、进程级），按 `bgTaskTypeOf` 去掉子 Agent 并排除 `ambient` 内务任务；Codex 按需查询主线程 `thread/backgroundTerminals/list`（跟随分页，单页 3 秒超时，未建线程为 0），app-server 不推送后台终端变化；`CodexAccountProcess` 作为只读查询直接问当前存活的子进程（换号中途也可），等额度或旧子进程已停时没有 app-server，计 0。Claude 尚未收到电平（resolve undefined）或 DSH 没有该接口时退回任务卡的非子 Agent 运行行；载荷或游标畸形、查询失败时为 null，显示 `后台MISS`，不当作 0。Claude 的 `in_process_teammate`、`remote_agent` 等非 `local_agent` 任务与任务卡一致计入后台。只在发 hi/bl 或生成单聊面板时读一次，不轮询、不改任务卡。
 - 单聊（`chat_type === 'p2p'`，`isP2pMessage`）在 daemon `handleMessage` 的去重与过期检查之后、`[DEBUG]`、群名解析、`sessionFor`、`bindSessionToChat`、`recordUserMessage` 之前交给 `p2p-panel.ts` 的 `replyP2pPanel` 并返回：不建 Session、不写状态、不启动进程，任何消息只回一张只读面板（`cards/p2p.ts` 的 `p2pConsoleCard`，单聊自己的模板，即全局总览：标题写运行中的项目数与要留意的等审批/工作中/服务失败数，正文依次为按所属主项目再按名称排序、每项两行的活跃项目，全部账号额度，默认折叠的主机；无会话名、当前模型和按钮，底部一行单聊说明。布局见 `src/cards/AGENTS.md`；群里的 `hi` 只显示本项目，见「卡片与持久化」）。依赖由 daemon 注入，只有读取与发送（运行中的 `Session.all`、`listChatOwners`、`isChatMember`、`boundChatIdForSession`、额度与主机读取、`sendCard`/`sendTextRaw`）；模块只引用类型和纯函数（`sanitizeSessionName` 在 `session-name.ts`，`feishu.ts` 转出），`daemon.ts` 导入即启动服务、无法直接单测，由 `p2p-panel.test.ts` 核对两个模块的 import 和 daemon 的分流位置与接线（TypeScript AST）。可见性（纯函数 `anchoredOwnedGroups` + `p2pSessionVisible`）：发起人当群主的群（一次分页 `im.chat.list`，`user_id_type: open_id` 比较 `owner_id`）只有在 `boundChatIdForSession(sanitizeSessionName(群名)) === 该群 chat_id` 时才算锚定（只看 `bindSessionToChat` 已保存的绑定，不用 `chatIdForSession` 按缓存群名猜测），同名、撞名（空格/标点、假名、64 字截断）或改名后留下的群不算；锚定群 G 的同名会话还须 `chatId` 就是 G，`G*…`、`G[…` 会话经 G 可见。其余会话实时分页查 `chatMembers.get` 看发起人是否在群里（并发上限 4，按依赖对象共用：daemon 里所有单聊共用一套，超时被放弃的构建仍在进行的查询也算在内）。群主与成员关系只在本次请求里比较，不缓存、不写 `chatNameCache`、不记录。成员查询返回 232006（chat_id 无效）、232009（群已解散）、232011（机器人不在群里）按不是成员处理、不提示；其他查询失败（含 `chat.list` 失败、发送者缺失）隐藏受影响的行并显示「部分项目读取失败，已隐藏」，不带 ID。整张面板 20 秒（`P2P_PANEL_DEADLINE_MS`）内没读完就不再等待，按全部隐藏回复同一提示、不重试；回复已定即中止构建：它在群主查询、每次成员查询和 workload/额度/主机读取之前及每次返回之后检查期限，到期不再发起读取、丢弃已读数据。`listChatOwners`/`isChatMember` 的每页请求在截止到该期限的 `FeishuRecoveryWindow` 内执行：单次超时取 15 秒与剩余时间的较小值、到点中止，到期不再翻页；已知瞬态错误只按既有退避在窗口内重试。读者是否受限由 `p2pViewerRestricted` 按事件判断：发送者与机器人的 `tenant_key` 都在且相同才算本企业成员，任一缺失也按外部处理（只用于单聊；群命令的 `RequesterTenant` 仍按缺失视为内部）。受限读者的行只取名字、状态、时长和计数（模板去掉账号名），不读也不显示额度与主机；内部成员另有账号名、主机与全部账号额度。卡片发送失败改发 `sendTextRaw`（`formatFeishuError` 经 `redactMemberIds`）；面板生成失败或超时时，受限读者只看到固定提示，内部成员另附原因。
-- 命令、模型、权限、工具、临时会话、worktree、Agent 身份和任务清单放在对应 `session-*.ts` helper；这些模块可协作访问 Session 的内部字段。
+- 命令、模型、权限、工具、临时会话、worktree 和 Agent 身份放在对应 `session-*.ts` helper；这些模块可协作访问 Session 的内部字段。
 - 群改名后群名对应的项目随之改变。原会话已停止时，下一条消息直接按新群名建立会话，并解除旧群名到本群的绑定；原会话仍在运行时不隐式停止，消息不执行并提示把群名改回后 `kill`。入站消息处理中的任何异常都要回到群里说明，不能只记日志。
 - 修改 `AgentProcess` 时检查 Codex、Claude、Session 消费方和卡片。单端能力用明确分支或 capability 表达。
 - Codex 通过 app-server JSON-RPC 管理 thread、turn、权限、提问、plan/goal、usage、compaction 和 collab 子 Agent。未知或畸形协议仅记录固定类别摘要并合并重复；已知未消费事件静默，不记录 payload、命令输出、diff、字段路径或关联 ID。
@@ -255,8 +242,6 @@
 - 文件交付约定仅由 `instructions.ts` 注入会话，不生成或安装独立 Skill。npm 安装/更新与 daemon 启动共用 `managed-skill-cleanup.cjs` 清理旧 `lodestar-files` 的 Codex、Claude 和共享插件副本；`data-dir.cjs` 与 `paths.ts` 共用跨平台/自定义数据目录解析，清理失败明确报错。安装清理使用随包的 CommonJS 源文件，不依赖预先构建、配置或 Agent。`channelInstructions()` 在主 Agent 启动时提供统一的飞书通道插件约定：附件读取、文件交付标记、shell 摘要，以及无需额外处理飞书事务。Codex、Claude、DSH 与两种交付方式共用中文原文，不再注入大小限制、提问工具、生图、管理命令或交付实现说明。交付层继续执行大小限制；委派 Agent 仍只返回路径给调用方。
 
 ## 卡片与持久化
-
-- `tasklist.ts` 按主项目名保存清单绑定。`session-tasklist.ts` 的查看、启用与删除均使用 `worktreeProjectName()`，主群、多个 WT 以及 BTW/FK 临时群共用同一项目清单；清单生命周期按项目串行，不改为按工作目录拆分，也不迁移为目录键。
 
 - `codex-live-usage.ts` 仅借用已绑定账号、拥有原生进程且具备额度 RPC 的 Codex 连接；排除控制查询客户端、逻辑换号 wrapper 和 API 来源。daemon 显式启动/停止监听，每账号合并一分钟兜底、原生额度变化通知及回合结束信号；通知正文不写缓存。Session 终态页脚与委派退出前进行有界回读，取消/停机不等待无界刷新；连接退出、换号和账号代次变化撤销旧请求的写入资格，不偷偷冷启动。
 

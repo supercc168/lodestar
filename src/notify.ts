@@ -6,8 +6,8 @@
  * Default bind: 127.0.0.1:9876. No auth — the daemon trusts loopback
  * on the assumption that anything able to hit this port is already
  * owner-equivalent (same security tier as the bot's stdin and the
- * debug.sock). Do NOT bind 0.0.0.0 without adding your own front-end
- * auth.
+ * debug.sock). The listener refuses any non-loopback bind; remote access
+ * is not supported.
  *
  *   POST /notify
  *     Content-Type: application/json
@@ -26,7 +26,7 @@
  *     }
  *   For a text-reply card, omit buttons and set "allow_reply": true.
  *   For a plain notification, omit both. All three types support text/images.
- *   → 200 { ok: true, chat_id, message_id, notify_id? }
+ *   → 200 { ok: true, message_id, notify_id? }
  *   → 400 bad/empty json or missing/invalid field
  *   → 404 project not bound to any Feishu group
  *   → 502 feishu sendCard failed (network / API rejection)
@@ -37,7 +37,7 @@
  *     → 200 applied/current, 202 durable unknown, 409 identity/version conflict
  *
  *   GET /notify/result/<notify_id>
- *     → 200 {notify_id,project,message_id,resolved,button?,resolved_at?,resolved_by?}
+ *     → 200 {notify_id,project,message_id,resolved,button?,resolved_at?}
  *     → 404 unknown notify_id
  *
  * Buttons turn the one-shot card into a two-way control that stays on
@@ -63,7 +63,7 @@ import { randomUUID } from 'node:crypto'
 import { log, logError } from './log'
 import { isLoopback } from './network-proxy'
 import * as feishu from './feishu'
-import { formatFeishuError } from './feishu-errors'
+import { formatFeishuError, redactMemberIds } from './feishu-errors'
 import { FeishuRequestError } from './feishu-retry'
 import { downgradeExternalImagesForCardKit, sanitizeMarkdownForCardKit } from './cards/elements'
 import {
@@ -134,7 +134,7 @@ interface NotifyActionValue {
  *   - `done`: pull / display-only mode — no push, freeze on the verdict
  * `operatorOpenId` is carried in the callback payload for the caller's
  * audit; the card itself shows only the choice + status. */
-export type NotifyResolutionStatus = 'processing' | 'delivered' | 'failed' | 'unknown' | 'done'
+export type NotifyResolutionStatus = 'processing' | 'delivered' | 'failed' | 'cancelled' | 'unknown' | 'done'
 export interface NotifyResolution {
   status: NotifyResolutionStatus
   buttonId?: string
@@ -329,7 +329,8 @@ export function buildNotifyReplyCard(
   const elements: object[] = [{ tag: 'markdown', content: `通知：${sanitizeMarkdownForCardKit(reg.title)}` }]
   if (state.response) elements.push({ tag: 'markdown', content: sanitizeMarkdownForCardKit(state.response.text) })
   if (status === 'waiting') {
-    elements.push({ tag: 'markdown', content: `<at id=${state.openId}></at> 请在群里发送一条文字消息作为回复。\n你的下一条文字优先用于这条通知，完成后再回答 Agent 的提问。点击其他通知的「回复」会放弃本次回复；群控制命令仍然优先。` })
+    const mention = state.openId ? `<at id=${state.openId}></at> ` : ''
+    elements.push({ tag: 'markdown', content: `${mention}请在群里发送一条文字消息作为回复。\n你的下一条文字优先用于这条通知，完成后再回答 Agent 的提问。点击其他通知的「回复」会放弃本次回复；群控制命令仍然优先。` })
     elements.push({ tag: 'button', text: { tag: 'plain_text', content: '取消回复' }, type: 'default',
       behaviors: [{ type: 'callback', value: {
         kind: 'notify_reply_cancel', notify_id: reg.notifyId, reply_id: state.id,
@@ -967,7 +968,7 @@ export async function handleNotifyRequest(
   if (!chatId) {
     log('notify.binding_missing')
     return sendText(404,
-      `project "${project}" has no conversation ID (chat_id) binding — send a message in the intended Feishu conversation, then retry`)
+      `project "${project}" has no bound conversation — send a message in the intended Feishu conversation, then retry`)
   }
 
   const imageInputs = Array.isArray(body.images) ? body.images : []
@@ -988,7 +989,7 @@ export async function handleNotifyRequest(
   const messageId = await transport.sendCard(chatId, card, error => { sendFailure = error })
   if (!messageId) {
     logError('notify.card.send_failed', sendFailure)
-    return sendText(502, `feishu sendCard failed: ${formatFeishuError(sendFailure)}`)
+    return sendText(502, `feishu sendCard failed: ${redactMemberIds(formatFeishuError(sendFailure))}`)
   }
 
   if (notifiable && notifyId) {
@@ -1010,9 +1011,10 @@ export async function handleNotifyRequest(
     registerCallback(reg)
   }
 
+  // Never echo the conversation id: /notify is reachable by any local
+  // process, including a backend Agent.
   sendJson(200, {
     ok: true,
-    chat_id: chatId,
     message_id: messageId,
     ...(notifyId ? { notify_id: notifyId } : {}),
   })

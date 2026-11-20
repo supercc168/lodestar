@@ -29,6 +29,7 @@ import {
 } from '@anthropic-ai/claude-agent-sdk'
 import { agentPackagePath, loadClaudeSdk } from './agent-updates'
 import { config, type ProjectProfile } from './config'
+import { scrubAgentHostEnv } from './agent-env'
 import { logError, logDiagnostic } from './log'
 import {
   CLAUDE_EFFORT,
@@ -1079,20 +1080,14 @@ export class ClaudeAgentProcess extends EventEmitter {
    * 最后合并,仅覆盖出现键)。routeDegraded 由 initializeQuery 显式传入,保证与
    * 模型剥 [1m] 同一次判定;测试接缝无参调用时自算当前路由降级态。 */
   private buildSpawnEnv(routeDegraded = degradedContextRoutes.has(claudeRouteKey(this.opts.model, this.tokenSourceId))): Record<string, string | undefined> {
-    const baseEnv: Record<string, string | undefined> = { ...(process.env as Record<string, string>), PATH: buildClaudeSpawnPath(),
-      ...config.claude.env }
+    const baseEnv: Record<string, string | undefined> = scrubAgentHostEnv({ ...(process.env as Record<string, string>), PATH: buildClaudeSpawnPath(),
+      ...config.claude.env, ...(this.opts.hostEnv ?? {}) })
     let env = this.opts.transformEnv ? this.opts.transformEnv(baseEnv) : baseEnv
     // 1214/爆窗自愈的 spawn 半边:降级路由 env 值剥 [1m] 回退裸名(正常路由零变化)。
     if (routeDegraded) {
       env = Object.fromEntries(
         Object.entries(env).map(([k, v]) => [k, typeof v === 'string' && ONE_M_SUFFIX_RE.test(v) ? stripOneMSuffix(v) : v]),
       )
-    }
-    if (this.opts.hostEnv) {
-      env = { ...env }
-      for (const [key, value] of Object.entries(this.opts.hostEnv)) {
-        if (value !== undefined) env[key] = value
-      }
     }
     // Claude Code 2.1.268+ hides task tracking on newer/unknown models unless
     // the host opts in. The session card consumes these Task tool events.

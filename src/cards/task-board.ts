@@ -7,6 +7,11 @@
 
 import { ELEMENTS } from './elements'
 
+/** 待办列表在卡片里最多显示的条目数。整块待办是单个 markdown 元素，条目数不增加
+ * 卡片元素数；上限按整卡约 30KB 的 JSON 预算与可读长度取值 —— 每条中文待办约 66
+ * 字节，50 条约 3KB。Codex 的实时计划面板不做截断，这里也只在超长任务板上压缩。 */
+export const TASK_LIST_VISIBLE_LIMIT = 50
+
 /** 一条任务在板上的累积视图。status 含 'deleted' —— 删除先标记,供渲染层过滤;
  * 真正移除由 TaskList 全量替换自然回收。 */
 export interface TaskBoardEntry {
@@ -286,7 +291,7 @@ function renderTaskBoardBody(board: TaskBoardEntry[], resolvedNote?: string): st
   const visible = board.filter(t => t.status !== 'deleted')
   const lines: string[] = [`**待办**: ${visible.length} 项`]
   // 条目放得下时按 #N(创建顺序)排列 —— 不按状态重排,否则 #1 一旦完成就沉底,
-  // 顺序乱;超过 12 条时未完成(进行中/待办)优先占位,已完成的先隐藏,组内仍按创建顺序。
+  // 顺序乱;超过上限时未完成(进行中/待办)优先占位,已完成的先隐藏,组内仍按创建顺序。
   const numId = (id: string): number => {
     const n = parseInt(id, 10)
     return Number.isNaN(n) ? Number.MAX_SAFE_INTEGER : n
@@ -295,7 +300,7 @@ function renderTaskBoardBody(board: TaskBoardEntry[], resolvedNote?: string): st
     const d = numId(a.id) - numId(b.id)
     return d !== 0 ? d : a.id.localeCompare(b.id)
   })
-  const shown = prioritizeVisibleSlice(ordered, 12, t => t.status === 'completed')
+  const shown = prioritizeVisibleSlice(ordered, TASK_LIST_VISIBLE_LIMIT, t => t.status === 'completed')
   for (const t of shown.items) {
     const emoji = STATUS_EMOJI[t.status]
     // 进行中时优先用 activeForm(更"正在进行"的语气),其余用 subject。

@@ -301,7 +301,10 @@ export function extractProjectOption(argv: string[]): { project?: string; argv: 
 
 function cliContext(project?: string): CliContext {
   if (project !== undefined) {
-    assertIndependentProjectCall()
+    if (['LODESTAR_AGENT_ROLE', 'LODESTAR_AGENT_URL', 'LODESTAR_AGENT_CAPABILITY', 'DSH_LODESTAR_AGENT_CONTEXT']
+      .some(key => process.env[key] !== undefined)) {
+      throw new Error('Agent task calls must remain session-bound; --project is only for independent services and applications')
+    }
     return { ...readAgentProjectClient(), project }
   }
   const delegation = process.env.DSH_LODESTAR_AGENT_CONTEXT

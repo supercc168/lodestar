@@ -35,7 +35,7 @@ import { recordClaudeSessionAccount } from './claude-session-accounts'
 import { enrollClaudeAccount } from './claude-account-selection'
 import { countActiveClaudeSessions } from './session-activity'
 import { withChatMessageOrder } from './chat-message-order'
-import { formatFeishuError } from './feishu-errors'
+import { formatFeishuError, redactPersonIdentifiers } from './feishu-errors'
 import { logError, logDiagnostic } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { captureCodexUsageCache } from './usage'
@@ -51,12 +51,11 @@ import type { RequesterTenant } from './requester-tenant'
 import * as sessionTools from './session-tools'
 import * as sessionAsk from './session-ask'
 import * as sessionPermission from './session-permission'
-import { diagnosticIdLabel, messageOf, type FooterTimer, type LifecycleProgressOpts, type ModelActionResult, type StatusCardHandle, type TasklistActionResult, type WorktreeActionResult, type LifecycleKind, type LifecycleLease, type ResumeIdentity } from './session-util'
+import { diagnosticIdLabel, messageOf, type FooterTimer, type LifecycleProgressOpts, type ModelActionResult, type StatusCardHandle, type WorktreeActionResult, type LifecycleKind, type LifecycleLease, type ResumeIdentity } from './session-util'
 import * as sessionCommands from './session-commands'
 import * as sessionCompact from './session-compact'
 import * as sessionModel from './session-model'
 import * as sessionAgentIdentities from './session-agent-identities'
-import * as sessionTasklist from './session-tasklist'
 import { createFileDelivery } from './file-delivery-runtime'
 import type { FileDeliveryHandle } from './file-delivery-types'
 import * as sessionWorktree from './session-worktree'
@@ -2172,7 +2171,6 @@ export class Session {
       // 段(claude-agent-process/codex-models)；缺省与 config.ts 默认一致。
       LODESTAR_AGENT_URL: agentApiUrl(config.notify?.bind ?? '127.0.0.1', config.notify?.port ?? 9876),
       LODESTAR_AGENT_CAPABILITY: this.agentCapability,
-      LODESTAR_AGENT_SESSION: this.sessionName,
       LODESTAR_AGENT_ROLE: 'main',
     }
     const pending = this.pendingConversationLaunch && (!lease || this.pendingConversationLaunch.lease === lease)
@@ -4582,7 +4580,7 @@ export class Session {
     }
     const anchor: feishu.TurnAnchor = {
       checkpoint,
-      preview: this.lastTurnUserPreview.slice(0, 80),
+      preview: redactPersonIdentifiers(this.lastTurnUserPreview.slice(0, 80)),
       ts: Date.now(),
       writes: this.collectTurnWrites(),
     }
@@ -4677,28 +4675,12 @@ export class Session {
     return sessionWorktree.showWorktrees(this)
   }
 
-  showTasklistPanel(): Promise<void> {
-    return sessionTasklist.showTasklistPanel(this)
-  }
-
   showAgentIdentityPanel(userOpenId = ''): Promise<void> {
     return sessionAgentIdentities.showAgentIdentityPanel(this, userOpenId)
   }
 
   onAgentIdentityPage(panelId: string, page: unknown, userOpenId: string): ModelActionResult {
     return sessionAgentIdentities.onAgentIdentityPage(panelId, page, userOpenId)
-  }
-
-  onTasklistEnable(): Promise<TasklistActionResult> {
-    return sessionTasklist.onTasklistEnable(this)
-  }
-
-  onTasklistDeletePrompt(guidRaw: string): TasklistActionResult {
-    return sessionTasklist.onTasklistDeletePrompt(this, guidRaw)
-  }
-
-  onTasklistDeleteConfirm(guidRaw: string): Promise<TasklistActionResult> {
-    return sessionTasklist.onTasklistDeleteConfirm(this, guidRaw)
   }
 
   showGsdPanel(): Promise<void> {

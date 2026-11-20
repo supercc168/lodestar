@@ -91,7 +91,7 @@ async function restartWithStatus(
   }
 }
 
-/** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`, `task`)
+/** Run a bare-text control command (`hi`, `stop`, `kill`, `restart`, `clear`, `compact`, `model`)
  * plus their two-letter aliases where applicable.
  * Returns true if the command was consumed (don't forward to Codex).
  * Exact match, case-insensitive, ignores trailing whitespace.
@@ -195,10 +195,6 @@ export async function runCommand(
   }
   if (raw.trim().match(/^(?:agents|agent)$/i)) {
     await s.showAgentIdentityPanel(userOpenId)
-    return true
-  }
-  if (raw.trim().toLowerCase() === 'task') {
-    await s.showTasklistPanel()
     return true
   }
   if (isGsdBareword(raw)) {

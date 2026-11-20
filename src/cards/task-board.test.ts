@@ -1,6 +1,7 @@
 import { describe, expect, test } from 'bun:test'
 
 import {
+  TASK_LIST_VISIBLE_LIMIT,
   applyTaskTool,
   asTaskToolName,
   summarizeTaskBoard,
@@ -244,47 +245,58 @@ describe('taskBoardElement — 渲染整个 board', () => {
     expect(el.elements[0].content).toContain('✅ **已允许** by Alice')
   })
 
-  test('超过 12 项截断提示', () => {
-    const board: TaskBoardEntry[] = Array.from({ length: 15 }, (_, k) => ({
-      id: `t${k}`, subject: `项${k}`, status: 'pending' as const,
+  test('上限以内全部显示,不截断', () => {
+    const board: TaskBoardEntry[] = Array.from({ length: TASK_LIST_VISIBLE_LIMIT }, (_, k) => ({
+      id: String(k), subject: `项${k}`, status: 'pending' as const,
     }))
     const el = taskBoardElement(0, board, { name: 'TaskList', status: '✅' }) as any
-    expect(el.elements[0].content).toContain('还有 3 项未显示')
+    const body: string = el.elements[0].content
+    expect(body).toContain(`- ⬜ 项${TASK_LIST_VISIBLE_LIMIT - 1}`)
+    expect(body).not.toContain('项未显示')
   })
 
-  test('超过 12 项时已完成项先隐藏,未完成项优先显示', () => {
+  test('超过上限截断提示', () => {
+    const board: TaskBoardEntry[] = Array.from({ length: TASK_LIST_VISIBLE_LIMIT + 5 }, (_, k) => ({
+      id: String(k), subject: `项${k}`, status: 'pending' as const,
+    }))
+    const el = taskBoardElement(0, board, { name: 'TaskList', status: '✅' }) as any
+    const body: string = el.elements[0].content
+    expect(body).toContain('还有 5 项未显示')
+    expect(body).toContain(`- ⬜ 项${TASK_LIST_VISIBLE_LIMIT - 1}`)
+    expect(body).not.toContain(`- ⬜ 项${TASK_LIST_VISIBLE_LIMIT}\n`)
+  })
+
+  test('超过上限时已完成项先隐藏,未完成项优先显示', () => {
     const board: TaskBoardEntry[] = [
       ...Array.from({ length: 5 }, (_, k) => ({
         id: `t${k}`, subject: `完成${k}`, status: 'completed' as const,
       })),
-      ...Array.from({ length: 10 }, (_, k) => ({
+      ...Array.from({ length: TASK_LIST_VISIBLE_LIMIT }, (_, k) => ({
         id: `t${k + 5}`, subject: `待办${k}`, status: 'pending' as const,
       })),
     ]
     const el = taskBoardElement(0, board, { name: 'TaskList', status: '✅' }) as any
     const body: string = el.elements[0].content
     const items = body.split('\n').filter(l => l.startsWith('- '))
-    // 10 个待办全部可见,完成项只显示最早的 2 个(#0、#1),其余 3 个完成被隐藏。
-    expect(items).toHaveLength(13) // 12 条目 + 1 条隐藏提示
+    // 未完成项全部可见,超出上限的 5 个完成项被隐藏。
+    expect(items).toHaveLength(TASK_LIST_VISIBLE_LIMIT + 1)
     expect(body).toContain('- ⬜ 待办0')
-    expect(body).toContain('- ⬜ 待办9')
-    expect(body).toContain('- ✅ 完成0')
-    expect(body).toContain('- ✅ 完成1')
-    expect(body).not.toContain('- ✅ 完成2')
-    expect(body).toContain('还有 3 项已完成未显示')
+    expect(body).toContain(`- ⬜ 待办${TASK_LIST_VISIBLE_LIMIT - 1}`)
+    expect(body).not.toContain('- ✅ 完成0')
+    expect(body).toContain('还有 5 项已完成未显示')
   })
 
   test('隐藏项同时含未完成与已完成时仍用通用提示', () => {
     const board: TaskBoardEntry[] = [
-      ...Array.from({ length: 14 }, (_, k) => ({
+      ...Array.from({ length: TASK_LIST_VISIBLE_LIMIT + 2 }, (_, k) => ({
         id: `t${k}`, subject: `进行${k}`, status: 'in_progress' as const,
       })),
       { id: 't99', subject: '完成项', status: 'completed' },
     ]
     const el = taskBoardElement(0, board, { name: 'TaskList', status: '✅' }) as any
     const body: string = el.elements[0].content
-    // 12 个进行中可见,隐藏 2 个进行中 + 1 个完成 → 通用提示。
+    // 上限个进行中可见,隐藏 2 个进行中 + 1 个完成 → 通用提示。
     expect(body).toContain('还有 3 项未显示')
     expect(body).not.toContain('已完成未显示')
-  })
+})
 })

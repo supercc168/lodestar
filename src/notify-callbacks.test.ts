@@ -93,11 +93,33 @@ describe('notify-callbacks store', () => {
     markResolved('nf_test1', 'approve', 'ou_user1')
     const got = get('nf_test1')
     expect(got?.resolvedAt).toBeGreaterThan(0)
-    expect(got?.resolvedBy).toEqual({ buttonId: 'approve', openId: 'ou_user1' })
-    // Confirmed on disk after a fresh load.
+    expect(got?.resolvedBy).toEqual({ buttonId: 'approve' })
+    // The state file never contains the raw open_id; a fresh load has only
+    // the stable hash and can still match the person.
+    const disk = readFileSync(tempFile, 'utf8')
+    expect(disk).not.toContain('ou_user1')
+    expect(disk).not.toContain('openId')
     __setStoreFileForTest(tempFile)
     loadCallbacks()
-    expect(get('nf_test1')?.resolvedBy?.openId).toBe('ou_user1')
+    expect(get('nf_test1')?.resolvedBy).toEqual({ buttonId: 'approve' })
+  })
+
+  test('legacy raw openId is removed on load; the prompt cannot resume without an identity', () => {
+    register(sampleReg())
+    // Simulate an older store that still wrote the raw value.
+    const legacy = JSON.parse(readFileSync(tempFile, 'utf8'))
+    legacy.nf_test1.replyState = {
+      id: 'reply-1', openId: 'ou_legacy', promptMessageId: 'om_prompt', openedAt: Date.now(), status: 'waiting',
+    }
+    writeFileSync(tempFile, JSON.stringify(legacy))
+    __setStoreFileForTest(tempFile)
+    loadCallbacks()
+    expect(get('nf_test1')?.replyState?.openId).toBeUndefined()
+    expect(get('nf_test1')?.replyState?.status).toBe('cancelled')
+    expect(get('nf_test1')?.replyState?.cancelReason).toBe('restart')
+    expect(findPendingReply('oc_chat', 'ou_legacy')).toBeUndefined()
+    expect(readFileSync(tempFile, 'utf8')).not.toContain('ou_legacy')
+    expect(readFileSync(tempFile, 'utf8')).not.toContain('openId')
   })
 
   test('markResolved exposes persistence failure and rolls back the resolved flag', () => {
@@ -120,7 +142,7 @@ describe('notify-callbacks store', () => {
     expect(outcome.state).toBe('unknown')
     expect(get('nf_test1')?.resolvedAt).toBeUndefined()
     expect(get('nf_test1')?.unknownAt).toBeGreaterThan(0)
-    expect(get('nf_test1')?.unknownBy).toEqual({ buttonId: 'approve', openId: 'ou_user1' })
+    expect(get('nf_test1')?.unknownBy).toEqual({ buttonId: 'approve' })
     expect(get('nf_test1')?.unknownReason).toContain('tombstone persistence')
   })
 
@@ -154,7 +176,7 @@ describe('notify-callbacks store', () => {
     const recovered = loadCallbacks()
     expect(recovered.map(reg => reg.notifyId)).toEqual(['nf_test1'])
     expect(buildNotifyResult(get('nf_test1')!)).toMatchObject({
-      resolved: false, unknown: true, button: { id: 'approve' }, unknown_by: 'ou_operator',
+      resolved: false, unknown: true, button: { id: 'approve' },
     })
     expect(() => beginCallbackDispatch('nf_test1', 'approve', 'ou_operator')).toThrow()
     __setStoreFileForTest(tempFile)
@@ -250,7 +272,8 @@ describe('durable resolved 墓碑 / markUnknown / 运行中修剪(上游 ec149d7
     __setStoreFileForTest(tempFile)
     loadCallbacks()
     expect(get('nf_ok')?.resolvedAt).toBeGreaterThan(0)
-    expect(get('nf_ok')?.resolvedBy?.openId).toBe('ou_u')
+    // 人员标识不落盘:重启后只留按钮墓碑
+    expect(get('nf_ok')?.resolvedBy).toEqual({ buttonId: 'approve' })
   })
 
   test('外部成功但本地持久化失败 → markUnknown 冻结(不当可重试)', () => {
@@ -263,19 +286,19 @@ describe('durable resolved 墓碑 / markUnknown / 运行中修剪(上游 ec149d7
     // 内存 guard 保留:unknownAt 冻结、resolvedAt 不得存在(冻结≠已解决)
     const got = get('nf_unknown')!
     expect(got.unknownAt).toBeGreaterThan(0)
-    expect(got.unknownBy).toEqual({ buttonId: 'approve', openId: 'ou_u' })
+    expect(got.unknownBy).toEqual({ buttonId: 'approve' })
     expect(got.resolvedAt).toBeUndefined()
     expect(typeof got.unknownReason).toBe('string')
   })
 
   test('markUnknown 可持久化时落盘,buildNotifyResult 暴露 unknown 分支', () => {
     register(sampleReg({ notifyId: 'nf_bnr_unknown' }))
-    markUnknown('nf_bnr_unknown', 'approve', 'ou_op', 'test freeze reason')
+    markUnknown('nf_bnr_unknown', 'approve', 'test freeze reason')
     const r = buildNotifyResult(get('nf_bnr_unknown')!) as any
     expect(r.resolved).toBe(false)
     expect(r.unknown).toBe(true)
     expect(r.button).toEqual({ id: 'approve', text: '✅ 通过', type: 'primary' })
-    expect(r.unknown_by).toBe('ou_op')
+    expect(r.unknown_by).toBeUndefined()
     expect(r.unknown_reason).toBe('test freeze reason')
     // 落盘后重启仍冻结
     __setStoreFileForTest(tempFile)
@@ -311,17 +334,17 @@ describe('buildNotifyResult (pull payload)', () => {
     expect(r.resolved_at).toBeUndefined()
   })
 
-  test('resolved ⇒ full verdict with button text/type + operator', () => {
+  test('resolved ⇒ full verdict with button text/type but no operator identity', () => {
     register(sampleReg({ notifyId: 'nf_done' }))
     markResolved('nf_done', 'approve', 'ou_op')
     const r = buildNotifyResult(get('nf_done')!) as any
     expect(r.resolved).toBe(true)
     expect(r.button).toEqual({ id: 'approve', text: '✅ 通过', type: 'primary' })
     expect(typeof r.resolved_at).toBe('number')
-    expect(r.resolved_by).toBe('ou_op')
+    expect(r.resolved_by).toBeUndefined()
   })
 
-  test('unknown ⇒ non-retryable ambiguous outcome with operator and reason', () => {
+  test('unknown ⇒ non-retryable ambiguous outcome with reason but no operator identity', () => {
     register(sampleReg({ notifyId: 'nf_unknown' }))
     __setStoreFileForTest(join(tempFile, 'child.json'), false)
     expect(recordCallbackSuccess('nf_unknown', 'approve', 'ou_op').state).toBe('unknown')
@@ -330,7 +353,7 @@ describe('buildNotifyResult (pull payload)', () => {
     expect(r.resolved).toBe(false)
     expect(r.unknown).toBe(true)
     expect(r.button).toEqual({ id: 'approve', text: '✅ 通过', type: 'primary' })
-    expect(r.unknown_by).toBe('ou_op')
+    expect(r.unknown_by).toBeUndefined()
     expect(r.unknown_reason).toContain('tombstone persistence')
   })
 })
@@ -492,7 +515,7 @@ describe('dispatchCallback', () => {
     expect(r.detail).toMatch(/ECONNREFUSED/)
   })
 
-  test('payload shape: notify_id / button / operator carried to the caller', async () => {
+  test('payload shape: notify_id / button carried, no chat or operator identity', async () => {
     let captured: any = null
     globalThis.fetch = (async (_input: any, init?: RequestInit) => {
       captured = JSON.parse(String(init?.body))
@@ -501,10 +524,10 @@ describe('dispatchCallback', () => {
     await dispatchCallback(sampleReg({ notifyId: 'nf_shape' }), { id: 'reject', text: '❌', type: 'danger' }, 'ou_op')
     expect(captured.notify_id).toBe('nf_shape')
     expect(captured.message_id).toBe('om_msg')
-    expect(captured.chat_id).toBe('oc_chat')
+    expect(captured.chat_id).toBeUndefined()
     expect(captured.project).toBe('feishu')
     expect(captured.button).toEqual({ id: 'reject', text: '❌', type: 'danger' })
-    expect(captured.operator).toEqual({ open_id: 'ou_op' })
+    expect(captured.operator).toBeUndefined()
     expect(typeof captured.timestamp).toBe('number')
 
     await dispatchCallback(sampleReg({ requestId: 'hub:card', appliedVersion: 7 }), {
@@ -523,7 +546,7 @@ describe('dispatchCallback', () => {
     const result = await dispatchCallback(sampleReg(), response, 'ou_author')
     expect(captured.response).toEqual({ type: 'text', ...response })
     expect(captured.message_id).toBe('om_msg')
-    expect(captured.operator).toEqual({ open_id: 'ou_author' })
+    expect(captured.operator).toBeUndefined()
     expect(captured.button).toBeUndefined()
     expect(result.reply).toBe('收到回复')
   })
@@ -569,12 +592,14 @@ describe('notify text reply store (上游 ae411a6)', () => {
     })
     // 模拟 daemon 重启:清内存 → 从盘重载
     __setStoreFileForTest(tempFile)
-    expect(loadCallbacks()).toEqual([])
+    // 人员标识不落盘:等待中的提示无法恢复,重启后取消并交由调用方补发过期提示。
+    const interrupted = loadCallbacks()
+    expect(interrupted.map(r => r.notifyId)).toEqual(['nf_reply_wait'])
     expect(get('nf_reply_wait')?.allowReply).toBe(true)
-    expect(get('nf_reply_wait')?.replyState).toEqual({
-      id: 'reply_wait', openId: 'ou_owner', promptMessageId: 'om_prompt',
-      openedAt: expect.any(Number), status: 'waiting',
+    expect(get('nf_reply_wait')?.replyState).toMatchObject({
+      id: 'reply_wait', promptMessageId: 'om_prompt', status: 'cancelled', cancelReason: 'restart',
     })
+    expect(get('nf_reply_wait')?.replyState?.openId).toBeUndefined()
   })
 
   test('中断的 sending 回复在 loadCallbacks 时标 UNKNOWN,且返回数组只含该中断条目', () => {
@@ -592,13 +617,14 @@ describe('notify text reply store (上游 ae411a6)', () => {
     __setStoreFileForTest(tempFile)
     const interrupted = loadCallbacks()
     // 02-02 的 boot 恢复逐条消费这个数组 —— 不能把全部登记混进来
-    expect(interrupted.map(r => r.notifyId)).toEqual(['nf_sending'])
+    expect(interrupted.map(r => r.notifyId)).toEqual(['nf_sending', 'nf_still_waiting'])
     const frozen = get('nf_sending')!
     expect(frozen.unknownAt).toBeGreaterThan(0)
-    expect(frozen.unknownBy).toEqual({ openId: 'ou_s' })
+    expect(frozen.unknownBy).toEqual({})
     expect(frozen.unknownReason).toBe('服务在文字回复回传期间中断，无法确认是否送达，禁止自动重试')
     expect(get('nf_still_waiting')?.unknownAt).toBeUndefined()
-    expect(get('nf_still_waiting')?.replyState?.status).toBe('waiting')
+    expect(get('nf_still_waiting')?.replyState?.status).toBe('cancelled')
+    expect(get('nf_still_waiting')?.replyState?.cancelReason).toBe('restart')
     // 冻结落盘:再次重启仍是 UNKNOWN,永不自动重放
     __setStoreFileForTest(tempFile)
     loadCallbacks()
@@ -699,7 +725,7 @@ describe('notify text reply store (上游 ae411a6)', () => {
         type: 'text', text: '好的', message_id: 'om_user_9', prompt_message_id: 'om_prompt_1',
       })
       expect('button' in captured).toBe(false)
-      expect(captured.operator).toEqual({ open_id: 'ou_op' })
+      expect(captured.operator).toBeUndefined()
     } finally {
       globalThis.fetch = originalFetch
     }
@@ -721,8 +747,8 @@ describe('notify text reply store (上游 ae411a6)', () => {
       type: 'text', text: '已确认', message_id: 'om_user', prompt_message_id: 'om_prompt',
     })
     expect(r.reply).toEqual({
-      status: 'resolved', prompt_message_id: 'om_prompt', operator: { open_id: 'ou_owner' },
+      status: 'resolved', prompt_message_id: 'om_prompt',
     })
-    expect(get('nf_text_done')?.resolvedBy).toEqual({ openId: 'ou_owner' })
+    expect(get('nf_text_done')?.resolvedBy).toEqual({})
   })
 })

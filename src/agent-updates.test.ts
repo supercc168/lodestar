@@ -355,6 +355,24 @@ test('DSH discovers new dependency and peer packages from the latest release wit
   expect(calls.some(call => call.startsWith('ordinary-library'))).toBe(false)
 })
 
+test('DSH optional platform packages may be absent while staying in the snapshot', async () => {
+  const root = await scratch()
+  const version = '9.0.0-rc.8'
+  const optional = '@deepseek-ai/dsh-experimental-cua-macos'
+  const state = await updateAgentRuntime('dsh', {
+    root,
+    metadata: async name => ({ name, version,
+      ...(name === '@deepseek-ai/dsh' ? { dependencies: { '@deepseek-ai/dsh-cua-bundle': version } } : {}),
+      ...(name === '@deepseek-ai/dsh-cua-bundle' ? { optionalDependencies: { [optional]: version } } : {}) }),
+    install: async directory => {
+      await install(directory)
+      await rm(join(directory, 'node_modules', optional), { recursive: true, force: true })
+    },
+  })
+  expect(state.versions?.[optional]).toBe(version)
+  expect(existsSync(join(state.directory!, 'node_modules', optional))).toBe(false)
+})
+
 test('DSH preserves upstream peer placement while keeping the resolved plugin family on one release', async () => {
   const root = await scratch()
   const version = '9.0.0-rc.8'
@@ -659,16 +677,24 @@ test('lodestar-version displays only the selected installation, without update d
   const selected = await updateAgentRuntime('codex', { root: runtimeRoot, install, metadata: async name => ({ name, version: '1.0.0' }) })
   await expect(updateAgentRuntime('codex', { root: runtimeRoot, metadata: async () => { throw new Error('TLS disconnected') } })).rejects.toThrow('TLS disconnected')
   await writeFile(join(runtimeRoot, 'codex/current.json'), JSON.stringify({ ...selected, error: 'legacy TLS disconnected' }))
-  const child = Bun.spawn([process.execPath, 'src/version-cli.ts'], {
-    cwd: repoRoot, env: { ...process.env, NODE_ENV: 'production', LODESTAR_DATA_DIR: root }, stdout: 'pipe', stderr: 'pipe',
-  })
-  const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
-  expect({ code, stderr }).toEqual({ code: 0, stderr: '' })
-  expect(stdout).toContain('codex: @openai/codex@1.0.0')
-  expect(stdout).toContain(selected.directory!)
-  expect(stdout).not.toContain('更新失败')
-  expect(stdout).not.toContain('TLS disconnected')
-  expect(stdout).not.toContain('codex: MISS')
+  const run = async (args: string[]) => {
+    const child = Bun.spawn([process.execPath, 'src/version-cli.ts', ...args], {
+      cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'production', LODESTAR_DATA_DIR: root }, stdout: 'pipe', stderr: 'pipe',
+    })
+    const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
+    return { code, stdout, stderr }
+  }
+  const plain = await run([])
+  expect({ code: plain.code, stderr: plain.stderr }).toEqual({ code: 0, stderr: '' })
+  expect(plain.stdout).toContain('codex: @openai/codex@1.0.0')
+  expect(plain.stdout).not.toContain(selected.directory!)
+  const verbose = await run(['--verbose'])
+  expect({ code: verbose.code, stderr: verbose.stderr }).toEqual({ code: 0, stderr: '' })
+  expect(verbose.stdout).toContain('codex: @openai/codex@1.0.0')
+  expect(verbose.stdout).toContain(selected.directory!)
+  expect(verbose.stdout).not.toContain('更新失败')
+  expect(verbose.stdout).not.toContain('TLS disconnected')
+  expect(verbose.stdout).not.toContain('codex: MISS')
 })
 
 test.each(['missing', 'mismatched'])('lodestar-version reports a %s installed package instead of a successful recorded version', async damage => {

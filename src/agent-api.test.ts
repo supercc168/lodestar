@@ -4,7 +4,7 @@ import { createServer, request, type Server } from 'node:http'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { Readable } from 'node:stream'
-import { handleAgentRequest } from './agent-api'
+import { agentVisibleText, handleAgentRequest } from './agent-api'
 import { buildAgentIdentityCatalog } from './agent-identities'
 import { listTokenSources, registerTokenSource, resetTokenSourceRegistry, type TokenSource } from './token-source'
 import { AgentService, type AgentServiceDeps } from './agent-service'
@@ -223,7 +223,7 @@ describe('durable Agent HTTP admission', () => {
   })
 })
 
-async function serve(onStart?: (request: any) => void, projectMode = false) {
+async function serve(onStart?: (request: any) => void, projectMode = false, runOverrides: any = {}) {
   const session = { sessionName: 'project', chatId: 'chat', workDir: '/repo', codexAccountId: () => 'default' } as any
   let current: any = null
   const service = {
@@ -234,7 +234,9 @@ async function serve(onStart?: (request: any) => void, projectMode = false) {
       current = {
         ...(principal.kind === 'project' ? { owner: principal.context.owner } : {}),
         runId: 'agent_1', sessionName: 'project', chatId: 'chat', workDir: request.workDir ?? '/repo', description: request.description, prompt: request.prompt,
-        depth: 0, status: 'running', createdAt: new Date().toISOString(), workers: [{
+        depth: 0, status: 'running', createdAt: new Date().toISOString(),
+        ...runOverrides,
+        workers: runOverrides.workers ?? [{
           identityId: 'agent:a', status: 'running', sessionId: request.sessionId, output: request.prompt,
           finalOutput: `  final:${request.prompt}  \n`, steps: [],
         }],
@@ -288,6 +290,76 @@ async function serve(onStart?: (request: any) => void, projectMode = false) {
   if (!address || typeof address === 'string') throw new Error('no address')
   return `http://127.0.0.1:${address.port}`
 }
+
+test('agent-visible diagnostics never carry emails, IM ids or absolute host paths', () => {
+  const result = agentVisibleText('401 for alice@corp.example at /Users/example/My Project/secret/chat\nid oc_1234567890abcdef1234')
+  expect(result).toContain('<email>')
+  expect(result).toContain('<path>')
+  expect(result).toContain('<id>')
+  expect(result).not.toContain('alice@')
+  expect(result).not.toContain('/Users/')
+  expect(result).not.toContain('My Project')
+  expect(result).not.toContain('oc_1234567890abcdef1234')
+  const otherPaths = agentVisibleText('~/work/项目\n/Volumes/Disk/Repo\n/Applications/App.app\nC:\\Users\\example\\My Project')
+  expect(otherPaths).not.toContain('~/work')
+  expect(otherPaths).not.toContain('/Volumes')
+  expect(otherPaths).not.toContain('/Applications')
+  expect(otherPaths).not.toContain('C:\\Users')
+  expect(otherPaths.match(/<path>/g)?.length).toBeGreaterThanOrEqual(4)
+})
+
+test('run snapshots redact diagnostics and omit card message ids', async () => {
+  const base = await serve(undefined, false, {
+    error: 'failed at /Users/example/My Project (oc_1234567890abcdef1234)',
+    presentationErrors: ['card om_1234567890abcdef1234 at /Volumes/Disk/Repo'],
+    cardMessageId: 'om_1234567890abcdef1234',
+    workers: [{
+      identityId: 'agent:a', status: 'failed', sessionId: 'sid', output: 'out', steps: [
+        { at: '2026-01-01T00:00:00Z', phase: 'info', tool: 'Read', detail: '/Users/example/My Project/file' },
+      ], error: 'worker at /Users/example/My Project',
+    }],
+  })
+  const headers = { authorization: 'Bearer secret', 'content-type': 'application/json' }
+  expect((await fetch(`${base}/agents/runs`, { method: 'POST', headers, body: JSON.stringify({
+    description: '任务说明', identity_ids: ['agent:a'], prompt: 'do it',
+  }) })).status).toBe(202)
+  const value = await (await fetch(`${base}/agents/runs/agent_1`, { headers })).json() as any
+  expect(value.card_message_id).toBeUndefined()
+  expect(value.error).toContain('<path>')
+  expect(value.presentation_errors[0]).toContain('<path>')
+  expect(value.workers[0].error).toContain('<path>')
+  expect(value.workers[0].steps[0].detail).toContain('<path>')
+  expect(JSON.stringify(value)).not.toContain('/Users/')
+  expect(JSON.stringify(value)).not.toContain('om_1234567890abcdef1234')
+})
+
+test('identity catalog reasons are sanitized before reaching an Agent', async () => {
+  const previous = [...listTokenSources()]
+  resetTokenSourceRegistry()
+  registerTokenSource({
+    id: 'bad-source', kind: 'bad-source', agent: 'codex', display: 'Bad source', enabled: true,
+    models: [], defaultModel: 'm',
+    modelCatalogState: { status: 'failed', updatedAt: 1,
+      error: 'HTTP 401 for alice@corp.example at /Users/example/secret (oc_1234567890abcdef1234)' },
+    refreshModels: async () => {}, spawnEnv: env => env, resolveSpawnModel: model => model,
+    readUsage: async () => ({ state: 'not_applicable', windows: [] }),
+  })
+  try {
+    const base = await serve()
+    const response = await fetch(`${base}/agents/identities`, { headers: { authorization: 'Bearer secret' } })
+    expect(response.status).toBe(200)
+    const value = await response.json() as any
+    const reason = value.source_failures[0].reason as string
+    expect(reason).toContain('<email>')
+    expect(reason).toContain('<path>')
+    expect(reason).toContain('<id>')
+    expect(reason).not.toContain('alice@')
+    expect(reason).not.toContain('/Users/')
+  } finally {
+    resetTokenSourceRegistry()
+    for (const source of previous) registerTokenSource(source)
+  }
+})
 
 describe('delegated Agent HTTP API', () => {
   test('non-agents paths return false', async () => {
@@ -562,6 +634,7 @@ describe('delegated Agent HTTP API', () => {
     const createdBody = await created.json() as any
     expect(createdBody.run_id).toBe('agent_1')
     expect(createdBody.workers[0]).toMatchObject({ output: 'do it', final_output: '  final:do it  \n' })
+    expect(createdBody.session_name).toBeUndefined()
     const status = await fetch(`${base}/agents/runs/agent_1`, { headers })
     expect(status.status).toBe(200)
     expect((await status.json() as any).workers[0].final_output).toBe('  final:do it  \n')

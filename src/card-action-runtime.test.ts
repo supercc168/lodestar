@@ -192,7 +192,7 @@ describe('card action identity', () => {
   })
 
   test('uses event_id and semantic keys together', () => {
-    const event = { ...data({ kind: 'tasklist_enable' }), event_id: 'evt-1' }
+    const event = { ...data({ kind: 'agent_identity_page', panel_id: 'p', page: 1 }), event_id: 'evt-1' }
     expect(cardActionDedupeKeys(event)).toHaveLength(2)
     expect(cardActionDedupeKeys(event)[0]).toContain('evt-1')
   })
@@ -207,11 +207,11 @@ describe('card action identity', () => {
     expect(validateCardActionAdmission(malformed)).toContain('无效的权限决定')
     expect(validateCardActionAdmission({
       context: { open_chat_id: 'chat' },
-      action: { value: { kind: 'tasklist_enable' } },
+      action: { value: { kind: 'menu' } },
     })).toContain('message_id')
     expect(validateCardActionAdmission({
       context: { open_message_id: 'message' },
-      action: { value: { kind: 'tasklist_enable' } },
+      action: { value: { kind: 'gsd_refresh' } },
     })).toContain('chat_id')
     expect(validateCardActionAdmission(data({
       kind: 'permission', request_id: 'r', decision: 'deny',

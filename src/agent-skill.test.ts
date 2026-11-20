@@ -44,7 +44,7 @@ describe('lodestar-agent skill body', () => {
     const body = agentSkillBody()
     expect(body).toContain('name: lodestar-agent')
     expect(body).toContain('固定档位')
-    expect(body).toContain('禁止暴露 LODESTAR_AGENT_CAPABILITY')
+    expect(body).toContain('Never expose `LODESTAR_AGENT_CAPABILITY`')
     expect(body).toContain('lodestar-agent identities')
     expect(body).not.toMatch(/Token Source/)
     expect(body).not.toContain('lodestar-consult')
@@ -115,7 +115,7 @@ describe('ensureLodestarAgentSkill', () => {
     expect(body).toBe(readFileSync(claude, 'utf8'))
     expect(body).toBe(agentSkillBody())
     expect(body).toContain('固定档位')
-    expect(body).toContain('禁止暴露 LODESTAR_AGENT_CAPABILITY')
+    expect(body).toContain('Never expose `LODESTAR_AGENT_CAPABILITY`')
   })
 
   test('LODESTAR_DISABLE_SKILL_SYNC=1 skips writing skill files', () => {

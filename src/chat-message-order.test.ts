@@ -42,8 +42,8 @@ describe('chat message ordering', () => {
     const currentGate = new Promise<void>(resolve => { release = resolve })
     const current = queue.run('chat', async () => { events.push('current'); await currentGate })
     wake()
-    await Promise.resolve()
-    await Promise.resolve()
+    // 队列尾部多一层收尾 promise:等一个宏任务,避免依赖微任务层数。
+    await new Promise<void>(resolve => setTimeout(resolve, 0))
     expect(events).toEqual(['current'])
     release()
     await Promise.all([current, detached])

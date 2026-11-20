@@ -29,7 +29,9 @@ export function readAgentOperatorClient(path = AGENT_OPERATOR_CLIENT_FILE): Agen
 function readLocalClient(path: string, label: string): AgentProjectClient {
   let raw: string
   try { raw = readFileSync(path, 'utf8') }
-  catch (error) { throw new Error(`无法读取${label}凭据 ${path}；请确认 daemon 已启动并支持项目调用: ${error instanceof Error ? error.message : String(error)}`, { cause: error }) }
+  // Do not echo the file path or the raw fs error: this message can be shown
+  // to a backend Agent that cleared its environment to try a project call.
+  catch (error) { throw new Error(`无法读取项目调用凭据；请确认 daemon 已启动并支持项目调用（${(error as NodeJS.ErrnoException)?.code ?? 'unknown'}）`, { cause: error }) }
   const client = JSON.parse(raw)
   if (!client || typeof client.baseUrl !== 'string' || typeof client.capability !== 'string' || !client.capability) {
     throw new Error(`${label}凭据文件无效`)

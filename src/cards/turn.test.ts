@@ -16,6 +16,7 @@ import {
   watchdogFooterContent,
 } from './turn'
 import { editBatchElement, readBatchElement, summarizeToolInput, toolCallElement, toolCallPermissionElement } from './tool'
+import { TASK_LIST_VISIBLE_LIMIT } from './task-board'
 
 describe('main conversation card rendering', () => {
   test('narrow model row buttons use one character while wide actions keep full labels', () => {
@@ -1276,22 +1277,30 @@ describe('other tool card rendering', () => {
     expect(body).not.toContain('"todos"')
   })
 
-  test('TodoWrite 超过 12 条时已完成的先隐藏,未完成的优先显示', () => {
+  test('TodoWrite 超过上限时已完成先隐藏,未完成的优先显示', () => {
     const input = {
       todos: [
         ...Array.from({ length: 5 }, (_, k) => ({ content: `完成${k}`, status: 'completed' })),
-        ...Array.from({ length: 10 }, (_, k) => ({ content: `待办${k}`, status: 'pending' })),
+        ...Array.from({ length: TASK_LIST_VISIBLE_LIMIT }, (_, k) => ({ content: `待办${k}`, status: 'pending' })),
       ],
     }
     const el = toolCallElement(10, 'TodoWrite', input, null, '✅') as any
     const body: string = el.elements[0].content
-    // 10 个待办全部可见,完成项只保留最早的 2 个,其余 3 个完成被隐藏。
+    // 未完成项全部可见,超出上限的 5 个完成项被隐藏。
     expect(body).toContain('- 待办: 待办0')
-    expect(body).toContain('- 待办: 待办9')
-    expect(body).toContain('- 完成: 完成0')
-    expect(body).toContain('- 完成: 完成1')
-    expect(body).not.toContain('- 完成: 完成2')
-    expect(body).toContain('还有 3 项已完成未显示')
+    expect(body).toContain(`- 待办: 待办${TASK_LIST_VISIBLE_LIMIT - 1}`)
+    expect(body).not.toContain('- 完成:')
+    expect(body).toContain('还有 5 项已完成未显示')
+  })
+
+  test('TodoWrite 超过上限且隐藏项含未完成时给通用提示', () => {
+    const todos = Array.from({ length: TASK_LIST_VISIBLE_LIMIT + 2 }, (_, k) => ({ content: `项${k}`, status: 'pending' }))
+
+    const el = toolCallElement(10, 'TodoWrite', { todos }, null, '✅') as any
+    const body: string = el.elements[0].content
+
+    expect(body).toContain(`- 待办: 项${TASK_LIST_VISIBLE_LIMIT - 1}`)
+    expect(body).toContain('还有 2 项未显示')
   })
 
   test('renders Claude Code Task descriptions before prompt details', () => {

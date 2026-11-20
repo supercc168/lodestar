@@ -124,21 +124,16 @@ export {
   type AgentIdentityListCardOpts,
   agentIdentityListCard,
   agentRunCard,
-  agentRunFooterElement,
-  agentRunSummary,
   agentWorkerElement,
   agentWorkerElementId,
-  agentWorkerPreviewChars,
+  agentRunFooterElement,
   agentRunElement,
   agentRunElementId,
   agentCardSummary,
   delegationCardSummary,
+  agentWorkerPreviewChars,
+  agentRunSummary,
 } from './cards/agents'
-export {
-  type TasklistPanelNotice,
-  type TasklistPanelOpts,
-  tasklistPanelCard,
-} from './cards/task'
 export {
   type GsdPanelNotice,
   type GsdPanelOpts,
@@ -191,26 +186,6 @@ export {
   backgroundMigratedMarker,
   backgroundMigratedElement,
 } from './cards/background'
-export {
-  type AutomationRunKind,
-  type AutomationRunStatus,
-  type AutomationRunView,
-  type AutomationBurst,
-  AUTO_ELEMENTS,
-  isCardedKind,
-  emptyBurst,
-  burstAddRun,
-  burstUpdateStdout,
-  burstSettleRun,
-  burstMarkScan,
-  hasRunningRun,
-  memberLabel,
-  statusLabel,
-  summarizeAutomation,
-  automationRunPanel,
-  automationLiveCard,
-  automationHistoryCard,
-} from './cards/automation'
 export { type AgentCardTaskKind, type SessionWorkload, sessionWorkloadLabel } from './cards/task-kind'
 export {
   claudeModelDisplayName,
