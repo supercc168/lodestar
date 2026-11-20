@@ -1081,13 +1081,19 @@ export class ClaudeAgentProcess extends EventEmitter {
    * 模型剥 [1m] 同一次判定;测试接缝无参调用时自算当前路由降级态。 */
   private buildSpawnEnv(routeDegraded = degradedContextRoutes.has(claudeRouteKey(this.opts.model, this.tokenSourceId))): Record<string, string | undefined> {
     const baseEnv: Record<string, string | undefined> = scrubAgentHostEnv({ ...(process.env as Record<string, string>), PATH: buildClaudeSpawnPath(),
-      ...config.claude.env, ...(this.opts.hostEnv ?? {}) })
+      ...config.claude.env })
     let env = this.opts.transformEnv ? this.opts.transformEnv(baseEnv) : baseEnv
     // 1214/爆窗自愈的 spawn 半边:降级路由 env 值剥 [1m] 回退裸名(正常路由零变化)。
     if (routeDegraded) {
       env = Object.fromEntries(
         Object.entries(env).map(([k, v]) => [k, typeof v === 'string' && ONE_M_SUFFIX_RE.test(v) ? stripOneMSuffix(v) : v]),
       )
+    }
+    // hostEnv 在 transformEnv 之后合并(仅覆盖同名键),但同样要过宿主变量清洗:
+    // LODESTAR_RESTART_CONTINUE_CHAT_ID / FEISHU_* 等不会随 hostEnv 注入子进程。
+    if (this.opts.hostEnv) {
+      const scrubbedHost = scrubAgentHostEnv({ ...(this.opts.hostEnv as Record<string, string | undefined>) })
+      env = { ...env, ...scrubbedHost }
     }
     // Claude Code 2.1.268+ hides task tracking on newer/unknown models unless
     // the host opts in. The session card consumes these Task tool events.
