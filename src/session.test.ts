@@ -8362,8 +8362,8 @@ describe('Session handler business receipts (upstream ec149d7 主题 I → ff44a
       expect(panel.element_id).toBe('console_usage')
       expect(panel.elements).toHaveLength(1)
       expect(content().split('\n')).toEqual([
-        `5h　${bar(0)} 7%　${grey('4.1h 后重置')}`,
-        `周　${bar(1)} 17%　${grey('6.9d 后重置')}`,
+        `5h　${bar(0)} 7%　${grey('4.1h')}`,
+        `周　${bar(1)} 17%　${grey('6.9d')}`,
         `Fable 周　${bar(3)} 42%　${grey('重置时间 MISS')}`,
       ])
       expect(readAllSpy).not.toHaveBeenCalled()
@@ -8381,12 +8381,13 @@ describe('Session handler business receipts (upstream ec149d7 主题 I → ff44a
         seven_day: { utilization: 17, resets_at: new Date(Date.now() + 6.9 * 86400_000).toISOString() },
       } })
       await session.patchConsoleUsage('quota-card')
-      expect(content()).toBe(`周　${bar(1)} 17%　${grey('6.9d 后重置')}`)
+      expect(content()).toBe(`周　${bar(1)} 17%　${grey('6.9d')}`)
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  [6.9d·17%]')
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'fable')).toBe('  |  [6.9d·17%]')
       snapshot = { state: 'network', windows: [], reason: 'query failed' }
       await session.patchConsoleUsage('quota-card')
-      expect(content()).toContain('MISS · query failed')
+      // 失败原因收进默认折叠面板，行内只留红字 MISS（上游 v0.25.1）
+      expect(content()).toContain('MISS')
       expect(await session.footerUsageSuffix('claude', null, source.id, source, null)).toBe('  |  额度 MISS')
       expect(await session.footerUsageSuffix('codex', null, source.id, source, null)).toBe('  |  额度 MISS')
       expect(await session.footerUsageSuffix('claude', null, 'other-source', undefined, null)).toBe('  |  额度 MISS')
@@ -14904,7 +14905,7 @@ describe('Session usage cache cross-backend isolation', () => {
   test('额度后缀保留原紧凑倒计时与百分比格式，缺失值显示 MISS', () => {
     const session = new Session('probe', 'chat_id') as any
     const h = (ms: number) => new Date(Date.now() + ms)
-    // 4.1h 后重置 5h 额度、已用 7%;6.9d 后重置周额度、已用 17%。
+    // 5h 额度距重置 4.1h、已用 7%;周额度距重置 6.9d、已用 17%。
     const fiveHour = { percent: 7, resetsAt: h(4.1 * 3600_000) }
     const weekly = { percent: 17, resetsAt: h(6.9 * 24 * 3600_000) }
     expect(session.fmtDualWindowSuffix(fiveHour, weekly)).toBe('  |  4.1h·7%·[6.9d·17%]')
@@ -14913,6 +14914,141 @@ describe('Session usage cache cross-backend isolation', () => {
     expect(session.fmtDualWindowSuffix(null, weekly)).toBe('  |  [6.9d·17%]')
     expect(session.fmtDualWindowSuffix({ percent: 7, resetsAt: new Date(Date.now() - 1000) }, weekly)).toBe('  |  7%·[6.9d·17%]')
     expect(session.fmtDualWindowSuffix(null, null)).toBe('  |  额度 MISS')
+  })
+
+  test('Claude 的 hi 展示本账号全部窗口，footer 按当前模型选择周额度并保留 5h', async () => {
+    const { claudeUsageSnapshot } = await import('./claude-usage')
+    const accountUsage = await import('./account-usage')
+    const session = new Session('claude-quota', 'chat_id') as any
+    let snapshot = claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
+      five_hour: { utilization: 7, resets_at: new Date(Date.now() + 4.1 * 3600_000).toISOString() },
+      seven_day: { utilization: 17, resets_at: new Date(Date.now() + 6.9 * 86400_000).toISOString() },
+      model_scoped: [{ display_name: 'Fable', utilization: 42, resets_at: null }],
+    } })
+    const source: any = { id: 'claude-sub', kind: 'claude-subscription', agent: 'claude', enabled: true, models: [], defaultModel: 'opus',
+      readUsage: async () => snapshot }
+    // Each account is its own view; hi must pick the one the live process is bound to.
+    const views: string[] = []
+    source.forAccount = (account: string) => {
+      views.push(account)
+      return { ...source, usageAccount: { id: `claude:${account}`, label: `Claude·${account === 'default' ? '默认' : account}` } }
+    }
+    const previousSources = listTokenSources()
+    resetTokenSourceRegistry()
+    registerTokenSource(source)
+    session.selectedTokenSourceId = source.id
+    session.currentTokenSource = () => source
+    // The live process runs on the default Claude account; hi reads only that account's view.
+    const proc = { isAlive: () => true, provider: 'claude', tokenSourceId: source.id }
+    const { bindProcessClaudeAccount } = await import('./claude-accounts')
+    bindProcessClaudeAccount(proc as any, 'default')
+    session.proc = proc
+    session.status = 'idle'
+    const replaceSpy = spyOn(cardkit, 'replaceElementChecked').mockResolvedValue(true)
+    // The group panel never reads every account; that is the 1:1 panel's job.
+    const readAllSpy = spyOn(accountUsage, 'readAllAccountUsage').mockImplementation(async () => { throw new Error('read all accounts') })
+    const bar = (cells: number) => `<font color='green'>${'▰'.repeat(cells)}${'▱'.repeat(6 - cells)}</font>`
+    const grey = (text: string) => `<font color='grey'>${text}</font>`
+    const content = () => (replaceSpy.mock.calls.at(-1)?.[2] as any).elements[0].content
+    try {
+      expect((await session.buildConsoleOpts()).account).toEqual({ id: 'claude:default', label: 'Claude·默认', usage: snapshot })
+      expect(views).toEqual(['default'])
+      await session.patchConsoleUsage('quota-card')
+      const panel = replaceSpy.mock.calls.at(-1)?.[2] as any
+      expect(panel.element_id).toBe('console_usage')
+      expect(panel.elements).toHaveLength(1)
+      expect(content().split('\n')).toEqual([
+        `5h　${bar(0)} 7%　${grey('4.1h')}`,
+        `周　${bar(1)} 17%　${grey('6.9d')}`,
+        `Fable 周　${bar(3)} 42%　${grey('重置时间 MISS')}`,
+      ])
+      expect(readAllSpy).not.toHaveBeenCalled()
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  4.1h·7%·[6.9d·17%]')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'default')).toBe('  |  4.1h·7%·[42%]')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'claude-fable-5-1[1m]')).toBe('  |  4.1h·7%·[42%]')
+      snapshot.windows.find(window => window.kind === 'modelWeekly:Fable')!.percent = null
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'fable')).toBe('  |  4.1h·7%·[MISS]')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, null)).toBe('  |  4.1h·7%·[MISS]')
+      // 账号取消 5 小时限额后只按周额度展示，不补 5h 的 MISS。
+      snapshot = claudeUsageSnapshot({ subscription_type: 'max', rate_limits_available: true, rate_limits: {
+        five_hour: null,
+        seven_day: { utilization: 17, resets_at: new Date(Date.now() + 6.9 * 86400_000).toISOString() },
+      } })
+      await session.patchConsoleUsage('quota-card')
+      expect(content()).toBe(`周　${bar(1)} 17%　${grey('6.9d')}`)
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'opus')).toBe('  |  [6.9d·17%]')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null, 'fable')).toBe('  |  [6.9d·17%]')
+      snapshot = { state: 'network', windows: [], reason: 'query failed' }
+      await session.patchConsoleUsage('quota-card')
+      // 行内只留 MISS，完整原因在默认折叠的错误详情面板里。
+      expect(content()).toBe("<font color='red'>MISS</font>")
+      expect(JSON.stringify(replaceSpy.mock.calls.at(-1)?.[2])).toContain('query failed')
+      expect(await session.footerUsageSuffix('claude', null, source.id, source, null)).toBe('  |  额度 MISS')
+      expect(await session.footerUsageSuffix('codex', null, source.id, source, null)).toBe('  |  额度 MISS')
+      expect(await session.footerUsageSuffix('claude', null, 'other-source', undefined, null)).toBe('  |  额度 MISS')
+      // Only the bound account's view was ever read.
+      expect(new Set(views)).toEqual(new Set(['default']))
+      // A Claude subscription process whose account is not known yet reads no account and shows no other account's quota.
+      const viewsRead = views.length
+      session.proc = { isAlive: () => true, provider: 'claude', tokenSourceId: source.id }
+      expect((await session.buildConsoleOpts()).account).toBeNull()
+      await session.patchConsoleUsage('quota-card')
+      expect(content()).toBe(grey('账号未确定'))
+      expect(views).toHaveLength(viewsRead)
+      // A failing account lookup is MISS on the card instead of a failed hi.
+      session.proc = proc
+      source.forAccount = () => { throw new Error('account store broke') }
+      const failed = await session.buildConsoleOpts()
+      expect(failed.account).toMatchObject({ label: 'MISS', usage: { state: 'network', reason: 'account store broke' } })
+      // Without a live process there is no account either.
+      session.proc = null
+      expect((await session.buildConsoleOpts()).account).toBeNull()
+      expect(readAllSpy).not.toHaveBeenCalled()
+    } finally {
+      replaceSpy.mockRestore(); readAllSpy.mockRestore()
+      resetTokenSourceRegistry()
+      for (const previous of previousSources) registerTokenSource(previous)
+    }
+  })
+
+  test('hi that starts the session turns its status card into this project\'s panel, then refreshes only that account', async () => {
+    const session = new Session('console-card', 'chat_id') as any
+    const balance = (remaining: number) => ({ state: 'ok', kind: 'balance', balance: { remaining, currency: 'CNY' }, windows: [] })
+    session.status = 'idle'
+    session.buildConsoleOpts = async () => ({ sessionName: 'console-card', status: 'idle', provider: 'claude', model: 'm', effort: 'high',
+      account: { id: 'deepseek', label: 'DeepSeek', usage: balance(12.34) } })
+    // The refresh after the card lands reads this account again and sees its newer cached balance.
+    const reads: string[] = []
+    session.consoleAccount = async () => { reads.push('deepseek'); return { id: 'deepseek', label: 'DeepSeek', usage: balance(10) } }
+    const writes: any[] = []
+    const spies = [
+      spyOn(cardkit, 'flush').mockResolvedValue(undefined),
+      spyOn(cardkit, 'replaceElementChecked').mockImplementation(async (_card: string, id: string, element: any) => { writes.push(['replace', id, element]); return true }),
+      spyOn(cardkit, 'addElementChecked').mockImplementation(async (_card: string, element: any, position: any) => { writes.push(['add', element, position.type, position.targetElementId]); return true }),
+      spyOn(cardkit, 'cancelSummary').mockImplementation(() => {}),
+      spyOn(cardkit, 'patchSettingsChecked').mockResolvedValue(true),
+      spyOn(cardkit, 'dispose').mockResolvedValue(undefined),
+    ]
+    const rawBefore = sentRawTexts.length
+    try {
+      await session.replaceStatusCardWithConsole({ cardId: 'status-card', timer: { stop() {}, elapsedSec: () => 3 } }, '✅ Claude 已就绪')
+      for (let tick = 0; tick < 50 && writes.length < 3; tick++) await new Promise(resolve => setTimeout(resolve, 1))
+      expect(writes).toHaveLength(3)
+      expect(writes[0]).toEqual(['replace', 'footer', { tag: 'markdown', element_id: 'footer',
+        content: '**状态**　🟢 空闲\n**模型**　Claude · `m/high`\n**账号**　DeepSeek' }])
+      expect(writes[1][0]).toBe('add')
+      expect(writes[1][1]).toMatchObject({ element_id: 'console_usage', elements: [{ content: '余额 ¥12.34' }] })
+      expect(writes[1].slice(2)).toEqual(['insert_after', 'footer'])
+      expect(writes[2][0]).toBe('replace')
+      expect(writes[2][1]).toBe('console_usage')
+      expect(writes[2][2].elements[0].content).toBe('余额 ¥10.00')
+      expect(reads).toEqual(['deepseek'])
+      // Nothing about other projects or the host reaches a group card, and no write failed.
+      expect(JSON.stringify(writes)).not.toMatch(/console_projects|console_host|活跃项目|主机/)
+      expect(sentRawTexts.slice(rawBefore)).toEqual([])
+    } finally {
+      for (const spy of spies) spy.mockRestore()
+    }
   })
 
   test('Claude 收尾查询等待期间切换模型，不改变旧回复的专属周额度', async () => {

@@ -659,7 +659,7 @@ test('a failed first install or a legacy error without a selected directory neve
       metadata: async () => { throw new Error('TLS disconnected') },
     }), /TLS disconnected/)
     assert.equal(agentRuntimeState('codex'), null)
-    assert.throws(() => agentRuntimeRoot('codex'), /runtime 未安装.*lodestar-update --agents-only/)
+    assert.throws(() => agentRuntimeRoot('codex'), /runtime 未安装.*lodestar update --agents-only/)
     await writeFile(join(process.env.LODESTAR_DATA_DIR, 'agent-runtimes/codex/current.json'), JSON.stringify({ checkedAt: 1, error: 'TLS disconnected' }))
     // Old releases erased the selected path on failure. An unrelated directory is not a selection record.
     const unrelated = join(process.env.LODESTAR_DATA_DIR, 'agent-runtimes/codex/unselected/node_modules/@openai/codex')
@@ -671,14 +671,14 @@ test('a failed first install or a legacy error without a selected directory neve
   expect({ code, stderr }).toEqual({ code: 0, stderr: '' })
 })
 
-test('lodestar-version displays only the selected installation, without update diagnostics or a failed exit code', async () => {
+test('lodestar version displays only the selected installation, without update diagnostics or a failed exit code', async () => {
   const root = await scratch()
   const runtimeRoot = join(root, 'agent-runtimes')
   const selected = await updateAgentRuntime('codex', { root: runtimeRoot, install, metadata: async name => ({ name, version: '1.0.0' }) })
   await expect(updateAgentRuntime('codex', { root: runtimeRoot, metadata: async () => { throw new Error('TLS disconnected') } })).rejects.toThrow('TLS disconnected')
   await writeFile(join(runtimeRoot, 'codex/current.json'), JSON.stringify({ ...selected, error: 'legacy TLS disconnected' }))
   const run = async (args: string[]) => {
-    const child = Bun.spawn([process.execPath, 'src/version-cli.ts', ...args], {
+    const child = Bun.spawn([process.execPath, 'cli.ts', 'version', ...args], {
       cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'production', LODESTAR_DATA_DIR: root }, stdout: 'pipe', stderr: 'pipe',
     })
     const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
@@ -697,14 +697,14 @@ test('lodestar-version displays only the selected installation, without update d
   expect(verbose.stdout).not.toContain('codex: MISS')
 })
 
-test.each(['missing', 'mismatched'])('lodestar-version reports a %s installed package instead of a successful recorded version', async damage => {
+test.each(['missing', 'mismatched'])('lodestar version reports a %s installed package instead of a successful recorded version', async damage => {
   const root = await scratch()
   const selected = await updateAgentRuntime('codex', { root: join(root, 'agent-runtimes'), install, metadata: async name => ({ name, version: '1.0.0' }) })
   const manifest = join(selected.directory!, 'node_modules/@openai/codex/package.json')
   if (damage === 'missing') await rm(manifest)
   else await writeFile(manifest, JSON.stringify({ name: '@openai/codex', version: '0.0.0' }))
-  const child = Bun.spawn([process.execPath, 'src/version-cli.ts'], {
-    cwd: repoRoot, env: { ...process.env, NODE_ENV: 'production', LODESTAR_DATA_DIR: root }, stdout: 'pipe', stderr: 'pipe',
+  const child = Bun.spawn([process.execPath, 'cli.ts', 'version'], {
+    cwd: process.cwd(), env: { ...process.env, NODE_ENV: 'production', LODESTAR_DATA_DIR: root }, stdout: 'pipe', stderr: 'pipe',
   })
   const [code, stdout, stderr] = await Promise.all([child.exited, new Response(child.stdout).text(), new Response(child.stderr).text()])
   expect(code).toBe(1)
@@ -795,9 +795,9 @@ test('setup 模板与 postinstall 提示:自动更新默认关,--agents-only 为
 
   const postinstall = await readFile(join(import.meta.dir, '..', 'scripts', 'postinstall.cjs'), 'utf8')
   expect(postinstall).toContain('启动时不检查或更新 Agent，自动更新默认关闭。')
-  // 合并后 lodestar-update 已支持 --agents-only(update-cli.ts 解析;agent-updates.ts
+  // 合并后 lodestar update 已支持 --agents-only(update-command.ts 解析;agent-updates.ts
   // 报错文案同源),postinstall 提示照上游 c55bb44 写该旗标。
-  expect(postinstall).toContain('lodestar-update --agents-only')
+  expect(postinstall).toContain('lodestar update --agents-only')
 })
 
 // ── 上游 v0.22.1 新增用例 ──────────────────────────────────────────────

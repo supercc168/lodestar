@@ -16,10 +16,11 @@ function deps(overrides: Parameters<typeof runLodestarUpdate>[1] = {}) {
   } }
 }
 
-test('after upgrading the package, Agents are updated by the newly installed updater, not the old in-memory code', async () => {
+test('本 fork 不发 npm 包：update 只更新 Agent 并打印源码更新指引', async () => {
   const run = deps()
   expect(await runLodestarUpdate([], run.deps)).toBe(0)
-  expect(run.calls).toEqual(['npm', 'installed agents'])
+  expect(run.calls).toEqual(['in-process agents'])
+  expect(run.lines.some(line => line.includes('git pull'))).toBe(true)
 })
 
 test('--agents-only updates in process without upgrading the package', async () => {
@@ -29,13 +30,10 @@ test('--agents-only updates in process without upgrading the package', async () 
   expect(run.lines.some(line => line.includes('Agent 更新完成'))).toBe(true)
 })
 
-test('the installed updater exit code is propagated and a failed npm upgrade never updates Agents', async () => {
-  const failedAgents = deps({ installedAgentUpdate: async () => 3, daemonRunning: () => true })
-  expect(await runLodestarUpdate([], failedAgents.deps)).toBe(3)
-  expect(failedAgents.lines.some(line => line.includes('需要重启'))).toBe(false)
-  const failedNpm = deps({ npmInstall: async () => 7 })
-  await expect(runLodestarUpdate([], failedNpm.deps)).rejects.toThrow('npm exit 7')
-  expect(failedNpm.calls).toEqual([])
+test('daemon 仍在跑时提示重启，未知参数按用法错误拒绝', async () => {
+  const running = deps({ daemonRunning: () => true })
+  expect(await runLodestarUpdate([], running.deps)).toBe(0)
+  expect(running.lines.some(line => line.includes('重启'))).toBe(true)
   await expect(runLodestarUpdate(['--force'], deps().deps)).rejects.toThrow('用法')
 })
 

@@ -65,7 +65,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - 后端 Agent 边界：三后端 spawn 前必须经 `src/agent-env.ts` 清洗环境，删除 `LODESTAR_CONFIG*`、`LODESTAR_DATA_DIR`、`LODESTAR_RESTART_CONTINUE_CHAT_ID`、`FEISHU_*` 等宿主变量，只保留 `LODESTAR_AGENT_*`、`LODESTAR_DSH_*`、`LODESTAR_RELAY_*`；不得注入 `LODESTAR_AGENT_SESSION`（受管上下文由 `LODESTAR_AGENT_ROLE/URL/CAPABILITY` 判定），清洗器对该键显式丢弃。收件附件落 `src/attachments.ts` 的临时私有目录，不得写入或指向状态目录。本机调试注入只在 `LODESTAR_DEBUG_SOCKET=1` 且 Bun 下启用，`debug-context.json` 不随普通运行写盘并在停机删除。
 - 本机通知响应与回调不回传 `chat_id`/操作者 `open_id`（只保留 `notify_id`、`message_id`、`project` 与按钮/回复），`feishu-notify` Skill 不写数据目录路径或状态文件名；Agent 侧错误回显先经 `redactMemberIds` 脱敏,`formatFeishuError` 只输出 code/message/log_id 等诊断字段。
 - Agent 可见的 `/agents` 诊断只保留脱敏文本（邮箱、IM ID、绝对路径替换为占位符）；`serializeRun` 不返回会话名。
-- Codex 项目信任通过启动参数 `-c projects.<path>.trust_level="trusted"` 逐次下发，不得写入共享 `~/.codex/config.toml`；启动时只清理当前会话绑定对应的直接子目录 trust 项（`src/codex-config.ts`），保留用户自建的其他信任。永久删除群后清理会话映射/租约/活跃时间；`agent-runs` 正文保留 30 天（启动与每日清理），已清理 run 记入 `pruned-artifacts.json` 并显示「已清理」，快照保留。`lodestar-version` 默认不输出运行目录，`--verbose` 才输出。
+- Codex 项目信任通过启动参数 `-c projects.<path>.trust_level="trusted"` 逐次下发，不得写入共享 `~/.codex/config.toml`；启动时只清理当前会话绑定对应的直接子目录 trust 项（`src/codex-config.ts`），保留用户自建的其他信任。永久删除群后清理会话映射/租约/活跃时间；`agent-runs` 正文保留 30 天（启动与每日清理），已清理 run 记入 `pruned-artifacts.json` 并显示「已清理」，快照保留。`lodestar version` 默认不输出运行目录，`--verbose` 才输出。
 - API、模型目录、额度、上传和进程启动失败必须记录并向调用方显示；缺失数据用 `MISS`，不能伪造成功或偷偷更换来源。仅允许对已知瞬态错误有限重试。Codex 自动选号成功时，其他账号的缓存过期、模型不支持、查询或认证失败等诊断仅保留在日志和主动查询面板，不单独推送警告；无法启动或继续任务的失败仍须明确提示。
 - 保留已有改动。依赖变化用 Bun 同步 `bun.lock`，不手改锁文件。
 - 凭据、本机配置、聊天成员、debug context 和 `~/.codex`、`~/.claude` 内容不得写入跟踪文件。
@@ -81,17 +81,17 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 - DSH 的 `deepseek-harness` 与 Claude 兼容的 `deepseek` 共用 DeepSeek 凭据和平台地址；`dsh-glm` 与 `glm` 共用 GLM Coding Plan 账号，前者通过原生 pi-ai 适配器接入。共享凭据只存一份，模型、effort 和可见性按 Agent 保留；旧配置冲突必须明确报错，任一 setup 入口均更新共享账号。运行时经更新器选择 latest，子进程需要 Node 22.19+（22.x）或 24+；`src/dsh-bridge.ts` 仅在该子进程加载。启动补丁按实际安装的 profile 判断是否已自带 ask-user 工具，避免重复注册；模型接入链需要的 credentials 服务保持启用，凭据仍只由环境变量注入。
 - Agent 运行时更新（`agent-updates.ts`）：
   - 按 `[runtime.agent_auto_update]` 的 `codex`、`claude`、`dsh` 三个独立开关每 6 小时更新对应 Agent，首次检查也在 6 小时后；三项默认关闭，各自防止重叠执行，失败互不阻塞。旧布尔总开关按原值兼容转换并提示迁移，不与新表混用。
-  - `lodestar-update --agents-only` 在当前进程立即安装/更新。不带参数的 `lodestar-update`（`update-run.ts`）先安装新版 Lodestar 包，再以子进程运行新装入口的 `--agents-only`，让新版自带的安装逻辑执行本次 Agent 更新。
+  - `lodestar update --agents-only` 在当前进程立即安装/更新。不带参数的 `lodestar update`（`update-run.ts`）先安装新版 Lodestar 包，再以子进程运行新装入口的 `--agents-only`，让新版自带的安装逻辑执行本次 Agent 更新。
   - 实际程序和 SDK 从独立版本目录加载；安装成功直接启用，新进程使用新版，已有进程保留其运行目录。更新成功后只保留当前与最近两个版本目录，并清理中断或取消安装遗留的 `.install-*` 临时目录与过期锁目录；仍被运行中进程使用的目录不删除，无法核对进程的平台跳过清理，清理问题不使更新失败。遗留临时目录须同时满足没有进程引用、安装时记录的安装器 PID 已确认退出才删除，没有 PID 记录的满 24 小时才删除。
   - 缺 PID 文件的锁目录超过 30 秒即回收，过期锁先改名再核对，避免两个等待者误删对方刚取得的锁。
   - Windows 不覆盖或删除使用中的 EXE/DLL；安装取消按精确 PID 终止安装器进程树，未确认退出不得清理其临时目录。文件占用有限重试，最终错误必须显示。
-  - 安装或查询失败只记录更新日志并向手动更新调用方返回失败，不修改当前安装记录，不影响已有安装的启动和 `lodestar-version`；已开启自动更新的 Agent 在下一个 6 小时周期再试。旧状态中的更新错误不参与启动判断或版本展示。首次未安装、安装损坏或旧版已清掉选择记录时按实际安装状态报错，不扫描目录猜测版本。
+  - 安装或查询失败只记录更新日志并向手动更新调用方返回失败，不修改当前安装记录，不影响已有安装的启动和 `lodestar version`；已开启自动更新的 Agent 在下一个 6 小时周期再试。旧状态中的更新错误不参与启动判断或版本展示。首次未安装、安装损坏或旧版已清掉选择记录时按实际安装状态报错，不扫描目录猜测版本。
   - 自动更新 Agent 不重启 daemon；daemon 停机在 15 秒期限内等待进行中的更新结算。
 - 飞书与 Lark 是两套独立的开放平台云。`[feishu].domain` 缺省为飞书（`open.feishu.cn`，与历史行为逐字节一致），`lark` 切换 `open.larksuite.com`，也可填 https 源站；REST 基址、Card Kit、云空间、SDK `Client` 和 `WSClient` 全部经 `feishu-endpoint.ts` 与 `feishu.sdkDomain()` 解析，不得再硬编码 `open.feishu.cn`。安装向导先探测所选区域，失败后才尝试另一侧，保证可用的飞书应用不会被切走。
 - Token Source 统一管理账号、凭据、模型目录、启动环境和额度。内置来源通过 factory 注册（`token-source-builtins.ts`）；模型与 Agent 身份动态读取来源目录，沿用目录声明的 effort；来源禁用或刷新失败显示 `MISS`。
   - Claude Code 订阅（`claude-sub`）独立复用本机原生登录态，可与第三方来源共存。
   - reclaude（来源 id 与类型均为 `reclaude`，Agent 为 Claude Code）是第三方 Claude Code 启动器：登录态、组织绑定和网络路由归 reclaude 管理，Lodestar 只经它启动 Claude Code，不读取、不保存其凭据。PATH 或 `~/.local/bin` 中找到 `reclaude` 命令（或 `[token_source.reclaude].bin` 指定）即自动启用，`enabled = false` 关闭；`org` 固定组织，省略时跟随 `reclaude org use` 的当前组织。进程以 `reclaude --org <组织 ID> cli <Claude Code 参数>` 启动。reclaude 的会话记录保存在各组织自己的绑定目录，与其他 Claude 来源共用的原生目录相互独立：`rs` 只列当前来源的目录，跨目录续接明确报错，不交给原生报找不到会话。细节见 `src/AGENTS.md`。
-  - 通用中转站按 `[relay.<site_id>]` 配置，由 `token-source-relay.ts` 生成来源（id `relay:<site_id>:<agent>`）：`anthropic` 类型只提供 Claude Code，`openai` 类型同时生成 Codex 与 DeepSeek Harness 两个来源。站点只保存 API Key、地址、协议类型和可选余额脚本，不绑定具体厂商。旧 `packy`、`packy-secondary`、`packy-codex` 配置节不再参与生产 Token Source 注册，也不阻断启动。
+  - 通用中转站按 `[relay.<site_id>]` 配置，由 `token-source-relay.ts` 生成来源（id `relay:<site_id>:<agent>`）：`anthropic` 类型只提供 Claude Code，`openai` 类型同时生成 Codex 与 DeepSeek Harness 两个来源。站点只保存 API Key、地址、协议类型和可选余额脚本，不绑定具体厂商。旧 `packy`、`packy-secondary`、`packy-codex` 来源与其配置已移除，残留在配置里的这些节不再读取，也不阻断启动。
 - MD 首页与模型目录：
   - 首页按 Claude Code、Codex、DeepSeek Harness 分组，底层 Agent id 仍为 `claude`、`codex`、`dsh`；reclaude 列在 Claude Code 组；各组的中转站站点收在一行「中转站」下，点开后再选站点。两个 DeepSeek 来源都显示为 DeepSeek。
   - 模型行右侧窄按钮用单字（选、显、隐、删），补录模型、显示模型、返回和翻页等宽按钮保留完整文案；模型行之间加分隔线，文字和按钮垂直居中。只有一个 effort 档位（含原生 default）时直接应用，多个档位才进入选择。
@@ -114,7 +114,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
   - OpenRouter 用 `/credits` 查账户余额，以实际响应判断权限。中转站余额只来自可选 `balance_script`，同一站点的各 Agent 视图合并为一个余额账号（单聊面板只列一次）；未配置脚本时不适用，脚本失败显示 MISS。
 - Lodestar Agent 不支持调用 Claude 订阅，遵守 Claude 用户协议；中转站等第三方来源的 Claude 模型仍可调用。reclaude 运行在订阅登录上，与 Claude 订阅一样排除。身份目录与新建/续跑入口仅按来源 ID 与类型排除 Claude 订阅与 reclaude，不按模型名称或显示名限制。此限制只作用于 Lodestar Agent，不影响主会话的 Claude 订阅/reclaude 能力或原生委派工具。
 - `AgentService` 的委派进程与主会话共用启动入口。主 Agent、委派 Agent 和原生子 Agent 均可继续派工，不设置 Lodestar 委派层数上限，保留原生委派工具；独立服务/软件的项目调用不提供提问或回答接口，新建和续跑均须自主执行、验证直至完整完成目标，不能以索取输入、计划或部分工作结束；真实阻断和故障须如实报告；后续委派继承项目、对话 ID（`chat_id`）和交互约定，并纳入父任务的取消树。会话委派与 `--project` 项目调用都只返回结果和本地文件路径，由调用方处理交付；不注入主会话交付提示词，不执行结果中的交付标记，新建与续跑一致。具体生命周期约束见 `src/AGENTS.md`。
-- Agent 执行任务中的调用必须绑定会话，不得通过 `--project`、清除环境或借用项目凭据脱离会话；独立服务/软件调用必须显式 `--project`，每次在绑定对话 ID 下显示独立卡。对话 ID（`chat_id`）标识调用绑定对象；原生 `session_id` 是后端会话唯一 ID，与对话 ID 不同，`run_id` 仅标识一次调用。恢复限同一项目、同一对话 ID，允许会话/项目两种绑定之间续跑；未知归属、跨项目和跨对话 ID 均报错。会话委派与项目调用不设任务数量上限，但接单时有撞车锁：work_dir、所在 Unity 工程根或 `--evidence-dir` 与其他调用树的活跃 run 重叠时排队（`queued` + `queued_reason`），锁空出后按先后自动开跑；Claude 订阅 run 另有全局 / 每号并发上限（默认 4 / 2，`[agent]` 配置或环境变量覆盖，满额报 `CLAUDE_SUB_FULL`，见 `src/agent-admission.ts`）。上游限制与启动失败按实际错误报告。
+- Agent 执行任务中的调用必须绑定会话，不得通过 `--project`、清除环境或借用项目凭据脱离会话；独立服务/软件调用必须显式 `--project`。项目调用默认不建卡（结果只回调用方），需要群内可见时由调用方显式请求：CLI `--card`、HTTP `display: "card"`；会话委派始终使用自己的卡片，`display: "silent"` 对会话调用报错。对话 ID（`chat_id`）标识调用绑定对象；原生 `session_id` 是后端会话唯一 ID，与对话 ID 不同，`run_id` 仅标识一次调用。恢复限同一项目、同一对话 ID，允许会话/项目两种绑定之间续跑；未知归属、跨项目和跨对话 ID 均报错。会话委派与项目调用不设任务数量上限，但接单时有撞车锁：work_dir、所在 Unity 工程根或 `--evidence-dir` 与其他调用树的活跃 run 重叠时排队（`queued` + `queued_reason`），锁空出后按先后自动开跑；Claude 订阅 run 另有全局 / 每号并发上限（默认 4 / 2，`[agent]` 配置或环境变量覆盖，满额报 `CLAUDE_SUB_FULL`，见 `src/agent-admission.ts`）。上游限制与启动失败按实际错误报告。
 - `managed-skills.ts` 同源生成 Codex/Claude standalone Skill 和 Claude 本地插件。GLM/DeepSeek 通过插件加载 Skill，不为此重新引入 user settings 和凭据。
 - 同 provider/source 调用 `setModelSettings`；Claude 后续 turn 生效，Codex 持久设置在重启后生效。跨 provider/source 只在空闲时换进程，resume id 按 provider 隔离。
 - 保留 Claude 的原生 resume/fork、提问、project profile、MCP/Skill、主动压缩和 SDK 后台任务；保留 Codex 的权限、提问、plan/goal、compaction、usage 和 collab 事件。共享接口须表达后端差异。
@@ -130,9 +130,9 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
   - 云空间卡只列本轮云空间文件，管理按钮打开本群全部历史云空间交付文件的原生飞书目录；交付发起人获 full_access、群获 view，不转移所有权或开放公网分享。超过 20 MB 分片上传，限额由上游判断，失败不自动切换通道。
   - 原附件/图片通道保留，旧聊天附件不删除、不自动迁移。记录由 `paths.ts` 定义，远端文件不自动清理，模板不读取文件。
 - Codex 生图超过 30 MB 时自动转云空间交付；其余图片与提示词默认放在同一个折叠面板，提示词包含完成事件补回的内容，不在折叠标题中展开。图片成功嵌入后不再单发；无法嵌入时按用户要求单独发图。关闭或换卡前等待所属图片上传和写入完成。
-- 单聊面板的账号额度展示全部已配置账号，一账号一块（首行账号名，每个窗口一行，如 `5h　▰▰▱▱▱▱ 34%　4.1h 后重置`）；DeepSeek、GLM 不按 Agent 重复展示。群里 `hi` 只显示本项目进程实际使用的那一个账号的额度。Codex 只显示主额度，不显示 Spark/gpt-reserve；Codex 账号可用的重置卡次数来自 `account/rateLimits/read` 的 `rateLimitResetCredits.availableCount`，写作 `重置卡 N`，这不是飞书换卡计数，也不加入回复 footer。GLM 月工具只显示百分比，无底部说明。
+- 单聊面板的账号额度展示全部已配置账号，一账号一块（首行账号名，每个窗口一行，如 `5h　▰▰▱▱▱▱ 34%　4.1h`）；DeepSeek、GLM 不按 Agent 重复展示。群里 `hi` 只显示本项目进程实际使用的那一个账号的额度。Codex 只显示主额度，不显示 Spark/gpt-reserve；Codex 账号可用的重置卡次数来自 `account/rateLimits/read` 的 `rateLimitResetCredits.availableCount`，写作 `重置卡 N`，这不是飞书换卡计数，也不加入回复 footer。GLM 月工具只显示百分比，无底部说明。
 - Claude 订阅账号的额度明细显示到登录最早可能结束的剩余时间（`凭据剩余 23.2d`；单聊面板跟在账号名后，群里 `hi` 为额度面板首行），只来自原生 `claude auth status --json` 的 `loginExpiresAt`，不读取钥匙串、凭据文件或令牌，也不改用其他来源；按原生口径取最晚到期前 3 天为最早结束，倒计时格式同距重置，显示不超过 7.0d 橙色，显示为小时或分钟（`凭据剩余 21.6h`）或已过最早结束（`凭据可能已到期`）红色；缺失或原生输出无法识别为 `凭据 MISS`，额度查询失败时不显示，不加入回复 footer。实现约束见 `src/AGENTS.md`。
-- 群里 `hi` 的状态行、单聊面板的活跃项目与 `bl` 在会话状态后追加仍在运行的子 Agent 与后台进程数，写法同运行任务卡预览（`空闲 · 子Agent2·后台1`，0 省略），使主线程空闲但后台仍在工作的会话不再只显示「空闲」；后台进程优先取后端实时集合（Claude SDK 电平、Codex 后台终端），读取失败显示 `后台MISS`，不当作 0。实现约束见 `src/AGENTS.md`。
+- 群里 `hi` 的状态行与 `bl` 在会话状态后追加仍在运行的子 Agent 与后台进程数，单聊面板的活跃项目把它写在项目名下面的单独一行并接着写运行时长，写法同运行任务卡预览：子 Agent 用 🤖、后台进程用 ⏳，紧接数量（`🤖2·⏳1`，0 省略），使主线程空闲但后台仍在工作的会话不再只显示「空闲」；后台进程优先取后端实时集合（Claude SDK 电平、Codex 后台终端），读取失败显示 `⏳MISS`，不当作 0。实现约束见 `src/AGENTS.md`。
 - `codex-reset [备注]` 显式使用一次账号重置卡；省略备注只取当前运行账号，账号未知时要求指定。调用原生 `account/rateLimitResetCredit/consume`，同一消息及其网络重试复用幂等标识；按四种原生 outcome 展示结果，之后重新读额度，不能推算卡数或掩盖已扣卡后的刷新/关闭失败。
 
 ## 运行中的 daemon
@@ -178,7 +178,7 @@ Lodestar 是 Bun/TypeScript daemon：从飞书 WebSocket 接收消息，每个�
 
 ## Runtime Operation Notes
 - 升级 claude CLI(SDK)前必须核验:`src/claude-agent-process.ts` compactThread 死等的 "Not enough messages to compact" 是 CLI 固定文案,CLI 改文案会让手动压缩 watch 永挂(仅 stop/proc exit 可解);升级后跑一次手动 `/compact` 冒烟确认两分支(compact_boundary / 无需压缩)都能落卡。
-- 从 Lodestar 自己承载的对话里执行 `systemctl --user restart feishu-daemon.service` / `lodestar-stop` / `restart` 这类会重启或停止当前 daemon 的命令时，工具调用显示 `aborted` 通常只是宿主进程被 SIGTERM 中断了，不代表操作失败。恢复后先用 `systemctl --user status feishu-daemon.service`、`journalctl --user -u feishu-daemon.service` 或 PID/日志确认结果，不要直接向用户汇报“重启未完成”。
+- 从 Lodestar 自己承载的对话里执行 `systemctl --user restart feishu-daemon.service` / `lodestar stop` / `restart` 这类会重启或停止当前 daemon 的命令时，工具调用显示 `aborted` 通常只是宿主进程被 SIGTERM 中断了，不代表操作失败。恢复后先用 `systemctl --user status feishu-daemon.service`、`journalctl --user -u feishu-daemon.service` 或 PID/日志确认结果，不要直接向用户汇报“重启未完成”。
 - “测试当前改动”“发交互卡片到本群”“先看看效果”默认都属于**非授权**的 live-service 变更理由。除非用户在当前用户消息中明确要求，否则禁止执行任何会影响 `feishu-daemon.service` 或当前 live daemon 的操作，包括但不限于 `stop`、`restart`、`systemd-run` 起替代 daemon、手工 `bun daemon.ts` 接管、修改 service 指向、覆盖 live repo 代码后重启。
 - live-service 操作授权不得跨 turn 生效：如果上一个 turn 同时要求“提交、重启”，后续新 turn 只说“提交”“继续”“再改一下”或提出新需求时，必须视为没有重启授权；需要重启时先停下来向用户要新的明确许可。
 

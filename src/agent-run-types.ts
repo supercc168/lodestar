@@ -1,6 +1,9 @@
 export const MAX_AGENT_DESCRIPTION_CHARS = 60
 export const PROJECT_AGENT_INPUT_ERROR = 'project Agent calls are non-interactive and have no question or answer interface; complete the supplied goal autonomously'
 
+/** 外部项目调用默认静默：结果只回调用方，不在群里建卡；`card` 才展示。 */
+export type AgentRunDisplay = 'card' | 'silent'
+
 /** Ownership is independent of the chat used to display a run. */
 export interface AgentRunOwner {
   kind: 'session' | 'project'
@@ -23,6 +26,8 @@ export interface AgentRunRequest {
   requestId?: string
   /** Optional caller attribution; never enables file delivery. */
   requesterOpenId?: string
+  /** Explicit display override; project calls default to `silent`, session calls to `card`. */
+  display?: AgentRunDisplay
 }
 
 export interface AgentFollowUpRequest {
@@ -36,6 +41,8 @@ export interface AgentFollowUpRequest {
   evidenceDir?: string
   requestId?: string
   requesterOpenId?: string
+  /** Defaults to the source run's display so a silent chain stays silent. */
+  display?: AgentRunDisplay
 }
 
 export interface AgentAnswerRequest {
@@ -145,6 +152,13 @@ export interface AgentRunSnapshot {
   evidenceDir?: string
   /** Collision lock keys (`workdir:` / `unity:` / `evidence:` + path) held while the run is active. */
   lockKeys?: string[]
+  /** Present only when the run renders no card; absent means carded (legacy history too). */
+  display?: 'silent'
+}
+
+/** Runs without a card keep their results in the run record and the caller's response. */
+export function isSilentAgentRun(run: Pick<AgentRunSnapshot, 'display'>): boolean {
+  return run.display === 'silent'
 }
 
 export function parseAgentRunRequest(raw: unknown): AgentRunRequest {
@@ -166,11 +180,13 @@ export function parseAgentRunRequest(raw: unknown): AgentRunRequest {
   const effort = optionalString(value.effort)
   const workDir = parseWorkDir(value)
   const evidenceDir = parseEvidenceDir(value)
+  const display = parseRunDisplay(value.display)
   return {
     identityIds, description: requireAgentDescription(value.description), prompt,
     ...(effort ? { effort } : {}), ...(sessionId ? { sessionId } : {}),
     ...(workDir !== undefined ? { workDir } : {}),
     ...(evidenceDir !== undefined ? { evidenceDir } : {}),
+    ...(display ? { display } : {}),
     ...parseProjectOptions(value),
   }
 }
@@ -182,6 +198,7 @@ export function parseAgentFollowUpRequest(raw: unknown): AgentFollowUpRequest {
   const effort = optionalString(value.effort)
   const workDir = parseWorkDir(value)
   const evidenceDir = parseEvidenceDir(value)
+  const display = parseRunDisplay(value.display)
   return {
     description: requireAgentDescription(value.description),
     prompt,
@@ -189,8 +206,15 @@ export function parseAgentFollowUpRequest(raw: unknown): AgentFollowUpRequest {
     ...(effort ? { effort } : {}),
     ...(workDir !== undefined ? { workDir } : {}),
     ...(evidenceDir !== undefined ? { evidenceDir } : {}),
+    ...(display ? { display } : {}),
     ...parseProjectOptions(value),
   }
+}
+
+function parseRunDisplay(raw: unknown): AgentRunDisplay | undefined {
+  if (raw === undefined) return undefined
+  if (raw === 'card' || raw === 'silent') return raw
+  throw new Error('agent display must be "card" or "silent"')
 }
 
 function parseProjectOptions(value: Record<string, unknown>): { requestId?: string; requesterOpenId?: string } {

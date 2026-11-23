@@ -1,6 +1,6 @@
 import { afterEach, beforeEach, describe, expect, spyOn, test } from 'bun:test'
 import { consoleUnifiedUsageContent, consoleUsageContent, consoleUsageElement, unifiedUsageSummary } from './console'
-import { accountUsageBlock } from './account-usage'
+import { accountUsageBlock, accountUsageError } from './account-usage'
 import { fmtCountdown } from './usage'
 import { codexUsageToUnified } from '../token-source-codex'
 import { snapshotFromReadResponse } from '../usage'
@@ -21,7 +21,7 @@ describe('clear account quota detail', () => {
       credits: { hasCredits: false, unlimited: false, balance: '0' },
     }, rateLimitResetCredits: { availableCount: 0 } })
     const usage = codexUsageToUnified(raw)
-    expect(consoleUnifiedUsageContent(usage)).toBe(`周　${bar(1)} 24%　${grey('3.0d 后重置')}`)
+    expect(consoleUnifiedUsageContent(usage)).toBe(`周　${bar(1)} 24%　${grey('3.0d')}`)
     expect(consoleUsageContent(raw)).not.toMatch(/5h|满窗/)
     expect(unifiedUsageSummary(usage)).not.toMatch(/5h|满窗/)
   })
@@ -35,8 +35,8 @@ describe('clear account quota detail', () => {
     const render = (primary: object) => consoleUnifiedUsageContent(codexUsageToUnified(snapshotFromReadResponse({
       rateLimits: { ...main, primary }, rateLimitResetCredits: { availableCount: 0 },
     }))).split('\n')
-    const weekly = `周　${bar(1)} 24%　${grey('3.0d 后重置')}`
-    expect(render(main.primary)).toEqual([`5h　${bar(0)} 0%　${grey('1.0h 后重置')}`, weekly])
+    const weekly = `周　${bar(1)} 24%　${grey('3.0d')}`
+    expect(render(main.primary)).toEqual([`5h　${bar(0)} 0%　${grey('1.0h')}`, weekly])
     expect(render({ usedPercent: 0, windowDurationMins: 300 })).toEqual([`5h　${bar(0)} 0%　${grey('重置时间 MISS')}`, weekly])
     // A wholly unknown window says MISS once.
     expect(render({ windowDurationMins: 300 })).toEqual(['5h　MISS', weekly])
@@ -75,7 +75,7 @@ describe('clear account quota detail', () => {
       { kind: 'fiveHour', label: '5h 窗口', percent: 11, resetsAt: new Date(Date.now() + 3600_000) },
       { kind: 'weekly', label: '周配额', percent: 24, resetsAt: new Date(Date.now() + 3 * 86400_000) },
     ] }
-    const lines = [`5h　${bar(1)} 11%　${grey('1.0h 后重置')}`, `周　${bar(1)} 24%　${grey('3.0d 后重置')}`]
+    const lines = [`5h　${bar(1)} 11%　${grey('1.0h')}`, `周　${bar(1)} 24%　${grey('3.0d')}`]
     const panel = consoleUsageElement({ sessionName: 'test', status: 'idle',
       account: { id: 'codex:default', label: 'Codex·默认', usage } }) as any
     expect(panel.element_id).toBe('console_usage')
@@ -94,6 +94,20 @@ describe('clear account quota detail', () => {
     expect(content({ account: null })).toBe(grey('账号未确定'))
     expect(content({ account: null, status: 'stopped' })).toBe(grey('未启动'))
     expect(content({})).toBe('加载中…')
+  })
+
+  test('a failed account keeps only MISS inline and folds the reason into a collapsed panel', () => {
+    const panel = consoleUsageElement({ sessionName: 'test', status: 'idle',
+      account: { id: 'glm', label: 'GLM', usage: { state: 'network', reason: 'upstream offline', windows: [] } } }) as any
+    expect(panel.elements[0]).toEqual({ tag: 'markdown', content: "<font color='red'>MISS</font>" })
+    const details = panel.elements[1]
+    expect(details.tag).toBe('collapsible_panel')
+    expect(details.expanded).toBe(false)
+    expect(details.header.title.content).toBe('⚠️ 额度读取失败')
+    expect(details.elements[0].content).toBe('upstream offline')
+    // 正常账号不出现错误面板。
+    expect((consoleUsageElement({ sessionName: 'test', status: 'idle', account: { id: 'glm', label: 'GLM',
+      usage: { state: 'ok', kind: 'balance', balance: { remaining: 3, currency: 'CNY' }, windows: [] } } }) as any).elements).toHaveLength(1)
   })
 
   test('Spark and reserve remain outside the main quota display', () => {
@@ -117,8 +131,8 @@ describe('clear account quota detail', () => {
       { kind: 'monthly', label: '月度工具', percent: 7, used: 290, total: 4000, resetsAt: new Date(Date.now() + 15 * 86400_000) },
     ] })
     expect(out.split('\n')).toEqual([
-      `5h　${bar(1)} 11%　${grey('1.0h 后重置')}`,
-      `周　${bar(1)} 17%　${grey('1.0d 后重置')}`,
+      `5h　${bar(1)} 11%　${grey('1.0h')}`,
+      `周　${bar(1)} 17%　${grey('1.0d')}`,
       `月工具　${bar(0)} 7%`,
     ])
     expect(out).not.toMatch(/290|4000|15.0d|Max/)
@@ -131,16 +145,21 @@ describe('clear account quota detail', () => {
       ] })).toBe('5h　MISS')
       expect(consoleUnifiedUsageContent({ state: 'ok', windows: [
         { kind: 'fiveHour', label: '5h', percent, resetsAt: new Date(Date.now() + 3600_000) },
-      ] })).toBe(`5h　MISS　${grey('1.0h 后重置')}`)
+      ] })).toBe(`5h　MISS　${grey('1.0h')}`)
     }
     // A reset time already reached reads as such rather than as a countdown.
     expect(consoleUnifiedUsageContent({ state: 'ok', windows: [
       { kind: 'fiveHour', label: '5h', percent: 40, resetsAt: new Date(Date.now() - 1000) },
     ] })).toBe(`5h　${bar(2)} 40%　${grey('已重置')}`)
-    expect(consoleUnifiedUsageContent({ state: 'network', reason: 'upstream offline', windows: [
+    // 行内只留 MISS，完整原因交给默认折叠的错误详情。
+    const offline = { state: 'network', reason: 'upstream offline', windows: [
       { kind: 'fiveHour', label: 'stale', percent: 10, resetsAt: null },
-    ] })).toBe("<font color='red'>MISS · upstream offline</font>")
-    expect(consoleUnifiedUsageContent({ state: 'rate_limited', windows: [] })).toContain('API 限频')
+    ] } as any
+    expect(consoleUnifiedUsageContent(offline)).toBe("<font color='red'>MISS</font>")
+    expect(accountUsageError(offline)).toBe('upstream offline')
+    expect(consoleUnifiedUsageContent({ state: 'rate_limited', windows: [] })).toBe("<font color='red'>MISS</font>")
+    expect(accountUsageError({ state: 'rate_limited', windows: [] })).toBe('API 限频')
+    expect(accountUsageError({ state: 'ok', windows: [], resetCredits: null })).toBeNull()
     expect(consoleUnifiedUsageContent({ state: 'not_applicable', windows: [] })).toBe(grey('无额度查询'))
     // No window at all is a MISS of the whole quota, with any account-level facts after it.
     expect(consoleUnifiedUsageContent({ state: 'ok', windows: [], resetCredits: null })).toBe('额度 MISS · 重置卡 MISS')
@@ -175,7 +194,7 @@ describe('clear account quota detail', () => {
     const relayLines = [
       `月工具　${bar(0)} 5%`,
       `日额度　${bar(1)} 12%　${grey('重置时间 MISS')}`,
-      `Pro 周额度　${bar(2)} 30%　${grey('1.0d 后重置')}`,
+      `Pro 周额度　${bar(2)} 30%　${grey('1.0d')}`,
     ]
     expect(consoleUnifiedUsageContent(relay).split('\n')).toEqual(relayLines)
     // Windows without a string kind, label, currency or reason are just unlisted, never a thrown panel.
@@ -192,7 +211,8 @@ describe('clear account quota detail', () => {
       expect(consoleUnifiedUsageContent({ state: 'ok', kind: 'quota', quota: { remaining: 1, limit: 2, currency }, windows: [] } as any))
         .toBe('剩余 1.00 / 2.00')
     }
-    expect(consoleUnifiedUsageContent({ state: 'network', reason: 404, windows: [] } as any)).toBe("<font color='red'>MISS · 404</font>")
+    expect(consoleUnifiedUsageContent({ state: 'network', reason: 404, windows: [] } as any)).toBe("<font color='red'>MISS</font>")
+    expect(accountUsageError({ state: 'network', reason: 404, windows: [] } as any)).toBe('404')
     // A window entry that is not an object is a wholly unknown window; the other windows still show.
     expect(consoleUnifiedUsageContent({ state: 'ok', windows: [null, 3, { kind: 'weekly', label: '周', percent: 50, resetsAt: null }] } as any)
       .split('\n')).toEqual(['额度　MISS', '额度　MISS', `周　${bar(3)} 50%　${grey('重置时间 MISS')}`])
@@ -205,8 +225,9 @@ describe('clear account quota detail', () => {
       .toBe(`周　${bar(0)} 5%　${grey('重置时间 MISS')}`)
     // Anything else malformed costs only this account a MISS, never the whole panel.
     const malformed = { state: 'ok', windows: 'x' } as any
-    expect(consoleUnifiedUsageContent(malformed)).toBe("<font color='red'>MISS · 额度数据格式无效</font>")
-    expect(accountUsageBlock({ id: 'relay:z', label: 'z', usage: malformed })).toBe("**z**　<font color='red'>MISS · 额度数据格式无效</font>")
+    expect(consoleUnifiedUsageContent(malformed)).toBe("<font color='red'>MISS</font>")
+    expect(accountUsageError(malformed)).toBe('额度数据格式无效')
+    expect(accountUsageBlock({ id: 'relay:z', label: 'z', usage: malformed })).toBe("**z**　<font color='red'>MISS</font>")
     expect(accountUsageBlock({ id: 'relay:x', label: 'x', usage: relay })).toBe(['**x**', ...relayLines].join('\n'))
     expect(accountUsageBlock({ id: 'relay:y', label: 'y', usage: { state: 'ok', windows: [{ label: '日额度', percent: 12, resetsAt: null }] } as any }))
       .toBe(`**y**\n日额度　${bar(1)} 12%　${grey('重置时间 MISS')}`)
@@ -221,13 +242,13 @@ describe('clear account quota detail', () => {
       { kind: 'seven_day_oauth_apps', label: 'OAuth 应用周额度', percent: 5, resetsAt: weekly },
     ] }).split('\n')
     const exhausted = `周　${bar(6, 'red')} <font color='red'>100%</font>`
-    const reset = (date: Date | null) => grey(date ? `${fmtCountdown(date.getTime() - Date.now())} 后重置` : '重置时间 MISS')
+    const reset = (date: Date | null) => grey(date ? `${fmtCountdown(date.getTime() - Date.now())}` : '重置时间 MISS')
     expect(render(total)).toEqual([
       `${exhausted}　${reset(total)}`, `Fable 周　${bar(3)} 47%　${reset(total)}`, `OAuth 应用周　${bar(0)} 5%　${reset(total)}`,
     ])
-    expect(reset(total)).toBe(grey('2.2d 后重置'))
+    expect(reset(total)).toBe(grey('2.2d'))
     const later = new Date(Date.now() + 3.1 * DAY)
-    expect(render(later)[1]).toBe(`Fable 周　${bar(3)} 47%　${grey('3.1d 后重置')}`)
+    expect(render(later)[1]).toBe(`Fable 周　${bar(3)} 47%　${grey('3.1d')}`)
     // A missing reset is never borrowed from another window, and `<name>　MISS` only ever means nothing is known.
     expect(render(null)[1]).toBe(`Fable 周　${bar(3)} 47%　${grey('重置时间 MISS')}`)
     expect(render(total, null)).toEqual([
@@ -267,7 +288,7 @@ describe('clear account quota detail', () => {
     const base = { state: 'ok' as const, windows: [
       { kind: 'weekly', label: '周额度', percent: 17, resetsAt: new Date(Date.now() + 6.9 * DAY) },
     ] }
-    const weekly = `周　${bar(1)} 17%　${grey('6.9d 后重置')}`
+    const weekly = `周　${bar(1)} 17%　${grey('6.9d')}`
     const render = (days: number | null) => consoleUnifiedUsageContent({ ...base,
       credentialExpiresAt: days === null ? null : Date.now() + days * DAY })
     const row = (fact: string) => `${fact}\n${weekly}`
@@ -293,8 +314,9 @@ describe('clear account quota detail', () => {
     expect(render(null)).toBe(row('凭据 MISS'))
     // Other sources carry no login end; failed rows keep only their reason; the footer never shows it.
     expect(consoleUnifiedUsageContent(base)).toBe(weekly)
-    expect(consoleUnifiedUsageContent({ state: 'no_credentials', windows: [], credentialExpiresAt: Date.now() + 20 * DAY }))
-      .toBe("<font color='red'>MISS · 未登录或未配置</font>")
+    const loggedOut = { state: 'no_credentials', windows: [], credentialExpiresAt: Date.now() + 20 * DAY } as any
+    expect(consoleUnifiedUsageContent(loggedOut)).toBe("<font color='red'>MISS</font>")
+    expect(accountUsageError(loggedOut)).toBe('未登录或未配置')
     expect(unifiedUsageSummary({ ...base, credentialExpiresAt: Date.now() + DAY })).not.toContain('凭据')
     expect(accountUsageBlock({ id: 'claude:default', label: 'Claude·默认', usage: { ...base, credentialExpiresAt: Date.now() + 27.3 * DAY } }))
       .toBe(`**Claude·默认**　凭据剩余 24.3d\n${weekly}`)

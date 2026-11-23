@@ -28,7 +28,9 @@ beforeEach(() => {
   })
   const settings = spyOn(cardkit, 'patchSettings').mockResolvedValue(undefined)
   const summary = spyOn(cardkit, 'cancelSummary').mockImplementation(() => {})
-  __setPendingReplyForTest('oc_ask', false)
+  // Production registers every turn card right after sendCard; the checked
+  // panel writes refuse to touch an unregistered card.
+  cardkit.recordCardCreated('card_ask', 1)
   restore = [() => add.mockRestore(), () => replace.mockRestore(), () => settings.mockRestore(), () => summary.mockRestore()]
 })
 afterEach(async () => {

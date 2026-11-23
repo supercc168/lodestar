@@ -63,6 +63,8 @@ export const PROJECT_AGENT_INSTRUCTIONS = [
 ].join('\n')
 
 export interface AgentCliLaunch {
+  /** 统一入口需要先写子命令，例如 `agent`。 */
+  argsPrefix?: string[]
   runtime: string
   entry: string
 }
@@ -103,13 +105,13 @@ export function agentSkillBody(): string {
     '',
     '| 调用场景 | 必须使用的绑定 |',
     '| --- | --- |',
-    '| 主 Agent、委派 Agent 或原生子 Agent 需要调用另一个 Agent / 模型 | 使用继承的受管上下文：普通 `lodestar-agent` 命令，不传 `--project` |',
+    '| 主 Agent、委派 Agent 或原生子 Agent 需要调用另一个 Agent / 模型 | 使用继承的受管上下文：普通 `lodestar agent` 命令，不传 `--project` |',
     '| 独立服务、定时任务或其他软件直接调用 | 绑定项目：每个命令都显式传 `--project <项目名>` |',
     '',
     '- Agent 通过 Shell、Python、脚本或 HTTP 发起的调用仍然属于 Agent 执行任务，必须沿用受管上下文及其项目、对话 ID 归属。',
     '- 不得把当前任务中的调用包装成“外部服务”，不得清除会话环境变量、复制项目凭据或使用 `--project` 脱离会话生命周期。',
     '- 没有有效会话上下文时，Agent 调用必须报错；项目入口不是会话凭据缺失、过期或失败时的替代路径。',
-    '- 独立服务和软件不借用任何主 Agent 的会话凭据，统一使用项目入口。项目任务有自己的卡片和取消入口，不依赖主会话存活。',
+    '- 独立服务和软件不借用任何主 Agent 的会话凭据，统一使用项目入口。项目调用默认静默（结果只回调用方，群里没有卡片、进度或失败提示）；只在调用方显式要求群内可见时传 `--card`，此时项目任务有自己的卡片和取消入口。无论是否建卡都不依赖主会话存活。',
     '- 项目入口不提供提问或回答接口：新建和续跑均须自主执行必要步骤并验证，直至完整完成调用方目标，不以计划、部分工作或索取输入结束；`answer` 供会话归属的各层委派使用。',
     '',
     '## 会话 ID 与恢复范围（强制）',
@@ -136,8 +138,8 @@ export function agentSkillBody(): string {
     '## Choosing delegation capabilities',
     '',
     '- Each Agent chooses between native Agent/subagent capabilities and',
-    '  `lodestar-agent` based on the task and available capabilities.',
-    '- Calling your own model or Agent through `lodestar-agent` is allowed; from inside a Claude subscription worker, do not call onward through the Claude subscription source and use another source instead. Native Agent/subagent tools remain available.',
+    '  `lodestar agent` based on the task and available capabilities.',
+    '- Calling your own model or Agent through `lodestar agent` is allowed when it does not use a Claude subscription source. Native Agent/subagent tools remain available.',
     '- The Agent workflow below always uses the inherited managed context. `--project` is reserved',
     '  for genuinely independent service/application clients, not Agent task execution.',
     '',
@@ -148,7 +150,7 @@ export function agentSkillBody(): string {
     '',
     '```bash',
     '# desc: 查询当前可用的 Agent 身份',
-    'lodestar-agent identities --json',
+    'lodestar agent identities --json',
     '```',
     '',
     '2. Select only identities with `status: "ready"`. Never invent, cache,',
@@ -174,7 +176,7 @@ export function agentSkillBody(): string {
     '',
     '```bash',
     '# desc: 把完整任务交给指定 Agent',
-    "lodestar-agent run --identity '<identity-id>' --description '完成指定任务' --stdin <<'EOF'",
+    "lodestar agent run --identity '<identity-id>' --description '完成指定任务' --stdin <<'EOF'",
     '<raw task prompt written by the main Agent>',
     'EOF',
     '```',
@@ -190,7 +192,7 @@ export function agentSkillBody(): string {
     '',
     '```bash',
     '# desc: 在主 Agent 工作目录的子目录中执行任务',
-    "lodestar-agent run --identity '<identity-id>' --description '检查应用代码' --workdir 'packages/app' --prompt 'Inspect the application and report the results.'",
+    "lodestar agent run --identity '<identity-id>' --description '检查应用代码' --workdir 'packages/app' --prompt 'Inspect the application and report the results.'",
     '```',
     '',
     '`run --session` and `follow-up` may select an existing directory within the same project.',
@@ -210,7 +212,7 @@ export function agentSkillBody(): string {
     '',
     '```bash',
     '# desc: 用历史会话 ID 继续下一轮',
-    "lodestar-agent run --session '<session-id>' --description '继续下一步任务' --stdin <<'EOF'",
+    "lodestar agent run --session '<session-id>' --description '继续下一步任务' --stdin <<'EOF'",
     '<new input for the next turn>',
     'EOF',
     '```',
@@ -236,14 +238,14 @@ export function agentSkillBody(): string {
     '',
     '```bash',
     '# desc: 第二轮根据上一轮结果和反馈继续修改',
-    "lodestar-agent run --session '<session-id>' --description '根据反馈修改' --prompt 'Revise the previous implementation using this feedback: <specific feedback>.' --json",
+    "lodestar agent run --session '<session-id>' --description '根据反馈修改' --prompt 'Revise the previous implementation using this feedback: <specific feedback>.' --json",
     '```',
     '',
     'Read turn 2\'s result before choosing turn 3\'s input, using the same session id:',
     '',
     '```bash',
     '# desc: 第三轮验证同一项工作的最终结果',
-    "lodestar-agent run --session '<session-id>' --description '验证最终结果' --prompt 'Verify the revised implementation against the original requirements and report the results and any remaining issues.' --json",
+    "lodestar agent run --session '<session-id>' --description '验证最终结果' --prompt 'Verify the revised implementation against the original requirements and report the results and any remaining issues.' --json",
     '```',
     '',
     'These turns retain the earlier conversation; send only the new requirements,',
@@ -256,7 +258,7 @@ export function agentSkillBody(): string {
     '',
     '```bash',
     '# desc: 在同一原生 Agent 会话中继续任务',
-    "lodestar-agent follow-up '<run-id>' --identity '<identity-id>' --description '完成指定任务' --stdin <<'EOF'",
+    "lodestar agent follow-up '<run-id>' --identity '<identity-id>' --description '完成指定任务' --stdin <<'EOF'",
     '<follow-up prompt>',
     'EOF',
     '```',
@@ -269,7 +271,7 @@ export function agentSkillBody(): string {
     '',
     '```bash',
     '# desc: 回答 Agent 的阻塞问题并继续运行',
-    "lodestar-agent answer '<run-id>' --identity '<identity-id>' --request '<request-id>' --stdin <<'EOF'",
+    "lodestar agent answer '<run-id>' --identity '<identity-id>' --request '<request-id>' --stdin <<'EOF'",
     '{"question-id":"answer"}',
     'EOF',
     '```',
@@ -317,9 +319,11 @@ export function resolveAgentCliLaunch(opts: {
   const runtimeIsBun = /^bun(?:\.exe)?$/i.test(basename(runtime))
   const candidates: string[] = []
   for (const root of roots) {
-    const source = join(root, 'src', 'agent-cli.ts')
-    const siblingBundle = join(root, 'lodestar-agent.js')
-    const rootBundle = join(root, 'dist', 'lodestar-agent.js')
+    // 统一入口：源码模式走仓库根 cli.ts，发布模式走同目录/dist 的 lodestar.js；
+    // 调用时在入口后追加 `agent` 子命令，旧的独立 agent bundle 已不存在。
+    const source = join(root, 'cli.ts')
+    const siblingBundle = join(root, 'lodestar.js')
+    const rootBundle = join(root, 'dist', 'lodestar.js')
     if (runtimeIsBun) candidates.push(source, siblingBundle, rootBundle)
     else candidates.push(siblingBundle, rootBundle, source)
   }
@@ -328,7 +332,7 @@ export function resolveAgentCliLaunch(opts: {
   if (!entry) {
     throw new Error(`lodestar-agent entry not found beside daemon: ${unique.join(', ')}`)
   }
-  return { runtime, entry }
+  return { runtime, entry, argsPrefix: ['agent'] }
 }
 
 export function ensureLodestarAgentSkill(opts: EnsureAgentSkillOptions = {}): void {
@@ -357,9 +361,10 @@ export function ensureLodestarAgentCommand(opts: EnsureAgentCommandOptions = {})
     exists: opts.exists,
   })
   const target = lodestarAgentWrapperPath(dataDir, platform)
+  const prefix = launch.argsPrefix ?? []
   const body = platform === 'win32'
-    ? `@"${windowsQuote(launch.runtime)}" "${windowsQuote(launch.entry)}" %*\r\n`
-    : `#!/bin/sh\nexec ${shellQuote(launch.runtime)} ${shellQuote(launch.entry)} "$@"\n`
+    ? `@"${windowsQuote(launch.runtime)}" "${windowsQuote(launch.entry)}" ${prefix.join(' ')} %*\r\n`
+    : `#!/bin/sh\nexec ${shellQuote(launch.runtime)} ${shellQuote(launch.entry)} ${prefix.map(shellQuote).join(' ')} "$@"\n`
   writeFileIfChanged(target, body, platform === 'win32' ? undefined : 0o700)
   prependPath(env, targetDir, platform)
   removeLegacyConsultCommand(targetDir, platform)

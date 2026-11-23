@@ -79,13 +79,13 @@ npm i -g .
 
 | 命令 | 作用 |
 | --- | --- |
-| `lodestar-setup` | **首次配置向导**(手把手带你配好一切) |
-| `lodestar-daemon` | 启动后台程序 |
-| `lodestar-stop` | 停止后台程序 |
-| `lodestar-update` | 升级到最新版 |
-| `lodestar-version` | 查看版本 |
+| `lodestar setup` | **首次配置向导**(手把手带你配好一切) |
+| `lodestar` | 启动后台程序 |
+| `lodestar stop` | 停止后台程序 |
+| `lodestar update` | 升级到最新版 |
+| `lodestar version` | 查看版本 |
 
-> 大多数人只需要跑 `lodestar-setup`,它会自动带你走完下面第五、六章的所有步骤。本说明书把每一步展开讲清楚,方便你理解和排查。
+> 大多数人只需要跑 `lodestar setup`,它会自动带你走完下面第五、六章的所有步骤。本说明书把每一步展开讲清楚,方便你理解和排查。
 
 ---
 
@@ -184,7 +184,7 @@ npm i -g .
 
 ### 方式一:配置向导(推荐)
 ```bash
-lodestar-setup
+lodestar setup
 ```
 向导会依次做 4 件事:
 1. **确保 Claude Code CLI 装好**(没装会自动 `npm i -g @anthropic-ai/claude-code`);
@@ -195,7 +195,7 @@ lodestar-setup
 跑完向导,daemon 就在后台跑起来了。**最后一步:在飞书群里发任意一条消息**,默认由 Claude 接管,你就能看到卡片了。
 
 ![图 6.1 配置向导运行界面](images/feishu/6.1-setup-wizard.png)
-> 📷 **待补图 6.1** ｜ 截图内容:终端里运行 `lodestar-setup` 的界面(能看到 4 个步骤的引导、飞书凭据测试通过 ✓、daemon 启动成功那几屏最好)。
+> 📷 **待补图 6.1** ｜ 截图内容:终端里运行 `lodestar setup` 的界面(能看到 4 个步骤的引导、飞书凭据测试通过 ✓、daemon 启动成功那几屏最好)。
 
 ### 方式二:手写配置文件
 配置文件位置(macOS/Linux):`~/.config/lodestar/config.toml`。最小配置只需要飞书凭据:
@@ -208,7 +208,7 @@ app_secret = "xxxxxxxx"
 projects_root = "~/"     # 项目根目录,可选,默认主目录
 # live_elapsed = "bucket"  # 活跃卡耗时: bucket(默认粗档位) | second(按秒,配额更费)
 ```
-写好后运行 `lodestar-daemon` 启动。(GLM / 其它配置见第八章。)
+写好后运行 `lodestar` 启动。(GLM / 其它配置见第八章。)
 
 ---
 
@@ -340,7 +340,7 @@ curl -sS -X POST http://127.0.0.1:9876/notify \
 
 想让 daemon 长期在后台跑、开机自启、崩溃自动重启:
 
-- **Linux / macOS**:用 `systemd --user` 拉起 `lodestar-daemon`。
+- **Linux / macOS**:用 `systemd --user` 拉起 `lodestar`。
 - **macOS**:也可用 `launchd`(LaunchAgent)托管。
 - **Windows**:用任务计划程序拉起。
 

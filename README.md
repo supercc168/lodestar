@@ -25,7 +25,7 @@ AI 不是帮手，是倍率。它放大的不是体力，是你 —— 你的直
 
 订阅了 GLM Coding Plan 的话强烈推荐 **Claude·GLM** 档位 —— GLM-5.3 开放 1M token 上下文窗口,长会话不易丢前文、中文友好。想省额度就切 **Claude·GLM-5.3 Flash**(智谱 2026-08-26 上线的快速档,价格约 GLM-5.3 的 1/10、同样 1M 上下文)。在 GLM 系档位上,`hi` 控制台会展示套餐档位、5 小时滚动窗口与月度用量;每条回复的 footer 也会带上当前 5h 窗口的已用百分比(`5h·N%`),额度消耗随时可见。
 
-**GLM 档位怎么配**:订阅后跑 `lodestar-setup`,第 2 步填入智谱 API key 就自动写好并设为默认;想手配或改模型,在 `~/.config/lodestar/config.toml` 加(**别写进 `~/.claude/settings.json`** —— 那会经 Claude Code 的 settingSources 污染 Fable 5 / Opus 登录档位,让它们也偷偷走 GLM):
+**GLM 档位怎么配**:订阅后跑 `lodestar setup`,第 2 步填入智谱 API key 就自动写好并设为默认;想手配或改模型,在 `~/.config/lodestar/config.toml` 加(**别写进 `~/.claude/settings.json`** —— 那会经 Claude Code 的 settingSources 污染 Fable 5 / Opus 登录档位,让它们也偷偷走 GLM):
 
 ```toml
 [claude]
@@ -73,20 +73,21 @@ npm i -g .
 
 | 命令 | 作用 |
 | --- | --- |
-| `lodestar-setup` | 首次配置向导 |
-| `lodestar-daemon` | 启动 daemon |
-| `lodestar-stop` | 停止 daemon |
-| `lodestar-update` | 升级到最新版(含 Codex CLI、Claude Code 和 Claude SDK)|
-| `lodestar-version` | 查看 Lodestar 和 Codex CLI 版本 |
+| `lodestar setup` | 首次配置向导 |
+| `lodestar` | 启动 daemon |
+| `lodestar stop` | 停止 daemon |
+| `lodestar update` | 升级到最新版(含 Codex CLI、Claude Code 和 Claude SDK)|
+| `lodestar version` | 查看 Lodestar 和 Codex CLI 版本 |
 | `lodestar-agent` | 供主 Agent 把完整任务委派给其他模型并续跑原生会话 |
 
 **2. 跑向导**
 
 ```bash
-lodestar-setup
+cd ~/git/lodestar && bun install && bun run build && npm i -g .
+lodestar
 ```
 
-按向导完成配置，把机器人拉进以项目目录命名的群，发消息即可开始工作。[安装要求与详细配置](https://github.com/leviyuan/lodestar/blob/main/docs/configuration.md)
+首次运行会自动进入配置向导（也可显式执行 `lodestar setup`）；完成后，把机器人拉进以项目目录命名的群，发消息即可开始工作。[安装要求与详细配置](https://github.com/leviyuan/lodestar/blob/main/docs/configuration.md)
 
 ## 常用指令
 
@@ -260,7 +261,7 @@ watchdog_mode = 'off'              # 单项目覆盖(off / warn / recover_once)
 **接入步骤:**
 
 1. 装好 reclaude 并 `reclaude login`,确认 `reclaude status` 里 daemon 和 gateway 正常
-2. 跑 `lodestar-setup` 时,第 2 步的 GLM key **直接回车跳过**(额度走 reclaude,不需要 GLM)
+2. 跑 `lodestar setup` 时,第 2 步的 GLM key **直接回车跳过**(额度走 reclaude,不需要 GLM)
 3. 向导跑完后,在 `config.toml`(macOS/Linux 默认 `~/.config/lodestar/config.toml`)追加:
 
    ```toml
@@ -268,7 +269,7 @@ watchdog_mode = 'off'              # 单项目覆盖(off / warn / recover_once)
    bin = "~/.local/bin/reclaude"
    ```
 
-4. 重启 daemon:裸跑时 `lodestar-stop` 后再 `lodestar-daemon`;已由 launchd / systemd 托管时改用 `launchctl kickstart -k gui/$(id -u)/<label>` / `systemctl --user restart <unit>`,**不要**手动再起实例(托管器 KeepAlive 会拉起自己的实例并与手动实例互杀)
+4. 重启 daemon:裸跑时 `lodestar stop` 后再 `lodestar`;已由 launchd / systemd 托管时改用 `launchctl kickstart -k gui/$(id -u)/<label>` / `systemctl --user restart <unit>`,**不要**手动再起实例(托管器 KeepAlive 会拉起自己的实例并与手动实例互杀)
 5. 验证:群里发条消息,daemon 日志出现 `executable=config-reclaude-sdk-native:…/reclaude` 即生效(stderr 里 reclaude 的 `同步配置…` 属正常输出)
 
 **没配就发消息的典型症状**:群里报 `Failed to authenticate. API Error: 401 Invalid bearer token` —— 裸 `claude` 拿着 reclaude 的本地凭据直连官方 API 必然 401,补上第 3、4 步即可。
@@ -365,7 +366,7 @@ default_setting_sources = "auto"   # 新建项目自动按目录探测加载 .cl
 ---
 
 > [!TIP]
-> 想 7×24 长跑,用 `systemd --user`(Linux/macOS)或 Windows 任务计划程序拉起 `lodestar-daemon`。重启后上次活跃的 sessions 会并发自动 `--resume` 接回。
+> 想 7×24 长跑,用 `systemd --user`(Linux/macOS)或 Windows 任务计划程序拉起 `lodestar`。重启后上次活跃的 sessions 会并发自动 `--resume` 接回。
 
 ---
 

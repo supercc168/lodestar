@@ -19,8 +19,10 @@ import type { AgentRunSnapshot, AgentWorkerResult } from '../agent-run-types'
 import { ELEMENTS, sanitizeMarkdownForCardKit } from './elements'
 import { formatDuration } from './duration'
 import {
+  AGENT_CARD_TASK_KIND_ICON,
   AGENT_CARD_TASK_KIND_ORDER,
   agentCardTaskKindLabel,
+  agentCardTaskKindShortLabel,
   type AgentCardTaskKind,
 } from './task-kind'
 import { boundedResultContent, compactTaskContent } from './task-content'
@@ -161,14 +163,16 @@ export function delegationCardSummary(tasks: Array<{
   }
   if (active.length > 0) {
     const counts = kindCounts(active)
-    return counts ? `⏳ ${counts}` : `⏳ ${active.length}项进行中`
+    if (!counts) return `⏳ ${active.length}项进行中`
+    // 计数里的 ⏳ 就是后台进程，与「进行中」的图标相同：已经有它时不再重复写状态图标。
+    return counts.includes(AGENT_CARD_TASK_KIND_ICON.background) ? counts : `⏳ ${counts}`
   }
   if (failed > 0) return `❌ ${failed}失败·${tasks.length - failed}完成`
   const done = kindCounts(tasks)
   return done ? `✅ ${done}` : `✅ ${tasks.length}项已完成`
 }
 
-/** e.g. `子Agent1·后台1`; three or more kinds return null so the caller can
+/** e.g. `🤖1·⏳1`; three or more kinds return null so the caller can
  * collapse to a total that still fits the ~15 character preview. */
 function kindCounts(tasks: Array<{ kind?: AgentCardTaskKind }>): string | null {
   const counts = new Map<AgentCardTaskKind, number>()
@@ -179,15 +183,6 @@ function kindCounts(tasks: Array<{ kind?: AgentCardTaskKind }>): string | null {
   const parts = AGENT_CARD_TASK_KIND_ORDER.filter(kind => counts.has(kind))
     .map(kind => `${agentCardTaskKindShortLabel(kind)}${counts.get(kind)}`)
   return parts.length > 2 ? null : parts.join('·')
-}
-
-function agentCardTaskKindShortLabel(kind: AgentCardTaskKind): string {
-  switch (kind) {
-    case 'project': return '项目'
-    case 'delegated': return '委派'
-    case 'subagent': return '子Agent'
-    case 'background': return '后台'
-  }
 }
 
 export function agentWorkerElement(

@@ -50,7 +50,7 @@ import { sanitizeMarkdownForCardKit } from './elements'
 import { boundedResultContent, compactTaskContent } from './task-content'
 import { formatDuration } from './duration'
 import { shellCommandDescription } from './shell-command'
-import { agentCardTaskKindLabel, type AgentCardTaskKind } from './task-kind'
+import { agentCardTaskKindName, type AgentCardTaskKind } from './task-kind'
 import { summarizeToolInput } from './tool'
 
 export type { BgTaskStatus }
@@ -690,7 +690,7 @@ export function backgroundLiveSummary(tasks: BgTaskEntry[]): string {
 }
 
 function renderDetailBody(t: BgTaskEntry): string {
-  const kindLabel = agentCardTaskKindLabel(backgroundTaskKind(t))
+  const kindLabel = agentCardTaskKindName(backgroundTaskKind(t))
   const typeLabel = TYPE_LABEL[t.type]
   const lines: string[] = [
     `**${kindLabel}${typeLabel !== kindLabel ? ` · ${typeLabel}` : ''}**${ownerOf(t) !== typeLabel ? ` · ${ownerOf(t)}` : ''}${isBgTerminal(t) ? ` · 用时 ${formatDuration(terminalElapsed(t) / 1000)}` : ''}`,
@@ -713,7 +713,7 @@ function renderDetailBody(t: BgTaskEntry): string {
 }
 
 export function backgroundTaskSummary(t: BgTaskEntry): string {
-  const kindLabel = agentCardTaskKindLabel(backgroundTaskKind(t))
+  const kindLabel = agentCardTaskKindName(backgroundTaskKind(t))
   const status = {
     running: `⏳ ${kindLabel}正在执行`, pending: `⏳ ${kindLabel}等待执行`, paused: `⏸️ ${kindLabel}已暂停`,
     completed: `✅ ${kindLabel}完成`, failed: `❌ ${kindLabel}失败`, killed: `🛑 ${kindLabel}已终止`,

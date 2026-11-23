@@ -31,11 +31,11 @@ describe('lodestar-agent skill body', () => {
     expect(body).toContain("caller-supplied prompt becomes that Agent run's task")
     expect(body).toContain('Both session-bound and project-bound Agents return results and local artifact paths to the caller')
     expect(body).toContain('Agent output markers do not upload files or grant sharing permissions')
-    expect(body).toContain('lodestar-agent follow-up')
-    expect(body).toContain("lodestar-agent run --session '<session-id>'")
+    expect(body).toContain('lodestar agent follow-up')
+    expect(body).toContain("lodestar agent run --session '<session-id>'")
     expect(body).toContain('workers[].session_id')
     expect(body).toContain('workers[].output')
-    expect(body).toContain('lodestar-agent answer')
+    expect(body).toContain('lodestar agent answer')
     expect(body.toLowerCase()).not.toContain('reviewer')
     expect(body.toLowerCase()).not.toContain('read-only')
   })
@@ -45,7 +45,7 @@ describe('lodestar-agent skill body', () => {
     expect(body).toContain('name: lodestar-agent')
     expect(body).toContain('固定档位')
     expect(body).toContain('Never expose `LODESTAR_AGENT_CAPABILITY`')
-    expect(body).toContain('lodestar-agent identities')
+    expect(body).toContain('lodestar agent identities')
     expect(body).not.toMatch(/Token Source/)
     expect(body).not.toContain('lodestar-consult')
     expect(body).not.toContain('reviewers')
@@ -62,7 +62,7 @@ describe('lodestar-agent skill body', () => {
 
   test('allows self-calls and recursive work while preserving caller delivery ownership', () => {
     const body = agentSkillBody()
-    expect(body).toContain('Calling your own model or Agent through `lodestar-agent` is allowed')
+    expect(body).toContain('Calling your own model or Agent through `lodestar agent` is allowed')
     expect(body).toContain('Claude subscription source')
     expect(body).toContain('## Recursive delegation')
     expect(body).not.toContain('Only the main Agent may delegate work')
@@ -171,12 +171,11 @@ describe('lodestar-agent wrapper', () => {
     expect(body).not.toMatch(/token/i)
   })
 
-  test('follows npm global bin symlink to dist/lodestar-agent.js', () => {
+  test('follows npm global bin symlink to dist/lodestar.js', () => {
     const pkg = tempDir('lodestar-agent-pkg-')
     const dist = join(pkg, 'dist')
     mkdirSync(dist)
     writeFileSync(join(dist, 'lodestar.js'), 'export {}\n')
-    writeFileSync(join(dist, 'lodestar-agent.js'), 'export {}\n')
     const binDir = tempDir('lodestar-agent-npmbin-')
     const shim = join(binDir, 'lodestar-daemon')
     symlinkSync(join(dist, 'lodestar.js'), shim)
@@ -184,27 +183,27 @@ describe('lodestar-agent wrapper', () => {
       daemonEntry: shim,
       runtime: '/usr/bin/node',
     })
-    expect(launch.entry).toBe(join(realpathSync(dist), 'lodestar-agent.js'))
+    expect(launch.entry).toBe(join(realpathSync(dist), 'lodestar.js'))
+    expect(launch.argsPrefix).toEqual(['agent'])
   })
 
-  test('bun daemon.ts still resolves src/agent-cli.ts beside the repo root', () => {
+  test('bun daemon.ts still resolves cli.ts beside the repo root', () => {
     const repo = tempDir('lodestar-agent-repo-')
-    mkdirSync(join(repo, 'src'))
     writeFileSync(join(repo, 'daemon.ts'), 'export {}\n')
-    writeFileSync(join(repo, 'src', 'agent-cli.ts'), 'export {}\n')
+    writeFileSync(join(repo, 'cli.ts'), 'export {}\n')
     const launch = resolveAgentCliLaunch({
       daemonEntry: join(repo, 'daemon.ts'),
       runtime: '/usr/bin/bun',
     })
-    expect(launch.entry).toBe(join(realpathSync(repo), 'src', 'agent-cli.ts'))
+    expect(launch.entry).toBe(join(realpathSync(repo), 'cli.ts'))
+    expect(launch.argsPrefix).toEqual(['agent'])
   })
 
   test('legacy lodestar-consult unlink is a no-op when absent and removes an owned leftover', () => {
     const dataDir = tempDir('lodestar-agent-legacy-')
     const bin = join(dataDir, 'bin')
     mkdirSync(bin, { recursive: true })
-    const entry = join(dataDir, 'src', 'agent-cli.ts')
-    mkdirSync(join(dataDir, 'src'), { recursive: true })
+    const entry = join(dataDir, 'cli.ts')
     writeFileSync(entry, 'export {}\n')
     ensureLodestarAgentCommand({
       dataDir,

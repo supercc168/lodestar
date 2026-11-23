@@ -116,7 +116,7 @@ import { readSysInfo } from './src/sysinfo'
 {
   const guard = checkPidGuard(PID_FILE)
   if (guard.state === 'exit') {
-    console.error('lodestar-daemon: already running')
+    console.error('lodestar: 已经有一个 daemon 在运行（用 lodestar stop 停止）')
     process.exit(1)
   }
   if (existsSync(PID_FILE)) { try { unlinkSync(PID_FILE) } catch {} }

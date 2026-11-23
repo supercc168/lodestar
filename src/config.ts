@@ -192,7 +192,7 @@ export interface CodexModelConfig {
  *  bin         — Claude 包装器，或 DeepSeek Harness 使用的 Node 可执行文件
  *  model       — 默认模型 slug(codex 下发 gpt-5.6-sol;claude 真实模型走 slots)
  *  effort      — 默认 effort
- *  models      — OpenRouter/Packy 显式可选列表；GLM/DeepSeek 经验证的补录模型
+ *  models      — OpenRouter/中转站的显式可选列表；GLM/DeepSeek 经验证的补录模型
  *  hidden_models — 非 OpenRouter 来源从接口目录中隐藏的模型(逗号分隔)
  *  shown_models — 自动精选列表之外显式显示的接口模型(逗号分隔)
  *  custom_models — 所有来源的列表外补录记录(逗号分隔，不代表已验证可运行)
@@ -207,12 +207,6 @@ export interface TokenSourceConfig {
   base_url?: string
   auth_token?: string
   api_key?: string
-  /** 独立的账户余额凭据，绝不传入模型进程。 */
-  management_token?: string
-  management_user_id?: string
-  management_url?: string
-  /** 只复用指定来源的余额账号，不复用它的模型 Key。 */
-  billing_source?: string
   bin?: string
   /** reclaude 组织 ID；省略时跟随 reclaude 的当前组织。 */
   org?: string
@@ -322,7 +316,7 @@ export function loadConfig(): LodestarConfig {
   } catch (e) {
     process.stderr.write(
       'lodestar: cannot read configuration\n' +
-      `  → 运行 \`lodestar-setup\` 走交互式向导生成 (Feishu / Codex / 工作目录)\n` +
+      `  → 运行 \`lodestar setup\` 走交互式向导生成 (Feishu / Codex / 工作目录)\n` +
       `  → 或手写: 设 LODESTAR_CONFIG=/path/to/config.toml 覆盖默认路径\n` +
       `    [feishu]\n    app_id = "cli_xxx"\n    app_secret = "xxx"\n\n`,
     )
@@ -515,7 +509,6 @@ export function loadConfig(): LodestarConfig {
         } else if (
           field === 'agent' || field === 'display' || field === 'auth' ||
           field === 'base_url' || field === 'auth_token' || field === 'api_key' ||
-          field === 'management_token' || field === 'management_user_id' || field === 'management_url' || field === 'billing_source' ||
           field === 'bin' || field === 'org' || field === 'model' || field === 'effort' ||
           field === 'models' || field === 'hidden_models' || field === 'shown_models' || field === 'custom_models' || field === 'slots' || field === 'usage'
         ) {

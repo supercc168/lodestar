@@ -22,7 +22,6 @@ import './token-source-claude'
 import './token-source-reclaude'
 import './token-source-deepseek'
 import './token-source-openrouter'
-import './token-source-packy'
 import './token-source-dsh'
 import './token-source-dsh-glm'
 import './token-source-grok-wuhen'
@@ -35,6 +34,7 @@ export function buildTokenSourcesFromConfig(): number {
     const detected = def.detect?.fromSettingsEnv(settingsEnv)
     return def.configSectionId && detected ? [[def.configSectionId, detected]] : []
   }))
+  // 未登记的旧来源配置节（如 packy）没有对应 factory，构建时自然忽略，不阻断启动。
   const sharedConfigs = sharedTokenSourceConfigs(config.token_sources ?? {}, detectedConfigs)
   const previous = new Map(listTokenSources().map(source => [source.id, source]))
   const definitions = tokenSourceFactories().map(def => {

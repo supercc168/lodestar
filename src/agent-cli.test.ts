@@ -1,48 +1,29 @@
 import { afterEach, describe, expect, test } from 'bun:test'
 import { spawnSync } from 'node:child_process'
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
+import { mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { pathToFileURL } from 'node:url'
-import { parsePromptArgs } from './agent-cli'
+import { parsePromptArgs } from './agent-main'
 
 const temps: string[] = []
 afterEach(() => {
   for (const dir of temps.splice(0)) rmSync(dir, { recursive: true, force: true })
 })
 
-describe('lodestar-agent CLI args', () => {
-  test('executes the release CLI through npm symlinks and remains inert when imported', async () => {
-    const root = mkdtempSync(join(tmpdir(), 'lodestar agent-cli-'))
-    try {
-      const dist = join(root, 'dist')
-      const bin = join(root, 'bin')
-      mkdirSync(bin)
-      writeFileSync(join(root, 'package.json'), '{"type":"module"}')
-      const build = await Bun.build({
-        entrypoints: [join(import.meta.dir, 'agent-cli.ts')], target: 'node', minify: true,
-        banner: '#!/usr/bin/env node', outdir: dist, naming: 'lodestar-agent.js',
-      })
-      expect(build.success, build.logs.join('\n')).toBe(true)
-      const entry = join(dist, 'lodestar-agent.js')
-      const command = join(bin, 'lodestar-agent')
-      symlinkSync('../dist/lodestar-agent.js', command)
-      for (const path of [entry, command]) {
-        const help = Bun.spawnSync(['node', path, '--help'], { cwd: root })
-        expect(help.exitCode, help.stderr.toString()).toBe(0)
-        expect(help.stdout.toString()).toContain('lodestar-agent run --identity')
-      }
-      const invalid = Bun.spawnSync(['node', command, 'identities'], {
-        cwd: root, env: { ...process.env, DSH_LODESTAR_AGENT_CONTEXT: '{}' },
-      })
-      expect(invalid.exitCode).toBe(1)
-      expect(invalid.stderr.toString()).toContain('invalid DSH Lodestar delegation context')
-      const imported = Bun.spawnSync(['node', '--input-type=module', '-e',
-        `await import(${JSON.stringify(pathToFileURL(entry).href)})`,
-      ], { cwd: root })
-      expect(imported.exitCode, imported.stderr.toString()).toBe(0)
-      expect(imported.stdout.toString()).toBe('')
-    } finally { rmSync(root, { recursive: true, force: true }) }
+/** 统一入口；Agent 调用与用户终端共用 `lodestar agent`。 */
+const CLI = join(import.meta.dir, '..', 'cli.ts')
+
+describe('lodestar agent subcommand', () => {
+  test('prints help and reports a malformed managed context without daemon config', () => {
+    const help = Bun.spawnSync([process.execPath, CLI, 'agent', '--help'], { cwd: join(import.meta.dir, '..') })
+    expect(help.exitCode, help.stderr.toString()).toBe(0)
+    expect(help.stdout.toString()).toContain('lodestar agent run --identity')
+    const invalid = Bun.spawnSync([process.execPath, CLI, 'agent', 'identities'], {
+      cwd: join(import.meta.dir, '..'),
+      env: { ...process.env, DSH_LODESTAR_AGENT_CONTEXT: '{}' },
+    })
+    expect(invalid.exitCode).toBe(1)
+    expect(invalid.stderr.toString()).toContain('invalid DSH Lodestar delegation context')
   })
 
   test('uses the DSH root context for its authenticated request', async () => {
@@ -52,7 +33,7 @@ describe('lodestar-agent CLI args', () => {
       return Response.json({ identities: [], sourceFailures: [] })
     } })
     try {
-      const proc = Bun.spawn([process.execPath, join(import.meta.dir, 'agent-cli.ts'), 'identities', '--json'], {
+      const proc = Bun.spawn([process.execPath, CLI, 'agent', 'identities', '--json'], {
         env: { ...process.env, DSH_LODESTAR_AGENT_CONTEXT: JSON.stringify({ baseUrl: `http://127.0.0.1:${server.port}`, capability: 'dsh-test-capability' }),
           LODESTAR_AGENT_CAPABILITY: 'must-not-use-legacy' }, stdout: 'pipe', stderr: 'pipe',
       })
@@ -64,7 +45,7 @@ describe('lodestar-agent CLI args', () => {
   })
 
   test('rejects malformed DSH context without using legacy credentials', () => {
-    const proc = Bun.spawnSync([process.execPath, join(import.meta.dir, 'agent-cli.ts'), 'identities'], {
+    const proc = Bun.spawnSync([process.execPath, CLI, 'agent', 'identities'], {
       env: { ...process.env, DSH_LODESTAR_AGENT_CONTEXT: '{}', LODESTAR_AGENT_URL: 'http://127.0.0.1:1', LODESTAR_AGENT_CAPABILITY: 'legacy' },
     })
     expect(proc.exitCode).not.toBe(0)
@@ -75,13 +56,13 @@ describe('lodestar-agent CLI args', () => {
     expect(parsePromptArgs([
       '--description', '任务说明', '--identity', 'a', '--identity', 'b', '--identity', 'a', '--effort', 'max', '--stdin', '--no-wait',
     ], true)).toEqual({
-      description: '任务说明', identityIds: ['a', 'b'], identityId: '', sessionId: '', workDir: '', evidenceDir: '', effort: 'max', prompt: '', noWait: true, readStdin: true, json: false,
+      description: '任务说明', identityIds: ['a', 'b'], identityId: '', sessionId: '', workDir: '', evidenceDir: '', effort: 'max', prompt: '', noWait: true, readStdin: true, json: false, card: false,
     })
   })
 
   test('parses a single-session follow-up', () => {
     expect(parsePromptArgs(['--description', '任务说明', '--identity', 'a', 'continue here'], false)).toEqual({
-      description: '任务说明', identityIds: [], identityId: 'a', sessionId: '', workDir: '', evidenceDir: '', effort: '', prompt: 'continue here', noWait: false, readStdin: false, json: false,
+      description: '任务说明', identityIds: [], identityId: 'a', sessionId: '', workDir: '', evidenceDir: '', effort: '', prompt: 'continue here', noWait: false, readStdin: false, json: false, card: false,
     })
   })
 
@@ -100,9 +81,18 @@ describe('lodestar-agent CLI args', () => {
     expect(() => parsePromptArgs(['task'], true)).toThrow('--identity')
   })
 
+  test('parses the explicit card flag for runs and follow-ups', () => {
+    expect(parsePromptArgs(['--description', '任务说明', '--identity', 'a', '--card', '--prompt', 'work'], true))
+      .toMatchObject({ card: true })
+    expect(parsePromptArgs(['--description', '任务说明', '--card', '--prompt', 'work'], false))
+      .toMatchObject({ card: true })
+    expect(parsePromptArgs(['--description', '任务说明', '--identity', 'a', '--prompt', 'work'], true))
+      .toMatchObject({ card: false })
+  })
+
   test('accepts session continuation without a new identity and rejects ambiguous session options', () => {
     expect(parsePromptArgs(['--description', '任务说明', '--session', 'sid', '--prompt', 'next turn', '--json'], true)).toEqual({
-      description: '任务说明', identityIds: [], identityId: '', sessionId: 'sid', workDir: '', evidenceDir: '', effort: '', prompt: 'next turn', noWait: false, readStdin: false, json: true,
+      description: '任务说明', identityIds: [], identityId: '', sessionId: 'sid', workDir: '', evidenceDir: '', effort: '', prompt: 'next turn', noWait: false, readStdin: false, json: true, card: false,
     })
     expect(() => parsePromptArgs(['--session', 'sid', '--identity', 'a', '--identity', 'b'], true)).toThrow('at most one')
     expect(() => parsePromptArgs(['--session', 'sid', '--session', 'other'], true)).toThrow('only be specified once')
@@ -138,7 +128,7 @@ describe('lodestar-agent CLI args', () => {
       return Response.json(current)
     } })
     const invoke = async (...args: string[]) => {
-      const proc = Bun.spawn([process.execPath, join(import.meta.dir, 'agent-cli.ts'), ...args], {
+      const proc = Bun.spawn([process.execPath, CLI, 'agent', ...args], {
         env: { ...process.env, DSH_LODESTAR_AGENT_CONTEXT: JSON.stringify({
           baseUrl: `http://127.0.0.1:${server.port}`, capability: 'cli-test-capability',
         }) }, stdout: 'pipe', stderr: 'pipe',
@@ -164,7 +154,7 @@ describe('lodestar-agent CLI args', () => {
       expect(third.code, third.stderr).toBe(0)
       expect(third.stdout).toContain('Session: native-sid')
       expect(third.stdout).toContain('Work directory: packages/app')
-      expect(third.stdout).toContain("lodestar-agent run --session 'native-sid' --identity 'agent:a' --description '<brief next step>' --stdin")
+      expect(third.stdout).toContain("lodestar agent run --session 'native-sid' --identity 'agent:a' --description '<brief next step>' --stdin")
       expect(requests).toEqual([
         { description: '任务说明', identity_ids: ['agent:a'], work_dir: 'packages/app', prompt: 'first' },
         { description: '任务说明', identity_ids: [], session_id: 'native-sid', prompt: '  第二轮\n' },
@@ -185,7 +175,7 @@ describe('lodestar-agent host env', () => {
   const CONTEXT_KEYS = ['LODESTAR_AGENT_URL', 'LODESTAR_AGENT_CAPABILITY', 'DSH_LODESTAR_AGENT_CONTEXT'] as const
 
   test('main refuses missing URL or capability', async () => {
-    const { main } = await import('./agent-cli')
+    const { main } = await import('./agent-main')
     const saved = new Map(CONTEXT_KEYS.map(key => [key, process.env[key]]))
     for (const key of CONTEXT_KEYS) delete process.env[key]
     try {
@@ -205,7 +195,7 @@ describe('lodestar-agent DSH delegation context', () => {
   const LEGACY_CAPABILITY = 'LODESTAR_AGENT_CAPABILITY'
 
   const runCli = async (args: string[], env: Record<string, string | undefined>) => {
-    const proc = Bun.spawn([process.execPath, join(import.meta.dir, 'agent-cli.ts'), ...args], {
+    const proc = Bun.spawn([process.execPath, join(import.meta.dir, '..', 'cli.ts'), 'agent', ...args], {
       env: { ...process.env, ...env }, stdout: 'pipe', stderr: 'pipe',
     })
     const [code, stdout, stderr] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()])
@@ -270,7 +260,7 @@ describe('lodestar-agent DSH delegation context', () => {
       [DSH_CONTEXT]: undefined, [LEGACY_URL]: undefined, [LEGACY_CAPABILITY]: undefined,
     })
     expect(missing.code).not.toBe(0)
-    expect(missing.stderr).toContain('lodestar-agent must run inside a Lodestar-managed Agent session (missing capability)')
+    expect(missing.stderr).toContain('lodestar agent must run inside a Lodestar-managed Agent session (missing capability)')
   })
 })
 
@@ -278,19 +268,21 @@ describe('lodestar-agent main-module guard', () => {
   test('follows an npm-style symlink to the bundle for --help', () => {
     const dir = mkdtempSync(join(tmpdir(), 'lodestar-agent-cli-'))
     temps.push(dir)
-    const bundle = join(dir, 'lodestar-agent.js')
+    // 产物放在仓库 dist/ 下运行：--packages=external 的依赖要从上层的 node_modules 解析。
+    const bundle = join(import.meta.dir, '..', 'dist', `lodestar-guard-${process.pid}.js`)
+    temps.push(bundle)
     const built = spawnSync('bun', [
-      'build', 'src/agent-cli.ts', '--target=node', '--outfile', bundle,
+      'build', 'cli.ts', '--target=node', '--packages=external', '--outfile', bundle,
     ], { cwd: join(import.meta.dir, '..'), encoding: 'utf8' })
-    expect(built.status).toBe(0)
-    const shim = join(dir, 'lodestar-agent')
+    expect(built.status, built.stderr).toBe(0)
+    const shim = join(dir, 'lodestar')
     symlinkSync(bundle, shim)
-    const viaShim = spawnSync('node', [shim, '--help'], { encoding: 'utf8' })
+    const viaShim = spawnSync('node', [shim, 'agent', '--help'], { encoding: 'utf8' })
     expect(viaShim.status).toBe(0)
     expect(viaShim.stdout).toContain('Usage:')
     const viaBundle = spawnSync('node', [bundle, '--help'], { encoding: 'utf8' })
     expect(viaBundle.status).toBe(0)
-    expect(viaBundle.stdout).toContain('Usage:')
+    expect(viaBundle.stdout).toContain('用法:')
   })
 })
 
@@ -313,7 +305,7 @@ test('explicit project CLI uses the private daemon endpoint and preserves projec
   const env = { ...process.env, LODESTAR_DATA_DIR: dir, LODESTAR_AGENT_ROLE: undefined, DSH_LODESTAR_AGENT_CONTEXT: undefined,
     LODESTAR_AGENT_URL: undefined, LODESTAR_AGENT_CAPABILITY: undefined }
   const exec = async (args: string[], extra = {}) => {
-    const proc = Bun.spawn([process.execPath, join(import.meta.dir, 'agent-cli.ts'), ...args], {
+    const proc = Bun.spawn([process.execPath, CLI, 'agent', ...args], {
       env: { ...env, ...extra }, stdout: 'pipe', stderr: 'pipe',
     })
     const [code, out, error] = await Promise.all([proc.exited, new Response(proc.stdout).text(), new Response(proc.stderr).text()])
@@ -324,7 +316,7 @@ test('explicit project CLI uses the private daemon endpoint and preserves projec
     writeFileSync(join(dir, 'agent-operator-client.json'), JSON.stringify({ baseUrl: `http://127.0.0.1:${server.port}`, capability: 'test-operator-key' }))
     const result = await exec(['run', '--project', 'repo', '--identity', 'agent:a', '--description', '任务', '--prompt', '--project', '--request-id', 'job-1'])
     expect(result.code, result.error).toBe(0)
-    expect(result.out).toContain("lodestar-agent --project 'repo' run --session 'native'")
+    expect(result.out).toContain("lodestar agent --project 'repo' run --session 'native'")
     expect(requests[0]).toMatchObject({ token: 'Bearer test-project-key', body: { prompt: '--project', request_id: 'job-1' } })
     expect(new URL(requests[0].url).searchParams.get('project')).toBe('repo')
     const jsonStatus = await exec(['--project', 'repo', 'status', 'agent_cli_project', '--json'])
@@ -339,6 +331,12 @@ test('explicit project CLI uses the private daemon endpoint and preserves projec
       expected_binding: 'binding-1', stopped: true, reason: 'operator verified native work stopped',
     } })
     expect(requests.at(-1)?.token).toBe('Bearer test-operator-key')
+    // External project calls carry no display field unless --card is passed (daemon default: silent).
+    expect(requests[0].body.display).toBeUndefined()
+    const carded = await exec(['run', '--project', 'repo', '--identity', 'agent:a', '--description', '任务', '--prompt', 'card', '--request-id', 'job-2', '--card'])
+    expect(carded.code, carded.error).toBe(0)
+    const cardPost = requests.find(item => item.body?.prompt === 'card')
+    expect(cardPost).toMatchObject({ body: { prompt: 'card', request_id: 'job-2', display: 'card' } })
     const answer = await exec(['--project', 'repo', 'answer', 'agent_cli_project', '--request', 'q', '--stdin'])
     expect(answer.code).toBe(1)
     expect(answer.error).toContain('non-interactive')
@@ -360,9 +358,10 @@ test('explicit project CLI uses the private daemon endpoint and preserves projec
       '--expected-binding', 'binding-1', '--stopped', '--reason', 'operator stop'], { LODESTAR_AGENT_ROLE: 'worker' })
     expect(managedReconcile.code).toBe(1)
     expect(managedReconcile.error).toContain('must remain session-bound')
-    expect(requests).toHaveLength(4)
+    expect(requests).toHaveLength(6)
+    expect(requests.filter(item => item.body)).toHaveLength(3)
     const duplicate = await exec(['--project', 'repo', 'identities', '--project', 'repo'])
-    expect(duplicate.code).toBe(1)
+    expect(duplicate.code).toBe(2)
     expect(duplicate.error).toContain('only be specified once')
   } finally {
     await server.stop(true)

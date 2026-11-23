@@ -1,9 +1,8 @@
-import { realpathSync } from 'node:fs'
-import { resolve } from 'node:path'
-import { fileURLToPath } from 'node:url'
 import { localFetch } from './network'
 import { requireAgentDescription, PROJECT_AGENT_INPUT_ERROR } from './agent-run-types'
 import { readAgentOperatorClient, readAgentProjectClient } from './agent-project-client'
+import { HelpRequest, UsageError } from './cli-errors'
+import { lodestarVersion } from './version'
 
 interface CliContext {
   baseUrl: string
@@ -25,9 +24,15 @@ interface PromptArgs {
   noWait: boolean
   readStdin: boolean
   json: boolean
+  /** Project calls render no card unless this flag is set. */
+  card: boolean
 }
 
 export async function main(argv = process.argv.slice(2)): Promise<void> {
+  if (argv[0] === '--version' || argv[0] === '-V') {
+    process.stdout.write(`${lodestarVersion()}\n`)
+    return
+  }
   const selected = extractProjectOption(argv)
   argv = selected.argv
   const command = argv.shift() ?? ''
@@ -35,6 +40,9 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
     process.stdout.write(`${usage()}\n`)
     return
   }
+  // 子命令帮助要在读取会话上下文之前返回，否则 `lodestar agent run --help`
+  // 会先因缺少受管上下文而失败。
+  if (argv[0] === '--help' || argv[0] === '-h') throw new HelpRequest(usage())
   const context = command === 'requests' ? operatorCliContext(selected.project) : cliContext(selected.project)
   switch (command) {
     case 'identities': {
@@ -69,7 +77,7 @@ export async function main(argv = process.argv.slice(2)): Promise<void> {
       return
     }
     default:
-      throw new Error(usage())
+      throw new UsageError(usage())
   }
 }
 
@@ -86,6 +94,7 @@ async function runCommand(context: CliContext, argv: string[]): Promise<void> {
     ...(parsed.evidenceDir ? { evidence_dir: parsed.evidenceDir } : {}),
     ...(parsed.requestId ? { request_id: parsed.requestId } : {}),
     ...(parsed.requesterOpenId ? { requester_open_id: parsed.requesterOpenId } : {}),
+    ...(parsed.card ? { display: 'card' } : {}),
   }
   const started = await requestJson(context, 'POST', '/agents/runs', body)
   await presentStartedRun(context, started, parsed.noWait, parsed.json)
@@ -104,6 +113,7 @@ async function followUpCommand(context: CliContext, argv: string[]): Promise<voi
     ...(parsed.evidenceDir ? { evidence_dir: parsed.evidenceDir } : {}),
     ...(parsed.requestId ? { request_id: parsed.requestId } : {}),
     ...(parsed.requesterOpenId ? { requester_open_id: parsed.requesterOpenId } : {}),
+    ...(parsed.card ? { display: 'card' } : {}),
   }
   const started = await requestJson(context, 'POST', `/agents/runs/${encodeURIComponent(runId)}/follow-up`, body)
   await presentStartedRun(context, started, parsed.noWait, parsed.json)
@@ -125,24 +135,25 @@ async function answerCommand(context: CliContext, argv: string[]): Promise<void>
       case '--answer': {
         const pair = next()
         const split = pair.indexOf('=')
-        if (split <= 0) throw new Error('--answer must be question-or-id=value')
+        if (split <= 0) throw new UsageError('--answer must be question-or-id=value')
         answers[pair.slice(0, split)] = pair.slice(split + 1)
         break
       }
       case '--stdin': readStdinFlag = true; break
-      default: throw new Error(`unknown answer option: ${arg}`)
+      case '--help': case '-h': throw new HelpRequest(usage())
+      default: throw new UsageError(`unknown answer option: ${arg}`)
     }
   }
   if (readStdinFlag) {
     const raw = (await readStdin()).trim()
     let parsed: unknown
     try { parsed = JSON.parse(raw) }
-    catch { throw new Error('answer stdin must be a JSON object') }
-    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('answer stdin must be a JSON object')
+    catch { throw new UsageError('answer stdin must be a JSON object') }
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new UsageError('answer stdin must be a JSON object')
     for (const [key, value] of Object.entries(parsed as Record<string, unknown>)) answers[key] = String(value)
   }
-  if (!requestId) throw new Error('answer requires --request')
-  if (Object.keys(answers).length === 0) throw new Error('answer requires --answer or --stdin')
+  if (!requestId) throw new UsageError('answer requires --request')
+  if (Object.keys(answers).length === 0) throw new UsageError('answer requires --answer or --stdin')
   const run = await requestJson(context, 'POST', `/agents/runs/${encodeURIComponent(runId)}/answer`, {
     request_id: requestId,
     answers,
@@ -186,12 +197,18 @@ async function requestsCommand(context: CliContext, argv: string[]): Promise<voi
 
 export function parsePromptArgs(argv: string[], identitiesRequired: boolean): PromptArgs {
   const out: PromptArgs = {
-    identityIds: [], identityId: '', sessionId: '', workDir: '', evidenceDir: '', effort: '', description: '', prompt: '', noWait: false, readStdin: false, json: false,
+    identityIds: [], identityId: '', sessionId: '', workDir: '', evidenceDir: '', effort: '', description: '', prompt: '',
+    noWait: false, readStdin: false, json: false, card: false,
   }
   const positional: string[] = []
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
     const next = () => requiredArg(argv[++i], `${arg} requires a value`)
+    // `--` 之后的全部内容按位置参数处理，供正文以 `-` 开头时透传。
+    if (arg === '--') {
+      positional.push(...argv.slice(i + 1))
+      break
+    }
     switch (arg) {
       case '--identity': case '-i':
         if (identitiesRequired) out.identityIds.push(next())
@@ -199,36 +216,42 @@ export function parsePromptArgs(argv: string[], identitiesRequired: boolean): Pr
         break
       case '--effort': out.effort = next(); break
       case '--request-id':
-        if (out.requestId) throw new Error('--request-id may only be specified once')
+        if (out.requestId) throw new UsageError('--request-id may only be specified once')
         out.requestId = next(); break
       case '--requester':
-        if (out.requesterOpenId) throw new Error('--requester may only be specified once')
+        if (out.requesterOpenId) throw new UsageError('--requester may only be specified once')
         out.requesterOpenId = next(); break
       case '--description': out.description = next(); break
       case '--workdir':
-        if (out.workDir) throw new Error('--workdir may only be specified once')
+        if (out.workDir) throw new UsageError('--workdir may only be specified once')
         next(); out.workDir = argv[i]!; break
       case '--evidence-dir':
         if (out.evidenceDir) throw new Error('--evidence-dir may only be specified once')
         next(); out.evidenceDir = argv[i]!; break
       case '--session':
-        if (!identitiesRequired) throw new Error('--session is only supported by run; follow-up accepts a run_id')
-        if (out.sessionId) throw new Error('--session may only be specified once')
+        if (!identitiesRequired) throw new UsageError('--session is only supported by run; follow-up accepts a run_id')
+        if (out.sessionId) throw new UsageError('--session may only be specified once')
         out.sessionId = next()
         break
       case '--prompt': next(); out.prompt = argv[i]!; break
       case '--stdin': out.readStdin = true; break
       case '--no-wait': out.noWait = true; break
+      case '--card': out.card = true; break
       case '--json': out.json = true; break
+      case '--help': case '-h': throw new HelpRequest(usage())
       default:
-        if (arg.startsWith('-')) throw new Error(`unknown option: ${arg}`)
+        if (arg.startsWith('-')) throw new UsageError(`unknown option: ${arg}`)
         positional.push(arg)
     }
   }
   out.identityIds = [...new Set(out.identityIds)]
-  if (out.sessionId && out.identityIds.length > 1) throw new Error('--session accepts at most one --identity')
-  if (identitiesRequired && !out.sessionId && out.identityIds.length === 0) throw new Error('run requires at least one --identity')
-  out.description = requireAgentDescription(out.description)
+  if (out.sessionId && out.identityIds.length > 1) throw new UsageError('--session accepts at most one --identity')
+  if (identitiesRequired && !out.sessionId && out.identityIds.length === 0) throw new UsageError('run requires at least one --identity')
+  try {
+    out.description = requireAgentDescription(out.description)
+  } catch (error) {
+    throw new UsageError(error instanceof Error ? error.message : String(error))
+  }
   if (!out.prompt && positional.length) out.prompt = positional.join(' ')
   if (!out.prompt) out.readStdin = true
   return out
@@ -237,7 +260,7 @@ export function parsePromptArgs(argv: string[], identitiesRequired: boolean): Pr
 async function resolvePrompt(parsed: PromptArgs): Promise<string> {
   const stdin = parsed.readStdin ? await readStdin() : ''
   const prompt = parsed.prompt || stdin
-  if (!prompt.trim()) throw new Error('agent prompt is empty')
+  if (!prompt.trim()) throw new UsageError('agent prompt is empty')
   return prompt
 }
 
@@ -259,7 +282,7 @@ async function waitAndPrintRun(context: CliContext, runId: string, json = false)
     cancelling = true
     void requestJson(context, 'DELETE', `/agents/runs/${encodeURIComponent(runId)}`)
       .then(() => process.exit(130), error => {
-        process.stderr.write(`lodestar-agent: cancellation failed: ${messageOf(error)}\n`)
+        process.stderr.write(`lodestar agent: cancellation failed: ${messageOf(error)}\n`)
         process.exit(1)
       })
   }
@@ -288,8 +311,13 @@ export function extractProjectOption(argv: string[]): { project?: string; argv: 
     '--request', '--answer', '--request-id', '--requester', '--expected-binding', '--reason'])
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i]
+    // `--` 之后保持原样交给子命令解析，避免把正文里的 --project 当成全局选项。
+    if (arg === '--') {
+      remaining.push(...argv.slice(i))
+      break
+    }
     if (arg === '--project') {
-      if (project !== undefined) throw new Error('--project may only be specified once')
+      if (project !== undefined) throw new UsageError('--project may only be specified once')
       project = requiredArg(argv[++i], '--project requires a project name')
     } else {
       remaining.push(arg)
@@ -325,7 +353,7 @@ function cliContext(project?: string): CliContext {
   const baseUrl = String(process.env.LODESTAR_AGENT_URL ?? '').replace(/\/+$/, '')
   const capability = String(process.env.LODESTAR_AGENT_CAPABILITY ?? '')
   if (!baseUrl || !capability) {
-    throw new Error('lodestar-agent must run inside a Lodestar-managed Agent session (missing capability)')
+    throw new Error('lodestar agent must run inside a Lodestar-managed Agent session (missing capability)')
   }
   return { baseUrl, capability }
 }
@@ -384,7 +412,7 @@ function printRun(run: any, json: boolean): void {
 }
 
 function formatRun(run: any): string {
-  const command = `lodestar-agent${run.binding === 'project' ? ` --project ${shellQuote(String(run.project))}` : ''}`
+  const command = `lodestar agent${run.binding === 'project' ? ` --project ${shellQuote(String(run.project))}` : ''}`
   const lines = [
     `# Lodestar agent ${run.run_id ?? 'MISS'}`,
     '',
@@ -394,6 +422,7 @@ function formatRun(run: any): string {
     `- Description: ${run.description ?? 'MISS'}`,
     `- Work directory: ${run.work_dir ?? 'MISS'}`,
     ...(run.parent_run_id ? [`- Parent: ${run.parent_run_id} (${run.parent_kind ?? 'delegate'})`] : []),
+    ...(run.display === 'silent' ? ['- Display: silent (no group card)'] : []),
   ]
   if (run.error) lines.push(`- Error: ${run.error}`)
   for (const worker of run.workers ?? []) {
@@ -438,22 +467,22 @@ async function readStdin(): Promise<string> {
 }
 
 function requiredArg(value: string | undefined, message: string): string {
-  if (!value?.trim()) throw new Error(message)
+  if (!value?.trim()) throw new UsageError(message)
   return value.trim()
 }
 
-function usage(): string {
+export function usage(): string {
   return [
     'Usage:',
-    '  lodestar-agent --project <project-or-worktree> <command> [options]',
-    '  lodestar-agent identities [--json]',
-    '  lodestar-agent run --identity <id> [--identity <id>...] --description <summary> [--workdir <path>] [--evidence-dir <path>] [--effort <level>] [--json] --stdin',
-    '  lodestar-agent run --session <session_id> [--identity <id>] --description <summary> [--workdir <path>] [--evidence-dir <path>] [--effort <level>] [--json] --stdin',
-    '  lodestar-agent follow-up <run_id> [--identity <id>] --description <summary> [--workdir <path>] [--evidence-dir <path>] [--effort <level>] [--json] --stdin',
-    '  lodestar-agent answer <run_id> [--identity <id>] --request <id> (--answer key=value | --stdin)',
-    '  lodestar-agent status <run_id> [--json]',
-    '  lodestar-agent cancel <run_id>',
-    '  lodestar-agent --project <project> requests reconcile --request <id> --expected-binding <id> --stopped --reason <text> [--json]',
+    '  lodestar agent --project <project-or-worktree> <command> [options]',
+    '  lodestar agent identities [--json]',
+    '  lodestar agent run --identity <id> [--identity <id>...] --description <summary> [--workdir <path>] [--evidence-dir <path>] [--effort <level>] [--card] [--json] --stdin',
+    '  lodestar agent run --session <session_id> [--identity <id>] --description <summary> [--workdir <path>] [--evidence-dir <path>] [--effort <level>] [--card] [--json] --stdin',
+    '  lodestar agent follow-up <run_id> [--identity <id>] --description <summary> [--workdir <path>] [--evidence-dir <path>] [--effort <level>] [--card] [--json] --stdin',
+    '  lodestar agent answer <run_id> [--identity <id>] --request <id> (--answer key=value | --stdin)',
+    '  lodestar agent status <run_id> [--json]',
+    '  lodestar agent cancel <run_id>',
+    '  lodestar agent --project <project> requests reconcile --request <id> --expected-binding <id> --stopped --reason <text> [--json]',
     '',
     'Claude subscription (claude-sub) Agent runs: at most 4 concurrent overall and 2 per account by default ([agent] claude_sub_max_concurrent / claude_sub_max_per_account in config.toml, or LODESTAR_CLAUDE_SUB_MAX_CONCURRENT / LODESTAR_CLAUDE_SUB_MAX_PER_ACCOUNT).',
     'The account is picked at admission by quota (5h used >= 80% or weekly >= 90% is excluded) and kept for the whole run; when no account can take it the run is rejected with CLAUDE_SUB_FULL (use another identity such as Codex Sol).',
@@ -464,6 +493,8 @@ function usage(): string {
     'Agent task calls must use the managed-session context. --project is only for independent services and applications.',
     'Without --project, the existing managed-session context is required; invalid contexts never switch modes.',
     'Project run/follow-up: --request-id <unique-key> deduplicates retries; --requester <open_id> records the requester only.',
+    'Project calls render no card by default; add --card to post the independent 项目任务 card in the bound conversation.',
+    'Session-bound delegation always renders its card; --card is a no-op there and silent display is rejected.',
     'Project calls are non-interactive and never wait for answers. The answer command is only for session-bound delegation.',
     'Agent results and local artifact paths return to the caller. File-delivery markers are not executed.',
     '--session resumes the unique native session ID only within its registered project and conversation ID (chat_id).',
@@ -473,7 +504,7 @@ function usage(): string {
     '--workdir defaults to the managed-session or explicit-project directory; relative paths are resolved from it.',
     'New conversations and resumes stay within that project root. Resumes otherwise reuse the recorded directory.',
     'session_id is the stable native session ID, distinct from the binding conversation ID (chat_id); run_id identifies one invocation.',
-    '--description is required for every run/follow-up: one short line, at most 60 characters, shown on the collapsed card.',
+    '--description is required for every run/follow-up: one short line, at most 60 characters, shown on the collapsed card when one is rendered.',
     'Each turn has a new run_id; workers[].session_id identifies the native Agent session.',
   ].join('\n')
 }
@@ -482,17 +513,12 @@ function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
 }
 
-function isMainModule(argv1: string | undefined): boolean {
-  if (!argv1) return false
-  let entry = resolve(argv1)
-  try { entry = realpathSync(argv1) } catch { /* dangling symlink / missing file */ }
-  return entry === fileURLToPath(import.meta.url)
-}
-
-// npm preserves the command symlink in argv[1]; compare the actual files.
-if (isMainModule(process.argv[1])) {
-  main().catch(error => {
-    process.stderr.write(`lodestar-agent: ${messageOf(error)}\n`)
-    process.exitCode = 1
-  })
+/** 统一入口与旧 bin 共用的错误出口：--help 走 stdout，用法错误退出 2。 */
+export function reportAgentError(error: unknown): void {
+  if (error instanceof HelpRequest) {
+    process.stdout.write(error.text.endsWith('\n') ? error.text : `${error.text}\n`)
+    return
+  }
+  process.stderr.write(`lodestar agent: ${messageOf(error)}\n`)
+  process.exitCode = error instanceof UsageError ? 2 : 1
 }

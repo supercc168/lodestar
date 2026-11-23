@@ -5,7 +5,8 @@ import { codexCreditsSummary, fmtCountdown } from './usage'
 
 // 额度明细：单聊面板（全部账号）与群里 hi（本项目账号）共用一套写法，以清晰为先。
 // - 一个账号一块：首行账号名，后面跟单值结果（余额、失败原因等）或账号级事实（积分、重置卡、凭据剩余）。
-// - 每个额度窗口单独一行：`名称　进度条 已用%　N 后重置`；距重置与凭据共用 fmtCountdown（m / 一位小数的 h、d）。
+// - 每个额度窗口单独一行：`名称　进度条 已用%　N`；距重置与凭据共用 fmtCountdown（m / 一位小数的 h、d），
+//   倒计时后不再跟「后重置」。
 // - 整窗未知只写一次 MISS；已用已知而重置时间未知写「重置时间 MISS」；GLM 月工具只显示百分比。
 // - 积分、重置卡确认为零时省略，未知写 MISS；金额符号紧贴数字，与回复 footer 一致。
 // - 颜色只看显示值（百分比、进度条与凭据倒计时），同一文案颜色不变。
@@ -67,10 +68,10 @@ function resetText(window: UsageWindowUnified): string | null {
   const date: unknown = window.resetsAt
   if (!(date instanceof Date) || !Number.isFinite(date.getTime())) return null
   const remaining = date.getTime() - Date.now()
-  return remaining <= 0 ? '已重置' : `${fmtCountdown(remaining)} 后重置`
+  return remaining <= 0 ? '已重置' : fmtCountdown(remaining)
 }
 
-/** 一个窗口一行：`5h　▰▰▱▱▱▱ 34%　4.1h 后重置`。整窗未知只写一次 MISS，所以 `名称　MISS` 只表示什么都不知道。 */
+/** 一个窗口一行：`5h　▰▰▱▱▱▱ 34%　4.1h`。整窗未知只写一次 MISS，所以 `名称　MISS` 只表示什么都不知道。 */
 function windowLine(window: UsageWindowUnified): string {
   const label = escape(windowLabel(window))
   const shown = shownPercent(window.percent)
@@ -110,10 +111,12 @@ function resetCardCount(count: unknown): string {
 
 /** 一个账号的额度明细。 */
 export interface AccountUsageDetail {
-  /** 与账号名同一行：单值结果（余额、令牌额度、失败原因、加载中、无额度查询），或积分、重置卡、凭据等账号级事实；可能为空。 */
+  /** 与账号名同一行：单值结果（余额、令牌额度、加载中、无额度查询），或积分、重置卡、凭据等账号级事实；可能为空。失败只写 `MISS`。 */
   summary: string
   /** 每个额度窗口一行；单值结果时为空。 */
   windows: string[]
+  /** 读取失败时的完整原因，供默认折叠的错误详情使用；正常、加载中与不适用时为 undefined。 */
+  error?: string
 }
 
 /** 额度快照里有中转站脚本原样转入的数据：任何格式问题都只让这一个账号显示 MISS，不能让整个面板生成失败。 */
@@ -121,7 +124,7 @@ export function accountUsageDetail(snapshot: UsageSnapshotUnified | undefined): 
   try {
     return usageDetail(snapshot)
   } catch {
-    return { summary: "<font color='red'>MISS · 额度数据格式无效</font>", windows: [] }
+    return { summary: "<font color='red'>MISS</font>", windows: [], error: '额度数据格式无效' }
   }
 }
 
@@ -133,7 +136,8 @@ function usageDetail(snapshot: UsageSnapshotUnified | undefined): AccountUsageDe
     const reason = snapshot.state === 'no_credentials' ? '未登录或未配置'
       : snapshot.state === 'rate_limited' ? 'API 限频'
       : String(snapshot.reason ?? '查询失败').replace(/^Claude 原生额度接口未返回 rate_limits 数据$/, '原生接口未返回额度')
-    return single(`<font color='red'>MISS · ${escape(reason.slice(0, 100))}</font>`)
+    // 行内只留 MISS：原因放进默认折叠的错误详情，长错误不挤坏版面。
+    return { summary: "<font color='red'>MISS</font>", windows: [], error: reason.slice(0, 300) }
   }
   if (snapshot.kind === 'balance') {
     return single(`余额 ${snapshot.balance ? money(snapshot.balance.remaining, snapshot.balance.currency) : 'MISS'}`)
@@ -152,6 +156,11 @@ function usageDetail(snapshot: UsageSnapshotUnified | undefined): AccountUsageDe
   if (snapshot.resetCredits !== undefined && snapshot.resetCredits !== 0) facts.push(`重置卡 ${resetCardCount(snapshot.resetCredits)}`)
   if (snapshot.credentialExpiresAt !== undefined) facts.push(credentialFact(snapshot.credentialExpiresAt))
   return { summary: facts.join(' · '), windows }
+}
+
+/** 失败原因（供折叠的错误详情）；正常、加载中或不适用时为 null。 */
+export function accountUsageError(snapshot: UsageSnapshotUnified | undefined): string | null {
+  return accountUsageDetail(snapshot).error ?? null
 }
 
 /** 群里 hi 的本项目账号（账号名已在上方）：摘要在前，其后每个窗口一行。 */

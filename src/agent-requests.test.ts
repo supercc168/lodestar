@@ -254,7 +254,8 @@ describe('project request binding and cancellation fence', () => {
     })
     const principal = h.service.projectPrincipal(context())
     const binding = h.service.getProjectBinding(principal).binding_id
-    const admitting = h.service.startRun(principal, request('lost-response'), binding)
+    // 项目调用默认静默、不开卡；这里要验证「开卡期间被取消」的创建栅栏，显式要求建卡。
+    const admitting = h.service.startRun(principal, { ...request('lost-response'), display: 'card' }, binding)
     await cardEntered
     const cancelling = h.service.cancelRequest(principal, 'lost-response', binding)
     release()
