@@ -248,10 +248,10 @@ export async function runCommand(
         const needsStart = !s.isRunning()
         const backend = s.backendLabel()
         const statusCard = needsStart
-          ? await s.openStatusCard('hi', s.withModel(`🚀 启动 ${backend}`))
+          ? await s.openStatusCard('hi', s.withModelAndAccount(`🚀 启动 ${backend}`, null))
           : null
         if (!s.ownsLifecycle(lease)) return true
-        let lastStatus = s.withModel(`🚀 启动 ${backend}`)
+        let lastStatus = s.withModelAndAccount(`🚀 启动 ${backend}`, null)
         const ok = needsStart
           ? await s.start({
               announce: !statusCard,
@@ -268,7 +268,7 @@ export async function runCommand(
           return true
         }
         if (s.proc?.turnRetry?.reason === 'quota') {
-          const waiting = '⏳ 等待额度恢复 · 可用后自动启动，stop 可取消'
+          const waiting = s.withModelAndAccount('⏳ 等待额度恢复 · 可用后自动启动，stop 可取消', s.proc)
           if (statusCard) await s.closeStatusCard(statusCard, waiting)
           else {
             const { codexAccountCard } = await import('./cards/codex-account')
@@ -282,14 +282,14 @@ export async function runCommand(
         if (statusCard) {
           await s.replaceStatusCardWithConsole(
             statusCard,
-            s.withModel(s.withWorktreeInstructionNotice(`✅ ${s.backendLabel()} 已就绪`)),
+            s.withModelAndAccount(s.withWorktreeInstructionNotice(`✅ ${s.backendLabel()} 已就绪`)),
           )
           return true
         }
         if (needsStart) {
           await s.closeStatusCard(
             statusCard,
-            s.withModel(s.withWorktreeInstructionNotice(`✅ ${s.backendLabel()} 已就绪`)),
+            s.withModelAndAccount(s.withWorktreeInstructionNotice(`✅ ${s.backendLabel()} 已就绪`)),
           )
         }
         if (s.ownsLifecycle(lease)) await s.showConsole()
@@ -479,10 +479,10 @@ export async function runCommand(
         const resumeThreadLabel = s.lastSessionId ? diagnosticIdLabel(s.lastSessionId) : ''
         const backend = s.backendLabel(s.proc?.provider ?? s.currentProvider())
         const initialStatus = s.isRunning()
-          ? s.withModel(`🔁 重启 ${backend}`)
+          ? s.withModelAndAccount(`🔁 重启 ${backend}`, null)
           : resumeThreadLabel
-            ? s.withModel(`🔁 恢复上一会话 thread=${resumeThreadLabel}`)
-            : s.withModel(`🔁 启动 ${backend}`)
+            ? s.withModelAndAccount(`🔁 恢复上一会话 thread=${resumeThreadLabel}`, null)
+            : s.withModelAndAccount(`🔁 启动 ${backend}`, null)
         const statusCard = await s.openStatusCard('restart', initialStatus)
         if (!s.ownsLifecycle(lease)) return true
         await s.cancelAgentRuns('restart command')
@@ -500,10 +500,10 @@ export async function runCommand(
             ? (
                 lastStatus.startsWith('✅')
                   ? lastStatus
-                  : s.withWorktreeInstructionNotice(resumeThreadLabel ? '✅ 已恢复上一会话' : `✅ ${s.backendLabel()} 已就绪`)
+                  : s.withModelAndAccount(s.withWorktreeInstructionNotice(resumeThreadLabel ? '✅ 已恢复上一会话' : `✅ ${s.backendLabel()} 已就绪`))
               )
             : (lastStatus.startsWith('❌') ? lastStatus : '❌ 重启失败')
-        await s.closeStatusCard(statusCard, ok ? s.withModel(finalStatus) : finalStatus)
+        await s.closeStatusCard(statusCard, ok ? s.withModelAndAccount(finalStatus) : finalStatus)
         if (failure !== undefined && !statusCard) throw failure
       }
       return true
@@ -554,7 +554,7 @@ export async function runCommand(
           failure !== undefined
             ? `❌ 清空失败: ${messageOf(failure)}`
             : ok
-              ? s.withModel(s.withWorktreeInstructionNotice('✅ 已清空并启动新会话'))
+              ? s.withModelAndAccount(s.withWorktreeInstructionNotice('✅ 已清空并启动新会话'))
               : (lastStatus.startsWith('❌') ? lastStatus : '❌ 清空失败'),
         )
         if (failure !== undefined && !statusCard) throw failure

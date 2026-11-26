@@ -39,8 +39,19 @@ export interface TurnState {
   /** Input receipts and their card handoffs must settle before closing this turn.
    *  (上游) */
   steeringInflight?: Set<Promise<void>>
-  /** What kicked off this turn. Kept explicit for turn lifecycle logic. */
+  /** What kicked off this turn. Kept explicit for turn lifecycle logic.
+   *   'user_message'   — 用户消息批次
+   *   'bg_task_resume' — 后台任务结算后 SDK 自发的恢复轮(无用户消息;
+   *                      不开卡的话整轮正文会被丢弃)
+   *   'scheduled_wakeup' — Claude SDK Cron 定时唤醒轮
+   *   'watchdog_resume' — Codex turn watchdog 自动恢复轮 */
   trigger: TurnTrigger
+  /** 本卡在会话里的 turn 编号，重绘输入面板标题时用（`📥 收到 (N) #n`）。 */
+  turnNo?: number
+  /** 冷启动首轮「📥 收到 (N) 🚀」面板的输入原文与标题里的账号标注。进程就绪后
+   *  用实际分配结果重绘这块面板，其他 turn 不带账号标注。 */
+  userInputs?: string[]
+  userInputAccountLabel?: string
   /** TurnState object identity is the primary async-event fence; these
    * backend IDs add protocol-level matching so stale events from a prior
    * or recovered backend turn cannot mutate the active card. */

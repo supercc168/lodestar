@@ -40,7 +40,7 @@ import { logError, logDiagnostic } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { captureCodexUsageCache } from './usage'
 import { codexCreditsSummary } from './cards/usage'
-import { readCodexAccountUsage, readTokenSourceAccountUsage, type AccountUsage } from './account-usage'
+import { readCodexAccountUsage, readTokenSourceAccountUsage, tokenSourceUsageAccount, type AccountUsage } from './account-usage'
 import { claudeWeeklyUsageWindow } from './claude-usage'
 import { contextLimitFromAppServer, contextTokensFromUsage } from './context-window'
 import { extractSendMarkerPaths, normalizeOutboundPath, extractAskUsrMarkers, stripAskUsrMarkers } from './outbound-markers'
@@ -2080,6 +2080,86 @@ export class Session {
     return text.includes(label) ? text : `${text} · ${label}`
   }
 
+  /** 启动与恢复状态里标注的账号分配结果。`proc` 缺省取当前活进程；显式传 null 表示
+   *  这次启动还没选定（按显式指定或固定单账号来源展示，订阅池写「选号中」）。
+   *  只用于启动阶段文案，常规 turn footer 仍保持 `agent · 模型/effort`。 */
+  accountAssignmentLabel(proc?: AgentProcess | null): string | null {
+    const live = proc === undefined ? (this.proc?.isAlive() ? this.proc : null) : (proc?.isAlive() ? proc : null)
+    const provider = live?.provider ?? this.selectedProvider
+    const tokenSourceId = live?.tokenSourceId ?? this.selectedTokenSourceId
+    // A live process asks the registry for its own source; an unstarted one uses the
+    // Session's current source so tests and temporary-session routing overrides hold.
+    const source = live ? getTokenSource(tokenSourceId) : this.currentTokenSource()
+    try {
+      if (provider === 'claude') {
+        if (live) {
+          if (live.tokenSourceId === 'claude-sub') {
+            const account = processClaudeAccount(live)
+            return account ? `Claude·${claudeAccounts.get(account).name}` : 'Claude·选号中'
+          }
+          return source ? tokenSourceUsageAccount(source).label : null
+        }
+        if (tokenSourceId === 'claude-sub' || source?.kind === 'claude-subscription') {
+          return this.claudeStartAccountOverride
+            ? `Claude·${claudeAccounts.get(this.claudeStartAccountOverride).name}`
+            : 'Claude·选号中'
+        }
+        return source ? tokenSourceUsageAccount(source).label : null
+      }
+      if (provider === 'codex') {
+        if (live) {
+          if (source?.codexApiProvider) return tokenSourceUsageAccount(source).label
+          const account = boundCodexAccount(live)
+          if (account) return `Codex·${codexAccounts.get(account).name}`
+          return source?.kind === 'codex-subscription' || live.tokenSourceId === 'codex-sub'
+            ? 'Codex·选号中' : null
+        }
+        const preference = this.codexStartAccountOverride ?? codexAccounts.preferred(this.sessionName)
+        if (preference) return `Codex·${codexAccounts.get(preference).name}`
+        if (source?.codexApiProvider) return tokenSourceUsageAccount(source).label
+        if (source?.kind === 'codex-subscription' || tokenSourceId === 'codex-sub') return 'Codex·选号中'
+        return 'Codex·默认'
+      }
+      if (provider === 'dsh') return source ? tokenSourceUsageAccount(source).label : null
+      return null
+    } catch {
+      // 展示标签不能阻断启动；未知账号按未标注处理。
+      return null
+    }
+  }
+
+  /** 启动/恢复状态行：模型行后追加账号分配结果。若 `text` 已带账号段则替换它，
+   *  保证模型始终在账号之前、重绘不会叠出两个账号。 */
+  withModelAndAccount(
+    text: string,
+    proc?: AgentProcess | null,
+    selection?: Pick<TurnState, 'provider' | 'model' | 'effort'>,
+  ): string {
+    const marker = ' · 账号 '
+    const at = text.lastIndexOf(marker)
+    const base = at >= 0 ? text.slice(0, at) : text
+    const existing = at >= 0 ? text.slice(at) : ''
+    const withModel = this.withModel(base, selection)
+    const label = this.accountAssignmentLabel(proc)
+    return label ? `${withModel}${marker}${label}` : `${withModel}${existing}`
+  }
+
+  /** 冷启动首轮开卡时订阅池还没选出账号，标题先写「选号中」。进程就绪后用实际
+   *  分配结果重绘「📥 收到 (N) 🚀」，让卡片顶部一直显示这次启动用的账号。 */
+  private async refreshTurnInputAccount(turn: TurnState, proc: AgentProcess): Promise<void> {
+    const inputs = turn.userInputs
+    const label = this.accountAssignmentLabel(proc)
+    if (!inputs?.length || !label || label === turn.userInputAccountLabel) return
+    const landed = await cardkit.replaceElementChecked(
+      turn.cardId,
+      cards.ELEMENTS.userInput,
+      cards.userInputPanel(inputs, { turn: turn.turnNo ?? 0, directStart: true, accountLabel: label }),
+      { notifyCardFailure: false },
+    )
+    if (landed) turn.userInputAccountLabel = label
+    else logDiagnostic('session: startup account header write failed')
+  }
+
   private async replaceFooterContent(cardId: string, content: string): Promise<cardkit.CardWriteResult> {
     // Live timing is optional: Card Kit logs failures, and the timer pauses
     // without a user notice. Never mark the footer missing or rotate its card.
@@ -2987,7 +3067,7 @@ export class Session {
     if (this.proc && !this.proc.isAlive()) this.detachProc(this.proc)
     if (this.isRunning()) {
       if (this.proc?.provider === provider) {
-        report?.(this.withModel(`✅ ${this.backendLabel()} 已运行`))
+        report?.(this.withModelAndAccount(`✅ ${this.backendLabel()} 已运行`, this.proc))
         return true
       }
       await this.stopIdleMismatchedProcess(lease)
@@ -3043,7 +3123,7 @@ export class Session {
       this.resetFreshConversationState()
     }
     this.status = 'starting'
-    report?.(this.withModel(`🚀 启动 ${this.backendLabel()}`))
+    report?.(this.withModelAndAccount(`🚀 启动 ${this.backendLabel()}`, null))
     let proc: AgentProcess
     try {
       proc = this.spawnAgent(undefined, provider, lease)
@@ -3078,8 +3158,8 @@ export class Session {
       ? this.waitForProcEarlyFailure(proc, CLAUDE_STARTUP_GRACE_MS)
       : null
     report?.(this.selectedProvider === 'claude'
-      ? `⏳ 检查 ${backend} 启动`
-      : `⏳ 等待 ${backend} init`)
+      ? this.withModelAndAccount(`⏳ 检查 ${backend} 启动`, proc)
+      : this.withModelAndAccount(`⏳ 等待 ${backend} init`, proc))
     let initialization: Promise<void> | undefined
     let initializeThrown: unknown = null
     try {
@@ -3106,7 +3186,7 @@ export class Session {
         : await this.waitForCodexInitialization(
             this.requireCodexInitializationPromise(initialization),
             () => {
-              report?.(this.withModel(`⏳ 仍在等待 ${backend} init 确认`))
+              report?.(this.withModelAndAccount(`⏳ 仍在等待 ${backend} init 确认`, proc))
             },
           )
     if (!this.ownsLifecycle(lease) || this.proc !== proc) {
@@ -3166,13 +3246,13 @@ export class Session {
       this.status = 'starting'
       this.startedAt = Date.now()
       this.opts.onLifecycleChange?.()
-      report?.('⏳ 账号额度用尽 · 自动等待恢复，可用后继续')
+      report?.(this.withModelAndAccount('⏳ 账号额度用尽 · 自动等待恢复，可用后继续', proc))
       if (announce) await feishu.sendCard(this.chatId, codexAccountCard({ phase: 'checking', title: '等待额度恢复',
         message: '额度恢复后自动继续', hint: 'stop 可取消等待' }))
       return true
     }
     if (announce) {
-      const modelLine = this.modelLine()
+      const modelLine = this.withModelAndAccount(this.modelLine(), proc)
       await feishu.sendText(this.chatId, [
         this.withWorktreeInstructionNotice(`✅ Lodestar session "${this.sessionName}" 已就绪，发消息开始对话。`),
         modelLine,
@@ -3187,7 +3267,7 @@ export class Session {
     this.startedAt = Date.now()
     this.daemonRestoreRequired = false
     this.opts.onLifecycleChange?.()
-    report?.(this.withModel(this.withWorktreeInstructionNotice(`✅ ${this.backendLabel()} 已就绪`)))
+    report?.(this.withModelAndAccount(this.withWorktreeInstructionNotice(`✅ ${this.backendLabel()} 已就绪`), proc))
     return true
   }
 
@@ -3790,12 +3870,12 @@ export class Session {
         return false
       }
     }
-    let prevThreadLabel = prevSessionId ? prevSessionId.slice(0, 8) : ''
+    let prevThreadLabel = prevSessionId ? diagnosticIdLabel(prevSessionId) : ''
     let statusCard: StatusCardHandle | null = null
     if (!report && announce && resume && prevSessionId) {
       const initialStatus = this.proc
-        ? this.withModel(`🔁 重启 ${this.backendLabel(this.proc.provider)}`)
-        : this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}`)
+        ? this.withModelAndAccount(`🔁 重启 ${this.backendLabel(this.proc.provider)}`, null)
+        : this.withModelAndAccount(`🔁 恢复上一会话 thread=${prevThreadLabel}`, null)
       statusCard = await this.openStatusCard('restart', initialStatus)
       owned.statusCard = statusCard
       if (!this.ownsLifecycle(lease)) {
@@ -3839,10 +3919,9 @@ export class Session {
       resumeRefreshError = this.persistResumableSessionId(false, current, false)
       if (this.lastSessionRef?.provider === provider) {
         prevSessionId = this.lastSessionRef.sessionId
-        prevThreadLabel = prevSessionId.slice(0, 8)
+        prevThreadLabel = prevSessionId ? diagnosticIdLabel(prevSessionId) : ''
       }
     }
-
     // 主动重启:孤儿缓冲随轮作废,不兜底推送。必须在 kill 之前丢弃 ——
     // 否则 kill 触发的 exit 处理器会抢先把缓冲当作"进程崩溃残留"兜底推出去,
     // 违背 restart 的作废语义。旧 proc 不再预置 null(上游形态):beginProcStop
@@ -4005,7 +4084,7 @@ export class Session {
       if (recovery && !this.ownsPreservedWatchdogRecovery(recovery, lease)) return false
       this.status = 'starting'
       this.usageTotalsSeedUnknown = true
-      report?.(this.withModel(`🔁 恢复上一会话 thread=${prevThreadLabel}`))
+      report?.(this.withModelAndAccount(`🔁 恢复上一会话 thread=${prevThreadLabel}`, null))
       let proc: AgentProcess
       try {
         // legacy(cwd:null)已在前置 ③ 升级(前置不 kill);此处 lastSessionRef
@@ -4063,8 +4142,8 @@ export class Session {
         ? this.waitForProcEarlyFailure(proc, CLAUDE_STARTUP_GRACE_MS)
         : null
       report?.(provider === 'claude'
-        ? `⏳ 检查 ${backend} 恢复启动`
-        : `⏳ 等待 ${backend} init 确认`)
+        ? this.withModelAndAccount(`⏳ 检查 ${backend} 恢复启动`, proc)
+        : this.withModelAndAccount(`⏳ 等待 ${backend} init 确认`, proc))
       let initialization: Promise<void> | undefined
       let initializeThrown: unknown = null
       try {
@@ -4088,7 +4167,7 @@ export class Session {
               this.requireCodexInitializationPromise(initialization),
               () => {
                 logDiagnostic("session: resume init still pending after")
-                report?.(this.withModel(`⏳ 仍在等待 ${backend} init 确认 thread=${prevThreadLabel}…`))
+                report?.(this.withModelAndAccount(`⏳ 仍在等待 ${backend} init 确认 thread=${prevThreadLabel}`, proc))
               },
             )
       if (!this.ownsLifecycle(lease)) {
@@ -4166,12 +4245,12 @@ export class Session {
         return false
       }
       this.captureAuthenticatedClaudeRevision(proc)
-      const msg = this.withModel(this.withWorktreeInstructionNotice(
+      const msg = this.withModelAndAccount(this.withWorktreeInstructionNotice(
         init.state === 'waiting_quota' ? '⏳ 账号额度用尽 · 等待后自动恢复原会话'
         : provider === 'claude' && init.state === 'ready'
-          ? `✅ 已准备恢复上一会话 thread=${prevThreadLabel}…`
-          : `✅ 已恢复上一会话 thread=${prevThreadLabel}…`,
-      ))
+          ? `✅ 已准备恢复上一会话 thread=${prevThreadLabel}`
+          : `✅ 已恢复上一会话 thread=${prevThreadLabel}`,
+      ), proc)
       if (init.state === 'waiting_quota') {
         const launch = explicitLaunch ?? (this.lastSessionRef ? { kind: 'resume' as const, source: this.lastSessionRef } : null)
         if (launch && launch.kind !== 'fresh') this.codexQuotaWaitLaunch = launch
@@ -5458,6 +5537,7 @@ export class Session {
         initialFooter: 'Waiting... (<30s)',
         startThinking: false,
         directStart: true,
+        startupAccount: true,
       })
       if (!this.ownsLifecycle(lease)) return
       const opened = this.openedTurnOf(openResult)
@@ -5466,10 +5546,10 @@ export class Session {
       if (this.currentTurn !== turn) return
       const bootTimer = this.startFooterTimer(
         turn.cardId,
-        `🚀 启动 ${this.backendLabel()}`,
+        this.withModelAndAccount(`🚀 启动 ${this.backendLabel()}`, null),
         status => this.withModel(status),
       )
-      let lastBootStatus = `🚀 启动 ${this.backendLabel()}`
+      let lastBootStatus = this.withModelAndAccount(`🚀 启动 ${this.backendLabel()}`, null)
       let ok: boolean
       try {
         ok = await this.start({
@@ -5510,6 +5590,9 @@ export class Session {
       const delivery = this.beginHumanDelivery(startedProc, batch, turn)
       batchTransferred = true
       if (delivery) await this.dispatchHumanBatch(delivery)
+      // 账号此时才确定；「📥 收到 (N) 🚀」标题按实际分配结果原地重绘，
+      // 排在用户输入送入后端之后，不拖慢首轮。
+      await this.refreshTurnInputAccount(turn, startedProc)
     } finally {
       if (
         !batchTransferred &&
@@ -8538,6 +8621,8 @@ export class Session {
       startThinking?: boolean
       directStart?: boolean
       expectedProc?: AgentProcess
+      /** 冷启动第 1 个 turn：footer 与「📥 收到 (N) 🚀」标题都先标注计划中的账号分配。 */
+      startupAccount?: boolean
     } = {},
   ): Promise<TurnCardOpenResult> {
     // 调用形态归一:合并定稿签名取上游 owner 协议 (owner, userOpenId, trigger, opts);
@@ -8605,7 +8690,14 @@ export class Session {
     const userInputs = this.pendingTurnInputs
     this.pendingTurnInputs = []
     this.lastTurnUserPreview = userInputs[0]?.slice(0, 80) ?? this.lastTurnUserPreview
-    const initialFooter = this.withModel(opts.initialFooter ?? 'Waiting...(0s)', turnSelection)
+    // 冷启动的第 1 个 turn 从 Waiting 起就标注账号分配结果；后续 turn 的
+    // footer 仍保持 `agent · 模型/effort`。
+    const initialFooter = opts.startupAccount
+      ? this.withModelAndAccount(opts.initialFooter ?? 'Waiting...(0s)', null, turnSelection)
+      : this.withModel(opts.initialFooter ?? 'Waiting...(0s)', turnSelection)
+    // 「📥 收到 (N) 🚀」标题同样标注这次启动用的账号：开卡时先写计划中的分配
+    // （订阅池写「选号中」），进程就绪后再用实际结果重绘。
+    const startupAccountLabel = opts.startupAccount ? this.accountAssignmentLabel(null) ?? undefined : undefined
     const card = cards.mainConversationCard({
       sessionName: this.sessionName,
       turn,
@@ -8616,6 +8708,7 @@ export class Session {
       userInputs,
       initialFooter,
       directStart: opts.directStart,
+      accountLabel: startupAccountLabel,
     })
     let messageId: string | null
     let sendFailure: unknown
@@ -8769,6 +8862,8 @@ export class Session {
       messageId,
       userOpenId,
       trigger,
+      turnNo: turn,
+      ...(opts.startupAccount ? { userInputs, userInputAccountLabel: startupAccountLabel } : {}),
       backendThreadId: null,
       backendTurnId: null,
       toolCount: 0,
