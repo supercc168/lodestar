@@ -35,7 +35,8 @@ import { recordClaudeSessionAccount } from './claude-session-accounts'
 import { enrollClaudeAccount } from './claude-account-selection'
 import { countActiveClaudeSessions } from './session-activity'
 import { withChatMessageOrder } from './chat-message-order'
-import { formatFeishuError, redactPersonIdentifiers } from './feishu-errors'
+import { feishuErrorDetails, formatFeishuError, redactPersonIdentifiers } from './feishu-errors'
+import { isTransientFeishuError } from './feishu-retry'
 import { logError, logDiagnostic } from './log'
 import { MANAGED_CLAUDE_PLUGIN_DIR } from './paths'
 import { captureCodexUsageCache } from './usage'
@@ -394,6 +395,12 @@ const CARD_ELEMENT_SOFT_LIMIT = 50
  * that itself exceeds the capacity ceiling. Network transport blips and
  * footer ticks never consume this budget (see onCardWriteFailure). */
 const MAX_MIDTURN_ROTATES = 5
+/** 续卡发送/初始化遇到确认的飞书瞬态故障(5xx、限流、超时、连接重置)时的
+ * 退避表。一次常见的飞书 5xx 窗口约几分钟(2026-11-26 实测约 6.5 分钟);
+ * 「两次失败就 log-only」会把整轮正文降级成纯文本兜底,正是那条
+ * 「对话卡片正文写入失败(CardKit 元素未落地)」的来源。永久拒绝
+ * (参数/权限/schema)不进入这张表,仍立即止损。 */
+const ROTATE_TRANSIENT_RETRY_DELAYS_MS = [15_000, 30_000, 60_000, 120_000, 180_000]
 // Cap a single assistant markdown element so one giant block can't alone
 // push the card over Feishu's total size ceiling (200860). Excess stays in
 // daemon logs / transcript; the card keeps a readable head.
@@ -4637,6 +4644,7 @@ export class Session {
     this.discardPreservedWatchdogRecovery('dispose')
     this.discardQueuedHumanWork('dispose')
     this.status = 'stopped'
+    if (this.currentTurn) this.clearRotateRetry(this.currentTurn)
     Session.all.delete(this)
     if (pendingProc?.isAlive()) void pendingProc.kill(1_000).catch(() => {})
   }
@@ -8905,6 +8913,7 @@ export class Session {
       cardWriteFailureNotices: new Set(),
       cardRotationFailed: false,
       rotateGivenUp: false,
+      rotateSendFailures: 0,
       outboundSeenPaths: new Set(),
       outboundSentPaths: new Set(),
       hostAskMarkersSeen: new Set(),
@@ -8970,10 +8979,50 @@ export class Session {
     if (!turn) return
     if (turn.rotateGivenUp) return
     if (turn.rotating) return
+    // 退避窗口内的内容事件不再打飞书;到点由计时器/下一个内容事件重试。
+    if (turn.rotateRetryAfter !== undefined && Date.now() < turn.rotateRetryAfter) return
     // 开卡失败的重试不被元素软上限挡住(上游 378f4a4):这一轮的卡可能还很空,
     // 但上一张续卡没发出去,必须再试一次 —— 与"满卡主动换卡"是两个判据。
     if (!turn.cardRotationFailed && cardkit.getElementCount(turn.cardId) < CARD_ELEMENT_SOFT_LIMIT) return
     this.startMidTurnRotate(turn)
+  }
+
+  /** 续卡发送/初始化失败后的重试判定。
+   * 确认的飞书瞬态故障(5xx/限流/超时/连接)按 15s→30s→60s→120s→180s
+   * 退避重试,共 6 次尝试,覆盖一次常见的几分钟飞书抖动。
+   * 无法归类或确认的永久拒绝(参数/权限/schema)保留原有两级阶梯:首次
+   * 暂停、下一个内容事件立即重试,第二次仍失败才 log-only 止损 —— 不给
+   * 修不好的错误烧满退避预算。返回 false 表示调用方应落实止损。 */
+  private retryRotateLater(turn: TurnState, failure: unknown): boolean {
+    if (isTransientFeishuError(failure)) {
+      const delay = ROTATE_TRANSIENT_RETRY_DELAYS_MS[turn.rotateSendFailures]
+      if (delay === undefined) return false
+      turn.rotateSendFailures++
+      turn.rotateRetryAfter = Date.now() + delay
+      if (turn.rotateRetryTimer) clearTimeout(turn.rotateRetryTimer)
+      const timer = setTimeout(() => {
+        // 只认自己那一次排期:换卡成功或又被更晚的失败重排后,旧计时器作废。
+        if (turn.rotateRetryTimer !== timer) return
+        turn.rotateRetryTimer = undefined
+        turn.rotateRetryAfter = undefined
+        if (this.currentTurn === turn) this.maybeMidTurnRotate()
+      }, delay)
+      turn.rotateRetryTimer = timer
+      const unref = (timer as { unref?: () => void }).unref
+      if (typeof unref === 'function') unref.call(timer)
+      return true
+    }
+    if (turn.rotateSendFailures > 0) return false
+    turn.rotateSendFailures = 1
+    turn.rotateRetryAfter = undefined
+    return true
+  }
+
+  /** 换卡成功或 turn 结束时清掉排期,避免迟到的计时器把已关闭的 turn 拉起。 */
+  private clearRotateRetry(turn: TurnState): void {
+    if (turn.rotateRetryTimer) clearTimeout(turn.rotateRetryTimer)
+    turn.rotateRetryTimer = undefined
+    turn.rotateRetryAfter = undefined
   }
 
   /** Reactive rotation is reserved for confirmed card-capacity failures:
@@ -9014,6 +9063,8 @@ export class Session {
     if (!turn || turn.cardId !== failedCardId) return
     if (turn.rotating) return
     if (turn.rotateGivenUp) return
+    // 只保留错误码供收尾兜底文案使用;原始 message/响应不进卡片也不进日志。
+    if (typeof code === 'number') turn.lastCardWriteCode = code
 
     const kind = meta?.kind
       ?? (typeof code === 'number' ? 'api' : 'network')
@@ -9021,7 +9072,7 @@ export class Session {
       // Transport blip already retried inside cardkit. Stay on this card;
       // the next real content write either lands (onCardWriteSuccess) or
       // surfaces a true API code that can rotate.
-      logDiagnostic("session: network write failure on")
+      logDiagnostic('session: network write failure')
       return
     }
 
@@ -9063,6 +9114,12 @@ export class Session {
       }
       turn.cardCapacityFailures.set(fingerprint, false)
     }
+    // 续卡退避窗口内不再叠一次换卡:旧卡已满,但此刻发新卡还会撞上同一波
+    // 飞书故障;交给退避计时器。容量指纹与通知照常记录。
+    if (turn.rotateRetryAfter !== undefined && Date.now() < turn.rotateRetryAfter) {
+      logDiagnostic('session: card write failure during rotate backoff', code === undefined ? {} : { code })
+      return
+    }
     if (turn.failureRotateCount >= MAX_MIDTURN_ROTATES) {
       turn.rotateGivenUp = true
       // log-only 要名副其实:停掉 footer 档位计时器,并把当前卡整卡标记
@@ -9070,12 +9127,12 @@ export class Session {
       // (2026-07-04:11 分钟 663 条 300308)。
       this.stopFooterStatus(turn)
       cardkit.markCardWriteDead(turn.cardId)
-      logDiagnostic("session: failure-rotate cap (")
+      logDiagnostic('session: failure-rotate cap', code === undefined ? {} : { code })
       void feishu.sendTextRaw(this.chatId, this.failureRotateGiveUpText(code, failure))
       return
     }
 
-    logDiagnostic("session: on")
+    logDiagnostic('session: card write failure rotate', code === undefined ? {} : { code })
     turn.failureRotateCount++
     this.startMidTurnRotate(turn)
   }
@@ -9146,78 +9203,106 @@ export class Session {
     }
     turn.rotating = (async () => {
       try {
-        const card = cards.mainConversationCard({
-          sessionName: this.sessionName,
-          turn: this.turnCounter,
-          provider: turn.provider,
-          model: turn.model ?? undefined,
-          effort: turn.effort ?? 'MISS',
-          kind: forSteering ? 'user_steering' : 'card_full',
-          userInputs: opts.userInputs ?? [],
-        })
-        let sendFailure: unknown
-        // 中途换卡也会在群尾新增一条消息，同样要把运行中的任务行搬到新卡之后。
-        const newMessageId = await withChatMessageOrder(this.chatId, async () => {
-          try { await this.agentCards.prepareNewCard(this.chatId) }
-          catch (error) { await this.reportBackgroundWriteFailure(error) }
-          const id = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
-          try { await this.agentCards.rebuildTailCard(this.chatId) }
-          catch (error) { await this.reportBackgroundWriteFailure(error) }
-          return id
-        })
+        // 续卡消息上一轮已经发出、只是 Card Kit 初始化失败时,只重新
+        // 转换这条消息 —— 再走一遍 sendCard 会在群里多堆一张死卡。
+        let newMessageId: string | null = turn.pendingRotateMessageId ?? null
         if (!newMessageId) {
-          logDiagnostic('session: mid-turn rotate sendCard failed')
-          if (!forSteering && this.currentTurn === turn) {
-            if (turn.cardRotationFailed) {
-              logDiagnostic("session: mid-turn rotate sendCard failed twice — giving up, rest of turn is log-only")
-              turn.rotateGivenUp = true
+          const card = cards.mainConversationCard({
+            sessionName: this.sessionName,
+            turn: this.turnCounter,
+            provider: turn.provider,
+            model: turn.model ?? undefined,
+            effort: turn.effort ?? 'MISS',
+            kind: forSteering ? 'user_steering' : 'card_full',
+            userInputs: opts.userInputs ?? [],
+          })
+          let sendFailure: unknown
+          // 中途换卡也会在群尾新增一条消息，同样要把运行中的任务行搬到新卡之后。
+          newMessageId = await withChatMessageOrder(this.chatId, async () => {
+            try { await this.agentCards.prepareNewCard(this.chatId) }
+            catch (error) { await this.reportBackgroundWriteFailure(error) }
+            const id = await feishu.sendCard(this.chatId, card, error => { sendFailure = error })
+            try { await this.agentCards.rebuildTailCard(this.chatId) }
+            catch (error) { await this.reportBackgroundWriteFailure(error) }
+            return id
+          })
+          if (!newMessageId) {
+            const details = feishuErrorDetails(sendFailure)
+            const code = typeof details.code === 'number' ? details.code : undefined
+            const transient = isTransientFeishuError(sendFailure)
+            const firstFailure = turn.rotateSendFailures === 0
+            const codeNote = details.code === undefined ? '' : `(飞书 code=${details.code})`
+            logDiagnostic('session: mid-turn rotate sendCard failed', code === undefined ? {} : { code })
+            if (!forSteering && this.currentTurn === turn) {
               this.stopFooterStatus(turn)
-              cardkit.markCardWriteDead(turn.cardId)
+              // 瞬态故障(5xx/限流/超时/连接)退避后再试;两次失败就
+              // log-only 会让一次几分钟的飞书抖动吞掉整轮正文。
+              if (this.retryRotateLater(turn, sendFailure)) {
+                turn.cardRotationFailed = true
+                logDiagnostic('session: mid-turn rotate sendCard retry scheduled', {
+                  attempt: turn.rotateSendFailures,
+                })
+                if (firstFailure) {
+                  await feishu.sendTextRaw(
+                    this.chatId,
+                    transient
+                      ? `⚠️ 续卡发送失败${codeNote}，稍后自动重试；期间正文会继续保留。`
+                      : '⚠️ 续卡发送失败，后续内容到达时会再次尝试。',
+                  )
+                }
+              } else {
+                logDiagnostic('session: mid-turn rotate sendCard failed — giving up, rest of turn is log-only')
+                turn.rotateGivenUp = true
+                cardkit.markCardWriteDead(turn.cardId)
+                await feishu.sendTextRaw(
+                  this.chatId,
+                  `⚠️ 续卡连续发送失败，本轮后续输出仅日志可见${codeNote}。`,
+                )
+              }
+            } else if (forSteering) {
               await feishu.sendTextRaw(
                 this.chatId,
-                '⚠️ 续卡连续发送失败，本轮后续输出仅日志可见。',
-              )
-            } else {
-              logDiagnostic("session: mid-turn rotate sendCard failed — retry on the next content event")
-              turn.cardRotationFailed = true
-              this.stopFooterStatus(turn)
-              await feishu.sendTextRaw(
-                this.chatId,
-                '⚠️ 续卡发送失败，后续内容到达时会再次尝试。',
+                `⚠️ 追加消息已交给 Agent，但新卡片发送失败。\n${formatFeishuError(sendFailure)}`,
               )
             }
-          } else if (forSteering) {
-            await feishu.sendTextRaw(
-              this.chatId,
-              `⚠️ 追加消息已交给 Agent，但新卡片发送失败。\n${formatFeishuError(sendFailure)}`,
-            )
+            return
           }
-          return
+          // The new input panel is now visible in chat. Remove its waiting
+          // reactions here, without waiting for conversion/migration/old close.
+          opts.onCardSent?.()
         }
-        // The new input panel is now visible in chat. Remove its waiting
-        // reactions here, without waiting for conversion/migration/old close.
-        opts.onCardSent?.()
         let newCardId: string
         try { newCardId = await cardkit.convertMessageToCard(newMessageId) }
         catch (e) {
-          logError("session: mid-turn rotate id_convert failed", e)
+          const details = feishuErrorDetails(e)
+          const transient = isTransientFeishuError(e)
+          const firstFailure = turn.rotateSendFailures === 0
+          const codeNote = details.code === undefined ? '' : `(飞书 code=${details.code})`
+          logError('session: mid-turn rotate id_convert failed', e)
           if (!forSteering && this.currentTurn === turn) {
-            // 与 sendCard 分支同一两级阶梯:首次暂停重试、二次才 give-up。
-            if (turn.cardRotationFailed) {
-              logError("session: mid-turn rotate id_convert failed twice — giving up, rest of turn is log-only", e)
+            // 消息已经发出:保留 message_id,下一次只重转,不再发新卡。
+            turn.pendingRotateMessageId = newMessageId
+            this.stopFooterStatus(turn)
+            if (this.retryRotateLater(turn, e)) {
+              turn.cardRotationFailed = true
+              logDiagnostic('session: mid-turn rotate id_convert retry scheduled', {
+                attempt: turn.rotateSendFailures,
+              })
+              if (firstFailure) {
+                await feishu.sendTextRaw(
+                  this.chatId,
+                  transient
+                    ? `⚠️ 续卡已发送，但 Card Kit 初始化失败${codeNote}，稍后自动重试。`
+                    : '⚠️ 续卡已发送，但 Card Kit 初始化失败；后续内容到达时会再次尝试。',
+                )
+              }
+            } else {
+              logError('session: mid-turn rotate id_convert failed — giving up, rest of turn is log-only', e)
               turn.rotateGivenUp = true
-              this.stopFooterStatus(turn)
               cardkit.markCardWriteDead(turn.cardId)
               await feishu.sendTextRaw(
                 this.chatId,
-                '⚠️ 续卡初始化连续失败，本轮后续输出仅日志可见。',
-              )
-            } else {
-              turn.cardRotationFailed = true
-              this.stopFooterStatus(turn)
-              await feishu.sendTextRaw(
-                this.chatId,
-                '⚠️ 续卡已发送，但 Card Kit 初始化失败；后续内容到达时会再次尝试。',
+                `⚠️ 续卡初始化连续失败，本轮后续输出仅日志可见${codeNote}。`,
               )
             }
           } else if (forSteering) {
@@ -9228,6 +9313,10 @@ export class Session {
           }
           return
         }
+        // 新卡就位:清掉续卡重试状态,避免迟到的计时器再开一张。
+        turn.pendingRotateMessageId = undefined
+        turn.rotateSendFailures = 0
+        this.clearRotateRetry(turn)
         // Capacity pages have a banner; steering pages have the new inputs.
         const initialElements = 1 + (forSteering ? (opts.userInputs!.length > 0 ? 1 : 0) : 1)
         cardkit.recordCardCreated(
@@ -10102,13 +10191,19 @@ export class Session {
     const cardId = turn.cardId
     const targetElementId = sessionTools.taskLiveAnchor(turn)
     const write = (async (): Promise<boolean> => {
+      let failure: cardkit.CardWriteFailure | undefined
       const added = await cardkit.addElementChecked(
         cardId,
         this.completedAssistantElement(segId, text),
-        { type: 'insert_before', targetElementId },
+        { type: 'insert_before', targetElementId, onFailure: f => { failure = f } },
       )
       if (!added) {
-        logDiagnostic('session: assistant text write failed')
+        // 不在流式路径上立刻重写:add 已花完自己的恢复窗口,再排一次
+        // replace 只会把卡写队列翻倍(飞书抖动时每段多等 60s)。失败元素
+        // 保留 failedAdds placement,由收尾统一做一次「能重建就重建」。
+        if (typeof failure?.code === 'number') turn.lastCardWriteCode = failure.code
+        logDiagnostic('session: assistant text write failed',
+          typeof failure?.code === 'number' ? { code: failure.code } : {})
         return false
       }
 
@@ -10127,6 +10222,15 @@ export class Session {
     turn.assistantWriteInflight.get(cardId)!.add(write)
     void write.finally(() => turn.assistantWriteInflight?.get(cardId)?.delete(write))
     return write
+  }
+
+  /** 兜底文案里的原因:带上真实飞书码,并区分「放弃续卡」与「单个元素没落地」。
+   * 旧文案一律写「CardKit 元素未落地」,把续卡失败也归到元素头上,排查时误导。 */
+  private assistantFallbackReason(turn: TurnState): string {
+    const suffix = turn.lastCardWriteCode === undefined ? '' : `，飞书 code=${turn.lastCardWriteCode}`
+    return turn.rotateGivenUp
+      ? `续卡失败，本轮未能继续写卡${suffix}`
+      : `CardKit 元素未落地${suffix}`
   }
 
   /** CardKit 正文写入失败时显式保全完整回复；不伪装卡片成功。 */
@@ -10473,6 +10577,8 @@ export class Session {
     // 插在 null-out 之前的同步块里 —— 后面 `await turn.rotating` 会等它落定。
     if (!suffix && turn.cardRotationFailed) this.maybeMidTurnRotate()
     this.currentTurn = null
+    // turn 已摘除:作废续卡退避计时器,避免迟到的重试去碰已关闭的卡。
+    this.clearRotateRetry(turn)
     this.clearToolFailureLoop(turn)
     this.endWatchdogTurn()
     // The task-end push targets the message the user last saw for this work.
@@ -10554,8 +10660,10 @@ export class Session {
     if (turn.currentAssistantSegmentId && turn.currentAssistantText.trim()) {
       const segId = turn.currentAssistantSegmentId
       const text = turn.currentAssistantText
-      const added = await this.addCompletedAssistantSegment(turn, segId, text)
-      if (!added) fallbackSegments.set(segId, text)
+      await this.addCompletedAssistantSegment(turn, segId, text)
+      // 失败段不在这里直接兜底:元素保留了 failedAdds placement,下面的
+      // 收尾循环会统一「能重建就重建,不能才发纯文本」。
+      if (!turn.segmentTexts.has(segId)) turn.segmentTexts.set(segId, text)
       turn.currentAssistantSegmentId = null
       turn.currentAssistantText = ''
     }
@@ -10578,26 +10686,52 @@ export class Session {
       await Promise.allSettled([...inflight])
     }
 
-    // 对每个 assistant 段 replaceElement 成最终内容。正文已经是静态 markdown,
-    // 这里只是收尾清洗 askusr 标记和兜住异常路径 —— 但公式段例外:
-    // replaceSegmentWithMathImgs 已经把段替换成摘出文本 + 紧贴插入公式图,
-    // 这里再用原文重渲会把渲染版覆盖回 $$…$$ 原码降级(代码块占位),图也
-    // 失去归属段。已渲染标记按卡隔离:本卡的段才跳过(rotation 重编号后
-    // 新卡同名段不受旧卡标记影响)。
+    // 收尾每个 assistant 段。正文在 block 完成时已按完整段落地,这里只补
+    // 两类:①写入失败但 CardKit 保留了 placement 的段 —— replace 会原位
+    // POST 重建,别急着把正文降级成纯文本;②卡已写死/元素已删除的段 →
+    // 纯文本兜底,正文不丢。已确认落地的段不再重复 replace:内容已是 final
+    // 形态,而卡写死时任何写都只会失败并把可见正文再发一遍(群里整段重复)。
+    // 公式段例外:replaceSegmentWithMathImgs 已把段替换成渲染版,重渲会把
+    // 图片覆盖回 $$…$$ 原码;已渲染标记按卡隔离,只跳过本卡的段。
     const renderedHere = turn.mathRendered?.get(cardId)
+    // 卡整卡写死(log-only 止损)时,元素是否可见只能看落盘记录:已落地的
+    // 段不能再走 replace(必失败),否则收尾会把可见正文整段重发一遍。
+    // 还能写的卡保持原来的逐段 replace 收尾,不改变正常路径行为。
+    const cardWriteDead = cardkit.isCardWriteDead(cardId)
+    const writtenHere = cardWriteDead
+      ? new Set(cardkit.getWrittenContentElementIds(cardId))
+      : new Set<string>()
+    // 收尾补写最多花一个恢复窗口:第一段就补不回来时,同卡后续段大概率
+    // 同样失败(整卡写死/服务未恢复),继续逐段等 60s 只会拖慢收尾,
+    // 宁可把剩下的正文一次性发成纯文本。
+    let repairStopped = false
     for (const [segId, fullText] of segmentTexts) {
       // A whitespace-only block (common just before a tool call) never became an element;
       // replacing it would be a write to an id the card does not have.
       if (!fullText.trim()) continue
-      if (cardkit.isDeadElement(cardId, segId)) {
+      if (renderedHere?.has(segId)) continue
+      if (writtenHere.has(segId)) continue
+      // 彻底删除/永不可能是这个元素的失败,直接兜底,不再白等一个恢复窗口。
+      if (cardkit.isDeadElement(cardId, segId) && !cardkit.isElementRebuildable(cardId, segId)) {
         fallbackSegments.set(segId, fullText)
         continue
       }
-      if (renderedHere?.has(segId)) continue
-      await cardkit.replaceElement(cardId, segId, this.completedAssistantElement(segId, fullText))
-    }
-    if (turn.rotateGivenUp || turn.cardRotationFailed) {
-      for (const [segId, fullText] of segmentTexts) fallbackSegments.set(segId, fullText)
+      if (repairStopped) {
+        fallbackSegments.set(segId, fullText)
+        continue
+      }
+      const landed = await cardkit.replaceElementChecked(
+        cardId,
+        segId,
+        this.completedAssistantElement(segId, fullText),
+        { notifyCardFailure: false, onFailure: failure => {
+          if (typeof failure.code === 'number') turn.lastCardWriteCode = failure.code
+        } },
+      )
+      if (!landed) {
+        repairStopped = true
+        fallbackSegments.set(segId, fullText)
+      }
     }
 
     // State marker leads the footer (✅ for natural completion, or the
@@ -10665,15 +10799,21 @@ export class Session {
       // would make the in-memory state claim success while Feishu still shows
       // a streaming/running card, and would prevent any later repair attempt.
       const detail = `footer=${footerLanded ? 'ok' : 'MISS'}, settings=${settingsLanded ? 'ok' : 'MISS'}`
-      logError('session: terminal card transaction incomplete', detail)
+      // 固定字段走诊断格式化白名单:logError 只认 Error/错误码,传字符串会被
+      // 格式化成 reason=unknown,把 footer/settings 哪个 MISS 吞掉。
+      logDiagnostic('session: terminal card transaction incomplete', {
+        footer: footerLanded ? 'ok' : 'miss',
+        settings: settingsLanded ? 'ok' : 'miss',
+      })
       await feishu.sendTextRaw(
         this.chatId,
         `⚠️ 对话卡片终态写入失败 (${detail})。本轮已结束: ${stateMark}\n${cardFailureDetails(failures)}`,
       )
     }
 
+    const fallbackReason = this.assistantFallbackReason(turn)
     for (const text of fallbackSegments.values()) {
-      await this.sendAssistantTextFallback(text, 'CardKit 元素未落地')
+      await this.sendAssistantTextFallback(text, fallbackReason)
     }
 
     // Phone push when the task really ends. A turn that closes while subagents

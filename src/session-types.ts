@@ -240,6 +240,21 @@ export interface TurnState {
   /** Latched once we hit the rotate cap and emit the "giving up" notice,
    * so the notice isn't repeated on every later failed write this turn. */
   rotateGivenUp: boolean
+  /** 续卡发送/初始化遇到**确认的飞书瞬态故障**(5xx、限流、超时、连接重置)
+   * 时的连续失败次数。只驱动退避重试,不再两次失败就落 log-only ——
+   * 一次几分钟的飞书 5xx 窗口曾把整轮正文降级成纯文本兜底
+   * (2026-11-26 etmmo 群)。成功换卡后归零;永久拒绝(4xx/校验)不重试。 */
+  rotateSendFailures: number
+  /** 下一次允许重试续卡的时间点(ms)。内容事件风暴里避免连续打飞书。 */
+  rotateRetryAfter?: number
+  /** 退避重试计时器;turn close/dispose 时清理,回调里再核对当前 turn。 */
+  rotateRetryTimer?: ReturnType<typeof setTimeout>
+  /** 续卡消息已发出但 Card Kit `id_convert` 失败时保留 message_id:
+   * 下次重试只重新转换这条消息,不再往群里多发一张卡。 */
+  pendingRotateMessageId?: string
+  /** 本轮最近一次正文写失败的飞书错误码。只用于用户兜底文案的可诊断性
+   * (例如「code=2200」),不参与任何身份信息。 */
+  lastCardWriteCode?: number
   /** 本 turn 已处理过的出站路径请求。包括合法绝对路径和被拒绝的非绝对路径,
    * 用来避免增量文本反复扫到同一个 [[send: ...]] 时重复上传或刷日志。 */
   outboundSeenPaths: Set<string>

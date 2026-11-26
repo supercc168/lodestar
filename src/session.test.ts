@@ -67,7 +67,7 @@ const mathRender = await import('./math-render')
 const sessionTools = await import('./session-tools')
 const sessionHostAsk = await import('./session-host-ask')
 const { ClaudeAgentProcess } = await import('./claude-agent-process')
-const { FeishuRecoveryWindow } = await import('./feishu-retry')
+const { FeishuRecoveryWindow, FeishuRequestError } = await import('./feishu-retry')
 const feishu = await import('./feishu')
 const { config } = await import('./config')
 const { getTokenSource, listTokenSources, registerTokenSource, refreshAllTokenSourceModels, resetTokenSourceRegistry, tokenSourceProcessRevision } = await import('./token-source')
@@ -386,6 +386,7 @@ function turnState(
     cardWriteFailureNotices: new Set(),
     cardRotationFailed: false,
     rotateGivenUp: false,
+    rotateSendFailures: 0,
     outboundSeenPaths: new Set(),
     outboundSentPaths: new Set(),
     hostAskMarkersSeen: new Set(),
@@ -13634,6 +13635,187 @@ describe('Session 轮转预算收紧与一次性诊断 (上游 4185808 主题 B)
     } finally {
       feishuMockState.sendCard = null
       session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+})
+
+describe('Session 正文兜底准确性 (2026-11-26 飞书 5xx 误报)', () => {
+  function cardCall(input: RequestInfo | URL, init?: RequestInit): { path: string; method: string } {
+    const url = new URL(String(input))
+    const path = url.pathname.replace('/open-apis/cardkit/v1', '')
+    const method = String(init?.method ?? 'GET')
+    calls.push({ method, path, body: init?.body ? JSON.parse(String(init.body)) : null })
+    return { path, method }
+  }
+
+  test('close 时补写失败元素:卡还能写就不发「正文写入失败」纯文本', async () => {
+    const session = new Session('close-rebuild', 'chat_id') as any
+    const turn = turnState('card_close_rebuild')
+    turn.provider = 'claude'
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const text = '收尾时补写回来的正文'
+    turn.segmentTexts.set('assistant_0', text)
+
+    let allowWrite = false
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const { path, method } = cardCall(input, init)
+      if (!allowWrite && method === 'POST' && path === `/cards/${turn.cardId}/elements`) {
+        return new Response(JSON.stringify({ code: 300121, msg: 'element does not exist' }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    const failed = await cardkit.addElementChecked(
+      turn.cardId,
+      session.completedAssistantElement('assistant_0', text),
+      { type: 'insert_before', targetElementId: 'footer' },
+    )
+    expect(failed).toBe(false)
+
+    allowWrite = true
+    await session.closeTurnCard(undefined, { hasFreshResult: false })
+    expect(sentTexts).toEqual([])
+    expect(JSON.stringify(calls)).toContain(text)
+  })
+
+  test('卡已写死时只兜底未落地的段,不把已可见正文重发一遍,并带真实错误码', async () => {
+    const session = new Session('close-dead-dedupe', 'chat_id') as any
+    const turn = turnState('card_close_dead')
+    turn.provider = 'claude'
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 1)
+    const landed = '已经落在卡上的正文'
+    const missing = '始终没能写进卡里的正文'
+    await cardkit.addElement(
+      turn.cardId,
+      session.completedAssistantElement('assistant_0', landed),
+      { type: 'insert_before', targetElementId: 'footer' },
+    )
+    await cardkit.flush(turn.cardId)
+    turn.segmentTexts.set('assistant_0', landed)
+    turn.segmentTexts.set('assistant_1', missing)
+    turn.lastCardWriteCode = 2200
+    cardkit.markCardWriteDead(turn.cardId)
+
+    await session.closeTurnCard(undefined, { hasFreshResult: false })
+    expect(sentTexts).toHaveLength(1)
+    expect(sentTexts[0]).toContain(missing)
+    expect(sentTexts[0]).not.toContain(landed)
+    expect(sentTexts[0]).toContain('飞书 code=2200')
+  })
+
+  test('续卡遇到飞书 5xx 按退避重试,不再第二次失败就整轮 log-only', async () => {
+    const session = new Session('rotate-transient', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-rotate-transient')
+    const turn = turnState('card_rotate_transient')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 50)
+    let attempts = 0
+    feishuMockState.sendCard = async (_chatId, _card, onFailure) => {
+      attempts++
+      onFailure?.(new FeishuRequestError('send card failed', 500, 2200))
+      return null
+    }
+    try {
+      session.maybeMidTurnRotate()
+      await turn.rotating
+      expect(turn.cardRotationFailed).toBe(true)
+      expect(turn.rotateGivenUp).toBe(false)
+      expect(turn.rotateRetryAfter).toBeGreaterThan(Date.now() - 1)
+      expect(sentRawTexts[0]).toContain('稍后自动重试')
+
+      // 退避窗口内:内容事件不重复打飞书
+      session.maybeMidTurnRotate()
+      expect(attempts).toBe(1)
+
+      // 旧卡继续报容量失败也不叠加换卡(交给退避计时器)
+      session.onCardWriteFailure(turn.cardId, 300305, { kind: 'api' } as any)
+      expect(attempts).toBe(1)
+
+      // 到点后再失败一次,仍在重试预算内
+      turn.rotateRetryAfter = undefined
+      session.maybeMidTurnRotate()
+      await turn.rotating
+      expect(turn.rotateGivenUp).toBe(false)
+      expect(attempts).toBe(2)
+
+      // 退避档位用完才止损(旧卡标死、给出「仅日志可见」)
+      turn.rotateSendFailures = 5
+      turn.rotateRetryAfter = undefined
+      session.maybeMidTurnRotate()
+      await turn.rotating
+      expect(turn.rotateGivenUp).toBe(true)
+      expect(sentRawTexts.at(-1)).toContain('仅日志可见')
+      expect(sentRawTexts.at(-1)).toContain('code=2200')
+    } finally {
+      feishuMockState.sendCard = null
+      session.clearRotateRetry(turn)
+      session.stopFooterStatus(turn)
+      await cardkit.dispose(turn.cardId)
+    }
+  })
+
+  test('id_convert 失败后只重转同一条消息,不再往群里多发一张卡', async () => {
+    const session = new Session('rotate-convert-pending', 'chat_id') as any
+    session.proc = new FakeAgentProc('claude', 'claude-rotate-convert')
+    const turn = turnState('card_rotate_convert')
+    turn.userOpenId = ''
+    session.currentTurn = turn
+    cardkit.recordCardCreated(turn.cardId, 50)
+    let sends = 0
+    feishuMockState.sendCard = async () => {
+      sends++
+      return 'om_rotate_pending'
+    }
+    let convertCalls = 0
+    globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
+      const { path } = cardCall(input, init)
+      if (path === '/cards/id_convert') {
+        convertCalls++
+        if (convertCalls === 1) {
+          return new Response(JSON.stringify({ code: 300315, msg: 'invalid layout' }), {
+            status: 400,
+            headers: { 'Content-Type': 'application/json' },
+          })
+        }
+        return new Response(JSON.stringify({ code: 0, data: { card_id: 'card_rotate_converted' } }), {
+          headers: { 'Content-Type': 'application/json' },
+        })
+      }
+      return new Response(JSON.stringify({ code: 0, data: {} }), {
+        headers: { 'Content-Type': 'application/json' },
+      })
+    }) as typeof fetch
+
+    try {
+      session.maybeMidTurnRotate()
+      await turn.rotating
+      expect(sends).toBe(1)
+      expect(turn.pendingRotateMessageId).toBe('om_rotate_pending')
+      expect(turn.cardRotationFailed).toBe(true)
+      expect(turn.rotateGivenUp).toBe(false)
+
+      // 非瞬态走原两级阶梯:内容事件立即重试,但只重新转换同一条消息
+      session.maybeMidTurnRotate()
+      await turn.rotating
+      expect(sends).toBe(1)
+      expect(convertCalls).toBe(2)
+      expect(turn.cardId).toBe('card_rotate_converted')
+      expect(turn.pendingRotateMessageId).toBeUndefined()
+      expect(turn.cardRotationFailed).toBe(false)
+    } finally {
+      feishuMockState.sendCard = null
+      session.stopFooterStatus(turn)
+      await cardkit.dispose('card_rotate_converted')
       await cardkit.dispose(turn.cardId)
     }
   })

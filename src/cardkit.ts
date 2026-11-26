@@ -344,6 +344,22 @@ export function isDeadElement(cardId: string, elementId: string): boolean {
   return cards.get(cardId)?.deadElements.has(elementId) ?? false
 }
 
+/** True if the element's last add/replace failed but CardKit kept its
+ * placement/recovery state, so a later write can rebuild it in place
+ * (上游 378f4a4 三态)。close 的正文收尾靠它区分「可补写」与「已彻底删除」,
+ * 避免给永远写不进去的元素再花一个恢复窗口。 */
+export function isElementRebuildable(cardId: string, elementId: string): boolean {
+  const s = cards.get(cardId)
+  return Boolean(s && (s.failedAdds.has(elementId) || s.failedReplacements.has(elementId)))
+}
+
+/** True once the card stopped accepting writes (log-only / rotate give-up).
+ * 收尾靠它区分「还能补写的卡」与「整卡已放弃」:后者不能再按元素已落地
+ * 与否来判断正文是否可见。 */
+export function isCardWriteDead(cardId: string): boolean {
+  return cards.get(cardId)?.writeDead === true
+}
+
 /** A duplicate-id add may mean the element landed but the acknowledgement
  * was lost/raced. Allow one checked PUT reconciliation against that id.
  * (上游 4185808) */

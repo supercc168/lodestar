@@ -115,6 +115,9 @@ const ENUM_VALUES: Record<string, ReadonlySet<string>> = {
     // Shutdowns the daemon starts itself: without these the log shows no cause at all.
     'unhandledRejection', 'uncaughtException', 'boot_fatal']),
   phase: new Set(['start', 'end', 'retry', 'recovered', 'failed']),
+  // 终态卡片事务的两个独立写入结果(close 收尾诊断);固定枚举,不含正文。
+  footer: new Set(['ok', 'miss']),
+  settings: new Set(['ok', 'miss']),
 }
 const recentDiagnostics = new Map<string, number>()
 const DIAGNOSTIC_INTERVAL_MS = 10 * 60_000
