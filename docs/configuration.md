@@ -154,6 +154,19 @@ OpenRouter 的模型目录与余额查询，以及 Lodestar 自己发出的其�
 
 服务进程读取它自己的环境及运行用户的设置。在终端里 `export HTTPS_PROXY=...` 不会修改已经运行的 systemd/launchd/Windows 服务；应在对应服务的环境中设置。代理设置只作用于 Lodestar 自有 HTTP：Codex、Claude、DSH 与 npm 的网络继续遵循各自应用配置，飞书 SDK 的 HTTP/WebSocket 也保留其原生配置方式。`[claude.env]`、`[codex.env]` 不是 daemon 的全局代理设置。
 
+Codex CLI 只认环境变量代理（`HTTPS_PROXY` / `HTTP_PROXY` / `ALL_PROXY`，例外走 `NO_PROXY`），不读取 macOS 系统代理；由 launchd / systemd 托管的 daemon 通常拿不到登录 shell 里的代理变量。所以当网络无法直连 ChatGPT 后端时，订阅账号的模型目录和额度会显示 `MISS`，而同一台机器上的普通会话未必受影响。需要让 Codex 子进程走代理时，用 `[codex.env]` 注入（`[claude.env]` 对 Claude 子进程同理）：
+
+```toml
+[codex.env]
+HTTPS_PROXY = "http://127.0.0.1:7890"
+HTTP_PROXY  = "http://127.0.0.1:7890"
+NO_PROXY    = "127.0.0.1,localhost,<自家中转站域名>"
+```
+
+配置在进程启动时读取，改完要重启 daemon。`NO_PROXY` 里列出本机地址和自家中转站域名，避免把本来直连更快的请求也绕进代理。
+
+用同一代理解析 `https://chatgpt.com/backend-api/wham/usage` 应返回 `401`（说明可达但未授权），而不是连接超时或 TLS 重置。代理已通却仍报 `模型目录 MISS：{"code":-32603,"message":"failed to load workspace requirements"}`、同时额度报 `failed to fetch codex rate limits`，说明 Codex 运行时的 workspace routing 与后端不兼容，用 `lodestar update --agents-only` 升到 latest 即可；`model/list` 本身不依赖该远程接口，所以这类 `MISS` 不代表本机没有可用模型。重启后日志不再出现 `codex quota read failed` 即表示恢复。
+
 ## 源码开发
 
 安装 Bun，在仓库根目录运行：
